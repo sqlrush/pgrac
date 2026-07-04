@@ -269,7 +269,7 @@ SELECT role, count(*) FROM pg_cluster_nodes GROUP BY role;
 ## pg_stat_cluster_wait_events
 
 Lists the cluster-specific wait event registry on the local node.
-Always returns 116 rows in `--enable-cluster` builds (one per
+Always returns 118 rows in `--enable-cluster` builds (one per
 registered cluster wait event).
 
 ### Columns
@@ -297,7 +297,7 @@ See [Wait events](wait-events.md) for the full event roster.
 ## pg_stat_gcluster_wait_events
 
 Cross-node placeholder for cluster-wide wait events.  In the
-current release returns 116 rows for the local node only;
+current release returns 118 rows for the local node only;
 `node_id` is always the value of the local `cluster.node_id` GUC.
 
 The column shape `(node_id, type, name)` is the public contract
@@ -446,16 +446,25 @@ see why RDMA was not selected.
 | `fallback_count` | `int8` | Per-peer RDMA-to-TCP fallback decisions. |
 | `send_count` / `recv_count` | `int8` | Mux-level send/receive handoffs counted by transport. |
 | `bytes_send` / `bytes_recv` | `int8` | Mux-level bytes handed to/from the selected transport. |
-| `block_sge_send_count` | `int8` | SEND-with-SGE block ship attempts posted on the RDMA path.  Spec-6.1 block replies use registered per-peer scratch MR, not live shared_buffers DMA. |
+| `block_sge_send_count` | `int8` | SEND-with-SGE block ship attempts posted on the RDMA path. |
 | `block_sge_fallback_count` | `int8` | SEND-with-SGE block ship attempts that materialized the SGEs and used TCP fallback. |
+| `tier3_send_count` | `int8` | Sends counted under tier3 RDMA accounting. |
+| `inline_send_count` | `int8` | Sends posted with `IBV_SEND_INLINE`. |
+| `unsignaled_batch_count` | `int8` | Unsignaled send decisions made by the bounded batching policy. |
+| `busypoll_us_burned` | `int8` | Microseconds spent in bounded CQ busypoll loops. |
+| `busypoll_fallback_count` | `int8` | Busypoll loops that exhausted the configured budget. |
+| `block_reply_lane_state` | `text` | Dedicated D6 block-reply lane state: `disabled`, `connecting`, `connected`, `resetting`, or `error`. |
+| `block_reply_lane_fallback_count` | `int8` | Direct-land attempts that fell back because the block-reply lane/capability/arm was unavailable before advertising direct-land. |
+| `block_reply_lane_error_count` | `int8` | Block-reply lane CQE/provider/reset errors. |
 | `latency_us_sum` / `latency_sample_count` | `int8` | Reserved latency aggregation counters for tier2/tier3 completion timing. |
 | `last_error_code` | `text` | Last SQLSTATE-style RDMA/mux error for this peer. |
 | `last_error` | `text` | Last human-readable RDMA/mux error. |
+| `last_block_reply_error` | `text` | Last block-reply lane error or fallback reason for this peer. |
 
 Example:
 
 ```sql
-SELECT node_id, transport, rdma_state, provider, fallback_count, last_error
+SELECT node_id, transport, rdma_state, provider, block_reply_lane_state, last_error
   FROM pg_stat_cluster_ic
  ORDER BY node_id;
 ```

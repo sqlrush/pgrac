@@ -420,6 +420,33 @@ UT_TEST(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal)
 }
 
 
+/* spec-6.13 D6: request-side direct-land flag rides reserved_0[1] and must
+ * stay independent from the existing clean-page eligibility flag at [0]. */
+UT_TEST(test_request_payload_direct_land_flag_roundtrip_and_orthogonal)
+{
+	GcsBlockRequestPayload req;
+
+	memset(&req, 0, sizeof(req));
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsDirectLandArmed(&req) ? 1 : 0, 0);
+
+	GcsBlockRequestPayloadSetCleanEligible(&req, true);
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, true);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsDirectLandArmed(&req) ? 1 : 0, 1);
+
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, false);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsDirectLandArmed(&req) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 1);
+
+	GcsBlockRequestPayloadSetCleanEligible(&req, false);
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, true);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsDirectLandArmed(&req) ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockRequestPayload), 64);
+}
+
+
 /* spec-5.2a D3 (U3): pure master-side clean-page X-transfer decision, all 5
  * branches.  Master == self runs the handler; args are (x_holder, requester,
  * master). */
@@ -487,7 +514,7 @@ UT_TEST(test_clean_xfer_stale_break_predicate)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -506,6 +533,7 @@ main(void)
 	UT_RUN(test_xheld_read_ship_decision_truth_table);
 	UT_RUN(test_forward_payload_read_image_flag_roundtrip);
 	UT_RUN(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal);
+	UT_RUN(test_request_payload_direct_land_flag_roundtrip_and_orthogonal);
 	UT_RUN(test_clean_xfer_master_decision_5_branches);
 	UT_RUN(test_clean_xfer_stale_break_predicate);
 	UT_DONE();

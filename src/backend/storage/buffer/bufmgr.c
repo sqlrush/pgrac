@@ -58,9 +58,11 @@
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
+#include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
+#include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -2025,6 +2027,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	ClusterHwClass hwc = CLUSTER_HW_NATIVE_LOCAL;
 	HwLock		hwlk;
 	ClusterResId hw_resid;
+	uint32		hw_lease_tail = 0;	/* spec-6.12d: parked grant tail */
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -2177,9 +2180,27 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * across nodes, so smgrzeroextend of distinct ranges is safe without it
 		 * held.  The authority may grant fewer blocks than requested; release
 		 * the surplus victim buffers (mirroring the extend_upto path below).
+		 *
+		 * PGRAC: spec-6.12d -- with static space affinity on, a plain-heap
+		 * extend over-asks the master (up to cluster.space_lease_blocks) so
+		 * the unconsumed tail of the grant can be parked as this node's
+		 * private lease: later writers on this node consume it without a
+		 * master round-trip (Q17-A extent-interior per-instance grouping).
+		 * Restricted to relkind 'r' main-fork extends without extend_upto,
+		 * the only shape the hio.c lease consumer serves.
 		 */
-		first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
-										  extend_by, seed_nblocks, &hw_granted);
+		{
+			uint32		hw_want = extend_by;
+
+			if (cluster_hw_lease_active() &&
+				extend_upto == InvalidBlockNumber &&
+				bmr.rel->rd_rel->relkind == RELKIND_RELATION &&
+				(uint32) cluster_space_lease_blocks > extend_by)
+				hw_want = (uint32) cluster_space_lease_blocks;
+
+			first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
+											  hw_want, seed_nblocks, &hw_granted);
+		}
 		cluster_hw_unlock(&hwlk);
 
 		if (first_block == InvalidBlockNumber || hw_granted == 0)
@@ -2212,6 +2233,18 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				UnpinBuffer(buf_hdr);
 			}
 			extend_by = hw_granted;
+		}
+		else
+		{
+			/*
+			 * PGRAC: spec-6.12d -- the over-ask surplus becomes this node's
+			 * lease.  It MUST also be zero-extended below: the HWM advance
+			 * for the whole grant is already durable, so leaving the tail
+			 * beyond EOF would break the dense-file contract (Q17-A) for
+			 * every EOF consumer.  Parked after the physical extension
+			 * succeeds.
+			 */
+			hw_lease_tail = hw_granted - extend_by;
 		}
 	}
 	else
@@ -2385,6 +2418,26 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * We don't need to set checksum for all-zero pages.
 	 */
 	smgrzeroextend(bmr.smgr, fork, first_block, extend_by, false);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12d -- physically materialize the lease tail of the HW
+	 * grant as zero pages (the file MUST stay dense up to the durably
+	 * advanced HWM) and only then park it.  No victim buffers exist for
+	 * these blocks -- they are disk-only zero pages, which is exactly what
+	 * keeps them out of the shared FSM (Q19-A #4) until a local writer
+	 * consumes them via the hio.c lease hook.  If smgrzeroextend throws,
+	 * no lease is installed and the range degrades to the documented
+	 * orphan-zero-page fail-safe once a later extend covers it.
+	 */
+	if (hw_lease_tail > 0)
+	{
+		smgrzeroextend(bmr.smgr, fork, first_block + extend_by,
+					   (int) hw_lease_tail, false);
+		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork,
+								 first_block + extend_by, hw_lease_tail);
+	}
+#endif
 
 	/*
 	 * Release the file-extension lock; it's now OK for someone else to extend
@@ -6213,6 +6266,7 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
  */
 
 #include "access/xlog.h"			/* XLogFlush */
+#include "cluster/cluster_gcs.h"	/* spec-6.12a ㉕ — downgrade notify (nowait) */
 #include "cluster/cluster_gcs_block.h"
 
 /*
@@ -6445,6 +6499,478 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 
 	cluster_bufmgr_unpin_for_gcs(buf);
 	return stable;
+}
+
+/*
+ * Borrow a live shared_buffers page for a registered RDMA SGE.
+ *
+ * This mirrors cluster_bufmgr_copy_block_for_gcs() through the HC82 WAL flush
+ * and HC89 single revalidation, but returns a raw-pinned page pointer instead
+ * of copying bytes.  content_lock is deliberately not held across return:
+ * callers must keep the existing end-to-end CRC fail-closed behavior because
+ * hint-bit or page-content drift after the revalidation can still make the
+ * shipped bytes differ from the pre-post checksum.  The raw pin only prevents
+ * buffer reuse while the asynchronous SEND is in flight.
+ */
+bool
+cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
+											 void **out_page_addr, BufferDesc **out_buf)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	XLogRecPtr	first_lsn;
+	XLogRecPtr	second_lsn;
+	int			retries;
+	Page		page;
+
+	Assert(out_page_lsn != NULL);
+	Assert(out_page_addr != NULL);
+	Assert(out_buf != NULL);
+
+	*out_page_lsn = InvalidXLogRecPtr;
+	*out_page_addr = NULL;
+	*out_buf = NULL;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	{
+		uint32		buf_state;
+
+		buf_state = LockBufHdr(buf);
+		if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+		{
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	}
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	page = (Page) BufHdrGetBlock(buf);
+
+	for (retries = 0; retries < 2; retries++)
+	{
+		LWLockAcquire(content_lock, LW_SHARED);
+		first_lsn = PageGetLSN(page);
+		LWLockRelease(content_lock);
+
+#ifdef USE_CLUSTER_UNIT
+		if (cluster_gcs_block_test_xlog_flush_hook != NULL)
+			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
+#endif
+		if (!XLogRecPtrIsInvalid(first_lsn))
+			XLogFlush(first_lsn);
+
+		LWLockAcquire(content_lock, LW_SHARED);
+		second_lsn = PageGetLSN(page);
+
+#ifdef USE_CLUSTER_UNIT
+		if (cluster_gcs_block_test_lsn_drift_hook != NULL)
+		{
+			int			drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
+
+			if (drift_remaining > retries)
+				second_lsn = first_lsn + 1;
+		}
+#endif
+
+		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn)
+		{
+			*out_page_lsn = second_lsn;
+			*out_page_addr = page;
+			*out_buf = buf;
+			LWLockRelease(content_lock);
+			return true;
+		}
+		LWLockRelease(content_lock);
+	}
+
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return false;
+}
+
+void
+cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf)
+{
+	if (buf != NULL)
+		cluster_bufmgr_unpin_for_gcs(buf);
+}
+
+/*
+ * Prepare a caller-pinned shared buffer as a direct-land target for a GCS block
+ * reply.  The target must already be tagged for the requested block, but it
+ * must not be visible as valid data.  We mark BM_IO_IN_PROGRESS so ordinary
+ * readers wait instead of observing RDMA-written bytes before the verifier has
+ * accepted the sidecar/header/checksum chain.
+ */
+bool
+cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag,
+												  void **out_page_addr)
+{
+	uint32		buf_state;
+
+	Assert(out_page_addr != NULL);
+
+	*out_page_addr = NULL;
+	if (buf == NULL)
+		return false;
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (buf_state & BM_TAG_VALID) == 0
+		|| (buf_state & BM_VALID) != 0
+		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	UnlockBufHdr(buf, buf_state);
+
+	if (!StartBufferIO(buf, true))
+		return false;
+
+	*out_page_addr = BufHdrGetBlock(buf);
+	return true;
+}
+
+/*
+ * Finish a direct-land target prepared by
+ * cluster_bufmgr_prepare_direct_land_target_for_gcs().  The caller guarantees
+ * any posted receive has completed or the block-reply lane was flushed/reset.
+ * On success, set the page LSN while holding content_lock and then publish
+ * BM_VALID through TerminateBufferIO.  On failure, leave the buffer invalid.
+ */
+void
+cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
+												 XLogRecPtr page_lsn)
+{
+	if (buf == NULL)
+		return;
+
+	if (valid)
+	{
+		LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
+		Page		page = (Page) BufHdrGetBlock(buf);
+
+		LWLockAcquire(content_lock, LW_EXCLUSIVE);
+		PageSetLSN(page, page_lsn);
+		LWLockRelease(content_lock);
+		TerminateBufferIO(buf, false, BM_VALID);
+	}
+	else
+		TerminateBufferIO(buf, false, 0);
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a (quiescent X->S downgrade).
+ *
+ *   cluster_bufmgr_downgrade_x_to_s_for_gcs(tag) — master==holder serve-side
+ *   self-downgrade so a cross-node read becomes a durable S grant instead of
+ *   a one-shot read image.  Under the buffer content_lock EXCLUSIVE:
+ *
+ *     1. Bail (false) unless our copy holds PCM X and the page is quiescent
+ *        (no ACTIVE / LOCK_ONLY_ACTIVE ITL slot).
+ *     2. FlushBuffer when dirty — makes shared storage CURRENT before any
+ *        S copy exists, so the pre-existing S invalidate + storage-fallback
+ *        machinery stays trivially correct (every S copy in the cluster is
+ *        storage-consistent; no PI needed until spec-6.12h).  FlushBuffer
+ *        performs its own XLogFlush(page_lsn) WAL-before-data.
+ *     3. Apply the master-side PCM_TRANS_X_TO_S_DOWNGRADE (caller
+ *        guarantees this node is the block master AND the recorded X
+ *        holder), then flip the local pcm_state cache X -> S.
+ *
+ *   Holding the content_lock EXCLUSIVE across flush + flip closes the
+ *   local-writer race: a writer that arrives after the flip sees S, which
+ *   does not cover X, so its LockBuffer(EXCLUSIVE) takes the full S->X
+ *   upgrade round-trip (spec-2.36 invalidate-then-grant) — the write-
+ *   permission revocation the downgrade requires (Rule 8.A).
+ *
+ *   Any bail-out leaves state exactly as found (a completed flush is
+ *   harmless).  Runs in the LMON IC-dispatch context; the FlushBuffer
+ *   call mirrors the checkpointer contract (pin + content lock held).
+ * ======================================================================== */
+bool
+cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	uint32		buf_state;
+	bool		dirty;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	LWLockAcquire(content_lock, LW_EXCLUSIVE);
+
+	/*
+	 * Re-verify under the content lock: still our tag, still PCM X, and
+	 * quiescent.  An ACTIVE ITL slot means a local transaction still needs
+	 * this in-memory copy for its commit stamp (the P0-2 dependency) — the
+	 * caller falls back to the one-shot read-image ship.
+	 */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (PcmState) buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
+	{
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf_state = LockBufHdr(buf);
+	dirty = (buf_state & BM_DIRTY) != 0;
+	UnlockBufHdr(buf, buf_state);
+
+	if (dirty)
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+
+	if (!cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE,
+											   cluster_node_id))
+	{
+		/* Master refused (state moved under us) — leave local X untouched. */
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf->pcm_state = (uint8) PCM_STATE_S;
+
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12g (block self-containment,
+ * opportunistic commit cleanout).
+ *
+ *   cluster_bufmgr_lock_resident_for_stamp(rlocator, forknum, blocknum) —
+ *   a NO-FETCH resident-buffer acquire for the commit-time ITL stamp path.
+ *   Returns a normally-pinned + content-lock-EXCLUSIVE Buffer iff the block
+ *   is ALREADY resident in this backend's buffer pool; InvalidBuffer
+ *   otherwise (never reads from storage / cache-fusion).
+ *
+ *   Residency IS the ownership proof under spec-6.12g: a self-contained
+ *   X-transfer (cluster_gcs_block.c D-g2) InvalidateBuffer-drops the
+ *   holder's copy as it ships, so a block still resident here was NOT
+ *   transferred away and its ITL slots are ours to stamp.  Stamping a
+ *   re-fetched copy of a block we no longer own would either trip the
+ *   P0-2 stamp assert or (worse) later flush a stale image over the new
+ *   holder's version -- hence the NO-FETCH contract (a freshly-fetched
+ *   buffer's pcm_state is not an authoritative ownership signal).
+ *
+ *   Caller MUST release with cluster_bufmgr_unlock_resident_stamp().  Runs
+ *   in a backend at commit (has a resource owner), so the standard
+ *   PinBuffer_Locked / ReleaseBuffer accounting applies (unlike the LMON
+ *   raw-pin helpers).
+ * ======================================================================== */
+Buffer
+cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
+									   BlockNumber blocknum)
+{
+	BufferTag	tag;
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+
+	InitBufferTag(&tag, &rlocator, forknum, blocknum);
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	ReservePrivateRefCountEntry();
+	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		/* Not resident -> transferred away (or never cached).  Skip stamp. */
+		LWLockRelease(partition_lock);
+		return InvalidBuffer;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	/* Pin under the header spinlock, then drop the partition lock (the pin
+	 * keeps the identity stable), and take the content lock EXCLUSIVE for the
+	 * GenericXLog stamp mutation. */
+	/*
+	 * PGRAC: spec-6.12g bugfix — PinBuffer (NOT PinBuffer_Locked) because the
+	 * committing backend may ALREADY hold a pin on this block (a same-txn DML
+	 * that has not yet released it).  PinBuffer_Locked asserts a first-time
+	 * pin (Assert(GetPrivateRefCountEntry(...) == NULL)) and crashes the whole
+	 * postmaster under concurrent write load; PinBuffer handles the
+	 * already-pinned case (bumps the existing private refcount).  The standard
+	 * buffer-hit path (BufferAlloc) pins the same way while holding the
+	 * partition lock, so this is a legal call sequence.
+	 */
+	(void)PinBuffer(buf, NULL);
+	LWLockRelease(partition_lock);
+
+	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+
+	/* Re-validate under the content lock: a concurrent transfer could have
+	 * evicted + reused this descriptor between the pin and the lock. */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (pg_atomic_read_u32(&buf->state) & BM_VALID) == 0)
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		ReleaseBuffer(BufferDescriptorGetBuffer(buf));
+		return InvalidBuffer;
+	}
+
+	return BufferDescriptorGetBuffer(buf);
+}
+
+void
+cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
+{
+	BufferDesc *buf;
+
+	if (!BufferIsValid(buffer))
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
+	ReleaseBuffer(buffer);
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a ㉕ (remote-holder X->S
+ * downgrade).
+ *
+ *   cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(tag, master_node) — the
+ *   REMOTE-holder twin of cluster_bufmgr_downgrade_x_to_s_for_gcs above.
+ *   Runs on the X HOLDER when the block's GCS master is a DIFFERENT node
+ *   (the master forwarded an N->S read with the downgrade-request flag).
+ *   Steps 1-2 (verify X + quiescent under the content_lock EXCLUSIVE,
+ *   FlushBuffer when dirty) are identical to the local variant.  Step 3
+ *   differs: the master PCM entry lives on master_node, so the
+ *   PCM_TRANS_X_TO_S_DOWNGRADE is delivered as a fire-and-forget wire
+ *   notify (cluster_gcs_send_transition_nowait) — this handler runs in the
+ *   LMON IC-dispatch context, which structurally cannot block on a reply it
+ *   would have to deliver itself.  The local pcm_state flips X->S ONLY
+ *   after the notify was handed to the transport; a send failure bails with
+ *   every state exactly as found (master unchanged, local X kept).
+ *
+ *   Safety of not observing the master's verdict: while this node holds a
+ *   local X (verified under the content_lock), the master's recorded
+ *   x_holder for the tag must be this node in the same epoch — every
+ *   transfer path destroys the holder's local X copy first, so a same-epoch
+ *   x_holder mismatch is unreachable; the notify carries the current epoch
+ *   and a post-reconfig master rejects it stale (HC73), where the epoch
+ *   cache-invalidation sweep already handles surviving copies.  A LOST
+ *   notify leaves master=X@us, local=S: our own writes then take the S->X
+ *   upgrade round-trip which fails closed until re-converged, and the
+ *   requester's registration try-ACK fails closed to one-shot semantics —
+ *   no path serves a copy the master does not track (Rule 8.A).
+ * ======================================================================== */
+bool
+cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	uint32		buf_state;
+	bool		dirty;
+
+	if (master_node < 0 || master_node == cluster_node_id)
+		return false;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	LWLockAcquire(content_lock, LW_EXCLUSIVE);
+
+	/* Same re-verify as the local variant: tag, PCM X, quiescent. */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (PcmState) buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
+	{
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf_state = LockBufHdr(buf);
+	dirty = (buf_state & BM_DIRTY) != 0;
+	UnlockBufHdr(buf, buf_state);
+
+	if (dirty)
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+
+	if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node))
+	{
+		/* Notify not handed to transport — keep local X, master unchanged. */
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf->pcm_state = (uint8) PCM_STATE_S;
+
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return true;
 }
 
 /*
@@ -6734,9 +7260,74 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
 		XLogFlush(page_lsn);
 
-	InvalidateBuffer(buf);
+	/*
+	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — InvalidateBuffer requires the
+	 * buffer header spinlock held at ENTRY (it Assert()s BM_LOCKED) and
+	 * releases it internally.  The bare call here previously ran with the
+	 * header unlocked; it never fired because the invalidate handler's
+	 * remote-holder path short-circuited before reaching the drop (see the
+	 * matching handler fix), so the first real caller tripped the assert.
+	 * Re-lock, re-validate the mapping (the buffer may have been evicted /
+	 * retagged while unpinned during XLogFlush), and clear the residency
+	 * mode under the lock so InvalidateBuffer's eviction hook sees
+	 * PCM_STATE_N and skips the remote-master release wire (the §3.5 LMON
+	 * context has no backend slot to send one — same BLOCKER A contract as
+	 * cluster_bufmgr_drop_block_for_gcs_no_wire below).
+	 */
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	buf->pcm_state = (uint8) PCM_STATE_N;
+	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a ㉕.
+ *
+ *   cluster_bufmgr_block_pcm_state(tag) — the resident buffer's node-local
+ *   PCM residency mirror for `tag` (PCM_STATE_N when the block is not
+ *   resident).  The INVALIDATE envelope handler needs the HOLDER-side view:
+ *   consulting cluster_pcm_lock_query there reads the local MASTER hash
+ *   table, which on a non-master holder has no entry and always answers N —
+ *   the latent pre-㉕ bug that made every remote-holder INVALIDATE
+ *   short-circuit to "already invalidated" while the cached S copy silently
+ *   survived (Rule 8.A stale-S hazard, masked on the phantom-shared harness
+ *   by the AD-015 divergence honesty note).
+ * ======================================================================== */
+PcmLockMode
+cluster_bufmgr_block_pcm_state(BufferTag tag)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	PcmLockMode mode = PCM_LOCK_MODE_N;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return PCM_LOCK_MODE_N;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0)
+		mode = (PcmLockMode) buf->pcm_state;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	return mode;
 }
 
 /* ========================================================================
@@ -6983,14 +7574,29 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
  *   diverging from the holder's X copy — a silent lost-update (Rule 8.A).  The
  *   cluster_itl forward-write allocation path fails closed (53R9H, retryable)
  *   when this returns false.
+ *
+ *   PGRAC modifications by SqlRush (spec-6.12a):
+ *   What changed: with cluster.read_scache on, PCM_STATE_S also denies the
+ *   forward ITL write.  Why: the quiescent X->S downgrade turns S into a
+ *   revoked-write state whose copies other nodes may serve reads from; a
+ *   legal writer re-acquires X via LockBuffer (S does not cover X) BEFORE
+ *   reaching this gate, so denying S here only backstops paths that skipped
+ *   the coherence upgrade (write-gate polarity flip, Rule 8.A).  Off keeps
+ *   the deny-list byte-identical to the spec-5.2 baseline.
  * ======================================================================== */
 bool
 cluster_bufmgr_block_write_permitted(Buffer buffer)
 {
+	PcmState	state;
+
 	if (BufferIsLocal(buffer))
 		return true;			/* temp / local buffers are never CF-shared */
-	return ((PcmState) GetBufferDescriptor(buffer - 1)->pcm_state)
-		!= PCM_STATE_READ_IMAGE;
+	state = (PcmState) GetBufferDescriptor(buffer - 1)->pcm_state;
+	if (state == PCM_STATE_READ_IMAGE)
+		return false;
+	if (cluster_read_scache && state == PCM_STATE_S)
+		return false;			/* spec-6.12a: S is a revoked-write state */
+	return true;
 }
 
 #endif							/* USE_PGRAC_CLUSTER */

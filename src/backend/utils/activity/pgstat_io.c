@@ -371,6 +371,14 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_SINVAL_BCAST:
 			return true;
 
+		/* PGRAC: spec-6.12a -- LMON flushes relation buffers in the
+		 * quiescent X->S downgrade (cluster_bufmgr_downgrade_x_to_s_for_gcs
+		 * -> FlushBuffer -> pgstat_count_io_op_time); untracked would trip
+		 * the pgstat_tracks_io_op() Assert on cassert builds (same pattern
+		 * as B_SINVAL_BCAST above). */
+		case B_LMON:
+			return true;
+
 		/* PGRAC: cluster aux types that do not perform buffer-manager IO. */
 		case B_CLUSTER_STATS:
 		case B_CSSD:
@@ -379,7 +387,6 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_INTERCONNECT:
 		case B_LCK:
 		case B_LMD:
-		case B_LMON:
 		case B_LMS:
 		case B_LMS_WORKER:
 		case B_MRP:

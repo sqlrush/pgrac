@@ -10,6 +10,11 @@
  * IDENTIFICATION
  *	  src/backend/access/nbtree/nbtutils.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - btoptions: parse the cluster_reverse_key reloption.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -2135,7 +2140,12 @@ btoptions(Datum reloptions, bool validate)
 		{"vacuum_cleanup_index_scale_factor", RELOPT_TYPE_REAL,
 		offsetof(BTOptions, vacuum_cleanup_index_scale_factor)},
 		{"deduplicate_items", RELOPT_TYPE_BOOL,
-		offsetof(BTOptions, deduplicate_items)}
+		offsetof(BTOptions, deduplicate_items)},
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: spec-6.12f -- reverse-key reloption (cluster builds only). */
+		{"cluster_reverse_key", RELOPT_TYPE_BOOL,
+		offsetof(BTOptions, cluster_reverse_key)},
+#endif
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

@@ -146,8 +146,8 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'116',
-	'E1 pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	'118',
+	'E1 pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -159,7 +159,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'116', 'E4 pg_stat_gcluster_wait_events returns 116 rows (single-node, spec-6.2 Smart Fusion authority waits)');
+	'118', 'E4 pg_stat_gcluster_wait_events returns 118 rows (single-node, spec-6.13 RDMA wait surface)');
 
 
 # ============================================================
@@ -330,7 +330,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'148', 'M1 148 injection points (spec-5.18 +7 cluster-node-remove-*; spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-2.41 +1 gcs-block-stale-ship; spec-5.7 D6 +1 ko-peer-skip-ack; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'150', 'M1 150 injection points (spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.18 +7 cluster-node-remove-*; spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-2.41 +1 gcs-block-stale-ship; spec-5.7 D6 +1 ko-peer-skip-ack; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -360,8 +360,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '296',
-	'M5 inject category has 148×2 = 296 sub-keys (.fault_type + .hits; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	) eq '300',
+	'M5 inject category has 150×2 = 300 sub-keys (.fault_type + .hits; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
@@ -395,8 +395,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_profile',
-	'O2 pg_cluster_state has all 52 categories (spec-6.2 adds smart_fusion)');
+	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_lever,xnode_profile',
+	'O2 pg_cluster_state has all 53 categories (spec-6.12 adds xnode_lever; spec-6.2 adds smart_fusion)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

@@ -14,6 +14,14 @@
  * IDENTIFICATION
  *	  src/backend/access/nbtree/nbtree.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - btinsert: byte-reverse the leading key of a reverse-key index.
+ *	  - btrescan: normalize + byte-reverse equality scan keys for a
+ *	    reverse-key index (fail closed on non-equality keys).
+ *	  - btcanreturn: disable index-only scans on reverse-key indexes.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -21,6 +29,9 @@
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
 #include "access/relscan.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
+#endif
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "commands/progress.h"
@@ -195,6 +206,19 @@ btinsert(Relation rel, Datum *values, bool *isnull,
 {
 	bool		result;
 	IndexTuple	itup;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- reverse-key.  Byte-reverse the leading integer
+	 * key datum before forming the tuple so a monotonic sequence scatters
+	 * across leaf pages.  The build-time validator guaranteed a single
+	 * supported integer key, so values[0] is a non-null pass-by-value
+	 * integer here (a NULL leading key would not benefit and is left as-is).
+	 */
+	if (BTGetClusterReverseKey(rel) && !isnull[0])
+		values[0] = cluster_reverse_key_encode(
+			values[0], TupleDescAttr(RelationGetDescr(rel), 0)->attlen);
+#endif
 
 	/* generate an index tuple */
 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
@@ -436,9 +460,29 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	 * Reset the scan keys
 	 */
 	if (scankey && scan->numberOfKeys > 0)
+	{
 		memmove(scan->keyData,
 				scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-6.12f -- reverse-key.  The stored keys are
+		 * byte-reversed, so an equality search key must be reversed too
+		 * before descent (with cross-type probes first normalized to the
+		 * key type; byte-reversal is a bijection only at equal width).  Do
+		 * this ONLY here, tied to the fresh copy of the caller's scankey --
+		 * reversing in place unconditionally would double-reverse across a
+		 * keep-keys rescan (scankey == NULL) and search for the un-reversed
+		 * value.  Non-equality keys make the helper fail closed (planner
+		 * contract violation, Q18-A) rather than return wrong rows.
+		 */
+		if (BTGetClusterReverseKey(scan->indexRelation))
+			cluster_reverse_key_transform_scankeys(scan->indexRelation,
+												   scan->keyData,
+												   scan->numberOfKeys);
+#endif
+	}
 	so->numberOfKeys = 0;		/* until _bt_preprocess_keys sets it */
 
 	/* If any keys are SK_SEARCHARRAY type, set up array-key info */
@@ -1424,5 +1468,15 @@ btreevacuumposting(BTVacState *vstate, IndexTuple posting,
 bool
 btcanreturn(Relation index, int attno)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- a reverse-key index stores byte-reversed key
+	 * datums, so it cannot return the original column value for an
+	 * index-only scan.  Disable IOS for such indexes (the planner then
+	 * fetches from the heap).
+	 */
+	if (BTGetClusterReverseKey(index))
+		return false;
+#endif
 	return true;
 }

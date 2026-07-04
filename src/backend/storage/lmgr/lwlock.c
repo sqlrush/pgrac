@@ -206,6 +206,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterNodeRemove",
 	/* PGRAC LWTRANCHE_CLUSTER_BACKUP (spec-6.5): */
 	"ClusterBackup",
+	/* PGRAC LWTRANCHE_CLUSTER_HW_LEASE (spec-6.12d): */
+	"ClusterHwLease",
 	/* PGRAC LWTRANCHE_CLUSTER_STATS: */
 	"ClusterStats",
 	/* PGRAC LWTRANCHE_CLUSTER_SCN: */

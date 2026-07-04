@@ -1626,6 +1626,12 @@ if test "$with_rdma" = yes; then
                   [AC_MSG_ERROR([infiniband/verbs.h header file is required for RDMA])])
   AC_CHECK_HEADER(rdma/rdma_cma.h, [],
                   [AC_MSG_ERROR([rdma/rdma_cma.h header file is required for RDMA])])
+  AC_CHECK_HEADER(infiniband/mlx5dv.h,
+                  [AC_CHECK_LIB(mlx5, mlx5dv_query_device,
+                                [AC_DEFINE([HAVE_MLX5DV], 1,
+                                           [Define to 1 when mlx5 direct verbs are available for pgrac RDMA tier3.])],
+                                [])],
+                  [])
 fi
 
 if test "$with_gssapi" = yes ; then

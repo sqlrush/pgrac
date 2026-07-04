@@ -45,6 +45,7 @@
 #include "cluster/cluster_cssd.h" /* spec-4.6 D4 — dead-master block-path guard */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
@@ -53,12 +54,14 @@
 #include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D2/D3/D4 profiling buckets */
+#include "cluster/cluster_xnode_lever.h"	/* spec-6.12a — downgrade counters */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
@@ -91,7 +94,8 @@
  *	backend slot without scanning all backends.
  * ============================================================ */
 
-#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND 8
+#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND \
+	CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
@@ -121,6 +125,16 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	uint64 request_epoch;
 	int32 expected_master_node;
 	bool stale;
+	uint32 direct_generation;
+	ClusterGcsBlockDirectState direct_state;
+	int32 direct_expected_peer;
+	uint32 direct_arm_id;
+	ClusterGcsBlockDirectTargetKind direct_target_kind;
+	BufferDesc *direct_target_buf;
+	void *direct_target_addr;
+	uint32 direct_target_lkey;
+	bool direct_target_prepared;
+	ClusterGcsBlockDirectAbortReason direct_abort_reason;
 } ClusterGcsBlockOutstandingSlot;
 
 typedef struct ClusterGcsBlockBackendBlock {
@@ -217,6 +231,18 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint32 invalidate_broadcast_acked_bm;	   /* holders ack'd so far */
 	LWLockPadded invalidate_broadcast_lock;			   /* protects identity + ack bitmap */
 	ConditionVariable invalidate_broadcast_cv;
+	/* PGRAC: spec-6.12a — request-id source for the LOCAL-master S->X
+	 * upgrade's invalidate broadcast (backend-context caller has no wire
+	 * request to borrow an id from; uniqueness vs stale acks is all the
+	 * slot needs). */
+	pg_atomic_uint64 local_upgrade_request_seq;
+	/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+	pg_atomic_uint64 scratch_copy_count;
+	pg_atomic_uint64 live_sge_send_count;
+	pg_atomic_uint64 live_sge_fallback_count;
+	pg_atomic_uint64 direct_install_count;
+	pg_atomic_uint64 direct_install_abort_count;
+	pg_atomic_uint64 install_copy_count;
 } ClusterGcsBlockShared;
 
 
@@ -244,12 +270,12 @@ static void gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot);
 static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req,
 								 GcsBlockReplyStatus status, XLogRecPtr page_lsn,
 								 const char *block_data);
-static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_lsn,
-									 char *copy_buf, const char **out_block_payload,
-									 uint32 *out_block_lkey,
-									 ClusterICSgeReleaseCallback *out_release_cb,
-									 void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
-									 bool *out_sf_dep_valid);
+static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
+									  XLogRecPtr *out_page_lsn, char *copy_buf,
+									  const char **out_block_payload, uint32 *out_block_lkey,
+									  ClusterICSgeReleaseCallback *out_release_cb,
+									  void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
+									  bool *out_sf_dep_valid);
 static void gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *release_arg);
 static uint32 gcs_block_compute_checksum(const char *block_data);
 static uint32 gcs_block_compute_invalidate_checksum(const GcsBlockInvalidatePayload *inv);
@@ -373,6 +399,15 @@ cluster_gcs_block_shmem_init(void)
 		LWLockInitialize(&ClusterGcsBlock->invalidate_broadcast_lock.lock,
 						 LWTRANCHE_CLUSTER_GCS_BLOCK);
 		ConditionVariableInit(&ClusterGcsBlock->invalidate_broadcast_cv);
+		/* PGRAC: spec-6.12a — local-upgrade broadcast id source. */
+		pg_atomic_init_u64(&ClusterGcsBlock->local_upgrade_request_seq, 0);
+		/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy counters init. */
+		pg_atomic_init_u64(&ClusterGcsBlock->scratch_copy_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_send_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_fallback_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_abort_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->install_copy_count, 0);
 
 		if (gcs_block_backend_blocks == NULL)
 			return;
@@ -394,6 +429,16 @@ cluster_gcs_block_shmem_init(void)
 				slot->request_epoch = 0; /* spec-2.34 HC100 */
 				slot->expected_master_node = -1;
 				slot->stale = false;
+				slot->direct_generation = 0;
+				slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+				slot->direct_expected_peer = -1;
+				slot->direct_arm_id = 0;
+				slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+				slot->direct_target_buf = NULL;
+				slot->direct_target_addr = NULL;
+				slot->direct_target_lkey = 0;
+				slot->direct_target_prepared = false;
+				slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
 				ConditionVariableInit(&slot->reply_cv);
 			}
 		}
@@ -458,6 +503,15 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 			slot->request_epoch = 0;
 			slot->expected_master_node = master_node;
 			slot->stale = false;
+			slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+			slot->direct_expected_peer = -1;
+			slot->direct_arm_id = 0;
+			slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+			slot->direct_target_buf = NULL;
+			slot->direct_target_addr = NULL;
+			slot->direct_target_lkey = 0;
+			slot->direct_target_prepared = false;
+			slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
 			*out_request_id = slot->request_id;
 			break;
 		}
@@ -491,7 +545,135 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 	slot->request_epoch = 0; /* spec-2.34 HC100 */
 	slot->expected_master_node = -1;
 	slot->stale = false;
+	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+	slot->direct_expected_peer = -1;
+	slot->direct_arm_id = 0;
+	slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+	slot->direct_target_buf = NULL;
+	slot->direct_target_addr = NULL;
+	slot->direct_target_lkey = 0;
+	slot->direct_target_prepared = false;
+	slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
 	LWLockRelease(&blk->lock.lock);
+}
+
+static uint32
+gcs_block_direct_arm_id(int backend_idx, int slot_idx)
+{
+	return (uint32)(backend_idx * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND + slot_idx);
+}
+
+static bool
+gcs_block_direct_decode_arm_id(uint32 arm_id, int *backend_idx, int *slot_idx)
+{
+	uint32 cap = (uint32)MaxBackends * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
+
+	if (arm_id >= cap)
+		return false;
+	if (backend_idx != NULL)
+		*backend_idx = (int)(arm_id / MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	if (slot_idx != NULL)
+		*slot_idx = (int)(arm_id % MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	return true;
+}
+
+static int
+gcs_block_slot_index(ClusterGcsBlockBackendBlock *blk, ClusterGcsBlockOutstandingSlot *slot)
+{
+	ptrdiff_t idx;
+
+	Assert(blk != NULL);
+	Assert(slot != NULL);
+	idx = slot - &blk->slots[0];
+	Assert(idx >= 0 && idx < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	return (int)idx;
+}
+
+static void
+gcs_block_direct_finish_target(BufferDesc *target_buf, bool prepared, bool valid,
+							   XLogRecPtr page_lsn)
+{
+	if (target_buf != NULL && prepared)
+		cluster_bufmgr_finish_direct_land_target_for_gcs(target_buf, valid, page_lsn);
+}
+
+static uint32
+gcs_block_direct_envelope_crc(const ClusterICEnvelope *env, const GcsBlockReplyHeader *hdr,
+							  const void *page)
+{
+	pg_crc32c crc;
+	const uint8 *env_bytes = (const uint8 *)env;
+	const size_t crc_offset = offsetof(ClusterICEnvelope, payload_crc32c);
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, env_bytes, crc_offset);
+	COMP_CRC32C(crc, hdr, sizeof(*hdr));
+	COMP_CRC32C(crc, page, GCS_BLOCK_DATA_SIZE);
+	FIN_CRC32C(crc);
+	return (uint32)crc;
+}
+
+static bool
+gcs_block_direct_prepare_attempt(ClusterGcsBlockOutstandingSlot *slot, BufferDesc *buf,
+								 BufferTag tag, PcmLockTransition transition_id,
+								 int32 expected_peer)
+{
+	ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+	void *page_addr = NULL;
+	int backend_idx = MyBackendId - 1;
+	int slot_idx;
+	int32 holder_node;
+
+	if (slot == NULL || buf == NULL)
+		return false;
+	if (transition_id != PCM_TRANS_N_TO_S)
+		return false;
+	holder_node = cluster_pcm_master_holder_node_by_tag(tag);
+	if (!GcsBlockDirectCanArmExpectedPeer(holder_node, expected_peer))
+		return false;
+	if (!cluster_ic_rdma_block_reply_lane_connected(expected_peer, NULL))
+		return false;
+	if (!cluster_bufmgr_prepare_direct_land_target_for_gcs(buf, tag, &page_addr))
+		return false;
+
+	slot_idx = gcs_block_slot_index(blk, slot);
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot->direct_generation = cluster_ic_rdma_direct_land_next_generation(slot->direct_generation);
+	slot->direct_state = GCS_BLOCK_DIRECT_ARMING;
+	slot->direct_expected_peer = expected_peer;
+	slot->direct_arm_id = gcs_block_direct_arm_id(backend_idx, slot_idx);
+	slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_SHARED_BUFFER;
+	slot->direct_target_buf = buf;
+	slot->direct_target_addr = page_addr;
+	slot->direct_target_lkey = 0;
+	slot->direct_target_prepared = true;
+	slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
+	LWLockRelease(&blk->lock.lock);
+	return true;
+}
+
+static bool
+gcs_block_direct_mark_aborting(ClusterGcsBlockOutstandingSlot *slot,
+							   ClusterGcsBlockDirectAbortReason reason)
+{
+	ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+	bool marked = false;
+
+	if (slot == NULL)
+		return false;
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	if (slot->in_use
+		&& (slot->direct_state == GCS_BLOCK_DIRECT_ARMED
+			|| slot->direct_state == GCS_BLOCK_DIRECT_ARMING
+			|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED)) {
+		slot->direct_state = GCS_BLOCK_DIRECT_ABORTING;
+		slot->direct_abort_reason = reason;
+		marked = true;
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (marked)
+		cluster_lmon_wakeup();
+	return marked;
 }
 
 
@@ -510,6 +692,14 @@ gcs_block_compute_checksum(const char *block_data)
 	return (uint32)crc;
 }
 
+/* PGRAC: spec-6.12b — public checksum for the CR-server reply builder
+ * (cluster_cr_server.c ships GCS_BLOCK_REPLY frames from the LMON tick). */
+uint32
+cluster_gcs_block_compute_checksum(const char *block_data)
+{
+	return gcs_block_compute_checksum(block_data);
+}
+
 static void
 gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *release_arg)
 {
@@ -517,14 +707,132 @@ gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *relea
 		release_cb(release_arg);
 }
 
+static void
+gcs_block_note_scratch_copy(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->scratch_copy_count, 1);
+}
+
+static void
+gcs_block_note_live_sge_fallback(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->live_sge_fallback_count, 1);
+}
+
+static void
+gcs_block_note_live_sge_send(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->live_sge_send_count, 1);
+}
+
+static void
+gcs_block_note_install_copy(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->install_copy_count, 1);
+}
+
+static void
+gcs_block_note_direct_install(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->direct_install_count, 1);
+}
+
+static void
+gcs_block_note_direct_abort(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->direct_install_abort_count, 1);
+}
+
+static void
+gcs_block_release_live_sge(void *arg)
+{
+	cluster_bufmgr_release_block_for_gcs_live_sge((BufferDesc *)arg);
+}
+
+static ClusterICSendResult
+gcs_block_send_direct_reply_sge(int32 dest_node, const GcsBlockReplyHeader *hdr,
+								const char *block_payload, uint32 block_lkey,
+								ClusterICSgeReleaseCallback release_cb, void *release_arg)
+{
+	ClusterICSge sge[2];
+	char *zero_page = NULL;
+	ClusterICSendResult rc;
+
+	if (hdr == NULL)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+
+	if (block_payload == NULL) {
+		zero_page = (char *)palloc0(GCS_BLOCK_DATA_SIZE);
+		block_payload = zero_page;
+		block_lkey = 0;
+		release_cb = NULL;
+		release_arg = NULL;
+	}
+
+	memset(sge, 0, sizeof(sge));
+	sge[0].addr = (void *)hdr;
+	sge[0].len = sizeof(*hdr);
+	sge[1].addr = (void *)block_payload;
+	sge[1].len = GCS_BLOCK_DATA_SIZE;
+	sge[1].lkey = block_lkey;
+	sge[1].release_cb = release_cb;
+	sge[1].release_arg = release_arg;
+	rc = cluster_ic_rdma_send_block_reply_direct(dest_node, sge, lengthof(sge),
+												 GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+	if (zero_page != NULL)
+		pfree(zero_page);
+	return rc;
+}
+
 static bool
-gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_lsn, char *copy_buf,
+gcs_block_try_send_direct_reply(int32 dest_node, bool direct_armed, GcsBlockReplyHeader *hdr,
+								const char *block_payload, uint32 block_lkey,
+								ClusterICSgeReleaseCallback release_cb, void *release_arg)
+{
+	ClusterICSendResult rc;
+	GcsBlockReplyHeader denial;
+	char zero_page[GCS_BLOCK_DATA_SIZE];
+	GcsBlockReplyStatus status;
+
+	if (!direct_armed || hdr == NULL)
+		return false;
+
+	status = (GcsBlockReplyStatus)hdr->status;
+	if (!GcsBlockReplyStatusIsDirectLandSendable(status)) {
+		memset(&denial, 0, sizeof(denial));
+		denial = *hdr;
+		denial.page_lsn = 0;
+		denial.status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+		memset(zero_page, 0, sizeof(zero_page));
+		denial.checksum = gcs_block_compute_checksum(zero_page);
+		rc = gcs_block_send_direct_reply_sge(dest_node, &denial, zero_page, 0, NULL, NULL);
+		if (release_cb != NULL)
+			release_cb(release_arg);
+	} else
+		rc = gcs_block_send_direct_reply_sge(dest_node, hdr, block_payload, block_lkey,
+											 release_cb, release_arg);
+
+	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+	return true;
+}
+
+static bool
+gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
+						 XLogRecPtr *out_page_lsn, char *copy_buf,
 						 const char **out_block_payload, uint32 *out_block_lkey,
 						 ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg,
 						 ClusterSfDepVec *out_sf_dep_vec, bool *out_sf_dep_valid)
 {
 	void *scratch = NULL;
 	uint32 scratch_lkey = 0;
+	bool rdma_sge_supported;
 	bool smart_fusion_reply;
 
 	if (out_block_payload != NULL)
@@ -541,9 +849,31 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 		cluster_sf_dep_vec_reset(out_sf_dep_vec);
 
 	smart_fusion_reply = cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(dest_node);
+	rdma_sge_supported = cluster_ic_rdma_block_sge_supported(NULL)
+						 && cluster_ic_mux_peer_transport(dest_node) == CLUSTER_IC_PEER_TRANSPORT_RDMA;
 
-	if (cluster_ic_rdma_block_sge_supported(NULL)
-		&& cluster_ic_mux_peer_transport(dest_node) == CLUSTER_IC_PEER_TRANSPORT_RDMA) {
+	if (allow_live_sge && !smart_fusion_reply && rdma_sge_supported) {
+		void *live_page = NULL;
+		BufferDesc *live_buf = NULL;
+		uint32 live_lkey = 0;
+
+		if (cluster_bufmgr_borrow_block_for_gcs_live_sge(tag, out_page_lsn, &live_page, &live_buf)) {
+			if (cluster_ic_rdma_shared_buffers_sge(live_page, GCS_BLOCK_DATA_SIZE, &live_lkey)) {
+				*out_block_payload = (const char *)live_page;
+				if (out_block_lkey != NULL)
+					*out_block_lkey = live_lkey;
+				if (out_release_cb != NULL)
+					*out_release_cb = gcs_block_release_live_sge;
+				if (out_release_arg != NULL)
+					*out_release_arg = live_buf;
+				return true;
+			}
+			cluster_bufmgr_release_block_for_gcs_live_sge(live_buf);
+		}
+		gcs_block_note_live_sge_fallback();
+	}
+
+	if (rdma_sge_supported) {
 		void *release_arg = NULL;
 		ClusterICSgeReleaseCallback release_cb = NULL;
 
@@ -561,6 +891,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 					release_cb(release_arg);
 				return false;
 			}
+			gcs_block_note_scratch_copy();
 			if (smart_fusion_reply && out_sf_dep_valid != NULL)
 				*out_sf_dep_valid = true;
 			*out_block_payload = (const char *)scratch;
@@ -572,6 +903,8 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 				*out_release_arg = release_arg;
 			return true;
 		}
+		if (allow_live_sge)
+			gcs_block_note_live_sge_fallback();
 	}
 
 	if (smart_fusion_reply) {
@@ -580,8 +913,11 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 			return false;
 		if (out_sf_dep_valid != NULL)
 			*out_sf_dep_valid = true;
+		gcs_block_note_scratch_copy();
 	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf))
 		return false;
+	else
+		gcs_block_note_scratch_copy();
 	*out_block_payload = copy_buf;
 	if (out_block_lkey != NULL)
 		*out_block_lkey = 0;
@@ -663,6 +999,7 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
+	gcs_block_note_install_copy();
 	PageSetLSN(page, page_lsn);
 	LWLockRelease(content_lock);
 }
@@ -916,6 +1253,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool read_image = false; /* spec-5.2 D2: one-shot read image, non-durable */
 	bool terminal_denied = false;
 	bool retransmit_warning_emitted = false;
+	bool suppress_direct_land = false;
 	uint8 final_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
 	int32 final_forwarding_master = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 	XLogRecPtr final_page_lsn = InvalidXLogRecPtr;
@@ -991,6 +1329,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
 			TimestampTz deadline;
 			bool got_reply = false;
+			bool direct_authoritative_denial = false;
 
 			/* Apply backoff for retry attempts (not the initial send). */
 			if (retry_attempt > 0) {
@@ -1049,8 +1388,20 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				slot->request_epoch = payload.epoch;
 				slot->expected_master_node = current_master;
 				slot->stale = false;
+				slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+				slot->direct_expected_peer = -1;
+				slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+				slot->direct_target_buf = NULL;
+				slot->direct_target_addr = NULL;
+				slot->direct_target_lkey = 0;
+				slot->direct_target_prepared = false;
+				slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
 				LWLockRelease(&blk->lock.lock);
 			}
+
+			if (!suppress_direct_land)
+				(void)gcs_block_direct_prepare_attempt(slot, buf, tag, transition_id,
+													   current_master);
 
 			if (retry_attempt == 0)
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_request_count, 1);
@@ -1059,11 +1410,33 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 			if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
 														  (uint32)current_master, &payload,
-														  sizeof(payload)))
+														  sizeof(payload))) {
+				BufferDesc *direct_target_buf = NULL;
+				bool direct_prepared = false;
+
+				{
+					ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+					LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+					if (slot->direct_state == GCS_BLOCK_DIRECT_ARMING) {
+						direct_target_buf = slot->direct_target_buf;
+						direct_prepared = slot->direct_target_prepared;
+						slot->direct_state = GCS_BLOCK_DIRECT_ABORTED;
+						slot->direct_target_buf = NULL;
+						slot->direct_target_addr = NULL;
+						slot->direct_target_lkey = 0;
+						slot->direct_target_prepared = false;
+						slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_ARM_FAILED;
+					}
+					LWLockRelease(&blk->lock.lock);
+				}
+				gcs_block_direct_finish_target(direct_target_buf, direct_prepared, false,
+											   InvalidXLogRecPtr);
 				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
 								errmsg("cluster_gcs_block: failed to enqueue "
 									   "GCS_BLOCK_REQUEST to node %d",
 									   current_master)));
+			}
 
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -1105,6 +1478,49 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			ConditionVariableCancelSleep();
 
 			if (!got_reply) {
+				bool direct_abort_done = true;
+
+				if (gcs_block_direct_mark_aborting(slot, GCS_BLOCK_DIRECT_ABORT_TIMEOUT)) {
+					TimestampTz abort_deadline
+						= GetCurrentTimestamp()
+						  + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+					ConditionVariablePrepareToSleep(&slot->reply_cv);
+					for (;;) {
+						ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+						bool abort_done;
+						TimestampTz now;
+						long timeout_ms;
+
+						LWLockAcquire(&blk->lock.lock, LW_SHARED);
+						abort_done = !slot->in_use
+									 || slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+									 || slot->direct_state == GCS_BLOCK_DIRECT_UNARMED;
+						LWLockRelease(&blk->lock.lock);
+						if (abort_done)
+							break;
+						now = GetCurrentTimestamp();
+						if (now >= abort_deadline)
+							break;
+						timeout_ms = (long)((abort_deadline - now) / 1000);
+						if (timeout_ms <= 0)
+							timeout_ms = 1;
+						(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+														  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+					}
+					ConditionVariableCancelSleep();
+					{
+						ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+						LWLockAcquire(&blk->lock.lock, LW_SHARED);
+						direct_abort_done = !slot->in_use
+											|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+											|| slot->direct_state == GCS_BLOCK_DIRECT_UNARMED;
+						LWLockRelease(&blk->lock.lock);
+					}
+				}
+				if (!direct_abort_done)
+					break;
 				/* timeout OR eager wake — retry within budget */
 				if (retry_attempt < max_retries) {
 					/* If we were waken by eager hook (slot.stale), advance
@@ -1125,6 +1541,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				break;
 			}
 
+			{
+				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+				LWLockAcquire(&blk->lock.lock, LW_SHARED);
+				direct_authoritative_denial = slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+											  && slot->direct_abort_reason
+													 == GCS_BLOCK_DIRECT_ABORT_BAD_STATUS
+											  && slot->reply_received;
+				LWLockRelease(&blk->lock.lock);
+			}
+
 			final_status = slot->reply_header.status;
 			final_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 			/* spec-2.35 HC105:  capture forward source so DENIED_MASTER_
@@ -1135,44 +1562,61 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 			if (final_status == GCS_BLOCK_REPLY_GRANTED
 				|| final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
-				uint32 expected;
-				uint32 got;
+				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+				|| final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+				uint32 expected = 0;
+				uint32 got = 0;
+				bool direct_installed;
 
-				/* PGRAC: spec-5.59 D2/D3 — reply verify sub-bucket (nested). */
-				cluster_xp_begin(&xp_recv,
-								 xp_is_read ? CLXP_R_GCS_S_RECEIVE : CLXP_W_GCS_X_RECEIVE);
-				expected = slot->reply_header.checksum;
-				got = gcs_block_compute_checksum(slot->reply_block_data);
-				cluster_xp_end(&xp_recv);
+				{
+					ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 
-				if (expected != got) {
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
-					final_status = GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL;
-					terminal_denied = true;
-					break;
+					LWLockAcquire(&blk->lock.lock, LW_SHARED);
+					direct_installed = slot->direct_state == GCS_BLOCK_DIRECT_INSTALLED;
+					LWLockRelease(&blk->lock.lock);
 				}
-				/* PGRAC: spec-5.59 D2 — image install sub-bucket (write axis
-				 * only; read installs stay inside the S_REQUEST total). */
-				if (!xp_is_read) {
-					ClusterXpScope xp_inst;
 
-					cluster_xp_begin(&xp_inst, CLXP_W_GCS_X_INSTALL);
-					gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
-												  slot);
-					cluster_xp_end(&xp_inst);
-				} else {
-					gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
-												  slot);
-					/* PGRAC: spec-5.59 §3.6 read amortization probe — a durable
-					 * S grant still shipped a full page image. */
+				if (!direct_installed) {
+					/* PGRAC: spec-5.59 D2/D3 — reply verify sub-bucket (nested). */
+					cluster_xp_begin(&xp_recv,
+									 xp_is_read ? CLXP_R_GCS_S_RECEIVE : CLXP_W_GCS_X_RECEIVE);
+					expected = slot->reply_header.checksum;
+					got = gcs_block_compute_checksum(slot->reply_block_data);
+					cluster_xp_end(&xp_recv);
+
+					if (expected != got) {
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+						final_status = GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL;
+						terminal_denied = true;
+						break;
+					}
+				}
+				if (!direct_installed) {
+					/* PGRAC: spec-5.59 D2 — image install sub-bucket (write axis
+					 * only; read installs stay inside the S_REQUEST total). */
+					if (!xp_is_read) {
+						ClusterXpScope xp_inst;
+
+						cluster_xp_begin(&xp_inst, CLXP_W_GCS_X_INSTALL);
+						gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
+													  slot);
+						cluster_xp_end(&xp_inst);
+					} else {
+						gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
+													  slot);
+						/* PGRAC: spec-5.59 §3.6 read amortization probe — a durable
+						 * S grant still shipped a full page image. */
+						cluster_xp_note_read(true);
+					}
+				} else if (xp_is_read) {
 					cluster_xp_note_read(true);
 				}
 				/* spec-5.14 D2 class 2: depend on the sender (+ forwarding holder). */
 				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
 										final_forwarding_master);
 				if (final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-					|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+					|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+					|| final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 					/*
 					 * spec-2.35 HC111: requester S-holder bit represents real
 					 * cache residency, not a forward intent.  The master
@@ -1187,8 +1631,30 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					if (final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count,
 												1);
-					cluster_gcs_send_transition_and_wait(tag, (PcmLockTransition)transition_id,
-														 final_forwarding_master);
+					if (final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+						/*
+						 * PGRAC: spec-6.12a ㉕ — the remote holder downgraded
+						 * X->S and shipped a durable S grant; its master notify
+						 * (PCM_TRANS_X_TO_S_DOWNGRADE) travels independently.
+						 * Register as an S holder with the NON-throwing
+						 * transition: if the master already processed the
+						 * notify our N->S lands on state S (grant + bitmap
+						 * add); if the notify is still in flight (or lost, or
+						 * a concurrent X-transfer won the race) the master
+						 * denies N->S-on-X and we DEGRADE to the one-shot
+						 * read-image semantics — install stands, pcm_state
+						 * stays N, no durable copy the master does not track
+						 * (Rule 8.A fail-closed; the next read converges).
+						 */
+						if (!cluster_gcs_try_send_transition_and_wait(
+								tag, (PcmLockTransition)transition_id, final_forwarding_master)) {
+							cluster_lever_a_note_remote_ack_degraded();
+							read_image = true;
+							break;
+						}
+					} else
+						cluster_gcs_send_transition_and_wait(tag, (PcmLockTransition)transition_id,
+															 final_forwarding_master);
 				}
 				granted = true;
 				break;
@@ -1287,6 +1753,24 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				if (retry_attempt < max_retries)
 					continue;
 				terminal_denied = true; /* exhausted → terminal 53R9L below */
+				break;
+			}
+
+			/*
+			 * D6 direct-land forward handoff: if the master consumed our posted
+			 * direct receive with a no-forward denial because it had to forward
+			 * to another holder, retry on the normal/generic path.  The generic
+			 * retry lets the holder reply reach this slot without racing a live
+			 * direct receive armed to the master.
+			 */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+				&& final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+				&& direct_authoritative_denial) {
+				suppress_direct_land = true;
+				current_master = cluster_gcs_lookup_master(tag);
+				if (retry_attempt < max_retries)
+					continue;
+				terminal_denied = true;
 				break;
 			}
 
@@ -1515,9 +1999,16 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
  *	holder keeps its X; this node installs the bytes for THIS read only and
  *	never registers as an S holder (returns false so buf->pcm_state stays N).
  *
- *	Returns false (one-shot read image, non-durable).  Fails closed
- *	(ereport) if no read image can be obtained — never a silent stale read
- *	(Rule 8.A).
+ *	spec-6.12a ㉕: with cluster.read_scache on, the forward also carries the
+ *	downgrade-request flag.  If the holder accepts (ships
+ *	S_GRANTED_XHOLDER_DOWNGRADE), this node — being the master — registers
+ *	itself as an S holder via a LOCAL transition apply and returns true
+ *	(durable S; the caller mirrors pcm_state).  Registration failure
+ *	degrades to the one-shot semantics below.
+ *
+ *	Returns false for the one-shot read image (non-durable), true for the
+ *	㉕ durable downgraded S grant.  Fails closed (ereport) if no image can
+ *	be obtained — never a silent stale read (Rule 8.A).
  */
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
@@ -1528,6 +2019,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
 	bool installed = false;
+	bool durable_s = false; /* spec-6.12a ㉕ — holder downgraded, we registered */
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1567,6 +2059,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 			&fwd, cluster_pcm_lock_pi_watermark_scn_query(tag));
 		GcsBlockForwardPayloadSetReadImage(&fwd, true);
+		/* PGRAC: spec-6.12a ㉕ — ask the remote X holder to TRY the quiescent
+		 * X->S downgrade so this read (and every later one) becomes a durable
+		 * cached S.  We ARE the master here, so on the holder's durable reply
+		 * the registration is a local transition apply — no ACK wire. */
+		if (cluster_read_scache)
+			GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
@@ -1604,7 +2102,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		ConditionVariableCancelSleep();
 
 		if (got_reply
-			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+			&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+				|| slot->reply_header.status
+					   == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)) {
 			uint32 expected = slot->reply_header.checksum;
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
@@ -1615,6 +2115,25 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 				 * remote holder's volatile image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				installed = true;
+				/*
+				 * PGRAC: spec-6.12a ㉕ — the holder downgraded X->S and shipped
+				 * a DURABLE S grant.  We are the master: register ourselves as
+				 * an S holder with a LOCAL transition apply (no ACK wire).  The
+				 * holder's own X->S notify travels on the LMON dispatch path;
+				 * if it was applied first our N->S lands on state S (bitmap
+				 * add); if it is still in flight the apply fails and we
+				 * DEGRADE to the one-shot semantics — install stands,
+				 * pcm_state stays N (Rule 8.A: never a durable copy the
+				 * master entry does not track).
+				 */
+				if (slot->reply_header.status
+					== (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+					if (cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S,
+															  cluster_node_id))
+						durable_s = true;
+					else
+						cluster_lever_a_note_remote_ack_degraded();
+				}
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 			}
@@ -1629,6 +2148,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 
 	gcs_block_release_slot(slot);
 
+	if (durable_s)
+		return true; /* spec-6.12a ㉕ — durable S; caller mirrors pcm_state = S */
 	if (installed)
 		return false; /* one-shot read image — non-durable, leave pcm_state N */
 
@@ -1642,6 +2163,136 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
 	return true; /* unreachable */
+}
+
+
+/*
+ * PGRAC: spec-6.12b — requester-side CR fetch.
+ *
+ *	Ask origin_node's CR-server for the CR page of `tag` at read_scn.  The
+ *	request rides the sub-case B wire shape (FORWARD payload direct to the
+ *	serving node via the backend outbound ring; the HC108 chain on the
+ *	direct-shipped reply validates forwarding_master == self).  The SCN
+ *	carrier holds the snapshot read_scn (the CR path never runs the
+ *	lost-write watermark verdict — the result is historical by intent).
+ *
+ *	true  -> dst_page holds the shipped CR page; *out_partial says whether
+ *	         the local construction continues on it.
+ *	false -> fail-closed: the caller keeps the unchanged 53R9G refusal
+ *	         (timeout, DENIED, checksum failure — Rule 8.A).  The CR page
+ *	         is NEVER installed as current and never flushed; it exists
+ *	         only in the caller's CR destination.
+ */
+bool
+cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node, char *dst_page,
+									bool *out_partial)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool fetched = false;
+
+	if (out_partial != NULL)
+		*out_partial = false;
+	if (dst_page == NULL || origin_node < 0 || origin_node == cluster_node_id)
+		return false;
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id;
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, read_scn);
+		GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)origin_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue CR request to "
+								   "origin node %d",
+								   (int)origin_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
+				|| slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL)) {
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				memcpy(dst_page, slot->reply_block_data, BLCKSZ);
+				/* spec-5.14 D2 class 2: this CR result is the origin's
+				 * volatile construction — depend on it for fail-stop. */
+				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+				if (out_partial != NULL)
+					*out_partial
+						= (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL);
+				fetched = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	return fetched; /* false -> caller keeps the unchanged 53R9G refusal */
 }
 
 
@@ -2017,12 +2668,24 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 	hdr.transition_id = req->transition_id;
 	hdr.status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	if (status == GCS_BLOCK_REPLY_GRANTED && block_data != NULL)
+		hdr.checksum = gcs_block_compute_checksum(block_data);
+
+	if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
+		if (status != GCS_BLOCK_REPLY_GRANTED || block_data == NULL) {
+			char zero_page[GCS_BLOCK_DATA_SIZE];
+
+			memset(zero_page, 0, sizeof(zero_page));
+			hdr.checksum = gcs_block_compute_checksum(zero_page);
+		}
+		(void)gcs_block_try_send_direct_reply(dest_node, true, &hdr, block_data, 0, NULL, NULL);
+		return;
+	}
 
 	if (status == GCS_BLOCK_REPLY_GRANTED && block_data != NULL) {
 		ClusterICSge sge[2];
 
 		memset(sge, 0, sizeof(sge));
-		hdr.checksum = gcs_block_compute_checksum(block_data);
 		sge[0].addr = &hdr;
 		sge[0].len = sizeof(hdr);
 		sge[1].addr = (void *)block_data;
@@ -2049,6 +2712,23 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 
 	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+}
+
+static bool
+gcs_block_deny_direct_armed_forward_request(const GcsBlockRequestPayload *req)
+{
+	if (!GcsBlockRequestPayloadIsDirectLandArmed(req))
+		return false;
+
+	/*
+	 * The requester posted its receive on this master's block-reply lane.  A
+	 * generic holder reply would arrive while that receive is still live, so
+	 * consume/abort the direct receive first and let the requester retry
+	 * without direct-land.
+	 */
+	gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
+						 InvalidXLogRecPtr, NULL);
+	return true;
 }
 
 /*
@@ -2226,7 +2906,7 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 	 * + HC89 single-retry revalidation.  Returns false if revalidation cannot
 	 * stabilize after one retry → DENIED_MASTER_NOT_HOLDER fail-closed.
 	 */
-	if (!gcs_block_get_ship_image(req->tag, req->sender_node, out_page_lsn, block_buf,
+	if (!gcs_block_get_ship_image(req->tag, req->sender_node, true, out_page_lsn, block_buf,
 								  out_block_payload, out_block_lkey, out_release_cb,
 								  out_release_arg, out_sf_dep_vec, out_sf_dep_valid)) {
 		*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
@@ -2370,6 +3050,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 
 			if (holder_node < 0 || holder_node == cluster_node_id)
 				return; /* malformed dedup entry; silent drop */
+			if (gcs_block_deny_direct_armed_forward_request(req))
+				return;
 
 			memset(&fwd, 0, sizeof(fwd));
 			fwd.request_id = req->request_id;
@@ -2379,6 +3061,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
+			GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */
@@ -2496,7 +3179,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			}
 			cluster_sf_dep_vec_reset(&sf_dep_vec);
 			sf_dep_valid = false;
-			if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
+			if (gcs_block_get_ship_image(req->tag, req->sender_node, false, &page_lsn, block_buf,
 										 &block_payload, &block_payload_lkey,
 										 &block_payload_release_cb, &block_payload_release_arg,
 										 &sf_dep_vec, &sf_dep_valid)) {
@@ -2606,8 +3289,23 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		 *   (5) a second X holder can never be granted (HG5 no double-X).
 		 * A dead holder is NOT handled here — that is the dead-master / warm-
 		 * recovery path (53R9K / spec-4.7); leave it to the flow below.
+		 *
+		 * PGRAC: spec-6.12a ㉕ — the gate is narrowed to the live X-HOLDER
+		 * case.  Live S holders now have a REAL invalidate path: the
+		 * pre_state==S branch below broadcasts GCS_BLOCK_INVALIDATE, collects
+		 * every ack, clears the invalidated bits, then grants — the same
+		 * invalidate-before-X contract the LOCAL-master upgrade
+		 * (cluster_gcs_block_local_x_upgrade) already enforces.  Before ㉕ the
+		 * S-holder combination was unreachable here (a remote-mastered block a
+		 * node had written stayed X at that node), so the blanket deny was
+		 * safe; after ㉕ the quiescent downgrade deliberately creates
+		 * "requester holds S, other nodes hold S" and the blanket deny would
+		 * make every downgraded block permanently unwritable by its former
+		 * holder.  Taking the block from a live X HOLDER remains wave-g
+		 * territory and stays denied.
 		 */
-		if (cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
+		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
+			&& cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
 								 InvalidXLogRecPtr, NULL);
@@ -2657,6 +3355,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
+				if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
+					cluster_pcm_lock_clear_pending_x(req->tag);
+					(void)gcs_block_deny_direct_armed_forward_request(req);
+					return;
+				}
 
 				memset(&fwd, 0, sizeof(fwd));
 				fwd.request_id = req->request_id;
@@ -2666,6 +3369,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
+				GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 				/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 				 * expected pi_watermark_scn. */
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
@@ -2719,6 +3423,26 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (requester_is_s_holder)
 				holders_bm &= ~((uint32)1u << req->sender_node);
 
+			/*
+			 * PGRAC: spec-6.12a ㉕ — the master itself may hold an S copy (it
+			 * registered as a reader after a remote-holder downgrade).  The
+			 * wire INVALIDATE cannot self-deliver; perform the holder-side
+			 * actions synchronously — drop the local copy and clear our own
+			 * bit on the authoritative entry — then broadcast only to the
+			 * remaining REMOTE holders.  (Idempotent when the copy is not
+			 * resident: the transition apply early-returns on a cleared bit.)
+			 */
+			if ((holders_bm & ((uint32)1u << cluster_node_id)) != 0) {
+				XLogRecPtr self_lsn = InvalidXLogRecPtr;
+				SCN self_scn = InvalidScn;
+
+				(void)cluster_bufmgr_invalidate_block_for_gcs(req->tag, PCM_LOCK_MODE_S, &self_lsn,
+															  &self_scn);
+				(void)cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_N_INVALIDATE,
+															cluster_node_id);
+				holders_bm &= ~((uint32)1u << cluster_node_id);
+			}
+
 			if (holders_bm != 0) {
 				if (!gcs_block_broadcast_invalidate_and_wait(req, holders_bm)) {
 					/* Budget exhausted — reply DENIED_INVALIDATE_TIMEOUT;
@@ -2731,6 +3455,23 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					return;
 				}
 				/* All acks collected; fall through to direct grant. */
+
+				/*
+				 * PGRAC: spec-6.12a ㉕ — clear the invalidated holders' bits on
+				 * the authoritative entry (mirror of the LOCAL-master upgrade,
+				 * cluster_gcs_block_local_x_upgrade).  The invalidate ACK
+				 * handler only collects the acked bitmap; without this clear
+				 * the sole-holder legality inside the S→X_UPGRADE apply below
+				 * still sees the dropped holders' bits and fails, sending the
+				 * requester a spurious DENIED_MASTER_NOT_HOLDER.  pending_x is
+				 * set, so no NEW S grant can slip in between the ack collection
+				 * and this clear (HC117).
+				 */
+				for (int inv_n = 0; inv_n < 32; inv_n++) {
+					if ((holders_bm & ((uint32)1u << inv_n)) != 0)
+						(void)cluster_pcm_lock_apply_gcs_transition(
+							req->tag, PCM_TRANS_S_TO_N_INVALIDATE, inv_n);
+				}
 			}
 
 			/*
@@ -2824,9 +3565,28 @@ x_path_skipped:
 				 * never folded into requester pp. */
 				ClusterXpScope xp_ship;
 
+				/*
+				 * PGRAC: spec-6.12a — quiescent S-cache.  Master==holder and the
+				 * read targets our X-held block: when the wave GUC is on and the
+				 * block is quiescent, flush it storage-current, self-downgrade
+				 * X->S and DON'T take the one-shot read-image path — control
+				 * falls through to the base master flow below, which now sees
+				 * state S with a resident buffer and serves a durable GRANTED
+				 * (image + requester N->S registration).  Repeat reads then hit
+				 * the requester's cached S copy locally.  Refusal (active ITL /
+				 * state raced / flush unavailable) keeps today's one-shot ship.
+				 */
+				if (cluster_read_scache) {
+					bool downgraded = cluster_bufmgr_downgrade_x_to_s_for_gcs(req->tag);
+
+					cluster_lever_a_note_downgrade(downgraded);
+					if (downgraded)
+						goto scache_downgraded_fall_through;
+				}
+
 				cluster_xp_begin(&xp_ship, CLXP_R_READIMAGE_SHIP);
 				/* Master holds X locally: ship its current image without revoking X. */
-				if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
+				if (gcs_block_get_ship_image(req->tag, req->sender_node, true, &page_lsn, block_buf,
 											 &block_payload, &block_payload_lkey,
 											 &block_payload_release_cb, &block_payload_release_arg,
 											 &sf_dep_vec, &sf_dep_valid)) {
@@ -2848,6 +3608,8 @@ x_path_skipped:
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
+				if (gcs_block_deny_direct_armed_forward_request(req))
+					return;
 
 				memset(&fwd, 0, sizeof(fwd));
 				fwd.request_id = req->request_id;
@@ -2857,10 +3619,21 @@ x_path_skipped:
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
+				GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
 				GcsBlockForwardPayloadSetReadImage(&fwd, true);
+				/* PGRAC: spec-6.12a ㉕ — with the wave GUC on, additionally ask
+				 * the holder to TRY the quiescent X->S downgrade so this (and
+				 * every later) read becomes a durable cached S instead of a
+				 * one-shot re-ship.  The holder alone judges quiescence and
+				 * falls back to the read-image ship on refusal; with the GUC
+				 * off this is the pre-㉕ one-shot (counted for D0 ceiling). */
+				if (cluster_read_scache)
+					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+				else
+					cluster_lever_a_note_fwd_oneshot();
 
 				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 											 sizeof(fwd))
@@ -2907,6 +3680,8 @@ x_path_skipped:
 									 InvalidXLogRecPtr, NULL);
 				return;
 			}
+			if (gcs_block_deny_direct_armed_forward_request(req))
+				return;
 
 			/* Build and send GCS_BLOCK_FORWARD to holder. */
 			memset(&fwd, 0, sizeof(fwd));
@@ -2917,6 +3692,7 @@ x_path_skipped:
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
+			GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */
@@ -2956,6 +3732,10 @@ x_path_skipped:
 	}
 
 	/* Produce the reply through the original master flow. */
+/* PGRAC: spec-6.12a — landing point after a quiescent X->S self-downgrade:
+ * master state is now S with a resident clean buffer, so produce_reply
+ * serves a durable GRANTED (image + requester N->S quick re-grant). */
+scache_downgraded_fall_through:
 	(void)gcs_block_produce_reply(req, block_buf, &status, &page_lsn, &block_payload,
 								  &block_payload_lkey, &block_payload_release_cb,
 								  &block_payload_release_arg, &sf_dep_vec, &sf_dep_valid);
@@ -3087,6 +3867,20 @@ build_and_send_reply: {
 
 	{
 		ClusterICSendResult send_rc;
+		bool live_sge_payload = has_block_payload
+								&& block_payload_release_cb == gcs_block_release_live_sge;
+
+		if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
+			(void)gcs_block_try_send_direct_reply(req->sender_node, true, hdr,
+												  has_block_payload ? block_payload : NULL,
+												  has_block_payload ? block_payload_lkey : 0,
+												  block_payload_release_cb,
+												  block_payload_release_arg);
+			block_payload_release_cb = NULL;
+			block_payload_release_arg = NULL;
+			pfree(buf);
+			return;
+		}
 
 		if (has_block_payload) {
 			ClusterICSge sge[2];
@@ -3110,6 +3904,8 @@ build_and_send_reply: {
 
 		if (send_rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
+			gcs_block_note_live_sge_send();
 	}
 
 	gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
@@ -3127,6 +3923,296 @@ build_and_send_reply: {
  *	does NOT scan all backends to find the matching outstanding slot — it
  *	indexes directly via requester_backend_id.
  * ============================================================ */
+
+void
+cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req, int32 dest_node)
+{
+	int backend_idx;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot = NULL;
+	BufferDesc *abort_target_buf = NULL;
+	bool abort_prepared = false;
+	void *target_addr = NULL;
+	uint32 target_lkey = 0;
+	uint32 arm_id = 0;
+	uint32 generation = 0;
+	bool posted = false;
+	int i;
+
+	if (req == NULL)
+		return;
+	GcsBlockRequestPayloadSetDirectLandArmed(req, false);
+
+	backend_idx = req->requester_backend_id - 1;
+	if (backend_idx < 0 || backend_idx >= MaxBackends)
+		return;
+	blk = &gcs_block_backend_blocks[backend_idx];
+
+	LWLockAcquire(&blk->lock.lock, LW_SHARED);
+	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *candidate = &blk->slots[i];
+
+		if (candidate->in_use && candidate->request_id == req->request_id) {
+			slot = candidate;
+			if (slot->direct_state == GCS_BLOCK_DIRECT_ARMING
+				&& slot->direct_expected_peer == dest_node && slot->direct_target_prepared
+				&& slot->direct_target_kind == GCS_BLOCK_DIRECT_TARGET_SHARED_BUFFER) {
+				target_addr = slot->direct_target_addr;
+				target_lkey = slot->direct_target_lkey;
+				arm_id = slot->direct_arm_id;
+				generation = slot->direct_generation;
+			}
+			break;
+		}
+	}
+	LWLockRelease(&blk->lock.lock);
+
+	if (slot == NULL || target_addr == NULL)
+		return;
+	if (target_lkey == 0
+		&& !cluster_ic_rdma_shared_buffers_sge(target_addr, GCS_BLOCK_DATA_SIZE, &target_lkey))
+		target_lkey = 0;
+
+	posted = target_lkey != 0
+			 && cluster_ic_rdma_block_reply_post_recv(dest_node, arm_id, generation, target_addr,
+													  target_lkey);
+
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	if (slot->in_use && slot->request_id == req->request_id
+		&& slot->direct_state == GCS_BLOCK_DIRECT_ARMING
+		&& slot->direct_generation == generation && slot->direct_arm_id == arm_id) {
+		if (posted) {
+			slot->direct_state = GCS_BLOCK_DIRECT_ARMED;
+			GcsBlockRequestPayloadSetDirectLandArmed(req, true);
+		} else {
+			abort_target_buf = slot->direct_target_buf;
+			abort_prepared = slot->direct_target_prepared;
+			slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+			slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+			slot->direct_target_buf = NULL;
+			slot->direct_target_addr = NULL;
+			slot->direct_target_lkey = 0;
+			slot->direct_target_prepared = false;
+			slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_ARM_FAILED;
+		}
+	} else if (posted) {
+		/*
+		 * The backend timed out/cancelled while LMON posted the receive.  Reset
+		 * the lane before the target can be released by any abort cleanup.
+		 */
+		cluster_ic_rdma_block_reply_abort_peer(dest_node, "direct-land arm raced slot cleanup");
+	}
+	LWLockRelease(&blk->lock.lock);
+
+	gcs_block_direct_finish_target(abort_target_buf, abort_prepared, false, InvalidXLogRecPtr);
+}
+
+static void
+gcs_block_direct_fail_slot(ClusterGcsBlockBackendBlock *blk,
+						   ClusterGcsBlockOutstandingSlot *slot,
+						   ClusterGcsBlockDirectAbortReason reason, bool authoritative_denial,
+						   const GcsBlockReplyHeader *hdr)
+{
+	BufferDesc *target_buf;
+	bool prepared;
+
+	Assert(blk != NULL);
+	Assert(slot != NULL);
+
+	target_buf = slot->direct_target_buf;
+	prepared = slot->direct_target_prepared;
+	slot->direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	slot->direct_abort_reason = reason;
+	slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+	slot->direct_target_buf = NULL;
+	slot->direct_target_addr = NULL;
+	slot->direct_target_lkey = 0;
+	slot->direct_target_prepared = false;
+	gcs_block_note_direct_abort();
+	if (authoritative_denial && hdr != NULL) {
+		slot->reply_header = *hdr;
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_received = true;
+	} else {
+		slot->stale = true;
+	}
+	ConditionVariableSignal(&slot->reply_cv);
+	LWLockRelease(&blk->lock.lock);
+	gcs_block_direct_finish_target(target_buf, prepared, false, InvalidXLogRecPtr);
+}
+
+void
+cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_id,
+													 bool cqe_success, uint32 byte_len,
+													 const void *sidecar)
+{
+	uint32 wr_peer = 0;
+	uint32 arm_id = 0;
+	uint32 generation = 0;
+	int backend_idx;
+	int slot_idx;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	const ClusterICEnvelope *env;
+	const GcsBlockReplyHeader *hdr;
+	void *page;
+	uint32 env_crc;
+	GcsBlockReplyStatus status;
+	bool success_status;
+	bool identity_ok;
+	int32 fwd_master;
+
+	if (!cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &wr_peer, &arm_id, &generation)
+		|| (int32)wr_peer != peer_node || !gcs_block_direct_decode_arm_id(arm_id, &backend_idx,
+																		  &slot_idx))
+		return;
+
+	blk = &gcs_block_backend_blocks[backend_idx];
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = &blk->slots[slot_idx];
+	if (!slot->in_use || slot->direct_state != GCS_BLOCK_DIRECT_ARMED
+		|| slot->direct_generation != generation || slot->direct_arm_id != arm_id
+		|| slot->direct_expected_peer != peer_node) {
+		LWLockRelease(&blk->lock.lock);
+		return;
+	}
+	if (!cqe_success) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_CQE_ERROR, false, NULL);
+		return;
+	}
+	slot->direct_state = GCS_BLOCK_DIRECT_LANDED;
+	if (byte_len != CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES || sidecar == NULL) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_LENGTH, false, NULL);
+		return;
+	}
+
+	env = (const ClusterICEnvelope *)sidecar;
+	hdr = (const GcsBlockReplyHeader *)((const char *)sidecar + PGRAC_IC_ENVELOPE_BYTES);
+	page = slot->direct_target_addr;
+	if (page == NULL || env->magic != PGRAC_IC_ENVELOPE_MAGIC
+		|| env->version != PGRAC_IC_ENVELOPE_VERSION_V1
+		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
+		|| (int32)env->source_node_id != peer_node
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_SIDECAR, false, NULL);
+		return;
+	}
+	env_crc = gcs_block_direct_envelope_crc(env, hdr, page);
+	if (env->payload_crc32c != env_crc) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_CHECKSUM, false, NULL);
+		return;
+	}
+
+	status = (GcsBlockReplyStatus)hdr->status;
+	success_status = GcsBlockReplyStatusAllowsDirectLandInstall(status);
+	fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
+	identity_ok = hdr->request_id == slot->request_id
+				  && hdr->requester_backend_id == backend_idx + 1
+				  && hdr->transition_id == slot->transition_id
+				  && hdr->epoch >= slot->request_epoch
+				  && hdr->sender_node == peer_node;
+	if (identity_ok) {
+		if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
+			identity_ok = GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(status);
+		else
+			identity_ok = fwd_master == slot->expected_master_node
+						  && (status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+							  || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+							  || status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+							  || status == GCS_BLOCK_REPLY_DENIED_LOST_WRITE);
+	}
+	if (!identity_ok) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY, false, NULL);
+		return;
+	}
+	if (hdr->checksum != gcs_block_compute_checksum((const char *)page)) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_CHECKSUM, false, NULL);
+		return;
+	}
+	if (!success_status) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_STATUS, true, hdr);
+		return;
+	}
+
+	cluster_bufmgr_finish_direct_land_target_for_gcs(slot->direct_target_buf, true,
+													 (XLogRecPtr)hdr->page_lsn);
+	slot->direct_target_prepared = false;
+	slot->direct_target_buf = NULL;
+	slot->direct_target_addr = NULL;
+	slot->direct_target_lkey = 0;
+	slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+	slot->direct_state = GCS_BLOCK_DIRECT_INSTALLED;
+	slot->reply_header = *hdr;
+	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+	slot->reply_sf_dep_valid = false;
+	slot->reply_sf_flags = 0;
+	cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+	slot->reply_received = true;
+	gcs_block_note_direct_install();
+	ConditionVariableSignal(&slot->reply_cv);
+	LWLockRelease(&blk->lock.lock);
+}
+
+void
+cluster_gcs_block_lmon_abort_direct_land_peer(int32 peer_node,
+											  ClusterGcsBlockDirectAbortReason reason)
+{
+	int i;
+
+	if (gcs_block_backend_blocks == NULL)
+		return;
+	for (i = 0; i < MaxBackends; i++) {
+		ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[i];
+		int j;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		for (j = 0; j < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; j++) {
+			ClusterGcsBlockOutstandingSlot *slot = &blk->slots[j];
+
+			if (!slot->in_use || slot->direct_expected_peer != peer_node)
+				continue;
+			if (slot->direct_state == GCS_BLOCK_DIRECT_ARMED
+				|| slot->direct_state == GCS_BLOCK_DIRECT_ARMING
+				|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED
+				|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
+				gcs_block_direct_fail_slot(blk, slot, reason, false, NULL);
+				LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+			}
+		}
+		LWLockRelease(&blk->lock.lock);
+	}
+}
+
+int
+cluster_gcs_block_lmon_drain_direct_land_aborts(void)
+{
+	int i;
+	int drained = 0;
+
+	if (gcs_block_backend_blocks == NULL)
+		return 0;
+	for (i = 0; i < MaxBackends; i++) {
+		ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[i];
+		int j;
+
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		for (j = 0; j < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; j++) {
+			ClusterGcsBlockOutstandingSlot *slot = &blk->slots[j];
+			int32 peer;
+
+			if (!slot->in_use || slot->direct_state != GCS_BLOCK_DIRECT_ABORTING)
+				continue;
+			peer = slot->direct_expected_peer;
+			LWLockRelease(&blk->lock.lock);
+			cluster_ic_rdma_block_reply_abort_peer(peer, "GCS direct-land abort requested");
+			drained++;
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		}
+		LWLockRelease(&blk->lock.lock);
+	}
+	return drained;
+}
 
 static bool
 gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
@@ -3216,6 +4302,14 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			int32 fwd_master;
 			bool authorized = false;
 
+			if (slot->direct_state == GCS_BLOCK_DIRECT_ARMED
+				|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED
+				|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+				LWLockRelease(&blk->lock.lock);
+				return;
+			}
+
 			/*
 			 * PGRAC: spec-2.34 HC100 — stale-reply defense (epoch +
 			 *   transition_id checks remain).
@@ -3242,16 +4336,21 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
 
 			if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
-				/* direct-from-master path */
+				/* direct-from-master path — a master never self-claims a
+				 * holder-shipped status (spec-6.12a ㉕ status included). */
 				if (hdr->sender_node == slot->expected_master_node
 					&& hdr->status != (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-					&& hdr->status != (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
+					&& hdr->status != (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+					&& hdr->status != (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)
 					authorized = true;
 			} else {
 				/* forwarded-by-master path */
 				if (fwd_master == slot->expected_master_node
 					&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -3303,6 +4402,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	void *block_payload_release_arg = NULL;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	bool holder_ship_ok;
+	bool remote_downgraded = false; /* spec-6.12a ㉕ — holder accepted the
+									 * master's downgrade request */
 	ClusterSfDepVec sf_dep_vec;
 	bool sf_dep_valid = false;
 	bool sf_peer_v2 = false;
@@ -3329,6 +4430,61 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return; /* malformed, silently drop;  master
 								 * dedup TTL will sweep stale entry */
 
+	/*
+	 * PGRAC: spec-6.12b — CR-server request.  LMON only validates + parks
+	 * the request for LMS (light-work rule: a CR construction walks undo
+	 * I/O and must never run in this dispatch loop); the LMON tick ships
+	 * the finished result.  A refused park (data plane off / no free slot)
+	 * replies a fail-closed DENIED immediately so the requester keeps its
+	 * unchanged 53R9G refusal (Rule 8.A).  Never falls through to the
+	 * current-image ship below: a CR result is HISTORICAL by intent and
+	 * the lost-write watermark verdict does not apply (the SCN carrier
+	 * holds the requester's read_scn on this path).
+	 */
+	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
+		if (!cluster_lms_cr_submit(fwd)) {
+			uint32 deny_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+			char *deny_buf = (char *)palloc0(deny_total);
+			GcsBlockReplyHeader *deny_hdr = (GcsBlockReplyHeader *)deny_buf;
+
+			deny_hdr->request_id = fwd->request_id;
+			deny_hdr->epoch = cluster_epoch_get_current();
+			deny_hdr->sender_node = cluster_node_id;
+			deny_hdr->requester_backend_id = fwd->requester_backend_id;
+			deny_hdr->transition_id = fwd->transition_id;
+			deny_hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+			GcsBlockReplyHeaderSetForwardingMasterNode(deny_hdr, fwd->master_node);
+			deny_hdr->checksum
+				= cluster_gcs_block_compute_checksum(deny_buf + sizeof(GcsBlockReplyHeader));
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+										   fwd->original_requester_node, deny_buf, deny_total);
+			pfree(deny_buf);
+		}
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-6.12a ㉕ — remote-holder downgrade.  The master asked us
+	 * (the X holder) to TRY the quiescent X->S self-downgrade before
+	 * shipping.  This MUST run before the ship-image copy below so a
+	 * successful downgrade ships the post-flush storage-consistent S page —
+	 * copying first would open a copy-vs-downgrade window where a local
+	 * write lands between the two and the requester caches a stale image
+	 * (Rule 8.A).  Refusal of any kind (wave GUC off on this node, active
+	 * ITL, state raced, flush unavailable, master notify send failure,
+	 * injection) falls back to today's one-shot read-image ship — the flag
+	 * is a request, never a command.
+	 */
+	if (cluster_read_scache && GcsBlockForwardPayloadIsReadImage(fwd)
+		&& GcsBlockForwardPayloadIsDowngradeRequest(fwd)
+		&& fwd->transition_id == PCM_TRANS_N_TO_S) {
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-remote-downgrade");
+		if (!cluster_injection_should_skip("cluster-gcs-block-remote-downgrade"))
+			remote_downgraded
+				= cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(fwd->tag, fwd->master_node);
+		cluster_lever_a_note_remote_downgrade(remote_downgraded);
+	}
+
 	/* spec-2.35 D15 — fault injection.  SKIP simulates evict race:
 	 * holder pretends buffer is not cached so we exercise the HC105
 	 * DENIED_MASTER_NOT_HOLDER + sender retransmit budget path. */
@@ -3337,7 +4493,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		holder_ship_ok = false;
 	else
 		holder_ship_ok = gcs_block_get_ship_image(
-			fwd->tag, fwd->original_requester_node, &page_lsn, block_buf, &block_payload,
+			fwd->tag, fwd->original_requester_node, true, &page_lsn, block_buf, &block_payload,
 			&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg, &sf_dep_vec,
 			&sf_dep_valid);
 
@@ -3421,11 +4577,34 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			 * transfer."  Rule 8.A: a GCS ownership transfer must satisfy the
 			 * holder's local commit dependency, not just the bufmgr API contract.
 			 */
-			if (GcsBlockForwardPayloadIsReadImage(fwd)
-				|| (GcsBlockForwardPayloadIsXTransfer(fwd)
-					&& (fwd->transition_id == PCM_TRANS_N_TO_X
-						|| fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-					&& cluster_itl_page_has_active_slot((Page)block_payload))) {
+			if (remote_downgraded) {
+				/*
+				 * PGRAC: spec-6.12a ㉕ — we accepted the downgrade: our copy is
+				 * S, the page is flushed storage-current, and the master
+				 * notify is on the wire.  Ship a DURABLE S grant; the
+				 * requester installs + registers as an S holder (wire try-ACK
+				 * or local apply), degrading to one-shot on denial.  HC109
+				 * chain fields were stamped above as for every holder ship.
+				 */
+				hdr->status = (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+			} else if (GcsBlockForwardPayloadIsReadImage(fwd)
+					   || (GcsBlockForwardPayloadIsXTransfer(fwd)
+						   && (fwd->transition_id == PCM_TRANS_N_TO_X
+							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
+						   && cluster_itl_page_has_active_slot((Page)block_payload)
+						   /* PGRAC: spec-6.12g D-g2 — with block self-containment
+							* the active-ITL X-transfer is NO LONGER deferred: the
+							* block ships WITH its uncommitted ITL and is dropped
+							* here (falls to the destructive-transfer branch below).
+							* The holder's later commit skips the stamp for this
+							* now-drifted block (D-g1) and readers resolve the
+							* migrated ACTIVE slot through the TT authority (AD-006).
+							* A same-ROW writer on the new holder still serializes
+							* through the cross-node TX enqueue wait (spec-5.2 D4/D5,
+							* t/280); only the same-block DIFFERENT-row false
+							* serialization is removed. */
+						   && !cluster_block_self_contained)) {
 				/* Holder keeps its X; the requester consumes this image —
 				 * read-image (D2) reads once and never registers as an S holder,
 				 * X-transfer deferral (D11) sees the row lock and waits, retrying
@@ -3466,6 +4645,16 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				if (GcsBlockForwardPayloadIsXTransfer(fwd)
 					&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+
+					/*
+					 * PGRAC: spec-6.12g D-g2 — count a transfer that carries an
+					 * uncommitted ITL slot (the D11 deferral we just lifted).
+					 * block_payload still points at the current image here, so
+					 * the active-ITL probe is exact.
+					 */
+					if (cluster_block_self_contained
+						&& cluster_itl_page_has_active_slot((Page)block_payload))
+						cluster_lever_g_note_active_itl_transfer();
 
 					if (block_payload_release_cb != NULL) {
 						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);
@@ -3551,11 +4740,31 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		hdrv2->sf_dep_count = (uint8)n;
 	}
 
+	if (GcsBlockForwardPayloadIsDirectLandArmed(fwd)) {
+		(void)gcs_block_try_send_direct_reply(
+			fwd->original_requester_node, true, hdr, holder_ship_ok ? block_payload : NULL,
+			holder_ship_ok ? block_payload_lkey : 0, block_payload_release_cb,
+			block_payload_release_arg);
+		if (hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+			cluster_xp_end(&xp_fwd_ship);
+		block_payload_release_cb = NULL;
+		block_payload_release_arg = NULL;
+		pfree(buf);
+		return;
+	}
+
 	if (holder_ship_ok && block_payload != NULL
 		&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 			|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-			|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)) {
+			|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+			/* PGRAC: spec-6.12a ㉕ — the downgraded durable S grant ships page
+			 * bytes exactly like the statuses above; leaving it off this list
+			 * would send the palloc0 zero pad under a real-page checksum
+			 * (guaranteed verify failure at the requester). */
+			|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)) {
 		ClusterICSge sge[2];
+		ClusterICSendResult send_rc;
+		bool live_sge_payload = block_payload_release_cb == gcs_block_release_live_sge;
 
 		memset(sge, 0, sizeof(sge));
 		sge[0].addr = hdr;
@@ -3565,8 +4774,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		sge[1].lkey = block_payload_lkey;
 		sge[1].release_cb = block_payload_release_cb;
 		sge[1].release_arg = block_payload_release_arg;
-		(void)cluster_ic_rdma_send_envelope_sge(
+		send_rc = cluster_ic_rdma_send_envelope_sge(
 			PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node, sge, lengthof(sge), total);
+		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
+			gcs_block_note_live_sge_send();
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
 	} else {
@@ -3629,7 +4840,8 @@ static const ClusterICMsgTypeInfo gcs_block_forward_info = {
  *	DENIED_INVALIDATE_TIMEOUT (status 11) → sender 53R91.
  * ============================================================ */
 static bool
-gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint32 holders_bm)
+gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, uint32 holders_bm,
+											bool via_outbound_ring)
 {
 	GcsBlockInvalidatePayload inv;
 	uint64 current_epoch;
@@ -3681,7 +4893,14 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
 		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
 			continue;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		/* PGRAC: spec-6.12a — a backend-context caller (local-master S->X
+		 * upgrade) cannot use the LMON-owned connections directly; route
+		 * through the backend outbound ring instead (LMON flushes it). */
+		if (via_outbound_ring)
+			(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+														   (uint32)n, &inv, sizeof(inv));
+		else
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 	}
 
@@ -3718,6 +4937,84 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 	return full_ack;
 }
 
+/* Original spec-2.36 entry point (LMON master-handler context). */
+static bool
+gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint32 holders_bm)
+{
+	return gcs_block_broadcast_invalidate_and_wait_ext(req, holders_bm, false);
+}
+
+/* ============================================================
+ * PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
+ *
+ *	The backend-side PCM acquire loop (cluster_pcm_lock_acquire) is the
+ *	LOCAL-master path: before spec-6.12a it had no cross-node invalidate
+ *	and bounded-fail-closed on any live remote S holder (the spec-4.7a
+ *	HG7 gate).  The quiescent X->S downgrade deliberately creates
+ *	remote S holders, so the wave must close this gap: revoke every
+ *	remote S copy, then upgrade self to X on the authoritative entry.
+ *
+ *	Sequence (backend context, master == self, caller holds NO buffer
+ *	content lock):
+ *	  1. pending_x barrier (HC117) so concurrent N->S readers back off.
+ *	  2. Broadcast INVALIDATE to every remote S holder through the
+ *	     backend outbound ring + collect acks on the shared slot (the
+ *	     ack handler runs in LMON and only touches shmem + CV).
+ *	  3. Every ack certifies that node dropped its copy and applied its
+ *	     local S->N; clear its bit on the authoritative entry with an
+ *	     explicit S_TO_N_INVALIDATE apply (idempotent when a release
+ *	     raced ahead).
+ *	  4. Now sole-S: apply S_TO_X_UPGRADE for self.
+ *
+ *	Any failure (slot busy / ack timeout / raced state) returns false
+ *	with pending_x cleared; the caller keeps the pre-6.12a bounded
+ *	fail-closed behaviour (Rule 8.A: never write past an unconfirmed
+ *	invalidate).
+ * ============================================================ */
+bool
+cluster_gcs_block_local_x_upgrade(BufferTag tag)
+{
+	GcsBlockRequestPayload synth;
+	uint32 holders_bm;
+	uint32 self_bit;
+	int n;
+	bool upgraded = false;
+
+	if (ClusterGcsBlock == NULL || cluster_node_id < 0 || cluster_node_id >= 32)
+		return false;
+	self_bit = (uint32)1u << cluster_node_id;
+
+	cluster_pcm_lock_set_pending_x(tag, cluster_node_id, (uint64)GetXLogInsertRecPtr());
+
+	holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
+	if (holders_bm != 0) {
+		memset(&synth, 0, sizeof(synth));
+		synth.request_id
+			= pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1;
+		synth.epoch = cluster_epoch_get_current();
+		synth.tag = tag;
+		synth.sender_node = cluster_node_id;
+
+		if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true)) {
+			cluster_pcm_lock_clear_pending_x(tag);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
+			return false;
+		}
+
+		/* Acks certify the drops; clear the acked bits on the
+		 * authoritative entry (idempotent vs racing releases). */
+		for (n = 0; n < 32; n++) {
+			if ((holders_bm & ((uint32)1u << n)) == 0)
+				continue;
+			(void)cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE, n);
+		}
+	}
+
+	upgraded
+		= cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE, cluster_node_id);
+	cluster_pcm_lock_clear_pending_x(tag);
+	return upgraded;
+}
 
 /* ============================================================
  * PGRAC: spec-2.36 D4 — invalidate handler (holder side).
@@ -3758,7 +5055,17 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		goto send_ack;
 	}
 
-	pre_state = cluster_pcm_lock_query(inv->tag);
+	/*
+	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — this handler runs on the
+	 * HOLDER, so the residency question must be answered by the node-local
+	 * buffer mirror, NOT cluster_pcm_lock_query: that reads the local MASTER
+	 * hash table, which on a non-master holder has no entry and always
+	 * answered N — every remote-holder INVALIDATE short-circuited to
+	 * "already invalidated" while the cached S copy silently survived
+	 * (Rule 8.A stale-S; masked pre-㉕ by the AD-015 phantom-harness
+	 * divergence deferral, exposed by the ㉕ remote-downgrade S caches).
+	 */
+	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
 	if (pre_state == PCM_LOCK_MODE_N) {
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;
@@ -4060,6 +5367,43 @@ uint64
 cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_ship_bytes_total) : 0;
+}
+
+/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+uint64
+cluster_gcs_get_scratch_copy_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->scratch_copy_count) : 0;
+}
+
+uint64
+cluster_gcs_get_live_sge_send_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->live_sge_send_count) : 0;
+}
+
+uint64
+cluster_gcs_get_live_sge_fallback_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->live_sge_fallback_count) : 0;
+}
+
+uint64
+cluster_gcs_get_direct_install_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->direct_install_count) : 0;
+}
+
+uint64
+cluster_gcs_get_direct_install_abort_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->direct_install_abort_count) : 0;
+}
+
+uint64
+cluster_gcs_get_install_copy_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->install_copy_count) : 0;
 }
 
 

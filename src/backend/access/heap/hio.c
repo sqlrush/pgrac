@@ -10,6 +10,12 @@
  * IDENTIFICATION
  *	  src/backend/access/heap/hio.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - RelationGetBufferForTuple: consume this node's parked HW space
+ *	    lease before the shared FSM (static space affinity).
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave d)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -20,11 +26,45 @@
 #include "access/heaptoast.h"		/* PGRAC: HeapPageSpecialSize */
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_hw_lease.h"	/* PGRAC: spec-6.12d lease consume */
+#endif
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-6.12d -- pop one block from this node's HW space lease for
+ * the relation, validated against the CURRENT relation size: VACUUM can
+ * truncate the trailing zero pages out from under a live lease (they are
+ * empty by construction), leaving the parked range pointing past EOF.  A
+ * stale range is discarded (bookkeeping only -- the storage was already
+ * reclaimed by the truncation) and reads as a lease miss, so the caller
+ * falls through to the native FSM / extend path.  A residual race with a
+ * concurrent truncation ends in the ordinary read-beyond-EOF error --
+ * fail-closed, never a wrong page.
+ */
+static BlockNumber
+cluster_hio_lease_target_block(Relation relation)
+{
+	BlockNumber lblk = cluster_hw_lease_next_block(relation->rd_locator,
+												   MAIN_FORKNUM);
+
+	if (lblk == InvalidBlockNumber)
+		return InvalidBlockNumber;
+
+	if (lblk >= RelationGetNumberOfBlocks(relation))
+	{
+		cluster_hw_lease_discard(relation->rd_locator, MAIN_FORKNUM);
+		return InvalidBlockNumber;
+	}
+
+	return lblk;
+}
+#endif
 
 /*
  * RelationPutHeapTuple - place tuple at specified page
@@ -590,6 +630,24 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	else
 		targetBlock = RelationGetTargetBlock(relation);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12d -- with static space affinity on, consume this
+	 * node's parked HW-lease block BEFORE consulting the shared FSM: the
+	 * lease is our private chunk of the extent (Q17-A grouping), already
+	 * zero-extended on disk, and taking it here avoids both the FSM's
+	 * cross-node contention and the HW master round-trip of an extend.
+	 * The block is a zero page; the PageIsNew lazy-init below handles it
+	 * exactly like a fresh extend.  Lease miss / exhaustion falls through
+	 * to the native path (the Q10-A degradation).  Note the "try the last
+	 * page" fallback below can still consume a foreign node's lease block
+	 * when the FSM is empty -- that only leaks affinity, never
+	 * correctness (two writers on one page is ordinary page contention).
+	 */
+	if (targetBlock == InvalidBlockNumber && cluster_hw_lease_active())
+		targetBlock = cluster_hio_lease_target_block(relation);
+#endif
+
 	if (targetBlock == InvalidBlockNumber && use_fsm)
 	{
 		/*
@@ -782,6 +840,27 @@ loop:
 														targetFreeSpace);
 		}
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12d -- FSM exhausted (or bypassed): consume this
+	 * node's parked lease block before paying for a real extend.  This is
+	 * the main consumption point -- the initial-selection probe above only
+	 * fires on a cold target cache, while every FSM-miss funnel ends here.
+	 * No buffer is held at loop exit, so re-entering the loop with the
+	 * lease block is the ordinary target-block path (PageIsNew lazy init).
+	 */
+	if (cluster_hw_lease_active())
+	{
+		BlockNumber lblk = cluster_hio_lease_target_block(relation);
+
+		if (lblk != InvalidBlockNumber)
+		{
+			targetBlock = lblk;
+			goto loop;
+		}
+	}
+#endif
 
 	/* Have to extend the relation */
 	buffer = RelationAddBlocks(relation, bistate, num_pages, use_fsm,

@@ -65,6 +65,8 @@ OBJS = \
 	cluster_write_fence.o \
 	cluster_ges.o \
 	cluster_ges_dedup.o \
+	cluster_ges_handoff.o \
+	cluster_ges_handoff_policy.o \
 	cluster_ges_mode.o \
 	cluster_ges_mode_backend.o \
 	cluster_ges_reply_wait.o \
@@ -96,6 +98,8 @@ OBJS = \
 	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \
 	cluster_rfs.o \
+	cluster_reverse_key.o \
+	cluster_hw_lease.o \
 	cluster_dl.o \
 	cluster_dl_lock.o \
 	cluster_ir.o \
@@ -178,6 +182,8 @@ OBJS = \
 	cluster_cr_tuple.o \
 	cluster_cr_tuple_stat.o \
 	cluster_cr_coordinator_stat.o \
+	cluster_cr_server.o \
+	cluster_cr_server_policy.o \
 	cluster_cr_srf.o \
 	cluster_resolver_cache.o \
 	cluster_tt_slot.o \
@@ -200,6 +206,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
+	cluster_xnode_lever.o \
 	cluster_xnode_profile.o \
 	storage/cluster_shared_fs.o \
 	storage/cluster_shared_fs_stub.o \

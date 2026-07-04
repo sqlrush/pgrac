@@ -62,6 +62,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "storage/block.h"
 
@@ -285,10 +286,238 @@ UT_TEST(test_l22_master_holder_lifecycle_documented_in_tap)
 }
 
 
+/* PGRAC: spec-6.12a ㉕ — downgrade-request flag rides reserved_0[3] and must
+ * not disturb the read-image [0] / X-transfer [1] / clean-eligible [2]
+ * overlays; the new durable reply status is the enum tail (15). */
+UT_TEST(test_downgrade_request_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	/* sizeof unchanged — flag lives inside the existing 64B wire. */
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_s_granted_xholder_downgrade_status_is_15)
+{
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE, 15);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE,
+				 (int)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1);
+}
+
+
+/* PGRAC: spec-6.12b — CR request flag rides reserved_0[4] independently and
+ * the CR result statuses are the enum tail (16/17). */
+UT_TEST(test_cr_request_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCrRequest(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+	GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetCrRequest(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_cr_result_statuses_are_16_17)
+{
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_FULL, 16);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL, 17);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_FULL,
+				 (int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1);
+}
+
+
+/* PGRAC: spec-6.13 D6 — direct-land FORWARD flag uses reserved_0[5], not the
+ * frozen-spec [3] byte that spec-6.12a already occupies for downgrade. */
+UT_TEST(test_direct_land_forward_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+	GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+	GcsBlockForwardPayloadSetDirectLandArmed(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetDirectLandArmed(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_forward_direct_land_from_request_requires_exact_holder_arm)
+{
+	GcsBlockRequestPayload req;
+	GcsBlockForwardPayload fwd;
+
+	memset(&req, 0, sizeof(req));
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, true);
+
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, true);
+	UT_ASSERT(GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, false);
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, true);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_direct_land_sidecar_size_locked)
+{
+	UT_ASSERT_EQ((int)CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES,
+				 (int)(PGRAC_IC_ENVELOPE_BYTES + sizeof(GcsBlockReplyHeader)));
+	UT_ASSERT_EQ((int)CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES,
+				 (int)(CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES + BLCKSZ));
+}
+
+
+UT_TEST(test_direct_land_wr_id_round_trip_rejects_wrong_type)
+{
+	uint64 wr_id;
+	uint32 peer = 0;
+	uint32 arm = 0;
+	uint32 generation = 0;
+
+	wr_id = cluster_ic_rdma_direct_land_make_wr_id(7, 1234, 55);
+	UT_ASSERT(cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &peer, &arm, &generation));
+	UT_ASSERT_EQ((int)peer, 7);
+	UT_ASSERT_EQ((int)arm, 1234);
+	UT_ASSERT_EQ((int)generation, 55);
+
+	wr_id = cluster_ic_rdma_direct_land_make_wr_id(
+		7, 1234, cluster_ic_rdma_direct_land_next_generation(65535));
+	UT_ASSERT(cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &peer, &arm, &generation));
+	UT_ASSERT_EQ((int)generation, 1);
+
+	UT_ASSERT(!cluster_ic_rdma_direct_land_decode_wr_id(UINT64CONST(0x5100000000000000),
+														&peer, &arm, &generation));
+}
+
+
+UT_TEST(test_direct_land_state_transitions)
+{
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_UNARMED,
+														   GCS_BLOCK_DIRECT_ARMING));
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_ARMING,
+														   GCS_BLOCK_DIRECT_ARMED));
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_ARMING,
+														   GCS_BLOCK_DIRECT_UNARMED));
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_ARMED,
+														   GCS_BLOCK_DIRECT_LANDED));
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_LANDED,
+														   GCS_BLOCK_DIRECT_INSTALLED));
+	UT_ASSERT(cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_ABORTING,
+														   GCS_BLOCK_DIRECT_ABORTED));
+	UT_ASSERT(!cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_UNARMED,
+															GCS_BLOCK_DIRECT_INSTALLED));
+	UT_ASSERT(!cluster_gcs_block_direct_state_transition_ok(GCS_BLOCK_DIRECT_ARMED,
+															GCS_BLOCK_DIRECT_INSTALLED));
+}
+
+
+UT_TEST(test_direct_land_success_status_whitelist)
+{
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED));
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
+	UT_ASSERT(
+		GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE));
+	UT_ASSERT(
+		!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK));
+	UT_ASSERT(
+		!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER));
+}
+
+
+UT_TEST(test_direct_land_no_forward_denial_identity_policy)
+{
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_GRANTED));
+	UT_ASSERT(
+		GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_DENIED_EPOCH_STALE));
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT));
+	UT_ASSERT(
+		GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_DENIED_DEDUP_FULL));
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER));
+	UT_ASSERT(
+		!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_CR_RESULT_FULL));
+}
+
+
+UT_TEST(test_direct_land_arm_blocks_known_different_holder)
+{
+	UT_ASSERT(GcsBlockDirectCanArmExpectedPeer(-1, 2));
+	UT_ASSERT(GcsBlockDirectCanArmExpectedPeer(2, 2));
+	UT_ASSERT(!GcsBlockDirectCanArmExpectedPeer(3, 2));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(34);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -311,6 +540,18 @@ main(void)
 	UT_RUN(test_l20_evict_race_recovery_documented_in_tap);
 	UT_RUN(test_l21_hc112_unlock_preserves_bit_documented_in_tap);
 	UT_RUN(test_l22_master_holder_lifecycle_documented_in_tap);
+	UT_RUN(test_downgrade_request_flag_round_trip_independent);
+	UT_RUN(test_s_granted_xholder_downgrade_status_is_15);
+	UT_RUN(test_cr_request_flag_round_trip_independent);
+	UT_RUN(test_cr_result_statuses_are_16_17);
+	UT_RUN(test_direct_land_forward_flag_round_trip_independent);
+	UT_RUN(test_forward_direct_land_from_request_requires_exact_holder_arm);
+	UT_RUN(test_direct_land_sidecar_size_locked);
+	UT_RUN(test_direct_land_wr_id_round_trip_rejects_wrong_type);
+	UT_RUN(test_direct_land_state_transitions);
+	UT_RUN(test_direct_land_success_status_whitelist);
+	UT_RUN(test_direct_land_no_forward_denial_identity_policy);
+	UT_RUN(test_direct_land_arm_blocks_known_different_holder);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

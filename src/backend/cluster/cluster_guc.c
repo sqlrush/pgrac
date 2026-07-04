@@ -99,6 +99,26 @@ int cluster_adg_lease_takeover_grace_ms = 5000;
 int cluster_adg_barrier_interval_ms = 1000;
 int cluster_wal_sender_timeout_sec = 60;
 int cluster_wal_receiver_timeout_sec = 60;
+/* spec-6.12c: read-layer-3 resolver terminal memo (default OFF). */
+bool cluster_page_scn_shortcut = false;
+/* spec-6.12a: quiescent-block S-cache via X->S downgrade (default OFF). */
+bool cluster_read_scache = false;
+/* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
+bool cluster_ges_handoff = false;
+/* spec-6.12b: cross-instance CR-server data plane (default OFF = 53R9G). */
+bool cluster_crossnode_cr_data_plane = false;
+/* spec-6.12g: block self-containment (active-ITL migration + opportunistic
+ * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
+bool cluster_block_self_contained = false;
+/* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
+int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
+int cluster_space_lease_blocks = 64;
+
+static const struct config_enum_entry cluster_space_affinity_options[]
+	= { { "off", CLUSTER_SPACE_AFFINITY_OFF, false },
+		{ "static", CLUSTER_SPACE_AFFINITY_STATIC, false },
+		{ "dynamic", CLUSTER_SPACE_AFFINITY_DYNAMIC, false },
+		{ NULL, 0, false } };
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -952,6 +972,23 @@ check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * spec-6.12d: dynamic space affinity needs the spec-6.3 DRM remaster
+ * machinery; reject the value explicitly until that ships (rule 8 --
+ * never a silently inert setting).
+ */
+static bool
+check_cluster_space_affinity(int *newval, void **extra, GucSource source)
+{
+	if (*newval == CLUSTER_SPACE_AFFINITY_DYNAMIC) {
+		GUC_check_errdetail("cluster.space_affinity = \"dynamic\" requires the "
+							"DRM remaster machinery (spec-6.3), which is not "
+							"implemented yet; use \"static\" or \"off\".");
+		return false;
+	}
+	return true;
+}
+
 
 /*
  * cluster_init_guc -- register all cluster GUC variables.
@@ -1154,7 +1191,8 @@ cluster_init_guc(void)
 		"cluster.interconnect_tier", gettext_noop("Cluster interconnect tier vtable selection."),
 		gettext_noop("stub (default) keeps cross-node IPC disabled; tier1 (TCP) "
 					 "uses TCP; tier2 selects the RDMA-capable transport mux; "
-					 "tier3 is reserved until mlx5 direct verbs are implemented. "
+					 "tier3 requests the RDMA optimized provider and may fall back "
+					 "to generic verbs when mlx5dv is unavailable. "
 					 "See docs/cluster-ic-design.md."),
 		&cluster_interconnect_tier, CLUSTER_IC_TIER_STUB,  /* boot value */
 		cluster_interconnect_tier_options, PGC_POSTMASTER, /* tier change requires restart */
@@ -1174,24 +1212,25 @@ cluster_init_guc(void)
 	DefineCustomEnumVariable(
 		"cluster.interconnect_rdma_provider",
 		gettext_noop("RDMA provider selection for tier2/tier3 interconnect."),
-		gettext_noop("auto and verbs request generic libibverbs; mlx5 is reserved and "
-					 "fails closed until the optimized mlx5 provider is implemented."),
+		gettext_noop("auto and verbs request generic libibverbs; mlx5 requests the "
+					 "spec-6.13 optimized provider and falls back according to "
+					 "cluster.interconnect_rdma_fallback."),
 		&cluster_interconnect_rdma_provider, CLUSTER_IC_RDMA_PROVIDER_AUTO,
 		cluster_interconnect_rdma_provider_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
 		"cluster.interconnect_rdma_completion",
 		gettext_noop("RDMA completion model for the interconnect."),
-		gettext_noop("event integrates with the LMON wait loop; busypoll is reserved "
-					 "and fails closed until the tier3 poller is implemented."),
+		gettext_noop("event integrates with the LMON wait loop; busypoll drains the "
+					 "CQ on the LMON tick within cluster.interconnect_rdma_busypoll_us."),
 		&cluster_interconnect_rdma_completion, CLUSTER_IC_RDMA_COMPLETION_EVENT,
 		cluster_interconnect_rdma_completion_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.interconnect_rdma_busypoll_us",
 		gettext_noop("RDMA busy-poll spin budget in microseconds."),
-		gettext_noop("Reserved for cluster.interconnect_rdma_completion=busypoll; "
-					 "unused by the spec-6.1 event-driven path."),
+		gettext_noop("Spin budget consumed by cluster.interconnect_rdma_completion=busypoll "
+					 "before the LMON loop yields."),
 		&cluster_interconnect_rdma_busypoll_us, 50, 0, 10000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1429,6 +1468,131 @@ cluster_init_guc(void)
 		"cluster.wal_receiver_timeout_sec", gettext_noop("ADG RFS WAL receiver timeout."),
 		gettext_noop("Standby-side per-thread ADG receive waits time out after this many seconds."),
 		&cluster_wal_receiver_timeout_sec, 60, 1, 3600, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	/*
+	 * cluster.page_scn_shortcut -- spec-6.12 wave c (read layer 3).  When
+	 * on, the cluster visibility resolver memoizes TERMINAL remote
+	 * transaction outcomes (exact TT key, per top-level transaction) and
+	 * replays them instead of repeating the TT overlay lookup for every
+	 * tuple.  Terminal outcomes are immutable, so the memo never answers
+	 * anything the same transaction's authoritative lookup did not
+	 * already answer.  Default OFF: resolver behaviour byte-identical to
+	 * the 5.59 baseline.  SUSET for measurement-window toggling (same
+	 * rationale as cluster.xnode_profile).
+	 */
+	DefineCustomBoolVariable(
+		"cluster.page_scn_shortcut",
+		gettext_noop("Enable the cross-node visibility resolver terminal-outcome memo."),
+		gettext_noop("Off keeps the per-tuple TT lookup path byte-identical."),
+		&cluster_page_scn_shortcut, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.read_scache -- spec-6.12 wave a (read layer 1).  When on, a
+	 * master==holder node serving a cross-node read of a QUIESCENT block
+	 * (no active ITL) flushes the page storage-current, downgrades its own
+	 * PCM X to S and grants the requester a durable S copy instead of a
+	 * one-shot read image -- repeat reads then hit the requester's local S
+	 * buffer with zero wire traffic (LockBuffer covered-mode fast path).
+	 * The pre-existing S invalidate-before-X machinery provides the real
+	 * invalidation path; S also becomes a revoked-write state at the ITL
+	 * forward-write gate.  Default OFF: every cross-node read of an X-held
+	 * block keeps the one-shot read-image behaviour (5.59 baseline).
+	 * SIGHUP: the decision runs in the LMON serve path, not per-session.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.read_scache", gettext_noop("Enable quiescent-block S-caching via X->S downgrade."),
+		gettext_noop("Off keeps one-shot read-image shipping for X-held blocks."),
+		&cluster_read_scache, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.ges_handoff -- spec-6.12 wave e1.  The deterministic
+	 * release-side drain (spec-5.3 D3) already grants the next compatible
+	 * convert/waiter in a single pass; this switch arms the 8.A-dual
+	 * verifier (no-double-grant / no-stale-holder / no-lost-waiter) over
+	 * every drain and the e1_* counters in the xnode_lever dump category,
+	 * so an invariant break surfaces as a counter + LOG.  Default OFF: the
+	 * drain path is byte-identical (verify skipped).  SUSET for a
+	 * measurement / chaos window without a restart.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ges_handoff",
+		gettext_noop("Verify the GES release-side deterministic handoff invariants."),
+		gettext_noop("Off keeps the drain path byte-identical (no verify, no counters)."),
+		&cluster_ges_handoff, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.crossnode_cr_data_plane -- spec-6.12 wave b (read layer 2).
+	 * When on, a CR construction whose newest candidate chain lives in a
+	 * REMOTE instance's undo (the spec-5.57 class-3 boundary that
+	 * otherwise fails closed 53R9G) asks that origin's CR-server for the
+	 * result: the origin's LMS constructs from its own current block +
+	 * local undo/TT and ships one CR page back (full, or a
+	 * write_scn-DESC-prefix partial the requester finishes locally).
+	 * Any uncertainty on either side -- origin cannot complete, chains
+	 * interleave across homes, timeout, checksum, GUC off on the origin
+	 * -- keeps the unchanged 53R9G fail-closed (Rule 8.A; the CR result
+	 * is never installed as current and never flushed).  Default OFF:
+	 * cross-instance CR keeps the 5.57 fail-closed boundary
+	 * byte-identical.  SUSET for measurement-window toggling.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.crossnode_cr_data_plane",
+		gettext_noop("Enable the cross-instance CR-server data plane (spec-6.12b)."),
+		gettext_noop("Off keeps cross-instance CR fail-closed (SQLSTATE 53R9G)."),
+		&cluster_crossnode_cr_data_plane, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.block_self_contained -- spec-6.12 wave g (write-write
+	 * collapse root).  When on, a block may be X-transferred across
+	 * instances WITH an uncommitted (ACTIVE) ITL slot -- the spec-5.2 D11
+	 * deferral that kept a block pinned to its holder until the holder's
+	 * transaction went terminal is lifted, so a same-block DIFFERENT-row
+	 * writer no longer waits on the holder's unrelated row.  The holder's
+	 * later commit stamps the ITL slot only if the block is still resident
+	 * (opportunistic cleanout); a drifted ACTIVE slot is left unstamped and
+	 * every reader resolves its committed-ness through the TT authority
+	 * (ITL->UBA->TT, AD-006), exactly as for any remote ITL ref.  SAME-row
+	 * conflicts still serialize through the cross-node TX enqueue wait
+	 * (spec-5.2 D4/D5, t/280).  8.A: the TT is the SOLE post-stamp-skip
+	 * commit_scn authority; any UNKNOWN resolution fails closed (53R97 /
+	 * 53R9G), never visible.  Default OFF: the D11 deferral is
+	 * byte-identical.  SUSET for a measurement / chaos window.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.block_self_contained",
+		gettext_noop("Allow active-ITL block migration + opportunistic commit cleanout "
+					 "(spec-6.12g)."),
+		gettext_noop("Off keeps the spec-5.2 D11 writer-transfer deferral for active-ITL blocks."),
+		&cluster_block_self_contained, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes
+	 * the cluster relation-extend path over-ask the HW master
+	 * (max(need, cluster.space_lease_blocks)), zero-extend the whole
+	 * grant (file stays dense) and park the unconsumed tail as this
+	 * node's private lease, consumed block-at-a-time before the shared
+	 * FSM (Q17-A extent-interior per-instance grouping; cuts HW master
+	 * round-trips by the lease factor).  dynamic is rejected until the
+	 * spec-6.3 DRM machinery ships (rule 8 explicit rejection).  Default
+	 * OFF: extend path byte-identical.
+	 */
+	DefineCustomEnumVariable(
+		"cluster.space_affinity",
+		gettext_noop("Instance space-affinity mode for cluster relation extends."),
+		gettext_noop("off = plain authority extends; static = per-node HW space leases."),
+		&cluster_space_affinity, CLUSTER_SPACE_AFFINITY_OFF, cluster_space_affinity_options,
+		PGC_SIGHUP, 0, check_cluster_space_affinity, NULL, NULL);
+
+	/*
+	 * cluster.space_lease_blocks -- spec-6.12 wave d.  Per-grant lease
+	 * cap; the transient bloat upper bound is
+	 * sum over active (relation, fork) leases of lease_blocks x nodes
+	 * (spec-6.12 v0.4 amendment 9), which the D0 bloat gate consumes.
+	 */
+	DefineCustomIntVariable(
+		"cluster.space_lease_blocks", gettext_noop("Blocks handed to a node per HW space lease."),
+		gettext_noop("Caps per-lease transient bloat (unconsumed zero pages)."),
+		&cluster_space_lease_blocks, 64, 1, 8192, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave

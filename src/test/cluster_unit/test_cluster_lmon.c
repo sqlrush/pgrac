@@ -192,6 +192,7 @@ char *cluster_injection_points = NULL;
  */
 bool cluster_enabled = false;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
+int cluster_interconnect_rdma_completion = 0; /* CLUSTER_IC_RDMA_COMPLETION_EVENT */
 
 /* spec-2.2 D7 GUCs (cluster_lmon.c references heartbeat_interval_ms). */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
@@ -682,6 +683,12 @@ cluster_ges_lmon_drain_work_queue(void)
 	return 0;
 }
 
+/* spec-6.12b — LmonMain ships finished CR-server results each tick; stub it
+ * (no LMS / no IC in the lmon unit harness). */
+void
+cluster_lms_cr_ship_ready(void)
+{}
+
 /* spec-5.16 — LmonMain sweeps abandoned reply-wait tombstones each tick; stub it
  * (real impl in cluster_ges_reply_wait.o, not linked into this standalone test). */
 int
@@ -692,6 +699,12 @@ cluster_ges_reply_wait_sweep_timeout(TimestampTz now pg_attribute_unused())
 
 int
 cluster_grd_outbound_lmon_drain_send(void)
+{
+	return 0;
+}
+
+int
+cluster_gcs_block_lmon_drain_direct_land_aborts(void)
 {
 	return 0;
 }

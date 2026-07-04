@@ -337,6 +337,28 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-forward-master-side" },
 	{ .name = "cluster-gcs-block-evict-holder-before-ship" },
 	/*
+	 * spec-6.12a ㉕ — remote-holder downgrade refusal injection.
+	 *
+	 *	cluster-gcs-block-remote-downgrade:
+	 *	  Fires inside the holder-side forward handler just before the
+	 *	  quiescent X->S remote downgrade attempt.  SKIP makes the holder
+	 *	  refuse the request → falls back to the pre-㉕ one-shot read-image
+	 *	  ship, so TAP can pin the refusal path (and the
+	 *	  a_remote_downgrade_refused_count observability) under a topology
+	 *	  that would otherwise downgrade.
+	 */
+	{ .name = "cluster-gcs-block-remote-downgrade" },
+	/*
+	 * spec-6.12b — CR-server construction refusal injection.
+	 *
+	 *	cluster-lms-cr-construct:
+	 *	  Fires in the LMS CR drain just before the stable copy +
+	 *	  construction.  SKIP forces the DENIED serve so TAP pins the
+	 *	  fail-closed requester leg (unchanged 53R9G) under a topology
+	 *	  that would otherwise serve FULL/PARTIAL.
+	 */
+	{ .name = "cluster-lms-cr-construct" },
+	/*
 	 * spec-5.2a D3 — FAITHFUL clean-page stale-holder injection.
 	 *
 	 *	cluster-clean-xfer-stale-holder:

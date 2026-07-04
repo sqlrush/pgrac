@@ -95,8 +95,8 @@ extern int cluster_node_id;
  *	            target!=self ereports ERRCODE_FEATURE_NOT_SUPPORTED.
  *	1 (tier1) = TCP.
  *	2 (tier2) = RDMA baseline through the transport mux.
- *	3 (tier3) = reserved RDMA optimized tier; fails closed until the
- *	            mlx5 direct-verbs provider is implemented.
+	 *	3 (tier3) = RDMA optimized tier; requests mlx5/direct-verbs and
+	 *	            falls back according to cluster.interconnect_rdma_fallback.
  *
  *	context: PGC_POSTMASTER (tier change requires reinitialising the
  *	         interconnect stack; runtime SET is rejected).
@@ -172,6 +172,37 @@ extern int cluster_adg_lease_takeover_grace_ms;
 extern int cluster_adg_barrier_interval_ms;
 extern int cluster_wal_sender_timeout_sec;
 extern int cluster_wal_receiver_timeout_sec;
+/* spec-6.12c: resolver terminal memo switch (default off). */
+extern bool cluster_page_scn_shortcut;
+
+/* spec-6.12a: quiescent S-cache switch (default off). */
+extern bool cluster_read_scache;
+
+/* spec-6.12e1: GES release-side handoff verify switch (default off). */
+extern bool cluster_ges_handoff;
+
+/* spec-6.12b: cross-instance CR-server data plane (default off = 53R9G). */
+extern bool cluster_crossnode_cr_data_plane;
+
+/* spec-6.12g: block self-containment switch (default off = D11 deferral). */
+extern bool cluster_block_self_contained;
+
+/*
+ * spec-6.12d: instance space-affinity mode (default off).  static parks
+ * the unconsumed tail of oversized HW grants as a per-node lease
+ * (Q17-A extent-interior grouping); dynamic is spec-6.3 DRM territory
+ * and is rejected at GUC check time until that ships.
+ */
+typedef enum ClusterSpaceAffinity {
+	CLUSTER_SPACE_AFFINITY_OFF = 0,
+	CLUSTER_SPACE_AFFINITY_STATIC,
+	CLUSTER_SPACE_AFFINITY_DYNAMIC,
+} ClusterSpaceAffinity;
+
+extern int cluster_space_affinity;
+
+/* spec-6.12d: per-lease grant-size cap in blocks (bloat bound input). */
+extern int cluster_space_lease_blocks;
 
 
 /*

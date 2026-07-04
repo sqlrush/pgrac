@@ -102,6 +102,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
+#include "cluster/cluster_xnode_lever.h"	  /* xnode lever counters (spec-6.12) */
+#include "cluster/cluster_hw_lease.h"		  /* space-lease counters (spec-6.12d) */
 #include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
 #include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
@@ -1769,6 +1771,19 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_wal_flush_before_ship_count()));
 	emit_row(rsinfo, "gcs", "block_ship_bytes_total",
 			 fmt_int64((int64)cluster_gcs_get_block_ship_bytes_total()));
+	/* spec-6.13 D8: RDMA tier3/direct-land copy path observability. */
+	emit_row(rsinfo, "gcs", "scratch_copy_count",
+			 fmt_int64((int64)cluster_gcs_get_scratch_copy_count()));
+	emit_row(rsinfo, "gcs", "live_sge_send_count",
+			 fmt_int64((int64)cluster_gcs_get_live_sge_send_count()));
+	emit_row(rsinfo, "gcs", "live_sge_fallback_count",
+			 fmt_int64((int64)cluster_gcs_get_live_sge_fallback_count()));
+	emit_row(rsinfo, "gcs", "direct_install_count",
+			 fmt_int64((int64)cluster_gcs_get_direct_install_count()));
+	emit_row(rsinfo, "gcs", "direct_install_abort_count",
+			 fmt_int64((int64)cluster_gcs_get_direct_install_abort_count()));
+	emit_row(rsinfo, "gcs", "install_copy_count",
+			 fmt_int64((int64)cluster_gcs_get_install_copy_count()));
 
 	/* spec-2.34 D10:  9 NEW reliability hardening counter rows
 	 * (dump_gcs 22 → 31 row).  Mirrors counters in
@@ -2401,10 +2416,11 @@ dump_undo(ReturnSetInfo *rsinfo)
 /*
  * dump_cr -- spec-3.9 D8 own-instance CR counter observability.
  *
- *	Emits 35 rows under category='cr' (9 spec-3.9 own-instance CR + 4 spec-3.10
+ *	Emits 41 rows under category='cr' (9 spec-3.9 own-instance CR + 4 spec-3.10
  *	L1 cache + 4 spec-3.22 xmax + 5 spec-5.53 identity/reuse-fence mismatch +
- *	8 spec-5.54 tuple-fast-path + 5 spec-5.56 lifecycle) plus the 'cr_pool'
- *	(spec-5.51) and admission (spec-5.52) rows.  Backs cluster_tap t/215 + t/311.
+ *	8 spec-5.54 tuple-fast-path + 5 spec-5.56 lifecycle + 6 spec-6.12b
+ *	CR-server rows) plus the 'cr_pool' (spec-5.51) and admission (spec-5.52)
+ *	rows.  Backs cluster_tap t/215 + t/311.
  */
 static void
 dump_cr(ReturnSetInfo *rsinfo)
@@ -2432,6 +2448,19 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_cache_evict_count()));
 	emit_row(rsinfo, "cr", "cr_cache_install_count",
 			 fmt_int64((int64)cluster_cr_cache_install_count()));
+	/* spec-6.12b: CR-server data plane (cr category 35 -> 41 rows). */
+	emit_row(rsinfo, "cr", "cr_remote_full_count",
+			 fmt_int64((int64)cluster_cr_remote_full_count()));
+	emit_row(rsinfo, "cr", "cr_remote_partial_count",
+			 fmt_int64((int64)cluster_cr_remote_partial_count()));
+	emit_row(rsinfo, "cr", "cr_remote_failed_count",
+			 fmt_int64((int64)cluster_cr_remote_failed_count()));
+	emit_row(rsinfo, "cr", "cr_server_full_count",
+			 fmt_int64((int64)cluster_cr_server_full_count()));
+	emit_row(rsinfo, "cr", "cr_server_partial_count",
+			 fmt_int64((int64)cluster_cr_server_partial_count()));
+	emit_row(rsinfo, "cr", "cr_server_denied_count",
+			 fmt_int64((int64)cluster_cr_server_denied_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));
@@ -2674,6 +2703,25 @@ dump_hw(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_hw_remaster_done_count()));
 	emit_row(rsinfo, "hw", "remaster_blocked_count",
 			 fmt_int64((int64)cluster_hw_remaster_blocked_count()));
+
+	/*
+	 * spec-6.12d D-obs: space-lease counters.  bloat_ratio itself is a
+	 * per-relation D0-gate metric the harness computes from these plus
+	 * relation size; outstanding = leased_total - consumed - orphan_zero
+	 * is the live zero-page inventory across all active leases.
+	 */
+	if (ClusterHwLeaseCtl != NULL) {
+		uint64 leased = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_leased_total);
+		uint64 consumed = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_consumed);
+		uint64 orphan = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_orphan_zero);
+
+		emit_row(rsinfo, "hw", "lease_leased_total", fmt_int64((int64)leased));
+		emit_row(rsinfo, "hw", "lease_consumed", fmt_int64((int64)consumed));
+		emit_row(rsinfo, "hw", "lease_orphan_zero", fmt_int64((int64)orphan));
+		emit_row(rsinfo, "hw", "lease_grants",
+				 fmt_int64((int64)pg_atomic_read_u64(&ClusterHwLeaseCtl->d_lease_grants)));
+		emit_row(rsinfo, "hw", "lease_outstanding", fmt_int64((int64)(leased - consumed - orphan)));
+	}
 }
 
 /*
@@ -2791,6 +2839,43 @@ dump_xnode_profile(ReturnSetInfo *rsinfo)
 			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_remote_count) : 0));
 }
 
+/*
+ * dump_xnode_lever -- spec-6.12 per-wave lever counters.
+ *
+ *	Wave-prefixed keys (c_* = wave 6.12c resolver memo + D0 stamp-evidence
+ *	classification).  Keys are emitted even while every wave GUC is off
+ *	(values stay 0) so the key surface is stable for tests and samplers;
+ *	later waves append keys, never rename (5.59 Q9-B category paradigm).
+ */
+static void
+dump_xnode_lever(ReturnSetInfo *rsinfo)
+{
+	ClusterXnodeLeverShared *ctl = ClusterXnodeLeverCtl;
+
+#define XNL_ROW(field)                                                                             \
+	emit_row(rsinfo, "xnode_lever", #field,                                                        \
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->field) : 0))
+	XNL_ROW(c_resolve_count);
+	XNL_ROW(c_tt_lookup_count);
+	XNL_ROW(c_memo_hit_count);
+	XNL_ROW(c_memo_install_count);
+	XNL_ROW(c_stamp_cached_seen_count);
+	XNL_ROW(c_stamp_contradicted_count);
+	XNL_ROW(a_downgrade_count);
+	XNL_ROW(a_downgrade_refused_count);
+	XNL_ROW(a_fwd_oneshot_count);
+	XNL_ROW(a_remote_downgrade_count);
+	XNL_ROW(a_remote_downgrade_refused_count);
+	XNL_ROW(a_remote_ack_degraded_count);
+	XNL_ROW(e1_drain_count);
+	XNL_ROW(e1_grant_count);
+	XNL_ROW(e1_invariant_violation_count);
+	XNL_ROW(g_active_itl_transfer_count);
+	XNL_ROW(g_stamp_skipped_count);
+	XNL_ROW(g_drift_resolved_via_tt_count);
+#undef XNL_ROW
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -2857,6 +2942,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_ts(rsinfo);
 		dump_ko(rsinfo);
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
+		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

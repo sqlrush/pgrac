@@ -85,12 +85,72 @@
 #define GCS_BLOCK_DATA_SIZE 8192
 
 /*
+ * Keep the per-backend outstanding-block cap visible to the RDMA direct-land
+ * lane: wr_id/sidecar arm ids are derived from backend_idx * cap + slot_idx
+ * so LMON can demux a completion without scanning every backend.
+ */
+#define CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND 8
+
+/*
  * spec-2.35 HC108/HC109: forwarding_master_node_bytes stores the master that
  * authorized a holder-to-requester direct ship.  Node 0 is a valid cluster
  * node, so the direct-from-master sentinel must be outside the legal node-id
  * range.
  */
 #define GCS_BLOCK_REPLY_NO_FORWARDING_MASTER (-1)
+
+typedef enum ClusterGcsBlockDirectState {
+	GCS_BLOCK_DIRECT_UNARMED = 0,
+	GCS_BLOCK_DIRECT_ARMING,
+	GCS_BLOCK_DIRECT_ARMED,
+	GCS_BLOCK_DIRECT_LANDED,
+	GCS_BLOCK_DIRECT_INSTALLED,
+	GCS_BLOCK_DIRECT_ABORTING,
+	GCS_BLOCK_DIRECT_ABORTED,
+} ClusterGcsBlockDirectState;
+
+typedef enum ClusterGcsBlockDirectTargetKind {
+	GCS_BLOCK_DIRECT_TARGET_NONE = 0,
+	GCS_BLOCK_DIRECT_TARGET_SHARED_BUFFER,
+	GCS_BLOCK_DIRECT_TARGET_STAGING_PAGE,
+} ClusterGcsBlockDirectTargetKind;
+
+typedef enum ClusterGcsBlockDirectAbortReason {
+	GCS_BLOCK_DIRECT_ABORT_NONE = 0,
+	GCS_BLOCK_DIRECT_ABORT_ARM_FAILED,
+	GCS_BLOCK_DIRECT_ABORT_CQE_ERROR,
+	GCS_BLOCK_DIRECT_ABORT_BAD_LENGTH,
+	GCS_BLOCK_DIRECT_ABORT_BAD_SIDECAR,
+	GCS_BLOCK_DIRECT_ABORT_BAD_STATUS,
+	GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY,
+	GCS_BLOCK_DIRECT_ABORT_BAD_CHECKSUM,
+	GCS_BLOCK_DIRECT_ABORT_TIMEOUT,
+	GCS_BLOCK_DIRECT_ABORT_PEER_DOWN,
+} ClusterGcsBlockDirectAbortReason;
+
+static inline bool
+cluster_gcs_block_direct_state_transition_ok(ClusterGcsBlockDirectState from,
+											 ClusterGcsBlockDirectState to)
+{
+	switch (from) {
+	case GCS_BLOCK_DIRECT_UNARMED:
+		return to == GCS_BLOCK_DIRECT_ARMING;
+	case GCS_BLOCK_DIRECT_ARMING:
+		return to == GCS_BLOCK_DIRECT_ARMED || to == GCS_BLOCK_DIRECT_UNARMED
+			   || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_ARMED:
+		return to == GCS_BLOCK_DIRECT_LANDED || to == GCS_BLOCK_DIRECT_ABORTING
+			   || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_LANDED:
+		return to == GCS_BLOCK_DIRECT_INSTALLED || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_ABORTING:
+		return to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_INSTALLED:
+	case GCS_BLOCK_DIRECT_ABORTED:
+		return to == GCS_BLOCK_DIRECT_UNARMED;
+	}
+	return false;
+}
 
 
 /* ============================================================
@@ -174,7 +234,7 @@ typedef enum GcsBlockReplyStatus {
 													 * Reuses HC103 copy-ship + HC127
 													 * watermark. */
 	,
-	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14 /* PGRAC: spec-5.16 D3b NEW;
+	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14,  /* PGRAC: spec-5.16 D3b NEW;
 													 * master-side hard gate (INV-R8/R14)
 													 * — the master (a rejoining node) is
 													 * NOT yet a quorum MEMBER, or the
@@ -185,14 +245,115 @@ typedef enum GcsBlockReplyStatus {
 													 * requester routed here never gets a
 													 * cold grant.  sender maps to 53R9L
 													 * (retry-safe, Class 53). */
+	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE = 15, /* PGRAC: spec-6.12a ㉕ NEW;
+													 * the remote X holder accepted the
+													 * downgrade request: it flushed the
+													 * quiescent page, flipped its own
+													 * copy X→S, fired the master
+													 * PCM_TRANS_X_TO_S_DOWNGRADE notify,
+													 * and ships this DURABLE S grant.
+													 * The requester installs the bytes,
+													 * then registers as an S holder via
+													 * the normal N→S transition (wire
+													 * try-ACK for the 3-corner path;
+													 * local apply when requester ==
+													 * master).  If that registration is
+													 * denied (notify raced or lost) the
+													 * requester DEGRADES to the one-shot
+													 * read-image semantics: pcm_state
+													 * stays N, no S copy is retained
+													 * (Rule 8.A fail-closed — never a
+													 * durable copy the master does not
+													 * track).  HC108 authorized chain
+													 * applies as for GRANTED_FROM_HOLDER. */
+	GCS_BLOCK_REPLY_CR_RESULT_FULL = 16,			  /* PGRAC: spec-6.12b NEW; the
+													 * origin's LMS constructed the
+													 * COMPLETE CR page at the carried
+													 * read_scn (every candidate chain
+													 * was origin-home).  The page is a
+													 * consistent-read result: NEVER
+													 * installed as current, never
+													 * flushed, consumed only by the CR
+													 * waiter into the CR cache slot /
+													 * scratch (Rule 8.A hard
+													 * invariant). */
+	GCS_BLOCK_REPLY_CR_RESULT_PARTIAL = 17			  /* PGRAC: spec-6.12b NEW; the
+													 * origin's LMS applied the
+													 * write_scn-DESC PREFIX of the
+													 * candidate chains (all
+													 * origin-home) and stopped at the
+													 * first foreign chain — which in
+													 * the 2-node topology is
+													 * requester-home.  The requester
+													 * CONTINUES the construction
+													 * locally on the shipped page (the
+													 * remaining candidates re-derive
+													 * from the page's ITL state); any
+													 * still-foreign chain there hits
+													 * the class-③ walk backstop ->
+													 * 53R9G (Rule 8.A). */
 } GcsBlockReplyStatus;
 
-/* spec-5.16 D3b / r4 — the new reply status MUST be the tail value (no
- * collision with any shipped status; r3 mis-read a truncated enum as max 8,
- * the real shipped max is READ_IMAGE_FROM_XHOLDER=13). */
+/* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
+ * appended as the tail value (no collision with any shipped status; r3 mis-read
+ * a truncated enum as max 8, the real shipped max before spec-5.16 was
+ * READ_IMAGE_FROM_XHOLDER=13). */
 StaticAssertDecl(GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING
 					 == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER + 1,
-				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must be the tail enum value");
+				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must follow READ_IMAGE_FROM_XHOLDER");
+StaticAssertDecl(
+	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE == GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1,
+	"GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE must follow DENIED_RESOURCE_RECOVERING");
+StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_FULL + 1
+					 && GCS_BLOCK_REPLY_CR_RESULT_FULL
+							== GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1,
+				 "spec-6.12b CR result statuses must be the tail enum values");
+
+static inline bool
+GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
+{
+	return status == GCS_BLOCK_REPLY_GRANTED
+		   || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+}
+
+static inline bool
+GcsBlockReplyStatusIsDirectLandSendable(GcsBlockReplyStatus status)
+{
+	if (GcsBlockReplyStatusAllowsDirectLandInstall(status))
+		return true;
+	switch (status) {
+	case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
+	case GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT:
+	case GCS_BLOCK_REPLY_DENIED_EPOCH_STALE:
+	case GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL:
+	case GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER:
+	case GCS_BLOCK_REPLY_DENIED_DEDUP_FULL:
+	case GCS_BLOCK_REPLY_DENIED_PENDING_X:
+	case GCS_BLOCK_REPLY_DENIED_INVALIDATE_TIMEOUT:
+	case GCS_BLOCK_REPLY_DENIED_LOST_WRITE:
+	case GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING:
+		return true;
+	default:
+		break;
+	}
+	return false;
+}
+
+static inline bool
+GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GcsBlockReplyStatus status)
+{
+	if (status == GCS_BLOCK_REPLY_GRANTED)
+		return true;
+	return !GcsBlockReplyStatusAllowsDirectLandInstall(status)
+		   && GcsBlockReplyStatusIsDirectLandSendable(status);
+}
+
+static inline bool
+GcsBlockDirectCanArmExpectedPeer(int32 holder_node, int32 expected_peer)
+{
+	return holder_node < 0 || holder_node == expected_peer;
+}
 
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
@@ -461,6 +622,22 @@ static inline bool
 GcsBlockRequestPayloadIsCleanEligible(const GcsBlockRequestPayload *p)
 {
 	return p->reserved_0[0] != 0;
+}
+
+/* PGRAC: spec-6.13 D6 — direct-land arming flag carried in REQUEST
+ * reserved_0[1].  REQUEST bytes are independent from FORWARD bytes; [0] is
+ * the clean-page X-transfer eligibility flag above and [1] was previously
+ * unused. */
+static inline void
+GcsBlockRequestPayloadSetDirectLandArmed(GcsBlockRequestPayload *p, bool armed)
+{
+	p->reserved_0[1] = armed ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockRequestPayloadIsDirectLandArmed(const GcsBlockRequestPayload *p)
+{
+	return p->reserved_0[1] != 0;
 }
 
 
@@ -851,6 +1028,92 @@ GcsBlockForwardPayloadIsCleanEligible(const GcsBlockForwardPayload *p)
 	return p->reserved_0[2] != 0;
 }
 
+/* PGRAC: spec-6.12a ㉕ — remote-holder downgrade request flag carried in
+ * reserved_0[3] ([0]=read-image, [1]=X-transfer, [2]=clean-eligible above;
+ * [4..6] remain free).
+ *
+ *	Set by the master ALONGSIDE the read-image flag when forwarding an N→S
+ *	read to a remote X holder and cluster.read_scache is on: the holder
+ *	should TRY the quiescent X→S self-downgrade (flush + local flip + master
+ *	notify) and, on success, ship a durable S grant
+ *	(S_GRANTED_XHOLDER_DOWNGRADE) instead of the one-shot read image.
+ *	Refusal (active ITL / raced / flush unavailable / notify send failure)
+ *	falls back to the read-image ship — the flag is a request, never a
+ *	command (Rule 8.A: the holder alone can judge quiescence).  A holder
+ *	running with cluster.read_scache=off ignores the flag entirely
+ *	(off-path byte-identical). */
+static inline void
+GcsBlockForwardPayloadSetDowngradeRequest(GcsBlockForwardPayload *p, bool downgrade)
+{
+	p->reserved_0[3] = downgrade ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsDowngradeRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[3] != 0;
+}
+
+/* PGRAC: spec-6.12b — cross-instance CR request flag carried in reserved_0[4]
+ * ([0]=read-image, [1]=X-transfer, [2]=clean-eligible, [3]=downgrade-request
+ * above; [5..6] remain free).
+ *
+ *	Sent REQUESTER -> ORIGIN (the foreign undo home derived from the chain
+ *	head UBA), riding the same 64B forward wire the sub-case B read-image
+ *	path already sends requester->holder.  With this flag set the
+ *	expected_pi_watermark_scn_bytes[8] carrier is REINTERPRETED as the
+ *	requester's snapshot read_scn (both are SCN carriers; a CR result is
+ *	historical by intent so the lost-write watermark verdict does not apply
+ *	on this path).  master_node = the requester itself, so the HC108
+ *	authorized chain on the direct-shipped reply validates exactly like the
+ *	sub-case B flow.  The origin's LMON only VALIDATES + parks the request
+ *	for LMS (light-work rule: construction never runs in the dispatch
+ *	loop); LMS constructs, LMON ships CR_RESULT_FULL / CR_RESULT_PARTIAL,
+ *	or a DENIED status which the requester maps to the unchanged 53R9G
+ *	fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetCrRequest(GcsBlockForwardPayload *p, bool cr_request)
+{
+	p->reserved_0[4] = cr_request ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCrRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[4] != 0;
+}
+
+/* PGRAC: spec-6.13 D6 — direct-land arming flag on FORWARD uses
+ * reserved_0[5].  The frozen spec text mentioned [3], but spec-6.12a already
+ * uses [3] for downgrade-request and spec-6.12b uses [4] for CR request; [5]
+ * is the first remaining free byte in the 7-byte FORWARD reserved area. */
+static inline void
+GcsBlockForwardPayloadSetDirectLandArmed(GcsBlockForwardPayload *p, bool armed)
+{
+	p->reserved_0[5] = armed ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[5] != 0;
+}
+
+/*
+ * spec-6.13 D6 safety gate: a master must not propagate the requester's
+ * direct-land flag to a forwarded holder unless the requester armed that exact
+ * holder as the expected block-reply peer.  Until redirect/exact-holder arm
+ * lands, all current forward paths pass exact_holder_arm=false.
+ */
+static inline void
+GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
+											   const GcsBlockRequestPayload *req,
+											   bool exact_holder_arm)
+{
+	GcsBlockForwardPayloadSetDirectLandArmed(
+		fwd, exact_holder_arm && GcsBlockRequestPayloadIsDirectLandArmed(req));
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -950,10 +1213,26 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
+extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
+														 void **out_page_addr,
+														 BufferDesc **out_buf);
+extern void cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf);
+extern bool cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag,
+															  void **out_page_addr);
+extern void cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
+															 XLogRecPtr page_lsn);
+extern uint32 cluster_gcs_block_compute_checksum(const char *block_data);
 extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn,
 														   char *dst, ClusterSfDepVec *out_dep_vec);
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
+extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
+/* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
+ * ITL stamp; residency proves ownership (a self-contained transfer drops the
+ * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */
+extern Buffer cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
+													 BlockNumber blocknum);
+extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop
@@ -961,6 +1240,22 @@ extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode e
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
+
+/* PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
+ * Backend-context path for a writer on the master node whose block was
+ * quiescent-downgraded: pending_x barrier + INVALIDATE broadcast via the
+ * backend outbound ring + ack-certified bit clearing + S_TO_X_UPGRADE.
+ * False = slot busy / ack timeout / raced state (caller stays on the
+ * pre-6.12a bounded fail-closed, Rule 8.A). */
+extern bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
+
+/* PGRAC: spec-6.12a — master==holder quiescent X->S self-downgrade.  Flushes
+ * a dirty page to shared storage first (every S copy stays storage-
+ * consistent), applies PCM_TRANS_X_TO_S_DOWNGRADE, flips the local
+ * pcm_state cache X->S.  False = not quiescent / not X / buffer gone /
+ * master refused; caller falls back to the one-shot read-image ship. */
+extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
+extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
 
 /* PGRAC: spec-5.2a D4 (backend eager flush) — flush a cluster sequence page to
  * shared storage from the BACKEND that just wrote it.  Caller holds a pin and
@@ -1187,6 +1482,13 @@ extern uint64 cluster_gcs_get_block_storage_fallback_count(void);
 extern uint64 cluster_gcs_get_block_master_not_holder_count(void);
 extern uint64 cluster_gcs_get_block_wal_flush_before_ship_count(void);
 extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
+/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+extern uint64 cluster_gcs_get_scratch_copy_count(void);
+extern uint64 cluster_gcs_get_live_sge_send_count(void);
+extern uint64 cluster_gcs_get_live_sge_fallback_count(void);
+extern uint64 cluster_gcs_get_direct_install_count(void);
+extern uint64 cluster_gcs_get_direct_install_abort_count(void);
+extern uint64 cluster_gcs_get_install_copy_count(void);
 
 /* ============================================================
  * spec-2.34 D1 — reliability hardening counter accessors (9 NEW).
@@ -1281,6 +1583,29 @@ extern uint64 cluster_gcs_get_recovery_before_boundary_failclosed(void);
  *	of ClusterGcsBlockShared to other translation units.
  */
 extern void cluster_gcs_block_bump_master_holder_lifecycle(void);
+
+/*
+ * spec-6.13 D6 direct-land hooks.
+ *
+ * LMON calls prepare_outbound_request after dequeuing a backend-produced
+ * GCS_BLOCK_REQUEST but before sending it on the wire.  The hook posts the
+ * two-SGE block-reply receive when the slot is in ARMING state and sets the
+ * request direct-land flag only after post_recv succeeds.
+ *
+ * The RDMA block-reply lane calls handle_direct_land_completion for receive
+ * CQEs.  `sidecar` points at exactly
+ * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES bytes containing
+ * ClusterICEnvelope + GcsBlockReplyHeader; the landed page is already in the
+ * slot target.
+ */
+extern void cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req,
+															int32 dest_node);
+extern void cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_id,
+																 bool cqe_success, uint32 byte_len,
+																 const void *sidecar);
+extern void cluster_gcs_block_lmon_abort_direct_land_peer(int32 peer_node,
+														  ClusterGcsBlockDirectAbortReason reason);
+extern int cluster_gcs_block_lmon_drain_direct_land_aborts(void);
 
 
 /* ============================================================

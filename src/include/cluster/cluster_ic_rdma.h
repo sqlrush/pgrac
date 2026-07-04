@@ -59,6 +59,14 @@ typedef enum ClusterICRdmaPeerState {
 	CLUSTER_IC_RDMA_PEER_ERROR,
 } ClusterICRdmaPeerState;
 
+typedef enum ClusterICRdmaBlockReplyLaneState {
+	CLUSTER_IC_RDMA_BLOCK_REPLY_DISABLED = 0,
+	CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTING,
+	CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED,
+	CLUSTER_IC_RDMA_BLOCK_REPLY_RESETTING,
+	CLUSTER_IC_RDMA_BLOCK_REPLY_ERROR,
+} ClusterICRdmaBlockReplyLaneState;
+
 typedef struct ClusterICMr {
 	void *base;
 	size_t len;
@@ -76,6 +84,91 @@ typedef struct ClusterICSge {
 	void *release_arg;
 } ClusterICSge;
 
+/*
+ * spec-6.13 D3/D6 constants.  Keep these header-visible so cluster_unit can
+ * pin the queue-depth policy and block-reply direct-land wire size without
+ * linking the backend RDMA implementation.
+ */
+#define CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP 32
+#define CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES 84
+#define CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES \
+	(CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES + BLCKSZ)
+#define CLUSTER_IC_RDMA_BLOCK_REPLY_MAX_RECV_SGE 2
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_RECV UINT64CONST(0x5400000000000000)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_MASK UINT64CONST(0xFF00000000000000)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_SHIFT 32
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_MASK UINT64CONST(0x00FFFFFF)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_GENERATION_SHIFT 16
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK UINT64CONST(0xFFFF)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES \
+	(CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK + UINT64CONST(1))
+
+static inline uint32
+cluster_ic_rdma_signal_batch_k(uint32 max_send_wr)
+{
+	uint32 k = max_send_wr / 2;
+
+	if (k == 0)
+		k = 1;
+	if (k > CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP)
+		k = CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP;
+	return k;
+}
+
+static inline bool
+cluster_ic_rdma_payload_inline_eligible(uint32 payload_len, int inline_max)
+{
+	return inline_max > 0 && payload_len <= (uint32)inline_max;
+}
+
+static inline bool
+cluster_ic_rdma_direct_land_wr_field_valid(uint32 value)
+{
+	return value <= (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK;
+}
+
+static inline bool
+cluster_ic_rdma_direct_land_arm_capacity_valid(uint32 capacity)
+{
+	return capacity <= (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES;
+}
+
+static inline uint32
+cluster_ic_rdma_direct_land_next_generation(uint32 generation)
+{
+	generation = (generation + 1) & (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK;
+	return generation == 0 ? 1 : generation;
+}
+
+static inline uint64
+cluster_ic_rdma_direct_land_make_wr_id(uint32 peer_id, uint32 arm_id, uint32 generation)
+{
+	return CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_RECV
+		   | (((uint64)peer_id & CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_MASK)
+			  << CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_SHIFT)
+		   | (((uint64)generation & CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK)
+			  << CLUSTER_IC_RDMA_DIRECT_LAND_WR_GENERATION_SHIFT)
+		   | ((uint64)arm_id & CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK);
+}
+
+static inline bool
+cluster_ic_rdma_direct_land_decode_wr_id(uint64 wr_id, uint32 *peer_id, uint32 *arm_id,
+										 uint32 *generation)
+{
+	if ((wr_id & CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_MASK)
+		!= CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_RECV)
+		return false;
+	if (peer_id != NULL)
+		*peer_id = (uint32)((wr_id >> CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_SHIFT)
+							& CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_MASK);
+	if (generation != NULL)
+		*generation = (uint32)((wr_id >> CLUSTER_IC_RDMA_DIRECT_LAND_WR_GENERATION_SHIFT)
+							   & CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK);
+	if (arm_id != NULL)
+		*arm_id = (uint32)(wr_id & CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK);
+	return true;
+}
+
 typedef struct ClusterICRdmaCtx ClusterICRdmaCtx;
 typedef struct ClusterICQp ClusterICQp;
 typedef struct ClusterICWc ClusterICWc;
@@ -86,8 +179,8 @@ typedef struct ClusterICRdmaProvider {
 	bool (*reg_region)(ClusterICRdmaCtx *ctx, void *base, size_t len, ClusterICMr *out);
 	bool (*qp_create)(ClusterICRdmaCtx *ctx, int32 peer, ClusterICQp *out);
 	ClusterICSendResult (*post_send)(ClusterICQp *qp, const ClusterICSge *sge, int n_sge,
-									 bool signaled, uint32 imm);
-	bool (*post_recv)(ClusterICQp *qp, ClusterICSge *sge);
+									 bool signaled, bool inline_send, uint32 imm);
+	bool (*post_recv)(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, uint64 wr_id);
 	int (*poll_cq)(ClusterICRdmaCtx *ctx, ClusterICWc *out, int max);
 	void (*device_close)(ClusterICRdmaCtx *ctx);
 } ClusterICRdmaProvider;
@@ -140,13 +233,17 @@ extern bool cluster_ic_rdma_pending_outbound(int32 peer_id);
 /*
  * D5 guard surface: callers may ask whether the current active transport can
  * carry a block image by RDMA SEND-with-SGE while preserving the envelope
- * verify/quarantine/install chain.  The SGE points at a registered per-peer
- * scratch MR populated under the normal bufmgr content-lock copy contract;
- * it never borrows a live shared_buffers page across asynchronous CQ
- * completion.  False means the caller must keep the existing contiguous
- * envelope path.
+ * verify/quarantine/install chain.  A block payload may be either a
+ * registered per-peer scratch MR or a raw-pinned shared_buffers page whose
+ * address is validated against the shared_buffers MR by
+ * cluster_ic_rdma_shared_buffers_sge().  The GCS owner remains responsible
+ * for WAL flush/revalidation and release after SEND completion/fallback.
+ * False means the caller must keep the existing contiguous envelope path.
+ * This is sender-side SGE support only, not receiver direct-land.
  */
 extern bool cluster_ic_rdma_block_sge_supported(const char **reason);
+extern bool cluster_ic_rdma_block_reply_lane_connected(int32 peer_id, const char **reason);
+extern bool cluster_ic_rdma_shared_buffers_sge(void *addr, size_t len, uint32 *out_lkey);
 extern bool cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void **out_addr,
 												 uint32 *out_lkey,
 												 ClusterICSgeReleaseCallback *out_release_cb,
@@ -154,6 +251,12 @@ extern bool cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void
 extern ClusterICSendResult cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 															 const ClusterICSge *payload_sge,
 															 int n_sge, uint32 payload_len);
+extern bool cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id,
+												  uint32 generation, void *target_addr,
+												  uint32 target_lkey);
+extern ClusterICSendResult cluster_ic_rdma_send_block_reply_direct(
+	int32 dest_node_id, const ClusterICSge *payload_sge, int n_sge, uint32 payload_len);
+extern void cluster_ic_rdma_block_reply_abort_peer(int32 peer_id, const char *reason);
 
 extern Datum cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS);
 

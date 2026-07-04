@@ -55,6 +55,7 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server result ship */
 #include "cluster/cluster_backup.h" /* cluster_backup_register_ic_msg_types + lmon_tick (spec-6.5) */
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
@@ -1007,6 +1008,9 @@ LmonMain(void)
 			 * LMS never advances past STARTING for the ownership purpose.
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+			 * constructed them; only LMON owns the IC connections). */
+			cluster_lms_cr_ship_ready();
 			/*
 			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
 			 * tombstones whose bounded TTL has elapsed.  This is the documented
@@ -1019,6 +1023,7 @@ LmonMain(void)
 			 */
 			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
 			cluster_grd_outbound_lmon_drain_send();
+			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			cluster_lms_native_probe_retry_tick();
 
 			/* spec-5.13 D6: clean-leave orchestration runs BEFORE the reconfig
@@ -1381,13 +1386,20 @@ LmonMain(void)
 
 			now = GetCurrentTimestamp();
 			wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
-			if (wait_ms < 0)
-				wait_ms = 0;
-			if (wait_ms > HEARTBEAT_INTERVAL_MS)
-				wait_ms = HEARTBEAT_INTERVAL_MS;
+				if (wait_ms < 0)
+					wait_ms = 0;
+				if (wait_ms > HEARTBEAT_INTERVAL_MS)
+					wait_ms = HEARTBEAT_INTERVAL_MS;
+				if ((ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
+					&& (ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
+						   == CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL) {
+					cluster_ic_rdma_lmon_handle_completion_events();
+					if (wait_ms > 1)
+						wait_ms = 1;
+				}
 
-			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
-										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
+				n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
+											WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
 			for (i = 0; i < n_events; i++) {
 				intptr_t tag = (intptr_t)ev[i].user_data;
@@ -1627,6 +1639,10 @@ LmonMain(void)
 			 * single node has no peers to send to).
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
+			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+			 * constructed them; only LMON owns the IC connections). */
+			cluster_lms_cr_ship_ready();
 
 			cluster_sinval_drain_outbound_and_broadcast();
 			cluster_sinval_drain_ack_outbound_and_send();

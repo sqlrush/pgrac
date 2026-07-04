@@ -728,7 +728,13 @@
  * originally bumped 202606340 -> 202606350; merging after spec-6.1
  * (202606360) and spec-6.4 (202606370) re-bumps it past both.
  * Bump 202606370 -> 202606380. */
-#define CATALOG_VERSION_NO 202606380
+/* spec-6.13: RDMA tier3/direct-wire observability columns on
+ * cluster_get_ic_rdma_peers / pg_stat_cluster_ic. */
+/* spec-6.13 D6: block-reply direct-land lane observability columns on
+ * cluster_get_ic_rdma_peers / pg_stat_cluster_ic.  Main already used
+ * 202606380 for spec-6.4/spec-6.5 merge order, so the combined mainline
+ * catalog surface re-bumps 202606380 -> 202606390. */
+#define CATALOG_VERSION_NO 202606390
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

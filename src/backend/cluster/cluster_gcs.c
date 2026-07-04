@@ -517,18 +517,30 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
  * Sender API (D3).
  * ============================================================ */
 
-void
-cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition_id,
-									 int master_node)
+/*
+ * gcs_transition_and_wait_internal — shared body of the throwing
+ * (cluster_gcs_send_transition_and_wait) and non-throwing
+ * (cluster_gcs_try_send_transition_and_wait, spec-6.12a ㉕) senders.
+ *
+ *	Returns the final GcsReplyStatus (GCS_REPLY_GRANTED on success; a
+ *	DENIED_* value or the DENIED_INCOMPATIBLE internal-timeout marker
+ *	otherwise).  When throw_on_send_fail is false, a transport send failure
+ *	is reported as DENIED_INCOMPATIBLE instead of ereport — required by the
+ *	㉕ degrade-to-one-shot requester path, where a failed registration must
+ *	not abort the query.  *out_final_transition echoes the reply's
+ *	transition_id for the throwing wrapper's error messages.
+ */
+static uint8
+gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id, int master_node,
+								 bool throw_on_send_fail, uint8 *out_final_transition)
 {
 	ClusterGcsOutstandingSlot *slot;
 	uint64 request_id = 0;
 	GcsRequestPayload payload;
 	GcsReplyPayload final_reply;
 	TimestampTz deadline;
-	bool granted = false;
+	bool send_failed = false;
 	uint8 final_status = GCS_REPLY_DENIED_INCOMPATIBLE;
-	uint8 final_transition = (uint8)transition_id;
 
 	if (transition_id < PCM_TRANS_N_TO_S || transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
 		/* Caller passed garbage; receiver would reject too.  Fail fast. */
@@ -560,10 +572,13 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 		 */
 		if (gcs_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
 										  sizeof(payload))
-			!= CLUSTER_IC_SEND_DONE)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("cluster_gcs: failed to send GCS request to node %d", master_node)));
+			!= CLUSTER_IC_SEND_DONE) {
+			if (throw_on_send_fail)
+				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+								errmsg("cluster_gcs: failed to send GCS request to node %d",
+									   master_node)));
+			send_failed = true;
+		}
 
 		/*
 		 * Wait for reply or internal safety deadline.  Public timeout GUC
@@ -571,37 +586,38 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 		 * 5s deadline catches receiver bugs without exposing a user-visible
 		 * knob yet.
 		 */
-		deadline = GetCurrentTimestamp()
-				   + ((TimestampTz)GCS_REPLY_INTERNAL_DEADLINE_MS) * (TimestampTz)1000;
+		if (!send_failed) {
+			deadline = GetCurrentTimestamp()
+					   + ((TimestampTz)GCS_REPLY_INTERNAL_DEADLINE_MS) * (TimestampTz)1000;
 
-		ConditionVariablePrepareToSleep(&slot->reply_cv);
-		for (;;) {
-			TimestampTz now;
-			long timeout_ms;
+			ConditionVariablePrepareToSleep(&slot->reply_cv);
+			for (;;) {
+				TimestampTz now;
+				long timeout_ms;
 
-			if (gcs_slot_get_reply(slot, NULL))
-				break;
+				if (gcs_slot_get_reply(slot, NULL))
+					break;
 
-			now = GetCurrentTimestamp();
-			if (now >= deadline) {
-				pg_atomic_fetch_add_u64(&ClusterGcs->reply_timeout_count, 1);
-				break;
+				now = GetCurrentTimestamp();
+				if (now >= deadline) {
+					pg_atomic_fetch_add_u64(&ClusterGcs->reply_timeout_count, 1);
+					break;
+				}
+				timeout_ms = (long)((deadline - now) / 1000);
+				if (timeout_ms <= 0)
+					timeout_ms = 1;
+				(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+												  WAIT_EVENT_GCS_REPLY_WAIT);
 			}
-			timeout_ms = (long)((deadline - now) / 1000);
-			if (timeout_ms <= 0)
-				timeout_ms = 1;
-			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
-											  WAIT_EVENT_GCS_REPLY_WAIT);
-		}
-		ConditionVariableCancelSleep();
+			ConditionVariableCancelSleep();
 
-		if (gcs_slot_get_reply(slot, &final_reply)) {
-			final_status = final_reply.status;
-			final_transition = final_reply.transition_id;
-			if (final_status == GCS_REPLY_GRANTED)
-				granted = true;
-		} else {
-			final_status = GCS_REPLY_DENIED_INCOMPATIBLE; /* internal timeout marker */
+			if (gcs_slot_get_reply(slot, &final_reply)) {
+				final_status = final_reply.status;
+				if (out_final_transition)
+					*out_final_transition = final_reply.transition_id;
+			} else {
+				final_status = GCS_REPLY_DENIED_INCOMPATIBLE; /* internal timeout marker */
+			}
 		}
 	}
 	PG_CATCH();
@@ -613,7 +629,33 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 
 	gcs_release_slot(slot);
 
-	if (granted) {
+	return final_status;
+}
+
+/* PGRAC: spec-6.12a ㉕ — non-throwing registration attempt (see header). */
+bool
+cluster_gcs_try_send_transition_and_wait(BufferTag tag, PcmLockTransition transition_id,
+										 int master_node)
+{
+	uint8 final_transition = (uint8)transition_id;
+
+	return gcs_transition_and_wait_internal(tag, transition_id, master_node,
+											/* throw_on_send_fail */ false, &final_transition)
+		   == GCS_REPLY_GRANTED;
+}
+
+void
+cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition_id,
+									 int master_node)
+{
+	uint8 final_status;
+	uint8 final_transition = (uint8)transition_id;
+
+	final_status
+		= gcs_transition_and_wait_internal(tag, transition_id, master_node,
+										   /* throw_on_send_fail */ true, &final_transition);
+
+	if (final_status == GCS_REPLY_GRANTED) {
 		/*
 		 * HC77:  master-side handler already applied the transition; sender
 		 * must not double-apply.  Caller (cluster_pcm_lock_acquire / etc.)
@@ -650,6 +692,42 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 		Assert(false); /* handled above */
 		break;
 	}
+}
+
+
+/*
+ * PGRAC: spec-6.12a ㉕ — fire-and-forget transition notify (see header).
+ *
+ *	No slot, no wait: request_id 0 marks the reply as unmatchable so the
+ *	sender-side reply handler HC74-drops it.  Callable from the LMON
+ *	IC-dispatch context (which must never block on a reply CV it would have
+ *	to deliver itself).  The caller flips its own local state ONLY when this
+ *	returns true — a false return leaves the cluster in the exact pre-call
+ *	state on both nodes.
+ */
+bool
+cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_id, int master_node)
+{
+	GcsRequestPayload payload;
+
+	if (transition_id < PCM_TRANS_N_TO_S || transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
+		return false;
+	if (master_node < 0 || master_node == cluster_node_id)
+		return false;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.request_id = 0; /* deliberate: no slot; reply HC74-drops */
+	payload.epoch = cluster_epoch_get_current();
+	payload.tag = tag;
+	payload.sender_node = cluster_node_id;
+	payload.transition_id = (uint8)transition_id;
+
+	pg_atomic_fetch_add_u64(&ClusterGcs->encode_payload_bytes, sizeof(payload));
+	pg_atomic_fetch_add_u64(&ClusterGcs->send_request_count, 1);
+
+	return cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
+									sizeof(payload))
+		   == CLUSTER_IC_SEND_DONE;
 }
 
 

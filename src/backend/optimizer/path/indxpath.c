@@ -11,6 +11,12 @@
  * IDENTIFICATION
  *	  src/backend/optimizer/path/indxpath.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - match_clause_to_indexcol / match_opclause_to_indexcol: match only
+ *	    plain equality clauses to a reverse-key index (Q18-A).
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -2266,6 +2272,20 @@ match_clause_to_indexcol(PlannerInfo *root,
 	if (clause == NULL)
 		return NULL;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- a reverse-key index is equality-only.  Only a
+	 * plain (indexkey = const) OpExpr may match; every other clause shape
+	 * (IN-list SAOP, row compare, func, boolean, IS NULL) would need the
+	 * byte-reversed encoding applied in ways the scan path does not
+	 * support, so reject them here (Q18-A) and let the planner use a plain
+	 * index or a seqscan.  The equality strategy is checked in
+	 * match_opclause_to_indexcol.
+	 */
+	if (index->cluster_reverse_key && !IsA(clause, OpExpr))
+		return NULL;
+#endif
+
 	/* First check for boolean-index cases. */
 	opfamily = index->opfamily[indexcol];
 	if (IsBooleanOpfamily(opfamily))
@@ -2468,6 +2488,31 @@ match_opclause_to_indexcol(PlannerInfo *root,
 	index_relid = index->rel->relid;
 	opfamily = index->opfamily[indexcol];
 	idxcollation = index->indexcollations[indexcol];
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- reverse-key equality-only.  Reject any operator
+	 * that is not the btree equality strategy in this opfamily (checking
+	 * the commutator for the const-on-left form).  Byte-reversal is not
+	 * order-preserving, so a range operator on a reverse-key index would
+	 * scan the wrong leaf range (Q18-A); the executor also fails closed in
+	 * btrescan, but rejecting here keeps the planner from choosing it.
+	 */
+	if (index->cluster_reverse_key)
+	{
+		StrategyNumber strat = get_op_opfamily_strategy(expr_op, opfamily);
+
+		if (strat == 0)
+		{
+			Oid			comm = get_commutator(expr_op);
+
+			if (OidIsValid(comm))
+				strat = get_op_opfamily_strategy(comm, opfamily);
+		}
+		if (strat != BTEqualStrategyNumber)
+			return NULL;
+	}
+#endif
 
 	/*
 	 * Check for clauses of the form: (indexkey operator constant) or

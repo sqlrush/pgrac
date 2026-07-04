@@ -15,3 +15,4 @@ test: fence_smoke
 test: reconfig_smoke
 test: cluster_clean_leave
 test: cluster_node_remove
+test: reverse_key

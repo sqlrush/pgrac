@@ -15,6 +15,9 @@
  *	  - _bt_insertonpg: optional count-only rightmost-leaf insert probe for
  *	    cross-node profiling (GUC-gated, no behavior change).
  *	    Spec: spec-5.59-two-node-crossnode-perf-profile.md (D4)
+ *	  - _bt_check_unique: decode reverse-key stored values back to the
+ *	    logical key in the duplicate-key error detail.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (f)
  *
  *-------------------------------------------------------------------------
  */
@@ -33,6 +36,7 @@
 #include "storage/smgr.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D4 probe */
 #endif
 
@@ -669,6 +673,20 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 						index_deform_tuple(itup, RelationGetDescr(rel),
 										   values, isnull);
+
+#ifdef USE_PGRAC_CLUSTER
+						/*
+						 * PGRAC: spec-6.12f -- a reverse-key index stores
+						 * byte-reversed keys; decode back to the logical
+						 * value so the error names the key the user wrote,
+						 * not its stored encoding.  (Byte-reversal is
+						 * involutive, so encode == decode.)
+						 */
+						if (BTGetClusterReverseKey(rel) && !isnull[0])
+							values[0] = cluster_reverse_key_encode(
+								values[0],
+								TupleDescAttr(RelationGetDescr(rel), 0)->attlen);
+#endif
 
 						key_desc = BuildIndexValueDescription(rel, values,
 															  isnull);

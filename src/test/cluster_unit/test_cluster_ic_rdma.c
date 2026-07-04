@@ -80,21 +80,25 @@ rdma_unit_qp_create(ClusterICRdmaCtx *ctx, int32 peer, ClusterICQp *out)
 }
 
 static ClusterICSendResult
-rdma_unit_post_send(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, bool signaled, uint32 imm)
+rdma_unit_post_send(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, bool signaled,
+					bool inline_send, uint32 imm)
 {
 	UT_ASSERT_NULL(qp);
 	UT_ASSERT_NOT_NULL(sge);
 	UT_ASSERT_EQ(n_sge, 1);
 	UT_ASSERT_EQ((int)signaled, 1);
+	UT_ASSERT_EQ((int)inline_send, 1);
 	UT_ASSERT_EQ((int)imm, 0);
 	return CLUSTER_IC_SEND_DONE;
 }
 
 static bool
-rdma_unit_post_recv(ClusterICQp *qp, ClusterICSge *sge)
+rdma_unit_post_recv(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, uint64 wr_id)
 {
 	UT_ASSERT_NULL(qp);
 	UT_ASSERT_NOT_NULL(sge);
+	UT_ASSERT_EQ(n_sge, 1);
+	UT_ASSERT_EQ((int)wr_id, 42);
 	return true;
 }
 
@@ -195,8 +199,8 @@ UT_TEST(test_rdma_provider_vtable_shape)
 	sge.addr = page;
 	sge.len = sizeof(page);
 	sge.lkey = mr.lkey;
-	UT_ASSERT_EQ((int)provider.post_send(NULL, &sge, 1, true, 0), (int)CLUSTER_IC_SEND_DONE);
-	UT_ASSERT(provider.post_recv(NULL, &sge));
+	UT_ASSERT_EQ((int)provider.post_send(NULL, &sge, 1, true, true, 0), (int)CLUSTER_IC_SEND_DONE);
+	UT_ASSERT(provider.post_recv(NULL, &sge, 1, 42));
 	UT_ASSERT_EQ(provider.poll_cq(NULL, NULL, 0), 0);
 	provider.device_close(NULL);
 }
@@ -212,21 +216,57 @@ UT_TEST(test_rdma_wait_events_are_contiguous)
 	UT_ASSERT_EQ((int)WAIT_EVENT_INTERCONNECT_RDMA_RECV,
 				 (int)WAIT_EVENT_INTERCONNECT_RDMA_SEND + 1);
 	UT_ASSERT_EQ((int)WAIT_EVENT_CLUSTER_IC_RDMA_POLL, (int)WAIT_EVENT_INTERCONNECT_RDMA_RECV + 1);
-	UT_ASSERT_EQ((int)WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT, (int)WAIT_EVENT_CLUSTER_IC_RDMA_POLL + 1);
+	UT_ASSERT_EQ((int)WAIT_EVENT_INTERCONNECT_RDMA_BUSYPOLL,
+				 (int)WAIT_EVENT_CLUSTER_IC_RDMA_POLL + 1);
+	UT_ASSERT_EQ((int)WAIT_EVENT_INTERCONNECT_RDMA_INLINE_SEND,
+				 (int)WAIT_EVENT_INTERCONNECT_RDMA_BUSYPOLL + 1);
+	UT_ASSERT_EQ((int)WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT,
+				 (int)WAIT_EVENT_INTERCONNECT_RDMA_INLINE_SEND + 1);
 	UT_ASSERT_EQ((int)WAIT_EVENT_INTERCONNECT_TCP_FALLBACK,
 				 (int)WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT + 1);
+}
+
+UT_TEST(test_rdma_spec613_header_policies)
+{
+	UT_ASSERT_EQ(cluster_ic_rdma_signal_batch_k(16), 8);
+	UT_ASSERT_EQ(cluster_ic_rdma_signal_batch_k(4096), CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP);
+	UT_ASSERT(cluster_ic_rdma_payload_inline_eligible(256, 256));
+	UT_ASSERT(!cluster_ic_rdma_payload_inline_eligible(257, 256));
+	UT_ASSERT_EQ(CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES, 84);
+	UT_ASSERT_EQ(CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES, 84 + BLCKSZ);
+}
+
+UT_TEST(test_rdma_direct_land_generation_wrap)
+{
+	UT_ASSERT_EQ((int)cluster_ic_rdma_direct_land_next_generation(0), 1);
+	UT_ASSERT_EQ((int)cluster_ic_rdma_direct_land_next_generation(1), 2);
+	UT_ASSERT_EQ((int)cluster_ic_rdma_direct_land_next_generation(65534), 65535);
+	UT_ASSERT_EQ((int)cluster_ic_rdma_direct_land_next_generation(65535), 1);
+	UT_ASSERT_EQ((int)cluster_ic_rdma_direct_land_next_generation(65536), 1);
+}
+
+UT_TEST(test_rdma_direct_land_arm_capacity_guard)
+{
+	UT_ASSERT(cluster_ic_rdma_direct_land_wr_field_valid(0));
+	UT_ASSERT(cluster_ic_rdma_direct_land_wr_field_valid(65535));
+	UT_ASSERT(!cluster_ic_rdma_direct_land_wr_field_valid(65536));
+	UT_ASSERT(cluster_ic_rdma_direct_land_arm_capacity_valid(65536));
+	UT_ASSERT(!cluster_ic_rdma_direct_land_arm_capacity_valid(65537));
 }
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(9);
 	UT_RUN(test_rdma_guc_enum_values_are_stable);
 	UT_RUN(test_rdma_view_transport_and_state_values_are_stable);
 	UT_RUN(test_rdma_sge_release_contract);
 	UT_RUN(test_rdma_provider_vtable_shape);
 	UT_RUN(test_rdma_lwlock_tranche_is_after_stage5_cluster_tranches);
 	UT_RUN(test_rdma_wait_events_are_contiguous);
+	UT_RUN(test_rdma_spec613_header_policies);
+	UT_RUN(test_rdma_direct_land_generation_wrap);
+	UT_RUN(test_rdma_direct_land_arm_capacity_guard);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -126,8 +126,8 @@ my $open_rr_reader = sub {
 
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'35',
-		'L1b cr category has 35 counters (17 + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle)');
+		'41',
+		'L1b cr category has 41 counters (17 + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server)');
 
 	$node->safe_psql('postgres',
 		'CREATE TABLE t_l1 (id int, v int); INSERT INTO t_l1 VALUES (1, 100);');

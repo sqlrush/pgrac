@@ -17,6 +17,12 @@
  * IDENTIFICATION
  *	  src/backend/utils/adt/selfuncs.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - get_actual_variable_range / btcostestimate: skip the NULL
+ *	    sortopfamily (reverse-key) btrees that provide no sort order.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -6058,6 +6064,17 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 		if (index->relam != BTREE_AM_OID)
 			continue;
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-6.12f -- ignore reverse-key btrees (marked by a NULL
+		 * sortopfamily, see get_relation_info): their keys are stored
+		 * byte-reversed, so the leftmost/rightmost leaf entries are not the
+		 * column min/max, and reverse_sort/nulls_first are NULL.
+		 */
+		if (index->sortopfamily == NULL)
+			continue;
+#endif
+
 		/*
 		 * Ignore partial indexes --- we only want stats that cover the entire
 		 * relation.
@@ -6989,7 +7006,18 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		}
 	}
 
-	if (HeapTupleIsValid(vardata.statsTuple))
+	/*
+	 * PGRAC: spec-6.12f -- skip the correlation adjustment for a reverse-key
+	 * btree (NULL sortopfamily, see get_relation_info): its reverse_sort
+	 * array is NULL, and physical leaf order has no correlation with the
+	 * column value anyway, so the generic indexCorrelation of 0 (fully
+	 * scattered) is the honest estimate.
+	 */
+	if (HeapTupleIsValid(vardata.statsTuple)
+#ifdef USE_PGRAC_CLUSTER
+		&& index->sortopfamily != NULL
+#endif
+		)
 	{
 		Oid			sortop;
 		AttStatsSlot sslot;

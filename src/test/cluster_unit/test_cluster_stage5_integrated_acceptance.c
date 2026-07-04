@@ -27,7 +27,7 @@
  *	        reconfig-in-progress / 53R61 join-rejected-stale / 53R62 clean-
  *	        leave-in-progress / 53R64 node-removed-fenced / 53R70 ges-timeout
  *	        / 55R01 pcm-state-invalid.
- *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 116 (spec-6.2 D10
+ *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 118 (spec-6.13 D8
  *	        value;  update-required contract) + the multi-node write-path
  *	        wait events present and pairwise distinct (GES_S4 / GES_REPLY /
  *	        CF_ENQUEUE / CR_CONSTRUCT / REL_EXTEND_WAIT — the MG-B M2 share).
@@ -189,10 +189,10 @@ UT_TEST(test_stage5_sqlstate_acceptance_surface_encodable)
 UT_TEST(test_stage5_wait_events_count_and_multinode_set)
 {
 	/* Current Stage 5 surface value; spec-6.2 adds the latest 4 Smart Fusion
-	 * authority waits.  update-required contract: a future spec adding cluster
-	 * wait events MUST bump this snapshot (and the dump/test baselines that
-	 * count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 116);
+	 * authority waits and spec-6.13 adds 2 RDMA tier3 waits.  update-required
+	 * contract: a future spec adding cluster wait events MUST bump this snapshot
+	 * (and the dump/test baselines that count them). */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 118);
 
 	/* The multi-node write-path wait events MG-B aggregates for the M2 share
 	 * must all be present and pairwise distinct (a reorder/removal would change

@@ -57,6 +57,7 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
 #include "cluster/cluster_ges.h"
@@ -695,6 +696,9 @@ LmsMain(void)
 	 * sleep / broadcast in this skeleton — pss_barrierCV is exercised
 	 * only via standard PG paths during proc_exit, which is verified safe.
 	 */
+	/* PGRAC: spec-6.12b — publish the wake latch for the CR submit path. */
+	cluster_cr_server_publish_lms_latch(MyLatch);
+
 	for (;;) {
 		CHECK_FOR_INTERRUPTS();
 
@@ -708,11 +712,17 @@ LmsMain(void)
 
 		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
 		cluster_lms_native_probe_retry_tick();
+		/* PGRAC: spec-6.12b — construct parked CR-server requests (every
+		 * failure becomes a DENIED result; LMS never exits over a serve). */
+		cluster_lms_cr_drain();
 
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
 		ResetLatch(MyLatch);
 	}
+
+	/* PGRAC: spec-6.12b — retract the wake latch before teardown. */
+	cluster_cr_server_publish_lms_latch(NULL);
 
 	/* Transition to DRAINING then STOPPED. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);

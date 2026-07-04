@@ -9,6 +9,11 @@
  *
  * src/include/access/nbtree.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - BTOptions: add cluster_reverse_key + BTGetClusterReverseKey().
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef NBTREE_H
@@ -1097,6 +1102,17 @@ typedef struct BTOptions
 	int			fillfactor;		/* page fill factor in percent (0..100) */
 	float8		vacuum_cleanup_index_scale_factor;	/* deprecated */
 	bool		deduplicate_items;	/* Try to deduplicate items? */
+	/*
+	 * PGRAC: spec-6.12f -- reverse-key index.  When set, the leading
+	 * fixed-width integer key datum is byte-reversed at insert and at
+	 * equality-search, scattering monotonically-increasing values across
+	 * leaf pages (dispersing the rightmost-leaf cross-node ping).  The
+	 * planner treats such an index as equality-only (no range / ORDER BY
+	 * paths, no index-only scans) because byte-reversal is not
+	 * order-preserving.  See spec-6.12 wave f (Q18-A equality-only
+	 * contract).  Off (default) = a plain btree index.
+	 */
+	bool		cluster_reverse_key;
 } BTOptions;
 
 #define BTGetFillFactor(relation) \
@@ -1112,6 +1128,19 @@ typedef struct BTOptions
 				 relation->rd_rel->relam == BTREE_AM_OID), \
 	((relation)->rd_options ? \
 	 ((BTOptions *) (relation)->rd_options)->deduplicate_items : true))
+/*
+ * PGRAC: spec-6.12f -- reverse-key reloption accessor.  Unlike the two
+ * accessors above, this one is also reached from planner code
+ * (get_relation_info / btcanreturn via amcanreturn), which sees
+ * partitioned parent indexes too -- their rd_options parse through the
+ * same index_reloptions/BTOptions path, so accept both relkinds.
+ */
+#define BTGetClusterReverseKey(relation) \
+	(AssertMacro((relation->rd_rel->relkind == RELKIND_INDEX || \
+				  relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) && \
+				 relation->rd_rel->relam == BTREE_AM_OID), \
+	((relation)->rd_options ? \
+	 ((BTOptions *) (relation)->rd_options)->cluster_reverse_key : false))
 
 /*
  * Constant definition for progress reporting.  Phase numbers must match

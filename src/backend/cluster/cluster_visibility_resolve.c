@@ -49,6 +49,7 @@
 #include "cluster/cluster_touched_peers.h"	/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
+#include "cluster/cluster_xnode_lever.h"   /* spec-6.12c: terminal memo + D0 counters */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
 
 /*
@@ -128,7 +129,29 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	key.cluster_epoch = ref->cluster_epoch;
 	key.local_xid = raw_xid;
 
+	/*
+	 * PGRAC: spec-6.12c -- replay a TERMINAL outcome this same top-level
+	 * transaction already obtained from an authoritative lookup under the
+	 * exact key.  Terminal outcomes are immutable, so a hit answers exactly
+	 * what the lookup below would answer; anything non-terminal was never
+	 * installed and re-resolves.  GUC off -> probe is a no-op.
+	 */
+	cluster_lever_c_note_resolve();
+	{
+		uint8 memo_status;
+		SCN memo_scn;
+
+		if (cluster_vis_memo_probe(&key, &memo_status, &memo_scn)) {
+			out->status = memo_status;
+			out->commit_scn = memo_scn;
+			cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
+			return;
+		}
+	}
+
 	if (!cluster_tt_status_lookup_exact(&key, &result) || !result.authoritative) {
+		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
+		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;					   /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
 	}
@@ -143,12 +166,29 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 
 	if (!result.authoritative) {
 		out->status = CLUSTER_TT_STATUS_UNKNOWN;
+		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
+		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;
 	}
 
 	out->status = result.status;
 	out->commit_scn = result.commit_scn;
+
+	/*
+	 * PGRAC: spec-6.12c -- D0 stamp-evidence classification + memo install.
+	 * stamp_contradicted counts an ITL cached-COMMITTED stamp that the TT
+	 * terminal verdict disagrees with (ABORTED, or a different commit SCN
+	 * identity): direct evidence that trusting page stamps alone for
+	 * committed-ness would be unsound (C1b -- committed-ness authority
+	 * stays with CLOG/TT; the stamp only caches the SCN value).
+	 */
+	cluster_lever_c_note_tt_lookup(ref->has_cached_status,
+								   ref->has_cached_status
+									   && (result.status == CLUSTER_TT_STATUS_ABORTED
+										   || (result.status == CLUSTER_TT_STATUS_COMMITTED
+											   && ref->cached_commit_scn != result.commit_scn)));
+	cluster_vis_memo_install(&key, (uint8)result.status, result.commit_scn);
 
 	/* PGRAC: spec-5.59 D3 profiling */
 	cluster_xp_end(&xp_scope);

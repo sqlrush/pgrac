@@ -49,6 +49,8 @@
 #include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D1 profiling gate stubs */
+#include "cluster/cluster_xnode_lever.h"   /* spec-6.12 lever counter stub */
+#include "cluster/cluster_hw_lease.h"	   /* spec-6.12d lease counter stub */
 
 #undef printf
 #undef fprintf
@@ -114,6 +116,14 @@ cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
 {
 	return "stub";
 }
+
+/* spec-6.12 stub: dump_xnode_lever reads this pointer (NULL -> all-zero
+ * rows); the unit harness does not link cluster_xnode_lever.o. */
+ClusterXnodeLeverShared *ClusterXnodeLeverCtl = NULL;
+
+/* spec-6.12d stub: dump_hw reads this pointer (NULL -> lease rows
+ * skipped); the unit harness does not link cluster_hw_lease.o. */
+ClusterHwLeaseShared *ClusterHwLeaseCtl = NULL;
 
 /* cluster_ic */
 const ClusterICOps *ClusterICOps_Active = NULL;
@@ -921,6 +931,36 @@ cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return 0;
 }
+uint64
+cluster_gcs_get_scratch_copy_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_live_sge_send_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_live_sge_fallback_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_direct_install_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_direct_install_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_install_copy_count(void)
+{
+	return 0;
+}
 
 /* spec-2.34 D10 stubs: 9 NEW reliability hardening counter accessors. */
 uint64
@@ -1559,6 +1599,37 @@ cluster_cr_cache_evict_count(void)
 }
 uint64
 cluster_cr_cache_install_count(void)
+{
+	return 0;
+}
+/* spec-6.12b: CR-server data plane counters. */
+uint64
+cluster_cr_remote_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_remote_partial_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_remote_failed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_partial_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_denied_count(void)
 {
 	return 0;
 }

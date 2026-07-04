@@ -183,6 +183,18 @@ reset_fake_pcm_runtime(int max_entries)
  */
 bool cluster_gcs_block_local_cache = false;
 
+/* spec-6.12a stubs — the local-master S->X upgrade path is only reached with
+ * the wave GUC on (default off here, so the branch is inert); provide inert
+ * link-surface satisfaction.  Real coverage is t/336 (2-node). */
+bool cluster_read_scache = false;
+
+bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
+bool
+cluster_gcs_block_local_x_upgrade(BufferTag tag pg_attribute_unused())
+{
+	return false;
+}
+
 /* spec-4.7a D4 — stub CSSD peer liveness for the other-live-holder gate.
  * Default: every peer ALIVE.  A test sets fake_cssd_dead_node to mark one
  * peer DEAD (to verify a dead holder is NOT counted by the D4 gate). */

@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_profile',
-	'all 52 categories appear (spec-6.2 adds smart_fusion;L122 alphabetic verify)');
+	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_lever,xnode_profile',
+	'all 53 categories appear (spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; L122 alphabetic verify)');
 
 
 # ----------
@@ -123,15 +123,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'148',
-	'all 148 injection points have a .fault_type entry under inject category (spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'150',
+	'all 150 injection points have a .fault_type entry under inject category (spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'148',
-	'all 148 injection points have a .hits entry under inject category (spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'150',
+	'all 150 injection points have a .hits entry under inject category (spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 
 # ----------
@@ -157,8 +157,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'116',
-	'pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	'118',
+	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 $node->stop;
 

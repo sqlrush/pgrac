@@ -1225,12 +1225,18 @@ pgstat_get_wait_cluster_interconnect(WaitEventCluster w)
 	case WAIT_EVENT_INTERCONNECT_RDMA_RECV:
 		event_name = "InterconnectRdmaRecv";
 		break;
-	case WAIT_EVENT_CLUSTER_IC_RDMA_POLL:
-		event_name = "ClusterICRdmaPoll";
-		break;
-	case WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT:
-		event_name = "ClusterICRdmaConnect";
-		break;
+		case WAIT_EVENT_CLUSTER_IC_RDMA_POLL:
+			event_name = "ClusterICRdmaPoll";
+			break;
+		case WAIT_EVENT_INTERCONNECT_RDMA_BUSYPOLL:
+			event_name = "InterconnectRdmaBusypoll";
+			break;
+		case WAIT_EVENT_INTERCONNECT_RDMA_INLINE_SEND:
+			event_name = "InterconnectRdmaInlineSend";
+			break;
+		case WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT:
+			event_name = "ClusterICRdmaConnect";
+			break;
 	case WAIT_EVENT_INTERCONNECT_TCP_FALLBACK:
 		event_name = "ClusterICRdmaFallback";
 		break;
@@ -1314,6 +1320,12 @@ pgstat_get_wait_cluster_adg(WaitEventCluster w)
 		break;
 	case WAIT_EVENT_ADG_WAL_RECEIVE_LAG:
 		event_name = "AdgWalReceiveLag";
+		break;
+	case WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT:
+		event_name = "AdgReadSnapshotWait";
+		break;
+	case WAIT_EVENT_ADG_SCN_SYNC_WAIT:
+		event_name = "AdgScnSyncWait";
 		break;
 	default:
 		break;

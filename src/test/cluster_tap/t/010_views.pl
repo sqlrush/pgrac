@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 116 (spec-6.2 adds 4 Smart Fusion authority waits).
+# Total row count: 118 (spec-6.13 adds RDMA busypoll + inline send waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'116',
-	'pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	'118',
+	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 is($node->safe_psql(
 		'postgres',
@@ -88,7 +88,7 @@ my %expected = (
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
-	'Cluster: Interconnect' => 7,
+	'Cluster: Interconnect' => 9,	# spec-6.13: +busypoll + inline send waits
 	'Cluster: Undo' => 4,
 	'Cluster: ADG' => 2,
 );
@@ -142,8 +142,8 @@ is($node->safe_psql('postgres',
 		q{SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
 		    FROM information_schema.columns
 		   WHERE table_name = 'pg_stat_cluster_ic'}),
-	'node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,latency_us_sum,latency_sample_count,last_error_code,last_error',
-	'pg_stat_cluster_ic column contract matches spec-6.1 D8');
+	'node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,tier3_send_count,inline_send_count,unsignaled_batch_count,busypoll_us_burned,busypoll_fallback_count,block_reply_lane_state,block_reply_lane_fallback_count,block_reply_lane_error_count,latency_us_sum,latency_sample_count,last_error_code,last_error,last_block_reply_error',
+	'pg_stat_cluster_ic column contract matches spec-6.13 D8');
 
 
 $node->stop;

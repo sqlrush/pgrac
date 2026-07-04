@@ -181,6 +181,38 @@ extern void cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransitio
 												 int master_node);
 
 /*
+ * cluster_gcs_send_transition_nowait — fire-and-forget GCS_REQUEST to a
+ * remote master (spec-6.12a ㉕ remote-holder downgrade notify).
+ *
+ *	Sends the transition envelope with request_id = 0 (never allocated by the
+ *	per-backend counters, which start at 1) and does NOT reserve a reply slot
+ *	or wait: the master's GCS_REPLY comes back to this node's reply handler,
+ *	finds no matching slot and is dropped as a stale reply (HC74) — by
+ *	design.  Built for the LMON IC-dispatch context, which structurally
+ *	CANNOT block on a reply CV (the reply would be delivered by the very
+ *	dispatch loop that is sleeping).  Returns true when the envelope was
+ *	handed to the transport; false on send failure — the caller must treat
+ *	false as "master not notified" and leave all local state untouched.
+ *
+ *	The master applies the transition through the same HC77 single-owner
+ *	handler; a lost/denied notify is converged by the requester's follow-up
+ *	registration attempt failing closed (degrade to one-shot semantics).
+ */
+extern bool cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_id,
+											   int master_node);
+
+/*
+ * cluster_gcs_try_send_transition_and_wait — spec-6.12a ㉕ non-throwing
+ * twin of cluster_gcs_send_transition_and_wait: same slot + wait machinery,
+ * but every non-GRANTED outcome (denied, timeout, send failure) returns
+ * false instead of ereport.  Built for the requester's S-holder
+ * registration after a remote-holder downgrade grant, where a denial must
+ * degrade to one-shot read semantics rather than abort the query.
+ */
+extern bool cluster_gcs_try_send_transition_and_wait(BufferTag tag, PcmLockTransition transition_id,
+													 int master_node);
+
+/*
  * cluster_gcs_register_msg_types — postmaster-once registration of
  * GCS_REQUEST + GCS_REPLY in cluster_ic dispatch table.  Called from
  * the same phase that registers GES / SCN / CSSD message types.

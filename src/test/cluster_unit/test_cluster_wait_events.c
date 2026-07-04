@@ -199,8 +199,9 @@ UT_TEST(test_last_event_per_category_in_class)
 
 /* ----------
  * Per-category event counts match the design doc roster
- *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 6,
-	 *   Sinval 3, Interconnect 7, Undo 8, ADG 2, SharedFs 12 -- plus later
+ *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig selected range 7,
+ *   Recovery 7, Sinval selected range 3, Interconnect 9, Undo 8, ADG 4,
+ *   SharedFs 12 -- plus later
  *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
  *
  *	Use (last - first + 1) within each category as the count.
@@ -234,14 +235,14 @@ UT_TEST(test_per_category_event_counts)
 				 3);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_INTERCONNECT_CONNECT_RETRY
 					 - (uint32)WAIT_EVENT_INTERCONNECT_RDMA_SEND + 1,
-				 7);
+				 9);
 	/* Undo category: 4 (AD-010) + CR_CONSTRUCT (spec-3.9) + TT_DURABLE_IO
 	 * (spec-3.11) + BUF_FLUSH + EXTENT_CLAIM (spec-3.18 D7) = 8.  Count the
 	 * full range to the last event so future additions are caught here (F12). */
 	UT_ASSERT_EQ(
 		(uint32)WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM - (uint32)WAIT_EVENT_UNDO_REMOTE_READ + 1, 8);
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_WAL_RECEIVE_LAG - (uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT + 1,
-				 2);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT - (uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT + 1,
+				 4);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER
 					 - (uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ + 1,
 				 12);
@@ -261,8 +262,8 @@ UT_TEST(test_cross_category_jump_is_one_class_step)
 	/* spec-3.9: last Undo event is now CR_CONSTRUCT (0x18000004) */
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT - (uint32)WAIT_EVENT_CLUSTER_CR_CONSTRUCT,
 				 0x01000000U - 4U);
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ - (uint32)WAIT_EVENT_ADG_WAL_RECEIVE_LAG,
-				 0x01000000U - 1U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ - (uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT,
+				 0x01000000U - 3U);
 }
 
 

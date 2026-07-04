@@ -113,13 +113,13 @@ is($cols,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'116',
-	'pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	'118',
+	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'116',
-	'pg_stat_gcluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	'118',
+	'pg_stat_gcluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
 	'stub',
