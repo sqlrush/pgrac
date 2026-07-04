@@ -125,8 +125,13 @@ my %expect_cat = (
 	recovery     => 39,    # 3.16(4)+4.10 block(2)+4.11 thread(4)+4.3 plan(13)+4.4 worker(8)+4.5/4.7 merge(8)
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 10,    # 4.7 warm-recovery(8) + spec-2.41 D7 redo-coverage serve-gate(2)
-	cr           => 30,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
-	pcm          => 20,    # 2.37 PI watermark + lock state
+	cr           => 41,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
+	                       # + post-5.54 band (tuple fallbacks, 5.56 rel-gen,
+	                       # retention/reconfig) additions (11) -- baseline was
+	                       # stale on main since those landed; first caught by
+	                       # a local full run (t/254 asserts counts, not names)
+	pcm          => 21,    # 2.37 PI watermark + lock state
+	                       # + spec-6.14a (b)-leg nonholder fail-closed counter
 );
 for my $cat (sort keys %expect_cat)
 {
