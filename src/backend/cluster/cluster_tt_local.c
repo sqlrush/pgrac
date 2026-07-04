@@ -506,9 +506,24 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 #ifdef USE_ASSERT_CHECKING
 	{
 		ClusterTTStatusResult res;
-		bool hit = cluster_tt_status_lookup_exact(&key, &res);
+		bool hit = false;
+		bool epoch_stable = ((uint32)cluster_epoch_get_current() == key.cluster_epoch);
 
-		Assert(hit && res.authoritative && res.status == status);
+		/*
+		 * lookup_exact() is the production reader API, so it intentionally fences
+		 * against the current cluster epoch.  A transaction can abort while a
+		 * clean-leave/reconfig advances the epoch; the local old-epoch status
+		 * install is still valid evidence for that transaction, but public lookup
+		 * must reject it.  Keep this debug wiring check only when the epoch stayed
+		 * stable across the install/lookup window.
+		 */
+		if (epoch_stable) {
+			hit = cluster_tt_status_lookup_exact(&key, &res);
+			epoch_stable = ((uint32)cluster_epoch_get_current() == key.cluster_epoch);
+		}
+
+		if (epoch_stable)
+			Assert(hit && res.authoritative && res.status == status);
 		if (hit && res.authoritative && res.status == status)
 			cluster_tt_status_bump_self_consumer_hit();
 	}
