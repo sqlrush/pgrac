@@ -872,11 +872,11 @@ test_cluster_ges_handoff: test_cluster_ges_handoff.c unit_test.h \
 test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_O) \
 		$(CLUSTER_SHARED_FS_STUB_O) $(CLUSTER_SHARED_FS_LOCAL_O) \
-		$(CLUSTER_SHARED_FS_SHAREDFS_O)
+		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(CLUSTER_SHARED_CATALOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_O) \
 		$(CLUSTER_SHARED_FS_STUB_O) $(CLUSTER_SHARED_FS_LOCAL_O) \
-		$(CLUSTER_SHARED_FS_SHAREDFS_O) -o $@
+		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(CLUSTER_SHARED_CATALOG_O) -o $@
 
 # spec-4.5a D12: runtime unit for the shared_fs backend + shared-root
 # sentinel.  Links ONLY cluster_shared_fs_sharedfs.o with functional
@@ -907,9 +907,9 @@ test_cluster_smgr: test_cluster_smgr.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
 		$(CLUSTER_SHARED_FS_LOCAL_O) \
-		$(CLUSTER_SHARED_FS_SHAREDFS_O)
+		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(CLUSTER_SHARED_CATALOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) $(CLUSTER_SHARED_CATALOG_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
 		$(CLUSTER_SHARED_FS_LOCAL_O) \
 		$(CLUSTER_SHARED_FS_SHAREDFS_O) -o $@

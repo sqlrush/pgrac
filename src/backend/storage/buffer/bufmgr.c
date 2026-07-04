@@ -104,10 +104,31 @@ extern bool ignore_checksum_failure;
 #define RELS_BSEARCH_THRESHOLD		20
 
 #ifdef USE_PGRAC_CLUSTER
+/*
+ * spec-6.14 D4: single PCM-tracking criterion by relfilenumber.  Under
+ * cluster.shared_catalog the catalog lives in the single shared tree, so its
+ * pages need the same N/S/X + CR + PI lost-write coherency as user pages
+ * (routing a catalog page into the shared tree without PCM tracking would be a
+ * double-write hazard -- pairs with the D3 smgr flip, INV-14-1).  All shared
+ * buffers under shared_catalog=on hold permanent (non-temp) relations: temp
+ * relations use local buffers and never reach these paths, and unlogged
+ * permanent relations are rejected at DDL time (Q12).  Off mode keeps the
+ * historic FirstNormalObjectId user-only boundary.
+ *
+ * The eviction/release hooks (HC112) MUST use this SAME criterion as the
+ * acquire path, otherwise a tracked catalog page's PCM lock would leak on
+ * eviction (spec-6.14 R6 -- do not let a gate drift).
+ */
+static inline bool
+cluster_bufmgr_reln_pcm_tracked(RelFileNumber relnum)
+{
+	return cluster_shared_catalog || relnum >= (RelFileNumber) FirstNormalObjectId;
+}
+
 static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 {
-	return BufTagGetRelNumber(&buf->tag) >= FirstNormalObjectId;
+	return cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&buf->tag));
 }
 #endif
 
@@ -1629,7 +1650,7 @@ retry:
 	 * BufferDesc.tag was just cleared above.
 	 */
 	if (cluster_pcm_is_active()
-		&& BufTagGetRelNumber(&oldTag) >= FirstNormalObjectId
+		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&oldTag))
 		&& buf->pcm_state != (uint8) PCM_STATE_N)
 	{
 		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
@@ -1739,7 +1760,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * (HC110) before BufTableDelete completes the eviction.
 	 */
 	if (cluster_pcm_is_active()
-		&& BufTagGetRelNumber(&tag) >= FirstNormalObjectId
+		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&tag))
 		&& buf_hdr->pcm_state != (uint8) PCM_STATE_N)
 	{
 		PcmLockMode old_mode = (PcmLockMode) buf_hdr->pcm_state;

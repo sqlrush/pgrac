@@ -332,19 +332,22 @@ cluster_smgr_which_for(RelFileLocator rlocator, BackendId backend)
 		return 0; /* opt-in GUC off: keep default safe */
 
 	/*
-	 * USER relations only (spec-4.5a G6).  Catalogs -- including the
-	 * shared ones under global/ -- are per-node state: every node runs
-	 * its own catalog copy (cross-node catalog coordination is feature
-	 * #11), so routing them into a genuinely shared root would point a
-	 * node at files initdb wrote into a DIFFERENT node's PGDATA.  The
-	 * local/stub backends masked this (their paths resolve inside the
-	 * node's own PGDATA either way); cluster_fs does not.  Same
-	 * relfilenumber boundary as cluster_bufmgr_should_pcm_track; a
-	 * rewritten catalog (VACUUM FULL pg_class) moving above
-	 * FirstNormalObjectId is out of harness scope until feature #11.
+	 * USER relations only (spec-4.5a G6) UNLESS shared_catalog is on.
+	 *
+	 * Historically catalogs -- including the shared ones under global/ --
+	 * were per-node state: every node ran its own catalog copy (cross-node
+	 * catalog coordination = feature #11), so routing them into a genuinely
+	 * shared root would point a node at files initdb wrote into a DIFFERENT
+	 * node's PGDATA.  spec-6.14 D3 closes that: under cluster.shared_catalog
+	 * the catalog IS the single shared tree, so the FirstNormalObjectId
+	 * boundary is removed and the criterion collapses to "non-temp = shared"
+	 * (the temp check above already excluded temp relations).  This also
+	 * makes a rewritten catalog (VACUUM FULL pg_class moving above
+	 * FirstNormalObjectId) route unambiguously.  D3/D4 flip together
+	 * (INV-14-1): shared-but-not-PCM-tracked would be a double-write hazard.
 	 */
-	if (rlocator.relNumber < FirstNormalObjectId)
-		return 0; /* catalog / system relation: per-node md.c */
+	if (!cluster_shared_catalog && rlocator.relNumber < FirstNormalObjectId)
+		return 0; /* catalog / system relation: per-node md.c (off mode) */
 
 	return 1; /* cluster_smgr */
 }

@@ -76,6 +76,8 @@
 /* GUC variables read by cluster_smgr / cluster_shared_fs. */
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
+bool cluster_shared_catalog = false;	/* spec-6.14 D3 routing flip */
+bool cluster_controlfile_shared_authority = false;	/* read by D1 startup vet */
 
 /* Cluster injection support. */
 #include "cluster/cluster_inject.h"
@@ -668,7 +670,44 @@ UT_TEST(test_which_for_full_opt_in_returns_cluster)
 
 	cluster_shared_storage_backend = 1; /* LOCAL */
 	cluster_smgr_user_relations = true; /* opt-in on */
+	cluster_shared_catalog = false;
 	UT_ASSERT_EQ(cluster_smgr_which_for(rl, InvalidBackendId), 1);
+}
+
+/* spec-6.14 D3/U8: a catalog relation (relNumber < FirstNormalObjectId, e.g.
+ * pg_class = 1259) routes to per-node md.c when shared_catalog is OFF... */
+UT_TEST(test_which_for_catalog_off_returns_md)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 1259 };
+
+	cluster_shared_storage_backend = 1; /* LOCAL */
+	cluster_smgr_user_relations = true;
+	cluster_shared_catalog = false;
+	UT_ASSERT_EQ(cluster_smgr_which_for(rl, InvalidBackendId), 0);
+}
+
+/* ...and to the shared cluster tree when shared_catalog is ON (U9). */
+UT_TEST(test_which_for_catalog_on_returns_cluster)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 1259 };
+
+	cluster_shared_storage_backend = 1; /* LOCAL */
+	cluster_smgr_user_relations = true;
+	cluster_shared_catalog = true;
+	UT_ASSERT_EQ(cluster_smgr_which_for(rl, InvalidBackendId), 1);
+	cluster_shared_catalog = false;		/* restore for later tests */
+}
+
+/* spec-6.14 D3/U10: temp relations stay node-local even under shared_catalog. */
+UT_TEST(test_which_for_temp_stays_md_under_shared_catalog)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
+
+	cluster_shared_storage_backend = 1;
+	cluster_smgr_user_relations = true;
+	cluster_shared_catalog = true;
+	UT_ASSERT_EQ(cluster_smgr_which_for(rl, 12 /* temp backend */ ), 0);
+	cluster_shared_catalog = false;
 }
 
 
@@ -895,12 +934,15 @@ main(void)
 	 */
 	cluster_smgr_shmem_init();
 
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(test_smgr_callbacks_linkable);
 	UT_RUN(test_which_for_temp_relation_returns_md);
 	UT_RUN(test_which_for_stub_backend_returns_md);
 	UT_RUN(test_which_for_user_relations_off_returns_md);
 	UT_RUN(test_which_for_full_opt_in_returns_cluster);
+	UT_RUN(test_which_for_catalog_off_returns_md);
+	UT_RUN(test_which_for_catalog_on_returns_cluster);
+	UT_RUN(test_which_for_temp_stays_md_under_shared_catalog);
 	UT_RUN(test_active_relation_count_pre_init);
 	UT_RUN(test_smgrsw_callback_signature_compiles);
 	UT_RUN(test_build_smgr_inval_msg_is_pg_native);

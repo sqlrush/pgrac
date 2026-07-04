@@ -526,6 +526,13 @@ void
 cluster_sequence_shmem_register(void)
 {}
 
+/* spec-6.14 D6 stub: cluster_init_shmem_module also calls
+ * cluster_oid_lease_shmem_register (cluster_oid_lease_shmem.c); the unit
+ * harness does not link that object, so provide a no-op. */
+void
+cluster_oid_lease_shmem_register(void)
+{}
+
 /* spec-5.5 D8 stub: cluster_init_shmem_module also calls
  * cluster_advisory_shmem_register (cluster_advisory.c); the unit harness does
  * not link that object, so provide a no-op. */
