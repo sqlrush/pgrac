@@ -1670,6 +1670,11 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_pcm_get_trans_s_to_n_release_count()));
 	emit_row(rsinfo, "pcm", "trans_s_to_x_cleanout_count",
 			 fmt_int64((int64)cluster_pcm_get_trans_s_to_x_cleanout_count()));
+
+	/* PGRAC: spec-6.14a D5 — local (b)-leg fail-closed counter (pcm row,
+	 * emitted here so the category groups stay contiguous). */
+	emit_row(rsinfo, "pcm", "local_s_revoke_nonholder_failclosed_count",
+			 fmt_int64((int64)cluster_pcm_get_local_s_revoke_nonholder_failclosed_count()));
 }
 
 
@@ -1838,15 +1843,14 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "gcs", "starvation_denied_pending_x_count",
 			 fmt_int64((int64)cluster_gcs_get_starvation_denied_pending_x_count()));
 
-	/* PGRAC: spec-6.14a D5 — 4 NEW counter rows for the X-vs-S arms. */
+	/* PGRAC: spec-6.14a D5 — 3 NEW gcs counter rows for the X-vs-S arms
+	 * (the companion pcm-category row lives in dump_pcm). */
 	emit_row(rsinfo, "gcs", "local_s_upgrade_grant_count",
 			 fmt_int64((int64)cluster_gcs_get_local_s_upgrade_grant_count()));
 	emit_row(rsinfo, "gcs", "x_vs_s_nonholder_grant_count",
 			 fmt_int64((int64)cluster_gcs_get_x_vs_s_nonholder_grant_count()));
 	emit_row(rsinfo, "gcs", "x_vs_s_no_carrier_denied_count",
 			 fmt_int64((int64)cluster_gcs_get_x_vs_s_no_carrier_denied_count()));
-	emit_row(rsinfo, "pcm", "local_s_revoke_nonholder_failclosed_count",
-			 fmt_int64((int64)cluster_pcm_get_local_s_revoke_nonholder_failclosed_count()));
 
 	/* PGRAC: spec-2.37 D12 — 4 NEW counter rows for PI watermark + lost-write. */
 	emit_row(rsinfo, "gcs", "pi_watermark_advance_count",

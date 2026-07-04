@@ -126,10 +126,14 @@ my %expect_cat = (
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 10,    # 4.7 warm-recovery(8) + spec-2.41 D7 redo-coverage serve-gate(2)
 	cr           => 41,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
-	                       # + post-5.54 band (tuple fallbacks, 5.56 rel-gen,
-	                       # retention/reconfig) additions (11) -- baseline was
-	                       # stale on main since those landed; first caught by
-	                       # a local full run (t/254 asserts counts, not names)
+	                       # + 11 post-5.54 keys the baseline missed (stale on
+	                       # main; first caught by a local full run): 6.12b
+	                       # cr_server_{full,partial,denied} +
+	                       # cr_remote_{full,partial,failed}, 5.56
+	                       # cr_rel_gen_{bump,table_overflow} +
+	                       # cr_global_epoch_fallback_bump,
+	                       # cr_retention_horizon_advance_noted,
+	                       # cr_reconfig_intra_survived
 	pcm          => 21,    # 2.37 PI watermark + lock state
 	                       # + spec-6.14a (b)-leg nonholder fail-closed counter
 );

@@ -3457,9 +3457,19 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 *       capturable current carrier would survive the revoke.
 			 */
 			if (!requester_is_s_holder) {
+				/*
+				 * allow_live_sge = false: the B2 capture must be an
+				 * INDEPENDENT copy, because the self-drop just below
+				 * invalidates this very buffer.  A live-SGE borrow raw-pins
+				 * the shared buffer itself: no copy would survive the drop
+				 * (s3.1 image-survival), and InvalidateBuffer would spin on
+				 * the foreign pin.  The read-image serve paths keep
+				 * allow_live_sge = true -- they never drop the pinned block
+				 * before the reply goes out.
+				 */
 				if ((holders_bm & ((uint32)1u << cluster_node_id)) != 0
 					&& gcs_block_get_ship_image(
-						req->tag, req->sender_node, true, &page_lsn, block_buf, &block_payload,
+						req->tag, req->sender_node, false, &page_lsn, block_buf, &block_payload,
 						&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg,
 						&sf_dep_vec, &sf_dep_valid))
 					xvs_b2_captured = true;
