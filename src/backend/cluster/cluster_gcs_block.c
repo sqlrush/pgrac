@@ -47,6 +47,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_reqid.h" /* PGRAC: spec-6.14a D1 — id domains */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
@@ -491,7 +492,13 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 			slot = &blk->slots[i];
 			slot->in_use = true;
 			slot->reply_received = false;
-			slot->request_id = blk->next_request_id++;
+			/* PGRAC: spec-6.14a D1 — domain-tagged id.  Raw per-backend
+			 * counters all start at 1, so ids from different backends (or
+			 * the local-upgrade counter) collide and a late invalidate ACK
+			 * from an earlier same-tag round could falsely certify a holder
+			 * in a newer round (ABA).  See cluster_gcs_reqid.h. */
+			slot->request_id = gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1,
+												   blk->next_request_id++);
 			slot->transition_id = transition_id;
 			slot->tag = tag;
 			slot->master_node = master_node;
@@ -4985,8 +4992,11 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 	holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
 	if (holders_bm != 0) {
 		memset(&synth, 0, sizeof(synth));
-		synth.request_id
-			= pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1;
+		/* PGRAC: spec-6.14a D1 — domain-tagged id (top bit = local-upgrade
+		 * domain; holds for node 0 too).  See cluster_gcs_reqid.h. */
+		synth.request_id = gcs_reqid_local_upgrade(
+			cluster_node_id,
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1);
 		synth.epoch = cluster_epoch_get_current();
 		synth.tag = tag;
 		synth.sender_node = cluster_node_id;
