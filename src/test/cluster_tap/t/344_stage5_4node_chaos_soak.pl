@@ -105,10 +105,11 @@ my @FAULTS = ('leave', 'leave', 'leave', 'kill', 'leave', 'leave',
 # ---------------------------------------------------------------------------
 sub read_scalar
 {
-	my ($node, $sql) = @_;
+	my ($node, $sql, $timeout) = @_;
 	my $to = 0;
+	$timeout //= 20;
 	my ($rc, $out) =
-		$node->psql('postgres', $sql, timeout => 20, timed_out => \$to);
+		$node->psql('postgres', $sql, timeout => $timeout, timed_out => \$to);
 	return undef if $to;    # blocked during a reconfig window -- tolerate
 	return (defined $rc && $rc == 0 && defined $out && $out ne '') ? $out : undef;
 }
@@ -175,11 +176,15 @@ sub epoch_coord
 sub materialized_sum
 {
 	my ($node) = @_;
-	# The owner node stays up, but a read may transiently blip during a reconfig
-	# window;  retry a few times before giving up (reads are never fenced).
-	for (1 .. 5)
+	# The owner node stays up, but after membership epoch convergence the GRD /
+	# block protocol may still fail-closed while remastering.  Give that
+	# read-only settle window time to clear before treating unreadable as a real
+	# consistency violation.
+	my $deadline = time + 60;
+	while (time < $deadline)
 	{
-		my $r = read_scalar($node, 'SELECT count(*), coalesce(sum(v),0) FROM soak_t');
+		my $r = read_scalar($node,
+			'SELECT count(*), coalesce(sum(v),0) FROM soak_t', 5);
 		return $r if defined $r;
 		usleep(400_000);
 	}
