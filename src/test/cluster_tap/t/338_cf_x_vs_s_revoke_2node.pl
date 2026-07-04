@@ -294,6 +294,15 @@ is($sum, "$expect", 'L5 reverse-table sum matches its committed round (no lost u
 is(no_carrier($pair), 0,
 	'L6 no-carrier fail-closed legs stayed 0 through the normal workload');
 
+# D4 regression face (spec s4 L8): ANALYZE drives the extend-liveness
+# engage path from a backend with a live peer; under cassert the old
+# postmaster-only Assert in cluster_lms_wait_for_ready would SIGABRT the
+# node.  safe_psql succeeding on both nodes proves the engage edge is
+# backend-safe.
+$node0->safe_psql('postgres', 'ANALYZE xvss');
+$node1->safe_psql('postgres', 'ANALYZE xvss_r');
+pass('L6 (D4) ANALYZE-driven engage path returned on both nodes, no TRAP');
+
 # ============================================================
 # L7: invalidate-ack stall on the holder -> bounded, retryable, no hang.
 # ============================================================
