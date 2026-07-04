@@ -475,10 +475,44 @@ UT_TEST(test_direct_land_success_status_whitelist)
 }
 
 
+UT_TEST(test_direct_land_no_forward_denial_identity_policy)
+{
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_GRANTED));
+	UT_ASSERT(
+		GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_DENIED_EPOCH_STALE));
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT));
+	UT_ASSERT(
+		GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_DENIED_DEDUP_FULL));
+	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
+		GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER));
+	UT_ASSERT(
+		!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_CR_RESULT_FULL));
+}
+
+
+UT_TEST(test_direct_land_arm_blocks_known_different_holder)
+{
+	UT_ASSERT(GcsBlockDirectCanArmExpectedPeer(-1, 2));
+	UT_ASSERT(GcsBlockDirectCanArmExpectedPeer(2, 2));
+	UT_ASSERT(!GcsBlockDirectCanArmExpectedPeer(3, 2));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -511,6 +545,8 @@ main(void)
 	UT_RUN(test_direct_land_wr_id_round_trip_rejects_wrong_type);
 	UT_RUN(test_direct_land_state_transitions);
 	UT_RUN(test_direct_land_success_status_whitelist);
+	UT_RUN(test_direct_land_no_forward_denial_identity_policy);
+	UT_RUN(test_direct_land_arm_blocks_known_different_holder);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

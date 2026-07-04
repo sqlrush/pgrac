@@ -201,10 +201,15 @@ advertise direct-land until the receive WR is already posted.
 Forwarded holder replies require an exact expected sender.  The safe initial
 D6 rule is:
 
-- direct-land is enabled only when the expected reply peer is known and armed;
-- if the master forwards to a holder that was not the armed peer, it must clear
-  the direct-land flag in `GcsBlockForwardPayload` and use the existing reply
-  path;
+- direct-land is not enabled when the requester already has local proof that a
+  holder different from the expected peer is current;
+- if the master receives a direct-armed request but must forward to a holder
+  that is not the armed peer, it must first consume the posted direct receive
+  with an authoritative direct-land denial and the requester retries with
+  direct-land suppressed;
+- forwarded `GcsBlockForwardPayload` direct-land is set only when a future
+  redirect-arm handshake proves the exact holder has been armed; the initial
+  D6 implementation always clears it;
 - a later in-spec enhancement may add a redirect-arm handshake, but holder
   direct-land must not rely on a wildcard receive posted to the wrong peer.
 
@@ -329,6 +334,12 @@ Unit tests:
 - arming failure clears request/forward direct-land flags;
 - success-status whitelist excludes destructive X-transfer and non-success
   denial statuses;
+- no-forward direct-land identity accepts sendable non-success denial statuses
+  after sidecar/checksum validation so they become authoritative denials rather
+  than stale `BAD_IDENTITY` aborts;
+- direct-land arming is skipped when local holder state proves the expected
+  peer is not the holder, and master-side forward decisions consume a direct
+  receive with a denial before any generic holder reply can race it;
 - forward direct-land flag uses `GcsBlockForwardPayload.reserved_0[5]` and
   master forwarding clears it unless an exact holder arm exists;
 - verifier rejects wrong peer, wrong backend id, wrong request id, wrong

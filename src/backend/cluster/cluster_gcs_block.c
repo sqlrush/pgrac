@@ -622,10 +622,14 @@ gcs_block_direct_prepare_attempt(ClusterGcsBlockOutstandingSlot *slot, BufferDes
 	void *page_addr = NULL;
 	int backend_idx = MyBackendId - 1;
 	int slot_idx;
+	int32 holder_node;
 
 	if (slot == NULL || buf == NULL)
 		return false;
 	if (transition_id != PCM_TRANS_N_TO_S)
+		return false;
+	holder_node = cluster_pcm_master_holder_node_by_tag(tag);
+	if (!GcsBlockDirectCanArmExpectedPeer(holder_node, expected_peer))
 		return false;
 	if (!cluster_ic_rdma_block_reply_lane_connected(expected_peer, NULL))
 		return false;
@@ -753,29 +757,6 @@ gcs_block_release_live_sge(void *arg)
 	cluster_bufmgr_release_block_for_gcs_live_sge((BufferDesc *)arg);
 }
 
-static bool
-gcs_block_direct_reply_status_sendable(GcsBlockReplyStatus status)
-{
-	if (GcsBlockReplyStatusAllowsDirectLandInstall(status))
-		return true;
-	switch (status) {
-	case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
-	case GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT:
-	case GCS_BLOCK_REPLY_DENIED_EPOCH_STALE:
-	case GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL:
-	case GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER:
-	case GCS_BLOCK_REPLY_DENIED_DEDUP_FULL:
-	case GCS_BLOCK_REPLY_DENIED_PENDING_X:
-	case GCS_BLOCK_REPLY_DENIED_INVALIDATE_TIMEOUT:
-	case GCS_BLOCK_REPLY_DENIED_LOST_WRITE:
-	case GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING:
-		return true;
-	default:
-		break;
-	}
-	return false;
-}
-
 static ClusterICSendResult
 gcs_block_send_direct_reply_sge(int32 dest_node, const GcsBlockReplyHeader *hdr,
 								const char *block_payload, uint32 block_lkey,
@@ -825,7 +806,7 @@ gcs_block_try_send_direct_reply(int32 dest_node, bool direct_armed, GcsBlockRepl
 		return false;
 
 	status = (GcsBlockReplyStatus)hdr->status;
-	if (!gcs_block_direct_reply_status_sendable(status)) {
+	if (!GcsBlockReplyStatusIsDirectLandSendable(status)) {
 		memset(&denial, 0, sizeof(denial));
 		denial = *hdr;
 		denial.page_lsn = 0;
@@ -1274,6 +1255,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool read_image = false; /* spec-5.2 D2: one-shot read image, non-durable */
 	bool terminal_denied = false;
 	bool retransmit_warning_emitted = false;
+	bool suppress_direct_land = false;
 	uint8 final_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
 	int32 final_forwarding_master = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 	XLogRecPtr final_page_lsn = InvalidXLogRecPtr;
@@ -1349,6 +1331,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
 			TimestampTz deadline;
 			bool got_reply = false;
+			bool direct_authoritative_denial = false;
 
 			/* Apply backoff for retry attempts (not the initial send). */
 			if (retry_attempt > 0) {
@@ -1418,7 +1401,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				LWLockRelease(&blk->lock.lock);
 			}
 
-			(void)gcs_block_direct_prepare_attempt(slot, buf, tag, transition_id, current_master);
+			if (!suppress_direct_land)
+				(void)gcs_block_direct_prepare_attempt(slot, buf, tag, transition_id,
+													   current_master);
 
 			if (retry_attempt == 0)
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_request_count, 1);
@@ -1556,6 +1541,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				}
 				/* budget exhausted at timeout */
 				break;
+			}
+
+			{
+				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+				LWLockAcquire(&blk->lock.lock, LW_SHARED);
+				direct_authoritative_denial = slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+											  && slot->direct_abort_reason
+													 == GCS_BLOCK_DIRECT_ABORT_BAD_STATUS
+											  && slot->reply_received;
+				LWLockRelease(&blk->lock.lock);
 			}
 
 			final_status = slot->reply_header.status;
@@ -1759,6 +1755,24 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				if (retry_attempt < max_retries)
 					continue;
 				terminal_denied = true; /* exhausted → terminal 53R9L below */
+				break;
+			}
+
+			/*
+			 * D6 direct-land forward handoff: if the master consumed our posted
+			 * direct receive with a no-forward denial because it had to forward
+			 * to another holder, retry on the normal/generic path.  The generic
+			 * retry lets the holder reply reach this slot without racing a live
+			 * direct receive armed to the master.
+			 */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+				&& final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+				&& direct_authoritative_denial) {
+				suppress_direct_land = true;
+				current_master = cluster_gcs_lookup_master(tag);
+				if (retry_attempt < max_retries)
+					continue;
+				terminal_denied = true;
 				break;
 			}
 
@@ -2702,6 +2716,23 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 }
 
+static bool
+gcs_block_deny_direct_armed_forward_request(const GcsBlockRequestPayload *req)
+{
+	if (!GcsBlockRequestPayloadIsDirectLandArmed(req))
+		return false;
+
+	/*
+	 * The requester posted its receive on this master's block-reply lane.  A
+	 * generic holder reply would arrive while that receive is still live, so
+	 * consume/abort the direct receive first and let the requester retry
+	 * without direct-land.
+	 */
+	gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
+						 InvalidXLogRecPtr, NULL);
+	return true;
+}
+
 /*
  * gcs_block_resend_cached_reply — for spec-2.34 D5 dedup CACHED_REPLY path.
  *
@@ -3021,6 +3052,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 
 			if (holder_node < 0 || holder_node == cluster_node_id)
 				return; /* malformed dedup entry; silent drop */
+			if (gcs_block_deny_direct_armed_forward_request(req))
+				return;
 
 			memset(&fwd, 0, sizeof(fwd));
 			fwd.request_id = req->request_id;
@@ -3324,6 +3357,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
+				if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
+					cluster_pcm_lock_clear_pending_x(req->tag);
+					(void)gcs_block_deny_direct_armed_forward_request(req);
+					return;
+				}
 
 				memset(&fwd, 0, sizeof(fwd));
 				fwd.request_id = req->request_id;
@@ -3572,6 +3610,8 @@ x_path_skipped:
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
+				if (gcs_block_deny_direct_armed_forward_request(req))
+					return;
 
 				memset(&fwd, 0, sizeof(fwd));
 				fwd.request_id = req->request_id;
@@ -3642,6 +3682,8 @@ x_path_skipped:
 									 InvalidXLogRecPtr, NULL);
 				return;
 			}
+			if (gcs_block_deny_direct_armed_forward_request(req))
+				return;
 
 			/* Build and send GCS_BLOCK_FORWARD to holder. */
 			memset(&fwd, 0, sizeof(fwd));
@@ -4074,7 +4116,7 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 				  && hdr->sender_node == peer_node;
 	if (identity_ok) {
 		if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
-			identity_ok = status == GCS_BLOCK_REPLY_GRANTED;
+			identity_ok = GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(status);
 		else
 			identity_ok = fwd_master == slot->expected_master_node
 						  && (status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER

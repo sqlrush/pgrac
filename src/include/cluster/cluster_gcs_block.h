@@ -317,6 +317,44 @@ GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
 		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
 }
 
+static inline bool
+GcsBlockReplyStatusIsDirectLandSendable(GcsBlockReplyStatus status)
+{
+	if (GcsBlockReplyStatusAllowsDirectLandInstall(status))
+		return true;
+	switch (status) {
+	case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
+	case GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT:
+	case GCS_BLOCK_REPLY_DENIED_EPOCH_STALE:
+	case GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL:
+	case GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER:
+	case GCS_BLOCK_REPLY_DENIED_DEDUP_FULL:
+	case GCS_BLOCK_REPLY_DENIED_PENDING_X:
+	case GCS_BLOCK_REPLY_DENIED_INVALIDATE_TIMEOUT:
+	case GCS_BLOCK_REPLY_DENIED_LOST_WRITE:
+	case GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING:
+		return true;
+	default:
+		break;
+	}
+	return false;
+}
+
+static inline bool
+GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GcsBlockReplyStatus status)
+{
+	if (status == GCS_BLOCK_REPLY_GRANTED)
+		return true;
+	return !GcsBlockReplyStatusAllowsDirectLandInstall(status)
+		   && GcsBlockReplyStatusIsDirectLandSendable(status);
+}
+
+static inline bool
+GcsBlockDirectCanArmExpectedPeer(int32 holder_node, int32 expected_peer)
+{
+	return holder_node < 0 || holder_node == expected_peer;
+}
+
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
  *
