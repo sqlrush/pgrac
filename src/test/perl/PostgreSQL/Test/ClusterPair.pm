@@ -129,9 +129,20 @@ sub new_pair
 	# (pgrac_shared.control) is created by the first node to attach and
 	# records both node_ids as participants.
 	my $shared_data_root;
+	my $block_device_img;
+	my $backend = $opts{storage_backend} // 'cluster_fs';   # spec-6.0a opt-in
 	if ($opts{shared_data})
 	{
 		$shared_data_root = PostgreSQL::Test::Utils::tempdir();
+		if ($backend eq 'block_device')
+		{
+			# spec-6.0a raw block_device backend over a loopback file image
+			# (t/333 pattern); ONE image, both nodes point to it.
+			$block_device_img = "$shared_data_root/pair_raw_device.img";
+			open(my $fh, '>', $block_device_img) or die "open img: $!";
+			truncate($fh, 512 * 1024 * 1024) or die "truncate img: $!";
+			close($fh);
+		}
 	}
 
 	my $wal_node_index = 0;
@@ -152,10 +163,26 @@ sub new_pair
 
 		if (defined $shared_data_root)
 		{
-			$node->append_conf('postgresql.conf',
-				"cluster.shared_storage_backend = cluster_fs\n");
-			$node->append_conf('postgresql.conf',
-				"cluster.shared_data_dir = '$shared_data_root'\n");
+			if ($backend eq 'block_device')
+			{
+				my $q = $block_device_img;
+				$q =~ s/'/''/g;
+				$node->append_conf('postgresql.conf',
+					"cluster.shared_storage_backend = block_device\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.block_device_path = '$q'\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.block_device_use_odirect = off\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.storage_fence_driver = disabled\n");
+			}
+			else
+			{
+				$node->append_conf('postgresql.conf',
+					"cluster.shared_storage_backend = cluster_fs\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.shared_data_dir = '$shared_data_root'\n");
+			}
 			$node->append_conf('postgresql.conf',
 				"cluster.smgr_user_relations = on\n");
 		}
