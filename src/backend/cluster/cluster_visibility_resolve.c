@@ -38,15 +38,16 @@
 #include "storage/bufpage.h"
 
 #include "cluster/cluster_epoch.h"
-#include "cluster/cluster_guc.h"			/* cluster_node_id, subtrans depth */
-#include "cluster/cluster_itl.h"			/* get_tt_ref / lock ref / multixact origin */
-#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
-#include "cluster/cluster_recovery_merge.h" /* spec-4.5a G6: materialized authority gate */
-#include "cluster/cluster_remote_xact.h"	/* spec-4.5a G6: wrap-checked authority */
-#include "cluster/cluster_subtrans.h"		/* SUBCOMMITTED parent follow */
-#include "cluster/cluster_tt_durable.h"		/* spec-4.8 D2 remote_active_failclosed counter */
-#include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
-#include "cluster/cluster_touched_peers.h"	/* spec-5.14 D2 class 4 */
+#include "cluster/cluster_guc.h"				/* cluster_node_id, subtrans depth */
+#include "cluster/cluster_itl.h"				/* get_tt_ref / lock ref / multixact origin */
+#include "cluster/cluster_itl_slot.h"			/* CLUSTER_ITL_SLOT_UNALLOCATED */
+#include "cluster/cluster_recovery_merge.h"		/* spec-4.5a G6: materialized authority gate */
+#include "cluster/cluster_remote_xact.h"		/* spec-4.5a G6: wrap-checked authority */
+#include "cluster/cluster_runtime_visibility.h" /* spec-6.12i CP3: active-runtime resolve */
+#include "cluster/cluster_subtrans.h"			/* SUBCOMMITTED parent follow */
+#include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
+#include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
+#include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
 #include "cluster/cluster_xnode_lever.h"   /* spec-6.12c: terminal memo + D0 counters */
@@ -339,6 +340,42 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 			default:
 				break; /* unprovable -> STALE fail-closed below */
 			}
+		} else if (cluster_crossnode_runtime_visibility) {
+			/*
+			 * PGRAC: spec-6.12i CP3 (D-i2 wiring) — ACTIVE-runtime resolution.
+			 *
+			 * The origin is NOT materialized (it is live — the materialized
+			 * marker is a crash-recovery artifact), so the recovery-side
+			 * authority above is structurally unavailable and this branch
+			 * used to be unconditionally fail-closed (53R97; the observed
+			 * cross-node concurrent-write collapse).  With the wave GUC on,
+			 * ask the live origin instead: D-i1 fetches the ref's TT header
+			 * block WITH a co-sampled live authority (Cache Fusion shape —
+			 * the transaction state is resolved on the bytes shipped from
+			 * the owner's cache, never on a bypassing disk read), the D-i2
+			 * gate proves that authority covers this tuple's page version in
+			 * the current membership epoch, and the positive-proof scan
+			 * accepts ONLY an exact xid+wrap terminal slot match.  A 0-match
+			 * on the single fetched block is NOT proof of recycled/aborted
+			 * (the slot may live in another segment) — proving absence would
+			 * need a complete origin TT header scan under one authority,
+			 * which is a possible future extension, not this slice.  Every
+			 * unproven outcome falls through to the unchanged
+			 * STALE_OR_AMBIGUOUS -> 53R97 (Rule 8.A: this wave only widens
+			 * "resolve when provable").
+			 */
+			bool committed = false;
+			SCN scn = InvalidScn;
+
+			if (cluster_runtime_visibility_try_resolve_remote((int)ref->origin_node_id,
+															  (uint32)ref->undo_segment_id, raw_xid,
+															  anchor_lsn, &committed, &scn)) {
+				out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+				out->status = committed ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+				out->commit_scn = committed ? scn : InvalidScn;
+				return;
+			}
+			cluster_tt_recovery_count_remote_active_failclosed();
 		}
 		out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
 		cluster_vis_bump_vis_variant_unknown_failclosed_count();

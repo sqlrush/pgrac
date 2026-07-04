@@ -2486,6 +2486,13 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_undo_served_count()));
 	emit_row(rsinfo, "cr", "cr_server_undo_denied_count",
 			 fmt_int64((int64)cluster_cr_server_undo_denied_count()));
+	/* spec-6.12i CP3: recycled-slot active-runtime resolution verdicts. */
+	emit_row(rsinfo, "cr", "rtvis_resolve_committed_count",
+			 fmt_int64((int64)cluster_rtvis_resolve_committed_count()));
+	emit_row(rsinfo, "cr", "rtvis_resolve_aborted_count",
+			 fmt_int64((int64)cluster_rtvis_resolve_aborted_count()));
+	emit_row(rsinfo, "cr", "rtvis_resolve_failclosed_count",
+			 fmt_int64((int64)cluster_rtvis_resolve_failclosed_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

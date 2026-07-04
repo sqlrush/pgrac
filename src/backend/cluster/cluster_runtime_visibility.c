@@ -199,4 +199,82 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
 	return true;
 }
 
+/*
+ * cluster_runtime_visibility_try_resolve_remote — CP3 (D-i2 wiring body).
+ *
+ *	Active-runtime terminal resolution of a RECYCLED remote ITL ref:
+ *	  fetch (D-i1, block 0 of the ref's segment)  ->  covers gate (D-i2,
+ *	  co-sampled authority vs this tuple's page LSN)  ->  positive proof
+ *	  (exact xid+wrap slot match on the SHIPPED bytes).
+ *
+ *	The proof scans the very bytes the authority was co-sampled with (also
+ *	on a cache hit — the pool/memo only ever serve the pair as installed),
+ *	so D-i2 condition (c) generation consistency is structural: there is no
+ *	second read whose generation could diverge.  auth.tt_generation is kept
+ *	for observability and any future cross-source check.
+ *
+ *	true only on a proven terminal verdict; every other outcome returns
+ *	false so classify_ref keeps the pre-existing STALE_OR_AMBIGUOUS ->
+ *	53R97 fail-closed (Rule 8.A: only "resolve when provable" is widened).
+ */
+bool
+cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
+											  TransactionId raw_xid, XLogRecPtr anchor_lsn,
+											  bool *out_committed, SCN *out_commit_scn)
+{
+	PGAlignedBlock page;
+	ClusterLiveAuthority auth;
+	SCN scn = InvalidScn;
+	uint16 wrap = TT_WRAP_INVALID;
+
+	if (out_committed != NULL)
+		*out_committed = false;
+	if (out_commit_scn != NULL)
+		*out_commit_scn = InvalidScn;
+	if (out_committed == NULL || out_commit_scn == NULL)
+		return false;
+
+	if (!cluster_crossnode_runtime_visibility)
+		return false;
+	if (origin_node < 0 || origin_node == cluster_node_id)
+		return false;
+
+	/*
+	 * uba_encode contract pre-validation (segment 0 is bootstrap-only and
+	 * Assert-fenced there; a ref carrying it is not resolvable evidence).
+	 */
+	if (undo_segment_id == 0 || undo_segment_id > UINT16_MAX)
+		return false;
+
+	if (!cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
+												 page.data, &auth)) {
+		cluster_rtvis_resolve_note_failclosed();
+		return false;
+	}
+
+	if (!cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+		cluster_rtvis_resolve_note_failclosed();
+		return false;
+	}
+
+	switch (cluster_vis_tt_block_positive_proof(page.data, undo_segment_id,
+												(uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
+	case CLUSTER_VIS_TT_PROOF_COMMITTED:
+		*out_committed = true;
+		*out_commit_scn = scn;
+		cluster_rtvis_resolve_note_committed();
+		return true;
+	case CLUSTER_VIS_TT_PROOF_ABORTED:
+		cluster_rtvis_resolve_note_aborted();
+		return true;
+	case CLUSTER_VIS_TT_PROOF_NONE:
+	default:
+		/* 0-match / multi-match / non-terminal / malformed header: a single
+		 * fetched TT block cannot prove recycled-or-aborted (the slot may
+		 * live in another segment) — stay fail-closed. */
+		cluster_rtvis_resolve_note_failclosed();
+		return false;
+	}
+}
+
 #endif /* USE_PGRAC_CLUSTER */

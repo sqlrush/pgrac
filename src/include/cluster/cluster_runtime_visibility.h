@@ -36,6 +36,7 @@
 
 #include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h" /* UBA */
+#include "cluster/cluster_scn.h"	  /* SCN */
 
 /*
  * Live authority triple, co-sampled by the origin LMS into the undo-block
@@ -92,5 +93,57 @@ extern bool cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLive
  */
 extern bool cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page,
 													ClusterLiveAuthority *auth_out);
+
+/*
+ * D-i2 positive proof over a fetched TT header block (spec-6.12i CP3).
+ *
+ * POSITIVE PROOF ONLY (user-approved boundary): a terminal verdict must come
+ * from exactly ONE occupied slot in the fetched block whose (xid, wrap) pair
+ * identifies the transaction — COMMITTED requires a valid commit_scn,
+ * ABORTED requires the ABORTED status itself.  Everything else is NO proof:
+ *   - 0 matches: a single fetched TT block cannot prove recycled/aborted
+ *     (the xid's slot may live in ANOTHER segment of the origin); proving
+ *     absence would need a complete origin TT header scan under the same
+ *     live authority — a possible future extension, NOT this slice.
+ *   - >1 matches: same-valued xid residue (any occupied status counts,
+ *     RECYCLABLE included) is ambiguity — refuse.
+ *   - ACTIVE / RECYCLABLE / COMMITTED-without-scn single match: not a
+ *     terminal proof — refuse.
+ *   - header mismatch (segment_id / owner / slot count) or an out-of-range
+ *     slot status byte: not provably the asked-for TT — refuse the block.
+ *
+ * Why one in-block (xid) match cannot alias across a 2^32 xid wraparound:
+ * a segment header takes bindings only during one contiguous active era
+ * (a rollover seals it; sealed segments take no new bindings until wiped on
+ * reuse, spec-3.12 D2b), every real-xid write xact binds one TT slot, and
+ * per-slot wrap is capped (TT_WRAP_MAX) — so one era spans far fewer
+ * bindings (≤ 48 × 65534) than the 2^32 xids a same-value recurrence
+ * requires.  The matched slot's wrap is returned as the exact-identity
+ * evidence (D-i2 condition (c)); >1 match still refuses as defense in
+ * depth.  Pure; no I/O, no shmem, no elog (unit truth table).
+ */
+typedef enum ClusterVisTtProof {
+	CLUSTER_VIS_TT_PROOF_NONE = 0, /* fail-closed: caller keeps 53R97 */
+	CLUSTER_VIS_TT_PROOF_COMMITTED = 1,
+	CLUSTER_VIS_TT_PROOF_ABORTED = 2
+} ClusterVisTtProof;
+
+extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
+															 uint32 expected_segment_id,
+															 uint8 expected_owner_instance,
+															 TransactionId xid, SCN *out_commit_scn,
+															 uint16 *out_wrap);
+
+/*
+ * CP3 orchestration (backend): active-runtime resolution of a RECYCLED
+ * remote ITL ref via D-i1 fetch + D-i2 gate + positive proof.  true only
+ * when a terminal verdict is proven (*out_committed says which; commit_scn
+ * valid iff committed); false = caller keeps the pre-existing
+ * STALE_OR_AMBIGUOUS -> 53R97 fail-closed (Rule 8.A).
+ */
+extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
+														  TransactionId raw_xid,
+														  XLogRecPtr anchor_lsn,
+														  bool *out_committed, SCN *out_commit_scn);
 
 #endif /* CLUSTER_RUNTIME_VISIBILITY_H */

@@ -25,6 +25,7 @@
 
 #include "cluster/cluster_gcs_block.h" /* undo-fetch tag + auth trailer (CP2) */
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_undo_segment.h" /* fake TT header blocks (CP3) */
 
 #include "unit_test.h"
 
@@ -134,6 +135,129 @@ UT_TEST(test_undo_auth_trailer_roundtrip)
 		UT_ASSERT_EQ(t.reserved_0[i], 0);
 }
 
+/* ============================================================
+ * CP3: positive-proof scan truth table (cluster_vis_tt_block_positive_proof)
+ * ============================================================ */
+
+#define PROOF_SEG 7
+#define PROOF_OWNER 2 /* origin node 1 -> owner_instance 2 */
+
+static PGAlignedBlock proof_block;
+
+static UndoSegmentHeaderData *
+mk_header(uint32 segment_id, uint8 owner, uint16 nslots)
+{
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)proof_block.data;
+
+	memset(proof_block.data, 0, BLCKSZ);
+	hdr->segment_id = segment_id;
+	hdr->owner_instance = owner;
+	hdr->tt_slots_count = nslots;
+	return hdr;
+}
+
+static void
+set_slot(UndoSegmentHeaderData *hdr, int i, TransactionId xid, uint16 wrap, uint8 status, SCN scn)
+{
+	hdr->tt_slots[i].xid = xid;
+	hdr->tt_slots[i].wrap = wrap;
+	hdr->tt_slots[i].status = status;
+	hdr->tt_slots[i].commit_scn = scn;
+}
+
+/* Exactly-one terminal match resolves; UNUSED same-xid bytes are ignored. */
+UT_TEST(test_ttproof_committed_and_aborted)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	SCN scn = InvalidScn;
+	uint16 wrap = 0;
+
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	set_slot(hdr, 9, 2000, 2, (uint8)TT_SLOT_ABORTED, InvalidScn);
+	/* UNUSED slot carrying the same xid bytes must NOT count as residue. */
+	set_slot(hdr, 11, 1000, 9, (uint8)TT_SLOT_UNUSED, InvalidScn);
+
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 &scn, &wrap),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(scn, (SCN)777);
+	UT_ASSERT_EQ(wrap, 5);
+
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+													 &scn, &wrap),
+				 CLUSTER_VIS_TT_PROOF_ABORTED);
+	UT_ASSERT_EQ(wrap, 2);
+}
+
+/* 0-match / ACTIVE / COMMITTED-without-scn: never a proof (user boundary:
+ * a single fetched block's 0-match is NOT recycled/aborted evidence). */
+UT_TEST(test_ttproof_zero_match_active_invalid_scn)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	SCN scn = (SCN)1;
+	uint16 wrap = 1;
+
+	set_slot(hdr, 0, 1000, 1, (uint8)TT_SLOT_ACTIVE, InvalidScn);
+	set_slot(hdr, 1, 2000, 1, (uint8)TT_SLOT_COMMITTED, InvalidScn); /* unstamped */
+
+	/* 0-match: xid 3000 nowhere in this block. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 3000,
+													 &scn, &wrap),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn); /* out-params reset on refusal */
+	/* single ACTIVE match: in progress, not terminal. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	/* single COMMITTED match without a valid commit_scn: unstamped, refuse. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+}
+
+/* Same-xid residue (RECYCLABLE counts) and an unparseable status byte both
+ * poison the verdict — defense in depth over the one-era argument. */
+UT_TEST(test_ttproof_ambiguity_and_garbage)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	set_slot(hdr, 7, 1000, 4, (uint8)TT_SLOT_RECYCLABLE, (SCN)555);
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* Garbage status ANYWHERE refuses even an otherwise-clean match. */
+	hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	set_slot(hdr, 40, 4000, 1, (uint8)7, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+}
+
+/* Header identity mismatches: not provably the asked-for TT -> refuse. */
+UT_TEST(test_ttproof_header_mismatch)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+
+	/* wrong segment id */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG + 1, PROOF_OWNER,
+													 1000, NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	/* wrong owner instance */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER + 1,
+													 1000, NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+	/* over-range slot count */
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT + 1;
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_NONE);
+}
+
 /* CP2: synthetic undo-address tag roundtrip + magic discrimination. */
 UT_TEST(test_undo_fetch_tag_roundtrip)
 {
@@ -159,13 +283,17 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_covers_when_epoch_match_and_hwm_ge_anchor);
 	UT_RUN(test_failclosed_when_epoch_differs);
 	UT_RUN(test_failclosed_when_hwm_invalid);
 	UT_RUN(test_failclosed_when_hwm_below_anchor);
 	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_hwm);
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
+	UT_RUN(test_ttproof_committed_and_aborted);
+	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
+	UT_RUN(test_ttproof_ambiguity_and_garbage);
+	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_DONE();

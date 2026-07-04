@@ -1685,6 +1685,22 @@ cluster_cr_server_undo_denied_count(void)
 {
 	return 0;
 }
+/* spec-6.12i CP3: resolution-verdict counters. */
+uint64
+cluster_rtvis_resolve_committed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_resolve_aborted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_resolve_failclosed_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)
