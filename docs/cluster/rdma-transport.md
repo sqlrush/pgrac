@@ -1,7 +1,8 @@
 # RDMA interconnect transport
 
 Spec: `spec-6.1-rdma-transport-stack.md` and the spec-6.13 RDMA tier3
-extensions.
+extensions.  The detailed spec-6.13 design is
+`docs/cluster/spec-6.13-rdma-tier3-zero-copy.md`.
 
 The RDMA transport is optional.  Default builds do not link libibverbs
 or librdmacm.  Build with `--with-rdma` to enable RDMA provider and mux
@@ -85,12 +86,13 @@ supports event-driven completions and bounded busypoll completions.
 when the binary and device expose mlx5dv capability; otherwise it follows
 the configured fallback policy.
 
-Receiver direct-land is not implemented on the generic RC QP.  The
-current QP has a single receive lane and one receive SGE, so a block
-reply cannot safely pre-post a sidecar + target-page receive on that lane
-without risking FIFO consumption by an unrelated message.  Direct-land
-requires a dedicated block-reply QP/lane, two-SGE receive posting, and an
-LMON send-before-arm handoff.
+Receiver direct-land is in the expanded spec-6.13 scope, but it must not
+use the generic RC QP.  The current generic QP has a single receive lane
+and one receive SGE, so a block reply cannot safely pre-post a sidecar +
+target-page receive on that lane without risking FIFO consumption by an
+unrelated message.  Direct-land must use the dedicated block-reply
+QP/lane, two-SGE receive posting, slot generation correlation, and LMON
+arm-before-send handoff described in the spec-6.13 design.
 
 ## Hardening
 
@@ -131,5 +133,5 @@ burn/fallback counters, and last error summary.
 `dump_cluster_state` exposes GCS-side copy-path counters:
 `scratch_copy_count`, `live_sge_send_count`, `live_sge_fallback_count`,
 `direct_install_count`, `direct_install_abort_count`, and
-`install_copy_count`.  The direct-install counters are reserved until the
-dedicated block-reply direct-land lane lands.
+`install_copy_count`.  The direct-install counters are reserved by the
+expanded spec-6.13 D6 direct-land lane until that lane lands.
