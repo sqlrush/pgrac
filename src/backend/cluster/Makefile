@@ -185,6 +185,7 @@ OBJS = \
 	cluster_cr_server.o \
 	cluster_cr_server_policy.o \
 	cluster_cr_srf.o \
+	cluster_runtime_visibility_policy.o \
 	cluster_resolver_cache.o \
 	cluster_tt_slot.o \
 	cluster_tt_2pc.o \

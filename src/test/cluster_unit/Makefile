@@ -76,6 +76,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_hang \
         test_cluster_hang_resolve \
         test_cluster_cr_server_policy \
+        test_cluster_runtime_visibility \
         test_cluster_touched_peers \
         test_cluster_clean_leave \
         test_cluster_membership \
@@ -172,7 +173,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_adg test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_adg test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -319,6 +320,16 @@ test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLU
 		$(CLUSTER_CR_SERVER_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CR_SERVER_POLICY_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-6.12i: test_cluster_runtime_visibility links cluster_runtime_visibility_policy.o
+# (the pure D-i2 live-authority window gate: epoch match + hwm >= anchor_lsn,
+# fail-closed on every doubt).  No PG-backend deps: branch-only integer logic.
+CLUSTER_RUNTIME_VIS_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_runtime_visibility_policy.o
+test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-5.14 D1: test_cluster_touched_peers links cluster_touched_peers.o (the
