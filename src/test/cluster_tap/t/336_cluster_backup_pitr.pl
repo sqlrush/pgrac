@@ -475,12 +475,24 @@ EOC
 	PostgreSQL::Test::Utils::append_to_file($restore_node->data_dir . '/recovery.signal', '');
 }
 
+sub wait_for_pair_restore_promotion
+{
+	my ($restore_node, $label) = @_;
+
+	ok($restore_node->poll_query_until('postgres',
+		q{SELECT CASE WHEN pg_is_in_recovery() THEN 'f' ELSE 't' END},
+		't'),
+		$label);
+}
+
 my $pair_restore = PgracClusterNode->new('cluster_backup_pair_restore');
 PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
 	$pair_restore->data_dir);
 chmod(0700, $pair_restore->data_dir);
 configure_pair_restore($pair_restore, $pair_restore_shared, $pair_consistent_scn);
 $pair_restore->start;
+wait_for_pair_restore_promotion($pair_restore,
+	'L18 two-node PITR restore finishes promotion before post-open checks');
 is($pair_restore->safe_psql('postgres',
 	q{SELECT string_agg(id::text || ':' || marker::text, ',' ORDER BY id)
 	     FROM cluster_backup_pair_probe}),
@@ -529,6 +541,8 @@ PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
 chmod(0700, $pair_latest_restore->data_dir);
 configure_pair_restore($pair_latest_restore, $pair_latest_shared, undef);
 $pair_latest_restore->start;
+wait_for_pair_restore_promotion($pair_latest_restore,
+	'L18d no-target restore finishes promotion before post-open checks');
 is($pair_latest_restore->safe_psql('postgres',
 	q{SELECT string_agg(id::text || ':' || marker::text, ',' ORDER BY id)
 	     FROM cluster_backup_pair_probe}),
