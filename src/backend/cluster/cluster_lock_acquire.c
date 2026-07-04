@@ -906,6 +906,41 @@ cluster_relation_is_persistent_or_unlogged(Oid relid)
 
 
 /*
+ * spec-6.14 D7 — is relid a mapped relation?
+ *
+ *	A mapped relation carries relfilenode == InvalidOid in its pg_class row;
+ *	its real file number lives in pg_filenode.map (the nailed system catalogs
+ *	that VACUUM FULL can rewrite).  cluster_lock_should_globalize uses this to
+ *	globalize mapped-relation write-mode locks (>= RowExclusive) under
+ *	shared_catalog, so a peer's low-mode write conflicts cross-node with a
+ *	relmap rewrite's AEL (r3 self-disclosure).
+ *
+ *	Fires only on catalog OIDs at RowExclusive+ (DDL-frequency; never the OLTP
+ *	user-table path).  Fail-safe:  unknown oid -> true (over-globalize is safe;
+ *	under-globalize risks a lost write on a mapped rel).
+ */
+bool
+cluster_relation_is_mapped(Oid relid)
+{
+	HeapTuple tuple;
+	bool mapped;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		return true; /* fail-safe: assume mapped (over-globalize is safe) */
+
+	{
+		Form_pg_class rel = (Form_pg_class)GETSTRUCT(tuple);
+
+		mapped = (rel->relfilenode == InvalidOid);
+	}
+
+	ReleaseSysCache(tuple);
+	return mapped;
+}
+
+
+/*
  * cluster_lock_decide_op — spec-5.3 D1: REQUEST vs CONVERT (requester-local).
  *
  *	Scans this backend's own LockMethodLocalHash for a cluster_registered

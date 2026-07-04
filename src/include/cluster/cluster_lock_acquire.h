@@ -367,6 +367,17 @@ cluster_lock_acquire_s5_not_found_is_benign(uint8 locktag_type, LOCKMODE lockmod
  */
 extern bool cluster_relation_is_persistent_or_unlogged(Oid relid);
 
+/*
+ * spec-6.14 D7 — is relid a mapped relation (relfilenode nailed in
+ * pg_filenode.map)?  Used by cluster_lock_should_globalize to globalize
+ * mapped-relation write-mode locks (>= RowExclusive) under shared_catalog so
+ * they conflict cross-node with a relmap rewrite's AEL (r3 self-disclosure).
+ * Fires only on catalog OIDs at RowExclusive+ (DDL-frequency).  Fail-safe:
+ * unknown oid -> true (over-globalize is safe; under-globalize risks a lost
+ * write on a mapped rel).
+ */
+extern bool cluster_relation_is_mapped(Oid relid);
+
 static inline bool
 cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 {
@@ -390,13 +401,38 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 
 	switch (locktag->locktag_type) {
 	case LOCKTAG_RELATION:
+		/*
+		 * spec-6.14 D7:  under cluster.shared_catalog the catalog is
+		 * cluster-shared, so the HC24 "oid < FirstNormalObjectId -> native"
+		 * boundary is removed for catalog OIDs.  Catalog DDL (>= SUEX)
+		 * globalizes; mapped-relation writes (>= RowExclusive) globalize too
+		 * (r3 self-disclosure) so a peer's low-mode write conflicts cross-node
+		 * with a relmap rewrite's AEL instead of silently writing the old
+		 * relfile (lost write).  Catalog reads (< RowExclusive) and non-mapped
+		 * low-mode writes stay native -- read consistency comes from the relmap
+		 * two-phase + CF page coherency, not a heavyweight lock (spec §3.2).
+		 * User relations (oid >= FirstNormalObjectId) skip this branch and take
+		 * the stock HC23/HC24/HC25 path below, so the OLTP hot path is
+		 * unchanged (off mode short-circuits on the first bool).
+		 */
+		if (cluster_shared_catalog
+			&& locktag->locktag_field2 < FirstNormalObjectId)
+		{
+			if (lockmode >= ShareUpdateExclusiveLock)
+				return true;	/* catalog DDL: catalog OIDs are never temp */
+			if (lockmode >= RowExclusiveLock
+				&& cluster_relation_is_mapped(locktag->locktag_field2))
+				return true;	/* mapped-rel write: globalize (r3) */
+			return false;		/* catalog read / non-mapped low-mode: native */
+		}
 		/* HC23 OLTP fast-path:  AccessShare / RowShare / RowExclusive go
 			 * PG-native.  ShareUpdateExclusiveLock (=5) is the lowest mode
 			 * routed through cluster. */
 		if (lockmode < ShareUpdateExclusiveLock)
 			return false;
-		/* HC24 system-catalog bootstrap-safe:  pg_class etc oids
-			 * < FirstNormalObjectId never enter cluster gate. */
+		/* HC24 system-catalog bootstrap-safe (off mode):  pg_class etc oids
+			 * < FirstNormalObjectId never enter cluster gate.  On-mode catalog
+			 * is handled by the shared_catalog branch above. */
 		if (locktag->locktag_field2 < FirstNormalObjectId)
 			return false;
 		/* HC25 relpersistence skip:  temp tables go PG-native;
@@ -407,8 +443,14 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 		/* HC26 mirror HC23 — only >= SUEX modes go cluster. */
 		if (lockmode < ShareUpdateExclusiveLock)
 			return false;
-		/* HC27 objoid >= FirstNormal — classoid is always system catalog
-			 * oid (pg_proc / pg_type etc).  Filter on objoid (field3). */
+		/* spec-6.14 D7:  under shared_catalog, catalog objects (objoid <
+			 * FirstNormalObjectId) are shared, so the HC27 boundary is removed
+			 * -- catalog-object DDL at >= SUEX globalizes like a user object
+			 * (user objects already pass HC27 unchanged). */
+		if (cluster_shared_catalog)
+			return true;
+		/* HC27 objoid >= FirstNormal (off mode) — classoid is always system
+			 * catalog oid (pg_proc / pg_type etc).  Filter on objoid (field3). */
 		if (locktag->locktag_field3 < FirstNormalObjectId)
 			return false;
 		return true;

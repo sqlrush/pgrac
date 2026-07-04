@@ -211,6 +211,11 @@ bool cluster_local_fast_path_enabled = true;
  * inline cluster_lock_should_globalize() advisory branch is exercised. */
 bool cluster_advisory_lock_enabled = true;
 
+/* spec-6.14 D7 — cluster.shared_catalog gate GUC (default off).  The inline
+ * cluster_lock_should_globalize() catalog branch reads it; default off keeps
+ * the existing HC23/HC24/HC27 behaviour for all other tests. */
+bool cluster_shared_catalog = false;
+
 /* spec-5.5 D8 — UL counter stubs:  cluster_lock_release() bumps the session-
  * release counter, but this fixture links neither the advisory shmem region nor
  * cluster_advisory.o.  The real counter behaviour is covered by
@@ -818,6 +823,51 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
 }
 
 
+/* spec-6.14 D7 — under cluster.shared_catalog the catalog OID boundary (HC24/
+ * HC27) is removed: catalog DDL and mapped-relation writes globalize, catalog
+ * reads stay native, and user relations are unaffected.  The SearchSysCache1
+ * stub returns NULL, so cluster_relation_is_mapped fails safe to true. */
+UT_TEST(test_shared_catalog_relation_gate)
+{
+	LOCKTAG		cat;
+	LOCKTAG		usr;
+
+	memset(&cat, 0, sizeof(cat));
+	cat.locktag_field1 = 1;
+	cat.locktag_field2 = 1259;	/* pg_class: a catalog OID < FirstNormalObjectId */
+	cat.locktag_type = LOCKTAG_RELATION;
+	cat.locktag_lockmethodid = 1;
+
+	memset(&usr, 0, sizeof(usr));
+	usr.locktag_field1 = 1;
+	usr.locktag_field2 = FirstNormalObjectId + 5;	/* a user relation */
+	usr.locktag_type = LOCKTAG_RELATION;
+	usr.locktag_lockmethodid = 1;
+
+	/* OFF mode: catalog stays native at every mode (HC24). */
+	cluster_shared_catalog = false;
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessShareLock, false), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, RowExclusiveLock, false), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessExclusiveLock, false), false);
+
+	/* ON mode: catalog reads (< RowExclusive) stay native; RowExclusive
+	 * (mapped-rel write) and DDL (>= SUEX) globalize. */
+	cluster_shared_catalog = true;
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessShareLock, false), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, RowShareLock, false), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, RowExclusiveLock, false), true);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, ShareUpdateExclusiveLock, false), true);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessExclusiveLock, false), true);
+
+	/* User relations are unchanged in ON mode: OLTP hot path (< SUEX) native,
+	 * DDL globalizes. */
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, RowExclusiveLock, false), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, AccessExclusiveLock, false), true);
+
+	cluster_shared_catalog = false;		/* restore */
+}
+
+
 /* ============================================================
  * spec-5.5 U6 — try-lock (NOWAIT) S4 reject mapping (D5).
  *
@@ -949,7 +999,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -958,6 +1008,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_top_level_monotonic_forward_no_cleanup_on_success);
 	UT_RUN(test_7step_s4_master_reject_default_deny);
 	UT_RUN(test_7step_transaction_should_globalize_gate);
+	UT_RUN(test_shared_catalog_relation_gate);
 	UT_RUN(test_7step_transaction_locktag_path_routes_through_cluster);
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
 	UT_RUN(test_ul_session_advisory_globalize_gate);
