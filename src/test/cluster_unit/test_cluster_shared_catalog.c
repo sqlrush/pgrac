@@ -143,10 +143,70 @@ UT_TEST(test_is_shared_rel_nontemp_is_shared)
 	UT_ASSERT_EQ(cluster_shared_catalog_is_shared_rel(false), true);
 }
 
+/* ----------
+ * D13 temp-namespace suffix format / parse round trip.
+ * ----------
+ */
+UT_TEST(test_temp_suffix_format_off_is_stock)
+{
+	char		buf[32];
+
+	cluster_temp_namespace_format_suffix(buf, sizeof(buf), false, 0, 12);
+	UT_ASSERT_STR_EQ(buf, "12");
+	cluster_temp_namespace_format_suffix(buf, sizeof(buf), false, 3, 99);
+	UT_ASSERT_STR_EQ(buf, "99");	/* node ignored in off mode */
+}
+
+UT_TEST(test_temp_suffix_format_on_is_node_qualified)
+{
+	char		buf[32];
+
+	cluster_temp_namespace_format_suffix(buf, sizeof(buf), true, 0, 12);
+	UT_ASSERT_STR_EQ(buf, "n0_12");
+	cluster_temp_namespace_format_suffix(buf, sizeof(buf), true, 2, 7);
+	UT_ASSERT_STR_EQ(buf, "n2_7");
+}
+
+UT_TEST(test_temp_suffix_parse_stock)
+{
+	int			node = 999;
+	int			backend;
+
+	backend = cluster_temp_namespace_parse_suffix("12", &node);
+	UT_ASSERT_EQ(backend, 12);
+	UT_ASSERT_EQ(node, -1);		/* stock format: no node */
+}
+
+UT_TEST(test_temp_suffix_parse_node_qualified)
+{
+	int			node = 999;
+	int			backend;
+
+	backend = cluster_temp_namespace_parse_suffix("n2_7", &node);
+	UT_ASSERT_EQ(backend, 7);
+	UT_ASSERT_EQ(node, 2);
+
+	backend = cluster_temp_namespace_parse_suffix("n0_12", &node);
+	UT_ASSERT_EQ(backend, 12);
+	UT_ASSERT_EQ(node, 0);
+}
+
+UT_TEST(test_temp_suffix_round_trip)
+{
+	char		buf[32];
+	int			node = 999;
+	int			backend;
+
+	cluster_temp_namespace_format_suffix(buf, sizeof(buf), true, 5, 42);
+	backend = cluster_temp_namespace_parse_suffix(buf, &node);
+	UT_ASSERT_EQ(backend, 42);
+	UT_ASSERT_EQ(node, 5);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(13);
 	UT_RUN(test_vet_off_always_ok);
 	UT_RUN(test_vet_on_all_present_ok);
 	UT_RUN(test_vet_on_missing_smgr_user_relations_first);
@@ -155,6 +215,11 @@ main(void)
 	UT_RUN(test_vet_missing_dep_name);
 	UT_RUN(test_is_shared_rel_temp_is_local);
 	UT_RUN(test_is_shared_rel_nontemp_is_shared);
+	UT_RUN(test_temp_suffix_format_off_is_stock);
+	UT_RUN(test_temp_suffix_format_on_is_node_qualified);
+	UT_RUN(test_temp_suffix_parse_stock);
+	UT_RUN(test_temp_suffix_parse_node_qualified);
+	UT_RUN(test_temp_suffix_round_trip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

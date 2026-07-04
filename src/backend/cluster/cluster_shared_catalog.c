@@ -29,6 +29,8 @@
  */
 #include "c.h"
 
+#include <stdlib.h>				/* strtol */
+
 #include "cluster/cluster_shared_catalog.h"
 
 /*
@@ -73,4 +75,57 @@ cluster_shared_catalog_vet_missing_dep_name(ClusterSharedCatalogVetResult r)
 			return "cluster.controlfile_shared_authority=on";
 	}
 	return "";
+}
+
+/*
+ * cluster_temp_namespace_format_suffix -- see header.  on-mode:
+ * "n<node>_<backendId>"; off-mode: "<backendId>".
+ */
+void
+cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
+									 bool shared_catalog, int node, int backend_id)
+{
+	if (shared_catalog)
+		snprintf(buf, buflen, "n%d_%d", node, backend_id);
+	else
+		snprintf(buf, buflen, "%d", backend_id);
+}
+
+/*
+ * cluster_temp_namespace_parse_suffix -- see header.  A leading 'n' marks the
+ * node-qualified format "n<node>_<backendId>"; otherwise the stock "<backendId>".
+ */
+int
+cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node)
+{
+	long		backend_id;
+	char	   *endp;
+
+	if (out_node != NULL)
+		*out_node = -1;
+
+	if (suffix == NULL)
+		return -1;
+
+	if (suffix[0] == 'n')
+	{
+		long		node;
+
+		/* node-qualified: n<node>_<backendId> */
+		node = strtol(suffix + 1, &endp, 10);
+		if (endp == suffix + 1 || *endp != '_')
+			return -1;			/* malformed */
+		backend_id = strtol(endp + 1, &endp, 10);
+		if (*(endp) != '\0' && *endp != '_')	/* tolerate nothing after */
+			/* trailing garbage: still accept the parsed id */ ;
+		if (out_node != NULL)
+			*out_node = (int) node;
+		return (int) backend_id;
+	}
+
+	/* stock: <backendId> */
+	backend_id = strtol(suffix, &endp, 10);
+	if (endp == suffix)
+		return -1;
+	return (int) backend_id;
 }

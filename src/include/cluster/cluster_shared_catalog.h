@@ -90,4 +90,29 @@ cluster_shared_catalog_is_shared_rel(bool is_temp)
 	return !is_temp;
 }
 
+/* ---- D13 temp-namespace identity (pure) -------------------------------- */
+
+/*
+ * cluster_temp_namespace_format_suffix -- format the numeric suffix of a temp
+ *	namespace name (the part after the "pg_temp_" / "pg_toast_temp_" prefix).
+ *	Under shared_catalog=on the suffix is node-qualified "n<node>_<backendId>"
+ *	so a temp namespace created on one node can never be mistaken for a
+ *	same-backendId namespace on another node (spec-6.14 D13 / R10).  Off mode
+ *	(and the leading 'n' absence) yields the stock "<backendId>" format, so
+ *	existing clusters and PG regression are byte-identical.
+ */
+extern void cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
+												 bool shared_catalog,
+												 int node, int backend_id);
+
+/*
+ * cluster_temp_namespace_parse_suffix -- parse the numeric suffix (the part
+ *	after "pg_temp_" / "pg_toast_temp_").  Returns the backend id; sets
+ *	*out_node to the node id, or -1 for the stock (un-node-qualified) format.
+ *	The leading 'n' distinguishes the node-qualified format from the stock
+ *	one, so both parse unambiguously.  Returns -1 (invalid backend id) when the
+ *	suffix is malformed.
+ */
+extern int	cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node);
+
 #endif							/* CLUSTER_SHARED_CATALOG_H */

@@ -59,6 +59,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-6.14 D13): node-qualified temp namespace identity. */
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_shared_catalog.h"
+#endif
 
 
 /*
@@ -3270,6 +3275,30 @@ isOtherTempNamespace(Oid namespaceId)
 	return isAnyTempNamespace(namespaceId);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * cluster_temp_namespace_node_id - spec-6.14 D13.  Returns the cluster node id
+ *	encoded in a temp namespace name (pg_temp_n<node>_<backendId> /
+ *	pg_toast_temp_n<node>_<backendId>), or -1 for the stock un-node-qualified
+ *	format or a non-temp namespace.
+ */
+static int
+cluster_temp_namespace_node_id(Oid namespaceId)
+{
+	char	   *nspname = get_namespace_name(namespaceId);
+	int			node = -1;
+
+	if (nspname == NULL)
+		return -1;
+	if (strncmp(nspname, "pg_temp_", 8) == 0)
+		(void) cluster_temp_namespace_parse_suffix(nspname + 8, &node);
+	else if (strncmp(nspname, "pg_toast_temp_", 14) == 0)
+		(void) cluster_temp_namespace_parse_suffix(nspname + 14, &node);
+	pfree(nspname);
+	return node;
+}
+#endif
+
 /*
  * checkTempNamespaceStatus - is the given namespace owned and actively used
  * by a backend?
@@ -3292,6 +3321,26 @@ checkTempNamespaceStatus(Oid namespaceId)
 	/* No such namespace, or its name shows it's not temp? */
 	if (backendId == InvalidBackendId)
 		return TEMP_NAMESPACE_NOT_TEMP;
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-6.14 D13):  under shared_catalog a temp namespace name is
+	 * node-qualified (pg_temp_n<node>_<backendId>).  A namespace owned by a
+	 * DIFFERENT node must never be treated as orphaned by THIS node -- its
+	 * backendId indexes a foreign ProcArray, so the checks below would wrongly
+	 * read it as IDLE and autovacuum would DROP another node's live temp table
+	 * (the r1-P1-1 命门).  From this node's perspective a foreign temp
+	 * namespace is owned elsewhere = busy.
+	 */
+	if (cluster_shared_catalog)
+	{
+		int			node = cluster_temp_namespace_node_id(namespaceId);
+
+		if (node >= 0 && node != cluster_node_id)
+			return TEMP_NAMESPACE_IN_USE;
+	}
+#endif
 
 	/* Is the backend alive? */
 	proc = BackendIdGetProc(backendId);
@@ -3327,9 +3376,21 @@ GetTempNamespaceBackendId(Oid namespaceId)
 	if (!nspname)
 		return InvalidBackendId;	/* no such namespace? */
 	if (strncmp(nspname, "pg_temp_", 8) == 0)
+#ifdef USE_PGRAC_CLUSTER
+		/* spec-6.14 D13: parse both the stock "<backendId>" and the
+		 * node-qualified "n<node>_<backendId>" formats (the leading 'n'
+		 * disambiguates); the node id is recovered separately by
+		 * cluster_temp_namespace_node_id. */
+		result = cluster_temp_namespace_parse_suffix(nspname + 8, NULL);
+#else
 		result = atoi(nspname + 8);
+#endif
 	else if (strncmp(nspname, "pg_toast_temp_", 14) == 0)
+#ifdef USE_PGRAC_CLUSTER
+		result = cluster_temp_namespace_parse_suffix(nspname + 14, NULL);
+#else
 		result = atoi(nspname + 14);
+#endif
 	else
 		result = InvalidBackendId;
 	pfree(nspname);
@@ -4036,7 +4097,21 @@ InitTempTableNamespace(void)
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot create temporary tables during a parallel operation")));
 
+#ifdef USE_PGRAC_CLUSTER
+	{
+		/* spec-6.14 D13: node-qualified under shared_catalog so a temp
+		 * namespace created on one node cannot be confused with the same
+		 * backendId on another node.  Off mode is byte-identical to stock. */
+		char		suffix[32];
+
+		cluster_temp_namespace_format_suffix(suffix, sizeof(suffix),
+											 cluster_shared_catalog,
+											 cluster_node_id, MyBackendId);
+		snprintf(namespaceName, sizeof(namespaceName), "pg_temp_%s", suffix);
+	}
+#else
 	snprintf(namespaceName, sizeof(namespaceName), "pg_temp_%d", MyBackendId);
+#endif
 
 	namespaceId = get_namespace_oid(namespaceName, true);
 	if (!OidIsValid(namespaceId))
@@ -4068,8 +4143,19 @@ InitTempTableNamespace(void)
 	 * it. (We assume there is no need to clean it out if it does exist, since
 	 * dropping a parent table should make its toast table go away.)
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	{
+		char		suffix[32];
+
+		cluster_temp_namespace_format_suffix(suffix, sizeof(suffix),
+											 cluster_shared_catalog,
+											 cluster_node_id, MyBackendId);
+		snprintf(namespaceName, sizeof(namespaceName), "pg_toast_temp_%s", suffix);
+	}
+#else
 	snprintf(namespaceName, sizeof(namespaceName), "pg_toast_temp_%d",
 			 MyBackendId);
+#endif
 
 	toastspaceId = get_namespace_oid(namespaceName, true);
 	if (!OidIsValid(toastspaceId))
