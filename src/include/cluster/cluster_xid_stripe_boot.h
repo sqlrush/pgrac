@@ -74,6 +74,23 @@ typedef enum ClusterXidStripeJoinVerdict {
 	CLUSTER_XID_STRIPE_JOIN_REFUSE		 /* config mismatch; fail-closed 53RB1 */
 } ClusterXidStripeJoinVerdict;
 
+/*
+ * Published knowledge about THIS node's region-4 stripe slot (D5c).
+ * MINE = a valid record naming this node, not retired (rejoin resumes
+ * it — owner identity is the FIRST-claim admitted incarnation and is
+ * never compared against the current boot's incarnation, which is
+ * freshly generated every start); RETIRED = the slot was permanently
+ * consumed by a spec-5.18 removal (v1 never reuses it — fresh joins
+ * of the same node_id refuse with 53RB1); CORRUPT fails closed.
+ */
+typedef enum ClusterXidStripeSlotState {
+	CLUSTER_XID_STRIPE_SLOT_UNKNOWN = 0,
+	CLUSTER_XID_STRIPE_SLOT_ABSENT,
+	CLUSTER_XID_STRIPE_SLOT_MINE,
+	CLUSTER_XID_STRIPE_SLOT_RETIRED,
+	CLUSTER_XID_STRIPE_SLOT_CORRUPT
+} ClusterXidStripeSlotState;
+
 /* shmem sizing / init (wired from cluster_init_shmem). */
 extern Size cluster_xid_stripe_shmem_size(void);
 extern void cluster_xid_stripe_shmem_init(void);
@@ -120,6 +137,24 @@ extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 extern ClusterXidStripeDiskState cluster_xid_stripe_disk_state(void);
 extern bool cluster_xid_stripe_get_activation(uint64 *floor_full, uint64 *epoch,
 											  uint64 *generation);
+extern ClusterXidStripeSlotState cluster_xid_stripe_slot_state(void);
+
+/*
+ * spec-5.18 removal hook (D5c): durably mark target_node's stripe slot
+ * retired BEFORE the removal point of no return.  Blocking-bounded
+ * (mirrors the join-marker submit); returns true when the retired
+ * record is majority-durable OR the cluster was never activated
+ * (nothing to retire).  false = not durable yet — the removal driver
+ * stays in its pre-commit phase and retries next tick (fail-closed:
+ * removal never commits ahead of the retired mark).
+ * owner_incarnation_hint seeds the tombstone when the slot was never
+ * claimed (the removal driver passes the last admitted incarnation).
+ */
+extern bool cluster_xid_stripe_submit_retire(int32 target_node, uint64 owner_incarnation_hint);
+
+/* qvotec self-incarnation accessor (the canonical durable identity
+ * seed this boot presents; consumed by the D5c slot claim). */
+extern uint64 cluster_qvotec_self_incarnation_value(void);
 
 #endif /* USE_PGRAC_CLUSTER */
 

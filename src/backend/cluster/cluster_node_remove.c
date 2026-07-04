@@ -63,6 +63,7 @@
 #include "cluster/cluster_pgstat.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5c retire-before-removal */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_write_fence.h"
@@ -544,6 +545,24 @@ cluster_node_remove_drive(void)
 		/* §2.5: durable REMOVING marker (pre-commit; not a trust source). */
 		(void)nr_write_marker(CLUSTER_REMOVAL_MARKER_REMOVING, node_id, baseline_epoch,
 							  last_incarnation, removal_event_id);
+
+		/*
+		 * spec-6.15 D5c (appendix B.3): durably retire the removed node's
+		 * xid stripe slot BEFORE the removal point of no return below.
+		 * Ordering is the identity-reuse defence: once removal commits, a
+		 * later fresh join of the same node_id (new incarnation = a new
+		 * durable owner) must land on a retired slot and refuse (53RB1),
+		 * never resume the old owner's congruence class.  Not durable yet
+		 * -> stay FENCE_ARMING and retry next tick (fail-closed; same
+		 * shape as a transient fence/quorum failure).  A never-activated
+		 * cluster returns true (nothing to retire).
+		 */
+		if (!cluster_xid_stripe_submit_retire(node_id, last_incarnation)) {
+			ereport(LOG, (errmsg("cluster node removal: stripe slot retire for node %d not durable "
+								 "yet — retrying before the removal commit",
+								 node_id)));
+			return;
+		}
 
 		/*
 		 * The commit point: guarded epoch bump + fence-arm (majority-durable, at
