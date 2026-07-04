@@ -353,7 +353,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 262144; /* spec-6.4: 4 regions × 128 × 512 */
+int cluster_voting_disk_size_bytes = 328192; /* spec-6.15: (5 × 128 + 1) × 512 */
 
 /* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
  * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
@@ -2852,29 +2852,36 @@ cluster_init_guc(void)
 
 	/*
 	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled;
-	 * spec-5.15 tripled; spec-6.4 quadrupled).  Voting disk file size —
-	 * pre-allocated on first boot.  Four 512-byte regions per instance:
-	 * region 1 = the voting slot
-	 * at offset (node_id × 512); region 2 = the clean-leave marker at offset
-	 * ((CLUSTER_MAX_NODES + node_id) × 512); region 3 = the join-commit marker
-	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512); region 4 = the ADG
-	 * apply-master lease marker at offset ((3 × CLUSTER_MAX_NODES + node_id)
-	 * × 512).  Default 262144 bytes = 4 × 128 × 512.  Range [4096, 1048576].
+	 * spec-5.15 tripled; spec-6.4 quadrupled; spec-6.15 adds the xid
+	 * stripe regions).  Voting disk file size — pre-allocated on first
+	 * boot.  Per-instance 512-byte regions: region 1 = the voting slot at
+	 * offset (node_id × 512); region 2 = the clean-leave marker at
+	 * ((CLUSTER_MAX_NODES + node_id) × 512); region 3 = the join-commit
+	 * marker at ((2 × CLUSTER_MAX_NODES + node_id) × 512); region 4 = the
+	 * ADG apply-master lease marker at ((3 × CLUSTER_MAX_NODES + node_id)
+	 * × 512); region 5 = the xid stripe slot at ((4 × CLUSTER_MAX_NODES +
+	 * node_id) × 512); region 6 = ONE cluster-wide stripe activation
+	 * record at (5 × CLUSTER_MAX_NODES × 512).  Default 328192 bytes =
+	 * (5 × 128 + 1) × 512.  Range [4096, 1048576].
 	 */
-	DefineCustomIntVariable(
-		"cluster.voting_disk_size_bytes", gettext_noop("Voting disk file size in bytes."),
-		gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
-					 "doubled for the clean-leave marker region; spec-5.15 "
-					 "tripled for the join-commit marker region; spec-6.4 "
-					 "quadrupled for the ADG apply-master lease region).  Each "
-					 "instance owns a 512-byte voting slot at offset "
-					 "(node_id × 512), a 512-byte leave-marker slot at "
-					 "((128 + node_id) × 512), and a 512-byte join-marker slot "
-					 "at ((256 + node_id) × 512), and a 512-byte ADG lease slot "
-					 "at ((384 + node_id) × 512).  Default 262144 = 4 × 128 "
-					 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
-		&cluster_voting_disk_size_bytes, 262144, 4096, 1048576, PGC_POSTMASTER, GUC_UNIT_BYTE, NULL,
-		NULL, NULL);
+	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
+							gettext_noop("Voting disk file size in bytes."),
+							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
+										 "doubled for the clean-leave marker region; spec-5.15 "
+										 "tripled for the join-commit marker region; spec-6.4 "
+										 "quadrupled for the ADG apply-master lease region; "
+										 "spec-6.15 adds the xid stripe slot region and the "
+										 "stripe activation record).  Each instance owns a "
+										 "512-byte voting slot at offset (node_id × 512), a "
+										 "leave-marker slot at ((128 + node_id) × 512), a "
+										 "join-marker slot at ((256 + node_id) × 512), an ADG "
+										 "lease slot at ((384 + node_id) × 512), and an xid "
+										 "stripe slot at ((512 + node_id) × 512); one "
+										 "cluster-wide stripe activation record lives at "
+										 "(640 × 512).  Default 328192 = (5 × 128 + 1) × 512.  "
+										 "Range [4096, 1048576] bytes; multiple of 512."),
+							&cluster_voting_disk_size_bytes, 328192, 4096, 1048576, PGC_POSTMASTER,
+							GUC_UNIT_BYTE, NULL, NULL, NULL);
 
 	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */
 	DefineCustomBoolVariable("cluster.online_join",

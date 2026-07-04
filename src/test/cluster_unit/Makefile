@@ -1758,9 +1758,12 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 # stripe pure derivation layer (widen signed window / origin_slot floor
 # semantics / next_striped candidate arithmetic incl. epoch carry +
 # special-value skip / herding lag predicate / runtime latch wrappers).
+# spec-6.15 D5a adds the durable stripe record integrity truth tables
+# ("PGXS"/"PGXA" CRC + sanity), which pull in libpgport for CRC32C.
 # Links cluster_xid_stripe.o standalone; stubs ReadNextFullTransactionId.
 CLUSTER_XID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \
 		$(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_XID_STRIPE_O) -o $@
+		$(CLUSTER_XID_STRIPE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@

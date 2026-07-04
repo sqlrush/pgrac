@@ -115,7 +115,32 @@
 #define CLUSTER_VOTING_APPLY_LEASE_GLOBAL_SLOT 0
 #define CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id)                                            \
 	((off_t)(3 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
-#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)4 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
+
+/*
+ * spec-6.15 D5/appendix B.1 — xid stripe regions.  Region 5 = one 512-byte
+ * per-node stripe slot (payload ClusterXidStripeSlotRecord, magic "PGXS"),
+ * laid out after the spec-6.4 ADG lease region; sole writer is the owning node
+ * (LMON hwm refresh), except the spec-5.18 removal coordinator cross-writes
+ * the retired flag (region-3 coordinator-write precedent).  Region 6 = ONE
+ * cluster-wide activation record (ClusterXidStripeActivationRecord, magic
+ * "PGXA") at a fixed offset right after region 5; written by the activation
+ * coordinator inside the spec-5.15 join serialization window.  The regions
+ * are materialised lazily exactly like regions 2/3 (an unwritten slot reads
+ * back EOF or zeros, which the stripe policy layer rejects as record-absent
+ * -- the correct fail-closed empty state).  The voting disk file therefore
+ * grows to (5 × CLUSTER_MAX_NODES + 1) × 512 bytes (cluster.voting_disk_
+ * size_bytes default bumped to match).  Only stripe slots 0..15 are ever
+ * used (CLUSTER_XID_STRIDE); the region is sized by CLUSTER_MAX_NODES to
+ * keep the offset arithmetic uniform with regions 1-3.  Payload-agnostic:
+ * this layer does aligned 512-byte raw slot I/O, the stripe layer owns the
+ * record integrity (cluster_xid_stripe.h).
+ */
+#define CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node_id)                                                 \
+	((off_t)(4 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET                                                    \
+	((off_t)(5 * CLUSTER_MAX_NODES) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
+	((off_t)(5 * CLUSTER_MAX_NODES + 1) * CLUSTER_VOTING_SLOT_BYTES)
 
 
 /*
