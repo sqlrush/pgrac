@@ -33,6 +33,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_bootstrap.h"
+#include "cluster/cluster_catalog_migrate.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_oid_lease.h"
@@ -71,4 +72,14 @@ cluster_catalog_startup_prepare(void)
 	if (cluster_oid_authority_seed_if_absent(cf.checkPointCopy.nextOid))
 		elog(LOG, "cluster shared_catalog: seeded OID authority high-water at %u",
 			 cf.checkPointCopy.nextOid);
+
+	/*
+	 * Establish the shared catalog relation tree: the seed node copies its
+	 * catalog relation files into the shared tree; a join node adopts the
+	 * existing tree after an identity gate.  Runs here, postmaster-once and
+	 * before the startup process, so it precedes any catalog access through
+	 * the (D3-flipped) shared smgr route.  system_identifier is the shared
+	 * pg_control's cluster-wide value both seed and join agree on.
+	 */
+	cluster_catalog_migrate_tree(DataDir, cf.system_identifier);
 }
