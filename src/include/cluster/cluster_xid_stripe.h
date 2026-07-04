@@ -121,4 +121,76 @@ extern int cluster_xid_allocation_slot(void);
 extern void cluster_xid_stripe_latch_runtime(bool active, int my_slot,
 											 FullTransactionId floor_full);
 
+/*
+ * ----------------------------------------------------------------
+ * Durable stripe records (spec-6.15 D5, appendix B.1)
+ *
+ * Two CRC-checked voting-disk record types, following the spec-5.15
+ * ClusterJoinCommitMarker envelope discipline (magic / version /
+ * monotonic generation / CRC32C; records are memset-0 before fill so
+ * padding is stable under the CRC):
+ *
+ *  - ClusterXidStripeSlotRecord ("PGXS"), one per stripe slot in
+ *    voting-disk region 4.  Sole writer is the OWNING node (LMON tick
+ *    refreshes next_xid_hwm_full -- the herding carrier), with one
+ *    exception: the spec-5.18 removal coordinator cross-writes the
+ *    retired flag (region-3 coordinator-writes-joiner-slot precedent).
+ *    The owner durable identity is {node_id, owner_incarnation}: the
+ *    stripe slot index equals the declared node_id in v1, and
+ *    owner_incarnation is the spec-5.15 admitted incarnation at FIRST
+ *    claim, written once and never rewritten (a restart presents a
+ *    fresh, higher incarnation, so stability across restarts is by
+ *    construction of the stored value, not by re-derivation).
+ *
+ *  - ClusterXidStripeActivationRecord ("PGXA"), a single cluster-wide
+ *    record in voting-disk region 5.  Written once by the activation
+ *    coordinator; stride_mode_epoch is monotonic and never rewinds.
+ *
+ * Readers treat ANY integrity failure (magic / version / CRC / sanity)
+ * as record-absent and fail closed (refuse activation / join / latch);
+ * they never guess.  The validators below are pure and unit-tested.
+ * ----------------------------------------------------------------
+ */
+
+#define CLUSTER_PGXS_MAGIC 0x50475853 /* "PGXS" */
+#define CLUSTER_PGXS_VERSION 1
+
+typedef struct ClusterXidStripeSlotRecord {
+	uint32 magic;	/* CLUSTER_PGXS_MAGIC */
+	uint32 version; /* CLUSTER_PGXS_VERSION */
+	int32 node_id;	/* owning slot == declared node_id (0..STRIDE-1) */
+	uint8 retired;	/* 0|1 -- set once by the 5.18 removal coordinator */
+	uint8 _pad[3];
+	uint64 owner_incarnation; /* first-claim admitted incarnation (immutable) */
+	uint64 floor_full;		  /* per-slot activation floor (full-xid U64) */
+	uint64 next_xid_hwm_full; /* herding high watermark (full-xid U64) */
+	uint64 stride_mode_epoch; /* activation epoch the slot was claimed under */
+	uint64 generation;		  /* monotonic torn-write guard (read newest) */
+	uint32 crc32c;			  /* CRC32C over [magic .. generation] */
+} ClusterXidStripeSlotRecord;
+
+#define CLUSTER_PGXA_MAGIC 0x50475841 /* "PGXA" */
+#define CLUSTER_PGXA_VERSION 1
+
+typedef struct ClusterXidStripeActivationRecord {
+	uint32 magic;				 /* CLUSTER_PGXA_MAGIC */
+	uint32 version;				 /* CLUSTER_PGXA_VERSION */
+	uint64 activated_floor_full; /* cluster activation floor (full-xid U64) */
+	uint64 stride_mode_epoch;	 /* >= 1; monotonic, never rewinds */
+	uint64 generation;			 /* monotonic torn-write guard (read newest) */
+	uint32 crc32c;				 /* CRC32C over [magic .. generation] */
+} ClusterXidStripeActivationRecord;
+
+/*
+ * Pure record integrity (rule 15) -- compute / validate.  Validation
+ * failure means "treat as absent, fail closed"; expected_node is the
+ * slot the record was read from (a record that names a different slot
+ * is a misplaced write and is rejected).
+ */
+extern void cluster_xid_stripe_slot_record_compute_crc(ClusterXidStripeSlotRecord *rec);
+extern bool cluster_xid_stripe_slot_record_valid(const ClusterXidStripeSlotRecord *rec,
+												 int32 expected_node);
+extern void cluster_xid_stripe_activation_record_compute_crc(ClusterXidStripeActivationRecord *rec);
+extern bool cluster_xid_stripe_activation_record_valid(const ClusterXidStripeActivationRecord *rec);
+
 #endif /* CLUSTER_XID_STRIPE_H */

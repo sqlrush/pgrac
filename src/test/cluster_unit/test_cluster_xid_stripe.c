@@ -18,6 +18,10 @@
  *	  - runtime wrappers (cluster_xid_origin_slot / cluster_xid_is_mine):
  *	    fail-closed before latch, derivation after latch, remote-ahead
  *	    window, wrap-crossing floor comparison.
+ *	  - durable stripe records (D5a): "PGXS"/"PGXA" integrity truth
+ *	    tables -- roundtrip accepts, every sanity / identity / CRC
+ *	    corruption rejects (treat-as-absent, fail-closed), all-zeros
+ *	    lazily-materialised slot rejects.
  *
  *	  The stripe layer is pure (no shmem / no locks); this binary links
  *	  cluster_xid_stripe.o standalone with ReadNextFullTransactionId
@@ -47,7 +51,7 @@
 #include "cluster/cluster_xid_stripe.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
- * stdlib printf and we don't link libpgport in this test binary. */
+ * stdlib printf (libpgport is linked for CRC32C only, D5a). */
 #undef printf
 #undef fprintf
 #undef snprintf
@@ -425,10 +429,209 @@ UT_TEST(test_runtime_latch_defensive)
 }
 
 
+/* ----------
+ * Durable stripe records (D5a): "PGXS" / "PGXA" integrity truth tables.
+ * Every corruption / sanity failure must reject (treat-as-absent,
+ * fail-closed); the roundtrip with a recomputed CRC must accept.
+ * ----------
+ */
+
+/* Build a valid, CRC-stamped slot record for stripe slot `node`. */
+static ClusterXidStripeSlotRecord
+make_slot_record(int32 node)
+{
+	ClusterXidStripeSlotRecord r;
+
+	memset(&r, 0, sizeof(r));
+	r.magic = CLUSTER_PGXS_MAGIC;
+	r.version = CLUSTER_PGXS_VERSION;
+	r.node_id = node;
+	r.retired = 0;
+	r.owner_incarnation = UINT64CONST(778899001122);
+	r.floor_full = (UINT64CONST(1) << 32) | 0x10; /* epoch-1 floor */
+	r.next_xid_hwm_full = (UINT64CONST(1) << 32) | 0x200;
+	r.stride_mode_epoch = 1;
+	r.generation = 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	return r;
+}
+
+/* Build a valid, CRC-stamped activation record. */
+static ClusterXidStripeActivationRecord
+make_activation_record(void)
+{
+	ClusterXidStripeActivationRecord r;
+
+	memset(&r, 0, sizeof(r));
+	r.magic = CLUSTER_PGXA_MAGIC;
+	r.version = CLUSTER_PGXA_VERSION;
+	r.activated_floor_full = (UINT64CONST(1) << 32) | 0x10;
+	r.stride_mode_epoch = 1;
+	r.generation = 1;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	return r;
+}
+
+UT_TEST(test_slot_record_roundtrip_valid)
+{
+	ClusterXidStripeSlotRecord r = make_slot_record(4);
+
+	UT_ASSERT(cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	/* retired=1 is a legal domain value (5.18 removal cross-write) */
+	r.retired = 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	/* hwm == floor is legal (freshly claimed slot) */
+	r = make_slot_record(0);
+	r.next_xid_hwm_full = r.floor_full;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(cluster_xid_stripe_slot_record_valid(&r, 0));
+
+	/* NULL rejects */
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(NULL, 0));
+}
+
+UT_TEST(test_slot_record_sanity_rejections)
+{
+	ClusterXidStripeSlotRecord r;
+
+	/* each corruption is applied to a fresh valid record and CRC is
+	 * RECOMPUTED, so the sanity gate itself (not the CRC) must reject */
+	r = make_slot_record(4);
+	r.magic = CLUSTER_PGXS_MAGIC + 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.version = CLUSTER_PGXS_VERSION + 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.node_id = -1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, -1));
+
+	r = make_slot_record(4);
+	r.node_id = CLUSTER_XID_STRIDE;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, CLUSTER_XID_STRIDE));
+
+	/* misplaced write: record names slot 4, read from slot 5 */
+	r = make_slot_record(4);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 5));
+
+	r = make_slot_record(4);
+	r.retired = 2;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.owner_incarnation = 0;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.floor_full = 0;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.next_xid_hwm_full = r.floor_full - 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.stride_mode_epoch = 0;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	r = make_slot_record(4);
+	r.generation = 0;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+}
+
+UT_TEST(test_slot_record_crc_rejections)
+{
+	ClusterXidStripeSlotRecord r;
+
+	/* payload bit flipped after the CRC stamp -> CRC mismatch */
+	r = make_slot_record(4);
+	r.next_xid_hwm_full += 16;
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	/* CRC field itself corrupted */
+	r = make_slot_record(4);
+	r.crc32c ^= 1;
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+
+	/* all-zeros slot (lazily materialised region reads back zeros) */
+	memset(&r, 0, sizeof(r));
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 0));
+}
+
+UT_TEST(test_activation_record_roundtrip_valid)
+{
+	ClusterXidStripeActivationRecord r = make_activation_record();
+
+	UT_ASSERT(cluster_xid_stripe_activation_record_valid(&r));
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(NULL));
+}
+
+UT_TEST(test_activation_record_sanity_rejections)
+{
+	ClusterXidStripeActivationRecord r;
+
+	r = make_activation_record();
+	r.magic = CLUSTER_PGXA_MAGIC + 1;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	r = make_activation_record();
+	r.version = CLUSTER_PGXA_VERSION + 1;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	r = make_activation_record();
+	r.activated_floor_full = 0;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	r = make_activation_record();
+	r.stride_mode_epoch = 0;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	r = make_activation_record();
+	r.generation = 0;
+	cluster_xid_stripe_activation_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+}
+
+UT_TEST(test_activation_record_crc_rejections)
+{
+	ClusterXidStripeActivationRecord r;
+
+	r = make_activation_record();
+	r.activated_floor_full += 16;
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	r = make_activation_record();
+	r.crc32c ^= 1;
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+
+	memset(&r, 0, sizeof(r));
+	UT_ASSERT(!cluster_xid_stripe_activation_record_valid(&r));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(26);
 
 	UT_RUN(test_widen_behind_same_epoch);
 	UT_RUN(test_widen_ahead_same_epoch);
@@ -454,6 +657,13 @@ main(void)
 	UT_RUN(test_runtime_latched_wrap_floor);
 	UT_RUN(test_allocation_slot_gate);
 	UT_RUN(test_runtime_latch_defensive);
+
+	UT_RUN(test_slot_record_roundtrip_valid);
+	UT_RUN(test_slot_record_sanity_rejections);
+	UT_RUN(test_slot_record_crc_rejections);
+	UT_RUN(test_activation_record_roundtrip_valid);
+	UT_RUN(test_activation_record_sanity_rejections);
+	UT_RUN(test_activation_record_crc_rejections);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

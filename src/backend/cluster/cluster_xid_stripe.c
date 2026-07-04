@@ -35,6 +35,17 @@
 #include "access/transam.h"
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / cluster_xid_striping */
 #include "cluster/cluster_xid_stripe.h"
+#include "port/pg_crc32c.h" /* durable stripe record integrity (D5) */
+
+/*
+ * Region-4/5 payloads must fit one voting-disk slot (CLUSTER_VOTING_
+ * SLOT_BYTES == 512; the literal keeps this pure layer free of the
+ * voting-disk header -- the I/O wiring cross-checks the real macro).
+ */
+StaticAssertDecl(sizeof(ClusterXidStripeSlotRecord) <= 512,
+				 "stripe slot record must fit a 512-byte voting slot");
+StaticAssertDecl(sizeof(ClusterXidStripeActivationRecord) <= 512,
+				 "stripe activation record must fit a 512-byte voting slot");
 
 /*
  * Process-local latched stripe runtime.  Immutable after the single
@@ -216,4 +227,101 @@ cluster_xid_stripe_latch_runtime(bool active, int my_slot, FullTransactionId flo
 	stripe_runtime.active = active;
 	stripe_runtime.my_slot = active ? my_slot : -1;
 	stripe_runtime.floor_full = active ? floor_full : InvalidFullTransactionId;
+}
+
+/* ============================================================
+ * Durable stripe records (spec-6.15 D5, appendix B.1) -- pure
+ * integrity layer (rule 15), mirroring the spec-5.15 join-commit
+ * marker discipline.  Any validation failure means "treat the
+ * record as absent and fail closed"; readers never guess.
+ * ============================================================
+ */
+
+/* Set rec->crc32c = CRC32C over [magic .. generation]. */
+void
+cluster_xid_stripe_slot_record_compute_crc(ClusterXidStripeSlotRecord *rec)
+{
+	pg_crc32c crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, rec, offsetof(ClusterXidStripeSlotRecord, crc32c));
+	FIN_CRC32C(crc);
+	rec->crc32c = (uint32)crc;
+}
+
+/*
+ * Structural + sanity validity of a per-slot stripe record read from
+ * region-4 slot expected_node.  FAIL-CLOSED: magic / version / slot
+ * identity / flag domain / zero owner / invalid floor / hwm below
+ * floor / zero epoch / zero generation / CRC mismatch all reject.
+ */
+bool
+cluster_xid_stripe_slot_record_valid(const ClusterXidStripeSlotRecord *rec, int32 expected_node)
+{
+	pg_crc32c crc;
+
+	if (rec == NULL)
+		return false;
+	if (rec->magic != CLUSTER_PGXS_MAGIC || rec->version != CLUSTER_PGXS_VERSION)
+		return false;
+	if (rec->node_id < 0 || rec->node_id >= CLUSTER_XID_STRIDE || rec->node_id != expected_node)
+		return false;
+	if (rec->retired > 1)
+		return false;
+	if (rec->owner_incarnation == 0)
+		return false;
+	if (rec->floor_full == 0)
+		return false;
+	if (rec->next_xid_hwm_full < rec->floor_full)
+		return false;
+	if (rec->stride_mode_epoch == 0)
+		return false;
+	if (rec->generation == 0)
+		return false;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, rec, offsetof(ClusterXidStripeSlotRecord, crc32c));
+	FIN_CRC32C(crc);
+	return (uint32)crc == rec->crc32c;
+}
+
+/* Set rec->crc32c = CRC32C over [magic .. generation]. */
+void
+cluster_xid_stripe_activation_record_compute_crc(ClusterXidStripeActivationRecord *rec)
+{
+	pg_crc32c crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, rec, offsetof(ClusterXidStripeActivationRecord, crc32c));
+	FIN_CRC32C(crc);
+	rec->crc32c = (uint32)crc;
+}
+
+/*
+ * Structural + sanity validity of the cluster-wide activation record
+ * (region 5).  FAIL-CLOSED on magic / version / invalid floor / zero
+ * epoch / zero generation / CRC mismatch.  Epoch-rewind rejection
+ * against a previously accepted record is the READER's cross-record
+ * check (activation path), not a single-record property.
+ */
+bool
+cluster_xid_stripe_activation_record_valid(const ClusterXidStripeActivationRecord *rec)
+{
+	pg_crc32c crc;
+
+	if (rec == NULL)
+		return false;
+	if (rec->magic != CLUSTER_PGXA_MAGIC || rec->version != CLUSTER_PGXA_VERSION)
+		return false;
+	if (rec->activated_floor_full == 0)
+		return false;
+	if (rec->stride_mode_epoch == 0)
+		return false;
+	if (rec->generation == 0)
+		return false;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, rec, offsetof(ClusterXidStripeActivationRecord, crc32c));
+	FIN_CRC32C(crc);
+	return (uint32)crc == rec->crc32c;
 }
