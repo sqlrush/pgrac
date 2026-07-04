@@ -149,12 +149,12 @@ UT_TEST(test_inactive_gate)
 UT_TEST(test_install_consume_roundtrip)
 {
 	RelFileLocator r = rloc_of(90010);
-	BlockNumber b;
 	uint32 i;
 
 	cluster_hw_lease_install(r, MAIN_FORKNUM, 200, 5);
 	for (i = 0; i < 5; i++) {
-		b = cluster_hw_lease_next_block(r, MAIN_FORKNUM);
+		BlockNumber b = cluster_hw_lease_next_block(r, MAIN_FORKNUM);
+
 		UT_ASSERT_EQ((int64)b, (int64)(200 + i));
 	}
 	UT_ASSERT(cluster_hw_lease_next_block(r, MAIN_FORKNUM) == InvalidBlockNumber);
@@ -224,13 +224,10 @@ UT_TEST(test_counters_add_up)
 }
 
 int
-main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
+main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	bool found;
-
 	/* stand-in for cluster_hw_lease_shmem_init over malloc-backed memory */
 	cluster_hw_lease_shmem_init();
-	(void)found;
 
 	UT_PLAN(6);
 

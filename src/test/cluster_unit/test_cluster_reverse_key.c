@@ -241,7 +241,7 @@ UT_TEST(test_order_not_preserved)
 }
 
 int
-main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
+main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
 	UT_PLAN(5);
 

@@ -263,7 +263,7 @@ UT_TEST(test_handoff_interleaving_sweep_legal)
 UT_DEFINE_GLOBALS();
 
 int
-main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
+main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
 	UT_PLAN(10);
 
