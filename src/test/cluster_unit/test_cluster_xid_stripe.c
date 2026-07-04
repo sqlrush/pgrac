@@ -76,6 +76,12 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* GUC / conf face consumed by cluster_xid_allocation_slot (cluster_guc.o
+ * is not linked here; the gate is a pure function of these three). */
+bool cluster_enabled = false;
+int cluster_node_id = -1;
+bool cluster_xid_striping = false;
+
 /* Settable stand-in for varsup.c ReadNextFullTransactionId (the runtime
  * wrappers read the local nextXid through it). */
 static FullTransactionId stub_next_full = { 0 };
@@ -367,6 +373,42 @@ UT_TEST(test_runtime_latched_wrap_floor)
 	stub_next_full = fxid(0, 0);
 }
 
+UT_TEST(test_allocation_slot_gate)
+{
+	/* off in every dimension by default */
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), -1);
+
+	/* fully enabled with a stripeable identity: slot == node_id */
+	cluster_enabled = true;
+	cluster_xid_striping = true;
+	cluster_node_id = 5;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), 5);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), 0);
+	cluster_node_id = CLUSTER_XID_STRIDE - 1;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), 15);
+
+	/* identity outside the stripe width: vanilla (boot validation in
+	 * cluster_init_shmem makes this unreachable on an enabled node) */
+	cluster_node_id = CLUSTER_XID_STRIDE;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), -1);
+	cluster_node_id = -1;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), -1);
+
+	/* each gate dimension individually off */
+	cluster_node_id = 5;
+	cluster_xid_striping = false;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), -1);
+	cluster_xid_striping = true;
+	cluster_enabled = false;
+	UT_ASSERT_EQ(cluster_xid_allocation_slot(), -1);
+
+	/* reset */
+	cluster_enabled = false;
+	cluster_xid_striping = false;
+	cluster_node_id = -1;
+}
+
 UT_TEST(test_runtime_latch_defensive)
 {
 	/* active=true with an out-of-range slot is treated as inactive
@@ -386,7 +428,7 @@ UT_TEST(test_runtime_latch_defensive)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 
 	UT_RUN(test_widen_behind_same_epoch);
 	UT_RUN(test_widen_ahead_same_epoch);
@@ -410,6 +452,7 @@ main(void)
 	UT_RUN(test_runtime_inactive_fail_closed);
 	UT_RUN(test_runtime_latched_derivation);
 	UT_RUN(test_runtime_latched_wrap_floor);
+	UT_RUN(test_allocation_slot_gate);
 	UT_RUN(test_runtime_latch_defensive);
 
 	UT_DONE();

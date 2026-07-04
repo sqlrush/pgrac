@@ -191,6 +191,10 @@ extern bool cluster_block_self_contained;
  * (undo-block CF fetch + live authority gate; default off = 53R97). */
 extern bool cluster_crossnode_runtime_visibility;
 
+/* spec-6.15 D1: xid space segmentation -- striped allocation (default
+ * off = vanilla dense per-node xid allocation). */
+extern bool cluster_xid_striping;
+
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks
  * the unconsumed tail of oversized HW grants as a per-node lease

@@ -113,6 +113,7 @@
 #include "cluster/cluster_cr_tuple.h" /* cluster_cr_tuple_stat_shmem_register (spec-5.54 D5) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_shmem_register (spec-5.55 D3) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_shmem_register (spec-5.57 D3) */
+#include "cluster/cluster_xid_stripe.h" /* CLUSTER_XID_STRIDE boot validation (spec-6.15 D1) */
 #include "cluster/cluster_tt_durable.h" /* cluster_tt_durable_shmem_register (spec-3.11 D7) */
 #include "cluster/cluster_sf_dep.h"		/* cluster_sf_dep_shmem_register (spec-6.2 D6) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
@@ -1012,6 +1013,28 @@ cluster_init_shmem(void)
 	 */
 	if (cluster_enabled && cluster_node_id >= 0 && cluster_conf_node_count() > 0)
 		cluster_grd_master_map_init();
+
+	/*
+	 * spec-6.15 D1: fail-closed validation of the xid striping identity.
+	 * Striping requires this node's declared identity to fit the stripe
+	 * width; booting striping-on WITHOUT a stripeable identity would
+	 * silently issue unstriped xids and break the global value-space
+	 * uniqueness invariant (spec §3.1), so refuse to start instead.
+	 * Gated on cluster_enabled per the L15 caller-primary pattern (the
+	 * vanilla-PG path promise: cluster.enabled=off ignores cluster.*).
+	 * Runs after cluster_conf_load() so cluster.node_id is final.
+	 */
+	if (cluster_enabled && cluster_xid_striping
+		&& (cluster_node_id < 0 || cluster_node_id >= CLUSTER_XID_STRIDE))
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster.xid_striping requires cluster.node_id between 0 and %d",
+							   CLUSTER_XID_STRIDE - 1),
+						errdetail("This node's cluster.node_id is %d, which cannot be mapped "
+								  "to an xid stripe slot.",
+								  cluster_node_id),
+						errhint("Set cluster.node_id to a value between 0 and %d, or disable "
+								"cluster.xid_striping.",
+								CLUSTER_XID_STRIDE - 1)));
 
 	/*
 	 * Stage 0.18: bind the cluster_ic vtable for the configured tier.
