@@ -35,14 +35,20 @@
 #define CLUSTER_RUNTIME_VISIBILITY_H
 
 #include "access/xlogdefs.h"
+#include "cluster/cluster_itl_slot.h" /* UBA */
 
 /*
  * Live authority triple, co-sampled by the origin LMS into the undo-block
  * reply (D-i1) so it is atomic with the undo/TT content it authorizes -- no
  * asynchronous-sampling tear window (spec-6.12 §2.11 "live authority source").
+ *
+ * origin_epoch is uint64, not the spec sketch's uint32: cluster_epoch is a
+ * uint64 everywhere (cluster_epoch_get_current, the GCS wire epoch fields),
+ * and the full-width equality gate is strictly stronger (no truncation
+ * aliasing) at zero cost.
  */
 typedef struct ClusterLiveAuthority {
-	uint32 origin_epoch;	 /* origin's view of the membership epoch */
+	uint64 origin_epoch;	 /* origin's view of the membership epoch */
 	XLogRecPtr live_hwm_lsn; /* origin durable AND TT-applied high-water */
 	uint64 tt_generation;	 /* origin TT-slot generation (anti-alias) */
 } ClusterLiveAuthority;
@@ -59,13 +65,32 @@ typedef struct ClusterLiveAuthority {
  * wrap-qualified resolution (D-i2 condition (a)/(c)).
  */
 extern bool cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn,
-													 ClusterLiveAuthority auth, uint32 local_epoch);
+													 ClusterLiveAuthority auth, uint64 local_epoch);
 
 /*
  * Runtime wrapper: supplies the local membership epoch to the pure gate.
- * (Defined alongside the resolve wiring in cluster_runtime_visibility.c,
- * landed in CP2/CP3; the pure policy above is CP1.)
+ * (cluster_runtime_visibility.c; the pure policy above is CP1.)
  */
 extern bool cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth);
+
+/*
+ * D-i1 fetch (spec-6.12i CP2): fetch the TT-bearing undo header block named
+ * by `uba` from `origin_node`, together with the co-sampled live authority
+ * triple.  The visibility slice serves ONLY block 0 (the segment header
+ * holding the durable TT slots): TT stamps are pre-commit targeted pwrites,
+ * so block 0 has no deferred-WAL staleness window; undo DATA blocks can lag
+ * their pool image under the spec-3.25 D1b keep-clean deferral and are
+ * refused fail-closed (feature #119 full undo-block CF is the downstream
+ * forward of this slice).
+ *
+ * true  -> out_page (BLCKSZ) holds the origin-fresh block and *auth_out the
+ *          authority sampled in the same reply (or a same-epoch cached pair
+ *          from the L2 CR pool + per-backend authority memo, Q-i5).
+ * false -> fail-closed miss: GUC off, bad UBA, non-header block, wire
+ *          timeout / DENIED / checksum / trailer missing.  The caller keeps
+ *          the unchanged 53R97 refusal (Rule 8.A).
+ */
+extern bool cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page,
+													ClusterLiveAuthority *auth_out);
 
 #endif /* CLUSTER_RUNTIME_VISIBILITY_H */

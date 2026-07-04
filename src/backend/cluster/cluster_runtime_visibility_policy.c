@@ -41,7 +41,7 @@
  */
 bool
 cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth,
-										 uint32 local_epoch)
+										 uint64 local_epoch)
 {
 	/*
 	 * (1) Same reconfig generation.  Authority sampled under a different

@@ -1,0 +1,202 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_runtime_visibility.c
+ *	  pgrac spec-6.12 wave 6.12i (缺口 A) — D-i1 undo-block CF fetch
+ *	  orchestration + the runtime live-authority gate wrapper.
+ *
+ *	  Active runtime has no materialized marker to admit the by-xid
+ *	  durable-TT resolution of a recycled remote ITL slot, so the origin's
+ *	  LMS co-samples a live authority triple {origin_epoch, live_hwm_lsn,
+ *	  tt_generation} into the very undo-block reply that carries its TT
+ *	  (spec-6.12 §2.11 "live authority source").  This file is the
+ *	  requester-side consumer: it rides the spec-6.12b CR-server wire
+ *	  (cluster_gcs_block_undo_tt_fetch_and_wait), caches the fetched
+ *	  block + authority PAIR (L2 CR pool bytes + a per-backend authority
+ *	  memo, Q-i5), and exposes the runtime covers() gate.
+ *
+ *	  The bytes and the authority are only ever served TOGETHER, exactly
+ *	  as co-sampled: a cache hit returns the authority sampled with the
+ *	  cached bytes, never a newer one — a scan over the bytes may only
+ *	  claim the coverage window of ITS OWN sample, or a 0-match inside a
+ *	  later window would be mistaken for proof (D-i2 condition (c)).
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_runtime_visibility.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file.  Compiled only in --enable-cluster
+ *	  builds.  Every miss path returns false so the caller keeps the
+ *	  pre-existing 53R97 fail-closed boundary (规则 8.A: this wave only
+ *	  widens "resolve when provable", never "resolve when unprovable").
+ *	  Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave i)
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#ifdef USE_PGRAC_CLUSTER
+
+#include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_cache.h"
+#include "cluster/cluster_cr_pool.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_elog.h" /* cluster_node_id */
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_uba.h"
+
+/*
+ * cluster_vis_live_authority_covers
+ *
+ * Runtime D-i2 window gate: the pure policy under the CURRENT membership
+ * epoch.  An epoch bump (origin fail-stop / any reconfig, D-i3) makes every
+ * previously sampled authority fail this gate immediately — the in-flight
+ * recycled resolution degrades to the unchanged 53R97 fail-closed.
+ */
+bool
+cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth)
+{
+	return cluster_vis_live_authority_covers_policy(anchor_lsn, auth, cluster_epoch_get_current());
+}
+
+
+/*
+ * Per-backend memo of the authority CO-SAMPLED with the block bytes last
+ * installed into the L2 CR pool for one (origin, segment) — the pool stores
+ * only page bytes, and a hit is unusable without the authority of exactly
+ * those bytes (banner).  Direct-mapped, exact-match validated; a collision
+ * only costs a re-fetch.  Backend-local by design: no locks, no torn
+ * triples, and the fetch path is backend-context anyway.
+ */
+#define RTVIS_AUTH_MEMO_SLOTS 8
+
+typedef struct RtvisAuthMemo {
+	bool valid;
+	int origin_node;
+	uint32 segment_id;
+	ClusterLiveAuthority auth;
+} RtvisAuthMemo;
+
+static RtvisAuthMemo rtvis_auth_memo[RTVIS_AUTH_MEMO_SLOTS];
+
+static inline RtvisAuthMemo *
+rtvis_auth_memo_slot(int origin_node, uint32 segment_id)
+{
+	uint32 h = (uint32)origin_node * 31u + segment_id;
+
+	return &rtvis_auth_memo[h % RTVIS_AUTH_MEMO_SLOTS];
+}
+
+/*
+ * Pool key for the cached undo header block.  Field reuse is deliberate and
+ * documented: the CR pool key is an opaque discriminator tuple, so the
+ * synthetic locator carries (magic, origin, segment) and the two identity
+ * tails carry the epoch and TT generation the bytes were sampled under — a
+ * reconfig or a TT rollover changes the key, leaving stale entries
+ * unreachable (fail-closed by construction; LRU reclaims them).  The magic
+ * spcOid keeps synthetic keys disjoint from every real-relation CR key.
+ */
+static ClusterCRCacheKey
+rtvis_pool_key(int origin_node, uint32 segment_id, uint32 block_no, ClusterLiveAuthority auth)
+{
+	ClusterCRCacheKey key;
+
+	memset(&key, 0, sizeof(key));
+	key.rlocator.spcOid = GCS_BLOCK_UNDO_FETCH_TAG_MAGIC;
+	key.rlocator.dbOid = (Oid)origin_node;
+	key.rlocator.relNumber = (RelFileNumber)segment_id;
+	key.forknum = MAIN_FORKNUM;
+	key.blockno = (BlockNumber)block_no;
+	key.read_scn = (SCN)auth.origin_epoch;				/* epoch discriminator */
+	key.base_page_lsn = (XLogRecPtr)auth.tt_generation; /* generation discriminator */
+	return key;
+}
+
+/*
+ * cluster_undo_block_fetch_for_visibility — D-i1 (spec-6.12i CP2).
+ *
+ * See cluster_runtime_visibility.h for the contract.  Order of refusal
+ * checks mirrors the origin-side serve so both ends agree on the slice
+ * boundary (block 0 / TT header only).
+ */
+bool
+cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page,
+										ClusterLiveAuthority *auth_out)
+{
+	uint32 segment_id = 0;
+	uint32 block_no = 0;
+	uint16 tt_slot_offset = 0;
+	uint16 row_offset = 0;
+	uint64 local_epoch;
+	RtvisAuthMemo *memo;
+	ClusterCRPoolHandle handle;
+
+	if (out_page == NULL || auth_out == NULL)
+		return false;
+	memset(auth_out, 0, sizeof(*auth_out));
+
+	if (!cluster_crossnode_runtime_visibility || origin_node < 0 || origin_node == cluster_node_id
+		|| !uba_decode(uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
+		|| block_no != 0) {
+		cluster_rtvis_undo_fetch_note_failclosed();
+		return false;
+	}
+
+	/*
+	 * Cache leg (Q-i5): serve the pool bytes ONLY together with the
+	 * same-epoch authority they were installed under.  The epoch equality
+	 * check here is the D-i3 crash-shrink: after a reconfig the memo (and
+	 * with it the pool key) is dead, so every path below re-fetches under
+	 * the new epoch.
+	 */
+	local_epoch = cluster_epoch_get_current();
+	memo = rtvis_auth_memo_slot(origin_node, segment_id);
+	if (memo->valid && memo->origin_node == origin_node && memo->segment_id == segment_id
+		&& memo->auth.origin_epoch == local_epoch) {
+		ClusterCRCacheKey key = rtvis_pool_key(origin_node, segment_id, block_no, memo->auth);
+
+		if (cluster_cr_pool_lookup_copy(&key, out_page)) {
+			*auth_out = memo->auth;
+			cluster_rtvis_undo_fetch_note_cache_hit();
+			return true;
+		}
+	}
+
+	/* Wire leg: fetch block + co-sampled authority from the origin. */
+	if (!cluster_gcs_block_undo_tt_fetch_and_wait((int32)origin_node, segment_id, block_no,
+												  out_page, auth_out)) {
+		cluster_rtvis_undo_fetch_note_failclosed();
+		return false;
+	}
+	cluster_rtvis_undo_fetch_note_wire();
+
+	/*
+	 * Install the PAIR: memo takes the reply authority verbatim (never a
+	 * max-merge — the authority must stay the one sampled with these
+	 * bytes), the pool takes the bytes under that authority's key.  A
+	 * reserve refusal (pool off / full / already present) only loses the
+	 * cache, never the result.
+	 */
+	memo->valid = true;
+	memo->origin_node = origin_node;
+	memo->segment_id = segment_id;
+	memo->auth = *auth_out;
+
+	{
+		ClusterCRCacheKey key = rtvis_pool_key(origin_node, segment_id, block_no, *auth_out);
+
+		if (cluster_cr_pool_reserve(&key, &handle))
+			cluster_cr_pool_publish(&handle, out_page);
+	}
+
+	return true;
+}
+
+#endif /* USE_PGRAC_CLUSTER */

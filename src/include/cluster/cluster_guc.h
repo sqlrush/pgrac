@@ -187,6 +187,10 @@ extern bool cluster_crossnode_cr_data_plane;
 /* spec-6.12g: block self-containment switch (default off = D11 deferral). */
 extern bool cluster_block_self_contained;
 
+/* spec-6.12i: active-runtime cross-instance recycled-slot visibility
+ * (undo-block CF fetch + live authority gate; default off = 53R97). */
+extern bool cluster_crossnode_runtime_visibility;
+
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks
  * the unconsumed tail of oversized HW grants as a per-node lease

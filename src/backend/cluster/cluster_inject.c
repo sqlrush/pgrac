@@ -359,6 +359,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-cr-construct" },
 	/*
+	 * spec-6.12i D-i1 — undo-TT fetch serve refusal injection.
+	 *
+	 *	cluster-lms-undo-fetch:
+	 *	  Fires in the LMS drain just before the authority co-sample + TT
+	 *	  header block read of a KIND_UNDO_FETCH slot.  SKIP forces the
+	 *	  DENIED serve so TAP pins the fail-closed requester leg (unchanged
+	 *	  53R97) under a topology that would otherwise serve the block.
+	 */
+	{ .name = "cluster-lms-undo-fetch" },
+	/*
 	 * spec-5.2a D3 — FAITHFUL clean-page stale-holder injection.
 	 *
 	 *	cluster-clean-xfer-stale-holder:

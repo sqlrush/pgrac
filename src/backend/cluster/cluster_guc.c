@@ -110,6 +110,9 @@ bool cluster_crossnode_cr_data_plane = false;
 /* spec-6.12g: block self-containment (active-ITL migration + opportunistic
  * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
 bool cluster_block_self_contained = false;
+/* spec-6.12i: active-runtime cross-instance recycled-slot visibility
+ * resolution via undo-block CF fetch (default OFF = 53R97). */
+bool cluster_crossnode_runtime_visibility = false;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1540,6 +1543,30 @@ cluster_init_guc(void)
 		gettext_noop("Enable the cross-instance CR-server data plane (spec-6.12b)."),
 		gettext_noop("Off keeps cross-instance CR fail-closed (SQLSTATE 53R9G)."),
 		&cluster_crossnode_cr_data_plane, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.crossnode_runtime_visibility -- spec-6.12 wave i (缺口 A).
+	 * When on, the by-xid durable-TT resolution of a RECYCLED remote ITL
+	 * slot — today admitted only behind the crash-recovery materialized
+	 * marker — may also be admitted in ACTIVE runtime, but ONLY behind the
+	 * D-i2 live authority gate: the origin's LMS co-samples {origin_epoch,
+	 * live_hwm_lsn, tt_generation} into the very undo-block reply that
+	 * carries its TT (D-i1 fetch, riding the 6.12b LMS ship + GCS block
+	 * wire), and the requester resolves only when that authority provably
+	 * covers the tuple's page version in the current membership epoch.
+	 * Proof-insufficient / epoch-changed / fetch-failed keeps the unchanged
+	 * 53R97 fail-closed (Rule 8.A: this wave only widens "resolve when
+	 * provable", never "resolve when unprovable").  Default OFF: the
+	 * materialized-marker-only boundary stays byte-identical.  SUSET for
+	 * measurement-window toggling.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.crossnode_runtime_visibility",
+		gettext_noop("Enable active-runtime cross-instance recycled-slot visibility "
+					 "resolution (spec-6.12i)."),
+		gettext_noop("Off keeps active-runtime recycled-slot resolution fail-closed "
+					 "(SQLSTATE 53R97)."),
+		&cluster_crossnode_runtime_visibility, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.block_self_contained -- spec-6.12 wave g (write-write

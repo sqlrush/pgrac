@@ -2475,6 +2475,17 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_partial_count()));
 	emit_row(rsinfo, "cr", "cr_server_denied_count",
 			 fmt_int64((int64)cluster_cr_server_denied_count()));
+	/* spec-6.12i: undo-TT fetch data plane (D-i1). */
+	emit_row(rsinfo, "cr", "rtvis_undo_fetch_wire_count",
+			 fmt_int64((int64)cluster_rtvis_undo_fetch_wire_count()));
+	emit_row(rsinfo, "cr", "rtvis_undo_fetch_cache_hit_count",
+			 fmt_int64((int64)cluster_rtvis_undo_fetch_cache_hit_count()));
+	emit_row(rsinfo, "cr", "rtvis_undo_fetch_failclosed_count",
+			 fmt_int64((int64)cluster_rtvis_undo_fetch_failclosed_count()));
+	emit_row(rsinfo, "cr", "cr_server_undo_served_count",
+			 fmt_int64((int64)cluster_cr_server_undo_served_count()));
+	emit_row(rsinfo, "cr", "cr_server_undo_denied_count",
+			 fmt_int64((int64)cluster_cr_server_undo_denied_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

@@ -121,6 +121,20 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_server_full_count;
 	pg_atomic_uint64 cr_server_partial_count;
 	pg_atomic_uint64 cr_server_denied_count;
+	/*
+	 * spec-6.12i: undo-TT fetch data plane (5 counters).  requester side:
+	 * wire fetches that returned block + co-sampled authority, cache hits
+	 * (L2 CR pool bytes + same-epoch per-backend authority memo), and
+	 * fail-closed misses (GUC off / bad UBA / non-header block / timeout /
+	 * DENIED / checksum / trailer missing -> the caller keeps 53R97).
+	 * server side (bumped in the LMS drain): TT header blocks served with a
+	 * co-sampled authority triple, and refusals.
+	 */
+	pg_atomic_uint64 rtvis_undo_fetch_wire_count;
+	pg_atomic_uint64 rtvis_undo_fetch_cache_hit_count;
+	pg_atomic_uint64 rtvis_undo_fetch_failclosed_count;
+	pg_atomic_uint64 cr_server_undo_served_count;
+	pg_atomic_uint64 cr_server_undo_denied_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -187,6 +201,11 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_server_full_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_partial_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_undo_fetch_wire_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_undo_fetch_cache_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_undo_fetch_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_undo_served_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_undo_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -243,7 +262,36 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 	case CLUSTER_CR_SERVER_STAT_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_denied_count, 1);
 		break;
+	case CLUSTER_CR_SERVER_STAT_UNDO_SERVED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_undo_served_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_UNDO_DENIED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_undo_denied_count, 1);
+		break;
 	}
+}
+
+/* PGRAC: spec-6.12i — requester-side undo-TT fetch outcome bumps (backend
+ * context, cluster_runtime_visibility.c). */
+void
+cluster_rtvis_undo_fetch_note_wire(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_undo_fetch_wire_count, 1);
+}
+
+void
+cluster_rtvis_undo_fetch_note_cache_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_undo_fetch_cache_hit_count, 1);
+}
+
+void
+cluster_rtvis_undo_fetch_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_undo_fetch_failclosed_count, 1);
 }
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
@@ -263,6 +311,12 @@ CR_COUNTER_ACCESSOR(cluster_cr_remote_failed_count, cr_remote_failed_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_full_count, cr_server_full_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_partial_count, cr_server_partial_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_denied_count, cr_server_denied_count)
+/* spec-6.12i: undo-TT fetch data plane (5 counters). */
+CR_COUNTER_ACCESSOR(cluster_rtvis_undo_fetch_wire_count, rtvis_undo_fetch_wire_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_undo_fetch_cache_hit_count, rtvis_undo_fetch_cache_hit_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_undo_fetch_failclosed_count, rtvis_undo_fetch_failclosed_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_undo_served_count, cr_server_undo_served_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_undo_denied_count, cr_server_undo_denied_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)

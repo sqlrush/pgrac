@@ -277,7 +277,7 @@ typedef enum GcsBlockReplyStatus {
 													 * waiter into the CR cache slot /
 													 * scratch (Rule 8.A hard
 													 * invariant). */
-	GCS_BLOCK_REPLY_CR_RESULT_PARTIAL = 17			  /* PGRAC: spec-6.12b NEW; the
+	GCS_BLOCK_REPLY_CR_RESULT_PARTIAL = 17,			  /* PGRAC: spec-6.12b NEW; the
 													 * origin's LMS applied the
 													 * write_scn-DESC PREFIX of the
 													 * candidate chains (all
@@ -292,6 +292,21 @@ typedef enum GcsBlockReplyStatus {
 													 * still-foreign chain there hits
 													 * the class-③ walk backstop ->
 													 * 53R9G (Rule 8.A). */
+	GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT = 18		  /* PGRAC: spec-6.12i NEW; the
+													 * origin's LMS read its own
+													 * TT-bearing undo header block
+													 * (D-i1) and CO-SAMPLED the live
+													 * authority triple into the same
+													 * reply: hdr.epoch = LMS-sampled
+													 * origin epoch, hdr.page_lsn =
+													 * live_hwm_lsn, and a 16-byte
+													 * ClusterGcsUndoAuthTrailer after
+													 * the page carries tt_generation.
+													 * The page is undo METADATA: never
+													 * installed as a current heap
+													 * block, never flushed; consumed
+													 * only by the runtime-visibility
+													 * fetch (Rule 8.A). */
 } GcsBlockReplyStatus;
 
 /* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
@@ -308,6 +323,8 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_
 					 && GCS_BLOCK_REPLY_CR_RESULT_FULL
 							== GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1,
 				 "spec-6.12b CR result statuses must be the tail enum values");
+StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT == GCS_BLOCK_REPLY_CR_RESULT_PARTIAL + 1,
+				 "spec-6.12i undo-TT fetch status must be the tail enum value");
 
 static inline bool
 GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
@@ -1098,6 +1115,35 @@ GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
 	return p->reserved_0[5] != 0;
 }
 
+/* PGRAC: spec-6.12i D-i1 — undo-TT fetch request carried in reserved_0[6]
+ * VALUE 1 ([0]=read-image, [1]=X-transfer, [2]=clean-eligible,
+ * [3]=downgrade-request/nudge, [4]=CR-request, [5]=spec-6.13 direct-land
+ * above; [6] is the last byte, value-multiplexed like [3]: value 1 =
+ * undo-TT fetch, value 2 = spec-6.15 D4 xid verdict).
+ *
+ *	Sent REQUESTER -> ORIGIN, riding the same 64B forward wire as the
+ *	spec-6.12b CR request.  With this flag set the BufferTag is a SYNTHETIC
+ *	undo address (see GcsBlockUndoFetchTagMake below), NOT a heap block
+ *	identity — the origin-side handler branches on this flag BEFORE any GRD
+ *	/ holder logic can interpret the tag, exactly like the CR branch.  The
+ *	origin's LMON validates + parks the request for LMS; LMS reads its OWN
+ *	TT-bearing undo header block and co-samples the live authority triple
+ *	{origin_epoch, live_hwm_lsn, tt_generation} (spec-6.12 §2.11 "live
+ *	authority source") into the reply; LMON ships UNDO_TT_FETCH_RESULT with
+ *	the ClusterGcsUndoAuthTrailer appended, or a DENIED status which the
+ *	requester maps to the unchanged 53R97 fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetUndoTtFetchRequest(GcsBlockForwardPayload *p, bool undo_fetch)
+{
+	p->reserved_0[6] = undo_fetch ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoTtFetchRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)1;
+}
+
 /*
  * spec-6.13 D6 safety gate: a master must not propagate the requester's
  * direct-land flag to a forwarded holder unless the requester armed that exact
@@ -1111,6 +1157,88 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
 {
 	GcsBlockForwardPayloadSetDirectLandArmed(
 		fwd, exact_holder_arm && GcsBlockRequestPayloadIsDirectLandArmed(req));
+}
+
+/* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.
+ *
+ *	An undo block has no BufferTag (undo segment files live outside shared
+ *	buffers, addressed by (segment_id, owner_instance, block_no) through
+ *	cluster_undo_smgr).  The fetch REUSES the forward payload's 20B tag
+ *	field to carry that address: spcOid holds a magic discriminator (so a
+ *	synthetic tag can never be confused with a real relation tag anywhere
+ *	it might leak into observability), dbOid carries the segment_id and
+ *	blockNum the block_no.  The OWNER is deliberately NOT carried: the
+ *	origin only ever serves its own undo (owner_instance derives from the
+ *	serving node's own id), so a forged owner field cannot redirect the
+ *	read (fail-closed by construction). */
+#define GCS_BLOCK_UNDO_FETCH_TAG_MAGIC ((Oid)0x50475549) /* "PGUI" */
+
+static inline BufferTag
+GcsBlockUndoFetchTagMake(uint32 segment_id, uint32 block_no)
+{
+	BufferTag tag;
+
+	tag.spcOid = GCS_BLOCK_UNDO_FETCH_TAG_MAGIC;
+	tag.dbOid = (Oid)segment_id;
+	tag.relNumber = (RelFileNumber)0;
+	tag.forkNum = MAIN_FORKNUM;
+	tag.blockNum = (BlockNumber)block_no;
+	return tag;
+}
+
+static inline bool
+GcsBlockUndoFetchTagDecode(BufferTag tag, uint32 *segment_id, uint32 *block_no)
+{
+	if (tag.spcOid != GCS_BLOCK_UNDO_FETCH_TAG_MAGIC)
+		return false;
+	if (segment_id != NULL)
+		*segment_id = (uint32)tag.dbOid;
+	if (block_no != NULL)
+		*block_no = (uint32)tag.blockNum;
+	return true;
+}
+
+/* PGRAC: spec-6.12i D-i1 — live-authority trailer appended after the BLCKSZ
+ * page on UNDO_TT_FETCH_RESULT replies (wire size = 48B v1 header + 8192B
+ * page + 16B trailer = 8256B; distinct from both the 8240B v1 and the 8504B
+ * spec-6.2 v2 sizes, so the reply decoder discriminates by length exactly
+ * like the v2 precedent).  Only tt_generation rides here: origin_epoch
+ * reuses the header's epoch field (which the HC100 stale-reply check already
+ * validates against the request epoch — a mid-reconfig reply drops, which IS
+ * the D-i3 fail-closed) and live_hwm_lsn reuses page_lsn (zero on every
+ * other served-page path).  Little-endian byte carrier, same pattern as
+ * expected_pi_watermark_scn_bytes. */
+typedef struct ClusterGcsUndoAuthTrailer {
+	uint8 tt_generation_bytes[8]; /* origin TT retention-rollover generation */
+	uint8 reserved_0[8];		  /* must be zero */
+} ClusterGcsUndoAuthTrailer;
+
+StaticAssertDecl(sizeof(ClusterGcsUndoAuthTrailer) == 16,
+				 "spec-6.12i ClusterGcsUndoAuthTrailer wire ABI is 16 bytes");
+
+static inline void
+ClusterGcsUndoAuthTrailerSetTtGeneration(ClusterGcsUndoAuthTrailer *t, uint64 tt_generation)
+{
+	t->tt_generation_bytes[0] = (uint8)(tt_generation & 0xff);
+	t->tt_generation_bytes[1] = (uint8)((tt_generation >> 8) & 0xff);
+	t->tt_generation_bytes[2] = (uint8)((tt_generation >> 16) & 0xff);
+	t->tt_generation_bytes[3] = (uint8)((tt_generation >> 24) & 0xff);
+	t->tt_generation_bytes[4] = (uint8)((tt_generation >> 32) & 0xff);
+	t->tt_generation_bytes[5] = (uint8)((tt_generation >> 40) & 0xff);
+	t->tt_generation_bytes[6] = (uint8)((tt_generation >> 48) & 0xff);
+	t->tt_generation_bytes[7] = (uint8)((tt_generation >> 56) & 0xff);
+}
+
+static inline uint64
+ClusterGcsUndoAuthTrailerGetTtGeneration(const ClusterGcsUndoAuthTrailer *t)
+{
+	return ((uint64)t->tt_generation_bytes[0]) | (((uint64)t->tt_generation_bytes[1]) << 8)
+		   | (((uint64)t->tt_generation_bytes[2]) << 16)
+		   | (((uint64)t->tt_generation_bytes[3]) << 24)
+		   | (((uint64)t->tt_generation_bytes[4]) << 32)
+		   | (((uint64)t->tt_generation_bytes[5]) << 40)
+		   | (((uint64)t->tt_generation_bytes[6]) << 48)
+		   | (((uint64)t->tt_generation_bytes[7]) << 56);
 }
 
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
