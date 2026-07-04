@@ -390,10 +390,32 @@ UT_TEST(test_direct_land_forward_flag_round_trip_independent)
 }
 
 
+UT_TEST(test_forward_direct_land_from_request_requires_exact_holder_arm)
+{
+	GcsBlockRequestPayload req;
+	GcsBlockForwardPayload fwd;
+
+	memset(&req, 0, sizeof(req));
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, true);
+
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, true);
+	UT_ASSERT(GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockRequestPayloadSetDirectLandArmed(&req, false);
+	GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, &req, true);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -421,6 +443,7 @@ main(void)
 	UT_RUN(test_cr_request_flag_round_trip_independent);
 	UT_RUN(test_cr_result_statuses_are_16_17);
 	UT_RUN(test_direct_land_forward_flag_round_trip_independent);
+	UT_RUN(test_forward_direct_land_from_request_requires_exact_holder_arm);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

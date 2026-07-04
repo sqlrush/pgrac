@@ -993,6 +993,21 @@ GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
 	return p->reserved_0[5] != 0;
 }
 
+/*
+ * spec-6.13 D6 safety gate: a master must not propagate the requester's
+ * direct-land flag to a forwarded holder unless the requester armed that exact
+ * holder as the expected block-reply peer.  Until redirect/exact-holder arm
+ * lands, all current forward paths pass exact_holder_arm=false.
+ */
+static inline void
+GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
+											   const GcsBlockRequestPayload *req,
+											   bool exact_holder_arm)
+{
+	GcsBlockForwardPayloadSetDirectLandArmed(
+		fwd, exact_holder_arm && GcsBlockRequestPayloadIsDirectLandArmed(req));
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */

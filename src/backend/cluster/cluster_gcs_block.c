@@ -2666,8 +2666,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
-			GcsBlockForwardPayloadSetDirectLandArmed(
-				&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
+			GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */
@@ -2970,8 +2969,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
-				GcsBlockForwardPayloadSetDirectLandArmed(
-					&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
+				GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 				/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 				 * expected pi_watermark_scn. */
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
@@ -3219,8 +3217,7 @@ x_path_skipped:
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
-				GcsBlockForwardPayloadSetDirectLandArmed(
-					&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
+				GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
@@ -3291,8 +3288,7 @@ x_path_skipped:
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
-			GcsBlockForwardPayloadSetDirectLandArmed(
-				&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
+			GcsBlockForwardPayloadSetDirectLandFromRequest(&fwd, req, false);
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */

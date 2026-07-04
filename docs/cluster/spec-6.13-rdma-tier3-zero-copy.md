@@ -135,6 +135,13 @@ The first D6 implementation should target the reserved invalid shared-buffer
 case for normal read misses.  It must keep the existing staging-copy path for
 cases that cannot prove exclusive ownership of the target page.
 
+Implementation constraint: while RDMA DMA is possible, a reserved
+shared-buffer target must stay pinned, invalid, and absent from any visible
+lookup/install path.  The verifier may set it valid only while holding the
+proper buffer/content locks used by the existing install path.  Abort cleanup
+must not release or recycle the target until the posted WR is known completed
+or the block-reply lane has been flushed/reset.
+
 ### D6.3 Slot Correlation
 
 The receive CQE must map to a single live outstanding GCS slot without scanning
@@ -230,12 +237,23 @@ LMON handles block-reply CQEs before waking the backend.  Completion processing:
 3. On CQE error, move to abort cleanup.
 4. On CQE success, mark the arm `LANDED` but keep the target invisible.
 5. Verify sidecar envelope and reply header.
-6. Verify `request_id`, `requester_backend_id`, `transition_id`, epoch, and
+6. Verify the reply status.  Only success statuses may install bytes:
+   `GCS_BLOCK_REPLY_GRANTED`, `GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER`,
+   `GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER`, and
+   `GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE`.  Any `DENIED_*`,
+   `GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK`, or CR-result status must not
+   install a landed page even when the sidecar and page checksum are valid.
+7. Verify `request_id`, `requester_backend_id`, `transition_id`, epoch, and
    expected peer against the outstanding slot.
-7. Verify envelope CRC over the sidecar payload header plus landed page bytes.
-8. Verify `GcsBlockReplyHeader.checksum` over the landed page bytes.
-9. Run the existing lost-write/page-LSN/SCN checks.
-10. Install or mark valid only after every check passes.
+8. Verify envelope CRC over the sidecar payload header plus landed page bytes.
+9. Verify `GcsBlockReplyHeader.checksum` over the landed page bytes.
+10. Run the existing lost-write/page-LSN/SCN checks.
+11. Install or mark valid only after every check passes.
+
+Direct-land denial replies use an existing non-success status, not a new wire
+status.  The preferred denial for "sender cannot produce a valid image" is
+`GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER`; epoch and validator failures retain
+their existing `DENIED_EPOCH_STALE` and `DENIED_VALIDATOR_REJECT` statuses.
 
 The verifier must not call the generic envelope dispatcher.  It can reuse the
 same checksum helpers, but the payload bytes are discontiguous across sidecar
