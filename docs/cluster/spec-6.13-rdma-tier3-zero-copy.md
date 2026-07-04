@@ -239,10 +239,12 @@ LMON handles block-reply CQEs before waking the backend.  Completion processing:
 5. Verify sidecar envelope and reply header.
 6. Verify the reply status.  Only success statuses may install bytes:
    `GCS_BLOCK_REPLY_GRANTED`, `GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER`,
-   `GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER`, and
-   `GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE`.  Any `DENIED_*`,
-   `GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK`, or CR-result status must not
-   install a landed page even when the sidecar and page checksum are valid.
+   and `GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE`.
+   `GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER` is excluded from the D6 whitelist
+   until destructive X-transfer has separate ownership/drop-before-send proof
+   and tests.  Any `DENIED_*`, `GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK`, or
+   CR-result status must not install a landed page even when the sidecar and
+   page checksum are valid.
 7. Verify `request_id`, `requester_backend_id`, `transition_id`, epoch, and
    expected peer against the outstanding slot.
 8. Verify envelope CRC over the sidecar payload header plus landed page bytes.
@@ -254,6 +256,12 @@ Direct-land denial replies use an existing non-success status, not a new wire
 status.  The preferred denial for "sender cannot produce a valid image" is
 `GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER`; epoch and validator failures retain
 their existing `DENIED_EPOCH_STALE` and `DENIED_VALIDATOR_REJECT` statuses.
+A non-success direct-land reply is authoritative for the outstanding slot only
+after the `wr_id`/sidecar identity, epoch, transition id, request id, requester
+backend, expected peer, envelope CRC, and page checksum all match.  If any of
+those checks fail, the receiver must treat the reply as stale or corrupt,
+abort/clean up the arm, and retry the normal path; it must not wake the waiter
+as if this were a valid denial for the slot.
 
 The verifier must not call the generic envelope dispatcher.  It can reuse the
 same checksum helpers, but the payload bytes are discontiguous across sidecar
@@ -352,10 +360,12 @@ notes in one patch.
 ### Request/Forward Flags
 
 `GcsBlockRequestPayload.reserved_0[1]` means the original requester armed a
-direct-land receive.  Forwarded holder requests carry the same intent in the
-forward payload flag already reserved for spec-6.13.  A sender must treat the
-flag as advisory and also check RDMA peer capability before choosing the
-direct-land reply format.
+direct-land receive.  Forwarded holder requests carry the same intent in
+`GcsBlockForwardPayload.reserved_0[5]`, which is the spec-6.13 forward
+direct-land flag.  `GcsBlockForwardPayload.reserved_0[3]` remains reserved for
+the spec-6.12a downgrade request flag, and `reserved_0[4]` remains reserved for
+the spec-6.12b CR request flag.  A sender must treat the flag as advisory and
+also check RDMA peer capability before choosing the direct-land reply format.
 
 The master must clear the forward direct-land flag unless it can prove the
 requester armed the holder as the exact expected reply peer.  Without that
