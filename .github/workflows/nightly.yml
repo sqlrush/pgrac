@@ -168,9 +168,29 @@ jobs:
           # shard so the multi-node reconfig leg (t/343) runs in parallel and
           # does not extend the ges-locking shard wallclock.
           - { name: stage5-hang-acceptance, ranges: "340-343", unit: false, regress: false }
+          # spec-5.21 D8: Stage 5 beta close-out.  t/344 = release-level sustained
+          # 4-node chaos soak (kill/leave under continuous load, HG#2); t/345 =
+          # integrated beta acceptance (evidence-completeness + 7 RAC core smoke,
+          # HG#1/HG#3).  Own shard so the multi-node soak runs in parallel.  The
+          # 4-node ClusterQuad soak leg is HG#2a-CI (PASS-or-environment-SKIP);
+          # the release-cut 4-node evidence is HG#2a-CI or HG#2a-EXT (external).
+          - { name: stage5-beta-chaos-soak, ranges: "344-345", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # spec-5.21 D2 Part A (evidence-completeness) checks each Stage 5 sub-spec
+      # ship tag is an ancestor of HEAD.  A default shallow checkout (depth 1)
+      # both omits the tags AND makes `git merge-base --is-ancestor` return
+      # rc=1 (ancestry cannot be established through a truncated history), so
+      # the shard must UNSHALLOW here.  Only the beta shard needs it.  Errors
+      # are NOT swallowed: if this fails the shard goes red rather than silently
+      # skipping the evidence-completeness gate (rule 8.B).
+      - name: Unshallow + fetch tags (beta evidence-completeness)
+        if: matrix.shard.name == 'stage5-beta-chaos-soak'
+        run: |
+          git fetch --unshallow --tags --force origin 2>/dev/null \
+            || git fetch --tags --force origin
 
       - name: Install Linux dependencies
         run: |
