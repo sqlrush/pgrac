@@ -35,7 +35,8 @@
 #include "access/transam.h"
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / cluster_xid_striping */
 #include "cluster/cluster_xid_stripe.h"
-#include "port/pg_crc32c.h" /* durable stripe record integrity (D5) */
+#include "cluster/cluster_xid_stripe_boot.h" /* lazy latch (D5b) */
+#include "port/pg_crc32c.h"					 /* durable stripe record integrity (D5) */
 
 /*
  * Region-4/5 payloads must fit one voting-disk slot (CLUSTER_VOTING_
@@ -193,8 +194,20 @@ cluster_xid_origin_slot(TransactionId xid)
 {
 	FullTransactionId fxid;
 
-	if (!stripe_runtime.active)
-		return -1;
+	if (!stripe_runtime.active) {
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * spec-6.15 D5b lazy latch: activation resolves after process
+		 * start (the membership join gate publishes it), so latch from
+		 * shmem on first use.  GUC-gated so striping-off clusters never
+		 * pay the shmem lookup on this path.
+		 */
+		if (cluster_enabled && cluster_xid_striping)
+			cluster_xid_stripe_lazy_latch();
+#endif
+		if (!stripe_runtime.active)
+			return -1;
+	}
 
 	fxid = cluster_xid_widen(xid, ReadNextFullTransactionId());
 

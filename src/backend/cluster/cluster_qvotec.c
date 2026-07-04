@@ -96,9 +96,10 @@
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
 #include "cluster/cluster_pgstat.h"		 /* cluster.qvotec.* counters */
 #include "cluster/cluster_reconfig.h"	 /* spec-4.12b D2: applied-membership snapshot */
-#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
-#include "cluster/cluster_write_fence.h" /* spec-4.12 D2: fence marker scan + token refresh */
-#include "utils/memutils.h"				 /* TopMemoryContext */
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b: region-5 scan + seed */
+#include "cluster/cluster_shmem.h"			 /* cluster_shmem_register_region */
+#include "cluster/cluster_write_fence.h"	 /* spec-4.12 D2: fence marker scan + token refresh */
+#include "utils/memutils.h"					 /* TopMemoryContext */
 
 
 /* ============================================================
@@ -1442,6 +1443,21 @@ qvotec_poll_once(void)
 			cluster_node_remove_qvotec_complete(disks_ok_post_write >= quorum_size_post_write);
 	}
 
+	/*
+	 * spec-6.15 D5b: xid-stripe face.  Keep re-scanning region 5 until a
+	 * record is PUBLISHED — an ABSENT verdict is not final (the seed
+	 * candidate on ANOTHER node writes the record after our startup scan,
+	 * and a co-booting joiner must observe it to leave the stripe HOLD),
+	 * and a CORRUPT verdict may be repaired in place.  One 512-byte pread
+	 * per disk per poll, and none once PUBLISHED (the steady state).
+	 * Also service a pending activation-seed request (write to every
+	 * disk, majority-durable, adopt-not-overwrite — see
+	 * cluster_xid_stripe_boot.c).
+	 */
+	if (cluster_xid_stripe_disk_state() != CLUSTER_XID_STRIPE_DISK_PUBLISHED)
+		cluster_xid_stripe_scan_disks(qvotec_fds, qvotec_n_disks);
+	cluster_xid_stripe_service_seed(qvotec_fds, qvotec_n_disks);
+
 	/* ---- 4. publish shmem ---- */
 	{
 		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
@@ -1649,6 +1665,14 @@ ClusterQvotecMain(void)
 	 */
 	cluster_reconfig_publish_join_qvotec_latch(MyLatch);
 	cluster_membership_seed_last_admitted_from_voting_disk(qvotec_fds, qvotec_n_disks);
+
+	/*
+	 * spec-6.15 D5b: publish the durable xid-stripe activation state
+	 * (voting-disk region 5) before the joiner gate can consult it.
+	 * Idempotent adopt-only read; any later activation seed goes
+	 * through the poll-loop mailbox below.
+	 */
+	cluster_xid_stripe_scan_disks(qvotec_fds, qvotec_n_disks);
 
 	/*
 	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the

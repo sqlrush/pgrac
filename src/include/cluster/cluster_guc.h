@@ -194,6 +194,8 @@ extern bool cluster_crossnode_runtime_visibility;
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * off = vanilla dense per-node xid allocation). */
 extern bool cluster_xid_striping;
+/* spec-6.15 D5/D3: herding slack (jump threshold; seed-floor headroom). */
+extern int cluster_xid_herding_slack;
 
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks

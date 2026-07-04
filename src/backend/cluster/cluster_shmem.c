@@ -121,7 +121,8 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
-#include "cluster/cluster_write_fence.h" /* cluster_write_fence_shmem_register (spec-4.12 D7) */
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b shmem size/init */
+#include "cluster/cluster_write_fence.h"	 /* cluster_write_fence_shmem_register (spec-4.12 D7) */
 #include "cluster/cluster_lms.h" /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
 #include "cluster/cluster_lmd.h" /* cluster_lmd_shmem_register (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_mrp.h" /* cluster_mrp_shmem_register (spec-6.4 D1) */
@@ -908,6 +909,9 @@ cluster_request_shmem(void)
 	 */
 	RequestAddinShmemSpace(cluster_remote_xact_shmem_size());
 	cluster_remote_xact_shmem_request();
+
+	/* spec-6.15 D5b: xid stripe activation publication + seed mailbox. */
+	RequestAddinShmemSpace(cluster_xid_stripe_shmem_size());
 }
 
 /*
@@ -956,6 +960,11 @@ cluster_init_shmem(void)
 
 	/* spec-4.5a G5: SLRU init (self-managed shmem, outside the registry). */
 	cluster_remote_xact_shmem_init();
+
+	/* spec-6.15 D5b: xid stripe activation publication + seed mailbox
+	 * (runs in postmaster and, under EXEC_BACKEND, in each child — the
+	 * attach re-points the process-local StripeBootShmem pointer). */
+	cluster_xid_stripe_shmem_init();
 
 	/*
 	 * spec-3.4b D8 / Q4 HC (L191): code-enforced automatic flush of the
@@ -1035,6 +1044,23 @@ cluster_init_shmem(void)
 						errhint("Set cluster.node_id to a value between 0 and %d, or disable "
 								"cluster.xid_striping.",
 								CLUSTER_XID_STRIDE - 1)));
+
+	/*
+	 * spec-6.15 D5b: striping rides the spec-5.15 membership serialization
+	 * for its activation protocol (the joiner gate is where the activation
+	 * record is seeded, validated and enforced — appendix B.2).  With
+	 * cluster.online_join off that gate never runs, so striping would come
+	 * up with no durable activation floor: allocation would stripe but the
+	 * derivation face would stay permanently underivable.  Refuse to start
+	 * instead of shipping a silently-inert feature (rule 8).
+	 */
+	if (cluster_enabled && cluster_xid_striping && !cluster_online_join)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster.xid_striping requires cluster.online_join"),
+						errdetail("The xid stripe activation handshake runs inside the online-join "
+								  "membership gate."),
+						errhint("Enable cluster.online_join on every node, or disable "
+								"cluster.xid_striping.")));
 
 	/*
 	 * Stage 0.18: bind the cluster_ic vtable for the configured tier.

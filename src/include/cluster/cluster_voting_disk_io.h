@@ -282,6 +282,25 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_apply_lease_global_slot
 extern ClusterVotingDiskIoState
 cluster_voting_disk_write_apply_lease_global_slot(int fd, const void *in_slot512);
 
+/*
+ * spec-6.15 D5 — raw 512-byte xid-stripe slot R/W (region 5, at
+ * CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node_id)) and the single cluster-wide
+ * stripe activation record (region 6, at CLUSTER_VOTING_STRIPE_ACTIVATION_
+ * OFFSET).  Payload-agnostic like the leave/join paths (the caller marshals
+ * a ClusterXidStripeSlotRecord / ClusterXidStripeActivationRecord and owns
+ * its magic/version/CRC); same per-I/O timeout discipline.  read returns OK
+ * + 512 bytes (a zeroed slot is OK — the caller's record validation rejects
+ * it as absent); FAILED on short read / EOF (file not yet grown) / I/O error.
+ */
+extern ClusterVotingDiskIoState cluster_voting_disk_read_stripe_slot(int fd, uint32 node_id,
+																	 void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_slot(int fd, uint32 node_id,
+																	  const void *in_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_read_stripe_activation(int fd,
+																		   void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_activation(int fd,
+																			const void *in_slot512);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 

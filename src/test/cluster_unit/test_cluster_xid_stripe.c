@@ -49,6 +49,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h" /* lazy-latch stub prototype */
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf (libpgport is linked for CRC32C only, D5a). */
@@ -85,6 +86,13 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_enabled = false;
 int cluster_node_id = -1;
 bool cluster_xid_striping = false;
+
+/* No-op stand-in for the D5b lazy latch (cluster_xid_stripe_boot.o is
+ * not linked here; the latch tests drive cluster_xid_stripe_latch_runtime
+ * directly). */
+void
+cluster_xid_stripe_lazy_latch(void)
+{}
 
 /* Settable stand-in for varsup.c ReadNextFullTransactionId (the runtime
  * wrappers read the local nextXid through it). */

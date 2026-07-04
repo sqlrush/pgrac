@@ -352,6 +352,8 @@ typedef enum BuiltinTrancheIds {
 		LWTRANCHE_CLUSTER_IC_RDMA,
 		/* PGRAC: spec-6.2 — Smart Fusion dependency authority shmem region. */
 		LWTRANCHE_CLUSTER_SMART_FUSION,
+		/* PGRAC: spec-6.15 D5b — xid stripe activation publication + seed mailbox. */
+		LWTRANCHE_CLUSTER_XID_STRIPE,
 	#endif
 		LWTRANCHE_FIRST_USER_DEFINED
 	} BuiltinTrancheIds;
