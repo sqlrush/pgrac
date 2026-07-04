@@ -25,7 +25,12 @@
  *	    native "one past last assigned" invariant is preserved for
  *	    GetSnapshotData / oldestXid consumers.  With the GUC off (the
  *	    default) the candidate equals nextXid and behaviour is
- *	    byte-identical to vanilla PostgreSQL.
+ *	    byte-identical to vanilla PostgreSQL.  D5e adds the durable
+ *	    per-slot floor clamp: a candidate below this node's claimed
+ *	    stripe floor (possible only through external nextXid rewinds
+ *	    such as pg_resetwal) is pulled up to the first in-class value
+ *	    at or above the floor, so a rewound allocator can never re-
+ *	    issue values under the activation floor (D0-F2).
  *
  *	Why: striping makes the 32-bit xid value space globally unique
  *	across cluster nodes so a raw xid is self-describing about its
@@ -44,7 +49,8 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
-#include "cluster/cluster_xid_stripe.h" /* PGRAC: spec-6.15 D1 striped candidate */
+#include "cluster/cluster_xid_stripe.h"		/* PGRAC: spec-6.15 D1 striped candidate */
+#include "cluster/cluster_xid_stripe_boot.h"	/* PGRAC: spec-6.15 D5e per-slot floor clamp */
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
@@ -128,7 +134,14 @@ GetNewTransactionId(bool isSubXact)
 
 		if (stripe_slot >= 0)
 		{
+			FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+
 			full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
+			/* D5e/D0-F2: never issue below the durable per-slot floor
+			 * (external rewinds only — pg_resetwal below the floor). */
+			if (FullTransactionIdIsValid(slot_floor)
+				&& FullTransactionIdPrecedes(full_xid, slot_floor))
+				full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
 			xid = XidFromFullTransactionId(full_xid);
 		}
 	}
@@ -226,7 +239,13 @@ GetNewTransactionId(bool isSubXact)
 
 			if (stripe_slot >= 0)
 			{
+				FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+
 				full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
+				/* D5e/D0-F2: same floor clamp as the first derivation. */
+				if (FullTransactionIdIsValid(slot_floor)
+					&& FullTransactionIdPrecedes(full_xid, slot_floor))
+					full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
 				xid = XidFromFullTransactionId(full_xid);
 			}
 		}
