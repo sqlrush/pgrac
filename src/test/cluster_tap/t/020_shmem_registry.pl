@@ -305,8 +305,8 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	   '116',
-	   'L17 pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+	   '118',
+	   'L17 pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
 
 
 # ----------
