@@ -72,9 +72,9 @@ is($node->safe_psql(
 # Distinct type count: current cluster wait-event type roster.
 # ----------
 is($node->safe_psql('postgres',
-		'SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events'),
-	'14',
-	'14 distinct Cluster: * types');
+			'SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events'),
+		'13',
+		'13 distinct Cluster: * types');
 
 
 # ----------
@@ -90,7 +90,7 @@ my %expected = (
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 9,	# spec-6.13: +busypoll + inline send waits
 	'Cluster: Undo' => 4,
-	'Cluster: ADG' => 2,
+	'Cluster: ADG' => 4,
 );
 
 for my $type (sort keys %expected)

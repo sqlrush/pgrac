@@ -104,7 +104,7 @@ my %expected = (
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 9,	# spec-6.13: +busypoll + inline send waits
 	'Cluster: Undo' => 4,
-	'Cluster: ADG' => 2,
+	'Cluster: ADG' => 4,
 );
 
 for my $type (sort keys %expected)

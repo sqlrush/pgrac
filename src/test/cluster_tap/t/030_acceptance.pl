@@ -246,8 +246,8 @@ ok($node->safe_psql('postgres',
 # ============================================================
 
 is($node->safe_psql('postgres',
-		q{SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events}),
-	'14', 'I1 wait_events has exactly 14 distinct types');
+			q{SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events}),
+		'13', 'I1 wait_events has exactly 13 distinct types');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_gcluster_wait_events WHERE node_id IS NOT NULL})
