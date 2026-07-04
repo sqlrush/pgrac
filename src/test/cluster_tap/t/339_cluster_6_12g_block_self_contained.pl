@@ -225,5 +225,28 @@ for my $n ($node0, $node1)
 	is($rows, '3', 'L4 wave-g lever keys present (' . $n->name . ')');
 }
 
+# ============================================================
+# L5: no-crash under concurrent DATA writes (Hardening v1.1 regression).
+# The commit-time stamp path (cluster_bufmgr_lock_resident_for_stamp) must
+# tolerate a block the committing backend ALREADY holds pinned.  A concurrent
+# pgbench UPDATE burst exercises exactly that; the pre-fix code used
+# PinBuffer_Locked (asserts a first-time pin) and crashed the whole
+# postmaster.  Single-node burst isolates the stamp path (no cross-node read
+# boundary).  Assertion: node0 stays UP after the burst.
+# ============================================================
+{
+	my $PGBENCH  = $ENV{PGBENCH} // 'pgbench';
+	my $conn     = "-h '" . $node0->host . "' -p " . $node0->port . ' postgres';
+	my $sfile    = "/tmp/g339_burst_$$.sql";
+	open my $sf, '>', $sfile;
+	print $sf "\\set id random(1, 2)\nUPDATE g_t SET v = v + 1 WHERE id = :id;\n";
+	close $sf;
+	`$PGBENCH -n -N -c 4 -T 4 -f $sfile $conn 2>&1`;
+	unlink $sfile;
+	ok($node0->safe_psql('postgres', 'SELECT 1') eq '1',
+		'L5 no-crash: node0 survives a concurrent DATA-write burst with '
+		. 'block_self_contained on (PinBuffer_Locked regression)');
+}
+
 $pair->stop_pair if $pair->can('stop_pair');
 done_testing();

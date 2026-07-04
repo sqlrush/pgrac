@@ -6657,8 +6657,17 @@ cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forkn
 	/* Pin under the header spinlock, then drop the partition lock (the pin
 	 * keeps the identity stable), and take the content lock EXCLUSIVE for the
 	 * GenericXLog stamp mutation. */
-	LockBufHdr(buf);
-	PinBuffer_Locked(buf);		/* releases the header spinlock */
+	/*
+	 * PGRAC: spec-6.12g bugfix — PinBuffer (NOT PinBuffer_Locked) because the
+	 * committing backend may ALREADY hold a pin on this block (a same-txn DML
+	 * that has not yet released it).  PinBuffer_Locked asserts a first-time
+	 * pin (Assert(GetPrivateRefCountEntry(...) == NULL)) and crashes the whole
+	 * postmaster under concurrent write load; PinBuffer handles the
+	 * already-pinned case (bumps the existing private refcount).  The standard
+	 * buffer-hit path (BufferAlloc) pins the same way while holding the
+	 * partition lock, so this is a legal call sequence.
+	 */
+	(void)PinBuffer(buf, NULL);
 	LWLockRelease(partition_lock);
 
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
