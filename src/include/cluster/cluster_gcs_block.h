@@ -312,8 +312,7 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_
 static inline bool
 GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
 {
-	return status == GCS_BLOCK_REPLY_GRANTED
-		   || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+	return status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
 }
 

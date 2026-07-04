@@ -91,8 +91,7 @@ typedef struct ClusterICSge {
  */
 #define CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP 32
 #define CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES 84
-#define CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES \
-	(CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES + BLCKSZ)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES (CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES + BLCKSZ)
 #define CLUSTER_IC_RDMA_BLOCK_REPLY_MAX_RECV_SGE 2
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_RECV UINT64CONST(0x5400000000000000)
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_MASK UINT64CONST(0xFF00000000000000)
@@ -100,7 +99,7 @@ typedef struct ClusterICSge {
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_MASK UINT64CONST(0x00FFFFFF)
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_GENERATION_SHIFT 16
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK UINT64CONST(0xFFFF)
-#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES \
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES                                                \
 	(CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK + UINT64CONST(1))
 
 static inline uint32
@@ -251,11 +250,11 @@ extern bool cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void
 extern ClusterICSendResult cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 															 const ClusterICSge *payload_sge,
 															 int n_sge, uint32 payload_len);
-extern bool cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id,
-												  uint32 generation, void *target_addr,
-												  uint32 target_lkey);
-extern ClusterICSendResult cluster_ic_rdma_send_block_reply_direct(
-	int32 dest_node_id, const ClusterICSge *payload_sge, int n_sge, uint32 payload_len);
+extern bool cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 generation,
+												  void *target_addr, uint32 target_lkey);
+extern ClusterICSendResult cluster_ic_rdma_send_block_reply_direct(int32 dest_node_id,
+																   const ClusterICSge *payload_sge,
+																   int n_sge, uint32 payload_len);
 extern void cluster_ic_rdma_block_reply_abort_peer(int32 peer_id, const char *reason);
 
 extern Datum cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS);

@@ -440,8 +440,8 @@ UT_TEST(test_direct_land_wr_id_round_trip_rejects_wrong_type)
 	UT_ASSERT(cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &peer, &arm, &generation));
 	UT_ASSERT_EQ((int)generation, 1);
 
-	UT_ASSERT(!cluster_ic_rdma_direct_land_decode_wr_id(UINT64CONST(0x5100000000000000),
-														&peer, &arm, &generation));
+	UT_ASSERT(!cluster_ic_rdma_direct_land_decode_wr_id(UINT64CONST(0x5100000000000000), &peer,
+														&arm, &generation));
 }
 
 
@@ -472,9 +472,9 @@ UT_TEST(test_direct_land_success_status_whitelist)
 	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
 	UT_ASSERT(
 		GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE));
+	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER));
 	UT_ASSERT(
-		!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER));
-	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK));
+		!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK));
 	UT_ASSERT(
 		!GcsBlockReplyStatusAllowsDirectLandInstall(GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER));
 }
@@ -491,8 +491,8 @@ UT_TEST(test_direct_land_no_forward_denial_identity_policy)
 		GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_DENIED_DEDUP_FULL));
 	UT_ASSERT(GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
 		GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER));
-	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
-		GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
+	UT_ASSERT(
+		!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER));
 	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(
 		GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE));
 	UT_ASSERT(!GcsBlockReplyStatusAllowsDirectLandNoForwardIdentity(

@@ -94,8 +94,7 @@
  *	backend slot without scanning all backends.
  * ============================================================ */
 
-#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND \
-	CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
+#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
@@ -271,11 +270,11 @@ static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *
 								 GcsBlockReplyStatus status, XLogRecPtr page_lsn,
 								 const char *block_data);
 static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
-									  XLogRecPtr *out_page_lsn, char *copy_buf,
-									  const char **out_block_payload, uint32 *out_block_lkey,
-									  ClusterICSgeReleaseCallback *out_release_cb,
-									  void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
-									  bool *out_sf_dep_valid);
+									 XLogRecPtr *out_page_lsn, char *copy_buf,
+									 const char **out_block_payload, uint32 *out_block_lkey,
+									 ClusterICSgeReleaseCallback *out_release_cb,
+									 void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
+									 bool *out_sf_dep_valid);
 static void gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *release_arg);
 static uint32 gcs_block_compute_checksum(const char *block_data);
 static uint32 gcs_block_compute_invalidate_checksum(const GcsBlockInvalidatePayload *inv);
@@ -815,8 +814,8 @@ gcs_block_try_send_direct_reply(int32 dest_node, bool direct_armed, GcsBlockRepl
 		if (release_cb != NULL)
 			release_cb(release_arg);
 	} else
-		rc = gcs_block_send_direct_reply_sge(dest_node, hdr, block_payload, block_lkey,
-											 release_cb, release_arg);
+		rc = gcs_block_send_direct_reply_sge(dest_node, hdr, block_payload, block_lkey, release_cb,
+											 release_arg);
 
 	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
@@ -825,10 +824,10 @@ gcs_block_try_send_direct_reply(int32 dest_node, bool direct_armed, GcsBlockRepl
 
 static bool
 gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
-						 XLogRecPtr *out_page_lsn, char *copy_buf,
-						 const char **out_block_payload, uint32 *out_block_lkey,
-						 ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg,
-						 ClusterSfDepVec *out_sf_dep_vec, bool *out_sf_dep_valid)
+						 XLogRecPtr *out_page_lsn, char *copy_buf, const char **out_block_payload,
+						 uint32 *out_block_lkey, ClusterICSgeReleaseCallback *out_release_cb,
+						 void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
+						 bool *out_sf_dep_valid)
 {
 	void *scratch = NULL;
 	uint32 scratch_lkey = 0;
@@ -849,15 +848,17 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 		cluster_sf_dep_vec_reset(out_sf_dep_vec);
 
 	smart_fusion_reply = cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(dest_node);
-	rdma_sge_supported = cluster_ic_rdma_block_sge_supported(NULL)
-						 && cluster_ic_mux_peer_transport(dest_node) == CLUSTER_IC_PEER_TRANSPORT_RDMA;
+	rdma_sge_supported
+		= cluster_ic_rdma_block_sge_supported(NULL)
+		  && cluster_ic_mux_peer_transport(dest_node) == CLUSTER_IC_PEER_TRANSPORT_RDMA;
 
 	if (allow_live_sge && !smart_fusion_reply && rdma_sge_supported) {
 		void *live_page = NULL;
 		BufferDesc *live_buf = NULL;
 		uint32 live_lkey = 0;
 
-		if (cluster_bufmgr_borrow_block_for_gcs_live_sge(tag, out_page_lsn, &live_page, &live_buf)) {
+		if (cluster_bufmgr_borrow_block_for_gcs_live_sge(tag, out_page_lsn, &live_page,
+														 &live_buf)) {
 			if (cluster_ic_rdma_shared_buffers_sge(live_page, GCS_BLOCK_DATA_SIZE, &live_lkey)) {
 				*out_block_payload = (const char *)live_page;
 				if (out_block_lkey != NULL)
@@ -1493,8 +1494,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						long timeout_ms;
 
 						LWLockAcquire(&blk->lock.lock, LW_SHARED);
-						abort_done = !slot->in_use
-									 || slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+						abort_done = !slot->in_use || slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
 									 || slot->direct_state == GCS_BLOCK_DIRECT_UNARMED;
 						LWLockRelease(&blk->lock.lock);
 						if (abort_done)
@@ -1545,10 +1545,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 
 				LWLockAcquire(&blk->lock.lock, LW_SHARED);
-				direct_authoritative_denial = slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
-											  && slot->direct_abort_reason
-													 == GCS_BLOCK_DIRECT_ABORT_BAD_STATUS
-											  && slot->reply_received;
+				direct_authoritative_denial
+					= slot->direct_state == GCS_BLOCK_DIRECT_ABORTED
+					  && slot->direct_abort_reason == GCS_BLOCK_DIRECT_ABORT_BAD_STATUS
+					  && slot->reply_received;
 				LWLockRelease(&blk->lock.lock);
 			}
 
@@ -3867,15 +3867,14 @@ build_and_send_reply: {
 
 	{
 		ClusterICSendResult send_rc;
-		bool live_sge_payload = has_block_payload
-								&& block_payload_release_cb == gcs_block_release_live_sge;
+		bool live_sge_payload
+			= has_block_payload && block_payload_release_cb == gcs_block_release_live_sge;
 
 		if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
-			(void)gcs_block_try_send_direct_reply(req->sender_node, true, hdr,
-												  has_block_payload ? block_payload : NULL,
-												  has_block_payload ? block_payload_lkey : 0,
-												  block_payload_release_cb,
-												  block_payload_release_arg);
+			(void)gcs_block_try_send_direct_reply(
+				req->sender_node, true, hdr, has_block_payload ? block_payload : NULL,
+				has_block_payload ? block_payload_lkey : 0, block_payload_release_cb,
+				block_payload_release_arg);
 			block_payload_release_cb = NULL;
 			block_payload_release_arg = NULL;
 			pfree(buf);
@@ -3979,8 +3978,8 @@ cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req, int
 
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 	if (slot->in_use && slot->request_id == req->request_id
-		&& slot->direct_state == GCS_BLOCK_DIRECT_ARMING
-		&& slot->direct_generation == generation && slot->direct_arm_id == arm_id) {
+		&& slot->direct_state == GCS_BLOCK_DIRECT_ARMING && slot->direct_generation == generation
+		&& slot->direct_arm_id == arm_id) {
 		if (posted) {
 			slot->direct_state = GCS_BLOCK_DIRECT_ARMED;
 			GcsBlockRequestPayloadSetDirectLandArmed(req, true);
@@ -4008,8 +4007,7 @@ cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req, int
 }
 
 static void
-gcs_block_direct_fail_slot(ClusterGcsBlockBackendBlock *blk,
-						   ClusterGcsBlockOutstandingSlot *slot,
+gcs_block_direct_fail_slot(ClusterGcsBlockBackendBlock *blk, ClusterGcsBlockOutstandingSlot *slot,
 						   ClusterGcsBlockDirectAbortReason reason, bool authoritative_denial,
 						   const GcsBlockReplyHeader *hdr)
 {
@@ -4063,8 +4061,8 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 	int32 fwd_master;
 
 	if (!cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &wr_peer, &arm_id, &generation)
-		|| (int32)wr_peer != peer_node || !gcs_block_direct_decode_arm_id(arm_id, &backend_idx,
-																		  &slot_idx))
+		|| (int32)wr_peer != peer_node
+		|| !gcs_block_direct_decode_arm_id(arm_id, &backend_idx, &slot_idx))
 		return;
 
 	blk = &gcs_block_backend_blocks[backend_idx];
@@ -4091,8 +4089,7 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 	page = slot->direct_target_addr;
 	if (page == NULL || env->magic != PGRAC_IC_ENVELOPE_MAGIC
 		|| env->version != PGRAC_IC_ENVELOPE_VERSION_V1
-		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
-		|| (int32)env->source_node_id != peer_node
+		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY || (int32)env->source_node_id != peer_node
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_SIDECAR, false, NULL);
@@ -4109,8 +4106,7 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 	fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
 	identity_ok = hdr->request_id == slot->request_id
 				  && hdr->requester_backend_id == backend_idx + 1
-				  && hdr->transition_id == slot->transition_id
-				  && hdr->epoch >= slot->request_epoch
+				  && hdr->transition_id == slot->transition_id && hdr->epoch >= slot->request_epoch
 				  && hdr->sender_node == peer_node;
 	if (identity_ok) {
 		if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
@@ -4741,10 +4737,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	}
 
 	if (GcsBlockForwardPayloadIsDirectLandArmed(fwd)) {
-		(void)gcs_block_try_send_direct_reply(
-			fwd->original_requester_node, true, hdr, holder_ship_ok ? block_payload : NULL,
-			holder_ship_ok ? block_payload_lkey : 0, block_payload_release_cb,
-			block_payload_release_arg);
+		(void)gcs_block_try_send_direct_reply(fwd->original_requester_node, true, hdr,
+											  holder_ship_ok ? block_payload : NULL,
+											  holder_ship_ok ? block_payload_lkey : 0,
+											  block_payload_release_cb, block_payload_release_arg);
 		if (hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
 			cluster_xp_end(&xp_fwd_ship);
 		block_payload_release_cb = NULL;

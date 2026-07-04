@@ -497,8 +497,8 @@ cluster_grd_outbound_lmon_drain_send(void)
 
 		if (slot.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 			&& slot.payload_len == sizeof(GcsBlockRequestPayload))
-			cluster_gcs_block_lmon_prepare_outbound_request(
-				(GcsBlockRequestPayload *)slot.payload, (int32)slot.dest_node_id);
+			cluster_gcs_block_lmon_prepare_outbound_request((GcsBlockRequestPayload *)slot.payload,
+															(int32)slot.dest_node_id);
 
 		rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
 									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);

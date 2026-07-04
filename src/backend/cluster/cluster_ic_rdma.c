@@ -248,8 +248,7 @@ rdma_valid_peer_id(int32 peer_id)
 	return peer_id >= 0 && peer_id < CLUSTER_MAX_NODES;
 }
 
-static uint32
-rdma_block_reply_arm_capacity(void) pg_attribute_unused();
+static uint32 rdma_block_reply_arm_capacity(void) pg_attribute_unused();
 
 static uint32
 rdma_block_reply_arm_capacity(void)
@@ -895,9 +894,8 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 		rdma_peer_release_buffers(peer);
 		return false;
 	}
-	peer->block_reply_send_mr
-		= ibv_reg_mr(RdmaCtx.pd, peer->block_reply_send_buf, peer->block_reply_send_buf_len,
-					 IBV_ACCESS_LOCAL_WRITE);
+	peer->block_reply_send_mr = ibv_reg_mr(RdmaCtx.pd, peer->block_reply_send_buf,
+										   peer->block_reply_send_buf_len, IBV_ACCESS_LOCAL_WRITE);
 	if (peer->block_reply_send_mr == NULL) {
 		RdmaUnavailableReason = "ibv_reg_mr(RDMA block-reply send buffer) failed";
 		rdma_peer_release_buffers(peer);
@@ -1082,7 +1080,7 @@ rdma_peer_inline_eligible(size_t frame_len)
 	if (frame_len > PG_UINT32_MAX)
 		return false;
 	return cluster_ic_rdma_payload_inline_eligible((uint32)frame_len,
-												  cluster_interconnect_rdma_inline_max);
+												   cluster_interconnect_rdma_inline_max);
 }
 
 static bool
@@ -1091,8 +1089,8 @@ rdma_peer_next_send_signaled(ClusterICRdmaPeer *peer, bool inline_send)
 	if (peer == NULL || !inline_send)
 		return true;
 	if (peer->signal_batch_k == 0)
-		peer->signal_batch_k = cluster_ic_rdma_signal_batch_k(
-			(uint32)cluster_interconnect_rdma_max_send_wr);
+		peer->signal_batch_k
+			= cluster_ic_rdma_signal_batch_k((uint32)cluster_interconnect_rdma_max_send_wr);
 
 	peer->wr_since_signal++;
 	if (peer->wr_since_signal >= peer->signal_batch_k) {
@@ -1237,8 +1235,8 @@ rdma_create_cm_qp(ClusterICRdmaPeer *peer, uint8 lane_type)
 	attr.cap.max_recv_wr = cluster_interconnect_rdma_max_send_wr;
 	attr.cap.max_send_sge = CLUSTER_IC_RDMA_MAX_SGE + 1;
 	attr.cap.max_recv_sge = lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY
-								 ? CLUSTER_IC_RDMA_BLOCK_REPLY_MAX_RECV_SGE
-								 : 1;
+								? CLUSTER_IC_RDMA_BLOCK_REPLY_MAX_RECV_SGE
+								: 1;
 	attr.cap.max_inline_data = cluster_interconnect_rdma_inline_max;
 
 	if (rdma_create_qp(id, RdmaCtx.pd, &attr) != 0) {
@@ -1263,8 +1261,8 @@ rdma_post_peer_recv(ClusterICRdmaPeer *peer)
 	sge.len = peer->recv_buf_len;
 	sge.lkey = peer->recv_mr->lkey;
 	return RdmaProvider != NULL
-		   && RdmaProvider->post_recv(
-			   &peer->qp, &sge, 1, rdma_make_wr_id(CLUSTER_IC_RDMA_WR_TYPE_RECV, peer->peer_id));
+		   && RdmaProvider->post_recv(&peer->qp, &sge, 1,
+									  rdma_make_wr_id(CLUSTER_IC_RDMA_WR_TYPE_RECV, peer->peer_id));
 }
 
 static bool
@@ -1288,9 +1286,10 @@ rdma_prepare_peer_for_connect(int32 peer_id, struct rdma_cm_id *id, bool active_
 		rdma_cm_id_set_peer_lane(id, peer_id, lane_type);
 
 		if (!rdma_create_cm_qp(peer, lane_type) || !rdma_peer_ensure_buffers(peer)) {
-			rdma_stats_note_block_reply_error(
-				peer_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
-														: "RDMA block-reply lane preparation failed");
+			rdma_stats_note_block_reply_error(peer_id,
+											  RdmaUnavailableReason != NULL
+												  ? RdmaUnavailableReason
+												  : "RDMA block-reply lane preparation failed");
 			return false;
 		}
 		stats = rdma_peer_stats(peer_id);
@@ -1423,8 +1422,8 @@ rdma_start_active_connect_one(int32 peer_id, uint8 lane_type)
 		return;
 	if (!rdma_peer_addr(peer_id, &addr, &reason)) {
 		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
-			rdma_stats_note_block_reply_error(peer_id,
-											  reason != NULL ? reason : "RDMA peer address unavailable");
+			rdma_stats_note_block_reply_error(
+				peer_id, reason != NULL ? reason : "RDMA peer address unavailable");
 		else
 			rdma_peer_fail_or_fallback(peer_id, reason);
 		return;
@@ -1690,9 +1689,10 @@ rdma_peer_post_sge(int32 peer_id, const ClusterICEnvelope *env, const ClusterICS
 			rdma_peer_release_pending_send(peer);
 			for (j = 0; j < release_count; j++) {
 				if (!rdma_peer_add_pending_release(peer, release_cb[j], release_arg[j]))
-					ereport(FATAL, (errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
-									errmsg("RDMA SEND posted but release callback table is full"),
-									errdetail("peer_id=%d, release_count=%d", peer_id, release_count)));
+					ereport(FATAL,
+							(errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+							 errmsg("RDMA SEND posted but release callback table is full"),
+							 errdetail("peer_id=%d, release_count=%d", peer_id, release_count)));
 			}
 		}
 		peer->send_busy = !inline_send;
@@ -2352,8 +2352,7 @@ cluster_ic_rdma_block_reply_lane_connected(int32 peer_id, const char **reason)
 		return false;
 	}
 	stats = rdma_peer_stats(peer_id);
-	if (stats != NULL
-		&& stats->block_reply_lane_state == CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED)
+	if (stats != NULL && stats->block_reply_lane_state == CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED)
 		return true;
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	ClusterICRdmaPeer *peer;
@@ -2381,8 +2380,7 @@ cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 gener
 		return false;
 	peer = &RdmaPeers[peer_id];
 	if (!peer->block_reply_connected || peer->block_reply_qp.qp == NULL
-		|| peer->block_reply_sidecar_buf == NULL || peer->block_reply_sidecar_mr == NULL)
-	{
+		|| peer->block_reply_sidecar_buf == NULL || peer->block_reply_sidecar_mr == NULL) {
 		rdma_stats_note_block_reply_fallback(peer_id, "RDMA block-reply lane is not connected");
 		return false;
 	}
@@ -2404,9 +2402,9 @@ cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 gener
 	wr_id = cluster_ic_rdma_direct_land_make_wr_id((uint32)peer_id, arm_id, generation);
 
 	if (!RdmaProvider->post_recv(&peer->block_reply_qp, sge, lengthof(sge), wr_id)) {
-		rdma_stats_note_block_reply_fallback(
-			peer_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
-													: "RDMA block-reply post_recv failed");
+		rdma_stats_note_block_reply_fallback(peer_id, RdmaUnavailableReason != NULL
+														  ? RdmaUnavailableReason
+														  : "RDMA block-reply post_recv failed");
 		return false;
 	}
 	return true;
@@ -2459,8 +2457,7 @@ cluster_ic_rdma_send_block_reply_direct(int32 dest_node_id, const ClusterICSge *
 		peer = &RdmaPeers[dest_node_id];
 		if (!peer->block_reply_connected || peer->block_reply_send_busy
 			|| peer->block_reply_qp.qp == NULL || peer->block_reply_send_buf == NULL
-			|| peer->block_reply_send_mr == NULL)
-		{
+			|| peer->block_reply_send_mr == NULL) {
 			rdma_stats_note_block_reply_error(dest_node_id,
 											  "RDMA block-reply lane cannot send direct reply");
 			rdma_release_sge_callbacks(payload_sge, n_sge);
@@ -2545,19 +2542,19 @@ cluster_ic_rdma_send_block_reply_direct(int32 dest_node_id, const ClusterICSge *
 
 			rdma_peer_release_block_reply_pending_send(peer);
 			for (j = 0; j < release_count; j++) {
-				if (!rdma_peer_add_block_reply_pending_release(peer, release_cb[j],
-															   release_arg[j]))
-					ereport(FATAL, (errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
-									errmsg("RDMA block-reply SEND posted but release table is full"),
-									errdetail("peer_id=%d", dest_node_id)));
+				if (!rdma_peer_add_block_reply_pending_release(peer, release_cb[j], release_arg[j]))
+					ereport(FATAL,
+							(errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+							 errmsg("RDMA block-reply SEND posted but release table is full"),
+							 errdetail("peer_id=%d", dest_node_id)));
 			}
 			peer->block_reply_send_busy = true;
 			cluster_ic_rdma_stats_note_send(dest_node_id, sizeof(env) + payload_len, true);
 			return CLUSTER_IC_SEND_DONE;
 		}
-		rdma_stats_note_block_reply_error(
-			dest_node_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
-														: "RDMA block-reply post_send failed");
+		rdma_stats_note_block_reply_error(dest_node_id, RdmaUnavailableReason != NULL
+															? RdmaUnavailableReason
+															: "RDMA block-reply post_send failed");
 		rdma_release_sge_callbacks(payload_sge, n_sge);
 		return rc;
 	}
@@ -2575,8 +2572,7 @@ cluster_ic_rdma_block_reply_abort_peer(int32 peer_id, const char *reason)
 {
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	rdma_peer_close_block_reply_lane(peer_id,
-									 reason != NULL ? reason : "RDMA block-reply lane abort",
-									 true);
+									 reason != NULL ? reason : "RDMA block-reply lane abort", true);
 #else
 	(void)peer_id;
 	(void)reason;
@@ -2681,8 +2677,7 @@ cluster_ic_rdma_lmon_start(void)
 
 	arm_capacity = rdma_block_reply_arm_capacity();
 	if (!cluster_ic_rdma_direct_land_arm_capacity_valid(arm_capacity)) {
-		rdma_lmon_report_start_failure(
-			"RDMA block-reply arm capacity exceeds 16-bit wr_id field");
+		rdma_lmon_report_start_failure("RDMA block-reply arm capacity exceeds 16-bit wr_id field");
 		return;
 	}
 
@@ -2698,16 +2693,15 @@ cluster_ic_rdma_lmon_start(void)
 
 		if (!rdma_mlx5_context_available(&RdmaCtx, &mlx5_reason)) {
 			if (cluster_interconnect_rdma_fallback == CLUSTER_IC_RDMA_FALLBACK_OFF)
-				ereport(FATAL,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("tier3/mlx5 RDMA direct verbs are unavailable on this device"),
-						 errdetail("%s",
-								   mlx5_reason != NULL ? mlx5_reason : "mlx5dv probe failed")));
+				ereport(
+					FATAL,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("tier3/mlx5 RDMA direct verbs are unavailable on this device"),
+					 errdetail("%s", mlx5_reason != NULL ? mlx5_reason : "mlx5dv probe failed")));
 			ereport(LOG,
 					(errmsg("tier3/mlx5 RDMA direct verbs unavailable on this device; "
 							"using generic verbs"),
-					 errdetail("%s",
-							   mlx5_reason != NULL ? mlx5_reason : "mlx5dv probe failed")));
+					 errdetail("%s", mlx5_reason != NULL ? mlx5_reason : "mlx5dv probe failed")));
 			RdmaProvider = &ClusterICRdmaProvider_Verbs;
 		}
 	}
@@ -2831,16 +2825,15 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply CM event error", true);
 			else
 				rdma_peer_fail_or_fallback(peer_id, "RDMA CM event error");
-		}
-		else
+		} else
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16", "RDMA CM event error");
 		return;
 	}
 
 	switch (event_type) {
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		if (!rdma_verify_private_hello(private_data, private_data_len, -1,
-									   CLUSTER_IC_RDMA_LANE_ANY, &peer_id, &lane_type, &reason)) {
+		if (!rdma_verify_private_hello(private_data, private_data_len, -1, CLUSTER_IC_RDMA_LANE_ANY,
+									   &peer_id, &lane_type, &reason)) {
 			rdma_reject(id, NULL, 0);
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "08P01",
 											 reason != NULL ? reason : "RDMA HELLO rejected");
@@ -2866,8 +2859,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 			|| rdma_accept(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
 			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
-				rdma_peer_close_block_reply_lane(peer_id, "rdma_accept(block-reply) failed",
-												 true);
+				rdma_peer_close_block_reply_lane(peer_id, "rdma_accept(block-reply) failed", true);
 			else
 				rdma_peer_fail_or_fallback(peer_id, "rdma_accept failed");
 			return;
@@ -2894,16 +2886,16 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 														? RdmaUnavailableReason
 														: "RDMA active preparation failed");
 			return;
-			}
-			if (rdma_resolve_route(id, cluster_interconnect_connect_timeout_ms) != 0) {
-				rdma_ack_cm_event(event);
-				if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
-					rdma_peer_close_block_reply_lane(peer_id,
-													 "rdma_resolve_route(block-reply) failed", true);
-				else
-					rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_route failed");
-				return;
-			}
+		}
+		if (rdma_resolve_route(id, cluster_interconnect_connect_timeout_ms) != 0) {
+			rdma_ack_cm_event(event);
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "rdma_resolve_route(block-reply) failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_route failed");
+			return;
+		}
 		break;
 
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
@@ -2917,8 +2909,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 			|| rdma_connect(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
 			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
-				rdma_peer_close_block_reply_lane(peer_id, "rdma_connect(block-reply) failed",
-												 true);
+				rdma_peer_close_block_reply_lane(peer_id, "rdma_connect(block-reply) failed", true);
 			else
 				rdma_peer_fail_or_fallback(peer_id, "rdma_connect failed");
 			return;
@@ -2933,17 +2924,15 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 		if (!rdma_verify_private_hello(private_data, private_data_len, expected_peer, lane_type,
 									   &verified_peer, &verified_lane, &reason)) {
 			rdma_ack_cm_event(event);
-			if (rdma_valid_peer_id(expected_peer))
-			{
+			if (rdma_valid_peer_id(expected_peer)) {
 				if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
 					rdma_peer_close_block_reply_lane(
-						expected_peer, reason != NULL ? reason : "RDMA block-reply HELLO verify failed",
-						true);
+						expected_peer,
+						reason != NULL ? reason : "RDMA block-reply HELLO verify failed", true);
 				else
 					rdma_peer_fail_or_fallback(
 						expected_peer, reason != NULL ? reason : "RDMA HELLO verify failed");
-			}
-			else
+			} else
 				cluster_ic_rdma_stats_note_error(
 					cluster_node_id, "08P01", reason != NULL ? reason : "RDMA HELLO verify failed");
 			return;
@@ -2970,12 +2959,10 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 		rdma_ack_cm_event(event);
 		if (rdma_valid_peer_id(peer_id)) {
 			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
-				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply CM event failed",
-												 true);
+				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply CM event failed", true);
 			else
 				rdma_peer_fail_or_fallback(peer_id, "RDMA CM connection event failed");
-		}
-		else
+		} else
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16",
 											 "RDMA CM connection event failed");
 		return;
@@ -3070,8 +3057,8 @@ rdma_process_polled_completions(ClusterICWc *wc, int n)
 				&& RdmaPeers[peer_id].block_reply_sidecar_buf != NULL)
 				sidecar = RdmaPeers[peer_id].block_reply_sidecar_buf
 						  + ((size_t)arm_id * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES);
-			cluster_gcs_block_lmon_handle_direct_land_completion(
-				peer_id, wc[i].wc.wr_id, true, wc[i].wc.byte_len, sidecar);
+			cluster_gcs_block_lmon_handle_direct_land_completion(peer_id, wc[i].wc.wr_id, true,
+																 wc[i].wc.byte_len, sidecar);
 #endif
 		}
 	}
@@ -3376,8 +3363,9 @@ rdma_tier_init(void)
 					 errdetail("%s", mlx5_reason != NULL ? mlx5_reason : "mlx5dv is unavailable"),
 					 errhint("Rebuild --with-rdma with libmlx5/mlx5dv support or set "
 							 "cluster.interconnect_rdma_fallback=auto.")));
-		ereport(LOG, (errmsg("tier3/mlx5 RDMA direct verbs unavailable; using generic verbs"),
-					  errdetail("%s", mlx5_reason != NULL ? mlx5_reason : "mlx5dv is unavailable")));
+		ereport(LOG,
+				(errmsg("tier3/mlx5 RDMA direct verbs unavailable; using generic verbs"),
+				 errdetail("%s", mlx5_reason != NULL ? mlx5_reason : "mlx5dv is unavailable")));
 	}
 
 	if ((ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
@@ -3599,8 +3587,8 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 			values[18] = Int64GetDatum((int64)unsignaled_batch_count);
 			values[19] = Int64GetDatum((int64)busypoll_us_burned);
 			values[20] = Int64GetDatum((int64)busypoll_fallback_count);
-			values[21] = CStringGetTextDatum(
-				rdma_block_reply_lane_state_name(block_reply_lane_state));
+			values[21]
+				= CStringGetTextDatum(rdma_block_reply_lane_state_name(block_reply_lane_state));
 			values[22] = Int64GetDatum(
 				p != NULL ? (int64)pg_atomic_read_u64(&p->block_reply_lane_fallback_count) : 0);
 			values[23] = Int64GetDatum(
