@@ -59,6 +59,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_scn.h"
 #include "storage/buf_internals.h" /* BufferTag */
 
@@ -97,19 +98,35 @@ typedef enum ClusterLmsCrSlotState {
 	CLUSTER_LMS_CR_READY = 3
 } ClusterLmsCrSlotState;
 
+/* Work-slot request kind (spec-6.12i extends the wave-b CR-only table). */
+typedef enum ClusterLmsCrSlotKind {
+	CLUSTER_LMS_SLOT_KIND_CR = 0,		 /* spec-6.12b CR construction */
+	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1 /* spec-6.12i undo-TT block fetch */
+} ClusterLmsCrSlotKind;
+
 typedef struct ClusterLmsCrSlot {
-	pg_atomic_uint32 state;	  /* ClusterLmsCrSlotState */
-	BufferTag tag;			  /* block identity */
-	SCN read_scn;			  /* requester snapshot */
-	uint64 request_id;		  /* echo for the reply slot match */
-	uint64 epoch;			  /* HC73 freshness echo */
-	int32 requester_node;	  /* direct-ship destination */
-	int32 requester_backend;  /* HC80 compound key echo */
-	int32 reply_master_node;  /* HC109 forwarding_master echo (== requester) */
-	uint8 transition_id;	  /* echo (N->S) for the reply slot match */
-	uint8 result_status;	  /* GcsBlockReplyStatus: CR_RESULT_FULL /
-							   * CR_RESULT_PARTIAL / DENIED_MASTER_NOT_HOLDER */
-	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL) */
+	pg_atomic_uint32 state;	 /* ClusterLmsCrSlotState */
+	BufferTag tag;			 /* block identity */
+	SCN read_scn;			 /* requester snapshot */
+	uint64 request_id;		 /* echo for the reply slot match */
+	uint64 epoch;			 /* HC73 freshness echo */
+	int32 requester_node;	 /* direct-ship destination */
+	int32 requester_backend; /* HC80 compound key echo */
+	int32 reply_master_node; /* HC109 forwarding_master echo (== requester) */
+	uint8 transition_id;	 /* echo (N->S) for the reply slot match */
+	uint8 result_status;	 /* GcsBlockReplyStatus: CR_RESULT_FULL /
+							   * CR_RESULT_PARTIAL / UNDO_TT_FETCH_RESULT /
+							   * DENIED_MASTER_NOT_HOLDER */
+	uint8 req_kind;			 /* ClusterLmsCrSlotKind (spec-6.12i) */
+	/* spec-6.12i D-i1: undo address decoded from the synthetic tag at submit
+	 * time, and the LMS-co-sampled live authority triple the ship path copies
+	 * into the reply (epoch -> hdr.epoch, live_hwm -> hdr.page_lsn,
+	 * tt_generation -> trailer).  Meaningful only for KIND_UNDO_FETCH. */
+	uint32 undo_segment_id;
+	uint32 undo_block_no;
+	ClusterLiveAuthority undo_auth;
+	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL) or
+							   * the fetched undo header block (UNDO_FETCH) */
 } ClusterLmsCrSlot;
 
 /* CR-server counter buckets (bumped into the ClusterCRShared region owned
@@ -117,7 +134,9 @@ typedef struct ClusterLmsCrSlot {
 typedef enum ClusterCrServerStat {
 	CLUSTER_CR_SERVER_STAT_FULL = 0,
 	CLUSTER_CR_SERVER_STAT_PARTIAL = 1,
-	CLUSTER_CR_SERVER_STAT_DENIED = 2
+	CLUSTER_CR_SERVER_STAT_DENIED = 2,
+	CLUSTER_CR_SERVER_STAT_UNDO_SERVED = 3, /* spec-6.12i D-i1 origin serve */
+	CLUSTER_CR_SERVER_STAT_UNDO_DENIED = 4	/* spec-6.12i D-i1 origin refuse */
 } ClusterCrServerStat;
 
 extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
@@ -140,6 +159,12 @@ extern void cluster_cr_server_publish_lms_latch(struct Latch *latch);
  * data plane off (caller replies the fail-closed DENIED immediately). */
 extern bool cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd);
 
+/* LMON dispatch side (spec-6.12i D-i1): park a validated undo-TT fetch
+ * request; false = wave GUC off on this node / malformed synthetic tag / no
+ * capacity (caller replies the fail-closed DENIED immediately — the
+ * requester keeps its unchanged 53R97). */
+extern bool cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd);
+
 /* LMS main-loop side: construct every PENDING slot (errors become DENIED
  * results — fail-closed to the requester, never an LMS restart). */
 extern void cluster_lms_cr_drain(void);
@@ -154,6 +179,16 @@ extern void cluster_lms_cr_ship_ready(void);
  * unchanged 53R9G refusal). */
 extern bool cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node,
 												char *dst_page, bool *out_partial);
+
+/* Requester side (backend, spec-6.12i D-i1): fetch origin_node's TT-bearing
+ * undo header block (segment_id, block_no) over the same wire, together with
+ * the co-sampled live authority triple.  On success copies the shipped block
+ * into dst_page, fills *auth_out and returns true; false = fail-closed
+ * (timeout / DENIED / checksum / trailer missing — caller keeps the
+ * unchanged 53R97 refusal, Rule 8.A). */
+extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id,
+													 uint32 block_no, char *dst_page,
+													 ClusterLiveAuthority *auth_out);
 
 #endif /* USE_PGRAC_CLUSTER */
 

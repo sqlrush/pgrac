@@ -230,6 +230,16 @@ extern uint64 cluster_cr_server_full_count(void);
 extern uint64 cluster_cr_server_partial_count(void);
 extern uint64 cluster_cr_server_denied_count(void);
 
+/* spec-6.12i: undo-TT fetch data plane counters + requester-side bumps. */
+extern uint64 cluster_rtvis_undo_fetch_wire_count(void);
+extern uint64 cluster_rtvis_undo_fetch_cache_hit_count(void);
+extern uint64 cluster_rtvis_undo_fetch_failclosed_count(void);
+extern uint64 cluster_cr_server_undo_served_count(void);
+extern uint64 cluster_cr_server_undo_denied_count(void);
+extern void cluster_rtvis_undo_fetch_note_wire(void);
+extern void cluster_rtvis_undo_fetch_note_cache_hit(void);
+extern void cluster_rtvis_undo_fetch_note_failclosed(void);
+
 /* Shmem region register / size / init (L206 5-step). */
 extern Size cluster_cr_shmem_size(void);
 extern void cluster_cr_shmem_init(void);

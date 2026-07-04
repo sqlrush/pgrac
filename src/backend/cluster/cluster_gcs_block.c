@@ -109,6 +109,10 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	bool reply_sf_dep_valid;
 	uint8 reply_sf_flags;
 	ClusterSfDepVec reply_sf_dep_vec;
+	/* PGRAC: spec-6.12i D-i1 — authority trailer parsed off an
+	 * UNDO_TT_FETCH_RESULT reply (epoch / live_hwm ride the header). */
+	bool reply_undo_trailer_valid;
+	uint64 reply_undo_tt_generation;
 	ConditionVariable reply_cv;
 	/* PGRAC: spec-2.34 D3/D4 — HC100 stale-reply defense + epoch invalidation.
 	 *  request_epoch:        snapshot of cluster_epoch at the time the
@@ -295,7 +299,8 @@ static void gcs_block_install_reply_block(BufferDesc *buf, const char *block_dat
 static bool gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
 										   const GcsBlockReplyHeader **out_hdr,
 										   const char **out_block_data, bool *out_sf_dep_valid,
-										   uint8 *out_sf_flags, ClusterSfDepVec *out_sf_dep_vec);
+										   uint8 *out_sf_flags, ClusterSfDepVec *out_sf_dep_vec,
+										   const ClusterGcsUndoAuthTrailer **out_undo_trailer);
 /* PGRAC: spec-2.36 D3 (HC116) — master synchronous broadcast invalidate.
  * Enumerates `holders_bm` (1 bit per cluster node), emits INVALIDATE
  * envelope to each, waits for all INVALIDATE_ACK msg_type 18 within
@@ -2314,6 +2319,139 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_no
 
 
 /*
+ * PGRAC: spec-6.12i D-i1 — requester-side undo-TT fetch.
+ *
+ *	Ask origin_node for its own TT-bearing undo header block (segment_id,
+ *	block_no) plus the co-sampled live authority triple, riding the same
+ *	sub-case B wire shape as the spec-6.12b CR fetch (FORWARD payload direct
+ *	to the serving node; HC108 chain on the direct-shipped reply validates
+ *	forwarding_master == self).  The tag is the SYNTHETIC undo address; the
+ *	origin branches on the undo-fetch flag before any tag interpretation.
+ *
+ *	true  -> dst_page holds the origin-fresh block; *auth_out carries the
+ *	         authority sampled ATOMICALLY with it (hdr.epoch / hdr.page_lsn /
+ *	         trailer tt_generation).
+ *	false -> fail-closed: timeout, DENIED, checksum failure, missing trailer
+ *	         (Rule 8.A — the caller keeps its unchanged 53R97 refusal).  The
+ *	         block is undo METADATA: never installed as current, never
+ *	         flushed.
+ */
+bool
+cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, uint32 block_no,
+										 char *dst_page, ClusterLiveAuthority *auth_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	BufferTag tag;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool fetched = false;
+
+	if (dst_page == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id)
+		return false;
+
+	memset(auth_out, 0, sizeof(*auth_out));
+	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->reply_undo_trailer_valid = false;
+		slot->reply_undo_tt_generation = 0;
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id;
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetUndoTtFetchRequest(&fwd, true);
+
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)origin_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue undo-TT fetch to "
+								   "origin node %d",
+								   (int)origin_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply && slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
+			&& slot->reply_undo_trailer_valid) {
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				memcpy(dst_page, slot->reply_block_data, BLCKSZ);
+				auth_out->origin_epoch = slot->reply_header.epoch;
+				auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
+				auth_out->tt_generation = slot->reply_undo_tt_generation;
+				/* spec-5.14 D2: the authority is the origin's volatile
+				 * co-sample — depend on it for fail-stop (D-i3). */
+				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+				fetched = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
+}
+
+
+/*
  * PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke) + wait.
  *
  *	When THIS node is the GCS master for a block that a REMOTE node holds in X,
@@ -4299,10 +4437,12 @@ static bool
 gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
 							   const GcsBlockReplyHeader **out_hdr, const char **out_block_data,
 							   bool *out_sf_dep_valid, uint8 *out_sf_flags,
-							   ClusterSfDepVec *out_sf_dep_vec)
+							   ClusterSfDepVec *out_sf_dep_vec,
+							   const ClusterGcsUndoAuthTrailer **out_undo_trailer)
 {
 	uint32 v1_size = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
 	uint32 v2_size = (uint32)(sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE);
+	uint32 undo_size = v1_size + (uint32)sizeof(ClusterGcsUndoAuthTrailer);
 
 	if (out_hdr != NULL)
 		*out_hdr = NULL;
@@ -4314,6 +4454,8 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 		*out_sf_flags = 0;
 	if (out_sf_dep_vec != NULL)
 		cluster_sf_dep_vec_reset(out_sf_dep_vec);
+	if (out_undo_trailer != NULL)
+		*out_undo_trailer = NULL;
 
 	if (env == NULL || payload == NULL)
 		return false;
@@ -4323,6 +4465,28 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 			*out_hdr = (const GcsBlockReplyHeader *)payload;
 		if (out_block_data != NULL)
 			*out_block_data = ((const char *)payload) + sizeof(GcsBlockReplyHeader);
+		return true;
+	}
+
+	/*
+	 * PGRAC: spec-6.12i D-i1 — undo-TT fetch reply: v1 header + page + 16B
+	 * authority trailer (8256B; distinct from both the 8240B v1 and the
+	 * 8504B v2 sizes).  Only accepted when the status says so — any other
+	 * status at this size is malformed and dropped.
+	 */
+	if (env->payload_length == undo_size) {
+		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
+
+		if (h->status != (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT)
+			return false;
+		if (out_hdr != NULL)
+			*out_hdr = h;
+		if (out_block_data != NULL)
+			*out_block_data = ((const char *)payload) + sizeof(GcsBlockReplyHeader);
+		if (out_undo_trailer != NULL)
+			*out_undo_trailer = (const ClusterGcsUndoAuthTrailer *)(((const char *)payload)
+																	+ sizeof(GcsBlockReplyHeader)
+																	+ GCS_BLOCK_DATA_SIZE);
 		return true;
 	}
 
@@ -4359,13 +4523,14 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	bool sf_dep_valid = false;
 	uint8 sf_flags = 0;
 	ClusterSfDepVec sf_dep_vec;
+	const ClusterGcsUndoAuthTrailer *undo_trailer = NULL;
 	int backend_idx;
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	if (!gcs_block_decode_reply_payload(env, payload, &hdr, &block_data, &sf_dep_valid, &sf_flags,
-										&sf_dep_vec))
+										&sf_dep_vec, &undo_trailer))
 		return;
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
@@ -4432,6 +4597,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -4449,6 +4615,10 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_sf_dep_valid = sf_dep_valid;
 			slot->reply_sf_flags = sf_flags;
 			slot->reply_sf_dep_vec = sf_dep_vec;
+			slot->reply_undo_trailer_valid = (undo_trailer != NULL);
+			slot->reply_undo_tt_generation
+				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetTtGeneration(undo_trailer)
+										 : 0;
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
 			LWLockRelease(&blk->lock.lock);
@@ -4524,6 +4694,37 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 */
 	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
 		if (!cluster_lms_cr_submit(fwd)) {
+			uint32 deny_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+			char *deny_buf = (char *)palloc0(deny_total);
+			GcsBlockReplyHeader *deny_hdr = (GcsBlockReplyHeader *)deny_buf;
+
+			deny_hdr->request_id = fwd->request_id;
+			deny_hdr->epoch = cluster_epoch_get_current();
+			deny_hdr->sender_node = cluster_node_id;
+			deny_hdr->requester_backend_id = fwd->requester_backend_id;
+			deny_hdr->transition_id = fwd->transition_id;
+			deny_hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+			GcsBlockReplyHeaderSetForwardingMasterNode(deny_hdr, fwd->master_node);
+			deny_hdr->checksum
+				= cluster_gcs_block_compute_checksum(deny_buf + sizeof(GcsBlockReplyHeader));
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+										   fwd->original_requester_node, deny_buf, deny_total);
+			pfree(deny_buf);
+		}
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-6.12i D-i1 — undo-TT fetch request.  Same LMON shape as the
+	 * CR branch above (validate + park only; the undo file read runs in LMS,
+	 * the LMON tick ships).  MUST branch here, before any holder / GRD logic:
+	 * the tag is a synthetic undo address, not a block identity.  A refused
+	 * park (wave GUC off / malformed tag / no free slot) replies the
+	 * fail-closed DENIED immediately so the requester keeps its unchanged
+	 * 53R97 refusal (Rule 8.A).
+	 */
+	if (GcsBlockForwardPayloadIsUndoTtFetchRequest(fwd)) {
+		if (!cluster_lms_undo_fetch_submit(fwd)) {
 			uint32 deny_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
 			char *deny_buf = (char *)palloc0(deny_total);
 			GcsBlockReplyHeader *deny_hdr = (GcsBlockReplyHeader *)deny_buf;

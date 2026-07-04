@@ -1659,6 +1659,32 @@ cluster_cr_server_denied_count(void)
 {
 	return 0;
 }
+/* spec-6.12i: undo-TT fetch data plane counters. */
+uint64
+cluster_rtvis_undo_fetch_wire_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_undo_fetch_cache_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_undo_fetch_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_undo_served_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_undo_denied_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)
