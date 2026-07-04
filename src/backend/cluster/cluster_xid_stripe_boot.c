@@ -803,8 +803,20 @@ cluster_xid_stripe_lazy_latch(void)
 FullTransactionId
 cluster_xid_stripe_my_slot_floor(void)
 {
+	/*
+	 * Process-local cache: the claim precedes gate-open, which precedes
+	 * any allocation, so the first successful read is the final value
+	 * (the per-slot floor is written once and never lowered).  Callers
+	 * run under XidGenLock — caching keeps that hot path free of this
+	 * module's LWLock after the first claimed read.  Never negatively
+	 * cached: until the claim is published we re-read.
+	 */
+	static bool floor_cached = false;
+	static FullTransactionId floor_cache = { 0 };
 	FullTransactionId result = InvalidFullTransactionId;
 
+	if (floor_cached)
+		return floor_cache;
 	if (StripeBootShmem == NULL)
 		return result;
 
@@ -812,6 +824,11 @@ cluster_xid_stripe_my_slot_floor(void)
 	if (StripeBootShmem->my_slot_claimed)
 		result = FullTransactionIdFromU64(StripeBootShmem->my_slot_floor_full);
 	LWLockRelease(&StripeBootShmem->lock);
+
+	if (FullTransactionIdIsValid(result)) {
+		floor_cache = result;
+		floor_cached = true;
+	}
 	return result;
 }
 
