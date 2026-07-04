@@ -246,6 +246,12 @@ jobs:
           # t/202 perf smoke runs in nightly Stage 2 acceptance medium.
           # t/201 fault matrix NOT here (avoid fast-gate inject flake).
           # t/227 Stage 3 workload perf smoke runs pgbench (>30s) -> nightly.
+          # spec-5.20 Hang Manager capability smoke on fast-gate = the D8
+          # cluster_unit static contract (test_cluster_hang_acceptance, runs in
+          # the unit step above, deterministic ms).  The chaos TAP matrix
+          # (t/340-343: 70-conn hang storm / ABA / 2PC / 3+4-node reconfig) is
+          # kept OFF the fast-gate blocking path (L91 minimal scope + storm
+          # flake risk) and runs in the nightly stage5-hang-acceptance shard.
           # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
           # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
           make -C src/test/cluster_tap check \

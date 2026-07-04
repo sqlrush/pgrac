@@ -162,6 +162,25 @@ jobs:
             --out "scripts/perf/results/cr-profile-${{ github.run_id }}.csv" \
             | tee "scripts/perf/results/cr-profile-${{ github.run_id }}.log"
 
+      # spec-5.20 D6: Hang Manager MG-A false-positive rate + MG-B detection/
+      # remediation latency (report-only measure-and-decide).  FP rate < 1% is a
+      # tuning reference, NOT a ship bar; the HG#2 zero-unsafe invariant is the
+      # only hard property (a genuinely-unsafe disposition exits non-zero).
+      # NO-GO / tuning recommendation is a legitimate latency outcome (spec §3.2).
+      # warn-only (perf is never a hard gate, 规则 20.A; Tier-3 weekly/manual).
+      - name: Hang Manager FP-rate + latency (warn-only, Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          mkdir -p scripts/perf/results
+          PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+          PGRAC_RESULTS_DIR=scripts/perf/results \
+          PGRAC_MG_WINDOW="${MG_WINDOW:-20}" \
+          scripts/perf/measure-hang-fp-rate.sh || true
+          PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+          PGRAC_RESULTS_DIR=scripts/perf/results \
+          scripts/perf/measure-hang-latency.sh || true
+
       # spec-6.0a D7: storage I/O report-only matrix.  The default CI leg uses a
       # regular-file raw image with O_DIRECT disabled, so it is a conformance and
       # trend artifact rather than a hardware O_DIRECT claim.

@@ -162,6 +162,12 @@ jobs:
           # O_DIRECT / SCSI-3 PR legs remain external/manual.  (334 is the
           # spec-5.59 profiling TAP and lives in the stage5 shard above.)
           - { name: stage6-storage, ranges: "332-333 335-339", unit: false, regress: false }
+          # spec-5.20 D9: Hang Manager chaos acceptance (detection matrix /
+          # remediation chaos / diagnostic completeness single-node + reconfig
+          # non-interference 3-node ClusterTriple + 4-node ClusterQuad).  Own
+          # shard so the multi-node reconfig leg (t/343) runs in parallel and
+          # does not extend the ges-locking shard wallclock.
+          - { name: stage5-hang-acceptance, ranges: "340-343", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
