@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1237,6 +1238,44 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 		return;
 
 	/*
+	 * spec-6.15 D5b: the xid-stripe face must be resolved before admission
+	 * finalizes — a striping-on node needs the published activation record
+	 * (a running cluster either has one or was never activated; a rejoiner
+	 * never seeds), and a striping-off node must NOT join an activated
+	 * cluster (its unstriped allocator would violate the striped uniqueness
+	 * invariant, 8.A).  Returning here is fail-closed and retried: qvotec
+	 * re-detects the COMMITTED marker every poll, so admission completes on
+	 * a later call once the stripe face resolves; a permanent mismatch runs
+	 * into the join convergence deadline (53R61) with the 53RB1 cause
+	 * logged once below.
+	 */
+	{
+		ClusterXidStripeJoinVerdict sv = cluster_xid_stripe_join_gate(false);
+
+		if (sv != CLUSTER_XID_STRIPE_JOIN_PROCEED) {
+			static bool stripe_admit_logged = false;
+
+			if (!stripe_admit_logged) {
+				stripe_admit_logged = true;
+				if (sv == CLUSTER_XID_STRIPE_JOIN_REFUSE)
+					ereport(LOG,
+							(errcode(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH),
+							 errmsg("cluster xid stripe: refusing to finalize admission of "
+									"node %d — stripe mode handshake mismatch (SQLSTATE 53RB1)",
+									cluster_node_id),
+							 errhint("cluster.xid_striping must match the cluster's durable "
+									 "activation state on every node; repair the voting-disk "
+									 "stripe region if it is corrupt.")));
+				else
+					ereport(LOG, (errmsg("cluster xid stripe: holding admission of node %d until "
+										 "the stripe activation state is resolved",
+										 cluster_node_id)));
+			}
+			return;
+		}
+	}
+
+	/*
 	 * Hardening v1.1 (HF-1 / INV-J9): this is called ONLY after the caller
 	 * (qvotec) has confirmed BOTH a same-commit majority COMMITTED marker (HF-3)
 	 * AND the publish-proof — cluster_reconfig_join_publish_proven — i.e. a
@@ -1375,6 +1414,36 @@ cluster_reconfig_bootstrap_quorum_at_initial(void)
 }
 
 /*
+ * spec-6.15 D5b — is THIS node the deterministic activation-seed candidate?
+ * Lowest declared node that is provably part of the cold-boot formation
+ * (self, or a FRESH-ALIVE co-boot slot at INITIAL — the same evidence the
+ * bootstrap quorum proof counts).  Only the candidate stages the activation
+ * seed, so concurrent bootstrapping nodes do not race to write region 5;
+ * the qvotec adopt-not-overwrite re-scan covers the residual window when
+ * the alive view shifts between ticks.
+ */
+static bool
+cluster_reconfig_self_is_stripe_seed_candidate(void)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 inc = 0;
+		uint64 gen = 0;
+
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (i == cluster_node_id)
+			return true; /* no lower declared node is provably alive */
+		if (cluster_reconfig_get_observed_slot(i, &inc, &gen) && gen > 0
+			&& cluster_reconfig_get_observed_fresh_alive(i)
+			&& cluster_reconfig_get_observed_epoch(i) == CLUSTER_EPOCH_INITIAL)
+			return false; /* a lower fresh-alive declared node seeds instead */
+	}
+	return false;
+}
+
+/*
  * spec-5.15 D5 — joiner self-tick (runs on every node each LMON tick).
  *
  *	Decides, fail-closed, whether THIS node may write before it is a confirmed
@@ -1471,6 +1540,45 @@ cluster_reconfig_joiner_self_tick(void)
 							"closed (53R60) pending admission",
 							cluster_node_id)));
 		} else if (cluster_reconfig_bootstrap_quorum_at_initial()) {
+			/*
+			 * spec-6.15 D5b: boot formation additionally requires the xid-stripe
+			 * face resolved — striping-on holds until the activation record is
+			 * published (staging the seed when self is the candidate), striping-
+			 * off refuses to form an activated cluster (53RB1).  Keeping the gate
+			 * undecided (fail-closed, like UNDECIDED below) retries next tick.
+			 */
+			ClusterXidStripeJoinVerdict sv
+				= cluster_xid_stripe_join_gate(cluster_reconfig_self_is_stripe_seed_candidate());
+
+			if (sv != CLUSTER_XID_STRIPE_JOIN_PROCEED) {
+				static bool stripe_boot_logged = false;
+
+				if (!stripe_boot_logged) {
+					stripe_boot_logged = true;
+					if (sv == CLUSTER_XID_STRIPE_JOIN_REFUSE)
+						ereport(LOG,
+								(errcode(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH),
+								 errmsg("cluster xid stripe: refusing cold-bootstrap membership "
+										"of node %d — stripe mode handshake mismatch "
+										"(SQLSTATE 53RB1)",
+										cluster_node_id),
+								 errhint("cluster.xid_striping must match the cluster's durable "
+										 "activation state on every node; repair the voting-disk "
+										 "stripe region if it is corrupt.")));
+					else
+						ereport(LOG,
+								(errmsg("cluster xid stripe: holding cold-bootstrap membership "
+										"of node %d until the stripe activation state is "
+										"resolved",
+										cluster_node_id)));
+				}
+				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+				ReconfigShmem->self_join_admitted = 0;
+				cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+				LWLockRelease(&ReconfigShmem->lock);
+				return;
+			}
+
 			/* BOOTSTRAP proven: quorum of declared nodes CSSD-alive at INITIAL.
 			 * Open the gate (boot formation is not gated) and latch so a later
 			 * epoch advance does not re-close this genuine member (INV-J14). */

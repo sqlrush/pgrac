@@ -252,6 +252,8 @@ static const char *const BuiltinTrancheNames[] = {
 		"ClusterIcRdma",
 		/* PGRAC LWTRANCHE_CLUSTER_SMART_FUSION: spec-6.2 dependency authority */
 		"ClusterSmartFusion",
+		/* PGRAC LWTRANCHE_CLUSTER_XID_STRIPE: spec-6.15 D5b activation publication */
+		"ClusterXidStripe",
 	#endif
 	};
 

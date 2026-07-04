@@ -209,6 +209,7 @@ OBJS = \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
 	cluster_xid_stripe.o \
+	cluster_xid_stripe_boot.o \
 	cluster_xnode_lever.o \
 	cluster_xnode_profile.o \
 	storage/cluster_shared_fs.o \

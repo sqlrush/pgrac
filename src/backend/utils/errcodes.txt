@@ -850,6 +850,17 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53RAE    E    ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE                            cluster_restore_incompatible
 53RAF    E    ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT                     cluster_restore_point_drain_timeout
 
+# 53RB0 is reserved by spec-6.14 (shared catalog authority) — do not reuse.
+
+# spec-6.15:  xid space segmentation (per-slot striping) fail-closed band.
+# 53RB1 rejects a node whose stripe-mode / activation-floor / epoch handshake
+# does not match the cluster's durable activation record (or whose stripe
+# slot is retired); 53RB2 refuses to issue new xids when counter herding has
+# failed long enough that the inter-slot window would exceed the hard limit
+# (the striped allocator never tears the single global xid window).
+53RB1    E    ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH                        cluster_xid_stripe_join_mismatch
+53RB2    E    ERRCODE_CLUSTER_XID_WINDOW_HARD_LIMIT                           cluster_xid_window_hard_limit
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

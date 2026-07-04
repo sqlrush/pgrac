@@ -253,9 +253,14 @@ UT_TEST(test_per_class_anchors)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH, 5), '5');
 	/* Class 40 has 5 entries: 40R01..40R05 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_RETRY, 5), '5');
-	/* Class 53 spans base 53R01..53R07 plus later pgrac bands up to 53RAF. */
+	/* Class 53 spans base 53R01..53R07 plus later pgrac bands up to 53RB2
+	 * (53RB0 is reserved by spec-6.14 and intentionally absent here). */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 4), 'A');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 5), 'F');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH, 4), 'B');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH, 5), '1');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_XID_WINDOW_HARD_LIMIT, 4), 'B');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_XID_WINDOW_HARD_LIMIT, 5), '2');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 4), '9');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 5), 'O');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 4), '9');

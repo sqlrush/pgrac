@@ -116,6 +116,9 @@ bool cluster_crossnode_runtime_visibility = false;
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * OFF = vanilla dense per-node xid allocation). */
 bool cluster_xid_striping = false;
+/* spec-6.15 D5/D3: herding slack (xid-value gap tolerated between
+ * stripe slots; also the seeded activation-floor headroom). */
+int cluster_xid_herding_slack = 4194304;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1587,6 +1590,23 @@ cluster_init_guc(void)
 					 "modulo 16, making xid values self-describing about their origin "
 					 "node. Requires cluster.node_id between 0 and 15."),
 		&cluster_xid_striping, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.xid_herding_slack -- spec-6.15 D5/D3.  Allowed xid-value
+	 * gap between the fastest and slowest stripe slots before a lagging
+	 * node observe-and-jumps its allocator forward (D3), and the extra
+	 * headroom added above the shared nextXid high watermark when the
+	 * activation floor is seeded (D5b).  SIGHUP: herding cadence is a
+	 * runtime tuning knob; the seeded floor uses the value in effect at
+	 * activation time only.
+	 */
+	DefineCustomIntVariable(
+		"cluster.xid_herding_slack",
+		gettext_noop("Allowed xid gap between stripe slots before herding jumps (spec-6.15)."),
+		gettext_noop("Lagging nodes jump their striped xid allocator forward once the "
+					 "cluster-wide watermark leads by more than this many xid values; "
+					 "the hard fail-closed refusal limit is 64x this value."),
+		&cluster_xid_herding_slack, 4194304, 65536, 268435456, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.block_self_contained -- spec-6.12 wave g (write-write
