@@ -1541,6 +1541,11 @@ extern uint64 cluster_gcs_get_block_x_forward_sent_count(void);
 extern uint64 cluster_gcs_get_block_x_granted_from_holder_count(void);
 extern uint64 cluster_gcs_get_starvation_denied_pending_x_count(void);
 
+/* PGRAC: spec-6.14a D5 — 3 NEW counter accessors for the X-vs-S arms. */
+extern uint64 cluster_gcs_get_local_s_upgrade_grant_count(void);
+extern uint64 cluster_gcs_get_x_vs_s_nonholder_grant_count(void);
+extern uint64 cluster_gcs_get_x_vs_s_no_carrier_denied_count(void);
+
 /* PGRAC: spec-2.37 D12 — 4 NEW counter accessors for PI watermark + lost-write. */
 extern uint64 cluster_gcs_get_pi_watermark_advance_count(void);
 extern uint64 cluster_gcs_get_pi_watermark_retire_count(void);

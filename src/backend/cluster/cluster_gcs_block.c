@@ -5594,6 +5594,27 @@ cluster_gcs_get_block_invalidate_timeout_count(void)
 						   : 0;
 }
 
+/* PGRAC: spec-6.14a D5 — 3 NEW counter accessors for the X-vs-S arms. */
+uint64
+cluster_gcs_get_local_s_upgrade_grant_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->local_s_upgrade_grant_count) : 0;
+}
+
+uint64
+cluster_gcs_get_x_vs_s_nonholder_grant_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_x_vs_s_no_carrier_denied_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count)
+						   : 0;
+}
+
 uint64
 cluster_gcs_get_block_x_forward_sent_count(void)
 {

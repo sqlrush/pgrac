@@ -1062,6 +1062,32 @@ cluster_gcs_get_block_invalidate_timeout_count(void)
 {
 	return 0;
 }
+
+/* PGRAC: spec-6.14a D5 stubs — dump_gcs/dump_pcm read the X-vs-S arm
+ * counters; the real modules are not linked here. */
+uint64
+cluster_gcs_get_local_s_upgrade_grant_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_gcs_get_x_vs_s_nonholder_grant_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_gcs_get_x_vs_s_no_carrier_denied_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
+{
+	return 0;
+}
 uint64
 cluster_gcs_get_block_x_forward_sent_count(void)
 {

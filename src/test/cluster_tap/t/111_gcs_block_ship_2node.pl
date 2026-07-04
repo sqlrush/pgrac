@@ -8,7 +8,7 @@
 #
 #	  L1  ClusterPair startup — both postmasters healthy + tier1 connected
 #	  L2  fresh baseline gcs counters on both nodes (block_* counters = 0)
-#	  L3  pg_cluster_state.gcs category has 64 keys (cumulative through
+#	  L3  pg_cluster_state.gcs category has 67 keys (cumulative through
 #	       spec-6.13 direct-land observability)
 #	  L4  4 NEW wait events registered in pg_stat_cluster_wait_events:
 #	       ClusterGCSBlockShipWait, ClusterGCSBlockRequestDispatch,
@@ -113,19 +113,19 @@ for my $node ($pair->node0, $pair->node1) {
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 64 keys
+# L3: pg_cluster_state.gcs category has 67 keys
 #	  (cumulative GCS surface through spec-6.13 direct-land observability).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '64',
-   'L3 node0 pg_cluster_state.gcs category has 64 keys');
+   '67',
+   'L3 node0 pg_cluster_state.gcs category has 67 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '64',
-   'L3 node1 pg_cluster_state.gcs category has 64 keys');
+   '67',
+   'L3 node1 pg_cluster_state.gcs category has 67 keys');
 
 
 # ============================================================

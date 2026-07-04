@@ -12,7 +12,7 @@
 #
 #	  L1   ClusterPair startup baseline (both postmasters healthy)
 #	  L2   fresh baseline: 6 NEW spec-2.36 counters all 0
-#	  L3   pg_cluster_state.gcs has 64 keys (cumulative through spec-6.13)
+#	  L3   pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a)
 #	  L4   catversion lower-bound >= 202605430; wait event count == 118
 #	  L5   S barrier injection — DENIED_PENDING_X surfaces under
 #	       cluster-gcs-block-starvation-force-denied inject; reader
@@ -106,18 +106,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 64 keys (cumulative through spec-6.13).
+# L3: pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '64',
-   'L3 node0 pg_cluster_state.gcs category has 64 keys');
+   '67',
+   'L3 node0 pg_cluster_state.gcs category has 67 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '64',
-   'L3 node1 pg_cluster_state.gcs category has 64 keys');
+   '67',
+   'L3 node1 pg_cluster_state.gcs category has 67 keys');
 
 
 # ============================================================
