@@ -239,6 +239,10 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: spec-6.14a D2 — successful local-master S->X upgrades (revoke
 	 * granted; the L442 mechanism counter for the local arm). */
 	pg_atomic_uint64 local_s_upgrade_grant_count;
+	/* PGRAC: spec-6.14a D3 — remote-path X-vs-S non-holder legs: B2 grants
+	 * (image captured before the revoke round) and B3/no-carrier denials. */
+	pg_atomic_uint64 x_vs_s_nonholder_grant_count;
+	pg_atomic_uint64 x_vs_s_no_carrier_denied_count;
 	/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
 	pg_atomic_uint64 scratch_copy_count;
 	pg_atomic_uint64 live_sge_send_count;
@@ -405,6 +409,8 @@ cluster_gcs_block_shmem_init(void)
 		/* PGRAC: spec-6.12a — local-upgrade broadcast id source. */
 		pg_atomic_init_u64(&ClusterGcsBlock->local_upgrade_request_seq, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count, 0);
 		/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->scratch_copy_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_send_count, 0);
@@ -3422,6 +3428,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			uint32 holders_bm = cluster_pcm_lock_query_s_holders_bitmap(req->tag);
 			bool requester_is_s_holder = (req->sender_node >= 0 && req->sender_node < 32
 										  && (holders_bm & ((uint32)1u << req->sender_node)) != 0);
+			bool xvs_b2_captured = false; /* PGRAC: spec-6.14a D3 (B2) */
 
 			/* Q5=A merged path + spec-4.7a D3:  exclude the requester's own S
 			 * bit from the invalidate set.  It is upgrading its OWN access to X
@@ -3433,6 +3440,41 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 * the requester's transition label. */
 			if (requester_is_s_holder)
 				holders_bm &= ~((uint32)1u << req->sender_node);
+
+			/*
+			 * PGRAC: spec-6.14a D3 — requester is NOT an S holder (plain
+			 * N→X against read-shared copies).  Classify BEFORE any copy is
+			 * dropped:
+			 *   B2: the master itself holds S — capture the ship image
+			 *       FIRST (image-survival: after the revoke round the only
+			 *       guaranteed current carriers are deliberately preserved
+			 *       copies; a revoked dirty-S copy is dropped after only an
+			 *       XLogFlush, so shared storage may be stale post-revoke),
+			 *       then let the self-drop + broadcast below run and grant
+			 *       WITH the image — never STORAGE_FALLBACK.
+			 *   B3: only third-party nodes hold S (master not resident;
+			 *       unreachable on 2 nodes) — fail closed, counted: no
+			 *       capturable current carrier would survive the revoke.
+			 */
+			if (!requester_is_s_holder) {
+				if ((holders_bm & ((uint32)1u << cluster_node_id)) != 0
+					&& gcs_block_get_ship_image(req->tag, req->sender_node, true, &page_lsn,
+												block_buf, &block_payload, &block_payload_lkey,
+												&block_payload_release_cb,
+												&block_payload_release_arg, &sf_dep_vec,
+												&sf_dep_valid))
+					xvs_b2_captured = true;
+
+				if (!xvs_b2_captured) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count,
+											1);
+					cluster_pcm_lock_clear_pending_x(req->tag);
+					status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+					page_lsn = InvalidXLogRecPtr;
+					block_payload = NULL;
+					goto build_and_send_reply;
+				}
+			}
 
 			/*
 			 * PGRAC: spec-6.12a ㉕ — the master itself may hold an S copy (it
@@ -3458,6 +3500,12 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				if (!gcs_block_broadcast_invalidate_and_wait(req, holders_bm)) {
 					/* Budget exhausted — reply DENIED_INVALIDATE_TIMEOUT;
 					 * sender backend maps to 53R91. */
+					if (xvs_b2_captured) {
+						/* PGRAC: spec-6.14a D3 — drop the captured image. */
+						gcs_block_release_ship_image(block_payload_release_cb,
+													 block_payload_release_arg);
+						block_payload = NULL;
+					}
 					cluster_pcm_lock_clear_pending_x(req->tag);
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
 					gcs_block_send_reply(req->sender_node, req,
@@ -3493,8 +3541,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 * HG5) and reply STORAGE_FALLBACK so the requester writes its own
 			 * resident / shared-storage copy.  WITHOUT this, produce_reply
 			 * (state still S, master not resident) replies DENIED_MASTER_NOT_
-			 * HOLDER and the sender retransmit-loops to 53R90.  Cross-node X
-			 * contention (requester was NOT an S holder) falls to the flow below.
+			 * HOLDER and the sender retransmit-loops to 53R90.  A non-holder
+			 * requester takes the spec-6.14a D3 B2 grant below instead.
 			 */
 			if (requester_is_s_holder
 				&& cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_X_UPGRADE,
@@ -3504,6 +3552,25 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
 				page_lsn = InvalidXLogRecPtr;
 				block_payload = NULL;
+				goto build_and_send_reply;
+			}
+
+			/*
+			 * PGRAC: spec-6.14a D3 (B2) — explicit grant for the non-holder
+			 * requester.  Every S copy (the master's own included) has been
+			 * dropped and ack-certified; the image captured BEFORE the
+			 * revoke round is the sole guaranteed-current carrier.  Record
+			 * the requester as the X holder atomically and reply GRANTED
+			 * with the image (storage currency is unproven post-revoke, so
+			 * STORAGE_FALLBACK is not a legal reply here).
+			 */
+			if (!requester_is_s_holder && xvs_b2_captured) {
+				cluster_pcm_lock_master_grant_x_to(
+					req->tag, req->sender_node, page_lsn,
+					(SCN)((PageHeader)block_payload)->pd_block_scn);
+				cluster_pcm_lock_clear_pending_x(req->tag);
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count, 1);
+				status = GCS_BLOCK_REPLY_GRANTED;
 				goto build_and_send_reply;
 			}
 		}
