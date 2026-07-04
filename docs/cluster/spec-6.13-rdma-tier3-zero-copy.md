@@ -160,6 +160,11 @@ all backends.  The correlation has three layers:
 The `wr_id` does not need to pack the full backend/request identity.  It should
 pack a bounded arm-table index plus enough generation bits to reject stale CQEs
 before following the arm pointer.  The arm record then stores the full identity.
+The D6 wire layout assigns 16 bits to `arm_id` and 16 bits to generation.  The
+slot generation must therefore be the same 16-bit wire generation used in
+`wr_id`: value 0 is reserved, and the sequence wraps `65535 -> 1`.  Startup
+must fail closed or disable RDMA direct-land if the arm-table capacity exceeds
+the 16-bit arm-id value space.
 
 `ClusterGcsBlockOutstandingSlot` grows direct-land fields:
 
@@ -330,6 +335,8 @@ Unit tests:
 
 - sidecar size/layout is exactly `ClusterICEnvelope + GcsBlockReplyHeader`;
 - `wr_id` arm-index/generation decoding rejects stale CQEs;
+- `wr_id` generation wrap stays in the 16-bit wire domain (`65535 -> 1`) and
+  arm-table capacity cannot exceed the arm-id field value space;
 - slot state transitions reject illegal edges;
 - arming failure clears request/forward direct-land flags;
 - success-status whitelist excludes destructive X-transfer and non-success

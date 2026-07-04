@@ -844,6 +844,7 @@ static bool
 rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 {
 	MemoryContext oldctx;
+	uint32 arm_capacity;
 
 	if (peer == NULL || RdmaCtx.pd == NULL)
 		return false;
@@ -852,6 +853,11 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 		&& peer->send_mr != NULL && peer->recv_mr != NULL && peer->block_scratch_mr != NULL
 		&& peer->block_reply_send_mr != NULL && peer->block_reply_sidecar_mr != NULL)
 		return true;
+	arm_capacity = rdma_block_reply_arm_capacity();
+	if (!cluster_ic_rdma_direct_land_arm_capacity_valid(arm_capacity)) {
+		RdmaUnavailableReason = "RDMA block-reply arm capacity exceeds 16-bit wr_id field";
+		return false;
+	}
 
 	rdma_peer_release_buffers(peer);
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
@@ -860,7 +866,7 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 	peer->block_scratch_len = BLCKSZ;
 	peer->block_reply_send_buf_len = CLUSTER_IC_RDMA_BLOCK_REPLY_SEND_BYTES;
 	peer->block_reply_sidecar_len
-		= (size_t)rdma_block_reply_arm_capacity() * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES;
+		= (size_t)arm_capacity * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES;
 	peer->send_buf = (uint8 *)palloc(peer->send_buf_len);
 	peer->recv_buf = (uint8 *)palloc(peer->recv_buf_len);
 	peer->block_scratch_buf = (uint8 *)palloc(peer->block_scratch_len);
@@ -2368,6 +2374,7 @@ cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 gener
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	ClusterICRdmaPeer *peer;
 	ClusterICSge sge[2];
+	uint32 arm_capacity;
 	uint64 wr_id;
 
 	if (!rdma_valid_peer_id(peer_id) || target_addr == NULL || target_lkey == 0)
@@ -2379,7 +2386,9 @@ cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 gener
 		rdma_stats_note_block_reply_fallback(peer_id, "RDMA block-reply lane is not connected");
 		return false;
 	}
-	if (arm_id >= rdma_block_reply_arm_capacity()) {
+	arm_capacity = rdma_block_reply_arm_capacity();
+	if (!cluster_ic_rdma_direct_land_arm_capacity_valid(arm_capacity)
+		|| !cluster_ic_rdma_direct_land_wr_field_valid(arm_id) || arm_id >= arm_capacity) {
 		rdma_stats_note_block_reply_fallback(peer_id, "RDMA block-reply arm id is out of range");
 		return false;
 	}
@@ -2664,10 +2673,18 @@ cluster_ic_rdma_lmon_start(void)
 	struct addrinfo hints;
 	struct addrinfo *res = NULL;
 	int gai_rc;
+	uint32 arm_capacity;
 
 	if (!IsUnderPostmaster || MyBackendType != B_LMON)
 		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("RDMA transport must be opened only by LMON")));
+
+	arm_capacity = rdma_block_reply_arm_capacity();
+	if (!cluster_ic_rdma_direct_land_arm_capacity_valid(arm_capacity)) {
+		rdma_lmon_report_start_failure(
+			"RDMA block-reply arm capacity exceeds 16-bit wr_id field");
+		return;
+	}
 
 	if (RdmaProvider == NULL)
 		RdmaProvider = rdma_select_provider();

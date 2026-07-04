@@ -435,6 +435,11 @@ UT_TEST(test_direct_land_wr_id_round_trip_rejects_wrong_type)
 	UT_ASSERT_EQ((int)arm, 1234);
 	UT_ASSERT_EQ((int)generation, 55);
 
+	wr_id = cluster_ic_rdma_direct_land_make_wr_id(
+		7, 1234, cluster_ic_rdma_direct_land_next_generation(65535));
+	UT_ASSERT(cluster_ic_rdma_direct_land_decode_wr_id(wr_id, &peer, &arm, &generation));
+	UT_ASSERT_EQ((int)generation, 1);
+
 	UT_ASSERT(!cluster_ic_rdma_direct_land_decode_wr_id(UINT64CONST(0x5100000000000000),
 														&peer, &arm, &generation));
 }

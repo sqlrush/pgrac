@@ -638,9 +638,7 @@ gcs_block_direct_prepare_attempt(ClusterGcsBlockOutstandingSlot *slot, BufferDes
 
 	slot_idx = gcs_block_slot_index(blk, slot);
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
-	slot->direct_generation++;
-	if (slot->direct_generation == 0)
-		slot->direct_generation = 1;
+	slot->direct_generation = cluster_ic_rdma_direct_land_next_generation(slot->direct_generation);
 	slot->direct_state = GCS_BLOCK_DIRECT_ARMING;
 	slot->direct_expected_peer = expected_peer;
 	slot->direct_arm_id = gcs_block_direct_arm_id(backend_idx, slot_idx);

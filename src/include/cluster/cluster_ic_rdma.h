@@ -100,6 +100,8 @@ typedef struct ClusterICSge {
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_PEER_MASK UINT64CONST(0x00FFFFFF)
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_GENERATION_SHIFT 16
 #define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK UINT64CONST(0xFFFF)
+#define CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES \
+	(CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK + UINT64CONST(1))
 
 static inline uint32
 cluster_ic_rdma_signal_batch_k(uint32 max_send_wr)
@@ -117,6 +119,25 @@ static inline bool
 cluster_ic_rdma_payload_inline_eligible(uint32 payload_len, int inline_max)
 {
 	return inline_max > 0 && payload_len <= (uint32)inline_max;
+}
+
+static inline bool
+cluster_ic_rdma_direct_land_wr_field_valid(uint32 value)
+{
+	return value <= (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK;
+}
+
+static inline bool
+cluster_ic_rdma_direct_land_arm_capacity_valid(uint32 capacity)
+{
+	return capacity <= (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_VALUES;
+}
+
+static inline uint32
+cluster_ic_rdma_direct_land_next_generation(uint32 generation)
+{
+	generation = (generation + 1) & (uint32)CLUSTER_IC_RDMA_DIRECT_LAND_WR_FIELD_MASK;
+	return generation == 0 ? 1 : generation;
 }
 
 static inline uint64
