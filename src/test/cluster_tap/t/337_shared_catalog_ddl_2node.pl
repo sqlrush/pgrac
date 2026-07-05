@@ -116,10 +116,13 @@ EOC
 #         shared_catalog=on still triggers the D2 catalog migration, which is
 #         gated on the GUC (not on cluster.enabled).
 # ----------
+# spec-5.6a grow-from-single contract: the seed sets its node_id before the
+# final single-era shutdown so that shutdown writes its recovery anchor.
 $node0->append_conf('postgresql.conf', $sc_common);
 $node0->append_conf('postgresql.conf', <<EOC);
 cluster.enabled = off
 cluster.lms_enabled = off
+cluster.node_id = 0
 EOC
 
 $node0->start;

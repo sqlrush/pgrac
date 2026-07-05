@@ -91,12 +91,15 @@ my $node1 = PostgreSQL::Test::Cluster->new('cf_cc_node1');
 $node1->init_from_backup($node0, 'cfb');
 
 # ---- node0 single-node builds the shared authority ----
+# spec-5.6a grow-from-single contract: the seed sets its node_id before the
+# final single-era shutdown so that shutdown writes its recovery anchor.
 $node0->append_conf('postgresql.conf', <<EOC);
 shared_buffers = 16MB
 cluster.enabled = off
 cluster.lms_enabled = off
 cluster.shared_data_dir = '$shared_root'
 cluster.controlfile_shared_authority = on
+cluster.node_id = 0
 EOC
 $node0->start;
 $node0->stop;
