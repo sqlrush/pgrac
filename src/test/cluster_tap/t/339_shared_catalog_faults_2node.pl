@@ -10,9 +10,12 @@
 #    invalidation messages, so before D9 a foreign thread tail containing ANY
 #    DDL commit made the cold merge FATAL on every start (53RA3, "carries an
 #    unsupported side effect") -- the cluster could never come back up.  With
-#    D9 both nodes cold-restart, each consuming the OTHER's in-flight DDL
-#    commits (invals consumed cold, relfile drops executed idempotently), and
-#    serve the full post-crash catalog truth.
+#    D9 both nodes cold-restart and serve the full post-crash catalog truth:
+#    the shared-regime recovery claim (spec-6.14 D9 amend, INV-D9-R) elects
+#    ONE cold merger, which consumes BOTH threads' in-flight DDL commits
+#    (invals consumed cold, relfile drops executed idempotently); the other
+#    node waits for the claim release and recovers its own stream under the
+#    merged bound.
 #
 #    Bring-up mirrors t/337 (shared-sysid seed + strict 2-node voting), plus
 #    the spec-4.1 shared per-thread WAL layout so each node can read the
@@ -27,10 +30,12 @@
 #          UNCOMMITTED CREATE.  node0 dies (SIGKILL); node1 declares it dead
 #          and the fail-stop reconfig fires (the death is real); node1 is
 #          then immediate-stopped (simulated crash, no shutdown checkpoint).
-#      L2  (D9 cold) BOTH nodes cold-restart: each node's merged replay
-#          diverts the other thread's DDL commit records -- with the pre-D9
-#          predicates either record FATALs the merge and the cluster stays
-#          down; with D9 both nodes reach ready.
+#      L2  (D9 cold) BOTH nodes cold-restart: the recovery claim serializes
+#          them (each node's boot logs its own claim acquisition; exactly
+#          one merged replay engages and diverts BOTH threads' DDL commit
+#          records) -- with the pre-D9 predicates the diverted record
+#          FATALs the merge and the cluster stays down; with D9 both nodes
+#          reach ready.
 #      L3  truth matrix on BOTH nodes: the settled table, the dead node's
 #          in-window committed CREATE and the survivor's in-tail CREATE are
 #          all readable; the dropped table is gone (catalog AND shared
@@ -324,6 +329,17 @@ PostgreSQL::Test::Utils::system_log(
 $node0->start;
 $node1->_update_pid(1);
 
+# Both up-checks poll tolerantly: the first connections after a cold
+# restart may transiently fail-close 53R97 while the peer's TT status
+# service settles (a backend's startup catalog read can hit the other
+# node's crash-era xids before the remote resolution path is ready).
+my $n0_up2 = 0;
+for (1 .. 60)
+{
+	my ($rc) = $node0->psql('postgres', 'SELECT 1');
+	if (defined $rc && $rc == 0) { $n0_up2 = 1; last; }
+	usleep(500_000);
+}
 my $n1_up2 = 0;
 for (1 .. 60)
 {
@@ -331,9 +347,23 @@ for (1 .. 60)
 	if (defined $rc && $rc == 0) { $n1_up2 = 1; last; }
 	usleep(500_000);
 }
-is($node0->safe_psql('postgres', 'SELECT 1'), '1',
-	'L2 (D9 cold): node0 restarted through the merged replay');
-is($n1_up2, 1, 'L2 (D9 cold): node1 restarted through the merged replay');
+is($n0_up2, 1, 'L2 (D9 cold): node0 restarted through the claim-serialized recovery');
+is($n1_up2, 1, 'L2 (D9 cold): node1 restarted through the claim-serialized recovery');
+
+# The recovery claim's serialization evidence (spec-6.14 D9 amend): every
+# crash boot in the shared regime acquires the claim (deterministic per-node
+# line), and exactly one cold merged replay engaged across the pair -- the
+# other node either waited on the claim or found its stream already merged.
+my $l2_log0 = PostgreSQL::Test::Utils::slurp_file($node0->logfile);
+my $l2_log1 = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+like($l2_log0, qr/shared-regime recovery claim acquired by node 0/,
+	'L2: node0 acquired the recovery claim for its crash boot');
+like($l2_log1, qr/shared-regime recovery claim acquired by node 1/,
+	'L2: node1 acquired the recovery claim for its crash boot');
+my $engaged = () = ($l2_log0 . $l2_log1) =~ /cluster merged recovery: engage decision PASSED/g;
+cmp_ok($engaged, '>=', 1, 'L2: the cold merged replay engaged');
+my $released = () = ($l2_log0 . $l2_log1) =~ /shared-regime recovery claim released/g;
+cmp_ok($released, '>=', 2, 'L2: both nodes released the claim after their recovery');
 
 # ----------
 # L3: post-recovery truth matrix on BOTH nodes.  The first catalog reads may
