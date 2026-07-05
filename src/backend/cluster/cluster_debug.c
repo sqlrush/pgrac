@@ -102,9 +102,10 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
-#include "cluster/cluster_xnode_lever.h"	  /* xnode lever counters (spec-6.12) */
-#include "cluster/cluster_hw_lease.h"		  /* space-lease counters (spec-6.12d) */
-#include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
+#include "cluster/cluster_xnode_lever.h"
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D6 dump */ /* xnode lever counters (spec-6.12) */
+#include "cluster/cluster_hw_lease.h"		/* space-lease counters (spec-6.12d) */
+#include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
 #include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"			 /* wal_thread dump accessors (spec-4.1 D7) */
@@ -883,6 +884,50 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 
 	iters = cluster_undo_cleaner_main_loop_iters();
 	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_main_loop_iters", fmt_int64(iters));
+}
+
+
+/*
+ * dump_xid_stripe -- spec-6.15 D6 xid stripe face diagnostics.
+ *
+ *	11 keys over the activation face (disk/slot state, floor, epoch),
+ *	the D3 herding plane (own floor/hwm promise, cluster min/max active
+ *	hwm) and the D5d replay face (replay-learned floor + active slot
+ *	bitmap).  All values come from one shmem snapshot.
+ */
+static void
+dump_xid_stripe(ReturnSetInfo *rsinfo)
+{
+	static const char *disk_states[] = { "unknown", "absent", "published", "corrupt" };
+	static const char *slot_states[] = { "unknown", "absent", "mine", "retired", "corrupt" };
+	ClusterXidStripeObs obs;
+
+	cluster_xid_stripe_observe(&obs);
+
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_disk_state",
+			 obs.disk_state < lengthof(disk_states) ? pstrdup(disk_states[obs.disk_state])
+													: fmt_int32((int32)obs.disk_state));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_slot_state",
+			 obs.slot_state < lengthof(slot_states) ? pstrdup(slot_states[obs.slot_state])
+													: fmt_int32((int32)obs.slot_state));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_activated_floor",
+			 fmt_int64((int64)obs.activated_floor_full));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_mode_epoch",
+			 fmt_int64((int64)obs.stride_mode_epoch));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_my_slot_floor",
+			 fmt_int64((int64)obs.my_slot_floor_full));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_my_hwm_promise",
+			 fmt_int64((int64)obs.my_hwm_on_disk));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_herding_floor",
+			 fmt_int64((int64)obs.herding_floor_full));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_cluster_min_hwm",
+			 fmt_int64((int64)obs.cluster_min_active_hwm));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_cluster_max_hwm",
+			 fmt_int64((int64)obs.cluster_max_active_hwm));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_replay_floor",
+			 fmt_int64((int64)obs.replay_floor_full));
+	emit_row(rsinfo, "xid_stripe", "xid_stripe_replay_active_bitmap",
+			 fmt_uint64_hex((uint64)obs.replay_active_bitmap));
 }
 
 
@@ -2975,6 +3020,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_ko(rsinfo);
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
 		dump_xnode_lever(rsinfo);	/* spec-6.12 */
+		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

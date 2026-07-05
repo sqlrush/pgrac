@@ -30,7 +30,13 @@
  *	    stripe floor (possible only through external nextXid rewinds
  *	    such as pg_resetwal) is pulled up to the first in-class value
  *	    at or above the floor, so a rewound allocator can never re-
- *	    issue values under the activation floor (D0-F2).
+ *	    issue values under the activation floor (D0-F2).  D3 adds the
+ *	    herding-floor clamp (the observe-and-jump landing point: a
+ *	    lagging node's next allocation jumps to its durably published
+ *	    hwm promise) and the window hard-limit refusal (SQLSTATE 53RB2
+ *	    when the candidate runs ahead of the slowest active slot by
+ *	    more than 64x the herding slack — fail-closed, never tears the
+ *	    single global xid window).
  *
  *	Why: striping makes the 32-bit xid value space globally unique
  *	across cluster nodes so a raw xid is self-describing about its
@@ -49,8 +55,10 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
+#include "cluster/cluster_guc.h"				/* PGRAC: spec-6.15 D3 cluster_xid_herding_slack */
+#include "cluster/cluster_inject.h"			/* PGRAC: spec-6.15 D3 hard-limit injection */
 #include "cluster/cluster_xid_stripe.h"		/* PGRAC: spec-6.15 D1 striped candidate */
-#include "cluster/cluster_xid_stripe_boot.h"	/* PGRAC: spec-6.15 D5e per-slot floor clamp */
+#include "cluster/cluster_xid_stripe_boot.h"	/* PGRAC: spec-6.15 D3/D5e floor clamps + 53RB2 */
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
@@ -135,6 +143,7 @@ GetNewTransactionId(bool isSubXact)
 		if (stripe_slot >= 0)
 		{
 			FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+			FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
 
 			full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
 			/* D5e/D0-F2: never issue below the durable per-slot floor
@@ -142,7 +151,32 @@ GetNewTransactionId(bool isSubXact)
 			if (FullTransactionIdIsValid(slot_floor)
 				&& FullTransactionIdPrecedes(full_xid, slot_floor))
 				full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
+			/* D3: never issue below the armed herding promise (the
+			 * observe-and-jump lands here — the jump abandons only
+			 * never-issued in-class positions, pure slack). */
+			if (FullTransactionIdIsValid(herd_floor)
+				&& FullTransactionIdPrecedes(full_xid, herd_floor))
+				full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
 			xid = XidFromFullTransactionId(full_xid);
+
+			/*
+			 * D3 window hard limit (spec §3.3): if this candidate runs
+			 * ahead of the slowest active slot's published hwm by more
+			 * than slack x 64, counter herding has been failing long
+			 * enough (partition / isolation) that continuing to issue
+			 * would tear at the single global xid window.  Refuse
+			 * fail-closed; the error aborts out of XidGenLock normally.
+			 */
+			if (cluster_xid_stripe_window_exceeded(full_xid))
+			{
+				CLUSTER_INJECTION_POINT("cluster-xid-window-hard-limit");
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_XID_WINDOW_HARD_LIMIT),
+						 errmsg("refusing to assign a new transaction ID: cluster xid window hard limit reached"),
+						 errdetail("This node's xid allocator runs ahead of the slowest active stripe slot by more than %d values.",
+								   cluster_xid_herding_slack * 64),
+						 errhint("Counter herding is not converging — check cluster connectivity, the voting disks, and lagging or isolated nodes; writes resume once herding catches up.")));
+			}
 		}
 	}
 #endif
@@ -240,12 +274,17 @@ GetNewTransactionId(bool isSubXact)
 			if (stripe_slot >= 0)
 			{
 				FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+				FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
 
 				full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
-				/* D5e/D0-F2: same floor clamp as the first derivation. */
+				/* D5e/D0-F2 + D3: same floor clamps as the first
+				 * derivation (the hard-limit refusal already ran). */
 				if (FullTransactionIdIsValid(slot_floor)
 					&& FullTransactionIdPrecedes(full_xid, slot_floor))
 					full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
+				if (FullTransactionIdIsValid(herd_floor)
+					&& FullTransactionIdPrecedes(full_xid, herd_floor))
+					full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
 				xid = XidFromFullTransactionId(full_xid);
 			}
 		}

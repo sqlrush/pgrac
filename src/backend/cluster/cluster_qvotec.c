@@ -1458,6 +1458,11 @@ qvotec_poll_once(void)
 		cluster_xid_stripe_scan_disks(qvotec_fds, qvotec_n_disks);
 	cluster_xid_stripe_service_seed(qvotec_fds, qvotec_n_disks);
 
+	/* spec-6.15 D3: counter herding — sweep peer hwm, publish min/max,
+	 * durably advance this node's hwm promise (no-op until the stripe
+	 * face is PUBLISHED + MINE). */
+	cluster_xid_stripe_herding_tick(qvotec_fds, qvotec_n_disks);
+
 	/* ---- 4. publish shmem ---- */
 	{
 		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);

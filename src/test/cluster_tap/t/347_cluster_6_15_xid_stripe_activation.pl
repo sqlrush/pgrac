@@ -37,6 +37,19 @@
 #           writable transaction ever succeeds (membership 53R64 and
 #           the retired stripe slot 53RB1 both bar the way).
 #
+#      L9   D3 counter herding (slack lowered to 65536 via SIGHUP
+#           first): node0 burns ~20k xids
+#           while node1 idles; after qvotec herding ticks, node1's
+#           next xid jumps into the window (>= node0's watermark
+#           minus slack) instead of resuming from its stale position,
+#           and stays in its congruence class.
+#      L10  D3 window hard limit, ORGANIC: node1's herding tick is
+#           frozen via the cluster-xid-herding-stall :skip injection
+#           (hwm publication stops; the quorum lease keeps running so
+#           no self-fence/fail-stop), node0 burns past slack x 64
+#           values ahead — xid assignment refuses fail-closed with the
+#           53RB2 message; disarming lets herding catch up and writes
+#           resume (never torn, fully recoverable).
 #      L8   (runs before L6/L7) D5d standby skip-fill: a streaming standby of node0 (fully
 #           isolated cluster plane: own pgrac.conf, own IC port, own
 #           empty voting disks) learns the activation floor + active
@@ -108,6 +121,29 @@ sub log_count
 	return $n;
 }
 
+# Burn $n top-level xids on $node: a flat stream of autocommit
+# txid_current() statements (one xid each = 16 values of striped
+# space).  Single-transaction subxact loops cannot do this — the
+# pgrac TT slot allocator bounds live subxacts per segment.  Errors
+# after a mid-stream 53RB2 trip are swallowed (no ON_ERROR_STOP).
+sub burn_xids
+{
+	my ($node, $n) = @_;
+	my $dir = PostgreSQL::Test::Utils::tempdir();
+	my $file = "$dir/burn.sql";
+	open my $fh, '>', $file or die "burn.sql: $!";
+	print $fh "SELECT txid_current();\n" for 1 .. $n;
+	close $fh;
+	# A plain psql stream (no ON_ERROR_STOP): statement-per-transaction
+	# autocommit, and any mid-stream error — the wanted 53RB2 trip, or a
+	# sporadic cross-node GES timeout (pre-existing substrate jitter,
+	# follow-up) — is swallowed and the stream continues.  pgbench is
+	# NOT suitable here: it aborts the whole client on the first error.
+	PostgreSQL::Test::Utils::system_log('psql', '-X', '-q', '-o', '/dev/null',
+		'-d', $node->connstr('postgres'), '-f', $file);
+	return;
+}
+
 # Read {magic, retired} of a region-4 stripe slot from a voting disk
 # file.  Slot N sits at ((3 * 128) + N) * 512; magic "PGXS" =
 # 0x50475853 LE; the retired flag is the byte at record offset 12
@@ -149,6 +185,14 @@ my @conf = (
 	'cluster.cssd_dead_deadband_factor = 6',
 	'cluster.ges_request_timeout_ms = 30000',
 	'cluster.xid_striping = on',
+	# small herding slack (min) so the L9/L10 herding legs trigger with
+	# ~100k burned xids instead of the 4M default
+	# (cluster.xid_herding_slack stays at the 4M default through L1-L8;
+	# the herding legs L9/L10 lower it via SIGHUP — booting with a tiny
+	# slack shrinks the activation floor into a value range whose TX
+	# enqueue masters remotely right after L4's under-deadband node1
+	# bounce, tripping a pre-existing same-epoch-restart GES staleness
+	# gap unrelated to the stripe face; follow-up)
 	'autovacuum = off',
 	'jit = off',
 );
@@ -216,10 +260,115 @@ my $node1 = $pair->node1;
 }
 
 # ----------
+# L9 — D3 counter herding: idle node1 jumps into the window.
+# (L9/L10 run on the pristine post-L3 cluster, BEFORE any leg that
+# detects a node death: a fail-stop's GRD remaster can leave shards
+# frozen long after the dead node rejoins — a pre-existing substrate
+# gap the 20k-xid burn reliably sweeps into, follow-up — and an
+# under-deadband bounce leaves stale per-node GES state with the same
+# effect on remote-mastered enqueues.)
+# ----------
+{
+	# Lower the herding slack to its 65536 minimum (PGC_SIGHUP) so the
+	# jump and the hard limit trigger with a few-second xid burn.
+	for my $n ($node0, $node1)
+	{
+		$n->append_conf('postgresql.conf', "cluster.xid_herding_slack = 65536\n");
+		$n->reload;
+	}
+	usleep(2_000_000); # let both qvotec herding ticks see the new slack
+
+	my $x1_before = $node1->safe_psql('postgres', 'SELECT txid_current()');
+
+	# Burn ~20k xids on node0 (16 values each = ~320k values, far past
+	# the 65536 slack).
+	burn_xids($node0, 20000);
+	my $x0 = $node0->safe_psql('postgres', 'SELECT txid_current()');
+	cmp_ok($x0 - $x1_before, '>', 300000,
+		"L9-0 the burn actually consumed xid space (node0 at $x0)");
+
+	# Wait for herding: qvotec publishes node0's hwm, node1 observes and
+	# durably arms its jump (poll interval 500ms; give it a few ticks).
+	my $deadline = time + 30;
+	my $x1_after = $x1_before;
+	while (time < $deadline)
+	{
+		usleep(1_000_000);
+		$x1_after = $node1->safe_psql('postgres', 'SELECT txid_current()');
+		last if $x1_after > $x0 - 65536 * 2;
+	}
+
+	cmp_ok($x1_after, '>', $x0 - 65536 * 2,
+		"L9-i idle node1 jumped into the window (node1 $x1_after vs node0 $x0, was $x1_before)");
+	is($x1_after % 16, 1, "L9-ii jumped xid $x1_after still in slot 1 (mod 16)");
+	cmp_ok($x1_after - $x1_before, '>', 100000,
+		'L9-iii the jump abandoned a large stretch of never-issued positions');
+}
+
+# ----------
+# L10 — D3 window hard limit (organic 53RB2): freeze node1's herding
+# plane via the cluster-xid-herding-stall injection (:skip makes its
+# herding tick a no-op; the quorum lease keeps refreshing, so no
+# self-fence and no fail-stop), burn node0 past slack x 64 values
+# ahead of the frozen hwm, hit the fail-closed refusal, then disarm
+# and watch herding catch up and writes resume.
+# ----------
+{
+	# Arm via the GUC + reload: the injection registry is per-process,
+	# so a SQL-armed fault only reaches the arming backend — the GUC
+	# assign hook re-arms every process (including qvotec) on SIGHUP.
+	$node1->append_conf('postgresql.conf',
+		"cluster.injection_points = 'cluster-xid-herding-stall:skip'\n");
+	$node1->reload;
+	usleep(2_000_000); # let node1's qvotec pick up the frozen plane
+	pass('L10-0 node1 herding plane frozen via injection GUC');
+	my ($ret, $out, $err);
+
+	# Burn 275k xids (~4.4M values, past the 4.19M hard limit above
+	# node1's frozen hwm).  Statements after the mid-stream trip just
+	# error and are swallowed by the stream (~8-10 minutes; this leg is
+	# the reason t/347 is nightly-scope).
+	burn_xids($node0, 275000);
+
+	diag("xid_stripe face on node0 after the burn:\n"
+		. $node0->safe_psql('postgres',
+			q{SELECT key || '=' || value FROM pg_cluster_state WHERE category = 'xid_stripe'}));
+
+	($ret, $out, $err) = $node0->psql('postgres', 'SELECT txid_current()');
+	isnt($ret, 0, 'L10-i xid assignment refused past the window hard limit');
+	like($err, qr/cluster xid window hard limit/,
+		'L10-ii the refusal is the 53RB2 hard-limit error (fail-closed, not a tear)');
+
+	# Reads that need no new xid keep working (refusal is write-scoped).
+	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
+		'L10-iii read-only queries unaffected by the refusal');
+
+	# Recovery: thaw node1's herding.  A GUC colon-armed fault of a
+	# non-WARNING type deliberately SURVIVES reloads (framework
+	# contract: explicit disarm is SQL-only, which cannot reach
+	# qvotec's process-local registry) — so clear it with a quick
+	# restart: the conf's trailing empty assignment wins at boot and
+	# the herding tick resumes, jumps, and republishes its hwm.
+	$node1->append_conf('postgresql.conf', "cluster.injection_points = ''\n");
+	$node1->restart;
+	ok(poll_write_ok($node0, 'INSERT INTO t347_n0 VALUES (10)', 120,
+			'node0 write after node1 herding thaws'),
+		'L10-iv writes resume once herding catches up (recoverable, never torn)');
+	is($node1->safe_psql('postgres', 'SELECT 1'), '1',
+		'L10-v node1 unperturbed (no fail-stop was triggered)');
+}
+
+# ----------
 # L4 — mixed-mode handshake refusal (53RB1), then clean rejoin.
 # ----------
 {
 	$node1->stop;
+	# Let the CSSD deadband (3s) expire so node1's death is DETECTED and
+	# the epoch bumps: an under-deadband bounce keeps the epoch and the
+	# peer's stale GES per-node state (request dedup / grants) poisons
+	# the rejoined node's remote-mastered lock traffic — a pre-existing
+	# substrate gap (follow-up), out of the stripe face's scope.
+	usleep(5_000_000);
 	$node1->append_conf('postgresql.conf', "cluster.xid_striping = off\n");
 	$node1->start;
 
@@ -239,6 +388,7 @@ my $node1 = $pair->node1;
 	is($write_ok, 0, 'L4-ii held node1 write gate stays closed (fail-closed)');
 
 	$node1->stop;
+	usleep(5_000_000); # detected death again (see above)
 	$node1->append_conf('postgresql.conf', "cluster.xid_striping = on\n");
 	$node1->start;
 	ok(poll_write_ok($node1, 'INSERT INTO t347_n1 VALUES (5)', 90,
@@ -280,7 +430,9 @@ my $disk0;
 	# pg_hba already trusts local replication connections.
 	$node0->append_conf('postgresql.conf',
 		"wal_level = replica\nmax_wal_senders = 4\nmax_replication_slots = 4\n");
-	$node0->restart;
+	$node0->stop;
+	usleep(5_000_000); # detected death (same substrate gap as L4)
+	$node0->start;
 	ok(poll_write_ok($node0, 'INSERT INTO t347_n0 VALUES (8)', 90,
 			'node0 write after streaming restart'),
 		'L8-0 node0 rejoins writable with streaming armed');

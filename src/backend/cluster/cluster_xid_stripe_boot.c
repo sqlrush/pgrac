@@ -47,6 +47,7 @@
 #include "access/xlog.h" /* RecoveryInProgress (D5d gate hold) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h" /* herding-stall injection (D3, L408) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -94,6 +95,20 @@ typedef struct ClusterXidStripeBootShmem {
 	bool my_slot_claimed;
 	uint64 my_slot_floor_full;
 	uint64 my_owner_incarnation;
+	uint64 my_hwm_on_disk; /* durable hwm last read/written (herding) */
+
+	/*
+	 * D3 counter herding (atomics: read on the GetNewTransactionId hot
+	 * path without this module's lock).  herding_floor_full is this
+	 * node's durable allocation promise — every xid it issues is at or
+	 * above it (published as the region-4 hwm BEFORE taking effect, so
+	 * a crash can never issue below an already-published promise);
+	 * cluster_min/max_active_hwm summarize the other DECLARED,
+	 * non-retired slots' published hwm (0 until the first scan).
+	 */
+	pg_atomic_uint64 herding_floor_full;
+	pg_atomic_uint64 cluster_min_active_hwm;
+	pg_atomic_uint64 cluster_max_active_hwm;
 
 	/*
 	 * Replay-learned stripe knowledge (D5d): written ONLY by WAL redo
@@ -149,6 +164,9 @@ cluster_xid_stripe_shmem_init(void)
 		pg_atomic_init_u64(&StripeBootShmem->replay_floor_full, 0);
 		pg_atomic_init_u64(&StripeBootShmem->replay_epoch, 0);
 		pg_atomic_init_u32(&StripeBootShmem->replay_active_bitmap, 0);
+		pg_atomic_init_u64(&StripeBootShmem->herding_floor_full, 0);
+		pg_atomic_init_u64(&StripeBootShmem->cluster_min_active_hwm, 0);
+		pg_atomic_init_u64(&StripeBootShmem->cluster_max_active_hwm, 0);
 	}
 }
 
@@ -366,10 +384,21 @@ cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 				StripeBootShmem->slot_state = CLUSTER_XID_STRIPE_SLOT_RETIRED;
 				StripeBootShmem->my_slot_claimed = false;
 			} else {
+				uint64 cur;
+
 				StripeBootShmem->slot_state = CLUSTER_XID_STRIPE_SLOT_MINE;
 				StripeBootShmem->my_slot_claimed = true;
 				StripeBootShmem->my_slot_floor_full = mine.floor_full;
 				StripeBootShmem->my_owner_incarnation = mine.owner_incarnation;
+				if (mine.next_xid_hwm_full > StripeBootShmem->my_hwm_on_disk)
+					StripeBootShmem->my_hwm_on_disk = mine.next_xid_hwm_full;
+				/* D3: the durable hwm is a crash-surviving allocation
+				 * promise — restore it into the herding floor so a
+				 * restart never issues below what it once published. */
+				cur = pg_atomic_read_u64(&StripeBootShmem->herding_floor_full);
+				if (mine.next_xid_hwm_full > cur)
+					pg_atomic_write_u64(&StripeBootShmem->herding_floor_full,
+										mine.next_xid_hwm_full);
 			}
 			LWLockRelease(&StripeBootShmem->lock);
 			break;
@@ -960,6 +989,210 @@ cluster_xid_stripe_get_activation(uint64 *floor_full, uint64 *epoch, uint64 *gen
 	}
 	LWLockRelease(&StripeBootShmem->lock);
 	return published;
+}
+
+/* ============================================================
+ * D3 counter herding (qvotec tick).
+ * ============================================================ */
+
+/*
+ * One herding pass, run from the qvotec poll after the stripe face is
+ * PUBLISHED and this node's slot is MINE:
+ *
+ *   1. read every DECLARED, non-retired peer slot's region-4 record
+ *      (newest generation across disks) and publish the min/max hwm;
+ *   2. compute this node's hwm promise = the first in-class candidate
+ *      at or above max(local nextXid, cluster_max - slack, floor) and,
+ *      when it moved forward, write it durably into our region-4 slot
+ *      (sole writer) BEFORE arming it as the local herding floor.
+ *
+ * The floor is consumed by GetNewTransactionId's clamp (D5e face), so
+ * a lagging node "jumps" at its next allocation — the jump abandons
+ * only never-issued in-class positions (pure slack, spec §3.3) and
+ * needs no WAL.  Publish-before-arm keeps the promise crash-safe: the
+ * scan restores the durable hwm into the floor at every boot.
+ */
+void
+cluster_xid_stripe_herding_tick(const int *fds, int n_disks)
+{
+	uint64 max_hwm = 0;
+	uint64 min_hwm = 0;
+	uint64 floor_full;
+	uint64 local_next;
+	uint64 target;
+	uint64 promised;
+	int slot;
+
+	if (StripeBootShmem == NULL || fds == NULL || n_disks <= 0)
+		return;
+	if (!cluster_enabled || !cluster_xid_striping)
+		return;
+	if (cluster_xid_stripe_disk_state() != CLUSTER_XID_STRIPE_DISK_PUBLISHED
+		|| cluster_xid_stripe_slot_state() != CLUSTER_XID_STRIPE_SLOT_MINE)
+		return;
+
+	/* An ARMED cluster-xid-herding-stall freezes the herding plane
+	 * only, for as long as it stays armed (the non-consuming peek —
+	 * arm -> observe -> disarm, test surface, L408).  hwm publication
+	 * and jump arming stop; the lease-critical rest of the qvotec
+	 * poll is untouched. */
+	{
+		uint64 dummy;
+
+		if (cluster_cr_injection_armed("cluster-xid-herding-stall", &dummy))
+			return;
+	}
+
+	/* 1. peer hwm sweep (declared, valid, non-retired slots only). */
+	for (slot = 0; slot < CLUSTER_XID_STRIDE; slot++) {
+		ClusterXidStripeSlotRecord rec;
+
+		if (cluster_conf_lookup_node(slot) == NULL)
+			continue;
+		memset(&rec, 0, sizeof(rec));
+		if (stripe_read_slot_all(fds, n_disks, slot, &rec) != STRIPE_READ_VALID)
+			continue;
+		if (rec.retired)
+			continue;
+		if (rec.next_xid_hwm_full > max_hwm)
+			max_hwm = rec.next_xid_hwm_full;
+		if (min_hwm == 0 || rec.next_xid_hwm_full < min_hwm)
+			min_hwm = rec.next_xid_hwm_full;
+	}
+	if (max_hwm != 0) {
+		pg_atomic_write_u64(&StripeBootShmem->cluster_max_active_hwm, max_hwm);
+		pg_atomic_write_u64(&StripeBootShmem->cluster_min_active_hwm, min_hwm);
+	}
+
+	/* 2. this node's hwm promise. */
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	floor_full = StripeBootShmem->my_slot_floor_full;
+	promised = StripeBootShmem->my_hwm_on_disk;
+	LWLockRelease(&StripeBootShmem->lock);
+
+	local_next = U64FromFullTransactionId(ReadNextFullTransactionId());
+	target = local_next;
+	if (max_hwm > (uint64)cluster_xid_herding_slack
+		&& max_hwm - (uint64)cluster_xid_herding_slack > target)
+		target = max_hwm - (uint64)cluster_xid_herding_slack; /* observe-and-jump */
+	if (floor_full > target)
+		target = floor_full;
+	target = U64FromFullTransactionId(
+		cluster_xid_next_striped_full(FullTransactionIdFromU64(target), cluster_node_id));
+
+	if (target > promised) {
+		ClusterXidStripeSlotRecord rec;
+		char slotbuf[CLUSTER_VOTING_SLOT_BYTES];
+		bool is_jump = target > local_next;
+		int disks_ok = 0;
+		int i;
+
+		/* read-modify-write our own record (sole writer). */
+		memset(&rec, 0, sizeof(rec));
+		if (stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec) != STRIPE_READ_VALID
+			|| rec.retired)
+			return; /* face shifted under us; next tick re-evaluates */
+		rec.next_xid_hwm_full = target;
+		rec.generation += 1;
+		cluster_xid_stripe_slot_record_compute_crc(&rec);
+		memset(slotbuf, 0, sizeof(slotbuf));
+		memcpy(slotbuf, &rec, sizeof(rec));
+
+		/*
+		 * Durability split: a TRACKING publish (hwm following the local
+		 * allocator) skips fdatasync — it runs every poll under
+		 * allocation load, and a per-poll fsync across every voting
+		 * disk can push qvotec's poll period past the in_quorum lease
+		 * window (a self-fence).  Losing a tracking write in a crash
+		 * only staleness-skews the peers' min/max view; uniqueness is
+		 * untouched.  A JUMP (a promise ABOVE the local allocator) is
+		 * armed as an allocation floor, so it stays publish-before-arm
+		 * durable.
+		 */
+		for (i = 0; i < n_disks; i++) {
+			if (cluster_voting_disk_write_stripe_slot_ex(fds[i], (uint32)cluster_node_id, slotbuf,
+														 is_jump)
+				== CLUSTER_VOTING_DISK_IO_OK)
+				disks_ok++;
+		}
+		if (disks_ok < (n_disks / 2) + 1)
+			return; /* not on a majority; do NOT arm (publish-before-arm) */
+
+		LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
+		if (target > StripeBootShmem->my_hwm_on_disk)
+			StripeBootShmem->my_hwm_on_disk = target;
+		LWLockRelease(&StripeBootShmem->lock);
+
+		/* arm: only a durably published jump becomes an allocation floor. */
+		if (is_jump && target > pg_atomic_read_u64(&StripeBootShmem->herding_floor_full)) {
+			pg_atomic_write_u64(&StripeBootShmem->herding_floor_full, target);
+			ereport(DEBUG1,
+					(errmsg("cluster xid stripe: herding jump armed to " UINT64_FORMAT
+							" (cluster max " UINT64_FORMAT ", local next " UINT64_FORMAT ")",
+							target, max_hwm, local_next)));
+		}
+	}
+}
+
+/*
+ * D3 allocation-side faces (read under XidGenLock; atomics keep the
+ * hot path free of this module's lock).  herding_floor: this node's
+ * armed allocation promise.  window_exceeded: is candidate ahead of
+ * the slowest ACTIVE slot's published hwm by more than the hard limit
+ * (slack x 64)?  TRUE means counter herding has been failing long
+ * enough that continuing to issue would tear at the single global xid
+ * window — the caller refuses fail-closed (53RB2, spec §3.3).  A
+ * cluster with no peer publication yet (min == 0) never trips it.
+ */
+FullTransactionId
+cluster_xid_stripe_herding_floor(void)
+{
+	uint64 v;
+
+	if (StripeBootShmem == NULL)
+		return InvalidFullTransactionId;
+	v = pg_atomic_read_u64(&StripeBootShmem->herding_floor_full);
+	return v == 0 ? InvalidFullTransactionId : FullTransactionIdFromU64(v);
+}
+
+/* D6 observability snapshot (single lock acquisition + atomics). */
+void
+cluster_xid_stripe_observe(ClusterXidStripeObs *obs)
+{
+	memset(obs, 0, sizeof(*obs));
+	if (StripeBootShmem == NULL)
+		return;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	obs->disk_state = StripeBootShmem->disk_state;
+	obs->slot_state = StripeBootShmem->slot_state;
+	obs->activated_floor_full = StripeBootShmem->floor_full;
+	obs->stride_mode_epoch = StripeBootShmem->epoch;
+	obs->my_slot_floor_full
+		= StripeBootShmem->my_slot_claimed ? StripeBootShmem->my_slot_floor_full : 0;
+	obs->my_hwm_on_disk = StripeBootShmem->my_hwm_on_disk;
+	LWLockRelease(&StripeBootShmem->lock);
+
+	obs->herding_floor_full = pg_atomic_read_u64(&StripeBootShmem->herding_floor_full);
+	obs->cluster_min_active_hwm = pg_atomic_read_u64(&StripeBootShmem->cluster_min_active_hwm);
+	obs->cluster_max_active_hwm = pg_atomic_read_u64(&StripeBootShmem->cluster_max_active_hwm);
+	obs->replay_floor_full = pg_atomic_read_u64(&StripeBootShmem->replay_floor_full);
+	obs->replay_active_bitmap = pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap);
+}
+
+bool
+cluster_xid_stripe_window_exceeded(FullTransactionId candidate)
+{
+	uint64 min_hwm;
+	uint64 cand = U64FromFullTransactionId(candidate);
+	uint64 hard = (uint64)cluster_xid_herding_slack * 64;
+
+	if (StripeBootShmem == NULL)
+		return false;
+	min_hwm = pg_atomic_read_u64(&StripeBootShmem->cluster_min_active_hwm);
+	if (min_hwm == 0)
+		return false;
+	return cand > min_hwm && cand - min_hwm > hard;
 }
 
 /* ============================================================
