@@ -227,6 +227,63 @@ cluster_xid_is_mine(TransactionId xid)
 }
 
 /*
+ * Runtime wrapper: does xid PROVABLY derive to another node's slot?
+ * True only above the activation floor with the stripe runtime latched
+ * — the one case where value-space uniqueness proves the xid is not
+ * ours, so PG-native CLOG / ProcArray / snapshot answers about it are
+ * void (AD-012 exception 9).  Underivable (below floor / striping off /
+ * non-normal) returns false: pre-striping history keeps its
+ * pre-existing native treatment.
+ *
+ * The congruence-class short-circuit keeps the common case (our own
+ * xids) free of the ReadNextFullTransactionId() shared-lock read the
+ * widening needs: an own-class xid can never be provably foreign.
+ */
+bool
+cluster_xid_provably_foreign(TransactionId xid)
+{
+	if (!stripe_runtime.active) {
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_xid_striping)
+			cluster_xid_stripe_lazy_latch();
+#endif
+		if (!stripe_runtime.active)
+			return false;
+	}
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	if ((int)(xid % CLUSTER_XID_STRIDE) == stripe_runtime.my_slot)
+		return false;
+
+	return cluster_xid_origin_slot(xid) >= 0;
+}
+
+/*
+ * Cheap stamp-suppression test: is xid in another node's congruence
+ * class while striping is latched?  No floor proof and no widening
+ * (lock-free), so a below-floor pre-striping local xid of a foreign
+ * class also answers true — callers may only use this to SUPPRESS an
+ * optional action (hint stamping), where over-suppression is always
+ * safe and under-suppression is the pre-striping status quo.
+ */
+bool
+cluster_xid_foreign_class_cheap(TransactionId xid)
+{
+	if (!stripe_runtime.active) {
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_xid_striping)
+			cluster_xid_stripe_lazy_latch();
+#endif
+		if (!stripe_runtime.active)
+			return false;
+	}
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	return (int)(xid % CLUSTER_XID_STRIDE) != stripe_runtime.my_slot;
+}
+
+/*
  * Latch the process-local stripe runtime.  See header for ownership;
  * inconsistent arguments latch the inactive state (fail-closed).
  */

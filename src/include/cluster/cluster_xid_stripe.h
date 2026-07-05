@@ -95,9 +95,17 @@ extern bool cluster_xid_lag_exceeds(FullTransactionId local_next, FullTransactio
  * runtime is not latched active or derivation fails.
  * cluster_xid_is_mine reports whether xid derives to this node's slot
  * (false whenever underivable).
+ * cluster_xid_provably_foreign reports whether xid PROVABLY derives to
+ * another node's slot (false whenever underivable — the fail-open
+ * direction here preserves native authority over pre-striping history).
+ * cluster_xid_foreign_class_cheap is the lock-free class-only variant
+ * for suppressing OPTIONAL actions (hint stamps): it skips the floor
+ * proof, so it may over-report foreignness for below-floor xids.
  */
 extern int cluster_xid_origin_slot(TransactionId xid);
 extern bool cluster_xid_is_mine(TransactionId xid);
+extern bool cluster_xid_provably_foreign(TransactionId xid);
+extern bool cluster_xid_foreign_class_cheap(TransactionId xid);
 
 /*
  * Allocation-side slot gate consumed by GetNewTransactionId under

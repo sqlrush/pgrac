@@ -341,10 +341,12 @@ UT_TEST(test_lag_exceeds)
 
 UT_TEST(test_runtime_inactive_fail_closed)
 {
-	/* before any latch: everything underivable / not mine */
+	/* before any latch: everything underivable / not mine / not foreign */
 	stub_next_full = fxid(0, 2000);
 	UT_ASSERT_EQ(cluster_xid_origin_slot(1996), -1);
 	UT_ASSERT(!cluster_xid_is_mine(1996));
+	UT_ASSERT(!cluster_xid_provably_foreign(1996));
+	UT_ASSERT(!cluster_xid_foreign_class_cheap(1996));
 }
 
 UT_TEST(test_runtime_latched_derivation)
@@ -365,6 +367,20 @@ UT_TEST(test_runtime_latched_derivation)
 	UT_ASSERT(cluster_xid_is_mine(1988));  /* 1988 mod 16 == 4 */
 	UT_ASSERT(!cluster_xid_is_mine(1989)); /* slot 5 */
 	UT_ASSERT(!cluster_xid_is_mine(500));  /* underivable -> false */
+
+	/* provably_foreign (spec-6.15 D7): only above-floor other-class xids */
+	UT_ASSERT(cluster_xid_provably_foreign(1996));	/* slot 12 != 4 */
+	UT_ASSERT(!cluster_xid_provably_foreign(1988)); /* own class */
+	UT_ASSERT(!cluster_xid_provably_foreign(500));	/* below floor */
+	UT_ASSERT(!cluster_xid_provably_foreign(FrozenTransactionId));
+
+	/* foreign_class_cheap: class-only, no floor proof (over-reports
+	 * below-floor xids — suppression-only contract) */
+	UT_ASSERT(cluster_xid_foreign_class_cheap(1996));  /* class 12 != 4 */
+	UT_ASSERT(!cluster_xid_foreign_class_cheap(1988)); /* own class */
+	UT_ASSERT(!cluster_xid_foreign_class_cheap(500));  /* 500 mod 16 == 4: own class */
+	UT_ASSERT(cluster_xid_foreign_class_cheap(501));   /* below floor, class 5: over-reports */
+	UT_ASSERT(!cluster_xid_provably_foreign(501));	   /* ... but never "provably" */
 
 	/* reset for other tests */
 	cluster_xid_stripe_latch_runtime(false, -1, InvalidFullTransactionId);

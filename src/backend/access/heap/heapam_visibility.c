@@ -61,6 +61,20 @@
  * IDENTIFICATION
  *	  src/backend/access/heap/heapam_visibility.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	  Cluster MVCC visibility fork: tuples carrying cluster ITL evidence are
+ *	  resolved through the cluster TT/undo authority instead of native
+ *	  CLOG/ProcArray (which alias across instances); unprovable outcomes fail
+ *	  closed.  Spec trail: spec-3.2 .. spec-3.16 (fork + resolver layers),
+ *	  spec-4.5a (CR gate / G6 xmax gate), spec-6.12i (active-runtime remote
+ *	  resolution), spec-6.15 D7 (mixed-tuple foreign-xmax discipline: native
+ *	  answers and hint stamps are void for provably-foreign xids; hint-stamp
+ *	  suppression in SetHintBits, distrust of foreign-class hint bits, and
+ *	  foreign-xmax routing in the Self / Dirty / MVCC native bodies and the
+ *	  update-path helper).
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -95,6 +109,79 @@
 #include "cluster/cluster_cr.h"					/* spec-3.9 D5 CR 3-tier MVCC gate */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D1 单一解析器 */
 #include "cluster/cluster_mode.h"				/* spec-3.14 storage-mode gate */
+#include "cluster/cluster_xid_stripe.h"			/* spec-6.15 D7 foreign-xmax discipline */
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-6.15 D7 — mixed-tuple deleter discipline.
+ *
+ * The cluster visibility fork routes a tuple by its XMIN: a local-class
+ * xmin falls through to the PG-native body.  But such a "mixed" tuple may
+ * still carry ANOTHER node's xid as its DELETER (bidirectional writes on
+ * one shared block), and every native answer about that xmax —
+ * TransactionIdDidCommit / TransactionIdIsInProgress / XidInMVCCSnapshot —
+ * is void for a foreign-class xid (per-node CLOG carries no foreign bits;
+ * the no-clog-overlay contract forbids mirroring them).  Trusting those
+ * answers false-aborts a committed foreign deleter: the superseded version
+ * stays visible next to its successor (silent duplicate rows), and the
+ * HEAP_XMAX_INVALID hint stamped from it poisons the SHARED page for every
+ * reader on every node.
+ *
+ * Above the spec-6.15 activation floor the striped value space proves a
+ * foreign xid from the value alone, so the native body can now detect the
+ * mixed case and route the xmax decision to the cluster resolver instead
+ * (falling closed 53R97 when no proof exists — never a guess).
+ */
+static inline bool
+cluster_plain_xmax_provably_foreign(HeapTupleHeader tuple)
+{
+	if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+		return false;
+	return cluster_xid_provably_foreign(HeapTupleHeaderGetRawXmax(tuple));
+}
+
+/*
+ * Instant-snapshot ("as of now") verdict for a provably-foreign plain
+ * deleter, shared by the Self and Dirty native bodies.  Every unproven
+ * outcome fails closed (规则 8.A) — never a fall-through to native.
+ */
+typedef enum ClusterForeignXmaxState
+{
+	CLUSTER_FOREIGN_XMAX_DELETED,	  /* deleter proven committed */
+	CLUSTER_FOREIGN_XMAX_NOT_DELETED, /* deleter proven aborted */
+	CLUSTER_FOREIGN_XMAX_IN_PROGRESS, /* deleter proven still running */
+} ClusterForeignXmaxState;
+
+static ClusterForeignXmaxState
+cluster_foreign_xmax_state(Buffer buffer, HeapTupleHeader tuple, TransactionId raw_xmax)
+{
+	ClusterVisResolve xr;
+
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
+	if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		switch (xr.status) {
+		case CLUSTER_TT_STATUS_COMMITTED:
+		case CLUSTER_TT_STATUS_CLEANED_OUT:
+			return CLUSTER_FOREIGN_XMAX_DELETED;
+		case CLUSTER_TT_STATUS_ABORTED:
+			return CLUSTER_FOREIGN_XMAX_NOT_DELETED;
+		case CLUSTER_TT_STATUS_IN_PROGRESS:
+		case CLUSTER_TT_STATUS_SUBCOMMITTED:
+			return CLUSTER_FOREIGN_XMAX_IN_PROGRESS;
+		default:
+			break;
+		}
+	}
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					errmsg("cluster TT status unknown for xmax %u", raw_xmax),
+					errhint("Remote commit_scn not yet propagated, or TT overlay "
+							"missed/stale; retry or abort.")));
+	return CLUSTER_FOREIGN_XMAX_NOT_DELETED; /* unreachable */
+}
+#else							/* !USE_PGRAC_CLUSTER */
+#define cluster_plain_xmax_provably_foreign(tuple) false
 #endif
 
 
@@ -132,6 +219,25 @@
 static inline void
 SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId xid)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.15 D7 — never stamp a hint whose truth this node cannot
+	 * know: commit/abort bits for another node's xid class come from native
+	 * CLOG / ProcArray answers that are void for foreign xids (the origin
+	 * stamps its own xids with authority).  Class-only test, no floor proof:
+	 * over-suppression only costs an optional hint.  Multixact ids and
+	 * pre-9.0 xvac relics are exempt.
+	 */
+	if ((infomask & (HEAP_XMAX_COMMITTED | HEAP_XMAX_INVALID)) != 0
+		&& !(tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+		&& cluster_xid_foreign_class_cheap(HeapTupleHeaderGetRawXmax(tuple)))
+		return;
+	if ((infomask & (HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID)) != 0
+		&& !(tuple->t_infomask & (HEAP_MOVED_OFF | HEAP_MOVED_IN))
+		&& cluster_xid_foreign_class_cheap(HeapTupleHeaderGetRawXmin(tuple)))
+		return;
+#endif
+
 	if (TransactionIdIsValid(xid)) {
 		/* NB: xid must be known committed here! */
 		XLogRecPtr commitLSN = TransactionIdGetCommitLSN(xid);
@@ -379,13 +485,19 @@ HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	/* by here, the inserting transaction has committed */
 
-	if (tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+	/* PGRAC: spec-6.15 D7 — a provably-foreign deleter's hints may be poison
+	 * stamps from the native no-authority era (see the mixed-tuple banner);
+	 * never trust them: fall through to the cluster resolver below. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+		&& !cluster_plain_xmax_provably_foreign(tuple))
 		return true;
 
 	if (tuple->t_infomask & HEAP_XMAX_COMMITTED) {
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 			return true;
-		return false; /* updated by other */
+		/* PGRAC: spec-6.15 D7 — foreign COMMITTED hint: resolve below. */
+		if (!cluster_plain_xmax_provably_foreign(tuple))
+			return false; /* updated by other */
 	}
 
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
@@ -408,6 +520,18 @@ HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		/* it must have aborted or crashed */
 		return true;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.15 D7 — mixed tuple: local-class xmin fell through to
+	 * this native body, but the deleter is provably another node's xid, so
+	 * every native answer below is void for it.  Resolve it instead. */
+	if (cluster_plain_xmax_provably_foreign(tuple)) {
+		if (cluster_foreign_xmax_state(buffer, tuple, HeapTupleHeaderGetRawXmax(tuple))
+			== CLUSTER_FOREIGN_XMAX_DELETED)
+			return false; /* updated by other */
+		return true; /* in-progress or aborted deleter: still visible to self */
+	}
+#endif
 
 	if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple))) {
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
@@ -677,7 +801,11 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 			*res = TM_Ok; /* live remote-committed tuple, no deleter */
 			return true;
 		}
-		return false; /* local xmin: PG-native */
+		/* PGRAC: spec-6.15 D7 — a provably-foreign INVALID hint may be a
+		 * poison stamp from the native no-authority era; never trust it:
+		 * fall through to the xmax resolve below. */
+		if (!cluster_plain_xmax_provably_foreign(tuple))
+			return false; /* local xmin: PG-native */
 	}
 
 	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
@@ -743,6 +871,18 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 			break;
 		}
 	}
+
+	/*
+	 * PGRAC: spec-6.15 D7 — the resolve above produced no proof (NONE
+	 * evidence).  A provably-foreign xmax (deleter OR locker) must never be
+	 * handed back to native primitives — their answers are void for it, and
+	 * "aborted by elimination" is exactly the false-abort that poisoned the
+	 * shared page.  Fail closed instead.
+	 */
+	if (cluster_xid_provably_foreign(raw_xmax))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xmax %u", raw_xmax),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
 
 	/*
 	 * xmax NONE/LOCAL.  If xmin is remote-committed we MUST NOT fall through
@@ -1253,13 +1393,19 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	/* by here, the inserting transaction has committed */
 
-	if (tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+	/* PGRAC: spec-6.15 D7 — a provably-foreign deleter's hints may be poison
+	 * stamps from the native no-authority era (see the mixed-tuple banner);
+	 * never trust them: fall through to the cluster resolver below. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+		&& !cluster_plain_xmax_provably_foreign(tuple))
 		return true;
 
 	if (tuple->t_infomask & HEAP_XMAX_COMMITTED) {
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 			return true;
-		return false; /* updated by other */
+		/* PGRAC: spec-6.15 D7 — foreign COMMITTED hint: resolve below. */
+		if (!cluster_plain_xmax_provably_foreign(tuple))
+			return false; /* updated by other */
 	}
 
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
@@ -1284,6 +1430,30 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		/* it must have aborted or crashed */
 		return true;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.15 D7 — mixed tuple: local-class xmin fell through to
+	 * this native body, but the deleter is provably another node's xid, so
+	 * every native answer below is void for it.  An in-flight foreign
+	 * deleter cannot be reported via snapshot->xmax either (native
+	 * XactLockTableWait cannot wait on another node's xid) — fail closed
+	 * retryable; the cross-node wait rides the writer's D2b bridge. */
+	if (cluster_plain_xmax_provably_foreign(tuple)) {
+		switch (cluster_foreign_xmax_state(buffer, tuple, HeapTupleHeaderGetRawXmax(tuple))) {
+		case CLUSTER_FOREIGN_XMAX_DELETED:
+			return false; /* updated by other */
+		case CLUSTER_FOREIGN_XMAX_NOT_DELETED:
+			return true;
+		case CLUSTER_FOREIGN_XMAX_IN_PROGRESS:
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+					 errmsg("cross-node write conflict on tuple with in-progress "
+							"remote deleter"),
+					 errhint("Retry the transaction.")));
+		}
+	}
+#endif
 
 	if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple))) {
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
@@ -1344,7 +1514,10 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 	ClusterVisResolve xr;
 	ClusterVisibilityDecision scn_decision = CLUSTER_VISIBILITY_UNKNOWN;
 
-	if (tuple->t_infomask & HEAP_XMAX_INVALID)
+	/* PGRAC: spec-6.15 D7 — a provably-foreign INVALID hint may be a poison
+	 * stamp from the native no-authority era; never trust it, resolve. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID)
+		&& !cluster_plain_xmax_provably_foreign(tuple))
 		return 1;
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		return 1; /* a lock-only xmax never deletes the row */
@@ -1418,8 +1591,15 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 	 * foreign xid.  A LOCAL slot recycled past xmax (slot xid != xmax) or no
 	 * slot evidence at all leaves the deleter's origin unprovable -> fail
 	 * closed (规则 8.A).
+	 *
+	 * PGRAC: spec-6.15 D7 — above the activation floor the striped value
+	 * space alone proves ownership (the same proof behind the D4
+	 * derived==self LOCAL route), so a slot recycled past our OWN xmax no
+	 * longer leaves the deleter unprovable: cluster_xid_is_mine is accepted
+	 * as the slot binding's value-space equivalent.
 	 */
-	if (xr.evidence == CLUSTER_VIS_EVIDENCE_LOCAL && xr.ref.local_xid == xmax) {
+	if (xr.evidence == CLUSTER_VIS_EVIDENCE_LOCAL
+		&& (xr.ref.local_xid == xmax || cluster_xid_is_mine(xmax))) {
 		if (XidInMVCCSnapshot(xmax, snapshot))
 			return 1; /* still in progress per this snapshot */
 		if (!TransactionIdDidCommit(xmax))
@@ -1907,7 +2087,11 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	/* by here, the inserting transaction has committed */
 
-	if (tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+	/* PGRAC: spec-6.15 D7 — a provably-foreign deleter's INVALID hint may be
+	 * a poison stamp from the native no-authority era (see the mixed-tuple
+	 * banner); never trust it: route to the cluster resolver below. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) /* xid invalid or aborted */
+		&& !cluster_plain_xmax_provably_foreign(tuple))
 		return true;
 
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
@@ -1937,6 +2121,31 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		/* it must have aborted or crashed */
 		return true;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.15 D7 — mixed tuple: the local-class xmin fell through
+	 * to this native body, but the deleter is provably another node's xid.
+	 * Native CLOG / snapshot answers (and both on-page hint bits) are void
+	 * for it — trusting them false-aborts a committed foreign deleter, so
+	 * the superseded version stays visible next to its successor.  Route
+	 * the whole xmax decision to the cluster resolver (same G6 gate the
+	 * remote-xmin arm uses); unprovable stays fail-closed 53R97. */
+	if (cluster_plain_xmax_provably_foreign(tuple)) {
+		switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
+		case 1:
+			return true;
+		case 0:
+			return false;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for deleting xmax of xid %u",
+							HeapTupleHeaderGetRawXmax(tuple)),
+					 errhint("Remote deleter commit state not yet propagated; "
+							 "retry or abort.")));
+		}
+	}
+#endif
 
 	if (!(tuple->t_infomask & HEAP_XMAX_COMMITTED)) {
 		if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple))) {
