@@ -127,6 +127,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
 #include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
 #include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
+#include "cluster/cluster_oid_lease.h"		 /* catalog category (spec-6.14 D10) */
 #include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				 /* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -2986,6 +2987,28 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 #undef XNL_ROW
 }
 
+/*
+ * dump_catalog -- spec-6.14 D10: shared-catalog single-authority
+ *	observability.  Keys backed by live substrate only; the relmap write /
+ *	broadcast-ack keys land with the relmapper activation (D5), so no key
+ *	here can be a permanently-dead zero.
+ */
+static void
+dump_catalog(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "catalog", "shared_catalog_enabled", fmt_bool(cluster_shared_catalog));
+	/* D6 OID lease allocator */
+	emit_row(rsinfo, "catalog", "oid_lease_acquire_count",
+			 fmt_int64((int64)cluster_oid_lease_acquire_count()));
+	emit_row(rsinfo, "catalog", "oid_lease_remaining",
+			 fmt_int64((int64)cluster_oid_lease_remaining()));
+	/* D9 foreign terminal-record side effects (recovery-executed) */
+	emit_row(rsinfo, "catalog", "recovery_side_effect_record_count",
+			 fmt_int64((int64)cluster_remote_xact_side_effect_record_count()));
+	emit_row(rsinfo, "catalog", "recovery_side_effect_drop_count",
+			 fmt_int64((int64)cluster_remote_xact_side_effect_drop_count()));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -3054,6 +3077,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
 		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
+		dump_catalog(rsinfo);		/* spec-6.14 D10 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

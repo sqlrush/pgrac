@@ -307,6 +307,31 @@ cluster_smgr_get_inval_bcast_sent_count(void)
 }
 bool cluster_smgr_user_relations = false;
 
+/* spec-6.14 D10 stubs: dump_catalog (cluster_debug.o) reads the shared-catalog
+ * GUC + the OID-lease and remote-xact side-effect counters; cluster_guc.o,
+ * cluster_oid_lease_shmem.o and cluster_remote_xact.o are not linked here. */
+bool cluster_shared_catalog = false;
+uint64
+cluster_oid_lease_acquire_count(void)
+{
+	return 0;
+}
+Oid
+cluster_oid_lease_remaining(void)
+{
+	return 0;
+}
+uint64
+cluster_remote_xact_side_effect_record_count(void)
+{
+	return 0;
+}
+uint64
+cluster_remote_xact_side_effect_drop_count(void)
+{
+	return 0;
+}
+
 /* spec-4.12 D7 + spec-4.12b D6 stubs: dump_write_fence (cluster_debug.o) reads 8
  * counters now, and cluster_startup_phase.o (linked here) references the rejoin
  * self-fence gate.  cluster_write_fence.o is not linked -- provide stubs returning

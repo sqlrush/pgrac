@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'all 54 categories appear (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; L122 alphabetic verify)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'all 55 categories appear (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog; L122 alphabetic verify)');
 
 
 # ----------
