@@ -19,6 +19,14 @@
 #
 #      L1  both nodes start and connect on the shared-sysid cluster.
 #      L2  node0 CREATE TABLE -> node1 SELECT sees it in < 1s (A1 命门).
+#      L3  node0 UNCOMMITTED CREATE TABLE -> node1 fail-closes 53R97 (an
+#          open remote xid is unprovable cross-node -- Q5/Q11 canonical:
+#          未知/不可判远端事务一律 53R97, retryable; never false-visible);
+#          after COMMIT node1 sees it.
+#      L4  injection-forced phase-gate close on node1 -> its catalog snapshot
+#          drops to the boot LOCAL posture -> reading foreign catalog rows
+#          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
+#          trigger case); disarm restores service.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -217,6 +225,78 @@ is($seen, 'from-node0',
 my $relkind = $node1->safe_psql('postgres',
 	"SELECT relkind FROM pg_class WHERE relname = 'a1_shared_cat'");
 is($relkind, 'r', 'L2 (A1): node1 pg_class has the shared table row');
+
+# ----------
+# L3: an UNCOMMITTED remote DDL must never become visible on node1.  The
+#     catalog row's xmin is a LIVE remote xid whose outcome node1 cannot
+#     prove (no commit_scn stamped anywhere it can read), so the D8 cluster
+#     resolver fail-closes 53R97 -- the Q5/Q11 canonical posture (retryable
+#     ERROR, never a false-visible, never a silent PG-native guess).  COMMIT
+#     then makes the table appear.
+# ----------
+my $bg0 = $node0->background_psql('postgres');
+$bg0->query_safe('BEGIN');
+$bg0->query_safe('CREATE TABLE a1_uncommitted (id int PRIMARY KEY, note text)');
+$bg0->query_safe("INSERT INTO a1_uncommitted VALUES (1, 'pending')");
+
+my ($rc3, $out3, $err3) = $node1->psql('postgres',
+	'SELECT note FROM a1_uncommitted WHERE id = 1');
+isnt($rc3, 0, 'L3: uncommitted remote CREATE TABLE is not resolvable on node1');
+like($err3, qr/cluster TT status unknown|not yet propagated/,
+	'L3: node1 fail-closes 53R97 on the live remote xid (not a wrong answer)');
+
+# COMMIT may emit the known "cluster sinval outbound queue full" WARNING
+# (catalog-DDL burst vs the default queue size -- registered follow-up);
+# plain query() tolerates the stderr WARNING, query_safe() would croak.
+$bg0->query('COMMIT');
+$bg0->quit;
+
+my $seen3 = '';
+for my $i (1 .. 20)
+{
+	my ($rc, $out) = $node1->psql('postgres',
+		'SELECT note FROM a1_uncommitted WHERE id = 1');
+	$seen3 = (defined $rc && $rc == 0 && defined $out) ? $out : '';
+	last if $seen3 eq 'pending';
+	usleep(100_000);
+}
+is($seen3, 'pending', 'L3: after COMMIT node1 sees the row');
+
+# ----------
+# L4: force the D8 services-ready gate closed on node1 (injection) -- its
+#     catalog snapshots drop to the boot LOCAL posture, and reading foreign
+#     catalog rows must fail-close 53R97 rather than judge a foreign xid
+#     against the local pg_xact (R11 negative direction; this is also the
+#     trigger case for the heapam LOCAL-guard ereport).
+# ----------
+$node1->safe_psql('postgres',
+	"ALTER SYSTEM SET cluster.injection_points = "
+	. "'cluster-catalog-services-ready-force-closed:skip'");
+$node1->safe_psql('postgres', 'SELECT pg_reload_conf()');
+usleep(300_000);
+
+my ($rc4, $out4, $err4) = $node1->psql('postgres',
+	'SELECT note FROM a1_shared_cat WHERE id = 1');
+isnt($rc4, 0, 'L4: forced-closed gate makes foreign catalog reads fail');
+like($err4, qr/53R97|LOCAL snapshot/,
+	'L4: the failure is the 53R97 fail-closed surface, not a wrong answer');
+
+$node1->safe_psql('postgres',
+	"ALTER SYSTEM SET cluster.injection_points = "
+	. "'cluster-catalog-services-ready-force-closed:none'");
+$node1->safe_psql('postgres', 'SELECT pg_reload_conf()');
+usleep(300_000);
+
+my $seen4 = '';
+for my $i (1 .. 10)
+{
+	my ($rc, $out) = $node1->psql('postgres',
+		'SELECT note FROM a1_shared_cat WHERE id = 1');
+	$seen4 = (defined $rc && $rc == 0 && defined $out) ? $out : '';
+	last if $seen4 eq 'from-node0';
+	usleep(100_000);
+}
+is($seen4, 'from-node0', 'L4: disarming the gate restores catalog service');
 
 $node1->stop;
 $node0->stop;

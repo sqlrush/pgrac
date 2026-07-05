@@ -37,6 +37,7 @@
 #include "cluster/cluster_catalog_migrate.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_oid_lease.h"
 #include "cluster/cluster_startup_phase.h"
@@ -118,6 +119,18 @@ cluster_catalog_services_ready(void)
 		return false;
 
 	if (RecoveryInProgress())
+		return false;
+
+	/*
+	 * Test-only lever (t/337 L4 / R11): SKIP-arming this point forces the
+	 * gate closed even after the RUNNING latch, driving the pre-ready
+	 * posture -- LOCAL catalog snapshots whose foreign-evidence reads
+	 * fail-close 53R97 -- from a running cluster, which no natural SQL
+	 * timing can reach.  Checked before the latch so disarming restores
+	 * normal service.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-catalog-services-ready-force-closed");
+	if (cluster_injection_should_skip("cluster-catalog-services-ready-force-closed"))
 		return false;
 
 	if (ready_latched)

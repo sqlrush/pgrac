@@ -414,11 +414,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  Fires inside master N→S handler.  SKIP forces DENIED_PENDING_X
 	 *	  reply unconditionally so TAP can drive reader backoff retry +
 	 *	  53R92 ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED.
+	 *
+	 *	cluster-catalog-services-ready-force-closed:
+	 *	  Fires inside cluster_catalog_services_ready (spec-6.14 D8).  SKIP
+	 *	  forces the catalog visibility phase gate closed on a RUNNING node,
+	 *	  driving the boot LOCAL posture -- foreign-evidence catalog reads
+	 *	  fail-closed 53R97 -- which no natural SQL timing can reach
+	 *	  (t/337 L4 / R11 negative leg).
 	 */
 	{ .name = "cluster-gcs-block-invalidate-drop-broadcast" },
 	{ .name = "cluster-gcs-block-invalidate-stall-ack" },
 	{ .name = "cluster-gcs-block-x-forward-master-side" },
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
+	{ .name = "cluster-catalog-services-ready-force-closed" },
 	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
