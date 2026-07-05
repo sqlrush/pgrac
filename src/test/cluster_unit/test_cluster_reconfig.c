@@ -380,6 +380,14 @@ void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set);
 void
 cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set pg_attribute_unused())
 {}
+/* spec-6.15 D5b: stripe joiner gate (not exercised here) — PROCEED so
+ * the vanilla membership legs run unchanged. */
+#include "cluster/cluster_xid_stripe_boot.h"
+ClusterXidStripeJoinVerdict
+cluster_xid_stripe_join_gate(bool self_may_seed pg_attribute_unused())
+{
+	return CLUSTER_XID_STRIPE_JOIN_PROCEED;
+}
 /* pgstat backend global referenced by pgstat_report_wait_start/end (the D4 join
  * marker submit wait); provide a file-static fake so the standalone link works. */
 static uint32 ut_wait_event_info_storage;

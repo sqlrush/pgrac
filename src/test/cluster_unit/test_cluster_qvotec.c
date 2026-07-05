@@ -581,6 +581,22 @@ void
 cluster_membership_seed_last_admitted_from_voting_disk(const int *fds pg_attribute_unused(),
 													   int n_disks pg_attribute_unused())
 {}
+/* spec-6.15 D5b: xid stripe region-5 scan + mailbox service (not
+ * exercised here; the stripe face has its own truth tables). */
+#include "cluster/cluster_xid_stripe_boot.h"
+void
+cluster_xid_stripe_scan_disks(const int *fds pg_attribute_unused(),
+							  int n_disks pg_attribute_unused())
+{}
+void
+cluster_xid_stripe_service_seed(const int *fds pg_attribute_unused(),
+								int n_disks pg_attribute_unused())
+{}
+ClusterXidStripeDiskState
+cluster_xid_stripe_disk_state(void)
+{
+	return CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+}
 #include "cluster/cluster_membership.h" /* ClusterJoinCommitMarker (D5 self-admit) */
 bool cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m, int32 expected_node);
 bool
