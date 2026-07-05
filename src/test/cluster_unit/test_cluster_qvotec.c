@@ -597,6 +597,10 @@ cluster_xid_stripe_disk_state(void)
 {
 	return CLUSTER_XID_STRIPE_DISK_UNKNOWN;
 }
+void
+cluster_xid_stripe_herding_tick(const int *fds pg_attribute_unused(),
+								int n_disks pg_attribute_unused())
+{}
 #include "cluster/cluster_membership.h" /* ClusterJoinCommitMarker (D5 self-admit) */
 bool cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m, int32 expected_node);
 bool

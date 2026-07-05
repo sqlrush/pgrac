@@ -133,6 +133,23 @@ extern void cluster_xid_stripe_lazy_latch(void);
  */
 extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 
+/* D6 observability snapshot consumed by pg_cluster_state (dump keys). */
+typedef struct ClusterXidStripeObs {
+	uint32 disk_state; /* ClusterXidStripeDiskState */
+	uint32 slot_state; /* ClusterXidStripeSlotState */
+	uint64 activated_floor_full;
+	uint64 stride_mode_epoch;
+	uint64 my_slot_floor_full; /* 0 = unclaimed */
+	uint64 my_hwm_on_disk;
+	uint64 herding_floor_full;
+	uint64 cluster_min_active_hwm;
+	uint64 cluster_max_active_hwm;
+	uint64 replay_floor_full;
+	uint32 replay_active_bitmap;
+} ClusterXidStripeObs;
+
+extern void cluster_xid_stripe_observe(ClusterXidStripeObs *obs);
+
 /* Published-state introspection (observability / tests). */
 extern ClusterXidStripeDiskState cluster_xid_stripe_disk_state(void);
 extern bool cluster_xid_stripe_get_activation(uint64 *floor_full, uint64 *epoch,
@@ -164,6 +181,19 @@ extern uint64 cluster_qvotec_self_incarnation_value(void);
  * only for an above-floor value of an inactive class (which, by the
  * per-thread WAL ordering invariant, was never issued).
  */
+/*
+ * D3 counter herding.  herding_tick runs from the qvotec poll (sole
+ * voting-disk writer): sweeps the peers' published region-4 hwm,
+ * publishes min/max, and durably advances this node's hwm promise
+ * (publish-before-arm) which the allocation clamp consumes as the
+ * herding floor.  window_exceeded is the hard-limit predicate behind
+ * SQLSTATE 53RB2 (candidate ahead of the slowest active slot by more
+ * than slack x 64 -> refuse to issue, fail-closed).
+ */
+extern void cluster_xid_stripe_herding_tick(const int *fds, int n_disks);
+extern FullTransactionId cluster_xid_stripe_herding_floor(void);
+extern bool cluster_xid_stripe_window_exceeded(FullTransactionId candidate);
+
 extern void cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot);
 extern void cluster_xid_stripe_replay_note_retire(int slot);
 extern bool cluster_xid_stripe_replay_filter_active(void);

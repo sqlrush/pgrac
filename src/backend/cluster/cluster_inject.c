@@ -640,6 +640,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-node-remove-shrink-committed" },
 	{ .name = "cluster-node-remove-cleanup-done" },
 	{ .name = "cluster-node-remove-escalate" },
+
+	/*
+	 * spec-6.15 D3 — xid stripe counter herding.
+	 *   cluster-xid-herding-stall: :skip freezes THIS node's herding
+	 *     tick (hwm publication + jump arming stop; the quorum lease
+	 *     and everything else in qvotec keeps running) — the organic
+	 *     window hard-limit (53RB2) test surface (L408).
+	 *   cluster-xid-window-hard-limit: fires when the hard limit
+	 *     refuses an assignment (observability hook inside the
+	 *     defensive branch).
+	 */
+	{ .name = "cluster-xid-herding-stall" },
+	{ .name = "cluster-xid-window-hard-limit" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

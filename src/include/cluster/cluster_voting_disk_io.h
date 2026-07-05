@@ -296,6 +296,9 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_stripe_slot(int fd, uin
 																	 void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_slot(int fd, uint32 node_id,
 																	  const void *in_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_slot_ex(int fd, uint32 node_id,
+																		 const void *in_slot512,
+																		 bool durable);
 extern ClusterVotingDiskIoState cluster_voting_disk_read_stripe_activation(int fd,
 																		   void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_activation(int fd,

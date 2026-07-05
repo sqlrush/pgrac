@@ -642,6 +642,24 @@ cluster_voting_disk_read_stripe_slot(int fd, uint32 node_id, void *out_slot512)
 ClusterVotingDiskIoState
 cluster_voting_disk_write_stripe_slot(int fd, uint32 node_id, const void *in_slot512)
 {
+	return cluster_voting_disk_write_stripe_slot_ex(fd, node_id, in_slot512, true);
+}
+
+/*
+ * spec-6.15 D3: the durable=false form skips fdatasync.  Used for the
+ * herding hwm TRACKING publish (hwm following the local allocator):
+ * qvotec runs it every poll, and a per-poll fsync on every voting disk
+ * can push the poll period past the in_quorum lease window under
+ * allocation-heavy load — a self-fence (observed: t/347 L9 burn).  A
+ * crash losing a tracking write only makes the peers' min/max view of
+ * this node conservative/stale by the lost delta; xid uniqueness is
+ * untouched (nextXid recovery never rewinds below issued values).
+ * Jump ARMING (a promise above the local allocator) stays durable.
+ */
+ClusterVotingDiskIoState
+cluster_voting_disk_write_stripe_slot_ex(int fd, uint32 node_id, const void *in_slot512,
+										 bool durable)
+{
 	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 	ssize_t nwritten;
 
@@ -659,7 +677,7 @@ cluster_voting_disk_write_stripe_slot(int fd, uint32 node_id, const void *in_slo
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 	}
-	if (fdatasync(fd) != 0) {
+	if (durable && fdatasync(fd) != 0) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 	}

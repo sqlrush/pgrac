@@ -125,6 +125,15 @@ ClusterXnodeLeverShared *ClusterXnodeLeverCtl = NULL;
  * skipped); the unit harness does not link cluster_hw_lease.o. */
 ClusterHwLeaseShared *ClusterHwLeaseCtl = NULL;
 
+/* spec-6.15 D6 stub: dump_xid_stripe snapshots the stripe boot face;
+ * the unit harness does not link cluster_xid_stripe_boot.o. */
+#include "cluster/cluster_xid_stripe_boot.h"
+void
+cluster_xid_stripe_observe(ClusterXidStripeObs *obs)
+{
+	memset(obs, 0, sizeof(*obs));
+}
+
 /* cluster_ic */
 const ClusterICOps *ClusterICOps_Active = NULL;
 
