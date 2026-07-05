@@ -41,6 +41,7 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
+#include "cluster/cluster_recovery_anchor.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -185,6 +186,26 @@ cluster_qvotec_in_quorum(void)
 
 /* ---- stubs for the bootstrap-window orchestrator's deps (not exercised) ---- */
 bool cluster_enabled = false;
+
+/* spec-5.6a: migrate/vet reference the per-node recovery anchor; node_id
+ * stays -1 here so the seed arm never fires (anchor behavior is covered by
+ * test_cluster_recovery_anchor), and the vet is gated on cluster_enabled
+ * (false above). */
+int cluster_node_id = -1;
+void
+cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf pg_attribute_unused(),
+											   ClusterRecoveryAnchor *out pg_attribute_unused())
+{}
+void
+cluster_recovery_anchor_write(const ClusterRecoveryAnchor *ra pg_attribute_unused())
+{}
+bool
+cluster_recovery_anchor_read(uint64 expected_sysid pg_attribute_unused(),
+							 ClusterRecoveryAnchor *out pg_attribute_unused(),
+							 bool *used_bak pg_attribute_unused())
+{
+	return false;
+}
 int
 cluster_conf_node_count(void)
 {

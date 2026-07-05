@@ -5327,8 +5327,17 @@ StartupXLOG(void)
 	 * it), but a label-less authority boot without a trustworthy anchor fails
 	 * closed -- "maybe this node was the last authority writer" is not
 	 * decidable, and adopting a foreign checkpoint silently corrupts recovery.
+	 *
+	 * Scoped to the multi-node regime (cluster.enabled=on): in the
+	 * single-node-authority regime (cluster off, e.g. the grow-from-single
+	 * seed era) the bootstrap window admits exactly one writer, the shared
+	 * checkpoint fields ARE this node's own, and cluster.node_id may
+	 * legitimately still be unset -- vanilla semantics are sound there.  The
+	 * grow-from-single provisioning contract requires the seed node to set
+	 * cluster.node_id before its final single-era shutdown, so its anchor
+	 * exists when it first boots as a cluster member.
 	 */
-	if (cluster_controlfile_shared_authority)
+	if (cluster_controlfile_shared_authority && cluster_enabled)
 	{
 		struct stat st;
 		bool		have_label = (stat(BACKUP_LABEL_FILE, &st) == 0);
@@ -6197,7 +6206,7 @@ StartupXLOG(void)
 	 * an anchor yet (label-provisioned first boot) is a no-op: creation
 	 * happens only at the checkpoint hook and the seed path.
 	 */
-	if (cluster_controlfile_shared_authority)
+	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_refresh_state(ControlFile->system_identifier,
 											  (uint32) DB_IN_PRODUCTION);
 
@@ -7452,7 +7461,7 @@ CreateCheckPoint(int flags)
 	 * gate: the anchor is a per-node file and must keep advancing even
 	 * while this node's shared-authority writes are suppressed.
 	 */
-	if (cluster_controlfile_shared_authority)
+	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_publish_checkpoint(ProcLastRecPtr, &checkPoint,
 												   ControlFile->system_identifier,
 												   shutdown ? (uint32) DB_SHUTDOWNED :

@@ -168,16 +168,22 @@ cluster_cf_contract_load(const char *p pg_attribute_unused())
 	return CLUSTER_CF_CONTRACT_UNVERIFIED;
 }
 
-/* find_peer_node() deps (verify_or_fail path; not exercised). */
+/* find_peer_node() / respond_tick deps.  Settable so the respond_tick leg
+ * can present a 2-node config (0 and 1) without dragging cluster_conf.o in. */
+static int stub_node_count = 1;
+static int stub_known_node = -1;
+
 const void *
-cluster_conf_lookup_node(int32 id pg_attribute_unused())
+cluster_conf_lookup_node(int32 id)
 {
-	return NULL;
+	static const int marker = 1;
+
+	return (stub_known_node >= 0 && id == stub_known_node) ? (const void *)&marker : NULL;
 }
 int
 cluster_conf_node_count(void)
 {
-	return 1;
+	return stub_node_count;
 }
 
 /* pg_strong_random is only used by verify_or_fail (not exercised); a local stub
@@ -294,13 +300,71 @@ UT_TEST(test_rendezvous_timeout)
 	UT_ASSERT(!cluster_cf_phase2_rendezvous(shared_root, 0, 1, 0x5555ULL, 0));
 }
 
+/* ======================================================================
+ * spec-5.6a: steady-state responder acks a fresh peer probe exactly once
+ * (a rejoining peer's rendezvous completes against a silent live node).
+ * ====================================================================== */
+UT_TEST(test_respond_tick)
+{
+	uint64 echo;
+
+	make_shared_root();
+
+	/* self = node 0; peer = node 1 in a 2-node config */
+	cluster_controlfile_shared_authority = true;
+	cluster_enabled = true;
+	cluster_shared_data_dir = shared_root;
+	stub_node_count = 2;
+	stub_known_node = 1;
+
+	/* no probe yet -> nothing acked */
+	cluster_cf_phase2_respond_tick();
+	UT_ASSERT(!cluster_cf_phase2_read_ack(shared_root, 1, &echo));
+
+	/* the rejoining peer publishes a fresh probe -> the tick acks it */
+	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 1, UINT64CONST(0x1111000122220002)));
+	cluster_cf_phase2_respond_tick();
+	UT_ASSERT(cluster_cf_phase2_read_ack(shared_root, 1, &echo));
+	UT_ASSERT_EQ(echo, UINT64CONST(0x1111000122220002));
+
+	/* same nonce again -> no rewrite needed (ack removed stays removed) */
+	{
+		char ackpath[MAXPGPATH];
+
+		snprintf(ackpath, sizeof(ackpath), "%s/%s/ack.1", shared_root, CLUSTER_CF_PHASE2_DIR);
+		unlink(ackpath);
+	}
+	cluster_cf_phase2_respond_tick();
+	UT_ASSERT(!cluster_cf_phase2_read_ack(shared_root, 1, &echo));
+
+	/* a NEW nonce (peer rebooted again) is acked afresh */
+	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 1, UINT64CONST(0x3333000344440004)));
+	cluster_cf_phase2_respond_tick();
+	UT_ASSERT(cluster_cf_phase2_read_ack(shared_root, 1, &echo));
+	UT_ASSERT_EQ(echo, UINT64CONST(0x3333000344440004));
+
+	/* gates: authority off -> no-op */
+	{
+		char ackpath[MAXPGPATH];
+
+		snprintf(ackpath, sizeof(ackpath), "%s/%s/ack.1", shared_root, CLUSTER_CF_PHASE2_DIR);
+		unlink(ackpath);
+	}
+	cluster_controlfile_shared_authority = false;
+	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 1, UINT64CONST(0x5555000566660006)));
+	cluster_cf_phase2_respond_tick();
+	UT_ASSERT(!cluster_cf_phase2_read_ack(shared_root, 1, &echo));
+	cluster_controlfile_shared_authority = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(test_probe_ack_roundtrip);
 	UT_RUN(test_rendezvous_success);
 	UT_RUN(test_rendezvous_timeout);
+	UT_RUN(test_respond_tick);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

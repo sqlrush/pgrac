@@ -141,10 +141,15 @@ EOC
 # ----------
 # Step 1: node0 single-node seeds the shared authorities (t/337 recipe).
 # ----------
+# spec-5.6a grow-from-single provisioning contract: the seed node sets its
+# cluster.node_id before its final single-era shutdown so that shutdown's
+# checkpoint writes the per-node recovery anchor its first cluster boot
+# needs (label-less multi-node boot without an anchor = 53RB3).
 $node0->append_conf('postgresql.conf', $sc_common);
 $node0->append_conf('postgresql.conf', <<EOC);
 cluster.enabled = off
 cluster.lms_enabled = off
+cluster.node_id = 0
 EOC
 
 $node0->start;

@@ -179,6 +179,14 @@ proc_exit(int code pg_attribute_unused())
 	abort();
 }
 
+/* spec-5.6a: CssdMain's heartbeat tick acks cf phase-2 probes; the tick
+ * body lives in cluster_cf_phase2.o (not linked here) and the main loop is
+ * not exercised, so a no-op stub satisfies the link (respond_tick itself is
+ * covered by test_cluster_cf_phase2). */
+void
+cluster_cf_phase2_respond_tick(void)
+{}
+
 /* CssdMain runtime stubs (Step 4 wires postmaster spawn;tests don't
  * invoke the full main loop). */
 #include "miscadmin.h"

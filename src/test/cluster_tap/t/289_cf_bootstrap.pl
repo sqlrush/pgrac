@@ -33,6 +33,24 @@
 #      L4  Phase-2 verified: both persisted the cross-node rename contract
 #          (the cf phase-2 LOG line / the node stays up = role gate passed).
 #
+#    spec-5.6a restart legs (per-node recovery anchor; the shared authority's
+#    checkpoint fields are deliberately poisoned with the peer's checkpoint
+#    before every restart, so each leg fails without the anchor):
+#      L-r1 crash-restart with the peer alive: node1 kill9 after a node0
+#           checkpoint overwrote the shared authority; restart adopts the
+#           anchor and replays its own tail ("redo done at" >= the LSN
+#           written before the crash).  This stack runs lms off, so the
+#           tail is driven with pg_logical_emit_message (user-table writes
+#           would hit the relation-extend gate); data-truth restart
+#           coverage on the full stack is t/339's.
+#      L-r2 clean-restart order: clean stop -> start must NOT run recovery
+#           (anchor state SHUTDOWNED) even though the shared state says the
+#           peer is IN_PRODUCTION; immediate-stop -> start must run it.
+#      L-r3 anchor missing (with .bak): label-less boot fails closed 53RB3.
+#      L-r4 corrupt primary -> .bak adoption WARNING; both corrupt -> 53RB3.
+#      L-r5 injection forces the fail-closed branch on a healthy anchor
+#           (L408); disarmed reboot moves recovery_anchor_boot_adopt_count.
+#
 #    NO SKIP for the core (L77).  lms is OFF here to isolate Phase-2 + the
 #    authority bootstrap from the GES checkpoint path (CF X serialization is
 #    t/288).
@@ -49,6 +67,7 @@
 # NOTES
 #    pgrac-original file.
 #    Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (§3.3 / §3.9 T6)
+#    Spec: spec-5.6a-per-node-recovery-anchor.md (§4 L-r1 .. L-r5)
 #
 #-------------------------------------------------------------------------
 
@@ -58,6 +77,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::RealBin/../../perl";
 
+use File::Copy qw(copy);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -99,12 +119,18 @@ $node1->init_from_backup($node0, 'cfb');
 # ----------
 # Step 1: node0 single-node builds the shared authority (t/287 recipe).
 # ----------
+# spec-5.6a grow-from-single provisioning contract: the seed node sets its
+# cluster.node_id BEFORE its final single-era shutdown, so that shutdown's
+# checkpoint writes the per-node recovery anchor it will need on its first
+# boot as a cluster member (a label-less multi-node boot without an anchor
+# fails closed, 53RB3).
 $node0->append_conf('postgresql.conf', <<EOC);
 shared_buffers = 16MB
 cluster.enabled = off
 cluster.lms_enabled = off
 cluster.shared_data_dir = '$shared_root'
 cluster.controlfile_shared_authority = on
+cluster.node_id = 0
 EOC
 $node0->start;
 # The authority file must now exist under the shared root.
@@ -220,6 +246,191 @@ ok(-f $node0->data_dir . '/global/pgrac_cf_contract',
 	'L4c: node0 persisted its cross-node storage contract record');
 ok(-f $node1->data_dir . '/global/pgrac_cf_contract',
 	'L4d: node1 persisted its cross-node storage contract record');
+
+# ==========================================================================
+# spec-5.6a: per-node recovery anchor restart legs (L-r1 .. L-r5).
+#
+# Every leg first poisons the shared authority's checkpoint fields with the
+# PEER's checkpoint (a node0 CHECKPOINT overwrites them), so a restarting
+# node1 that consulted the shared fields would look for a foreign checkpoint
+# in its own WAL thread and PANIC.  Coming up at all is the anchor working.
+# ==========================================================================
+my $anchor1     = "$shared_root/global/pgrac_recovery_anchor_n1";
+my $anchor1_bak = "$anchor1.bak";
+
+sub cf_counter
+{
+	my ($node, $key) = @_;
+	my $v = $node->safe_psql('postgres', qq{
+		SELECT coalesce(value::bigint, 0) FROM pg_cluster_state
+		WHERE category = 'cf' AND key = '$key'});
+	return $v // 0;
+}
+
+# Numeric compare of two X/Y LSN strings: -1 / 0 / 1.
+sub lsn_cmp
+{
+	my ($a, $b) = @_;
+	my ($ah, $al) = map { hex } split qr{/}, $a;
+	my ($bh, $bl) = map { hex } split qr{/}, $b;
+	return $ah <=> $bh || $al <=> $bl;
+}
+
+# Flip one byte at the given offset of a file (corrupts its CRC).
+sub flip_byte
+{
+	my ($path, $off) = @_;
+	open my $fh, '+<', $path or die "flip_byte open $path: $!";
+	binmode $fh;
+	seek $fh, $off, 0 or die "flip_byte seek: $!";
+	defined(read $fh, my $b, 1) or die "flip_byte read: $!";
+	seek $fh, $off, 0 or die "flip_byte re-seek: $!";
+	print $fh chr(ord($b) ^ 0xFF);
+	close $fh;
+}
+
+# node0 CHECKPOINT with retry: right after a node1 stop/kill the membership
+# reconfigures and the CF X grant can transiently fail; poisoning must land
+# before the leg proceeds, so retry until it does.
+sub poison_authority_from_node0
+{
+	my ($why) = @_;
+	for (1 .. 60)
+	{
+		my ($rc) = $node0->psql('postgres', 'CHECKPOINT');
+		return if defined $rc && $rc == 0;
+		usleep(1_000_000);
+	}
+	die "node0 CHECKPOINT never succeeded ($why)";
+}
+
+ok(-f $anchor1, 'L-r0: node1 has a per-node recovery anchor after its first checkpoint');
+
+# ----------
+# L-r1: crash-restart with the peer alive.
+# ----------
+$node1->safe_psql('postgres', 'CHECKPOINT');
+# Un-checkpointed WAL tail on node1's own thread (lms is off here, so no
+# user-table writes: they would hit the relation-extend gate).  The pre-tail
+# LSN is the replay lower bound: kill9 may legitimately lose the very tail
+# of the unflushed stream, but recovery must replay PAST the checkpoint into
+# the emitted tail -- impossible from a foreign checkpoint pointer.
+my $r1_lsn = $node1->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+$node1->safe_psql('postgres',
+	"SELECT pg_logical_emit_message(true, 'ra_r1', 'tail-' || g) FROM generate_series(1,50) g");
+poison_authority_from_node0('L-r1 poison');
+
+my $r1_off = -s $node1->logfile;
+$node1->kill9;
+$node1->start;
+my $r1_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r1_off);
+like($r1_log, qr/using per-node recovery anchor for node 1/,
+	'L-r1: node1 adopted its own recovery anchor on crash-restart');
+like($r1_log, qr/database system was not properly shut down; automatic recovery in progress/,
+	'L-r1: node1 ran its own crash recovery');
+unlike($r1_log, qr/could not locate a valid checkpoint record/,
+	'L-r1: no foreign-checkpoint PANIC despite the poisoned shared authority');
+my ($redo_done) = ($r1_log =~ /redo done at ([0-9A-F]+\/[0-9A-F]+)/);
+ok(defined $redo_done && lsn_cmp($redo_done, $r1_lsn) > 0,
+	sprintf('L-r1: own tail replayed past the pre-tail LSN (redo done %s > %s)',
+		$redo_done // 'none', $r1_lsn));
+
+# ----------
+# L-r2: clean-restart order.  After node1's clean stop the shared authority is
+# poisoned again (state DB_IN_PRODUCTION, node0's checkpoint), so only the
+# anchor can prove "this node shut down cleanly -> no recovery".
+# ----------
+$node1->stop;
+poison_authority_from_node0('L-r2 poison');
+
+my $r2_off = -s $node1->logfile;
+$node1->start;
+my $r2_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r2_off);
+like($r2_log, qr/database system was shut down at/,
+	'L-r2a: clean restart is recognized as clean from the anchor');
+unlike($r2_log, qr/automatic recovery in progress/,
+	'L-r2a: no crash recovery on a clean restart');
+
+$node1->stop('immediate');
+poison_authority_from_node0('L-r2b poison');
+
+$r2_off = -s $node1->logfile;
+$node1->start;
+$r2_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r2_off);
+like($r2_log, qr/database system was not properly shut down; automatic recovery in progress/,
+	'L-r2b: immediate-stop restart runs crash recovery (anchor state IN_PRODUCTION)');
+
+# ----------
+# L-r3: anchor missing (both primary and .bak) -> label-less boot fails
+# closed with the 53RB3 face; the node is NOT allowed to guess from the
+# shared authority.
+# ----------
+$node1->stop;
+copy($anchor1, "$anchor1.saved") or die "save anchor: $!";
+copy($anchor1_bak, "$anchor1_bak.saved") or die "save anchor bak: $!";
+unlink $anchor1, $anchor1_bak;
+
+my $r3_off = -s $node1->logfile;
+my $r3 = $node1->start(fail_ok => 1);
+ok(!$r3, 'L-r3: label-less boot without an anchor refuses to start');
+my $r3_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r3_off);
+like($r3_log, qr/per-node recovery anchor for node 1 is missing or invalid/,
+	'L-r3: the failure is the 53RB3 anchor fail-closed gate');
+like($r3_log, qr/Re-provision this node from a base backup/,
+	'L-r3: the errhint names the recovery action');
+
+copy("$anchor1.saved", $anchor1) or die "restore anchor: $!";
+copy("$anchor1_bak.saved", $anchor1_bak) or die "restore anchor bak: $!";
+
+# ----------
+# L-r4: corrupt primary -> the strictly-validated .bak is adopted (WARNING);
+# corrupt both -> fail-closed.
+# ----------
+flip_byte($anchor1, 24);
+my $r4_off = -s $node1->logfile;
+$node1->start;
+my $r4_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r4_off);
+like($r4_log, qr/recovery anchor for node 1 was adopted from its backup copy/,
+	'L-r4a: corrupt primary falls back to the .bak with a WARNING');
+$node1->stop;
+
+# The shutdown checkpoint just rewrote a fresh primary/.bak pair; save it,
+# then corrupt both.
+copy($anchor1, "$anchor1.saved") or die "save anchor: $!";
+copy($anchor1_bak, "$anchor1_bak.saved") or die "save anchor bak: $!";
+flip_byte($anchor1, 24);
+flip_byte($anchor1_bak, 24);
+
+$r4_off = -s $node1->logfile;
+my $r4 = $node1->start(fail_ok => 1);
+ok(!$r4, 'L-r4b: boot with primary AND .bak corrupt refuses to start');
+$r4_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r4_off);
+like($r4_log, qr/per-node recovery anchor for node 1 is missing or invalid/,
+	'L-r4b: the failure is the 53RB3 anchor fail-closed gate');
+
+copy("$anchor1.saved", $anchor1) or die "restore anchor: $!";
+copy("$anchor1_bak.saved", $anchor1_bak) or die "restore anchor bak: $!";
+
+# ----------
+# L-r5 (L408): the injection point forces the StartupXLOG fail-closed branch
+# on a node whose on-disk anchor is healthy; the disarmed reboot proves the
+# adoption branch through the counter.
+# ----------
+$node1->append_conf('postgresql.conf',
+	"cluster.injection_points = 'cluster-recovery-anchor-force-failclosed:skip'\n");
+my $r5_off = -s $node1->logfile;
+my $r5 = $node1->start(fail_ok => 1);
+ok(!$r5, 'L-r5: forced fail-closed branch refuses the boot despite a healthy anchor');
+my $r5_log = substr(PostgreSQL::Test::Utils::slurp_file($node1->logfile), $r5_off);
+like($r5_log, qr/per-node recovery anchor for node 1 is missing or invalid/,
+	'L-r5: the injected failure surfaces the same 53RB3 face');
+
+$node1->append_conf('postgresql.conf', "cluster.injection_points = ''\n");
+$node1->start;
+cmp_ok(cf_counter($node1, 'recovery_anchor_boot_adopt_count'), '>=', 1,
+	'L-r5: disarmed reboot adopted the anchor (recovery_anchor_boot_adopt_count moved)');
+cmp_ok(cf_counter($node0, 'recovery_anchor_write_count'), '>=', 1,
+	'L-r5: node0 checkpoints moved recovery_anchor_write_count');
 
 $node0->stop;
 $node1->stop;

@@ -708,7 +708,7 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 			struct stat label_st;
 
 			snprintf(label_path, sizeof(label_path), "%s/backup_label", local_pgdata);
-			if (stat(label_path, &label_st) != 0) {
+			if (cluster_node_id >= 0 && stat(label_path, &label_st) != 0) {
 				ClusterRecoveryAnchor ra;
 
 				cluster_recovery_anchor_build_from_controlfile(&local_cf, &ra);
@@ -873,8 +873,11 @@ cluster_cf_startup_prepare(const char *pgdata)
 	 * foreign fields (StartupXLOG re-checks and stays the authoritative
 	 * consumer; this is the early, actionable error).  A backup_label boot
 	 * is exempt: the label is the one-shot provisioning authority and the
-	 * first own checkpoint creates the anchor.
+	 * first own checkpoint creates the anchor.  Scoped to the multi-node
+	 * regime (cluster.enabled=on): the single-node-authority window admits
+	 * exactly one writer, so the shared fields are this node's own there.
 	 */
+	if (cluster_enabled)
 	{
 		char label_path[MAXPGPATH];
 		struct stat label_st;

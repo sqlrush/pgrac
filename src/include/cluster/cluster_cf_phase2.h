@@ -61,6 +61,14 @@ extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uin
 extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo);
 
 /*
+ * Steady-state probe responder (spec-5.6a): acks any configured peer's
+ * fresh probe so a node crash-restarting into a live cluster can complete
+ * its bootstrap rendezvous.  Called from the CSSD heartbeat cadence; no-op
+ * unless the shared authority is on and the cluster is multi-node.
+ */
+extern void cluster_cf_phase2_respond_tick(void);
+
+/*
  * cluster_cf_phase2_rendezvous -- run the symmetric nonce+ack handshake from
  * this node against `peer_id` over `shared_dir`, bounded by timeout_ms.
  * Returns true iff BOTH directions verified (this node saw the peer's probe,

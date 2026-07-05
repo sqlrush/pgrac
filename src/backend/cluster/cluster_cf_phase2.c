@@ -326,3 +326,54 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 					peer_id)));
 	}
 }
+
+/*
+ * cluster_cf_phase2_respond_tick -- steady-state probe responder
+ * (spec-5.6a D6 substrate repair).
+ *
+ *	The boot-time rendezvous above acks peer probes only while THIS node is
+ *	itself inside its bootstrap loop, so a node crash-restarting into a live
+ *	cluster could never get its fresh nonce acked: the live peer was
+ *	steady-state and silent, and the rejoiner failed closed at the multi-node
+ *	role gate ("cannot establish bootstrap shared control-file authority").
+ *	This tick, run from the CSSD heartbeat cadence, acks any configured
+ *	peer's probe whose nonce has not been acked yet, giving a rejoining peer
+ *	its live-peer + cross-node-visibility proof (the same conclusion the
+ *	concurrent-bootstrap rendezvous establishes; same files, same protocol).
+ *
+ *	Cheap and idempotent: one small read per configured peer per tick, an
+ *	ack write only when a fresh probe appears.  Acking a stale leftover
+ *	probe is harmless -- no one waits on it, and a rebooting peer always
+ *	publishes a fresh nonce first.
+ */
+void
+cluster_cf_phase2_respond_tick(void)
+{
+	static uint64 last_acked_nonce[CLUSTER_MAX_NODES]; /* CSSD process-local */
+	static bool last_acked_valid[CLUSTER_MAX_NODES];
+	int id;
+
+	if (!cluster_controlfile_shared_authority)
+		return;
+	if (!cluster_enabled || cluster_conf_node_count() <= 1)
+		return;
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return;
+
+	for (id = 0; id < CLUSTER_MAX_NODES; id++) {
+		uint64 nonce;
+
+		if (id == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(id) == NULL)
+			continue;
+		if (!cluster_cf_phase2_read_probe(cluster_shared_data_dir, id, &nonce))
+			continue;
+		if (last_acked_valid[id] && last_acked_nonce[id] == nonce)
+			continue;
+		if (cluster_cf_phase2_write_ack(cluster_shared_data_dir, id, nonce)) {
+			last_acked_nonce[id] = nonce;
+			last_acked_valid[id] = true;
+		}
+	}
+}

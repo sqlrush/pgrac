@@ -81,6 +81,7 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_cssd.h"
+#include "cluster/cluster_cf_phase2.h" /* respond_tick: steady-state probe ack (spec-5.6a) */
 #include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node (SRF row filter) */
 #include "cluster/cluster_guc.h"	   /* cluster_node_id + cssd_* GUCs */
 #include "cluster/cluster_ic_router.h" /* ClusterICFanoutResult (heartbeat tick read result) */
@@ -929,6 +930,13 @@ CssdMain(void)
 			now_us = (uint64)GetCurrentTimestamp();
 			if (now_us >= next_heartbeat_at) {
 				cssd_heartbeat_broadcast_tick();
+
+				/* spec-5.6a: ack any rejoining peer's cf phase-2 probe at
+				 * the heartbeat cadence -- a steady-state node is otherwise
+				 * silent and a crash-restarting peer could never complete
+				 * its bootstrap rendezvous (fail-closed at the role gate). */
+				cluster_cf_phase2_respond_tick();
+
 				next_heartbeat_at = now_us + (uint64)cluster_cssd_heartbeat_interval_ms * 1000ULL;
 			}
 
