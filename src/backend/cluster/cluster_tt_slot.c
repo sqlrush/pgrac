@@ -121,6 +121,21 @@ typedef struct ClusterTTSlotShmem {
 	 */
 	pg_atomic_uint64 retention_off_recycle_count;
 
+	/*
+	 * spec-6.12i CP5 (D-i4): monotonic MAX over the gate horizon of every
+	 * HORIZON-GATED COMMITTED recycle this incarnation.  This is the bound
+	 * the cross-instance origin verdict ships for a complete-scan 0-match:
+	 * every gated recycle proved its commit_scn at/below the gate horizon,
+	 * so the max over those horizons upper-bounds every recycled commit_scn
+	 * — and unlike the CURRENT horizon (which falls back to the live SCN
+	 * clock and Lamport-chases any observing peer forever), it only moves
+	 * when a recycle actually happens, so a peer that observed it can catch
+	 * up (requester leg (e) converges).  InvalidScn until the first gated
+	 * recycle this incarnation -> the verdict serve refuses (fail-closed;
+	 * pre-restart recycles are not covered by this incarnation's tracker).
+	 */
+	pg_atomic_uint64 retention_max_recycle_horizon;
+
 	/* spec-3.13 D5: entries refused for recycle because wrap reached
 	 * TT_WRAP_MAX (ABA fail-fast guard; cleared only by whole-segment
 	 * rollover/reuse which resets wraps to 0).  Bumped by BOTH selection
@@ -236,6 +251,35 @@ tt_slot_count_wrap_retired(void)
 {
 	if (ClusterTTSlotShm != NULL)
 		pg_atomic_fetch_add_u64(&ClusterTTSlotShm->tt_slot_wrap_retired_count, 1);
+}
+
+/*
+ * tt_slot_note_gated_recycle_horizon / cluster_tt_slot_note_gated_recycle_
+ * horizon -- spec-6.12i CP5 (D-i4): fold the gate horizon of a HORIZON-GATED
+ * COMMITTED recycle into the monotonic max tracker (see the shmem field
+ * comment).  Lock-free CAS max: callers hold different per-segment locks (or
+ * the lifecycle lock, for the segment-granularity feed), so the max must be
+ * its own atomic protocol.  scn_time_cmp keeps the SCN ordering discipline.
+ */
+static void
+tt_slot_note_gated_recycle_horizon(SCN horizon)
+{
+	uint64 old;
+
+	if (ClusterTTSlotShm == NULL || !SCN_VALID(horizon))
+		return;
+	old = pg_atomic_read_u64(&ClusterTTSlotShm->retention_max_recycle_horizon);
+	while (!SCN_VALID((SCN)old) || scn_time_cmp(horizon, (SCN)old) > 0) {
+		if (pg_atomic_compare_exchange_u64(&ClusterTTSlotShm->retention_max_recycle_horizon, &old,
+										   (uint64)horizon))
+			break;
+	}
+}
+
+void
+cluster_tt_slot_note_gated_recycle_horizon(SCN horizon)
+{
+	tt_slot_note_gated_recycle_horizon(horizon);
 }
 
 
@@ -393,6 +437,8 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 			 * this incarnation (cluster_cr_retention_proof_valid). */
 			if (!gate_enabled || !SCN_VALID(horizon))
 				pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_off_recycle_count, 1);
+			else
+				tt_slot_note_gated_recycle_horizon(horizon); /* spec-6.12i CP5 */
 		}
 	} else {
 		/*
@@ -469,6 +515,8 @@ cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats)
 			 * xmax 0-match shortcut fails closed (cluster_cr_retention_proof_valid). */
 			if (!SCN_VALID(horizon))
 				pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_off_recycle_count, 1);
+			else
+				tt_slot_note_gated_recycle_horizon(horizon); /* spec-6.12i CP5 */
 		}
 		tt_slot_entry_recycle_locked(e, InvalidTransactionId);
 		gcd++;
@@ -789,6 +837,7 @@ cluster_tt_slot_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTSlotShm->tt_slot_retain_skip_count, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_recycle_count, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_off_recycle_count, 0);
+		pg_atomic_init_u64(&ClusterTTSlotShm->retention_max_recycle_horizon, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->tt_slot_wrap_retired_count, 0);
 		SpinLockInit(&ClusterTTSlotShm->protected_lock);
 		ClusterTTSlotShm->protected_count = 0;
@@ -822,6 +871,21 @@ cluster_tt_slot_retention_recycle_count(void)
 	if (ClusterTTSlotShm == NULL)
 		return 0;
 	return pg_atomic_read_u64(&ClusterTTSlotShm->retention_recycle_count);
+}
+
+/*
+ * cluster_tt_slot_max_recycle_horizon -- spec-6.12i CP5 (D-i4): the monotonic
+ * max gate horizon over every horizon-gated COMMITTED recycle this
+ * incarnation (slot-level AND segment-level feeds).  InvalidScn until the
+ * first gated recycle -- the origin-verdict serve must then refuse a
+ * below-horizon claim (fail-closed).
+ */
+SCN
+cluster_tt_slot_max_recycle_horizon(void)
+{
+	if (ClusterTTSlotShm == NULL)
+		return InvalidScn;
+	return (SCN)pg_atomic_read_u64(&ClusterTTSlotShm->retention_max_recycle_horizon);
 }
 
 /*

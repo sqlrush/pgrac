@@ -292,7 +292,7 @@ typedef enum GcsBlockReplyStatus {
 													 * still-foreign chain there hits
 													 * the class-③ walk backstop ->
 													 * 53R9G (Rule 8.A). */
-	GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT = 18		  /* PGRAC: spec-6.12i NEW; the
+	GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT = 18,		  /* PGRAC: spec-6.12i NEW; the
 													 * origin's LMS read its own
 													 * TT-bearing undo header block
 													 * (D-i1) and CO-SAMPLED the live
@@ -307,6 +307,19 @@ typedef enum GcsBlockReplyStatus {
 													 * block, never flushed; consumed
 													 * only by the runtime-visibility
 													 * fetch (Rule 8.A). */
+	GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT = 19		  /* PGRAC: spec-6.12i D-i4 /
+													 * spec-6.15 D4 NEW; the origin's
+													 * LMS ran the COMPLETE own-TT
+													 * by-xid scan + CLOG cross-check
+													 * + retention origin legs and
+													 * ships a ClusterGcsUndoVerdictPage
+													 * (in the BLCKSZ area) under the
+													 * same co-sampled authority
+													 * carriage as status 18 (epoch /
+													 * live_hwm_lsn / trailer).  Every
+													 * unprovable outcome is a DENIED
+													 * reply instead — the requester
+													 * keeps 53R97 (Rule 8.A). */
 } GcsBlockReplyStatus;
 
 /* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
@@ -324,7 +337,9 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_
 							== GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1,
 				 "spec-6.12b CR result statuses must be the tail enum values");
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT == GCS_BLOCK_REPLY_CR_RESULT_PARTIAL + 1,
-				 "spec-6.12i undo-TT fetch status must be the tail enum value");
+				 "spec-6.12i undo-TT fetch status must precede the verdict status");
+StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT + 1,
+				 "spec-6.12i undo-verdict status must be the tail enum value");
 
 static inline bool
 GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
@@ -1159,6 +1174,36 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
 		fwd, exact_holder_arm && GcsBlockRequestPayloadIsDirectLandArmed(req));
 }
 
+/* PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request carried in
+ * reserved_0[6] VALUE 2 (the byte is value-multiplexed with the undo-TT
+ * fetch, value 1 — see the allocation list on the undo-fetch flag above;
+ * one FORWARD is only ever one of the two request kinds).
+ *
+ *	Sent REQUESTER -> ORIGIN when the single-block positive proof came back
+ *	NONE (0-match / ambiguity): ask the origin for a COMPLETE own-TT by-xid
+ *	verdict instead.  The asked-for xid rides the expected-PI-watermark SCN
+ *	carrier (widened to uint64; the upper 32 bits MUST be zero — the origin
+ *	validates on decode), and the BufferTag stays the synthetic undo address
+ *	of the ref's segment (kept for tag validity + observability only: the
+ *	verdict scan is complete over ALL of the origin's own segments, so the
+ *	segment field does not scope the answer).  The origin's LMON validates +
+ *	parks for LMS; LMS serves ONLY xids the spec-6.15 stripe derivation
+ *	proves its own (cluster_xid_is_mine — the D4 self-check), runs the
+ *	complete durable-TT scan + CLOG cross-check + retention origin legs and
+ *	ships UNDO_VERDICT_RESULT, or a DENIED status which the requester maps
+ *	to the unchanged 53R97 fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool undo_verdict)
+{
+	p->reserved_0[6] = undo_verdict ? (uint8)2 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)2;
+}
+
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.
  *
  *	An undo block has no BufferTag (undo segment files live outside shared
@@ -1240,6 +1285,59 @@ ClusterGcsUndoAuthTrailerGetTtGeneration(const ClusterGcsUndoAuthTrailer *t)
 		   | (((uint64)t->tt_generation_bytes[6]) << 48)
 		   | (((uint64)t->tt_generation_bytes[7]) << 56);
 }
+
+/* PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — verdict page carried in the BLCKSZ
+ * area of an UNDO_VERDICT_RESULT reply (rest of the page is zero; the reply
+ * checksum covers the whole BLCKSZ area exactly like every other reply).
+ *
+ *	The verdict is the origin's answer over its COMPLETE own durable TT
+ *	(cluster_tt_slot_durable_resolve_by_xid) cross-checked against its own
+ *	CLOG (AD-006: CLOG is the committed-ness authority; the TT carries
+ *	commit_scn), under the same co-sampled live authority carriage as the
+ *	single-block fetch (hdr.epoch / hdr.page_lsn / auth trailer):
+ *
+ *	  COMMITTED_EXACT          exactly one COMMITTED slot match with a valid
+ *	                           commit_scn, CLOG-confirmed, wrap-suspect gate
+ *	                           passed (cluster_cr_accept_resolved_scn).
+ *	  COMMITTED_BELOW_HORIZON  complete-scan 0-match + CLOG COMMITTED + the
+ *	                           spec-3.22 retention origin legs: the xact's
+ *	                           slot was horizon-gated-recycled, so its (lost)
+ *	                           commit_scn is provably <= horizon_scn.  The
+ *	                           exact value is gone — the requester may use
+ *	                           the bound ONLY for a read_scn at/after the
+ *	                           horizon (requester leg (e)), and must never
+ *	                           cache/stamp the bound as an exact scn.
+ *	  ABORTED                  terminal abort: either an exact ABORTED-slot
+ *	                           match or complete-scan 0-match + explicit
+ *	                           CLOG ABORTED.
+ *
+ *	horizon_scn doubles as the Lamport-observe carrier: an SCN that crossed
+ *	the wire MUST be observed by the receiver (AD-008) so a horizon ahead of
+ *	the requester's clock makes the NEXT snapshot admissible instead of
+ *	failing leg (e) forever. */
+#define CLUSTER_GCS_UNDO_VERDICT_MAGIC ((uint32)0x50475556) /* "PGUV" */
+#define CLUSTER_GCS_UNDO_VERDICT_VERSION ((uint32)1)
+
+typedef enum ClusterGcsUndoVerdictKind {
+	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
+	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON = 2,
+	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3
+} ClusterGcsUndoVerdictKind;
+
+typedef struct ClusterGcsUndoVerdictPage {
+	uint32 magic;		 /* CLUSTER_GCS_UNDO_VERDICT_MAGIC */
+	uint32 version;		 /* CLUSTER_GCS_UNDO_VERDICT_VERSION */
+	uint64 xid_echo;	 /* asked-for xid widened to u64 (upper 32 bits zero) */
+	uint8 verdict;		 /* ClusterGcsUndoVerdictKind */
+	uint8 reserved_0[7]; /* must be zero */
+	uint64 commit_scn;	 /* COMMITTED_EXACT only, else InvalidScn */
+	uint64 horizon_scn;	 /* COMMITTED_BELOW_HORIZON bound, else InvalidScn */
+	uint16 wrap;		 /* COMMITTED_EXACT slot wrap evidence */
+	uint8 reserved_1[6]; /* must be zero */
+} ClusterGcsUndoVerdictPage;
+
+StaticAssertDecl(sizeof(ClusterGcsUndoVerdictPage) == 48,
+				 "spec-6.12i ClusterGcsUndoVerdictPage wire ABI is 48 bytes");
 
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate

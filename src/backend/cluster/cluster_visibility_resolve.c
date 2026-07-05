@@ -37,6 +37,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 
+#include "cluster/cluster_cr.h" /* spec-6.15 D4: underivable counter */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"				/* cluster_node_id, subtrans depth */
 #include "cluster/cluster_itl.h"				/* get_tt_ref / lock ref / multixact origin */
@@ -50,6 +51,7 @@
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
+#include "cluster/cluster_xid_stripe.h"	   /* spec-6.15 D4: origin derivation */
 #include "cluster/cluster_xnode_lever.h"   /* spec-6.12c: terminal memo + D0 counters */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
 
@@ -211,7 +213,7 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
  */
 static void
 classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-			 ClusterVisResolve *out)
+			 SCN read_scn, ClusterVisResolve *out)
 {
 	if (out == NULL || ref == NULL)
 		return;
@@ -342,38 +344,62 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 			}
 		} else if (cluster_crossnode_runtime_visibility) {
 			/*
-			 * PGRAC: spec-6.12i CP3 (D-i2 wiring) — ACTIVE-runtime resolution.
+			 * PGRAC: spec-6.12i CP3/CP5 (D-i2/D-i4 wiring) — ACTIVE-runtime
+			 * resolution.
 			 *
 			 * The origin is NOT materialized (it is live — the materialized
 			 * marker is a crash-recovery artifact), so the recovery-side
 			 * authority above is structurally unavailable and this branch
 			 * used to be unconditionally fail-closed (53R97; the observed
-			 * cross-node concurrent-write collapse).  With the wave GUC on,
-			 * ask the live origin instead: D-i1 fetches the ref's TT header
-			 * block WITH a co-sampled live authority (Cache Fusion shape —
-			 * the transaction state is resolved on the bytes shipped from
-			 * the owner's cache, never on a bypassing disk read), the D-i2
-			 * gate proves that authority covers this tuple's page version in
-			 * the current membership epoch, and the positive-proof scan
-			 * accepts ONLY an exact xid+wrap terminal slot match.  A 0-match
-			 * on the single fetched block is NOT proof of recycled/aborted
-			 * (the slot may live in another segment) — proving absence would
-			 * need a complete origin TT header scan under one authority,
-			 * which is a possible future extension, not this slice.  Every
-			 * unproven outcome falls through to the unchanged
-			 * STALE_OR_AMBIGUOUS -> 53R97 (Rule 8.A: this wave only widens
-			 * "resolve when provable").
+			 * cross-node concurrent-write collapse).
+			 *
+			 * PGRAC: spec-6.15 D4 — the origin to ask is derived from the
+			 * XID ITSELF (cluster_xid_origin_slot: stripe congruence above
+			 * the activation floor), NEVER from ref->origin_node_id: the
+			 * ref names the slot's CURRENT owner, and after a recycle that
+			 * is unrelated to the tuple-side xid — trusting it was the
+			 * original 6.12i false-resolve P0 (overlapping per-node xid
+			 * value spaces made "ask the ref's origin by xid" match another
+			 * node's same-valued xid).  Striping makes the value space
+			 * globally unique above the floor, so:
+			 *   derived == self  -> the xid is OURS (a remote writer merely
+			 *                       recycled our slot): route LOCAL — the
+			 *                       PG-native CLOG path is alias-free for a
+			 *                       provably-own xid;
+			 *   derived == peer  -> ask THAT peer: D-i1 fetch + covers gate
+			 *                       + positive proof, then the D-i4
+			 *                       complete-scan origin verdict on a
+			 *                       0-match (read_scn decides below-horizon
+			 *                       admissibility, leg (e));
+			 *   underivable (-1) -> striping off / below the floor: keep
+			 *                       the unchanged 53R97 (never guess).
+			 * Every unproven outcome falls through to STALE_OR_AMBIGUOUS ->
+			 * 53R97 (Rule 8.A: this wave only widens "resolve when
+			 * provable").
 			 */
-			bool committed = false;
-			SCN scn = InvalidScn;
+			int derived_origin = cluster_xid_origin_slot(raw_xid);
 
-			if (cluster_runtime_visibility_try_resolve_remote((int)ref->origin_node_id,
-															  (uint32)ref->undo_segment_id, raw_xid,
-															  anchor_lsn, &committed, &scn)) {
-				out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
-				out->status = committed ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
-				out->commit_scn = committed ? scn : InvalidScn;
+			if (derived_origin == cluster_node_id) {
+				out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
 				return;
+			}
+			if (derived_origin >= 0) {
+				bool committed = false;
+				SCN scn = InvalidScn;
+				bool is_bound = false;
+
+				if (cluster_runtime_visibility_try_resolve_remote(
+						derived_origin, (uint32)ref->undo_segment_id, raw_xid, anchor_lsn, read_scn,
+						&committed, &scn, &is_bound)) {
+					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+					out->status
+						= committed ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+					out->commit_scn = committed ? scn : InvalidScn;
+					out->commit_scn_is_bound = committed ? is_bound : false;
+					return;
+				}
+			} else {
+				cluster_rtvis_note_underivable_failclosed();
 			}
 			cluster_tt_recovery_count_remote_active_failclosed();
 		}
@@ -390,6 +416,14 @@ void
 cluster_visibility_resolve_from_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 									XLogRecPtr anchor_lsn, ClusterVisResolve *out)
 {
+	cluster_visibility_resolve_from_ref_scn(raw_xid, ref, anchor_lsn, InvalidScn, out);
+}
+
+
+void
+cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+										XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
+{
 	if (out == NULL)
 		return;
 
@@ -398,13 +432,21 @@ cluster_visibility_resolve_from_ref(TransactionId raw_xid, const ClusterUndoTTSl
 	out->status = CLUSTER_TT_STATUS_UNKNOWN;
 	out->commit_scn = InvalidScn;
 
-	classify_ref(raw_xid, ref, anchor_lsn, out);
+	classify_ref(raw_xid, ref, anchor_lsn, read_scn, out);
 }
 
 
 void
 cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup, TransactionId raw_xid,
 								 ClusterVisXidKind which, ClusterVisResolve *out)
+{
+	cluster_visibility_resolve_tuple_scn(buffer, htup, raw_xid, which, InvalidScn, out);
+}
+
+
+void
+cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, TransactionId raw_xid,
+									 ClusterVisXidKind which, SCN read_scn, ClusterVisResolve *out)
 {
 	Page page;
 	ClusterUndoTTSlotRef ref;
@@ -436,14 +478,14 @@ cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup, Transactio
 		/* The tuple's own ITL slot records the last writer of this version. */
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref))
-			classify_ref(raw_xid, &ref, anchor_lsn, out);
+			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_LOCK_ONLY:
 		/* Lock-only xmax: the writer slot is found by xmax, not by the
 		 * tuple's own slot index (spec-3.4d D1). */
 		if (cluster_itl_find_lock_tt_ref_by_xmax(page, raw_xid, &ref))
-			classify_ref(raw_xid, &ref, anchor_lsn, out);
+			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_MULTI: {

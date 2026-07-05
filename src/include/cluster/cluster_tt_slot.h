@@ -414,6 +414,20 @@ extern uint32 cluster_tt_slot_protected_count(void);
 extern uint64 cluster_tt_slot_retention_recycle_count(void);
 extern uint64 cluster_tt_slot_retention_off_recycle_count(void); /* spec-3.22 */
 
+/*
+ * spec-6.12i CP5 (D-i4): monotonic max gate horizon over every horizon-gated
+ * COMMITTED recycle this incarnation (InvalidScn before the first one), and
+ * the feed hook for the segment-granularity recycle path (spec-3.13 D3
+ * COMMITTED -> RECYCLABLE advancement; the slot-level alloc/GC feeds are
+ * internal to cluster_tt_slot.c).  This is the bound the cross-instance
+ * origin verdict ships for a complete-scan 0-match: it only advances when a
+ * recycle actually happens, so -- unlike the live retention horizon, whose
+ * no-reader fallback is the current SCN clock -- an observing peer's read_scn
+ * can catch up to it (requester leg (e) converges).
+ */
+extern SCN cluster_tt_slot_max_recycle_horizon(void);
+extern void cluster_tt_slot_note_gated_recycle_horizon(SCN horizon);
+
 
 /*
  * Test-only: wipe all per-node allocator state back to zeroes.  Used by

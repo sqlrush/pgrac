@@ -248,6 +248,41 @@ extern void cluster_rtvis_resolve_note_committed(void);
 extern void cluster_rtvis_resolve_note_aborted(void);
 extern void cluster_rtvis_resolve_note_failclosed(void);
 
+/* spec-6.12i CP5 (D-i4): origin-verdict leg (5 requester + 2 server). */
+extern uint64 cluster_rtvis_verdict_wire_count(void);
+extern uint64 cluster_rtvis_verdict_failclosed_count(void);
+extern uint64 cluster_rtvis_verdict_exact_count(void);
+extern uint64 cluster_rtvis_verdict_below_horizon_count(void);
+extern uint64 cluster_rtvis_verdict_inadmissible_count(void);
+extern uint64 cluster_cr_server_verdict_served_count(void);
+extern uint64 cluster_cr_server_verdict_denied_count(void);
+extern void cluster_rtvis_verdict_note_wire(void);
+extern void cluster_rtvis_verdict_note_failclosed(void);
+extern void cluster_rtvis_verdict_note_exact(void);
+extern void cluster_rtvis_verdict_note_below_horizon(void);
+extern void cluster_rtvis_verdict_note_inadmissible(void);
+
+/* spec-6.15 D4: underivable-origin refusals (classify_ref). */
+extern uint64 cluster_rtvis_underivable_failclosed_count(void);
+extern void cluster_rtvis_note_underivable_failclosed(void);
+
+/*
+ * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict
+ * serve (cluster_cr_server.c).
+ *
+ *	cluster_cr_retention_proof_origin_legs — the spec-3.22 retention-proof
+ *	legs (a)-(d) evaluated on THIS node with the current horizon returned
+ *	for the wire; the requester decides leg (e) against its own read_scn.
+ *	MUST be evaluated after the complete by-xid scan (ordering contract in
+ *	the function comment — the horizon monotonicity argument).
+ *
+ *	cluster_cr_accept_resolved_scn — the authoritative wrap-suspect
+ *	acceptance gate for a by-xid RESOLVED_SCN match (bumps the
+ *	wrap_generation_disambiguated counter on refusal).
+ */
+extern bool cluster_cr_retention_proof_origin_legs(SCN *out_horizon);
+extern bool cluster_cr_accept_resolved_scn(SCN scn);
+
 /* Shmem region register / size / init (L206 5-step). */
 extern Size cluster_cr_shmem_size(void);
 extern void cluster_cr_shmem_init(void);

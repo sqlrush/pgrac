@@ -94,6 +94,15 @@ typedef struct ClusterVisResolve {
 	ClusterVisEvidence evidence;
 	ClusterTTStatus status;		 /* valid when evidence == REMOTE */
 	SCN commit_scn;				 /* valid for COMMITTED / CLEANED_OUT */
+	bool commit_scn_is_bound;	 /* spec-6.12i CP5: commit_scn is a HORIZON
+								   * BOUND from a below-horizon verdict, not
+								   * the exact commit_scn.  It decides
+								   * correctly against the read_scn this
+								   * resolve ran under ONLY; consumers must
+								   * never stamp / cache / memo it as an
+								   * exact scn (a later smaller read_scn
+								   * would read it as committed-after ->
+								   * false-invisible, Rule 8.A). */
 	ClusterUndoTTSlotRef ref;	 /* copied exact ref (REMOTE/LOCAL/STALE) */
 	uint16 multi_marker_origin;	 /* XMAX_MULTI: origin node of marker, else 0 */
 	bool multi_marker_is_remote; /* XMAX_MULTI: marker hit + origin != self */
@@ -115,6 +124,19 @@ extern void cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup
 											 ClusterVisResolve *out);
 
 /*
+ * spec-6.12i CP5: the _scn variant threads the caller's snapshot read_scn
+ * down to the active-runtime resolver so a below-horizon origin verdict can
+ * be judged admissible (requester leg (e)) and returned as a bound
+ * (commit_scn_is_bound).  Callers without snapshot semantics use the plain
+ * variant above (read_scn = InvalidScn -> bounds are never admissible;
+ * exact verdicts still resolve).  Only the HeapTupleSatisfiesMVCC fork
+ * sites pass a real read_scn.
+ */
+extern void cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup,
+												 TransactionId raw_xid, ClusterVisXidKind which,
+												 SCN read_scn, ClusterVisResolve *out);
+
+/*
  * Resolve directly from a caller-supplied ITL ref (e.g. the spec-3.2 D5b
  * test inject hook).  Same classification + remote resolve as
  * cluster_visibility_resolve_tuple but without re-reading the page slot.
@@ -124,6 +146,12 @@ extern void cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup
 extern void cluster_visibility_resolve_from_ref(TransactionId raw_xid,
 												const ClusterUndoTTSlotRef *ref,
 												XLogRecPtr anchor_lsn, ClusterVisResolve *out);
+
+/* spec-6.12i CP5: _scn variant of the above (see resolve_tuple_scn). */
+extern void cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid,
+													const ClusterUndoTTSlotRef *ref,
+													XLogRecPtr anchor_lsn, SCN read_scn,
+													ClusterVisResolve *out);
 
 
 /*

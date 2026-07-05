@@ -2325,6 +2325,17 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
 	result = cluster_undo_segment_try_mark_recyclable(segment_id, owner, horizon);
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 
+	/*
+	 * PGRAC: spec-6.12i CP5 (D-i4) -- a RECYCLABLE segment's durable TT
+	 * slots vanish for the by-xid complete scan once the segment file is
+	 * reused (wiped), so this segment-granularity recycle must feed the max
+	 * gate-horizon tracker exactly like a slot-level recycle: the transition
+	 * proved every slot's commit_scn at/below `horizon`.  Fed at the
+	 * ADVANCED moment (happens-before any wipe of this segment).
+	 */
+	if (result == CLUSTER_SEG_RECYCLE_ADVANCED)
+		cluster_tt_slot_note_gated_recycle_horizon(horizon);
+
 	return result;
 }
 

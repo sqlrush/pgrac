@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_gcs_block.h" /* ClusterGcsUndoVerdictPage (CP5) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
 
@@ -158,4 +159,54 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 
 	/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: not a terminal proof. */
 	return CLUSTER_VIS_TT_PROOF_NONE;
+}
+
+/*
+ * cluster_vis_undo_verdict_page_usable
+ *
+ * CP5 (D-i4) pure structural validation of a shipped verdict page.  See the
+ * header for the contract: every field must be exactly consistent with the
+ * claimed verdict kind, or the page is not evidence about `asked_xid` and
+ * the caller keeps the 53R97 fail-closed boundary.  The read_scn
+ * admissibility of a BELOW_HORIZON bound (requester leg (e)) is NOT decided
+ * here — it needs scn_time_cmp, which is deliberately outside this
+ * dependency-free policy object; the consumer applies it.
+ */
+bool
+cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+									 TransactionId asked_xid)
+{
+	if (v == NULL || !TransactionIdIsNormal(asked_xid))
+		return false;
+
+	if (v->magic != CLUSTER_GCS_UNDO_VERDICT_MAGIC
+		|| v->version != CLUSTER_GCS_UNDO_VERDICT_VERSION)
+		return false;
+
+	/* The echo is the widened xid: upper 32 bits MUST be zero (a non-zero
+	 * high word means a corrupted or foreign carrier, never a valid echo). */
+	if (v->xid_echo != (uint64)asked_xid)
+		return false;
+
+	for (size_t i = 0; i < sizeof(v->reserved_0); i++)
+		if (v->reserved_0[i] != 0)
+			return false;
+	for (size_t i = 0; i < sizeof(v->reserved_1); i++)
+		if (v->reserved_1[i] != 0)
+			return false;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		/* Exact terminal commit: needs the exact scn, carries no bound. */
+		return SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		/* Bound-only commit: needs the horizon, must NOT claim an exact scn
+		 * (a stray commit_scn here could leak into stamp/cache paths). */
+		return !SCN_VALID(v->commit_scn) && SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		/* Terminal abort carries no scn of any kind. */
+		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	default:
+		return false; /* unknown kind: refuse, never guess */
+	}
 }

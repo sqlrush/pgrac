@@ -144,6 +144,31 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 rtvis_resolve_committed_count;
 	pg_atomic_uint64 rtvis_resolve_aborted_count;
 	pg_atomic_uint64 rtvis_resolve_failclosed_count;
+	/*
+	 * spec-6.12i CP5 (D-i4) / spec-6.15 D4: origin-verdict leg (5 requester
+	 * counters + 2 server counters).  requester side: verdict wire round
+	 * trips, verdict-leg fail-closed refusals (wire / covers gate / page
+	 * validation), exact terminal verdicts consumed, below-horizon bounds
+	 * consumed (leg (e) admissible), and below-horizon bounds REFUSED by
+	 * leg (e) (read_scn behind the shipped horizon — the clock-skew
+	 * diagnostic; the observe makes the next snapshot admissible).
+	 * server side (LMS drain): complete-scan verdicts served vs refused.
+	 */
+	pg_atomic_uint64 rtvis_verdict_wire_count;
+	pg_atomic_uint64 rtvis_verdict_failclosed_count;
+	pg_atomic_uint64 rtvis_verdict_exact_count;
+	pg_atomic_uint64 rtvis_verdict_below_horizon_count;
+	pg_atomic_uint64 rtvis_verdict_inadmissible_count;
+	pg_atomic_uint64 cr_server_verdict_served_count;
+	pg_atomic_uint64 cr_server_verdict_denied_count;
+	/*
+	 * spec-6.15 D4: a recycled remote ref whose tuple xid the stripe
+	 * derivation could not attribute (striping off / below the activation
+	 * floor) — the active-runtime resolution never even asks the wire and
+	 * the caller keeps 53R97 (t/347 L2 asserts this stays 0 on a fully
+	 * striped cluster).
+	 */
+	pg_atomic_uint64 rtvis_underivable_failclosed_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -218,6 +243,14 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_resolve_committed_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_resolve_aborted_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_resolve_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_verdict_wire_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_verdict_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_verdict_exact_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_verdict_below_horizon_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_verdict_inadmissible_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_verdict_served_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -280,6 +313,12 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 	case CLUSTER_CR_SERVER_STAT_UNDO_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_undo_denied_count, 1);
 		break;
+	case CLUSTER_CR_SERVER_STAT_VERDICT_SERVED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_verdict_served_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_VERDICT_DENIED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_verdict_denied_count, 1);
+		break;
 	}
 }
 
@@ -327,6 +366,51 @@ cluster_rtvis_resolve_note_failclosed(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_resolve_failclosed_count, 1);
 }
+
+/* PGRAC: spec-6.12i CP5 (D-i4) — origin-verdict leg bumps (backend context,
+ * cluster_runtime_visibility.c). */
+void
+cluster_rtvis_verdict_note_wire(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_verdict_wire_count, 1);
+}
+
+void
+cluster_rtvis_verdict_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_verdict_failclosed_count, 1);
+}
+
+void
+cluster_rtvis_verdict_note_exact(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_verdict_exact_count, 1);
+}
+
+void
+cluster_rtvis_verdict_note_below_horizon(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_verdict_below_horizon_count, 1);
+}
+
+void
+cluster_rtvis_verdict_note_inadmissible(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_verdict_inadmissible_count, 1);
+}
+
+/* PGRAC: spec-6.15 D4 — underivable-origin refusal (classify_ref). */
+void
+cluster_rtvis_note_underivable_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
+}
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -355,6 +439,15 @@ CR_COUNTER_ACCESSOR(cluster_cr_server_undo_denied_count, cr_server_undo_denied_c
 CR_COUNTER_ACCESSOR(cluster_rtvis_resolve_committed_count, rtvis_resolve_committed_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_resolve_aborted_count, rtvis_resolve_aborted_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_resolve_failclosed_count, rtvis_resolve_failclosed_count)
+/* spec-6.12i CP5 (D-i4): origin-verdict leg counters. */
+CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_wire_count, rtvis_verdict_wire_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_failclosed_count, rtvis_verdict_failclosed_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_exact_count, rtvis_verdict_exact_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_below_horizon_count, rtvis_verdict_below_horizon_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_inadmissible_count, rtvis_verdict_inadmissible_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_served_count, cr_server_verdict_served_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_denied_count, cr_server_verdict_denied_count)
+CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)
@@ -1673,7 +1766,44 @@ typedef enum ClusterCrXmaxResolve {
 static bool
 cluster_cr_retention_proof_valid(SCN read_scn)
 {
+	SCN horizon = InvalidScn;
+
+	if (!cluster_cr_retention_proof_origin_legs(&horizon))
+		return false; /* (a)-(d) */
+
+	/* (e) horizon must not be newer than read_scn (scn_time_cmp keeps the gate). */
+	return scn_time_cmp(horizon, read_scn) <= 0;
+}
+
+/*
+ * cluster_cr_retention_proof_origin_legs -- spec-6.12i CP5 (D-i4): the
+ * ORIGIN-side legs (a)-(d) of the spec-3.22 retention proof, extracted so
+ * the origin-verdict serve (cluster_cr_server.c) can evaluate them for a
+ * cross-instance requester whose leg (e) — "horizon not newer than MY
+ * read_scn" — can only be decided at the requester against the shipped
+ * horizon.  Returns true with *out_horizon = the current horizon when every
+ * origin leg holds:
+ *
+ *	(a) own-instance node (a durable scan was actually possible here);
+ *	(b) the retention GUC is on right now;
+ *	(c) no COMMITTED slot was ever recycled ungated this incarnation;
+ *	(d) the current horizon is valid.
+ *
+ * ORDERING CONTRACT (soundness of the shipped bound): the caller must
+ * evaluate these legs — in particular sample the horizon — AFTER its
+ * complete by-xid scan finished.  The horizon is monotonic, so any slot
+ * recycled before a scanned block was read had its commit_scn at or below
+ * the recycle-time horizon, itself at or below this sample; sampling BEFORE
+ * the scan would let a recycle land between sample and scan whose
+ * commit_scn exceeds the shipped bound (false-visible direction, Rule 8.A).
+ */
+bool
+cluster_cr_retention_proof_origin_legs(SCN *out_horizon)
+{
 	SCN horizon;
+
+	if (out_horizon != NULL)
+		*out_horizon = InvalidScn;
 
 	if (cluster_node_id < 0)
 		return false; /* (a) */
@@ -1686,8 +1816,9 @@ cluster_cr_retention_proof_valid(SCN read_scn)
 	if (!SCN_VALID(horizon))
 		return false; /* (d) cluster disabled / no horizon */
 
-	/* (e) horizon must not be newer than read_scn (scn_time_cmp keeps the gate). */
-	return scn_time_cmp(horizon, read_scn) <= 0;
+	if (out_horizon != NULL)
+		*out_horizon = horizon;
+	return true;
 }
 
 /* spec-3.22 D3: xmax resolve outcome counters (lock-free; bumped at the gate). */
@@ -1754,8 +1885,14 @@ cluster_cr_resolved_scn_is_acceptable(SCN scn)
  *	through to the authoritative scan, so bumping here would DOUBLE-count the base
  *	wrap_generation_disambiguated counter on a wrap-suspect hit -- it calls the
  *	pure predicate instead.  Returns true to ACCEPT (RESOLVED).
+ *
+ *	spec-6.12i CP5 (D-i4) exports this gate: the origin-verdict serve
+ *	(cluster_cr_server.c) vets its own complete-scan RESOLVED_SCN match with
+ *	the SAME wrap-suspect acceptance before shipping a COMMITTED_EXACT
+ *	verdict cross-instance (an authoritative resolution here too, so the
+ *	observability bump semantics are identical).
  */
-static bool
+bool
 cluster_cr_accept_resolved_scn(SCN scn)
 {
 	if (cluster_cr_resolved_scn_is_acceptable(scn))
