@@ -200,12 +200,105 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
 }
 
 /*
- * cluster_runtime_visibility_try_resolve_remote — CP3 (D-i2 wiring body).
+ * rtvis_try_origin_verdict — CP5 (D-i4 / spec-6.15 D4) verdict fallback leg.
+ *
+ *	Reached when the single-block positive proof came back NONE (0-match /
+ *	ambiguity): ask the ORIGIN for a complete own-TT by-xid verdict (the
+ *	spec-3.22 retention theorem served cross-instance; see the header and
+ *	cluster_cr_server.c lms_undo_verdict_serve for the origin-side legs).
+ *
+ *	The shipped horizon_scn / commit_scn are Lamport-observed BEFORE any
+ *	admissibility decision (AD-008: an SCN that crossed the wire advances
+ *	the local clock) — so even a leg-(e) refusal (read_scn behind the
+ *	shipped horizon, the t/346 clock-skew case) self-heals: the NEXT
+ *	snapshot's read_scn is at/after the observed horizon.
+ *
+ *	true only on a proven terminal verdict; *out_commit_scn_is_bound marks a
+ *	BELOW_HORIZON commit whose scn field is the horizon BOUND (valid against
+ *	THIS read_scn only — never stamp/cache it).  false = fail-closed.
+ */
+static bool
+rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+						 XLogRecPtr anchor_lsn, SCN read_scn, bool *out_committed,
+						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+{
+	ClusterGcsUndoVerdictPage verdict;
+	ClusterLiveAuthority auth;
+
+	cluster_rtvis_verdict_note_wire();
+	if (!cluster_gcs_block_undo_verdict_fetch_and_wait((int32)origin_node, undo_segment_id, raw_xid,
+													   &verdict, &auth)) {
+		cluster_rtvis_verdict_note_failclosed();
+		return false;
+	}
+
+	/* Lamport-observe every SCN that crossed the wire (AD-008), before any
+	 * gate can refuse — the observe is what makes a refusal self-heal. */
+	cluster_scn_observe((SCN)verdict.horizon_scn);
+	cluster_scn_observe((SCN)verdict.commit_scn);
+
+	if (!cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+		cluster_rtvis_verdict_note_failclosed();
+		return false;
+	}
+
+	switch (verdict.verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		*out_committed = true;
+		*out_commit_scn = (SCN)verdict.commit_scn;
+		cluster_rtvis_verdict_note_exact();
+		elog(DEBUG1,
+			 "rtvis verdict: xid %u origin %d COMMITTED_EXACT scn " UINT64_FORMAT " wrap %u",
+			 raw_xid, origin_node, (uint64)verdict.commit_scn, (unsigned)verdict.wrap);
+		return true;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		*out_committed = false;
+		cluster_rtvis_verdict_note_exact();
+		elog(DEBUG1, "rtvis verdict: xid %u origin %d ABORTED", raw_xid, origin_node);
+		return true;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		/*
+		 * Requester leg (e) of the retention proof: the bound commit_scn <=
+		 * horizon decides against read_scn only when the horizon is not
+		 * newer than read_scn.  A caller without snapshot semantics
+		 * (read_scn invalid) can never consume a bound.
+		 */
+		if (!SCN_VALID(read_scn) || scn_time_cmp((SCN)verdict.horizon_scn, read_scn) > 0) {
+			cluster_rtvis_verdict_note_inadmissible();
+			elog(DEBUG1,
+				 "rtvis verdict: xid %u origin %d BELOW_HORIZON " UINT64_FORMAT
+				 " inadmissible for read_scn " UINT64_FORMAT " (observed; next snapshot heals)",
+				 raw_xid, origin_node, (uint64)verdict.horizon_scn, (uint64)read_scn);
+			return false;
+		}
+		*out_committed = true;
+		*out_commit_scn = (SCN)verdict.horizon_scn;
+		*out_commit_scn_is_bound = true;
+		cluster_rtvis_verdict_note_below_horizon();
+		elog(DEBUG1,
+			 "rtvis verdict: xid %u origin %d COMMITTED_BELOW_HORIZON " UINT64_FORMAT
+			 " admissible for read_scn " UINT64_FORMAT,
+			 raw_xid, origin_node, (uint64)verdict.horizon_scn, (uint64)read_scn);
+		return true;
+
+	default:
+		/* page_usable() already fenced the kind range; defense in depth. */
+		cluster_rtvis_verdict_note_failclosed();
+		return false;
+	}
+}
+
+/*
+ * cluster_runtime_visibility_try_resolve_remote — CP3 + CP5 (D-i2/D-i4
+ * wiring body).
  *
  *	Active-runtime terminal resolution of a RECYCLED remote ITL ref:
  *	  fetch (D-i1, block 0 of the ref's segment)  ->  covers gate (D-i2,
  *	  co-sampled authority vs this tuple's page LSN)  ->  positive proof
- *	  (exact xid+wrap slot match on the SHIPPED bytes).
+ *	  (exact xid+wrap slot match on the SHIPPED bytes)  ->  on a proof NONE,
+ *	  the CP5 origin-verdict fallback (complete scan at the origin).
  *
  *	The proof scans the very bytes the authority was co-sampled with (also
  *	on a cache hit — the pool/memo only ever serve the pair as installed),
@@ -220,7 +313,8 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
 bool
 cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
 											  TransactionId raw_xid, XLogRecPtr anchor_lsn,
-											  bool *out_committed, SCN *out_commit_scn)
+											  SCN read_scn, bool *out_committed,
+											  SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	PGAlignedBlock page;
 	ClusterLiveAuthority auth;
@@ -231,7 +325,9 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		*out_committed = false;
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
-	if (out_committed == NULL || out_commit_scn == NULL)
+	if (out_commit_scn_is_bound != NULL)
+		*out_commit_scn_is_bound = false;
+	if (out_committed == NULL || out_commit_scn == NULL || out_commit_scn_is_bound == NULL)
 		return false;
 
 	if (!cluster_crossnode_runtime_visibility)
@@ -246,35 +342,49 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	if (undo_segment_id == 0 || undo_segment_id > UINT16_MAX)
 		return false;
 
-	if (!cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
-												 page.data, &auth)) {
-		cluster_rtvis_resolve_note_failclosed();
-		return false;
+	/*
+	 * Single-block fast leg (CP3), entirely opportunistic since CP5: the
+	 * ref's segment id names the CURRENT slot owner's segment, which under
+	 * the spec-6.15 D4 xid-derived origin may not even exist on the node we
+	 * are asking — a fetch miss there is a routing artifact, not evidence.
+	 * A successful exact xid+wrap proof still short-circuits the wire; a
+	 * fetch miss or a proof NONE falls to the origin-verdict leg.
+	 */
+	if (cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
+												page.data, &auth)
+		&& cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+		switch (cluster_vis_tt_block_positive_proof(
+			page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
+		case CLUSTER_VIS_TT_PROOF_COMMITTED:
+			*out_committed = true;
+			*out_commit_scn = scn;
+			cluster_rtvis_resolve_note_committed();
+			return true;
+		case CLUSTER_VIS_TT_PROOF_ABORTED:
+			cluster_rtvis_resolve_note_aborted();
+			return true;
+		case CLUSTER_VIS_TT_PROOF_NONE:
+		default:
+			break; /* 0-match / ambiguity: fall to the verdict leg */
+		}
 	}
 
-	if (!cluster_vis_live_authority_covers(anchor_lsn, auth)) {
-		cluster_rtvis_resolve_note_failclosed();
-		return false;
-	}
-
-	switch (cluster_vis_tt_block_positive_proof(page.data, undo_segment_id,
-												(uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
-	case CLUSTER_VIS_TT_PROOF_COMMITTED:
-		*out_committed = true;
-		*out_commit_scn = scn;
-		cluster_rtvis_resolve_note_committed();
+	/*
+	 * CP5 (D-i4) verdict leg: a single fetched TT block cannot prove
+	 * recycled-or-aborted (the slot may live in another segment), and a
+	 * fetch/covers miss proves nothing either — ask the origin for the
+	 * complete own-TT verdict instead of failing closed outright.
+	 */
+	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, anchor_lsn, read_scn,
+								 out_committed, out_commit_scn, out_commit_scn_is_bound)) {
+		if (*out_committed)
+			cluster_rtvis_resolve_note_committed();
+		else
+			cluster_rtvis_resolve_note_aborted();
 		return true;
-	case CLUSTER_VIS_TT_PROOF_ABORTED:
-		cluster_rtvis_resolve_note_aborted();
-		return true;
-	case CLUSTER_VIS_TT_PROOF_NONE:
-	default:
-		/* 0-match / multi-match / non-terminal / malformed header: a single
-		 * fetched TT block cannot prove recycled-or-aborted (the slot may
-		 * live in another segment) — stay fail-closed. */
-		cluster_rtvis_resolve_note_failclosed();
-		return false;
 	}
+	cluster_rtvis_resolve_note_failclosed();
+	return false;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

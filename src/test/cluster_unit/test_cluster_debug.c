@@ -1710,6 +1710,47 @@ cluster_rtvis_resolve_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-6.12i CP5 (D-i4) / spec-6.15 D4: origin-verdict leg counters. */
+uint64
+cluster_rtvis_verdict_wire_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_verdict_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_verdict_exact_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_verdict_below_horizon_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_verdict_inadmissible_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_verdict_served_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_verdict_denied_count(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_underivable_failclosed_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)
@@ -2226,6 +2267,11 @@ uint64
 cluster_tt_slot_retention_off_recycle_count(void) /* spec-3.22 */
 {
 	return 0;
+}
+SCN
+cluster_tt_slot_max_recycle_horizon(void) /* spec-6.12i CP5 (D-i4) */
+{
+	return InvalidScn;
 }
 uint64
 cluster_undo_segment_retain_skip_count(void)

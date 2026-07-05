@@ -258,6 +258,85 @@ UT_TEST(test_ttproof_header_mismatch)
 				 CLUSTER_VIS_TT_PROOF_NONE);
 }
 
+/* CP5 (D-i4): verdict-page structural validation truth table — every field
+ * must be exactly consistent with the claimed kind, or the page is refused
+ * (the caller keeps 53R97). */
+UT_TEST(test_undo_verdict_page_usable)
+{
+	ClusterGcsUndoVerdictPage v;
+
+	/* Baseline good EXACT page. */
+	memset(&v, 0, sizeof(v));
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	v.xid_echo = 1000;
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v.commit_scn = 777;
+	v.horizon_scn = InvalidScn;
+	v.wrap = 5;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), true);
+
+	/* NULL page / invalid asked xid. */
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(NULL, 1000), false);
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, InvalidTransactionId), false);
+
+	/* Wrong magic / version / echo (incl. a widened echo with high bits). */
+	v.magic = 0xDEADBEEF;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = 2;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1001), false);
+	v.xid_echo = (((uint64)1) << 32) + 1000; /* high word poisons the echo */
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.xid_echo = 1000;
+
+	/* Non-zero reserved bytes poison the page. */
+	v.reserved_0[3] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.reserved_0[3] = 0;
+	v.reserved_1[0] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.reserved_1[0] = 0;
+
+	/* EXACT kind-field consistency: needs commit_scn, refuses a horizon. */
+	v.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = 777;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* BELOW_HORIZON: needs a horizon, refuses an exact scn (a stray
+	 * commit_scn could leak into stamp/cache paths). */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+	v.commit_scn = InvalidScn;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), true);
+	v.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = InvalidScn;
+	v.horizon_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+
+	/* ABORTED: carries no scn of any kind. */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), true);
+	v.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = InvalidScn;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* Unknown kinds refuse (0 and one past the last known). */
+	v.verdict = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED + 1;
+	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+}
+
 /* CP2: synthetic undo-address tag roundtrip + magic discrimination. */
 UT_TEST(test_undo_fetch_tag_roundtrip)
 {
@@ -283,7 +362,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_covers_when_epoch_match_and_hwm_ge_anchor);
 	UT_RUN(test_failclosed_when_epoch_differs);
 	UT_RUN(test_failclosed_when_hwm_invalid);
@@ -295,6 +374,7 @@ main(void)
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
 	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
+	UT_RUN(test_undo_verdict_page_usable);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -135,15 +135,51 @@ extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
 															 uint16 *out_wrap);
 
 /*
- * CP3 orchestration (backend): active-runtime resolution of a RECYCLED
- * remote ITL ref via D-i1 fetch + D-i2 gate + positive proof.  true only
- * when a terminal verdict is proven (*out_committed says which; commit_scn
- * valid iff committed); false = caller keeps the pre-existing
- * STALE_OR_AMBIGUOUS -> 53R97 fail-closed (Rule 8.A).
+ * CP5 (D-i4) pure structural validation of a shipped verdict page (see
+ * cluster_gcs_block.h for the wire struct and the verdict taxonomy).  true
+ * only when the page provably answers the asked-for xid: magic / version /
+ * widened-xid echo match, the verdict kind is known, its scn fields are
+ * consistent with the kind (EXACT needs a valid commit_scn and no horizon;
+ * BELOW_HORIZON needs a valid horizon and no commit_scn; ABORTED needs
+ * neither), and every reserved byte is zero.  Anything else refuses — the
+ * caller keeps the 53R97 fail-closed boundary (Rule 8.A).  Pure: no shmem,
+ * no locks, no elog (unit truth table).
+ */
+struct ClusterGcsUndoVerdictPage; /* cluster_gcs_block.h */
+extern bool cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+												 TransactionId asked_xid);
+
+/*
+ * CP3 + CP5 orchestration (backend): active-runtime resolution of a RECYCLED
+ * remote ITL ref.  Two provable legs, both under the co-sampled live
+ * authority gate (D-i2):
+ *
+ *	 1. single-block positive proof (CP3): D-i1 fetch of the ref's segment
+ *	    header + exact xid+wrap slot match on the shipped bytes;
+ *	 2. origin verdict (CP5 / D-i4): on a 1-leg NONE, ask the origin for a
+ *	    COMPLETE own-TT by-xid verdict (complete scan + CLOG cross-check +
+ *	    retention origin legs; ≈ the spec-3.22 retention theorem served
+ *	    cross-instance).  A COMMITTED_BELOW_HORIZON verdict carries only a
+ *	    bound (the true commit_scn is at or below horizon_scn), so it is
+ *	    consumed IFF the caller's read_scn is at/after the horizon
+ *	    (requester leg (e)); the shipped
+ *	    horizon is Lamport-observed either way (AD-008) so a leg-(e) miss
+ *	    self-heals on the next snapshot.
+ *
+ * read_scn = the caller's snapshot SCN, or InvalidScn for callers without
+ * snapshot semantics (below-horizon verdicts are then inadmissible; exact
+ * verdicts still resolve).  true only when a terminal verdict is proven
+ * (*out_committed says which).  On true with *out_commit_scn_is_bound set,
+ * *out_commit_scn is the HORIZON BOUND, not the exact commit_scn: it decides
+ * correctly against THIS read_scn only, and must never be stamped/cached as
+ * an exact scn (a later smaller read_scn would falsely read it as
+ * committed-after — false-invisible, Rule 8.A).  false = caller keeps the
+ * pre-existing STALE_OR_AMBIGUOUS -> 53R97 fail-closed.
  */
 extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
 														  TransactionId raw_xid,
-														  XLogRecPtr anchor_lsn,
-														  bool *out_committed, SCN *out_commit_scn);
+														  XLogRecPtr anchor_lsn, SCN read_scn,
+														  bool *out_committed, SCN *out_commit_scn,
+														  bool *out_commit_scn_is_bound);
 
 #endif /* CLUSTER_RUNTIME_VISIBILITY_H */

@@ -1386,7 +1386,12 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		return 0;	  /* deleted before scan started */
 	}
 
-	cluster_visibility_resolve_tuple(buffer, tuple, xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
+	/* PGRAC: spec-6.12i CP5 — the _scn variant threads the snapshot read_scn
+	 * down so a below-horizon origin verdict is judged admissible (leg (e))
+	 * inside the resolver; a returned bound decides correctly against THIS
+	 * read_scn (see commit_scn_is_bound). */
+	cluster_visibility_resolve_tuple_scn(buffer, tuple, xmax, CLUSTER_VIS_XMAX_UPDATE,
+										 snapshot->read_scn, &xr);
 
 	if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 		if (xr.status == CLUSTER_TT_STATUS_COMMITTED || xr.status == CLUSTER_TT_STATUS_CLEANED_OUT)
@@ -1620,12 +1625,16 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		{
 			ClusterVisResolve res;
 
-			if (ref_filled) {
-				cluster_visibility_resolve_from_ref(raw_xmin, &ref,
-													PageGetLSN(BufferGetPage(buffer)), &res);
-			} else {
-				cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &res);
-			}
+			/* PGRAC: spec-6.12i CP5 — _scn variants: the snapshot read_scn
+			 * reaches the active-runtime resolver (below-horizon verdict
+			 * admissibility, leg (e)). */
+			if (ref_filled)
+				cluster_visibility_resolve_from_ref_scn(raw_xmin, &ref,
+														PageGetLSN(BufferGetPage(buffer)),
+														snapshot->read_scn, &res);
+			else
+				cluster_visibility_resolve_tuple_scn(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN,
+													 snapshot->read_scn, &res);
 
 			if (res.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
@@ -1657,7 +1666,14 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						 */
 						Page page = BufferGetPage(buffer);
 
-						if (PageHasItl(page)
+						/* PGRAC: spec-6.12i CP5 — a horizon-BOUND scn (below-
+						 * horizon verdict) must never be stamped as an exact
+						 * commit_scn: a later reader with a smaller read_scn
+						 * would decide committed-after off the stamp ->
+						 * false-invisible (Rule 8.A).  Bound resolves skip
+						 * the cleanout; the verdict itself already decided
+						 * this read. */
+						if (!res.commit_scn_is_bound && PageHasItl(page)
 							&& tuple->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 							&& tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT) {
 							ClusterItlSlotData *slot

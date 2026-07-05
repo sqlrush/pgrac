@@ -12,6 +12,12 @@
 #	  xmin resolves through the RECYCLED remote branch on node1
 #	  (ref->local_xid != raw_xid; the pre-6.12i unconditional 53R97).
 #
+#	  The pair boots with cluster.xid_striping = on (+ online_join, its
+#	  boot prerequisite): since spec-6.15 D4 the active-runtime resolution
+#	  derives the origin from the XID ITSELF (stripe congruence), so every
+#	  gain leg needs a striped value space -- an unstriped cluster keeps
+#	  the underivable 53R97 fail-closed by design.
+#
 #	  L1  pair boots + GUC default off + one-block table seeded
 #	  L2  8A off-leg: node1 read fails closed 53R97 (unchanged boundary)
 #	  L3  gain leg (GUC on both): the same node1 read SUCCEEDS; the wave
@@ -26,20 +32,30 @@
 #	      process-local (t/015 note) and never reaches the LMS process --
 #	      conf-time cluster.injection_points arming is the chaos-harness
 #	      face, not this test.)
+#	  L4b aged-seed verdict leg (D-i4 / spec-6.15 D4): node0 burns single-
+#	      statement write xacts until the SEED xact's durable TT slot is
+#	      recycled -- the single-block positive proof then 0-matches, and
+#	      the read resolves through the ORIGIN VERDICT (complete own-TT
+#	      scan + CLOG cross-check + retention origin legs; the shipped
+#	      horizon is Lamport-observed, so a first read refused by leg (e)
+#	      clock skew self-heals for the next).  Counters prove the leg:
+#	      verdict wire + below-horizon on the requester, verdict served on
+#	      the origin.
 #	  L5  D-i3 crash leg: node0 fail-stops mid-session; after node1's CSSD
 #	      marks it dead + reconfig fires (epoch bump), the SAME session's
 #	      re-read must ERROR -- the cached authority from the old epoch is
 #	      dead (covers=false) and the wire has no live origin.  A fresh
 #	      backend fails too.  NEVER a silent stale/false-visible read.
-#	  L6  counter surface: the 8 wave-i cr keys present
+#	  L6  counter surface: the 16 wave-i cr keys present
 #
-#	  Honesty (规则 18): L3 proves the FUNCTIONAL gain leg (fail-closed ->
-#	  works) on the phantom-shared harness; the true write-scaling numbers
-#	  (node1 pgbench write > 0, 53R97 storm gone) belong to the spec-6.0a
-#	  block_device rerun of the t/340 scaling probe (§3.5 substrate rule).
-#	  L5 asserts fail-closed-on-crash broadly (53R97 / enqueue failure /
-#	  fail-stop abort are all acceptable) -- the specific survivor-reads-
-#	  dead-node's-data recovery is the spec-4.10 face, out of wave scope.
+#	  Honesty (规则 18): L3/L4b prove the FUNCTIONAL gain legs (fail-closed
+#	  -> works) on the phantom-shared harness; the true write-scaling
+#	  numbers (node1 pgbench write > 0, 53R97 storm gone) belong to the
+#	  spec-6.0a block_device rerun of the t/340 scaling probe (§3.5
+#	  substrate rule).  L5 asserts fail-closed-on-crash broadly (53R97 /
+#	  enqueue failure / fail-stop abort are all acceptable) -- the specific
+#	  survivor-reads-dead-node's-data recovery is the spec-4.10 face, out
+#	  of wave scope.
 #
 # Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave i)
 #
@@ -114,6 +130,13 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		# PGC_POSTMASTER, so arm it at boot (t/320 idiom).
 		'cluster.shared_cr_pool_enabled = on',
 		'cluster.shared_cr_pool_size_blocks = 256',
+		# spec-6.15 D4: origin derivation needs a striped xid value space;
+		# striping requires online_join (activation rides the 5.15 join
+		# serialization window -- the boot contract FATALs otherwise).
+		'cluster.online_join = on',
+		'cluster.quorum_poll_interval_ms = 500',
+		'cluster.join_convergence_timeout_ms = 30000',
+		'cluster.xid_striping = on',
 	]);
 $pair->start_pair;
 
@@ -220,6 +243,53 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 }
 
 # ============================================================
+# L4b: aged-seed verdict leg (D-i4 / spec-6.15 D4) -- burn write xacts on the
+# origin until the seed xact's durable TT slot recycles; the single-block
+# proof then 0-matches and the read must resolve via the ORIGIN VERDICT
+# (complete scan + CLOG cross + retention legs; below-horizon bound).
+# ============================================================
+{
+	my $vwire0   = state_val($node1, 'cr', 'rtvis_verdict_wire_count');
+	my $vbelow0  = state_val($node1, 'cr', 'rtvis_verdict_below_horizon_count');
+	my $vserved0 = state_val($node0, 'cr', 'cr_server_verdict_served_count');
+
+	$node0->safe_psql('postgres', 'CREATE TABLE i_burn (b int)');
+
+	# Burn rounds: 200 single-statement autocommit xacts per round (a psql
+	# stream, NOT one multi-statement xact -- each INSERT is its own TT slot
+	# binding), until the origin has served a verdict AND the node1 read
+	# succeeds again.  A read may fail 53R97 while the seed slot is mid-
+	# recycle, and a first verdict may be refused by leg (e) clock skew (the
+	# observe heals the next attempt) -- both are expected transients.
+	my $burn = join("\n", map { "INSERT INTO i_burn VALUES ($_);" } (1 .. 200));
+	my $ok_rows    = 0;
+	my $ok_verdict = 0;
+	for my $round (1 .. 10)
+	{
+		$node0->safe_psql('postgres', $burn);
+		for my $try (1 .. 6)
+		{
+			my ($rc, $out, $err) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+			$ok_rows = (defined $out && $out =~ /^12$/m) ? 1 : 0;
+			$ok_verdict
+				= (state_val($node0, 'cr', 'cr_server_verdict_served_count') > $vserved0) ? 1 : 0;
+			last if $ok_rows && $ok_verdict;
+			usleep(500_000);
+		}
+		last if $ok_rows && $ok_verdict;
+	}
+
+	ok($ok_verdict, 'L4b origin served a complete-scan verdict (seed TT slot aged out)');
+	ok($ok_rows,    'L4b node1 still reads all 12 seed rows through the verdict path');
+	cmp_ok(state_val($node1, 'cr', 'rtvis_verdict_wire_count'), '>', $vwire0,
+		'L4b requester verdict wire counter moved');
+	cmp_ok(state_val($node1, 'cr', 'rtvis_verdict_below_horizon_count'), '>', $vbelow0,
+		'L4b below-horizon bound consumed (leg (e) admissible after observe)');
+	is(state_val($node1, 'cr', 'rtvis_underivable_failclosed_count'), 0,
+		'L4b no underivable refusals on a fully striped cluster (spec-6.15 D4)');
+}
+
+# ============================================================
 # L5: D-i3 crash leg -- origin fail-stop => epoch bump => the session's
 # cached authority is dead; re-read must ERROR, never a stale serve.
 # ============================================================
@@ -255,7 +325,7 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 }
 
 # ============================================================
-# L6: counter surface -- the 8 wave-i cr keys exist on node1 (node0 is dead).
+# L6: counter surface -- the 16 wave-i cr keys exist on node1 (node0 is dead).
 # ============================================================
 {
 	my $rows = $node1->safe_psql('postgres',
@@ -264,8 +334,12 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 		     ('rtvis_undo_fetch_wire_count','rtvis_undo_fetch_cache_hit_count',
 		      'rtvis_undo_fetch_failclosed_count','cr_server_undo_served_count',
 		      'cr_server_undo_denied_count','rtvis_resolve_committed_count',
-		      'rtvis_resolve_aborted_count','rtvis_resolve_failclosed_count')});
-	is($rows, '8', 'L6 all 8 wave-i cr keys present');
+		      'rtvis_resolve_aborted_count','rtvis_resolve_failclosed_count',
+		      'rtvis_verdict_wire_count','rtvis_verdict_failclosed_count',
+		      'rtvis_verdict_exact_count','rtvis_verdict_below_horizon_count',
+		      'rtvis_verdict_inadmissible_count','cr_server_verdict_served_count',
+		      'cr_server_verdict_denied_count','rtvis_underivable_failclosed_count')});
+	is($rows, '16', 'L6 all 16 wave-i cr keys present');
 }
 
 $pair->stop_pair if $pair->can('stop_pair');

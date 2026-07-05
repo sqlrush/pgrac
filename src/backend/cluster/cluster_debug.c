@@ -2413,6 +2413,9 @@ dump_undo(ReturnSetInfo *rsinfo)
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",
 			 fmt_int64((int64)cluster_tt_slot_retention_horizon_scn()));
+	/* spec-6.12i CP5 (D-i4): the origin-verdict below-horizon bound source. */
+	emit_row(rsinfo, "undo", "retention_max_recycle_horizon",
+			 fmt_int64((int64)cluster_tt_slot_max_recycle_horizon()));
 	emit_row(rsinfo, "undo", "tt_slot_retain_skip_count",
 			 fmt_int64((int64)cluster_tt_slot_retain_skip_count()));
 	emit_row(rsinfo, "undo", "segment_retain_skip_count",
@@ -2538,6 +2541,23 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_rtvis_resolve_aborted_count()));
 	emit_row(rsinfo, "cr", "rtvis_resolve_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_resolve_failclosed_count()));
+	/* spec-6.12i CP5 (D-i4) / spec-6.15 D4: origin-verdict leg. */
+	emit_row(rsinfo, "cr", "rtvis_verdict_wire_count",
+			 fmt_int64((int64)cluster_rtvis_verdict_wire_count()));
+	emit_row(rsinfo, "cr", "rtvis_verdict_failclosed_count",
+			 fmt_int64((int64)cluster_rtvis_verdict_failclosed_count()));
+	emit_row(rsinfo, "cr", "rtvis_verdict_exact_count",
+			 fmt_int64((int64)cluster_rtvis_verdict_exact_count()));
+	emit_row(rsinfo, "cr", "rtvis_verdict_below_horizon_count",
+			 fmt_int64((int64)cluster_rtvis_verdict_below_horizon_count()));
+	emit_row(rsinfo, "cr", "rtvis_verdict_inadmissible_count",
+			 fmt_int64((int64)cluster_rtvis_verdict_inadmissible_count()));
+	emit_row(rsinfo, "cr", "cr_server_verdict_served_count",
+			 fmt_int64((int64)cluster_cr_server_verdict_served_count()));
+	emit_row(rsinfo, "cr", "cr_server_verdict_denied_count",
+			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
+	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
+			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

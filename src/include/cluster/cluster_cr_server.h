@@ -100,8 +100,9 @@ typedef enum ClusterLmsCrSlotState {
 
 /* Work-slot request kind (spec-6.12i extends the wave-b CR-only table). */
 typedef enum ClusterLmsCrSlotKind {
-	CLUSTER_LMS_SLOT_KIND_CR = 0,		 /* spec-6.12b CR construction */
-	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1 /* spec-6.12i undo-TT block fetch */
+	CLUSTER_LMS_SLOT_KIND_CR = 0,		   /* spec-6.12b CR construction */
+	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1,  /* spec-6.12i undo-TT block fetch */
+	CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT = 2 /* spec-6.12i D-i4 complete-scan verdict */
 } ClusterLmsCrSlotKind;
 
 typedef struct ClusterLmsCrSlot {
@@ -116,17 +117,22 @@ typedef struct ClusterLmsCrSlot {
 	uint8 transition_id;	 /* echo (N->S) for the reply slot match */
 	uint8 result_status;	 /* GcsBlockReplyStatus: CR_RESULT_FULL /
 							   * CR_RESULT_PARTIAL / UNDO_TT_FETCH_RESULT /
+							   * UNDO_VERDICT_RESULT /
 							   * DENIED_MASTER_NOT_HOLDER */
 	uint8 req_kind;			 /* ClusterLmsCrSlotKind (spec-6.12i) */
 	/* spec-6.12i D-i1: undo address decoded from the synthetic tag at submit
 	 * time, and the LMS-co-sampled live authority triple the ship path copies
 	 * into the reply (epoch -> hdr.epoch, live_hwm -> hdr.page_lsn,
-	 * tt_generation -> trailer).  Meaningful only for KIND_UNDO_FETCH. */
+	 * tt_generation -> trailer).  Meaningful only for KIND_UNDO_FETCH /
+	 * KIND_UNDO_VERDICT.  undo_xid is the D-i4 verdict subject, decoded from
+	 * the widened watermark carrier at submit time (KIND_UNDO_VERDICT only). */
 	uint32 undo_segment_id;
 	uint32 undo_block_no;
+	TransactionId undo_xid;
 	ClusterLiveAuthority undo_auth;
-	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL) or
-							   * the fetched undo header block (UNDO_FETCH) */
+	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL), the
+							   * fetched undo header block (UNDO_FETCH), or
+							   * the ClusterGcsUndoVerdictPage (UNDO_VERDICT) */
 } ClusterLmsCrSlot;
 
 /* CR-server counter buckets (bumped into the ClusterCRShared region owned
@@ -135,8 +141,10 @@ typedef enum ClusterCrServerStat {
 	CLUSTER_CR_SERVER_STAT_FULL = 0,
 	CLUSTER_CR_SERVER_STAT_PARTIAL = 1,
 	CLUSTER_CR_SERVER_STAT_DENIED = 2,
-	CLUSTER_CR_SERVER_STAT_UNDO_SERVED = 3, /* spec-6.12i D-i1 origin serve */
-	CLUSTER_CR_SERVER_STAT_UNDO_DENIED = 4	/* spec-6.12i D-i1 origin refuse */
+	CLUSTER_CR_SERVER_STAT_UNDO_SERVED = 3,	   /* spec-6.12i D-i1 origin serve */
+	CLUSTER_CR_SERVER_STAT_UNDO_DENIED = 4,	   /* spec-6.12i D-i1 origin refuse */
+	CLUSTER_CR_SERVER_STAT_VERDICT_SERVED = 5, /* spec-6.12i D-i4 verdict serve */
+	CLUSTER_CR_SERVER_STAT_VERDICT_DENIED = 6  /* spec-6.12i D-i4 verdict refuse */
 } ClusterCrServerStat;
 
 extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
@@ -165,6 +173,14 @@ extern bool cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd);
  * requester keeps its unchanged 53R97). */
 extern bool cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd);
 
+/* LMON dispatch side (spec-6.12i D-i4 / spec-6.15 D4): park a validated
+ * undo-verdict request (the asked-for xid rides the widened watermark
+ * carrier; a carrier with non-zero upper 32 bits or a non-normal xid is
+ * malformed).  false = wave GUC off on this node / malformed tag or carrier
+ * / no capacity (caller replies the fail-closed DENIED immediately — the
+ * requester keeps its unchanged 53R97). */
+extern bool cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd);
+
 /* LMS main-loop side: construct every PENDING slot (errors become DENIED
  * results — fail-closed to the requester, never an LMS restart). */
 extern void cluster_lms_cr_drain(void);
@@ -189,6 +205,21 @@ extern bool cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int
 extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id,
 													 uint32 block_no, char *dst_page,
 													 ClusterLiveAuthority *auth_out);
+
+/* Requester side (backend, spec-6.12i D-i4 / spec-6.15 D4): ask origin_node
+ * for a COMPLETE own-TT by-xid verdict on `xid` over the same wire, together
+ * with the co-sampled live authority triple.  On success copies the
+ * validated verdict page into *verdict_out (magic / version / xid echo /
+ * kind-field consistency already vetted via
+ * cluster_vis_undo_verdict_page_usable), fills *auth_out and returns true;
+ * false = fail-closed (timeout / DENIED / checksum / trailer missing /
+ * malformed page — caller keeps the unchanged 53R97 refusal, Rule 8.A).
+ * The caller MUST Lamport-observe verdict_out->horizon_scn (and any
+ * commit_scn) it consumes — SCNs that crossed the wire (AD-008). */
+extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
+														  TransactionId xid,
+														  ClusterGcsUndoVerdictPage *verdict_out,
+														  ClusterLiveAuthority *auth_out);
 
 #endif /* USE_PGRAC_CLUSTER */
 
