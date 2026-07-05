@@ -232,17 +232,21 @@ cluster_shared_fs_init(void)
 						 "cluster.smgr_user_relations=off.")));
 
 	/*
-	 * spec-6.14 D1 cross-check: cluster.shared_catalog=on requires all three
+	 * spec-6.14 D1 cross-check: cluster.shared_catalog=on requires all four
 	 * hard dependencies -- smgr_user_relations (permanent relations must
 	 * already route through cluster_smgr), a configured shared_data_dir (to
-	 * hold the single catalog tree) and controlfile_shared_authority (so
+	 * hold the single catalog tree), controlfile_shared_authority (so
 	 * join nodes have a shared pg_control to adopt the system identifier
-	 * from).  Missing any one is incoherent, so fail closed at postmaster
-	 * init with a precise errhint naming the one thing to fix.  Co-located
-	 * with the stub cross-check above so all shared-storage cross-GUC gates
-	 * live together (spec-6.14 §2.3 / §3.5).  The join-time "all nodes
-	 * agree" consistency check is enforced separately in the membership
-	 * path (cluster_shared_catalog_register_ic_msg_types).
+	 * from) and merged_recovery (cold crash redo of the now-PCM-tracked
+	 * catalog pages is only lawful inside the k-way merged-replay window;
+	 * single-stream redo of a DDL-bearing tail would issue live GCS from
+	 * the startup process -- spec-6.14 D9 amend INV-D9-R).  Missing any one
+	 * is incoherent, so fail closed at postmaster init with a precise
+	 * errhint naming the one thing to fix.  Co-located with the stub
+	 * cross-check above so all shared-storage cross-GUC gates live together
+	 * (spec-6.14 §2.3 / §3.5).  The join-time "all nodes agree" consistency
+	 * check is enforced separately in the membership path
+	 * (cluster_shared_catalog_register_ic_msg_types).
 	 */
 	{
 		ClusterSharedCatalogVetResult vet;
@@ -252,7 +256,8 @@ cluster_shared_fs_init(void)
 		vet = cluster_shared_catalog_vet(cluster_shared_catalog,
 										 cluster_smgr_user_relations,
 										 have_shared_data_dir,
-										 cluster_controlfile_shared_authority);
+										 cluster_controlfile_shared_authority,
+										 cluster_merged_recovery);
 		if (vet != CLUSTER_SHARED_CATALOG_VET_OK)
 			ereport(FATAL,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

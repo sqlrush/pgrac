@@ -78,6 +78,7 @@ int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
 bool cluster_shared_catalog = false;	/* spec-6.14 D3 routing flip */
 bool cluster_controlfile_shared_authority = false;	/* read by D1 startup vet */
+bool cluster_merged_recovery = false;	/* read by D1 startup vet (D9 amend dep) */
 
 /* Cluster injection support. */
 #include "cluster/cluster_inject.h"

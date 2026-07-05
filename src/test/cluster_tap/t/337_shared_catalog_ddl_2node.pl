@@ -107,6 +107,7 @@ cluster.shared_data_dir = '$shared_root'
 cluster.smgr_user_relations = on
 cluster.controlfile_shared_authority = on
 cluster.shared_catalog = on
+cluster.merged_recovery = on
 EOC
 
 # ----------
@@ -441,6 +442,7 @@ cluster.shared_data_dir = '$vet_root'
 cluster.smgr_user_relations = on
 cluster.controlfile_shared_authority = on
 cluster.shared_catalog = on
+cluster.merged_recovery = on
 EOC
 
 	my $vret = $vet->start(fail_ok => 1);

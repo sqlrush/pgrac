@@ -43,29 +43,36 @@ typedef enum ClusterSharedCatalogVetResult
 	CLUSTER_SHARED_CATALOG_VET_OK = 0,
 	CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS,
 	CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR,
-	CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY
+	CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY,
+	CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY
 } ClusterSharedCatalogVetResult;
 
 /*
  * cluster_shared_catalog_vet -- pure startup dependency check.
  *
- *	Given the shared_catalog master switch and the state of its three hard
+ *	Given the shared_catalog master switch and the state of its four hard
  *	dependencies, return the first unmet dependency (priority order:
- *	smgr_user_relations, shared_data_dir, controlfile_shared_authority) or
- *	_OK.  When shared_catalog is off the result is always _OK (the feature
- *	imposes no requirements and the off path is byte-identical to stock PG).
+ *	smgr_user_relations, shared_data_dir, controlfile_shared_authority,
+ *	merged_recovery) or _OK.  When shared_catalog is off the result is
+ *	always _OK (the feature imposes no requirements and the off path is
+ *	byte-identical to stock PG).
  *
- *	The three dependencies exist because shared_catalog can only be sound
+ *	The four dependencies exist because shared_catalog can only be sound
  *	when (a) permanent relations already route through cluster_smgr, (b) a
- *	shared data root is configured to hold the single catalog tree, and (c)
+ *	shared data root is configured to hold the single catalog tree, (c)
  *	a shared pg_control authority exists for join nodes to adopt the system
- *	identifier from (spec-6.14 §2.3 / §3.5).
+ *	identifier from (spec-6.14 §2.3 / §3.5), and (d) cold crash recovery
+ *	runs under the k-way merged-replay window: with the catalog PCM-tracked,
+ *	single-stream redo of a DDL-bearing WAL tail would issue live GCS
+ *	requests from the startup process, which has no backend identity and no
+ *	recovery ownership of the shared pages (spec-6.14 D9 amend INV-D9-R).
  */
 extern ClusterSharedCatalogVetResult
 			cluster_shared_catalog_vet(bool shared_catalog,
 									   bool smgr_user_relations,
 									   bool have_shared_data_dir,
-									   bool controlfile_shared_authority);
+									   bool controlfile_shared_authority,
+									   bool merged_recovery);
 
 /*
  * cluster_shared_catalog_vet_missing_dep_name -- human-readable dependency

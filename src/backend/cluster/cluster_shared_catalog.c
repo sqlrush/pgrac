@@ -42,7 +42,8 @@ ClusterSharedCatalogVetResult
 cluster_shared_catalog_vet(bool shared_catalog,
 						   bool smgr_user_relations,
 						   bool have_shared_data_dir,
-						   bool controlfile_shared_authority)
+						   bool controlfile_shared_authority,
+						   bool merged_recovery)
 {
 	if (!shared_catalog)
 		return CLUSTER_SHARED_CATALOG_VET_OK;
@@ -53,6 +54,8 @@ cluster_shared_catalog_vet(bool shared_catalog,
 		return CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR;
 	if (!controlfile_shared_authority)
 		return CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY;
+	if (!merged_recovery)
+		return CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY;
 
 	return CLUSTER_SHARED_CATALOG_VET_OK;
 }
@@ -73,6 +76,8 @@ cluster_shared_catalog_vet_missing_dep_name(ClusterSharedCatalogVetResult r)
 			return "cluster.shared_data_dir";
 		case CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY:
 			return "cluster.controlfile_shared_authority=on";
+		case CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY:
+			return "cluster.merged_recovery=on";
 	}
 	return "";
 }

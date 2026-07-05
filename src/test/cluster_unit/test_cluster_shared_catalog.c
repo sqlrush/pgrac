@@ -59,34 +59,35 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  */
 UT_TEST(test_vet_off_always_ok)
 {
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, false, false, false),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, false, false, false, false),
 				 CLUSTER_SHARED_CATALOG_VET_OK);
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, true, true, true),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, true, true, true, true),
 				 CLUSTER_SHARED_CATALOG_VET_OK);
 	/* mixed dependency state, still off -> still OK */
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, true, false, true),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(false, true, false, true, false),
 				 CLUSTER_SHARED_CATALOG_VET_OK);
 }
 
 /* ----------
  * U15: with shared_catalog on and all dependencies satisfied -> OK; with any
  * dependency missing -> the FIRST missing one in priority order
- * (smgr_user_relations, then shared_data_dir, then controlfile authority).
+ * (smgr_user_relations, then shared_data_dir, then controlfile authority,
+ * then merged_recovery -- spec-6.14 D9 amend INV-D9-R).
  * ----------
  */
 UT_TEST(test_vet_on_all_present_ok)
 {
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, true),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, true, true),
 				 CLUSTER_SHARED_CATALOG_VET_OK);
 }
 
 UT_TEST(test_vet_on_missing_smgr_user_relations_first)
 {
 	/* smgr_user_relations is the highest-priority dependency: reported even
-	 * when the other two are ALSO missing. */
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, false, false, false),
+	 * when the other three are ALSO missing. */
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, false, false, false, false),
 				 CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS);
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, false, true, true),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, false, true, true, true),
 				 CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS);
 }
 
@@ -94,17 +95,29 @@ UT_TEST(test_vet_on_missing_shared_data_dir_second)
 {
 	/* smgr present, shared_data_dir missing -> shared_data_dir, even when the
 	 * cf authority is also missing. */
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, false, false),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, false, false, false),
 				 CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR);
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, false, true),
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, false, true, true),
 				 CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR);
 }
 
-UT_TEST(test_vet_on_missing_cf_authority_last)
+UT_TEST(test_vet_on_missing_cf_authority_third)
 {
-	/* smgr + shared_data_dir present, only the cf authority missing. */
-	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, false),
+	/* smgr + shared_data_dir present, cf authority missing: reported even
+	 * when merged_recovery is also missing. */
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, false, false),
 				 CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY);
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, false, true),
+				 CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY);
+}
+
+UT_TEST(test_vet_on_missing_merged_recovery_last)
+{
+	/* All other dependencies present, only merged_recovery missing: cold
+	 * crash redo of PCM-tracked catalog pages needs the merged-replay
+	 * window (spec-6.14 D9 amend INV-D9-R). */
+	UT_ASSERT_EQ(cluster_shared_catalog_vet(true, true, true, true, false),
+				 CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY);
 }
 
 /* ----------
@@ -124,6 +137,9 @@ UT_TEST(test_vet_missing_dep_name)
 	UT_ASSERT_STR_CONTAINS(cluster_shared_catalog_vet_missing_dep_name(
 							   CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY),
 						   "controlfile_shared_authority");
+	UT_ASSERT_STR_CONTAINS(cluster_shared_catalog_vet_missing_dep_name(
+							   CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY),
+						   "merged_recovery");
 }
 
 /* ----------
@@ -206,12 +222,13 @@ UT_TEST(test_temp_suffix_round_trip)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_vet_off_always_ok);
 	UT_RUN(test_vet_on_all_present_ok);
 	UT_RUN(test_vet_on_missing_smgr_user_relations_first);
 	UT_RUN(test_vet_on_missing_shared_data_dir_second);
-	UT_RUN(test_vet_on_missing_cf_authority_last);
+	UT_RUN(test_vet_on_missing_cf_authority_third);
+	UT_RUN(test_vet_on_missing_merged_recovery_last);
 	UT_RUN(test_vet_missing_dep_name);
 	UT_RUN(test_is_shared_rel_temp_is_local);
 	UT_RUN(test_is_shared_rel_nontemp_is_shared);
