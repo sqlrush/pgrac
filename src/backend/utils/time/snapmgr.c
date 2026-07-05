@@ -74,6 +74,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		/* PGRAC (spec-3.3 D3/D4): cluster_enabled */
+#include "cluster/cluster_catalog_bootstrap.h"	/* PGRAC (spec-6.14 D8): services-ready gate */
+#include "cluster/cluster_visibility_resolve.h" /* PGRAC (spec-6.14 D8): no-recursion guard */
 #endif
 
 
@@ -449,30 +451,76 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		!RelationHasSysCache(relid))
 		InvalidateCatalogSnapshot();
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-6.14 D8): no catalog snapshot may be built or fetched
+	 * while a cluster visibility resolution is in flight.  The resolver is
+	 * catalog-free by contract (spec-3.27 identity-only TT/undo substrate);
+	 * a request landing here from inside a resolve means some resolve-path
+	 * change broke that contract and is about to recurse (catalog scan ->
+	 * cluster_tt lookup -> catalog scan).  Fail-stop rather than recurse.
+	 */
+	if (cluster_vis_resolve_in_flight())
+	{
+		Assert(false);
+		elog(ERROR, "catalog snapshot requested while a cluster visibility "
+					"resolution is in flight");
+	}
+
+	/*
+	 * PGRAC (spec-6.14 D8): the catalog-snapshot posture (LOCAL before the
+	 * services-ready gate, CLUSTER after) is decided at build time below.  A
+	 * cached snapshot built under the other posture must not be served
+	 * across the flip -- most importantly right after the gate opens, when a
+	 * cached LOCAL snapshot would keep foreign catalog rows unresolvable.
+	 */
+	if (CatalogSnapshot
+		&& ((CatalogSnapshot->cluster_source == (uint8) SNAPSHOT_SOURCE_CLUSTER)
+			!= cluster_catalog_services_ready()))
+		InvalidateCatalogSnapshot();
+#endif
+
 	if (CatalogSnapshot == NULL)
 	{
 		/* Get new snapshot. */
 		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
 
 #ifdef USE_PGRAC_CLUSTER
+		if (!cluster_catalog_services_ready())
+		{
+			/*
+			 * PGRAC (spec-3.3 D3): force catalog snapshot to LOCAL source.
+			 *
+			 * GetSnapshotData() above sets cluster_source = CLUSTER when
+			 * cluster_enabled.  But before the spec-6.14 D8 services-ready
+			 * gate opens (boot / shutdown / recovery / shared_catalog=off),
+			 * catalog scans must NEVER enter the cluster visibility path:
+			 * without a shared catalog, catalog rows have no cluster TT
+			 * overlay, and routing catalog reads through the cluster path
+			 * before the TT/undo services stand can produce a startup-time
+			 * circular dependency (catalog scan -> cluster_tt lookup ->
+			 * catalog scan).
+			 *
+			 * read_scn / read_epoch are forced to InvalidScn / 0 to make any
+			 * accidental cluster-path entry under a catalog snapshot fail
+			 * loudly (53R97 UNKNOWN) rather than silently take a stale
+			 * comparison.
+			 */
+			CatalogSnapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+			CatalogSnapshot->read_scn = InvalidScn;
+			CatalogSnapshot->read_epoch = 0;
+		}
+
 		/*
-		 * PGRAC (spec-3.3 D3): force catalog snapshot to LOCAL source.
-		 *
-		 * GetSnapshotData() above sets cluster_source = CLUSTER when
-		 * cluster_enabled.  But catalog scans must NEVER enter the cluster
-		 * visibility path: catalog rows have no cluster TT overlay, and
-		 * routing catalog reads through the cluster path can produce a
-		 * startup-time circular dependency (catalog scan -> cluster_tt
-		 * lookup -> catalog scan).  Snapshots returned from GetCatalogSnapshot
-		 * therefore always carry LOCAL semantics regardless of cluster_enabled.
-		 *
-		 * read_scn / read_epoch are forced to InvalidScn / 0 to make any
-		 * accidental cluster-path entry under a catalog snapshot fail loudly
-		 * (53R97 UNKNOWN) rather than silently take a stale comparison.
+		 * else (spec-6.14 D8): cluster.shared_catalog is on and every
+		 * service a catalog-tuple remote-xid resolution depends on is READY
+		 * (CLUSTER_PHASE_RUNNING).  Keep the CLUSTER stamping (read_scn /
+		 * read_epoch) GetSnapshotData applied: catalog scans now judge
+		 * foreign-origin rows through the cluster resolver exactly like user
+		 * tables (Q5/Q11 canonical), with UNKNOWN fail-closed at 53R97.  The
+		 * no-recursion guard above keeps the resolve path honest.
 		 */
-		CatalogSnapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
-		CatalogSnapshot->read_scn = InvalidScn;
-		CatalogSnapshot->read_epoch = 0;
 #endif
 
 		/*

@@ -225,5 +225,15 @@ extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool 
  */
 extern bool cluster_tuple_has_remote_evidence(Buffer buffer, HeapTupleHeader tuple);
 
+/*
+ * spec-6.14 D8: catalog-safe no-recursion guard.  in_flight() is checked by
+ * GetCatalogSnapshot (snapmgr.c) -- a catalog snapshot may never be built
+ * while a cluster visibility resolution is running (catalog scan ->
+ * cluster_tt lookup -> catalog scan circularity).  abort_reset() clears the
+ * depth counter after an ERROR escaped mid-resolve ((Sub)AbortTransaction).
+ */
+extern bool cluster_vis_resolve_in_flight(void);
+extern void cluster_vis_resolve_abort_reset(void);
+
 
 #endif /* CLUSTER_VISIBILITY_RESOLVE_H */

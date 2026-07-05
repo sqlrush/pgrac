@@ -1998,6 +1998,33 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			 * fall through to PG-native MultiXact resolution below. */
 		}
 	}
+
+	/*
+	 * PGRAC (spec-6.14 D8): under cluster.shared_catalog the LOCAL-source
+	 * escape above is only lawful for tuples with no foreign-writer
+	 * evidence.  Catalog pages live in the single shared tree, so a LOCAL
+	 * MVCC snapshot -- the catalog snapshot before the services-ready gate
+	 * opens (boot / shutdown / recovery windows) -- can meet a tuple whose
+	 * xmin/xmax belongs to another node.  Judging it by the PG-native body
+	 * below would consult the LOCAL pg_xact / ProcArray by raw xid (a
+	 * cross-instance alias, AD-012 例外 9) and stamp wrong hint bits onto
+	 * the shared page.  There is no lawful verdict under LOCAL semantics
+	 * (a foreign xid is incomparable with a local snapshot), so fail closed
+	 * (53R97, retryable) -- strictly safer than any convergence guess.
+	 * shared_catalog=off keeps this branch dead: catalog pages then never
+	 * carry foreign tuples, and user-table LOCAL windows (logical decoding
+	 * historic reads) keep their shipped spec-3.2 N1 posture.
+	 */
+	if (cluster_shared_catalog && cluster_enabled && BufferIsValid(buffer)
+		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_LOCAL
+		&& cluster_tuple_has_remote_evidence(buffer, tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+				 errmsg("foreign-origin tuple cannot be judged under a LOCAL snapshot "
+						"with cluster.shared_catalog enabled"),
+				 errhint("Catalog services on this node are not ready yet (starting up, "
+						 "shutting down, or in recovery); retry once the cluster reaches "
+						 "the RUNNING phase.")));
 #endif /* USE_PGRAC_CLUSTER */
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {

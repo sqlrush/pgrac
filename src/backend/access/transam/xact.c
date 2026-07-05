@@ -156,6 +156,7 @@
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
+#include "cluster/cluster_visibility_resolve.h" /* PGRAC: spec-6.14 D8 depth reset */
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
@@ -3265,6 +3266,11 @@ AbortTransaction(void)
 	 * escaped the precommit gap, so ADG thread-safe-SCN publication does not
 	 * freeze permanently on an aborted local transaction. */
 	(void)cluster_scn_pending_commit_clear_my_pending();
+
+	/* spec-6.14 D8: an ERROR escaping mid-resolve unwinds past the resolver's
+	 * no-recursion depth decrement; reset it so the catalog-snapshot guard
+	 * does not false-positive on the next catalog scan. */
+	cluster_vis_resolve_abort_reset();
 #endif
 
 	/* Cancel condition variable sleep */
@@ -5666,6 +5672,12 @@ AbortSubTransaction(void)
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
 	UnlockBuffers();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-6.14 D8: mirror AbortTransaction -- clear the resolver's
+	 * no-recursion depth counter after an ERROR escaped mid-resolve. */
+	cluster_vis_resolve_abort_reset();
+#endif
 
 	/* Reset WAL record construction state */
 	XLogResetInsertion();

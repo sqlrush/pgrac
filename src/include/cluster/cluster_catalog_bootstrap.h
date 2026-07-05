@@ -43,4 +43,16 @@
  */
 extern void cluster_catalog_startup_prepare(void);
 
+/*
+ * cluster_catalog_services_ready -- spec-6.14 D8 visibility phase gate.
+ *	True once THIS process may run catalog scans under cluster snapshot
+ *	semantics: shared_catalog mode is on and every service a catalog-tuple
+ *	remote-xid resolution depends on (interconnect rendezvous, TT/undo
+ *	substrate, cluster recovery) has completed startup, which the phase
+ *	driver condenses into CLUSTER_PHASE_RUNNING.  Before that -- and in
+ *	bootstrap / standalone / recovery contexts -- catalog snapshots keep the
+ *	spec-3.3 D3 LOCAL posture.
+ */
+extern bool cluster_catalog_services_ready(void);
+
 #endif							/* CLUSTER_CATALOG_BOOTSTRAP_H */

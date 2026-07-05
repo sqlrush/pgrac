@@ -31,12 +31,15 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_bootstrap.h"
 #include "cluster/cluster_catalog_migrate.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_oid_lease.h"
+#include "cluster/cluster_startup_phase.h"
 #include "miscadmin.h"
 
 void
@@ -82,4 +85,49 @@ cluster_catalog_startup_prepare(void)
 	 * pg_control's cluster-wide value both seed and join agree on.
 	 */
 	cluster_catalog_migrate_tree(DataDir, cf.system_identifier);
+}
+
+/*
+ * cluster_catalog_services_ready -- spec-6.14 D8 visibility phase gate.
+ *
+ * True once catalog scans in THIS process may run under cluster snapshot
+ * semantics.  CLUSTER_PHASE_RUNNING is the aggregate judge: the phase driver
+ * reaches it only after phases 1-4 all published READY (LMON/interconnect,
+ * LCK/LMS lock services, cluster recovery, normal-operation children), which
+ * is exactly the service set a catalog-tuple remote-xid resolution depends
+ * on.  Before that -- and in bootstrap / standalone / off-mode contexts,
+ * where the phase state stays PRE_INIT -- catalog snapshots keep the
+ * spec-3.3 D3 LOCAL posture.
+ *
+ * Recovery contexts stay LOCAL as well: on an ADG physical standby the local
+ * pg_xact is replayed from the primary's own WAL stream and is authoritative
+ * for every replayed xid (t/242 L9 RL1), and crash-recovery replay never
+ * runs MVCC catalog scans.
+ *
+ * The RUNNING observation is latched per backend: phases never regress
+ * except into SHUTDOWN, where the desired posture is the resolver's own
+ * fail-closed 53R97 (services torn down, not wrong answers), not a silent
+ * flip back to LOCAL judgement of foreign tuples.
+ */
+bool
+cluster_catalog_services_ready(void)
+{
+	static bool ready_latched = false;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return false;
+
+	if (RecoveryInProgress())
+		return false;
+
+	if (ready_latched)
+		return true;
+
+	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING)
+	{
+		ready_latched = true;
+		return true;
+	}
+
+	return false;
 }

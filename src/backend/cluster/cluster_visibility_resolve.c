@@ -79,6 +79,40 @@ vis_origin_materialized(int origin)
 
 
 /*
+ * PGRAC: spec-6.14 D8 -- catalog-safe no-recursion guard.
+ *
+ * Under cluster.shared_catalog, catalog tuples themselves resolve through
+ * this file, so the resolve path must stay catalog-free: a syscache /
+ * systable access from inside a resolve would take a fresh catalog snapshot
+ * whose tuples resolve through this same path -- the spec-3.3 startup
+ * circularity (catalog scan -> cluster_tt lookup -> catalog scan), now
+ * reachable at steady state.  The TT / undo substrate honours this by
+ * design (spec-3.27 identity-only: undo-segment identity and xid->node
+ * routing are configuration-derived, never catalog-derived); this counter
+ * turns that contract into an enforced invariant.  GetCatalogSnapshot
+ * checks it and fail-stops instead of recursing.
+ *
+ * The counter is bumped around every ref classification (local evidence
+ * included -- the contract is "the resolver is catalog-free", not "remote
+ * lookups are").  An ERROR escaping mid-resolve unwinds past the decrement,
+ * so (Sub)AbortTransaction resets it via cluster_vis_resolve_abort_reset().
+ */
+static int cluster_vis_resolve_depth = 0;
+
+bool
+cluster_vis_resolve_in_flight(void)
+{
+	return cluster_vis_resolve_depth > 0;
+}
+
+void
+cluster_vis_resolve_abort_reset(void)
+{
+	cluster_vis_resolve_depth = 0;
+}
+
+
+/*
  * Fill `out` from an authoritative remote exact ref.  Performs the TT
  * overlay lookup + SUBCOMMITTED parent follow, leaving a terminal-or-
  * in-progress status.  Lookup miss / non-authoritative -> UNKNOWN (the
@@ -212,8 +246,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
  *	  origin != self            -> REMOTE (overlay resolve).
  */
 static void
-classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-			 SCN read_scn, ClusterVisResolve *out)
+classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
+				  SCN read_scn, ClusterVisResolve *out)
 {
 	if (out == NULL || ref == NULL)
 		return;
@@ -429,6 +463,19 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 	}
 
 	resolve_from_remote_ref(raw_xid, ref, out);
+}
+
+/*
+ * classify_ref -- spec-6.14 D8 wrapper: run the classification under the
+ * catalog-safe no-recursion counter (see cluster_vis_resolve_depth above).
+ */
+static void
+classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
+			 SCN read_scn, ClusterVisResolve *out)
+{
+	cluster_vis_resolve_depth++;
+	classify_ref_guts(raw_xid, ref, anchor_lsn, read_scn, out);
+	cluster_vis_resolve_depth--;
 }
 
 
