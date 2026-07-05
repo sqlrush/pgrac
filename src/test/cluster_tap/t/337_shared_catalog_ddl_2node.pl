@@ -28,7 +28,8 @@
 #          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
 #          trigger case); disarm restores service.
 #      L5  (Q12 / §3.6 rejection face) CREATE UNLOGGED TABLE, ALTER TABLE
-#          SET UNLOGGED, CREATE DATABASE and CREATE TABLESPACE all refuse
+#          SET UNLOGGED, CREATE DATABASE, CREATE TABLESPACE and mapped
+#          catalog rewrites (VACUUM FULL pg_class, D5 interim gate) refuse
 #          with feature_not_supported under shared_catalog=on.
 #      L6  (Q12 enable-time vet) a throwaway node with PRE-EXISTING unlogged
 #          storage refuses to boot with shared_catalog=on (init-fork vet
@@ -400,6 +401,16 @@ my ($rcu4, undef, $erru4) = $node0->psql('postgres',
 isnt($rcu4, 0, 'L5: CREATE TABLESPACE is refused');
 like($erru4, qr/CREATE TABLESPACE is not supported with/,
 	'L5: CREATE TABLESPACE refusal is the explicit fail-closed message');
+
+# Mapped-catalog rewrite (spec-6.14 D5 interim gate): a VACUUM FULL of a
+# mapped catalog would rewrite only the local pg_filenode.map while the
+# peer keeps serving the stale mapping for the shared tree -- refused
+# until the relmap authority write path is activated.
+my ($rcu5, undef, $erru5) = $node0->psql('postgres', 'VACUUM FULL pg_class');
+isnt($rcu5, 0, 'L5: mapped catalog rewrite (VACUUM FULL pg_class) is refused');
+like($erru5,
+	qr/mapped catalog relation rewrite is not supported with cluster\.shared_catalog/,
+	'L5: mapped rewrite refusal is the explicit fail-closed message');
 
 $node1->stop;
 $node0->stop;

@@ -52,6 +52,16 @@
  *     broadcast STUB counter); spec-2.27 SI Broadcaster will turn
  *     it into a real wire send.
  *
+ *   - Added an interim fail-closed gate in RelationMapUpdateMap():
+ *     mapped-catalog relation rewrites (VACUUM FULL / CLUSTER /
+ *     REINDEX of mapped rels) are rejected while
+ *     cluster.shared_catalog is enabled, until the cluster relation
+ *     map authority write path (pending/publish protocol) ships.
+ *     Without it a mapped rewrite would update only the local
+ *     pg_filenode.map while peers keep serving the stale mapping —
+ *     a silent lost-write / wrong-relfilenode read across nodes.
+ *     Spec: spec-6.14-shared-catalog-single-authority.md (D5).
+ *
  *   - History note: Hardening v1.0.0 (2026-05-09 pre-ship F3) moved
  *     the hook from RelationMapInvalidate() (the sinval RECEIVE
  *     callback) to write_relmap_file() source side to avoid
@@ -408,6 +418,27 @@ RelationMapUpdateMap(Oid relationId, RelFileNumber fileNumber, bool shared,
 
 		if (IsInParallelMode())
 			elog(ERROR, "cannot change relation mapping in parallel mode");
+
+#ifdef USE_PGRAC_CLUSTER
+
+		/*
+		 * PGRAC MODIFICATIONS (spec-6.14 D5): mapped-catalog rewrites are
+		 * rejected under cluster.shared_catalog until the cluster relation
+		 * map authority write path (pending/publish) is activated.  A local
+		 * pg_filenode.map update would leave every peer serving the stale
+		 * mapping for the shared tree: their relcache rebuilds would open
+		 * the OLD relfilenumber — a silent cross-node lost write.  Explicit
+		 * fail-closed refusal until then; WAL replay (relmap_redo) and
+		 * bootstrap are not affected.
+		 */
+		if (cluster_shared_catalog)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("mapped catalog relation rewrite is not supported with cluster.shared_catalog"),
+					 errhint("VACUUM FULL, CLUSTER, and REINDEX on mapped system "
+							 "catalogs require the cluster relation map write "
+							 "path, which is not yet activated.")));
+#endif
 
 		if (immediate)
 		{
