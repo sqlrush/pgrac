@@ -6,5 +6,7 @@
 /reindexdb
 /vacuumdb
 /pg_isready
+# PGRAC: cluster backup frontend (spec-6.5)
+/pg_cluster_basebackup
 
 /tmp_check/
