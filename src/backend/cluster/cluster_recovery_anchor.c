@@ -20,9 +20,13 @@
  *	  passes its stale redo point.  Reads never ereport; they classify the
  *	  primary and then the .bak under the same strict validation and
  *	  return false so the caller decides the error face (FATAL 53RB3).
- *	  The anchor is one checkpoint stale at worst -- it is written before
- *	  the same checkpoint cycle recycles WAL -- so a .bak needs no extra
- *	  recoverability probe beyond full validity.
+ *	  The PRIMARY anchor never points past recycled WAL (it is written
+ *	  before the same checkpoint cycle recycles).  The .bak is best-effort
+ *	  corruption recovery: after the next cycle recycles WAL it may point
+ *	  below the retained floor, in which case adopting it fails closed
+ *	  downstream (ReadCheckpointRecord PANICs on the unreadable record;
+ *	  never a silent wrong recovery), so no extra acceptance probe is
+ *	  applied.
  *
  *	  Single writer: the owning node's startup process or checkpointer,
  *	  serialized by the checkpoint interlock.  No cross-node access; other

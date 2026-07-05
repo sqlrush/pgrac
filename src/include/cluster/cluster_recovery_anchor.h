@@ -139,12 +139,15 @@ extern const char *cluster_recovery_anchor_bak_path(void);
 
 /*
  * Read this node's anchor into *out.  Tries the primary first, then the
- * .bak under the same strict classification (an anchor that is merely one
- * checkpoint stale is safe -- the WAL it points into has not been recycled
- * -- so no extra acceptance probe is needed beyond full validity).
- * Returns true and fills *out (setting *used_bak when the .bak was the
- * source) on success; returns false when the read must fail-closed.
- * Never ereports; the caller decides the error face (FATAL 53RB3).
+ * .bak under the same strict classification.  The .bak is best-effort
+ * corruption recovery, not a recoverability guarantee: once the NEXT
+ * checkpoint cycle has recycled WAL, a .bak that is one checkpoint stale
+ * may point below the retained-WAL floor -- adopting it then fails closed
+ * downstream (ReadCheckpointRecord cannot validate a recycled segment and
+ * PANICs; never a silent wrong-recovery).  Returns true and fills *out
+ * (setting *used_bak when the .bak was the source) on success; returns
+ * false when the read must fail-closed.  Never ereports; the caller
+ * decides the error face (FATAL 53RB3).
  */
 extern bool cluster_recovery_anchor_read(uint64 expected_sysid, ClusterRecoveryAnchor *out,
 										 bool *used_bak);

@@ -5345,50 +5345,63 @@ StartupXLOG(void)
 		bool		force_failclosed = false;
 
 		/*
-		 * Test-only: SKIP makes this boot behave as if the anchor were
-		 * unreadable, driving the 53RB3 fail-closed branch on a node whose
-		 * on-disk anchor is healthy (t/289 L-r5, L408).
+		 * A backup_label boot never activates the anchor: the label is the
+		 * one-shot provisioning authority for EVERY restart input, and a
+		 * stale anchor from this node's previous incarnation (same sysid
+		 * and node_id, so it classifies VALID) must not drive boot_state /
+		 * didCrash / recoveryTargetTLI on a restore -- a leftover
+		 * DB_SHUTDOWNED would skip the restore's data-directory fsync.
+		 * Vanilla label semantics apply; the first own checkpoint after
+		 * label recovery rewrites the anchor.
 		 */
-		CLUSTER_INJECTION_POINT("cluster-recovery-anchor-force-failclosed");
-		if (cluster_injection_should_skip("cluster-recovery-anchor-force-failclosed"))
-			force_failclosed = true;
-
-		if (!force_failclosed &&
-			cluster_recovery_anchor_load(ControlFile->system_identifier,
-										 &anchor_from_bak))
+		if (!have_label)
 		{
-			const ClusterRecoveryAnchor *ra = cluster_recovery_anchor_get();
-
 			/*
-			 * The write hooks only ever record the two steady states; any
-			 * other value is a foreign/corrupt leftover -- refuse to guess a
-			 * restart semantic from it.
+			 * Test-only: SKIP makes this boot behave as if the anchor were
+			 * unreadable, driving the 53RB3 fail-closed branch on a node
+			 * whose on-disk anchor is healthy (t/289 L-r5, L408).
 			 */
-			if (ra->state != (uint32) DB_SHUTDOWNED &&
-				ra->state != (uint32) DB_IN_PRODUCTION)
+			CLUSTER_INJECTION_POINT("cluster-recovery-anchor-force-failclosed");
+			if (cluster_injection_should_skip("cluster-recovery-anchor-force-failclosed"))
+				force_failclosed = true;
+
+			if (!force_failclosed &&
+				cluster_recovery_anchor_load(ControlFile->system_identifier,
+											 &anchor_from_bak))
+			{
+				const ClusterRecoveryAnchor *ra = cluster_recovery_anchor_get();
+
+				/*
+				 * The write hooks only ever record the two steady states;
+				 * any other value is a foreign/corrupt leftover -- refuse
+				 * to guess a restart semantic from it.
+				 */
+				if (ra->state != (uint32) DB_SHUTDOWNED &&
+					ra->state != (uint32) DB_IN_PRODUCTION)
+					ereport(FATAL,
+							(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+							 errmsg("recovery anchor for node %d contains unexpected database state %u",
+									cluster_node_id, (unsigned) ra->state),
+							 errhint("Re-provision this node from a base backup.")));
+
+				if (anchor_from_bak)
+					ereport(WARNING,
+							(errmsg("recovery anchor for node %d was adopted from its backup copy",
+									cluster_node_id)));
+				ereport(LOG,
+						(errmsg("using per-node recovery anchor for node %d: state %u, checkpoint %X/%X, redo %X/%X",
+								cluster_node_id, (unsigned) ra->state,
+								LSN_FORMAT_ARGS(ra->checkPoint),
+								LSN_FORMAT_ARGS(ra->checkPointCopy.redo))));
+			}
+			else
 				ereport(FATAL,
 						(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
-						 errmsg("recovery anchor for node %d contains unexpected database state %u",
-								cluster_node_id, (unsigned) ra->state),
-						 errhint("Re-provision this node from a base backup.")));
-
-			if (anchor_from_bak)
-				ereport(WARNING,
-						(errmsg("recovery anchor for node %d was adopted from its backup copy",
-								cluster_node_id)));
-			ereport(LOG,
-					(errmsg("using per-node recovery anchor for node %d: state %u, checkpoint %X/%X, redo %X/%X",
-							cluster_node_id, (unsigned) ra->state,
-							LSN_FORMAT_ARGS(ra->checkPoint),
-							LSN_FORMAT_ARGS(ra->checkPointCopy.redo))));
+						 errmsg("per-node recovery anchor for node %d is missing or invalid under the shared control-file authority",
+								cluster_node_id),
+						 errdetail("The shared pg_control checkpoint fields belong to the last writer node and cannot locate this node's own checkpoint."),
+						 errhint("Re-provision this node from a base backup, or verify that cluster.shared_data_dir is correctly mounted.")));
 		}
-		else if (!have_label)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
-					 errmsg("per-node recovery anchor for node %d is missing or invalid under the shared control-file authority",
-							cluster_node_id),
-					 errdetail("The shared pg_control checkpoint fields belong to the last writer node and cannot locate this node's own checkpoint."),
-					 errhint("Re-provision this node from a base backup, or verify that cluster.shared_data_dir is correctly mounted.")));
 	}
 #endif
 
@@ -6192,7 +6205,6 @@ StartupXLOG(void)
 	SpinLockRelease(&XLogCtl->info_lck);
 
 	UpdateControlFile();
-	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -6205,10 +6217,20 @@ StartupXLOG(void)
 	 * the vanilla pg_control state update above prevents.  A node without
 	 * an anchor yet (label-provisioned first boot) is a no-op: creation
 	 * happens only at the checkpoint hook and the seed path.
+	 *
+	 * Runs before ControlFileLock is released so the two production flips
+	 * stay adjacent: no WAL can be written between them (backends are not
+	 * yet admitted and this process writes none here), so a crash in the
+	 * residual two-file window loses no replayable work.
 	 */
 	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_refresh_state(ControlFile->system_identifier,
 											  (uint32) DB_IN_PRODUCTION);
+#endif
+
+	LWLockRelease(ControlFileLock);
+
+#ifdef USE_PGRAC_CLUSTER
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.
