@@ -484,6 +484,13 @@ own_slot_modify(void (*mutate)(ClusterWalStateSlot *, uint64), uint64 arg)
 	return write_own_slot(&slot);
 }
 
+/*
+ * Durable-flush bound staged by publish_checkpoint_redo for
+ * mutate_checkpoint_redo (own_slot_modify carries a single value).
+ * Process-local: only one checkpoint publish runs per process at a time.
+ */
+static uint64 publish_flushed_bound = 0;
+
 static void
 mutate_checkpoint_redo(ClusterWalStateSlot *s, uint64 v)
 {
@@ -496,14 +503,16 @@ mutate_checkpoint_redo(ClusterWalStateSlot *s, uint64 v)
 	 * then dies within one refresh interval leaves highest_lsn BELOW its own
 	 * checkpoint_redo_lsn -- and the thread-recovery window derivation
 	 * correctly treats an inverted slot as garbage and fail-closes, freezing
-	 * the dead thread forever.  The checkpoint completion has already
-	 * XLogFlush'd through the checkpoint record, so the flush pointer is a
-	 * PROVEN durable lower bound (>= the just-published redo) and strictly
-	 * sound for validated_min.  Monotonic max: never lower a fresher refresh.
-	 * CreateCheckPoint runs outside recovery only, so GetFlushRecPtr is legal.
+	 * the dead thread forever.  The caller passes the checkpoint record's
+	 * already-XLogFlush'd end LSN as the PROVEN durable lower bound (>= the
+	 * just-published redo) -- it must NOT be read via GetFlushRecPtr here:
+	 * the END_OF_RECOVERY checkpoint runs while SharedRecoveryState is not
+	 * yet RECOVERY_STATE_DONE, where that accessor asserts (spec-6.14 D9
+	 * amend, t/339 L2 checkpointer TRAP).  Monotonic max: never lower a
+	 * fresher refresh.
 	 */
-	if ((uint64)GetFlushRecPtr(NULL) > s->highest_lsn)
-		s->highest_lsn = (uint64)GetFlushRecPtr(NULL);
+	if (publish_flushed_bound > s->highest_lsn)
+		s->highest_lsn = publish_flushed_bound;
 }
 
 static void
@@ -514,8 +523,9 @@ mutate_fpw_off(ClusterWalStateSlot *s, uint64 v)
 }
 
 void
-cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn)
+cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn, uint64 flushed_lsn)
 {
+	publish_flushed_bound = flushed_lsn;
 	if (!own_slot_modify(mutate_checkpoint_redo, redo_lsn) && registry_configured())
 		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
 						  errmsg("could not publish checkpoint redo to the WAL state registry: %m"),

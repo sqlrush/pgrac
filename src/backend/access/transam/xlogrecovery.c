@@ -114,6 +114,23 @@
  *	               the local pg_undo/instance_<owner> tree.
  *	Why:           spec-4.5a-shared-storage-data-backend.md §0 G2 +
  *	               §3.3a/§3.3c (P0-3).
+ *
+ * PGRAC MODIFICATIONS (spec-6.14 D9 amend, INV-D9-R)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:  1. PerformWalRecovery acquires the shared-regime
+ *	               crash-recovery claim (blocking) before the engage
+ *	               decision, crash recovery only -- serializing merged
+ *	               replays AND plain own-stream redo across concurrently
+ *	               booting nodes.  2. cluster_record_apply_class routes
+ *	               RM_SMGR create/truncate by their PAYLOAD relfile
+ *	               locator (they carry no block ref; pre-amend they fell
+ *	               through to UNCLASSIFIABLE and 53RA3'd the merge on any
+ *	               foreign CREATE TABLE tail).
+ *	Why:           spec-6.14-shared-catalog-single-authority.md D9 amend
+ *	               (the spec-5.6 Phase-2 rendezvous forces concurrent
+ *	               boots, breaking spec-4.5a Q3's serialized-cold-merge
+ *	               premise).
  */
 
 #include "postgres.h"
@@ -157,6 +174,7 @@
 #include "access/xlogutils.h"
 #include "backup/basebackup.h"
 #include "catalog/pg_control.h"
+#include "catalog/storage_xlog.h" /* PGRAC: spec-6.14 D9 amend smgr payload routing */
 #include "commands/tablespace.h"
 #include "common/file_utils.h"
 #include "miscadmin.h"
@@ -2399,6 +2417,23 @@ PerformWalRecovery(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
+	 * PGRAC spec-6.14 D9 amend (INV-D9-R): serialize the shared-regime
+	 * crash-recovery critical section BEFORE deciding how to recover.  Two
+	 * nodes passing the all-cold engage gate concurrently (the spec-5.6
+	 * Phase-2 rendezvous forces concurrent boots) would run two merged
+	 * replays over the same shared pages; and a node running plain
+	 * own-stream redo cannot be seen by a peer's registry-staleness
+	 * SKIPPED verdict (redo refreshes no watermarks), so its replay could
+	 * overlap a peer's merge of its thread.  The claim is held across the
+	 * whole recovery and released after the end-of-recovery checkpoint.
+	 * Crash recovery only: archive/standby/restore recovery is unbounded
+	 * or off-regime and must not pin the claim.
+	 */
+	if (!ArchiveRecoveryRequested && !StandbyMode
+		&& !cluster_backup_recovery_merge_required && !cluster_mrp_should_start())
+		cluster_recovery_merge_claim_acquire_blocking();
+
+	/*
 	 * PGRAC spec-4.5 §3.1/§3.2: decide whether to engage k-way merged
 	 * recovery now that InRecovery is settled.  The decision FATALs
 	 * 53RA3 if it wants to engage but the (A-closure capability /
@@ -3155,6 +3190,37 @@ cluster_record_apply_class(XLogReaderState *r)
 				same_routing = false;
 		}
 		first_shared = (routed == 1);
+	}
+	else if (XLogRecGetRmid(r) == RM_SMGR_ID)
+	{
+		/*
+		 * PGRAC: spec-6.14 D9 amend -- smgr create/truncate carry their
+		 * target relfile in the PAYLOAD, not in a block ref, so the block
+		 * walk above cannot route them (pre-amend they fell through to
+		 * UNCLASSIFIABLE and 53RA3'd the merge on the first foreign CREATE
+		 * TABLE tail).  Route the payload locator through the same smgr
+		 * predicate: a shared relfile's create/truncate is S (smgr_redo is
+		 * idempotent under isRedo -- create-if-absent / truncate-to-size),
+		 * a local one is L (a foreign stream must not re-drive this node's
+		 * local files).  The routing rides the first_block_is_shared
+		 * parameter of the pure matrix.
+		 */
+		uint8		info = XLogRecGetInfo(r) & ~XLR_INFO_MASK;
+
+		if (info == XLOG_SMGR_CREATE)
+		{
+			xl_smgr_create *xlrec = (xl_smgr_create *) XLogRecGetData(r);
+
+			first_shared = (cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1);
+		}
+		else if (info == XLOG_SMGR_TRUNCATE)
+		{
+			xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(r);
+
+			first_shared = (cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1);
+		}
+		else
+			return CLUSTER_RECMERGE_UNCLASSIFIABLE; /* unknown smgr info bits */
 	}
 
 	return cluster_recovery_record_class(XLogRecGetRmid(r), has_block, first_shared,

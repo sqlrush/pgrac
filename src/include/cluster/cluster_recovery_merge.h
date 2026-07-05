@@ -45,6 +45,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_wal_state.h"
+#include "port/pg_crc32c.h" /* spec-6.14 D9 amend: merge-claim CRC */
 
 /*
  * §3.3e apply class.  Per record, decided from the rmid white-table +
@@ -116,6 +117,13 @@ cluster_recovery_record_class(RmgrId rmid, bool has_block_ref, bool first_block_
 			/* XLOG housekeeping (checkpoint/fpw/...) + relmap are
 			 * node-local on a foreign stream. */
 			return CLUSTER_RECMERGE_LOCAL;
+		case RM_SMGR_ID:
+			/* smgr create/truncate name their relfile in the payload;
+			 * the caller resolves its routing through the same smgr
+			 * predicate and reports it via first_block_is_shared
+			 * (spec-6.14 D9 amend -- pre-amend these fell through to U
+			 * and 53RA3'd the merge on any foreign CREATE TABLE tail). */
+			return first_block_is_shared ? CLUSTER_RECMERGE_SHARED : CLUSTER_RECMERGE_LOCAL;
 		case RM_DBASE_ID:
 		case RM_TBLSPC_ID:
 			/* createdb / tablespace ops touch local dirs we cannot
@@ -281,6 +289,99 @@ cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, i
 	return CLUSTER_RECMERGE_STREAMING_RECORD_READY;
 }
 
+/* ============================================================
+ * Sole-merger claim (spec-6.14 D9 amend, INV-D9-R).
+ *
+ *	spec-4.5a Q3 assumed cold merges are SERIALIZED (the stage-4
+ *	harnesses restarted nodes one at a time).  Under the spec-5.6
+ *	shared control-file authority the Phase-2 rendezvous forces
+ *	concurrent boots, so two nodes can pass the all-cold engage gate
+ *	simultaneously and run two merged replays over the SAME shared
+ *	pages -- the second merger's raw read-modify-write can regress the
+ *	first merger's post-recovery live writes (lost write).  A durable
+ *	claim file on the shared root serializes the whole shared-regime
+ *	crash-recovery critical section: EVERY node about to run local
+ *	crash redo acquires it first (blocking), so a vanilla own-stream
+ *	replay can never overlap a peer's merge of the same thread either
+ *	(the registry-staleness SKIPPED verdict cannot see a mid-redo node
+ *	-- redo refreshes no watermarks).  The winner-of-the-moment runs
+ *	its recovery (k-way merge or plain own-stream redo per the
+ *	unchanged engage decision) and releases only after its
+ *	end-of-recovery checkpoint has made the recovered content durable
+ *	in shared storage; a waiter then acquires and proceeds, its own
+ *	stream protected by the §3.3c own-bound skip when a merger already
+ *	covered it.  A claim held by a node that is provably dead is
+ *	NEVER taken over -- there is no early-fencing oracle to prove the
+ *	holder's in-flight writes ceased (same posture as the sole-survivor
+ *	bootstrap fail-close in cluster_cf_storage.c) -- boot fails closed
+ *	and the operator resolves it.
+ *
+ *	The pure build/classify core lives here (unit-testable, frontend-
+ *	safe); the claim I/O + wait loop are backend-only below.
+ * ============================================================
+ */
+#define CLUSTER_MERGE_CLAIM_MAGIC UINT64CONST(0x4d52474d434c4d31) /* "MRGMCLM1" */
+
+typedef struct ClusterMergeClaimFile {
+	uint64 magic;
+	uint64 sysid; /* cluster system identifier (foreign-root guard) */
+	int32 node;	  /* 0-based claimant node id */
+	int32 pad;	  /* zero; keeps the CRC field aligned + layout explicit */
+	pg_crc32c crc; /* over the four fields above */
+} ClusterMergeClaimFile;
+
+typedef enum ClusterMergeClaimVerdict {
+	CLUSTER_MERGE_CLAIM_VALID = 0,
+	CLUSTER_MERGE_CLAIM_INVALID_SHORT,	  /* wrong byte count */
+	CLUSTER_MERGE_CLAIM_INVALID_CRC,	  /* checksum mismatch */
+	CLUSTER_MERGE_CLAIM_INVALID_MAGIC,	  /* not a claim file */
+	CLUSTER_MERGE_CLAIM_INVALID_IDENTITY, /* another cluster's sysid */
+	CLUSTER_MERGE_CLAIM_INVALID_NODE	  /* claimant id out of range */
+} ClusterMergeClaimVerdict;
+
+static inline void
+cluster_merge_claim_build(ClusterMergeClaimFile *f, int32 node, uint64 sysid)
+{
+	f->magic = CLUSTER_MERGE_CLAIM_MAGIC;
+	f->sysid = sysid;
+	f->node = node;
+	f->pad = 0;
+	INIT_CRC32C(f->crc);
+	COMP_CRC32C(f->crc, f, offsetof(ClusterMergeClaimFile, crc));
+	FIN_CRC32C(f->crc);
+}
+
+/*
+ * Classify a claim image read back from the shared root.  CRC first (a
+ * torn/garbage file must not be interpreted at all), then magic, then
+ * identity, then node range -- mirrors cluster_cf_classify_buffer's
+ * ordering discipline.
+ */
+static inline ClusterMergeClaimVerdict
+cluster_merge_claim_classify(const void *buf, size_t len, uint64 expected_sysid)
+{
+	ClusterMergeClaimFile f;
+	pg_crc32c crc;
+
+	if (len != sizeof(ClusterMergeClaimFile))
+		return CLUSTER_MERGE_CLAIM_INVALID_SHORT;
+	memcpy(&f, buf, sizeof(f));
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &f, offsetof(ClusterMergeClaimFile, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, f.crc))
+		return CLUSTER_MERGE_CLAIM_INVALID_CRC;
+
+	if (f.magic != CLUSTER_MERGE_CLAIM_MAGIC)
+		return CLUSTER_MERGE_CLAIM_INVALID_MAGIC;
+	if (f.sysid != expected_sysid)
+		return CLUSTER_MERGE_CLAIM_INVALID_IDENTITY;
+	if (f.node < 0 || f.node >= CLUSTER_WAL_STATE_SLOT_COUNT)
+		return CLUSTER_MERGE_CLAIM_INVALID_NODE;
+	return CLUSTER_MERGE_CLAIM_VALID;
+}
+
 #ifndef FRONTEND
 
 /* Backend engine (cluster_recovery_merge.c). */
@@ -308,6 +409,18 @@ typedef enum ClusterMergeEngage {
 extern ClusterMergeEngage cluster_recovery_merge_decide(uint16 own_thread, XLogRecPtr own_redo,
 														uint64 out_bitmap[2],
 														XLogRecPtr *out_start);
+
+/* Sole-merger claim lifecycle (spec-6.14 D9 amend; see the pure core
+ * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage
+ * decision (crash recovery only -- never archive/standby/restore, whose
+ * recovery is unbounded or off-regime); it no-ops unless the shared-WAL
+ * regime is fully configured.  release runs in StartupXLOG AFTER the
+ * end-of-recovery checkpoint (only then is the recovered content durable
+ * in shared storage; releasing at merge end would let a late booter
+ * re-merge from stale storage concurrently with this node's live
+ * writes). */
+extern void cluster_recovery_merge_claim_acquire_blocking(void);
+extern void cluster_recovery_merge_claim_release_if_held(void);
 
 extern ClusterRecoveryMergeState *cluster_recovery_merge_begin(const uint64 merge_bitmap[2],
 															   const XLogRecPtr *start_lsn,

@@ -245,6 +245,16 @@ UT_TEST(test_class_unlisted_noblock)
 				 (int)CLUSTER_RECMERGE_UNCLASSIFIABLE);
 }
 
+/* spec-6.14 D9 amend: smgr create/truncate route by their PAYLOAD relfile
+ * (reported through first_block_is_shared) -- shared -> S, local -> L. */
+UT_TEST(test_class_smgr_payload_routing)
+{
+	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_SMGR_ID, false, true, true),
+				 (int)CLUSTER_RECMERGE_SHARED);
+	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_SMGR_ID, false, false, true),
+				 (int)CLUSTER_RECMERGE_LOCAL);
+}
+
 UT_TEST(test_class_block_shared)
 {
 	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_HEAP_ID, true, true, true),
@@ -411,11 +421,77 @@ UT_TEST(test_streaming_heartbeat_equal_scn_uses_closed_frontier)
 	UT_ASSERT_EQ((int)key.scn, 20);
 }
 
+/* ----------
+ * spec-6.14 D9 amend: shared-regime recovery-claim pure core.
+ * Round trip, then every classify rejection in priority order (CRC
+ * first: a torn image must be rejected before its fields are read).
+ * ----------
+ */
+UT_TEST(test_claim_build_classify_round_trip)
+{
+	ClusterMergeClaimFile f;
+
+	cluster_merge_claim_build(&f, 3, UINT64CONST(0xDEADBEEFCAFE));
+	UT_ASSERT_EQ((int)cluster_merge_claim_classify(&f, sizeof(f), UINT64CONST(0xDEADBEEFCAFE)),
+				 (int)CLUSTER_MERGE_CLAIM_VALID);
+	UT_ASSERT_EQ(f.node, 3);
+}
+
+UT_TEST(test_claim_classify_rejections)
+{
+	ClusterMergeClaimFile f;
+	uint64		sysid = UINT64CONST(0x1122334455667788);
+
+	cluster_merge_claim_build(&f, 1, sysid);
+
+	/* short read */
+	UT_ASSERT_EQ((int)cluster_merge_claim_classify(&f, sizeof(f) - 1, sysid),
+				 (int)CLUSTER_MERGE_CLAIM_INVALID_SHORT);
+
+	/* flipped byte -> CRC (before any field interpretation) */
+	{
+		ClusterMergeClaimFile torn = f;
+
+		torn.node ^= 0x40;
+		UT_ASSERT_EQ((int)cluster_merge_claim_classify(&torn, sizeof(torn), sysid),
+					 (int)CLUSTER_MERGE_CLAIM_INVALID_CRC);
+	}
+
+	/* wrong magic, valid CRC */
+	{
+		ClusterMergeClaimFile m;
+
+		cluster_merge_claim_build(&m, 1, sysid);
+		m.magic = UINT64CONST(0x4141414141414141);
+		INIT_CRC32C(m.crc);
+		COMP_CRC32C(m.crc, &m, offsetof(ClusterMergeClaimFile, crc));
+		FIN_CRC32C(m.crc);
+		UT_ASSERT_EQ((int)cluster_merge_claim_classify(&m, sizeof(m), sysid),
+					 (int)CLUSTER_MERGE_CLAIM_INVALID_MAGIC);
+	}
+
+	/* foreign cluster's sysid */
+	UT_ASSERT_EQ((int)cluster_merge_claim_classify(&f, sizeof(f), sysid + 1),
+				 (int)CLUSTER_MERGE_CLAIM_INVALID_IDENTITY);
+
+	/* claimant node id out of slot range */
+	{
+		ClusterMergeClaimFile n;
+
+		cluster_merge_claim_build(&n, CLUSTER_WAL_STATE_SLOT_COUNT, sysid);
+		UT_ASSERT_EQ((int)cluster_merge_claim_classify(&n, sizeof(n), sysid),
+					 (int)CLUSTER_MERGE_CLAIM_INVALID_NODE);
+		cluster_merge_claim_build(&n, -1, sysid);
+		UT_ASSERT_EQ((int)cluster_merge_claim_classify(&n, sizeof(n), sysid),
+					 (int)CLUSTER_MERGE_CLAIM_INVALID_NODE);
+	}
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(25);
+	UT_PLAN(28);
 
 	UT_RUN(test_heap_scn_order);
 	UT_RUN(test_heap_scn_tie_lsn);
@@ -428,6 +504,7 @@ main(int argc, char **argv)
 	UT_RUN(test_class_local_noblock);
 	UT_RUN(test_class_unclassifiable_noblock);
 	UT_RUN(test_class_unlisted_noblock);
+	UT_RUN(test_class_smgr_payload_routing);
 	UT_RUN(test_class_block_shared);
 	UT_RUN(test_class_block_local);
 	UT_RUN(test_class_block_mixed);
@@ -442,6 +519,8 @@ main(int argc, char **argv)
 	UT_RUN(test_streaming_missing_stream_blocks_record);
 	UT_RUN(test_streaming_heartbeat_frontier_blocks_record);
 	UT_RUN(test_streaming_heartbeat_equal_scn_uses_closed_frontier);
+	UT_RUN(test_claim_build_classify_round_trip);
+	UT_RUN(test_claim_classify_rejections);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -45,10 +45,12 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_tier1.h" /* spec-6.14 D9 amend: claim-holder liveness poll */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_wal_thread.h"
+#include "postmaster/startup.h" /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
 #include "cluster/storage/cluster_shared_fs.h" /* spec-4.5a D4: capability gate */
 #include "lib/stringinfo.h"
 #include "miscadmin.h" /* DataDir (authority marker path) */
@@ -359,6 +361,249 @@ cluster_merged_any_remote_materialized(void)
 			return true;
 	}
 	return false;
+}
+
+/* ============================================================
+ * Shared-regime crash-recovery claim (spec-6.14 D9 amend, INV-D9-R).
+ *
+ *	One durable file on the shared root serializes crash recovery
+ *	across the cluster (see the design note in cluster_recovery_merge.h
+ *	above the pure claim core).  Atomicity: the claim content is first
+ *	written durably to a per-node tmp file, then link(2)ed to the final
+ *	name -- the claim either does not exist or is complete (no torn
+ *	window), and exactly one concurrent link() wins.  The holder keeps
+ *	it across its whole recovery (merge OR plain own-stream redo) and
+ *	releases in StartupXLOG only after the end-of-recovery checkpoint
+ *	made the recovered pages durable in shared storage.
+ *
+ *	Waiter liveness: the tier1 interconnect plane is already up during
+ *	startup (listener + HELLO run in cluster startup phase 1, before
+ *	phase 3 recovery), so a waiter judges the holder by its IC peer
+ *	state.  An unlocked read of the shmem state field is fine for a
+ *	100ms liveness poll.  A holder that stays un-CONNECTED for a full
+ *	CSSD dead deadband is judged dead -> FATAL fail-closed: there is no
+ *	early-fencing oracle to prove the dead holder's in-flight writes
+ *	ceased, so the claim is never taken over (posture mirrors the
+ *	sole-survivor bootstrap fail-close in cluster_cf_storage.c).
+ * ============================================================
+ */
+#define MERGE_CLAIM_POLL_INTERVAL_MS 100
+
+static bool merge_claim_held = false;
+
+static int
+merge_claim_path(char *buf, size_t buf_size)
+{
+	int ret;
+
+	ret = snprintf(buf, buf_size, "%s/global/pgrac_merge.claim", cluster_shared_data_dir);
+	if (ret < 0 || (size_t)ret >= buf_size)
+		return -1;
+	return 0;
+}
+
+/*
+ * merge_claim_regime_configured -- is the shared-WAL crash-recovery
+ *	regime fully configured on this node?  Outside it there is nothing a
+ *	claim could serialize (no shared data root / no per-thread WAL), and
+ *	the claim file could not even be named.
+ */
+static bool
+merge_claim_regime_configured(void)
+{
+	return cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		   && cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0'
+		   && cluster_wal_threads_dir != NULL && cluster_wal_threads_dir[0] != '\0'
+		   && cluster_node_id >= 0 && cluster_wal_thread_id() != XLP_THREAD_ID_LEGACY;
+}
+
+/*
+ * cluster_recovery_merge_claim_acquire_blocking -- see header.
+ */
+void
+cluster_recovery_merge_claim_acquire_blocking(void)
+{
+	ClusterMergeClaimFile f;
+	char claim[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char gdir[MAXPGPATH];
+	uint64 sysid;
+	int fd;
+	int ret;
+	long dead_ms = 0;
+	long deadband_ms;
+	int32 wait_holder = -1;
+
+	if (!merge_claim_regime_configured() || merge_claim_held)
+		return;
+
+	if (merge_claim_path(claim, sizeof(claim)) < 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("shared-regime recovery claim path too long")));
+	ret = snprintf(tmp, sizeof(tmp), "%s.n%d.tmp", claim, cluster_node_id);
+	if (ret < 0 || (size_t)ret >= sizeof(tmp))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("shared-regime recovery claim tmp path too long")));
+	ret = snprintf(gdir, sizeof(gdir), "%s/global", cluster_shared_data_dir);
+	if (ret < 0 || (size_t)ret >= sizeof(gdir))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("shared-regime recovery claim dir path too long")));
+
+	sysid = GetSystemIdentifier();
+	cluster_merge_claim_build(&f, cluster_node_id, sysid);
+
+	/* Durable per-node tmp image; link() below publishes it atomically. */
+	fd = OpenTransientFile(tmp, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not create recovery claim tmp file \"%s\": %m", tmp)));
+	if (write(fd, &f, sizeof(f)) != sizeof(f) || pg_fsync(fd) != 0)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not write recovery claim tmp file \"%s\": %m", tmp)));
+	if (CloseTransientFile(fd) != 0)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not close recovery claim tmp file \"%s\": %m", tmp)));
+
+	deadband_ms = (long)cluster_cssd_heartbeat_interval_ms
+				  * (long)Max(cluster_cssd_dead_deadband_factor, 1);
+	if (deadband_ms < 5000)
+		deadband_ms = 5000;
+
+	for (;;) {
+		if (link(tmp, claim) == 0) {
+			fsync_fname(gdir, true);
+			(void)unlink(tmp);
+			merge_claim_held = true;
+			if (wait_holder >= 0)
+				ereport(LOG,
+						(errmsg("shared-regime recovery claim acquired by node %d after waiting "
+								"for node %d (own-stream records a peer merged are skipped "
+								"under the recovered bound)",
+								cluster_node_id, wait_holder)));
+			else
+				ereport(LOG, (errmsg("shared-regime recovery claim acquired by node %d",
+									 cluster_node_id)));
+			return;
+		}
+		if (errno != EEXIST)
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not link recovery claim \"%s\": %m", claim)));
+
+		/* Claim exists: read it back and judge the holder. */
+		{
+			char buf[sizeof(ClusterMergeClaimFile) + 1];
+			ssize_t n;
+			ClusterMergeClaimFile cur;
+			ClusterMergeClaimVerdict v;
+
+			fd = OpenTransientFile(claim, O_RDONLY | PG_BINARY);
+			if (fd < 0) {
+				if (errno == ENOENT)
+					continue; /* released between link() and open(); retry */
+				ereport(FATAL, (errcode_for_file_access(),
+								errmsg("could not open recovery claim \"%s\": %m", claim)));
+			}
+			n = read(fd, buf, sizeof(buf));
+			if (n < 0)
+				ereport(FATAL, (errcode_for_file_access(),
+								errmsg("could not read recovery claim \"%s\": %m", claim)));
+			if (CloseTransientFile(fd) != 0)
+				ereport(FATAL, (errcode_for_file_access(),
+								errmsg("could not close recovery claim \"%s\": %m", claim)));
+
+			v = cluster_merge_claim_classify(buf, (size_t)n, sysid);
+			if (v != CLUSTER_MERGE_CLAIM_VALID)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("shared-regime recovery claim \"%s\" is not valid (verdict %d)",
+								claim, (int)v),
+						 errhint("The claim file on the shared root is corrupt or belongs to "
+								 "another cluster.  Verify no node is recovering, remove the "
+								 "file, and restart.")));
+			memcpy(&cur, buf, sizeof(cur));
+
+			if (cur.node == cluster_node_id) {
+				/*
+				 * Our own claim from a previous incarnation that crashed
+				 * mid-recovery.  A node id maps to one pgdata, so no other
+				 * process can be running under it -- adopt the claim and
+				 * re-recover (the merge is SCN-idempotent over partially
+				 * flushed pages).
+				 */
+				(void)unlink(tmp);
+				merge_claim_held = true;
+				ereport(LOG,
+						(errmsg("shared-regime recovery claim re-adopted by node %d (previous "
+								"incarnation crashed while recovering; re-running recovery)",
+								cluster_node_id)));
+				return;
+			}
+
+			/* Held by a peer: wait for its release, watching its liveness. */
+			if (cur.node != wait_holder) {
+				wait_holder = cur.node;
+				dead_ms = 0;
+				ereport(LOG,
+						(errmsg("shared-regime crash recovery already claimed by node %d; "
+								"waiting for its recovery to complete",
+								wait_holder)));
+			}
+		}
+
+		{
+			const ClusterICPeerStateShmem *ps = cluster_ic_tier1_peer_get(wait_holder);
+
+			if (ps != NULL && ps->state == (int32)CLUSTER_IC_PEER_CONNECTED)
+				dead_ms = 0; /* holder reachable; keep waiting */
+			else
+				dead_ms += MERGE_CLAIM_POLL_INTERVAL_MS;
+		}
+		if (dead_ms >= deadband_ms)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("node %d died holding the shared-regime recovery claim", wait_holder),
+					 errdetail("The claim holder has been unreachable on the interconnect for "
+							   "%ld ms while its claim persists on the shared root.",
+							   dead_ms),
+					 errhint("The claim is never taken over without fencing (the dead holder's "
+							 "in-flight writes cannot be proven ceased).  Restart node %d so it "
+							 "re-adopts and completes its recovery, or verify it is down, remove "
+							 "\"%s\" from the shared root, and restart this node.",
+							 wait_holder, claim)));
+
+		HandleStartupProcInterrupts();
+		pg_usleep(MERGE_CLAIM_POLL_INTERVAL_MS * 1000L);
+	}
+}
+
+/*
+ * cluster_recovery_merge_claim_release_if_held -- see header.
+ */
+void
+cluster_recovery_merge_claim_release_if_held(void)
+{
+	char claim[MAXPGPATH];
+	char gdir[MAXPGPATH];
+	int ret;
+
+	if (!merge_claim_held)
+		return;
+	merge_claim_held = false;
+
+	if (merge_claim_path(claim, sizeof(claim)) < 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("shared-regime recovery claim path too long")));
+	if (unlink(claim) != 0 && errno != ENOENT)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not release recovery claim \"%s\": %m", claim),
+						errhint("A claim this node cannot remove would wedge every peer's "
+								"crash recovery; shared storage must support unlink here.")));
+	ret = snprintf(gdir, sizeof(gdir), "%s/global", cluster_shared_data_dir);
+	if (ret > 0 && (size_t)ret < sizeof(gdir))
+		fsync_fname(gdir, true);
+	ereport(LOG, (errmsg("shared-regime recovery claim released by node %d "
+						 "(recovered content durable after the end-of-recovery checkpoint)",
+						 cluster_node_id)));
 }
 
 typedef struct MergeStream {

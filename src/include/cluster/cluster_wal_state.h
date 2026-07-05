@@ -303,7 +303,7 @@ extern void cluster_wal_state_publish_stopped(void);
  * durable (merged-recovery start point, Q5); mark the fpw_was_off
  * sticky on the authoritative full_page_writes on->off path (§3.3d.3).
  * Both best-effort: failure WARNs, never blocks. */
-extern void cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn);
+extern void cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn, uint64 flushed_lsn);
 extern void cluster_wal_state_mark_fpw_off(void);
 
 /* spec-4.5 §3.3c: coordinator records how far it replayed a crashed

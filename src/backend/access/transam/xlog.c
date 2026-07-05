@@ -86,6 +86,25 @@
  *	  the write side.  Routing/layout validation lives in
  *	  cluster_wal_thread_init() (ipci.c); the own-stream strict reader
  *	  check lives in xlogreader.c + xlogrecovery.c (spec-4.1 RL1).
+ *
+ * PGRAC MODIFICATIONS (spec-6.14 D9 amend, INV-D9-R)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-6.14-shared-catalog-single-authority.md (D9 amend)
+ *
+ *	What changed:
+ *	  - StartupXLOG(): release the shared-regime crash-recovery claim
+ *	    right after PerformRecoveryXLogAction() -- only once the
+ *	    end-of-recovery checkpoint made the recovered pages durable in
+ *	    shared storage may a waiting peer start its own recovery.
+ *	  - CreateCheckPoint(): the wal-state redo publish now also passes
+ *	    the checkpoint record's flushed end LSN as the durable
+ *	    highest_lsn bound (GetFlushRecPtr is not legal during the
+ *	    END_OF_RECOVERY checkpoint).
+ *
+ *	Why:
+ *	  Cold crash recovery must be serialized cluster-wide under the
+ *	  spec-5.6 rendezvous-forced concurrent boots (INV-D9-R).
  */
 
 #include "postgres.h"
@@ -173,6 +192,7 @@
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
+#include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
@@ -6166,6 +6186,19 @@ StartupXLOG(void)
 	if (performedWalRecovery)
 		promoted = PerformRecoveryXLogAction();
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC spec-6.14 D9 amend (INV-D9-R): release the shared-regime
+	 * crash-recovery claim only NOW -- the end-of-recovery checkpoint above
+	 * ran synchronously (CHECKPOINT_WAIT), so every page this recovery
+	 * produced is durable in shared storage.  Releasing at merge end
+	 * instead would let a late-booting peer engage its own merge against
+	 * stale storage while this node's buffered content is still in flight.
+	 * No-op unless this startup acquired the claim.
+	 */
+	cluster_recovery_merge_claim_release_if_held();
+#endif
+
 	/*
 	 * If any of the critical GUCs have changed, log them before we allow
 	 * backends to write WAL.
@@ -7465,9 +7498,13 @@ CreateCheckPoint(int flags)
 	/*
 	 * PGRAC spec-4.5 (Q5): the checkpoint is now durable in pg_control;
 	 * publish this thread's redo start so a merged recovery of a crashed
-	 * peer knows where to begin.  Best-effort (WARN on failure).
+	 * peer knows where to begin.  Best-effort (WARN on failure).  recptr is
+	 * the checkpoint record's end LSN, XLogFlush'd above -- the proven
+	 * durable bound for the highest_lsn watermark (passed in because
+	 * GetFlushRecPtr is not legal during the END_OF_RECOVERY checkpoint,
+	 * spec-6.14 D9 amend).
 	 */
-	cluster_wal_state_publish_checkpoint_redo((uint64) checkPoint.redo);
+	cluster_wal_state_publish_checkpoint_redo((uint64) checkPoint.redo, (uint64) recptr);
 
 	/*
 	 * PGRAC (spec-5.6a D2 write hook #1): under the shared pg_control
