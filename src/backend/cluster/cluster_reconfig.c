@@ -2133,6 +2133,33 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	}
 
 	cluster_reconfig_publish_event(&evt);
+
+	/*
+	 * PGRAC: spec-6.14 D9 amend (F5) — unconditional operator evidence for a
+	 * fail-stop membership epoch bump (rule 17: key state changes must be
+	 * traceable).  Every pre-existing message on this path is traffic-driven
+	 * (stale-epoch replies, GRD rebuild), so a bump on an idle survivor left
+	 * no log line at all and harnesses had to poll SQL state instead.  A
+	 * fixed stack buffer (worst case: 128 node ids x 4 chars) keeps the LMON
+	 * tick free of allocator traffic.
+	 */
+	{
+		char		dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
+		int			off = 0;
+		int			n;
+
+		dead[0] = '\0';
+		for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
+			if (dead_bitmap[n / 8] & (1 << (n % 8)))
+				off += snprintf(dead + off, sizeof(dead) - off, "%s%d",
+								off ? "," : "", n);
+		}
+		ereport(LOG,
+				(errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
+						"(coordinator node %d, dead node(s) {%s})",
+						(unsigned long long) old_epoch, (unsigned long long) new_epoch,
+						(int) coordinator_node_id, dead)));
+	}
 }
 
 

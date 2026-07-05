@@ -136,6 +136,7 @@ cluster.shared_data_dir = '$shared_root'
 cluster.smgr_user_relations = on
 cluster.controlfile_shared_authority = on
 cluster.shared_catalog = on
+cluster.merged_recovery = on
 EOC
 
 # ----------
@@ -288,12 +289,16 @@ for (1 .. 90)
 }
 is($dead_ok, 1, 'L1: node1 CSSD declared node0 dead (log evidence)');
 
+# The epoch bump itself is deterministic log evidence (spec-6.14 D9 amend
+# F5): the coordinator emits an unconditional line at publish.  The old
+# traffic-driven patterns (stale-epoch replies / GRD rebuild messages) only
+# appear if some backend happens to generate traffic during the outage --
+# with zero load a perfectly healthy reconfig printed nothing.
 my $reconfig_ok = 0;
 for (1 .. 60)
 {
 	my $log = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
-	if ($log =~ /stale epoch \d+ < current [1-9]/
-		|| $log =~ /being rebuilt after reconfiguration/)
+	if ($log =~ /fail-stop epoch bump \d+ -> [1-9]\d* published .* dead node\(s\) \{0\}/)
 	{
 		$reconfig_ok = 1;
 		last;
