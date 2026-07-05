@@ -421,12 +421,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  driving the boot LOCAL posture -- foreign-evidence catalog reads
 	 *	  fail-closed 53R97 -- which no natural SQL timing can reach
 	 *	  (t/337 L4 / R11 negative leg).
+	 *
+	 *	cluster-recovery-anchor-force-failclosed:
+	 *	  Fires in StartupXLOG's recovery-anchor load (spec-5.6a D3).  SKIP
+	 *	  makes the boot behave as if this node's anchor were unreadable, so
+	 *	  a label-less authority boot drives the FATAL 53RB3 fail-closed
+	 *	  branch on a node whose on-disk anchor is actually healthy
+	 *	  (t/289 L-r5, L408 positive coverage of the fail-closed arm).
 	 */
 	{ .name = "cluster-gcs-block-invalidate-drop-broadcast" },
 	{ .name = "cluster-gcs-block-invalidate-stall-ack" },
 	{ .name = "cluster-gcs-block-x-forward-master-side" },
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
 	{ .name = "cluster-catalog-services-ready-force-closed" },
+	{ .name = "cluster-recovery-anchor-force-failclosed" },
 	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *

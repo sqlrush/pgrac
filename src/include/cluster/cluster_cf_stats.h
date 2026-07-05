@@ -42,7 +42,10 @@ typedef enum ClusterCfCounter {
 	CLUSTER_CF_FAILCLOSED = 2,			  /* CF lock unprovable -> caller fails closed */
 	CLUSTER_CF_SINGLE_NODE_AUTHORITY = 3, /* bootstrap single-node authority window opened */
 	CLUSTER_CF_BAK_FALLBACK = 4,		  /* authority read fell back to a valid .bak */
-	CLUSTER_CF_COUNTER_COUNT = 5
+	/* spec-5.6a: per-node recovery anchor observability */
+	CLUSTER_CF_RECOVERY_ANCHOR_WRITE = 5,	   /* anchor durably (re)written */
+	CLUSTER_CF_RECOVERY_ANCHOR_BOOT_ADOPT = 6, /* boot adopted a valid anchor */
+	CLUSTER_CF_COUNTER_COUNT = 7
 } ClusterCfCounter;
 
 /* shmem region lifecycle (mirror cluster_advisory). */

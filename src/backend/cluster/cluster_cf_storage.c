@@ -44,6 +44,7 @@
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_recovery_anchor.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -690,6 +691,31 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 		}
 		if (local_cf.system_identifier != shared_cf.system_identifier)
 			return false; /* foreign authority -> fail-closed */
+
+		/*
+		 * spec-5.6a D4: seed this node's per-node recovery anchor from the
+		 * pre-migration local control file -- at this moment it still holds
+		 * this node's own checkpoint/state (its authority=off semantics).
+		 * Skipped when a backup_label is present: a label-provisioned tree
+		 * carries the SOURCE node's checkpoint fields in its control file,
+		 * so a joiner's anchor is created by its first own checkpoint
+		 * instead (a crash inside that label window fails closed, 53RB3,
+		 * and is re-provisioned).  Written durably BEFORE the symlink flip
+		 * below, so a crash between the two re-runs this arm (R7 ordering).
+		 */
+		{
+			char label_path[MAXPGPATH];
+			struct stat label_st;
+
+			snprintf(label_path, sizeof(label_path), "%s/backup_label", local_pgdata);
+			if (stat(label_path, &label_st) != 0) {
+				ClusterRecoveryAnchor ra;
+
+				cluster_recovery_anchor_build_from_controlfile(&local_cf, &ra);
+				cluster_recovery_anchor_write(&ra);
+			}
+		}
+
 		if (!cluster_cf_contract_persist(local_pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED,
 										 shared_cf.system_identifier))
 			return false; /* could not record the identity anchor -> fail-closed */
@@ -837,4 +863,38 @@ cluster_cf_startup_prepare(const char *pgdata)
 						errhint("This node is not bound to the shared authority at \"%s\"; it "
 								"must only attach to the cluster it was provisioned with.",
 								shared)));
+
+	/*
+	 * spec-5.6a D4 startup vet: a label-less boot under the authority needs
+	 * this node's per-node recovery anchor to locate its own checkpoint in
+	 * its own WAL thread -- the shared authority's checkpoint fields belong
+	 * to the last permitted writer.  Fail here, before any further boot side
+	 * effects, rather than let the startup process get anywhere near the
+	 * foreign fields (StartupXLOG re-checks and stays the authoritative
+	 * consumer; this is the early, actionable error).  A backup_label boot
+	 * is exempt: the label is the one-shot provisioning authority and the
+	 * first own checkpoint creates the anchor.
+	 */
+	{
+		char label_path[MAXPGPATH];
+		struct stat label_st;
+
+		snprintf(label_path, sizeof(label_path), "%s/backup_label", pgdata);
+		if (stat(label_path, &label_st) != 0) {
+			ClusterRecoveryAnchor ra;
+
+			if (!cluster_recovery_anchor_read(cf.system_identifier, &ra, NULL))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+						 errmsg("per-node recovery anchor for node %d is missing or invalid "
+								"under the shared control-file authority",
+								cluster_node_id),
+						 errdetail("A label-less restart cannot locate this node's own "
+								   "checkpoint from the shared pg_control (its checkpoint "
+								   "fields belong to the last writer node)."),
+						 errhint("Re-provision this node from a base backup, or verify that "
+								 "cluster.shared_data_dir (\"%s\") is correctly mounted.",
+								 cluster_shared_data_dir)));
+		}
+	}
 }

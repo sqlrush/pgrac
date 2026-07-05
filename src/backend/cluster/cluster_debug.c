@@ -1752,6 +1752,11 @@ dump_cf(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY)));
 	emit_row(rsinfo, "cf", "cf_bak_fallback",
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK)));
+	/* spec-5.6a D5: per-node recovery anchor write / boot-adoption proof */
+	emit_row(rsinfo, "cf", "recovery_anchor_write_count",
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_RECOVERY_ANCHOR_WRITE)));
+	emit_row(rsinfo, "cf", "recovery_anchor_boot_adopt_count",
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_RECOVERY_ANCHOR_BOOT_ADOPT)));
 }
 
 static void

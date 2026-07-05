@@ -51,6 +51,7 @@
 #include <unistd.h>
 
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_anchor.h"
 #include "port/pg_crc32c.h"
@@ -301,6 +302,7 @@ cluster_recovery_anchor_write(const ClusterRecoveryAnchor *ra)
 
 	roll_primary_to_bak(primary, bak, baktmp);
 	write_durable(tmp, primary, (const char *)&local);
+	cluster_cf_counter_inc(CLUSTER_CF_RECOVERY_ANCHOR_WRITE);
 }
 
 /*
@@ -396,6 +398,7 @@ cluster_recovery_anchor_load(uint64 expected_sysid, bool *used_bak)
 		return false;
 	}
 	boot_anchor_active = true;
+	cluster_cf_counter_inc(CLUSTER_CF_RECOVERY_ANCHOR_BOOT_ADOPT);
 	return true;
 }
 

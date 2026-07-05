@@ -67,12 +67,12 @@
  * requires a CLUSTER_RECOVERY_ANCHOR_VERSION bump.
  */
 typedef struct ClusterRecoveryAnchor {
-	uint32 magic;								   /* CLUSTER_RECOVERY_ANCHOR_MAGIC */
-	uint16 version;								   /* CLUSTER_RECOVERY_ANCHOR_VERSION */
-	uint16 _pad_6;								   /* explicit pad, always 0 */
-	int32 node_id;								   /* owner; must equal cluster_node_id at read */
-	uint32 state;								   /* DBState of THIS node's WAL thread */
-	uint64 system_identifier;					   /* must match the shared authority's sysid */
+	uint32 magic;			   /* CLUSTER_RECOVERY_ANCHOR_MAGIC */
+	uint16 version;			   /* CLUSTER_RECOVERY_ANCHOR_VERSION */
+	uint16 _pad_6;			   /* explicit pad, always 0 */
+	int32 node_id;			   /* owner; must equal cluster_node_id at read */
+	uint32 state;			   /* DBState of THIS node's WAL thread */
+	uint64 system_identifier;  /* must match the shared authority's sysid */
 	XLogRecPtr checkPoint;	   /* THIS node's last checkpoint record LSN */
 	pg_time_t write_time;	   /* observational only */
 	CheckPoint checkPointCopy; /* THIS node's full CheckPoint record copy */
@@ -81,7 +81,7 @@ typedef struct ClusterRecoveryAnchor {
 								* counter, not the last authority writer's
 								* (L437 sweep: xlog.c unloggedLSN restore) */
 	char _reserved[508 - 40 - 8 - sizeof(CheckPoint)]; /* zero pad to the CRC */
-	pg_crc32c crc;			   /* CRC32C over [0, offsetof(crc)) */
+	pg_crc32c crc;									   /* CRC32C over [0, offsetof(crc)) */
 } ClusterRecoveryAnchor;
 
 StaticAssertDecl(offsetof(ClusterRecoveryAnchor, node_id) == 8, "recovery anchor node_id offset");

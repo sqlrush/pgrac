@@ -5333,8 +5333,19 @@ StartupXLOG(void)
 		struct stat st;
 		bool		have_label = (stat(BACKUP_LABEL_FILE, &st) == 0);
 		bool		anchor_from_bak = false;
+		bool		force_failclosed = false;
 
-		if (cluster_recovery_anchor_load(ControlFile->system_identifier,
+		/*
+		 * Test-only: SKIP makes this boot behave as if the anchor were
+		 * unreadable, driving the 53RB3 fail-closed branch on a node whose
+		 * on-disk anchor is healthy (t/289 L-r5, L408).
+		 */
+		CLUSTER_INJECTION_POINT("cluster-recovery-anchor-force-failclosed");
+		if (cluster_injection_should_skip("cluster-recovery-anchor-force-failclosed"))
+			force_failclosed = true;
+
+		if (!force_failclosed &&
+			cluster_recovery_anchor_load(ControlFile->system_identifier,
 										 &anchor_from_bak))
 		{
 			const ClusterRecoveryAnchor *ra = cluster_recovery_anchor_get();

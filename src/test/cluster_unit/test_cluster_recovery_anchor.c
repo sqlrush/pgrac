@@ -51,6 +51,7 @@
 #include <unistd.h>
 
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_recovery_anchor.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -172,6 +173,13 @@ durable_rename(const char *oldfile, const char *newfile, int elevel pg_attribute
 		return -1;
 	return 0;
 }
+
+/* spec-5.6a D5: the module bumps CF observability counters; cluster_cf_stats.o
+ * is not linked here, so a no-op stub satisfies the link (the counter
+ * mechanism itself is covered by test_cluster_cf_stats). */
+void
+cluster_cf_counter_inc(ClusterCfCounter which pg_attribute_unused())
+{}
 
 /* ----------
  * Test fixture: a temp shared root with a global/ subdir.
