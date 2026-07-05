@@ -50,6 +50,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
 #include "storage/lwlock.h"
 #include "utils/hsearch.h"
@@ -546,6 +547,16 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/* spec-6.14 D9 amend: acquire_buffer's no-backend-identity guard reads
+ * MyBackendId; a valid id (1) keeps the historical acquire paths open. */
+BackendId	MyBackendId = 1;
 
 #define UT_EXPECT_EREPORT(stmt)                                                                    \
 	do {                                                                                           \

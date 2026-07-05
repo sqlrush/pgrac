@@ -47,6 +47,7 @@
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h" /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
+#include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
 #include "storage/lwlock.h"
@@ -2065,6 +2066,31 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 						errmsg("cluster_pcm_lock_acquire_buffer: invalid mode %d "
 							   "(must be S=1 or X=2)",
 							   (int)mode)));
+
+	/*
+	 * PGRAC: spec-6.14 D9 amend (INV-D9-R) — designed fail-closed boundary
+	 * for processes without a backend identity (startup / aux:
+	 * MyBackendId = InvalidBackendId).  The live GCS data plane keys its
+	 * per-backend outstanding-slot table by MyBackendId and belongs to
+	 * post-PM_RUN backends only; recovery-time access to cluster-coherent
+	 * pages is lawful solely inside a recovery-ownership window (cold
+	 * merged-replay window: PCM globally inactive; or the survivor's online
+	 * thread-recovery engine, which bypasses the buffer manager).  Reaching
+	 * this point from redo means the WAL tail holds records for PCM-tracked
+	 * shared pages that no recovery-ownership regime covers -- refuse loudly
+	 * instead of tripping the slot-table range check downstream
+	 * (historically the accidental "MyBackendId=-1" internal FATAL,
+	 * t/243 L4 scope note signature (a)).
+	 */
+	if (MyBackendId == InvalidBackendId)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("crash recovery of a cluster-coherent page requires a recovery-ownership window"),
+				 errdetail("A process without a backend identity attempted a live GCS block request "
+						   "(page coherence negotiation) during recovery."),
+				 errhint("Cold multi-node crash recovery must run under cluster.merged_recovery=on; "
+						 "a node restarting while peers are alive must wait for the survivor's "
+						 "online thread recovery to cover its WAL tail before restarting.")));
 
 	tag = buf->tag;
 

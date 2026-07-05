@@ -46,6 +46,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "storage/backendid.h" /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
 #include "storage/lwlock.h"
@@ -462,6 +463,16 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/* spec-6.14 D9 amend: acquire_buffer's no-backend-identity guard reads
+ * MyBackendId; a valid id (1) keeps the historical acquire paths open. */
+BackendId	MyBackendId = 1;
 
 /* ============================================================
  * Minimal mock BufferDesc with just the fields the hook touches.
