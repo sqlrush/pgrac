@@ -258,20 +258,35 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 		 * remote-unknown would make ordinary local UPDATE/DELETE/SELECT fail
 		 * closed.  Remote safety still depends on an explicit remote-origin
 		 * ref, which is checked below.
+		 *
+		 * PGRAC: spec-6.15 D7 — that single-writer-era shortcut is only sound
+		 * for the xids the value space cannot prove foreign.  On a
+		 * bidirectionally-written page OUR xact recycles a slot whose previous
+		 * occupant was the PEER's xid: the slot's current owner proves nothing
+		 * about raw_xid's origin, and routing a provably-foreign xid to
+		 * PG-native CLOG is the same trust-the-ref false-resolve D4 closed in
+		 * the remote direction (false-abort of a committed foreign deleter /
+		 * false-invisible of a committed foreign inserter).  Derive from the
+		 * value instead and fall through to the remote machinery; below the
+		 * floor / striping off keeps the pre-striping LOCAL routing.
 		 */
-		out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
-		return;
+		if (ref->local_xid == raw_xid || !cluster_xid_provably_foreign(raw_xid)) {
+			out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
+			return;
+		}
+		/* Stamp the DERIVED peer (INV-TP1/TP2): the ref names ourselves. */
+		cluster_touched_peers_stamp(cluster_xid_origin_slot(raw_xid), CLUSTER_TOUCH_VISIBILITY);
+	} else {
+		/*
+		 * spec-5.14 D2 class 4: past the self-check this is a genuine
+		 * remote-origin ITL ref — the visibility verdict (whether via
+		 * resolve_from_remote_ref or the STALE wrap-checked remote authority
+		 * below) now depends on that peer's volatile TT / undo state.  Stamp
+		 * conservatively so a fail-stop of the origin aborts this transaction
+		 * (INV-TP1/TP2).  Read-only; resolve logic unchanged.
+		 */
+		cluster_touched_peers_stamp((int32)ref->origin_node_id, CLUSTER_TOUCH_VISIBILITY);
 	}
-
-	/*
-	 * spec-5.14 D2 class 4: past the self-check this is a genuine remote-origin
-	 * ITL ref — the visibility verdict (whether via resolve_from_remote_ref or
-	 * the STALE wrap-checked remote authority below) now depends on that peer's
-	 * volatile TT / undo state.  Stamp conservatively so a fail-stop of the
-	 * origin aborts this transaction (INV-TP1/TP2).  Read-only; resolve logic
-	 * unchanged.
-	 */
-	cluster_touched_peers_stamp((int32)ref->origin_node_id, CLUSTER_TOUCH_VISIBILITY);
 
 	if (ref->local_xid != raw_xid) {
 		/*
@@ -296,7 +311,12 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 		 * pre-FATAL xids as COMMITTED while post-FATAL committed changes never
 		 * materialized -> torn-history false-visible.  No marker -> fail closed.
 		 */
-		if (vis_origin_materialized((int)ref->origin_node_id)) {
+		/* PGRAC: spec-6.15 D7 — the own-owner recycled fall-through reaches
+		 * here with ref->origin == self; the materialized (crash-recovery)
+		 * authority is a PEER-origin face only, so gate it out — the armed
+		 * active-runtime branch below derives the true origin itself. */
+		if ((int32)ref->origin_node_id != cluster_node_id
+			&& vis_origin_materialized((int)ref->origin_node_id)) {
 			SCN scn;
 
 			/*

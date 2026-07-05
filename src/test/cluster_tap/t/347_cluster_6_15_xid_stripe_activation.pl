@@ -13,6 +13,20 @@
 #           published (writes succeed on both).
 #      L2   striped allocation is live: each node's next xid falls in
 #           its own congruence class (node0 = 0 mod 16, node1 = 1).
+#      L2b  (D7) bidirectional writes on ONE shared heap block with
+#           mutual ITL slot recycling — the original 6.12i P0
+#           false-resolve scenario, held to the fail-closed contract:
+#           individual cross-node updates may fail closed (per-thread
+#           covers-gate limit, forward to 6.12i amend ㉖) and a LEDGER
+#           of acknowledged commits defines the truth; both nodes'
+#           cross reads of the peer's recycled refs fail closed 53R97
+#           while cluster.crossnode_runtime_visibility is off (the
+#           mutual recycle is real, not a vacuous pass); once armed, a
+#           read that SUCCEEDS must return exactly the ledger state —
+#           same count twice (no duplicate row versions in one
+#           snapshot: the D7 foreign-xmax discipline guard), exact
+#           sum — and the D4 origin derivation never refuses
+#           (underivable == 0; derived == self routes LOCAL).
 #      L3   activation is idempotent across a full pair restart: the
 #           record is adopted, never re-seeded (the seed-staging log
 #           line appears exactly once across both boots), and writes
@@ -109,6 +123,28 @@ sub poll_write_ok
 		usleep(500_000);
 	}
 	diag("poll_write_ok timeout ($label)");
+	return 0;
+}
+
+# Read one pg_cluster_state counter (0 when absent).
+sub state_val
+{
+	my ($node, $cat, $key) = @_;
+	my $v = $node->safe_psql('postgres',
+		qq{SELECT value FROM pg_cluster_state WHERE category='$cat' AND key='$key'});
+	return defined($v) && $v ne '' ? $v + 0 : 0;
+}
+
+# Retry a write statement through transient cross-node GES/CF jitter.
+sub write_retry
+{
+	my ($node, $sql) = @_;
+	for my $i (1 .. 10)
+	{
+		my $ok = eval { $node->safe_psql('postgres', $sql); 1 };
+		return 1 if $ok;
+		usleep(500_000);
+	}
 	return 0;
 }
 
@@ -238,6 +274,255 @@ my $node1 = $pair->node1;
 	my $x1 = $node1->safe_psql('postgres', 'SELECT txid_current()');
 	is($x0 % 16, 0, "L2-i node0 xid $x0 is congruent to slot 0 (mod 16)");
 	is($x1 % 16, 1, "L2-ii node1 xid $x1 is congruent to slot 1 (mod 16)");
+}
+
+# ----------
+# L2b — D7: bidirectional writes on ONE shared block, mutual ITL
+# recycling (the original 6.12i P0 false-resolve scenario), proven
+# positive end to end.
+#
+# Both nodes create the same table: on a fresh pair the OID /
+# relfilenode allocation coincides, so both catalog entries point at
+# ONE physical file on the shared store (the t/346 recipe; catalogs
+# stay per-node until spec-6.14).  node0 seeds 12 rows on one block,
+# then the nodes alternate committed single-row UPDATE xacts (20 xacts
+# > 8 ITL slots), so EARLY updaters' slots from BOTH nodes recycle
+# while tuples still reference them.
+#
+# Sequencing: cluster.crossnode_runtime_visibility is armed BEFORE the
+# alternating phase — once the block's ITL starts recycling, a
+# cross-node updater's own scan must already resolve the peer's
+# recycled refs (the write-side resolution ride-along).  It is then
+# dropped to prove BOTH directions fail closed 53R97 (the mutual
+# recycle is real — without this the positive reads below would pass
+# vacuously), and re-armed for the positive proof: exact rows and
+# values on both nodes, wire fetches in both directions, and the D4
+# origin derivation never refusing (underivable == 0; refs whose xid
+# derives to the reader's own slot route LOCAL).
+# ----------
+{
+	# The coincidence is not free here: L1's write-gate CREATE polling
+	# burned an uneven number of OIDs per node.  Align the two OID
+	# counters first — measure the relfilenode delta and burn single
+	# OIDs (lo_create/lo_unlink) on the lagging node until an identical
+	# CREATE lands on the same relfilenode on both.
+	my ($p0, $p1) = ('', '');
+	for my $attempt (1 .. 8)
+	{
+		$node0->safe_psql('postgres', 'CREATE TABLE t347_bi (id int, v int)');
+		$node1->safe_psql('postgres', 'CREATE TABLE t347_bi (id int, v int)');
+		$p0 = $node0->safe_psql('postgres',
+			q{SELECT pg_relation_filepath('t347_bi')});
+		$p1 = $node1->safe_psql('postgres',
+			q{SELECT pg_relation_filepath('t347_bi')});
+		last if $p0 eq $p1;
+		my ($n0) = $p0 =~ /(\d+)$/;
+		my ($n1) = $p1 =~ /(\d+)$/;
+		my ($lag, $burn) =
+		  $n0 < $n1 ? ($node0, $n1 - $n0) : ($node1, $n0 - $n1);
+		$lag->safe_psql('postgres',
+			"SELECT lo_unlink(lo_create(0)) FROM generate_series(1, $burn)");
+		$node0->safe_psql('postgres', 'DROP TABLE t347_bi');
+		$node1->safe_psql('postgres', 'DROP TABLE t347_bi');
+	}
+	is($p0, $p1, 'L2b-0 t347_bi relfilepath coincidence holds (one shared file)');
+
+	ok(write_retry($node0,
+			'INSERT INTO t347_bi SELECT g, g * 10 FROM generate_series(1, 12) g'),
+		'L2b-i node0 seed xact inserted 12 rows on one block');
+
+	for my $n ($node0, $node1)
+	{
+		$n->append_conf('postgresql.conf',
+			"cluster.crossnode_runtime_visibility = on\n");
+		$n->reload;
+	}
+	usleep(1_000_000);
+
+	# Counter baselines BEFORE the armed write phase: the alternating
+	# updates themselves must resolve the peer's recycled refs (their own
+	# scans hit them once the ITL recycles), so the exercised/wire asserts
+	# below hold even when the later read probes stay fail-closed pre-㉖.
+	my $rc1_0   = state_val($node1, 'cr', 'rtvis_resolve_committed_count');
+	my $rc0_0   = state_val($node0, 'cr', 'rtvis_resolve_committed_count');
+	my $wire1_0 = state_val($node1, 'cr', 'rtvis_undo_fetch_wire_count')
+	  + state_val($node1, 'cr', 'rtvis_verdict_wire_count');
+	my $wire0_0 = state_val($node0, 'cr', 'rtvis_undo_fetch_wire_count')
+	  + state_val($node0, 'cr', 'rtvis_verdict_wire_count');
+
+	# Alternate 2 updater xacts per row, flipping which node goes last.
+	# Individual cross-node updates MAY fail closed (the covers gate
+	# compares per-thread WAL positions numerically — a pre-existing
+	# 6.12i limit, positive capability forwarded to amend ㉖); a LEDGER
+	# of acknowledged commits defines the exact expected final state, so
+	# any read that later SUCCEEDS with different numbers is a silent
+	# wrong answer and fails the leg.
+	my $sum_expected = 780; # seed: sum(10*id, id=1..12)
+	my %final_class = (1 => 0, 2 => 0); # id -> class of last acked updater
+	my ($n0_acks, $n1_acks) = (0, 0);
+	for my $id (3 .. 12)
+	{
+		$final_class{$id} = 0; # seed xact is node0-class
+		my @legs =
+		  ($id % 2)
+		  ? ([ $node0, 2, 0 ], [ $node1, 1, 1 ])
+		  : ([ $node1, 1, 1 ], [ $node0, 2, 0 ]);
+		for my $leg (@legs)
+		{
+			my ($node, $delta, $class) = @$leg;
+			next
+			  unless write_retry($node,
+				"UPDATE t347_bi SET v = v + $delta WHERE id = $id");
+			$sum_expected += $delta;
+			$final_class{$id} = $class;
+			$class ? $n1_acks++ : $n0_acks++;
+		}
+	}
+	cmp_ok($n0_acks, '>=', 2,
+		"L2b-ii node0 committed updater xacts on the shared block ($n0_acks/10)");
+	cmp_ok($n1_acks, '>=', 2,
+		"L2b-iii node1 committed updater xacts on the shared block ($n1_acks/10)");
+	ok(write_retry($node0, 'CHECKPOINT'), 'L2b-iii-b checkpoint');
+
+	# Drop the GUC: each direction must now fail closed on the OTHER
+	# node's recycled refs (own-class recycled refs resolve LOCAL and
+	# never need it — the reason these two probes prove MUTUAL recycle).
+	for my $n ($node0, $node1)
+	{
+		$n->append_conf('postgresql.conf',
+			"cluster.crossnode_runtime_visibility = off\n");
+		$n->reload;
+	}
+	usleep(1_000_000);
+	{
+		my ($rc, $out, $err) =
+		  $node1->psql('postgres', 'SELECT count(*) FROM t347_bi');
+		like($err, qr/cluster TT (status unknown|slot recycled)/,
+			'L2b-iv node1 read of node0-recycled refs fails closed 53R97 when off');
+		($rc, $out, $err) =
+		  $node0->psql('postgres', 'SELECT count(*) FROM t347_bi');
+		like($err, qr/cluster TT (status unknown|slot recycled)/,
+			'L2b-v node0 read of node1-recycled refs fails closed 53R97 when off');
+	}
+
+	# Re-arm and prove the positive: any read that SUCCEEDS must return
+	# exactly the ledger state — same count twice (no duplicate versions
+	# of a row in one snapshot: the D7 false-visible guard), exact sum.
+	# A read may fail closed 53R97 until each origin's flushed WAL
+	# position numerically passes the shared page's LSN (covers-gate
+	# per-thread limit, forwarded to 6.12i amend ㉖) — nudge both nodes'
+	# WAL forward with node-local writes and retry.
+	for my $n ($node0, $node1)
+	{
+		$n->append_conf('postgresql.conf',
+			"cluster.crossnode_runtime_visibility = on\n");
+		$n->reload;
+	}
+	usleep(1_000_000);
+
+	# The anti-silent-wrong audit: probe both nodes repeatedly (nudging
+	# each origin's WAL + checkpoint forward: the covers gate and the
+	# durable-TT stamp are both per-thread progress conditions).  EVERY
+	# outcome must be either the exact ledger state or a documented
+	# fail-closed refusal — never different data.  Exact convergence is
+	# NOT required pre-㉖: an organically-formed cross-node multixact
+	# xmax keeps the read fail-closed (the spec-3.6 XXX foreign-multi
+	# gate), which is the honest contract this leg pins.
+	# WAL nudge = a plain xid burn: it advances the origin's flushed WAL
+	# position with pure xact records — data-block writes here would grow
+	# relations mid-leg and change the L8 replay window (a pre-existing
+	# shared-pg_control restart seam, spec-5.6a, is parked there).
+	my $expected  = "12|12|$sum_expected";
+	my $failre    = qr/cluster TT (status unknown|slot recycled)|cross-node write conflict|multixact/;
+	my $converged = 0;
+	for my $probe ([ $node1, 'L2b-vi node1' ], [ $node0, 'L2b-vii node0' ])
+	{
+		my ($node, $tag) = @$probe;
+		my ($exact, $safe_refusals, $bad) = (0, 0, '');
+		for my $try (1 .. 20)
+		{
+			if ($try % 5 == 1)
+			{
+				write_retry($node0, 'CHECKPOINT');
+				write_retry($node1, 'CHECKPOINT');
+			}
+			my ($rc, $out, $err) = $node->psql('postgres',
+				'SELECT count(*), count(DISTINCT id), sum(v) FROM t347_bi');
+			if ($rc == 0)
+			{
+				if ($out eq $expected) { $exact++; last; }
+				$bad = "wrong data: got '$out' want '$expected'";
+				last;
+			}
+			elsif ($err =~ $failre) { $safe_refusals++; }
+			else                    { $bad = "unexpected error: $err"; last; }
+			burn_xids($node0, 50);
+			burn_xids($node1, 50);
+			usleep(500_000);
+		}
+		is($bad, '',
+			"$tag every read outcome is exact-ledger or fail-closed "
+			  . "(exact=$exact refusals=$safe_refusals)");
+		$converged++ if $exact;
+	}
+
+	# When a read converged, the on-page state must match the ledger in
+	# full (one block; live xmin classes = classes of the acked final
+	# updaters).  When it did not (pre-㉖ multi-xmax refusal), the audit
+	# above already proved the fail-closed contract held throughout.
+	if ($converged)
+	{
+		is($node0->safe_psql('postgres',
+				q{SELECT count(DISTINCT (ctid::text::point)[0]::int) FROM t347_bi}),
+			'1', 'L2b-viii all live rows stayed on ONE heap block');
+		my %classes = map { $_ => 1 } values %final_class;
+		my $want = join(',', sort keys %classes);
+		is($node0->safe_psql('postgres',
+				q{SELECT string_agg(DISTINCT (xmin::text::bigint % 16)::text, ','
+				  ORDER BY (xmin::text::bigint % 16)::text) FROM t347_bi}),
+			$want,
+			"L2b-ix live xmin congruence classes match the ledger ($want)");
+	}
+	else
+	{
+		diag('L2b interread did not converge in this run (pre-㉖ '
+			  . 'cross-node multixact xmax keeps it fail-closed) — '
+			  . 'the audit asserts above still pin no-silent-wrong');
+		pass('L2b-viii (skipped page-shape check: no converged read)');
+		pass('L2b-ix (skipped ledger-class check: no converged read)');
+	}
+
+	# Which node lands positive proofs varies run to run pre-㉖ (a node
+	# whose acked legs all predate the recycle may see only refusals
+	# afterwards) — the cluster-wide count must move; per-node coverage
+	# is pinned by the wire-attempt asserts below.
+	cmp_ok(state_val($node1, 'cr', 'rtvis_resolve_committed_count')
+			 + state_val($node0, 'cr', 'rtvis_resolve_committed_count'),
+		'>', $rc1_0 + $rc0_0,
+		'L2b-x cross-node resolution produced positive proofs (cluster-wide)');
+	# fetch or verdict: which wire leg serves depends on whether the ref's
+	# segment id (the CURRENT slot owner's namespace) happens to exist on
+	# the derived origin — both are cross-node proof, either counts.
+	cmp_ok(state_val($node1, 'cr', 'rtvis_undo_fetch_wire_count')
+			 + state_val($node1, 'cr', 'rtvis_verdict_wire_count'), '>', $wire1_0,
+		'L2b-xii node1 rode the wire for node0 proofs (fetch or verdict)');
+	cmp_ok(state_val($node0, 'cr', 'rtvis_undo_fetch_wire_count')
+			 + state_val($node0, 'cr', 'rtvis_verdict_wire_count'), '>', $wire0_0,
+		'L2b-xiii node0 rode the wire for node1 proofs (fetch or verdict)');
+
+	is(state_val($node0, 'cr', 'rtvis_underivable_failclosed_count'), 0,
+		'L2b-xiv node0: no underivable refusals ever (spec-6.15 D4)');
+	is(state_val($node1, 'cr', 'rtvis_underivable_failclosed_count'), 0,
+		'L2b-xv node1: no underivable refusals ever (spec-6.15 D4)');
+
+	# Restore the baseline environment for the later legs.
+	for my $n ($node0, $node1)
+	{
+		$n->append_conf('postgresql.conf',
+			"cluster.crossnode_runtime_visibility = off\n");
+		$n->reload;
+	}
+	usleep(1_000_000);
 }
 
 # ----------
