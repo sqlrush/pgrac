@@ -758,6 +758,89 @@ Verbosity of fence-related entries in the postmaster log.
 * `debug` — adds DEBUG2 entries for each backend that received the
   freeze signal.  Verbose, dev / test only.
 
+### `cluster.xid_striping`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `off` |
+| Context | postmaster |
+
+Stripes transaction ID (xid) allocation into per-node congruence
+classes.  When enabled, each declared node only issues xids congruent
+to its node slot modulo 16, which makes every xid value self-describing
+about the node that issued it.
+
+Requirements and behaviour:
+
+* `cluster.node_id` must be between 0 and 15; startup is refused
+  otherwise.  Striped clusters are therefore limited to **16 nodes**.
+* `cluster.online_join` must be `on`; startup is refused otherwise.
+* All nodes must run with the same `cluster.xid_striping` setting.
+  The cluster records its striping state durably on the voting disk;
+  a node whose configuration disagrees with that recorded state (or
+  whose node slot has been retired by a permanent removal) is refused
+  at join time with SQLSTATE `53RB1`.
+* Node slots are permanently bound to their first owner.  A node that
+  rejoins after a restart keeps its slot; a slot released by permanent
+  node removal is retired and is not reused.
+
+```ini
+# postgresql.conf (all nodes)
+cluster.xid_striping = on
+cluster.online_join = on
+```
+
+### `cluster.xid_herding_slack`
+
+| | |
+|---|---|
+| Type | integer |
+| Default | `4194304` |
+| Min / Max | `65536` / `268435456` |
+| Context | sighup |
+
+Allowed xid-value gap between the fastest and slowest nodes of a
+striped cluster before a lagging node jumps its allocator forward to
+stay inside the shared window.  Idle or slow nodes catch up
+automatically (roughly every dozen seconds under a busy peer at the
+default setting); no action is required.
+
+The hard fail-closed limit is **64x** this value: a node that would
+allocate past the cluster window — typically because it cannot reach
+its peers while they keep allocating — refuses to issue new xids with
+SQLSTATE `53RB2`.  Read-only queries are unaffected.  Allocation
+resumes automatically once coordination with the peers recovers.
+
+### Operational notes for striped xid allocation
+
+With `cluster.xid_striping = on`, every allocation consumes 16 values
+of the shared 32-bit xid space (one per node slot).  Plan for the
+following:
+
+* **Database age advances up to 16x faster per transaction.**
+  `age(relfrozenxid)` / `age(datfrozenxid)` are measured in xid
+  values, so anti-wraparound autovacuum triggers correspondingly more
+  often at the default `autovacuum_freeze_max_age = 200000000`.
+* **Raise `autovacuum_freeze_max_age`** (for example to `800000000`)
+  to keep the freeze cadence reasonable.  This still leaves well over
+  a billion xid values of headroom before the wraparound stop limit.
+* **Strengthen autovacuum** — more `autovacuum_max_workers`, a shorter
+  `autovacuum_naptime` — so freeze runs keep up under sustained write
+  load.
+* **Idle nodes age too.**  Counter herding advances every node's xid
+  counter at the pace of the busiest node, so databases on idle nodes
+  hit the freeze threshold at the same rate.  Those vacuums are cheap
+  (all-frozen pages are skipped) but must be allowed to run.
+* **Monitor age.**  Alert on `age(datfrozenxid)` well before the
+  freeze threshold; the striped-allocation counters are exposed in the
+  `pg_cluster_state` view under the `xid_stripe` category.
+
+```sql
+SELECT key, value FROM pg_cluster_state
+ WHERE category = 'xid_stripe';
+```
+
 ## Reconfig coordinator observability
 
 ### `pg_cluster_reconfig_state` view
