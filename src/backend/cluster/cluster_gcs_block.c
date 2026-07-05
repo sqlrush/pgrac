@@ -3495,8 +3495,21 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				 * image (returns false; pcm_state stays N).  Rule 8.A: a GCS
 				 * ownership transfer must satisfy the holder's local commit
 				 * dependency, not just the bufmgr API contract.
+				 *
+				 * PGRAC: spec-6.12g D-g2 — with block self-containment this
+				 * deferral is lifted HERE TOO (twin site of the holder-forward
+				 * handler's gate below): the block ships WITH its uncommitted
+				 * ITL and our copy is dropped; our later commit skips the stamp
+				 * for the drifted block (D-g1 resident-for-stamp) and readers
+				 * resolve the migrated ACTIVE slot through the TT authority
+				 * (AD-006).  A same-ROW writer still serializes through the
+				 * cross-node TX enqueue.  This site was missed by the original
+				 * D-g2 change; a committed-but-unstamped (Fast Commit) ITL
+				 * keeps the ACTIVE bit until cleanout, so without the gate a
+				 * peer writer waits for a "terminal" that already happened.
 				 */
-				if (cluster_itl_page_has_active_slot((Page)block_payload)) {
+				if (cluster_itl_page_has_active_slot((Page)block_payload)
+					&& !cluster_block_self_contained) {
 					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
@@ -3516,6 +3529,26 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					 * satisfies WAL-before-share.  Count a clean transfer. */
 					if (GcsBlockRequestPayloadIsCleanEligible(req) && ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
+
+					/*
+					 * PGRAC: spec-6.12g D-g2 (twin site) — count a self-ship
+					 * transfer that carries an uncommitted ITL slot, and
+					 * materialize an SGE-backed image into block_buf BEFORE the
+					 * drop (the drop invalidates the buffer the SGE may point
+					 * at; same recipe as the holder-forward destructive branch).
+					 */
+					if (cluster_block_self_contained
+						&& cluster_itl_page_has_active_slot((Page)block_payload))
+						cluster_lever_g_note_active_itl_transfer();
+					if (block_payload_release_cb != NULL) {
+						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);
+						gcs_block_release_ship_image(block_payload_release_cb,
+													 block_payload_release_arg);
+						block_payload = block_buf;
+						block_payload_lkey = 0;
+						block_payload_release_cb = NULL;
+						block_payload_release_arg = NULL;
+					}
 
 					/*
 					 * The image is already captured (copy_block_for_gcs succeeded

@@ -213,6 +213,50 @@ is($node1->safe_psql('postgres', 'SHOW cluster.block_self_contained'), 'on',
 }
 
 # ============================================================
+# L3b: master==holder TWIN SITE (spec-6.12g D-g2 completion).  L3's flow
+# goes requester(master)->FORWARD->holder, exercising the holder-forward
+# gate; when the block's static PCM home is the HOLDER node instead, the
+# X request lands in the master==holder self-ship branch, whose active-ITL
+# deferral originally missed the self-contained gate (a committed-but-
+# unstamped Fast-Commit ITL then blocks a peer writer forever).  Six
+# single-block tables spread the tag hash over both homes (P(no node0-
+# mastered table) = 2^-6); the master==holder engagements are visible as
+# block_x_self_ship_count growth (that counter only increments in the
+# self-ship branch -- pre-fix those tables read-image-deferred instead
+# and the peer write failed 53R9H).
+# ============================================================
+{
+	my $ship0 = state_val($node0, 'gcs', 'block_x_self_ship_count')
+			  + state_val($node1, 'gcs', 'block_x_self_ship_count');
+	my $made = 0;
+	for my $i (1 .. 6)
+	{
+		my $t = "g_m$i";
+		$node0->safe_psql('postgres', "CREATE TABLE $t (id int, v int)");
+		$node1->safe_psql('postgres', "CREATE TABLE $t (id int, v int)");
+		my $q0 = $node0->safe_psql('postgres', qq{SELECT pg_relation_filepath('$t')});
+		my $q1 = $node1->safe_psql('postgres', qq{SELECT pg_relation_filepath('$t')});
+		next if $q0 ne $q1;    # coincidence drifted: skip this table
+		next unless write_retry($node0, "INSERT INTO $t VALUES (1, 10), (2, 20)");
+		next unless write_retry($node0, 'CHECKPOINT');
+		$made++;
+
+		my $a = $node0->background_psql('postgres', on_error_stop => 0);
+		$a->query_safe('BEGIN');
+		$a->query_safe("SELECT v FROM $t WHERE id = 2 FOR UPDATE");
+		my $ok = write_retry($node1, "UPDATE $t SET v = 11 WHERE id = 1");
+		ok($ok, "L3b $t: peer DIFFERENT-row write succeeds under active-ITL hold");
+		$a->query_safe('ROLLBACK');
+		$a->quit;
+	}
+	cmp_ok($made, '>=', 4, "L3b enough coincident probe tables ($made/6)");
+	my $ship1 = state_val($node0, 'gcs', 'block_x_self_ship_count')
+			  + state_val($node1, 'gcs', 'block_x_self_ship_count');
+	cmp_ok($ship1, '>', $ship0,
+		'L3b master==holder self-ship engaged under active ITL (twin-site gate)');
+}
+
+# ============================================================
 # L4: counter surface on both nodes.
 # ============================================================
 for my $n ($node0, $node1)
