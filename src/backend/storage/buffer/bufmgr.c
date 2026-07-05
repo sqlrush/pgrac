@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#include "access/xlog.h"		/* PGRAC (spec-6.14 D8): GetXLogInsertRecPtr */
 #ifdef USE_PGRAC_CLUSTER
 #include "access/transam.h"		/* FirstNormalObjectId */
 #endif
@@ -53,6 +54,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
@@ -129,6 +131,45 @@ static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 {
 	return cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&buf->tag));
+}
+
+/*
+ * spec-6.14 D8 (A1 blocker): PCM write gate for the two content-lock
+ * acquisitions that bypass LockBuffer() -- ReadBuffer_common's
+ * RBM_ZERO_AND_LOCK branch and ExtendBufferedRelShared's EB_LOCK_FIRST
+ * branch (both LWLockAcquire the content lock directly because the buffer
+ * is not BM_VALID yet, which LockBuffer asserts).
+ *
+ * Without this, a freshly EXTENDED heap block is written under a content
+ * lock that never registered PCM X with the block's GCS master.  A remote
+ * reader whose master-side GRD then shows state N takes the lawful HC88
+ * "N => storage is current" tag-only + storage read -- and reads a stale
+ * zero page from the shared tree, caching it under durable S (the t/337 A1
+ * false-invisible: heap extends use EB_LOCK_FIRST, so the INSERT's page
+ * never crossed; btree extends go through LockBuffer and did).  Registering
+ * X here restores the HC88 premise for extended blocks.
+ *
+ * Mirrors the LockBuffer gate exactly (active + tracked + not covered),
+ * and runs BEFORE the content-lock LWLockAcquire: the acquire path may
+ * install a shipped image, which itself takes the content lock (deadlock
+ * if we held it), and LockBuffer establishes the same acquire-then-lock
+ * order.  The caller zero-fills/PageInits the page afterwards, so an
+ * installed image being overwritten is fine -- the point is the master-side
+ * X registration, not the bytes.
+ */
+static void
+cluster_bufmgr_pcm_gate_direct_lock(BufferDesc *buf)
+{
+	if (cluster_pcm_is_active() &&
+		cluster_bufmgr_should_pcm_track(buf) &&
+		!(cluster_gcs_block_local_cache &&
+		  cluster_pcm_mode_covers((PcmLockMode) buf->pcm_state, PCM_LOCK_MODE_X)))
+	{
+		if (cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X))
+			cluster_buffer_desc_apply_pcm_ownership_fields(&buf->buffer_type,
+														   &buf->pcm_state,
+														   PCM_LOCK_MODE_X);
+	}
 }
 #endif
 
@@ -1308,6 +1349,11 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if ((mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) &&
 		!isLocalBuf)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* spec-6.14 D8: register PCM X for this LockBuffer-bypassing
+		 * exclusive acquisition (see cluster_bufmgr_pcm_gate_direct_lock). */
+		cluster_bufmgr_pcm_gate_direct_lock(bufHdr);
+#endif
 		LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
 	}
 
@@ -2513,7 +2559,17 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		}
 
 		if (lock)
+		{
+#ifdef USE_PGRAC_CLUSTER
+			/* spec-6.14 D8: register PCM X for this LockBuffer-bypassing
+			 * exclusive acquisition -- heap extends land here, and without
+			 * the registration the new block's master stays at N and remote
+			 * readers lawfully storage-read a stale zero page (see
+			 * cluster_bufmgr_pcm_gate_direct_lock). */
+			cluster_bufmgr_pcm_gate_direct_lock(buf_hdr);
+#endif
 			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+		}
 
 		TerminateBufferIO(buf_hdr, false, BM_VALID);
 	}
@@ -3944,6 +4000,28 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * disastrous system-wide consequences.  To make sure that can't happen,
 	 * skip the flush if the buffer isn't permanent.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-6.14 D8): a shipped Cache Fusion image carries the
+	 * ORIGIN's page LSN.  Every ship path flushes the origin's WAL through
+	 * that LSN before the bytes go on the wire (HC82 master serve, the
+	 * xheld-read holder forward, and the X-transfer capture), so
+	 * WAL-before-data for the shipped content is already durable at the
+	 * origin.  This node cannot flush another node's WAL: XLogFlush would
+	 * compare the foreign LSN against the LOCAL flush horizon and, whenever
+	 * the local WAL is numerically behind, FATAL out ("xlog flush request
+	 * is not satisfied" -- a mostly-read node's shutdown checkpoint writing
+	 * a hint-dirtied shipped page, the t/337 crash).  An LSN beyond the
+	 * local insert position can only be foreign: local WAL stamps never
+	 * exceed the local insert point.  Skip the local flush for such a page;
+	 * the only local additions on top of a shipped image are hint-class
+	 * changes (ITL lazy cleanout, index kill bits), which emit no WAL.
+	 */
+	if (cluster_storage_mode_enabled() && !RecoveryInProgress()
+		&& recptr > GetXLogInsertRecPtr())
+		recptr = InvalidXLogRecPtr;
+#endif
 	if (buf_state & BM_PERMANENT)
 		XLogFlush(recptr);
 
