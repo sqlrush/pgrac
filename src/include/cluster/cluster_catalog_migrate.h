@@ -78,4 +78,12 @@ typedef struct ClusterCatalogAuthorityMarker
 extern void cluster_catalog_migrate_tree(const char *local_pgdata,
 										 uint64 system_identifier);
 
+/*
+ * cluster_catalog_vet_no_unlogged -- spec-6.14 Q12 enable-time vet: FATAL
+ *	(FEATURE_NOT_SUPPORTED) if any unlogged relation storage (an "_init" fork
+ *	file) exists in the local tree or the shared tree.  Runs every
+ *	shared-catalog boot, before any adopt/seed side effect.
+ */
+extern void cluster_catalog_vet_no_unlogged(const char *local_pgdata);
+
 #endif							/* CLUSTER_CATALOG_MIGRATE_H */

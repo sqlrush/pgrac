@@ -47,6 +47,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 Q12 shared-catalog SET UNLOGGED refusal */
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) placement TT(S) guard */
 #endif
 #include "catalog/pg_type.h"
@@ -16671,6 +16672,26 @@ ATPrepChangePersistence(Relation rel, bool toLogged)
 	HeapTuple	tuple;
 	SysScanDesc scan;
 	ScanKeyData skey[1];
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-6.14 Q12): SET UNLOGGED is rejected under
+	 * cluster.shared_catalog for the same reason CREATE UNLOGGED is (see
+	 * heap_create_with_catalog): per-node crash-reset semantics on single-
+	 * authority shared storage need a cluster-wide protocol (spec-6.14c).
+	 * SET LOGGED stays allowed -- no unlogged relation can exist under the
+	 * GUC (creation refused + enable-time storage vet), so it is a no-op
+	 * path kept for symmetry with vanilla error behaviour.
+	 */
+	if (cluster_shared_catalog && !toLogged)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ALTER TABLE ... SET UNLOGGED is not supported with "
+						"cluster.shared_catalog"),
+				 errhint("Cluster-wide unlogged crash-reset is not yet implemented "
+						 "(spec-6.14c).")));
+#endif
 
 	/*
 	 * Disallow changing status for a temp table.  Also verify whether we can

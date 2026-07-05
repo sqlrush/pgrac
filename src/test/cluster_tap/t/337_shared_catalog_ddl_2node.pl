@@ -27,6 +27,12 @@
 #          drops to the boot LOCAL posture -> reading foreign catalog rows
 #          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
 #          trigger case); disarm restores service.
+#      L5  (Q12 / §3.6 rejection face) CREATE UNLOGGED TABLE, ALTER TABLE
+#          SET UNLOGGED, CREATE DATABASE and CREATE TABLESPACE all refuse
+#          with feature_not_supported under shared_catalog=on.
+#      L6  (Q12 enable-time vet) a throwaway node with PRE-EXISTING unlogged
+#          storage refuses to boot with shared_catalog=on (init-fork vet
+#          FATAL, before any seed side effect).
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -298,7 +304,71 @@ for my $i (1 .. 10)
 }
 is($seen4, 'from-node0', 'L4: disarming the gate restores catalog service');
 
+# ----------
+# L5 (Q12 / §3.6): the rejection face.  Every operation that would need a
+# capability the shared catalog does not have yet must refuse loudly
+# (feature_not_supported), never half-work.
+# ----------
+my ($rcu1, undef, $erru1) = $node0->psql('postgres',
+	'CREATE UNLOGGED TABLE q12_unlogged (id int)');
+isnt($rcu1, 0, 'L5: CREATE UNLOGGED TABLE is refused');
+like($erru1, qr/unlogged relations are not supported with cluster\.shared_catalog/,
+	'L5: CREATE UNLOGGED refusal is the explicit fail-closed message');
+
+$node0->safe_psql('postgres', 'CREATE TABLE q12_logged (id int)');
+my ($rcu2, undef, $erru2) = $node0->psql('postgres',
+	'ALTER TABLE q12_logged SET UNLOGGED');
+isnt($rcu2, 0, 'L5: ALTER TABLE ... SET UNLOGGED is refused');
+like($erru2, qr/SET UNLOGGED is not supported with/,
+	'L5: SET UNLOGGED refusal is the explicit fail-closed message');
+
+my ($rcu3, undef, $erru3) = $node0->psql('postgres', 'CREATE DATABASE q12_db');
+isnt($rcu3, 0, 'L5: CREATE DATABASE is refused');
+like($erru3, qr/CREATE DATABASE is not supported with/,
+	'L5: CREATE DATABASE refusal is the explicit fail-closed message');
+
+my ($rcu4, undef, $erru4) = $node0->psql('postgres',
+	"CREATE TABLESPACE q12_ts LOCATION ''");
+isnt($rcu4, 0, 'L5: CREATE TABLESPACE is refused');
+like($erru4, qr/CREATE TABLESPACE is not supported with/,
+	'L5: CREATE TABLESPACE refusal is the explicit fail-closed message');
+
 $node1->stop;
 $node0->stop;
+
+# ----------
+# L6 (Q12 enable-time vet): pre-existing unlogged storage must refuse the
+# GUC at boot -- an isolated throwaway node with its own shared root.
+# ----------
+{
+	my $vet_root = PostgreSQL::Test::Utils::tempdir();
+	mkdir "$vet_root/global" or die "mkdir vet global: $!";
+
+	my $vet = PostgreSQL::Test::Cluster->new('sc_vet_node');
+	$vet->init;
+	$vet->start;
+	$vet->safe_psql('postgres', 'CREATE UNLOGGED TABLE q12_pre (id int)');
+	$vet->stop;
+
+	$vet->append_conf('postgresql.conf', <<EOC);
+shared_buffers = 16MB
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.shared_storage_backend = cluster_fs
+cluster.shared_data_dir = '$vet_root'
+cluster.smgr_user_relations = on
+cluster.controlfile_shared_authority = on
+cluster.shared_catalog = on
+EOC
+
+	my $vret = $vet->start(fail_ok => 1);
+	is($vret, 0, 'L6: boot with pre-existing unlogged storage fails');
+
+	my $vlog = PostgreSQL::Test::Utils::slurp_file($vet->logfile);
+	like($vlog, qr/unlogged relation storage exists/,
+		'L6: the failure is the enable-time init-fork vet FATAL');
+	ok(!-e "$vet_root/global/pgrac_catalog_authority",
+		'L6: the vet fired before any seed side effect (no authority marker)');
+}
 
 done_testing();

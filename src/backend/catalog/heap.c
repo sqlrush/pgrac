@@ -66,6 +66,9 @@
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 Q12 shared-catalog unlogged refusal */
+#endif
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/array.h"
@@ -1132,6 +1135,28 @@ heap_create_with_catalog(const char *relname,
 	 * sanity checks
 	 */
 	Assert(IsNormalProcessingMode() || IsBootstrapProcessingMode());
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-6.14 Q12): unlogged relations are rejected
+	 * under cluster.shared_catalog.  Their crash semantics are per-node (any
+	 * restarting node resets the relation from its init fork), but the
+	 * storage is a cluster-wide single authority -- one node's restart would
+	 * wipe the relation under every other live node.  A cluster-wide unlogged
+	 * reset protocol is a separate feature (spec-6.14c); until then this is
+	 * an explicit fail-closed refusal.  This chokepoint covers every
+	 * catalogued relation kind (tables, sequences; indexes and toast inherit
+	 * the parent's persistence and are unreachable once the parent is
+	 * refused).
+	 */
+	if (cluster_shared_catalog && relpersistence == RELPERSISTENCE_UNLOGGED)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unlogged relations are not supported with cluster.shared_catalog"),
+				 errhint("Cluster-wide unlogged crash-reset is not yet implemented "
+						 "(spec-6.14c); use a logged or temporary relation.")));
+#endif
 
 	/*
 	 * Validate proposed tupdesc for the desired relkind.  If

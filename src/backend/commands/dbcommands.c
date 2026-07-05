@@ -43,6 +43,9 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/comment.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 shared-catalog CREATE DATABASE refusal */
+#endif
 #include "commands/dbcommands.h"
 #include "commands/dbcommands_xlog.h"
 #include "commands/defrem.h"
@@ -725,6 +728,24 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-6.14 §3.6): CREATE DATABASE is rejected under
+	 * cluster.shared_catalog.  createdb copies template directories wholesale
+	 * (checkpoint + directory-level copy), a path orthogonal to the
+	 * per-relation shared-tree routing; multi-database shared catalog trees
+	 * are a separate feature (spec-6.14b).  Explicit fail-closed refusal
+	 * until then.
+	 */
+	if (cluster_shared_catalog)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE DATABASE is not supported with cluster.shared_catalog"),
+				 errhint("Multi-database shared catalog support is not yet implemented "
+						 "(spec-6.14b).")));
+#endif
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)

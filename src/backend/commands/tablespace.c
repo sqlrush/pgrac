@@ -85,6 +85,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 shared-catalog CREATE TABLESPACE refusal */
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) tablespace-DDL lock */
 #endif
 #include "commands/comment.h"
@@ -243,6 +244,24 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	Oid			ownerId;
 	Datum		newOptions;
 	bool		in_place;
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-6.14 §3.6): CREATE TABLESPACE is rejected
+	 * under cluster.shared_catalog.  A tablespace introduces a per-node
+	 * filesystem location outside the single shared tree the relation
+	 * routing and the relmap authority cover; cross-node tablespace layout
+	 * is a separate feature (spec-6.14b).  Explicit fail-closed refusal
+	 * until then.
+	 */
+	if (cluster_shared_catalog)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CREATE TABLESPACE is not supported with cluster.shared_catalog"),
+				 errhint("Cross-node tablespace support is not yet implemented "
+						 "(spec-6.14b).")));
+#endif
 
 	/* Must be superuser */
 	if (!superuser())

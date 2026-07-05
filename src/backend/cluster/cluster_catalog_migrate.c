@@ -190,6 +190,124 @@ seed_dir(const char *local_pgdata, const char *rel)
 }
 
 /*
+ * is_init_fork_filename -- is `name` an unlogged relation's init fork?
+ *
+ *	Init forks ("<relfilenumber>_init") exist for unlogged relations (and
+ *	their indexes) only, so their presence is an exact storage-level witness
+ *	that an unlogged relation exists -- no catalog access needed this early
+ *	in startup.
+ */
+static bool
+is_init_fork_filename(const char *name)
+{
+	size_t		len;
+
+	if (!is_relation_filename(name))
+		return false;
+	len = strlen(name);
+	return len > 5 && strcmp(name + len - 5, "_init") == 0;
+}
+
+/*
+ * vet_dir_no_init -- FATAL if <root>/<rel> holds any init fork.
+ *
+ *	A missing directory is fine (the shared tree has no base/<db> before the
+ *	seed; a local join node may have a sparse tree).
+ */
+static void
+vet_dir_no_init(const char *root, const char *rel)
+{
+	char		dirpath[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+
+	snprintf(dirpath, sizeof(dirpath), "%s/%s", root, rel);
+
+	dir = AllocateDir(dirpath);
+	if (dir == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
+						dirpath)));
+	}
+
+	while ((de = ReadDir(dir, dirpath)) != NULL)
+	{
+		if (is_init_fork_filename(de->d_name))
+			ereport(FATAL,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster.shared_catalog cannot be enabled: unlogged relation "
+							"storage exists"),
+					 errdetail("Init fork \"%s/%s\" indicates an unlogged relation.",
+							   dirpath, de->d_name),
+					 errhint("Drop existing unlogged relations (or ALTER TABLE ... SET "
+							 "LOGGED) before enabling cluster.shared_catalog; cluster-wide "
+							 "unlogged support is spec-6.14c.")));
+	}
+	FreeDir(dir);
+}
+
+/*
+ * vet_tree_no_init -- vet one PGDATA-shaped tree (global/ + every base/<db>).
+ */
+static void
+vet_tree_no_init(const char *root)
+{
+	char		basepath[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+
+	vet_dir_no_init(root, "global");
+
+	snprintf(basepath, sizeof(basepath), "%s/base", root);
+	dir = AllocateDir(basepath);
+	if (dir == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
+						basepath)));
+	}
+	while ((de = ReadDir(dir, basepath)) != NULL)
+	{
+		char		rel[MAXPGPATH];
+
+		if (!isdigit((unsigned char) de->d_name[0]))
+			continue;
+		snprintf(rel, sizeof(rel), "base/%s", de->d_name);
+		vet_dir_no_init(root, rel);
+	}
+	FreeDir(dir);
+}
+
+/*
+ * cluster_catalog_vet_no_unlogged -- spec-6.14 Q12 enable-time vet.
+ *
+ *	Unlogged relations need a cluster-wide crash-reset protocol (any node's
+ *	restart resets the SHARED init-fork copy under every other node) that is
+ *	not implemented (spec-6.14c); CREATE UNLOGGED / SET UNLOGGED are rejected
+ *	at runtime, and this vet fail-closes the remaining hole: pre-existing
+ *	unlogged storage when the GUC is turned on.  Both trees are checked every
+ *	shared-catalog boot: the local tree (the seed source) and the shared tree
+ *	(an off-mode window with cluster.smgr_user_relations=on routes user
+ *	relations -- unlogged included -- into the shared tree).
+ */
+void
+cluster_catalog_vet_no_unlogged(const char *local_pgdata)
+{
+	Assert(cluster_shared_catalog);
+
+	vet_tree_no_init(local_pgdata);
+	if (cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0')
+		vet_tree_no_init(cluster_shared_data_dir);
+}
+
+/*
  * marker_crc -- CRC over the marker's bytes preceding the crc field.
  */
 static pg_crc32c
@@ -346,6 +464,9 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 
 	Assert(cluster_shared_catalog);
 	Assert(cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0');
+
+	/* spec-6.14 Q12: fail-closed BEFORE any adopt or seed side effect. */
+	cluster_catalog_vet_no_unlogged(local_pgdata);
 
 	/*
 	 * JOIN: an authority already exists.  Adopt it after proving it is this
