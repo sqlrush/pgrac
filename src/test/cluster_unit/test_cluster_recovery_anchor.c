@@ -277,6 +277,7 @@ UT_TEST(test_layout)
 	UT_ASSERT_EQ(offsetof(ClusterRecoveryAnchor, checkPoint), 24);
 	UT_ASSERT_EQ(offsetof(ClusterRecoveryAnchor, write_time), 32);
 	UT_ASSERT_EQ(offsetof(ClusterRecoveryAnchor, checkPointCopy), 40);
+	UT_ASSERT_EQ(offsetof(ClusterRecoveryAnchor, unloggedLSN), 128);
 	UT_ASSERT_EQ(offsetof(ClusterRecoveryAnchor, crc), 508);
 	UT_ASSERT_EQ(sizeof(ClusterRecoveryAnchor), CLUSTER_RECOVERY_ANCHOR_SIZE);
 }
@@ -446,6 +447,7 @@ UT_TEST(test_build_from_controlfile)
 	cf.checkPointCopy.redo = 0x0000000212330000ULL;
 	cf.checkPointCopy.ThisTimeLineID = 5;
 	cf.checkPointCopy.nextOid = 24576;
+	cf.unloggedLSN = 0x0000000000004321ULL;
 
 	memset(&ra, 0xEE, sizeof(ra));
 	cluster_recovery_anchor_build_from_controlfile(&cf, &ra);
@@ -459,6 +461,7 @@ UT_TEST(test_build_from_controlfile)
 	UT_ASSERT_EQ(ra.checkPointCopy.redo, 0x0000000212330000ULL);
 	UT_ASSERT_EQ(ra.checkPointCopy.ThisTimeLineID, 5);
 	UT_ASSERT_EQ(ra.checkPointCopy.nextOid, 24576);
+	UT_ASSERT_EQ(ra.unloggedLSN, 0x0000000000004321ULL);
 	/* the built image classifies VALID once CRC'd (writer does that) */
 	finalize_crc(&ra);
 	UT_ASSERT_EQ(
@@ -507,7 +510,7 @@ UT_TEST(test_publish_checkpoint)
 	cp.nextOid = 40960;
 
 	cluster_recovery_anchor_publish_checkpoint(0x0000000398770000ULL, &cp, TEST_SYSID,
-											   (uint32)DB_SHUTDOWNED);
+											   (uint32)DB_SHUTDOWNED, 0x0000000000009999ULL);
 
 	memset(&out, 0xEE, sizeof(out));
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
@@ -517,6 +520,7 @@ UT_TEST(test_publish_checkpoint)
 	UT_ASSERT_EQ(out.checkPointCopy.nextOid, 40960);
 	UT_ASSERT_EQ(out.state, (uint32)DB_SHUTDOWNED);
 	UT_ASSERT_EQ(out.node_id, cluster_node_id);
+	UT_ASSERT_EQ(out.unloggedLSN, 0x0000000000009999ULL);
 }
 
 /* ======================================================================

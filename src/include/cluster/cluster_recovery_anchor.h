@@ -73,11 +73,15 @@ typedef struct ClusterRecoveryAnchor {
 	int32 node_id;								   /* owner; must equal cluster_node_id at read */
 	uint32 state;								   /* DBState of THIS node's WAL thread */
 	uint64 system_identifier;					   /* must match the shared authority's sysid */
-	XLogRecPtr checkPoint;						   /* THIS node's last checkpoint record LSN */
-	pg_time_t write_time;						   /* observational only */
-	CheckPoint checkPointCopy;					   /* THIS node's full CheckPoint record copy */
-	char _reserved[508 - 40 - sizeof(CheckPoint)]; /* zero pad to the CRC */
-	pg_crc32c crc;								   /* CRC32C over [0, offsetof(crc)) */
+	XLogRecPtr checkPoint;	   /* THIS node's last checkpoint record LSN */
+	pg_time_t write_time;	   /* observational only */
+	CheckPoint checkPointCopy; /* THIS node's full CheckPoint record copy */
+	XLogRecPtr unloggedLSN;	   /* THIS node's unloggedLSN at last write; a
+								* clean restart must restore its own fake-LSN
+								* counter, not the last authority writer's
+								* (L437 sweep: xlog.c unloggedLSN restore) */
+	char _reserved[508 - 40 - 8 - sizeof(CheckPoint)]; /* zero pad to the CRC */
+	pg_crc32c crc;			   /* CRC32C over [0, offsetof(crc)) */
 } ClusterRecoveryAnchor;
 
 StaticAssertDecl(offsetof(ClusterRecoveryAnchor, node_id) == 8, "recovery anchor node_id offset");
@@ -90,6 +94,8 @@ StaticAssertDecl(offsetof(ClusterRecoveryAnchor, write_time) == 32,
 				 "recovery anchor write_time offset");
 StaticAssertDecl(offsetof(ClusterRecoveryAnchor, checkPointCopy) == 40,
 				 "recovery anchor CheckPoint copy offset");
+StaticAssertDecl(offsetof(ClusterRecoveryAnchor, unloggedLSN) == 128,
+				 "recovery anchor unloggedLSN offset (locks sizeof(CheckPoint) too)");
 StaticAssertDecl(offsetof(ClusterRecoveryAnchor, crc) == 508, "recovery anchor crc offset");
 StaticAssertDecl(sizeof(ClusterRecoveryAnchor) == CLUSTER_RECOVERY_ANCHOR_SIZE,
 				 "recovery anchor size");
@@ -170,7 +176,8 @@ extern void cluster_recovery_anchor_build_from_controlfile(const ControlFileData
  */
 extern void cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 													   const CheckPoint *checkpoint_copy,
-													   uint64 sysid, uint32 state);
+													   uint64 sysid, uint32 state,
+													   XLogRecPtr unlogged_lsn);
 
 /*
  * Production state refresh (write hook #2): flip an existing valid

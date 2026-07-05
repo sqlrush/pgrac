@@ -322,6 +322,7 @@ cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf,
 	out->checkPoint = cf->checkPoint;
 	out->write_time = (pg_time_t)time(NULL);
 	out->checkPointCopy = cf->checkPointCopy;
+	out->unloggedLSN = cf->unloggedLSN;
 }
 
 /*
@@ -334,7 +335,7 @@ cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf,
 void
 cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 										   const CheckPoint *checkpoint_copy, uint64 sysid,
-										   uint32 state)
+										   uint32 state, XLogRecPtr unlogged_lsn)
 {
 	ClusterRecoveryAnchor ra;
 
@@ -347,6 +348,7 @@ cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 	ra.checkPoint = checkpoint_lsn;
 	ra.write_time = (pg_time_t)time(NULL);
 	ra.checkPointCopy = *checkpoint_copy;
+	ra.unloggedLSN = unlogged_lsn;
 
 	cluster_recovery_anchor_write(&ra);
 }

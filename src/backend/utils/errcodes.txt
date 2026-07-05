@@ -866,6 +866,15 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53RB1    E    ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH                        cluster_xid_stripe_join_mismatch
 53RB2    E    ERRCODE_CLUSTER_XID_WINDOW_HARD_LIMIT                           cluster_xid_window_hard_limit
 
+# spec-5.6a:  per-node recovery anchor unavailable.  Under
+# cluster.controlfile_shared_authority=on a plain (label-less) restart must
+# locate this node's own checkpoint via its per-node recovery anchor; a
+# missing/corrupt/foreign anchor fails closed rather than adopt the shared
+# control file's last-writer checkpoint fields.  Recover by re-provisioning
+# the node from a base backup (the backup_label path rebuilds the anchor at
+# the first own checkpoint).
+53RB3    E    ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE                      cluster_recovery_anchor_unavailable
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

@@ -138,6 +138,7 @@
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
 #include "cluster/cluster_mrp.h"	   /* PGRAC: spec-6.4 ADG Apply Master gate */
+#include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node restart inputs */
 #include "cluster/cluster_mrp_apply.h" /* PGRAC: spec-6.4 MRP apply facade */
 #include "cluster/cluster_rfs.h"	   /* PGRAC: spec-6.4 ADG RFS coordinator */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
@@ -1120,6 +1121,20 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	else
 		recoveryTargetTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-5.6a D3 / L437 sweep): the shared copy's TLI is the last
+	 * authority writer's; initialize from this node's own anchor copy.
+	 * minRecoveryPoint is an archive/standby-regime field and stays invalid
+	 * on pgrac primaries, so the max() shape above is preserved.
+	 */
+	if (cluster_recovery_anchor_active() &&
+		ControlFile->minRecoveryPointTLI <=
+		cluster_recovery_anchor_get()->checkPointCopy.ThisTimeLineID)
+		recoveryTargetTLI = cluster_recovery_anchor_get()->checkPointCopy.ThisTimeLineID;
+#endif
+
 	/*
 	 * Check for signal files, and if so set up state for offline recovery
 	 */
@@ -1213,8 +1228,18 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 */
 	if (!ArchiveRecoveryRequested && !StandbyModeRequested)
 	{
-		cluster_recovery_plan_generate((uint32) ControlFile->state,
-									   ControlFile->state != DB_SHUTDOWNED);
+		DBState		plan_state = ControlFile->state;
+
+		/*
+		 * PGRAC (spec-5.6a D3 consumption point #3): the plan's
+		 * dbstate_at_startup / local_recovery_needed inputs must describe
+		 * THIS node's previous incarnation, not the last authority writer's.
+		 */
+		if (cluster_recovery_anchor_active())
+			plan_state = (DBState) cluster_recovery_anchor_get()->state;
+
+		cluster_recovery_plan_generate((uint32) plan_state,
+									   plan_state != DB_SHUTDOWNED);
 
 		/*
 		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
@@ -1451,6 +1476,30 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		CheckPointTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 		RedoStartLSN = ControlFile->checkPointCopy.redo;
 		RedoStartTLI = ControlFile->checkPointCopy.ThisTimeLineID;
+
+#ifdef USE_PGRAC_CLUSTER
+
+		/*
+		 * PGRAC (spec-5.6a D3 consumption point #4): under the shared
+		 * pg_control authority the fields just read are the last authority
+		 * writer's own-thread values; locating that checkpoint in THIS
+		 * node's WAL thread PANICs ("could not locate a valid checkpoint
+		 * record") or, worse, replays from a foreign redo start.  Take this
+		 * node's own last checkpoint from its recovery anchor (this also
+		 * heals the cold-merge own-stream start, which is derived from
+		 * RedoStartLSN).  A label-less authority boot without a valid
+		 * anchor already failed closed (53RB3) in StartupXLOG.
+		 */
+		if (cluster_recovery_anchor_active())
+		{
+			const ClusterRecoveryAnchor *ra = cluster_recovery_anchor_get();
+
+			CheckPointLoc = ra->checkPoint;
+			CheckPointTLI = ra->checkPointCopy.ThisTimeLineID;
+			RedoStartLSN = ra->checkPointCopy.redo;
+			RedoStartTLI = ra->checkPointCopy.ThisTimeLineID;
+		}
+#endif
 		record = ReadCheckpointRecord(xlogprefetcher, CheckPointLoc,
 									  CheckPointTLI);
 		if (record != NULL)
@@ -1570,8 +1619,23 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 					(errmsg("invalid redo record in shutdown checkpoint")));
 		InRecovery = true;
 	}
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-5.6a D3 / L437 sweep): the clean-shutdown test must use
+	 * this node's own state.  A peer's clean shutdown recorded in the shared
+	 * authority must not mask this node's crash (its tail WAL would be
+	 * silently skipped -- lost writes), and a peer's crash must not force
+	 * recovery after this node's clean shutdown.
+	 */
+	else if (cluster_recovery_anchor_active() ?
+			 cluster_recovery_anchor_get()->state != (uint32) DB_SHUTDOWNED :
+			 ControlFile->state != DB_SHUTDOWNED)
+		InRecovery = true;
+#else
 	else if (ControlFile->state != DB_SHUTDOWNED)
 		InRecovery = true;
+#endif
 	else if (ArchiveRecoveryRequested)
 	{
 		/* force recovery due to presence of recovery signal file */

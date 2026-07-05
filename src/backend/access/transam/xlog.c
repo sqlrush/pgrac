@@ -180,6 +180,7 @@
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
+#include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
 
@@ -5272,6 +5273,9 @@ StartupXLOG(void)
 	XLogRecPtr	EndOfLog;
 	TimeLineID	EndOfLogTLI;
 	TimeLineID	newTLI;
+	DBState		boot_state;		/* PGRAC: spec-5.6a own-node restart state */
+	pg_time_t	boot_time;		/* PGRAC: spec-5.6a own-node state timestamp */
+	pg_time_t	boot_ckpt_time; /* PGRAC: spec-5.6a own-node checkpoint time */
 	bool		performedWalRecovery;
 	EndOfWalRecoveryInfo *endOfRecoveryInfo;
 	XLogRecPtr	abortedRecPtr;
@@ -5312,16 +5316,105 @@ StartupXLOG(void)
 	 * No-op unless cluster.controlfile_shared_authority is on.
 	 */
 	cluster_cf_enter_bootstrap_window_or_fail();
+
+	/*
+	 * PGRAC (spec-5.6a D3): load this node's per-node recovery anchor.  Under
+	 * the shared pg_control authority the shared checkPoint / checkPointCopy /
+	 * state fields are the last permitted writer's own-thread values; a plain
+	 * (label-less) restart must take its restart inputs from its own anchor
+	 * instead.  A backup label stays the one-shot provisioning authority: a
+	 * label boot without an anchor is legal (the first own checkpoint creates
+	 * it), but a label-less authority boot without a trustworthy anchor fails
+	 * closed -- "maybe this node was the last authority writer" is not
+	 * decidable, and adopting a foreign checkpoint silently corrupts recovery.
+	 */
+	if (cluster_controlfile_shared_authority)
+	{
+		struct stat st;
+		bool		have_label = (stat(BACKUP_LABEL_FILE, &st) == 0);
+		bool		anchor_from_bak = false;
+
+		if (cluster_recovery_anchor_load(ControlFile->system_identifier,
+										 &anchor_from_bak))
+		{
+			const ClusterRecoveryAnchor *ra = cluster_recovery_anchor_get();
+
+			/*
+			 * The write hooks only ever record the two steady states; any
+			 * other value is a foreign/corrupt leftover -- refuse to guess a
+			 * restart semantic from it.
+			 */
+			if (ra->state != (uint32) DB_SHUTDOWNED &&
+				ra->state != (uint32) DB_IN_PRODUCTION)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+						 errmsg("recovery anchor for node %d contains unexpected database state %u",
+								cluster_node_id, (unsigned) ra->state),
+						 errhint("Re-provision this node from a base backup.")));
+
+			if (anchor_from_bak)
+				ereport(WARNING,
+						(errmsg("recovery anchor for node %d was adopted from its backup copy",
+								cluster_node_id)));
+			ereport(LOG,
+					(errmsg("using per-node recovery anchor for node %d: state %u, checkpoint %X/%X, redo %X/%X",
+							cluster_node_id, (unsigned) ra->state,
+							LSN_FORMAT_ARGS(ra->checkPoint),
+							LSN_FORMAT_ARGS(ra->checkPointCopy.redo))));
+		}
+		else if (!have_label)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+					 errmsg("per-node recovery anchor for node %d is missing or invalid under the shared control-file authority",
+							cluster_node_id),
+					 errdetail("The shared pg_control checkpoint fields belong to the last writer node and cannot locate this node's own checkpoint."),
+					 errhint("Re-provision this node from a base backup, or verify that cluster.shared_data_dir is correctly mounted.")));
+	}
 #endif
 
 	/*
 	 * Check that contents look valid.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-5.6a D3 consumption point #1): when the anchor is active,
+	 * the restart input to validate is the anchor's checkpoint location; the
+	 * shared field is observational (last writer's).
+	 */
+	if (cluster_recovery_anchor_active())
+	{
+		if (!XRecOffIsValid(cluster_recovery_anchor_get()->checkPoint))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+					 errmsg("recovery anchor contains invalid checkpoint location"),
+					 errhint("Re-provision this node from a base backup.")));
+	}
+	else
+#endif
 	if (!XRecOffIsValid(ControlFile->checkPoint))
 		ereport(FATAL,
 				(errmsg("control file contains invalid checkpoint location")));
 
-	switch (ControlFile->state)
+	/*
+	 * PGRAC (spec-5.6a D3 consumption point #2): the boot-time state report
+	 * (and the didCrash decision below) must describe THIS node's previous
+	 * incarnation.  boot_state/boot_time alias the vanilla shared fields and
+	 * are overridden from the anchor when it is active, so the vanilla
+	 * switch below stays intact for both builds.
+	 */
+	boot_state = ControlFile->state;
+	boot_time = ControlFile->time;
+	boot_ckpt_time = ControlFile->checkPointCopy.time;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_recovery_anchor_active())
+	{
+		boot_state = (DBState) cluster_recovery_anchor_get()->state;
+		boot_time = cluster_recovery_anchor_get()->write_time;
+		boot_ckpt_time = cluster_recovery_anchor_get()->checkPointCopy.time;
+	}
+#endif
+
+	switch (boot_state)
 	{
 		case DB_SHUTDOWNED:
 
@@ -5331,25 +5424,25 @@ StartupXLOG(void)
 			 */
 			ereport(IsPostmasterEnvironment ? LOG : NOTICE,
 					(errmsg("database system was shut down at %s",
-							str_time(ControlFile->time))));
+							str_time(boot_time))));
 			break;
 
 		case DB_SHUTDOWNED_IN_RECOVERY:
 			ereport(LOG,
 					(errmsg("database system was shut down in recovery at %s",
-							str_time(ControlFile->time))));
+							str_time(boot_time))));
 			break;
 
 		case DB_SHUTDOWNING:
 			ereport(LOG,
 					(errmsg("database system shutdown was interrupted; last known up at %s",
-							str_time(ControlFile->time))));
+							str_time(boot_time))));
 			break;
 
 		case DB_IN_CRASH_RECOVERY:
 			ereport(LOG,
 					(errmsg("database system was interrupted while in recovery at %s",
-							str_time(ControlFile->time)),
+							str_time(boot_time)),
 					 errhint("This probably means that some data is corrupted and"
 							 " you will have to use the last backup for recovery.")));
 			break;
@@ -5357,7 +5450,7 @@ StartupXLOG(void)
 		case DB_IN_ARCHIVE_RECOVERY:
 			ereport(LOG,
 					(errmsg("database system was interrupted while in recovery at log time %s",
-							str_time(ControlFile->checkPointCopy.time)),
+							str_time(boot_ckpt_time)),
 					 errhint("If this has occurred more than once some data might be corrupted"
 							 " and you might need to choose an earlier recovery target.")));
 			break;
@@ -5365,7 +5458,7 @@ StartupXLOG(void)
 		case DB_IN_PRODUCTION:
 			ereport(LOG,
 					(errmsg("database system was interrupted; last known up at %s",
-							str_time(ControlFile->time))));
+							str_time(boot_time))));
 			break;
 
 		default:
@@ -5405,8 +5498,13 @@ StartupXLOG(void)
 	 *   though more recent data written to disk from here on would be
 	 *   persisted.  To avoid that, fsync the entire data directory.
 	 */
-	if (ControlFile->state != DB_SHUTDOWNED &&
-		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
+	/*
+	 * PGRAC (spec-5.6a D3 / L437 sweep): boot_state, not ControlFile->state
+	 * -- a peer's clean shutdown recorded in the shared authority must not
+	 * let this crashed node skip the data-directory fsync.
+	 */
+	if (boot_state != DB_SHUTDOWNED &&
+		boot_state != DB_SHUTDOWNED_IN_RECOVERY)
 	{
 		RemoveTempXlogFiles();
 		SyncDataDirectory();
@@ -5426,6 +5524,22 @@ StartupXLOG(void)
 	InitWalRecovery(ControlFile, &wasShutdown,
 					&haveBackupLabel, &haveTblspcMap);
 	checkPoint = ControlFile->checkPointCopy;
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (spec-5.6a D3 / L437 sweep): on a clean (no-recovery) restart the
+	 * shared copy still holds the last authority writer's CheckPoint -- its
+	 * nextXid / nextOid / oldest* are that node's per-node values and must
+	 * not seed this node's ShmemVariableCache below.  Adopt this node's own
+	 * copy from the anchor.  When recovery ran, InitWalRecovery already
+	 * replaced the in-memory copy with the record read from this node's own
+	 * WAL (the same record the anchor points at), so the vanilla source is
+	 * correct.
+	 */
+	if (cluster_recovery_anchor_active() && !InRecovery)
+		checkPoint = cluster_recovery_anchor_get()->checkPointCopy;
+#endif
 
 	/* initialize shared memory variables from the checkpoint record */
 	ShmemVariableCache->nextXid = checkPoint.nextXid;
@@ -5496,6 +5610,20 @@ StartupXLOG(void)
 	 * control file. On recovery, all unlogged relations are blown away, so
 	 * the unlogged LSN counter can be reset too.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-5.6a D3 / L437 sweep): both the clean-shutdown test and the
+	 * restored counter must be this node's own -- the shared fields carry the
+	 * last authority writer's unloggedLSN, and adopting a foreign (possibly
+	 * lower) value would make this node's fake LSNs go backwards.  With the
+	 * anchor active, !InRecovery is exactly "this node shut down cleanly"
+	 * (the InRecovery decision itself is anchor-driven).
+	 */
+	if (cluster_recovery_anchor_active())
+		XLogCtl->unloggedLSN = InRecovery ? FirstNormalUnloggedLSN :
+			cluster_recovery_anchor_get()->unloggedLSN;
+	else
+#endif
 	if (ControlFile->state == DB_SHUTDOWNED)
 		XLogCtl->unloggedLSN = ControlFile->unloggedLSN;
 	else
@@ -6047,6 +6175,21 @@ StartupXLOG(void)
 	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-5.6a D2 write hook #2): mirror the DB_IN_PRODUCTION flip
+	 * into this node's recovery anchor (state only; its checkpoint fields
+	 * are preserved).  Without this, a clean shutdown followed by a restart
+	 * that writes WAL and then crashes would be misread as a clean shutdown
+	 * on the next boot -- the anchor would still say DB_SHUTDOWNED -- and
+	 * the tail WAL would be silently skipped, exactly the lost-write hazard
+	 * the vanilla pg_control state update above prevents.  A node without
+	 * an anchor yet (label-provisioned first boot) is a no-op: creation
+	 * happens only at the checkpoint hook and the seed path.
+	 */
+	if (cluster_controlfile_shared_authority)
+		cluster_recovery_anchor_refresh_state(ControlFile->system_identifier,
+											  (uint32) DB_IN_PRODUCTION);
+
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.
 	 *
@@ -7283,6 +7426,27 @@ CreateCheckPoint(int flags)
 	 * peer knows where to begin.  Best-effort (WARN on failure).
 	 */
 	cluster_wal_state_publish_checkpoint_redo((uint64) checkPoint.redo);
+
+	/*
+	 * PGRAC (spec-5.6a D2 write hook #1): under the shared pg_control
+	 * authority the shared checkpoint fields belong to whichever node wrote
+	 * them last, so persist THIS node's checkpoint record LSN, CheckPoint
+	 * copy and state in its per-node recovery anchor; a plain (label-less)
+	 * restart consumes the anchor instead of the shared fields.  Same window
+	 * as the wal-state publish above: after UpdateControlFile, before this
+	 * cycle's WAL recycling below, so the anchor never points past recycled
+	 * WAL.  PANICs on I/O failure (an anchor that silently stops advancing
+	 * loses this node's recoverability once recycling passes its redo
+	 * point).  Deliberately NOT subject to the CF write-skip/JOIN_READONLY
+	 * gate: the anchor is a per-node file and must keep advancing even
+	 * while this node's shared-authority writes are suppressed.
+	 */
+	if (cluster_controlfile_shared_authority)
+		cluster_recovery_anchor_publish_checkpoint(ProcLastRecPtr, &checkPoint,
+												   ControlFile->system_identifier,
+												   shutdown ? (uint32) DB_SHUTDOWNED :
+												   (uint32) DB_IN_PRODUCTION,
+												   ControlFile->unloggedLSN);
 #endif
 
 	/* Update shared-memory copy of checkpoint XID/epoch */
