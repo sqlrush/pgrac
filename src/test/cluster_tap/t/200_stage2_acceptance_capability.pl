@@ -8,7 +8,9 @@
 #	  Each capability block (L1-L13) targets a Stage 2 sub-spec
 #	  user-visible behavior contract:
 #	    L1a  DDL propagation mechanism  (spec-2.38 + 2.39 sinval/ACK)
-#	    L1b  DDL propagation behavior   (best-effort; Stage 3 limitation)
+#	    L1b  DDL propagation behavior   (hard matrix negative: per-node
+#	         catalog invisibility; the shared_catalog=on hard positive is
+#	         t/337 -- spec-6.14 D12 deleted the old best-effort SKIP)
 #	    L2   CF 2-way S→S forward       (spec-2.35)
 #	    L3   CF 3-way X writer + reader-starvation guard (spec-2.36;3-node)
 #	    L4   PI lost-write detection MVP (spec-2.37)
@@ -73,19 +75,20 @@ my $ack_after = cnt($pair->node0, 'sinval', 'ack_received_count');
 cmp_ok($ack_after, '>=', $ack_before,
 	"L1a DDL mechanism: ack_received_count stable/incremented ($ack_before → $ack_after)");
 
-# L1b best-effort: try to observe cross-node visibility within 5s.
-my $node1_sees = 0;
-for (my $i = 0; $i < 25; $i++) {
-	my $r = $pair->node1->safe_psql('postgres',
-		q{SELECT count(*) FROM pg_class WHERE relname='l1_ddl_test'});
-	if ($r eq '1') { $node1_sees = 1; last; }
-	sleep 0.2;
-}
-SKIP: {
-	skip 'L1b best-effort: cross-node DDL visibility requires Stage 3 MVCC cross-node coherence; SKIP if not observable', 1
-		if !$node1_sees;
-	pass('L1b DDL behavior: node1 sees l1_ddl_test within 5s (Stage 2 best-effort, full coherence推 Stage 3)');
-}
+# L1b (spec-6.14 D12 upgrade -- the best-effort SKIP branch is deleted).
+# The single-sided DDL visibility contract is now deterministic across the
+# cluster.shared_catalog matrix:
+#   off (THIS harness): each node has its OWN catalog, so node0's
+#       single-sided CREATE must NOT appear on node1 -- a hard negative.
+#   on: the hard positive (< 1s visibility, plus the ALTER / CREATE INDEX /
+#       DROP matrix) runs on the shared-catalog bring-up in
+#       t/337_shared_catalog_ddl_2node.pl.
+sleep 1;	# give sinval propagation every chance to (wrongly) surface it
+my $node1_sees = $pair->node1->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_class WHERE relname='l1_ddl_test'});
+is($node1_sees, '0',
+	'L1b DDL behavior (shared_catalog=off matrix): single-sided CREATE is '
+	. 'per-node-catalog invisible on node1 (hard positive lives in t/337)');
 $pair->node0->safe_psql('postgres', 'DROP TABLE IF EXISTS l1_ddl_test');
 
 # ============================================================

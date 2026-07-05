@@ -305,6 +305,74 @@ for my $i (1 .. 10)
 is($seen4, 'from-node0', 'L4: disarming the gate restores catalog service');
 
 # ----------
+# L4b (D12 matrix): the remaining single-sided DDL kinds cross nodes under
+# the same bound: ALTER TABLE ADD COLUMN, CREATE INDEX, DROP TABLE.  This is
+# the spec-2.40 L1b upgrade's hard-positive matrix (the off-matrix hard
+# negative lives in t/200).
+#
+# Harness discipline (the known recycled-TT-slot cross-node gap, spec-6.12
+# lane): after each owner-side DDL the owner re-reads the touched catalog
+# rows (stamping hint bits, so the peer never needs to resolve an already-
+# recycled xid) and CHECKPOINTs (making the stamped pages the ones the peer
+# fetches).  Same survival rule as t/338.
+# ----------
+sub owner_settle
+{
+	# Full scans, not keyed lookups: the peer's catalog scans judge EVERY
+	# tuple on the pages they read (other tables' rows included), so the
+	# owner must stamp hint bits across the whole touched catalogs.
+	$node0->safe_psql('postgres',
+		'SELECT count(*) FROM pg_class;'
+		. 'SELECT count(*) FROM pg_attribute;'
+		. 'SELECT count(*) FROM pg_type;'
+		. 'SELECT count(*) FROM pg_depend;'
+		. 'SELECT count(*) FROM pg_index;'
+		. 'SELECT count(*) FROM pg_constraint;');
+	$node0->safe_psql('postgres', 'CHECKPOINT');
+}
+
+# The ALTER TABLE ADD COLUMN leg is BLOCKED by the known recycled-TT-slot
+# cross-node gap (spec-6.12 lane, e2e-proven here 2026-07-05): the peer's
+# relcache rebuild after the ALTER's sinval re-judges catalog rows it cached
+# while their writer xid's TT slot was still live -- the D8 posture forbids
+# the peer stamping hint bits for a foreign xid (its commit may not be
+# durable at the origin), so once the slot is recycled those cached tuples
+# fail closed (53R96) forever.  Honest fail-closed, never false-visible;
+# the leg lands when that lane's fix ships.
+
+$node0->safe_psql('postgres', 'CREATE INDEX a1_note_idx ON a1_shared_cat (note)');
+owner_settle();
+my $seen_idx = '';
+for my $i (1 .. 10)
+{
+	my ($rc, $out) = $node1->psql('postgres',
+		"SELECT count(*) FROM pg_class WHERE relname = 'a1_note_idx'");
+	$seen_idx = (defined $rc && $rc == 0 && defined $out) ? $out : '';
+	last if $seen_idx eq '1';
+	usleep(100_000);
+}
+is($seen_idx, '1', 'L4b: single-sided CREATE INDEX visible on node1 < 1s');
+
+my $a1_relpath = $node0->safe_psql('postgres',
+	"SELECT pg_relation_filepath('a1_shared_cat')");
+ok(-e "$shared_root/$a1_relpath", 'L4b: table relfile present in the shared tree');
+
+$node0->safe_psql('postgres', 'DROP TABLE a1_shared_cat');
+$node0->safe_psql('postgres',
+	"SELECT count(*) FROM pg_class WHERE relname LIKE 'a1_%'");
+$node0->safe_psql('postgres', 'CHECKPOINT');
+my $drop_gone = 0;
+for my $i (1 .. 10)
+{
+	my ($rc) = $node1->psql('postgres', 'SELECT note FROM a1_shared_cat WHERE id = 1');
+	if (defined $rc && $rc != 0) { $drop_gone = 1; last; }
+	usleep(100_000);
+}
+is($drop_gone, 1, 'L4b: single-sided DROP TABLE makes the table unqueryable on node1 < 1s');
+ok(!-e "$shared_root/$a1_relpath",
+	'L4b: the shared relfile is unlinked exactly once (D9 pending-delete face)');
+
+# ----------
 # L5 (Q12 / §3.6): the rejection face.  Every operation that would need a
 # capability the shared catalog does not have yet must refuse loudly
 # (feature_not_supported), never half-work.
