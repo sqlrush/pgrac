@@ -46,6 +46,7 @@
 #include "cluster/cluster_adg_xlog.h"			/* spec-6.4 ADG barrier */
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-1.22 D14a */
 #include "cluster/storage/cluster_raw_xlog.h"  /* spec-6.0a raw layout */
+#include "cluster/cluster_xid_stripe_xlog.h" /* spec-6.15 xid stripe (D5d) */
 #endif
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"

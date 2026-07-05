@@ -261,6 +261,29 @@ GetNewTransactionId(bool isSubXact)
 	 *
 	 * Extend pg_subtrans and pg_commit_ts too.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.15 D5e -- a striped candidate that jumped far past
+	 * the previous nextXid (the activation-floor clamp; later the D3
+	 * herding jump) skips whole SLRU pages, and Extend*() only zeroes a
+	 * page when handed its FIRST xid.  Walk the gap so every skipped
+	 * page exists before the candidate is issued (the recovery-side gap
+	 * fill walks per-xid the same way, procarray.c).  One-time cost at
+	 * activation; bounded by the herding slack. */
+	if (U64FromFullTransactionId(full_xid) > U64FromFullTransactionId(ShmemVariableCache->nextXid)
+		&& U64FromFullTransactionId(full_xid)
+		- U64FromFullTransactionId(ShmemVariableCache->nextXid) > CLUSTER_XID_STRIDE)
+	{
+		TransactionId gap_xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
+
+		while (TransactionIdPrecedes(gap_xid, xid))
+		{
+			ExtendCLOG(gap_xid);
+			ExtendCommitTs(gap_xid);
+			ExtendSUBTRANS(gap_xid);
+			TransactionIdAdvance(gap_xid);
+		}
+	}
+#endif
 	ExtendCLOG(xid);
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);

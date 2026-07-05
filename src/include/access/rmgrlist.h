@@ -92,4 +92,6 @@ PG_RMGR(RM_CLUSTER_UNDO_ID, "ClusterUndo", cluster_undo_redo, cluster_undo_desc,
 PG_RMGR(RM_CLUSTER_RAW_LAYOUT_ID, "ClusterRawLayout", cluster_raw_layout_redo, cluster_raw_layout_desc, cluster_raw_layout_identify, NULL, NULL, NULL, NULL)
 /* PGRAC spec-6.4: ADG thread-safe-SCN barriers. */
 PG_RMGR(RM_CLUSTER_ADG_ID, "ClusterAdg", cluster_adg_redo, cluster_adg_desc, cluster_adg_identify, NULL, NULL, NULL, NULL)
+/* PGRAC spec-6.15 D5d: xid stripe activation knowledge (JOIN / RETIRE). */
+PG_RMGR(RM_CLUSTER_XID_STRIPE_ID, "ClusterXidStripe", cluster_xid_stripe_redo, cluster_xid_stripe_desc, cluster_xid_stripe_identify, NULL, NULL, NULL, NULL)
 #endif

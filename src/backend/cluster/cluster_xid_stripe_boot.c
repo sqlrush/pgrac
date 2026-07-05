@@ -44,12 +44,14 @@
 #include <unistd.h>
 
 #include "access/transam.h"
+#include "access/xlog.h" /* RecoveryInProgress (D5d gate hold) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_xid_stripe_xlog.h" /* JOIN record emission (D5d) */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -93,6 +95,17 @@ typedef struct ClusterXidStripeBootShmem {
 	uint64 my_slot_floor_full;
 	uint64 my_owner_incarnation;
 
+	/*
+	 * Replay-learned stripe knowledge (D5d): written ONLY by WAL redo
+	 * (startup process), consumed by the hot-standby KnownAssignedXids
+	 * gap-fill in the same process (atomics are for cross-process
+	 * observability, e.g. after promotion).  floor 0 = not activated
+	 * (dense fill); bit k of the bitmap = slot k active.
+	 */
+	pg_atomic_uint64 replay_floor_full;
+	pg_atomic_uint64 replay_epoch;
+	pg_atomic_uint32 replay_active_bitmap;
+
 	/* stripe mailbox: LMON stages -> qvotec writes -> majority ACK */
 	pg_atomic_uint64 req_seq;
 	pg_atomic_uint64 done_seq;
@@ -133,6 +146,9 @@ cluster_xid_stripe_shmem_init(void)
 		pg_atomic_init_u64(&StripeBootShmem->done_seq, 0);
 		pg_atomic_init_u32(&StripeBootShmem->op_result, 0);
 		pg_atomic_init_u32(&StripeBootShmem->done_op, 0);
+		pg_atomic_init_u64(&StripeBootShmem->replay_floor_full, 0);
+		pg_atomic_init_u64(&StripeBootShmem->replay_epoch, 0);
+		pg_atomic_init_u32(&StripeBootShmem->replay_active_bitmap, 0);
 	}
 }
 
@@ -713,6 +729,18 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 	if (cluster_xid_striping) {
 		uint32 slot_state;
 
+		/*
+		 * D5d (8.A): hold until local recovery is over.  The seed floor
+		 * must be computed from the POST-recovery shared nextXid — a
+		 * mid-recovery read could seed a floor below the recovery-end
+		 * value, leaving pre-striping dense history ABOVE the floor,
+		 * which the derivation would misattribute to stripe classes
+		 * (false origin, 8.A).  It also guarantees the JOIN WAL record
+		 * below is insertable.
+		 */
+		if (RecoveryInProgress())
+			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+
 		switch ((ClusterXidStripeDiskState)state) {
 		case CLUSTER_XID_STRIPE_DISK_PUBLISHED:
 			break; /* activation resolved; fall through to the slot vet */
@@ -740,6 +768,15 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 
 		switch ((ClusterXidStripeSlotState)slot_state) {
 		case CLUSTER_XID_STRIPE_SLOT_MINE:
+			/*
+			 * D5d ordering invariant: the JOIN record must be in OUR WAL
+			 * thread before the gate opens (i.e. before this node's first
+			 * xid-bearing record) so any order-preserving WAL consumer
+			 * learns "slot active above floor" first.  Not insertable yet
+			 * -> hold (retried next tick).
+			 */
+			if (!cluster_xid_stripe_emit_join_wal())
+				return CLUSTER_XID_STRIPE_JOIN_HOLD;
 			return CLUSTER_XID_STRIPE_JOIN_PROCEED;
 		case CLUSTER_XID_STRIPE_SLOT_ABSENT:
 			(void)stripe_stage_op(STRIPE_OP_CLAIM, cluster_node_id, 0);
@@ -923,6 +960,81 @@ cluster_xid_stripe_get_activation(uint64 *floor_full, uint64 *epoch, uint64 *gen
 	}
 	LWLockRelease(&StripeBootShmem->lock);
 	return published;
+}
+
+/* ============================================================
+ * D5d replay face: redo publishes, the standby gap-fill consumes.
+ * ============================================================ */
+
+void
+cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot)
+{
+	uint32 bitmap;
+
+	if (StripeBootShmem == NULL)
+		return;
+
+	/* floor/epoch: first JOIN wins; repeats are idempotent (all carry
+	 * the same durable activation content; epoch never regresses). */
+	if (pg_atomic_read_u64(&StripeBootShmem->replay_floor_full) == 0) {
+		pg_atomic_write_u64(&StripeBootShmem->replay_epoch, epoch);
+		pg_write_barrier();
+		pg_atomic_write_u64(&StripeBootShmem->replay_floor_full, floor_full);
+		ereport(LOG, (errmsg("cluster xid stripe: replay learned activation "
+							 "(floor " UINT64_FORMAT ", epoch " UINT64_FORMAT ")",
+							 floor_full, epoch)));
+	}
+	bitmap = pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap);
+	pg_atomic_write_u32(&StripeBootShmem->replay_active_bitmap, bitmap | (1u << slot));
+}
+
+void
+cluster_xid_stripe_replay_note_retire(int slot)
+{
+	uint32 bitmap;
+
+	if (StripeBootShmem == NULL)
+		return;
+	bitmap = pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap);
+	pg_atomic_write_u32(&StripeBootShmem->replay_active_bitmap, bitmap & ~(1u << slot));
+}
+
+bool
+cluster_xid_stripe_replay_filter_active(void)
+{
+	return StripeBootShmem != NULL && pg_atomic_read_u64(&StripeBootShmem->replay_floor_full) != 0;
+}
+
+/*
+ * Should the standby gap-fill treat xid as possibly-assigned?  TRUE
+ * (fill) for everything below the replay-learned floor (pre-striping
+ * dense history) and for active classes above it; FALSE only for an
+ * above-floor xid whose class is not active — by the per-thread
+ * ordering invariant such a value can never have been issued.
+ * Underivable widening fails toward TRUE (fill = the conservative,
+ * treat-as-running direction; never a visibility hazard).
+ */
+bool
+cluster_xid_stripe_replay_should_fill(TransactionId xid)
+{
+	uint64 floor_full;
+	uint32 bitmap;
+	FullTransactionId fxid;
+
+	if (StripeBootShmem == NULL)
+		return true;
+	floor_full = pg_atomic_read_u64(&StripeBootShmem->replay_floor_full);
+	if (floor_full == 0)
+		return true;
+
+	fxid = cluster_xid_widen(xid, ReadNextFullTransactionId());
+	if (!FullTransactionIdIsValid(fxid))
+		return true; /* fail toward fill */
+	if (U64FromFullTransactionId(fxid) < floor_full)
+		return true; /* dense pre-striping history */
+
+	bitmap = pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap);
+	return (bitmap & (1u << (xid % CLUSTER_XID_STRIDE))) != 0;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

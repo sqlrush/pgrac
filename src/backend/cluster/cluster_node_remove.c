@@ -64,6 +64,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5c retire-before-removal */
+#include "cluster/cluster_xid_stripe_xlog.h" /* spec-6.15 D5d RETIRE record */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_write_fence.h"
@@ -563,6 +564,10 @@ cluster_node_remove_drive(void)
 								 node_id)));
 			return;
 		}
+		/* D5d: carry the retire to WAL consumers (standby stops gap-
+		 * filling the dead class).  The voting-disk retire above is the
+		 * correctness anchor; emission failure is tolerated (logged). */
+		cluster_xid_stripe_emit_retire_wal(node_id);
 
 		/*
 		 * The commit point: guarded epoch bump + fence-arm (majority-durable, at

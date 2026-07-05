@@ -37,7 +37,13 @@
 #           writable transaction ever succeeds (membership 53R64 and
 #           the retired stripe slot 53RB1 both bar the way).
 #
-#    The D5d standby skip-fill leg lands with its deliverable.
+#      L8   (runs before L6/L7) D5d standby skip-fill: a streaming standby of node0 (fully
+#           isolated cluster plane: own pgrac.conf, own IC port, own
+#           empty voting disks) learns the activation floor + active
+#           slot set ONLY from replayed JOIN records (checkpoint
+#           re-emission covers the backup window), sees committed
+#           primary data, and its snapshot carries no x16 phantom
+#           in-progress xids for the striped allocation gaps.
 #
 # IDENTIFICATION
 #    src/test/cluster_tap/t/347_cluster_6_15_xid_stripe_activation.pl
@@ -258,6 +264,100 @@ my $disk0;
 			"L5-i slot $n carries the PGXS magic on disk");
 		is($slot->{retired}, 0, "L5-ii slot $n is not retired");
 	}
+}
+
+# ----------
+# L8 — D5d: standby learns the stripe state from WAL and skip-fills.
+# ----------
+{
+	# Arm streaming on node0 only now (wal_level = replica from the start
+	# perturbs the L6 leave+removal timing — a pre-existing interaction
+	# unrelated to the stripe face; follow-up).  This leg runs BEFORE the
+	# removal (L6): node0's restart rejoins via the live node1 coordinator
+	# (the t/315 pattern); a lone-survivor restart with online_join = on
+	# after the peer's removal has no coordinator left to admit it — a
+	# pre-existing 5.15/5.18 interaction, follow-up.  initdb's default
+	# pg_hba already trusts local replication connections.
+	$node0->append_conf('postgresql.conf',
+		"wal_level = replica\nmax_wal_senders = 4\nmax_replication_slots = 4\n");
+	$node0->restart;
+	ok(poll_write_ok($node0, 'INSERT INTO t347_n0 VALUES (8)', 90,
+			'node0 write after streaming restart'),
+		'L8-0 node0 rejoins writable with streaming armed');
+
+	$node0->safe_psql('postgres',
+		q{SELECT pg_create_physical_replication_slot('s347')});
+	$node0->backup('b347');
+
+	my $standby = PostgreSQL::Test::Cluster->new('stripe_standby');
+	$standby->init_from_backup($node0, 'b347', has_streaming => 1);
+	$standby->append_conf('postgresql.conf', "primary_slot_name = 's347'\n");
+
+	# Fully isolate the standby's cluster plane: its own single-node
+	# pgrac.conf on a fresh IC port (never fights node0's identity) and
+	# its own empty voting disks (the stripe replay face must learn the
+	# activation ONLY from WAL — never from disks or local config).
+	my $ic_port = PostgreSQL::Test::Cluster::get_free_port();
+	my $ddir = $standby->data_dir;
+	open(my $fh, '>', "$ddir/pgrac.conf") or die "pgrac.conf: $!";
+	print $fh "[cluster]\nname = spec_6_15_stripe\n\n[node.0]\n"
+	  . "interconnect_addr = 127.0.0.1:$ic_port\n";
+	close $fh;
+	my $sdisk_dir = PostgreSQL::Test::Utils::tempdir();
+	my @sdisks;
+	for my $i (0 .. 2)
+	{
+		my $path = "$sdisk_dir/sdisk$i";
+		open(my $dh, '>', $path) or die "$path: $!";
+		binmode $dh;
+		print $dh ("\0" x (2 * 128 * 512));
+		close $dh;
+		push @sdisks, $path;
+	}
+	$standby->append_conf('postgresql.conf',
+		"cluster.voting_disks = '" . join(',', @sdisks) . "'\n");
+	$standby->start;
+
+	# an open write txn (real in-progress xid) + a committed one after it,
+	# leaving a striped allocation gap between their xids.
+	my $bg = $node0->background_psql('postgres');
+	$bg->query_safe('BEGIN');
+	$bg->query_safe('INSERT INTO t347_n0 VALUES (81)');
+	$node0->safe_psql('postgres', 'INSERT INTO t347_n0 VALUES (82)');
+	my $marker_rows = $node0->safe_psql('postgres',
+		'SELECT count(*) FROM t347_n0 WHERE v = 82');
+
+	$node0->wait_for_catchup($standby);
+
+	cmp_ok(log_count($standby, 'replay learned activation'), '>=', 1,
+		'L8-i standby learned the activation floor from replayed JOIN records');
+
+	is($standby->safe_psql('postgres', 'SELECT count(*) FROM t347_n0 WHERE v = 82'),
+		$marker_rows, 'L8-ii committed primary rows visible on the standby');
+
+	# snapshot phantom check: the striped gaps between node0's xids must
+	# NOT be filled as in-progress foreign-class xids.  With skip-fill the
+	# standby snapshot holds just the open txn (allow a little noise);
+	# the vanilla dense fill would hold ~16 per allocation gap.
+	my $snap = $standby->safe_psql('postgres', 'SELECT txid_current_snapshot()');
+	my (undef, undef, $xip) = split(/:/, $snap);
+	my $xip_count = defined($xip) && length($xip) ? scalar(split(/,/, $xip)) : 0;
+	cmp_ok($xip_count, '<=', 3,
+		"L8-iii standby snapshot has no x16 phantom fill (xip count $xip_count, snapshot $snap)");
+
+	# 8.A pin: the still-open primary txn's rows must NOT be visible on
+	# the standby — skip-fill may only drop classes that can never have
+	# been issued, never a real in-progress xid.
+	is($standby->safe_psql('postgres', 'SELECT count(*) FROM t347_n0 WHERE v = 81'),
+		'0', 'L8-iii-b open txn rows are invisible on the standby (8.A)');
+
+	$bg->query_safe('COMMIT');
+	$bg->quit;
+	$node0->wait_for_catchup($standby);
+	is($standby->safe_psql('postgres', 'SELECT count(*) FROM t347_n0 WHERE v = 81'),
+		'1', 'L8-iv the open txn becomes visible on the standby after commit');
+
+	$standby->stop;
 }
 
 # ----------
