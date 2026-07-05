@@ -879,6 +879,17 @@ cluster_remote_xact_shmem_size(void)
 {
 	return 0;
 }
+/* spec-6.15 D5b: xid stripe activation shmem (not exercised here). */
+Size cluster_xid_stripe_shmem_size(void);
+Size
+cluster_xid_stripe_shmem_size(void)
+{
+	return 0;
+}
+void cluster_xid_stripe_shmem_init(void);
+void
+cluster_xid_stripe_shmem_init(void)
+{}
 void cluster_remote_xact_shmem_request(void);
 void
 cluster_remote_xact_shmem_request(void)

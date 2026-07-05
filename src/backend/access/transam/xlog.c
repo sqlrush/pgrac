@@ -178,6 +178,7 @@
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
+#include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
 
@@ -7196,6 +7197,16 @@ CreateCheckPoint(int flags)
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_hw_authority_active())
 		cluster_hw_snapshot_checkpoint_write(checkPoint.redo);
+
+	/* PGRAC: spec-6.15 D5d -- re-emit the xid stripe JOIN record so any
+	 * replay window starting at this checkpoint learns the activation
+	 * floor + this node's active slot within one checkpoint distance.
+	 * ONLINE checkpoints only: a shutdown checkpoint must be the final
+	 * WAL record (the "concurrent write-ahead log activity" cross-check
+	 * below PANICs otherwise), and a boot after a clean shutdown
+	 * re-emits at gate-open anyway. */
+	if (!shutdown)
+		cluster_xid_stripe_checkpoint_reemit();
 #endif
 
 	START_CRIT_SECTION();

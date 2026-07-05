@@ -78,6 +78,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_retention.h" /* spec-3.12 D1: retention horizon */
+#include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5d: standby skip-fill */
 #endif
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
@@ -4604,7 +4605,30 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
 		 */
 		next_expected_xid = latestObservedXid;
 		TransactionIdAdvance(next_expected_xid);
-		KnownAssignedXidsAdd(next_expected_xid, xid, false);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: spec-6.15 D5d (F1a skip-fill) -- with xid striping
+		 * activated, a gap between observed xids is mostly OTHER
+		 * nodes' congruence classes, which this stream can never
+		 * assign.  Fill only classes the replayed JOIN records
+		 * declared active (plus everything below the activation
+		 * floor, the dense pre-striping history); always add the
+		 * observed xid itself unconditionally (it is real).  Without
+		 * replayed stripe knowledge the fill stays vanilla-dense. */
+		if (cluster_xid_stripe_replay_filter_active())
+		{
+			TransactionId fill_xid = next_expected_xid;
+
+			while (TransactionIdPrecedes(fill_xid, xid))
+			{
+				if (cluster_xid_stripe_replay_should_fill(fill_xid))
+					KnownAssignedXidsAdd(fill_xid, fill_xid, false);
+				TransactionIdAdvance(fill_xid);
+			}
+			KnownAssignedXidsAdd(xid, xid, false);
+		}
+		else
+#endif
+			KnownAssignedXidsAdd(next_expected_xid, xid, false);
 
 		/*
 		 * Now we can advance latestObservedXid

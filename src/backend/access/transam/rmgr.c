@@ -59,6 +59,7 @@
 #include "cluster/cluster_adg_xlog.h"			/* RM_CLUSTER_ADG_ID handlers */
 #include "cluster/storage/cluster_undo_xlog.h"	/* RM_CLUSTER_UNDO_ID handlers */
 #include "cluster/storage/cluster_raw_xlog.h"	/* RM_CLUSTER_RAW_LAYOUT_ID handlers */
+#include "cluster/cluster_xid_stripe_xlog.h" /* spec-6.15 xid stripe (D5d) */
 #endif
 
 /* must be kept in sync with RmgrData definition in xlog_internal.h */

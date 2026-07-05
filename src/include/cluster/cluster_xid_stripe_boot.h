@@ -156,6 +156,19 @@ extern bool cluster_xid_stripe_submit_retire(int32 target_node, uint64 owner_inc
  * seed this boot presents; consumed by the D5c slot claim). */
 extern uint64 cluster_qvotec_self_incarnation_value(void);
 
+/*
+ * D5d replay face: WAL redo publishes the replay-learned stripe
+ * knowledge (activation floor + active slot set); the hot-standby
+ * KnownAssignedXids gap-fill consumes it.  should_fill(xid) is TRUE
+ * for pre-striping history (below floor) and active classes; FALSE
+ * only for an above-floor value of an inactive class (which, by the
+ * per-thread WAL ordering invariant, was never issued).
+ */
+extern void cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot);
+extern void cluster_xid_stripe_replay_note_retire(int slot);
+extern bool cluster_xid_stripe_replay_filter_active(void);
+extern bool cluster_xid_stripe_replay_should_fill(TransactionId xid);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* FRONTEND */

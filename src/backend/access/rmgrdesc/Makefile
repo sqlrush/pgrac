@@ -14,6 +14,7 @@ OBJS = \
 	clogdesc.o \
 	clusteradgdesc.o \
 	clusterrawdesc.o \
+	clusterxidstripedesc.o \
 	clusterundodesc.o \
 	committsdesc.o \
 	dbasedesc.o \
