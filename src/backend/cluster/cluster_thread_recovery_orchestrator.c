@@ -550,11 +550,23 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 	 * live fail-closed would be invisible in thread_recovery_replay_failclosed).
 	 */
 	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK) {
+		/* spec-6.14 D9: window-derivation fail-closes were silent; a frozen
+		 * thread needs an operator trace (launches are reconfig-driven, so
+		 * these one-per-launch LOGs cannot spam). */
+		ereport(LOG,
+				(errmsg("cluster thread recovery: dead thread %u wal-state slot unreadable "
+						"-> BLOCKED (kept frozen)",
+						dead_tid)));
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
 	if (slot.checkpoint_redo_lsn == 0 || slot.highest_lsn == 0
 		|| slot.highest_lsn <= slot.checkpoint_redo_lsn) {
+		ereport(LOG,
+				(errmsg("cluster thread recovery: dead thread %u wal-state slot unusable "
+						"(checkpoint_redo %X/%X, highest %X/%X) -> BLOCKED (kept frozen)",
+						dead_tid, LSN_FORMAT_ARGS((XLogRecPtr)slot.checkpoint_redo_lsn),
+						LSN_FORMAT_ARGS((XLogRecPtr)slot.highest_lsn))));
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
@@ -572,6 +584,10 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 	 */
 	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &scan_upper)
 		!= CLUSTER_THREADREC_DONE) {
+		ereport(LOG,
+				(errmsg("cluster thread recovery: dead thread %u validated-end decode failed "
+						"(lower %X/%X, validated_min %X/%X) -> BLOCKED (kept frozen)",
+						dead_tid, LSN_FORMAT_ARGS(lower), LSN_FORMAT_ARGS(validated_min))));
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}

@@ -169,6 +169,32 @@ UT_TEST(test_remote_xact_unrelated_xinfo_not_blocked)
 
 
 /* ============================================================
+ * spec-6.14 D9: shared-catalog terminal predicate
+ * ============================================================ */
+
+UT_TEST(test_remote_xact_shared_catalog_terminal_predicate)
+{
+	/* Under cluster.shared_catalog the relfile / inval / stats side effects
+	 * execute for real, so they are no longer inputs to the predicate at all:
+	 * only subxacts and a caller-declared malformed xinfo bit block. */
+	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, 0,
+																   UT_XACT_XINFO_HAS_TWOPHASE));
+	/* subxact outcomes still fail closed (no per-subxact durable wrap proof) */
+	UT_ASSERT(cluster_remote_xact_terminal_blocked_shared_catalog(1, 0,
+																  UT_XACT_XINFO_HAS_TWOPHASE));
+	/* 2PC bit on a PLAIN record arm (disallowed mask carries it) blocks */
+	UT_ASSERT(cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_TWOPHASE,
+																  UT_XACT_XINFO_HAS_TWOPHASE));
+	/* the *_PREPARED arms pass disallowed=0: the expected 2PC bit is admitted */
+	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_TWOPHASE,
+																   0));
+	/* AE-lock bits are consumed (standby machinery), never blocking */
+	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_AE_LOCKS,
+																   UT_XACT_XINFO_HAS_TWOPHASE));
+}
+
+
+/* ============================================================
  * Outcome enum contract
  * ============================================================ */
 
@@ -236,7 +262,7 @@ UT_TEST(test_remote_xact_writer_denied_outside_scope)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_remote_xact_entry_width);
 	UT_RUN(test_remote_xact_origin_partition_disjoint);
 	UT_RUN(test_remote_xact_origin_no_cross_partition_overlap);
@@ -244,6 +270,7 @@ main(void)
 	UT_RUN(test_remote_xact_side_effects_blocked);
 	UT_RUN(test_remote_xact_prepared_commit_allows_2pc_lock_bits);
 	UT_RUN(test_remote_xact_unrelated_xinfo_not_blocked);
+	UT_RUN(test_remote_xact_shared_catalog_terminal_predicate);
 	UT_RUN(test_remote_xact_indoubt_is_zero);
 
 	UT_RUN(test_remote_xact_blocked_elevel_cold_is_fatal);

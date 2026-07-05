@@ -129,6 +129,30 @@ cluster_remote_xact_commit_prepared_blocked(int nrels, int nmsgs, int nstats, in
 }
 
 /*
+ * cluster_remote_xact_terminal_blocked_shared_catalog -- spec-6.14 D9 pure
+ * predicate: under cluster.shared_catalog the relfile-drop / invalidation /
+ * stats side effects of a foreign TERMINAL record (COMMIT / COMMIT PREPARED /
+ * ABORT / ABORT PREPARED) are executed for real against the shared tree, so
+ * they no longer make the record unmergeable.  What still blocks:
+ *
+ *	- subxact outcomes (nsubxacts > 0): no per-subxact durable TT wrap proof
+ *	  exists (the commit record's TT delta covers the top-level slot only), and
+ *	  a materialized COMMITTED entry without a wrap proof reads INDOUBT through
+ *	  the durable-checked path anyway -- materializing them would claim a
+ *	  usefulness the reader cannot honor.  Fail closed instead.
+ *	- any xinfo bit the calling arm declares malformed (2PC on a plain
+ *	  COMMIT/ABORT record; the *_PREPARED arms pass 0 because the 2PC bit is
+ *	  expected there).  AE-lock bits are consumed: standby lock release is
+ *	  hot-standby machinery with no merged-recovery analog.
+ */
+static inline bool
+cluster_remote_xact_terminal_blocked_shared_catalog(int nsubxacts, uint32 xinfo,
+													uint32 disallowed_xinfo)
+{
+	return nsubxacts > 0 || (xinfo & disallowed_xinfo) != 0;
+}
+
+/*
  * R13 (spec-4.11 3b-2): the elevel cluster_remote_xact_apply raises when a
  * foreign record cannot be materialized (multixact/commit_ts, an unsupported
  * commit/abort side effect, a missing SCN, or a 2PC/assignment record).
@@ -232,6 +256,9 @@ extern ClusterRemoteXactOutcome cluster_remote_commit_outcome(int origin_node, T
 /* Observation counters (D11 dump). */
 extern uint64 cluster_remote_xact_diverted_commit_count(void);
 extern uint64 cluster_remote_xact_diverted_abort_count(void);
+/* spec-6.14 D9: foreign terminal-record side effects executed for real. */
+extern uint64 cluster_remote_xact_side_effect_record_count(void);
+extern uint64 cluster_remote_xact_side_effect_drop_count(void);
 extern uint64 cluster_remote_xact_outcome_indoubt_count(void);
 
 #endif /* CLUSTER_REMOTE_XACT_H */

@@ -393,7 +393,15 @@ cluster_thread_recovery_drive(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr
 		 * Reset stats so a partial run never reports progress (8.A): a BLOCKED
 		 * has, by contract, recovered nothing.  The keep_frozen-vs-panic policy
 		 * is the orchestrator's (3b-2), not this mechanism's.
+		 *
+		 * spec-6.14 D9: LOG the demoted reason.  A silently-swallowed cause
+		 * left a frozen thread with zero operator trace; recovery launches are
+		 * reconfig-driven (not a poll loop), so this cannot spam.
 		 */
+		ereport(LOG,
+				(errmsg("cluster thread recovery: demoted a catchable error to BLOCKED "
+						"(dead thread %u): %s",
+						dead_tid, edata->message != NULL ? edata->message : "unknown")));
 		FlushErrorState();
 		FreeErrorData(edata);
 		if (stats)

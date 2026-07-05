@@ -1329,8 +1329,19 @@ LmonMain(void)
 				rdma_cm_fd = cluster_ic_rdma_lmon_cm_fd();
 				rdma_cq_fd = cluster_ic_rdma_lmon_completion_fd();
 
-				wes = CreateWaitEventSet(CurrentMemoryContext, 4 + 2 * CLUSTER_MAX_NODES);
+				wes = CreateWaitEventSet(CurrentMemoryContext, 5 + 2 * CLUSTER_MAX_NODES);
 				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+
+				/*
+				 * spec-6.14 D9 (found by the t/339 kill-9 leg): the tier1
+				 * transport loop waits HERE, not in the stub-mode WaitLatch
+				 * (which already has WL_EXIT_ON_PM_DEATH) -- without the
+				 * death event a SIGKILL'd postmaster left LMON looping on
+				 * heartbeat/reconnect ticks forever, pinning the shared
+				 * memory segment and blocking any restart of the node
+				 * ("pre-existing shared memory block is still in use").
+				 */
+				AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
 				if (listener_fd >= 0)
 					AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
 									  (void *)(intptr_t)-1);

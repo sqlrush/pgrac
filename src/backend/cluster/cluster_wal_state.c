@@ -488,6 +488,22 @@ static void
 mutate_checkpoint_redo(ClusterWalStateSlot *s, uint64 v)
 {
 	s->checkpoint_redo_lsn = v;
+
+	/*
+	 * spec-6.14 D9: raise the observational durable-write watermark alongside
+	 * the redo publish.  The watermark otherwise advances only on the
+	 * cluster_stats best-effort refresh tick, so a node that checkpoints and
+	 * then dies within one refresh interval leaves highest_lsn BELOW its own
+	 * checkpoint_redo_lsn -- and the thread-recovery window derivation
+	 * correctly treats an inverted slot as garbage and fail-closes, freezing
+	 * the dead thread forever.  The checkpoint completion has already
+	 * XLogFlush'd through the checkpoint record, so the flush pointer is a
+	 * PROVEN durable lower bound (>= the just-published redo) and strictly
+	 * sound for validated_min.  Monotonic max: never lower a fresher refresh.
+	 * CreateCheckPoint runs outside recovery only, so GetFlushRecPtr is legal.
+	 */
+	if ((uint64)GetFlushRecPtr(NULL) > s->highest_lsn)
+		s->highest_lsn = (uint64)GetFlushRecPtr(NULL);
 }
 
 static void

@@ -39,18 +39,23 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "miscadmin.h"
+#include "pgstat.h"			/* spec-6.14 D9: foreign commit-time stats drops */
 #include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
+#include "storage/md.h" /* spec-6.14 D9: DropRelationFiles */
 #include "storage/shmem.h"
+#include "storage/sinval.h"
 #include "storage/sync.h"
 #include "utils/elog.h"
+#include "utils/inval.h" /* spec-6.14 D9: ProcessCommittedInvalidationMessages */
 
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"				/* recovery_replay_observe (G6) */
+#include "cluster/cluster_sinval.h"				/* spec-6.14 D9: cluster-wide inval fanout */
 #include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority substrate */
 #include "cluster/cluster_tt_durable.h"			/* durable wrap cross-check (G6 P1 #2) */
 #include "cluster/storage/cluster_undo_xlog.h"	/* redo_stamp_slot (G6) */
@@ -86,6 +91,10 @@ typedef struct ClusterRemoteXactShared {
 	pg_atomic_uint64 diverted_commit_count;
 	pg_atomic_uint64 diverted_abort_count;
 	pg_atomic_uint64 outcome_indoubt_count;
+	/* spec-6.14 D9: foreign terminal-record side effects executed for real
+	 * under cluster.shared_catalog (records with any / relfiles dropped). */
+	pg_atomic_uint64 side_effect_record_count;
+	pg_atomic_uint64 side_effect_drop_count;
 } ClusterRemoteXactShared;
 
 static ClusterRemoteXactShared *RemoteXactShared = NULL;
@@ -155,6 +164,8 @@ cluster_remote_xact_shmem_init(void)
 		pg_atomic_init_u64(&RemoteXactShared->diverted_commit_count, 0);
 		pg_atomic_init_u64(&RemoteXactShared->diverted_abort_count, 0);
 		pg_atomic_init_u64(&RemoteXactShared->outcome_indoubt_count, 0);
+		pg_atomic_init_u64(&RemoteXactShared->side_effect_record_count, 0);
+		pg_atomic_init_u64(&RemoteXactShared->side_effect_drop_count, 0);
 
 		/*
 		 * Create the SLRU directory (postmaster-once).  Unlike pg_xact, this
@@ -537,6 +548,76 @@ cluster_remote_xact_commit_wrap_proof(int origin_node, TransactionId xid,
 }
 
 /*
+ * cluster_remote_xact_exec_side_effects -- spec-6.14 D9: execute the
+ *	cross-instance side effects a foreign TERMINAL record carries, against the
+ *	shared tree.  Only reached under cluster.shared_catalog (the caller gates);
+ *	with it off the record was already fail-closed by the P1-1 predicates.
+ *
+ *	Invalidation messages (commit records only):
+ *
+ *	  online  -- the survivor is live: apply them locally exactly as hot
+ *	  standby's xact_redo_commit does (ProcessCommittedInvalidationMessages
+ *	  resolves the init-file path from dbid/tsid itself), then fan them out
+ *	  cluster-wide so OTHER survivors drop their stale relcache/syscache
+ *	  entries too -- the origin died possibly between making its commit record
+ *	  durable and broadcasting its own sinval batch.  A full outbound queue
+ *	  fails closed (catchable here, so the R13 harness retries the episode).
+ *
+ *	  cold -- consume them: this mirrors vanilla crash recovery (standbyState
+ *	  == STANDBY_DISABLED skips ProcessCommittedInvalidationMessages).  No
+ *	  backend runs during startup replay, every cache is rebuilt afterwards,
+ *	  and pg_internal.init was already removed by RelationCacheInitFileRemove
+ *	  at startup -- a proven no-op, not a silent skip.
+ *
+ *	Relfile drops: vanilla xact_redo_commit issues XLogFlush(lsn) before the
+ *	irreversible unlink (WAL-first).  That lsn lives in the ORIGIN thread's
+ *	address space -- flushing it against the local WAL is meaningless and the
+ *	local insert position may numerically trail it (same rule as the spec-6.14
+ *	FlushBuffer foreign-LSN skip).  The equivalent guarantee holds
+ *	structurally: the terminal record mandating this drop was READ from the
+ *	origin's durable WAL thread on shared storage, and a crash before the
+ *	unlink completes re-merges the same window and re-drops it
+ *	(DropRelationFiles isRedo tolerates ENOENT, so an origin that already
+ *	unlinked before dying -- or a second node replaying the same window --
+ *	degrades to a no-op: the drop takes effect exactly once).
+ *
+ *	Stats drops: same as vanilla redo; per-node runtime stats entries for the
+ *	dropped objects on nodes that never replay this record are reconciled by
+ *	pgstat_vacuum_stat against the (shared) catalog.
+ */
+static void
+cluster_remote_xact_exec_side_effects(int nmsgs, SharedInvalidationMessage *msgs,
+									  bool initfileinval, Oid dbid, Oid tsid, int nrels,
+									  RelFileLocator *xlocators, int nstats,
+									  xl_xact_stats_item *stats, bool online)
+{
+	if (nmsgs <= 0 && nrels <= 0 && nstats <= 0)
+		return;
+
+	if (nmsgs > 0 && online) {
+		ProcessCommittedInvalidationMessages(msgs, nmsgs, initfileinval, dbid, tsid);
+
+		if (cluster_sinval_is_active() && !cluster_sinval_enqueue_batch(msgs, nmsgs))
+			ereport(cluster_remote_xact_blocked_elevel(online),
+					(errcode(ERRCODE_CLUSTER_SINVAL_QUEUE_FULL),
+					 errmsg("cluster sinval queue full while replaying a foreign commit's "
+							"invalidations"),
+					 errhint("Peers could not be told about the recovered catalog change; "
+							 "the recovery episode will be retried.")));
+	}
+
+	if (nrels > 0) {
+		DropRelationFiles(xlocators, nrels, true);
+		pg_atomic_fetch_add_u64(&RemoteXactShared->side_effect_drop_count, (uint64)nrels);
+	}
+
+	if (nstats > 0)
+		pgstat_execute_transactional_drops(nstats, stats, true);
+
+	pg_atomic_fetch_add_u64(&RemoteXactShared->side_effect_record_count, 1);
+}
+
+/*
  * cluster_remote_xact_apply -- D10b divert (P1-1 fail-closed parse).
  *
  *	online (spec-4.11 3b-2, R13): false = cold merged replay (startup) FATALs on
@@ -545,6 +626,12 @@ cluster_remote_xact_commit_wrap_proof(int origin_node, TransactionId xid,
  *	BLOCKED and the survivor keeps running.  The materializing branches
  *	(cluster_remote_xact_set) run only under the orchestrator's online-writer
  *	scope (R14).
+ *
+ *	spec-6.14 D9: under cluster.shared_catalog a terminal record's relfile /
+ *	invalidation / stats side effects EXECUTE (cluster_remote_xact_exec_side_
+ *	effects) instead of blocking; only subxact outcomes (and malformed 2PC
+ *	bits) still fail closed -- see
+ *	cluster_remote_xact_terminal_blocked_shared_catalog.
  */
 void
 cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
@@ -615,10 +702,19 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		 * (relfile drops, invalidations, stats drops, subxacts, 2PC,
 		 * AE locks) is unsupported on a foreign stream -- fail closed,
 		 * never silently dropped.
+		 *
+		 * spec-6.14 D9: under cluster.shared_catalog the relfile / inval /
+		 * stats side effects execute for real below, so only subxacts and a
+		 * malformed 2PC bit still block.
 		 */
-		if (cluster_remote_xact_commit_blocked(parsed.nrels, parsed.nmsgs, parsed.nstats,
-											   parsed.nsubxacts, parsed.xinfo,
-											   XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
+		if (cluster_shared_catalog
+				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
+																	  parsed.xinfo,
+																	  XACT_XINFO_HAS_TWOPHASE)
+				: cluster_remote_xact_commit_blocked(parsed.nrels, parsed.nmsgs, parsed.nstats,
+													 parsed.nsubxacts, parsed.xinfo,
+													 XACT_XINFO_HAS_TWOPHASE,
+													 XACT_XINFO_HAS_AE_LOCKS))
 			ereport(
 				blocked_elevel,
 				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -627,9 +723,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 						origin_node, xid),
 				 errdetail("nrels=%d nmsgs=%d nstats=%d nsubxacts=%d xinfo=0x%x.", parsed.nrels,
 						   parsed.nmsgs, parsed.nstats, parsed.nsubxacts, (unsigned)parsed.xinfo),
-				 errhint("Cross-instance relfile drop / invalidation / stats / subxacts / "
-						 "2PC are not yet mergeable (roadmap 4.6/4.7 + feature #11); "
-						 "recover with cluster.merged_recovery=off.")));
+				 errhint(cluster_shared_catalog
+							 ? "Foreign subtransaction outcomes are not yet materializable; "
+							   "recover with cluster.merged_recovery=off."
+							 : "Cross-instance relfile drop / invalidation / stats / subxacts / "
+							   "2PC are not yet mergeable (roadmap 4.6/4.7 + feature #11); "
+							   "recover with cluster.merged_recovery=off.")));
 
 		if (!SCN_VALID(parsed.scn))
 			ereport(blocked_elevel,
@@ -661,6 +760,14 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
 								commit_wrap_valid, commit_wrap);
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
+
+		/* spec-6.14 D9: execute the record's side effects (outcome first,
+		 * effects after -- mirror of xact_redo_commit's order). */
+		if (cluster_shared_catalog)
+			cluster_remote_xact_exec_side_effects(
+				parsed.nmsgs, parsed.msgs,
+				XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0, parsed.dbId, parsed.tsId,
+				parsed.nrels, parsed.xlocators, parsed.nstats, parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_COMMIT_PREPARED: {
@@ -679,9 +786,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 									 errhint("The prepared transaction xid must be present in the "
 											 "COMMIT PREPARED record body.")));
 
-		if (cluster_remote_xact_commit_prepared_blocked(
-				parsed.nrels, parsed.nmsgs, parsed.nstats, parsed.nsubxacts, parsed.xinfo,
-				XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
+		if (cluster_shared_catalog
+				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
+																	  parsed.xinfo, 0)
+				: cluster_remote_xact_commit_prepared_blocked(
+					  parsed.nrels, parsed.nmsgs, parsed.nstats, parsed.nsubxacts, parsed.xinfo,
+					  XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
 			ereport(
 				blocked_elevel,
 				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -690,9 +800,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 						origin_node, xid),
 				 errdetail("nrels=%d nmsgs=%d nstats=%d nsubxacts=%d xinfo=0x%x.", parsed.nrels,
 						   parsed.nmsgs, parsed.nstats, parsed.nsubxacts, (unsigned)parsed.xinfo),
-				 errhint("Cross-instance relfile drop / invalidation / stats / subxacts "
-						 "are not yet mergeable; recover with "
-						 "cluster.merged_recovery=off.")));
+				 errhint(cluster_shared_catalog
+							 ? "Foreign subtransaction outcomes are not yet materializable; "
+							   "recover with cluster.merged_recovery=off."
+							 : "Cross-instance relfile drop / invalidation / stats / subxacts "
+							   "are not yet mergeable; recover with "
+							   "cluster.merged_recovery=off.")));
 
 		if (!SCN_VALID(parsed.scn))
 			ereport(blocked_elevel,
@@ -709,6 +822,13 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
 								commit_wrap_valid, commit_wrap);
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
+
+		/* spec-6.14 D9: see the plain-commit arm. */
+		if (cluster_shared_catalog)
+			cluster_remote_xact_exec_side_effects(
+				parsed.nmsgs, parsed.msgs,
+				XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0, parsed.dbId, parsed.tsId,
+				parsed.nrels, parsed.xlocators, parsed.nstats, parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_ABORT: {
@@ -716,8 +836,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		xl_xact_parsed_abort parsed;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		if (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0
-			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0)
+		if (cluster_shared_catalog
+				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
+																	  parsed.xinfo,
+																	  XACT_XINFO_HAS_TWOPHASE)
+				: (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0
+				   || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0))
 			ereport(blocked_elevel,
 					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 					 errmsg("merged recovery: foreign abort record carries an unsupported "
@@ -730,6 +854,14 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
 								0);
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
+
+		/* spec-6.14 D9: an aborted xact's delete-on-abort relfiles (files it
+		 * CREATEd) are unlinked here if the origin died first; aborts carry
+		 * no invalidation messages. */
+		if (cluster_shared_catalog)
+			cluster_remote_xact_exec_side_effects(0, NULL, false, InvalidOid, InvalidOid,
+												  parsed.nrels, parsed.xlocators, parsed.nstats,
+												  parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_ABORT_PREPARED: {
@@ -745,7 +877,10 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 											origin_node, xid),
 									 errhint("The prepared transaction xid must be present in the "
 											 "ABORT PREPARED record body.")));
-		if (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0)
+		if (cluster_shared_catalog
+				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
+																	  parsed.xinfo, 0)
+				: (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0))
 			ereport(blocked_elevel,
 					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 					 errmsg("merged recovery: foreign prepared abort carries an unsupported "
@@ -757,6 +892,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
 								0);
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
+
+		/* spec-6.14 D9: see the plain-abort arm. */
+		if (cluster_shared_catalog)
+			cluster_remote_xact_exec_side_effects(0, NULL, false, InvalidOid, InvalidOid,
+												  parsed.nrels, parsed.xlocators, parsed.nstats,
+												  parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_PREPARE: {
@@ -815,6 +956,16 @@ uint64
 cluster_remote_xact_diverted_commit_count(void)
 {
 	return RemoteXactShared ? pg_atomic_read_u64(&RemoteXactShared->diverted_commit_count) : 0;
+}
+uint64
+cluster_remote_xact_side_effect_record_count(void)
+{
+	return RemoteXactShared ? pg_atomic_read_u64(&RemoteXactShared->side_effect_record_count) : 0;
+}
+uint64
+cluster_remote_xact_side_effect_drop_count(void)
+{
+	return RemoteXactShared ? pg_atomic_read_u64(&RemoteXactShared->side_effect_drop_count) : 0;
 }
 uint64
 cluster_remote_xact_diverted_abort_count(void)

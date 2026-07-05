@@ -63,6 +63,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h" /* RmgrId + RM_XACT_ID/RM_CLOG_ID/... for the visibility pass */
+#include "access/xact.h" /* spec-6.14 D9: ParseCommitRecord/ParseAbortRecord (missing-rel forget) */
 #include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
@@ -75,7 +76,7 @@
 #include "utils/memutils.h" /* MemoryContextAlloc for the touched-rel collector */
 
 #include "cluster/cluster_gcs_block.h"	 /* PI probe/snapshot/discard (spec-6.12h D-h3c) */
-#include "cluster/cluster_guc.h"		 /* cluster_past_image */
+#include "cluster/cluster_guc.h"		 /* cluster_past_image; spec-6.14 D9 shared_catalog gate */
 #include "cluster/cluster_xnode_lever.h" /* h_pi_recovery_base_* counters */
 
 #include "cluster/cluster_remote_xact.h" /* online visibility divert (spec-4.11 3b-2) */
@@ -158,6 +159,82 @@ cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched)
 }
 
 /*
+ * Deferred missing-relfile set (spec-6.14 D9).  Under cluster.shared_catalog a
+ * relation file legitimately vanishes mid-stream: the dead origin dropped it
+ * (a terminal record later in this SAME thread) and completed the unlink
+ * before dying.  The engine cannot know that at the page record -- PG redo has
+ * the same problem and solves it with the invalid-pages table
+ * (log_invalid_page / forget_invalid_pages).  Mirror that protocol: remember
+ * the locator, skip the block (a missing file is never written around), forget
+ * it when a later terminal record drops the relfilenode, and fail closed at
+ * end of drive if anything is left.
+ */
+typedef struct ClusterThreadMissingRels {
+	RelFileLocator *items;
+	int n;
+	int cap;
+} ClusterThreadMissingRels;
+
+static void
+missing_add(ClusterThreadMissingRels *missing, const RelFileLocator *rl)
+{
+	int i;
+
+	for (i = 0; i < missing->n; i++)
+		if (RelFileLocatorEquals(missing->items[i], *rl))
+			return; /* already deferred */
+
+	if (missing->n == missing->cap) {
+		int newcap = (missing->cap == 0) ? 8 : missing->cap * 2;
+
+		if (missing->items == NULL)
+			missing->items = (RelFileLocator *)palloc(sizeof(RelFileLocator) * newcap);
+		else
+			missing->items =
+				(RelFileLocator *)repalloc(missing->items, sizeof(RelFileLocator) * newcap);
+		missing->cap = newcap;
+	}
+	missing->items[missing->n++] = *rl;
+}
+
+/*
+ * missing_forget_dropped -- after the visibility pass consumed a foreign
+ *		RM_XACT record cleanly, remove from the deferred set every relfilenode
+ *		that record drops (the drop itself already executed inside
+ *		cluster_remote_xact_apply -> DropRelationFiles).
+ */
+static void
+missing_forget_dropped(ClusterThreadMissingRels *missing, XLogReaderState *reader)
+{
+	uint8 info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+	RelFileLocator *locs = NULL;
+	int nlocs = 0;
+	xl_xact_parsed_commit pc;
+	xl_xact_parsed_abort pa;
+	int i;
+
+	if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED) {
+		ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader), &pc);
+		locs = pc.xlocators;
+		nlocs = pc.nrels;
+	} else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED) {
+		ParseAbortRecord(XLogRecGetInfo(reader), (xl_xact_abort *)XLogRecGetData(reader), &pa);
+		locs = pa.xlocators;
+		nlocs = pa.nrels;
+	}
+
+	for (i = 0; i < nlocs; i++) {
+		int keep = 0;
+		int k;
+
+		for (k = 0; k < missing->n; k++)
+			if (!RelFileLocatorEquals(missing->items[k], locs[i]))
+				missing->items[keep++] = missing->items[k];
+		missing->n = keep;
+	}
+}
+
+/*
  * replay_one_block -- classify and (if TARGET) read-modify-write one block
  *		reference of one record against shared storage.
  *
@@ -188,8 +265,14 @@ cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched)
  *	proves the byte-for-byte equivalence of this rebuild).
  */
 static bool
+ *	missing (spec-6.14 D9): non-NULL only on the visibility-enabled
+ *	shared-catalog path; a missing-file block ref is then DEFERRED (recorded +
+ *	skipped) instead of an immediate BLOCKED -- see ClusterThreadMissingRels.
+ */
+static bool
 replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window_first_scn,
-				 ClusterThreadTouchedRels *touched, ClusterThreadReplayStats *st)
+				 ClusterThreadTouchedRels *touched, ClusterThreadMissingRels *missing,
+				 ClusterThreadReplayStats *st)
 {
 	RelFileLocator rl;
 	ForkNumber forknum;
@@ -220,6 +303,18 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window
 	nblocks = rel_exists ? smgrnblocks(reln, forknum) : 0;
 	cls = cluster_thread_replay_classify_block(1, rel_exists, blocknum, nblocks);
 	if (cls == CLUSTER_THREADREPLAY_BLK_BLOCKED) {
+		if (!rel_exists && missing != NULL) {
+			/*
+			 * spec-6.14 D9: defer the verdict (see ClusterThreadMissingRels).
+			 * The block apply is skipped entirely and the drive stays honest:
+			 * end of drive fails closed unless a later terminal record in
+			 * this stream dropped the relfilenode.  Beyond-EOF (rel_exists)
+			 * keeps the immediate fail-closed below.
+			 */
+			missing_add(missing, &rl);
+			st->blocks_missing_deferred++;
+			return true;
+		}
 		ereport(DEBUG2,
 				(errmsg_internal(
 					"thread recovery replay fail-closed: rel %u/%u/%u fork %d block %u %s",
@@ -355,6 +450,8 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 	bool saw_straddle = false;
 	bool reached;
 	SCN window_first_scn = InvalidScn; /* spec-6.12h D-h3c: PI self-containment judge */
+	ClusterThreadMissingRels missing = {NULL, 0, 0};
+	ClusterThreadMissingRels *missingp = NULL;
 
 	memset(&st, 0, sizeof(st));
 
@@ -363,6 +460,15 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 			*stats = st;
 		return CLUSTER_THREADREC_BLOCKED; /* invalid input -> fail-closed */
 	}
+
+	/*
+	 * spec-6.14 D9: only the visibility-enabled path can prove a missing file
+	 * legitimate (its terminal records execute the drops), and only under
+	 * cluster.shared_catalog do foreign terminal records drop for real.  The
+	 * data-only callers keep the immediate fail-closed.
+	 */
+	if (vis != NULL && vis->do_visibility && cluster_shared_catalog)
+		missingp = &missing;
 
 	for (;;) {
 		char *errormsg;
@@ -405,7 +511,7 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 		max_id = XLogRecMaxBlockId(reader);
 		for (block_id = 0; block_id <= max_id; block_id++) {
 			if (!replay_one_block(reader, (uint8)block_id, pagebuf.data, window_first_scn, touched,
-								  &st)) {
+								  missingp, &st)) {
 				record_blocked = true;
 				break;
 			}
@@ -432,8 +538,14 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 			RmgrId rmid = XLogRecGetRmid(reader);
 
 			if (rmid == RM_XACT_ID || rmid == RM_CLOG_ID || rmid == RM_MULTIXACT_ID
-				|| rmid == RM_COMMIT_TS_ID)
+				|| rmid == RM_COMMIT_TS_ID) {
 				cluster_remote_xact_apply(vis->origin_node, reader, true);
+
+				/* spec-6.14 D9: the record may have dropped relfiles whose
+				 * earlier page refs were deferred -- legitimize them now. */
+				if (rmid == RM_XACT_ID && missingp != NULL && missingp->n > 0)
+					missing_forget_dropped(missingp, reader);
+			}
 		}
 
 		/*
@@ -460,6 +572,22 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 		if (reader->EndRecPtr == scan_upper)
 			break;
 	}
+
+	/*
+	 * spec-6.14 D9: a deferred missing-relfile page ref that no later terminal
+	 * record in this stream dropped is real corruption -> fail closed, the
+	 * exact verdict the pre-deferral engine gave immediately.
+	 */
+	if (missing.n > 0) {
+		ereport(DEBUG2,
+				(errmsg_internal("thread recovery replay fail-closed: %d missing relation(s) "
+								 "never dropped by a later terminal record (first: %u/%u/%u)",
+								 missing.n, missing.items[0].spcOid, missing.items[0].dbOid,
+								 missing.items[0].relNumber)));
+		aborted = true;
+	}
+	if (missing.items != NULL)
+		pfree(missing.items);
 
 	if (stats)
 		*stats = st;
