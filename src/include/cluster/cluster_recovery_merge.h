@@ -112,6 +112,14 @@ cluster_recovery_record_class(RmgrId rmid, bool has_block_ref, bool first_block_
 		case RM_STANDBY_ID:
 		case RM_COMMIT_TS_ID:
 			return CLUSTER_RECMERGE_GLOBAL;
+		case RM_CLUSTER_XID_STRIPE_ID:
+			/* spec-6.15 stripe JOIN/RETIRE notes: cluster-wide logical
+			 * facts ("slot N joined at floor F / retired"), payload-only,
+			 * idempotent by slot.  A merger replaying BOTH threads builds
+			 * the complete stripe view in true SCN order -- exactly the G
+			 * contract.  (First co-run of merged recovery x xid striping;
+			 * pre-arm these fell through to U and 53RA3'd the merge.) */
+			return CLUSTER_RECMERGE_GLOBAL;
 		case RM_XLOG_ID:
 		case RM_RELMAP_ID:
 			/* XLOG housekeeping (checkpoint/fpw/...) + relmap are

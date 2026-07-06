@@ -221,6 +221,11 @@ UT_TEST(test_class_global)
 				 (int)CLUSTER_RECMERGE_GLOBAL);
 	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_COMMIT_TS_ID, false, false, true),
 				 (int)CLUSTER_RECMERGE_GLOBAL);
+	/* spec-6.15 stripe JOIN/RETIRE notes are cluster-wide idempotent facts:
+	 * G, applied on both the own and foreign paths (first co-run of merged
+	 * recovery x xid striping; pre-arm these 53RA3'd the merge). */
+	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_CLUSTER_XID_STRIPE_ID, false, false, true),
+				 (int)CLUSTER_RECMERGE_GLOBAL);
 }
 
 UT_TEST(test_class_local_noblock)
