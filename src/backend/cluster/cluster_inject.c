@@ -428,6 +428,14 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  a label-less authority boot drives the FATAL 53RB3 fail-closed
 	 *	  branch on a node whose on-disk anchor is actually healthy
 	 *	  (t/289 L-r5, L408 positive coverage of the fail-closed arm).
+	 *
+	 *	cluster-relmap-crash-after-stage / cluster-relmap-crash-before-publish:
+	 *	  Fire in the on-mode relmap write path (spec-6.14 D5, relmapper.c).
+	 *	  SKIP is a designed PANIC in the two crash-arbitration windows --
+	 *	  after the pending image is durable but before the commit record
+	 *	  (arbitration must DISCARD), and after the commit record but before
+	 *	  the publish (arbitration must PUBLISH).  Neither window is
+	 *	  reachable by natural SQL timing (t/344).
 	 */
 	{ .name = "cluster-gcs-block-invalidate-drop-broadcast" },
 	{ .name = "cluster-gcs-block-invalidate-stall-ack" },
@@ -435,6 +443,8 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
 	{ .name = "cluster-catalog-services-ready-force-closed" },
 	{ .name = "cluster-recovery-anchor-force-failclosed" },
+	{ .name = "cluster-relmap-crash-after-stage" },
+	{ .name = "cluster-relmap-crash-before-publish" },
 	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *

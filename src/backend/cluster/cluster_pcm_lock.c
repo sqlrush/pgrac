@@ -297,6 +297,10 @@ typedef struct ClusterPcmShared {
 	/* PGRAC: spec-6.14a D2 — local-master X-vs-remote-S arm: writer had no
 	 * local S residency, no provable-current carrier -> fail-closed count. */
 	pg_atomic_uint64 local_s_revoke_nonholder_failclosed_count;
+	/* PGRAC: spec-6.14 D5 — aux-context eviction (KO flush drain) could not
+	 * ride the GCS request wire; remote S release deferred, master keeps a
+	 * phantom-holder bit until the next acquire / GRD reclaim. */
+	pg_atomic_uint64 evict_release_deferred_aux_count;
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -1662,6 +1666,15 @@ cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 			   : 0;
 }
 
+/* PGRAC: spec-6.14 D5 — observability for the aux-deferred remote S release. */
+uint64
+cluster_pcm_get_evict_release_deferred_aux_count(void)
+{
+	return ClusterPcm != NULL
+			   ? pg_atomic_read_u64(&ClusterPcm->evict_release_deferred_aux_count)
+			   : 0;
+}
+
 uint64
 cluster_pcm_get_trans_x_to_n_downgrade_count(void)
 {
@@ -2347,6 +2360,28 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 	master_node = cluster_gcs_lookup_master(tag);
 
 	if (master_node != cluster_node_id) {
+		/*
+		 * PGRAC: spec-6.14 D5 — an aux-context eviction (the KO flush drain
+		 * dropping a whole relfilenode on a peer, spec-5.7 D6) has no
+		 * per-backend GCS request slot (MyBackendId is invalid), so it
+		 * cannot ride the request/reply wire.  Defer the remote S release:
+		 * the master keeps a stale S bit for this node -- the shipped
+		 * phantom-holder shape, where a forwarded read finds no resident
+		 * copy and falls back to shared storage, which IS current here (the
+		 * KO drain flushes before it drops, and an S copy is never ahead of
+		 * storage).  The bit self-heals on this node's next acquire of the
+		 * block or on GRD entry reclaim.  Only S can legitimately reach
+		 * this arm (X is single-holder and the DDL's cluster-wide AEL
+		 * excludes a live remote writer before any KO drop), so a tracked X
+		 * stays on the throwing wire path below.
+		 */
+		if (MyBackendId == InvalidBackendId && mode == PCM_LOCK_MODE_S) {
+			pg_atomic_fetch_add_u64(&ClusterPcm->evict_release_deferred_aux_count, 1);
+			elog(DEBUG1, "cluster_pcm: deferred remote S release for evicted buffer "
+				 "(aux context); master keeps a phantom-holder bit");
+			return;
+		}
+
 		if (mode == PCM_LOCK_MODE_S)
 			trans = PCM_TRANS_S_TO_N_RELEASE;
 		else if (mode == PCM_LOCK_MODE_X)
@@ -2716,6 +2751,7 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_n_release_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_cleanout_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->evict_release_deferred_aux_count, 0);
 	}
 
 	/*

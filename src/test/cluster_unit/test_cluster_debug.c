@@ -1123,6 +1123,11 @@ cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 	return 0;
 }
 uint64
+cluster_pcm_get_evict_release_deferred_aux_count(void)
+{
+	return 0;
+}
+uint64
 cluster_gcs_get_block_x_forward_sent_count(void)
 {
 	return 0;

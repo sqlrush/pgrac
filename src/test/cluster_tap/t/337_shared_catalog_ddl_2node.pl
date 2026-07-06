@@ -28,9 +28,12 @@
 #          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
 #          trigger case); disarm restores service.
 #      L5  (Q12 / §3.6 rejection face) CREATE UNLOGGED TABLE, ALTER TABLE
-#          SET UNLOGGED, CREATE DATABASE, CREATE TABLESPACE and mapped
-#          catalog rewrites (VACUUM FULL pg_class, D5 interim gate) refuse
-#          with feature_not_supported under shared_catalog=on.
+#          SET UNLOGGED, CREATE DATABASE and CREATE TABLESPACE refuse with
+#          feature_not_supported under shared_catalog=on.
+#      A3  (D5-activation) mapped-catalog rewrite works cluster-wide:
+#          node0 VACUUM FULL pg_class commits a new relfilenumber through
+#          the shared relmap authority (pending -> publish -> invalidation
+#          ack) and node1 adopts it and keeps reading the catalog.
 #      L6  (Q12 enable-time vet) a throwaway node with PRE-EXISTING unlogged
 #          storage refuses to boot with shared_catalog=on (init-fork vet
 #          FATAL, before any seed side effect).
@@ -406,15 +409,45 @@ isnt($rcu4, 0, 'L5: CREATE TABLESPACE is refused');
 like($erru4, qr/CREATE TABLESPACE is not supported with/,
 	'L5: CREATE TABLESPACE refusal is the explicit fail-closed message');
 
-# Mapped-catalog rewrite (spec-6.14 D5 interim gate): a VACUUM FULL of a
-# mapped catalog would rewrite only the local pg_filenode.map while the
-# peer keeps serving the stale mapping for the shared tree -- refused
-# until the relmap authority write path is activated.
-my ($rcu5, undef, $erru5) = $node0->psql('postgres', 'VACUUM FULL pg_class');
-isnt($rcu5, 0, 'L5: mapped catalog rewrite (VACUUM FULL pg_class) is refused');
-like($erru5,
-	qr/mapped catalog relation rewrite is not supported with cluster\.shared_catalog/,
-	'L5: mapped rewrite refusal is the explicit fail-closed message');
+# ----------
+# A3 (spec-6.14 D5-activation): mapped-catalog rewrite works CLUSTER-WIDE.
+# node0's VACUUM FULL pg_class commits a new relfilenumber through the
+# shared relmap authority (stage pending -> commit -> publish -> relmap
+# invalidation with the all-alive-peer ack barrier); the ack round
+# completes before VACUUM FULL returns, so node1's next command applies
+# the queued invalidation at AcceptInvalidationMessages and resolves the
+# NEW file.
+# ----------
+my $fn_before0 = $node0->safe_psql('postgres',
+	"SELECT pg_relation_filenode('pg_class')");
+my $fn_before1 = $node1->safe_psql('postgres',
+	"SELECT pg_relation_filenode('pg_class')");
+is($fn_before1, $fn_before0,
+	'A3: both nodes resolve the same pg_class relfilenumber before the rewrite');
+
+$node0->safe_psql('postgres', 'VACUUM FULL pg_class');
+
+my $fn_after0 = $node0->safe_psql('postgres',
+	"SELECT pg_relation_filenode('pg_class')");
+isnt($fn_after0, $fn_before0,
+	'A3: VACUUM FULL pg_class moved the mapped relfilenumber on node0');
+
+# node1 adopts the new mapping (bounded poll; the inval is already in its
+# local queue -- the ack barrier guaranteed that before VACUUM FULL
+# returned -- and a fresh backend/AIM picks it up).
+my $fn_after1 = '';
+foreach my $i (1 .. 100)
+{
+	$fn_after1 = $node1->safe_psql('postgres',
+		"SELECT pg_relation_filenode('pg_class')");
+	last if $fn_after1 eq $fn_after0;
+	usleep(100_000);
+}
+is($fn_after1, $fn_after0, 'A3: node1 adopts the new mapped relfilenumber');
+
+is($node1->safe_psql('postgres',
+	"SELECT count(*) FROM pg_class WHERE relname = 'q12_logged'"),
+	'1', 'A3: node1 reads catalog content through the rewritten pg_class');
 
 $node1->stop;
 $node0->stop;

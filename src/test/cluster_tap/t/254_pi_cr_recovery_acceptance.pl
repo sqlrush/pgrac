@@ -134,7 +134,7 @@ my %expect_cat = (
 	                       # cr_global_epoch_fallback_bump,
 	                       # cr_retention_horizon_advance_noted,
 	                       # cr_reconfig_intra_survived
-	pcm          => 21,    # 2.37 PI watermark + lock state
+	pcm          => 22,    # 2.37 PI watermark + lock state + 6.14 D5 aux-deferred release
 	                       # + spec-6.14a (b)-leg nonholder fail-closed counter
 );
 for my $cat (sort keys %expect_cat)

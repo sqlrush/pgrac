@@ -55,14 +55,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 21 keys (spec-2.30 + spec-6.14a D5)
+# L1: pg_cluster_state.pcm category has 22 keys (spec-2.30 + spec-6.14a D5 + spec-6.14 D5)
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-   '21',
-   'L1 pg_cluster_state.pcm category has 21 keys (spec-2.30 surface + spec-6.14a D5)');
+   '22',
+   'L1 pg_cluster_state.pcm category has 22 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5)');
 
 
 # ----------

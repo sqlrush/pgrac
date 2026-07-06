@@ -52,15 +52,15 @@
  *     broadcast STUB counter); spec-2.27 SI Broadcaster will turn
  *     it into a real wire send.
  *
- *   - Added an interim fail-closed gate in RelationMapUpdateMap():
- *     mapped-catalog relation rewrites (VACUUM FULL / CLUSTER /
- *     REINDEX of mapped rels) are rejected while
- *     cluster.shared_catalog is enabled, until the cluster relation
- *     map authority write path (pending/publish protocol) ships.
- *     Without it a mapped rewrite would update only the local
- *     pg_filenode.map while peers keep serving the stale mapping —
- *     a silent lost-write / wrong-relfilenode read across nodes.
- *     Spec: spec-6.14-shared-catalog-single-authority.md (D5).
+ *   - perform_relmap_update() commits through the shared relmap
+ *     AUTHORITY under cluster.shared_catalog=on (the pending/publish
+ *     protocol: cluster_perform_relmap_update stages pre-commit,
+ *     AtEOXact_ClusterRelmapPublish publishes + invalidates
+ *     post-commit, AtAbort_ClusterRelmapPending discards on abort).
+ *     The earlier interim fail-closed gate in RelationMapUpdateMap()
+ *     is gone: mapped-catalog rewrites (VACUUM FULL / CLUSTER /
+ *     REINDEX of mapped rels) are supported cluster-wide.
+ *     Spec: spec-6.14-shared-catalog-single-authority.md (D5, §3.2).
  *
  *   - read_relmap_file() reads the shared relmap AUTHORITY instead of
  *     the local pg_filenode.map under cluster.shared_catalog=on
@@ -131,6 +131,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
+#include "cluster/cluster_inject.h"	  /* crash-window test levers (D5) */
 #include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
 #include "cluster/cluster_reconfig.h"	  /* observed epoch for the owner header */
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
@@ -434,27 +435,6 @@ RelationMapUpdateMap(Oid relationId, RelFileNumber fileNumber, bool shared,
 
 		if (IsInParallelMode())
 			elog(ERROR, "cannot change relation mapping in parallel mode");
-
-#ifdef USE_PGRAC_CLUSTER
-
-		/*
-		 * PGRAC MODIFICATIONS (spec-6.14 D5): mapped-catalog rewrites are
-		 * rejected under cluster.shared_catalog until the cluster relation
-		 * map authority write path (pending/publish) is activated.  A local
-		 * pg_filenode.map update would leave every peer serving the stale
-		 * mapping for the shared tree: their relcache rebuilds would open
-		 * the OLD relfilenumber — a silent cross-node lost write.  Explicit
-		 * fail-closed refusal until then; WAL replay (relmap_redo) and
-		 * bootstrap are not affected.
-		 */
-		if (cluster_shared_catalog)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("mapped catalog relation rewrite is not supported with cluster.shared_catalog"),
-					 errhint("VACUUM FULL, CLUSTER, and REINDEX on mapped system "
-							 "catalogs require the cluster relation map write "
-							 "path, which is not yet activated.")));
-#endif
 
 		if (immediate)
 		{
@@ -1477,6 +1457,17 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 	arm->dbid = dbid;
 	arm->generation = newgen;
 	ForceSyncCommit();
+
+	/*
+	 * Test-only crash lever (t/344): die AFTER the pending image is durable
+	 * but BEFORE the commit record -- arbitration must DISCARD (the owner
+	 * xid never committed).  SKIP-armed => designed fail-stop.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-relmap-crash-after-stage");
+	if (cluster_injection_should_skip("cluster-relmap-crash-after-stage"))
+		ereport(PANIC,
+				(errmsg("cluster-relmap-crash-after-stage injection: dying with a "
+						"staged, uncommitted relmap pending image")));
 }
 
 /*
@@ -1495,6 +1486,19 @@ AtEOXact_ClusterRelmapPublish(void)
 	if (!cluster_relmap_publish_arms[0].armed &&
 		!cluster_relmap_publish_arms[1].armed)
 		return;
+
+	/*
+	 * Test-only crash lever (t/344): die AFTER the commit record is durable
+	 * but BEFORE the publish -- arbitration must PUBLISH (the owner xid
+	 * committed).  Checked only when this transaction actually staged
+	 * (after the fast no-op return above), so arming never touches
+	 * unrelated commits.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-relmap-crash-before-publish");
+	if (cluster_injection_should_skip("cluster-relmap-crash-before-publish"))
+		ereport(PANIC,
+				(errmsg("cluster-relmap-crash-before-publish injection: dying with "
+						"a committed, unpublished relmap pending image")));
 
 	for (slot = 0; slot < 2; slot++)
 	{

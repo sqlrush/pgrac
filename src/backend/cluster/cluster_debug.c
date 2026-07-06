@@ -1721,6 +1721,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 * emitted here so the category groups stay contiguous). */
 	emit_row(rsinfo, "pcm", "local_s_revoke_nonholder_failclosed_count",
 			 fmt_int64((int64)cluster_pcm_get_local_s_revoke_nonholder_failclosed_count()));
+	emit_row(rsinfo, "pcm", "evict_release_deferred_aux_count",
+			 fmt_int64((int64)cluster_pcm_get_evict_release_deferred_aux_count()));
 }
 
 
