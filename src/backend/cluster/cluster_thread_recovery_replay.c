@@ -263,8 +263,7 @@ missing_forget_dropped(ClusterThreadMissingRels *missing, XLogReaderState *reade
  * Why: the PI shortcut recovers the block without an FPI in the window and
  *	without depending on a stale storage base (the D-h3b differential t/349
  *	proves the byte-for-byte equivalence of this rebuild).
- */
-static bool
+ *
  *	missing (spec-6.14 D9): non-NULL only on the visibility-enabled
  *	shared-catalog path; a missing-file block ref is then DEFERRED (recorded +
  *	skipped) instead of an immediate BLOCKED -- see ClusterThreadMissingRels.
