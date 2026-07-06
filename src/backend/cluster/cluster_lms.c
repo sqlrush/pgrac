@@ -299,7 +299,7 @@ cluster_lms_wait_for_ready(int timeout_ms)
 	 * bufmgr extend / dl_lock / ko_lock are all backend contexts).  The
 	 * former "Assert(!IsUnderPostmaster)" predated the second caller and
 	 * SIGABRTed any backend that hit the peer-alive + LMS-not-READY
-	 * window under cassert (first reproduced by t/337's A1 INSERT with
+	 * window under cassert (first reproduced by t/353's A1 INSERT with
 	 * lms_enabled left off).  The body only polls shmem state and
 	 * sleeps, which is safe in both contexts.
 	 */

@@ -185,7 +185,7 @@ bool cluster_gcs_block_local_cache = false;
 
 /* spec-6.12a stubs — the local-master S->X upgrade path is only reached with
  * the wave GUC on (default off here, so the branch is inert); provide inert
- * link-surface satisfaction.  Real coverage is t/336 (2-node). */
+ * link-surface satisfaction.  Real coverage is t/352 (2-node). */
 bool cluster_read_scache = false;
 
 bool cluster_gcs_block_local_x_upgrade(BufferTag tag);

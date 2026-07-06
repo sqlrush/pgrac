@@ -6,7 +6,7 @@
  *
  *	  U-d coverage (the pure bookkeeping half; the cross-node
  *	  non-overlap of the ranges themselves is inherited from the durable
- *	  HW authority and exercised end-to-end by cluster_tap t/337):
+ *	  HW authority and exercised end-to-end by cluster_tap t/353):
  *	    1) inactive gate: consume/install are no-ops when the GUC is off
  *	       or shmem is absent.
  *	    2) install/consume roundtrip: parked range hands back exactly

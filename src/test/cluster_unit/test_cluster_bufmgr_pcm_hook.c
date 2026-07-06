@@ -80,7 +80,7 @@ bool cluster_gcs_block_local_cache = true;
 
 /* spec-6.12a stubs — the local-master S->X upgrade branch is wave-gated off
  * (cluster_read_scache default false), so it is inert here; provide inert
- * link-surface satisfaction.  Real coverage is t/336 (2-node). */
+ * link-surface satisfaction.  Real coverage is t/352 (2-node). */
 bool cluster_read_scache = false;
 
 bool cluster_gcs_block_local_x_upgrade(BufferTag tag);

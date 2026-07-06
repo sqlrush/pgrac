@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 336_cluster_6_12a_read_scache.pl
+# 352_cluster_6_12a_read_scache.pl
 #	  spec-6.12 wave a -- quiescent-block S-cache behavioural TAP on a
 #	  2-node ClusterPair (phantom-shared plain-heap table, t/334
 #	  pattern).  node0 writes (holds X); node1 reads cross-node.
@@ -42,7 +42,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/336_cluster_6_12a_read_scache.pl
+#	  src/test/cluster_tap/t/352_cluster_6_12a_read_scache.pl
 #
 #-------------------------------------------------------------------------
 

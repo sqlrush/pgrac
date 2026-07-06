@@ -88,7 +88,7 @@ usleep(3_000_000);
 my $n0 = $pair->node0;
 my $n1 = $pair->node1;
 
-# same-DDL/same-relfilenode harness (t/339 convention): identical DDL in the
+# same-DDL/same-relfilenode harness (t/355 convention): identical DDL in the
 # same order on both nodes maps both catalogs onto the same shared file.
 $n0->safe_psql('postgres', 'CREATE TABLE pp_t (id int, v int)');
 $n1->safe_psql('postgres', 'CREATE TABLE pp_t (id int, v int)');

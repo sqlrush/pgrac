@@ -798,7 +798,7 @@ test_cluster_reverse_key: test_cluster_reverse_key.c unit_test.h $(CLUSTER_REVER
 # test_cluster_hw_lease links cluster_hw_lease.o standalone (spec-6.12d
 # U-d): locks the slot-table bookkeeping (install/consume roundtrip, pair
 # isolation, replacement/LRU orphan accounting).  LWLock/shmem stubbed
-# (single-threaded); the real cross-node path is cluster_tap t/337.
+# (single-threaded); the real cross-node path is cluster_tap t/353.
 CLUSTER_HW_LEASE_O = $(top_builddir)/src/backend/cluster/cluster_hw_lease.o
 test_cluster_hw_lease: test_cluster_hw_lease.c unit_test.h $(CLUSTER_HW_LEASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

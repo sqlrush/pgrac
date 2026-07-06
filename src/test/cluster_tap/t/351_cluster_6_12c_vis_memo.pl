@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 335_cluster_6_12c_vis_memo.pl
+# 351_cluster_6_12c_vis_memo.pl
 #	  spec-6.12 wave c -- resolver terminal-outcome memo behavioural TAP
 #	  on a 2-node ClusterPair (phantom-shared plain-heap table, t/334
 #	  pattern: identical DDL on both nodes -> coincident relfilepath;
@@ -28,7 +28,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/335_cluster_6_12c_vis_memo.pl
+#	  src/test/cluster_tap/t/351_cluster_6_12c_vis_memo.pl
 #
 #-------------------------------------------------------------------------
 
