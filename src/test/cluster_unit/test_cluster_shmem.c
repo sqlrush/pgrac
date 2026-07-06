@@ -533,6 +533,13 @@ void
 cluster_oid_lease_shmem_register(void)
 {}
 
+/* spec-6.14 D10b stub: cluster_init_shmem_module also calls
+ * cluster_catalog_stats_shmem_register (cluster_catalog_stats.c); the unit
+ * harness does not link that object, so provide a no-op. */
+void
+cluster_catalog_stats_shmem_register(void)
+{}
+
 /* spec-5.5 D8 stub: cluster_init_shmem_module also calls
  * cluster_advisory_shmem_register (cluster_advisory.c); the unit harness does
  * not link that object, so provide a no-op. */

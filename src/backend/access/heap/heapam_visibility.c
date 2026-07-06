@@ -96,6 +96,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* spec-3.2 D5:  MVCC cluster visibility fork. */
+#include "cluster/cluster_catalog_stats.h"		/* vis_unknown counter (spec-6.14 D10b) */
 #include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
@@ -2018,6 +2019,10 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	if (cluster_shared_catalog && cluster_enabled && BufferIsValid(buffer)
 		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_LOCAL
 		&& cluster_tuple_has_remote_evidence(buffer, tuple))
+	{
+		/* spec-6.14 D10b: count the fail-closed outcome (dump key
+		 * catalog.vis_unknown_count) before raising. */
+		cluster_catalog_stats_vis_unknown_inc();
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 				 errmsg("foreign-origin tuple cannot be judged under a LOCAL snapshot "
@@ -2025,6 +2030,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				 errhint("Catalog services on this node are not ready yet (starting up, "
 						 "shutting down, or in recovery); retry once the cluster reaches "
 						 "the RUNNING phase.")));
+	}
 #endif /* USE_PGRAC_CLUSTER */
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {

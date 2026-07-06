@@ -633,6 +633,15 @@ typedef enum {
 	 */
 	WAIT_EVENT_CLUSTER_OID_LEASE,
 	WAIT_EVENT_CLUSTER_RELMAP_WRITE,	/* spec-6.14 D5: relmap authority write lock */
+
+	/*
+	 * spec-6.14 D10b:  a catalog-page tuple is being resolved through the
+	 * cluster visibility path (ITL/TT evidence; may consult the per-origin
+	 * durable outcome store).  Only unhinted or foreign-evidence catalog
+	 * tuples reach the resolver, so time here means cross-node catalog MVCC
+	 * work, not routine catalog scans.
+	 */
+	WAIT_EVENT_CLUSTER_CATALOG_VIS_RESOLVE,
 } WaitEventCluster;
 
 

@@ -43,6 +43,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
@@ -1134,6 +1135,27 @@ cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 }
 uint64
 cluster_pcm_get_evict_release_deferred_aux_count(void)
+{
+	return 0;
+}
+/* spec-6.14 D10b catalog counters (cluster_catalog_stats.o not linked) */
+uint64
+cluster_catalog_stats_vis_resolve_count(void)
+{
+	return 0;
+}
+uint64
+cluster_catalog_stats_vis_unknown_count(void)
+{
+	return 0;
+}
+uint64
+cluster_catalog_stats_buf_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_catalog_stats_buf_miss_count(void)
 {
 	return 0;
 }

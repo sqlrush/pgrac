@@ -10,8 +10,12 @@
  *	  from.  "Seed if absent" makes this idempotent: the seed node (authority
  *	  absent) creates it, a join node (authority present) skips it.
  *
- *	  The relmap-authority seed and the catalog-file migration/adoption (the
- *	  rest of D2) land with D2b/D2c and D5-activation.
+ *	  cluster_catalog_migrate_tree() (called below) then establishes the
+ *	  shared catalog relation tree and the relmap authority: the seed node
+ *	  copies its catalog files in and publishes the authority marker last;
+ *	  a join node adopts the existing tree behind sysid + catalog-version
+ *	  vets.  pgrac-init --cluster-seed/--cluster-join wire the GUC set and
+ *	  provision joiner data directories around this boot-time contract.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

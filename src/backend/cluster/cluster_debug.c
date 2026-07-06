@@ -127,6 +127,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
 #include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
 #include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
+#include "cluster/cluster_catalog_stats.h"	 /* catalog counters (spec-6.14 D10b) */
 #include "cluster/cluster_oid_lease.h"		 /* catalog category (spec-6.14 D10) */
 #include "cluster/cluster_relmap_authority.h" /* relmap authority state (spec-6.14 D5) */
 #include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
@@ -3034,6 +3035,20 @@ dump_catalog(ReturnSetInfo *rsinfo)
 			 fmt_int64(rmok ? (int64)rmhdr.pending_generation : 0));
 	emit_row(rsinfo, "catalog", "relmap_shared_pending_owner_node",
 			 fmt_int64(rmok ? (int64)rmhdr.owner_node : -1));
+
+	/*
+	 * D10b shared-catalog data-plane counters: cluster-path visibility
+	 * resolutions of catalog-page tuples, their fail-closed (53R97-family)
+	 * outcomes, and catalog-page buffer traffic.
+	 */
+	emit_row(rsinfo, "catalog", "vis_resolve_count",
+			 fmt_int64((int64)cluster_catalog_stats_vis_resolve_count()));
+	emit_row(rsinfo, "catalog", "vis_unknown_count",
+			 fmt_int64((int64)cluster_catalog_stats_vis_unknown_count()));
+	emit_row(rsinfo, "catalog", "buf_hit_count",
+			 fmt_int64((int64)cluster_catalog_stats_buf_hit_count()));
+	emit_row(rsinfo, "catalog", "buf_miss_count",
+			 fmt_int64((int64)cluster_catalog_stats_buf_miss_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

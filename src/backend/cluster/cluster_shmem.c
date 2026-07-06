@@ -71,6 +71,7 @@
 #include "cluster/cluster_epoch.h"		   /* cluster_epoch_shmem_register (2.4) */
 #include "cluster/cluster_scn.h"		   /* cluster_scn_shmem_register (1.15) */
 #include "cluster/cluster_sequence.h"	   /* cluster_sequence_shmem_register (spec-5.4 D1) */
+#include "cluster/cluster_catalog_stats.h" /* cluster_catalog_stats_shmem_register (spec-6.14 D10b) */
 #include "cluster/cluster_oid_lease.h"	   /* cluster_oid_lease_shmem_register (spec-6.14 D6) */
 #include "cluster/cluster_hw.h"			   /* cluster_hw_shmem_register (spec-5.7 D1) */
 #include "cluster/cluster_xnode_profile.h" /* cluster_xnode_profile_shmem_register (spec-5.59 D1) */
@@ -815,6 +816,10 @@ cluster_init_shmem_module(void)
 	/* spec-6.14 D6: register the shared-catalog OID lease region. */
 	if (cluster_shmem_lookup_region("pgrac cluster oid lease") == NULL)
 		cluster_oid_lease_shmem_register();
+
+	/* spec-6.14 D10b: register the shared-catalog observability counters. */
+	if (cluster_shmem_lookup_region("pgrac cluster catalog stats") == NULL)
+		cluster_catalog_stats_shmem_register();
 
 	/* spec-5.7 D1: register HW relation-extend block-number authority region. */
 	if (cluster_shmem_lookup_region("pgrac cluster hw") == NULL)

@@ -36,7 +36,9 @@
 #include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/wait_event.h"			/* spec-6.14 D10b ClusterCatalogVisResolve */
 
+#include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b counters */
 #include "cluster/cluster_cr.h" /* spec-6.15 D4: underivable counter */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"				/* cluster_node_id, subtrans depth */
@@ -518,6 +520,7 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	Page page;
 	ClusterUndoTTSlotRef ref;
 	XLogRecPtr anchor_lsn;
+	bool		is_catalog_page = false;
 
 	if (out == NULL)
 		return;
@@ -534,6 +537,29 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	page = BufferGetPage(buffer);
 	if (!PageHasItl(page))
 		return;
+
+	/*
+	 * spec-6.14 D10b: catalog-page resolutions are the shared-catalog
+	 * cross-node MVCC surface -- count them and advertise the (possibly
+	 * remote-consulting) classification under a dedicated wait event.
+	 * Only unhinted / foreign-evidence tuples reach the resolver, so the
+	 * counter bump is off any hot path.
+	 */
+	if (cluster_shared_catalog)
+	{
+		RelFileLocator rlocator;
+		ForkNumber	forknum;
+		BlockNumber blknum;
+
+		BufferGetTag(buffer, &rlocator, &forknum, &blknum);
+		is_catalog_page =
+			rlocator.relNumber < (RelFileNumber) FirstNormalObjectId;
+	}
+	if (is_catalog_page)
+	{
+		cluster_catalog_stats_vis_resolve_inc();
+		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CATALOG_VIS_RESOLVE);
+	}
 
 	/* spec-4.8 D2: the tuple's page LSN is the recovered_through anchor for the
 	 * cross-node TT authority gate (classify_ref). */
@@ -568,6 +594,19 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 		}
 		break;
 	}
+	}
+
+	/*
+	 * spec-6.14 D10b: a STALE/AMBIGUOUS verdict on a catalog page is the
+	 * fail-closed outcome -- the caller raises the 53R97-family ERROR
+	 * rather than guessing (the fail-closed posture itself is untouched;
+	 * this only counts it).
+	 */
+	if (is_catalog_page)
+	{
+		pgstat_report_wait_end();
+		if (out->evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+			cluster_catalog_stats_vis_unknown_inc();
 	}
 }
 

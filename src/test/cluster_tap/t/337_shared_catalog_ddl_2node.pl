@@ -449,6 +449,25 @@ is($node1->safe_psql('postgres',
 	"SELECT count(*) FROM pg_class WHERE relname = 'q12_logged'"),
 	'1', 'A3: node1 reads catalog content through the rewritten pg_class');
 
+# ----------
+# D10b: the shared-catalog data-plane counters moved during the run.
+# node1 consumed node0's DDL all test long, so it must have resolved
+# foreign-origin catalog tuples (the path the ClusterCatalogVisResolve
+# wait event wraps) and sourced catalog pages into its cache.
+# ----------
+my %cat = split /\|/, $node1->safe_psql('postgres',
+	"SELECT string_agg(key || '|' || value, '|') FROM pg_cluster_state "
+	. "WHERE category = 'catalog' AND key IN ('vis_resolve_count', "
+	. "'vis_unknown_count', 'buf_hit_count', 'buf_miss_count')");
+cmp_ok($cat{vis_resolve_count}, '>', 0,
+	'D10b: node1 resolved foreign catalog tuples through the cluster path');
+cmp_ok($cat{vis_unknown_count}, '>=', 0,
+	'D10b: fail-closed counter present (zero on this healthy run)');
+cmp_ok($cat{buf_hit_count}, '>', 0,
+	'D10b: catalog-page buffer hits counted on node1');
+cmp_ok($cat{buf_miss_count}, '>', 0,
+	'D10b: catalog-page buffer misses counted on node1 (pages sourced)');
+
 $node1->stop;
 $node0->stop;
 

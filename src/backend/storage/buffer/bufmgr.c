@@ -54,6 +54,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b — catalog buf hit/miss */
 #include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
@@ -1195,6 +1196,25 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
 				 mode == RBM_ZERO_ON_ERROR)
 			pgBufferUsage.shared_blks_read++;
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * spec-6.14 D10b: catalog-page buffer traffic under the shared
+		 * catalog (dump keys catalog.buf_hit_count / buf_miss_count).  A
+		 * miss is a catalog page sourced from shared storage or a
+		 * cross-node CF transfer -- the cache-locality signal the A-L9
+		 * observability leg watches.
+		 */
+		if (cluster_shared_catalog &&
+			smgr->smgr_rlocator.locator.relNumber <
+			(RelFileNumber) FirstNormalObjectId)
+		{
+			if (found)
+				cluster_catalog_stats_buf_hit_inc();
+			else
+				cluster_catalog_stats_buf_miss_inc();
+		}
+#endif
 	}
 
 	/* At this point we do NOT hold any locks. */

@@ -1512,6 +1512,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_RELMAP_WRITE:
 		event_name = "ClusterRelmapWrite";
 		break;
+	case WAIT_EVENT_CLUSTER_CATALOG_VIS_RESOLVE:
+		event_name = "ClusterCatalogVisResolve";
+		break;
 	default:
 		break;
 	}

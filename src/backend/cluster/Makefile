@@ -159,6 +159,7 @@ OBJS = \
 	cluster_scn.o \
 	cluster_catalog_bootstrap.o \
 	cluster_catalog_migrate.o \
+	cluster_catalog_stats.o \
 	cluster_oid_lease.o \
 	cluster_oid_lease_shmem.o \
 	cluster_relmap_arb.o \
