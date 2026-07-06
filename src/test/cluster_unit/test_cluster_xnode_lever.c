@@ -78,6 +78,7 @@ bool cluster_page_scn_shortcut = false;
 bool cluster_read_scache = false;
 bool cluster_block_self_contained = false;
 bool cluster_ges_bast = false;
+bool cluster_past_image = false;
 bool cluster_xnode_profile_enabled = false;
 
 /* Backend identity: the memo stamps entries with MyProc->lxid. */

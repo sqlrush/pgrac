@@ -191,6 +191,10 @@ extern bool cluster_block_self_contained;
  * off = e1 release-side handoff only). */
 extern bool cluster_ges_bast;
 
+/* spec-6.12h: keep a Past Image on block transfer/invalidate (default
+ * off = flush + drop the copy). */
+extern bool cluster_past_image;
+
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * (undo-block CF fetch + live authority gate; default off = 53R97). */
 extern bool cluster_crossnode_runtime_visibility;

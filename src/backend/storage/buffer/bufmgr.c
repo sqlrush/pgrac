@@ -58,6 +58,7 @@
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
+#include "cluster/cluster_xnode_lever.h"	/* spec-6.12h — PI keep counter */
 #include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
@@ -507,6 +508,10 @@ static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void BufferSync(int flags);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: spec-6.12h D-h1 — Past Image conversion (definition below). */
+static bool cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state);
+#endif
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
@@ -7281,8 +7286,60 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		return false;
 	}
 	buf->pcm_state = (uint8) PCM_STATE_N;
+
+	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
+	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
+		return true;
+
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
+	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12h D-h1 (AD-002 PI orthogonal
+ * state activation).
+ *
+ *   cluster_bufmgr_convert_to_pi_locked(buf, buf_state) — with
+ *   cluster.past_image on and the buffer unpinned, convert the outgoing
+ *   copy into a Past Image INSTEAD of InvalidateBuffer: clear BM_VALID and
+ *   every dirty-tracking flag, stamp buffer_type = BUF_TYPE_PI, and keep
+ *   the tag mapping + page bytes intact.  Returns true when it converted
+ *   (header lock released); false when the caller must fall back to the
+ *   plain drop (GUC off, or the buffer is pinned — a PI is fail-safe by
+ *   contract, so ANY doubt falls back to today's InvalidateBuffer).
+ *
+ *   Why this exact flag shape is the never-serve-read guard (§3.4b hard
+ *   invariant): PG's BufTable holds ONE buffer per tag, so an Oracle-style
+ *   PI+current pair cannot coexist; a BM_TAG_VALID/!BM_VALID buffer is
+ *   native PG for "mapping exists, content needs IO" — every reader treats
+ *   it as a miss (StartBufferIO + re-read/install overwrite the bytes =
+ *   the implicit discard), the checkpointer/bgwriter skip it (!BM_DIRTY;
+ *   never flushing a PI is ALSO the no-stale-flush 8.A contract: shared
+ *   storage must not be clobbered under the new holder), and clock-sweep
+ *   eviction may reuse it at any time (dropping a PI only loses the D-h3
+ *   recovery shortcut, never correctness — storage + full redo remain).
+ *   The page bytes keep pd_block_scn + LSN for the D-h3 newest-PI
+ *   ordering proof.
+ * ======================================================================== */
+static bool
+cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
+{
+	if (!cluster_past_image)
+		return false;			/* wave off: caller drops as today */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		/* Pinned: fail-safe fallback to the plain drop (single lock-free
+		 * atomic tick; same class as PG's own buf->state atomics under
+		 * this spinlock). */
+		cluster_lever_h_note_pi_ineligible();
+		return false;
+	}
+
+	buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
+	buf->buffer_type = (uint8) BUF_TYPE_PI;
+	UnlockBufHdr(buf, buf_state);
+	cluster_lever_h_note_pi_kept();
 	return true;
 }
 
@@ -7432,6 +7489,12 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 		return false;
 	}
 	buf->pcm_state = (uint8) PCM_STATE_N;
+
+	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping (the
+	 * shipped current went to the new holder; our copy becomes the PI). */
+	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
+		return true;
+
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;

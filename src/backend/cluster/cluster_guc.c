@@ -113,6 +113,9 @@ bool cluster_block_self_contained = false;
 /* spec-6.12e2: master->holder BAST nudge on live-X-holder deny (default
  * OFF = e1 release-side handoff only). */
 bool cluster_ges_bast = false;
+/* spec-6.12h: keep a Past Image on block transfer/invalidate (default
+ * OFF = flush + drop the copy). */
+bool cluster_past_image = false;
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * resolution via undo-block CF fetch (default OFF = 53R97). */
 bool cluster_crossnode_runtime_visibility = false;
@@ -1654,6 +1657,26 @@ cluster_init_guc(void)
 					 "(spec-6.12e2)."),
 		gettext_noop("Off keeps the deny-and-retry path without nudging the holder."),
 		&cluster_ges_bast, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.past_image -- spec-6.12 wave h (AD-002 PI orthogonal state).
+	 * When a block leaves this node (X-transfer ship+drop, S-copy
+	 * invalidate), keep the local copy as a Past Image instead of dropping
+	 * it: buffer_type = BUF_TYPE_PI with BM_VALID and every dirty flag
+	 * cleared, so native bufmgr semantics guarantee the hard invariant "a
+	 * PI never serves a query" (a !VALID buffer is an IO-needed miss) and
+	 * a later local read of the same block re-reads/installs over the
+	 * bytes -- the implicit discard.  PIs are fail-safe: dropping one at
+	 * any moment only loses the crash-recovery shortcut (D-h3), never
+	 * correctness (storage + full redo remain).  Default OFF = today's
+	 * flush + drop.  SUSET for measurement windows.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.past_image",
+		gettext_noop("Keep a Past Image copy when a block is transferred or invalidated "
+					 "(spec-6.12h)."),
+		gettext_noop("Off drops the local copy after WAL flush (no recovery shortcut)."),
+		&cluster_past_image, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes

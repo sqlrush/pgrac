@@ -94,6 +94,9 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_sent_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_yield_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_refused_count, 0);
+		/* spec-6.12h */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_kept_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_ineligible_count, 0);
 	}
 }
 
@@ -331,4 +334,29 @@ cluster_lever_e2_note_nudge_result(bool yielded)
 	pg_atomic_fetch_add_u64(yielded ? &ClusterXnodeLeverCtl->e2_bast_nudge_yield_count
 									: &ClusterXnodeLeverCtl->e2_bast_nudge_refused_count,
 							1);
+}
+
+/* spec-6.12h gating: the wave switch or the profile umbrella. */
+static inline bool
+lever_h_counting(void)
+{
+	return (cluster_past_image || cluster_xnode_profile_enabled) && ClusterXnodeLeverCtl != NULL;
+}
+
+/* spec-6.12h — a transfer/invalidate kept a Past Image instead of dropping. */
+void
+cluster_lever_h_note_pi_kept(void)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_kept_count, 1);
+}
+
+/* spec-6.12h — PI wanted but the buffer was pinned; fell back to the drop. */
+void
+cluster_lever_h_note_pi_ineligible(void)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_ineligible_count, 1);
 }
