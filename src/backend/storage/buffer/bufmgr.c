@@ -6464,6 +6464,40 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
 #include "cluster/cluster_gcs_block.h"
 
 /*
+ * cluster_gcs_clamp_ship_flush_lsn -- spec-6.14 D11, the ship-path sibling of
+ * the FlushBuffer D8 foreign-LSN guard above.
+ *
+ *	A page LSN beyond the LOCAL insert position can only be a FOREIGN
+ *	thread's LSN (per-thread WAL: cross-thread LSNs are not comparable;
+ *	local stamps never exceed the local insert point).  This node cannot
+ *	flush another node's WAL -- XLogFlush(foreign_lsn) compares against the
+ *	local horizon and ERRORs ("flush request is not satisfied"), killing
+ *	the serve (seen: LMON's gcs_block_forward handler dropping the frame,
+ *	the requester PANICking on transfer timeout, when a page modified by
+ *	THIS node after an X-transfer keeps the origin's higher LSN under the
+ *	monotonic pd_lsn discipline).
+ *
+ *	The foreign origin flushed its own WAL through that LSN before the
+ *	image was ever shipped (HC82 holds on every ship path), so the only
+ *	WAL still owed locally is this node's OWN records for modifications
+ *	made after adoption -- all at or below the local insert position.
+ *	Clamping the flush target to the local insert position keeps
+ *	WAL-before-data cluster-wide (foreign half durable at the origin,
+ *	local half durable here) at the cost of over-flushing local WAL.
+ */
+static XLogRecPtr
+cluster_gcs_clamp_ship_flush_lsn(XLogRecPtr page_lsn)
+{
+	XLogRecPtr	local_insert;
+
+	if (XLogRecPtrIsInvalid(page_lsn) || RecoveryInProgress())
+		return page_lsn;
+
+	local_insert = GetXLogInsertRecPtr();
+	return (page_lsn > local_insert) ? local_insert : page_lsn;
+}
+
+/*
  * LMON handles remote GCS_BLOCK_REQUEST messages, so the block-copy path
  * cannot use PinBuffer_Locked()/UnpinBuffer(): those routines maintain
  * backend-local private refcounts and CurrentResourceOwner state.  The raw pin
@@ -6653,7 +6687,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
 #endif
 		if (!XLogRecPtrIsInvalid(first_lsn))
-			XLogFlush(first_lsn);
+			XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
 
 		/*
 		 * Reacquire content_lock SHARED and revalidate that the page LSN
@@ -6768,7 +6802,7 @@ cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page
 			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
 #endif
 		if (!XLogRecPtrIsInvalid(first_lsn))
-			XLogFlush(first_lsn);
+			XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
 
 		LWLockAcquire(content_lock, LW_SHARED);
 		second_lsn = PageGetLSN(page);
@@ -7452,7 +7486,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		*out_page_scn = page_scn;
 
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
-		XLogFlush(page_lsn);
+		XLogFlush(cluster_gcs_clamp_ship_flush_lsn(page_lsn));
 
 	/*
 	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — InvalidateBuffer requires the
@@ -7673,7 +7707,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	 * no-stale-flush); InvalidateBuffer below discards the dirty buffer.
 	 */
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
-		XLogFlush(page_lsn);
+		XLogFlush(cluster_gcs_clamp_ship_flush_lsn(page_lsn));
 
 	/*
 	 * InvalidateBuffer requires the buffer header spinlock held at ENTRY and
