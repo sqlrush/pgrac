@@ -449,6 +449,17 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("shared-regime recovery claim dir path too long")));
 
+	/*
+	 * The claim can be the FIRST writer under <shared>/global (a shared
+	 * per-thread WAL layout needs no other global/ file before its first
+	 * crash boot -- the t/248 shape), so ensure the directory exists
+	 * rather than FATALing the whole recovery on ENOENT.
+	 */
+	if (MakePGDirectory(gdir) < 0 && errno != EEXIST)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not create shared claim directory \"%s\": %m",
+							   gdir)));
+
 	sysid = GetSystemIdentifier();
 	cluster_merge_claim_build(&f, cluster_node_id, sysid);
 
