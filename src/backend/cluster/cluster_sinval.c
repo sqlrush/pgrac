@@ -1509,7 +1509,7 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 	if (result == CLUSTER_SINVAL_ACK_TIMEOUT) {
 		pg_atomic_fetch_add_u64(&ClusterSinval->ack_timeout_count, 1);
 		ereport(WARNING, (errcode(ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT),
-						  errmsg("sinval ack timeout — some peers未 propagate within %d ms",
+						  errmsg("sinval ack timeout — some peers did not propagate within %d ms",
 								 cluster_sinval_ack_timeout_ms),
 						  errhint("check cluster health via pg_stat_cluster_counters.")));
 	}
