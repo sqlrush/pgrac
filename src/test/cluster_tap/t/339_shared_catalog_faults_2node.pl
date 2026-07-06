@@ -44,6 +44,17 @@
 #      L4  neither node's log carries the pre-D9 "unsupported side effect"
 #          fail-closed marker.
 #
+#    KNOWN-BLOCKED (spec-6.15 xid striping, spec-6.12-crossnode-perf lane;
+#    user decision B 2026-07-06): the L3 serving legs stay RED on this
+#    branch's base -- without xid striping the two threads' bare xids
+#    collide (pg_waldump-proven: the same xid on both threads writing the
+#    same catalog block), so post-merge TT lookups for the other thread's
+#    xids are permanently UNKNOWN and every cross-thread catalog read
+#    fail-closes 53R97 (honest, never false-visible).  The claim / engage /
+#    divert / exactly-once-drop framework legs (L0-L2, L4) are green.  The
+#    serving legs turn green when this branch rebases onto the merged
+#    6.12/6.15 lane; do NOT re-point them at weaker assertions.
+#
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 # Portions Copyright (c) 2026, pgrac contributors
