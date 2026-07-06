@@ -3874,12 +3874,22 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					xvs_b2_captured = true;
 
 				if (!xvs_b2_captured) {
+					/*
+					 * PGRAC: spec-6.12e2 × spec-6.14a merge — a THIRD-PARTY-ONLY
+					 * S set with no master carrier must NOT terminal-deny here:
+					 * the S bits are only ever cleared by the self-drop +
+					 * nowait-invalidate blocks below, which a terminal deny
+					 * never reaches, so the e2 3-corner nudge flow would
+					 * live-lock on an eternal B3 (t/348 L3).  Count the
+					 * no-carrier round and FALL THROUGH: the e2 blocks below
+					 * fire the invalidates and reply DENIED_PENDING_X, and the
+					 * requester's retry finds the S set cleared and takes the
+					 * original spec-2.33 flow (whose storage fallback stays
+					 * under the spec-2.41 lost-write detector — no un-carried
+					 * GRANT is ever produced on this path, deny direction
+					 * preserved, only liveness added).
+					 */
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count, 1);
-					cluster_pcm_lock_clear_pending_x(req->tag);
-					status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
-					page_lsn = InvalidXLogRecPtr;
-					block_payload = NULL;
-					goto build_and_send_reply;
 				}
 			}
 
