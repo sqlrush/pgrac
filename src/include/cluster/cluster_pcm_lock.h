@@ -530,6 +530,54 @@ extern uint64 cluster_pcm_lock_pi_watermark_retire_for_truncate_range(Oid db_oid
 extern bool cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag,
 															XLogRecPtr written_page_lsn);
 
+/* ============================================================
+ * PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (master side).
+ *
+ *   cluster_pcm_pi_discard_covered:  the PURE coverage judge.  A durable
+ *     write of the block's CURRENT copy proves every Past Image obsolete
+ *     iff the written page's pd_block_scn reaches the SCN watermark (the
+ *     newest shipped version): every PI is that version or older.  The
+ *     SCN unit (AD-008 Lamport pd_block_scn, the lost-write detector
+ *     unit) is the ONLY cross-node comparable unit — per-thread WAL
+ *     (spec-4.1) gives every node its own LSN space, so the LSN
+ *     watermark (fed from the SHIPPING holder's stream) and a durable
+ *     note (from the WRITING holder's stream) are generally from
+ *     DIFFERENT streams and numerically incomparable; the judge
+ *     deliberately never reads the LSN unit.  SCN-unarmed (a
+ *     recovery-rebuilt LSN-only entry) or SCN-unknown written page ->
+ *     false, fail-safe: the PI merely lingers until buffer pressure /
+ *     implicit-discard reread.
+ *
+ *   cluster_pcm_lock_pi_holder_note:  set `holder_node`'s bit in the
+ *     authoritative entry's pi_holders_bitmap — a conversion site kept a
+ *     real BUF_TYPE_PI buffer (D-h1) and reported it.  Advisory (missing
+ *     entry -> no-op): an untracked PI only misses the discard notify.
+ *
+ *   cluster_pcm_lock_pi_discard_collect:  the D-h2 production retire.
+ *     Under the entry lock: if the written pd_block_scn covers the SCN
+ *     watermark, clear BOTH watermarks (a durable copy >= the newest
+ *     shipped version also discharges the redo-coverage claim — the same
+ *     "durable >= watermark" contract as retire_if_durable) + the PI
+ *     holder bitmap, and hand the pre-clear bitmap to the caller, which
+ *     owns notifying each PI holder (PI_DISCARD ride on the INVALIDATE
+ *     wire).  This is the durable-confirm retire HC130 anticipated;
+ *     retire_if_durable stays as the LSN-only single-stream fixture.
+ * ============================================================ */
+static inline bool
+cluster_pcm_pi_discard_covered(SCN wm_scn, SCN written_scn)
+{
+	if (!SCN_VALID(wm_scn))
+		return false; /* SCN unit unarmed -> nothing provable cross-node */
+	if (!SCN_VALID(written_scn))
+		return false; /* written version unknown -> fail-safe keep */
+	/* SCN_CMP_OK: scn_time_cmp order via scn_local (raw compare would be
+	 * node_id-dominated — same rule as the grant/take watermark advance). */
+	return scn_local(written_scn) >= scn_local(wm_scn);
+}
+
+extern void cluster_pcm_lock_pi_holder_note(BufferTag tag, int32 holder_node);
+extern bool cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn,
+												uint32 *holders_out);
 
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PCM_LOCK_H */

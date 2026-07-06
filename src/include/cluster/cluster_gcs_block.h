@@ -489,6 +489,38 @@ GcsBlockInvalidateAckPayloadGetPageScn(const GcsBlockInvalidateAckPayload *p)
 	return (SCN)v;
 }
 
+/* ============================================================
+ * PGRAC: spec-6.12h D-h2 — reserved-byte / status overlays on the
+ * INVALIDATE / INVALIDATE_ACK wire pair (§3.6 discipline: no new msg_type;
+ * the "copy hygiene" channel carries the PI-discard protocol).  All four
+ * rides are covered by the existing checksums (invalidate: bytes [0,48);
+ * ACK: all-bytes-except-checksum).
+ *
+ *   INVALIDATE.reserved_0[0] == KIND_PI_DISCARD:  master → holder "drop
+ *     your Past Image of this tag" directive.  Unsolicited (request_id 0),
+ *     fire-and-forget, NEVER ACKed; the holder drops strictly PI-typed
+ *     buffers only (a live current copy is never touched).  0 keeps the
+ *     legacy S-invalidate semantics byte-identical.
+ *
+ *   ACK.reserved_0[0] == ACK_KEPT_PI (on a solicited status-0 ack):  the
+ *     invalidated holder's drop converted to a D-h1 Past Image; the master
+ *     records the sender in pi_holders_bitmap.
+ *
+ *   ACK.ack_status == PI_DURABLE_NOTE (unsolicited):  a writer reports the
+ *     block's CURRENT copy durable on shared storage (Q25-A trigger fired);
+ *     page_scn_bytes@52 carries the written pd_block_scn (the only
+ *     cross-node comparable version unit — per-thread WAL keeps LSNs in
+ *     per-node spaces, so no LSN rides).  request_id stays 0; no slot
+ *     matching (diverted before the HC100 slot logic); no reply.
+ *
+ *   ACK.ack_status == PI_KEPT_NOTE (unsolicited):  a forwarded holder's
+ *     destructive drop kept a Past Image; master records the sender.
+ * ============================================================ */
+#define GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD 1
+#define GCS_BLOCK_INVALIDATE_ACK_KEPT_PI 1
+#define GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE 3
+#define GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE 4
+
 
 /* ============================================================
  *   GcsBlockRedeclarePayload -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_REDECLARE
@@ -1497,6 +1529,16 @@ extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode e
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
 
+/* PGRAC: spec-6.12h D-h2 — Past Image discard helpers.
+ * block_is_pi: does this tag's resident buffer hold a D-h1 Past Image
+ * (BUF_TYPE_PI)?  Conversion sites use it to report kept-PI to the master.
+ * discard_pi_block: drop the tag's buffer iff it is a real unpinned Past
+ * Image (strictly type PI + !BM_VALID + refcount 0 — a current copy is
+ * NEVER touched); false = no droppable PI (already implicitly discarded,
+ * pinned by a racing re-reader, or never kept). */
+extern bool cluster_bufmgr_block_is_pi(BufferTag tag);
+extern bool cluster_bufmgr_discard_pi_block(BufferTag tag);
+
 /* PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
  * Backend-context path for a writer on the master node whose block was
  * quiescent-downgraded: pending_x barrier + INVALIDATE broadcast via the
@@ -1826,6 +1868,31 @@ extern uint64 cluster_gcs_get_clean_page_xfer_third_party_denied_count(void);
  * forward-to-holder revoke; B: master==holder self-ship). */
 extern uint64 cluster_gcs_get_block_x_transfer_ship_count(void);
 extern uint64 cluster_gcs_get_block_x_self_ship_count(void);
+
+/* ============================================================
+ * PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (Q25-A dual trigger).
+ *
+ *	The "current copy written durable" proof pipeline: FlushBuffer records
+ *	every tracked-block write into a small shmem ring (pi_write_note = the
+ *	"写盘成功" face); the checkpointer brackets ProcessSyncRequests with
+ *	presync_snapshot/confirm (the "checkpoint 推进" face — everything noted
+ *	before the sync phase is durable once it returns, exactly Oracle's
+ *	"a PI may be discarded only after a newer version is persisted"); the
+ *	LMON tick drains confirmed notes and routes each to the block's master
+ *	(locally, or as an unsolicited INVALIDATE_ACK status-3 durable-note ride:
+ *	page_scn_bytes@52 carries the written pd_block_scn — the only cross-node
+ *	comparable version unit under per-thread WAL, so the page LSN is
+ *	deliberately not part of the protocol).  The master retires the
+ *	watermarks + PI bitmap
+ *	(cluster_pcm_lock_pi_discard_collect) and sends each PI holder a
+ *	PI_DISCARD (INVALIDATE ride, reserved_0[0] = 1, no ACK).  Every hop is
+ *	fire-and-forget fail-safe: a lost note/notify only leaves a PI lingering
+ *	until buffer pressure or the implicit-discard reread.
+ * ============================================================ */
+extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
+extern uint64 cluster_gcs_block_pi_note_presync_snapshot(void);
+extern void cluster_gcs_block_pi_note_confirm(uint64 presync_seq);
+extern void cluster_gcs_block_pi_discard_drain(void);
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);

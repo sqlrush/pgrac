@@ -24,6 +24,11 @@
 #	      the block is drifted on node1, so the commit cleanout SKIPS the stamp
 #	      (verified via the local skip counter)
 #	  L4  counter surface: 3 wave-g xnode_lever keys present on both nodes
+#	  L6  (D-h1) Past Image kept on X-transfer + NEVER-SERVE outcomes audit
+#	  L7  (D-h2) discard protocol: the new holder's write + CHECKPOINT proves
+#	      the current durable (Q25-A dual trigger) -> the master retires the
+#	      watermarks + fans out PI_DISCARD -> the old holder's PI is truly
+#	      invalidated (h_pi_write_note + h_pi_discarded deltas)
 #
 #	  Substrate honesty (L373/L374 / spec-6.12 §3.5, same as wave-b): the hold
 #	  uses a LOCK-ONLY hold (SELECT ... FOR UPDATE) -- like t/280 -- so no data
@@ -378,6 +383,91 @@ for my $n ($node0, $node1)
 			  : 'L6 positive read-through stayed fail-closed (phantom-harness '
 			  . 'Stage-6 boundary; armed positive path covered by t/346)');
 	}
+}
+
+# ============================================================
+# L7 (spec-6.12h D-h2): PI-holder discard protocol (Q25-A dual trigger).
+# Fresh table so the sequence is fully controlled:
+#   1. seed on node0 (node0 = X holder), transfer to node1 (peer write)
+#      -> node0 keeps a PI (D-h1) AND the master's pi_holders_bitmap
+#         records node0 (local note when node0 masters the tag; the
+#         PI_KEPT ack/note ride when node1 does — the leg is
+#         master-position agnostic on purpose);
+#   2. CHECKPOINT on node1 = the new holder's CURRENT copy written +
+#      fsync-proven durable (the write-note ring sealed by the
+#      ProcessSyncRequests bracket);
+#   3. node1's LMON drains the note to the master -> watermarks retired
+#      -> PI_DISCARD directed at node0 -> node0's PI buffer is TRULY
+#      invalidated: sum(h_pi_discarded_count) rises.  No reads touch the
+#      table on node0 in between, so the tick cannot be a miss-path
+#      artifact (an implicit-discard reread would leave no PI to drop
+#      and tick h_pi_discard_miss instead).
+# ============================================================
+{
+	$node0->safe_psql('postgres', 'CREATE TABLE h_d (id int, v int)');
+	$node1->safe_psql('postgres', 'CREATE TABLE h_d (id int, v int)');
+	is( $node0->safe_psql('postgres', q{SELECT pg_relation_filepath('h_d')}),
+		$node1->safe_psql('postgres', q{SELECT pg_relation_filepath('h_d')}),
+		'L7 h_d relfilepath coincidence holds');
+	ok(write_retry($node0, 'INSERT INTO h_d VALUES (1, 10), (2, 20)'),
+		'L7 seeded');
+	ok(write_retry($node0, 'CHECKPOINT'), 'L7 seed checkpoint');
+	$node0->safe_psql('postgres', 'SELECT sum(v) FROM h_d');
+
+	my $kept0    = state_val($node0, 'xnode_lever', 'h_pi_kept_count')
+				 + state_val($node1, 'xnode_lever', 'h_pi_kept_count');
+	my $note0    = state_val($node0, 'xnode_lever', 'h_pi_write_note_count')
+				 + state_val($node1, 'xnode_lever', 'h_pi_write_note_count');
+	my $discard0 = state_val($node0, 'xnode_lever', 'h_pi_discarded_count')
+				 + state_val($node1, 'xnode_lever', 'h_pi_discarded_count');
+
+	# Transfer: node1 takes X; node0's copy becomes the PI to be discarded.
+	ok(write_retry($node1, 'UPDATE h_d SET v = 222 WHERE id = 1'),
+		'L7 peer write moved the block');
+	my $kept1 = state_val($node0, 'xnode_lever', 'h_pi_kept_count')
+			  + state_val($node1, 'xnode_lever', 'h_pi_kept_count');
+	cmp_ok($kept1, '>', $kept0, 'L7 a Past Image was kept on transfer');
+
+	# Q25-A: the new holder writes its CURRENT copy durable.  FlushBuffer
+	# notes the write (face 1), the checkpoint's sync bracket seals it
+	# (face 2), the LMON drain routes it to the master.
+	ok(write_retry($node1, 'CHECKPOINT'), 'L7 new-holder checkpoint');
+
+	my $deadline = time() + 30;
+	my ($note1, $discard1) = ($note0, $discard0);
+	while (time() < $deadline)
+	{
+		$note1    = state_val($node0, 'xnode_lever', 'h_pi_write_note_count')
+				  + state_val($node1, 'xnode_lever', 'h_pi_write_note_count');
+		$discard1 = state_val($node0, 'xnode_lever', 'h_pi_discarded_count')
+				  + state_val($node1, 'xnode_lever', 'h_pi_discarded_count');
+		last if $discard1 > $discard0;
+		usleep(300_000);
+	}
+	for my $pair_n ([ 'node0', $node0 ], [ 'node1', $node1 ])
+	{
+		my ($nm, $n) = @$pair_n;
+		note("L7 diag $nm: "
+			  . join(' ',
+				map { "$_=" . state_val($n, 'xnode_lever', "h_pi_$_") }
+				  qw(kept_count write_note_count note_overflow_count
+					 discard_notify_count discarded_count discard_miss_count)));
+		note("L7 diag $nm gcs: retire="
+			  . state_val($n, 'gcs', 'pi_watermark_retire_count')
+			  . " advance=" . state_val($n, 'gcs', 'pi_watermark_advance_count')
+			  . " pcm_pi_holders=" . state_val($n, 'pcm', 'pi_holders_total_count'));
+	}
+	cmp_ok($note1, '>', $note0,
+		'L7 face 1: the tracked-block write was noted (h_pi_write_note)');
+	# Directive issuance is proven BY the discarded tick below:
+	# cluster_bufmgr_discard_pi_block has exactly two callers, both driven
+	# by a master PI_DISCARD directive (local apply or the INVALIDATE ride),
+	# so a rising h_pi_discarded implies the notify hop fired.  A strict
+	# h_pi_discard_notify delta is deliberately NOT asserted: earlier legs'
+	# tags carry legacy HC58 downgrade bits, so any checkpoint can retire
+	# them in the background and race the baseline sample.
+	cmp_ok($discard1, '>', $discard0,
+		'L7 the PI was TRULY invalidated at its holder (h_pi_discarded)');
 }
 
 $pair->stop_pair if $pair->can('stop_pair');

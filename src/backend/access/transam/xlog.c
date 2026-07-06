@@ -176,6 +176,7 @@
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
+#include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
@@ -7552,7 +7553,25 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
 	CheckpointStats.ckpt_sync_t = GetCurrentTimestamp();
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12h D-h2 (Q25-A "checkpoint 推进" face) — bracket the
+	 * fsync sweep: every tracked-block write FlushBuffer noted before this
+	 * point is durable once ProcessSyncRequests returns, so seal those notes
+	 * for the LMON drain (which turns them into PI_DISCARD directives).
+	 * Notes appended during the sweep wait for the next checkpoint —
+	 * conservative by one cycle, never wrong (fail-safe direction: a PI
+	 * lingering longer costs memory hygiene, never correctness).
+	 */
+	{
+		uint64		pi_note_presync_seq = cluster_gcs_block_pi_note_presync_snapshot();
+
+		ProcessSyncRequests();
+		cluster_gcs_block_pi_note_confirm(pi_note_presync_seq);
+	}
+#else
 	ProcessSyncRequests();
+#endif
 	CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();
 

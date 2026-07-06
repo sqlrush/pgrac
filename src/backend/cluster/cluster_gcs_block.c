@@ -78,6 +78,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
+#include "storage/spin.h" /* PGRAC: spec-6.12h D-h2 — PI-discard note ring lock */
 #include "utils/elog.h"
 #include "utils/pg_crc.h"
 #include "utils/timestamp.h"
@@ -96,6 +97,11 @@
  * ============================================================ */
 
 #define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
+
+/* PGRAC: spec-6.12h D-h2 — PI-discard write-note ring capacity.  Sized for
+ * one checkpoint cycle of tracked-block writes between LMON drains; overflow
+ * drops the new note (fail-safe: the PI merely lingers, counted). */
+#define CLUSTER_GCS_PI_NOTE_RING_SIZE 128
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
@@ -254,6 +260,27 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 direct_install_count;
 	pg_atomic_uint64 direct_install_abort_count;
 	pg_atomic_uint64 install_copy_count;
+	/* PGRAC: spec-6.12h D-h2 — PI-discard write-note ring (Q25-A dual
+	 * trigger).  FlushBuffer appends a note per tracked-block write (the
+	 * "写盘成功" face); the checkpointer brackets ProcessSyncRequests with
+	 * presync_snapshot/confirm so pi_note_confirmed_seq only ever covers
+	 * notes whose write is PROVEN durable (the "checkpoint 推进" face); the
+	 * LMON tick drains [drain_seq, confirmed_seq) and routes each note to
+	 * the block's master.  Multi-producer append under the spinlock; the
+	 * seq fields are plain uint64 protected by the same spinlock (short
+	 * hold, no I/O).  Ring full -> the NEW note is dropped (fail-safe: the
+	 * PI merely lingers; dropping the oldest could starve a sealed note
+	 * the drain is about to consume). */
+	slock_t pi_note_lock;
+	uint64 pi_note_append_seq;	  /* next seq to write (ring head) */
+	uint64 pi_note_confirmed_seq; /* notes below are checkpoint-durable */
+	uint64 pi_note_drain_seq;	  /* notes below were drained by LMON */
+	struct {
+		BufferTag tag;
+		SCN page_scn; /* written pd_block_scn — the only cross-node
+					   * comparable version unit (per-thread WAL makes
+					   * cross-node LSN comparison meaningless) */
+	} pi_note_ring[CLUSTER_GCS_PI_NOTE_RING_SIZE];
 } ClusterGcsBlockShared;
 
 
@@ -312,6 +339,11 @@ static bool gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const v
  * structural fix — the dispatch loop cannot sleep on ACKs it drains). */
 static void gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req,
 												  uint32 holders_bm);
+
+/* PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (definitions after the
+ * invalidate machinery; the conversion sites above them need the decls). */
+static void gcs_block_pi_kept_note_send(BufferTag tag, int32 master_node);
+static void gcs_block_pi_discard_master_apply(BufferTag tag, SCN written_scn);
 
 
 /* ============================================================
@@ -426,6 +458,12 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_abort_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->install_copy_count, 0);
+		/* PGRAC: spec-6.12h D-h2 — PI-discard write-note ring. */
+		SpinLockInit(&ClusterGcsBlock->pi_note_lock);
+		ClusterGcsBlock->pi_note_append_seq = 0;
+		ClusterGcsBlock->pi_note_confirmed_seq = 0;
+		ClusterGcsBlock->pi_note_drain_seq = 0;
+		memset(ClusterGcsBlock->pi_note_ring, 0, sizeof(ClusterGcsBlock->pi_note_ring));
 
 		if (gcs_block_backend_blocks == NULL)
 			return;
@@ -3571,6 +3609,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					cluster_pcm_lock_master_grant_x_to(
 						req->tag, req->sender_node, page_lsn,
 						(SCN)((PageHeader)block_payload)->pd_block_scn);
+					/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
+					 * outgoing copy as a Past Image, record ourselves on the
+					 * authoritative PI bitmap (master == self: local note). */
+					if (cluster_bufmgr_block_is_pi(req->tag))
+						cluster_pcm_lock_pi_holder_note(req->tag, cluster_node_id);
 					status = GCS_BLOCK_REPLY_GRANTED;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_self_ship_count, 1);
@@ -3850,6 +3893,12 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 															  &self_scn);
 				(void)cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_N_INVALIDATE,
 															cluster_node_id);
+				/* PGRAC: spec-6.12h D-h2 — the self-drop may have kept a Past
+				 * Image (D-h1 conversion inside the helper); master == self,
+				 * so record it on the authoritative PI bitmap directly (the
+				 * wire kept_pi ACK flag cannot self-deliver either). */
+				if (cluster_bufmgr_block_is_pi(req->tag))
+					cluster_pcm_lock_pi_holder_note(req->tag, cluster_node_id);
 				holders_bm &= ~((uint32)1u << cluster_node_id);
 			}
 
@@ -5230,6 +5279,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
 					if (GcsBlockForwardPayloadIsCleanEligible(fwd))
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
+					/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
+					 * outgoing copy as a Past Image, report it to the master
+					 * (unsolicited PI_KEPT ride; fire-and-forget — a lost note
+					 * only leaves the PI untracked, fail-safe lingering). */
+					if (cluster_bufmgr_block_is_pi(fwd->tag))
+						gcs_block_pi_kept_note_send(fwd->tag, fwd->master_node);
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
@@ -5498,6 +5553,218 @@ gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req, uint32 
 }
 
 /* ============================================================
+ * PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (Q25-A dual trigger).
+ *
+ *	Pipeline (every hop fire-and-forget fail-safe — a lost note/notify only
+ *	leaves a PI lingering until buffer pressure or the implicit-discard
+ *	reread; §3.4b):
+ *
+ *	  FlushBuffer                      pi_write_note        ("写盘成功" face)
+ *	  checkpointer ProcessSyncRequests presync_snapshot/confirm
+ *	                                                        ("checkpoint 推进" face)
+ *	  LMON tick                        pi_discard_drain -> route to master
+ *	  master                           pi_discard_master_apply:
+ *	                                     collect (retire watermarks + bitmap)
+ *	                                     -> PI_DISCARD per holder
+ *	  holder                           cluster_bufmgr_discard_pi_block
+ * ============================================================ */
+
+/*
+ * FlushBuffer just wrote a cluster-tracked block toward shared storage.
+ * Record (tag, pd_block_scn) of the flushed image; the note only becomes a
+ * discard trigger after the checkpoint sync phase proves it durable.  The
+ * page LSN is deliberately NOT recorded: under per-thread WAL every node has
+ * its own LSN space, so only the pd_block_scn (AD-008 Lamport) version is
+ * cross-node comparable.  Multi-producer (checkpointer / bgwriter /
+ * backends), so the append runs under the ring spinlock; ring full drops the
+ * NEW note (dropping the oldest could starve a sealed note the drain is
+ * consuming).
+ */
+void
+cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn)
+{
+	bool overflowed = false;
+
+	if (ClusterGcsBlock == NULL || !cluster_past_image)
+		return;
+
+	SpinLockAcquire(&ClusterGcsBlock->pi_note_lock);
+	if (ClusterGcsBlock->pi_note_append_seq - ClusterGcsBlock->pi_note_drain_seq
+		>= CLUSTER_GCS_PI_NOTE_RING_SIZE) {
+		overflowed = true;
+	} else {
+		uint64 slot = ClusterGcsBlock->pi_note_append_seq % CLUSTER_GCS_PI_NOTE_RING_SIZE;
+
+		ClusterGcsBlock->pi_note_ring[slot].tag = tag;
+		ClusterGcsBlock->pi_note_ring[slot].page_scn = page_scn;
+		ClusterGcsBlock->pi_note_append_seq++;
+	}
+	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+
+	cluster_lever_h_note_write_note(overflowed);
+}
+
+/*
+ * Checkpointer, right BEFORE ProcessSyncRequests: snapshot the append seq.
+ * Every note recorded before the sync phase begins is durable once it
+ * returns (its smgrwrite happened before the fsync sweep that is about to
+ * run).  Notes appended DURING the sync phase wait for the next checkpoint
+ * — conservative by one cycle, never wrong.
+ */
+uint64
+cluster_gcs_block_pi_note_presync_snapshot(void)
+{
+	uint64 seq;
+
+	if (ClusterGcsBlock == NULL)
+		return 0;
+	SpinLockAcquire(&ClusterGcsBlock->pi_note_lock);
+	seq = ClusterGcsBlock->pi_note_append_seq;
+	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+	return seq;
+}
+
+/*
+ * Checkpointer, right AFTER ProcessSyncRequests returned: everything below
+ * the presync snapshot is now provably durable.  Monotone (a concurrent
+ * end-of-recovery checkpoint cannot regress the seal).
+ */
+void
+cluster_gcs_block_pi_note_confirm(uint64 presync_seq)
+{
+	if (ClusterGcsBlock == NULL)
+		return;
+	SpinLockAcquire(&ClusterGcsBlock->pi_note_lock);
+	if (presync_seq > ClusterGcsBlock->pi_note_confirmed_seq)
+		ClusterGcsBlock->pi_note_confirmed_seq = presync_seq;
+	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+}
+
+/*
+ * Report "our destructive drop kept a Past Image" to the block's master so
+ * it lands on the authoritative pi_holders_bitmap.  Local master -> direct
+ * note; remote -> unsolicited PI_KEPT ride on the invalidate-ACK wire.
+ */
+static void
+gcs_block_pi_kept_note_send(BufferTag tag, int32 master_node)
+{
+	if (master_node == cluster_node_id) {
+		cluster_pcm_lock_pi_holder_note(tag, cluster_node_id);
+		return;
+	}
+	if (master_node < 0 || master_node >= 32)
+		return;
+
+	{
+		GcsBlockInvalidateAckPayload note;
+
+		memset(&note, 0, sizeof(note));
+		note.request_id = 0; /* unsolicited: diverted before the slot logic */
+		note.epoch = cluster_epoch_get_current();
+		note.tag = tag;
+		note.sender_node = cluster_node_id;
+		note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE;
+		note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
+		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
+									   sizeof(note));
+	}
+}
+
+/*
+ * Master side: a durable-note for `tag` arrived (locally routed or via the
+ * status-3 wire ride).  If the written pd_block_scn covers the SCN watermark
+ * (the only cross-node comparable unit), collect + clear the PI holder
+ * bitmap and direct every holder to drop its Past Image: self drops locally
+ * (the wire cannot send to self, ㉕ precedent), remote holders get a
+ * PI_DISCARD INVALIDATE ride (nowait, never ACKed).  Runs in LMON
+ * dispatch/tick context — sends must not block.
+ */
+static void
+gcs_block_pi_discard_master_apply(BufferTag tag, SCN written_scn)
+{
+	uint32 holders = 0;
+	int n;
+
+	if (!cluster_pcm_lock_pi_discard_collect(tag, written_scn, &holders))
+		return;
+	/* The durable-confirm retire HC130 anticipated (counter shared with the
+	 * tag-lifecycle retire family). */
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_retire_count, 1);
+
+	for (n = 0; n < 32; n++) {
+		if ((holders & ((uint32)1u << n)) == 0)
+			continue;
+		cluster_lever_h_note_discard_notify();
+		if (n == cluster_node_id) {
+			cluster_lever_h_note_discard_result(cluster_bufmgr_discard_pi_block(tag));
+		} else {
+			GcsBlockInvalidatePayload inv;
+
+			memset(&inv, 0, sizeof(inv));
+			inv.request_id = 0; /* unsolicited: no broadcast slot, no ACK */
+			inv.epoch = cluster_epoch_get_current();
+			inv.tag = tag;
+			inv.master_node = cluster_node_id;
+			inv.invalidating_for_x_node = 0;
+			inv.reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD;
+			inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		}
+	}
+}
+
+/*
+ * LMON tick: drain confirmed notes [drain_seq, confirmed_seq) and route each
+ * to its master — locally when this node masters the tag, else as a status-3
+ * durable-note ride (page_scn_bytes@52 = the written pd_block_scn;
+ * request_id stays 0, unsolicited).  Bounded by the ring size per tick; only
+ * LMON owns the tier-1 IC fds (L172 family).
+ */
+void
+cluster_gcs_block_pi_discard_drain(void)
+{
+	if (ClusterGcsBlock == NULL || !cluster_past_image)
+		return;
+
+	for (;;) {
+		BufferTag tag;
+		SCN page_scn;
+		uint64 slot;
+		int master_node;
+
+		SpinLockAcquire(&ClusterGcsBlock->pi_note_lock);
+		if (ClusterGcsBlock->pi_note_drain_seq >= ClusterGcsBlock->pi_note_confirmed_seq) {
+			SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+			break;
+		}
+		slot = ClusterGcsBlock->pi_note_drain_seq % CLUSTER_GCS_PI_NOTE_RING_SIZE;
+		tag = ClusterGcsBlock->pi_note_ring[slot].tag;
+		page_scn = ClusterGcsBlock->pi_note_ring[slot].page_scn;
+		ClusterGcsBlock->pi_note_drain_seq++;
+		SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+
+		master_node = cluster_gcs_lookup_master(tag);
+		if (master_node == cluster_node_id) {
+			gcs_block_pi_discard_master_apply(tag, page_scn);
+		} else if (master_node >= 0 && master_node < 32) {
+			GcsBlockInvalidateAckPayload note;
+
+			memset(&note, 0, sizeof(note));
+			note.request_id = 0; /* unsolicited: diverted before slot logic */
+			note.epoch = cluster_epoch_get_current();
+			note.tag = tag;
+			note.sender_node = cluster_node_id;
+			note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE;
+			GcsBlockInvalidateAckPayloadSetPageScn(&note, page_scn);
+			note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node,
+										   &note, sizeof(note));
+		}
+	}
+}
+
+/* ============================================================
  * PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
  *
  *	The backend-side PCM acquire loop (cluster_pcm_lock_acquire) is the
@@ -5597,6 +5864,7 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	SCN page_scn = InvalidScn; /* spec-2.41 D3 — ACK SCN carrier */
 	uint8 ack_status = 0;	   /* OK */
+	bool kept_pi = false;	   /* spec-6.12h D-h2 — drop converted to a PI */
 	uint64 current_epoch;
 
 	/* D16 inject — stall ack for timeout testing. */
@@ -5608,6 +5876,21 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		return;
 
 	current_epoch = cluster_epoch_get_current();
+
+	/*
+	 * PGRAC: spec-6.12h D-h2 — PI_DISCARD directive ride.  Strictly drops a
+	 * BUF_TYPE_PI buffer (a live current copy is never touched — the strict
+	 * check lives in cluster_bufmgr_discard_pi_block); unsolicited and NEVER
+	 * ACKed (an ACK would hit the e2 slotless branch and clear an S bit this
+	 * node may legitimately hold).  Off-epoch directives are dropped: the
+	 * reconfig epoch bump owns cross-generation hygiene.
+	 */
+	if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD) {
+		if (inv->epoch == current_epoch)
+			cluster_lever_h_note_discard_result(cluster_bufmgr_discard_pi_block(inv->tag));
+		return;
+	}
+
 	if (inv->epoch < current_epoch) {
 		ack_status = 1; /* epoch_stale */
 		goto send_ack;
@@ -5651,6 +5934,11 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		 * ACK (replacing the spec-2.37 page_lsn carrier) and applied to the
 		 * master's detector SCN watermark by the ACK handler.  Do not advance
 		 * the holder-local HTAB: the master GrdEntry is the authoritative owner. */
+
+		/* PGRAC: spec-6.12h D-h2 — the D-h1 conversion may have kept our
+		 * dropped copy as a Past Image; flag it on the solicited ACK so the
+		 * master records this node on the PI holder bitmap. */
+		kept_pi = cluster_bufmgr_block_is_pi(inv->tag);
 	} else {
 		ack_status = 2; /* race: not resident */
 	}
@@ -5662,6 +5950,8 @@ send_ack:
 	ack.tag = inv->tag;
 	ack.sender_node = cluster_node_id;
 	ack.ack_status = ack_status;
+	/* PGRAC: spec-6.12h D-h2 — kept-PI report ride (checksum-covered). */
+	ack.reserved_0[0] = kept_pi ? (uint8)GCS_BLOCK_INVALIDATE_ACK_KEPT_PI : (uint8)0;
 	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
 	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
@@ -5698,6 +5988,28 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	}
 
 	/*
+	 * PGRAC: spec-6.12h D-h2 — unsolicited rides on the ACK wire, diverted
+	 * BEFORE the e2 slotless branch and the HC100 slot logic (both reject
+	 * status > 2).  Status 3 = a writer's durable-note (page_scn_bytes@52
+	 * carries the written pd_block_scn — the only cross-node comparable
+	 * version unit) -> retire watermarks + fan out PI_DISCARD.  Status 4 =
+	 * a forwarded holder kept a Past Image -> record it on the bitmap.
+	 * Off-epoch notes are dropped (fail-safe: the PI merely lingers).
+	 */
+	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE) {
+		if (ack->epoch == cluster_epoch_get_current())
+			gcs_block_pi_discard_master_apply(ack->tag,
+											  GcsBlockInvalidateAckPayloadGetPageScn(ack));
+		return;
+	}
+	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE) {
+		if (ack->epoch == cluster_epoch_get_current() && ack->sender_node >= 0
+			&& ack->sender_node < 32)
+			cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
+		return;
+	}
+
+	/*
 	 * PGRAC: spec-6.12e2 (structural fix) — clear the sender's S bit on the
 	 * authoritative entry FIRST, independent of the broadcast-slot match
 	 * below.  The LMON wire-request S-branch fires its INVALIDATEs without
@@ -5717,6 +6029,13 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		&& ack->sender_node >= 0 && ack->sender_node < 32) {
 		(void)cluster_pcm_lock_apply_gcs_transition(ack->tag, PCM_TRANS_S_TO_N_INVALIDATE,
 													ack->sender_node);
+		/* PGRAC: spec-6.12h D-h2 — the holder reported its dropped copy was
+		 * kept as a Past Image (D-h1); record it on the PI holder bitmap so
+		 * the discard protocol can target it later.  Runs here (before the
+		 * slot logic) so both the slotless e2 fan-out and the slot-claimed
+		 * blocking broadcast get the report. */
+		if (ack->ack_status == 0 && ack->reserved_0[0] == (uint8)GCS_BLOCK_INVALIDATE_ACK_KEPT_PI)
+			cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
 		/* spec-2.41 D3 parity — the nowait fan-out has no slot-valid branch
 		 * below, so feed the detector SCN watermark here too (monotonic max;
 		 * skipping it would under-advance the lost-write expectation).  Skip

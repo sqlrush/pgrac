@@ -121,6 +121,19 @@ typedef struct ClusterXnodeLeverShared {
 										   * a PI instead of dropping */
 	pg_atomic_uint64 h_pi_ineligible_count; /* PI wanted but fell back to the
 											 * plain drop (pinned buffer) */
+
+	/* ---- wave h D-h2: PI-holder discard protocol (Q25-A dual trigger) ---- */
+	pg_atomic_uint64 h_pi_write_note_count;		/* FlushBuffer noted a tracked-
+												 * block write into the ring */
+	pg_atomic_uint64 h_pi_note_overflow_count;	/* ring full: note dropped
+												 * (fail-safe, PI lingers) */
+	pg_atomic_uint64 h_pi_discard_notify_count; /* master issued a PI_DISCARD
+												 * directive (wire or local) */
+	pg_atomic_uint64 h_pi_discarded_count;		/* holder truly invalidated a
+												 * BUF_TYPE_PI buffer */
+	pg_atomic_uint64 h_pi_discard_miss_count;	/* directive found no droppable
+												 * PI (already gone / pinned /
+												 * live-S over-approximation) */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -179,5 +192,13 @@ extern void cluster_lever_e2_note_nudge_result(bool yielded);
  */
 extern void cluster_lever_h_note_pi_kept(void);
 extern void cluster_lever_h_note_pi_ineligible(void);
+
+/*
+ * Wave-h D-h2 counters (PI-holder discard protocol; ticked from FlushBuffer's
+ * write-note, the master's discard fan-out, and the holder's PI drop).
+ */
+extern void cluster_lever_h_note_write_note(bool overflowed);
+extern void cluster_lever_h_note_discard_notify(void);
+extern void cluster_lever_h_note_discard_result(bool discarded);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

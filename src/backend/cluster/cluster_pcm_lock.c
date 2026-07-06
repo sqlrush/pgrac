@@ -1304,6 +1304,77 @@ cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag, XLogRecPtr writte
 	return retired;
 }
 
+/*
+ * PGRAC: spec-6.12h D-h2 — record that `holder_node` kept a real Past Image
+ * buffer (BUF_TYPE_PI, D-h1) for this block.  Called by the conversion sites
+ * (locally on the master, or via the ACK-ride PI_KEPT/kept_pi wire reports)
+ * so the discard protocol can later target the actual PI holders.  Advisory:
+ * a missing entry is a no-op — an untracked PI only misses the discard
+ * notify and lingers until buffer pressure / implicit-discard reread
+ * (fail-safe by the §3.4b PI contract).
+ */
+void
+cluster_pcm_lock_pi_holder_note(BufferTag tag, int32 holder_node)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (cluster_pcm_htab == NULL || holder_node < 0 || holder_node >= 32)
+		return;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, (uint32)1u << (uint32)holder_node);
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+}
+
+/*
+ * PGRAC: spec-6.12h D-h2 — the production durable-confirm retire (the
+ * callsite HC130 deferred; see header block).  A node reported that it wrote
+ * the block's CURRENT copy to shared storage and the write is durable
+ * (checkpoint sync completed, Q25-A dual trigger).  If the written page's
+ * pd_block_scn covers the SCN watermark (cluster_pcm_pi_discard_covered —
+ * the only cross-node comparable unit under per-thread WAL), retire BOTH
+ * watermarks, hand the pre-clear PI holder bitmap to the caller, and clear
+ * it.  The caller owns notifying each holder (PI_DISCARD on the INVALIDATE
+ * wire); a lost notify is fail-safe (the PI merely lingers).  Returns true
+ * iff the watermarks were retired here.
+ */
+bool
+cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn, uint32 *holders_out)
+{
+	struct GrdEntry *entry;
+	bool found;
+	bool retired = false;
+
+	if (holders_out != NULL)
+		*holders_out = 0;
+	if (cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (cluster_pcm_pi_discard_covered(entry->pi_watermark_scn, written_scn)) {
+			if (holders_out != NULL)
+				*holders_out = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn; /* spec-2.41 D2/D6 — clear BOTH watermarks */
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+			retired = true;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return retired;
+}
+
 
 void
 cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)

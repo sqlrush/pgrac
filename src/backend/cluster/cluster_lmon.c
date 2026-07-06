@@ -1072,6 +1072,11 @@ LmonMain(void)
 			 */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
+			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard write
+			 * notes and route each to the block's master (fire-and-forget;
+			 * only LMON owns the tier1 fds, L172 family). */
+			cluster_gcs_block_pi_discard_drain();
+
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
 			now = GetCurrentTimestamp();
@@ -1655,6 +1660,9 @@ LmonMain(void)
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+
+			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard notes. */
+			cluster_gcs_block_pi_discard_drain();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 

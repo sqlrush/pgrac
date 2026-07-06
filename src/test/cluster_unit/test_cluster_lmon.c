@@ -661,6 +661,13 @@ void
 cluster_gcs_block_dedup_sweep_expired(TimestampTz now pg_attribute_unused())
 {}
 
+/* spec-6.12h D-h2 stub:  LMON tick body drains the PI-discard note ring.
+ * Standalone fixture has no gcs_block shmem linked; vacuous stub. */
+void cluster_gcs_block_pi_discard_drain(void);
+void
+cluster_gcs_block_pi_discard_drain(void)
+{}
+
 /* spec-2.17 Step 5 L104 stub:  cluster_grd_deadlock_lmon_tick wired
  * into LMON tick body after dead sweep. */
 void cluster_grd_deadlock_lmon_tick(void);
