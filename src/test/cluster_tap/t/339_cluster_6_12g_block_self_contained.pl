@@ -292,5 +292,93 @@ for my $n ($node0, $node1)
 		. 'block_self_contained on (PinBuffer_Locked regression)');
 }
 
+# ============================================================
+# L6 (spec-6.12h D-h1): Past Image retention on X-transfer.
+# With cluster.past_image on, the old holder's copy is KEPT as a PI
+# (BM_TAG_VALID / !BM_VALID / buffer_type=PI) instead of dropped:
+#   (a) the transfer ticks h_pi_kept_count on the shipping side;
+#   (b) NEVER-SERVE hard invariant, proven on the data plane: after the
+#       peer commits a new version, the old holder's read must return
+#       the NEW value (a served PI byte-image would show the stale one);
+#       the read itself overwrites the PI = the implicit discard.
+# ============================================================
+{
+	for my $n ($node0, $node1)
+	{
+		$n->safe_psql('postgres', 'ALTER SYSTEM SET cluster.past_image = on');
+		$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
+	}
+	usleep(1_000_000);
+	is($node1->safe_psql('postgres', 'SHOW cluster.past_image'), 'on',
+		'L6 cluster.past_image armed on both nodes');
+
+	$node0->safe_psql('postgres', 'CREATE TABLE g_h (id int, v int)');
+	$node1->safe_psql('postgres', 'CREATE TABLE g_h (id int, v int)');
+	my $h0 = $node0->safe_psql('postgres', q{SELECT pg_relation_filepath('g_h')});
+	my $h1 = $node1->safe_psql('postgres', q{SELECT pg_relation_filepath('g_h')});
+	is($h0, $h1, 'L6 g_h relfilepath coincidence holds');
+	ok(write_retry($node0, 'INSERT INTO g_h VALUES (1, 10), (2, 20)'),
+		'L6 seeded');
+	ok(write_retry($node0, 'CHECKPOINT'), 'L6 checkpoint');
+	# hint-预读: stamp the seed ITL so the peer's read resolves locally.
+	$node0->safe_psql('postgres', 'SELECT sum(v) FROM g_h');
+
+	my $kept0 = state_val($node0, 'xnode_lever', 'h_pi_kept_count')
+			  + state_val($node1, 'xnode_lever', 'h_pi_kept_count');
+
+	# Peer write forces the X-transfer away from node0 -> PI conversion at
+	# the shipping side (either drop-site twin, depending on the tag home).
+	ok(write_retry($node1, 'UPDATE g_h SET v = 111 WHERE id = 1'),
+		'L6 peer write moved the block');
+
+	my $kept1 = state_val($node0, 'xnode_lever', 'h_pi_kept_count')
+			  + state_val($node1, 'xnode_lever', 'h_pi_kept_count');
+	cmp_ok($kept1, '>', $kept0, 'L6 a Past Image was kept on transfer');
+
+	# Stamp the peer's committed version so the old holder's verification
+	# read resolves it locally (pair-harness visibility recipe).
+	ok(write_retry($node1, 'CHECKPOINT'), 'L6 peer checkpoint');
+	$node1->safe_psql('postgres', 'SELECT sum(v) FROM g_h');
+
+	# NEVER-SERVE proof, outcomes-audit shape (t/347 L2b precedent): every
+	# node0 read outcome must be EITHER the peer's new value (111) OR a
+	# documented fail-closed refusal — NEVER the PI's stale bytes (v=10 =
+	# P0 false-visible).  On this phantom-shared harness the positive
+	# read-through of a peer-written recycled-ITL version stays behind the
+	# Stage-6 boundary (striping / runtime-visibility off here; t/346
+	# covers the armed positive path), so persistent 53R97-family refusal
+	# is a legal outcome; a served 10 is not.
+	{
+		my $deadline = time() + 20;
+		my ($served_stale, $served_new, $bad_err) = (0, 0, '');
+		while (time() < $deadline)
+		{
+			my $v = eval { $node0->safe_psql('postgres',
+					'SELECT v FROM g_h WHERE id = 1'); };
+			if (defined $v)
+			{
+				if    ($v eq '111') { $served_new = 1; last; }
+				elsif ($v eq '10')  { $served_stale = 1; last; }
+			}
+			else
+			{
+				$bad_err = $1
+				  if !$bad_err && $@ !~ /TT slot recycled|TT status unknown/
+				  && $@ =~ /(ERROR:[^\n]*)/;
+			}
+			usleep(200_000);
+		}
+		is($served_stale, 0,
+			'L6 NEVER-SERVE hard invariant: the stale PI bytes were never '
+			  . 'returned to a query');
+		is($bad_err, '',
+			'L6 refusals stay in the documented fail-closed family');
+		note($served_new
+			  ? 'L6 positive read-through converged (111 served)'
+			  : 'L6 positive read-through stayed fail-closed (phantom-harness '
+			  . 'Stage-6 boundary; armed positive path covered by t/346)');
+	}
+}
+
 $pair->stop_pair if $pair->can('stop_pair');
 done_testing();

@@ -115,6 +115,12 @@ typedef struct ClusterXnodeLeverShared {
 												   * (quiescent X->S succeeded) */
 	pg_atomic_uint64 e2_bast_nudge_refused_count; /* holder: nudges refused
 												   * (active ITL / raced / off) */
+
+	/* ---- wave h: Past Image retention (AD-002 PI orthogonal state) ---- */
+	pg_atomic_uint64 h_pi_kept_count;		/* transfers/invalidates that kept
+										   * a PI instead of dropping */
+	pg_atomic_uint64 h_pi_ineligible_count; /* PI wanted but fell back to the
+											 * plain drop (pinned buffer) */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -166,5 +172,12 @@ extern void cluster_lever_g_note_drift_resolved_via_tt(void);
  */
 extern void cluster_lever_e2_note_nudge_sent(void);
 extern void cluster_lever_e2_note_nudge_result(bool yielded);
+
+/*
+ * Wave-h counters (Past Image retention; ticked from the bufmgr transfer /
+ * invalidate drop sites).
+ */
+extern void cluster_lever_h_note_pi_kept(void);
+extern void cluster_lever_h_note_pi_ineligible(void);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

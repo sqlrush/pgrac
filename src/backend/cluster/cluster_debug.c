@@ -2973,6 +2973,8 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(e2_bast_nudge_sent_count);
 	XNL_ROW(e2_bast_nudge_yield_count);
 	XNL_ROW(e2_bast_nudge_refused_count);
+	XNL_ROW(h_pi_kept_count);
+	XNL_ROW(h_pi_ineligible_count);
 #undef XNL_ROW
 }
 
