@@ -174,7 +174,7 @@ cluster_relmap_arbitrate_pendings(void)
 {
 	char basepath[MAXPGPATH];
 	DIR *dir;
-	struct dirent *de;
+	const struct dirent *de;
 
 	if (!cluster_shared_catalog)
 		return;

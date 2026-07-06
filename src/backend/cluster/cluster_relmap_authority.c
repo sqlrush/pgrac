@@ -351,7 +351,10 @@ cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation)
 void
 cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 generation)
 {
-	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE] = { 0 }; /* zero-init: cppcheck
+														   * cannot see through
+														   * load_authority()'s
+														   * fill of image */
 	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *)image;
 
 	if (!load_authority(shared_map, dbid, image)) {
