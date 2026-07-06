@@ -7675,6 +7675,91 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 }
 
 /* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12h D-h3b (PI snapshot for the
+ * detached recovery rebuild).
+ *
+ *   cluster_bufmgr_snapshot_pi_block(tag, dst, out_ship_scn) — copy a Past
+ *   Image's bytes + its D-h3a ship-SCN stamp out of the buffer pool.  The
+ *   D-h3 rebuild never mutates the resident PI; it replays the dead
+ *   thread's records onto this private copy, so a retry simply re-snapshots
+ *   (idempotence without a page-version gate).
+ *
+ *   Copy safety without a content lock: a !BM_VALID buffer's bytes are only
+ *   ever written inside the StartBufferIO..TerminateBufferIO window, and
+ *   the D-h3a seam resets buffer_type OUT of BUF_TYPE_PI under the header
+ *   lock BEFORE that window opens.  So: validate the PI shape + read the
+ *   stamp under the header lock, raw-pin (keeps buf_id's identity: discard
+ *   and victim reuse both need refcount 0), copy unlocked, then re-lock and
+ *   recheck shape + tag + stamp — if the recheck still sees the stamped PI,
+ *   no overwrite can have STARTED during the copy, hence the copied bytes
+ *   are exactly the conversion-frozen image.  Any recheck failure returns
+ *   false (fail-safe: the caller falls back to storage + full redo).
+ * ======================================================================== */
+bool
+cluster_bufmgr_snapshot_pi_block(BufferTag tag, char *dst, SCN *out_ship_scn)
+{
+	uint32		hash = BufTableHashCode(&tag);
+	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	SCN			ship_scn;
+	bool		intact;
+
+	*out_ship_scn = InvalidScn;
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hash);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| buf->buffer_type != (uint8) BUF_TYPE_PI
+		|| (buf_state & BM_VALID) != 0
+		|| (buf_state & BM_TAG_VALID) == 0
+		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	ship_scn = cluster_pi_shadow_read(buf->buf_id);
+	if (!SCN_VALID(ship_scn))
+	{
+		/* Unstamped PI (clock unarmed at conversion): the recovery boundary
+		 * is unprovable, so the PI is useless as a base (gate UNUSABLE). */
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);	/* raw-pin + unlock header */
+	LWLockRelease(partition_lock);
+
+	memcpy(dst, (char *) BufHdrGetBlock(buf), BLCKSZ);
+
+	buf_state = LockBufHdr(buf);
+	/* SCN_CMP_OK: identity recheck of the same slot (same-stamp equality),
+	 * not a Lamport-order comparison. */
+	intact = BufferTagsEqual(&buf->tag, &tag)
+		&& buf->buffer_type == (uint8) BUF_TYPE_PI
+		&& (buf_state & BM_VALID) == 0
+		&& cluster_pi_shadow_read(buf->buf_id) == ship_scn;
+	UnlockBufHdr(buf, buf_state);
+	cluster_bufmgr_unpin_for_gcs(buf);
+
+	if (!intact)
+		return false;
+
+	*out_ship_scn = ship_scn;
+	return true;
+}
+
+/* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-5.2a D4 (backend eager flush).
  *
  *   cluster_bufmgr_flush_seq_page_to_storage(buffer)

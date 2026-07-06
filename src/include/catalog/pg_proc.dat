@@ -12903,6 +12903,20 @@
   proargnames => '{scope}',
   prosrc => 'cluster_thread_capability_gate_test' },
 
+# spec-6.12h D-h3b: rebuild one block over a dead thread's per-thread WAL
+# window, either from the local Past Image base (ship-SCN-gated) or from a
+# zero base (FPI-first, LSN-gated parity reference), for the byte-for-byte
+# L-h differential.  Returns 'status:ship_scn:applied:skipped:md5'.
+# Superuser-only.
+{ oid => '8975',
+  descr => 'TEST-ONLY: PI-base vs zero-base thread-WAL block rebuild (spec-6.12h)',
+  proname => 'cluster_pi_apply_redo_test',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'regclass int4 int8 int4 pg_lsn pg_lsn bool',
+  proargnames => '{rel,forknum,blocknum,thread_id,start_lsn,end_lsn,use_pi}',
+  prosrc => 'cluster_pi_apply_redo_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or
