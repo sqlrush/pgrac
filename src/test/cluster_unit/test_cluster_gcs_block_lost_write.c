@@ -31,6 +31,11 @@
  *	    L16 cluster_gcs_get_lost_write_avoid_count linkable
  *	    L17 cluster_gcs_block_lost_write_action GUC variable linkable
  *	    L18 placeholder — TAP 116 L1-L10 behavioral coverage
+ *	    L19 spec-6.12h D-h2 cluster_pcm_pi_discard_covered truth table
+ *	    L20 spec-6.12h D-h2 INVALIDATE/ACK wire-overlay constants + 64B lock
+ *	    L21 spec-6.12h D-h2 pi_holder_note / pi_discard_collect linkable
+ *	    L22 spec-6.12h D-h2 bufmgr block_is_pi / discard_pi_block linkable
+ *	    L23 spec-6.12h D-h2 pi-note ring API (note/snapshot/confirm/drain)
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -348,6 +353,83 @@ UT_TEST(test_placeholder_tap_116_lost_write_behavioral)
 }
 
 
+/* ----- L19-L23: spec-6.12h D-h2 PI-discard protocol (U-h) ----- */
+
+UT_TEST(test_pi_discard_covered_truth_table)
+{
+	/* cluster_pcm_pi_discard_covered (cluster_pcm_lock.h static inline):
+	 * SCN-unit-only judge.  Per-thread WAL keeps LSNs in per-node spaces,
+	 * so only the AD-008 Lamport pd_block_scn orders cross-node — the LSN
+	 * watermark is deliberately not consulted.  SCNs here are node-0
+	 * encodings (scn_local(v) == v), so plain small values order. */
+
+	/* SCN unit unarmed -> nothing provable cross-node. */
+	UT_ASSERT(!cluster_pcm_pi_discard_covered(InvalidScn, (SCN)9));
+
+	/* Written version unknown -> fail-safe keep. */
+	UT_ASSERT(!cluster_pcm_pi_discard_covered((SCN)5, InvalidScn));
+
+	/* Equal covers: the durable copy IS the newest shipped version, so
+	 * every PI (that version or older) is redundant with storage. */
+	UT_ASSERT(cluster_pcm_pi_discard_covered((SCN)5, (SCN)5));
+
+	/* Newer covers; older does not. */
+	UT_ASSERT(cluster_pcm_pi_discard_covered((SCN)5, (SCN)9));
+	UT_ASSERT(!cluster_pcm_pi_discard_covered((SCN)5, (SCN)4));
+
+	/* Cross-node encodings: node-id bits must not dominate the order
+	 * (scn_local strips them; a raw uint64 compare would invert this). */
+	UT_ASSERT(cluster_pcm_pi_discard_covered(scn_encode(1, 5), scn_encode(0, 7)));
+	UT_ASSERT(!cluster_pcm_pi_discard_covered(scn_encode(0, 7), scn_encode(1, 5)));
+}
+
+UT_TEST(test_pi_discard_wire_overlay_constants)
+{
+	/* The overlay rides must stay clear of the legacy invalidate-ACK status
+	 * space (0/1/2) and keep both payloads at the locked 64B (§3.6 no
+	 * wire-ABI change: reserved bytes + new status values only). */
+	UT_ASSERT(GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD == 1);
+	UT_ASSERT(GCS_BLOCK_INVALIDATE_ACK_KEPT_PI == 1);
+	UT_ASSERT(GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE == 3);
+	UT_ASSERT(GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE == 4);
+	UT_ASSERT(GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE
+			  != GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE);
+	UT_ASSERT(sizeof(GcsBlockInvalidatePayload) == 64);
+	UT_ASSERT(sizeof(GcsBlockInvalidateAckPayload) == 64);
+}
+
+UT_TEST(test_pi_holder_note_and_collect_prototypes_linkable)
+{
+	void (*note_fp)(BufferTag, int32) = &cluster_pcm_lock_pi_holder_note;
+	bool (*collect_fp)(BufferTag, SCN, uint32 *) = &cluster_pcm_lock_pi_discard_collect;
+
+	UT_ASSERT(note_fp != NULL);
+	UT_ASSERT(collect_fp != NULL);
+}
+
+UT_TEST(test_bufmgr_pi_helpers_prototypes_linkable)
+{
+	bool (*is_pi_fp)(BufferTag) = &cluster_bufmgr_block_is_pi;
+	bool (*discard_fp)(BufferTag) = &cluster_bufmgr_discard_pi_block;
+
+	UT_ASSERT(is_pi_fp != NULL);
+	UT_ASSERT(discard_fp != NULL);
+}
+
+UT_TEST(test_pi_note_ring_api_prototypes_linkable)
+{
+	void (*note_fp)(BufferTag, SCN) = &cluster_gcs_block_pi_write_note;
+	uint64 (*snap_fp)(void) = &cluster_gcs_block_pi_note_presync_snapshot;
+	void (*confirm_fp)(uint64) = &cluster_gcs_block_pi_note_confirm;
+	void (*drain_fp)(void) = &cluster_gcs_block_pi_discard_drain;
+
+	UT_ASSERT(note_fp != NULL);
+	UT_ASSERT(snap_fp != NULL);
+	UT_ASSERT(confirm_fp != NULL);
+	UT_ASSERT(drain_fp != NULL);
+}
+
+
 int
 main(void)
 {
@@ -372,5 +454,10 @@ main(void)
 	UT_RUN(test_lost_write_avoid_count_accessor_linkable);
 	UT_RUN(test_lost_write_action_guc_extern_declared);
 	UT_RUN(test_placeholder_tap_116_lost_write_behavioral);
+	UT_RUN(test_pi_discard_covered_truth_table);
+	UT_RUN(test_pi_discard_wire_overlay_constants);
+	UT_RUN(test_pi_holder_note_and_collect_prototypes_linkable);
+	UT_RUN(test_bufmgr_pi_helpers_prototypes_linkable);
+	UT_RUN(test_pi_note_ring_api_prototypes_linkable);
 	UT_DONE();
 }

@@ -511,6 +511,9 @@ static void BufferSync(int flags);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-6.12h D-h1 — Past Image conversion (definition below). */
 static bool cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state);
+/* PGRAC: spec-6.12h D-h2 — FlushBuffer write-note (cluster_gcs_block.h is
+ * included mid-file, after FlushBuffer; redeclare the one symbol it needs). */
+extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
 #endif
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
@@ -3932,6 +3935,26 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			  buf->tag.blockNum,
 			  bufToWrite,
 			  false);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC spec-6.12h D-h2 (Q25-A "写盘成功" face): a cluster-tracked block's
+	 * CURRENT copy was just written toward shared storage.  Record (tag,
+	 * pd_block_scn) in the PI-discard note ring; the note becomes a discard
+	 * trigger only after the checkpointer's sync phase proves it durable
+	 * (the "checkpoint 推进" face brackets ProcessSyncRequests).  bufToWrite
+	 * is the flushed image, so the recorded pd_block_scn is exactly the
+	 * version that reached storage (the page LSN is deliberately not part of
+	 * the protocol: per-thread WAL keeps LSNs in per-node spaces, so only
+	 * the AD-008 Lamport pd_block_scn is cross-node comparable).  Advisory:
+	 * pcm_state is read unlocked (a spurious or missed note is harmless —
+	 * the master's watermark check and the holder's strict PI-only drop own
+	 * correctness).
+	 */
+	if (cluster_past_image && buf->pcm_state != (uint8) PCM_STATE_N)
+		cluster_gcs_block_pi_write_note(buf->tag,
+										((PageHeader) bufToWrite)->pd_block_scn);
+#endif
 
 	/*
 	 * When a strategy is in use, only flushes of dirty buffers already in the
@@ -7495,6 +7518,90 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
 		return true;
 
+	InvalidateBuffer(buf);		/* releases the header spinlock */
+
+	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12h D-h2 (PI discard helpers).
+ *
+ *   cluster_bufmgr_block_is_pi(tag) — read-only probe: does this tag map to
+ *   a D-h1 Past Image buffer (buffer_type BUF_TYPE_PI)?  The conversion
+ *   sites call it right after the drop helpers above to learn whether the
+ *   drop actually kept a PI (the helpers deliberately return the same true
+ *   for "dropped" and "converted", keeping their ㉕-era ABI), and report
+ *   kept-PI to the master's pi_holders_bitmap.
+ *
+ *   cluster_bufmgr_discard_pi_block(tag) — the PI_DISCARD consumer: drop
+ *   the tag's buffer iff it is strictly a real unpinned Past Image
+ *   (buffer_type PI + !BM_VALID + refcount 0).  A current copy (BM_VALID
+ *   or non-PI buffer_type) is NEVER touched — the master's bitmap may
+ *   over-approximate (legacy HC58 downgrade bits cover live-S holders), so
+ *   the strictness lives HERE.  A pinned PI is a racing re-reader already
+ *   installing over the bytes (the implicit discard) — skip it.  The
+ *   partition lock is released before InvalidateBuffer (it re-acquires the
+ *   partition lock itself; holding it across the call would self-deadlock);
+ *   the header-lock tag re-check covers the unlocked window.
+ * ======================================================================== */
+bool
+cluster_bufmgr_block_is_pi(BufferTag tag)
+{
+	uint32		hash = BufTableHashCode(&tag);
+	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	bool		is_pi;
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hash);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	is_pi = BufferTagsEqual(&buf->tag, &tag)
+		&& buf->buffer_type == (uint8) BUF_TYPE_PI
+		&& (buf_state & BM_VALID) == 0;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	return is_pi;
+}
+
+bool
+cluster_bufmgr_discard_pi_block(BufferTag tag)
+{
+	uint32		hash = BufTableHashCode(&tag);
+	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hash);
+	LWLockRelease(partition_lock);
+	if (buf_id < 0)
+		return false;
+
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| buf->buffer_type != (uint8) BUF_TYPE_PI
+		|| (buf_state & BM_VALID) != 0
+		|| BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+
+	/* A PI carries no residency claim (D-h1 set pcm_state N at conversion),
+	 * but clear it again under the lock so InvalidateBuffer's eviction hook
+	 * can never see a stale mode and emit a release wire from LMON. */
+	buf->pcm_state = (uint8) PCM_STATE_N;
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;

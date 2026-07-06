@@ -97,6 +97,12 @@ cluster_xnode_lever_shmem_init(void)
 		/* spec-6.12h */
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_kept_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_ineligible_count, 0);
+		/* spec-6.12h D-h2 */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_write_note_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_note_overflow_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discard_notify_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discarded_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discard_miss_count, 0);
 	}
 }
 
@@ -359,4 +365,38 @@ cluster_lever_h_note_pi_ineligible(void)
 	if (!lever_h_counting())
 		return;
 	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_ineligible_count, 1);
+}
+
+/* spec-6.12h D-h2 — FlushBuffer noted a tracked-block write (or the note
+ * ring was full and the note was dropped, fail-safe). */
+void
+cluster_lever_h_note_write_note(bool overflowed)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(overflowed ? &ClusterXnodeLeverCtl->h_pi_note_overflow_count
+									   : &ClusterXnodeLeverCtl->h_pi_write_note_count,
+							1);
+}
+
+/* spec-6.12h D-h2 — the master issued a PI_DISCARD directive (INVALIDATE
+ * ride to a remote holder, or the local drop on the master itself). */
+void
+cluster_lever_h_note_discard_notify(void)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_discard_notify_count, 1);
+}
+
+/* spec-6.12h D-h2 — a PI_DISCARD directive landed: the holder either truly
+ * invalidated a BUF_TYPE_PI buffer or found no droppable PI (miss). */
+void
+cluster_lever_h_note_discard_result(bool discarded)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(discarded ? &ClusterXnodeLeverCtl->h_pi_discarded_count
+									  : &ClusterXnodeLeverCtl->h_pi_discard_miss_count,
+							1);
 }
