@@ -181,7 +181,8 @@ sub burn_xids
 }
 
 # Read {magic, retired} of a region-4 stripe slot from a voting disk
-# file.  Slot N sits at ((3 * 128) + N) * 512; magic "PGXS" =
+# file.  Slot N sits at ((4 * 128) + N) * 512 (region 5, after the
+# spec-6.4 ADG lease region); magic "PGXS" =
 # 0x50475853 LE; the retired flag is the byte at record offset 12
 # (magic 4 + version 4 + node_id 4).
 sub read_stripe_slot
@@ -189,7 +190,7 @@ sub read_stripe_slot
 	my ($path, $node) = @_;
 	open(my $fh, '<', $path) or return undef;
 	binmode $fh;
-	return undef unless seek($fh, (3 * 128 + $node) * 512, 0);
+	return undef unless seek($fh, (4 * 128 + $node) * 512, 0);
 	my $buf;
 	return undef unless read($fh, $buf, 16) == 16;
 	close $fh;
@@ -198,13 +199,13 @@ sub read_stripe_slot
 }
 
 # Read the region-5 activation record magic from a voting disk file.
-# Region 5 sits at offset 4 * 128 * 512; magic "PGXA" = 0x50475841 LE.
+# Region 6 sits at offset 5 * 128 * 512; magic "PGXA" = 0x50475841 LE.
 sub read_activation_magic
 {
 	my ($path) = @_;
 	open(my $fh, '<', $path) or return undef;
 	binmode $fh;
-	return undef unless seek($fh, 4 * 128 * 512, 0);
+	return undef unless seek($fh, 5 * 128 * 512, 0);
 	my $buf;
 	return undef unless read($fh, $buf, 4) == 4;
 	close $fh;

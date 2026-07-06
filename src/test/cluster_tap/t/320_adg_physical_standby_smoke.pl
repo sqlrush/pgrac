@@ -189,7 +189,7 @@ for my $i (0 .. 2)
 	my $path = "$disk_dir/disk$i";
 	open(my $fh, '>', $path) or die "open $path: $!";
 	binmode $fh;
-	print $fh ("\0" x 262144);
+	print $fh ("\0" x 328192);
 	close $fh;
 	push @voting_disks, $path;
 }
