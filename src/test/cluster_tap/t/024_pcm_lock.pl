@@ -162,8 +162,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '150',
-   'L6a pg_stat_cluster_injections has 141 entries (spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+   '154',
+   'L6a pg_stat_cluster_injections has 154 entries (spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is($node->safe_psql(
 		'postgres',
@@ -189,8 +189,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '53',
-   'L7b pg_cluster_state has 53 distinct categories (spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever)');
+   '54',
+   'L7b pg_cluster_state has 54 distinct categories (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever)');
 
 
 # ----------
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '53', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (53 categories; spec-6.2 adds smart_fusion)');
+is($smoke_categories, '54', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (54 categories; spec-6.15 adds xid_stripe)');
 
 
 # ----------
