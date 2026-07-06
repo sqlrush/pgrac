@@ -3,31 +3,49 @@
 #
 # pgrac-init -- initialise a new pgrac data directory
 #
-# Stage 0.20 stub: a thin wrapper around initdb that additionally
-# (a) sets cluster.node_id in postgresql.conf, and (b) writes a
-# minimal pgrac.conf with a [node.<id>] section.  Stage 2+ will
-# extend this script (or replace it) with multi-node bootstrap
-# orchestration.
+# Stage 0.20 shipped the thin wrapper around initdb that (a) sets
+# cluster.node_id in postgresql.conf, and (b) writes a minimal
+# pgrac.conf with a [node.<id>] section.  spec-4.1 added the
+# per-thread WAL layout (--wal-threads-dir).  spec-6.14 adds the
+# shared-catalog bootstrap modes:
+#
+#   --cluster-seed   initdb the FIRST node and wire the shared-catalog
+#                    GUC set; the node's first (single-node) start
+#                    seeds the shared authorities under
+#                    cluster.shared_data_dir.
+#   --cluster-join   provision an ADDITIONAL node from a pg_basebackup
+#                    of the seed (live via --join-from, or a backup
+#                    directory via --join-from-backup); no initdb runs
+#                    on a joiner, the server adopts the shared catalog
+#                    authority at first start.
 #
 # Author: SqlRush <sqlrush@gmail.com>
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # Spec:   specs/spec-0.20-init-tools.md
+#         specs/spec-6.14-shared-catalog-single-authority.md
 # Design: docs/cluster-conf-design.md (pgrac.conf format)
 #
 #-------------------------------------------------------------------------
 set -euo pipefail
 
 PROGNAME="pgrac-init"
-PGRAC_VERSION="0.1.0-stage0.20"
+PGRAC_VERSION="0.1.0-stage6.14"
 
 # ---- defaults ---------------------------------------------------------
 PGDATA_OPT=""
 NODE_ID="0"
+NODE_ID_SET="no"
 CLUSTER_NAME="pgrac"
 INITDB_OPTS=""
 FORCE="no"
 WAL_THREADS_DIR=""
+MODE_SEED="no"
+MODE_JOIN="no"
+SHARED_DATA_DIR=""
+JOIN_FROM=""
+JOIN_FROM_BACKUP=""
+INTERCONNECT_ADDR=""
 
 # ---- helpers ----------------------------------------------------------
 
@@ -61,6 +79,28 @@ Options:
                              (use --initdb-options="--encoding=UTF8 --locale=C")
   -V, --version              output version information, then exit
   -?, --help                 show this help, then exit
+
+Shared-catalog cluster modes (spec-6.14):
+      --cluster-seed         initialise the FIRST node of a shared-catalog
+                             cluster: runs the normal initdb path and wires
+                             the shared-catalog GUC set into postgresql.conf;
+                             the node's first (single-node) start seeds the
+                             shared authorities under --shared-data-dir
+      --cluster-join         provision an ADDITIONAL node: no initdb runs;
+                             the data directory is cloned from a pg_basebackup
+                             of the seed node and re-identified as this node
+                             (requires an explicit --node-id and exactly one
+                             of --join-from / --join-from-backup)
+      --shared-data-dir=DIR  shared-storage root holding the cluster-wide
+                             catalog authorities (absolute path; required by
+                             both modes; written as cluster.shared_data_dir)
+      --join-from=CONNINFO   take the clone with pg_basebackup from the
+                             RUNNING seed node (connection string or URI)
+      --join-from-backup=DIR clone an existing pg_basebackup directory
+                             (raw data-directory copies are refused: the
+                             backup must carry backup_label)
+      --interconnect-addr=A  host:port of THIS node's interconnect endpoint;
+                             appended to pgrac.conf as the [node.<id>] section
 
 Report bugs to <https://github.com/sqlrush/pgrac/issues>.
 EOF
@@ -142,7 +182,7 @@ set_postgresql_conf_value() {
 # Write pgrac.conf with the [cluster] header and one [node.N] section.
 # Refuses to overwrite an existing file unless --force.
 write_pgrac_conf() {
-    local conf="$1" node_id="$2" cluster_name="$3"
+    local conf="$1" node_id="$2" cluster_name="$3" addr="${4:-127.0.0.1:6432}"
     local hostname_short
     hostname_short=$(hostname -s 2>/dev/null || hostname || echo "localhost")
     if [ -e "$conf" ] && [ "$FORCE" != "yes" ]; then
@@ -157,11 +197,69 @@ write_pgrac_conf() {
 name = $cluster_name
 
 [node.$node_id]
-interconnect_addr = 127.0.0.1:6432
+interconnect_addr = $addr
 hostname = $hostname_short
 role = primary
 EOF
     echo "$PROGNAME: wrote $conf"
+}
+
+# Read the effective (last uncommented) value of a postgresql.conf key.
+# Prints nothing when the key is not set.
+get_postgresql_conf_value() {
+    local conf="$1" key="$2"
+    local key_re="${key//./\\.}"
+    local pattern="^[[:space:]]*${key_re}[[:space:]]*="
+    # "|| true": an unset key is an empty result, not an errexit death
+    # (grep exits 1 on no match and pipefail propagates it).
+    grep -E "$pattern" "$conf" 2>/dev/null | tail -1 \
+        | sed -E "s/^[[:space:]]*${key_re}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//" \
+        || true
+}
+
+# set_postgresql_conf_value with overwrite always allowed.  Join mode
+# uses this for the keys whose cloned value is EXPECTED to differ
+# (cluster.node_id carries the clone source's identity).
+force_set_postgresql_conf_value() {
+    local saved_force="$FORCE"
+    FORCE="yes"
+    set_postgresql_conf_value "$@"
+    FORCE="$saved_force"
+}
+
+# Wire the shared-catalog GUC set (the spec-6.14 dependency closure:
+# the server's enable-time vet demands every one of these).  Idempotent
+# when the values already match; a DIFFERING pre-existing value fails
+# without --force, which is the right fail-closed default for a clone
+# whose source pointed at another shared tree.
+append_shared_catalog_gucs() {
+    local conf="$1" shared_dir="$2"
+    set_postgresql_conf_value "$conf" "cluster.shared_storage_backend" "cluster_fs"
+    set_postgresql_conf_value "$conf" "cluster.shared_data_dir" "'$shared_dir'"
+    set_postgresql_conf_value "$conf" "cluster.smgr_user_relations" "on"
+    set_postgresql_conf_value "$conf" "cluster.controlfile_shared_authority" "on"
+    set_postgresql_conf_value "$conf" "cluster.shared_catalog" "on"
+    set_postgresql_conf_value "$conf" "cluster.merged_recovery" "on"
+}
+
+# Append this node's [node.N] section to an existing pgrac.conf (the
+# clone carries the seed's topology file).  A pre-existing [node.N]
+# section means the id is already taken in the topology -- refuse.
+append_pgrac_conf_node_section() {
+    local conf="$1" node_id="$2" addr="$3"
+    local hostname_short
+    hostname_short=$(hostname -s 2>/dev/null || hostname || echo "localhost")
+    if grep -Eq "^\[node\.${node_id}\]" "$conf"; then
+        die "$conf already has a [node.$node_id] section (node id taken; choose another --node-id or edit pgrac.conf manually)"
+    fi
+    cat >>"$conf" <<EOF
+
+[node.$node_id]
+interconnect_addr = $addr
+hostname = $hostname_short
+role = primary
+EOF
+    echo "$PROGNAME: appended [node.$node_id] to $conf"
 }
 
 # Detect whether the PG binary in this install was built with
@@ -209,9 +307,49 @@ while [ $# -gt 0 ]; do
             shift
             [ $# -gt 0 ] || die "option --node-id requires an argument"
             NODE_ID="$1"
+            NODE_ID_SET="yes"
             ;;
         --node-id=*)
             NODE_ID="${1#*=}"
+            NODE_ID_SET="yes"
+            ;;
+        --cluster-seed)
+            MODE_SEED="yes"
+            ;;
+        --cluster-join)
+            MODE_JOIN="yes"
+            ;;
+        --shared-data-dir)
+            shift
+            [ $# -gt 0 ] || die "option --shared-data-dir requires an argument"
+            SHARED_DATA_DIR="$1"
+            ;;
+        --shared-data-dir=*)
+            SHARED_DATA_DIR="${1#*=}"
+            ;;
+        --join-from)
+            shift
+            [ $# -gt 0 ] || die "option --join-from requires an argument"
+            JOIN_FROM="$1"
+            ;;
+        --join-from=*)
+            JOIN_FROM="${1#*=}"
+            ;;
+        --join-from-backup)
+            shift
+            [ $# -gt 0 ] || die "option --join-from-backup requires an argument"
+            JOIN_FROM_BACKUP="$1"
+            ;;
+        --join-from-backup=*)
+            JOIN_FROM_BACKUP="${1#*=}"
+            ;;
+        --interconnect-addr)
+            shift
+            [ $# -gt 0 ] || die "option --interconnect-addr requires an argument"
+            INTERCONNECT_ADDR="$1"
+            ;;
+        --interconnect-addr=*)
+            INTERCONNECT_ADDR="${1#*=}"
             ;;
         --cluster-name)
             shift
@@ -287,9 +425,195 @@ if [ "$NODE_ID" -lt 0 ] || [ "$NODE_ID" -gt 127 ]; then
     die "--node-id must be in [0, 127] (got $NODE_ID)"
 fi
 
+# ---- shared-catalog mode validation (spec-6.14) -----------------------
+
+if [ "$MODE_SEED" = "yes" ] && [ "$MODE_JOIN" = "yes" ]; then
+    die "--cluster-seed and --cluster-join are mutually exclusive"
+fi
+if [ "$MODE_SEED" = "yes" ] || [ "$MODE_JOIN" = "yes" ]; then
+    [ -n "$SHARED_DATA_DIR" ] \
+        || die "--shared-data-dir is required by --cluster-seed/--cluster-join"
+    case "$SHARED_DATA_DIR" in
+        /*) ;;
+        *) die "--shared-data-dir must be an absolute path (got \"$SHARED_DATA_DIR\")" ;;
+    esac
+else
+    [ -z "$JOIN_FROM" ] && [ -z "$JOIN_FROM_BACKUP" ] \
+        || die "--join-from/--join-from-backup require --cluster-join"
+    [ -z "$SHARED_DATA_DIR" ] \
+        || die "--shared-data-dir requires --cluster-seed or --cluster-join"
+fi
+if [ "$MODE_JOIN" = "yes" ]; then
+    [ "$NODE_ID_SET" = "yes" ] \
+        || die "--cluster-join requires an explicit --node-id (a joiner must not reuse the seed's id)"
+    if [ -n "$JOIN_FROM" ] && [ -n "$JOIN_FROM_BACKUP" ]; then
+        die "--join-from and --join-from-backup are mutually exclusive"
+    fi
+    if [ -z "$JOIN_FROM" ] && [ -z "$JOIN_FROM_BACKUP" ]; then
+        die "--cluster-join requires a clone source (--join-from=CONNINFO or --join-from-backup=DIR)"
+    fi
+    [ -z "$INITDB_OPTS" ] \
+        || die "--initdb-options cannot be used with --cluster-join (a joiner never runs initdb)"
+fi
+
+# ---- join mode (spec-6.14 D2): clone, re-identify, wire ---------------
+#
+# A joiner never runs initdb: it is provisioned from a pg_basebackup of
+# the seed node (both nodes must share ONE system identifier -- the
+# server's boot-time authority vet enforces it), re-identified with its
+# own node id, and pointed at the shared tree.  First start runs label
+# recovery and adopts the shared catalog authority.
+
+if [ "$MODE_JOIN" = "yes" ]; then
+    # The shared tree must already carry the seeded authorities: the
+    # seed node's first start publishes them, and joining before that
+    # can only produce a divergent catalog.
+    if [ ! -f "$SHARED_DATA_DIR/global/pgrac_catalog_authority" ] \
+        || [ ! -e "$SHARED_DATA_DIR/global/pg_control" ]; then
+        die "shared tree \"$SHARED_DATA_DIR\" has no catalog authority yet (the seed node must complete its first start before nodes can join)"
+    fi
+
+    # Never clobber an existing data directory.
+    if [ -e "$TARGET_PGDATA" ] && [ -n "$(ls -A "$TARGET_PGDATA" 2>/dev/null)" ]; then
+        die "target PGDATA \"$TARGET_PGDATA\" exists and is not empty"
+    fi
+
+    if [ -n "$JOIN_FROM_BACKUP" ]; then
+        [ -d "$JOIN_FROM_BACKUP" ] \
+            || die "backup directory \"$JOIN_FROM_BACKUP\" does not exist"
+        [ -f "$JOIN_FROM_BACKUP/PG_VERSION" ] \
+            || die "\"$JOIN_FROM_BACKUP\" is not a PostgreSQL backup (PG_VERSION missing)"
+        # Raw data-directory copies are refused: the joiner first-boot
+        # contract is a label-provisioned tree (the server seeds this
+        # node's recovery identity from the label boot; a raw clone's
+        # behaviour is undefined).
+        [ -f "$JOIN_FROM_BACKUP/backup_label" ] \
+            || die "\"$JOIN_FROM_BACKUP\" has no backup_label; raw data-directory copies are not a supported join source -- take the backup with pg_basebackup"
+    fi
+
+    warn_if_disable_cluster_build
+
+    mkdir -p "$TARGET_PGDATA" || die "could not create \"$TARGET_PGDATA\""
+    chmod 700 "$TARGET_PGDATA"
+
+    # From here on a failure leaves a half-provisioned clone: remove it
+    # so a corrected re-run does not trip the non-empty-target check.
+    join_die() {
+        rm -rf "$TARGET_PGDATA"
+        die "$@"
+    }
+
+    if [ -n "$JOIN_FROM_BACKUP" ]; then
+        echo "$PROGNAME: cloning backup \"$JOIN_FROM_BACKUP\""
+        if ! (cd "$JOIN_FROM_BACKUP" && tar cf - .) | (cd "$TARGET_PGDATA" && tar xf -); then
+            join_die "could not copy \"$JOIN_FROM_BACKUP\" to \"$TARGET_PGDATA\""
+        fi
+    else
+        PG_BASEBACKUP=$(locate_pg_tool pg_basebackup PG_BASEBACKUP)
+        echo "$PROGNAME: taking pg_basebackup from \"$JOIN_FROM\""
+        if ! "$PG_BASEBACKUP" -D "$TARGET_PGDATA" -d "$JOIN_FROM" -c fast; then
+            join_die "pg_basebackup from \"$JOIN_FROM\" failed"
+        fi
+    fi
+
+    PG_CONF="$TARGET_PGDATA/postgresql.conf"
+    PGRAC_CONF="$TARGET_PGDATA/pgrac.conf"
+    [ -f "$PG_CONF" ] || join_die "$PG_CONF missing -- clone did not produce expected layout"
+
+    # Re-identify: the clone carries the SOURCE's node id.  Reusing it
+    # would put two live nodes on one identity -- refuse.
+    SOURCE_NODE_ID=$(get_postgresql_conf_value "$PG_CONF" "cluster.node_id")
+    if [ -n "$SOURCE_NODE_ID" ] && [ "$SOURCE_NODE_ID" = "$NODE_ID" ]; then
+        join_die "--node-id=$NODE_ID is the clone source's own node id (each node needs a distinct id)"
+    fi
+    force_set_postgresql_conf_value "$PG_CONF" "cluster.node_id" "$NODE_ID"
+
+    append_shared_catalog_gucs "$PG_CONF" "$SHARED_DATA_DIR"
+
+    # WAL stream identity.  A clone whose pg_wal is a symlink points at
+    # the SOURCE's per-thread WAL stream; sharing it corrupts both
+    # nodes, so demand a thread home of this node's own.
+    if [ -L "$TARGET_PGDATA/pg_wal" ]; then
+        if [ -z "$WAL_THREADS_DIR" ]; then
+            join_die "the clone's pg_wal is a symlink to the source's WAL thread; pass --wal-threads-dir so this node gets its own WAL stream"
+        fi
+        rm "$TARGET_PGDATA/pg_wal"
+        mkdir "$TARGET_PGDATA/pg_wal"
+    fi
+    if [ -n "$WAL_THREADS_DIR" ]; then
+        case "$WAL_THREADS_DIR" in
+            /*) ;;
+            *) join_die "--wal-threads-dir must be an absolute path (got \"$WAL_THREADS_DIR\")" ;;
+        esac
+        THREAD_ID=$((NODE_ID + 1))
+        THREAD_DIR="$WAL_THREADS_DIR/thread_$THREAD_ID"
+        if [ -d "$THREAD_DIR" ] && [ -n "$(ls -A "$THREAD_DIR" 2>/dev/null)" ]; then
+            join_die "WAL thread directory \"$THREAD_DIR\" is not empty (another node's stream?)"
+        fi
+        mkdir -p "$WAL_THREADS_DIR" || join_die "could not create \"$WAL_THREADS_DIR\""
+        if [ -d "$THREAD_DIR" ]; then
+            rmdir "$THREAD_DIR" || join_die "could not remove empty \"$THREAD_DIR\""
+        fi
+        # Relocate the clone's pg_wal (it holds the WAL the label boot
+        # replays) to this node's thread home, initdb -X style.
+        if ! mv "$TARGET_PGDATA/pg_wal" "$THREAD_DIR"; then
+            join_die "could not move pg_wal to \"$THREAD_DIR\""
+        fi
+        ln -s "$THREAD_DIR" "$TARGET_PGDATA/pg_wal" \
+            || join_die "could not symlink pg_wal to \"$THREAD_DIR\""
+        set_postgresql_conf_value "$PG_CONF" "cluster.wal_threads_dir" "'$WAL_THREADS_DIR'"
+        echo "$PROGNAME: WAL thread $THREAD_ID stream at \"$THREAD_DIR\""
+    fi
+
+    # Topology: the clone carries the seed's pgrac.conf.  Append this
+    # node's section when we know its interconnect address; otherwise
+    # remind the operator.
+    if [ -n "$INTERCONNECT_ADDR" ]; then
+        if [ -f "$PGRAC_CONF" ]; then
+            append_pgrac_conf_node_section "$PGRAC_CONF" "$NODE_ID" "$INTERCONNECT_ADDR"
+        else
+            write_pgrac_conf "$PGRAC_CONF" "$NODE_ID" "$CLUSTER_NAME" "$INTERCONNECT_ADDR"
+        fi
+        cat <<EOF
+$PROGNAME: add the same [node.$NODE_ID] section to pgrac.conf on EVERY
+$PROGNAME: other node of the cluster (the topology file is per-node).
+EOF
+    else
+        cat <<EOF
+$PROGNAME: no --interconnect-addr given; before starting, add this
+$PROGNAME: node's section to pgrac.conf on this node AND on every other
+$PROGNAME: node of the cluster:
+    [node.$NODE_ID]
+    interconnect_addr = <host:port>
+EOF
+    fi
+
+    cat <<EOF
+
+$PROGNAME: node $NODE_ID joined the shared-catalog cluster at \"$TARGET_PGDATA\".
+$PROGNAME: first start runs label recovery and adopts the shared catalog
+$PROGNAME: authority under \"$SHARED_DATA_DIR\".
+
+You can now start the node with:
+    pgrac-start -D \"$TARGET_PGDATA\"
+EOF
+    exit 0
+fi
+
 INITDB=$(locate_pg_tool initdb INITDB)
 
 warn_if_disable_cluster_build
+
+# ---- seed preflight (spec-6.14 D2) ------------------------------------
+#
+# A FRESH initdb mints a brand-new system identifier; against a shared
+# tree that already carries a catalog authority the boot-time identity
+# vet can only FATAL.  Refuse up front and point at the join mode.
+
+if [ "$MODE_SEED" = "yes" ] && [ ! -f "$TARGET_PGDATA/PG_VERSION" ] \
+    && [ -f "$SHARED_DATA_DIR/global/pgrac_catalog_authority" ]; then
+    die "shared tree \"$SHARED_DATA_DIR\" already carries a catalog authority; a fresh initdb can never match it (use --cluster-join to attach an additional node)"
+fi
 
 # ---- Step 0: per-thread WAL layout (spec-4.1) -------------------------
 #
@@ -348,12 +672,24 @@ if [ -n "$WAL_THREADS_DIR" ]; then
     set_postgresql_conf_value "$PG_CONF" "cluster.wal_threads_dir" "'$WAL_THREADS_DIR'"
 fi
 
+# ---- Step 2b: shared-catalog seed wiring (spec-6.14 D2) ----------------
+#
+# The GUC set is the whole seed-side story: the server's first
+# (single-node) start migrates this node's catalog into the shared tree
+# and publishes the authorities, postmaster-once and idempotent.
+
+if [ "$MODE_SEED" = "yes" ]; then
+    mkdir -p "$SHARED_DATA_DIR/global" \
+        || die "could not create \"$SHARED_DATA_DIR/global\""
+    append_shared_catalog_gucs "$PG_CONF" "$SHARED_DATA_DIR"
+fi
+
 # ---- Step 3: write pgrac.conf -----------------------------------------
 
 if [ -f "$PGRAC_CONF" ] && [ "$FORCE" != "yes" ]; then
     echo "$PROGNAME: $PGRAC_CONF already exists, leaving in place (use --force to overwrite)"
 else
-    write_pgrac_conf "$PGRAC_CONF" "$NODE_ID" "$CLUSTER_NAME"
+    write_pgrac_conf "$PGRAC_CONF" "$NODE_ID" "$CLUSTER_NAME" "$INTERCONNECT_ADDR"
 fi
 
 # ---- Step 4: success message ------------------------------------------
@@ -362,6 +698,19 @@ cat <<EOF
 
 $PROGNAME: pgrac data directory ready at \"$TARGET_PGDATA\".
 $PROGNAME: cluster.node_id = $NODE_ID, cluster name = \"$CLUSTER_NAME\".
+EOF
+
+if [ "$MODE_SEED" = "yes" ]; then
+    cat <<EOF
+
+$PROGNAME: shared-catalog seed node.  The FIRST start must complete
+$PROGNAME: single-node: it seeds the shared catalog authority under
+$PROGNAME: \"$SHARED_DATA_DIR\".  Take joiner backups (pgrac-init
+$PROGNAME: --cluster-join) only after that first start.
+EOF
+fi
+
+cat <<EOF
 
 You can now start the cluster with:
     pgrac-start -D \"$TARGET_PGDATA\"
