@@ -324,6 +324,49 @@ UT_TEST(test_s_granted_xholder_downgrade_status_is_15)
 }
 
 
+/* PGRAC: spec-6.12e2 (㉔) — the BAST nudge is VALUE 2 in the same
+ * reserved_0[3] byte as the ㉕ downgrade request (value 1).  The two
+ * predicates must be disjoint (a nudge is NOT a downgrade-with-ship
+ * request and vice versa), the nudge must not disturb the neighbour
+ * overlays, and clearing via SetDowngradeRequest(false) resets the byte. */
+UT_TEST(test_bast_nudge_flag_disjoint_from_downgrade_request)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsBastNudge(&fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	/* nudge alone: nudge yes, downgrade-request no */
+	GcsBlockForwardPayloadSetBastNudge(&fwd);
+	UT_ASSERT(GcsBlockForwardPayloadIsBastNudge(&fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	/* downgrade request overwrites: downgrade yes, nudge no */
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+	UT_ASSERT(!GcsBlockForwardPayloadIsBastNudge(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	/* clear resets both readings */
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsBastNudge(&fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	/* neighbour overlays undisturbed by the nudge */
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+	GcsBlockForwardPayloadSetBastNudge(&fwd);
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsBastNudge(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
 /* PGRAC: spec-6.12b — CR request flag rides reserved_0[4] independently and
  * the CR result statuses are the enum tail (16/17). */
 UT_TEST(test_cr_request_flag_round_trip_independent)
@@ -541,6 +584,7 @@ main(void)
 	UT_RUN(test_l21_hc112_unlock_preserves_bit_documented_in_tap);
 	UT_RUN(test_l22_master_holder_lifecycle_documented_in_tap);
 	UT_RUN(test_downgrade_request_flag_round_trip_independent);
+	UT_RUN(test_bast_nudge_flag_disjoint_from_downgrade_request);
 	UT_RUN(test_s_granted_xholder_downgrade_status_is_15);
 	UT_RUN(test_cr_request_flag_round_trip_independent);
 	UT_RUN(test_cr_result_statuses_are_16_17);

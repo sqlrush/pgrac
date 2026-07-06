@@ -123,15 +123,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'153',
-	'all 153 injection points have a .fault_type entry under inject category (spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'154',
+	'all 154 injection points have a .fault_type entry under inject category (spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'153',
-	'all 153 injection points have a .hits entry under inject category (spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'154',
+	'all 154 injection points have a .hits entry under inject category (spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 
 # ----------

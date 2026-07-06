@@ -1082,7 +1082,38 @@ GcsBlockForwardPayloadSetDowngradeRequest(GcsBlockForwardPayload *p, bool downgr
 static inline bool
 GcsBlockForwardPayloadIsDowngradeRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[3] != 0;
+	/* PGRAC: spec-6.12e2 — value 2 in the same byte is the BAST-nudge
+	 * variant (below); the ㉕ downgrade-with-ship request is exactly 1.
+	 * Existing senders only ever wrote 0/1, so the narrowed predicate is
+	 * wire-compatible. */
+	return p->reserved_0[3] == 1;
+}
+
+/* PGRAC: spec-6.12e2 (㉔) — BAST nudge carried as VALUE 2 in the same
+ * reserved_0[3] byte (all seven reserved bytes are taken; the ㉕ request
+ * uses value 1, so the byte becomes a tiny enum: 0=none, 1=downgrade-
+ * with-ship, 2=nudge-only).
+ *
+ *	Sent by the MASTER, fire-and-forget (request_id 0, no reply of any
+ *	kind), when it must DENY an X request because another LIVE node
+ *	holds X (the HG7 conservative deny): the holder's LMON should TRY
+ *	the quiescent X→S self-downgrade NOW instead of waiting for a
+ *	natural release, so the requester's bounded retry finds an
+ *	S-invalidate-able holder and the grant proceeds (Oracle BAST → LMS
+ *	background yield; never interrupts a foreground session).  Refusal
+ *	(active ITL / pinned / raced / flush unavailable) leaves today's
+ *	deny-retry path untouched — the nudge is advisory, never a command,
+ *	and the e1 release-side path remains the fallback (§3.4b). */
+static inline void
+GcsBlockForwardPayloadSetBastNudge(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[3] = (uint8)2;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsBastNudge(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[3] == 2;
 }
 
 /* PGRAC: spec-6.12b — cross-instance CR request flag carried in reserved_0[4]

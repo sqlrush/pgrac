@@ -369,6 +369,17 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-undo-fetch" },
 	/*
+	 * spec-6.12e2 — holder-side BAST-nudge refusal injection.
+	 *
+	 *	cluster-gcs-block-bast-nudge:
+	 *	  Fires in the holder's forward handler on a nudge-flagged FORWARD
+	 *	  just before the quiescent X->S downgrade attempt.  SKIP forces
+	 *	  the refusal branch so TAP pins the advisory contract: the
+	 *	  requester's deny-retry (e1 release-side) path stays intact when
+	 *	  the holder does not yield.
+	 */
+	{ .name = "cluster-gcs-block-bast-nudge" },
+	/*
 	 * spec-5.2a D3 — FAITHFUL clean-page stale-holder injection.
 	 *
 	 *	cluster-clean-xfer-stale-holder:

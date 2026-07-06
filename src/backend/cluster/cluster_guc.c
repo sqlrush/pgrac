@@ -110,6 +110,9 @@ bool cluster_crossnode_cr_data_plane = false;
 /* spec-6.12g: block self-containment (active-ITL migration + opportunistic
  * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
 bool cluster_block_self_contained = false;
+/* spec-6.12e2: master->holder BAST nudge on live-X-holder deny (default
+ * OFF = e1 release-side handoff only). */
+bool cluster_ges_bast = false;
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * resolution via undo-block CF fetch (default OFF = 53R97). */
 bool cluster_crossnode_runtime_visibility = false;
@@ -1631,6 +1634,26 @@ cluster_init_guc(void)
 					 "(spec-6.12g)."),
 		gettext_noop("Off keeps the spec-5.2 D11 writer-transfer deferral for active-ITL blocks."),
 		&cluster_block_self_contained, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.ges_bast -- spec-6.12 wave e2 (㉔ form).  When the master
+	 * must DENY an X request because ANOTHER live node holds the block in
+	 * X (the HG7 conservative deny), it additionally sends the holder a
+	 * fire-and-forget BAST nudge: the holder's LMON tries the quiescent
+	 * X->S self-downgrade right away instead of waiting for a natural
+	 * release, so the requester's bounded retry can proceed through the
+	 * S-invalidate grant path (Oracle BAST -> holder LMS background
+	 * yield; the foreground session is never interrupted).  The nudge is
+	 * advisory: any refusal (active ITL, pinned, raced) leaves the
+	 * deny-retry (e1 release-side) path untouched.  Default OFF =
+	 * byte-identical deny behaviour.  SUSET for measurement windows.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ges_bast",
+		gettext_noop("Send a BAST nudge to a live X holder blocking a peer writer "
+					 "(spec-6.12e2)."),
+		gettext_noop("Off keeps the deny-and-retry path without nudging the holder."),
+		&cluster_ges_bast, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes
