@@ -161,6 +161,7 @@ OBJS = \
 	cluster_catalog_migrate.o \
 	cluster_oid_lease.o \
 	cluster_oid_lease_shmem.o \
+	cluster_relmap_arb.o \
 	cluster_relmap_authority.o \
 	cluster_relmap_lock.o \
 	cluster_sequence.o \

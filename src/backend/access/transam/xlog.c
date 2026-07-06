@@ -193,6 +193,7 @@
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
+#include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
@@ -6187,6 +6188,15 @@ StartupXLOG(void)
 		promoted = PerformRecoveryXLogAction();
 
 #ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC spec-6.14 D5: with recovery durable, the sole merger resolves
+	 * any staged relmap-authority pending image (publish if the owner
+	 * committed, discard if it aborted, keep + fail-closed if unprovable)
+	 * BEFORE the claim is released -- no concurrent merger, no live relmap
+	 * writer can race the arbitration.  No-op without the claim.
+	 */
+	cluster_relmap_arbitrate_pendings();
+
 	/*
 	 * PGRAC spec-6.14 D9 amend (INV-D9-R): release the shared-regime
 	 * crash-recovery claim only NOW -- the end-of-recovery checkpoint above

@@ -577,6 +577,17 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 }
 
 /*
+ * cluster_recovery_merge_claim_is_held -- is this node the sole merger?
+ *	(spec-6.14 D5 arbitration gates on it: only the claim holder may
+ *	resolve pending relmap images.)
+ */
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return merge_claim_held;
+}
+
+/*
  * cluster_recovery_merge_claim_release_if_held -- see header.
  */
 void

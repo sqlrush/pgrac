@@ -421,6 +421,7 @@ extern ClusterMergeEngage cluster_recovery_merge_decide(uint16 own_thread, XLogR
  * writes). */
 extern void cluster_recovery_merge_claim_acquire_blocking(void);
 extern void cluster_recovery_merge_claim_release_if_held(void);
+extern bool cluster_recovery_merge_claim_is_held(void);
 
 extern ClusterRecoveryMergeState *cluster_recovery_merge_begin(const uint64 merge_bitmap[2],
 															   const XLogRecPtr *start_lsn,
