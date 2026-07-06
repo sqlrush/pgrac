@@ -69,6 +69,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
+#include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
 #endif
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
@@ -849,6 +850,19 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 *	via re-exec on EXEC_BACKEND platforms is harmless.
 	 */
 	before_shmem_exit(cluster_grd_cleanup_on_backend_exit_callback, 0);
+
+	/*
+	 * spec-6.14 D11 — register the GCS block-dedup backend-exit hook
+	 * EAGERLY here rather than lazily at first GCS-block use: a lazy
+	 * before_shmem_exit registration inside a PG_ENSURE_ERROR_CLEANUP
+	 * window (e.g. btbulkdelete's _bt_end_vacuum_callback bracket) lands
+	 * on top of that macro's entry and breaks its LIFO cancel, ERROR-ing
+	 * the surrounding command (seen: plain VACUUM of a catalog index
+	 * whose page traffic was the backend's first GCS-block operation).
+	 * The register function is idempotent; the first-use call sites keep
+	 * their calls as no-op backstops for processes that skip InitPostgres.
+	 */
+	cluster_gcs_block_dedup_register_backend_exit_hook();
 #endif
 
 	/* The autovacuum launcher is done here */
