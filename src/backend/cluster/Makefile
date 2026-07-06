@@ -151,6 +151,7 @@ OBJS = \
 	cluster_node_remove_views.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
+	cluster_pi_recovery_srf.o \
 	cluster_pi_shadow.o \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \

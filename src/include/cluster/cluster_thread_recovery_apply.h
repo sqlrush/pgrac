@@ -52,6 +52,8 @@
 #include "c.h"
 #include "access/xlogdefs.h"
 
+#include "cluster/cluster_pi_shadow.h" /* SCN + the D-h3a recovery-boundary gate */
+
 struct XLogReaderState;
 
 /*
@@ -117,5 +119,25 @@ cluster_thread_apply_decide(bool has_block_ref, bool page_is_new, XLogRecPtr rec
 extern ClusterThreadApplyResult cluster_thread_apply_record_to_page(struct XLogReaderState *record,
 																	uint8 block_id, char *page,
 																	XLogRecPtr *applied_lsn);
+
+/*
+ * PGRAC: spec-6.12h D-h3b -- ship-SCN-gated variant for a PAST IMAGE base.
+ *
+ *	When the rebuild base is a D-h1 Past Image instead of a live shared-storage
+ *	page, the LSN-gate above is the WRONG unit: the PI's pd_lsn is whatever
+ *	stream last wrote the bytes before they were shipped away (possibly another
+ *	node's), and per-thread WAL (spec-4.1) makes LSNs from different streams
+ *	numerically incomparable -- gating the first dead-thread record against a
+ *	foreign pd_lsn could silently skip a lost update or re-apply lineage.  The
+ *	provable boundary is the conversion's ship-SCN stamp (cluster_pi_shadow.h):
+ *	a record whose Lamport counter is at or below the stamp is already in the
+ *	PI bytes (DONE), strictly above must be applied (APPLIED), and an
+ *	unprovable operand poisons the whole PI (BLOCKED -- the caller must
+ *	abandon the PI base and fall back to storage + full redo, never keep
+ *	replaying onto it).
+ */
+extern ClusterThreadApplyResult
+cluster_pi_thread_apply_record_to_page(struct XLogReaderState *record, uint8 block_id, char *page,
+									   SCN ship_scn, XLogRecPtr *applied_lsn);
 
 #endif /* CLUSTER_THREAD_RECOVERY_APPLY_H */

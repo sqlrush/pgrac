@@ -240,6 +240,43 @@ thread_wal_reader_make(uint16 dead_tid, ThreadWalReadPrivate **priv_out)
 }
 
 /*
+ * cluster_thread_wal_reader_make / _free -- exported thin wrappers over the
+ *	per-thread WAL reader factory above, for the spec-6.12h D-h3b PI-recovery
+ *	differential SRF (it reads the same dead-thread source the data driver
+ *	does).  The private state stays opaque to callers (void *); the free
+ *	wrapper owns the full cleanup discipline (segment fd, reader, private).
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+XLogReaderState *
+cluster_thread_wal_reader_make(uint16 tid, void **priv_out)
+{
+	ThreadWalReadPrivate *priv = NULL;
+	XLogReaderState *reader;
+
+	*priv_out = NULL;
+	reader = thread_wal_reader_make(tid, &priv);
+	if (reader == NULL)
+		return NULL;
+
+	*priv_out = (void *)priv;
+	return reader;
+}
+
+void
+cluster_thread_wal_reader_free(XLogReaderState *reader, void *priv_void)
+{
+	ThreadWalReadPrivate *priv = (ThreadWalReadPrivate *)priv_void;
+
+	if (priv != NULL && priv->seg_fd >= 0)
+		close(priv->seg_fd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (priv != NULL)
+		pfree(priv);
+}
+
+/*
  * drive_data_inner -- build the dead thread's reader and drive the engine.
  *
  *	Returns BLOCKED (fail-closed) for every bad source / window (amend 4); a

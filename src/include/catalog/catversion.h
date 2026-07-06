@@ -734,7 +734,9 @@
  * cluster_get_ic_rdma_peers / pg_stat_cluster_ic.  Main already used
  * 202606380 for spec-6.4/spec-6.5 merge order, so the combined mainline
  * catalog surface re-bumps 202606380 -> 202606390. */
-#define CATALOG_VERSION_NO 202606390
+/* spec-6.12h D-h3b: PI recovery differential catalog surface —
+ * cluster_pi_apply_redo_test SRF (oid 8975).  Bump 202606390 -> 202607060. */
+#define CATALOG_VERSION_NO 202607060
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

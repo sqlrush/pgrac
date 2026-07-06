@@ -126,6 +126,69 @@ cluster_thread_apply_record_to_page(XLogReaderState *record, uint8 block_id, cha
 	return CLUSTER_THREADAPPLY_BLOCKED;
 }
 
+/*
+ * cluster_pi_thread_apply_record_to_page -- ship-SCN-gated single-block
+ *	apply-through over a Past Image base (spec-6.12h D-h3b).
+ *
+ * Mirrors cluster_thread_apply_record_to_page above with ONE substitution:
+ * the per-record gate is the D-h3a recovery-boundary judge over (xl_scn,
+ * ship_scn) instead of the record-end vs page-LSN compare, which is the
+ * wrong unit over a PI base (see the header note).  The page evolves in the
+ * caller's PRIVATE copy (cluster_bufmgr_snapshot_pi_block); the resident PI
+ * buffer is never mutated, so a retry re-snapshots a fresh base and
+ * idempotence needs no page-version gate.  DONE here means "lineage: the
+ * conversion-frozen bytes already contain this record's effect".
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterThreadApplyResult
+cluster_pi_thread_apply_record_to_page(XLogReaderState *record, uint8 block_id, char *page,
+									   SCN ship_scn, XLogRecPtr *applied_lsn)
+{
+	bool has_ref = XLogRecHasBlockRef(record, block_id);
+	XLogRecPtr page_lsn = PageIsNew(page) ? InvalidXLogRecPtr : PageGetLSN(page);
+	ClusterBlkApplyResult res;
+
+	if (!has_ref) {
+		if (applied_lsn)
+			*applied_lsn = page_lsn;
+		return CLUSTER_THREADAPPLY_NOOP;
+	}
+
+	switch (cluster_pi_recovery_gate((SCN)XLogRecGetScn(record), ship_scn)) {
+	case CLUSTER_PI_GATE_UNUSABLE:
+		/* Boundary unprovable -> the WHOLE PI base is unusable (8.A): the
+		 * caller must stop replaying onto this copy and discard it. */
+		if (applied_lsn)
+			*applied_lsn = InvalidXLogRecPtr;
+		return CLUSTER_THREADAPPLY_BLOCKED;
+
+	case CLUSTER_PI_GATE_SKIP:
+		/* Lineage: already reflected in the conversion-frozen bytes. */
+		if (applied_lsn)
+			*applied_lsn = page_lsn;
+		return CLUSTER_THREADAPPLY_DONE;
+
+	case CLUSTER_PI_GATE_APPLY:
+		/* Post-ship: hand to the verified single-block apply core (same
+		 * fail-closed mapping as the LSN-gated wrapper above). */
+		res = cluster_block_apply_one(record, block_id, page);
+		if (res == CLUSTER_BLKAPPLY_OK) {
+			if (applied_lsn)
+				*applied_lsn = record->EndRecPtr;
+			return CLUSTER_THREADAPPLY_APPLIED;
+		}
+		if (applied_lsn)
+			*applied_lsn = InvalidXLogRecPtr;
+		return CLUSTER_THREADAPPLY_BLOCKED;
+	}
+
+	/* cluster_pi_recovery_gate returns one of the cases above. */
+	if (applied_lsn)
+		*applied_lsn = InvalidXLogRecPtr;
+	return CLUSTER_THREADAPPLY_BLOCKED;
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 /* Disable-cluster build: this file compiles to nothing. */

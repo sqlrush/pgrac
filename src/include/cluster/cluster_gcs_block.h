@@ -1539,6 +1539,14 @@ extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr 
 extern bool cluster_bufmgr_block_is_pi(BufferTag tag);
 extern bool cluster_bufmgr_discard_pi_block(BufferTag tag);
 
+/* PGRAC: spec-6.12h D-h3b — copy a Past Image's frozen bytes + its D-h3a
+ * ship-SCN stamp out of the buffer pool for a detached recovery rebuild.
+ * True only when the tag maps to a stamped PI whose bytes provably did not
+ * change during the copy (the D-h3a StartBufferIO reset seam makes the
+ * post-copy shape recheck sufficient); false = no usable PI, the caller
+ * falls back to storage + full redo (fail-safe, never an error). */
+extern bool cluster_bufmgr_snapshot_pi_block(BufferTag tag, char *dst, SCN *out_ship_scn);
+
 /* PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
  * Backend-context path for a writer on the master node whose block was
  * quiescent-downgraded: pending_x barrier + INVALIDATE broadcast via the

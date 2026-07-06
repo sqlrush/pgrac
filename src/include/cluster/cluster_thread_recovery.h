@@ -644,6 +644,18 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 										  XLogRecPtr scan_upper, uint64 episode_epoch,
 										  ClusterThreadReplayStats *stats);
 
+/*
+ * PGRAC: spec-6.12h D-h3b -- per-thread WAL reader factory, exported for the
+ * PI-recovery differential SRF.  The same source the data driver reads: a
+ * reader over <cluster.wal_threads_dir>/thread_<tid>.  NULL on any
+ * fail-closed condition (bad tid / unset or missing dir / OOM); on success
+ * the caller owns both handles and must release them through
+ * cluster_thread_wal_reader_free on every exit.  The reader is NOT
+ * positioned -- the caller runs XLogFindNextRecord.
+ */
+extern struct XLogReaderState *cluster_thread_wal_reader_make(uint16 tid, void **priv_out);
+extern void cluster_thread_wal_reader_free(struct XLogReaderState *reader, void *priv);
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_THREAD_RECOVERY_H */
