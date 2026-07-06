@@ -44,16 +44,46 @@
 #      L4  neither node's log carries the pre-D9 "unsupported side effect"
 #          fail-closed marker.
 #
-#    KNOWN-BLOCKED (spec-6.15 xid striping, spec-6.12-crossnode-perf lane;
-#    user decision B 2026-07-06): the L3 serving legs stay RED on this
-#    branch's base -- without xid striping the two threads' bare xids
-#    collide (pg_waldump-proven: the same xid on both threads writing the
-#    same catalog block), so post-merge TT lookups for the other thread's
-#    xids are permanently UNKNOWN and every cross-thread catalog read
-#    fail-closes 53R97 (honest, never false-visible).  The claim / engage /
-#    divert / exactly-once-drop framework legs (L0-L2, L4) are green.  The
-#    serving legs turn green when this branch rebases onto the merged
-#    6.12/6.15 lane; do NOT re-point them at weaker assertions.
+#    KNOWN-BLOCKED (two-layer, investigated 2026-07-06 after the 6.12/6.15
+#    rebase).  This test deterministically runs WITHOUT cluster.xid_striping
+#    so it brings up cleanly and reproduces Layer 1 -- turning striping on
+#    (which is what would make the serving legs' xids resolvable) drags in
+#    Layer 2, whose non-convergence makes bring-up itself flaky.
+#
+#    Layer 1 (xid collision) -- what striping WOULD fix: on this striped-off
+#    config the two threads share bare xids (pg_waldump-proven: the same xid
+#    on both threads writing the same catalog block), so post-merge TT
+#    lookups for the other thread's xids are permanently UNKNOWN and every
+#    cross-thread catalog read fail-closes 53R97 (honest, never false-
+#    visible).  With cluster.xid_striping=on the collision is gone AND merged
+#    recovery classifies the RM_CLUSTER_XID_STRIPE JOIN/RETIRE notes as
+#    GLOBAL (see cluster_recovery_record_class, added this session), so both
+#    nodes boot and complete cold merged recovery -- verified in a striping-
+#    on diagnostic run.  But that run then exposes:
+#
+#    Layer 2 (the real blocker, root cause pinned 2026-07-06 via debug1):
+#    the L2 up-check and L3 truth-matrix serving legs stay RED because of a
+#    MEMBERSHIP COLD-FORMATION gap, not the snap-back fence (the fence
+#    RECOVERING / "block master is recovering" errors are all downstream
+#    symptoms).  cluster.xid_striping REQUIRES cluster.online_join=on; with
+#    online_join on, a cold-restarting node takes the "joining a RUNNING
+#    cluster, wait for a coordinator to admit me" path (53R60) -- but in a
+#    full-outage cold-restart there is no running cluster and no coordinator,
+#    so the join times out into a degraded 53R61 ("restart with a fresh
+#    incarnation") state.  The node never becomes a full MEMBER, never runs
+#    its GRD re-declare episode at the rejoin fence epoch, so every shared-
+#    catalog block master (pg_authid et al.) stays fenced RECOVERING and no
+#    backend can authenticate.
+#
+#    NB: the spec-5.6a CF Phase-2 rendezvous DOES succeed here (both nodes
+#    verify the cross-node storage-rename contract over shared storage) --
+#    the online-join membership layer overrides that cold-formation
+#    rendezvous with its admission-wait.  The fix is a spec-level online-join
+#    cold-formation path (mutually admit via the rendezvous / voting-disk
+#    quorum instead of waiting for a live coordinator), not a code-local
+#    escape hatch.  Registered as a follow-up; do NOT re-point the serving
+#    legs at weaker assertions.  The framework legs (claim / engage /
+#    release, merge classifies stripe records, no-fail-marker) ARE green.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
