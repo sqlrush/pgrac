@@ -299,15 +299,76 @@ UT_TEST(test_corrupt_primary_falls_back_to_bak)
 	UT_ASSERT_EQ((unsigned char) out[0], 0x11);
 }
 
+UT_TEST(test_discard_pending_keeps_committed)
+{
+	char		img1[CLUSTER_RELMAP_IMAGE_MAX];
+	char		img2[CLUSTER_RELMAP_IMAGE_MAX];
+	char		out[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32		out_len = 0;
+	ClusterRelmapAuthorityHeader hdr;
+	ClusterRelmapOwner owner = {.owner_node = 1,.owner_xid = 777,.owner_epoch = 1,.relmap_lsn = 0x99};
+
+	setup_shared_dir();
+	unlink_authority();
+
+	/* committed gen1 = 0xAA; stage pending gen2 = 0xBB */
+	make_map_image(img1, 524, 0xAA);
+	cluster_relmap_authority_write_pending(true, InvalidOid, img1, 524, 1, &owner);
+	make_map_image(img2, 524, 0xBB);
+	cluster_relmap_authority_write_pending(true, InvalidOid, img2, 524, 2, &owner);
+
+	/* discard the pending: committed image + generation survive intact */
+	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
+
+	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
+	UT_ASSERT_EQ((uint32) hdr.pending_generation, 0u);
+	UT_ASSERT_EQ((uint32) hdr.committed_generation, 1u);
+	UT_ASSERT_EQ(hdr.owner_node, 0);
+	UT_ASSERT_EQ((uint32) hdr.owner_xid, 0u);
+
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
+				 true);
+	UT_ASSERT_EQ((unsigned char) out[0], 0xAA);
+}
+
+UT_TEST(test_discard_pending_generation_mismatch_noop)
+{
+	char		img[CLUSTER_RELMAP_IMAGE_MAX];
+	ClusterRelmapAuthorityHeader hdr;
+	ClusterRelmapOwner owner = {.owner_node = 2,.owner_xid = 888,.owner_epoch = 1,.relmap_lsn = 0};
+
+	setup_shared_dir();
+	unlink_authority();
+
+	make_map_image(img, 524, 0xAA);
+	cluster_relmap_authority_write_pending(true, InvalidOid, img, 524, 1, &owner);
+	cluster_relmap_authority_write_pending(true, InvalidOid, img, 524, 2, &owner);
+
+	/* wrong generation: no-op (already-published/idempotent-retry shape) */
+	cluster_relmap_authority_discard_pending(true, InvalidOid, 7);
+
+	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
+	UT_ASSERT_EQ((uint32) hdr.pending_generation, 2u);
+	UT_ASSERT_EQ(hdr.owner_node, 2);
+
+	/* matching generation discards; a second identical discard is a no-op */
+	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
+	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
+	UT_ASSERT_EQ((uint32) hdr.pending_generation, 0u);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_classify_short_magic_crc);
 	UT_RUN(test_first_write_seeds_committed);
 	UT_RUN(test_pending_not_visible_until_publish);
 	UT_RUN(test_owner_identity_preserved_in_header);
 	UT_RUN(test_corrupt_primary_falls_back_to_bak);
+	UT_RUN(test_discard_pending_keeps_committed);
+	UT_RUN(test_discard_pending_generation_mismatch_noop);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

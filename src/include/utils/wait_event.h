@@ -632,6 +632,7 @@ typedef enum {
 	 * completing (ConditionVariable broadcast) or on the refiller failing.
 	 */
 	WAIT_EVENT_CLUSTER_OID_LEASE,
+	WAIT_EVENT_CLUSTER_RELMAP_WRITE,	/* spec-6.14 D5: relmap authority write lock */
 } WaitEventCluster;
 
 

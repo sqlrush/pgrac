@@ -163,4 +163,18 @@ extern void cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
 extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid,
 											 uint64 generation);
 
+/*
+ * cluster_relmap_authority_discard_pending -- drop a staged pending image
+ *	(atomic, durable; the committed image is untouched).  Used when the
+ *	staging transaction aborts before its commit record (the pending is then
+ *	dead) and by crash arbitration when the owner is proven aborted.
+ *	Idempotent: a non-matching pending_generation (already discarded or
+ *	published) is a no-op.  An unreadable authority LOGs and returns -- the
+ *	unresolved pending then keeps relmap writes fail-closed (53RB), which is
+ *	the honest posture; this function is called from abort paths and must
+ *	not throw.
+ */
+extern void cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid,
+													 uint64 generation);
+
 #endif							/* CLUSTER_RELMAP_AUTHORITY_H */

@@ -157,6 +157,7 @@
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC: spec-6.14 D8 depth reset */
+#include "cluster/cluster_relmap_lock.h"		  /* PGRAC: spec-6.14 D5 abort release */
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
@@ -2765,6 +2766,22 @@ CommitTransaction(void)
 	 */
 	ProcArrayEndTransaction(MyProc, latestXid);
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * spec-6.14 D5 (INV-14-8): publish any staged relmap authority pending
+	 * image now that the commit record is durable (ForceSyncCommit was set
+	 * at staging), then broadcast the relmap invalidation and wait for all
+	 * live peers' acks.  Must run while the singleton relmap lock and the
+	 * mapped rel's AEL are still held, and before smgrDoPendingDeletes
+	 * unlinks the old physical files below.  No-op for transactions that
+	 * staged nothing; parallel workers cannot stage (relmap updates are
+	 * rejected in parallel mode).
+	 */
+	if (!is_parallel_worker)
+		AtEOXact_ClusterRelmapPublish();
+#endif
+
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
 	 * it's too late to abort the transaction.  This should be just
@@ -3271,6 +3288,14 @@ AbortTransaction(void)
 	 * no-recursion depth decrement; reset it so the catalog-snapshot guard
 	 * does not false-positive on the next catalog scan. */
 	cluster_vis_resolve_abort_reset();
+
+	/* spec-6.14 D5: a pre-commit failure in the relmap authority write path
+	 * (lock taken in AtEOXact_RelationMap, before the commit record) aborts
+	 * the transaction while the singleton relmap X lock is held.  Discard
+	 * the staged pending image first (leaving it would keep every cluster
+	 * relmap write fail-closed until arbitration), then drop the lock. */
+	AtAbort_ClusterRelmapPending();
+	cluster_relmap_lock_abort_release();
 #endif
 
 	/* Cancel condition variable sleep */

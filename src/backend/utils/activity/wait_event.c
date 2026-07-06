@@ -1509,6 +1509,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_OID_LEASE:
 		event_name = "ClusterOidLease";
 		break;
+	case WAIT_EVENT_CLUSTER_RELMAP_WRITE:
+		event_name = "ClusterRelmapWrite";
+		break;
 	default:
 		break;
 	}

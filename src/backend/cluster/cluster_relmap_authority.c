@@ -362,3 +362,36 @@ cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation)
 	finalize_header_crc(image);
 	store_authority(shared_map, dbid, image);
 }
+
+void
+cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid,
+										 uint64 generation)
+{
+	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *) image;
+
+	if (!load_authority(shared_map, dbid, image))
+	{
+		/*
+		 * Must not throw (abort-path callable).  The unresolved pending, if
+		 * any survives on disk, keeps relmap writes fail-closed until a
+		 * trustworthy authority reappears.
+		 */
+		elog(LOG, "relmap authority for db %u unavailable at pending discard; "
+			 "leaving it for arbitration", dbid);
+		return;
+	}
+
+	if (hdr->pending_generation != generation)
+		return;					/* already discarded or published */
+
+	hdr->pending_generation = 0;
+	hdr->owner_node = 0;
+	hdr->owner_xid = 0;
+	hdr->owner_epoch = 0;
+	hdr->relmap_lsn = 0;
+	memset(image + PENDING_SLOT_OFFSET, 0, CLUSTER_RELMAP_IMAGE_MAX);
+
+	finalize_header_crc(image);
+	store_authority(shared_map, dbid, image);
+}

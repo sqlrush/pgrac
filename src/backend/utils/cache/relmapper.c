@@ -131,8 +131,13 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
+#include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
+#include "cluster/cluster_reconfig.h"	  /* observed epoch for the owner header */
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
+#include "cluster/cluster_relmap_lock.h"  /* singleton relmap X lock (D5) */
+#include "cluster/cluster_sinval.h"		  /* cross-node inval ack barrier (2.39) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
+#include "storage/sinval.h"				  /* SendSharedInvalidMessages */
 #endif
 
 
@@ -1291,6 +1296,285 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 		END_CRIT_SECTION();
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC MODIFICATIONS by SqlRush (spec-6.14 D5-activation, §3.2):
+ *
+ * On-mode relmap write path.  A mapped-catalog rewrite commits its new map
+ * through the shared authority, never through the local pg_filenode.map:
+ *
+ *   pre-commit  (cluster_perform_relmap_update, from AtEOXact_RelationMap):
+ *     singleton relmap X lock (GES, cluster-wide) -> unresolved-pending
+ *     guard (53RB) -> merge updates over the authority's committed image ->
+ *     XLOG_RELMAP_UPDATE (WAL-before-data, arbitration breadcrumb) ->
+ *     stage the image as PENDING with the owner identity header ->
+ *     ForceSyncCommit().  Readers keep adopting the old committed image
+ *     (INV-14-7); no invalidation is sent yet (INV-14-8).
+ *
+ *   post-commit (AtEOXact_ClusterRelmapPublish, from CommitTransaction
+ *     right after ProcArrayEndTransaction):  publish (pending->committed,
+ *     atomic+durable) -> local relmap sinval -> cross-node relmap sinval
+ *     with the spec-2.39 all-alive-peer ack barrier -> release the relmap
+ *     lock.  Failures here must never take the ordinary ERROR path (the
+ *     owning transaction is durably committed): bounded retries, then
+ *     PANIC (r4-P1) -- fail-stop degenerates into the crash-arbitration
+ *     path, which publishes by the committed owner_xid.
+ *
+ *   abort       (AtAbort_ClusterRelmapPending, from AbortTransaction):
+ *     discard the staged pending (it can never be published; leaving it
+ *     would keep every cluster relmap write 53RB until arbitration) and
+ *     let cluster_relmap_lock_abort_release drop the lock.
+ *
+ * The map-before-content ordering comes from locking (spec §3.2): the
+ * mapped rel's AEL and the relmap lock are both held until the post-publish
+ * invalidation is acknowledged by every live peer, and the old physical
+ * files are unlinked later still (smgrDoPendingDeletes).  A peer that
+ * next locks the rel processes the queued invalidation at AIM and reloads
+ * the new committed image before it can touch any content.
+ */
+
+/* One staged-publish arm per map flavour: [0] = shared, [1] = per-db. */
+typedef struct ClusterRelmapPublishArm
+{
+	bool		armed;
+	bool		shared;
+	Oid			dbid;
+	uint64		generation;
+} ClusterRelmapPublishArm;
+
+static ClusterRelmapPublishArm cluster_relmap_publish_arms[2];
+
+/* Bounded post-commit retries before fail-stop (r4-P1). */
+#define CLUSTER_RELMAP_PUBLISH_RETRIES 10
+
+static void
+cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
+{
+	Oid			dbid = shared ? InvalidOid : MyDatabaseId;
+	Oid			tsid = shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace;
+	RelMapFile	newmap;
+	ClusterRelmapAuthorityHeader hdr;
+	ClusterRelmapOwner owner;
+	ClusterRelmapPublishArm *arm = &cluster_relmap_publish_arms[shared ? 0 : 1];
+	uint64		newgen;
+	XLogRecPtr	lsn;
+	xl_relmap_update xlrec;
+	int32		i;
+
+	Assert(!arm->armed);
+
+	/*
+	 * Singleton cluster X lock.  One transaction can commit both a shared
+	 * and a per-db map update; both stage under a single hold, released
+	 * after the post-commit publish round (or by abort).
+	 */
+	if (!cluster_relmap_authority_x_held() &&
+		!cluster_relmap_authority_x_lock())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not acquire the cluster relation map authority lock"),
+				 errhint("The cluster lock service is unreachable; retry once the "
+						 "cluster is healthy.")));
+
+	/*
+	 * Unresolved-pending guard (r4-P1): while any staged pending image is
+	 * awaiting publish or arbitration, every other relmap write in the
+	 * cluster fails closed.  Our own lock hold guarantees no LIVE writer
+	 * races us, so a pending here is a dead writer's residue.
+	 */
+	if (!cluster_relmap_authority_read_header(shared, dbid, &hdr))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap authority for %s map is unavailable",
+						shared ? "the shared" : "this database's"),
+				 errhint("Check cluster.shared_data_dir.")));
+	if (hdr.pending_generation != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap write is blocked by an unresolved pending "
+						"image (owner node %d, xid %u)",
+						(int) hdr.owner_node, hdr.owner_xid),
+				 errhint("A relation-map writer died before publishing; recovery "
+						 "arbitration resolves the pending image.")));
+
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+
+	/* Adopt the current committed image, then merge our updates over it. */
+	load_relmap_file(shared, true);
+	if (shared)
+		memcpy(&newmap, &shared_map, sizeof(RelMapFile));
+	else
+		memcpy(&newmap, &local_map, sizeof(RelMapFile));
+	merge_map_updates(&newmap, updates, allowSystemTableMods);
+
+	newgen = hdr.committed_generation + 1;
+
+	/* Finalize the image exactly as write_relmap_file would. */
+	newmap.magic = RELMAPPER_FILEMAGIC;
+	if (newmap.num_mappings < 0 || newmap.num_mappings > MAX_MAPPINGS)
+		elog(ERROR, "attempt to write bogus relation mapping");
+	INIT_CRC32C(newmap.crc);
+	COMP_CRC32C(newmap.crc, (char *) &newmap, offsetof(RelMapFile, crc));
+	FIN_CRC32C(newmap.crc);
+
+	/*
+	 * WAL first (same record as the vanilla path, so off-mode PITR and the
+	 * per-thread merged replay see identical history); the record LSN goes
+	 * into the owner header as the arbitration breadcrumb.
+	 */
+	START_CRIT_SECTION();
+	xlrec.dbid = dbid;
+	xlrec.tsid = tsid;
+	xlrec.nbytes = sizeof(RelMapFile);
+	XLogBeginInsert();
+	XLogRegisterData((char *) (&xlrec), MinSizeOfRelmapUpdate);
+	XLogRegisterData((char *) &newmap, sizeof(RelMapFile));
+	lsn = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
+	XLogFlush(lsn);
+	END_CRIT_SECTION();
+
+	/*
+	 * Stage the pending image (durable, torn-safe; the substrate PANICs on
+	 * I/O failure -- fail-stop, same posture as the CF authority write).
+	 * WAL precedes pending precedes commit: a crash at any point in
+	 * between leaves an unpublished pending whose owner never committed,
+	 * which arbitration discards.
+	 */
+	owner.owner_node = (int16) cluster_node_id;
+	owner.owner_xid = GetTopTransactionId();
+	owner.owner_epoch = cluster_reconfig_get_observed_epoch(cluster_node_id);
+	owner.relmap_lsn = (uint64) lsn;
+	cluster_relmap_authority_write_pending(shared, dbid, (const char *) &newmap,
+										   (uint32) sizeof(RelMapFile),
+										   newgen, &owner);
+
+	/*
+	 * Keep the new physical files across a later abort (same cheat as the
+	 * vanilla path: mapped files live in pg_global or the database's
+	 * default tablespace).
+	 */
+	for (i = 0; i < newmap.num_mappings; i++)
+	{
+		RelFileLocator rlocator;
+
+		rlocator.spcOid = tsid;
+		rlocator.dbOid = dbid;
+		rlocator.relNumber = newmap.mappings[i].mapfilenumber;
+		RelationPreserveStorage(rlocator, false);
+	}
+
+	/* Our own process adopts the new map now (vanilla semantics). */
+	if (shared)
+		memcpy(&shared_map, &newmap, sizeof(RelMapFile));
+	else
+		memcpy(&local_map, &newmap, sizeof(RelMapFile));
+
+	LWLockRelease(RelationMappingLock);
+
+	/* Arm the post-commit publish; the commit record must be durable. */
+	arm->armed = true;
+	arm->shared = shared;
+	arm->dbid = dbid;
+	arm->generation = newgen;
+	ForceSyncCommit();
+}
+
+/*
+ * AtEOXact_ClusterRelmapPublish
+ *
+ * Post-commit half of the on-mode relmap write (see the block comment
+ * above).  Called from CommitTransaction after ProcArrayEndTransaction,
+ * with the relmap lock and the mapped rel's AEL still held.  No-op unless
+ * this transaction staged a pending image.
+ */
+void
+AtEOXact_ClusterRelmapPublish(void)
+{
+	int			slot;
+
+	if (!cluster_relmap_publish_arms[0].armed &&
+		!cluster_relmap_publish_arms[1].armed)
+		return;
+
+	for (slot = 0; slot < 2; slot++)
+	{
+		ClusterRelmapPublishArm *arm = &cluster_relmap_publish_arms[slot];
+		SharedInvalidationMessage msg;
+
+		if (!arm->armed)
+			continue;
+
+		/* Atomic durable flip; readers now adopt the new image. */
+		cluster_relmap_authority_publish(arm->shared, arm->dbid, arm->generation);
+
+		/*
+		 * Invalidations strictly AFTER the publish (INV-14-8): any reload
+		 * they trigger reads the new committed image.  Local ring first,
+		 * then the cross-node fanout with the all-alive-peer ack barrier.
+		 */
+		msg.rm.id = SHAREDINVALRELMAP_ID;
+		msg.rm.dbId = arm->dbid;
+		SendSharedInvalidMessages(&msg, 1);
+
+		if (cluster_peer_mode_enabled())
+		{
+			int			attempt;
+			ClusterSinvalAckResult r = CLUSTER_SINVAL_ACK_TIMEOUT;
+
+			for (attempt = 0; attempt < CLUSTER_RELMAP_PUBLISH_RETRIES; attempt++)
+			{
+				r = cluster_sinval_enqueue_and_wait_ack(&msg, 1);
+				if (r == CLUSTER_SINVAL_ACK_DONE)
+					break;
+				ereport(WARNING,
+						(errmsg("cluster relmap invalidation not acknowledged "
+								"(attempt %d of %d), retrying",
+								attempt + 1, CLUSTER_RELMAP_PUBLISH_RETRIES)));
+			}
+			if (r != CLUSTER_SINVAL_ACK_DONE)
+				ereport(PANIC,
+						(errmsg("cluster relmap invalidation was not acknowledged "
+								"by all live peers"),
+						 errdetail("The relation map authority was already "
+								   "published; a peer serving the stale map would "
+								   "read the wrong relation file."),
+						 errhint("Fail-stop: recovery arbitration and reconfig "
+								 "RESET-all restore coherence.")));
+		}
+
+		arm->armed = false;
+	}
+
+	cluster_relmap_authority_x_unlock();
+}
+
+/*
+ * AtAbort_ClusterRelmapPending
+ *
+ * Abort half: a transaction that staged a pending image and then failed
+ * before its commit record discards the staging (still under the relmap
+ * lock; cluster_relmap_lock_abort_release drops the lock right after).
+ * A post-commit failure never comes through here -- the publish path
+ * PANICs instead (r4-P1).
+ */
+void
+AtAbort_ClusterRelmapPending(void)
+{
+	int			slot;
+
+	for (slot = 0; slot < 2; slot++)
+	{
+		ClusterRelmapPublishArm *arm = &cluster_relmap_publish_arms[slot];
+
+		if (!arm->armed)
+			continue;
+		cluster_relmap_authority_discard_pending(arm->shared, arm->dbid,
+												 arm->generation);
+		arm->armed = false;
+	}
+}
+#endif							/* USE_PGRAC_CLUSTER */
+
 /*
  * Merge the specified updates into the appropriate "real" map,
  * and write out the changes.  This function must be used for committing
@@ -1300,6 +1584,15 @@ static void
 perform_relmap_update(bool shared, const RelMapFile *updates)
 {
 	RelMapFile	newmap;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: on-mode commits go through the shared authority (D5, §3.2). */
+	if (cluster_shared_catalog)
+	{
+		cluster_perform_relmap_update(shared, updates);
+		return;
+	}
+#endif
 
 	/*
 	 * Anyone updating a relation's mapping info should take exclusive lock on

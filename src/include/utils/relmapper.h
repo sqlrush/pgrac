@@ -54,6 +54,13 @@ extern void AtCCI_RelationMap(void);
 extern void AtEOXact_RelationMap(bool isCommit, bool isParallelWorker);
 extern void AtPrepare_RelationMap(void);
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
+ * shared relmap authority image. */
+extern void AtEOXact_ClusterRelmapPublish(void);
+extern void AtAbort_ClusterRelmapPending(void);
+#endif
+
 extern void CheckPointRelationMap(void);
 
 extern void RelationMapFinishBootstrap(void);
