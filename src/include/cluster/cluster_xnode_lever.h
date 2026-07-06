@@ -140,6 +140,17 @@ typedef struct ClusterXnodeLeverShared {
 												   * PI: D-h1 implicit discard
 												   * observed at the D-h3a
 												   * StartBufferIO reset seam */
+
+	/* ---- wave h D-h3c: PI as the 4.11 recovery base ---- */
+	pg_atomic_uint64 h_pi_recovery_base_used_count;		/* replay consumed a PI
+														 * base (write-back of
+														 * PI + first post-ship
+														 * record) */
+	pg_atomic_uint64 h_pi_recovery_base_fallback_count; /* a resident PI was
+														 * abandoned (judge /
+														 * snapshot / rebuild
+														 * failure) -> storage
+														 * path */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -212,5 +223,12 @@ extern void cluster_lever_h_note_discard_result(bool discarded);
  * PI-label reset seam when a read IO implicitly discards a Past Image).
  */
 extern void cluster_lever_h_note_pi_implicit_discard(void);
+
+/*
+ * Wave-h D-h3c counter (PI as the 4.11 recovery base; ticked from the
+ * online thread-recovery replay engine when a resident PI is consumed as
+ * the rebuild base, or abandoned back to the storage path).
+ */
+extern void cluster_lever_h_note_recovery_base(bool used);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

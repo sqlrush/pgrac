@@ -2981,6 +2981,8 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(h_pi_discarded_count);
 	XNL_ROW(h_pi_discard_miss_count);
 	XNL_ROW(h_pi_implicit_discard_count);
+	XNL_ROW(h_pi_recovery_base_used_count);
+	XNL_ROW(h_pi_recovery_base_fallback_count);
 #undef XNL_ROW
 }
 
