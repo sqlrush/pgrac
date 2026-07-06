@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 337_cluster_6_12d_space_lease.pl
+# 353_cluster_6_12d_space_lease.pl
 #	  spec-6.12 wave d (static) -- per-node HW space leases on a 2-node
 #	  ClusterPair (phantom-shared plain-heap table, t/334 pattern).
 #	  Exercises the Q19-A materialization contract end to end (the
@@ -32,7 +32,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/337_cluster_6_12d_space_lease.pl
+#	  src/test/cluster_tap/t/353_cluster_6_12d_space_lease.pl
 #
 #-------------------------------------------------------------------------
 

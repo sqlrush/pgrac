@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 340_scaling_efficiency.pl
+# 356_scaling_efficiency.pl
 #	  spec-6.12 scaling-efficiency probe (report-only, run via make check).
 #	  READ  scenario: pgbench -S    WRITE scenario: pgbench -N
 #	  solo (node0 alone) vs pair (node0+node1 concurrent).
@@ -13,7 +13,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/340_scaling_efficiency.pl
+#	  src/test/cluster_tap/t/356_scaling_efficiency.pl
 #
 #-------------------------------------------------------------------------
 use strict;

@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 339_cluster_6_12g_block_self_contained.pl
+# 355_cluster_6_12g_block_self_contained.pl
 #	  spec-6.12 wave g -- block self-containment (active-ITL migration +
 #	  opportunistic commit cleanout) on a 2-node ClusterPair.
 #
@@ -49,7 +49,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/339_cluster_6_12g_block_self_contained.pl
+#	  src/test/cluster_tap/t/355_cluster_6_12g_block_self_contained.pl
 #
 #-------------------------------------------------------------------------
 

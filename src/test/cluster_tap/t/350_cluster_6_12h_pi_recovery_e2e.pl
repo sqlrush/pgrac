@@ -89,7 +89,7 @@ usleep(3_000_000);
 my $n0 = $pair->node0;
 my $n1 = $pair->node1;
 
-# same-DDL/same-relfilenode harness (t/339 convention).
+# same-DDL/same-relfilenode harness (t/355 convention).
 $n0->safe_psql('postgres', 'CREATE TABLE pp_t (id int, v int)');
 $n1->safe_psql('postgres', 'CREATE TABLE pp_t (id int, v int)');
 

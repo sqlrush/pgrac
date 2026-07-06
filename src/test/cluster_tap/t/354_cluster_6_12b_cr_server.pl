@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 338_cluster_6_12b_cr_server.pl
+# 354_cluster_6_12b_cr_server.pl
 #	  spec-6.12 wave b -- cross-instance CR-server data plane on a 2-node
 #	  ClusterPair (phantom-shared plain-heap table, t/334 pattern).
 #
@@ -38,7 +38,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/338_cluster_6_12b_cr_server.pl
+#	  src/test/cluster_tap/t/354_cluster_6_12b_cr_server.pl
 #
 #-------------------------------------------------------------------------
 

@@ -51,7 +51,7 @@
 #	  Honesty (规则 18): L3/L4b prove the FUNCTIONAL gain legs (fail-closed
 #	  -> works) on the phantom-shared harness; the true write-scaling
 #	  numbers (node1 pgbench write > 0, 53R97 storm gone) belong to the
-#	  spec-6.0a block_device rerun of the t/340 scaling probe (§3.5
+#	  spec-6.0a block_device rerun of the t/356 scaling probe (§3.5
 #	  substrate rule).  L5 asserts fail-closed-on-crash broadly (53R97 /
 #	  enqueue failure / fail-stop abort are all acceptable) -- the specific
 #	  survivor-reads-dead-node's-data recovery is the spec-4.10 face, out
