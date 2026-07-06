@@ -295,6 +295,12 @@ cluster_oid_authority_read(Oid *next_oid)
  * fail-closed" (spec-6.14 §3.6) -- a corrupt authority must never be silently
  * re-seeded from the checkpointed shared pg_control high-water, which can lag
  * OID ranges the cluster already leased out.  Never ereports.
+ *
+ * Fail-closed errno discipline: only ENOENT proves absence.  Any other
+ * stat() failure (EIO/EACCES/ESTALE -- all live possibilities on the shared
+ * or networked storage the shared tree sits on) means the file may well
+ * exist but be transiently unreadable; answering "absent" there would let
+ * the bootstrap re-seed over a real authority.  Report such files present.
  */
 bool
 cluster_oid_authority_present(void)
@@ -307,7 +313,11 @@ cluster_oid_authority_present(void)
 		|| !build_path(bak_path, sizeof(bak_path), CLUSTER_OID_AUTHORITY_BAK_REL_PATH))
 		return false;
 
-	return stat(primary_path, &st) == 0 || stat(bak_path, &st) == 0;
+	if (stat(primary_path, &st) == 0 || errno != ENOENT)
+		return true;
+	if (stat(bak_path, &st) == 0 || errno != ENOENT)
+		return true;
+	return false;
 }
 
 /*

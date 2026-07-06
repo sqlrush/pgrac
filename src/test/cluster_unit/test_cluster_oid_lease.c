@@ -420,10 +420,37 @@ UT_TEST(test_authority_present_distinguishes_corrupt_from_absent)
 	UT_ASSERT_EQ(cluster_oid_authority_present(), true);
 }
 
+UT_TEST(test_authority_present_fails_closed_on_unreadable)
+{
+	char		globaldir[MAXPGPATH];
+	Oid			got = 0;
+
+	setup_shared_dir();
+	unlink_authority();
+
+	/* A REAL authority behind a stat() that fails non-ENOENT (EACCES via an
+	 * unsearchable parent) must read as PRESENT: answering "absent" would
+	 * let the bootstrap re-seed over it (opus review r1 P1). */
+	cluster_oid_authority_write(424242);
+	snprintf(globaldir, sizeof(globaldir), "%s/global", test_root);
+	if (chmod(globaldir, 0000) != 0)
+	{
+		printf("# chmod 0000 failed; skipping unreadable-dir probe\n");
+		return;
+	}
+
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), false);
+	UT_ASSERT_EQ(cluster_oid_authority_present(), true);
+
+	chmod(globaldir, 0700);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
+	UT_ASSERT_EQ(got, 424242u);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_normalize_forces_reserved_up);
 	UT_RUN(test_carve_basic_block);
 	UT_RUN(test_carve_normalizes_reserved_hw);
@@ -436,6 +463,7 @@ main(void)
 	UT_RUN(test_authority_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_authority_seed_if_absent);
 	UT_RUN(test_authority_present_distinguishes_corrupt_from_absent);
+	UT_RUN(test_authority_present_fails_closed_on_unreadable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
