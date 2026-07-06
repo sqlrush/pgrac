@@ -59,6 +59,7 @@
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
 #include "cluster/cluster_xnode_lever.h"	/* spec-6.12h — PI keep counter */
+#include "cluster/cluster_pi_shadow.h"	/* spec-6.12h D-h3a — PI ship-SCN stamp */
 #include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
@@ -1609,6 +1610,14 @@ retry:
 	oldFlags = buf_state & BUF_FLAG_MASK;
 	ClearBufferTag(&buf->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.12h D-h3a — the mapping dies here; reset the cluster
+	 * copy label under the same header-lock hold so a later retag can never
+	 * inherit a stale BUF_TYPE_PI (the PI shape must stay reachable ONLY
+	 * through cluster_bufmgr_convert_to_pi_locked, or the D-h3 shadow stamp
+	 * could be paired with another residency's bytes). */
+	buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+#endif
 	UnlockBufHdr(buf, buf_state);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -1712,6 +1721,12 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 */
 	ClearBufferTag(&buf_hdr->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.12h D-h3a — victim reuse retags this buffer; reset the
+	 * cluster copy label under the header lock (same stale-BUF_TYPE_PI
+	 * containment as InvalidateBuffer above). */
+	buf_hdr->buffer_type = (uint8) BUF_TYPE_CURRENT;
+#endif
 	UnlockBufHdr(buf_hdr, buf_state);
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
@@ -5762,11 +5777,29 @@ WaitIO(BufferDesc *buf)
  *
  * Returns true if we successfully marked the buffer as I/O busy,
  * false if someone else already did the work.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: spec-6.12h D-h3a — a read IO about to start over a
+ *	Past Image buffer (BUF_TYPE_PI, D-h1) resets buffer_type back to
+ *	BUF_TYPE_CURRENT under the same header-lock hold.
+ * Why: the bytes of a !BM_VALID shared buffer are only ever written
+ *	inside the StartBufferIO..TerminateBufferIO window, so this single
+ *	seam (with the retag resets in InvalidateBuffer /
+ *	InvalidateVictimBuffer) makes the PI shape (BUF_TYPE_PI &&
+ *	BM_TAG_VALID && !BM_VALID) reachable ONLY through
+ *	cluster_bufmgr_convert_to_pi_locked with bytes frozen since its
+ *	D-h3 shadow stamp.  It is the D-h1 "re-read = implicit discard"
+ *	made explicit BEFORE any byte changes: a failed or aborted read
+ *	(!BM_VALID + BM_IO_ERROR) can then never masquerade as a PI whose
+ *	bytes drifted after the stamp (a wrong recovery base, Rule 8.A).
  */
 static bool
 StartBufferIO(BufferDesc *buf, bool forInput)
 {
 	uint32		buf_state;
+#ifdef USE_PGRAC_CLUSTER
+	bool		pi_implicit_discard = false;
+#endif
 
 	ResourceOwnerEnlargeBufferIOs(CurrentResourceOwner);
 
@@ -5789,8 +5822,22 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 		return false;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-6.12h D-h3a — see the function header note. */
+	if (forInput && buf->buffer_type == (uint8) BUF_TYPE_PI)
+	{
+		buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+		pi_implicit_discard = true;
+	}
+#endif
+
 	buf_state |= BM_IO_IN_PROGRESS;
 	UnlockBufHdr(buf, buf_state);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (pi_implicit_discard)
+		cluster_lever_h_note_pi_implicit_discard();
+#endif
 
 	ResourceOwnerRememberBufferIO(CurrentResourceOwner,
 								  BufferDescriptorGetBuffer(buf));
@@ -7342,8 +7389,18 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
  *   storage must not be clobbered under the new holder), and clock-sweep
  *   eviction may reuse it at any time (dropping a PI only loses the D-h3
  *   recovery shortcut, never correctness — storage + full redo remain).
- *   The page bytes keep pd_block_scn + LSN for the D-h3 newest-PI
- *   ordering proof.
+ *
+ *   D-h3a: the conversion also stamps the SHIP SCN — the local Lamport
+ *   clock at the conversion instant — into the PI shadow slot
+ *   (cluster_pi_shadow.h holds the full recovery-boundary proof).  The
+ *   sample MUST be ordered after the refcount==0 check above, i.e. taken
+ *   inside this header-lock hold: a writer that came and went between an
+ *   earlier (outside-the-lock) sample and LockBufHdr would leave a
+ *   lineage record stamped ABOVE the boundary, which D-h3 replay would
+ *   re-apply onto bytes that already contain it (double-apply, Rule 8.A).
+ *   cluster_scn_current() is lock-free atomic reads only (spec-1.17), so
+ *   sampling under the buffer-header spinlock is the same class as the
+ *   lever ticks above.
  * ======================================================================== */
 static bool
 cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
@@ -7361,6 +7418,10 @@ cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
 
 	buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
 	buf->buffer_type = (uint8) BUF_TYPE_PI;
+	/* D-h3a ship-SCN boundary stamp — see the header note on why the
+	 * clock sample must sit inside this lock hold.  An unarmed clock
+	 * stamps InvalidScn and the D-h3 gate fails closed to UNUSABLE. */
+	cluster_pi_shadow_stamp(buf->buf_id, cluster_scn_current());
 	UnlockBufHdr(buf, buf_state);
 	cluster_lever_h_note_pi_kept();
 	return true;
@@ -7602,6 +7663,12 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	 * but clear it again under the lock so InvalidateBuffer's eviction hook
 	 * can never see a stale mode and emit a release wire from LMON. */
 	buf->pcm_state = (uint8) PCM_STATE_N;
+	/* PGRAC: spec-6.12h D-h3a — hygiene: drop the shadow stamp with the PI.
+	 * Correctness never depends on this clear (the D-h3 consumer
+	 * re-validates the PI shape + tag under this same header lock, and
+	 * InvalidateBuffer below breaks the shape), but a directive-discarded
+	 * slot should not linger as a plausible-looking stamp. */
+	cluster_pi_shadow_clear(buf->buf_id);
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;

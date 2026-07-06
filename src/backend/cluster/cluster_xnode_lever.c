@@ -103,6 +103,8 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discard_notify_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discarded_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discard_miss_count, 0);
+		/* spec-6.12h D-h3a */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_implicit_discard_count, 0);
 	}
 }
 
@@ -399,4 +401,14 @@ cluster_lever_h_note_discard_result(bool discarded)
 	pg_atomic_fetch_add_u64(discarded ? &ClusterXnodeLeverCtl->h_pi_discarded_count
 									  : &ClusterXnodeLeverCtl->h_pi_discard_miss_count,
 							1);
+}
+
+/* spec-6.12h D-h3a — a read IO started over a PI buffer: StartBufferIO
+ * reset the PI label before the bytes could change (implicit discard). */
+void
+cluster_lever_h_note_pi_implicit_discard(void)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_implicit_discard_count, 1);
 }

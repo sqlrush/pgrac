@@ -3604,6 +3604,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					 * requester.  Rule 8.A holds.
 					 */
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
+					/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
+					 * conversion (inside the drop above) samples its
+					 * ship-SCN stamp BEFORE the grant reply leaves
+					 * (build_and_send_reply below), so the requester's
+					 * envelope observe — and every post-ship record it
+					 * stamps — is strictly above the recovery boundary
+					 * (cluster_pi_shadow.h proof item 2). */
 					/* spec-2.41 D2 — advance detector SCN watermark from the
 					 * shipped page's pd_block_scn (local-page source = block_buf). */
 					cluster_pcm_lock_master_grant_x_to(
@@ -3899,6 +3906,12 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				 * wire kept_pi ACK flag cannot self-deliver either). */
 				if (cluster_bufmgr_block_is_pi(req->tag))
 					cluster_pcm_lock_pi_holder_note(req->tag, cluster_node_id);
+				/* PGRAC: spec-6.12h D-h3a — ordering pin: this
+				 * self-conversion runs before the X grant is issued below,
+				 * and the grant envelope leaves this same node stamped
+				 * scn_current >= the ship-SCN stamp, so the upgrader's
+				 * observe puts every post-upgrade record strictly above the
+				 * boundary (cluster_pi_shadow.h proof item 2). */
 				holders_bm &= ~((uint32)1u << cluster_node_id);
 			}
 
@@ -5276,6 +5289,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					 * already-flushed page_lsn satisfies WAL-before-share.  A
 					 * clean transfer increments clean_page_xfer_count too. */
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
+					/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
+					 * conversion (inside the drop above) precedes the reply
+					 * send at the bottom of this handler
+					 * (cluster_ic_rdma_send_envelope_sge), so the requester
+					 * observes an envelope stamped at-or-above the ship-SCN
+					 * boundary (cluster_pi_shadow.h proof item 2). */
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
 					if (GcsBlockForwardPayloadIsCleanEligible(fwd))
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
@@ -5939,6 +5958,14 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		 * dropped copy as a Past Image; flag it on the solicited ACK so the
 		 * master records this node on the PI holder bitmap. */
 		kept_pi = cluster_bufmgr_block_is_pi(inv->tag);
+
+		/* PGRAC: spec-6.12h D-h3a — ordering pin (two-hop chain): the PI
+		 * conversion (inside the invalidate above) samples its ship-SCN
+		 * stamp before this ACK is sent below; the master observes the ACK
+		 * envelope and only then clears our holder bit and grants X, and
+		 * the upgrader observes the grant envelope — each observe is a
+		 * strict Lamport bump (max+1), so every post-upgrade record sits
+		 * strictly above the boundary (cluster_pi_shadow.h proof item 2). */
 	} else {
 		ack_status = 2; /* race: not resident */
 	}
