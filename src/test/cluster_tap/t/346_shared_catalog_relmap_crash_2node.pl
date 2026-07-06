@@ -244,14 +244,27 @@ is($node1->safe_psql('postgres', "SELECT pg_relation_filenode('pg_class')"),
 # on fresh foreign-xid resolution (keeps this file 6.15-independent).
 sub owner_settle
 {
-	$node0->safe_psql('postgres',
-		'SELECT count(*) FROM pg_class;'
-		. 'SELECT count(*) FROM pg_attribute;'
-		. 'SELECT count(*) FROM pg_type;'
-		. 'SELECT count(*) FROM pg_depend;'
-		. 'SELECT count(*) FROM pg_index;'
-		. 'SELECT count(*) FROM pg_constraint;');
-	$node0->safe_psql('postgres', 'CHECKPOINT');
+	# Tolerant: right after a cold restart node0 can still be write-fenced
+	# (the fail-stop reconfig declared it dead; the fence lifts once
+	# membership settles), so the CHECKPOINT half may transiently fail --
+	# retry within a budget, and die honestly if the fence never lifts.
+	for my $t (1 .. 60)
+	{
+		my ($rc1) = $node0->psql('postgres',
+			'SELECT count(*) FROM pg_class;'
+			. 'SELECT count(*) FROM pg_attribute;'
+			. 'SELECT count(*) FROM pg_type;'
+			. 'SELECT count(*) FROM pg_depend;'
+			. 'SELECT count(*) FROM pg_index;'
+			. 'SELECT count(*) FROM pg_constraint;');
+		if (defined $rc1 && $rc1 == 0)
+		{
+			my ($rc2) = $node0->psql('postgres', 'CHECKPOINT');
+			return if defined $rc2 && $rc2 == 0;
+		}
+		usleep(500_000);
+	}
+	die 'owner_settle: node0 never became writable (write fence never lifted?)';
 }
 
 owner_settle();

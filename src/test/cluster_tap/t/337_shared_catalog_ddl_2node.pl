@@ -623,8 +623,8 @@ my %cat = split /\|/, $node1->safe_psql('postgres',
 	. "'vis_unknown_count', 'buf_hit_count', 'buf_miss_count')");
 cmp_ok($cat{vis_resolve_count}, '>', 0,
 	'D10b: node1 resolved foreign catalog tuples through the cluster path');
-cmp_ok($cat{vis_unknown_count}, '>=', 0,
-	'D10b: fail-closed counter present (zero on this healthy run)');
+ok(exists $cat{vis_unknown_count} && $cat{vis_unknown_count} =~ /^\d+$/,
+	'D10b: fail-closed counter key present and numeric (zero on this healthy run)');
 cmp_ok($cat{buf_hit_count}, '>', 0,
 	'D10b: catalog-page buffer hits counted on node1');
 cmp_ok($cat{buf_miss_count}, '>', 0,
