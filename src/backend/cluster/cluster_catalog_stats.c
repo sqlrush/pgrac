@@ -37,8 +37,7 @@
 #include "port/atomics.h"
 #include "storage/shmem.h"
 
-typedef struct ClusterCatalogStatsShared
-{
+typedef struct ClusterCatalogStatsShared {
 	pg_atomic_uint64 vis_resolve_count;
 	pg_atomic_uint64 vis_unknown_count;
 	pg_atomic_uint64 buf_hit_count;
@@ -59,14 +58,12 @@ cluster_catalog_stats_shmem_size(void)
 static void
 cluster_catalog_stats_shmem_init(void)
 {
-	bool		found;
+	bool found;
 
-	catalog_stats = (ClusterCatalogStatsShared *)
-		ShmemInitStruct("pgrac cluster catalog stats",
-						MAXALIGN(sizeof(ClusterCatalogStatsShared)), &found);
+	catalog_stats = (ClusterCatalogStatsShared *)ShmemInitStruct(
+		"pgrac cluster catalog stats", MAXALIGN(sizeof(ClusterCatalogStatsShared)), &found);
 
-	if (!IsUnderPostmaster)
-	{
+	if (!IsUnderPostmaster) {
 		pg_atomic_init_u64(&catalog_stats->vis_resolve_count, 0);
 		pg_atomic_init_u64(&catalog_stats->vis_unknown_count, 0);
 		pg_atomic_init_u64(&catalog_stats->buf_hit_count, 0);
@@ -123,27 +120,23 @@ cluster_catalog_stats_buf_miss_inc(void)
 uint64
 cluster_catalog_stats_vis_resolve_count(void)
 {
-	return catalog_stats != NULL
-		? pg_atomic_read_u64(&catalog_stats->vis_resolve_count) : 0;
+	return catalog_stats != NULL ? pg_atomic_read_u64(&catalog_stats->vis_resolve_count) : 0;
 }
 
 uint64
 cluster_catalog_stats_vis_unknown_count(void)
 {
-	return catalog_stats != NULL
-		? pg_atomic_read_u64(&catalog_stats->vis_unknown_count) : 0;
+	return catalog_stats != NULL ? pg_atomic_read_u64(&catalog_stats->vis_unknown_count) : 0;
 }
 
 uint64
 cluster_catalog_stats_buf_hit_count(void)
 {
-	return catalog_stats != NULL
-		? pg_atomic_read_u64(&catalog_stats->buf_hit_count) : 0;
+	return catalog_stats != NULL ? pg_atomic_read_u64(&catalog_stats->buf_hit_count) : 0;
 }
 
 uint64
 cluster_catalog_stats_buf_miss_count(void)
 {
-	return catalog_stats != NULL
-		? pg_atomic_read_u64(&catalog_stats->buf_miss_count) : 0;
+	return catalog_stats != NULL ? pg_atomic_read_u64(&catalog_stats->buf_miss_count) : 0;
 }

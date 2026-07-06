@@ -31,7 +31,7 @@
  */
 #include "postgres.h"
 
-#include "miscadmin.h"			/* IsUnderPostmaster */
+#include "miscadmin.h" /* IsUnderPostmaster */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_oid_lease.h"
@@ -47,16 +47,15 @@
  * live lease block; refill_in_progress + refill_cv serialise the (rare)
  * cross-node refill so only one backend drives it while peers wait.
  */
-typedef struct ClusterOidLeaseShared
-{
-	LWLock		lwlock;			/* guards next/end/refill_in_progress */
-	ConditionVariable refill_cv;	/* refill serialisation */
-	Oid			next;			/* next OID this node may hand out */
-	Oid			end;			/* exclusive block end (0 == top of space) */
-	bool		refill_in_progress;
-	pg_atomic_uint64 acquire_count;	/* OIDs handed out (D10) */
-	pg_atomic_uint64 refill_count;	/* successful authority refills (D10) */
-	pg_atomic_uint64 refill_wait_count;	/* times a backend waited on the CV */
+typedef struct ClusterOidLeaseShared {
+	LWLock lwlock;				 /* guards next/end/refill_in_progress */
+	ConditionVariable refill_cv; /* refill serialisation */
+	Oid next;					 /* next OID this node may hand out */
+	Oid end;					 /* exclusive block end (0 == top of space) */
+	bool refill_in_progress;
+	pg_atomic_uint64 acquire_count;		/* OIDs handed out (D10) */
+	pg_atomic_uint64 refill_count;		/* successful authority refills (D10) */
+	pg_atomic_uint64 refill_wait_count; /* times a backend waited on the CV */
 } ClusterOidLeaseShared;
 
 static ClusterOidLeaseShared *oid_state = NULL;
@@ -64,10 +63,9 @@ static ClusterOidLeaseShared *oid_state = NULL;
 /*
  * Per-backend hold record for the singleton OID X lock (mirrors CfHoldState).
  */
-typedef struct OidLeaseXHold
-{
-	bool		held;
-	bool		coordinated;
+typedef struct OidLeaseXHold {
+	bool held;
+	bool coordinated;
 	ClusterLockAcquireRequest req;
 } OidLeaseXHold;
 
@@ -84,18 +82,16 @@ cluster_oid_lease_shmem_size(void)
 void
 cluster_oid_lease_shmem_init(void)
 {
-	bool		found;
+	bool found;
 
-	oid_state = (ClusterOidLeaseShared *)
-		ShmemInitStruct("pgrac cluster oid lease",
-						MAXALIGN(sizeof(ClusterOidLeaseShared)), &found);
+	oid_state = (ClusterOidLeaseShared *)ShmemInitStruct(
+		"pgrac cluster oid lease", MAXALIGN(sizeof(ClusterOidLeaseShared)), &found);
 
-	if (!IsUnderPostmaster)
-	{
+	if (!IsUnderPostmaster) {
 		LWLockInitialize(&oid_state->lwlock, LWTRANCHE_CLUSTER_OID_LEASE);
 		ConditionVariableInit(&oid_state->refill_cv);
 		oid_state->next = InvalidOid;
-		oid_state->end = InvalidOid;	/* next==end -> exhausted -> refill */
+		oid_state->end = InvalidOid; /* next==end -> exhausted -> refill */
 		oid_state->refill_in_progress = false;
 		pg_atomic_init_u64(&oid_state->acquire_count, 0);
 		pg_atomic_init_u64(&oid_state->refill_count, 0);
@@ -135,35 +131,34 @@ oid_authority_x_lock(void)
 	req.lockmethod_id = DEFAULT_LOCKMETHOD;
 	req.dontwait = false;
 	req.sessionLock = false;
-	req.caller_local_start_ts_ms = (uint64) (GetCurrentTimestamp() / 1000);
+	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	req.timeout_ms = cluster_ges_request_timeout_ms;
 	req.wait_event = WAIT_EVENT_CLUSTER_OID_LEASE;
 
 	r = cluster_lock_acquire_seven_step(&req);
 
-	switch (r)
-	{
-		case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
-			/* single-node / gate off: nothing registered in the GRD. */
-			oid_x_hold.held = true;
-			oid_x_hold.coordinated = false;
-			oid_x_hold.req = req;
-			return true;
+	switch (r) {
+	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
+		/* single-node / gate off: nothing registered in the GRD. */
+		oid_x_hold.held = true;
+		oid_x_hold.coordinated = false;
+		oid_x_hold.req = req;
+		return true;
 
-		case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
-		case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
-		case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
-			/* granted at cluster level: promote the reservation to a holder. */
-			if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-				return false;
-			oid_x_hold.held = true;
-			oid_x_hold.coordinated = true;
-			oid_x_hold.req = req;
-			return true;
-
-		default:
-			/* timeout / LMS unavailable / deadlock / internal: fail closed. */
+	case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
+	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
+	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
+		/* granted at cluster level: promote the reservation to a holder. */
+		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			return false;
+		oid_x_hold.held = true;
+		oid_x_hold.coordinated = true;
+		oid_x_hold.req = req;
+		return true;
+
+	default:
+		/* timeout / LMS unavailable / deadlock / internal: fail closed. */
+		return false;
 	}
 }
 
@@ -173,7 +168,7 @@ oid_authority_x_unlock(void)
 	if (!oid_x_hold.held)
 		return;
 	if (oid_x_hold.coordinated)
-		(void) cluster_lock_acquire_s6_release(&oid_x_hold.req);
+		(void)cluster_lock_acquire_s6_release(&oid_x_hold.req);
 	oid_x_hold.held = false;
 	oid_x_hold.coordinated = false;
 }
@@ -189,27 +184,25 @@ oid_authority_x_unlock(void)
 static void
 refill_from_authority(Oid *out_start, Oid *out_end)
 {
-	Oid			hw;
-	Oid			new_authority;
+	Oid hw;
+	Oid new_authority;
 
 	if (!oid_authority_x_lock())
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("could not acquire the shared OID authority lock"),
-				 errhint("The cluster OID authority is unreachable; retry once the "
-						 "cluster is healthy.")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("could not acquire the shared OID authority lock"),
+						errhint("The cluster OID authority is unreachable; retry once the "
+								"cluster is healthy.")));
 
 	PG_TRY();
 	{
 		if (!cluster_oid_authority_read(&hw))
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-					 errmsg("shared OID authority is unavailable or corrupt"),
-					 errhint("Check cluster.shared_data_dir and the "
-							 "global/pgrac_oid_authority file.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("shared OID authority is unavailable or corrupt"),
+							errhint("Check cluster.shared_data_dir and the "
+									"global/pgrac_oid_authority file.")));
 
-		cluster_oid_lease_carve(hw, (uint32) cluster_oid_lease_size,
-								out_start, out_end, &new_authority);
+		cluster_oid_lease_carve(hw, (uint32)cluster_oid_lease_size, out_start, out_end,
+								&new_authority);
 
 		/* Advance the durable high-water BEFORE handing out the block. */
 		cluster_oid_authority_write(new_authority);
@@ -233,17 +226,15 @@ cluster_oid_lease_get_next(void)
 {
 	Assert(oid_state != NULL);
 
-	for (;;)
-	{
-		Oid			oid;
-		Oid			new_start;
-		Oid			new_end;
+	for (;;) {
+		Oid oid;
+		Oid new_start;
+		Oid new_end;
 
 		LWLockAcquire(&oid_state->lwlock, LW_EXCLUSIVE);
 
 		/* Fast path: the live block still has an OID. */
-		if (oid_state->next != oid_state->end)
-		{
+		if (oid_state->next != oid_state->end) {
 			ClusterOidLease live;
 
 			live.next = oid_state->next;
@@ -258,8 +249,7 @@ cluster_oid_lease_get_next(void)
 		}
 
 		/* Exhausted.  If someone else is refilling, wait and re-check. */
-		if (oid_state->refill_in_progress)
-		{
+		if (oid_state->refill_in_progress) {
 			ConditionVariablePrepareToSleep(&oid_state->refill_cv);
 			LWLockRelease(&oid_state->lwlock);
 			pg_atomic_fetch_add_u64(&oid_state->refill_wait_count, 1);
@@ -315,14 +305,13 @@ cluster_oid_lease_acquire_count(void)
 Oid
 cluster_oid_lease_remaining(void)
 {
-	Oid			n,
-				e;
+	Oid n, e;
 
 	if (oid_state == NULL)
 		return 0;
 	n = oid_state->next;
 	e = oid_state->end;
-	if (e == 0)					/* block runs to top of space */
+	if (e == 0) /* block runs to top of space */
 		return 0;
 	return (e >= n) ? (e - n) : 0;
 }

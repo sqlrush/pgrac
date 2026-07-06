@@ -45,10 +45,9 @@
  * Per-backend hold record for the singleton relmap X lock (mirrors
  * OidLeaseXHold / CfHoldState).
  */
-typedef struct RelmapXHold
-{
-	bool		held;
-	bool		coordinated;
+typedef struct RelmapXHold {
+	bool held;
+	bool coordinated;
 	ClusterLockAcquireRequest req;
 } RelmapXHold;
 
@@ -85,35 +84,34 @@ cluster_relmap_authority_x_lock(void)
 	req.lockmethod_id = DEFAULT_LOCKMETHOD;
 	req.dontwait = false;
 	req.sessionLock = false;
-	req.caller_local_start_ts_ms = (uint64) (GetCurrentTimestamp() / 1000);
+	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	req.timeout_ms = cluster_ges_request_timeout_ms;
 	req.wait_event = WAIT_EVENT_CLUSTER_RELMAP_WRITE;
 
 	r = cluster_lock_acquire_seven_step(&req);
 
-	switch (r)
-	{
-		case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
-			/* single-node / gate off: nothing registered in the GRD. */
-			relmap_x_hold.held = true;
-			relmap_x_hold.coordinated = false;
-			relmap_x_hold.req = req;
-			return true;
+	switch (r) {
+	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
+		/* single-node / gate off: nothing registered in the GRD. */
+		relmap_x_hold.held = true;
+		relmap_x_hold.coordinated = false;
+		relmap_x_hold.req = req;
+		return true;
 
-		case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
-		case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
-		case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
-			/* granted at cluster level: promote the reservation to a holder. */
-			if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-				return false;
-			relmap_x_hold.held = true;
-			relmap_x_hold.coordinated = true;
-			relmap_x_hold.req = req;
-			return true;
-
-		default:
-			/* timeout / LMS unavailable / deadlock / internal: fail closed. */
+	case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
+	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
+	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
+		/* granted at cluster level: promote the reservation to a holder. */
+		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			return false;
+		relmap_x_hold.held = true;
+		relmap_x_hold.coordinated = true;
+		relmap_x_hold.req = req;
+		return true;
+
+	default:
+		/* timeout / LMS unavailable / deadlock / internal: fail closed. */
+		return false;
 	}
 }
 
@@ -123,7 +121,7 @@ cluster_relmap_authority_x_unlock(void)
 	if (!relmap_x_hold.held)
 		return;
 	if (relmap_x_hold.coordinated)
-		(void) cluster_lock_acquire_s6_release(&relmap_x_hold.req);
+		(void)cluster_lock_acquire_s6_release(&relmap_x_hold.req);
 	relmap_x_hold.held = false;
 	relmap_x_hold.coordinated = false;
 }

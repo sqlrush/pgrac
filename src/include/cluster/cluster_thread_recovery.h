@@ -219,11 +219,11 @@ cluster_thread_replay_classify_block(int which_for, bool rel_exists, BlockNumber
  */
 typedef struct ClusterThreadReplayStats {
 	uint64 records_scanned;
-	uint64 blocks_applied;			 /* APPLIED -> smgrwrite (write-back; NOT durable) */
-	uint64 blocks_gated;			 /* DONE: LSN-gate idempotent skip */
-	uint64 blocks_out_of_scope;		 /* OUT_OF_SCOPE: per-node block refs skipped */
-	uint64 blocks_missing_deferred;	 /* spec-6.14 D9: missing-file refs deferred to a later drop */
-	XLogRecPtr recovered_through;	 /* EndRecPtr of last fully-processed record */
+	uint64 blocks_applied;			/* APPLIED -> smgrwrite (write-back; NOT durable) */
+	uint64 blocks_gated;			/* DONE: LSN-gate idempotent skip */
+	uint64 blocks_out_of_scope;		/* OUT_OF_SCOPE: per-node block refs skipped */
+	uint64 blocks_missing_deferred; /* spec-6.14 D9: missing-file refs deferred to a later drop */
+	XLogRecPtr recovered_through;	/* EndRecPtr of last fully-processed record */
 } ClusterThreadReplayStats;
 
 #ifndef FRONTEND

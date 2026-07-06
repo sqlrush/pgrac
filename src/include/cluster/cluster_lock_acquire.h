@@ -415,15 +415,12 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 		 * the stock HC23/HC24/HC25 path below, so the OLTP hot path is
 		 * unchanged (off mode short-circuits on the first bool).
 		 */
-		if (cluster_shared_catalog
-			&& locktag->locktag_field2 < FirstNormalObjectId)
-		{
+		if (cluster_shared_catalog && locktag->locktag_field2 < FirstNormalObjectId) {
 			if (lockmode >= ShareUpdateExclusiveLock)
-				return true;	/* catalog DDL: catalog OIDs are never temp */
-			if (lockmode >= RowExclusiveLock
-				&& cluster_relation_is_mapped(locktag->locktag_field2))
-				return true;	/* mapped-rel write: globalize (r3) */
-			return false;		/* catalog read / non-mapped low-mode: native */
+				return true; /* catalog DDL: catalog OIDs are never temp */
+			if (lockmode >= RowExclusiveLock && cluster_relation_is_mapped(locktag->locktag_field2))
+				return true; /* mapped-rel write: globalize (r3) */
+			return false;	 /* catalog read / non-mapped low-mode: native */
 		}
 		/* HC23 OLTP fast-path:  AccessShare / RowShare / RowExclusive go
 			 * PG-native.  ShareUpdateExclusiveLock (=5) is the lowest mode

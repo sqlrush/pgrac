@@ -46,7 +46,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
-#include "port/atomics.h" /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
+#include "port/atomics.h"	   /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
 #include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
@@ -1670,9 +1670,8 @@ cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 uint64
 cluster_pcm_get_evict_release_deferred_aux_count(void)
 {
-	return ClusterPcm != NULL
-			   ? pg_atomic_read_u64(&ClusterPcm->evict_release_deferred_aux_count)
-			   : 0;
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->evict_release_deferred_aux_count)
+							  : 0;
 }
 
 uint64
@@ -2096,14 +2095,16 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 	 * t/243 L4 scope note signature (a)).
 	 */
 	if (MyBackendId == InvalidBackendId)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-				 errmsg("crash recovery of a cluster-coherent page requires a recovery-ownership window"),
-				 errdetail("A process without a backend identity attempted a live GCS block request "
-						   "(page coherence negotiation) during recovery."),
-				 errhint("Cold multi-node crash recovery must run under cluster.merged_recovery=on; "
-						 "a node restarting while peers are alive must wait for the survivor's "
-						 "online thread recovery to cover its WAL tail before restarting.")));
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg(
+				 "crash recovery of a cluster-coherent page requires a recovery-ownership window"),
+			 errdetail("A process without a backend identity attempted a live GCS block request "
+					   "(page coherence negotiation) during recovery."),
+			 errhint("Cold multi-node crash recovery must run under cluster.merged_recovery=on; "
+					 "a node restarting while peers are alive must wait for the survivor's "
+					 "online thread recovery to cover its WAL tail before restarting.")));
 
 	tag = buf->tag;
 
@@ -2378,7 +2379,7 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 		if (MyBackendId == InvalidBackendId && mode == PCM_LOCK_MODE_S) {
 			pg_atomic_fetch_add_u64(&ClusterPcm->evict_release_deferred_aux_count, 1);
 			elog(DEBUG1, "cluster_pcm: deferred remote S release for evicted buffer "
-				 "(aux context); master keeps a phantom-holder bit");
+						 "(aux context); master keeps a phantom-holder bit");
 			return;
 		}
 

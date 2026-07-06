@@ -53,4 +53,4 @@ extern uint64 cluster_catalog_stats_vis_unknown_count(void);
 extern uint64 cluster_catalog_stats_buf_hit_count(void);
 extern uint64 cluster_catalog_stats_buf_miss_count(void);
 
-#endif							/* CLUSTER_CATALOG_STATS_H */
+#endif /* CLUSTER_CATALOG_STATS_H */

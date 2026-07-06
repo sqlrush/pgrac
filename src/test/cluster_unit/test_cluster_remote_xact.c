@@ -177,17 +177,17 @@ UT_TEST(test_remote_xact_shared_catalog_terminal_predicate)
 	/* Under cluster.shared_catalog the relfile / inval / stats side effects
 	 * execute for real, so they are no longer inputs to the predicate at all:
 	 * only subxacts and a caller-declared malformed xinfo bit block. */
-	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, 0,
-																   UT_XACT_XINFO_HAS_TWOPHASE));
+	UT_ASSERT(
+		!cluster_remote_xact_terminal_blocked_shared_catalog(0, 0, UT_XACT_XINFO_HAS_TWOPHASE));
 	/* subxact outcomes still fail closed (no per-subxact durable wrap proof) */
-	UT_ASSERT(cluster_remote_xact_terminal_blocked_shared_catalog(1, 0,
-																  UT_XACT_XINFO_HAS_TWOPHASE));
+	UT_ASSERT(
+		cluster_remote_xact_terminal_blocked_shared_catalog(1, 0, UT_XACT_XINFO_HAS_TWOPHASE));
 	/* 2PC bit on a PLAIN record arm (disallowed mask carries it) blocks */
 	UT_ASSERT(cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_TWOPHASE,
 																  UT_XACT_XINFO_HAS_TWOPHASE));
 	/* the *_PREPARED arms pass disallowed=0: the expected 2PC bit is admitted */
-	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_TWOPHASE,
-																   0));
+	UT_ASSERT(
+		!cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_TWOPHASE, 0));
 	/* AE-lock bits are consumed (standby machinery), never blocking */
 	UT_ASSERT(!cluster_remote_xact_terminal_blocked_shared_catalog(0, UT_XACT_XINFO_HAS_AE_LOCKS,
 																   UT_XACT_XINFO_HAS_TWOPHASE));

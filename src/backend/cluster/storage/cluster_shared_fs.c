@@ -250,22 +250,19 @@ cluster_shared_fs_init(void)
 	 */
 	{
 		ClusterSharedCatalogVetResult vet;
-		bool		have_shared_data_dir =
-			(cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0');
+		bool have_shared_data_dir
+			= (cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0');
 
-		vet = cluster_shared_catalog_vet(cluster_shared_catalog,
-										 cluster_smgr_user_relations,
-										 have_shared_data_dir,
-										 cluster_controlfile_shared_authority,
+		vet = cluster_shared_catalog_vet(cluster_shared_catalog, cluster_smgr_user_relations,
+										 have_shared_data_dir, cluster_controlfile_shared_authority,
 										 cluster_merged_recovery);
 		if (vet != CLUSTER_SHARED_CATALOG_VET_OK)
-			ereport(FATAL,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cluster.shared_catalog=on requires %s",
-							cluster_shared_catalog_vet_missing_dep_name(vet)),
-					 errhint("Set %s in postgresql.conf and restart, or revert "
-							 "cluster.shared_catalog=off.",
-							 cluster_shared_catalog_vet_missing_dep_name(vet))));
+			ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cluster.shared_catalog=on requires %s",
+								   cluster_shared_catalog_vet_missing_dep_name(vet)),
+							errhint("Set %s in postgresql.conf and restart, or revert "
+									"cluster.shared_catalog=off.",
+									cluster_shared_catalog_vet_missing_dep_name(vet))));
 	}
 
 	/*

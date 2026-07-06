@@ -39,7 +39,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "miscadmin.h"
-#include "pgstat.h"			/* spec-6.14 D9: foreign commit-time stats drops */
+#include "pgstat.h" /* spec-6.14 D9: foreign commit-time stats drops */
 #include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
@@ -708,13 +708,11 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		 * malformed 2PC bit still block.
 		 */
 		if (cluster_shared_catalog
-				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
-																	  parsed.xinfo,
-																	  XACT_XINFO_HAS_TWOPHASE)
-				: cluster_remote_xact_commit_blocked(parsed.nrels, parsed.nmsgs, parsed.nstats,
-													 parsed.nsubxacts, parsed.xinfo,
-													 XACT_XINFO_HAS_TWOPHASE,
-													 XACT_XINFO_HAS_AE_LOCKS))
+				? cluster_remote_xact_terminal_blocked_shared_catalog(
+					  parsed.nsubxacts, parsed.xinfo, XACT_XINFO_HAS_TWOPHASE)
+				: cluster_remote_xact_commit_blocked(
+					  parsed.nrels, parsed.nmsgs, parsed.nstats, parsed.nsubxacts, parsed.xinfo,
+					  XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
 			ereport(
 				blocked_elevel,
 				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -765,9 +763,9 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		 * effects after -- mirror of xact_redo_commit's order). */
 		if (cluster_shared_catalog)
 			cluster_remote_xact_exec_side_effects(
-				parsed.nmsgs, parsed.msgs,
-				XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0, parsed.dbId, parsed.tsId,
-				parsed.nrels, parsed.xlocators, parsed.nstats, parsed.stats, online);
+				parsed.nmsgs, parsed.msgs, XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0,
+				parsed.dbId, parsed.tsId, parsed.nrels, parsed.xlocators, parsed.nstats,
+				parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_COMMIT_PREPARED: {
@@ -826,9 +824,9 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		/* spec-6.14 D9: see the plain-commit arm. */
 		if (cluster_shared_catalog)
 			cluster_remote_xact_exec_side_effects(
-				parsed.nmsgs, parsed.msgs,
-				XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0, parsed.dbId, parsed.tsId,
-				parsed.nrels, parsed.xlocators, parsed.nstats, parsed.stats, online);
+				parsed.nmsgs, parsed.msgs, XactCompletionRelcacheInitFileInval(parsed.xinfo) != 0,
+				parsed.dbId, parsed.tsId, parsed.nrels, parsed.xlocators, parsed.nstats,
+				parsed.stats, online);
 		break;
 	}
 	case XLOG_XACT_ABORT: {
@@ -836,12 +834,10 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		xl_xact_parsed_abort parsed;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		if (cluster_shared_catalog
-				? cluster_remote_xact_terminal_blocked_shared_catalog(parsed.nsubxacts,
-																	  parsed.xinfo,
-																	  XACT_XINFO_HAS_TWOPHASE)
-				: (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0
-				   || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0))
+		if (cluster_shared_catalog ? cluster_remote_xact_terminal_blocked_shared_catalog(
+										 parsed.nsubxacts, parsed.xinfo, XACT_XINFO_HAS_TWOPHASE)
+								   : (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0
+									  || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0))
 			ereport(blocked_elevel,
 					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 					 errmsg("merged recovery: foreign abort record carries an unsupported "

@@ -2144,21 +2144,19 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * tick free of allocator traffic.
 	 */
 	{
-		char		dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
-		int			off = 0;
-		int			n;
+		char dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
+		int off = 0;
+		int n;
 
 		dead[0] = '\0';
 		for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
 			if (dead_bitmap[n / 8] & (1 << (n % 8)))
-				off += snprintf(dead + off, sizeof(dead) - off, "%s%d",
-								off ? "," : "", n);
+				off += snprintf(dead + off, sizeof(dead) - off, "%s%d", off ? "," : "", n);
 		}
-		ereport(LOG,
-				(errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
-						"(coordinator node %d, dead node(s) {%s})",
-						(unsigned long long) old_epoch, (unsigned long long) new_epoch,
-						(int) coordinator_node_id, dead)));
+		ereport(LOG, (errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
+							 "(coordinator node %d, dead node(s) {%s})",
+							 (unsigned long long)old_epoch, (unsigned long long)new_epoch,
+							 (int)coordinator_node_id, dead)));
 	}
 }
 

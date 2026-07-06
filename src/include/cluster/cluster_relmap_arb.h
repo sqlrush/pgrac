@@ -53,4 +53,4 @@
  */
 extern void cluster_relmap_arbitrate_pendings(void);
 
-#endif							/* CLUSTER_RELMAP_ARB_H */
+#endif /* CLUSTER_RELMAP_ARB_H */

@@ -36,10 +36,10 @@
 #include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "utils/wait_event.h"			/* spec-6.14 D10b ClusterCatalogVisResolve */
+#include "utils/wait_event.h" /* spec-6.14 D10b ClusterCatalogVisResolve */
 
-#include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b counters */
-#include "cluster/cluster_cr.h" /* spec-6.15 D4: underivable counter */
+#include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b counters */
+#include "cluster/cluster_cr.h"			   /* spec-6.15 D4: underivable counter */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"				/* cluster_node_id, subtrans depth */
 #include "cluster/cluster_itl.h"				/* get_tt_ref / lock ref / multixact origin */
@@ -520,7 +520,7 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	Page page;
 	ClusterUndoTTSlotRef ref;
 	XLogRecPtr anchor_lsn;
-	bool		is_catalog_page = false;
+	bool is_catalog_page = false;
 
 	if (out == NULL)
 		return;
@@ -545,18 +545,15 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	 * Only unhinted / foreign-evidence tuples reach the resolver, so the
 	 * counter bump is off any hot path.
 	 */
-	if (cluster_shared_catalog)
-	{
+	if (cluster_shared_catalog) {
 		RelFileLocator rlocator;
-		ForkNumber	forknum;
+		ForkNumber forknum;
 		BlockNumber blknum;
 
 		BufferGetTag(buffer, &rlocator, &forknum, &blknum);
-		is_catalog_page =
-			rlocator.relNumber < (RelFileNumber) FirstNormalObjectId;
+		is_catalog_page = rlocator.relNumber < (RelFileNumber)FirstNormalObjectId;
 	}
-	if (is_catalog_page)
-	{
+	if (is_catalog_page) {
 		cluster_catalog_stats_vis_resolve_inc();
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CATALOG_VIS_RESOLVE);
 	}
@@ -602,8 +599,7 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	 * rather than guessing (the fail-closed posture itself is untouched;
 	 * this only counts it).
 	 */
-	if (is_catalog_page)
-	{
+	if (is_catalog_page) {
 		pgstat_report_wait_end();
 		if (out->evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
 			cluster_catalog_stats_vis_unknown_inc();

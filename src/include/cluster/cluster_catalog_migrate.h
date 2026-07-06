@@ -47,19 +47,18 @@
  * marker, so the next start re-seeds rather than adopting a half-populated
  * tree.  Fixed-size + CRC = torn-safe, exactly like the spec-5.6 CF authority.
  */
-#define CLUSTER_CATALOG_AUTHORITY_MAGIC 0x50474341	/* 'PGCA' */
+#define CLUSTER_CATALOG_AUTHORITY_MAGIC 0x50474341 /* 'PGCA' */
 #define CLUSTER_CATALOG_AUTHORITY_VERSION 1
 #define CLUSTER_CATALOG_AUTHORITY_REL_PATH "global/pgrac_catalog_authority"
 #define CLUSTER_CATALOG_AUTHORITY_TMP_REL_PATH "global/pgrac_catalog_authority.tmp"
 
-typedef struct ClusterCatalogAuthorityMarker
-{
-	uint32		magic;
-	uint32		version;
-	uint64		system_identifier;	/* must match the shared pg_control */
-	uint32		catalog_version_no; /* must match this build's CATALOG_VERSION_NO */
-	uint32		flags;				/* reserved (0) */
-	pg_crc32c	crc;				/* over [0, offsetof(crc)) */
+typedef struct ClusterCatalogAuthorityMarker {
+	uint32 magic;
+	uint32 version;
+	uint64 system_identifier;  /* must match the shared pg_control */
+	uint32 catalog_version_no; /* must match this build's CATALOG_VERSION_NO */
+	uint32 flags;			   /* reserved (0) */
+	pg_crc32c crc;			   /* over [0, offsetof(crc)) */
 } ClusterCatalogAuthorityMarker;
 
 /*
@@ -75,8 +74,7 @@ typedef struct ClusterCatalogAuthorityMarker
  *	Fail-closed: FATAL 53RB0 on a foreign/mismatched or unreadable authority.
  *	system_identifier is the cluster-wide value from the shared pg_control.
  */
-extern void cluster_catalog_migrate_tree(const char *local_pgdata,
-										 uint64 system_identifier);
+extern void cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier);
 
 /*
  * cluster_catalog_vet_no_unlogged -- spec-6.14 Q12 enable-time vet: FATAL
@@ -94,4 +92,4 @@ extern void cluster_catalog_vet_no_unlogged(const char *local_pgdata);
  */
 extern void cluster_catalog_vet_off_mode(void);
 
-#endif							/* CLUSTER_CATALOG_MIGRATE_H */
+#endif /* CLUSTER_CATALOG_MIGRATE_H */

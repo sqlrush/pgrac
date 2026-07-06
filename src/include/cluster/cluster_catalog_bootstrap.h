@@ -55,4 +55,4 @@ extern void cluster_catalog_startup_prepare(void);
  */
 extern bool cluster_catalog_services_ready(void);
 
-#endif							/* CLUSTER_CATALOG_BOOTSTRAP_H */
+#endif /* CLUSTER_CATALOG_BOOTSTRAP_H */

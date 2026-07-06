@@ -478,7 +478,7 @@ errdetail(const char *fmt pg_attribute_unused(), ...)
 
 /* spec-6.14 D9 amend: acquire_buffer's no-backend-identity guard reads
  * MyBackendId; a valid id (1) keeps the historical acquire paths open. */
-BackendId	MyBackendId = 1;
+BackendId MyBackendId = 1;
 
 /* ============================================================
  * Minimal mock BufferDesc with just the fields the hook touches.

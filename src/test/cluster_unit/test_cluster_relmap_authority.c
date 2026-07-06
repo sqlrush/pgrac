@@ -56,7 +56,7 @@
 
 UT_DEFINE_GLOBALS();
 
-char	   *cluster_shared_data_dir = NULL;
+char *cluster_shared_data_dir = NULL;
 
 /* ---- Assert + ereport machinery ---- */
 void
@@ -68,8 +68,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -83,8 +82,7 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{
-}
+{}
 int
 errcode(int sqlerrcode pg_attribute_unused())
 {
@@ -96,12 +94,12 @@ errcode_for_file_access(void)
 	return 0;
 }
 int
-errmsg(const char *fmt pg_attribute_unused(),...)
+errmsg(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
 int
-errmsg_internal(const char *fmt pg_attribute_unused(),...)
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -134,9 +132,9 @@ static char test_root[MAXPGPATH];
 static void
 setup_shared_dir(void)
 {
-	char		dir[MAXPGPATH];
+	char dir[MAXPGPATH];
 
-	snprintf(test_root, sizeof(test_root), "/tmp/pgrac_relmap_ut_%d", (int) getpid());
+	snprintf(test_root, sizeof(test_root), "/tmp/pgrac_relmap_ut_%d", (int)getpid());
 	mkdir(test_root, 0700);
 	snprintf(dir, sizeof(dir), "%s/global", test_root);
 	mkdir(dir, 0700);
@@ -146,7 +144,7 @@ setup_shared_dir(void)
 static void
 unlink_authority(void)
 {
-	char		p[MAXPGPATH];
+	char p[MAXPGPATH];
 
 	snprintf(p, sizeof(p), "%s/global/pgrac_relmap_authority", test_root);
 	unlink(p);
@@ -167,16 +165,15 @@ make_map_image(char *buf, uint32 len, unsigned char marker)
 
 UT_TEST(test_classify_short_magic_crc)
 {
-	char		buf[64];
+	char buf[64];
 
 	/* short */
-	UT_ASSERT_EQ(cluster_relmap_authority_classify("x", 1),
-				 CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT);
+	UT_ASSERT_EQ(cluster_relmap_authority_classify("x", 1), CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT);
 
 	/* full-length zeroed buffer -> bad magic */
 	memset(buf, 0, sizeof(buf));
 	UT_ASSERT_EQ(cluster_relmap_authority_classify(buf, sizeof(buf)),
-				 CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT);	/* 64 < file size */
+				 CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT); /* 64 < file size */
 }
 
 /* ============================================================
@@ -185,36 +182,36 @@ UT_TEST(test_classify_short_magic_crc)
 
 UT_TEST(test_first_write_seeds_committed)
 {
-	char		img[CLUSTER_RELMAP_IMAGE_MAX];
-	char		out[CLUSTER_RELMAP_IMAGE_MAX];
-	uint32		out_len = 0;
-	ClusterRelmapOwner owner = {.owner_node = 2,.owner_xid = 4242,.owner_epoch = 7,.relmap_lsn = 0x1234};
+	char img[CLUSTER_RELMAP_IMAGE_MAX];
+	char out[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 out_len = 0;
+	ClusterRelmapOwner owner
+		= { .owner_node = 2, .owner_xid = 4242, .owner_epoch = 7, .relmap_lsn = 0x1234 };
 
 	setup_shared_dir();
 	unlink_authority();
 
 	/* read before any write -> fail-closed */
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 false);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), false);
 
 	/* first write seeds committed from the same image */
 	make_map_image(img, 524, 0xAB);
 	cluster_relmap_authority_write_pending(true, InvalidOid, img, 524, 1, &owner);
 
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 true);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), true);
 	UT_ASSERT_EQ(out_len, 524u);
-	UT_ASSERT_EQ((unsigned char) out[0], 0xAB);
-	UT_ASSERT_EQ((unsigned char) out[523], 0xAB);
+	UT_ASSERT_EQ((unsigned char)out[0], 0xAB);
+	UT_ASSERT_EQ((unsigned char)out[523], 0xAB);
 }
 
 UT_TEST(test_pending_not_visible_until_publish)
 {
-	char		img1[CLUSTER_RELMAP_IMAGE_MAX];
-	char		img2[CLUSTER_RELMAP_IMAGE_MAX];
-	char		out[CLUSTER_RELMAP_IMAGE_MAX];
-	uint32		out_len = 0;
-	ClusterRelmapOwner owner = {.owner_node = 1,.owner_xid = 100,.owner_epoch = 1,.relmap_lsn = 0};
+	char img1[CLUSTER_RELMAP_IMAGE_MAX];
+	char img2[CLUSTER_RELMAP_IMAGE_MAX];
+	char out[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 out_len = 0;
+	ClusterRelmapOwner owner
+		= { .owner_node = 1, .owner_xid = 100, .owner_epoch = 1, .relmap_lsn = 0 };
 
 	setup_shared_dir();
 	unlink_authority();
@@ -228,22 +225,21 @@ UT_TEST(test_pending_not_visible_until_publish)
 	cluster_relmap_authority_write_pending(true, InvalidOid, img2, 524, 2, &owner);
 
 	/* INV-14-7: read_committed still returns the committed 0xAA, not pending */
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 true);
-	UT_ASSERT_EQ((unsigned char) out[0], 0xAA);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), true);
+	UT_ASSERT_EQ((unsigned char)out[0], 0xAA);
 
 	/* publish generation 2: now committed = 0xBB */
 	cluster_relmap_authority_publish(true, InvalidOid, 2);
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 true);
-	UT_ASSERT_EQ((unsigned char) out[0], 0xBB);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), true);
+	UT_ASSERT_EQ((unsigned char)out[0], 0xBB);
 }
 
 UT_TEST(test_owner_identity_preserved_in_header)
 {
-	char		img[CLUSTER_RELMAP_IMAGE_MAX];
+	char img[CLUSTER_RELMAP_IMAGE_MAX];
 	ClusterRelmapAuthorityHeader hdr;
-	ClusterRelmapOwner owner = {.owner_node = 3,.owner_xid = 55555,.owner_epoch = 99,.relmap_lsn = 0xDEADBEEF};
+	ClusterRelmapOwner owner
+		= { .owner_node = 3, .owner_xid = 55555, .owner_epoch = 99, .relmap_lsn = 0xDEADBEEF };
 
 	setup_shared_dir();
 	unlink_authority();
@@ -256,21 +252,22 @@ UT_TEST(test_owner_identity_preserved_in_header)
 
 	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
 	UT_ASSERT_EQ(hdr.owner_node, 3);
-	UT_ASSERT_EQ((uint32) hdr.owner_xid, 55555u);
-	UT_ASSERT_EQ((uint32) hdr.owner_epoch, 99u);
-	UT_ASSERT_EQ((uint32) hdr.relmap_lsn, 0xDEADBEEFu);
-	UT_ASSERT_EQ((uint32) hdr.pending_generation, 2u);
-	UT_ASSERT_EQ((uint32) hdr.committed_generation, 1u);
+	UT_ASSERT_EQ((uint32)hdr.owner_xid, 55555u);
+	UT_ASSERT_EQ((uint32)hdr.owner_epoch, 99u);
+	UT_ASSERT_EQ((uint32)hdr.relmap_lsn, 0xDEADBEEFu);
+	UT_ASSERT_EQ((uint32)hdr.pending_generation, 2u);
+	UT_ASSERT_EQ((uint32)hdr.committed_generation, 1u);
 }
 
 UT_TEST(test_corrupt_primary_falls_back_to_bak)
 {
-	char		img[CLUSTER_RELMAP_IMAGE_MAX];
-	char		out[CLUSTER_RELMAP_IMAGE_MAX];
-	uint32		out_len = 0;
-	char		primary[MAXPGPATH];
-	int			fd;
-	ClusterRelmapOwner owner = {.owner_node = 1,.owner_xid = 1,.owner_epoch = 1,.relmap_lsn = 0};
+	char img[CLUSTER_RELMAP_IMAGE_MAX];
+	char out[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 out_len = 0;
+	char primary[MAXPGPATH];
+	int fd;
+	ClusterRelmapOwner owner
+		= { .owner_node = 1, .owner_xid = 1, .owner_epoch = 1, .relmap_lsn = 0 };
 
 	setup_shared_dir();
 	unlink_authority();
@@ -284,29 +281,28 @@ UT_TEST(test_corrupt_primary_falls_back_to_bak)
 	/* corrupt the primary */
 	snprintf(primary, sizeof(primary), "%s/global/pgrac_relmap_authority", test_root);
 	fd = open(primary, O_WRONLY);
-	if (fd >= 0)
-	{
-		char		junk[8] = {0};
+	if (fd >= 0) {
+		char junk[8] = { 0 };
 
 		if (write(fd, junk, sizeof(junk)) < 0)
-			 /* ignore */ ;
+			/* ignore */;
 		close(fd);
 	}
 
 	/* falls back to the .bak (committed 0x11, from the first write's seed) */
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 true);
-	UT_ASSERT_EQ((unsigned char) out[0], 0x11);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), true);
+	UT_ASSERT_EQ((unsigned char)out[0], 0x11);
 }
 
 UT_TEST(test_discard_pending_keeps_committed)
 {
-	char		img1[CLUSTER_RELMAP_IMAGE_MAX];
-	char		img2[CLUSTER_RELMAP_IMAGE_MAX];
-	char		out[CLUSTER_RELMAP_IMAGE_MAX];
-	uint32		out_len = 0;
+	char img1[CLUSTER_RELMAP_IMAGE_MAX];
+	char img2[CLUSTER_RELMAP_IMAGE_MAX];
+	char out[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32 out_len = 0;
 	ClusterRelmapAuthorityHeader hdr;
-	ClusterRelmapOwner owner = {.owner_node = 1,.owner_xid = 777,.owner_epoch = 1,.relmap_lsn = 0x99};
+	ClusterRelmapOwner owner
+		= { .owner_node = 1, .owner_xid = 777, .owner_epoch = 1, .relmap_lsn = 0x99 };
 
 	setup_shared_dir();
 	unlink_authority();
@@ -321,21 +317,21 @@ UT_TEST(test_discard_pending_keeps_committed)
 	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
 
 	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
-	UT_ASSERT_EQ((uint32) hdr.pending_generation, 0u);
-	UT_ASSERT_EQ((uint32) hdr.committed_generation, 1u);
+	UT_ASSERT_EQ((uint32)hdr.pending_generation, 0u);
+	UT_ASSERT_EQ((uint32)hdr.committed_generation, 1u);
 	UT_ASSERT_EQ(hdr.owner_node, 0);
-	UT_ASSERT_EQ((uint32) hdr.owner_xid, 0u);
+	UT_ASSERT_EQ((uint32)hdr.owner_xid, 0u);
 
-	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len),
-				 true);
-	UT_ASSERT_EQ((unsigned char) out[0], 0xAA);
+	UT_ASSERT_EQ(cluster_relmap_authority_read_committed(true, InvalidOid, out, &out_len), true);
+	UT_ASSERT_EQ((unsigned char)out[0], 0xAA);
 }
 
 UT_TEST(test_discard_pending_generation_mismatch_noop)
 {
-	char		img[CLUSTER_RELMAP_IMAGE_MAX];
+	char img[CLUSTER_RELMAP_IMAGE_MAX];
 	ClusterRelmapAuthorityHeader hdr;
-	ClusterRelmapOwner owner = {.owner_node = 2,.owner_xid = 888,.owner_epoch = 1,.relmap_lsn = 0};
+	ClusterRelmapOwner owner
+		= { .owner_node = 2, .owner_xid = 888, .owner_epoch = 1, .relmap_lsn = 0 };
 
 	setup_shared_dir();
 	unlink_authority();
@@ -348,14 +344,14 @@ UT_TEST(test_discard_pending_generation_mismatch_noop)
 	cluster_relmap_authority_discard_pending(true, InvalidOid, 7);
 
 	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
-	UT_ASSERT_EQ((uint32) hdr.pending_generation, 2u);
+	UT_ASSERT_EQ((uint32)hdr.pending_generation, 2u);
 	UT_ASSERT_EQ(hdr.owner_node, 2);
 
 	/* matching generation discards; a second identical discard is a no-op */
 	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
 	cluster_relmap_authority_discard_pending(true, InvalidOid, 2);
 	UT_ASSERT_EQ(cluster_relmap_authority_read_header(true, InvalidOid, &hdr), true);
-	UT_ASSERT_EQ((uint32) hdr.pending_generation, 0u);
+	UT_ASSERT_EQ((uint32)hdr.pending_generation, 0u);
 }
 
 int

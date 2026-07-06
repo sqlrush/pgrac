@@ -71,9 +71,9 @@
 static bool
 is_relation_filename(const char *name)
 {
-	size_t		len;
+	size_t len;
 
-	if (name == NULL || !isdigit((unsigned char) name[0]))
+	if (name == NULL || !isdigit((unsigned char)name[0]))
 		return false;
 
 	len = strlen(name);
@@ -92,74 +92,61 @@ is_relation_filename(const char *name)
 static void
 copy_file_durable(const char *src, const char *dst)
 {
-	char		dsttmp[MAXPGPATH];
-	int			srcfd;
-	int			dstfd;
-	char		buf[BLCKSZ];
-	int			nread;
+	char dsttmp[MAXPGPATH];
+	int srcfd;
+	int dstfd;
+	char buf[BLCKSZ];
+	int nread;
 
-	if (snprintf(dsttmp, sizeof(dsttmp), "%s.tmp", dst) >= (int) sizeof(dsttmp))
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("shared catalog authority path too long: \"%s\"", dst)));
+	if (snprintf(dsttmp, sizeof(dsttmp), "%s.tmp", dst) >= (int)sizeof(dsttmp))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("shared catalog authority path too long: \"%s\"", dst)));
 
 	srcfd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
 	if (srcfd < 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not open catalog file \"%s\" for shared migration: %m",
-						src)));
+				 errmsg("could not open catalog file \"%s\" for shared migration: %m", src)));
 
 	dstfd = OpenTransientFile(dsttmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-	if (dstfd < 0)
-	{
+	if (dstfd < 0) {
 		CloseTransientFile(srcfd);
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not create shared catalog file \"%s\": %m", dsttmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not create shared catalog file \"%s\": %m", dsttmp)));
 	}
 
-	while ((nread = read(srcfd, buf, sizeof(buf))) > 0)
-	{
-		if (write(dstfd, buf, nread) != nread)
-		{
+	while ((nread = read(srcfd, buf, sizeof(buf))) > 0) {
+		if (write(dstfd, buf, nread) != nread) {
 			CloseTransientFile(srcfd);
 			CloseTransientFile(dstfd);
-			ereport(FATAL,
-					(errcode_for_file_access(),
-					 errmsg("could not write shared catalog file \"%s\": %m", dsttmp)));
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not write shared catalog file \"%s\": %m", dsttmp)));
 		}
 	}
-	if (nread < 0)
-	{
+	if (nread < 0) {
 		CloseTransientFile(srcfd);
 		CloseTransientFile(dstfd);
 		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not read catalog file \"%s\": %m", src)));
+				(errcode_for_file_access(), errmsg("could not read catalog file \"%s\": %m", src)));
 	}
 
-	if (pg_fsync(dstfd) != 0)
-	{
+	if (pg_fsync(dstfd) != 0) {
 		CloseTransientFile(srcfd);
 		CloseTransientFile(dstfd);
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync shared catalog file \"%s\": %m", dsttmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not fsync shared catalog file \"%s\": %m", dsttmp)));
 	}
 
 	if (CloseTransientFile(dstfd) != 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not close shared catalog file \"%s\": %m", dsttmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not close shared catalog file \"%s\": %m", dsttmp)));
 	CloseTransientFile(srcfd);
 
 	/* Atomically publish the fully-written file (fsyncs the directory too). */
 	if (durable_rename(dsttmp, dst, LOG) != 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not rename shared catalog file \"%s\" to \"%s\"",
-						dsttmp, dst)));
+				 errmsg("could not rename shared catalog file \"%s\" to \"%s\"", dsttmp, dst)));
 }
 
 /*
@@ -170,9 +157,9 @@ copy_file_durable(const char *src, const char *dst)
 static void
 seed_dir(const char *local_pgdata, const char *rel)
 {
-	char		localdir[MAXPGPATH];
-	char		shareddir[MAXPGPATH];
-	DIR		   *dir;
+	char localdir[MAXPGPATH];
+	char shareddir[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	snprintf(localdir, sizeof(localdir), "%s/%s", local_pgdata, rel);
@@ -180,16 +167,13 @@ seed_dir(const char *local_pgdata, const char *rel)
 
 	/* The shared root has no pre-created base/<db>; materialise it. */
 	if (pg_mkdir_p(shareddir, pg_dir_create_mode) != 0 && errno != EEXIST)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not create shared catalog directory \"%s\": %m",
-						shareddir)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not create shared catalog directory \"%s\": %m", shareddir)));
 
 	dir = AllocateDir(localdir);
-	while ((de = ReadDir(dir, localdir)) != NULL)
-	{
-		char		srcpath[MAXPGPATH];
-		char		dstpath[MAXPGPATH];
+	while ((de = ReadDir(dir, localdir)) != NULL) {
+		char srcpath[MAXPGPATH];
+		char dstpath[MAXPGPATH];
 
 		if (!is_relation_filename(de->d_name))
 			continue;
@@ -212,7 +196,7 @@ seed_dir(const char *local_pgdata, const char *rel)
 static bool
 is_init_fork_filename(const char *name)
 {
-	size_t		len;
+	size_t len;
 
 	if (!is_relation_filename(name))
 		return false;
@@ -229,35 +213,31 @@ is_init_fork_filename(const char *name)
 static void
 vet_dir_no_init(const char *root, const char *rel)
 {
-	char		dirpath[MAXPGPATH];
-	DIR		   *dir;
+	char dirpath[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	snprintf(dirpath, sizeof(dirpath), "%s/%s", root, rel);
 
 	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-	{
+	if (dir == NULL) {
 		if (errno == ENOENT)
 			return;
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
-						dirpath)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
+							   dirpath)));
 	}
 
-	while ((de = ReadDir(dir, dirpath)) != NULL)
-	{
+	while ((de = ReadDir(dir, dirpath)) != NULL) {
 		if (is_init_fork_filename(de->d_name))
-			ereport(FATAL,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cluster.shared_catalog cannot be enabled: unlogged relation "
-							"storage exists"),
-					 errdetail("Init fork \"%s/%s\" indicates an unlogged relation.",
-							   dirpath, de->d_name),
-					 errhint("Drop existing unlogged relations (or ALTER TABLE ... SET "
-							 "LOGGED) before enabling cluster.shared_catalog; cluster-wide "
-							 "unlogged support is spec-6.14c.")));
+			ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cluster.shared_catalog cannot be enabled: unlogged relation "
+								   "storage exists"),
+							errdetail("Init fork \"%s/%s\" indicates an unlogged relation.",
+									  dirpath, de->d_name),
+							errhint("Drop existing unlogged relations (or ALTER TABLE ... SET "
+									"LOGGED) before enabling cluster.shared_catalog; cluster-wide "
+									"unlogged support is spec-6.14c.")));
 	}
 	FreeDir(dir);
 }
@@ -268,28 +248,25 @@ vet_dir_no_init(const char *root, const char *rel)
 static void
 vet_tree_no_init(const char *root)
 {
-	char		basepath[MAXPGPATH];
-	DIR		   *dir;
+	char basepath[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	vet_dir_no_init(root, "global");
 
 	snprintf(basepath, sizeof(basepath), "%s/base", root);
 	dir = AllocateDir(basepath);
-	if (dir == NULL)
-	{
+	if (dir == NULL) {
 		if (errno == ENOENT)
 			return;
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
-						basepath)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not open directory \"%s\" for the unlogged-relation vet: %m",
+							   basepath)));
 	}
-	while ((de = ReadDir(dir, basepath)) != NULL)
-	{
-		char		rel[MAXPGPATH];
+	while ((de = ReadDir(dir, basepath)) != NULL) {
+		char rel[MAXPGPATH];
 
-		if (!isdigit((unsigned char) de->d_name[0]))
+		if (!isdigit((unsigned char)de->d_name[0]))
 			continue;
 		snprintf(rel, sizeof(rel), "base/%s", de->d_name);
 		vet_dir_no_init(root, rel);
@@ -325,7 +302,7 @@ cluster_catalog_vet_no_unlogged(const char *local_pgdata)
 static pg_crc32c
 marker_crc(const ClusterCatalogAuthorityMarker *m)
 {
-	pg_crc32c	crc;
+	pg_crc32c crc;
 
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, m, offsetof(ClusterCatalogAuthorityMarker, crc));
@@ -342,35 +319,29 @@ marker_crc(const ClusterCatalogAuthorityMarker *m)
 static bool
 read_marker(ClusterCatalogAuthorityMarker *out)
 {
-	char		path[MAXPGPATH];
-	int			fd;
-	int			nread;
+	char path[MAXPGPATH];
+	int fd;
+	int nread;
 
 	snprintf(path, sizeof(path), "%s/%s", cluster_shared_data_dir,
 			 CLUSTER_CATALOG_AUTHORITY_REL_PATH);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-	{
+	if (fd < 0) {
 		if (errno == ENOENT)
-			return false;		/* absent: this node is the seed */
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not open shared catalog authority marker \"%s\": %m",
-						path)));
+			return false; /* absent: this node is the seed */
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not open shared catalog authority marker \"%s\": %m", path)));
 	}
 
 	nread = read(fd, out, sizeof(*out));
 	CloseTransientFile(fd);
 
-	if (nread != (int) sizeof(*out) ||
-		out->magic != CLUSTER_CATALOG_AUTHORITY_MAGIC ||
-		out->version != CLUSTER_CATALOG_AUTHORITY_VERSION ||
-		out->crc != marker_crc(out))
+	if (nread != (int)sizeof(*out) || out->magic != CLUSTER_CATALOG_AUTHORITY_MAGIC
+		|| out->version != CLUSTER_CATALOG_AUTHORITY_VERSION || out->crc != marker_crc(out))
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("shared catalog authority marker \"%s\" is corrupt or truncated",
-						path),
+				 errmsg("shared catalog authority marker \"%s\" is corrupt or truncated", path),
 				 errhint("Remove the shared catalog tree under cluster.shared_data_dir "
 						 "and re-seed from a single node, or restore it from backup.")));
 
@@ -385,10 +356,10 @@ read_marker(ClusterCatalogAuthorityMarker *out)
 static void
 write_marker(uint64 system_identifier)
 {
-	char		tmp[MAXPGPATH];
-	char		final[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char final[MAXPGPATH];
 	ClusterCatalogAuthorityMarker m;
-	int			fd;
+	int fd;
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_CATALOG_AUTHORITY_MAGIC;
@@ -407,34 +378,23 @@ write_marker(uint64 system_identifier)
 	if (fd < 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not create shared catalog authority marker \"%s\": %m",
-						tmp)));
-	if (write(fd, &m, sizeof(m)) != sizeof(m))
-	{
+				 errmsg("could not create shared catalog authority marker \"%s\": %m", tmp)));
+	if (write(fd, &m, sizeof(m)) != sizeof(m)) {
 		CloseTransientFile(fd);
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not write shared catalog authority marker \"%s\": %m",
-						tmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not write shared catalog authority marker \"%s\": %m", tmp)));
 	}
-	if (pg_fsync(fd) != 0)
-	{
+	if (pg_fsync(fd) != 0) {
 		CloseTransientFile(fd);
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync shared catalog authority marker \"%s\": %m",
-						tmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not fsync shared catalog authority marker \"%s\": %m", tmp)));
 	}
 	if (CloseTransientFile(fd) != 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not close shared catalog authority marker \"%s\": %m",
-						tmp)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not close shared catalog authority marker \"%s\": %m", tmp)));
 	if (durable_rename(tmp, final, LOG) != 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not publish shared catalog authority marker \"%s\"",
-						final)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not publish shared catalog authority marker \"%s\"", final)));
 }
 
 /*
@@ -448,19 +408,18 @@ write_marker(uint64 system_identifier)
 static void
 seed_base_databases(const char *local_pgdata)
 {
-	char		localbase[MAXPGPATH];
-	DIR		   *dir;
+	char localbase[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	snprintf(localbase, sizeof(localbase), "%s/base", local_pgdata);
 
 	dir = AllocateDir(localbase);
-	while ((de = ReadDir(dir, localbase)) != NULL)
-	{
-		char		rel[MAXPGPATH];
+	while ((de = ReadDir(dir, localbase)) != NULL) {
+		char rel[MAXPGPATH];
 
 		/* database directories are named by numeric db OID */
-		if (!isdigit((unsigned char) de->d_name[0]))
+		if (!isdigit((unsigned char)de->d_name[0]))
 			continue;
 
 		snprintf(rel, sizeof(rel), "base/%s", de->d_name);
@@ -481,54 +440,49 @@ seed_base_databases(const char *local_pgdata)
  *	pending, so the foreign-pending write guard never sees a seed residue.
  */
 static void
-seed_relmap_one(const char *local_pgdata, const char *rel,
-				bool shared_map, Oid dbid)
+seed_relmap_one(const char *local_pgdata, const char *rel, bool shared_map, Oid dbid)
 {
-	char		path[MAXPGPATH];
-	char		image[CLUSTER_RELMAP_IMAGE_MAX];
+	char path[MAXPGPATH];
+	char image[CLUSTER_RELMAP_IMAGE_MAX];
 	ClusterRelmapAuthorityHeader hdr;
 	ClusterRelmapOwner owner;
 	struct stat st;
-	int			fd;
-	int			nread;
+	int fd;
+	int nread;
 
 	if (cluster_relmap_authority_read_header(shared_map, dbid, &hdr))
-		return;					/* already seeded (idempotent re-run) */
+		return; /* already seeded (idempotent re-run) */
 
 	/* RELMAPPER_FILENAME is private to relmapper.c; the name is fixed. */
 	snprintf(path, sizeof(path), "%s/%s/pg_filenode.map", local_pgdata, rel);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not open relation map file \"%s\" for the shared "
-						"relmap authority seed: %m", path)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not open relation map file \"%s\" for the shared "
+							   "relmap authority seed: %m",
+							   path)));
 	if (fstat(fd, &st) != 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not stat relation map file \"%s\": %m", path)));
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not stat relation map file \"%s\": %m", path)));
 	if (st.st_size <= 0 || st.st_size > CLUSTER_RELMAP_IMAGE_MAX)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("relation map file \"%s\" has unexpected size %lld",
-						path, (long long) st.st_size),
-				 errhint("The local relation map is not trustworthy; restore the "
-						 "node from backup before seeding cluster.shared_catalog.")));
-	nread = read(fd, image, (size_t) st.st_size);
-	if (nread != (int) st.st_size)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not read relation map file \"%s\": %m", path)));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("relation map file \"%s\" has unexpected size %lld", path,
+							   (long long)st.st_size),
+						errhint("The local relation map is not trustworthy; restore the "
+								"node from backup before seeding cluster.shared_catalog.")));
+	nread = read(fd, image, (size_t)st.st_size);
+	if (nread != (int)st.st_size)
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not read relation map file \"%s\": %m", path)));
 	CloseTransientFile(fd);
 
-	owner.owner_node = (int16) cluster_node_id;
+	owner.owner_node = (int16)cluster_node_id;
 	owner.owner_xid = InvalidTransactionId;
 	owner.owner_epoch = 0;
 	owner.relmap_lsn = 0;
 
-	cluster_relmap_authority_write_pending(shared_map, dbid, image,
-										   (uint32) st.st_size, 1, &owner);
+	cluster_relmap_authority_write_pending(shared_map, dbid, image, (uint32)st.st_size, 1, &owner);
 	cluster_relmap_authority_publish(shared_map, dbid, 1);
 }
 
@@ -539,19 +493,18 @@ seed_relmap_one(const char *local_pgdata, const char *rel,
 static void
 seed_relmap_authority(const char *local_pgdata)
 {
-	char		localbase[MAXPGPATH];
-	DIR		   *dir;
+	char localbase[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	seed_relmap_one(local_pgdata, "global", true, InvalidOid);
 
 	snprintf(localbase, sizeof(localbase), "%s/base", local_pgdata);
 	dir = AllocateDir(localbase);
-	while ((de = ReadDir(dir, localbase)) != NULL)
-	{
-		char		rel[MAXPGPATH];
+	while ((de = ReadDir(dir, localbase)) != NULL) {
+		char rel[MAXPGPATH];
 
-		if (!isdigit((unsigned char) de->d_name[0]))
+		if (!isdigit((unsigned char)de->d_name[0]))
 			continue;
 
 		snprintf(rel, sizeof(rel), "base/%s", de->d_name);
@@ -573,26 +526,24 @@ static void
 vet_seed_clean_shutdown(const char *local_pgdata)
 {
 	ControlFileData *lcf;
-	bool		crc_ok;
+	bool crc_ok;
 
 	lcf = get_controlfile(local_pgdata, &crc_ok);
 	if (!crc_ok)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("local pg_control has an invalid checksum; cannot seed "
-						"the shared catalog authority")));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("local pg_control has an invalid checksum; cannot seed "
+							   "the shared catalog authority")));
 	if (lcf->state != DB_SHUTDOWNED)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("seeding the shared catalog authority requires a cleanly "
-						"shut down node"),
-				 errdetail("Local pg_control state is \"%s\"; pending WAL could "
-						   "hold relation-map updates the seeded authority would "
-						   "never see.",
-						   lcf->state == DB_SHUTDOWNED_IN_RECOVERY ?
-						   "shut down in recovery" : "not shut down"),
-				 errhint("Start and cleanly stop this node with "
-						 "cluster.shared_catalog=off, then enable it.")));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("seeding the shared catalog authority requires a cleanly "
+							   "shut down node"),
+						errdetail("Local pg_control state is \"%s\"; pending WAL could "
+								  "hold relation-map updates the seeded authority would "
+								  "never see.",
+								  lcf->state == DB_SHUTDOWNED_IN_RECOVERY ? "shut down in recovery"
+																		  : "not shut down"),
+						errhint("Start and cleanly stop this node with "
+								"cluster.shared_catalog=off, then enable it.")));
 	pfree(lcf);
 }
 
@@ -608,35 +559,31 @@ vet_seed_clean_shutdown(const char *local_pgdata)
 static void
 vet_seed_no_tablespaces(const char *local_pgdata)
 {
-	char		tblspcdir[MAXPGPATH];
-	DIR		   *dir;
+	char tblspcdir[MAXPGPATH];
+	DIR *dir;
 	struct dirent *de;
 
 	snprintf(tblspcdir, sizeof(tblspcdir), "%s/pg_tblspc", local_pgdata);
 
 	dir = AllocateDir(tblspcdir);
-	if (dir == NULL)
-	{
+	if (dir == NULL) {
 		if (errno == ENOENT)
 			return;
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not open directory \"%s\" for the tablespace vet: %m",
-						tblspcdir)));
+				 errmsg("could not open directory \"%s\" for the tablespace vet: %m", tblspcdir)));
 	}
-	while ((de = ReadDir(dir, tblspcdir)) != NULL)
-	{
+	while ((de = ReadDir(dir, tblspcdir)) != NULL) {
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
 			continue;
-		ereport(FATAL,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cluster.shared_catalog cannot be enabled: user tablespace "
-						"storage exists"),
-				 errdetail("\"%s/%s\" exists; per-database catalogs under a user "
-						   "tablespace are outside the shared catalog seed.",
-						   tblspcdir, de->d_name),
-				 errhint("Drop all user tablespaces before enabling "
-						 "cluster.shared_catalog; tablespace support is spec-6.14b.")));
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster.shared_catalog cannot be enabled: user tablespace "
+							   "storage exists"),
+						errdetail("\"%s/%s\" exists; per-database catalogs under a user "
+								  "tablespace are outside the shared catalog seed.",
+								  tblspcdir, de->d_name),
+						errhint("Drop all user tablespaces before enabling "
+								"cluster.shared_catalog; tablespace support is spec-6.14b.")));
 	}
 	FreeDir(dir);
 }
@@ -658,8 +605,7 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 	 * (catalog version).  Fail-closed on any mismatch -- never write a
 	 * divergent catalog copy over a foreign authority.
 	 */
-	if (read_marker(&existing))
-	{
+	if (read_marker(&existing)) {
 		if (existing.system_identifier != system_identifier)
 			ereport(FATAL,
 					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
@@ -669,15 +615,15 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 							   existing.system_identifier, system_identifier),
 					 errhint("Point cluster.shared_data_dir at this cluster's shared tree.")));
 		if (existing.catalog_version_no != CATALOG_VERSION_NO)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-					 errmsg("shared catalog authority has an incompatible catalog version"),
-					 errdetail("Shared authority catalog version %u does not match this "
-							   "build's %u.",
-							   existing.catalog_version_no, (uint32) CATALOG_VERSION_NO)));
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("shared catalog authority has an incompatible catalog version"),
+							errdetail("Shared authority catalog version %u does not match this "
+									  "build's %u.",
+									  existing.catalog_version_no, (uint32)CATALOG_VERSION_NO)));
 
-		elog(LOG, "cluster shared_catalog: adopted shared catalog authority (sysid "
-			 UINT64_FORMAT ")", system_identifier);
+		elog(LOG,
+			 "cluster shared_catalog: adopted shared catalog authority (sysid " UINT64_FORMAT ")",
+			 system_identifier);
 		return;
 	}
 
@@ -695,8 +641,10 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 	seed_relmap_authority(local_pgdata);
 	write_marker(system_identifier);
 
-	elog(LOG, "cluster shared_catalog: seeded shared catalog authority under \"%s\" "
-		 "(sysid " UINT64_FORMAT ")", cluster_shared_data_dir, system_identifier);
+	elog(LOG,
+		 "cluster shared_catalog: seeded shared catalog authority under \"%s\" "
+		 "(sysid " UINT64_FORMAT ")",
+		 cluster_shared_data_dir, system_identifier);
 }
 
 /*
@@ -722,14 +670,13 @@ cluster_catalog_vet_off_mode(void)
 	if (!read_marker(&m))
 		return;
 
-	ereport(FATAL,
-			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-			 errmsg("cluster.shared_catalog is off but the shared tree holds a "
-					"shared catalog authority"),
-			 errdetail("\"%s/%s\" certifies that this cluster's catalog lives in "
-					   "the shared tree; the node-local catalog files are stale "
-					   "once any DDL ran with cluster.shared_catalog=on.",
-					   cluster_shared_data_dir, CLUSTER_CATALOG_AUTHORITY_REL_PATH),
-			 errhint("Re-enable cluster.shared_catalog, or restore this node from "
-					 "a backup taken before the shared catalog was seeded.")));
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					errmsg("cluster.shared_catalog is off but the shared tree holds a "
+						   "shared catalog authority"),
+					errdetail("\"%s/%s\" certifies that this cluster's catalog lives in "
+							  "the shared tree; the node-local catalog files are stale "
+							  "once any DDL ran with cluster.shared_catalog=on.",
+							  cluster_shared_data_dir, CLUSTER_CATALOG_AUTHORITY_REL_PATH),
+					errhint("Re-enable cluster.shared_catalog, or restore this node from "
+							"a backup taken before the shared catalog was seeded.")));
 }

@@ -41,8 +41,8 @@
 
 #include "c.h"
 
-#include "cluster/cluster_grd.h"		/* ClusterResId */
-#include "port/pg_crc32c.h"				/* pg_crc32c + CRC macros */
+#include "cluster/cluster_grd.h" /* ClusterResId */
+#include "port/pg_crc32c.h"		 /* pg_crc32c + CRC macros */
 
 /*
  * CLUSTER_OID_RESID_TYPE -- OID-authority resource-id namespace marker for the
@@ -53,11 +53,11 @@
 #define CLUSTER_OID_RESID_TYPE 0xF7
 
 /* On-disk authority header magic + version. */
-#define CLUSTER_OID_AUTHORITY_MAGIC   0x0140D617	/* "OID" authority tag     */
+#define CLUSTER_OID_AUTHORITY_MAGIC 0x0140D617 /* "OID" authority tag     */
 #define CLUSTER_OID_AUTHORITY_VERSION 1
 
 /* Shared authority file paths, relative to cluster.shared_data_dir. */
-#define CLUSTER_OID_AUTHORITY_REL_PATH     "global/pgrac_oid_authority"
+#define CLUSTER_OID_AUTHORITY_REL_PATH "global/pgrac_oid_authority"
 #define CLUSTER_OID_AUTHORITY_BAK_REL_PATH "global/pgrac_oid_authority.bak"
 #define CLUSTER_OID_AUTHORITY_TMP_REL_PATH "global/pgrac_oid_authority.tmp"
 #define CLUSTER_OID_AUTHORITY_BAK_TMP_REL_PATH "global/pgrac_oid_authority.bak.tmp"
@@ -68,20 +68,18 @@
  * [old high-water, old high-water + lease_size) and the file is bumped to the
  * new high-water under the cross-node X lock before the lease is handed out.
  */
-typedef struct ClusterOidAuthorityHeader
-{
-	uint32		magic;			/* CLUSTER_OID_AUTHORITY_MAGIC             */
-	uint32		version;		/* CLUSTER_OID_AUTHORITY_VERSION           */
-	Oid			next_oid;		/* cluster-wide next unallocated OID       */
-	uint32		reserved;		/* pad / future use; zero                  */
-	pg_crc32c	crc;			/* CRC of all preceding bytes              */
+typedef struct ClusterOidAuthorityHeader {
+	uint32 magic;	 /* CLUSTER_OID_AUTHORITY_MAGIC             */
+	uint32 version;	 /* CLUSTER_OID_AUTHORITY_VERSION           */
+	Oid next_oid;	 /* cluster-wide next unallocated OID       */
+	uint32 reserved; /* pad / future use; zero                  */
+	pg_crc32c crc;	 /* CRC of all preceding bytes              */
 } ClusterOidAuthorityHeader;
 
 /*
  * ClusterOidAuthorityValidity -- classification of an authority image buffer.
  */
-typedef enum ClusterOidAuthorityValidity
-{
+typedef enum ClusterOidAuthorityValidity {
 	CLUSTER_OID_AUTHORITY_VALID = 0,
 	CLUSTER_OID_AUTHORITY_INVALID_SHORT,
 	CLUSTER_OID_AUTHORITY_INVALID_MAGIC,
@@ -93,10 +91,9 @@ typedef enum ClusterOidAuthorityValidity
  * OID this node may hand out; end is the exclusive upper bound.  next == end
  * means the block is exhausted and a refill is required.
  */
-typedef struct ClusterOidLease
-{
-	Oid			next;
-	Oid			end;
+typedef struct ClusterOidLease {
+	Oid next;
+	Oid end;
 } ClusterOidLease;
 
 /* ---- pure layer (cluster_oid_lease.c) ---------------------------------- */
@@ -111,15 +108,14 @@ extern void cluster_oid_resid_encode(ClusterResId *dst);
  * cluster_oid_authority_classify -- pure validity check of an authority image
  *	buffer of length len (short / bad magic / bad CRC / valid).
  */
-extern ClusterOidAuthorityValidity
-			cluster_oid_authority_classify(const char *buf, size_t len);
+extern ClusterOidAuthorityValidity cluster_oid_authority_classify(const char *buf, size_t len);
 
 /*
  * cluster_oid_lease_normalize_start -- force an authority high-water up to
  *	FirstNormalObjectId when it has wrapped below the reserved range (mirrors
  *	the wraparound handling in the stock GetNewObjectId).  Pure.
  */
-extern Oid	cluster_oid_lease_normalize_start(Oid start);
+extern Oid cluster_oid_lease_normalize_start(Oid start);
 
 /*
  * cluster_oid_lease_consume -- hand out one OID from a lease, advancing it.
@@ -128,7 +124,7 @@ extern Oid	cluster_oid_lease_normalize_start(Oid start);
  *	never contains a reserved (< FirstNormalObjectId) OID, so consume is a
  *	plain next++ with unsigned wrap.  Pure.
  */
-extern Oid	cluster_oid_lease_consume(ClusterOidLease *lease);
+extern Oid cluster_oid_lease_consume(ClusterOidLease *lease);
 
 /*
  * cluster_oid_lease_carve -- pure refill math.  Given the current authority
@@ -141,8 +137,7 @@ extern Oid	cluster_oid_lease_consume(ClusterOidLease *lease);
  *	pairwise disjoint (spec-6.14 §3.3).  *out_end == 0 means the block runs to
  *	the top of the OID space (exclusive end wraps to 0).
  */
-extern void cluster_oid_lease_carve(Oid hw, uint32 lease_size,
-									Oid *out_start, Oid *out_end,
+extern void cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, Oid *out_end,
 									Oid *out_new_authority);
 
 /* ---- authority file I/O (cluster_oid_lease.c, backend) ----------------- */
@@ -195,10 +190,10 @@ extern void cluster_oid_lease_shmem_register(void);
  *	falls back to the node-local counter.  Called from GetNewObjectId under
  *	shared_catalog=on.
  */
-extern Oid	cluster_oid_lease_get_next(void);
+extern Oid cluster_oid_lease_get_next(void);
 
 /* Observability accessors (D10). */
 extern uint64 cluster_oid_lease_acquire_count(void);
-extern Oid	cluster_oid_lease_remaining(void);
+extern Oid cluster_oid_lease_remaining(void);
 
-#endif							/* CLUSTER_OID_LEASE_H */
+#endif /* CLUSTER_OID_LEASE_H */

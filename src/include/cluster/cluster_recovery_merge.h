@@ -332,9 +332,9 @@ cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, i
 
 typedef struct ClusterMergeClaimFile {
 	uint64 magic;
-	uint64 sysid; /* cluster system identifier (foreign-root guard) */
-	int32 node;	  /* 0-based claimant node id */
-	int32 pad;	  /* zero; keeps the CRC field aligned + layout explicit */
+	uint64 sysid;  /* cluster system identifier (foreign-root guard) */
+	int32 node;	   /* 0-based claimant node id */
+	int32 pad;	   /* zero; keeps the CRC field aligned + layout explicit */
 	pg_crc32c crc; /* over the four fields above */
 } ClusterMergeClaimFile;
 

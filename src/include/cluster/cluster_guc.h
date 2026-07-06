@@ -329,7 +329,7 @@ extern bool cluster_shared_catalog;
  *	the shared OID authority (default 8192, range 1024..1048576).  Only
  *	meaningful when cluster_shared_catalog is on.  context: PGC_POSTMASTER.
  */
-extern int	cluster_oid_lease_size;
+extern int cluster_oid_lease_size;
 
 
 /*

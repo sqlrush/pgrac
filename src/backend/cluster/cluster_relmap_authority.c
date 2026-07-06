@@ -35,16 +35,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "cluster/cluster_guc.h"	/* cluster_shared_data_dir */
+#include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_relmap_authority.h"
 #include "storage/fd.h"
 
 /* Fixed on-disk file size: header + two full-width image slots. */
-#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE \
-	((int) (sizeof(ClusterRelmapAuthorityHeader) + 2 * CLUSTER_RELMAP_IMAGE_MAX))
+#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE                                                         \
+	((int)(sizeof(ClusterRelmapAuthorityHeader) + 2 * CLUSTER_RELMAP_IMAGE_MAX))
 
-#define COMMITTED_SLOT_OFFSET ((int) sizeof(ClusterRelmapAuthorityHeader))
-#define PENDING_SLOT_OFFSET   (COMMITTED_SLOT_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
+#define COMMITTED_SLOT_OFFSET ((int)sizeof(ClusterRelmapAuthorityHeader))
+#define PENDING_SLOT_OFFSET (COMMITTED_SLOT_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
 
 /* Relative authority path within cluster_shared_data_dir. */
 #define AUTHORITY_BASENAME "pgrac_relmap_authority"
@@ -57,9 +57,9 @@ ClusterRelmapAuthorityValidity
 cluster_relmap_authority_classify(const char *buf, size_t len)
 {
 	ClusterRelmapAuthorityHeader hdr;
-	pg_crc32c	crc;
+	pg_crc32c crc;
 
-	if (buf == NULL || len < (size_t) CLUSTER_RELMAP_AUTHORITY_FILE_SIZE)
+	if (buf == NULL || len < (size_t)CLUSTER_RELMAP_AUTHORITY_FILE_SIZE)
 		return CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT;
 
 	memcpy(&hdr, buf, sizeof(hdr));
@@ -91,18 +91,17 @@ cluster_relmap_authority_classify(const char *buf, size_t len)
  * false when the shared root is not configured.
  */
 static bool
-build_authority_path(char *dst, size_t dstlen, bool shared_map, Oid dbid,
-					 const char *suffix)
+build_authority_path(char *dst, size_t dstlen, bool shared_map, Oid dbid, const char *suffix)
 {
 	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
 		return false;
 
 	if (shared_map)
-		snprintf(dst, dstlen, "%s/global/%s%s",
-				 cluster_shared_data_dir, AUTHORITY_BASENAME, suffix);
+		snprintf(dst, dstlen, "%s/global/%s%s", cluster_shared_data_dir, AUTHORITY_BASENAME,
+				 suffix);
 	else
-		snprintf(dst, dstlen, "%s/base/%u/%s%s",
-				 cluster_shared_data_dir, dbid, AUTHORITY_BASENAME, suffix);
+		snprintf(dst, dstlen, "%s/base/%u/%s%s", cluster_shared_data_dir, dbid, AUTHORITY_BASENAME,
+				 suffix);
 	return true;
 }
 
@@ -113,29 +112,24 @@ build_authority_path(char *dst, size_t dstlen, bool shared_map, Oid dbid,
 static void
 write_durable(const char *tmp, const char *final, const char *buf)
 {
-	int			fd;
+	int fd;
 
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", tmp)));
 
 	errno = 0;
-	if (write(fd, buf, CLUSTER_RELMAP_AUTHORITY_FILE_SIZE) != CLUSTER_RELMAP_AUTHORITY_FILE_SIZE)
-	{
+	if (write(fd, buf, CLUSTER_RELMAP_AUTHORITY_FILE_SIZE) != CLUSTER_RELMAP_AUTHORITY_FILE_SIZE) {
 		if (errno == 0)
 			errno = ENOSPC;
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not write file \"%s\": %m", tmp)));
 	}
 
 	if (pg_fsync(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not fsync file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not fsync file \"%s\": %m", tmp)));
 
 	if (CloseTransientFile(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", tmp)));
 
 	if (durable_rename(tmp, final, PANIC) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
@@ -145,13 +139,13 @@ write_durable(const char *tmp, const char *final, const char *buf)
 static void
 roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 {
-	char		buf[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
-	int			fd;
-	int			r;
+	char buf[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(primary, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		return;					/* first write: no prior primary */
+		return; /* first write: no prior primary */
 
 	r = read(fd, buf, CLUSTER_RELMAP_AUTHORITY_FILE_SIZE);
 	CloseTransientFile(fd);
@@ -168,8 +162,8 @@ roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 static ClusterRelmapAuthorityValidity
 read_whole(const char *path, char *image)
 {
-	int			fd;
-	int			r;
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
@@ -190,8 +184,8 @@ read_whole(const char *path, char *image)
 static bool
 load_authority(bool shared_map, Oid dbid, char *image)
 {
-	char		primary[MAXPGPATH];
-	char		bak[MAXPGPATH];
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
 
 	if (!build_authority_path(primary, sizeof(primary), shared_map, dbid, "")
 		|| !build_authority_path(bak, sizeof(bak), shared_map, dbid, ".bak"))
@@ -211,10 +205,10 @@ load_authority(bool shared_map, Oid dbid, char *image)
 static void
 store_authority(bool shared_map, Oid dbid, const char *image)
 {
-	char		primary[MAXPGPATH];
-	char		bak[MAXPGPATH];
-	char		tmp[MAXPGPATH];
-	char		baktmp[MAXPGPATH];
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char baktmp[MAXPGPATH];
 
 	if (!build_authority_path(primary, sizeof(primary), shared_map, dbid, "")
 		|| !build_authority_path(bak, sizeof(bak), shared_map, dbid, ".bak")
@@ -232,7 +226,7 @@ store_authority(bool shared_map, Oid dbid, const char *image)
 static void
 finalize_header_crc(char *image)
 {
-	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *) image;
+	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *)image;
 
 	INIT_CRC32C(hdr->crc);
 	COMP_CRC32C(hdr->crc, image, offsetof(ClusterRelmapAuthorityHeader, crc));
@@ -244,10 +238,9 @@ finalize_header_crc(char *image)
  * ============================================================ */
 
 bool
-cluster_relmap_authority_read_committed(bool shared_map, Oid dbid,
-										char *map_out, uint32 *out_len)
+cluster_relmap_authority_read_committed(bool shared_map, Oid dbid, char *map_out, uint32 *out_len)
 {
-	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
 	ClusterRelmapAuthorityHeader hdr;
 
 	if (!load_authority(shared_map, dbid, image))
@@ -260,10 +253,9 @@ cluster_relmap_authority_read_committed(bool shared_map, Oid dbid,
 }
 
 bool
-cluster_relmap_authority_read_header(bool shared_map, Oid dbid,
-									 ClusterRelmapAuthorityHeader *out)
+cluster_relmap_authority_read_header(bool shared_map, Oid dbid, ClusterRelmapAuthorityHeader *out)
 {
-	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
 
 	if (!load_authority(shared_map, dbid, image))
 		return false;
@@ -273,18 +265,16 @@ cluster_relmap_authority_read_header(bool shared_map, Oid dbid,
 }
 
 void
-cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
-									   const char *map_image, uint32 image_size,
-									   uint64 pending_generation,
+cluster_relmap_authority_write_pending(bool shared_map, Oid dbid, const char *map_image,
+									   uint32 image_size, uint64 pending_generation,
 									   const ClusterRelmapOwner *owner)
 {
-	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
-	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *) image;
-	bool		have_prior;
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *)image;
+	bool have_prior;
 
 	if (image_size == 0 || image_size > CLUSTER_RELMAP_IMAGE_MAX)
-		ereport(PANIC,
-				(errmsg("relmap authority image size %u out of range", image_size)));
+		ereport(PANIC, (errmsg("relmap authority image size %u out of range", image_size)));
 
 	/* Start from the current authority if any, else a zeroed image. */
 	have_prior = load_authority(shared_map, dbid, image);
@@ -315,8 +305,7 @@ cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
 	 * committed_generation so a reader before the first publish still adopts a
 	 * valid map (there is no "old committed" to preserve).
 	 */
-	if (!have_prior)
-	{
+	if (!have_prior) {
 		memset(image + COMMITTED_SLOT_OFFSET, 0, CLUSTER_RELMAP_IMAGE_MAX);
 		memcpy(image + COMMITTED_SLOT_OFFSET, map_image, image_size);
 		hdr->committed_generation = pending_generation;
@@ -329,15 +318,13 @@ cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
 void
 cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation)
 {
-	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
-	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *) image;
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *)image;
 
 	if (!load_authority(shared_map, dbid, image))
-		ereport(PANIC,
-				(errmsg("relmap authority unavailable at publish for db %u", dbid)));
+		ereport(PANIC, (errmsg("relmap authority unavailable at publish for db %u", dbid)));
 
-	if (hdr->pending_generation != generation)
-	{
+	if (hdr->pending_generation != generation) {
 		/*
 		 * Already published (idempotent retry) or a stale generation.  If the
 		 * committed generation already matches, treat as done; otherwise this
@@ -345,17 +332,15 @@ cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation)
 		 */
 		if (hdr->committed_generation == generation)
 			return;
-		ereport(PANIC,
-				(errmsg("relmap authority publish generation mismatch: "
-						"pending %llu committed %llu requested %llu",
-						(unsigned long long) hdr->pending_generation,
-						(unsigned long long) hdr->committed_generation,
-						(unsigned long long) generation)));
+		ereport(PANIC, (errmsg("relmap authority publish generation mismatch: "
+							   "pending %llu committed %llu requested %llu",
+							   (unsigned long long)hdr->pending_generation,
+							   (unsigned long long)hdr->committed_generation,
+							   (unsigned long long)generation)));
 	}
 
 	/* Flip pending -> committed: copy the pending slot over the committed slot. */
-	memcpy(image + COMMITTED_SLOT_OFFSET, image + PENDING_SLOT_OFFSET,
-		   CLUSTER_RELMAP_IMAGE_MAX);
+	memcpy(image + COMMITTED_SLOT_OFFSET, image + PENDING_SLOT_OFFSET, CLUSTER_RELMAP_IMAGE_MAX);
 	hdr->committed_generation = generation;
 	hdr->pending_generation = 0;
 
@@ -364,26 +349,26 @@ cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation)
 }
 
 void
-cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid,
-										 uint64 generation)
+cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 generation)
 {
-	char		image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
-	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *) image;
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE];
+	ClusterRelmapAuthorityHeader *hdr = (ClusterRelmapAuthorityHeader *)image;
 
-	if (!load_authority(shared_map, dbid, image))
-	{
+	if (!load_authority(shared_map, dbid, image)) {
 		/*
 		 * Must not throw (abort-path callable).  The unresolved pending, if
 		 * any survives on disk, keeps relmap writes fail-closed until a
 		 * trustworthy authority reappears.
 		 */
-		elog(LOG, "relmap authority for db %u unavailable at pending discard; "
-			 "leaving it for arbitration", dbid);
+		elog(LOG,
+			 "relmap authority for db %u unavailable at pending discard; "
+			 "leaving it for arbitration",
+			 dbid);
 		return;
 	}
 
 	if (hdr->pending_generation != generation)
-		return;					/* already discarded or published */
+		return; /* already discarded or published */
 
 	hdr->pending_generation = 0;
 	hdr->owner_node = 0;

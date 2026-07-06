@@ -445,7 +445,7 @@ UT_TEST(test_claim_build_classify_round_trip)
 UT_TEST(test_claim_classify_rejections)
 {
 	ClusterMergeClaimFile f;
-	uint64		sysid = UINT64CONST(0x1122334455667788);
+	uint64 sysid = UINT64CONST(0x1122334455667788);
 
 	cluster_merge_claim_build(&f, 1, sysid);
 

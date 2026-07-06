@@ -56,15 +56,14 @@ cluster_catalog_startup_prepare(void)
 	if (IsUnderPostmaster)
 		return;
 
-	if (!cluster_shared_catalog)
-	{
+	if (!cluster_shared_catalog) {
 		/*
 		 * Off-mode boots against a shared tree that already holds a catalog
 		 * authority are refused (D5 off-flip vet): the local catalog files
 		 * are stale once any DDL ran under the shared catalog.
 		 */
 		cluster_catalog_vet_off_mode();
-		return;					/* off: stock per-node catalog */
+		return; /* off: stock per-node catalog */
 	}
 
 	/*
@@ -73,11 +72,10 @@ cluster_catalog_startup_prepare(void)
 	 * it fail-closed keeps a seed value that every node agrees on.
 	 */
 	if (!cluster_cf_authority_read(&cf))
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-				 errmsg("shared pg_control authority is unavailable at catalog bootstrap"),
-				 errhint("cluster.shared_catalog requires a readable shared "
-						 "pg_control under cluster.shared_data_dir.")));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("shared pg_control authority is unavailable at catalog bootstrap"),
+						errhint("cluster.shared_catalog requires a readable shared "
+								"pg_control under cluster.shared_data_dir.")));
 
 	/*
 	 * Seed the OID authority from the shared high-water if absent (seed node);
@@ -91,19 +89,17 @@ cluster_catalog_startup_prepare(void)
 	 * could hand the same OID range to two nodes.
 	 */
 	{
-		Oid			oid_hw;
+		Oid oid_hw;
 
-		if (!cluster_oid_authority_read(&oid_hw) &&
-			cluster_oid_authority_present())
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-					 errmsg("shared OID authority is present but corrupt"),
-					 errdetail("Neither \"%s/global/pgrac_oid_authority\" nor its "
-							   ".bak fallback passes validation.",
-							   cluster_shared_data_dir),
-					 errhint("Restore the shared OID authority files from a backup "
-							 "of the shared tree; do not delete them (re-seeding "
-							 "from a stale high-water can reissue leased OIDs).")));
+		if (!cluster_oid_authority_read(&oid_hw) && cluster_oid_authority_present())
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("shared OID authority is present but corrupt"),
+							errdetail("Neither \"%s/global/pgrac_oid_authority\" nor its "
+									  ".bak fallback passes validation.",
+									  cluster_shared_data_dir),
+							errhint("Restore the shared OID authority files from a backup "
+									"of the shared tree; do not delete them (re-seeding "
+									"from a stale high-water can reissue leased OIDs).")));
 	}
 	if (cluster_oid_authority_seed_if_absent(cf.checkPointCopy.nextOid))
 		elog(LOG, "cluster shared_catalog: seeded OID authority high-water at %u",
@@ -168,8 +164,7 @@ cluster_catalog_services_ready(void)
 	if (ready_latched)
 		return true;
 
-	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING)
-	{
+	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING) {
 		ready_latched = true;
 		return true;
 	}

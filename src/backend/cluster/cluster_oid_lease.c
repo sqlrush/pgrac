@@ -35,13 +35,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/transam.h"			/* FirstNormalObjectId */
-#include "cluster/cluster_guc.h"	/* cluster_shared_data_dir */
+#include "access/transam.h"		 /* FirstNormalObjectId */
+#include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_oid_lease.h"
 #include "storage/fd.h"
 
 /* On-disk image size: the fixed header, exactly. */
-#define CLUSTER_OID_AUTHORITY_FILE_SIZE ((int) sizeof(ClusterOidAuthorityHeader))
+#define CLUSTER_OID_AUTHORITY_FILE_SIZE ((int)sizeof(ClusterOidAuthorityHeader))
 
 /* ============================================================
  * Pure layer (no elog/shmem/fd; standalone-linkable for cluster_unit).
@@ -74,7 +74,7 @@ ClusterOidAuthorityValidity
 cluster_oid_authority_classify(const char *buf, size_t len)
 {
 	ClusterOidAuthorityHeader hdr;
-	pg_crc32c	crc;
+	pg_crc32c crc;
 
 	if (buf == NULL || len < sizeof(ClusterOidAuthorityHeader))
 		return CLUSTER_OID_AUTHORITY_INVALID_SHORT;
@@ -100,8 +100,8 @@ cluster_oid_authority_classify(const char *buf, size_t len)
 Oid
 cluster_oid_lease_normalize_start(Oid start)
 {
-	if (start < (Oid) FirstNormalObjectId)
-		return (Oid) FirstNormalObjectId;
+	if (start < (Oid)FirstNormalObjectId)
+		return (Oid)FirstNormalObjectId;
 	return start;
 }
 
@@ -113,16 +113,16 @@ cluster_oid_lease_normalize_start(Oid start)
 Oid
 cluster_oid_lease_consume(ClusterOidLease *lease)
 {
-	Oid			oid;
+	Oid oid;
 
 	Assert(lease != NULL);
 	if (lease->next == lease->end)
 		return InvalidOid;
 
 	oid = lease->next;
-	lease->next = oid + 1;		/* uint32 wrap is fine: end==0 stops at 2^32 */
+	lease->next = oid + 1; /* uint32 wrap is fine: end==0 stops at 2^32 */
 
-	Assert(oid >= (Oid) FirstNormalObjectId);
+	Assert(oid >= (Oid)FirstNormalObjectId);
 	return oid;
 }
 
@@ -133,18 +133,17 @@ cluster_oid_lease_consume(ClusterOidLease *lease)
  * OID space (end == 0) and the authority is reset to FirstNormalObjectId.
  */
 void
-cluster_oid_lease_carve(Oid hw, uint32 lease_size,
-						Oid *out_start, Oid *out_end, Oid *out_new_authority)
+cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, Oid *out_end,
+						Oid *out_new_authority)
 {
-	Oid			start = cluster_oid_lease_normalize_start(hw);
-	Oid			end;
+	Oid start = cluster_oid_lease_normalize_start(hw);
+	Oid end;
 
 	Assert(lease_size > 0);
 
-	end = start + lease_size;	/* may wrap */
+	end = start + lease_size; /* may wrap */
 
-	if (end <= start)
-	{
+	if (end <= start) {
 		/*
 		 * The block would wrap the 32-bit OID space and spill into the
 		 * reserved (< FirstNormalObjectId) range.  Cap it at the top: an
@@ -153,9 +152,8 @@ cluster_oid_lease_carve(Oid hw, uint32 lease_size,
 		 * FirstNormalObjectId.
 		 */
 		end = 0;
-		*out_new_authority = (Oid) FirstNormalObjectId;
-	}
-	else
+		*out_new_authority = (Oid)FirstNormalObjectId;
+	} else
 		*out_new_authority = end;
 
 	*out_start = start;
@@ -186,29 +184,24 @@ build_path(char *dst, size_t dstlen, const char *relpath)
 static void
 write_durable(const char *tmp, const char *final, const char *buf)
 {
-	int			fd;
+	int fd;
 
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", tmp)));
 
 	errno = 0;
-	if (write(fd, buf, CLUSTER_OID_AUTHORITY_FILE_SIZE) != CLUSTER_OID_AUTHORITY_FILE_SIZE)
-	{
+	if (write(fd, buf, CLUSTER_OID_AUTHORITY_FILE_SIZE) != CLUSTER_OID_AUTHORITY_FILE_SIZE) {
 		if (errno == 0)
 			errno = ENOSPC;
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not write file \"%s\": %m", tmp)));
 	}
 
 	if (pg_fsync(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not fsync file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not fsync file \"%s\": %m", tmp)));
 
 	if (CloseTransientFile(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", tmp)));
 
 	if (durable_rename(tmp, final, PANIC) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
@@ -222,18 +215,18 @@ write_durable(const char *tmp, const char *final, const char *buf)
 static void
 roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 {
-	char		buf[CLUSTER_OID_AUTHORITY_FILE_SIZE];
-	int			fd;
-	int			r;
+	char buf[CLUSTER_OID_AUTHORITY_FILE_SIZE];
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(primary, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		return;					/* first write: no prior primary */
+		return; /* first write: no prior primary */
 
 	r = read(fd, buf, CLUSTER_OID_AUTHORITY_FILE_SIZE);
 	CloseTransientFile(fd);
 	if (r != CLUSTER_OID_AUTHORITY_FILE_SIZE)
-		return;					/* short/odd primary: don't manufacture a .bak */
+		return; /* short/odd primary: don't manufacture a .bak */
 
 	write_durable(baktmp, bak, buf);
 }
@@ -245,8 +238,8 @@ roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 static ClusterOidAuthorityValidity
 read_image(const char *path, char *image)
 {
-	int			fd;
-	int			r;
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
@@ -268,19 +261,18 @@ read_image(const char *path, char *image)
 bool
 cluster_oid_authority_read(Oid *next_oid)
 {
-	char		primary_path[MAXPGPATH];
-	char		bak_path[MAXPGPATH];
-	char		image[CLUSTER_OID_AUTHORITY_FILE_SIZE];
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char image[CLUSTER_OID_AUTHORITY_FILE_SIZE];
 	ClusterOidAuthorityHeader hdr;
 
 	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_OID_AUTHORITY_REL_PATH)
 		|| !build_path(bak_path, sizeof(bak_path), CLUSTER_OID_AUTHORITY_BAK_REL_PATH))
 		return false;
 
-	if (read_image(primary_path, image) != CLUSTER_OID_AUTHORITY_VALID)
-	{
+	if (read_image(primary_path, image) != CLUSTER_OID_AUTHORITY_VALID) {
 		if (read_image(bak_path, image) != CLUSTER_OID_AUTHORITY_VALID)
-			return false;		/* fail-closed: neither trustworthy */
+			return false; /* fail-closed: neither trustworthy */
 	}
 
 	memcpy(&hdr, image, sizeof(hdr));
@@ -305,8 +297,8 @@ cluster_oid_authority_read(Oid *next_oid)
 bool
 cluster_oid_authority_present(void)
 {
-	char		primary_path[MAXPGPATH];
-	char		bak_path[MAXPGPATH];
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
 	struct stat st;
 
 	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_OID_AUTHORITY_REL_PATH)
@@ -328,11 +320,11 @@ cluster_oid_authority_present(void)
 void
 cluster_oid_authority_write(Oid next_oid)
 {
-	char		buffer[CLUSTER_OID_AUTHORITY_FILE_SIZE];
-	char		primary[MAXPGPATH];
-	char		bak[MAXPGPATH];
-	char		tmp[MAXPGPATH];
-	char		baktmp[MAXPGPATH];
+	char buffer[CLUSTER_OID_AUTHORITY_FILE_SIZE];
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char baktmp[MAXPGPATH];
 	ClusterOidAuthorityHeader hdr;
 
 	if (!build_path(primary, sizeof(primary), CLUSTER_OID_AUTHORITY_REL_PATH)
@@ -347,7 +339,7 @@ cluster_oid_authority_write(Oid next_oid)
 	hdr.next_oid = next_oid;
 	hdr.reserved = 0;
 	INIT_CRC32C(hdr.crc);
-	COMP_CRC32C(hdr.crc, (char *) &hdr, offsetof(ClusterOidAuthorityHeader, crc));
+	COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterOidAuthorityHeader, crc));
 	FIN_CRC32C(hdr.crc);
 
 	memset(buffer, 0, sizeof(buffer));
@@ -365,10 +357,10 @@ cluster_oid_authority_write(Oid next_oid)
 bool
 cluster_oid_authority_seed_if_absent(Oid initial_next_oid)
 {
-	Oid			existing;
+	Oid existing;
 
 	if (cluster_oid_authority_read(&existing))
-		return false;			/* already seeded (join node / prior seed) */
+		return false; /* already seeded (join node / prior seed) */
 
 	cluster_oid_authority_write(cluster_oid_lease_normalize_start(initial_next_oid));
 	return true;

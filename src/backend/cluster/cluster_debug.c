@@ -121,29 +121,29 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "catalog/pg_control.h" /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
-#include "cluster/cluster_recovery_merge.h"	 /* is_materialized (spec-4.5a D11) */
-#include "cluster/cluster_reconfig.h"		 /* spec-5.14 D6 touched counters */
-#include "cluster/cluster_touched_peers.h"	 /* spec-5.14 D6 self_touched_hex */
-#include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
-#include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
-#include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
-#include "cluster/cluster_catalog_stats.h"	 /* catalog counters (spec-6.14 D10b) */
-#include "cluster/cluster_oid_lease.h"		 /* catalog category (spec-6.14 D10) */
+#include "cluster/cluster_recovery_merge.h"	  /* is_materialized (spec-4.5a D11) */
+#include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched counters */
+#include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_touched_hex */
+#include "cluster/cluster_block_recovery.h"	  /* block-recovery counters (spec-4.10 D6) */
+#include "cluster/cluster_thread_recovery.h"  /* online thread-recovery counters (spec-4.11 D5) */
+#include "cluster/cluster_write_fence.h"	  /* write-fence counters (spec-4.12 D7) */
+#include "cluster/cluster_catalog_stats.h"	  /* catalog counters (spec-6.14 D10b) */
+#include "cluster/cluster_oid_lease.h"		  /* catalog category (spec-6.14 D10) */
 #include "cluster/cluster_relmap_authority.h" /* relmap authority state (spec-6.14 D5) */
-#include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
-#include "cluster/cluster_ic.h"				 /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"			 /* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
-#include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
-#include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
-#include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
-#include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
-#include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
-#include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_remote_xact.h"	  /* remote outcome counters (spec-4.5a D11) */
+#include "cluster/cluster_ic.h"				  /* ClusterICOps_Active, ClusterICTier */
+#include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"			/* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"	/* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"		/* PCM state-machine API + grd helpers */
+#include "cluster/cluster_gcs.h"			/* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"		/* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_sinval.h"			/* SI Broadcaster counter accessors (spec-2.38 D10) */
+#include "cluster/cluster_tt_status.h"		/* TT status overlay counter accessors (spec-3.1 D9) */
+#include "cluster/cluster_tt_status_hint.h" /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_tx_enqueue.h"		/* TX enqueue wait counters (spec-5.2 D4/D6) */
+#include "cluster/cluster_startup_phase.h"	/* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -3005,7 +3005,7 @@ static void
 dump_catalog(ReturnSetInfo *rsinfo)
 {
 	ClusterRelmapAuthorityHeader rmhdr;
-	bool		rmok;
+	bool rmok;
 
 	emit_row(rsinfo, "catalog", "shared_catalog_enabled", fmt_bool(cluster_shared_catalog));
 	/* D6 OID lease allocator */
@@ -3027,8 +3027,7 @@ dump_catalog(ReturnSetInfo *rsinfo)
 	 * are 53RB while it stands).  Read on demand; stable key set when the
 	 * authority is unreadable/off (0/0/-1).
 	 */
-	rmok = cluster_shared_catalog
-		&& cluster_relmap_authority_read_header(true, InvalidOid, &rmhdr);
+	rmok = cluster_shared_catalog && cluster_relmap_authority_read_header(true, InvalidOid, &rmhdr);
 	emit_row(rsinfo, "catalog", "relmap_shared_committed_generation",
 			 fmt_int64(rmok ? (int64)rmhdr.committed_generation : 0));
 	emit_row(rsinfo, "catalog", "relmap_shared_pending_generation",

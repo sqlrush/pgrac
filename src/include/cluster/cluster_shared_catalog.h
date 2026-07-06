@@ -38,8 +38,7 @@
  * FIRST unsatisfied hard dependency, in a fixed priority order, so the FATAL
  * errhint can point the operator at exactly one thing to fix.
  */
-typedef enum ClusterSharedCatalogVetResult
-{
+typedef enum ClusterSharedCatalogVetResult {
 	CLUSTER_SHARED_CATALOG_VET_OK = 0,
 	CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS,
 	CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR,
@@ -68,11 +67,8 @@ typedef enum ClusterSharedCatalogVetResult
  *	recovery ownership of the shared pages (spec-6.14 D9 amend INV-D9-R).
  */
 extern ClusterSharedCatalogVetResult
-			cluster_shared_catalog_vet(bool shared_catalog,
-									   bool smgr_user_relations,
-									   bool have_shared_data_dir,
-									   bool controlfile_shared_authority,
-									   bool merged_recovery);
+cluster_shared_catalog_vet(bool shared_catalog, bool smgr_user_relations, bool have_shared_data_dir,
+						   bool controlfile_shared_authority, bool merged_recovery);
 
 /*
  * cluster_shared_catalog_vet_missing_dep_name -- human-readable dependency
@@ -108,8 +104,7 @@ cluster_shared_catalog_is_shared_rel(bool is_temp)
  *	(and the leading 'n' absence) yields the stock "<backendId>" format, so
  *	existing clusters and PG regression are byte-identical.
  */
-extern void cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
-												 bool shared_catalog,
+extern void cluster_temp_namespace_format_suffix(char *buf, size_t buflen, bool shared_catalog,
 												 int node, int backend_id);
 
 /*
@@ -120,6 +115,6 @@ extern void cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
  *	one, so both parse unambiguously.  Returns -1 (invalid backend id) when the
  *	suffix is malformed.
  */
-extern int	cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node);
+extern int cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node);
 
-#endif							/* CLUSTER_SHARED_CATALOG_H */
+#endif /* CLUSTER_SHARED_CATALOG_H */

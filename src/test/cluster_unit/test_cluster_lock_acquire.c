@@ -829,18 +829,18 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
  * stub returns NULL, so cluster_relation_is_mapped fails safe to true. */
 UT_TEST(test_shared_catalog_relation_gate)
 {
-	LOCKTAG		cat;
-	LOCKTAG		usr;
+	LOCKTAG cat;
+	LOCKTAG usr;
 
 	memset(&cat, 0, sizeof(cat));
 	cat.locktag_field1 = 1;
-	cat.locktag_field2 = 1259;	/* pg_class: a catalog OID < FirstNormalObjectId */
+	cat.locktag_field2 = 1259; /* pg_class: a catalog OID < FirstNormalObjectId */
 	cat.locktag_type = LOCKTAG_RELATION;
 	cat.locktag_lockmethodid = 1;
 
 	memset(&usr, 0, sizeof(usr));
 	usr.locktag_field1 = 1;
-	usr.locktag_field2 = FirstNormalObjectId + 5;	/* a user relation */
+	usr.locktag_field2 = FirstNormalObjectId + 5; /* a user relation */
 	usr.locktag_type = LOCKTAG_RELATION;
 	usr.locktag_lockmethodid = 1;
 
@@ -864,7 +864,7 @@ UT_TEST(test_shared_catalog_relation_gate)
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, RowExclusiveLock, false), false);
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, AccessExclusiveLock, false), true);
 
-	cluster_shared_catalog = false;		/* restore */
+	cluster_shared_catalog = false; /* restore */
 }
 
 

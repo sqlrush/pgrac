@@ -29,7 +29,7 @@
 #ifndef CLUSTER_RELMAP_LOCK_H
 #define CLUSTER_RELMAP_LOCK_H
 
-#include "cluster/cluster_grd.h"		/* ClusterResId */
+#include "cluster/cluster_grd.h" /* ClusterResId */
 
 /*
  * CLUSTER_RELMAP_RESID_TYPE -- relmap-authority resource-id namespace marker
@@ -73,4 +73,4 @@ extern bool cluster_relmap_authority_x_held(void);
  */
 extern void cluster_relmap_lock_abort_release(void);
 
-#endif							/* CLUSTER_RELMAP_LOCK_H */
+#endif /* CLUSTER_RELMAP_LOCK_H */

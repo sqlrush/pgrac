@@ -190,8 +190,8 @@ missing_add(ClusterThreadMissingRels *missing, const RelFileLocator *rl)
 		if (missing->items == NULL)
 			missing->items = (RelFileLocator *)palloc(sizeof(RelFileLocator) * newcap);
 		else
-			missing->items =
-				(RelFileLocator *)repalloc(missing->items, sizeof(RelFileLocator) * newcap);
+			missing->items
+				= (RelFileLocator *)repalloc(missing->items, sizeof(RelFileLocator) * newcap);
 		missing->cap = newcap;
 	}
 	missing->items[missing->n++] = *rl;
@@ -449,7 +449,7 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 	bool saw_straddle = false;
 	bool reached;
 	SCN window_first_scn = InvalidScn; /* spec-6.12h D-h3c: PI self-containment judge */
-	ClusterThreadMissingRels missing = {NULL, 0, 0};
+	ClusterThreadMissingRels missing = { NULL, 0, 0 };
 	ClusterThreadMissingRels *missingp = NULL;
 
 	memset(&st, 0, sizeof(st));

@@ -126,8 +126,8 @@ UT_TEST(test_vet_on_missing_merged_recovery_last)
  */
 UT_TEST(test_vet_missing_dep_name)
 {
-	UT_ASSERT_STR_EQ(cluster_shared_catalog_vet_missing_dep_name(
-						 CLUSTER_SHARED_CATALOG_VET_OK), "");
+	UT_ASSERT_STR_EQ(cluster_shared_catalog_vet_missing_dep_name(CLUSTER_SHARED_CATALOG_VET_OK),
+					 "");
 	UT_ASSERT_STR_CONTAINS(cluster_shared_catalog_vet_missing_dep_name(
 							   CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS),
 						   "smgr_user_relations");
@@ -165,17 +165,17 @@ UT_TEST(test_is_shared_rel_nontemp_is_shared)
  */
 UT_TEST(test_temp_suffix_format_off_is_stock)
 {
-	char		buf[32];
+	char buf[32];
 
 	cluster_temp_namespace_format_suffix(buf, sizeof(buf), false, 0, 12);
 	UT_ASSERT_STR_EQ(buf, "12");
 	cluster_temp_namespace_format_suffix(buf, sizeof(buf), false, 3, 99);
-	UT_ASSERT_STR_EQ(buf, "99");	/* node ignored in off mode */
+	UT_ASSERT_STR_EQ(buf, "99"); /* node ignored in off mode */
 }
 
 UT_TEST(test_temp_suffix_format_on_is_node_qualified)
 {
-	char		buf[32];
+	char buf[32];
 
 	cluster_temp_namespace_format_suffix(buf, sizeof(buf), true, 0, 12);
 	UT_ASSERT_STR_EQ(buf, "n0_12");
@@ -185,18 +185,18 @@ UT_TEST(test_temp_suffix_format_on_is_node_qualified)
 
 UT_TEST(test_temp_suffix_parse_stock)
 {
-	int			node = 999;
-	int			backend;
+	int node = 999;
+	int backend;
 
 	backend = cluster_temp_namespace_parse_suffix("12", &node);
 	UT_ASSERT_EQ(backend, 12);
-	UT_ASSERT_EQ(node, -1);		/* stock format: no node */
+	UT_ASSERT_EQ(node, -1); /* stock format: no node */
 }
 
 UT_TEST(test_temp_suffix_parse_node_qualified)
 {
-	int			node = 999;
-	int			backend;
+	int node = 999;
+	int backend;
 
 	backend = cluster_temp_namespace_parse_suffix("n2_7", &node);
 	UT_ASSERT_EQ(backend, 7);
@@ -209,9 +209,9 @@ UT_TEST(test_temp_suffix_parse_node_qualified)
 
 UT_TEST(test_temp_suffix_round_trip)
 {
-	char		buf[32];
-	int			node = 999;
-	int			backend;
+	char buf[32];
+	int node = 999;
+	int backend;
 
 	cluster_temp_namespace_format_suffix(buf, sizeof(buf), true, 5, 42);
 	backend = cluster_temp_namespace_parse_suffix(buf, &node);

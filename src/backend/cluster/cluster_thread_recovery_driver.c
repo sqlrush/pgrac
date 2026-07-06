@@ -398,10 +398,9 @@ cluster_thread_recovery_drive(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr
 		 * left a frozen thread with zero operator trace; recovery launches are
 		 * reconfig-driven (not a poll loop), so this cannot spam.
 		 */
-		ereport(LOG,
-				(errmsg("cluster thread recovery: demoted a catchable error to BLOCKED "
-						"(dead thread %u): %s",
-						dead_tid, edata->message != NULL ? edata->message : "unknown")));
+		ereport(LOG, (errmsg("cluster thread recovery: demoted a catchable error to BLOCKED "
+							 "(dead thread %u): %s",
+							 dead_tid, edata->message != NULL ? edata->message : "unknown")));
 		FlushErrorState();
 		FreeErrorData(edata);
 		if (stats)

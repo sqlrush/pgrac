@@ -29,7 +29,7 @@
  */
 #include "c.h"
 
-#include <stdlib.h>				/* strtol */
+#include <stdlib.h> /* strtol */
 
 #include "cluster/cluster_shared_catalog.h"
 
@@ -39,11 +39,8 @@
  * thing at a time.
  */
 ClusterSharedCatalogVetResult
-cluster_shared_catalog_vet(bool shared_catalog,
-						   bool smgr_user_relations,
-						   bool have_shared_data_dir,
-						   bool controlfile_shared_authority,
-						   bool merged_recovery)
+cluster_shared_catalog_vet(bool shared_catalog, bool smgr_user_relations, bool have_shared_data_dir,
+						   bool controlfile_shared_authority, bool merged_recovery)
 {
 	if (!shared_catalog)
 		return CLUSTER_SHARED_CATALOG_VET_OK;
@@ -66,18 +63,17 @@ cluster_shared_catalog_vet(bool shared_catalog,
 const char *
 cluster_shared_catalog_vet_missing_dep_name(ClusterSharedCatalogVetResult r)
 {
-	switch (r)
-	{
-		case CLUSTER_SHARED_CATALOG_VET_OK:
-			return "";
-		case CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS:
-			return "cluster.smgr_user_relations=on";
-		case CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR:
-			return "cluster.shared_data_dir";
-		case CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY:
-			return "cluster.controlfile_shared_authority=on";
-		case CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY:
-			return "cluster.merged_recovery=on";
+	switch (r) {
+	case CLUSTER_SHARED_CATALOG_VET_OK:
+		return "";
+	case CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS:
+		return "cluster.smgr_user_relations=on";
+	case CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR:
+		return "cluster.shared_data_dir";
+	case CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY:
+		return "cluster.controlfile_shared_authority=on";
+	case CLUSTER_SHARED_CATALOG_VET_MISSING_MERGED_RECOVERY:
+		return "cluster.merged_recovery=on";
 	}
 	return "";
 }
@@ -87,8 +83,8 @@ cluster_shared_catalog_vet_missing_dep_name(ClusterSharedCatalogVetResult r)
  * "n<node>_<backendId>"; off-mode: "<backendId>".
  */
 void
-cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
-									 bool shared_catalog, int node, int backend_id)
+cluster_temp_namespace_format_suffix(char *buf, size_t buflen, bool shared_catalog, int node,
+									 int backend_id)
 {
 	if (shared_catalog)
 		snprintf(buf, buflen, "n%d_%d", node, backend_id);
@@ -103,8 +99,8 @@ cluster_temp_namespace_format_suffix(char *buf, size_t buflen,
 int
 cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node)
 {
-	long		backend_id;
-	char	   *endp;
+	long backend_id;
+	char *endp;
 
 	if (out_node != NULL)
 		*out_node = -1;
@@ -112,25 +108,24 @@ cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node)
 	if (suffix == NULL)
 		return -1;
 
-	if (suffix[0] == 'n')
-	{
-		long		node;
+	if (suffix[0] == 'n') {
+		long node;
 
 		/* node-qualified: n<node>_<backendId> */
 		node = strtol(suffix + 1, &endp, 10);
 		if (endp == suffix + 1 || *endp != '_')
-			return -1;			/* malformed */
+			return -1; /* malformed */
 		backend_id = strtol(endp + 1, &endp, 10);
-		if (*(endp) != '\0' && *endp != '_')	/* tolerate nothing after */
-			/* trailing garbage: still accept the parsed id */ ;
+		if (*(endp) != '\0' && *endp != '_') /* tolerate nothing after */
+			/* trailing garbage: still accept the parsed id */;
 		if (out_node != NULL)
-			*out_node = (int) node;
-		return (int) backend_id;
+			*out_node = (int)node;
+		return (int)backend_id;
 	}
 
 	/* stock: <backendId> */
 	backend_id = strtol(suffix, &endp, 10);
 	if (endp == suffix)
 		return -1;
-	return (int) backend_id;
+	return (int)backend_id;
 }

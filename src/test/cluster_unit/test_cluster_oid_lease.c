@@ -41,7 +41,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/transam.h"			/* FirstNormalObjectId */
+#include "access/transam.h" /* FirstNormalObjectId */
 #include "cluster/cluster_oid_lease.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -58,7 +58,7 @@
 UT_DEFINE_GLOBALS();
 
 /* Global read by cluster_oid_lease.o's authority I/O. */
-char	   *cluster_shared_data_dir = NULL;
+char *cluster_shared_data_dir = NULL;
 
 /* ---- Assert + ereport machinery (aborts on ERROR; the read path never
  * ereports, the write path only PANICs on real I/O failure). ---- */
@@ -71,8 +71,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -86,8 +85,7 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{
-}
+{}
 int
 errcode(int sqlerrcode pg_attribute_unused())
 {
@@ -99,22 +97,22 @@ errcode_for_file_access(void)
 	return 0;
 }
 int
-errmsg(const char *fmt pg_attribute_unused(),...)
+errmsg(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
 int
-errmsg_internal(const char *fmt pg_attribute_unused(),...)
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
 int
-errdetail(const char *fmt pg_attribute_unused(),...)
+errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
 int
-errhint(const char *fmt pg_attribute_unused(),...)
+errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -147,9 +145,9 @@ static char test_root[MAXPGPATH];
 static void
 setup_shared_dir(void)
 {
-	char		globaldir[MAXPGPATH];
+	char globaldir[MAXPGPATH];
 
-	snprintf(test_root, sizeof(test_root), "/tmp/pgrac_oid_lease_ut_%d", (int) getpid());
+	snprintf(test_root, sizeof(test_root), "/tmp/pgrac_oid_lease_ut_%d", (int)getpid());
 	mkdir(test_root, 0700);
 	snprintf(globaldir, sizeof(globaldir), "%s/global", test_root);
 	mkdir(globaldir, 0700);
@@ -159,7 +157,7 @@ setup_shared_dir(void)
 static void
 unlink_authority(void)
 {
-	char		p[MAXPGPATH];
+	char p[MAXPGPATH];
 
 	snprintf(p, sizeof(p), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_REL_PATH);
 	unlink(p);
@@ -173,18 +171,16 @@ unlink_authority(void)
 
 UT_TEST(test_normalize_forces_reserved_up)
 {
-	UT_ASSERT_EQ(cluster_oid_lease_normalize_start(0), (Oid) FirstNormalObjectId);
-	UT_ASSERT_EQ(cluster_oid_lease_normalize_start(100), (Oid) FirstNormalObjectId);
-	UT_ASSERT_EQ(cluster_oid_lease_normalize_start((Oid) FirstNormalObjectId),
-				 (Oid) FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_normalize_start(0), (Oid)FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_normalize_start(100), (Oid)FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_normalize_start((Oid)FirstNormalObjectId),
+				 (Oid)FirstNormalObjectId);
 	UT_ASSERT_EQ(cluster_oid_lease_normalize_start(1000000), 1000000);
 }
 
 UT_TEST(test_carve_basic_block)
 {
-	Oid			start,
-				end,
-				newauth;
+	Oid start, end, newauth;
 
 	cluster_oid_lease_carve(100000, 8192, &start, &end, &newauth);
 	UT_ASSERT_EQ(start, 100000);
@@ -194,54 +190,44 @@ UT_TEST(test_carve_basic_block)
 
 UT_TEST(test_carve_normalizes_reserved_hw)
 {
-	Oid			start,
-				end,
-				newauth;
+	Oid start, end, newauth;
 
 	/* hw below FirstNormalObjectId is forced up before carving. */
 	cluster_oid_lease_carve(5, 8192, &start, &end, &newauth);
-	UT_ASSERT_EQ(start, (Oid) FirstNormalObjectId);
-	UT_ASSERT_EQ(end, (Oid) FirstNormalObjectId + 8192);
-	UT_ASSERT_EQ(newauth, (Oid) FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(start, (Oid)FirstNormalObjectId);
+	UT_ASSERT_EQ(end, (Oid)FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(newauth, (Oid)FirstNormalObjectId + 8192);
 }
 
 UT_TEST(test_carve_disjoint_from_monotonic_hw)
 {
-	Oid			s1,
-				e1,
-				a1,
-				s2,
-				e2,
-				a2;
+	Oid s1, e1, a1, s2, e2, a2;
 
 	/* Two consecutive carves from the advancing authority are disjoint:
 	 * the second block starts exactly where the first's authority left off. */
 	cluster_oid_lease_carve(200000, 4096, &s1, &e1, &a1);
 	cluster_oid_lease_carve(a1, 4096, &s2, &e2, &a2);
-	UT_ASSERT_EQ(e1, s2);		/* adjacent, non-overlapping */
+	UT_ASSERT_EQ(e1, s2); /* adjacent, non-overlapping */
 	UT_ASSERT(s2 >= e1);
 }
 
 UT_TEST(test_carve_wraparound_capped)
 {
-	Oid			start,
-				end,
-				newauth;
+	Oid start, end, newauth;
 
 	/* hw near the top of the OID space: the block must not spill into the
 	 * reserved range.  end is capped to 0 (top of space) and the authority is
 	 * reset to FirstNormalObjectId for the next refill. */
 	cluster_oid_lease_carve(0xFFFFF000u, 8192, &start, &end, &newauth);
 	UT_ASSERT_EQ(start, 0xFFFFF000u);
-	UT_ASSERT_EQ(end, 0);		/* exclusive end wraps to top of space */
-	UT_ASSERT_EQ(newauth, (Oid) FirstNormalObjectId);
+	UT_ASSERT_EQ(end, 0); /* exclusive end wraps to top of space */
+	UT_ASSERT_EQ(newauth, (Oid)FirstNormalObjectId);
 }
 
 UT_TEST(test_consume_advances_and_exhausts)
 {
 	ClusterOidLease lease;
-	Oid			a,
-				b;
+	Oid a, b;
 
 	lease.next = 500000;
 	lease.end = 500002;
@@ -256,9 +242,8 @@ UT_TEST(test_consume_advances_and_exhausts)
 
 UT_TEST(test_consume_no_overlap_between_two_leases)
 {
-	ClusterOidLease l1,
-				l2;
-	Oid			seen1_last;
+	ClusterOidLease l1, l2;
+	Oid seen1_last;
 
 	/* carve two adjacent blocks and drain them; no value repeats. */
 	l1.next = 300000;
@@ -281,11 +266,10 @@ UT_TEST(test_consume_no_overlap_between_two_leases)
 UT_TEST(test_classify_short_and_magic_and_crc)
 {
 	ClusterOidAuthorityHeader hdr;
-	char		buf[sizeof(ClusterOidAuthorityHeader)];
+	char buf[sizeof(ClusterOidAuthorityHeader)];
 
 	/* short */
-	UT_ASSERT_EQ(cluster_oid_authority_classify("x", 1),
-				 CLUSTER_OID_AUTHORITY_INVALID_SHORT);
+	UT_ASSERT_EQ(cluster_oid_authority_classify("x", 1), CLUSTER_OID_AUTHORITY_INVALID_SHORT);
 
 	/* bad magic */
 	memset(&hdr, 0, sizeof(hdr));
@@ -299,7 +283,7 @@ UT_TEST(test_classify_short_and_magic_and_crc)
 	hdr.magic = CLUSTER_OID_AUTHORITY_MAGIC;
 	hdr.version = CLUSTER_OID_AUTHORITY_VERSION;
 	hdr.next_oid = 12345;
-	hdr.crc = 0;				/* deliberately wrong */
+	hdr.crc = 0; /* deliberately wrong */
 	memcpy(buf, &hdr, sizeof(hdr));
 	UT_ASSERT_EQ(cluster_oid_authority_classify(buf, sizeof(buf)),
 				 CLUSTER_OID_AUTHORITY_INVALID_CRC);
@@ -307,7 +291,7 @@ UT_TEST(test_classify_short_and_magic_and_crc)
 
 UT_TEST(test_authority_write_read_round_trip)
 {
-	Oid			got = 0;
+	Oid got = 0;
 
 	setup_shared_dir();
 	unlink_authority();
@@ -327,26 +311,25 @@ UT_TEST(test_authority_write_read_round_trip)
 
 UT_TEST(test_authority_primary_corrupt_falls_back_to_bak)
 {
-	char		primary[MAXPGPATH];
-	Oid			got = 0;
-	int			fd;
+	char primary[MAXPGPATH];
+	Oid got = 0;
+	int fd;
 
 	setup_shared_dir();
 	unlink_authority();
 
 	/* first write: no .bak yet.  second write rolls the first into .bak. */
 	cluster_oid_authority_write(111111);
-	cluster_oid_authority_write(222222);	/* rolls 111111 into .bak */
+	cluster_oid_authority_write(222222); /* rolls 111111 into .bak */
 
 	/* corrupt the primary in place */
 	snprintf(primary, sizeof(primary), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_REL_PATH);
 	fd = open(primary, O_WRONLY);
-	if (fd >= 0)
-	{
-		char		junk[4] = {0, 0, 0, 0};
+	if (fd >= 0) {
+		char junk[4] = { 0, 0, 0, 0 };
 
 		if (write(fd, junk, sizeof(junk)) < 0)
-			/* ignore: test aborts below if the read misbehaves */ ;
+			/* ignore: test aborts below if the read misbehaves */;
 		close(fd);
 	}
 
@@ -357,7 +340,7 @@ UT_TEST(test_authority_primary_corrupt_falls_back_to_bak)
 
 UT_TEST(test_authority_seed_if_absent)
 {
-	Oid			got = 0;
+	Oid got = 0;
 
 	setup_shared_dir();
 	unlink_authority();
@@ -365,12 +348,12 @@ UT_TEST(test_authority_seed_if_absent)
 	/* absent -> seeds with normalized initial (a low value is forced up). */
 	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(5), true);
 	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
-	UT_ASSERT_EQ(got, (Oid) FirstNormalObjectId);
+	UT_ASSERT_EQ(got, (Oid)FirstNormalObjectId);
 
 	/* present -> no-op (does not lower or change the existing high-water). */
 	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(1000000), false);
 	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
-	UT_ASSERT_EQ(got, (Oid) FirstNormalObjectId);	/* unchanged */
+	UT_ASSERT_EQ(got, (Oid)FirstNormalObjectId); /* unchanged */
 
 	/* a higher initial on a fresh authority seeds that value. */
 	unlink_authority();
@@ -381,10 +364,10 @@ UT_TEST(test_authority_seed_if_absent)
 
 UT_TEST(test_authority_present_distinguishes_corrupt_from_absent)
 {
-	char		path[MAXPGPATH];
-	char		junk[16];
-	Oid			got = 0;
-	int			fd;
+	char path[MAXPGPATH];
+	char junk[16];
+	Oid got = 0;
+	int fd;
 
 	setup_shared_dir();
 	unlink_authority();
@@ -396,23 +379,21 @@ UT_TEST(test_authority_present_distinguishes_corrupt_from_absent)
 	 * the distinction the catalog bootstrap FATALs on instead of silently
 	 * re-seeding over a damaged authority (spec-6.14 §3.6). */
 	cluster_oid_authority_write(111111);
-	cluster_oid_authority_write(222222);	/* rolls 111111 into .bak */
+	cluster_oid_authority_write(222222); /* rolls 111111 into .bak */
 
 	memset(junk, 0, sizeof(junk));
 	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_REL_PATH);
 	fd = open(path, O_WRONLY);
-	if (fd >= 0)
-	{
+	if (fd >= 0) {
 		if (write(fd, junk, sizeof(junk)) < 0)
-			/* ignore: the asserts below catch a misbehaving read */ ;
+			/* ignore: the asserts below catch a misbehaving read */;
 		close(fd);
 	}
 	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_BAK_REL_PATH);
 	fd = open(path, O_WRONLY);
-	if (fd >= 0)
-	{
+	if (fd >= 0) {
 		if (write(fd, junk, sizeof(junk)) < 0)
-			/* ignore: the asserts below catch a misbehaving read */ ;
+			/* ignore: the asserts below catch a misbehaving read */;
 		close(fd);
 	}
 
@@ -422,8 +403,8 @@ UT_TEST(test_authority_present_distinguishes_corrupt_from_absent)
 
 UT_TEST(test_authority_present_fails_closed_on_unreadable)
 {
-	char		globaldir[MAXPGPATH];
-	Oid			got = 0;
+	char globaldir[MAXPGPATH];
+	Oid got = 0;
 
 	setup_shared_dir();
 	unlink_authority();
@@ -433,8 +414,7 @@ UT_TEST(test_authority_present_fails_closed_on_unreadable)
 	 * let the bootstrap re-seed over it (opus review r1 P1). */
 	cluster_oid_authority_write(424242);
 	snprintf(globaldir, sizeof(globaldir), "%s/global", test_root);
-	if (chmod(globaldir, 0000) != 0)
-	{
+	if (chmod(globaldir, 0000) != 0) {
 		printf("# chmod 0000 failed; skipping unreadable-dir probe\n");
 		return;
 	}

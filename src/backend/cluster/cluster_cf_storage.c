@@ -877,8 +877,7 @@ cluster_cf_startup_prepare(const char *pgdata)
 	 * regime (cluster.enabled=on): the single-node-authority window admits
 	 * exactly one writer, so the shared fields are this node's own there.
 	 */
-	if (cluster_enabled)
-	{
+	if (cluster_enabled) {
 		char label_path[MAXPGPATH];
 		struct stat label_st;
 
@@ -887,17 +886,16 @@ cluster_cf_startup_prepare(const char *pgdata)
 			ClusterRecoveryAnchor ra;
 
 			if (!cluster_recovery_anchor_read(cf.system_identifier, &ra, NULL))
-				ereport(FATAL,
-						(errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
-						 errmsg("per-node recovery anchor for node %d is missing or invalid "
-								"under the shared control-file authority",
-								cluster_node_id),
-						 errdetail("A label-less restart cannot locate this node's own "
-								   "checkpoint from the shared pg_control (its checkpoint "
-								   "fields belong to the last writer node)."),
-						 errhint("Re-provision this node from a base backup, or verify that "
-								 "cluster.shared_data_dir (\"%s\") is correctly mounted.",
-								 cluster_shared_data_dir)));
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE),
+								errmsg("per-node recovery anchor for node %d is missing or invalid "
+									   "under the shared control-file authority",
+									   cluster_node_id),
+								errdetail("A label-less restart cannot locate this node's own "
+										  "checkpoint from the shared pg_control (its checkpoint "
+										  "fields belong to the last writer node)."),
+								errhint("Re-provision this node from a base backup, or verify that "
+										"cluster.shared_data_dir (\"%s\") is correctly mounted.",
+										cluster_shared_data_dir)));
 		}
 	}
 }

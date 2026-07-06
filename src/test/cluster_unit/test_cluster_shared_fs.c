@@ -75,7 +75,7 @@ bool cluster_smgr_user_relations = false;
 /* spec-6.14 D1: read by the shared_catalog startup vet in cluster_shared_fs_init. */
 bool cluster_shared_catalog = false;
 bool cluster_controlfile_shared_authority = false;
-bool cluster_merged_recovery = false;	/* read by D1 startup vet (D9 amend dep) */
+bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) */
 /* spec-4.5a: sharedfs backend GUC storages + node id (link-only). */
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;

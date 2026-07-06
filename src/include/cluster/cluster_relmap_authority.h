@@ -52,7 +52,7 @@
 #include "port/pg_crc32c.h"
 
 /* Authority header magic + version. */
-#define CLUSTER_RELMAP_AUTHORITY_MAGIC   0x0140DEA9	/* relmap authority tag */
+#define CLUSTER_RELMAP_AUTHORITY_MAGIC 0x0140DEA9 /* relmap authority tag */
 #define CLUSTER_RELMAP_AUTHORITY_VERSION 1
 
 /*
@@ -65,8 +65,7 @@
  */
 #define CLUSTER_RELMAP_IMAGE_MAX 1024
 
-typedef enum ClusterRelmapAuthorityValidity
-{
+typedef enum ClusterRelmapAuthorityValidity {
 	CLUSTER_RELMAP_AUTHORITY_VALID = 0,
 	CLUSTER_RELMAP_AUTHORITY_INVALID_SHORT,
 	CLUSTER_RELMAP_AUTHORITY_INVALID_MAGIC,
@@ -80,33 +79,31 @@ typedef enum ClusterRelmapAuthorityValidity
  *     [ ClusterRelmapAuthorityHeader ][ committed image ][ pending image ]
  * with each image occupying image_size bytes.
  */
-typedef struct ClusterRelmapAuthorityHeader
-{
-	uint32		magic;
-	uint32		version;
-	uint64		committed_generation;	/* what every reader adopts   */
-	uint64		pending_generation; /* 0 = no pending                 */
-	Oid			dbid;			/* InvalidOid for the shared map        */
-	uint8		shared_map;		/* 1 = shared (global) map, 0 = per-db  */
-	uint8		pad0;
-	int16		owner_node;		/* pending owner identity ...           */
+typedef struct ClusterRelmapAuthorityHeader {
+	uint32 magic;
+	uint32 version;
+	uint64 committed_generation; /* what every reader adopts   */
+	uint64 pending_generation;	 /* 0 = no pending                 */
+	Oid dbid;					 /* InvalidOid for the shared map        */
+	uint8 shared_map;			 /* 1 = shared (global) map, 0 = per-db  */
+	uint8 pad0;
+	int16 owner_node; /* pending owner identity ...           */
 	TransactionId owner_xid;
-	uint64		owner_epoch;
-	uint64		relmap_lsn;		/* XLOG_RELMAP_UPDATE in owner thread   */
-	uint32		image_size;		/* bytes per image slot                 */
-	uint32		pad1;
-	pg_crc32c	crc;			/* CRC of the header (not the images)   */
+	uint64 owner_epoch;
+	uint64 relmap_lsn; /* XLOG_RELMAP_UPDATE in owner thread   */
+	uint32 image_size; /* bytes per image slot                 */
+	uint32 pad1;
+	pg_crc32c crc; /* CRC of the header (not the images)   */
 } ClusterRelmapAuthorityHeader;
 
 /*
  * ClusterRelmapOwner -- the pending owner identity a writer stamps.
  */
-typedef struct ClusterRelmapOwner
-{
-	int16		owner_node;
+typedef struct ClusterRelmapOwner {
+	int16 owner_node;
 	TransactionId owner_xid;
-	uint64		owner_epoch;
-	uint64		relmap_lsn;
+	uint64 owner_epoch;
+	uint64 relmap_lsn;
 } ClusterRelmapOwner;
 
 /* ---- pure classification (standalone-linkable) ------------------------- */
@@ -115,8 +112,8 @@ typedef struct ClusterRelmapOwner
  * cluster_relmap_authority_classify -- validate an authority file buffer
  *	(header magic + CRC + image_size sanity).  len is the whole file length.
  */
-extern ClusterRelmapAuthorityValidity
-			cluster_relmap_authority_classify(const char *buf, size_t len);
+extern ClusterRelmapAuthorityValidity cluster_relmap_authority_classify(const char *buf,
+																		size_t len);
 
 /* ---- authority file I/O (backend) -------------------------------------- */
 
@@ -127,8 +124,8 @@ extern ClusterRelmapAuthorityValidity
  *	false when neither the primary nor .bak authority is trustworthy.  Never
  *	ereports.
  */
-extern bool cluster_relmap_authority_read_committed(bool shared_map, Oid dbid,
-													char *map_out, uint32 *out_len);
+extern bool cluster_relmap_authority_read_committed(bool shared_map, Oid dbid, char *map_out,
+													uint32 *out_len);
 
 /*
  * cluster_relmap_authority_read_header -- read just the durable header (for
@@ -146,9 +143,8 @@ extern bool cluster_relmap_authority_read_header(bool shared_map, Oid dbid,
  *	first-ever write (no prior authority) the committed slot is seeded from the
  *	same image so a reader before the first publish still sees a valid map.
  */
-extern void cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
-												   const char *map_image, uint32 image_size,
-												   uint64 pending_generation,
+extern void cluster_relmap_authority_write_pending(bool shared_map, Oid dbid, const char *map_image,
+												   uint32 image_size, uint64 pending_generation,
 												   const ClusterRelmapOwner *owner);
 
 /*
@@ -160,8 +156,7 @@ extern void cluster_relmap_authority_write_pending(bool shared_map, Oid dbid,
  *	(the owning xact is already committed); the activation layer retries and
  *	PANICs on exhaustion (r4-P1).
  */
-extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid,
-											 uint64 generation);
+extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid, uint64 generation);
 
 /*
  * cluster_relmap_authority_discard_pending -- drop a staged pending image
@@ -174,7 +169,6 @@ extern void cluster_relmap_authority_publish(bool shared_map, Oid dbid,
  *	the honest posture; this function is called from abort paths and must
  *	not throw.
  */
-extern void cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid,
-													 uint64 generation);
+extern void cluster_relmap_authority_discard_pending(bool shared_map, Oid dbid, uint64 generation);
 
-#endif							/* CLUSTER_RELMAP_AUTHORITY_H */
+#endif /* CLUSTER_RELMAP_AUTHORITY_H */

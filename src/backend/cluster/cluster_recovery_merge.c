@@ -50,7 +50,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_wal_thread.h"
-#include "postmaster/startup.h" /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
+#include "postmaster/startup.h"				   /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
 #include "cluster/storage/cluster_shared_fs.h" /* spec-4.5a D4: capability gate */
 #include "lib/stringinfo.h"
 #include "miscadmin.h" /* DataDir (authority marker path) */
@@ -457,8 +457,7 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 	 */
 	if (MakePGDirectory(gdir) < 0 && errno != EEXIST)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not create shared claim directory \"%s\": %m",
-							   gdir)));
+						errmsg("could not create shared claim directory \"%s\": %m", gdir)));
 
 	sysid = GetSystemIdentifier();
 	cluster_merge_claim_build(&f, cluster_node_id, sysid);
@@ -543,10 +542,9 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 				 */
 				(void)unlink(tmp);
 				merge_claim_held = true;
-				ereport(LOG,
-						(errmsg("shared-regime recovery claim re-adopted by node %d (previous "
-								"incarnation crashed while recovering; re-running recovery)",
-								cluster_node_id)));
+				ereport(LOG, (errmsg("shared-regime recovery claim re-adopted by node %d (previous "
+									 "incarnation crashed while recovering; re-running recovery)",
+									 cluster_node_id)));
 				return;
 			}
 
@@ -554,10 +552,9 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 			if (cur.node != wait_holder) {
 				wait_holder = cur.node;
 				dead_ms = 0;
-				ereport(LOG,
-						(errmsg("shared-regime crash recovery already claimed by node %d; "
-								"waiting for its recovery to complete",
-								wait_holder)));
+				ereport(LOG, (errmsg("shared-regime crash recovery already claimed by node %d; "
+									 "waiting for its recovery to complete",
+									 wait_holder)));
 			}
 		}
 

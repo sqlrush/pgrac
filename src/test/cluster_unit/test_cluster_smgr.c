@@ -76,9 +76,9 @@
 /* GUC variables read by cluster_smgr / cluster_shared_fs. */
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
-bool cluster_shared_catalog = false;	/* spec-6.14 D3 routing flip */
-bool cluster_controlfile_shared_authority = false;	/* read by D1 startup vet */
-bool cluster_merged_recovery = false;	/* read by D1 startup vet (D9 amend dep) */
+bool cluster_shared_catalog = false;			   /* spec-6.14 D3 routing flip */
+bool cluster_controlfile_shared_authority = false; /* read by D1 startup vet */
+bool cluster_merged_recovery = false;			   /* read by D1 startup vet (D9 amend dep) */
 
 /* Cluster injection support. */
 #include "cluster/cluster_inject.h"
@@ -696,7 +696,7 @@ UT_TEST(test_which_for_catalog_on_returns_cluster)
 	cluster_smgr_user_relations = true;
 	cluster_shared_catalog = true;
 	UT_ASSERT_EQ(cluster_smgr_which_for(rl, InvalidBackendId), 1);
-	cluster_shared_catalog = false;		/* restore for later tests */
+	cluster_shared_catalog = false; /* restore for later tests */
 }
 
 /* spec-6.14 D3/U10: temp relations stay node-local even under shared_catalog. */
@@ -707,7 +707,7 @@ UT_TEST(test_which_for_temp_stays_md_under_shared_catalog)
 	cluster_shared_storage_backend = 1;
 	cluster_smgr_user_relations = true;
 	cluster_shared_catalog = true;
-	UT_ASSERT_EQ(cluster_smgr_which_for(rl, 12 /* temp backend */ ), 0);
+	UT_ASSERT_EQ(cluster_smgr_which_for(rl, 12 /* temp backend */), 0);
 	cluster_shared_catalog = false;
 }
 
