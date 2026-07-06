@@ -10,6 +10,14 @@
  *	  addressed through the sharedfs relation path), and the durable authority
  *	  marker that gates seed vs adopt.
  *
+ *	  The seed branch also seeds the relation-map authority (spec-6.14 D5):
+ *	  the local pg_filenode.map images (global + per database) become the
+ *	  committed generation-1 images of the shared relmap authority, which the
+ *	  relmapper reads instead of local files under shared_catalog=on.  Seeding
+ *	  requires a cleanly shut down local node: tail WAL could hold
+ *	  XLOG_RELMAP_UPDATE records that replay only into the (unused) local
+ *	  files, leaving a freshly seeded authority permanently stale.
+ *
  *	  Runs from cluster_catalog_startup_prepare (postmaster-once, after the
  *	  shared pg_control authority is established) so it precedes the startup
  *	  process and any backend catalog access.
@@ -37,9 +45,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/transam.h"
 #include "catalog/catversion.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_migrate.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_relmap_authority.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -457,6 +469,178 @@ seed_base_databases(const char *local_pgdata)
 	FreeDir(dir);
 }
 
+/*
+ * seed_relmap_one -- seed one relmap authority (global or per-db) from the
+ *	local pg_filenode.map under <local_pgdata>/<rel>.  Idempotent: an already
+ *	valid authority (torn re-seed after a crash between relmap seed and the
+ *	marker write) is left untouched.
+ *
+ *	The image bytes are opaque here (they carry RelMapFile's own CRC, which
+ *	the relmapper validates on every load); we only bound their size.  The
+ *	write_pending(1) + publish(1) pair leaves committed_generation=1 and no
+ *	pending, so the foreign-pending write guard never sees a seed residue.
+ */
+static void
+seed_relmap_one(const char *local_pgdata, const char *rel,
+				bool shared_map, Oid dbid)
+{
+	char		path[MAXPGPATH];
+	char		image[CLUSTER_RELMAP_IMAGE_MAX];
+	ClusterRelmapAuthorityHeader hdr;
+	ClusterRelmapOwner owner;
+	struct stat st;
+	int			fd;
+	int			nread;
+
+	if (cluster_relmap_authority_read_header(shared_map, dbid, &hdr))
+		return;					/* already seeded (idempotent re-run) */
+
+	/* RELMAPPER_FILENAME is private to relmapper.c; the name is fixed. */
+	snprintf(path, sizeof(path), "%s/%s/pg_filenode.map", local_pgdata, rel);
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open relation map file \"%s\" for the shared "
+						"relmap authority seed: %m", path)));
+	if (fstat(fd, &st) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not stat relation map file \"%s\": %m", path)));
+	if (st.st_size <= 0 || st.st_size > CLUSTER_RELMAP_IMAGE_MAX)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("relation map file \"%s\" has unexpected size %lld",
+						path, (long long) st.st_size),
+				 errhint("The local relation map is not trustworthy; restore the "
+						 "node from backup before seeding cluster.shared_catalog.")));
+	nread = read(fd, image, (size_t) st.st_size);
+	if (nread != (int) st.st_size)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not read relation map file \"%s\": %m", path)));
+	CloseTransientFile(fd);
+
+	owner.owner_node = (int16) cluster_node_id;
+	owner.owner_xid = InvalidTransactionId;
+	owner.owner_epoch = 0;
+	owner.relmap_lsn = 0;
+
+	cluster_relmap_authority_write_pending(shared_map, dbid, image,
+										   (uint32) st.st_size, 1, &owner);
+	cluster_relmap_authority_publish(shared_map, dbid, 1);
+}
+
+/*
+ * seed_relmap_authority -- seed the shared relmap authorities (global map +
+ *	every base/<db> map) from this node's local pg_filenode.map files.
+ */
+static void
+seed_relmap_authority(const char *local_pgdata)
+{
+	char		localbase[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+
+	seed_relmap_one(local_pgdata, "global", true, InvalidOid);
+
+	snprintf(localbase, sizeof(localbase), "%s/base", local_pgdata);
+	dir = AllocateDir(localbase);
+	while ((de = ReadDir(dir, localbase)) != NULL)
+	{
+		char		rel[MAXPGPATH];
+
+		if (!isdigit((unsigned char) de->d_name[0]))
+			continue;
+
+		snprintf(rel, sizeof(rel), "base/%s", de->d_name);
+		seed_relmap_one(local_pgdata, rel, false, atooid(de->d_name));
+	}
+	FreeDir(dir);
+}
+
+/*
+ * vet_seed_clean_shutdown -- FATAL unless the local node was cleanly shut
+ *	down.  Seeding from a crashed node would copy a pg_filenode.map that is
+ *	missing tail-WAL XLOG_RELMAP_UPDATE records; replay heals only the local
+ *	files (relmap_redo never touches the authority, by design -- INV-14-7
+ *	arbitration discipline), so the authority would be permanently stale.
+ *	Catalog relation files do not need this vet: their tail WAL replays into
+ *	the shared tree through the shared smgr route and heals the seeded copy.
+ */
+static void
+vet_seed_clean_shutdown(const char *local_pgdata)
+{
+	ControlFileData *lcf;
+	bool		crc_ok;
+
+	lcf = get_controlfile(local_pgdata, &crc_ok);
+	if (!crc_ok)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("local pg_control has an invalid checksum; cannot seed "
+						"the shared catalog authority")));
+	if (lcf->state != DB_SHUTDOWNED)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("seeding the shared catalog authority requires a cleanly "
+						"shut down node"),
+				 errdetail("Local pg_control state is \"%s\"; pending WAL could "
+						   "hold relation-map updates the seeded authority would "
+						   "never see.",
+						   lcf->state == DB_SHUTDOWNED_IN_RECOVERY ?
+						   "shut down in recovery" : "not shut down"),
+				 errhint("Start and cleanly stop this node with "
+						 "cluster.shared_catalog=off, then enable it.")));
+	pfree(lcf);
+}
+
+/*
+ * vet_seed_no_tablespaces -- FATAL if any user tablespace exists at seed
+ *	time.  A database whose default tablespace is not pg_default keeps its
+ *	per-db catalogs (and pg_filenode.map) under pg_tblspc/, which the seed
+ *	does not walk; its relmap authority would silently never exist and every
+ *	later connection would fail 53RB0.  CREATE TABLESPACE is already rejected
+ *	under shared_catalog=on (Q12), so vetting the pre-existing stock here
+ *	closes the whole class.
+ */
+static void
+vet_seed_no_tablespaces(const char *local_pgdata)
+{
+	char		tblspcdir[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+
+	snprintf(tblspcdir, sizeof(tblspcdir), "%s/pg_tblspc", local_pgdata);
+
+	dir = AllocateDir(tblspcdir);
+	if (dir == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\" for the tablespace vet: %m",
+						tblspcdir)));
+	}
+	while ((de = ReadDir(dir, tblspcdir)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster.shared_catalog cannot be enabled: user tablespace "
+						"storage exists"),
+				 errdetail("\"%s/%s\" exists; per-database catalogs under a user "
+						   "tablespace are outside the shared catalog seed.",
+						   tblspcdir, de->d_name),
+				 errhint("Drop all user tablespaces before enabling "
+						 "cluster.shared_catalog; tablespace support is spec-6.14b.")));
+	}
+	FreeDir(dir);
+}
+
 void
 cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 {
@@ -500,12 +684,52 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 	/*
 	 * SEED: no authority yet.  Copy this node's catalog relation files into
 	 * the shared tree, then publish the marker last so a torn seed re-runs
-	 * instead of being adopted.
+	 * instead of being adopted.  Seed-only vets first (a join node may well
+	 * be crash-restarting; a seed node must be pristine).
 	 */
+	vet_seed_clean_shutdown(local_pgdata);
+	vet_seed_no_tablespaces(local_pgdata);
+
 	seed_dir(local_pgdata, "global");
 	seed_base_databases(local_pgdata);
+	seed_relmap_authority(local_pgdata);
 	write_marker(system_identifier);
 
 	elog(LOG, "cluster shared_catalog: seeded shared catalog authority under \"%s\" "
 		 "(sysid " UINT64_FORMAT ")", cluster_shared_data_dir, system_identifier);
+}
+
+/*
+ * cluster_catalog_vet_off_mode -- spec-6.14 D5 off-flip vet.
+ *
+ *	Booting with cluster.shared_catalog=off against a shared tree that holds
+ *	a catalog authority marker is refused outright.  Once a node has run with
+ *	the shared catalog, every on-era DDL lives only in the shared tree: the
+ *	local catalog files (and pg_filenode.map) are frozen at their seed-time
+ *	state, so silently flipping back would serve a stale catalog -- lost
+ *	tables at best, wrong-relfilenumber reads at worst.
+ */
+void
+cluster_catalog_vet_off_mode(void)
+{
+	ClusterCatalogAuthorityMarker m;
+
+	Assert(!cluster_shared_catalog);
+
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return;
+
+	if (!read_marker(&m))
+		return;
+
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster.shared_catalog is off but the shared tree holds a "
+					"shared catalog authority"),
+			 errdetail("\"%s/%s\" certifies that this cluster's catalog lives in "
+					   "the shared tree; the node-local catalog files are stale "
+					   "once any DDL ran with cluster.shared_catalog=on.",
+					   cluster_shared_data_dir, CLUSTER_CATALOG_AUTHORITY_REL_PATH),
+			 errhint("Re-enable cluster.shared_catalog, or restore this node from "
+					 "a backup taken before the shared catalog was seeded.")));
 }

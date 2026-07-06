@@ -86,4 +86,12 @@ extern void cluster_catalog_migrate_tree(const char *local_pgdata,
  */
 extern void cluster_catalog_vet_no_unlogged(const char *local_pgdata);
 
+/*
+ * cluster_catalog_vet_off_mode -- spec-6.14 D5 off-flip vet: FATAL when
+ *	cluster.shared_catalog is off but the shared tree holds a catalog
+ *	authority marker (the local catalog files are stale once any DDL ran
+ *	under the shared catalog).  Postmaster-once, off-mode boots only.
+ */
+extern void cluster_catalog_vet_off_mode(void);
+
 #endif							/* CLUSTER_CATALOG_MIGRATE_H */

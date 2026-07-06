@@ -62,6 +62,16 @@
  *     a silent lost-write / wrong-relfilenode read across nodes.
  *     Spec: spec-6.14-shared-catalog-single-authority.md (D5).
  *
+ *   - read_relmap_file() reads the shared relmap AUTHORITY instead of
+ *     the local pg_filenode.map under cluster.shared_catalog=on
+ *     (cluster_read_relmap_from_authority below): readers adopt the
+ *     authority's COMMITTED image only (INV-14-7), fail-closed 53RB0
+ *     when no trustworthy authority exists — never the stale local
+ *     file.  Local map files are no longer read (AD-001: no local
+ *     persistent map); relmap_redo still writes them (harmless, and
+ *     keeps off-mode/PITR semantics byte-identical).
+ *     Spec: spec-6.14-shared-catalog-single-authority.md (D5, §3.2).
+ *
  *   - History note: Hardening v1.0.0 (2026-05-09 pre-ship F3) moved
  *     the hook from RelationMapInvalidate() (the sinval RECEIVE
  *     callback) to write_relmap_file() source side to avoid
@@ -121,6 +131,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
+#include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
 #endif
 
@@ -875,6 +886,103 @@ load_relmap_file(bool shared, bool lock_held)
 		read_relmap_file(&local_map, DatabasePath, lock_held, FATAL);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC MODIFICATIONS by SqlRush (spec-6.14 D5-activation):
+ *
+ * cluster_read_relmap_from_authority -- on-mode replacement for the local
+ * pg_filenode.map read: adopt the COMMITTED image of the shared relmap
+ * authority (INV-14-7; a staged-but-unpublished pending image is never
+ * readable).  dbpath identifies the map: "global" is the shared map, any
+ * database path resolves through its trailing <dbid> component (the
+ * authority is keyed by database OID, not by physical location).
+ *
+ * Fail-closed: no trustworthy authority, an unresolvable dbpath, or a
+ * corrupt inner image all raise 53RB0 at the caller's elevel -- the stale
+ * local file is never used as a fallback (INV-14-6).
+ *
+ * Lock discipline mirrors the vanilla read: RelationMappingLock SHARED
+ * unless already held, interlocking against the in-memory map updates the
+ * on-mode write path makes under the EXCLUSIVE lock.
+ */
+static void
+cluster_read_relmap_from_authority(RelMapFile *map, const char *dbpath,
+								   bool lock_held, int elevel)
+{
+	bool		shared_authority = (strcmp(dbpath, "global") == 0);
+	Oid			dbid = InvalidOid;
+	char		image[CLUSTER_RELMAP_IMAGE_MAX];
+	uint32		image_len = 0;
+	bool		ok;
+	pg_crc32c	crc;
+
+	Assert(elevel >= ERROR);
+
+	if (!shared_authority)
+	{
+		const char *comp = strrchr(dbpath, '/');
+		unsigned long parsed;
+		char	   *endp;
+
+		comp = (comp != NULL) ? comp + 1 : dbpath;
+		errno = 0;
+		parsed = strtoul(comp, &endp, 10);
+		if (errno != 0 || endp == comp || *endp != '\0' ||
+			parsed == 0 || parsed > PG_UINT32_MAX)
+			ereport(elevel,
+					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					 errmsg("cannot resolve database path \"%s\" to a relmap authority",
+							dbpath)));
+		dbid = (Oid) parsed;
+	}
+
+	if (!lock_held)
+		LWLockAcquire(RelationMappingLock, LW_SHARED);
+
+	pgstat_report_wait_start(WAIT_EVENT_RELATION_MAP_READ);
+	ok = cluster_relmap_authority_read_committed(shared_authority, dbid,
+												 image, &image_len);
+	pgstat_report_wait_end();
+
+	if (!lock_held)
+		LWLockRelease(RelationMappingLock);
+
+	if (!ok)
+		ereport(elevel,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap authority for \"%s\" is unavailable or not trustworthy",
+						dbpath),
+				 errhint("Check cluster.shared_data_dir; the node-local relation "
+						 "map is never used while cluster.shared_catalog is on.")));
+
+	if (image_len != sizeof(RelMapFile))
+		ereport(elevel,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap authority image for \"%s\" has wrong size %u",
+						dbpath, image_len)));
+
+	memcpy(map, image, sizeof(RelMapFile));
+
+	/* Same content validation as the vanilla file read below. */
+	if (map->magic != RELMAPPER_FILEMAGIC ||
+		map->num_mappings < 0 ||
+		map->num_mappings > MAX_MAPPINGS)
+		ereport(elevel,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap authority image for \"%s\" contains invalid data",
+						dbpath)));
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, (char *) map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, map->crc))
+		ereport(elevel,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relmap authority image for \"%s\" contains incorrect checksum",
+						dbpath)));
+}
+#endif							/* USE_PGRAC_CLUSTER */
+
 /*
  * read_relmap_file -- load data from any relation mapper file
  *
@@ -894,6 +1002,15 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 	int			r;
 
 	Assert(elevel >= ERROR);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: on-mode reads adopt the shared relmap authority (spec-6.14 D5). */
+	if (cluster_shared_catalog && !IsBootstrapProcessingMode())
+	{
+		cluster_read_relmap_from_authority(map, dbpath, lock_held, elevel);
+		return;
+	}
+#endif
 
 	/*
 	 * Grab the lock to prevent the file from being updated while we read it,

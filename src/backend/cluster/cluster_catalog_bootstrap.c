@@ -48,12 +48,20 @@ cluster_catalog_startup_prepare(void)
 {
 	ControlFileData cf;
 
-	if (!cluster_shared_catalog)
-		return;					/* off: stock per-node catalog */
-
 	/* Postmaster-once: only the postmaster seeds; forked backends inherit. */
 	if (IsUnderPostmaster)
 		return;
+
+	if (!cluster_shared_catalog)
+	{
+		/*
+		 * Off-mode boots against a shared tree that already holds a catalog
+		 * authority are refused (D5 off-flip vet): the local catalog files
+		 * are stale once any DDL ran under the shared catalog.
+		 */
+		cluster_catalog_vet_off_mode();
+		return;					/* off: stock per-node catalog */
+	}
 
 	/*
 	 * shared_catalog=on requires the shared pg_control authority (D1 vet), so
