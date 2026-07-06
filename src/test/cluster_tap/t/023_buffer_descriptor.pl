@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '77' : '76'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a)
+  my $expected_region_count = $has_visibility_inject ? '78' : '77'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a)
 
 
 # ----------
@@ -157,8 +157,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '154',
-   'L11 pg_stat_cluster_injections is 154 (spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 xid herding/hard-limit; spec-6.12 waves a/b/i +3; full breakdown in t/015)');
+   '158',
+   'L11 pg_stat_cluster_injections is 158 (spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 xid herding/hard-limit; spec-6.12 waves a/b/i +3; full breakdown in t/015)');
 
 
 # ----------

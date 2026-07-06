@@ -51,6 +51,7 @@
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"   /* spec-6.12 lever counter stub */
 #include "cluster/cluster_hw_lease.h"	   /* spec-6.12d lease counter stub */
+#include "cluster/cluster_relmap_authority.h" /* spec-6.14 D5 header-read stub */
 
 #undef printf
 #undef fprintf
@@ -330,6 +331,15 @@ uint64
 cluster_remote_xact_side_effect_drop_count(void)
 {
 	return 0;
+}
+/* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
+ * cluster_relmap_authority.o is not linked here.  cluster_shared_catalog is
+ * false above, so the read is short-circuited and never called. */
+bool
+cluster_relmap_authority_read_header(bool shared_map, Oid dbid,
+									 ClusterRelmapAuthorityHeader *out)
+{
+	return false;
 }
 
 /* spec-4.12 D7 + spec-4.12b D6 stubs: dump_write_fence (cluster_debug.o) reads 8

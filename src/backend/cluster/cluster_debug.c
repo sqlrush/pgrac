@@ -128,6 +128,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
 #include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
 #include "cluster/cluster_oid_lease.h"		 /* catalog category (spec-6.14 D10) */
+#include "cluster/cluster_relmap_authority.h" /* relmap authority state (spec-6.14 D5) */
 #include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				 /* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -2996,13 +2997,15 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 
 /*
  * dump_catalog -- spec-6.14 D10: shared-catalog single-authority
- *	observability.  Keys backed by live substrate only; the relmap write /
- *	broadcast-ack keys land with the relmapper activation (D5), so no key
- *	here can be a permanently-dead zero.
+ *	observability.  Keys backed by live substrate only; no key here can be
+ *	a permanently-dead zero.
  */
 static void
 dump_catalog(ReturnSetInfo *rsinfo)
 {
+	ClusterRelmapAuthorityHeader rmhdr;
+	bool		rmok;
+
 	emit_row(rsinfo, "catalog", "shared_catalog_enabled", fmt_bool(cluster_shared_catalog));
 	/* D6 OID lease allocator */
 	emit_row(rsinfo, "catalog", "oid_lease_acquire_count",
@@ -3014,6 +3017,23 @@ dump_catalog(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_remote_xact_side_effect_record_count()));
 	emit_row(rsinfo, "catalog", "recovery_side_effect_drop_count",
 			 fmt_int64((int64)cluster_remote_xact_side_effect_drop_count()));
+
+	/*
+	 * D5 relmap authority state (the SHARED map's durable header): the
+	 * committed generation every reader adopts, and whether a staged
+	 * pending image is outstanding (non-zero = a writer is between stage
+	 * and publish, or died there and awaits arbitration -- relmap writes
+	 * are 53RB while it stands).  Read on demand; stable key set when the
+	 * authority is unreadable/off (0/0/-1).
+	 */
+	rmok = cluster_shared_catalog
+		&& cluster_relmap_authority_read_header(true, InvalidOid, &rmhdr);
+	emit_row(rsinfo, "catalog", "relmap_shared_committed_generation",
+			 fmt_int64(rmok ? (int64)rmhdr.committed_generation : 0));
+	emit_row(rsinfo, "catalog", "relmap_shared_pending_generation",
+			 fmt_int64(rmok ? (int64)rmhdr.pending_generation : 0));
+	emit_row(rsinfo, "catalog", "relmap_shared_pending_owner_node",
+			 fmt_int64(rmok ? (int64)rmhdr.owner_node : -1));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

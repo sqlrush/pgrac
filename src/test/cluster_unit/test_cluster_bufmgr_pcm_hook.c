@@ -459,6 +459,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
 errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;

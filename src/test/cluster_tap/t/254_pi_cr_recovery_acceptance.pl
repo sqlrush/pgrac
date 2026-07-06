@@ -288,7 +288,13 @@ SKIP:
 	my $failclosed =
 	     $err =~ /\b53R9[FG]\b/                          # registered CR / remote-authority fail-closed
 	  || $err =~ /snapshot too old/i                     # registered CR horizon fail-closed
-	  || $err =~ /cross-node block.*not supported/i;     # explicit FEATURE_NOT_SUPPORTED (Stage 5 forward)
+	  || $err =~ /cross-node block.*not supported/i      # explicit FEATURE_NOT_SUPPORTED (Stage 5 forward)
+	  || $err =~ /could not obtain read image from X holder/; # spec-5.2 D11 xheld-forward
+	                                                     # fail-closed: the X holder is the
+	                                                     # freshly killed peer and the read
+	                                                     # lands inside the pre-reconfig
+	                                                     # window (FEATURE_NOT_SUPPORTED,
+	                                                     # designed message -- never stale data)
 	my $correct = ($rc == 0 && $out eq '50');
 	diag("L6: survivor cross-node read rc=$rc out='$out'"
 		  . ($failclosed ? " fail-closed (SAFE)" : ($correct ? " correct" : " err=$err")));
