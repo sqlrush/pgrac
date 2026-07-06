@@ -531,14 +531,12 @@ if [ "$MODE_JOIN" = "yes" ]; then
     append_shared_catalog_gucs "$PG_CONF" "$SHARED_DATA_DIR"
 
     # WAL stream identity.  A clone whose pg_wal is a symlink points at
-    # the SOURCE's per-thread WAL stream; sharing it corrupts both
-    # nodes, so demand a thread home of this node's own.
+    # the SOURCE's per-thread WAL stream: sharing it corrupts both nodes,
+    # and swapping in an empty replacement stream would discard the
+    # label-era WAL the first boot must replay (FATAL at recovery).
+    # Refuse outright: the backup has to carry its own WAL.
     if [ -L "$TARGET_PGDATA/pg_wal" ]; then
-        if [ -z "$WAL_THREADS_DIR" ]; then
-            join_die "the clone's pg_wal is a symlink to the source's WAL thread; pass --wal-threads-dir so this node gets its own WAL stream"
-        fi
-        rm "$TARGET_PGDATA/pg_wal"
-        mkdir "$TARGET_PGDATA/pg_wal"
+        join_die "the clone's pg_wal is a symlink to the source's WAL thread; materialize the WAL into the backup (take the copy with 'cp -RL', or clone a live node with --join-from) so the label boot has its segments"
     fi
     if [ -n "$WAL_THREADS_DIR" ]; then
         case "$WAL_THREADS_DIR" in

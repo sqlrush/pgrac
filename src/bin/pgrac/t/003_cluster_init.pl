@@ -275,20 +275,37 @@ command_fails(
 		"--join-from-backup=$src_d2" ],
 	'D2: join from a symlinked-pg_wal source without --wal-threads-dir fails');
 
-# D3: same source, but WITH --wal-threads-dir: the joiner gets its own
-# fresh thread directory (never the source's stream).
-my $join_d3 = "$tempdir/join-d3";
-command_ok(
-	[ 'pgrac-init', '-D', $join_d3, '--cluster-join', '--node-id=6',
+# D3: even WITH --wal-threads-dir a symlinked-pg_wal clone is refused:
+# an empty replacement stream would discard the label-era WAL the first
+# boot must replay (opus review r1 P3 -- the old success shape was a
+# boot-time trap).  The backup has to carry its WAL materialized.
+command_fails(
+	[ 'pgrac-init', '-D', "$tempdir/join-d3", '--cluster-join', '--node-id=6',
 		"--shared-data-dir=$sroot_d2",
 		"--join-from-backup=$src_d2",
 		"--wal-threads-dir=$wroot_d2" ],
-	'D3: join from a symlinked-pg_wal source with --wal-threads-dir succeeds');
-ok(-l "$join_d3/pg_wal", 'D3: pg_wal is a symlink');
+	'D3: a symlinked-pg_wal clone is refused even with --wal-threads-dir');
+
+# D3b: the operator's path out: a DEREFERENCED copy (cp -RL) carries the
+# WAL segments as a real pg_wal; the join then relocates them -- segments
+# included -- to this node's own thread home.
+my $src_d3b = "$tempdir/src-d3b";
+PostgreSQL::Test::Utils::system_or_bail('cp', '-RL', $src_d2, $src_d3b);
+my $join_d3b = "$tempdir/join-d3b";
+command_ok(
+	[ 'pgrac-init', '-D', $join_d3b, '--cluster-join', '--node-id=6',
+		"--shared-data-dir=$sroot_d2",
+		"--join-from-backup=$src_d3b",
+		"--wal-threads-dir=$wroot_d2" ],
+	'D3b: join from a dereferenced (cp -RL) copy succeeds');
+ok(-l "$join_d3b/pg_wal", 'D3b: pg_wal is a symlink');
 {
-	my $target = readlink("$join_d3/pg_wal");
-	like($target, qr/thread_7/, 'D3: joiner symlink targets its OWN thread_7');
-	unlike($target, qr/thread_1\b/, 'D3: joiner does not adopt the source thread');
+	my $target = readlink("$join_d3b/pg_wal");
+	like($target, qr/thread_7/, 'D3b: joiner symlink targets its OWN thread_7');
+	unlike($target, qr/thread_1\b/, 'D3b: joiner does not adopt the source thread');
+	my @segs = glob("$wroot_d2/thread_7/0*");
+	cmp_ok(scalar(@segs), '>', 0,
+		'D3b: the label-era WAL segments moved with the clone into the thread home');
 }
 
 # ----------
