@@ -90,6 +90,10 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_active_itl_transfer_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_stamp_skipped_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_drift_resolved_via_tt_count, 0);
+		/* spec-6.12e2 */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_sent_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_yield_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_refused_count, 0);
 	}
 }
 
@@ -300,4 +304,31 @@ cluster_lever_g_note_drift_resolved_via_tt(void)
 	if (!lever_g_counting())
 		return;
 	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->g_drift_resolved_via_tt_count, 1);
+}
+
+/* spec-6.12e2 gating: the wave switch or the profile umbrella. */
+static inline bool
+lever_e2_counting(void)
+{
+	return (cluster_ges_bast || cluster_xnode_profile_enabled) && ClusterXnodeLeverCtl != NULL;
+}
+
+/* spec-6.12e2 — master sent a BAST nudge alongside a live-X-holder deny. */
+void
+cluster_lever_e2_note_nudge_sent(void)
+{
+	if (!lever_e2_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->e2_bast_nudge_sent_count, 1);
+}
+
+/* spec-6.12e2 — holder decided a nudge: yielded (quiescent X->S) or refused. */
+void
+cluster_lever_e2_note_nudge_result(bool yielded)
+{
+	if (!lever_e2_counting())
+		return;
+	pg_atomic_fetch_add_u64(yielded ? &ClusterXnodeLeverCtl->e2_bast_nudge_yield_count
+									: &ClusterXnodeLeverCtl->e2_bast_nudge_refused_count,
+							1);
 }

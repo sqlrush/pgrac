@@ -107,6 +107,14 @@ typedef struct ClusterXnodeLeverShared {
 													 * stamp-skipped ACTIVE slot
 													 * that the TT authority
 													 * decided (observability) */
+
+	/* ---- wave e2: master->holder BAST nudge (㉔ form) ---- */
+	pg_atomic_uint64 e2_bast_nudge_sent_count;	  /* master: nudges sent alongside
+												   * a live-X-holder deny */
+	pg_atomic_uint64 e2_bast_nudge_yield_count;	  /* holder: nudges that yielded
+												   * (quiescent X->S succeeded) */
+	pg_atomic_uint64 e2_bast_nudge_refused_count; /* holder: nudges refused
+												   * (active ITL / raced / off) */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -151,5 +159,12 @@ extern void cluster_lever_a_note_remote_ack_degraded(void);
 extern void cluster_lever_g_note_active_itl_transfer(void);
 extern void cluster_lever_g_note_stamp_skipped(void);
 extern void cluster_lever_g_note_drift_resolved_via_tt(void);
+
+/*
+ * Wave-e2 counters (BAST nudge; ticked from the master deny path and the
+ * holder-side nudge handler).
+ */
+extern void cluster_lever_e2_note_nudge_sent(void);
+extern void cluster_lever_e2_note_nudge_result(bool yielded);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

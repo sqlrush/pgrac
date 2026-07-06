@@ -306,9 +306,12 @@ static bool gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const v
  * envelope to each, waits for all INVALIDATE_ACK msg_type 18 within
  * cluster.gcs_block_invalidate_ack_timeout_ms;  retries failed/timed-out
  * holders per spec-2.34 retransmit budget;  returns true on full
- * collection, false on budget exhaustion. */
-static bool gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req,
-													uint32 holders_bm);
+ * collection, false on budget exhaustion.  The blocking form survives
+ * only behind the backend-context local-master upgrade (_ext, outbound
+ * ring); the LMON wire-request S-branch uses the nowait fan-out (e2
+ * structural fix — the dispatch loop cannot sleep on ACKs it drains). */
+static void gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req,
+												  uint32 holders_bm);
 
 
 /* ============================================================
@@ -3636,6 +3639,39 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		 */
 		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
 			&& cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
+			/*
+			 * PGRAC: spec-6.12e2 (㉔) — BAST nudge.  We are about to DENY
+			 * because a live X holder blocks this requester; with the wave
+			 * GUC on, additionally nudge that holder (fire-and-forget
+			 * FORWARD, request_id 0, no reply of any kind) so its LMON
+			 * tries the quiescent X->S self-downgrade NOW instead of
+			 * waiting for a natural release — the requester's bounded
+			 * retry then proceeds through the S-invalidate grant path.
+			 * The deny below is unchanged in every case (the nudge is
+			 * advisory; refusal keeps today's e1 release-side fallback).
+			 */
+			if (cluster_ges_bast) {
+				int nudge_holder = cluster_pcm_master_holder_node_by_tag(req->tag);
+
+				if (nudge_holder >= 0 && nudge_holder != cluster_node_id
+					&& nudge_holder != req->sender_node) {
+					GcsBlockForwardPayload nudge;
+
+					memset(&nudge, 0, sizeof(nudge));
+					nudge.request_id = 0; /* HC74 shape: nobody waits */
+					nudge.epoch = cluster_epoch_get_current();
+					nudge.tag = req->tag;
+					nudge.original_requester_node = req->sender_node;
+					nudge.requester_backend_id = req->requester_backend_id;
+					nudge.master_node = cluster_node_id;
+					nudge.transition_id = req->transition_id;
+					GcsBlockForwardPayloadSetBastNudge(&nudge);
+					if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, nudge_holder,
+												 &nudge, sizeof(nudge))
+						== CLUSTER_IC_SEND_DONE)
+						cluster_lever_e2_note_nudge_sent();
+				}
+			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
 								 InvalidXLogRecPtr, NULL);
@@ -3818,40 +3854,35 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			}
 
 			if (holders_bm != 0) {
-				if (!gcs_block_broadcast_invalidate_and_wait(req, holders_bm)) {
-					/* Budget exhausted — reply DENIED_INVALIDATE_TIMEOUT;
-					 * sender backend maps to 53R91. */
-					if (xvs_b2_captured) {
-						/* PGRAC: spec-6.14a D3 — drop the captured image. */
-						gcs_block_release_ship_image(block_payload_release_cb,
-													 block_payload_release_arg);
-						block_payload = NULL;
-					}
-					cluster_pcm_lock_clear_pending_x(req->tag);
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
-					gcs_block_send_reply(req->sender_node, req,
-										 GCS_BLOCK_REPLY_DENIED_INVALIDATE_TIMEOUT,
-										 InvalidXLogRecPtr, NULL);
-					return;
-				}
-				/* All acks collected; fall through to direct grant. */
-
 				/*
-				 * PGRAC: spec-6.12a ㉕ — clear the invalidated holders' bits on
-				 * the authoritative entry (mirror of the LOCAL-master upgrade,
-				 * cluster_gcs_block_local_x_upgrade).  The invalidate ACK
-				 * handler only collects the acked bitmap; without this clear
-				 * the sole-holder legality inside the S→X_UPGRADE apply below
-				 * still sees the dropped holders' bits and fails, sending the
-				 * requester a spurious DENIED_MASTER_NOT_HOLDER.  pending_x is
-				 * set, so no NEW S grant can slip in between the ack collection
-				 * and this clear (HC117).
+				 * PGRAC: spec-6.12e2 (structural fix) — NEVER sleep for the
+				 * ACKs here.  This handler runs in the LMON dispatch loop and
+				 * the very ACKs a blocking wait would collect are drained by
+				 * this same loop, so the CV sleep could only ever time out
+				 * (observed: guaranteed HC116 DENIED_INVALIDATE_TIMEOUT for
+				 * any REMOTE S holder; unreachable in two-node clusters where
+				 * the S set reduces to {master, requester}, both handled
+				 * above — first reached by the 3-corner e2 nudge flow).  Fire
+				 * the INVALIDATEs and reply DENIED_PENDING_X: the requester's
+				 * own HC117 starvation backoff retries the request; meanwhile
+				 * each holder drops its copy and its ACK — epoch/checksum
+				 * validated in the ACK handler — clears its S bit on the
+				 * authoritative entry, so a following retry finds no remote
+				 * holder left and grants.  Deny direction throughout (8.A).
 				 */
-				for (int inv_n = 0; inv_n < 32; inv_n++) {
-					if ((holders_bm & ((uint32)1u << inv_n)) != 0)
-						(void)cluster_pcm_lock_apply_gcs_transition(
-							req->tag, PCM_TRANS_S_TO_N_INVALIDATE, inv_n);
+				if (xvs_b2_captured) {
+					/* PGRAC: spec-6.14a D3 — drop the captured image: this
+					 * PENDING_X deny replies without it, and the requester's
+					 * retry recaptures against the post-revoke state. */
+					gcs_block_release_ship_image(block_payload_release_cb,
+												 block_payload_release_arg);
+					block_payload = NULL;
 				}
+				gcs_block_broadcast_invalidate_nowait(req, holders_bm);
+				cluster_pcm_lock_clear_pending_x(req->tag);
+				gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
+									 InvalidXLogRecPtr, NULL);
+				return;
 			}
 
 			/*
@@ -4934,6 +4965,29 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	}
 
 	/*
+	 * PGRAC: spec-6.12e2 (㉔) — BAST nudge.  The master denied a peer's X
+	 * request because WE hold this block in X; it asks us to TRY the
+	 * quiescent X->S self-downgrade right away (Oracle BAST -> holder LMS
+	 * background yield; the foreground session is never interrupted).
+	 * Fire-and-forget: NO reply of any kind — the requester already got
+	 * its bounded DENIED and retries.  The downgrade helper alone judges
+	 * quiescence (active ITL / pinned / raced / flush unavailable all
+	 * refuse), flushes WAL-before-share, flips our pcm_state X->S and
+	 * nowait-notifies the master; any refusal leaves today's deny-retry
+	 * (e1 release-side) path untouched (§3.4b: never force the holder).
+	 * MUST branch before the ship-image copy below: a nudge ships nothing.
+	 */
+	if (GcsBlockForwardPayloadIsBastNudge(fwd)) {
+		bool yielded = false;
+
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-bast-nudge");
+		if (cluster_ges_bast && !cluster_injection_should_skip("cluster-gcs-block-bast-nudge"))
+			yielded = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(fwd->tag, fwd->master_node);
+		cluster_lever_e2_note_nudge_result(yielded);
+		return;
+	}
+
+	/*
 	 * PGRAC: spec-6.12a ㉕ — remote-holder downgrade.  The master asked us
 	 * (the X holder) to TRY the quiescent X->S self-downgrade before
 	 * shipping.  This MUST run before the ship-image copy below so a
@@ -5407,11 +5461,40 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	return full_ack;
 }
 
-/* Original spec-2.36 entry point (LMON master-handler context). */
-static bool
-gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint32 holders_bm)
+/*
+ * PGRAC: spec-6.12e2 (structural fix) — fire-and-forget INVALIDATE fan-out
+ * for the LMON wire-request S-branch.  No broadcast slot, no CV wait: the
+ * dispatch loop must never sleep on ACKs it alone can drain.  Ack-side
+ * bookkeeping happens in the ACK handler (authoritative S-bit clear); the
+ * requester converges through its DENIED_PENDING_X backoff retries.
+ */
+static void
+gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req, uint32 holders_bm)
 {
-	return gcs_block_broadcast_invalidate_and_wait_ext(req, holders_bm, false);
+	GcsBlockInvalidatePayload inv;
+	int n;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+
+	memset(&inv, 0, sizeof(inv));
+	inv.request_id = req->request_id;
+	inv.epoch = cluster_epoch_get_current();
+	inv.tag = req->tag;
+	inv.master_node = cluster_node_id;
+	inv.invalidating_for_x_node = (uint8)(req->sender_node & 0xff);
+	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
+
+	for (n = 0; n < 32; n++) {
+		if ((holders_bm & ((uint32)1u << n)) == 0)
+			continue;
+		/* D16 inject — drop a single broadcast envelope. */
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
+		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
+			continue;
+		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
+	}
 }
 
 /* ============================================================
@@ -5612,6 +5695,44 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	if (ack->checksum != gcs_block_compute_invalidate_ack_checksum(ack)) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 		return;
+	}
+
+	/*
+	 * PGRAC: spec-6.12e2 (structural fix) — clear the sender's S bit on the
+	 * authoritative entry FIRST, independent of the broadcast-slot match
+	 * below.  The LMON wire-request S-branch fires its INVALIDATEs without
+	 * sleeping (sleeping in the dispatch loop would deadlock on the ACKs
+	 * this very loop drains), so by the time an ACK lands no slot is
+	 * claimed and the slot logic would drop it as stale — leaving the S
+	 * bit set forever and every requester retry re-invalidating.  The
+	 * holder self-reports that it no longer caches the block (status 0 =
+	 * dropped, 2 = not resident); per-peer IC streams are FIFO, so an S
+	 * the holder re-acquires later (a REQUEST that follows this ACK on the
+	 * same stream, granted by this master) cannot be clobbered by this
+	 * earlier ACK.  Epoch must equal the current epoch (reconfig fences
+	 * stale reports); the transition apply itself early-returns when the
+	 * bit is already clear (idempotent).
+	 */
+	if ((ack->ack_status == 0 || ack->ack_status == 2) && ack->epoch == cluster_epoch_get_current()
+		&& ack->sender_node >= 0 && ack->sender_node < 32) {
+		(void)cluster_pcm_lock_apply_gcs_transition(ack->tag, PCM_TRANS_S_TO_N_INVALIDATE,
+													ack->sender_node);
+		/* spec-2.41 D3 parity — the nowait fan-out has no slot-valid branch
+		 * below, so feed the detector SCN watermark here too (monotonic max;
+		 * skipping it would under-advance the lost-write expectation).  Skip
+		 * when the ACK matches the claimed slot: the slot-valid branch below
+		 * advances for the blocking (backend) sender, and advancing twice
+		 * would double-count the observability counter. */
+		if (ack->ack_status == 0
+			&& pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id)
+				   != ack->request_id) {
+			SCN pre_scn = GcsBlockInvalidateAckPayloadGetPageScn(ack);
+
+			if (SCN_VALID(pre_scn)) {
+				cluster_pcm_lock_pi_watermark_scn_advance(ack->tag, pre_scn);
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
+			}
+		}
 	}
 
 	LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);

@@ -2970,6 +2970,9 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(g_active_itl_transfer_count);
 	XNL_ROW(g_stamp_skipped_count);
 	XNL_ROW(g_drift_resolved_via_tt_count);
+	XNL_ROW(e2_bast_nudge_sent_count);
+	XNL_ROW(e2_bast_nudge_yield_count);
+	XNL_ROW(e2_bast_nudge_refused_count);
 #undef XNL_ROW
 }
 
