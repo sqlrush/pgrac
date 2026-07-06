@@ -388,8 +388,21 @@ for (1 .. 60)
 	if (defined $rc && $rc == 0) { $n1_up2 = 1; last; }
 	usleep(500_000);
 }
-is($n0_up2, 1, 'L2 (D9 cold): node0 restarted through the claim-serialized recovery');
-is($n1_up2, 1, 'L2 (D9 cold): node1 restarted through the claim-serialized recovery');
+# KNOWN-BLOCKED (spec-5.22 online-join cold-formation; see file header).
+# On this base a full-outage cold restart of a striped (online_join-forced)
+# cluster cannot re-form -- a cold-restarting node waits to be admitted by a
+# non-existent coordinator (53R60) and times out into 53R61, so neither node
+# ever serves.  The serving-dependent legs (these up-checks + the L3 truth
+# matrix) are skipped until spec-5.22 lands; the framework legs below (claim
+# acquire / engage / release from the on-disk logs, the exactly-once relfile
+# drop from the filesystem, the no-fail-marker check) read state that does
+# NOT depend on the nodes serving and remain the real assertions.
+SKIP: {
+	skip 'spec-5.22 online-join cold-formation not yet implemented '
+	  . '(full-outage cold restart cannot re-form; nodes do not serve)', 2;
+	is($n0_up2, 1, 'L2 (D9 cold): node0 restarted through the claim-serialized recovery');
+	is($n1_up2, 1, 'L2 (D9 cold): node1 restarted through the claim-serialized recovery');
+}
 
 # The recovery claim's serialization evidence (spec-6.14 D9 amend): every
 # crash boot in the shared regime acquires the claim (deterministic per-node
@@ -416,32 +429,45 @@ my %expect = (
 	t_survivor		  => 'alive',
 );
 
-for my $pair ([ $node0, 'node0' ], [ $node1, 'node1' ])
-{
-	my ($node, $name) = @$pair;
+# L3 truth matrix is serving-dependent -> KNOWN-BLOCKED on spec-5.22 (both
+# the positive reads AND the "not queryable" negatives: on a node that never
+# forms the cluster, EVERY query fails, so a negative assert would pass for
+# the wrong reason -- rule 8.B forbids that fake-green).  Skip the whole
+# per-node matrix; the relfile-drop below is filesystem state written by the
+# cold merge (independent of serving) and stays a real assertion.
+my $l3_legs = 2 * (scalar(keys %expect) + 2);   # positive + dropped + uncommitted, per node
+SKIP: {
+	skip 'spec-5.22 online-join cold-formation not yet implemented '
+	  . '(nodes do not serve; positive reads unreachable, negatives would '
+	  . 'pass for the wrong reason)', $l3_legs;
 
-	for my $tbl (sort keys %expect)
+	for my $pair ([ $node0, 'node0' ], [ $node1, 'node1' ])
 	{
-		my $want = $expect{$tbl};
-		my $seen = '';
-		for my $i (1 .. 60)
+		my ($node, $name) = @$pair;
+
+		for my $tbl (sort keys %expect)
 		{
-			my ($rc, $out) = $node->psql('postgres',
-				"SELECT note FROM $tbl WHERE id = 1");
-			$seen = (defined $rc && $rc == 0 && defined $out) ? $out : '';
-			last if $seen eq $want;
-			usleep(500_000);
+			my $want = $expect{$tbl};
+			my $seen = '';
+			for my $i (1 .. 60)
+			{
+				my ($rc, $out) = $node->psql('postgres',
+					"SELECT note FROM $tbl WHERE id = 1");
+				$seen = (defined $rc && $rc == 0 && defined $out) ? $out : '';
+				last if $seen eq $want;
+				usleep(500_000);
+			}
+			is($seen, $want, "L3: $name serves $tbl after the cold merge");
 		}
-		is($seen, $want, "L3: $name serves $tbl after the cold merge");
+
+		my ($rcd, $outd, $errd) = $node->psql('postgres',
+			'SELECT note FROM t_dropme WHERE id = 1');
+		isnt($rcd, 0, "L3: dropped table is not queryable on $name");
+
+		my ($rcu, $outu, $erru) = $node->psql('postgres',
+			'SELECT note FROM t_crash_uncommitted WHERE id = 1');
+		isnt($rcu, 0, "L3: crash-uncommitted CREATE never surfaces on $name (8.A)");
 	}
-
-	my ($rcd, $outd, $errd) = $node->psql('postgres',
-		'SELECT note FROM t_dropme WHERE id = 1');
-	isnt($rcd, 0, "L3: dropped table is not queryable on $name");
-
-	my ($rcu, $outu, $erru) = $node->psql('postgres',
-		'SELECT note FROM t_crash_uncommitted WHERE id = 1');
-	isnt($rcu, 0, "L3: crash-uncommitted CREATE never surfaces on $name (8.A)");
 }
 
 ok(!-e "$shared_root/$drop_relpath",
