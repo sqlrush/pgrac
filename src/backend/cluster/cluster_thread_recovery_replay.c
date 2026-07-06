@@ -68,10 +68,15 @@
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
 #include "storage/backendid.h"
+#include "storage/buf_internals.h" /* InitBufferTag (spec-6.12h D-h3c PI base) */
 #include "storage/bufpage.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "utils/memutils.h" /* MemoryContextAlloc for the touched-rel collector */
+
+#include "cluster/cluster_gcs_block.h"	 /* PI probe/snapshot/discard (spec-6.12h D-h3c) */
+#include "cluster/cluster_guc.h"		 /* cluster_past_image */
+#include "cluster/cluster_xnode_lever.h" /* h_pi_recovery_base_* counters */
 
 #include "cluster/cluster_remote_xact.h" /* online visibility divert (spec-4.11 3b-2) */
 #include "cluster/cluster_thread_recovery.h"
@@ -160,9 +165,30 @@ cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched)
  *	skipped) and false on a fail-closed BLOCKED outcome.  On true, *st is
  *	advanced; on false the caller stops the whole replay (8.A).  The page buffer
  *	is the caller's scratch (one read-modify-write at a time, no buffer pool).
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: spec-6.12h D-h3c — when this node kept a stamped Past Image
+ *	of the target block (D-h1/D-h3a), it is consumed as the recovery base
+ *	instead of the live storage page: the record is judged by the ship-SCN
+ *	boundary gate (lineage already in the PI bytes -> skip; first post-ship
+ *	record -> write PI+record back and DISCARD the resident PI, after which
+ *	the storage page carries the PI lineage with a dead-thread pd_lsn and
+ *	every later record rides the normal LSN-gated path below).
+ *	window_first_scn is the xl_scn of the FIRST record of this replay
+ *	window (any block); the PI is only eligible when
+ *	cluster_pi_recovery_gate(window_first_scn, ship_scn) == SKIP: per-thread
+ *	xl_scn is non-decreasing in LSN order, so a lineage window-head proves
+ *	every pre-window record is lineage too — i.e. the storage page's already-
+ *	reflected history is contained in the PI's frozen bytes and the write-
+ *	back can never regress shared storage.  Any doubt (no usable snapshot,
+ *	judge failure, unusable stamp, apply failure) abandons the PI (discard,
+ *	fail-safe) and falls back to the storage path — today's behaviour.
+ * Why: the PI shortcut recovers the block without an FPI in the window and
+ *	without depending on a stale storage base (the D-h3b differential t/349
+ *	proves the byte-for-byte equivalence of this rebuild).
  */
 static bool
-replay_one_block(XLogReaderState *reader, uint8 block_id, char *page,
+replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window_first_scn,
 				 ClusterThreadTouchedRels *touched, ClusterThreadReplayStats *st)
 {
 	RelFileLocator rl;
@@ -202,6 +228,56 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page,
 		return false;
 	}
 	/* cls == TARGET (OUT_OF_SCOPE was handled by gate 1 above). */
+
+	/*
+	 * PGRAC: spec-6.12h D-h3c — Past Image recovery base (see the function
+	 * header).  Probe is cheap (BufTable lookup); every uncertain outcome
+	 * discards the PI and falls through to the storage path below.
+	 */
+	if (cluster_past_image) {
+		BufferTag tag;
+		SCN ship_scn;
+
+		InitBufferTag(&tag, &rl, forknum, blocknum);
+		if (cluster_bufmgr_block_is_pi(tag)) {
+			if (cluster_bufmgr_snapshot_pi_block(tag, page, &ship_scn)
+				&& cluster_pi_recovery_gate(window_first_scn, ship_scn) == CLUSTER_PI_GATE_SKIP) {
+				XLogRecPtr pi_applied_lsn;
+				ClusterThreadApplyResult pi_res;
+
+				pi_res = cluster_pi_thread_apply_record_to_page(reader, block_id, page, ship_scn,
+																&pi_applied_lsn);
+				if (pi_res == CLUSTER_THREADAPPLY_DONE) {
+					/* Lineage: already in the PI bytes.  Nothing to write;
+					 * the PI stays armed for the first post-ship record. */
+					st->blocks_gated++;
+					return true;
+				}
+				if (pi_res == CLUSTER_THREADAPPLY_APPLIED) {
+					/* First post-ship record: the PI base is consumed.
+					 * Write PI+record back, then discard the resident PI —
+					 * storage now carries the PI lineage with a dead-thread
+					 * pd_lsn, so every later record of this block rides the
+					 * normal LSN-gated storage path. */
+					PageSetChecksumInplace((Page)page, blocknum);
+					smgrwrite(reln, forknum, blocknum, page, false);
+					touched_add(touched, &rl, forknum);
+					(void)cluster_bufmgr_discard_pi_block(tag);
+					cluster_lever_h_note_recovery_base(true);
+					st->blocks_applied++;
+					return true;
+				}
+				/* BLOCKED (unusable stamp / apply failure; NOOP impossible —
+				 * the tag matched): abandon the PI, storage path below. */
+			}
+			/* No usable snapshot, self-containment judge failed, or the
+			 * rebuild blocked: the PI cannot prove itself at-or-ahead of
+			 * storage for this window — discard it (fail-safe: only the
+			 * shortcut is lost) and take the storage path. */
+			(void)cluster_bufmgr_discard_pi_block(tag);
+			cluster_lever_h_note_recovery_base(false);
+		}
+	}
 
 	/*
 	 * Read the LIVE shared page and apply the record onto it.  The LSN-gate
@@ -278,6 +354,7 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 	bool aborted = false;
 	bool saw_straddle = false;
 	bool reached;
+	SCN window_first_scn = InvalidScn; /* spec-6.12h D-h3c: PI self-containment judge */
 
 	memset(&st, 0, sizeof(st));
 
@@ -319,9 +396,16 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 
 		st.records_scanned++;
 
+		/* PGRAC: spec-6.12h D-h3c — the window's first xl_scn anchors the PI
+		 * self-containment judge (per-thread xl_scn is non-decreasing in LSN
+		 * order, so it upper-bounds every pre-window record's stamp). */
+		if (st.records_scanned == 1)
+			window_first_scn = (SCN)XLogRecGetScn(reader);
+
 		max_id = XLogRecMaxBlockId(reader);
 		for (block_id = 0; block_id <= max_id; block_id++) {
-			if (!replay_one_block(reader, (uint8)block_id, pagebuf.data, touched, &st)) {
+			if (!replay_one_block(reader, (uint8)block_id, pagebuf.data, window_first_scn, touched,
+								  &st)) {
 				record_blocked = true;
 				break;
 			}

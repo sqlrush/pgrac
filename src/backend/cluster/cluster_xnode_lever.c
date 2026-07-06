@@ -105,6 +105,9 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_discard_miss_count, 0);
 		/* spec-6.12h D-h3a */
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_implicit_discard_count, 0);
+		/* spec-6.12h D-h3c */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_recovery_base_used_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->h_pi_recovery_base_fallback_count, 0);
 	}
 }
 
@@ -411,4 +414,17 @@ cluster_lever_h_note_pi_implicit_discard(void)
 	if (!lever_h_counting())
 		return;
 	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->h_pi_implicit_discard_count, 1);
+}
+
+/* spec-6.12h D-h3c — online thread recovery consumed a Past Image as the
+ * rebuild base (used), or abandoned a resident PI back to the storage
+ * path (judge / snapshot / rebuild failure — fail-safe). */
+void
+cluster_lever_h_note_recovery_base(bool used)
+{
+	if (!lever_h_counting())
+		return;
+	pg_atomic_fetch_add_u64(used ? &ClusterXnodeLeverCtl->h_pi_recovery_base_used_count
+								 : &ClusterXnodeLeverCtl->h_pi_recovery_base_fallback_count,
+							1);
 }
