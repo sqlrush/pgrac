@@ -155,6 +155,14 @@ extern void cluster_oid_lease_carve(Oid hw, uint32 lease_size,
 extern bool cluster_oid_authority_read(Oid *next_oid);
 
 /*
+ * cluster_oid_authority_present -- does an authority image (primary or .bak)
+ *	exist on disk, trustworthy or not?  Combined with a failed _read this
+ *	distinguishes "absent: first seed" from "present but corrupt: fail-closed"
+ *	(spec-6.14 §3.6).  Never ereports.
+ */
+extern bool cluster_oid_authority_present(void);
+
+/*
  * cluster_oid_authority_write -- torn-safe write of a new high-water (temp +
  *	fsync + .bak roll + durable_rename).  Caller must hold the OID X lock.
  *	PANICs on I/O failure (mirrors cluster_cf_authority_write).
@@ -167,7 +175,10 @@ extern void cluster_oid_authority_write(Oid next_oid);
  *	does not already exist (D2 seed node).  A join node whose authority already
  *	exists is a no-op (returns false).  Returns true when it seeded.  Idempotent
  *	for the normal seed-then-join bring-up (a designated seed node comes up
- *	first).  Never lowers an existing high-water.
+ *	first).  Never lowers an existing high-water.  NB: treats an unreadable
+ *	authority like an absent one -- callers that must not re-seed over a
+ *	corrupt-but-present authority guard with cluster_oid_authority_present()
+ *	first (the catalog bootstrap does; spec-6.14 §3.6 fail-closed).
  */
 extern bool cluster_oid_authority_seed_if_absent(Oid initial_next_oid);
 

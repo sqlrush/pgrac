@@ -32,6 +32,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/transam.h"			/* FirstNormalObjectId */
@@ -285,6 +286,28 @@ cluster_oid_authority_read(Oid *next_oid)
 	memcpy(&hdr, image, sizeof(hdr));
 	*next_oid = hdr.next_oid;
 	return true;
+}
+
+/*
+ * cluster_oid_authority_present -- does any authority image (primary or .bak)
+ * exist on disk at all, trustworthy or not?  Lets the catalog bootstrap
+ * distinguish "absent: genuine first seed" from "present but corrupt:
+ * fail-closed" (spec-6.14 §3.6) -- a corrupt authority must never be silently
+ * re-seeded from the checkpointed shared pg_control high-water, which can lag
+ * OID ranges the cluster already leased out.  Never ereports.
+ */
+bool
+cluster_oid_authority_present(void)
+{
+	char		primary_path[MAXPGPATH];
+	char		bak_path[MAXPGPATH];
+	struct stat st;
+
+	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_OID_AUTHORITY_REL_PATH)
+		|| !build_path(bak_path, sizeof(bak_path), CLUSTER_OID_AUTHORITY_BAK_REL_PATH))
+		return false;
+
+	return stat(primary_path, &st) == 0 || stat(bak_path, &st) == 0;
 }
 
 /*

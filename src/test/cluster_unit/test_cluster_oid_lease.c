@@ -379,10 +379,51 @@ UT_TEST(test_authority_seed_if_absent)
 	UT_ASSERT_EQ(got, 500000u);
 }
 
+UT_TEST(test_authority_present_distinguishes_corrupt_from_absent)
+{
+	char		path[MAXPGPATH];
+	char		junk[16];
+	Oid			got = 0;
+	int			fd;
+
+	setup_shared_dir();
+	unlink_authority();
+
+	/* absent: no image at all -> present=false (genuine first seed) */
+	UT_ASSERT_EQ(cluster_oid_authority_present(), false);
+
+	/* corrupt BOTH primary and .bak -> read fail-closed but present=true:
+	 * the distinction the catalog bootstrap FATALs on instead of silently
+	 * re-seeding over a damaged authority (spec-6.14 §3.6). */
+	cluster_oid_authority_write(111111);
+	cluster_oid_authority_write(222222);	/* rolls 111111 into .bak */
+
+	memset(junk, 0, sizeof(junk));
+	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_REL_PATH);
+	fd = open(path, O_WRONLY);
+	if (fd >= 0)
+	{
+		if (write(fd, junk, sizeof(junk)) < 0)
+			/* ignore: the asserts below catch a misbehaving read */ ;
+		close(fd);
+	}
+	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_BAK_REL_PATH);
+	fd = open(path, O_WRONLY);
+	if (fd >= 0)
+	{
+		if (write(fd, junk, sizeof(junk)) < 0)
+			/* ignore: the asserts below catch a misbehaving read */ ;
+		close(fd);
+	}
+
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), false);
+	UT_ASSERT_EQ(cluster_oid_authority_present(), true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_normalize_forces_reserved_up);
 	UT_RUN(test_carve_basic_block);
 	UT_RUN(test_carve_normalizes_reserved_hw);
@@ -394,6 +435,7 @@ main(void)
 	UT_RUN(test_authority_write_read_round_trip);
 	UT_RUN(test_authority_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_authority_seed_if_absent);
+	UT_RUN(test_authority_present_distinguishes_corrupt_from_absent);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

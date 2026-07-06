@@ -20,6 +20,15 @@
 #          invalidation; both nodes adopt the new relfilenumber.
 #      R3  the write path is healthy after both crashes: a plain
 #          VACUUM FULL pg_class round-trips cluster-wide.
+#      R4  (B-L10) OID lease crash non-reissue: a kill mid-lease loses the
+#          lease's unconsumed tail but never reissues -- every OID handed
+#          out after the cold restart is strictly above everything issued
+#          before it, and the durable authority high-water only advances.
+#      R5  (B-L3) authority corruption is fail-closed, not re-seeded: with
+#          BOTH the OID authority and its .bak corrupted, boot dies FATAL
+#          ("present but corrupt") instead of silently re-seeding from the
+#          checkpointed shared pg_control high-water (which can lag leased
+#          ranges and reissue them).
 #
 #    Bring-up mirrors t/339 (shared catalog + per-thread WAL layout so the
 #    shared-regime merge claim engages on crash recovery).  Single-writer
@@ -50,7 +59,7 @@
 #
 # NOTES
 #    pgrac-original file.
-#    Spec: spec-6.14-shared-catalog-single-authority.md (D5, §3.2; B-L7/L7b)
+#    Spec: spec-6.14-shared-catalog-single-authority.md (D5, §3.2; B-L3/L7/L7b/L10)
 #
 #-------------------------------------------------------------------------
 
@@ -415,7 +424,79 @@ isnt($fn_r3, $fn_r2, 'R3: a plain mapped rewrite works after the crashes');
 is(authority_filenode(1259), $fn_r3,
 	'R3: the authority committed image maps pg_class to the plain-rewrite file');
 
+# oid_authority_hw -- the durable OID authority high-water (header field
+# next_oid), read straight from the shared file like authority_filenode.
+sub oid_authority_hw
+{
+	my $path = "$shared_root/global/pgrac_oid_authority";
+
+	open my $fh, '<:raw', $path or return '';
+	local $/;
+	my $img = <$fh>;
+	close $fh;
+
+	my ($magic, $version, $next) = unpack('VVV', $img);
+	return '' if !defined $magic || $magic != 0x0140D617;
+	return $next;
+}
+
+# ----------
+# R4 (B-L10): OID lease crash non-reissue.  The running lease carved
+# [hw, hw+lease) and durably bumped the authority to hw+lease BEFORE any
+# OID from the block was consumed, so a crash loses the unconsumed tail of
+# the lease but can never reissue: the cold restart re-leases at the
+# durable high-water, strictly above every pre-crash OID.
+# ----------
+$node0->safe_psql('postgres',
+	'DO $$ BEGIN FOR i IN 1..8 LOOP '
+	. "EXECUTE format('CREATE TABLE oid_ls_a_%s (id int)', i); "
+	. 'END LOOP; END $$;');
+my $max_a = $node0->safe_psql('postgres',
+	"SELECT max(oid) FROM pg_class WHERE relname LIKE 'oid_ls_a_%'");
+my $hw_a = oid_authority_hw();
+cmp_ok($hw_a, '>', $max_a,
+	'R4: the durable high-water sits above every issued OID');
+owner_settle();
+
+# Crash mid-lease (no shutdown checkpoint on either node).
+$node0->stop('immediate');
+ok(cold_restart_both('R4'), 'R4: cluster cold-restarted after the mid-lease crash');
+
+$node0->safe_psql('postgres',
+	'DO $$ BEGIN FOR i IN 1..8 LOOP '
+	. "EXECUTE format('CREATE TABLE oid_ls_b_%s (id int)', i); "
+	. 'END LOOP; END $$;');
+my $min_b = $node0->safe_psql('postgres',
+	"SELECT min(oid) FROM pg_class WHERE relname LIKE 'oid_ls_b_%'");
+my $hw_b = oid_authority_hw();
+cmp_ok($min_b, '>', $max_a,
+	'R4: every post-crash OID is above every pre-crash OID (no reissue)');
+cmp_ok($hw_b, '>', $hw_a, 'R4: the authority high-water only advanced');
+
+# ----------
+# R5 (B-L3): a present-but-corrupt OID authority is FATAL at boot, never
+# silently re-seeded (the checkpointed shared pg_control high-water can lag
+# ranges already leased out).  Corrupt BOTH the primary and the .bak, then
+# prove the boot refuses AND left the corpses alone.
+# ----------
 $node1->stop;
 $node0->stop;
+
+for my $f ('pgrac_oid_authority', 'pgrac_oid_authority.bak')
+{
+	open my $fh, '>:raw', "$shared_root/global/$f"
+		or die "corrupt $f: $!";
+	print $fh "\0" x 16;		# short + bad magic: INVALID on every axis
+	close $fh;
+}
+
+my $r5ret = $node0->start(fail_ok => 1);
+is($r5ret, 0, 'R5: boot with a doubly-corrupt OID authority fails');
+
+my $r5log = PostgreSQL::Test::Utils::slurp_file($node0->logfile);
+like($r5log, qr/shared OID authority is present but corrupt/,
+	'R5: the failure is the designed fail-closed FATAL, not a re-seed');
+is(-s "$shared_root/global/pgrac_oid_authority", 16,
+	'R5: the corrupt authority was not rewritten (no silent re-seed)');
 
 done_testing();

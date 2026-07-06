@@ -84,7 +84,27 @@ cluster_catalog_startup_prepare(void)
 	 * a join node whose authority already exists is a no-op.  The high-water is
 	 * never lowered, so a fresh cluster starts allocating cluster-wide OIDs
 	 * from the same floor every node observes.
+	 *
+	 * A present-but-unreadable authority is FATAL, not a re-seed (§3.6
+	 * fail-closed): the checkpointed shared pg_control high-water can lag OID
+	 * ranges the cluster already leased out, so silently re-seeding from it
+	 * could hand the same OID range to two nodes.
 	 */
+	{
+		Oid			oid_hw;
+
+		if (!cluster_oid_authority_read(&oid_hw) &&
+			cluster_oid_authority_present())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					 errmsg("shared OID authority is present but corrupt"),
+					 errdetail("Neither \"%s/global/pgrac_oid_authority\" nor its "
+							   ".bak fallback passes validation.",
+							   cluster_shared_data_dir),
+					 errhint("Restore the shared OID authority files from a backup "
+							 "of the shared tree; do not delete them (re-seeding "
+							 "from a stale high-water can reissue leased OIDs).")));
+	}
 	if (cluster_oid_authority_seed_if_absent(cf.checkPointCopy.nextOid))
 		elog(LOG, "cluster shared_catalog: seeded OID authority high-water at %u",
 			 cf.checkPointCopy.nextOid);
