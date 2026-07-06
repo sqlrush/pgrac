@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '76' : '75'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020
+  my $expected_region_count = $has_visibility_inject ? '77' : '76'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a)
 
 
 # ----------
@@ -157,8 +157,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '150',
-   'L11 pg_stat_cluster_injections is 141 (spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+   '154',
+   'L11 pg_stat_cluster_injections is 154 (spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 xid herding/hard-limit; spec-6.12 waves a/b/i +3; full breakdown in t/015)');
 
 
 # ----------
@@ -168,8 +168,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '53',
-   'L12 pg_cluster_state has 53 categories (spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever)');
+   '54',
+   'L12 pg_cluster_state has 54 categories (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '53', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (53 categories; spec-6.2 adds smart_fusion)');
+is($smoke_categories, '54', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + xid_stripe categories (54 categories; spec-6.15 adds xid_stripe)');
 
 
 # ----------

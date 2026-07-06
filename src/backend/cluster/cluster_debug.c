@@ -2980,6 +2980,7 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(h_pi_discard_notify_count);
 	XNL_ROW(h_pi_discarded_count);
 	XNL_ROW(h_pi_discard_miss_count);
+	XNL_ROW(h_pi_implicit_discard_count);
 #undef XNL_ROW
 }
 

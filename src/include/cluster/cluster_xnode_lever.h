@@ -134,6 +134,12 @@ typedef struct ClusterXnodeLeverShared {
 	pg_atomic_uint64 h_pi_discard_miss_count;	/* directive found no droppable
 												 * PI (already gone / pinned /
 												 * live-S over-approximation) */
+
+	/* ---- wave h D-h3a: PI ship-SCN shadow (recovery boundary) ---- */
+	pg_atomic_uint64 h_pi_implicit_discard_count; /* a read IO started over a
+												   * PI: D-h1 implicit discard
+												   * observed at the D-h3a
+												   * StartBufferIO reset seam */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -200,5 +206,11 @@ extern void cluster_lever_h_note_pi_ineligible(void);
 extern void cluster_lever_h_note_write_note(bool overflowed);
 extern void cluster_lever_h_note_discard_notify(void);
 extern void cluster_lever_h_note_discard_result(bool discarded);
+
+/*
+ * Wave-h D-h3a counter (PI ship-SCN shadow; ticked from the StartBufferIO
+ * PI-label reset seam when a read IO implicitly discards a Past Image).
+ */
+extern void cluster_lever_h_note_pi_implicit_discard(void);
 
 #endif /* CLUSTER_XNODE_LEVER_H */
