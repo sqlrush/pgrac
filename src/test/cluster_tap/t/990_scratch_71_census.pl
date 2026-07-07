@@ -1,3 +1,4 @@
+#-------------------------------------------------------------------------
 # spec-7.1 D0 scratch census driver (NOT part of the test schedule; run by hand).
 #
 #   53R97 per-leg census over S3-shaped (100% write) and S5-shaped (99/1)
@@ -9,6 +10,15 @@
 #   from each node's log.
 #
 # Spec: spec-7.1-cross-instance-positive-interread.md (D0-①)
+
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# IDENTIFICATION
+#    src/test/cluster_tap/990_scratch_71_census.pl
+#-------------------------------------------------------------------------
 
 use strict;
 use warnings FATAL => 'all';

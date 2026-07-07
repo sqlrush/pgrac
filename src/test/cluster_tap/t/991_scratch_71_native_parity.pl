@@ -1,3 +1,4 @@
+#-------------------------------------------------------------------------
 # spec-7.1 L6 native-parity harness (scratch skeleton; promoted to a real
 # t/NNN at ship time -- number assigned then, L464).
 #
@@ -18,6 +19,15 @@
 #   of what D1-D4 must close before this harness can gate the ship.
 #
 # Spec: spec-7.1-cross-instance-positive-interread.md (D6 L6)
+
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# IDENTIFICATION
+#    src/test/cluster_tap/991_scratch_71_native_parity.pl
+#-------------------------------------------------------------------------
 
 use strict;
 use warnings FATAL => 'all';
