@@ -71,9 +71,12 @@ sub new_quad
 {
 	my ($class, $cluster_name, %opts) = @_;
 
-	# Allocate 8 distinct free ports (4 PG + 4 IC).
+	# Allocate 12 distinct free ports (4 PG + 4 IC + 4 DATA).
+	# spec-7.2 D2: DATA-plane ports are allocator-provided, never
+	# offset-derived (r1-F2).
 	my @pg_ports;
 	my @ic_ports;
+	my @data_ports;
 	for (0 .. $NODES - 1)
 	{
 		push @pg_ports, PostgreSQL::Test::Cluster::get_free_port();
@@ -81,6 +84,10 @@ sub new_quad
 	for (0 .. $NODES - 1)
 	{
 		push @ic_ports, PostgreSQL::Test::Cluster::get_free_port();
+	}
+	for (0 .. $NODES - 1)
+	{
+		push @data_ports, PostgreSQL::Test::Cluster::get_free_port();
 	}
 
 	my @nodes;
@@ -194,8 +201,9 @@ sub new_quad
 	my $peers_block = "";
 	for my $i (0 .. $NODES - 1)
 	{
-		$peers_block .=
-		  "[node.$i]\ninterconnect_addr = 127.0.0.1:$ic_ports[$i]\n\n";
+		$peers_block .= "[node.$i]\n"
+		  . "interconnect_addr = 127.0.0.1:$ic_ports[$i]\n"
+		  . "data_addr = 127.0.0.1:$data_ports[$i]\n\n";
 	}
 
 	my $pgrac_conf_body = <<EOC;
@@ -216,6 +224,7 @@ EOC
 		cluster_name      => $cluster_name,
 		pg_ports          => \@pg_ports,
 		ic_ports          => \@ic_ports,
+		data_ports        => \@data_ports,
 		voting_disk_paths => \@voting_disk_paths,
 		wal_threads_root  => $wal_threads_root,
 		shared_data_root  => $shared_data_root,
