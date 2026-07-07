@@ -778,17 +778,24 @@ LmsMain(void)
 			 * quiet via the same registry probe);  the DATA outbound
 			 * ring drains here either way (empty before the flip).
 			 * D5 fence linkage: while the write-fence is enforcing and
-			 * writes are disallowed, the DATA plane sends nothing —
-			 * block images must not leave a fenced node.  Thaw wakes
-			 * the latch and the held frames drain (pure-read probe,
-			 * no-throw, per the write_fence_allowed contract). */
-			if (!(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
-				if (cluster_gcs_block_family_on_data_plane()) {
-					cluster_lms_cr_ship_ready();
-					cluster_gcs_block_pi_discard_drain();
-				}
-				(void)cluster_lms_outbound_drain_send();
+			 * writes are disallowed, the IMAGE-BEARING legs (READY
+			 * ship + PI notes) send nothing — block images must not
+			 * leave a fenced node.  The outbound ring is NOT fence
+			 * gated: it carries only backend solicitations (REQUEST /
+			 * FORWARD / CR + undo fetches — the master's image REPLY
+			 * is sent from the dispatch context, never staged here),
+			 * and a fenced node's reads must keep flowing exactly as
+			 * they do on the ungated CONTROL ring pre-flip;  gating
+			 * them wedges post-crash rejoin behind its own catalog
+			 * reads.  Thaw wakes the latch and the held image legs
+			 * resume (pure-read probe, no-throw, per the
+			 * write_fence_allowed contract). */
+			if (cluster_gcs_block_family_on_data_plane()
+				&& !(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
+				cluster_lms_cr_ship_ready();
+				cluster_gcs_block_pi_discard_drain();
 			}
+			(void)cluster_lms_outbound_drain_send();
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
