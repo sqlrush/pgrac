@@ -504,12 +504,30 @@ my $node1 = $pair->node1;
 	# fetch or verdict: which wire leg serves depends on whether the ref's
 	# segment id (the CURRENT slot owner's namespace) happens to exist on
 	# the derived origin — both are cross-node proof, either counts.
-	cmp_ok(state_val($node1, 'cr', 'rtvis_undo_fetch_wire_count')
-			 + state_val($node1, 'cr', 'rtvis_verdict_wire_count'), '>', $wire1_0,
-		'L2b-xii node1 rode the wire for node0 proofs (fetch or verdict)');
-	cmp_ok(state_val($node0, 'cr', 'rtvis_undo_fetch_wire_count')
-			 + state_val($node0, 'cr', 'rtvis_verdict_wire_count'), '>', $wire0_0,
-		'L2b-xiii node0 rode the wire for node1 proofs (fetch or verdict)');
+	#
+	# Multi-xmax alias floor amendment: the bidirectional-update workload
+	# organically composes cross-node multixacts (update-chain locking), and
+	# the floor refuses such tuples BEFORE the per-xid resolve — whether a
+	# node's reads ever reach a wire-riding recycled ref now depends on scan
+	# order.  Either outcome is the pinned fail-closed posture (L2b-vii
+	# above is the no-silent-wrong tooth): the wire moved, or reads refused
+	# at the multi floor first.
+	{
+		my $w1 = state_val($node1, 'cr', 'rtvis_undo_fetch_wire_count')
+		  + state_val($node1, 'cr', 'rtvis_verdict_wire_count') > $wire1_0 ? 1 : 0;
+		my $f1 = log_count($node1, 'cannot be attributed to an origin node')
+		  + log_count($node1, 'TT status unknown for deleting xmax');
+		ok($w1 || $f1 > 0,
+			"L2b-xii node1 rode the wire OR refused at the multi floor "
+			  . "(wire_moved=$w1 floor_refusals=$f1)");
+		my $w0 = state_val($node0, 'cr', 'rtvis_undo_fetch_wire_count')
+		  + state_val($node0, 'cr', 'rtvis_verdict_wire_count') > $wire0_0 ? 1 : 0;
+		my $f0 = log_count($node0, 'cannot be attributed to an origin node')
+		  + log_count($node0, 'TT status unknown for deleting xmax');
+		ok($w0 || $f0 > 0,
+			"L2b-xiii node0 rode the wire OR refused at the multi floor "
+			  . "(wire_moved=$w0 floor_refusals=$f0)");
+	}
 
 	is(state_val($node0, 'cr', 'rtvis_underivable_failclosed_count'), 0,
 		'L2b-xiv node0: no underivable refusals ever (spec-6.15 D4)');

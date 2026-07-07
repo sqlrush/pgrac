@@ -1523,28 +1523,21 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		return 1; /* a lock-only xmax never deletes the row */
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
-		uint16 marker_origin = 0;
-
 		/*
-		 * A multixact id is node-local; its members come from the LOCAL
-		 * pg_multixact, which aliases for a FOREIGN multi (AD-012 例外 9).
-		 *
-		 * Today a foreign multi cannot REACH this gate: an in-window foreign
-		 * multi FATALs the merge (RM_MULTIXACT divert), and a pre-window
-		 * foreign tuple is rejected upstream at the xmin resolve -- its
-		 * creator committed before the merge window, so it has no materialized
-		 * durable TT slot and resolves INDOUBT -> 53R97 BEFORE this xmax test.
-		 * The marker helper below cannot itself distinguish origin (spec-3.6
-		 * D7b stamps marker_origin = self), so it is NOT a real guard -- the
-		 * upstream fail-closed is.  XXX spec-4.6/4.7: once warm cross-instance
-		 * reads make a pre-window foreign tuple legitimately visible, this gate
-		 * MUST gain an on-page origin marker and fail closed on a foreign multi
-		 * here directly (the local decode below would otherwise alias).
+		 * PGRAC multi-xmax alias floor: a multixact id is node-local and its
+		 * members come from the LOCAL pg_multixact, which ALIASES for a
+		 * foreign multi once the local counter passes that id (AD-012 例外
+		 * 9; the spec-7.1 census probe-F silent false-visible).  The spec-3.6
+		 * D7b page marker cannot distinguish the origin (it stamps the
+		 * reader's own id), and warm cross-instance reads (spec-6.12i/6.15)
+		 * make a foreign tuple with a multi xmax legitimately reach this
+		 * gate -- the exact hazard the pre-floor XXX note here predicted.
+		 * Updater-bearing multis therefore fail closed in peer mode until
+		 * spec-7.1 D3 makes the origin derivable; the caller's 53R97 ERROR
+		 * is retryable.  (Lock-only multis returned 1 above: a lock never
+		 * deletes the row, no member decode is needed.)
 		 */
-		if (cluster_itl_find_multixact_origin_by_xmax(BufferGetPage(buffer),
-													  (MultiXactId)HeapTupleHeaderGetRawXmax(tuple),
-													  &marker_origin)
-			&& (int32)marker_origin != cluster_node_id)
+		if (cluster_peer_mode_enabled())
 			return -1;
 		xmax = HeapTupleGetUpdateXid(tuple);
 	} else
@@ -1936,11 +1929,36 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		 *   IN_PROGRESS authoritative state in resolve_visibility ->
 		 *   VISIBLE (per OBS-1 truth table:  uncommitted Update/
 		 *   NoKeyUpdate not yet hides tuple).  UNKNOWN -> 53R9C.
+		 *
+		 *   PGRAC multi-xmax alias floor: step 5's "marker says local ->
+		 *   PG-native" is NOT safe -- the D7b marker stamps the READER's
+		 *   own id, so it says "local" for every multi, and the native
+		 *   decode of a foreign multi resolves against unrelated LOCAL
+		 *   members once the local counter passes that id (silent
+		 *   false-visible; spec-7.1 census probe F).  Until the origin is
+		 *   derivable, an updater-bearing multi in peer mode fails closed
+		 *   HERE, before the native fall-through.  Lock-only multis never
+		 *   cut visibility (native returns visible without a member
+		 *   decode) and an XMAX_INVALID-hinted multi is never decoded;
+		 *   both stay readable.
+		 *   Spec: spec-7.1-cross-instance-positive-interread.md (D3 floor)
 		 */
 		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0) {
 			TransactionId raw_xmax_multi = HeapTupleHeaderGetRawXmax(tuple);
 			Page page = BufferGetPage(buffer);
 			uint16 marker_origin = 0;
+
+			if (MultiXactIdIsValid((MultiXactId)raw_xmax_multi)
+				&& !(tuple->t_infomask & HEAP_XMAX_INVALID)
+				&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
+				&& cluster_peer_mode_enabled())
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+						 errmsg("cluster multixact %u cannot be attributed to an origin node",
+								(unsigned)raw_xmax_multi),
+						 errhint("Multixact ids are node-local and this tuple's deleting "
+								 "multixact cannot be proven local; cross-node multixact "
+								 "resolution is not implemented yet. Retry the transaction.")));
 
 			if (MultiXactIdIsValid((MultiXactId)raw_xmax_multi)
 				&& cluster_itl_find_multixact_origin_by_xmax(page, (MultiXactId)raw_xmax_multi,
