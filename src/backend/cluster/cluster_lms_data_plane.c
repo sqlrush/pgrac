@@ -56,6 +56,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_inject.h" /* PGRAC: spec-7.2 D6 injection points */
 #include "cluster/cluster_lms.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -228,6 +229,7 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	 * sender gate in tier1_send_bytes is the structural backstop for
 	 * the window between the bump and this tick.
 	 */
+	CLUSTER_INJECTION_POINT("cluster-lms-conn-reset");
 	{
 		static uint64 dp_last_epoch = 0;
 		static bool dp_epoch_seen = false;
@@ -236,7 +238,8 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		if (!dp_epoch_seen) {
 			dp_last_epoch = cur_epoch;
 			dp_epoch_seen = true;
-		} else if (cur_epoch != dp_last_epoch) {
+		} else if (cur_epoch != dp_last_epoch
+				   || cluster_injection_should_skip("cluster-lms-conn-reset")) {
 			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 				if (dp_track[pi].fd >= 0) {
 					cluster_ic_tier1_close_peer(pi, "data-plane epoch bump reset");
@@ -304,7 +307,21 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	if (timeout_ms < 0)
 		timeout_ms = 0;
 
-	n_events = WaitEventSetWait(dp_wes, timeout_ms, ev, lengthof(ev), WAIT_EVENT_PG_SLEEP);
+	{
+		/* PGRAC: spec-7.2 D6 — wait identity:  SEND while any peer has a
+		 * backpressured partial frame (we are waiting for WRITEABLE
+		 * drainage), RECV otherwise. */
+		uint32 wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_RECV;
+
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+			if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
+				&& cluster_ic_tier1_pending_outbound(pi)) {
+				wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_SEND;
+				break;
+			}
+		}
+		n_events = WaitEventSetWait(dp_wes, timeout_ms, ev, lengthof(ev), wait_kind);
+	}
 
 	for (i = 0; i < n_events; i++) {
 		intptr_t tag = (intptr_t)ev[i].user_data;
@@ -370,6 +387,7 @@ cluster_lms_data_plane_tick(long timeout_ms)
 				}
 			} else if (dp_track[peer].substate == LMS_DP_CONNECTED
 					   && (ev[i].events & WL_SOCKET_READABLE)) {
+				CLUSTER_INJECTION_POINT("cluster-lms-data-dispatch");
 				/* Generic envelope pump: recv + verify + dispatch.  No
 				 * DATA msg_type is registered before the D3/D4 flip, so
 				 * pre-flip traffic is limited to HELLO/errors;  post-

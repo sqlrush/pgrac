@@ -57,8 +57,8 @@ $node->start;
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'158',
-	'pg_stat_cluster_injections returns 158 rows (spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.18 +7 cluster-node-remove-*; spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 cluster-clean-leave-survivor-suppress-preflight-ack; spec-5.53 +1 cluster-cr-skip-epoch-bump; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.8 +1 cluster-lmd-force-partial-round; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'160',
+	'pg_stat_cluster_injections returns 160 rows (spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.18 +7 cluster-node-remove-*; spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 cluster-clean-leave-survivor-suppress-preflight-ack; spec-5.53 +1 cluster-cr-skip-epoch-bump; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.8 +1 cluster-lmd-force-partial-round; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 
 # ----------
@@ -189,8 +189,8 @@ ok($hits >= 1,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'118',
-	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+	'120',
+	'pg_stat_cluster_wait_events returns 120 rows (spec-7.2 LMS data-plane waits)');
 
 # ----------
 # Test 11 (Hardening v1.0.1 / codex review P2-2): SQL SRF rejects

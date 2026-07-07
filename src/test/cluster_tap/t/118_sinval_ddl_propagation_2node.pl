@@ -81,8 +81,8 @@ is($pair->node0->safe_psql('postgres', 'SHOW cluster.sinval_ack_wait_slots'),
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'118',
-	'L4 pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+	'120',
+	'L4 pg_stat_cluster_wait_events returns 120 rows (spec-6.13 RDMA wait surface)');
 
 # ============================================================
 # L5: 3 NEW ack wait events visible.
