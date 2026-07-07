@@ -695,6 +695,11 @@ LmsMain(void)
 	cluster_lms_bump_restart_generation_at_main_entry();
 	(void)cluster_ges_dedup_drop_stale_entries();
 
+	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
+	 * mesh (false = plane off for this node;  the loop below then keeps
+	 * the historic latch-only wait and park-serve keeps working). */
+	(void)cluster_lms_data_plane_startup();
+
 	/* Transition to READY. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	cluster_lms_state->ready_at = GetCurrentTimestamp();
@@ -734,10 +739,21 @@ LmsMain(void)
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
 		cluster_lms_cr_drain();
 
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
-		ResetLatch(MyLatch);
+		/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
+		 * the data-plane tick (WaitEventSet: DATA sockets + MyLatch, latch
+		 * reset inside);  the historic plain WaitLatch stays the fallback
+		 * when the plane is off. */
+		if (cluster_lms_data_plane_enabled())
+			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+		else {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+			ResetLatch(MyLatch);
+		}
 	}
+
+	/* PGRAC: spec-7.2 D2 — close DATA-plane fds before teardown. */
+	cluster_lms_data_plane_shutdown();
 
 	/* PGRAC: spec-6.12b — retract the wake latch before teardown. */
 	cluster_cr_server_publish_lms_latch(NULL);

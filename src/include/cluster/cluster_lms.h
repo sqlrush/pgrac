@@ -295,6 +295,19 @@ extern void cluster_lms_request_shutdown(void);
 extern void LmsMain(void) pg_attribute_noreturn();
 
 /*
+ * PGRAC: spec-7.2 D2 — LMS-owned DATA-plane interconnect loop
+ * (cluster_lms_data_plane.c).  startup binds the data_addr listener and
+ * aims this process's tier1 state at the DATA plane (false = plane off:
+ * no data_addr / cluster off / stub tier);  tick runs one management +
+ * WaitEventSet round (sockets + MyLatch — replaces the historic plain
+ * WaitLatch when the plane is live);  shutdown closes owned fds.
+ */
+extern bool cluster_lms_data_plane_startup(void);
+extern bool cluster_lms_data_plane_enabled(void);
+extern void cluster_lms_data_plane_tick(long timeout_ms);
+extern void cluster_lms_data_plane_shutdown(void);
+
+/*
  * Read-only accessors for SQL view + diagnostics.
  */
 extern ClusterLmsState cluster_lms_get_state(void);
