@@ -73,6 +73,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h"
+#include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D2 HELLO conn_epoch */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_reset_peer (spec-2.4) */
 #include "cluster/cluster_ic.h"
@@ -117,6 +118,22 @@ typedef struct ClusterICTier1Shmem {
 
 #define PGRAC_IC_TIER1_SHMEM_MAGIC ((uint32)0x54494331U) /* "TIC1" */
 
+/*
+ * PGRAC: spec-7.2 D2 — per-plane shmem instances inside the single
+ * "pgrac cluster_ic_tier1" region ([0] = CONTROL, [1] = DATA).
+ *
+ *	Tier1Shmem stays the working alias and points at THIS process's
+ *	plane instance: process-local tier1 state (fd arrays, buffers,
+ *	HELLO state machines) is naturally per-process, so the plane a
+ *	process owns is implied by the process — LMON = CONTROL (the
+ *	default), LMS = DATA (set via cluster_ic_tier1_set_my_plane at
+ *	LmsMain entry).  Every existing tier1 function keeps reading
+ *	Tier1Shmem unchanged and lands on its own plane's peers[] /
+ *	listener metadata / CONNECTED gate.  Cross-plane observers (SQL
+ *	views) address Tier1ShmemByPlane[] explicitly.
+ */
+static ClusterICTier1Shmem *Tier1ShmemByPlane[CLUSTER_IC_PLANE_N] = { NULL, NULL };
+static ClusterICPlane tier1_my_plane = CLUSTER_IC_PLANE_CONTROL;
 static ClusterICTier1Shmem *Tier1Shmem = NULL;
 
 /*
@@ -364,6 +381,7 @@ static const char *
 peer_addr(int32 peer_id)
 {
 	const ClusterNodeInfo *n;
+	const char *addr;
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return NULL;
@@ -372,12 +390,24 @@ peer_addr(int32 peer_id)
 	if (n == NULL)
 		return NULL;
 
+	/*
+	 * PGRAC: spec-7.2 D2 — plane-selected peer address.  The DATA plane
+	 * connects to the peer's declared data_addr;  a peer without one
+	 * offers no DATA plane and is unreachable on it (NULL, no connect
+	 * attempts — never fall back to the CONTROL address:  r1-F2 no
+	 * port guessing, and mixing planes on one socket breaks the
+	 * per-plane single-stream ordering).
+	 */
+	addr = (tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? n->data_addr : n->interconnect_addr;
+	if (addr[0] == '\0')
+		return NULL;
+
 	if (Tier1Shmem != NULL && Tier1Shmem->peers[peer_id].interconnect_addr[0] == '\0') {
-		strlcpy(Tier1Shmem->peers[peer_id].interconnect_addr, n->interconnect_addr,
+		strlcpy(Tier1Shmem->peers[peer_id].interconnect_addr, addr,
 				sizeof(Tier1Shmem->peers[peer_id].interconnect_addr));
 		Tier1Shmem->peers[peer_id].node_id = peer_id;
 	}
-	return n->interconnect_addr;
+	return addr;
 }
 
 
@@ -388,51 +418,81 @@ peer_addr(int32 peer_id)
 static Size
 tier1_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterICTier1Shmem));
+	/* PGRAC: spec-7.2 D2 — one instance per plane (CONTROL + DATA). */
+	return CLUSTER_IC_PLANE_N * MAXALIGN(sizeof(ClusterICTier1Shmem));
 }
 
 static void
 tier1_shmem_init(void)
 {
 	bool found;
+	char *base;
+	int plane;
 
-	Tier1Shmem = (ClusterICTier1Shmem *)ShmemInitStruct("pgrac cluster_ic_tier1",
-														tier1_shmem_size(), &found);
+	base = (char *)ShmemInitStruct("pgrac cluster_ic_tier1", tier1_shmem_size(), &found);
+
+	/* PGRAC: spec-7.2 D2 — carve one instance per plane;  the working
+	 * alias follows this process's plane (CONTROL unless
+	 * cluster_ic_tier1_set_my_plane re-aims it, i.e. in LMS). */
+	for (plane = 0; plane < CLUSTER_IC_PLANE_N; plane++)
+		Tier1ShmemByPlane[plane]
+			= (ClusterICTier1Shmem *)(base + plane * MAXALIGN(sizeof(ClusterICTier1Shmem)));
+	Tier1Shmem = Tier1ShmemByPlane[tier1_my_plane];
 
 	if (!found) {
-		int i;
+		memset(base, 0, tier1_shmem_size());
 
-		memset(Tier1Shmem, 0, tier1_shmem_size());
-		Tier1Shmem->magic = PGRAC_IC_TIER1_SHMEM_MAGIC;
-		Tier1Shmem->listener_port = -1;
-		Tier1Shmem->listener_pid = 0;
-		Tier1Shmem->listener_incarnation = 0;
+		for (plane = 0; plane < CLUSTER_IC_PLANE_N; plane++) {
+			ClusterICTier1Shmem *s = Tier1ShmemByPlane[plane];
+			int i;
 
-		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			Tier1Shmem->peers[i].node_id = -1;
-			Tier1Shmem->peers[i].state = (int32)CLUSTER_IC_PEER_DOWN;
-			Tier1Shmem->peers[i].last_errno = 0;
-			Tier1Shmem->peers[i].last_connect_at = 0;
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].heartbeat_send_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].heartbeat_recv_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].msg_send_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].msg_recv_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].bytes_send, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].bytes_recv, 0);
-			/* spec-2.4 D10 NEW counters */
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].stale_epoch_drop_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].lamport_observe_advance_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].chunk_reassembly_timeout_count, 0);
-			pg_atomic_init_u32(&Tier1Shmem->peers[i].chunk_reassembly_active, 0);
-			/* spec-2.29 D20 + D18b: hostile-spoof + epoch piggyback counters. */
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].unreasonable_epoch_jump_count, 0);
-			pg_atomic_init_u64(&Tier1Shmem->peers[i].epoch_observe_advance_count, 0);
-			/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
-			pg_atomic_init_u32(&Tier1Shmem->peers[i].close_requested, 0);
+			s->magic = PGRAC_IC_TIER1_SHMEM_MAGIC;
+			s->listener_port = -1;
+			s->listener_pid = 0;
+			s->listener_incarnation = 0;
+
+			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+				s->peers[i].node_id = -1;
+				s->peers[i].state = (int32)CLUSTER_IC_PEER_DOWN;
+				s->peers[i].last_errno = 0;
+				s->peers[i].last_connect_at = 0;
+				pg_atomic_init_u64(&s->peers[i].heartbeat_send_count, 0);
+				pg_atomic_init_u64(&s->peers[i].heartbeat_recv_count, 0);
+				pg_atomic_init_u64(&s->peers[i].msg_send_count, 0);
+				pg_atomic_init_u64(&s->peers[i].msg_recv_count, 0);
+				pg_atomic_init_u64(&s->peers[i].bytes_send, 0);
+				pg_atomic_init_u64(&s->peers[i].bytes_recv, 0);
+				/* spec-2.4 D10 NEW counters */
+				pg_atomic_init_u64(&s->peers[i].stale_epoch_drop_count, 0);
+				pg_atomic_init_u64(&s->peers[i].lamport_observe_advance_count, 0);
+				pg_atomic_init_u64(&s->peers[i].chunk_reassembly_timeout_count, 0);
+				pg_atomic_init_u32(&s->peers[i].chunk_reassembly_active, 0);
+				/* spec-2.29 D20 + D18b: hostile-spoof + epoch piggyback counters. */
+				pg_atomic_init_u64(&s->peers[i].unreasonable_epoch_jump_count, 0);
+				pg_atomic_init_u64(&s->peers[i].epoch_observe_advance_count, 0);
+				/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
+				pg_atomic_init_u32(&s->peers[i].close_requested, 0);
+			}
 		}
 	}
 
 	Assert(Tier1Shmem->magic == PGRAC_IC_TIER1_SHMEM_MAGIC);
+}
+
+/*
+ * PGRAC: spec-7.2 D2 — re-aim the working alias at this process's plane.
+ *
+ *	Called once at aux-process entry BEFORE any tier1 use (LmsMain →
+ *	DATA).  Processes that never call it stay on CONTROL, which keeps
+ *	LMON, backends and every SQL observer on the historic instance.
+ */
+void
+cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
+{
+	Assert(plane >= 0 && plane < CLUSTER_IC_PLANE_N);
+	tier1_my_plane = plane;
+	if (Tier1ShmemByPlane[plane] != NULL)
+		Tier1Shmem = Tier1ShmemByPlane[plane];
 }
 
 static const ClusterShmemRegion cluster_ic_tier1_region = {
@@ -990,10 +1050,31 @@ cluster_ic_tier1_listener_bind(void)
 						 "interconnect_addr.",
 						 cluster_node_id)));
 
-	if (!parse_host_port(self->interconnect_addr, self_host, sizeof(self_host), &self_port))
-		ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
-						errmsg("cluster_ic tier1: cannot parse interconnect_addr \"%s\"",
-							   self->interconnect_addr)));
+	/*
+	 * PGRAC: spec-7.2 D2 — plane-selected listener address.  The DATA
+	 * plane binds the node's declared data_addr;  no declaration means
+	 * this node offers no DATA plane (LOG + no listener — the caller
+	 * treats -1 as plane-off;  fail-closed enforcement arrives with
+	 * the GCS-block plane flip).  Never derived from interconnect_addr
+	 * (r1-F2: adjacent-port collisions make offset defaults unsound).
+	 */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA && self->data_addr[0] == '\0') {
+		ereport(LOG, (errmsg("cluster_ic tier1: no data_addr declared for node %d; "
+							 "DATA plane disabled",
+							 cluster_node_id)));
+		return -1;
+	}
+
+	if (!parse_host_port((tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? self->data_addr
+																   : self->interconnect_addr,
+						 self_host, sizeof(self_host), &self_port))
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CONFIG_FILE_ERROR),
+			 errmsg("cluster_ic tier1: cannot parse %s \"%s\"",
+					(tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? "data_addr" : "interconnect_addr",
+					(tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? self->data_addr
+															  : self->interconnect_addr)));
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (fd < 0)
@@ -1221,8 +1302,11 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 	 * already-sent prefix.
 	 */
 	self_cluster_name = (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "";
+	/* PGRAC: spec-7.2 D2 — HELLO carries this process's plane + the
+	 * cluster epoch at connect time (INV-7.2-CONN-EPOCH substrate). */
 	cluster_ic_build_hello(tier1_hello_send_buf[peer_id], PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, self_cluster_name);
+						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, self_cluster_name,
+						   tier1_my_plane, cluster_epoch_get_current());
 	tier1_hello_send_remaining[peer_id] = PGRAC_IC_HELLO_BYTES;
 
 	return cluster_ic_tier1_continue_hello_send(peer_id, peer_fd);
@@ -1334,6 +1418,29 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 						  "HELLO cluster_name mismatch (peer=\"%s\" mine=\"%s\")", msg.cluster_name,
 						  self_cluster_name);
 		cluster_ic_tier1_close_peer(peer_id, "HELLO cluster_name mismatch");
+		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
+		return false;
+	}
+
+	/*
+	 * PGRAC: spec-7.2 D2 — plane match:  a HELLO arriving on this
+	 * process's listener/connection must claim the same plane (a
+	 * CONTROL peer dialing the DATA port, or vice versa, is a wiring
+	 * error;  pre-7.2 senders read as plane 0 = CONTROL and are only
+	 * acceptable on the CONTROL plane).  DATA additionally requires a
+	 * nonzero conn_epoch (INV-7.2-CONN-EPOCH: zero would defeat the
+	 * connection-generation fence;  fail-closed).
+	 */
+	if (cluster_ic_hello_plane(&msg) != tier1_my_plane) {
+		peer_record_error(peer_id, 0, "08P01", "HELLO plane mismatch (peer=%d mine=%d)",
+						  (int)cluster_ic_hello_plane(&msg), (int)tier1_my_plane);
+		cluster_ic_tier1_close_peer(peer_id, "HELLO plane mismatch");
+		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
+		return false;
+	}
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA && cluster_ic_hello_conn_epoch(&msg) == 0) {
+		peer_record_error(peer_id, 0, "08P01", "DATA HELLO missing conn_epoch");
+		cluster_ic_tier1_close_peer(peer_id, "DATA HELLO missing conn_epoch");
 		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
 		return false;
 	}
@@ -1509,6 +1616,18 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		ereport(LOG,
 				(errmsg("cluster_ic tier1 HELLO cluster_name mismatch (peer=\"%s\" mine=\"%s\")",
 						msg.cluster_name, self_cluster_name)));
+		return false;
+	}
+
+	/* PGRAC: spec-7.2 D2 — plane match + DATA conn_epoch (see the
+	 * named-peer verify path for the rationale). */
+	if (cluster_ic_hello_plane(&msg) != tier1_my_plane) {
+		ereport(LOG, (errmsg("cluster_ic tier1 HELLO plane mismatch (peer=%d mine=%d)",
+							 (int)cluster_ic_hello_plane(&msg), (int)tier1_my_plane)));
+		return false;
+	}
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA && cluster_ic_hello_conn_epoch(&msg) == 0) {
+		ereport(LOG, (errmsg("cluster_ic tier1 DATA HELLO missing conn_epoch")));
 		return false;
 	}
 

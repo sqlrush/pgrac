@@ -134,6 +134,15 @@ extern void cluster_ic_tier1_shmem_register(void);
 extern int cluster_ic_tier1_listener_bind(void);
 
 /*
+ * PGRAC: spec-7.2 D2 — re-aim this process's tier1 working state at a
+ * plane ([0] = CONTROL, [1] = DATA inside the single tier1 region).
+ * Call once at aux-process entry BEFORE any tier1 use (LmsMain → DATA);
+ * processes that never call it stay on CONTROL (LMON, backends, SQL
+ * observers — the historic instance and contract).
+ */
+extern void cluster_ic_tier1_set_my_plane(ClusterICPlane plane);
+
+/*
  * Accept exactly one pending connection on the listener fd.  Returns
  * true if accepted (sets *out_peer_fd and *out_peer_id from HELLO once
  * verified), false if no connection pending (EAGAIN) or HELLO failed.

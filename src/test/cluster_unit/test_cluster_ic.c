@@ -519,7 +519,7 @@ UT_TEST(test_hello_wire_roundtrip)
 	bool ok;
 
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 42,
-						   "pgrac-test");
+						   "pgrac-test", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	ok = cluster_ic_parse_hello(wire, &parsed);
 	UT_ASSERT(ok);
@@ -554,7 +554,7 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * unintended endian flips, and uninitialized memory leakage.
 	 */
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
-						   0x01020304, "AB");
+						   0x01020304, "AB", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	/* magic */
 	UT_ASSERT_EQ(wire[0], 0x48);
@@ -577,9 +577,45 @@ UT_TEST(test_hello_wire_reference_bytes)
 	UT_ASSERT_EQ(wire[13], 'B');
 	for (i = 14; i < 36; i++)
 		UT_ASSERT_EQ(wire[i], 0);
-	/* _pad must be all zero */
+	/* _pad must be all zero: a CONTROL-plane HELLO with conn_epoch 0 is
+	 * byte-identical to the pre-7.2 wire (spec-7.2 D2 compat pin). */
 	for (i = 36; i < PGRAC_IC_HELLO_BYTES; i++)
 		UT_ASSERT_EQ(wire[i], 0);
+}
+
+/*
+ * spec-7.2 D2 — DATA-plane HELLO reference bytes:  plane byte at offset
+ * 40, conn_epoch LE at 44-51, spec-7.3 worker bytes (41/42) still zero,
+ * tail 52-63 still zero.  Plus accessor roundtrip.
+ */
+UT_TEST(test_hello_wire_data_plane_bytes)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	int i;
+
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 3, "AB",
+						   CLUSTER_IC_PLANE_DATA, UINT64CONST(0x1122334455667788));
+
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_PLANE_OFFSET], 1);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 0);
+	UT_ASSERT_EQ(wire[43], 0);
+	/* conn_epoch = 0x1122334455667788 little-endian */
+	UT_ASSERT_EQ(wire[44], 0x88);
+	UT_ASSERT_EQ(wire[45], 0x77);
+	UT_ASSERT_EQ(wire[46], 0x66);
+	UT_ASSERT_EQ(wire[47], 0x55);
+	UT_ASSERT_EQ(wire[48], 0x44);
+	UT_ASSERT_EQ(wire[49], 0x33);
+	UT_ASSERT_EQ(wire[50], 0x22);
+	UT_ASSERT_EQ(wire[51], 0x11);
+	for (i = 52; i < PGRAC_IC_HELLO_BYTES; i++)
+		UT_ASSERT_EQ(wire[i], 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_plane(&parsed), CLUSTER_IC_PLANE_DATA);
+	UT_ASSERT(cluster_ic_hello_conn_epoch(&parsed) == UINT64CONST(0x1122334455667788));
 }
 
 UT_TEST(test_hello_smart_fusion_capability_gate)
@@ -591,7 +627,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-off");
+						   "sf-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
 
@@ -599,7 +635,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-tier-mismatch");
+						   "sf-tier-mismatch", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
 
@@ -607,7 +643,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-tier-match");
+						   "sf-tier-match", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2);
 
@@ -621,7 +657,8 @@ UT_TEST(test_hello_parse_rejects_bad_magic)
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
 
-	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1, "x");
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1, "x",
+						   CLUSTER_IC_PLANE_CONTROL, 0);
 	/* Corrupt magic */
 	wire[0] = 0xDE;
 	wire[1] = 0xAD;
@@ -638,7 +675,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 	const char *long_name = "this-cluster-name-is-way-longer-than-the-fixed-cap-on-purpose";
 
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 7,
-						   long_name);
+						   long_name, CLUSTER_IC_PLANE_CONTROL, 0);
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	/*
@@ -654,7 +691,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(20); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(21); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -674,6 +711,7 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_wire_data_plane_bytes); /* spec-7.2 D2 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
 	UT_RUN(test_hello_parse_rejects_bad_magic);
 	UT_RUN(test_hello_build_truncates_long_name);
