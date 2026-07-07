@@ -335,6 +335,19 @@ cluster_remote_xact_side_effect_drop_count(void)
 {
 	return 0;
 }
+/* spec-7.1 D3-a stub: dump_state (cluster_debug.o) reads the striped-multixact
+ * origin-derivation observability counters; cluster_multixact.o is not linked
+ * here.  Stub each to return 0 (matches the module-disabled path). */
+uint64
+cluster_multixact_get_mxid_halfspace_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_mxid_underivable_read_count(void)
+{
+	return 0;
+}
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
  * cluster_relmap_authority.o is not linked here.  cluster_shared_catalog is
  * false above, so the read is short-circuited and never called. */
