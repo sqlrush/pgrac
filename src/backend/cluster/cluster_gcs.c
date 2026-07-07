@@ -499,8 +499,14 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
 
 	/*
 	 * GCS requests can be produced from bufmgr/content-lock backend paths.
-	 * Tier1 sockets are owned by LMON, so non-LMON request producers enqueue
-	 * to the existing GRD outbound ring and wait on the normal reply slot.
+	 * CONTROL-plane sockets are owned by LMON, so non-LMON request
+	 * producers enqueue to the existing GRD outbound ring and wait on the
+	 * normal reply slot.  PGRAC: spec-7.2 D3 — this branch is also the
+	 * staging rule for LMS:  a migrated DATA-plane handler that must emit
+	 * GCS_REQUEST (a CONTROL message;  the ㉕ X->S downgrade notify and
+	 * the BAST-nudge branch) lands here by the same != B_LMON test and
+	 * goes through the ring for LMON to send — a direct send would trip
+	 * the router's plane gate by design.
 	 */
 	if (msg_type == PGRAC_IC_MSG_GCS_REQUEST && MyBackendType != B_LMON)
 		return cluster_grd_outbound_enqueue_backend_msg(msg_type, (uint32)dest_node, payload,
@@ -725,8 +731,15 @@ cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_i
 	pg_atomic_fetch_add_u64(&ClusterGcs->encode_payload_bytes, sizeof(payload));
 	pg_atomic_fetch_add_u64(&ClusterGcs->send_request_count, 1);
 
-	return cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
-									sizeof(payload))
+	/*
+	 * PGRAC: spec-7.2 D3 — route through the loopback/ring-aware helper
+	 * instead of a raw send:  post-flip this fire-and-forget notify is
+	 * emitted from the LMS-context FORWARD/BAST paths, where GCS_REQUEST
+	 * (CONTROL plane) must stage into the outbound ring for LMON (the
+	 * D0-①b staging case).  LMON callers keep the direct send.
+	 */
+	return gcs_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
+										 sizeof(payload))
 		   == CLUSTER_IC_SEND_DONE;
 }
 
