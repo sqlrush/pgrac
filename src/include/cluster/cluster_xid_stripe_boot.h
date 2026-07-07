@@ -126,6 +126,17 @@ extern ClusterXidStripeJoinVerdict cluster_xid_stripe_join_gate(bool self_may_se
 extern void cluster_xid_stripe_lazy_latch(void);
 
 /*
+ * Companion lazy latch for the mxid stripe face (spec-7.1 D3-a):
+ * populates the process-local mxid runtime (cluster_mxid_stripe.c)
+ * from the published activation state when the region-6 slot carried a
+ * valid "PGXM" extension record.  A published activation WITHOUT the
+ * extension (pre-extension cluster) leaves the mxid face unlatched
+ * forever -- allocation stays vanilla dense and every foreign multi
+ * stays underivable fail-closed.
+ */
+extern void cluster_mxid_stripe_lazy_latch(void);
+
+/*
  * D5e allocation clamp face: this node's durable per-slot floor (the
  * region-4 claim), or InvalidFullTransactionId when no claim has been
  * published.  Read under XidGenLock by GetNewTransactionId; the value
@@ -146,6 +157,7 @@ typedef struct ClusterXidStripeObs {
 	uint64 cluster_max_active_hwm;
 	uint64 replay_floor_full;
 	uint32 replay_active_bitmap;
+	uint32 activated_mxid_floor; /* "PGXM" extension floor; 0 = absent (spec-7.1 D3-a) */
 } ClusterXidStripeObs;
 
 extern void cluster_xid_stripe_observe(ClusterXidStripeObs *obs);

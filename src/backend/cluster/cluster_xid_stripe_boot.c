@@ -43,11 +43,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/multixact.h" /* ReadNextMultiXactId (mxid floor seed sample, spec-7.1 D3-a) */
 #include "access/transam.h"
 #include "access/xlog.h" /* RecoveryInProgress (D5d gate hold) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_inject.h" /* herding-stall injection (D3, L408) */
+#include "cluster/cluster_inject.h"		 /* herding-stall injection (D3, L408) */
+#include "cluster/cluster_mxid_stripe.h" /* mxid stripe face (spec-7.1 D3-a) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -65,6 +67,9 @@ StaticAssertDecl(sizeof(ClusterXidStripeSlotRecord) <= CLUSTER_VOTING_SLOT_BYTES
 				 "stripe slot record must fit a voting slot");
 StaticAssertDecl(sizeof(ClusterXidStripeActivationRecord) <= CLUSTER_VOTING_SLOT_BYTES,
 				 "stripe activation record must fit a voting slot");
+StaticAssertDecl(CLUSTER_PGXM_SLOT_OFFSET + sizeof(ClusterMxidStripeExtensionRecord)
+					 <= CLUSTER_VOTING_SLOT_BYTES,
+				 "mxid stripe extension must fit the activation voting slot");
 
 /*
  * Stripe mailbox ops (single producer LMON / single consumer qvotec,
@@ -89,6 +94,7 @@ typedef struct ClusterXidStripeBootShmem {
 	uint64 floor_full;
 	uint64 epoch;
 	uint64 generation;
+	uint32 mxid_floor; /* "PGXM" extension floor; 0 = absent (spec-7.1 D3-a) */
 
 	/* this node's region-4 publication (D5c; D5e reads the floor) */
 	uint32 slot_state; /* ClusterXidStripeSlotState */
@@ -131,12 +137,14 @@ typedef struct ClusterXidStripeBootShmem {
 	uint64 op_incarnation_hint; /* RETIRE tombstone owner */
 	uint64 seed_floor_full;		/* SEED payload */
 	uint64 seed_epoch;
+	uint32 seed_mxid_floor; /* SEED payload, mxid face (spec-7.1 D3-a) */
 } ClusterXidStripeBootShmem;
 
 static ClusterXidStripeBootShmem *StripeBootShmem = NULL;
 
 /* process-local: lazy latch ran (one-way, per process) */
 static bool stripe_latch_done = false;
+static bool mxid_stripe_latch_done = false;
 
 Size
 cluster_xid_stripe_shmem_size(void)
@@ -199,10 +207,13 @@ buffer_is_all_zeros(const char *buf, Size len)
 }
 
 static StripeSlotReadClass
-stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out)
+stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out, uint32 *out_mxid_floor)
 {
 	char slot[CLUSTER_VOTING_SLOT_BYTES];
 	ClusterVotingDiskIoState rc;
+
+	if (out_mxid_floor)
+		*out_mxid_floor = 0;
 
 	rc = cluster_voting_disk_read_stripe_activation(fd, slot);
 	if (rc != CLUSTER_VOTING_DISK_IO_OK) {
@@ -221,6 +232,23 @@ stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out)
 	memcpy(out, slot, sizeof(*out));
 	if (!cluster_xid_stripe_activation_record_valid(out))
 		return STRIPE_READ_CORRUPT;
+
+	/*
+	 * spec-7.1 D3-a: parse the "PGXM" mxid-floor extension riding the
+	 * same slot at a fixed offset.  A slot written by a pre-extension
+	 * binary reads back zeros there (record-absent); any invalid
+	 * content is likewise treated as absent -- the mxid face then
+	 * stays fail-closed while the xid activation stands on its own
+	 * CRC.  Never a CORRUPT verdict: the extension is optional and
+	 * must not hold up the xid face.
+	 */
+	if (out_mxid_floor) {
+		ClusterMxidStripeExtensionRecord ext;
+
+		memcpy(&ext, slot + CLUSTER_PGXM_SLOT_OFFSET, sizeof(ext));
+		if (cluster_mxid_stripe_extension_record_valid(&ext))
+			*out_mxid_floor = ext.activated_mxid_floor;
+	}
 	return STRIPE_READ_VALID;
 }
 
@@ -312,6 +340,7 @@ void
 cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 {
 	ClusterXidStripeActivationRecord best;
+	uint32 best_mxid_floor = 0;
 	bool have_valid = false;
 	bool have_corrupt = false;
 	bool have_readable = false;
@@ -324,12 +353,15 @@ cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 
 	for (i = 0; i < n_disks; i++) {
 		ClusterXidStripeActivationRecord rec;
+		uint32 rec_mxid_floor;
 
-		switch (stripe_read_activation_one(fds[i], &rec)) {
+		switch (stripe_read_activation_one(fds[i], &rec, &rec_mxid_floor)) {
 		case STRIPE_READ_VALID:
 			have_readable = true;
 			if (!have_valid || rec.generation > best.generation) {
 				best = rec;
+				/* the extension travels with its slot's PGXA record */
+				best_mxid_floor = rec_mxid_floor;
 				have_valid = true;
 			}
 			break;
@@ -359,6 +391,7 @@ cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 			StripeBootShmem->floor_full = best.activated_floor_full;
 			StripeBootShmem->epoch = best.stride_mode_epoch;
 			StripeBootShmem->generation = best.generation;
+			StripeBootShmem->mxid_floor = best_mxid_floor;
 		}
 	} else if (have_corrupt) {
 		/* Garbage and no valid copy anywhere: fail-closed hold.  The
@@ -469,6 +502,7 @@ stripe_stage_seed_request(void)
 {
 	FullTransactionId next_full;
 	uint64 floor;
+	uint32 mxid_floor;
 
 	if (pg_atomic_read_u64(&StripeBootShmem->req_seq)
 		!= pg_atomic_read_u64(&StripeBootShmem->done_seq))
@@ -479,9 +513,24 @@ stripe_stage_seed_request(void)
 	floor = floor - (floor % CLUSTER_XID_STRIDE) + CLUSTER_XID_STRIDE; /* round up */
 	floor += (uint64)cluster_xid_herding_slack;
 
+	/*
+	 * spec-7.1 D3-a: sample the mxid activation floor at the same
+	 * staging point.  Like the xid floor, its dominance over shared-
+	 * page history rests on activation landing at cluster formation,
+	 * before member admission opens user transactions (the seed's
+	 * post-recovery counter is the observed cluster high-water,
+	 * spec-6.15 §2.3 discipline).  Rounded up to the stride plus one
+	 * stride of margin; multixacts have no herding, so no slack term.
+	 */
+	mxid_floor = (uint32)ReadNextMultiXactId();
+	mxid_floor = mxid_floor - (mxid_floor % CLUSTER_MXID_STRIDE) + 2 * CLUSTER_MXID_STRIDE;
+	if (mxid_floor < FirstMultiXactId)
+		mxid_floor += CLUSTER_MXID_STRIDE; /* wrapped onto 0: skip Invalid */
+
 	LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
 	StripeBootShmem->seed_floor_full = floor;
 	StripeBootShmem->seed_epoch = 1;
+	StripeBootShmem->seed_mxid_floor = mxid_floor;
 	LWLockRelease(&StripeBootShmem->lock);
 
 	if (stripe_stage_op(STRIPE_OP_SEED, -1, 0) != 0)
@@ -500,6 +549,7 @@ static uint32
 stripe_service_seed(const int *fds, int n_disks)
 {
 	ClusterXidStripeActivationRecord rec;
+	ClusterMxidStripeExtensionRecord ext;
 	char slot[CLUSTER_VOTING_SLOT_BYTES];
 	int disks_ok = 0;
 	int majority;
@@ -511,17 +561,30 @@ stripe_service_seed(const int *fds, int n_disks)
 		return 1;
 
 	memset(&rec, 0, sizeof(rec));
+	memset(&ext, 0, sizeof(ext));
 	rec.magic = CLUSTER_PGXA_MAGIC;
 	rec.version = CLUSTER_PGXA_VERSION;
+	ext.magic = CLUSTER_PGXM_MAGIC;
+	ext.version = CLUSTER_PGXM_VERSION;
 	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
 	rec.activated_floor_full = StripeBootShmem->seed_floor_full;
 	rec.stride_mode_epoch = StripeBootShmem->seed_epoch;
+	ext.activated_mxid_floor = StripeBootShmem->seed_mxid_floor;
 	LWLockRelease(&StripeBootShmem->lock);
 	rec.generation = 1;
 	cluster_xid_stripe_activation_record_compute_crc(&rec);
+	ext.generation = 1;
+	cluster_mxid_stripe_extension_record_compute_crc(&ext);
 
+	/*
+	 * spec-7.1 D3-a: the "PGXM" mxid-floor extension rides the SAME
+	 * 512-byte slot write as the PGXA record, so both floors land
+	 * atomically in one sector -- there is no ordering window where
+	 * one face is durable without the other.
+	 */
 	memset(slot, 0, sizeof(slot));
 	memcpy(slot, &rec, sizeof(rec));
+	memcpy(slot + CLUSTER_PGXM_SLOT_OFFSET, &ext, sizeof(ext));
 
 	for (i = 0; i < n_disks; i++) {
 		if (cluster_voting_disk_write_stripe_activation(fds[i], slot) == CLUSTER_VOTING_DISK_IO_OK)
@@ -535,10 +598,12 @@ stripe_service_seed(const int *fds, int n_disks)
 		StripeBootShmem->floor_full = rec.activated_floor_full;
 		StripeBootShmem->epoch = rec.stride_mode_epoch;
 		StripeBootShmem->generation = rec.generation;
+		StripeBootShmem->mxid_floor = ext.activated_mxid_floor;
 		LWLockRelease(&StripeBootShmem->lock);
 		ereport(LOG, (errmsg("cluster xid stripe: activation record durable on %d/%d disks "
-							 "(floor " UINT64_FORMAT ", epoch " UINT64_FORMAT ")",
-							 disks_ok, n_disks, rec.activated_floor_full, rec.stride_mode_epoch)));
+							 "(floor " UINT64_FORMAT ", epoch " UINT64_FORMAT ", mxid floor %u)",
+							 disks_ok, n_disks, rec.activated_floor_full, rec.stride_mode_epoch,
+							 (unsigned)ext.activated_mxid_floor)));
 		return 1;
 	}
 	ereport(LOG, (errmsg("cluster xid stripe: activation seed reached only %d/%d disks "
@@ -866,6 +931,38 @@ cluster_xid_stripe_lazy_latch(void)
 	stripe_latch_done = true;
 }
 
+/*
+ * Companion one-way lazy latch for the mxid stripe face (spec-7.1
+ * D3-a).  Latches only when the published activation carried a valid
+ * "PGXM" extension floor; a pre-extension activation (mxid_floor 0)
+ * leaves the mxid face unlatched for the life of the process --
+ * allocation stays vanilla dense and readers keep failing closed on
+ * foreign multis (honest degrade, never a misattribution).
+ */
+void
+cluster_mxid_stripe_lazy_latch(void)
+{
+	uint32 mxid_floor = 0;
+	bool published = false;
+
+	if (mxid_stripe_latch_done || StripeBootShmem == NULL)
+		return;
+
+	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+	if (StripeBootShmem->disk_state == CLUSTER_XID_STRIPE_DISK_PUBLISHED
+		&& StripeBootShmem->mxid_floor != 0) {
+		published = true;
+		mxid_floor = StripeBootShmem->mxid_floor;
+	}
+	LWLockRelease(&StripeBootShmem->lock);
+
+	if (!published)
+		return; /* stays unlatched; wrappers keep failing closed */
+
+	cluster_mxid_stripe_latch_runtime(true, cluster_xid_allocation_slot(), (MultiXactId)mxid_floor);
+	mxid_stripe_latch_done = true;
+}
+
 FullTransactionId
 cluster_xid_stripe_my_slot_floor(void)
 {
@@ -1171,6 +1268,7 @@ cluster_xid_stripe_observe(ClusterXidStripeObs *obs)
 	obs->my_slot_floor_full
 		= StripeBootShmem->my_slot_claimed ? StripeBootShmem->my_slot_floor_full : 0;
 	obs->my_hwm_on_disk = StripeBootShmem->my_hwm_on_disk;
+	obs->activated_mxid_floor = StripeBootShmem->mxid_floor;
 	LWLockRelease(&StripeBootShmem->lock);
 
 	obs->herding_floor_full = pg_atomic_read_u64(&StripeBootShmem->herding_floor_full);

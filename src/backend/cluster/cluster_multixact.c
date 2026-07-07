@@ -68,6 +68,9 @@ typedef struct ClusterMultiXactShmem {
 	pg_atomic_uint64 overlay_miss_count;
 	pg_atomic_uint64 overlay_overflow_count;
 	pg_atomic_uint64 resolve_visibility_count;
+	/* spec-7.1 D3-a guardrail counters */
+	pg_atomic_uint64 mxid_halfspace_refuse_count; /* allocator half-space refusals */
+	pg_atomic_uint64 mxid_underivable_read_count; /* reader: foreign multi origin underivable */
 } ClusterMultiXactShmem;
 
 static HTAB *ClusterMultiXactHTAB = NULL;
@@ -111,6 +114,8 @@ cluster_multixact_shmem_init(void)
 		pg_atomic_init_u64(&ClusterMultiXactState->overlay_miss_count, 0);
 		pg_atomic_init_u64(&ClusterMultiXactState->overlay_overflow_count, 0);
 		pg_atomic_init_u64(&ClusterMultiXactState->resolve_visibility_count, 0);
+		pg_atomic_init_u64(&ClusterMultiXactState->mxid_halfspace_refuse_count, 0);
+		pg_atomic_init_u64(&ClusterMultiXactState->mxid_underivable_read_count, 0);
 	}
 
 	lockblock = (LWLockPadded *)ShmemInitStruct("ClusterMultiXactLock",
@@ -320,6 +325,45 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 	return CLUSTER_VISIBILITY_VISIBLE;
 }
 
+/*
+ * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a)
+ *
+ *	One-call reader helper: overlay key build (current epoch) + member
+ *	overlay lookup + OBS-1 visibility resolution.  See header; UNKNOWN
+ *	always means fail closed at the caller.
+ */
+ClusterVisibilityDecision
+cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
+									  bool *overlay_hit)
+{
+	ClusterMultiXactKey mxkey;
+	ClusterMultiXactMemberOverlayResult *mxres;
+	ClusterVisibilityDecision decision;
+	Size resbuf_sz = offsetof(ClusterMultiXactMemberOverlayResult, members)
+					 + CLUSTER_MULTIXACT_MAX_MEMBERS * sizeof(ClusterMultiXactMember);
+
+	if (overlay_hit)
+		*overlay_hit = false;
+
+	memset(&mxkey, 0, sizeof(mxkey));
+	mxkey.origin_node_id = origin_slot;
+	mxkey.multixact_id = mxid;
+	mxkey.cluster_epoch = (uint32)cluster_epoch_get_current();
+
+	mxres = (ClusterMultiXactMemberOverlayResult *)palloc0(resbuf_sz);
+
+	if (!cluster_multixact_member_overlay_lookup(&mxkey, mxres, CLUSTER_MULTIXACT_MAX_MEMBERS)) {
+		pfree(mxres);
+		return CLUSTER_VISIBILITY_UNKNOWN;
+	}
+
+	if (overlay_hit)
+		*overlay_hit = true;
+	decision = cluster_multixact_resolve_visibility(mxres, snap);
+	pfree(mxres);
+	return decision;
+}
+
 uint16
 cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
 {
@@ -373,6 +417,28 @@ CLUSTER_MULTIXACT_GETTER(overlay_lookup_hit_count)
 CLUSTER_MULTIXACT_GETTER(overlay_miss_count)
 CLUSTER_MULTIXACT_GETTER(overlay_overflow_count)
 CLUSTER_MULTIXACT_GETTER(resolve_visibility_count)
+CLUSTER_MULTIXACT_GETTER(mxid_halfspace_refuse_count)
+CLUSTER_MULTIXACT_GETTER(mxid_underivable_read_count)
+
+/*
+ * spec-7.1 D3-a guardrail bumps.  Called from GetNewMultiXactId under
+ * MultiXactGenLock (halfspace refuse) and from the reader fail-closed
+ * legs in heapam_visibility.c (underivable read); atomics, no lock of
+ * this module taken.
+ */
+void
+cluster_multixact_note_halfspace_refuse(void)
+{
+	if (ClusterMultiXactState != NULL)
+		pg_atomic_fetch_add_u64(&ClusterMultiXactState->mxid_halfspace_refuse_count, 1);
+}
+
+void
+cluster_multixact_note_underivable_read(void)
+{
+	if (ClusterMultiXactState != NULL)
+		pg_atomic_fetch_add_u64(&ClusterMultiXactState->mxid_underivable_read_count, 1);
+}
 
 #else /* !USE_PGRAC_CLUSTER */
 
@@ -422,6 +488,18 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 	return CLUSTER_VISIBILITY_UNKNOWN;
 }
 
+ClusterVisibilityDecision
+cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
+									  bool *overlay_hit)
+{
+	(void)origin_slot;
+	(void)mxid;
+	(void)snap;
+	if (overlay_hit)
+		*overlay_hit = false;
+	return CLUSTER_VISIBILITY_UNKNOWN;
+}
+
 uint16
 cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
 {
@@ -446,5 +524,15 @@ CLUSTER_MULTIXACT_GETTER_STUB(overlay_lookup_hit_count)
 CLUSTER_MULTIXACT_GETTER_STUB(overlay_miss_count)
 CLUSTER_MULTIXACT_GETTER_STUB(overlay_overflow_count)
 CLUSTER_MULTIXACT_GETTER_STUB(resolve_visibility_count)
+CLUSTER_MULTIXACT_GETTER_STUB(mxid_halfspace_refuse_count)
+CLUSTER_MULTIXACT_GETTER_STUB(mxid_underivable_read_count)
+
+void
+cluster_multixact_note_halfspace_refuse(void)
+{}
+
+void
+cluster_multixact_note_underivable_read(void)
+{}
 
 #endif /* USE_PGRAC_CLUSTER */

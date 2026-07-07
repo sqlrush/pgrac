@@ -2,28 +2,41 @@
 #
 # 357_cluster_multi_xmax_alias_floor.pl
 #
-#   Multi-xmax alias floor: a multixact id is a node-local counter, so a
-#   foreign multi decoded against the LOCAL pg_multixact aliases to
-#   unrelated members once the local counter passes that id -- before the
-#   floor this read answered SILENTLY WRONG (the spec-7.1 census probe-F
-#   reproduction: the committed update vanished and the superseded version
-#   stayed visible).  The floor fails every updater-bearing multi closed in
-#   peer mode (53R9C, retryable) until cross-node multixact resolution
-#   lands; lock-only multis never cut visibility and stay readable.
+#   Multi-xmax alias floor + spec-7.1 D3-a origin derivation: a multixact
+#   id is a node-local counter, so a foreign multi decoded against the
+#   LOCAL pg_multixact aliases to unrelated members once the local
+#   counter passes that id -- before the floor this read answered
+#   SILENTLY WRONG (the spec-7.1 census probe-F reproduction: the
+#   committed update vanished and the superseded version stayed visible).
+#   D3-a derives the origin from the STRIPED mxid value:
+#     - a DERIVED-OWN multi decodes natively (alias-free above the
+#       activation floor) -- the creator can read its own updater multi
+#       again (L4), lifting the D3-0 floor's blanket cost;
+#     - a DERIVED-FOREIGN updater multi is resolved through the member
+#       overlay when it HITS, else fails closed 53R9C.  The proactive V4
+#       overlay never covers updater-bearing multis (the updater has no
+#       TT binding at heap_update compose time -- see multixact.c
+#       spec-7.1 D3-a note), so cross-node positive resolution of those
+#       multis is served by the member-serve slow path = spec-7.1 D3-b
+#       (software-ordered behind spec-7.2 D3).  Until D3-b, foreign
+#       updater multis stay fail-closed (L2/L3) -- never silently wrong.
 #
 #   L1  lockers-only multi, committed  -> remote read still answers (no
 #       over-blocking: lock-only never needs a member decode)
 #   L2  keyshare+update multi          -> remote read fails closed 53R9C
-#       (pre-floor: raw native "MultiXactId N has not been created yet")
+#       (derived foreign, overlay miss; positive = D3-b member serve).
+#       NEVER the silent-wrong native alias (pre-floor P0)
 #   L3  probe F: the reader first advances its OWN multixact counter past
-#       the foreign id -> read STILL fails closed 53R9C (pre-floor: rc=0
-#       with the superseded row -- the silent-wrong P0)
-#   L4  creator-side read of its own updater-multi OLD version also fails
-#       closed -- the documented availability cost of the floor (origin is
-#       not yet derivable, so the creator cannot be distinguished from an
-#       aliasing reader); spec-7.1 D3 restores this with a positive proof.
+#       the foreign id -> read STILL fails closed (origin derivation is
+#       immune to the local counter position; the silent-wrong P0 can no
+#       longer happen by construction -- the superseded row is never
+#       returned)
+#   L4  creator-side read of its own updater-multi OLD version resolves
+#       natively -- a DERIVED-OWN multi decodes alias-free above the
+#       activation floor (was: the D3-0 floor's documented availability
+#       cost; this is the D3-a positive win over the blanket floor)
 #
-# Spec: spec-7.1-cross-instance-positive-interread.md (D3 floor)
+# Spec: spec-7.1-cross-instance-positive-interread.md (D3-a)
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -99,6 +112,33 @@ sub mirrored_coincident_create
 	return 0;
 }
 
+sub dump_key
+{
+	my ($node, $key) = @_;
+	return $node->safe_psql('postgres',
+		qq{SELECT value FROM cluster_dump_state() WHERE key = '$key'});
+}
+
+# The mxid activation floor must be published + latched before the test
+# composes the multixacts it expects to resolve positively: a multixact
+# allocated before activation is a DENSE (pre-stripe) id, which is
+# forever underivable and correctly fails closed (the honest floor, not
+# a positive-resolution case).  Wait for both nodes to see a nonzero
+# floor so the L2/L3/L5 composes land above it (striped, derivable).
+sub wait_mxid_floor
+{
+	for my $i (1 .. 60)
+	{
+		my $f0 = dump_key($node0, 'mxid_stripe_activated_floor') || '0';
+		my $f1 = dump_key($node1, 'mxid_stripe_activated_floor') || '0';
+		return 1 if $f0 > 0 && $f1 > 0;
+		usleep(1_000_000);
+	}
+	return 0;
+}
+
+ok(wait_mxid_floor(), 'mxid activation floor published + latched on both nodes');
+
 ok(mirrored_coincident_create('mxf_t', 'CREATE TABLE mxf_t (aid int, v int)'),
 	'mxf_t relfilepath coincidence holds');
 ok(write_retry($node0, 'INSERT INTO mxf_t SELECT g, 0 FROM generate_series(1, 20) g'), 'seeded');
@@ -109,6 +149,22 @@ sub bq
 	my $ok = eval { $bg->query_safe($sql); 1 };
 	diag("step $tag FAILED: $@") if !$ok;
 	return $ok;
+}
+
+# Cross-node positive reads converge once the member overlay + member
+# commit hints arrive on the wire; retry to the expected answer (the
+# project's "转正腿带收敛等待" idiom).
+sub read_converge
+{
+	my ($node, $sql, $want, $tries) = @_;
+	my ($rc, $out, $err) = (1, '', '');
+	for my $i (1 .. $tries)
+	{
+		($rc, $out, $err) = $node->psql('postgres', $sql, timeout => 15);
+		return ($rc, $out, $err) if $rc == 0 && $out eq $want;
+		usleep(500_000);
+	}
+	return ($rc, $out, $err);
 }
 
 # ------------------------------------------------------------------
@@ -149,10 +205,14 @@ sub bq
 
 	my ($rc, $out, $err) =
 	  $node1->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
-	isnt($rc, 0, 'L2 updater multi: remote read fails closed');
-	like($err, qr/cannot be attributed to an origin node|TT status unknown for deleting xmax/,		'L2 updater multi: clean 53R9C floor message (not a raw native multixact error)');
+	isnt($rc, 0,
+		'L2 updater multi: remote read fails closed (derived foreign; positive = D3-b member serve)');
+	like(
+		$err,
+		qr/cannot be attributed to an origin node|multixact member overlay miss|TT status unknown for deleting xmax/,
+		'L2 updater multi: clean 53R9C floor message (not a raw native multixact error)');
 	unlike($err, qr/has not been created yet/,
-		'L2 updater multi: native id-space error no longer surfaces');
+		'L2 updater multi: native id-space error never surfaces');
 }
 
 # ------------------------------------------------------------------
@@ -180,21 +240,47 @@ sub bq
 
 	my ($rc, $out, $err) =
 	  $node1->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
-	isnt($rc, 0, 'L3 probe F: aliased read still fails closed (was: silent wrong answer)');
-	like($err, qr/cannot be attributed to an origin node|TT status unknown for deleting xmax/, 'L3 probe F: floor message');
+	isnt($rc, 0,
+		'L3 probe F: aliased read still fails closed (derivation immune to local counter position)');
+	like(
+		$err,
+		qr/cannot be attributed to an origin node|multixact member overlay miss|TT status unknown for deleting xmax/,
+		'L3 probe F: floor message');
 	unlike($out, qr/11\|0/, 'L3 probe F: the superseded version is NEVER returned');
 }
 
 # ------------------------------------------------------------------
-# L4: creator-side read of its own updater-multi OLD version -- the
-#     documented availability cost (creator is indistinguishable from an
-#     aliasing reader until spec-7.1 D3 makes the origin derivable).
+# L4: creator-side read of its own updater-multi OLD version resolves
+#     natively -- a DERIVED-OWN multi decodes alias-free above the
+#     activation floor (the D3-a positive win over the D3-0 blanket
+#     floor, which fail-closed even the creator).
 # ------------------------------------------------------------------
 {
 	my ($rc, $out, $err) =
-	  $node0->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
-	isnt($rc, 0, 'L4 creator-local read of the multi old version fails closed (documented cost)');
-	like($err, qr/cannot be attributed to an origin node|TT status unknown for deleting xmax/, 'L4 floor message on the creator too');
+	  read_converge($node0, 'SELECT aid, v FROM mxf_t WHERE aid = 11', '11|100', 10);
+	is($rc, 0, 'L4 creator-local read of its own updater multi answers (derived own -> native)');
+	is($out, '11|100', 'L4 creator sees the committed update');
+}
+
+# ------------------------------------------------------------------
+# L5: revert valve -- cluster.multi_xmax_remote_resolve = off keeps the
+#     derived-foreign fail-closed floor (the on-path for updater multis
+#     is fail-closed too until D3-b, so L5 asserts off never REGRESSES
+#     to the native silent-wrong alias, and the derived-own L4 win is
+#     independent of the GUC).
+# ------------------------------------------------------------------
+{
+	$node1->append_conf('postgresql.conf', 'cluster.multi_xmax_remote_resolve = off');
+	$node1->reload;
+	usleep(500_000);
+
+	my ($rc, $out, $err) =
+	  $node1->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
+	isnt($rc, 0, 'L5 resolve off: foreign updater multi read fails closed (floor verbatim)');
+	unlike($out, qr/11\|0/, 'L5 resolve off: the superseded version is NEVER returned');
+
+	$node1->append_conf('postgresql.conf', 'cluster.multi_xmax_remote_resolve = on');
+	$node1->reload;
 }
 
 $pair->stop_pair;

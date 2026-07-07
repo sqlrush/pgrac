@@ -203,6 +203,22 @@ extern uint16 cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
 extern void cluster_multixact_purge_epoch(uint32 obsolete_epoch);
 
 /*
+ * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a)
+ *
+ *   One-call reader helper for a DERIVED-foreign multixact xmax:
+ *   builds the overlay key {origin_slot, mxid, current epoch}, looks
+ *   up the member overlay and resolves visibility against snap per
+ *   the OBS-1 truth table.  *overlay_hit reports whether the overlay
+ *   held the entry (miss -> UNKNOWN; the member-serve wire that would
+ *   answer a miss positively is a later deliverable).  UNKNOWN always
+ *   means the caller must fail closed (rule 8.A).
+ */
+extern ClusterVisibilityDecision cluster_multixact_remote_xmax_resolve(uint16 origin_slot,
+																	   MultiXactId mxid,
+																	   Snapshot snap,
+																	   bool *overlay_hit);
+
+/*
  * Counter getters (always linked;return 0 in disable-cluster build).
  */
 extern uint64 cluster_multixact_get_overlay_install_count(void);
@@ -210,6 +226,18 @@ extern uint64 cluster_multixact_get_overlay_lookup_hit_count(void);
 extern uint64 cluster_multixact_get_overlay_miss_count(void);
 extern uint64 cluster_multixact_get_overlay_overflow_count(void);
 extern uint64 cluster_multixact_get_resolve_visibility_count(void);
+extern uint64 cluster_multixact_get_mxid_halfspace_refuse_count(void);
+extern uint64 cluster_multixact_get_mxid_underivable_read_count(void);
+
+/*
+ * spec-7.1 D3-a guardrail bumps (no-op in disable-cluster build).
+ * halfspace_refuse: the striped allocator refused a candidate at or
+ * beyond floor + 2^31 (53RB4).  underivable_read: a reader met a
+ * foreign-evidence multixact whose origin could not be derived
+ * (below-floor / unlatched / beyond-half-space) and failed closed.
+ */
+extern void cluster_multixact_note_halfspace_refuse(void);
+extern void cluster_multixact_note_underivable_read(void);
 
 /*
  * Shmem hooks (defined in cluster_multixact.c when USE_PGRAC_CLUSTER;

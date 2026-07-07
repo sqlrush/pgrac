@@ -205,6 +205,12 @@ extern bool cluster_xid_striping;
 /* spec-6.15 D5/D3: herding slack (jump threshold; seed-floor headroom). */
 extern int cluster_xid_herding_slack;
 
+/* spec-7.1 D3-a: cross-node multixact xmax positive resolution via
+ * origin derivation + member overlay (default on; off = the D3-0
+ * fail-closed floor verbatim: every updater multi in peer mode
+ * refuses 53R9C). */
+extern bool cluster_multi_xmax_remote_resolve;
+
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks
  * the unconsumed tail of oversized HW grants as a per-node lease

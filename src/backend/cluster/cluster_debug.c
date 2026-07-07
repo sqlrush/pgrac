@@ -104,6 +104,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
 #include "cluster/cluster_xnode_lever.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D6 dump */ /* xnode lever counters (spec-6.12) */
+#include "cluster/cluster_multixact.h"		/* mxid stripe guardrail counters (spec-7.1 D3-a) */
 #include "cluster/cluster_hw_lease.h"		/* space-lease counters (spec-6.12d) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
@@ -898,10 +899,13 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 /*
  * dump_xid_stripe -- spec-6.15 D6 xid stripe face diagnostics.
  *
- *	11 keys over the activation face (disk/slot state, floor, epoch),
+ *	14 keys over the activation face (disk/slot state, floor, epoch),
  *	the D3 herding plane (own floor/hwm promise, cluster min/max active
- *	hwm) and the D5d replay face (replay-learned floor + active slot
- *	bitmap).  All values come from one shmem snapshot.
+ *	hwm), the D5d replay face (replay-learned floor + active slot
+ *	bitmap) and the spec-7.1 D3-a mxid stripe face (activated mxid
+ *	floor -- 0 = extension absent -- plus the half-space-refusal and
+ *	underivable-read guardrail counters).  Values come from one shmem
+ *	snapshot plus the multixact counter atomics.
  */
 static void
 dump_xid_stripe(ReturnSetInfo *rsinfo)
@@ -936,6 +940,12 @@ dump_xid_stripe(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)obs.replay_floor_full));
 	emit_row(rsinfo, "xid_stripe", "xid_stripe_replay_active_bitmap",
 			 fmt_uint64_hex((uint64)obs.replay_active_bitmap));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_activated_floor",
+			 fmt_int64((int64)obs.activated_mxid_floor));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_halfspace_refusals",
+			 fmt_int64((int64)cluster_multixact_get_mxid_halfspace_refuse_count()));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_underivable_reads",
+			 fmt_int64((int64)cluster_multixact_get_mxid_underivable_read_count()));
 }
 
 

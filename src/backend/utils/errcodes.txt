@@ -875,6 +875,12 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # the first own checkpoint).
 53RB3    E    ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE                      cluster_recovery_anchor_unavailable
 
+# spec-7.1 D3-a:  striped multixact id allocation refused because the
+# candidate would leave the half-space [floor, floor + 2^31) above the
+# durable mxid activation floor -- beyond it the 32-bit wraparound makes
+# origin derivation ambiguous, so the allocator fails closed instead of
+# ever letting the derivation window alias (rule 8.A).
+53RB4    E    ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT                            cluster_mxid_halfspace_limit
 # spec-6.15b:  shared XID authority / native-era prehistory unavailable.
 # Under cluster.shared_catalog=on a joiner must reconcile its transaction
 # horizon against the sealed shared XID authority and adopt the native-era

@@ -888,6 +888,37 @@ SELECT key, value FROM pg_cluster_state
  WHERE category = 'xid_stripe';
 ```
 
+Multixact IDs are striped the same way on a striped cluster: each node
+only issues multixact ids in its own congruence class, inside a window
+of 2^31 values above the recorded activation point.  Multixact ids are
+consumed only when several transactions lock or update the same row
+concurrently, so this window lasts far longer than the xid cycle; if
+it is ever exhausted, new multixact creation is refused with SQLSTATE
+`53RB4` (existing data stays readable).  The window position and the
+refusal counter appear in the same `xid_stripe` category
+(`mxid_stripe_activated_floor`, `mxid_stripe_halfspace_refusals`,
+`mxid_stripe_underivable_reads`).
+
+### `cluster.multi_xmax_remote_resolve`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `on` |
+| Context | sighup |
+
+Resolves row lock/update combinations (multixact xmax) created on
+another node when reading shared data.  When enabled (default), a read
+that meets such a row determines the creating node from the striped
+multixact id and resolves the member transactions through the cluster
+member overlay; a combination that cannot be proven fails the read
+with SQLSTATE `53R9C` (safe to retry).
+
+When `off`, every row carrying an updater-bearing multixact fails
+closed with `53R9C` on a cluster read.  Rows that only carry row locks
+(`FOR SHARE` / `FOR KEY SHARE` with no updater) are always readable
+under either setting.
+
 ## Reconfig coordinator observability
 
 ### `pg_cluster_reconfig_state` view

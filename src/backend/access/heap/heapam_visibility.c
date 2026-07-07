@@ -73,7 +73,11 @@
  *	  answers and hint stamps are void for provably-foreign xids; hint-stamp
  *	  suppression in SetHintBits, distrust of foreign-class hint bits, and
  *	  foreign-xmax routing in the Self / Dirty / MVCC native bodies and the
- *	  update-path helper).
+ *	  update-path helper), spec-7.1 D1 (live-slot overlay-miss verdict ask)
+ *	  and spec-7.1 D3-a (multixact xmax positive resolution: origin derived
+ *	  from the striped mxid value, member overlay resolve in the MVCC D6
+ *	  branch and the G6 keeps-visible multi arm; underivable stays the
+ *	  fail-closed floor).
  *
  *-------------------------------------------------------------------------
  */
@@ -105,6 +109,7 @@
 #include "cluster/cluster_tt_slot.h"			/* ClusterUndoTTSlotRef */
 #include "cluster/cluster_subtrans.h"			/* spec-3.5 D8 lookup_parent */
 #include "cluster/cluster_multixact.h"			/* spec-3.6 D6 reader overlay */
+#include "cluster/cluster_mxid_stripe.h"		/* spec-7.1 D3-a mxid origin derivation */
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_inject.h"	/* D5b test-only inject helper */
 #include "cluster/cluster_cr.h"					/* spec-3.9 D5 CR 3-tier MVCC gate */
@@ -138,8 +143,7 @@
 static inline bool
 cluster_plain_xmax_provably_foreign(HeapTupleHeader tuple)
 {
-	if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI)
-		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+	if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) || HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		return false;
 	return cluster_xid_provably_foreign(HeapTupleHeaderGetRawXmax(tuple));
 }
@@ -149,8 +153,7 @@ cluster_plain_xmax_provably_foreign(HeapTupleHeader tuple)
  * deleter, shared by the Self and Dirty native bodies.  Every unproven
  * outcome fails closed (规则 8.A) — never a fall-through to native.
  */
-typedef enum ClusterForeignXmaxState
-{
+typedef enum ClusterForeignXmaxState {
 	CLUSTER_FOREIGN_XMAX_DELETED,	  /* deleter proven committed */
 	CLUSTER_FOREIGN_XMAX_NOT_DELETED, /* deleter proven aborted */
 	CLUSTER_FOREIGN_XMAX_IN_PROGRESS, /* deleter proven still running */
@@ -182,7 +185,7 @@ cluster_foreign_xmax_state(Buffer buffer, HeapTupleHeader tuple, TransactionId r
 							"missed/stale; retry or abort.")));
 	return CLUSTER_FOREIGN_XMAX_NOT_DELETED; /* unreachable */
 }
-#else							/* !USE_PGRAC_CLUSTER */
+#else /* !USE_PGRAC_CLUSTER */
 #define cluster_plain_xmax_provably_foreign(tuple) false
 #endif
 
@@ -556,7 +559,7 @@ HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		if (cluster_foreign_xmax_state(buffer, tuple, HeapTupleHeaderGetRawXmax(tuple))
 			== CLUSTER_FOREIGN_XMAX_DELETED)
 			return false; /* updated by other */
-		return true; /* in-progress or aborted deleter: still visible to self */
+		return true;	  /* in-progress or aborted deleter: still visible to self */
 	}
 #endif
 
@@ -1476,11 +1479,10 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			return true;
 		case CLUSTER_FOREIGN_XMAX_IN_PROGRESS:
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("cross-node write conflict on tuple with in-progress "
-							"remote deleter"),
-					 errhint("Retry the transaction.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict on tuple with in-progress "
+								   "remote deleter"),
+							errhint("Retry the transaction.")));
 		}
 	}
 #endif
@@ -1546,30 +1548,57 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 
 	/* PGRAC: spec-6.15 D7 — a provably-foreign INVALID hint may be a poison
 	 * stamp from the native no-authority era; never trust it, resolve. */
-	if ((tuple->t_infomask & HEAP_XMAX_INVALID)
-		&& !cluster_plain_xmax_provably_foreign(tuple))
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) && !cluster_plain_xmax_provably_foreign(tuple))
 		return 1;
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		return 1; /* a lock-only xmax never deletes the row */
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 		/*
-		 * PGRAC multi-xmax alias floor: a multixact id is node-local and its
-		 * members come from the LOCAL pg_multixact, which ALIASES for a
-		 * foreign multi once the local counter passes that id (AD-012 例外
-		 * 9; the spec-7.1 census probe-F silent false-visible).  The spec-3.6
+		 * PGRAC multi-xmax alias floor + spec-7.1 D3-a positive
+		 * resolution: a multixact id is node-local and its members come
+		 * from the LOCAL pg_multixact, which ALIASES for a foreign multi
+		 * once the local counter passes that id (AD-012 例外 9; the
+		 * spec-7.1 census probe-F silent false-visible).  The spec-3.6
 		 * D7b page marker cannot distinguish the origin (it stamps the
-		 * reader's own id), and warm cross-instance reads (spec-6.12i/6.15)
-		 * make a foreign tuple with a multi xmax legitimately reach this
-		 * gate -- the exact hazard the pre-floor XXX note here predicted.
-		 * Updater-bearing multis therefore fail closed in peer mode until
-		 * spec-7.1 D3 makes the origin derivable; the caller's 53R97 ERROR
-		 * is retryable.  (Lock-only multis returned 1 above: a lock never
-		 * deletes the row, no member decode is needed.)
+		 * reader's own id); the striped mxid VALUE can (D3-a Route B):
+		 * derived own -> native member decode is alias-free above the
+		 * activation floor; derived foreign -> member overlay resolve
+		 * (OBS-1 truth table, same helper as the MVCC D6 branch);
+		 * underivable or overlay-unprovable -> -1, the caller's
+		 * retryable 53R97 ERROR (fail-closed direction unchanged).
+		 * (Lock-only multis returned 1 above: a lock never deletes the
+		 * row, no member decode is needed.)
 		 */
 		if (cluster_peer_mode_enabled()) {
-			/* PGRAC: spec-7.1 D0 census — foreign-multi refuse leg (D3 target). */
-			cluster_vis53r97_note_multi_unresolvable();
-			return -1;
+			int mx_origin = -1;
+
+			if (cluster_multi_xmax_remote_resolve)
+				mx_origin = cluster_mxid_origin_slot((MultiXactId)HeapTupleHeaderGetRawXmax(tuple));
+
+			if (mx_origin < 0) {
+				/* PGRAC: spec-7.1 D0 census — foreign-multi refuse leg. */
+				cluster_multixact_note_underivable_read();
+				cluster_vis53r97_note_multi_unresolvable();
+				return -1;
+			}
+			if (mx_origin != cluster_node_id) {
+				bool mx_hit = false;
+
+				switch (cluster_multixact_remote_xmax_resolve(
+					(uint16)mx_origin, (MultiXactId)HeapTupleHeaderGetRawXmax(tuple), snapshot,
+					&mx_hit)) {
+				case CLUSTER_VISIBILITY_VISIBLE:
+					return 1; /* no committed updater hides the row */
+				case CLUSTER_VISIBILITY_INVISIBLE:
+					return 0; /* the delete is visible at this snapshot */
+				case CLUSTER_VISIBILITY_UNKNOWN:
+				default:
+					cluster_vis53r97_note_multi_unresolvable();
+					return -1; /* overlay miss / member unprovable */
+				}
+			}
+			/* derived own slot: fall through to the alias-free native
+			 * update-xid decode below. */
 		}
 		xmax = HeapTupleGetUpdateXid(tuple);
 	} else
@@ -1737,10 +1766,9 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	if (cluster_enabled && BufferIsValid(buffer)
 		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_CLUSTER
 		&& (!cluster_cr_no_peer_fastpath_eligible(snapshot)
-			|| (!RecoveryInProgress()
-				&& cluster_tuple_has_remote_evidence(buffer, tuple)))) {
+			|| (!RecoveryInProgress() && cluster_tuple_has_remote_evidence(buffer, tuple)))) {
 		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
-		ClusterUndoTTSlotRef ref = {0};
+		ClusterUndoTTSlotRef ref = { 0 };
 		bool ref_filled = false;
 
 		/*
@@ -2018,107 +2046,90 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		 *   Scope:  HeapTupleSatisfiesMVCC() only (per OBS-1/F5).  Other
 		 *   HeapTupleSatisfies* paths remain PG-native.
 		 *
-		 *   Path:
-		 *     1. tuple xmax has HEAP_XMAX_IS_MULTI flag
-		 *     2. find page ITL marker via D7b helper (buffer content
-		 *        lock held by caller per L200 + spec-3.4d Hardening
-		 *        v1.0.1 F10 family)
-		 *     3. marker hit + origin_node_id != cluster_node_id ->
-		 *        remote multixact -> cluster overlay lookup + resolve
-		 *     4. marker miss / overlay miss -> 53R9C fail-closed (per
-		 *        L199 NO PG-native fallback)
-		 *     5. marker hit + origin_node_id == cluster_node_id ->
-		 *        local-origin multixact -> fall through to PG-native
-		 *        (PG SLRU resolves locally)
+		 *   Path (spec-7.1 D3-a positive resolution):
+		 *     1. tuple xmax has HEAP_XMAX_IS_MULTI flag (updater-
+		 *        bearing only: lock-only multis never cut visibility
+		 *        and an XMAX_INVALID-hinted multi is never decoded --
+		 *        both stay readable natively)
+		 *     2. derive the origin slot from the striped mxid VALUE
+		 *        (cluster_mxid_origin_slot, half-space window above
+		 *        the durable activation floor) -- NEVER from the D7b
+		 *        page marker, which stamps the READER's own id and
+		 *        would call every multi "local" (the probe-F silent
+		 *        false-visible this branch's floor was shipped for)
+		 *     3. underivable (below floor / unlatched / beyond the
+		 *        half-space / cluster.multi_xmax_remote_resolve off)
+		 *        -> 53R9C fail-closed floor, direction unchanged
+		 *     4. derived foreign -> cluster member overlay lookup +
+		 *        OBS-1 resolve; overlay miss / UNKNOWN -> 53R9C (per
+		 *        L199 NO PG-native fallback; the member-serve wire
+		 *        that would answer a miss positively is a later
+		 *        deliverable of this spec)
+		 *     5. derived OWN slot -> fall through to PG-native: above
+		 *        the floor only this node ever issues its congruence
+		 *        class, so the local SLRU member decode is provably
+		 *        alias-free
 		 *
 		 *   IN_PROGRESS authoritative state in resolve_visibility ->
 		 *   VISIBLE (per OBS-1 truth table:  uncommitted Update/
 		 *   NoKeyUpdate not yet hides tuple).  UNKNOWN -> 53R9C.
-		 *
-		 *   PGRAC multi-xmax alias floor: step 5's "marker says local ->
-		 *   PG-native" is NOT safe -- the D7b marker stamps the READER's
-		 *   own id, so it says "local" for every multi, and the native
-		 *   decode of a foreign multi resolves against unrelated LOCAL
-		 *   members once the local counter passes that id (silent
-		 *   false-visible; spec-7.1 census probe F).  Until the origin is
-		 *   derivable, an updater-bearing multi in peer mode fails closed
-		 *   HERE, before the native fall-through.  Lock-only multis never
-		 *   cut visibility (native returns visible without a member
-		 *   decode) and an XMAX_INVALID-hinted multi is never decoded;
-		 *   both stay readable.
-		 *   Spec: spec-7.1-cross-instance-positive-interread.md (D3 floor)
+		 *   Spec: spec-7.1-cross-instance-positive-interread.md (D3-a)
 		 */
 		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0) {
 			TransactionId raw_xmax_multi = HeapTupleHeaderGetRawXmax(tuple);
-			Page page = BufferGetPage(buffer);
-			uint16 marker_origin = 0;
 
 			if (MultiXactIdIsValid((MultiXactId)raw_xmax_multi)
 				&& !(tuple->t_infomask & HEAP_XMAX_INVALID)
-				&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
-				&& cluster_peer_mode_enabled())
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
-						 errmsg("cluster multixact %u cannot be attributed to an origin node",
-								(unsigned)raw_xmax_multi),
-						 errhint("Multixact ids are node-local and this tuple's deleting "
-								 "multixact cannot be proven local; cross-node multixact "
-								 "resolution is not implemented yet. Retry the transaction.")));
+				&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) && cluster_peer_mode_enabled()) {
+				int mx_origin = -1;
 
-			if (MultiXactIdIsValid((MultiXactId)raw_xmax_multi)
-				&& cluster_itl_find_multixact_origin_by_xmax(page, (MultiXactId)raw_xmax_multi,
-															 &marker_origin)
-				&& (int32)marker_origin != cluster_node_id) {
-				/*
-				 * Remote-origin MultiXact tuple visible reader.  Stack-
-				 * allocate result struct with members[256] cap matching
-				 * V4 wire ceiling.
-				 */
-				ClusterMultiXactKey mxkey;
-				ClusterMultiXactMemberOverlayResult *mxres;
-				ClusterVisibilityDecision mvcc_decision;
-				Size resbuf_sz = offsetof(ClusterMultiXactMemberOverlayResult, members)
-								 + 256 * sizeof(ClusterMultiXactMember);
+				if (cluster_multi_xmax_remote_resolve)
+					mx_origin = cluster_mxid_origin_slot((MultiXactId)raw_xmax_multi);
 
-				memset(&mxkey, 0, sizeof(mxkey));
-				mxkey.origin_node_id = marker_origin;
-				mxkey.multixact_id = (MultiXactId)raw_xmax_multi;
-				mxkey.cluster_epoch = (uint32)cluster_epoch_get_current();
-
-				mxres = (ClusterMultiXactMemberOverlayResult *)palloc0(resbuf_sz);
-
-				if (!cluster_multixact_member_overlay_lookup(&mxkey, mxres, 256)) {
-					pfree(mxres);
+				if (mx_origin < 0) {
+					/* D3-0 floor: origin not provable -> fail closed */
+					cluster_multixact_note_underivable_read();
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
-							 errmsg("cluster multixact member overlay miss for "
-									"remote multixact id %u from node %u",
-									(unsigned)mxkey.multixact_id, (unsigned)mxkey.origin_node_id),
-							 errhint("Remote multixact member overlay is not "
-									 "available;  retry the transaction after "
-									 "the origin emits a fresh overlay.")));
+							 errmsg("cluster multixact %u cannot be attributed to an origin node",
+									(unsigned)raw_xmax_multi),
+							 errhint("Multixact ids are node-local and this tuple's deleting "
+									 "multixact cannot be proven local; cross-node multixact "
+									 "resolution needs mxid striping and "
+									 "cluster.multi_xmax_remote_resolve. Retry the transaction.")));
 				}
+				if (mx_origin != cluster_node_id) {
+					bool mx_hit = false;
 
-				mvcc_decision = cluster_multixact_resolve_visibility(mxres, snapshot);
-				pfree(mxres);
-
-				switch (mvcc_decision) {
-				case CLUSTER_VISIBILITY_VISIBLE:
-					return true;
-				case CLUSTER_VISIBILITY_INVISIBLE:
-					return false;
-				case CLUSTER_VISIBILITY_UNKNOWN:
-				default:
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
-							 errmsg("cluster multixact resolve visibility UNKNOWN "
-									"for multixact id %u from node %u",
-									(unsigned)mxkey.multixact_id, (unsigned)mxkey.origin_node_id),
-							 errhint("Member commit_scn not yet propagated;  retry "
-									 "transaction.")));
+					switch (cluster_multixact_remote_xmax_resolve(
+						(uint16)mx_origin, (MultiXactId)raw_xmax_multi, snapshot, &mx_hit)) {
+					case CLUSTER_VISIBILITY_VISIBLE:
+						return true;
+					case CLUSTER_VISIBILITY_INVISIBLE:
+						return false;
+					case CLUSTER_VISIBILITY_UNKNOWN:
+					default:
+						if (!mx_hit)
+							ereport(ERROR, (errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+											errmsg("cluster multixact member overlay miss for "
+												   "remote multixact id %u from node %d",
+												   (unsigned)raw_xmax_multi, mx_origin),
+											errhint("Remote multixact member overlay is not "
+													"available;  retry the transaction after "
+													"the origin emits a fresh overlay.")));
+						ereport(ERROR, (errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+										errmsg("cluster multixact resolve visibility UNKNOWN "
+											   "for multixact id %u from node %d",
+											   (unsigned)raw_xmax_multi, mx_origin),
+										errhint("Member commit_scn not yet propagated;  retry "
+												"transaction.")));
+					}
 				}
+				/* mx_origin == cluster_node_id: provably OUR multixact
+				 * above the activation floor -> the PG-native member
+				 * decode below is alias-free. */
 			}
-			/* else:  no marker / local-origin multixact / invalid mid ->
+			/* lock-only / XMAX_INVALID / invalid mid / non-peer ->
 			 * fall through to PG-native MultiXact resolution below. */
 		}
 	}
@@ -2141,18 +2152,16 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	 */
 	if (cluster_shared_catalog && cluster_enabled && BufferIsValid(buffer)
 		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_LOCAL
-		&& cluster_tuple_has_remote_evidence(buffer, tuple))
-	{
+		&& cluster_tuple_has_remote_evidence(buffer, tuple)) {
 		/* spec-6.14 D10b: count the fail-closed outcome (dump key
 		 * catalog.vis_unknown_count) before raising. */
 		cluster_catalog_stats_vis_unknown_inc();
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-				 errmsg("foreign-origin tuple cannot be judged under a LOCAL snapshot "
-						"with cluster.shared_catalog enabled"),
-				 errhint("Catalog services on this node are not ready yet (starting up, "
-						 "shutting down, or in recovery); retry once the cluster reaches "
-						 "the RUNNING phase.")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("foreign-origin tuple cannot be judged under a LOCAL snapshot "
+							   "with cluster.shared_catalog enabled"),
+						errhint("Catalog services on this node are not ready yet (starting up, "
+								"shutting down, or in recovery); retry once the cluster reaches "
+								"the RUNNING phase.")));
 	}
 #endif /* USE_PGRAC_CLUSTER */
 
@@ -2293,12 +2302,11 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		case 0:
 			return false;
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-					 errmsg("cluster TT status unknown for deleting xmax of xid %u",
-							HeapTupleHeaderGetRawXmax(tuple)),
-					 errhint("Remote deleter commit state not yet propagated; "
-							 "retry or abort.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+							errmsg("cluster TT status unknown for deleting xmax of xid %u",
+								   HeapTupleHeaderGetRawXmax(tuple)),
+							errhint("Remote deleter commit state not yet propagated; "
+									"retry or abort.")));
 		}
 	}
 #endif
