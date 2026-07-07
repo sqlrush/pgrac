@@ -78,7 +78,11 @@ PG_FUNCTION_INFO_V1(cluster_get_nodes);
 StaticAssertDecl(sizeof(ClusterNodeRole) == sizeof(int32),
 				 "ClusterNodeRole must be int32-sized for shmem ABI stability");
 
-StaticAssertDecl(sizeof(ClusterConf) <= 65536, "ClusterConf must fit in 64 KiB");
+/* PGRAC: spec-7.2 D2 — budget raised 64 -> 128 KiB when data_addr joined
+ * the per-node entry (128 slots x 128B pushed the old bound;  the region
+ * is shmem-only, so the budget is an anchor against accidental bloat,
+ * not a wire/disk contract).  cluster-conf-design.md §3.2 amended. */
+StaticAssertDecl(sizeof(ClusterConf) <= 131072, "ClusterConf must fit in 128 KiB");
 
 
 /* ============================================================
@@ -476,6 +480,17 @@ apply_node_field(ClusterNodeInfo *n, const char *key, const char *value, const c
 			return false;
 		}
 		strlcpy(n->public_addr, value, sizeof(n->public_addr));
+		return true;
+	}
+	/* PGRAC: spec-7.2 D2 — optional DATA-plane listener address.  Empty
+	 * (or absent) = data plane off for this node;  never derived from
+	 * interconnect_addr (r1-F2: no port guessing). */
+	if (strcmp(key, "data_addr") == 0) {
+		if (*value != '\0' && !validate_addr_format(value)) {
+			*out_err = "data_addr must be empty or in host:port form";
+			return false;
+		}
+		strlcpy(n->data_addr, value, sizeof(n->data_addr));
 		return true;
 	}
 	if (strcmp(key, "role") == 0) {
