@@ -940,6 +940,18 @@ cluster_gcs_get_block_request_count(void)
 {
 	return 0;
 }
+/* spec-7.2 D6 stubs: ship-latency histogram accessors. */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	return (bucket == 15) ? UINT64_MAX : (uint64)(bucket + 1) * 1000;
+}
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	(void)bucket;
+	return 0;
+}
 uint64
 cluster_gcs_get_block_reply_count(void)
 {

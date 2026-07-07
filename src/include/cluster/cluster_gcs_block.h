@@ -1788,6 +1788,23 @@ extern uint64 cluster_gcs_get_block_storage_fallback_count(void);
 extern uint64 cluster_gcs_get_block_master_not_holder_count(void);
 extern uint64 cluster_gcs_get_block_wal_flush_before_ship_count(void);
 extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
+
+/*
+ * PGRAC: spec-7.2 D6 — requester-side block-ship latency histogram.
+ *
+ *	16 log-scale buckets in microseconds;  bucket b counts completions
+ *	with elapsed <= bound(b), last bucket is the +inf overflow.  Samples
+ *	are recorded at the single normal-exit funnel of
+ *	cluster_gcs_send_block_request_and_wait (GRANTED / STORAGE_FALLBACK /
+ *	READ_IMAGE);  terminal-ereport exits lose the sample.  This is the
+ *	ruler for the spec-7.2 value gate (p99 < 20ms, p50 < 5ms) and the
+ *	7.7/7.8 wait-closure legs.  dump category 'gcs', keys
+ *	ship_hist_us_le_<bound> + ship_hist_us_inf.
+ */
+#define CLUSTER_GCS_SHIP_HIST_BUCKETS 16
+extern uint64 cluster_gcs_block_ship_hist_bound_us(int bucket);
+extern uint64 cluster_gcs_block_ship_hist_count(int bucket);
+
 /* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
 extern uint64 cluster_gcs_get_scratch_copy_count(void);
 extern uint64 cluster_gcs_get_live_sge_send_count(void);

@@ -281,10 +281,39 @@ typedef struct ClusterGcsBlockShared {
 					   * comparable version unit (per-thread WAL makes
 					   * cross-node LSN comparison meaningless) */
 	} pi_note_ring[CLUSTER_GCS_PI_NOTE_RING_SIZE];
+
+	/* PGRAC: spec-7.2 D6 — requester-side block-ship latency histogram.
+	 * Bucketed at the single normal-exit funnel of
+	 * cluster_gcs_send_block_request_and_wait (GRANTED / STORAGE_FALLBACK /
+	 * READ_IMAGE completions only;  ereport exits lose the sample, mirroring
+	 * the xp scopes).  This is the ruler for the spec-7.2 value gate
+	 * (ship p99 < 20ms, p50 < 5ms) and the 7.7/7.8 wait-closure legs. */
+	pg_atomic_uint64 ship_latency_hist[CLUSTER_GCS_SHIP_HIST_BUCKETS];
 } ClusterGcsBlockShared;
 
 
 static ClusterGcsBlockShared *ClusterGcsBlock = NULL;
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram bucket upper bounds (us).
+ * 15 bounds -> 16 buckets;  the last bucket is the +inf overflow. */
+static const uint64 gcs_ship_hist_bounds_us[CLUSTER_GCS_SHIP_HIST_BUCKETS - 1]
+	= { 500,	1000,	2000,	 5000,	  10000,   20000,	 50000,	  100000,
+		200000, 500000, 1000000, 2000000, 5000000, 10000000, 30000000 };
+
+/* Record one completed ship into the histogram (requester context). */
+static void
+gcs_block_ship_hist_record(TimestampTz started_at)
+{
+	uint64 elapsed_us;
+	int b = 0;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+	elapsed_us = (uint64)(GetCurrentTimestamp() - started_at);
+	while (b < CLUSTER_GCS_SHIP_HIST_BUCKETS - 1 && elapsed_us > gcs_ship_hist_bounds_us[b])
+		b++;
+	pg_atomic_fetch_add_u64(&ClusterGcsBlock->ship_latency_hist[b], 1);
+}
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 
 
@@ -381,6 +410,9 @@ cluster_gcs_block_shmem_init(void)
 
 	if (!found) {
 		memset(ClusterGcsBlock, 0, sizeof(*ClusterGcsBlock));
+		/* PGRAC: spec-7.2 D6 — ship-latency histogram buckets. */
+		for (i = 0; i < CLUSTER_GCS_SHIP_HIST_BUCKETS; i++)
+			pg_atomic_init_u64(&ClusterGcsBlock->ship_latency_hist[i], 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_request_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_reply_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_timeout_count, 0);
@@ -1330,6 +1362,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	ClusterXpScope xp_recv;
 	bool xp_is_read;
 	bool xp_is_index;
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp. */
+	TimestampTz ship_started_at;
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1380,6 +1414,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		cluster_xp_begin(&xp_idx, CLXP_I_INDEX_BLOCK_XFER);
 	else
 		xp_idx.active = false;
+
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp (always on,
+	 * unlike the GUC-gated xp scopes above;  the histogram is the value-
+	 * gate ruler so it must not depend on profiling being enabled). */
+	ship_started_at = GetCurrentTimestamp();
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)transition_id, current_master, &request_id);
@@ -1969,6 +2008,13 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	 * paths above simply lose the sample (stack scope, harmless). */
 	cluster_xp_end(&xp_idx);
 	cluster_xp_end(&xp_req);
+
+	/* PGRAC: spec-7.2 D6 — record the completed ship into the latency
+	 * histogram (GRANTED / STORAGE_FALLBACK / READ_IMAGE all delivered a
+	 * usable page;  the terminal-denied tail below ereports and loses the
+	 * sample, mirroring the xp scopes). */
+	if (granted || granted_storage_fallback || read_image)
+		gcs_block_ship_hist_record(ship_started_at);
 
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
@@ -6319,6 +6365,25 @@ uint64
 cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_ship_bytes_total) : 0;
+}
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram accessors (dump + tests). */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	if (bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	if (bucket == CLUSTER_GCS_SHIP_HIST_BUCKETS - 1)
+		return UINT64_MAX; /* +inf overflow bucket */
+	return gcs_ship_hist_bounds_us[bucket];
+}
+
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	if (ClusterGcsBlock == NULL || bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	return pg_atomic_read_u64(&ClusterGcsBlock->ship_latency_hist[bucket]);
 }
 
 /* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
