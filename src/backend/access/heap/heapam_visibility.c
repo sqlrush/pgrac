@@ -108,6 +108,7 @@
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_inject.h"	/* D5b test-only inject helper */
 #include "cluster/cluster_cr.h"					/* spec-3.9 D5 CR 3-tier MVCC gate */
+#include "cluster/cluster_runtime_visibility.h" /* spec-7.1 D1: try_resolve_remote */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D1 单一解析器 */
 #include "cluster/cluster_mode.h"				/* spec-3.14 storage-mode gate */
 #include "cluster/cluster_xid_stripe.h"			/* spec-6.15 D7 foreign-xmax discipline */
@@ -1929,10 +1930,77 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				}
 
 				/*
+				 * PGRAC: spec-7.1 D1 requester 半边 (IN-9).  An overlay miss
+				 * means the V4 hint wire has not ARRIVED, not that raw_xmin
+				 * has no terminal state -- the origin's durable TT is
+				 * authoritative (Fast Commit stamps it pre-commit).  Before
+				 * failing closed, ask the origin for a complete by-xid
+				 * verdict.  This is the SAME buffer-content-lock context and
+				 * verdict wire as the shipped recycled-slot ask (6.12i
+				 * try_resolve_remote called from classify_ref): res came back
+				 * from cluster_visibility_resolve_tuple_scn above, so its
+				 * internal depth guard already balanced -- no new lock is
+				 * held across this wire (Impl note IN-9 锁上下文).  positive
+				 * proof only: any refuse / UNKNOWN / covers-miss falls through
+				 * to the 53R97 below (Rule 8.A; direction unchanged).  The
+				 * covers SCN-domain gate (D2) is applied inside
+				 * try_resolve_remote, so a page version the origin's window
+				 * does not cover still fails closed.
+				 */
+				if (cluster_crossnode_runtime_visibility && res.ref.undo_segment_id != 0) {
+					int d1_origin = cluster_xid_origin_slot(raw_xmin);
+					bool d1_committed = false;
+					bool d1_is_bound = false;
+					SCN d1_scn = InvalidScn;
+					SCN d1_block_scn = ((PageHeader)BufferGetPage(buffer))->pd_block_scn;
+
+					if (d1_origin >= 0 && d1_origin != cluster_node_id) {
+						cluster_vis53r97_note_xmin_overlay_verdict_ask();
+						if (cluster_runtime_visibility_try_resolve_remote(
+								d1_origin, (uint32)res.ref.undo_segment_id, raw_xmin, d1_block_scn,
+								snapshot->read_scn, &d1_committed, &d1_scn, &d1_is_bound)) {
+							if (!d1_committed) {
+								/* origin proved ABORTED -> this xmin was never
+								 * visible to any snapshot. */
+								cluster_vis53r97_note_xmin_overlay_verdict_hit();
+								return false;
+							}
+							switch (cluster_visibility_decide_by_scn(d1_scn, snapshot->read_scn)) {
+							case CLUSTER_VISIBILITY_VISIBLE:
+								cluster_vis53r97_note_xmin_overlay_verdict_hit();
+								/* xmin visible via verdict; the remote deleter
+								 * (xmax) side still must be checked before
+								 * answering visible (spec-4.5a G6, mirrors the
+								 * COMMITTED-overlay arm above). */
+								switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple,
+																			   snapshot)) {
+								case 1:
+									return true;
+								case 0:
+									return false;
+								default:
+									break; /* xmax unprovable -> fall to 53R97 */
+								}
+								break;
+							case CLUSTER_VISIBILITY_INVISIBLE:
+								cluster_vis53r97_note_xmin_overlay_verdict_hit();
+								return false;
+							case CLUSTER_VISIBILITY_UNKNOWN:
+								break; /* undecidable at this read_scn -> 53R97 */
+							}
+						}
+					}
+				}
+
+				/*
 				 * HC181 fail-closed.  L177 NO WAIT.  Reaches here on overlay
-				 * lookup miss, COMMITTED with UNKNOWN SCN decision, or an
-				 * unknown status enum value.  evidence is REMOTE so there is
-				 * NO PG-native fallback (C-V2 / L199).
+				 * lookup miss (with the D1 verdict ask above also unable to
+				 * prove a terminal state), COMMITTED with UNKNOWN SCN
+				 * decision, or an unknown status enum value.  evidence is
+				 * REMOTE so there is NO PG-native fallback (C-V2 / L199).
+				 * This leg's residual is attributable as
+				 * (xmin_overlay_verdict_ask - hit): every ask that did not
+				 * prove a terminal state fell through to here (D5 / census).
 				 */
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 								errmsg("cluster TT status unknown for xid %u", raw_xmin),

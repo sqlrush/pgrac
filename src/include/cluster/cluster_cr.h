@@ -280,6 +280,11 @@ extern void cluster_vis53r97_note_srv_other(void);
 extern void cluster_vis53r97_note_covers_refuse(void);
 extern void cluster_vis53r97_note_multi_unresolvable(void);
 extern void cluster_vis53r97_note_xmax_unprovable(void);
+/* spec-7.1 D1 requester 半边: xmin overlay-miss verdict ask / hit. */
+extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void);
+extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void);
+extern void cluster_vis53r97_note_xmin_overlay_verdict_ask(void);
+extern void cluster_vis53r97_note_xmin_overlay_verdict_hit(void);
 
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict

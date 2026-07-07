@@ -190,6 +190,18 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 vis53r97_leg_covers_refuse_count;
 	pg_atomic_uint64 vis53r97_leg_multi_unresolvable_count;
 	pg_atomic_uint64 vis53r97_leg_xmax_unprovable_count;
+	/*
+	 * spec-7.1 D1 requester 半边: the xmin overlay-miss leg (census S5's
+	 * largest 53R97 source) asks the origin for a by-xid verdict before
+	 * failing closed.  ask = every such verdict ask issued; hit = the ask
+	 * proved a terminal state (positive interread).  ask far exceeding the
+	 * distinct-missed-xid count over a census window is the same-xid
+	 * thundering-herd signal (N backends miss one hot xid -> N parallel asks
+	 * to one origin; singleflight is a 7.2/7.3 concern -- D5 only makes it
+	 * observable, IN-9 执行条件 2).
+	 */
+	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_ask_count;
+	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_hit_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -278,6 +290,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_covers_refuse_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_unresolvable_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -483,6 +497,25 @@ cluster_vis53r97_note_xmax_unprovable(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 1);
 }
+
+/* spec-7.1 D1 requester 半边: xmin overlay-miss verdict ask / hit. */
+void
+cluster_vis53r97_note_xmin_overlay_verdict_ask(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 1);
+}
+
+void
+cluster_vis53r97_note_xmin_overlay_verdict_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 1);
+}
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_ask_count,
+					vis53r97_leg_xmin_overlay_verdict_ask_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_hit_count,
+					vis53r97_leg_xmin_overlay_verdict_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
