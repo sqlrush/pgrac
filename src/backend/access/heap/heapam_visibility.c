@@ -1565,8 +1565,11 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		 * is retryable.  (Lock-only multis returned 1 above: a lock never
 		 * deletes the row, no member decode is needed.)
 		 */
-		if (cluster_peer_mode_enabled())
+		if (cluster_peer_mode_enabled()) {
+			/* PGRAC: spec-7.1 D0 census — foreign-multi refuse leg (D3 target). */
+			cluster_vis53r97_note_multi_unresolvable();
 			return -1;
+		}
 		xmax = HeapTupleGetUpdateXid(tuple);
 	} else
 		xmax = HeapTupleHeaderGetRawXmax(tuple);
@@ -1600,6 +1603,8 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			return 0;
 		default:
+			/* PGRAC: spec-7.1 D0 census — deleting-xmax unproven leg. */
+			cluster_vis53r97_note_xmax_unprovable();
 			return -1; /* unknown / unresolved -> fail closed */
 		}
 	}
@@ -1631,6 +1636,8 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		return 0;	  /* our committed delete, visible to this snapshot */
 	}
 
+	/* PGRAC: spec-7.1 D0 census — deleting-xmax unproven leg. */
+	cluster_vis53r97_note_xmax_unprovable();
 	return -1; /* origin unprovable -> fail closed */
 }
 #endif

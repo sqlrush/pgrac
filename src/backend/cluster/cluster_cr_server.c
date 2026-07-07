@@ -402,12 +402,16 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
-	if (!TransactionIdIsNormal(xid))
+	if (!TransactionIdIsNormal(xid)) {
+		cluster_vis53r97_note_srv_other();
 		return false;
+	}
 
 	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
-	if (!cluster_xid_is_mine(xid))
+	if (!cluster_xid_is_mine(xid)) {
+		cluster_vis53r97_note_srv_other();
 		return false;
+	}
 
 	/* Co-sample the authority triple BEFORE the scan (see banner). */
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
@@ -428,8 +432,10 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	switch (
 		cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn, NULL, NULL, &wrap)) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
-		if (!TransactionIdDidCommit(xid))
+		if (!TransactionIdDidCommit(xid)) {
+			cluster_vis53r97_note_srv_other();
 			return false; /* C1b: stamped-then-crashed is in-doubt */
+		}
 		if (cluster_cr_accept_resolved_scn(scn)) {
 			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 			v->commit_scn = scn;
@@ -456,11 +462,15 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		 * No gated recycle this incarnation -> the recycled-recurrence
 		 * candidate is unboundable -> refuse, exactly like zero-match.
 		 */
-		if (!cluster_cr_retention_proof_origin_legs(&horizon))
+		if (!cluster_cr_retention_proof_origin_legs(&horizon)) {
+			cluster_vis53r97_note_srv_other();
 			return false;
+		}
 		horizon = cluster_tt_slot_max_recycle_horizon();
-		if (!SCN_VALID(horizon))
+		if (!SCN_VALID(horizon)) {
+			cluster_vis53r97_note_srv_other();
 			return false;
+		}
 		if (scn_time_cmp(scn, horizon) > 0)
 			horizon = scn;
 		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
@@ -480,11 +490,15 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		 * (no gated recycle this incarnation — e.g. all recycles predate a
 		 * restart) refuses fail-closed.
 		 */
-		if (!cluster_cr_retention_proof_origin_legs(&horizon))
+		if (!cluster_cr_retention_proof_origin_legs(&horizon)) {
+			cluster_vis53r97_note_srv_other();
 			return false;
+		}
 		horizon = cluster_tt_slot_max_recycle_horizon();
-		if (!SCN_VALID(horizon))
+		if (!SCN_VALID(horizon)) {
+			cluster_vis53r97_note_srv_other();
 			return false;
+		}
 		if (TransactionIdDidCommit(xid)) {
 			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
 			v->horizon_scn = horizon;
@@ -494,12 +508,18 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
 			return true;
 		}
+		cluster_vis53r97_note_srv_zero_match();
 		return false; /* neither explicit CLOG state -> refuse */
 
 	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
+		/* spec-7.1 D0 census: the delayed-cleanout window leg (D1 target). */
+		cluster_vis53r97_note_srv_invalid_scn();
+		return false;
+
 	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
 	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
 	default:
+		cluster_vis53r97_note_srv_other();
 		return false;
 	}
 }

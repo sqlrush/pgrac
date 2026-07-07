@@ -1871,6 +1871,37 @@ cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-7.1 D0/D5: 53R97 per-leg attribution counters. */
+uint64
+cluster_vis53r97_leg_invalid_scn_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_zero_match_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_srv_other_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_covers_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_unresolvable_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmax_unprovable_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)

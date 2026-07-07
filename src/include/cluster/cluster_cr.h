@@ -266,6 +266,21 @@ extern void cluster_rtvis_verdict_note_inadmissible(void);
 extern uint64 cluster_rtvis_underivable_failclosed_count(void);
 extern void cluster_rtvis_note_underivable_failclosed(void);
 
+/* spec-7.1 D0/D5: 53R97 per-leg attribution (3 server legs + 3 requester
+ * legs; see the ClusterCRShared field comment for each leg's meaning). */
+extern uint64 cluster_vis53r97_leg_invalid_scn_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_zero_match_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_srv_other_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_covers_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_multi_unresolvable_count(void);
+extern uint64 cluster_vis53r97_leg_xmax_unprovable_count(void);
+extern void cluster_vis53r97_note_srv_invalid_scn(void);
+extern void cluster_vis53r97_note_srv_zero_match(void);
+extern void cluster_vis53r97_note_srv_other(void);
+extern void cluster_vis53r97_note_covers_refuse(void);
+extern void cluster_vis53r97_note_multi_unresolvable(void);
+extern void cluster_vis53r97_note_xmax_unprovable(void);
+
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict
  * serve (cluster_cr_server.c).

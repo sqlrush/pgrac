@@ -2643,6 +2643,19 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* spec-7.1 D0/D5: 53R97 per-leg attribution (census + error-closure dial). */
+	emit_row(rsinfo, "cr", "vis53r97_leg_invalid_scn_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_invalid_scn_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_zero_match_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_zero_match_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_srv_other_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_srv_other_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_covers_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_covers_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_unresolvable_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_unresolvable_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_xmax_unprovable_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_xmax_unprovable_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

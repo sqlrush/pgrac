@@ -242,6 +242,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 
 	if (!cluster_vis_live_authority_covers(demand_scn, auth)) {
 		cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
+		cluster_vis53r97_note_covers_refuse();		/* spec-7.1 D0 census (union) */
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
