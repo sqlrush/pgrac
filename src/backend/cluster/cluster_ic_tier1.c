@@ -1489,16 +1489,6 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
 		return false;
 	}
-	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_ic_hello_conn_epoch(&msg) != cluster_epoch_get_current()) {
-		peer_record_error(peer_id, 0, "08P01",
-						  "DATA HELLO conn_epoch mismatch (peer=" UINT64_FORMAT
-						  " mine=" UINT64_FORMAT ")",
-						  cluster_ic_hello_conn_epoch(&msg), cluster_epoch_get_current());
-		cluster_ic_tier1_close_peer(peer_id, "DATA HELLO conn_epoch mismatch");
-		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
-		return false;
-	}
 
 	peer_info = cluster_conf_lookup_node(msg.source_node_id);
 	if (peer_info == NULL) {
@@ -1524,8 +1514,12 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	}
 
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
-	/* PGRAC: spec-7.2 D5 — bind the connection to the peer's HELLO epoch. */
-	Tier1Shmem->peers[peer_id].conn_epoch = cluster_ic_hello_conn_epoch(&msg);
+	/* PGRAC: spec-7.2 D5 — bind the connection to THIS node's current
+	 * epoch (our own view), so the sender gate compares apples to
+	 * apples;  the peer's HELLO epoch may differ transiently during a
+	 * cold-form / reconfig window and per-message envelope HC100 (not
+	 * the HELLO) is the receiver-side stale-epoch guard. */
+	Tier1Shmem->peers[peer_id].conn_epoch = cluster_epoch_get_current();
 	Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
 	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
@@ -1676,18 +1670,14 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		return false;
 	}
 
-	/* PGRAC: spec-7.2 D2 — plane match + DATA conn_epoch equality (see
-	 * the named-peer verify path for the rationale). */
+	/* PGRAC: spec-7.2 D2 — plane match (a CONTROL peer dialing the DATA
+	 * port, or vice versa, is a wiring error).  No conn_epoch reject at
+	 * HELLO: cross-node epoch may differ transiently during cold-form /
+	 * reconfig, and per-message envelope HC100 is the stale-epoch guard
+	 * (D5 §3.2 ④). */
 	if (cluster_ic_hello_plane(&msg) != tier1_my_plane) {
 		ereport(LOG, (errmsg("cluster_ic tier1 HELLO plane mismatch (peer=%d mine=%d)",
 							 (int)cluster_ic_hello_plane(&msg), (int)tier1_my_plane)));
-		return false;
-	}
-	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_ic_hello_conn_epoch(&msg) != cluster_epoch_get_current()) {
-		ereport(LOG, (errmsg("cluster_ic tier1 DATA HELLO conn_epoch mismatch "
-							 "(peer=" UINT64_FORMAT " mine=" UINT64_FORMAT ")",
-							 cluster_ic_hello_conn_epoch(&msg), cluster_epoch_get_current())));
 		return false;
 	}
 
@@ -1704,8 +1694,9 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
-		/* PGRAC: spec-7.2 D5 — bind the connection to the peer's HELLO epoch. */
-		Tier1Shmem->peers[learned].conn_epoch = cluster_ic_hello_conn_epoch(&msg);
+		/* PGRAC: spec-7.2 D5 — bind to THIS node's current epoch (our own
+		 * view;  see the named-peer path for the rationale). */
+		Tier1Shmem->peers[learned].conn_epoch = cluster_epoch_get_current();
 		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
 		(void)peer_addr(learned);
 		cluster_sf_note_peer_hello_capabilities(learned, cluster_ic_hello_capabilities(&msg));
