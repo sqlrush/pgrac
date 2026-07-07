@@ -707,7 +707,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
  * HC92 + HC97 — see cluster_guc.h for semantics.
  */
 int cluster_gcs_block_retransmit_max_retries = 4;
-int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 10; /* spec-7.2 D1 */
 
 /* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch.
  * ON (default): the bufmgr acquire gate skips the remote master round-trip when
