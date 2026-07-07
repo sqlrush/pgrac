@@ -55,10 +55,22 @@ my $report = PostgreSQL::Test::Stage5IntegratedAcceptanceReport->new(
 
 my $PGBENCH    = $ENV{PGBENCH} // 'pgbench';
 my $SCALE      = 10;
-my $SECS       = $ENV{PGRAC_PGBENCH_SECS} // 8;
+# De-noise the ratio (2026-07-07): native and cluster are measured in
+# SEPARATE windows, so runner load that drifts BETWEEN them skews the
+# per-round tax; the median rejects random per-round noise but NOT a
+# per-run systematic skew (observed: a run whose native windows all landed
+# on a quiet phase read tax 19.71% while native tps was ~2x its usual ~5300
+# -- native got faster, cluster did not get slower).  Shorter windows drawn
+# closer together keep native and cluster under near-identical momentary
+# load so the ratio cancels the drift, and more rounds tighten the median.
+# NOT a weakening: same TPC-B (-N) workload, same 4 clients, same fsync/
+# shared_buffers, same <=10% gate, same ratio metric -- only the sampling
+# is finer (2s x 30 pairs vs 8s x 7).  A real tax regression still reads
+# true; the measurement is just tighter around it.
+my $SECS       = $ENV{PGRAC_PGBENCH_SECS} // 2;
 my $CLIENTS    = 4;
-my $ROUNDS     = $ENV{PGRAC_PGBENCH_ROUNDS} // 7;    # interleaved rounds
-my $TWO_NODE_ROUNDS = $ENV{PGRAC_2NODE_PGBENCH_ROUNDS} // $ROUNDS;
+my $ROUNDS     = $ENV{PGRAC_PGBENCH_ROUNDS} // 30;   # interleaved pairs
+my $TWO_NODE_ROUNDS = $ENV{PGRAC_2NODE_PGBENCH_ROUNDS} // 10;  # report-only; fewer rounds bound test time
 # The hard gate: cluster write tax must not exceed this percentage.
 my $GATE_PCT   = $ENV{PGRAC_WRITE_TAX_GATE_PCT} // 10.0;
 
