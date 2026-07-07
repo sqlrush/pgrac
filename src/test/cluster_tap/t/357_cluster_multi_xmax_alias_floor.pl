@@ -1,3 +1,5 @@
+#-------------------------------------------------------------------------
+#
 # 357_cluster_multi_xmax_alias_floor.pl
 #
 #   Multi-xmax alias floor: a multixact id is a node-local counter, so a
@@ -22,6 +24,14 @@
 #       aliasing reader); spec-7.1 D3 restores this with a positive proof.
 #
 # Spec: spec-7.1-cross-instance-positive-interread.md (D3 floor)
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# IDENTIFICATION
+#    src/test/cluster_tap/t/357_cluster_multi_xmax_alias_floor.pl
+#-------------------------------------------------------------------------
 
 use strict;
 use warnings FATAL => 'all';
