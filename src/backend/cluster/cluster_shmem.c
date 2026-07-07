@@ -918,6 +918,7 @@ cluster_request_shmem(void)
 	cluster_cr_pool_request_lwlocks();		  /* spec-5.51: CR pool named LWLock tranche */
 	cluster_resolver_cache_request_lwlocks(); /* spec-5.55: resolver cache LWLock tranche */
 	cluster_ges_dedup_shmem_request();
+	cluster_lms_outbound_request_lwlocks(); /* PGRAC: spec-7.2 D4 DATA ring */
 
 	/*
 	 * spec-4.5a G5: pg_xact_remote SLRU manages its own shmem (SimpleLru),

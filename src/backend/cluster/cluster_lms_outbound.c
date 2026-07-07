@@ -103,6 +103,13 @@ cluster_lms_outbound_shmem_register(void)
 	cluster_shmem_register_region(&cluster_lms_outbound_region);
 }
 
+/* Named-tranche request (process_shmem_requests window;  I15 pattern). */
+void
+cluster_lms_outbound_request_lwlocks(void)
+{
+	RequestNamedLWLockTranche("ClusterLmsDataOutbound", 1);
+}
+
 /*
  * cluster_lms_outbound_enqueue — stage one DATA-plane frame for LMS.
  *
