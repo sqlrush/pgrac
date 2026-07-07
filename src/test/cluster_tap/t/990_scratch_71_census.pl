@@ -76,11 +76,22 @@ my @KEYS = qw(
   rtvis_undo_fetch_failclosed_count
 );
 
+# spec-7.1 D3-a mxid-stripe face (dump category 'xid_stripe'): the foreign
+# updater-multi fail-closed legs and the allocator half-space guardrail.
+# activated_floor is a level (not a counter) but its delta proves the stripe
+# activated during the run.
+my @XID_STRIPE_KEYS = qw(
+  mxid_stripe_activated_floor
+  mxid_stripe_halfspace_refusals
+  mxid_stripe_underivable_reads
+);
+
 sub snap_counters
 {
 	my ($node) = @_;
 	my %s;
 	$s{$_} = state_val($node, 'cr', $_) for @KEYS;
+	$s{$_} = state_val($node, 'xid_stripe', $_) for @XID_STRIPE_KEYS;
 	return \%s;
 }
 
@@ -88,7 +99,7 @@ sub diff_counters
 {
 	my ($before, $after) = @_;
 	my %d;
-	for my $k (@KEYS)
+	for my $k (@KEYS, @XID_STRIPE_KEYS)
 	{
 		my $delta = $after->{$k} - $before->{$k};
 		$d{$k} = $delta if $delta != 0;
