@@ -113,6 +113,9 @@ typedef struct ClusterICTier1Shmem {
 	pid_t listener_pid;			 /* current LMON pid */
 	uint64 listener_incarnation; /* ++ on each LMON respawn */
 	uint32 magic;				 /* sanity check */
+	/* PGRAC: spec-7.2 D3 — frames dropped by the dispatch plane gate
+	 * (a msg_type dispatched in the wrong plane's owner process). */
+	pg_atomic_uint64 plane_misroute_reject;
 	ClusterICPeerStateShmem peers[CLUSTER_MAX_NODES];
 } ClusterICTier1Shmem;
 
@@ -450,6 +453,7 @@ tier1_shmem_init(void)
 			s->listener_port = -1;
 			s->listener_pid = 0;
 			s->listener_incarnation = 0;
+			pg_atomic_init_u64(&s->plane_misroute_reject, 0);
 
 			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 				s->peers[i].node_id = -1;
@@ -493,6 +497,30 @@ cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
 	tier1_my_plane = plane;
 	if (Tier1ShmemByPlane[plane] != NULL)
 		Tier1Shmem = Tier1ShmemByPlane[plane];
+}
+
+/* PGRAC: spec-7.2 D3 — this process's plane (router plane gates). */
+ClusterICPlane
+cluster_ic_tier1_my_plane(void)
+{
+	return tier1_my_plane;
+}
+
+/* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (this plane's
+ * instance;  pre-shmem no-op keeps the router callable in unit stubs). */
+void
+cluster_ic_tier1_bump_plane_misroute_reject(void)
+{
+	if (Tier1Shmem != NULL)
+		pg_atomic_fetch_add_u64(&Tier1Shmem->plane_misroute_reject, 1);
+}
+
+uint64
+cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
+{
+	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N || Tier1ShmemByPlane[plane] == NULL)
+		return 0;
+	return pg_atomic_read_u64(&Tier1ShmemByPlane[plane]->plane_misroute_reject);
 }
 
 static const ClusterShmemRegion cluster_ic_tier1_region = {

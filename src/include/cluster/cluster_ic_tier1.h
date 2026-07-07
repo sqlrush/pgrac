@@ -141,6 +141,11 @@ extern int cluster_ic_tier1_listener_bind(void);
  * observers — the historic instance and contract).
  */
 extern void cluster_ic_tier1_set_my_plane(ClusterICPlane plane);
+extern ClusterICPlane cluster_ic_tier1_my_plane(void);
+
+/* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */
+extern void cluster_ic_tier1_bump_plane_misroute_reject(void);
+extern uint64 cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane);
 
 /*
  * Accept exactly one pending connection on the listener fd.  Returns
