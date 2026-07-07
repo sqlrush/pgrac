@@ -902,9 +902,11 @@ extern int cluster_gcs_reply_timeout_ms;
  *
  *	cluster.gcs_block_retransmit_initial_backoff_ms
  *	  type: int   context: PGC_SUSET
- *	  default: 100 (min 10, max 5000)
- *	  Backoff before retry 1.  Subsequent retries double:  100 → 200 →
- *	  400 → 800 ms (with default max_retries=4, total backoff = 1500 ms).
+ *	  default: 10 (min 1, max 5000;  spec-7.2 D1 lowered from 100/10)
+ *	  Backoff before retry 1.  Subsequent retries double:  10 → 20 →
+ *	  40 → 80 ms (with default max_retries=4, total backoff = 150 ms).
+ *	  The per-attempt reply wait stays cluster.gcs_reply_timeout_ms;
+ *	  this only paces the fast-deny / timeout retry cadence (HC96).
  *
  *	cluster.gcs_block_dedup_max_entries
  *	  type: int   context: PGC_POSTMASTER

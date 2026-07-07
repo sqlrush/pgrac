@@ -15,7 +15,7 @@
 #	  L5  CLUSTER_WAIT_EVENTS_COUNT = 85 (was 83 spec-2.33)
 #	  L6  3 NEW GUC visible + defaults + contexts:
 #	       cluster.gcs_block_retransmit_max_retries PGC_SUSET 4
-#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 100
+#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 10 (spec-7.2 D1)
 #	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 1024
 #	  L7  single-shot ship workload — retransmit_attempt_count=0
 #	  L8  inject `cluster-gcs-block-drop-reply-before-send:skip:1` →
@@ -153,7 +153,7 @@ is($pair->node0->safe_psql(
 # ============================================================
 for my $row (
 	[ 'cluster.gcs_block_retransmit_max_retries', '4', 'superuser' ],
-	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '100', 'superuser' ],
+	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '10', 'superuser' ],
 	[ 'cluster.gcs_block_dedup_max_entries', '1024', 'postmaster' ],
 )
 {

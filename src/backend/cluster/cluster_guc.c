@@ -3860,9 +3860,11 @@ cluster_init_guc(void)
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),
 		gettext_noop("Exponential backoff base for GCS block-ship retransmit:  "
 					 "retry 1 waits this much, retry 2 doubles, etc.  Default "
-					 "100 → 100/200/400/800 ms for N=4 retries (total 1500 ms).  "
-					 "HC97.  PGC_SUSET."),
-		&cluster_gcs_block_retransmit_initial_backoff_ms, 100, 10, 5000, PGC_SUSET, 0, NULL, NULL,
+					 "10 → 10/20/40/80 ms for N=4 retries (total 150 ms;  LAN "
+					 "RTT scale, spec-7.2 D1).  Raise on slow or congested "
+					 "interconnects.  The per-attempt reply wait itself stays "
+					 "cluster.gcs_reply_timeout_ms.  HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_initial_backoff_ms, 10, 1, 5000, PGC_SUSET, 0, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",
