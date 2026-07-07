@@ -59,8 +59,9 @@
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current */
-#include "cluster/cluster_gcs_block.h" /* PGRAC: spec-7.2 D4 plane probe + pi drain */
+#include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
+#include "cluster/cluster_gcs_block.h"	 /* PGRAC: spec-7.2 D4 plane probe + pi drain */
+#include "cluster/cluster_write_fence.h" /* PGRAC: spec-7.2 D5 fence linkage */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -775,12 +776,19 @@ LmsMain(void)
 			 * the DATA plane, LMS ships its own READY results and
 			 * drives the PI-discard notes (the LMON tick twins go
 			 * quiet via the same registry probe);  the DATA outbound
-			 * ring drains here either way (empty before the flip). */
-			if (cluster_gcs_block_family_on_data_plane()) {
-				cluster_lms_cr_ship_ready();
-				cluster_gcs_block_pi_discard_drain();
+			 * ring drains here either way (empty before the flip).
+			 * D5 fence linkage: while the write-fence is enforcing and
+			 * writes are disallowed, the DATA plane sends nothing —
+			 * block images must not leave a fenced node.  Thaw wakes
+			 * the latch and the held frames drain (pure-read probe,
+			 * no-throw, per the write_fence_allowed contract). */
+			if (!(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
+				if (cluster_gcs_block_family_on_data_plane()) {
+					cluster_lms_cr_ship_ready();
+					cluster_gcs_block_pi_discard_drain();
+				}
+				(void)cluster_lms_outbound_drain_send();
 			}
-			(void)cluster_lms_outbound_drain_send();
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

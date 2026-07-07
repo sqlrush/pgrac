@@ -476,6 +476,7 @@ tier1_shmem_init(void)
 				pg_atomic_init_u64(&s->peers[i].epoch_observe_advance_count, 0);
 				/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
 				pg_atomic_init_u32(&s->peers[i].close_requested, 0);
+				s->peers[i].conn_epoch = 0;
 			}
 		}
 	}
@@ -598,6 +599,20 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	if (Tier1Shmem == NULL
 		|| Tier1Shmem->peers[target_node_id].state != (int32)CLUSTER_IC_PEER_CONNECTED)
 		return CLUSTER_IC_SEND_WOULD_BLOCK; /* HELLO pending; caller retries */
+
+	/*
+	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH sender gate) — never put a
+	 * new epoch's DATA frame on a connection established under an older
+	 * epoch:  cross-epoch interleave on one byte stream would defeat the
+	 * reconfig-rebuild ordering argument (8.A face).  HARD_ERROR makes
+	 * the data-plane loop close the peer;  reconnect + re-HELLO rebinds
+	 * at the current epoch (the epoch-watch in the LMS tick also force-
+	 * closes proactively on a bump).  CONTROL is exempt — its single
+	 * LMON stream is the epoch-event carrier itself.
+	 */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& Tier1Shmem->peers[target_node_id].conn_epoch != cluster_epoch_get_current())
+		return CLUSTER_IC_SEND_HARD_ERROR;
 
 	/*
 	 * Hardening v1.0.1 F1 (spec-2.2 v1.0.1 + spec-2.3 v1.0.1 L68):
@@ -1396,6 +1411,9 @@ cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
 	 */
 	if (Tier1Shmem != NULL) {
 		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
+		/* PGRAC: spec-7.2 D5 — bind the connection to its epoch (dialer
+		 * side stamped this epoch into its HELLO). */
+		Tier1Shmem->peers[peer_id].conn_epoch = cluster_epoch_get_current();
 		Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	}
 	ereport(LOG,
@@ -1506,6 +1524,8 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	}
 
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
+	/* PGRAC: spec-7.2 D5 — bind the connection to the peer's HELLO epoch. */
+	Tier1Shmem->peers[peer_id].conn_epoch = cluster_ic_hello_conn_epoch(&msg);
 	Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
 	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
@@ -1684,6 +1704,8 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
+		/* PGRAC: spec-7.2 D5 — bind the connection to the peer's HELLO epoch. */
+		Tier1Shmem->peers[learned].conn_epoch = cluster_ic_hello_conn_epoch(&msg);
 		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
 		(void)peer_addr(learned);
 		cluster_sf_note_peer_hello_capabilities(learned, cluster_ic_hello_capabilities(&msg));

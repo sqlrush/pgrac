@@ -99,6 +99,18 @@ typedef struct ClusterICPeerStateShmem {
 	 * close.
 	 */
 	pg_atomic_uint32 close_requested; /* 0 = idle, 1 = pending close */
+
+	/*
+	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH) — the cluster epoch this
+	 * connection was established under (recorded at the CONNECTED
+	 * transition;  DATA plane only, CONTROL leaves it 0/unenforced).
+	 * The DATA physical-send gate refuses to put bytes on a connection
+	 * whose conn_epoch != current epoch — an epoch bump structurally
+	 * invalidates the old stream and forces close + re-HELLO, so a new
+	 * epoch's frames can never interleave into an old epoch's byte
+	 * stream.  Written and read by the owning plane's process only.
+	 */
+	uint64 conn_epoch;
 } ClusterICPeerStateShmem;
 
 /*

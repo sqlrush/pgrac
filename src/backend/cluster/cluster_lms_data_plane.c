@@ -52,6 +52,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h"
+#include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D5 epoch watch */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -218,6 +219,37 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	Assert(dp_enabled);
 
 	now = GetCurrentTimestamp();
+
+	/*
+	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH ③) — proactive connection
+	 * reset on an epoch bump:  every DATA connection is bound to the
+	 * epoch it was established under, so a bump force-closes the mesh
+	 * and the reconnect below re-HELLOs at the current epoch.  The
+	 * sender gate in tier1_send_bytes is the structural backstop for
+	 * the window between the bump and this tick.
+	 */
+	{
+		static uint64 dp_last_epoch = 0;
+		static bool dp_epoch_seen = false;
+		uint64 cur_epoch = cluster_epoch_get_current();
+
+		if (!dp_epoch_seen) {
+			dp_last_epoch = cur_epoch;
+			dp_epoch_seen = true;
+		} else if (cur_epoch != dp_last_epoch) {
+			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+				if (dp_track[pi].fd >= 0) {
+					cluster_ic_tier1_close_peer(pi, "data-plane epoch bump reset");
+					dp_track[pi].fd = -1;
+					dp_track[pi].substate = LMS_DP_DOWN;
+					dp_track[pi].connect_started_at = 0;
+					dp_track[pi].next_attempt_at = 0; /* reconnect immediately */
+					dp_wes_dirty = true;
+				}
+			}
+			dp_last_epoch = cur_epoch;
+		}
+	}
 
 	/* Active-role reconnect for DOWN peers whose backoff elapsed. */
 	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
