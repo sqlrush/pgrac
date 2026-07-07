@@ -59,7 +59,8 @@
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
+#include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current */
+#include "cluster/cluster_gcs_block.h" /* PGRAC: spec-7.2 D4 plane probe + pi drain */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -381,6 +382,22 @@ cluster_lms_get_pid(void)
 	return pid;
 }
 
+/*
+ * PGRAC: spec-7.2 D4 — wake the LMS data-plane loop (mirror of
+ * cluster_lmon_wakeup):  SIGUSR1 → lms_sigusr1_handler → SetLatch.
+ * Safe from any context;  self-kick and pre-spawn calls no-op.
+ */
+void
+cluster_lms_wakeup(void)
+{
+	pid_t pid = cluster_lms_get_pid();
+
+	if (pid <= 0 || pid == MyProcPid)
+		return;
+
+	(void)kill(pid, SIGUSR1);
+}
+
 TimestampTz
 cluster_lms_get_spawned_at(void)
 {
@@ -651,6 +668,14 @@ cluster_lms_wake_drain(void)
  *	      latch / ShutdownRequestPending)
  * ============================================================ */
 
+/* PGRAC: spec-7.2 D4 — SIGUSR1 wakeup handler (latch only;  rule 16:
+ * async-signal-safe operations exclusively). */
+static void
+lms_sigusr1_handler(SIGNAL_ARGS)
+{
+	SetLatch(MyLatch);
+}
+
 void
 LmsMain(void)
 {
@@ -667,7 +692,9 @@ LmsMain(void)
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	/* No ProcSignal slot in the skeleton; see auxprocess.c early setup. */
-	pqsignal(SIGUSR1, SIG_IGN);
+	/* PGRAC: spec-7.2 D4 — SIGUSR1 = data-plane wakeup (was SIG_IGN in
+	 * the skeleton).  Handler only sets the latch (async-signal-safe). */
+	pqsignal(SIGUSR1, lms_sigusr1_handler);
 	pqsignal(SIGUSR2, SIG_IGN);
 	pqsignal(SIGCHLD, SIG_DFL);
 
@@ -743,9 +770,19 @@ LmsMain(void)
 		 * the data-plane tick (WaitEventSet: DATA sockets + MyLatch, latch
 		 * reset inside);  the historic plain WaitLatch stays the fallback
 		 * when the plane is off. */
-		if (cluster_lms_data_plane_enabled())
+		if (cluster_lms_data_plane_enabled()) {
+			/* PGRAC: spec-7.2 D4 — once the GCS block family flips to
+			 * the DATA plane, LMS ships its own READY results and
+			 * drives the PI-discard notes (the LMON tick twins go
+			 * quiet via the same registry probe);  the DATA outbound
+			 * ring drains here either way (empty before the flip). */
+			if (cluster_gcs_block_family_on_data_plane()) {
+				cluster_lms_cr_ship_ready();
+				cluster_gcs_block_pi_discard_drain();
+			}
+			(void)cluster_lms_outbound_drain_send();
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
-		else {
+		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
 			ResetLatch(MyLatch);

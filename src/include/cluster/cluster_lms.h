@@ -308,6 +308,18 @@ extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);
 
 /*
+ * PGRAC: spec-7.2 D4 — LMS wakeup (mirror of cluster_lmon_wakeup) + the
+ * DATA-plane outbound ring (cluster_lms_outbound.c;  Q6-B twin ring:
+ * backends stage DATA frames, LMS drains and sends on its own fds).
+ */
+extern void cluster_lms_wakeup(void);
+extern void cluster_lms_outbound_shmem_register(void);
+extern bool cluster_lms_outbound_enqueue(uint8 msg_type, uint32 dest_node_id, const void *payload,
+										 uint16 payload_len);
+extern int cluster_lms_outbound_drain_send(void);
+extern uint32 cluster_lms_outbound_depth(void);
+
+/*
  * Read-only accessors for SQL view + diagnostics.
  */
 extern ClusterLmsState cluster_lms_get_state(void);

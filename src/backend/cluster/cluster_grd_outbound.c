@@ -40,6 +40,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_lms.h" /* PGRAC: spec-7.2 D4 DATA-ring routing */
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
@@ -288,6 +289,20 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	bool ok;
 
 	Assert(cluster_grd_outbound_state != NULL);
+
+	/*
+	 * PGRAC: spec-7.2 D4 — plane routing at the single backend staging
+	 * entry:  a msg_type registered on the DATA plane goes to the DATA
+	 * twin ring (LMS drains + sends);  everything else stays on this
+	 * CONTROL ring (LMON).  Before the plane flip every type reads
+	 * CONTROL here, so this branch is dormant until the flip commit.
+	 */
+	{
+		const ClusterICMsgTypeInfo *pinfo = cluster_ic_get_msg_type_info(msg_type);
+
+		if (pinfo != NULL && (ClusterICPlane)pinfo->plane == CLUSTER_IC_PLANE_DATA)
+			return cluster_lms_outbound_enqueue(msg_type, dest_node_id, payload, payload_len);
+	}
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 

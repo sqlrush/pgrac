@@ -300,6 +300,21 @@ static const uint64 gcs_ship_hist_bounds_us[CLUSTER_GCS_SHIP_HIST_BUCKETS - 1]
 	= { 500,	1000,	2000,	 5000,	  10000,   20000,	 50000,	  100000,
 		200000, 500000, 1000000, 2000000, 5000000, 10000000, 30000000 };
 
+/*
+ * PGRAC: spec-7.2 D3/D4 — registry probe:  is the GCS block family on
+ * the DATA plane?  REPLY stands in for all five (they flip atomically,
+ * H-5).  Both LMON tick sites (ship_ready / pi_discard) and the LMS
+ * data-plane loop consult this so the flip commit only edits the six
+ * registration structs and everything pivots at once.
+ */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	const ClusterICMsgTypeInfo *info = cluster_ic_get_msg_type_info(PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+
+	return info != NULL && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA;
+}
+
 /* Record one completed ship into the histogram (requester context). */
 static void
 gcs_block_ship_hist_record(TimestampTz started_at)

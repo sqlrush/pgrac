@@ -681,6 +681,9 @@ cluster_init_shmem_module(void)
 		cluster_grd_outbound_shmem_register();
 	if (cluster_shmem_lookup_region("pgrac cluster grd work queue") == NULL)
 		cluster_grd_work_queue_shmem_register();
+	/* PGRAC: spec-7.2 D4 — DATA-plane outbound ring (Q6-B twin). */
+	if (cluster_shmem_lookup_region("pgrac cluster lms data outbound") == NULL)
+		cluster_lms_outbound_shmem_register();
 
 	/*
 	 * spec-2.4 D2: register cluster_epoch shmem region.  64-byte cache-

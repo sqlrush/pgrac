@@ -1099,7 +1099,8 @@ LmonMain(void)
 				cluster_ges_lmon_drain_work_queue();
 			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+			if (!cluster_gcs_block_family_on_data_plane()
+				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
 				cluster_lms_cr_ship_ready();
 			/*
 			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
@@ -1175,7 +1176,8 @@ LmonMain(void)
 			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard write
 			 * notes and route each to the block's master (fire-and-forget;
 			 * only LMON owns the tier1 fds, L172 family). */
-			cluster_gcs_block_pi_discard_drain();
+			if (!cluster_gcs_block_family_on_data_plane())
+				cluster_gcs_block_pi_discard_drain();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
@@ -1770,7 +1772,8 @@ LmonMain(void)
 			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+			if (!cluster_gcs_block_family_on_data_plane()
+				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
 				cluster_lms_cr_ship_ready();
 
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
@@ -1792,7 +1795,8 @@ LmonMain(void)
 				cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
 			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard notes. */
-			cluster_gcs_block_pi_discard_drain();
+			if (!cluster_gcs_block_family_on_data_plane())
+				cluster_gcs_block_pi_discard_drain();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 

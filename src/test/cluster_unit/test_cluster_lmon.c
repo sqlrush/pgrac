@@ -202,6 +202,13 @@ int cluster_interconnect_recv_timeout_ms = 30000;
 /* spec-7.2 D1 GUC (cluster_lmon_duty_should_run references it). */
 bool cluster_ic_duty_lazy = true;
 
+/* spec-7.2 D4 stub: plane-flip registry probe (skeleton = CONTROL). */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return false;
+}
+
 #include "cluster/cluster_ic_tier1.h"
 
 int

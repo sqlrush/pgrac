@@ -1805,6 +1805,9 @@ extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
 extern uint64 cluster_gcs_block_ship_hist_bound_us(int bucket);
 extern uint64 cluster_gcs_block_ship_hist_count(int bucket);
 
+/* PGRAC: spec-7.2 D3/D4 — registry probe for the atomic plane flip. */
+extern bool cluster_gcs_block_family_on_data_plane(void);
+
 /* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
 extern uint64 cluster_gcs_get_scratch_copy_count(void);
 extern uint64 cluster_gcs_get_live_sge_send_count(void);
