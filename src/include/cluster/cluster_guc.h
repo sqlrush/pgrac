@@ -925,6 +925,15 @@ extern int cluster_gcs_block_retransmit_initial_backoff_ms;
  * (default on).  See cluster_guc.c for semantics. */
 extern bool cluster_gcs_block_local_cache;
 extern bool cluster_tx_enqueue_wait_enabled; /* spec-5.2 D4 */
+
+/*
+ *	cluster.ic_duty_lazy
+ *	  type: bool   context: PGC_SIGHUP   default: on
+ *	  spec-7.2 D1 — gate the lazy-able (queue-consumption) LMON duty
+ *	  families behind producer dirty marks + a >= 1 Hz floor.  Never-lazy
+ *	  correctness families are unaffected.  Off = pre-7.2 behavior.
+ */
+extern bool cluster_ic_duty_lazy;
 extern int cluster_gcs_block_dedup_max_entries;
 
 /* PGRAC: spec-4.7 D1 — bounded wait (ms) on a RECOVERING block resource

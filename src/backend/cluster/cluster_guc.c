@@ -720,6 +720,7 @@ bool cluster_gcs_block_local_cache = true;
  * remote row-lock conflict block until the holder completes; off reverts to
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
+bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -3854,6 +3855,18 @@ cluster_init_guc(void)
 										  "spec-5.2 D4.  PGC_SUSET."),
 							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
 							 NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.ic_duty_lazy",
+		gettext_noop("Run lazy-able LMON duty-chain drains on demand instead of every iteration."),
+		gettext_noop("When on (default), the queue-consumption duty families in the "
+					 "LMON main loop (outbound drains / ship-ready / sinval out / "
+					 "tt-hint / dedup TTL / backup / GES work queue) run only when "
+					 "their producer marked them dirty or on the >= 1 Hz floor.  "
+					 "Correctness families (fence / sweeps / reconfig / recovery) "
+					 "always run every iteration.  Off restores the run-every-"
+					 "iteration behavior (escape hatch).  spec-7.2 D1.  PGC_SIGHUP."),
+		&cluster_ic_duty_lazy, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",

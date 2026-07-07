@@ -176,6 +176,9 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 	cluster_grd_outbound_state->ring_head
 		= (cluster_grd_outbound_state->ring_head + 1) % PGRAC_GES_OUTBOUND_RING_CAPACITY;
 	cluster_grd_outbound_state->ring_count++;
+	/* PGRAC: spec-7.2 D1 — mark the drain family dirty inside the push
+	 * helper so every producer (current and future) is covered. */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND);
 	return true;
 }
 
@@ -207,6 +210,7 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 		= (cluster_grd_outbound_state->reply_dirty_head + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
 	cluster_grd_outbound_state->reply_dirty_count++;
 	cluster_grd_inc_ges_reply_deferred();
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
 }
 
 static void
@@ -239,6 +243,7 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 		= (cluster_grd_outbound_state->cleanup_dirty_head + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
 	cluster_grd_outbound_state->cleanup_dirty_count++;
 	cluster_grd_inc_ges_cleanup_deferred();
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
 }
 
 static void

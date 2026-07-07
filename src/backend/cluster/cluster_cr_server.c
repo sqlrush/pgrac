@@ -545,6 +545,7 @@ cluster_lms_cr_drain(void)
 			 * without this the READY result sat until LMON's next natural
 			 * wakeup (typ. 100-250ms, worst case one heartbeat).
 			 * Publish-before-signal: READY store above precedes the kick. */
+			cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
 			cluster_lmon_wakeup();
 			continue;
 		}
@@ -588,6 +589,7 @@ cluster_lms_cr_drain(void)
 		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_READY);
 		/* PGRAC: spec-7.2 D1 -- wake the shipper (see the undo/verdict
 		 * READY publish above for the rationale). */
+		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
 		cluster_lmon_wakeup();
 	}
 }

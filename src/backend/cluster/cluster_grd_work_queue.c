@@ -131,6 +131,7 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	 * LWLock above) before the wakeup fires.
 	 * Spec: spec-7.2-ic-data-plane-decoupling.md
 	 */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GES_WORK_QUEUE);
 	cluster_lmon_wakeup();
 
 	return true;
