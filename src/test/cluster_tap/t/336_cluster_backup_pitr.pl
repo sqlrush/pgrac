@@ -440,6 +440,8 @@ sub configure_pair_restore
 	my ($restore_node, $shared_dir, $target_scn) = @_;
 	my $restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $restore_data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $restore_data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $target_conf = defined($target_scn)
 	  ? "cluster.recovery_target_scn = '$target_scn'\n"
 	  : "";
@@ -452,9 +454,11 @@ name = cluster_backup_pair_restore
 
 [node.0]
 interconnect_addr = 127.0.0.1:$restore_ic0
+data_addr = 127.0.0.1:$restore_data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$restore_ic1
+data_addr = 127.0.0.1:$restore_data_port1
 EOC
 	$restore_node->append_conf('postgresql.conf',
 	  "port = " . $restore_node->port . "\n"

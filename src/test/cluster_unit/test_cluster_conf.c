@@ -80,6 +80,10 @@ bool cluster_allow_single_node = true; /* spec-2.1 D1; storage stub matches defa
  */
 bool cluster_enabled = true;
 
+/* spec-7.2 flip: post_validate consults the interconnect tier for the
+ * multi-node data_addr gate;  stub = stub tier (gate exempt). */
+int cluster_interconnect_tier = 0;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),

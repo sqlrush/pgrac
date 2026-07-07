@@ -66,6 +66,8 @@ $node->append_conf('postgresql.conf', "cluster.allow_single_node = on\n");
 # Declare 2 nodes so we can spoof "peer 1" connecting to "peer 0" (us).
 my $self_ic_port = PostgreSQL::Test::Cluster::get_free_port();
 my $spoof_ic_port = PostgreSQL::Test::Cluster::get_free_port();
+my $self_data_port = PostgreSQL::Test::Cluster::get_free_port();
+my $spoof_data_port = PostgreSQL::Test::Cluster::get_free_port();
 my $cluster_name = 'pgrac-078';
 my $pgrac_conf = <<EOC;
 [cluster]
@@ -73,9 +75,11 @@ name = $cluster_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:$self_ic_port
+data_addr = 127.0.0.1:$self_data_port
 
 [node.1]
 interconnect_addr = 127.0.0.1:$spoof_ic_port
+data_addr = 127.0.0.1:$spoof_data_port
 EOC
 PostgreSQL::Test::Utils::append_to_file($node->data_dir . '/pgrac.conf',
 	$pgrac_conf);

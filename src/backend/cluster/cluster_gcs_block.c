@@ -3397,6 +3397,24 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	}
 
+	/*
+	 * PGRAC: spec-7.2 D5 — master-side fail-stop episode fence, symmetric
+	 * with the requester-side acquire gate (cluster_pcm_lock.c).  While a
+	 * dead static master's block resources are mid-episode (survivor
+	 * re-declare not yet complete, or merged replay not yet materialized),
+	 * serving a request here could grant a block whose surviving holder
+	 * has not re-declared yet (phantom-holder overtake window).  The
+	 * requester-side gate cannot close this alone: a remote requester with
+	 * a stale view routes here directly.  Fail-closed before any dedup /
+	 * state change;  DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L
+	 * (retry-safe).  phase_for_tag counts the hit itself.
+	 */
+	if (cluster_gcs_block_phase_for_tag(req->tag) == GCS_BLOCK_RECOVERING) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
+
 	/* HC75 range guard — out of range never enters dedup HTAB. */
 	if (req->transition_id < PCM_TRANS_N_TO_S || req->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
@@ -5466,31 +5484,48 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 /* ============================================================
  * Dispatch table registration.
+ *
+ * PGRAC: spec-7.2 flip — the five block-family msg_types (REQUEST /
+ * REPLY / FORWARD / INVALIDATE / INVALIDATE_ACK) are registered on
+ * the DATA plane:  the LMS-owned tier1 instance carries their frames,
+ * the LMS loop dispatches them, and the producer mask admits the LMS
+ * family for the drain-and-send leg.  All five flip in this one edit
+ * (H-5: no half-migrated window;  the registry probe above pivots the
+ * LMON tick sites and the LMS loop automatically).  REDECLARE alone
+ * stays on the CONTROL plane (r4): recovery re-declare must survive a
+ * DATA-mesh teardown mid-episode, and the REDECLARE -> REDECLARE_DONE
+ * pair may not be split across planes.
  * ============================================================ */
 
 static const ClusterICMsgTypeInfo gcs_block_request_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
 	.name = "gcs_block_request",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_request_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_reply_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 	.name = "gcs_block_reply",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_reply_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 /* PGRAC: spec-2.35 D8 — holder-side forward handler msg_type registration. */
 static const ClusterICMsgTypeInfo gcs_block_forward_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 	.name = "gcs_block_forward",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_forward_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6207,20 +6242,25 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 }
 
 
+/* PGRAC: spec-7.2 flip — DATA plane (see the dispatch-table comment). */
 static const ClusterICMsgTypeInfo gcs_block_invalidate_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
 	.name = "gcs_block_invalidate",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
 	.name = "gcs_block_invalidate_ack",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_ack_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6307,12 +6347,18 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 }
 
 
+/* PGRAC: spec-7.2 flip (r4) — REDECLARE stays on the CONTROL plane:
+ * survivor re-declare and its DONE barrier belong to the LMON-owned
+ * recovery episode and must not depend on the DATA mesh being up.
+ * None of the five migrated handlers emits REDECLARE (D0-①b audit),
+ * so no cross-plane staging leg is required here. */
 static const ClusterICMsgTypeInfo gcs_block_redeclare_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REDECLARE,
 	.name = "gcs_block_redeclare",
 	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_redeclare_envelope,
+	.plane = CLUSTER_IC_PLANE_CONTROL,
 };
 
 

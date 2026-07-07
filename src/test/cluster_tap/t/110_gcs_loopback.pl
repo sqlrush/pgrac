@@ -7,10 +7,10 @@
 #	  any wire send (HC72), so wire path coverage is effectively limited
 #	  to SQL-visible surface invariants:
 #
-#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 83 keys
+#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 85 keys
 #	  L2  api_state = "active" after postmaster phase 1 init
 #	  L3  WAIT_EVENT_GCS_REPLY_WAIT registered in pg_stat_cluster_wait_events
-#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 118 (cumulative through spec-6.13)
+#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 120 (cumulative through spec-7.2)
 #	  L5  msg_type registry surface visible:  pg_cluster_ic_msg_types has
 #	       gcs_request + gcs_reply rows
 #	  L6  workload (SELECT/UPDATE/VACUUM) does NOT inc send_request_count
@@ -65,12 +65,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 83 keys (spec-7.2 D6 hist).
+# L1 — pg_cluster_state.gcs surface has 85 keys (spec-7.2 D6 hist).
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '83',
-   'L1 pg_cluster_state.gcs category has 83 keys (spec-7.2 D6)');
+   '85',
+   'L1 pg_cluster_state.gcs category has 85 keys (spec-7.2 D6)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.
@@ -87,11 +87,11 @@ is($gcs_reply_wait_event, '1',
    'L3 ClusterGcsReplyWait wait event registered (spec-2.32 D7)');
 
 
-# L4 — CLUSTER_WAIT_EVENTS_COUNT == 118 (spec-6.13).
+# L4 — CLUSTER_WAIT_EVENTS_COUNT == 120 (spec-7.2 D6).
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
-is($total_wait_events, '118',
-	'L4 wait_events count 118 (spec-6.13 RDMA wait surface)');
+is($total_wait_events, '120',
+	'L4 wait_events count 120 (spec-7.2 D6 LMS data-plane wait surface)');
 
 
 # L6 — Production workload does NOT trigger wire path (HC72 short-circuit).

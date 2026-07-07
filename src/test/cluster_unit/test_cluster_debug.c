@@ -952,6 +952,18 @@ cluster_gcs_block_ship_hist_count(int bucket)
 	(void)bucket;
 	return 0;
 }
+/* spec-7.2 flip stubs: plane facts. */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return false;
+}
+uint64
+cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
 uint64
 cluster_gcs_get_block_reply_count(void)
 {
