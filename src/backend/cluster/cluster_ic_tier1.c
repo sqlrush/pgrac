@@ -1427,9 +1427,14 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	 * process's listener/connection must claim the same plane (a
 	 * CONTROL peer dialing the DATA port, or vice versa, is a wiring
 	 * error;  pre-7.2 senders read as plane 0 = CONTROL and are only
-	 * acceptable on the CONTROL plane).  DATA additionally requires a
-	 * nonzero conn_epoch (INV-7.2-CONN-EPOCH: zero would defeat the
-	 * connection-generation fence;  fail-closed).
+	 * acceptable on the CONTROL plane).  On DATA the conn_epoch must
+	 * EQUAL this node's current cluster epoch (INV-7.2-CONN-EPOCH:
+	 * the connection is bound to the epoch it was established in — a
+	 * dialer still on a stale epoch is refused and reconnects after
+	 * observing the bump;  fail-closed, self-healing.  The initial
+	 * epoch is legitimately 0 on both sides, so equality — not
+	 * nonzero-ness — is the sound check;  cross-version senders are
+	 * already excluded by the version gate above).
 	 */
 	if (cluster_ic_hello_plane(&msg) != tier1_my_plane) {
 		peer_record_error(peer_id, 0, "08P01", "HELLO plane mismatch (peer=%d mine=%d)",
@@ -1438,9 +1443,13 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
 		return false;
 	}
-	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA && cluster_ic_hello_conn_epoch(&msg) == 0) {
-		peer_record_error(peer_id, 0, "08P01", "DATA HELLO missing conn_epoch");
-		cluster_ic_tier1_close_peer(peer_id, "DATA HELLO missing conn_epoch");
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& cluster_ic_hello_conn_epoch(&msg) != cluster_epoch_get_current()) {
+		peer_record_error(peer_id, 0, "08P01",
+						  "DATA HELLO conn_epoch mismatch (peer=" UINT64_FORMAT
+						  " mine=" UINT64_FORMAT ")",
+						  cluster_ic_hello_conn_epoch(&msg), cluster_epoch_get_current());
+		cluster_ic_tier1_close_peer(peer_id, "DATA HELLO conn_epoch mismatch");
 		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
 		return false;
 	}
@@ -1619,15 +1628,18 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		return false;
 	}
 
-	/* PGRAC: spec-7.2 D2 — plane match + DATA conn_epoch (see the
-	 * named-peer verify path for the rationale). */
+	/* PGRAC: spec-7.2 D2 — plane match + DATA conn_epoch equality (see
+	 * the named-peer verify path for the rationale). */
 	if (cluster_ic_hello_plane(&msg) != tier1_my_plane) {
 		ereport(LOG, (errmsg("cluster_ic tier1 HELLO plane mismatch (peer=%d mine=%d)",
 							 (int)cluster_ic_hello_plane(&msg), (int)tier1_my_plane)));
 		return false;
 	}
-	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA && cluster_ic_hello_conn_epoch(&msg) == 0) {
-		ereport(LOG, (errmsg("cluster_ic tier1 DATA HELLO missing conn_epoch")));
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& cluster_ic_hello_conn_epoch(&msg) != cluster_epoch_get_current()) {
+		ereport(LOG, (errmsg("cluster_ic tier1 DATA HELLO conn_epoch mismatch "
+							 "(peer=" UINT64_FORMAT " mine=" UINT64_FORMAT ")",
+							 cluster_ic_hello_conn_epoch(&msg), cluster_epoch_get_current())));
 		return false;
 	}
 
