@@ -87,6 +87,7 @@
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
 #include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D4 cross-node TX enqueue wait */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D5b surely-dead guard */
+#include "cluster/cluster_writer_chain.h" /* spec-7.1a D0 terminal-writer chaining */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
@@ -2963,6 +2964,82 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
  */
 #ifdef USE_PGRAC_CLUSTER
 /*
+ * cluster_writer_chain_probe_new_version -- spec-7.1a D0 (Q9 single hop).
+ *
+ *	Prove the committed remote UPDATE's new version is reachable and
+ *	chain-valid before TM_Updated is surfaced to EvalPlanQual: the tuple at
+ *	new_tid must exist and its xmin must be exactly the updater's xid (a
+ *	recycled line pointer / broken chain probes false -> the caller keeps
+ *	the fail-closed floor).  Reads the new version's page through the
+ *	ordinary cluster-coherent buffer path; EvalPlanQual re-fetches and
+ *	re-judges the version itself, so only a probe descriptor (t_self /
+ *	t_tableOid; t_data stays NULL) is returned.
+ *
+ *	Called with the OLD page's content lock held EXCLUSIVE.  A same-page
+ *	new version is probed under that lock; a different page is probed by
+ *	dropping the old lock first (never two content locks at once -- lock
+ *	order) and reacquiring it EXCLUSIVE after, the caller's post-return
+ *	re-validation covering the window (L350).
+ */
+static bool
+cluster_writer_chain_probe_new_version(Relation relation, Buffer oldbuf,
+									   ItemPointer new_tid, TransactionId update_xid,
+									   HeapTupleData *out_tup)
+{
+	BlockNumber newblk = ItemPointerGetBlockNumber(new_tid);
+	OffsetNumber newoff = ItemPointerGetOffsetNumber(new_tid);
+	Page		newpage;
+	bool		ok = false;
+
+	if (newblk == BufferGetBlockNumber(oldbuf))
+	{
+		newpage = BufferGetPage(oldbuf);
+		if (newoff <= PageGetMaxOffsetNumber(newpage))
+		{
+			ItemId		lp = PageGetItemId(newpage, newoff);
+
+			if (ItemIdIsNormal(lp))
+			{
+				HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(newpage, lp);
+
+				ok = TransactionIdEquals(HeapTupleHeaderGetXmin(htup), update_xid);
+			}
+		}
+	}
+	else
+	{
+		Buffer		newbuf;
+
+		LockBuffer(oldbuf, BUFFER_LOCK_UNLOCK);
+		newbuf = ReadBuffer(relation, newblk);
+		LockBuffer(newbuf, BUFFER_LOCK_SHARE);
+		newpage = BufferGetPage(newbuf);
+		if (newoff <= PageGetMaxOffsetNumber(newpage))
+		{
+			ItemId		lp = PageGetItemId(newpage, newoff);
+
+			if (ItemIdIsNormal(lp))
+			{
+				HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(newpage, lp);
+
+				ok = TransactionIdEquals(HeapTupleHeaderGetXmin(htup), update_xid);
+			}
+		}
+		UnlockReleaseBuffer(newbuf);
+		LockBuffer(oldbuf, BUFFER_LOCK_EXCLUSIVE);
+	}
+
+	if (ok)
+	{
+		out_tup->t_self = *new_tid;
+		out_tup->t_tableOid = RelationGetRelid(relation);
+		out_tup->t_data = NULL;
+		out_tup->t_len = 0;
+	}
+	return ok;
+}
+
+/*
  * spec-3.14 D2b + spec-5.2 §3.2 (C4/D11): cross-node writer/locker wait.
  *
  *	heap_delete / heap_update reach a native wait (XactLockTableWait /
@@ -2973,21 +3050,32 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
  *
  *	spec-5.2 replaces the spec-3.14 unconditional 53R9H with a real
  *	cross-node completion wait (cluster_tx_enqueue_wait) and a typed
- *	outcome.  Return value:
+ *	outcome; spec-7.1a D0 adds terminal-WRITER chaining.  Return value:
  *
  *	  false  -- NOT a cross-node conflict (no peer / no ITL ref / local
  *	            locker).  The caller runs PG's native locker resolution
  *	            unchanged (it is correct for a local xid).
- *	  true   -- a REMOTE LOCK-ONLY holder is terminal (committed/aborted);
- *	            the row lock is released and the row was not modified, so
- *	            the caller MUST skip native locker resolution and may
- *	            continue (can_continue).  Skipping is mandatory: native
- *	            XactLockTableWait on the remote raw xid hangs (BLOCKER C).
+ *	  true   -- the cluster path handled a REMOTE holder; *res says how:
+ *	            TM_Ok      a LOCK-ONLY holder is terminal (lock released),
+ *	                       or the remote WRITER ABORTED: the row was not
+ *	                       (or no longer) modified.  The caller MUST skip
+ *	                       native locker resolution (XactLockTableWait on
+ *	                       the remote raw xid hangs, BLOCKER C),
+ *	                       re-validate against the pre-wait snapshot,
+ *	                       clear the released xmax and continue.
+ *	            TM_Updated the remote writer's UPDATE committed and the
+ *	                       single-hop new version was probed (Q9);
+ *	            TM_Deleted its DELETE committed.  The caller re-validates,
+ *	                       then routes result into its native failure
+ *	                       exit, which fills tmfd from the on-page old
+ *	                       tuple exactly as for a local conflict
+ *	                       (spec-7.1a D0; only with
+ *	                       cluster.crossnode_write_write=on).
  *
- *	A remote WRITER holder (committed/aborted UPDATE/DELETE), a remote
- *	MultiXact, a wait timeout, or cluster.tx_enqueue_wait=off all raise
- *	(ereport) inside -- they never return.  Cross-node writer-writer
- *	chaining (TM_Updated against the remote new version) is forwarded.
+ *	A remote MultiXact, a wait timeout, cluster.tx_enqueue_wait=off, a
+ *	terminal remote WRITER under cluster.crossnode_write_write=off (the
+ *	pre-7.1a floor), or an unprovable writer outcome all raise (ereport)
+ *	inside -- they never return.
  *
  *	Called with the buffer content lock held.  On the false (native)
  *	return the lock is restored.  On the true return the lock is
@@ -2997,7 +3085,8 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
  */
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
-									TransactionId xwait, uint16 saved_infomask)
+									TransactionId xwait, uint16 saved_infomask,
+									LockWaitPolicy wait_policy, TM_Result *res)
 {
 	Page		page = BufferGetPage(buffer);
 	ClusterUndoTTSlotRef cref;
@@ -3082,6 +3171,23 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 				|| cres.status == CLUSTER_TT_STATUS_CLEANED_OUT);
 
 		if (!tt_terminal) {
+			/*
+			 * PGRAC: spec-7.1a D0 -- only heap_lock_tuple passes a non-Block
+			 * policy; never Block-wait under LockWaitSkip / LockWaitError
+			 * (mirrors the native switch semantics for a live local holder).
+			 */
+			if (wait_policy == LockWaitSkip)
+			{
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				*res = TM_WouldBlock;
+				return true;
+			}
+			if (wait_policy == LockWaitError)
+				ereport(ERROR,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("could not obtain lock on row in relation \"%s\"",
+								RelationGetRelationName(relation))));
+
 			if (cluster_tx_enqueue_wait_enabled) {
 				ClusterTxwResult txw;
 
@@ -3136,20 +3242,92 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 *   (its TransactionIdIsInProgress loop never breaks).
 	 *
 	 *   WRITER holder (committed/aborted UPDATE/DELETE): the row version may
-	 *   have changed remotely; cross-node writer-writer chaining (surfacing
-	 *   TM_Updated / EvalPlanQual against the remote new version) is forwarded.
-	 *   Fail closed retryably (53R9H) instead of running the unsafe native path.
+	 *   have changed remotely.  With cluster.crossnode_write_write=on the
+	 *   outcome is resolved from cluster authority and chained onto the
+	 *   native TM_Result contract (spec-7.1a D0, below); off -- or when the
+	 *   outcome / new version is unprovable -- fail closed retryably (53R9H)
+	 *   instead of running the unsafe native path.
 	 */
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	if (is_lock_only)
+	{
+		*res = TM_Ok;
 		return true;
+	}
+
+	/*
+	 * PGRAC: spec-7.1a D0 -- terminal remote WRITER chaining.
+	 *
+	 * Resolve the writer's outcome from cluster authority (page ITL ref +
+	 * TT overlay + origin live-IC verdict, all inside
+	 * cluster_visibility_resolve_tuple; never native CLOG/ProcArray on the
+	 * foreign xid, AD-012 例外 9) and map it onto the native TM_Result
+	 * contract via cluster_writer_chain_decide:
+	 *
+	 *   ABORTED            -> TM_Ok (row unchanged; the caller re-validates,
+	 *                         clears the released xmax and continues)
+	 *   COMMITTED, DELETE  -> TM_Deleted (t_ctid self-points)
+	 *   COMMITTED, UPDATE  -> TM_Updated after the single-hop new version
+	 *                         is probed reachable + chain-valid (Q9); the
+	 *                         caller's native failure exit fills tmfd from
+	 *                         the on-page tuple
+	 *   anything unprovable-> fall through to the pre-7.1a 53R9H floor
+	 *
+	 * The resolve and the DELETE/UPDATE split read the tuple under the
+	 * content lock reacquired above; the caller's post-return re-validation
+	 * (xmax_infomask_changed) discards the outcome if the tuple moved.
+	 */
+	if (cluster_crossnode_write_write)
+	{
+		ClusterVisResolve xr;
+		ClusterWriterOutcome wo;
+		HeapTupleData probe_tup;
+		ItemPointerData old_t_ctid;
+
+		memset(&wo, 0, sizeof(wo));
+		wo.kind = CWO_UNRESOLVABLE;
+		old_t_ctid = tup->t_data->t_ctid;
+
+		cluster_visibility_resolve_tuple(buffer, tup->t_data, xwait,
+										 CLUSTER_VIS_XMAX_UPDATE, &xr);
+
+		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE)
+		{
+			if (xr.status == CLUSTER_TT_STATUS_ABORTED)
+				wo.kind = CWO_ABORTED;
+			else if (xr.status == CLUSTER_TT_STATUS_COMMITTED
+					 || xr.status == CLUSTER_TT_STATUS_CLEANED_OUT)
+			{
+				if (ItemPointerEquals(&tup->t_self, &old_t_ctid))
+					wo.kind = CWO_DELETED;
+				else if (cluster_writer_chain_probe_new_version(relation, buffer,
+																&old_t_ctid, xwait,
+																&probe_tup))
+				{
+					wo.kind = CWO_UPDATED;
+					wo.new_ctid = old_t_ctid;
+					wo.new_tuple = &probe_tup;
+				}
+				/* probe failure keeps CWO_UNRESOLVABLE -> floor below */
+			}
+			/* IN_PROGRESS / UNKNOWN after a completed wait: floor below */
+		}
+
+		if (cluster_writer_chain_decide(&wo, &old_t_ctid, xwait, res, NULL))
+			return true;
+		/* fall through: unprovable -> the pre-7.1a fail-closed floor */
+	}
 
 	cluster_vis_bump_vis_conflict_failclosed_count();
 	ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 					errmsg("cross-node write conflict: remote writer %u on node %u is terminal",
 						   xwait, cref.origin_node_id),
-					errhint("Cross-node writer-writer update chaining is not yet supported; "
-							"retry the transaction.")));
+					cluster_crossnode_write_write
+					? errhint("Peer authority or the new row version is not yet "
+							  "resolvable; retry the transaction.")
+					: errhint("Cross-node writer-writer update chaining is disabled; "
+							  "enable cluster.crossnode_write_write or retry the "
+							  "transaction.")));
 }
 #endif /* USE_PGRAC_CLUSTER */
 
@@ -3180,6 +3358,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
 	UBA			cluster_itl_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
+	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
 #endif
 
 	Assert(ItemPointerIsValid(tid));
@@ -3261,10 +3440,12 @@ l1:
 		 * below then yields TM_Ok.  A false return means a local locker; the
 		 * native path is correct.  A remote writer / timeout / wait-off raises.
 		 */
-		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask))
+		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
+												LockWaitBlock, &cluster_writer_res))
 		{
 			/*
-			 * Remote LOCK-ONLY holder terminal -> its row lock is released.
+			 * Remote holder handled by the cluster path (lock released,
+			 * writer aborted, or terminal writer chained -- spec-7.1a D0).
 			 *
 			 * The helper dropped and reacquired the buffer content lock across
 			 * the wait, so re-validate against the pre-wait snapshot (as the
@@ -3277,8 +3458,24 @@ l1:
 				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data), xwait))
 				goto l1;
 
+			if (cluster_writer_res != TM_Ok)
+			{
+				/*
+				 * PGRAC: spec-7.1a D0 -- the remote writer's UPDATE/DELETE
+				 * committed.  Its xmax is a COMMITTED foreign deleter: never
+				 * stamp HEAP_XMAX_INVALID over it (a false hint on a shared
+				 * page poisons every node -- 缺陷 1 / Rule 8.A).  Route the
+				 * chained result into the native failure exit, which fills
+				 * tmfd from the on-page tuple exactly as for a local
+				 * conflict.
+				 */
+				result = cluster_writer_res;
+				goto cluster_writer_terminal;
+			}
+
 			/*
-			 * Unchanged: mark the released xmax invalid so the TM_Ok
+			 * TM_Ok: released lock-only holder, or an authoritatively ABORTED
+			 * remote writer.  Mark the released xmax invalid so the TM_Ok
 			 * determination below sees an unlocked tuple and the delete's new
 			 * xmax is a single xid, not a node-local MultiXact a peer cannot
 			 * read (AD-012).  Then fall through to the LOCKED_ONLY /
@@ -3395,6 +3592,9 @@ l1:
 	}
 
 	/* sanity check the result HeapTupleSatisfiesUpdate() and the logic above */
+#ifdef USE_PGRAC_CLUSTER
+cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
+#endif
 	if (result != TM_Ok)
 	{
 		Assert(result == TM_SelfModified ||
@@ -3859,6 +4059,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		cluster_itl_new_active = false;
 	/* spec-3.4b D5: single binding shared across old + new stamps (F11). */
 	UBA			cluster_itl_uba = InvalidUba_init;
+	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
 #endif
 
 	Assert(ItemPointerIsValid(otid));
@@ -4087,10 +4288,12 @@ l2:
 		 * false return means a local locker; the native path below is correct.
 		 * A remote writer / timeout / wait-off raises inside.
 		 */
-		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask))
+		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask,
+												LockWaitBlock, &cluster_writer_res))
 		{
 			/*
-			 * Remote LOCK-ONLY holder is terminal -> its row lock is released.
+			 * Remote holder handled by the cluster path (lock released,
+			 * writer aborted, or terminal writer chained -- spec-7.1a D0).
 			 *
 			 * cluster_heap_writer_wait_failclosed dropped and reacquired the
 			 * buffer content lock across a multi-second wait, so the tuple may
@@ -4107,13 +4310,30 @@ l2:
 									 xwait))
 				goto l2;
 
+			if (cluster_writer_res != TM_Ok)
+			{
+				/*
+				 * PGRAC: spec-7.1a D0 -- the remote writer's UPDATE/DELETE
+				 * committed.  Its xmax is a COMMITTED foreign deleter: never
+				 * stamp HEAP_XMAX_INVALID over it (a false hint on a shared
+				 * page poisons every node -- 缺陷 1 / Rule 8.A).  Route the
+				 * chained result into the native failure exit, which fills
+				 * tmfd from the on-page tuple exactly as for a local
+				 * conflict.
+				 */
+				result = cluster_writer_res;
+				goto cluster_writer_terminal;
+			}
+
 			/*
-			 * Unchanged: the released remote lock is gone.  Mark the released
-			 * xmax invalid (mirrors native UpdateXmaxHintBits for a gone
-			 * lock-only locker) so compute_new_xmax_infomask below treats the
-			 * tuple as unlocked and does NOT fold the released remote lock into
-			 * a node-local MultiXact that a peer cannot read (MultiXact ids
-			 * alias across instances, like raw xids — AD-012).
+			 * TM_Ok: released lock-only holder, or an authoritatively ABORTED
+			 * remote writer.  The released remote lock (or aborted update) is
+			 * gone.  Mark the released xmax invalid (mirrors native
+			 * UpdateXmaxHintBits for a gone lock-only locker) so
+			 * compute_new_xmax_infomask below treats the tuple as unlocked and
+			 * does NOT fold the released remote lock into a node-local
+			 * MultiXact that a peer cannot read (MultiXact ids alias across
+			 * instances, like raw xids — AD-012).
 			 */
 			HeapTupleSetHintBits(oldtup.t_data, buffer, HEAP_XMAX_INVALID,
 								 InvalidTransactionId);
@@ -4278,6 +4498,9 @@ l2:
 	}
 
 	/* Sanity check the result HeapTupleSatisfiesUpdate() and the logic above */
+#ifdef USE_PGRAC_CLUSTER
+cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
+#endif
 	if (result != TM_Ok)
 	{
 		Assert(result == TM_SelfModified ||
@@ -6002,6 +6225,85 @@ l3:
 						 */
 						cluster_remote_lockonly_terminal = true;
 					}
+				}
+#endif
+#ifdef USE_PGRAC_CLUSTER
+				/*
+				 * PGRAC: spec-7.1a D0 -- remote WRITER holder in
+				 * heap_lock_tuple (SELECT FOR UPDATE / the EvalPlanQual chase
+				 * behind a chained TM_Updated).  The pre-7.1a code fell
+				 * through to the native wait below, whose XactLockTableWait
+				 * on a remote raw xid aliases/hangs (Blocker C family, L349)
+				 * -- the same hole the writer-wait bridge closes for
+				 * heap_update / heap_delete.  Reuse that bridge: it waits
+				 * (cluster_tx_enqueue_wait, honoring wait_policy), resolves
+				 * the terminal outcome from cluster authority and either
+				 * chains it (cluster.crossnode_write_write=on) or keeps the
+				 * fail-closed floor (53R9H).  Every remote-holder path exits
+				 * via goto/ereport; only a LOCAL holder falls through to the
+				 * native wait.
+				 */
+				if (!HEAP_XMAX_IS_LOCKED_ONLY(infomask)
+					&& !(infomask & HEAP_XMAX_IS_MULTI)
+					&& cluster_peer_mode_enabled())
+				{
+					TM_Result	cwres = TM_Ok;
+
+					/*
+					 * F10: PG released the buffer lock before sleeping;
+					 * reacquire + revalidate before the bridge scans the ITL
+					 * (it expects the content lock held), exactly like the
+					 * lock-only block above.
+					 */
+					LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
+						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
+											 xwait))
+						goto l3;
+
+					if (cluster_heap_writer_wait_failclosed(relation, *buffer, tuple,
+															xwait, infomask,
+															wait_policy, &cwres))
+					{
+						/*
+						 * The bridge dropped the content lock across its
+						 * wait/lookup; re-validate against the pre-wait
+						 * snapshot before consuming the outcome (L350).
+						 */
+						if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
+							!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
+												 xwait))
+							goto l3;
+
+						if (cwres == TM_Ok)
+						{
+							/*
+							 * Authoritatively ABORTED remote writer: mark the
+							 * dead xmax invalid (mirrors native
+							 * UpdateXmaxHintBits for an aborted writer; the
+							 * verdict came from cluster authority, never the
+							 * local CLOG view of the foreign xid) and re-run
+							 * the tuple-state machine -- it now sees
+							 * HEAP_XMAX_INVALID and locks the tuple natively.
+							 */
+							HeapTupleSetHintBits(tuple->t_data, *buffer,
+												 HEAP_XMAX_INVALID,
+												 InvalidTransactionId);
+							goto l3;
+						}
+
+						/*
+						 * TM_WouldBlock (LockWaitSkip on a live remote
+						 * writer) or a chained TM_Updated / TM_Deleted: route
+						 * into the native failure exit, which fills tmfd from
+						 * the on-page tuple.  Content lock is held.
+						 */
+						result = cwres;
+						goto failed;
+					}
+
+					/* LOCAL writer: PG's native wait below is correct. */
+					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 				}
 #endif
 				/* wait for regular transaction to end, or die trying */

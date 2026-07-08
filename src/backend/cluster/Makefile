@@ -184,6 +184,7 @@ OBJS = \
 	cluster_undo_cleaner.o \
 	cluster_visibility_resolve.o \
 	cluster_visibility_verdict.o \
+	cluster_writer_chain.o \
 	cluster_undo_record.o \
 	cluster_undo_retention.o \
 	cluster_undo_srf.o \
