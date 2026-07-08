@@ -445,8 +445,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				bool is_bound = false;
 
 				if (cluster_runtime_visibility_try_resolve_remote(
-						derived_origin, (uint32)ref->undo_segment_id, raw_xid, anchor_lsn, read_scn,
-						&committed, &scn, &is_bound)) {
+						derived_origin, (uint32)ref->undo_segment_id, raw_xid, read_scn, &committed,
+						&scn, &is_bound)) {
 					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 					out->status
 						= committed ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;

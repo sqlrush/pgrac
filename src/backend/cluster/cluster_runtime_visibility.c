@@ -61,9 +61,9 @@
  * recycled resolution degrades to the unchanged 53R97 fail-closed.
  */
 bool
-cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth)
+cluster_vis_live_authority_covers(SCN demand_scn, ClusterLiveAuthority auth)
 {
-	return cluster_vis_live_authority_covers_policy(anchor_lsn, auth, cluster_epoch_get_current());
+	return cluster_vis_live_authority_covers_policy(demand_scn, auth, cluster_epoch_get_current());
 }
 
 
@@ -219,8 +219,8 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 XLogRecPtr anchor_lsn, SCN read_scn, bool *out_committed,
-						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+						 SCN demand_scn, SCN read_scn, bool *out_committed, SCN *out_commit_scn,
+						 bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
 	ClusterLiveAuthority auth;
@@ -236,8 +236,9 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	 * gate can refuse — the observe is what makes a refusal self-heal. */
 	cluster_scn_observe((SCN)verdict.horizon_scn);
 	cluster_scn_observe((SCN)verdict.commit_scn);
+	cluster_scn_observe(auth.authority_scn);
 
-	if (!cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+	if (!cluster_vis_live_authority_covers(demand_scn, auth)) {
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -312,13 +313,14 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
  */
 bool
 cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
-											  TransactionId raw_xid, XLogRecPtr anchor_lsn,
-											  SCN read_scn, bool *out_committed,
-											  SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+											  TransactionId raw_xid, SCN read_scn,
+											  bool *out_committed, SCN *out_commit_scn,
+											  bool *out_commit_scn_is_bound)
 {
 	PGAlignedBlock page;
 	ClusterLiveAuthority auth;
 	SCN scn = InvalidScn;
+	SCN demand_scn;
 	uint16 wrap = TT_WRAP_INVALID;
 
 	if (out_committed != NULL)
@@ -343,6 +345,15 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		return false;
 
 	/*
+	 * PGRAC: spec-7.1a D3 -- the covers demand.  Snapshot legs demand
+	 * conclusiveness for their read_scn; no-snapshot legs (writer terminal
+	 * resolution, read_scn = InvalidScn) demand the local clock AS OF NOW.
+	 * Sampled BEFORE any fetch: the reply's SCNs are Lamport-observed below,
+	 * so sampling after would trivially satisfy the gate and void it.
+	 */
+	demand_scn = SCN_VALID(read_scn) ? read_scn : cluster_scn_current();
+
+	/*
 	 * Single-block fast leg (CP3), entirely opportunistic since CP5: the
 	 * ref's segment id names the CURRENT slot owner's segment, which under
 	 * the spec-6.15 D4 xid-derived origin may not even exist on the node we
@@ -351,21 +362,25 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * fetch miss or a proof NONE falls to the origin-verdict leg.
 	 */
 	if (cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
-												page.data, &auth)
-		&& cluster_vis_live_authority_covers(anchor_lsn, auth)) {
-		switch (cluster_vis_tt_block_positive_proof(
-			page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
-		case CLUSTER_VIS_TT_PROOF_COMMITTED:
-			*out_committed = true;
-			*out_commit_scn = scn;
-			cluster_rtvis_resolve_note_committed();
-			return true;
-		case CLUSTER_VIS_TT_PROOF_ABORTED:
-			cluster_rtvis_resolve_note_aborted();
-			return true;
-		case CLUSTER_VIS_TT_PROOF_NONE:
-		default:
-			break; /* 0-match / ambiguity: fall to the verdict leg */
+												page.data, &auth)) {
+		/* Lamport-observe the co-sampled clock BEFORE the gate can refuse
+		 * (AD-008) -- the observe is what makes a refusal self-heal. */
+		cluster_scn_observe(auth.authority_scn);
+		if (cluster_vis_live_authority_covers(demand_scn, auth)) {
+			switch (cluster_vis_tt_block_positive_proof(
+				page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
+			case CLUSTER_VIS_TT_PROOF_COMMITTED:
+				*out_committed = true;
+				*out_commit_scn = scn;
+				cluster_rtvis_resolve_note_committed();
+				return true;
+			case CLUSTER_VIS_TT_PROOF_ABORTED:
+				cluster_rtvis_resolve_note_aborted();
+				return true;
+			case CLUSTER_VIS_TT_PROOF_NONE:
+			default:
+				break; /* 0-match / ambiguity: fall to the verdict leg */
+			}
 		}
 	}
 
@@ -375,7 +390,7 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * fetch/covers miss proves nothing either — ask the origin for the
 	 * complete own-TT verdict instead of failing closed outright.
 	 */
-	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, anchor_lsn, read_scn,
+	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, demand_scn, read_scn,
 								 out_committed, out_commit_scn, out_commit_scn_is_bound)) {
 		if (*out_committed)
 			cluster_rtvis_resolve_note_committed();

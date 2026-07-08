@@ -333,6 +333,10 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
+	/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
+	 * pre-content-read ordering (a stamp landing after the sample only makes
+	 * the content newer than claimed; additive and safe). */
+	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	/* Serve only SELF-owned undo: the owner derives from this node's own
 	 * id, never from the wire (a forged request cannot redirect the read). */
@@ -409,6 +413,10 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
+	/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
+	 * pre-content-read ordering (a stamp landing after the sample only makes
+	 * the content newer than claimed; additive and safe). */
+	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	memset(slot->result_page, 0, BLCKSZ);
 	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
@@ -660,6 +668,8 @@ cluster_lms_cr_ship_ready(void)
 			hdr->page_lsn = slot->undo_auth.live_hwm_lsn;
 			memcpy(buf + header_len, slot->result_page, BLCKSZ);
 			ClusterGcsUndoAuthTrailerSetTtGeneration(trailer, slot->undo_auth.tt_generation);
+			ClusterGcsUndoAuthTrailerSetAuthorityScn(trailer,
+													 (uint64)slot->undo_auth.authority_scn);
 		}
 		hdr->checksum = cluster_gcs_block_compute_checksum(buf + header_len);
 

@@ -121,6 +121,7 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	 * UNDO_TT_FETCH_RESULT reply (epoch / live_hwm ride the header). */
 	bool reply_undo_trailer_valid;
 	uint64 reply_undo_tt_generation;
+	uint64 reply_undo_authority_scn; /* PGRAC: spec-7.1a D3 (trailer SCN) */
 	ConditionVariable reply_cv;
 	/* PGRAC: spec-2.34 D3/D4 — HC100 stale-reply defense + epoch invalidation.
 	 *  request_epoch:        snapshot of cluster_epoch at the time the
@@ -2511,6 +2512,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2570,6 +2572,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 				auth_out->origin_epoch = slot->reply_header.epoch;
 				auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 				auth_out->tt_generation = slot->reply_undo_tt_generation;
+				auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
 				/* spec-5.14 D2: the authority is the origin's volatile
 				 * co-sample — depend on it for fail-stop (D-i3). */
 				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -2646,6 +2649,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2711,6 +2715,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 					auth_out->origin_epoch = slot->reply_header.epoch;
 					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 					auth_out->tt_generation = slot->reply_undo_tt_generation;
+					auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
 					/* spec-5.14 D2: the verdict is the origin's volatile
 					 * co-sample — depend on it for fail-stop (D-i3). */
 					gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -5016,6 +5021,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_undo_trailer_valid = (undo_trailer != NULL);
 			slot->reply_undo_tt_generation
 				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetTtGeneration(undo_trailer)
+										 : 0;
+			slot->reply_undo_authority_scn
+				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_trailer)
 										 : 0;
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
