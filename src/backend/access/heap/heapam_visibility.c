@@ -254,6 +254,31 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 	MarkBufferDirtyHint(buffer, true);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * cluster_heap_stamp_released_xmax_invalid -- authority-backed XMAX_INVALID.
+ *
+ *	spec-7.1a D0/D2: SetHintBits above deliberately suppresses xmax hints
+ *	whose xid is another node's class (spec-6.15 D7) because ordinary hint
+ *	stamping is backed by native CLOG/ProcArray answers that are void for a
+ *	foreign xid.  The cluster writer/locker paths however must still
+ *	physically clear a RELEASED (lock-only terminal) or ABORTED remote xmax
+ *	once CLUSTER authority (TT / live-IC verdict) proved it gone -- leaving
+ *	it in place makes compute_new_xmax_infomask treat the dead remote xid as
+ *	a live locker and fold it into a node-local MultiXact that aliases on
+ *	every peer (L349).  This is the one sanctioned bypass: the fact comes
+ *	from cluster authority, never from a native reading of the foreign xid,
+ *	and marking released/aborted needs no commit-LSN interlock (see the
+ *	SetHintBits header: aborted hints are always safe).
+ */
+void
+cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
+{
+	tuple->t_infomask |= HEAP_XMAX_INVALID;
+	MarkBufferDirtyHint(buffer, true);
+}
+#endif
+
 /*
  * HeapTupleSetHintBits --- exported version of SetHintBits()
  *

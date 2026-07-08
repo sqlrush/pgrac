@@ -3481,8 +3481,7 @@ l1:
 			 * read (AD-012).  Then fall through to the LOCKED_ONLY /
 			 * XMAX_INVALID -> TM_Ok path below.
 			 */
-			HeapTupleSetHintBits(tp.t_data, buffer, HEAP_XMAX_INVALID,
-								 InvalidTransactionId);
+			cluster_heap_stamp_released_xmax_invalid(tp.t_data, buffer);
 		}
 		else
 #endif
@@ -4335,8 +4334,7 @@ l2:
 			 * MultiXact that a peer cannot read (MultiXact ids alias across
 			 * instances, like raw xids — AD-012).
 			 */
-			HeapTupleSetHintBits(oldtup.t_data, buffer, HEAP_XMAX_INVALID,
-								 InvalidTransactionId);
+			cluster_heap_stamp_released_xmax_invalid(oldtup.t_data, buffer);
 			checked_lockers = true;
 			locker_remains = false;
 			can_continue = true;
@@ -6286,9 +6284,8 @@ l3:
 							 * the tuple-state machine -- it now sees
 							 * HEAP_XMAX_INVALID and locks the tuple natively.
 							 */
-							HeapTupleSetHintBits(tuple->t_data, *buffer,
-												 HEAP_XMAX_INVALID,
-												 InvalidTransactionId);
+							cluster_heap_stamp_released_xmax_invalid(tuple->t_data,
+																	 *buffer);
 							goto l3;
 						}
 
@@ -6383,8 +6380,7 @@ l3:
 				 * meaningless for a foreign xid (AD-012).  The result-determination
 				 * below then sees HEAP_XMAX_INVALID / LOCKED_ONLY and yields TM_Ok.
 				 */
-				HeapTupleSetHintBits(tuple->t_data, *buffer, HEAP_XMAX_INVALID,
-									 InvalidTransactionId);
+				cluster_heap_stamp_released_xmax_invalid(tuple->t_data, *buffer);
 			}
 			else
 #endif
