@@ -53,6 +53,7 @@
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
 #include "cluster/cluster_hw_lease.h"		  /* spec-6.12d lease counter stub */
 #include "cluster/cluster_relmap_authority.h" /* spec-6.14 D5 header-read stub */
+#include "cluster/cluster_xid_authority.h"	  /* spec-6.15b XID authority dump stubs */
 
 #undef printf
 #undef fprintf
@@ -338,6 +339,21 @@ cluster_remote_xact_side_effect_drop_count(void)
  * false above, so the read is short-circuited and never called. */
 bool
 cluster_relmap_authority_read_header(bool shared_map, Oid dbid, ClusterRelmapAuthorityHeader *out)
+{
+	return false;
+}
+
+/* spec-6.15b D7 stubs: dump_catalog reads the XID authority observation
+ * keys; this standalone debug unit does not link the file-I/O authority
+ * objects. */
+bool
+cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
+{
+	return false;
+}
+
+bool
+cluster_xid_prehistory_was_adopted(void)
 {
 	return false;
 }

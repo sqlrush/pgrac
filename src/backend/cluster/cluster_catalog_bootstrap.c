@@ -35,6 +35,10 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+#include <sys/stat.h>
+
+#include "access/transam.h"
 #include "access/xlog.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_bootstrap.h"
@@ -44,13 +48,184 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_oid_lease.h"
+#include "cluster/cluster_recovery_anchor.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_xid_authority.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
+
+static bool
+cluster_catalog_backup_label_present(void)
+{
+	char label_path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(label_path, sizeof(label_path), "%s/%s", DataDir, BACKUP_LABEL_FILE);
+	return stat(label_path, &st) == 0;
+}
+
+static void
+cluster_catalog_xid_authority_corrupt_fatal(const char *detail)
+{
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					errmsg("shared XID authority is unavailable at catalog bootstrap"),
+					errdetail("%s", detail),
+					errhint("Restore \"%s/%s\" (or its .bak) from a backup of the shared tree; "
+							"do not delete or re-seed it from a stale xid high-water.",
+							cluster_shared_data_dir, CLUSTER_XID_AUTHORITY_REL_PATH)));
+}
+
+
+/*
+ * Early D6 topology sniff: cluster_conf_load() runs later when shmem exists,
+ * but shared_catalog bootstrap must reject multi-node xid_striping=off before
+ * it seeds/adopts any authority.  This deliberately counts only [node.N]
+ * section headers; the real parser remains the startup SSOT and will still
+ * validate syntax, required fields, and node_id consistency later.
+ */
+static int
+cluster_catalog_declared_node_count_early(void)
+{
+	const char *path = (cluster_config_file != NULL && cluster_config_file[0] != '\0')
+						   ? cluster_config_file
+						   : "pgrac.conf";
+	FILE *f;
+	char line[1024];
+	int nodes = 0;
+
+	f = AllocateFile(path, "r");
+	if (f == NULL)
+		return 1;
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		const char *p = line;
+
+		while (*p != '\0' && isspace((unsigned char)*p))
+			p++;
+		if (strncmp(p, "[node.", 6) == 0)
+			nodes++;
+	}
+	FreeFile(f);
+
+	return nodes > 0 ? nodes : 1;
+}
+
+static void
+cluster_catalog_vet_xid_striping_for_shared_catalog(void)
+{
+	int nodes;
+
+	if (!cluster_enabled || cluster_xid_striping)
+		return;
+
+	nodes = cluster_catalog_declared_node_count_early();
+	if (nodes > 1)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster.shared_catalog on a multi-node cluster requires cluster.xid_striping"),
+			 errdetail("The configured cluster declares %d nodes.", nodes),
+			 errhint("Set cluster.xid_striping=on (and cluster.online_join=on) on every "
+					 "shared_catalog node.")));
+}
+
+static void
+cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
+									  ClusterCatalogMigrateResult migrate_result)
+{
+	ClusterXidAuthorityHeader auth;
+	bool have_auth;
+
+	have_auth = cluster_xid_authority_read(&auth);
+	if (!have_auth && cluster_xid_authority_present())
+		cluster_catalog_xid_authority_corrupt_fatal(
+			"Neither the primary shared XID authority nor its .bak fallback passes validation.");
+
+	if (!have_auth) {
+		if (migrate_result != CLUSTER_CATALOG_MIGRATE_SEEDED)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("shared XID authority is absent for an existing shared catalog tree"),
+					 errdetail("The shared catalog marker exists, but \"%s/%s\" does not.",
+							   cluster_shared_data_dir, CLUSTER_XID_AUTHORITY_REL_PATH),
+					 errhint("Re-seed the shared tree with a build carrying spec-6.15b.")));
+
+		if (cluster_xid_authority_seed_if_absent(
+				U64FromFullTransactionId(cf->checkPointCopy.nextXid)))
+			elog(LOG, "cluster shared_catalog: seeded XID authority native high-water at %llu",
+				 (unsigned long long)U64FromFullTransactionId(cf->checkPointCopy.nextXid));
+
+		if (!cluster_xid_authority_read(&auth))
+			cluster_catalog_xid_authority_corrupt_fatal(
+				"The shared XID authority was just seeded but cannot be read back.");
+	}
+
+	if (!cluster_enabled) {
+		if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA)
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("native seed era cannot be re-entered on a formed shared catalog tree"),
+				 errdetail("The shared XID authority is already marked cluster-era started."),
+				 errhint(
+					 "Keep cluster.enabled=on for this shared tree, or destroy and re-form it.")));
+		return;
+	}
+
+	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("shared XID authority is not sealed"),
+			 errdetail("The seed node has not completed a clean native-era shutdown."),
+			 errhint(
+				 "Start the seed with cluster.enabled=off, stop it cleanly, then start joiners.")));
+
+	if (cluster_catalog_backup_label_present())
+		elog(LOG, "cluster shared_catalog: skipped XID prehistory adopt on backup_label boot");
+	else {
+		ClusterRecoveryAnchor ra;
+		uint64 own_next;
+
+		if (!cluster_recovery_anchor_read(cf->system_identifier, &ra, NULL))
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("per-node recovery anchor is unavailable for XID prehistory adopt"),
+				 errdetail("The joiner cannot determine its own pre-adopt nextXid without \"%s\".",
+						   cluster_recovery_anchor_path() != NULL ? cluster_recovery_anchor_path()
+																  : "(unset)"),
+				 errhint(
+					 "Re-provision this node or verify cluster.shared_data_dir before startup.")));
+
+		own_next = U64FromFullTransactionId(ra.checkPointCopy.nextXid);
+		if (own_next < auth.native_hw_full) {
+			cluster_xid_prehistory_adopt(DataDir, auth.native_hw_full);
+			elog(LOG,
+				 "cluster shared_catalog: adopted XID prehistory through native high-water %llu "
+				 "(own nextXid was %llu)",
+				 (unsigned long long)auth.native_hw_full, (unsigned long long)own_next);
+		} else
+			elog(LOG,
+				 "cluster shared_catalog: skipped XID prehistory adopt; own nextXid %llu >= native "
+				 "high-water %llu",
+				 (unsigned long long)own_next, (unsigned long long)auth.native_hw_full);
+	}
+
+	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA) == 0) {
+		cluster_xid_authority_mark_cluster_era();
+		elog(LOG,
+			 "cluster shared_catalog: marked XID authority cluster era started at native "
+			 "high-water %llu",
+			 (unsigned long long)auth.native_hw_full);
+	}
+}
 
 void
 cluster_catalog_startup_prepare(void)
 {
 	ControlFileData cf;
+	ClusterCatalogMigrateResult migrate_result;
 
 	/* Postmaster-once: only the postmaster seeds; forked backends inherit. */
 	if (IsUnderPostmaster)
@@ -65,6 +240,8 @@ cluster_catalog_startup_prepare(void)
 		cluster_catalog_vet_off_mode();
 		return; /* off: stock per-node catalog */
 	}
+
+	cluster_catalog_vet_xid_striping_for_shared_catalog();
 
 	/*
 	 * shared_catalog=on requires the shared pg_control authority (D1 vet), so
@@ -113,7 +290,8 @@ cluster_catalog_startup_prepare(void)
 	 * the (D3-flipped) shared smgr route.  system_identifier is the shared
 	 * pg_control's cluster-wide value both seed and join agree on.
 	 */
-	cluster_catalog_migrate_tree(DataDir, cf.system_identifier);
+	migrate_result = cluster_catalog_migrate_tree(DataDir, cf.system_identifier);
+	cluster_catalog_prepare_xid_authority(&cf, migrate_result);
 }
 
 /*

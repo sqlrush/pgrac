@@ -201,6 +201,7 @@
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
+#include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
@@ -5593,6 +5594,35 @@ StartupXLOG(void)
 	 */
 	if (cluster_recovery_anchor_active() && !InRecovery)
 		checkPoint = cluster_recovery_anchor_get()->checkPointCopy;
+
+	/*
+	 * PGRAC (spec-6.15b D5): shared_catalog nodes must reconcile their
+	 * transaction horizon with the sealed native-era XID authority before
+	 * ShmemVariableCache is seeded and before StartupCLOG computes its latest
+	 * page.  This deliberately consumes a dedicated never-lowered authority,
+	 * not the shared pg_control CheckPoint copy (spec-5.6a keeps that
+	 * per-writer).
+	 */
+	if (cluster_shared_catalog && cluster_enabled)
+	{
+		ClusterXidAuthorityHeader auth;
+
+		if (!cluster_xid_authority_read(&auth) ||
+			(auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+							errmsg("shared XID authority is unavailable during WAL startup"),
+							errdetail("StartupXLOG cannot seed nextXid without a sealed native-era high-water."),
+							errhint("Complete a clean native-era seed shutdown before starting shared_catalog nodes.")));
+
+		if (U64FromFullTransactionId(checkPoint.nextXid) < auth.native_hw_full)
+		{
+			uint64 own_next = U64FromFullTransactionId(checkPoint.nextXid);
+
+			checkPoint.nextXid = FullTransactionIdFromU64(auth.native_hw_full);
+			elog(LOG, "cluster shared_catalog: merged nextXid with XID authority native high-water %llu (own was %llu)",
+				 (unsigned long long)auth.native_hw_full, (unsigned long long)own_next);
+		}
+	}
 #endif
 
 	/* initialize shared memory variables from the checkpoint record */
@@ -7548,6 +7578,33 @@ CreateCheckPoint(int flags)
 	 * have trouble while fooling with old log segments.
 	 */
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-6.15b D3): after the shutdown checkpoint record,
+	 * control-file update, CLOG flush, and per-node recovery anchor publish
+	 * are complete, publish the native-era pg_xact prehistory and seal the
+	 * shared XID authority.  This does durable file I/O and may fail closed,
+	 * so it must stay outside the checkpoint critical section.
+	 */
+	if (shutdown && cluster_shared_catalog && !cluster_enabled)
+	{
+		uint64 native_hw = U64FromFullTransactionId(checkPoint.nextXid);
+
+		if (checkPoint.nextMulti > FirstMultiXactId)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+							errmsg("native-era seed loads that create MultiXacts are not supported"),
+							errdetail("Shutdown checkpoint nextMulti is %u, but only %u is supported.",
+									  checkPoint.nextMulti, FirstMultiXactId),
+							errhint("Recreate the seed without MultiXact-producing operations, or move the load in-protocol.")));
+
+		cluster_xid_prehistory_publish(DataDir, native_hw);
+		cluster_xid_authority_publish_native(native_hw, checkPoint.nextMulti, true);
+		elog(LOG, "cluster shared_catalog: published and sealed native-era XID authority high-water %llu",
+			 (unsigned long long)native_hw);
+	}
+
+#endif
 
 	/*
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).

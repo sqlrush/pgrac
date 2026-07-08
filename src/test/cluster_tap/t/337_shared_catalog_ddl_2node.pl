@@ -161,6 +161,8 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.online_join = on
+cluster.xid_striping = on
 cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off

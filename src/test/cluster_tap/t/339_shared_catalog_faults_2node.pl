@@ -44,24 +44,14 @@
 #      L4  neither node's log carries the pre-D9 "unsupported side effect"
 #          fail-closed marker.
 #
-#    KNOWN-BLOCKED (two-layer, investigated 2026-07-06 after the 6.12/6.15
-#    rebase).  This test deterministically runs WITHOUT cluster.xid_striping
-#    so it brings up cleanly and reproduces Layer 1 -- turning striping on
-#    (which is what would make the serving legs' xids resolvable) drags in
-#    Layer 2, whose non-convergence makes bring-up itself flaky.
+#    KNOWN-BLOCKED (membership layer, investigated 2026-07-06 after the
+#    6.12/6.15 rebase; D6 in spec-6.15b now requires striping for every
+#    shared_catalog multi-node boot).  With cluster.xid_striping=on the xid
+#    collision layer is gone and merged recovery classifies the
+#    RM_CLUSTER_XID_STRIPE JOIN/RETIRE notes as GLOBAL.  The remaining
+#    blocker is:
 #
-#    Layer 1 (xid collision) -- what striping WOULD fix: on this striped-off
-#    config the two threads share bare xids (pg_waldump-proven: the same xid
-#    on both threads writing the same catalog block), so post-merge TT
-#    lookups for the other thread's xids are permanently UNKNOWN and every
-#    cross-thread catalog read fail-closes 53R97 (honest, never false-
-#    visible).  With cluster.xid_striping=on the collision is gone AND merged
-#    recovery classifies the RM_CLUSTER_XID_STRIPE JOIN/RETIRE notes as
-#    GLOBAL (see cluster_recovery_record_class, added this session), so both
-#    nodes boot and complete cold merged recovery -- verified in a striping-
-#    on diagnostic run.  But that run then exposes:
-#
-#    Layer 2 (the real blocker, root cause pinned 2026-07-06 via debug1):
+#    Layer 2 (root cause pinned 2026-07-06 via debug1):
 #    the L2 up-check and L3 truth-matrix serving legs stay RED because of a
 #    MEMBERSHIP COLD-FORMATION gap, not the snap-back fence (the fence
 #    RECOVERING / "block master is recovering" errors are all downstream
@@ -211,6 +201,8 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.online_join = on
+cluster.xid_striping = on
 cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off

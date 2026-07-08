@@ -207,7 +207,7 @@ UT_TEST(test_gate_raw_compare_traps)
 }
 
 int
-main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
+main(void)
 {
 	/* stand-in for cluster_pi_shadow_shmem_init over malloc-backed memory */
 	cluster_pi_shadow_shmem_init();

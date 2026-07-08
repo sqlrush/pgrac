@@ -1078,6 +1078,22 @@ cluster_init_shmem(void)
 								"cluster.xid_striping.")));
 
 	/*
+	 * spec-6.15b D6: shared_catalog puts catalog heap pages on one shared
+	 * storage image, so a multi-node cluster must not allocate dense native
+	 * xids from every node.  Without striping, two nodes can reuse the seed
+	 * native-era xid range and poison shared catalog visibility.
+	 */
+	if (cluster_enabled && cluster_shared_catalog && cluster_conf_node_count() > 1
+		&& !cluster_xid_striping)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster.shared_catalog on a multi-node cluster requires cluster.xid_striping"),
+			 errdetail("The configured cluster declares %d nodes.", cluster_conf_node_count()),
+			 errhint("Set cluster.xid_striping=on (and cluster.online_join=on) on every "
+					 "shared_catalog node.")));
+
+	/*
 	 * Stage 0.18: bind the cluster_ic vtable for the configured tier.
 	 * Stub mode allocates no shmem; tier1+ (Stage 2+) will piggyback
 	 * its own *_shmem_init helper above.  Done here -- inside

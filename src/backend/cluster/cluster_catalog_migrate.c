@@ -588,7 +588,7 @@ vet_seed_no_tablespaces(const char *local_pgdata)
 	FreeDir(dir);
 }
 
-void
+ClusterCatalogMigrateResult
 cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 {
 	ClusterCatalogAuthorityMarker existing;
@@ -624,7 +624,7 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 		elog(LOG,
 			 "cluster shared_catalog: adopted shared catalog authority (sysid " UINT64_FORMAT ")",
 			 system_identifier);
-		return;
+		return CLUSTER_CATALOG_MIGRATE_ADOPTED;
 	}
 
 	/*
@@ -645,6 +645,7 @@ cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier)
 		 "cluster shared_catalog: seeded shared catalog authority under \"%s\" "
 		 "(sysid " UINT64_FORMAT ")",
 		 cluster_shared_data_dir, system_identifier);
+	return CLUSTER_CATALOG_MIGRATE_SEEDED;
 }
 
 /*
