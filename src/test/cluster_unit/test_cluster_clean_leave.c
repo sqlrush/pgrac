@@ -185,31 +185,44 @@ UT_TEST(test_version_coherent)
 
 
 /* ============================================================
- * U3b — leaver barrier-tick own-commit latch (spec-2.29a r2 P2-1)
+ * U3b — leaver barrier-tick own-commit latch (spec-2.29a r3, evidence
+ *        over inference)
  * ============================================================ */
 
 UT_TEST(test_own_commit_latched)
 {
-	/* own commit latches only when the epoch advanced AND both the others-dead
-	 * bitmap and the scalar dead_generation are unchanged. */
+	/* The latch verdict is EVIDENCE-only: the first argument is "the durable
+	 * COMMITTED marker for THIS leave attempt was confirmed" (the coordinator's
+	 * nonce-bound LEAVE_COMMITTED attestation).  The two coherence observations
+	 * (others-dead bitmap / scalar dead_generation) stay in the signature as
+	 * contract inputs the verdict must IGNORE — a third-party transient
+	 * false-DEAD flap on the leaver's local CSSD view advances the (monotone)
+	 * dead_generation and can transiently disturb the bitmap, and neither may
+	 * refuse a latch that marker evidence backs (the t/331 C1/C4 false-
+	 * escalation), nor may any combination latch without evidence (the r2 P2-1
+	 * refused-leave mis-latch hang). */
 
-	/* clean commit: epoch advanced, nothing else moved -> latch */
+	/* (a) evidence present, no flap noise -> latch */
 	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, true, true));
 
-	/* epoch has not advanced yet -> not our commit (keep waiting) */
+	/* (d) PINNING LEG (t/331 C1/C4 regression): a third-party flap advanced the
+	 * scalar dead_generation (it never rebounds) while the bitmap rebounded to
+	 * its bound value — WITH marker evidence the leave still latches; the flap
+	 * must not false-escalate a committed leave. */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, true, false));
+
+	/* (d) flap currently visible in the others-dead bitmap too -> still latch */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, false, true));
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, false, false));
+
+	/* (c) no evidence -> never latch, whatever the coherence observations say
+	 * (a refused leave never produces a COMMITTED marker, so the barrier
+	 * deadline escalation stays armed and bounds the wait — the r2 P2-1
+	 * mis-latch wedge stays closed). */
 	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, true, true));
-
-	/* a third-party death is currently in the others-dead set -> escalate */
-	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, false, true));
-
-	/* r2 P2-1 rebound case: the others-dead bitmap has REBOUND to its bound
-	 * value (a third-party false-DEAD then recovered) but the scalar
-	 * dead_generation ADVANCED — the non-monotone bitmap must NOT be trusted;
-	 * the scalar conjunct forces escalate instead of a false latch/hang. */
-	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, true, false));
-
-	/* both diverged -> escalate */
-	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, false, false));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, true, false));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, false, true));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, false, false));
 }
 
 
