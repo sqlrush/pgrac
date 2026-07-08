@@ -61,7 +61,10 @@
 #define CLUSTER_XID_AUTHORITY_MAGIC 0x0141D617
 #define CLUSTER_XID_AUTHORITY_VERSION 1
 
-/* A clean native-era shutdown published a complete hw + prehistory. */
+/* A clean native-era shutdown published a complete hw + prehistory.
+ * Cleared again -- only while CLUSTER_ERA is unset -- when a follow-up
+ * native-era run boots, so a crash of that run leaves joiners
+ * fail-closed instead of adopting the previous pass's stale hw. */
 #define CLUSTER_XID_AUTHORITY_FLAG_SEALED 0x0001
 /* A cluster.enabled=on boot closed the native era forever (one-way). */
 #define CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA 0x0002
@@ -168,6 +171,14 @@ extern void cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 n
 
 /* One-way: stamp CLUSTER_ERA (first cluster.enabled=on boot). */
 extern void cluster_xid_authority_mark_cluster_era(void);
+
+/*
+ * A follow-up native-era (cluster.enabled=off) boot on a sealed authority
+ * re-opens the era: clears SEALED so a crash of this run never exposes the
+ * previous pass's stale high-water to joiners.  Caller vets CLUSTER_ERA
+ * first (re-entry is FATAL); no-op when already unsealed.
+ */
+extern void cluster_xid_authority_begin_native_run(void);
 
 /* ============================================================
  * Prehistory publish / adopt (spec-6.15b D2; P2: adopt is complete and

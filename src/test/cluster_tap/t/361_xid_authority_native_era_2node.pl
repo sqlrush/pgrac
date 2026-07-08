@@ -407,4 +407,63 @@ EOC
 		'N3: startup log names the unsealed authority');
 }
 
+# -------------------------------------------------------------------------
+# Multi-pass seed negative: a SECOND native-era run unseals the authority at
+# boot, so crashing that run leaves joiners fail-closed instead of silently
+# adopting the first pass's stale high-water (spec-6.15b §3.1 multi-pass arm).
+# -------------------------------------------------------------------------
+{
+	my $m_shared = make_shared_root();
+	my $m_disks = make_voting_disks();
+	my $m_ic0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $m_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $m0 = PostgreSQL::Test::Cluster->new('sxid_multipass_node0');
+	my $m1 = PostgreSQL::Test::Cluster->new('sxid_multipass_node1');
+
+	$m0->init(allows_streaming => 1);
+	$m0->start;
+	$m0->safe_psql('postgres', 'CHECKPOINT');
+	$m0->stop;
+	cold_clone_data_dir($m0, $m1);
+
+	append_common_shared_catalog_conf($m0, $m_shared);
+	$m0->append_conf('postgresql.conf', <<EOC);
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+EOC
+
+	# pass 1: consume native xids (catalog-only DDL; a native-era relation
+	# extend would trip the extend-lock gate), shut down cleanly -> sealed
+	$m0->start;
+	$m0->safe_psql('postgres', 'CREATE SCHEMA sxid_pass1;');
+	$m0->stop;
+	my $m_auth = read_xid_authority($m_shared);
+	ok(($m_auth->{flags} & 0x0001) != 0,
+		'N4: first native pass sealed the XID authority');
+
+	# pass 2: booting a follow-up native run re-opens (unseals) the era
+	$m0->start;
+	$m_auth = read_xid_authority($m_shared);
+	ok(($m_auth->{flags} & 0x0001) == 0,
+		'N4: follow-up native pass unsealed the XID authority at boot');
+	like(PostgreSQL::Test::Utils::slurp_file($m0->logfile),
+		qr/re-opened native seed era/,
+		'N4: seed log names the re-opened native era');
+
+	# crash pass 2: the stale pass-1 high-water must NOT become adoptable
+	$m0->stop('immediate');
+	append_common_shared_catalog_conf($m1, $m_shared);
+	append_strict_two_node_conf($m1, $m_disks, undef);
+	$m1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+	append_pgrac_conf($m1, 'sxid_multipass', $m_ic0, $m_ic1);
+
+	my $multipass_failed = !$m1->start(fail_ok => 1);
+	ok($multipass_failed,
+		'N4: joiner refuses adoption after a crashed follow-up native pass');
+	like(PostgreSQL::Test::Utils::slurp_file($m1->logfile),
+		qr/shared XID authority is not sealed|shared XID authority is unavailable/,
+		'N4: startup log fails closed on the unsealed authority');
+}
+
 done_testing();

@@ -338,3 +338,44 @@ cluster_xid_authority_mark_cluster_era(void)
 	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA;
 	write_header(&hdr);
 }
+
+/*
+ * cluster_xid_authority_begin_native_run -- re-open the native era for a
+ * follow-up cluster.enabled=off seed run (spec-6.15b §3.1 multi-pass arm).
+ *
+ *	A sealed authority means "the high-water and prehistory are complete as
+ *	of a clean native shutdown".  A NEW native run invalidates that
+ *	completeness the moment it allocates its first xid, so the seal is
+ *	cleared up front: if this run crashes, joiners fail closed (unsealed,
+ *	53RB5) instead of adopting the previous pass's stale high-water --
+ *	false-invisible for every xid the crashed pass consumed (rule 8.A).
+ *	The clean shutdown of this run re-publishes and re-seals monotonically.
+ *
+ *	Only legal while CLUSTER_ERA is unset (the caller FATALs re-entry
+ *	first; re-checked here defensively).  Formation recipes keep native-era
+ *	boots and first cluster boots strictly ordered; if a racing first
+ *	cluster boot stamps CLUSTER_ERA inside this read-modify-write window,
+ *	the stamp is re-applied by the next cluster boot (mark is re-issued
+ *	whenever unset) and this authority is left unsealed -- which only ever
+ *	blocks adoption, never yields a wrong answer.
+ */
+void
+cluster_xid_authority_begin_native_run(void)
+{
+	ClusterXidAuthorityHeader hdr;
+
+	if (!cluster_xid_authority_read(&hdr))
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						errmsg("shared XID authority is missing or corrupt at native-run open")));
+
+	if (hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("native seed era cannot be re-entered on a formed shared catalog tree")));
+
+	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0)
+		return; /* already open (first run, or a prior pass crashed) */
+
+	hdr.flags &= ~CLUSTER_XID_AUTHORITY_FLAG_SEALED;
+	write_header(&hdr);
+}

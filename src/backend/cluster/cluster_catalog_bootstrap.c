@@ -169,6 +169,19 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 				 errdetail("The shared XID authority is already marked cluster-era started."),
 				 errhint(
 					 "Keep cluster.enabled=on for this shared tree, or destroy and re-form it.")));
+
+		/*
+		 * A follow-up native run on a SEALED authority re-opens the era: the
+		 * seal is cleared up front so a crash of this run leaves joiners
+		 * fail-closed (unsealed) instead of adopting the previous pass's
+		 * stale high-water (spec-6.15b §3.1 multi-pass arm, rule 8.A).  The
+		 * clean shutdown of this run re-publishes and re-seals.
+		 */
+		if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) {
+			cluster_xid_authority_begin_native_run();
+			elog(LOG, "cluster shared_catalog: re-opened native seed era "
+					  "(XID authority unsealed for this run)");
+		}
 		return;
 	}
 

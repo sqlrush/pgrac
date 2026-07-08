@@ -467,18 +467,45 @@ UT_TEST(test_prehistory_classify_corrupt)
 				 CLUSTER_XID_AUTHORITY_INVALID_MAGIC);
 }
 
+UT_TEST(test_begin_native_run_unseals_before_cluster_era)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+
+	/* a follow-up native run clears SEALED but keeps the high-water */
+	cluster_xid_authority_begin_native_run();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 816);
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, 0);
+
+	/* idempotent while open */
+	cluster_xid_authority_begin_native_run();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, 0);
+
+	/* the run's clean shutdown re-publishes and re-seals monotonically */
+	cluster_xid_authority_publish_native(900, 1, true);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 900);
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, CLUSTER_XID_AUTHORITY_FLAG_SEALED);
+}
+
 int
 main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
 	UT_RUN(test_seed_if_absent_creates_unsealed);
 	UT_RUN(test_publish_monotone_and_seal);
 	UT_RUN(test_mark_cluster_era_one_way);
+	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_present_distinguishes_corrupt_from_absent);
 	UT_RUN(test_prehistory_publish_adopt_round_trip);
