@@ -355,6 +355,13 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	memset(out, 0, sizeof(*out));
 }
 
+/* spec-2.29a: no pre-bump staging in the starvation fixture (no-op false). */
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return false;
+}
+
 /* spec-4.11 D3 stub:  cluster_grd.c's WAIT_CLUSTER->IDLE transition consults the
  * thread-recovery unfreeze gate before P7.  These tests drive the GES/GRD
  * remaster FSM, not online thread recovery, so the gate is out of scope -> no-op

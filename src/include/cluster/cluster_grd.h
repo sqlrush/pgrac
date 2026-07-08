@@ -660,6 +660,7 @@ typedef struct ClusterGrdRecoveryCounters {
 } ClusterGrdRecoveryCounters;
 
 extern void cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out);
+extern uint64 cluster_grd_recovery_event_old_epoch(void); /* spec-2.29a WAIT_EPOCH baseline */
 
 /* spec-4.6 P0#2 — pre-remaster stale-epoch sweep SCOPED to the affected
  * (dead-master) shards;  affected_shards is a PGRAC_GRD_SHARD_COUNT-bit

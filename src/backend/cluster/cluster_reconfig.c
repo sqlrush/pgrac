@@ -1253,6 +1253,30 @@ cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
 	stage->removal_event_id = 0;
 }
 
+/*
+ * spec-2.29a nightly-regression fix — pre-bump staging window guard.
+ *
+ *	The three pre-bump coordinator paths (fail-stop fence, node-remove,
+ *	join Phase-1) advance the membership epoch at stage-entry but only
+ *	publish the reconfig event once the voting-disk marker ACKs, which now
+ *	spans several LMON ticks instead of the pre-async single-tick spin.
+ *	Between the bump and the publish the GRD recovery IDLE tick would
+ *	re-capture recovery_event_old_epoch as the post-bump value, so its P0
+ *	accept later reads old == cur and wedges WAIT_EPOCH forever (the
+ *	spec-4.6a section 0 shape, here triggered by the coordinator on ITSELF
+ *	— even in a 2-node cluster with no IC piggyback).  While any pre-bump
+ *	stage is live the GRD IDLE tick must hold its last stable (genuine
+ *	pre-reconfig) baseline instead of re-capturing.  join Phase-2 COMMITTED
+ *	does not pre-bump, so it is intentionally excluded.
+ */
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return failstop_fence_stage.async.has_staged_event
+		   || node_removed_fence_stage.async.has_staged_event
+		   || join_prepare_stage.async.has_staged_event;
+}
+
 static bool
 cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage, ClusterMarkerAsyncKind kind,
 									int32 target_node, TimestampTz now)

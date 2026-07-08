@@ -409,6 +409,12 @@ extern void cluster_reconfig_shmem_register(void);
  */
 extern void cluster_reconfig_get_last_event(ReconfigEvent *out);
 
+/* spec-2.29a: true while a pre-bump coordinator stage (fail-stop fence /
+ * node-remove / join Phase-1) has bumped the epoch but not yet published its
+ * reconfig event -- the GRD recovery IDLE tick must hold its baseline instead
+ * of re-capturing the post-bump epoch (else WAIT_EPOCH wedges). */
+extern bool cluster_reconfig_has_pending_prebump_stage(void);
+
 
 /* ============================================================
  * Coordinator path APIs (Step 2 D2 wiring).

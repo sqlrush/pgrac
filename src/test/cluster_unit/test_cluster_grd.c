@@ -383,6 +383,16 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	memset(out, 0, sizeof(*out));
 }
 
+/* spec-2.29a nightly-regression fix: controllable pre-bump-stage flag so the
+ * GRD IDLE baseline-hold can be unit-driven (default false = pre-fix
+ * re-capture behavior; existing tests are unaffected). */
+static bool ut_mock_pending_prebump = false;
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return ut_mock_pending_prebump;
+}
+
 /* spec-4.11 D3 stub:  cluster_grd.c's WAIT_CLUSTER->IDLE transition consults the
  * thread-recovery unfreeze gate before P7.  These tests drive the GES/GRD
  * remaster FSM, not online thread recovery, so the gate is out of scope -> no-op
@@ -4044,6 +4054,43 @@ UT_TEST(test_jr_u17_stale_recipient_not_excluded_next_episode)
 }
 
 
+/* ============================================================
+ * spec-2.29a nightly-regression fix — GRD IDLE baseline hold while a
+ * pre-bump coordinator stage is in flight.
+ *
+ *	The async fence/join/node-remove marker staging bumps the epoch
+ *	several ticks before publishing.  While that window is open the GRD
+ *	IDLE tick must NOT re-capture the post-bump epoch as its WAIT_EPOCH
+ *	baseline, or the P0 accept that follows reads old == cur and wedges.
+ * ============================================================ */
+
+UT_TEST(test_recovery_idle_holds_baseline_during_prebump_stage)
+{
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	ut_mock_pending_prebump = false;
+
+	/* Idle tick with epoch 5 captures baseline 5 (no staging; get_last_event
+	 * returns event_id 0 so the tick stays IDLE and re-captures). */
+	ut_mock_epoch = 5;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_event_old_epoch(), 5);
+
+	/* A pre-bump stage goes live and the coordinator bumps the epoch to 6
+	 * before publishing.  The IDLE tick must HOLD baseline 5. */
+	ut_mock_pending_prebump = true;
+	ut_mock_epoch = 6;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_event_old_epoch(), 5);
+
+	/* Marker ACKs, stage clears; a subsequent idle tick resumes tracking. */
+	ut_mock_pending_prebump = false;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_event_old_epoch(), 6);
+
+	cluster_enabled = false;
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -4055,7 +4102,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA);
 	 * spec-5.16:+12 (join-remaster U1-U5/U10-U16);
 	 * +1 (U17 cross-episode fence Hardening). */
-	UT_PLAN(80);
+	UT_PLAN(81);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4158,6 +4205,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_jr_u15_master_side_gate_decision);
 	UT_RUN(test_jr_u16_pre_member_guard);
 	UT_RUN(test_jr_u17_stale_recipient_not_excluded_next_episode);
+	UT_RUN(test_recovery_idle_holds_baseline_during_prebump_stage);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
