@@ -134,6 +134,19 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* spec-4.6a Amendment v1.2 (R5): the S->X upgrade is now wrapped in
+ * PG_TRY/PG_CATCH, which references the exception stack + re-throw.  The
+ * unit's errfinish mock longjmps to its own buffer (never through
+ * PG_exception_stack), so these exist for the linker only. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 static BufferTag
 make_tag(uint32 blockno)
 {

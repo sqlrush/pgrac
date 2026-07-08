@@ -95,8 +95,16 @@ hw_remaster_next_attempt_deadline(uint32 completed_retry_attempts)
 static void
 hw_remaster_record_terminal(int dead_node, ClusterHwRemasterResult res)
 {
+	/* Amendment v1.2 (R6): the worker stores next_attempt_at BEFORE the
+	 * terminal result, and the LMON relaunch decision reads them in the
+	 * opposite order (result first).  Order the two stores so a decider
+	 * that observes the terminal result also observes the matching backoff
+	 * deadline — without the fence a weakly-ordered CPU could let it pair a
+	 * fresh BLOCKED with a stale (zero) deadline and skip one backoff wait
+	 * (bounded self-correcting, but cheap to close outright). */
 	if (res == CLUSTER_HW_REMASTER_DONE) {
 		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
+		pg_memory_barrier();
 		cluster_hw_remaster_set_result(dead_node, res);
 		cluster_hw_bump_remaster_done();
 	} else if (res == CLUSTER_HW_REMASTER_BLOCKED) {
@@ -104,14 +112,23 @@ hw_remaster_record_terminal(int dead_node, ClusterHwRemasterResult res)
 
 		cluster_hw_remaster_set_next_attempt_at(dead_node,
 												hw_remaster_next_attempt_deadline(attempts));
+		pg_memory_barrier();
 		cluster_hw_remaster_set_result(dead_node, res);
 		cluster_hw_bump_remaster_blocked();
 	} else if (res == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL) {
-		cluster_hw_remaster_set_next_attempt_at(dead_node, CLUSTER_HW_REMASTER_NO_DEADLINE);
+		/* Amendment v1.2 (R7): leave next_attempt_at at 0 (not NO_DEADLINE)
+		 * so the FSM's next tick takes the MARK_STRUCTURAL decision branch
+		 * and emits the episode-once operator WARNING + errhint — covering
+		 * the SIGHUP race where only the WORKER (not the launch-side
+		 * precheck) discovers the structural cause.  MARK_STRUCTURAL then
+		 * stamps NO_DEADLINE, making the WARNING once-per-episode. */
+		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
+		pg_memory_barrier();
 		cluster_hw_remaster_set_result(dead_node, res);
 		cluster_hw_bump_remaster_blocked();
 	} else if (res == CLUSTER_HW_REMASTER_NOT_APPLICABLE) {
 		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
+		pg_memory_barrier();
 		cluster_hw_remaster_set_result(dead_node, res);
 	}
 }

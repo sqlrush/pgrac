@@ -2221,7 +2221,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 						 errmsg("block-level cache protocol state is being rebuilt "
 								"after reconfiguration"),
 						 errhint("The block resource is recovering (survivor re-declare / "
-								 "master rebuild after node failure); retry the transaction.")));
+								 "master rebuild after node failure); retry the transaction. "
+								 "If the failed node stays down, restart it to run its "
+								 "instance recovery, or enable online thread recovery in a "
+								 "supported scope (cluster.online_thread_recovery).")));
 
 			CHECK_FOR_INTERRUPTS();
 			pgstat_report_wait_start(WAIT_EVENT_GCS_BLOCK_RECOVERING);
@@ -2305,9 +2308,24 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 
 			if ((cluster_pcm_lock_query_s_holders_bitmap(tag) & self_bit) == 0) {
 				struct GrdEntry *entry;
+				bool upgraded = false;
 
 				cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
-				if (!cluster_gcs_block_local_x_upgrade(tag)) {
+				/* Amendment v1.2 (R5): the upgrade waits on remote ACKs with
+				 * CHECK_FOR_INTERRUPTS in the loop, so a cancel can THROW out
+				 * of it — release the temporary S claim on that path too, not
+				 * only on the false return. */
+				PG_TRY();
+				{
+					upgraded = cluster_gcs_block_local_x_upgrade(tag);
+				}
+				PG_CATCH();
+				{
+					cluster_pcm_lock_release(tag);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+				if (!upgraded) {
 					cluster_pcm_lock_release(tag);
 					ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 									errmsg("cluster_pcm: S->X upgrade invalidate did not complete"),
@@ -2318,6 +2336,11 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 				entry = pcm_find_entry(tag);
 				if (entry != NULL) {
 					pcm_entry_lock_exclusive(entry);
+					/* Amendment v1.2 (R9): the completed S->X upgrade replaces
+					 * ALL of this node's S declarations for the tag (the X
+					 * grant subsumes them), so the local S refcount is
+					 * intentionally hard-reset rather than decremented — a
+					 * later release of the X does not owe any S releases. */
 					entry->s_holder_refcount_local = 0;
 					LWLockRelease(&entry->entry_lock.lock);
 				}
