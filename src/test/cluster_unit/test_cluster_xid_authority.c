@@ -200,6 +200,40 @@ make_fake_pgdata(char *pgdata, size_t len, const char *tag, int n_pages, unsigne
 	close(fd);
 }
 
+/* Build a fake PGDATA whose pg_xact spans SLRU segments: n_pages whole CLOG
+ * pages, 32 per segment file (0000, 0001, ...), page p filled with byte
+ * (p & 0xFF) so cross-segment ordering is byte-verifiable. */
+static void
+make_fake_pgdata_multiseg(char *pgdata, size_t len, const char *tag, int n_pages)
+{
+	char dir[MAXPGPATH];
+	char seg[MAXPGPATH];
+	char page[BLCKSZ];
+	int fd = -1;
+	int cur_seg = -1;
+	int p;
+
+	snprintf(pgdata, len, "%s/pgdata_%s", test_root, tag);
+	mkdir(pgdata, 0700);
+	snprintf(dir, sizeof(dir), "%s/pg_xact", pgdata);
+	mkdir(dir, 0700);
+	for (p = 0; p < n_pages; p++) {
+		int segno = p / 32;
+
+		if (segno != cur_seg) {
+			if (fd >= 0)
+				close(fd);
+			snprintf(seg, sizeof(seg), "%s/%04X", dir, segno);
+			fd = open(seg, O_RDWR | O_CREAT | O_TRUNC, 0600);
+			cur_seg = segno;
+		}
+		memset(page, p & 0xFF, sizeof(page));
+		(void)!write(fd, page, sizeof(page));
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
 /* ============================================================
  * U5: on-disk layout locked
  * ============================================================ */
@@ -427,6 +461,40 @@ UT_TEST(test_prehistory_publish_adopt_round_trip)
 	UT_ASSERT_EQ(memcmp(seed_page, join_page, BLCKSZ), 0);
 }
 
+UT_TEST(test_prehistory_multi_segment_round_trip)
+{
+	const uint64 xids_per_page = (uint64)BLCKSZ * 4;
+	const int n_pages = 33; /* segment 0000 full (32 pages) + 0001 (1 page) */
+	const uint64 hw = (uint64)n_pages * xids_per_page;
+	char pgdata_seed[MAXPGPATH];
+	char pgdata_join[MAXPGPATH];
+	char seg[MAXPGPATH];
+	char want[BLCKSZ];
+	char got[BLCKSZ];
+	int p;
+
+	unlink_files();
+	make_fake_pgdata_multiseg(pgdata_seed, sizeof(pgdata_seed), "seedms", n_pages);
+	/* short pre-seed clone: only one zeroed page in segment 0000 */
+	make_fake_pgdata_multiseg(pgdata_join, sizeof(pgdata_join), "joinms", 1);
+
+	cluster_xid_prehistory_publish(pgdata_seed, hw);
+	cluster_xid_prehistory_adopt(pgdata_join, hw);
+
+	for (p = 0; p < n_pages; p++) {
+		int fd;
+
+		snprintf(seg, sizeof(seg), "%s/pg_xact/%04X", pgdata_join, p / 32);
+		fd = open(seg, O_RDONLY, 0);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(lseek(fd, (off_t)(p % 32) * BLCKSZ, SEEK_SET), (off_t)(p % 32) * BLCKSZ);
+		UT_ASSERT_EQ(read(fd, got, BLCKSZ), BLCKSZ);
+		close(fd);
+		memset(want, p & 0xFF, sizeof(want));
+		UT_ASSERT_EQ(memcmp(got, want, BLCKSZ), 0);
+	}
+}
+
 UT_TEST(test_prehistory_classify_corrupt)
 {
 	char buf[64];
@@ -498,7 +566,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -509,6 +577,7 @@ main(void)
 	UT_RUN(test_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_present_distinguishes_corrupt_from_absent);
 	UT_RUN(test_prehistory_publish_adopt_round_trip);
+	UT_RUN(test_prehistory_multi_segment_round_trip);
 	UT_RUN(test_prehistory_classify_corrupt);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

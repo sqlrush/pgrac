@@ -7586,22 +7586,48 @@ CreateCheckPoint(int flags)
 	 * are complete, publish the native-era pg_xact prehistory and seal the
 	 * shared XID authority.  This does durable file I/O and may fail closed,
 	 * so it must stay outside the checkpoint critical section.
+	 *
+	 * Two deliberate exclusions (review P2-1):
+	 *
+	 * - END_OF_RECOVERY checkpoints carry `shutdown` but are NOT a clean
+	 *   close of the native run: the seed keeps consuming xids afterwards,
+	 *   so sealing here would let a joiner adopt a mid-run stale high-water
+	 *   (the same 8.A window the begin_native_run unseal closes for the
+	 *   multi-pass case).  Only a true shutdown checkpoint seals.
+	 *
+	 * - An unsupported native era (MultiXacts created, or past the
+	 *   prehistory cap) SKIPS the seal with a WARNING instead of FATALing:
+	 *   the refusal still lands fail-closed on every joiner (53RB5,
+	 *   authority unsealed), but the seed itself can shut down cleanly
+	 *   instead of wedging every later shutdown/boot in a FATAL loop.
 	 */
-	if (shutdown && cluster_shared_catalog && !cluster_enabled)
+	if (shutdown && !(flags & CHECKPOINT_END_OF_RECOVERY)
+		&& cluster_shared_catalog && !cluster_enabled)
 	{
 		uint64 native_hw = U64FromFullTransactionId(checkPoint.nextXid);
 
 		if (checkPoint.nextMulti > FirstMultiXactId)
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
-							errmsg("native-era seed loads that create MultiXacts are not supported"),
-							errdetail("Shutdown checkpoint nextMulti is %u, but only %u is supported.",
-									  checkPoint.nextMulti, FirstMultiXactId),
-							errhint("Recreate the seed without MultiXact-producing operations, or move the load in-protocol.")));
-
-		cluster_xid_prehistory_publish(DataDir, native_hw);
-		cluster_xid_authority_publish_native(native_hw, checkPoint.nextMulti, true);
-		elog(LOG, "cluster shared_catalog: published and sealed native-era XID authority high-water %llu",
-			 (unsigned long long)native_hw);
+			ereport(WARNING,
+					(errmsg("native-era seed loads that create MultiXacts are not supported; "
+							"leaving the shared XID authority unsealed"),
+					 errdetail("Shutdown checkpoint nextMulti is %u, but only %u is supported.",
+							   checkPoint.nextMulti, FirstMultiXactId),
+					 errhint("Joiners will fail closed (53RB5); recreate the seed without "
+							 "MultiXact-producing operations, or move the load in-protocol.")));
+		else if (cluster_xid_prehistory_payload_bytes(native_hw) == 0)
+			ereport(WARNING,
+					(errmsg("native-era xid high-water %llu is outside the prehistory publish "
+							"range; leaving the shared XID authority unsealed",
+							(unsigned long long) native_hw),
+					 errhint("Joiners will fail closed (53RB5); split the seed load or move "
+							 "it in-protocol.")));
+		else
+		{
+			cluster_xid_prehistory_publish(DataDir, native_hw);
+			cluster_xid_authority_publish_native(native_hw, checkPoint.nextMulti, true);
+			elog(LOG, "cluster shared_catalog: published and sealed native-era XID authority high-water %llu",
+				 (unsigned long long) native_hw);
+		}
 	}
 
 #endif

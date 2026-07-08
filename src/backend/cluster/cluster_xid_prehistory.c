@@ -189,6 +189,9 @@ roll_blob_to_bak(const char *primary, const char *bak, const char *baktmp)
 			ereport(PANIC,
 					(errcode_for_file_access(), errmsg("could not write file \"%s\": %m", baktmp)));
 	}
+	if (r < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(), errmsg("could not read file \"%s\": %m", primary)));
 	CloseTransientFile(src);
 	if (pg_fsync(dst) != 0)
 		ereport(PANIC,
