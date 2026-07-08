@@ -202,6 +202,24 @@ PostgreSQL::Test::Utils::system_log(
 $node0->start;
 $node1->_update_pid(1);
 
+# spec-6.15b D6 flipped this test to online_join+xid_striping: formation now
+# passes through the join gate, whose home-block rebuild window answers
+# transiently with "block master is recovering ... retry is safe" (even at
+# connection time, via the pg_authid read).  First-contact probes therefore
+# retry; every semantic assert below stays strict.
+sub psql_retry_ok
+{
+	my ($node, $sql, $tries) = @_;
+	$tries //= 120;
+	for (1 .. $tries)
+	{
+		my ($rc, $out) = $node->psql('postgres', $sql);
+		return (1, $out) if defined $rc && $rc == 0;
+		usleep(500_000);
+	}
+	return (0, undef);
+}
+
 # node1 must actually be up.
 my $n1_up = 0;
 for (1 .. 60)
@@ -214,7 +232,7 @@ for (1 .. 60)
 # ----------
 # L1: both alive + IC-connected on the shared-sysid cluster.
 # ----------
-my $a0 = $node0->safe_psql('postgres', 'SELECT 1');
+my ($n0_up, $a0) = psql_retry_ok($node0, 'SELECT 1');
 is($a0, '1', 'L1: node0 is up on the shared-catalog 2-node cluster');
 is($n1_up, 1, 'L1: node1 is up on the shared-catalog 2-node cluster');
 
@@ -222,10 +240,10 @@ is($n1_up, 1, 'L1: node1 is up on the shared-catalog 2-node cluster');
 my $peer_ok = 0;
 for (1 .. 40)
 {
-	my $s = $node0->safe_psql('postgres',
+	my ($prc, $s) = psql_retry_ok($node0,
 		"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
-		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
-	if (defined $s && $s eq 't') { $peer_ok = 1; last; }
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1", 1);
+	if ($prc && defined $s && $s eq 't') { $peer_ok = 1; last; }
 	usleep(500_000);
 }
 is($peer_ok, 1, 'L1: node0 sees node1 heartbeats (IC connected)');
@@ -235,9 +253,10 @@ is($peer_ok, 1, 'L1: node0 sees node1 heartbeats (IC connected)');
 #              node1 ever running the DDL.  This is the Stage 2 exit debt
 #              (spec-2.0:135) closure.
 # ----------
-$node0->safe_psql('postgres',
+my ($ddl_ok) = psql_retry_ok($node0,
 	'CREATE TABLE a1_shared_cat (id int PRIMARY KEY, note text);'
 	. "INSERT INTO a1_shared_cat VALUES (1, 'from-node0');");
+die 'first cross-node DDL never succeeded' unless $ddl_ok;
 
 # Poll node1 up to 1s (10 x 100ms).  "retry is safe" per the GCS remaster
 # transient; a settled shared catalog resolves well within the budget.

@@ -243,6 +243,23 @@ PostgreSQL::Test::Utils::system_log(
 $node0->start;
 $node1->_update_pid(1);
 
+# spec-6.15b D6 flipped this test to online_join+xid_striping: formation now
+# passes through the join gate, whose home-block rebuild window answers
+# transiently with "block master is recovering ... retry is safe" (even at
+# connection time).  First-contact probes retry; semantic asserts stay strict.
+sub psql_retry_ok
+{
+	my ($node, $sql, $tries) = @_;
+	$tries //= 120;
+	for (1 .. $tries)
+	{
+		my ($rc, $out) = $node->psql('postgres', $sql);
+		return (1, $out) if defined $rc && $rc == 0;
+		usleep(500_000);
+	}
+	return (0, undef);
+}
+
 my $n1_up = 0;
 for (1 .. 60)
 {
@@ -254,16 +271,17 @@ for (1 .. 60)
 # ----------
 # L0: both alive + IC-connected.
 # ----------
-is($node0->safe_psql('postgres', 'SELECT 1'), '1', 'L0: node0 is up');
+my ($n0_up_rc, $n0_up_out) = psql_retry_ok($node0, 'SELECT 1');
+is($n0_up_out, '1', 'L0: node0 is up');
 is($n1_up, 1, 'L0: node1 is up');
 
 my $peer_ok = 0;
 for (1 .. 40)
 {
-	my $s = $node0->safe_psql('postgres',
+	my ($prc, $s) = psql_retry_ok($node0,
 		"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
-		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
-	if (defined $s && $s eq 't') { $peer_ok = 1; last; }
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1", 1);
+	if ($prc && defined $s && $s eq 't') { $peer_ok = 1; last; }
 	usleep(500_000);
 }
 is($peer_ok, 1, 'L0: node0 sees node1 heartbeats (IC connected)');
@@ -279,15 +297,17 @@ is($peer_ok, 1, 'L0: node0 sees node1 heartbeats (IC connected)');
 #                CREATE t_crash_uncommitted (+ row, NO commit) -> 8.A leg
 #     -> node1's cold merge must divert all of these.
 # ----------
-$node1->safe_psql('postgres',
+my ($survivor_ok) = psql_retry_ok($node1,
 	"CREATE TABLE t_survivor (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_survivor VALUES (1, 'alive');");
+die 'node1 first DDL never succeeded' unless $survivor_ok;
 
-$node0->safe_psql('postgres',
+my ($keep_ok) = psql_retry_ok($node0,
 	"CREATE TABLE t_keep (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_keep VALUES (1, 'keep');"
 	. "CREATE TABLE t_dropme (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_dropme VALUES (1, 'doomed');");
+die 'node0 first DDL never succeeded' unless $keep_ok;
 
 # Shared-tree relfile of t_dropme, captured BEFORE the drop.
 my $drop_relpath = $node0->safe_psql('postgres',
