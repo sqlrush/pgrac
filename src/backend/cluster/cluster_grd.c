@@ -46,7 +46,8 @@
 #include "cluster/cluster_pcm_lock.h"	 /* spec-2.36 HC124 pending_x node-dead cleanup */
 #include "cluster/cluster_gcs.h"		 /* spec-4.7 D2 — cluster_gcs_lookup_master */
 #include "cluster/cluster_membership.h"	 /* spec-5.16 D1 — cluster_membership_is_member */
-#include "cluster/cluster_gcs_block.h"	 /* spec-4.7 D2 — block re-declare scan + send */
+#include "cluster/cluster_native_lock_probe.h"
+#include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
@@ -731,9 +732,13 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->recovery_event_old_epoch, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_redeclare_generation, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_barrier_deadline, 0);
+		pg_atomic_init_u32(&cluster_grd_state->recovery_event_coordinator, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch_at_accept, 0);
 		/* spec-4.6 P0#3 cluster gate — per-node barrier-done epochs. */
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->recovery_done_event_id[i], 0);
+		}
 		pg_atomic_init_u64(&cluster_grd_state->remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_done_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_failed_count, 0);
@@ -747,6 +752,9 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->block_path_failclosed_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->unaffected_holder_survived_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->stale_holder_swept_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->cluster_gate_timeout_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->wait_epoch_escape_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->pcm_dead_cleanup_entries, 0);
 
 		/* spec-5.16 D2/D3b/D5 — online-join remaster fence + counters. */
 		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_epoch, 0);
@@ -1630,6 +1638,78 @@ cluster_grd_redeclare_episode_epoch(void)
  *	been re-declared to its recovery-aware master — serving it would risk an
  *	8.A double-grant.  Reaching IDLE implies all survivor scans completed.
  */
+uint32
+cluster_grd_recovery_state_value(void)
+{
+	if (cluster_grd_state == NULL)
+		return (uint32)GRD_RECOVERY_IDLE;
+	return pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+}
+
+const char *
+cluster_grd_recovery_state_name(uint32 state)
+{
+	switch ((ClusterGrdRecoveryState)state) {
+	case GRD_RECOVERY_IDLE:
+		return "idle";
+	case GRD_RECOVERY_WAIT_EPOCH:
+		return "wait_epoch";
+	case GRD_RECOVERY_WAIT_BARRIER:
+		return "wait_barrier";
+	case GRD_RECOVERY_WAIT_CLUSTER:
+		return "wait_cluster";
+	}
+	return "unknown";
+}
+
+uint64
+cluster_grd_recovery_last_event_id(void)
+{
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)
+			   : 0;
+}
+
+uint64
+cluster_grd_recovery_event_old_epoch(void)
+{
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch)
+			   : 0;
+}
+
+uint64
+cluster_grd_recovery_episode_epoch_value(void)
+{
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch)
+			   : 0;
+}
+
+uint32
+cluster_grd_recovery_event_coordinator(void)
+{
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u32(&cluster_grd_state->recovery_event_coordinator)
+			   : 0;
+}
+
+uint64
+cluster_grd_recovery_done_epoch_for(int32 node)
+{
+	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[node]);
+}
+
+uint64
+cluster_grd_recovery_done_event_id_for(int32 node)
+{
+	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[node]);
+}
+
 bool
 cluster_grd_recovery_in_progress(void)
 {
@@ -1686,6 +1766,10 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	out->unaffected_holder_survived
 		= pg_atomic_read_u64(&cluster_grd_state->unaffected_holder_survived_count);
 	out->stale_holder_swept = pg_atomic_read_u64(&cluster_grd_state->stale_holder_swept_count);
+	out->cluster_gate_timeout = pg_atomic_read_u64(&cluster_grd_state->cluster_gate_timeout_count);
+	out->wait_epoch_escape = pg_atomic_read_u64(&cluster_grd_state->wait_epoch_escape_count);
+	out->pcm_dead_cleanup_entries
+		= pg_atomic_read_u64(&cluster_grd_state->pcm_dead_cleanup_entries);
 	/* spec-5.16 D5 — join-direction remaster counters. */
 	out->join_remaster_started
 		= pg_atomic_read_u64(&cluster_grd_state->join_remaster_started_count);
@@ -1924,6 +2008,39 @@ grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 	return true;
 }
 
+static void
+grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf, Size buflen)
+{
+	int beid;
+	pid_t self_pid = MyProcPid;
+
+	if (buflen == 0)
+		return;
+	buf[0] = '\0';
+	for (beid = 1; beid <= MaxBackends; beid++) {
+		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+		uint32 registered;
+		uint64 acked;
+		uint64 acked_epoch;
+
+		if (proc == NULL || proc->pid == 0 || proc->pid == self_pid)
+			continue;
+		registered = pg_atomic_read_u32(&proc->cluster_grd_registered_count);
+		if (registered == 0)
+			continue;
+		acked = pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked);
+		acked_epoch = pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch);
+		if (acked < gen || acked_epoch != episode_epoch) {
+			snprintf(buf, buflen,
+					 "beid=%d pid=%d registered=%u acked=" UINT64_FORMAT "/" UINT64_FORMAT
+					 " target=" UINT64_FORMAT "/" UINT64_FORMAT,
+					 beid, (int)proc->pid, registered, acked, acked_epoch, gen, episode_epoch);
+			return;
+		}
+	}
+	snprintf(buf, buflen, "none");
+}
+
 /*
  * spec-4.6 P0#3 cluster gate — announce "my local rebind barrier is
  * complete for `epoch`" to every declared peer (fire-and-forget;  the
@@ -1934,6 +2051,7 @@ static void
 grd_recovery_broadcast_done(uint64 epoch)
 {
 	GesRequestPayload req;
+	uint64 event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
 	uint64 master_gen = cluster_lms_get_shard_master_generation();
 	int i;
 
@@ -1943,6 +2061,8 @@ grd_recovery_broadcast_done(uint64 epoch)
 	req.holder_procno = 0;
 	req.holder_cluster_epoch_lo = (uint32)(epoch & 0xffffffffu);
 	req.holder_cluster_epoch_hi = (uint32)(epoch >> 32);
+	req.holder_request_id_lo = (uint32)(event_id & 0xffffffffu);
+	req.holder_request_id_hi = (uint32)(event_id >> 32);
 	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
 	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
 
@@ -1961,19 +2081,33 @@ grd_recovery_broadcast_done(uint64 epoch)
 
 /* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
 void
-cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch)
+cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
 {
-	uint64 prev;
+	uint64 current_event_id;
 
 	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
 		return;
-	/* Monotonic max:  late/duplicate announcements never regress. */
-	prev = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[node]);
-	while (epoch > prev) {
-		if (pg_atomic_compare_exchange_u64(&cluster_grd_state->recovery_done_epoch[node], &prev,
-										   epoch))
-			break;
+
+	/*
+	 * spec-4.6a D4-v2: REDECLARE_DONE is an event-scoped proof.  A stale DONE
+	 * from a previous episode can carry the same epoch when cur==old, so epoch
+	 * monotonicity alone is not enough.  Drop messages for any event other than
+	 * the one this LMON has accepted; senders re-announce every tick.
+	 */
+	current_event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	if (event_id == 0 || (current_event_id != 0 && event_id != current_event_id))
+		return;
+
+	/* spec-4.6a §2.3: monotonic-max accounting.  Under strictly-monotonic
+	 * per-event epochs the incoming value always wins, but never regress the
+	 * published value if a delayed lower-epoch frame ever slips through. */
+	{
+		uint64 prev = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[node]);
+
+		if (epoch > prev)
+			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[node], epoch);
 	}
+	pg_atomic_write_u64(&cluster_grd_state->recovery_done_event_id[node], event_id);
 }
 
 /*
@@ -1998,6 +2132,144 @@ grd_recovery_abort_to_idle(void)
 	ereport(DEBUG1,
 			(errmsg_internal("cluster_grd_recovery: episode aborted (epoch moved / new event "
 							 "mid-recovery); shards stay frozen, re-running under the new epoch")));
+}
+
+static void
+grd_recovery_appendf(char *buf, Size buflen, int *off, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+	Size avail;
+
+	if (buflen == 0 || *off >= (int)buflen - 1)
+		return;
+	avail = buflen - (Size)*off;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *off, avail, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	if ((Size)n >= avail)
+		*off = (int)buflen - 1;
+	else
+		*off += n;
+}
+
+static void
+grd_recovery_format_missing_survivors(const uint64 *dead, uint64 episode_epoch, bool is_join,
+									  char *buf, Size buflen)
+{
+	int off = 0;
+	int i;
+	bool any = false;
+
+	buf[0] = '\0';
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 done_epoch;
+
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (grd_dead_bitmap_test(dead, i))
+			continue;
+		if (is_join && join_fence_is_recipient_for(i, episode_epoch))
+			continue;
+		done_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]);
+		if (done_epoch >= episode_epoch
+			&& pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i])
+				   == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id))
+			continue;
+		grd_recovery_appendf(buf, buflen, &off,
+							 "%s%d(done=" UINT64_FORMAT "/event=" UINT64_FORMAT ")", any ? "," : "",
+							 i, done_epoch,
+							 pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i]));
+		any = true;
+	}
+	if (!any)
+		grd_recovery_appendf(buf, buflen, &off, "none");
+}
+
+static void
+grd_recovery_format_hw_dead(const uint64 *dead, char *buf, Size buflen)
+{
+	int off = 0;
+	int i;
+	bool any = false;
+
+	buf[0] = '\0';
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterHwRemasterResult result;
+
+		if (!grd_dead_bitmap_test(dead, i) || i == cluster_node_id)
+			continue;
+		result = cluster_hw_remaster_result(i);
+		grd_recovery_appendf(buf, buflen, &off, "%s%d:%s/%u", any ? "," : "", i,
+							 cluster_hw_remaster_result_name(result),
+							 cluster_hw_remaster_attempts(i));
+		any = true;
+	}
+	if (!any)
+		grd_recovery_appendf(buf, buflen, &off, "none");
+}
+
+static bool
+grd_recovery_adopt_observed_epoch(const uint64 *dead, uint64 cur_epoch)
+{
+	uint64 max_epoch = cur_epoch;
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 peer_epoch;
+
+		if (i == cluster_node_id || cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (grd_dead_bitmap_test(dead, i))
+			continue;
+		peer_epoch = cluster_reconfig_get_observed_epoch(i);
+		if (peer_epoch > max_epoch)
+			max_epoch = peer_epoch;
+	}
+	if (max_epoch <= cur_epoch)
+		return false;
+	cluster_epoch_adopt_admitted(max_epoch);
+	return true;
+}
+
+static void
+grd_recovery_wait_cluster_watchdog(const uint64 *dead, uint64 episode_epoch)
+{
+	TimestampTz now;
+	TimestampTz deadline;
+	TimestampTz next_deadline;
+	char missing[512];
+	char hw_dead[512];
+	bool thread_gate;
+	bool hw_gate;
+	bool is_join;
+
+	deadline = (TimestampTz)pg_atomic_read_u64(&cluster_grd_state->recovery_barrier_deadline);
+	now = GetCurrentTimestamp();
+	if (deadline == 0 || now <= deadline)
+		return;
+
+	is_join = (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+			   == (uint32)GRD_REMASTER_DIR_JOIN);
+	grd_recovery_format_missing_survivors(dead, episode_epoch, is_join, missing, sizeof(missing));
+	thread_gate = cluster_thread_recovery_gate_unfreeze(dead, (CLUSTER_MAX_NODES + 63) / 64);
+	hw_gate = cluster_hw_remaster_gate_unfreeze();
+	grd_recovery_format_hw_dead(dead, hw_dead, sizeof(hw_dead));
+
+	pg_atomic_fetch_add_u64(&cluster_grd_state->cluster_gate_timeout_count, 1);
+	ereport(
+		WARNING,
+		(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+		 errmsg("cluster GRD recovery WAIT_CLUSTER watchdog fired; affected shards stay frozen"),
+		 errdetail("episode_epoch=" UINT64_FORMAT ", missing_survivors=%s, "
+				   "thread_gate=%s, hw_gate=%s, hw_dead=%s",
+				   episode_epoch, missing, thread_gate ? "held" : "open", hw_gate ? "held" : "open",
+				   hw_dead),
+		 errhint("This watchdog is observational only; it never unfreezes a shard.")));
+	next_deadline = TimestampTzPlusMilliseconds(now, cluster_grd_rebuild_timeout_ms);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)next_deadline);
 }
 
 
@@ -2078,6 +2350,24 @@ grd_block_redeclare_scan_complete(uint64 episode_epoch)
 	return grd_block_redeclare_epoch == episode_epoch && grd_block_redeclare_done;
 }
 
+int
+cluster_grd_recovery_block_redeclare_cursor(void)
+{
+	return grd_block_redeclare_cursor;
+}
+
+uint64
+cluster_grd_recovery_block_redeclare_epoch(void)
+{
+	return grd_block_redeclare_epoch;
+}
+
+bool
+cluster_grd_recovery_block_redeclare_done(void)
+{
+	return grd_block_redeclare_done;
+}
+
 void
 cluster_grd_recovery_lmon_tick(void)
 {
@@ -2119,6 +2409,18 @@ cluster_grd_recovery_lmon_tick(void)
 		 * epoch (the genuine pre-reconfig baseline) — do NOT overwrite it
 		 * with evt.old_epoch here. */
 		pg_atomic_write_u64(&cluster_grd_state->recovery_last_event_id, ev_id);
+		pg_atomic_write_u32(&cluster_grd_state->recovery_event_coordinator,
+							(uint32)evt.coordinator_node_id);
+		if (evt.coordinator_node_id >= 0 && evt.coordinator_node_id < CLUSTER_MAX_NODES)
+			pg_atomic_write_u64(
+				&cluster_grd_state->recovery_done_epoch_at_accept,
+				pg_atomic_read_u64(
+					&cluster_grd_state->recovery_done_epoch[evt.coordinator_node_id]));
+		else
+			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch_at_accept, 0);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
+							(uint64)TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+																cluster_grd_rebuild_timeout_ms));
 		for (b = 0; b < (CLUSTER_MAX_NODES + 63) / 64; b++) {
 			uint64 word = 0;
 			int j;
@@ -2174,35 +2476,116 @@ cluster_grd_recovery_lmon_tick(void)
 		int i;
 		int signaled;
 
-		/*
-		 * Gate on the ACCEPTED epoch having advanced past the episode's
-		 * old epoch:  the coordinator bumped it earlier this tick;  a
-		 * non-coordinator survivor observes it via IC envelope piggyback
-		 * a tick or two later.  Running the rebind before the local
-		 * epoch advances would mint holders the new master rejects.
-		 *
-		 * spec-5.16 (P0, Rule 8.A) — direction-aware.  A FAIL survivor captures
-		 * old_epoch BEFORE the coordinator bumps, so it must wait for a STRICT
-		 * advance (cur > old) to prove it adopted the new master view.  A JOIN
-		 * observer survivor instead adopts the coordinator's JOIN epoch bump (via the
-		 * joiner_self_tick max-peer-epoch adoption, same LMON tick) BEFORE it readmits
-		 * the rejoiner and publishes its own observer JOIN_COMMITTED event, so by the
-		 * time its FSM accepts that event old_epoch == cur_epoch == the join epoch.
-		 * Requiring a strict advance there wedges the survivor in WAIT_EPOCH forever:
-		 * it never runs the re-declare barrier, never broadcasts REDECLARE_DONE, and
-		 * the coordinator's all-members JOIN barrier (Hardening v1.1) hangs →
-		 * join_remaster_done never advances.  For JOIN the survivor already holds the
-		 * epoch it rebinds under (that IS the post-bump master view), so equality is
-		 * sufficient; cur_epoch is monotonic so cur < old never occurs for JOIN.
-		 */
-		if (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
-					== (uint32)GRD_REMASTER_DIR_JOIN
-				? cur_epoch < old_epoch
-				: cur_epoch <= old_epoch)
-			return;
-
 		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
 			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+
+		/*
+		 * Gate on the ACCEPTED epoch having advanced past the episode's old epoch.
+		 * FAIL requires proof of a post-bump epoch; JOIN keeps its existing equality
+		 * allowance because the observer already accepted the coordinator's JOIN epoch.
+		 * For FAIL, deadline expiry is not an escape hatch by itself: we either adopt
+		 * a durable observed epoch or require a coordinator REDECLARE_DONE witness for
+		 * cur==old.  Without either proof, stay fail-closed in WAIT_EPOCH.
+		 */
+		{
+			ReconfigEvent latest;
+			bool is_join;
+
+			cluster_reconfig_get_last_event(&latest);
+			if (latest.event_id != 0
+				&& latest.event_id
+					   != pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)) {
+				grd_recovery_abort_to_idle();
+				return;
+			}
+
+			is_join = (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+					   == (uint32)GRD_REMASTER_DIR_JOIN);
+			if (is_join) {
+				if (cur_epoch < old_epoch)
+					return;
+			} else if (cur_epoch <= old_epoch) {
+				TimestampTz now = GetCurrentTimestamp();
+				TimestampTz wait_deadline;
+				TimestampTz next_deadline;
+				uint32 coordinator;
+				uint64 coord_done;
+				uint64 coord_done_event_id;
+				uint64 accepted_event_id;
+				uint64 coord_done_at_accept;
+
+				wait_deadline = (TimestampTz)pg_atomic_read_u64(
+					&cluster_grd_state->recovery_barrier_deadline);
+				if (wait_deadline == 0 || now <= wait_deadline)
+					return;
+
+				if (grd_recovery_adopt_observed_epoch(dead, cur_epoch)) {
+					next_deadline
+						= TimestampTzPlusMilliseconds(now, cluster_grd_rebuild_timeout_ms);
+					pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
+										(uint64)next_deadline);
+					ereport(
+						WARNING,
+						(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+						 errmsg("cluster GRD recovery WAIT_EPOCH adopted a durable observed epoch; "
+								"affected shards stay frozen until recovery completes")));
+					return;
+				}
+
+				coordinator = pg_atomic_read_u32(&cluster_grd_state->recovery_event_coordinator);
+				accepted_event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+				coord_done
+					= coordinator < CLUSTER_MAX_NODES
+						  ? pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[coordinator])
+						  : 0;
+				coord_done_event_id
+					= coordinator < CLUSTER_MAX_NODES
+						  ? pg_atomic_read_u64(
+								&cluster_grd_state->recovery_done_event_id[coordinator])
+						  : 0;
+				coord_done_at_accept
+					= pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch_at_accept);
+				/*
+				 * spec-4.6a §2.3 witness (all three conjuncts of the frozen
+				 * text): the coordinator's DONE must (a) be for THIS event,
+				 * (b) name exactly cur as the episode epoch, and (c) have been
+				 * accounted after our P0 accept snapshot.  Under strictly
+				 * monotonic per-event epochs (c) is implied by (a)+(b) — any
+				 * pre-accept residue carries a lower epoch — but it stays as a
+				 * belt-and-suspenders guard against accounting bugs.
+				 */
+				if (cur_epoch == old_epoch && coord_done == cur_epoch
+					&& coord_done_event_id == accepted_event_id
+					&& coord_done > coord_done_at_accept) {
+					pg_atomic_fetch_add_u64(&cluster_grd_state->wait_epoch_escape_count, 1);
+					ereport(WARNING,
+							(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+							 errmsg("cluster GRD recovery WAIT_EPOCH used coordinator witness for "
+									"equal-epoch progress"),
+							 errdetail("coordinator=%u, epoch=" UINT64_FORMAT
+									   ", event_id=" UINT64_FORMAT,
+									   coordinator, cur_epoch, accepted_event_id)));
+				} else {
+					next_deadline
+						= TimestampTzPlusMilliseconds(now, cluster_grd_rebuild_timeout_ms);
+					pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
+										(uint64)next_deadline);
+					ereport(
+						WARNING,
+						(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+						 errmsg("cluster GRD recovery WAIT_EPOCH has no post-bump proof; "
+								"affected shards stay frozen"),
+						 errdetail("cur_epoch=" UINT64_FORMAT ", old_epoch=" UINT64_FORMAT
+								   ", coordinator=%u, coordinator_done=" UINT64_FORMAT
+								   ", coordinator_done_event_id=" UINT64_FORMAT
+								   ", accepted_event_id=" UINT64_FORMAT
+								   ", coordinator_done_at_accept=" UINT64_FORMAT,
+								   cur_epoch, old_epoch, coordinator, coord_done,
+								   coord_done_event_id, accepted_event_id, coord_done_at_accept)));
+					return;
+				}
+			}
+		}
 
 		/*
 		 * P1 freeze affected + P3 scoped sweep + P4 remaster.  Direction-
@@ -2306,6 +2689,7 @@ cluster_grd_recovery_lmon_tick(void)
 	if (state == (uint32)GRD_RECOVERY_WAIT_BARRIER) {
 		uint64 gen = pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
 		uint64 episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
+		TimestampTz deadline;
 
 		/* P0-1 epoch-coherence guard:  a SECOND epoch bump landed
 		 * mid-episode (e.g. a third node's heartbeat flap re-fired
@@ -2344,7 +2728,12 @@ cluster_grd_recovery_lmon_tick(void)
 			 */
 			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[cluster_node_id],
 								episode_epoch);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_done_event_id[cluster_node_id],
+								pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id));
 			grd_recovery_broadcast_done(episode_epoch);
+			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   cluster_grd_rebuild_timeout_ms);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
 			pg_atomic_write_u32(&cluster_grd_state->recovery_state,
 								(uint32)GRD_RECOVERY_WAIT_CLUSTER);
 			ereport(DEBUG1,
@@ -2358,6 +2747,12 @@ cluster_grd_recovery_lmon_tick(void)
 		if (GetCurrentTimestamp()
 			> (TimestampTz)pg_atomic_read_u64(&cluster_grd_state->recovery_barrier_deadline)) {
 			TimestampTz deadline;
+			char waiting_backend[256];
+			bool ges_barrier_complete = grd_recovery_barrier_complete(gen, episode_epoch);
+			bool block_scan_complete = grd_block_redeclare_scan_complete(episode_epoch);
+
+			grd_recovery_format_waiting_backend(gen, episode_epoch, waiting_backend,
+												sizeof(waiting_backend));
 
 			/*
 			 * Barrier deadline expired:  fail-closed.  Affected shards
@@ -2376,6 +2771,12 @@ cluster_grd_recovery_lmon_tick(void)
 					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
 					 errmsg("cluster GRD holder-rebuild barrier timed out; affected shards "
 							"stay frozen"),
+					 errdetail("gen=" UINT64_FORMAT ", episode_epoch=" UINT64_FORMAT
+							   ", ges_barrier=%s, block_scan=%s, block_cursor=%d"
+							   ", block_epoch=" UINT64_FORMAT ", waiting_backend=%s",
+							   gen, episode_epoch, ges_barrier_complete ? "done" : "waiting",
+							   block_scan_complete ? "done" : "waiting", grd_block_redeclare_cursor,
+							   grd_block_redeclare_epoch, waiting_backend),
 					 errhint("A backend has not acked the cooperative rebind within "
 							 "cluster.grd_rebuild_timeout_ms; re-broadcasting.")));
 			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
@@ -2408,6 +2809,8 @@ cluster_grd_recovery_lmon_tick(void)
 
 		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
 			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+
+		grd_recovery_wait_cluster_watchdog(dead, episode_epoch);
 
 		/*
 		 * spec-4.11 D1 (3b-4b Part 3) — launch one per-episode online thread-
@@ -2461,8 +2864,9 @@ cluster_grd_recovery_lmon_tick(void)
 				 */
 				if (is_join && join_fence_is_recipient_for(i, episode_epoch))
 					continue;
-				if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i])
-					< episode_epoch) {
+				if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < episode_epoch
+					|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i])
+						   != pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)) {
 					all_done = false;
 					break;
 				}
@@ -5344,13 +5748,28 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 	int swept = 0;
 	int nresids;
 	uint64 pending_x_cleared = 0;
+	uint64 pcm_holders_cleaned = 0;
 	int i;
 
 	pending_x_cleared = cluster_pcm_lock_clear_pending_x_for_node(dead_node_id);
-	if (pending_x_cleared > 0)
-		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
-										 "cleared " UINT64_FORMAT " PCM pending_x entries",
-										 dead_node_id, pending_x_cleared)));
+	pcm_holders_cleaned = cluster_pcm_lock_cleanup_on_node_dead(dead_node_id);
+
+	/*
+	 * spec-4.6a D12: dead-node PCM residue is part of the reconfig
+	 * convergence chain -- a leftover holder/pending-X record from the dead
+	 * node blocks post-kill DDL with lock-acquire timeouts long after the
+	 * remaster itself finished.  Surface the cleanup as a LOG summary plus an
+	 * assertable counter (pcm/dead_cleanup_entries).
+	 */
+	if (pending_x_cleared > 0 || pcm_holders_cleaned > 0) {
+		if (cluster_grd_state != NULL)
+			pg_atomic_fetch_add_u64(&cluster_grd_state->pcm_dead_cleanup_entries,
+									pending_x_cleared + pcm_holders_cleaned);
+		ereport(LOG, (errmsg("cluster GRD dead-node cleanup for node %d: cleared " UINT64_FORMAT
+							 " PCM pending-X waiter(s) and " UINT64_FORMAT
+							 " PCM holder record(s) left by the dead node",
+							 dead_node_id, pending_x_cleared, pcm_holders_cleaned)));
+	}
 
 	if (cluster_grd_entry_htab == NULL) {
 		ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "

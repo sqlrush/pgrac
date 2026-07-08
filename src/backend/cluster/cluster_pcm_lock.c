@@ -724,6 +724,96 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
 	return cleared;
 }
 
+uint64
+cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
+{
+	HASH_SEQ_STATUS scan;
+	struct GrdEntry *entry;
+	uint64 cleaned = 0;
+	uint32 dead_bit;
+
+	if (cluster_pcm_htab == NULL || dead_node < 0 || dead_node >= 32)
+		return 0;
+
+	dead_bit = (uint32)1u << (uint32)dead_node;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	hash_seq_init(&scan, cluster_pcm_htab);
+	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		bool changed = false;
+		bool broadcast_needed = false;
+		bool master_holder_was_dead;
+		PcmState before_state;
+		PcmState after_state;
+		uint32 s_bitmap;
+		uint32 pi_bitmap;
+
+		/* Cheap unlocked filter; rechecked under entry_lock below. */
+		if (entry->x_holder_node != dead_node
+			&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & dead_bit) == 0
+			&& (pg_atomic_read_u32(&entry->pi_holders_bitmap) & dead_bit) == 0
+			&& (!pcm_master_holder_is_valid(entry)
+				|| (int32)entry->master_holder.node_id != dead_node))
+			continue;
+
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		before_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+		master_holder_was_dead
+			= pcm_master_holder_is_valid(entry) && (int32)entry->master_holder.node_id == dead_node;
+
+		if (entry->x_holder_node == dead_node) {
+			entry->x_holder_node = -1;
+			changed = true;
+		}
+		s_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
+		if ((s_bitmap & dead_bit) != 0) {
+			s_bitmap &= ~dead_bit;
+			pg_atomic_write_u32(&entry->s_holders_bitmap, s_bitmap);
+			changed = true;
+		}
+		pi_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+		if ((pi_bitmap & dead_bit) != 0) {
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, pi_bitmap & ~dead_bit);
+			changed = true;
+		}
+
+		if (entry->x_holder_node >= 0) {
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+			if (master_holder_was_dead)
+				pcm_master_holder_set_node(entry, entry->x_holder_node);
+		} else if (s_bitmap != 0) {
+			int32 next_holder = pcm_lowest_set_bit_node(s_bitmap);
+
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+			if (master_holder_was_dead) {
+				if (next_holder >= 0)
+					pcm_master_holder_set_node(entry, next_holder);
+				else
+					pcm_master_holder_clear(entry);
+			}
+		} else {
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+			if (pcm_master_holder_is_valid(entry))
+				pcm_master_holder_clear(entry);
+		}
+		if (master_holder_was_dead)
+			changed = true;
+		after_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+		if (changed && after_state != before_state)
+			broadcast_needed = true;
+
+		LWLockRelease(&entry->entry_lock.lock);
+
+		if (broadcast_needed)
+			ConditionVariableBroadcast(&entry->wait_cv);
+		if (changed)
+			cleaned++;
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return cleaned;
+}
+
 
 /* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5 (clean-leave PCM release).
@@ -2199,6 +2289,41 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 
 		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
 			return cluster_gcs_local_master_x_transfer_and_wait(buf, holder, clean_eligible);
+
+		/*
+		 * PGRAC: spec-4.6a BUG-C2 follow-through for shared_catalog DDL after
+		 * fail-stop.  Local-master state=S with other live S holders but no local
+		 * S bit used to fall through to the tag-only X acquire, which fail-closed
+		 * as "no local S residency".  This entry point is buffer-aware: the
+		 * caller has already read or initialized the BufferDesc before asking for
+		 * X, so first register a local S residency, then reuse the existing
+		 * local S->X invalidate/upgrade path.  If the invalidate cannot be proven,
+		 * drop the temporary S claim and rethrow the same fail-closed error.
+		 */
+		if (master_state == PCM_LOCK_MODE_S && cluster_node_id >= 0 && cluster_node_id < 32) {
+			uint32 self_bit = (uint32)1u << (uint32)cluster_node_id;
+
+			if ((cluster_pcm_lock_query_s_holders_bitmap(tag) & self_bit) == 0) {
+				struct GrdEntry *entry;
+
+				cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+				if (!cluster_gcs_block_local_x_upgrade(tag)) {
+					cluster_pcm_lock_release(tag);
+					ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+									errmsg("cluster_pcm: S->X upgrade invalidate did not complete"),
+									errhint("Remote S holders did not all acknowledge in time; "
+											"retry the statement.")));
+				}
+
+				entry = pcm_find_entry(tag);
+				if (entry != NULL) {
+					pcm_entry_lock_exclusive(entry);
+					entry->s_holder_refcount_local = 0;
+					LWLockRelease(&entry->entry_lock.lock);
+				}
+				return true;
+			}
+		}
 	}
 
 	cluster_pcm_lock_acquire(tag, mode);

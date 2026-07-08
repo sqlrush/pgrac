@@ -100,6 +100,8 @@ typedef struct ClusterHwShared {
 	pg_atomic_uint64 not_ready_count;		 /* 53RA6 serve-gate (shard adopted, unrebuilt) */
 	pg_atomic_uint64 remaster_done_count;	 /* online-remaster HW rebuild DONE (S5/S7) */
 	pg_atomic_uint64 remaster_blocked_count; /* online-remaster HW rebuild fail-closed (S5/S7) */
+	pg_atomic_uint64 remaster_retry_count;	 /* same-episode retry launches */
+	pg_atomic_uint64 remaster_retry_exhausted_count; /* same-episode retry cap reached */
 	pg_atomic_uint32 hw_rebuilt_generation[PGRAC_GRD_SHARD_COUNT]; /* §3.1b R4/R9 gate */
 	/*
 	 * remaster_launched_episode[node] -- the reconfig episode for which the GRD
@@ -111,6 +113,9 @@ typedef struct ClusterHwShared {
 	 * race on this field.
 	 */
 	pg_atomic_uint64 remaster_launched_episode[CLUSTER_MAX_NODES];
+	pg_atomic_uint32 remaster_result[CLUSTER_MAX_NODES];
+	pg_atomic_uint32 remaster_attempts[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 remaster_next_attempt_at[CLUSTER_MAX_NODES];
 } ClusterHwShared;
 
 /*
@@ -196,12 +201,18 @@ cluster_hw_shmem_init(void)
 		pg_atomic_init_u64(&hw_state->not_ready_count, 0);
 		pg_atomic_init_u64(&hw_state->remaster_done_count, 0);
 		pg_atomic_init_u64(&hw_state->remaster_blocked_count, 0);
+		pg_atomic_init_u64(&hw_state->remaster_retry_count, 0);
+		pg_atomic_init_u64(&hw_state->remaster_retry_exhausted_count, 0);
 		/* No shard rebuilt yet; 0 matches a never-remastered shard's GRD
 		 * master_generation (0), so boot / steady state serves. */
 		for (s = 0; s < PGRAC_GRD_SHARD_COUNT; s++)
 			pg_atomic_init_u32(&hw_state->hw_rebuilt_generation[s], 0);
-		for (s = 0; s < CLUSTER_MAX_NODES; s++)
+		for (s = 0; s < CLUSTER_MAX_NODES; s++) {
 			pg_atomic_init_u64(&hw_state->remaster_launched_episode[s], 0);
+			pg_atomic_init_u32(&hw_state->remaster_result[s], (uint32)CLUSTER_HW_REMASTER_NONE);
+			pg_atomic_init_u32(&hw_state->remaster_attempts[s], 0);
+			pg_atomic_init_u64(&hw_state->remaster_next_attempt_at[s], 0);
+		}
 	}
 
 	memset(&hctl, 0, sizeof(hctl));
@@ -406,6 +417,81 @@ cluster_hw_remaster_set_launched(int node_id, uint64 episode)
 	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
 		return;
 	pg_atomic_write_u64(&hw_state->remaster_launched_episode[node_id], episode);
+}
+
+ClusterHwRemasterResult
+cluster_hw_remaster_result(int node_id)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_HW_REMASTER_NONE;
+	return (ClusterHwRemasterResult)pg_atomic_read_u32(&hw_state->remaster_result[node_id]);
+}
+
+void
+cluster_hw_remaster_set_result(int node_id, ClusterHwRemasterResult result)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u32(&hw_state->remaster_result[node_id], (uint32)result);
+}
+
+uint32
+cluster_hw_remaster_attempts(int node_id)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return 0;
+	return pg_atomic_read_u32(&hw_state->remaster_attempts[node_id]);
+}
+
+void
+cluster_hw_remaster_set_attempts(int node_id, uint32 attempts)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u32(&hw_state->remaster_attempts[node_id], attempts);
+}
+
+uint64
+cluster_hw_remaster_next_attempt_at(int node_id)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return 0;
+	return pg_atomic_read_u64(&hw_state->remaster_next_attempt_at[node_id]);
+}
+
+void
+cluster_hw_remaster_set_next_attempt_at(int node_id, uint64 ts)
+{
+	if (hw_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u64(&hw_state->remaster_next_attempt_at[node_id], ts);
+}
+
+const char *
+cluster_hw_remaster_result_name(ClusterHwRemasterResult result)
+{
+	switch (result) {
+	case CLUSTER_HW_REMASTER_NONE:
+		return "none";
+	case CLUSTER_HW_REMASTER_RUNNING:
+		return "running";
+	case CLUSTER_HW_REMASTER_DONE:
+		return "done";
+	case CLUSTER_HW_REMASTER_BLOCKED:
+		return "blocked";
+	case CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL:
+		return "blocked_structural";
+	case CLUSTER_HW_REMASTER_NOT_APPLICABLE:
+		return "not_applicable";
+	}
+	return "unknown";
+}
+
+bool
+cluster_hw_remaster_recoverable(void)
+{
+	return !cluster_hw_authority_active()
+		   || (cluster_wal_threads_dir != NULL && cluster_wal_threads_dir[0] != '\0');
 }
 
 
@@ -747,6 +833,16 @@ cluster_hw_bump_remaster_blocked(void)
 {
 	HW_BUMP(remaster_blocked_count);
 }
+void
+cluster_hw_bump_remaster_retry(void)
+{
+	HW_BUMP(remaster_retry_count);
+}
+void
+cluster_hw_bump_remaster_retry_exhausted(void)
+{
+	HW_BUMP(remaster_retry_exhausted_count);
+}
 
 uint64
 cluster_hw_alloc_count(void)
@@ -787,4 +883,14 @@ uint64
 cluster_hw_remaster_blocked_count(void)
 {
 	return HW_READ(remaster_blocked_count);
+}
+uint64
+cluster_hw_remaster_retry_count(void)
+{
+	return HW_READ(remaster_retry_count);
+}
+uint64
+cluster_hw_remaster_retry_exhausted_count(void)
+{
+	return HW_READ(remaster_retry_exhausted_count);
 }

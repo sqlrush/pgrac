@@ -552,7 +552,8 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * record and return (no work queue, no reply, no dedup;  the sender
 	 * re-announces each tick, the receiver write is a monotonic max). */
 	if (req->opcode == GES_REQ_OPCODE_REDECLARE_DONE) {
-		cluster_grd_recovery_mark_peer_done((int32)env->source_node_id, holder_epoch);
+		cluster_grd_recovery_mark_peer_done((int32)env->source_node_id, holder_epoch,
+											ges_request_holder_request_id(req));
 		return;
 	}
 

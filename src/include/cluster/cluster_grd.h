@@ -275,6 +275,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 recovery_event_old_epoch;
 	pg_atomic_uint64 recovery_redeclare_generation;
 	pg_atomic_uint64 recovery_barrier_deadline;
+	pg_atomic_uint32 recovery_event_coordinator;
+	pg_atomic_uint64 recovery_done_epoch_at_accept;
 
 	/*
 	 * spec-4.6 P0-1 (Fable review) — the epoch this episode is LOCKED to.
@@ -294,6 +296,7 @@ typedef struct ClusterGrdShared {
 	 * last announced "local rebind barrier complete" (REDECLARE_DONE).
 	 * P6 requires done_epoch[s] >= current epoch for EVERY survivor. */
 	pg_atomic_uint64 recovery_done_epoch[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 recovery_done_event_id[CLUSTER_MAX_NODES];
 
 	/* spec-4.6 D5 — 13 grd_recovery counters (dump category
 	 * 'grd_recovery';  each has a t/249 leg).  Incremented along
@@ -311,6 +314,10 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 block_path_failclosed_count;	   /* D4 GCS/PCM 53R9K (L12) */
 	pg_atomic_uint64 unaffected_holder_survived_count; /* L13 sweep-scope guard */
 	pg_atomic_uint64 stale_holder_swept_count;		   /* P6 post-barrier sweep (L15) */
+	pg_atomic_uint64 cluster_gate_timeout_count;	   /* WAIT_CLUSTER watchdog only */
+	pg_atomic_uint64 wait_epoch_escape_count;		   /* proof-carrying equal-epoch advance */
+	pg_atomic_uint64
+		pcm_dead_cleanup_entries; /* spec-4.6a D12: dead-node PCM holder/pending-X records cleaned */
 
 	/* spec-5.1b D9 — convert state-machine observability counters.
 	 * convert_queue_full reuses the existing converts_full_count above;
@@ -609,6 +616,18 @@ typedef enum ClusterGrdRecoveryState {
 } ClusterGrdRecoveryState;
 
 extern void cluster_grd_recovery_lmon_tick(void);
+/* spec-4.6a D5/D6 — recovery state observability for pg_cluster_state. */
+extern uint32 cluster_grd_recovery_state_value(void);
+extern const char *cluster_grd_recovery_state_name(uint32 state);
+extern uint64 cluster_grd_recovery_last_event_id(void);
+extern uint64 cluster_grd_recovery_event_old_epoch(void);
+extern uint64 cluster_grd_recovery_episode_epoch_value(void);
+extern uint32 cluster_grd_recovery_event_coordinator(void);
+extern uint64 cluster_grd_recovery_done_epoch_for(int32 node);
+extern uint64 cluster_grd_recovery_done_event_id_for(int32 node);
+extern int cluster_grd_recovery_block_redeclare_cursor(void);
+extern uint64 cluster_grd_recovery_block_redeclare_epoch(void);
+extern bool cluster_grd_recovery_block_redeclare_done(void);
 extern uint64 cluster_grd_redeclare_generation(void);
 /* spec-4.6 P0-1 — the epoch the current episode is locked to (0 = none). */
 extern uint64 cluster_grd_redeclare_episode_epoch(void);
@@ -626,7 +645,7 @@ extern bool grd_block_redeclare_scan_complete(uint64 episode_epoch);
 /* spec-4.6 P0#3 cluster gate — REDECLARE_DONE receiver (cluster_ges.c
  * inbound handler):  record that `node` completed its local rebind
  * barrier for `epoch`. */
-extern void cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch);
+extern void cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id);
 
 /* spec-4.6 D4/D5 — recovery counter bumps for out-of-module call sites. */
 extern void cluster_grd_inc_stale_request_drop(void);
@@ -650,6 +669,9 @@ typedef struct ClusterGrdRecoveryCounters {
 	uint64 block_path_failclosed;
 	uint64 unaffected_holder_survived;
 	uint64 stale_holder_swept;
+	uint64 cluster_gate_timeout;
+	uint64 wait_epoch_escape;
+	uint64 pcm_dead_cleanup_entries;
 	/* spec-5.16 D5 — join-direction remaster counters (distinct from the
 	 * failure-driven remaster_* above; §8 Q6-A). */
 	uint64 join_remaster_started;

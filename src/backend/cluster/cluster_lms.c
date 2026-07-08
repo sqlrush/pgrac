@@ -59,6 +59,7 @@
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -1043,6 +1044,8 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 				continue;
 			conf_node = cluster_conf_lookup_node(candidate);
 			if (conf_node == NULL)
+				continue;
+			if (cluster_cssd_get_peer_state(candidate) == CLUSTER_CSSD_PEER_DEAD)
 				continue;
 			if (!native_probe_node_bit(candidate, &peer_bit)) {
 				pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);

@@ -61,6 +61,7 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
@@ -73,6 +74,65 @@
 #include "cluster/cluster_wal_state.h"		   /* read_slot (durable watermark) */
 #include "cluster/cluster_wal_thread.h"		   /* node id -> thread id */
 #include "cluster/storage/cluster_undo_xlog.h" /* xl_hw_reserve, XLOG_HW_RESERVE */
+
+/* One worker process owns exactly one dead origin / episode. */
+static int hw_worker_dead_node = -1;
+static uint64 hw_worker_episode = 0;
+static bool hw_worker_armed = false;
+
+static uint64
+hw_remaster_next_attempt_deadline(uint32 completed_retry_attempts)
+{
+	uint32 backoff_ms;
+	TimestampTz deadline;
+
+	backoff_ms = cluster_hw_remaster_compute_backoff_ms(cluster_hw_remaster_retry_backoff_ms,
+														completed_retry_attempts);
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), (int)backoff_ms);
+	return (uint64)deadline;
+}
+
+static void
+hw_remaster_record_terminal(int dead_node, ClusterHwRemasterResult res)
+{
+	if (res == CLUSTER_HW_REMASTER_DONE) {
+		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
+		cluster_hw_remaster_set_result(dead_node, res);
+		cluster_hw_bump_remaster_done();
+	} else if (res == CLUSTER_HW_REMASTER_BLOCKED) {
+		uint32 attempts = cluster_hw_remaster_attempts(dead_node);
+
+		cluster_hw_remaster_set_next_attempt_at(dead_node,
+												hw_remaster_next_attempt_deadline(attempts));
+		cluster_hw_remaster_set_result(dead_node, res);
+		cluster_hw_bump_remaster_blocked();
+	} else if (res == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL) {
+		cluster_hw_remaster_set_next_attempt_at(dead_node, CLUSTER_HW_REMASTER_NO_DEADLINE);
+		cluster_hw_remaster_set_result(dead_node, res);
+		cluster_hw_bump_remaster_blocked();
+	} else if (res == CLUSTER_HW_REMASTER_NOT_APPLICABLE) {
+		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
+		cluster_hw_remaster_set_result(dead_node, res);
+	}
+}
+
+static void
+hw_remaster_mark_blocked_on_exit(int code pg_attribute_unused(), Datum arg)
+{
+	int dead_node = DatumGetInt32(arg);
+
+	if (!hw_worker_armed)
+		return;
+	if (dead_node != hw_worker_dead_node)
+		return;
+	if (cluster_hw_remaster_launched_episode(dead_node) != hw_worker_episode)
+		return;
+	if (cluster_hw_remaster_result(dead_node) != CLUSTER_HW_REMASTER_RUNNING)
+		return;
+
+	cluster_hw_bump_failclosed();
+	hw_remaster_record_terminal(dead_node, CLUSTER_HW_REMASTER_BLOCKED);
+}
 
 
 /* ============================================================
@@ -332,10 +392,24 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 		return CLUSTER_HW_REMASTER_NOT_APPLICABLE;
 	if (dead_node_id < 0 || dead_node_id == cluster_node_id)
 		return CLUSTER_HW_REMASTER_NOT_APPLICABLE;
+	if (!cluster_hw_remaster_recoverable()) {
+		cluster_hw_bump_failclosed();
+		ereport(LOG, (errmsg("cluster HW remaster: cluster.wal_threads_dir is not configured; "
+							 "adopted shards stay fail-closed"),
+					  errhint("Set cluster.wal_threads_dir to the shared per-thread WAL root and "
+							  "restart, or restart the dead node so a JOIN rebuild can replace "
+							  "the failure-driven remaster.")));
+		return CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL;
+	}
 
 	dead_tid = cluster_wal_thread_id_for(true, dead_node_id);
-	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
+	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX) {
+		cluster_hw_bump_failclosed();
+		ereport(LOG, (errmsg("cluster HW remaster: dead node %d maps to invalid WAL thread id %u; "
+							 "adopted shards stay fail-closed",
+							 dead_node_id, (unsigned)dead_tid)));
 		return CLUSTER_HW_REMASTER_BLOCKED;
+	}
 
 	entries = (ClusterHwSnapshotEntry *)palloc(sizeof(ClusterHwSnapshotEntry)
 											   * CLUSTER_HW_AUTHORITY_MAX);
@@ -384,6 +458,9 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK
 		|| slot.highest_lsn == 0) {
 		cluster_hw_bump_failclosed();
+		ereport(LOG, (errmsg("cluster HW remaster: dead node %d WAL state slot is unusable; "
+							 "adopted shards stay fail-closed",
+							 dead_node_id)));
 		return CLUSTER_HW_REMASTER_BLOCKED;
 	}
 	validated_min = (XLogRecPtr)slot.highest_lsn;
@@ -391,6 +468,9 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &upper)
 		!= CLUSTER_THREADREC_DONE) {
 		cluster_hw_bump_failclosed();
+		ereport(LOG, (errmsg("cluster HW remaster: dead node %d validated WAL end is unavailable; "
+							 "adopted shards stay fail-closed",
+							 dead_node_id)));
 		return CLUSTER_HW_REMASTER_BLOCKED;
 	}
 
@@ -466,29 +546,26 @@ cluster_hw_remaster_worker_main(Datum main_arg)
 
 	/* The bgworker framework starts the entry point with signals blocked; unblock
 	 * before any I/O so a SIGTERM during a stuck shared-storage read / shutdown is
-	 * delivered (the default die handler FATALs, a clean fail-closed: unmarked). */
+	 * delivered (the default die handler FATALs into the BLOCKED exit callback). */
 	BackgroundWorkerUnblockSignals();
 
 	/* Capture the live reconfig episode this rebuild is for; rebuild_origin uses
 	 * it as the staleness fence before it marks any shard rebuilt. */
 	episode = cluster_grd_redeclare_episode_epoch();
-	res = cluster_hw_remaster_rebuild_origin(dead_node, episode);
+	hw_worker_dead_node = dead_node;
+	hw_worker_episode = episode;
+	hw_worker_armed = true;
+	before_shmem_exit(hw_remaster_mark_blocked_on_exit, Int32GetDatum(dead_node));
 
-	/* Observability (S5/S7): a DONE rebuilt + adopted + marked the shards; a
-	 * BLOCKED kept them frozen (fail-closed).  NOT_APPLICABLE (HW inactive) is
-	 * neither. */
-	if (res == CLUSTER_HW_REMASTER_DONE)
-		cluster_hw_bump_remaster_done();
-	else if (res == CLUSTER_HW_REMASTER_BLOCKED)
-		cluster_hw_bump_remaster_blocked();
+	res = cluster_hw_remaster_rebuild_origin(dead_node, episode);
+	hw_remaster_record_terminal(dead_node, res);
+	hw_worker_armed = false;
 
 	ereport(LOG, (errmsg("cluster HW remaster worker: dead node %d -> %s", dead_node,
-						 res == CLUSTER_HW_REMASTER_DONE	  ? "done"
-						 : res == CLUSTER_HW_REMASTER_BLOCKED ? "blocked (shards kept frozen)"
-															  : "not applicable")));
+						 cluster_hw_remaster_result_name(res))));
 	/* Returning is a clean exit(0).  On BLOCKED / abnormal exit the adopted shards
-	 * stay unmarked, so the serve gate keeps them fail-closed (8.A) and a later
-	 * episode relaunches the rebuild -- no abnormal-exit handler is needed. */
+	 * stay unmarked, so the serve gate keeps them fail-closed (8.A); the terminal
+	 * result lets the LMON FSM retry within the same episode when appropriate. */
 }
 
 /*
@@ -522,6 +599,7 @@ cluster_hw_remaster_launch_workers(const uint64 *dead, int nwords, uint64 episod
 {
 	int node;
 	int max_node;
+	uint64 now;
 
 	if (dead == NULL || nwords <= 0)
 		return;
@@ -538,30 +616,92 @@ cluster_hw_remaster_launch_workers(const uint64 *dead, int nwords, uint64 episod
 	max_node = nwords * 64;
 	if (max_node > CLUSTER_MAX_NODES)
 		max_node = CLUSTER_MAX_NODES;
+	now = (uint64)GetCurrentTimestamp();
 
 	for (node = 0; node < max_node; node++) {
+		ClusterHwRemasterResult result;
+		ClusterHwRemasterRelaunchDecision d;
+		uint64 launched;
+		uint64 next_attempt_at;
+		uint32 attempts;
+
 		if ((dead[node / 64] & (UINT64CONST(1) << (node % 64))) == 0)
 			continue;
 		if (node == cluster_node_id)
 			continue; /* self is never its own dead origin */
-		/* Idempotent: launch once per episode per dead origin. */
-		if (cluster_hw_remaster_launched_episode(node) == episode_epoch)
+
+		launched = cluster_hw_remaster_launched_episode(node);
+		if (!cluster_hw_remaster_recoverable() && launched != episode_epoch) {
+			cluster_hw_remaster_set_launched(node, episode_epoch);
+			cluster_hw_remaster_set_attempts(node, 0);
+			cluster_hw_remaster_set_next_attempt_at(node, 0);
+			cluster_hw_remaster_set_result(node, CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL);
+			launched = episode_epoch;
+		}
+
+		result = cluster_hw_remaster_result(node);
+		attempts = cluster_hw_remaster_attempts(node);
+		next_attempt_at = cluster_hw_remaster_next_attempt_at(node);
+		d = cluster_hw_remaster_relaunch_decide(launched, episode_epoch, result, attempts,
+												next_attempt_at, now,
+												cluster_hw_remaster_retry_max_attempts);
+
+		if (d.action == CLUSTER_HW_REMASTER_LAUNCH_MARK_STRUCTURAL) {
+			cluster_hw_remaster_set_next_attempt_at(node, d.next_attempt_at);
+			ereport(WARNING,
+					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+					 errmsg("cluster HW remaster is structurally blocked for dead node %d; "
+							"adopted shards stay fail-closed",
+							node),
+					 errhint("Set cluster.wal_threads_dir to the shared per-thread WAL root "
+							 "and restart, or restart the dead node so a JOIN rebuild can "
+							 "replace the failure-driven remaster.")));
 			continue;
-		/*
-		 * Claim BEFORE registering so a same-episode re-entry does not double-
-		 * launch; revert on a registration failure so a later tick retries (the
-		 * adopted shards stay fail-closed meanwhile, via the P7 gate).
-		 */
+		}
+		if (d.action == CLUSTER_HW_REMASTER_LAUNCH_MARK_EXHAUSTED) {
+			cluster_hw_remaster_set_next_attempt_at(node, d.next_attempt_at);
+			cluster_hw_bump_remaster_retry_exhausted();
+			ereport(WARNING,
+					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+					 errmsg("cluster HW remaster retries exhausted for dead node %d after %u "
+							"attempt(s); adopted shards stay fail-closed",
+							node, attempts),
+					 errhint("Fix the shared HW snapshot/WAL source, then raise "
+							 "cluster.hw_remaster_retry_max_attempts with SIGHUP to resume "
+							 "same-episode retrying.")));
+			continue;
+		}
+		if (d.action != CLUSTER_HW_REMASTER_LAUNCH_INITIAL
+			&& d.action != CLUSTER_HW_REMASTER_LAUNCH_RETRY)
+			continue;
+
 		cluster_hw_remaster_set_launched(node, episode_epoch);
+		cluster_hw_remaster_set_attempts(node, d.next_attempts);
+		cluster_hw_remaster_set_next_attempt_at(node, 0);
+		cluster_hw_remaster_set_result(node, CLUSTER_HW_REMASTER_RUNNING);
 		if (!register_one_worker(node)) {
-			cluster_hw_remaster_set_launched(node, 0);
+			cluster_hw_remaster_set_launched(
+				node, d.action == CLUSTER_HW_REMASTER_LAUNCH_INITIAL ? 0 : launched);
+			cluster_hw_remaster_set_attempts(node, attempts);
+			cluster_hw_remaster_set_next_attempt_at(node, next_attempt_at);
+			cluster_hw_remaster_set_result(node, result);
 			ereport(WARNING,
 					(errmsg("could not register HW remaster worker for dead node %d", node),
 					 errhint("Background worker slots are exhausted (max_worker_processes); the "
 							 "adopted shards stay fail-closed until the rebuild can run.")));
+			continue;
+		}
+		if (d.action == CLUSTER_HW_REMASTER_LAUNCH_RETRY) {
+			cluster_hw_bump_remaster_retry();
+			ereport(LOG,
+					(errmsg("cluster HW remaster: retrying dead node %d in episode " UINT64_FORMAT
+							" (attempt %u/%d)",
+							node, episode_epoch, d.next_attempts,
+							cluster_hw_remaster_retry_max_attempts)));
 		}
 	}
 }
+
 
 bool
 cluster_hw_remaster_gate_unfreeze(void)

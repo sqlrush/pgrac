@@ -51,11 +51,12 @@
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
-#include "cluster/cluster_membership.h"		/* spec-5.16 D3b — is_member master-side gate */
-#include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
-#include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
-#include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D2/D3/D4 profiling buckets */
-#include "cluster/cluster_xnode_lever.h"	/* spec-6.12a — downgrade counters */
+#include "cluster/cluster_membership.h"		 /* spec-5.16 D3b — is_member master-side gate */
+#include "cluster/cluster_qvotec.h"			 /* spec-5.16 D3b — in_quorum master-side gate */
+#include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
+#include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
+#include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
@@ -65,6 +66,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 2 */
 #include "common/hashfn.h"
@@ -1221,12 +1223,13 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 
 	/*
 	 * spec-4.7 D7 + D5 — static master is DEAD;  the block is remastered to a
-	 * live survivor (recovery-aware routing).  The survivor may SERVE only
-	 * after the dead origin's merged WAL recovery passes the redo-before-
-	 * unfreeze gate;  before that the shared-storage / re-declared version may
-	 * be stale → fail-closed RECOVERING (never a stale page).
+	 * live survivor (recovery-aware routing).  The redo-before-serve gate must
+	 * engage on EXACTLY the same scope where online thread recovery can actually
+	 * run.  Otherwise a >2-node or GUC-off deployment waits forever on a
+	 * materialization authority that the thread-recovery launcher intentionally
+	 * treats as not applicable.
 	 *
-	 * TWO conditions, both required (Q5):
+	 * In applicable 2-node scope, two conditions are both required (Q5):
 	 *  (a) is_materialized(origin):  the dead origin's merged replay completed
 	 *      (publish is atomic at end-of-replay with the max EndRecPtr).  This
 	 *      is the cold-block safety door — a block NO survivor observed has no
@@ -1236,13 +1239,19 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 *      survivor DID observe (rebuilt pi_watermark_lsn > 0), the dead
 	 *      origin's recovered_lsn must reach that observed page_lsn — else the
 	 *      dead node wrote a version a survivor saw but whose WAL never durably
-	 *      reached us → lost-write → fail-closed.  This is the LSN comparison
-	 *      (NOT a bool), live in the serve path;  required_lsn == 0 (cold) is
-	 *      trivially covered and (a) carries the safety.
-	 *
-	 * Once both hold → NORMAL → the re-routed survivor serves (rebuilt-from-
-	 * redeclare for held blocks, lazy minimal view for cold blocks).
+	 *      reached us → lost-write → fail-closed.
 	 */
+	{
+		bool shared_fs;
+		int survivors;
+
+		shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+		survivors = cluster_conf_node_count() - 1;
+		if (!cluster_thread_recovery_materialization_gate_enabled(
+				cluster_online_thread_recovery, cluster_conf_has_peers(), shared_fs, survivors))
+			return GCS_BLOCK_NORMAL;
+	}
+
 	if (!cluster_merged_instance_is_materialized(static_master)) {
 		if (ClusterGcsBlock != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_block_resources_recovering, 1);

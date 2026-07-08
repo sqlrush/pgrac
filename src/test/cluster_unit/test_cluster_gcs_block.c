@@ -70,6 +70,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "common/hashfn.h"
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"
@@ -284,6 +285,16 @@ UT_TEST(test_gcs_block_tag_is_standard_buffer_tag_20b)
 	/* BufferTag in PG 16 is 5×uint32 = 20B (spec-2.30 v0.2 F1 PG-fact). */
 	UT_ASSERT_EQ((int)sizeof(req.tag), 20);
 	UT_ASSERT_EQ((int)sizeof(BufferTag), 20);
+}
+
+
+UT_TEST(test_dead_static_master_materialization_gate_scope_matches_thread_recovery)
+{
+	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(false, true, true, 1));
+	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, false, true, 1));
+	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, true, false, 1));
+	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, true, true, 2));
+	UT_ASSERT(cluster_thread_recovery_materialization_gate_enabled(true, true, true, 1));
 }
 
 
@@ -514,7 +525,7 @@ UT_TEST(test_clean_xfer_stale_break_predicate)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -530,6 +541,7 @@ main(void)
 	UT_RUN(test_gcs_block_data_size_equals_blcksz);
 	UT_RUN(test_gcs_block_msg_type_enum_extends_without_gap);
 	UT_RUN(test_gcs_block_tag_is_standard_buffer_tag_20b);
+	UT_RUN(test_dead_static_master_materialization_gate_scope_matches_thread_recovery);
 	UT_RUN(test_xheld_read_ship_decision_truth_table);
 	UT_RUN(test_forward_payload_read_image_flag_roundtrip);
 	UT_RUN(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal);

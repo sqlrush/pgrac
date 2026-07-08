@@ -1195,8 +1195,30 @@ static void
 dump_grd_recovery(ReturnSetInfo *rsinfo)
 {
 	ClusterGrdRecoveryCounters c;
+	uint32 state;
 
 	cluster_grd_recovery_counters_snapshot(&c);
+	state = cluster_grd_recovery_state_value();
+	emit_row(rsinfo, "grd_recovery", "state", cluster_grd_recovery_state_name(state));
+	emit_row(rsinfo, "grd_recovery", "state_enum_value", fmt_int32((int32)state));
+	emit_row(rsinfo, "grd_recovery", "last_event_id",
+			 fmt_int64((int64)cluster_grd_recovery_last_event_id()));
+	emit_row(rsinfo, "grd_recovery", "event_old_epoch",
+			 fmt_int64((int64)cluster_grd_recovery_event_old_epoch()));
+	emit_row(rsinfo, "grd_recovery", "episode_epoch",
+			 fmt_int64((int64)cluster_grd_recovery_episode_epoch_value()));
+	emit_row(rsinfo, "grd_recovery", "event_coordinator",
+			 fmt_int32((int32)cluster_grd_recovery_event_coordinator()));
+	emit_row(rsinfo, "grd_recovery", "done_self_epoch",
+			 fmt_int64((int64)cluster_grd_recovery_done_epoch_for(cluster_node_id)));
+	emit_row(rsinfo, "grd_recovery", "done_self_event_id",
+			 fmt_int64((int64)cluster_grd_recovery_done_event_id_for(cluster_node_id)));
+	emit_row(rsinfo, "grd_recovery", "block_redeclare_cursor",
+			 fmt_int32((int32)cluster_grd_recovery_block_redeclare_cursor()));
+	emit_row(rsinfo, "grd_recovery", "block_redeclare_epoch",
+			 fmt_int64((int64)cluster_grd_recovery_block_redeclare_epoch()));
+	emit_row(rsinfo, "grd_recovery", "block_redeclare_done",
+			 fmt_bool(cluster_grd_recovery_block_redeclare_done()));
 	emit_row(rsinfo, "grd_recovery", "remaster_started", fmt_int64((int64)c.remaster_started));
 	emit_row(rsinfo, "grd_recovery", "remaster_done", fmt_int64((int64)c.remaster_done));
 	emit_row(rsinfo, "grd_recovery", "remaster_failed", fmt_int64((int64)c.remaster_failed));
@@ -1212,6 +1234,11 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "grd_recovery", "unaffected_holder_survived",
 			 fmt_int64((int64)c.unaffected_holder_survived));
 	emit_row(rsinfo, "grd_recovery", "stale_holder_swept", fmt_int64((int64)c.stale_holder_swept));
+	emit_row(rsinfo, "grd_recovery", "cluster_gate_timeout",
+			 fmt_int64((int64)c.cluster_gate_timeout));
+	emit_row(rsinfo, "grd_recovery", "wait_epoch_escape", fmt_int64((int64)c.wait_epoch_escape));
+	/* spec-4.6a D12 — dead-node PCM residue cleanup (categorized under pcm). */
+	emit_row(rsinfo, "pcm", "dead_cleanup_entries", fmt_int64((int64)c.pcm_dead_cleanup_entries));
 	/* spec-5.16 D5 — join-direction remaster counters (same grd_recovery
 	 * category; no new dump category, §8 Q6-A). */
 	emit_row(rsinfo, "grd_recovery", "join_remaster_started",
@@ -2810,6 +2837,12 @@ dump_hw(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_hw_remaster_done_count()));
 	emit_row(rsinfo, "hw", "remaster_blocked_count",
 			 fmt_int64((int64)cluster_hw_remaster_blocked_count()));
+	emit_row(rsinfo, "hw", "remaster_retry_count",
+			 fmt_int64((int64)cluster_hw_remaster_retry_count()));
+	emit_row(rsinfo, "hw", "remaster_retry_exhausted_count",
+			 fmt_int64((int64)cluster_hw_remaster_retry_exhausted_count()));
+	emit_row(rsinfo, "hw", "remaster_recoverable",
+			 fmt_int64((int64)(cluster_hw_remaster_recoverable() ? 1 : 0)));
 
 	/*
 	 * spec-6.12d D-obs: space-lease counters.  bloat_ratio itself is a
