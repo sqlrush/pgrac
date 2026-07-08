@@ -88,6 +88,7 @@
 #include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D4 cross-node TX enqueue wait */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D5b surely-dead guard */
 #include "cluster/cluster_writer_chain.h" /* spec-7.1a D0 terminal-writer chaining */
+#include "cluster/cluster_xid_stripe.h" /* spec-7.1a D5 foreign-class chain floor */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
@@ -3454,7 +3455,8 @@ l1:
 			 * re-run HeapTupleSatisfiesUpdate (else: lost update / delete of an
 			 * unvalidated version — Rule 8.A).
 			 */
-			if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
+			if ((vmbuffer == InvalidBuffer && PageIsAllVisible(page)) ||
+				xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
 				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data), xwait))
 				goto l1;
 
@@ -5800,6 +5802,41 @@ l3:
 				{
 					TM_Result	res;
 
+#ifdef USE_PGRAC_CLUSTER
+					/*
+					 * PGRAC: spec-7.1a D5 -- a remote-marker multixact
+					 * updater must not seed the chain walk: the entry decode
+					 * (MultiXactIdGetUpdateXid) reads the LOCAL pg_multixact,
+					 * which aliases for a foreign multi (AD-012 / L349).  The
+					 * walk entry floors the non-multi foreign root itself;
+					 * the multi marker needs the page, so check here.
+					 */
+					if (cluster_peer_mode_enabled() && (infomask & HEAP_XMAX_IS_MULTI))
+					{
+						uint16		marker_origin = 0;
+						bool		remote_multi;
+
+						LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+						if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
+							!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
+												 xwait))
+							goto l3;
+						remote_multi = PageHasItl(page)
+							&& cluster_itl_find_multixact_origin_by_xmax(page,
+																		 (MultiXactId) xwait,
+																		 &marker_origin)
+							&& (int32) marker_origin != cluster_node_id;
+						if (remote_multi)
+							ereport(ERROR,
+									(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+									 errmsg("cross-node write conflict: remote multixact updater %u on node %u",
+											xwait, marker_origin),
+									 errhint("Cross-node update-chain locking is not yet "
+											 "supported; retry the transaction.")));
+						LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					}
+#endif
+
 					res = heap_lock_updated_tuple(relation,
 												  infomask, xwait, &t_ctid,
 												  GetCurrentTransactionId(),
@@ -5987,6 +6024,42 @@ l3:
 				/* We only ever lock tuples, never update them */
 				if (status >= MultiXactStatusNoKeyUpdate)
 					elog(ERROR, "invalid lock mode in heap_lock_tuple");
+
+#ifdef USE_PGRAC_CLUSTER
+				/*
+				 * PGRAC: spec-7.1a D5 -- a remote-marker multixact must not
+				 * reach the native MultiXactIdWait below: multixact ids are
+				 * node-local, so decoding a foreign one against the local
+				 * pg_multixact aliases (AD-012 / L349; heap_update and
+				 * heap_delete floor this in the writer-wait bridge, this is
+				 * the heap_lock_tuple sibling, L352).  Reacquire the content
+				 * lock for the marker scan; re-judge from scratch if the
+				 * tuple moved meanwhile.
+				 */
+				if (cluster_peer_mode_enabled())
+				{
+					uint16		marker_origin = 0;
+					bool		remote_multi;
+
+					LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
+						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
+											 xwait))
+						goto l3;
+					remote_multi = PageHasItl(page)
+						&& cluster_itl_find_multixact_origin_by_xmax(page, (MultiXactId) xwait,
+																	 &marker_origin)
+						&& (int32) marker_origin != cluster_node_id;
+					if (remote_multi)
+						ereport(ERROR,
+								(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								 errmsg("cross-node write conflict: remote multixact holder %u on node %u",
+										xwait, marker_origin),
+								 errhint("Cross-node multixact wait is not yet supported; "
+										 "retry the transaction.")));
+					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+				}
+#endif
 
 				/* wait for multixact to end, or die trying  */
 				switch (wait_policy)
@@ -7403,6 +7476,26 @@ l4:
 		 * (sub)transaction, then we already locked the last live one in the
 		 * chain, thus we're done, so return success.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-7.1a D5 -- a chain version created by ANOTHER node's
+		 * xid cannot be judged by the native TransactionIdDidAbort below
+		 * (raw xids alias across instances, AD-012 例外 9).  Cross-node
+		 * update-chain locking is the Q9 multi-hop forward: fail closed
+		 * retryably instead of mis-walking the chain.
+		 */
+		if (cluster_peer_mode_enabled()
+			&& cluster_xid_foreign_class_cheap(HeapTupleHeaderGetXmin(mytup.t_data)))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: update chain crosses onto "
+								   "node-foreign xid %u",
+								   HeapTupleHeaderGetXmin(mytup.t_data)),
+							errhint("Cross-node update-chain locking is not yet supported; "
+									"retry the transaction.")));
+		}
+#endif
 		if (TransactionIdDidAbort(HeapTupleHeaderGetXmin(mytup.t_data)))
 		{
 			result = TM_Ok;
@@ -7412,6 +7505,38 @@ l4:
 		old_infomask = mytup.t_data->t_infomask;
 		old_infomask2 = mytup.t_data->t_infomask2;
 		xmax = HeapTupleHeaderGetRawXmax(mytup.t_data);
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-7.1a D5 -- the same foreign-class floor for the chain
+		 * member's xmax: the branches below judge it with native
+		 * DidCommit/IsInProgress/MultiXact machinery, all void for a
+		 * node-foreign xid or a remote-marker multixact (L349/L352).
+		 */
+		if (cluster_peer_mode_enabled() && !(old_infomask & HEAP_XMAX_INVALID))
+		{
+			bool		foreign_xmax = false;
+			uint16		marker_origin = 0;
+
+			if (old_infomask & HEAP_XMAX_IS_MULTI)
+				foreign_xmax = cluster_itl_find_multixact_origin_by_xmax(
+								   BufferGetPage(buf), (MultiXactId) xmax, &marker_origin)
+					&& (int32) marker_origin != cluster_node_id;
+			else
+				foreign_xmax = TransactionIdIsValid(xmax)
+					&& cluster_xid_foreign_class_cheap(xmax);
+			if (foreign_xmax)
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("cross-node write conflict: update chain member "
+									   "locked/updated by another node (xmax %u)",
+									   xmax),
+								errhint("Cross-node update-chain locking is not yet "
+										"supported; retry the transaction.")));
+			}
+		}
+#endif
 
 		/*
 		 * If this tuple version has been updated or locked by some concurrent
@@ -7806,6 +7931,24 @@ heap_lock_updated_tuple(Relation rel,
 		 * immediately afterwards.)
 		 */
 		MultiXactIdSetOldestMember();
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-7.1a D5 -- never seed the chain walk from a
+		 * node-foreign updater: the walk (and a foreign MULTI decode against
+		 * the local pg_multixact) judges raw xids natively (AD-012 alias).
+		 * The heap_lock_tuple call sites floor remote holders before calling
+		 * here; this is defense in depth for the non-multi root.
+		 */
+		if (cluster_peer_mode_enabled() && !(prior_infomask & HEAP_XMAX_IS_MULTI)
+			&& cluster_xid_foreign_class_cheap(prior_raw_xmax))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: update chain rooted at "
+								   "node-foreign updater %u",
+								   prior_raw_xmax),
+							errhint("Cross-node update-chain locking is not yet supported; "
+									"retry the transaction.")));
+#endif
 
 		prior_xmax = (prior_infomask & HEAP_XMAX_IS_MULTI) ?
 			MultiXactIdGetUpdateXid(prior_raw_xmax, prior_infomask) : prior_raw_xmax;
