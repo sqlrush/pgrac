@@ -1844,13 +1844,20 @@ test_cluster_undo_resid: test_cluster_undo_resid.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_HW_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-# spec-5.22b D2-1: test_cluster_undo_gcs — owner-as-master routing layer
-# (cluster_undo_block_lookup_master / _master_is_self).  Links the D1 undo
-# resid pure object plus the D2 routing object; the test owns the
-# cluster_node_id stub so the routing object links without the GUC layer.
+# spec-5.22b D2-1/D2-3: test_cluster_undo_gcs — owner-as-master routing layer
+# (D2-1: cluster_undo_block_lookup_master / _master_is_self) + the pure reader
+# S-grant decision core (D2-3: cluster_undo_grant_armed / _admissible /
+# _reader_pcm_*).  Links the D1 undo resid pure object, the D2 routing object,
+# and the pure live-authority policy object (cluster_undo_grant_admissible
+# reuses cluster_vis_live_authority_covers_policy); the test owns the
+# cluster_node_id stub so the routing object links without the GUC layer.  The
+# runtime acquire_shared wrapper (heavy fetch/epoch/smgr deps) lives in
+# cluster_undo_gcs_grant.o, NOT here — it is forward-covered by the D2-7/D6 TAP.
 CLUSTER_UNDO_GCS_O = $(top_builddir)/src/backend/cluster/cluster_undo_gcs.o
 test_cluster_undo_gcs: test_cluster_undo_gcs.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

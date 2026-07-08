@@ -101,3 +101,71 @@ cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode,
 	 */
 	return peer_mode && coherence_on;
 }
+
+/*
+ * cluster_undo_grant_armed -- pure coherence gate (D2-3).
+ *
+ *	See cluster_undo_gcs.h for the contract.  Mirrors the physical-migration
+ *	gate above (peer_mode && coherence_on): the grant/PI data plane and the
+ *	physical migration arm together, so a peer never grants against undo bytes
+ *	that were never migrated to the shared root.
+ */
+bool
+cluster_undo_grant_armed(bool coherence_on, bool peer_mode)
+{
+	return coherence_on && peer_mode;
+}
+
+/*
+ * cluster_undo_grant_admissible -- pure reader S-grant admissibility (D2-3).
+ *
+ *	See cluster_undo_gcs.h for the two-dimension fail-closed contract.  The two
+ *	admit conditions are ANDed; any single failure returns false so the caller
+ *	keeps the pre-existing 53R97 fail-closed boundary (Rule 8.A -- this only
+ *	widens "admit when provable", never "admit when unprovable").
+ */
+bool
+cluster_undo_grant_admissible(const ClusterResId *undo_resid, uint32 expected_generation,
+							  ClusterLiveAuthority auth, uint64 local_epoch, XLogRecPtr anchor_lsn)
+{
+	if (undo_resid == NULL)
+		return false;
+
+	/*
+	 * (1) Segment-generation anti-ABA (D1 §3.3 dim 1).  A recycled segment
+	 * reuses (undo_segment, block_no) for different content, so a generation
+	 * mismatch means the reference is stale -- fail closed, never a match.
+	 */
+	if (!cluster_undo_resid_generation_matches(undo_resid, expected_generation))
+		return false;
+
+	/*
+	 * (2) Owner-incarnation epoch + durable coverage (D-i2/D-i3).  Reuse the
+	 * pure live-authority window gate: authority sampled under a different
+	 * membership epoch cannot be trusted, a reply with no live authority
+	 * (invalid hwm) is never guessed, and the durable high-water must cover the
+	 * version anchor (Invalid at the block level -> epoch + presence only).
+	 */
+	if (!cluster_vis_live_authority_covers_policy(anchor_lsn, auth, local_epoch))
+		return false;
+
+	return true;
+}
+
+/*
+ * cluster_undo_grant_reader_pcm_mode / _transition -- reader lock contract
+ * (D2-3).  The reader takes the undo block in PCM S mode via the read-first
+ * N->S transition (the legal read-first pair; cluster_pcm_lock owns and tests
+ * the transition-legality table).  The writer/cleaner X path is D2-4.
+ */
+PcmState
+cluster_undo_grant_reader_pcm_mode(void)
+{
+	return PCM_LOCK_MODE_S;
+}
+
+PcmLockTransition
+cluster_undo_grant_reader_pcm_transition(void)
+{
+	return PCM_TRANS_N_TO_S;
+}

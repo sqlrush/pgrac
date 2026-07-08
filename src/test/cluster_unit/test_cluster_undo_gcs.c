@@ -175,15 +175,114 @@ UT_TEST(test_undo_gcs_intent_for_owner)
 	cluster_node_id = 0; /* restore stub default */
 }
 
+/* ======================================================================
+ * U9 -- reader S-grant coherence gate (spec-5.22b §3.5, Q8): the mastered
+ * S-grant path is ARMED only when cluster.undo_gcs_coherence is on AND the
+ * deployment is peer-mode.  Off in either dimension => not armed => the caller
+ * keeps its pre-D2 authority-less fetch path (回归安全, zero behaviour change at
+ * the default).  Pure: branch-only integer logic, no globals.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_grant_armed_gate)
+{
+	UT_ASSERT(cluster_undo_grant_armed(true /*coherence*/, true /*peer*/));
+	UT_ASSERT(!cluster_undo_grant_armed(false /*coherence*/, true /*peer*/));
+	UT_ASSERT(!cluster_undo_grant_armed(true /*coherence*/, false /*peer*/));
+	UT_ASSERT(!cluster_undo_grant_armed(false /*coherence*/, false /*peer*/));
+}
+
+/* ======================================================================
+ * U4 -- reader S-grant lock contract (spec-5.22b §2.2/§4.1): the reader
+ * acquires the undo block in PCM S mode via the read-first N->S transition.
+ * The N->S transition-legality TABLE is owned + exhaustively tested by
+ * cluster_pcm_lock (test_cluster_pcm_lock, spec-2.30); D2-3 only pins that the
+ * reader selects that legal read-first pair, never a write/upgrade transition.
+ * Pure: compile-time constants.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_grant_reader_pcm_contract)
+{
+	UT_ASSERT_EQ(cluster_undo_grant_reader_pcm_mode(), PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_undo_grant_reader_pcm_transition(), PCM_TRANS_N_TO_S);
+
+	/* a reader must never select a write-side mode / transition */
+	UT_ASSERT(cluster_undo_grant_reader_pcm_mode() != PCM_LOCK_MODE_X);
+	UT_ASSERT(cluster_undo_grant_reader_pcm_transition() != PCM_TRANS_N_TO_X);
+}
+
+/* ======================================================================
+ * U7 -- reader S-grant admissibility: SEGMENT-generation anti-ABA (spec-5.22b
+ * §3.3 dim 1, D1).  A reference whose encoded generation (segment wrap_count)
+ * no longer matches the reader's expected generation is STALE (the segment was
+ * recycled) -- admit MUST fail closed (Rule 8.A), never treat as a match.  The
+ * per-slot TT generation (auth.tt_generation) is a SEPARATE finer dimension
+ * resolved at D3, not here.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_grant_admissible_generation)
+{
+	ClusterResId r;
+	ClusterLiveAuthority auth;
+
+	/* authority that is otherwise admissible (epoch match, hwm present) */
+	memset(&auth, 0, sizeof(auth));
+	auth.origin_epoch = 42;
+	auth.live_hwm_lsn = 0x1000;
+	auth.tt_generation = 9;
+
+	cluster_undo_resid_encode(3, 7, 129, 5 /*generation*/, &r);
+
+	/* generation matches => admissible (epoch 42 == local 42, hwm >= anchor 0) */
+	UT_ASSERT(cluster_undo_grant_admissible(&r, 5 /*expected_gen*/, auth, 42 /*local_epoch*/,
+											InvalidXLogRecPtr));
+
+	/* generation mismatch (recycled segment) => fail closed */
+	UT_ASSERT(
+		!cluster_undo_grant_admissible(&r, 6 /*expected_gen != 5*/, auth, 42, InvalidXLogRecPtr));
+}
+
+/* ======================================================================
+ * U6 -- reader S-grant admissibility: owner-incarnation epoch + durable
+ * coverage (spec-5.22b §3.2, D-i2/D-i3).  Authority sampled under a different
+ * membership epoch than the reader's current epoch cannot be trusted (a
+ * reconfig may have remastered/fenced the owner between sample and use) => fail
+ * closed.  A missing live authority (hwm invalid) also fails closed -- never
+ * guess.  Reuses the pure cluster_vis_live_authority_covers_policy gate.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_grant_admissible_epoch)
+{
+	ClusterResId r;
+	ClusterLiveAuthority auth;
+
+	cluster_undo_resid_encode(3, 7, 129, 5, &r);
+
+	memset(&auth, 0, sizeof(auth));
+	auth.origin_epoch = 100;
+	auth.live_hwm_lsn = 0x2000;
+	auth.tt_generation = 1;
+
+	/* epoch match => admissible */
+	UT_ASSERT(cluster_undo_grant_admissible(&r, 5, auth, 100 /*local_epoch*/, InvalidXLogRecPtr));
+
+	/* epoch mismatch (reconfig between sample and use) => fail closed */
+	UT_ASSERT(
+		!cluster_undo_grant_admissible(&r, 5, auth, 101 /*local_epoch != 100*/, InvalidXLogRecPtr));
+
+	/* missing live authority (hwm invalid) => fail closed, never guess */
+	auth.live_hwm_lsn = InvalidXLogRecPtr;
+	UT_ASSERT(!cluster_undo_grant_admissible(&r, 5, auth, 100, InvalidXLogRecPtr));
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(9);
 	UT_RUN(test_undo_gcs_lookup_master_is_owner);
 	UT_RUN(test_undo_gcs_master_is_self);
 	UT_RUN(test_undo_gcs_path_runtime_shared_mode_branch);
 	UT_RUN(test_undo_gcs_path_materialized_never_migrates);
 	UT_RUN(test_undo_gcs_intent_for_owner);
+	UT_RUN(test_undo_gcs_grant_armed_gate);
+	UT_RUN(test_undo_gcs_grant_reader_pcm_contract);
+	UT_RUN(test_undo_gcs_grant_admissible_generation);
+	UT_RUN(test_undo_gcs_grant_admissible_epoch);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
