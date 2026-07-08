@@ -1777,17 +1777,32 @@ cl_leaving_barrier_tick(void)
 	 *	leave is active (cluster_clean_leave_in_progress gates drive_joins +
 	 *	commit_member), and the leave does not start while a join is pending
 	 *	(cluster_reconfig_join_in_progress gates the request).  Under that invariant a
-	 *	bump with an unchanged others-dead set during a leave can only be the
-	 *	leave's own commit (spec-2.29a ②b: the leaving node's own DEAD is excluded
-	 *	so its expected heartbeat stop no longer looks like a third-party death).
+	 *	bump with an unchanged version during a leave can only be the leave's own
+	 *	commit.
+	 *
+	 *	spec-2.29a ②b + r2 P2-1: "unchanged version" here means the others-dead
+	 *	bitmap AND the scalar dead_generation both unchanged.  The bitmap excludes
+	 *	the leaving node's own expected DEAD (②b: else its heartbeat stop would
+	 *	falsely escalate), but the bitmap is not monotone — a third-party
+	 *	false-DEAD→ALIVE rebound restores it while the scalar dead_generation only
+	 *	advances (r2 P2-1: else the leaver could mis-latch a refused leave and
+	 *	hang).  The leaver's own DEAD never bumps its OWN dead_generation, so the
+	 *	scalar conjunct is safe on this side (it would NOT be safe on the survivor
+	 *	side, which keeps the bitmap-only coherence check).
 	 */
 	if (cluster_epoch_get_current() > baseline_epoch) {
 		uint8 now_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		bool others_dead_unchanged;
+		bool dead_gen_unchanged;
 
 		cl_others_dead_snapshot(cl_state->leaving_node_id, now_others_dead);
-		if (memcmp(now_others_dead, cl_state->leave_baseline_others_dead,
-				   CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
-			== 0) {
+		others_dead_unchanged = (memcmp(now_others_dead, cl_state->leave_baseline_others_dead,
+										CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
+								 == 0);
+		dead_gen_unchanged
+			= (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen);
+		if (cluster_clean_leave_own_commit_latched(true, others_dead_unchanged,
+												   dead_gen_unchanged)) {
 			/*
 			 * Commit point observed (our clean-leave epoch was published; no
 			 * third-party death intruded).  The leave can no longer be

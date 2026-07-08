@@ -185,6 +185,35 @@ UT_TEST(test_version_coherent)
 
 
 /* ============================================================
+ * U3b — leaver barrier-tick own-commit latch (spec-2.29a r2 P2-1)
+ * ============================================================ */
+
+UT_TEST(test_own_commit_latched)
+{
+	/* own commit latches only when the epoch advanced AND both the others-dead
+	 * bitmap and the scalar dead_generation are unchanged. */
+
+	/* clean commit: epoch advanced, nothing else moved -> latch */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, true, true));
+
+	/* epoch has not advanced yet -> not our commit (keep waiting) */
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, true, true));
+
+	/* a third-party death is currently in the others-dead set -> escalate */
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, false, true));
+
+	/* r2 P2-1 rebound case: the others-dead bitmap has REBOUND to its bound
+	 * value (a third-party false-DEAD then recovered) but the scalar
+	 * dead_generation ADVANCED — the non-monotone bitmap must NOT be trusted;
+	 * the scalar conjunct forces escalate instead of a false latch/hang. */
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, true, false));
+
+	/* both diverged -> escalate */
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(true, false, false));
+}
+
+
+/* ============================================================
  * U5 — writable-only quiesce gate
  * ============================================================ */
 
@@ -396,10 +425,11 @@ UT_TEST(test_ic_payload_validation)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_fsm);
 	UT_RUN(test_version_coherent);
+	UT_RUN(test_own_commit_latched);
 	UT_RUN(test_writable_only_gate);
 	UT_RUN(test_marker_validation);
 	UT_RUN(test_should_invalidate);

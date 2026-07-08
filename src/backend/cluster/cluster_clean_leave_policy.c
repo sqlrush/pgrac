@@ -167,6 +167,36 @@ cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 current_epoch,
 	return memcmp(bound_others_dead, current_others_dead, (size_t)nbytes) == 0;
 }
 
+/*
+ * cluster_clean_leave_own_commit_latched -- the LEAVING node's barrier tick
+ * infers "my clean-leave committed" from the membership epoch advancing past
+ * its bound baseline (the coordinator publishes the CLEAN_LEAVE event into ITS
+ * own reconfig state, but the epoch piggybacks to the leaver).  Latching that
+ * inference suppresses the barrier-deadline escalation, so a FALSE latch hangs
+ * the leaver in BARRIER_WAIT forever.
+ *
+ * spec-2.29a r2 P2-1: the leaver's own-commit inference needs BOTH a bitmap
+ * check AND the scalar dead_generation.  The others-dead bitmap alone is not
+ * monotone: a third-party node that false-fail-stopped (bumping the epoch)
+ * then recovered leaves the CSSD hysteresis DEAD→ALIVE, so the others-dead
+ * bitmap returns to its bound value while the scalar dead_generation (which
+ * only advances) does not.  If the leaver's first epoch>baseline observation
+ * lands after that rebound, a bitmap-only check would mis-latch a leave the
+ * survivor coordinator actually refused.  The scalar conjunct closes it — and
+ * it does NOT reintroduce the ②b false positive, because the leaving node's
+ * OWN alive→DEAD transition never bumps ITS OWN dead_generation (a node does
+ * not observe itself dead), so on the leaver side dead_gen stays at baseline
+ * through its own drain.  (The survivor-side coherence sites keep the
+ * others-dead bitmap: a survivor DOES observe the leaver's DEAD and would be
+ * falsely escalated by the scalar there.)
+ */
+bool
+cluster_clean_leave_own_commit_latched(bool epoch_advanced, bool others_dead_unchanged,
+									   bool dead_gen_unchanged)
+{
+	return epoch_advanced && others_dead_unchanged && dead_gen_unchanged;
+}
+
 
 /* ============================================================
  * leave-intent marker structural validation (D2 / §2.5)

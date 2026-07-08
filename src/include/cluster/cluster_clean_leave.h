@@ -352,6 +352,15 @@ extern bool cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 curr
 												 const uint8 *bound_others_dead,
 												 const uint8 *current_others_dead, int nbytes);
 
+/* spec-2.29a r2 P2-1: the leaving node's barrier-tick own-commit latch.  Needs
+ * BOTH the others-dead bitmap unchanged AND the scalar dead_generation
+ * unchanged — the bitmap alone is not monotone under a third-party
+ * false-DEAD→ALIVE rebound and could mis-latch a refused leave (hang).  The
+ * leaver's own DEAD never bumps its own dead_generation, so the scalar
+ * conjunct does not reintroduce the ②b false positive. */
+extern bool cluster_clean_leave_own_commit_latched(bool epoch_advanced, bool others_dead_unchanged,
+												   bool dead_gen_unchanged);
+
 /* leave-intent marker structural validation (magic/version/CRC/identity).  Pure:
  * computes CRC32C over [magic..phase] and checks magic, version, that the
  * leaving node is the expected declared peer, and the dead_bitmap names only the

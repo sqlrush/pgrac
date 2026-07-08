@@ -177,6 +177,7 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->apply_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->dedup_skip_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->procsig_broadcast_count, 0);
+		pg_atomic_init_u32(&ReconfigShmem->prebump_sync_active, 0); /* spec-2.29a r2 t/274 */
 		/* spec-5.14 D6 — touched_peers observability counters. */
 		pg_atomic_init_u64(&ReconfigShmem->touched_abort_count, 0);
 		pg_atomic_init_u64(&ReconfigShmem->touched_stamp_count, 0);
@@ -1272,6 +1273,11 @@ cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
 {
+	/* spec-2.29a r2 t/274: the shmem bit covers a BACKEND-context coordinator's
+	 * bump→publish window (LMON cannot see that process's local stage); the
+	 * three LMON-local staged flags cover the LMON-driven paths. */
+	if (ReconfigShmem != NULL && pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0)
+		return true;
 	return failstop_fence_stage.async.has_staged_event
 		   || node_removed_fence_stage.async.has_staged_event
 		   || join_prepare_stage.async.has_staged_event;
@@ -2533,6 +2539,16 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-epoch-bump-pre");
 
+	/*
+	 * spec-2.29a r2 t/274: mark the pre-bump→publish window BEFORE bumping the
+	 * epoch, so a concurrent LMON GRD IDLE tick holds its WAIT_EPOCH baseline
+	 * while this (possibly backend-context, synchronous) path bumps but has not
+	 * yet published.  Cleared at every return below.  Harmless on the LMON /
+	 * fence-off paths (they either hand off to the local staged flag or publish
+	 * within this same call with no intervening tick).
+	 */
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 1);
+
 	/* D18:  atomic CAS-loop increment.  Returns pre/post snapshots. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
 
@@ -2650,11 +2666,13 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 									 "majority for epoch %llu; not publishing reconfig event "
 									 "(write-fenced, will retry)",
 									 (unsigned long long)new_epoch)));
+				pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
 				return;
 			}
 
 			cluster_reconfig_publish_event(&evt);
 			cluster_reconfig_log_failstop_epoch_bump(&evt);
+			pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
 			return;
 		}
 
@@ -2665,6 +2683,8 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 		(void)cluster_reconfig_submit_fence_stage(&failstop_fence_stage,
 												  CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
 												  coordinator_node_id, GetCurrentTimestamp());
+		/* LMON path: the local staged flag now covers the pending window. */
+		pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
 		return; /* fail-closed until the staged marker is majority-durable */
 	}
 
@@ -2680,6 +2700,9 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * tick free of allocator traffic.
 	 */
 	cluster_reconfig_log_failstop_epoch_bump(&evt);
+
+	/* spec-2.29a r2 t/274: fence-off path published within this call. */
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
 }
 
 

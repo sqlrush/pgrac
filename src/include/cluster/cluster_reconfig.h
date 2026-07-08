@@ -226,6 +226,16 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 apply_counter;			  /* total events observed */
 	pg_atomic_uint64 dedup_skip_counter;	  /* duplicate event_id skipped */
 	pg_atomic_uint64 procsig_broadcast_count; /* PROCSIG broadcast tally */
+	/* spec-2.29a r2 t/274: a backend-context coordinator (e.g. the fail-stop
+	 * inject test) advances the epoch then SYNCHRONOUSLY waits for the fence
+	 * marker before publishing.  During that (seconds-long) wait the epoch is
+	 * bumped but the reconfig event is not yet published, so a concurrently
+	 * running LMON GRD IDLE tick would re-capture the post-bump epoch as its
+	 * WAIT_EPOCH baseline and wedge (old==cur).  The LMON-process-local staged
+	 * flags cannot see a backend's pre-bump window, so publish it in shmem:
+	 * set before the bump, cleared after publish / on failure.  The GRD IDLE
+	 * baseline-hold guard reads this OR the local stage. */
+	pg_atomic_uint32 prebump_sync_active;
 
 	/* spec-5.14 D6 — touched_peers fail-stop observability (Q8 A': these
 	 * live in this existing region; the region count is unchanged). */
