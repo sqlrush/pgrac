@@ -376,16 +376,6 @@ cluster_thread_recovery_gate_decide(ClusterThreadRecScope scope, const uint64 *d
 	return false; /* every dead origin materialized -> ready to unfreeze */
 }
 
-static inline bool
-cluster_thread_recovery_materialization_gate_enabled(bool guc_on, bool has_peers,
-													 bool shared_fs_backend,
-													 int live_survivor_count)
-{
-	return cluster_thread_recovery_decide_scope(guc_on, has_peers, shared_fs_backend,
-												live_survivor_count)
-		   == CLUSTER_THREADREC_SCOPE_APPLICABLE;
-}
-
 /*
  * cluster_thread_recovery_replay_epoch_aborts -- the L235 episode-epoch
  * staleness guard (spec-4.11 3b-4b).  The per-thread replay slot stamps the GRD

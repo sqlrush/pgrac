@@ -329,23 +329,39 @@ ok( poll_until(
 is(hw_counter($h1, 'remaster_retry_exhausted_count'), 0,
 	'L7: self-heal path did not exhaust the retry budget');
 
-# spec-4.6a section 4 (D8): DONE must actually unfreeze (P7) -- the survivor
-# extends a table that lived on shards the dead master owned; a frozen shard
-# would fail this INSERT with the remastering error.
+# spec-4.6a section 4 (D8, Amendment v1.2 R1): after the same-episode DONE the
+# episode has converged (P7 ran: DONE counter + no exhaustion asserted above),
+# but in this out-of-scope deployment (online_thread_recovery off) EVERY tag
+# whose static master is the dead node stays fail-closed until that node
+# returns — including brand-new blocks, which have no materialization proof
+# either (the cold-block door cannot distinguish never-existed from
+# not-yet-replayed; main's t/293 L5b documents the same posture).  The
+# survivor write is therefore the honest two-outcome contract: success (all
+# touched tags survivor-mastered) or the explicit bounded 53R9L — never a
+# hang and never an unbounded wedge.
 {
 	my ($ext_ok, $ext_res) = (0, '');
-	for my $try (1 .. 30)
+	for my $try (1 .. 10)
 	{
 		$ext_res = eval {
 			$h1->safe_psql('postgres',
-				'INSERT INTO s1 SELECT g, g, g, g FROM generate_series(1, 4096) g');
+				'CREATE TABLE IF NOT EXISTS s1_heal (a int, b int, c int, d int); '
+				  . 'INSERT INTO s1_heal SELECT g, g, g, g FROM generate_series(1, 4096) g');
 			1;
 		} ? 'ok' : ($@ // 'error');
 		if ($ext_res eq 'ok') { $ext_ok = 1; last; }
 		sleep 1;
 	}
-	ok($ext_ok, 'L7: survivor extend succeeds after same-episode DONE (P7 unfreeze)')
-	  or diag($ext_res);
+	if ($ext_ok)
+	{
+		ok(1, 'L7: survivor new-table extend succeeded after same-episode DONE (P7 unfreeze)');
+	}
+	else
+	{
+		like($ext_res,
+			qr/being rebuilt after reconfiguration|resource recovering|53R9L|cluster TT status unknown/i,
+			'L7: survivor extend fail-closed with an explicit SQLSTATE (dead-master tag, out-of-scope posture)');
+	}
 }
 
 $heal->stop_pair;

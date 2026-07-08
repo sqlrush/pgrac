@@ -288,16 +288,6 @@ UT_TEST(test_gcs_block_tag_is_standard_buffer_tag_20b)
 }
 
 
-UT_TEST(test_dead_static_master_materialization_gate_scope_matches_thread_recovery)
-{
-	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(false, true, true, 1));
-	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, false, true, 1));
-	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, true, false, 1));
-	UT_ASSERT(!cluster_thread_recovery_materialization_gate_enabled(true, true, true, 2));
-	UT_ASSERT(cluster_thread_recovery_materialization_gate_enabled(true, true, true, 1));
-}
-
-
 /* spec-5.2 D2 (U3): pure master-side decision for an X-held N→S read.
  * node0 = holder/master in DIRECT, node1 = requester. */
 UT_TEST(test_xheld_read_ship_decision_truth_table)
@@ -525,7 +515,7 @@ UT_TEST(test_clean_xfer_stale_break_predicate)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(21);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -541,7 +531,6 @@ main(void)
 	UT_RUN(test_gcs_block_data_size_equals_blcksz);
 	UT_RUN(test_gcs_block_msg_type_enum_extends_without_gap);
 	UT_RUN(test_gcs_block_tag_is_standard_buffer_tag_20b);
-	UT_RUN(test_dead_static_master_materialization_gate_scope_matches_thread_recovery);
 	UT_RUN(test_xheld_read_ship_decision_truth_table);
 	UT_RUN(test_forward_payload_read_image_flag_roundtrip);
 	UT_RUN(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal);

@@ -1223,13 +1223,8 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 
 	/*
 	 * spec-4.7 D7 + D5 — static master is DEAD;  the block is remastered to a
-	 * live survivor (recovery-aware routing).  The redo-before-serve gate must
-	 * engage on EXACTLY the same scope where online thread recovery can actually
-	 * run.  Otherwise a >2-node or GUC-off deployment waits forever on a
-	 * materialization authority that the thread-recovery launcher intentionally
-	 * treats as not applicable.
-	 *
-	 * In applicable 2-node scope, two conditions are both required (Q5):
+	 * live survivor (recovery-aware routing).  Two conditions are both
+	 * required before the on-disk version may be served (Q5):
 	 *  (a) is_materialized(origin):  the dead origin's merged replay completed
 	 *      (publish is atomic at end-of-replay with the max EndRecPtr).  This
 	 *      is the cold-block safety door — a block NO survivor observed has no
@@ -1240,18 +1235,18 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 *      origin's recovered_lsn must reach that observed page_lsn — else the
 	 *      dead node wrote a version a survivor saw but whose WAL never durably
 	 *      reached us → lost-write → fail-closed.
+	 *
+	 * spec-4.6a Amendment v1.2 (R1):  this proof is UNCONDITIONAL.  Where
+	 * online thread recovery cannot run (GUC off — the default — or any
+	 * >2-node deployment) the materialization authority is never published,
+	 * so a dead master's blocks stay RECOVERING until the failed node
+	 * restarts and runs its own instance recovery: a bounded, retryable
+	 * ERROR on the request path (53R9L), never an unproven serve.  A scope
+	 * predicate must never gate a correctness proof — a committed write on
+	 * a cold block that only the dead node saw has NO other guard on this
+	 * read path (GRD freeze ends with the episode; the HW gate covers only
+	 * extend high-water marks; pd_block_scn checks ride the ship path).
 	 */
-	{
-		bool shared_fs;
-		int survivors;
-
-		shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
-		survivors = cluster_conf_node_count() - 1;
-		if (!cluster_thread_recovery_materialization_gate_enabled(
-				cluster_online_thread_recovery, cluster_conf_has_peers(), shared_fs, survivors))
-			return GCS_BLOCK_NORMAL;
-	}
-
 	if (!cluster_merged_instance_is_materialized(static_master)) {
 		if (ClusterGcsBlock != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_block_resources_recovering, 1);
