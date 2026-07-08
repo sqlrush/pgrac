@@ -77,7 +77,7 @@ typedef struct ClusterLiveAuthority {
  *   - live_hwm_lsn invalid         -> no authority sampled
  *   - authority_scn invalid        -> older peer / no SCN co-sample
  *   - demand_scn invalid           -> caller supplied no demand
- *   - authority_scn < demand_scn   -> origin clock not provably conclusive
+ *   - authority_scn before demand  -> origin clock not provably conclusive
  *                                     for this demand yet (retry self-heals:
  *                                     the shipped SCNs are Lamport-observed)
  * tt_generation is NOT checked here; it is consumed by the downstream by-xid

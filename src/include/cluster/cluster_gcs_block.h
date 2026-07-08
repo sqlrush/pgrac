@@ -1356,28 +1356,31 @@ ClusterGcsUndoAuthTrailerGetTtGeneration(const ClusterGcsUndoAuthTrailer *t)
  * origin SCN clock (rides the former must-be-zero trailer bytes, so the
  * wire size is unchanged and an older peer's zero reads as InvalidScn). */
 static inline void
-ClusterGcsUndoAuthTrailerSetAuthorityScn(ClusterGcsUndoAuthTrailer *t, uint64 authority_scn)
+ClusterGcsUndoAuthTrailerSetAuthorityScn(ClusterGcsUndoAuthTrailer *t, uint64 v)
 {
-	t->authority_scn_bytes[0] = (uint8)(authority_scn & 0xff);
-	t->authority_scn_bytes[1] = (uint8)((authority_scn >> 8) & 0xff);
-	t->authority_scn_bytes[2] = (uint8)((authority_scn >> 16) & 0xff);
-	t->authority_scn_bytes[3] = (uint8)((authority_scn >> 24) & 0xff);
-	t->authority_scn_bytes[4] = (uint8)((authority_scn >> 32) & 0xff);
-	t->authority_scn_bytes[5] = (uint8)((authority_scn >> 40) & 0xff);
-	t->authority_scn_bytes[6] = (uint8)((authority_scn >> 48) & 0xff);
-	t->authority_scn_bytes[7] = (uint8)((authority_scn >> 56) & 0xff);
+	t->authority_scn_bytes[0] = (uint8)(v & 0xff);
+	t->authority_scn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	t->authority_scn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	t->authority_scn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	t->authority_scn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	t->authority_scn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	t->authority_scn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	t->authority_scn_bytes[7] = (uint8)((v >> 56) & 0xff);
 }
 
 static inline uint64
 ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
 {
-	return ((uint64)t->authority_scn_bytes[0]) | (((uint64)t->authority_scn_bytes[1]) << 8)
-		   | (((uint64)t->authority_scn_bytes[2]) << 16)
-		   | (((uint64)t->authority_scn_bytes[3]) << 24)
-		   | (((uint64)t->authority_scn_bytes[4]) << 32)
-		   | (((uint64)t->authority_scn_bytes[5]) << 40)
-		   | (((uint64)t->authority_scn_bytes[6]) << 48)
-		   | (((uint64)t->authority_scn_bytes[7]) << 56);
+	uint64 v = (uint64)t->authority_scn_bytes[0];
+
+	v |= (uint64)t->authority_scn_bytes[1] << 8;
+	v |= (uint64)t->authority_scn_bytes[2] << 16;
+	v |= (uint64)t->authority_scn_bytes[3] << 24;
+	v |= (uint64)t->authority_scn_bytes[4] << 32;
+	v |= (uint64)t->authority_scn_bytes[5] << 40;
+	v |= (uint64)t->authority_scn_bytes[6] << 48;
+	v |= (uint64)t->authority_scn_bytes[7] << 56;
+	return v;
 }
 
 /* PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — verdict page carried in the BLCKSZ
