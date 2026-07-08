@@ -521,8 +521,7 @@ extern ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
 extern bool cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
 													const ClusterFenceMarker *m,
-													ClusterMarkerAsyncKind kind,
-													int32 target_node,
+													ClusterMarkerAsyncKind kind, int32 target_node,
 													TimestampTz now);
 extern ClusterMarkerPollResult cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a,
 																	 TimestampTz now,

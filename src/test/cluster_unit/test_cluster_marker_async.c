@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/test/cluster_unit/test_cluster_marker_async.c
  *
@@ -48,8 +50,8 @@ SetLatch(Latch *latch pg_attribute_unused())
 }
 
 static void
-ut_reset(ClusterMarkerAsync *a, pg_atomic_uint64 *request_seq,
-		 pg_atomic_uint64 *completion_seq, pg_atomic_uint32 *result_slot)
+ut_reset(ClusterMarkerAsync *a, pg_atomic_uint64 *request_seq, pg_atomic_uint64 *completion_seq,
+		 pg_atomic_uint32 *result_slot)
 {
 	cluster_marker_async_init(a);
 	pg_atomic_init_u64(request_seq, 0);

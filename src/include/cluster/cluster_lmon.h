@@ -138,7 +138,7 @@ typedef struct ClusterLmonSharedState {
 	TimestampTz ready_at;			   /* set by LMON in CLUSTER_LMON_READY */
 	TimestampTz last_liveness_tick_at; /* HC6: local liveness tick — NOT inter-node heartbeat */
 	int64 main_loop_iters;			   /* monotone counter; observable proof of liveness */
-	uint64 last_iter_us;				   /* most recent main-loop iteration wall time */
+	uint64 last_iter_us;			   /* most recent main-loop iteration wall time */
 	uint64 max_iter_us;				   /* high-water iteration wall time */
 	uint64 slow_iter_count;			   /* iterations over cluster.lmon_slow_iteration_warn_ms */
 	struct Latch *lmon_latch;		   /* qvotec completion wake target; LMON owns lifecycle */

@@ -177,12 +177,15 @@ jobs:
           - { name: stage5-beta-chaos-soak, ranges: "344-345", unit: false, regress: false }
           # spec-6.12/6.15 cross-node perf + correctness family (t/346-350:
           # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash),
-          # the renumbered t/351-356 family, t/357 multi-xmax alias floor, and
-          # t/358 spec-2.29a marker-async LMON liveness.
+          # the renumbered t/351-356 family, t/357 multi-xmax alias floor.
           # Closes the 346+ shard hole (every new t/ file must land in a shard
           # the same commit; see docs/code-review-checklist.md).
           - { name: stage6-crossnode-a, ranges: "346-350", unit: false, regress: false }
-          - { name: stage6-crossnode-b, ranges: "351-358", unit: false, regress: false }
+          - { name: stage6-crossnode-b, ranges: "351-357", unit: false, regress: false }
+          # t/363 spec-2.29a marker-async LMON liveness (t/358-362 reserved by
+          # the parallel spec-7.2 / S-xid / S-reconfig lanes; L464 occupancy
+          # verified against origin branches 2026-07-08).
+          - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

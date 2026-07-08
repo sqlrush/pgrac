@@ -3,13 +3,26 @@
  * cluster_marker_async.h
  *	  Small process-local async FSM for qvotec marker submit mailboxes.
  *
- *	  The mailbox remains the existing request_seq/completion_seq/result slot.
- *	  This wrapper changes only the waiting shape: submit publishes a request and
- *	  returns; the owning LMON tick polls completion without sleeping.
- *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_marker_async.h
+ *
+ * NOTES
+ *	  The mailbox remains the existing request_seq/completion_seq/result
+ *	  slot.  This wrapper changes only the waiting shape: submit publishes
+ *	  a request and returns; the owning LMON tick polls completion without
+ *	  sleeping (spec-2.29a — the pre-async 2ms pg_usleep spin inside the
+ *	  LMON tick starved the CSSD heartbeat relay and caused false-DEAD
+ *	  storms during cold formation, BUG-C1).
+ *
+ *	  The staged has_staged_event flag is the P1-1 bump-once contract: a
+ *	  pre-bump caller (fail-stop fence / node-remove / join Phase-1) must
+ *	  not re-enter its epoch-bump path while a stage is live.
  *
  *-------------------------------------------------------------------------
  */
@@ -109,8 +122,7 @@ cluster_marker_async_is_submitted(const ClusterMarkerAsync *a)
 }
 
 static inline bool
-cluster_marker_async_mailbox_busy(pg_atomic_uint64 *request_seq,
-								  pg_atomic_uint64 *completion_seq)
+cluster_marker_async_mailbox_busy(pg_atomic_uint64 *request_seq, pg_atomic_uint64 *completion_seq)
 {
 	return pg_atomic_read_u64(request_seq) != pg_atomic_read_u64(completion_seq);
 }
@@ -118,8 +130,8 @@ cluster_marker_async_mailbox_busy(pg_atomic_uint64 *request_seq,
 static inline bool
 cluster_marker_async_submit(ClusterMarkerAsync *a, pg_atomic_uint64 *request_seq,
 							pg_atomic_uint64 *completion_seq, struct Latch *qvotec_latch,
-							TimestampTz now, uint64 timeout_us,
-							ClusterMarkerAsyncKind kind, int32 target_node)
+							TimestampTz now, uint64 timeout_us, ClusterMarkerAsyncKind kind,
+							int32 target_node)
 {
 	uint64 seq;
 
@@ -148,8 +160,8 @@ cluster_marker_async_submit(ClusterMarkerAsync *a, pg_atomic_uint64 *request_seq
 
 static inline ClusterMarkerPollResult
 cluster_marker_async_poll(ClusterMarkerAsync *a, pg_atomic_uint64 *completion_seq,
-						  pg_atomic_uint32 *result_slot, TimestampTz now,
-						  uint32 *out_result, uint64 *out_elapsed_us)
+						  pg_atomic_uint32 *result_slot, TimestampTz now, uint32 *out_result,
+						  uint64 *out_elapsed_us)
 {
 	uint64 elapsed;
 
@@ -168,9 +180,8 @@ cluster_marker_async_poll(ClusterMarkerAsync *a, pg_atomic_uint64 *completion_se
 		pg_read_barrier();
 		if (out_result != NULL)
 			*out_result = pg_atomic_read_u32(result_slot);
-		elapsed = ((uint64)now > (uint64)a->submitted_at)
-					  ? ((uint64)now - (uint64)a->submitted_at)
-					  : 0;
+		elapsed
+			= ((uint64)now > (uint64)a->submitted_at) ? ((uint64)now - (uint64)a->submitted_at) : 0;
 		if (out_elapsed_us != NULL)
 			*out_elapsed_us = elapsed;
 		a->state = CLUSTER_MARKER_ASYNC_IDLE;
@@ -178,9 +189,8 @@ cluster_marker_async_poll(ClusterMarkerAsync *a, pg_atomic_uint64 *completion_se
 	}
 
 	if ((uint64)now >= a->deadline_us) {
-		elapsed = ((uint64)now > (uint64)a->submitted_at)
-					  ? ((uint64)now - (uint64)a->submitted_at)
-					  : 0;
+		elapsed
+			= ((uint64)now > (uint64)a->submitted_at) ? ((uint64)now - (uint64)a->submitted_at) : 0;
 		if (out_elapsed_us != NULL)
 			*out_elapsed_us = elapsed;
 		a->state = CLUSTER_MARKER_ASYNC_IDLE;

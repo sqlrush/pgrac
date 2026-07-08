@@ -2580,8 +2580,8 @@ cluster_init_guc(void)
 		gettext_noop("A value greater than zero logs LMON main-loop iterations above this "
 					 "duration; the lmon_slow_iter_count counter is maintained even when "
 					 "logging is disabled with 0."),
-		&cluster_lmon_slow_iteration_warn_ms, 1000, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
-		NULL, NULL);
+		&cluster_lmon_slow_iteration_warn_ms, 1000, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	DefineCustomIntVariable(
 		"cluster.lck_main_loop_interval",

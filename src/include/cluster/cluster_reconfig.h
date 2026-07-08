@@ -56,7 +56,7 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
-#include "cluster/cluster_conf.h"		/* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
+#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
 #include "cluster/cluster_marker_async.h"
 #include "cluster/cluster_membership.h" /* ClusterMembershipTable (spec-5.15 D2 SSOT) */
 
@@ -585,8 +585,7 @@ extern ClusterJoinMarkerSubmitResult
 cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMarker *m);
 extern bool cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_node,
 													  const ClusterJoinCommitMarker *m,
-													  ClusterMarkerAsyncKind kind,
-													  TimestampTz now);
+													  ClusterMarkerAsyncKind kind, TimestampTz now);
 extern ClusterMarkerPollResult cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a,
 																	   TimestampTz now,
 																	   uint32 *out_result,
@@ -773,6 +772,12 @@ extern uint64 cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_n
 																 uint64 removal_event_id,
 																 uint64 last_incarnation,
 																 bool *out_contest);
+
+/* spec-2.29a review r1 P2: true while the staged node-removed fence marker is
+ * in flight -- the node-remove driver skips its FENCE_ARMING pre-work
+ * (REMOVING marker / stripe retire) instead of re-keying it to the live
+ * (already self-bumped) epoch. */
+extern bool cluster_reconfig_node_removed_fence_stage_pending(void);
 
 
 #endif /* CLUSTER_RECONFIG_H */

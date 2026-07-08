@@ -227,13 +227,13 @@ cluster_node_remove_submit_marker_async(ClusterMarkerAsync *a, const ClusterRemo
 }
 
 ClusterMarkerPollResult
-cluster_node_remove_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
-									  uint32 *out_result, uint64 *out_elapsed_us)
+cluster_node_remove_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+									  uint64 *out_elapsed_us)
 {
 	if (nr_state == NULL || a == NULL)
 		return CLUSTER_MARKER_POLL_IDLE;
-	return cluster_marker_async_poll(a, &nr_state->marker_completion_seq,
-									 &nr_state->marker_result, now, out_result, out_elapsed_us);
+	return cluster_marker_async_poll(a, &nr_state->marker_completion_seq, &nr_state->marker_result,
+									 now, out_result, out_elapsed_us);
 }
 
 bool
@@ -312,8 +312,8 @@ nr_release_marker_stage(void)
 }
 
 static bool
-nr_marker_stage_matches(int phase, int32 node_id, uint64 remove_epoch,
-						uint64 removed_incarnation, uint64 removal_event_id)
+nr_marker_stage_matches(int phase, int32 node_id, uint64 remove_epoch, uint64 removed_incarnation,
+						uint64 removal_event_id)
 {
 	return nr_marker_async.has_staged_event && nr_marker_phase == phase
 		   && nr_marker_node_id == node_id && nr_marker_epoch == remove_epoch
@@ -685,31 +685,43 @@ cluster_node_remove_drive(void)
 
 		(void)baseline_dead_gen; /* contest is now signalled by out_contest, not derived */
 
-		/* §2.5: durable REMOVING marker (pre-commit; not a trust source). */
-		(void)nr_write_marker(CLUSTER_REMOVAL_MARKER_REMOVING, node_id, baseline_epoch,
-							  last_incarnation, removal_event_id);
-
 		/*
-		 * spec-6.15 D5c (appendix B.3): durably retire the removed node's
-		 * xid stripe slot BEFORE the removal point of no return below.
-		 * Ordering is the identity-reuse defence: once removal commits, a
-		 * later fresh join of the same node_id (new incarnation = a new
-		 * durable owner) must land on a retired slot and refuse (53RB1),
-		 * never resume the old owner's congruence class.  Not durable yet
-		 * -> stay FENCE_ARMING and retry next tick (fail-closed; same
-		 * shape as a transient fence/quorum failure).  A never-activated
-		 * cluster returns true (nothing to retire).
+		 * spec-2.29a review r1 P2: while the staged fence marker from a
+		 * previous FENCE_ARMING tick is still in flight, skip the pre-work
+		 * below — the epoch was already self-bumped at stage-entry, so
+		 * re-running it would key a SECOND REMOVING marker to the post-bump
+		 * epoch and re-submit the stripe retire during the very contention
+		 * window the async stage relieves.  Fall through straight to
+		 * apply(), which polls the stage.
 		 */
-		if (!cluster_xid_stripe_submit_retire(node_id, last_incarnation)) {
-			ereport(LOG, (errmsg("cluster node removal: stripe slot retire for node %d not durable "
-								 "yet — retrying before the removal commit",
-								 node_id)));
-			return;
+		if (!cluster_reconfig_node_removed_fence_stage_pending()) {
+			/* §2.5: durable REMOVING marker (pre-commit; not a trust source). */
+			(void)nr_write_marker(CLUSTER_REMOVAL_MARKER_REMOVING, node_id, baseline_epoch,
+								  last_incarnation, removal_event_id);
+
+			/*
+			 * spec-6.15 D5c (appendix B.3): durably retire the removed node's
+			 * xid stripe slot BEFORE the removal point of no return below.
+			 * Ordering is the identity-reuse defence: once removal commits, a
+			 * later fresh join of the same node_id (new incarnation = a new
+			 * durable owner) must land on a retired slot and refuse (53RB1),
+			 * never resume the old owner's congruence class.  Not durable yet
+			 * -> stay FENCE_ARMING and retry next tick (fail-closed; same
+			 * shape as a transient fence/quorum failure).  A never-activated
+			 * cluster returns true (nothing to retire).
+			 */
+			if (!cluster_xid_stripe_submit_retire(node_id, last_incarnation)) {
+				ereport(LOG,
+						(errmsg("cluster node removal: stripe slot retire for node %d not durable "
+								"yet — retrying before the removal commit",
+								node_id)));
+				return;
+			}
+			/* D5d: carry the retire to WAL consumers (standby stops gap-
+			 * filling the dead class).  The voting-disk retire above is the
+			 * correctness anchor; emission failure is tolerated (logged). */
+			cluster_xid_stripe_emit_retire_wal(node_id);
 		}
-		/* D5d: carry the retire to WAL consumers (standby stops gap-
-		 * filling the dead class).  The voting-disk retire above is the
-		 * correctness anchor; emission failure is tolerated (logged). */
-		cluster_xid_stripe_emit_retire_wal(node_id);
 
 		/*
 		 * The commit point: guarded epoch bump + fence-arm (majority-durable, at

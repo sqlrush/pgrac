@@ -341,6 +341,28 @@ cluster_reconfig_publish_event(const ReconfigEvent *evt)
 }
 
 
+static void
+cluster_reconfig_log_failstop_epoch_bump(const ReconfigEvent *evt)
+{
+	char dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
+	int off = 0;
+	int n;
+
+	Assert(evt != NULL);
+
+	dead[0] = '\0';
+	for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
+		if (evt->dead_bitmap[n / 8] & (1 << (n % 8)))
+			off += snprintf(dead + off, sizeof(dead) - off, "%s%d", off ? "," : "", n);
+	}
+
+	ereport(LOG, (errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
+						 "(coordinator node %d, dead node(s) {%s})",
+						 (unsigned long long)evt->old_epoch, (unsigned long long)evt->new_epoch,
+						 (int)evt->coordinator_node_id, dead)));
+}
+
+
 /* ============================================================
  * Counter accessors (Step 2 + Step 3 SRF support).
  * ============================================================
@@ -1075,10 +1097,9 @@ cluster_reconfig_note_marker_slow_ack(ClusterMarkerAsyncKind kind, int32 target_
 		return;
 
 	pg_atomic_fetch_add_u64(&ReconfigShmem->marker_slow_ack_count, 1);
-	ereport(LOG,
-			(errmsg("cluster marker: slow qvotec ACK for %s target node %d took %llu ms",
-					cluster_marker_async_kind_name(kind), target_node,
-					(unsigned long long)(elapsed_us / 1000ULL))));
+	ereport(LOG, (errmsg("cluster marker: slow qvotec ACK for %s target node %d took %llu ms",
+						 cluster_marker_async_kind_name(kind), target_node,
+						 (unsigned long long)(elapsed_us / 1000ULL))));
 }
 
 void
@@ -1087,10 +1108,9 @@ cluster_reconfig_note_marker_timeout(ClusterMarkerAsyncKind kind, int32 target_n
 {
 	if (ReconfigShmem != NULL)
 		pg_atomic_fetch_add_u64(&ReconfigShmem->marker_timeout_count, 1);
-	ereport(LOG,
-			(errmsg("cluster marker: qvotec marker %s target node %d timed out after %llu ms",
-					cluster_marker_async_kind_name(kind), target_node,
-					(unsigned long long)(elapsed_us / 1000ULL))));
+	ereport(LOG, (errmsg("cluster marker: qvotec marker %s target node %d timed out after %llu ms",
+						 cluster_marker_async_kind_name(kind), target_node,
+						 (unsigned long long)(elapsed_us / 1000ULL))));
 }
 
 uint64
@@ -1234,14 +1254,13 @@ cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
 }
 
 static bool
-cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage,
-									ClusterMarkerAsyncKind kind, int32 target_node,
-									TimestampTz now)
+cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage, ClusterMarkerAsyncKind kind,
+									int32 target_node, TimestampTz now)
 {
 	if (stage->submitted)
 		return true;
-	if (!cluster_write_fence_submit_marker_async(&stage->async, &stage->marker, kind,
-												 target_node, now))
+	if (!cluster_write_fence_submit_marker_async(&stage->async, &stage->marker, kind, target_node,
+												 now))
 		return false;
 	stage->submitted = true;
 	return true;
@@ -1281,6 +1300,7 @@ cluster_reconfig_poll_failstop_fence_stage(void)
 										  elapsed_us);
 	if (result == CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
 		cluster_reconfig_publish_event(&failstop_fence_stage.event);
+		cluster_reconfig_log_failstop_epoch_bump(&failstop_fence_stage.event);
 		cluster_reconfig_broadcast_local_procsig();
 	} else {
 		ereport(LOG,
@@ -1324,8 +1344,8 @@ cluster_reconfig_poll_node_removed_fence_stage(int32 removed_node_id, uint64 rem
 		return 0;
 	}
 
-	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED,
-										  removed_node_id, elapsed_us);
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED, removed_node_id,
+										  elapsed_us);
 	if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
 		ereport(LOG, (errmsg("cluster node removal: fence marker for node %d did not reach a "
 							 "voting-disk majority for epoch %llu; not publishing removal "
@@ -1364,24 +1384,12 @@ cluster_reconfig_release_join_prepare_stage(void)
 	join_prepare_stage.submitted = false;
 }
 
-static void
-cluster_reconfig_abort_join_prepare_stage(void)
-{
-	int i;
-
-	if (ReconfigShmem != NULL) {
-		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			if (!dead_bitmap_test_bit(join_prepare_stage.join_bitmap, i))
-				continue;
-			ReconfigShmem->pending_join_bitmap[i / 8] &= (uint8) ~(1u << (i % 8));
-			if (cluster_membership_get_state(i) == CLUSTER_MEMBER_JOINING)
-				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
-		}
-		LWLockRelease(&ReconfigShmem->lock);
-	}
-	cluster_reconfig_release_join_prepare_stage();
-}
+/* (spec-2.29a review r1: the former abort_join_prepare_stage — revert
+ * JOINING→DEAD + clear pending on PREPARE failure — was removed.  Q5=A makes
+ * PREPARE strictly best-effort: TIMEOUT / non-ACK advances the queue and the
+ * staged JOIN_PENDING still publishes, so no revert path exists; reverting
+ * would let compute_join_bitmap re-detect the joiner and re-bump the epoch
+ * every deadline period — the P1-1 bump storm.) */
 
 static bool
 cluster_reconfig_submit_join_prepare_current(TimestampTz now)
@@ -1422,6 +1430,22 @@ cluster_reconfig_submit_join_prepare_current(TimestampTz now)
 	return true;
 }
 
+/*
+ * spec-2.29a review r1 P2 — node-remove driver pre-work gate.
+ *
+ *	While the staged node-removed fence marker from a previous FENCE_ARMING
+ *	tick is still in flight, the driver must not re-run its pre-work
+ *	(REMOVING marker write / stripe retire): the epoch has already been
+ *	self-bumped by the stage-entry, so a re-run would key a SECOND REMOVING
+ *	marker to the post-bump epoch and add voting-disk writes during the
+ *	exact contention window the async stage exists to relieve.
+ */
+bool
+cluster_reconfig_node_removed_fence_stage_pending(void)
+{
+	return node_removed_fence_stage.async.has_staged_event;
+}
+
 static bool
 cluster_reconfig_poll_join_prepare_stage(void)
 {
@@ -1445,22 +1469,28 @@ cluster_reconfig_poll_join_prepare_stage(void)
 												 &elapsed_us);
 	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
 		return true;
-	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
-		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_PREPARE, target,
-											 elapsed_us);
-		cluster_reconfig_abort_join_prepare_stage();
-		return true;
-	}
 
-	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_PREPARE, target,
-										  elapsed_us);
-	if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
-		ereport(LOG,
-				(errmsg("cluster membership: PREPARE join marker for node %d did not reach a "
-						"voting-disk majority; not publishing JOIN_PENDING (will retry)",
-						target)));
-		cluster_reconfig_abort_join_prepare_stage();
-		return true;
+	/*
+	 * spec-2.29a Q5=A (review r1 P1): PREPARE is best-effort in OUTCOME — the
+	 * pre-async code ignored the submit result and always published
+	 * JOIN_PENDING (only the Phase-2 COMMITTED marker is a commit point, P1-r5).
+	 * A TIMEOUT / non-ACK PREPARE therefore advances the queue instead of
+	 * aborting: aborting would revert the joiner JOINING→DEAD, and the next
+	 * tick's compute_join_bitmap would re-detect it CSSD-alive and RE-BUMP the
+	 * epoch — exactly the per-tick epoch-bump storm the P1-1 staged record
+	 * forbids.  Draining to publish keeps the joiner on a stable JOINING
+	 * (one Phase-1 bump total, regardless of PREPARE outcomes).
+	 */
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_PREPARE, target, elapsed_us);
+	} else {
+		cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_PREPARE, target, elapsed_us);
+		if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+			ereport(LOG,
+					(errmsg("cluster membership: PREPARE join marker for node %d did not reach "
+							"a voting-disk majority; continuing best-effort (COMMITTED is the "
+							"commit point)",
+							target)));
 	}
 
 	join_prepare_stage.submitted = false;
@@ -1584,7 +1614,7 @@ cluster_reconfig_poll_join_commit_stage(void)
 											&admitted_generation)
 		|| admitted_incarnation != join_commit_stage.admitted_incarnation
 		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
-										  admitted_generation)
+										 admitted_generation)
 			   != CLUSTER_JOIN_ACCEPT
 		|| !cluster_reconfig_publish_join_commit(join_commit_stage.node_id,
 												 join_commit_stage.admitted_incarnation,
@@ -2578,6 +2608,32 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 				marker.fenced_dead_bitmap[b] |= removed_bitmap[b];
 		}
 
+		/*
+		 * The async stage is process-local by design and is driven only by LMON
+		 * ticks.  Test-only backend callers, such as
+		 * cluster_reconfig_inject_dead_node_test(), would otherwise stage the marker
+		 * in their own process and return with no LMON-visible pending publish
+		 * record.  Keep those non-LMON paths on the old bounded wait: they are not
+		 * transport-liveness actors, so this does not reintroduce the BUG-C1 LMON
+		 * park.
+		 */
+		if (MyBackendType != B_LMON) {
+			ClusterFenceMarkerSubmitResult result;
+
+			result = cluster_write_fence_submit_marker(&marker);
+			if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+				ereport(LOG, (errmsg("cluster reconfig: fence marker did not reach a voting-disk "
+									 "majority for epoch %llu; not publishing reconfig event "
+									 "(write-fenced, will retry)",
+									 (unsigned long long)new_epoch)));
+				return;
+			}
+
+			cluster_reconfig_publish_event(&evt);
+			cluster_reconfig_log_failstop_epoch_bump(&evt);
+			return;
+		}
+
 		failstop_fence_stage.event = evt;
 		failstop_fence_stage.marker = marker;
 		failstop_fence_stage.node_id = coordinator_node_id;
@@ -2599,21 +2655,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * fixed stack buffer (worst case: 128 node ids x 4 chars) keeps the LMON
 	 * tick free of allocator traffic.
 	 */
-	{
-		char dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
-		int off = 0;
-		int n;
-
-		dead[0] = '\0';
-		for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
-			if (dead_bitmap[n / 8] & (1 << (n % 8)))
-				off += snprintf(dead + off, sizeof(dead) - off, "%s%d", off ? "," : "", n);
-		}
-		ereport(LOG, (errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
-							 "(coordinator node %d, dead node(s) {%s})",
-							 (unsigned long long)old_epoch, (unsigned long long)new_epoch,
-							 (int)coordinator_node_id, dead)));
-	}
+	cluster_reconfig_log_failstop_epoch_bump(&evt);
 }
 
 
@@ -2928,8 +2970,8 @@ cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_no
 }
 
 ClusterMarkerPollResult
-cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a, TimestampTz now,
-										uint32 *out_result, uint64 *out_elapsed_us)
+cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+										uint64 *out_elapsed_us)
 {
 	if (ReconfigShmem == NULL || a == NULL)
 		return CLUSTER_MARKER_POLL_IDLE;

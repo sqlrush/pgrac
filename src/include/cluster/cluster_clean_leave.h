@@ -412,8 +412,7 @@ extern ClusterLeaveMarkerSubmitResult
 cluster_clean_leave_submit_marker(const ClusterLeaveIntentMarker *m);
 extern bool cluster_clean_leave_submit_marker_async(ClusterMarkerAsync *a,
 													const ClusterLeaveIntentMarker *m,
-													ClusterMarkerAsyncKind kind,
-													int32 target_node,
+													ClusterMarkerAsyncKind kind, int32 target_node,
 													TimestampTz now);
 extern ClusterMarkerPollResult cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a,
 																	 TimestampTz now,

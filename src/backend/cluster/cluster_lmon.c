@@ -866,10 +866,9 @@ lmon_record_iteration(TimestampTz iter_started_at)
 	}
 
 	if (should_log)
-		ereport(LOG,
-				(errmsg("cluster lmon: main loop iteration took %llu ms (threshold %d ms)",
-						(unsigned long long)(elapsed_us / 1000ULL),
-						cluster_lmon_slow_iteration_warn_ms)));
+		ereport(LOG, (errmsg("cluster lmon: main loop iteration took %llu ms (threshold %d ms)",
+							 (unsigned long long)(elapsed_us / 1000ULL),
+							 cluster_lmon_slow_iteration_warn_ms)));
 }
 
 

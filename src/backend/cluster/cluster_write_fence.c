@@ -786,14 +786,13 @@ cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenc
 	memcpy(&cluster_write_fence_shmem->pending_marker, m, sizeof(*m));
 	return cluster_marker_async_submit(
 		a, &cluster_write_fence_shmem->marker_request_seq,
-		&cluster_write_fence_shmem->marker_completion_seq,
-		cluster_write_fence_shmem->qvotec_latch, now,
-		(uint64)cluster_write_fence_lease_ms * 1000ULL, kind, target_node);
+		&cluster_write_fence_shmem->marker_completion_seq, cluster_write_fence_shmem->qvotec_latch,
+		now, (uint64)cluster_write_fence_lease_ms * 1000ULL, kind, target_node);
 }
 
 ClusterMarkerPollResult
-cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
-									  uint32 *out_result, uint64 *out_elapsed_us)
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+									  uint64 *out_elapsed_us)
 {
 	if (cluster_write_fence_shmem == NULL || a == NULL)
 		return CLUSTER_MARKER_POLL_IDLE;

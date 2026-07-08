@@ -58,7 +58,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
-#include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (D12) */
+#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (D12) */
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h" /* PCM release-all-self + no-leftover verify (D5) */
 #include "cluster/cluster_qvotec.h"	  /* cluster_qvotec_in_quorum (request gate) */
@@ -813,8 +813,8 @@ cl_poll_lmon_marker_stage(void)
 	now = GetCurrentTimestamp();
 	kind = cl_marker_phase_kind(cl_lmon_marker_phase);
 	if (!cl_lmon_marker_submitted) {
-		if (!cluster_clean_leave_submit_marker_async(&cl_lmon_marker_async, &cl_lmon_marker,
-													 kind, cl_lmon_marker_leaving, now))
+		if (!cluster_clean_leave_submit_marker_async(&cl_lmon_marker_async, &cl_lmon_marker, kind,
+													 cl_lmon_marker_leaving, now))
 			return CL_LEAVE_ASYNC_PENDING;
 		cl_lmon_marker_submitted = true;
 		return CL_LEAVE_ASYNC_PENDING;
@@ -859,11 +859,10 @@ cl_drive_committed_marker_stage(int32 leaving, uint64 committed_epoch)
 		cl_send_committed(leaving, committed_epoch);
 		cl_release_lmon_marker_stage();
 	} else if (ar == CL_LEAVE_ASYNC_FAILED) {
-		ereport(LOG,
-				(errmsg("cluster clean-leave: committed node %d at epoch %llu but the "
-						"COMMITTED marker is not yet majority-durable; retrying each tick "
-						"(leaving node waits)",
-						leaving, (unsigned long long)committed_epoch)));
+		ereport(LOG, (errmsg("cluster clean-leave: committed node %d at epoch %llu but the "
+							 "COMMITTED marker is not yet majority-durable; retrying each tick "
+							 "(leaving node waits)",
+							 leaving, (unsigned long long)committed_epoch)));
 	}
 }
 
@@ -931,8 +930,8 @@ cluster_clean_leave_submit_marker_async(ClusterMarkerAsync *a, const ClusterLeav
 }
 
 ClusterMarkerPollResult
-cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
-									  uint32 *out_result, uint64 *out_elapsed_us)
+cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+									  uint64 *out_elapsed_us)
 {
 	if (cl_state == NULL || a == NULL)
 		return CLUSTER_MARKER_POLL_IDLE;
@@ -1805,12 +1804,37 @@ cl_coordinator_commit(int32 leaving)
 			return;
 		if (phase == CLUSTER_LEAVE_MARKER_PHASE_COMMITTING) {
 			cl_release_lmon_marker_stage();
+
+			/*
+			 * spec-2.29a review r1 P1 — CL-I3 re-check at the staged-ACK
+			 * handoff.  The COMMITTING marker wait now spans LMON ticks, so a
+			 * real death can bump CSSD dead_generation INSIDE the wait window
+			 * while the fail-stop epoch has not yet advanced (the >=3-node
+			 * window of Hardening v1.0.1 P1-2).  The guarded CAS inside
+			 * apply_clean_leave_as_coordinator only catches the epoch move;
+			 * re-run the same dead_gen-aware coherence check the non-staged
+			 * pre-check uses, at the last observable point before the commit
+			 * applies.  On failure the leave does not commit and the leaving
+			 * node escalates to fail-stop (identical to the pre-check path).
+			 */
+			if (!cluster_clean_leave_version_coherent(baseline_epoch, cluster_epoch_get_current(),
+													  cl_state->leave_baseline_dead_gen,
+													  cluster_cssd_get_dead_generation())) {
+				ereport(LOG,
+						(errmsg("cluster clean-leave: version moved (epoch or dead_generation) "
+								"across the COMMITTING marker wait for node %d; not committing "
+								"(escalate to fail-stop, CL-I3)",
+								leaving)));
+				return;
+			}
+
 			new_epoch = cluster_reconfig_apply_clean_leave_as_coordinator(leaving, baseline_epoch);
 			if (new_epoch == 0) {
-				ereport(LOG,
-						(errmsg("cluster clean-leave: epoch moved off baseline %llu before commit "
-								"for node %d; not committing (the leaving node escalates to fail-stop)",
-								(unsigned long long)baseline_epoch, leaving)));
+				ereport(
+					LOG,
+					(errmsg("cluster clean-leave: epoch moved off baseline %llu before commit "
+							"for node %d; not committing (the leaving node escalates to fail-stop)",
+							(unsigned long long)baseline_epoch, leaving)));
 				return;
 			}
 			cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, new_epoch);

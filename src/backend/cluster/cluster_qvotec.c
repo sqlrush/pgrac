@@ -95,8 +95,8 @@
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_pgstat.h"		 /* cluster.qvotec.* counters */
-#include "cluster/cluster_reconfig.h"	 /* spec-4.12b D2: applied-membership snapshot */
+#include "cluster/cluster_pgstat.h"			 /* cluster.qvotec.* counters */
+#include "cluster/cluster_reconfig.h"		 /* spec-4.12b D2: applied-membership snapshot */
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b: region-5 scan + seed */
 #include "cluster/cluster_shmem.h"			 /* cluster_shmem_register_region */
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D2: fence marker scan + token refresh */

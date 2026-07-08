@@ -419,8 +419,7 @@ extern ClusterRemovalMarkerSubmitResult
 cluster_node_remove_submit_marker(const ClusterRemovalMarker *m);
 extern bool cluster_node_remove_submit_marker_async(ClusterMarkerAsync *a,
 													const ClusterRemovalMarker *m,
-													ClusterMarkerAsyncKind kind,
-													int32 target_node,
+													ClusterMarkerAsyncKind kind, int32 target_node,
 													TimestampTz now);
 extern ClusterMarkerPollResult cluster_node_remove_poll_marker_async(ClusterMarkerAsync *a,
 																	 TimestampTz now,

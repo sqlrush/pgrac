@@ -61,6 +61,14 @@
 
 UT_DEFINE_GLOBALS();
 
+/* spec-2.29a: cluster_reconfig.c gates the async marker stage on
+ * MyBackendType == B_LMON.  The fixture exercises the pre-2.29a bounded-wait
+ * semantics (write_fence submit stub returns FAILED synchronously), so run as
+ * a non-LMON backend; the async FSM itself is covered by
+ * test_cluster_marker_async.c. */
+#include "miscadmin.h"
+BackendType MyBackendType = B_INVALID;
+
 
 /* ============================================================
  * Stubs — link cluster_reconfig.o + cluster_epoch.o standalone.
@@ -357,22 +365,44 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unuse
 {
 	return CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
+/* spec-2.29a review r1 P1-c: controllable async-marker stubs so the tick-level
+ * P1-1 invariants (bump-once while PENDING, node-remove zero-false-contest,
+ * publish deferred to ACK) can be hard-asserted.  Defaults preserve the
+ * pre-existing inert behavior (submit rejected, poll idle). */
+static bool ut_fence_async_submit_ok = false;
+static ClusterMarkerPollResult ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
+static uint32 ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+static int ut_fence_async_submit_calls = 0;
+static int ut_fence_async_poll_calls = 0;
+
 bool
-cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a pg_attribute_unused(),
+cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
 										const ClusterFenceMarker *m pg_attribute_unused(),
-										ClusterMarkerAsyncKind kind pg_attribute_unused(),
-										int32 target_node pg_attribute_unused(),
+										ClusterMarkerAsyncKind kind, int32 target_node,
 										TimestampTz now pg_attribute_unused())
 {
-	return false;
+	ut_fence_async_submit_calls++;
+	if (!ut_fence_async_submit_ok)
+		return false;
+	/* mirror the real wrapper's FSM effect so is_submitted() sees SUBMITTED */
+	a->state = CLUSTER_MARKER_ASYNC_SUBMITTED;
+	a->kind = kind;
+	a->target_node = target_node;
+	return true;
 }
 ClusterMarkerPollResult
-cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a pg_attribute_unused(),
-									  TimestampTz now pg_attribute_unused(),
-									  uint32 *out_result pg_attribute_unused(),
-									  uint64 *out_elapsed_us pg_attribute_unused())
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now pg_attribute_unused(),
+									  uint32 *out_result, uint64 *out_elapsed_us)
 {
-	return CLUSTER_MARKER_POLL_IDLE;
+	ut_fence_async_poll_calls++;
+	if (out_result != NULL)
+		*out_result = ut_fence_async_poll_result;
+	if (out_elapsed_us != NULL)
+		*out_elapsed_us = 0;
+	if (ut_fence_async_poll_pr == CLUSTER_MARKER_POLL_ACKED
+		|| ut_fence_async_poll_pr == CLUSTER_MARKER_POLL_TIMEOUT)
+		a->state = CLUSTER_MARKER_ASYNC_IDLE;
+	return ut_fence_async_poll_pr;
 }
 void
 cluster_lmon_marker_complete_wakeup(void)
@@ -979,6 +1009,142 @@ UT_TEST(test_reconfig_lmon_tick_survivor_does_not_advance_epoch)
 	cluster_reconfig_get_last_event(&evt);
 	UT_ASSERT_EQ(evt.coordinator_node_id, 0);
 	UT_ASSERT_EQ(evt.observer_role, CLUSTER_RECONFIG_OBSERVER_SURVIVOR);
+}
+
+
+/* ============================================================
+ * T-reconfig-2.29a — P1-1 staged-record hard assertions (spec-2.29a
+ * review r1 P1-c).
+ *
+ *	(a) fail-stop fence stage: while the marker is PENDING across ticks
+ *	    the epoch is bumped EXACTLY ONCE and nothing publishes; the
+ *	    staged event publishes only on ACKED+ACK.
+ *	(b) node-remove stage: a tick re-entry while the fence marker is
+ *	    PENDING returns 0 with *out_contest == false (no false contest
+ *	    against our own already-advanced baseline) and no re-bump.
+ * ============================================================ */
+
+UT_TEST(test_reconfig_failstop_fence_stage_bump_once_while_pending)
+{
+	uint64 epoch_after_bump;
+	uint64 apply_before;
+
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	epoch_init_done = false;
+	cluster_reconfig_shmem_init();
+	cluster_epoch_shmem_init();
+
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;
+	ut_dead_generation = 1;
+
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	MyBackendType = B_LMON;
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+
+	apply_before = cluster_reconfig_get_apply_counter();
+
+	/* tick #1: stage-entry — bump once, submit, DO NOT publish. */
+	cluster_reconfig_lmon_tick();
+	epoch_after_bump = cluster_epoch_get_current();
+	UT_ASSERT(epoch_after_bump > 0);
+	UT_ASSERT_EQ((unsigned long long)cluster_reconfig_get_apply_counter(),
+				 (unsigned long long)apply_before);
+
+	/* ticks #2/#3: marker PENDING — the bump path must NOT re-enter
+	 * (P1-1 invariant 0: zero re-bump, zero publish, zero side-effects). */
+	cluster_reconfig_lmon_tick();
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ((unsigned long long)cluster_epoch_get_current(),
+				 (unsigned long long)epoch_after_bump);
+	UT_ASSERT_EQ((unsigned long long)cluster_reconfig_get_apply_counter(),
+				 (unsigned long long)apply_before);
+
+	/* tick #4: ACKED + ACK — the STAGED event publishes; still no re-bump. */
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ((unsigned long long)cluster_epoch_get_current(),
+				 (unsigned long long)epoch_after_bump);
+	UT_ASSERT_EQ((unsigned long long)cluster_reconfig_get_apply_counter(),
+				 (unsigned long long)(apply_before + 1));
+
+	/* restore fixture defaults for the neighboring tests */
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	ut_fence_async_submit_ok = false;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+}
+
+
+UT_TEST(test_reconfig_node_remove_stage_no_false_contest)
+{
+	uint64 baseline;
+	uint64 epoch_after_bump;
+	uint64 ret;
+	bool contest;
+
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	epoch_init_done = false;
+	cluster_reconfig_shmem_init();
+	cluster_epoch_shmem_init();
+
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	MyBackendType = B_LMON;
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+
+	baseline = cluster_epoch_get_current();
+
+	/* call #1: guarded CAS advances baseline→baseline+1, stages the fence
+	 * marker, returns 0 (not yet committed), contest MUST be false. */
+	contest = true;
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7, &contest);
+	UT_ASSERT_EQ((unsigned long long)ret, 0ULL);
+	UT_ASSERT(!contest);
+	epoch_after_bump = cluster_epoch_get_current();
+	UT_ASSERT_EQ((unsigned long long)epoch_after_bump, (unsigned long long)(baseline + 1));
+
+	/* call #2 (tick re-entry with the SAME stale baseline while PENDING):
+	 * without the staged record this would re-run the baseline CAS against
+	 * our own advanced epoch and report a FALSE contest.  P1-1: it must
+	 * poll the stage instead — 0, contest==false, no second bump. */
+	contest = true;
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7, &contest);
+	UT_ASSERT_EQ((unsigned long long)ret, 0ULL);
+	UT_ASSERT(!contest);
+	UT_ASSERT_EQ((unsigned long long)cluster_epoch_get_current(),
+				 (unsigned long long)epoch_after_bump);
+
+	/* call #3: ACKED + ACK — removal publishes at the STAGED epoch. */
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	contest = true;
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7, &contest);
+	UT_ASSERT_EQ((unsigned long long)ret, (unsigned long long)epoch_after_bump);
+	UT_ASSERT(!contest);
+	UT_ASSERT_EQ((unsigned long long)cluster_epoch_get_current(),
+				 (unsigned long long)epoch_after_bump);
+
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	ut_fence_async_submit_ok = false;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
 
 
@@ -1595,6 +1761,8 @@ main(void)
 	/* T-reconfig-3 — lmon_tick dedup. */
 	UT_RUN(test_reconfig_lmon_tick_dedups_same_event_id);
 	UT_RUN(test_reconfig_lmon_tick_refires_on_dead_gen_bump);
+	UT_RUN(test_reconfig_failstop_fence_stage_bump_once_while_pending);
+	UT_RUN(test_reconfig_node_remove_stage_no_false_contest);
 
 	/* T-reconfig-4 / 4b — Q2 A'' + I2 + L20 + F11 + empty-dead-set gates. */
 	UT_RUN(test_reconfig_lmon_tick_skips_when_not_in_quorum);

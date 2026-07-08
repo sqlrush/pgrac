@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 358_cluster_2_29a_marker_async_liveness.pl
+# 363_cluster_2_29a_marker_async_liveness.pl
 #	  BUG-C1 / spec-2.29a — qvotec marker backlog must not park LMON.
 #
 #	  The hold injection freezes qvotec marker completion until released.  Before
@@ -18,8 +18,10 @@
 #
 # Portions Copyright (c) 2026, pgrac contributors
 #
+# Author: SqlRush <sqlrush@gmail.com>
+#
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/358_cluster_2_29a_marker_async_liveness.pl
+#	  src/test/cluster_tap/t/363_cluster_2_29a_marker_async_liveness.pl
 #
 #-------------------------------------------------------------------------
 
@@ -119,6 +121,8 @@ ok(poll_until($node0,
 set_injection($node0, 'cluster-qvotec-marker-service-hold');
 my $lmon_iters_before = state_int($node0, 'lmon', 'lmon_slow_iter_count');
 my $timeouts_before = state_int($node0, 'reconfig', 'marker_timeout_count');
+my $epoch_hold_start =
+	$node0->safe_psql('postgres', 'SELECT new_epoch FROM pg_cluster_reconfig_state') + 0;
 
 $node1->start;
 ok(poll_until($node0,
@@ -148,6 +152,17 @@ isnt($node0->safe_psql('postgres',
 		q{SELECT state FROM pg_cluster_membership WHERE node_id = 1}),
 	'member',
 	'L4 held/timeout marker does not publish node1 admission');
+
+# P1-1 bump-once (spec-2.29a review r1): the whole >=95s hold must cost at most
+# ONE join Phase-1 epoch bump (staged record; PREPARE timeouts drain best-effort
+# and never revert the joiner, so compute_join_bitmap cannot re-detect + re-bump
+# per deadline period).  Pre-fix abort+revert behavior re-bumped ~once per 3.5s
+# deadline (~27 bumps in this window); a <=2 bound separates cleanly without
+# being flaky against one incidental episode.
+my $epoch_hold_end =
+	$node0->safe_psql('postgres', 'SELECT new_epoch FROM pg_cluster_reconfig_state') + 0;
+cmp_ok($epoch_hold_end - $epoch_hold_start, '<=', 2,
+	'L4 epoch advance across the hold window is bounded (no per-deadline bump storm)');
 
 set_injection($node0, '');
 ok(poll_until($node0,
