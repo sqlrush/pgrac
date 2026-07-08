@@ -106,6 +106,8 @@ is(raise_and_get_sqlstate('cluster_reconfig_in_progress'), '53R60',
 	"cluster_reconfig_in_progress -> 53R60");
 is(raise_and_get_sqlstate('cluster_backup_incomplete'), '53RAD',
 	"cluster_backup_incomplete -> 53RAD");
+is(raise_and_get_sqlstate('cluster_undo_resid_hash_routed'), '53R9Q',
+	"cluster_undo_resid_hash_routed -> 53R9Q");
 is(raise_and_get_sqlstate('cluster_adg_apply_lag_excessive'), '57R06',
 	"cluster_adg_apply_lag_excessive -> 57R06");
 is(raise_and_get_sqlstate('cluster_adg_standby_unresolvable'), '57R07',

@@ -56,6 +56,7 @@
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
+#include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
@@ -85,34 +86,55 @@
 
 bool IsUnderPostmaster = false;
 
+/* spec-5.22a D1-5 verifies a fail-closed guard is reached.  Setjmp-based
+ * trampoline (mirrors test_cluster_fence.c): when armed, an Assert trip
+ * (assert builds) or an ereport(ERROR) (production builds) jumps back to
+ * the test instead of aborting the binary.  For elevel < ERROR the stubs
+ * keep the historical silent-no-op behaviour. */
+static sigjmp_buf ut_trap_jump;
+static bool ut_trap_jump_armed = false;
+static int ut_ereport_last_errcode = 0;
+static int ut_current_elevel = 0;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
+	if (ut_trap_jump_armed)
+		siglongjmp(ut_trap_jump, 2);
 	abort();
 }
 
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int elevel, const char *d pg_attribute_unused())
 {
-	return false;
+	ut_current_elevel = elevel;
+	/* PG: ERROR = 21 (elog.h).  >= ERROR runs the ereport body so the
+	 * errcode stub can capture the SQLSTATE before errfinish jumps. */
+	return elevel >= 21;
 }
 
 bool
-errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart_cold(int elevel, const char *d)
 {
-	return false;
+	return errstart(elevel, d);
 }
 
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
-{}
+{
+	if (ut_current_elevel >= 21 && ut_trap_jump_armed)
+		siglongjmp(ut_trap_jump, 1);
+	/* Otherwise (LOG/NOTICE/no jump armed): silent return. */
+}
 
 int
-errcode(int s pg_attribute_unused())
+errcode(int s)
 {
+	if (ut_trap_jump_armed)
+		ut_ereport_last_errcode = s;
 	return 0;
 }
 
@@ -1981,6 +2003,47 @@ UT_TEST(test_grd_lookup_master_gen_q3c_verbatim)
 	UT_ASSERT_EQ(token, ((((uint64)21) << 32) | 0x000000aa));
 	UT_ASSERT_EQ(master, cluster_grd_lookup_master(&resid));
 	mock_lms_shard_master_generation = 0;
+}
+
+/* spec-5.22a D1-5:  the GRD shard-hash master lookup fail-closes on an
+ * undo-class resid.  Undo is owner-as-master (the master IS the encoded
+ * owner); a hash-derived master would bypass the owner authority, so no
+ * caller may hash-route it.  Assert builds trip the guard's Assert first
+ * (trampoline rc 2); production builds reach the ereport(ERROR) (rc 1)
+ * whose SQLSTATE must be 53R9Q. */
+UT_TEST(test_grd_lookup_master_rejects_undo_resid)
+{
+	int32 nodes2[] = { 0, 1 };
+	ClusterResId undo;
+	int rc;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(2, nodes2);
+	cluster_grd_master_map_init();
+
+	/* hand-built undo-class resid: only the type byte matters to the
+	 * guard (the undo encoder object is deliberately not linked here) */
+	memset(&undo, 0, sizeof(undo));
+	undo.field1 = 7;   /* undo_segment */
+	undo.field2 = 129; /* block_no */
+	undo.field3 = 3;   /* generation */
+	undo.field4 = 1;   /* owner_node */
+	undo.type = CLUSTER_UNDO_RESID_TYPE;
+	undo.lockmethodid = DEFAULT_LOCKMETHOD;
+
+	ut_ereport_last_errcode = 0;
+	rc = sigsetjmp(ut_trap_jump, 0);
+	if (rc == 0) {
+		ut_trap_jump_armed = true;
+		(void)cluster_grd_lookup_master(&undo);
+		/* reaching here means the undo resid was hash-routed */
+		ut_trap_jump_armed = false;
+		UT_ASSERT(false);
+	}
+	ut_trap_jump_armed = false;
+	UT_ASSERT(rc == 1 || rc == 2);
+	if (rc == 1) /* ereport path (production builds) */
+		UT_ASSERT_EQ(ut_ereport_last_errcode, ERRCODE_CLUSTER_UNDO_RESID_HASH_ROUTED);
 }
 
 UT_TEST(test_grd_shard_phase_accessors)
@@ -4055,7 +4118,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA);
 	 * spec-5.16:+12 (join-remaster U1-U5/U10-U16);
 	 * +1 (U17 cross-episode fence Hardening). */
-	UT_PLAN(80);
+	UT_PLAN(81);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4091,6 +4154,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_remaster_multi_death_and_sparse);
 	UT_RUN(test_grd_remaster_no_survivor_fail_closed);
 	UT_RUN(test_grd_lookup_master_gen_q3c_verbatim);
+	UT_RUN(test_grd_lookup_master_rejects_undo_resid);
 	UT_RUN(test_grd_shard_phase_accessors);
 	UT_RUN(test_grd_d2_redeclare_scan_completion_gate);
 

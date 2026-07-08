@@ -745,6 +745,15 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # retried; never write dependent bytes to storage.
 53R9P    E    ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST                            cluster_smart_fusion_dep_lost
 
+# spec-5.22a D1:  undo resids are owner-as-master resources (the resource
+# master IS the owning instance);  routing one through the GRD shard-hash
+# master lookup would place the authority at a node that does not own the
+# undo.  No caller may hash-route an undo resid;  the hash lookup fails
+# closed here (route via cluster_undo_resid_master instead).  Q is the next
+# free slot in the 53R9 family (A..P allocated;  X taken by the clean-page
+# X-transfer band below).
+53R9Q    E    ERRCODE_CLUSTER_UNDO_RESID_HASH_ROUTED                           cluster_undo_resid_hash_routed
+
 # spec-5.2a D6:  clean-page X-transfer enabler terminal fail-closed.  A clean
 # (sequence) page X-transfer could not complete safely and there is no proven-
 # safe fallback:  a 3-node third-party master clean transfer (out of the 2-node

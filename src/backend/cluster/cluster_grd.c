@@ -53,6 +53,7 @@
 #include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
+#include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "storage/procsignal.h"				 /* spec-4.6 D3 — redeclare broadcast */
 #include "storage/sinvaladt.h"				 /* spec-4.6 D3 — BackendIdGetProc */
 #include "utils/timestamp.h"				 /* spec-4.6 D1 — barrier deadline */
@@ -992,6 +993,24 @@ cluster_grd_lookup_master(const ClusterResId *resid)
 {
 	uint32 shard_id;
 	int32 master;
+
+	/*
+	 * PGRAC: spec-5.22a D1-5 -- undo resids are owner-as-master resources;
+	 * their master is the encoded owner (cluster_undo_resid_master), never a
+	 * shard-hash node.  A hash-derived master would place the undo authority
+	 * at a node that does not own the undo, so no caller may hash-route the
+	 * undo class.  Fail closed: no data-plane path legitimately reaches here
+	 * with an undo resid.
+	 */
+	if (resid != NULL && resid->type == CLUSTER_UNDO_RESID_TYPE) {
+		Assert(false);
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_UNDO_RESID_HASH_ROUTED),
+			 errmsg("undo resource id must not be routed through the GRD hash master lookup"),
+			 errhint(
+				 "Undo resources are owner-as-master; route via cluster_undo_resid_master().")));
+	}
 
 	Assert(cluster_grd_state != NULL);
 
