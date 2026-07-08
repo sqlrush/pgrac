@@ -737,8 +737,9 @@ cluster_grd_shmem_init(void)
 		/* spec-4.6 P0#3 cluster gate — per-node barrier-done epochs. */
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch[i], 0);
-			pg_atomic_init_u64(&cluster_grd_state->recovery_done_event_id[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->recovery_done_bitmap_hash[i], 0);
 		}
+		pg_atomic_init_u64(&cluster_grd_state->recovery_event_bitmap_hash, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_done_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_failed_count, 0);
@@ -1703,11 +1704,36 @@ cluster_grd_recovery_done_epoch_for(int32 node)
 }
 
 uint64
-cluster_grd_recovery_done_event_id_for(int32 node)
+cluster_grd_recovery_done_bitmap_hash_for(int32 node)
 {
 	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
 		return 0;
-	return pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[node]);
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[node]);
+}
+
+uint64
+cluster_grd_recovery_event_bitmap_hash_value(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
+}
+
+/*
+ * cluster_grd_dead_bitmap_hash — spec-4.6a Amendment v1.2 (R2).
+ *
+ *	The cross-node half of the REDECLARE_DONE convergence key: a hash over
+ *	the quorum-accepted dead bitmap ALONE.  Same kernel as the event_id hash
+ *	(cluster_reconfig_compute_event_id) minus the cssd_dead_generation fold —
+ *	the generation is per-instance observation history and does NOT converge
+ *	across survivors, which is exactly why event_id cannot key the P6 gate.
+ *	A JOIN episode's dead bitmap is all-zero, hashing identically everywhere,
+ *	so the composite key degrades to the epoch-only gate there.
+ */
+uint64
+cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap)
+{
+	return hash_bytes_extended(dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES, 0);
 }
 
 bool
@@ -2051,7 +2077,11 @@ static void
 grd_recovery_broadcast_done(uint64 epoch)
 {
 	GesRequestPayload req;
-	uint64 event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	/* Amendment v1.2 (R2): the DONE payload carries the sender's accepted
+	 * dead-bitmap hash (cross-node convergence key), riding the request-id
+	 * field pair — NOT the sender-local event_id (its dead_generation fold
+	 * diverges across survivors' flap observation histories). */
+	uint64 bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
 	uint64 master_gen = cluster_lms_get_shard_master_generation();
 	int i;
 
@@ -2061,8 +2091,8 @@ grd_recovery_broadcast_done(uint64 epoch)
 	req.holder_procno = 0;
 	req.holder_cluster_epoch_lo = (uint32)(epoch & 0xffffffffu);
 	req.holder_cluster_epoch_hi = (uint32)(epoch >> 32);
-	req.holder_request_id_lo = (uint32)(event_id & 0xffffffffu);
-	req.holder_request_id_hi = (uint32)(event_id >> 32);
+	req.holder_request_id_lo = (uint32)(bitmap_hash & 0xffffffffu);
+	req.holder_request_id_hi = (uint32)(bitmap_hash >> 32);
 	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
 	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
 
@@ -2081,21 +2111,29 @@ grd_recovery_broadcast_done(uint64 epoch)
 
 /* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
 void
-cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
+cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap_hash)
 {
-	uint64 current_event_id;
+	uint64 episode_bitmap_hash;
 
 	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
 		return;
 
 	/*
-	 * spec-4.6a D4-v2: REDECLARE_DONE is an event-scoped proof.  A stale DONE
-	 * from a previous episode can carry the same epoch when cur==old, so epoch
-	 * monotonicity alone is not enough.  Drop messages for any event other than
-	 * the one this LMON has accepted; senders re-announce every tick.
+	 * spec-4.6a Amendment v1.2 (R2): REDECLARE_DONE converges on the COMPOSITE
+	 * key (episode_epoch, dead_bitmap_hash).  A stale DONE from a previous
+	 * episode can carry the same epoch when cur==old, so epoch monotonicity
+	 * alone is not enough — but the previous episode's dead SET necessarily
+	 * differs (a coordinator re-election adds the old coordinator to it; a
+	 * re-death of the same node rides a higher epoch via the interposed JOIN
+	 * bump), so the bitmap hash is the ABA guard.  Flap-history drift changes
+	 * only the per-instance dead_generation, never the quorum dead SET, so
+	 * DONEs for the same episode always match here (the R2 wedge fix).
+	 * Pre-accept frames mismatch the previous episode's stamp and are dropped;
+	 * senders re-announce every tick, so accounting lands after our P0 accept
+	 * (which also closes the R4 pre-accept window by construction).
 	 */
-	current_event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
-	if (event_id == 0 || (current_event_id != 0 && event_id != current_event_id))
+	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
+	if (dead_bitmap_hash == 0 || dead_bitmap_hash != episode_bitmap_hash)
 		return;
 
 	/* spec-4.6a §2.3: monotonic-max accounting.  Under strictly-monotonic
@@ -2107,7 +2145,7 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
 		if (epoch > prev)
 			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[node], epoch);
 	}
-	pg_atomic_write_u64(&cluster_grd_state->recovery_done_event_id[node], event_id);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_done_bitmap_hash[node], dead_bitmap_hash);
 }
 
 /*
@@ -2175,13 +2213,13 @@ grd_recovery_format_missing_survivors(const uint64 *dead, uint64 episode_epoch, 
 			continue;
 		done_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]);
 		if (done_epoch >= episode_epoch
-			&& pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i])
-				   == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id))
+			&& pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i])
+				   == pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash))
 			continue;
 		grd_recovery_appendf(buf, buflen, &off,
-							 "%s%d(done=" UINT64_FORMAT "/event=" UINT64_FORMAT ")", any ? "," : "",
-							 i, done_epoch,
-							 pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i]));
+							 "%s%d(done=" UINT64_FORMAT "/bitmap_hash=" UINT64_FORMAT ")",
+							 any ? "," : "", i, done_epoch,
+							 pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i]));
 		any = true;
 	}
 	if (!any)
@@ -2433,6 +2471,12 @@ cluster_grd_recovery_lmon_tick(void)
 			}
 			pg_atomic_write_u64(&cluster_grd_state->recovery_dead_bitmap[b], word);
 		}
+		/* Amendment v1.2 (R2): stamp the composite convergence key's cross-node
+		 * half.  Hash over the accepted dead bitmap alone — every survivor that
+		 * accepted the same quorum dead SET computes the same value regardless
+		 * of its private dead_generation observation history. */
+		pg_atomic_write_u64(&cluster_grd_state->recovery_event_bitmap_hash,
+							cluster_grd_dead_bitmap_hash(evt.dead_bitmap));
 		/*
 		 * spec-5.16 D2 — record the remaster direction and, for JOIN, arm the
 		 * joiner-home PCM block fence on THIS node.  The joiner already armed it
@@ -2510,8 +2554,8 @@ cluster_grd_recovery_lmon_tick(void)
 				TimestampTz next_deadline;
 				uint32 coordinator;
 				uint64 coord_done;
-				uint64 coord_done_event_id;
-				uint64 accepted_event_id;
+				uint64 coord_done_bitmap_hash;
+				uint64 episode_bitmap_hash;
 				uint64 coord_done_at_accept;
 
 				wait_deadline = (TimestampTz)pg_atomic_read_u64(
@@ -2533,29 +2577,33 @@ cluster_grd_recovery_lmon_tick(void)
 				}
 
 				coordinator = pg_atomic_read_u32(&cluster_grd_state->recovery_event_coordinator);
-				accepted_event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+				episode_bitmap_hash
+					= pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
 				coord_done
 					= coordinator < CLUSTER_MAX_NODES
 						  ? pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[coordinator])
 						  : 0;
-				coord_done_event_id
+				coord_done_bitmap_hash
 					= coordinator < CLUSTER_MAX_NODES
 						  ? pg_atomic_read_u64(
-								&cluster_grd_state->recovery_done_event_id[coordinator])
+								&cluster_grd_state->recovery_done_bitmap_hash[coordinator])
 						  : 0;
 				coord_done_at_accept
 					= pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch_at_accept);
 				/*
-				 * spec-4.6a §2.3 witness (all three conjuncts of the frozen
-				 * text): the coordinator's DONE must (a) be for THIS event,
-				 * (b) name exactly cur as the episode epoch, and (c) have been
+				 * spec-4.6a §2.3 witness, composite-key form (Amendment v1.2
+				 * R2): the coordinator's DONE must (a) name this episode's
+				 * quorum dead SET (bitmap hash — the cross-node-consistent
+				 * key; the sender-local event_id folds the per-instance
+				 * dead_generation and diverges under flap asymmetry), (b)
+				 * name exactly cur as the episode epoch, and (c) have been
 				 * accounted after our P0 accept snapshot.  Under strictly
 				 * monotonic per-event epochs (c) is implied by (a)+(b) — any
 				 * pre-accept residue carries a lower epoch — but it stays as a
 				 * belt-and-suspenders guard against accounting bugs.
 				 */
 				if (cur_epoch == old_epoch && coord_done == cur_epoch
-					&& coord_done_event_id == accepted_event_id
+					&& coord_done_bitmap_hash == episode_bitmap_hash
 					&& coord_done > coord_done_at_accept) {
 					pg_atomic_fetch_add_u64(&cluster_grd_state->wait_epoch_escape_count, 1);
 					ereport(WARNING,
@@ -2563,25 +2611,25 @@ cluster_grd_recovery_lmon_tick(void)
 							 errmsg("cluster GRD recovery WAIT_EPOCH used coordinator witness for "
 									"equal-epoch progress"),
 							 errdetail("coordinator=%u, epoch=" UINT64_FORMAT
-									   ", event_id=" UINT64_FORMAT,
-									   coordinator, cur_epoch, accepted_event_id)));
+									   ", dead_bitmap_hash=" UINT64_FORMAT,
+									   coordinator, cur_epoch, episode_bitmap_hash)));
 				} else {
 					next_deadline
 						= TimestampTzPlusMilliseconds(now, cluster_grd_rebuild_timeout_ms);
 					pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
 										(uint64)next_deadline);
-					ereport(
-						WARNING,
-						(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-						 errmsg("cluster GRD recovery WAIT_EPOCH has no post-bump proof; "
-								"affected shards stay frozen"),
-						 errdetail("cur_epoch=" UINT64_FORMAT ", old_epoch=" UINT64_FORMAT
-								   ", coordinator=%u, coordinator_done=" UINT64_FORMAT
-								   ", coordinator_done_event_id=" UINT64_FORMAT
-								   ", accepted_event_id=" UINT64_FORMAT
-								   ", coordinator_done_at_accept=" UINT64_FORMAT,
-								   cur_epoch, old_epoch, coordinator, coord_done,
-								   coord_done_event_id, accepted_event_id, coord_done_at_accept)));
+					ereport(WARNING,
+							(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+							 errmsg("cluster GRD recovery WAIT_EPOCH has no post-bump proof; "
+									"affected shards stay frozen"),
+							 errdetail("cur_epoch=" UINT64_FORMAT ", old_epoch=" UINT64_FORMAT
+									   ", coordinator=%u, coordinator_done=" UINT64_FORMAT
+									   ", coordinator_done_bitmap_hash=" UINT64_FORMAT
+									   ", episode_bitmap_hash=" UINT64_FORMAT
+									   ", coordinator_done_at_accept=" UINT64_FORMAT,
+									   cur_epoch, old_epoch, coordinator, coord_done,
+									   coord_done_bitmap_hash, episode_bitmap_hash,
+									   coord_done_at_accept)));
 					return;
 				}
 			}
@@ -2728,8 +2776,8 @@ cluster_grd_recovery_lmon_tick(void)
 			 */
 			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[cluster_node_id],
 								episode_epoch);
-			pg_atomic_write_u64(&cluster_grd_state->recovery_done_event_id[cluster_node_id],
-								pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id));
+			pg_atomic_write_u64(&cluster_grd_state->recovery_done_bitmap_hash[cluster_node_id],
+								pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash));
 			grd_recovery_broadcast_done(episode_epoch);
 			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
 												   cluster_grd_rebuild_timeout_ms);
@@ -2864,9 +2912,13 @@ cluster_grd_recovery_lmon_tick(void)
 				 */
 				if (is_join && join_fence_is_recipient_for(i, episode_epoch))
 					continue;
+				/* Amendment v1.2 (R2): composite key — the peer's DONE must name
+				 * this episode's epoch AND the same quorum dead SET.  Keying on
+				 * event_id here wedged the gate whenever survivors' private
+				 * dead_generation histories diverged (flap asymmetry). */
 				if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < episode_epoch
-					|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_event_id[i])
-						   != pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)) {
+					|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i])
+						   != pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)) {
 					all_done = false;
 					break;
 				}

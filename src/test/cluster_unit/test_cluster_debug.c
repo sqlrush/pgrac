@@ -3350,7 +3350,7 @@ cluster_grd_recovery_done_epoch_for(int32 node pg_attribute_unused())
 }
 
 uint64
-cluster_grd_recovery_done_event_id_for(int32 node pg_attribute_unused())
+cluster_grd_recovery_done_bitmap_hash_for(int32 node pg_attribute_unused())
 {
 	return 0;
 }

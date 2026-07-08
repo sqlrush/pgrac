@@ -3748,6 +3748,30 @@ ut_jr_setup_3node(void)
 	cluster_grd_master_map_init();
 }
 
+/* spec-4.6a Amendment v1.2 (R2): REDECLARE_DONE accounting converges on the
+ * composite key (episode_epoch, dead_bitmap_hash), so a test that feeds DONEs
+ * must first drive a P0 accept to stamp the episode's bitmap hash.  Accept an
+ * empty-dead-bitmap FAIL event (hash identical to a JOIN episode's, no fence
+ * side effects; the FSM parks in WAIT_EPOCH awaiting a strict bump, which the
+ * fence assertions never touch).  Returns the stamped hash for the callers'
+ * mark_peer_done payloads. */
+static uint64
+ut_jr_stamp_episode_bitmap_hash(uint64 event_id)
+{
+	bool saved_enabled = cluster_enabled;
+
+	cluster_enabled = true;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick(); /* idle tick: baseline capture */
+	ut_mock_last_event.event_id = event_id;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.reconfig_kind = (uint8)RECONFIG_KIND_FAIL_STOP;
+	cluster_grd_recovery_lmon_tick(); /* P0 accept stamps the bitmap hash */
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_enabled = saved_enabled;
+	return cluster_grd_recovery_event_bitmap_hash_value();
+}
+
 /* U1 — recompute moves the joiner's home shards back from the survivor. */
 UT_TEST(test_jr_u1_recompute_moves_joiner_home)
 {
@@ -3937,9 +3961,12 @@ UT_TEST(test_jr_u13_view_rebuilt_all_members_barrier)
 	int n1[1] = { 1 };
 	BufferTag tag;
 
+	uint64 done_hash;
+
 	memset(&tag, 0, sizeof(tag));
 	ut_jr_setup_3node();
 	ut_mock_epoch = 10;
+	done_hash = ut_jr_stamp_episode_bitmap_hash(901); /* v1.2 R2 composite key */
 	ut_jr_build_bitmap(join1, n1, 1);
 	cluster_grd_arm_join_pcm_fence(join1);
 	ut_mock_static_master = 1; /* the rejoiner's home block */
@@ -3950,15 +3977,15 @@ UT_TEST(test_jr_u13_view_rebuilt_all_members_barrier)
 
 	/* HARDENING v1.1 — the joiner (node 1) announcing its OWN trivial barrier
 	 * must NOT lift the fence: survivors 0 and 2 have not re-declared yet. */
-	cluster_grd_recovery_mark_peer_done(1, 10, 1);
+	cluster_grd_recovery_mark_peer_done(1, 10, done_hash);
 	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
 
 	/* One survivor done is still not enough. */
-	cluster_grd_recovery_mark_peer_done(0, 10, 1);
+	cluster_grd_recovery_mark_peer_done(0, 10, done_hash);
 	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
 
 	/* All members done → view rebuilt → fence lifts. */
-	cluster_grd_recovery_mark_peer_done(2, 10, 1);
+	cluster_grd_recovery_mark_peer_done(2, 10, done_hash);
 	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
 }
 
@@ -3969,10 +3996,13 @@ UT_TEST(test_jr_u14_fence_arm_monotonic_and_scope)
 	int n1[1] = { 1 };
 	BufferTag tag;
 
+	uint64 done_hash;
+
 	memset(&tag, 0, sizeof(tag));
 	ut_jr_setup_3node();
 
 	ut_mock_epoch = 10;
+	done_hash = ut_jr_stamp_episode_bitmap_hash(902); /* v1.2 R2 composite key */
 	ut_jr_build_bitmap(join1, n1, 1);
 	cluster_grd_arm_join_pcm_fence(join1);
 
@@ -3981,15 +4011,15 @@ UT_TEST(test_jr_u14_fence_arm_monotonic_and_scope)
 	ut_mock_epoch = 5;
 	cluster_grd_arm_join_pcm_fence(join1);
 	ut_mock_static_master = 1;
-	cluster_grd_recovery_mark_peer_done(0, 5, 1);
-	cluster_grd_recovery_mark_peer_done(1, 5, 1);
-	cluster_grd_recovery_mark_peer_done(2, 5, 1);
+	cluster_grd_recovery_mark_peer_done(0, 5, done_hash);
+	cluster_grd_recovery_mark_peer_done(1, 5, done_hash);
+	cluster_grd_recovery_mark_peer_done(2, 5, done_hash);
 	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag)); /* 5 < fence epoch 10 */
 
 	/* Done at the real fence epoch lifts it. */
-	cluster_grd_recovery_mark_peer_done(0, 10, 1);
-	cluster_grd_recovery_mark_peer_done(1, 10, 1);
-	cluster_grd_recovery_mark_peer_done(2, 10, 1);
+	cluster_grd_recovery_mark_peer_done(0, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(1, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(2, 10, done_hash);
 	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
 }
 
@@ -4002,10 +4032,12 @@ UT_TEST(test_jr_u15_master_side_gate_decision)
 	int n1[1] = { 1 };
 	BufferTag tag;
 	bool deny;
+	uint64 done_hash;
 
 	memset(&tag, 0, sizeof(tag));
 	ut_jr_setup_3node();
 	ut_mock_epoch = 10;
+	done_hash = ut_jr_stamp_episode_bitmap_hash(903); /* v1.2 R2 composite key */
 	ut_jr_build_bitmap(join1, n1, 1);
 	cluster_grd_arm_join_pcm_fence(join1);
 	ut_mock_static_master = 1;
@@ -4014,9 +4046,9 @@ UT_TEST(test_jr_u15_master_side_gate_decision)
 	deny = cluster_grd_join_remaster_active_for_shard(tag) && !cluster_grd_block_view_rebuilt(tag);
 	UT_ASSERT(deny);
 
-	cluster_grd_recovery_mark_peer_done(0, 10, 1);
-	cluster_grd_recovery_mark_peer_done(1, 10, 1);
-	cluster_grd_recovery_mark_peer_done(2, 10, 1);
+	cluster_grd_recovery_mark_peer_done(0, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(1, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(2, 10, done_hash);
 	deny = cluster_grd_join_remaster_active_for_shard(tag) && !cluster_grd_block_view_rebuilt(tag);
 	UT_ASSERT(!deny);
 }
@@ -4059,17 +4091,20 @@ UT_TEST(test_jr_u17_stale_recipient_not_excluded_next_episode)
 	int n2[1] = { 2 };
 	BufferTag tag;
 
+	uint64 done_hash;
+
 	memset(&tag, 0, sizeof(tag));
 	ut_jr_setup_3node(); /* declared {0,1,2}, all members */
 
 	/* --- Episode 1: node 1 rejoins and completes (all survivors re-declare). --- */
 	ut_mock_epoch = 10;
+	done_hash = ut_jr_stamp_episode_bitmap_hash(904); /* v1.2 R2 composite key */
 	ut_jr_build_bitmap(join1, n1, 1);
 	cluster_grd_arm_join_pcm_fence(join1);
 	ut_mock_static_master = 1; /* a node-1-home block */
-	cluster_grd_recovery_mark_peer_done(0, 10, 1);
-	cluster_grd_recovery_mark_peer_done(1, 10, 1);
-	cluster_grd_recovery_mark_peer_done(2, 10, 1);
+	cluster_grd_recovery_mark_peer_done(0, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(1, 10, done_hash);
+	cluster_grd_recovery_mark_peer_done(2, 10, done_hash);
 	UT_ASSERT(cluster_grd_block_view_rebuilt(tag)); /* episode 1 converged */
 
 	/* --- Episode 2: node 2 rejoins.  node 1 is now a steady survivor whose held
@@ -4082,29 +4117,35 @@ UT_TEST(test_jr_u17_stale_recipient_not_excluded_next_episode)
 	/* Only the OTHER survivor (node 0) has re-declared for episode 2; node 1 has
 	 * NOT.  node 1's stale episode-1 fence bit must NOT exclude it from the
 	 * barrier — it must still gate the fence lift. */
-	cluster_grd_recovery_mark_peer_done(0, 20, 1);
+	cluster_grd_recovery_mark_peer_done(0, 20, done_hash);
 	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag)); /* must still wait for node 1 */
 
 	/* Once node 1 re-declares for episode 2 the barrier converges and lifts. */
-	cluster_grd_recovery_mark_peer_done(1, 20, 1);
+	cluster_grd_recovery_mark_peer_done(1, 20, done_hash);
 	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
 }
 
 
 /* ============================================================
- * spec-4.6a r2-P1-1 — event-scoped REDECLARE_DONE proof.
+ * spec-4.6a Amendment v1.2 (R2) — composite-key REDECLARE_DONE proof.
  *
- *	A stale DONE (previous event) must be dropped at the accounting
- *	layer and must never satisfy the WAIT_EPOCH coordinator witness;
- *	a current-event DONE at exactly cur, accounted after the P0
- *	accept snapshot, is the only equal-epoch escape (proof-carrying,
- *	never timeout-only).
+ *	The cross-node convergence key is (episode_epoch, dead_bitmap_hash).
+ *	A DONE naming a DIFFERENT dead set (the old-event ABA shape) must be
+ *	dropped at the accounting layer and never satisfy the WAIT_EPOCH
+ *	coordinator witness.  A DONE naming the SAME dead set must be
+ *	accounted even though the sender's local event_id differs (the
+ *	dead_generation-drift shape that wedged the event_id key: R2), and
+ *	then satisfies the witness — the only equal-epoch escape
+ *	(proof-carrying, never timeout-only).
  * ============================================================ */
 
-UT_TEST(test_recovery_stale_event_done_rejected_and_witness_advance)
+UT_TEST(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance)
 {
 	ClusterGrdRecoveryCounters before;
 	ClusterGrdRecoveryCounters after;
+	uint8 old_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 episode_hash;
+	uint64 old_event_hash;
 
 	ut_jr_setup_3node();
 	cluster_enabled = true;
@@ -4117,27 +4158,38 @@ UT_TEST(test_recovery_stale_event_done_rejected_and_witness_advance)
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
 	cluster_grd_recovery_lmon_tick();
 
-	/* Stage the fail-stop event: dead node 2, coordinator 0, event 77. */
+	/* Stage the fail-stop event: dead node 2, coordinator 0.  The local
+	 * event_id (77) folds this node's own dead_generation; a peer that saw a
+	 * different flap history computes a DIFFERENT id for the same episode. */
 	ut_mock_last_event.event_id = 77;
 	ut_mock_last_event.coordinator_node_id = 0;
 	ut_mock_last_event.reconfig_kind = (uint8)RECONFIG_KIND_FAIL_STOP;
 	ut_mock_last_event.dead_bitmap[0] = 0x04;
 	cluster_grd_recovery_lmon_tick(); /* P0 accept -> WAIT_EPOCH, no proof yet */
 	UT_ASSERT_EQ(cluster_grd_recovery_last_event_id(), 77);
+	episode_hash = cluster_grd_recovery_event_bitmap_hash_value();
+	UT_ASSERT_EQ(episode_hash, cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
 
-	/* Stale-event DONE (event 76) is dropped: nothing is accounted. */
-	cluster_grd_recovery_mark_peer_done(0, 10, 76);
-	UT_ASSERT_EQ(cluster_grd_recovery_done_event_id_for(0), 0);
+	/* Old-event ABA shape: a late DONE naming a DIFFERENT dead set (node 3
+	 * instead of node 2 — e.g. the previous episode before a coordinator
+	 * re-election) is dropped: nothing is accounted. */
+	memset(old_dead, 0, sizeof(old_dead));
+	old_dead[0] = 0x08;
+	old_event_hash = cluster_grd_dead_bitmap_hash(old_dead);
+	cluster_grd_recovery_mark_peer_done(0, 10, old_event_hash);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), 0);
 	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 0);
 
-	/* Current-event DONE is accounted (epoch + event id). */
-	cluster_grd_recovery_mark_peer_done(0, 10, 77);
+	/* Generation-drift shape (the R2 wedge): the peer's local event_id
+	 * differs, but its DONE names the SAME quorum dead set -> the composite
+	 * key matches and the DONE is accounted. */
+	cluster_grd_recovery_mark_peer_done(0, 10, episode_hash);
 	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 10);
-	UT_ASSERT_EQ(cluster_grd_recovery_done_event_id_for(0), 77);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), episode_hash);
 
-	/* Witness advance: deadline expired + cur==old + coordinator DONE for
-	 * THIS event at exactly cur, accounted after the accept snapshot.  The
-	 * FSM takes the event-scoped equal-epoch escape exactly once. */
+	/* Witness advance: deadline expired + cur==old + coordinator DONE naming
+	 * THIS dead set at exactly cur, accounted after the accept snapshot.  The
+	 * FSM takes the composite-key equal-epoch escape exactly once. */
 	cluster_grd_recovery_counters_snapshot(&before);
 	ut_mock_now = (int64)60 * 1000000;
 	cluster_grd_recovery_lmon_tick();
@@ -4264,7 +4316,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_jr_u15_master_side_gate_decision);
 	UT_RUN(test_jr_u16_pre_member_guard);
 	UT_RUN(test_jr_u17_stale_recipient_not_excluded_next_episode);
-	UT_RUN(test_recovery_stale_event_done_rejected_and_witness_advance);
+	UT_RUN(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
