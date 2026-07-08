@@ -382,6 +382,11 @@ cluster_clean_leave_check_pending_in_proc_interrupts(void)
  *	disabled survivor MUST reply LEAVE_DRAIN_NAK rather than go silent, else the
  *	leaving node waits for an ACK that never comes and false-times-out.
  */
+
+/* spec-2.29a ②b: forward decls — the bind sites (below) snapshot the
+ * others-dead set that the coherence gate (defined near drive_drain) compares. */
+static void cl_others_dead_snapshot(int32 leaving, uint8 *out);
+
 static void
 cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 {
@@ -510,6 +515,9 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 		 * fails the commit closed instead of committing on a stale membership view.
 		 */
 		cl_state->leave_baseline_dead_gen = cluster_cssd_get_dead_generation();
+		/* spec-2.29a ②b: snapshot the others-dead set (excludes the leaving node)
+		 * the coherence gate compares against. */
+		cl_others_dead_snapshot(leaving, cl_state->leave_baseline_others_dead);
 		pg_atomic_write_u32(&cl_state->survivor_acked, 0);
 		pg_atomic_write_u32(&cl_state->commit_ready_received, 0);
 		pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
@@ -1430,6 +1438,8 @@ cl_request_body(void)
 	cl_state->leaving_node_id = cluster_node_id;
 	cl_state->leave_epoch = baseline_epoch;
 	cl_state->leave_baseline_dead_gen = cluster_cssd_get_dead_generation();
+	/* spec-2.29a ②b: snapshot the others-dead set (excludes self, the leaver). */
+	cl_others_dead_snapshot(cluster_node_id, cl_state->leave_baseline_others_dead);
 	cl_state->barrier_deadline_us
 		= (uint64)GetCurrentTimestamp() + (uint64)cluster_clean_leave_drain_timeout_ms * 1000ULL;
 	/*
@@ -1563,6 +1573,49 @@ cluster_clean_leave_request(void)
  * re-checks version coherence (CL-I3: an external epoch bump = a real death
  * intruded -> escalate) and the mixed-mode NAK (clean abort).
  */
+
+/*
+ * spec-2.29a ②b: snapshot the CSSD dead set EXCLUDING the leaving node.  The
+ * coherence gate compares this "others-dead" set rather than the scalar global
+ * dead_generation, so the leaving node's own expected alive->DEAD transition
+ * (it stops heart-beating once its drain finishes) never falsely escalates the
+ * leave.  A third-party death still changes this set and escalates (CL-I3).
+ */
+static void
+cl_others_dead_snapshot(int32 leaving, uint8 *out /* CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES */)
+{
+	int i;
+
+	memset(out, 0, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == leaving)
+			continue; /* the leaving node's own DEAD is expected, not incoherence */
+		if (i >= CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES * 8)
+			break;
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
+			out[i / 8] |= (uint8)(1u << (i % 8));
+	}
+}
+
+/*
+ * spec-2.29a ②b: the coherence gate used by every clean-leave step.  Coherent
+ * iff the epoch has not moved AND no THIRD-PARTY death changed the others-dead
+ * set since the leave was bound.  cl_state->leaving_node_id names the node
+ * whose own DEAD is excluded.
+ */
+static bool
+cl_coherent(uint64 baseline_epoch)
+{
+	uint8 now_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+
+	cl_others_dead_snapshot(cl_state->leaving_node_id, now_others_dead);
+	return cluster_clean_leave_version_coherent(
+		baseline_epoch, cluster_epoch_get_current(), cl_state->leave_baseline_others_dead,
+		now_others_dead, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES);
+}
+
 void
 cluster_clean_leave_drive_drain(void)
 {
@@ -1623,16 +1676,14 @@ cluster_clean_leave_drive_drain(void)
 	/*
 	 * CL-I3 coherence gate, re-checked before every drain step.  Uses the
 	 * dead_gen-aware helper, not an epoch-only compare: CSSD increments the
-	 * dead_generation the moment it declares a peer dead, which is STRICTLY
-	 * BEFORE the reconfig coordinator bumps the membership epoch.  Checking
-	 * dead_gen too lets us escalate in that earlier window instead of draining
-	 * into a death that has not yet reached the epoch.  At commit the guarded
-	 * CAS in apply_clean_leave_as_coordinator is the final authority.
+	 * others-dead set the moment it declares a THIRD-PARTY peer dead, which is
+	 * STRICTLY BEFORE the reconfig coordinator bumps the membership epoch.
+	 * Checking that set too lets us escalate in that earlier window instead of
+	 * draining into a death that has not yet reached the epoch.  The leaving
+	 * node's OWN DEAD is excluded (spec-2.29a ②b).  At commit the guarded CAS
+	 * in apply_clean_leave_as_coordinator is the final authority.
 	 */
-#define CL_COHERENT()                                                                              \
-	cluster_clean_leave_version_coherent(baseline_epoch, cluster_epoch_get_current(),              \
-										 cl_state->leave_baseline_dead_gen,                        \
-										 cluster_cssd_get_dead_generation())
+#define CL_COHERENT() cl_coherent(baseline_epoch)
 
 	/* REQUESTED -> QUIESCING: abort local writable backends (53R62). */
 	if (!CL_COHERENT()) {
@@ -1726,14 +1777,22 @@ cl_leaving_barrier_tick(void)
 	 *	leave is active (cluster_clean_leave_in_progress gates drive_joins +
 	 *	commit_member), and the leave does not start while a join is pending
 	 *	(cluster_reconfig_join_in_progress gates the request).  Under that invariant a
-	 *	dead_gen-unchanged bump during a leave can only be the leave's own commit.
+	 *	bump with an unchanged others-dead set during a leave can only be the
+	 *	leave's own commit (spec-2.29a ②b: the leaving node's own DEAD is excluded
+	 *	so its expected heartbeat stop no longer looks like a third-party death).
 	 */
 	if (cluster_epoch_get_current() > baseline_epoch) {
-		if (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen) {
+		uint8 now_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+
+		cl_others_dead_snapshot(cl_state->leaving_node_id, now_others_dead);
+		if (memcmp(now_others_dead, cl_state->leave_baseline_others_dead,
+				   CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
+			== 0) {
 			/*
-			 * Commit point observed (our clean-leave epoch was published; no real
-			 * death intruded).  The leave can no longer be un-committed, so from
-			 * here the barrier deadline must NOT escalate (Hardening v1.0.1 P1-1).
+			 * Commit point observed (our clean-leave epoch was published; no
+			 * third-party death intruded).  The leave can no longer be
+			 * un-committed, so from here the barrier deadline must NOT escalate
+			 * (Hardening v1.0.1 P1-1).
 			 */
 			pg_atomic_write_u32(&cl_state->commit_point_observed, 1);
 			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -1817,11 +1876,9 @@ cl_coordinator_commit(int32 leaving)
 			 * applies.  On failure the leave does not commit and the leaving
 			 * node escalates to fail-stop (identical to the pre-check path).
 			 */
-			if (!cluster_clean_leave_version_coherent(baseline_epoch, cluster_epoch_get_current(),
-													  cl_state->leave_baseline_dead_gen,
-													  cluster_cssd_get_dead_generation())) {
+			if (!cl_coherent(baseline_epoch)) {
 				ereport(LOG,
-						(errmsg("cluster clean-leave: version moved (epoch or dead_generation) "
+						(errmsg("cluster clean-leave: version moved (epoch or third-party death) "
 								"across the COMMITTING marker wait for node %d; not committing "
 								"(escalate to fail-stop, CL-I3)",
 								leaving)));
@@ -1862,22 +1919,21 @@ cl_coordinator_commit(int32 leaving)
 	 * guarded CAS inside apply_clean_leave_as_coordinator below, which closes the
 	 * check-then-bump TOCTOU at >=3 nodes. */
 	/*
-	 * CL-I3 commit-handoff coherence (epoch AND dead_gen): refuse to commit if a
-	 * real death intruded since this survivor started tracking the leave — either
-	 * the death's fail-stop already bumped the epoch, OR (the >=3-node window,
-	 * Hardening v1.0.1 P1-2) CSSD bumped its dead_generation but the fail-stop
-	 * epoch has NOT yet advanced, which an epoch-only check (and the guarded CAS
-	 * below) would miss and commit on a stale membership view.  Uses the same
-	 * unit-tested version_coherent helper as drive_drain so the dead_gen-aware
-	 * coherence holds through the commit handoff; the leaving node then observes
-	 * the eventual foreign event and escalates.
+	 * CL-I3 commit-handoff coherence (epoch AND others-dead): refuse to commit if
+	 * a THIRD-PARTY death intruded since this survivor started tracking the leave
+	 * — either the death's fail-stop already bumped the epoch, OR (the >=3-node
+	 * window, Hardening v1.0.1 P1-2) CSSD added it to the others-dead set but the
+	 * fail-stop epoch has NOT yet advanced, which an epoch-only check (and the
+	 * guarded CAS below) would miss and commit on a stale membership view.  Uses
+	 * the same others-dead coherence helper as drive_drain (spec-2.29a ②b: the
+	 * leaving node's own expected DEAD is excluded so it never falsely escalates);
+	 * the leaving node then observes the eventual foreign event and escalates.
 	 */
-	if (!cluster_clean_leave_version_coherent(baseline_epoch, cluster_epoch_get_current(),
-											  cl_state->leave_baseline_dead_gen,
-											  cluster_cssd_get_dead_generation())) {
-		ereport(LOG, (errmsg("cluster clean-leave: version moved (epoch or dead_generation) before "
-							 "committing node %d; not committing (escalate to fail-stop, CL-I3)",
-							 leaving)));
+	if (!cl_coherent(baseline_epoch)) {
+		ereport(LOG,
+				(errmsg("cluster clean-leave: version moved (epoch or third-party death) before "
+						"committing node %d; not committing (escalate to fail-stop, CL-I3)",
+						leaving)));
 		return;
 	}
 

@@ -151,11 +151,17 @@ typedef struct ClusterLeaveState {
 	int32 leaving_node_id;	/* -1 if none */
 	uint32 _pad0;
 	uint64 leave_epoch;				/* epoch this leave is bound to (CL-I3 immutable) */
-	uint64 leave_baseline_dead_gen; /* CSSD dead_generation when the leave was bound;
-									 * an unchanged value at the epoch bump means OUR
-									 * clean-leave committed (no real death intruded) */
+	uint64 leave_baseline_dead_gen; /* CSSD dead_generation when the leave was bound
+									 * (retained for observability; the coherence gate
+									 * now uses leave_baseline_others_dead, spec-2.29a
+									 * ②b — the scalar counted the leaving node's own
+									 * expected DEAD and falsely escalated) */
 	uint64 barrier_deadline_us;		/* fail-closed deadline (drain_timeout_ms) */
 	uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES]; /* survivor acks */
+	/* spec-2.29a ②b: CSSD dead set (EXCLUDING the leaving node) snapshotted when
+	 * the leave was bound; the coherence gate escalates only if a THIRD-PARTY
+	 * death changed this set mid-drain. */
+	uint8 leave_baseline_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
 	pg_atomic_uint64 ges_drained_count; /* shards/grants drained (observability) */
 	pg_atomic_uint64 gcs_flushed_count; /* dirty/X pages flushed */
 	pg_atomic_uint64 shards_remastered; /* shards moved off leaving node */
@@ -337,10 +343,14 @@ extern bool cluster_clean_leave_should_abort_writable(bool in_transaction, bool 
 
 /* version-coherent leave (U3 / CL-I3 / L235): the leave is still coherent only
  * if neither the cluster epoch nor the CSSD dead_generation moved since the
- * leave was bound; any external bump (a real death intruding) => not coherent
- * => the caller must ABORTED_ESCALATE. */
+ * leave was bound; any external membership change (a third-party death, or a
+ * third-party fail-stop that already bumped the epoch) => not coherent => the
+ * caller must ABORTED_ESCALATE.  spec-2.29a ②b: the dead set compared here
+ * EXCLUDES the leaving node itself (others-dead bitmap), so the leaving node's
+ * own expected alive→DEAD transition never falsely escalates the leave. */
 extern bool cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 current_epoch,
-												 uint64 bound_dead_gen, uint64 current_dead_gen);
+												 const uint8 *bound_others_dead,
+												 const uint8 *current_others_dead, int nbytes);
 
 /* leave-intent marker structural validation (magic/version/CRC/identity).  Pure:
  * computes CRC32C over [magic..phase] and checks magic, version, that the

@@ -159,14 +159,28 @@ UT_TEST(test_phase_fsm)
 
 UT_TEST(test_version_coherent)
 {
-	/* nothing moved -> coherent */
-	UT_ASSERT(cluster_clean_leave_version_coherent(7, 7, 3, 3));
-	/* epoch bumped by an external death -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, 3, 3));
-	/* dead_generation moved -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, 3, 4));
-	/* both moved -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, 3, 4));
+	/* spec-2.29a ②b: coherence = epoch unchanged AND the others-dead bitmap
+	 * (dead set EXCLUDING the leaving node) unchanged.  The reflexive-case
+	 * matrix from the spec §②b 8.A argument, exercised on the pure predicate. */
+	uint8 od_none[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES] = { 0 };
+	uint8 od_third[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES] = { 0 };
+	const int n = CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES;
+
+	od_third[0] = 0x04; /* a THIRD-PARTY node (e.g. node 2) became DEAD */
+
+	/* (i) nothing moved (leaving node's own DEAD is already excluded upstream,
+	 *     so its transition does not appear here) -> coherent */
+	UT_ASSERT(cluster_clean_leave_version_coherent(7, 7, od_none, od_none, n));
+	/* (iii) epoch bumped by an external fail-stop -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, od_none, od_none, n));
+	/* (ii) a third-party death entered the others-dead set, epoch not yet
+	 *      bumped (the P1-b window) -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, od_none, od_third, n));
+	/* (iv) both moved -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, od_none, od_third, n));
+	/* fail-closed on a missing view */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, NULL, od_none, n));
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, od_none, NULL, n));
 }
 
 

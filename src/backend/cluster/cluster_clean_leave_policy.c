@@ -136,17 +136,35 @@ cluster_clean_leave_should_abort_writable(bool in_transaction, bool has_top_xid)
 
 /*
  * cluster_clean_leave_version_coherent -- the bound leave is still coherent
- * only if neither the cluster epoch nor the CSSD dead_generation moved since
- * the leave was bound.  Any external bump (a real death intruding mid-drain)
- * makes it incoherent → caller must ABORTED_ESCALATE (never complete a clean
- * leave on a stale version, which would let a destructive sweep run on a newer
- * version and double-grant).
+ * only if neither the cluster epoch nor the OTHERS-dead set (every dead node
+ * except the leaving node itself) moved since the leave was bound.  Any
+ * external membership change — a third-party death intruding mid-drain, or a
+ * third-party fail-stop that already bumped the epoch — makes it incoherent →
+ * caller must ABORTED_ESCALATE (never complete a clean leave on a stale
+ * membership view, which would let a destructive sweep run on a newer view
+ * and double-grant, CL-I3).
+ *
+ * spec-2.29a ②b fix: the pre-fix predicate compared the SCALAR global CSSD
+ * dead_generation, which also counts the leaving node's OWN alive→DEAD
+ * transition (it stops heart-beating once its drain finishes — the EXPECTED
+ * terminal state of a clean leave).  Under the async COMMITTING marker that
+ * spans several LMON ticks, a slow environment lets that transition land
+ * inside the wait window and the scalar check wrongly escalated an otherwise
+ * healthy leave.  Comparing the others-dead bitmap (which excludes the
+ * leaving node) removes exactly that false positive while keeping every
+ * third-party incoherence escalation (see the reflexive-case matrix in
+ * spec-2.29a §②b 8.A argument).
  */
 bool
 cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 current_epoch,
-									 uint64 bound_dead_gen, uint64 current_dead_gen)
+									 const uint8 *bound_others_dead,
+									 const uint8 *current_others_dead, int nbytes)
 {
-	return bound_epoch == current_epoch && bound_dead_gen == current_dead_gen;
+	if (bound_epoch != current_epoch)
+		return false;
+	if (bound_others_dead == NULL || current_others_dead == NULL)
+		return false; /* fail-closed: cannot prove coherence without both views */
+	return memcmp(bound_others_dead, current_others_dead, (size_t)nbytes) == 0;
 }
 
 
