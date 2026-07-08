@@ -34,6 +34,7 @@
 #define CLUSTER_UNDO_ALLOC_H
 
 #include "c.h"
+#include "cluster/cluster_scn.h" /* SCN (cluster_undo_segment_try_mark_recyclable) */
 #include "storage/block.h"
 
 
@@ -78,6 +79,54 @@
 
 
 /*
+ * ClusterUndoPathIntent -- spec-5.22b D2-2 (P1-3 hard contract).
+ *
+ *	Declares, at every undo path-resolve call site, WHICH physical root a
+ *	segment resolves to.  The intent is stated EXPLICITLY by the caller and
+ *	is never inferred from owner==self, because D4 will introduce a
+ *	"foreign + runtime-shared serve" case (a survivor reading a dead owner's
+ *	durable block from shared storage) where owner!=self no longer implies
+ *	"local materialized copy".
+ *
+ *	  CLUSTER_UNDO_PATH_RUNTIME_SHARED
+ *	      The owner's own live runtime undo.  Migrates to the shared
+ *	      cluster_fs root ONLY under peer-mode AND cluster.undo_gcs_coherence
+ *	      (both off => local DataDir, inert).
+ *
+ *	  CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL
+ *	      A dead-origin materialized copy that recovery rebuilt in the local
+ *	      DataDir (cluster_tt_durable.c by-xid resolve of a foreign origin,
+ *	      merged recovery, remote-xact outcome store).  ALWAYS resolves to
+ *	      the local DataDir, in any mode -- D2 must never redirect these
+ *	      reads, else dead-origin recovery / CR regress (spec-5.22b §3.6, R1).
+ */
+typedef enum ClusterUndoPathIntent {
+	CLUSTER_UNDO_PATH_RUNTIME_SHARED,	 /* own live undo; shared under peer-mode+coherence */
+	CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL /* dead-origin materialized copy; always local */
+} ClusterUndoPathIntent;
+
+/* cluster_node_id owns the +1 sentinel offset: owner_instance == node_id + 1. */
+extern int cluster_node_id; /* cluster_guc.c */
+
+/*
+ * cluster_undo_intent_for_owner -- per-call intent derivation (D2-2, B).
+ *
+ *	The single derivation every undo smgr / path call site consults: this
+ *	node's own undo (owner_instance == cluster_node_id + 1) is
+ *	RUNTIME_SHARED; a foreign owner -- in D2 always a dead-origin materialized
+ *	copy that recovery rebuilt in the local DataDir -- is MATERIALIZED_LOCAL.
+ *	Inline (mirrors cluster_mode.h's node-id gates) so the ~30 call sites take
+ *	no link dependency on the GCS routing object.
+ */
+static inline ClusterUndoPathIntent
+cluster_undo_intent_for_owner(uint8 owner_instance)
+{
+	return (owner_instance == (uint8)(cluster_node_id + 1)) ? CLUSTER_UNDO_PATH_RUNTIME_SHARED
+															: CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL;
+}
+
+
+/*
  * cluster_undo_path_resolve
  *	  Build the segment file path:
  *	    $PGDATA/pg_undo/instance_<N>/seg_<segment_id>.dat
@@ -86,10 +135,19 @@
  *	    <N> in [0, 255] (uint8 max)
  *	    <segment_id> in [0, 4294967295] (uint32 max)
  *
- *	  Returns 0 on success, -1 on buffer overflow.  Caller supplies a
- *	  buf with capacity >= MAXPGPATH.
+ *	  spec-5.22b D2-2: takes an explicit ClusterUndoPathIntent.  A
+ *	  RUNTIME_SHARED own-instance segment resolves under the shared cluster_fs
+ *	  root when peer-mode + cluster.undo_gcs_coherence are on; MATERIALIZED_LOCAL
+ *	  (and every non-coherent mode) resolves under the local DataDir.  Callers
+ *	  pass cluster_undo_intent_for_owner(owner) unless they have a stronger
+ *	  reason to name a literal intent.
+ *
+ *	  Returns 0 on success, -1 on buffer overflow (or an unset shared root on
+ *	  the shared branch -- fail-closed).  Caller supplies a buf with capacity
+ *	  >= MAXPGPATH.
  */
-extern int cluster_undo_path_resolve(uint8 instance, uint32 segment_id, char *buf, size_t buf_size);
+extern int cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 instance,
+									 uint32 segment_id, char *buf, size_t buf_size);
 
 
 /*

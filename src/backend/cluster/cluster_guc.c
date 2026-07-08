@@ -119,6 +119,11 @@ bool cluster_past_image = false;
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * resolution via undo-block CF fetch (default OFF = 53R97). */
 bool cluster_crossnode_runtime_visibility = false;
+/* spec-5.22b D2-2: shared-undo GCS coherence master switch (default OFF =
+ * undo stays on the local DataDir, inert -- 6.12i unmastered fetch path; ON =
+ * own-instance runtime AND redo undo migrate to the shared cluster_fs root
+ * under owner-as-master GCS grant/PI).  PGC_SIGHUP. */
+bool cluster_undo_gcs_coherence = false;
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * OFF = vanilla dense per-node xid allocation). */
 bool cluster_xid_striping = false;
@@ -985,6 +990,31 @@ check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * check_cluster_undo_gcs_coherence -- GUC check_hook for
+ *	cluster.undo_gcs_coherence (spec-5.22b D2-2).
+ *
+ *	Turning the shared-undo data plane ON physically migrates own-instance
+ *	runtime + redo undo onto the shared cluster_fs root, so it REQUIRES
+ *	cluster.shared_data_dir to name that root.  Reject the ON transition when
+ *	the root is unset: a clear config-time error beats a runtime read that has
+ *	to fail closed with a generic SQLSTATE.  (The runtime path additionally
+ *	fails closed -- an unresolvable shared path yields the 53R97 visibility
+ *	fail-close, never a bogus local fallback -- so this hook is operability,
+ *	not the correctness backstop.)
+ */
+static bool
+check_cluster_undo_gcs_coherence(bool *newval, void **extra, GucSource source)
+{
+	if (*newval && (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')) {
+		GUC_check_errdetail(
+			"cluster.undo_gcs_coherence requires cluster.shared_data_dir to name the shared "
+			"cluster_fs mount (the same root used by shared_catalog and the recovery anchor).");
+		return false;
+	}
+	return true;
+}
+
 static bool
 check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 {
@@ -1587,6 +1617,28 @@ cluster_init_guc(void)
 		gettext_noop("Off keeps active-runtime recycled-slot resolution fail-closed "
 					 "(SQLSTATE 53R97)."),
 		&cluster_crossnode_runtime_visibility, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.undo_gcs_coherence -- spec-5.22b D2 master switch for the
+	 * shared-undo block data plane.  OFF (default): undo segments stay on the
+	 * local DataDir and cross-instance undo reads take the 6.12i unmastered
+	 * fetch path (fresh ref => 53R97) -- byte-identical to pre-D2, a safe
+	 * rollback surface.  ON: own-instance runtime AND redo undo writes migrate
+	 * to the shared cluster_fs root (cluster.shared_data_dir), and undo blocks
+	 * become owner-as-master GCS resources (grant / PI land in D2-3/D2-4).
+	 * Gating physical migration on this switch (not merely peer-mode) keeps
+	 * runtime and redo writes consistent -- both move only when it is on, so a
+	 * default deployment never splits runtime-shared vs redo-local
+	 * (Hardening v1.0.1 裁决 A).  PGC_SIGHUP: flippable for the D6 end-to-end
+	 * validation window; a default-ON flip is a separate decision after D3-D6.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.undo_gcs_coherence",
+		gettext_noop("Enable the shared-undo block GCS data plane (spec-5.22b)."),
+		gettext_noop("Off keeps undo on the local data dir and cross-instance undo "
+					 "fail-closed (SQLSTATE 53R97).  Requires cluster.shared_data_dir when on."),
+		&cluster_undo_gcs_coherence, false, PGC_SIGHUP, 0, check_cluster_undo_gcs_coherence, NULL,
+		NULL);
 
 	/*
 	 * cluster.xid_striping -- spec-6.15 D1 (AD-012 exception 10 xid

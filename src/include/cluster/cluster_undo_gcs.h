@@ -41,7 +41,8 @@
 #ifndef CLUSTER_UNDO_GCS_H
 #define CLUSTER_UNDO_GCS_H
 
-#include "cluster/cluster_grd.h" /* ClusterResId */
+#include "cluster/cluster_grd.h"				/* ClusterResId */
+#include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent */
 
 /*
  * cluster_undo_block_lookup_master -- owner-as-master routing entry.
@@ -65,5 +66,30 @@ extern int32 cluster_undo_block_lookup_master(const ClusterResId *undo_resid);
  *	(D2-3), not here.
  */
 extern bool cluster_undo_block_master_is_self(const ClusterResId *undo_resid);
+
+/*
+ * cluster_undo_path_uses_shared_root -- pure physical-root decision (D2-2).
+ *
+ *	Returns true iff an undo segment with the given path intent resolves to
+ *	the shared cluster_fs root (cluster.shared_data_dir) rather than the
+ *	local DataDir.  Pure: takes the mode inputs explicitly (no globals), so
+ *	cluster_unit drives every mode combination standalone.
+ *
+ *	  RUNTIME_SHARED     -> shared iff (peer_mode && coherence_on)
+ *	  MATERIALIZED_LOCAL -> always local (P1-3 hard contract, spec-5.22b §3.6)
+ *
+ *	cluster_undo_path_resolve (cluster_undo_alloc.c) and the redo write
+ *	surface (cluster_undo_xlog.c) read the live peer_mode / coherence globals
+ *	and delegate the decision here so the two path builders never diverge
+ *	(own-instance undo split-brain, Hardening v1.0.1 裁决 A).
+ */
+extern bool cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode,
+											   bool coherence_on);
+
+/*
+ * cluster_undo_intent_for_owner (the per-call intent derivation every undo
+ * smgr / path call site uses) is a static inline in cluster_undo_alloc.h so
+ * the ~30 call sites take no link dependency on this routing object.
+ */
 
 #endif /* CLUSTER_UNDO_GCS_H */

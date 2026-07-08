@@ -760,7 +760,8 @@ cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance,
 	if (UndoRecordShared == NULL || seg == 0)
 		return;
 
-	if (!cluster_undo_smgr_read_block(seg, owner_instance, 0, blockbuf.data))
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance), seg,
+									  owner_instance, 0, blockbuf.data))
 		return; /* read fail -> retain (best-effort) */
 	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, seg, owner_instance))
 		return; /* L212: identity, not template bytes -> retain */
@@ -801,7 +802,8 @@ cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance,
 	}
 
 	if (dirty)
-		(void)cluster_undo_smgr_write_block(seg, owner_instance, 0, blockbuf.data, true);
+		(void)cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance), seg,
+											owner_instance, 0, blockbuf.data, true);
 }
 
 uint64
@@ -864,7 +866,8 @@ read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *
 	 */
 	img = cluster_undo_buf_pin(segment_id, owner_instance, block_no, CLUSTER_UNDO_BUF_SHARED, &pin);
 	if (img == NULL)
-		return cluster_undo_smgr_read_block(segment_id, owner_instance, block_no, buf);
+		return cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance),
+											segment_id, owner_instance, block_no, buf);
 	memcpy(buf, img, BLCKSZ);
 	cluster_undo_buf_unpin(&pin);
 	return true;
@@ -893,7 +896,8 @@ write_undo_block_ext(uint32 segment_id, uint8 owner_instance, uint32 block_no, c
 	 * do_fsync request goes straight to the direct smgr write.
 	 */
 	if (do_fsync)
-		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, true);
+		return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance),
+											 segment_id, owner_instance, block_no, buf, true);
 
 	/*
 	 * Write-through the pool for DATA blocks:  update the cached image and
@@ -911,7 +915,8 @@ write_undo_block_ext(uint32 segment_id, uint8 owner_instance, uint32 block_no, c
 		 */
 		if (keep_clean)
 			return false;
-		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, false);
+		return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance),
+											 segment_id, owner_instance, block_no, buf, false);
 	}
 
 	/*

@@ -68,3 +68,36 @@ cluster_undo_block_master_is_self(const ClusterResId *undo_resid)
 
 	return cluster_undo_resid_master(undo_resid) == cluster_node_id;
 }
+
+/*
+ * cluster_undo_path_uses_shared_root -- pure physical-root decision (D2-2).
+ *
+ *	The single source of truth that both undo path builders consult:
+ *	cluster_undo_path_resolve (runtime segment I/O) and the redo write
+ *	surface in cluster_undo_xlog.c.  Keeping the decision here (not
+ *	duplicated in each builder) is what prevents own-instance undo
+ *	split-brain -- runtime reading the shared copy while redo stamps the
+ *	local copy (Hardening v1.0.1 裁决 A).
+ */
+bool
+cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode, bool coherence_on)
+{
+	/*
+	 * P1-3 hard contract: a dead-origin materialized copy (recovery rebuilt
+	 * it in the local DataDir) NEVER migrates to the shared root, in any
+	 * mode.  Redirecting it would send dead-origin resolve / CR reads to an
+	 * empty shared path (spec-5.22b §3.6, R1).
+	 */
+	if (intent == CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL)
+		return false;
+
+	Assert(intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED);
+
+	/*
+	 * Own live runtime undo migrates to the shared cluster_fs root only when
+	 * the whole physical migration is armed: a declared multi-node
+	 * deployment (peer_mode) AND cluster.undo_gcs_coherence on.  Either off
+	 * => local DataDir, so D2 lands inert at the default (裁决 A).
+	 */
+	return peer_mode && coherence_on;
+}

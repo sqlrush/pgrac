@@ -46,19 +46,30 @@
 #include "postgres.h"
 #include "storage/block.h"
 
+#include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent (D2-2) */
+
+
+/*
+ * spec-5.22b D2-2: the block / header I/O entries take an explicit
+ * ClusterUndoPathIntent so the shared-vs-local physical root is chosen per
+ * call (RUNTIME_SHARED own undo -> shared cluster_fs root under coherence;
+ * MATERIALIZED_LOCAL foreign dead-origin copy -> local DataDir).  Callers
+ * pass cluster_undo_intent_for_owner(owner_instance).
+ */
 
 /*
  * cluster_undo_smgr_read_block -- read one 8KB block from undo segment file.
  *
  *	Args:
+ *	  intent                      -- shared-vs-local root selector (D2-2)
  *	  segment_id, owner_instance -- per-instance segment identity
  *	  block_no                    -- 0..UNDO_BLOCKS_PER_SEGMENT-1
  *	  buf                         -- caller-provided 8KB buffer (BLCKSZ)
  *
  *	Returns: true on success, false on I/O error or short read.
  */
-extern bool cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
-										 char *buf);
+extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id,
+										 uint8 owner_instance, uint32 block_no, char *buf);
 
 
 /*
@@ -74,8 +85,9 @@ extern bool cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance
  *
  *	NOT critical-section safe.
  */
-extern bool cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
-										  const char *buf, bool do_fsync);
+extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id,
+										  uint8 owner_instance, uint32 block_no, const char *buf,
+										  bool do_fsync);
 
 
 /*
@@ -89,10 +101,12 @@ extern bool cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instanc
  *	Returns true on success, false on bad args / I/O error / short transfer.
  *	NOT critical-section safe.
  */
-extern bool cluster_undo_smgr_read_header_bytes(uint32 segment_id, uint8 owner_instance,
-												uint32 offset, char *buf, uint32 len);
-extern bool cluster_undo_smgr_write_header_bytes(uint32 segment_id, uint8 owner_instance,
-												 uint32 offset, const char *buf, uint32 len);
+extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
+												uint8 owner_instance, uint32 offset, char *buf,
+												uint32 len);
+extern bool cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
+												 uint8 owner_instance, uint32 offset,
+												 const char *buf, uint32 len);
 
 
 /*

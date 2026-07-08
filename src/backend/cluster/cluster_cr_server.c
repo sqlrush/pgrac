@@ -335,7 +335,8 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 
 	/* Serve only SELF-owned undo: the owner derives from this node's own
 	 * id, never from the wire (a forged request cannot redirect the read). */
-	return cluster_undo_smgr_read_block(slot->undo_segment_id, (uint8)(cluster_node_id + 1),
+	return cluster_undo_smgr_read_block(cluster_undo_intent_for_owner((uint8)(cluster_node_id + 1)),
+										slot->undo_segment_id, (uint8)(cluster_node_id + 1),
 										slot->undo_block_no, slot->result_page);
 }
 

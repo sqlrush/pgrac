@@ -488,7 +488,8 @@ flush_dirty_slot(int slotno)
 	 * XLogFlush above is attributed to its own WAL wait event.
 	 */
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH);
-	if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data, /* do_fsync = */ true)) {
+	if (!cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner), seg, owner, blk,
+									   localbuf.data, /* do_fsync = */ true)) {
 		pgstat_report_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						errmsg("cluster undo buffer write-back flush failed "
@@ -681,7 +682,8 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 			LWLockRelease(&UndoBufPool->map_lock);
 
 			/* Disk read OUTSIDE the map_lock. */
-			if (!cluster_undo_smgr_read_block(segment_id, owner, block_no, SLOT_DATA(slotno))) {
+			if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id,
+											  owner, block_no, SLOT_DATA(slotno))) {
 				/* Fill failed — release reservation + report. */
 				LWLockRelease(&s->content_lock);
 				LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
@@ -732,8 +734,9 @@ cluster_undo_buf_mark_dirty(const ClusterUndoBufPin *pin, XLogRecPtr wal_lsn)
 		 * The block is NOT left buffered-dirty, so durability is identical to
 		 * today's per-block direct write.
 		 */
-		if (!cluster_undo_smgr_write_block(s->segment_id, s->owner, s->block_no,
-										   SLOT_DATA(pin->slot), /* do_fsync = */ false))
+		if (!cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(s->owner), s->segment_id,
+										   s->owner, s->block_no, SLOT_DATA(pin->slot),
+										   /* do_fsync = */ false))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 					 errmsg("cluster undo buffer write-through failed seg=%u owner=%u block=%u",

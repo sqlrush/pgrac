@@ -199,6 +199,11 @@ extern bool cluster_past_image;
  * (undo-block CF fetch + live authority gate; default off = 53R97). */
 extern bool cluster_crossnode_runtime_visibility;
 
+/* spec-5.22b D2-2: shared-undo GCS coherence master switch (default off =
+ * undo stays on the local DataDir; on = own-instance runtime + redo undo
+ * migrate to the shared cluster_fs root under owner-as-master GCS). */
+extern bool cluster_undo_gcs_coherence;
+
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * off = vanilla dense per-node xid allocation). */
 extern bool cluster_xid_striping;

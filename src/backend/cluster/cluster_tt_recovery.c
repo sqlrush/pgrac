@@ -157,7 +157,8 @@ cluster_tt_recovery_resolve_active_slots(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
+		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
+										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip (never false-abort) */
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
@@ -235,7 +236,8 @@ cluster_tt_recovery_observe_scn_highwater(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
+		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
+										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip */
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
@@ -483,7 +485,8 @@ cluster_tt_recovery_physical_rollback(void)
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
+		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
+										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip */
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;

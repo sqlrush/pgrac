@@ -193,7 +193,8 @@ cluster_undo_cleaner_scan_wait_end(void)
 {}
 
 bool
-cluster_undo_smgr_read_header_bytes(uint32 segment_id pg_attribute_unused(),
+cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent pg_attribute_unused(),
+									uint32 segment_id pg_attribute_unused(),
 									uint8 owner_instance pg_attribute_unused(), uint32 offset,
 									char *buf, uint32 len)
 {
@@ -212,7 +213,8 @@ static int g_write_hdr_calls = 0;  /* spec-3.13 D2-B scan-only invariant probe *
 static TTSlot g_last_written_slot; /* spec-3.15: capture write payload */
 
 bool
-cluster_undo_smgr_write_header_bytes(uint32 segment_id pg_attribute_unused(),
+cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_unused(),
+									 uint32 segment_id pg_attribute_unused(),
 									 uint8 owner_instance pg_attribute_unused(),
 									 uint32 offset pg_attribute_unused(), const char *buf,
 									 uint32 len)
@@ -224,8 +226,8 @@ cluster_undo_smgr_write_header_bytes(uint32 segment_id pg_attribute_unused(),
 }
 
 bool
-cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance pg_attribute_unused(),
-							 uint32 block_no, char *buf)
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
+							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	if (buf == NULL || block_no != 0 || segment_id != g_canned_block_segment)
 		return false; /* other segments "don't exist" -> by-xid skips them */
