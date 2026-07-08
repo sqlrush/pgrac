@@ -232,6 +232,11 @@ $node0->stop;
 
 my $node1 = PostgreSQL::Test::Cluster->new('sxid_node1');
 cold_clone_data_dir($node0, $node1);
+# F3: real scram TCP login leg needs a host auth line AND a TCP listener on
+# the joiner (test nodes default to unix sockets only).
+PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pg_hba.conf',
+	"host all sxid_login 127.0.0.1/32 scram-sha-256\n");
+$node1->append_conf('postgresql.conf', "listen_addresses = '127.0.0.1'\n");
 
 append_common_shared_catalog_conf($node0, $shared_root);
 $node0->append_conf('postgresql.conf', <<EOC);
@@ -310,6 +315,12 @@ wait_sql_eq($node1,
 wait_sql_eq($node1,
 	q{SET ROLE sxid_login; SELECT current_user},
 	'sxid_login', 'G4: node1 can resolve and SET ROLE to the seed role');
+# F3: the seed role's scram password must survive adoption -- a real TCP
+# login exercises rolpassword visibility at connection time.
+$node1->connect_ok(
+	'host=127.0.0.1 port=' . $node1->port
+	  . ' user=sxid_login password=sxidpass dbname=postgres',
+	'G4: seed role logs in over scram TCP on node1');
 
 wait_sql_eq($node1, "SELECT txid_status($seed_schema_xid)", 'committed',
 	'G5: node1 txid_status sees the native-era committed schema xid');
@@ -319,6 +330,15 @@ wait_sql_eq($node1, "SELECT txid_status($abort_xid)", 'aborted',
 	'G5: node1 txid_status sees the native-era aborted xid');
 is($node0->safe_psql('postgres', "SELECT txid_status($abort_xid)"),
 	'aborted', 'G5: node0 still sees the aborted xid after node1 reads');
+# F4: the poison-stamp proof must re-read the shared HEAP rows on node0 --
+# a wrong HEAP_XMIN_INVALID hint written by node1 lives in the shared
+# catalog block, not in node0's CLOG.
+is($node0->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_namespace WHERE nspname = 'sxid'}),
+	'1', 'G5: node0 still sees the seed schema row after node1 scans (no poison stamp)');
+is($node0->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_authid WHERE rolname = 'sxid_login'}),
+	'1', 'G5: node0 still sees the seed role row after node1 scans (no poison stamp)');
 
 my $state_hw = $node1->safe_psql('postgres', q{
 SELECT value FROM pg_cluster_state
@@ -359,12 +379,20 @@ like(PostgreSQL::Test::Utils::slurp_file($node0->logfile),
 
 corrupt_file("$shared_root/global/pgrac_xid_authority");
 corrupt_file("$shared_root/global/pgrac_xid_authority.bak");
-$node1->append_conf('postgresql.conf', "# t/361 force new logfile generation after corrupt authority\n");
+# F9: pin the 53RB5 SQLSTATE contract on one leg (startup FATALs surface in
+# the server log only, so %e in log_line_prefix carries the SQLSTATE; the
+# other negative legs deliberately match message text).
+# %e must precede %q: the refusal FATAL comes from the postmaster (a
+# non-session process), and %q stops expansion there.
+$node1->append_conf('postgresql.conf',
+	"log_line_prefix = '%m [%p] %e %q%a '\n");
 my $corrupt_failed = !$node1->start(fail_ok => 1);
 ok($corrupt_failed, 'N2: corrupt shared XID authority fails closed');
 like(PostgreSQL::Test::Utils::slurp_file($node1->logfile),
 	qr/shared XID authority is unavailable|present but corrupt|cluster_xid_authority_unavailable/,
 	'N2: startup log names corrupt/unavailable XID authority');
+like(PostgreSQL::Test::Utils::slurp_file($node1->logfile),
+	qr/53RB5/, 'N2: the refusal carries SQLSTATE 53RB5');
 
 # -------------------------------------------------------------------------
 # Unsealed authority negative: seed startup wrote the authority, but the seed
@@ -464,6 +492,85 @@ EOC
 	like(PostgreSQL::Test::Utils::slurp_file($m1->logfile),
 		qr/shared XID authority is not sealed|shared XID authority is unavailable/,
 		'N4: startup log fails closed on the unsealed authority');
+}
+
+# -------------------------------------------------------------------------
+# Divergent-lineage negative (review F2 / spec Q6 amendment): a same-sysid
+# clone that ran STANDALONE after cloning holds its own outcomes in the
+# native xid range; neither skipping nor adopting is sound -> FATAL 53RB5.
+# -------------------------------------------------------------------------
+{
+	my $d_shared = make_shared_root();
+	my $d_disks = make_voting_disks();
+	my $d_ic0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $d_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $d0 = PostgreSQL::Test::Cluster->new('sxid_diverge_node0');
+	my $d1 = PostgreSQL::Test::Cluster->new('sxid_diverge_node1');
+
+	$d0->init(allows_streaming => 1);
+	$d0->start;
+	$d0->safe_psql('postgres', 'CHECKPOINT');
+	$d0->stop;
+	cold_clone_data_dir($d0, $d1);
+
+	# d1 diverges: a plain standalone run committing 30 transactions writes
+	# d1's own outcomes into the xid range the seed is about to consume.
+	$d1->start;
+	$d1->safe_psql('postgres',
+		join('', map { "BEGIN; CREATE TABLE d_t$_ (i int); COMMIT;\n" } 1 .. 30));
+	$d1->stop;
+
+	# d0 seeds: one aborted xid guarantees a byte-level contradiction with
+	# d1's straight-committed overlap.
+	append_common_shared_catalog_conf($d0, $d_shared);
+	$d0->append_conf('postgresql.conf', <<EOC);
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+EOC
+	$d0->start;
+	$d0->safe_psql('postgres', q{
+BEGIN;
+CREATE SCHEMA d_abort_shadow;
+ROLLBACK;
+});
+	$d0->safe_psql('postgres', 'CREATE SCHEMA d_seed;');
+	$d0->stop;
+
+	append_common_shared_catalog_conf($d1, $d_shared);
+	append_strict_two_node_conf($d1, $d_disks, undef);
+	$d1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+	append_pgrac_conf($d1, 'sxid_diverge', $d_ic0, $d_ic1);
+
+	my $diverge_failed = !$d1->start(fail_ok => 1);
+	ok($diverge_failed, 'N5: divergent-lineage joiner is refused');
+	like(PostgreSQL::Test::Utils::slurp_file($d1->logfile),
+		qr/divergent native-era lineage/,
+		'N5: startup log names the divergent lineage');
+}
+
+# -------------------------------------------------------------------------
+# L9 dormant leg: with cluster.shared_catalog=off nothing of the XID
+# authority machinery may touch the shared tree.
+# -------------------------------------------------------------------------
+{
+	my $o_shared = make_shared_root();
+	my $o0 = PostgreSQL::Test::Cluster->new('sxid_off_node0');
+
+	$o0->init(allows_streaming => 1);
+	$o0->append_conf('postgresql.conf', <<EOC);
+cluster.shared_storage_backend = cluster_fs
+cluster.shared_data_dir = '$o_shared'
+cluster.enabled = off
+cluster.lms_enabled = off
+EOC
+	$o0->start;
+	$o0->safe_psql('postgres', 'CREATE SCHEMA off_mode_probe;');
+	$o0->stop;
+	ok(!-e "$o_shared/global/pgrac_xid_authority",
+		'L9: shared_catalog=off never creates the XID authority');
+	ok(!-e "$o_shared/global/pgrac_xid_prehistory",
+		'L9: shared_catalog=off never creates the XID prehistory');
 }
 
 done_testing();

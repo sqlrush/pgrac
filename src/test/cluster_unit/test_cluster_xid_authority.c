@@ -495,6 +495,122 @@ UT_TEST(test_prehistory_multi_segment_round_trip)
 	}
 }
 
+UT_TEST(test_unseal_survives_primary_corruption_via_bak)
+{
+	ClusterXidAuthorityHeader got;
+	char path[MAXPGPATH];
+	int fd;
+
+	/* F1: after begin_native_run, NO on-disk copy may still say SEALED --
+	 * a corrupt primary falling back to a stale SEALED .bak would hand a
+	 * joiner the previous pass's high-water (8.A false-invisible). */
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_begin_native_run();
+
+	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_REL_PATH);
+	fd = open(path, O_RDWR, 0600);
+	(void)!write(fd, "garbage!", 8);
+	close(fd);
+
+	if (cluster_xid_authority_read(&got))
+		UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, 0);
+	/* read failing entirely (no trustworthy copy) is also acceptable:
+	 * joiners fail closed on unavailable exactly like on unsealed. */
+}
+
+UT_TEST(test_mark_cluster_era_survives_primary_corruption_via_bak)
+{
+	ClusterXidAuthorityHeader got;
+	char path[MAXPGPATH];
+	int fd;
+
+	/* F1 variant: after mark_cluster_era, no on-disk copy may lack the
+	 * one-way CLUSTER_ERA flag -- a stale .bak without it would let an
+	 * enabled=off boot re-enter the native era on a formed tree. */
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+
+	snprintf(path, sizeof(path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_REL_PATH);
+	fd = open(path, O_RDWR, 0600);
+	(void)!write(fd, "garbage!", 8);
+	close(fd);
+
+	if (cluster_xid_authority_read(&got))
+		UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA,
+					 CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
+}
+
+UT_TEST(test_prefix_check_divergence_truth_table)
+{
+	const uint64 xids_per_page = (uint64)BLCKSZ * 4;
+	char pgdata_seed[MAXPGPATH];
+	char pgdata_join[MAXPGPATH];
+	char seg[MAXPGPATH];
+	int fd;
+
+	/* F2: identical prefix -> CONSISTENT (both trees one page of 0xAA) */
+	unlink_files();
+	make_fake_pgdata(pgdata_seed, sizeof(pgdata_seed), "f2seed", 1, 0xAA);
+	make_fake_pgdata(pgdata_join, sizeof(pgdata_join), "f2join", 1, 0xAA);
+	cluster_xid_prehistory_publish(pgdata_seed, 816);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+				 CLUSTER_XID_PREFIX_CONSISTENT);
+
+	/* flip one status byte INSIDE the limit -> DIVERGED */
+	snprintf(seg, sizeof(seg), "%s/pg_xact/0000", pgdata_join);
+	fd = open(seg, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(lseek(fd, 100, SEEK_SET), 100); /* byte 100 = xids 400..403 */
+	(void)!write(fd, "X", 1);
+	close(fd);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+				 CLUSTER_XID_PREFIX_DIVERGED);
+
+	/* the same flipped byte OUTSIDE the limit -> CONSISTENT (adopt arm:
+	 * bytes at/after own_next belong to the seed alone) */
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 400),
+				 CLUSTER_XID_PREFIX_CONSISTENT);
+
+	/* partial-byte boundary: xid 400's 2-bit slot enters scope at limit 401 */
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 401),
+				 CLUSTER_XID_PREFIX_DIVERGED);
+
+	/* missing local pg_xact segment -> comparable prefix is empty ->
+	 * CONSISTENT (a shorter clone has no bits to contradict) */
+	unlink(seg);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+				 CLUSTER_XID_PREFIX_CONSISTENT);
+
+	/* no trustworthy blob -> UNAVAILABLE */
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+				 CLUSTER_XID_PREFIX_UNAVAILABLE);
+
+	/* multi-segment divergence: 33-page trees, flip a byte in segment 0001 */
+	{
+		const int n_pages = 33;
+		const uint64 hw = (uint64)n_pages * xids_per_page;
+
+		unlink_files();
+		make_fake_pgdata_multiseg(pgdata_seed, sizeof(pgdata_seed), "f2seedms", n_pages);
+		make_fake_pgdata_multiseg(pgdata_join, sizeof(pgdata_join), "f2joinms", n_pages);
+		cluster_xid_prehistory_publish(pgdata_seed, hw);
+		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw),
+					 CLUSTER_XID_PREFIX_CONSISTENT);
+		snprintf(seg, sizeof(seg), "%s/pg_xact/0001", pgdata_join);
+		fd = open(seg, O_RDWR, 0600);
+		UT_ASSERT(fd >= 0);
+		(void)!write(fd, "Z", 1);
+		close(fd);
+		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw),
+					 CLUSTER_XID_PREFIX_DIVERGED);
+	}
+}
+
 UT_TEST(test_prehistory_classify_corrupt)
 {
 	char buf[64];
@@ -566,7 +682,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -574,10 +690,13 @@ main(void)
 	UT_RUN(test_publish_monotone_and_seal);
 	UT_RUN(test_mark_cluster_era_one_way);
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
+	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
+	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);
 	UT_RUN(test_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_present_distinguishes_corrupt_from_absent);
 	UT_RUN(test_prehistory_publish_adopt_round_trip);
 	UT_RUN(test_prehistory_multi_segment_round_trip);
+	UT_RUN(test_prefix_check_divergence_truth_table);
 	UT_RUN(test_prehistory_classify_corrupt);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

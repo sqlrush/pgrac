@@ -816,9 +816,9 @@ Provisioning sequence:
    native-era stop; joiners refuse an unsealed authority with SQLSTATE
    `53RB5`.
 4. Start all nodes with `cluster.enabled = on`, `cluster.online_join = on`,
-   and `cluster.xid_striping = on`.  Joiners adopt the prehistory before
-   WAL startup seeds `nextXid`, so seed tuples and roles are judged from
-   first-hand pg_xact truth rather than hint bits.
+   and `cluster.xid_striping = on`.  Joiners adopt the seed's transaction
+   history at startup, so seed tables, roles, and data are visible on
+   every node.
 
 Do not delete or re-create the authority files to recover a failed join.
 A missing, unsealed, or corrupt authority/prehistory is intentionally

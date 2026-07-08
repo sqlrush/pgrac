@@ -451,3 +451,123 @@ cluster_xid_prehistory_was_adopted(void)
 {
 	return prehistory_adopted_this_boot;
 }
+
+/* ============================================================
+ * Divergent-lineage guard (review F2; spec Q6 amendment).
+ * ============================================================ */
+
+/*
+ * read_local_clog_page_optional -- read local pg_xact page `pageno` into
+ * buf.  Returns false when the segment file or the page does not exist
+ * (short clone: the comparable prefix ends there); PANICs on a real read
+ * error so an I/O fault is never mistaken for a short prefix.
+ */
+static bool
+read_local_clog_page_optional(const char *local_pgdata, uint32 pageno, char *buf)
+{
+	char seg[MAXPGPATH];
+	off_t offset;
+	int fd;
+	int r;
+
+	snprintf(seg, sizeof(seg), "%s/pg_xact/%04X", local_pgdata,
+			 pageno / PREHISTORY_PAGES_PER_SEGMENT);
+	offset = (off_t)(pageno % PREHISTORY_PAGES_PER_SEGMENT) * BLCKSZ;
+
+	fd = OpenTransientFile(seg, O_RDONLY | PG_BINARY);
+	if (fd < 0) {
+		if (errno == ENOENT)
+			return false;
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", seg)));
+	}
+	if (lseek(fd, offset, SEEK_SET) != offset) {
+		CloseTransientFile(fd);
+		return false;
+	}
+	errno = 0;
+	r = read(fd, buf, BLCKSZ);
+	CloseTransientFile(fd);
+	if (r < 0)
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not read file \"%s\": %m", seg)));
+	return r == BLCKSZ;
+}
+
+/*
+ * cluster_xid_prehistory_prefix_check -- see header.  Streams the sealed
+ * blob (primary, then .bak) and byte-compares the local pg_xact prefix
+ * covering xids [0, limit_xid_full) at per-xact (2-bit) precision.
+ */
+ClusterXidPrefixVerdict
+cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_full,
+									uint64 limit_xid_full)
+{
+	ClusterXidPrehistoryHeader hdr;
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char blob_page[BLCKSZ];
+	char local_page[BLCKSZ];
+	const char *src_path;
+	uint32 pages = 0;
+	uint32 p;
+	uint64 limit;
+	int src;
+
+	if (!build_path(primary, sizeof(primary), CLUSTER_XID_PREHISTORY_REL_PATH)
+		|| !build_path(bak, sizeof(bak), CLUSTER_XID_PREHISTORY_BAK_REL_PATH))
+		return CLUSTER_XID_PREFIX_UNAVAILABLE;
+
+	if (verify_blob(primary, native_hw_full, &pages))
+		src_path = primary;
+	else if (verify_blob(bak, native_hw_full, &pages))
+		src_path = bak;
+	else
+		return CLUSTER_XID_PREFIX_UNAVAILABLE;
+
+	limit = Min(limit_xid_full, native_hw_full);
+	if (limit == 0)
+		return CLUSTER_XID_PREFIX_CONSISTENT;
+
+	src = OpenTransientFile(src_path, O_RDONLY | PG_BINARY);
+	if (src < 0 || read(src, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+		if (src >= 0)
+			CloseTransientFile(src);
+		return CLUSTER_XID_PREFIX_UNAVAILABLE;
+	}
+
+	for (p = 0; p < pages; p++) {
+		uint64 page_first_xid = (uint64)p * PREHISTORY_XACTS_PER_PAGE;
+		uint64 in_scope;
+		uint32 full_bytes;
+		uint32 partial_bits;
+
+		if (read(src, blob_page, BLCKSZ) != BLCKSZ) {
+			CloseTransientFile(src);
+			return CLUSTER_XID_PREFIX_UNAVAILABLE;
+		}
+		if (page_first_xid >= limit)
+			break; /* comparison scope ended on a page boundary */
+
+		if (!read_local_clog_page_optional(local_pgdata, p, local_page))
+			break; /* short clone: no local bits left to contradict */
+
+		in_scope = Min((uint64)PREHISTORY_XACTS_PER_PAGE, limit - page_first_xid);
+		full_bytes = (uint32)(in_scope / 4);
+		partial_bits = (uint32)(in_scope % 4) * 2;
+
+		if (full_bytes > 0 && memcmp(blob_page, local_page, full_bytes) != 0) {
+			CloseTransientFile(src);
+			return CLUSTER_XID_PREFIX_DIVERGED;
+		}
+		if (partial_bits > 0) {
+			unsigned char mask = (unsigned char)((1 << partial_bits) - 1);
+
+			if (((unsigned char)blob_page[full_bytes] & mask)
+				!= ((unsigned char)local_page[full_bytes] & mask)) {
+				CloseTransientFile(src);
+				return CLUSTER_XID_PREFIX_DIVERGED;
+			}
+		}
+	}
+	CloseTransientFile(src);
+	return CLUSTER_XID_PREFIX_CONSISTENT;
+}

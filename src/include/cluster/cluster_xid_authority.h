@@ -81,6 +81,19 @@ typedef struct ClusterXidAuthorityHeader {
 	pg_crc32c crc;		   /* over all preceding bytes */
 } ClusterXidAuthorityHeader;
 
+/* On-disk ABI locked at compile time (review F7; mirrors the recovery
+ * anchor's precedent).  The unit truth table re-checks these at runtime. */
+StaticAssertDecl(offsetof(ClusterXidAuthorityHeader, flags) == 8,
+				 "xid authority header layout is on-disk ABI");
+StaticAssertDecl(offsetof(ClusterXidAuthorityHeader, native_hw_full) == 16,
+				 "xid authority header layout is on-disk ABI");
+StaticAssertDecl(offsetof(ClusterXidAuthorityHeader, next_multi) == 24,
+				 "xid authority header layout is on-disk ABI");
+StaticAssertDecl(offsetof(ClusterXidAuthorityHeader, crc) == 32,
+				 "xid authority header layout is on-disk ABI");
+StaticAssertDecl(sizeof(ClusterXidAuthorityHeader) == 40,
+				 "xid authority header size is on-disk ABI");
+
 /* Relative paths under cluster.shared_data_dir. */
 #define CLUSTER_XID_AUTHORITY_REL_PATH "global/pgrac_xid_authority"
 #define CLUSTER_XID_AUTHORITY_BAK_REL_PATH "global/pgrac_xid_authority.bak"
@@ -117,6 +130,15 @@ typedef struct ClusterXidPrehistoryHeader {
 	pg_crc32c crc;		   /* over header fields above + payload */
 } ClusterXidPrehistoryHeader;
 
+StaticAssertDecl(offsetof(ClusterXidPrehistoryHeader, native_hw_full) == 8,
+				 "xid prehistory header layout is on-disk ABI");
+StaticAssertDecl(offsetof(ClusterXidPrehistoryHeader, payload_len) == 16,
+				 "xid prehistory header layout is on-disk ABI");
+StaticAssertDecl(offsetof(ClusterXidPrehistoryHeader, crc) == 24,
+				 "xid prehistory header layout is on-disk ABI");
+StaticAssertDecl(sizeof(ClusterXidPrehistoryHeader) == 32,
+				 "xid prehistory header size is on-disk ABI");
+
 #define CLUSTER_XID_PREHISTORY_REL_PATH "global/pgrac_xid_prehistory"
 #define CLUSTER_XID_PREHISTORY_BAK_REL_PATH "global/pgrac_xid_prehistory.bak"
 #define CLUSTER_XID_PREHISTORY_TMP_REL_PATH "global/pgrac_xid_prehistory.tmp"
@@ -147,6 +169,9 @@ extern ClusterXidAuthorityValidity cluster_xid_prehistory_classify(const char *b
  * Never ereports (safe on the bootstrap early-read path).
  */
 extern bool cluster_xid_authority_read(ClusterXidAuthorityHeader *out);
+
+/* As read(), reporting .bak fallback for a consumer-side LOG (review F8). */
+extern bool cluster_xid_authority_read_checked(ClusterXidAuthorityHeader *out, bool *used_bak);
 
 /*
  * ENOENT-only-absent presence probe (spec-6.14 §3.6 posture): any stat()
@@ -201,5 +226,28 @@ extern void cluster_xid_prehistory_publish(const char *local_pgdata, uint64 nati
  */
 extern void cluster_xid_prehistory_adopt(const char *local_pgdata, uint64 native_hw_full);
 extern bool cluster_xid_prehistory_was_adopted(void);
+
+/* ============================================================
+ * Divergent-lineage guard (review F2; spec Q6 amendment).
+ * ============================================================ */
+
+typedef enum ClusterXidPrefixVerdict {
+	CLUSTER_XID_PREFIX_CONSISTENT = 0, /* local prefix matches the blob */
+	CLUSTER_XID_PREFIX_DIVERGED,	   /* local pg_xact contradicts the blob */
+	CLUSTER_XID_PREFIX_UNAVAILABLE,	   /* no trustworthy blob to compare */
+} ClusterXidPrefixVerdict;
+
+/*
+ * Compare the local pg_xact bytes covering xids [0, limit_xid_full) with the
+ * sealed prehistory blob at 2-bit (per-xact) precision.  A local segment or
+ * page that does not exist ends the comparable prefix (a shorter clone has
+ * no bits to contradict).  Callers FATAL on DIVERGED/UNAVAILABLE: a joiner
+ * whose own native-era history contradicts the seed's is not a pre-seed
+ * lineage, and neither skipping (trusting local bits) nor adopting
+ * (overwriting the joiner's own outcomes) is sound for it.
+ */
+extern ClusterXidPrefixVerdict cluster_xid_prehistory_prefix_check(const char *local_pgdata,
+																   uint64 native_hw_full,
+																   uint64 limit_xid_full);
 
 #endif /* CLUSTER_XID_AUTHORITY_H */

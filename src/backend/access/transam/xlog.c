@@ -5606,8 +5606,15 @@ StartupXLOG(void)
 	if (cluster_shared_catalog && cluster_enabled)
 	{
 		ClusterXidAuthorityHeader auth;
+		bool		auth_from_bak = false;
+		bool		auth_ok;
 
-		if (!cluster_xid_authority_read(&auth) ||
+		auth_ok = cluster_xid_authority_read_checked(&auth, &auth_from_bak);
+		if (auth_ok && auth_from_bak)
+			elog(LOG, "cluster shared_catalog: XID authority served from .bak fallback; "
+				 "the primary copy failed validation");
+
+		if (!auth_ok ||
 			(auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0)
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 							errmsg("shared XID authority is unavailable during WAL startup"),

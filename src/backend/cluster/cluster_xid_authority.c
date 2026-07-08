@@ -179,9 +179,24 @@ read_image(const char *path, char *image)
 bool
 cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
 {
+	return cluster_xid_authority_read_checked(out, NULL);
+}
+
+/*
+ * cluster_xid_authority_read_checked -- as above, additionally reporting
+ * whether the image came from the .bak fallback so consumers can surface a
+ * LOG-once operator signal (review F8; the read itself stays silent for
+ * the bootstrap early-read path).
+ */
+bool
+cluster_xid_authority_read_checked(ClusterXidAuthorityHeader *out, bool *used_bak)
+{
 	char primary_path[MAXPGPATH];
 	char bak_path[MAXPGPATH];
 	char image[CLUSTER_XID_AUTHORITY_FILE_SIZE];
+
+	if (used_bak != NULL)
+		*used_bak = false;
 
 	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_XID_AUTHORITY_REL_PATH)
 		|| !build_path(bak_path, sizeof(bak_path), CLUSTER_XID_AUTHORITY_BAK_REL_PATH))
@@ -190,6 +205,8 @@ cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
 	if (read_image(primary_path, image) != CLUSTER_XID_AUTHORITY_VALID) {
 		if (read_image(bak_path, image) != CLUSTER_XID_AUTHORITY_VALID)
 			return false; /* fail-closed: neither trustworthy */
+		if (used_bak != NULL)
+			*used_bak = true;
 	}
 
 	memcpy(out, image, sizeof(*out));
@@ -255,6 +272,48 @@ write_header(ClusterXidAuthorityHeader *hdr)
 
 	roll_primary_to_bak(primary, bak, baktmp);
 	write_durable(tmp, primary, buffer);
+}
+
+/*
+ * write_header_both -- CRC-stamp the header and install the SAME image as
+ * both primary and .bak (primary first).  For FLAG transitions (unseal,
+ * CLUSTER_ERA stamp) the usual roll-primary-to-.bak is unsafe: it would
+ * preserve a pre-transition image that the fail-closed read falls back to
+ * when the primary is later damaged -- a stale SEALED .bak hands a joiner
+ * the previous pass's high-water (review F1, 8.A), and a stale
+ * pre-CLUSTER_ERA .bak re-opens the native-era re-entry guard.  Crash
+ * points: both copies old (transition not yet taken: state still
+ * consistent), primary new + .bak old (read prefers the valid primary),
+ * both new.  A later single-copy corruption therefore never resurrects the
+ * pre-transition flags.
+ */
+static void
+write_header_both(ClusterXidAuthorityHeader *hdr)
+{
+	char buffer[CLUSTER_XID_AUTHORITY_FILE_SIZE];
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char baktmp[MAXPGPATH];
+
+	if (!build_path(primary, sizeof(primary), CLUSTER_XID_AUTHORITY_REL_PATH)
+		|| !build_path(bak, sizeof(bak), CLUSTER_XID_AUTHORITY_BAK_REL_PATH)
+		|| !build_path(tmp, sizeof(tmp), CLUSTER_XID_AUTHORITY_TMP_REL_PATH)
+		|| !build_path(baktmp, sizeof(baktmp), CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH))
+		ereport(PANIC, (errmsg("cluster shared_data_dir is not configured")));
+
+	hdr->magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	hdr->version = CLUSTER_XID_AUTHORITY_VERSION;
+	hdr->reserved = 0;
+	INIT_CRC32C(hdr->crc);
+	COMP_CRC32C(hdr->crc, (char *)hdr, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(hdr->crc);
+
+	memset(buffer, 0, sizeof(buffer));
+	memcpy(buffer, hdr, sizeof(*hdr));
+
+	write_durable(tmp, primary, buffer);
+	write_durable(baktmp, bak, buffer);
 }
 
 /*
@@ -336,7 +395,7 @@ cluster_xid_authority_mark_cluster_era(void)
 		return;
 
 	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA;
-	write_header(&hdr);
+	write_header_both(&hdr); /* review F1 variant: one-way flag in BOTH copies */
 }
 
 /*
@@ -377,5 +436,5 @@ cluster_xid_authority_begin_native_run(void)
 		return; /* already open (first run, or a prior pass crashed) */
 
 	hdr.flags &= ~CLUSTER_XID_AUTHORITY_FLAG_SEALED;
-	write_header(&hdr);
+	write_header_both(&hdr); /* review F1: no copy may retain SEALED */
 }

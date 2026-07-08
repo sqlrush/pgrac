@@ -136,7 +136,14 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 	ClusterXidAuthorityHeader auth;
 	bool have_auth;
 
-	have_auth = cluster_xid_authority_read(&auth);
+	{
+		bool auth_from_bak = false;
+
+		have_auth = cluster_xid_authority_read_checked(&auth, &auth_from_bak);
+		if (have_auth && auth_from_bak)
+			elog(LOG, "cluster shared_catalog: XID authority served from .bak fallback; "
+					  "the primary copy failed validation");
+	}
 	if (!have_auth && cluster_xid_authority_present())
 		cluster_catalog_xid_authority_corrupt_fatal(
 			"Neither the primary shared XID authority nor its .bak fallback passes validation.");
@@ -212,6 +219,42 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 					 "Re-provision this node or verify cluster.shared_data_dir before startup.")));
 
 		own_next = U64FromFullTransactionId(ra.checkPointCopy.nextXid);
+
+		/*
+		 * Review F2 (spec Q6 amendment): the sysid gate cannot tell a true
+		 * pre-seed clone from a same-sysid clone that ran STANDALONE after
+		 * cloning -- such a node's pg_xact holds its own outcomes in the
+		 * native range, so skipping would trust divergent local truth and
+		 * adopting would overwrite the node's own outcomes; both are
+		 * silently wrong (8.A).  Byte-compare the comparable prefix
+		 * [0, min(own_next, native_hw)) against the sealed blob and fail
+		 * closed on any contradiction.  Bypass only when the local
+		 * oldestXid has advanced past the native range (frozen+truncated:
+		 * those bits are never consulted again).
+		 */
+		if ((uint64)ra.checkPointCopy.oldestXid <= auth.native_hw_full) {
+			ClusterXidPrefixVerdict pv;
+
+			pv = cluster_xid_prehistory_prefix_check(DataDir, auth.native_hw_full,
+													 Min(own_next, auth.native_hw_full));
+			if (pv == CLUSTER_XID_PREFIX_DIVERGED)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						 errmsg("local pg_xact contradicts the sealed native-era prehistory"),
+						 errdetail("divergent native-era lineage: this node's transaction "
+								   "history overlaps the seed's native xid range with "
+								   "different outcomes."),
+						 errhint("This node is not a pre-seed clone of the shared tree; "
+								 "destroy and re-provision it from the seed lineage.")));
+			if (pv == CLUSTER_XID_PREFIX_UNAVAILABLE)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						 errmsg("shared XID prehistory is unavailable for the lineage check"),
+						 errhint("Restore \"%s\" (or its .bak) from the shared tree's "
+								 "backup.",
+								 CLUSTER_XID_PREHISTORY_REL_PATH)));
+		}
+
 		if (own_next < auth.native_hw_full) {
 			cluster_xid_prehistory_adopt(DataDir, auth.native_hw_full);
 			elog(LOG,
