@@ -34,6 +34,14 @@ UT_DEFINE_GLOBALS();
 static int ut_set_latch_count = 0;
 
 void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+void
 SetLatch(Latch *latch pg_attribute_unused())
 {
 	ut_set_latch_count++;
