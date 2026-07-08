@@ -178,6 +178,7 @@ cluster_postmaster_start_lmon(void)
  * MyLatch + cluster_inject framework.  Stubs cover them all --
  * runtime LmonMain is not exercised. */
 int cluster_lmon_main_loop_interval = 1000;
+int cluster_lmon_slow_iteration_warn_ms = 1000;
 
 #include "cluster/cluster_inject.h"
 int cluster_injection_armed_count = 0;
@@ -590,6 +591,9 @@ pg_usleep(long microsec pg_attribute_unused())
 /* Sprint B: Latch / WaitLatch / ResetLatch stubs (LmonMain runtime
  * is not invoked at unit-test level). */
 struct Latch *MyLatch = NULL;
+void
+SetLatch(struct Latch *latch pg_attribute_unused())
+{}
 int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
@@ -598,6 +602,11 @@ WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute
 }
 void
 ResetLatch(struct Latch *latch pg_attribute_unused())
+{}
+
+#include "storage/ipc.h"
+void
+on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}
 
 /* cluster_lmon.c references MyBackendType (set by LmonMain). */
@@ -804,7 +813,19 @@ UT_TEST(test_lmon_public_symbols_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_shmem_size);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_shmem_init);
 	UT_ASSERT_NOT_NULL((void *)cluster_lmon_shmem_register);
+	UT_ASSERT_NOT_NULL((void *)cluster_lmon_last_iter_us);
+	UT_ASSERT_NOT_NULL((void *)cluster_lmon_max_iter_us);
+	UT_ASSERT_NOT_NULL((void *)cluster_lmon_slow_iter_count);
+	UT_ASSERT_NOT_NULL((void *)cluster_lmon_marker_complete_wakeup);
 	UT_ASSERT_NOT_NULL((void *)LmonMain);
+}
+
+UT_TEST(test_lmon_iteration_counters_null_safe)
+{
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_last_iter_us(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_max_iter_us(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_slow_iter_count(), 0ULL);
+	cluster_lmon_marker_complete_wakeup();
 }
 
 
@@ -815,12 +836,13 @@ UT_TEST(test_lmon_public_symbols_linkable)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
 	UT_RUN(test_lmon_status_unknown_returns_unknown);
 	UT_RUN(test_lmon_public_symbols_linkable);
+	UT_RUN(test_lmon_iteration_counters_null_safe);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

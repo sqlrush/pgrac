@@ -681,6 +681,61 @@ cluster_lmon_main_loop_iters(void)
 	return result;
 }
 
+uint64
+cluster_lmon_last_iter_us(void)
+{
+	uint64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->last_iter_us;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+uint64
+cluster_lmon_max_iter_us(void)
+{
+	uint64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->max_iter_us;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+uint64
+cluster_lmon_slow_iter_count(void)
+{
+	uint64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->slow_iter_count;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+	struct Latch *latch;
+
+	if (cluster_lmon_state == NULL)
+		return;
+
+	latch = cluster_lmon_state->lmon_latch;
+	if (latch != NULL)
+		SetLatch(latch);
+}
+
 
 /* ============================================================
  * LMON main entry (AuxiliaryProcessMain dispatch target).
@@ -720,9 +775,27 @@ lmon_publish_status(ClusterLmonStatus status)
 		cluster_lmon_state->ready_at = 0;
 		cluster_lmon_state->last_liveness_tick_at = 0;
 		cluster_lmon_state->main_loop_iters = 0;
+		cluster_lmon_state->last_iter_us = 0;
+		cluster_lmon_state->max_iter_us = 0;
+		cluster_lmon_state->slow_iter_count = 0;
+		cluster_lmon_state->lmon_latch = NULL;
 	} else if (status == CLUSTER_LMON_READY) {
 		cluster_lmon_state->ready_at = now;
+		cluster_lmon_state->lmon_latch = MyLatch;
+	} else if (status == CLUSTER_LMON_EXITED) {
+		cluster_lmon_state->lmon_latch = NULL;
 	}
+	LWLockRelease(&cluster_lmon_state->lwlock);
+}
+
+static void
+lmon_clear_latch(int code, Datum arg)
+{
+	if (cluster_lmon_state == NULL)
+		return;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
+	cluster_lmon_state->lmon_latch = NULL;
 	LWLockRelease(&cluster_lmon_state->lwlock);
 }
 
@@ -758,6 +831,45 @@ lmon_advance_liveness_tick(void)
 	cluster_lmon_state->last_liveness_tick_at = now;
 	cluster_lmon_state->main_loop_iters++;
 	LWLockRelease(&cluster_lmon_state->lwlock);
+}
+
+static void
+lmon_record_iteration(TimestampTz iter_started_at)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	uint64 elapsed_us;
+	bool slow;
+	bool should_log = false;
+	static TimestampTz last_slow_log_at = 0;
+
+	if (now <= iter_started_at)
+		elapsed_us = 0;
+	else
+		elapsed_us = (uint64)(now - iter_started_at);
+
+	slow = (cluster_lmon_slow_iteration_warn_ms >= 0)
+		   && elapsed_us >= (uint64)cluster_lmon_slow_iteration_warn_ms * 1000ULL;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
+	cluster_lmon_state->last_iter_us = elapsed_us;
+	if (elapsed_us > cluster_lmon_state->max_iter_us)
+		cluster_lmon_state->max_iter_us = elapsed_us;
+	if (slow)
+		cluster_lmon_state->slow_iter_count++;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+
+	if (slow && cluster_lmon_slow_iteration_warn_ms > 0
+		&& (last_slow_log_at == 0
+			|| now - last_slow_log_at >= INT64CONST(60) * INT64CONST(1000000))) {
+		last_slow_log_at = now;
+		should_log = true;
+	}
+
+	if (should_log)
+		ereport(LOG,
+				(errmsg("cluster lmon: main loop iteration took %llu ms (threshold %d ms)",
+						(unsigned long long)(elapsed_us / 1000ULL),
+						cluster_lmon_slow_iteration_warn_ms)));
 }
 
 
@@ -811,6 +923,7 @@ LmonMain(void)
 
 	/* Publish SPAWNING (records pid + spawned_at). */
 	lmon_publish_status(CLUSTER_LMON_SPAWNING);
+	on_shmem_exit(lmon_clear_latch, (Datum)0);
 
 	/* Sprint B inject: ready-publish (test slow startup / phase 1 wait timeout). */
 	CLUSTER_INJECTION_POINT("cluster-lmon-ready-publish");
@@ -938,6 +1051,7 @@ LmonMain(void)
 			int n_events;
 			long wait_ms;
 			TimestampTz now;
+			TimestampTz iter_started_at;
 			int32 i;
 
 			CHECK_FOR_INTERRUPTS();
@@ -950,6 +1064,7 @@ LmonMain(void)
 			if (ShutdownRequestPending || lmon_shutdown_requested())
 				break;
 
+			iter_started_at = GetCurrentTimestamp();
 			lmon_advance_liveness_tick();
 
 			/*
@@ -1414,6 +1529,7 @@ LmonMain(void)
 					wait_ms = 1;
 			}
 
+			lmon_record_iteration(iter_started_at);
 			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
 										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
@@ -1588,6 +1704,7 @@ LmonMain(void)
 		/* Stub / mock / disabled mode -- preserve spec-1.11 simple loop. */
 		for (;;) {
 			int rc;
+			TimestampTz iter_started_at;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -1599,6 +1716,7 @@ LmonMain(void)
 			if (ShutdownRequestPending || lmon_shutdown_requested())
 				break;
 
+			iter_started_at = GetCurrentTimestamp();
 			lmon_advance_liveness_tick();
 
 			/*
@@ -1677,6 +1795,7 @@ LmonMain(void)
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
+			lmon_record_iteration(iter_started_at);
 			rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						   cluster_lmon_main_loop_interval,
 						   WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);

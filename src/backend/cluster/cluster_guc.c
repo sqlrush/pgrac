@@ -307,6 +307,7 @@ int cluster_phase4_timeout = 30;
  * LMON main-loop tick / WaitLatch timeout in milliseconds.
  */
 int cluster_lmon_main_loop_interval = 1000;
+int cluster_lmon_slow_iteration_warn_ms = 1000;
 
 /* spec-1.12 Sprint B D8: cluster.lck_main_loop_interval (mirror). */
 int cluster_lck_main_loop_interval = 1000;
@@ -2572,6 +2573,15 @@ cluster_init_guc(void)
 					 "functionally equivalent."),
 		&cluster_lmon_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.lmon_slow_iteration_warn_ms",
+		gettext_noop("LMON main-loop slow-iteration warning threshold in milliseconds."),
+		gettext_noop("A value greater than zero logs LMON main-loop iterations above this "
+					 "duration; the lmon_slow_iter_count counter is maintained even when "
+					 "logging is disabled with 0."),
+		&cluster_lmon_slow_iteration_warn_ms, 1000, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.lck_main_loop_interval",

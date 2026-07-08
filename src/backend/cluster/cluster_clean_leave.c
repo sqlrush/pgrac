@@ -59,6 +59,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (D12) */
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h" /* PCM release-all-self + no-leftover verify (D5) */
 #include "cluster/cluster_qvotec.h"	  /* cluster_qvotec_in_quorum (request gate) */
 #include "cluster/cluster_reconfig.h" /* apply_clean_leave + record/is_clean_departed + join_in_progress */
@@ -745,6 +746,126 @@ cluster_clean_leave_ic_send_ack(int32 dest_node_id, int32 leaving_node_id, uint6
 /* qvotec-side per-process handshake cursors (mirror the fence-marker ones). */
 static uint64 cl_qvotec_last_processed_marker_seq = 0;
 static uint64 cl_qvotec_inflight_marker_seq = 0;
+static ClusterMarkerAsync cl_lmon_marker_async;
+static ClusterLeaveIntentMarker cl_lmon_marker;
+static int cl_lmon_marker_phase = 0;
+static int32 cl_lmon_marker_leaving = -1;
+static uint64 cl_lmon_marker_epoch = 0;
+static bool cl_lmon_marker_submitted = false;
+
+static void cl_build_marker(ClusterLeaveIntentMarker *m, uint8 marker_phase, int32 leaving,
+							uint64 epoch);
+
+typedef enum ClusterLeaveAsyncMarkerResult {
+	CL_LEAVE_ASYNC_PENDING = 0,
+	CL_LEAVE_ASYNC_ACKED,
+	CL_LEAVE_ASYNC_FAILED
+} ClusterLeaveAsyncMarkerResult;
+
+static ClusterMarkerAsyncKind
+cl_marker_phase_kind(int phase)
+{
+	if (phase == CLUSTER_LEAVE_MARKER_PHASE_COMMITTING)
+		return CLUSTER_MARKER_KIND_CLEAN_LEAVE_COMMITTING;
+	if (phase == CLUSTER_LEAVE_MARKER_PHASE_COMMITTED)
+		return CLUSTER_MARKER_KIND_CLEAN_LEAVE_COMMITTED;
+	return CLUSTER_MARKER_KIND_UNKNOWN;
+}
+
+static void
+cl_release_lmon_marker_stage(void)
+{
+	cluster_marker_async_release_stage(&cl_lmon_marker_async);
+	memset(&cl_lmon_marker, 0, sizeof(cl_lmon_marker));
+	cl_lmon_marker_phase = 0;
+	cl_lmon_marker_leaving = -1;
+	cl_lmon_marker_epoch = 0;
+	cl_lmon_marker_submitted = false;
+}
+
+static bool
+cl_start_lmon_marker_stage(const ClusterLeaveIntentMarker *m, int phase, int32 leaving,
+						   uint64 epoch)
+{
+	if (cl_lmon_marker_async.has_staged_event)
+		return false;
+	cl_lmon_marker = *m;
+	cl_lmon_marker_phase = phase;
+	cl_lmon_marker_leaving = leaving;
+	cl_lmon_marker_epoch = epoch;
+	cl_lmon_marker_async.has_staged_event = true;
+	cl_lmon_marker_submitted = false;
+	return true;
+}
+
+static ClusterLeaveAsyncMarkerResult
+cl_poll_lmon_marker_stage(void)
+{
+	TimestampTz now;
+	uint32 result = CLUSTER_LEAVE_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+	ClusterMarkerAsyncKind kind;
+
+	if (!cl_lmon_marker_async.has_staged_event)
+		return CL_LEAVE_ASYNC_FAILED;
+
+	now = GetCurrentTimestamp();
+	kind = cl_marker_phase_kind(cl_lmon_marker_phase);
+	if (!cl_lmon_marker_submitted) {
+		if (!cluster_clean_leave_submit_marker_async(&cl_lmon_marker_async, &cl_lmon_marker,
+													 kind, cl_lmon_marker_leaving, now))
+			return CL_LEAVE_ASYNC_PENDING;
+		cl_lmon_marker_submitted = true;
+		return CL_LEAVE_ASYNC_PENDING;
+	}
+
+	pr = cluster_clean_leave_poll_marker_async(&cl_lmon_marker_async, now, &result, &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return CL_LEAVE_ASYNC_PENDING;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(kind, cl_lmon_marker_leaving, elapsed_us);
+		cl_release_lmon_marker_stage();
+		return CL_LEAVE_ASYNC_FAILED;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(kind, cl_lmon_marker_leaving, elapsed_us);
+	if (result != CLUSTER_LEAVE_MARKER_SUBMIT_ACK) {
+		cl_release_lmon_marker_stage();
+		return CL_LEAVE_ASYNC_FAILED;
+	}
+	return CL_LEAVE_ASYNC_ACKED;
+}
+
+static void
+cl_drive_committed_marker_stage(int32 leaving, uint64 committed_epoch)
+{
+	ClusterLeaveIntentMarker cm;
+	ClusterLeaveAsyncMarkerResult ar;
+
+	if (cl_lmon_marker_async.has_staged_event) {
+		if (cl_lmon_marker_phase != CLUSTER_LEAVE_MARKER_PHASE_COMMITTED
+			|| cl_lmon_marker_leaving != leaving || cl_lmon_marker_epoch != committed_epoch)
+			return;
+	} else {
+		cl_build_marker(&cm, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, committed_epoch);
+		(void)cl_start_lmon_marker_stage(&cm, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving,
+										 committed_epoch);
+	}
+
+	ar = cl_poll_lmon_marker_stage();
+	if (ar == CL_LEAVE_ASYNC_ACKED) {
+		pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
+		cl_send_committed(leaving, committed_epoch);
+		cl_release_lmon_marker_stage();
+	} else if (ar == CL_LEAVE_ASYNC_FAILED) {
+		ereport(LOG,
+				(errmsg("cluster clean-leave: committed node %d at epoch %llu but the "
+						"COMMITTED marker is not yet majority-durable; retrying each tick "
+						"(leaving node waits)",
+						leaving, (unsigned long long)committed_epoch)));
+	}
+}
 
 ClusterLeaveMarkerSubmitResult
 cluster_clean_leave_submit_marker(const ClusterLeaveIntentMarker *m)
@@ -788,6 +909,38 @@ cluster_clean_leave_submit_marker(const ClusterLeaveIntentMarker *m)
 }
 
 bool
+cluster_clean_leave_submit_marker_async(ClusterMarkerAsync *a, const ClusterLeaveIntentMarker *m,
+										ClusterMarkerAsyncKind kind, int32 target_node,
+										TimestampTz now)
+{
+	int wait_ms;
+
+	if (cl_state == NULL || m == NULL || a == NULL)
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	if (cluster_marker_async_mailbox_busy(&cl_state->marker_request_seq,
+										  &cl_state->marker_completion_seq))
+		return false;
+
+	cl_state->pending_marker = *m;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	return cluster_marker_async_submit(a, &cl_state->marker_request_seq,
+									   &cl_state->marker_completion_seq, cl_state->qvotec_latch,
+									   now, (uint64)wait_ms * 1000ULL, kind, target_node);
+}
+
+ClusterMarkerPollResult
+cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
+									  uint32 *out_result, uint64 *out_elapsed_us)
+{
+	if (cl_state == NULL || a == NULL)
+		return CLUSTER_MARKER_POLL_IDLE;
+	return cluster_marker_async_poll(a, &cl_state->marker_completion_seq, &cl_state->marker_result,
+									 now, out_result, out_elapsed_us);
+}
+
+bool
 cluster_clean_leave_qvotec_poll_pending(void *out_slot512)
 {
 	uint64 req;
@@ -818,6 +971,7 @@ cluster_clean_leave_qvotec_complete(bool acked)
 	pg_write_barrier();
 	pg_atomic_write_u64(&cl_state->marker_completion_seq, cl_qvotec_inflight_marker_seq);
 	cl_qvotec_last_processed_marker_seq = cl_qvotec_inflight_marker_seq;
+	cluster_lmon_marker_complete_wakeup();
 }
 
 static void
@@ -1640,6 +1794,44 @@ cl_coordinator_commit(int32 leaving)
 	uint64 new_epoch;
 	ClusterLeaveIntentMarker m;
 
+	if (cl_lmon_marker_async.has_staged_event) {
+		ClusterLeaveAsyncMarkerResult ar = cl_poll_lmon_marker_stage();
+		int phase = cl_lmon_marker_phase;
+		uint64 staged_epoch = cl_lmon_marker_epoch;
+
+		if (ar == CL_LEAVE_ASYNC_PENDING)
+			return;
+		if (ar == CL_LEAVE_ASYNC_FAILED)
+			return;
+		if (phase == CLUSTER_LEAVE_MARKER_PHASE_COMMITTING) {
+			cl_release_lmon_marker_stage();
+			new_epoch = cluster_reconfig_apply_clean_leave_as_coordinator(leaving, baseline_epoch);
+			if (new_epoch == 0) {
+				ereport(LOG,
+						(errmsg("cluster clean-leave: epoch moved off baseline %llu before commit "
+								"for node %d; not committing (the leaving node escalates to fail-stop)",
+								(unsigned long long)baseline_epoch, leaving)));
+				return;
+			}
+			cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, new_epoch);
+			(void)cl_start_lmon_marker_stage(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving,
+											 new_epoch);
+			(void)cl_poll_lmon_marker_stage();
+			ereport(LOG,
+					(errmsg("cluster clean-leave: committed departure of node %d at epoch %llu",
+							leaving, (unsigned long long)new_epoch)));
+			return;
+		}
+		if (phase == CLUSTER_LEAVE_MARKER_PHASE_COMMITTED) {
+			pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
+			cl_send_committed(leaving, staged_epoch);
+			cl_release_lmon_marker_stage();
+			return;
+		}
+		cl_release_lmon_marker_stage();
+		return;
+	}
+
 	/* CL-I3 pre-check: refuse to commit a clean leave on a version a real death
 	 * already bumped — the leaving node will then observe a non-CLEAN_LEAVE event
 	 * and escalate.  This is a cheap early-out; the authoritative guard is the
@@ -1668,51 +1860,9 @@ cl_coordinator_commit(int32 leaving)
 	/* (1) COMMITTING(E) marker (coordinator's own slot, before the bump; NOT a
 	 * trust basis).  Not durable -> do not commit. */
 	cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTING, leaving, baseline_epoch + 1);
-	if (cluster_clean_leave_submit_marker(&m) != CLUSTER_LEAVE_MARKER_SUBMIT_ACK) {
-		ereport(LOG, (errmsg("cluster clean-leave: COMMITTING marker not durable for node %d; "
-							 "not committing (the leaving node will retry/escalate)",
-							 leaving)));
-		return;
-	}
-
-	/* (2) the real commit point: guarded epoch bump (only if still baseline) +
-	 * publish CLEAN_LEAVE + record clean-departed.  Returns 0 if a concurrent
-	 * reconfig moved the epoch off the baseline after the COMMITTING marker —
-	 * fail-closed, do NOT write the COMMITTED marker (CL-I3). */
-	new_epoch = cluster_reconfig_apply_clean_leave_as_coordinator(leaving, baseline_epoch);
-	if (new_epoch == 0) {
-		ereport(LOG,
-				(errmsg("cluster clean-leave: epoch moved off baseline %llu before commit "
-						"for node %d; not committing (the leaving node escalates to fail-stop)",
-						(unsigned long long)baseline_epoch, leaving)));
-		return; /* CL-I3: stale baseline (or cluster disabled / bad id) */
-	}
-
-	/*
-	 * (3) COMMITTED(E) marker (after the bump; the ONLY rebuild trust basis).
-	 * Post-commit it MUST become majority-durable — the durable truth-source must
-	 * exist BEFORE the leaving node departs (P1-V0.7 exit gate; §2.5).  Try once
-	 * here.  If it reaches majority, mark durable + tell the leaving node it may
-	 * exit (LEAVE_COMMITTED).  If NOT, do not give up: committed_marker_durable
-	 * stays 0, cl_survivor_tick retries the marker every tick, and the leaving
-	 * node stays in BARRIER_WAIT (no LEAVE_COMMITTED) until it is durable — it
-	 * never departs without a durable truth-source.  The leave is already
-	 * committed (epoch bumped); we never revert.
-	 */
-	cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, new_epoch);
-	if (cluster_clean_leave_submit_marker(&m) == CLUSTER_LEAVE_MARKER_SUBMIT_ACK) {
-		pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
-		cl_send_committed(leaving, new_epoch);
-	} else {
-		ereport(
-			LOG,
-			(errmsg("cluster clean-leave: committed node %d at epoch %llu but the COMMITTED "
-					"marker is not yet majority-durable; retrying each tick (leaving node waits)",
-					leaving, (unsigned long long)new_epoch)));
-	}
-
-	ereport(LOG, (errmsg("cluster clean-leave: committed departure of node %d at epoch %llu",
-						 leaving, (unsigned long long)new_epoch)));
+	(void)cl_start_lmon_marker_stage(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTING, leaving,
+									 baseline_epoch + 1);
+	(void)cl_poll_lmon_marker_stage();
 }
 
 /* survivor (incl. coordinator) side of another node's leave. */
@@ -1773,13 +1923,9 @@ cl_survivor_tick(int32 leaving)
 	if (coordinator == cluster_node_id && cluster_reconfig_is_clean_departed(leaving)) {
 		uint64 committed_epoch = cluster_reconfig_get_clean_departed_epoch(leaving);
 
-		if (!pg_atomic_read_u32(&cl_state->committed_marker_durable)) {
-			ClusterLeaveIntentMarker cm;
+		if (!pg_atomic_read_u32(&cl_state->committed_marker_durable))
+			cl_drive_committed_marker_stage(leaving, committed_epoch);
 
-			cl_build_marker(&cm, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, committed_epoch);
-			if (cluster_clean_leave_submit_marker(&cm) == CLUSTER_LEAVE_MARKER_SUBMIT_ACK)
-				pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
-		}
 		/* Re-send LEAVE_COMMITTED every tick once durable until the leaver is gone
 		 * (best-effort IC): the leaving node will not depart until it receives one,
 		 * and step 3 holds the slot until it is CSSD-dead, so delivery is assured. */

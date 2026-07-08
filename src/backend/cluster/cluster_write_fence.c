@@ -40,6 +40,7 @@
 
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
 #include "cluster/cluster_guc.h"			/* cluster_node_id, cluster_voting_disks */
+#include "cluster/cluster_lmon.h"			/* cluster_lmon_marker_complete_wakeup */
 #include "cluster/cluster_qvotec.h"			/* ClusterVotingSlot (marker layout asserts) */
 #include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
 #include "cluster/cluster_voting_disk_io.h" /* D6 direct durable marker read */
@@ -769,6 +770,38 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 	}
 }
 
+bool
+cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenceMarker *m,
+										ClusterMarkerAsyncKind kind, int32 target_node,
+										TimestampTz now)
+{
+	if (cluster_write_fence_shmem == NULL || m == NULL || a == NULL)
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	if (cluster_marker_async_mailbox_busy(&cluster_write_fence_shmem->marker_request_seq,
+										  &cluster_write_fence_shmem->marker_completion_seq))
+		return false;
+
+	memcpy(&cluster_write_fence_shmem->pending_marker, m, sizeof(*m));
+	return cluster_marker_async_submit(
+		a, &cluster_write_fence_shmem->marker_request_seq,
+		&cluster_write_fence_shmem->marker_completion_seq,
+		cluster_write_fence_shmem->qvotec_latch, now,
+		(uint64)cluster_write_fence_lease_ms * 1000ULL, kind, target_node);
+}
+
+ClusterMarkerPollResult
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
+									  uint32 *out_result, uint64 *out_elapsed_us)
+{
+	if (cluster_write_fence_shmem == NULL || a == NULL)
+		return CLUSTER_MARKER_POLL_IDLE;
+	return cluster_marker_async_poll(a, &cluster_write_fence_shmem->marker_completion_seq,
+									 &cluster_write_fence_shmem->marker_result, now, out_result,
+									 out_elapsed_us);
+}
+
 /*
  * cluster_write_fence_clear_qvotec_latch / _publish_qvotec_latch -- qvotec publishes
  *	its MyLatch at startup so LMON can wake it; auto-cleared at proc_exit so a stale
@@ -835,6 +868,7 @@ cluster_write_fence_qvotec_complete(bool acked)
 	pg_atomic_write_u64(&cluster_write_fence_shmem->marker_completion_seq,
 						qvotec_inflight_marker_seq);
 	qvotec_last_processed_marker_seq = qvotec_inflight_marker_seq;
+	cluster_lmon_marker_complete_wakeup();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

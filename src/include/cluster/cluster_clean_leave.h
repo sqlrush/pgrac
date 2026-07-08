@@ -65,6 +65,8 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_marker_async.h"
+
 /* 128 nodes, same width as ReconfigEvent.dead_bitmap. */
 #define CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES 16
 /* Default drain deadline; aligns with the feature-082 30s barrier. */
@@ -408,6 +410,15 @@ extern void cluster_clean_leave_shmem_register(void);
  * ------------------------------------------------------------------ */
 extern ClusterLeaveMarkerSubmitResult
 cluster_clean_leave_submit_marker(const ClusterLeaveIntentMarker *m);
+extern bool cluster_clean_leave_submit_marker_async(ClusterMarkerAsync *a,
+													const ClusterLeaveIntentMarker *m,
+													ClusterMarkerAsyncKind kind,
+													int32 target_node,
+													TimestampTz now);
+extern ClusterMarkerPollResult cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a,
+																	 TimestampTz now,
+																	 uint32 *out_result,
+																	 uint64 *out_elapsed_us);
 extern bool cluster_clean_leave_qvotec_poll_pending(void *out_slot512);
 extern void cluster_clean_leave_qvotec_complete(bool acked);
 extern void cluster_clean_leave_publish_qvotec_latch(struct Latch *latch);

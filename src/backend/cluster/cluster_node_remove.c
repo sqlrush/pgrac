@@ -57,6 +57,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_node_remove.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -162,6 +163,14 @@ cluster_node_remove_get_state(ClusterNodeRemoveState *out)
 
 static uint64 nr_qvotec_last_processed_marker_seq = 0;
 static uint64 nr_qvotec_inflight_marker_seq = 0;
+static ClusterMarkerAsync nr_marker_async;
+static ClusterRemovalMarker nr_marker_stage;
+static int nr_marker_phase = 0;
+static int32 nr_marker_node_id = -1;
+static uint64 nr_marker_epoch = 0;
+static uint64 nr_marker_removed_incarnation = 0;
+static uint64 nr_marker_removal_event_id = 0;
+static bool nr_marker_submitted = false;
 
 ClusterRemovalMarkerSubmitResult
 cluster_node_remove_submit_marker(const ClusterRemovalMarker *m)
@@ -196,6 +205,38 @@ cluster_node_remove_submit_marker(const ClusterRemovalMarker *m)
 }
 
 bool
+cluster_node_remove_submit_marker_async(ClusterMarkerAsync *a, const ClusterRemovalMarker *m,
+										ClusterMarkerAsyncKind kind, int32 target_node,
+										TimestampTz now)
+{
+	int wait_ms;
+
+	if (nr_state == NULL || m == NULL || a == NULL)
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	if (cluster_marker_async_mailbox_busy(&nr_state->marker_request_seq,
+										  &nr_state->marker_completion_seq))
+		return false;
+
+	nr_state->pending_marker = *m;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	return cluster_marker_async_submit(a, &nr_state->marker_request_seq,
+									   &nr_state->marker_completion_seq, nr_state->qvotec_latch,
+									   now, (uint64)wait_ms * 1000ULL, kind, target_node);
+}
+
+ClusterMarkerPollResult
+cluster_node_remove_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now,
+									  uint32 *out_result, uint64 *out_elapsed_us)
+{
+	if (nr_state == NULL || a == NULL)
+		return CLUSTER_MARKER_POLL_IDLE;
+	return cluster_marker_async_poll(a, &nr_state->marker_completion_seq,
+									 &nr_state->marker_result, now, out_result, out_elapsed_us);
+}
+
+bool
 cluster_node_remove_qvotec_poll_pending(ClusterRemovalMarker *out)
 {
 	uint64 req;
@@ -223,6 +264,7 @@ cluster_node_remove_qvotec_complete(bool acked)
 	pg_write_barrier();
 	pg_atomic_write_u64(&nr_state->marker_completion_seq, nr_qvotec_inflight_marker_seq);
 	nr_qvotec_last_processed_marker_seq = nr_qvotec_inflight_marker_seq;
+	cluster_lmon_marker_complete_wakeup();
 }
 
 static void
@@ -241,24 +283,124 @@ cluster_node_remove_publish_qvotec_latch(struct Latch *latch)
 	on_shmem_exit(nr_clear_qvotec_latch, (Datum)0);
 }
 
-/* build + submit one durable removal marker; returns true iff majority-durable. */
+static ClusterMarkerAsyncKind
+nr_marker_phase_kind(int phase)
+{
+	switch (phase) {
+	case CLUSTER_REMOVAL_MARKER_REMOVING:
+		return CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVING;
+	case CLUSTER_REMOVAL_MARKER_SHRUNK:
+		return CLUSTER_MARKER_KIND_NODE_REMOVE_SHRUNK;
+	case CLUSTER_REMOVAL_MARKER_REMOVED:
+		return CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVED;
+	default:
+		return CLUSTER_MARKER_KIND_UNKNOWN;
+	}
+}
+
+static void
+nr_release_marker_stage(void)
+{
+	cluster_marker_async_release_stage(&nr_marker_async);
+	memset(&nr_marker_stage, 0, sizeof(nr_marker_stage));
+	nr_marker_phase = 0;
+	nr_marker_node_id = -1;
+	nr_marker_epoch = 0;
+	nr_marker_removed_incarnation = 0;
+	nr_marker_removal_event_id = 0;
+	nr_marker_submitted = false;
+}
+
+static bool
+nr_marker_stage_matches(int phase, int32 node_id, uint64 remove_epoch,
+						uint64 removed_incarnation, uint64 removal_event_id)
+{
+	return nr_marker_async.has_staged_event && nr_marker_phase == phase
+		   && nr_marker_node_id == node_id && nr_marker_epoch == remove_epoch
+		   && nr_marker_removed_incarnation == removed_incarnation
+		   && nr_marker_removal_event_id == removal_event_id;
+}
+
+/* build + poll one durable removal marker; returns true iff majority-durable. */
 static bool
 nr_write_marker(int phase, int32 node_id, uint64 remove_epoch, uint64 removed_incarnation,
 				uint64 removal_event_id)
 {
 	ClusterRemovalMarker m;
+	TimestampTz now;
+	uint32 result = CLUSTER_REMOVAL_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+	ClusterMarkerAsyncKind kind;
 
-	memset(&m, 0, sizeof(m));
-	m.magic = CLUSTER_REMOVAL_MARKER_MAGIC;
-	m.version = CLUSTER_REMOVAL_MARKER_VERSION;
-	m.phase = (uint16)phase;
-	m.removed_node_id = node_id;
-	m.remove_epoch = remove_epoch;
-	m.removed_incarnation = removed_incarnation;
-	m.removal_event_id = removal_event_id;
-	cluster_removal_marker_compute_crc(&m);
+	now = GetCurrentTimestamp();
+	kind = nr_marker_phase_kind(phase);
 
-	return cluster_node_remove_submit_marker(&m) == CLUSTER_REMOVAL_MARKER_SUBMIT_ACK;
+	if (nr_marker_async.has_staged_event
+		&& !nr_marker_stage_matches(phase, node_id, remove_epoch, removed_incarnation,
+									removal_event_id)) {
+		if (!nr_marker_submitted) {
+			if (cluster_node_remove_submit_marker_async(&nr_marker_async, &nr_marker_stage,
+														nr_marker_phase_kind(nr_marker_phase),
+														nr_marker_node_id, now))
+				nr_marker_submitted = true;
+			return false;
+		}
+		pr = cluster_node_remove_poll_marker_async(&nr_marker_async, now, &result, &elapsed_us);
+		if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+			cluster_reconfig_note_marker_timeout(nr_marker_async.kind, nr_marker_node_id,
+												 elapsed_us);
+			nr_release_marker_stage();
+		} else if (pr == CLUSTER_MARKER_POLL_ACKED) {
+			cluster_reconfig_note_marker_slow_ack(nr_marker_async.kind, nr_marker_node_id,
+												  elapsed_us);
+			nr_release_marker_stage();
+		}
+		return false;
+	}
+
+	if (!nr_marker_async.has_staged_event) {
+		memset(&m, 0, sizeof(m));
+		m.magic = CLUSTER_REMOVAL_MARKER_MAGIC;
+		m.version = CLUSTER_REMOVAL_MARKER_VERSION;
+		m.phase = (uint16)phase;
+		m.removed_node_id = node_id;
+		m.remove_epoch = remove_epoch;
+		m.removed_incarnation = removed_incarnation;
+		m.removal_event_id = removal_event_id;
+		cluster_removal_marker_compute_crc(&m);
+
+		nr_marker_stage = m;
+		nr_marker_phase = phase;
+		nr_marker_node_id = node_id;
+		nr_marker_epoch = remove_epoch;
+		nr_marker_removed_incarnation = removed_incarnation;
+		nr_marker_removal_event_id = removal_event_id;
+		nr_marker_async.has_staged_event = true;
+		nr_marker_async.staged_expect_epoch = remove_epoch;
+		nr_marker_submitted = false;
+	}
+
+	if (!nr_marker_submitted) {
+		if (!cluster_node_remove_submit_marker_async(&nr_marker_async, &nr_marker_stage, kind,
+													 node_id, now))
+			return false;
+		nr_marker_submitted = true;
+		return false;
+	}
+
+	pr = cluster_node_remove_poll_marker_async(&nr_marker_async, now, &result, &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return false;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(kind, node_id, elapsed_us);
+		nr_release_marker_stage();
+		return false;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(kind, node_id, elapsed_us);
+	nr_release_marker_stage();
+	return result == CLUSTER_REMOVAL_MARKER_SUBMIT_ACK;
 }
 
 

@@ -199,6 +199,7 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	/* spec-2.6 Sprint A Step 4 D14 — 5 qvotec / quorum-lite injects. */
 	{ .name = "cluster-qvotec-poll-pre" },
 	{ .name = "cluster-qvotec-poll-post" },
+	{ .name = "cluster-qvotec-marker-service-hold" },
 	{ .name = "cluster-voting-disk-write-fail" },
 	{ .name = "cluster-quorum-loss-broadcast" },
 	{ .name = "cluster-collision-detect" },

@@ -357,6 +357,26 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unuse
 {
 	return CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
+bool
+cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a pg_attribute_unused(),
+										const ClusterFenceMarker *m pg_attribute_unused(),
+										ClusterMarkerAsyncKind kind pg_attribute_unused(),
+										int32 target_node pg_attribute_unused(),
+										TimestampTz now pg_attribute_unused())
+{
+	return false;
+}
+ClusterMarkerPollResult
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a pg_attribute_unused(),
+									  TimestampTz now pg_attribute_unused(),
+									  uint32 *out_result pg_attribute_unused(),
+									  uint64 *out_elapsed_us pg_attribute_unused())
+{
+	return CLUSTER_MARKER_POLL_IDLE;
+}
+void
+cluster_lmon_marker_complete_wakeup(void)
+{}
 
 /* spec-3.1 D7 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
  * calls cluster_tt_status_flush_all.  Fixture has no TT overlay shmem;

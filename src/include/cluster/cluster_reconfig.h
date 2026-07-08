@@ -57,6 +57,7 @@
 #include "storage/lwlock.h"
 
 #include "cluster/cluster_conf.h"		/* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
+#include "cluster/cluster_marker_async.h"
 #include "cluster/cluster_membership.h" /* ClusterMembershipTable (spec-5.15 D2 SSOT) */
 
 struct Latch; /* spec-5.15 D4 — join-marker qvotec mailbox latch (pointer only) */
@@ -316,6 +317,8 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 join_reject_count;
 	pg_atomic_uint64 join_timeout_count;
 	pg_atomic_uint64 clean_departed_cleared_count;
+	pg_atomic_uint64 marker_slow_ack_count;
+	pg_atomic_uint64 marker_timeout_count;
 
 	/*
 	 * spec-5.15 D1 — per declared node, the freshest voting-slot incarnation +
@@ -580,9 +583,24 @@ extern bool cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarn
  */
 extern ClusterJoinMarkerSubmitResult
 cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMarker *m);
+extern bool cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_node,
+													  const ClusterJoinCommitMarker *m,
+													  ClusterMarkerAsyncKind kind,
+													  TimestampTz now);
+extern ClusterMarkerPollResult cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a,
+																	   TimestampTz now,
+																	   uint32 *out_result,
+																	   uint64 *out_elapsed_us);
 extern bool cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512);
 extern void cluster_reconfig_join_qvotec_complete(bool acked);
 extern void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
+
+extern void cluster_reconfig_note_marker_slow_ack(ClusterMarkerAsyncKind kind, int32 target_node,
+												  uint64 elapsed_us);
+extern void cluster_reconfig_note_marker_timeout(ClusterMarkerAsyncKind kind, int32 target_node,
+												 uint64 elapsed_us);
+extern uint64 cluster_reconfig_get_marker_slow_ack_count(void);
+extern uint64 cluster_reconfig_get_marker_timeout_count(void);
 
 /* ============================================================
  * spec-5.15 D5 — joiner-side write gate + admission (INV-J9 / §2.4 / §2.7).
