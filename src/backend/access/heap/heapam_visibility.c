@@ -877,12 +877,15 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 		switch (cluster_vis_update_xmax_verdict(r.status, is_delete)) {
 		case CVV_VISIBLE:
+			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Ok;
 			return true;
 		case CVV_GONE_UPDATED:
+			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Updated;
 			return true;
 		case CVV_GONE_DELETED:
+			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Deleted;
 			return true;
 		case CVV_BEING_MODIFIED:
@@ -1591,8 +1594,10 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 
 		switch (cluster_vis_cr_xmax_verdict(xr.status, scn_decision)) {
 		case CVV_VISIBLE:
+			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			return 1;
 		case CVV_INVISIBLE:
+			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			return 0;
 		default:
 			return -1; /* unknown / unresolved -> fail closed */

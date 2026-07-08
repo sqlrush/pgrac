@@ -3315,10 +3315,14 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		}
 
 		if (cluster_writer_chain_decide(&wo, &old_t_ctid, xwait, res, NULL))
+		{
+			cluster_vis_bump_writer_chain_resolved_count();
 			return true;
+		}
 		/* fall through: unprovable -> the pre-7.1a fail-closed floor */
 	}
 
+	cluster_vis_bump_writer_chain_failclosed_count();
 	cluster_vis_bump_vis_conflict_failclosed_count();
 	ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 					errmsg("cross-node write conflict: remote writer %u on node %u is terminal",

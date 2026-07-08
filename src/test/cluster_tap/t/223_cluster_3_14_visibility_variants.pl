@@ -137,7 +137,7 @@ is($n0->safe_psql('postgres', q{SELECT pad FROM v314_hot WHERE id = 1}), 'd',
 # ============================================================
 my $vis_rows = $n0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category = 'visibility'});
-is($vis_rows, '6', 'L5 visibility category exposes 6 D8 counters');
+is($vis_rows, '11', 'L5 visibility category exposes 6 D8 + 5 spec-7.1a D6 counters');
 
 my $vis_keys = $n0->safe_psql('postgres',
 	q{SELECT string_agg(key, ',' ORDER BY key) FROM pg_cluster_state
@@ -145,6 +145,8 @@ my $vis_keys = $n0->safe_psql('postgres',
 like($vis_keys, qr/vis_conflict_failclosed_count/, 'L5 conflict counter present');
 like($vis_keys, qr/prune_remote_keep_count/,       'L5 prune-keep counter present');
 like($vis_keys, qr/vis_update_fork_count/,         'L5 update-fork counter present');
+like($vis_keys, qr/writer_chain_resolved_count/,   'L5 writer-chain counter present (spec-7.1a D6)');
+like($vis_keys, qr/covers_scn_refuse_count/,       'L5 covers-refuse counter present (spec-7.1a D6)');
 
 
 # ============================================================

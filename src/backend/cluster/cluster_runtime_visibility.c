@@ -239,6 +239,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	cluster_scn_observe(auth.authority_scn);
 
 	if (!cluster_vis_live_authority_covers(demand_scn, auth)) {
+		cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -366,7 +367,9 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		/* Lamport-observe the co-sampled clock BEFORE the gate can refuse
 		 * (AD-008) -- the observe is what makes a refusal self-heal. */
 		cluster_scn_observe(auth.authority_scn);
-		if (cluster_vis_live_authority_covers(demand_scn, auth)) {
+		if (!cluster_vis_live_authority_covers(demand_scn, auth))
+			cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
+		else {
 			switch (cluster_vis_tt_block_positive_proof(
 				page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
 			case CLUSTER_VIS_TT_PROOF_COMMITTED:

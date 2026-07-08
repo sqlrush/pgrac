@@ -157,6 +157,7 @@ resolve_live_overlay_miss_via_origin(TransactionId raw_xid, const ClusterUndoTTS
 													   read_scn, &committed, &scn, &is_bound))
 		return; /* stay UNKNOWN -> caller 53R97 fail-closed */
 
+	cluster_vis_bump_overlay_refresh_count(); /* spec-7.1a D6 */
 	if (committed) {
 		out->status = CLUSTER_TT_STATUS_COMMITTED;
 		out->commit_scn = scn;
