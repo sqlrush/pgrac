@@ -2992,6 +2992,18 @@ cluster_writer_chain_probe_new_version(Relation relation, Buffer oldbuf,
 	Page		newpage;
 	bool		ok = false;
 
+	/*
+	 * PGRAC: spec-7.1a hardening -- refuse a forward pointer that names no
+	 * probeable block in THIS relation.  The moved-partitions sentinel
+	 * block is InvalidBlockNumber (== P_NEW: ReadBuffer below would
+	 * silently EXTEND the relation by one empty page), and any other
+	 * out-of-range block (a corrupt or foreign-partition ctid) must never
+	 * reach ReadBuffer either.  Returning false keeps the caller's
+	 * CWO_UNRESOLVABLE fail-closed floor.
+	 */
+	if (!BlockNumberIsValid(newblk) || newblk >= RelationGetNumberOfBlocks(relation))
+		return false;
+
 	if (newblk == BufferGetBlockNumber(oldbuf))
 	{
 		newpage = BufferGetPage(oldbuf);
@@ -3301,6 +3313,22 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 			{
 				if (ItemPointerEquals(&tup->t_self, &old_t_ctid))
 					wo.kind = CWO_DELETED;
+				else if (ItemPointerIndicatesMovedPartitions(&old_t_ctid))
+				{
+					/*
+					 * PGRAC: spec-7.1a hardening -- the committed remote
+					 * UPDATE moved the row to ANOTHER partition: the
+					 * forward pointer is the moved-partitions sentinel
+					 * (block == InvalidBlockNumber == P_NEW), which names
+					 * no tuple in THIS relation, and probing it would
+					 * ReadBuffer-extend the old partition (same judgement
+					 * the native paths make first, e.g. the SatisfiesUpdate
+					 * cluster fork's is_delete).  Keep CWO_UNRESOLVABLE:
+					 * the retryable 53R9H floor below is the fail-closed
+					 * disposition; cross-partition chaining is not a
+					 * single-hop probe.
+					 */
+				}
 				else if (cluster_writer_chain_probe_new_version(relation, buffer,
 																&old_t_ctid, xwait,
 																&probe_tup))
