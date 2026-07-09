@@ -68,6 +68,7 @@ sub gcs_int_value {
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_ship',
 	quorum_voting_disks => 3,
+	data_port_span => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 

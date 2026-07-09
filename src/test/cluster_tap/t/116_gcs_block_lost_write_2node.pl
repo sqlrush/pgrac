@@ -71,6 +71,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_lost_write',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.grd_max_entries = 1024',

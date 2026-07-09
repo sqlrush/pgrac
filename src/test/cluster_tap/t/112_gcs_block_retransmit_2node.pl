@@ -69,9 +69,13 @@ sub gcs_int
 # ============================================================
 # L1: ClusterPair startup.
 # ============================================================
+# spec-7.3: cluster.lms_workers defaults to 2, and each node's DATA plane binds
+# a per-worker listener at data_port + worker_id (D3).  Reserve a 2-port span per
+# node so node0's worker-1 port does not collide with node1's base (mirrors t/365).
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_retransmit',
 	quorum_voting_disks => 3,
+	data_port_span => 2,
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 
