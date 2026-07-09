@@ -184,6 +184,8 @@ OBJS = \
 	cluster_visibility_verdict.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
+	cluster_undo_authority.o \
+	cluster_undo_authority_snapshot.o \
 	cluster_undo_gcs.o \
 	cluster_undo_gcs_grant.o \
 	cluster_undo_gcs_stat.o \
