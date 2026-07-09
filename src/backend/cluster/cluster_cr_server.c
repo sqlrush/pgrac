@@ -747,7 +747,9 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 		switch (lms_resolve_own_xid_verdict(member_xid, &out->verdict, &out->commit_scn,
 											&out->horizon_scn, &out->wrap)) {
 		case LMS_OWN_XID_PROVEN:
+			break;
 		case LMS_OWN_XID_PROVEN_UPGRADE:
+			cluster_vis53r97_note_live_upgrade_hit(); /* spec-7.1 D1 serve upgrade (multi member) */
 			break;
 		default:
 			pfree(members);
