@@ -430,11 +430,41 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
 		if (!TransactionIdDidCommit(xid))
 			return false; /* C1b: stamped-then-crashed is in-doubt */
-		if (!cluster_cr_accept_resolved_scn(scn))
-			return false; /* wrap-suspect -> refuse */
-		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
-		v->commit_scn = scn;
-		v->wrap = wrap;
+		if (cluster_cr_accept_resolved_scn(scn)) {
+			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+			v->commit_scn = scn;
+			v->wrap = wrap;
+			return true;
+		}
+
+		/*
+		 * PGRAC: spec-7.1a hardening -- wrap-suspect stamped scn (below the
+		 * retention horizon), reached routinely now that the requester
+		 * finalizes EVERY shipped COMMITTED stamp here instead of concluding
+		 * on the fetch fast leg.  The EXACT value cannot be shipped (a
+		 * same-valued xid recurrence across TT wrap could own a different
+		 * scn), but "committed at/below a FROZEN bound" still can:
+		 *   - a LIVE recurrence would be a second by-value match ->
+		 *     AMBIGUOUS_WRAP (refused below), so the single live match has
+		 *     no live rival;
+		 *   - a RECYCLED recurrence's lost scn is at/below the max gated-
+		 *     recycle horizon (the zero-match arm's own bound);
+		 *   - this slot's own stamped scn bounds itself.
+		 * Ship BELOW_HORIZON over the max of both candidates -- the same
+		 * frozen, non-clock-chasing consumer contract as the zero-match arm
+		 * (never cached; judged against the requester's read_scn, leg (e)).
+		 * No gated recycle this incarnation -> the recycled-recurrence
+		 * candidate is unboundable -> refuse, exactly like zero-match.
+		 */
+		if (!cluster_cr_retention_proof_origin_legs(&horizon))
+			return false;
+		horizon = cluster_tt_slot_max_recycle_horizon();
+		if (!SCN_VALID(horizon))
+			return false;
+		if (scn_time_cmp(scn, horizon) > 0)
+			horizon = scn;
+		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+		v->horizon_scn = horizon;
 		return true;
 
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:

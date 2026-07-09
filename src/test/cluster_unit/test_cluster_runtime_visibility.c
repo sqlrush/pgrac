@@ -238,6 +238,24 @@ UT_TEST(test_ttproof_committed_and_aborted)
 	UT_ASSERT_EQ(wrap, 2);
 }
 
+/* spec-7.1a hardening (C1b): PROOF_COMMITTED is EVIDENCE, not a verdict --
+ * the consumer routes it to the origin verdict leg and takes NO payload from
+ * the stamp (a durable COMMITTED stamp lands at 2PC pre-commit, so a
+ * stamped-then-crashed xid is in-doubt).  Pin the NULL-out-param consumer
+ * shape: the proof classification itself is unchanged and payload pointers
+ * are optional. */
+UT_TEST(test_ttproof_committed_is_evidence_not_verdict)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+
+	/* The hardened fast leg passes NULL/NULL: classification only. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
+}
+
 /* 0-match / ACTIVE / COMMITTED-without-scn: never a proof (user boundary:
  * a single fetched block's 0-match is NOT recycled/aborted evidence). */
 UT_TEST(test_ttproof_zero_match_active_invalid_scn)
@@ -422,6 +440,7 @@ main(void)
 	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_scn);
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
 	UT_RUN(test_ttproof_committed_and_aborted);
+	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
 	UT_RUN(test_ttproof_header_mismatch);

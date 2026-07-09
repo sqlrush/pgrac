@@ -141,9 +141,12 @@ extern bool cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, ch
  * depth.  Pure; no I/O, no shmem, no elog (unit truth table).
  */
 typedef enum ClusterVisTtProof {
-	CLUSTER_VIS_TT_PROOF_NONE = 0, /* fail-closed: caller keeps 53R97 */
-	CLUSTER_VIS_TT_PROOF_COMMITTED = 1,
-	CLUSTER_VIS_TT_PROOF_ABORTED = 2
+	CLUSTER_VIS_TT_PROOF_NONE = 0,		/* fail-closed: caller keeps 53R97 */
+	CLUSTER_VIS_TT_PROOF_COMMITTED = 1, /* EVIDENCE only: stamps land at 2PC
+										 * pre-commit; consumers finalize via
+										 * the origin's C1b verdict leg,
+										 * never conclude committed here */
+	CLUSTER_VIS_TT_PROOF_ABORTED = 2	/* terminal: an abort is irreversible */
 } ClusterVisTtProof;
 
 extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,

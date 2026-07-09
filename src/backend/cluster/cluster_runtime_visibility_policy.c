@@ -96,6 +96,13 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
  * / multi-match / non-terminal / malformed all refuse).  The block bytes are
  * the origin's own shipped copy, so every refusal is a clean NONE — never an
  * elog — and the caller keeps the 53R97 fail-closed boundary.
+ *
+ * PROOF_COMMITTED is EVIDENCE, not a verdict (spec-7.1a hardening): durable
+ * COMMITTED stamps land at pre-commit (2PC COMMIT PREPARED stamps before the
+ * commit record — cluster_tt_durable.h), so a stamped-then-crashed xid is
+ * in-doubt.  Consumers must finalize a COMMITTED proof through the origin's
+ * C1b CLOG cross-check (the verdict leg); only PROOF_ABORTED may be consumed
+ * directly (an abort stamp is terminal and irreversible).
  */
 ClusterVisTtProof
 cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,
