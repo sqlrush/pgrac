@@ -226,6 +226,8 @@ int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
 /* spec-4.6 D4/D1 — failure-driven remaster tunables. */
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
+int cluster_hw_remaster_retry_backoff_ms = 1000;
+int cluster_hw_remaster_retry_max_attempts = 16;
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
 int cluster_sequence_default_cache = 100;		/* CREATE-time CACHE injection default */
@@ -307,6 +309,7 @@ int cluster_phase4_timeout = 30;
  * LMON main-loop tick / WaitLatch timeout in milliseconds.
  */
 int cluster_lmon_main_loop_interval = 1000;
+int cluster_lmon_slow_iteration_warn_ms = 1000;
 
 /* spec-1.12 Sprint B D8: cluster.lck_main_loop_interval (mirror). */
 int cluster_lck_main_loop_interval = 1000;
@@ -707,7 +710,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
  * HC92 + HC97 — see cluster_guc.h for semantics.
  */
 int cluster_gcs_block_retransmit_max_retries = 4;
-int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 10; /* spec-7.2 D1 */
 
 /* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch.
  * ON (default): the bufmgr acquire gate skips the remote master round-trip when
@@ -720,6 +723,7 @@ bool cluster_gcs_block_local_cache = true;
  * remote row-lock conflict block until the holder completes; off reverts to
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
+bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -2374,6 +2378,21 @@ cluster_init_guc(void)
 					 "request with a fresh deadline."),
 		&cluster_grd_rebuild_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_backoff_ms",
+		gettext_noop("Initial backoff before retrying a BLOCKED HW remaster worker (ms)."),
+		gettext_noop("Range [100, 60000].  Default 1000.  Same-episode HW remaster "
+					 "retries use exponential backoff capped at 60 seconds; the adopted "
+					 "shards stay frozen while retrying."),
+		&cluster_hw_remaster_retry_backoff_ms, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_max_attempts",
+		gettext_noop("Maximum same-episode retries for a BLOCKED HW remaster worker."),
+		gettext_noop("Range [0, 1000].  Default 16.  Zero disables same-episode retry.  "
+					 "Raising the value with SIGHUP lets an exhausted episode resume retrying "
+					 "without waiting for a new reconfig episode."),
+		&cluster_hw_remaster_retry_max_attempts, 16, 0, 1000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.23 D11 NEW:  coordinator REPORT collect deadline. */
 	DefineCustomIntVariable("cluster.lmd_probe_collect_timeout_ms",
@@ -2571,6 +2590,15 @@ cluster_init_guc(void)
 					 "LMON has no real consumer work, so any value in range is "
 					 "functionally equivalent."),
 		&cluster_lmon_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.lmon_slow_iteration_warn_ms",
+		gettext_noop("LMON main-loop slow-iteration warning threshold in milliseconds."),
+		gettext_noop("A value greater than zero logs LMON main-loop iterations above this "
+					 "duration; the lmon_slow_iter_count counter is maintained even when "
+					 "logging is disabled with 0."),
+		&cluster_lmon_slow_iteration_warn_ms, 1000, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable(
@@ -3855,14 +3883,28 @@ cluster_init_guc(void)
 							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
 							 NULL);
 
+	DefineCustomBoolVariable(
+		"cluster.ic_duty_lazy",
+		gettext_noop("Run lazy-able LMON duty-chain drains on demand instead of every iteration."),
+		gettext_noop("When on (default), the queue-consumption duty families in the "
+					 "LMON main loop (outbound drains / ship-ready / sinval out / "
+					 "tt-hint / dedup TTL / backup / GES work queue) run only when "
+					 "their producer marked them dirty or on the >= 1 Hz floor.  "
+					 "Correctness families (fence / sweeps / reconfig / recovery) "
+					 "always run every iteration.  Off restores the run-every-"
+					 "iteration behavior (escape hatch).  spec-7.2 D1.  PGC_SIGHUP."),
+		&cluster_ic_duty_lazy, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),
 		gettext_noop("Exponential backoff base for GCS block-ship retransmit:  "
 					 "retry 1 waits this much, retry 2 doubles, etc.  Default "
-					 "100 → 100/200/400/800 ms for N=4 retries (total 1500 ms).  "
-					 "HC97.  PGC_SUSET."),
-		&cluster_gcs_block_retransmit_initial_backoff_ms, 100, 10, 5000, PGC_SUSET, 0, NULL, NULL,
+					 "10 → 10/20/40/80 ms for N=4 retries (total 150 ms;  LAN "
+					 "RTT scale, spec-7.2 D1).  Raise on slow or congested "
+					 "interconnects.  The per-attempt reply wait itself stays "
+					 "cluster.gcs_reply_timeout_ms.  HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_initial_backoff_ms, 10, 1, 5000, PGC_SUSET, 0, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",

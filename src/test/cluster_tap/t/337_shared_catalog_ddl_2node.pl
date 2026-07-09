@@ -94,6 +94,8 @@ if ($ENV{with_pgrac_cluster} && $ENV{with_pgrac_cluster} eq 'no')
 my $shared_root = PostgreSQL::Test::Utils::tempdir();
 mkdir "$shared_root/global" or die "mkdir shared global: $!";
 
+my $wal_root = PostgreSQL::Test::Utils::tempdir();
+
 my $disk_dir = PostgreSQL::Test::Utils::tempdir();
 my @disks;
 for my $i (0 .. 2)
@@ -109,18 +111,38 @@ my $disks_csv = join(',', @disks);
 
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ----------
 # Step 0: node0 init -> backup -> node1 init_from_backup (one shared sysid).
 # ----------
 my $node0 = PostgreSQL::Test::Cluster->new('sc_ddl_node0');
-$node0->init(allows_streaming => 1);
+$node0->init(allows_streaming => 1, extra => [ '-X', "$wal_root/thread_1" ]);
 $node0->start;
 $node0->backup('scb');
 $node0->stop;
 
 my $node1 = PostgreSQL::Test::Cluster->new('sc_ddl_node1');
 $node1->init_from_backup($node0, 'scb');
+
+# Relocate node1's backup-copied WAL into its shared thread dir.  shared_catalog
+# multi-node formation is fail-fast without cluster.wal_threads_dir, and the WAL
+# thread validator requires pg_wal to resolve to the configured thread_N dir.
+{
+	my $pgwal = $node1->data_dir . '/pg_wal';
+	my $wal2 = "$wal_root/thread_2";
+	mkdir $wal2 or die "mkdir $wal2: $!";
+	opendir(my $dh, $pgwal) or die "opendir $pgwal: $!";
+	for my $e (readdir $dh)
+	{
+		next if $e eq '.' || $e eq '..';
+		rename("$pgwal/$e", "$wal2/$e") or die "rename $pgwal/$e: $!";
+	}
+	closedir $dh;
+	rmdir $pgwal or die "rmdir $pgwal: $!";
+	symlink($wal2, $pgwal) or die "symlink $pgwal -> $wal2: $!";
+}
 
 # Config common to the shared-catalog feature (both nodes, both phases).
 my $sc_common = <<EOC;
@@ -161,6 +183,8 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.online_join = on
+cluster.xid_striping = on
 cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off
@@ -168,6 +192,7 @@ cluster.voting_disks = '$disks_csv'
 cluster.cssd_heartbeat_interval_ms = 2000
 cluster.cssd_dead_deadband_factor = 10
 cluster.cf_enqueue_timeout_ms = 30000
+cluster.wal_threads_dir = '$wal_root'
 EOC
 
 $node0->append_conf('postgresql.conf', $cluster_conf);
@@ -183,9 +208,11 @@ name = sc_ddl
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);
@@ -200,6 +227,24 @@ PostgreSQL::Test::Utils::system_log(
 $node0->start;
 $node1->_update_pid(1);
 
+# spec-6.15b D6 flipped this test to online_join+xid_striping: formation now
+# passes through the join gate, whose home-block rebuild window answers
+# transiently with "block master is recovering ... retry is safe" (even at
+# connection time, via the pg_authid read).  First-contact probes therefore
+# retry; every semantic assert below stays strict.
+sub psql_retry_ok
+{
+	my ($node, $sql, $tries) = @_;
+	$tries //= 120;
+	for (1 .. $tries)
+	{
+		my ($rc, $out) = $node->psql('postgres', $sql);
+		return (1, $out) if defined $rc && $rc == 0;
+		usleep(500_000);
+	}
+	return (0, undef);
+}
+
 # node1 must actually be up.
 my $n1_up = 0;
 for (1 .. 60)
@@ -212,7 +257,7 @@ for (1 .. 60)
 # ----------
 # L1: both alive + IC-connected on the shared-sysid cluster.
 # ----------
-my $a0 = $node0->safe_psql('postgres', 'SELECT 1');
+my ($n0_up, $a0) = psql_retry_ok($node0, 'SELECT 1');
 is($a0, '1', 'L1: node0 is up on the shared-catalog 2-node cluster');
 is($n1_up, 1, 'L1: node1 is up on the shared-catalog 2-node cluster');
 
@@ -220,10 +265,10 @@ is($n1_up, 1, 'L1: node1 is up on the shared-catalog 2-node cluster');
 my $peer_ok = 0;
 for (1 .. 40)
 {
-	my $s = $node0->safe_psql('postgres',
+	my ($prc, $s) = psql_retry_ok($node0,
 		"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
-		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
-	if (defined $s && $s eq 't') { $peer_ok = 1; last; }
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1", 1);
+	if ($prc && defined $s && $s eq 't') { $peer_ok = 1; last; }
 	usleep(500_000);
 }
 is($peer_ok, 1, 'L1: node0 sees node1 heartbeats (IC connected)');
@@ -233,9 +278,10 @@ is($peer_ok, 1, 'L1: node0 sees node1 heartbeats (IC connected)');
 #              node1 ever running the DDL.  This is the Stage 2 exit debt
 #              (spec-2.0:135) closure.
 # ----------
-$node0->safe_psql('postgres',
+my ($ddl_ok) = psql_retry_ok($node0,
 	'CREATE TABLE a1_shared_cat (id int PRIMARY KEY, note text);'
 	. "INSERT INTO a1_shared_cat VALUES (1, 'from-node0');");
+die 'first cross-node DDL never succeeded' unless $ddl_ok;
 
 # Poll node1 up to 1s (10 x 100ms).  "retry is safe" per the GCS remaster
 # transient; a settled shared catalog resolves well within the budget.
@@ -818,5 +864,24 @@ my $offlog = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
 like($offlog,
 	qr/cluster\.shared_catalog is off but the shared tree holds/,
 	'L7: the refusal is the designed off-flip vet FATAL (never a stale serve)');
+
+# ----------
+# L8 (spec-4.6a D11 level-2 fail-fast): a multi-node shared_catalog=on boot
+# without cluster.wal_threads_dir is refused at startup -- that shape cannot
+# rebuild a dead node's HW authority from per-thread WAL, so a node failure
+# would be permanently unrecoverable (the silent-BLOCKED wedge of
+# spec-4.6a section 0).  Flip shared_catalog back on and blank the WAL
+# threads root; the boot must fail on the D11 vet, not come up degraded.
+# ----------
+$node1->append_conf('postgresql.conf', "cluster.shared_catalog = on
+");
+$node1->append_conf('postgresql.conf', "cluster.wal_threads_dir = ''
+");
+my $nowalret = $node1->start(fail_ok => 1);
+is($nowalret, 0, 'L8: multi-node shared_catalog boot without wal_threads_dir fails');
+my $nowallog = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+like($nowallog,
+	qr/cluster\.shared_catalog requires cluster\.wal_threads_dir in a multi-node cluster/,
+	'L8: the refusal is the spec-4.6a D11 startup FATAL with the config errhint');
 
 done_testing();

@@ -70,6 +70,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "common/hashfn.h"
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"

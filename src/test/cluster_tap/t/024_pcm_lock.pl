@@ -55,14 +55,15 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 22 keys (spec-2.30 + spec-6.14a D5 + spec-6.14 D5)
+# L1: pg_cluster_state.pcm category has 23 keys (spec-2.30 + spec-6.14a D5 + spec-6.14 D5
+# + spec-4.6a D12 dead_cleanup_entries)
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-   '22',
-   'L1 pg_cluster_state.pcm category has 22 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5)');
+   '23',
+   'L1 pg_cluster_state.pcm category has 23 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5 + spec-4.6a D12)');
 
 
 # ----------
@@ -162,8 +163,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '158',
-   'L6a pg_stat_cluster_injections has 158 entries (spec-6.14 D5+D8 +3; spec-5.6a +1; spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+   '161',
+   'L6a pg_stat_cluster_injections has 161 entries (spec-7.2 D6 +2 lms data-dispatch/conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
 
 is($node->safe_psql(
 		'postgres',
@@ -189,8 +190,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '55',
-   'L7b pg_cluster_state has 55 distinct categories (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
+   '56',
+   'L7b pg_cluster_state has 56 distinct categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
 
 
 # ----------
@@ -209,7 +210,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '55', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (55 categories; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
+is($smoke_categories, '56', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + reconfig categories (56 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
 
 
 # ----------

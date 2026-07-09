@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -540,6 +541,12 @@ cluster_lms_cr_drain(void)
 
 			pg_write_barrier();
 			pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_READY);
+			/* PGRAC: spec-7.2 D1 -- wake the shipper (LMON) right away;
+			 * without this the READY result sat until LMON's next natural
+			 * wakeup (typ. 100-250ms, worst case one heartbeat).
+			 * Publish-before-signal: READY store above precedes the kick. */
+			cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
+			cluster_lmon_wakeup();
 			continue;
 		}
 
@@ -580,6 +587,10 @@ cluster_lms_cr_drain(void)
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_READY);
+		/* PGRAC: spec-7.2 D1 -- wake the shipper (see the undo/verdict
+		 * READY publish above for the rationale). */
+		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
+		cluster_lmon_wakeup();
 	}
 }
 

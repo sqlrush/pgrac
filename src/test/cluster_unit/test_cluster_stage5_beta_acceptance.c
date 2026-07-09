@@ -191,7 +191,7 @@ UT_TEST(test_beta_wait_events_count)
 	/* Current Stage 5 beta surface value.  update-required contract: a future
 	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
 	 * baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 118);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 120); /* spec-7.2 D6 +2 */
 }
 
 

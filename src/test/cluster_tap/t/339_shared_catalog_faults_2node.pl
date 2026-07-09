@@ -44,24 +44,14 @@
 #      L4  neither node's log carries the pre-D9 "unsupported side effect"
 #          fail-closed marker.
 #
-#    KNOWN-BLOCKED (two-layer, investigated 2026-07-06 after the 6.12/6.15
-#    rebase).  This test deterministically runs WITHOUT cluster.xid_striping
-#    so it brings up cleanly and reproduces Layer 1 -- turning striping on
-#    (which is what would make the serving legs' xids resolvable) drags in
-#    Layer 2, whose non-convergence makes bring-up itself flaky.
+#    KNOWN-BLOCKED (membership layer, investigated 2026-07-06 after the
+#    6.12/6.15 rebase; D6 in spec-6.15b now requires striping for every
+#    shared_catalog multi-node boot).  With cluster.xid_striping=on the xid
+#    collision layer is gone and merged recovery classifies the
+#    RM_CLUSTER_XID_STRIPE JOIN/RETIRE notes as GLOBAL.  The remaining
+#    blocker is:
 #
-#    Layer 1 (xid collision) -- what striping WOULD fix: on this striped-off
-#    config the two threads share bare xids (pg_waldump-proven: the same xid
-#    on both threads writing the same catalog block), so post-merge TT
-#    lookups for the other thread's xids are permanently UNKNOWN and every
-#    cross-thread catalog read fail-closes 53R97 (honest, never false-
-#    visible).  With cluster.xid_striping=on the collision is gone AND merged
-#    recovery classifies the RM_CLUSTER_XID_STRIPE JOIN/RETIRE notes as
-#    GLOBAL (see cluster_recovery_record_class, added this session), so both
-#    nodes boot and complete cold merged recovery -- verified in a striping-
-#    on diagnostic run.  But that run then exposes:
-#
-#    Layer 2 (the real blocker, root cause pinned 2026-07-06 via debug1):
+#    Layer 2 (root cause pinned 2026-07-06 via debug1):
 #    the L2 up-check and L3 truth-matrix serving legs stay RED because of a
 #    MEMBERSHIP COLD-FORMATION gap, not the snap-back fence (the fence
 #    RECOVERING / "block master is recovering" errors are all downstream
@@ -143,6 +133,8 @@ my $disks_csv = join(',', @disks);
 
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ----------
 # Step 0: node0 init -> backup -> node1 init_from_backup (one shared sysid).
@@ -211,6 +203,8 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.online_join = on
+cluster.xid_striping = on
 cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off
@@ -234,9 +228,11 @@ name = sc_flt
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);
@@ -251,6 +247,23 @@ PostgreSQL::Test::Utils::system_log(
 $node0->start;
 $node1->_update_pid(1);
 
+# spec-6.15b D6 flipped this test to online_join+xid_striping: formation now
+# passes through the join gate, whose home-block rebuild window answers
+# transiently with "block master is recovering ... retry is safe" (even at
+# connection time).  First-contact probes retry; semantic asserts stay strict.
+sub psql_retry_ok
+{
+	my ($node, $sql, $tries) = @_;
+	$tries //= 120;
+	for (1 .. $tries)
+	{
+		my ($rc, $out) = $node->psql('postgres', $sql);
+		return (1, $out) if defined $rc && $rc == 0;
+		usleep(500_000);
+	}
+	return (0, undef);
+}
+
 my $n1_up = 0;
 for (1 .. 60)
 {
@@ -262,16 +275,17 @@ for (1 .. 60)
 # ----------
 # L0: both alive + IC-connected.
 # ----------
-is($node0->safe_psql('postgres', 'SELECT 1'), '1', 'L0: node0 is up');
+my ($n0_up_rc, $n0_up_out) = psql_retry_ok($node0, 'SELECT 1');
+is($n0_up_out, '1', 'L0: node0 is up');
 is($n1_up, 1, 'L0: node1 is up');
 
 my $peer_ok = 0;
 for (1 .. 40)
 {
-	my $s = $node0->safe_psql('postgres',
+	my ($prc, $s) = psql_retry_ok($node0,
 		"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
-		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
-	if (defined $s && $s eq 't') { $peer_ok = 1; last; }
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1", 1);
+	if ($prc && defined $s && $s eq 't') { $peer_ok = 1; last; }
 	usleep(500_000);
 }
 is($peer_ok, 1, 'L0: node0 sees node1 heartbeats (IC connected)');
@@ -287,15 +301,17 @@ is($peer_ok, 1, 'L0: node0 sees node1 heartbeats (IC connected)');
 #                CREATE t_crash_uncommitted (+ row, NO commit) -> 8.A leg
 #     -> node1's cold merge must divert all of these.
 # ----------
-$node1->safe_psql('postgres',
+my ($survivor_ok) = psql_retry_ok($node1,
 	"CREATE TABLE t_survivor (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_survivor VALUES (1, 'alive');");
+die 'node1 first DDL never succeeded' unless $survivor_ok;
 
-$node0->safe_psql('postgres',
+my ($keep_ok) = psql_retry_ok($node0,
 	"CREATE TABLE t_keep (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_keep VALUES (1, 'keep');"
 	. "CREATE TABLE t_dropme (id int PRIMARY KEY, note text);"
 	. "INSERT INTO t_dropme VALUES (1, 'doomed');");
+die 'node0 first DDL never succeeded' unless $keep_ok;
 
 # Shared-tree relfile of t_dropme, captured BEFORE the drop.
 my $drop_relpath = $node0->safe_psql('postgres',

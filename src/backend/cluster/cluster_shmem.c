@@ -681,6 +681,9 @@ cluster_init_shmem_module(void)
 		cluster_grd_outbound_shmem_register();
 	if (cluster_shmem_lookup_region("pgrac cluster grd work queue") == NULL)
 		cluster_grd_work_queue_shmem_register();
+	/* PGRAC: spec-7.2 D4 — DATA-plane outbound ring (Q6-B twin). */
+	if (cluster_shmem_lookup_region("pgrac cluster lms data outbound") == NULL)
+		cluster_lms_outbound_shmem_register();
 
 	/*
 	 * spec-2.4 D2: register cluster_epoch shmem region.  64-byte cache-
@@ -915,6 +918,7 @@ cluster_request_shmem(void)
 	cluster_cr_pool_request_lwlocks();		  /* spec-5.51: CR pool named LWLock tranche */
 	cluster_resolver_cache_request_lwlocks(); /* spec-5.55: resolver cache LWLock tranche */
 	cluster_ges_dedup_shmem_request();
+	cluster_lms_outbound_request_lwlocks(); /* PGRAC: spec-7.2 D4 DATA ring */
 
 	/*
 	 * spec-4.5a G5: pg_xact_remote SLRU manages its own shmem (SimpleLru),
@@ -1076,6 +1080,22 @@ cluster_init_shmem(void)
 								  "membership gate."),
 						errhint("Enable cluster.online_join on every node, or disable "
 								"cluster.xid_striping.")));
+
+	/*
+	 * spec-6.15b D6: shared_catalog puts catalog heap pages on one shared
+	 * storage image, so a multi-node cluster must not allocate dense native
+	 * xids from every node.  Without striping, two nodes can reuse the seed
+	 * native-era xid range and poison shared catalog visibility.
+	 */
+	if (cluster_enabled && cluster_shared_catalog && cluster_conf_node_count() > 1
+		&& !cluster_xid_striping)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster.shared_catalog on a multi-node cluster requires cluster.xid_striping"),
+			 errdetail("The configured cluster declares %d nodes.", cluster_conf_node_count()),
+			 errhint("Set cluster.xid_striping=on (and cluster.online_join=on) on every "
+					 "shared_catalog node.")));
 
 	/*
 	 * Stage 0.18: bind the cluster_ic vtable for the configured tier.

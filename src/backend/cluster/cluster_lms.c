@@ -59,7 +59,10 @@
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
+#include "cluster/cluster_cssd.h"
+#include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
+#include "cluster/cluster_gcs_block.h"	 /* PGRAC: spec-7.2 D4 plane probe + pi drain */
+#include "cluster/cluster_write_fence.h" /* PGRAC: spec-7.2 D5 fence linkage */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -196,6 +199,8 @@ cluster_lms_shmem_init(void)
 		 * starvation counter starts at 0. */
 		pg_atomic_init_u64(&cluster_lms_state->lms_restart_generation, 0);
 		pg_atomic_init_u64(&cluster_lms_state->priority_starvation_observed_count, 0);
+		/* spec-7.2 D6 — DATA-plane connection resets counter. */
+		pg_atomic_init_u64(&cluster_lms_state->lms_conn_resets, 0);
 		ConditionVariableInit(&cluster_lms_state->cv);
 	}
 }
@@ -381,6 +386,22 @@ cluster_lms_get_pid(void)
 	return pid;
 }
 
+/*
+ * PGRAC: spec-7.2 D4 — wake the LMS data-plane loop (mirror of
+ * cluster_lmon_wakeup):  SIGUSR1 → lms_sigusr1_handler → SetLatch.
+ * Safe from any context;  self-kick and pre-spawn calls no-op.
+ */
+void
+cluster_lms_wakeup(void)
+{
+	pid_t pid = cluster_lms_get_pid();
+
+	if (pid <= 0 || pid == MyProcPid)
+		return;
+
+	(void)kill(pid, SIGUSR1);
+}
+
 TimestampTz
 cluster_lms_get_spawned_at(void)
 {
@@ -562,6 +583,29 @@ cluster_lms_get_priority_starvation_observed_count(void)
 	return pg_atomic_read_u64(&cluster_lms_state->priority_starvation_observed_count);
 }
 
+/*
+ * spec-7.2 D6 — DATA-plane connection resets counter.
+ *
+ *	cluster_lms_bump_conn_resets adds the number of DATA connections a
+ *	single reset event tore down (epoch bump in production, injection in
+ *	the F6-1 test).  Called from the LMS DATA-plane tick; a shared-memory
+ *	atomic so pg_stat_cluster_* / the debug dump can observe reset activity.
+ */
+void
+cluster_lms_bump_conn_resets(uint32 n)
+{
+	if (cluster_lms_state != NULL && n > 0)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_conn_resets, (uint64)n);
+}
+
+uint64
+cluster_lms_get_conn_resets(void)
+{
+	if (cluster_lms_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lms_state->lms_conn_resets);
+}
+
 
 /* ============================================================
  * HC4 single ownership atomic guard.
@@ -651,6 +695,14 @@ cluster_lms_wake_drain(void)
  *	      latch / ShutdownRequestPending)
  * ============================================================ */
 
+/* PGRAC: spec-7.2 D4 — SIGUSR1 wakeup handler (latch only;  rule 16:
+ * async-signal-safe operations exclusively). */
+static void
+lms_sigusr1_handler(SIGNAL_ARGS)
+{
+	SetLatch(MyLatch);
+}
+
 void
 LmsMain(void)
 {
@@ -667,7 +719,9 @@ LmsMain(void)
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	/* No ProcSignal slot in the skeleton; see auxprocess.c early setup. */
-	pqsignal(SIGUSR1, SIG_IGN);
+	/* PGRAC: spec-7.2 D4 — SIGUSR1 = data-plane wakeup (was SIG_IGN in
+	 * the skeleton).  Handler only sets the latch (async-signal-safe). */
+	pqsignal(SIGUSR1, lms_sigusr1_handler);
 	pqsignal(SIGUSR2, SIG_IGN);
 	pqsignal(SIGCHLD, SIG_DFL);
 
@@ -694,6 +748,11 @@ LmsMain(void)
 	 * the new generation. */
 	cluster_lms_bump_restart_generation_at_main_entry();
 	(void)cluster_ges_dedup_drop_stale_entries();
+
+	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
+	 * mesh (false = plane off for this node;  the loop below then keeps
+	 * the historic latch-only wait and park-serve keeps working). */
+	(void)cluster_lms_data_plane_startup();
 
 	/* Transition to READY. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
@@ -734,10 +793,45 @@ LmsMain(void)
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
 		cluster_lms_cr_drain();
 
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
-		ResetLatch(MyLatch);
+		/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
+		 * the data-plane tick (WaitEventSet: DATA sockets + MyLatch, latch
+		 * reset inside);  the historic plain WaitLatch stays the fallback
+		 * when the plane is off. */
+		if (cluster_lms_data_plane_enabled()) {
+			/* PGRAC: spec-7.2 D4 — once the GCS block family flips to
+			 * the DATA plane, LMS ships its own READY results and
+			 * drives the PI-discard notes (the LMON tick twins go
+			 * quiet via the same registry probe);  the DATA outbound
+			 * ring drains here either way (empty before the flip).
+			 * D5 fence linkage: while the write-fence is enforcing and
+			 * writes are disallowed, the IMAGE-BEARING legs (READY
+			 * ship + PI notes) send nothing — block images must not
+			 * leave a fenced node.  The outbound ring is NOT fence
+			 * gated: it carries only backend solicitations (REQUEST /
+			 * FORWARD / CR + undo fetches — the master's image REPLY
+			 * is sent from the dispatch context, never staged here),
+			 * and a fenced node's reads must keep flowing exactly as
+			 * they do on the ungated CONTROL ring pre-flip;  gating
+			 * them wedges post-crash rejoin behind its own catalog
+			 * reads.  Thaw wakes the latch and the held image legs
+			 * resume (pure-read probe, no-throw, per the
+			 * write_fence_allowed contract). */
+			if (cluster_gcs_block_family_on_data_plane()
+				&& !(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
+				cluster_lms_cr_ship_ready();
+				cluster_gcs_block_pi_discard_drain();
+			}
+			(void)cluster_lms_outbound_drain_send();
+			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+		} else {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+			ResetLatch(MyLatch);
+		}
 	}
+
+	/* PGRAC: spec-7.2 D2 — close DATA-plane fds before teardown. */
+	cluster_lms_data_plane_shutdown();
 
 	/* PGRAC: spec-6.12b — retract the wake latch before teardown. */
 	cluster_cr_server_publish_lms_latch(NULL);
@@ -1043,6 +1137,8 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 				continue;
 			conf_node = cluster_conf_lookup_node(candidate);
 			if (conf_node == NULL)
+				continue;
+			if (cluster_cssd_get_peer_state(candidate) == CLUSTER_CSSD_PEER_DEAD)
 				continue;
 			if (!native_probe_node_bit(candidate, &peer_bit)) {
 				pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);

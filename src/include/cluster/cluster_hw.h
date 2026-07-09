@@ -312,12 +312,30 @@ extern uint32 cluster_hw_shard_rebuilt_generation(uint32 shard_id);
 extern void cluster_hw_mark_shard_rebuilt(uint32 shard_id, uint32 generation);
 
 /*
- * Per-dead-origin online-remaster launch idempotency (S5d).  The GRD FSM records
- * the episode it last launched a rebuild worker for a dead origin under, and
- * skips relaunching while the value equals the current episode.
+ * Per-dead-origin online-remaster launch state (S5d / spec-4.6a).  The GRD FSM
+ * records the episode it last launched a rebuild worker for a dead origin under,
+ * and the worker records a terminal result.  BLOCKED is retryable within the same
+ * episode; BLOCKED_STRUCTURAL is not.
  */
+typedef enum ClusterHwRemasterResult {
+	CLUSTER_HW_REMASTER_NONE = 0,
+	CLUSTER_HW_REMASTER_RUNNING,
+	CLUSTER_HW_REMASTER_DONE,
+	CLUSTER_HW_REMASTER_BLOCKED,
+	CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL,
+	CLUSTER_HW_REMASTER_NOT_APPLICABLE,
+} ClusterHwRemasterResult;
+
 extern uint64 cluster_hw_remaster_launched_episode(int node_id);
 extern void cluster_hw_remaster_set_launched(int node_id, uint64 episode);
+extern ClusterHwRemasterResult cluster_hw_remaster_result(int node_id);
+extern void cluster_hw_remaster_set_result(int node_id, ClusterHwRemasterResult result);
+extern uint32 cluster_hw_remaster_attempts(int node_id);
+extern void cluster_hw_remaster_set_attempts(int node_id, uint32 attempts);
+extern uint64 cluster_hw_remaster_next_attempt_at(int node_id);
+extern void cluster_hw_remaster_set_next_attempt_at(int node_id, uint64 ts);
+extern const char *cluster_hw_remaster_result_name(ClusterHwRemasterResult result);
+extern bool cluster_hw_remaster_recoverable(void);
 
 /*
  * cluster_hw_apply_hwm -- redo / remaster rebuild: create-if-absent and raise
@@ -383,6 +401,8 @@ extern uint64 cluster_hw_failclosed_count(void);
 extern uint64 cluster_hw_not_ready_count(void);
 extern uint64 cluster_hw_remaster_done_count(void);
 extern uint64 cluster_hw_remaster_blocked_count(void);
+extern uint64 cluster_hw_remaster_retry_count(void);
+extern uint64 cluster_hw_remaster_retry_exhausted_count(void);
 extern void cluster_hw_bump_alloc(void);
 extern void cluster_hw_bump_authority_create(void);
 extern void cluster_hw_bump_reserve_wal(void);
@@ -391,6 +411,8 @@ extern void cluster_hw_bump_failclosed(void);
 extern void cluster_hw_bump_not_ready(void);
 extern void cluster_hw_bump_remaster_done(void);
 extern void cluster_hw_bump_remaster_blocked(void);
+extern void cluster_hw_bump_remaster_retry(void);
+extern void cluster_hw_bump_remaster_retry_exhausted(void);
 
 #endif /* !FRONTEND */
 

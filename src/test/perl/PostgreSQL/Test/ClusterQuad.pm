@@ -55,6 +55,29 @@ use PostgreSQL::Test::Utils;
 our $NODES = 4;
 
 
+
+# Relocate an init_from_backup node's copied pg_wal into its shared WAL thread
+# directory, matching the layout initdb -X produces for the seed node.
+sub _relocate_backup_pg_wal
+{
+	my ($node, $wal_threads_root, $thread_id) = @_;
+	my $pgwal = $node->data_dir . '/pg_wal';
+	my $wal_thread = "$wal_threads_root/thread_$thread_id";
+
+	mkdir $wal_thread or die "mkdir $wal_thread: $!";
+	opendir(my $dh, $pgwal) or die "opendir $pgwal: $!";
+	for my $e (readdir $dh)
+	{
+		next if $e eq '.' || $e eq '..';
+		rename("$pgwal/$e", "$wal_thread/$e")
+		  or die "rename $pgwal/$e -> $wal_thread/$e: $!";
+	}
+	closedir $dh;
+	rmdir $pgwal or die "rmdir $pgwal: $!";
+	symlink($wal_thread, $pgwal) or die "symlink $pgwal -> $wal_thread: $!";
+	return;
+}
+
 #-----------------------------------------------------------------------
 # new_quad($class, $cluster_name, %opts)
 #
@@ -66,14 +89,19 @@ our $NODES = 4;
 #	                        voting-disk files (QVOTEC reaches quorum OK)
 #	  wal_threads_root    : 1  -> shared per-thread WAL root
 #	  shared_data         : 1  -> shared data root (cluster_fs backend)
+#	  shared_catalog      : 1  -> t/337-style shared-catalog formation;
+#	                        implies shared_data + wal_threads_root
 #-----------------------------------------------------------------------
 sub new_quad
 {
 	my ($class, $cluster_name, %opts) = @_;
 
-	# Allocate 8 distinct free ports (4 PG + 4 IC).
+	# Allocate 12 distinct free ports (4 PG + 4 IC + 4 DATA).
+	# spec-7.2 D2: DATA-plane ports are allocator-provided, never
+	# offset-derived (r1-F2).
 	my @pg_ports;
 	my @ic_ports;
+	my @data_ports;
 	for (0 .. $NODES - 1)
 	{
 		push @pg_ports, PostgreSQL::Test::Cluster::get_free_port();
@@ -82,6 +110,10 @@ sub new_quad
 	{
 		push @ic_ports, PostgreSQL::Test::Cluster::get_free_port();
 	}
+	for (0 .. $NODES - 1)
+	{
+		push @data_ports, PostgreSQL::Test::Cluster::get_free_port();
+	}
 
 	my @nodes;
 	for my $i (0 .. $NODES - 1)
@@ -89,6 +121,12 @@ sub new_quad
 		push @nodes,
 		  PostgreSQL::Test::Cluster->new(
 			"${cluster_name}_node$i", port => $pg_ports[$i]);
+	}
+
+	if ($opts{shared_catalog})
+	{
+		$opts{shared_data} = 1;
+		$opts{wal_threads_root} = 1;
 	}
 
 	# spec-4.6: strict-mode opt-in (mirror ClusterTriple) -- pre-allocate N
@@ -127,23 +165,75 @@ sub new_quad
 	if ($opts{shared_data})
 	{
 		$shared_data_root = PostgreSQL::Test::Utils::tempdir();
+		if ($opts{shared_catalog})
+		{
+			mkdir "$shared_data_root/global"
+			  or die "mkdir $shared_data_root/global: $!";
+		}
 	}
 
-	my $wal_node_index = 0;
+	if ($opts{shared_catalog})
+	{
+		my $sc_common = <<EOC;
+shared_buffers = 16MB
+cluster.shared_storage_backend = cluster_fs
+cluster.shared_data_dir = '$shared_data_root'
+cluster.smgr_user_relations = on
+cluster.controlfile_shared_authority = on
+cluster.shared_catalog = on
+cluster.merged_recovery = on
+EOC
+
+		$nodes[0]->init(allows_streaming => 1,
+			extra => [ '-X', "$wal_threads_root/thread_1" ]);
+		$nodes[0]->start;
+		$nodes[0]->backup('clusterquad_scb');
+		$nodes[0]->stop;
+
+		for my $i (1 .. $NODES - 1)
+		{
+			$nodes[$i]->init_from_backup($nodes[0], 'clusterquad_scb');
+			_relocate_backup_pg_wal($nodes[$i], $wal_threads_root, $i + 1);
+		}
+
+		# Seed the shared catalog/controlfile/OID authorities in a single-node era,
+		# then append the real cluster config below.  Last GUC value wins.
+		$nodes[0]->append_conf('postgresql.conf', $sc_common);
+		$nodes[0]->append_conf('postgresql.conf', <<EOC);
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+EOC
+		$nodes[0]->start;
+		die "shared_catalog seed did not create catalog authority"
+		  unless -e "$shared_data_root/global/pgrac_catalog_authority";
+		$nodes[0]->stop;
+	}
+	else
+	{
+		my $wal_node_index = 0;
+		for my $node (@nodes)
+		{
+			if (defined $wal_threads_root)
+			{
+				my $thread_id = $wal_node_index + 1;
+				$node->init(extra => [ '-X', "$wal_threads_root/thread_$thread_id" ]);
+			}
+			else
+			{
+				$node->init;
+			}
+			$wal_node_index++;
+		}
+	}
+
 	for my $node (@nodes)
 	{
 		if (defined $wal_threads_root)
 		{
-			my $thread_id = $wal_node_index + 1;
-			$node->init(extra => [ '-X', "$wal_threads_root/thread_$thread_id" ]);
 			$node->append_conf('postgresql.conf',
 				"cluster.wal_threads_dir = '$wal_threads_root'\n");
 		}
-		else
-		{
-			$node->init;
-		}
-		$wal_node_index++;
 
 		if (defined $shared_data_root)
 		{
@@ -153,6 +243,15 @@ sub new_quad
 				"cluster.shared_data_dir = '$shared_data_root'\n");
 			$node->append_conf('postgresql.conf',
 				"cluster.smgr_user_relations = on\n");
+			if ($opts{shared_catalog})
+			{
+				$node->append_conf('postgresql.conf',
+					"cluster.controlfile_shared_authority = on\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.shared_catalog = on\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.merged_recovery = on\n");
+			}
 		}
 
 		# Enable cluster + tier1, same baseline as ClusterTriple (spec-2.2).
@@ -194,8 +293,9 @@ sub new_quad
 	my $peers_block = "";
 	for my $i (0 .. $NODES - 1)
 	{
-		$peers_block .=
-		  "[node.$i]\ninterconnect_addr = 127.0.0.1:$ic_ports[$i]\n\n";
+		$peers_block .= "[node.$i]\n"
+		  . "interconnect_addr = 127.0.0.1:$ic_ports[$i]\n"
+		  . "data_addr = 127.0.0.1:$data_ports[$i]\n\n";
 	}
 
 	my $pgrac_conf_body = <<EOC;
@@ -216,6 +316,7 @@ EOC
 		cluster_name      => $cluster_name,
 		pg_ports          => \@pg_ports,
 		ic_ports          => \@ic_ports,
+		data_ports        => \@data_ports,
 		voting_disk_paths => \@voting_disk_paths,
 		wal_threads_root  => $wal_threads_root,
 		shared_data_root  => $shared_data_root,

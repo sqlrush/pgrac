@@ -100,6 +100,9 @@ static Size fake_pcm_keysize = 0;
 static Size fake_pcm_entrysize = 0;
 static LWLock *fake_lwlock_held = NULL;
 static LWLockMode fake_lwlock_mode = LW_EXCLUSIVE;
+static LWLock *fake_lwlock_stack[16];
+static LWLockMode fake_lwlock_mode_stack[16];
+static int fake_lwlock_depth = 0;
 static uint32 fake_init_wait_event_seen = 0;
 static uint32 fake_lwlock_wait_event_seen = 0;
 
@@ -121,11 +124,25 @@ static struct {
 static sigjmp_buf ut_ereport_jump;
 static bool ut_ereport_jump_armed = false;
 static int ut_ereport_fired_count = 0;
+static bool fake_local_x_upgrade_result = false;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+/* spec-4.6a Amendment v1.2 (R5): the S->X upgrade is now wrapped in
+ * PG_TRY/PG_CATCH, which references the exception stack + re-throw.  The
+ * unit's errfinish mock longjmps to its own buffer (never through
+ * PG_exception_stack), so these exist for the linker only. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
 {
 	abort();
 }
@@ -155,6 +172,10 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_pcm_keysize = 0;
 	fake_pcm_entrysize = 0;
 	fake_lwlock_held = NULL;
+	fake_lwlock_mode = LW_EXCLUSIVE;
+	fake_lwlock_depth = 0;
+	memset(fake_lwlock_stack, 0, sizeof(fake_lwlock_stack));
+	memset(fake_lwlock_mode_stack, 0, sizeof(fake_lwlock_mode_stack));
 	fake_init_wait_event_seen = 0;
 	fake_lwlock_wait_event_seen = 0;
 	ut_wait_event_info_storage = 0;
@@ -167,6 +188,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_cv_broadcast_count = 0;
 	fake_cv_sleep_wait_event = 0;
 	fake_cv_wake_release.armed = false;
+	fake_local_x_upgrade_result = false;
 	cluster_node_id = 0;
 	NBuffers = max_entries;
 	cluster_pcm_grd_max_entries = max_entries;
@@ -191,9 +213,20 @@ bool cluster_read_scache = false;
 
 bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
 bool
-cluster_gcs_block_local_x_upgrade(BufferTag tag pg_attribute_unused())
+cluster_gcs_block_local_x_upgrade(BufferTag tag)
 {
-	return false;
+	uint32 holders_bm;
+	int n;
+
+	if (!fake_local_x_upgrade_result)
+		return false;
+	holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag);
+	if (cluster_node_id >= 0 && cluster_node_id < 32)
+		holders_bm &= ~((uint32)1u << (uint32)cluster_node_id);
+	for (n = 0; n < 32; n++)
+		if ((holders_bm & ((uint32)1u << n)) != 0)
+			(void)cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE, n);
+	return cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE, cluster_node_id);
 }
 
 /* spec-4.7a D4 — stub CSSD peer liveness for the other-live-holder gate.
@@ -348,6 +381,10 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	Assert(fake_lwlock_depth < (int)lengthof(fake_lwlock_stack));
+	fake_lwlock_stack[fake_lwlock_depth] = lock;
+	fake_lwlock_mode_stack[fake_lwlock_depth] = mode;
+	fake_lwlock_depth++;
 	fake_lwlock_held = lock;
 	fake_lwlock_mode = mode;
 	fake_lwlock_wait_event_seen = ut_wait_event_info_storage;
@@ -357,14 +394,28 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
-	Assert(fake_lwlock_held == lock);
-	fake_lwlock_held = NULL;
+	Assert(fake_lwlock_depth > 0);
+	Assert(fake_lwlock_stack[fake_lwlock_depth - 1] == lock);
+	fake_lwlock_depth--;
+	fake_lwlock_stack[fake_lwlock_depth] = NULL;
+	if (fake_lwlock_depth > 0) {
+		fake_lwlock_held = fake_lwlock_stack[fake_lwlock_depth - 1];
+		fake_lwlock_mode = fake_lwlock_mode_stack[fake_lwlock_depth - 1];
+	} else {
+		fake_lwlock_held = NULL;
+		fake_lwlock_mode = LW_EXCLUSIVE;
+	}
 }
 
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
-	return fake_lwlock_held == lock && fake_lwlock_mode == mode;
+	int i;
+
+	for (i = fake_lwlock_depth - 1; i >= 0; i--)
+		if (fake_lwlock_stack[i] == lock && fake_lwlock_mode_stack[i] == mode)
+			return true;
+	return false;
 }
 
 /* ----------
@@ -1280,6 +1331,79 @@ UT_TEST(test_pcm_d3_not_double_x)
 	}
 }
 
+UT_TEST(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades)
+{
+	BufferTag tag = make_tag(96);
+	BufferDesc buf;
+	bool save = cluster_gcs_block_local_cache;
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+	cluster_gcs_block_local_cache = true;
+	fake_local_x_upgrade_result = true;
+
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+
+	memset(&buf, 0, sizeof(buf));
+	buf.tag = tag;
+	buf.pcm_state = (uint8)PCM_STATE_N;
+	cluster_node_id = 0;
+	UT_ASSERT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_X));
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_X);
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tag, 0));
+	UT_ASSERT(cluster_pcm_master_requester_is_holder(tag, 0, PCM_TRANS_N_TO_X));
+
+	cluster_gcs_block_local_cache = save;
+}
+
+UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
+{
+	BufferTag stag = make_tag(94);
+	BufferTag xtag = make_tag(95);
+	uint32 s_bitmap;
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+
+	/* Dead node 2 was the first S holder, so master_holder points at it. */
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(stag, PCM_LOCK_MODE_S);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(stag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(stag), 2);
+	UT_ASSERT(!cluster_pcm_lock_clean_leave_verify_no_leftover(2));
+
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(xtag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(xtag), (int)PCM_LOCK_MODE_X);
+
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_cleanup_on_node_dead(2), (uint64)2);
+
+	s_bitmap = cluster_pcm_lock_query_s_holders_bitmap(stag);
+	UT_ASSERT_EQ((int)(s_bitmap & (1u << 2)), 0);
+	UT_ASSERT((s_bitmap & (1u << 1)) != 0);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(stag), (int)PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(stag), 1);
+
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(xtag), (int)PCM_LOCK_MODE_N);
+	UT_ASSERT(cluster_pcm_lock_clean_leave_verify_no_leftover(2));
+	UT_ASSERT((fake_cv_broadcast_count) >= (1));
+
+	/* Idempotent: a repeated dead-sweep pass has nothing left to clean. */
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_cleanup_on_node_dead(2), (uint64)0);
+
+	/* spec-4.6a D12 (r2-P1-3) pending-X form: a dead requester's parked X
+	 * intent is cleared by the companion HC124 sweep the same dead-sweep hook
+	 * drives, and the sweep is idempotent too. */
+	cluster_pcm_lock_set_pending_x(stag, 2, 1234);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), 2);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_clear_pending_x_for_node(2), (uint64)1);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), -1);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_clear_pending_x_for_node(2), (uint64)0);
+}
+
 /* spec-5.2a D2 (U1): clean-page X-transfer arm is one-shot.  arm(true) sets
  * the backend-local flag; consume() reads-and-clears it (the acquire path
  * calls consume() once so the eligibility can never leak into a SUBSEQUENT
@@ -1313,7 +1437,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(41);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -1352,6 +1476,8 @@ main(void)
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
 	UT_RUN(test_pcm_d3_not_double_x);
+	UT_RUN(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades);
+	UT_RUN(test_pcm_dead_node_cleanup_drops_holder_records);
 	UT_RUN(test_clean_page_xfer_arm_is_one_shot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

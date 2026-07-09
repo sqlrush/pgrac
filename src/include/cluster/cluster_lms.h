@@ -257,6 +257,15 @@ typedef struct ClusterLmsSharedState {
 	 *	BOOST = 11 awaits spec-2.28+ with PG core lock manager
 	 *	`LockWaitQueueInsertAtHead`改造 + integrated receiver. */
 	pg_atomic_uint64 priority_starvation_observed_count;
+
+	/* spec-7.2 D6 — DATA-plane connection resets observability counter.
+	 *
+	 *	Bumped by the LMS DATA-plane tick (cluster_lms_data_plane.c) once
+	 *	per connection torn down by a proactive reset:  an epoch bump in
+	 *	production (INV-7.2-CONN-EPOCH ③) or the cluster-lms-conn-reset
+	 *	injection in the F6-1 fault test.  Monotone; cluster-wide reset
+	 *	activity is the sum across nodes. */
+	pg_atomic_uint64 lms_conn_resets;
 } ClusterLmsSharedState;
 
 
@@ -293,6 +302,32 @@ extern void cluster_lms_request_shutdown(void);
  * IsUnderPostmaster (reverse defense in depth).  Never returns.
  */
 extern void LmsMain(void) pg_attribute_noreturn();
+
+/*
+ * PGRAC: spec-7.2 D2 — LMS-owned DATA-plane interconnect loop
+ * (cluster_lms_data_plane.c).  startup binds the data_addr listener and
+ * aims this process's tier1 state at the DATA plane (false = plane off:
+ * no data_addr / cluster off / stub tier);  tick runs one management +
+ * WaitEventSet round (sockets + MyLatch — replaces the historic plain
+ * WaitLatch when the plane is live);  shutdown closes owned fds.
+ */
+extern bool cluster_lms_data_plane_startup(void);
+extern bool cluster_lms_data_plane_enabled(void);
+extern void cluster_lms_data_plane_tick(long timeout_ms);
+extern void cluster_lms_data_plane_shutdown(void);
+
+/*
+ * PGRAC: spec-7.2 D4 — LMS wakeup (mirror of cluster_lmon_wakeup) + the
+ * DATA-plane outbound ring (cluster_lms_outbound.c;  Q6-B twin ring:
+ * backends stage DATA frames, LMS drains and sends on its own fds).
+ */
+extern void cluster_lms_wakeup(void);
+extern void cluster_lms_outbound_shmem_register(void);
+extern void cluster_lms_outbound_request_lwlocks(void);
+extern bool cluster_lms_outbound_enqueue(uint8 msg_type, uint32 dest_node_id, const void *payload,
+										 uint16 payload_len);
+extern int cluster_lms_outbound_drain_send(void);
+extern uint32 cluster_lms_outbound_depth(void);
 
 /*
  * Read-only accessors for SQL view + diagnostics.
@@ -332,6 +367,10 @@ extern void cluster_lms_bump_restart_generation_at_main_entry(void);
 /* spec-2.27 D7 — priority starvation observability counter. */
 extern void cluster_lms_inc_priority_starvation_observed(void);
 extern uint64 cluster_lms_get_priority_starvation_observed_count(void);
+
+/* spec-7.2 D6 — DATA-plane connection resets observability counter. */
+extern void cluster_lms_bump_conn_resets(uint32 n);
+extern uint64 cluster_lms_get_conn_resets(void);
 
 /*
  * State enum -> canonical lowercase string ("disabled", "not_started",

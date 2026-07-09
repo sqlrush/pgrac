@@ -74,6 +74,8 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_marker_async.h"
+
 #include "cluster/cluster_write_fence.h" /* CLUSTER_FENCE_MARKER_BYTES (marker offset) */
 
 /* 128 nodes, same width as ReconfigEvent.dead_bitmap. */
@@ -415,6 +417,14 @@ extern void cluster_node_remove_shmem_register(void);
  * ------------------------------------------------------------------ */
 extern ClusterRemovalMarkerSubmitResult
 cluster_node_remove_submit_marker(const ClusterRemovalMarker *m);
+extern bool cluster_node_remove_submit_marker_async(ClusterMarkerAsync *a,
+													const ClusterRemovalMarker *m,
+													ClusterMarkerAsyncKind kind, int32 target_node,
+													TimestampTz now);
+extern ClusterMarkerPollResult cluster_node_remove_poll_marker_async(ClusterMarkerAsync *a,
+																	 TimestampTz now,
+																	 uint32 *out_result,
+																	 uint64 *out_elapsed_us);
 extern bool cluster_node_remove_qvotec_poll_pending(ClusterRemovalMarker *out);
 extern void cluster_node_remove_qvotec_complete(bool acked);
 extern void cluster_node_remove_publish_qvotec_latch(struct Latch *latch);

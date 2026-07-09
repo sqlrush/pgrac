@@ -45,6 +45,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
@@ -53,6 +54,7 @@
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
 #include "cluster/cluster_hw_lease.h"		  /* spec-6.12d lease counter stub */
 #include "cluster/cluster_relmap_authority.h" /* spec-6.14 D5 header-read stub */
+#include "cluster/cluster_xid_authority.h"	  /* spec-6.15b XID authority dump stubs */
 
 #undef printf
 #undef fprintf
@@ -342,6 +344,21 @@ cluster_relmap_authority_read_header(bool shared_map, Oid dbid, ClusterRelmapAut
 	return false;
 }
 
+/* spec-6.15b D7 stubs: dump_catalog reads the XID authority observation
+ * keys; this standalone debug unit does not link the file-I/O authority
+ * objects. */
+bool
+cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
+{
+	return false;
+}
+
+bool
+cluster_xid_prehistory_was_adopted(void)
+{
+	return false;
+}
+
 /* spec-4.12 D7 + spec-4.12b D6 stubs: dump_write_fence (cluster_debug.o) reads 8
  * counters now, and cluster_startup_phase.o (linked here) references the rejoin
  * self-fence gate.  cluster_write_fence.o is not linked -- provide stubs returning
@@ -564,6 +581,9 @@ uint64 cluster_hw_failclosed_count(void);
 uint64 cluster_hw_not_ready_count(void);
 uint64 cluster_hw_remaster_done_count(void);
 uint64 cluster_hw_remaster_blocked_count(void);
+uint64 cluster_hw_remaster_retry_count(void);
+uint64 cluster_hw_remaster_retry_exhausted_count(void);
+bool cluster_hw_remaster_recoverable(void);
 uint64
 cluster_hw_alloc_count(void)
 {
@@ -603,6 +623,21 @@ uint64
 cluster_hw_remaster_blocked_count(void)
 {
 	return 0;
+}
+uint64
+cluster_hw_remaster_retry_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_remaster_retry_exhausted_count(void)
+{
+	return 0;
+}
+bool
+cluster_hw_remaster_recoverable(void)
+{
+	return true;
 }
 
 /* spec-5.7 D4 dump_dl stubs (cluster_dl.c not linked in this binary). */
@@ -938,6 +973,30 @@ cluster_gcs_get_api_state(void)
 uint64
 cluster_gcs_get_block_request_count(void)
 {
+	return 0;
+}
+/* spec-7.2 D6 stubs: ship-latency histogram accessors. */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	return (bucket == 15) ? UINT64_MAX : (uint64)(bucket + 1) * 1000;
+}
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	(void)bucket;
+	return 0;
+}
+/* spec-7.2 flip stubs: plane facts. */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return false;
+}
+uint64
+cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
+{
+	(void)plane;
 	return 0;
 }
 uint64
@@ -2638,6 +2697,21 @@ cluster_lmon_main_loop_iters(void)
 {
 	return 0;
 }
+uint64
+cluster_lmon_last_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_max_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_slow_iter_count(void)
+{
+	return 0;
+}
 int
 cluster_lmon_status(void)
 {
@@ -3288,15 +3362,77 @@ cluster_grd_deadlock_chunk_oo_buffer_overflow_count(void)
 	return 0;
 }
 
-/* spec-4.6 D5 stub:  dump_grd_recovery consumes the bulk counter
- * snapshot.  Zero-fill;  layout = 13 × uint64 (must track the
- * ClusterGrdRecoveryCounters struct in cluster_grd.h). */
-struct ClusterGrdRecoveryCounters;
-void cluster_grd_recovery_counters_snapshot(struct ClusterGrdRecoveryCounters *out);
-void
-cluster_grd_recovery_counters_snapshot(struct ClusterGrdRecoveryCounters *out)
+uint32
+cluster_grd_recovery_state_value(void)
 {
-	memset(out, 0, 13 * sizeof(uint64));
+	return (uint32)GRD_RECOVERY_IDLE;
+}
+
+const char *
+cluster_grd_recovery_state_name(uint32 state pg_attribute_unused())
+{
+	return "idle";
+}
+
+uint64
+cluster_grd_recovery_last_event_id(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_event_old_epoch(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_episode_epoch_value(void)
+{
+	return 0;
+}
+
+uint32
+cluster_grd_recovery_event_coordinator(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_done_epoch_for(int32 node pg_attribute_unused())
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_done_bitmap_hash_for(int32 node pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+cluster_grd_recovery_block_redeclare_cursor(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_block_redeclare_epoch(void)
+{
+	return 0;
+}
+
+bool
+cluster_grd_recovery_block_redeclare_done(void)
+{
+	return true;
+}
+
+/* spec-4.6 D5 stub: dump_grd_recovery consumes the bulk counter snapshot. */
+void
+cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
+{
+	memset(out, 0, sizeof(*out));
 }
 
 uint32
@@ -3374,6 +3510,16 @@ cluster_reconfig_get_join_timeout_count(void)
 }
 uint64
 cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_slow_ack_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_timeout_count(void)
 {
 	return 0;
 }
@@ -3554,6 +3700,12 @@ cluster_lms_get_native_probe_timeout_count(void)
 /* spec-2.27 D7 R10 stub audit — priority starvation observability counter. */
 uint64
 cluster_lms_get_priority_starvation_observed_count(void)
+{
+	return 0;
+}
+/* spec-7.2 D6 stub — DATA-plane connection resets observability counter. */
+uint64
+cluster_lms_get_conn_resets(void)
 {
 	return 0;
 }

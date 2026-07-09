@@ -550,9 +550,12 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 
 	/* spec-4.6 P0#3 cluster gate — fire-and-forget barrier announcement:
 	 * record and return (no work queue, no reply, no dedup;  the sender
-	 * re-announces each tick, the receiver write is a monotonic max). */
+	 * re-announces each tick, the receiver write is a monotonic max).
+	 * Amendment v1.2 (R2): the request-id field pair carries the sender's
+	 * dead_bitmap hash (composite convergence key), not an event_id. */
 	if (req->opcode == GES_REQ_OPCODE_REDECLARE_DONE) {
-		cluster_grd_recovery_mark_peer_done((int32)env->source_node_id, holder_epoch);
+		cluster_grd_recovery_mark_peer_done((int32)env->source_node_id, holder_epoch,
+											ges_request_holder_request_id(req));
 		return;
 	}
 

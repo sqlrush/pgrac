@@ -83,6 +83,8 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 
 my $rdma_port0 = PostgreSQL::Test::Cluster::get_free_port();
 my $rdma_port1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 for my $node ($pair->node0, $pair->node1)
 {
@@ -100,6 +102,7 @@ name = $cluster_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:@{[$pair->ic_port(0)]}
+data_addr = 127.0.0.1:$data_port0
 rdma_addr = $rdma_host:$rdma_port0
 rdma_gid = rxe
 rdma_port = 1
@@ -108,6 +111,7 @@ rdma_qkey = 0
 
 [node.1]
 interconnect_addr = 127.0.0.1:@{[$pair->ic_port(1)]}
+data_addr = 127.0.0.1:$data_port1
 rdma_addr = $rdma_host:$rdma_port1
 rdma_gid = rxe
 rdma_port = 1

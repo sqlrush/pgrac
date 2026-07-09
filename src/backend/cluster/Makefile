@@ -143,6 +143,8 @@ OBJS = \
 	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
+	cluster_lms_data_plane.o \
+	cluster_lms_outbound.o \
 	cluster_lns.o \
 	cluster_membership.o \
 	cluster_mrp.o \
@@ -220,6 +222,8 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
+	cluster_xid_authority.o \
+	cluster_xid_prehistory.o \
 	cluster_xid_stripe.o \
 	cluster_xid_stripe_boot.o \
 	cluster_xid_stripe_xlog.o \

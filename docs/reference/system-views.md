@@ -210,6 +210,9 @@ must not be read as evidence that early transfer is active.
 | `smart_fusion` | `origin_suspect_count` | Pending dependencies associated with an origin suspected dead or unavailable. |
 | `smart_fusion` | `dep_lost_failclosed_count` | Missing or malformed dependency evidence rejected fail-closed. |
 | `smart_fusion` | `retry_failclosed_count` | Retryable Smart Fusion fail-closed outcomes, primarily commit-brake timeout. |
+| `catalog` | `xid_authority_native_hw` | Sealed native-era xid high-water for shared-catalog formation; `0` when the authority is inactive or unreadable. |
+| `catalog` | `xid_authority_sealed` | `t` when the seed completed a clean native-era shutdown and published adoptable XID prehistory. |
+| `catalog` | `xid_prehistory_adopted` | Process-local marker showing whether this postmaster boot adopted native-era pg_xact prehistory. |
 
 Example:
 
