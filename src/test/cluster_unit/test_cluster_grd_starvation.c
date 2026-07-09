@@ -61,6 +61,7 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
@@ -90,6 +91,14 @@
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+
+/* spec-4.6a D12 stub: cluster_grd_cleanup_on_node_dead chains into the PCM
+ * dead-holder cleanup; this fixture has no PCM shmem — no-op. */
+uint64
+cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node pg_attribute_unused())
+{
+	return 0;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -298,6 +307,10 @@ cluster_epoch_get_current(void)
 	return 0;
 }
 
+void
+cluster_epoch_adopt_admitted(uint64 admitted_epoch pg_attribute_unused())
+{}
+
 /*
  * spec-4.7 D2 (L238) — cluster_grd.o's reconfig tick now references the block
  * re-declare scan/send (grd_block_redeclare_step / _cb).  This test exercises
@@ -355,6 +368,12 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	memset(out, 0, sizeof(*out));
 }
 
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
 /* spec-4.11 D3 stub:  cluster_grd.c's WAIT_CLUSTER->IDLE transition consults the
  * thread-recovery unfreeze gate before P7.  These tests drive the GES/GRD
  * remaster FSM, not online thread recovery, so the gate is out of scope -> no-op
@@ -389,6 +408,24 @@ bool
 cluster_hw_remaster_gate_unfreeze(void)
 {
 	return false;
+}
+
+ClusterHwRemasterResult
+cluster_hw_remaster_result(int node_id pg_attribute_unused())
+{
+	return CLUSTER_HW_REMASTER_NONE;
+}
+
+uint32
+cluster_hw_remaster_attempts(int node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+const char *
+cluster_hw_remaster_result_name(ClusterHwRemasterResult result pg_attribute_unused())
+{
+	return "none";
 }
 
 struct PGPROC *

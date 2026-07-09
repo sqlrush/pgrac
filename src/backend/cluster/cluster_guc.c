@@ -226,6 +226,8 @@ int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
 /* spec-4.6 D4/D1 — failure-driven remaster tunables. */
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
+int cluster_hw_remaster_retry_backoff_ms = 1000;
+int cluster_hw_remaster_retry_max_attempts = 16;
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
 int cluster_sequence_default_cache = 100;		/* CREATE-time CACHE injection default */
@@ -2374,6 +2376,21 @@ cluster_init_guc(void)
 					 "request with a fresh deadline."),
 		&cluster_grd_rebuild_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_backoff_ms",
+		gettext_noop("Initial backoff before retrying a BLOCKED HW remaster worker (ms)."),
+		gettext_noop("Range [100, 60000].  Default 1000.  Same-episode HW remaster "
+					 "retries use exponential backoff capped at 60 seconds; the adopted "
+					 "shards stay frozen while retrying."),
+		&cluster_hw_remaster_retry_backoff_ms, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_max_attempts",
+		gettext_noop("Maximum same-episode retries for a BLOCKED HW remaster worker."),
+		gettext_noop("Range [0, 1000].  Default 16.  Zero disables same-episode retry.  "
+					 "Raising the value with SIGHUP lets an exhausted episode resume retrying "
+					 "without waiting for a new reconfig episode."),
+		&cluster_hw_remaster_retry_max_attempts, 16, 0, 1000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.23 D11 NEW:  coordinator REPORT collect deadline. */
 	DefineCustomIntVariable("cluster.lmd_probe_collect_timeout_ms",

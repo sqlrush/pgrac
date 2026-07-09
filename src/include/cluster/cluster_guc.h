@@ -399,6 +399,8 @@ extern int cluster_ges_reply_wait_max_entries;
  *   5000ms;  SIGHUP). */
 extern int cluster_grd_remaster_wait_ms;
 extern int cluster_grd_rebuild_timeout_ms;
+extern int cluster_hw_remaster_retry_backoff_ms;
+extern int cluster_hw_remaster_retry_max_attempts;
 
 /* spec-5.4 D8: SQ sequence lock tunables. */
 extern int cluster_sequence_default_cache;

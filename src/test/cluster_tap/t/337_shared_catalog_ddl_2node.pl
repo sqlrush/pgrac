@@ -94,6 +94,8 @@ if ($ENV{with_pgrac_cluster} && $ENV{with_pgrac_cluster} eq 'no')
 my $shared_root = PostgreSQL::Test::Utils::tempdir();
 mkdir "$shared_root/global" or die "mkdir shared global: $!";
 
+my $wal_root = PostgreSQL::Test::Utils::tempdir();
+
 my $disk_dir = PostgreSQL::Test::Utils::tempdir();
 my @disks;
 for my $i (0 .. 2)
@@ -114,13 +116,31 @@ my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
 # Step 0: node0 init -> backup -> node1 init_from_backup (one shared sysid).
 # ----------
 my $node0 = PostgreSQL::Test::Cluster->new('sc_ddl_node0');
-$node0->init(allows_streaming => 1);
+$node0->init(allows_streaming => 1, extra => [ '-X', "$wal_root/thread_1" ]);
 $node0->start;
 $node0->backup('scb');
 $node0->stop;
 
 my $node1 = PostgreSQL::Test::Cluster->new('sc_ddl_node1');
 $node1->init_from_backup($node0, 'scb');
+
+# Relocate node1's backup-copied WAL into its shared thread dir.  shared_catalog
+# multi-node formation is fail-fast without cluster.wal_threads_dir, and the WAL
+# thread validator requires pg_wal to resolve to the configured thread_N dir.
+{
+	my $pgwal = $node1->data_dir . '/pg_wal';
+	my $wal2 = "$wal_root/thread_2";
+	mkdir $wal2 or die "mkdir $wal2: $!";
+	opendir(my $dh, $pgwal) or die "opendir $pgwal: $!";
+	for my $e (readdir $dh)
+	{
+		next if $e eq '.' || $e eq '..';
+		rename("$pgwal/$e", "$wal2/$e") or die "rename $pgwal/$e: $!";
+	}
+	closedir $dh;
+	rmdir $pgwal or die "rmdir $pgwal: $!";
+	symlink($wal2, $pgwal) or die "symlink $pgwal -> $wal2: $!";
+}
 
 # Config common to the shared-catalog feature (both nodes, both phases).
 my $sc_common = <<EOC;
@@ -168,6 +188,7 @@ cluster.voting_disks = '$disks_csv'
 cluster.cssd_heartbeat_interval_ms = 2000
 cluster.cssd_dead_deadband_factor = 10
 cluster.cf_enqueue_timeout_ms = 30000
+cluster.wal_threads_dir = '$wal_root'
 EOC
 
 $node0->append_conf('postgresql.conf', $cluster_conf);
@@ -818,5 +839,24 @@ my $offlog = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
 like($offlog,
 	qr/cluster\.shared_catalog is off but the shared tree holds/,
 	'L7: the refusal is the designed off-flip vet FATAL (never a stale serve)');
+
+# ----------
+# L8 (spec-4.6a D11 level-2 fail-fast): a multi-node shared_catalog=on boot
+# without cluster.wal_threads_dir is refused at startup -- that shape cannot
+# rebuild a dead node's HW authority from per-thread WAL, so a node failure
+# would be permanently unrecoverable (the silent-BLOCKED wedge of
+# spec-4.6a section 0).  Flip shared_catalog back on and blank the WAL
+# threads root; the boot must fail on the D11 vet, not come up degraded.
+# ----------
+$node1->append_conf('postgresql.conf', "cluster.shared_catalog = on
+");
+$node1->append_conf('postgresql.conf', "cluster.wal_threads_dir = ''
+");
+my $nowalret = $node1->start(fail_ok => 1);
+is($nowalret, 0, 'L8: multi-node shared_catalog boot without wal_threads_dir fails');
+my $nowallog = PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+like($nowallog,
+	qr/cluster\.shared_catalog requires cluster\.wal_threads_dir in a multi-node cluster/,
+	'L8: the refusal is the spec-4.6a D11 startup FATAL with the config errhint');
 
 done_testing();

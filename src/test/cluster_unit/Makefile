@@ -65,6 +65,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_oid_lease \
         test_cluster_relmap_authority \
         test_cluster_hw \
+        test_cluster_hw_remaster_retry \
         test_cluster_dl \
         test_cluster_extend_gate \
         test_cluster_ir \
