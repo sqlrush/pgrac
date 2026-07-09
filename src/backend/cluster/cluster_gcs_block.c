@@ -4652,13 +4652,25 @@ build_and_send_reply: {
 		 * active on that retry).  Useful for driving the
 		 * retransmit_send_count + dedup_hit_count TAP surfaces.
 		 */
-	CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
-	if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
-		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
-		block_payload_release_cb = NULL;
-		block_payload_release_arg = NULL;
-		pfree(buf);
-		return;
+	/*
+	 * spec-7.2a: gate the drop-reply dispatch on the test target relfilenode.
+	 * A :skipn:N count is per-process global; without this gate an unrelated
+	 * (catalog / internal) block ship consumes the countdown before the test's
+	 * user-relation ship reaches the point.  Gating the CLUSTER_INJECTION_POINT
+	 * itself (not just should_skip) ensures only matching ships consume the
+	 * count.  0 (default) keeps the un-targeted behaviour for spec-2.34 tests.
+	 */
+	if (cluster_gcs_block_drop_target_relfilenode == 0
+		|| BufTagGetRelNumber(&req->tag)
+			   == (RelFileNumber) cluster_gcs_block_drop_target_relfilenode) {
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
+		if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
+			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
+			block_payload_release_cb = NULL;
+			block_payload_release_arg = NULL;
+			pfree(buf);
+			return;
+		}
 	}
 
 	{
@@ -7068,6 +7080,31 @@ uint64
 cluster_gcs_get_block_dedup_full_count(void)
 {
 	return cluster_gcs_block_dedup_get_full_count();
+}
+
+/*
+ * spec-7.2a D5:  dedup capacity/occupancy observability wrappers.  The
+ * entry_count wrapper reads the historical _get_in_flight_count accessor,
+ * whose backing counter (entry_count) tracks every live entry (in-flight
+ * slots plus completed cached replies) -- that live total is what dump_gcs
+ * surfaces as dedup_entry_count for the saturation ratio.
+ */
+uint64
+cluster_gcs_get_block_dedup_entry_count(void)
+{
+	return cluster_gcs_block_dedup_get_in_flight_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_evict_count(void)
+{
+	return cluster_gcs_block_dedup_get_evict_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_max_entries(void)
+{
+	return cluster_gcs_block_dedup_get_max_entries();
 }
 
 

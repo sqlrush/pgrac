@@ -733,6 +733,12 @@ bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
  * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
 bool cluster_crossnode_write_write = false;
 int cluster_gcs_block_dedup_max_entries = 4096; /* spec-7.2a: raised from 1024 */
+/*
+ * spec-7.2a test-only: when non-zero, the drop-reply injection only fires for
+ * block ships of this relfilenode, so a :skipn:N count lands on the intended
+ * relation and is not consumed by unrelated catalog/internal ships.  0 = any.
+ */
+int cluster_gcs_block_drop_target_relfilenode = 0;
 
 /*
  * PGRAC: spec-4.7 D1 — cluster.gcs_block_recovery_wait_ms.  Bounded backend
@@ -3957,6 +3963,16 @@ cluster_init_guc(void)
 										 "HC96 transient).  HC92.  PGC_POSTMASTER (restart to "
 										 "change the fixed HTAB size)."),
 							&cluster_gcs_block_dedup_max_entries, 4096, 256, 65536, PGC_POSTMASTER,
+							0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.gcs_block_drop_target_relfilenode",
+							gettext_noop("Test-only: restrict the drop-reply injection to one relfilenode."),
+							gettext_noop("When non-zero, cluster-gcs-block-drop-reply-before-send only "
+										 "fires for block ships whose relfilenode matches this value, so "
+										 "a :skipn:N count is spent on the intended relation and not on "
+										 "unrelated catalog/internal ships.  0 (default) disables the "
+										 "filter.  For TAP retransmit-dedup correctness tests only."),
+							&cluster_gcs_block_drop_target_relfilenode, 0, 0, INT_MAX, PGC_SUSET,
 							0, NULL, NULL, NULL);
 
 	/*

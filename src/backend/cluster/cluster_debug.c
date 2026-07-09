@@ -1938,6 +1938,15 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_collision_count()));
 	emit_row(rsinfo, "gcs", "dedup_full_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_full_count()));
+	/* spec-7.2a D5:  3 NEW dedup capacity/occupancy rows.  entry_count /
+	 * max_entries give the saturation ratio;  evict_count counts eager
+	 * reclaim + TTL-sweep removals (dump_gcs gcs-category 85 -> 88). */
+	emit_row(rsinfo, "gcs", "dedup_entry_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_entry_count()));
+	emit_row(rsinfo, "gcs", "dedup_evict_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_evict_count()));
+	emit_row(rsinfo, "gcs", "dedup_max_entries",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_max_entries()));
 	emit_row(rsinfo, "gcs", "epoch_invalidate_wake_count",
 			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
 	emit_row(rsinfo, "gcs", "stale_reply_drop_count",

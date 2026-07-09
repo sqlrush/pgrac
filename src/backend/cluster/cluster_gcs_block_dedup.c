@@ -76,6 +76,14 @@ static bool dedup_backend_exit_hook_registered = false;
  */
 #define GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE 256
 
+/*
+ * spec-7.2a D5:  emit a saturation LOG only after this many additional
+ * DENIED_DEDUP_FULL events accrue since the last report, so a persistently
+ * full table logs at most once per this many drops (rule 17: no hot-path
+ * flood).  The LMON TTL sweep is the sole evaluation site.
+ */
+#define GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD 64
+
 /* Forward declarations for GC helpers used by the MISS-path eager reclaim. */
 static int64 dedup_expiry_threshold_us(void);
 static int dedup_reclaim_reclaimable_locked(TimestampTz now, int want);
@@ -470,6 +478,29 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 
 	threshold_us = dedup_expiry_threshold_us();
 
+	/*
+	 * spec-7.2a D5:  saturation LOG-once.  When DENIED_DEDUP_FULL keeps growing
+	 * past a threshold across sweep cycles, emit one LOG so operators see
+	 * sustained dedup saturation without flooding the hot request path (rule
+	 * 17).  Lock-free (atomics only); the LMON sweep is the sole caller so the
+	 * static high-water mark is process-local and race-free.
+	 */
+	{
+		static uint64 dedup_full_logged_hwm = 0;
+		uint64 cur_full = pg_atomic_read_u64(&cluster_gcs_block_dedup_shared->full_count);
+
+		if (cur_full - dedup_full_logged_hwm >= GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD)
+		{
+			elog(LOG,
+				 "GCS block dedup saturating: %llu new DENIED_DEDUP_FULL since last report "
+				 "(cap=%d, live entries=%u); raise cluster.gcs_block_dedup_max_entries if sustained",
+				 (unsigned long long) (cur_full - dedup_full_logged_hwm),
+				 cluster_gcs_block_dedup_effective_entries(),
+				 pg_atomic_read_u32(&cluster_gcs_block_dedup_shared->entry_count));
+			dedup_full_logged_hwm = cur_full;
+		}
+	}
+
 	LWLockAcquire(&cluster_gcs_block_dedup_shared->lock.lock, LW_EXCLUSIVE);
 
 	hash_seq_init(&seq, cluster_gcs_block_dedup_htab);
@@ -595,6 +626,21 @@ cluster_gcs_block_dedup_get_evict_count(void)
 	return cluster_gcs_block_dedup_shared
 			   ? pg_atomic_read_u64(&cluster_gcs_block_dedup_shared->evict_count)
 			   : 0;
+}
+
+/*
+ * cluster_gcs_block_dedup_get_max_entries -- effective dedup capacity.
+ *
+ *	spec-7.2a D5:  reports the effective entry ceiling resolved by
+ *	cluster_gcs_block_dedup_effective_entries() (the GUC value, or 0 during
+ *	initdb/bootstrap before a cluster node id is assigned).  The occupancy
+ *	ratio entry_count / max_entries is the saturation signal behind the
+ *	DEDUP_FULL fail-closed path.
+ */
+uint64
+cluster_gcs_block_dedup_get_max_entries(void)
+{
+	return (uint64) cluster_gcs_block_dedup_effective_entries();
 }
 
 
