@@ -618,6 +618,39 @@ UT_TEST(test_hello_wire_data_plane_bytes)
 	UT_ASSERT(cluster_ic_hello_conn_epoch(&parsed) == UINT64CONST(0x1122334455667788));
 }
 
+/*
+ * spec-7.3 D3 — the worker_id / n_workers HELLO fields (offsets 41/42) are
+ * written by cluster_ic_hello_set_worker_fields on the DATA-plane send path
+ * and read by the accessors.  build_hello alone leaves them zero, so a plain
+ * DATA HELLO stays byte-identical to spec-7.2 (compat pin).
+ */
+UT_TEST(test_hello_worker_fields_roundtrip)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	/* build_hello alone => worker fields zero (spec-7.2 compat). */
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 3, "AB",
+						   CLUSTER_IC_PLANE_DATA, UINT64CONST(0x99));
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_worker_id(&parsed), 0);
+	UT_ASSERT_EQ(cluster_ic_hello_n_workers(&parsed), 0);
+
+	/* set worker fields => offsets 41/42 carry them; plane/pad/epoch intact. */
+	cluster_ic_hello_set_worker_fields(wire, 3, 5);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 3);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 5);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_PLANE_OFFSET], (uint8)CLUSTER_IC_PLANE_DATA);
+	UT_ASSERT_EQ(wire[43], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_CONN_EPOCH_OFFSET], 0x99);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_worker_id(&parsed), 3);
+	UT_ASSERT_EQ(cluster_ic_hello_n_workers(&parsed), 5);
+}
+
 UT_TEST(test_hello_smart_fusion_capability_gate)
 {
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
@@ -691,7 +724,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(21); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(22); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -711,7 +744,8 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
-	UT_RUN(test_hello_wire_data_plane_bytes); /* spec-7.2 D2 */
+	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
+	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
 	UT_RUN(test_hello_parse_rejects_bad_magic);
 	UT_RUN(test_hello_build_truncates_long_name);

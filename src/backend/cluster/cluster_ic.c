@@ -635,6 +635,23 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	ic_le_write_uint64(out_buf + PGRAC_IC_HELLO_CONN_EPOCH_OFFSET, conn_epoch);
 }
 
+/*
+ * PGRAC: spec-7.3 D3 — write the DATA-plane worker_id / n_workers fields onto
+ * an already-built HELLO buffer (offsets 41/42, single bytes).  build_hello
+ * leaves them zero;  the DATA-plane send path calls this to stamp the worker
+ * identity so the accepting worker can enforce the shard-aligned topology and
+ * a cluster-uniform worker count (spec-7.3 §3.1/§3.2, 8.A).
+ */
+void
+cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 worker_id,
+								   uint8 n_workers)
+{
+	Assert(out_buf != NULL);
+
+	out_buf[PGRAC_IC_HELLO_WORKER_ID_OFFSET] = worker_id;
+	out_buf[PGRAC_IC_HELLO_N_WORKERS_OFFSET] = n_workers;
+}
+
 bool
 cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
 {

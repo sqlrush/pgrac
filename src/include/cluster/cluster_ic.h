@@ -303,6 +303,24 @@ cluster_ic_hello_conn_epoch(const ClusterICHelloMsg *msg)
 	return v;
 }
 
+/* PGRAC: spec-7.3 D3 — DATA-plane worker_id / n_workers accessors (offsets
+ * 41/42).  Zero for a pre-7.3 sender or a CONTROL-plane HELLO. */
+static inline uint8
+cluster_ic_hello_worker_id(const ClusterICHelloMsg *msg)
+{
+	if (msg == NULL)
+		return 0;
+	return msg->_pad[PGRAC_IC_HELLO_WORKER_ID_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET];
+}
+
+static inline uint8
+cluster_ic_hello_n_workers(const ClusterICHelloMsg *msg)
+{
+	if (msg == NULL)
+		return 0;
+	return msg->_pad[PGRAC_IC_HELLO_N_WORKERS_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET];
+}
+
 
 /*
  * spec-2.2 D2 (post-codex review) -- HELLO wire encode/decode helpers.
@@ -331,6 +349,15 @@ extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 h
 								   uint64 conn_epoch);
 extern bool cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
 								   ClusterICHelloMsg *out_msg);
+
+/*
+ * spec-7.3 D3 — write the DATA-plane worker_id / n_workers fields (offsets
+ * 41/42) onto an already-built HELLO buffer.  Only the DATA-plane send path
+ * calls it;  a CONTROL / pre-7.3 HELLO leaves them zero (byte-identical to
+ * spec-7.2).  Kept next to build_hello as the wire-layout authority.
+ */
+extern void cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 worker_id,
+											   uint8 n_workers);
 
 
 /*
