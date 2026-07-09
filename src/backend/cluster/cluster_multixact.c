@@ -315,7 +315,7 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 				 * decision through cluster_vis_cr_xmax_verdict -- the polarity
 				 * SSOT shared with the single-xmax path
 				 * (cluster_visibility_verdict.c).  A committed updater whose
-				 * delete is VISIBLE at read_scn (commit_scn <= read_scn) hides
+				 * delete is VISIBLE at read_scn (commit_scn at/before read_scn) hides
 				 * the tuple (CVV_INVISIBLE); one committed AFTER the snapshot
 				 * leaves the row live (CVV_VISIBLE).  The prior inline compare
 				 * had this INVERTED -- latent until D3-b's member serve first
