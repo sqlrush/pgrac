@@ -2657,6 +2657,21 @@ cluster_lmon_main_loop_iters(void)
 {
 	return 0;
 }
+uint64
+cluster_lmon_last_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_max_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_slow_iter_count(void)
+{
+	return 0;
+}
 int
 cluster_lmon_status(void)
 {
@@ -3455,6 +3470,16 @@ cluster_reconfig_get_join_timeout_count(void)
 }
 uint64
 cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_slow_ack_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_timeout_count(void)
 {
 	return 0;
 }

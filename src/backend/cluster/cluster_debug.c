@@ -544,6 +544,10 @@ dump_lmon(ReturnSetInfo *rsinfo)
 
 	iters = cluster_lmon_main_loop_iters();
 	emit_row(rsinfo, "lmon", "lmon_main_loop_iters", fmt_int64(iters));
+	emit_row(rsinfo, "lmon", "lmon_last_iter_us", fmt_int64((int64)cluster_lmon_last_iter_us()));
+	emit_row(rsinfo, "lmon", "lmon_max_iter_us", fmt_int64((int64)cluster_lmon_max_iter_us()));
+	emit_row(rsinfo, "lmon", "lmon_slow_iter_count",
+			 fmt_int64((int64)cluster_lmon_slow_iter_count()));
 }
 
 /*
@@ -1502,6 +1506,10 @@ dump_reconfig_join(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_reconfig_get_join_timeout_count()));
 	emit_row(rsinfo, "reconfig_join", "clean_departed_cleared_count",
 			 fmt_int64((int64)cluster_reconfig_get_clean_departed_cleared_count()));
+	emit_row(rsinfo, "reconfig", "marker_slow_ack_count",
+			 fmt_int64((int64)cluster_reconfig_get_marker_slow_ack_count()));
+	emit_row(rsinfo, "reconfig", "marker_timeout_count",
+			 fmt_int64((int64)cluster_reconfig_get_marker_timeout_count()));
 }
 
 /*

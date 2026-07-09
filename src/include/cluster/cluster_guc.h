@@ -471,6 +471,7 @@ extern int cluster_phase4_timeout;
  *	range:        [100, 60000] (millisecond)
  */
 extern int cluster_lmon_main_loop_interval;
+extern int cluster_lmon_slow_iteration_warn_ms;
 
 
 /*

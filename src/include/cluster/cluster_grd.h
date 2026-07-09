@@ -632,7 +632,6 @@ extern void cluster_grd_recovery_lmon_tick(void);
 extern uint32 cluster_grd_recovery_state_value(void);
 extern const char *cluster_grd_recovery_state_name(uint32 state);
 extern uint64 cluster_grd_recovery_last_event_id(void);
-extern uint64 cluster_grd_recovery_event_old_epoch(void);
 extern uint64 cluster_grd_recovery_episode_epoch_value(void);
 extern uint32 cluster_grd_recovery_event_coordinator(void);
 extern uint64 cluster_grd_recovery_done_epoch_for(int32 node);
@@ -700,6 +699,7 @@ typedef struct ClusterGrdRecoveryCounters {
 } ClusterGrdRecoveryCounters;
 
 extern void cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out);
+extern uint64 cluster_grd_recovery_event_old_epoch(void); /* spec-2.29a WAIT_EPOCH baseline */
 
 /* spec-4.6 P0#2 — pre-remaster stale-epoch sweep SCOPED to the affected
  * (dead-master) shards;  affected_shards is a PGRAC_GRD_SHARD_COUNT-bit

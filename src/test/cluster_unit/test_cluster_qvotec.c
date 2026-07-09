@@ -212,6 +212,14 @@ void
 cluster_elog_init(void)
 {}
 
+#include "cluster/cluster_inject.h"
+bool
+cluster_cr_injection_armed(const char *name pg_attribute_unused(),
+						   uint64 *out_param pg_attribute_unused())
+{
+	return false;
+}
+
 /* Step 3 D7 stubs: signal/ps_display/procsignal symbols not linked
  * here (cluster_qvotec.c references them for ClusterQvotecMain;
  * unit test never invokes Main, just address-takes for T-6). */

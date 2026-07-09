@@ -1672,14 +1672,6 @@ cluster_grd_recovery_last_event_id(void)
 }
 
 uint64
-cluster_grd_recovery_event_old_epoch(void)
-{
-	return cluster_grd_state != NULL
-			   ? pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch)
-			   : 0;
-}
-
-uint64
 cluster_grd_recovery_episode_epoch_value(void)
 {
 	return cluster_grd_state != NULL
@@ -1746,6 +1738,20 @@ cluster_grd_recovery_in_progress(void)
 	if (cluster_grd_state == NULL)
 		return false;
 	return pg_atomic_read_u32(&cluster_grd_state->recovery_state) != (uint32)GRD_RECOVERY_IDLE;
+}
+
+/*
+ * spec-2.29a: the pre-reconfig baseline epoch the WAIT_EPOCH gate compares
+ * against.  Exposed for diagnostics + the IDLE baseline-hold unit test (the
+ * async pre-bump staging window must not let this re-capture a post-bump
+ * value; see the IDLE branch of cluster_grd_recovery_lmon_tick).
+ */
+uint64
+cluster_grd_recovery_event_old_epoch(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch);
 }
 
 /* spec-4.6 D4/D5 — recovery counter bump helpers for out-of-module
@@ -2507,9 +2513,19 @@ cluster_grd_recovery_lmon_tick(void)
 			 * fires, making old_epoch already == the post-bump epoch and
 			 * wedging WAIT_EPOCH forever (cur <= old).  The last stable
 			 * idle epoch is the reliable "before reconfig" value.
+			 *
+			 * spec-2.29a nightly-regression fix:  the coordinator's own
+			 * async pre-bump stages (fail-stop / node-remove / join
+			 * Phase-1) bump the epoch several ticks before publishing the
+			 * event.  During that window this IDLE tick must NOT re-capture
+			 * the already-bumped epoch as the baseline, or the P0 accept
+			 * that follows the publish reads old == cur and wedges
+			 * WAIT_EPOCH — the coordinator wedging itself, no IC piggyback
+			 * needed.  Hold the last stable pre-reconfig baseline instead.
 			 */
-			pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch,
-								cluster_epoch_get_current());
+			if (!cluster_reconfig_has_pending_prebump_stage())
+				pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch,
+									cluster_epoch_get_current());
 			return;
 		}
 

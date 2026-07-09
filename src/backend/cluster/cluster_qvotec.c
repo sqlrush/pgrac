@@ -94,8 +94,9 @@
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
-#include "cluster/cluster_pgstat.h"		 /* cluster.qvotec.* counters */
-#include "cluster/cluster_reconfig.h"	 /* spec-4.12b D2: applied-membership snapshot */
+#include "cluster/cluster_inject.h"
+#include "cluster/cluster_pgstat.h"			 /* cluster.qvotec.* counters */
+#include "cluster/cluster_reconfig.h"		 /* spec-4.12b D2: applied-membership snapshot */
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b: region-5 scan + seed */
 #include "cluster/cluster_shmem.h"			 /* cluster_shmem_register_region */
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D2: fence marker scan + token refresh */
@@ -883,6 +884,10 @@ qvotec_poll_once(void)
 	 * carried forward every poll like the fence marker (R12), and acked majority-
 	 * durable from the self-slot write tally. */
 	have_removal_submit = cluster_node_remove_qvotec_poll_pending(&removal_submit_marker);
+	if ((have_submit || have_leave_submit || have_join_submit || have_removal_submit)
+		&& cluster_cr_injection_armed("cluster-qvotec-marker-service-hold", NULL))
+		return;
+
 	memset(&apply_lease_request, 0, sizeof(apply_lease_request));
 	memset(&apply_lease_winner, 0, sizeof(apply_lease_winner));
 	apply_lease_winner.owner_node_id = -1;

@@ -159,14 +159,104 @@ UT_TEST(test_phase_fsm)
 
 UT_TEST(test_version_coherent)
 {
-	/* nothing moved -> coherent */
-	UT_ASSERT(cluster_clean_leave_version_coherent(7, 7, 3, 3));
-	/* epoch bumped by an external death -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, 3, 3));
-	/* dead_generation moved -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, 3, 4));
-	/* both moved -> incoherent */
-	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, 3, 4));
+	/* spec-2.29a ②b: coherence = epoch unchanged AND the others-dead bitmap
+	 * (dead set EXCLUDING the leaving node) unchanged.  The reflexive-case
+	 * matrix from the spec §②b 8.A argument, exercised on the pure predicate. */
+	uint8 od_none[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES] = { 0 };
+	uint8 od_third[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES] = { 0 };
+	const int n = CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES;
+
+	od_third[0] = 0x04; /* a THIRD-PARTY node (e.g. node 2) became DEAD */
+
+	/* (i) nothing moved (leaving node's own DEAD is already excluded upstream,
+	 *     so its transition does not appear here) -> coherent */
+	UT_ASSERT(cluster_clean_leave_version_coherent(7, 7, od_none, od_none, n));
+	/* (iii) epoch bumped by an external fail-stop -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, od_none, od_none, n));
+	/* (ii) a third-party death entered the others-dead set, epoch not yet
+	 *      bumped (the P1-b window) -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, od_none, od_third, n));
+	/* (iv) both moved -> incoherent */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 8, od_none, od_third, n));
+	/* fail-closed on a missing view */
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, NULL, od_none, n));
+	UT_ASSERT(!cluster_clean_leave_version_coherent(7, 7, od_none, NULL, n));
+}
+
+
+/* ============================================================
+ * U3b — leaver barrier-tick own-commit latch (spec-2.29a r3, evidence
+ *        over inference)
+ * ============================================================ */
+
+UT_TEST(test_own_commit_latched)
+{
+	/* The latch verdict is EVIDENCE-only: the first argument is "the durable
+	 * COMMITTED marker for THIS leave attempt was confirmed" (the coordinator's
+	 * nonce-bound LEAVE_COMMITTED attestation).  The two coherence observations
+	 * (others-dead bitmap / scalar dead_generation) stay in the signature as
+	 * contract inputs the verdict must IGNORE — a third-party transient
+	 * false-DEAD flap on the leaver's local CSSD view advances the (monotone)
+	 * dead_generation and can transiently disturb the bitmap, and neither may
+	 * refuse a latch that marker evidence backs (the t/331 C1/C4 false-
+	 * escalation), nor may any combination latch without evidence (the r2 P2-1
+	 * refused-leave mis-latch hang). */
+
+	/* (a) evidence present, no flap noise -> latch */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, true, true));
+
+	/* (d) PINNING LEG (t/331 C1/C4 regression): a third-party flap advanced the
+	 * scalar dead_generation (it never rebounds) while the bitmap rebounded to
+	 * its bound value — WITH marker evidence the leave still latches; the flap
+	 * must not false-escalate a committed leave. */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, true, false));
+
+	/* (d) flap currently visible in the others-dead bitmap too -> still latch */
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, false, true));
+	UT_ASSERT(cluster_clean_leave_own_commit_latched(true, false, false));
+
+	/* (c) no evidence -> never latch, whatever the coherence observations say
+	 * (a refused leave never produces a COMMITTED marker, so the barrier
+	 * deadline escalation stays armed and bounds the wait — the r2 P2-1
+	 * mis-latch wedge stays closed). */
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, true, true));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, true, false));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, false, true));
+	UT_ASSERT(!cluster_clean_leave_own_commit_latched(false, false, false));
+}
+
+
+/* ============================================================
+ * U3c — LEAVE_COMMITTED evidence identity gate (spec-2.29a r3)
+ * ============================================================ */
+
+UT_TEST(test_committed_evidence_matches)
+{
+	/* args: payload_leaving_node, payload_nonce, payload_epoch,
+	 *       self_node, current_leaving_node, current_attempt_nonce,
+	 *       bound_leave_epoch */
+
+	/* (a) confirmation for THIS node's CURRENT attempt, committed epoch past
+	 * the bound baseline -> evidence accepted */
+	UT_ASSERT(cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, 1, 42, 7));
+
+	/* (b) stale identity: a LEAVE_COMMITTED (and through it a COMMITTED
+	 * marker) from a PREVIOUS leave attempt of the same node — nonce differs
+	 * -> fail-closed, no latch */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 41, 8, 1, 1, 42, 7));
+
+	/* (b) misrouted: confirmation addressed to a different leaving node */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(2, 42, 8, 1, 1, 42, 7));
+
+	/* (b) this node is not currently leaving (idle: leaving_node_id == -1,
+	 * or tracking someone else's leave) */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, -1, 42, 7));
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, 2, 42, 7));
+
+	/* (b) committed epoch not past the bound baseline (attested epoch must be
+	 * the guarded-CAS successor of the baseline this leave bound) */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 7, 1, 1, 42, 7));
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 0, 1, 1, 42, 7));
 }
 
 
@@ -382,10 +472,12 @@ UT_TEST(test_ic_payload_validation)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_fsm);
 	UT_RUN(test_version_coherent);
+	UT_RUN(test_own_commit_latched);
+	UT_RUN(test_committed_evidence_matches);
 	UT_RUN(test_writable_only_gate);
 	UT_RUN(test_marker_validation);
 	UT_RUN(test_should_invalidate);
