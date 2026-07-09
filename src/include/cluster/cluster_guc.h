@@ -937,7 +937,7 @@ extern bool cluster_tx_enqueue_wait_enabled; /* spec-5.2 D4 */
  *	  correctness families are unaffected.  Off = pre-7.2 behavior.
  */
 extern bool cluster_ic_duty_lazy;
-extern bool cluster_crossnode_write_write;	 /* spec-7.1a D0 */
+extern bool cluster_crossnode_write_write; /* spec-7.1a D0 */
 extern int cluster_gcs_block_dedup_max_entries;
 
 /* PGRAC: spec-4.7 D1 — bounded wait (ms) on a RECOVERING block resource
