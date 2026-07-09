@@ -31,6 +31,7 @@
 
 #include "cluster/cluster_gcs_block.h" /* ClusterGcsUndoVerdictPage (CP5) */
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_scn.h"		  /* scn_time_cmp / SCN_VALID (spec-7.1a D3) */
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
 
 /*
@@ -42,7 +43,7 @@
  * widens "resolve when provable", never widens "resolve when unprovable").
  */
 bool
-cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth,
+cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority auth,
 										 uint64 local_epoch)
 {
 	/*
@@ -56,20 +57,32 @@ cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAutho
 	/*
 	 * (2) Authority actually present.  An undo-block reply that did not carry
 	 * a live authority (older peer / off path) leaves live_hwm_lsn invalid ->
-	 * fail closed, never guess.
+	 * fail closed, never guess.  The SCN co-sample must be present too: an
+	 * older peer ships zero trailer bytes = InvalidScn -> refuse.
 	 */
 	if (XLogRecPtrIsInvalid(auth.live_hwm_lsn))
 		return false;
+	if (!SCN_VALID(auth.authority_scn))
+		return false;
 
 	/*
-	 * (3) Durable coverage of THIS page version.  live_hwm_lsn is the origin's
-	 * durable-and-TT-applied high-water; only if it is at or beyond the
-	 * tuple's page LSN has the origin's durable TT reconciled this version.
-	 * Semantically equivalent to the recovery-side recovered_through >=
-	 * anchor_lsn gate, but sourced from a live durable watermark rather than a
-	 * merge-complete marker (spec-6.12 §2.11 torn-history equivalence).
+	 * (3) SCN-total-order conclusiveness (spec-7.1a D3, replacing the former
+	 * `live_hwm_lsn < anchor_lsn` compare that was unsound across per-thread
+	 * WAL streams: a page last written by another thread carries an LSN from
+	 * a different stream, so the raw compare false-refused live resolutions
+	 * and could false-pass -- both measured/analyzed in gaps §C.2).  The
+	 * caller demands conclusiveness for demand_scn (its snapshot read_scn,
+	 * or its own clock sampled BEFORE the fetch): the origin allocates its
+	 * commit SCNs from the clock this authority co-sampled and durably
+	 * stamps the TT BEFORE the commit record, so authority_scn at/after the
+	 * demand proves every commit the demand could have observed is already
+	 * in the shipped content (AD-008 Lamport total order across threads and
+	 * nodes).  A refusal self-heals: the shipped SCNs are Lamport-observed
+	 * by the consumer, so the next demand is at/after this authority.
 	 */
-	if (auth.live_hwm_lsn < anchor_lsn)
+	if (!SCN_VALID(demand_scn))
+		return false;
+	if (scn_time_cmp(auth.authority_scn, demand_scn) < 0)
 		return false;
 
 	return true;
@@ -83,6 +96,13 @@ cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAutho
  * / multi-match / non-terminal / malformed all refuse).  The block bytes are
  * the origin's own shipped copy, so every refusal is a clean NONE — never an
  * elog — and the caller keeps the 53R97 fail-closed boundary.
+ *
+ * PROOF_COMMITTED is EVIDENCE, not a verdict (spec-7.1a hardening): durable
+ * COMMITTED stamps land at pre-commit (2PC COMMIT PREPARED stamps before the
+ * commit record — cluster_tt_durable.h), so a stamped-then-crashed xid is
+ * in-doubt.  Consumers must finalize a COMMITTED proof through the origin's
+ * C1b CLOG cross-check (the verdict leg); only PROOF_ABORTED may be consumed
+ * directly (an abort stamp is terminal and irreversible).
  */
 ClusterVisTtProof
 cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,

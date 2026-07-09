@@ -724,6 +724,11 @@ bool cluster_gcs_block_local_cache = true;
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
 bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
+
+/* PGRAC: spec-7.1a D0 -- cross-node write-write chaining (default off).
+ * Off keeps the pre-7.1a floor: a TERMINAL remote writer holder fails
+ * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
+bool cluster_crossnode_write_write = false;
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -3895,6 +3900,17 @@ cluster_init_guc(void)
 					 "iteration behavior (escape hatch).  spec-7.2 D1.  PGC_SIGHUP."),
 		&cluster_ic_duty_lazy, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"cluster.crossnode_write_write",
+		gettext_noop("Chain a local write past a terminal remote writer."),
+		gettext_noop("When on, a write that conflicts with a remote writer "
+					 "that already committed or aborted maps the outcome onto "
+					 "the native TM_Result contract (remote UPDATE -> chase the "
+					 "new version via EvalPlanQual; remote DELETE -> deleted; "
+					 "aborted -> proceed).  Off (default) keeps the fail-closed "
+					 "floor: SQLSTATE 53R9H, retry.  Unprovable outcomes fail "
+					 "closed either way.  spec-7.1a D0.  PGC_SUSET."),
+		&cluster_crossnode_write_write, false, PGC_SUSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),

@@ -40,67 +40,110 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* policy.o references scn_time_cmp (spec-7.1a D3); SCNs here are plain
+ * monotonic test values, so the total-order stub is a raw compare. */
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	if (a == b)
+		return 0;
+	return (a > b) ? 1 : -1;
+}
+
 #define LOCAL_EPOCH 7
 
 static ClusterLiveAuthority
-mk_auth(uint64 epoch, XLogRecPtr hwm, uint64 gen)
+mk_auth(uint64 epoch, XLogRecPtr hwm, uint64 gen, SCN authority_scn)
 {
 	ClusterLiveAuthority a;
 
 	a.origin_epoch = epoch;
 	a.live_hwm_lsn = hwm;
 	a.tt_generation = gen;
+	a.authority_scn = authority_scn;
 	return a;
 }
 
-/* All three admit conditions hold -> resolve is permitted (the ONLY true). */
-UT_TEST(test_covers_when_epoch_match_and_hwm_ge_anchor)
+/* All admit conditions hold -> resolve is permitted (the ONLY true). */
+UT_TEST(test_covers_when_epoch_match_and_scn_ge_demand)
 {
-	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 5000, 42);
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 5000, 42, (SCN)900);
 
-	/* hwm (5000) >= anchor (5000): boundary-equal covers. */
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(5000, a, LOCAL_EPOCH), true);
-	/* hwm (5000) > anchor (4096): covers. */
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(4096, a, LOCAL_EPOCH), true);
+	/* authority_scn (900) == demand (900): boundary-equal covers. */
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)900, a, LOCAL_EPOCH), true);
+	/* authority_scn (900) > demand (450): covers. */
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)450, a, LOCAL_EPOCH), true);
+}
+
+/*
+ * spec-7.1a D3 U2 (false-refuse regression): the former gate compared the
+ * origin flush LSN against the tuple page LSN, refusing whenever the page
+ * was last written by ANOTHER WAL thread with a numerically larger LSN
+ * (gaps §C.2, 10/10 measured).  The LSN must not gate any more: a tiny
+ * (but valid) hwm with a covering SCN admits.
+ */
+UT_TEST(test_covers_ignores_cross_thread_lsn)
+{
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 1 /* tiny but valid */, 42, (SCN)900);
+
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)900, a, LOCAL_EPOCH), true);
 }
 
 /* Authority from a different reconfig generation -> fail closed. */
 UT_TEST(test_failclosed_when_epoch_differs)
 {
-	ClusterLiveAuthority older = mk_auth(LOCAL_EPOCH - 1, 9000, 42);
-	ClusterLiveAuthority newer = mk_auth(LOCAL_EPOCH + 1, 9000, 42);
+	ClusterLiveAuthority older = mk_auth(LOCAL_EPOCH - 1, 9000, 42, (SCN)900);
+	ClusterLiveAuthority newer = mk_auth(LOCAL_EPOCH + 1, 9000, 42, (SCN)900);
 
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(1, older, LOCAL_EPOCH), false);
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(1, newer, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, older, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, newer, LOCAL_EPOCH), false);
 }
 
 /* No authority sampled (invalid hwm) -> fail closed, never guess. */
 UT_TEST(test_failclosed_when_hwm_invalid)
 {
-	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, InvalidXLogRecPtr, 42);
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, InvalidXLogRecPtr, 42, (SCN)900);
 
-	/* Even with anchor 0, an absent authority must not admit. */
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(0, a, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, LOCAL_EPOCH), false);
 }
 
-/* Origin durable TT does not yet cover this page version -> fail closed. */
-UT_TEST(test_failclosed_when_hwm_below_anchor)
+/* Older peer shipped no SCN co-sample (zero trailer) -> fail closed. */
+UT_TEST(test_failclosed_when_authority_scn_absent)
 {
-	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 4095, 42);
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 9000, 42, InvalidScn);
 
-	/* hwm (4095) < anchor (4096): under-covered window. */
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(4096, a, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, LOCAL_EPOCH), false);
+}
+
+/* Caller supplied no demand -> fail closed (never guess a demand). */
+UT_TEST(test_failclosed_when_demand_invalid)
+{
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 9000, 42, (SCN)900);
+
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(InvalidScn, a, LOCAL_EPOCH), false);
 }
 
 /*
- * Combined-doubt: epoch mismatch takes precedence even when the hwm would
+ * spec-7.1a D3 U2 (false-pass guard): origin clock BEHIND the demand ->
+ * the shipped content is not provably conclusive for this demand; refuse
+ * (the observe of the shipped SCN makes the retry self-heal).
+ */
+UT_TEST(test_failclosed_when_authority_scn_below_demand)
+{
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH, 9000, 42, (SCN)899);
+
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)900, a, LOCAL_EPOCH), false);
+}
+
+/*
+ * Combined-doubt: epoch mismatch takes precedence even when the SCN would
  * otherwise cover -- proves conditions are ANDed, not ORed.
  */
-UT_TEST(test_failclosed_epoch_mismatch_dominates_good_hwm)
+UT_TEST(test_failclosed_epoch_mismatch_dominates_good_scn)
 {
-	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH + 3, 0xFFFFFFFF, 42);
+	ClusterLiveAuthority a = mk_auth(LOCAL_EPOCH + 3, 0xFFFFFFFF, 42, (SCN)9999);
 
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(1, a, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, LOCAL_EPOCH), false);
 }
 
 /*
@@ -111,11 +154,11 @@ UT_TEST(test_failclosed_epoch_mismatch_dominates_good_hwm)
 UT_TEST(test_failclosed_epoch_differs_above_32bit)
 {
 	uint64 wide_epoch = ((uint64)1 << 32) + LOCAL_EPOCH;
-	ClusterLiveAuthority a = mk_auth(wide_epoch, 9000, 42);
+	ClusterLiveAuthority a = mk_auth(wide_epoch, 9000, 42, (SCN)900);
 
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(1, a, LOCAL_EPOCH), false);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, LOCAL_EPOCH), false);
 	/* Same wide epoch on both sides still admits (sanity). */
-	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy(1, a, wide_epoch), true);
+	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, wide_epoch), true);
 }
 
 /* CP2: authority trailer little-endian carrier roundtrip (wire ABI). */
@@ -129,10 +172,16 @@ UT_TEST(test_undo_auth_trailer_roundtrip)
 	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		ClusterGcsUndoAuthTrailerSetTtGeneration(&t, cases[i]);
 		UT_ASSERT_EQ(ClusterGcsUndoAuthTrailerGetTtGeneration(&t), cases[i]);
+		/* spec-7.1a D3: the SCN carrier rides the former reserved bytes. */
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(&t, cases[i] ^ 0x5a5a5a5a5a5a5a5aULL);
+		UT_ASSERT_EQ(ClusterGcsUndoAuthTrailerGetAuthorityScn(&t),
+					 cases[i] ^ 0x5a5a5a5a5a5a5a5aULL);
+		/* The two carriers are independent (no overlap). */
+		UT_ASSERT_EQ(ClusterGcsUndoAuthTrailerGetTtGeneration(&t), cases[i]);
 	}
-	/* The setter must not touch the reserved (must-be-zero) tail. */
-	for (size_t i = 0; i < sizeof(t.reserved_0); i++)
-		UT_ASSERT_EQ(t.reserved_0[i], 0);
+	/* Zeroed trailer reads as InvalidScn (older-peer fail-closed signal). */
+	memset(&t, 0, sizeof(t));
+	UT_ASSERT_EQ(ClusterGcsUndoAuthTrailerGetAuthorityScn(&t), 0);
 }
 
 /* ============================================================
@@ -187,6 +236,24 @@ UT_TEST(test_ttproof_committed_and_aborted)
 													 &scn, &wrap),
 				 CLUSTER_VIS_TT_PROOF_ABORTED);
 	UT_ASSERT_EQ(wrap, 2);
+}
+
+/* spec-7.1a hardening (C1b): PROOF_COMMITTED is EVIDENCE, not a verdict --
+ * the consumer routes it to the origin verdict leg and takes NO payload from
+ * the stamp (a durable COMMITTED stamp lands at 2PC pre-commit, so a
+ * stamped-then-crashed xid is in-doubt).  Pin the NULL-out-param consumer
+ * shape: the proof classification itself is unchanged and payload pointers
+ * are optional. */
+UT_TEST(test_ttproof_committed_is_evidence_not_verdict)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+
+	/* The hardened fast leg passes NULL/NULL: classification only. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 NULL, NULL),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
 }
 
 /* 0-match / ACTIVE / COMMITTED-without-scn: never a proof (user boundary:
@@ -362,14 +429,18 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(13);
-	UT_RUN(test_covers_when_epoch_match_and_hwm_ge_anchor);
+	UT_PLAN(16);
+	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
+	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
 	UT_RUN(test_failclosed_when_hwm_invalid);
-	UT_RUN(test_failclosed_when_hwm_below_anchor);
-	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_hwm);
+	UT_RUN(test_failclosed_when_authority_scn_absent);
+	UT_RUN(test_failclosed_when_demand_invalid);
+	UT_RUN(test_failclosed_when_authority_scn_below_demand);
+	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_scn);
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
 	UT_RUN(test_ttproof_committed_and_aborted);
+	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
 	UT_RUN(test_ttproof_header_mismatch);

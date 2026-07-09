@@ -2149,6 +2149,32 @@ cluster_thread_recovery_get_recovered_through(void)
 {
 	return 0;
 }
+/* spec-7.1a D6 write-write chaining counter accessor stubs. */
+uint64
+cluster_vis_get_writer_chain_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_writer_chain_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_xmax_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_overlay_refresh_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_covers_scn_refuse_count(void)
+{
+	return 0;
+}
 /* spec-3.16 D5 recovery counter accessor stubs (dump_recovery rows). */
 uint64
 cluster_vis_get_recovery_undo_redo_applies(void)

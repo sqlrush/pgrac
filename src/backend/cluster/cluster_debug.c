@@ -2411,6 +2411,17 @@ dump_visibility(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis_get_prune_remote_keep_count()));
 	emit_row(rsinfo, "visibility", "vis_variant_unknown_failclosed_count",
 			 fmt_int64((int64)cluster_vis_get_vis_variant_unknown_failclosed_count()));
+	/* PGRAC: spec-7.1a D6 -- write-write chaining counters. */
+	emit_row(rsinfo, "visibility", "writer_chain_resolved_count",
+			 fmt_int64((int64)cluster_vis_get_writer_chain_resolved_count()));
+	emit_row(rsinfo, "visibility", "writer_chain_failclosed_count",
+			 fmt_int64((int64)cluster_vis_get_writer_chain_failclosed_count()));
+	emit_row(rsinfo, "visibility", "xmax_resolved_count",
+			 fmt_int64((int64)cluster_vis_get_xmax_resolved_count()));
+	emit_row(rsinfo, "visibility", "overlay_refresh_count",
+			 fmt_int64((int64)cluster_vis_get_overlay_refresh_count()));
+	emit_row(rsinfo, "visibility", "covers_scn_refuse_count",
+			 fmt_int64((int64)cluster_vis_get_covers_scn_refuse_count()));
 }
 
 

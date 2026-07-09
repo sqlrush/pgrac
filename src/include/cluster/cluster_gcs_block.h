@@ -1318,7 +1318,10 @@ GcsBlockUndoFetchTagDecode(BufferTag tag, uint32 *segment_id, uint32 *block_no)
  * expected_pi_watermark_scn_bytes. */
 typedef struct ClusterGcsUndoAuthTrailer {
 	uint8 tt_generation_bytes[8]; /* origin TT retention-rollover generation */
-	uint8 reserved_0[8];		  /* must be zero */
+	uint8 authority_scn_bytes[8]; /* PGRAC: spec-7.1a D3 -- origin SCN clock
+								   * co-sampled with the content (LE); zero
+								   * (InvalidScn) = absent (older peer) ->
+								   * the covers gate refuses fail-closed */
 } ClusterGcsUndoAuthTrailer;
 
 StaticAssertDecl(sizeof(ClusterGcsUndoAuthTrailer) == 16,
@@ -1347,6 +1350,37 @@ ClusterGcsUndoAuthTrailerGetTtGeneration(const ClusterGcsUndoAuthTrailer *t)
 		   | (((uint64)t->tt_generation_bytes[5]) << 40)
 		   | (((uint64)t->tt_generation_bytes[6]) << 48)
 		   | (((uint64)t->tt_generation_bytes[7]) << 56);
+}
+
+/* PGRAC: spec-7.1a D3 -- same little-endian carrier for the co-sampled
+ * origin SCN clock (rides the former must-be-zero trailer bytes, so the
+ * wire size is unchanged and an older peer's zero reads as InvalidScn). */
+static inline void
+ClusterGcsUndoAuthTrailerSetAuthorityScn(ClusterGcsUndoAuthTrailer *t, uint64 v)
+{
+	t->authority_scn_bytes[0] = (uint8)(v & 0xff);
+	t->authority_scn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	t->authority_scn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	t->authority_scn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	t->authority_scn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	t->authority_scn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	t->authority_scn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	t->authority_scn_bytes[7] = (uint8)((v >> 56) & 0xff);
+}
+
+static inline uint64
+ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
+{
+	uint64 v = (uint64)t->authority_scn_bytes[0];
+
+	v |= (uint64)t->authority_scn_bytes[1] << 8;
+	v |= (uint64)t->authority_scn_bytes[2] << 16;
+	v |= (uint64)t->authority_scn_bytes[3] << 24;
+	v |= (uint64)t->authority_scn_bytes[4] << 32;
+	v |= (uint64)t->authority_scn_bytes[5] << 40;
+	v |= (uint64)t->authority_scn_bytes[6] << 48;
+	v |= (uint64)t->authority_scn_bytes[7] << 56;
+	return v;
 }
 
 /* PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — verdict page carried in the BLCKSZ

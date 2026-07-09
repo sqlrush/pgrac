@@ -61,9 +61,9 @@
  * recycled resolution degrades to the unchanged 53R97 fail-closed.
  */
 bool
-cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth)
+cluster_vis_live_authority_covers(SCN demand_scn, ClusterLiveAuthority auth)
 {
-	return cluster_vis_live_authority_covers_policy(anchor_lsn, auth, cluster_epoch_get_current());
+	return cluster_vis_live_authority_covers_policy(demand_scn, auth, cluster_epoch_get_current());
 }
 
 
@@ -203,7 +203,9 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  * rtvis_try_origin_verdict — CP5 (D-i4 / spec-6.15 D4) verdict fallback leg.
  *
  *	Reached when the single-block positive proof came back NONE (0-match /
- *	ambiguity): ask the ORIGIN for a complete own-TT by-xid verdict (the
+ *	ambiguity) or COMMITTED (spec-7.1a hardening: a COMMITTED stamp is
+ *	pre-commit evidence and only the origin can run the C1b CLOG cross-
+ *	check on it): ask the ORIGIN for a complete own-TT by-xid verdict (the
  *	spec-3.22 retention theorem served cross-instance; see the header and
  *	cluster_cr_server.c lms_undo_verdict_serve for the origin-side legs).
  *
@@ -219,8 +221,8 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 XLogRecPtr anchor_lsn, SCN read_scn, bool *out_committed,
-						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+						 SCN demand_scn, SCN read_scn, bool *out_committed, SCN *out_commit_scn,
+						 bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
 	ClusterLiveAuthority auth;
@@ -236,8 +238,10 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	 * gate can refuse — the observe is what makes a refusal self-heal. */
 	cluster_scn_observe((SCN)verdict.horizon_scn);
 	cluster_scn_observe((SCN)verdict.commit_scn);
+	cluster_scn_observe(auth.authority_scn);
 
-	if (!cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+	if (!cluster_vis_live_authority_covers(demand_scn, auth)) {
+		cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -297,8 +301,11 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
  *	Active-runtime terminal resolution of a RECYCLED remote ITL ref:
  *	  fetch (D-i1, block 0 of the ref's segment)  ->  covers gate (D-i2,
  *	  co-sampled authority vs this tuple's page LSN)  ->  positive proof
- *	  (exact xid+wrap slot match on the SHIPPED bytes)  ->  on a proof NONE,
- *	  the CP5 origin-verdict fallback (complete scan at the origin).
+ *	  (exact xid+wrap slot match on the SHIPPED bytes)  ->  on a proof NONE
+ *	  or a proof COMMITTED (evidence only -- the stamp lands at pre-commit
+ *	  and needs the origin's C1b CLOG cross-check, see the fast-leg banner
+ *	  below), the CP5 origin-verdict leg (complete scan at the origin);
+ *	  only a proof ABORTED short-circuits.
  *
  *	The proof scans the very bytes the authority was co-sampled with (also
  *	on a cache hit — the pool/memo only ever serve the pair as installed),
@@ -312,14 +319,13 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
  */
 bool
 cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
-											  TransactionId raw_xid, XLogRecPtr anchor_lsn,
-											  SCN read_scn, bool *out_committed,
-											  SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+											  TransactionId raw_xid, SCN read_scn,
+											  bool *out_committed, SCN *out_commit_scn,
+											  bool *out_commit_scn_is_bound)
 {
 	PGAlignedBlock page;
 	ClusterLiveAuthority auth;
-	SCN scn = InvalidScn;
-	uint16 wrap = TT_WRAP_INVALID;
+	SCN demand_scn;
 
 	if (out_committed != NULL)
 		*out_committed = false;
@@ -343,29 +349,58 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		return false;
 
 	/*
+	 * PGRAC: spec-7.1a D3 -- the covers demand.  Snapshot legs demand
+	 * conclusiveness for their read_scn; no-snapshot legs (writer terminal
+	 * resolution, read_scn = InvalidScn) demand the local clock AS OF NOW.
+	 * Sampled BEFORE any fetch: the reply's SCNs are Lamport-observed below,
+	 * so sampling after would trivially satisfy the gate and void it.
+	 */
+	demand_scn = SCN_VALID(read_scn) ? read_scn : cluster_scn_current();
+
+	/*
 	 * Single-block fast leg (CP3), entirely opportunistic since CP5: the
 	 * ref's segment id names the CURRENT slot owner's segment, which under
 	 * the spec-6.15 D4 xid-derived origin may not even exist on the node we
 	 * are asking — a fetch miss there is a routing artifact, not evidence.
-	 * A successful exact xid+wrap proof still short-circuits the wire; a
-	 * fetch miss or a proof NONE falls to the origin-verdict leg.
+	 * Only an exact ABORTED proof still short-circuits the wire (an abort
+	 * stamp is terminal and irreversible); a COMMITTED proof is EVIDENCE
+	 * that must be finalized by the origin's C1b CLOG cross-check on the
+	 * verdict leg, and a fetch miss or a proof NONE prove nothing — all
+	 * three fall to the origin-verdict leg.
 	 */
 	if (cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
-												page.data, &auth)
-		&& cluster_vis_live_authority_covers(anchor_lsn, auth)) {
-		switch (cluster_vis_tt_block_positive_proof(
-			page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
-		case CLUSTER_VIS_TT_PROOF_COMMITTED:
-			*out_committed = true;
-			*out_commit_scn = scn;
-			cluster_rtvis_resolve_note_committed();
-			return true;
-		case CLUSTER_VIS_TT_PROOF_ABORTED:
-			cluster_rtvis_resolve_note_aborted();
-			return true;
-		case CLUSTER_VIS_TT_PROOF_NONE:
-		default:
-			break; /* 0-match / ambiguity: fall to the verdict leg */
+												page.data, &auth)) {
+		/* Lamport-observe the co-sampled clock BEFORE the gate can refuse
+		 * (AD-008) -- the observe is what makes a refusal self-heal. */
+		cluster_scn_observe(auth.authority_scn);
+		if (!cluster_vis_live_authority_covers(demand_scn, auth))
+			cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
+		else {
+			switch (cluster_vis_tt_block_positive_proof(
+				page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, NULL, NULL)) {
+			case CLUSTER_VIS_TT_PROOF_COMMITTED:
+
+				/*
+				 * PGRAC: spec-7.1a hardening (C1b) -- a shipped COMMITTED
+				 * stamp is evidence, NOT a verdict.  The durable slot is
+				 * stamped at pre-commit (2PC COMMIT PREPARED stamps before
+				 * the commit record -- cluster_tt_durable.h), so an owner
+				 * crash in that window leaves a COMMITTED stamp on an
+				 * in-doubt xid; concluding committed here is a
+				 * false-committed (Rule 8.A).  Only the origin can run the
+				 * C1b CLOG cross-check (the foreign xid has no meaning in
+				 * the LOCAL clog -- AD-012 例外 9), and it does so on the
+				 * verdict leg (cluster_cr_server.c lms_undo_verdict_serve
+				 * refuses !TransactionIdDidCommit): fall through to it.
+				 */
+				break;
+			case CLUSTER_VIS_TT_PROOF_ABORTED:
+				cluster_rtvis_resolve_note_aborted();
+				return true;
+			case CLUSTER_VIS_TT_PROOF_NONE:
+			default:
+				break; /* 0-match / ambiguity: fall to the verdict leg */
+			}
 		}
 	}
 
@@ -375,7 +410,7 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * fetch/covers miss proves nothing either — ask the origin for the
 	 * complete own-TT verdict instead of failing closed outright.
 	 */
-	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, anchor_lsn, read_scn,
+	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, demand_scn, read_scn,
 								 out_committed, out_commit_scn, out_commit_scn_is_bound)) {
 		if (*out_committed)
 			cluster_rtvis_resolve_note_committed();
