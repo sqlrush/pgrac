@@ -171,6 +171,26 @@ extern bool cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerd
 												 TransactionId asked_xid);
 
 /*
+ * spec-7.1 D3-b pure structural validation of a shipped BATCHED multixact
+ * member-verdict page (see cluster_gcs_block.h for the wire struct).  true
+ * only when the page provably answers the asked-for mxid: magic / version /
+ * widened-mxid echo match, status is SERVED (the only status that ships a
+ * page; a DENIED reply never reaches here), nmembers is in [1, MAX], every
+ * reserved byte is zero, and EACH member is internally consistent -- lock-only
+ * members (status <= MultiXactStatusForUpdate) carry no verdict and no scn;
+ * updater members (4-5) carry a known verdict whose scn fields match the kind
+ * exactly (mirroring cluster_vis_undo_verdict_page_usable).  Anything else
+ * refuses so the caller keeps the 53R97 fail-closed boundary (Rule 8.A).
+ * Pure: no shmem, no locks, no elog (unit truth table).  The read_scn
+ * admissibility of a BELOW_HORIZON bound is decided by the consumer
+ * (cluster_multixact_resolve_visibility_served), not here.
+ */
+struct ClusterGcsUndoMultiVerdictPage; /* cluster_gcs_block.h */
+extern bool
+cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdictPage *v,
+										   MultiXactId asked_mxid);
+
+/*
  * CP3 + CP5 orchestration (backend): active-runtime resolution of a RECYCLED
  * remote ITL ref.  Two provable legs, both under the co-sampled live
  * authority gate (D-i2):
