@@ -615,6 +615,28 @@ typedef enum {
 	MrpProcess,
 	RfsProcess,
 
+	/*
+	 * LMS worker pool (spec-7.3 D2) — LmsWorker1..7Process are the DATA-plane
+	 * worker siblings of LmsProcess (which is worker 0).  Appended after
+	 * RfsProcess to preserve every existing AuxProcType numeric value.  Each
+	 * is a DISTINCT AuxProcType so it gets its own BackendStatus /
+	 * AuxiliaryProc slot (slotno = MaxBackends + MyAuxProcType) — sidestepping
+	 * the "one process per aux type" assumption (backend_status.c) that ruled
+	 * out a single-type-multi-instance carrier.  Their MyBackendType is
+	 * B_LMS_WORKER (the Stage 0.10 reserved BackendType).  Postmaster forks
+	 * cluster.lms_workers - 1 of them (0 when lms_workers = 1, i.e. the
+	 * spec-7.2 topology identity).  Contiguity and the worker_id derivation
+	 * (MyAuxProcType - LmsWorker1Process + 1) are asserted in
+	 * test_cluster_backend_types.c.
+	 */
+	LmsWorker1Process,
+	LmsWorker2Process,
+	LmsWorker3Process,
+	LmsWorker4Process,
+	LmsWorker5Process,
+	LmsWorker6Process,
+	LmsWorker7Process,
+
 #endif
 	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
@@ -640,6 +662,16 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmUndoCleanerProcess() (MyAuxProcType == UndoCleanerProcess)
 #define AmMrpProcess() (MyAuxProcType == MrpProcess)
 #define AmRfsProcess() (MyAuxProcType == RfsProcess)
+/*
+ * LMS worker pool (spec-7.3 D2).  AmLmsWorkerProcess() is true in a DATA-plane
+ * worker sibling (worker id 1..7);  worker 0 is the plain LmsProcess and is
+ * NOT matched here (AmLmsProcess()).  ClusterLmsWorkerIdForType() maps a
+ * worker AuxProcType to its 1-based worker id (only valid when
+ * AmLmsWorkerProcess()).
+ */
+#define AmLmsWorkerProcess() \
+	(MyAuxProcType >= LmsWorker1Process && MyAuxProcType <= LmsWorker7Process)
+#define ClusterLmsWorkerIdForType(t) ((int)((t) - LmsWorker1Process) + 1)
 #endif
 
 
