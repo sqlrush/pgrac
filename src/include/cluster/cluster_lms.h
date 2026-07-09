@@ -329,7 +329,7 @@ extern pid_t cluster_lms_get_worker_pid(int worker_id);
  * WaitEventSet round (sockets + MyLatch — replaces the historic plain
  * WaitLatch when the plane is live);  shutdown closes owned fds.
  */
-extern bool cluster_lms_data_plane_startup(void);
+extern bool cluster_lms_data_plane_startup(int worker_id, int n_workers);
 extern bool cluster_lms_data_plane_enabled(void);
 extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);

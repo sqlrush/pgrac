@@ -98,12 +98,14 @@ static bool dp_enabled = false;
  *	the READY transition.
  */
 bool
-cluster_lms_data_plane_startup(void)
+cluster_lms_data_plane_startup(int worker_id, int n_workers)
 {
 	int32 self_id = cluster_node_id;
 	int32 pi;
 
-	Assert(MyBackendType == B_LMS);
+	/* worker 0 = LmsProcess (B_LMS);  workers 1..7 = LmsWorker (B_LMS_WORKER). */
+	Assert(MyBackendType == B_LMS || MyBackendType == B_LMS_WORKER);
+	Assert(worker_id >= 0 && worker_id < n_workers);
 
 	if (!cluster_enabled)
 		return false;
@@ -112,8 +114,14 @@ cluster_lms_data_plane_startup(void)
 		&& cluster_interconnect_tier != CLUSTER_IC_TIER_3)
 		return false;
 
-	/* Aim this process's tier1 state at the DATA plane BEFORE any use. */
-	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_DATA);
+	/*
+	 * PGRAC: spec-7.3 D3 — aim this process's tier1 state at MY DATA worker
+	 * channel BEFORE any use.  This implies the DATA plane, gives this worker
+	 * its private tier1 instance (peers[] / listener), sets the listener/dial
+	 * port offset (data_port + worker_id) and the HELLO worker fields
+	 * (worker_id, n_workers) for the shard-aligned mesh + N negotiation.
+	 */
+	cluster_ic_tier1_set_my_data_channel(worker_id, n_workers);
 
 	dp_listener_fd = cluster_ic_tier1_listener_bind();
 	if (dp_listener_fd < 0)
