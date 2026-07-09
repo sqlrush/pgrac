@@ -378,10 +378,20 @@ cluster_multixact_remote_xmax_ask_origin(uint16 origin_slot, MultiXactId mxid, S
 															 page_buf.data, &auth))
 		return CLUSTER_VISIBILITY_UNKNOWN; /* DENIED / timeout / invalid -> 53R97 */
 
-	/* The page is structurally validated (SERVED, nmembers in [1, MAX], every
-	 * member consistent) by the fetch; map it to served terminals + resolve. */
+	/* The page is structurally validated (SERVED, nmembers in [2, MAX], every
+	 * member consistent) by the fetch, which validates the STABLE local copy it
+	 * returns in page_buf (not the volatile reply slot).  Map it to served
+	 * terminals + resolve. */
 	page = (const ClusterGcsUndoMultiVerdictPage *)page_buf.data;
 	n = page->nmembers;
+	/*
+	 * Belt (spec-7.1 D3-b hardening, Rule 15): re-assert the [2, MAX] bound
+	 * before the variable-length member loop so a future regression in the
+	 * fetch validation can never turn an over-range wire count into an
+	 * out-of-bounds read of page_buf.
+	 */
+	if (n < 2 || n > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS)
+		return CLUSTER_VISIBILITY_UNKNOWN;
 	served
 		= (ClusterMultiXactServedMember *)palloc0((Size)n * sizeof(ClusterMultiXactServedMember));
 	for (i = 0; i < n; i++) {

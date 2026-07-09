@@ -457,8 +457,11 @@ UT_TEST(test_undo_multi_verdict_page_usable)
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
 	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
 
-	/* nmembers bounds: 0 refused, MAX ok (below), MAX+1 refused. */
+	/* nmembers bounds: < 2 refused (a real multi has >= 2 members; the origin
+	 * ships NO_MEMBERS for < 2), MAX ok (below), MAX+1 refused. */
 	v->nmembers = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->nmembers = 1;
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
 	v->nmembers = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS + 1;
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);

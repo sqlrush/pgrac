@@ -2848,17 +2848,33 @@ cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXact
 		if (got_reply
 			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 			&& slot->reply_undo_trailer_valid) {
-			uint32 expected = slot->reply_header.checksum;
-			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+			uint32 expected;
+			uint32 got;
+
+			/*
+			 * PGRAC (spec-7.1 D3-b hardening, Rule 15/16): snapshot the volatile
+			 * reply slot into the caller's STABLE page BEFORE checksum /
+			 * validation / observe.  This consume runs without blk->lock, so a
+			 * spec-2.34 retransmit that overwrites reply_block_data between a
+			 * validate-on-slot and the copy would hand a torn, unvalidated
+			 * nmembers to the variable-length member loop downstream (OOB read).
+			 * Validating the LOCAL copy makes the bytes we act on exactly the
+			 * bytes we prove usable: a torn copy fails the checksum (fail-closed),
+			 * and nmembers is bounded to [2, MAX] before any member is read.  The
+			 * checksum is read block-then-header, so an overwrite that lands mid-
+			 * snapshot fails the compare rather than passing on a mixed pair.
+			 */
+			memcpy(page_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+			expected = slot->reply_header.checksum;
+			got = gcs_block_compute_checksum(page_out);
 
 			if (expected == got) {
 				const ClusterGcsUndoMultiVerdictPage *v
-					= (const ClusterGcsUndoMultiVerdictPage *)slot->reply_block_data;
+					= (const ClusterGcsUndoMultiVerdictPage *)page_out;
 
 				if (cluster_vis_undo_multi_verdict_page_usable(v, mxid)) {
 					uint16 i;
 
-					memcpy(page_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
 					auth_out->origin_epoch = slot->reply_header.epoch;
 					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 					auth_out->tt_generation = slot->reply_undo_tt_generation;
