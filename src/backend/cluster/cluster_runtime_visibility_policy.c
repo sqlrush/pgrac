@@ -32,6 +32,7 @@
 #include "cluster/cluster_gcs_block.h" /* ClusterGcsUndoVerdictPage (CP5) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
+#include "cluster/cluster_undo_verdict.h" /* D3 verdict taxonomy + mappers */
 
 /*
  * cluster_vis_live_authority_covers_policy
@@ -208,5 +209,84 @@ cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
 	default:
 		return false; /* unknown kind: refuse, never guess */
+	}
+}
+
+/*
+ * cluster_undo_verdict_from_wire_page
+ *
+ * D3-1 pure mapper: a CP5 origin verdict page -> the five-value taxonomy.
+ * Fail-closed by construction: a page that does not structurally answer
+ * asked_xid (cluster_vis_undo_verdict_page_usable) yields UNKNOWN_FAIL_CLOSED,
+ * so the caller keeps the 53R97 boundary (Rule 8.A).  A BELOW_HORIZON page
+ * maps to COMMITTED_BOUND unconditionally -- the read_scn admissibility of
+ * that bound (requester leg (e)) needs scn_time_cmp and is applied by the
+ * D3-3 consumer, deliberately outside this dependency-free policy object (see
+ * cluster_vis_undo_verdict_page_usable NOTES).  Pure: no I/O, no elog.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
+									TransactionId asked_xid)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	/* Structural gate first: an unusable page is not evidence about the xid. */
+	if (!cluster_vis_undo_verdict_page_usable(v, asked_xid))
+		return r;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = (SCN)v->commit_scn;
+		r.wrap = v->wrap;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		/* Bound-only commit: kind == BOUND is itself the "never stamp the
+			 * scn as exact" marker.  The read_scn gate is the consumer's. */
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+		r.commit_scn = (SCN)v->horizon_scn;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	default:
+		/* page_usable() already fenced the kind range; defense in depth. */
+		return r;
+	}
+}
+
+/*
+ * cluster_undo_verdict_from_block_proof
+ *
+ * D3-1 pure mapper: a CP3 single-block positive proof (exact xid+wrap slot
+ * match on the shipped block0 bytes) -> the taxonomy.  COMMITTED carries the
+ * true commit SCN (EXACT); ABORTED is terminal; NONE is UNKNOWN_FAIL_CLOSED,
+ * which the orchestrator reads as "fall to the CP5 origin verdict", never as
+ * a terminal answer to the caller (Rule 8.A).  Pure.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_block_proof(ClusterVisTtProof proof, SCN commit_scn, uint16 wrap)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	switch (proof) {
+	case CLUSTER_VIS_TT_PROOF_COMMITTED:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = commit_scn;
+		r.wrap = wrap;
+		return r;
+
+	case CLUSTER_VIS_TT_PROOF_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	case CLUSTER_VIS_TT_PROOF_NONE:
+	default:
+		return r;
 	}
 }
