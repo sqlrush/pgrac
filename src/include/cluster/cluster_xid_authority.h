@@ -244,16 +244,23 @@ typedef enum ClusterXidPrefixVerdict {
 } ClusterXidPrefixVerdict;
 
 /*
- * Compare the local pg_xact bytes covering xids [0, limit_xid_full) with the
- * sealed prehistory blob at 2-bit (per-xact) precision.  A local segment or
- * page that does not exist ends the comparable prefix (a shorter clone has
- * no bits to contradict).  Callers FATAL on DIVERGED/UNAVAILABLE: a joiner
- * whose own native-era history contradicts the seed's is not a pre-seed
- * lineage, and neither skipping (trusting local bits) nor adopting
- * (overwriting the joiner's own outcomes) is sound for it.
+ * Compare the local pg_xact bytes covering xids [oldest_xid_full,
+ * limit_xid_full) with the sealed prehistory blob at 2-bit (per-xact)
+ * precision.  Bits below oldest_xid_full are frozen truth that CLOG never
+ * consults again and that SimpleLruTruncate may already have removed
+ * (whole segments); they are exempt whether the pages survive or not.  A
+ * local page missing INSIDE the comparable range is fail-closed
+ * UNAVAILABLE, never CONSISTENT: pg_xact covers [oldestXid, nextXid) on a
+ * well-formed node, so a hole is an anomaly, and a front-truncated
+ * divergent clone must not pass as a "shorter clone" (review r3-X2).
+ * Callers FATAL on DIVERGED/UNAVAILABLE: a joiner whose own native-era
+ * history contradicts the seed's is not a pre-seed lineage, and neither
+ * skipping (trusting local bits) nor adopting (overwriting the joiner's
+ * own outcomes) is sound for it.
  */
 extern ClusterXidPrefixVerdict cluster_xid_prehistory_prefix_check(const char *local_pgdata,
 																   uint64 native_hw_full,
-																   uint64 limit_xid_full);
+																   uint64 limit_xid_full,
+																   uint64 oldest_xid_full);
 
 #endif /* CLUSTER_XID_AUTHORITY_H */

@@ -680,7 +680,7 @@ UT_TEST(test_prefix_check_divergence_truth_table)
 	make_fake_pgdata(pgdata_seed, sizeof(pgdata_seed), "f2seed", 1, 0xAA);
 	make_fake_pgdata(pgdata_join, sizeof(pgdata_join), "f2join", 1, 0xAA);
 	cluster_xid_prehistory_publish(pgdata_seed, 816);
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816, 0),
 				 CLUSTER_XID_PREFIX_CONSISTENT);
 
 	/* flip one status byte INSIDE the limit -> DIVERGED */
@@ -690,27 +690,29 @@ UT_TEST(test_prefix_check_divergence_truth_table)
 	UT_ASSERT_EQ(lseek(fd, 100, SEEK_SET), 100); /* byte 100 = xids 400..403 */
 	(void)!write(fd, "X", 1);
 	close(fd);
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816, 0),
 				 CLUSTER_XID_PREFIX_DIVERGED);
 
 	/* the same flipped byte OUTSIDE the limit -> CONSISTENT (adopt arm:
 	 * bytes at/after own_next belong to the seed alone) */
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 400),
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 400, 0),
 				 CLUSTER_XID_PREFIX_CONSISTENT);
 
 	/* partial-byte boundary: xid 400's 2-bit slot enters scope at limit 401 */
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 401),
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 401, 0),
 				 CLUSTER_XID_PREFIX_DIVERGED);
 
-	/* missing local pg_xact segment -> comparable prefix is empty ->
-	 * CONSISTENT (a shorter clone has no bits to contradict) */
+	/* missing local page inside the comparable range -> fail-closed
+	 * UNAVAILABLE, never CONSISTENT: with oldestXid=0 nothing below the
+	 * hole is frozen, so "shorter clone" is not a possible innocent
+	 * explanation (review r3-X2) */
 	unlink(seg);
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
-				 CLUSTER_XID_PREFIX_CONSISTENT);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816, 0),
+				 CLUSTER_XID_PREFIX_UNAVAILABLE);
 
 	/* no trustworthy blob -> UNAVAILABLE */
 	unlink_files();
-	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816),
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, 816, 816, 0),
 				 CLUSTER_XID_PREFIX_UNAVAILABLE);
 
 	/* multi-segment divergence: 33-page trees, flip a byte in segment 0001 */
@@ -722,16 +724,75 @@ UT_TEST(test_prefix_check_divergence_truth_table)
 		make_fake_pgdata_multiseg(pgdata_seed, sizeof(pgdata_seed), "f2seedms", n_pages);
 		make_fake_pgdata_multiseg(pgdata_join, sizeof(pgdata_join), "f2joinms", n_pages);
 		cluster_xid_prehistory_publish(pgdata_seed, hw);
-		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw),
+		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, 0),
 					 CLUSTER_XID_PREFIX_CONSISTENT);
 		snprintf(seg, sizeof(seg), "%s/pg_xact/0001", pgdata_join);
 		fd = open(seg, O_RDWR, 0600);
 		UT_ASSERT(fd >= 0);
 		(void)!write(fd, "Z", 1);
 		close(fd);
-		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw),
+		UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, 0),
 					 CLUSTER_XID_PREFIX_DIVERGED);
 	}
+}
+
+UT_TEST(test_prefix_check_front_truncation)
+{
+	const uint64 xids_per_page = (uint64)BLCKSZ * 4;
+	const int n_pages = 33;
+	const uint64 hw = (uint64)n_pages * xids_per_page;
+	const uint64 page32_first = 32 * xids_per_page;
+	char pgdata_seed[MAXPGPATH];
+	char pgdata_join[MAXPGPATH];
+	char seg[MAXPGPATH];
+	unsigned char b;
+	int fd;
+
+	/* review r3-X2 (a): front truncation is no alibi.  SimpleLruTruncate
+	 * removed the joiner's segment 0000 (oldestXid frozen past it), but the
+	 * surviving page 32 diverges inside the comparable range -> DIVERGED.
+	 * Pre-fix, break-on-first-missing-local-page returned CONSISTENT and
+	 * the adopt arm then overwrote the joiner's own live-xid outcomes. */
+	unlink_files();
+	make_fake_pgdata_multiseg(pgdata_seed, sizeof(pgdata_seed), "ftseed", n_pages);
+	make_fake_pgdata_multiseg(pgdata_join, sizeof(pgdata_join), "ftjoin", n_pages);
+	cluster_xid_prehistory_publish(pgdata_seed, hw);
+	snprintf(seg, sizeof(seg), "%s/pg_xact/0000", pgdata_join);
+	UT_ASSERT_EQ(unlink(seg), 0);
+	snprintf(seg, sizeof(seg), "%s/pg_xact/0001", pgdata_join);
+	fd = open(seg, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(lseek(fd, 600, SEEK_SET), 600); /* byte 600 = slots 2400..2403 */
+	(void)!write(fd, "X", 1);
+	close(fd);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, page32_first),
+				 CLUSTER_XID_PREFIX_DIVERGED);
+
+	/* (b) frozen exemption: restore byte 600 (page fill 0x20), then flip
+	 * ONLY slot 2400's two low bits (0x20 -> 0x21).  With oldestXid at slot
+	 * 2401 the divergence sits strictly below the boundary, mid-byte: the
+	 * lead mask must exclude it -> CONSISTENT (missing segment 0000 below
+	 * page(oldestXid) is equally exempt). */
+	fd = open(seg, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(lseek(fd, 600, SEEK_SET), 600);
+	b = 0x21;
+	(void)!write(fd, &b, 1);
+	close(fd);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, page32_first + 2401),
+				 CLUSTER_XID_PREFIX_CONSISTENT);
+
+	/* same bytes with oldestXid AT the divergent slot -> DIVERGED (the
+	 * boundary slot itself is comparable) */
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, page32_first + 2400),
+				 CLUSTER_XID_PREFIX_DIVERGED);
+
+	/* review r3-X2 (c): a hole AT/ABOVE page(oldestXid) inside the
+	 * comparable range is an anomaly -> UNAVAILABLE (fail-closed), never
+	 * CONSISTENT */
+	UT_ASSERT_EQ(unlink(seg), 0);
+	UT_ASSERT_EQ(cluster_xid_prehistory_prefix_check(pgdata_join, hw, hw, page32_first + 2400),
+				 CLUSTER_XID_PREFIX_UNAVAILABLE);
 }
 
 UT_TEST(test_prehistory_classify_corrupt)
@@ -805,7 +866,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -822,6 +883,7 @@ main(void)
 	UT_RUN(test_prehistory_publish_adopt_round_trip);
 	UT_RUN(test_prehistory_multi_segment_round_trip);
 	UT_RUN(test_prefix_check_divergence_truth_table);
+	UT_RUN(test_prefix_check_front_truncation);
 	UT_RUN(test_prehistory_classify_corrupt);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

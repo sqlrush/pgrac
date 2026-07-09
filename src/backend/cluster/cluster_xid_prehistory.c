@@ -458,9 +458,11 @@ cluster_xid_prehistory_was_adopted(void)
 
 /*
  * read_local_clog_page_optional -- read local pg_xact page `pageno` into
- * buf.  Returns false when the segment file or the page does not exist
- * (short clone: the comparable prefix ends there); PANICs on a real read
- * error so an I/O fault is never mistaken for a short prefix.
+ * buf.  Returns false when the segment file or the page does not exist;
+ * PANICs on a real read error so an I/O fault is never mistaken for a
+ * missing page.  The caller decides what a missing page means: below
+ * page(oldestXid) it is a legitimately truncated frozen segment, at or
+ * above it is an anomaly (review r3-X2).
  */
 static bool
 read_local_clog_page_optional(const char *local_pgdata, uint32 pageno, char *buf)
@@ -493,13 +495,84 @@ read_local_clog_page_optional(const char *local_pgdata, uint32 pageno, char *buf
 }
 
 /*
+ * clog_slot_mask -- byte mask covering the 2-bit CLOG status slots
+ * [lo, hi) within one byte (0 <= lo < hi <= 4).  Slot n of a byte holds
+ * xid bits at (n * CLOG_BITS_PER_XACT), low-order first (clog.c
+ * TransactionIdToBIndex).
+ */
+static inline unsigned char
+clog_slot_mask(uint32 lo, uint32 hi)
+{
+	unsigned int m;
+
+	m = ((hi >= 4) ? 0xFFu : ((1u << (hi * 2)) - 1u)) & ~((1u << (lo * 2)) - 1u);
+	return (unsigned char)m;
+}
+
+/*
+ * clog_page_range_equal -- compare blob vs local CLOG page content for the
+ * page-local 2-bit slots [from_xact, to_xact) only.  Sub-byte boundaries
+ * are masked so bits outside the range never influence the verdict.
+ */
+static bool
+clog_page_range_equal(const char *blob_page, const char *local_page, uint32 from_xact,
+					  uint32 to_xact)
+{
+	uint32 first_byte = from_xact / 4;
+	uint32 last_byte = (to_xact - 1) / 4;
+
+	Assert(from_xact < to_xact && to_xact <= PREHISTORY_XACTS_PER_PAGE);
+
+	if (first_byte == last_byte)
+		return ((unsigned char)(blob_page[first_byte] ^ local_page[first_byte])
+				& clog_slot_mask(from_xact % 4, to_xact - first_byte * 4))
+			   == 0;
+
+	if (from_xact % 4 != 0) {
+		if (((unsigned char)(blob_page[first_byte] ^ local_page[first_byte])
+			 & clog_slot_mask(from_xact % 4, 4))
+			!= 0)
+			return false;
+		first_byte++;
+	}
+	if (to_xact % 4 != 0) {
+		if (((unsigned char)(blob_page[last_byte] ^ local_page[last_byte])
+			 & clog_slot_mask(0, to_xact % 4))
+			!= 0)
+			return false;
+		last_byte--;
+	}
+	return first_byte > last_byte
+		   || memcmp(blob_page + first_byte, local_page + first_byte, last_byte - first_byte + 1)
+				  == 0;
+}
+
+/*
  * cluster_xid_prehistory_prefix_check -- see header.  Streams the sealed
  * blob (primary, then .bak) and byte-compares the local pg_xact prefix
- * covering xids [0, limit_xid_full) at per-xact (2-bit) precision.
+ * covering xids [oldest_xid_full, min(limit_xid_full, native_hw_full)) at
+ * per-xact (2-bit) precision.
+ *
+ * Frozen-prefix exemption (review r3-X2): SimpleLruTruncate removes whole
+ * pg_xact SEGMENTS once every page they cover precedes page(oldestXid)
+ * (slru.c SlruMayDeleteSegment), so a joiner that froze past >=1 segment
+ * legitimately has no file where the blob still has pages -- the old
+ * break-on-first-missing-local-page treated exactly that shape as a
+ * tail-short clone and returned CONSISTENT without ever comparing the
+ * surviving pages.  Neither truncation nor tuple freezing rewrites the
+ * CLOG bytes that survive, but bits below oldestXid are dead content
+ * anyway (every tuple with such an xmin/xmax is frozen, so CLOG is never
+ * consulted for them again) and whether they still exist is an accident
+ * of truncation timing; lineage evidence therefore starts at oldestXid's
+ * own 2-bit slot, and everything below it is skipped whether the page
+ * survives or not.  Within the comparable range [oldestXid, limit) a
+ * MISSING local page is an anomaly -- pg_xact always covers
+ * [page(oldestXid), page(nextXid)] on a well-formed node -- and returns
+ * UNAVAILABLE (fail-closed), never CONSISTENT.
  */
 ClusterXidPrefixVerdict
 cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_full,
-									uint64 limit_xid_full)
+									uint64 limit_xid_full, uint64 oldest_xid_full)
 {
 	ClusterXidPrehistoryHeader hdr;
 	char primary[MAXPGPATH];
@@ -508,8 +581,10 @@ cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_f
 	char local_page[BLCKSZ];
 	const char *src_path;
 	uint32 pages = 0;
+	uint32 start_page;
 	uint32 p;
 	uint64 limit;
+	uint64 oldest;
 	int src;
 
 	if (!build_path(primary, sizeof(primary), CLUSTER_XID_PREHISTORY_REL_PATH)
@@ -527,6 +602,11 @@ cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_f
 	if (limit == 0)
 		return CLUSTER_XID_PREFIX_CONSISTENT;
 
+	oldest = Min(oldest_xid_full, limit);
+	if (oldest >= limit)
+		return CLUSTER_XID_PREFIX_CONSISTENT; /* everything comparable is frozen */
+	start_page = (uint32)(oldest / PREHISTORY_XACTS_PER_PAGE);
+
 	src = OpenTransientFile(src_path, O_RDONLY | PG_BINARY);
 	if (src < 0 || read(src, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		if (src >= 0)
@@ -536,9 +616,8 @@ cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_f
 
 	for (p = 0; p < pages; p++) {
 		uint64 page_first_xid = (uint64)p * PREHISTORY_XACTS_PER_PAGE;
-		uint64 in_scope;
-		uint32 full_bytes;
-		uint32 partial_bits;
+		uint64 cmp_from;
+		uint64 cmp_to;
 
 		if (read(src, blob_page, BLCKSZ) != BLCKSZ) {
 			CloseTransientFile(src);
@@ -546,26 +625,24 @@ cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_f
 		}
 		if (page_first_xid >= limit)
 			break; /* comparison scope ended on a page boundary */
+		if (p < start_page)
+			continue; /* wholly frozen page: skipped, present or not */
 
-		if (!read_local_clog_page_optional(local_pgdata, p, local_page))
-			break; /* short clone: no local bits left to contradict */
+		cmp_from = Max(page_first_xid, oldest);
+		cmp_to = Min(page_first_xid + PREHISTORY_XACTS_PER_PAGE, limit);
+		/* oldest < limit and p >= start_page guarantee a non-empty range */
+		Assert(cmp_from < cmp_to);
 
-		in_scope = Min((uint64)PREHISTORY_XACTS_PER_PAGE, limit - page_first_xid);
-		full_bytes = (uint32)(in_scope / 4);
-		partial_bits = (uint32)(in_scope % 4) * 2;
+		if (!read_local_clog_page_optional(local_pgdata, p, local_page)) {
+			/* hole inside the comparable range: fail closed (r3-X2) */
+			CloseTransientFile(src);
+			return CLUSTER_XID_PREFIX_UNAVAILABLE;
+		}
 
-		if (full_bytes > 0 && memcmp(blob_page, local_page, full_bytes) != 0) {
+		if (!clog_page_range_equal(blob_page, local_page, (uint32)(cmp_from - page_first_xid),
+								   (uint32)(cmp_to - page_first_xid))) {
 			CloseTransientFile(src);
 			return CLUSTER_XID_PREFIX_DIVERGED;
-		}
-		if (partial_bits > 0) {
-			unsigned char mask = (unsigned char)((1 << partial_bits) - 1);
-
-			if (((unsigned char)blob_page[full_bytes] & mask)
-				!= ((unsigned char)local_page[full_bytes] & mask)) {
-				CloseTransientFile(src);
-				return CLUSTER_XID_PREFIX_DIVERGED;
-			}
 		}
 	}
 	CloseTransientFile(src);

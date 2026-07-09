@@ -234,16 +234,21 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 		 * native range, so skipping would trust divergent local truth and
 		 * adopting would overwrite the node's own outcomes; both are
 		 * silently wrong (8.A).  Byte-compare the comparable prefix
-		 * [0, min(own_next, native_hw)) against the sealed blob and fail
-		 * closed on any contradiction.  Bypass only when the local
+		 * [oldestXid, min(own_next, native_hw)) against the sealed blob and
+		 * fail closed on any contradiction.  Bypass only when the local
 		 * oldestXid has advanced past the native range (frozen+truncated:
-		 * those bits are never consulted again).
+		 * those bits are never consulted again).  Below that bypass the
+		 * check starts at oldestXid itself (review r3-X2): segments frozen
+		 * and truncated away are no alibi for the surviving range, and a
+		 * missing local page inside the comparable range fails closed
+		 * (UNAVAILABLE) instead of passing as a shorter clone.
 		 */
 		if ((uint64)ra.checkPointCopy.oldestXid <= auth.native_hw_full) {
 			ClusterXidPrefixVerdict pv;
 
 			pv = cluster_xid_prehistory_prefix_check(DataDir, auth.native_hw_full,
-													 Min(own_next, auth.native_hw_full));
+													 Min(own_next, auth.native_hw_full),
+													 (uint64)ra.checkPointCopy.oldestXid);
 			if (pv == CLUSTER_XID_PREFIX_DIVERGED)
 				ereport(FATAL,
 						(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
@@ -257,8 +262,11 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 				ereport(FATAL,
 						(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 						 errmsg("shared XID prehistory is unavailable for the lineage check"),
-						 errhint("Restore \"%s\" (or its .bak) from the shared tree's "
-								 "backup.",
+						 errdetail("Either no sealed prehistory blob passes validation, or the "
+								   "local pg_xact has a hole inside the comparable native "
+								   "range."),
+						 errhint("Restore \"%s\" (or its .bak) from the shared tree's backup, "
+								 "or re-provision this node if its local pg_xact is damaged.",
 								 CLUSTER_XID_PREHISTORY_REL_PATH)));
 		}
 
