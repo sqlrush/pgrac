@@ -172,6 +172,46 @@ read_image(const char *path, char *image)
 }
 
 /*
+ * copy_flags_settled -- does the on-disk copy at relpath validate AND carry
+ * all `must_set` flag bits with all `must_clear` bits clear?
+ */
+static bool
+copy_flags_settled(const char *relpath, uint32 must_set, uint32 must_clear)
+{
+	ClusterXidAuthorityHeader hdr;
+	char path[MAXPGPATH];
+	char image[CLUSTER_XID_AUTHORITY_FILE_SIZE];
+
+	if (!build_path(path, sizeof(path), relpath))
+		return false;
+	if (read_image(path, image) != CLUSTER_XID_AUTHORITY_VALID)
+		return false;
+	memcpy(&hdr, image, sizeof(hdr));
+	return (hdr.flags & must_set) == must_set && (hdr.flags & must_clear) == 0;
+}
+
+/*
+ * both_copies_flags_settled -- is a one-way flag transition complete in BOTH
+ * on-disk copies?  Flag transitions install the same image as primary and
+ * .bak (primary first), so a crash between the two durable renames leaves a
+ * pre-transition .bak behind an already-transitioned primary.  Nothing else
+ * on the restart path rewrites the pair, so without a re-assert the stale
+ * copy survives the whole run, and any later transient primary read failure
+ * resurrects the pre-transition flags through the .bak fallback -- a stale
+ * SEALED .bak hands joiners the previous pass's high-water and a stale
+ * pre-CLUSTER_ERA .bak re-opens the native-era re-entry guard (review
+ * r3-X1, 8.A).  The transition entry points therefore skip their write only
+ * when this returns true; a missing or invalid copy is "not settled" too,
+ * which restores the damaged copy for free.
+ */
+static bool
+both_copies_flags_settled(uint32 must_set, uint32 must_clear)
+{
+	return copy_flags_settled(CLUSTER_XID_AUTHORITY_REL_PATH, must_set, must_clear)
+		   && copy_flags_settled(CLUSTER_XID_AUTHORITY_BAK_REL_PATH, must_set, must_clear);
+}
+
+/*
  * cluster_xid_authority_read -- fail-closed read of the shared authority.
  * Tries primary then .bak; returns false when neither is trustworthy.  Never
  * ereports (safe on the bootstrap early-read path).
@@ -284,8 +324,10 @@ write_header(ClusterXidAuthorityHeader *hdr)
  * pre-CLUSTER_ERA .bak re-opens the native-era re-entry guard.  Crash
  * points: both copies old (transition not yet taken: state still
  * consistent), primary new + .bak old (read prefers the valid primary),
- * both new.  A later single-copy corruption therefore never resurrects the
- * pre-transition flags.
+ * both new.  The primary-new/.bak-old window does not self-repair on its
+ * own: the transition entry points are re-run by every boot and re-assert
+ * both copies until both_copies_flags_settled holds (review r3-X1), so a
+ * later single-copy corruption never resurrects the pre-transition flags.
  */
 static void
 write_header_both(ClusterXidAuthorityHeader *hdr)
@@ -378,7 +420,11 @@ cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 next_multi, b
 
 /*
  * cluster_xid_authority_mark_cluster_era -- one-way CLUSTER_ERA stamp (first
- * cluster.enabled=on boot; spec §3.1).  No-op when already stamped.  A
+ * cluster.enabled=on boot; spec §3.1).  Idempotent re-assert: re-run by
+ * every cluster boot, it rewrites BOTH copies until both carry the flag, so
+ * a crash between write_header_both's two renames (stamped primary, stale
+ * .bak) is repaired on the next boot instead of surviving the run (review
+ * r3-X1); once both copies are settled it is a no-write no-op.  A
  * missing/corrupt authority PANICs: the catalog bootstrap seeds it before
  * any caller can reach this point, so absence here is real damage.
  */
@@ -391,8 +437,9 @@ cluster_xid_authority_mark_cluster_era(void)
 		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 						errmsg("shared XID authority is missing or corrupt at cluster-era stamp")));
 
-	if (hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA)
-		return;
+	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA) != 0
+		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA, 0))
+		return; /* transition complete in both copies */
 
 	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA;
 	write_header_both(&hdr); /* review F1 variant: one-way flag in BOTH copies */
@@ -417,6 +464,12 @@ cluster_xid_authority_mark_cluster_era(void)
  *	the stamp is re-applied by the next cluster boot (mark is re-issued
  *	whenever unset) and this authority is left unsealed -- which only ever
  *	blocks adoption, never yields a wrong answer.
+ *
+ *	Idempotent re-assert (review r3-X1): re-run by every native-era boot,
+ *	it rewrites BOTH copies until neither retains SEALED, so a crash
+ *	between write_header_both's two renames (unsealed primary, stale
+ *	SEALED .bak) is repaired on the next boot instead of surviving the
+ *	run; once both copies are settled it is a no-write no-op.
  */
 void
 cluster_xid_authority_begin_native_run(void)
@@ -432,8 +485,9 @@ cluster_xid_authority_begin_native_run(void)
 				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 				 errmsg("native seed era cannot be re-entered on a formed shared catalog tree")));
 
-	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0)
-		return; /* already open (first run, or a prior pass crashed) */
+	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0
+		&& both_copies_flags_settled(0, CLUSTER_XID_AUTHORITY_FLAG_SEALED))
+		return; /* open, and no copy retains SEALED */
 
 	hdr.flags &= ~CLUSTER_XID_AUTHORITY_FLAG_SEALED;
 	write_header_both(&hdr); /* review F1: no copy may retain SEALED */

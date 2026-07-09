@@ -544,6 +544,129 @@ UT_TEST(test_mark_cluster_era_survives_primary_corruption_via_bak)
 					 CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
 }
 
+/*
+ * write_raw_image / read_raw_image -- install / fetch one fixed-size
+ * authority image at `path` (raw open/write, no CRC games: the images
+ * moved around here are byte copies of real, valid on-disk images).
+ */
+static void
+write_raw_image(const char *path, const char *image, size_t len)
+{
+	int fd;
+
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, image, len), (long long)len);
+	close(fd);
+}
+
+static void
+read_raw_image(const char *path, char *image, size_t len)
+{
+	int fd;
+
+	fd = open(path, O_RDONLY, 0);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(read(fd, image, len), (long long)len);
+	close(fd);
+}
+
+UT_TEST(test_unseal_torn_crash_repairs_stale_sealed_bak)
+{
+	ClusterXidAuthorityHeader got;
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char old_image[sizeof(ClusterXidAuthorityHeader)];
+	char bak_image[sizeof(ClusterXidAuthorityHeader)];
+	int fd;
+
+	/* review r3-X1: a crash BETWEEN write_header_both's two renames leaves
+	 * primary=UNSEALED(new) / .bak=SEALED(old high-water).  Every native-era
+	 * boot re-runs the transition, which must re-assert BOTH copies; before
+	 * the fix it early-returned on the already-unsealed primary and the
+	 * stale SEALED .bak survived the whole run -- any later primary read
+	 * failure resurrected the previous pass's high-water (8.A). */
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+
+	/* capture the pre-transition (SEALED) primary image */
+	snprintf(primary_path, sizeof(primary_path), "%s/%s", test_root,
+			 CLUSTER_XID_AUTHORITY_REL_PATH);
+	snprintf(bak_path, sizeof(bak_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+	read_raw_image(primary_path, old_image, sizeof(old_image));
+
+	/* complete the transition, then re-install the old SEALED image as
+	 * .bak, simulating the crash window between the two durable renames */
+	cluster_xid_authority_begin_native_run();
+	write_raw_image(bak_path, old_image, sizeof(old_image));
+
+	/* restart repair path: the next native-era boot re-runs the transition */
+	cluster_xid_authority_begin_native_run();
+
+	/* the .bak copy itself must have been repaired to an unsealed image */
+	read_raw_image(bak_path, bak_image, sizeof(bak_image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(bak_image, sizeof(bak_image)),
+				 CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&got, bak_image, sizeof(got));
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, 0);
+
+	/* a later primary read failure must fall back to the REPAIRED image,
+	 * not resurrect the previous pass's sealed high-water */
+	fd = open(primary_path, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	(void)!write(fd, "garbage!", 8);
+	close(fd);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 816);
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, 0);
+}
+
+UT_TEST(test_mark_cluster_era_torn_crash_repairs_stale_bak)
+{
+	ClusterXidAuthorityHeader got;
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char old_image[sizeof(ClusterXidAuthorityHeader)];
+	char bak_image[sizeof(ClusterXidAuthorityHeader)];
+	int fd;
+
+	/* review r3-X1 variant: the same torn-crash window across the
+	 * CLUSTER_ERA stamp leaves a .bak without the one-way flag; a .bak
+	 * fallback would then let an enabled=off boot re-enter the native era
+	 * on a formed tree.  The stamp is re-run by every cluster boot and
+	 * must repair the lagging copy. */
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+
+	snprintf(primary_path, sizeof(primary_path), "%s/%s", test_root,
+			 CLUSTER_XID_AUTHORITY_REL_PATH);
+	snprintf(bak_path, sizeof(bak_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+	read_raw_image(primary_path, old_image, sizeof(old_image));
+
+	cluster_xid_authority_mark_cluster_era();
+	write_raw_image(bak_path, old_image, sizeof(old_image));
+
+	/* restart repair path: the next cluster boot re-runs the stamp */
+	cluster_xid_authority_mark_cluster_era();
+
+	read_raw_image(bak_path, bak_image, sizeof(bak_image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(bak_image, sizeof(bak_image)),
+				 CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&got, bak_image, sizeof(got));
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA,
+				 CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
+
+	fd = open(primary_path, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	(void)!write(fd, "garbage!", 8);
+	close(fd);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA,
+				 CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
+}
+
 UT_TEST(test_prefix_check_divergence_truth_table)
 {
 	const uint64 xids_per_page = (uint64)BLCKSZ * 4;
@@ -682,7 +805,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -692,6 +815,8 @@ main(void)
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
 	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);
+	UT_RUN(test_unseal_torn_crash_repairs_stale_sealed_bak);
+	UT_RUN(test_mark_cluster_era_torn_crash_repairs_stale_bak);
 	UT_RUN(test_primary_corrupt_falls_back_to_bak);
 	UT_RUN(test_present_distinguishes_corrupt_from_absent);
 	UT_RUN(test_prehistory_publish_adopt_round_trip);

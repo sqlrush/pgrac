@@ -194,14 +194,20 @@ extern bool cluster_xid_authority_seed_if_absent(uint64 initial_native_hw);
 extern void cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 next_multi,
 												 bool seal);
 
-/* One-way: stamp CLUSTER_ERA (first cluster.enabled=on boot). */
+/*
+ * One-way: stamp CLUSTER_ERA (first cluster.enabled=on boot).  Idempotent
+ * re-assert: rewrites BOTH copies until both carry the flag (repairing a
+ * torn previous stamp); no-write no-op once both are stamped.
+ */
 extern void cluster_xid_authority_mark_cluster_era(void);
 
 /*
  * A follow-up native-era (cluster.enabled=off) boot on a sealed authority
  * re-opens the era: clears SEALED so a crash of this run never exposes the
  * previous pass's stale high-water to joiners.  Caller vets CLUSTER_ERA
- * first (re-entry is FATAL); no-op when already unsealed.
+ * first (re-entry is FATAL).  Idempotent re-assert: rewrites BOTH copies
+ * until neither retains SEALED (repairing a torn previous unseal);
+ * no-write no-op once both are open.
  */
 extern void cluster_xid_authority_begin_native_run(void);
 

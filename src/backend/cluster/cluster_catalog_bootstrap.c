@@ -183,12 +183,19 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 		 * fail-closed (unsealed) instead of adopting the previous pass's
 		 * stale high-water (spec-6.15b §3.1 multi-pass arm, rule 8.A).  The
 		 * clean shutdown of this run re-publishes and re-seals.
+		 *
+		 * Called unconditionally (not gated on the primary's SEALED flag):
+		 * the transition re-asserts BOTH on-disk copies, so a crash between
+		 * a previous unseal's two renames -- a stale SEALED .bak behind an
+		 * already-unsealed primary, which a later primary read failure
+		 * would resurrect -- is repaired here instead of surviving the run
+		 * (review r3-X1).  Once both copies are open this is a no-write
+		 * no-op.
 		 */
-		if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) {
-			cluster_xid_authority_begin_native_run();
+		cluster_xid_authority_begin_native_run();
+		if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED)
 			elog(LOG, "cluster shared_catalog: re-opened native seed era "
 					  "(XID authority unsealed for this run)");
-		}
 		return;
 	}
 
@@ -268,13 +275,21 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 				 (unsigned long long)own_next, (unsigned long long)auth.native_hw_full);
 	}
 
-	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA) == 0) {
-		cluster_xid_authority_mark_cluster_era();
+	/*
+	 * One-way CLUSTER_ERA stamp, re-run unconditionally on every cluster
+	 * boot: the transition re-asserts BOTH on-disk copies, so a crash
+	 * between a previous stamp's two renames -- a stale pre-CLUSTER_ERA
+	 * .bak behind an already-stamped primary, which a later primary read
+	 * failure would hand to an enabled=off boot as a re-entry bypass -- is
+	 * repaired here instead of surviving the run (review r3-X1).  Once
+	 * both copies are stamped this is a no-write no-op.
+	 */
+	cluster_xid_authority_mark_cluster_era();
+	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA) == 0)
 		elog(LOG,
 			 "cluster shared_catalog: marked XID authority cluster era started at native "
 			 "high-water %llu",
 			 (unsigned long long)auth.native_hw_full);
-	}
 }
 
 void
