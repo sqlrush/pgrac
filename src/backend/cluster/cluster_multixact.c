@@ -37,6 +37,8 @@
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_cr.h"		   /* vis53r97 multi_member_serve counters (D3-b) */
+#include "cluster/cluster_cr_server.h" /* undo_multi_verdict_fetch_and_wait (D3-b) */
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
@@ -341,11 +343,71 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 }
 
 /*
- * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a)
+ * cluster_multixact_remote_xmax_ask_origin (spec-7.1 D3-b)
+ *
+ *	The member overlay missed a foreign multixact xmax.  For an updater-bearing
+ *	multi this miss is STRUCTURAL, not incidental: the proactive overlay is
+ *	installed at heap_update's OLD-xmax compose time, when the updater still has
+ *	no TT binding (IN-12), so the overlay never covers it.  The only positive
+ *	path is to ask the ORIGIN -- the sole owner of the multi's pg_multixact
+ *	members -- for a batched per-member verdict, then feed the served terminals
+ *	to the pure combination resolver.
+ *
+ *	Any fail-closed outcome (GUC off, DENIED / timeout / invalid page, or a
+ *	SERVED page still UNKNOWN at this read_scn) keeps the pre-existing 53R97
+ *	boundary (Rule 8.A).  ask/hit census: ask = every request; hit = a definite
+ *	VISIBLE/INVISIBLE; unprovable = ask - hit (the feature #119 residue).
+ */
+static ClusterVisibilityDecision
+cluster_multixact_remote_xmax_ask_origin(uint16 origin_slot, MultiXactId mxid, Snapshot snap)
+{
+	PGAlignedBlock page_buf;
+	const ClusterGcsUndoMultiVerdictPage *page;
+	ClusterLiveAuthority auth;
+	ClusterMultiXactServedMember *served;
+	ClusterVisibilityDecision decision;
+	uint16 n;
+	uint16 i;
+
+	/* Only the GUC-armed cross-node runtime path asks; off = D3-a floor. */
+	if (!cluster_crossnode_runtime_visibility || !cluster_multi_xmax_remote_resolve)
+		return CLUSTER_VISIBILITY_UNKNOWN;
+
+	cluster_vis53r97_note_multi_member_serve_ask();
+	if (!cluster_gcs_block_undo_multi_verdict_fetch_and_wait((int32)origin_slot, mxid,
+															 page_buf.data, &auth))
+		return CLUSTER_VISIBILITY_UNKNOWN; /* DENIED / timeout / invalid -> 53R97 */
+
+	/* The page is structurally validated (SERVED, nmembers in [1, MAX], every
+	 * member consistent) by the fetch; map it to served terminals + resolve. */
+	page = (const ClusterGcsUndoMultiVerdictPage *)page_buf.data;
+	n = page->nmembers;
+	served
+		= (ClusterMultiXactServedMember *)palloc0((Size)n * sizeof(ClusterMultiXactServedMember));
+	for (i = 0; i < n; i++) {
+		served[i].commit_scn = (SCN)page->members[i].commit_scn;
+		served[i].horizon_scn = (SCN)page->members[i].horizon_scn;
+		served[i].xid = page->members[i].xid;
+		served[i].wrap = page->members[i].wrap;
+		served[i].verdict = page->members[i].verdict;
+		served[i].member_status = page->members[i].member_status;
+	}
+	decision = cluster_multixact_resolve_visibility_served(served, n, snap->read_scn);
+	pfree(served);
+
+	if (decision != CLUSTER_VISIBILITY_UNKNOWN)
+		cluster_vis53r97_note_multi_member_serve_hit();
+	return decision;
+}
+
+/*
+ * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a + D3-b)
  *
  *	One-call reader helper: overlay key build (current epoch) + member
- *	overlay lookup + OBS-1 visibility resolution.  See header; UNKNOWN
- *	always means fail closed at the caller.
+ *	overlay lookup + OBS-1 visibility resolution.  On overlay HIT the local
+ *	OBS-1 resolver decides; on overlay MISS (structural for a foreign
+ *	updater-multi, IN-12) the D3-b origin member-verdict ask decides.  See
+ *	header; UNKNOWN always means fail closed at the caller.
  */
 ClusterVisibilityDecision
 cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
@@ -369,7 +431,8 @@ cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snap
 
 	if (!cluster_multixact_member_overlay_lookup(&mxkey, mxres, CLUSTER_MULTIXACT_MAX_MEMBERS)) {
 		pfree(mxres);
-		return CLUSTER_VISIBILITY_UNKNOWN;
+		/* spec-7.1 D3-b: overlay miss -> ask the origin (banner). */
+		return cluster_multixact_remote_xmax_ask_origin(origin_slot, mxid, snap);
 	}
 
 	if (overlay_hit)

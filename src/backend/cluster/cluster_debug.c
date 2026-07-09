@@ -2675,6 +2675,11 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_ask_count()));
 	emit_row(rsinfo, "cr", "vis53r97_leg_xmin_overlay_verdict_hit_count",
 			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_hit_count()));
+	/* spec-7.1 D3-b: foreign multixact member-verdict requester ask / hit. */
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_member_serve_ask_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_member_serve_ask_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_member_serve_hit_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_member_serve_hit_count()));
 	emit_row(rsinfo, "cr", "vis53r97_leg_live_upgrade_hit_count",
 			 fmt_int64((int64)cluster_vis53r97_leg_live_upgrade_hit_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */

@@ -287,6 +287,12 @@ extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void);
 extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void);
 extern void cluster_vis53r97_note_xmin_overlay_verdict_ask(void);
 extern void cluster_vis53r97_note_xmin_overlay_verdict_hit(void);
+/* spec-7.1 D3-b requester 半边: foreign multixact member-verdict ask / hit
+ * (unprovable = ask - hit -> the 53R97 residue, feature #119 forward). */
+extern uint64 cluster_vis53r97_leg_multi_member_serve_ask_count(void);
+extern uint64 cluster_vis53r97_leg_multi_member_serve_hit_count(void);
+extern void cluster_vis53r97_note_multi_member_serve_ask(void);
+extern void cluster_vis53r97_note_multi_member_serve_hit(void);
 /* spec-7.1 D1 serve 半边: INVALID_SCN -> positive ABORTED via CLOG (hit); the
  * miss counterpart is invalid_scn_refuse_count / note_srv_invalid_scn. */
 extern uint64 cluster_vis53r97_leg_live_upgrade_hit_count(void);

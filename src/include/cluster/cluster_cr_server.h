@@ -251,6 +251,18 @@ extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uin
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);
 
+/* Requester side (backend, spec-7.1 D3-b): ask origin_node for a batched
+ * member verdict on the foreign multixact `mxid` over the same wire.  On
+ * success copies the structurally-validated (cluster_vis_undo_multi_verdict_
+ * page_usable) SERVED page into page_out (a BLCKSZ, 8-byte-aligned buffer),
+ * Lamport-observes every member SCN that crossed the wire (AD-008), fills
+ * *auth_out and returns true; false = fail-closed (timeout / DENIED / checksum
+ * / trailer missing / non-SERVED / malformed page — caller keeps the unchanged
+ * 53R97, Rule 8.A). */
+extern bool cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXactId mxid,
+																char *page_out,
+																ClusterLiveAuthority *auth_out);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_CR_SERVER_H */

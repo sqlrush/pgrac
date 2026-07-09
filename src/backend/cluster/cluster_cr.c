@@ -209,6 +209,15 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_ask_count;
 	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_hit_count;
 	/*
+	 * spec-7.1 D3-b requester 半边: a foreign multixact xmax whose member
+	 * overlay missed asked the origin for a batched member verdict.  ask =
+	 * every request sent; hit = a request whose SERVED page resolved to a
+	 * definite VISIBLE/INVISIBLE.  unprovable = ask - hit (a DENIED / timeout /
+	 * invalid page, or a SERVED page still UNKNOWN at this read_scn) -> 53R97.
+	 */
+	pg_atomic_uint64 vis53r97_leg_multi_member_serve_ask_count;
+	pg_atomic_uint64 vis53r97_leg_multi_member_serve_hit_count;
+	/*
 	 * spec-7.1 D1 serve 半边: the origin LMS verdict serve upgraded a durable
 	 * XID_MATCH_INVALID_SCN hit (unstamped commit_scn, delayed-cleanout window)
 	 * to a positive ABORTED answer by cross-checking CLOG (authoritative for
@@ -311,6 +320,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_member_serve_ask_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_member_serve_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_live_upgrade_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
@@ -539,6 +550,21 @@ cluster_vis53r97_note_xmin_overlay_verdict_hit(void)
 		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 1);
 }
 
+/* spec-7.1 D3-b requester 半边: foreign multixact member-verdict ask / hit. */
+void
+cluster_vis53r97_note_multi_member_serve_ask(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_multi_member_serve_ask_count, 1);
+}
+
+void
+cluster_vis53r97_note_multi_member_serve_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_multi_member_serve_hit_count, 1);
+}
+
 /* spec-7.1 D1 serve 半边: INVALID_SCN durable hit upgraded to positive ABORTED
  * via CLOG cross-check (the miss counterpart is note_srv_invalid_scn). */
 void
@@ -551,6 +577,10 @@ CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_ask_count,
 					vis53r97_leg_xmin_overlay_verdict_ask_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_hit_count,
 					vis53r97_leg_xmin_overlay_verdict_hit_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_multi_member_serve_ask_count,
+					vis53r97_leg_multi_member_serve_ask_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_multi_member_serve_hit_count,
+					vis53r97_leg_multi_member_serve_hit_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_live_upgrade_hit_count,
 					vis53r97_leg_live_upgrade_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)

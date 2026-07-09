@@ -1936,6 +1936,16 @@ cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void)
 	return 0;
 }
 uint64
+cluster_vis53r97_leg_multi_member_serve_ask_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_member_serve_hit_count(void)
+{
+	return 0;
+}
+uint64
 cluster_vis53r97_leg_live_upgrade_hit_count(void)
 {
 	return 0;
