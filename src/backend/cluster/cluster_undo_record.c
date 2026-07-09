@@ -1765,14 +1765,29 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	 * blanket-converted to ERROR.  The CR-construct caller no longer relies on
 	 * this branch: the spec-5.57 D2 pre-check in cluster_cr.c fail-closes a
 	 * runtime-warm cross-instance origin with 53R9G BEFORE this read, so for the
-	 * CR path the boundary is consolidated to one errcode.  The runtime
-	 * cross-instance undo data plane lands in Stage 6 (#119). */
+	 * CR path the boundary is consolidated to one errcode.
+	 *
+	 * spec-5.22b D2 (#119) — this wall now formally ENFORCES invariant #8: a
+	 * peer NEVER self-reads a foreign owner's undo bytes.  The coherent runtime
+	 * cross-instance undo read is cluster_undo_block_acquire_shared (D2-3): the
+	 * owner is the master AND the holder, so it ships its own block image over
+	 * owner-as-master routing and the requesting peer consumes THAT shipped
+	 * image, never opening the foreign pg_undo/instance_<origin> tree here.
+	 * Hence this local-open path correctly STAYS fail-closed for a runtime-warm
+	 * foreign owner -- the coherent bytes come from the grant, not from this
+	 * read (admitting a local foreign read here would BREAK invariant #8).  The
+	 * admit set is unchanged (own-instance OR materialized-remote, both P1-3
+	 * local): only this contract text is updated (spec-5.22b Q-D24-1=A, zero
+	 * behaviour change).  Routing the recovery/SRF/CR callers onto the grant
+	 * (so a runtime-warm foreign read reaches acquire_shared instead of this
+	 * warning) is the D6 consumer wiring. */
 	if (owner_instance != (uint8)(cluster_node_id + 1)
 		&& !cluster_merged_instance_is_materialized((int)owner_instance - 1)) {
 		ereport(WARNING,
 				(errmsg("cluster_undo_get_record: runtime cross-instance undo read not supported"),
-				 errhint("Cross-instance undo/CR data plane lands in Stage 6 (#119 undo-block "
-						 "Cache Fusion); see Spec: spec-5.57.")));
+				 errhint("The coherent cross-instance undo path is the owner's shipped block "
+						 "image (spec-5.22b #119 undo-block Cache Fusion), not a local read; "
+						 "see Spec: spec-5.57.")));
 		return 0;
 	}
 	if (owner_instance != (uint8)(cluster_node_id + 1))

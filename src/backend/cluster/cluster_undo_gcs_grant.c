@@ -128,3 +128,115 @@ cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expecte
 	res->status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 	return true;
 }
+
+/*
+ * cluster_undo_block_acquire_exclusive -- writer/cleaner X-grant primitive
+ * (D2-4).
+ *
+ *	See cluster_undo_gcs.h for the full contract.  The owner takes X on its OWN
+ *	undo block before mutating/recycling it; a peer must never take X on a
+ *	foreign owner's undo (single-writer invariant), so master != self fails
+ *	closed (Rule 8.A).  Runtime object; its live consumer + the D6
+ *	owner-incarnation self-check are skeleton-ahead (Q-D24-3).
+ */
+bool
+cluster_undo_block_acquire_exclusive(const ClusterResId *undo_resid)
+{
+	if (undo_resid == NULL)
+		return false; /* fail-closed */
+	if (!cluster_undo_resid_is_undo(undo_resid))
+		return false;
+
+	/*
+	 * Coherence gate.  At the default (coherence off / non peer-mode) the owner
+	 * keeps its unchanged local undo write path, so D2 lands inert (回归安全).
+	 */
+	if (!cluster_undo_grant_armed(cluster_undo_gcs_coherence, cluster_peer_mode_enabled()))
+		return false;
+
+	/*
+	 * Single-writer invariant: only the owner ever writes/recycles its own undo
+	 * (cluster_undo_record.c owner_instance == self).  A peer taking X on a
+	 * foreign owner's undo would be writing foreign undo -> fail closed
+	 * (Rule 8.A), never grant.  master == self => local PCM X, zero network (the
+	 * owner is already both master and the sole writer).  The owner-incarnation
+	 * self-check (L364) that must gate actually serving from this local fast
+	 * path lands with the write-path consumer in D6.
+	 */
+	if (!cluster_undo_block_master_is_self(undo_resid))
+		return false;
+
+	return true;
+}
+
+/*
+ * cluster_undo_block_invalidate_peers -- owner-write PI-discard broadcast
+ * (D2-4).
+ *
+ *	See cluster_undo_gcs.h for the full contract.  After the owner durably
+ *	writes its undo block's current copy, direct every peer holding an obsolete
+ *	Past Image to drop it.  SCN-only (Q-D24-2); LMON-context (L172); returns the
+ *	number of peers notified, all misses fail-safe (0).  Skeleton-ahead until
+ *	D6 registers undo PI holders (Q-D24-3).
+ */
+int
+cluster_undo_block_invalidate_peers(const ClusterResId *undo_resid, SCN write_scn)
+{
+	int32 owner;
+	uint32 seg;
+	uint32 block;
+	uint32 gen;
+	BufferTag tag;
+	uint32 holders = 0;
+	int notified = 0;
+	int n;
+
+	if (undo_resid == NULL)
+		return 0;
+	if (!cluster_undo_resid_is_undo(undo_resid))
+		return 0;
+
+	/* Not armed (single-node / coherence off) -> no peers to invalidate. */
+	if (!cluster_undo_grant_armed(cluster_undo_gcs_coherence, cluster_peer_mode_enabled()))
+		return 0;
+
+	cluster_undo_resid_decode(undo_resid, &owner, &seg, &block, &gen);
+	(void)owner; /* synthetic undo tag deliberately omits owner (the origin only
+				  * ever serves its own undo; fail-closed by construction) */
+	(void)gen;	 /* segment generation is the READER's anti-ABA dimension
+				  * (cluster_undo_grant_admissible), not the write-side notify */
+
+	/*
+	 * The undo block's synthetic address tag (spec-6.12i D-i1): undo segments
+	 * live outside shared buffers, so the PI protocol keys them by this magic
+	 * tag exactly as the fetch wire does.
+	 */
+	tag = GcsBlockUndoFetchTagMake(seg, block);
+
+	/*
+	 * SCN coverage judge under the entry lock: if the just-durable write reaches
+	 * the block's SCN watermark, collect + clear the pi_holders_bitmap (both
+	 * watermarks) and hand back the pre-clear set to notify.  Missing entry /
+	 * not-covered / unarmed watermark -> false (fail-safe: the PI merely lingers
+	 * until buffer pressure / anti-ABA reread, never a correctness loss).  Until
+	 * D6 registers undo PI holders this fail-safes to 0 (Q-D24-3).
+	 */
+	if (!cluster_pcm_lock_pi_discard_collect(tag, write_scn, &holders))
+		return 0;
+
+	/*
+	 * Direct a PI_DISCARD to each PEER whose bit is set (the owner is the
+	 * current writer, never a PI holder of its own block -- notify_target
+	 * excludes self).  Reuses the shipped single-target INVALIDATE send
+	 * (LMON-context; L172 -- the D6 live caller runs in the owner-as-master
+	 * LMON dispatch/tick path).
+	 */
+	for (n = 0; n < 32; n++) {
+		if (!cluster_undo_pi_discard_notify_target(holders, n, cluster_node_id))
+			continue;
+		cluster_gcs_block_send_pi_discard_invalidate(tag, n);
+		notified++;
+	}
+
+	return notified;
+}

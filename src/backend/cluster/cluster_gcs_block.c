@@ -5700,6 +5700,31 @@ gcs_block_pi_kept_note_send(BufferTag tag, int32 master_node)
 }
 
 /*
+ * Send one unsolicited PI_DISCARD INVALIDATE ride to `target_node` for `tag`:
+ * "drop your Past Image of this block".  request_id 0, fire-and-forget, never
+ * ACKed (spec-6.12h D-h2).  Public so the shared-undo data plane (spec-5.22b
+ * D2-4, owner-as-master) reuses the exact wire + checksum rather than
+ * duplicating the payload build.  Emits tier-1 IC -> must run in LMON
+ * dispatch/tick context (L172 family); the caller owns the self/range guard.
+ */
+void
+cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 target_node)
+{
+	GcsBlockInvalidatePayload inv;
+
+	memset(&inv, 0, sizeof(inv));
+	inv.request_id = 0; /* unsolicited: no broadcast slot, no ACK */
+	inv.epoch = cluster_epoch_get_current();
+	inv.tag = tag;
+	inv.master_node = cluster_node_id;
+	inv.invalidating_for_x_node = 0;
+	inv.reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD;
+	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, target_node, &inv,
+								   sizeof(inv));
+}
+
+/*
  * Master side: a durable-note for `tag` arrived (locally routed or via the
  * status-3 wire ride).  If the written pd_block_scn covers the SCN watermark
  * (the only cross-node comparable unit), collect + clear the PI holder
@@ -5728,17 +5753,7 @@ gcs_block_pi_discard_master_apply(BufferTag tag, SCN written_scn)
 		if (n == cluster_node_id) {
 			cluster_lever_h_note_discard_result(cluster_bufmgr_discard_pi_block(tag));
 		} else {
-			GcsBlockInvalidatePayload inv;
-
-			memset(&inv, 0, sizeof(inv));
-			inv.request_id = 0; /* unsolicited: no broadcast slot, no ACK */
-			inv.epoch = cluster_epoch_get_current();
-			inv.tag = tag;
-			inv.master_node = cluster_node_id;
-			inv.invalidating_for_x_node = 0;
-			inv.reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD;
-			inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
-			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+			cluster_gcs_block_send_pi_discard_invalidate(tag, n);
 		}
 	}
 }

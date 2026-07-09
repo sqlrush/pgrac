@@ -42,8 +42,9 @@
 #define CLUSTER_UNDO_GCS_H
 
 #include "cluster/cluster_grd.h"				/* ClusterResId */
-#include "cluster/cluster_pcm_lock.h"			/* PcmState / PcmLockTransition */
+#include "cluster/cluster_pcm_lock.h"			/* PcmState / PcmLockTransition / pi_discard */
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority */
+#include "cluster/cluster_scn.h"				/* SCN (D2-4 PI-discard coverage) */
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent */
 
 /*
@@ -155,6 +156,57 @@ extern PcmState cluster_undo_grant_reader_pcm_mode(void);
 extern PcmLockTransition cluster_undo_grant_reader_pcm_transition(void);
 
 /*
+ * cluster_undo_grant_writer_pcm_mode / _transition -- writer/cleaner lock
+ * contract (D2-4, §2.2).  Before an owner mutates (or a cleaner recycles) its
+ * OWN undo block it takes the block in PCM X mode via the write-first N->X
+ * transition -- the pair symmetric to the reader's S / N->S (D2-3).  The
+ * transition-legality table itself is owned + tested by cluster_pcm_lock
+ * (spec-2.30); this only names which pair the undo writer selects, so a
+ * write path can never accidentally take the read-first pair.
+ */
+extern PcmState cluster_undo_grant_writer_pcm_mode(void);
+extern PcmLockTransition cluster_undo_grant_writer_pcm_transition(void);
+
+/*
+ * cluster_undo_pi_discard_covered -- pure PI-discard coverage judge (D2-4,
+ * §3.1; Q-D24-2).
+ *
+ *	true iff the owner's just-durable write of an undo block's CURRENT copy
+ *	(written_scn = its pd_block_scn) proves every peer Past Image of that block
+ *	obsolete: the written version reaches the block's SCN watermark (the newest
+ *	shipped version), so every PI is that version or older.  Delegates to the
+ *	shipped cross-node coverage primitive cluster_pcm_pi_discard_covered, which
+ *	compares on scn_local (AD-008 time order), never the raw SCN (node-id
+ *	dominated).  Fail-safe: an unarmed (Invalid) watermark or an unknown
+ *	(Invalid) written version returns false (keep the PI, never a false
+ *	discard).
+ *
+ *	SCN-only BY CONSTRUCTION (Q-D24-2 resolution): per-node WAL (spec-4.1)
+ *	gives every node its own LSN space, so the LSN unit is incomparable
+ *	cross-node.  The LSN redo-coverage dimension is NOT judged here -- it is
+ *	discharged by cluster_pcm_lock_pi_discard_collect (which clears BOTH
+ *	watermarks once the SCN covers -- durable >= newest-shipped also
+ *	discharges the redo-coverage claim) plus retire_if_durable (the single
+ *	stream LSN fixture).  So this D2-4 judge deliberately adds no LSN
+ *	dimension; doing so would double-count or wrongly compare across streams.
+ */
+extern bool cluster_undo_pi_discard_covered(SCN wm_scn, SCN written_scn);
+
+/*
+ * cluster_undo_pi_discard_notify_target -- pure PI-discard targeting (D2-4,
+ * §1.2; Q4-A per-block).
+ *
+ *	Once the coverage judge clears a block's pi_holders_bitmap, the owner
+ *	directs a PI_DISCARD to each PEER whose bit is set.  `node` is a legal
+ *	target iff its bit is set in `holders` AND it is not `self_node` (the owner
+ *	is the current writer of its own undo, never a Past-Image holder of it) AND
+ *	its id is in range [0,32) (the 32-wide bitmap; ㉕ self-send precedent).
+ *	Pure bitmap logic (no globals) so cluster_unit drives it standalone; the
+ *	runtime invalidate_peers loops peers through this predicate.
+ */
+extern bool cluster_undo_pi_discard_notify_target(uint32 holders, int32 node, int32 self_node);
+
+/*
  * cluster_undo_block_acquire_shared -- reader S-grant primitive (D2-3, §2.2).
  *
  *	A peer reads owner N's undo block (block0 TT header is D3's first consumer)
@@ -178,5 +230,56 @@ extern PcmLockTransition cluster_undo_grant_reader_pcm_transition(void);
 extern bool cluster_undo_block_acquire_shared(const ClusterResId *undo_resid,
 											  uint32 expected_generation, char *dst_block,
 											  ClusterUndoGrantResult *res);
+
+/*
+ * cluster_undo_block_acquire_exclusive -- writer/cleaner X-grant primitive
+ * (D2-4, §2.2/§3.1).
+ *
+ *	The owner takes its OWN undo block in exclusive mode before mutating it (a
+ *	record writer) or recycling its segment (the cleaner).  Under owner-as
+ *	master an undo block's master IS its owner, and the single-writer invariant
+ *	means only the owner ever writes its own undo (cluster_undo_record.c
+ *	owner_instance == self), so:
+ *	  - not armed (coherence off / non-peer) -> false: the caller keeps its
+ *	    unchanged local write path (D2 inert at the default, 回归安全).
+ *	  - master != self -> false, fail-closed: a peer must NEVER take X on a
+ *	    foreign owner's undo (that would be writing foreign undo, breaking the
+ *	    single-writer invariant, Rule 8.A).
+ *	  - master == self (armed) -> true: the owner grants itself the local PCM X
+ *	    (zero network -- it is already the master and the sole writer).
+ *
+ *	X-grant here means "hold X so peer S copies are invalidated" (the paired
+ *	invalidate_peers), NEVER "a peer may write foreign undo".  Runtime object
+ *	(heavy deps): not in the standalone cluster_unit link; its live consumer
+ *	(the owner's undo write path taking X + the D6 owner-incarnation self-check)
+ *	lands in D6, so this increment is skeleton-ahead-of-consumer (Q-D24-3),
+ *	forward-covered by the D2-7/D6 TAP.
+ */
+extern bool cluster_undo_block_acquire_exclusive(const ClusterResId *undo_resid);
+
+/*
+ * cluster_undo_block_invalidate_peers -- owner-write PI-discard broadcast
+ * (D2-4, §1.2/§3.1; Q-D24-2/Q-D24-3).
+ *
+ *	After the owner durably writes its undo block's CURRENT copy, it directs
+ *	every peer holding a now-obsolete Past Image to drop it.  Builds the block's
+ *	synthetic undo address tag (GcsBlockUndoFetchTagMake) and reuses the shipped
+ *	spec-6.12h PI-discard machinery: cluster_pcm_lock_pi_discard_collect judges
+ *	SCN coverage (written_scn vs the block's SCN watermark) under the entry
+ *	lock and, when covered, clears the watermarks + hands back the pre-clear
+ *	pi_holders_bitmap; each set PEER then gets a PI_DISCARD ride on the
+ *	INVALIDATE wire (unsolicited, never ACKed).  Returns the number of peers
+ *	notified (0 when not armed, no entry, or not covered -- all fail-safe: an
+ *	un-discarded PI merely lingers until buffer pressure / anti-ABA reread,
+ *	never a correctness loss).
+ *
+ *	SCN-only (Q-D24-2): write_scn is the only cross-node comparable unit.
+ *	LMON-context contract: it emits tier-1 IC (L172 family) so its live caller
+ *	is the owner-as-master LMON dispatch/tick path (D6), NOT a writer backend;
+ *	with no undo PI holder registered before D6 the collect fail-safes to 0,
+ *	so this increment is skeleton-ahead-of-consumer (Q-D24-3), forward-covered
+ *	by the D2-7/D6 TAP.
+ */
+extern int cluster_undo_block_invalidate_peers(const ClusterResId *undo_resid, SCN write_scn);
 
 #endif /* CLUSTER_UNDO_GCS_H */

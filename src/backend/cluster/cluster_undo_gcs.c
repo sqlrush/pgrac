@@ -169,3 +169,58 @@ cluster_undo_grant_reader_pcm_transition(void)
 {
 	return PCM_TRANS_N_TO_S;
 }
+
+/*
+ * cluster_undo_grant_writer_pcm_mode / _transition -- writer/cleaner lock
+ * contract (D2-4).  The owner takes its own undo block in PCM X via the
+ * write-first N->X transition before mutating/recycling it.  See
+ * cluster_undo_gcs.h for the contract; cluster_pcm_lock owns and tests the
+ * transition-legality table.
+ */
+PcmState
+cluster_undo_grant_writer_pcm_mode(void)
+{
+	return PCM_LOCK_MODE_X;
+}
+
+PcmLockTransition
+cluster_undo_grant_writer_pcm_transition(void)
+{
+	return PCM_TRANS_N_TO_X;
+}
+
+/*
+ * cluster_undo_pi_discard_covered -- pure PI-discard coverage judge (D2-4).
+ *
+ *	Delegates to the shipped cross-node coverage primitive
+ *	cluster_pcm_pi_discard_covered (SCN-only, scn_local order).  This undo
+ *	domain wrapper exists to (a) name the owner-write "did my durable copy
+ *	obsolete peer PIs" decision in the undo data plane and (b) pin the
+ *	Q-D24-2 resolution at the type boundary: the judge is SCN-only, the LSN
+ *	redo-coverage dimension is discharged by the collect (both-watermark
+ *	clear) + retire_if_durable, never re-judged here.  See cluster_undo_gcs.h.
+ */
+bool
+cluster_undo_pi_discard_covered(SCN wm_scn, SCN written_scn)
+{
+	return cluster_pcm_pi_discard_covered(wm_scn, written_scn);
+}
+
+/*
+ * cluster_undo_pi_discard_notify_target -- pure PI-discard targeting (D2-4).
+ *
+ *	A peer `node` receives a PI_DISCARD iff its bit is set in `holders`, it is
+ *	not `self_node` (the owner is the writer, never a PI holder of its own
+ *	block), and its id is a valid 32-wide bitmap slot.  Any out-of-range id
+ *	fails closed (never index the bitmap out of bounds).  See
+ *	cluster_undo_gcs.h.
+ */
+bool
+cluster_undo_pi_discard_notify_target(uint32 holders, int32 node, int32 self_node)
+{
+	if (node < 0 || node >= 32)
+		return false; /* invalid slot -> never a target (no OOB shift) */
+	if (node == self_node)
+		return false; /* owner never notifies itself */
+	return (holders & ((uint32)1u << (uint32)node)) != 0;
+}

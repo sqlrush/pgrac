@@ -1901,6 +1901,9 @@ extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
 extern uint64 cluster_gcs_block_pi_note_presync_snapshot(void);
 extern void cluster_gcs_block_pi_note_confirm(uint64 presync_seq);
 extern void cluster_gcs_block_pi_discard_drain(void);
+/* spec-5.22b D2-4 — single-target PI_DISCARD send, reused by the shared-undo
+ * owner-as-master data plane (LMON-context; caller owns self/range guard). */
+extern void cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 target_node);
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);

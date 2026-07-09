@@ -209,6 +209,102 @@ UT_TEST(test_undo_gcs_grant_reader_pcm_contract)
 }
 
 /* ======================================================================
+ * U5 -- writer/cleaner X-grant lock contract (spec-5.22b D2-4, §2.2): the
+ * owner takes its OWN undo block in PCM X mode via the write-first N->X
+ * transition before mutating it.  The N->X transition-legality TABLE is owned
+ * + exhaustively tested by cluster_pcm_lock (spec-2.30); D2-4 only pins that
+ * the writer selects that legal write-first pair, never the reader S/N->S
+ * pair.  Pure: compile-time constants.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_grant_writer_pcm_contract)
+{
+	UT_ASSERT_EQ(cluster_undo_grant_writer_pcm_mode(), PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_undo_grant_writer_pcm_transition(), PCM_TRANS_N_TO_X);
+
+	/* a writer must never select the reader-side S mode / read-first pair */
+	UT_ASSERT(cluster_undo_grant_writer_pcm_mode() != PCM_LOCK_MODE_S);
+	UT_ASSERT(cluster_undo_grant_writer_pcm_transition() != PCM_TRANS_N_TO_S);
+
+	/* writer and reader select DIFFERENT modes/transitions (no aliasing) */
+	UT_ASSERT(cluster_undo_grant_writer_pcm_mode() != cluster_undo_grant_reader_pcm_mode());
+	UT_ASSERT(cluster_undo_grant_writer_pcm_transition()
+			  != cluster_undo_grant_reader_pcm_transition());
+}
+
+/* ======================================================================
+ * U5 -- PI-discard coverage judge (spec-5.22b D2-4, §3.1; Q-D24-2): the
+ * owner's durable write of the block's CURRENT copy obsoletes every peer Past
+ * Image IFF the written pd_block_scn reaches the SCN watermark (the newest
+ * shipped version).  The comparison MUST be on scn_local (AD-008 time order),
+ * never the raw SCN (whose high bits are node-id dominated) -- a durable write
+ * from a high node-id must not "cover" a watermark from a low node-id merely
+ * because its raw value is larger.  Fail-safe: an unarmed (Invalid) watermark
+ * or an unknown (Invalid) written version never discards (keep the PI).
+ * SCN-only by construction (Q-D24-2): per-node WAL makes the LSN unit
+ * incomparable cross-node, so the LSN redo-coverage dimension is discharged by
+ * cluster_pcm_lock_pi_discard_collect (clears BOTH watermarks on cover) +
+ * retire_if_durable (the single-stream LSN fixture), not here.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_pi_discard_covered)
+{
+	/* written local == watermark local (different nodes) => covered (equal is
+	 * enough; proves the compare is on scn_local, node-independent) */
+	UT_ASSERT(cluster_undo_pi_discard_covered(scn_encode(2, 500), scn_encode(1, 500)));
+
+	/* written local strictly newer => covered */
+	UT_ASSERT(cluster_undo_pi_discard_covered(scn_encode(1, 400), scn_encode(3, 900)));
+
+	/* written local older => NOT covered (keep PI) */
+	UT_ASSERT(!cluster_undo_pi_discard_covered(scn_encode(1, 900), scn_encode(3, 400)));
+
+	/* node-domination trap: written raw value is LARGER (high node id) but its
+	 * scn_local is SMALLER -> must NOT be treated as covered (raw compare would
+	 * wrongly discard a still-live PI, an 8.A hazard) */
+	UT_ASSERT(!cluster_undo_pi_discard_covered(scn_encode(1, 100), scn_encode(5, 50)));
+
+	/* unarmed watermark (Invalid) => nothing provable cross-node => keep */
+	UT_ASSERT(!cluster_undo_pi_discard_covered(InvalidScn, scn_encode(1, 500)));
+
+	/* unknown written version (Invalid) => fail-safe keep */
+	UT_ASSERT(!cluster_undo_pi_discard_covered(scn_encode(1, 500), InvalidScn));
+}
+
+/* ======================================================================
+ * U5 -- PI-discard notify targeting (spec-5.22b D2-4, §1.2, Q4-A per-block):
+ * once the coverage judge clears a block's pi_holders_bitmap, the owner directs
+ * a PI_DISCARD to each PEER whose bit is set.  A peer is a legal target IFF its
+ * bit is set AND it is not the owner itself (the owner is the current writer,
+ * never a Past-Image holder of its own block) AND its node id is in range
+ * [0,32).  Pure bitmap logic, no globals.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_pi_discard_notify_target)
+{
+	uint32 holders = (1u << 1) | (1u << 3); /* peers 1 and 3 hold a PI */
+
+	/* set bits, not self => target */
+	UT_ASSERT(cluster_undo_pi_discard_notify_target(holders, 1, 0 /*self*/));
+	UT_ASSERT(cluster_undo_pi_discard_notify_target(holders, 3, 0 /*self*/));
+
+	/* unset bit => never a target */
+	UT_ASSERT(!cluster_undo_pi_discard_notify_target(holders, 2, 0 /*self*/));
+	UT_ASSERT(!cluster_undo_pi_discard_notify_target(holders, 0, 0 /*self*/));
+
+	/* self is never notified even if its bit is set (owner is the writer) */
+	{
+		uint32 with_self = holders | (1u << 2);
+
+		UT_ASSERT(!cluster_undo_pi_discard_notify_target(with_self, 2, 2 /*self==2*/));
+		/* other peers still targeted when self==2 */
+		UT_ASSERT(cluster_undo_pi_discard_notify_target(with_self, 1, 2));
+	}
+
+	/* out-of-range node ids fail closed (32-wide bitmap, ㉕ precedent) */
+	UT_ASSERT(!cluster_undo_pi_discard_notify_target(0xffffffffu, -1, 0));
+	UT_ASSERT(!cluster_undo_pi_discard_notify_target(0xffffffffu, 32, 0));
+	UT_ASSERT(!cluster_undo_pi_discard_notify_target(0xffffffffu, 99, 0));
+}
+
+/* ======================================================================
  * U7 -- reader S-grant admissibility: SEGMENT-generation anti-ABA (spec-5.22b
  * §3.3 dim 1, D1).  A reference whose encoded generation (segment wrap_count)
  * no longer matches the reader's expected generation is STALE (the segment was
@@ -273,7 +369,7 @@ UT_TEST(test_undo_gcs_grant_admissible_epoch)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(test_undo_gcs_lookup_master_is_owner);
 	UT_RUN(test_undo_gcs_master_is_self);
 	UT_RUN(test_undo_gcs_path_runtime_shared_mode_branch);
@@ -283,6 +379,9 @@ main(void)
 	UT_RUN(test_undo_gcs_grant_reader_pcm_contract);
 	UT_RUN(test_undo_gcs_grant_admissible_generation);
 	UT_RUN(test_undo_gcs_grant_admissible_epoch);
+	UT_RUN(test_undo_gcs_grant_writer_pcm_contract);
+	UT_RUN(test_undo_gcs_pi_discard_covered);
+	UT_RUN(test_undo_gcs_pi_discard_notify_target);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
