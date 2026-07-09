@@ -68,6 +68,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_tier1.h" /* CLUSTER_IC_TIER1_DATA_CHANNELS (spec-7.3 D3) */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_shmem.h"
@@ -727,7 +728,7 @@ LmsMain(void)
 	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
 	 * mesh (false = plane off for this node;  the loop below then keeps
 	 * the historic latch-only wait and park-serve keeps working). */
-	(void)cluster_lms_data_plane_startup();
+	(void)cluster_lms_data_plane_startup(0, cluster_lms_workers);
 
 	/* Transition to READY. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
@@ -848,6 +849,10 @@ StaticAssertDecl(LmsWorker7Process - LmsWorker1Process + 1 == CLUSTER_LMS_MAX_WO
 				 "spec-7.3: LmsWorker1..7Process must be CLUSTER_LMS_MAX_WORKERS-1 "
 				 "contiguous aux process types");
 
+/* The tier1 transport must carve a DATA channel per LMS worker (spec-7.3 D3). */
+StaticAssertDecl(CLUSTER_LMS_MAX_WORKERS <= CLUSTER_IC_TIER1_DATA_CHANNELS,
+				 "spec-7.3: tier1 must provide a DATA shmem channel per LMS worker");
+
 void
 LmsWorkerMain(int worker_id)
 {
@@ -887,9 +892,22 @@ LmsWorkerMain(int worker_id)
 						 (int)MyProcPid)));
 
 	/*
-	 * D2 idle loop.  SIGTERM sets ShutdownRequestPending + MyLatch; the head
-	 * guard breaks and proc_exit(0) completes cleanly.  No cluster shmem work
-	 * beyond the pid slot until the D3+ DATA-plane wiring lands.
+	 * PGRAC: spec-7.3 D3 — bring up this worker's DATA-plane channel + mesh
+	 * (its own tier1 instance, listener on data_port + worker_id, dial peer
+	 * worker_id only, HELLO worker/n negotiation).  false = plane off for
+	 * this node (no data_addr / cluster off / stub tier) → the loop below
+	 * keeps the historic latch-only idle wait.
+	 */
+	(void)cluster_lms_data_plane_startup(worker_id, cluster_lms_workers);
+
+	/*
+	 * D3 worker loop.  A worker maintains its per-channel mesh via the
+	 * data-plane tick;  the block-family dispatch that arrives on its channel
+	 * is served here (the outbound ring group + shard routing that steers
+	 * backend requests to a worker land in D4).  Worker 0's GES / park-serve
+	 * / outbound-drain duties stay in LmsMain — a worker (1..7) is DATA only.
+	 * SIGTERM sets ShutdownRequestPending; the head guard breaks and
+	 * proc_exit(0) completes cleanly.
 	 */
 	for (;;) {
 		CHECK_FOR_INTERRUPTS();
@@ -902,12 +920,18 @@ LmsWorkerMain(int worker_id)
 		if (ShutdownRequestPending)
 			break;
 
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
-		ResetLatch(MyLatch);
+		if (cluster_lms_data_plane_enabled()) {
+			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+		} else {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+			ResetLatch(MyLatch);
+		}
 	}
 
-	/* Clear our pid slot before teardown. */
+	/* Close DATA-plane fds, then clear our pid slot before teardown. */
+	cluster_lms_data_plane_shutdown();
+
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	cluster_lms_state->worker_pids[worker_id] = 0;
 	LWLockRelease(&cluster_lms_state->lwlock);
