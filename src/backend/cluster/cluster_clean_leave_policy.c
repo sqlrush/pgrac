@@ -169,32 +169,79 @@ cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 current_epoch,
 
 /*
  * cluster_clean_leave_own_commit_latched -- the LEAVING node's barrier tick
- * infers "my clean-leave committed" from the membership epoch advancing past
- * its bound baseline (the coordinator publishes the CLEAN_LEAVE event into ITS
- * own reconfig state, but the epoch piggybacks to the leaver).  Latching that
- * inference suppresses the barrier-deadline escalation, so a FALSE latch hangs
- * the leaver in BARRIER_WAIT forever.
+ * latches "my clean-leave committed" on direct EVIDENCE, never on inference
+ * (spec-2.29a r3).  The evidence is committed_marker_evidence: the survivor
+ * coordinator made the COMMITTED marker for THIS leave attempt majority-
+ * durable on the voting disk and attested it with a nonce-bound
+ * LEAVE_COMMITTED (validated by cluster_clean_leave_committed_evidence_
+ * matches before the flag this argument mirrors is ever set).  Latching
+ * suppresses the barrier-deadline escalation and lets the leaver exit, so
+ * the verdict must be exactly: latch <=> evidence.
  *
- * spec-2.29a r2 P2-1: the leaver's own-commit inference needs BOTH a bitmap
- * check AND the scalar dead_generation.  The others-dead bitmap alone is not
- * monotone: a third-party node that false-fail-stopped (bumping the epoch)
- * then recovered leaves the CSSD hysteresis DEAD→ALIVE, so the others-dead
- * bitmap returns to its bound value while the scalar dead_generation (which
- * only advances) does not.  If the leaver's first epoch>baseline observation
- * lands after that rebound, a bitmap-only check would mis-latch a leave the
- * survivor coordinator actually refused.  The scalar conjunct closes it — and
- * it does NOT reintroduce the ②b false positive, because the leaving node's
- * OWN alive→DEAD transition never bumps ITS OWN dead_generation (a node does
- * not observe itself dead), so on the leaver side dead_gen stays at baseline
- * through its own drain.  (The survivor-side coherence sites keep the
- * others-dead bitmap: a survivor DOES observe the leaver's DEAD and would be
- * falsely escalated by the scalar there.)
+ * History of the two inference failure modes this replaces:
+ *   - r2 P2-1 (mis-latch wedge): the pre-r2 "epoch advanced + others-dead
+ *     bitmap unchanged" inference could mis-latch a REFUSED leave after a
+ *     third-party false-DEAD -> ALIVE rebound restored the (non-monotone)
+ *     bitmap, suppressing the deadline escalation forever.
+ *   - r3 (t/331 C1/C4 false-escalation): the r2 scalar dead_generation
+ *     conjunct is monotone the other way — a third-party transient flap on
+ *     the leaver's local CSSD view advances it forever, so a healthy
+ *     committed leave was refused until the deadline escalated it.
+ * Marker evidence is immune to both: a refused leave never gets a COMMITTED
+ * marker (no latch -> bounded deadline escalation), and a flap cannot make
+ * durable evidence disappear (latch -> no false escalation).
+ *
+ * others_dead_unchanged / dead_gen_unchanged are the leaver's live coherence
+ * observations.  They are deliberately kept in the signature as contract
+ * inputs that MUST NOT affect the verdict — the U3b unit matrix pins the
+ * flap-immunity on them — and the runtime uses them only for the flap-noise
+ * LOG at the latch point (observability, never control flow).
  */
 bool
-cluster_clean_leave_own_commit_latched(bool epoch_advanced, bool others_dead_unchanged,
+cluster_clean_leave_own_commit_latched(bool committed_marker_evidence, bool others_dead_unchanged,
 									   bool dead_gen_unchanged)
 {
-	return epoch_advanced && others_dead_unchanged && dead_gen_unchanged;
+	(void)others_dead_unchanged; /* observability-only input (see above) */
+	(void)dead_gen_unchanged;	 /* observability-only input (see above) */
+	return committed_marker_evidence;
+}
+
+/*
+ * cluster_clean_leave_committed_evidence_matches -- may the leaving node
+ * accept a LEAVE_COMMITTED confirmation as marker evidence for THIS leave
+ * attempt?  (spec-2.29a r3; the payload's magic/version/CRC were already
+ * checked by cluster_clean_leave_announce_payload_valid.)
+ *
+ *	Identity is bound three ways, all fail-closed:
+ *	  - payload_leaving_node == self_node: the confirmation is addressed to
+ *	    this node's own leave (LEAVE_COMMITTED is point-to-point, but a
+ *	    misrouted frame must still not latch).
+ *	  - current_leaving_node == self_node: this node IS currently the leaver
+ *	    (not idle, not a survivor of someone else's leave).
+ *	  - payload_nonce == current_attempt_nonce: the per-attempt nonce
+ *	    (Hardening v1.0.2) pins the confirmation to THIS attempt, so a stale
+ *	    LEAVE_COMMITTED — and through it a stale COMMITTED marker — from a
+ *	    PREVIOUS leave of the same node can never false-latch a new attempt.
+ *	  - payload_epoch > bound_leave_epoch: the committed epoch E the
+ *	    coordinator attests must lie past the baseline this leave bound
+ *	    (sanity; the commit is a guarded CAS off that baseline).
+ */
+bool
+cluster_clean_leave_committed_evidence_matches(int32 payload_leaving_node, uint64 payload_nonce,
+											   uint64 payload_epoch, int32 self_node,
+											   int32 current_leaving_node,
+											   uint64 current_attempt_nonce,
+											   uint64 bound_leave_epoch)
+{
+	if (payload_leaving_node != self_node)
+		return false;
+	if (current_leaving_node != self_node)
+		return false;
+	if (payload_nonce != current_attempt_nonce)
+		return false;
+	if (payload_epoch <= bound_leave_epoch)
+		return false;
+	return true;
 }
 
 

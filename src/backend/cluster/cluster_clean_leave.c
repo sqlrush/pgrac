@@ -122,6 +122,8 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u32(&cl_state->commit_point_observed, 0);
 		pg_atomic_init_u32(&cl_state->committed_durable_confirmed, 0);
 		pg_atomic_init_u32(&cl_state->committed_marker_durable, 0);
+		/* spec-2.29a r3 (evidence latch). */
+		cl_state->committed_confirmed_epoch = 0;
 		/* Hardening v1.0.2 (P1 preflight / P2 nonce). */
 		pg_atomic_init_u64(&cl_state->leave_attempt_nonce, 0);
 		pg_atomic_init_u32(&cl_state->preflight_pending, 0);
@@ -555,11 +557,15 @@ cl_commit_ready_handler(const ClusterICEnvelope *env, const void *payload)
 }
 
 /*
- * cl_committed_handler -- leaving node side (Hardening v1.0.1, P1-V0.7 exit gate):
- * the survivor coordinator has made the COMMITTED marker majority-durable and
- * signals that the durable truth-source now exists, so this leaving node may
- * proceed to COMMITTED and exit.  Only acted on if it is about OUR leave; idem-
- * potent (the coordinator re-sends each tick until we are gone).
+ * cl_committed_handler -- leaving node side (Hardening v1.0.1, P1-V0.7 exit gate;
+ * spec-2.29a r3 evidence latch): the survivor coordinator has made the COMMITTED
+ * marker majority-durable and attests that the durable truth-source now exists.
+ * This confirmation is the leaver's own-commit MARKER EVIDENCE: the barrier tick
+ * latches on it (and only on it) and proceeds to COMMITTED/exit.  Identity is
+ * checked by the pure evidence gate (self-addressed + currently leaving +
+ * per-attempt nonce + committed epoch past the bound baseline) — any mismatch is
+ * dropped fail-closed.  Idempotent (the coordinator re-sends each tick until we
+ * are gone).
  */
 static void
 cl_committed_handler(const ClusterICEnvelope *env, const void *payload)
@@ -571,17 +577,19 @@ cl_committed_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	if (!cluster_clean_leave_announce_payload_valid(p))
 		return;
-	if (p->leaving_node_id != cluster_node_id)
-		return; /* only the leaving node consumes its own COMMITTED confirmation */
-	/* Hardening v1.0.2 (P2): bind to THIS attempt — a stale LEAVE_COMMITTED from a
-	 * prior same-epoch attempt must not prematurely confirm the current one.  Only
-	 * meaningful once we are the leaver actively awaiting confirmation. */
-	if (p->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce))
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (!cluster_clean_leave_committed_evidence_matches(
+			p->leaving_node_id, p->leave_nonce, p->leave_epoch, cluster_node_id,
+			cl_state->leaving_node_id, pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+			cl_state->leave_epoch)) {
+		LWLockRelease(&cl_state->lock);
 		return;
-	if (cl_state->leaving_node_id != cluster_node_id)
-		return; /* we are not currently leaving */
-
+	}
+	/* the committed epoch E is recorded BEFORE the evidence flag is published,
+	 * inside the same critical section the barrier tick reads it back under. */
+	cl_state->committed_confirmed_epoch = p->leave_epoch;
 	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 1);
+	LWLockRelease(&cl_state->lock);
 }
 
 /*
@@ -1467,6 +1475,7 @@ cl_request_body(void)
 	pg_atomic_write_u32(&cl_state->commit_point_observed, 0);
 	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 0);
 	pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
+	cl_state->committed_confirmed_epoch = 0; /* spec-2.29a r3: per-attempt evidence */
 	LWLockRelease(&cl_state->lock);
 	cl_set_phase(CLUSTER_LEAVE_REQUESTED);
 
@@ -1755,83 +1764,72 @@ cl_leaving_barrier_tick(void)
 {
 	uint64 baseline_epoch = cl_state->leave_epoch;
 	int32 coordinator;
+	uint8 now_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	bool committed_evidence;
+	bool others_dead_unchanged;
+	bool dead_gen_unchanged;
 
 	/*
-	 * 1. observe the commit.  The survivor coordinator runs the actual two-phase
-	 * commit and publishes the CLEAN_LEAVE event into ITS OWN reconfig state —
-	 * the leaving node's last_applied never carries it.  What DOES propagate to
-	 * the leaving node is the membership epoch (every IC envelope piggybacks it).
-	 * So the leaving node detects its own commit by the epoch advancing past the
-	 * bound baseline.  Discriminate from a real death intruding (CL-I3) by the
-	 * CSSD dead_generation: a cooperative leave does NOT mark anyone CSSD-dead, so
-	 * an unchanged dead_generation at the bump means OUR clean-leave committed; a
-	 * changed one means a real death (escalate).
+	 * 1. observe the commit — EVIDENCE over inference (spec-2.29a r3).  The
+	 * survivor coordinator runs the actual two-phase commit, publishes the
+	 * CLEAN_LEAVE event into ITS OWN reconfig state, drives the COMMITTED marker
+	 * to voting-disk majority-durability, and only then sends the nonce-bound
+	 * LEAVE_COMMITTED (re-sent each tick while we are alive).  That confirmation
+	 * — validated by the pure identity gate in cl_committed_handler — is the ONLY
+	 * basis on which this node latches its own commit: latch <=> a valid
+	 * COMMITTED marker for THIS leave attempt exists.
 	 *
-	 *	Hardening v1.0.4 (P2): this "epoch bump + dead_gen unchanged == OUR commit"
-	 *	inference is sound ONLY because there is no OTHER dead_gen-unchanged reconfig
-	 *	in flight.  A spec-5.15 online JOIN also bumps the epoch with dead_gen
-	 *	unchanged and would be mis-observed here as the leave's commit (then the node
-	 *	stops escalating but never gets the real LEAVE_COMMITTED -> BARRIER_WAIT
-	 *	hang).  That collision is removed STRUCTURALLY by the one-membership-reconfig-
-	 *	at-a-time serialization: the join driver does not bump the epoch while a clean
-	 *	leave is active (cluster_clean_leave_in_progress gates drive_joins +
-	 *	commit_member), and the leave does not start while a join is pending
-	 *	(cluster_reconfig_join_in_progress gates the request).  Under that invariant a
-	 *	bump with an unchanged version during a leave can only be the leave's own
-	 *	commit.
+	 *	Two inference generations preceded this and each failed one way (see the
+	 *	predicate comment in cluster_clean_leave_policy.c): "epoch advanced +
+	 *	others-dead bitmap unchanged" could mis-latch a REFUSED leave after a
+	 *	third-party false-DEAD rebound (r2 P2-1 wedge); adding the monotone scalar
+	 *	dead_generation conjunct then false-escalated a healthy committed leave
+	 *	whenever a transient third-party flap advanced the leaver's local
+	 *	dead_generation during the leave window (nightly t/331 C1/C4).  Marker
+	 *	evidence is immune to both: flaps cannot erase a durable marker, and a
+	 *	refused leave never produces one — no latch, so the barrier deadline below
+	 *	still bounds the wait (fail-closed escalation, unchanged semantics).
 	 *
-	 *	spec-2.29a ②b + r2 P2-1: "unchanged version" here means the others-dead
-	 *	bitmap AND the scalar dead_generation both unchanged.  The bitmap excludes
-	 *	the leaving node's own expected DEAD (②b: else its heartbeat stop would
-	 *	falsely escalate), but the bitmap is not monotone — a third-party
-	 *	false-DEAD→ALIVE rebound restores it while the scalar dead_generation only
-	 *	advances (r2 P2-1: else the leaver could mis-latch a refused leave and
-	 *	hang).  The leaver's own DEAD never bumps its OWN dead_generation, so the
-	 *	scalar conjunct is safe on this side (it would NOT be safe on the survivor
-	 *	side, which keeps the bitmap-only coherence check).
+	 *	The coherence observations are still taken, but ONLY for the flap-noise
+	 *	LOG at the latch (the predicate contract pins that they never affect the
+	 *	verdict).  A real third-party death intruding mid-leave is refused on the
+	 *	survivor side (cl_coherent pre-check + guarded CAS, CL-I3), so no evidence
+	 *	arrives here and the deadline escalates this leaver — same outcome as the
+	 *	old immediate escalate arm, now bounded by the barrier deadline instead.
+	 *
+	 *	Latching collapses the old two-step gate: the evidence IS the P1-V0.7
+	 *	durable-truth-source confirmation, so the leave can no longer be
+	 *	un-committed (deadline must not escalate past here, Hardening v1.0.1
+	 *	P1-1) AND the node may exit (COMMITTED) in the same tick.
 	 */
-	if (cluster_epoch_get_current() > baseline_epoch) {
-		uint8 now_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
-		bool others_dead_unchanged;
-		bool dead_gen_unchanged;
+	committed_evidence = (pg_atomic_read_u32(&cl_state->committed_durable_confirmed) != 0);
+	cl_others_dead_snapshot(cl_state->leaving_node_id, now_others_dead);
+	others_dead_unchanged = (memcmp(now_others_dead, cl_state->leave_baseline_others_dead,
+									CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
+							 == 0);
+	dead_gen_unchanged = (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen);
+	if (cluster_clean_leave_own_commit_latched(committed_evidence, others_dead_unchanged,
+											   dead_gen_unchanged)) {
+		uint64 committed_epoch;
 
-		cl_others_dead_snapshot(cl_state->leaving_node_id, now_others_dead);
-		others_dead_unchanged = (memcmp(now_others_dead, cl_state->leave_baseline_others_dead,
-										CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
-								 == 0);
-		dead_gen_unchanged
-			= (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen);
-		if (cluster_clean_leave_own_commit_latched(true, others_dead_unchanged,
-												   dead_gen_unchanged)) {
-			/*
-			 * Commit point observed (our clean-leave epoch was published; no
-			 * third-party death intruded).  The leave can no longer be
-			 * un-committed, so from here the barrier deadline must NOT escalate
-			 * (Hardening v1.0.1 P1-1).
-			 */
-			pg_atomic_write_u32(&cl_state->commit_point_observed, 1);
-			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
-			cl_state->leave_epoch = cluster_epoch_get_current(); /* the committed epoch E */
-			LWLockRelease(&cl_state->lock);
+		pg_atomic_write_u32(&cl_state->commit_point_observed, 1);
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		committed_epoch = cl_state->committed_confirmed_epoch; /* the committed epoch E */
+		cl_state->leave_epoch = committed_epoch;
+		LWLockRelease(&cl_state->lock);
 
-			/*
-			 * P1-V0.7 exit gate: reach COMMITTED ("may exit") ONLY after the
-			 * coordinator confirms the COMMITTED marker is majority-durable
-			 * (LEAVE_COMMITTED).  Until then stay in BARRIER_WAIT and re-tick — the
-			 * durable truth-source must exist before this node departs, else a
-			 * survivor restart could not rebuild the clean-departed fact.
-			 */
-			if (pg_atomic_read_u32(&cl_state->committed_durable_confirmed)) {
-				cl_set_phase(CLUSTER_LEAVE_COMMITTED);
-				CLUSTER_INJECTION_POINT("cluster-clean-leave-barrier-complete");
-				ereport(LOG,
-						(errmsg("cluster clean-leave: committed at epoch %llu + COMMITTED marker "
-								"majority-durable; this node has drained and may exit",
-								(unsigned long long)cl_state->leave_epoch)));
-			}
-		} else {
-			cl_escalate(); /* a real death changed the version mid-leave (CL-I3) */
-		}
+		if (!others_dead_unchanged || !dead_gen_unchanged)
+			ereport(LOG, (errmsg("cluster clean-leave: third-party liveness flap observed at the "
+								 "commit latch (others-dead %s, dead_generation %s); durable "
+								 "COMMITTED marker evidence overrides it",
+								 others_dead_unchanged ? "unchanged" : "changed",
+								 dead_gen_unchanged ? "unchanged" : "advanced")));
+
+		cl_set_phase(CLUSTER_LEAVE_COMMITTED);
+		CLUSTER_INJECTION_POINT("cluster-clean-leave-barrier-complete");
+		ereport(LOG, (errmsg("cluster clean-leave: committed at epoch %llu + COMMITTED marker "
+							 "majority-durable; this node has drained and may exit",
+							 (unsigned long long)committed_epoch)));
 		return;
 	}
 
@@ -1842,8 +1840,12 @@ cl_leaving_barrier_tick(void)
 	}
 
 	/* 3. fail-closed deadline — ONLY before the commit point (P1-1: a committed
-	 * leave is never un-committed; post-commit we wait for the durable marker,
-	 * bounded by disk health, and never escalate). */
+	 * leave is never un-committed).  With the r3 evidence latch this arm is what
+	 * bounds EVERY no-evidence outcome: a refused leave, a foreign death that
+	 * moved the version (the coordinator then refuses, CL-I3), or a lost/never-
+	 * sent confirmation all end here instead of hanging in BARRIER_WAIT.  The
+	 * commit_point_observed guard is belt-and-braces: the latch above transitions
+	 * out of BARRIER_WAIT in the same tick it sets the flag. */
 	if (!pg_atomic_read_u32(&cl_state->commit_point_observed)
 		&& (uint64)GetCurrentTimestamp() > cl_state->barrier_deadline_us) {
 		cl_escalate();

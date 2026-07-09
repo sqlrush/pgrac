@@ -227,6 +227,40 @@ UT_TEST(test_own_commit_latched)
 
 
 /* ============================================================
+ * U3c — LEAVE_COMMITTED evidence identity gate (spec-2.29a r3)
+ * ============================================================ */
+
+UT_TEST(test_committed_evidence_matches)
+{
+	/* args: payload_leaving_node, payload_nonce, payload_epoch,
+	 *       self_node, current_leaving_node, current_attempt_nonce,
+	 *       bound_leave_epoch */
+
+	/* (a) confirmation for THIS node's CURRENT attempt, committed epoch past
+	 * the bound baseline -> evidence accepted */
+	UT_ASSERT(cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, 1, 42, 7));
+
+	/* (b) stale identity: a LEAVE_COMMITTED (and through it a COMMITTED
+	 * marker) from a PREVIOUS leave attempt of the same node — nonce differs
+	 * -> fail-closed, no latch */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 41, 8, 1, 1, 42, 7));
+
+	/* (b) misrouted: confirmation addressed to a different leaving node */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(2, 42, 8, 1, 1, 42, 7));
+
+	/* (b) this node is not currently leaving (idle: leaving_node_id == -1,
+	 * or tracking someone else's leave) */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, -1, 42, 7));
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 8, 1, 2, 42, 7));
+
+	/* (b) committed epoch not past the bound baseline (attested epoch must be
+	 * the guarded-CAS successor of the baseline this leave bound) */
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 7, 1, 1, 42, 7));
+	UT_ASSERT(!cluster_clean_leave_committed_evidence_matches(1, 42, 0, 1, 1, 42, 7));
+}
+
+
+/* ============================================================
  * U5 — writable-only quiesce gate
  * ============================================================ */
 
@@ -438,11 +472,12 @@ UT_TEST(test_ic_payload_validation)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_fsm);
 	UT_RUN(test_version_coherent);
 	UT_RUN(test_own_commit_latched);
+	UT_RUN(test_committed_evidence_matches);
 	UT_RUN(test_writable_only_gate);
 	UT_RUN(test_marker_validation);
 	UT_RUN(test_should_invalidate);
