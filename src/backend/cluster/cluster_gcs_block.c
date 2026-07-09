@@ -1201,6 +1201,39 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 		return GCS_BLOCK_RECOVERING;
 	}
 
+	/*
+	 * r3-P2-1 unseal-safety proof — this predicate is heartbeat LIVENESS
+	 * (CSSD hysteresis flips DEAD->ALIVE on heartbeat receipt alone,
+	 * cluster_cssd.c deadband scan), NOT a direct "instance recovery
+	 * complete" signal.  It is nevertheless safe to return NORMAL here,
+	 * because on a crash-restarted master the heartbeat source itself is
+	 * recovery-gated:
+	 *  (1) CSSD — the only heartbeat sender — is spawned by the cluster
+	 *      phase-4 driver, which the postmaster reaper invokes only at the
+	 *      PM_RUN transition, i.e. after the startup process exited 0 and
+	 *      the node's crash recovery fully replayed its WAL thread to shared
+	 *      storage (the ServerLoop respawn is equally PM_RUN-gated).  A
+	 *      still-recovering node sends NO heartbeats, so a survivor's DEAD
+	 *      verdict cannot flip back early.
+	 *  (2) Belt-and-suspenders: even under a stale-ALIVE view (fast restart
+	 *      inside the deadband), a fetch cannot complete against a
+	 *      still-recovering node.  The master-side handler
+	 *      (cluster_gcs_handle_block_request_envelope) default-denies unless
+	 *      the node is an in-quorum MEMBER, and cluster_qvotec_in_quorum()
+	 *      demands QUORUM_OK plus a live lease — state only the QVOTEC
+	 *      process (phase-4 / post-PM_RUN as well) can establish after a
+	 *      restart wiped shmem.  The deny replies map to bounded 53R9L; an
+	 *      unresponsive endpoint exhausts the retransmit budget into bounded
+	 *      53R90.  Neither path ever falls back to a silent local storage
+	 *      read (STORAGE_FALLBACK is a master REPLY status, not a local
+	 *      fallback).
+	 *  (3) For online_join rejoin, MEMBER additionally requires coordinator
+	 *      admission, which vets the joiner's post-recovery voting slot
+	 *      (the slot_generation != 0 readiness sub-gate).
+	 * So heartbeat-ALIVE implies the returned master completed its own
+	 * instance recovery: its committed WAL is on shared storage and no
+	 * merged-materialization proof is needed for its blocks.
+	 */
 	if (static_master == cluster_node_id
 		|| cluster_cssd_get_peer_state(static_master) != CLUSTER_CSSD_PEER_DEAD)
 		return GCS_BLOCK_NORMAL;
@@ -1240,7 +1273,9 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 * online thread recovery cannot run (GUC off — the default — or any
 	 * >2-node deployment) the materialization authority is never published,
 	 * so a dead master's blocks stay RECOVERING until the failed node
-	 * restarts and runs its own instance recovery: a bounded, retryable
+	 * restarts and completes its own instance recovery (the unseal above is
+	 * heartbeat liveness; the r3-P2-1 note explains why heartbeats imply
+	 * recovery completion): a bounded, retryable
 	 * ERROR on the request path (53R9L), never an unproven serve.  A scope
 	 * predicate must never gate a correctness proof — a committed write on
 	 * a cold block that only the dead node saw has NO other guard on this
