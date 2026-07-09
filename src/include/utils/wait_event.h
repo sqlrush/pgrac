@@ -469,16 +469,21 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT,
 	WAIT_EVENT_CLUSTER_IC_RECONNECT,
 
-	/* Cluster: Undo (8 events) -- AD-010; spec-3.9 adds CR_CONSTRUCT;
-	 * spec-3.11 adds TT_DURABLE_IO; spec-3.18 D7 adds BUF_FLUSH + EXTENT_CLAIM */
+	/* Cluster: Undo (11 events) -- AD-010; spec-3.9 adds CR_CONSTRUCT;
+	 * spec-3.11 adds TT_DURABLE_IO; spec-3.18 D7 adds BUF_FLUSH + EXTENT_CLAIM;
+	 * spec-5.22b D2-6 adds BLOCK_GRANT/INVALIDATE/REMASTER (owner-as-master
+	 * grant data plane; PCM convert/downgrade waits reuse the PCM class above) */
 	WAIT_EVENT_UNDO_REMOTE_READ = PG_WAIT_CLUSTER_UNDO,
 	WAIT_EVENT_UNDO_TT_LOOKUP_REMOTE,
 	WAIT_EVENT_UNDO_SEGMENT_FETCH,
 	WAIT_EVENT_UNDO_RETENTION_WAIT,
-	WAIT_EVENT_CLUSTER_CR_CONSTRUCT,	  /* spec-3.9: own-instance CR block construction */
-	WAIT_EVENT_UNDO_TT_DURABLE_IO,		  /* spec-3.11: durable TT slot header I/O */
-	WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH,	  /* spec-3.18 D7: undo buffer write-back I/O */
-	WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM, /* spec-3.18 D7: extent claim autoextend I/O */
+	WAIT_EVENT_CLUSTER_CR_CONSTRUCT,	   /* spec-3.9: own-instance CR block construction */
+	WAIT_EVENT_UNDO_TT_DURABLE_IO,		   /* spec-3.11: durable TT slot header I/O */
+	WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH,	   /* spec-3.18 D7: undo buffer write-back I/O */
+	WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM,  /* spec-3.18 D7: extent claim autoextend I/O */
+	WAIT_EVENT_UNDO_BLOCK_GRANT_WAIT,	   /* spec-5.22b D2-6: owner-as-master S/X grant */
+	WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT, /* spec-5.22b D2-6: PI-discard invalidate broadcast */
+	WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT,   /* spec-5.22b D2-6: remaster serve-gate wait */
 
 	/* Cluster: ADG (4 events) -- #95 */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT = PG_WAIT_CLUSTER_ADG,

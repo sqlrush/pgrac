@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 118 (spec-6.13 adds RDMA busypoll + inline send waits).
+# Total row count: 121 (spec-6.13 RDMA + spec-5.22b D2-6 undo-block grant-plane waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'118',
-	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+	'121',
+	'pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
 
 is($node->safe_psql(
 		'postgres',
@@ -89,7 +89,7 @@ my %expected = (
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 9,	# spec-6.13: +busypoll + inline send waits
-	'Cluster: Undo' => 4,
+	'Cluster: Undo' => 7,    # spec-5.22b D2-6: +UndoBlock Grant/Invalidate/Remaster waits
 	'Cluster: ADG' => 4,
 );
 
