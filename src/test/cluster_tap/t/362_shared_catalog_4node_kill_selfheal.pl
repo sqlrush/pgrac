@@ -11,7 +11,9 @@
 #    53R9L) and equally its transaction verdicts (TT status unknown for its
 #    xids, the visibility door).  Reads and DDL are asserted on the honest
 #    two-outcome contract (success or explicit SQLSTATE, never a hang);
-#    new-object DDL/writes prove P7 unfreeze.
+#    new-object DDL/writes prove P7 unfreeze.  L4h (r3-P1-1) is the serve-gate
+#    LOCK: a fresh backend's wide catalog scan on a cold survivor MUST fail
+#    53R9L (no success arm) while the dead node is down.
 #    After the kill legs start there is no SKIP path: BLOCKED_STRUCTURAL means
 #    the test harness is misconfigured, and lack of convergence is a real FAIL.
 #
@@ -284,6 +286,9 @@ my $done_before = bg_sum(\%bg, 'hw', 'remaster_done_count', @survivors);
 my $blocked_before = bg_sum(\%bg, 'hw', 'remaster_blocked_count', @survivors);
 my $retry_before = bg_sum(\%bg, 'hw', 'remaster_retry_count', @survivors);
 my $cleanup_before = bg_sum(\%bg, 'pcm', 'dead_cleanup_entries', @survivors);
+my %grd_done_before;
+$grd_done_before{$_} = bg_counter($bg{$_}, 'grd_recovery', 'remaster_done')
+  for @survivors;
 
 # L2: kill node3 and require every survivor to see the real DEAD edge.
 # Use the CSSD log instead of a SQL view: during fail-closed GRD recovery,
@@ -336,6 +341,56 @@ if ($blocked_after > $blocked_before)
 else
 {
 	pass('L6: no transient HW BLOCKED occurred on the clean 4-node path');
+}
+
+# L4h (r3-P1-1 hard leg): with the serve gate in place, an out-of-scope
+# formation (4 nodes / online_thread_recovery off) NEVER publishes the dead
+# node's materialization proof, so EVERY node3-mastered page stays RECOVERING
+# until node3 returns — and node3 is never restarted in this test.  A wide
+# catalog scan from a FRESH backend on a cold survivor therefore MUST fail
+# closed with 53R9L: pg_class + pg_attribute span dozens of pages hashed ~1/4
+# to node3, and a fresh backend's full scan cold-reads pages no prior session
+# pulled into the 16MB test pool.  Deliberately NO success arm — a NORMAL
+# serve of a dead-master page here is the exact 8.A regression this leg locks
+# (reverting the serve-gate fix turns this leg red while the two-outcome legs
+# stay green).  Gate on the survivor's OWN episode reaching IDLE first so the
+# failure surface is deterministically the post-episode materialization proof
+# (53R9L), never the in-episode shard freeze (53R9I).  The scan touches no
+# node3-written rows (node3 ran only heap INSERTs, no DDL), so the TT
+# visibility door cannot fire first: 53R9L is the ONLY legal outcome.
+{
+	my $cold = 2;
+
+	# Compare in Perl, not SQL: the warm session's catcache covers exactly the
+	# bg_counter query shape it ran pre-kill; a cast/operator added in SQL
+	# would itself cold-read a dead-master catalog page and trip 53R9L.
+	my $idle = 0;
+	my $idle_deadline = time() + 90;
+	while (time() < $idle_deadline)
+	{
+		if (bg_counter($bg{$cold}, 'grd_recovery', 'remaster_done')
+			> $grd_done_before{$cold})
+		{
+			$idle = 1;
+			last;
+		}
+		usleep(500_000);
+	}
+	ok($idle, "L4h: survivor node$cold GRD recovery episode reached IDLE (warm session)");
+
+	my $t0 = time();
+	my ($rc, $out, $err) = $quad->node($cold)->psql('postgres',
+		'SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid',
+		timeout => 60);
+	my $elapsed = time() - $t0;
+	isnt(defined $rc ? $rc : 0, 0,
+		"L4h: fresh wide catalog scan on survivor node$cold MUST fail while node$dead is down");
+	like($err // '',
+		qr/block-level cache protocol state is being rebuilt after reconfiguration/,
+		'L4h: the failure is the explicit 53R9L dead-master fail-closed gate');
+	cmp_ok($elapsed, '<', 60, 'L4h: fail-closed scan returned bounded (no hang)');
+	diag("L4h: scan failed closed as required: " . ($err // '(no stderr)'))
+	  if defined $err && $err ne '';
 }
 
 # L4a (Amendment v1.2 R1): reading the dead master's PRE-EXISTING blocks in an
@@ -392,7 +447,7 @@ for my $i (@survivors)
 	else
 	{
 		like($err // '',
-			qr/being rebuilt after reconfiguration|resource recovering|53R9L|being remastered|53R9I|cluster TT status unknown/i,
+			qr/being rebuilt after reconfiguration|resource recovering|53R9L|being remastered|53R9I|cluster TT status unknown|write-fenced/i,
 			"L4: fresh connection on node$i fail-closed with an explicit SQLSTATE");
 	}
 	cmp_ok(time() - $t0, '<', 60, "L4: fresh connection probe on node$i returned bounded");
@@ -406,8 +461,11 @@ if ($ddl_ok)
 }
 else
 {
+	# write-fenced (53R51, spec-4.12): a transient lease/epoch fence on the
+	# writer right after the reconfig — an explicit, retryable fail-closed
+	# rejection, squarely inside the honest two-outcome contract.
 	like($ddl_err // '',
-		qr/being rebuilt after reconfiguration|resource recovering|53R9L|being remastered|53R9I|cluster TT status unknown/i,
+		qr/being rebuilt after reconfiguration|resource recovering|53R9L|being remastered|53R9I|cluster TT status unknown|write-fenced/i,
 		'L4: coordinator DDL fail-closed with an explicit SQLSTATE (dead-master catalog block)');
 	diag("L4: DDL fail-closed honestly: $ddl_err");
 }
