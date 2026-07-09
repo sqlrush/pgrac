@@ -98,6 +98,19 @@
 	 | CLUSTER_IC_PRODUCER_BGWRITER | CLUSTER_IC_PRODUCER_CHECKPOINTER)
 /* spec-2.X may add more as new BackendType slots get assigned */
 
+/*
+ * PGRAC: spec-7.2 D3 (r3/r4 amend) — LMS producer bits for the DATA-plane
+ * msg_type family.  _LMS_DATA pre-includes the 7.3 worker bit so the
+ * five GCS block registrations widen exactly once.  REDECLARE stays on
+ * the CONTROL mask untouched (r4 ruling), and CONTROL-only msg_types
+ * never gain these bits — a migrated handler that must emit a CONTROL
+ * message stages it into the CONTROL outbound ring for LMON to send
+ * (direct send from LMS = producer-gate ERROR by construction).
+ */
+#define CLUSTER_IC_PRODUCER_LMS ((uint32)(1u << B_LMS))
+#define CLUSTER_IC_PRODUCER_LMS_WORKER ((uint32)(1u << B_LMS_WORKER))
+#define CLUSTER_IC_PRODUCER_LMS_DATA (CLUSTER_IC_PRODUCER_LMS | CLUSTER_IC_PRODUCER_LMS_WORKER)
+
 
 /* ============================================================
  * ClusterICMsgTypeInfo -- registration record for one msg_type.
@@ -114,6 +127,18 @@ typedef struct ClusterICMsgTypeInfo {
 	uint32 allowed_producer_mask; /* OR of CLUSTER_IC_PRODUCER_* */
 	bool broadcast_ok;			  /* dest = PGRAC_IC_BROADCAST allowed? */
 	void (*handler)(const ClusterICEnvelope *env, const void *payload);
+
+	/*
+	 * PGRAC: spec-7.2 D3 — owning plane (ClusterICPlane; uint8 keeps the
+	 * const-initializer shape).  Zero = CONTROL, so every existing
+	 * registration is CONTROL without edits.  A msg_type is sent and
+	 * dispatched ONLY in its plane's owner process:  the physical-send
+	 * layer ereports on a cross-plane send, dispatch drops the frame
+	 * fail-closed (plane_misroute_reject).  Flip discipline (H-5 + user
+	 * ruling): the five GCS block types turn DATA in ONE commit at the
+	 * end of the D3+D4 sequence — no half-migrated window.
+	 */
+	uint8 plane;
 } ClusterICMsgTypeInfo;
 
 

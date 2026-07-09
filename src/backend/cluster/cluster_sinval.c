@@ -325,6 +325,7 @@ cluster_sinval_enqueue_batch(const SharedInvalidationMessage *msgs, int n)
 	 * tier1 TCP fds.  Wake LMON immediately; its main loop drains the
 	 * outbound queue via cluster_ic_send_envelope_fanout().
 	 */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_OUT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 	return true;
 }
@@ -365,6 +366,7 @@ cluster_sinval_enqueue_batch_with_ack_flag(const SharedInvalidationMessage *msgs
 	pg_atomic_write_u32(&ClusterSinvalOutbound->tail, (tail + 1) % ClusterSinvalOutbound->capacity);
 	LWLockRelease(&ClusterSinvalOutbound->lock.lock);
 
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_OUT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 	return true;
 }
@@ -1111,6 +1113,7 @@ cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 s
 	pg_atomic_write_u32(&ClusterSinvalAckOutbound->tail, next_tail);
 	LWLockRelease(&ClusterSinvalAckOutbound->lock.lock);
 
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 }
 

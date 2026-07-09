@@ -79,6 +79,8 @@ my $disks_csv = join(',', @disks);
 
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ---- node0 init -> backup -> node1 init_from_backup (shared sysid) ----
 my $node0 = PostgreSQL::Test::Cluster->new('cf_cc_node0');
@@ -131,9 +133,11 @@ name = cf_cc
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);

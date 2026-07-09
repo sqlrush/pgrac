@@ -163,8 +163,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '159',
-   'L6a pg_stat_cluster_injections has 159 entries (spec-6.14 D5+D8 +3; spec-5.6a +1; spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
+   '161',
+   'L6a pg_stat_cluster_injections has 161 entries (spec-7.2 D6 +2 lms data-dispatch/conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
 
 is($node->safe_psql(
 		'postgres',

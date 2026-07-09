@@ -57,6 +57,13 @@ sub new_triple
 		PostgreSQL::Test::Cluster::get_free_port(),
 		PostgreSQL::Test::Cluster::get_free_port(),
 	);
+	# spec-7.2 D2: explicit DATA-plane ports (allocator-provided, never
+	# offset-derived -- r1-F2).
+	my @data_ports = (
+		PostgreSQL::Test::Cluster::get_free_port(),
+		PostgreSQL::Test::Cluster::get_free_port(),
+		PostgreSQL::Test::Cluster::get_free_port(),
+	);
 
 	my @nodes;
 	for my $i (0 .. 2)
@@ -176,8 +183,9 @@ sub new_triple
 	my $peers_block = "";
 	for my $i (0 .. 2)
 	{
-		$peers_block .=
-		  "[node.$i]\ninterconnect_addr = 127.0.0.1:$ic_ports[$i]\n\n";
+		$peers_block .= "[node.$i]\n"
+		  . "interconnect_addr = 127.0.0.1:$ic_ports[$i]\n"
+		  . "data_addr = 127.0.0.1:$data_ports[$i]\n\n";
 	}
 
 	my $pgrac_conf_body = <<EOC;
@@ -198,6 +206,7 @@ EOC
 		cluster_name => $cluster_name,
 		pg_ports    => \@pg_ports,
 		ic_ports    => \@ic_ports,
+		data_ports  => \@data_ports,
 		voting_disk_paths => \@voting_disk_paths,
 		wal_threads_root  => $wal_threads_root,
 		shared_data_root  => $shared_data_root,

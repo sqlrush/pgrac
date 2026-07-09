@@ -58,6 +58,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_elog.h"	/* CLUSTER_LOG */
 #include "cluster/cluster_guc.h"	/* cluster_node_id, cluster_config_file */
+#include "cluster/cluster_ic.h"		/* CLUSTER_IC_TIER_* (spec-7.2 data_addr gate) */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.27) */
 #endif
 
@@ -78,7 +79,11 @@ PG_FUNCTION_INFO_V1(cluster_get_nodes);
 StaticAssertDecl(sizeof(ClusterNodeRole) == sizeof(int32),
 				 "ClusterNodeRole must be int32-sized for shmem ABI stability");
 
-StaticAssertDecl(sizeof(ClusterConf) <= 65536, "ClusterConf must fit in 64 KiB");
+/* PGRAC: spec-7.2 D2 — budget raised 64 -> 128 KiB when data_addr joined
+ * the per-node entry (128 slots x 128B pushed the old bound;  the region
+ * is shmem-only, so the budget is an anchor against accidental bloat,
+ * not a wire/disk contract).  cluster-conf-design.md §3.2 amended. */
+StaticAssertDecl(sizeof(ClusterConf) <= 131072, "ClusterConf must fit in 128 KiB");
 
 
 /* ============================================================
@@ -478,6 +483,17 @@ apply_node_field(ClusterNodeInfo *n, const char *key, const char *value, const c
 		strlcpy(n->public_addr, value, sizeof(n->public_addr));
 		return true;
 	}
+	/* PGRAC: spec-7.2 D2 — optional DATA-plane listener address.  Empty
+	 * (or absent) = data plane off for this node;  never derived from
+	 * interconnect_addr (r1-F2: no port guessing). */
+	if (strcmp(key, "data_addr") == 0) {
+		if (*value != '\0' && !validate_addr_format(value)) {
+			*out_err = "data_addr must be empty or in host:port form";
+			return false;
+		}
+		strlcpy(n->data_addr, value, sizeof(n->data_addr));
+		return true;
+	}
 	if (strcmp(key, "role") == 0) {
 		ClusterNodeRole role;
 
@@ -596,6 +612,29 @@ post_validate(const char *path)
 					 "cluster_conf: node %d in \"%s\" is missing required field interconnect_addr",
 					 n->node_id, path)));
 		}
+
+		/*
+		 * PGRAC: spec-7.2 flip — with the GCS block family on the DATA
+		 * plane, a multi-node cluster on a real interconnect tier
+		 * cannot serve block transfers without a per-node data_addr.
+		 * Fail-closed at startup (r1-F2: no port guessing, no silent
+		 * CONTROL fallback) instead of hanging the first cross-node
+		 * block request.  Single-node fallback and stub/mock tiers are
+		 * exempt (no remote block traffic exists there).
+		 */
+		if (ClusterConfShmem->node_count > 1 && cluster_enabled
+			&& (cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				|| cluster_interconnect_tier == CLUSTER_IC_TIER_2
+				|| cluster_interconnect_tier == CLUSTER_IC_TIER_3)
+			&& n->data_addr[0] == '\0') {
+			ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+							errmsg("cluster_conf: node %d in \"%s\" is missing required field "
+								   "data_addr (multi-node DATA plane, spec-7.2)",
+								   n->node_id, path),
+							errhint("Declare data_addr = host:port for every [node.N] section; "
+									"the GCS block family ships over the LMS-owned DATA plane.")));
+		}
+
 		if (n->rdma_port == 0)
 			n->rdma_port = 1;
 		if (n->node_id == cluster_node_id)

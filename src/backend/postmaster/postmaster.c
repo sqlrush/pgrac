@@ -2017,8 +2017,17 @@ ServerLoop(void)
 		 * external child termination paths.  cluster.lms_enabled = off
 		 * (PGC_POSTMASTER) keeps LMS un-forked and leaves the startup-time
 		 * PG-native fallback path active.
+		 *
+		 * PGRAC: spec-7.2 — LMS must also run in HOT STANDBY:  with the
+		 * GCS block family on the LMS-owned DATA plane, an ADG standby
+		 * without an LMS has no DATA listener and every cross-node block
+		 * request from or to it retransmits to exhaustion (t/335).  The
+		 * standby LMS serves the same roles as on a primary (DATA plane
+		 * + CR/undo park-serve);  grant ownership stays with LMON (HC4)
+		 * on every node.
 		 */
-		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0
+			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY))
 			LmsPID = StartLms();
 
 		/*

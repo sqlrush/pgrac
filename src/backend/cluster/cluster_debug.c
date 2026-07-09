@@ -1867,6 +1867,32 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_wal_flush_before_ship_count()));
 	emit_row(rsinfo, "gcs", "block_ship_bytes_total",
 			 fmt_int64((int64)cluster_gcs_get_block_ship_bytes_total()));
+	/* PGRAC: spec-7.2 flip — plane facts:  which plane owns the block
+	 * family (0 = CONTROL pre-flip, 1 = DATA) and the total frames the
+	 * dispatch plane gate dropped (both tier1 instances). */
+	emit_row(rsinfo, "gcs", "block_family_plane",
+			 fmt_int64(cluster_gcs_block_family_on_data_plane() ? 1 : 0));
+	emit_row(
+		rsinfo, "gcs", "plane_misroute_reject",
+		fmt_int64((int64)(cluster_ic_tier1_get_plane_misroute_reject(CLUSTER_IC_PLANE_CONTROL)
+						  + cluster_ic_tier1_get_plane_misroute_reject(CLUSTER_IC_PLANE_DATA))));
+	/* PGRAC: spec-7.2 D6 — requester ship-latency histogram (16 rows,
+	 * keys ship_hist_us_le_<bound> + ship_hist_us_inf). */
+	{
+		int hb;
+
+		for (hb = 0; hb < CLUSTER_GCS_SHIP_HIST_BUCKETS; hb++) {
+			char histkey[48];
+			uint64 bound = cluster_gcs_block_ship_hist_bound_us(hb);
+
+			if (bound == UINT64_MAX)
+				snprintf(histkey, sizeof(histkey), "ship_hist_us_inf");
+			else
+				snprintf(histkey, sizeof(histkey), "ship_hist_us_le_" UINT64_FORMAT, bound);
+			emit_row(rsinfo, "gcs", histkey,
+					 fmt_int64((int64)cluster_gcs_block_ship_hist_count(hb)));
+		}
+	}
 	/* spec-6.13 D8: RDMA tier3/direct-land copy path observability. */
 	emit_row(rsinfo, "gcs", "scratch_copy_count",
 			 fmt_int64((int64)cluster_gcs_get_scratch_copy_count()));

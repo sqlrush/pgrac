@@ -98,6 +98,7 @@
 #define CLUSTER_LMON_H
 
 #include "datatype/timestamp.h"
+#include "port/atomics.h"
 #include "storage/lwlock.h"
 
 struct Latch;
@@ -143,7 +144,91 @@ typedef struct ClusterLmonSharedState {
 	uint64 slow_iter_count;			   /* iterations over cluster.lmon_slow_iteration_warn_ms */
 	struct Latch *lmon_latch;		   /* qvotec completion wake target; LMON owns lifecycle */
 	bool shutdown_requested;		   /* postmaster sets; LMON main loop polls + exits */
+
+	/*
+	 * PGRAC: spec-7.2 D1 duty-chain on-demand gating.  Dirty bitmask for
+	 * the lazy-able (queue-consumption) duty families: producers set their
+	 * family bit at enqueue time (fetch-or, lock-free, NOT under lwlock);
+	 * the LMON main loop test-and-clears it to decide whether the drain
+	 * runs this iteration.  A missed bit is latency-bounded, never a
+	 * correctness issue: the heartbeat-interval floor forces every duty
+	 * at >= 1 Hz (cluster.ic_duty_lazy = off restores run-every-iteration).
+	 */
+	pg_atomic_uint32 lazy_duty_dirty;
 } ClusterLmonSharedState;
+
+/*
+ * ClusterLmonDuty -- spec-7.2 D1 classification table (§3.7).
+ *
+ *	EVERY tick/drain call in the LMON main-loop duty chain is enumerated
+ *	here and classified by cluster_lmon_duty_is_lazy():
+ *
+ *	  never-lazy (correctness families):  fence / sweeps / reconfig /
+ *	    recovery / epoch-quorum / order-writ members (I47: dead-sweep
+ *	    MUST run BEFORE reconfig; clean-leave MUST run BEFORE reconfig).
+ *	    These run every iteration, order and cadence verbatim.
+ *
+ *	  lazy-able (queue-consumption families):  drains whose producers
+ *	    mark_dirty at enqueue time (or that are purely TTL/time-based and
+ *	    ride the >= 1 Hz floor).  Skipping an iteration only delays the
+ *	    drain, bounded by the floor.
+ *
+ *	A NEW duty added to the chain without an enum entry is never-lazy by
+ *	construction (a plain unconditional call).  To make it lazy it must
+ *	be enumerated + classified here, and the unit truth table
+ *	(test_cluster_lmon.c) re-pinned -- that is the anti-drift gate.
+ */
+typedef enum ClusterLmonDuty {
+	/* never-lazy (correctness families) */
+	CLUSTER_LMON_DUTY_LIVENESS = 0,
+	CLUSTER_LMON_DUTY_FENCE,
+	CLUSTER_LMON_DUTY_GRD_DEAD_SWEEP, /* I47: MUST run BEFORE reconfig */
+	CLUSTER_LMON_DUTY_GRD_RECLAIM,
+	CLUSTER_LMON_DUTY_GRD_STARVATION_SWEEP,
+	CLUSTER_LMON_DUTY_DEADLOCK,
+	CLUSTER_LMON_DUTY_GES_REPLY_WAIT_SWEEP, /* 5.16 rule-8.A backstop */
+	CLUSTER_LMON_DUTY_DIRECT_LAND_ABORTS,
+	CLUSTER_LMON_DUTY_LMS_NATIVE_PROBE_RETRY,
+	CLUSTER_LMON_DUTY_CLEAN_LEAVE, /* CL-I13: MUST run BEFORE reconfig */
+	CLUSTER_LMON_DUTY_NODE_REMOVE, /* INV-LF1: before reconfig */
+	CLUSTER_LMON_DUTY_RECONFIG,
+	CLUSTER_LMON_DUTY_GRD_RECOVERY, /* AFTER reconfig tick (spec-4.6) */
+	CLUSTER_LMON_DUTY_BOC_BROADCAST,
+	CLUSTER_LMON_DUTY_SINVAL_RESET_ALL, /* order-sensitive protocol */
+	CLUSTER_LMON_DUTY_PI_DISCARD,
+	/* lazy-able (queue-consumption families) -- keep contiguous; the
+	 * dirty bit is (duty - CLUSTER_LMON_DUTY_LAZY_FIRST) */
+	CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
+	CLUSTER_LMON_DUTY_SHIP_READY,
+	CLUSTER_LMON_DUTY_GRD_OUTBOUND,
+	CLUSTER_LMON_DUTY_SINVAL_OUT,
+	CLUSTER_LMON_DUTY_SINVAL_ACK_OUT,
+	CLUSTER_LMON_DUTY_TT_HINT,
+	CLUSTER_LMON_DUTY_DEDUP_TTL, /* TTL/time-based: floor-driven, no producer */
+	CLUSTER_LMON_DUTY_BACKUP,
+	CLUSTER_LMON_DUTY_N
+} ClusterLmonDuty;
+
+#define CLUSTER_LMON_DUTY_LAZY_FIRST CLUSTER_LMON_DUTY_GES_WORK_QUEUE
+
+StaticAssertDecl(CLUSTER_LMON_DUTY_N - CLUSTER_LMON_DUTY_LAZY_FIRST <= 32,
+				 "lazy duty families must fit the uint32 dirty bitmask");
+
+/*
+ * Duty-gating API (spec-7.2 D1).
+ *
+ *	cluster_lmon_duty_is_lazy      pure classification (unit-pinned).
+ *	cluster_lmon_duty_mark_dirty   producer side, any process; lock-free
+ *	                               fetch-or; no-op for never-lazy duties
+ *	                               and pre-shmem calls.  Call BEFORE the
+ *	                               cluster_lmon_wakeup() kick.
+ *	cluster_lmon_duty_should_run   LMON loop side; true for never-lazy,
+ *	                               lazy=off, or force_all (>= 1 Hz floor);
+ *	                               otherwise test-and-clears the bit.
+ */
+extern bool cluster_lmon_duty_is_lazy(ClusterLmonDuty duty);
+extern void cluster_lmon_duty_mark_dirty(ClusterLmonDuty duty);
+extern bool cluster_lmon_duty_should_run(ClusterLmonDuty duty, bool force_all);
 
 
 /*
