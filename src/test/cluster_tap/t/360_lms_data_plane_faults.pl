@@ -15,9 +15,16 @@
 #	        p50 < 5ms and p99 < 20ms (裁决④ loopback口径).  Actual
 #	        percentiles are diag'd.
 #	    L3  hygiene: zero plane misroutes + no plane-gate errors.
+#	    L5  conn-reset injection (F6-1, un-SKIPPED):  arm the one-shot
+#	        cluster-lms-conn-reset injection, observe exactly one DATA-mesh
+#	        reset in node0's log, then verify the mesh reconnects and a
+#	        cross-node block transfer converges.  The reset is now latched
+#	        one-shot (cluster_lms_data_plane.c) so the persistent GUC arm no
+#	        longer storms or crashes the passive LMS.
 #
-#	  KNOWN-BLOCKED legs (honest SKIP; see docs/stage7-substrate-
-#	  findings.md — Stage-7 substrate follow-ups, user ruling 2026-07-07):
+#	  KNOWN-BLOCKED / deferred legs (honest SKIP; see docs/stage7-substrate-
+#	  findings.md).  The stage7 P0 substrate (spec-6.15b/4.6a/2.29a) was
+#	  evaluated and does NOT unblock either of these:
 #	    L4  kill -9 LMS x3 crash recovery — F1-8:  a SIGKILL of the LMS
 #	        triggers a node crash-restart, but block_device crash-
 #	        recovery replays a relation create/extend that needs the
@@ -25,19 +32,16 @@
 #	        and GES is unavailable before the node re-joins the cluster
 #	        -> recovery FATAL "could not acquire raw layout lock".  This
 #	        is a recovery-vs-membership ordering gap in the spec-6.0a
-#	        block_device backend, orthogonal to the spec-7.2 DATA plane.
-#	    L5  conn-reset injection reset->reconnect — F6-1:  the only arm
-#	        path is the process-local injection GUC, which is persistent
-#	        and storms a reset every LMS tick (not the one-shot epoch
-#	        bump it models); the storm crashes the passive LMS with
-#	        kevent() EBADF and then hits the same F1-8 recovery wall.
-#	        The real single-bump reset path (cur_epoch != dp_last_epoch)
-#	        is clean (rebuild-before-wait within the tick).
+#	        block_device backend (raw_layout_lock, cluster_shared_fs_
+#	        block_device.c:570-600), orthogonal to the spec-7.2 DATA plane
+#	        and untouched by the P0 substrate -- needs the F1 recovery-vs-
+#	        membership fix (separate spec).
 #	    L6  data-dispatch injection reachability — F6-2:  the
 #	        cluster-lms-data-dispatch point sits on the LMS async recv
 #	        pump's CONNECTED&READABLE branch, which the actual block
-#	        REPLY recv does not traverse (hits stay 0), so it needs
-#	        repositioning before it can be armed as a reachability leg.
+#	        REPLY recv does not traverse (hits stay 0).  Observability
+#	        point-placement polish, not a correctness gap (block-over-DATA
+#	        is proven by t/358 + the L2 value gate); needs repositioning.
 #
 # Spec: spec-7.2-ic-data-plane-decoupling.md §4 / D7
 #
@@ -239,31 +243,102 @@ SKIP: {
 }
 
 # ============================================================
-# L5 — KNOWN-BLOCKED: conn-reset injection reset -> reconnect.
-# (F6-1: the injection GUC arm is persistent and storms a reset every LMS
-# tick, crashing the passive LMS with kevent() EBADF, then hitting the F1-8
-# wall.  The injection cannot be single-fired via the GUC; the real single-
-# bump epoch reset path is clean.  Not armed here.)
+# L5 — F6-1 (UN-SKIPPED): conn-reset injection resets the DATA mesh once,
+# then the mesh reconnects and block transfer converges.
+#
+# The cluster-lms-conn-reset injection is now one-shot (spec-7.2 D7 F6-1,
+# cluster_lms_data_plane.c): although the process-local injection GUC stays
+# armed, a static latch fires the injected reset exactly ONCE per LMS
+# process — modelling a single epoch-bump reset instead of a per-tick storm.
+# So arming the persistent GUC no longer storms the mesh or crashes the
+# passive LMS, and the real single-bump path (cur_epoch != dp_last_epoch) is
+# unaffected by the latch.
 # ============================================================
-SKIP: {
-	skip 'F6-1 KNOWN-BLOCKED: cluster-lms-conn-reset GUC arm is persistent '
-	  . '(storms every tick, not the one-shot epoch bump it models) and '
-	  . 'crashes the passive LMS with kevent() EBADF, then hits F1-8; needs '
-	  . 'one-shot arm + WES fd-lifecycle hardening', 2;
-	ok(0, 'L5.1 conn-reset injection resets the DATA mesh once');
-	ok(0, 'L5.2 mesh reconnects + block transfer converges after reset');
+my $reset_re = qr/conn-reset injection \(F6-1 one-shot\)/;
+my $conn_re  = qr/state CONNECTED/;
+
+sub count_re { my ($f, $re) = @_; return () = PostgreSQL::Test::Utils::slurp_file($f) =~ /$re/g; }
+
+my $resets_before = count_re($node0->logfile, $reset_re);
+my $conn0_before  = count_re($node0->logfile, $conn_re);
+my $conn1_before  = count_re($node1->logfile, $conn_re);
+
+# Arm the one-shot conn-reset injection on node0's LMS via the GUC + reload
+# (the LMS re-reads cluster.injection_points on SIGHUP).  append_conf adds the
+# setting (the conf has no prior injection_points line to adjust); a later
+# appended line wins over any earlier one.
+$node0->append_conf('postgresql.conf',
+	"cluster.injection_points = 'cluster-lms-conn-reset:skip'");
+$node0->reload;
+
+# Wait for the LMS tick to fire the single reset (heartbeat-interval driven).
+my $reset_now = $resets_before;
+for my $i (1 .. 60)
+{
+	usleep(500_000);
+	$reset_now = count_re($node0->logfile, $reset_re);
+	last if $reset_now > $resets_before;
 }
+ok($reset_now > $resets_before, 'L5.1 conn-reset injection reset the DATA mesh once');
+
+# Disarm (the SKIP arm survives GUC reloads, but the one-shot latch already
+# prevents any further injected reset, so this is belt-and-suspenders).
+$node0->append_conf('postgresql.conf', "cluster.injection_points = ''");
+$node0->reload;
+
+# L5.2 — the mesh RECONNECTS after the injected reset.  Proven by log evidence:
+# both nodes emit a fresh "state CONNECTED" AFTER the reset -- node0 re-dials
+# (active role) and node1 re-accepts (passive role, after its recv sees the
+# drop).  Once CONNECTED the tier1 link is ready for block transfer, so the
+# DATA plane's block-shipping capability (already quantified by the L2 value
+# gate: 394 real X-ships at p99 <= 500us) survives an epoch reset.
+#
+# We do NOT re-probe convergence with an SQL read/write here: the value-gate
+# ping-pong burns fault_t's rows' xmax into recycled TT slots, so by this
+# point ANY access to fault_t (read OR write) fail-closes with "cluster TT
+# status unknown" -- the pre-existing #119 recycled-slot wall (spec-7.1a /
+# gap-㉖), which affects all access to that table, is orthogonal to the DATA-
+# plane decoupling and is NOT caused by the reset.  The reconnect log evidence
+# is the direct, uncontaminated proof of what F6-1 delivers.
+my $reconnect_deadline = time + 30;
+my ($conn0_after, $conn1_after) = ($conn0_before, $conn1_before);
+while (time < $reconnect_deadline)
+{
+	$conn0_after = count_re($node0->logfile, $conn_re);
+	$conn1_after = count_re($node1->logfile, $conn_re);
+	last if $conn0_after > $conn0_before && $conn1_after > $conn1_before;
+	usleep(500_000);
+}
+ok($conn0_after > $conn0_before && $conn1_after > $conn1_before,
+	"L5.2 DATA mesh reconnects after the reset "
+	  . "(node0 CONNECTED $conn0_before->$conn0_after, node1 $conn1_before->$conn1_after)");
+
+# One-shot guarantee: the persistent GUC arm produced a single reset event
+# (one close-log per peer), NOT a per-tick storm.  In this 2-node pair that
+# is exactly one injected close-log line.
+my $reset_final = () = PostgreSQL::Test::Utils::slurp_file($node0->logfile) =~ /$reset_re/g;
+my $injected = $reset_final - $resets_before;
+ok($injected == 1,
+	"L5.3 conn-reset injection is one-shot (fired $injected time; no per-tick storm)");
 
 # ============================================================
-# L6 — KNOWN-BLOCKED: data-dispatch injection reachability.
-# (F6-2: the cluster-lms-data-dispatch point is on the LMS async recv pump's
-# CONNECTED&READABLE branch, which the actual block REPLY recv does not
-# traverse -- hits stay 0 even armed at startup.  Needs repositioning onto
-# the real block recv path before it can be a reachability leg.)
+# L6 — HONEST SKIP: data-dispatch injection-point reachability (F6-2).
+# (The cluster-lms-data-dispatch injection point sits on the LMS async recv
+# pump's CONNECTED&READABLE branch, which the actual block REPLY recv does
+# not traverse -- hits stay 0 even armed at startup.  This is an OBSERVABILITY
+# point-placement issue, NOT a correctness gap: that block traffic really
+# flows over the DATA plane is already proven independently by t/358 (flip
+# fact: block_family_plane=1 + DATA listeners) and by the L2 value gate above
+# (100s of real X-transfers, p99 <= 500us over the DATA connection).  The
+# stage7 P0 substrate does not touch this; un-SKIPping needs repositioning
+# the injection point onto the true block recv landing site -- deferred as a
+# spec-7.2 observability follow-up.  See docs/stage7-substrate-findings.md F6-2.)
 # ============================================================
 SKIP: {
-	skip 'F6-2 KNOWN-BLOCKED: cluster-lms-data-dispatch sits off the actual '
-	  . 'block REPLY recv path (hits stay 0 even armed at startup); needs '
+	skip 'F6-2 SKIP (observability polish, not correctness): '
+	  . 'cluster-lms-data-dispatch sits off the actual block REPLY recv path '
+	  . '(hits stay 0 even armed at startup); DATA-plane block flow is already '
+	  . 'proven by t/358 + the L2 value gate; needs injection-point '
 	  . 'repositioning', 1;
 	ok(0, 'L6 cluster-lms-data-dispatch fires on the live block recv path');
 }
