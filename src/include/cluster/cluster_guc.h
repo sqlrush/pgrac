@@ -779,6 +779,15 @@ extern bool cluster_lmd_enabled;
 extern bool cluster_lms_enabled;
 
 /*
+ * spec-7.3 D2 — cluster.lms_workers: size of the LMS DATA-plane worker pool
+ * (worker 0 = LmsProcess, plus workers 1..cluster_lms_workers-1).  PGC_POSTMASTER,
+ * default 2, range [1, CLUSTER_LMS_MAX_WORKERS].  1 = spec-7.2 topology
+ * identity (no worker siblings forked).  Must be cluster-uniform (HELLO
+ * negotiation, spec-7.3 D3).
+ */
+extern int cluster_lms_workers;
+
+/*
  * cluster.lock_acquire_cluster_path (spec-2.21 D2).
  *
  *	context: PGC_POSTMASTER

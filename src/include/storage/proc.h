@@ -514,7 +514,8 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
  * (L18 startup-time validation family).
  */
 #ifdef USE_PGRAC_CLUSTER
-#define NUM_AUXILIARY_PROCS 18 /* spec-6.4: +MrpProcess/+RfsProcess (was 16 spec-3.13) */
+#define NUM_AUXILIARY_PROCS \
+	25 /* spec-7.3: +LmsWorker1..7Process (was 18 spec-6.4: +Mrp/+Rfs; 16 spec-3.13) */
 #else
 #define NUM_AUXILIARY_PROCS 5
 #endif

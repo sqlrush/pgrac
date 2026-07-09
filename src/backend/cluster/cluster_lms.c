@@ -826,6 +826,110 @@ LmsMain(void)
 
 
 /* ============================================================
+ * spec-7.3 D2 — LMS DATA-plane worker pool (workers 1..7).
+ *
+ *	Workers are distinct AuxProcTypes (LmsWorker1..7Process) that carry the
+ *	B_LMS_WORKER display type.  worker 0 is the plain LmsProcess above; it
+ *	keeps ALL of the LMS duties (GES grant service + park-serve CR + DATA
+ *	shard 0).  Workers 1..7 run the DATA plane ONLY.
+ *
+ *	D2 scope (this file): spawn + identify (B_LMS_WORKER + worker_pids slot)
+ *	+ idle.  The per-worker DATA listener + shard topology + HELLO
+ *	worker_id/n_workers negotiation (D3), the outbound ring group + wakeup
+ *	(D4), the per-worker private tables (D5) and the inline CR construction
+ *	(D6) grow this loop toward the shared, worker_id-parameterised DATA loop.
+ *	When cluster.lms_workers = 1 no worker is forked, so LmsMain runs exactly
+ *	as in spec-7.2 (topology identity).
+ * ============================================================ */
+
+/* The 7 worker AuxProcTypes must be exactly CLUSTER_LMS_MAX_WORKERS - 1
+ * contiguous types, so ClusterLmsWorkerIdForType() maps them to 1..7. */
+StaticAssertDecl(LmsWorker7Process - LmsWorker1Process + 1 == CLUSTER_LMS_MAX_WORKERS - 1,
+				 "spec-7.3: LmsWorker1..7Process must be CLUSTER_LMS_MAX_WORKERS-1 "
+				 "contiguous aux process types");
+
+void
+LmsWorkerMain(int worker_id)
+{
+	Assert(IsUnderPostmaster);
+	Assert(worker_id >= 1 && worker_id < CLUSTER_LMS_MAX_WORKERS);
+
+	MyBackendType = B_LMS_WORKER;
+	init_ps_display(NULL);
+
+	/* Standard PG aux-process signal layout (mirrors LmsMain). */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGALRM, SIG_IGN);
+	pqsignal(SIGPIPE, SIG_IGN);
+	/* SIGUSR1 = DATA-plane wakeup (latch only, async-signal-safe).  In D2 it
+	 * just re-arms the idle wait;  the D4 outbound-ring producers use it to
+	 * wake the worker that owns a tag's shard. */
+	pqsignal(SIGUSR1, lms_sigusr1_handler);
+	pqsignal(SIGUSR2, SIG_IGN);
+	pqsignal(SIGCHLD, SIG_DFL);
+
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	if (cluster_lms_state == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
+				 errhint("cluster_lms_shmem_init() must run during "
+						 "CreateSharedMemoryAndSemaphores().")));
+
+	/* Publish this worker's pid so the D4 wakeup path can find it. */
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+	cluster_lms_state->worker_pids[worker_id] = MyProcPid;
+	LWLockRelease(&cluster_lms_state->lwlock);
+
+	ereport(LOG, (errmsg("cluster_lms: DATA-plane worker %d started (pid %d)", worker_id,
+						 (int)MyProcPid)));
+
+	/*
+	 * D2 idle loop.  SIGTERM sets ShutdownRequestPending + MyLatch; the head
+	 * guard breaks and proc_exit(0) completes cleanly.  No cluster shmem work
+	 * beyond the pid slot until the D3+ DATA-plane wiring lands.
+	 */
+	for (;;) {
+		CHECK_FOR_INTERRUPTS();
+
+		if (ConfigReloadPending) {
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		if (ShutdownRequestPending)
+			break;
+
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+	}
+
+	/* Clear our pid slot before teardown. */
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+	cluster_lms_state->worker_pids[worker_id] = 0;
+	LWLockRelease(&cluster_lms_state->lwlock);
+
+	proc_exit(0);
+}
+
+pid_t
+cluster_lms_get_worker_pid(int worker_id)
+{
+	pid_t pid;
+
+	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return 0;
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
+	pid = cluster_lms_state->worker_pids[worker_id];
+	LWLockRelease(&cluster_lms_state->lwlock);
+	return pid;
+}
+
+
+/* ============================================================
  * spec-2.25 D4 — native-lock probe collector lifecycle (Step 5).
  *
  *	Public API mirrors cluster_native_lock_probe.h declarations.

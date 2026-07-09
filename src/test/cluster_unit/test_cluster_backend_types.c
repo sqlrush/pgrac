@@ -178,17 +178,50 @@ UT_TEST(test_mrp_aux_proc_slot_is_reserved)
 #endif
 }
 
+/*
+ * spec-7.3 D2 — the 7 LMS worker AuxProcTypes (LmsWorker1..7Process) are a
+ * contiguous block appended after RfsProcess (so no existing aux type is
+ * renumbered), their 1-based worker id derives from the offset, and the
+ * NUM_AUXILIARY_PROCS bump still covers every aux type (backend-status /
+ * aux-PGPROC slot per type).
+ */
+UT_TEST(test_lms_worker_aux_slots_reserved)
+{
+#ifdef USE_PGRAC_CLUSTER
+	/* Contiguous block, appended after RfsProcess, before NUM_AUXPROCTYPES. */
+	UT_ASSERT(LmsWorker1Process > RfsProcess);
+	UT_ASSERT_EQ(LmsWorker2Process, LmsWorker1Process + 1);
+	UT_ASSERT_EQ(LmsWorker3Process, LmsWorker1Process + 2);
+	UT_ASSERT_EQ(LmsWorker4Process, LmsWorker1Process + 3);
+	UT_ASSERT_EQ(LmsWorker5Process, LmsWorker1Process + 4);
+	UT_ASSERT_EQ(LmsWorker6Process, LmsWorker1Process + 5);
+	UT_ASSERT_EQ(LmsWorker7Process, LmsWorker1Process + 6);
+	UT_ASSERT(LmsWorker7Process < NUM_AUXPROCTYPES);
+
+	/* worker_id derivation maps the 7 types to 1..7. */
+	UT_ASSERT_EQ(ClusterLmsWorkerIdForType(LmsWorker1Process), 1);
+	UT_ASSERT_EQ(ClusterLmsWorkerIdForType(LmsWorker4Process), 4);
+	UT_ASSERT_EQ(ClusterLmsWorkerIdForType(LmsWorker7Process), 7);
+
+	/* The +7 aux types must still be covered by the aux slot count. */
+	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
+#else
+	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
+#endif
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_backend_num_types_is_32);
 	UT_RUN(test_pgrac_values_appended_after_wal_writer);
 	UT_RUN(test_pg_native_values_unchanged);
 	UT_RUN(test_pgrac_values_are_dense_and_distinct);
 	UT_RUN(test_rfs_is_last);
 	UT_RUN(test_mrp_aux_proc_slot_is_reserved);
+	UT_RUN(test_lms_worker_aux_slots_reserved);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -86,7 +86,8 @@
 #include "storage/condition_variable.h"
 #include "storage/lock.h" /* LOCKTAG / LOCKMODE for probe slot */
 #include "storage/lwlock.h"
-#include "cluster/cluster_grd.h" /* ClusterGrdHolderId for probe slot */
+#include "cluster/cluster_grd.h"	   /* ClusterGrdHolderId for probe slot */
+#include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
 
 
 /*
@@ -257,6 +258,15 @@ typedef struct ClusterLmsSharedState {
 	 *	BOOST = 11 awaits spec-2.28+ with PG core lock manager
 	 *	`LockWaitQueueInsertAtHead`改造 + integrated receiver. */
 	pg_atomic_uint64 priority_starvation_observed_count;
+
+	/*
+	 * spec-7.3 D2 — LMS DATA-plane worker pool pids.  worker_pids[id] is the
+	 * pid of worker id (0 = LmsProcess, 1..7 = LmsWorker aux processes);  each
+	 * worker publishes its own slot at main-entry and clears it on exit.  0 =
+	 * not running.  Read by backends (spec-7.3 D4) to wake the worker that
+	 * owns a tag's shard.  Guarded by lwlock like the other non-atomic fields.
+	 */
+	pid_t worker_pids[CLUSTER_LMS_MAX_WORKERS];
 } ClusterLmsSharedState;
 
 
@@ -293,6 +303,23 @@ extern void cluster_lms_request_shutdown(void);
  * IsUnderPostmaster (reverse defense in depth).  Never returns.
  */
 extern void LmsMain(void) pg_attribute_noreturn();
+
+/*
+ * spec-7.3 D2 — LMS DATA-plane worker main entry (workers 1..7).  Invoked
+ * from auxprocess.c dispatch when MyAuxProcType is one of LmsWorker1..7Process;
+ * worker_id is the 1-based id.  Publishes worker_pids[worker_id], installs the
+ * standard aux signal layout, and idles on MyLatch.  The DATA-plane topology,
+ * outbound ring and inline construction are wired in spec-7.3 D3-D6 — a D2
+ * worker only spawns, identifies, and idles.  Asserts IsUnderPostmaster.
+ * Never returns.
+ */
+extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
+
+/*
+ * spec-7.3 D2 — read a worker's published pid (0 = not running).  worker_id
+ * in [0, CLUSTER_LMS_MAX_WORKERS).  Used by the D4 wakeup path + tests.
+ */
+extern pid_t cluster_lms_get_worker_pid(int worker_id);
 
 /*
  * PGRAC: spec-7.2 D2 — LMS-owned DATA-plane interconnect loop
