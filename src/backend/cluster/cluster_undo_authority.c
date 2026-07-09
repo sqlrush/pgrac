@@ -88,4 +88,39 @@ cluster_undo_authority_decide(const ClusterUndoAuthorityInput *in,
 	return (out->status = CLUSTER_UNDO_AUTHORITY_RECOVERING);
 }
 
+/*
+ * cluster_undo_route_decide -- pure serve routing.
+ *
+ *	OWNER_LIVE          -> serve from the (live) owner (D6 path).
+ *	OK                  -> serve from the elected authority.
+ *	RECOVERING/UNKNOWN  -> destination -1 (fail closed).  There is NO branch
+ *	                       to a GRD hash-master: undo is owner-as-master, so a
+ *	                       miss fails closed, never falls back to hash routing
+ *	                       (spec-5.22d 约束 #2).
+ */
+ClusterUndoServeRoute
+cluster_undo_route_decide(int32 owner_node, uint64 reconfig_epoch,
+						  ClusterUndoAuthorityStatus status, int32 authority_node)
+{
+	ClusterUndoServeRoute r;
+
+	r.reconfig_epoch = reconfig_epoch;
+	r.status = status;
+
+	switch (status) {
+	case CLUSTER_UNDO_AUTHORITY_OWNER_LIVE:
+		r.destination_node = owner_node;
+		break;
+	case CLUSTER_UNDO_AUTHORITY_OK:
+		r.destination_node = authority_node;
+		break;
+	case CLUSTER_UNDO_AUTHORITY_RECOVERING:
+	case CLUSTER_UNDO_AUTHORITY_UNKNOWN:
+	default:
+		r.destination_node = -1; /* fail closed; never a hash master */
+		break;
+	}
+	return r;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

@@ -41,6 +41,7 @@
 #define CLUSTER_UNDO_AUTHORITY_H
 
 #include "c.h"
+#include "cluster/cluster_grd.h"	  /* ClusterResId */
 #include "cluster/cluster_reconfig.h" /* CLUSTER_RECONFIG_DEAD_BITMAP_BYTES */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -119,6 +120,41 @@ extern ClusterUndoAuthorityStatus cluster_undo_authority_decide(const ClusterUnd
  */
 extern ClusterUndoAuthorityStatus
 cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int32 *out_authority);
+
+/*
+ * D4-2 -- serve routing.  Identity (canonical owner, D1 cluster_undo_resid_
+ * master) is deliberately kept separate from the serve DESTINATION: the
+ * request's owner never changes, only WHERE the verdict is served from.
+ *
+ *	destination_node -- owner (OWNER_LIVE) or elected authority (OK);
+ *	                    -1 for RECOVERING / UNKNOWN (fail-closed).  It is
+ *	                    NEVER a GRD shard hash-master -- undo is owner-as-
+ *	                    master, so a lookup miss fails closed, it does NOT
+ *	                    fall back to the hash route (spec-5.22d 约束 #2).
+ */
+typedef struct ClusterUndoServeRoute {
+	int32 destination_node;
+	uint64 reconfig_epoch;
+	ClusterUndoAuthorityStatus status;
+} ClusterUndoServeRoute;
+
+/*
+ * Pure route mapper: (owner, epoch, lookup status, elected authority) -> route.
+ * No shmem deps; unit-testable.  The only nodes it can ever emit are the
+ * passed owner (live) or authority (elected) -- structurally there is no path
+ * to a hash-master, so a fail-closed status yields destination -1.
+ */
+extern ClusterUndoServeRoute cluster_undo_route_decide(int32 owner_node, uint64 reconfig_epoch,
+													   ClusterUndoAuthorityStatus status,
+													   int32 authority_node);
+
+/*
+ * Heavy glue (snapshot object, TAP-covered): resolve the canonical owner from
+ * the undo resid (D1), look up the live serve authority (D4-1 wrapper), and
+ * map to a route.  Never routes undo through the GRD hash master.
+ */
+extern ClusterUndoServeRoute cluster_undo_serve_authority(const ClusterResId *undo_resid,
+														  uint64 reconfig_epoch);
 
 #endif /* USE_PGRAC_CLUSTER */
 

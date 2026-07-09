@@ -36,6 +36,7 @@
 #include "cluster/cluster_reconfig.h"	/* cluster_reconfig_get_observed_fresh_alive */
 #include "cluster/cluster_scn.h"		/* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_authority.h"
+#include "cluster/cluster_undo_resid.h" /* cluster_undo_resid_master (D1) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -100,6 +101,27 @@ cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int
 	if (out.status == CLUSTER_UNDO_AUTHORITY_OK)
 		*out_authority = out.authority_node;
 	return out.status;
+}
+
+/*
+ * cluster_undo_serve_authority -- resolve the serve route for one undo
+ * resource (D4-2 heavy glue).
+ *
+ *	Canonical owner comes from the D1 pure identity (cluster_undo_resid_
+ *	master, never a hash route); the live serve authority comes from the
+ *	D4-1 wrapper; the pure D4-2 mapper turns the two into a route.  A lookup
+ *	miss yields a fail-closed route (destination -1), NEVER the GRD hash
+ *	master (spec-5.22d 约束 #2 / §2.2).
+ */
+ClusterUndoServeRoute
+cluster_undo_serve_authority(const ClusterResId *undo_resid, uint64 reconfig_epoch)
+{
+	int32 owner_node = cluster_undo_resid_master(undo_resid);
+	int32 authority_node = -1;
+	ClusterUndoAuthorityStatus st;
+
+	st = cluster_undo_serve_authority_lookup(owner_node, reconfig_epoch, &authority_node);
+	return cluster_undo_route_decide(owner_node, reconfig_epoch, st, authority_node);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -217,10 +217,55 @@ UT_TEST(test_authority_invalid_owner_unknown)
 	UT_ASSERT_EQ(out.authority_node, -1);
 }
 
+/* ======================================================================
+ * D4-2 route mapper (U3 family) -- identity(owner) vs destination(authority)
+ * separation; a fail-closed status NEVER yields a node (no hash fallback).
+ * ====================================================================== */
+
+/* U3a -- OWNER_LIVE routes to the owner itself (live-owner / D6 path) */
+UT_TEST(test_route_owner_live_routes_owner)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(2 /*owner*/, 42, CLUSTER_UNDO_AUTHORITY_OWNER_LIVE, -1);
+
+	UT_ASSERT_EQ(r.status, CLUSTER_UNDO_AUTHORITY_OWNER_LIVE);
+	UT_ASSERT_EQ(r.destination_node, 2);
+	UT_ASSERT_EQ((int)r.reconfig_epoch, 42);
+}
+
+/* U3b -- OK routes to the elected authority, NOT the (dead) owner */
+UT_TEST(test_route_ok_routes_authority)
+{
+	ClusterUndoServeRoute r = cluster_undo_route_decide(0 /*dead owner*/, 42,
+														CLUSTER_UNDO_AUTHORITY_OK, 3 /*authority*/);
+
+	UT_ASSERT_EQ(r.status, CLUSTER_UNDO_AUTHORITY_OK);
+	UT_ASSERT_EQ(r.destination_node, 3);
+}
+
+/* U3c -- RECOVERING fails closed to -1; NEVER a node / hash master (约束 #2) */
+UT_TEST(test_route_recovering_failclosed_not_node)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(0, 42, CLUSTER_UNDO_AUTHORITY_RECOVERING, -1);
+
+	UT_ASSERT_EQ(r.status, CLUSTER_UNDO_AUTHORITY_RECOVERING);
+	UT_ASSERT_EQ(r.destination_node, -1);
+}
+
+/* U3d -- UNKNOWN fails closed to -1 (no ad-hoc / hash fallback) */
+UT_TEST(test_route_unknown_failclosed)
+{
+	ClusterUndoServeRoute r = cluster_undo_route_decide(0, 42, CLUSTER_UNDO_AUTHORITY_UNKNOWN, -1);
+
+	UT_ASSERT_EQ(r.status, CLUSTER_UNDO_AUTHORITY_UNKNOWN);
+	UT_ASSERT_EQ(r.destination_node, -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_authority_dead_owner_elects_lowest_survivor);
 	UT_RUN(test_authority_owner_live_no_election);
 	UT_RUN(test_authority_owner_undecided_unknown);
@@ -229,6 +274,10 @@ main(void)
 	UT_RUN(test_authority_skips_lower_nonfresh);
 	UT_RUN(test_authority_requires_declared);
 	UT_RUN(test_authority_invalid_owner_unknown);
+	UT_RUN(test_route_owner_live_routes_owner);
+	UT_RUN(test_route_ok_routes_authority);
+	UT_RUN(test_route_recovering_failclosed_not_node);
+	UT_RUN(test_route_unknown_failclosed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
