@@ -4201,6 +4201,131 @@ UT_TEST(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance)
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
 }
 
+/* r3-P2-2 — survivor-behind multi-death detection skew.  The coordinator
+ * folded {1,2} into ONE epoch bump; this survivor accepted only {1} first and
+ * stamped H({1}) at that epoch.  Its later local detection of node 2 publishes
+ * a new event with the GROWN set at the SAME epoch (no further bump), which
+ * pre-fix was never re-consumed past WAIT_EPOCH: DONE hashes could never match
+ * and P6 (no timeout) wedged permanently.  The mid-episode guard must abort to
+ * IDLE, re-consume, re-stamp the full set's hash, re-run the remaster against
+ * the fuller dead set, and let full-set DONEs account. */
+UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
+{
+	ClusterGrdRecoveryCounters c0;
+	ClusterGrdRecoveryCounters c1;
+	uint8 grown[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 h_small;
+	uint64 h_grown;
+	int i;
+
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	ut_mock_now = 0;
+	ut_mock_epoch = 10;
+
+	/* Idle tick captures the pre-reconfig baseline (old = 10). */
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick();
+
+	/* Event 1: this survivor's CSSD has seen only node 1 dead so far. */
+	ut_mock_last_event.event_id = 601;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.reconfig_kind = (uint8)RECONFIG_KIND_FAIL_STOP;
+	ut_mock_last_event.dead_bitmap[0] = 0x02; /* {1} */
+	cluster_grd_recovery_lmon_tick();		  /* P0 accept -> parks in WAIT_EPOCH (cur==old) */
+	h_small = cluster_grd_recovery_event_bitmap_hash_value();
+
+	/* The coordinator's single folded bump arrives via piggyback: this node
+	 * sails past WAIT_EPOCH with the SMALL set stamped. */
+	ut_mock_epoch = 11;
+	cluster_grd_recovery_lmon_tick(); /* P1-P5 -> WAIT_BARRIER, episode epoch 11 */
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
+	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_small);
+
+	/* The wedge shape: a full-set DONE from the coordinator is dropped while
+	 * this node's stamp is behind. */
+	memset(grown, 0, sizeof(grown));
+	grown[0] = 0x06; /* {1,2} */
+	h_grown = cluster_grd_dead_bitmap_hash(grown);
+	UT_ASSERT_NE(h_grown, h_small);
+	cluster_grd_recovery_mark_peer_done(0, 11, h_grown);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), 0);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 0);
+
+	/* Local CSSD catches up: NEW event_id, SAME epoch, GROWN dead set. */
+	cluster_grd_recovery_counters_snapshot(&c0);
+	ut_mock_last_event.event_id = 602;
+	ut_mock_last_event.dead_bitmap[0] = 0x06;
+	cluster_grd_recovery_lmon_tick(); /* WAIT_BARRIER guard -> abort to IDLE */
+	cluster_grd_recovery_counters_snapshot(&c1);
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_IDLE);
+	UT_ASSERT_EQ(c1.remaster_failed, c0.remaster_failed + 1);
+
+	/* Re-consume: re-stamp to the FULL set's hash, re-run the remaster against
+	 * the fuller set (nothing may stay mastered by 1 OR 2), land back in
+	 * WAIT_BARRIER under the same epoch. */
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
+	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_grown);
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_EQ(cluster_grd_shard_master(i), (int32)0);
+
+	/* The coordinator's per-tick full-set DONE re-announce now accounts. */
+	cluster_grd_recovery_mark_peer_done(0, 11, h_grown);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 11);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), h_grown);
+
+	cluster_enabled = false;
+	ut_mock_now = 0;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+}
+
+/* r3-P2-2 no-regression leg — dead_generation drift re-fires the SAME dead
+ * set under the same epoch (new event_id, identical bitmap).  The guard must
+ * ABSORB it: no abort-to-IDLE churn, stamp unchanged, and the event_id is
+ * consumed so the post-episode IDLE dedup does not re-run the episode. */
+UT_TEST(test_recovery_same_epoch_same_set_drift_absorbed_no_churn)
+{
+	ClusterGrdRecoveryCounters c0;
+	ClusterGrdRecoveryCounters c1;
+	uint64 h_set;
+
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	ut_mock_now = 0;
+	ut_mock_epoch = 10;
+
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick(); /* idle baseline (old = 10) */
+
+	ut_mock_last_event.event_id = 611;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.reconfig_kind = (uint8)RECONFIG_KIND_FAIL_STOP;
+	ut_mock_last_event.dead_bitmap[0] = 0x04; /* {2} */
+	cluster_grd_recovery_lmon_tick();		  /* P0 accept -> WAIT_EPOCH */
+	ut_mock_epoch = 11;
+	cluster_grd_recovery_lmon_tick(); /* P1-P5 -> WAIT_BARRIER */
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
+	h_set = cluster_grd_recovery_event_bitmap_hash_value();
+
+	/* Same-set re-fire (drift): absorbed, no episode churn.  The tick may
+	 * legitimately advance the episode (WAIT_BARRIER -> WAIT_CLUSTER with the
+	 * trivial unit barrier) — the assertion is that it never falls back to
+	 * IDLE and the stamp/counters do not move. */
+	cluster_grd_recovery_counters_snapshot(&c0);
+	ut_mock_last_event.event_id = 612;
+	cluster_grd_recovery_lmon_tick();
+	cluster_grd_recovery_counters_snapshot(&c1);
+	UT_ASSERT_EQ(c1.remaster_failed, c0.remaster_failed); /* no abort */
+	UT_ASSERT_NE(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_IDLE);
+	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_set);
+	UT_ASSERT_EQ(cluster_grd_recovery_last_event_id(), 612);
+
+	cluster_enabled = false;
+	ut_mock_now = 0;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+}
+
 
 int
 /* cppcheck-suppress constParameter
@@ -4212,8 +4337,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-6.3a:+6 lifecycle; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b);
 	 * D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA);
 	 * spec-5.16:+12 (join-remaster U1-U5/U10-U16);
-	 * +1 (U17 cross-episode fence Hardening). */
-	UT_PLAN(81);
+	 * +1 (U17 cross-episode fence Hardening);
+	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn). */
+	UT_PLAN(83);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4317,6 +4443,10 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_jr_u16_pre_member_guard);
 	UT_RUN(test_jr_u17_stale_recipient_not_excluded_next_episode);
 	UT_RUN(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance);
+
+	/* spec-4.6a r3-P2-2 — same-epoch multi-death detection-skew closure. */
+	UT_RUN(test_recovery_same_epoch_dead_set_growth_restamps);
+	UT_RUN(test_recovery_same_epoch_same_set_drift_absorbed_no_churn);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

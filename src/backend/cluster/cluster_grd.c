@@ -1723,12 +1723,16 @@ cluster_grd_recovery_event_bitmap_hash_value(void)
  * cluster_grd_dead_bitmap_hash — spec-4.6a Amendment v1.2 (R2).
  *
  *	The cross-node half of the REDECLARE_DONE convergence key: a hash over
- *	the quorum-accepted dead bitmap ALONE.  Same kernel as the event_id hash
+ *	the sender's ACCEPTED dead bitmap ALONE (each node's own local event —
+ *	there is no cross-node ratification of the bitmap; see the P0 stamp-site
+ *	note and the r3-P2-2 mid-episode re-consume guard for how detection skew
+ *	converges).  Same kernel as the event_id hash
  *	(cluster_reconfig_compute_event_id) minus the cssd_dead_generation fold —
  *	the generation is per-instance observation history and does NOT converge
  *	across survivors, which is exactly why event_id cannot key the P6 gate.
- *	A JOIN episode's dead bitmap is all-zero, hashing identically everywhere,
- *	so the composite key degrades to the epoch-only gate there.
+ *	A JOIN episode's dead bitmap is all-zero, hashing identically everywhere
+ *	(a fixed NONZERO constant — 0 stays reserved for "unstamped"), so the
+ *	composite key degrades to the epoch-only gate there.
  */
 uint64
 cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap)
@@ -2126,11 +2130,23 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	 * differs (a coordinator re-election adds the old coordinator to it; a
 	 * re-death of the same node rides a higher epoch via the interposed JOIN
 	 * bump), so the bitmap hash is the ABA guard.  Flap-history drift changes
-	 * only the per-instance dead_generation, never the quorum dead SET, so
-	 * DONEs for the same episode always match here (the R2 wedge fix).
+	 * only the per-instance dead_generation, never the sender's accepted dead
+	 * SET, so same-set DONEs match here (the R2 wedge fix).  r3-P2-2: the
+	 * bitmap is NOT quorum-ratified — under multi-death detection skew a
+	 * behind survivor transiently stamps (and announces) a SMALLER set's hash
+	 * at the same epoch; those frames are dropped HERE until its own CSSD
+	 * catches up and the mid-episode re-consume guard re-stamps + re-announces
+	 * the full set (grd_recovery_consume_new_event_mid_episode).  Per-tick
+	 * re-announce then converges the accounting.
 	 * Pre-accept frames mismatch the previous episode's stamp and are dropped;
 	 * senders re-announce every tick, so accounting lands after our P0 accept
 	 * (which also closes the R4 pre-accept window by construction).
+	 *
+	 * r3-P3(a) — the `== 0` arm treats 0 as "unstamped/pre-accept" (our own
+	 * recovery_event_bitmap_hash is 0 before the first P0 accept).  This
+	 * relies on a stamped hash never being 0: JOIN episodes hash an ALL-ZERO
+	 * bitmap and hash_bytes_extended(zero[16], 0) is a fixed nonzero
+	 * constant (asserted at the stamp site).
 	 */
 	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
 	if (dead_bitmap_hash == 0 || dead_bitmap_hash != episode_bitmap_hash)
@@ -2170,6 +2186,61 @@ grd_recovery_abort_to_idle(void)
 	ereport(DEBUG1,
 			(errmsg_internal("cluster_grd_recovery: episode aborted (epoch moved / new event "
 							 "mid-recovery); shards stay frozen, re-running under the new epoch")));
+}
+
+/*
+ * grd_recovery_consume_new_event_mid_episode — spec-4.6a r3-P2-2.
+ *
+ *	WAIT_BARRIER / WAIT_CLUSTER guard against a NEWER local reconfig event at
+ *	the SAME epoch.  Multi-death detection skew: when two nodes die near-
+ *	simultaneously the coordinator can fold both into ONE epoch bump with dead
+ *	set {A,B}, while a survivor whose CSSD saw only {B} first stamps
+ *	recovery_event_bitmap_hash = H({B}) and sails past WAIT_EPOCH on that
+ *	bump.  Its later local detection of A publishes a new event with dead set
+ *	{A,B} but does NOT move the epoch, so the WAIT_BARRIER / WAIT_CLUSTER
+ *	epoch guards never fire, the survivor keeps announcing DONE under H({B}),
+ *	every peer that stamped H({A,B}) keeps dropping it (composite-key
+ *	mismatch), and P6 — which has no timeout by design — wedges permanently.
+ *
+ *	Disposition (runs in the single-writer LMON tick, after the epoch guard):
+ *	  - new event, FAIL direction, SAME dead-bitmap hash: only the sender-
+ *	    local dead_generation fold moved (flap drift re-fired the same quorum
+ *	    dead set).  Absorb the event_id — the episode semantics (epoch, dead
+ *	    set) are unchanged, so re-running P1-P7 would be pure churn.
+ *	    Absorbing also keeps the IDLE dedup from re-consuming the event after
+ *	    this episode completes.
+ *	  - new event with a DIFFERENT dead-bitmap hash (grown dead set — the
+ *	    skew above — or a JOIN/FAIL interleave): abort to IDLE.  The next
+ *	    tick re-consumes the current event, re-stamps
+ *	    recovery_event_bitmap_hash, re-runs recovery against the fuller dead
+ *	    set, and re-announces DONE under the new composite key — closing the
+ *	    survivor-behind wedge.  The coordinator-behind direction needs no
+ *	    handling here: the coordinator's own later detection bumps the epoch
+ *	    again and the existing epoch guards abort.
+ *
+ *	Returns true when the caller must return (episode aborted to IDLE).
+ */
+static bool
+grd_recovery_consume_new_event_mid_episode(void)
+{
+	ReconfigEvent latest;
+
+	cluster_reconfig_get_last_event(&latest);
+	if (latest.event_id == 0
+		|| latest.event_id == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id))
+		return false;
+
+	if (latest.reconfig_kind == (uint8)RECONFIG_KIND_FAIL_STOP
+		&& pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+			   == (uint32)GRD_REMASTER_DIR_FAIL
+		&& cluster_grd_dead_bitmap_hash(latest.dead_bitmap)
+			   == pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)) {
+		pg_atomic_write_u64(&cluster_grd_state->recovery_last_event_id, latest.event_id);
+		return false;
+	}
+
+	grd_recovery_abort_to_idle();
+	return true;
 }
 
 static void
@@ -2471,12 +2542,28 @@ cluster_grd_recovery_lmon_tick(void)
 			}
 			pg_atomic_write_u64(&cluster_grd_state->recovery_dead_bitmap[b], word);
 		}
-		/* Amendment v1.2 (R2): stamp the composite convergence key's cross-node
-		 * half.  Hash over the accepted dead bitmap alone — every survivor that
-		 * accepted the same quorum dead SET computes the same value regardless
-		 * of its private dead_generation observation history. */
+		/* Amendment v1.2 (R2) + r3-P2-2: stamp the composite convergence key's
+		 * cross-node half.  The hash is over THIS node's OWN accepted event's
+		 * dead bitmap — there is NO cross-node ratification of the bitmap (the
+		 * envelope propagates only the epoch).  Convergence is eventual, not
+		 * instantaneous: every survivor's CSSD deadband converges on the same
+		 * dead set, and until it does, a survivor that accepted a SMALLER set
+		 * at the same epoch stamps a different hash.  The mid-episode
+		 * re-consume guard (grd_recovery_consume_new_event_mid_episode) closes
+		 * that skew: the survivor's own later detection re-stamps the full
+		 * set's hash and re-announces DONE.  dead_generation drift alone never
+		 * changes the bitmap, so same-set re-fires hash identically. */
 		pg_atomic_write_u64(&cluster_grd_state->recovery_event_bitmap_hash,
 							cluster_grd_dead_bitmap_hash(evt.dead_bitmap));
+		/* r3-P3(a) — 0 is reserved as "unstamped/pre-accept" in
+		 * mark_peer_done's drop test, so a stamped episode hash must never be
+		 * 0.  JOIN episodes hash an ALL-ZERO dead bitmap: the invariant is
+		 * that hash_bytes_extended(zero[16], 0) != 0 (a fixed nonzero
+		 * constant).  For FAIL bitmaps a zero hash is a 2^-64 collision, the
+		 * same trust level as the event_id hash; the Assert turns the
+		 * otherwise-undebuggable "all DONEs dropped" wedge into a loud stop
+		 * on cassert builds. */
+		Assert(pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash) != 0);
 		/*
 		 * spec-5.16 D2 — record the remaster direction and, for JOIN, arm the
 		 * joiner-home PCM block fence on THIS node.  The joiner already armed it
@@ -2749,6 +2836,12 @@ cluster_grd_recovery_lmon_tick(void)
 			return;
 		}
 
+		/* r3-P2-2 — a newer local event at the SAME epoch (multi-death
+		 * detection skew grew the dead set) re-consumes; same-set drift is
+		 * absorbed without churn. */
+		if (grd_recovery_consume_new_event_mid_episode())
+			return;
+
 		/* spec-4.7 D2 — advance the survivor block re-declare scan one chunk
 		 * while the GES rebind barrier is still pending (worker-centric, runs
 		 * in this tick;  epoch-coherent via the guard just above). */
@@ -2849,6 +2942,13 @@ cluster_grd_recovery_lmon_tick(void)
 			grd_recovery_abort_to_idle();
 			return;
 		}
+
+		/* r3-P2-2 — same-epoch dead-set growth re-consumes here too: this
+		 * node may already have announced DONE under the stale bitmap hash;
+		 * the re-run re-announces under the full set's hash so peers'
+		 * composite-key accounting converges (P6 has no timeout). */
+		if (grd_recovery_consume_new_event_mid_episode())
+			return;
 
 		/* spec-4.7 D2 — keep advancing the block re-declare scan after the GES
 		 * rebind barrier completed, so a large pool is fully re-declared within
