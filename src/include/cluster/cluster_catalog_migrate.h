@@ -61,6 +61,11 @@ typedef struct ClusterCatalogAuthorityMarker {
 	pg_crc32c crc;			   /* over [0, offsetof(crc)) */
 } ClusterCatalogAuthorityMarker;
 
+typedef enum ClusterCatalogMigrateResult {
+	CLUSTER_CATALOG_MIGRATE_SEEDED = 0,
+	CLUSTER_CATALOG_MIGRATE_ADOPTED
+} ClusterCatalogMigrateResult;
+
 /*
  * cluster_catalog_migrate_tree -- establish the shared catalog relation tree
  *	for this node.  Postmaster-once, only meaningful when
@@ -74,7 +79,8 @@ typedef struct ClusterCatalogAuthorityMarker {
  *	Fail-closed: FATAL 53RB0 on a foreign/mismatched or unreadable authority.
  *	system_identifier is the cluster-wide value from the shared pg_control.
  */
-extern void cluster_catalog_migrate_tree(const char *local_pgdata, uint64 system_identifier);
+extern ClusterCatalogMigrateResult cluster_catalog_migrate_tree(const char *local_pgdata,
+																uint64 system_identifier);
 
 /*
  * cluster_catalog_vet_no_unlogged -- spec-6.14 Q12 enable-time vet: FATAL

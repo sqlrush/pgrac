@@ -776,6 +776,9 @@ Requirements and behaviour:
 * `cluster.node_id` must be between 0 and 15; startup is refused
   otherwise.  Striped clusters are therefore limited to **16 nodes**.
 * `cluster.online_join` must be `on`; startup is refused otherwise.
+* `cluster.shared_catalog = on` with more than one declared node requires
+  `cluster.xid_striping = on`; startup fails closed with SQLSTATE `53RB5`
+  if a multi-node shared-catalog cluster is formed without striping.
 * All nodes must run with the same `cluster.xid_striping` setting.
   The cluster records its striping state durably on the voting disk;
   a node whose configuration disagrees with that recorded state (or
@@ -789,6 +792,50 @@ Requirements and behaviour:
 # postgresql.conf (all nodes)
 cluster.xid_striping = on
 cluster.online_join = on
+```
+
+### Shared-catalog native-era XID authority
+
+A shared-catalog cluster that is formed from a single seed node has a
+short native era: the seed runs with `cluster.enabled = off` while it
+creates initial catalog rows, roles, schemas, and seed data.  Those
+transactions consume the seed node's local xids before other nodes have
+joined.  During the seed node's clean shutdown, pgrac publishes two
+formation files under `cluster.shared_data_dir/global`:
+`pgrac_xid_authority` (the sealed native xid high-water) and
+`pgrac_xid_prehistory` (the seed node's pg_xact truth for those xids).
+
+Provisioning sequence:
+
+1. Create or clone joiner data directories before the seed load if they
+   must share the seed node's system identifier.
+2. Start the seed with `cluster.shared_catalog = on`,
+   `cluster.controlfile_shared_authority = on`, `cluster.enabled = off`,
+   and a fixed `cluster.node_id`; perform the seed load.
+3. Stop the seed cleanly.  Do not use immediate shutdown for the final
+   native-era stop; joiners refuse an unsealed authority with SQLSTATE
+   `53RB5`.
+4. Start all nodes with `cluster.enabled = on`, `cluster.online_join = on`,
+   and `cluster.xid_striping = on`.  Joiners adopt the seed's transaction
+   history at startup, so seed tables, roles, and data are visible on
+   every node.
+
+Do not delete or re-create the authority files to recover a failed join.
+A missing, unsealed, or corrupt authority/prehistory is intentionally
+fail-closed (`53RB5`); restore the shared tree files from backup or
+re-provision the cluster.  After the first `cluster.enabled = on` boot,
+the native era is permanently closed and a later `cluster.enabled = off`
+boot against the same shared tree is refused.
+
+Observe formation state with:
+
+```sql
+SELECT key, value
+  FROM pg_cluster_state
+ WHERE category = 'catalog'
+   AND key IN ('xid_authority_native_hw',
+               'xid_authority_sealed',
+               'xid_prehistory_adopted');
 ```
 
 ### `cluster.xid_herding_slack`

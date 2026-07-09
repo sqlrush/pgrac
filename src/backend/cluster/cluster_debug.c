@@ -130,6 +130,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_catalog_stats.h"	  /* catalog counters (spec-6.14 D10b) */
 #include "cluster/cluster_oid_lease.h"		  /* catalog category (spec-6.14 D10) */
 #include "cluster/cluster_relmap_authority.h" /* relmap authority state (spec-6.14 D5) */
+#include "cluster/cluster_xid_authority.h"	  /* XID authority state (spec-6.15b D7) */
 #include "cluster/cluster_remote_xact.h"	  /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				  /* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -3075,6 +3076,19 @@ dump_catalog(ReturnSetInfo *rsinfo)
 			 fmt_int64(rmok ? (int64)rmhdr.pending_generation : 0));
 	emit_row(rsinfo, "catalog", "relmap_shared_pending_owner_node",
 			 fmt_int64(rmok ? (int64)rmhdr.owner_node : -1));
+
+	/* spec-6.15b D7: native-era XID authority and this-boot adopt marker. */
+	{
+		ClusterXidAuthorityHeader xahdr;
+		bool xaok = cluster_shared_catalog && cluster_xid_authority_read(&xahdr);
+
+		emit_row(rsinfo, "catalog", "xid_authority_native_hw",
+				 fmt_int64(xaok ? (int64)xahdr.native_hw_full : 0));
+		emit_row(rsinfo, "catalog", "xid_authority_sealed",
+				 fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) != 0));
+		emit_row(rsinfo, "catalog", "xid_prehistory_adopted",
+				 fmt_bool(cluster_xid_prehistory_was_adopted()));
+	}
 
 	/*
 	 * D10b shared-catalog data-plane counters: cluster-path visibility

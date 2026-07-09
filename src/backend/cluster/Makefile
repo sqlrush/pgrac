@@ -220,6 +220,8 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
+	cluster_xid_authority.o \
+	cluster_xid_prehistory.o \
 	cluster_xid_stripe.o \
 	cluster_xid_stripe_boot.o \
 	cluster_xid_stripe_xlog.o \

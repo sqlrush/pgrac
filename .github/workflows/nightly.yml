@@ -176,6 +176,7 @@ jobs:
           # the release-cut 4-node evidence is HG#2a-CI or HG#2a-EXT (external).
           - { name: stage5-beta-chaos-soak, ranges: "344-345", unit: false, regress: false }
           # spec-6.12/6.15 cross-node perf + correctness family (t/346-350:
+<<<<<<< HEAD
           # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash),
           # the renumbered t/351-356 family, t/357 multi-xmax alias floor.
           # Closes the 346+ shard hole (every new t/ file must land in a shard
@@ -194,6 +195,14 @@ jobs:
           # verified against origin branches 2026-07-08).
           - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
 >>>>>>> stage7-p0-dead-diagnosis
+=======
+          # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash) and
+          # the renumbered t/351-356 family, t/357 multi-xmax alias floor, and t/361 XID authority native-era adoption.
+          # Closes the 346+ shard hole (every new t/ file must land in a shard
+          # the same commit; see docs/code-review-checklist.md).
+          - { name: stage6-crossnode-a, ranges: "346-350", unit: false, regress: false }
+          - { name: stage6-crossnode-b, ranges: "351-357 361", unit: false, regress: false }
+>>>>>>> stage7-p0-xid-authority
     steps:
       - name: Checkout
         uses: actions/checkout@v4
