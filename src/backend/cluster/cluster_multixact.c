@@ -44,6 +44,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_subtrans.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_visibility_resolve.h" /* cluster_vis_cr_xmax_verdict (polarity SSOT) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -307,14 +308,28 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 				continue; /* in-progress update not yet visible: tuple still visible */
 			if (ttres.status == CLUSTER_TT_STATUS_COMMITTED
 				|| ttres.status == CLUSTER_TT_STATUS_CLEANED_OUT) {
-				ClusterVisibilityDecision d
+				/*
+				 * spec-7.1 D3-b hotfix (P0): route the committed-updater
+				 * decision through cluster_vis_cr_xmax_verdict -- the polarity
+				 * SSOT shared with the single-xmax path
+				 * (cluster_visibility_verdict.c).  A committed updater whose
+				 * delete is VISIBLE at read_scn (commit_scn <= read_scn) hides
+				 * the tuple (CVV_INVISIBLE); one committed AFTER the snapshot
+				 * leaves the row live (CVV_VISIBLE).  The prior inline compare
+				 * had this INVERTED -- latent until D3-b's member serve first
+				 * feeds this branch a real committed updater terminal.
+				 */
+				ClusterVisibilityDecision scn_decision
 					= cluster_visibility_decide_by_scn(ttres.commit_scn, snap->read_scn);
-				if (d == CLUSTER_VISIBILITY_INVISIBLE)
-					return CLUSTER_VISIBILITY_INVISIBLE;
-				if (d == CLUSTER_VISIBILITY_UNKNOWN)
-					return CLUSTER_VISIBILITY_UNKNOWN;
-				/* VISIBLE -> updater happened after snapshot;  continue */
-				continue;
+
+				switch (cluster_vis_cr_xmax_verdict(ttres.status, scn_decision)) {
+				case CVV_VISIBLE:
+					continue; /* updater does not hide the tuple at this snapshot */
+				case CVV_INVISIBLE:
+					return CLUSTER_VISIBILITY_INVISIBLE; /* delete visible -> tuple gone */
+				default:
+					return CLUSTER_VISIBILITY_UNKNOWN; /* CVV_FAILCLOSED_* */
+				}
 			}
 			/* SUBCOMMITTED / UNKNOWN / other -> caller fail-closed */
 			return CLUSTER_VISIBILITY_UNKNOWN;
