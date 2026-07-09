@@ -248,16 +248,49 @@ UT_TEST(test_undo_verdict_coherence_off_fallback)
 	UT_ASSERT(!cluster_undo_grant_armed(false, false));
 }
 
+/* ======================================================================
+ * U13 -- verdict_resolve outcome folding (spec-5.22c D3-3, Amendment-2):
+ * the entry folds the runtime resolver's (ok, committed, scn, is_bound) into
+ * the taxonomy.  !ok -> UNKNOWN_FAIL_CLOSED; committed & !is_bound -> EXACT;
+ * committed & is_bound -> BOUND (never EXACT); !committed -> ABORTED.  This
+ * is the point the legacy is_bound boolean is collapsed into the kind so a
+ * consumer never sees the side axis.
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_from_resolve_folding)
+{
+	ClusterUndoVerdictResult r;
+
+	/* resolver failed (fetch/covers/deny miss) -> fail-closed */
+	r = cluster_undo_verdict_from_resolve(false, false, InvalidScn, false);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* committed, exact scn -> COMMITTED_EXACT{scn} */
+	r = cluster_undo_verdict_from_resolve(true, true, 8000, false);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((uint64)r.commit_scn, 8000);
+
+	/* committed, bound only -> COMMITTED_BOUND{scn}, NEVER EXACT (Amendment-2) */
+	r = cluster_undo_verdict_from_resolve(true, true, 9000, true);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ((uint64)r.commit_scn, 9000);
+	UT_ASSERT_NE(r.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+
+	/* not committed -> ABORTED */
+	r = cluster_undo_verdict_from_resolve(true, false, InvalidScn, false);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_ABORTED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_undo_verdict_from_wire_page_mapping);
 	UT_RUN(test_undo_verdict_zero_value_is_fail_closed);
 	UT_RUN(test_undo_verdict_from_block_proof_mapping);
 	UT_RUN(test_undo_verdict_resid_encode_contract);
 	UT_RUN(test_undo_verdict_version_coverage_gate);
 	UT_RUN(test_undo_verdict_coherence_off_fallback);
+	UT_RUN(test_undo_verdict_from_resolve_folding);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -392,9 +392,6 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 {
 	ClusterGcsUndoVerdictPage *v = (ClusterGcsUndoVerdictPage *)slot->result_page;
 	TransactionId xid = slot->undo_xid;
-	SCN scn = InvalidScn;
-	SCN horizon = InvalidScn;
-	uint16 wrap = 0;
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
@@ -410,7 +407,43 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
 
+	/*
+	 * Zero the full BLCKSZ wire page (the reply checksum covers it all), then
+	 * fill the verdict fields from the OWN durable TT + CLOG.  fill_page is
+	 * shared with the master==self local verdict resolve (D3-4) so the served
+	 * and self answers over one xid can never diverge (Rule 8.A).
+	 */
 	memset(slot->result_page, 0, BLCKSZ);
+	return cluster_lms_undo_verdict_fill_page(xid, v);
+}
+
+/*
+ * cluster_lms_undo_verdict_fill_page -- resolve an OWN xid into a verdict page
+ * over the COMPLETE own durable TT (cluster_tt_slot_durable_resolve_by_xid)
+ * cross-checked against the OWN CLOG (AD-006: CLOG is the committed-ness
+ * authority; the TT carries commit_scn).  The caller has already zeroed the
+ * page buffer (origin: the full BLCKSZ wire page; D3-4 self: sizeof the
+ * struct) and owns any authority co-sampling; this fills only
+ * magic/version/xid_echo and the verdict taxonomy fields.  true = *v holds
+ * the verdict; false = refuse (in-doubt / ambiguous / not-own / unresolvable
+ * -> caller keeps the 53R97 fail-closed boundary, Rule 8.A).  Shared so the
+ * origin-served verdict and the master==self local verdict are byte-for-byte
+ * the same decision.
+ */
+bool
+cluster_lms_undo_verdict_fill_page(TransactionId xid, ClusterGcsUndoVerdictPage *v)
+{
+	SCN scn = InvalidScn;
+	SCN horizon = InvalidScn;
+	uint16 wrap = 0;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
+	if (!cluster_xid_is_mine(xid))
+		return false;
+
 	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
 	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
 	v->xid_echo = (uint64)xid;

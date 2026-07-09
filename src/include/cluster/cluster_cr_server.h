@@ -181,6 +181,14 @@ extern bool cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd);
  * requester keeps its unchanged 53R97). */
 extern bool cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd);
 
+/* spec-5.22c D3-4: resolve an OWN xid into a verdict page over the complete
+ * own durable TT + own CLOG.  Shared by the origin-served verdict
+ * (lms_undo_verdict_serve) and the master==self local verdict resolve so the
+ * two answers over one xid can never diverge (Rule 8.A).  The caller zeroes
+ * the page buffer and owns any authority co-sampling; true = *v holds the
+ * verdict, false = refuse (caller keeps 53R97 fail-closed). */
+extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, ClusterGcsUndoVerdictPage *v);
+
 /* LMS main-loop side: construct every PENDING slot (errors become DENIED
  * results — fail-closed to the requester, never an LMS restart). */
 extern void cluster_lms_cr_drain(void);

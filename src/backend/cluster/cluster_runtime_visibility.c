@@ -46,14 +46,16 @@
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_pool.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_cssd.h" /* cluster_cssd_get_peer_state (D3-3 Q9 serve-gate) */
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_uba.h"
-#include "cluster/cluster_undo_gcs.h"	/* cluster_undo_block_acquire_shared (D3-2) */
-#include "cluster/cluster_undo_resid.h" /* cluster_undo_resid_encode (D3-2) */
+#include "cluster/cluster_undo_gcs.h"	  /* cluster_undo_block_acquire_shared (D3-2) */
+#include "cluster/cluster_undo_resid.h"	  /* cluster_undo_resid_encode (D3-2) */
+#include "cluster/cluster_undo_verdict.h" /* verdict taxonomy + entry (D3-3/D3-4) */
 
 /*
  * cluster_vis_live_authority_covers
@@ -227,6 +229,23 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 {
 	ClusterGcsUndoVerdictPage verdict;
 	ClusterLiveAuthority auth;
+
+	/*
+	 * Q9: owner-as-master serve-gate precheck (coherent regime only).  A dead
+	 * owner or an in-flight remaster fails closed early — with no doomed
+	 * verdict request on the wire — symmetric with the D2-5 acquire_shared
+	 * serve-gate (keyed on the OWNER under owner-as-master, not a hash static
+	 * master).  Dead-owner SERVE from shared storage is D4, never a D2/D3
+	 * false-resolve (Rule 8.A).  Off the coherent gate the 6.12i best-effort
+	 * verdict path is unchanged (回归安全).
+	 */
+	if (cluster_undo_gcs_coherence && cluster_peer_mode_enabled()
+		&& !cluster_undo_serve_allowed(cluster_cssd_get_peer_state((int32)origin_node)
+										   != CLUSTER_CSSD_PEER_DEAD,
+									   cluster_grd_recovery_in_progress())) {
+		cluster_rtvis_verdict_note_failclosed();
+		return false;
+	}
 
 	cluster_rtvis_verdict_note_wire();
 	if (!cluster_gcs_block_undo_verdict_fetch_and_wait((int32)origin_node, undo_segment_id, raw_xid,
@@ -429,6 +448,87 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	}
 	cluster_rtvis_resolve_note_failclosed();
 	return false;
+}
+
+/*
+ * rtvis_resolve_own_xid — D3-4 master==self local verdict resolve (Q5).
+ *
+ *	The owner resolving its OWN xid needs no network grant: its own durable TT
+ *	+ own CLOG are the authority.  It must NOT take acquire_shared, which is
+ *	fail-closed-forward-D6 for master==self (cluster_undo_gcs_grant.c:97).  The
+ *	resolution reuses cluster_lms_undo_verdict_fill_page — the very function
+ *	the origin serves foreign requesters with — so a node's self answer and
+ *	its served answer over one xid can never diverge (Rule 8.A).  A
+ *	COMMITTED_BOUND then applies the same read_scn admissibility (requester leg
+ *	(e)) the foreign path applies: observe the horizon (Lamport self-heal),
+ *	admit only when read_scn is at/after it, else fail-closed for THIS
+ *	snapshot.
+ */
+static ClusterUndoVerdictResult
+rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
+{
+	ClusterGcsUndoVerdictPage v;
+	ClusterUndoVerdictResult r;
+	ClusterUndoVerdictResult unknown
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	memset(&v, 0, sizeof(v));
+	if (!cluster_lms_undo_verdict_fill_page(raw_xid, &v))
+		return unknown; /* in-doubt / ambiguous / not-own -> fail-closed */
+
+	r = cluster_undo_verdict_from_wire_page(&v, raw_xid);
+
+	if (r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND) {
+		cluster_scn_observe(r.commit_scn);
+		if (!SCN_VALID(read_scn) || scn_time_cmp(r.commit_scn, read_scn) > 0)
+			return unknown; /* bound inadmissible for this snapshot; heals next */
+	}
+	return r;
+}
+
+/*
+ * cluster_undo_verdict_resolve — D3 cross-node xid -> commit_scn verdict entry
+ * (D3-3).  The D6 consumer calls this to decide a seed / fresh-ref tuple.
+ *
+ *	master==self (owner reads its own xid) routes to the local durable resolve
+ *	(rtvis_resolve_own_xid); master!=self (a peer reading a foreign owner — the
+ *	seed/joiner main scene) routes to the CP3 owner-as-master S-grant + CP5
+ *	origin verdict (cluster_runtime_visibility_try_resolve_remote), whose
+ *	outcome is folded into the taxonomy (Amendment-2 collapses is_bound into
+ *	the kind, so a consumer never sees the side axis).  Every unproven path
+ *	returns UNKNOWN_FAIL_CLOSED so the caller keeps its 53R97 boundary
+ *	(Rule 8.A — never a false-visible edge).
+ *
+ *	The foreign-path result carries wrap == 0: the wrap is the anti-ABA
+ *	evidence already consumed inside try_resolve_remote (proof + wrap-suspect
+ *	gate), not a consumer output; the self path carries it verbatim from the
+ *	verdict page.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+							 XLogRecPtr anchor_lsn, SCN read_scn)
+{
+	ClusterUndoVerdictResult unknown
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+	bool committed = false;
+	bool is_bound = false;
+	SCN commit_scn = InvalidScn;
+
+	if (!cluster_crossnode_runtime_visibility)
+		return unknown;
+	if (!TransactionIdIsNormal(raw_xid) || origin_node < 0)
+		return unknown;
+
+	/* master==self: own CLOG + own durable TT authority (Q5/D3-4). */
+	if (origin_node == cluster_node_id)
+		return rtvis_resolve_own_xid(raw_xid, read_scn);
+
+	/* master!=self: CP3 owner-as-master S-grant + CP5 origin verdict. */
+	if (cluster_runtime_visibility_try_resolve_remote(origin_node, undo_segment_id, raw_xid,
+													  anchor_lsn, read_scn, &committed, &commit_scn,
+													  &is_bound))
+		return cluster_undo_verdict_from_resolve(true, committed, commit_scn, is_bound);
+	return unknown;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

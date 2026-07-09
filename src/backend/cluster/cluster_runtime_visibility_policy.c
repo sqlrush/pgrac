@@ -290,3 +290,30 @@ cluster_undo_verdict_from_block_proof(ClusterVisTtProof proof, SCN commit_scn, u
 		return r;
 	}
 }
+
+/*
+ * cluster_undo_verdict_from_resolve
+ *
+ * D3-3 Amendment-2 folding point: collapse the runtime resolver's
+ * (ok, committed, commit_scn, is_bound) outcome into the taxonomy so the
+ * legacy is_bound boolean never escapes to a consumer.  is_bound maps to
+ * COMMITTED_BOUND (never COMMITTED_EXACT), so a switch that only handles
+ * EXACT falls to fail-closed on a bound -- a horizon bound is never stamped
+ * or cached as an exact commit SCN.  Pure.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_resolve(bool ok, bool committed, SCN commit_scn, bool is_bound)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	if (!ok)
+		return r; /* fetch / covers / deny miss -> fail-closed */
+	if (!committed) {
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+	}
+	r.kind = is_bound ? CLUSTER_UNDO_VERDICT_COMMITTED_BOUND : CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = commit_scn;
+	return r;
+}

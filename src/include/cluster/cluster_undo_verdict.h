@@ -96,4 +96,32 @@ cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
 extern ClusterUndoVerdictResult cluster_undo_verdict_from_block_proof(ClusterVisTtProof proof,
 																	  SCN commit_scn, uint16 wrap);
 
+/*
+ * cluster_undo_verdict_from_resolve -- fold the runtime resolver's outcome
+ * (ok, committed, commit_scn, is_bound) into the taxonomy.  This is the
+ * Amendment-2 folding point: the legacy is_bound boolean becomes the
+ * COMMITTED_BOUND kind (never COMMITTED_EXACT), so a consumer switch that
+ * handles only EXACT falls to fail-closed on a bound.  !ok -> UNKNOWN;
+ * committed && is_bound -> BOUND; committed && !is_bound -> EXACT; !committed
+ * -> ABORTED.  Pure.
+ */
+extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool committed,
+																  SCN commit_scn, bool is_bound);
+
+/*
+ * cluster_undo_verdict_resolve — D3 cross-node xid -> commit_scn verdict entry
+ * (D3-3), the primitive the D6 consumer calls to decide a seed / fresh-ref
+ * tuple.  origin_node = the xid's owner; undo_segment_id = the ITL-ref segment
+ * (CP3 block0 locator); anchor_lsn = this tuple's page LSN (version-coverage
+ * gate); read_scn = the snapshot SCN (COMMITTED_BOUND admissibility), or
+ * InvalidScn for callers without snapshot semantics.  master==self routes to
+ * the local durable resolve; master!=self to the CP3 S-grant + CP5 verdict.
+ * kind == UNKNOWN_FAIL_CLOSED => the caller keeps 53R97 (never false-visible).
+ * Compiled only in --enable-cluster builds.
+ */
+extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
+															 uint32 undo_segment_id,
+															 TransactionId raw_xid,
+															 XLogRecPtr anchor_lsn, SCN read_scn);
+
 #endif /* CLUSTER_UNDO_VERDICT_H */
