@@ -64,6 +64,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h" /* PGRAC: spec-7.3 D5 — my DATA channel = worker id */
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
@@ -3397,6 +3398,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	GcsBlockDedupKey key;
 	GcsBlockDedupEntry cached_entry;
 	GcsBlockDedupResult dr;
+	int dedup_worker_id; /* PGRAC: spec-7.3 D5 — this request's dedup shard */
 	char block_buf[GCS_BLOCK_DATA_SIZE];
 	GcsBlockReplyStatus status;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
@@ -3462,6 +3464,37 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	}
 
+	/*
+	 * PGRAC: spec-7.3 D5 — per-worker dedup shard routing guard.  A block
+	 * request's tag routes to exactly one LMS worker (worker[shard(tag)],
+	 * D4), which owns that tag's private dedup shard.  This handler runs in
+	 * the worker whose DATA channel received the envelope; verify it is the
+	 * routed worker before touching the shard.  A mismatch is a mis-route
+	 * (序破坏, 8.A): D3 negotiates a cluster-wide n_workers and D1 shard()
+	 * is byte-identical on both ends, so this cannot happen without a code
+	 * bug — fail closed (drop; sender retransmits via 53R90) rather than
+	 * serve from, or contend on, a shard this worker does not own.
+	 */
+	dedup_worker_id = cluster_ic_tier1_my_data_channel();
+	{
+		int tag_shard = cluster_lms_shard_for_tag(&req->tag, cluster_lms_workers);
+
+		Assert(tag_shard == dedup_worker_id);
+		if (tag_shard != dedup_worker_id) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block request misrouted to LMS worker %d (tag shard "
+										 "%d); dropping (spec-7.3 D5 8.A fail-closed)",
+										 dedup_worker_id, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	/* PGRAC: spec-2.34 D5 — dedup lookup_or_register (HC90 + HC91 + HC92). */
 	memset(&key, 0, sizeof(key));
 	key.origin_node_id = (uint32)req->sender_node;
@@ -3470,8 +3503,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.cluster_epoch = req->epoch;
 	memset(&cached_entry, 0, sizeof(cached_entry));
 
-	dr = cluster_gcs_block_dedup_lookup_or_register(&key, req->tag, req->transition_id,
-													&cached_entry);
+	dr = cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
+													req->transition_id, &cached_entry);
 	switch (dr) {
 	case GCS_BLOCK_DEDUP_CACHED_REPLY:
 		gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
@@ -3927,8 +3960,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					fwd_hdr.sender_node = x_holder;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				cluster_pcm_lock_clear_pending_x(req->tag);
@@ -4269,8 +4303,9 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				/* Forward send failed — fall through to the fail-closed flow. */
@@ -4340,8 +4375,8 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node; /* HC113: holder stored here */
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(&key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
-														  &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(
+						dedup_worker_id, &key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
 				}
 				return;
 			}
@@ -4463,7 +4498,7 @@ build_and_send_reply: {
 		hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 	}
 
-	cluster_gcs_block_dedup_install_reply_ex(&key, status, hdr,
+	cluster_gcs_block_dedup_install_reply_ex(dedup_worker_id, &key, status, hdr,
 											 has_block_payload ? block_payload : NULL,
 											 send_sf_dep ? &sf_dep_vec : NULL, send_sf_dep);
 

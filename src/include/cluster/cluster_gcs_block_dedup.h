@@ -202,10 +202,19 @@ typedef enum GcsBlockDedupResult {
  *	node-dead cleanup, and backend-exit cleanup can remove entries as soon
  *	as this function releases the dedup lock, so CACHED_REPLY must be
  *	replayed from the copied entry.
+ *
+ *	PGRAC: spec-7.3 D5 — worker_id selects the per-worker dedup shard.  It
+ *	MUST equal cluster_lms_shard_for_tag(tag, cluster_lms_workers): every
+ *	message for a given block tag routes to worker[shard(tag)] (D4), so the
+ *	dedup entry for that request lives in exactly one shard.  The caller
+ *	(master-side handler) asserts shard(tag) == its own DATA channel before
+ *	calling here.  worker_id out of [0, live shard count) is a mis-route
+ *	(序破坏, 8.A): fail-closed → FULL + misroute_failclosed_count++, never
+ *	served from a wrong shard.
  */
 extern GcsBlockDedupResult
-cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTag tag,
-										   uint8 transition_id,
+cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey *key,
+										   BufferTag tag, uint8 transition_id,
 										   GcsBlockDedupEntry *cached_reply_out);
 
 /*
@@ -223,17 +232,20 @@ extern void cluster_gcs_block_dedup_register_backend_exit_hook(void);
  *	block_data may be NULL for non-GRANTED status; the entry's block_data
  *	field is zero-filled in that case.
  */
-extern void cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key,
+extern void cluster_gcs_block_dedup_install_reply(int worker_id, const GcsBlockDedupKey *key,
 												  GcsBlockReplyStatus status,
 												  const GcsBlockReplyHeader *header,
 												  const char *block_data);
-extern void
-cluster_gcs_block_dedup_install_reply_ex(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
-										 const GcsBlockReplyHeader *header, const char *block_data,
-										 const ClusterSfDepVec *sf_dep_vec, bool has_sf_dep);
+extern void cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *key,
+													 GcsBlockReplyStatus status,
+													 const GcsBlockReplyHeader *header,
+													 const char *block_data,
+													 const ClusterSfDepVec *sf_dep_vec,
+													 bool has_sf_dep);
 
-/* Remove a specific entry by key (rare path; mostly used by tests). */
-extern void cluster_gcs_block_dedup_remove(const GcsBlockDedupKey *key);
+/* Remove a specific entry by key (rare path; mostly used by tests).
+ * worker_id selects the shard (spec-7.3 D5). */
+extern void cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key);
 
 
 /* ============================================================
@@ -280,6 +292,21 @@ extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
 extern uint64 cluster_gcs_block_dedup_get_full_count(void);
 extern uint64 cluster_gcs_block_dedup_get_in_flight_count(void);
+
+/*
+ * PGRAC: spec-7.3 D5 — count of dedup accesses rejected because worker_id
+ * fell outside [0, live shard count).  A mis-route (a block tag reaching
+ * the wrong LMS worker) is a code-path invariant violation (D3 HELLO
+ * negotiates a cluster-wide n_workers; D1 shard() is byte-identical on
+ * both ends), so this stays 0 in a healthy cluster.  A non-zero value is
+ * a fail-closed drop (8.A), never a wrong-shard serve.  Summed across all
+ * shards but stored once in the always-present ctl header.
+ */
+extern uint64 cluster_gcs_block_dedup_get_misroute_failclosed_count(void);
+
+/* Record a mis-routed dedup access (shard(tag) != serving worker); shared
+ * by the module bounds guard and the master-side handler (spec-7.3 D5). */
+extern void cluster_gcs_block_dedup_note_misroute(void);
 
 
 /* ============================================================
