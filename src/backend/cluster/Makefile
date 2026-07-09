@@ -145,6 +145,7 @@ OBJS = \
 	cluster_lms.o \
 	cluster_lms_data_plane.o \
 	cluster_lms_outbound.o \
+	cluster_lms_shard.o \
 	cluster_lns.o \
 	cluster_membership.o \
 	cluster_mrp.o \
