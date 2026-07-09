@@ -60,12 +60,25 @@ typedef struct ClusterGcsBlockDedupShared {
 	pg_atomic_uint64 miss_count;	  /* MISS_REGISTERED paths */
 	pg_atomic_uint64 collision_count; /* HC91 VALIDATION_FAIL */
 	pg_atomic_uint64 full_count;	  /* HC92 FULL */
+	pg_atomic_uint64 evict_count;	  /* spec-7.2a: eager reclaim + TTL sweep removed */
 	pg_atomic_uint32 entry_count;	  /* live in-flight + completed entries */
 } ClusterGcsBlockDedupShared;
 
 static ClusterGcsBlockDedupShared *cluster_gcs_block_dedup_shared = NULL;
 static HTAB *cluster_gcs_block_dedup_htab = NULL;
 static bool dedup_backend_exit_hook_registered = false;
+
+/*
+ * Upper bound on entries examined per cap-full eager-reclaim probe.  We do
+ * NOT full-scan the HTAB under the exclusive lock on every cap-full MISS
+ * (spec-7.2a §6 "非全扫"): if no reclaim-safe entry is found within the probe
+ * budget, fall back to the fail-closed HC92 path.
+ */
+#define GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE 256
+
+/* Forward declarations for GC helpers used by the MISS-path eager reclaim. */
+static int64 dedup_expiry_threshold_us(void);
+static int dedup_reclaim_reclaimable_locked(TimestampTz now, int want);
 
 
 static int
@@ -125,6 +138,7 @@ cluster_gcs_block_dedup_shmem_init(void)
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->miss_count, 0);
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->collision_count, 0);
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->full_count, 0);
+		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->evict_count, 0);
 		pg_atomic_init_u32(&cluster_gcs_block_dedup_shared->entry_count, 0);
 	}
 
@@ -245,6 +259,17 @@ cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTa
 	 * with cap reached; convert to FULL fail-closed (HC92). */
 	entry = (GcsBlockDedupEntry *)hash_search(cluster_gcs_block_dedup_htab, key, HASH_ENTER_NULL,
 											  &found);
+	if (entry == NULL) {
+		/* PGRAC: spec-7.2a D1 — before failing closed, try to reclaim one
+		 * reclaim-safe entry (aged past the 2x window, or a site-proven
+		 * idempotent status) to make room.  Reclaim never removes an entry
+		 * whose retransmitted duplicate could still be served incorrectly
+		 * (§3.1); if nothing is safe to reclaim, keep the fail-closed HC92
+		 * behavior below. */
+		if (dedup_reclaim_reclaimable_locked(GetCurrentTimestamp(), 1) > 0)
+			entry = (GcsBlockDedupEntry *)hash_search(cluster_gcs_block_dedup_htab, key,
+													  HASH_ENTER_NULL, &found);
+	}
 	if (entry == NULL) {
 		pg_atomic_fetch_add_u64(&cluster_gcs_block_dedup_shared->full_count, 1);
 		LWLockRelease(&cluster_gcs_block_dedup_shared->lock.lock);
@@ -381,6 +406,57 @@ dedup_expiry_threshold_us(void)
 	return total_backoff_ms * 1000 * 2; /* × 2 safety margin (HC93) */
 }
 
+/*
+ * dedup_reclaim_reclaimable_locked -- caller MUST hold the dedup lock
+ * exclusively.  Under cap pressure (HASH_ENTER_NULL about to fail), scan the
+ * HTAB and remove up to `want` reclaim-safe entries so the MISS path can
+ * register instead of failing closed (spec-7.2a D1).
+ *
+ * Only entries GcsBlockDedupEntryIsReclaimSafe() approves are removed: an
+ * entry aged past the 2x out-of-window threshold (safe for every status,
+ * §3.1 theorem) or one whose status is site-proven in-window idempotent
+ * (whitelist currently empty).  Reclaim NEVER removes an entry whose
+ * retransmitted duplicate could be re-served incorrectly — it only ever
+ * brings the FULL path forward in time, never sacrifices correctness.
+ *
+ * The scan is bounded to GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE entries so a table
+ * full of in-window entries does not turn every MISS into a full O(cap) scan
+ * under the exclusive lock (spec-7.2a §6).  Returns the number reclaimed.
+ */
+static int
+dedup_reclaim_reclaimable_locked(TimestampTz now, int want)
+{
+	HASH_SEQ_STATUS seq;
+	GcsBlockDedupEntry *entry;
+	int64 out_of_window_us;
+	int reclaimed = 0;
+	int probed = 0;
+
+	if (want <= 0)
+		return 0;
+
+	out_of_window_us = dedup_expiry_threshold_us();
+
+	hash_seq_init(&seq, cluster_gcs_block_dedup_htab);
+	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
+		if (GcsBlockDedupEntryIsReclaimSafe(entry, now, out_of_window_us)) {
+			(void)hash_search(cluster_gcs_block_dedup_htab, &entry->key, HASH_REMOVE, NULL);
+			reclaimed++;
+		}
+
+		if (reclaimed >= want || ++probed >= GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE) {
+			hash_seq_term(&seq); /* early break must terminate the scan */
+			break;
+		}
+	}
+
+	if (reclaimed > 0) {
+		pg_atomic_fetch_sub_u32(&cluster_gcs_block_dedup_shared->entry_count, (uint32)reclaimed);
+		pg_atomic_fetch_add_u64(&cluster_gcs_block_dedup_shared->evict_count, (uint64)reclaimed);
+	}
+	return reclaimed;
+}
+
 void
 cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 {
@@ -412,8 +488,11 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		}
 	}
 
-	if (removed > 0)
+	if (removed > 0) {
 		pg_atomic_fetch_sub_u32(&cluster_gcs_block_dedup_shared->entry_count, (uint32)removed);
+		/* spec-7.2a D5: evict_count aggregates eager reclaim + TTL sweep. */
+		pg_atomic_fetch_add_u64(&cluster_gcs_block_dedup_shared->evict_count, (uint64)removed);
+	}
 
 	LWLockRelease(&cluster_gcs_block_dedup_shared->lock.lock);
 }
@@ -507,6 +586,14 @@ cluster_gcs_block_dedup_get_in_flight_count(void)
 {
 	return cluster_gcs_block_dedup_shared
 			   ? (uint64)pg_atomic_read_u32(&cluster_gcs_block_dedup_shared->entry_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_block_dedup_get_evict_count(void)
+{
+	return cluster_gcs_block_dedup_shared
+			   ? pg_atomic_read_u64(&cluster_gcs_block_dedup_shared->evict_count)
 			   : 0;
 }
 

@@ -732,7 +732,7 @@ bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
  * Off keeps the pre-7.1a floor: a TERMINAL remote writer holder fails
  * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
 bool cluster_crossnode_write_write = false;
-int cluster_gcs_block_dedup_max_entries = 1024;
+int cluster_gcs_block_dedup_max_entries = 4096; /* spec-7.2a: raised from 1024 */
 
 /*
  * PGRAC: spec-4.7 D1 — cluster.gcs_block_recovery_wait_ms.  Bounded backend
@@ -3946,14 +3946,17 @@ cluster_init_guc(void)
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",
 							gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
-							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8312B.  "
-										 "Default 1024 → ~8.4MB shmem on each node serving as "
-										 "GCS block-ship master; bootstrap/initdb with no "
-										 "configured cluster.node_id does not allocate the HTAB.  "
-										 "HASH_ENTER_NULL on cap → "
+							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8448B.  "
+										 "Default 4096 → ~34.7MB shmem on each node serving as "
+										 "GCS block-ship master; ceiling 65536 → ~554MB; "
+										 "bootstrap/initdb with no configured cluster.node_id does "
+										 "not allocate the HTAB.  Under cap pressure the master "
+										 "eagerly reclaims reclaim-safe entries before failing "
+										 "closed; HASH_ENTER_NULL on a still-full table → "
 										 "DENIED_DEDUP_FULL fail-closed (sender retries via "
-										 "HC96 transient).  HC92.  PGC_POSTMASTER."),
-							&cluster_gcs_block_dedup_max_entries, 1024, 256, 16384, PGC_POSTMASTER,
+										 "HC96 transient).  HC92.  PGC_POSTMASTER (restart to "
+										 "change the fixed HTAB size)."),
+							&cluster_gcs_block_dedup_max_entries, 4096, 256, 65536, PGC_POSTMASTER,
 							0, NULL, NULL, NULL);
 
 	/*

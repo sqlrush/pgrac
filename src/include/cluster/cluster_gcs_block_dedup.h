@@ -361,6 +361,7 @@ extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
 extern uint64 cluster_gcs_block_dedup_get_full_count(void);
 extern uint64 cluster_gcs_block_dedup_get_in_flight_count(void);
+extern uint64 cluster_gcs_block_dedup_get_evict_count(void); /* spec-7.2a D5 */
 
 
 /* ============================================================
