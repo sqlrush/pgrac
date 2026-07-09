@@ -386,15 +386,21 @@ cluster_lms_get_pid(void)
 }
 
 /*
- * PGRAC: spec-7.2 D4 — wake the LMS data-plane loop (mirror of
- * cluster_lmon_wakeup):  SIGUSR1 → lms_sigusr1_handler → SetLatch.
- * Safe from any context;  self-kick and pre-spawn calls no-op.
+ * PGRAC: spec-7.2 D4 + spec-7.3 D4 — wake DATA worker worker_id's data-plane
+ * loop (SIGUSR1 → lms_sigusr1_handler → SetLatch).  worker 0's pid is
+ * published to worker_pids[0] by LmsMain, workers 1..7 by LmsWorkerMain, so
+ * this is uniform across the pool.  Safe from any context;  self-kick,
+ * out-of-range and pre-spawn calls no-op.
  */
 void
-cluster_lms_wakeup(void)
+cluster_lms_wakeup(int worker_id)
 {
-	pid_t pid = cluster_lms_get_pid();
+	pid_t pid;
 
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return;
+
+	pid = cluster_lms_get_worker_pid(worker_id);
 	if (pid <= 0 || pid == MyProcPid)
 		return;
 
@@ -709,9 +715,12 @@ LmsMain(void)
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
 
-	/* Publish STARTING + record pid / spawned_at. */
+	/* Publish STARTING + record pid / spawned_at.  spec-7.3 D4: worker 0's
+	 * pid also goes to worker_pids[0] so cluster_lms_wakeup(0) is uniform with
+	 * the LmsWorker pool (backends waking DATA shard 0 use worker_pids[0]). */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	cluster_lms_state->pid = MyProcPid;
+	cluster_lms_state->worker_pids[0] = MyProcPid;
 	cluster_lms_state->spawned_at = GetCurrentTimestamp();
 	lms_set_state(CLUSTER_LMS_STARTING);
 	LWLockRelease(&cluster_lms_state->lwlock);
@@ -797,7 +806,7 @@ LmsMain(void)
 				cluster_lms_cr_ship_ready();
 				cluster_gcs_block_pi_discard_drain();
 			}
-			(void)cluster_lms_outbound_drain_send();
+			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -921,6 +930,12 @@ LmsWorkerMain(int worker_id)
 			break;
 
 		if (cluster_lms_data_plane_enabled()) {
+			/* spec-7.3 D4 — drain this worker's outbound ring (backends
+			 * staged REQUEST/FORWARD/INVALIDATE for our shard), then service
+			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
+			 * sent directly from the dispatch handler in THIS process, so
+			 * they already ride this worker's channel. */
+			(void)cluster_lms_outbound_drain_send(worker_id);
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

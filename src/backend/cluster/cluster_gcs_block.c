@@ -47,6 +47,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms_shard.h"		 /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
@@ -4531,6 +4532,68 @@ build_and_send_reply: {
 	block_payload_release_arg = NULL;
 	pfree(buf);
 }
+}
+
+
+/*
+ * cluster_gcs_block_payload_shard — spec-7.3 D4 (8.A).
+ *
+ *	Pick the DATA worker for a staged block-family frame by hashing its
+ *	BufferTag.  Only the three tag-carrying staging-path types reach the
+ *	outbound ring (REQUEST / FORWARD / INVALIDATE — each with the tag at a
+ *	fixed offset);  REPLY (no tag, request_id-correlated) and INVALIDATE-ACK
+ *	are sent DIRECTLY from the receiving worker's dispatch handler, so they
+ *	already ride the correct worker channel and never reach this function.
+ *
+ *	Returns the worker id in [0, n_workers), or -1 if the (msg_type, payload)
+ *	pair carries no routable tag.  -1 is an 8.A fail-closed signal: an
+ *	unroutable DATA frame must be REFUSED, never defaulted to a worker (that
+ *	would break per-tag order).  The size check pins the payload ABI so a
+ *	mismatched length can never read a tag from the wrong offset.
+ */
+/* spec-7.3 D4 (8.A) — the routing key is the tag at a fixed offset in each
+ * staging-path payload;  pin the offsets so a struct change can't silently
+ * move the tag and misroute (payload_shard reads &p->tag, but this makes the
+ * assumption explicit + fails the build if a field is inserted before it). */
+StaticAssertDecl(offsetof(GcsBlockRequestPayload, tag) == 16,
+				 "spec-7.3 D4: GcsBlockRequestPayload.tag offset moved");
+StaticAssertDecl(offsetof(GcsBlockForwardPayload, tag) == 16,
+				 "spec-7.3 D4: GcsBlockForwardPayload.tag offset moved");
+StaticAssertDecl(offsetof(GcsBlockInvalidatePayload, tag) == 16,
+				 "spec-7.3 D4: GcsBlockInvalidatePayload.tag offset moved");
+
+int
+cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payload_len,
+								int n_workers)
+{
+	const BufferTag *tag;
+
+	if (payload == NULL)
+		return -1;
+
+	switch (msg_type) {
+	case PGRAC_IC_MSG_GCS_BLOCK_REQUEST:
+		if (payload_len != sizeof(GcsBlockRequestPayload))
+			return -1;
+		tag = &((const GcsBlockRequestPayload *)payload)->tag;
+		break;
+	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
+		if (payload_len != sizeof(GcsBlockForwardPayload))
+			return -1;
+		tag = &((const GcsBlockForwardPayload *)payload)->tag;
+		break;
+	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:
+		if (payload_len != sizeof(GcsBlockInvalidatePayload))
+			return -1;
+		tag = &((const GcsBlockInvalidatePayload *)payload)->tag;
+		break;
+	default:
+		/* REPLY / INVALIDATE-ACK are direct-sent, not staged;  any other
+		 * DATA type would need an explicit shard key (spec-7.3 §3.6). */
+		return -1;
+	}
+
+	return cluster_lms_shard_for_tag(tag, n_workers);
 }
 
 
