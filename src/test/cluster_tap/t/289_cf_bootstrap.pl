@@ -103,6 +103,8 @@ my $disks_csv = join(',', @disks);
 # ---- IC ports ----
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ----------
 # Step 0: node0 init -> backup -> node1 init_from_backup (shared sysid).
@@ -168,9 +170,11 @@ name = cf_boot
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);
@@ -446,6 +450,8 @@ my $neg_shared = PostgreSQL::Test::Utils::tempdir();
 mkdir "$neg_shared/global" or die "mkdir neg global: $!";
 my $neg_ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $neg_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $neg_data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $neg_data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 my $neg = PostgreSQL::Test::Cluster->new('cf_boot_neg');
 $neg->init;
@@ -469,9 +475,11 @@ name = cf_boot_neg
 
 [node.0]
 interconnect_addr = 127.0.0.1:$neg_ic0
+data_addr = 127.0.0.1:$neg_data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$neg_ic1
+data_addr = 127.0.0.1:$neg_data_port1
 EOC
 
 my $nret = $neg->start(fail_ok => 1);

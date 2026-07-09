@@ -314,6 +314,22 @@ void
 cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id pg_attribute_unused())
 {}
 
+/* spec-7.2 D3 stubs: plane gates (this harness models the CONTROL-plane
+ * owner;  the plane-gate truth table is pinned in the test body). */
+static ClusterICPlane router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+static uint64 router_test_misroute_count = 0;
+
+ClusterICPlane
+cluster_ic_tier1_my_plane(void)
+{
+	return router_test_my_plane;
+}
+void
+cluster_ic_tier1_bump_plane_misroute_reject(void)
+{
+	router_test_misroute_count++;
+}
+
 /* MyBackendType -- writable from tests to flip producer scope */
 extern BackendType MyBackendType;
 BackendType MyBackendType = B_INVALID;

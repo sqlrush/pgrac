@@ -98,15 +98,19 @@ sub write_pair_conf
 	my ($node0, $node1, $cluster_name) = @_;
 	my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $conf = <<EOC;
 [cluster]
 name = $cluster_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 
 	PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $conf);

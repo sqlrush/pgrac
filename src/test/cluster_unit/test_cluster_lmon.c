@@ -200,6 +200,16 @@ int cluster_interconnect_heartbeat_interval_ms = 1000;
 int cluster_interconnect_connect_timeout_ms = 5000;
 int cluster_interconnect_recv_timeout_ms = 30000;
 
+/* spec-7.2 D1 GUC (cluster_lmon_duty_should_run references it). */
+bool cluster_ic_duty_lazy = true;
+
+/* spec-7.2 D4 stub: plane-flip registry probe (skeleton = CONTROL). */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return false;
+}
+
 #include "cluster/cluster_ic_tier1.h"
 
 int
@@ -828,6 +838,50 @@ UT_TEST(test_lmon_iteration_counters_null_safe)
 	cluster_lmon_marker_complete_wakeup();
 }
 
+/*
+ * spec-7.2 D1 -- duty classification truth table (§3.7).
+ *
+ *	Pins EVERY ClusterLmonDuty row to its never-lazy / lazy-able class.
+ *	Re-classifying a duty (or adding one) MUST update this table
+ *	deliberately -- that is the anti-drift gate against a future spec
+ *	silently sliding a correctness family into the lazy set.
+ */
+UT_TEST(test_lmon_duty_lazy_truth_table)
+{
+	/* never-lazy (correctness families) */
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_LIVENESS));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_FENCE));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GRD_DEAD_SWEEP));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GRD_RECLAIM));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GRD_STARVATION_SWEEP));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_DEADLOCK));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GES_REPLY_WAIT_SWEEP));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_DIRECT_LAND_ABORTS));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_LMS_NATIVE_PROBE_RETRY));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_CLEAN_LEAVE));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_NODE_REMOVE));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_RECONFIG));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GRD_RECOVERY));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_BOC_BROADCAST));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_SINVAL_RESET_ALL));
+	UT_ASSERT(!cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_PI_DISCARD));
+	/* lazy-able (queue-consumption families) */
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GES_WORK_QUEUE));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_SHIP_READY));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_GRD_OUTBOUND));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_SINVAL_OUT));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_TT_HINT));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_DEDUP_TTL));
+	UT_ASSERT(cluster_lmon_duty_is_lazy(CLUSTER_LMON_DUTY_BACKUP));
+	/* enum shape: lazy block is contiguous + fits the uint32 bitmask */
+	UT_ASSERT_EQ(CLUSTER_LMON_DUTY_N - CLUSTER_LMON_DUTY_LAZY_FIRST, 8);
+	/* pre-shmem safety: mark is a no-op, should_run fails open (true) */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND);
+	UT_ASSERT(cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GRD_OUTBOUND, false));
+	UT_ASSERT(cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_FENCE, false));
+}
+
 
 /* ============================================================
  * Test runner
@@ -836,13 +890,14 @@ UT_TEST(test_lmon_iteration_counters_null_safe)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
 	UT_RUN(test_lmon_status_unknown_returns_unknown);
 	UT_RUN(test_lmon_public_symbols_linkable);
 	UT_RUN(test_lmon_iteration_counters_null_safe);
+	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

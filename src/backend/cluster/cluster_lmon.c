@@ -183,6 +183,7 @@ cluster_lmon_shmem_init(void)
 		memset(cluster_lmon_state, 0, sizeof(*cluster_lmon_state));
 		LWLockInitialize(&cluster_lmon_state->lwlock, LWTRANCHE_CLUSTER_LMON);
 		cluster_lmon_state->status = CLUSTER_LMON_NOT_STARTED;
+		pg_atomic_init_u32(&cluster_lmon_state->lazy_duty_dirty, 0);
 	}
 
 	/*
@@ -625,6 +626,76 @@ cluster_lmon_wakeup(void)
 	(void)kill(pid, SIGUSR1);
 }
 
+/*
+ * PGRAC: spec-7.2 D1 -- duty-chain on-demand gating (§3.7 classification).
+ *
+ *	See the ClusterLmonDuty enum in cluster_lmon.h for the two-class
+ *	table.  The switch below has NO default case on purpose: adding an
+ *	enum entry without classifying it here is a -Wswitch warning (CI
+ *	warning budget catches it), and the unit truth table pins every row.
+ */
+bool
+cluster_lmon_duty_is_lazy(ClusterLmonDuty duty)
+{
+	switch (duty) {
+	case CLUSTER_LMON_DUTY_LIVENESS:
+	case CLUSTER_LMON_DUTY_FENCE:
+	case CLUSTER_LMON_DUTY_GRD_DEAD_SWEEP:
+	case CLUSTER_LMON_DUTY_GRD_RECLAIM:
+	case CLUSTER_LMON_DUTY_GRD_STARVATION_SWEEP:
+	case CLUSTER_LMON_DUTY_DEADLOCK:
+	case CLUSTER_LMON_DUTY_GES_REPLY_WAIT_SWEEP:
+	case CLUSTER_LMON_DUTY_DIRECT_LAND_ABORTS:
+	case CLUSTER_LMON_DUTY_LMS_NATIVE_PROBE_RETRY:
+	case CLUSTER_LMON_DUTY_CLEAN_LEAVE:
+	case CLUSTER_LMON_DUTY_NODE_REMOVE:
+	case CLUSTER_LMON_DUTY_RECONFIG:
+	case CLUSTER_LMON_DUTY_GRD_RECOVERY:
+	case CLUSTER_LMON_DUTY_BOC_BROADCAST:
+	case CLUSTER_LMON_DUTY_SINVAL_RESET_ALL:
+	case CLUSTER_LMON_DUTY_PI_DISCARD:
+		return false;
+	case CLUSTER_LMON_DUTY_GES_WORK_QUEUE:
+	case CLUSTER_LMON_DUTY_SHIP_READY:
+	case CLUSTER_LMON_DUTY_GRD_OUTBOUND:
+	case CLUSTER_LMON_DUTY_SINVAL_OUT:
+	case CLUSTER_LMON_DUTY_SINVAL_ACK_OUT:
+	case CLUSTER_LMON_DUTY_TT_HINT:
+	case CLUSTER_LMON_DUTY_DEDUP_TTL:
+	case CLUSTER_LMON_DUTY_BACKUP:
+		return true;
+	case CLUSTER_LMON_DUTY_N:
+		break;
+	}
+	return false;
+}
+
+void
+cluster_lmon_duty_mark_dirty(ClusterLmonDuty duty)
+{
+	if (cluster_lmon_state == NULL)
+		return; /* pre-shmem: the >= 1 Hz floor covers it */
+	if (!cluster_lmon_duty_is_lazy(duty))
+		return;
+	pg_atomic_fetch_or_u32(&cluster_lmon_state->lazy_duty_dirty,
+						   1u << (duty - CLUSTER_LMON_DUTY_LAZY_FIRST));
+}
+
+bool
+cluster_lmon_duty_should_run(ClusterLmonDuty duty, bool force_all)
+{
+	uint32 bit;
+	uint32 old;
+
+	if (!cluster_lmon_duty_is_lazy(duty))
+		return true;
+	if (!cluster_ic_duty_lazy || force_all || cluster_lmon_state == NULL)
+		return true;
+	bit = 1u << (duty - CLUSTER_LMON_DUTY_LAZY_FIRST);
+	old = pg_atomic_fetch_and_u32(&cluster_lmon_state->lazy_duty_dirty, ~bit);
+	return (old & bit) != 0;
+}
+
 TimestampTz
 cluster_lmon_spawned_at(void)
 {
@@ -1023,6 +1094,7 @@ LmonMain(void)
 		int rdma_cm_fd = -1;
 		int rdma_cq_fd = -1;
 		TimestampTz next_heartbeat_at;
+		TimestampTz next_duty_floor_at; /* PGRAC: spec-7.2 D1 lazy-duty floor */
 		int32 self_id = cluster_node_id;
 		int32 pi;
 
@@ -1044,6 +1116,7 @@ LmonMain(void)
 		}
 
 		next_heartbeat_at = GetCurrentTimestamp() + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+		next_duty_floor_at = 0; /* PGRAC: spec-7.2 D1 — first iteration forces all duties */
 
 		for (;;) {
 			WaitEvent ev[2 * CLUSTER_MAX_NODES + 4];
@@ -1052,6 +1125,7 @@ LmonMain(void)
 			TimestampTz now;
 			TimestampTz iter_started_at;
 			int32 i;
+			bool force_all_duties;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -1064,6 +1138,20 @@ LmonMain(void)
 				break;
 
 			iter_started_at = GetCurrentTimestamp();
+
+			/*
+			 * PGRAC: spec-7.2 D1 -- >= 1 Hz floor for the lazy duty
+			 * families (§3.5 backstop): every lazy-able drain runs at
+			 * least once per heartbeat interval even if its producer
+			 * never marked it dirty.  Never-lazy duties ignore this and
+			 * run every iteration, order verbatim.  Reuse the iteration
+			 * start timestamp (stage7-p0 profiling) as "now".
+			 */
+			now = iter_started_at;
+			force_all_duties = (now >= next_duty_floor_at);
+			if (force_all_duties)
+				next_duty_floor_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+
 			lmon_advance_liveness_tick();
 
 			/*
@@ -1121,10 +1209,15 @@ LmonMain(void)
 			 * point but the read returns false in the skeleton path because
 			 * LMS never advances past STARTING for the ownership purpose.
 			 */
-			cluster_ges_lmon_drain_work_queue();
+			/* PGRAC: spec-7.2 D1 — lazy-gated (producer marks dirty at
+			 * enqueue; >= 1 Hz floor backstops a missed mark). */
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE, force_all_duties))
+				cluster_ges_lmon_drain_work_queue();
 			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			cluster_lms_cr_ship_ready();
+			if (!cluster_gcs_block_family_on_data_plane()
+				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+				cluster_lms_cr_ship_ready();
 			/*
 			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
 			 * tombstones whose bounded TTL has elapsed.  This is the documented
@@ -1136,7 +1229,8 @@ LmonMain(void)
 			 * wait table full" (cap = cluster.ges_reply_wait_max_entries).
 			 */
 			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
-			cluster_grd_outbound_lmon_drain_send();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GRD_OUTBOUND, force_all_duties))
+				cluster_grd_outbound_lmon_drain_send();
 			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			cluster_lms_native_probe_retry_tick();
 
@@ -1167,14 +1261,21 @@ LmonMain(void)
 			 * in LMON because LMON owns the process-local IC fds.
 			 */
 			cluster_scn_lmon_drain_boc_broadcast();
-			cluster_sinval_drain_outbound_and_broadcast();
-			cluster_sinval_drain_ack_outbound_and_send();
+			/* PGRAC: spec-7.2 D1 — sinval outbound drains are lazy-gated;
+			 * the RESET-all sentinel below stays never-lazy (order-
+			 * sensitive protocol, §3.6). */
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
+				cluster_sinval_drain_outbound_and_broadcast();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT, force_all_duties))
+				cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();
 
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
-			cluster_tt_status_hint_drain_outbound();
-			cluster_backup_lmon_tick();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
+				cluster_tt_status_hint_drain_outbound();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
+				cluster_backup_lmon_tick();
 
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
@@ -1182,14 +1283,17 @@ LmonMain(void)
 			 * 2 × max_retransmit_window age and in-flight entries
 			 * abandoned past the same threshold.  Runs in LMON context
 			 * with raw LWLock + hash_seq (per L150;  no buffer pin / no
-			 * ResourceOwner).
+			 * ResourceOwner).  PGRAC: spec-7.2 D1 — TTL/time-based, so
+			 * floor-driven (>= 1 Hz), no producer mark.
 			 */
-			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
+				cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
 			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard write
 			 * notes and route each to the block's master (fire-and-forget;
 			 * only LMON owns the tier1 fds, L172 family). */
-			cluster_gcs_block_pi_discard_drain();
+			if (!cluster_gcs_block_family_on_data_plane())
+				cluster_gcs_block_pi_discard_drain();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
@@ -1701,9 +1805,13 @@ LmonMain(void)
 			cluster_ic_rdma_lmon_stop();
 	} else {
 		/* Stub / mock / disabled mode -- preserve spec-1.11 simple loop. */
+		TimestampTz next_duty_floor_at = 0; /* PGRAC: spec-7.2 D1 lazy-duty floor */
+
 		for (;;) {
 			int rc;
 			TimestampTz iter_started_at;
+			bool force_all_duties;
+			TimestampTz dnow;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -1716,6 +1824,14 @@ LmonMain(void)
 				break;
 
 			iter_started_at = GetCurrentTimestamp();
+
+			/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
+			dnow = iter_started_at;
+			force_all_duties = (dnow >= next_duty_floor_at);
+			if (force_all_duties)
+				next_duty_floor_at
+					= dnow + (int64)cluster_interconnect_heartbeat_interval_ms * INT64CONST(1000);
+
 			lmon_advance_liveness_tick();
 
 			/*
@@ -1771,26 +1887,36 @@ LmonMain(void)
 			 * so the outbound drain is intentionally NOT hoisted (a stub
 			 * single node has no peers to send to).
 			 */
-			cluster_ges_lmon_drain_work_queue();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE, force_all_duties))
+				cluster_ges_lmon_drain_work_queue();
 			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			cluster_lms_cr_ship_ready();
+			if (!cluster_gcs_block_family_on_data_plane()
+				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+				cluster_lms_cr_ship_ready();
 
-			cluster_sinval_drain_outbound_and_broadcast();
-			cluster_sinval_drain_ack_outbound_and_send();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
+				cluster_sinval_drain_outbound_and_broadcast();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT, force_all_duties))
+				cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();
 
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
-			cluster_tt_status_hint_drain_outbound();
-			cluster_backup_lmon_tick();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
+				cluster_tt_status_hint_drain_outbound();
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
+				cluster_backup_lmon_tick();
 
-			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
-			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB.
+			 * PGRAC: spec-7.2 D1 — TTL/time-based, floor-driven. */
+			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
+				cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
 			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard notes. */
-			cluster_gcs_block_pi_discard_drain();
+			if (!cluster_gcs_block_family_on_data_plane())
+				cluster_gcs_block_pi_discard_drain();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 

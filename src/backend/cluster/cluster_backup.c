@@ -1099,6 +1099,7 @@ cluster_backup_coord_request(ClusterBackupWireOp op, const char *backup_id,
 	}
 	cluster_backup_state->coordinator_send_pending = true;
 	LWLockRelease(&cluster_backup_state->lock.lock);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_BACKUP); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 
 	started_at = GetCurrentTimestamp();
@@ -1278,6 +1279,7 @@ cluster_backup_lmon_queue_peer_reply(const ClusterBackupWireAck *reply, int32 de
 	cluster_backup_state->peer_reply_dest = dest;
 	cluster_backup_state->peer_reply_pending = true;
 	LWLockRelease(&cluster_backup_state->lock.lock);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_BACKUP); /* spec-7.2 D1 */
 }
 
 static bool
@@ -1301,6 +1303,7 @@ cluster_backup_lmon_start_restore_point_prepare(const ClusterBackupWireRequest *
 		cluster_backup_lmon_prepare_started_at = cluster_backup_restore_point_fence_start();
 		cluster_backup_lmon_restore_point_prepare_pending = true;
 		cluster_backup_lmon_set_prepare_pending(true);
+		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_BACKUP); /* spec-7.2 D1 */
 		return false;
 	}
 
@@ -1712,6 +1715,7 @@ cluster_backup_request_handler(const ClusterICEnvelope *env, const void *payload
 		cluster_backup_state->peer_command_pending = true;
 	}
 	LWLockRelease(&cluster_backup_state->lock.lock);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_BACKUP); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 }
 
@@ -1896,6 +1900,8 @@ cluster_backup_lmon_process_peer_command(void)
 void
 cluster_backup_lmon_tick(void)
 {
+	bool in_flight;
+
 	if (cluster_backup_state == NULL || !cluster_enabled)
 		return;
 
@@ -1906,6 +1912,26 @@ cluster_backup_lmon_tick(void)
 	cluster_backup_lmon_advance_restore_point_prepare();
 	cluster_backup_lmon_send_peer_reply();
 	cluster_backup_maybe_auto_restore_point();
+
+	/*
+	 * PGRAC: spec-7.2 D1 -- the backup protocol is multi-phase and its
+	 * advance steps are time-driven (fence quiesce), not producer-driven.
+	 * While any operation is in flight, self-re-mark the duty so the
+	 * lazy gate keeps the legacy every-iteration cadence until the
+	 * protocol settles; steady state (no backup) reaps the lazy skip.
+	 */
+	if (cluster_backup_lmon_restore_point_prepare_pending)
+		in_flight = true;
+	else {
+		LWLockAcquire(&cluster_backup_state->lock.lock, LW_SHARED);
+		in_flight = cluster_backup_state->peer_reply_pending
+					|| cluster_backup_state->coordinator_send_pending
+					|| cluster_backup_state->peer_command_pending
+					|| cluster_backup_state->peer_restore_point_prepare_pending;
+		LWLockRelease(&cluster_backup_state->lock.lock);
+	}
+	if (in_flight)
+		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_BACKUP);
 }
 
 static void

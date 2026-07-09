@@ -710,7 +710,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
  * HC92 + HC97 — see cluster_guc.h for semantics.
  */
 int cluster_gcs_block_retransmit_max_retries = 4;
-int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 10; /* spec-7.2 D1 */
 
 /* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch.
  * ON (default): the bufmgr acquire gate skips the remote master round-trip when
@@ -723,6 +723,7 @@ bool cluster_gcs_block_local_cache = true;
  * remote row-lock conflict block until the holder completes; off reverts to
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
+bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -3882,14 +3883,28 @@ cluster_init_guc(void)
 							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
 							 NULL);
 
+	DefineCustomBoolVariable(
+		"cluster.ic_duty_lazy",
+		gettext_noop("Run lazy-able LMON duty-chain drains on demand instead of every iteration."),
+		gettext_noop("When on (default), the queue-consumption duty families in the "
+					 "LMON main loop (outbound drains / ship-ready / sinval out / "
+					 "tt-hint / dedup TTL / backup / GES work queue) run only when "
+					 "their producer marked them dirty or on the >= 1 Hz floor.  "
+					 "Correctness families (fence / sweeps / reconfig / recovery) "
+					 "always run every iteration.  Off restores the run-every-"
+					 "iteration behavior (escape hatch).  spec-7.2 D1.  PGC_SIGHUP."),
+		&cluster_ic_duty_lazy, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),
 		gettext_noop("Exponential backoff base for GCS block-ship retransmit:  "
 					 "retry 1 waits this much, retry 2 doubles, etc.  Default "
-					 "100 → 100/200/400/800 ms for N=4 retries (total 1500 ms).  "
-					 "HC97.  PGC_SUSET."),
-		&cluster_gcs_block_retransmit_initial_backoff_ms, 100, 10, 5000, PGC_SUSET, 0, NULL, NULL,
+					 "10 → 10/20/40/80 ms for N=4 retries (total 150 ms;  LAN "
+					 "RTT scale, spec-7.2 D1).  Raise on slow or congested "
+					 "interconnects.  The per-attempt reply wait itself stays "
+					 "cluster.gcs_reply_timeout_ms.  HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_initial_backoff_ms, 10, 1, 5000, PGC_SUSET, 0, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",

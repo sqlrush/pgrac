@@ -25,6 +25,7 @@
 
 #include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 enqueue wakeup */
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h" /* IsBootstrapProcessingMode */
 #include "storage/lwlock.h"
@@ -119,6 +120,20 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	cluster_grd_work_queue_state->count++;
 
 	LWLockRelease(cluster_grd_work_queue_lock);
+
+	/*
+	 * PGRAC: spec-7.2 D1 -- wake the drain consumer (LMON) on enqueue,
+	 * mirroring the cluster_grd_outbound enqueue family.  Without this a
+	 * locally-mastered GES request sat in the queue until LMON woke for
+	 * some other reason (worst case a full heartbeat interval, <= 1s),
+	 * which made local-master lock requests slower than remote-master
+	 * ones.  Publish-before-signal: the slot is visible (released the
+	 * LWLock above) before the wakeup fires.
+	 * Spec: spec-7.2-ic-data-plane-decoupling.md
+	 */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GES_WORK_QUEUE);
+	cluster_lmon_wakeup();
+
 	return true;
 }
 

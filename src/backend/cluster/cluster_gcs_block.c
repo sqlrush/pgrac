@@ -283,10 +283,54 @@ typedef struct ClusterGcsBlockShared {
 					   * comparable version unit (per-thread WAL makes
 					   * cross-node LSN comparison meaningless) */
 	} pi_note_ring[CLUSTER_GCS_PI_NOTE_RING_SIZE];
+
+	/* PGRAC: spec-7.2 D6 — requester-side block-ship latency histogram.
+	 * Bucketed at the single normal-exit funnel of
+	 * cluster_gcs_send_block_request_and_wait (GRANTED / STORAGE_FALLBACK /
+	 * READ_IMAGE completions only;  ereport exits lose the sample, mirroring
+	 * the xp scopes).  This is the ruler for the spec-7.2 value gate
+	 * (ship p99 < 20ms, p50 < 5ms) and the 7.7/7.8 wait-closure legs. */
+	pg_atomic_uint64 ship_latency_hist[CLUSTER_GCS_SHIP_HIST_BUCKETS];
 } ClusterGcsBlockShared;
 
 
 static ClusterGcsBlockShared *ClusterGcsBlock = NULL;
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram bucket upper bounds (us).
+ * 15 bounds -> 16 buckets;  the last bucket is the +inf overflow. */
+static const uint64 gcs_ship_hist_bounds_us[CLUSTER_GCS_SHIP_HIST_BUCKETS - 1]
+	= { 500,	1000,	2000,	 5000,	  10000,   20000,	 50000,	  100000,
+		200000, 500000, 1000000, 2000000, 5000000, 10000000, 30000000 };
+
+/*
+ * PGRAC: spec-7.2 D3/D4 — registry probe:  is the GCS block family on
+ * the DATA plane?  REPLY stands in for all five (they flip atomically,
+ * H-5).  Both LMON tick sites (ship_ready / pi_discard) and the LMS
+ * data-plane loop consult this so the flip commit only edits the six
+ * registration structs and everything pivots at once.
+ */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	const ClusterICMsgTypeInfo *info = cluster_ic_get_msg_type_info(PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+
+	return info != NULL && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA;
+}
+
+/* Record one completed ship into the histogram (requester context). */
+static void
+gcs_block_ship_hist_record(TimestampTz started_at)
+{
+	uint64 elapsed_us;
+	int b = 0;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+	elapsed_us = (uint64)(GetCurrentTimestamp() - started_at);
+	while (b < CLUSTER_GCS_SHIP_HIST_BUCKETS - 1 && elapsed_us > gcs_ship_hist_bounds_us[b])
+		b++;
+	pg_atomic_fetch_add_u64(&ClusterGcsBlock->ship_latency_hist[b], 1);
+}
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 
 
@@ -383,6 +427,9 @@ cluster_gcs_block_shmem_init(void)
 
 	if (!found) {
 		memset(ClusterGcsBlock, 0, sizeof(*ClusterGcsBlock));
+		/* PGRAC: spec-7.2 D6 — ship-latency histogram buckets. */
+		for (i = 0; i < CLUSTER_GCS_SHIP_HIST_BUCKETS; i++)
+			pg_atomic_init_u64(&ClusterGcsBlock->ship_latency_hist[i], 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_request_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_reply_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_timeout_count, 0);
@@ -1369,6 +1416,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	ClusterXpScope xp_recv;
 	bool xp_is_read;
 	bool xp_is_index;
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp. */
+	TimestampTz ship_started_at;
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1419,6 +1468,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		cluster_xp_begin(&xp_idx, CLXP_I_INDEX_BLOCK_XFER);
 	else
 		xp_idx.active = false;
+
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp (always on,
+	 * unlike the GUC-gated xp scopes above;  the histogram is the value-
+	 * gate ruler so it must not depend on profiling being enabled). */
+	ship_started_at = GetCurrentTimestamp();
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)transition_id, current_master, &request_id);
@@ -2008,6 +2062,13 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	 * paths above simply lose the sample (stack scope, harmless). */
 	cluster_xp_end(&xp_idx);
 	cluster_xp_end(&xp_req);
+
+	/* PGRAC: spec-7.2 D6 — record the completed ship into the latency
+	 * histogram (GRANTED / STORAGE_FALLBACK / READ_IMAGE all delivered a
+	 * usable page;  the terminal-denied tail below ereports and loses the
+	 * sample, mirroring the xp scopes). */
+	if (granted || granted_storage_fallback || read_image)
+		gcs_block_ship_hist_record(ship_started_at);
 
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
@@ -3370,6 +3431,24 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		|| (cluster_grd_join_remaster_active_for_shard(req->tag)
 			&& !cluster_grd_block_view_rebuilt(req->tag))) {
 		cluster_grd_inc_join_block_failclosed();
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.2 D5 — master-side fail-stop episode fence, symmetric
+	 * with the requester-side acquire gate (cluster_pcm_lock.c).  While a
+	 * dead static master's block resources are mid-episode (survivor
+	 * re-declare not yet complete, or merged replay not yet materialized),
+	 * serving a request here could grant a block whose surviving holder
+	 * has not re-declared yet (phantom-holder overtake window).  The
+	 * requester-side gate cannot close this alone: a remote requester with
+	 * a stale view routes here directly.  Fail-closed before any dedup /
+	 * state change;  DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L
+	 * (retry-safe).  phase_for_tag counts the hit itself.
+	 */
+	if (cluster_gcs_block_phase_for_tag(req->tag) == GCS_BLOCK_RECOVERING) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
 							 InvalidXLogRecPtr, NULL);
 		return;
@@ -5444,31 +5523,48 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 /* ============================================================
  * Dispatch table registration.
+ *
+ * PGRAC: spec-7.2 flip — the five block-family msg_types (REQUEST /
+ * REPLY / FORWARD / INVALIDATE / INVALIDATE_ACK) are registered on
+ * the DATA plane:  the LMS-owned tier1 instance carries their frames,
+ * the LMS loop dispatches them, and the producer mask admits the LMS
+ * family for the drain-and-send leg.  All five flip in this one edit
+ * (H-5: no half-migrated window;  the registry probe above pivots the
+ * LMON tick sites and the LMS loop automatically).  REDECLARE alone
+ * stays on the CONTROL plane (r4): recovery re-declare must survive a
+ * DATA-mesh teardown mid-episode, and the REDECLARE -> REDECLARE_DONE
+ * pair may not be split across planes.
  * ============================================================ */
 
 static const ClusterICMsgTypeInfo gcs_block_request_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
 	.name = "gcs_block_request",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_request_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_reply_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 	.name = "gcs_block_reply",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_reply_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 /* PGRAC: spec-2.35 D8 — holder-side forward handler msg_type registration. */
 static const ClusterICMsgTypeInfo gcs_block_forward_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 	.name = "gcs_block_forward",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_forward_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6185,20 +6281,25 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 }
 
 
+/* PGRAC: spec-7.2 flip — DATA plane (see the dispatch-table comment). */
 static const ClusterICMsgTypeInfo gcs_block_invalidate_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
 	.name = "gcs_block_invalidate",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
 	.name = "gcs_block_invalidate_ack",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_ack_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6285,12 +6386,18 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 }
 
 
+/* PGRAC: spec-7.2 flip (r4) — REDECLARE stays on the CONTROL plane:
+ * survivor re-declare and its DONE barrier belong to the LMON-owned
+ * recovery episode and must not depend on the DATA mesh being up.
+ * None of the five migrated handlers emits REDECLARE (D0-①b audit),
+ * so no cross-plane staging leg is required here. */
 static const ClusterICMsgTypeInfo gcs_block_redeclare_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REDECLARE,
 	.name = "gcs_block_redeclare",
 	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_redeclare_envelope,
+	.plane = CLUSTER_IC_PLANE_CONTROL,
 };
 
 
@@ -6358,6 +6465,25 @@ uint64
 cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_ship_bytes_total) : 0;
+}
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram accessors (dump + tests). */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	if (bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	if (bucket == CLUSTER_GCS_SHIP_HIST_BUCKETS - 1)
+		return UINT64_MAX; /* +inf overflow bucket */
+	return gcs_ship_hist_bounds_us[bucket];
+}
+
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	if (ClusterGcsBlock == NULL || bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	return pg_atomic_read_u64(&ClusterGcsBlock->ship_latency_hist[bucket]);
 }
 
 /* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */

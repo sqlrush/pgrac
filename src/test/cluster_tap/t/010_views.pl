@@ -50,8 +50,8 @@ $node->start;
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'118',
-	'pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+	'120',
+	'pg_stat_cluster_wait_events returns 120 rows (spec-7.2 LMS data-plane waits)');
 
 is($node->safe_psql(
 		'postgres',
@@ -88,7 +88,7 @@ my %expected = (
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
-	'Cluster: Interconnect' => 9,	# spec-6.13: +busypoll + inline send waits
+	'Cluster: Interconnect' => 11,	# spec-6.13: +busypoll + inline send waits; spec-7.2 D6: +LmsDataRecv/Send
 	'Cluster: Undo' => 4,
 	'Cluster: ADG' => 4,
 );
