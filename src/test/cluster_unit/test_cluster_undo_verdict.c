@@ -36,8 +36,10 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"			/* ClusterGcsUndoVerdictPage + wire kinds */
-#include "cluster/cluster_runtime_visibility.h" /* ClusterVisTtProof */
+#include "cluster/cluster_runtime_visibility.h" /* ClusterVisTtProof + covers policy */
 #include "cluster/cluster_scn.h"				/* SCN, InvalidScn */
+#include "cluster/cluster_undo_gcs.h"			/* cluster_undo_grant_armed (D3-2 pin) */
+#include "cluster/cluster_undo_resid.h"			/* cluster_undo_resid_encode (D3-2 pin) */
 #include "cluster/cluster_undo_verdict.h"
 
 #undef printf
@@ -47,6 +49,13 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/*
+ * Stub self-node global.  cluster_undo_gcs.o (the D2 routing object linked for
+ * the D3-2 armed-gate pin) resolves cluster_node_id from cluster_guc.c in a
+ * real backend; the test owns it so the routing object links standalone.
+ */
+int cluster_node_id = 0;
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -160,13 +169,95 @@ UT_TEST(test_undo_verdict_from_block_proof_mapping)
 	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 }
 
+/* ======================================================================
+ * U4 -- resid encoding contract the D3-2 CP3 path composes (spec-5.22c
+ * §2.3): owner->field4, seg->field1, block0->field2, gen->field3; the master
+ * of an undo resid IS the encoded owner (owner-as-master, never a hash).  A
+ * carried ITL-ref generation is preserved in field3 (Amendment-1).
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_resid_encode_contract)
+{
+	ClusterResId rid;
+	int32 owner = -1;
+	uint32 seg = 0;
+	uint32 block = 99;
+	uint32 gen = 99;
+
+	/* D3-2 encodes (origin, segment, block0, gen) */
+	cluster_undo_resid_encode(2, 7, 0 /* block0 */, 0 /* gen, Amendment-1 neutral */, &rid);
+	cluster_undo_resid_decode(&rid, &owner, &seg, &block, &gen);
+	UT_ASSERT_EQ(owner, 2);
+	UT_ASSERT_EQ(seg, 7);
+	UT_ASSERT_EQ(block, 0);
+	UT_ASSERT_EQ(gen, 0);
+
+	/* owner-as-master: the master IS the owner, never a hash of the tag */
+	UT_ASSERT_EQ(cluster_undo_resid_master(&rid), 2);
+
+	/* a carried ITL-ref generation is preserved in field3 */
+	cluster_undo_resid_encode(3, 9, 0, 5, &rid);
+	cluster_undo_resid_decode(&rid, &owner, &seg, &block, &gen);
+	UT_ASSERT_EQ(gen, 5);
+	UT_ASSERT_EQ(cluster_undo_resid_master(&rid), 3);
+}
+
+/* ======================================================================
+ * U6 -- version-coverage gate the D3-2 CP3 path applies on the S-grant
+ * authority (D2-deferred, §3.5): hwm >= anchor + matching epoch -> covers;
+ * hwm < anchor -> refuse (origin durable TT does not yet cover this tuple
+ * version); epoch mismatch -> refuse (authority from a different reconfig
+ * generation).  Fail-closed on every doubt (Rule 8.A).
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_version_coverage_gate)
+{
+	ClusterLiveAuthority auth;
+	uint64 epoch = 7;
+
+	auth.origin_epoch = epoch;
+	auth.tt_generation = 1;
+
+	/* hwm >= anchor, epoch matches -> covers */
+	auth.live_hwm_lsn = 2000;
+	UT_ASSERT(cluster_vis_live_authority_covers_policy(1000, auth, epoch));
+
+	/* hwm < anchor -> does not cover (fall-closed) */
+	auth.live_hwm_lsn = 500;
+	UT_ASSERT(!cluster_vis_live_authority_covers_policy(1000, auth, epoch));
+
+	/* epoch mismatch -> refuse even with a covering hwm */
+	auth.live_hwm_lsn = 2000;
+	UT_ASSERT(!cluster_vis_live_authority_covers_policy(1000, auth, epoch + 1));
+}
+
+/* ======================================================================
+ * U11 -- coherence-off fallback gate (spec-5.22c §3.4, Q2): the D3-2 CP3
+ * path takes the D2 owner-as-master S-grant ONLY when armed (coherence on
+ * AND peer-mode); every other combination keeps the 6.12i best-effort fetch
+ * verbatim (回归安全 -- coherence off is byte-for-byte the old path).
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_coherence_off_fallback)
+{
+	/* armed only when BOTH coherence and peer-mode hold */
+	UT_ASSERT(cluster_undo_grant_armed(true /*coherence*/, true /*peer*/));
+
+	/* coherence off -> not armed -> best-effort fallback (no regression) */
+	UT_ASSERT(!cluster_undo_grant_armed(false /*coherence*/, true /*peer*/));
+
+	/* single-node / non-peer -> not armed regardless of coherence */
+	UT_ASSERT(!cluster_undo_grant_armed(true /*coherence*/, false /*peer*/));
+	UT_ASSERT(!cluster_undo_grant_armed(false, false));
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(6);
 	UT_RUN(test_undo_verdict_from_wire_page_mapping);
 	UT_RUN(test_undo_verdict_zero_value_is_fail_closed);
 	UT_RUN(test_undo_verdict_from_block_proof_mapping);
+	UT_RUN(test_undo_verdict_resid_encode_contract);
+	UT_RUN(test_undo_verdict_version_coverage_gate);
+	UT_RUN(test_undo_verdict_coherence_off_fallback);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

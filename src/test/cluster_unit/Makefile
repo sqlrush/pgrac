@@ -1863,17 +1863,22 @@ test_cluster_undo_gcs: test_cluster_undo_gcs.c unit_test.h \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-# spec-5.22c D3-1: test_cluster_undo_verdict — cross-node xid->commit_scn
+# spec-5.22c D3-1/D3-2: test_cluster_undo_verdict — cross-node xid->commit_scn
 # verdict taxonomy (five-value ClusterUndoVerdictKind) + the two pure mapping
 # helpers (wire ClusterGcsUndoVerdictPage -> taxonomy, block-proof
-# ClusterVisTtProof -> taxonomy).  The mappers live in the dependency-free
-# runtime-visibility policy object (no scn_time_cmp / shmem / elog), so the
-# taxonomy layer links standalone against it plus libpgport.  The read_scn
-# admissibility gate of a COMMITTED_BOUND is the D3-3 consumer's, not these
-# pure mappers'; the S-grant / verdict orchestration wiring is backend-heavy
-# and forward-covered by the D3-7 / D6 TAP.
+# ClusterVisTtProof -> taxonomy), plus the pure contract pins the D3-2 CP3
+# wiring composes (D1 resid encode/master, D2 armed gate, the version-coverage
+# policy).  All pure decision objects link standalone: the taxonomy mappers +
+# covers policy live in the dependency-free runtime-visibility policy object,
+# resid encode/master in the D1 object, the armed gate in the D2 routing
+# object; the test owns the cluster_node_id stub the routing object needs.
+# The read_scn admissibility of a COMMITTED_BOUND is the D3-3 consumer's, and
+# the S-grant / verdict orchestration wiring is backend-heavy and
+# forward-covered by the D3-7 / D6 TAP.
 test_cluster_undo_verdict: test_cluster_undo_verdict.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

@@ -49,8 +49,11 @@
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_gcs.h"	/* cluster_undo_block_acquire_shared (D3-2) */
+#include "cluster/cluster_undo_resid.h" /* cluster_undo_resid_encode (D3-2) */
 
 /*
  * cluster_vis_live_authority_covers
@@ -320,6 +323,7 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	ClusterLiveAuthority auth;
 	SCN scn = InvalidScn;
 	uint16 wrap = TT_WRAP_INVALID;
+	bool got_block = false;
 
 	if (out_committed != NULL)
 		*out_committed = false;
@@ -349,10 +353,50 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * are asking — a fetch miss there is a routing artifact, not evidence.
 	 * A successful exact xid+wrap proof still short-circuits the wire; a
 	 * fetch miss or a proof NONE falls to the origin-verdict leg.
+	 *
+	 * Block0 acquisition (D3-2): under cluster.undo_gcs_coherence + peer-mode
+	 * the read goes through the D2 owner-as-master coherent S-grant
+	 * (cluster_undo_block_acquire_shared -- owner-as-master routing + D2-5
+	 * serve-gate + epoch/generation admissibility; the owner ships the image
+	 * and this peer never opens the foreign undo file, invariant #8).  Off
+	 * that gate it keeps the 6.12i best-effort authority-less fetch verbatim,
+	 * so coherence off is byte-for-byte the old path (回归安全).
+	 *
+	 * Amendment-1 (generation): the requester has no independent source for
+	 * the owner's current segment generation, so it encodes rid.field3 == gen
+	 * (its own known value: a carried ITL-ref generation if any, else a
+	 * neutral 0).  D2's generation_matches(rid, gen) then compares two equal
+	 * caller values and is structurally true -- it is NOT the anti-ABA gate on
+	 * this path.  The real anti-ABA is the slot-level xid+wrap positive proof
+	 * below (content-based on the shipped bytes; a recycled segment changes
+	 * the slot wrap, so the proof fails NONE -> fail-closed).
 	 */
-	if (cluster_undo_block_fetch_for_visibility(origin_node, uba_encode(undo_segment_id, 0, 0, 0),
-												page.data, &auth)
-		&& cluster_vis_live_authority_covers(anchor_lsn, auth)) {
+	if (cluster_undo_gcs_coherence && cluster_peer_mode_enabled()) {
+		ClusterResId rid;
+		ClusterUndoGrantResult res;
+		uint32 gen = 0; /* Amendment-1: rid.field3 == gen, self-consistent */
+
+		cluster_undo_resid_encode((int32)origin_node, undo_segment_id, 0 /* block0 */, gen, &rid);
+		if (cluster_undo_block_acquire_shared(&rid, gen, page.data, &res)) {
+			/* Reconstruct the co-sampled authority the D3 version-coverage
+			 * gate below needs (D2 kept only the triple, not the struct). */
+			auth.origin_epoch = res.origin_epoch;
+			auth.live_hwm_lsn = res.live_hwm_lsn;
+			auth.tt_generation = res.tt_generation;
+			got_block = true;
+		}
+	} else
+		got_block = cluster_undo_block_fetch_for_visibility(
+			origin_node, uba_encode(undo_segment_id, 0, 0, 0), page.data, &auth);
+
+	/*
+	 * Version-coverage gate.  For the S-grant path this is the gate D2
+	 * deferred (its admissibility used anchor=Invalid): the owner's shipped
+	 * hwm must cover THIS tuple's anchor_lsn (§3.5).  For the best-effort path
+	 * it is the unchanged 6.12i D-i2 window gate.  hwm < anchor -> the origin
+	 * durable TT does not yet cover this version -> fall to the verdict leg.
+	 */
+	if (got_block && cluster_vis_live_authority_covers(anchor_lsn, auth)) {
 		switch (cluster_vis_tt_block_positive_proof(
 			page.data, undo_segment_id, (uint8)(origin_node + 1), raw_xid, &scn, &wrap)) {
 		case CLUSTER_VIS_TT_PROOF_COMMITTED:
