@@ -257,6 +257,15 @@ typedef struct ClusterLmsSharedState {
 	 *	BOOST = 11 awaits spec-2.28+ with PG core lock manager
 	 *	`LockWaitQueueInsertAtHead`改造 + integrated receiver. */
 	pg_atomic_uint64 priority_starvation_observed_count;
+
+	/* spec-7.2 D6 — DATA-plane connection resets observability counter.
+	 *
+	 *	Bumped by the LMS DATA-plane tick (cluster_lms_data_plane.c) once
+	 *	per connection torn down by a proactive reset:  an epoch bump in
+	 *	production (INV-7.2-CONN-EPOCH ③) or the cluster-lms-conn-reset
+	 *	injection in the F6-1 fault test.  Monotone; cluster-wide reset
+	 *	activity is the sum across nodes. */
+	pg_atomic_uint64 lms_conn_resets;
 } ClusterLmsSharedState;
 
 
@@ -358,6 +367,10 @@ extern void cluster_lms_bump_restart_generation_at_main_entry(void);
 /* spec-2.27 D7 — priority starvation observability counter. */
 extern void cluster_lms_inc_priority_starvation_observed(void);
 extern uint64 cluster_lms_get_priority_starvation_observed_count(void);
+
+/* spec-7.2 D6 — DATA-plane connection resets observability counter. */
+extern void cluster_lms_bump_conn_resets(uint32 n);
+extern uint64 cluster_lms_get_conn_resets(void);
 
 /*
  * State enum -> canonical lowercase string ("disabled", "not_started",

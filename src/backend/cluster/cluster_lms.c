@@ -199,6 +199,8 @@ cluster_lms_shmem_init(void)
 		 * starvation counter starts at 0. */
 		pg_atomic_init_u64(&cluster_lms_state->lms_restart_generation, 0);
 		pg_atomic_init_u64(&cluster_lms_state->priority_starvation_observed_count, 0);
+		/* spec-7.2 D6 — DATA-plane connection resets counter. */
+		pg_atomic_init_u64(&cluster_lms_state->lms_conn_resets, 0);
 		ConditionVariableInit(&cluster_lms_state->cv);
 	}
 }
@@ -579,6 +581,29 @@ cluster_lms_get_priority_starvation_observed_count(void)
 	if (cluster_lms_state == NULL)
 		return 0;
 	return pg_atomic_read_u64(&cluster_lms_state->priority_starvation_observed_count);
+}
+
+/*
+ * spec-7.2 D6 — DATA-plane connection resets counter.
+ *
+ *	cluster_lms_bump_conn_resets adds the number of DATA connections a
+ *	single reset event tore down (epoch bump in production, injection in
+ *	the F6-1 test).  Called from the LMS DATA-plane tick; a shared-memory
+ *	atomic so pg_stat_cluster_* / the debug dump can observe reset activity.
+ */
+void
+cluster_lms_bump_conn_resets(uint32 n)
+{
+	if (cluster_lms_state != NULL && n > 0)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_conn_resets, (uint64)n);
+}
+
+uint64
+cluster_lms_get_conn_resets(void)
+{
+	if (cluster_lms_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lms_state->lms_conn_resets);
 }
 
 

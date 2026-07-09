@@ -203,13 +203,13 @@ UT_TEST(test_stage4_sqlstate_recovery_fence_surface_encodable)
 
 /* ===== L5 — wait-events count snapshot ===== */
 
-UT_TEST(test_stage4_wait_events_count_snapshot_118)
+UT_TEST(test_stage4_wait_events_count_snapshot_120)
 {
 	/* Current Stage 4 surface value; spec-6.2 adds the latest 4 Smart Fusion
 	 * authority waits and spec-6.13 adds 2 RDMA tier3 waits.  update-required
 	 * contract: a future spec adding cluster wait events MUST bump this snapshot
 	 * (and the dump/test baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 118);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 120); /* spec-7.2 D6 +2 */
 }
 
 
@@ -312,7 +312,7 @@ main(void)
 	UT_RUN(test_stage4_undo_opcodes_preserved_and_info_mask_clear);
 	UT_RUN(test_stage4_recovery_dump_category_names);
 	UT_RUN(test_stage4_sqlstate_recovery_fence_surface_encodable);
-	UT_RUN(test_stage4_wait_events_count_snapshot_118);
+	UT_RUN(test_stage4_wait_events_count_snapshot_120);
 	UT_RUN(test_stage4_write_fence_enums_locked);
 	UT_RUN(test_stage4_thread_recovery_scope_enum_complete);
 	UT_RUN(test_stage4_undo_writeback_boundary_enum_complete);

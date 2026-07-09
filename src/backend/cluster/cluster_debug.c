@@ -1260,13 +1260,12 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 /*
  * dump_lms -- spec-2.18 Sprint A Step 4 D10.
  *
- *	Emits 6 rows under category='lms' corresponding to the 6 atomic
- *	counters in ClusterLmsSharedState (v0.3 §1.4 F2 收紧;
- *	grant/reject/convert 分项 counter 推 spec-2.20 真激活 grant state
- *	machine 时一并 ship).
- *
- *	Plus the LMS state string for HC2 4-state semantic分流
- *	observability.
+ *	Emits the LMS state string (HC2 4-state semantic 分流 observability)
+ *	plus one row per atomic counter in ClusterLmsSharedState:  the
+ *	spec-2.18 base set (started/work_drained/decision grant/reject/convert/
+ *	drain_empty/error), the spec-2.25 native-lock probe counters, the
+ *	spec-2.27 priority-starvation counter, and the spec-7.2 D6
+ *	lms_conn_resets DATA-plane reset counter.
  */
 static void
 dump_lms(ReturnSetInfo *rsinfo)
@@ -1310,6 +1309,9 @@ dump_lms(ReturnSetInfo *rsinfo)
 	 * on wire;  reserved opcode 11 awaits spec-2.28+ integrated receiver). */
 	emit_row(rsinfo, "lms", "priority_starvation_observed_count",
 			 fmt_int64((int64)cluster_lms_get_priority_starvation_observed_count()));
+	/* spec-7.2 D6 — DATA-plane connection resets (epoch bump in production;
+	 * cluster-lms-conn-reset injection in the F6-1 fault test). */
+	emit_row(rsinfo, "lms", "lms_conn_resets", fmt_int64((int64)cluster_lms_get_conn_resets()));
 }
 
 /*
