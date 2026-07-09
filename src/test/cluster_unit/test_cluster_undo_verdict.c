@@ -280,10 +280,124 @@ UT_TEST(test_undo_verdict_from_resolve_folding)
 	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_ABORTED);
 }
 
+/* ======================================================================
+ * U7 -- 8.A gate: a structurally malformed verdict page is never evidence
+ * (spec-5.22c §3.2, Q7).  An EXACT kind with no commit_scn, a BELOW_HORIZON
+ * carrying a stray exact scn, an unknown kind, or a wrong magic all fail
+ * closed to UNKNOWN_FAIL_CLOSED -- never guessed committed.
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_wire_page_malformed_fail_closed)
+{
+	ClusterGcsUndoVerdictPage v;
+	ClusterUndoVerdictResult r;
+	TransactionId xid = 555;
+
+	/* EXACT kind but no commit_scn (unstamped) -> UNKNOWN */
+	make_verdict_page(&v, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT, xid, InvalidScn, InvalidScn, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* BELOW_HORIZON but carries a stray exact commit_scn -> UNKNOWN */
+	make_verdict_page(&v, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON, xid, 5000, 6000, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* unknown verdict kind (99) -> UNKNOWN (never guess) */
+	make_verdict_page(&v, 99, xid, InvalidScn, InvalidScn, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* wrong magic (corrupt / foreign carrier) -> UNKNOWN */
+	make_verdict_page(&v, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT, xid, 5000, InvalidScn, 3);
+	v.magic = 0xDEADBEEFu;
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+}
+
+/* ======================================================================
+ * U8 -- segment-generation gate is structural, not the anti-ABA gate
+ * (spec-5.22c Amendment-1, Q4).  D3 encodes rid.field3 == gen (its own known
+ * value), so D2's generation_matches compares two equal caller values and is
+ * structurally TRUE -- it is a real comparison (a genuine mismatch fails
+ * closed), but D3 makes it always-true by construction, so it provides NO
+ * independent anti-ABA proof on the requester path.
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_generation_structural_not_anti_aba)
+{
+	ClusterResId rid;
+
+	cluster_undo_resid_encode(2, 7, 0, 4, &rid);
+
+	/* field3 == gen -> structurally passes (D3's construction) */
+	UT_ASSERT(cluster_undo_resid_generation_matches(&rid, 4));
+
+	/* it IS a real comparison: a genuine mismatch fails closed.  D3 chooses
+	 * gen == field3 to make it pass, it does not disable the check. */
+	UT_ASSERT(!cluster_undo_resid_generation_matches(&rid, 5));
+
+	/* The real anti-ABA on the requester path is the slot-level xid+wrap
+	 * positive proof (cluster_vis_tt_block_positive_proof), whose recycle /
+	 * ambiguity truth table is covered by test_cluster_runtime_visibility and
+	 * consumed verbatim by the D3-2 CP3 leg. */
+}
+
+/* ======================================================================
+ * U10 -- IN_PROGRESS is reserved but never produced by D3 (spec-5.22c Q6,
+ * §3.3).  The taxonomy keeps the value位 for a future write-path consumer,
+ * but every D3 mapper folds an unproven-terminal outcome to UNKNOWN, never
+ * IN_PROGRESS (cross-node has no origin-live ProcArray proof; conflating
+ * "running" with "crash-lost" would breach 8.A).
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_in_progress_never_produced)
+{
+	ClusterGcsUndoVerdictPage v;
+	TransactionId xid = 321;
+
+	UT_ASSERT_EQ((int)CLUSTER_UNDO_VERDICT_IN_PROGRESS, 4); /* value位 reserved */
+
+	/* no wire kind maps to IN_PROGRESS (wire is EXACT/BELOW_HORIZON/ABORTED) */
+	make_verdict_page(&v, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT, xid, 5000, InvalidScn, 1);
+	UT_ASSERT_NE(cluster_undo_verdict_from_wire_page(&v, xid).kind,
+				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+
+	/* from_resolve never yields IN_PROGRESS across its whole domain */
+	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(false, false, InvalidScn, false).kind,
+				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, true, 1, false).kind,
+				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, true, 1, true).kind,
+				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, false, InvalidScn, false).kind,
+				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+}
+
+/* ======================================================================
+ * U12 -- the slot-wrap positive proof is the real anti-ABA, even when the
+ * segment-generation gate is structurally true (spec-5.22c Amendment-1).  A
+ * recycled segment changes the slot bytes so the xid+wrap proof comes back
+ * NONE; D3 maps a NONE proof to UNKNOWN_FAIL_CLOSED (never committed).  The
+ * proof truth table itself lives in test_cluster_runtime_visibility; here we
+ * pin the D3 layer's fail-closed handling of a proof miss under a
+ * structurally-true generation gate.
+ * ====================================================================== */
+UT_TEST(test_undo_verdict_slot_wrap_is_the_real_anti_aba)
+{
+	ClusterResId rid;
+	ClusterUndoVerdictResult r;
+
+	/* generation gate structurally true (does not weaken safety) ... */
+	cluster_undo_resid_encode(2, 7, 0, 4, &rid);
+	UT_ASSERT(cluster_undo_resid_generation_matches(&rid, 4));
+
+	/* ... yet a recycled segment -> proof NONE -> D3 fail-closes to UNKNOWN */
+	r = cluster_undo_verdict_from_block_proof(CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(11);
 	UT_RUN(test_undo_verdict_from_wire_page_mapping);
 	UT_RUN(test_undo_verdict_zero_value_is_fail_closed);
 	UT_RUN(test_undo_verdict_from_block_proof_mapping);
@@ -291,6 +405,10 @@ main(void)
 	UT_RUN(test_undo_verdict_version_coverage_gate);
 	UT_RUN(test_undo_verdict_coherence_off_fallback);
 	UT_RUN(test_undo_verdict_from_resolve_folding);
+	UT_RUN(test_undo_verdict_wire_page_malformed_fail_closed);
+	UT_RUN(test_undo_verdict_generation_structural_not_anti_aba);
+	UT_RUN(test_undo_verdict_in_progress_never_produced);
+	UT_RUN(test_undo_verdict_slot_wrap_is_the_real_anti_aba);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

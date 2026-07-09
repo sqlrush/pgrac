@@ -473,16 +473,30 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
 
 	memset(&v, 0, sizeof(v));
-	if (!cluster_lms_undo_verdict_fill_page(raw_xid, &v))
-		return unknown; /* in-doubt / ambiguous / not-own -> fail-closed */
+	if (!cluster_lms_undo_verdict_fill_page(raw_xid, &v)) {
+		cluster_rtvis_resolve_note_failclosed(); /* D3-6: self-path observability */
+		return unknown;							 /* in-doubt / ambiguous / not-own -> fail-closed */
+	}
 
 	r = cluster_undo_verdict_from_wire_page(&v, raw_xid);
 
 	if (r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND) {
 		cluster_scn_observe(r.commit_scn);
-		if (!SCN_VALID(read_scn) || scn_time_cmp(r.commit_scn, read_scn) > 0)
+		if (!SCN_VALID(read_scn) || scn_time_cmp(r.commit_scn, read_scn) > 0) {
+			cluster_rtvis_resolve_note_failclosed();
 			return unknown; /* bound inadmissible for this snapshot; heals next */
+		}
 	}
+
+	/* D3-6: count the self-path terminal outcome on the same rtvis resolve
+	 * counters the foreign path uses (total verdict resolutions by outcome). */
+	if (r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+		|| r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
+		cluster_rtvis_resolve_note_committed();
+	else if (r.kind == CLUSTER_UNDO_VERDICT_ABORTED)
+		cluster_rtvis_resolve_note_aborted();
+	else
+		cluster_rtvis_resolve_note_failclosed();
 	return r;
 }
 
