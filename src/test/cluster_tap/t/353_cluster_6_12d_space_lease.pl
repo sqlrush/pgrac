@@ -117,6 +117,15 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'd612_lease',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	# The L5 reborn leg takes a FRESH HW space lease, which needs the survivor
+	# to complete HW remaster of the dead node's shards.  HW remaster reads the
+	# dead node's per-thread WAL, so on a shared_data multi-node pair it is only
+	# recoverable when cluster.wal_threads_dir is set
+	# (cluster_hw_remaster_recoverable); without it the remaster is marked
+	# BLOCKED_STRUCTURAL and the reborn node's fresh-lease access stays
+	# fail-closed.  Every HW-remaster-dependent kill test opts into this
+	# (t/247/248/274/293).  Spec: spec-4.6a-grd-recovery-liveness.md (D4).
+	wal_threads_root    => 1,
 	extra_conf          => [
 		'autovacuum = off',
 		'jit = off',
