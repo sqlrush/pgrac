@@ -1571,6 +1571,69 @@ sub get_free_port
 	return $port;
 }
 
+=pod
+
+=item get_free_port_range(n)
+
+PGRAC: spec-7.3 D3 -- reserve a block of C<n> consecutive free ports and
+return the base.  The LMS DATA-plane worker pool binds one listener per
+worker at C<data_port + worker_id>, so a multi-node test needs each node's
+C<[data_port, data_port + workers)> range to be free and non-overlapping
+across nodes.  Mirrors get_free_port's availability + reservation logic over
+a whole range (each port is 127.0.0.1-bindable, not held by a live node, and
+reserved via the same lockfile scheme), so two independent calls never
+overlap.
+
+=cut
+
+sub get_free_port_range
+{
+	my $n = shift;
+	die "get_free_port_range: n must be >= 1" if !defined $n || $n < 1;
+
+	# Bounded retry: get_free_port() advances the shared cursor, so each
+	# attempt probes a fresh base.  100 attempts is ample even when the port
+	# space is busy; a real exhaustion dies loudly rather than looping.
+	for (my $attempt = 0; $attempt < 100; $attempt++)
+	{
+		my $base = get_free_port();    # reserves $base
+		my $ok = 1;
+
+		for my $off (1 .. $n - 1)
+		{
+			my $p = $base + $off;
+
+			if ($p > $port_upper_bound)
+			{
+				$ok = 0;
+				last;
+			}
+			foreach my $node (@all_nodes)
+			{
+				if ($node->port == $p)
+				{
+					$ok = 0;
+					last;
+				}
+			}
+			last if !$ok;
+			if (!can_bind("127.0.0.1", $p) || !_reserve_port($p))
+			{
+				$ok = 0;
+				last;
+			}
+		}
+
+		return $base if $ok;
+
+		# This base's block was not fully free; the ports we did reserve stay
+		# reserved for this process (released at exit) — harmless, and the next
+		# attempt starts past them.
+	}
+
+	die "get_free_port_range: could not find $n consecutive free ports";
+}
+
 # Internal routine to check whether a host:port is available to bind
 sub can_bind
 {

@@ -1650,7 +1650,15 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
 	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
 
-	ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
+	/* spec-7.3 D3 — tag the DATA-plane CONNECTED log with this worker's
+	 * channel so a 2-node test can prove the shard-aligned i<->i mesh formed
+	 * per worker (CONTROL keeps its historic message verbatim). */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED (DATA worker %d)",
+						peer_id, tier1_my_data_channel)));
+	else
+		ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
 	return true;
 }
 
@@ -1850,8 +1858,16 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	if (out_learned_peer_id != NULL)
 		*out_learned_peer_id = learned;
 
-	ereport(LOG, (errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED",
-						 anon_slot, learned)));
+	/* spec-7.3 D3 — same DATA-plane channel tag on the anon (accept) path. */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED "
+						"(DATA worker %d)",
+						anon_slot, learned, tier1_my_data_channel)));
+	else
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED",
+						anon_slot, learned)));
 	return true;
 }
 
