@@ -366,10 +366,37 @@ UT_TEST(test_undo_gcs_grant_admissible_epoch)
 	UT_ASSERT(!cluster_undo_grant_admissible(&r, 5, auth, 100, InvalidXLogRecPtr));
 }
 
+/* ======================================================================
+ * U8 -- remaster serve-gate (spec-5.22b D2-5, §3.4, Rule 8.A).  Under
+ * owner-as-master an undo resource's master IS its owner, so the serve-gate
+ * keys on the OWNER's incarnation liveness -- the owner-as-master mirror of
+ * cluster_gcs_block_phase_for_tag's (CSSD-DEAD + recovery-in-progress) fence
+ * for hash blocks, and of cluster_hw_serve_allowed's pure shape.  An undo
+ * grant may proceed ONLY when the owner is a live serving master AND no
+ * remaster episode is fencing its shard; a dead owner OR an in-flight remaster
+ * window fails closed (the requester keeps 53R97 and DENIED_RESOURCE_RECOVERING
+ * -- dead-owner SERVE is D4, never a D2 false-resolve).  Pure: branch-only, no
+ * globals, so cluster_unit drives every owner-state combination standalone.
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_serve_gate)
+{
+	/* live owner, no remaster => serve (the D2 seed happy path: node0 live) */
+	UT_ASSERT(cluster_undo_serve_allowed(true /*owner_alive*/, false /*remaster*/));
+
+	/* dead owner => deny (serve = D4; never a false-resolve, Rule 8.A) */
+	UT_ASSERT(!cluster_undo_serve_allowed(false /*owner_alive*/, false /*remaster*/));
+
+	/* remaster episode in flight (even a live owner) => deny (fail-closed window) */
+	UT_ASSERT(!cluster_undo_serve_allowed(true /*owner_alive*/, true /*remaster*/));
+
+	/* dead owner AND remastering => deny */
+	UT_ASSERT(!cluster_undo_serve_allowed(false /*owner_alive*/, true /*remaster*/));
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_undo_gcs_lookup_master_is_owner);
 	UT_RUN(test_undo_gcs_master_is_self);
 	UT_RUN(test_undo_gcs_path_runtime_shared_mode_branch);
@@ -382,6 +409,7 @@ main(void)
 	UT_RUN(test_undo_gcs_grant_writer_pcm_contract);
 	UT_RUN(test_undo_gcs_pi_discard_covered);
 	UT_RUN(test_undo_gcs_pi_discard_notify_target);
+	UT_RUN(test_undo_gcs_serve_gate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

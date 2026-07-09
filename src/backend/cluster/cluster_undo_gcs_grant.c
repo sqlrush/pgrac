@@ -36,8 +36,10 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cr_server.h" /* cluster_gcs_block_undo_tt_fetch_and_wait */
+#include "cluster/cluster_cssd.h"	   /* cluster_cssd_get_peer_state (D2-5 serve-gate) */
 #include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current */
 #include "cluster/cluster_gcs_block.h" /* GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER */
+#include "cluster/cluster_grd.h"	   /* cluster_grd_recovery_in_progress (D2-5 serve-gate) */
 #include "cluster/cluster_guc.h"	   /* cluster_undo_gcs_coherence */
 #include "cluster/cluster_mode.h"	   /* cluster_peer_mode_enabled, cluster_node_id */
 #include "cluster/cluster_undo_gcs.h"
@@ -95,6 +97,25 @@ cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expecte
 		 * D6.  The peer-reads-foreign S-grant below is D2-3's delivered heart.
 		 */
 		return false; /* honest fail-closed forward (D6); never a stale local serve */
+	}
+
+	/*
+	 * D2-5 remaster serve-gate (§3.4).  Under owner-as-master the undo shard's
+	 * master IS its owner, so the owner-death / remaster window IS the undo
+	 * shard's recovery phase.  Deny BEFORE the fetch when the owner is not a
+	 * live serving master -- a converged-DEAD owner OR an in-flight remaster
+	 * episode -- so the peer fail-closes as DENIED_RESOURCE_RECOVERING instead
+	 * of stalling on a doomed fetch to a dead node (dead-owner SERVE from shared
+	 * storage is D4, not D2; Rule 8.A never false-resolves).  The owner-liveness
+	 * read mirrors cluster_gcs_block_phase_for_tag's CSSD-DEAD +
+	 * recovery-in-progress fence, keyed on the OWNER (owner-as-master) rather
+	 * than a hash static master; undo folds into the reconfig episode by reading
+	 * its state, never by joining the hash-shard master map (D1-5).
+	 */
+	if (!cluster_undo_serve_allowed(cluster_cssd_get_peer_state(owner) != CLUSTER_CSSD_PEER_DEAD,
+									cluster_grd_recovery_in_progress())) {
+		res->status = (uint8)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING;
+		return false; /* fail-closed; serve = D4 */
 	}
 
 	/*

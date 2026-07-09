@@ -207,6 +207,34 @@ extern bool cluster_undo_pi_discard_covered(SCN wm_scn, SCN written_scn);
 extern bool cluster_undo_pi_discard_notify_target(uint32 holders, int32 node, int32 self_node);
 
 /*
+ * cluster_undo_serve_allowed -- pure owner-as-master remaster serve-gate (D2-5,
+ * §3.4; Rule 8.A/8.B).
+ *
+ *	Under owner-as-master an undo resource's master IS its owner, so the undo
+ *	shard folds into the SAME reconfig/remaster episode as the rest of that
+ *	owner's resources -- not into the hash-shard master map (undo never
+ *	hash-routes, D1-5).  This is the owner-as-master mirror of
+ *	cluster_gcs_block_phase_for_tag's (static-master DEAD + recovery-in-progress)
+ *	fence for hash blocks, and of cluster_hw_serve_allowed's pure shape.
+ *
+ *	true (may serve the live-owner grant) iff BOTH:
+ *	  - owner_alive: the owner is CSSD-alive (not converged DEAD), and
+ *	  - !remaster_in_progress: no death-driven remaster episode is fencing the
+ *	    owner's shard (cluster_grd_recovery_in_progress()).
+ *	false (any doubt) => the caller denies with DENIED_RESOURCE_RECOVERING and
+ *	fails closed (keeps 53R97); dead-owner SERVE from shared storage is D4, NOT
+ *	D2 -- D2 only proves the fail-closed deny, never a false-resolve.
+ *
+ *	remaster_in_progress is a per-node episode flag (any dead peer's episode),
+ *	so this conservatively denies a LIVE owner's undo during an unrelated
+ *	reconfig window too; that over-deny is a bounded, fail-closed availability
+ *	cost (spec-5.22b §6 R8) -- the seed happy path (owner node0 live, no episode)
+ *	is never gated.  Pure (inputs explicit, no globals) so cluster_unit drives
+ *	every owner-state combination standalone.
+ */
+extern bool cluster_undo_serve_allowed(bool owner_alive, bool remaster_in_progress);
+
+/*
  * cluster_undo_block_acquire_shared -- reader S-grant primitive (D2-3, §2.2).
  *
  *	A peer reads owner N's undo block (block0 TT header is D3's first consumer)

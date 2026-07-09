@@ -224,3 +224,20 @@ cluster_undo_pi_discard_notify_target(uint32 holders, int32 node, int32 self_nod
 		return false; /* owner never notifies itself */
 	return (holders & ((uint32)1u << (uint32)node)) != 0;
 }
+
+/*
+ * cluster_undo_serve_allowed -- pure owner-as-master remaster serve-gate (D2-5).
+ *
+ *	See cluster_undo_gcs.h for the full contract.  A live-owner undo grant may
+ *	proceed only when the owner is CSSD-alive AND no remaster episode is fencing
+ *	its shard; either doubt fails closed so the caller denies with
+ *	DENIED_RESOURCE_RECOVERING (dead-owner SERVE is D4, never a D2 false-resolve
+ *	-- Rule 8.A/8.B).  Undo folds into the reconfig episode by READING its state
+ *	(this predicate's two inputs), never by joining the hash-shard master map
+ *	(undo is owner-as-master, D1-5).
+ */
+bool
+cluster_undo_serve_allowed(bool owner_alive, bool remaster_in_progress)
+{
+	return owner_alive && !remaster_in_progress;
+}
