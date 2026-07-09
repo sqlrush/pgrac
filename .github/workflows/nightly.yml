@@ -147,7 +147,13 @@ jobs:
           - { name: stage2-gcs,        ranges: "100-118", unit: false, regress: false }
           - { name: stage3-core,       ranges: "203-225", unit: false, regress: false }
           - { name: stage3-recent,     ranges: "228-237", unit: false, regress: false }
-          - { name: stage4-wal,        ranges: "242-248 273 275", unit: false, regress: false }
+          # 255 = spec-5.22b D2-7 undo-block GCS shared-storage data-plane TAP
+          # (2-node ClusterPair + shared cluster_fs; owner-as-master physical
+          # migration).  Registered here (undo/recovery bucket) so the new file
+          # runs in nightly per the "every new t/ file lands in a shard the same
+          # commit" rule.  NOTE: t/249-254 + t/256-272 remain an un-sharded
+          # pre-existing gap (tracked separately), not opened by this commit.
+          - { name: stage4-wal,        ranges: "242-248 255 273 275", unit: false, regress: false }
           - { name: stage4-hardgate,   ranges: "274-274", unit: false, regress: false }
           - { name: stage5-ges-locking, ranges: "276-326", unit: false, regress: false }
           # spec-5.19 D9: Stage 5 integrated acceptance (heavy 4-node ClusterQuad
