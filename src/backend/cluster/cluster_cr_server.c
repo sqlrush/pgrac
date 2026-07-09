@@ -55,7 +55,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
-#include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
+#include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -705,7 +705,7 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
-	slot->undo_auth.live_hwm_scn = cluster_scn_current();
+	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	nmembers = GetMultiXactIdMembers(mxid, &members, false, false);
 	if (nmembers < 2 || members == NULL) {

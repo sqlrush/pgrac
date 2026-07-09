@@ -2793,7 +2793,7 @@ cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXact
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
-		slot->reply_undo_live_hwm_scn = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2878,8 +2878,8 @@ cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXact
 					auth_out->origin_epoch = slot->reply_header.epoch;
 					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 					auth_out->tt_generation = slot->reply_undo_tt_generation;
-					auth_out->live_hwm_scn = (SCN)slot->reply_undo_live_hwm_scn;
-					cluster_scn_observe(auth_out->live_hwm_scn);
+					auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
+					cluster_scn_observe(auth_out->authority_scn);
 					/* AD-008: Lamport-observe every member SCN that crossed the
 					 * wire so a below-horizon bound is admissible next snapshot. */
 					for (i = 0; i < v->nmembers; i++) {

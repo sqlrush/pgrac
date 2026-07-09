@@ -1971,21 +1971,21 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				 * held across this wire (Impl note IN-9 锁上下文).  positive
 				 * proof only: any refuse / UNKNOWN / covers-miss falls through
 				 * to the 53R97 below (Rule 8.A; direction unchanged).  The
-				 * covers SCN-domain gate (D2) is applied inside
-				 * try_resolve_remote, so a page version the origin's window
-				 * does not cover still fails closed.
+				 * covers SCN-domain gate (spec-7.1a) is applied inside
+				 * try_resolve_remote against the snapshot read_scn, so an
+				 * origin authority that does not provably cover read_scn still
+				 * fails closed.
 				 */
 				if (cluster_crossnode_runtime_visibility && res.ref.undo_segment_id != 0) {
 					int d1_origin = cluster_xid_origin_slot(raw_xmin);
 					bool d1_committed = false;
 					bool d1_is_bound = false;
 					SCN d1_scn = InvalidScn;
-					SCN d1_block_scn = ((PageHeader)BufferGetPage(buffer))->pd_block_scn;
 
 					if (d1_origin >= 0 && d1_origin != cluster_node_id) {
 						cluster_vis53r97_note_xmin_overlay_verdict_ask();
 						if (cluster_runtime_visibility_try_resolve_remote(
-								d1_origin, (uint32)res.ref.undo_segment_id, raw_xmin, d1_block_scn,
+								d1_origin, (uint32)res.ref.undo_segment_id, raw_xmin,
 								snapshot->read_scn, &d1_committed, &d1_scn, &d1_is_bound)) {
 							if (!d1_committed) {
 								/* origin proved ABORTED -> this xmin was never
