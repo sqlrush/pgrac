@@ -533,7 +533,13 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
  *      6      2    envelope_version (PGRAC_IC_ENVELOPE_VERSION_V1 = 1)
  *      8      4    source_node_id (signed int32)
  *     12     24    cluster_name (NUL-terminated; truncated to 23 + NUL)
- *     36     28    _pad (always zero on send;ignored on receive)
+ *     36      4    capabilities bitmask (smart-fusion; zero = none)
+ *     40      1    plane (spec-7.2: 0 = CONTROL, 1 = DATA)
+ *     41      2    worker_id / n_workers (spec-7.3 reserved, zero in 7.2)
+ *     43      1    reserved (zero)
+ *     44      8    conn_epoch (spec-7.2: cluster epoch at connect;
+ *                  zero from pre-7.2 senders / unenforced on CONTROL)
+ *     52     12    _pad tail (always zero on send;ignored on receive)
  *   ------  -----
  *   total   64
  *
@@ -574,9 +580,20 @@ ic_le_read_uint32(const uint8 *buf)
 		   | ((uint32)buf[3] << 24);
 }
 
+/* PGRAC: spec-7.2 D2 — 64-bit LE helper (HELLO conn_epoch). */
+static inline void
+ic_le_write_uint64(uint8 *buf, uint64 v)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		buf[i] = (uint8)((v >> (8 * i)) & 0xFF);
+}
+
 void
 cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
-					   uint16 envelope_version, int32 source_node_id, const char *cluster_name)
+					   uint16 envelope_version, int32 source_node_id, const char *cluster_name,
+					   ClusterICPlane plane, uint64 conn_epoch)
 {
 	size_t name_len;
 	uint32 capabilities = 0;
@@ -608,6 +625,14 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
+
+	/*
+	 * PGRAC: spec-7.2 D2 — plane byte + connection epoch ride the
+	 * documented-zero pad (capabilities precedent;  V1 stays 64B).
+	 * Offsets 41/42 stay zero (spec-7.3 worker fields).
+	 */
+	out_buf[PGRAC_IC_HELLO_PLANE_OFFSET] = (uint8)plane;
+	ic_le_write_uint64(out_buf + PGRAC_IC_HELLO_CONN_EPOCH_OFFSET, conn_epoch);
 }
 
 bool

@@ -75,12 +75,16 @@ sub new_pair
 {
 	my ($class, $cluster_name, %opts) = @_;
 
-	# Allocate 4 distinct free ports.  get_free_port() reserves the port
+	# Allocate 6 distinct free ports.  get_free_port() reserves the port
 	# until the test exits, so successive calls return distinct values.
+	# spec-7.2 D2: every node also gets an explicit DATA-plane port
+	# (data_addr) -- allocator-provided, never offset-derived (r1-F2).
 	my $pg_port_0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $pg_port_1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic_port_0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic_port_1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port_0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port_1 = PostgreSQL::Test::Cluster::get_free_port();
 
 	my $node0 =
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node0", port => $pg_port_0);
@@ -241,9 +245,11 @@ name = $cluster_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic_port_0
+data_addr = 127.0.0.1:$data_port_0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic_port_1
+data_addr = 127.0.0.1:$data_port_1
 EOC
 
 	# node1's pgrac.conf -- same except optionally a different cluster_name
@@ -255,9 +261,11 @@ name = $alt_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic_port_0
+data_addr = 127.0.0.1:$data_port_0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic_port_1
+data_addr = 127.0.0.1:$data_port_1
 EOC
 
 	PostgreSQL::Test::Utils::append_to_file(
@@ -271,6 +279,7 @@ EOC
 		cluster_name => $cluster_name,
 		pg_ports    => [ $pg_port_0, $pg_port_1 ],
 		ic_ports    => [ $ic_port_0, $ic_port_1 ],
+		data_ports  => [ $data_port_0, $data_port_1 ],
 		voting_disk_paths => \@voting_disk_paths,
 		wal_threads_root  => $wal_threads_root,
 		shared_data_root  => $shared_data_root,

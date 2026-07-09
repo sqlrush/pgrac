@@ -360,6 +360,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-cr-construct" },
 	/*
+	 * spec-7.2 D6 — LMS data-plane observability injections.
+	 *
+	 *	cluster-lms-data-dispatch:
+	 *	  Fires in the LMS data-plane tick just before the inbound
+	 *	  envelope pump for a readable DATA peer (hit-count surface for
+	 *	  the flip e2e legs).
+	 *	cluster-lms-conn-reset:
+	 *	  Fires in the tick's reset scan;  SKIP forces a one-shot close
+	 *	  of every DATA connection (reconnect + re-HELLO converge), the
+	 *	  L4-family reset/epoch legs' trigger.
+	 */
+	{ .name = "cluster-lms-data-dispatch" },
+	{ .name = "cluster-lms-conn-reset" },
+	/*
 	 * spec-6.12i D-i1 — undo-TT fetch serve refusal injection.
 	 *
 	 *	cluster-lms-undo-fetch:

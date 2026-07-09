@@ -109,9 +109,9 @@ my $has_visibility_inject =
 # between "pgrac cluster cr relgen" and "pgrac cluster cr tuple stats").
 # spec-6.12h D-h3a: +1 "pgrac cluster pi shadow" (PI ship-SCN shadow table;
 # sorts between "pgrac cluster oid lease,pgrac cluster pcm grd" and "pgrac cluster qvotec").
-my $expected_region_count = $has_visibility_inject ? '79' : '78';
+my $expected_region_count = $has_visibility_inject ? '80' : '79';
 my $expected_regions =
-  'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster catalog stats,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr server,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster hw lease,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster mrp,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster oid lease,pgrac cluster pcm grd,pgrac cluster pi shadow,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smart fusion deps,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
+  'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster catalog stats,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr server,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster hw lease,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lms data outbound,pgrac cluster lock-path counters,pgrac cluster mrp,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster oid lease,pgrac cluster pcm grd,pgrac cluster pi shadow,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smart fusion deps,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 # spec-4.12 D7: cooperative write-fence region;  always registered.  Sorts after
@@ -280,8 +280,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '159',
-   'L15 total injection registry size is 159 (spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-2.29a +1 cluster-qvotec-marker-service-hold; full breakdown in t/015)');
+   '161',
+   'L15 total injection registry size is 161 (spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; full breakdown in t/015)');
 
 
 # ----------
@@ -309,8 +309,8 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	   '118',
-	   'L17 pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+	   '120',
+	   'L17 pg_stat_cluster_wait_events returns 120 rows (spec-6.13 RDMA wait surface)');
 
 
 # ----------

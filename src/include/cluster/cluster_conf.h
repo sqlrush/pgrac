@@ -111,12 +111,25 @@ typedef struct ClusterNodeInfo {
 	uint16 rdma_port;
 	uint16 rdma_pkey;
 	uint32 rdma_qkey;
+
+	/*
+	 * PGRAC: spec-7.2 D2 — DATA-plane (LMS<->LMS) listener address,
+	 * host:port.  Optional: empty means this node offers no DATA plane
+	 * (the CONTROL plane on interconnect_addr is unaffected).  Never
+	 * derived from interconnect_addr by offset — adjacent-port
+	 * collisions on single-host deployments make an implicit default
+	 * unsound (spec-7.2 r1-F2), so it is declared explicitly or the
+	 * data plane stays off (fail-closed once the GCS block family
+	 * flips to the DATA plane).  Appended per the layout-append rule.
+	 */
+	char data_addr[CLUSTER_NODE_ADDR_LEN];
 } ClusterNodeInfo;
 
 
 /*
- * Top-level container in shmem.  Sized to ~64 KiB (accepted overhead
- * given the simplicity it buys; see docs/cluster-conf-design.md §3.2).
+ * Top-level container in shmem.  Sized to ~128 KiB (accepted overhead
+ * given the simplicity it buys; see docs/cluster-conf-design.md §3.2 —
+ * budget raised from 64 KiB when spec-7.2 D2 appended data_addr).
  */
 typedef struct ClusterConf {
 	uint32 magic;

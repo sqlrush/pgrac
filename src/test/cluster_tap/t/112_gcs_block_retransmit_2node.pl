@@ -9,13 +9,13 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline:  9 NEW reliability counters all 0 on both nodes
-#	  L3  pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a)
+#	  L3  pg_cluster_state.gcs has 85 keys (cumulative through spec-7.2 D6 hist)
 #	  L4  2 NEW wait events registered (ClusterGCSBlockRetransmitWait +
 #	       ClusterGCSBlockEpochStaleRetry)
-#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 85 (was 83 spec-2.33)
+#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 120 (spec-7.2 +2)
 #	  L6  3 NEW GUC visible + defaults + contexts:
 #	       cluster.gcs_block_retransmit_max_retries PGC_SUSET 4
-#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 100
+#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 10 (spec-7.2 D1)
 #	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 1024
 #	  L7  single-shot ship workload — retransmit_attempt_count=0
 #	  L8  inject `cluster-gcs-block-drop-reply-before-send:skip:1` →
@@ -107,18 +107,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 67 keys (cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs category has 85 keys (cumulative through spec-7.2 D6 hist).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node0 pg_cluster_state.gcs category has 67 keys');
+   '85',
+   'L3 node0 pg_cluster_state.gcs category has 85 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node1 pg_cluster_state.gcs category has 67 keys');
+   '85',
+   'L3 node1 pg_cluster_state.gcs category has 85 keys');
 
 
 # ============================================================
@@ -144,8 +144,8 @@ for my $we_name (
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '118',
-   'L5 pg_stat_cluster_wait_events returns 118 rows (spec-6.13 RDMA wait surface)');
+   '120',
+   'L5 pg_stat_cluster_wait_events returns 120 rows (spec-7.2 LMS data-plane waits)');
 
 
 # ============================================================
@@ -153,7 +153,7 @@ is($pair->node0->safe_psql(
 # ============================================================
 for my $row (
 	[ 'cluster.gcs_block_retransmit_max_retries', '4', 'superuser' ],
-	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '100', 'superuser' ],
+	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '10', 'superuser' ],
 	[ 'cluster.gcs_block_dedup_max_entries', '1024', 'postmaster' ],
 )
 {

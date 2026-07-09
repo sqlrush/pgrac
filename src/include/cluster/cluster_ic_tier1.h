@@ -99,6 +99,18 @@ typedef struct ClusterICPeerStateShmem {
 	 * close.
 	 */
 	pg_atomic_uint32 close_requested; /* 0 = idle, 1 = pending close */
+
+	/*
+	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH) — the cluster epoch this
+	 * connection was established under (recorded at the CONNECTED
+	 * transition;  DATA plane only, CONTROL leaves it 0/unenforced).
+	 * The DATA physical-send gate refuses to put bytes on a connection
+	 * whose conn_epoch != current epoch — an epoch bump structurally
+	 * invalidates the old stream and forces close + re-HELLO, so a new
+	 * epoch's frames can never interleave into an old epoch's byte
+	 * stream.  Written and read by the owning plane's process only.
+	 */
+	uint64 conn_epoch;
 } ClusterICPeerStateShmem;
 
 /*
@@ -132,6 +144,20 @@ extern void cluster_ic_tier1_shmem_register(void);
  * to caller for direct LMON WaitEventSet registration.
  */
 extern int cluster_ic_tier1_listener_bind(void);
+
+/*
+ * PGRAC: spec-7.2 D2 — re-aim this process's tier1 working state at a
+ * plane ([0] = CONTROL, [1] = DATA inside the single tier1 region).
+ * Call once at aux-process entry BEFORE any tier1 use (LmsMain → DATA);
+ * processes that never call it stay on CONTROL (LMON, backends, SQL
+ * observers — the historic instance and contract).
+ */
+extern void cluster_ic_tier1_set_my_plane(ClusterICPlane plane);
+extern ClusterICPlane cluster_ic_tier1_my_plane(void);
+
+/* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */
+extern void cluster_ic_tier1_bump_plane_misroute_reject(void);
+extern uint64 cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane);
 
 /*
  * Accept exactly one pending connection on the listener fd.  Returns
