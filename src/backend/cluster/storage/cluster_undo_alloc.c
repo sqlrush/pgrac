@@ -96,14 +96,24 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, ui
 	/*
 	 * spec-5.22b D2-2 (threading strategy B): every caller derives intent via
 	 * cluster_undo_intent_for_owner(owner), so in D2 RUNTIME_SHARED ⟺ own
-	 * instance and MATERIALIZED_LOCAL ⟺ a foreign dead-origin owner.  Assert
-	 * that invariant here: a future spec (D4) that serves a foreign owner's
-	 * live undo from shared storage passes RUNTIME_SHARED with owner!=self and
-	 * MUST revisit this path -- the assert makes that divergence loud rather
-	 * than a silent split.
+	 * instance and MATERIALIZED_LOCAL ⟺ a foreign dead-origin owner.
+	 *
+	 * spec-5.22d D4-3: the dead-owner authority serve introduces exactly one
+	 * sanctioned foreign-owner shared read -- RUNTIME_SHARED_AUTHORITY_BLOCK0,
+	 * which by construction targets a foreign owner (owner != self).  Relax
+	 * the invariant to admit that one case ONLY:
+	 *   - a plain RUNTIME_SHARED with a foreign owner is still a loud
+	 *     split-brain bug (it would silently read the shared copy of a
+	 *     segment it does not own);
+	 *   - AUTHORITY_BLOCK0 with owner == self is likewise rejected (a live
+	 *     owner serves via the D6 path, never via the authority block0 route).
+	 * The read stays block0-only by the call-site contract (§2.3/§3.6); this
+	 * assert only governs the owner-vs-self / intent pairing.
 	 */
-	Assert((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED)
-		   == (owner_instance == (uint8)(cluster_node_id + 1)));
+	Assert(((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			== (owner_instance == (uint8)(cluster_node_id + 1)))
+		   || (intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0
+			   && owner_instance != (uint8)(cluster_node_id + 1)));
 
 	/*
 	 * RUNTIME_SHARED own undo migrates to the shared cluster_fs root only

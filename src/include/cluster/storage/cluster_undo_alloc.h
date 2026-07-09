@@ -99,10 +99,22 @@
  *	      merged recovery, remote-xact outcome store).  ALWAYS resolves to
  *	      the local DataDir, in any mode -- D2 must never redirect these
  *	      reads, else dead-origin recovery / CR regress (spec-5.22b §3.6, R1).
+ *
+ *	  CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0  (spec-5.22d D4-3)
+ *	      A survivor authority serving a DEAD owner's durable block0 (TTSlot
+ *	      verdict) from shared storage.  Here owner != self, yet the read
+ *	      DOES migrate to the shared cluster_fs root -- the ONLY intent that
+ *	      resolves a FOREIGN owner's shared block0.  Armed by the same gate
+ *	      as own RUNTIME_SHARED (peer-mode + cluster.undo_gcs_coherence).
+ *	      Read-only and block0-only by call-site contract (§2.3/§3.6); it
+ *	      never grants DATA-block access, and a plain RUNTIME_SHARED with
+ *	      owner != self is still rejected by cluster_undo_path_resolve.
  */
 typedef enum ClusterUndoPathIntent {
-	CLUSTER_UNDO_PATH_RUNTIME_SHARED,	 /* own live undo; shared under peer-mode+coherence */
-	CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL /* dead-origin materialized copy; always local */
+	CLUSTER_UNDO_PATH_RUNTIME_SHARED,	  /* own live undo; shared under peer-mode+coherence */
+	CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, /* dead-origin materialized copy; always local */
+	CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0 /* D4: authority reads a dead owner's
+													   * shared block0 (read-only, foreign) */
 } ClusterUndoPathIntent;
 
 /* cluster_node_id owns the +1 sentinel offset: owner_instance == node_id + 1. */

@@ -91,13 +91,22 @@ cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode,
 	if (intent == CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL)
 		return false;
 
-	Assert(intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED);
+	/*
+	 * spec-5.22d D4-3: RUNTIME_SHARED (own live undo) and
+	 * RUNTIME_SHARED_AUTHORITY_BLOCK0 (a survivor authority reading a dead
+	 * owner's durable block0 from shared storage) both resolve to the shared
+	 * cluster_fs root under the SAME arm gate.  MATERIALIZED_LOCAL already
+	 * returned above; any other value is a caller bug.
+	 */
+	Assert(intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		   || intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0);
 
 	/*
-	 * Own live runtime undo migrates to the shared cluster_fs root only when
-	 * the whole physical migration is armed: a declared multi-node
+	 * The shared migration is armed only under a declared multi-node
 	 * deployment (peer_mode) AND cluster.undo_gcs_coherence on.  Either off
-	 * => local DataDir, so D2 lands inert at the default (裁决 A).
+	 * => local DataDir, so both the own-instance runtime path (D2, 裁决 A)
+	 * and the dead-owner authority block0 serve (D4) land inert at the
+	 * default.
 	 */
 	return peer_mode && coherence_on;
 }

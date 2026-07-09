@@ -153,6 +153,36 @@ UT_TEST(test_undo_gcs_path_materialized_never_migrates)
 }
 
 /* ======================================================================
+ * U6 -- path-intent AUTHORITY_BLOCK0 root decision (spec-5.22d D4-3,
+ * 约束 #4): a survivor authority serving a DEAD owner's durable block0 from
+ * shared storage (owner != self) migrates to the shared cluster_fs root
+ * under the SAME arm gate as own-instance RUNTIME_SHARED -- peer-mode AND
+ * cluster.undo_gcs_coherence.  Either off => inert (local DataDir), so D4
+ * lands zero behaviour change at the default (回归安全).  This is the ONLY
+ * intent that legitimately resolves a FOREIGN owner's shared block0
+ * (read-only); a plain RUNTIME_SHARED foreign owner is rejected by the
+ * ownership assert in cluster_undo_path_resolve, so AUTHORITY_BLOCK0 does
+ * not generalise to DATA-block reads (spec-5.22d §2.3/§3.6).
+ * ====================================================================== */
+UT_TEST(test_undo_gcs_path_authority_block0_mode_branch)
+{
+	/* serve: survivor authority reads a dead owner's shared block0,
+	 * peer-mode, coherence on -> shared root */
+	UT_ASSERT(cluster_undo_path_uses_shared_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												 true /*peer*/, true /*coherence*/));
+
+	/* coherence off => inert, stay local (回归安全) */
+	UT_ASSERT(!cluster_undo_path_uses_shared_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												  true /*peer*/, false /*coherence*/));
+
+	/* non-peer-mode => local regardless of coherence (declared topology gate) */
+	UT_ASSERT(!cluster_undo_path_uses_shared_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												  false /*peer*/, true /*coherence*/));
+	UT_ASSERT(!cluster_undo_path_uses_shared_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												  false /*peer*/, false /*coherence*/));
+}
+
+/* ======================================================================
  * U11 -- per-call intent derivation (spec-5.22b D2-2, threading strategy B):
  * an undo segment whose owner IS this node maps to RUNTIME_SHARED (own live
  * undo); any foreign owner maps to MATERIALIZED_LOCAL (dead-origin
@@ -396,11 +426,12 @@ UT_TEST(test_undo_gcs_serve_gate)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_undo_gcs_lookup_master_is_owner);
 	UT_RUN(test_undo_gcs_master_is_self);
 	UT_RUN(test_undo_gcs_path_runtime_shared_mode_branch);
 	UT_RUN(test_undo_gcs_path_materialized_never_migrates);
+	UT_RUN(test_undo_gcs_path_authority_block0_mode_branch);
 	UT_RUN(test_undo_gcs_intent_for_owner);
 	UT_RUN(test_undo_gcs_grant_armed_gate);
 	UT_RUN(test_undo_gcs_grant_reader_pcm_contract);
