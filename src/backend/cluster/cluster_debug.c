@@ -2651,6 +2651,11 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_verdict_served_count()));
 	emit_row(rsinfo, "cr", "cr_server_verdict_denied_count",
 			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
+	/* spec-7.1 D3-b: origin multixact member-verdict serve counters. */
+	emit_row(rsinfo, "cr", "cr_server_multi_verdict_served_count",
+			 fmt_int64((int64)cluster_cr_server_multi_verdict_served_count()));
+	emit_row(rsinfo, "cr", "cr_server_multi_verdict_denied_count",
+			 fmt_int64((int64)cluster_cr_server_multi_verdict_denied_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
 	/* spec-7.1 D0/D5: 53R97 per-leg attribution (census + error-closure dial). */

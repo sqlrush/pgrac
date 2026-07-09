@@ -1880,6 +1880,16 @@ cluster_cr_server_verdict_denied_count(void)
 	return 0;
 }
 uint64
+cluster_cr_server_multi_verdict_served_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_multi_verdict_denied_count(void)
+{
+	return 0;
+}
+uint64
 cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;

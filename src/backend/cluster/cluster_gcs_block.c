@@ -4878,8 +4878,7 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (env->payload_length == undo_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (h->status != (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
-			&& h->status != (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT)
+		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status))
 			return false;
 		if (out_hdr != NULL)
 			*out_hdr = h;
@@ -5001,6 +5000,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -5158,6 +5158,22 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 */
 	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)) {
 		if (!cluster_lms_undo_verdict_submit(fwd))
+			gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.1 D3-b — undo-MULTI-verdict request.  Same LMON shape as
+	 * the single verdict branch above (validate + park; the member enumeration
+	 * + per-updater terminal scan runs in LMS, the LMON tick ships).  MUST
+	 * branch here, before any holder / GRD logic: the tag is a synthetic undo
+	 * address and the SCN carrier holds the widened MXID.  A refused park
+	 * (wave GUC off / malformed tag or carrier / no capacity) replies the
+	 * fail-closed DENIED immediately so the requester keeps its unchanged
+	 * 53R97 refusal (Rule 8.A).
+	 */
+	if (GcsBlockForwardPayloadIsUndoMultiVerdictRequest(fwd)) {
+		if (!cluster_lms_undo_multi_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}

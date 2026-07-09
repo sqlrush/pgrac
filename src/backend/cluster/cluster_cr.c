@@ -162,6 +162,12 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_server_verdict_served_count;
 	pg_atomic_uint64 cr_server_verdict_denied_count;
 	/*
+	 * spec-7.1 D3-b (server side): multixact member-verdict batches served vs
+	 * refused (any unprovable updater member refuses the whole multi).
+	 */
+	pg_atomic_uint64 cr_server_multi_verdict_served_count;
+	pg_atomic_uint64 cr_server_multi_verdict_denied_count;
+	/*
 	 * spec-6.15 D4: a recycled remote ref whose tuple xid the stripe
 	 * derivation could not attribute (striping off / below the activation
 	 * floor) — the active-runtime resolution never even asks the wire and
@@ -294,6 +300,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_verdict_inadmissible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_served_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_invalid_scn_refuse_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_zero_match_refuse_count, 0);
@@ -371,6 +379,12 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 		break;
 	case CLUSTER_CR_SERVER_STAT_VERDICT_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_verdict_denied_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_multi_verdict_served_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_multi_verdict_denied_count, 1);
 		break;
 	}
 }
@@ -575,6 +589,11 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_below_horizon_count, rtvis_verdict_bel
 CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_inadmissible_count, rtvis_verdict_inadmissible_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_served_count, cr_server_verdict_served_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_denied_count, cr_server_verdict_denied_count)
+/* spec-7.1 D3-b: origin multixact member-verdict serve counters. */
+CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_served_count,
+					cr_server_multi_verdict_served_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_denied_count,
+					cr_server_multi_verdict_denied_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_invalid_scn_refuse_count,
 					vis53r97_leg_invalid_scn_refuse_count)

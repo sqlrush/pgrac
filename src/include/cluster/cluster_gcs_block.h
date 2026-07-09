@@ -357,6 +357,19 @@ StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 					 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
 				 "spec-7.1 D3-b undo-multi-verdict status must be the tail enum value");
 
+/* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
+ * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
+ * a co-sampled ClusterGcsUndoAuthTrailer and overrides the reply header's
+ * epoch / page_lsn with the LMS-sampled live authority.  Centralised so every
+ * ship/parse site treats the three identically (D-i3 authority carriage). */
+static inline bool
+GcsBlockReplyStatusCarriesUndoAuthTrailer(GcsBlockReplyStatus status)
+{
+	return status == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
+		   || status == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+}
+
 static inline bool
 GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
 {

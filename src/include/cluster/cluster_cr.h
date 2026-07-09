@@ -256,6 +256,8 @@ extern uint64 cluster_rtvis_verdict_below_horizon_count(void);
 extern uint64 cluster_rtvis_verdict_inadmissible_count(void);
 extern uint64 cluster_cr_server_verdict_served_count(void);
 extern uint64 cluster_cr_server_verdict_denied_count(void);
+extern uint64 cluster_cr_server_multi_verdict_served_count(void);
+extern uint64 cluster_cr_server_multi_verdict_denied_count(void);
 extern void cluster_rtvis_verdict_note_wire(void);
 extern void cluster_rtvis_verdict_note_failclosed(void);
 extern void cluster_rtvis_verdict_note_exact(void);
