@@ -1956,6 +1956,15 @@ extern void cluster_gcs_block_bump_master_holder_lifecycle(void);
  */
 extern void cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req,
 															int32 dest_node);
+
+/*
+ * spec-7.3 D4 — DATA worker for a staged block-family frame (hash of its
+ * BufferTag).  Only REQUEST / FORWARD / INVALIDATE carry a routable tag;
+ * returns [0, n_workers) or -1 (8.A fail-closed: refuse to stage, never
+ * default a worker).  See cluster_gcs_block.c for the direct-send rationale.
+ */
+extern int cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payload_len,
+										   int n_workers);
 extern void cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_id,
 																 bool cqe_success, uint32 byte_len,
 																 const void *sidecar);

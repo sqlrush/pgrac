@@ -65,34 +65,51 @@ typedef struct ClusterLmsOutboundState {
 	ClusterLmsOutboundSlot ring[PGRAC_LMS_OUTBOUND_CAPACITY];
 } ClusterLmsOutboundState;
 
-static ClusterLmsOutboundState *cluster_lms_outbound_state = NULL;
-static LWLock *cluster_lms_outbound_lock = NULL;
+/*
+ * spec-7.3 D4 — one ring per DATA worker channel.  rings[0] is worker 0 (the
+ * spec-7.2 ring; lms_workers=1 uses only it — byte-identical), rings[c] is
+ * worker c.  Sizing is the compile-time cap (CLUSTER_LMS_MAX_WORKERS); the
+ * live count follows cluster.lms_workers.  Each ring keeps the Q6-B single-
+ * consumer single-tail FIFO semantics, and each has its own lock so worker c
+ * drains rings[c] without contending on the other workers.
+ */
+static ClusterLmsOutboundState *cluster_lms_outbound_rings = NULL;
+static LWLock *cluster_lms_outbound_locks[CLUSTER_LMS_MAX_WORKERS];
+
+#define OB_RING(w) (&cluster_lms_outbound_rings[(w)])
+#define OB_LOCK(w) (cluster_lms_outbound_locks[(w)])
 
 static Size
 cluster_lms_outbound_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterLmsOutboundState));
+	/* Contiguous array of CLUSTER_LMS_MAX_WORKERS rings; the C array stride is
+	 * sizeof(ClusterLmsOutboundState), so size the whole block then MAXALIGN. */
+	return MAXALIGN(mul_size(CLUSTER_LMS_MAX_WORKERS, sizeof(ClusterLmsOutboundState)));
 }
 
 static void
 cluster_lms_outbound_shmem_init(void)
 {
 	bool found;
+	int i;
 
-	cluster_lms_outbound_state = (ClusterLmsOutboundState *)ShmemInitStruct(
+	cluster_lms_outbound_rings = (ClusterLmsOutboundState *)ShmemInitStruct(
 		"pgrac cluster lms data outbound", cluster_lms_outbound_shmem_size(), &found);
 	if (!found)
-		memset(cluster_lms_outbound_state, 0, sizeof(*cluster_lms_outbound_state));
+		memset(cluster_lms_outbound_rings, 0,
+			   CLUSTER_LMS_MAX_WORKERS * sizeof(ClusterLmsOutboundState));
 
 	if (!IsBootstrapProcessingMode())
-		cluster_lms_outbound_lock = &(GetNamedLWLockTranche("ClusterLmsDataOutbound"))[0].lock;
+		for (i = 0; i < CLUSTER_LMS_MAX_WORKERS; i++)
+			cluster_lms_outbound_locks[i]
+				= &(GetNamedLWLockTranche("ClusterLmsDataOutbound"))[i].lock;
 }
 
 static const ClusterShmemRegion cluster_lms_outbound_region = {
 	.name = "pgrac cluster lms data outbound",
 	.size_fn = cluster_lms_outbound_shmem_size,
 	.init_fn = cluster_lms_outbound_shmem_init,
-	.lwlock_count = 1,
+	.lwlock_count = CLUSTER_LMS_MAX_WORKERS,
 	.owner_subsys = "cluster_lms_outbound",
 	.reserved_flags = 0,
 };
@@ -107,7 +124,7 @@ cluster_lms_outbound_shmem_register(void)
 void
 cluster_lms_outbound_request_lwlocks(void)
 {
-	RequestNamedLWLockTranche("ClusterLmsDataOutbound", 1);
+	RequestNamedLWLockTranche("ClusterLmsDataOutbound", CLUSTER_LMS_MAX_WORKERS);
 }
 
 /*
@@ -119,84 +136,98 @@ cluster_lms_outbound_request_lwlocks(void)
  *	before the LMS wakeup fires.
  */
 bool
-cluster_lms_outbound_enqueue(uint8 msg_type, uint32 dest_node_id, const void *payload,
-							 uint16 payload_len)
+cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
+							 const void *payload, uint16 payload_len)
 {
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
 	ClusterLmsOutboundSlot *slot;
 
-	if (cluster_lms_outbound_state == NULL || cluster_lms_outbound_lock == NULL)
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return false;
+	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
 		return false;
 	if (payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX)
 		return false;
 
-	LWLockAcquire(cluster_lms_outbound_lock, LW_EXCLUSIVE);
-	if (cluster_lms_outbound_state->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
-		LWLockRelease(cluster_lms_outbound_lock);
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+		LWLockRelease(lock);
 		return false;
 	}
-	slot = &cluster_lms_outbound_state->ring[cluster_lms_outbound_state->head];
+	slot = &ring->ring[ring->head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
 	slot->payload_len = payload_len;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
-	cluster_lms_outbound_state->head
-		= (cluster_lms_outbound_state->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
-	cluster_lms_outbound_state->count++;
-	LWLockRelease(cluster_lms_outbound_lock);
+	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+	ring->count++;
+	LWLockRelease(lock);
 
-	cluster_lms_wakeup();
+	cluster_lms_wakeup(worker_id);
 	return true;
 }
 
-/* Head-requeue for WOULD_BLOCK (preserves per-peer FIFO). */
+/* Head-requeue for WOULD_BLOCK (preserves this worker's per-peer FIFO). */
 static void
-lms_outbound_requeue_head(const ClusterLmsOutboundSlot *slot)
+lms_outbound_requeue_head(int worker_id, const ClusterLmsOutboundSlot *slot)
 {
-	LWLockAcquire(cluster_lms_outbound_lock, LW_EXCLUSIVE);
-	if (cluster_lms_outbound_state->count < PGRAC_LMS_OUTBOUND_CAPACITY) {
-		cluster_lms_outbound_state->tail
-			= (cluster_lms_outbound_state->tail + PGRAC_LMS_OUTBOUND_CAPACITY - 1)
-			  % PGRAC_LMS_OUTBOUND_CAPACITY;
-		cluster_lms_outbound_state->ring[cluster_lms_outbound_state->tail] = *slot;
-		cluster_lms_outbound_state->count++;
+	ClusterLmsOutboundState *ring = OB_RING(worker_id);
+	LWLock *lock = OB_LOCK(worker_id);
+
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	if (ring->count < PGRAC_LMS_OUTBOUND_CAPACITY) {
+		ring->tail = (ring->tail + PGRAC_LMS_OUTBOUND_CAPACITY - 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+		ring->ring[ring->tail] = *slot;
+		ring->count++;
 	}
 	/* full → drop;  fire-and-forget layers self-heal via retransmit */
-	LWLockRelease(cluster_lms_outbound_lock);
+	LWLockRelease(lock);
 }
 
 /*
- * cluster_lms_outbound_drain_send — LMS data-plane loop: drain + send.
+ * cluster_lms_outbound_drain_send — one worker drains + sends its own ring.
  *
  *	Bounded batch per call.  WOULD_BLOCK requeues at the HEAD so the
- *	per-peer byte stream is never reordered (INV-7.2-DATA-FIFO).  The
- *	GCS block REQUEST pre-send hook (direct-land arm) migrates here
- *	with the DATA consumer (D0-② coupling item ①).
+ *	per-peer byte stream is never reordered (INV-7.2-DATA-FIFO).  worker c
+ *	only ever touches rings[c], so the single-consumer-single-tail
+ *	guarantee holds per worker (spec-7.3 D4).  The GCS block REQUEST
+ *	pre-send hook (direct-land arm) rides along with the DATA consumer.
  */
 int
-cluster_lms_outbound_drain_send(void)
+cluster_lms_outbound_drain_send(int worker_id)
 {
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
 	int sent = 0;
 
-	if (cluster_lms_outbound_state == NULL || cluster_lms_outbound_lock == NULL)
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return 0;
+	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
 		return 0;
 
-	Assert(MyBackendType == B_LMS);
+	Assert(MyBackendType == B_LMS || MyBackendType == B_LMS_WORKER);
+
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
 
 	while (sent < 64) {
 		ClusterLmsOutboundSlot slot;
 		ClusterICSendResult rc;
 		bool got = false;
 
-		LWLockAcquire(cluster_lms_outbound_lock, LW_EXCLUSIVE);
-		if (cluster_lms_outbound_state->count > 0) {
-			slot = cluster_lms_outbound_state->ring[cluster_lms_outbound_state->tail];
-			cluster_lms_outbound_state->tail
-				= (cluster_lms_outbound_state->tail + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
-			cluster_lms_outbound_state->count--;
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		if (ring->count > 0) {
+			slot = ring->ring[ring->tail];
+			ring->tail = (ring->tail + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+			ring->count--;
 			got = true;
 		}
-		LWLockRelease(cluster_lms_outbound_lock);
+		LWLockRelease(lock);
 		if (!got)
 			break;
 
@@ -212,7 +243,7 @@ cluster_lms_outbound_drain_send(void)
 			continue;
 		}
 		if (rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
-			lms_outbound_requeue_head(&slot);
+			lms_outbound_requeue_head(worker_id, &slot);
 			break;
 		}
 		/* HARD_ERROR: peer down — drop;  requesters retry fail-closed. */
@@ -222,15 +253,21 @@ cluster_lms_outbound_drain_send(void)
 }
 
 uint32
-cluster_lms_outbound_depth(void)
+cluster_lms_outbound_depth(int worker_id)
 {
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
 	uint32 depth;
 
-	if (cluster_lms_outbound_state == NULL || cluster_lms_outbound_lock == NULL)
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return 0;
-	LWLockAcquire(cluster_lms_outbound_lock, LW_SHARED);
-	depth = cluster_lms_outbound_state->count;
-	LWLockRelease(cluster_lms_outbound_lock);
+	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
+		return 0;
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+	LWLockAcquire(lock, LW_SHARED);
+	depth = ring->count;
+	LWLockRelease(lock);
 	return depth;
 }
 
