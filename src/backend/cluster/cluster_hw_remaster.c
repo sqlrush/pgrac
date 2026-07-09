@@ -101,7 +101,9 @@ hw_remaster_record_terminal(int dead_node, ClusterHwRemasterResult res)
 	 * that observes the terminal result also observes the matching backoff
 	 * deadline — without the fence a weakly-ordered CPU could let it pair a
 	 * fresh BLOCKED with a stale (zero) deadline and skip one backoff wait
-	 * (bounded self-correcting, but cheap to close outright). */
+	 * (bounded self-correcting, but cheap to close outright).  r3-P3(b):
+	 * paired with the pg_read_barrier() between the result and deadline
+	 * loads in cluster_hw_remaster_launch_workers (acquire/release pair). */
 	if (res == CLUSTER_HW_REMASTER_DONE) {
 		cluster_hw_remaster_set_next_attempt_at(dead_node, 0);
 		pg_memory_barrier();
@@ -657,6 +659,16 @@ cluster_hw_remaster_launch_workers(const uint64 *dead, int nwords, uint64 episod
 		}
 
 		result = cluster_hw_remaster_result(node);
+		/* r3-P3(b) — read-side pairing for the hw_remaster_record_terminal
+		 * write fence (deadline stored BEFORE the terminal result, with
+		 * pg_memory_barrier between).  Load the result FIRST, fence, then the
+		 * deadline: a decider that observed a terminal result is then
+		 * guaranteed to observe the matching backoff deadline.  Without this
+		 * the release fence is one-sided and a weakly-ordered reader could
+		 * still pair a fresh BLOCKED with a stale (zero) deadline.  attempts
+		 * needs no fence: it is written only by this FSM (single-writer
+		 * LMON). */
+		pg_read_barrier();
 		attempts = cluster_hw_remaster_attempts(node);
 		next_attempt_at = cluster_hw_remaster_next_attempt_at(node);
 		d = cluster_hw_remaster_relaunch_decide(launched, episode_epoch, result, attempts,
