@@ -46,7 +46,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
-        test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
+        test_cluster_subtrans test_cluster_multixact test_cluster_mxid_stripe \
+        test_cluster_undo_format \
         test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
@@ -1851,4 +1852,18 @@ test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \
 		$(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XID_STRIPE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-7.1 D3-a: test_cluster_mxid_stripe — truth tables for the mxid
+# stripe pure derivation layer (half-space origin derivation / striped
+# candidate arithmetic incl. 2^32 wrap + InvalidMultiXactId skip /
+# half-space guardrail predicate / runtime latch wrappers / "PGXM"
+# activation-slot extension record integrity, which pulls in libpgport
+# for CRC32C).  Links cluster_mxid_stripe.o standalone; stubs the boot
+# lazy latch to a no-op.
+CLUSTER_MXID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_mxid_stripe.o
+test_cluster_mxid_stripe: test_cluster_mxid_stripe.c unit_test.h \
+		$(CLUSTER_MXID_STRIPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_MXID_STRIPE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
