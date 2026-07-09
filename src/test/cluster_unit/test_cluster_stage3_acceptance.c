@@ -381,7 +381,8 @@ UT_TEST(test_stage3_wait_events_count_snapshot_121)
 	 * adding a wait event MUST bump this snapshot (it is current state, not
 	 * "==93 forever").  spec-4.6 D4: 97 → 98;  spec-4.7 D1: 98 → 99
 	 * (+ ClusterGCSBlockRecovering);  spec-4.11 D5: 99 → 100
-	 * (+ ClusterThreadRecovery).  spec-6.13 D8 -> 118; spec-5.22b D2-6 +3 undo-block waits -> 121. * */
+	 * (+ ClusterThreadRecovery).  spec-6.13 D8 -> 118;
+	 * spec-5.22b D2-6 +3 undo-block waits -> 121. */
 	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 121);
 }
 

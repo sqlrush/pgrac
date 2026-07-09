@@ -1570,6 +1570,37 @@ cluster_undo_reader_lookup_count(void)
 {
 	return 0;
 }
+/* spec-5.22b D2-6 stubs: 6 undo GCS grant-plane counters referenced by dump_undo. */
+uint64
+cluster_undo_gcs_grant_shared_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_grant_exclusive_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_ship_bytes(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_invalidate_notify_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_remaster_deny_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_local_fast_path_count(void)
+{
+	return 0;
+}
 /* spec-3.8 D11 stubs: 4 NEW lifecycle counters referenced by dump_undo. */
 uint64
 cluster_undo_autoextend_count(void)

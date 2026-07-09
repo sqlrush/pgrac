@@ -96,6 +96,7 @@ cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expecte
 		 * fail-closed here and lands with its incarnation check + consumer in
 		 * D6.  The peer-reads-foreign S-grant below is D2-3's delivered heart.
 		 */
+		cluster_undo_gcs_count_local_fast_path(); /* D2-6: master==self routing taken */
 		return false; /* honest fail-closed forward (D6); never a stale local serve */
 	}
 
@@ -115,7 +116,8 @@ cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expecte
 	if (!cluster_undo_serve_allowed(cluster_cssd_get_peer_state(owner) != CLUSTER_CSSD_PEER_DEAD,
 									cluster_grd_recovery_in_progress())) {
 		res->status = (uint8)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING;
-		return false; /* fail-closed; serve = D4 */
+		cluster_undo_gcs_count_remaster_deny(); /* D2-6 */
+		return false;							/* fail-closed; serve = D4 */
 	}
 
 	/*
@@ -147,6 +149,7 @@ cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expecte
 	res->live_hwm_lsn = auth.live_hwm_lsn;
 	res->tt_generation = auth.tt_generation;
 	res->status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+	cluster_undo_gcs_count_grant_shared(GCS_BLOCK_DATA_SIZE); /* D2-6: S-grant + shipped bytes */
 	return true;
 }
 
@@ -187,6 +190,8 @@ cluster_undo_block_acquire_exclusive(const ClusterResId *undo_resid)
 	if (!cluster_undo_block_master_is_self(undo_resid))
 		return false;
 
+	cluster_undo_gcs_count_grant_exclusive(); /* D2-6: local X grant */
+	cluster_undo_gcs_count_local_fast_path(); /* D2-6: master==self, zero network */
 	return true;
 }
 
@@ -259,5 +264,6 @@ cluster_undo_block_invalidate_peers(const ClusterResId *undo_resid, SCN write_sc
 		notified++;
 	}
 
+	cluster_undo_gcs_count_invalidate_notify(notified); /* D2-6 */
 	return notified;
 }

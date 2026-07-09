@@ -118,6 +118,7 @@
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_shmem_register (spec-5.57 D3) */
 #include "cluster/cluster_xid_stripe.h" /* CLUSTER_XID_STRIDE boot validation (spec-6.15 D1) */
 #include "cluster/cluster_tt_durable.h" /* cluster_tt_durable_shmem_register (spec-3.11 D7) */
+#include "cluster/cluster_undo_gcs.h"	/* cluster_undo_gcs_shmem_register (spec-5.22b D2-6) */
 #include "cluster/cluster_sf_dep.h"		/* cluster_sf_dep_shmem_register (spec-6.2 D6) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_itl.h"			   /* cluster_lock_path_shmem_register (spec-3.4e D6) */
@@ -550,6 +551,13 @@ cluster_init_shmem_module(void)
 	 * counters, 0 LWLock).
 	 */
 	cluster_tt_durable_shmem_register();
+
+	/*
+	 * PGRAC spec-5.22b D2-6:  register undo GCS data-plane counters shmem
+	 * region (grant S/X, ship bytes, invalidate notify, remaster deny,
+	 * local-fast-path; 6 atomic counters, 0 LWLock).
+	 */
+	cluster_undo_gcs_shmem_register();
 
 	/* spec-6.2 D6: Smart Fusion dependency-vector store.  Size is zero unless
 	 * cluster.smart_fusion=on, preserving default-off behavior. */

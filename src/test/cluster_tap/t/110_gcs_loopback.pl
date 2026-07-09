@@ -10,7 +10,7 @@
 #	  L1  fresh cluster startup:  pg_cluster_state.gcs has 67 keys
 #	  L2  api_state = "active" after postmaster phase 1 init
 #	  L3  WAIT_EVENT_GCS_REPLY_WAIT registered in pg_stat_cluster_wait_events
-#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 118 (cumulative through spec-6.13)
+#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 121 (cumulative through spec-6.13)
 #	  L5  msg_type registry surface visible:  pg_cluster_ic_msg_types has
 #	       gcs_request + gcs_reply rows
 #	  L6  workload (SELECT/UPDATE/VACUUM) does NOT inc send_request_count
@@ -87,11 +87,11 @@ is($gcs_reply_wait_event, '1',
    'L3 ClusterGcsReplyWait wait event registered (spec-2.32 D7)');
 
 
-# L4 — CLUSTER_WAIT_EVENTS_COUNT == 118 (spec-6.13).
+# L4 — CLUSTER_WAIT_EVENTS_COUNT == 121 (spec-6.13).
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
-is($total_wait_events, '118',
-	'L4 wait_events count 118 (spec-6.13 RDMA wait surface)');
+is($total_wait_events, '121',
+	'L4 wait_events count 121 (spec-6.13 RDMA wait surface)');
 
 
 # L6 — Production workload does NOT trigger wire path (HC72 short-circuit).

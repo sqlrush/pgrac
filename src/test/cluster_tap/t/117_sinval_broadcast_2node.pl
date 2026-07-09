@@ -93,8 +93,8 @@ cmp_ok($catver, '>=', 202605450,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'118',
-	'L3 wait event count == 118 (spec-6.13 RDMA wait surface)');
+	'121',
+	'L3 wait event count == 121 (spec-6.13 RDMA wait surface)');
 
 
 # ============================================================

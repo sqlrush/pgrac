@@ -424,6 +424,11 @@ cluster_tt_status_shmem_register(void)
 void
 cluster_tt_local_shmem_register(void)
 {}
+/* spec-5.22b D2-6 stub: cluster_init_shmem_module also calls
+ * cluster_undo_gcs_shmem_register. */
+void
+cluster_undo_gcs_shmem_register(void)
+{}
 
 /* spec-3.2 D3 stub: cluster_init_shmem_module also calls
  * cluster_tt_status_hint_shmem_register. */

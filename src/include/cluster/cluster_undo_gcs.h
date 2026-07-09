@@ -310,4 +310,30 @@ extern bool cluster_undo_block_acquire_exclusive(const ClusterResId *undo_resid)
  */
 extern int cluster_undo_block_invalidate_peers(const ClusterResId *undo_resid, SCN write_scn);
 
+/*
+ * Undo GCS data-plane observability (D2-6, cluster_undo_gcs_stat.c).
+ *
+ *	Shmem region (six atomic counters, no LWLock) + bump hooks + lock-free read
+ *	accessors for the owner-as-master grant plane.  The runtime primitives above
+ *	call the bump hooks; dump_undo (cluster_debug.c) reads the accessors.  The
+ *	counters are register-ahead of a live consumer (skeleton-ahead, D2-3/D2-4):
+ *	at rest every counter reads 0, but the surface is present + queryable now.
+ */
+extern Size cluster_undo_gcs_shmem_size(void);
+extern void cluster_undo_gcs_shmem_init(void);
+extern void cluster_undo_gcs_shmem_register(void);
+
+extern void cluster_undo_gcs_count_grant_shared(uint32 bytes);
+extern void cluster_undo_gcs_count_grant_exclusive(void);
+extern void cluster_undo_gcs_count_invalidate_notify(int peers);
+extern void cluster_undo_gcs_count_remaster_deny(void);
+extern void cluster_undo_gcs_count_local_fast_path(void);
+
+extern uint64 cluster_undo_gcs_grant_shared_count(void);
+extern uint64 cluster_undo_gcs_grant_exclusive_count(void);
+extern uint64 cluster_undo_gcs_ship_bytes(void);
+extern uint64 cluster_undo_gcs_invalidate_notify_count(void);
+extern uint64 cluster_undo_gcs_remaster_deny_count(void);
+extern uint64 cluster_undo_gcs_local_fast_path_count(void);
+
 #endif /* CLUSTER_UNDO_GCS_H */
