@@ -54,6 +54,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
+#include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -512,7 +513,32 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		return false; /* neither explicit CLOG state -> refuse */
 
 	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
-		/* spec-7.1 D0 census: the delayed-cleanout window leg (D1 target). */
+		/*
+		 * spec-7.1 D1 serve: the durable by-xid scan matched our own xid but
+		 * the slot carries no stamped commit_scn (delayed-cleanout window).
+		 * Per IN-5, normal commit stamps the durable TT pre-commit (Fast
+		 * Commit), so a committed xid never lands here; the real population is
+		 * aborted-unstamped (abort writes no durable commit_scn).  Cross-check
+		 * CLOG -- authoritative for our own xid -- and answer a provably
+		 * ABORTED xid positively (invisible at the requester) instead of
+		 * 53R97.  This mirrors the RECYCLED_ZERO_MATCH CLOG cross-check above.
+		 *
+		 * 8.A (positive proof only): we ONLY upgrade on an explicit CLOG abort.
+		 * A committed-but-unstamped xid (we cannot fabricate its commit_scn),
+		 * an in-flight/in-doubt xid (crash or 2PC-prepared window), or any
+		 * transaction whose CLOG state is not yet a definite abort stays
+		 * fail-closed on the invalid_scn refuse leg -- the refuse direction is
+		 * unchanged.  TransactionIdDidAbort returns true only for an explicit
+		 * abort record, so a crashed-without-abort xid does NOT upgrade here.
+		 * The abort->ABORTED / else->REFUSE decision is the pure, unit-tested
+		 * cluster_cr_server_invalid_scn_verdict (test_cluster_cr_server_policy).
+		 */
+		if (cluster_cr_server_invalid_scn_verdict(TransactionIdDidAbort(xid))
+			== CLUSTER_CR_INVALID_SCN_ABORTED) {
+			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+			cluster_vis53r97_note_live_upgrade_hit();
+			return true;
+		}
 		cluster_vis53r97_note_srv_invalid_scn();
 		return false;
 

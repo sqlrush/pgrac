@@ -82,6 +82,22 @@ extern ClusterCrServerSplit cluster_cr_server_split_classify(const int32 *chain_
 															 int *out_prefix_len);
 
 /*
+ * spec-7.1 D1 serve: pure verdict decision for the durable
+ * XID_MATCH_INVALID_SCN case (our own xid matched but carries no stamped
+ * commit_scn -- the delayed-cleanout window).  8.A: ONLY an explicit CLOG
+ * abort upgrades to a positive ABORTED answer; a committed-but-unstamped,
+ * in-flight, 2PC-prepared or crashed-without-abort xid stays fail-closed (we
+ * never fabricate a commit_scn).  Pure (no shmem / lock / elog) so
+ * cluster_unit exercises both branches standalone.
+ */
+typedef enum ClusterCrInvalidScnVerdict {
+	CLUSTER_CR_INVALID_SCN_REFUSE = 0, /* no positive proof -> fail closed */
+	CLUSTER_CR_INVALID_SCN_ABORTED = 1 /* CLOG proved abort -> positive invisible */
+} ClusterCrInvalidScnVerdict;
+
+extern ClusterCrInvalidScnVerdict cluster_cr_server_invalid_scn_verdict(bool clog_did_abort);
+
+/*
  * LMS CR work slots (shmem, embedded in the cluster_lms region).
  *
  *	Slot lifecycle: FREE -(LMON submit)-> PENDING -(LMS drain)-> BUSY

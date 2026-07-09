@@ -2670,6 +2670,8 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_ask_count()));
 	emit_row(rsinfo, "cr", "vis53r97_leg_xmin_overlay_verdict_hit_count",
 			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_hit_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_live_upgrade_hit_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_live_upgrade_hit_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

@@ -285,6 +285,10 @@ extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void);
 extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void);
 extern void cluster_vis53r97_note_xmin_overlay_verdict_ask(void);
 extern void cluster_vis53r97_note_xmin_overlay_verdict_hit(void);
+/* spec-7.1 D1 serve 半边: INVALID_SCN -> positive ABORTED via CLOG (hit); the
+ * miss counterpart is invalid_scn_refuse_count / note_srv_invalid_scn. */
+extern uint64 cluster_vis53r97_leg_live_upgrade_hit_count(void);
+extern void cluster_vis53r97_note_live_upgrade_hit(void);
 
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict

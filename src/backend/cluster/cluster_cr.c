@@ -202,6 +202,17 @@ typedef struct ClusterCRShared {
 	 */
 	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_ask_count;
 	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_hit_count;
+	/*
+	 * spec-7.1 D1 serve 半边: the origin LMS verdict serve upgraded a durable
+	 * XID_MATCH_INVALID_SCN hit (unstamped commit_scn, delayed-cleanout window)
+	 * to a positive ABORTED answer by cross-checking CLOG (authoritative for
+	 * our own xid).  hit = the leg resolved positively (aborted-unstamped, the
+	 * IN-5 real population); the miss counterpart is invalid_scn_refuse_count
+	 * above (an INVALID_SCN hit that stays fail-closed: in-flight, 2PC-prepared,
+	 * crash window, or committed-but-unstamped -- no fabricated commit_scn).
+	 * 8.A: positive proof only; direction of every refuse leg is unchanged.
+	 */
+	pg_atomic_uint64 vis53r97_leg_live_upgrade_hit_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -292,6 +303,7 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_live_upgrade_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -512,10 +524,21 @@ cluster_vis53r97_note_xmin_overlay_verdict_hit(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 1);
 }
+
+/* spec-7.1 D1 serve 半边: INVALID_SCN durable hit upgraded to positive ABORTED
+ * via CLOG cross-check (the miss counterpart is note_srv_invalid_scn). */
+void
+cluster_vis53r97_note_live_upgrade_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_live_upgrade_hit_count, 1);
+}
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_ask_count,
 					vis53r97_leg_xmin_overlay_verdict_ask_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_hit_count,
 					vis53r97_leg_xmin_overlay_verdict_hit_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_live_upgrade_hit_count,
+					vis53r97_leg_live_upgrade_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)

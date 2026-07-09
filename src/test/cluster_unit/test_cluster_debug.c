@@ -1925,6 +1925,11 @@ cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void)
 {
 	return 0;
 }
+uint64
+cluster_vis53r97_leg_live_upgrade_hit_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)
