@@ -2123,24 +2123,44 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 		return;
 
 	/*
-	 * spec-4.6a Amendment v1.2 (R2): REDECLARE_DONE converges on the COMPOSITE
-	 * key (episode_epoch, dead_bitmap_hash).  A stale DONE from a previous
-	 * episode can carry the same epoch when cur==old, so epoch monotonicity
-	 * alone is not enough — but the previous episode's dead SET necessarily
-	 * differs (a coordinator re-election adds the old coordinator to it; a
-	 * re-death of the same node rides a higher epoch via the interposed JOIN
-	 * bump), so the bitmap hash is the ABA guard.  Flap-history drift changes
-	 * only the per-instance dead_generation, never the sender's accepted dead
-	 * SET, so same-set DONEs match here (the R2 wedge fix).  r3-P2-2: the
-	 * bitmap is NOT quorum-ratified — under multi-death detection skew a
-	 * behind survivor transiently stamps (and announces) a SMALLER set's hash
-	 * at the same epoch; those frames are dropped HERE until its own CSSD
-	 * catches up and the mid-episode re-consume guard re-stamps + re-announces
-	 * the full set (grd_recovery_consume_new_event_mid_episode).  Per-tick
-	 * re-announce then converges the accounting.
-	 * Pre-accept frames mismatch the previous episode's stamp and are dropped;
-	 * senders re-announce every tick, so accounting lands after our P0 accept
-	 * (which also closes the R4 pre-accept window by construction).
+	 * The two accounting axes feed DIFFERENT consumers and must not share
+	 * one drop gate (nightly regression: t/347 L4-iii / t/353 L5 joiner
+	 * write wedge):
+	 *
+	 * 1. done_epoch[] — monotonic-max, UNCONDITIONAL (the spec-4.6 axis;
+	 *    never regress on a delayed lower-epoch frame).  Consumed epoch-only
+	 *    by the spec-5.16 D3 join fence (cluster_grd_block_view_rebuilt): a
+	 *    DONE at epoch E proves the sender completed its WAIT_BARRIER at E —
+	 *    the cluster-wide rebind plus the FULL block re-declare scan against
+	 *    then-current routing — which is the fence's safety condition
+	 *    regardless of the sender's episode dead set.  Crucially, a
+	 *    rejoining node never P0-accepts the JOIN episode as its own FSM
+	 *    episode (spec-5.16 D8: JOIN_COMMITTED is coordinator-side only), so
+	 *    its local episode-hash stamp stays 0/stale forever; gating this
+	 *    axis on the composite key drops every survivor DONE on the joiner,
+	 *    its join fence never lifts, and every joiner-home block access
+	 *    fail-closes 53R9L permanently.
+	 *
+	 * 2. done_bitmap_hash[] — composite-gated (spec-4.6a Amendment v1.2 R2).
+	 *    Read together with done_epoch[] as the (episode_epoch,
+	 *    dead_bitmap_hash) composite key by the P6 cluster gate and the
+	 *    WAIT_EPOCH coordinator witness.  A stale DONE from a previous
+	 *    episode can carry the same epoch when cur==old, but its dead SET
+	 *    necessarily differs (a coordinator re-election adds the old
+	 *    coordinator to it; a re-death of the same node rides a higher epoch
+	 *    via the interposed JOIN bump), so the hash is the ABA guard:
+	 *    mismatching frames withhold the hash half and the composite
+	 *    consumers stay fail-closed.  Flap-history drift changes only the
+	 *    per-instance dead_generation, never the sender's accepted dead SET,
+	 *    so same-set DONEs match here (the R2 wedge fix).  r3-P2-2: the
+	 *    bitmap is NOT quorum-ratified — under multi-death detection skew a
+	 *    behind survivor transiently announces a SMALLER set's hash at the
+	 *    same epoch; those frames withhold the hash half until its own CSSD
+	 *    catches up and the mid-episode re-consume guard re-stamps +
+	 *    re-announces the full set
+	 *    (grd_recovery_consume_new_event_mid_episode).  Per-tick re-announce
+	 *    then converges the accounting after our P0 accept (the R4
+	 *    pre-accept window stays closed for the composite consumers).
 	 *
 	 * r3-P3(a) — the `== 0` arm treats 0 as "unstamped/pre-accept" (our own
 	 * recovery_event_bitmap_hash is 0 before the first P0 accept).  This
@@ -2148,19 +2168,17 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	 * bitmap and hash_bytes_extended(zero[16], 0) is a fixed nonzero
 	 * constant (asserted at the stamp site).
 	 */
-	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
-	if (dead_bitmap_hash == 0 || dead_bitmap_hash != episode_bitmap_hash)
-		return;
-
-	/* spec-4.6a §2.3: monotonic-max accounting.  Under strictly-monotonic
-	 * per-event epochs the incoming value always wins, but never regress the
-	 * published value if a delayed lower-epoch frame ever slips through. */
 	{
 		uint64 prev = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[node]);
 
 		if (epoch > prev)
 			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[node], epoch);
 	}
+
+	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
+	if (dead_bitmap_hash == 0 || dead_bitmap_hash != episode_bitmap_hash)
+		return;
+
 	pg_atomic_write_u64(&cluster_grd_state->recovery_done_bitmap_hash[node], dead_bitmap_hash);
 }
 

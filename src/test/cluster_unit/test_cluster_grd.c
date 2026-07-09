@@ -4172,13 +4172,27 @@ UT_TEST(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance)
 
 	/* Old-event ABA shape: a late DONE naming a DIFFERENT dead set (node 3
 	 * instead of node 2 — e.g. the previous episode before a coordinator
-	 * re-election) is dropped: nothing is accounted. */
+	 * re-election) withholds the composite hash half.  The epoch axis
+	 * accounts unconditionally (the spec-5.16 join-fence liveness feed —
+	 * see cluster_grd_recovery_mark_peer_done); the composite consumers
+	 * stay blocked, pinned by the no-escape tick below. */
 	memset(old_dead, 0, sizeof(old_dead));
 	old_dead[0] = 0x08;
 	old_event_hash = cluster_grd_dead_bitmap_hash(old_dead);
 	cluster_grd_recovery_mark_peer_done(0, 10, old_event_hash);
 	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), 0);
-	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 0);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 10);
+
+	/* Deadline expiry with ONLY the stale-set DONE accounted: the witness
+	 * must NOT fire (its hash conjunct is unsatisfied), and the FSM stays
+	 * fail-closed in WAIT_EPOCH — the epoch axis alone can never unlock the
+	 * composite escape. */
+	cluster_grd_recovery_counters_snapshot(&before);
+	ut_mock_now = (int64)60 * 1000000;
+	cluster_grd_recovery_lmon_tick();
+	cluster_grd_recovery_counters_snapshot(&after);
+	UT_ASSERT_EQ(after.wait_epoch_escape, before.wait_epoch_escape);
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_EPOCH);
 
 	/* Generation-drift shape (the R2 wedge): the peer's local event_id
 	 * differs, but its DONE names the SAME quorum dead set -> the composite
@@ -4189,9 +4203,11 @@ UT_TEST(test_recovery_stale_bitmap_done_rejected_and_drifted_witness_advance)
 
 	/* Witness advance: deadline expired + cur==old + coordinator DONE naming
 	 * THIS dead set at exactly cur, accounted after the accept snapshot.  The
-	 * FSM takes the composite-key equal-epoch escape exactly once. */
+	 * FSM takes the composite-key equal-epoch escape exactly once.  (The
+	 * no-proof tick above re-armed the deadline to +rebuild_timeout, so jump
+	 * well past it.) */
 	cluster_grd_recovery_counters_snapshot(&before);
-	ut_mock_now = (int64)60 * 1000000;
+	ut_mock_now = (int64)130 * 1000000;
 	cluster_grd_recovery_lmon_tick();
 	cluster_grd_recovery_counters_snapshot(&after);
 	UT_ASSERT_EQ(after.wait_epoch_escape, before.wait_epoch_escape + 1);
@@ -4242,15 +4258,17 @@ UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
 	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_small);
 
-	/* The wedge shape: a full-set DONE from the coordinator is dropped while
-	 * this node's stamp is behind. */
+	/* The wedge shape: a full-set DONE from the coordinator withholds the
+	 * composite hash half while this node's stamp is behind (the epoch axis
+	 * accounts unconditionally for the join-fence liveness feed; P6 still
+	 * blocks on the missing hash). */
 	memset(grown, 0, sizeof(grown));
 	grown[0] = 0x06; /* {1,2} */
 	h_grown = cluster_grd_dead_bitmap_hash(grown);
 	UT_ASSERT_NE(h_grown, h_small);
 	cluster_grd_recovery_mark_peer_done(0, 11, h_grown);
 	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), 0);
-	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 0);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 11);
 
 	/* Local CSSD catches up: NEW event_id, SAME epoch, GROWN dead set. */
 	cluster_grd_recovery_counters_snapshot(&c0);
@@ -4324,6 +4342,62 @@ UT_TEST(test_recovery_same_epoch_same_set_drift_absorbed_no_churn)
 	cluster_enabled = false;
 	ut_mock_now = 0;
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+}
+
+/* Joiner-side DONE-accounting liveness (nightly t/347 L4-iii / t/353 L5
+ * regression pin).  A rejoining node never P0-accepts the JOIN episode as
+ * its own FSM episode (spec-5.16 D8: JOIN_COMMITTED is published
+ * coordinator-side only), so its local episode-hash stamp stays 0 forever.
+ * The survivors' per-tick REDECLARE_DONE re-announces are that node's ONLY
+ * feed for the spec-5.16 D3 join fence (cluster_grd_block_view_rebuilt);
+ * gating the done_epoch axis on the composite key drops every frame on the
+ * joiner, the fence never lifts, and every joiner-home block access
+ * fail-closes 53R9L until the caller's retry budget burns out.  The epoch
+ * axis must account unconditionally — a DONE at epoch E proves the sender
+ * completed its WAIT_BARRIER at E (cluster-wide rebind + full block
+ * re-declare scan against then-current routing), which is the fence's
+ * safety condition regardless of the sender's episode dead set — while the
+ * composite hash half stays withheld pre-accept (P6 gate and WAIT_EPOCH
+ * witness unchanged). */
+UT_TEST(test_recovery_idle_joiner_accounts_done_epoch_for_fence)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 zero_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	BufferTag tag;
+	uint64 join_hash;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node(); /* FSM IDLE, episode hash stamp 0: never accepted */
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+	ut_mock_static_master = 1; /* the rejoiner's home block */
+
+	/* The real JOIN-episode DONE payload: hash of the all-zero dead bitmap
+	 * (nonzero by the r3-P3(a) invariant). */
+	memset(zero_bitmap, 0, sizeof(zero_bitmap));
+	join_hash = cluster_grd_dead_bitmap_hash(zero_bitmap);
+	UT_ASSERT_NE(join_hash, 0);
+
+	UT_ASSERT(cluster_grd_join_remaster_active_for_shard(tag));
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
+
+	/* Survivor DONEs arrive while this node's FSM is IDLE and unstamped
+	 * (node 1 is this episode's recipient — skipped by the barrier). */
+	cluster_grd_recovery_mark_peer_done(1, 10, join_hash);
+	cluster_grd_recovery_mark_peer_done(0, 10, join_hash);
+	cluster_grd_recovery_mark_peer_done(2, 10, join_hash);
+
+	/* Epoch axis accounted -> the join fence lifts (the wedge fix)... */
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 10);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(2), 10);
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+
+	/* ...while the composite hash half stays withheld pre-accept (v1.2 R2:
+	 * P6 / witness consumers remain fail-closed on this node). */
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), 0);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(2), 0);
 }
 
 
@@ -4447,6 +4521,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	/* spec-4.6a r3-P2-2 — same-epoch multi-death detection-skew closure. */
 	UT_RUN(test_recovery_same_epoch_dead_set_growth_restamps);
 	UT_RUN(test_recovery_same_epoch_same_set_drift_absorbed_no_churn);
+
+	/* spec-4.6a nightly regression — joiner-side DONE accounting liveness. */
+	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
