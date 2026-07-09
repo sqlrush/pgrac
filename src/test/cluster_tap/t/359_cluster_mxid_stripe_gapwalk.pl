@@ -23,16 +23,21 @@
 #       the refusal branch (the organic trigger needs 2^31 multixacts);
 #       the guardrail counter becomes visible in the dump and creation
 #       recovers after disarm.
-#   G5  overlay-miss negative leg: with the origin's overlay emit
-#       suppressed (member cap below the composed member count), the
-#       remote read of an updater multi fails closed 53R9C -- positive
-#       resolution never guesses on a miss.
+#   G5  overlay-capped positive leg (spec-7.1 D3-b): with the requester
+#       overlay capped below the composed member count, the read STILL
+#       resolves positively -- the origin member serve reads its own
+#       pg_multixact directly, independent of the requester overlay (which
+#       never covers updater multis anyway, IN-12).
 #
-#   The positive-resolution legs (foreign updater multi resolves through
-#   the member overlay) live in t/357, whose floor legs turned positive
-#   with this deliverable.
+#   The floor->positive legs for foreign updater multis (member serve) also
+#   live in t/357, whose L2/L3 legs turned positive with this deliverable;
+#   the fail-closed direction is covered by t/357 L5 (requester ask GUC off)
+#   and the served-resolver unit truth table.  The dedicated origin-refuse
+#   e2e leg (cluster-lms-undo-fetch is PGC_POSTMASTER, must be boot-armed --
+#   t/346 idiom) is a chaos-harness follow-up.
 #
-# Spec: spec-7.1-cross-instance-positive-interread.md (D3-a)
+# Spec: spec-7.1-cross-instance-positive-interread.md (D3-a derivation +
+#       D3-b origin member-verdict serve)
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -121,6 +126,22 @@ sub bq
 	my $ok = eval { $bg->query_safe($sql); 1 };
 	diag("step $tag FAILED: $@") if !$ok;
 	return $ok;
+}
+
+# Cross-node positive reads converge once node1's clock observes the origin
+# commit_scn (a lagging snapshot may briefly still see the pre-update row --
+# correct MVCC, not a false-visible); retry to the expected answer.
+sub read_converge
+{
+	my ($node, $sql, $want, $tries) = @_;
+	my ($rc, $out, $err) = (1, '', '');
+	for my $i (1 .. $tries)
+	{
+		($rc, $out, $err) = $node->psql('postgres', $sql, timeout => 15);
+		return ($rc, $out, $err) if $rc == 0 && $out eq $want;
+		usleep(500_000);
+	}
+	return ($rc, $out, $err);
 }
 
 # One lock-only multixact per round on $node against $table (two
@@ -276,14 +297,15 @@ is(burn_multis($node1, 'mxgw_t', 160, 'G2'),
 	}
 	eval { $bgu->quit };
 
+	# D3-b: capping the overlay no longer fails closed.  The origin member
+	# serve reads its OWN pg_multixact directly (independent of the requester
+	# overlay -- which never covers updater multis anyway, IN-12), so node1
+	# resolves positively and converges to the committed update.  This
+	# deterministically exercises the D3-b origin-serve path.
 	my ($rc, $out, $err) =
-	  $node1->psql('postgres', 'SELECT aid, v FROM mxgw_g5 WHERE aid = 17', timeout => 15);
-	isnt($rc, 0, 'G5 remote read of the unemitted updater multi fails closed');
-	like(
-		$err,
-		qr/multixact member overlay miss|TT status unknown for deleting xmax/,
-		'G5 clean overlay-miss fail-closed message');
-	unlike($out, qr/17\|0/, 'G5 the superseded version is NEVER returned');
+	  read_converge($node1, 'SELECT aid, v FROM mxgw_g5 WHERE aid = 17', '17|500', 20);
+	is($rc, 0, 'G5 overlay-capped miss resolves positively via the origin member serve');
+	is($out, '17|500', 'G5 node1 converges to the committed update (origin serve, not overlay)');
 
 	$node0->append_conf('postgresql.conf', 'cluster.multixact_member_overlay_max_members = 32');
 	$node0->reload;

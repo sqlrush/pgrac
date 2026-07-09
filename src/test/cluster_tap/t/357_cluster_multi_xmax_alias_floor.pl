@@ -13,30 +13,38 @@
 #       activation floor) -- the creator can read its own updater multi
 #       again (L4), lifting the D3-0 floor's blanket cost;
 #     - a DERIVED-FOREIGN updater multi is resolved through the member
-#       overlay when it HITS, else fails closed 53R9C.  The proactive V4
+#       overlay when it HITS, else served by the origin: the proactive V4
 #       overlay never covers updater-bearing multis (the updater has no
 #       TT binding at heap_update compose time -- see multixact.c
 #       spec-7.1 D3-a note), so cross-node positive resolution of those
-#       multis is served by the member-serve slow path = spec-7.1 D3-b
-#       (software-ordered behind spec-7.2 D3).  Until D3-b, foreign
-#       updater multis stay fail-closed (L2/L3) -- never silently wrong.
+#       multis is served by the member-serve slow path = spec-7.1 D3-b:
+#       the reader asks the origin (sole owner of the multi's members)
+#       for a batched per-member verdict and resolves against its own
+#       snapshot.  Only when the origin cannot prove every updater member
+#       (origin down / member unprovable) does the read fail closed 53R9C.
 #
 #   L1  lockers-only multi, committed  -> remote read still answers (no
 #       over-blocking: lock-only never needs a member decode)
-#   L2  keyshare+update multi          -> remote read fails closed 53R9C
-#       (derived foreign, overlay miss; positive = D3-b member serve).
-#       NEVER the silent-wrong native alias (pre-floor P0)
+#   L2  keyshare+update multi          -> remote read resolves POSITIVELY
+#       via the D3-b origin member-verdict serve, converging to the
+#       committed update (the old version is invisible once the origin's
+#       updater terminal is observed).  NEVER the silent-wrong native
+#       alias (pre-floor P0)
 #   L3  probe F: the reader first advances its OWN multixact counter past
-#       the foreign id -> read STILL fails closed (origin derivation is
-#       immune to the local counter position; the silent-wrong P0 can no
-#       longer happen by construction -- the superseded row is never
-#       returned)
+#       the foreign id -> read STILL resolves POSITIVELY to the committed
+#       update (origin derivation is immune to the local counter position;
+#       the silent-wrong P0 can never happen -- the superseded row is
+#       never the converged answer)
 #   L4  creator-side read of its own updater-multi OLD version resolves
 #       natively -- a DERIVED-OWN multi decodes alias-free above the
 #       activation floor (was: the D3-0 floor's documented availability
 #       cost; this is the D3-a positive win over the blanket floor)
+#   L5  revert valve: cluster.multi_xmax_remote_resolve = off drops the
+#       D3-b ask and keeps the derived-foreign fail-closed floor (never a
+#       native silent-wrong alias)
 #
-# Spec: spec-7.1-cross-instance-positive-interread.md (D3-a)
+# Spec: spec-7.1-cross-instance-positive-interread.md (D3-a origin
+#       derivation + D3-b origin member-verdict serve)
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -203,14 +211,17 @@ sub read_converge
 	eval { $bg1->quit };
 	eval { $bg2->quit };
 
+	# D3-b: node1 asks the origin (node0) for the multi's member verdict,
+	# resolves the updater terminal against its own snapshot, and converges
+	# to the committed update once its clock observes the origin commit_scn
+	# (a lagging snapshot may briefly still see the pre-update row -- correct
+	# MVCC, not a false-visible; convergence to 11|100 proves the positive
+	# path AND the absence of a PERSISTENT superseded read).
 	my ($rc, $out, $err) =
-	  $node1->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
-	isnt($rc, 0,
-		'L2 updater multi: remote read fails closed (derived foreign; positive = D3-b member serve)');
-	like(
-		$err,
-		qr/cannot be attributed to an origin node|multixact member overlay miss|TT status unknown for deleting xmax/,
-		'L2 updater multi: clean 53R9C floor message (not a raw native multixact error)');
+	  read_converge($node1, 'SELECT aid, v FROM mxf_t WHERE aid = 11', '11|100', 20);
+	is($rc, 0, 'L2 updater multi: remote read resolves positively (D3-b origin member serve)');
+	is($out, '11|100',
+		'L2 updater multi: node1 converges to the committed update (old version invisible)');
 	unlike($err, qr/has not been created yet/,
 		'L2 updater multi: native id-space error never surfaces');
 }
@@ -238,15 +249,16 @@ sub read_converge
 		eval { $bgy->quit };
 	}
 
+	# D3-b probe F: even after node1 advanced its OWN multixact counter past
+	# the foreign id, the STRIPED-value derivation still identifies the multi
+	# as foreign and asks the origin -- so node1 converges to the committed
+	# update, NEVER the superseded 11|0 native alias (the pre-floor P0).  A
+	# regression to the native alias would return 11|0 persistently and this
+	# convergence would time out.
 	my ($rc, $out, $err) =
-	  $node1->psql('postgres', 'SELECT aid, v FROM mxf_t WHERE aid = 11', timeout => 15);
-	isnt($rc, 0,
-		'L3 probe F: aliased read still fails closed (derivation immune to local counter position)');
-	like(
-		$err,
-		qr/cannot be attributed to an origin node|multixact member overlay miss|TT status unknown for deleting xmax/,
-		'L3 probe F: floor message');
-	unlike($out, qr/11\|0/, 'L3 probe F: the superseded version is NEVER returned');
+	  read_converge($node1, 'SELECT aid, v FROM mxf_t WHERE aid = 11', '11|100', 20);
+	is($rc, 0, 'L3 probe F: aliased read resolves positively (derivation immune to counter position)');
+	is($out, '11|100', 'L3 probe F: converges to the committed update, never the superseded 11|0 alias');
 }
 
 # ------------------------------------------------------------------
@@ -263,11 +275,10 @@ sub read_converge
 }
 
 # ------------------------------------------------------------------
-# L5: revert valve -- cluster.multi_xmax_remote_resolve = off keeps the
-#     derived-foreign fail-closed floor (the on-path for updater multis
-#     is fail-closed too until D3-b, so L5 asserts off never REGRESSES
-#     to the native silent-wrong alias, and the derived-own L4 win is
-#     independent of the GUC).
+# L5: revert valve -- cluster.multi_xmax_remote_resolve = off DROPS the
+#     D3-b origin ask and keeps the derived-foreign fail-closed floor
+#     (off must never REGRESS to the native silent-wrong alias, and the
+#     derived-own L4 win is independent of the GUC).
 # ------------------------------------------------------------------
 {
 	$node1->append_conf('postgresql.conf', 'cluster.multi_xmax_remote_resolve = off');
