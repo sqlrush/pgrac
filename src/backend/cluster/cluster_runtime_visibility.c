@@ -224,7 +224,7 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 XLogRecPtr anchor_lsn, SCN read_scn, bool *out_committed,
+						 XLogRecPtr anchor_lsn, SCN read_scn, bool authoritative, bool *out_committed,
 						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
@@ -249,7 +249,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 
 	cluster_rtvis_verdict_note_wire();
 	if (!cluster_gcs_block_undo_verdict_fetch_and_wait((int32)origin_node, undo_segment_id, raw_xid,
-													   &verdict, &auth)) {
+													   authoritative, &verdict, &auth)) {
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -335,7 +335,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 bool
 cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
 											  TransactionId raw_xid, XLogRecPtr anchor_lsn,
-											  SCN read_scn, bool *out_committed,
+											  SCN read_scn, bool authoritative, bool *out_committed,
 											  SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	PGAlignedBlock page;
@@ -439,7 +439,8 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * complete own-TT verdict instead of failing closed outright.
 	 */
 	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, anchor_lsn, read_scn,
-								 out_committed, out_commit_scn, out_commit_scn_is_bound)) {
+								 authoritative, out_committed, out_commit_scn,
+								 out_commit_scn_is_bound)) {
 		if (*out_committed)
 			cluster_rtvis_resolve_note_committed();
 		else
@@ -473,7 +474,9 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
 
 	memset(&v, 0, sizeof(v));
-	if (!cluster_lms_undo_verdict_fill_page(raw_xid, &v)) {
+	/* master==self keeps the stripe self-check (authoritative=false): D6-7's
+	 * physical-binding relaxation is for the FOREIGN fresh-ref serve only. */
+	if (!cluster_lms_undo_verdict_fill_page(raw_xid, false, &v)) {
 		cluster_rtvis_resolve_note_failclosed(); /* D3-6: self-path observability */
 		return unknown;							 /* in-doubt / ambiguous / not-own -> fail-closed */
 	}
@@ -520,7 +523,7 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
  */
 ClusterUndoVerdictResult
 cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-							 XLogRecPtr anchor_lsn, SCN read_scn)
+							 XLogRecPtr anchor_lsn, SCN read_scn, bool authoritative)
 {
 	ClusterUndoVerdictResult unknown
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
@@ -539,8 +542,8 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 
 	/* master!=self: CP3 owner-as-master S-grant + CP5 origin verdict. */
 	if (cluster_runtime_visibility_try_resolve_remote(origin_node, undo_segment_id, raw_xid,
-													  anchor_lsn, read_scn, &committed, &commit_scn,
-													  &is_bound))
+													  anchor_lsn, read_scn, authoritative, &committed,
+													  &commit_scn, &is_bound))
 		return cluster_undo_verdict_from_resolve(true, committed, commit_scn, is_bound);
 	return unknown;
 }

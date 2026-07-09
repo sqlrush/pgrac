@@ -179,6 +179,7 @@ extern bool cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerd
 extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
 														  TransactionId raw_xid,
 														  XLogRecPtr anchor_lsn, SCN read_scn,
+														  bool authoritative,
 														  bool *out_committed, SCN *out_commit_scn,
 														  bool *out_commit_scn_is_bound);
 

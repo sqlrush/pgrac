@@ -94,8 +94,8 @@ my $node0 = $pair->node0;
 # ----------
 my $cr_rows = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'});
-is($cr_rows, '57',
-	'L2 cr category has 57 counter rows (9 + 4 cache + 4 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict)');
+is($cr_rows, '59',
+	'L2 cr category has 59 counter rows (9 + 4 cache + 4 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict + 2 spec-5.22f D6 fresh-ref verdict)');
 
 
 # ----------

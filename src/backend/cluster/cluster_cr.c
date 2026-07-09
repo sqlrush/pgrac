@@ -169,6 +169,17 @@ typedef struct ClusterCRShared {
 	 * striped cluster).
 	 */
 	pg_atomic_uint64 rtvis_underivable_failclosed_count;
+	/*
+	 * spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters.  A
+	 * fresh ref (local_xid == raw_xid, origin != self) that missed the overlay
+	 * and was resolved by the D3 cross-node verdict (classify_ref_guts D6
+	 * branch): resolved = a terminal COMMITTED/ABORTED verdict consumed
+	 * (the L1 root-cause-#1 hard assert lands here, proving the fresh-ref path
+	 * ran rather than an overlay / ordinary-propagation hit); failclosed = a
+	 * STALE integrity mismatch or an UNKNOWN verdict kept 53R97.
+	 */
+	pg_atomic_uint64 vis_freshref_verdict_resolved_count;
+	pg_atomic_uint64 vis_freshref_verdict_failclosed_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -251,6 +262,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
+		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -411,6 +424,22 @@ cluster_rtvis_note_underivable_failclosed(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
 }
+
+/* PGRAC: spec-5.22f D6-3 — fresh-remote-ITL-ref widening outcome bumps
+ * (classify_ref_guts, backend context). */
+void
+cluster_vis_freshref_verdict_note_resolved(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis_freshref_verdict_resolved_count, 1);
+}
+
+void
+cluster_vis_freshref_verdict_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis_freshref_verdict_failclosed_count, 1);
+}
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -448,6 +477,10 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_inadmissible_count, rtvis_verdict_inad
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_served_count, cr_server_verdict_served_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_denied_count, cr_server_verdict_denied_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count, vis_freshref_verdict_resolved_count)
+CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_failclosed_count,
+					vis_freshref_verdict_failclosed_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)

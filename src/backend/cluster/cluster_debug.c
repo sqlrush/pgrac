@@ -2588,6 +2588,11 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcomes. */
+	emit_row(rsinfo, "cr", "vis_freshref_verdict_resolved_count",
+			 fmt_int64((int64)cluster_vis_freshref_verdict_resolved_count()));
+	emit_row(rsinfo, "cr", "vis_freshref_verdict_failclosed_count",
+			 fmt_int64((int64)cluster_vis_freshref_verdict_failclosed_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

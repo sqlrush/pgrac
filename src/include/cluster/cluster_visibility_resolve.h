@@ -57,6 +57,7 @@
 #include "cluster/cluster_scn.h"	   /* SCN */
 #include "cluster/cluster_tt_slot.h"   /* ClusterUndoTTSlotRef */
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22f D6) */
 
 
 /*
@@ -213,6 +214,57 @@ cluster_vis_cr_xmax_verdict(ClusterTTStatus xmax_status,
 /* OBS-3 Dirty: no wait_policy layer, so remote in-progress -> 53R9H. */
 extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool is_xmax,
 												   bool is_delete);
+
+
+/*
+ * ============================================================
+ * spec-5.22f D6: shared-catalog seed / fresh-ref visibility consumer.
+ *
+ *	Two PURE helpers (no I/O / no shmem / no elog) that let the
+ *	classify_ref_guts fresh-remote-ITL-ref branch consume the D3
+ *	cross-node verdict (cluster_undo_verdict_resolve).  Kept pure so the
+ *	mapping + origin-decision truth tables are a fully enumerable unit
+ *	test (test_cluster_vis_undo_verdict_map, U1-U10) exactly as the OBS-2~5
+ *	tables above.  Implementation lives with them in
+ *	cluster_visibility_verdict.c (no cluster_visibility_verdict.h churn).
+ * ============================================================
+ */
+
+/*
+ * cluster_vis_from_undo_verdict -- map a D3 cross-node verdict onto the local
+ * visibility out-params.  COMMITTED_EXACT/BOUND -> REMOTE/COMMITTED (BOUND
+ * sets commit_scn_is_bound so a below-horizon bound is never stamped/cached);
+ * ABORTED -> REMOTE/ABORTED; UNKNOWN_FAIL_CLOSED / IN_PROGRESS (D3 never
+ * produces IN_PROGRESS) / any other -> STALE_OR_AMBIGUOUS so the caller keeps
+ * the 53R97 fail-closed boundary (Rule 8.A / L10).  ALL branches overwrite
+ * commit_scn + commit_scn_is_bound so a non-terminal verdict never leaks a
+ * residual scn.  Returns true iff a terminal (COMMITTED/ABORTED) was produced.
+ */
+extern bool cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out);
+
+/*
+ * cluster_vis_freshref_origin_decision -- the fresh-remote-ITL-ref origin
+ * decision (spec-5.22f Q2 / Option B, P1-a).  A fresh ref (local_xid ==
+ * raw_xid) carries the tuple page's PHYSICAL ITL binding, so ref_origin is the
+ * true owner; the value-derived cluster_xid_origin_slot(raw_xid) is only a
+ * derivable-time integrity cross-check:
+ *	  derived_slot < 0 (underivable: below-floor pre-striping seed / striping
+ *	                    off)                                       -> ASK (P1-a:
+ *	                    NOT fail-closed -- the fresh ref's physical binding is
+ *	                    authoritative and D3's wrap-suspect / covers / serve
+ *	                    gates fail-close every unproven leg internally)
+ *	  derived_slot == ref_origin (corroborated)                   -> ASK
+ *	  derived_slot >= 0 && derived_slot != ref_origin (striping bug / page
+ *	                    corruption / alias)                        -> STALE
+ * Pure.
+ */
+typedef enum ClusterVisFreshRefOriginDecision {
+	CLUSTER_VIS_FRESHREF_ORIGIN_ASK = 0,
+	CLUSTER_VIS_FRESHREF_ORIGIN_STALE = 1
+} ClusterVisFreshRefOriginDecision;
+
+extern ClusterVisFreshRefOriginDecision cluster_vis_freshref_origin_decision(int derived_slot,
+																			 int32 ref_origin);
 
 
 /*

@@ -1843,6 +1843,17 @@ cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+uint64
+cluster_vis_freshref_verdict_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_freshref_verdict_failclosed_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)

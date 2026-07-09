@@ -446,6 +446,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 
 				if (cluster_runtime_visibility_try_resolve_remote(
 						derived_origin, (uint32)ref->undo_segment_id, raw_xid, anchor_lsn, read_scn,
+						false /* derived origin: keep the stripe self-check (6.12i P0) */,
 						&committed, &scn, &is_bound)) {
 					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 					out->status
@@ -465,6 +466,68 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 	}
 
 	resolve_from_remote_ref(raw_xid, ref, out);
+
+	/*
+	 * PGRAC: spec-5.22f D6-2 — fresh-remote-ITL-ref widening (root-cause #1
+	 * seed/joiner visibility consumer).
+	 *
+	 * A fresh remote ITL ref reaches here (origin != self, local_xid ==
+	 * raw_xid: the slot still binds raw_xid, so ref->origin_node_id +
+	 * undo_segment_id are the tuple page's PHYSICAL ITL binding = the xid's
+	 * true owner + CP3 block0 locator).  A fresh joiner reading a seed-committed
+	 * tuple has an EMPTY TT overlay, so resolve_from_remote_ref left
+	 * {REMOTE, UNKNOWN} on the miss -> 53R97 -> false-invisible (命门 2).  Ask
+	 * the live owner via the D3 cross-node verdict instead of fail-closing.
+	 *
+	 * Unlike the recycled branch (:436), which MUST derive the origin from the
+	 * xid value (a recycled ref names the slot's NEW owner, unrelated to
+	 * raw_xid — the 6.12i alias P0), the fresh ref's ref->origin_node_id is
+	 * authoritative.  cluster_xid_origin_slot is only a derivable-time integrity
+	 * cross-check (Q2 / Option B, P1-a): underivable (below-floor pre-striping
+	 * seed / striping off) STILL asks the verdict — Rule 8.A safety is anchored
+	 * INSIDE D3 (wrap-suspect anti-ABA / covers / serve gates fail-close every
+	 * unproven leg), never on a "no alias" assumption.  crossnode off / a
+	 * derivable mismatch / an UNKNOWN verdict all keep STALE_OR_AMBIGUOUS ->
+	 * 53R97 (Rule 8.A: this branch only widens "resolve when provable").
+	 */
+	if (out->status == CLUSTER_TT_STATUS_UNKNOWN && cluster_crossnode_runtime_visibility
+		&& (int32)ref->origin_node_id != cluster_node_id) {
+		int derived = cluster_xid_origin_slot(raw_xid); /* derivable-time check only */
+
+		switch (cluster_vis_freshref_origin_decision(derived, (int32)ref->origin_node_id)) {
+		case CLUSTER_VIS_FRESHREF_ORIGIN_STALE:
+			/* derivable mismatch: striping bug / page corruption / alias.  No
+			 * verdict is asked, so only the dedicated fresh-ref counter moves
+			 * -- mirroring the recycled underivable leg (:458), which likewise
+			 * does not touch the shared rtvis_resolve totals. */
+			out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+			cluster_vis_freshref_verdict_note_failclosed();
+			break;
+
+		case CLUSTER_VIS_FRESHREF_ORIGIN_ASK:
+		default: {
+			/* origin = ref->origin_node_id (physical binding, authoritative);
+			 * every unproven leg inside D3 returns UNKNOWN_FAIL_CLOSED.
+			 * cluster_undo_verdict_resolve -> try_resolve_remote already bumps
+			 * the shared rtvis_resolve_{committed,aborted,failclosed} totals
+			 * internally (cluster_runtime_visibility.c:424/427/444/446/449), so
+			 * the dedicated fresh-ref counter is the ONLY extra bump here -- an
+			 * explicit rtvis_resolve_note here would double-count. */
+			ClusterUndoVerdictResult v
+				= cluster_undo_verdict_resolve((int)ref->origin_node_id,
+											   (uint32)ref->undo_segment_id, raw_xid, anchor_lsn,
+											   read_scn, true /* fresh ref: physical-binding authority */);
+
+			if (cluster_vis_from_undo_verdict(v, out)) {
+				cluster_vis_freshref_verdict_note_resolved();
+				return;
+			}
+			/* verdict UNKNOWN: cluster_vis_from_undo_verdict already set STALE. */
+			cluster_vis_freshref_verdict_note_failclosed();
+			break;
+		}
+		}
+	}
 }
 
 /*

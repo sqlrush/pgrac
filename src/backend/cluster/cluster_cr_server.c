@@ -283,6 +283,7 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		slot->undo_segment_id = segment_id;
 		slot->undo_block_no = block_no;
 		slot->undo_xid = (TransactionId)carrier;
+		slot->undo_authoritative = GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
 		memset(&slot->undo_auth, 0, sizeof(slot->undo_auth));
 
 		/* Publish the request fields before LMS can observe PENDING. */
@@ -398,8 +399,14 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	if (!TransactionIdIsNormal(xid))
 		return false;
 
-	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
-	if (!cluster_xid_is_mine(xid))
+	/*
+	 * spec-6.15 D4: only answer for provably-own xids (see banner) -- UNLESS
+	 * the request is spec-5.22f D6-7 AUTHORITATIVE (origin chosen from the fresh
+	 * ref's physical ITL binding, so the requester already proved this is the
+	 * correct owner; the underivable own seed xid is answered over the durable-TT
+	 * + CLOG authority below, the positive proof unchanged).
+	 */
+	if (!slot->undo_authoritative && !cluster_xid_is_mine(xid))
 		return false;
 
 	/* Co-sample the authority triple BEFORE the scan (see banner). */
@@ -414,7 +421,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	 * and self answers over one xid can never diverge (Rule 8.A).
 	 */
 	memset(slot->result_page, 0, BLCKSZ);
-	return cluster_lms_undo_verdict_fill_page(xid, v);
+	return cluster_lms_undo_verdict_fill_page(xid, slot->undo_authoritative, v);
 }
 
 /*
@@ -431,7 +438,8 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
  * the same decision.
  */
 bool
-cluster_lms_undo_verdict_fill_page(TransactionId xid, ClusterGcsUndoVerdictPage *v)
+cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+								   ClusterGcsUndoVerdictPage *v)
 {
 	SCN scn = InvalidScn;
 	SCN horizon = InvalidScn;
@@ -440,8 +448,12 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, ClusterGcsUndoVerdictPage 
 	if (!TransactionIdIsNormal(xid))
 		return false;
 
-	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
-	if (!cluster_xid_is_mine(xid))
+	/* spec-6.15 D4: only answer for provably-own xids (see banner) -- UNLESS the
+	 * caller is spec-5.22f D6-7 AUTHORITATIVE (physical-binding fresh ref), in
+	 * which case the durable-TT + CLOG scan below is the authority for an
+	 * underivable own xid.  The derived (recycled) and master==self callers pass
+	 * false and keep the self-check. */
+	if (!authoritative && !cluster_xid_is_mine(xid))
 		return false;
 
 	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;

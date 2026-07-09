@@ -1255,16 +1255,33 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  *	complete durable-TT scan + CLOG cross-check + retention origin legs and
  *	ships UNDO_VERDICT_RESULT, or a DENIED status which the requester maps
  *	to the unchanged 53R97 fail-closed (Rule 8.A). */
+/*
+ * PGRAC: spec-5.22f D6-7 — reserved_0[6] value-multiplexes the verdict request
+ * into two sub-kinds: VALUE 2 = a DERIVED verdict (the spec-6.15 D4 recycled
+ * path, whose origin was derived from the xid value; the serve keeps the
+ * cluster_xid_is_mine self-check that guards the 6.12i P0 wrong-origin match),
+ * VALUE 3 = an AUTHORITATIVE verdict (the spec-5.22f fresh-ref path, whose
+ * origin is the tuple page's PHYSICAL ITL binding — the requester already
+ * proved this is the correct owner, so the serve skips the stripe pre-filter
+ * and answers underivable own xids over its own durable-TT + CLOG authority;
+ * the positive-proof gates are unchanged, Rule 8.A).
+ */
 static inline void
-GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool undo_verdict)
+GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
 {
-	p->reserved_0[6] = undo_verdict ? (uint8)2 : (uint8)0;
+	p->reserved_0[6] = authoritative ? (uint8)3 : (uint8)2;
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)2;
+	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)3;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)3;
 }
 
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.

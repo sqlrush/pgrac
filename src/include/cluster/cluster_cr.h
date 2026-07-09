@@ -266,6 +266,12 @@ extern void cluster_rtvis_verdict_note_inadmissible(void);
 extern uint64 cluster_rtvis_underivable_failclosed_count(void);
 extern void cluster_rtvis_note_underivable_failclosed(void);
 
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
+extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);
+extern void cluster_vis_freshref_verdict_note_resolved(void);
+extern void cluster_vis_freshref_verdict_note_failclosed(void);
+
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict
  * serve (cluster_cr_server.c).

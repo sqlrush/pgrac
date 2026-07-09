@@ -129,6 +129,12 @@ typedef struct ClusterLmsCrSlot {
 	uint32 undo_segment_id;
 	uint32 undo_block_no;
 	TransactionId undo_xid;
+	/* spec-5.22f D6-7: the KIND_UNDO_VERDICT request was AUTHORITATIVE (origin
+	 * chosen from the fresh ref's physical ITL binding, wire value 3) -> the
+	 * serve skips the cluster_xid_is_mine stripe self-check and answers an
+	 * underivable own xid over its durable-TT + CLOG authority.  false for the
+	 * derived (recycled) path, which keeps the self-check (6.12i P0 guard). */
+	bool undo_authoritative;
 	ClusterLiveAuthority undo_auth;
 	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL), the
 							   * fetched undo header block (UNDO_FETCH), or
@@ -187,7 +193,8 @@ extern bool cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd);
  * two answers over one xid can never diverge (Rule 8.A).  The caller zeroes
  * the page buffer and owns any authority co-sampling; true = *v holds the
  * verdict, false = refuse (caller keeps 53R97 fail-closed). */
-extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, ClusterGcsUndoVerdictPage *v);
+extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+											   ClusterGcsUndoVerdictPage *v);
 
 /* LMS main-loop side: construct every PENDING slot (errors become DENIED
  * results — fail-closed to the requester, never an LMS restart). */
@@ -225,7 +232,7 @@ extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 s
  * The caller MUST Lamport-observe verdict_out->horizon_scn (and any
  * commit_scn) it consumes — SCNs that crossed the wire (AD-008). */
 extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
-														  TransactionId xid,
+														  TransactionId xid, bool authoritative,
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);
 

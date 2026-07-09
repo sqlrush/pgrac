@@ -117,11 +117,18 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  * InvalidScn for callers without snapshot semantics.  master==self routes to
  * the local durable resolve; master!=self to the CP3 S-grant + CP5 verdict.
  * kind == UNKNOWN_FAIL_CLOSED => the caller keeps 53R97 (never false-visible).
- * Compiled only in --enable-cluster builds.
+ *
+ * authoritative (spec-5.22f D6-7) = the origin was chosen from the tuple page's
+ * PHYSICAL ITL binding (a fresh-ref consumer), not derived from the xid value.
+ * When true the origin serves underivable own xids over its own durable-TT +
+ * CLOG authority (skipping the stripe self-check that guards the derived-path
+ * 6.12i P0); the positive-proof gates are unchanged.  Derived (recycled) callers
+ * pass false to keep cluster_xid_is_mine.  Compiled only in --enable-cluster builds.
  */
 extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
 															 uint32 undo_segment_id,
 															 TransactionId raw_xid,
-															 XLogRecPtr anchor_lsn, SCN read_scn);
+															 XLogRecPtr anchor_lsn, SCN read_scn,
+															 bool authoritative);
 
 #endif /* CLUSTER_UNDO_VERDICT_H */

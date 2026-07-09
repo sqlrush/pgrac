@@ -2510,7 +2510,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
  */
 bool
 cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
-											  TransactionId xid,
+											  TransactionId xid, bool authoritative,
 											  ClusterGcsUndoVerdictPage *verdict_out,
 											  ClusterLiveAuthority *auth_out)
 {
@@ -2559,7 +2559,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 		fwd.requester_backend_id = (int32)MyBackendId;
 		fwd.master_node = cluster_node_id;
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
-		GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true);
+		GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, authoritative);
 		/* The widened xid rides the watermark carrier (upper 32 bits zero). */
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)(uint64)xid);
 
