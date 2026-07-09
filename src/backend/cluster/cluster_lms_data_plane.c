@@ -233,23 +233,57 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	{
 		static uint64 dp_last_epoch = 0;
 		static bool dp_epoch_seen = false;
+		static bool dp_inject_reset_done = false;
 		uint64 cur_epoch = cluster_epoch_get_current();
+		bool inject_reset = false;
+
+		/*
+		 * PGRAC: spec-7.2 D7 (F6-1) — the cluster-lms-conn-reset injection
+		 * models a SINGLE epoch-bump reset, but its only arm path is the
+		 * process-local injection GUC, which stays armed and re-sets
+		 * skip_pending on every tick (CLUSTER_INJECTION_POINT above) — a
+		 * reset storm that starves the mesh (and, on the passive side, was
+		 * observed to trip the accept/close WES churn into a crash).  Latch
+		 * the injected reset so it fires exactly ONCE per process lifetime:
+		 * the test then observes one clean reset -> reconnect -> converge,
+		 * matching the real single-bump path (cur_epoch != dp_last_epoch).
+		 * should_skip still drains the pending flag each tick (harmless once
+		 * latched).  The real epoch-bump reset is unaffected by the latch.
+		 */
+		if (cluster_injection_should_skip("cluster-lms-conn-reset") && !dp_inject_reset_done)
+			inject_reset = true;
 
 		if (!dp_epoch_seen) {
 			dp_last_epoch = cur_epoch;
 			dp_epoch_seen = true;
-		} else if (cur_epoch != dp_last_epoch
-				   || cluster_injection_should_skip("cluster-lms-conn-reset")) {
+		} else if (cur_epoch != dp_last_epoch || inject_reset) {
+			const char *reason = inject_reset ? "data-plane conn-reset injection (F6-1 one-shot)"
+											  : "data-plane epoch bump reset";
+			int n_closed = 0;
+
 			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 				if (dp_track[pi].fd >= 0) {
-					cluster_ic_tier1_close_peer(pi, "data-plane epoch bump reset");
+					cluster_ic_tier1_close_peer(pi, reason);
 					dp_track[pi].fd = -1;
 					dp_track[pi].substate = LMS_DP_DOWN;
 					dp_track[pi].connect_started_at = 0;
 					dp_track[pi].next_attempt_at = 0; /* reconnect immediately */
 					dp_wes_dirty = true;
+					n_closed++;
 				}
 			}
+
+			/*
+			 * F6-1 one-shot latch:  only mark the injected reset consumed
+			 * once it has actually torn down a live connection.  This keeps
+			 * the injection from being wasted on a tick where the mesh is
+			 * momentarily DOWN (arm-before-connect race) — it retries until
+			 * a peer is live, then latches so the persistent GUC does not
+			 * storm.  The real epoch-bump reset does not touch the latch.
+			 */
+			if (inject_reset && n_closed > 0)
+				dp_inject_reset_done = true;
+
 			dp_last_epoch = cur_epoch;
 		}
 	}
