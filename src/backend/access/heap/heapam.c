@@ -7517,7 +7517,7 @@ l4:
 		 * retryably instead of mis-walking the chain.
 		 */
 		if (cluster_peer_mode_enabled()
-			&& cluster_xid_foreign_class_cheap(HeapTupleHeaderGetXmin(mytup.t_data)))
+			&& cluster_xid_provably_foreign(HeapTupleHeaderGetXmin(mytup.t_data)))
 		{
 			UnlockReleaseBuffer(buf);
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
@@ -7556,7 +7556,7 @@ l4:
 					&& (int32) marker_origin != cluster_node_id;
 			else
 				foreign_xmax = TransactionIdIsValid(xmax)
-					&& cluster_xid_foreign_class_cheap(xmax);
+					&& cluster_xid_provably_foreign(xmax);
 			if (foreign_xmax)
 			{
 				UnlockReleaseBuffer(buf);
@@ -7973,7 +7973,7 @@ heap_lock_updated_tuple(Relation rel,
 		 * here; this is defense in depth for the non-multi root.
 		 */
 		if (cluster_peer_mode_enabled() && !(prior_infomask & HEAP_XMAX_IS_MULTI)
-			&& cluster_xid_foreign_class_cheap(prior_raw_xmax))
+			&& cluster_xid_provably_foreign(prior_raw_xmax))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 							errmsg("cross-node write conflict: update chain rooted at "
 								   "node-foreign updater %u",
