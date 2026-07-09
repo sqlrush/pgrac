@@ -61,6 +61,10 @@ my @KEYS = qw(
   vis53r97_leg_covers_refuse_count
   vis53r97_leg_multi_unresolvable_count
   vis53r97_leg_xmax_unprovable_count
+  vis53r97_leg_multi_member_serve_ask_count
+  vis53r97_leg_multi_member_serve_hit_count
+  cr_server_multi_verdict_served_count
+  cr_server_multi_verdict_denied_count
   rtvis_underivable_failclosed_count
   rtvis_resolve_committed_count
   rtvis_resolve_aborted_count
