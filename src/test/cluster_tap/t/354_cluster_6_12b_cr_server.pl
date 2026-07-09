@@ -109,6 +109,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'b612_crsrv',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.crossnode_cr_data_plane = on',
@@ -222,6 +223,36 @@ for my $n ($node0, $node1)
 		     ('cr_remote_full_count','cr_remote_partial_count','cr_remote_failed_count',
 		      'cr_server_full_count','cr_server_partial_count','cr_server_denied_count')});
 	is($rows, '6', 'L5 cr-server keys present (' . $n->name . ')');
+}
+
+# ============================================================
+# L6: spec-7.3 D6 — 8.A envelope on the inline serve.  Forcing the origin's
+# CR construction to fail-closed (the cluster-lms-cr-construct skip injection)
+# must (a) keep the requester at the unchanged 53R9G, (b) leave the origin's
+# serving worker[shard] alive (the inline serve reproduces the drain's
+# PG_TRY -> DENIED envelope, so a refused construction never crashes the
+# worker), and (c) recover a normal serve once the injection clears.
+# ============================================================
+SKIP:
+{
+	skip "ClusterPair inject SKIP helper missing — L6 8.A envelope covered by "
+		. "the shared PG_TRY drain path", 3
+		unless $pair->can('inject_skip_set');
+
+	$pair->inject_skip_set($node0, 'cluster-lms-cr-construct', 100);
+	my ($off_d6, $off_err6) = cr_image($node1, 0, $scn_mid);
+	like($off_err6, qr/(53R9G|cross-instance)/,
+		'L6 origin construct fail-closed keeps the requester 53R9G (8.A inline)');
+
+	# The origin's serving worker survived the fail-closed serve.
+	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
+		'L6 origin still serving after a fail-closed inline CR construct');
+
+	$pair->inject_skip_set($node0, 'cluster-lms-cr-construct', 0);
+	my ($rec_d6, $rec_err6) = cr_image_retry($node1, 0, $scn_mid);
+	is($rec_d6, $auth,
+		'L6 remote CR serve recovers after the injection clears '
+		. '(' . (defined $rec_d6 ? 'ok' : "err=$rec_err6") . ')');
 }
 
 $pair->stop_pair if $pair->can('stop_pair');

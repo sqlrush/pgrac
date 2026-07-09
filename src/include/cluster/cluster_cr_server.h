@@ -188,6 +188,21 @@ extern void cluster_lms_cr_drain(void);
 /* LMON tick side: ship every READY slot to its requester and free it. */
 extern void cluster_lms_cr_ship_ready(void);
 
+/*
+ * spec-7.3 D6 — DATA-plane inline serve.  When the GCS block family is on the
+ * DATA plane, the worker[shard] that received a GCS_BLOCK_FORWARD CR /
+ * undo-fetch / undo-verdict request serves it inline (validate + construct /
+ * scan under the PG_TRY -> DENIED envelope) and ships the reply on its own
+ * DATA channel — no shmem slot, no worker-0 poll, no 100 ms latency.  kind
+ * selects the branch; a refused / failed request ships an immediate
+ * fail-closed DENIED (requester keeps 53R9G / 53R97, Rule 8.A).  The caller
+ * routes here ONLY when cluster_gcs_block_family_on_data_plane(); on the
+ * CONTROL plane the light-work park path (submit) is used instead.  Always
+ * ships exactly one reply, so the caller does not itself reply on refusal.
+ */
+extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd,
+												   ClusterLmsCrSlotKind kind);
+
 /* Requester side (backend): fetch a CR page for (locator, fork, block) at
  * read_scn from origin_node.  On success copies the shipped page into
  * dst_page and returns true; *out_partial says whether the local

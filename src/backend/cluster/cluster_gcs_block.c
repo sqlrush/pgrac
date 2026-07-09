@@ -5205,49 +5205,57 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 								 * dedup TTL will sweep stale entry */
 
 	/*
-	 * PGRAC: spec-6.12b — CR-server request.  LMON only validates + parks
-	 * the request for LMS (light-work rule: a CR construction walks undo
-	 * I/O and must never run in this dispatch loop); the LMON tick ships
-	 * the finished result.  A refused park (data plane off / no free slot)
-	 * replies a fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R9G refusal (Rule 8.A).  Never falls through to the
-	 * current-image ship below: a CR result is HISTORICAL by intent and
-	 * the lost-write watermark verdict does not apply (the SCN carrier
-	 * holds the requester's read_scn on this path).
+	 * PGRAC: spec-6.12b + spec-7.3 D6 — CR-server request.  When the family is
+	 * on the DATA plane this handler runs in the receiving worker[shard], so it
+	 * serves the request INLINE (construct under the PG_TRY -> DENIED envelope)
+	 * and ships on its own channel — the park -> LMS-poll -> LMON-ship
+	 * indirection is retired there (D6).  On the CONTROL plane the handler runs
+	 * in LMON, whose tight IC dispatch loop must NOT walk undo I/O (the
+	 * light-work rule), so it parks for LMS worker 0 instead; a refused park
+	 * (data plane off / no free slot) replies a fail-closed DENIED immediately.
+	 * Either way the requester keeps its unchanged 53R9G on refusal (Rule 8.A).
+	 * Never falls through to the current-image ship below: a CR result is
+	 * HISTORICAL by intent and the lost-write watermark verdict does not apply
+	 * (the SCN carrier holds the requester's read_scn on this path).
 	 */
 	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
-		if (!cluster_lms_cr_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_CR);
+		else if (!cluster_lms_cr_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i1 — undo-TT fetch request.  Same LMON shape as the
-	 * CR branch above (validate + park only; the undo file read runs in LMS,
-	 * the LMON tick ships).  MUST branch here, before any holder / GRD logic:
-	 * the tag is a synthetic undo address, not a block identity.  A refused
-	 * park (wave GUC off / malformed tag / no free slot) replies the
-	 * fail-closed DENIED immediately so the requester keeps its unchanged
-	 * 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i1 + spec-7.3 D6 — undo-TT fetch request.  DATA plane
+	 * serves inline (the undo file read runs in the worker[shard]); CONTROL
+	 * plane parks for LMS worker 0 (light-work rule).  MUST branch here, before
+	 * any holder / GRD logic: the tag is a synthetic undo address, not a block
+	 * identity.  A refusal (wave GUC off / malformed tag / no free slot) ships
+	 * DENIED so the requester keeps its unchanged 53R97 (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoTtFetchRequest(fwd)) {
-		if (!cluster_lms_undo_fetch_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_FETCH);
+		else if (!cluster_lms_undo_fetch_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request.  Same
-	 * LMON shape as the two branches above (validate + park only; the
-	 * complete durable-TT scan + CLOG cross-check runs in LMS, the LMON tick
-	 * ships).  MUST branch here, before any holder / GRD logic: the tag is a
-	 * synthetic undo address and the SCN carrier holds the widened xid.  A
-	 * refused park (wave GUC off / malformed tag or carrier / no free slot)
-	 * replies the fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 + spec-7.3 D6 — undo-verdict
+	 * request.  DATA plane serves inline (the complete durable-TT scan + CLOG
+	 * cross-check runs in the worker[shard]); CONTROL plane parks for LMS
+	 * worker 0 (light-work rule).  MUST branch here, before any holder / GRD
+	 * logic: the tag is a synthetic undo address and the SCN carrier holds the
+	 * widened xid.  A refusal (wave GUC off / malformed tag or carrier / no
+	 * free slot) ships DENIED so the requester keeps its unchanged 53R97
+	 * (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)) {
-		if (!cluster_lms_undo_verdict_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
+		else if (!cluster_lms_undo_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}

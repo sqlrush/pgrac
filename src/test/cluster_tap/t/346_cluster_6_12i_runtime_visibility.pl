@@ -120,6 +120,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'i612_rtvis',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.ges_request_timeout_ms = 30000',
