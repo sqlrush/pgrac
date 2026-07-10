@@ -291,6 +291,15 @@ $standby0->append_conf('postgresql.conf',
 	'cluster.adg_rfs_conninfos = ' . quote_conf($rfs_conninfos) . "\n");
 $standby1->append_conf('postgresql.conf', $standby_common_conf);
 $standby1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$primary0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$primary1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$standby0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$standby1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 write_pair_conf($standby0, $standby1, 'adg2_standby');
 
 $standby0->start;

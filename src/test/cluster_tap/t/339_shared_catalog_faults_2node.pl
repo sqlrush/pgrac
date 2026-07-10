@@ -221,6 +221,13 @@ $node0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node1->append_conf('postgresql.conf', $sc_common);
 $node1->append_conf('postgresql.conf', $cluster_conf);
 $node1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$node0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$node1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 
 my $pgrac_conf = <<EOC;
 [cluster]

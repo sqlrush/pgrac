@@ -95,11 +95,20 @@ my $pgrac_visible = $node->safe_psql(
 	q{SELECT count(*) FROM pg_stat_activity
 	   WHERE backend_type IN (
 	       'heartbeat', 'interconnect listener',
-	       'lms worker',
 	       'managed recovery process', 'recovery coordinator',
 	       'recovery worker', 'sinval broadcaster', 'tt gc')});
 is($pgrac_visible, '0',
 	'no pgrac process descriptor visible except spawned skeletons (others deferred to Stage 2-6)');
+
+# spec-7.3 D2: the LMS DATA-plane worker pool ships with a default of
+# cluster.lms_workers = 2 -- worker 0 stays the historic 'lms' process and
+# workers 1..N-1 run as 'lms worker' aux processes, so exactly ONE
+# 'lms worker' descriptor is a spawned skeleton now (not deferred).
+my $lms_worker_visible = $node->safe_psql(
+	'postgres',
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'lms worker'});
+is($lms_worker_visible, '1',
+	'default LMS pool spawns exactly one lms worker aux process (spec-7.3 D2)');
 
 # LMON is spawned by postmaster (spec-1.11 Sprint A).  Verify it
 # appears in pg_stat_activity exactly once.

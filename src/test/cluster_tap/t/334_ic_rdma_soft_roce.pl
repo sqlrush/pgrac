@@ -89,6 +89,9 @@ my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 for my $node ($pair->node0, $pair->node1)
 {
 	$node->adjust_conf('postgresql.conf', 'cluster.interconnect_tier', 'tier3');
+	# spec-7.3 merge: this rig rewrites pgrac.conf with ONE data port per
+	# node; pin the pool to one worker (N=1 = spec-7.2 topology identity).
+	$node->adjust_conf('postgresql.conf', 'cluster.lms_workers', '1');
 }
 
 sub write_rdma_pgrac_conf

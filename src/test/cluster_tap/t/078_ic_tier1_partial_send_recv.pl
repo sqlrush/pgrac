@@ -61,6 +61,12 @@ $node->init;
 $node->append_conf('postgresql.conf', "cluster.enabled = on\n");
 $node->append_conf('postgresql.conf', "cluster.interconnect_tier = tier1\n");
 $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$node->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 $node->append_conf('postgresql.conf', "cluster.allow_single_node = on\n");
 
 # Declare 2 nodes so we can spoof "peer 1" connecting to "peer 0" (us).
