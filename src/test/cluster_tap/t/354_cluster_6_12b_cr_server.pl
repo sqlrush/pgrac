@@ -30,6 +30,13 @@
 #	  L4  data plane OFF at the requester -> class-(3) refuse before any
 #	      fetch -> 53R9G (the boundary is byte-identical to pre-6.12b)
 #	  L5  counter surface: 6 cr-server keys present on both nodes
+#	  L5b spec-7.3 D8: per-worker inline-serve counters + duration histogram
+#	  L6  spec-7.3 D6: construct fail-closed injection -> requester 53R9G,
+#	      worker survives, serve recovers on disarm (conf-armed + SIGHUP)
+#	  L7  spec-7.3 D7: fence gate BEFORE construct -> DENIED without
+#	      constructing (full/partial static), fence_refused advances
+#	  L7b spec-7.3 D7 review P1-1: ship-time fence RE-CHECK (TOCTOU) ->
+#	      construct runs, ship discarded, DENIED + fence_refused advances
 #
 # Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave b)
 #
@@ -244,22 +251,53 @@ for my $n ($node0, $node1)
 	cmp_ok($hist_total, '>', 0, 'L5b serve-duration histogram recorded the serves');
 }
 
+# Arm a SKIP injection on the origin via the conf GUC + reload (the LMS
+# workers re-read cluster.injection_points on SIGHUP — the t/360 L5 pattern;
+# review P1-2: the ClusterPair::inject_skip_set helper never existed, so the
+# old guard skipped these legs forever), then poll the requester until the
+# armed refusal is observable (the arm needs a worker SIGHUP tick to land).
+# Returns the last (digest, err): on success err carries the fail-closed
+# SQLSTATE; on timeout the caller's like() fails with the last evidence.
+sub arm_and_poll_refuse
+{
+	my ($arm_node, $point, $req_node, $b, $scn) = @_;
+	$arm_node->append_conf('postgresql.conf',
+		"cluster.injection_points = '$point:skip'");
+	$arm_node->reload;
+	my ($d, $err) = (undef, 'arm poll never ran');
+	for my $i (1 .. 60)
+	{
+		($d, $err) = cr_image($req_node, $b, $scn);
+		last if !defined($d) && $err =~ /(53R9G|cross-instance)/;
+		usleep(500_000);
+	}
+	return ($d, $err);
+}
+
+# Disarm a conf-armed SKIP injection on $node.  A bare empty list does NOT
+# disarm a :skip arm (the assign_hook's not-in-list revert only recalls
+# WARNING arms — colon-typed arms survive reloads by design); an explicit
+# '<point>:none' entry re-arms the point to NONE in every process on SIGHUP.
+sub disarm_injection
+{
+	my ($node, $point) = @_;
+	$node->append_conf('postgresql.conf',
+		"cluster.injection_points = '$point:none'");
+	$node->reload;
+}
+
 # ============================================================
 # L6: spec-7.3 D6 — 8.A envelope on the inline serve.  Forcing the origin's
-# CR construction to fail-closed (the cluster-lms-cr-construct skip injection)
-# must (a) keep the requester at the unchanged 53R9G, (b) leave the origin's
-# serving worker[shard] alive (the inline serve reproduces the drain's
-# PG_TRY -> DENIED envelope, so a refused construction never crashes the
-# worker), and (c) recover a normal serve once the injection clears.
+# CR construction to fail-closed (the cluster-lms-cr-construct skip injection,
+# conf-armed + SIGHUP) must (a) keep the requester at the unchanged 53R9G,
+# (b) leave the origin's serving worker[shard] alive (the inline serve
+# reproduces the drain's PG_TRY -> DENIED envelope, so a refused construction
+# never crashes the worker), and (c) recover a normal serve once the
+# injection clears.
 # ============================================================
-SKIP:
 {
-	skip "ClusterPair inject SKIP helper missing — L6 8.A envelope covered by "
-		. "the shared PG_TRY drain path", 3
-		unless $pair->can('inject_skip_set');
-
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-construct', 100);
-	my ($off_d6, $off_err6) = cr_image($node1, 0, $scn_mid);
+	my (undef, $off_err6)
+		= arm_and_poll_refuse($node0, 'cluster-lms-cr-construct', $node1, 0, $scn_mid);
 	like($off_err6, qr/(53R9G|cross-instance)/,
 		'L6 origin construct fail-closed keeps the requester 53R9G (8.A inline)');
 
@@ -267,7 +305,7 @@ SKIP:
 	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
 		'L6 origin still serving after a fail-closed inline CR construct');
 
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-construct', 0);
+	disarm_injection($node0, 'cluster-lms-cr-construct');
 	my ($rec_d6, $rec_err6) = cr_image_retry($node1, 0, $scn_mid);
 	is($rec_d6, $auth,
 		'L6 remote CR serve recovers after the injection clears '
@@ -275,28 +313,30 @@ SKIP:
 }
 
 # ============================================================
-# L7: spec-7.3 D7 — fence ×N.  A write-fenced node must not ship a CR image on
-# the DATA plane.  The fence gate sits ahead of construction in the inline
-# serve, so forcing it (cluster-lms-cr-fence-refuse) must (a) keep the requester
-# fail-closed 53R9G, (b) bump cr_server_fence_refused_count, (c) NOT construct
-# anything (full/partial counters stay put — the RED signal distinguishing the
-# gate from a construction that merely failed), (d) leave the origin serving,
-# and (e) recover a normal serve once the fence clears.
+# L7: spec-7.3 D7 — fence ×N, gate-BEFORE-construct leg.  A write-fenced node
+# must not ship a CR image on the DATA plane.  The fence gate sits ahead of
+# construction in the inline serve, so forcing it (cluster-lms-cr-fence-refuse)
+# must (a) keep the requester fail-closed 53R9G, (b) bump
+# cr_server_fence_refused_count, (c) NOT construct anything (full/partial
+# counters stay put — the RED signal distinguishing the gate from a
+# construction that merely failed), (d) leave the origin serving, and
+# (e) recover a normal serve once the fence clears.  Counter snapshots are
+# taken AFTER the arm is observably effective: the arm-landing poll itself
+# may be served FULL until the worker's SIGHUP tick, and those pre-arm
+# serves must not contaminate the static-counter assertions.
 # ============================================================
-SKIP:
 {
-	skip "ClusterPair inject SKIP helper missing — fence gate covered by "
-		. "the shared DENIED reply path", 5
-		unless $pair->can('inject_skip_set');
+	my (undef, $off_err7)
+		= arm_and_poll_refuse($node0, 'cluster-lms-cr-fence-refuse', $node1, 0, $scn_mid);
+	like($off_err7, qr/(53R9G|cross-instance)/,
+		'L7 write-fenced origin keeps the requester fail-closed 53R9G (fence ×N, 8.A)');
 
 	my $fr_before = state_val($node0, 'cr', 'cr_server_fence_refused_count');
 	my $full_before = state_val($node0, 'cr', 'cr_server_full_count');
 	my $part_before = state_val($node0, 'cr', 'cr_server_partial_count');
 
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 100);
-	my ($off_d7, $off_err7) = cr_image($node1, 0, $scn_mid);
-	like($off_err7, qr/(53R9G|cross-instance)/,
-		'L7 write-fenced origin keeps the requester fail-closed 53R9G (fence ×N, 8.A)');
+	# One deterministic fenced request against the armed gate.
+	my (undef, $gate_err7) = cr_image($node1, 0, $scn_mid);
 
 	# The fence gate fired (refused ship) ...
 	my $fr_after = state_val($node0, 'cr', 'cr_server_fence_refused_count');
@@ -313,11 +353,58 @@ SKIP:
 	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
 		'L7 origin still serving after a fence-refused inline serve');
 
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 0);
+	disarm_injection($node0, 'cluster-lms-cr-fence-refuse');
 	my ($rec_d7, $rec_err7) = cr_image_retry($node1, 0, $scn_mid);
 	is($rec_d7, $auth,
 		'L7 remote CR serve recovers after the fence clears '
 		. '(' . (defined $rec_d7 ? 'ok' : "err=$rec_err7") . ')');
+}
+
+# ============================================================
+# L7b: spec-7.3 D7 review P1-1 — fence ×N, ship-time RE-CHECK leg (TOCTOU).
+# A lease that expires while the serve constructs must discard the
+# just-constructed result at ship time (cluster-lms-cr-fence-recheck models
+# the mid-serve expiry, which is not schedulable from TAP).  The TOCTOU
+# discard signature is the exact inverse of L7's: the construct DID happen
+# (full/partial advanced — the gate was passed while the lease still held)
+# yet the reply is still the fail-closed DENIED (fence_refused advanced,
+# requester keeps 53R9G) — proving the discard sits between construct and
+# ship, not ahead of construct.
+# ============================================================
+{
+	my (undef, $off_err7b)
+		= arm_and_poll_refuse($node0, 'cluster-lms-cr-fence-recheck', $node1, 0, $scn_mid);
+	like($off_err7b, qr/(53R9G|cross-instance)/,
+		'L7b mid-serve fence expiry keeps the requester fail-closed 53R9G (TOCTOU, 8.A)');
+
+	my $fr_before = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+	my $constructed_before = state_val($node0, 'cr', 'cr_server_full_count')
+		+ state_val($node0, 'cr', 'cr_server_partial_count');
+
+	# One deterministic request against the armed re-check.
+	my (undef, $recheck_err7b) = cr_image($node1, 0, $scn_mid);
+
+	# The re-check fired (discarded ship) ...
+	my $fr_after = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+	ok($fr_after > $fr_before,
+		"L7b cr_server_fence_refused_count advanced ($fr_before -> $fr_after)");
+
+	# ... AFTER a real construction (the TOCTOU discard signature: the early
+	# gate was passed, the serve constructed, the ship-time re-check refused).
+	my $constructed_after = state_val($node0, 'cr', 'cr_server_full_count')
+		+ state_val($node0, 'cr', 'cr_server_partial_count');
+	cmp_ok($constructed_after, '>', $constructed_before,
+		'L7b construction DID run before the ship-time re-check discarded it');
+
+	# The origin's serving worker survived the discarded ship.
+	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
+		'L7b origin still serving after a re-check-discarded inline serve');
+
+	disarm_injection($node0, 'cluster-lms-cr-fence-recheck');
+	my ($rec_d7b, $rec_err7b) = cr_image_retry($node1, 0, $scn_mid);
+	is($rec_d7b, $auth,
+		'L7b remote CR serve recovers after the re-check clears '
+		. '(' . (defined $rec_d7b ? 'ok' : "err=$rec_err7b") . ')');
 }
 
 $pair->stop_pair if $pair->can('stop_pair');
