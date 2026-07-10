@@ -16,7 +16,7 @@
 #    fetched cross-node through the GCS block-ship data plane -- the substrate
 #    the dedup HTAB serves.
 #
-#      L1  cluster.gcs_block_dedup_max_entries default = 4096 (spec-7.2a D4;
+#      L1  cluster.gcs_block_dedup_max_entries default = 16384 (spec-7.2a D4;
 #          raised from 1024).  PGC_POSTMASTER, visible via SHOW.
 #      L2  cross-node distinct-block reads populate the dedup HTAB
 #          (dedup_miss_count > 0 proves the cross-node ship path fired) while
@@ -268,11 +268,11 @@ ok($n0_up, 'bring-up: node0 answers on the shared-sysid cluster');
 
 
 # ============================================================
-# L1: default GUC value = 4096 (spec-7.2a D4).
+# L1: default GUC value = 16384 (spec-7.2a D4).
 # ============================================================
 is($node0->safe_psql('postgres', 'SHOW cluster.gcs_block_dedup_max_entries'),
-	'4096',
-	'L1 cluster.gcs_block_dedup_max_entries default = 4096 (spec-7.2a D4)');
+	'16384',
+	'L1 cluster.gcs_block_dedup_max_entries default = 16384 (spec-7.2a D4)');
 
 
 # ============================================================
@@ -321,7 +321,7 @@ cmp_ok($miss_post, '>', $miss_pre,
 	. "(dedup_miss $miss_pre -> $miss_post) -- cross-node ship path fired");
 
 is($full_ct, 0,
-	"L2 dedup_full_count = 0 at default 4096 under distinct reads "
+	"L2 dedup_full_count = 0 at the raised default under distinct reads "
 	. "(S1 saturation mode does not recur)");
 
 # No client saw the 53R90 retransmit-exhaustion escalation.
@@ -471,12 +471,12 @@ for my $key (qw(dedup_entry_count dedup_evict_count dedup_max_entries))
 	   "L5 dump_gcs exposes $key (spec-7.2a D5)");
 }
 
-# dedup_max_entries reflects the effective cap (4096) on a serving node.
+# dedup_max_entries reflects the effective cap (16384) on a serving node.
 is($node0->safe_psql('postgres',
 		q{SELECT value FROM pg_cluster_state
 		  WHERE category='gcs' AND key='dedup_max_entries'}),
-   '4096',
-   'L5 dedup_max_entries reports the effective cap (4096)');
+   '16384',
+   'L5 dedup_max_entries reports the effective cap (16384)');
 
 
 $node0->stop;

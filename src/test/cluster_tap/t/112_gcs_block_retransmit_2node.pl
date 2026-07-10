@@ -16,7 +16,7 @@
 #	  L6  3 NEW GUC visible + defaults + contexts:
 #	       cluster.gcs_block_retransmit_max_retries PGC_SUSET 4
 #	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 10 (spec-7.2 D1)
-#	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 4096
+#	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 16384
 #	  L7  single-shot ship workload — retransmit_attempt_count=0
 #	  L8  inject `cluster-gcs-block-drop-reply-before-send:skip:1` →
 #	       retransmit_send_count grows + WARNING at 3/4 budget
@@ -154,7 +154,7 @@ is($pair->node0->safe_psql(
 for my $row (
 	[ 'cluster.gcs_block_retransmit_max_retries', '4', 'superuser' ],
 	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '10', 'superuser' ],
-	[ 'cluster.gcs_block_dedup_max_entries', '4096', 'postmaster' ],
+	[ 'cluster.gcs_block_dedup_max_entries', '16384', 'postmaster' ],
 )
 {
 	my ($name, $expected_default, $expected_ctx) = @$row;

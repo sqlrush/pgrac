@@ -919,10 +919,11 @@ extern int cluster_gcs_reply_timeout_ms;
  *
  *	cluster.gcs_block_dedup_max_entries
  *	  type: int   context: PGC_POSTMASTER
- *	  default: 4096 (min 256, max 65536;  spec-7.2a D4 raised from
- *	  1024/16384)
+ *	  default: 16384 (min 256, max 65536;  spec-7.2a D4 raised from
+ *	  1024/16384; 16384 = the measured S1 4-node distinct-read green
+ *	  floor on the RACvsRAC rig)
  *	  Per-node cap for the master-side dedup HTAB.  Each entry occupies
- *	  sizeof(GcsBlockDedupEntry) = 8448B, so default cap → ~34.7 MB shmem
+ *	  sizeof(GcsBlockDedupEntry) = 8448B, so default cap → ~138 MB shmem
  *	  on each node acting as GCS block-ship master.  The effective
  *	  capacity is auto-sized to at least MaxConnections × declared node
  *	  count (capped at the ceiling; spec-7.2a D4 Q4).  Under cap pressure
