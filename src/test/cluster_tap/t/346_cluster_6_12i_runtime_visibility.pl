@@ -247,27 +247,43 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 # L4c: spec-7.3 D7 -- fence ×N on the undo serve.  A write-fenced origin must
 # not ship undo bytes / a commit verdict on the DATA plane (the 8.A-critical
 # stale-commit_scn surface).  The inline serve's fence gate sits ahead of the
-# undo read / authority co-sample, so forcing it (cluster-lms-cr-fence-refuse)
-# must keep a fresh node1 backend fail-closed 53R97, bump the origin's
-# cr_server_fence_refused_count, and serve NOTHING (undo_served / verdict_served
-# stay put -- the RED signal distinguishing the gate from a serve that failed),
-# then recover once the fence clears.  Shares the single gate with L7 in t/354.
+# undo read / authority co-sample, so forcing it (cluster-lms-cr-fence-refuse,
+# conf-armed + SIGHUP per the t/360 L5 pattern -- review P1-2: the old
+# inject_skip_set guard skipped this leg forever) must keep a fresh node1
+# backend fail-closed 53R97, bump the origin's cr_server_fence_refused_count,
+# and serve NOTHING (undo_served / verdict_served stay put -- the RED signal
+# distinguishing the gate from a serve that failed), then recover once the
+# fence clears.  Shares the single gate with L7 in t/354; counter snapshots
+# are taken AFTER the arm is observably effective so pre-arm serves cannot
+# contaminate the static-counter assertions.
 # ============================================================
-SKIP:
 {
-	skip "ClusterPair inject SKIP helper missing", 5
-		unless $pair->can('inject_skip_set');
+	# Arm on the origin; the LMS workers re-read cluster.injection_points on
+	# SIGHUP, so poll a fresh node1 backend (no per-backend authority memo ->
+	# the fetch rides the wire into the origin's fence gate) until the armed
+	# refusal is observable.
+	$node0->append_conf('postgresql.conf',
+		"cluster.injection_points = 'cluster-lms-cr-fence-refuse:skip'");
+	$node0->reload;
+	my $err = 'arm poll never ran';
+	for my $try (1 .. 60)
+	{
+		my ($rc, $out);
+		($rc, $out, $err) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+		last if defined($err) && $err =~ /cluster TT (status unknown|slot recycled)/;
+		usleep(500_000);
+	}
+	like($err, qr/cluster TT (status unknown|slot recycled)/,
+		'L4c fence ×N: write-fenced origin keeps the undo read fail-closed (53R97)');
 
 	my $fr0 = state_val($node0, 'cr', 'cr_server_fence_refused_count');
 	my $us0 = state_val($node0, 'cr', 'cr_server_undo_served_count');
 	my $vs0 = state_val($node0, 'cr', 'cr_server_verdict_served_count');
 
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 100);
-	# Fresh backend -> no cached authority memo -> the fetch rides the wire into
-	# the origin's fence gate.
-	my ($rc, $out, $err) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
-	like($err, qr/cluster TT (status unknown|slot recycled)/,
-		'L4c fence ×N: write-fenced origin keeps the undo read fail-closed (53R97)');
+	# One deterministic fenced fetch against the armed gate.
+	my ($rc2, $out2, $err2) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+	like($err2, qr/cluster TT (status unknown|slot recycled)/,
+		'L4c armed gate keeps a fresh backend fail-closed (deterministic leg)');
 	cmp_ok(state_val($node0, 'cr', 'cr_server_fence_refused_count'), '>', $fr0,
 		'L4c origin fence-refused counter advanced (undo serve refused pre-read)');
 	is(state_val($node0, 'cr', 'cr_server_undo_served_count'), $us0,
@@ -275,13 +291,17 @@ SKIP:
 	is(state_val($node0, 'cr', 'cr_server_verdict_served_count'), $vs0,
 		'L4c no verdict served while fenced');
 
-	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 0);
-	usleep(1_000_000);
+	# Disarm.  A bare empty list does NOT recall a :skip arm (the assign_hook
+	# only reverts WARNING arms); an explicit ':none' entry re-arms the point
+	# to NONE in every process on SIGHUP.
+	$node0->append_conf('postgresql.conf',
+		"cluster.injection_points = 'cluster-lms-cr-fence-refuse:none'");
+	$node0->reload;
 	my $ok = 0;
 	for my $try (1 .. 20)
 	{
-		my ($rc2, $out2, $err2) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
-		if (defined $out2 && $out2 =~ /^12$/m) { $ok = 1; last; }
+		my ($rc3, $out3, $err3) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+		if (defined $out3 && $out3 =~ /^12$/m) { $ok = 1; last; }
 		usleep(500_000);
 	}
 	ok($ok, 'L4c undo read recovers after the fence clears');
