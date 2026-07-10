@@ -44,11 +44,13 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <sys/stat.h>
 
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/tuplestore.h"
@@ -190,6 +192,51 @@ cluster_conf_node_count(void)
 	if (ClusterConfShmem == NULL)
 		return 0;
 	return ClusterConfShmem->node_count;
+}
+
+/*
+ * cluster_conf_declared_node_count_early
+ *
+ *	Pre-shmem topology sniff (see cluster_conf.h).  Deliberately counts only
+ *	[node.N] section headers; cluster_conf_load() remains the startup SSOT
+ *	and still validates syntax, required fields, and node_id consistency
+ *	later.  Cached per process: the file is postmaster-static for the life
+ *	of the instance, and shmem size_fn/init_fn must see the same value so
+ *	the reserved region always covers the initialised HTAB (spec-7.2a D4).
+ *	Originally a static helper in cluster_catalog_bootstrap.c (spec-6.14 D6);
+ *	hoisted here when spec-7.2a added a second pre-shmem consumer.
+ */
+int
+cluster_conf_declared_node_count_early(void)
+{
+	static int declared_nodes_cache = -1;
+	const char *path;
+	FILE *f;
+	char line[1024];
+	int nodes = 0;
+
+	if (declared_nodes_cache > 0)
+		return declared_nodes_cache;
+
+	path = (cluster_config_file != NULL && cluster_config_file[0] != '\0') ? cluster_config_file
+																		   : "pgrac.conf";
+
+	f = AllocateFile(path, "r");
+	if (f == NULL)
+		return 1; /* absent file → single-node fallback; do not cache ENOENT */
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		const char *p = line;
+
+		while (*p != '\0' && isspace((unsigned char)*p))
+			p++;
+		if (strncmp(p, "[node.", 6) == 0)
+			nodes++;
+	}
+	FreeFile(f);
+
+	declared_nodes_cache = nodes > 0 ? nodes : 1;
+	return declared_nodes_cache;
 }
 
 

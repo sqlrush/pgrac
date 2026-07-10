@@ -3956,24 +3956,30 @@ cluster_init_guc(void)
 										 "Default 4096 → ~34.7MB shmem on each node serving as "
 										 "GCS block-ship master; ceiling 65536 → ~554MB; "
 										 "bootstrap/initdb with no configured cluster.node_id does "
-										 "not allocate the HTAB.  Under cap pressure the master "
-										 "eagerly reclaims reclaim-safe entries before failing "
-										 "closed; HASH_ENTER_NULL on a still-full table → "
-										 "DENIED_DEDUP_FULL fail-closed (sender retries via "
-										 "HC96 transient).  HC92.  PGC_POSTMASTER (restart to "
-										 "change the fixed HTAB size)."),
-							&cluster_gcs_block_dedup_max_entries, 4096, 256, 65536, PGC_POSTMASTER,
-							0, NULL, NULL, NULL);
+										 "not allocate the HTAB.  The effective capacity is never "
+										 "below MaxConnections × declared node count (auto-size "
+										 "floor, capped at the ceiling), so undersized configs do "
+										 "not saturate under distinct-read pressure.  Under cap "
+										 "pressure the master eagerly reclaims reclaim-safe "
+										 "entries before failing closed; HASH_ENTER_NULL on a "
+										 "still-full table → DENIED_DEDUP_FULL fail-closed "
+										 "(sender retries via HC96 transient).  HC92.  "
+										 "PGC_POSTMASTER (restart to change the fixed HTAB size)."),
+							&cluster_gcs_block_dedup_max_entries, 4096, 256,
+							CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING, PGC_POSTMASTER, 0, NULL,
+							NULL, NULL);
 
-	DefineCustomIntVariable("cluster.gcs_block_drop_target_relfilenode",
-							gettext_noop("Test-only: restrict the drop-reply injection to one relfilenode."),
-							gettext_noop("When non-zero, cluster-gcs-block-drop-reply-before-send only "
-										 "fires for block ships whose relfilenode matches this value, so "
-										 "a :skipn:N count is spent on the intended relation and not on "
-										 "unrelated catalog/internal ships.  0 (default) disables the "
-										 "filter.  For TAP retransmit-dedup correctness tests only."),
-							&cluster_gcs_block_drop_target_relfilenode, 0, 0, INT_MAX, PGC_SUSET,
-							0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.gcs_block_drop_target_relfilenode",
+		gettext_noop("Test-only: restrict the drop-reply injection to one relfilenode."),
+		gettext_noop("When non-zero, cluster-gcs-block-drop-reply-before-send only "
+					 "fires for block ships whose physical relfilenode matches this "
+					 "value, so a :skipn:N count is spent on the intended relation and "
+					 "not on unrelated catalog/internal ships.  0 (default) disables "
+					 "the filter; current TAP tests use 0 (the non-zero filter is "
+					 "reserved for non-shared-catalog rigs).  For TAP retransmit-dedup "
+					 "correctness tests only."),
+		&cluster_gcs_block_drop_target_relfilenode, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * PGRAC: spec-2.36 D8 — 3 NEW GUC for CF 3-way (X transfer +

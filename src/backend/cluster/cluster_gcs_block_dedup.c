@@ -37,6 +37,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
@@ -62,6 +63,9 @@ typedef struct ClusterGcsBlockDedupShared {
 	pg_atomic_uint64 full_count;	  /* HC92 FULL */
 	pg_atomic_uint64 evict_count;	  /* spec-7.2a: eager reclaim + TTL sweep removed */
 	pg_atomic_uint32 entry_count;	  /* live in-flight + completed entries */
+	int max_entries_effective;		  /* spec-7.2a D4: cap the HTAB was sized
+									   * with (configured + auto-size floor);
+									   * stamped once at init, read-only after */
 } ClusterGcsBlockDedupShared;
 
 static ClusterGcsBlockDedupShared *cluster_gcs_block_dedup_shared = NULL;
@@ -92,6 +96,9 @@ static int dedup_reclaim_reclaimable_locked(TimestampTz now, int want);
 static int
 cluster_gcs_block_dedup_effective_entries(void)
 {
+	int configured;
+	int64 auto_floor;
+
 	/*
 	 * Heavy GCS block-dedup storage is only meaningful for configured
 	 * cluster nodes.  initdb/bootstrap runs with cluster_node_id = -1 and
@@ -101,7 +108,29 @@ cluster_gcs_block_dedup_effective_entries(void)
 	if (!cluster_enabled || cluster_node_id < 0)
 		return 0;
 
-	return cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+	configured
+		= cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+
+	/*
+	 * spec-7.2a D4 (Q4) auto-size lower bound: every connected backend on
+	 * every declared node can hold one block request in flight against this
+	 * master, so a configured cap below MaxConnections × node_count is
+	 * guaranteed to saturate under distinct-read pressure.  Raise such
+	 * configs to that floor, clamped at the GUC ceiling — auto-sizing widens
+	 * a foot-gun config, it never grows shmem past what the DBA could
+	 * configure by hand.  The node count comes from the pre-shmem conf sniff
+	 * (cluster_conf_load() runs only after every region is initialised, so
+	 * cluster_conf_node_count() is still 0 when size_fn/init_fn call here);
+	 * with no readable pgrac.conf the sniff reports 1 and the floor
+	 * degenerates to MaxConnections.
+	 */
+	auto_floor = (int64)MaxConnections * cluster_conf_declared_node_count_early();
+	if (auto_floor > CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING)
+		auto_floor = CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING;
+	if (configured < (int)auto_floor)
+		configured = (int)auto_floor;
+
+	return configured;
 }
 
 
@@ -148,6 +177,10 @@ cluster_gcs_block_dedup_shmem_init(void)
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->full_count, 0);
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->evict_count, 0);
 		pg_atomic_init_u32(&cluster_gcs_block_dedup_shared->entry_count, 0);
+		/* spec-7.2a D4: stamp the cap the HTAB below is sized with, so the
+		 * observability accessor reports the capacity actually in force
+		 * (identical in every process, EXEC_BACKEND included). */
+		cluster_gcs_block_dedup_shared->max_entries_effective = cap;
 	}
 
 	memset(&info, 0, sizeof(info));
@@ -489,14 +522,14 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		static uint64 dedup_full_logged_hwm = 0;
 		uint64 cur_full = pg_atomic_read_u64(&cluster_gcs_block_dedup_shared->full_count);
 
-		if (cur_full - dedup_full_logged_hwm >= GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD)
-		{
-			elog(LOG,
-				 "GCS block dedup saturating: %llu new DENIED_DEDUP_FULL since last report "
-				 "(cap=%d, live entries=%u); raise cluster.gcs_block_dedup_max_entries if sustained",
-				 (unsigned long long) (cur_full - dedup_full_logged_hwm),
-				 cluster_gcs_block_dedup_effective_entries(),
-				 pg_atomic_read_u32(&cluster_gcs_block_dedup_shared->entry_count));
+		if (cur_full - dedup_full_logged_hwm >= GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD) {
+			elog(
+				LOG,
+				"GCS block dedup saturating: %llu new DENIED_DEDUP_FULL since last report "
+				"(cap=%d, live entries=%u); raise cluster.gcs_block_dedup_max_entries if sustained",
+				(unsigned long long)(cur_full - dedup_full_logged_hwm),
+				cluster_gcs_block_dedup_shared->max_entries_effective,
+				pg_atomic_read_u32(&cluster_gcs_block_dedup_shared->entry_count));
 			dedup_full_logged_hwm = cur_full;
 		}
 	}
@@ -631,16 +664,19 @@ cluster_gcs_block_dedup_get_evict_count(void)
 /*
  * cluster_gcs_block_dedup_get_max_entries -- effective dedup capacity.
  *
- *	spec-7.2a D5:  reports the effective entry ceiling resolved by
- *	cluster_gcs_block_dedup_effective_entries() (the GUC value, or 0 during
- *	initdb/bootstrap before a cluster node id is assigned).  The occupancy
- *	ratio entry_count / max_entries is the saturation signal behind the
- *	DEDUP_FULL fail-closed path.
+ *	spec-7.2a D5:  reports the capacity stamped at shmem init (the GUC value
+ *	raised to the D4 auto-size floor — the size the HTAB was actually built
+ *	with), or 0 when the HTAB was never allocated (initdb/bootstrap before a
+ *	cluster node id is assigned, or vanilla mode).  The occupancy ratio
+ *	entry_count / max_entries is the saturation signal behind the DEDUP_FULL
+ *	fail-closed path.
  */
 uint64
 cluster_gcs_block_dedup_get_max_entries(void)
 {
-	return (uint64) cluster_gcs_block_dedup_effective_entries();
+	return cluster_gcs_block_dedup_shared
+			   ? (uint64)cluster_gcs_block_dedup_shared->max_entries_effective
+			   : 0;
 }
 
 
