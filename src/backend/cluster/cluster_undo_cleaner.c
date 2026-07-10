@@ -681,6 +681,7 @@ UNDO_CLEANER_COUNTER_ACCESSOR(pass_count)
 UNDO_CLEANER_COUNTER_ACCESSOR(shmem_tt_slots_gcd)
 UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
 UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
+UNDO_CLEANER_COUNTER_ACCESSOR(header_tt_slots_below_horizon) /* spec-5.22e D5-5 */
 
 
 /* ============================================================

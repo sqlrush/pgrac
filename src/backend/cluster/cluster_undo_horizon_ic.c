@@ -568,6 +568,42 @@ cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
 	return cluster_epoch_get_current() != expected_epoch;
 }
 
+/*
+ * Per-peer report summary for the dump surface (D5-5): one static line
+ * "n<id>:v=<valid>,cap=<cap>,e=<epoch>,scn=<scn>,age_ms=<age>,iv=<ms>,fl=<flag>"
+ * per declared peer, space-separated.  Diagnostic only (torn reads are
+ * acceptable here; the fold uses the seqlock-protocol sampler).
+ */
+const char *
+cluster_undo_horizon_peer_reports_summary(void)
+{
+	static char buf[CLUSTER_MAX_NODES * 96];
+	uint64 now_us = (uint64)GetCurrentTimestamp();
+	size_t off = 0;
+	int i;
+
+	buf[0] = '\0';
+	if (UndoHorizonShmem == NULL)
+		return buf;
+	for (i = 0; i < CLUSTER_MAX_NODES && off + 96 < sizeof(buf); i++) {
+		ClusterUndoHorizonSlotShmem *slot = &UndoHorizonShmem->slots[i];
+		int64 age_ms;
+
+		if (i == cluster_node_id || cluster_conf_lookup_node(i) == NULL)
+			continue;
+		age_ms = slot->recv_at_us == 0 || now_us < slot->recv_at_us
+					 ? -1
+					 : (int64)((now_us - slot->recv_at_us) / 1000);
+		off += (size_t)snprintf(
+			buf + off, sizeof(buf) - off,
+			"%sn%d:v=%d,cap=%d,e=" UINT64_FORMAT ",scn=" UINT64_FORMAT ",age_ms=%lld,iv=%u,fl=%d",
+			off > 0 ? " " : "", i, slot->valid ? 1 : 0,
+			cluster_sf_peer_supports_undo_horizon(i) ? 1 : 0, slot->epoch, slot->horizon_scn,
+			(long long)age_ms, slot->sender_interval_ms, slot->regression_flagged ? 1 : 0);
+	}
+	return buf;
+}
+
 /* ---------------- observability (D5-5 accessors) ---------------------- */
 
 #define UNDO_HORIZON_NOTE(field)                                                                   \

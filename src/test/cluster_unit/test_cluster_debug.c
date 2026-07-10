@@ -2295,6 +2295,47 @@ cluster_undo_cleaner_pass_count(void)
 {
 	return 0;
 }
+/* spec-5.22e D5-5 stubs: retention brake observability rows. */
+uint64
+cluster_undo_cleaner_header_tt_slots_below_horizon(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_stall_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_peer_stale_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_pass_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_wire_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_admission_refuse_count(void)
+{
+	return 0;
+}
+SCN
+cluster_undo_horizon_last_floor(void)
+{
+	return (SCN)0;
+}
+const char *
+cluster_undo_horizon_peer_reports_summary(void)
+{
+	return "";
+}
 uint64
 cluster_undo_cleaner_shmem_tt_slots_gcd(void)
 {

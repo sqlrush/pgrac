@@ -189,6 +189,7 @@ extern int64 cluster_undo_cleaner_main_loop_iters(void);
 
 /* D6 counter accessors (dump_undo + tests). */
 extern uint64 cluster_undo_cleaner_pass_count(void);
+extern uint64 cluster_undo_cleaner_header_tt_slots_below_horizon(void); /* spec-5.22e D5-5 */
 extern uint64 cluster_undo_cleaner_shmem_tt_slots_gcd(void);
 extern uint64 cluster_undo_cleaner_segments_marked_recyclable(void);
 extern uint64 cluster_undo_cleaner_stale_active_skipped(void);

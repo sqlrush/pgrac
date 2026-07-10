@@ -206,6 +206,7 @@ extern void cluster_undo_horizon_note_wire_reject(void);
 extern uint64 cluster_undo_horizon_wire_reject_count(void);
 extern void cluster_undo_horizon_note_admission_refuse(void);
 extern uint64 cluster_undo_horizon_admission_refuse_count(void);
+extern const char *cluster_undo_horizon_peer_reports_summary(void);
 extern void cluster_undo_horizon_note_floor(SCN scn);
 extern SCN cluster_undo_horizon_last_floor(void);
 

@@ -115,7 +115,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_cssd.h"		  /* cluster_cssd_status (spec-2.5 D12) */
 #include "cluster/cluster_stats.h"		  /* cluster_stats_status (spec-1.14 D12) */
-#include "cluster/cluster_undo_cleaner.h" /* dump_undo_cleaner (spec-3.13 D1) */
+#include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_undo_horizon.h" /* D5-5 brake observability (spec-5.22e) */ /* dump_undo_cleaner (spec-3.13 D1) */
 #include "cluster/cluster_undo_gcs.h"	  /* undo GCS grant-plane counters (spec-5.22b D2-6) */
 #include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
@@ -2476,6 +2477,26 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_segment_reuse_count()));
 	emit_row(rsinfo, "undo", "tt_slot_wrap_retired_count",
 			 fmt_int64((int64)cluster_tt_slot_wrap_retired_count()));
+
+	/* spec-5.22e D5-5: cluster retention brake observability (32 -> 40 rows).
+	 * Stall/abort/reject/admission counters + the last proven floor gauge +
+	 * the previously accessor-less below-horizon inventory counter. */
+	emit_row(rsinfo, "undo", "horizon_stall_count",
+			 fmt_int64((int64)cluster_undo_horizon_stall_count()));
+	emit_row(rsinfo, "undo", "horizon_peer_stale_count",
+			 fmt_int64((int64)cluster_undo_horizon_peer_stale_count()));
+	emit_row(rsinfo, "undo", "horizon_pass_abort_count",
+			 fmt_int64((int64)cluster_undo_horizon_pass_abort_count()));
+	emit_row(rsinfo, "undo", "horizon_wire_reject_count",
+			 fmt_int64((int64)cluster_undo_horizon_wire_reject_count()));
+	emit_row(rsinfo, "undo", "horizon_admission_refuse_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_refuse_count()));
+	emit_row(rsinfo, "undo", "horizon_last_floor_scn",
+			 fmt_int64((int64)cluster_undo_horizon_last_floor()));
+	emit_row(rsinfo, "undo", "horizon_peer_reports",
+			 cluster_undo_horizon_peer_reports_summary());
+	emit_row(rsinfo, "undo", "cleaner_header_tt_slots_below_horizon",
+			 fmt_int64((int64)cluster_undo_cleaner_header_tt_slots_below_horizon()));
 
 	/* spec-4.8ab D7: 4 checkpoint-writeback boundary counters (grown into the
 	 * existing undo buffer pool region -- D0 finding-3, no new region). */

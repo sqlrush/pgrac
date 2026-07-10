@@ -116,6 +116,27 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, ui
 			   && owner_instance != (uint8)(cluster_node_id + 1)));
 
 	/*
+	 * spec-5.22e D5-4: the pairing above is a WRITER-EXCLUSION pillar (the
+	 * D4 complete-scan prove and the D5 retention brake both argue "no
+	 * foreign writer can exist in an owner's shared namespace"), so an
+	 * Assert alone is not enough -- production builds must fail closed too
+	 * (rule 12: Assert never substitutes for a runtime guard).  Callers
+	 * resolve paths outside critical sections (the 53R9D discipline), so
+	 * an ERROR here is safe.
+	 */
+	if (!((((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			== (owner_instance == (uint8)(cluster_node_id + 1)))
+		   || (intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0
+			   && owner_instance != (uint8)(cluster_node_id + 1)))))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("undo path intent/ownership violation: intent %d, owner %u, self node %d",
+						(int)intent, (unsigned)owner_instance, cluster_node_id),
+				 errhint("Foreign-owner shared undo is only reachable through the dead-owner "
+						 "authority block0 route; anything else is a split-brain bug "
+						 "(spec-5.22e writer-exclusion guard).")));
+
+	/*
 	 * RUNTIME_SHARED own undo migrates to the shared cluster_fs root only
 	 * under peer-mode + cluster.undo_gcs_coherence; MATERIALIZED_LOCAL and
 	 * every non-coherent mode stay on the local DataDir (P1-3 / 裁决 A).  An

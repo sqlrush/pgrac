@@ -145,8 +145,12 @@ cluster_undo_serve_authority(const ClusterResId *undo_resid, uint64 reconfig_epo
  *	owner is dead-decided + write-fenced (its revival forces a reconfig ⇒
  *	epoch bump ⇒ the caller's post-scan re-check refuses); survivors' only
  *	foreign-owner intent is AUTHORITY_BLOCK0, whose single I/O consumer is
- *	the read below (no writer, no unlink/rename path exists).  D5's future
- *	reclaimer must inherit this invariant before deleting anything here.
+ *	the read below (no writer, no unlink/rename path exists).  spec-5.22e
+ *	(D5) RULED the reclaimer question: retention stays own-instance only
+ *	(dead-owner segments are frozen; the path_resolve ownership guard is
+ *	now enforced in release builds too), so this invariant holds unchanged.
+ *	A future cross-node reclaimer (D7+) must revise the A1.1-bis argument
+ *	(serialize against authority serve) BEFORE deleting anything here.
  *
  *	seg_0 is NOT skipped (A1.1-bis #3): "segment 0 never carries a xact TT
  *	slot" is not a verified structural invariant (the uba_encode Assert only
