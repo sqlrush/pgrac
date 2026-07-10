@@ -735,6 +735,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	MemoryContext old;
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
+	bool inject_refuse;
 
 	if (fwd == NULL)
 		return;
@@ -767,8 +768,11 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	 * injection forces the same branch deterministically for the TAP fence leg.
 	 */
 	CLUSTER_INJECTION_POINT("cluster-lms-cr-fence-refuse");
-	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
-		|| cluster_injection_should_skip("cluster-lms-cr-fence-refuse")) {
+	/* Consume a pending injection arm unconditionally (F6-1 local-var idiom):
+	 * evaluating it as the second || operand would let a genuine fence
+	 * short-circuit past the consume, leaking the arm to a later call. */
+	inject_refuse = cluster_injection_should_skip("cluster-lms-cr-fence-refuse");
+	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed()) || inject_refuse) {
 		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
 		old = MemoryContextSwitchTo(cr_serve_scratch_context());
 		cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
