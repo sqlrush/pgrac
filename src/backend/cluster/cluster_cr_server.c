@@ -20,8 +20,11 @@
  *	                         LMON owns the IC connections.
  *
  *	  The slot state word is an atomic; each transition has exactly one
- *	  writer (LMON: FREE→PENDING, READY→FREE; LMS: PENDING→BUSY→READY),
- *	  so no lock is needed beyond the CAS on FREE→PENDING.
+ *	  writer (submitter: FREE→FILLING→PENDING; LMS: PENDING→BUSY→READY;
+ *	  LMON ship: READY→FREE), so no lock is needed beyond the CAS on
+ *	  FREE→FILLING.  FILLING is the producer-only reservation: PENDING
+ *	  is published only after the request fields + a write barrier, so
+ *	  the LMS drain can never acquire a half-written slot.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -160,7 +163,10 @@ cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		/* Reserve producer-only FILLING first (spec-7.1 integration review):
+		 * landing directly on PENDING would let the LMS drain acquire the
+		 * slot before the request fields below are written. */
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -210,7 +216,10 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		/* Reserve producer-only FILLING first (spec-7.1 integration review):
+		 * landing directly on PENDING would let the LMS drain acquire the
+		 * slot before the request fields below are written. */
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -271,7 +280,10 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		/* Reserve producer-only FILLING first (spec-7.1 integration review):
+		 * landing directly on PENDING would let the LMS drain acquire the
+		 * slot before the request fields below are written. */
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -341,7 +353,10 @@ cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		/* Reserve producer-only FILLING first (spec-7.1 integration review):
+		 * landing directly on PENDING would let the LMS drain acquire the
+		 * slot before the request fields below are written. */
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
 			continue;
 
 		slot->tag = fwd->tag;

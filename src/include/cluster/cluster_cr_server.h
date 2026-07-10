@@ -100,10 +100,20 @@ extern ClusterCrInvalidScnVerdict cluster_cr_server_invalid_scn_verdict(bool clo
 /*
  * LMS CR work slots (shmem, embedded in the cluster_lms region).
  *
- *	Slot lifecycle: FREE -(LMON submit)-> PENDING -(LMS drain)-> BUSY
- *	-(LMS result)-> READY -(LMON ship)-> FREE.  Single-producer single-
- *	consumer per direction (LMON dispatch is single-threaded; LMS is one
- *	process), so an atomic state word per slot is the whole protocol.
+ *	Slot lifecycle: FREE -(submit CAS)-> FILLING -(submit publish)->
+ *	PENDING -(LMS drain)-> BUSY -(LMS result)-> READY -(LMON ship)->
+ *	FREE.  Single-producer single-consumer per direction (LMON dispatch
+ *	is single-threaded; LMS is one process), so an atomic state word per
+ *	slot is the whole protocol.
+ *
+ *	PGRAC (spec-7.1 integration review): FILLING is the producer-only
+ *	reservation.  The submit CAS must NOT land directly on PENDING: the
+ *	drain CAS-acquires PENDING slots, so a drain racing the submitter's
+ *	field stores would serve garbage, and the submitter's trailing
+ *	publish store would then stomp the LMS's BUSY/READY (double serve /
+ *	lost reply).  A producer killed between CAS and publish leaks the
+ *	slot in FILLING — fail-closed (submits degrade to false = requester
+ *	keeps 53R97), never a garbage serve.
  */
 #define CLUSTER_LMS_CR_SLOTS 4
 
@@ -111,7 +121,8 @@ typedef enum ClusterLmsCrSlotState {
 	CLUSTER_LMS_CR_FREE = 0,
 	CLUSTER_LMS_CR_PENDING = 1,
 	CLUSTER_LMS_CR_BUSY = 2,
-	CLUSTER_LMS_CR_READY = 3
+	CLUSTER_LMS_CR_READY = 3,
+	CLUSTER_LMS_CR_FILLING = 4 /* producer-reserved; fields not yet published */
 } ClusterLmsCrSlotState;
 
 /* Work-slot request kind (spec-6.12i extends the wave-b CR-only table). */
