@@ -267,7 +267,7 @@ is(gcs_int($node1, 'plane_misroute_reject'), 0, 'L3 node1 zero plane misroutes')
 # stays blocked on the same F1 wall above.  The ISOLATED path -- a GRACEFUL
 # worker exit (SIGTERM) that respawns just that slot with the other shards
 # undisturbed -- is the reachable D7 improvement and is proven live in
-# t/365 L6 (no crash cascade; worker respawns with a fresh pid; mesh re-forms).
+# t/367 L6 (no crash cascade; worker respawns with a fresh pid; mesh re-forms).
 # ============================================================
 SKIP: {
 	skip 'F1-8 KNOWN-BLOCKED: block_device crash-recovery raw_layout_lock '
