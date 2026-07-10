@@ -221,6 +221,30 @@ ok(defined($p99) && $p99 <= 20000,
 	sprintf('L2 value gate p99 < 20ms (p99 <= %s us)', defined($p99) ? $p99 : 'inf'));
 
 # ============================================================
+# L2b — spec-7.3 D8: per-worker dispatch counter.  The L2 ping-pong rode the
+# DATA plane, so the LMS pool on both nodes dispatched envelopes;  the
+# aggregate must equal the per-worker sum (default pool: w0 + w1).  This is
+# the assertable surface F6-2 wanted (the mispositioned data-dispatch
+# injection point stays a spec-7.2 follow-up — the counter sits on the real
+# dispatch path, in cluster_ic_dispatch_envelope).
+# ============================================================
+sub lms_int
+{
+	my ($node, $key) = @_;
+	my $v = $node->safe_psql('postgres',
+		qq{SELECT value FROM pg_cluster_state WHERE category='lms' AND key='$key'});
+	return defined($v) && $v ne '' ? int($v) : 0;
+}
+for my $n ($node0, $node1)
+{
+	my $agg = lms_int($n, 'lms_data_dispatch_count');
+	cmp_ok($agg, '>', 0, 'L2b ' . $n->name . ' LMS pool dispatched DATA envelopes');
+	is($agg,
+		lms_int($n, 'lms_data_dispatch_count_w0') + lms_int($n, 'lms_data_dispatch_count_w1'),
+		'L2b ' . $n->name . ' dispatch aggregate = per-worker sum');
+}
+
+# ============================================================
 # L3 — hygiene: zero plane misroutes.
 # ============================================================
 is(gcs_int($node0, 'plane_misroute_reject'), 0, 'L3 node0 zero plane misroutes');

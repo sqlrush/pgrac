@@ -771,6 +771,12 @@ cluster_touched_peers_stamp(int32 node_id pg_attribute_unused(),
 	return false;
 }
 
+/* spec-7.3 D8: link-only stub — the per-worker dispatch counter bump is a
+ * no-op outside an LMS process, and the unit harness has no LMS. */
+void
+cluster_lms_obs_note_dispatch(void)
+{}
+
 int
 main(void)
 {

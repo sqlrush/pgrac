@@ -630,6 +630,14 @@ bool cluster_lms_enabled = true;
 int cluster_lms_workers = 2;
 
 /*
+ * spec-7.3 D8 (Q8) — cluster.lms_nice: optional setpriority for the LMS
+ * DATA-plane workers.  Default 0 = leave the inherited priority alone
+ * (best-effort weak alignment to Oracle's LMS scheduling priority;  the
+ * RT scheduling class is out of scope).  PGC_SIGHUP.
+ */
+int cluster_lms_nice = 0;
+
+/*
  * spec-2.21 D2:cluster.lock_acquire_cluster_path emergency bypass GUC.
  * Default true; PGC_POSTMASTER context.  Set false only for P0 incident
  * response to skip the cluster gate entirely (PG-native lock only).
@@ -3725,6 +3733,17 @@ cluster_init_guc(void)
 					 "Must be identical on every node (HELLO negotiation rejects a "
 					 "mismatch).  PGC_POSTMASTER: restart required to resize the pool."),
 		&cluster_lms_workers, 2, 1, CLUSTER_LMS_MAX_WORKERS, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-7.3 D8 (Q8) — cluster.lms_nice: optional LMS scheduling priority. */
+	DefineCustomIntVariable(
+		"cluster.lms_nice",
+		gettext_noop("Nice value applied to the LMS DATA-plane workers (0 = leave alone)."),
+		gettext_noop("When non-zero, every LMS worker applies this nice value to itself via "
+					 "setpriority (best-effort;  a failure is a WARNING, not an error).  The "
+					 "default 0 leaves the inherited priority untouched, and setting the value "
+					 "back to 0 does not restore a previously applied one.  SIGHUP: workers "
+					 "re-apply on config reload."),
+		&cluster_lms_nice, 0, -20, 0, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.21 D2:emergency bypass GUC */
 	DefineCustomBoolVariable("cluster.lock_acquire_cluster_path",

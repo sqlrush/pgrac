@@ -226,6 +226,25 @@ for my $n ($node0, $node1)
 }
 
 # ============================================================
+# L5b: spec-7.3 D8 — per-worker inline-serve observability.  The L2 remote CR
+# above was served inline by the origin's worker[shard], so the origin's
+# per-worker serve counters + duration histogram must have moved, and every
+# inline serve ships exactly one direct reply (direct_reply >= inline_serve;
+# fence/deny ships count as replies too).
+# ============================================================
+{
+	my $srv = state_val($node0, 'lms', 'lms_inline_serve_count');
+	my $rep = state_val($node0, 'lms', 'lms_direct_reply_count');
+	my $hist_total = $node0->safe_psql('postgres', q{
+		SELECT COALESCE(sum(value::bigint), 0) FROM pg_cluster_state
+		 WHERE category='lms' AND key LIKE 'lms\_serve\_hist\_us\_%' ESCAPE '\'
+		   AND key NOT LIKE '%\_w%' ESCAPE '\'});
+	cmp_ok($srv, '>', 0, 'L5b origin inline-serve counter moved (worker-side serve)');
+	cmp_ok($rep, '>=', $srv, 'L5b every inline serve shipped a direct reply');
+	cmp_ok($hist_total, '>', 0, 'L5b serve-duration histogram recorded the serves');
+}
+
+# ============================================================
 # L6: spec-7.3 D6 — 8.A envelope on the inline serve.  Forcing the origin's
 # CR construction to fail-closed (the cluster-lms-cr-construct skip injection)
 # must (a) keep the requester at the unchanged 53R9G, (b) leave the origin's

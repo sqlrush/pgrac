@@ -60,6 +60,34 @@ my $guc_meta = $node2->safe_psql('postgres', q{
 is($guc_meta, '2|integer|postmaster',
 	'L2 cluster.lms_workers is a postmaster int GUC defaulting to 2');
 
+# ---- L2b (spec-7.3 D8) : lms_nice GUC + per-worker dump rows ---------------
+my $nice_meta = $node2->safe_psql('postgres', q{
+	SELECT setting, vartype, context, min_val, max_val
+	  FROM pg_settings
+	 WHERE name = 'cluster.lms_nice'});
+is($nice_meta, '0|integer|sighup|-20|0',
+	'L2b cluster.lms_nice is a sighup int GUC defaulting to 0 (range [-20,0])');
+
+# Per-worker observability rows are emitted for the LIVE pool only:
+# lms_workers=2 exposes _w0 + _w1 and no _w2.
+my $wrows2 = $node2->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_cluster_state
+	 WHERE category='lms' AND key IN
+	   ('lms_data_dispatch_count', 'lms_direct_reply_count',
+	    'lms_conn_reset_count', 'lms_inline_serve_count',
+	    'lms_data_dispatch_count_w0', 'lms_data_dispatch_count_w1')});
+is($wrows2, '6',
+	'L2b aggregate + per-worker observability keys present (lms_workers=2)');
+is( $node2->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_cluster_state
+	 WHERE category='lms' AND key = 'lms_data_dispatch_count_w2'}),
+	'0', 'L2b no _w2 rows beyond the live pool');
+is( $node2->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_cluster_state
+	 WHERE category='lms' AND key LIKE 'lms\_serve\_hist\_us\_%' ESCAPE '\'
+	   AND key NOT LIKE '%\_w%' ESCAPE '\'}),
+	'16', 'L2b aggregate serve-duration histogram has 16 buckets');
+
 $node2->stop;
 
 # ---- L3 : pool size 4 -> three worker siblings -----------------------------
@@ -90,6 +118,13 @@ $node1->safe_psql('postgres', 'SELECT pg_sleep(1)');
 is(backend_count($node1, 'lms worker'), '0',
 	'L4 no lms worker forked when cluster.lms_workers=1 (7.2 identity)');
 is(backend_count($node1, 'lms'), '1', 'L4a worker 0 (lms) still present');
+
+# L4b (spec-7.3 D8): the live-pool bound follows N=1 -- _w0 only, no _w1.
+is( $node1->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_cluster_state
+	 WHERE category='lms' AND key IN
+	   ('lms_data_dispatch_count_w0', 'lms_data_dispatch_count_w1')}),
+	'1', 'L4b per-worker rows bounded to the live pool (N=1: _w0 only)');
 
 # L5 clean shutdown (fast stop; TAP asserts the exit status is clean).
 $node1->stop;

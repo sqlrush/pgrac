@@ -155,6 +155,14 @@ typedef enum ClusterLmsState {
  */
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS 64
 
+/*
+ * spec-7.3 D8 — per-worker inline-serve duration histogram bucket count.
+ * 15 finite upper bounds (µs, see lms_serve_hist_bounds_us in cluster_lms.c)
+ * + 1 overflow bucket.  LMS-owned;  distinct from the requester-side
+ * CLUSTER_GCS_SHIP_HIST_BUCKETS measurement (D0-③).
+ */
+#define CLUSTER_LMS_SERVE_HIST_BUCKETS 16
+
 typedef struct ClusterLmsNativeLockProbeSlot {
 	pg_atomic_uint64 in_use;		   /* 0 = free, 2 = initializing, 1 = active */
 	uint64 probe_id;				   /* monotonic per-shard id (HC36 epoch) */
@@ -267,6 +275,37 @@ typedef struct ClusterLmsSharedState {
 	 * owns a tag's shard.  Guarded by lwlock like the other non-atomic fields.
 	 */
 	pid_t worker_pids[CLUSTER_LMS_MAX_WORKERS];
+
+	/*
+	 * spec-7.3 D8 — per-worker DATA-plane observability (×N).  Each worker
+	 * bumps only its own slot (index = its DATA channel id), so there is no
+	 * cross-worker contention;  the dump surface exposes the per-worker
+	 * detail plus the pool aggregate (sum).
+	 *
+	 *	worker_dispatch_count:      envelopes dispatched in this worker's
+	 *	                            DATA recv pump (shard-balance evidence).
+	 *	worker_direct_reply_count:  replies shipped directly from this
+	 *	                            worker's dispatch context by the D6
+	 *	                            inline serve (one per serve call,
+	 *	                            fence-refused DENIED ships included).
+	 *	worker_conn_reset_count:    DATA-mesh resets this worker executed
+	 *	                            (epoch bump / injected;  spec-7.3 D7).
+	 *	worker_inline_serve_count:  inline CR / undo-fetch / undo-verdict
+	 *	                            serves that reached the serve envelope
+	 *	                            (fence-refused excluded — those never
+	 *	                            read or construct;  spec-7.3 D6/D7).
+	 *	worker_serve_hist:          inline serve duration histogram (µs;
+	 *	                            last bucket = overflow) — the R4
+	 *	                            slow-shard backstop.  LMS-owned:  the
+	 *	                            requester-side ship_latency_hist in
+	 *	                            ClusterGcsBlockShared is a different
+	 *	                            measurement, NOT resized (D0-③).
+	 */
+	pg_atomic_uint64 worker_dispatch_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_direct_reply_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_conn_reset_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_inline_serve_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_serve_hist[CLUSTER_LMS_MAX_WORKERS][CLUSTER_LMS_SERVE_HIST_BUCKETS];
 } ClusterLmsSharedState;
 
 
@@ -388,6 +427,32 @@ extern void cluster_lms_bump_restart_generation_at_main_entry(void);
 /* spec-2.27 D7 — priority starvation observability counter. */
 extern void cluster_lms_inc_priority_starvation_observed(void);
 extern uint64 cluster_lms_get_priority_starvation_observed_count(void);
+
+/*
+ * spec-7.3 D8 — per-worker DATA-plane observability (×N).
+ *
+ *	The note_* bumpers are no-ops outside an LMS process (worker 0 or a
+ *	LmsWorker) — each resolves the caller's worker slot from its DATA
+ *	channel id.  note_inline_serve also records the serve duration into
+ *	the caller worker's histogram.  The get_* readers take a worker id,
+ *	or -1 for the pool aggregate (sum over all slots);  hist_bound_us
+ *	returns bucket b's inclusive upper bound in µs (UINT64_MAX for the
+ *	overflow bucket, matching the gcs ship-hist idiom).
+ */
+extern void cluster_lms_obs_note_dispatch(void);
+extern void cluster_lms_obs_note_direct_reply(void);
+extern void cluster_lms_obs_note_conn_reset(void);
+extern void cluster_lms_obs_note_inline_serve(uint64 elapsed_us);
+extern uint64 cluster_lms_obs_get_dispatch_count(int worker_id);
+extern uint64 cluster_lms_obs_get_direct_reply_count(int worker_id);
+extern uint64 cluster_lms_obs_get_conn_reset_count(int worker_id);
+extern uint64 cluster_lms_obs_get_inline_serve_count(int worker_id);
+extern uint64 cluster_lms_obs_get_serve_hist(int worker_id, int bucket);
+extern uint64 cluster_lms_obs_serve_hist_bound_us(int bucket);
+
+/* spec-7.3 D8 (Q8) — apply cluster.lms_nice to the calling LMS process
+ * (setpriority, best-effort;  0 = leave the inherited priority alone). */
+extern void cluster_lms_apply_nice(void);
 
 /*
  * State enum -> canonical lowercase string ("disabled", "not_started",

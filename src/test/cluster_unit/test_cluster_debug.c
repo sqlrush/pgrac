@@ -3708,6 +3708,45 @@ cluster_lms_get_priority_starvation_observed_count(void)
 {
 	return 0;
 }
+/* spec-7.3 D8 — per-worker observability stubs (+ the pool-size GUC the
+ * dump uses to bound the per-worker rows). */
+int cluster_lms_workers = 2;
+uint64
+cluster_lms_obs_get_dispatch_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_direct_reply_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_conn_reset_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_inline_serve_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_serve_hist(int worker_id pg_attribute_unused(),
+							   int bucket pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_serve_hist_bound_us(int bucket)
+{
+	static const uint64 bounds[15] = { 50,	  100,	 200,	 500,	 1000,	 2000,	  5000,	  10000,
+									   20000, 50000, 100000, 200000, 500000, 1000000, 5000000 };
+
+	if (bucket < 0 || bucket >= 15)
+		return UINT64_MAX;
+	return bounds[bucket];
+}
 const char *
 cluster_lms_state_to_string(int s pg_attribute_unused())
 {

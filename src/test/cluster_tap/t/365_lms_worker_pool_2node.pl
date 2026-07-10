@@ -150,6 +150,23 @@ for my $i (1 .. 60)
 ok($both_reset,
 	'L5 epoch ×N: both worker 0 and worker 1 reset their DATA mesh independently');
 
+# spec-7.3 D8 — the per-worker conn-reset counters carry the same fact
+# (stronger than the log grep: exact worker attribution via the dump).
+sub lms_int
+{
+	my ($node, $key) = @_;
+	my $v = $node->safe_psql('postgres',
+		qq{SELECT value FROM pg_cluster_state WHERE category='lms' AND key='$key'});
+	return defined($v) && $v ne '' ? int($v) : 0;
+}
+cmp_ok(lms_int($node0, 'lms_conn_reset_count_w0'), '>=', 1,
+	'L5 worker 0 conn-reset counter moved');
+cmp_ok(lms_int($node0, 'lms_conn_reset_count_w1'), '>=', 1,
+	'L5 worker 1 conn-reset counter moved');
+is(lms_int($node0, 'lms_conn_reset_count'),
+	lms_int($node0, 'lms_conn_reset_count_w0') + lms_int($node0, 'lms_conn_reset_count_w1'),
+	'L5 aggregate conn-reset = sum of the per-worker counters');
+
 # Disarm before the recycle leg (the one-shot latch already prevents a storm;
 # a later appended line wins on reload).
 $node0->append_conf('postgresql.conf', "cluster.injection_points = ''");
