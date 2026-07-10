@@ -6088,6 +6088,36 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	if (inv->checksum != gcs_block_compute_invalidate_checksum(inv))
 		return;
 
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE receive side.  Same invariant as the REQUEST dedup guard
+	 * above: INVALIDATE is staged and routed by shard(tag) (payload_shard),
+	 * so the receiving worker must be the routed worker.  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order invalidate
+	 * could drop a copy a later grant relies on) that cannot happen without
+	 * a code bug — fail closed (drop without ACK; the master's broadcast
+	 * fail-closes on its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&inv->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block invalidate misrouted to LMS worker %d (tag "
+										 "shard %d); dropping (spec-7.3 P2-1 8.A fail-closed)",
+										 recv_worker, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	current_epoch = cluster_epoch_get_current();
 
 	/*
@@ -6206,6 +6236,37 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	if (ack->checksum != gcs_block_compute_invalidate_ack_checksum(ack)) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE-ACK receive side (master).  The ACK is direct-sent from
+	 * the holder worker that received the INVALIDATE (worker[shard(tag)]),
+	 * and worker channels pair i<->i across nodes, so a well-routed ACK
+	 * always lands on this master's worker[shard(tag)].  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order ACK could
+	 * certify a drop the holder has not applied yet) that cannot happen
+	 * without a code bug — fail closed (drop; the broadcast fail-closes on
+	 * its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&ack->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG, (errmsg_internal("gcs block invalidate-ack misrouted to LMS worker %d "
+											  "(tag shard %d); dropping (spec-7.3 P2-1 8.A "
+											  "fail-closed)",
+											  recv_worker, tag_shard)));
+			}
+			return;
+		}
 	}
 
 	/*
