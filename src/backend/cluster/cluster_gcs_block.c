@@ -4659,10 +4659,16 @@ build_and_send_reply: {
 	 * user-relation ship reaches the point.  Gating the CLUSTER_INJECTION_POINT
 	 * itself (not just should_skip) ensures only matching ships consume the
 	 * count.  0 (default) keeps the un-targeted behaviour for spec-2.34 tests.
+	 *
+	 * Current TAP coverage uses target=0 only (shared_catalog remaps the
+	 * catalog-visible relfilenode to a different physical relNumber, so SQL
+	 * cannot name the shipped block); the non-zero filter is reserved for
+	 * precise spec-2.34-style targeting on non-shared-catalog rigs and is not
+	 * yet exercised by any test.
 	 */
 	if (cluster_gcs_block_drop_target_relfilenode == 0
 		|| BufTagGetRelNumber(&req->tag)
-			   == (RelFileNumber) cluster_gcs_block_drop_target_relfilenode) {
+			   == (RelFileNumber)cluster_gcs_block_drop_target_relfilenode) {
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
 		if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
 			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);

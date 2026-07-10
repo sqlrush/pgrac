@@ -68,7 +68,8 @@ typedef struct ClusterInjectPoint {
 	pg_atomic_uint32 armed_type;   /* ClusterInjectFaultType */
 	pg_atomic_uint64 armed_param;  /* sleep us / SKIP cookie */
 	pg_atomic_uint32 skip_pending; /* set by SKIP dispatch, read+reset by probe */
-	pg_atomic_uint32 skip_remaining; /* spec-7.2a: SKIP countdown for :skip:N (param 0 = unlimited) */
+	pg_atomic_uint32
+		skip_remaining; /* spec-7.2a: :skipn:N countdown (0 = exhausted or not armed) */
 } ClusterInjectPoint;
 
 /*
@@ -896,7 +897,7 @@ cluster_injection_arm_internal(ClusterInjectPoint *p, ClusterInjectFaultType new
 	 * "skip while armed" behaviour and leaves the countdown at 0.
 	 */
 	if (new_type == CLUSTER_FAULT_SKIP_N && param > 0)
-		pg_atomic_write_u32(&p->skip_remaining, (uint32) param);
+		pg_atomic_write_u32(&p->skip_remaining, (uint32)param);
 	else
 		pg_atomic_write_u32(&p->skip_remaining, 0);
 
@@ -1010,8 +1011,7 @@ cluster_injection_run(const char *name)
 		uint32 expected = pg_atomic_read_u32(&p->skip_remaining);
 
 		while (expected > 0) {
-			if (pg_atomic_compare_exchange_u32(&p->skip_remaining,
-											   &expected, expected - 1)) {
+			if (pg_atomic_compare_exchange_u32(&p->skip_remaining, &expected, expected - 1)) {
 				pg_atomic_write_u32(&p->skip_pending, 1);
 				break;
 			}

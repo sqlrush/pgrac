@@ -193,13 +193,13 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L9 (alias of L2): gcs key count = 48.
+# L9 (alias of L2): gcs key count = 88.
 # ============================================================
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
    '88',
-   'L9 node1 pg_cluster_state.gcs has 67 keys (cross-node parity)');
+   'L9 node1 pg_cluster_state.gcs has 88 keys (cross-node parity)');
 
 
 # ============================================================
