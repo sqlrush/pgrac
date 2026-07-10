@@ -56,6 +56,7 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <sys/resource.h> /* PGRAC: spec-7.3 D8 setpriority (cluster.lms_nice) */
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
@@ -68,6 +69,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_tier1.h" /* CLUSTER_IC_TIER1_DATA_CHANNELS (spec-7.3 D3) */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_shmem.h"
@@ -199,8 +201,18 @@ cluster_lms_shmem_init(void)
 		 * starvation counter starts at 0. */
 		pg_atomic_init_u64(&cluster_lms_state->lms_restart_generation, 0);
 		pg_atomic_init_u64(&cluster_lms_state->priority_starvation_observed_count, 0);
-		/* spec-7.2 D6 — DATA-plane connection resets counter. */
-		pg_atomic_init_u64(&cluster_lms_state->lms_conn_resets, 0);
+		/* spec-7.3 D8 — per-worker observability counters + serve hist. */
+		{
+			int w, b;
+			for (w = 0; w < CLUSTER_LMS_MAX_WORKERS; w++) {
+				pg_atomic_init_u64(&cluster_lms_state->worker_dispatch_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_direct_reply_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_conn_reset_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_inline_serve_count[w], 0);
+				for (b = 0; b < CLUSTER_LMS_SERVE_HIST_BUCKETS; b++)
+					pg_atomic_init_u64(&cluster_lms_state->worker_serve_hist[w][b], 0);
+			}
+		}
 		ConditionVariableInit(&cluster_lms_state->cv);
 	}
 }
@@ -387,15 +399,21 @@ cluster_lms_get_pid(void)
 }
 
 /*
- * PGRAC: spec-7.2 D4 — wake the LMS data-plane loop (mirror of
- * cluster_lmon_wakeup):  SIGUSR1 → lms_sigusr1_handler → SetLatch.
- * Safe from any context;  self-kick and pre-spawn calls no-op.
+ * PGRAC: spec-7.2 D4 + spec-7.3 D4 — wake DATA worker worker_id's data-plane
+ * loop (SIGUSR1 → lms_sigusr1_handler → SetLatch).  worker 0's pid is
+ * published to worker_pids[0] by LmsMain, workers 1..7 by LmsWorkerMain, so
+ * this is uniform across the pool.  Safe from any context;  self-kick,
+ * out-of-range and pre-spawn calls no-op.
  */
 void
-cluster_lms_wakeup(void)
+cluster_lms_wakeup(int worker_id)
 {
-	pid_t pid = cluster_lms_get_pid();
+	pid_t pid;
 
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return;
+
+	pid = cluster_lms_get_worker_pid(worker_id);
 	if (pid <= 0 || pid == MyProcPid)
 		return;
 
@@ -583,30 +601,6 @@ cluster_lms_get_priority_starvation_observed_count(void)
 	return pg_atomic_read_u64(&cluster_lms_state->priority_starvation_observed_count);
 }
 
-/*
- * spec-7.2 D6 — DATA-plane connection resets counter.
- *
- *	cluster_lms_bump_conn_resets adds the number of DATA connections a
- *	single reset event tore down (epoch bump in production, injection in
- *	the F6-1 test).  Called from the LMS DATA-plane tick; a shared-memory
- *	atomic so pg_stat_cluster_* / the debug dump can observe reset activity.
- */
-void
-cluster_lms_bump_conn_resets(uint32 n)
-{
-	if (cluster_lms_state != NULL && n > 0)
-		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_conn_resets, (uint64)n);
-}
-
-uint64
-cluster_lms_get_conn_resets(void)
-{
-	if (cluster_lms_state == NULL)
-		return 0;
-	return pg_atomic_read_u64(&cluster_lms_state->lms_conn_resets);
-}
-
-
 /* ============================================================
  * HC4 single ownership atomic guard.
  *
@@ -733,9 +727,12 @@ LmsMain(void)
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
 
-	/* Publish STARTING + record pid / spawned_at. */
+	/* Publish STARTING + record pid / spawned_at.  spec-7.3 D4: worker 0's
+	 * pid also goes to worker_pids[0] so cluster_lms_wakeup(0) is uniform with
+	 * the LmsWorker pool (backends waking DATA shard 0 use worker_pids[0]). */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	cluster_lms_state->pid = MyProcPid;
+	cluster_lms_state->worker_pids[0] = MyProcPid;
 	cluster_lms_state->spawned_at = GetCurrentTimestamp();
 	lms_set_state(CLUSTER_LMS_STARTING);
 	LWLockRelease(&cluster_lms_state->lwlock);
@@ -752,7 +749,10 @@ LmsMain(void)
 	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
 	 * mesh (false = plane off for this node;  the loop below then keeps
 	 * the historic latch-only wait and park-serve keeps working). */
-	(void)cluster_lms_data_plane_startup();
+	(void)cluster_lms_data_plane_startup(0, cluster_lms_workers);
+
+	/* PGRAC: spec-7.3 D8 (Q8) — optional scheduling priority (0 = no-op). */
+	cluster_lms_apply_nice();
 
 	/* Transition to READY. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
@@ -782,6 +782,8 @@ LmsMain(void)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			/* PGRAC: spec-7.3 D8 — re-apply cluster.lms_nice on reload. */
+			cluster_lms_apply_nice();
 		}
 
 		if (ShutdownRequestPending || lms_shutdown_requested())
@@ -821,7 +823,7 @@ LmsMain(void)
 				cluster_lms_cr_ship_ready();
 				cluster_gcs_block_pi_discard_drain();
 			}
-			(void)cluster_lms_outbound_drain_send();
+			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -847,6 +849,331 @@ LmsMain(void)
 	LWLockRelease(&cluster_lms_state->lwlock);
 
 	proc_exit(0);
+}
+
+
+/* ============================================================
+ * spec-7.3 D2 — LMS DATA-plane worker pool (workers 1..7).
+ *
+ *	Workers are distinct AuxProcTypes (LmsWorker1..7Process) that carry the
+ *	B_LMS_WORKER display type.  worker 0 is the plain LmsProcess above; it
+ *	keeps ALL of the LMS duties (GES grant service + park-serve CR + DATA
+ *	shard 0).  Workers 1..7 run the DATA plane ONLY.
+ *
+ *	D2 scope (this file): spawn + identify (B_LMS_WORKER + worker_pids slot)
+ *	+ idle.  The per-worker DATA listener + shard topology + HELLO
+ *	worker_id/n_workers negotiation (D3), the outbound ring group + wakeup
+ *	(D4), the per-worker private tables (D5) and the inline CR construction
+ *	(D6) grow this loop toward the shared, worker_id-parameterised DATA loop.
+ *	When cluster.lms_workers = 1 no worker is forked, so LmsMain runs exactly
+ *	as in spec-7.2 (topology identity).
+ * ============================================================ */
+
+/* The 7 worker AuxProcTypes must be exactly CLUSTER_LMS_MAX_WORKERS - 1
+ * contiguous types, so ClusterLmsWorkerIdForType() maps them to 1..7. */
+StaticAssertDecl(LmsWorker7Process - LmsWorker1Process + 1 == CLUSTER_LMS_MAX_WORKERS - 1,
+				 "spec-7.3: LmsWorker1..7Process must be CLUSTER_LMS_MAX_WORKERS-1 "
+				 "contiguous aux process types");
+
+/* The tier1 transport must carve a DATA channel per LMS worker (spec-7.3 D3). */
+StaticAssertDecl(CLUSTER_LMS_MAX_WORKERS <= CLUSTER_IC_TIER1_DATA_CHANNELS,
+				 "spec-7.3: tier1 must provide a DATA shmem channel per LMS worker");
+
+void
+LmsWorkerMain(int worker_id)
+{
+	Assert(IsUnderPostmaster);
+	Assert(worker_id >= 1 && worker_id < CLUSTER_LMS_MAX_WORKERS);
+
+	MyBackendType = B_LMS_WORKER;
+	init_ps_display(NULL);
+
+	/* Standard PG aux-process signal layout (mirrors LmsMain). */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGALRM, SIG_IGN);
+	pqsignal(SIGPIPE, SIG_IGN);
+	/* SIGUSR1 = DATA-plane wakeup (latch only, async-signal-safe).  In D2 it
+	 * just re-arms the idle wait;  the D4 outbound-ring producers use it to
+	 * wake the worker that owns a tag's shard. */
+	pqsignal(SIGUSR1, lms_sigusr1_handler);
+	pqsignal(SIGUSR2, SIG_IGN);
+	pqsignal(SIGCHLD, SIG_DFL);
+
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	if (cluster_lms_state == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
+				 errhint("cluster_lms_shmem_init() must run during "
+						 "CreateSharedMemoryAndSemaphores().")));
+
+	/* Publish this worker's pid so the D4 wakeup path can find it. */
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+	cluster_lms_state->worker_pids[worker_id] = MyProcPid;
+	LWLockRelease(&cluster_lms_state->lwlock);
+
+	ereport(LOG, (errmsg("cluster_lms: DATA-plane worker %d started (pid %d)", worker_id,
+						 (int)MyProcPid)));
+
+	/*
+	 * PGRAC: spec-7.3 D3 — bring up this worker's DATA-plane channel + mesh
+	 * (its own tier1 instance, listener on data_port + worker_id, dial peer
+	 * worker_id only, HELLO worker/n negotiation).  false = plane off for
+	 * this node (no data_addr / cluster off / stub tier) → the loop below
+	 * keeps the historic latch-only idle wait.
+	 */
+	(void)cluster_lms_data_plane_startup(worker_id, cluster_lms_workers);
+
+	/* PGRAC: spec-7.3 D8 (Q8) — optional scheduling priority (0 = no-op). */
+	cluster_lms_apply_nice();
+
+	/*
+	 * D3 worker loop.  A worker maintains its per-channel mesh via the
+	 * data-plane tick;  the block-family dispatch that arrives on its channel
+	 * is served here (the outbound ring group + shard routing that steers
+	 * backend requests to a worker land in D4).  Worker 0's GES / park-serve
+	 * / outbound-drain duties stay in LmsMain — a worker (1..7) is DATA only.
+	 * SIGTERM sets ShutdownRequestPending; the head guard breaks and
+	 * proc_exit(0) completes cleanly.
+	 */
+	for (;;) {
+		CHECK_FOR_INTERRUPTS();
+
+		if (ConfigReloadPending) {
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+			/* PGRAC: spec-7.3 D8 — re-apply cluster.lms_nice on reload. */
+			cluster_lms_apply_nice();
+		}
+
+		if (ShutdownRequestPending)
+			break;
+
+		if (cluster_lms_data_plane_enabled()) {
+			/* spec-7.3 D4 — drain this worker's outbound ring (backends
+			 * staged REQUEST/FORWARD/INVALIDATE for our shard), then service
+			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
+			 * sent directly from the dispatch handler in THIS process, so
+			 * they already ride this worker's channel. */
+			(void)cluster_lms_outbound_drain_send(worker_id);
+			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+		} else {
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+			ResetLatch(MyLatch);
+		}
+	}
+
+	/* Close DATA-plane fds, then clear our pid slot before teardown. */
+	cluster_lms_data_plane_shutdown();
+
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+	cluster_lms_state->worker_pids[worker_id] = 0;
+	LWLockRelease(&cluster_lms_state->lwlock);
+
+	proc_exit(0);
+}
+
+pid_t
+cluster_lms_get_worker_pid(int worker_id)
+{
+	pid_t pid;
+
+	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return 0;
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
+	pid = cluster_lms_state->worker_pids[worker_id];
+	LWLockRelease(&cluster_lms_state->lwlock);
+	return pid;
+}
+
+
+/* ============================================================
+ * spec-7.3 D8 — per-worker DATA-plane observability (×N).
+ *
+ *	Bumpers resolve the calling worker's slot from its DATA channel id
+ *	and are no-ops in any non-LMS process (a backend dispatching a
+ *	CONTROL envelope, the GC sweepers, etc.), so the call sites need no
+ *	process-type guards of their own.  Readers sum over all slots when
+ *	worker_id = -1 (the pool aggregate the 7.2-era single-value keys
+ *	generalize to, spec §3.8).
+ * ============================================================ */
+
+/* Inline-serve duration histogram bounds (µs, inclusive upper bounds);
+ * the 16th bucket is the overflow.  Finer-grained at the low end than the
+ * requester-side ship hist:  a serve is a local construct (no wire RTT). */
+static const uint64 lms_serve_hist_bounds_us[CLUSTER_LMS_SERVE_HIST_BUCKETS - 1] = {
+	50,	   100,	  200,	  500,	  1000,	  2000,	   5000,	10000,
+	20000, 50000, 100000, 200000, 500000, 1000000, 5000000,
+};
+
+/* Calling worker's observability slot, or -1 when not an LMS process. */
+static int
+lms_obs_my_slot(void)
+{
+	int w;
+
+	if (cluster_lms_state == NULL)
+		return -1;
+	if (MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
+		return -1;
+	w = cluster_ic_tier1_my_data_channel();
+	if (w < 0 || w >= CLUSTER_LMS_MAX_WORKERS)
+		return -1;
+	return w;
+}
+
+void
+cluster_lms_obs_note_dispatch(void)
+{
+	int w = lms_obs_my_slot();
+
+	if (w >= 0)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->worker_dispatch_count[w], 1);
+}
+
+void
+cluster_lms_obs_note_direct_reply(void)
+{
+	int w = lms_obs_my_slot();
+
+	if (w >= 0)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->worker_direct_reply_count[w], 1);
+}
+
+void
+cluster_lms_obs_note_conn_reset(void)
+{
+	int w = lms_obs_my_slot();
+
+	if (w >= 0)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->worker_conn_reset_count[w], 1);
+}
+
+void
+cluster_lms_obs_note_inline_serve(uint64 elapsed_us)
+{
+	int w = lms_obs_my_slot();
+	int b = 0;
+
+	if (w < 0)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_inline_serve_count[w], 1);
+	while (b < CLUSTER_LMS_SERVE_HIST_BUCKETS - 1 && elapsed_us > lms_serve_hist_bounds_us[b])
+		b++;
+	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_serve_hist[w][b], 1);
+}
+
+/* Reader helper: one slot, or the sum over all slots for worker_id = -1. */
+static uint64
+lms_obs_read(const pg_atomic_uint64 *arr, int worker_id)
+{
+	uint64 sum = 0;
+	int w;
+
+	if (cluster_lms_state == NULL)
+		return 0;
+	if (worker_id >= 0) {
+		if (worker_id >= CLUSTER_LMS_MAX_WORKERS)
+			return 0;
+		return pg_atomic_read_u64(unconstify(pg_atomic_uint64 *, &arr[worker_id]));
+	}
+	for (w = 0; w < CLUSTER_LMS_MAX_WORKERS; w++)
+		sum += pg_atomic_read_u64(unconstify(pg_atomic_uint64 *, &arr[w]));
+	return sum;
+}
+
+uint64
+cluster_lms_obs_get_dispatch_count(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_dispatch_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_direct_reply_count(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_direct_reply_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_conn_reset_count(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_conn_reset_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_inline_serve_count(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_inline_serve_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_serve_hist(int worker_id, int bucket)
+{
+	uint64 sum = 0;
+	int w;
+
+	if (cluster_lms_state == NULL || bucket < 0 || bucket >= CLUSTER_LMS_SERVE_HIST_BUCKETS)
+		return 0;
+	if (worker_id >= 0) {
+		if (worker_id >= CLUSTER_LMS_MAX_WORKERS)
+			return 0;
+		return pg_atomic_read_u64(&cluster_lms_state->worker_serve_hist[worker_id][bucket]);
+	}
+	for (w = 0; w < CLUSTER_LMS_MAX_WORKERS; w++)
+		sum += pg_atomic_read_u64(&cluster_lms_state->worker_serve_hist[w][bucket]);
+	return sum;
+}
+
+uint64
+cluster_lms_obs_serve_hist_bound_us(int bucket)
+{
+	if (bucket < 0 || bucket >= CLUSTER_LMS_SERVE_HIST_BUCKETS - 1)
+		return UINT64_MAX; /* overflow bucket (or out of range): no finite bound */
+	return lms_serve_hist_bounds_us[bucket];
+}
+
+/*
+ * cluster_lms_apply_nice — spec-7.3 D8 (Q8): apply cluster.lms_nice to the
+ * calling LMS process via setpriority(2), best-effort.
+ *
+ *	0 (the default) means "leave the inherited priority alone" — going back
+ *	to 0 after a non-zero value does NOT restore (raising priority back
+ *	needs privileges anyway;  documented manual behavior).  Called at
+ *	LmsMain / LmsWorkerMain entry and after each SIGHUP config reload;  a
+ *	change is applied once (LOG) and a failure warns once per value (the
+ *	weak alignment to Oracle's LMS RT priority — the RT scheduling class
+ *	itself is out of scope, spec §1.3).
+ */
+void
+cluster_lms_apply_nice(void)
+{
+#ifndef WIN32
+	static int lms_nice_applied = 0; /* 0 = never applied (the no-op default) */
+
+	if (cluster_lms_nice == 0 || cluster_lms_nice == lms_nice_applied)
+		return;
+	if (setpriority(PRIO_PROCESS, 0, cluster_lms_nice) == 0) {
+		ereport(LOG, (errmsg("cluster_lms: applied cluster.lms_nice = %d (worker %d)",
+							 cluster_lms_nice, cluster_ic_tier1_my_data_channel())));
+		lms_nice_applied = cluster_lms_nice;
+	} else {
+		ereport(WARNING, (errmsg("cluster_lms: setpriority(%d) failed: %m", cluster_lms_nice),
+						  errhint("cluster.lms_nice is best-effort;  lowering the nice value below "
+								  "the inherited one may require privileges.")));
+		lms_nice_applied = cluster_lms_nice; /* don't re-warn every reload */
+	}
+#endif
 }
 
 

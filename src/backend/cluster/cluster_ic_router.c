@@ -60,6 +60,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"	   /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_lms.h"		   /* PGRAC: spec-7.3 D8 per-worker dispatch counter */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
 
@@ -313,6 +314,12 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	 */
 	if (env->msg_type == PGRAC_IC_CHUNK_MSG_TYPE)
 		return cluster_ic_chunk_dispatch_frame(env, payload, peer_id);
+
+	/* PGRAC: spec-7.3 D8 — per-worker dispatch counter.  A no-op outside an
+	 * LMS process (the bumper resolves the caller's worker slot itself);
+	 * placed after the chunk short-circuit so a chunked message counts once
+	 * (the reassembled inner envelope), not once per wire frame. */
+	cluster_lms_obs_note_dispatch();
 
 	info = &dispatch_table[env->msg_type];
 

@@ -78,6 +78,7 @@ OBJS = \
 	cluster_gcs.o \
 	cluster_gcs_block.o \
 	cluster_gcs_block_dedup.o \
+	cluster_gcs_block_shard.o \
 	cluster_reconfig.o \
 	cluster_recovery_plan.o \
 	cluster_recovery_worker.o \
@@ -145,6 +146,7 @@ OBJS = \
 	cluster_lms.o \
 	cluster_lms_data_plane.o \
 	cluster_lms_outbound.o \
+	cluster_lms_shard.o \
 	cluster_lns.o \
 	cluster_membership.o \
 	cluster_mrp.o \

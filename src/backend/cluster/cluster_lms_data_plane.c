@@ -98,12 +98,14 @@ static bool dp_enabled = false;
  *	the READY transition.
  */
 bool
-cluster_lms_data_plane_startup(void)
+cluster_lms_data_plane_startup(int worker_id, int n_workers)
 {
 	int32 self_id = cluster_node_id;
 	int32 pi;
 
-	Assert(MyBackendType == B_LMS);
+	/* worker 0 = LmsProcess (B_LMS);  workers 1..7 = LmsWorker (B_LMS_WORKER). */
+	Assert(MyBackendType == B_LMS || MyBackendType == B_LMS_WORKER);
+	Assert(worker_id >= 0 && worker_id < n_workers);
 
 	if (!cluster_enabled)
 		return false;
@@ -112,8 +114,14 @@ cluster_lms_data_plane_startup(void)
 		&& cluster_interconnect_tier != CLUSTER_IC_TIER_3)
 		return false;
 
-	/* Aim this process's tier1 state at the DATA plane BEFORE any use. */
-	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_DATA);
+	/*
+	 * PGRAC: spec-7.3 D3 — aim this process's tier1 state at MY DATA worker
+	 * channel BEFORE any use.  This implies the DATA plane, gives this worker
+	 * its private tier1 instance (peers[] / listener), sets the listener/dial
+	 * port offset (data_port + worker_id) and the HELLO worker fields
+	 * (worker_id, n_workers) for the shard-aligned mesh + N negotiation.
+	 */
+	cluster_ic_tier1_set_my_data_channel(worker_id, n_workers);
 
 	dp_listener_fd = cluster_ic_tier1_listener_bind();
 	if (dp_listener_fd < 0)
@@ -235,7 +243,6 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		static bool dp_epoch_seen = false;
 		static bool dp_inject_reset_done = false;
 		uint64 cur_epoch = cluster_epoch_get_current();
-		bool epoch_bumped = dp_epoch_seen && cur_epoch != dp_last_epoch;
 		bool inject_reset = false;
 
 		/*
@@ -262,6 +269,8 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		 * otherwise lost.  Test-only path: the injection GUC is never armed
 		 * in production, where epoch_bumped alone drives the reset.
 		 */
+		bool epoch_bumped = dp_epoch_seen && cur_epoch != dp_last_epoch;
+
 		if (!epoch_bumped && cluster_injection_should_skip("cluster-lms-conn-reset")
 			&& !dp_inject_reset_done)
 			inject_reset = true;
@@ -298,13 +307,24 @@ cluster_lms_data_plane_tick(long timeout_ms)
 				dp_inject_reset_done = true;
 
 			/*
-			 * PGRAC: spec-7.2 D6 — observability.  lms_conn_resets counts
-			 * DATA-plane connections torn down by a reset (epoch bump in
-			 * production, injection in the F6-1 test), making the reset
-			 * path visible in pg_stat_cluster_* / the debug dump.
+			 * PGRAC: spec-7.3 D7 — per-worker reset observability (epoch ×N).
+			 * Each DATA worker (0..N-1) runs this tick in its OWN process and
+			 * observes the shared epoch bump independently, so a reconfig
+			 * resets the whole pool without any cross-process driver — the
+			 * sender gate (tier1_send_bytes) fail-closes any stale-epoch send
+			 * in the meantime.  Emit one LOG per worker per reset carrying the
+			 * worker channel id so the ×N reset legs can assert that all N
+			 * workers reset (only when a live connection was actually torn
+			 * down, to avoid logging on an idle-mesh epoch advance).
 			 */
-			if (n_closed > 0)
-				cluster_lms_bump_conn_resets((uint32)n_closed);
+			if (n_closed > 0) {
+				cluster_lms_obs_note_conn_reset(); /* spec-7.3 D8 per-worker counter */
+				ereport(LOG,
+						(errmsg("cluster_lms: DATA mesh reset (worker %d) at epoch "
+								"%llu (%d peer%s closed)",
+								cluster_ic_tier1_my_data_channel(), (unsigned long long)cur_epoch,
+								n_closed, n_closed == 1 ? "" : "s")));
+			}
 
 			dp_last_epoch = cur_epoch;
 		}

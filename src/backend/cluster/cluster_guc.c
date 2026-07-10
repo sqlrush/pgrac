@@ -49,6 +49,7 @@
 #include "cluster/cluster_cr_pool.h"			 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lms_shard.h"		  /* CLUSTER_LMS_MAX_WORKERS (spec-7.3 D2) */
 #include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
 #include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
@@ -623,6 +624,21 @@ bool cluster_lmd_enabled = true;
  *	→ backend receives SQLSTATE 53R80 cluster_lms_unavailable。
  */
 bool cluster_lms_enabled = true;
+
+/*
+ * spec-7.3 D2 — cluster.lms_workers: LMS DATA-plane worker pool size.
+ * Default 2; PGC_POSTMASTER (restart required to resize the pool + its shmem
+ * ring group).  1 = spec-7.2 topology identity (worker 0 only).
+ */
+int cluster_lms_workers = 2;
+
+/*
+ * spec-7.3 D8 (Q8) — cluster.lms_nice: optional setpriority for the LMS
+ * DATA-plane workers.  Default 0 = leave the inherited priority alone
+ * (best-effort weak alignment to Oracle's LMS scheduling priority;  the
+ * RT scheduling class is out of scope).  PGC_SIGHUP.
+ */
+int cluster_lms_nice = 0;
 
 /*
  * spec-2.21 D2:cluster.lock_acquire_cluster_path emergency bypass GUC.
@@ -3737,6 +3753,29 @@ cluster_init_guc(void)
 					 "restart required to flip ownership (HC1 fail-closed "
 					 "startup-time fallback;spec-2.18 §1.4 F1 deferred wording)。"),
 		&cluster_lms_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-7.3 D2 — cluster.lms_workers: LMS DATA-plane worker pool size. */
+	DefineCustomIntVariable(
+		"cluster.lms_workers",
+		gettext_noop("Number of LMS DATA-plane workers (including worker 0)."),
+		gettext_noop("The LMS DATA plane (spec-7.2) is parallelised across this many "
+					 "workers, each serving the block-family messages of a shard of the "
+					 "BufferTag space.  Worker 0 is the LmsProcess; workers 1.. are "
+					 "LmsWorker aux processes.  1 = the spec-7.2 single-LMS topology.  "
+					 "Must be identical on every node (HELLO negotiation rejects a "
+					 "mismatch).  PGC_POSTMASTER: restart required to resize the pool."),
+		&cluster_lms_workers, 2, 1, CLUSTER_LMS_MAX_WORKERS, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-7.3 D8 (Q8) — cluster.lms_nice: optional LMS scheduling priority. */
+	DefineCustomIntVariable(
+		"cluster.lms_nice",
+		gettext_noop("Nice value applied to the LMS DATA-plane workers (0 = leave alone)."),
+		gettext_noop("When non-zero, every LMS worker applies this nice value to itself via "
+					 "setpriority (best-effort;  a failure is a WARNING, not an error).  The "
+					 "default 0 leaves the inherited priority untouched, and setting the value "
+					 "back to 0 does not restore a previously applied one.  SIGHUP: workers "
+					 "re-apply on config reload."),
+		&cluster_lms_nice, 0, -20, 0, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.21 D2:emergency bypass GUC */
 	DefineCustomBoolVariable("cluster.lock_acquire_cluster_path",

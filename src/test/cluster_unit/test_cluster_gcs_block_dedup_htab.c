@@ -179,6 +179,16 @@ add_size(Size s1, Size s2)
 	return s1 + s2;
 }
 
+Size
+mul_size(Size s1, Size s2)
+{
+	return s1 * s2;
+}
+
+/* spec-7.3 D5: the sharded dedup sizes/initialises per LMS worker; a single
+ * shard keeps these tests' capacity math identical to the pre-shard shape. */
+int cluster_lms_workers = 1;
+
 /* Linear estimate is enough for the D4c size-equivalence assertion. */
 Size
 hash_estimate_size(long num_entries, Size entrysize)
@@ -396,7 +406,7 @@ register_key(uint64 request_id)
 	GcsBlockDedupKey key = make_key(request_id);
 	BufferTag tag = make_tag((uint32)request_id);
 
-	return cluster_gcs_block_dedup_lookup_or_register(&key, tag, 1, NULL);
+	return cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, NULL);
 }
 
 static void
@@ -406,7 +416,7 @@ complete_key(uint64 request_id, GcsBlockReplyStatus status)
 	GcsBlockReplyHeader header;
 
 	memset(&header, 0, sizeof(header));
-	cluster_gcs_block_dedup_install_reply(&key, status, &header, NULL);
+	cluster_gcs_block_dedup_install_reply(0, &key, status, &header, NULL);
 }
 
 /* ============================================================
@@ -486,7 +496,7 @@ UT_TEST(test_u5_reclaimed_key_re_registers_without_double_count)
 	 * again, so its registration eager-reclaims exactly one more aged
 	 * completed entry. */
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_MISS_REGISTERED,
-				 cluster_gcs_block_dedup_lookup_or_register(&key0, tag0, 1, NULL));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &key0, tag0, 1, NULL));
 	UT_ASSERT_EQ(2, (int)cluster_gcs_block_dedup_get_evict_count());
 	UT_ASSERT_EQ(2, (int)cluster_gcs_block_dedup_get_full_count());
 	UT_ASSERT_EQ(4, (int)cluster_gcs_block_dedup_get_in_flight_count());
@@ -497,7 +507,7 @@ UT_TEST(test_u5_reclaimed_key_re_registers_without_double_count)
 	 * same-key retransmit hits the cached reply. */
 	complete_key(0, GCS_BLOCK_REPLY_GRANTED);
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_CACHED_REPLY,
-				 cluster_gcs_block_dedup_lookup_or_register(&key0, tag0, 1, &cached));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &key0, tag0, 1, &cached));
 	UT_ASSERT_EQ(1, (int)cluster_gcs_block_dedup_get_hit_count());
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED, (int)cached.status);
 }
@@ -506,12 +516,12 @@ UT_TEST(test_u6_remove_keeps_accounting_conserved)
 {
 	GcsBlockDedupKey key0 = make_key(0);
 
-	cluster_gcs_block_dedup_remove(&key0);
+	cluster_gcs_block_dedup_remove(0, &key0);
 	UT_ASSERT_EQ(3, (int)cluster_gcs_block_dedup_get_in_flight_count());
 	UT_ASSERT_EQ(3, (int)fake_live_count());
 
 	/* Removing a key that is no longer resident must not underflow. */
-	cluster_gcs_block_dedup_remove(&key0);
+	cluster_gcs_block_dedup_remove(0, &key0);
 	UT_ASSERT_EQ(3, (int)cluster_gcs_block_dedup_get_in_flight_count());
 	UT_ASSERT_EQ(3, (int)fake_live_count());
 }

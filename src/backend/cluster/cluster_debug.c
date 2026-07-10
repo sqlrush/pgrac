@@ -134,18 +134,19 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_xid_authority.h"	  /* XID authority state (spec-6.15b D7) */
 #include "cluster/cluster_remote_xact.h"	  /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				  /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"			/* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"	/* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"		/* PCM state-machine API + grd helpers */
-#include "cluster/cluster_gcs.h"			/* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"		/* GCS block-ship data plane (spec-2.33 D10) */
-#include "cluster/cluster_sinval.h"			/* SI Broadcaster counter accessors (spec-2.38 D10) */
-#include "cluster/cluster_tt_status.h"		/* TT status overlay counter accessors (spec-3.1 D9) */
-#include "cluster/cluster_tt_status_hint.h" /* TT status hint counter accessors (spec-3.2 D8) */
-#include "cluster/cluster_tx_enqueue.h"		/* TX enqueue wait counters (spec-5.2 D4/D6) */
-#include "cluster/cluster_startup_phase.h"	/* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"			 /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_gcs_block_dedup.h" /* per-worker dedup-shard counters (spec-7.3 D5/D9) */
+#include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
+#include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
+#include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
+#include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -1320,9 +1321,66 @@ dump_lms(ReturnSetInfo *rsinfo)
 	 * on wire;  reserved opcode 11 awaits spec-2.28+ integrated receiver). */
 	emit_row(rsinfo, "lms", "priority_starvation_observed_count",
 			 fmt_int64((int64)cluster_lms_get_priority_starvation_observed_count()));
-	/* spec-7.2 D6 — DATA-plane connection resets (epoch bump in production;
-	 * cluster-lms-conn-reset injection in the F6-1 fault test). */
-	emit_row(rsinfo, "lms", "lms_conn_resets", fmt_int64((int64)cluster_lms_get_conn_resets()));
+
+	/* PGRAC: spec-7.3 D8 — per-worker DATA-plane observability.  The bare
+	 * keys are the pool aggregates (the 7.2-era single-value semantics'
+	 * natural generalization, spec §3.8);  the _w<N> suffixed keys are the
+	 * per-worker detail, emitted for the live pool only (w < lms_workers). */
+	emit_row(rsinfo, "lms", "lms_data_dispatch_count",
+			 fmt_int64((int64)cluster_lms_obs_get_dispatch_count(-1)));
+	emit_row(rsinfo, "lms", "lms_direct_reply_count",
+			 fmt_int64((int64)cluster_lms_obs_get_direct_reply_count(-1)));
+	emit_row(rsinfo, "lms", "lms_conn_reset_count",
+			 fmt_int64((int64)cluster_lms_obs_get_conn_reset_count(-1)));
+	emit_row(rsinfo, "lms", "lms_inline_serve_count",
+			 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(-1)));
+	{
+		int w, hb;
+
+		for (w = 0; w < cluster_lms_workers && w < CLUSTER_LMS_MAX_WORKERS; w++) {
+			char wkey[64];
+
+			snprintf(wkey, sizeof(wkey), "lms_data_dispatch_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey, fmt_int64((int64)cluster_lms_obs_get_dispatch_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_direct_reply_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_direct_reply_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_conn_reset_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_conn_reset_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_inline_serve_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(w)));
+		}
+
+		/* Inline-serve duration histogram: aggregate 16 rows + per live
+		 * worker 16 rows (keys mirror the gcs ship-hist idiom). */
+		for (hb = 0; hb < CLUSTER_LMS_SERVE_HIST_BUCKETS; hb++) {
+			char histkey[64];
+			uint64 bound = cluster_lms_obs_serve_hist_bound_us(hb);
+
+			if (bound == UINT64_MAX)
+				snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_inf");
+			else
+				snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_le_" UINT64_FORMAT, bound);
+			emit_row(rsinfo, "lms", histkey,
+					 fmt_int64((int64)cluster_lms_obs_get_serve_hist(-1, hb)));
+		}
+		for (w = 0; w < cluster_lms_workers && w < CLUSTER_LMS_MAX_WORKERS; w++) {
+			for (hb = 0; hb < CLUSTER_LMS_SERVE_HIST_BUCKETS; hb++) {
+				char histkey[64];
+				uint64 bound = cluster_lms_obs_serve_hist_bound_us(hb);
+
+				if (bound == UINT64_MAX)
+					snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_inf_w%d", w);
+				else
+					snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_le_" UINT64_FORMAT "_w%d",
+							 bound, w);
+				emit_row(rsinfo, "lms", histkey,
+						 fmt_int64((int64)cluster_lms_obs_get_serve_hist(w, hb)));
+			}
+		}
+	}
 }
 
 /*
@@ -1947,6 +2005,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_evict_count()));
 	emit_row(rsinfo, "gcs", "dedup_max_entries",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_max_entries()));
+	/* spec-7.3 D9 (rule 17): the D5 per-worker dedup-shard mis-route
+	 * fail-closed drop counter gets its SQL surface (gcs 85 -> 86). */
+	emit_row(rsinfo, "gcs", "dedup_misroute_failclosed_count",
+			 fmt_int64((int64)cluster_gcs_block_dedup_get_misroute_failclosed_count()));
 	emit_row(rsinfo, "gcs", "epoch_invalidate_wake_count",
 			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
 	emit_row(rsinfo, "gcs", "stale_reply_drop_count",
@@ -2666,6 +2728,10 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_multi_verdict_served_count()));
 	emit_row(rsinfo, "cr", "cr_server_multi_verdict_denied_count",
 			 fmt_int64((int64)cluster_cr_server_multi_verdict_denied_count()));
+	/* spec-7.3 D7 — DATA-plane inline serve refused because the node is
+	 * write-fenced (image / undo / verdict withheld to avoid a stale ship). */
+	emit_row(rsinfo, "cr", "cr_server_fence_refused_count",
+			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
 	/* spec-7.1 D0/D5: 53R97 per-leg attribution (census + error-closure dial). */

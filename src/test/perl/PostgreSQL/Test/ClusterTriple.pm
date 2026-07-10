@@ -39,8 +39,10 @@ use PostgreSQL::Test::Utils;
 #
 #	Allocate three PG instances that share a pgrac cluster name.
 #	Optional %opts:
-#	  extra_conf  : arrayref of extra GUC lines appended to ALL nodes'
-#	                postgresql.conf
+#	  extra_conf     : arrayref of extra GUC lines appended to ALL nodes'
+#	                   postgresql.conf
+#	  data_port_span : per-node DATA-plane port range width (default 2 =
+#	                   the shipped cluster.lms_workers default; spec-7.3)
 #-----------------------------------------------------------------------
 sub new_triple
 {
@@ -58,12 +60,18 @@ sub new_triple
 		PostgreSQL::Test::Cluster::get_free_port(),
 	);
 	# spec-7.2 D2: explicit DATA-plane ports (allocator-provided, never
-	# offset-derived -- r1-F2).
-	my @data_ports = (
-		PostgreSQL::Test::Cluster::get_free_port(),
-		PostgreSQL::Test::Cluster::get_free_port(),
-		PostgreSQL::Test::Cluster::get_free_port(),
-	);
+	# offset-derived -- r1-F2).  spec-7.3 D9: the LMS worker pool binds a
+	# listener per worker at data_port + worker_id, so each node needs a
+	# reserved [data_port, data_port + span) range; the default span
+	# follows the shipped default cluster.lms_workers = 2 (same root fix
+	# as ClusterPair -- a span of 1 left data_port + 1 unreserved and the
+	# triple FATALed on "Address already in use").
+	my $data_span = $opts{data_port_span} // 2;
+	my @data_ports = map {
+		$data_span > 1
+		  ? PostgreSQL::Test::Cluster::get_free_port_range($data_span)
+		  : PostgreSQL::Test::Cluster::get_free_port()
+	} (0 .. 2);
 
 	my @nodes;
 	for my $i (0 .. 2)

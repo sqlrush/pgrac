@@ -83,8 +83,24 @@ sub new_pair
 	my $pg_port_1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic_port_0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic_port_1 = PostgreSQL::Test::Cluster::get_free_port();
-	my $data_port_0 = PostgreSQL::Test::Cluster::get_free_port();
-	my $data_port_1 = PostgreSQL::Test::Cluster::get_free_port();
+	# spec-7.3 D3: the LMS worker pool binds a listener per worker at
+	# data_port + worker_id, so a test that runs >1 worker needs each node's
+	# [data_port, data_port + span) range free and non-overlapping across the
+	# two same-host nodes.  The DEFAULT span follows the shipped default
+	# cluster.lms_workers = 2 (spec-7.3 D9 root fix: with a span of 1 any
+	# pair test that leaves the pool at its default binds data_port + 1
+	# on an unreserved port and can FATAL on "Address already in use" --
+	# the D5/D7 point fixes whack-a-moled 8 files of ~85).  Tests that
+	# override cluster.lms_workers above 2 pass data_port_span explicitly.
+	my $data_span = $opts{data_port_span} // 2;
+	my $data_port_0 =
+	  $data_span > 1
+	  ? PostgreSQL::Test::Cluster::get_free_port_range($data_span)
+	  : PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port_1 =
+	  $data_span > 1
+	  ? PostgreSQL::Test::Cluster::get_free_port_range($data_span)
+	  : PostgreSQL::Test::Cluster::get_free_port();
 
 	my $node0 =
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node0", port => $pg_port_0);

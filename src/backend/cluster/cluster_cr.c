@@ -161,6 +161,7 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 rtvis_verdict_inadmissible_count;
 	pg_atomic_uint64 cr_server_verdict_served_count;
 	pg_atomic_uint64 cr_server_verdict_denied_count;
+	pg_atomic_uint64 cr_server_fence_refused_count; /* spec-7.3 D7 fence ×N refuse */
 	/*
 	 * spec-7.1 D3-b (server side): multixact member-verdict batches served vs
 	 * refused (any unprovable updater member refuses the whole multi).
@@ -311,6 +312,7 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_fence_refused_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_invalid_scn_refuse_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_zero_match_refuse_count, 0);
@@ -396,6 +398,9 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 		break;
 	case CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_multi_verdict_denied_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_FENCE_REFUSED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_fence_refused_count, 1);
 		break;
 	}
 }
@@ -624,6 +629,7 @@ CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_served_count,
 					cr_server_multi_verdict_served_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_denied_count,
 					cr_server_multi_verdict_denied_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_fence_refused_count, cr_server_fence_refused_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_invalid_scn_refuse_count,
 					vis53r97_leg_invalid_scn_refuse_count)

@@ -1,30 +1,33 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cr_server.c
- *	  pgrac spec-6.12b — CR-server runtime: the LMON↔LMS slot handoff and
- *	  the LMON-side result shipping for cross-instance CR construction.
+ *	  pgrac spec-6.12b / spec-7.3 D6 — cross-instance CR-server runtime.
  *
- *	  Split of labour (see cluster_cr_server.h banner):
- *	    LMON (IC dispatch)   validates + parks the CR request in a shmem
- *	                         slot (cluster_lms_cr_submit) — light work
- *	                         only, the dispatch loop never walks undo.
- *	    LMS  (aux process)   drains PENDING slots and constructs the CR
- *	                         page (cluster_lms_cr_drain →
- *	                         cluster_cr_construct_page_for_server); every
- *	                         construction error becomes a DENIED result,
- *	                         never an LMS exit (fail-closed at the
- *	                         requester, Rule 8.A).
- *	    LMON (tick)          ships READY results direct to the requester
- *	                         (cluster_lms_cr_ship_ready) — the 72-byte
- *	                         outbound ring cannot carry a page and only
- *	                         LMON owns the IC connections.
+ *	  spec-6.12b split the origin serve across LMON (validate + park in a
+ *	  shmem slot) → LMS (drain + construct) → LMON (tick-ship), because the
+ *	  IC dispatch loop could not walk undo I/O, the 72-byte outbound ring
+ *	  could not carry a page, and only LMON owned the IC connections.
+ *
+ *	  spec-7.3 D6: when the GCS block family is on the DATA plane (the LMS
+ *	  worker pool owns the DATA connections + a page-carrying outbound ring),
+ *	  the worker[shard] that receives a GCS_BLOCK_FORWARD serves the request
+ *	  INLINE (cluster_gcs_block_forward_serve_inline) — no park → poll → ship
+ *	  indirection, no worker-0 handoff, no 100 ms idle latency; a slow
+ *	  construction only stalls that worker's shard (1/N).  The park-serve
+ *	  path is RETAINED for the CONTROL-plane fallback: a node whose data
+ *	  plane is off (no data_addr) still dispatches the FORWARD in LMON, and
+ *	  LMON must not walk undo I/O in its tight IC loop — so it parks, LMS
+ *	  worker 0 drains, and LMON ships (the light-work rule, unchanged).
+ *
+ *	  Both paths share cr_serve_slot() (the PG_TRY → DENIED serve envelope)
+ *	  and cr_build_and_send_reply() (the reply build).  8.A envelope: CR
+ *	  construction (cluster_cr.c) re-throws on any uncertainty; the wrapper
+ *	  converts it to a fail-closed DENIED, never a worker/LMS exit or a
+ *	  wrong-order construction.
  *
  *	  The slot state word is an atomic; each transition has exactly one
- *	  writer (submitter: FREE→FILLING→PENDING; LMS: PENDING→BUSY→READY;
- *	  LMON ship: READY→FREE), so no lock is needed beyond the CAS on
- *	  FREE→FILLING.  FILLING is the producer-only reservation: PENDING
- *	  is published only after the request fields + a write barrier, so
- *	  the LMS drain can never acquire a half-written slot.
+ *	  writer (LMON: FREE→PENDING, READY→FREE; LMS: PENDING→BUSY→READY),
+ *	  so no lock is needed beyond the CAS on FREE→PENDING.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -38,7 +41,9 @@
  * NOTES
  *	  This is a pgrac-original file.  Compiled only in --enable-cluster
  *	  builds.
- *	  Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave b)
+ *	  Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave b/i)
+ *	  Spec: spec-7.3-lms-worker-pool.md (D6 — inline serve on the DATA plane;
+ *	  D7 — fence ×N: the inline serve refuses to ship on a write-fenced node)
  *
  *-------------------------------------------------------------------------
  */
@@ -53,18 +58,23 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_gcs_block_dedup.h" /* PGRAC: spec-7.3 P2-1 — note_misroute */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
+#include "cluster/cluster_ic_tier1.h"  /* PGRAC: spec-7.3 P2-1 — my DATA channel */
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
-#include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
+#include "cluster/cluster_lmon.h"		 /* PGRAC: spec-7.2 D1 READY-publish wakeup */
+#include "cluster/cluster_lms.h"		 /* PGRAC: spec-7.3 D8 per-worker serve counters */
+#include "cluster/cluster_lms_shard.h"	 /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
+#include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
+#include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
 #include "cluster/cluster_undo_record_api.h" /* tt_retention_rollover_count */
-#include "cluster/cluster_mxid_stripe.h"	 /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_undo_smgr.h"		 /* cluster_undo_smgr_read_block */
+#include "cluster/cluster_write_fence.h"	 /* PGRAC: spec-7.3 D7 fence ×N gate */
 #include "cluster/cluster_xid_stripe.h"		 /* cluster_xid_is_mine (spec-6.15 D4) */
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -72,12 +82,14 @@
 #include "storage/shmem.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h" /* PGRAC: spec-7.3 D8 serve duration (GetCurrentTimestamp) */
 
 /*
  * Shmem: the slot table + the published LMS latch pointer (set by LmsMain
  * at entry so the LMON submit path can cut the 100 ms idle-poll latency;
  * a stale pointer after an LMS crash only risks a spurious latch set on a
- * reused PGPROC — benign).
+ * reused PGPROC — benign).  Used by the CONTROL-plane park-serve path only
+ * (spec-7.3 D6: the DATA plane serves inline and never parks).
  */
 typedef struct ClusterCrServerShared {
 	pg_atomic_uint64 lms_latch_ptr; /* (uintptr_t) Latch*; 0 = not running */
@@ -144,12 +156,11 @@ cr_server_wake_lms(void)
 }
 
 /*
- * cluster_lms_cr_submit — LMON dispatch side.  Park a CR request.
- *
- *	The caller (the GCS_BLOCK_FORWARD handler) has already range-checked
- *	the transition id and knows the payload carries the CR flag.  false =
- *	data plane off / no capacity: the caller replies the fail-closed
- *	DENIED immediately (the requester keeps 53R9G — Rule 8.A).
+ * cluster_lms_cr_submit — CONTROL-plane park.  The caller (the GCS_BLOCK_
+ * FORWARD handler running in LMON when the family is on the control plane)
+ * has already range-checked the transition id and knows the payload carries
+ * the CR flag.  false = data plane off / no capacity: the caller replies the
+ * fail-closed DENIED immediately (the requester keeps 53R9G — Rule 8.A).
  */
 bool
 cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
@@ -163,10 +174,7 @@ cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		/* Reserve producer-only FILLING first (spec-7.1 integration review):
-		 * landing directly on PENDING would let the LMS drain acquire the
-		 * slot before the request fields below are written. */
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -191,13 +199,13 @@ cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
 }
 
 /*
- * cluster_lms_undo_fetch_submit — LMON dispatch side (spec-6.12i D-i1).
+ * cluster_lms_undo_fetch_submit — CONTROL-plane park (spec-6.12i D-i1).
  *
- *	Park an undo-TT fetch request.  The caller (the GCS_BLOCK_FORWARD
- *	handler) branches on the undo-fetch flag BEFORE any GRD / holder logic
- *	can interpret the synthetic tag.  false = wave GUC off on this node /
- *	malformed synthetic tag / no capacity: the caller replies the
- *	fail-closed DENIED immediately (the requester keeps 53R97 — Rule 8.A).
+ *	Park an undo-TT fetch request.  The caller branches on the undo-fetch
+ *	flag BEFORE any GRD / holder logic can interpret the synthetic tag.
+ *	false = wave GUC off on this node / malformed synthetic tag / no capacity:
+ *	the caller replies the fail-closed DENIED immediately (the requester keeps
+ *	53R97 — Rule 8.A).
  */
 bool
 cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
@@ -216,10 +224,7 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		/* Reserve producer-only FILLING first (spec-7.1 integration review):
-		 * landing directly on PENDING would let the LMS drain acquire the
-		 * slot before the request fields below are written. */
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -248,7 +253,7 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 }
 
 /*
- * cluster_lms_undo_verdict_submit — LMON dispatch side (spec-6.12i D-i4 /
+ * cluster_lms_undo_verdict_submit — CONTROL-plane park (spec-6.12i D-i4 /
  * spec-6.15 D4).
  *
  *	Park a complete-scan verdict request.  The asked-for xid rides the
@@ -280,10 +285,7 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		/* Reserve producer-only FILLING first (spec-7.1 integration review):
-		 * landing directly on PENDING would let the LMS drain acquire the
-		 * slot before the request fields below are written. */
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -778,116 +780,97 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 }
 
 /*
- * cluster_lms_cr_drain — LMS main-loop side.  Construct every PENDING slot.
- *
- *	The current block must be resident here (this node's undo holds the
- *	newest chains, so it was — or recently was — the writer); a stable copy
- *	is taken with the raw-pin ship helper.  Every failure (not resident,
- *	interleaved homes, snapshot-too-old, corruption, injection) becomes a
- *	DENIED result: the requester keeps its unchanged 53R9G fail-closed and
- *	LMS itself NEVER exits over a serve (PG_TRY + FlushErrorState).
+ * cr_serve_slot — serve one populated request carrier.  Shared by the
+ * CONTROL-plane park drain and the D6 DATA-plane inline serve.  Sets
+ * slot->result_status and fills result_page / undo_auth; every failure
+ * (interleaved homes, snapshot-too-old, corruption, non-own xid, read
+ * failure, injection, wave GUC off) becomes a DENIED result under the
+ * PG_TRY -> DENIED envelope — the worker/LMS NEVER exits over a serve and
+ * NEVER constructs out of order (Rule 8.A).  Does not touch the slot state
+ * word or ship (callers own those).  Assumes the carrier is already
+ * validated + populated (submit / serve_inline decode the synthetic address
+ * + carrier before calling).
  */
-void
-cluster_lms_cr_drain(void)
+static void
+cr_serve_slot(ClusterLmsCrSlot *slot)
 {
-	if (CrServerShared == NULL)
-		return;
+	slot->result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 
-	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
-		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_PENDING;
+	/*
+	 * spec-6.12i D-i1 / D-i4 — undo-TT fetch + undo-verdict kinds.  No
+	 * construction: read the self-owned TT header block (FETCH), or run the
+	 * complete own-TT by-xid scan + CLOG cross-check (VERDICT); both co-sample
+	 * the live authority triple.  The injection point is shared by both kinds:
+	 * it models "the origin's undo serve plane is down", refusing fetches and
+	 * verdicts alike.
+	 */
+	if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_FETCH
+		|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT
+		|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT) {
+		bool served = false;
+		uint8 result_status;
+		ClusterCrServerStat served_stat;
+		ClusterCrServerStat denied_stat;
+
+		switch (slot->req_kind) {
+		case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED;
+			break;
+		case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_VERDICT_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_VERDICT_DENIED;
+			break;
+		default: /* CLUSTER_LMS_SLOT_KIND_UNDO_FETCH */
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_UNDO_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_UNDO_DENIED;
+			break;
+		}
+
+		CLUSTER_INJECTION_POINT("cluster-lms-undo-fetch");
+		if (!cluster_injection_should_skip("cluster-lms-undo-fetch")) {
+			PG_TRY();
+			{
+				switch (slot->req_kind) {
+				case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+					served = lms_undo_multi_verdict_serve(slot);
+					break;
+				case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
+					served = lms_undo_verdict_serve(slot);
+					break;
+				default:
+					served = lms_undo_fetch_serve(slot);
+					break;
+				}
+			}
+			PG_CATCH();
+			{
+				/* Fail-closed serve; keep the worker/LMS alive. */
+				served = false;
+				MemoryContextSwitchTo(TopMemoryContext);
+				FlushErrorState();
+			}
+			PG_END_TRY();
+		}
+
+		if (served) {
+			slot->result_status = result_status;
+			cluster_cr_server_stat_bump(served_stat);
+		} else {
+			cluster_cr_server_stat_bump(denied_stat);
+		}
+		return;
+	}
+
+	/* spec-6.12b CR construction. */
+	{
 		PGAlignedBlock cur_copy;
 		XLogRecPtr page_lsn = InvalidXLogRecPtr;
 		bool partial = false;
 		bool constructed = false;
-
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_BUSY))
-			continue;
-		pg_read_barrier(); /* pair with the submit-side publish barrier */
-
-		slot->result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
-
-		/*
-		 * spec-6.12i D-i1 / D-i4 — undo-TT fetch + undo-verdict kinds.  No
-		 * construction: read the self-owned TT header block (FETCH), or run
-		 * the complete own-TT by-xid scan + CLOG cross-check (VERDICT); both
-		 * co-sample the live authority triple.  Every refusal (GUC raced
-		 * off, non-header block, bad segment, non-own xid, unprovable
-		 * outcome, read failure, injection) keeps the DENIED status — the
-		 * requester keeps its unchanged 53R97 fail-closed (Rule 8.A).  The
-		 * injection point is shared by all three kinds: it models "the
-		 * origin's undo serve plane is down", which refuses fetches, single
-		 * verdicts and multi-member verdicts (spec-7.1 D3-b) alike.
-		 */
-		if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_FETCH
-			|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT
-			|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT) {
-			bool served = false;
-			uint8 result_status;
-			ClusterCrServerStat served_stat;
-			ClusterCrServerStat denied_stat;
-
-			switch (slot->req_kind) {
-			case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
-				result_status = (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
-				served_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED;
-				denied_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED;
-				break;
-			case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
-				result_status = (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
-				served_stat = CLUSTER_CR_SERVER_STAT_VERDICT_SERVED;
-				denied_stat = CLUSTER_CR_SERVER_STAT_VERDICT_DENIED;
-				break;
-			default: /* CLUSTER_LMS_SLOT_KIND_UNDO_FETCH */
-				result_status = (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
-				served_stat = CLUSTER_CR_SERVER_STAT_UNDO_SERVED;
-				denied_stat = CLUSTER_CR_SERVER_STAT_UNDO_DENIED;
-				break;
-			}
-
-			CLUSTER_INJECTION_POINT("cluster-lms-undo-fetch");
-			if (!cluster_injection_should_skip("cluster-lms-undo-fetch")) {
-				PG_TRY();
-				{
-					switch (slot->req_kind) {
-					case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
-						served = lms_undo_multi_verdict_serve(slot);
-						break;
-					case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
-						served = lms_undo_verdict_serve(slot);
-						break;
-					default:
-						served = lms_undo_fetch_serve(slot);
-						break;
-					}
-				}
-				PG_CATCH();
-				{
-					/* Fail-closed serve; keep LMS alive (as the CR kind). */
-					served = false;
-					MemoryContextSwitchTo(TopMemoryContext);
-					FlushErrorState();
-				}
-				PG_END_TRY();
-			}
-
-			if (served) {
-				slot->result_status = result_status;
-				cluster_cr_server_stat_bump(served_stat);
-			} else {
-				cluster_cr_server_stat_bump(denied_stat);
-			}
-
-			pg_write_barrier();
-			pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_READY);
-			/* PGRAC: spec-7.2 D1 -- wake the shipper (LMON) right away;
-			 * without this the READY result sat until LMON's next natural
-			 * wakeup (typ. 100-250ms, worst case one heartbeat).
-			 * Publish-before-signal: READY store above precedes the kick. */
-			cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
-			cluster_lmon_wakeup();
-			continue;
-		}
 
 		/* spec-6.12b injection — force the DENIED serve path. */
 		CLUSTER_INJECTION_POINT("cluster-lms-cr-construct");
@@ -903,10 +886,10 @@ cluster_lms_cr_drain(void)
 			PG_CATCH();
 			{
 				/*
-				 * Fail-closed serve: keep the DENIED status and keep LMS
-				 * alive.  The taxonomy counters were already bumped by the
-				 * construction wrapper; drop the error state entirely (an
-				 * aux-process ERROR would otherwise escalate to exit).
+				 * Fail-closed serve: keep the DENIED status and keep the
+				 * worker/LMS alive.  The taxonomy counters were already bumped
+				 * by the construction wrapper; drop the error state entirely
+				 * (an aux-process ERROR would otherwise escalate to exit).
 				 */
 				constructed = false;
 				MemoryContextSwitchTo(TopMemoryContext);
@@ -923,23 +906,104 @@ cluster_lms_cr_drain(void)
 		} else {
 			cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_DENIED);
 		}
+	}
+}
+
+/*
+ * cr_build_and_send_reply — build the standard GCS_BLOCK_REPLY (header +
+ * BLCKSZ page, + ClusterGcsUndoAuthTrailer for served undo kinds) with the
+ * HC109 forwarding-master echo the requester's HC108 chain expects, and send
+ * it to the requester.  A DENIED result ships a zero page under a matching
+ * checksum (the requester never consumes DENIED bytes).  Shared by the
+ * CONTROL-plane LMON ship and the D6 DATA-plane inline serve.
+ */
+static void
+cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
+{
+	uint32 header_len = (uint32)sizeof(GcsBlockReplyHeader);
+	uint32 total = header_len + GCS_BLOCK_DATA_SIZE;
+	char *buf;
+	GcsBlockReplyHeader *hdr;
+
+	/* spec-6.12i: a served undo-TT fetch / undo verdict appends the authority
+	 * trailer (tt_generation); DENIED undo replies stay v1-sized. */
+	if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)slot->result_status))
+		total += (uint32)sizeof(ClusterGcsUndoAuthTrailer);
+	buf = (char *)palloc0(total);
+	hdr = (GcsBlockReplyHeader *)buf;
+	hdr->request_id = slot->request_id;
+	hdr->page_lsn = 0;
+	hdr->epoch = cluster_epoch_get_current();
+	hdr->sender_node = cluster_node_id;
+	hdr->requester_backend_id = slot->requester_backend;
+	hdr->transition_id = slot->transition_id;
+	hdr->status = slot->result_status;
+	GcsBlockReplyHeaderSetForwardingMasterNode(hdr, slot->reply_master_node);
+
+	if (hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
+		|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL)
+		memcpy(buf + header_len, slot->result_page, BLCKSZ);
+	else if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)hdr->status)) {
+		ClusterGcsUndoAuthTrailer *trailer
+			= (ClusterGcsUndoAuthTrailer *)(buf + header_len + GCS_BLOCK_DATA_SIZE);
+
+		/*
+		 * spec-6.12i co-sample carriage: the authority sampled ATOMICALLY
+		 * with the content read overrides the ship-time header fields —
+		 * epoch carries the sampled origin epoch (the HC100 `hdr.epoch >=
+		 * request_epoch` check then drops a mid-reconfig reply, which IS the
+		 * D-i3 fail-closed) and page_lsn carries live_hwm_lsn.
+		 */
+		hdr->epoch = slot->undo_auth.origin_epoch;
+		hdr->page_lsn = slot->undo_auth.live_hwm_lsn;
+		memcpy(buf + header_len, slot->result_page, BLCKSZ);
+		ClusterGcsUndoAuthTrailerSetTtGeneration(trailer, slot->undo_auth.tt_generation);
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(trailer, (uint64)slot->undo_auth.authority_scn);
+	}
+	hdr->checksum = cluster_gcs_block_compute_checksum(buf + header_len);
+
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf, total);
+	pfree(buf);
+}
+
+/*
+ * cluster_lms_cr_drain — CONTROL-plane park drain (LMS worker 0 main loop).
+ * Serve every PENDING slot into a READY result (errors become DENIED; LMS
+ * never exits over a serve).  DATA-plane requests are served inline and never
+ * reach this table, so on a data-plane node the loop is a no-op.
+ */
+void
+cluster_lms_cr_drain(void)
+{
+	if (CrServerShared == NULL)
+		return;
+
+	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 expected = CLUSTER_LMS_CR_PENDING;
+
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_BUSY))
+			continue;
+		pg_read_barrier(); /* pair with the submit-side publish barrier */
+
+		cr_serve_slot(slot);
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_READY);
-		/* PGRAC: spec-7.2 D1 -- wake the shipper (see the undo/verdict
-		 * READY publish above for the rationale). */
+		/* PGRAC: spec-7.2 D1 -- wake the shipper (LMON) right away; without
+		 * this the READY result sat until LMON's next natural wakeup (typ.
+		 * 100-250ms).  Publish-before-signal: READY store above precedes the
+		 * kick. */
 		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
 		cluster_lmon_wakeup();
 	}
 }
 
 /*
- * cluster_lms_cr_ship_ready — LMON tick side.  Ship READY results.
- *
- *	Builds the standard GCS_BLOCK_REPLY (header + BLCKSZ page) with the
- *	HC109 forwarding-master echo the requester's HC108 chain expects, and
- *	frees the slot.  A DENIED result ships a zero page under a matching
- *	checksum (the requester never consumes DENIED bytes).
+ * cluster_lms_cr_ship_ready — CONTROL-plane ship (LMON tick).  Ship every
+ * READY result to its requester and free the slot.  DATA-plane requests are
+ * shipped inline (see cluster_gcs_block_forward_serve_inline) and never reach
+ * this table.
  */
 void
 cluster_lms_cr_ship_ready(void)
@@ -949,65 +1013,206 @@ cluster_lms_cr_ship_ready(void)
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_READY;
-		uint32 header_len;
-		uint32 total;
-		char *buf;
-		GcsBlockReplyHeader *hdr;
 
 		if (pg_atomic_read_u32(&slot->state) != CLUSTER_LMS_CR_READY)
 			continue;
-		(void)expected; /* single shipper (LMON tick); state re-checked above */
 		pg_read_barrier();
 
-		header_len = (uint32)sizeof(GcsBlockReplyHeader);
-		total = header_len + GCS_BLOCK_DATA_SIZE;
-		/* spec-6.12i: a served undo-TT fetch / undo verdict appends the
-		 * authority trailer (tt_generation); DENIED undo replies stay
-		 * v1-sized. */
-		if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)slot->result_status))
-			total += (uint32)sizeof(ClusterGcsUndoAuthTrailer);
-		buf = (char *)palloc0(total);
-		hdr = (GcsBlockReplyHeader *)buf;
-		hdr->request_id = slot->request_id;
-		hdr->page_lsn = 0;
-		hdr->epoch = cluster_epoch_get_current();
-		hdr->sender_node = cluster_node_id;
-		hdr->requester_backend_id = slot->requester_backend;
-		hdr->transition_id = slot->transition_id;
-		hdr->status = slot->result_status;
-		GcsBlockReplyHeaderSetForwardingMasterNode(hdr, slot->reply_master_node);
-
-		if (hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
-			|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL)
-			memcpy(buf + header_len, slot->result_page, BLCKSZ);
-		else if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)hdr->status)) {
-			ClusterGcsUndoAuthTrailer *trailer
-				= (ClusterGcsUndoAuthTrailer *)(buf + header_len + GCS_BLOCK_DATA_SIZE);
-
-			/*
-			 * spec-6.12i co-sample carriage: the authority the LMS sampled
-			 * ATOMICALLY with the content read overrides the ship-time
-			 * header fields — epoch carries the sampled origin epoch (the
-			 * HC100 `hdr.epoch >= request_epoch` check then drops a
-			 * mid-reconfig reply, which IS the D-i3 fail-closed) and
-			 * page_lsn carries live_hwm_lsn.
-			 */
-			hdr->epoch = slot->undo_auth.origin_epoch;
-			hdr->page_lsn = slot->undo_auth.live_hwm_lsn;
-			memcpy(buf + header_len, slot->result_page, BLCKSZ);
-			ClusterGcsUndoAuthTrailerSetTtGeneration(trailer, slot->undo_auth.tt_generation);
-			ClusterGcsUndoAuthTrailerSetAuthorityScn(trailer,
-													 (uint64)slot->undo_auth.authority_scn);
-		}
-		hdr->checksum = cluster_gcs_block_compute_checksum(buf + header_len);
-
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf,
-									   total);
-		pfree(buf);
+		cr_build_and_send_reply(slot);
 
 		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_FREE);
 	}
+}
+
+/*
+ * spec-7.3 D6 — scratch context for one inline serve.  CR construction and
+ * the reply build palloc transient state; the inline serve runs inside the
+ * worker's long-lived DATA-dispatch loop, so it must reset its own scratch
+ * rather than leak into that context.  Lazily created per worker process.
+ */
+static MemoryContext CrServeScratchCtx = NULL;
+
+static MemoryContext
+cr_serve_scratch_context(void)
+{
+	if (CrServeScratchCtx == NULL)
+		CrServeScratchCtx = AllocSetContextCreate(TopMemoryContext, "cluster cr inline serve",
+												  ALLOCSET_DEFAULT_SIZES);
+	return CrServeScratchCtx;
+}
+
+/*
+ * cluster_gcs_block_forward_serve_inline — spec-7.3 D6 entry.  When the GCS
+ * block family is on the DATA plane, the worker[shard] that received a
+ * GCS_BLOCK_FORWARD CR / undo-fetch / undo-verdict request serves it inline
+ * and ships the reply on its own DATA channel — no shmem slot, no worker-0
+ * poll handoff, no 100 ms idle latency.  The forward handler routes to this
+ * only when cluster_gcs_block_family_on_data_plane(): on the CONTROL plane
+ * the request must go through the light-work park path instead (LMON must not
+ * walk undo I/O in its dispatch loop).
+ *
+ *	Populates the request carrier from the forward payload (decoding the
+ *	synthetic undo address / xid carrier as the submit path does), then serves
+ *	it through the shared cr_serve_slot() envelope and ships exactly one reply
+ *	(the result, or a fail-closed DENIED on any refusal / wave-GUC-off /
+ *	malformed request — the requester keeps its unchanged 53R9G / 53R97, Rule
+ *	8.A).  Everything runs inside a per-call scratch context that is reset on
+ *	return so the long-lived DATA-dispatch loop never accumulates transients.
+ */
+void
+cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, ClusterLmsCrSlotKind kind)
+{
+	ClusterLmsCrSlot slot;
+	MemoryContext old;
+	uint32 segment_id = 0;
+	uint32 block_no = 0;
+	bool inject_refuse;
+	TimestampTz serve_started_at;
+
+	if (fwd == NULL)
+		return;
+
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * FORWARD inline-serve entry.  Same invariant as the REQUEST dedup
+	 * guard (cluster_gcs_block.c): a block-family frame's tag routes to
+	 * exactly one LMS worker (worker[shard(tag)], D4), and this serve runs
+	 * in the worker whose DATA channel received the envelope.  A mismatch
+	 * is a mis-route (per-tag order break, 8.A) that cannot happen without
+	 * a code bug — fail closed (drop without serving; the requester
+	 * retransmits within its budget and 53R90/53R9G fail-closes) rather
+	 * than serve a tag this worker does not own.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&fwd->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block forward misrouted to LMS worker %d (tag shard "
+										 "%d); dropping (spec-7.3 P2-1 8.A fail-closed)",
+										 recv_worker, tag_shard)));
+			}
+			return;
+		}
+	}
+
+	/* Populate the request carrier from the forward payload (was submit). */
+	memset(&slot, 0, sizeof(slot));
+	slot.tag = fwd->tag;
+	slot.request_id = fwd->request_id;
+	slot.epoch = fwd->epoch;
+	slot.requester_node = fwd->original_requester_node;
+	slot.requester_backend = fwd->requester_backend_id;
+	slot.reply_master_node = fwd->master_node;
+	slot.transition_id = fwd->transition_id;
+	slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+	slot.req_kind = (uint8)kind;
+
+	/*
+	 * PGRAC: spec-7.3 D7 — fence ×N.  A write-fenced node must not let block
+	 * images / undo bytes / commit verdicts leave: while the cooperative
+	 * write-fence is enforcing but this node is NOT authorized for the live
+	 * epoch, any served payload could be stale relative to the cluster's
+	 * authoritative state — a split-brain read (CR image) or a false-committed
+	 * verdict (stale commit_scn) surface (Rule 8.A).  The worker-0 park ship
+	 * path keeps this gate (cluster_lms.c fence-gates cr_ship_ready); D6's move
+	 * to inline serve dropped it.  Restoring it HERE — ahead of the kind switch
+	 * and any construct/read — covers every worker (0..7) and all three kinds
+	 * uniformly.  Refuse by shipping the pre-set DENIED result WITHOUT reading
+	 * or constructing anything; the requester retransmits within its budget and
+	 * 53R90 fail-closes if the fence outlasts it — never a stale ship.  The
+	 * injection forces the same branch deterministically for the TAP fence leg.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-lms-cr-fence-refuse");
+	/* Consume a pending injection arm unconditionally (F6-1 local-var idiom):
+	 * evaluating it as the second || operand would let a genuine fence
+	 * short-circuit past the consume, leaking the arm to a later call. */
+	inject_refuse = cluster_injection_should_skip("cluster-lms-cr-fence-refuse");
+	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed()) || inject_refuse) {
+		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
+		old = MemoryContextSwitchTo(cr_serve_scratch_context());
+		cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(CrServeScratchCtx);
+		cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
+		return;
+	}
+
+	switch (kind) {
+	case CLUSTER_LMS_SLOT_KIND_CR:
+		slot.read_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		break;
+
+	case CLUSTER_LMS_SLOT_KIND_UNDO_FETCH:
+		slot.read_scn = InvalidScn;
+		/* A malformed tag leaves segment_id 0 -> lms_undo_fetch_serve refuses. */
+		(void)GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no);
+		slot.undo_segment_id = segment_id;
+		slot.undo_block_no = block_no;
+		slot.undo_xid = InvalidTransactionId;
+		break;
+
+	case CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT: {
+		uint64 carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+
+		slot.read_scn = InvalidScn;
+		(void)GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no);
+		slot.undo_segment_id = segment_id;
+		slot.undo_block_no = block_no;
+		/* A malformed carrier (upper 32 bits set / non-normal) leaves xid
+		 * Invalid -> lms_undo_verdict_serve refuses. */
+		slot.undo_xid
+			= (carrier <= (uint64)PG_UINT32_MAX && TransactionIdIsNormal((TransactionId)carrier))
+				  ? (TransactionId)carrier
+				  : InvalidTransactionId;
+		break;
+	}
+	}
+
+	old = MemoryContextSwitchTo(cr_serve_scratch_context());
+	/* PGRAC: spec-7.3 D8 — time the serve into the calling worker's duration
+	 * histogram (the R4 slow-shard backstop:  a slow CR construction stalls
+	 * only this shard, and the per-worker hist is where that shows). */
+	serve_started_at = GetCurrentTimestamp();
+	cr_serve_slot(&slot);
+	cluster_lms_obs_note_inline_serve((uint64)(GetCurrentTimestamp() - serve_started_at));
+	/* A caught construction throw left CurrentMemoryContext at TopMemoryContext;
+	 * normalize back to the scratch context before the reply build. */
+	MemoryContextSwitchTo(cr_serve_scratch_context());
+
+	/*
+	 * PGRAC: spec-7.3 D7 (review P1-1) — re-check the fence at SHIP time.
+	 * The gate above runs BEFORE construction; the serve itself walks undo
+	 * I/O / TT scans (ms-scale), so a qvotec lease that expires DURING the
+	 * serve would otherwise let the just-constructed image / verdict leave
+	 * the now-fenced node — stale bytes the cluster's authoritative state
+	 * has moved past (Rule 8.A).  The park ship path never had this window
+	 * (cluster_lms.c gates cr_ship_ready at ship time, per tick); restore
+	 * that timing here by discarding the constructed result and shipping
+	 * the fail-closed DENIED instead — the requester retransmits within its
+	 * budget and 53R90/53R9G fail-closes if the fence outlasts it.  The
+	 * probe is a pure in-memory time comparison (no I/O on the hot path).
+	 * The injection forces this branch deterministically for the TAP
+	 * TOCTOU leg (a genuine mid-serve lease expiry is not schedulable from
+	 * TAP); same unconditional-consume idiom as the gate above (F6-1).
+	 */
+	CLUSTER_INJECTION_POINT("cluster-lms-cr-fence-recheck");
+	inject_refuse = cluster_injection_should_skip("cluster-lms-cr-fence-recheck");
+	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed()) || inject_refuse) {
+		slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
+	}
+	cr_build_and_send_reply(&slot);
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(CrServeScratchCtx);
+	cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
 }
 
 #endif /* USE_PGRAC_CLUSTER */

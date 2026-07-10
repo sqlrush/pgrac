@@ -48,6 +48,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms_shard.h"		 /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
@@ -64,6 +65,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h" /* PGRAC: spec-7.3 D5 — my DATA channel = worker id */
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
@@ -3573,6 +3575,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	GcsBlockDedupKey key;
 	GcsBlockDedupEntry cached_entry;
 	GcsBlockDedupResult dr;
+	int dedup_worker_id; /* PGRAC: spec-7.3 D5 — this request's dedup shard */
 	char block_buf[GCS_BLOCK_DATA_SIZE];
 	GcsBlockReplyStatus status;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
@@ -3638,6 +3641,37 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	}
 
+	/*
+	 * PGRAC: spec-7.3 D5 — per-worker dedup shard routing guard.  A block
+	 * request's tag routes to exactly one LMS worker (worker[shard(tag)],
+	 * D4), which owns that tag's private dedup shard.  This handler runs in
+	 * the worker whose DATA channel received the envelope; verify it is the
+	 * routed worker before touching the shard.  A mismatch is a mis-route
+	 * (序破坏, 8.A): D3 negotiates a cluster-wide n_workers and D1 shard()
+	 * is byte-identical on both ends, so this cannot happen without a code
+	 * bug — fail closed (drop; sender retransmits via 53R90) rather than
+	 * serve from, or contend on, a shard this worker does not own.
+	 */
+	dedup_worker_id = cluster_ic_tier1_my_data_channel();
+	{
+		int tag_shard = cluster_lms_shard_for_tag(&req->tag, cluster_lms_workers);
+
+		Assert(tag_shard == dedup_worker_id);
+		if (tag_shard != dedup_worker_id) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block request misrouted to LMS worker %d (tag shard "
+										 "%d); dropping (spec-7.3 D5 8.A fail-closed)",
+										 dedup_worker_id, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	/* PGRAC: spec-2.34 D5 — dedup lookup_or_register (HC90 + HC91 + HC92). */
 	memset(&key, 0, sizeof(key));
 	key.origin_node_id = (uint32)req->sender_node;
@@ -3646,8 +3680,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.cluster_epoch = req->epoch;
 	memset(&cached_entry, 0, sizeof(cached_entry));
 
-	dr = cluster_gcs_block_dedup_lookup_or_register(&key, req->tag, req->transition_id,
-													&cached_entry);
+	dr = cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
+													req->transition_id, &cached_entry);
 	switch (dr) {
 	case GCS_BLOCK_DEDUP_CACHED_REPLY:
 		gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
@@ -4103,8 +4137,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					fwd_hdr.sender_node = x_holder;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				cluster_pcm_lock_clear_pending_x(req->tag);
@@ -4445,8 +4480,9 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				/* Forward send failed — fall through to the fail-closed flow. */
@@ -4516,8 +4552,8 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node; /* HC113: holder stored here */
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(&key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
-														  &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(
+						dedup_worker_id, &key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
 				}
 				return;
 			}
@@ -4639,7 +4675,7 @@ build_and_send_reply: {
 		hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 	}
 
-	cluster_gcs_block_dedup_install_reply_ex(&key, status, hdr,
+	cluster_gcs_block_dedup_install_reply_ex(dedup_worker_id, &key, status, hdr,
 											 has_block_payload ? block_payload : NULL,
 											 send_sf_dep ? &sf_dep_vec : NULL, send_sf_dep);
 
@@ -4727,6 +4763,11 @@ build_and_send_reply: {
 	pfree(buf);
 }
 }
+
+
+/* cluster_gcs_block_payload_shard (spec-7.3 D4) lives in
+ * cluster_gcs_block_shard.c — extracted at D9 as a pure file so the
+ * cluster_unit suite links the REAL staging-path router. */
 
 
 /* ============================================================
@@ -5305,49 +5346,57 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 								 * dedup TTL will sweep stale entry */
 
 	/*
-	 * PGRAC: spec-6.12b — CR-server request.  LMON only validates + parks
-	 * the request for LMS (light-work rule: a CR construction walks undo
-	 * I/O and must never run in this dispatch loop); the LMON tick ships
-	 * the finished result.  A refused park (data plane off / no free slot)
-	 * replies a fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R9G refusal (Rule 8.A).  Never falls through to the
-	 * current-image ship below: a CR result is HISTORICAL by intent and
-	 * the lost-write watermark verdict does not apply (the SCN carrier
-	 * holds the requester's read_scn on this path).
+	 * PGRAC: spec-6.12b + spec-7.3 D6 — CR-server request.  When the family is
+	 * on the DATA plane this handler runs in the receiving worker[shard], so it
+	 * serves the request INLINE (construct under the PG_TRY -> DENIED envelope)
+	 * and ships on its own channel — the park -> LMS-poll -> LMON-ship
+	 * indirection is retired there (D6).  On the CONTROL plane the handler runs
+	 * in LMON, whose tight IC dispatch loop must NOT walk undo I/O (the
+	 * light-work rule), so it parks for LMS worker 0 instead; a refused park
+	 * (data plane off / no free slot) replies a fail-closed DENIED immediately.
+	 * Either way the requester keeps its unchanged 53R9G on refusal (Rule 8.A).
+	 * Never falls through to the current-image ship below: a CR result is
+	 * HISTORICAL by intent and the lost-write watermark verdict does not apply
+	 * (the SCN carrier holds the requester's read_scn on this path).
 	 */
 	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
-		if (!cluster_lms_cr_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_CR);
+		else if (!cluster_lms_cr_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i1 — undo-TT fetch request.  Same LMON shape as the
-	 * CR branch above (validate + park only; the undo file read runs in LMS,
-	 * the LMON tick ships).  MUST branch here, before any holder / GRD logic:
-	 * the tag is a synthetic undo address, not a block identity.  A refused
-	 * park (wave GUC off / malformed tag / no free slot) replies the
-	 * fail-closed DENIED immediately so the requester keeps its unchanged
-	 * 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i1 + spec-7.3 D6 — undo-TT fetch request.  DATA plane
+	 * serves inline (the undo file read runs in the worker[shard]); CONTROL
+	 * plane parks for LMS worker 0 (light-work rule).  MUST branch here, before
+	 * any holder / GRD logic: the tag is a synthetic undo address, not a block
+	 * identity.  A refusal (wave GUC off / malformed tag / no free slot) ships
+	 * DENIED so the requester keeps its unchanged 53R97 (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoTtFetchRequest(fwd)) {
-		if (!cluster_lms_undo_fetch_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_FETCH);
+		else if (!cluster_lms_undo_fetch_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request.  Same
-	 * LMON shape as the two branches above (validate + park only; the
-	 * complete durable-TT scan + CLOG cross-check runs in LMS, the LMON tick
-	 * ships).  MUST branch here, before any holder / GRD logic: the tag is a
-	 * synthetic undo address and the SCN carrier holds the widened xid.  A
-	 * refused park (wave GUC off / malformed tag or carrier / no free slot)
-	 * replies the fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 + spec-7.3 D6 — undo-verdict
+	 * request.  DATA plane serves inline (the complete durable-TT scan + CLOG
+	 * cross-check runs in the worker[shard]); CONTROL plane parks for LMS
+	 * worker 0 (light-work rule).  MUST branch here, before any holder / GRD
+	 * logic: the tag is a synthetic undo address and the SCN carrier holds the
+	 * widened xid.  A refusal (wave GUC off / malformed tag or carrier / no
+	 * free slot) ships DENIED so the requester keeps its unchanged 53R97
+	 * (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)) {
-		if (!cluster_lms_undo_verdict_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
+		else if (!cluster_lms_undo_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
@@ -6253,6 +6302,36 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	if (inv->checksum != gcs_block_compute_invalidate_checksum(inv))
 		return;
 
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE receive side.  Same invariant as the REQUEST dedup guard
+	 * above: INVALIDATE is staged and routed by shard(tag) (payload_shard),
+	 * so the receiving worker must be the routed worker.  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order invalidate
+	 * could drop a copy a later grant relies on) that cannot happen without
+	 * a code bug — fail closed (drop without ACK; the master's broadcast
+	 * fail-closes on its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&inv->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block invalidate misrouted to LMS worker %d (tag "
+										 "shard %d); dropping (spec-7.3 P2-1 8.A fail-closed)",
+										 recv_worker, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	current_epoch = cluster_epoch_get_current();
 
 	/*
@@ -6371,6 +6450,37 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	if (ack->checksum != gcs_block_compute_invalidate_ack_checksum(ack)) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE-ACK receive side (master).  The ACK is direct-sent from
+	 * the holder worker that received the INVALIDATE (worker[shard(tag)]),
+	 * and worker channels pair i<->i across nodes, so a well-routed ACK
+	 * always lands on this master's worker[shard(tag)].  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order ACK could
+	 * certify a drop the holder has not applied yet) that cannot happen
+	 * without a code bug — fail closed (drop; the broadcast fail-closes on
+	 * its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&ack->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG, (errmsg_internal("gcs block invalidate-ack misrouted to LMS worker %d "
+											  "(tag shard %d); dropping (spec-7.3 P2-1 8.A "
+											  "fail-closed)",
+											  recv_worker, tag_shard)));
+			}
+			return;
+		}
 	}
 
 	/*

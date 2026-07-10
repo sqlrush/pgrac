@@ -122,22 +122,53 @@ typedef struct ClusterICTier1Shmem {
 #define PGRAC_IC_TIER1_SHMEM_MAGIC ((uint32)0x54494331U) /* "TIC1" */
 
 /*
- * PGRAC: spec-7.2 D2 — per-plane shmem instances inside the single
- * "pgrac cluster_ic_tier1" region ([0] = CONTROL, [1] = DATA).
+ * PGRAC: spec-7.2 D2 + spec-7.3 D3 — per-plane / per-DATA-worker shmem slots
+ * inside the single "pgrac cluster_ic_tier1" region (slot 0 = CONTROL,
+ * slot 1 + c = DATA worker channel c; see Tier1ShmemSlots below).
  *
  *	Tier1Shmem stays the working alias and points at THIS process's
- *	plane instance: process-local tier1 state (fd arrays, buffers,
- *	HELLO state machines) is naturally per-process, so the plane a
- *	process owns is implied by the process — LMON = CONTROL (the
- *	default), LMS = DATA (set via cluster_ic_tier1_set_my_plane at
- *	LmsMain entry).  Every existing tier1 function keeps reading
- *	Tier1Shmem unchanged and lands on its own plane's peers[] /
- *	listener metadata / CONNECTED gate.  Cross-plane observers (SQL
- *	views) address Tier1ShmemByPlane[] explicitly.
+ *	slot instance: process-local tier1 state (fd arrays, buffers,
+ *	HELLO state machines) is naturally per-process, so the plane/channel
+ *	a process owns is implied by the process — LMON = CONTROL (the
+ *	default), LMS worker c = DATA channel c (set via
+ *	cluster_ic_tier1_set_my_plane / set_my_data_channel at aux entry).
+ *	Every existing tier1 function keeps reading Tier1Shmem unchanged and
+ *	lands on its own slot's peers[] / listener metadata / CONNECTED gate.
+ *	Plane-scoped observers (get_plane_misroute_reject) aggregate the DATA
+ *	worker channels;  peer_get / get_peer_fd read the caller's own slot.
  */
-static ClusterICTier1Shmem *Tier1ShmemByPlane[CLUSTER_IC_PLANE_N] = { NULL, NULL };
+/*
+ * PGRAC: spec-7.3 D3 — per-plane / per-DATA-worker shmem slots.  Layout:
+ *   slot 0                    = CONTROL
+ *   slot 1 + c (c 0..N-1)     = DATA worker channel c
+ * so CONTROL (slot 0) and DATA worker 0 (slot 1) keep their spec-7.2 offsets
+ * and cluster.lms_workers = 1 is byte-identical.  Each DATA worker gets its
+ * own instance, so peers[] (read by the send-gate) and listener metadata are
+ * never clobbered across worker processes.
+ */
+#define CLUSTER_IC_TIER1_SLOTS (1 + CLUSTER_IC_TIER1_DATA_CHANNELS)
+static ClusterICTier1Shmem *Tier1ShmemSlots[CLUSTER_IC_TIER1_SLOTS];
 static ClusterICPlane tier1_my_plane = CLUSTER_IC_PLANE_CONTROL;
+static int tier1_my_data_channel = 0; /* worker id;  valid when plane == DATA */
+static int tier1_my_n_workers = 1;	  /* cluster-uniform worker count (DATA HELLO) */
 static ClusterICTier1Shmem *Tier1Shmem = NULL;
+
+/* Map (plane, DATA channel) to a shmem slot index. */
+static inline int
+tier1_slot_of(ClusterICPlane plane, int data_channel)
+{
+	if (plane == CLUSTER_IC_PLANE_DATA)
+		return 1 + data_channel;
+	return 0; /* CONTROL (channel irrelevant) */
+}
+
+/* Port offset this process applies to its declared data port (0 = CONTROL or
+ * DATA worker 0;  worker c binds/dials declared_port + c — spec-7.3 D3). */
+static inline int
+tier1_my_port_offset(void)
+{
+	return (tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? tier1_my_data_channel : 0;
+}
 
 /*
  * Listener fd -- process-local; valid only in the LMON aux process that
@@ -421,8 +452,9 @@ peer_addr(int32 peer_id)
 static Size
 tier1_shmem_size(void)
 {
-	/* PGRAC: spec-7.2 D2 — one instance per plane (CONTROL + DATA). */
-	return CLUSTER_IC_PLANE_N * MAXALIGN(sizeof(ClusterICTier1Shmem));
+	/* PGRAC: spec-7.2 D2 + spec-7.3 D3 — one instance per slot (CONTROL +
+	 * DATA worker channels). */
+	return CLUSTER_IC_TIER1_SLOTS * MAXALIGN(sizeof(ClusterICTier1Shmem));
 }
 
 static void
@@ -430,23 +462,23 @@ tier1_shmem_init(void)
 {
 	bool found;
 	char *base;
-	int plane;
+	int slot;
 
 	base = (char *)ShmemInitStruct("pgrac cluster_ic_tier1", tier1_shmem_size(), &found);
 
-	/* PGRAC: spec-7.2 D2 — carve one instance per plane;  the working
-	 * alias follows this process's plane (CONTROL unless
-	 * cluster_ic_tier1_set_my_plane re-aims it, i.e. in LMS). */
-	for (plane = 0; plane < CLUSTER_IC_PLANE_N; plane++)
-		Tier1ShmemByPlane[plane]
-			= (ClusterICTier1Shmem *)(base + plane * MAXALIGN(sizeof(ClusterICTier1Shmem)));
-	Tier1Shmem = Tier1ShmemByPlane[tier1_my_plane];
+	/* PGRAC: spec-7.2 D2 + spec-7.3 D3 — carve one instance per slot;  the
+	 * working alias follows this process's plane / DATA channel (CONTROL
+	 * unless set_my_plane / set_my_data_channel re-aims it, i.e. in LMS). */
+	for (slot = 0; slot < CLUSTER_IC_TIER1_SLOTS; slot++)
+		Tier1ShmemSlots[slot]
+			= (ClusterICTier1Shmem *)(base + slot * MAXALIGN(sizeof(ClusterICTier1Shmem)));
+	Tier1Shmem = Tier1ShmemSlots[tier1_slot_of(tier1_my_plane, tier1_my_data_channel)];
 
 	if (!found) {
 		memset(base, 0, tier1_shmem_size());
 
-		for (plane = 0; plane < CLUSTER_IC_PLANE_N; plane++) {
-			ClusterICTier1Shmem *s = Tier1ShmemByPlane[plane];
+		for (slot = 0; slot < CLUSTER_IC_TIER1_SLOTS; slot++) {
+			ClusterICTier1Shmem *s = Tier1ShmemSlots[slot];
 			int i;
 
 			s->magic = PGRAC_IC_TIER1_SHMEM_MAGIC;
@@ -494,10 +526,50 @@ tier1_shmem_init(void)
 void
 cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
 {
+	int slot;
+
 	Assert(plane >= 0 && plane < CLUSTER_IC_PLANE_N);
 	tier1_my_plane = plane;
-	if (Tier1ShmemByPlane[plane] != NULL)
-		Tier1Shmem = Tier1ShmemByPlane[plane];
+	/* set_my_plane alone keeps the DATA channel at its current value (0 =
+	 * worker 0 by default);  set_my_data_channel selects a worker channel. */
+	slot = tier1_slot_of(plane, tier1_my_data_channel);
+	if (Tier1ShmemSlots[slot] != NULL)
+		Tier1Shmem = Tier1ShmemSlots[slot];
+}
+
+/*
+ * PGRAC: spec-7.3 D3 — select this DATA worker's channel.  Implies the DATA
+ * plane and re-aims the working alias at the channel's private instance, so
+ * the listener/dial port (data port + channel) and the HELLO worker fields
+ * (channel as worker_id, n_workers) follow.  Called once at DATA-worker entry
+ * BEFORE any tier1 use.  channel in [0, CLUSTER_IC_TIER1_DATA_CHANNELS).
+ */
+void
+cluster_ic_tier1_set_my_data_channel(int channel, int n_workers)
+{
+	int slot;
+
+	Assert(channel >= 0 && channel < CLUSTER_IC_TIER1_DATA_CHANNELS);
+	Assert(n_workers >= 1 && n_workers <= CLUSTER_IC_TIER1_DATA_CHANNELS);
+
+	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
+	tier1_my_data_channel = channel;
+	tier1_my_n_workers = n_workers;
+	slot = tier1_slot_of(CLUSTER_IC_PLANE_DATA, channel);
+	if (Tier1ShmemSlots[slot] != NULL)
+		Tier1Shmem = Tier1ShmemSlots[slot];
+}
+
+int
+cluster_ic_tier1_my_data_channel(void)
+{
+	return tier1_my_data_channel;
+}
+
+int
+cluster_ic_tier1_my_n_workers(void)
+{
+	return tier1_my_n_workers;
 }
 
 /* PGRAC: spec-7.2 D3 — this process's plane (router plane gates). */
@@ -519,9 +591,26 @@ cluster_ic_tier1_bump_plane_misroute_reject(void)
 uint64
 cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
 {
-	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N || Tier1ShmemByPlane[plane] == NULL)
+	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N)
 		return 0;
-	return pg_atomic_read_u64(&Tier1ShmemByPlane[plane]->plane_misroute_reject);
+
+	/* spec-7.3 D3 — the DATA plane spans per-worker channels;  aggregate. */
+	if (plane == CLUSTER_IC_PLANE_DATA) {
+		uint64 sum = 0;
+		int c;
+
+		for (c = 0; c < CLUSTER_IC_TIER1_DATA_CHANNELS; c++) {
+			int slot = tier1_slot_of(CLUSTER_IC_PLANE_DATA, c);
+
+			if (Tier1ShmemSlots[slot] != NULL)
+				sum += pg_atomic_read_u64(&Tier1ShmemSlots[slot]->plane_misroute_reject);
+		}
+		return sum;
+	}
+
+	if (Tier1ShmemSlots[0] == NULL)
+		return 0;
+	return pg_atomic_read_u64(&Tier1ShmemSlots[0]->plane_misroute_reject);
 }
 
 static const ClusterShmemRegion cluster_ic_tier1_region = {
@@ -1119,6 +1208,11 @@ cluster_ic_tier1_listener_bind(void)
 					(tier1_my_plane == CLUSTER_IC_PLANE_DATA) ? self->data_addr
 															  : self->interconnect_addr)));
 
+	/* PGRAC: spec-7.3 D3 — DATA worker c binds declared_port + c, so each
+	 * worker owns a distinct listener within the node-internal range
+	 * [data_port, data_port + n_workers). */
+	self_port += tier1_my_port_offset();
+
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (fd < 0)
 		ereport(FATAL,
@@ -1268,6 +1362,11 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 		return false;
 	}
 
+	/* PGRAC: spec-7.3 D3 — DATA worker c dials the peer's worker-c listener
+	 * (declared_port + c), keeping the shard-aligned i<->i mesh: my channel
+	 * only ever pairs with the peer's same channel. */
+	port += tier1_my_port_offset();
+
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (fd < 0) {
 		int saved = errno;
@@ -1350,6 +1449,12 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 	cluster_ic_build_hello(tier1_hello_send_buf[peer_id], PGRAC_IC_HELLO_VERSION_V1,
 						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, self_cluster_name,
 						   tier1_my_plane, cluster_epoch_get_current());
+	/* PGRAC: spec-7.3 D3 — stamp the DATA worker identity so the accepting
+	 * worker can enforce the shard-aligned topology + a cluster-uniform
+	 * worker count (8.A).  CONTROL leaves the fields zero (build_hello). */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		cluster_ic_hello_set_worker_fields(tier1_hello_send_buf[peer_id],
+										   (uint8)tier1_my_data_channel, (uint8)tier1_my_n_workers);
 	tier1_hello_send_remaining[peer_id] = PGRAC_IC_HELLO_BYTES;
 
 	return cluster_ic_tier1_continue_hello_send(peer_id, peer_fd);
@@ -1490,6 +1595,27 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 		return false;
 	}
 
+	/*
+	 * PGRAC: spec-7.3 D3 (8.A) — on the DATA plane, reject fail-closed unless
+	 * the peer claims MY worker channel (shard-aligned i<->i mesh) and the
+	 * SAME cluster-uniform worker count.  A worker_id skew would pair
+	 * different shards across the two ends;  an n_workers skew would make the
+	 * two ends' shard tables disagree — either is a message-order break =
+	 * false-visible surface, so it must be refused, never downgraded.
+	 */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& ((int)cluster_ic_hello_worker_id(&msg) != tier1_my_data_channel
+			|| (int)cluster_ic_hello_n_workers(&msg) != tier1_my_n_workers)) {
+		peer_record_error(peer_id, 0, "08P01",
+						  "HELLO DATA worker mismatch (peer worker=%d n=%d mine worker=%d n=%d)",
+						  (int)cluster_ic_hello_worker_id(&msg),
+						  (int)cluster_ic_hello_n_workers(&msg), tier1_my_data_channel,
+						  tier1_my_n_workers);
+		cluster_ic_tier1_close_peer(peer_id, "HELLO DATA worker mismatch");
+		Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_REJECTED;
+		return false;
+	}
+
 	peer_info = cluster_conf_lookup_node(msg.source_node_id);
 	if (peer_info == NULL) {
 		peer_record_error(peer_id, 0, "08P01", "HELLO unknown source_node_id %d",
@@ -1524,7 +1650,15 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
 	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
 
-	ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
+	/* spec-7.3 D3 — tag the DATA-plane CONNECTED log with this worker's
+	 * channel so a 2-node test can prove the shard-aligned i<->i mesh formed
+	 * per worker (CONTROL keeps its historic message verbatim). */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED (DATA worker %d)",
+						peer_id, tier1_my_data_channel)));
+	else
+		ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
 	return true;
 }
 
@@ -1681,6 +1815,25 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		return false;
 	}
 
+	/*
+	 * PGRAC: spec-7.3 D3 (8.A) — same DATA-plane worker gate as the named
+	 * path:  an anonymous inbound HELLO must claim MY worker channel and the
+	 * SAME worker count, else it is refused fail-closed (a mismatch = shard
+	 * misroute = message-order break).  peer_id is not yet known here (this
+	 * is the learn path), so there is no shmem REJECTED state to set.
+	 */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& ((int)cluster_ic_hello_worker_id(&msg) != tier1_my_data_channel
+			|| (int)cluster_ic_hello_n_workers(&msg) != tier1_my_n_workers)) {
+		ereport(
+			LOG,
+			(errmsg("cluster_ic tier1 HELLO DATA worker mismatch (peer worker=%d n=%d mine "
+					"worker=%d n=%d)",
+					(int)cluster_ic_hello_worker_id(&msg), (int)cluster_ic_hello_n_workers(&msg),
+					tier1_my_data_channel, tier1_my_n_workers)));
+		return false;
+	}
+
 	peer_info = cluster_conf_lookup_node(msg.source_node_id);
 	if (peer_info == NULL) {
 		ereport(LOG,
@@ -1705,8 +1858,16 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	if (out_learned_peer_id != NULL)
 		*out_learned_peer_id = learned;
 
-	ereport(LOG, (errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED",
-						 anon_slot, learned)));
+	/* spec-7.3 D3 — same DATA-plane channel tag on the anon (accept) path. */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED "
+						"(DATA worker %d)",
+						anon_slot, learned, tier1_my_data_channel)));
+	else
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED",
+						anon_slot, learned)));
 	return true;
 }
 

@@ -20,7 +20,7 @@
 #	  L7  SQLSTATE 53R93 ERRCODE_CLUSTER_LOST_WRITE_DETECTED literal-
 #	      encodable in PG SQL (catalog 形式 verification)
 #	  L8  GUC switch back to 'error' SHOW returns 'error'
-#	  L9  pg_cluster_state.gcs category has 88 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)
+#	  L9  pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)
 #	  L10 Reply status enum value 12 (DENIED_LOST_WRITE) is新增的
 #	      最大 value (baseline workload must not trigger lost-write)
 #	  L11 spec-2.41 D / P1-C — behavioral lost-write inject: a
@@ -71,6 +71,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_lost_write',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.grd_max_entries = 1024',
@@ -107,8 +108,8 @@ is($pair->node0->safe_psql('postgres',
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '88',
-   'L2 pg_cluster_state.gcs category has 88 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)');
+   '89',
+   'L2 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)');
 
 
 # ============================================================
@@ -193,13 +194,13 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L9 (alias of L2): gcs key count = 88.
+# L9 (alias of L2): gcs key count = 89.
 # ============================================================
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '88',
-   'L9 node1 pg_cluster_state.gcs has 88 keys (cross-node parity)');
+   '89',
+   'L9 node1 pg_cluster_state.gcs has 89 keys (cross-node parity)');
 
 
 # ============================================================

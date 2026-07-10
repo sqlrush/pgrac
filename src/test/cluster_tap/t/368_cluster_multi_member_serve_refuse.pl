@@ -1,6 +1,6 @@
 #-------------------------------------------------------------------------
 #
-# 360_cluster_multi_member_serve_refuse.pl
+# 368_cluster_multi_member_serve_refuse.pl
 #
 #   spec-7.1 D3-b origin-refuse negative leg (Rule 8.A).  The positive
 #   member-serve path (a foreign updater multixact resolved by asking the
@@ -23,7 +23,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#    src/test/cluster_tap/t/360_cluster_multi_member_serve_refuse.pl
+#    src/test/cluster_tap/t/368_cluster_multi_member_serve_refuse.pl
 #-------------------------------------------------------------------------
 
 use strict;

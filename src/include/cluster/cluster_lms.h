@@ -86,7 +86,8 @@
 #include "storage/condition_variable.h"
 #include "storage/lock.h" /* LOCKTAG / LOCKMODE for probe slot */
 #include "storage/lwlock.h"
-#include "cluster/cluster_grd.h" /* ClusterGrdHolderId for probe slot */
+#include "cluster/cluster_grd.h"	   /* ClusterGrdHolderId for probe slot */
+#include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
 
 
 /*
@@ -153,6 +154,14 @@ typedef enum ClusterLmsState {
  *	"active capacity" — slots beyond it are reserved but unused.
  */
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS 64
+
+/*
+ * spec-7.3 D8 — per-worker inline-serve duration histogram bucket count.
+ * 15 finite upper bounds (µs, see lms_serve_hist_bounds_us in cluster_lms.c)
+ * + 1 overflow bucket.  LMS-owned;  distinct from the requester-side
+ * CLUSTER_GCS_SHIP_HIST_BUCKETS measurement (D0-③).
+ */
+#define CLUSTER_LMS_SERVE_HIST_BUCKETS 16
 
 typedef struct ClusterLmsNativeLockProbeSlot {
 	pg_atomic_uint64 in_use;		   /* 0 = free, 2 = initializing, 1 = active */
@@ -258,14 +267,45 @@ typedef struct ClusterLmsSharedState {
 	 *	`LockWaitQueueInsertAtHead`改造 + integrated receiver. */
 	pg_atomic_uint64 priority_starvation_observed_count;
 
-	/* spec-7.2 D6 — DATA-plane connection resets observability counter.
+	/*
+	 * spec-7.3 D2 — LMS DATA-plane worker pool pids.  worker_pids[id] is the
+	 * pid of worker id (0 = LmsProcess, 1..7 = LmsWorker aux processes);  each
+	 * worker publishes its own slot at main-entry and clears it on exit.  0 =
+	 * not running.  Read by backends (spec-7.3 D4) to wake the worker that
+	 * owns a tag's shard.  Guarded by lwlock like the other non-atomic fields.
+	 */
+	pid_t worker_pids[CLUSTER_LMS_MAX_WORKERS];
+
+	/*
+	 * spec-7.3 D8 — per-worker DATA-plane observability (×N).  Each worker
+	 * bumps only its own slot (index = its DATA channel id), so there is no
+	 * cross-worker contention;  the dump surface exposes the per-worker
+	 * detail plus the pool aggregate (sum).
 	 *
-	 *	Bumped by the LMS DATA-plane tick (cluster_lms_data_plane.c) once
-	 *	per connection torn down by a proactive reset:  an epoch bump in
-	 *	production (INV-7.2-CONN-EPOCH ③) or the cluster-lms-conn-reset
-	 *	injection in the F6-1 fault test.  Monotone; cluster-wide reset
-	 *	activity is the sum across nodes. */
-	pg_atomic_uint64 lms_conn_resets;
+	 *	worker_dispatch_count:      envelopes dispatched in this worker's
+	 *	                            DATA recv pump (shard-balance evidence).
+	 *	worker_direct_reply_count:  replies shipped directly from this
+	 *	                            worker's dispatch context by the D6
+	 *	                            inline serve (one per serve call,
+	 *	                            fence-refused DENIED ships included).
+	 *	worker_conn_reset_count:    DATA-mesh resets this worker executed
+	 *	                            (epoch bump / injected;  spec-7.3 D7).
+	 *	worker_inline_serve_count:  inline CR / undo-fetch / undo-verdict
+	 *	                            serves that reached the serve envelope
+	 *	                            (fence-refused excluded — those never
+	 *	                            read or construct;  spec-7.3 D6/D7).
+	 *	worker_serve_hist:          inline serve duration histogram (µs;
+	 *	                            last bucket = overflow) — the R4
+	 *	                            slow-shard backstop.  LMS-owned:  the
+	 *	                            requester-side ship_latency_hist in
+	 *	                            ClusterGcsBlockShared is a different
+	 *	                            measurement, NOT resized (D0-③).
+	 */
+	pg_atomic_uint64 worker_dispatch_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_direct_reply_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_conn_reset_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_inline_serve_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_serve_hist[CLUSTER_LMS_MAX_WORKERS][CLUSTER_LMS_SERVE_HIST_BUCKETS];
 } ClusterLmsSharedState;
 
 
@@ -304,6 +344,23 @@ extern void cluster_lms_request_shutdown(void);
 extern void LmsMain(void) pg_attribute_noreturn();
 
 /*
+ * spec-7.3 D2 — LMS DATA-plane worker main entry (workers 1..7).  Invoked
+ * from auxprocess.c dispatch when MyAuxProcType is one of LmsWorker1..7Process;
+ * worker_id is the 1-based id.  Publishes worker_pids[worker_id], installs the
+ * standard aux signal layout, and idles on MyLatch.  The DATA-plane topology,
+ * outbound ring and inline construction are wired in spec-7.3 D3-D6 — a D2
+ * worker only spawns, identifies, and idles.  Asserts IsUnderPostmaster.
+ * Never returns.
+ */
+extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
+
+/*
+ * spec-7.3 D2 — read a worker's published pid (0 = not running).  worker_id
+ * in [0, CLUSTER_LMS_MAX_WORKERS).  Used by the D4 wakeup path + tests.
+ */
+extern pid_t cluster_lms_get_worker_pid(int worker_id);
+
+/*
  * PGRAC: spec-7.2 D2 — LMS-owned DATA-plane interconnect loop
  * (cluster_lms_data_plane.c).  startup binds the data_addr listener and
  * aims this process's tier1 state at the DATA plane (false = plane off:
@@ -311,23 +368,26 @@ extern void LmsMain(void) pg_attribute_noreturn();
  * WaitEventSet round (sockets + MyLatch — replaces the historic plain
  * WaitLatch when the plane is live);  shutdown closes owned fds.
  */
-extern bool cluster_lms_data_plane_startup(void);
+extern bool cluster_lms_data_plane_startup(int worker_id, int n_workers);
 extern bool cluster_lms_data_plane_enabled(void);
 extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);
 
 /*
- * PGRAC: spec-7.2 D4 — LMS wakeup (mirror of cluster_lmon_wakeup) + the
- * DATA-plane outbound ring (cluster_lms_outbound.c;  Q6-B twin ring:
- * backends stage DATA frames, LMS drains and sends on its own fds).
+ * PGRAC: spec-7.2 D4 + spec-7.3 D4 — wake a specific DATA worker + the
+ * DATA-plane outbound ring GROUP (cluster_lms_outbound.c; one Q6-B ring per
+ * worker).  A backend picks the worker for a block by hashing its BufferTag
+ * (cluster_lms_shard_for_tag), stages the frame into that worker's ring, and
+ * wakes that worker.  worker c drains and sends only rings[c].  worker_id in
+ * [0, CLUSTER_LMS_MAX_WORKERS).
  */
-extern void cluster_lms_wakeup(void);
+extern void cluster_lms_wakeup(int worker_id);
 extern void cluster_lms_outbound_shmem_register(void);
 extern void cluster_lms_outbound_request_lwlocks(void);
-extern bool cluster_lms_outbound_enqueue(uint8 msg_type, uint32 dest_node_id, const void *payload,
-										 uint16 payload_len);
-extern int cluster_lms_outbound_drain_send(void);
-extern uint32 cluster_lms_outbound_depth(void);
+extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
+										 const void *payload, uint16 payload_len);
+extern int cluster_lms_outbound_drain_send(int worker_id);
+extern uint32 cluster_lms_outbound_depth(int worker_id);
 
 /*
  * Read-only accessors for SQL view + diagnostics.
@@ -369,8 +429,32 @@ extern void cluster_lms_inc_priority_starvation_observed(void);
 extern uint64 cluster_lms_get_priority_starvation_observed_count(void);
 
 /* spec-7.2 D6 — DATA-plane connection resets observability counter. */
-extern void cluster_lms_bump_conn_resets(uint32 n);
-extern uint64 cluster_lms_get_conn_resets(void);
+
+/*
+ * spec-7.3 D8 — per-worker DATA-plane observability (×N).
+ *
+ *	The note_* bumpers are no-ops outside an LMS process (worker 0 or a
+ *	LmsWorker) — each resolves the caller's worker slot from its DATA
+ *	channel id.  note_inline_serve also records the serve duration into
+ *	the caller worker's histogram.  The get_* readers take a worker id,
+ *	or -1 for the pool aggregate (sum over all slots);  hist_bound_us
+ *	returns bucket b's inclusive upper bound in µs (UINT64_MAX for the
+ *	overflow bucket, matching the gcs ship-hist idiom).
+ */
+extern void cluster_lms_obs_note_dispatch(void);
+extern void cluster_lms_obs_note_direct_reply(void);
+extern void cluster_lms_obs_note_conn_reset(void);
+extern void cluster_lms_obs_note_inline_serve(uint64 elapsed_us);
+extern uint64 cluster_lms_obs_get_dispatch_count(int worker_id);
+extern uint64 cluster_lms_obs_get_direct_reply_count(int worker_id);
+extern uint64 cluster_lms_obs_get_conn_reset_count(int worker_id);
+extern uint64 cluster_lms_obs_get_inline_serve_count(int worker_id);
+extern uint64 cluster_lms_obs_get_serve_hist(int worker_id, int bucket);
+extern uint64 cluster_lms_obs_serve_hist_bound_us(int bucket);
+
+/* spec-7.3 D8 (Q8) — apply cluster.lms_nice to the calling LMS process
+ * (setpriority, best-effort;  0 = leave the inherited priority alone). */
+extern void cluster_lms_apply_nice(void);
 
 /*
  * State enum -> canonical lowercase string ("disabled", "not_started",

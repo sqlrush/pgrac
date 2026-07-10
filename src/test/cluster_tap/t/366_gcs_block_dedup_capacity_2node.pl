@@ -236,6 +236,15 @@ $node0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node1->append_conf('postgresql.conf', $sc_common);
 $node1->append_conf('postgresql.conf', $cluster_conf);
 $node1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node, but
+# the shipped default cluster.lms_workers=2 binds [data_port, data_port+1] --
+# consecutive get_free_port() values then cross-wire the two nodes' worker
+# ports (HELLO DATA worker mismatch, fail-closed boot).  Pin the pool to one
+# worker: N=1 is the spec-7.2 topology identity, and the dedup capacity /
+# eager-GC subject under test then runs on the single shard 0 -- byte-
+# identical to the pre-pool shape this test was written against.
+$node0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$node1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 
 my $pgrac_conf = <<EOC;
 [cluster]
