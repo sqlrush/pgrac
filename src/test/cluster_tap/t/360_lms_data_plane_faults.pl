@@ -18,10 +18,15 @@
 #	    L5  conn-reset injection (F6-1, un-SKIPPED):  arm the one-shot
 #	        cluster-lms-conn-reset injection, observe one DATA-mesh reset per
 #	        worker process (worker 0 + worker 1 under the default
-#	        lms_workers=2) in node0's log, then verify the mesh reconnects and
-#	        a cross-node block transfer converges.  The reset is latched
-#	        one-shot per worker (cluster_lms_data_plane.c) so the persistent
-#	        GUC arm no longer storms or crashes the passive LMS.
+#	        lms_workers=2) in node0's log (L5.1), verify the mesh reconnects
+#	        (L5.2) and that the reset is one-shot per worker (L5.3), then
+#	        prove block transfer CONVERGES after the reset (L5.4/L5.5, spec
+#	        §4 line 193 "重连收敛"): the per-worker conn-reset counter
+#	        recorded the reset, and a FRESH post-reset coincidence table
+#	        (new, un-recycled xids that never hit the #119 wall) is X-swapped
+#	        cross-node with wire block REQUESTs on both sides.  The reset is
+#	        latched one-shot per worker (cluster_lms_data_plane.c) so the
+#	        persistent GUC arm no longer storms or crashes the passive LMS.
 #
 #	  KNOWN-BLOCKED / deferred legs (honest SKIP; see docs/stage7-substrate-
 #	  findings.md).  The stage7 P0 substrate (spec-6.15b/4.6a/2.29a) was
@@ -96,6 +101,14 @@ sub gcs_int
 	my ($node, $key) = @_;
 	my $v = $node->safe_psql('postgres',
 		qq{SELECT value FROM pg_cluster_state WHERE category='gcs' AND key='$key'});
+	return defined($v) && $v ne '' ? int($v) : 0;
+}
+
+sub lms_int
+{
+	my ($node, $key) = @_;
+	my $v = $node->safe_psql('postgres',
+		qq{SELECT value FROM pg_cluster_state WHERE category='lms' AND key='$key'});
 	return defined($v) && $v ne '' ? int($v) : 0;
 }
 
@@ -228,13 +241,6 @@ ok(defined($p99) && $p99 <= 20000,
 # injection point stays a spec-7.2 follow-up — the counter sits on the real
 # dispatch path, in cluster_ic_dispatch_envelope).
 # ============================================================
-sub lms_int
-{
-	my ($node, $key) = @_;
-	my $v = $node->safe_psql('postgres',
-		qq{SELECT value FROM pg_cluster_state WHERE category='lms' AND key='$key'});
-	return defined($v) && $v ne '' ? int($v) : 0;
-}
 for my $n ($node0, $node1)
 {
 	my $agg = lms_int($n, 'lms_data_dispatch_count');
@@ -326,17 +332,19 @@ $node0->reload;
 # L5.2 — the mesh RECONNECTS after the injected reset.  Proven by log evidence:
 # both nodes emit a fresh "state CONNECTED" AFTER the reset -- node0 re-dials
 # (active role) and node1 re-accepts (passive role, after its recv sees the
-# drop).  Once CONNECTED the tier1 link is ready for block transfer, so the
-# DATA plane's block-shipping capability (already quantified by the L2 value
-# gate: 394 real X-ships at p99 <= 500us) survives an epoch reset.
+# drop).  Once CONNECTED the tier1 link is ready for block transfer; L5.4/L5.5
+# below prove that convergence directly with a real cross-node transfer.
 #
-# We do NOT re-probe convergence with an SQL read/write here: the value-gate
-# ping-pong burns fault_t's rows' xmax into recycled TT slots, so by this
-# point ANY access to fault_t (read OR write) fail-closes with "cluster TT
-# status unknown" -- the pre-existing #119 recycled-slot wall (spec-7.1a /
-# gap-㉖), which affects all access to that table, is orthogonal to the DATA-
-# plane decoupling and is NOT caused by the reset.  The reconnect log evidence
-# is the direct, uncontaminated proof of what F6-1 delivers.
+# We do NOT re-probe convergence on fault_t itself:  the L2 value-gate ping-
+# pong recycled fault_t's rows' xmax into reused TT slots, so any access to
+# THOSE recycled rows fail-closes with "cluster TT status unknown" -- the pre-
+# existing #119 recycled-slot wall (spec-7.1a / gap-㉖).  That wall is PER-
+# recycled-slot:  it walls only the rows whose xids the ping-pong recycled, and
+# does NOT wall a fresh table's new, un-recycled xids.  It is orthogonal to the
+# DATA-plane decoupling and is NOT caused by the reset.  So the convergence
+# probe (L5.4/L5.5) uses a FRESH coincidence table whose new tuples never hit
+# #119 -- the direct "block transfer recovers" proof the reconnect log evidence
+# alone did not give.
 my $reconnect_deadline = time + 30;
 my ($conn0_after, $conn1_after) = ($conn0_before, $conn1_before);
 while (time < $reconnect_deadline)
@@ -360,6 +368,76 @@ my $reset_final = () = PostgreSQL::Test::Utils::slurp_file($node0->logfile) =~ /
 my $injected = $reset_final - $resets_before;
 ok($injected >= 1 && $injected <= 2,
 	"L5.3 conn-reset injection is one-shot per worker (fired $injected time(s); no per-tick storm)");
+
+# ============================================================
+# ============================================================
+# L5.4 / L5.5 — F6-1 CONVERGENCE (spec §4 line 193 "重连收敛"): after the reset
+# + reconnect, a real cross-node block transfer converges.
+#
+# The reconnect log evidence (L5.2) shows the link is back; this leg proves the
+# DATA plane actually SHIPS BLOCKS again.  We use a FRESH coincidence table
+# (fault2_t) created AFTER the reset: its tuples carry new, un-recycled xids, so
+# they never hit the #119 recycled-slot wall that walls fault_t (that wall is
+# per-recycled-slot, not table-wide -- see the L5.2 note).  The nodes then swap
+# X on it exactly as t/358 L2/L3 do; convergence = both writes succeed AND both
+# requesters' block_request_count grow (real wire REQUESTs after the reset) AND
+# zero plane misroutes.  The per-worker conn-reset counter (aggregate) also confirms the reset
+# was observable.
+# ============================================================
+cmp_ok(lms_int($node0, 'lms_conn_reset_count'), '>', 0,
+	'L5.4 node0 per-worker conn-reset counter (aggregate) recorded the DATA-plane reset');
+
+# Fresh coincidence table on new xids (t/347 OID-align pattern; independent of
+# the reset -- just re-aligns the OID counters the run has since drifted).
+my ($q0, $q1) = ('', '');
+for my $attempt (1 .. 8)
+{
+	$node0->safe_psql('postgres',
+		'CREATE TABLE fault2_t (aid int, bal int) WITH (fillfactor = 50)');
+	$node1->safe_psql('postgres',
+		'CREATE TABLE fault2_t (aid int, bal int) WITH (fillfactor = 50)');
+	$q0 = $node0->safe_psql('postgres', q{SELECT pg_relation_filepath('fault2_t')});
+	$q1 = $node1->safe_psql('postgres', q{SELECT pg_relation_filepath('fault2_t')});
+	last if $q0 eq $q1;
+	my ($m0) = $q0 =~ /(\d+)$/;
+	my ($m1) = $q1 =~ /(\d+)$/;
+	my ($lag, $burn) = $m0 < $m1 ? ($node0, $m1 - $m0) : ($node1, $m0 - $m1);
+	$lag->safe_psql('postgres',
+		"SELECT lo_unlink(lo_create(0)) FROM generate_series(1, $burn)");
+	$node0->safe_psql('postgres', 'DROP TABLE fault2_t');
+	$node1->safe_psql('postgres', 'DROP TABLE fault2_t');
+}
+is($q0, $q1, 'L5.4 post-reset shared-table coincidence (fresh un-recycled xids)');
+$node0->safe_psql('postgres',
+	'INSERT INTO fault2_t SELECT g, 0 FROM generate_series(1, 200) g');
+$node0->safe_psql('postgres', 'CHECKPOINT');
+$node1->safe_psql('postgres', 'CHECKPOINT');
+
+# Cross-node X swap: node0 holds -> node1 ships in, node1 holds -> node0 ships
+# back.  The full swap guarantees each node issues wire block REQUESTs for its
+# remote-mastered half (t/358 L2/L3 shape; a single-row leg alone is master-
+# placement dependent per HC72 master==self).
+my $req0_before = gcs_int($node0, 'block_request_count');
+my $req1_before = gcs_int($node1, 'block_request_count');
+
+ok(timed_update_retry($node0, 'UPDATE fault2_t SET bal = bal + 1', 20),
+	'L5.5 setup: node0 X-holds the fresh post-reset table');
+usleep(500_000);
+ok(timed_update_retry($node1, 'UPDATE fault2_t SET bal = bal + 1 WHERE aid = 7', 20),
+	'L5.5 node1 ships a node0-held block over the reconnected DATA plane');
+usleep(500_000);
+ok(timed_update_retry($node1, 'UPDATE fault2_t SET bal = bal + 1', 20),
+	'L5.5 setup: node1 takes the table X (reverse ship)');
+usleep(500_000);
+ok(timed_update_retry($node0, 'UPDATE fault2_t SET bal = bal + 1 WHERE aid = 11', 20),
+	'L5.5 node0 ships a node1-held block back (bidirectional convergence)');
+
+cmp_ok(gcs_int($node1, 'block_request_count'), '>', $req1_before,
+	'L5.5 node1 issued wire block requests after the reset (transfer converged)');
+cmp_ok(gcs_int($node0, 'block_request_count'), '>', $req0_before,
+	'L5.5 node0 issued wire block requests after the reset (transfer converged)');
+is(gcs_int($node0, 'plane_misroute_reject'), 0, 'L5.5 node0 zero plane misroutes post-reset');
+is(gcs_int($node1, 'plane_misroute_reject'), 0, 'L5.5 node1 zero plane misroutes post-reset');
 
 # ============================================================
 # L6 — HONEST SKIP: data-dispatch injection-point reachability (F6-2).

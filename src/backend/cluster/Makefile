@@ -186,6 +186,7 @@ OBJS = \
 	cluster_undo_cleaner.o \
 	cluster_visibility_resolve.o \
 	cluster_visibility_verdict.o \
+	cluster_writer_chain.o \
 	cluster_undo_record.o \
 	cluster_undo_retention.o \
 	cluster_undo_srf.o \
@@ -218,6 +219,8 @@ OBJS = \
 	cluster_tx_enqueue.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
+	cluster_multixact_served.o \
+	cluster_mxid_stripe.o \
 	cluster_visibility_inject.o \
 	cluster_stats.o \
 	cluster_version.o \

@@ -171,6 +171,11 @@ extern bool cluster_itl_page_has_active_slot(Page page);
  *	MUST hold buffer EXCLUSIVE content lock.  Returns slot_idx on success,
  *	CLUSTER_ITL_SLOT_UNALLOCATED on OVERFLOW (caller decides whether to
  *	skip / continue with V4 emit alone).
+ *
+ *	spec-7.1 watch-2: reusing a completed DATA slot folds the evicted
+ *	write_scn into the page's recycle watermark (spec-3.10 §v0.5) before
+ *	overwriting, exactly like a data-writer recycle -- the marker eviction
+ *	drops that slot's undo anchor from the per-page CR candidate set.
  */
 extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id);
 

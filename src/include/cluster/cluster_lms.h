@@ -428,6 +428,8 @@ extern void cluster_lms_bump_restart_generation_at_main_entry(void);
 extern void cluster_lms_inc_priority_starvation_observed(void);
 extern uint64 cluster_lms_get_priority_starvation_observed_count(void);
 
+/* spec-7.2 D6 — DATA-plane connection resets observability counter. */
+
 /*
  * spec-7.3 D8 — per-worker DATA-plane observability (×N).
  *

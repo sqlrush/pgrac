@@ -90,6 +90,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 int cluster_lms_workers = 2;
+int MaxConnections = 1; /* spec-7.2a D4 floor input (x declared nodes = 1) */
 int cluster_gcs_block_dedup_max_entries = 8;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int cluster_gcs_block_retransmit_max_retries = 4;
@@ -264,6 +265,40 @@ TimestampTz
 GetCurrentTimestamp(void)
 {
 	return (TimestampTz)1000;
+}
+
+/* elog(LOG) plumbing for the spec-7.2a D5 saturation LOG-once in the TTL
+ * sweep (never fires in these tests: full_count stays below threshold). */
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false; /* suppress: no message assembly in unit context */
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/* spec-7.2a D4: pre-shmem conf sniff — a single declared node keeps the
+ * auto-size floor at MaxConnections (=1), so the tests' tiny configured
+ * capacities stay in force. */
+int
+cluster_conf_declared_node_count_early(void)
+{
+	return 1;
 }
 
 Size

@@ -122,6 +122,13 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	shared_data         => 1,
 	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
+		# spec-7.1a: a LIVE remote ITL ref whose overlay lookup misses is
+		# resolved by the D4 origin pull, and that pull is (by design)
+		# armed by cluster.crossnode_write_write -- without it the
+		# updater-xmax judges on this test's superseded versions stay
+		# UNKNOWN fail-closed once the wave-i aging shape is reached
+		# (same conf evolution as the 6.15 striping arming below).
+		'cluster.crossnode_write_write = on',
 		'autovacuum = off',
 		'cluster.ges_request_timeout_ms = 30000',
 		'cluster.gcs_reply_timeout_ms = 3000',
@@ -360,8 +367,18 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 # ============================================================
 {
 	# Warm a session: resolves + populates its per-backend authority memo.
+	# Since the spec-7.1a hardening every COMMITTED stamp is finalized on
+	# the verdict leg, so this fresh session's FIRST read can hit the
+	# leg-(e) clock-skew refusal (the L4b note: an expected transient, the
+	# observe self-heals the next attempt) -- retry until actually warm.
 	my $s = $node1->background_psql('postgres', on_error_stop => 0);
-	my $warm = $s->query('SELECT count(*) FROM i_t');
+	my $warm;
+	for my $try (1 .. 10)
+	{
+		$warm = $s->query('SELECT count(*) FROM i_t');
+		last if defined $warm && $warm =~ /12/;
+		usleep(500_000);
+	}
 	like($warm, qr/12/, 'L5 session warmed (memo + pool populated pre-crash)');
 
 	$pair->kill_node9(0);

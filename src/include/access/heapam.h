@@ -321,6 +321,13 @@ extern HTSV_Result HeapTupleSatisfiesVacuumHorizon(HeapTuple htup, Buffer buffer
 												   TransactionId *dead_after);
 extern void HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer,
 								 uint16 infomask, TransactionId xid);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: spec-7.1a D0/D2 -- authority-backed clear of a RELEASED/ABORTED
+ * remote xmax (bypasses the spec-6.15 D7 foreign-class hint suppression;
+ * only ever called on a cluster-authority terminal verdict). */
+extern void cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple,
+													 Buffer buffer);
+#endif
 extern bool HeapTupleHeaderIsOnlyLocked(HeapTupleHeader tuple);
 extern bool HeapTupleIsSurelyDead(HeapTuple htup,
 								  struct GlobalVisState *vistest);

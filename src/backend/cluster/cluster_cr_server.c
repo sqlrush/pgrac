@@ -51,8 +51,9 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
-#include "access/transam.h" /* TransactionIdDidCommit/DidAbort (D-i4 CLOG cross) */
-#include "access/xlog.h"	/* GetFlushRecPtr (spec-6.12i live_hwm_lsn) */
+#include "access/multixact.h" /* GetMultiXactIdMembers / MultiXactMember (spec-7.1 D3-b) */
+#include "access/transam.h"	  /* TransactionIdDidCommit/DidAbort (D-i4 CLOG cross) */
+#include "access/xlog.h"	  /* GetFlushRecPtr (spec-6.12i live_hwm_lsn) */
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_elog.h" /* cluster_node_id */
@@ -63,9 +64,11 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
 #include "cluster/cluster_ic_tier1.h"  /* PGRAC: spec-7.3 P2-1 — my DATA channel */
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_lmon.h"	   /* PGRAC: spec-7.2 D1 READY-publish wakeup */
-#include "cluster/cluster_lms.h"	   /* PGRAC: spec-7.3 D8 per-worker serve counters */
-#include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
+#include "cluster/cluster_lmon.h"		 /* PGRAC: spec-7.2 D1 READY-publish wakeup */
+#include "cluster/cluster_lms.h"		 /* PGRAC: spec-7.3 D8 per-worker serve counters */
+#include "cluster/cluster_lms_shard.h"	 /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
+#include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
+#include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -311,7 +314,80 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 }
 
 /*
- * lms_undo_fetch_serve — serve one KIND_UNDO_FETCH request (spec-6.12i).
+ * spec-7.1 D3-b (Q-D3b1): a MultiXactId is the same 32-bit width as a
+ * TransactionId, so the multi-verdict request carries the asked-for MXID in
+ * the SAME slot->undo_xid field the single-xid verdict uses -- disambiguated
+ * purely by slot->req_kind (KIND_UNDO_MULTI_VERDICT).  Assert the width so a
+ * future MultiXactId widening cannot silently truncate the carrier.
+ */
+StaticAssertDecl(sizeof(MultiXactId) == sizeof(TransactionId),
+				 "spec-7.1 D3-b reuses the undo_xid carrier width for MultiXactId (Q-D3b1)");
+
+/*
+ * cluster_lms_undo_multi_verdict_submit — LMON dispatch side (spec-7.1 D3-b).
+ *
+ *	Park a validated multi member-verdict request.  Same shape as the single
+ *	verdict submit, but the widened watermark carrier holds a MultiXactId
+ *	(not a TransactionId): a non-zero upper 32 bits or an invalid mxid is a
+ *	malformed carrier — refuse (the caller replies the fail-closed DENIED; the
+ *	requester keeps 53R97, Rule 8.A).  The synthetic tag is validated for
+ *	shape only; the member scan is complete over the multi's own pg_multixact.
+ */
+bool
+cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
+{
+	uint32 segment_id = 0;
+	uint32 block_no = 0;
+	uint64 carrier;
+
+	if (CrServerShared == NULL || fwd == NULL)
+		return false;
+	if (!cluster_crossnode_runtime_visibility)
+		return false;
+	if (!GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no))
+		return false;
+
+	carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+	if (carrier > (uint64)PG_UINT32_MAX || !MultiXactIdIsValid((MultiXactId)carrier))
+		return false;
+
+	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 expected = CLUSTER_LMS_CR_FREE;
+
+		/* Reserve producer-only FILLING first (spec-7.1 integration review):
+		 * landing directly on PENDING would let the LMS drain acquire the
+		 * slot before the request fields below are written. */
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+			continue;
+
+		slot->tag = fwd->tag;
+		slot->read_scn = InvalidScn; /* the carrier held the mxid, not a snapshot */
+		slot->request_id = fwd->request_id;
+		slot->epoch = fwd->epoch;
+		slot->requester_node = fwd->original_requester_node;
+		slot->requester_backend = fwd->requester_backend_id;
+		slot->reply_master_node = fwd->master_node;
+		slot->transition_id = fwd->transition_id;
+		slot->result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+		slot->req_kind = (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT;
+		slot->undo_segment_id = segment_id;
+		slot->undo_block_no = block_no;
+		slot->undo_xid = (TransactionId)carrier; /* Q-D3b1: carries the MXID */
+		memset(&slot->undo_auth, 0, sizeof(slot->undo_auth));
+
+		/* Publish the request fields before LMS can observe PENDING. */
+		pg_write_barrier();
+		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_PENDING);
+		cr_server_wake_lms();
+		return true;
+	}
+
+	return false; /* all slots busy — fail closed, requester retries/refuses */
+}
+
+/*
+ * lms_undo_fetch_serve — LMS side of one KIND_UNDO_FETCH slot (spec-6.12i).
  *
  *	Samples the live authority triple FIRST, then reads the block: the
  *	watermark is then conservative relative to the shipped content (every
@@ -347,6 +423,10 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
+	/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
+	 * pre-content-read ordering (a stamp landing after the sample only makes
+	 * the content newer than claimed; additive and safe). */
+	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	/* Serve only SELF-owned undo: the owner derives from this node's own
 	 * id, never from the wire (a forged request cannot redirect the read). */
@@ -355,8 +435,140 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 }
 
 /*
- * lms_undo_verdict_serve — serve one KIND_UNDO_VERDICT request (spec-6.12i
- * D-i4 / spec-6.15 D4).
+ * lms_resolve_own_xid_verdict — shared core resolving ONE own xid's terminal
+ * verdict over this node's COMPLETE durable TT + CLOG (spec-6.12i D-i4 /
+ * spec-6.15 D4 / spec-7.1 D1-serve, D3-b).
+ *
+ *	Used by BOTH the single-xid verdict serve and the multi member-verdict
+ *	serve so the terminal decision lives in exactly one place (no fork).  The
+ *	caller must have already gated cluster_xid_is_mine(xid) and co-sampled the
+ *	live authority triple (the coverage claim never exceeds the scanned durable
+ *	state).  Fills *out_verdict + the scn/wrap fields on a proven terminal and
+ *	returns a reason so each caller attributes its OWN census (this core bumps
+ *	NO counter):
+ *	  RESOLVED_SCN        exact COMMITTED match: CLOG must confirm (C1b — the
+ *	                      TT stamp is pre-commit, a stamp without a commit
+ *	                      record is in-doubt).  Acceptance-gate PASS ->
+ *	                      COMMITTED_EXACT{commit_scn, wrap}; a wrap-suspect scn
+ *	                      (spec-7.1a hardening) ships COMMITTED_BELOW_HORIZON{H}
+ *	                      over max(scn, gated-recycle horizon) instead of
+ *	                      refusing (no gated recycle -> refuse, like zero-match).
+ *	  RECYCLED_ZERO_MATCH the slot is provably gone: the spec-3.22 retention
+ *	                      origin legs (a)-(d) + the monotonic max recycle
+ *	                      horizon sampled AFTER the scan, then CLOG decides:
+ *	                        COMMITTED -> COMMITTED_BELOW_HORIZON{H} (recycle was
+ *	                        horizon-gated, so the lost commit_scn is <= H);
+ *	                        explicit ABORTED -> ABORTED; neither -> refuse.
+ *	  XID_MATCH_INVALID_SCN  spec-7.1 D1 serve: our own xid matched but carries
+ *	                      no stamped commit_scn (delayed-cleanout window).  8.A
+ *	                      positive proof only: ONLY an explicit CLOG abort
+ *	                      upgrades to a positive ABORTED (the pure, unit-tested
+ *	                      cluster_cr_server_invalid_scn_verdict); a committed-
+ *	                      but-unstamped / in-flight / 2PC / crashed-without-abort
+ *	                      xid stays fail-closed (we never fabricate a scn).
+ *	  anything else       AMBIGUOUS_WRAP / SCAN_UNAVAILABLE -> refuse.
+ */
+typedef enum LmsOwnXidReason {
+	LMS_OWN_XID_PROVEN = 0,		   /* out_* holds a proven terminal */
+	LMS_OWN_XID_PROVEN_UPGRADE,	   /* proven ABORTED via the invalid_scn CLOG upgrade */
+	LMS_OWN_XID_REFUSE_OTHER,	   /* not-committed / wrap-suspect / retention-fail / ambiguous */
+	LMS_OWN_XID_REFUSE_ZERO_MATCH, /* recycled 0-match with no explicit CLOG terminal */
+	LMS_OWN_XID_REFUSE_INVALID_SCN /* delayed-cleanout, not provably aborted */
+} LmsOwnXidReason;
+
+static LmsOwnXidReason
+lms_resolve_own_xid_verdict(TransactionId xid, uint8 *out_verdict, SCN *out_commit_scn,
+							SCN *out_horizon_scn, uint16 *out_wrap)
+{
+	SCN scn = InvalidScn;
+	SCN horizon = InvalidScn;
+	uint16 wrap = 0;
+
+	*out_verdict = 0;
+	*out_commit_scn = InvalidScn;
+	*out_horizon_scn = InvalidScn;
+	*out_wrap = 0;
+
+	switch (
+		cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn, NULL, NULL, &wrap)) {
+	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
+		if (!TransactionIdDidCommit(xid))
+			return LMS_OWN_XID_REFUSE_OTHER; /* C1b: stamped-then-crashed is in-doubt */
+		if (cluster_cr_accept_resolved_scn(scn)) {
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+			*out_commit_scn = scn;
+			*out_wrap = wrap;
+			return LMS_OWN_XID_PROVEN;
+		}
+
+		/*
+		 * PGRAC: spec-7.1a hardening -- wrap-suspect stamped scn (below the
+		 * retention horizon), reached routinely now that the requester
+		 * finalizes EVERY shipped COMMITTED stamp here instead of concluding
+		 * on the fetch fast leg.  The EXACT value cannot be shipped (a
+		 * same-valued xid recurrence across TT wrap could own a different
+		 * scn), but "committed at/below a FROZEN bound" still can:
+		 *   - a LIVE recurrence would be a second by-value match ->
+		 *     AMBIGUOUS_WRAP (refused below), so the single live match has
+		 *     no live rival;
+		 *   - a RECYCLED recurrence's lost scn is at/below the max gated-
+		 *     recycle horizon (the zero-match arm's own bound);
+		 *   - this slot's own stamped scn bounds itself.
+		 * Ship BELOW_HORIZON over the max of both candidates -- the same
+		 * frozen, non-clock-chasing consumer contract as the zero-match arm
+		 * (never cached; judged against the requester's read_scn, leg (e)).
+		 * No gated recycle this incarnation -> the recycled-recurrence
+		 * candidate is unboundable -> refuse, exactly like zero-match.
+		 * Absorbed into the shared core (spec-7.1 D3-b integration) so BOTH
+		 * the single-xid serve and each multi member-verdict resolve through
+		 * exactly this bound -- no serve forks on the wrap-suspect leg.
+		 */
+		if (!cluster_cr_retention_proof_origin_legs(&horizon))
+			return LMS_OWN_XID_REFUSE_OTHER;
+		horizon = cluster_tt_slot_max_recycle_horizon();
+		if (!SCN_VALID(horizon))
+			return LMS_OWN_XID_REFUSE_OTHER;
+		if (scn_time_cmp(scn, horizon) > 0)
+			horizon = scn;
+		*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+		*out_horizon_scn = horizon;
+		return LMS_OWN_XID_PROVEN;
+
+	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
+		if (!cluster_cr_retention_proof_origin_legs(&horizon))
+			return LMS_OWN_XID_REFUSE_OTHER;
+		horizon = cluster_tt_slot_max_recycle_horizon();
+		if (!SCN_VALID(horizon))
+			return LMS_OWN_XID_REFUSE_OTHER;
+		if (TransactionIdDidCommit(xid)) {
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+			*out_horizon_scn = horizon;
+			return LMS_OWN_XID_PROVEN;
+		}
+		if (TransactionIdDidAbort(xid)) {
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+			return LMS_OWN_XID_PROVEN;
+		}
+		return LMS_OWN_XID_REFUSE_ZERO_MATCH; /* neither explicit CLOG state -> refuse */
+
+	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
+		if (cluster_cr_server_invalid_scn_verdict(TransactionIdDidAbort(xid))
+			== CLUSTER_CR_INVALID_SCN_ABORTED) {
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+			return LMS_OWN_XID_PROVEN_UPGRADE;
+		}
+		return LMS_OWN_XID_REFUSE_INVALID_SCN;
+
+	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
+	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
+	default:
+		return LMS_OWN_XID_REFUSE_OTHER;
+	}
+}
+
+/*
+ * lms_undo_verdict_serve — LMS side of one KIND_UNDO_VERDICT slot
+ * (spec-6.12i D-i4 / spec-6.15 D4).
  *
  *	The complete-scan verdict: the requester's single fetched TT block came
  *	back 0-match, which proves nothing (the xid's slot may live in another
@@ -397,87 +609,174 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
  *
  *	true = result_page holds the ClusterGcsUndoVerdictPage and
  *	slot->undo_auth the co-sampled triple; false = refuse (caller ships
- *	DENIED — requester keeps 53R97).  Runs under the serve PG_TRY: a CLOG
+ *	DENIED — requester keeps 53R97).  Runs under the drain's PG_TRY: a CLOG
  *	page truncated under an old xid, an unreadable segment, or any other
- *	throw becomes a refusal, never a worker/LMS exit.
+ *	throw becomes a refusal, never an LMS exit.
  */
 static bool
 lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 {
 	ClusterGcsUndoVerdictPage *v = (ClusterGcsUndoVerdictPage *)slot->result_page;
 	TransactionId xid = slot->undo_xid;
-	SCN scn = InvalidScn;
-	SCN horizon = InvalidScn;
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
-	if (!TransactionIdIsNormal(xid))
+	if (!TransactionIdIsNormal(xid)) {
+		cluster_vis53r97_note_srv_other();
 		return false;
+	}
 
 	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
-	if (!cluster_xid_is_mine(xid))
+	if (!cluster_xid_is_mine(xid)) {
+		cluster_vis53r97_note_srv_other();
 		return false;
+	}
 
 	/* Co-sample the authority triple BEFORE the scan (see banner). */
 	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
 	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
 	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
+	/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
+	 * pre-content-read ordering (a stamp landing after the sample only makes
+	 * the content newer than claimed; additive and safe). */
+	slot->undo_auth.authority_scn = cluster_scn_current();
+
+	/* Resolve the terminal via the shared core; attribute the census leg. */
+	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	case LMS_OWN_XID_PROVEN:
+		break;
+	case LMS_OWN_XID_PROVEN_UPGRADE:
+		cluster_vis53r97_note_live_upgrade_hit(); /* spec-7.1 D1 serve upgrade */
+		break;
+	case LMS_OWN_XID_REFUSE_ZERO_MATCH:
+		cluster_vis53r97_note_srv_zero_match();
+		return false;
+	case LMS_OWN_XID_REFUSE_INVALID_SCN:
+		cluster_vis53r97_note_srv_invalid_scn();
+		return false;
+	case LMS_OWN_XID_REFUSE_OTHER:
+	default:
+		cluster_vis53r97_note_srv_other();
+		return false;
+	}
 
 	memset(slot->result_page, 0, BLCKSZ);
 	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
 	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
 	v->xid_echo = (uint64)xid;
-	v->commit_scn = InvalidScn;
-	v->horizon_scn = InvalidScn;
+	v->verdict = verdict;
+	v->commit_scn = commit_scn;
+	v->horizon_scn = horizon_scn;
+	v->wrap = wrap;
+	return true;
+}
 
-	switch (
-		cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn, NULL, NULL, &wrap)) {
-	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
-		if (!TransactionIdDidCommit(xid))
-			return false; /* C1b: stamped-then-crashed is in-doubt */
-		if (!cluster_cr_accept_resolved_scn(scn))
-			return false; /* wrap-suspect -> refuse */
-		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
-		v->commit_scn = scn;
-		v->wrap = wrap;
-		return true;
+/*
+ * lms_undo_multi_verdict_serve — LMS side of one KIND_UNDO_MULTI_VERDICT slot
+ * (spec-7.1 D3-b).
+ *
+ *	The requester's member overlay structurally missed a FOREIGN multixact
+ *	xmax (the updater had no compose-time TT binding, IN-12), so THIS node —
+ *	the sole owner of the multi's pg_multixact members — answers over its own
+ *	state:
+ *	  1. serve ONLY multis the stripe derivation proves ours
+ *	     (cluster_mxid_is_mine; underivable / foreign -> refuse, mirroring the
+ *	     single-xid D4 self-check);
+ *	  2. co-sample the live authority triple BEFORE enumerating (same
+ *	     conservative ordering as the single serve);
+ *	  3. GetMultiXactIdMembers over our own pg_multixact; a set < 2 or over the
+ *	     wire capacity is refused (never truncate a member set, 8.A);
+ *	  4. for each UPDATER member (status 4-5) resolve its terminal via the
+ *	     shared lms_resolve_own_xid_verdict; lock-only members (A2) record
+ *	     {xid, status} only.  A member xid that is not provably ours (a foreign
+ *	     xid that locked/updated our row) is not resolvable from our TT/CLOG,
+ *	     so any unprovable UPDATER makes the WHOLE multi UNPROVABLE -> refuse
+ *	     (the requester keeps 53R97; the residue is the feature #119 forward).
+ *
+ *	true = result_page holds a SERVED ClusterGcsUndoMultiVerdictPage; false =
+ *	refuse (caller ships DENIED).  Runs under the drain's PG_TRY: a truncated
+ *	pg_multixact / CLOG page or any throw becomes a refusal, never an LMS exit.
+ */
+static bool
+lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
+{
+	ClusterGcsUndoMultiVerdictPage *v = (ClusterGcsUndoMultiVerdictPage *)slot->result_page;
+	MultiXactId mxid = (MultiXactId)slot->undo_xid; /* Q-D3b1: carrier holds the mxid */
+	MultiXactMember *members = NULL;
+	int nmembers;
+	int i;
 
-	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
-		/*
-		 * Origin legs AFTER the complete scan (ordering contract).  The
-		 * SHIPPED bound is NOT the live horizon (its no-reader fallback is
-		 * the current SCN clock, which Lamport-chases the observing
-		 * requester forever — leg (e) would never converge) but the
-		 * monotonic max gate horizon over the recycles that actually
-		 * happened: the asked-for xid's slot was one of them, so its lost
-		 * commit_scn is at/below that max; and the max freezes between
-		 * recycles, so the requester's observe catches up.  InvalidScn
-		 * (no gated recycle this incarnation — e.g. all recycles predate a
-		 * restart) refuses fail-closed.
-		 */
-		if (!cluster_cr_retention_proof_origin_legs(&horizon))
-			return false;
-		horizon = cluster_tt_slot_max_recycle_horizon();
-		if (!SCN_VALID(horizon))
-			return false;
-		if (TransactionIdDidCommit(xid)) {
-			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
-			v->horizon_scn = horizon;
-			return true;
-		}
-		if (TransactionIdDidAbort(xid)) {
-			v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
-			return true;
-		}
-		return false; /* neither explicit CLOG state -> refuse */
-
-	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
-	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
-	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
-	default:
+	if (!cluster_crossnode_runtime_visibility)
 		return false;
+	if (!MultiXactIdIsValid(mxid))
+		return false;
+	/* spec-7.1 D3-b: only answer for provably-own multis (see banner). */
+	if (!cluster_mxid_is_mine(mxid))
+		return false;
+
+	/* Co-sample the authority triple BEFORE enumerating the members. */
+	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
+	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
+	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
+	slot->undo_auth.authority_scn = cluster_scn_current();
+
+	nmembers = GetMultiXactIdMembers(mxid, &members, false, false);
+	if (nmembers < 2 || members == NULL) {
+		if (members != NULL)
+			pfree(members);
+		return false; /* < 2 members: not a real multi / unreadable set */
 	}
+	if (nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS) {
+		pfree(members);
+		return false; /* over wire capacity -> refuse (never truncate) */
+	}
+
+	memset(slot->result_page, 0, BLCKSZ);
+	v->magic = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION;
+	v->mxid_echo = (uint64)mxid;
+	v->nmembers = (uint16)nmembers;
+
+	for (i = 0; i < nmembers; i++) {
+		ClusterGcsUndoMultiVerdictMember *out = &v->members[i];
+		TransactionId member_xid = members[i].xid;
+		uint8 status = (uint8)members[i].status;
+
+		out->xid = member_xid;
+		out->member_status = status;
+
+		/* Lock-only members never gate visibility (A2): {xid, status} only —
+		 * no terminal needed even for a foreign lock-only member. */
+		if (status <= (uint8)MultiXactStatusForUpdate)
+			continue;
+
+		/* Updater member (4-5): its terminal decides tuple visibility, so it
+		 * must be provably ours.  A foreign / underivable updater xid or an
+		 * unprovable terminal makes the WHOLE multi UNPROVABLE (8.A). */
+		if (!TransactionIdIsNormal(member_xid) || !cluster_xid_is_mine(member_xid)) {
+			pfree(members);
+			return false;
+		}
+		switch (lms_resolve_own_xid_verdict(member_xid, &out->verdict, &out->commit_scn,
+											&out->horizon_scn, &out->wrap)) {
+		case LMS_OWN_XID_PROVEN:
+			break;
+		case LMS_OWN_XID_PROVEN_UPGRADE:
+			cluster_vis53r97_note_live_upgrade_hit(); /* spec-7.1 D1 serve upgrade (multi member) */
+			break;
+		default:
+			pfree(members);
+			return false; /* an unprovable updater -> whole multi UNPROVABLE */
+		}
+	}
+
+	pfree(members);
+	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
+	return true;
 }
 
 /*
@@ -506,15 +805,46 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 	 * verdicts alike.
 	 */
 	if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_FETCH
-		|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT) {
-		bool is_verdict = (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
+		|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT
+		|| slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT) {
 		bool served = false;
+		uint8 result_status;
+		ClusterCrServerStat served_stat;
+		ClusterCrServerStat denied_stat;
+
+		switch (slot->req_kind) {
+		case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED;
+			break;
+		case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_VERDICT_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_VERDICT_DENIED;
+			break;
+		default: /* CLUSTER_LMS_SLOT_KIND_UNDO_FETCH */
+			result_status = (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
+			served_stat = CLUSTER_CR_SERVER_STAT_UNDO_SERVED;
+			denied_stat = CLUSTER_CR_SERVER_STAT_UNDO_DENIED;
+			break;
+		}
 
 		CLUSTER_INJECTION_POINT("cluster-lms-undo-fetch");
 		if (!cluster_injection_should_skip("cluster-lms-undo-fetch")) {
 			PG_TRY();
 			{
-				served = is_verdict ? lms_undo_verdict_serve(slot) : lms_undo_fetch_serve(slot);
+				switch (slot->req_kind) {
+				case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+					served = lms_undo_multi_verdict_serve(slot);
+					break;
+				case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
+					served = lms_undo_verdict_serve(slot);
+					break;
+				default:
+					served = lms_undo_fetch_serve(slot);
+					break;
+				}
 			}
 			PG_CATCH();
 			{
@@ -527,13 +857,10 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 		}
 
 		if (served) {
-			slot->result_status = (uint8)(is_verdict ? GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
-													 : GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT);
-			cluster_cr_server_stat_bump(is_verdict ? CLUSTER_CR_SERVER_STAT_VERDICT_SERVED
-												   : CLUSTER_CR_SERVER_STAT_UNDO_SERVED);
+			slot->result_status = result_status;
+			cluster_cr_server_stat_bump(served_stat);
 		} else {
-			cluster_cr_server_stat_bump(is_verdict ? CLUSTER_CR_SERVER_STAT_VERDICT_DENIED
-												   : CLUSTER_CR_SERVER_STAT_UNDO_DENIED);
+			cluster_cr_server_stat_bump(denied_stat);
 		}
 		return;
 	}
@@ -600,8 +927,7 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 
 	/* spec-6.12i: a served undo-TT fetch / undo verdict appends the authority
 	 * trailer (tt_generation); DENIED undo replies stay v1-sized. */
-	if (slot->result_status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
-		|| slot->result_status == (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT)
+	if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)slot->result_status))
 		total += (uint32)sizeof(ClusterGcsUndoAuthTrailer);
 	buf = (char *)palloc0(total);
 	hdr = (GcsBlockReplyHeader *)buf;
@@ -617,8 +943,7 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 	if (hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
 		|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL)
 		memcpy(buf + header_len, slot->result_page, BLCKSZ);
-	else if (hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
-			 || hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT) {
+	else if (GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)hdr->status)) {
 		ClusterGcsUndoAuthTrailer *trailer
 			= (ClusterGcsUndoAuthTrailer *)(buf + header_len + GCS_BLOCK_DATA_SIZE);
 
@@ -633,6 +958,7 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 		hdr->page_lsn = slot->undo_auth.live_hwm_lsn;
 		memcpy(buf + header_len, slot->result_page, BLCKSZ);
 		ClusterGcsUndoAuthTrailerSetTtGeneration(trailer, slot->undo_auth.tt_generation);
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(trailer, (uint64)slot->undo_auth.authority_scn);
 	}
 	hdr->checksum = cluster_gcs_block_compute_checksum(buf + header_len);
 
