@@ -12,7 +12,7 @@
  *	  Header-only — no linking of cluster_gcs_block_dedup.o.  The behavioral
  *	  reclaim path (cap-full -> reclaim -> register, evict_count accounting,
  *	  retransmit-dedup correctness under drop-reply injection) lives in
- *	  cluster_tap t/NNN_gcs_block_dedup_capacity.pl, which exercises a real
+ *	  cluster_tap t/366_gcs_block_dedup_capacity_2node.pl, which exercises a real
  *	  2-node ClusterPair.
  *
  *	  Tests in this binary:
@@ -79,7 +79,7 @@ make_completed_entry(GcsBlockReplyStatus status, TimestampTz now, int64 age_us)
 	GcsBlockDedupEntry e;
 
 	memset(&e, 0, sizeof(e));
-	e.status = (uint8) status;
+	e.status = (uint8)status;
 	e.registered_at_ts = now - age_us - 1;
 	e.completed_at_ts = now - age_us;
 	return e;
@@ -94,7 +94,7 @@ UT_TEST(test_r1_whitelist_empty_all_statuses_in_window_unsafe)
 	/* Every reply status in the enum range must be fail-closed UNSAFE for
 	 * in-window reclaim until its install sites are proven idempotent. */
 	for (s = GCS_BLOCK_REPLY_GRANTED; s <= GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT; s++)
-		UT_ASSERT_EQ(false, GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus) s));
+		UT_ASSERT_EQ(false, GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus)s));
 }
 
 UT_TEST(test_r2_payload_granted_never_in_window)
@@ -144,7 +144,7 @@ UT_TEST(test_r8_in_flight_entry_never_reclaim_safe)
 	TimestampTz now = 1000000;
 
 	memset(&e, 0, sizeof(e));
-	e.status = (uint8) GCS_BLOCK_REPLY_GRANTED;
+	e.status = (uint8)GCS_BLOCK_REPLY_GRANTED;
 	e.registered_at_ts = now - 5000;
 	e.completed_at_ts = 0; /* in-flight: original request still processing */
 
@@ -156,8 +156,8 @@ UT_TEST(test_r9_aged_out_safe_for_every_status)
 	TimestampTz now = 1000000;
 	int64 window = 1000;
 	GcsBlockDedupEntry granted = make_completed_entry(GCS_BLOCK_REPLY_GRANTED, now, 2000);
-	GcsBlockDedupEntry sfb =
-		make_completed_entry(GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, now, 2000);
+	GcsBlockDedupEntry sfb
+		= make_completed_entry(GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, now, 2000);
 	GcsBlockDedupEntry lost = make_completed_entry(GCS_BLOCK_REPLY_DENIED_LOST_WRITE, now, 2000);
 
 	/* age 2000us > window 1000us: out-of-window, safe for ALL (2x theorem). */
@@ -194,11 +194,10 @@ UT_TEST(test_r12_in_window_verdict_tracks_whitelist)
 
 	/* In-window (age 100 << window): verdict must equal the whitelist for
 	 * every status.  Whitelist is empty -> all in-window verdicts false. */
-	for (s = GCS_BLOCK_REPLY_GRANTED; s <= GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT; s++)
-	{
-		GcsBlockDedupEntry e = make_completed_entry((GcsBlockReplyStatus) s, now, 100);
+	for (s = GCS_BLOCK_REPLY_GRANTED; s <= GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT; s++) {
+		GcsBlockDedupEntry e = make_completed_entry((GcsBlockReplyStatus)s, now, 100);
 
-		UT_ASSERT_EQ(GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus) s),
+		UT_ASSERT_EQ(GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus)s),
 					 GcsBlockDedupEntryIsReclaimSafe(&e, now, window));
 	}
 }

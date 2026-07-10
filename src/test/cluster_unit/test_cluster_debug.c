@@ -1114,6 +1114,23 @@ cluster_gcs_get_block_dedup_full_count(void)
 {
 	return 0;
 }
+
+/* spec-7.2a D5 stubs: 3 NEW dedup capacity/occupancy accessors. */
+uint64
+cluster_gcs_get_block_dedup_entry_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_evict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_max_entries(void)
+{
+	return 0;
+}
 uint64
 cluster_gcs_get_block_epoch_invalidate_wake_count(void)
 {

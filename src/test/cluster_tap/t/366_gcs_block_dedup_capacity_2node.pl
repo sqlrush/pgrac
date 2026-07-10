@@ -1,6 +1,6 @@
 #-------------------------------------------------------------------------
 #
-# 365_gcs_block_dedup_capacity_2node.pl
+# 366_gcs_block_dedup_capacity_2node.pl
 #    spec-7.2a D6 -- GCS block-ship dedup capacity + eager reclaim, exercised
 #    over a genuinely shared catalog so node1 issues real cross-node block
 #    requests against masters that live on node0 (and vice versa).  The dedup
@@ -42,7 +42,7 @@
 # Author: SqlRush <sqlrush@gmail.com>
 #
 # IDENTIFICATION
-#    src/test/cluster_tap/t/365_gcs_block_dedup_capacity_2node.pl
+#    src/test/cluster_tap/t/366_gcs_block_dedup_capacity_2node.pl
 #
 # NOTES
 #    pgrac-original file.
@@ -365,9 +365,6 @@ my ($tok, $truth) = psql_retry($node1,
 ok($tok && defined($truth) && $truth ne '',
 	'L3 captured ground-truth checksum for the target block range');
 
-# Restrict the drop-reply injection to dedup_probe_t's relfilenode so the
-# :skipn:1 countdown is spent on the test's own block ship, not on an unrelated
-# catalog/internal ship (spec-7.2a test-only GUC).
 # 8.A correctness leg.  shared_catalog remaps the catalog-visible relfilenode
 # (pg_class) to a different physical relNumber on the ship path, so a catalog
 # lookup cannot name the shipped block;  we drop the first cross-node reply of

@@ -192,11 +192,11 @@ jobs:
           - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
           # t/365 spec-7.1a cross-instance write-write MVCC coordination.
           - { name: stage7-write-write, ranges: "365-365", unit: false, regress: false }
-          # t/365 spec-7.2a GCS block dedup capacity + eager reclaim.  Own shard:
+          # t/366 spec-7.2a GCS block dedup capacity + eager reclaim.  Own shard:
           # 2-node shared_catalog bring-up + cross-node distinct-read dedup
           # pressure + injected retransmit-dedup correctness needs the wall
           # clock.  (t/364 reserved by the parallel spec-7.3 LMS-pool lane.)
-          - { name: stage7-gcs-dedup-capacity, ranges: "365-365", unit: false, regress: false }
+          - { name: stage7-gcs-dedup-capacity, ranges: "366-366", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
