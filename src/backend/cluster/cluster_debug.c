@@ -133,18 +133,19 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_xid_authority.h"	  /* XID authority state (spec-6.15b D7) */
 #include "cluster/cluster_remote_xact.h"	  /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				  /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"			/* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"	/* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"		/* PCM state-machine API + grd helpers */
-#include "cluster/cluster_gcs.h"			/* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"		/* GCS block-ship data plane (spec-2.33 D10) */
-#include "cluster/cluster_sinval.h"			/* SI Broadcaster counter accessors (spec-2.38 D10) */
-#include "cluster/cluster_tt_status.h"		/* TT status overlay counter accessors (spec-3.1 D9) */
-#include "cluster/cluster_tt_status_hint.h" /* TT status hint counter accessors (spec-3.2 D8) */
-#include "cluster/cluster_tx_enqueue.h"		/* TX enqueue wait counters (spec-5.2 D4/D6) */
-#include "cluster/cluster_startup_phase.h"	/* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"			 /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_gcs_block_dedup.h" /* per-worker dedup-shard counters (spec-7.3 D5/D9) */
+#include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
+#include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
+#include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
+#include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -1985,6 +1986,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_collision_count()));
 	emit_row(rsinfo, "gcs", "dedup_full_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_full_count()));
+	/* spec-7.3 D9 (rule 17): the D5 per-worker dedup-shard mis-route
+	 * fail-closed drop counter gets its SQL surface (gcs 85 -> 86). */
+	emit_row(rsinfo, "gcs", "dedup_misroute_failclosed_count",
+			 fmt_int64((int64)cluster_gcs_block_dedup_get_misroute_failclosed_count()));
 	emit_row(rsinfo, "gcs", "epoch_invalidate_wake_count",
 			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
 	emit_row(rsinfo, "gcs", "stale_reply_drop_count",

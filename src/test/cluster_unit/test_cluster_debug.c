@@ -1102,6 +1102,11 @@ cluster_gcs_get_block_dedup_full_count(void)
 	return 0;
 }
 uint64
+cluster_gcs_block_dedup_get_misroute_failclosed_count(void)
+{
+	return 0;
+}
+uint64
 cluster_gcs_get_block_epoch_invalidate_wake_count(void)
 {
 	return 0;
