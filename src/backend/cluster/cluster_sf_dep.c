@@ -179,6 +179,52 @@ cluster_peer_supports_undo_authority_serve(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1) != 0;
 }
 
+/*
+ * cluster_sf_peer_supports_undo_horizon
+ *
+ * spec-5.22e D5-2 capability gate: true iff the peer's verified HELLO on the
+ * CURRENT connection advertised the undo-horizon report protocol bit.  Same
+ * no-local-GUC discipline as the authority-serve query above.  Combined with
+ * the disconnect reset below this is connection-bound (Q1' amend): a closed
+ * or not-yet-HELLOed connection reads as false, so the sender skips the peer
+ * and the fold stalls with NOCAP instead of trusting a stale capability.
+ */
+bool
+cluster_sf_peer_supports_undo_horizon(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = ClusterSfDep->peer_capabilities[peer_id];
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1) != 0;
+}
+
+/*
+ * cluster_sf_note_peer_disconnected
+ *
+ * spec-5.22e D5-2 (Q1' amend): capability state is a property of the
+ * CONNECTION that carried the HELLO, not of the peer's identity.  Called
+ * from the transport close funnel; clears every advertised bit so nothing
+ * consumes a stale capability across a reconnect window.  The next verified
+ * HELLO repopulates.  Clearing is uniformly the conservative direction for
+ * every existing consumer: smart-fusion falls back to v1 replies, the D4
+ * authority leg fails closed, and the D5 horizon sender/fold skip/stall.
+ */
+void
+cluster_sf_note_peer_disconnected(int32 peer_id)
+{
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	ClusterSfDep->peer_capabilities[peer_id] = 0;
+	LWLockRelease(&ClusterSfDep->lock);
+}
+
 void
 cluster_sf_handle_durable_gossip(const ClusterICEnvelope *env, const void *payload)
 {

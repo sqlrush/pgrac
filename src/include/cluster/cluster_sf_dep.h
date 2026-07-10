@@ -146,6 +146,10 @@ extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
  * smart-fusion query above): the bit answers "can that binary parse kind 4";
  * the runtime arm gates live elsewhere. */
 extern bool cluster_peer_supports_undo_authority_serve(int32 peer_id);
+/* spec-5.22e D5-2: undo-horizon report capability (connection-bound; see
+ * cluster_sf_note_peer_disconnected) + the close-funnel reset hook. */
+extern bool cluster_sf_peer_supports_undo_horizon(int32 peer_id);
+extern void cluster_sf_note_peer_disconnected(int32 peer_id);
 extern void cluster_sf_handle_durable_gossip(const ClusterICEnvelope *env, const void *payload);
 
 extern void cluster_sf_note_dep_touched(Buffer buffer);

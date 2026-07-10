@@ -1073,13 +1073,13 @@ UT_TEST(test_cluster_shmem_iter_regions_returns_false_when_uninit)
 UT_TEST(test_cluster_shmem_max_regions_default_value)
 {
 	/*
-	 * The boot-value of cluster.shmem_max_regions is 80 (spec-5.56 raised it
-	 * 64 -> 80 for the per-relation CR generation region; cluster_guc.c static
+	 * The boot-value of cluster.shmem_max_regions is 96 (spec-5.22e raised it
+	 * 80 -> 96 for the undo horizon region + headroom; cluster_guc.c static
 	 * initializer).  Unit test links cluster_guc.o but never calls
 	 * cluster_init_guc, so the C global retains its static-initializer default.
 	 */
 	extern int cluster_shmem_max_regions;
-	UT_ASSERT_EQ(cluster_shmem_max_regions, 80);
+	UT_ASSERT_EQ(cluster_shmem_max_regions, 96);
 }
 
 

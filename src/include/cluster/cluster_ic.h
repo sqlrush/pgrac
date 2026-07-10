@@ -237,6 +237,16 @@ extern const ClusterICOps *ClusterICOps_Active;
  * advertised this bit; without it the authority leg fails closed (the
  * election is NOT re-run against a different node). */
 #define PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 ((uint32)0x00000002U)
+/* PGRAC: spec-5.22e D5-2 — this binary registers PGRAC_IC_MSG_UNDO_HORIZON
+ * and publishes/consumes undo retention horizon reports.  A PROTOCOL
+ * capability, advertised unconditionally.  Send-side hard gate: a report is
+ * only sent to a peer whose CURRENT connection advertised this bit (an old
+ * peer treats the unregistered msg_type as a peer-level failure and closes
+ * the connection).  Fold-side: a required MEMBER peer without this bit
+ * stalls recycling (NOCAP) — never a fallback to local-horizon recycling
+ * (Q3'').  Capability state is connection-bound: cleared on peer close and
+ * only reinstated by the next HELLO (Q1' amend). */
+#define PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 ((uint32)0x00000004U)
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */

@@ -610,6 +610,9 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * understands kind-4 / version-2 regardless of any GUC, so advertise
 	 * unconditionally (the serve side's GUC gate refuses at run time). */
 	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1;
+	/* spec-5.22e D5-2: same protocol-capability discipline for the undo
+	 * horizon report msg_type. */
+	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 }

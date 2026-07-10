@@ -176,7 +176,7 @@ bool cluster_smgr_user_relations = false;
  */
 bool cluster_shared_catalog = false;
 int cluster_oid_lease_size = 8192;
-int cluster_shmem_max_regions = 80; /* spec-5.56: 64 -> 80 (cr relgen region; restore margin) */
+int cluster_shmem_max_regions = 96; /* spec-5.22e: 80 -> 96 (undo horizon region; restore margin); spec-5.56: 64 -> 80 */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
@@ -2167,7 +2167,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 80, CLUSTER_SHMEM_MIN_REGIONS, 256,
+							&cluster_shmem_max_regions, 96, CLUSTER_SHMEM_MIN_REGIONS, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */

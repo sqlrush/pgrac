@@ -382,6 +382,26 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-undo-authority-block0-prove" },
 	/*
+	 * spec-5.22e D5-7 — undo horizon report drop injection (TAP L2).
+	 *
+	 *	cluster-undo-horizon-report-drop:
+	 *	  Fires in the LMON receive handler before validation/publish; SKIP
+	 *	  drops the peer's report so its slot ages into a fold stall
+	 *	  (undo_horizon_stall_count bumps, recycling pauses) and self-heals
+	 *	  once disarmed — pins the stall leg with a counter delta (L408).
+	 */
+	{ .name = "cluster-undo-horizon-report-drop" },
+	/*
+	 * spec-5.22e D5-7 — undo horizon epoch fence injection (TAP L6).
+	 *
+	 *	cluster-undo-horizon-epoch-fence:
+	 *	  Fires in the cleaner pass between the fold and the first recycle
+	 *	  mutation; SKIP simulates a mid-pass reconfig epoch bump so the
+	 *	  fence aborts the pass (undo_horizon_pass_abort_count bumps, zero
+	 *	  recycles this pass) — pins the F-D2 fence with a counter delta.
+	 */
+	{ .name = "cluster-undo-horizon-epoch-fence" },
+	/*
 	 * spec-6.12e2 — holder-side BAST-nudge refusal injection.
 	 *
 	 *	cluster-gcs-block-bast-nudge:

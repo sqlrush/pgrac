@@ -165,4 +165,41 @@ extern ClusterUndoHorizonFoldStatus cluster_undo_horizon_cluster_floor(
 /* Attribution name for LOG-once / dump lines ("nocap", "stale", ...). */
 extern const char *cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStallReason reason);
 
+/*
+ * Wire payload (PGRAC_IC_MSG_UNDO_HORIZON, D5-2): 20 bytes packed.  The
+ * sender's lmon_main_loop_interval rides along so a slow-tick sender is
+ * not misjudged stale by a fast-tick receiver (freshness window =
+ * FACTOR * max(sender, local)).  The receive handler validates length,
+ * sender, SCN, interval range and same-epoch monotonicity before
+ * publishing (Q5' amend); invalid frames are counted, never published.
+ */
+typedef struct pg_attribute_packed() ClusterUndoHorizonWire {
+	uint64 epoch;			   /* sender's reconfig epoch at sampling */
+	uint64 horizon_scn;		   /* S2.1 sampling rule output */
+	uint32 sender_interval_ms; /* validated to [MIN,MAX] */
+} ClusterUndoHorizonWire;
+
+/* ---- heavy path (cluster_undo_horizon_ic.c; LMON + cleaner) --------- */
+
+extern void cluster_undo_horizon_shmem_register(void);
+extern void cluster_undo_horizon_register_ic_msg_types(void);
+extern void cluster_undo_horizon_lmon_tick(void);
+
+extern int cluster_undo_horizon_sample_views(ClusterUndoHorizonReportView *views, int maxviews);
+extern bool cluster_undo_horizon_required_members(uint8 *required, uint64 *out_epoch);
+
+/* observability (D5-5) */
+extern void cluster_undo_horizon_note_stall(void);
+extern uint64 cluster_undo_horizon_stall_count(void);
+extern void cluster_undo_horizon_note_peer_stale(void);
+extern uint64 cluster_undo_horizon_peer_stale_count(void);
+extern void cluster_undo_horizon_note_pass_abort(void);
+extern uint64 cluster_undo_horizon_pass_abort_count(void);
+extern void cluster_undo_horizon_note_wire_reject(void);
+extern uint64 cluster_undo_horizon_wire_reject_count(void);
+extern void cluster_undo_horizon_note_admission_refuse(void);
+extern uint64 cluster_undo_horizon_admission_refuse_count(void);
+extern void cluster_undo_horizon_note_floor(SCN scn);
+extern SCN cluster_undo_horizon_last_floor(void);
+
 #endif /* CLUSTER_UNDO_HORIZON_H */

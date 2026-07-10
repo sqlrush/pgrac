@@ -241,9 +241,13 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_BACKUP_ACK = 34,			/* PGRAC: spec-6.5 D1/D4 — peer -> backup
 			   * coordinator (ClusterBackupWireAck): local thread REDO/checkpoint/stop-cut
 			   * metadata or fail-closed NAK reason. */
-	PGRAC_IC_MSG_SMART_FUSION_DURABLE = 35	/* PGRAC: spec-6.2 D8 — origin durable-LSN
+	PGRAC_IC_MSG_SMART_FUSION_DURABLE = 35, /* PGRAC: spec-6.2 D8 — origin durable-LSN
 			   * gossip for Smart Fusion dependency release. */
-	/* values 36..255 available for future sub-spec; never reuse 0..35 */
+	PGRAC_IC_MSG_UNDO_HORIZON = 36	/* PGRAC: spec-5.22e D5-2 — per-peer undo
+			   * retention horizon report (LMON-only producer; p2p, never
+			   * broadcast; capability-gated on UNDO_HORIZON_V1 so an old
+			   * peer never sees an unregistered msg_type). */
+	/* values 37..255 available for future sub-spec; never reuse 0..36 */
 } ClusterICMsgType;
 
 

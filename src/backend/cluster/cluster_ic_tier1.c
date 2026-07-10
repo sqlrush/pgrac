@@ -1837,6 +1837,15 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		tier1_peer_fds[peer_id] = -1;
 	}
 
+	/*
+	 * spec-5.22e D5-2 (Q1' amend): HELLO capabilities are a property of the
+	 * connection that carried them.  Clear them in the close funnel so no
+	 * consumer (horizon sender/fold, authority routing, smart fusion) trusts
+	 * a stale capability across the reconnect window; the next verified
+	 * HELLO repopulates.
+	 */
+	cluster_sf_note_peer_disconnected(peer_id);
+
 	if (Tier1Shmem != NULL) {
 		if (reason != NULL && reason[0] != '\0')
 			peer_record_error(peer_id, 0, "08006", "%s", reason);

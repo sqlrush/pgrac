@@ -190,6 +190,7 @@ OBJS = \
 	cluster_undo_gcs_grant.o \
 	cluster_undo_gcs_stat.o \
 	cluster_undo_horizon.o \
+	cluster_undo_horizon_ic.o \
 	cluster_undo_retention.o \
 	cluster_undo_srf.o \
 	cluster_cr.o \
