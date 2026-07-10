@@ -942,6 +942,7 @@ dump_xid_stripe(ReturnSetInfo *rsinfo)
 			 fmt_uint64_hex((uint64)obs.replay_active_bitmap));
 	emit_row(rsinfo, "xid_stripe", "mxid_stripe_activated_floor",
 			 fmt_int64((int64)obs.activated_mxid_floor));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_disk_state", fmt_int64((int64)obs.mxid_disk_state));
 	emit_row(rsinfo, "xid_stripe", "mxid_stripe_halfspace_refusals",
 			 fmt_int64((int64)cluster_multixact_get_mxid_halfspace_refuse_count()));
 	emit_row(rsinfo, "xid_stripe", "mxid_stripe_underivable_reads",

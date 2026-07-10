@@ -324,6 +324,107 @@ UT_TEST(test_runtime_latched_derivation)
 	cluster_node_id = -1;
 }
 
+/* ----------
+ * cross-copy "PGXM" evidence resolve (spec-7.1 integration review P0)
+ * ----------
+ */
+
+static ClusterMxidFloorEvidence
+mk_ev(uint64 generation, ClusterMxidExtReadClass cls, uint32 floor)
+{
+	ClusterMxidFloorEvidence ev;
+
+	ev.generation = generation;
+	ev.ext_class = (uint8)cls;
+	ev.floor = floor;
+	return ev;
+}
+
+UT_TEST(test_resolve_floor_truth_table)
+{
+	ClusterMxidFloorEvidence ev[4];
+	uint32 floor = 99;
+
+	/* no evidence at all -> ABSENT, floor cleared */
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(NULL, 0, &floor) == CLUSTER_MXID_FLOOR_ABSENT);
+	UT_ASSERT(floor == 0);
+
+	/* all copies absent -> ABSENT (pre-activation, dense is consistent) */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_ABSENT, 0);
+	ev[1] = mk_ev(1, CLUSTER_MXID_EXT_ABSENT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_ABSENT);
+
+	/* single valid copy -> VALID, floor adopted */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 4096);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 1, &floor) == CLUSTER_MXID_FLOOR_VALID);
+	UT_ASSERT(floor == 4096);
+
+	/* valid + same-generation CORRUPT sibling -> VALID (torn-copy repair) */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 4096);
+	ev[1] = mk_ev(1, CLUSTER_MXID_EXT_CORRUPT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_VALID);
+	UT_ASSERT(floor == 4096);
+
+	/* valid + same-generation ABSENT sibling -> VALID (evidence travels) */
+	ev[1] = mk_ev(1, CLUSTER_MXID_EXT_ABSENT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_VALID);
+
+	/* two VALID with different floors (same gen) -> POISONED */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 4096);
+	ev[1] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 8192);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+	UT_ASSERT(floor == 0);
+
+	/* two VALID with different floors (cross gen) -> POISONED (floor is
+	 * written once with the seed; two coherent records disagreeing is
+	 * damage/aliasing, never a torn write) */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 4096);
+	ev[1] = mk_ev(2, CLUSTER_MXID_EXT_VALID, 8192);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+
+	/* older-gen VALID but newest gen lost the extension -> POISONED
+	 * (activation must never regress to absent/dense) */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_VALID, 4096);
+	ev[1] = mk_ev(2, CLUSTER_MXID_EXT_ABSENT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+	ev[1] = mk_ev(2, CLUSTER_MXID_EXT_CORRUPT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+
+	/* CORRUPT with no valid anywhere -> POISONED ("never activated" is
+	 * unprovable under the damage) */
+	ev[0] = mk_ev(1, CLUSTER_MXID_EXT_CORRUPT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 1, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+	ev[1] = mk_ev(1, CLUSTER_MXID_EXT_ABSENT, 0);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_POISONED);
+
+	/* same floor on both copies -> VALID (the ONLY multi-valid accept) */
+	ev[0] = mk_ev(3, CLUSTER_MXID_EXT_VALID, 4096);
+	ev[1] = mk_ev(3, CLUSTER_MXID_EXT_VALID, 4096);
+	UT_ASSERT(cluster_mxid_stripe_resolve_floor(ev, 2, &floor) == CLUSTER_MXID_FLOOR_VALID);
+	UT_ASSERT(floor == 4096);
+}
+
+/* NOTE: poison is sticky for the process — keep this the LAST runtime
+ * test (there is deliberately no un-poison API). */
+UT_TEST(test_runtime_poisoned_dominates)
+{
+	UT_ASSERT(!cluster_mxid_stripe_poisoned());
+
+	cluster_mxid_stripe_latch_poisoned();
+
+	UT_ASSERT(cluster_mxid_stripe_poisoned());
+	UT_ASSERT(cluster_mxid_origin_slot(5000) == -1);
+	UT_ASSERT(!cluster_mxid_is_mine(5000));
+	UT_ASSERT(cluster_mxid_allocation_slot() == -1);
+	UT_ASSERT(cluster_mxid_stripe_floor() == InvalidMultiXactId);
+
+	/* a later active latch must NOT override poison (sticky) */
+	cluster_mxid_stripe_latch_runtime(true, 3, 4096);
+	UT_ASSERT(cluster_mxid_stripe_poisoned());
+	UT_ASSERT(cluster_mxid_origin_slot(4096 + 16 * 4 + 3) == -1);
+	UT_ASSERT(cluster_mxid_allocation_slot() == -1);
+}
+
 
 /* ----------
  * durable "PGXM" activation-slot extension record
@@ -424,6 +525,9 @@ main(void)
 	UT_RUN(test_runtime_inactive_fail_closed);
 	UT_RUN(test_runtime_latch_defensive);
 	UT_RUN(test_runtime_latched_derivation);
+
+	UT_RUN(test_resolve_floor_truth_table);
+	UT_RUN(test_runtime_poisoned_dominates);
 
 	UT_RUN(test_ext_record_roundtrip_valid);
 	UT_RUN(test_ext_record_absent_all_zeros);

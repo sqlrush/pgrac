@@ -49,11 +49,12 @@
  */
 typedef struct ClusterMxidStripeRuntime {
 	bool active;
+	bool poisoned; /* POISONED disk state latched: sticky, dominates active */
 	int my_slot;
 	MultiXactId floor_mxid;
 } ClusterMxidStripeRuntime;
 
-static ClusterMxidStripeRuntime mxid_stripe_runtime = { false, -1, InvalidMultiXactId };
+static ClusterMxidStripeRuntime mxid_stripe_runtime = { false, false, -1, InvalidMultiXactId };
 
 /*
  * Derive the origin slot of mxid against the mxid activation floor, or
@@ -198,10 +199,127 @@ cluster_mxid_stripe_latch_runtime(bool active, int my_slot, MultiXactId floor_mx
 {
 	if (active && (my_slot < 0 || my_slot >= CLUSTER_MXID_STRIDE || floor_mxid < FirstMultiXactId))
 		active = false;
+	/* A poisoned runtime never activates (sticky; see header). */
+	if (mxid_stripe_runtime.poisoned)
+		active = false;
 
 	mxid_stripe_runtime.active = active;
 	mxid_stripe_runtime.my_slot = active ? my_slot : -1;
 	mxid_stripe_runtime.floor_mxid = active ? floor_mxid : InvalidMultiXactId;
+}
+
+/*
+ * Latch the poisoned mxid stripe runtime (spec-7.1 integration review,
+ * P0).  Sticky for the life of the process: derivation stays
+ * underivable (foreign reads keep their 53R9C fail-closed boundary)
+ * and the allocation gate below refuses instead of degrading to the
+ * vanilla dense allocator.
+ */
+void
+cluster_mxid_stripe_latch_poisoned(void)
+{
+	mxid_stripe_runtime.poisoned = true;
+	mxid_stripe_runtime.active = false;
+	mxid_stripe_runtime.my_slot = -1;
+	mxid_stripe_runtime.floor_mxid = InvalidMultiXactId;
+}
+
+/*
+ * Runtime poisoned query (allocation-side consumer: GetNewMultiXactId
+ * must refuse rather than allocate dense).  Retries the boot lazy
+ * latch until the runtime settles either active or poisoned, mirroring
+ * cluster_mxid_origin_slot.
+ */
+bool
+cluster_mxid_stripe_poisoned(void)
+{
+	if (!mxid_stripe_runtime.active && !mxid_stripe_runtime.poisoned) {
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_xid_striping)
+			cluster_mxid_stripe_lazy_latch();
+#endif
+	}
+	return mxid_stripe_runtime.poisoned;
+}
+
+/*
+ * cluster_mxid_stripe_resolve_floor — fold per-copy "PGXM" evidence
+ * into one verdict (pure; spec-7.1 integration review, P0).
+ *
+ *	ev[i] describes the extension area of one valid-PGXA activation
+ *	copy: the PGXA generation it rides, its read class, and (when
+ *	VALID) its floor.  Verdict rules, in dominance order:
+ *
+ *	  1. two VALID extensions with different floors    -> POISONED
+ *	     (the floor is written once with the activation seed and never
+ *	     changes; two coherent records disagreeing cannot come from a
+ *	     torn write -- each carries its own CRC).
+ *	  2. a VALID extension exists, but no copy at the NEWEST PGXA
+ *	     generation carries one                        -> POISONED
+ *	     (activation cannot regress to absent: adopting the newest
+ *	     copy's "absent" would silently re-open dense allocation while
+ *	     other nodes stay striped -- the probe-F misattribution class).
+ *	  3. a VALID extension at the newest generation     -> VALID
+ *	     (an ABSENT/CORRUPT sibling copy is torn-write damage the
+ *	     valid CRC'd record repairs, same tolerance as the PGXA face).
+ *	  4. no VALID anywhere but CORRUPT bytes somewhere  -> POISONED
+ *	     ("never activated" is unprovable under the damage; treating
+ *	     it as absent could seed a second, different floor).
+ *	  5. all ABSENT                                     -> ABSENT.
+ */
+ClusterMxidFloorResolve
+cluster_mxid_stripe_resolve_floor(const ClusterMxidFloorEvidence *ev, int n, uint32 *out_floor)
+{
+	uint64 wgen = 0;
+	bool any_valid = false;
+	bool any_corrupt = false;
+	bool valid_at_wgen = false;
+	bool have_floor = false;
+	bool floor_conflict = false;
+	uint32 floor = 0;
+	int i;
+
+	if (out_floor)
+		*out_floor = 0;
+	if (ev == NULL || n <= 0)
+		return CLUSTER_MXID_FLOOR_ABSENT;
+
+	for (i = 0; i < n; i++)
+		if (ev[i].generation > wgen)
+			wgen = ev[i].generation;
+
+	for (i = 0; i < n; i++) {
+		switch (ev[i].ext_class) {
+		case CLUSTER_MXID_EXT_VALID:
+			any_valid = true;
+			if (ev[i].generation == wgen)
+				valid_at_wgen = true;
+			if (!have_floor) {
+				floor = ev[i].floor;
+				have_floor = true;
+			} else if (floor != ev[i].floor)
+				floor_conflict = true;
+			break;
+		case CLUSTER_MXID_EXT_CORRUPT:
+			any_corrupt = true;
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (floor_conflict)
+		return CLUSTER_MXID_FLOOR_POISONED;
+	if (any_valid && !valid_at_wgen)
+		return CLUSTER_MXID_FLOOR_POISONED;
+	if (any_valid) {
+		if (out_floor)
+			*out_floor = floor;
+		return CLUSTER_MXID_FLOOR_VALID;
+	}
+	if (any_corrupt)
+		return CLUSTER_MXID_FLOOR_POISONED;
+	return CLUSTER_MXID_FLOOR_ABSENT;
 }
 
 /* Set rec->crc32c = CRC32C over [magic .. generation]. */

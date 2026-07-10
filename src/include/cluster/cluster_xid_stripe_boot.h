@@ -158,6 +158,7 @@ typedef struct ClusterXidStripeObs {
 	uint64 replay_floor_full;
 	uint32 replay_active_bitmap;
 	uint32 activated_mxid_floor; /* "PGXM" extension floor; 0 = absent (spec-7.1 D3-a) */
+	uint32 mxid_disk_state;		 /* ClusterMxidDiskState (spec-7.1 integration review P0) */
 } ClusterXidStripeObs;
 
 extern void cluster_xid_stripe_observe(ClusterXidStripeObs *obs);

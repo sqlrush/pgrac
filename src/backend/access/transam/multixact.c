@@ -1121,6 +1121,30 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign MultiXactIds during recovery");
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-7.1 integration review (P0) -- a poisoned mxid stripe
+	 * state (conflicting / corrupt "PGXM" activation evidence on the
+	 * voting disks) must REFUSE new multixact allocation instead of
+	 * falling back to the vanilla dense allocator: a dense mxid landing
+	 * at/above another node's latched floor would be misattributed by
+	 * the value-mod-16 origin derivation and answered from the wrong
+	 * node's SLRU (the probe-F silent-wrong class).  Reads are
+	 * unaffected (derivation stays unlatched and fails closed).
+	 */
+	if (cluster_mxid_stripe_poisoned())
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("multixact allocation refused: cluster mxid stripe activation state is "
+						"poisoned"),
+				 errdetail("The \"PGXM\" mxid activation records on the voting disks are "
+						   "conflicting or corrupt, so neither striped nor dense allocation can "
+						   "be proven safe."),
+				 errhint("Repair or re-initialize the cluster voting disks, then restart this "
+						 "node.")));
+#endif
+
 	LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
 
 	/* Handle wraparound of the nextMXact counter */

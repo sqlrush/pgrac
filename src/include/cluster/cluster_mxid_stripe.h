@@ -127,6 +127,70 @@ extern void cluster_mxid_stripe_latch_runtime(bool active, int my_slot, MultiXac
 
 /*
  * ----------------------------------------------------------------
+ * Durable mxid floor evidence resolution (spec-7.1 integration
+ * review, P0).
+ *
+ * The boot scan reads the "PGXM" extension area of every valid-PGXA
+ * activation copy and classifies it: ABSENT (all-zero bytes -- a
+ * pre-extension binary wrote the slot), VALID (magic/version/CRC/floor
+ * all pass), or CORRUPT (non-zero bytes failing validation).  The pure
+ * resolver below folds the per-copy evidence into ONE verdict:
+ *
+ *   ABSENT    no copy anywhere carries a valid extension: the mxid
+ *             face was never activated -- vanilla dense allocation and
+ *             fail-closed foreign reads are consistent cluster-wide.
+ *   VALID     a single coherent floor: adopt it.
+ *   POISONED  the evidence conflicts: two valid extensions disagree on
+ *             the floor, a valid extension exists but the newest-
+ *             generation copy lost it (activation can never regress to
+ *             absent), or damaged bytes leave "never activated"
+ *             unprovable.  The mxid face must FAIL CLOSED: dense
+ *             allocation is forbidden (a dense mxid at/above another
+ *             node's latched floor would be misattributed by the %16
+ *             derivation and served from the wrong origin's SLRU --
+ *             the probe-F silent-wrong class), and derivation stays
+ *             unlatched so foreign reads keep their 53R9C boundary.
+ */
+typedef enum ClusterMxidExtReadClass {
+	CLUSTER_MXID_EXT_ABSENT = 0, /* extension area all zeros */
+	CLUSTER_MXID_EXT_VALID = 1,	 /* record validates; floor usable */
+	CLUSTER_MXID_EXT_CORRUPT = 2 /* non-zero bytes failing validation */
+} ClusterMxidExtReadClass;
+
+typedef struct ClusterMxidFloorEvidence {
+	uint64 generation; /* PGXA generation of the carrying copy */
+	uint8 ext_class;   /* ClusterMxidExtReadClass */
+	uint32 floor;	   /* meaningful only when ext_class == VALID */
+} ClusterMxidFloorEvidence;
+
+typedef enum ClusterMxidFloorResolve {
+	CLUSTER_MXID_FLOOR_ABSENT = 0,
+	CLUSTER_MXID_FLOOR_VALID = 1,
+	CLUSTER_MXID_FLOOR_POISONED = 2
+} ClusterMxidFloorResolve;
+
+/* Published mxid disk-state (StripeBootShmem->mxid_disk_state). */
+typedef enum ClusterMxidDiskState {
+	CLUSTER_MXID_DISK_UNKNOWN = 0,	 /* no scan yet */
+	CLUSTER_MXID_DISK_ABSENT = 1,	 /* scanned; never activated */
+	CLUSTER_MXID_DISK_PUBLISHED = 2, /* floor adopted */
+	CLUSTER_MXID_DISK_POISONED = 3	 /* conflicting/corrupt evidence */
+} ClusterMxidDiskState;
+
+extern ClusterMxidFloorResolve cluster_mxid_stripe_resolve_floor(const ClusterMxidFloorEvidence *ev,
+																 int n, uint32 *out_floor);
+
+/*
+ * Poisoned mxid stripe runtime: latched from the POISONED disk state.
+ * Sticky and dominant -- a poisoned process never latches active, the
+ * allocation gate must refuse (never fall back to vanilla dense), and
+ * derivation stays underivable (foreign reads keep failing closed).
+ */
+extern void cluster_mxid_stripe_latch_poisoned(void);
+extern bool cluster_mxid_stripe_poisoned(void);
+
+/*
+ * ----------------------------------------------------------------
  * Durable mxid activation extension record ("PGXM")
  *
  * Rides the region-6 activation slot (512 bytes, sole writer qvotec)
