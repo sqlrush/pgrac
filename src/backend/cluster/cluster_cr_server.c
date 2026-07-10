@@ -57,12 +57,15 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_gcs_block_dedup.h" /* PGRAC: spec-7.3 P2-1 — note_misroute */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
+#include "cluster/cluster_ic_tier1.h"  /* PGRAC: spec-7.3 P2-1 — my DATA channel */
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
-#include "cluster/cluster_lms.h"  /* PGRAC: spec-7.3 D8 per-worker serve counters */
+#include "cluster/cluster_lmon.h"	   /* PGRAC: spec-7.2 D1 READY-publish wakeup */
+#include "cluster/cluster_lms.h"	   /* PGRAC: spec-7.3 D8 per-worker serve counters */
+#include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -743,6 +746,37 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	if (fwd == NULL)
 		return;
 
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * FORWARD inline-serve entry.  Same invariant as the REQUEST dedup
+	 * guard (cluster_gcs_block.c): a block-family frame's tag routes to
+	 * exactly one LMS worker (worker[shard(tag)], D4), and this serve runs
+	 * in the worker whose DATA channel received the envelope.  A mismatch
+	 * is a mis-route (per-tag order break, 8.A) that cannot happen without
+	 * a code bug — fail closed (drop without serving; the requester
+	 * retransmits within its budget and 53R90/53R9G fail-closes) rather
+	 * than serve a tag this worker does not own.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&fwd->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block forward misrouted to LMS worker %d (tag shard "
+										 "%d); dropping (spec-7.3 P2-1 8.A fail-closed)",
+										 recv_worker, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	/* Populate the request carrier from the forward payload (was submit). */
 	memset(&slot, 0, sizeof(slot));
 	slot.tag = fwd->tag;
@@ -826,6 +860,29 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	/* A caught construction throw left CurrentMemoryContext at TopMemoryContext;
 	 * normalize back to the scratch context before the reply build. */
 	MemoryContextSwitchTo(cr_serve_scratch_context());
+
+	/*
+	 * PGRAC: spec-7.3 D7 (review P1-1) — re-check the fence at SHIP time.
+	 * The gate above runs BEFORE construction; the serve itself walks undo
+	 * I/O / TT scans (ms-scale), so a qvotec lease that expires DURING the
+	 * serve would otherwise let the just-constructed image / verdict leave
+	 * the now-fenced node — stale bytes the cluster's authoritative state
+	 * has moved past (Rule 8.A).  The park ship path never had this window
+	 * (cluster_lms.c gates cr_ship_ready at ship time, per tick); restore
+	 * that timing here by discarding the constructed result and shipping
+	 * the fail-closed DENIED instead — the requester retransmits within its
+	 * budget and 53R90/53R9G fail-closes if the fence outlasts it.  The
+	 * probe is a pure in-memory time comparison (no I/O on the hot path).
+	 * The injection forces this branch deterministically for the TAP
+	 * TOCTOU leg (a genuine mid-serve lease expiry is not schedulable from
+	 * TAP); same unconditional-consume idiom as the gate above (F6-1).
+	 */
+	CLUSTER_INJECTION_POINT("cluster-lms-cr-fence-recheck");
+	inject_refuse = cluster_injection_should_skip("cluster-lms-cr-fence-recheck");
+	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed()) || inject_refuse) {
+		slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
+	}
 	cr_build_and_send_reply(&slot);
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(CrServeScratchCtx);
