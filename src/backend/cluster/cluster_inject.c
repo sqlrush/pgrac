@@ -68,6 +68,8 @@ typedef struct ClusterInjectPoint {
 	pg_atomic_uint32 armed_type;   /* ClusterInjectFaultType */
 	pg_atomic_uint64 armed_param;  /* sleep us / SKIP cookie */
 	pg_atomic_uint32 skip_pending; /* set by SKIP dispatch, read+reset by probe */
+	pg_atomic_uint32
+		skip_remaining; /* spec-7.2a: :skipn:N countdown (0 = exhausted or not armed) */
 } ClusterInjectPoint;
 
 /*
@@ -728,6 +730,15 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-xid-herding-stall" },
 	{ .name = "cluster-xid-window-hard-limit" },
+
+	/*
+	 * spec-7.1 D3-a — mxid stripe half-space guardrail.
+	 *   cluster-mxid-halfspace-hard-limit: armed-state peek FORCES the
+	 *     53RB4 refusal branch in GetNewMultiXactId (the organic
+	 *     trigger needs 2^31 multixacts; the armed peek lets a test
+	 *     exercise the fail-closed leg + guardrail counter).
+	 */
+	{ .name = "cluster-mxid-halfspace-hard-limit" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)
@@ -764,6 +775,7 @@ cluster_injection_initialise(void)
 		pg_atomic_init_u32(&cluster_injection_points[i].armed_type, CLUSTER_FAULT_NONE);
 		pg_atomic_init_u64(&cluster_injection_points[i].armed_param, 0);
 		pg_atomic_init_u32(&cluster_injection_points[i].skip_pending, 0);
+		pg_atomic_init_u32(&cluster_injection_points[i].skip_remaining, 0);
 	}
 	cluster_injection_initialised = true;
 }
@@ -805,6 +817,8 @@ parse_fault_type(const char *s)
 		return CLUSTER_FAULT_CRASH;
 	if (pg_strcasecmp(s, "skip") == 0)
 		return CLUSTER_FAULT_SKIP;
+	if (pg_strcasecmp(s, "skipn") == 0)
+		return CLUSTER_FAULT_SKIP_N;
 	return CLUSTER_FAULT_NONE; /* unknown -> NONE; caller may warn */
 }
 
@@ -873,6 +887,8 @@ fault_type_name(ClusterInjectFaultType t)
 		return "crash";
 	case CLUSTER_FAULT_SKIP:
 		return "skip";
+	case CLUSTER_FAULT_SKIP_N:
+		return "skipn";
 	}
 	return "unknown";
 }
@@ -895,6 +911,18 @@ cluster_injection_arm_internal(ClusterInjectPoint *p, ClusterInjectFaultType new
 
 	old_type = pg_atomic_exchange_u32(&p->armed_type, new_type);
 	pg_atomic_write_u64(&p->armed_param, (uint64)param);
+
+	/*
+	 * spec-7.2a: SKIP_N is count-based -- it skips exactly `param` times, then
+	 * falls through (dispatch stops setting skip_pending, so the sender's
+	 * retransmit succeeds instead of exhausting its budget).  Reset the
+	 * countdown on every (re-)arm.  Plain SKIP keeps the legacy unlimited
+	 * "skip while armed" behaviour and leaves the countdown at 0.
+	 */
+	if (new_type == CLUSTER_FAULT_SKIP_N && param > 0)
+		pg_atomic_write_u32(&p->skip_remaining, (uint32)param);
+	else
+		pg_atomic_write_u32(&p->skip_remaining, 0);
 
 	if (old_type == CLUSTER_FAULT_NONE && new_type != CLUSTER_FAULT_NONE)
 		cluster_injection_armed_count++;
@@ -991,8 +1019,29 @@ cluster_injection_run(const char *name)
 		break;
 
 	case CLUSTER_FAULT_SKIP:
+		/* Unlimited skip while armed (legacy: param is ignored). */
 		pg_atomic_write_u32(&p->skip_pending, 1);
 		break;
+
+	case CLUSTER_FAULT_SKIP_N: {
+		/*
+		 * spec-7.2a count-based skip: consume one unit of the countdown and
+		 * only arm skip_pending while units remain.  The CAS loop keeps the
+		 * decrement race-free across concurrent dispatchers and never
+		 * underflows past 0 -- once exhausted the point stops skipping so the
+		 * sender's retransmit lands (and hits the dedup cache).
+		 */
+		uint32 expected = pg_atomic_read_u32(&p->skip_remaining);
+
+		while (expected > 0) {
+			if (pg_atomic_compare_exchange_u32(&p->skip_remaining, &expected, expected - 1)) {
+				pg_atomic_write_u32(&p->skip_pending, 1);
+				break;
+			}
+			/* expected reloaded by the failed CAS; retry */
+		}
+		break;
+	}
 	}
 }
 

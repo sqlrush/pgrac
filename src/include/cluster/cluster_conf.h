@@ -190,6 +190,19 @@ extern const ClusterNodeInfo *cluster_conf_lookup_node(int32 node_id);
 extern int cluster_conf_node_count(void);
 
 /*
+ * Pre-shmem topology sniff: count [node.N] section headers straight from
+ * pgrac.conf.  cluster_conf_load() (the real parser, startup SSOT) runs only
+ * after every shmem region is initialised, so size_fn/init_fn-time consumers
+ * that must scale with the declared node count (shared-catalog bootstrap
+ * vetting, spec-7.2a dedup auto-size floor) cannot use
+ * cluster_conf_node_count() and read the file directly instead.  Returns 1
+ * when the file is absent/unreadable (single-node fallback, mirroring the
+ * loader's degraded topology).  Syntax is NOT validated here; the loader
+ * still FATALs later on malformed files.
+ */
+extern int cluster_conf_declared_node_count_early(void);
+
+/*
  * Hot-path peer predicate.  Use this instead of cluster_conf_node_count()
  * in per-tuple / per-transaction gates so single-node fallback avoids an
  * out-of-line function call.  The topology is postmaster-static after

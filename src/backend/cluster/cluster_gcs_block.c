@@ -38,6 +38,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/multixact.h" /* MultiXactIdIsValid (spec-7.1 D3-b fetch) */
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_clean_leave.h" /* spec-5.13 S6 — CL-I5 serve gate */
@@ -123,6 +124,7 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	 * UNDO_TT_FETCH_RESULT reply (epoch / live_hwm ride the header). */
 	bool reply_undo_trailer_valid;
 	uint64 reply_undo_tt_generation;
+	uint64 reply_undo_authority_scn; /* PGRAC: spec-7.1a D3 (trailer SCN) */
 	ConditionVariable reply_cv;
 	/* PGRAC: spec-2.34 D3/D4 — HC100 stale-reply defense + epoch invalidation.
 	 *  request_epoch:        snapshot of cluster_epoch at the time the
@@ -2513,6 +2515,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2572,6 +2575,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 				auth_out->origin_epoch = slot->reply_header.epoch;
 				auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 				auth_out->tt_generation = slot->reply_undo_tt_generation;
+				auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
 				/* spec-5.14 D2: the authority is the origin's volatile
 				 * co-sample — depend on it for fail-stop (D-i3). */
 				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -2648,6 +2652,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2713,8 +2718,180 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 					auth_out->origin_epoch = slot->reply_header.epoch;
 					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 					auth_out->tt_generation = slot->reply_undo_tt_generation;
+					auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
 					/* spec-5.14 D2: the verdict is the origin's volatile
 					 * co-sample — depend on it for fail-stop (D-i3). */
+					gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+					fetched = true;
+				}
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
+}
+
+
+/*
+ * PGRAC: spec-7.1 D3-b — requester-side batched multixact member-verdict fetch.
+ *
+ *	Ask origin_node for a per-member verdict on the foreign multixact `mxid`,
+ *	riding the same sub-case B wire shape as the single verdict fetch.  The
+ *	asked-for MXID rides the widened watermark carrier (upper 32 bits zero);
+ *	the synthetic tag keeps a placeholder segment (0) — the member scan is
+ *	complete over the multi's own pg_multixact, so the tag scopes nothing.
+ *
+ *	true  -> page_out (BLCKSZ) holds the structurally validated SERVED page and
+ *	         *auth_out the co-sampled authority; every member SCN that crossed
+ *	         the wire is Lamport-observed (AD-008) so a below-horizon bound is
+ *	         admissible on the next snapshot.
+ *	false -> fail-closed: timeout, DENIED, checksum failure, missing trailer,
+ *	         non-SERVED status, malformed page (Rule 8.A — the caller keeps its
+ *	         unchanged 53R97 refusal).
+ */
+bool
+cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXactId mxid,
+													char *page_out, ClusterLiveAuthority *auth_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	BufferTag tag;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool fetched = false;
+
+	if (page_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
+		|| !MultiXactIdIsValid(mxid))
+		return false;
+
+	memset(page_out, 0, BLCKSZ);
+	memset(auth_out, 0, sizeof(*auth_out));
+	tag = GcsBlockUndoFetchTagMake(0, 0); /* placeholder segment (scan is complete) */
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->reply_undo_trailer_valid = false;
+		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id;
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetUndoMultiVerdictRequest(&fwd, true);
+		/* The widened mxid rides the watermark carrier (upper 32 bits zero). */
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)(uint64)mxid);
+
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)origin_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue undo-multi-verdict fetch "
+								   "to origin node %d",
+								   (int)origin_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
+			&& slot->reply_undo_trailer_valid) {
+			uint32 expected;
+			uint32 got;
+
+			/*
+			 * PGRAC (spec-7.1 D3-b hardening, Rule 15/16): snapshot the volatile
+			 * reply slot into the caller's STABLE page BEFORE checksum /
+			 * validation / observe.  This consume runs without blk->lock, so a
+			 * spec-2.34 retransmit that overwrites reply_block_data between a
+			 * validate-on-slot and the copy would hand a torn, unvalidated
+			 * nmembers to the variable-length member loop downstream (OOB read).
+			 * Validating the LOCAL copy makes the bytes we act on exactly the
+			 * bytes we prove usable: a torn copy fails the checksum (fail-closed),
+			 * and nmembers is bounded to [2, MAX] before any member is read.  The
+			 * checksum is read block-then-header, so an overwrite that lands mid-
+			 * snapshot fails the compare rather than passing on a mixed pair.
+			 */
+			memcpy(page_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+			expected = slot->reply_header.checksum;
+			got = gcs_block_compute_checksum(page_out);
+
+			if (expected == got) {
+				const ClusterGcsUndoMultiVerdictPage *v
+					= (const ClusterGcsUndoMultiVerdictPage *)page_out;
+
+				if (cluster_vis_undo_multi_verdict_page_usable(v, mxid)) {
+					uint16 i;
+
+					auth_out->origin_epoch = slot->reply_header.epoch;
+					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
+					auth_out->tt_generation = slot->reply_undo_tt_generation;
+					auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
+					cluster_scn_observe(auth_out->authority_scn);
+					/* AD-008: Lamport-observe every member SCN that crossed the
+					 * wire so a below-horizon bound is admissible next snapshot. */
+					for (i = 0; i < v->nmembers; i++) {
+						if (SCN_VALID(v->members[i].commit_scn))
+							cluster_scn_observe((SCN)v->members[i].commit_scn);
+						if (SCN_VALID(v->members[i].horizon_scn))
+							cluster_scn_observe((SCN)v->members[i].horizon_scn);
+					}
+					/* spec-5.14 D2: depend on the origin's volatile co-sample
+					 * for fail-stop (D-i3). */
 					gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 					fetched = true;
 				}
@@ -4511,13 +4688,31 @@ build_and_send_reply: {
 		 * active on that retry).  Useful for driving the
 		 * retransmit_send_count + dedup_hit_count TAP surfaces.
 		 */
-	CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
-	if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
-		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
-		block_payload_release_cb = NULL;
-		block_payload_release_arg = NULL;
-		pfree(buf);
-		return;
+	/*
+	 * spec-7.2a: gate the drop-reply dispatch on the test target relfilenode.
+	 * A :skipn:N count is per-process global; without this gate an unrelated
+	 * (catalog / internal) block ship consumes the countdown before the test's
+	 * user-relation ship reaches the point.  Gating the CLUSTER_INJECTION_POINT
+	 * itself (not just should_skip) ensures only matching ships consume the
+	 * count.  0 (default) keeps the un-targeted behaviour for spec-2.34 tests.
+	 *
+	 * Current TAP coverage uses target=0 only (shared_catalog remaps the
+	 * catalog-visible relfilenode to a different physical relNumber, so SQL
+	 * cannot name the shipped block); the non-zero filter is reserved for
+	 * precise spec-2.34-style targeting on non-shared-catalog rigs and is not
+	 * yet exercised by any test.
+	 */
+	if (cluster_gcs_block_drop_target_relfilenode == 0
+		|| BufTagGetRelNumber(&req->tag)
+			   == (RelFileNumber)cluster_gcs_block_drop_target_relfilenode) {
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
+		if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
+			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
+			block_payload_release_cb = NULL;
+			block_payload_release_arg = NULL;
+			pfree(buf);
+			return;
+		}
 	}
 
 	{
@@ -4914,8 +5109,7 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (env->payload_length == undo_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (h->status != (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
-			&& h->status != (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT)
+		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status))
 			return false;
 		if (out_hdr != NULL)
 			*out_hdr = h;
@@ -5037,6 +5231,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -5057,6 +5252,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_undo_trailer_valid = (undo_trailer != NULL);
 			slot->reply_undo_tt_generation
 				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetTtGeneration(undo_trailer)
+										 : 0;
+			slot->reply_undo_authority_scn
+				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_trailer)
 										 : 0;
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
@@ -5199,6 +5397,22 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		if (cluster_gcs_block_family_on_data_plane())
 			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
 		else if (!cluster_lms_undo_verdict_submit(fwd))
+			gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.1 D3-b — undo-MULTI-verdict request.  Same LMON shape as
+	 * the single verdict branch above (validate + park; the member enumeration
+	 * + per-updater terminal scan runs in LMS, the LMON tick ships).  MUST
+	 * branch here, before any holder / GRD logic: the tag is a synthetic undo
+	 * address and the SCN carrier holds the widened MXID.  A refused park
+	 * (wave GUC off / malformed tag or carrier / no capacity) replies the
+	 * fail-closed DENIED immediately so the requester keeps its unchanged
+	 * 53R97 refusal (Rule 8.A).
+	 */
+	if (GcsBlockForwardPayloadIsUndoMultiVerdictRequest(fwd)) {
+		if (!cluster_lms_undo_multi_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
@@ -6982,6 +7196,31 @@ uint64
 cluster_gcs_get_block_dedup_full_count(void)
 {
 	return cluster_gcs_block_dedup_get_full_count();
+}
+
+/*
+ * spec-7.2a D5:  dedup capacity/occupancy observability wrappers.  The
+ * entry_count wrapper reads the historical _get_in_flight_count accessor,
+ * whose backing counter (entry_count) tracks every live entry (in-flight
+ * slots plus completed cached replies) -- that live total is what dump_gcs
+ * surfaces as dedup_entry_count for the saturation ratio.
+ */
+uint64
+cluster_gcs_get_block_dedup_entry_count(void)
+{
+	return cluster_gcs_block_dedup_get_in_flight_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_evict_count(void)
+{
+	return cluster_gcs_block_dedup_get_evict_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_max_entries(void)
+{
+	return cluster_gcs_block_dedup_get_max_entries();
 }
 
 

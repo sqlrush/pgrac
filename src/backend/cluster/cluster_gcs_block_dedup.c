@@ -48,6 +48,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_conf.h" /* declared_node_count_early (spec-7.2a D4) */
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS */
@@ -77,12 +78,17 @@ typedef struct ClusterGcsBlockDedupShard {
 	pg_atomic_uint64 miss_count;	  /* MISS_REGISTERED paths */
 	pg_atomic_uint64 collision_count; /* HC91 VALIDATION_FAIL */
 	pg_atomic_uint64 full_count;	  /* HC92 FULL */
+	pg_atomic_uint64 evict_count;	  /* spec-7.2a: eager reclaim + TTL sweep removed */
 	pg_atomic_uint32 entry_count;	  /* live in-flight + completed entries */
 } ClusterGcsBlockDedupShard;
 
 typedef struct ClusterGcsBlockDedupCtl {
 	pg_atomic_uint64 misroute_failclosed_count; /* spec-7.3 D5 — 8.A drops */
 	int n_shards;								/* live shard count fixed at init */
+	int max_entries_effective;					/* spec-7.2a D4: per-shard cap the
+												 * HTABs were sized with (configured
+												 * + auto-size floor); stamped once
+												 * at init, read-only after */
 } ClusterGcsBlockDedupCtl;
 
 static ClusterGcsBlockDedupCtl *cluster_gcs_block_dedup_ctl = NULL;
@@ -90,6 +96,27 @@ static ClusterGcsBlockDedupShard *cluster_gcs_block_dedup_shards = NULL;
 static HTAB *cluster_gcs_block_dedup_htabs[CLUSTER_LMS_MAX_WORKERS];
 static int cluster_gcs_block_dedup_n_shards = 0;
 static bool dedup_backend_exit_hook_registered = false;
+
+/*
+ * Upper bound on entries examined per cap-full eager-reclaim probe.  We do
+ * NOT full-scan the HTAB under the exclusive lock on every cap-full MISS
+ * (spec-7.2a §6 "no full scan"): if no reclaim-safe entry is found within the
+ * probe budget, fall back to the fail-closed HC92 path.
+ */
+#define GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE 256
+
+/*
+ * spec-7.2a D5:  emit a saturation LOG only after this many additional
+ * DENIED_DEDUP_FULL events accrue since the last report, so a persistently
+ * full table logs at most once per this many drops (rule 17: no hot-path
+ * flood).  The LMON TTL sweep is the sole evaluation site.
+ */
+#define GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD 64
+
+/* Forward declarations for GC helpers used by the MISS-path eager reclaim. */
+static int64 dedup_expiry_threshold_us(void);
+static int dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab,
+											TimestampTz now, int want);
 
 
 static int
@@ -104,7 +131,35 @@ cluster_gcs_block_dedup_effective_entries(void)
 	if (!cluster_enabled || cluster_node_id < 0)
 		return 0;
 
-	return cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+	{
+		int configured
+			= cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+		int64 auto_floor;
+
+		/*
+		 * spec-7.2a D4 (Q4) auto-size lower bound: every connected backend on
+		 * every declared node can hold one block request in flight against
+		 * this master, so a configured cap below MaxConnections × node_count
+		 * is guaranteed to saturate under distinct-read pressure.  Raise such
+		 * configs to that floor, clamped at the GUC ceiling — auto-sizing
+		 * widens a foot-gun config, it never grows shmem past what the DBA
+		 * could configure by hand.  The node count comes from the pre-shmem
+		 * conf sniff (cluster_conf_load() runs only after every region is
+		 * initialised, so cluster_conf_node_count() is still 0 when
+		 * size_fn/init_fn call here); with no readable pgrac.conf the sniff
+		 * reports 1 and the floor degenerates to MaxConnections.  The floor
+		 * applies PER SHARD (spec-7.3 D5): tags route to exactly one worker's
+		 * shard, so a single hot shard must alone absorb the floor's
+		 * worst-case in-flight population.
+		 */
+		auto_floor = (int64)MaxConnections * cluster_conf_declared_node_count_early();
+		if (auto_floor > CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING)
+			auto_floor = CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING;
+		if (configured < (int)auto_floor)
+			configured = (int)auto_floor;
+
+		return configured;
+	}
 }
 
 /*
@@ -186,6 +241,10 @@ cluster_gcs_block_dedup_shmem_init(void)
 	if (!found) {
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_ctl->misroute_failclosed_count, 0);
 		cluster_gcs_block_dedup_ctl->n_shards = n;
+		/* spec-7.2a D4: stamp the per-shard cap the HTABs below are sized
+		 * with, so the observability accessor reports the capacity actually
+		 * in force (identical in every process, EXEC_BACKEND included). */
+		cluster_gcs_block_dedup_ctl->max_entries_effective = cap;
 
 		for (i = 0; i < n; i++) {
 			ClusterGcsBlockDedupShard *shard = &cluster_gcs_block_dedup_shards[i];
@@ -196,6 +255,7 @@ cluster_gcs_block_dedup_shmem_init(void)
 			pg_atomic_init_u64(&shard->miss_count, 0);
 			pg_atomic_init_u64(&shard->collision_count, 0);
 			pg_atomic_init_u64(&shard->full_count, 0);
+			pg_atomic_init_u64(&shard->evict_count, 0);
 			pg_atomic_init_u32(&shard->entry_count, 0);
 		}
 	}
@@ -357,6 +417,16 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	 * with cap reached; convert to FULL fail-closed (HC92). */
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
 	if (entry == NULL) {
+		/* PGRAC: spec-7.2a D1 — before failing closed, try to reclaim one
+		 * reclaim-safe entry (aged past the 2x window, or a site-proven
+		 * idempotent status) to make room.  Reclaim never removes an entry
+		 * whose retransmitted duplicate could still be served incorrectly
+		 * (§3.1); if nothing is safe to reclaim, keep the fail-closed HC92
+		 * behavior below. */
+		if (dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1) > 0)
+			entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
+	}
+	if (entry == NULL) {
 		pg_atomic_fetch_add_u64(&shard->full_count, 1);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_DEDUP_FULL;
@@ -506,6 +576,59 @@ dedup_expiry_threshold_us(void)
 	return total_backoff_ms * 1000 * 2; /* × 2 safety margin (HC93) */
 }
 
+/*
+ * dedup_reclaim_reclaimable_locked -- caller MUST hold this shard's dedup
+ * lock exclusively.  Under cap pressure (HASH_ENTER_NULL about to fail),
+ * scan the shard's HTAB and remove up to `want` reclaim-safe entries so the
+ * MISS path can register instead of failing closed (spec-7.2a D1).
+ *
+ * Only entries GcsBlockDedupEntryIsReclaimSafe() approves are removed: an
+ * entry aged past the 2x out-of-window threshold (safe for every status,
+ * §3.1 theorem) or one whose status is site-proven in-window idempotent
+ * (whitelist currently empty).  Reclaim NEVER removes an entry whose
+ * retransmitted duplicate could be re-served incorrectly — it only ever
+ * brings the FULL path forward in time, never sacrifices correctness.
+ *
+ * The scan is bounded to GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE entries so a
+ * shard full of in-window entries does not turn every MISS into a full
+ * O(cap) scan under the exclusive lock (spec-7.2a §6).  Returns the number
+ * reclaimed.
+ */
+static int
+dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab, TimestampTz now,
+								 int want)
+{
+	HASH_SEQ_STATUS seq;
+	GcsBlockDedupEntry *entry;
+	int64 out_of_window_us;
+	int reclaimed = 0;
+	int probed = 0;
+
+	if (want <= 0)
+		return 0;
+
+	out_of_window_us = dedup_expiry_threshold_us();
+
+	hash_seq_init(&seq, htab);
+	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
+		if (GcsBlockDedupEntryIsReclaimSafe(entry, now, out_of_window_us)) {
+			(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
+			reclaimed++;
+		}
+
+		if (reclaimed >= want || ++probed >= GCS_BLOCK_DEDUP_RECLAIM_MAX_PROBE) {
+			hash_seq_term(&seq); /* early break must terminate the scan */
+			break;
+		}
+	}
+
+	if (reclaimed > 0) {
+		pg_atomic_fetch_sub_u32(&shard->entry_count, (uint32)reclaimed);
+		pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)reclaimed);
+	}
+	return reclaimed;
+}
+
 void
 cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 {
@@ -516,6 +639,32 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		return;
 
 	threshold_us = dedup_expiry_threshold_us();
+
+	/*
+	 * spec-7.2a D5:  saturation LOG-once.  When DENIED_DEDUP_FULL keeps
+	 * growing past a threshold across sweep cycles, emit one LOG so operators
+	 * see sustained dedup saturation without flooding the hot request path
+	 * (rule 17).  Lock-free (atomics only); the LMON sweep is the sole caller
+	 * so the static high-water mark is process-local and race-free.  The
+	 * counters aggregate over every shard (spec-7.3 D5).
+	 */
+	{
+		static uint64 dedup_full_logged_hwm = 0;
+		uint64 cur_full = cluster_gcs_block_dedup_get_full_count();
+
+		if (cur_full - dedup_full_logged_hwm >= GCS_BLOCK_DEDUP_FULL_LOG_THRESHOLD) {
+			elog(LOG,
+				 "GCS block dedup saturating: %llu new DENIED_DEDUP_FULL since last report "
+				 "(per-shard cap=%d, live entries=%llu); raise "
+				 "cluster.gcs_block_dedup_max_entries if sustained",
+				 (unsigned long long)(cur_full - dedup_full_logged_hwm),
+				 cluster_gcs_block_dedup_ctl != NULL
+					 ? cluster_gcs_block_dedup_ctl->max_entries_effective
+					 : 0,
+				 (unsigned long long)cluster_gcs_block_dedup_get_in_flight_count());
+			dedup_full_logged_hwm = cur_full;
+		}
+	}
 
 	for (s = 0; s < cluster_gcs_block_dedup_n_shards; s++) {
 		ClusterGcsBlockDedupShard *shard = &cluster_gcs_block_dedup_shards[s];
@@ -545,8 +694,11 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 			}
 		}
 
-		if (removed > 0)
+		if (removed > 0) {
 			pg_atomic_fetch_sub_u32(&shard->entry_count, (uint32)removed);
+			/* spec-7.2a D5: evict_count aggregates eager reclaim + TTL sweep. */
+			pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)removed);
+		}
 
 		LWLockRelease(&shard->lock.lock);
 	}
@@ -676,6 +828,30 @@ cluster_gcs_block_dedup_get_in_flight_count(void)
 	for (s = 0; s < cluster_gcs_block_dedup_n_shards; s++)
 		total += (uint64)pg_atomic_read_u32(&cluster_gcs_block_dedup_shards[s].entry_count);
 	return total;
+}
+
+uint64
+cluster_gcs_block_dedup_get_evict_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, evict_count));
+}
+
+/*
+ * cluster_gcs_block_dedup_get_max_entries -- effective PER-SHARD dedup
+ * capacity.
+ *
+ *	spec-7.2a D5:  reports the per-shard cap stamped at shmem init (the GUC
+ *	value raised to the D4 auto-size floor — the size each shard HTAB was
+ *	actually built with), or 0 when the HTABs were never allocated
+ *	(initdb/bootstrap before a cluster node id is assigned, or vanilla mode).
+ *	The occupancy ratio entry_count / max_entries is the saturation signal
+ *	behind the DEDUP_FULL fail-closed path.
+ */
+uint64
+cluster_gcs_block_dedup_get_max_entries(void)
+{
+	return cluster_gcs_block_dedup_ctl ? (uint64)cluster_gcs_block_dedup_ctl->max_entries_effective
+									   : 0;
 }
 
 uint64

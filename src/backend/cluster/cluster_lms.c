@@ -601,7 +601,6 @@ cluster_lms_get_priority_starvation_observed_count(void)
 	return pg_atomic_read_u64(&cluster_lms_state->priority_starvation_observed_count);
 }
 
-
 /* ============================================================
  * HC4 single ownership atomic guard.
  *

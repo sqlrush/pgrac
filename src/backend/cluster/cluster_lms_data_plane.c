@@ -254,19 +254,33 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		 * observed to trip the accept/close WES churn into a crash).  Latch
 		 * the injected reset so it fires exactly ONCE per process lifetime:
 		 * the test then observes one clean reset -> reconnect -> converge,
-		 * matching the real single-bump path (cur_epoch != dp_last_epoch).
-		 * should_skip still drains the pending flag each tick (harmless once
-		 * latched).  The real epoch-bump reset is unaffected by the latch.
+		 * matching the real single-bump path (epoch_bumped).  should_skip
+		 * still drains the pending flag each tick (harmless once latched).
+		 * The real epoch-bump reset is unaffected by the latch.
+		 *
+		 * PGRAC modifications (F6-1 review r2, Finding 3):  a real epoch
+		 * bump takes precedence over the injected reset in the SAME tick.
+		 * We only arm inject_reset when there is no epoch bump, so the
+		 * reason log is attributed to the epoch bump (not "F6-1 one-shot")
+		 * and the one-shot latch is NOT consumed by an epoch-bump tick —
+		 * the injection then still fires exactly once on a later
+		 * injection-only tick.  This preserves the pre-F6-1 short-circuit
+		 * (epoch bump || should_skip) attribution that this reorder
+		 * otherwise lost.  Test-only path: the injection GUC is never armed
+		 * in production, where epoch_bumped alone drives the reset.
 		 */
-		if (cluster_injection_should_skip("cluster-lms-conn-reset") && !dp_inject_reset_done)
+		bool epoch_bumped = dp_epoch_seen && cur_epoch != dp_last_epoch;
+
+		if (!epoch_bumped && cluster_injection_should_skip("cluster-lms-conn-reset")
+			&& !dp_inject_reset_done)
 			inject_reset = true;
 
 		if (!dp_epoch_seen) {
 			dp_last_epoch = cur_epoch;
 			dp_epoch_seen = true;
-		} else if (cur_epoch != dp_last_epoch || inject_reset) {
-			const char *reason = inject_reset ? "data-plane conn-reset injection (F6-1 one-shot)"
-											  : "data-plane epoch bump reset";
+		} else if (epoch_bumped || inject_reset) {
+			const char *reason = epoch_bumped ? "data-plane epoch bump reset"
+											  : "data-plane conn-reset injection (F6-1 one-shot)";
 			int n_closed = 0;
 
 			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {

@@ -35,7 +35,6 @@
  */
 #include "postgres.h"
 
-#include <ctype.h>
 #include <sys/stat.h>
 
 #include "access/transam.h"
@@ -44,6 +43,7 @@
 #include "cluster/cluster_catalog_bootstrap.h"
 #include "cluster/cluster_catalog_migrate.h"
 #include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"
@@ -76,40 +76,6 @@ cluster_catalog_xid_authority_corrupt_fatal(const char *detail)
 }
 
 
-/*
- * Early D6 topology sniff: cluster_conf_load() runs later when shmem exists,
- * but shared_catalog bootstrap must reject multi-node xid_striping=off before
- * it seeds/adopts any authority.  This deliberately counts only [node.N]
- * section headers; the real parser remains the startup SSOT and will still
- * validate syntax, required fields, and node_id consistency later.
- */
-static int
-cluster_catalog_declared_node_count_early(void)
-{
-	const char *path = (cluster_config_file != NULL && cluster_config_file[0] != '\0')
-						   ? cluster_config_file
-						   : "pgrac.conf";
-	FILE *f;
-	char line[1024];
-	int nodes = 0;
-
-	f = AllocateFile(path, "r");
-	if (f == NULL)
-		return 1;
-
-	while (fgets(line, sizeof(line), f) != NULL) {
-		const char *p = line;
-
-		while (*p != '\0' && isspace((unsigned char)*p))
-			p++;
-		if (strncmp(p, "[node.", 6) == 0)
-			nodes++;
-	}
-	FreeFile(f);
-
-	return nodes > 0 ? nodes : 1;
-}
-
 static void
 cluster_catalog_vet_xid_striping_for_shared_catalog(void)
 {
@@ -118,7 +84,14 @@ cluster_catalog_vet_xid_striping_for_shared_catalog(void)
 	if (!cluster_enabled || cluster_xid_striping)
 		return;
 
-	nodes = cluster_catalog_declared_node_count_early();
+	/*
+	 * Early D6 topology sniff: cluster_conf_load() runs later when shmem
+	 * exists, but shared_catalog bootstrap must reject multi-node
+	 * xid_striping=off before it seeds/adopts any authority.  The sniff
+	 * helper lives in cluster_conf.c (spec-7.2a hoisted it for a second
+	 * pre-shmem consumer).
+	 */
+	nodes = cluster_conf_declared_node_count_early();
 	if (nodes > 1)
 		ereport(
 			FATAL,

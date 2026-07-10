@@ -104,6 +104,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
 #include "cluster/cluster_xnode_lever.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D6 dump */ /* xnode lever counters (spec-6.12) */
+#include "cluster/cluster_multixact.h"		/* mxid stripe guardrail counters (spec-7.1 D3-a) */
 #include "cluster/cluster_hw_lease.h"		/* space-lease counters (spec-6.12d) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
@@ -899,10 +900,13 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 /*
  * dump_xid_stripe -- spec-6.15 D6 xid stripe face diagnostics.
  *
- *	11 keys over the activation face (disk/slot state, floor, epoch),
+ *	14 keys over the activation face (disk/slot state, floor, epoch),
  *	the D3 herding plane (own floor/hwm promise, cluster min/max active
- *	hwm) and the D5d replay face (replay-learned floor + active slot
- *	bitmap).  All values come from one shmem snapshot.
+ *	hwm), the D5d replay face (replay-learned floor + active slot
+ *	bitmap) and the spec-7.1 D3-a mxid stripe face (activated mxid
+ *	floor -- 0 = extension absent -- plus the half-space-refusal and
+ *	underivable-read guardrail counters).  Values come from one shmem
+ *	snapshot plus the multixact counter atomics.
  */
 static void
 dump_xid_stripe(ReturnSetInfo *rsinfo)
@@ -937,6 +941,13 @@ dump_xid_stripe(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)obs.replay_floor_full));
 	emit_row(rsinfo, "xid_stripe", "xid_stripe_replay_active_bitmap",
 			 fmt_uint64_hex((uint64)obs.replay_active_bitmap));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_activated_floor",
+			 fmt_int64((int64)obs.activated_mxid_floor));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_disk_state", fmt_int64((int64)obs.mxid_disk_state));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_halfspace_refusals",
+			 fmt_int64((int64)cluster_multixact_get_mxid_halfspace_refuse_count()));
+	emit_row(rsinfo, "xid_stripe", "mxid_stripe_underivable_reads",
+			 fmt_int64((int64)cluster_multixact_get_mxid_underivable_read_count()));
 }
 
 
@@ -1261,13 +1272,12 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 /*
  * dump_lms -- spec-2.18 Sprint A Step 4 D10.
  *
- *	Emits 6 rows under category='lms' corresponding to the 6 atomic
- *	counters in ClusterLmsSharedState (v0.3 §1.4 F2 收紧;
- *	grant/reject/convert 分项 counter 推 spec-2.20 真激活 grant state
- *	machine 时一并 ship).
- *
- *	Plus the LMS state string for HC2 4-state semantic分流
- *	observability.
+ *	Emits the LMS state string (HC2 4-state semantic 分流 observability)
+ *	plus one row per atomic counter in ClusterLmsSharedState:  the
+ *	spec-2.18 base set (started/work_drained/decision grant/reject/convert/
+ *	drain_empty/error), the spec-2.25 native-lock probe counters, the
+ *	spec-2.27 priority-starvation counter, and the spec-7.2 D6
+ *	lms_conn_resets DATA-plane reset counter.
  */
 static void
 dump_lms(ReturnSetInfo *rsinfo)
@@ -1986,6 +1996,15 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_collision_count()));
 	emit_row(rsinfo, "gcs", "dedup_full_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_full_count()));
+	/* spec-7.2a D5:  3 NEW dedup capacity/occupancy rows.  entry_count /
+	 * max_entries give the saturation ratio;  evict_count counts eager
+	 * reclaim + TTL-sweep removals (dump_gcs gcs-category 85 -> 88). */
+	emit_row(rsinfo, "gcs", "dedup_entry_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_entry_count()));
+	emit_row(rsinfo, "gcs", "dedup_evict_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_evict_count()));
+	emit_row(rsinfo, "gcs", "dedup_max_entries",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_max_entries()));
 	/* spec-7.3 D9 (rule 17): the D5 per-worker dedup-shard mis-route
 	 * fail-closed drop counter gets its SQL surface (gcs 85 -> 86). */
 	emit_row(rsinfo, "gcs", "dedup_misroute_failclosed_count",
@@ -2474,6 +2493,17 @@ dump_visibility(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis_get_prune_remote_keep_count()));
 	emit_row(rsinfo, "visibility", "vis_variant_unknown_failclosed_count",
 			 fmt_int64((int64)cluster_vis_get_vis_variant_unknown_failclosed_count()));
+	/* PGRAC: spec-7.1a D6 -- write-write chaining counters. */
+	emit_row(rsinfo, "visibility", "writer_chain_resolved_count",
+			 fmt_int64((int64)cluster_vis_get_writer_chain_resolved_count()));
+	emit_row(rsinfo, "visibility", "writer_chain_failclosed_count",
+			 fmt_int64((int64)cluster_vis_get_writer_chain_failclosed_count()));
+	emit_row(rsinfo, "visibility", "xmax_resolved_count",
+			 fmt_int64((int64)cluster_vis_get_xmax_resolved_count()));
+	emit_row(rsinfo, "visibility", "overlay_refresh_count",
+			 fmt_int64((int64)cluster_vis_get_overlay_refresh_count()));
+	emit_row(rsinfo, "visibility", "covers_scn_refuse_count",
+			 fmt_int64((int64)cluster_vis_get_covers_scn_refuse_count()));
 }
 
 
@@ -2693,12 +2723,41 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_verdict_served_count()));
 	emit_row(rsinfo, "cr", "cr_server_verdict_denied_count",
 			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
+	/* spec-7.1 D3-b: origin multixact member-verdict serve counters. */
+	emit_row(rsinfo, "cr", "cr_server_multi_verdict_served_count",
+			 fmt_int64((int64)cluster_cr_server_multi_verdict_served_count()));
+	emit_row(rsinfo, "cr", "cr_server_multi_verdict_denied_count",
+			 fmt_int64((int64)cluster_cr_server_multi_verdict_denied_count()));
 	/* spec-7.3 D7 — DATA-plane inline serve refused because the node is
 	 * write-fenced (image / undo / verdict withheld to avoid a stale ship). */
 	emit_row(rsinfo, "cr", "cr_server_fence_refused_count",
 			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* spec-7.1 D0/D5: 53R97 per-leg attribution (census + error-closure dial). */
+	emit_row(rsinfo, "cr", "vis53r97_leg_invalid_scn_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_invalid_scn_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_zero_match_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_zero_match_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_srv_other_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_srv_other_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_covers_refuse_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_covers_refuse_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_unresolvable_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_unresolvable_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_xmax_unprovable_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_xmax_unprovable_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_xmin_overlay_verdict_ask_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_ask_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_xmin_overlay_verdict_hit_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_xmin_overlay_verdict_hit_count()));
+	/* spec-7.1 D3-b: foreign multixact member-verdict requester ask / hit. */
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_member_serve_ask_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_member_serve_ask_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_multi_member_serve_hit_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_multi_member_serve_hit_count()));
+	emit_row(rsinfo, "cr", "vis53r97_leg_live_upgrade_hit_count",
+			 fmt_int64((int64)cluster_vis53r97_leg_live_upgrade_hit_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

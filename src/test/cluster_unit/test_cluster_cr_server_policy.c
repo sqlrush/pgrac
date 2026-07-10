@@ -113,10 +113,30 @@ UT_TEST(test_split_malformed_is_deny)
 				 (int)CLUSTER_CR_SPLIT_DENY);
 }
 
+/*
+ * spec-7.1 D1 serve: the INVALID_SCN verdict decision.  An explicit CLOG abort
+ * upgrades to a positive ABORTED (the aborted-unstamped delayed-cleanout
+ * window); everything else -- committed-but-unstamped, in-flight, 2PC, crashed
+ * -- must stay REFUSE (8.A: never fabricate a commit_scn / positive answer).
+ */
+UT_TEST(test_invalid_scn_aborted_is_positive)
+{
+	UT_ASSERT_EQ((int)cluster_cr_server_invalid_scn_verdict(true),
+				 (int)CLUSTER_CR_INVALID_SCN_ABORTED);
+}
+
+UT_TEST(test_invalid_scn_not_aborted_refuses)
+{
+	/* The 8.A tooth: a NON-abort (committed-unstamped / in-flight / in-doubt)
+	 * must NOT upgrade -- it stays fail-closed on the refuse leg. */
+	UT_ASSERT_EQ((int)cluster_cr_server_invalid_scn_verdict(false),
+				 (int)CLUSTER_CR_INVALID_SCN_REFUSE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -124,6 +144,8 @@ main(void)
 	UT_RUN(test_split_interleave_is_deny);
 	UT_RUN(test_split_third_party_suffix_stays_partial);
 	UT_RUN(test_split_malformed_is_deny);
+	UT_RUN(test_invalid_scn_aborted_is_positive);
+	UT_RUN(test_invalid_scn_not_aborted_refuses);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

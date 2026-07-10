@@ -41,9 +41,10 @@
 #      L5  (D3 flipped) the rebound holders release against their
 #          current-epoch masters and both resources are immediately
 #          re-acquirable.  Pinned gap was: release silently swallowed.
-#      L7  (D5 flipped) grd_recovery dump category: 13 counters, key
-#          roster per spec-4.6 §2.4, episode trail asserted
-#          (remaster_started/done, shards_remastered=2048,
+#      L7  (D5 flipped) grd_recovery dump category: 31 keys (spec-4.6
+#          §2.4 base 13 + spec-5.16 D5 join-direction 5 + spec-4.6a
+#          liveness/episode surface 13), full key roster, episode trail
+#          asserted (remaster_started/done, shards_remastered=2048,
 #          holders_redeclared>=1, rebuild_timeout=0).
 #
 #    Discipline notes:
@@ -395,22 +396,29 @@ is($rc5, 0,
 
 
 # ----------
-# L7 (FLIPPED by D5; spec-5.16 D5 +5 join-direction counters): grd_recovery
-#     dump category exposes 18 counters and the recovery episode left the
-#     expected trail.
+# L7 (FLIPPED by D5; spec-5.16 D5 +5 join-direction counters; spec-4.6a
+#     +13 episode/liveness keys): grd_recovery dump category exposes 31
+#     keys and the recovery episode left the expected trail.
 # ----------
 is($pair->node1->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state() WHERE category = 'grd_recovery'}),
-	'18', 'L7 grd_recovery dump category exposes 18 counters (D5 + spec-5.16 join)');
+	'31',
+	'L7 grd_recovery dump category exposes 31 keys (spec-4.6 D5 + spec-5.16 join + spec-4.6a)');
 
 is($pair->node1->safe_psql('postgres', q{
 	SELECT string_agg(key, ',' ORDER BY key) FROM cluster_dump_state()
 	 WHERE category = 'grd_recovery'}),
-	'block_path_failclosed,converts_requeued,holders_rebound,holders_redeclared,'
-	. 'rebuild_timeout,remaster_done,remaster_failed,remaster_started,'
-	. 'shards_remastered,stale_holder_swept,stale_request_drop,'
-	. 'unaffected_holder_survived,waiters_requeued',
-	'L7 grd_recovery key roster matches spec-4.6 §2.4');
+	'block_path_failclosed,block_redeclare_cursor,block_redeclare_done,'
+	. 'block_redeclare_epoch,cluster_gate_timeout,converts_requeued,'
+	. 'done_self_bitmap_hash,done_self_epoch,episode_epoch,event_coordinator,'
+	. 'event_old_epoch,holders_rebound,holders_redeclared,'
+	. 'join_block_recovering_failclosed,join_block_views_rebuilt,'
+	. 'join_remaster_done,join_remaster_started,join_shards_remastered,'
+	. 'last_event_id,rebuild_timeout,remaster_done,remaster_failed,'
+	. 'remaster_started,shards_remastered,stale_holder_swept,'
+	. 'stale_request_drop,state,state_enum_value,unaffected_holder_survived,'
+	. 'wait_epoch_escape,waiters_requeued',
+	'L7 grd_recovery key roster (spec-4.6 §2.4 + spec-5.16 D5 + spec-4.6a)');
 
 is($pair->node1->safe_psql('postgres',
 		q{SELECT value::bigint >= 1 FROM cluster_dump_state()

@@ -24,12 +24,12 @@
 #
 # Spec: spec-7.2-ic-data-plane-decoupling.md (flip commit)
 #
+# IDENTIFICATION
+#	  src/test/cluster_tap/t/358_data_plane_flip_e2e.pl
+#
 # Author: SqlRush <sqlrush@gmail.com>
 #
 # Portions Copyright (c) 2026, pgrac contributors
-#
-# IDENTIFICATION
-#	  src/test/cluster_tap/t/358_data_plane_flip_e2e.pl
 #
 #-------------------------------------------------------------------------
 
