@@ -292,6 +292,24 @@ cluster_lms_data_plane_tick(long timeout_ms)
 			if (inject_reset && n_closed > 0)
 				dp_inject_reset_done = true;
 
+			/*
+			 * PGRAC: spec-7.3 D7 — per-worker reset observability (epoch ×N).
+			 * Each DATA worker (0..N-1) runs this tick in its OWN process and
+			 * observes the shared epoch bump independently, so a reconfig
+			 * resets the whole pool without any cross-process driver — the
+			 * sender gate (tier1_send_bytes) fail-closes any stale-epoch send
+			 * in the meantime.  Emit one LOG per worker per reset carrying the
+			 * worker channel id so the ×N reset legs can assert that all N
+			 * workers reset (only when a live connection was actually torn
+			 * down, to avoid logging on an idle-mesh epoch advance).
+			 */
+			if (n_closed > 0)
+				ereport(LOG,
+						(errmsg("cluster_lms: DATA mesh reset (worker %d) at epoch "
+								"%llu (%d peer%s closed)",
+								cluster_ic_tier1_my_data_channel(), (unsigned long long)cur_epoch,
+								n_closed, n_closed == 1 ? "" : "s")));
+
 			dp_last_epoch = cur_epoch;
 		}
 	}

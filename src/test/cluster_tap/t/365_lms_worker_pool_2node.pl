@@ -123,6 +123,103 @@ unlike($merged, qr/HELLO DATA worker mismatch/, 'L3 matched pool: no worker mism
 is(gcs_int($node0, 'plane_misroute_reject'), 0, 'L3 node0 zero plane misroutes');
 is(gcs_int($node1, 'plane_misroute_reject'), 0, 'L3 node1 zero plane misroutes');
 
+# ============================================================
+# L5 — spec-7.3 D7: epoch-reset ×N.  Each DATA worker runs its own tick in its
+# OWN process and observes the shared epoch / reconfig reset signal
+# independently, so a reset reaches the WHOLE pool with no cross-process driver
+# (the tier1 sender gate is the structural backstop for the window between the
+# bump and each worker's next tick).  Arm the one-shot conn-reset injection on
+# node0 -- SIGHUP fans out to every worker pid -- and assert that BOTH worker 0
+# AND worker 1 log their own per-worker DATA-mesh reset.
+# ============================================================
+my $w0_reset_re = qr/DATA mesh reset \(worker 0\)/;
+my $w1_reset_re = qr/DATA mesh reset \(worker 1\)/;
+
+$node0->append_conf('postgresql.conf',
+	"cluster.injection_points = 'cluster-lms-conn-reset:skip'");
+$node0->reload;
+
+my $both_reset = 0;
+for my $i (1 .. 60)
+{
+	usleep(500_000);
+	my $l = PostgreSQL::Test::Utils::slurp_file($node0->logfile);
+	$both_reset = ($l =~ $w0_reset_re && $l =~ $w1_reset_re) ? 1 : 0;
+	last if $both_reset;
+}
+ok($both_reset,
+	'L5 epoch ×N: both worker 0 and worker 1 reset their DATA mesh independently');
+
+# Disarm before the recycle leg (the one-shot latch already prevents a storm;
+# a later appended line wins on reload).
+$node0->append_conf('postgresql.conf', "cluster.injection_points = ''");
+$node0->reload;
+usleep(1_000_000);
+
+# ============================================================
+# L6 — spec-7.3 D7: graceful per-worker recycle isolation (L3a, Path A).
+# SIGTERM ONE DATA worker (worker 1) on node0.  A clean worker exit respawns
+# just that slot via the ServerLoop WITHOUT a node crash cascade, so node0
+# stays up and serving throughout, worker 1 comes back with a fresh pid, and
+# its DATA mesh re-forms -- worker 0 (the other shard) is never disturbed.
+# (Contrast: a SIGKILL hard-crash cascades the whole node -- KNOWN-BLOCKED on
+# the orthogonal F1 recovery-vs-membership wall, see t/360 L4.)
+# ============================================================
+my $w1_pid = $node0->safe_psql('postgres',
+	q{SELECT pid FROM pg_stat_activity
+	   WHERE backend_type = 'lms worker' ORDER BY pid LIMIT 1});
+if (defined $w1_pid && $w1_pid =~ /^\d+$/)
+{
+	my $verify_re = qr/HELLO verified.*\(DATA worker 1\)/;
+	my $verified_before = () = merged_log($node0, $node1) =~ /$verify_re/g;
+
+	kill 'TERM', $w1_pid;
+
+	# node0 stays UP the whole time -- a crash cascade would drop SELECT 1
+	# during PM_WAIT_BACKENDS; a graceful recycle never does.
+	my $stayed_up = 1;
+	for my $i (1 .. 10)
+	{
+		$stayed_up = 0 unless eval { $node0->safe_psql('postgres', 'SELECT 1'); 1 };
+		usleep(300_000);
+	}
+	ok($stayed_up,
+		'L6 node0 stayed up through the graceful worker recycle (no crash cascade)');
+
+	# worker 1 respawned with a fresh pid (isolated restart).
+	my $new_pid = '';
+	for my $i (1 .. 60)
+	{
+		$new_pid = $node0->safe_psql('postgres',
+			q{SELECT pid FROM pg_stat_activity
+			   WHERE backend_type = 'lms worker' ORDER BY pid LIMIT 1});
+		last if defined $new_pid && $new_pid =~ /^\d+$/ && $new_pid ne $w1_pid;
+		usleep(500_000);
+	}
+	ok(defined $new_pid && $new_pid =~ /^\d+$/ && $new_pid ne $w1_pid,
+		"L6 DATA worker 1 respawned isolated (pid $w1_pid -> $new_pid)");
+
+	# The respawned worker re-forms its DATA mesh: a FRESH HELLO verify appears
+	# (count strictly increases over the pre-kill baseline).
+	my $reverified = 0;
+	for my $i (1 .. 60)
+	{
+		my $now = () = merged_log($node0, $node1) =~ /$verify_re/g;
+		$reverified = ($now > $verified_before) ? 1 : 0;
+		last if $reverified;
+		usleep(500_000);
+	}
+	ok($reverified,
+		'L6 respawned worker 1 re-formed its DATA mesh (fresh re-HELLO converged)');
+}
+else
+{
+	SKIP:
+	{
+		skip 'no lms worker in pg_stat_activity (unexpected on a matched pool)', 3;
+	}
+}
+
 $pair->stop_pair;
 
 # ============================================================

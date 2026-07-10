@@ -161,6 +161,7 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 rtvis_verdict_inadmissible_count;
 	pg_atomic_uint64 cr_server_verdict_served_count;
 	pg_atomic_uint64 cr_server_verdict_denied_count;
+	pg_atomic_uint64 cr_server_fence_refused_count; /* spec-7.3 D7 fence ×N refuse */
 	/*
 	 * spec-6.15 D4: a recycled remote ref whose tuple xid the stripe
 	 * derivation could not attribute (striping off / below the activation
@@ -250,6 +251,7 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_verdict_inadmissible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_fence_refused_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
@@ -318,6 +320,9 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 		break;
 	case CLUSTER_CR_SERVER_STAT_VERDICT_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_verdict_denied_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_FENCE_REFUSED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_fence_refused_count, 1);
 		break;
 	}
 }
@@ -447,6 +452,7 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_below_horizon_count, rtvis_verdict_bel
 CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_inadmissible_count, rtvis_verdict_inadmissible_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_served_count, cr_server_verdict_served_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_denied_count, cr_server_verdict_denied_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_fence_refused_count, cr_server_fence_refused_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)

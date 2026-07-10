@@ -16,11 +16,12 @@
 #	        percentiles are diag'd.
 #	    L3  hygiene: zero plane misroutes + no plane-gate errors.
 #	    L5  conn-reset injection (F6-1, un-SKIPPED):  arm the one-shot
-#	        cluster-lms-conn-reset injection, observe exactly one DATA-mesh
-#	        reset in node0's log, then verify the mesh reconnects and a
-#	        cross-node block transfer converges.  The reset is now latched
-#	        one-shot (cluster_lms_data_plane.c) so the persistent GUC arm no
-#	        longer storms or crashes the passive LMS.
+#	        cluster-lms-conn-reset injection, observe one DATA-mesh reset per
+#	        worker process (worker 0 + worker 1 under the default
+#	        lms_workers=2) in node0's log, then verify the mesh reconnects and
+#	        a cross-node block transfer converges.  The reset is latched
+#	        one-shot per worker (cluster_lms_data_plane.c) so the persistent
+#	        GUC arm no longer storms or crashes the passive LMS.
 #
 #	  KNOWN-BLOCKED / deferred legs (honest SKIP; see docs/stage7-substrate-
 #	  findings.md).  The stage7 P0 substrate (spec-6.15b/4.6a/2.29a) was
@@ -71,6 +72,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	quorum_voting_disks => 3,
 	shared_data         => 1,
 	storage_backend     => 'block_device',
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'fsync = off',
@@ -231,6 +233,17 @@ is(gcs_int($node1, 'plane_misroute_reject'), 0, 'L3 node1 zero plane misroutes')
 # Orthogonal to the spec-7.2 DATA plane; see docs/stage7-substrate-
 # findings.md.  The SIGKILL is NOT issued here -- it would crash the node
 # into an unrecoverable state.)
+#
+# spec-7.3 D7 (Path A) confirms this is the intended HARD-crash semantics for
+# the worker pool too: a SIGKILL/SIGSEGV of ANY LMS process (worker 0 or a
+# LmsWorker) is treated like any PG aux-process crash -- the reaper escalates
+# (HandleChildCrash -> PMQUIT_FOR_CRASH -> whole-node crash-restart), because a
+# process killed mid-serve can leave a shmem LWLock (the per-worker outbound
+# ring / dedup shard) stuck, and only a shmem reinit is safe.  Full recovery
+# stays blocked on the same F1 wall above.  The ISOLATED path -- a GRACEFUL
+# worker exit (SIGTERM) that respawns just that slot with the other shards
+# undisturbed -- is the reachable D7 improvement and is proven live in
+# t/365 L6 (no crash cascade; worker respawns with a fresh pid; mesh re-forms).
 # ============================================================
 SKIP: {
 	skip 'F1-8 KNOWN-BLOCKED: block_device crash-recovery raw_layout_lock '
@@ -313,13 +326,16 @@ ok($conn0_after > $conn0_before && $conn1_after > $conn1_before,
 	"L5.2 DATA mesh reconnects after the reset "
 	  . "(node0 CONNECTED $conn0_before->$conn0_after, node1 $conn1_before->$conn1_after)");
 
-# One-shot guarantee: the persistent GUC arm produced a single reset event
-# (one close-log per peer), NOT a per-tick storm.  In this 2-node pair that
-# is exactly one injected close-log line.
+# One-shot guarantee: the persistent GUC arm produced one reset event PER
+# worker process (one close-log per peer), NOT a per-tick storm.  spec-7.3:
+# with the default lms_workers=2, node0 runs worker 0 (LmsProcess) + worker 1
+# (LmsWorker), each with its own DATA channel + its own one-shot latch, so the
+# SIGHUP fan-out fires at most one injected close-log per worker (1..2 total),
+# never the per-tick storm (>> 2) the latch prevents.
 my $reset_final = () = PostgreSQL::Test::Utils::slurp_file($node0->logfile) =~ /$reset_re/g;
 my $injected = $reset_final - $resets_before;
-ok($injected == 1,
-	"L5.3 conn-reset injection is one-shot (fired $injected time; no per-tick storm)");
+ok($injected >= 1 && $injected <= 2,
+	"L5.3 conn-reset injection is one-shot per worker (fired $injected time(s); no per-tick storm)");
 
 # ============================================================
 # L6 — HONEST SKIP: data-dispatch injection-point reachability (F6-2).

@@ -2628,6 +2628,10 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_verdict_served_count()));
 	emit_row(rsinfo, "cr", "cr_server_verdict_denied_count",
 			 fmt_int64((int64)cluster_cr_server_verdict_denied_count()));
+	/* spec-7.3 D7 — DATA-plane inline serve refused because the node is
+	 * write-fenced (image / undo / verdict withheld to avoid a stale ship). */
+	emit_row(rsinfo, "cr", "cr_server_fence_refused_count",
+			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
