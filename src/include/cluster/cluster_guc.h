@@ -788,6 +788,13 @@ extern bool cluster_lms_enabled;
 extern int cluster_lms_workers;
 
 /*
+ * spec-7.3 D8 (Q8) — cluster.lms_nice: optional nice value the LMS workers
+ * apply to themselves (setpriority, best-effort).  PGC_SIGHUP, default 0 =
+ * leave the inherited priority alone;  range [-20, 0].
+ */
+extern int cluster_lms_nice;
+
+/*
  * cluster.lock_acquire_cluster_path (spec-2.21 D2).
  *
  *	context: PGC_POSTMASTER

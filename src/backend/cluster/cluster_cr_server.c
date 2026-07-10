@@ -62,6 +62,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 READY-publish wakeup */
+#include "cluster/cluster_lms.h"  /* PGRAC: spec-7.3 D8 per-worker serve counters */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
@@ -75,6 +76,7 @@
 #include "storage/shmem.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h" /* PGRAC: spec-7.3 D8 serve duration (GetCurrentTimestamp) */
 
 /*
  * Shmem: the slot table + the published LMS latch pointer (set by LmsMain
@@ -736,6 +738,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
 	bool inject_refuse;
+	TimestampTz serve_started_at;
 
 	if (fwd == NULL)
 		return;
@@ -778,6 +781,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(CrServeScratchCtx);
+		cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
 		return;
 	}
 
@@ -813,13 +817,19 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	}
 
 	old = MemoryContextSwitchTo(cr_serve_scratch_context());
+	/* PGRAC: spec-7.3 D8 — time the serve into the calling worker's duration
+	 * histogram (the R4 slow-shard backstop:  a slow CR construction stalls
+	 * only this shard, and the per-worker hist is where that shows). */
+	serve_started_at = GetCurrentTimestamp();
 	cr_serve_slot(&slot);
+	cluster_lms_obs_note_inline_serve((uint64)(GetCurrentTimestamp() - serve_started_at));
 	/* A caught construction throw left CurrentMemoryContext at TopMemoryContext;
 	 * normalize back to the scratch context before the reply build. */
 	MemoryContextSwitchTo(cr_serve_scratch_context());
 	cr_build_and_send_reply(&slot);
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(CrServeScratchCtx);
+	cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
 }
 
 #endif /* USE_PGRAC_CLUSTER */

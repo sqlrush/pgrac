@@ -303,12 +303,14 @@ cluster_lms_data_plane_tick(long timeout_ms)
 			 * workers reset (only when a live connection was actually torn
 			 * down, to avoid logging on an idle-mesh epoch advance).
 			 */
-			if (n_closed > 0)
+			if (n_closed > 0) {
+				cluster_lms_obs_note_conn_reset(); /* spec-7.3 D8 per-worker counter */
 				ereport(LOG,
 						(errmsg("cluster_lms: DATA mesh reset (worker %d) at epoch "
 								"%llu (%d peer%s closed)",
 								cluster_ic_tier1_my_data_channel(), (unsigned long long)cur_epoch,
 								n_closed, n_closed == 1 ? "" : "s")));
+			}
 
 			dp_last_epoch = cur_epoch;
 		}

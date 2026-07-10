@@ -1310,6 +1310,66 @@ dump_lms(ReturnSetInfo *rsinfo)
 	 * on wire;  reserved opcode 11 awaits spec-2.28+ integrated receiver). */
 	emit_row(rsinfo, "lms", "priority_starvation_observed_count",
 			 fmt_int64((int64)cluster_lms_get_priority_starvation_observed_count()));
+
+	/* PGRAC: spec-7.3 D8 — per-worker DATA-plane observability.  The bare
+	 * keys are the pool aggregates (the 7.2-era single-value semantics'
+	 * natural generalization, spec §3.8);  the _w<N> suffixed keys are the
+	 * per-worker detail, emitted for the live pool only (w < lms_workers). */
+	emit_row(rsinfo, "lms", "lms_data_dispatch_count",
+			 fmt_int64((int64)cluster_lms_obs_get_dispatch_count(-1)));
+	emit_row(rsinfo, "lms", "lms_direct_reply_count",
+			 fmt_int64((int64)cluster_lms_obs_get_direct_reply_count(-1)));
+	emit_row(rsinfo, "lms", "lms_conn_reset_count",
+			 fmt_int64((int64)cluster_lms_obs_get_conn_reset_count(-1)));
+	emit_row(rsinfo, "lms", "lms_inline_serve_count",
+			 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(-1)));
+	{
+		int w, hb;
+
+		for (w = 0; w < cluster_lms_workers && w < CLUSTER_LMS_MAX_WORKERS; w++) {
+			char wkey[64];
+
+			snprintf(wkey, sizeof(wkey), "lms_data_dispatch_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey, fmt_int64((int64)cluster_lms_obs_get_dispatch_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_direct_reply_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_direct_reply_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_conn_reset_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_conn_reset_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_inline_serve_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(w)));
+		}
+
+		/* Inline-serve duration histogram: aggregate 16 rows + per live
+		 * worker 16 rows (keys mirror the gcs ship-hist idiom). */
+		for (hb = 0; hb < CLUSTER_LMS_SERVE_HIST_BUCKETS; hb++) {
+			char histkey[64];
+			uint64 bound = cluster_lms_obs_serve_hist_bound_us(hb);
+
+			if (bound == UINT64_MAX)
+				snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_inf");
+			else
+				snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_le_" UINT64_FORMAT, bound);
+			emit_row(rsinfo, "lms", histkey,
+					 fmt_int64((int64)cluster_lms_obs_get_serve_hist(-1, hb)));
+		}
+		for (w = 0; w < cluster_lms_workers && w < CLUSTER_LMS_MAX_WORKERS; w++) {
+			for (hb = 0; hb < CLUSTER_LMS_SERVE_HIST_BUCKETS; hb++) {
+				char histkey[64];
+				uint64 bound = cluster_lms_obs_serve_hist_bound_us(hb);
+
+				if (bound == UINT64_MAX)
+					snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_inf_w%d", w);
+				else
+					snprintf(histkey, sizeof(histkey), "lms_serve_hist_us_le_" UINT64_FORMAT "_w%d",
+							 bound, w);
+				emit_row(rsinfo, "lms", histkey,
+						 fmt_int64((int64)cluster_lms_obs_get_serve_hist(w, hb)));
+			}
+		}
+	}
 }
 
 /*
