@@ -37,8 +37,9 @@
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
 
-#include "cluster/cluster_cr.h"		   /* vis53r97 multi_member_serve counters (D3-b) */
-#include "cluster/cluster_cr_server.h" /* undo_multi_verdict_fetch_and_wait (D3-b) */
+#include "cluster/cluster_cr.h"					/* vis53r97 multi_member_serve counters (D3-b) */
+#include "cluster/cluster_cr_server.h"			/* undo_multi_verdict_fetch_and_wait (D3-b) */
+#include "cluster/cluster_runtime_visibility.h" /* live-authority covers gate (D3-b review) */
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
@@ -377,6 +378,24 @@ cluster_multixact_remote_xmax_ask_origin(uint16 origin_slot, MultiXactId mxid, S
 	if (!cluster_gcs_block_undo_multi_verdict_fetch_and_wait((int32)origin_slot, mxid,
 															 page_buf.data, &auth))
 		return CLUSTER_VISIBILITY_UNKNOWN; /* DENIED / timeout / invalid -> 53R97 */
+
+	/*
+	 * PGRAC (spec-7.1 integration review, P0): the served member terminals are
+	 * only conclusive for THIS snapshot when the co-sampled live authority
+	 * covers the demand — same gate, same demand (the snapshot read_scn) as
+	 * the single-xid verdict leg (cluster_runtime_visibility.c
+	 * rtvis_try_origin_verdict).  Without it an epoch-stale reply (the origin
+	 * may have been remastered/fenced since sampling, D-i3) or an origin clock
+	 * behind read_scn (a member could still commit after the scan with a
+	 * commit_scn at/below read_scn) would be consumed as conclusive.  The
+	 * fetch already Lamport-observed every shipped SCN, so a refusal
+	 * self-heals on the next snapshot (Rule 8.A: refuse -> UNKNOWN -> 53R97).
+	 */
+	if (!cluster_vis_live_authority_covers(snap->read_scn, auth)) {
+		cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
+		cluster_vis53r97_note_covers_refuse();		/* spec-7.1 D0 census */
+		return CLUSTER_VISIBILITY_UNKNOWN;
+	}
 
 	/* The page is structurally validated (SERVED, nmembers in [2, MAX], every
 	 * member consistent) by the fetch, which validates the STABLE local copy it
