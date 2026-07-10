@@ -256,6 +256,8 @@ extern uint64 cluster_rtvis_verdict_below_horizon_count(void);
 extern uint64 cluster_rtvis_verdict_inadmissible_count(void);
 extern uint64 cluster_cr_server_verdict_served_count(void);
 extern uint64 cluster_cr_server_verdict_denied_count(void);
+extern uint64 cluster_cr_server_multi_verdict_served_count(void);
+extern uint64 cluster_cr_server_multi_verdict_denied_count(void);
 extern void cluster_rtvis_verdict_note_wire(void);
 extern void cluster_rtvis_verdict_note_failclosed(void);
 extern void cluster_rtvis_verdict_note_exact(void);
@@ -265,6 +267,36 @@ extern void cluster_rtvis_verdict_note_inadmissible(void);
 /* spec-6.15 D4: underivable-origin refusals (classify_ref). */
 extern uint64 cluster_rtvis_underivable_failclosed_count(void);
 extern void cluster_rtvis_note_underivable_failclosed(void);
+
+/* spec-7.1 D0/D5: 53R97 per-leg attribution (3 server legs + 3 requester
+ * legs; see the ClusterCRShared field comment for each leg's meaning). */
+extern uint64 cluster_vis53r97_leg_invalid_scn_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_zero_match_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_srv_other_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_covers_refuse_count(void);
+extern uint64 cluster_vis53r97_leg_multi_unresolvable_count(void);
+extern uint64 cluster_vis53r97_leg_xmax_unprovable_count(void);
+extern void cluster_vis53r97_note_srv_invalid_scn(void);
+extern void cluster_vis53r97_note_srv_zero_match(void);
+extern void cluster_vis53r97_note_srv_other(void);
+extern void cluster_vis53r97_note_covers_refuse(void);
+extern void cluster_vis53r97_note_multi_unresolvable(void);
+extern void cluster_vis53r97_note_xmax_unprovable(void);
+/* spec-7.1 D1 requester 半边: xmin overlay-miss verdict ask / hit. */
+extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void);
+extern uint64 cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void);
+extern void cluster_vis53r97_note_xmin_overlay_verdict_ask(void);
+extern void cluster_vis53r97_note_xmin_overlay_verdict_hit(void);
+/* spec-7.1 D3-b requester 半边: foreign multixact member-verdict ask / hit
+ * (unprovable = ask - hit -> the 53R97 residue, feature #119 forward). */
+extern uint64 cluster_vis53r97_leg_multi_member_serve_ask_count(void);
+extern uint64 cluster_vis53r97_leg_multi_member_serve_hit_count(void);
+extern void cluster_vis53r97_note_multi_member_serve_ask(void);
+extern void cluster_vis53r97_note_multi_member_serve_hit(void);
+/* spec-7.1 D1 serve 半边: INVALID_SCN -> positive ABORTED via CLOG (hit); the
+ * miss counterpart is invalid_scn_refuse_count / note_srv_invalid_scn. */
+extern uint64 cluster_vis53r97_leg_live_upgrade_hit_count(void);
+extern void cluster_vis53r97_note_live_upgrade_hit(void);
 
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict

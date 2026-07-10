@@ -320,6 +320,19 @@ typedef enum GcsBlockReplyStatus {
 													 * unprovable outcome is a DENIED
 													 * reply instead — the requester
 													 * keeps 53R97 (Rule 8.A). */
+	,
+	GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT = 20 /* PGRAC: spec-7.1 D3-b NEW; the
+													 * origin's LMS enumerated a foreign
+													 * multixact's members and served a
+													 * per-updater-member batch verdict
+													 * (ClusterGcsUndoMultiVerdictPage in
+													 * the BLCKSZ area) under the same
+													 * co-sampled authority carriage as
+													 * statuses 18/19.  Shipped ONLY when
+													 * every updater member is proven
+													 * (status SERVED); any unprovable
+													 * multi is a DENIED reply — the
+													 * requester keeps 53R97 (Rule 8.A). */
 } GcsBlockReplyStatus;
 
 /* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
@@ -339,7 +352,23 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT == GCS_BLOCK_REPLY_CR_RESULT_PARTIAL + 1,
 				 "spec-6.12i undo-TT fetch status must precede the verdict status");
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT + 1,
-				 "spec-6.12i undo-verdict status must be the tail enum value");
+				 "spec-6.12i undo-verdict status must follow the undo-TT fetch status");
+StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
+					 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
+				 "spec-7.1 D3-b undo-multi-verdict status must be the tail enum value");
+
+/* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
+ * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
+ * a co-sampled ClusterGcsUndoAuthTrailer and overrides the reply header's
+ * epoch / page_lsn with the LMS-sampled live authority.  Centralised so every
+ * ship/parse site treats the three identically (D-i3 authority carriage). */
+static inline bool
+GcsBlockReplyStatusCarriesUndoAuthTrailer(GcsBlockReplyStatus status)
+{
+	return status == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
+		   || status == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+}
 
 static inline bool
 GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
@@ -1267,6 +1296,34 @@ GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 	return p->reserved_0[6] == (uint8)2;
 }
 
+/* PGRAC: spec-7.1 D3-b — undo-MULTI-verdict request carried in reserved_0[6]
+ * VALUE 3 (the byte is value-multiplexed with the undo-TT fetch (1) and the
+ * single-xid verdict (2); one FORWARD is only ever one request kind).
+ *
+ *	Sent REQUESTER -> ORIGIN when a FOREIGN multixact xmax structurally misses
+ *	the requester's member overlay (the updater has no compose-time TT
+ *	binding, spec-7.1 IN-12): ask the origin, which alone owns the multi's
+ *	members, for a batched per-member verdict.  The asked-for MXID rides the
+ *	expected-PI-watermark SCN carrier (widened to uint64; upper 32 bits MUST
+ *	be zero — MultiXactId is 32-bit like TransactionId, Q-D3b1) and the
+ *	BufferTag stays the synthetic undo address for tag validity + routing
+ *	observability only.  The origin's LMON parks for LMS; LMS gates on
+ *	cluster_mxid_is_mine, enumerates the members, resolves each updater's
+ *	terminal via the single-xid verdict path and ships
+ *	UNDO_MULTI_VERDICT_RESULT (status SERVED) or a DENIED status the requester
+ *	maps to the unchanged 53R97 fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetUndoMultiVerdictRequest(GcsBlockForwardPayload *p, bool undo_multi_verdict)
+{
+	p->reserved_0[6] = undo_multi_verdict ? (uint8)3 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoMultiVerdictRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)3;
+}
+
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.
  *
  *	An undo block has no BufferTag (undo segment files live outside shared
@@ -1435,6 +1492,70 @@ typedef struct ClusterGcsUndoVerdictPage {
 
 StaticAssertDecl(sizeof(ClusterGcsUndoVerdictPage) == 48,
 				 "spec-6.12i ClusterGcsUndoVerdictPage wire ABI is 48 bytes");
+
+/* PGRAC: spec-7.1 D3-b — batched multixact member-verdict page carried in the
+ * BLCKSZ area of a GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT reply.
+ *
+ *	A foreign multixact xmax the requester cannot resolve locally (its member
+ *	overlay structurally misses — the updater has no TT binding at compose
+ *	time, spec-7.1 IN-12) is answered by the ORIGIN, which alone owns the
+ *	multi's pg_multixact members: the origin enumerates the members
+ *	(GetMultiXactIdMembers) and resolves each UPDATER member's terminal via
+ *	the SAME by-xid verdict path as the single-xid serve (A1/A2).  lock-only
+ *	members (status <= MultiXactStatusForUpdate) never gate visibility and
+ *	carry no verdict.  The requester feeds the per-member terminals to the
+ *	pure combination resolver cluster_multixact_resolve_visibility_served.
+ *
+ *	8.A (positive proof only): the origin ships this page ONLY when EVERY
+ *	updater member has a proven terminal (status == SERVED).  A multi with an
+ *	unprovable updater / not-mine mxid / unreadable member set is refused with
+ *	a DENIED reply (no page) exactly like the single-verdict serve — the
+ *	requester keeps its unchanged 53R97.  The status field is carried for
+ *	defence-in-depth (the requester re-checks SERVED) and future
+ *	observability.  Each member mirrors one ClusterGcsUndoVerdictPage's
+ *	{commit_scn, horizon_scn, wrap, verdict}; horizon_scn crossings are
+ *	Lamport-observed by the requester exactly as the single verdict's are. */
+#define CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC ((uint32)0x50474D56) /* "PGMV" */
+#define CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION ((uint32)1)
+#define CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS 256
+
+/* Whole-multi serve status (A2 / Q-D3b3: origin never sends a partial set). */
+typedef enum ClusterGcsUndoMultiVerdictStatus {
+	CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED = 1,	   /* every updater member proven */
+	CLUSTER_GCS_UNDO_MULTI_VERDICT_UNPROVABLE = 2, /* an updater member unprovable */
+	CLUSTER_GCS_UNDO_MULTI_VERDICT_NOT_MINE = 3,   /* mxid not origin-derived-own */
+	CLUSTER_GCS_UNDO_MULTI_VERDICT_NO_MEMBERS = 4  /* < 2 / unreadable member set */
+} ClusterGcsUndoMultiVerdictStatus;
+
+typedef struct ClusterGcsUndoMultiVerdictMember {
+	uint64 commit_scn;	 /* COMMITTED_EXACT only, else InvalidScn */
+	uint64 horizon_scn;	 /* COMMITTED_BELOW_HORIZON bound, else InvalidScn */
+	TransactionId xid;	 /* member xid (uint32; NOT full-xid) */
+	uint16 wrap;		 /* COMMITTED_EXACT slot wrap evidence */
+	uint8 verdict;		 /* ClusterGcsUndoVerdictKind (1/2/3); 0 = lock-only none */
+	uint8 member_status; /* MultiXactStatus: updater(4-5) vs lock-only(0-3) */
+} ClusterGcsUndoMultiVerdictMember;
+
+StaticAssertDecl(sizeof(ClusterGcsUndoMultiVerdictMember) == 24,
+				 "spec-7.1 D3-b ClusterGcsUndoMultiVerdictMember wire ABI is 24 bytes");
+
+typedef struct ClusterGcsUndoMultiVerdictPage {
+	uint32 magic;		 /* CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC */
+	uint32 version;		 /* CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION */
+	uint64 mxid_echo;	 /* asked-for mxid widened to u64 (upper 32 bits zero) */
+	uint16 nmembers;	 /* 1..CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS */
+	uint8 status;		 /* ClusterGcsUndoMultiVerdictStatus */
+	uint8 reserved_0[5]; /* must be zero (pads members[] to 8-byte alignment) */
+	ClusterGcsUndoMultiVerdictMember members[FLEXIBLE_ARRAY_MEMBER];
+} ClusterGcsUndoMultiVerdictPage;
+
+StaticAssertDecl(offsetof(ClusterGcsUndoMultiVerdictPage, members) == 24,
+				 "spec-7.1 D3-b multi-verdict header is 24 bytes (members 8-aligned)");
+StaticAssertDecl(offsetof(ClusterGcsUndoMultiVerdictPage, members)
+						 + CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS
+							   * sizeof(ClusterGcsUndoMultiVerdictMember)
+					 <= BLCKSZ,
+				 "spec-7.1 D3-b multi-verdict page (header + max members) must fit BLCKSZ");
 
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate

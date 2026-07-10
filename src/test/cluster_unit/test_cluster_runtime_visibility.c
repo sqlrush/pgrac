@@ -23,6 +23,7 @@
  */
 #include "postgres.h"
 
+#include "access/multixact.h"		   /* MultiXactStatus* member kinds (D3-b) */
 #include "cluster/cluster_gcs_block.h" /* undo-fetch tag + auth trailer (CP2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* fake TT header blocks (CP3) */
@@ -404,6 +405,137 @@ UT_TEST(test_undo_verdict_page_usable)
 	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
 }
 
+/* spec-7.1 D3-b: structural validation of a batched multixact member-verdict
+ * page.  true only for a SERVED page whose every member is internally
+ * consistent (lock-only carry no verdict/scn; updaters carry a known verdict
+ * whose scn fields match the kind), or the page is refused (caller keeps
+ * 53R97).  Covers the batch boundaries 1 / 2 / MAX / MAX+1 (Rule 8.A). */
+UT_TEST(test_undo_multi_verdict_page_usable)
+{
+	PGAlignedBlock blk;
+	ClusterGcsUndoMultiVerdictPage *v = (ClusterGcsUndoMultiVerdictPage *)blk.data;
+	MultiXactId asked = 4242;
+	int i;
+
+	/* Baseline good SERVED page: 1 updater EXACT + 1 lock-only. */
+	memset(blk.data, 0, BLCKSZ);
+	v->magic = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION;
+	v->mxid_echo = asked;
+	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
+	v->nmembers = 2;
+	v->members[0].member_status = MultiXactStatusUpdate; /* updater */
+	v->members[0].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v->members[0].commit_scn = 777;
+	v->members[0].horizon_scn = InvalidScn;
+	v->members[0].wrap = 3;
+	v->members[0].xid = 111;
+	v->members[1].member_status = MultiXactStatusForShare; /* lock-only */
+	v->members[1].verdict = 0;
+	v->members[1].xid = 222;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), true);
+
+	/* NULL page / invalid asked mxid. */
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(NULL, asked), false);
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, InvalidMultiXactId), false);
+
+	/* Wrong magic / version / echo (incl. a widened echo with high bits). */
+	v->magic = 0xDEADBEEF;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->magic = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC;
+	v->version = 2;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->version = CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, 4243), false);
+	v->mxid_echo = (((uint64)1) << 32) + asked; /* high word poisons the echo */
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->mxid_echo = asked;
+
+	/* Only a SERVED page carries consumable members (DENIED never reaches
+	 * here, but re-check defence-in-depth). */
+	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_UNPROVABLE;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
+
+	/* nmembers bounds: < 2 refused (a real multi has >= 2 members; the origin
+	 * ships NO_MEMBERS for < 2), MAX ok (below), MAX+1 refused. */
+	v->nmembers = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->nmembers = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->nmembers = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS + 1;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->nmembers = 2;
+
+	/* Non-zero reserved bytes poison the page. */
+	v->reserved_0[2] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->reserved_0[2] = 0;
+
+	/* Out-of-range member_status (> MaxMultiXactStatus) refused. */
+	v->members[0].member_status = 9;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].member_status = MultiXactStatusUpdate;
+
+	/* A lock-only member must carry NO verdict and NO scn. */
+	v->members[1].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[1].verdict = 0;
+	v->members[1].commit_scn = 5;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[1].commit_scn = InvalidScn;
+
+	/* Updater EXACT consistency: needs commit_scn, refuses a horizon. */
+	v->members[0].commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].commit_scn = 777;
+	v->members[0].horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].horizon_scn = InvalidScn;
+
+	/* Updater BELOW_HORIZON: needs a horizon, refuses an exact scn. */
+	v->members[0].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+	v->members[0].commit_scn = InvalidScn;
+	v->members[0].horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), true);
+	v->members[0].commit_scn = 777;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].commit_scn = InvalidScn;
+	v->members[0].horizon_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+
+	/* Updater ABORTED: carries no scn of any kind. */
+	v->members[0].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), true);
+	v->members[0].commit_scn = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].commit_scn = InvalidScn;
+
+	/* Updater with an unknown verdict (0 / one past the last known) refuses
+	 * the WHOLE page (8.A: never a partial-proof multi). */
+	v->members[0].verdict = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	v->members[0].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED + 1;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+
+	/* Capacity boundary: MAX all-updater members round-trip; poisoning the
+	 * LAST member still refuses (the validator walks every member). */
+	memset(blk.data, 0, BLCKSZ);
+	v->magic = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION;
+	v->mxid_echo = asked;
+	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
+	v->nmembers = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS;
+	for (i = 0; i < CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS; i++) {
+		v->members[i].member_status = MultiXactStatusUpdate;
+		v->members[i].verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+		v->members[i].xid = 1000 + (TransactionId)i;
+	}
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), true);
+	v->members[CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS - 1].commit_scn = 9;
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+}
+
 /* CP2: synthetic undo-address tag roundtrip + magic discrimination. */
 UT_TEST(test_undo_fetch_tag_roundtrip)
 {
@@ -429,7 +561,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -446,6 +578,7 @@ main(void)
 	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
 	UT_RUN(test_undo_verdict_page_usable);
+	UT_RUN(test_undo_multi_verdict_page_usable);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

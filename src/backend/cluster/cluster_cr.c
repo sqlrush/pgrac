@@ -162,6 +162,12 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_server_verdict_served_count;
 	pg_atomic_uint64 cr_server_verdict_denied_count;
 	/*
+	 * spec-7.1 D3-b (server side): multixact member-verdict batches served vs
+	 * refused (any unprovable updater member refuses the whole multi).
+	 */
+	pg_atomic_uint64 cr_server_multi_verdict_served_count;
+	pg_atomic_uint64 cr_server_multi_verdict_denied_count;
+	/*
 	 * spec-6.15 D4: a recycled remote ref whose tuple xid the stripe
 	 * derivation could not attribute (striping off / below the activation
 	 * floor) — the active-runtime resolution never even asks the wire and
@@ -169,6 +175,59 @@ typedef struct ClusterCRShared {
 	 * striped cluster).
 	 */
 	pg_atomic_uint64 rtvis_underivable_failclosed_count;
+	/*
+	 * spec-7.1 D0/D5: 53R97 per-leg attribution.  Every fail-closed refusal
+	 * on the cross-instance read path is attributed to the leg that produced
+	 * it, so the census (D0 before / D4 after) can prove each leg's zeroing
+	 * by the mechanism that closed it instead of a lump total.  Server side
+	 * (origin LMS verdict serve): invalid_scn = durable by-xid hit with an
+	 * unstamped commit_scn (delayed cleanout window); zero_match = provably
+	 * recycled slot whose CLOG state is neither explicit commit nor abort;
+	 * srv_other = every remaining refusal (ambiguous wrap, scan unavailable,
+	 * non-own xid, wrap-suspect, in-doubt stamped-then-crashed).  Requester
+	 * side: covers_refuse = live-authority covers gate refused the verdict
+	 * pairing; multi_unresolvable = a multixact xmax whose member set or
+	 * origin cannot be proven; xmax_unprovable = a deleting xmax whose
+	 * terminal state resolution ended unproven (fail-closed -1).
+	 */
+	pg_atomic_uint64 vis53r97_leg_invalid_scn_refuse_count;
+	pg_atomic_uint64 vis53r97_leg_zero_match_refuse_count;
+	pg_atomic_uint64 vis53r97_leg_srv_other_refuse_count;
+	pg_atomic_uint64 vis53r97_leg_covers_refuse_count;
+	pg_atomic_uint64 vis53r97_leg_multi_unresolvable_count;
+	pg_atomic_uint64 vis53r97_leg_xmax_unprovable_count;
+	/*
+	 * spec-7.1 D1 requester 半边: the xmin overlay-miss leg (census S5's
+	 * largest 53R97 source) asks the origin for a by-xid verdict before
+	 * failing closed.  ask = every such verdict ask issued; hit = the ask
+	 * proved a terminal state (positive interread).  ask far exceeding the
+	 * distinct-missed-xid count over a census window is the same-xid
+	 * thundering-herd signal (N backends miss one hot xid -> N parallel asks
+	 * to one origin; singleflight is a 7.2/7.3 concern -- D5 only makes it
+	 * observable, IN-9 执行条件 2).
+	 */
+	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_ask_count;
+	pg_atomic_uint64 vis53r97_leg_xmin_overlay_verdict_hit_count;
+	/*
+	 * spec-7.1 D3-b requester 半边: a foreign multixact xmax whose member
+	 * overlay missed asked the origin for a batched member verdict.  ask =
+	 * every request sent; hit = a request whose SERVED page resolved to a
+	 * definite VISIBLE/INVISIBLE.  unprovable = ask - hit (a DENIED / timeout /
+	 * invalid page, or a SERVED page still UNKNOWN at this read_scn) -> 53R97.
+	 */
+	pg_atomic_uint64 vis53r97_leg_multi_member_serve_ask_count;
+	pg_atomic_uint64 vis53r97_leg_multi_member_serve_hit_count;
+	/*
+	 * spec-7.1 D1 serve 半边: the origin LMS verdict serve upgraded a durable
+	 * XID_MATCH_INVALID_SCN hit (unstamped commit_scn, delayed-cleanout window)
+	 * to a positive ABORTED answer by cross-checking CLOG (authoritative for
+	 * our own xid).  hit = the leg resolved positively (aborted-unstamped, the
+	 * IN-5 real population); the miss counterpart is invalid_scn_refuse_count
+	 * above (an INVALID_SCN hit that stays fail-closed: in-flight, 2PC-prepared,
+	 * crash window, or committed-but-unstamped -- no fabricated commit_scn).
+	 * 8.A: positive proof only; direction of every refuse leg is unchanged.
+	 */
+	pg_atomic_uint64 vis53r97_leg_live_upgrade_hit_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -250,7 +309,20 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_verdict_inadmissible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_verdict_denied_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_served_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_invalid_scn_refuse_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_zero_match_refuse_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_srv_other_refuse_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_covers_refuse_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_unresolvable_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_member_serve_ask_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_multi_member_serve_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->vis53r97_leg_live_upgrade_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -318,6 +390,12 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 		break;
 	case CLUSTER_CR_SERVER_STAT_VERDICT_DENIED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_verdict_denied_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_multi_verdict_served_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_multi_verdict_denied_count, 1);
 		break;
 	}
 }
@@ -411,6 +489,100 @@ cluster_rtvis_note_underivable_failclosed(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
 }
+
+/* PGRAC: spec-7.1 D0/D5 — 53R97 per-leg attribution bumps (see the struct
+ * comment for each leg's meaning; server legs run in LMS drain context,
+ * requester legs in backend context — all plain atomic adds). */
+void
+cluster_vis53r97_note_srv_invalid_scn(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_invalid_scn_refuse_count, 1);
+}
+
+void
+cluster_vis53r97_note_srv_zero_match(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_zero_match_refuse_count, 1);
+}
+
+void
+cluster_vis53r97_note_srv_other(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_srv_other_refuse_count, 1);
+}
+
+void
+cluster_vis53r97_note_covers_refuse(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_covers_refuse_count, 1);
+}
+
+void
+cluster_vis53r97_note_multi_unresolvable(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_multi_unresolvable_count, 1);
+}
+
+void
+cluster_vis53r97_note_xmax_unprovable(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmax_unprovable_count, 1);
+}
+
+/* spec-7.1 D1 requester 半边: xmin overlay-miss verdict ask / hit. */
+void
+cluster_vis53r97_note_xmin_overlay_verdict_ask(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_ask_count, 1);
+}
+
+void
+cluster_vis53r97_note_xmin_overlay_verdict_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_xmin_overlay_verdict_hit_count, 1);
+}
+
+/* spec-7.1 D3-b requester 半边: foreign multixact member-verdict ask / hit. */
+void
+cluster_vis53r97_note_multi_member_serve_ask(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_multi_member_serve_ask_count, 1);
+}
+
+void
+cluster_vis53r97_note_multi_member_serve_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_multi_member_serve_hit_count, 1);
+}
+
+/* spec-7.1 D1 serve 半边: INVALID_SCN durable hit upgraded to positive ABORTED
+ * via CLOG cross-check (the miss counterpart is note_srv_invalid_scn). */
+void
+cluster_vis53r97_note_live_upgrade_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis53r97_leg_live_upgrade_hit_count, 1);
+}
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_ask_count,
+					vis53r97_leg_xmin_overlay_verdict_ask_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmin_overlay_verdict_hit_count,
+					vis53r97_leg_xmin_overlay_verdict_hit_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_multi_member_serve_ask_count,
+					vis53r97_leg_multi_member_serve_ask_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_multi_member_serve_hit_count,
+					vis53r97_leg_multi_member_serve_hit_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_live_upgrade_hit_count,
+					vis53r97_leg_live_upgrade_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -447,7 +619,22 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_below_horizon_count, rtvis_verdict_bel
 CR_COUNTER_ACCESSOR(cluster_rtvis_verdict_inadmissible_count, rtvis_verdict_inadmissible_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_served_count, cr_server_verdict_served_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_verdict_denied_count, cr_server_verdict_denied_count)
+/* spec-7.1 D3-b: origin multixact member-verdict serve counters. */
+CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_served_count,
+					cr_server_multi_verdict_served_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_denied_count,
+					cr_server_multi_verdict_denied_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_invalid_scn_refuse_count,
+					vis53r97_leg_invalid_scn_refuse_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_zero_match_refuse_count,
+					vis53r97_leg_zero_match_refuse_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_srv_other_refuse_count,
+					vis53r97_leg_srv_other_refuse_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_covers_refuse_count, vis53r97_leg_covers_refuse_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_multi_unresolvable_count,
+					vis53r97_leg_multi_unresolvable_count)
+CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_xmax_unprovable_count, vis53r97_leg_xmax_unprovable_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)

@@ -280,8 +280,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '161',
-   'L15 total injection registry size is 161 (spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; full breakdown in t/015)');
+   '162',
+   'L15 total injection registry size is 162 (spec-7.1 D3-a +1 cluster-mxid-halfspace-hard-limit; spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 cluster-xid-herding-stall + cluster-xid-window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; full breakdown in t/015)');
 
 
 # ----------

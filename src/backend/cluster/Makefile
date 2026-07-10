@@ -217,6 +217,8 @@ OBJS = \
 	cluster_tx_enqueue.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
+	cluster_multixact_served.o \
+	cluster_mxid_stripe.o \
 	cluster_visibility_inject.o \
 	cluster_stats.o \
 	cluster_version.o \

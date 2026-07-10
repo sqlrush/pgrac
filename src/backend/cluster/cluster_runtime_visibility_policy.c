@@ -29,7 +29,8 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_gcs_block.h" /* ClusterGcsUndoVerdictPage (CP5) */
+#include "access/multixact.h"		   /* MultiXactStatusForUpdate / MaxMultiXactStatus (D3-b) */
+#include "cluster/cluster_gcs_block.h" /* ClusterGcsUndo{,Multi}VerdictPage (CP5 / D3-b) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_scn.h"		  /* scn_time_cmp / SCN_VALID (spec-7.1a D3) */
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
@@ -229,4 +230,84 @@ cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 	default:
 		return false; /* unknown kind: refuse, never guess */
 	}
+}
+
+/*
+ * cluster_vis_undo_multi_verdict_page_usable — see header for the contract.
+ */
+bool
+cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdictPage *v,
+										   MultiXactId asked_mxid)
+{
+	uint16 i;
+
+	if (v == NULL || !MultiXactIdIsValid(asked_mxid))
+		return false;
+
+	if (v->magic != CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC
+		|| v->version != CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION)
+		return false;
+
+	/* The echo is the widened mxid: upper 32 bits MUST be zero (a non-zero
+	 * high word means a corrupted or foreign carrier, never a valid echo). */
+	if (v->mxid_echo != (uint64)asked_mxid)
+		return false;
+
+	/* Only a fully-proven SERVED page carries consumable members; every other
+	 * status ships as a DENIED reply (no page), so it should never reach here.
+	 * Re-check defensively (8.A): never consume an UNPROVABLE / NOT_MINE page. */
+	if (v->status != (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED)
+		return false;
+
+	/* A real multi always has members; the origin refuses < 2 as NO_MEMBERS.
+	 * Reject < 2 (not a real multi) and anything past the wire capacity, so the
+	 * requester's variable-length member loop is bounded to [2, MAX]. */
+	if (v->nmembers < 2 || v->nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS)
+		return false;
+
+	for (i = 0; i < sizeof(v->reserved_0); i++)
+		if (v->reserved_0[i] != 0)
+			return false;
+
+	for (i = 0; i < v->nmembers; i++) {
+		const ClusterGcsUndoMultiVerdictMember *m = &v->members[i];
+
+		/* member_status must be a real MultiXactStatus (0..5). */
+		if (m->member_status > MaxMultiXactStatus)
+			return false;
+
+		/* Lock-only members (<= MultiXactStatusForUpdate, status 0-3) never
+		 * gate visibility (A2): they carry no verdict and no scn of any kind. */
+		if (m->member_status <= MultiXactStatusForUpdate) {
+			if (m->verdict != 0 || SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			continue;
+		}
+
+		/* Updater members (4-5): the verdict kind must be known and its scn
+		 * fields consistent with the kind, mirroring the single-verdict page
+		 * (any updater without a proven terminal refuses the WHOLE page). */
+		switch (m->verdict) {
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+			/* Exact terminal commit: needs the exact scn, carries no bound. */
+			if (!SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+			/* Bound-only commit: needs the horizon, must NOT claim an exact
+				 * scn (a stray commit_scn could leak into stamp/cache paths). */
+			if (SCN_VALID(m->commit_scn) || !SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+			/* Terminal abort carries no scn of any kind. */
+			if (SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		default:
+			return false; /* unknown kind on an updater: refuse, never guess */
+		}
+	}
+
+	return true;
 }

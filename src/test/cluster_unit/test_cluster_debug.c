@@ -335,6 +335,19 @@ cluster_remote_xact_side_effect_drop_count(void)
 {
 	return 0;
 }
+/* spec-7.1 D3-a stub: dump_state (cluster_debug.o) reads the striped-multixact
+ * origin-derivation observability counters; cluster_multixact.o is not linked
+ * here.  Stub each to return 0 (matches the module-disabled path). */
+uint64
+cluster_multixact_get_mxid_halfspace_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_mxid_underivable_read_count(void)
+{
+	return 0;
+}
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
  * cluster_relmap_authority.o is not linked here.  cluster_shared_catalog is
  * false above, so the read is short-circuited and never called. */
@@ -1867,7 +1880,73 @@ cluster_cr_server_verdict_denied_count(void)
 	return 0;
 }
 uint64
+cluster_cr_server_multi_verdict_served_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_multi_verdict_denied_count(void)
+{
+	return 0;
+}
+uint64
 cluster_rtvis_underivable_failclosed_count(void)
+{
+	return 0;
+}
+/* spec-7.1 D0/D5: 53R97 per-leg attribution counters. */
+uint64
+cluster_vis53r97_leg_invalid_scn_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_zero_match_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_srv_other_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_covers_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_unresolvable_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmax_unprovable_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_member_serve_ask_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_member_serve_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_live_upgrade_hit_count(void)
 {
 	return 0;
 }

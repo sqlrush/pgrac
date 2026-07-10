@@ -705,6 +705,15 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-xid-herding-stall" },
 	{ .name = "cluster-xid-window-hard-limit" },
+
+	/*
+	 * spec-7.1 D3-a — mxid stripe half-space guardrail.
+	 *   cluster-mxid-halfspace-hard-limit: armed-state peek FORCES the
+	 *     53RB4 refusal branch in GetNewMultiXactId (the organic
+	 *     trigger needs 2^31 multixacts; the armed peek lets a test
+	 *     exercise the fail-closed leg + guardrail counter).
+	 */
+	{ .name = "cluster-mxid-halfspace-hard-limit" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

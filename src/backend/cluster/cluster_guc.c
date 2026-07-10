@@ -125,6 +125,9 @@ bool cluster_xid_striping = false;
 /* spec-6.15 D5/D3: herding slack (xid-value gap tolerated between
  * stripe slots; also the seeded activation-floor headroom). */
 int cluster_xid_herding_slack = 4194304;
+/* spec-7.1 D3-a: cross-node multixact xmax positive resolution
+ * (default ON; off = the D3-0 fail-closed floor verbatim). */
+bool cluster_multi_xmax_remote_resolve = true;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1613,6 +1616,24 @@ cluster_init_guc(void)
 					 "modulo 16, making xid values self-describing about their origin "
 					 "node. Requires cluster.node_id between 0 and 15."),
 		&cluster_xid_striping, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.multi_xmax_remote_resolve -- spec-7.1 D3-a.  When on
+	 * (default), a reader that meets a foreign-origin updater
+	 * multixact xmax derives the origin from the striped mxid value
+	 * and resolves member visibility through the cluster member
+	 * overlay; anything unprovable still fails closed.  Off = the
+	 * fail-closed floor verbatim (every updater multi in peer mode
+	 * refuses with SQLSTATE 53R9C).  SIGHUP: a pure reader-side
+	 * positive branch, safe to flip at runtime.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.multi_xmax_remote_resolve",
+		gettext_noop(
+			"Resolve foreign multixact xmax through the cluster member overlay (spec-7.1)."),
+		gettext_noop("When off, every updater-bearing multixact xmax on a cluster page "
+					 "read in peer mode fails closed with SQLSTATE 53R9C."),
+		&cluster_multi_xmax_remote_resolve, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.xid_herding_slack -- spec-6.15 D5/D3.  Allowed xid-value
