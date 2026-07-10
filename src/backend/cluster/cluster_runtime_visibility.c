@@ -58,6 +58,7 @@
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
 #include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
+#include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
 
 /*
  * cluster_vis_live_authority_covers
@@ -226,8 +227,8 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 XLogRecPtr anchor_lsn, SCN read_scn, bool authoritative, bool *out_committed,
-						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+						 XLogRecPtr anchor_lsn, SCN read_scn, bool authoritative,
+						 bool *out_committed, SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
 	ClusterLiveAuthority auth;
@@ -350,6 +351,11 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		*out_committed = false;
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
+
+	/* spec-5.22e D5-8: inherently remote -- same admission as the verdict
+	 * entry (53R60 on not-member/pre-join; false = mixed-cap fail-closed). */
+	if (!cluster_undo_horizon_read_admission_enforce(read_scn))
+		return false;
 	if (out_commit_scn_is_bound != NULL)
 		*out_commit_scn_is_bound = false;
 	if (out_committed == NULL || out_commit_scn == NULL || out_commit_scn_is_bound == NULL)
@@ -571,6 +577,15 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 	if (!TransactionIdIsNormal(raw_xid) || origin_node < 0)
 		return unknown;
 
+	/*
+	 * spec-5.22e D5-8 read admission, FOREIGN arm only (own-instance reads
+	 * below are untouched): a non-MEMBER or pre-join snapshot must not
+	 * consult foreign undo (53R60 inside), and a mixed-capability cluster
+	 * fails closed here (false return keeps the UNKNOWN/53R97 shape).
+	 */
+	if (origin_node != cluster_node_id && !cluster_undo_horizon_read_admission_enforce(read_scn))
+		return unknown;
+
 	/* master==self: own CLOG + own durable TT authority (Q5/D3-4). */
 	if (origin_node == cluster_node_id)
 		return rtvis_resolve_own_xid(raw_xid, read_scn);
@@ -639,8 +654,8 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 	/* master!=self, owner live (or data plane unarmed): CP3 S-grant + CP5
 	 * origin verdict, byte-for-byte the pre-D4 path. */
 	if (cluster_runtime_visibility_try_resolve_remote(origin_node, undo_segment_id, raw_xid,
-													  anchor_lsn, read_scn, authoritative, &committed,
-													  &commit_scn, &is_bound))
+													  anchor_lsn, read_scn, authoritative,
+													  &committed, &commit_scn, &is_bound))
 		return cluster_undo_verdict_from_resolve(true, committed, commit_scn, is_bound);
 	return unknown;
 }

@@ -26,8 +26,10 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_guc.h" /* cluster_node_id (spec-5.22e D5-8) */
 #include "cluster/cluster_membership.h"
-#include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum (quorum sub-gate) */
+#include "cluster/cluster_qvotec.h"		  /* cluster_qvotec_in_quorum (quorum sub-gate) */
+#include "cluster/cluster_undo_horizon.h" /* note_self_member (spec-5.22e D5-8) */
 
 /*
  * Backing store.
@@ -168,9 +170,24 @@ cluster_membership_get_state(int32 node_id)
 void
 cluster_membership_set_state(int32 node_id, ClusterMembershipState state)
 {
+	ClusterMembershipState prev;
+
 	if (!node_id_in_range(node_id))
 		return;
+	prev = (ClusterMembershipState)MembershipTable->membership_state[node_id];
 	MembershipTable->membership_state[node_id] = (uint8)state;
+
+	/*
+	 * spec-5.22e D5-8: capture the exact epoch at which THIS node becomes
+	 * MEMBER (bootstrap formation, online join and rejoin all funnel through
+	 * this choke).  The read-admission gate compares snapshot->read_epoch
+	 * against it so pre-join snapshots can never consume foreign undo, and
+	 * a late capture would mis-refuse legitimate post-admission snapshots
+	 * after an unrelated epoch bump.
+	 */
+	if (node_id == cluster_node_id && state == CLUSTER_MEMBER_MEMBER
+		&& prev != CLUSTER_MEMBER_MEMBER)
+		cluster_undo_horizon_note_self_member();
 }
 
 /*

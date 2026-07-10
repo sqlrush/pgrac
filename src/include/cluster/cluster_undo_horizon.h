@@ -189,6 +189,11 @@ extern int cluster_undo_horizon_sample_views(ClusterUndoHorizonReportView *views
 extern bool cluster_undo_horizon_required_members(uint8 *required, uint64 *out_epoch);
 /* F-D2 epoch fence (recycle mutation points; injection-forceable, t/370 L6) */
 extern bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
+/* D5-8 read admission: self-MEMBER capture + consumer-side enforce (53R60 on
+ * not-member / pre-join snapshot; false = mixed-capability, caller keeps its
+ * UNKNOWN/53R97 fail-closed shape).  Foreign arms only; own reads ungated. */
+extern void cluster_undo_horizon_note_self_member(void);
+extern bool cluster_undo_horizon_read_admission_enforce(SCN read_scn);
 
 /* observability (D5-5) */
 extern void cluster_undo_horizon_note_stall(void);

@@ -582,9 +582,10 @@ UT_TEST(test_hello_wire_reference_bytes)
 	UT_ASSERT_EQ(wire[13], 'B');
 	for (i = 14; i < 36; i++)
 		UT_ASSERT_EQ(wire[i], 0);
-	/* capability bitmap: exactly the unconditional D4-6 authority-serve bit
+	/* capability bitmap: the unconditional protocol bits -- D4-6
+	 * authority-serve (0x2) + spec-5.22e D5-2 undo-horizon (0x4)
 	 * (smart-fusion is off in this fixture) */
-	UT_ASSERT_EQ(wire[36], 0x02);
+	UT_ASSERT_EQ(wire[36], 0x06);
 	UT_ASSERT_EQ(wire[37], 0x00);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
@@ -598,9 +599,9 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
 
-	/* the spec-5.22d D4-6 authority-serve bit is unconditional, so it is
-	 * the capability-word BASELINE in every row below; only the smart-
-	 * fusion bit is GUC/tier-gated */
+	/* the spec-5.22d D4-6 authority-serve + spec-5.22e undo-horizon bits
+	 * are unconditional, so they are the capability-word BASELINE in every
+	 * row below; only the smart-fusion bit is GUC/tier-gated */
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
@@ -608,7 +609,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 						   "sf-off");
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
-				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1);
+				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -617,7 +618,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 						   "sf-tier-mismatch");
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
-				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1);
+				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -627,7 +628,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
 				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
-					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1);
+					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;

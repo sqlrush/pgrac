@@ -53,6 +53,12 @@
  *	miss / DENIED / doubt returns false so the caller keeps its 53R97
  *	fail-closed boundary (Rule 8.A -- MVCC/visibility never forward-links a
  *	false-visible edge).
+ *
+ *	spec-5.22e D5-8 contract: every caller must pass the read-admission
+ *	gate (cluster_undo_horizon_read_admission_enforce) BEFORE reaching this
+ *	primitive -- the sole current caller (try_resolve_remote) gates at its
+ *	entry.  A new caller that skips admission reopens the pre-join /
+ *	mixed-capability consumption hole.
  */
 bool
 cluster_undo_block_acquire_shared(const ClusterResId *undo_resid, uint32 expected_generation,

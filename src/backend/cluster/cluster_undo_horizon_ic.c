@@ -56,6 +56,7 @@
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
 #include "storage/shmem.h"
+#include "utils/snapmgr.h" /* ActiveSnapshotSet / GetActiveSnapshot (D5-8) */
 #include "utils/timestamp.h"
 
 /*
@@ -90,7 +91,8 @@ typedef struct ClusterUndoHorizonShmem {
 	pg_atomic_uint64 pass_abort_count;
 	pg_atomic_uint64 wire_reject_count;
 	pg_atomic_uint64 admission_refuse_count;
-	pg_atomic_uint64 last_floor_scn; /* gauge: last OK fold result */
+	pg_atomic_uint64 last_floor_scn;	  /* gauge: last OK fold result */
+	pg_atomic_uint64 self_admitted_epoch; /* D5-8: epoch self last became MEMBER */
 } ClusterUndoHorizonShmem;
 
 static ClusterUndoHorizonShmem *UndoHorizonShmem = NULL;
@@ -121,6 +123,7 @@ cluster_undo_horizon_shmem_init(void)
 		pg_atomic_init_u64(&shmem->wire_reject_count, 0);
 		pg_atomic_init_u64(&shmem->admission_refuse_count, 0);
 		pg_atomic_init_u64(&shmem->last_floor_scn, 0);
+		pg_atomic_init_u64(&shmem->self_admitted_epoch, 0);
 	}
 	UndoHorizonShmem = shmem;
 }
@@ -427,6 +430,124 @@ cluster_undo_horizon_required_members(uint8 *required, uint64 *out_epoch)
 		}
 	}
 	return false;
+}
+
+/* ---------------- D5-8 read admission (consumer side) ----------------- */
+
+/*
+ * Self admission epoch: the reconfig epoch at which THIS node last became
+ * MEMBER (captured by the cluster_membership_set_state choke, so every
+ * admission path -- bootstrap formation, online join, rejoin -- records it
+ * exactly).  0 = never admitted this incarnation (conservative refuse).
+ */
+void
+cluster_undo_horizon_note_self_member(void)
+{
+	if (UndoHorizonShmem == NULL)
+		return;
+	pg_atomic_write_u64(&UndoHorizonShmem->self_admitted_epoch, cluster_epoch_get_current());
+}
+
+/*
+ * cluster_undo_horizon_read_admission_enforce -- D5-8 gate at every
+ * cross-node undo consumption entry (D3 verdict wire leg, D2-3 CP3
+ * acquire, 6.12i live resolve).  Own-instance reads are NOT gated (the
+ * callers only invoke this on their foreign arms).
+ *
+ *	Refusal arms (S3.0 (4): a snapshot must either be covered by the fold
+ *	or be unable to reference foreign undo at all):
+ *	  - self not MEMBER: a JOINING/ABSENT node's reads are legal locally
+ *	    but must not consult foreign undo -- its snapshots are not covered
+ *	    by any owner's required set.  53R60, retry-safe: succeeds once the
+ *	    join commits and a NEW snapshot is taken.
+ *	  - pre-join snapshot: snapshot->read_epoch predates this node's
+ *	    admission -- it existed before owners were required to cover us
+ *	    (F-D3(3); a mere at-consumption MEMBER check would re-admit it).
+ *	    Also 53R60 with a new-snapshot hint.
+ *	  - mixed capability: an old-binary MEMBER owner has no brake, so a
+ *	    new consumer must not trust ANY owner's retention until the whole
+ *	    cluster is capable (S3.3 matrix).  Returns false; the caller keeps
+ *	    its existing UNKNOWN/53R97 fail-closed shape (LOG-once here).
+ *
+ *	The epoch is read from the ACTIVE snapshot (crossnode resolution runs
+ *	under the snapshot being evaluated; catalog snapshots are forced LOCAL
+ *	and never reach these paths).  Any shape we cannot prove -- no active
+ *	snapshot, or its read_scn disagreeing with the resolver's -- refuses
+ *	conservatively (never "assume admissible").
+ *
+ *	Rejoin residual note (S3.0 (3)): a joiner adopts its admitted epoch off
+ *	the voting disk (cluster_epoch_adopt_admitted), which carries no SCN
+ *	observe; but every foreign consumption below rides IC envelopes whose
+ *	reply observe (cluster_ic_envelope.c) advances the clock before any
+ *	verdict is consumed, and a pre-observe snapshot that meets an
+ *	already-recycled slot lands in the COMMITTED_BELOW_HORIZON catch-up
+ *	bound arm -- fail-closed, never false-visible.
+ */
+bool
+cluster_undo_horizon_read_admission_enforce(SCN read_scn)
+{
+	uint64 admitted;
+	Snapshot snap;
+	int pi;
+
+	if (cluster_node_id < 0)
+		return true; /* cluster off: nothing to gate */
+
+	if (cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER) {
+		if (UndoHorizonShmem != NULL)
+			pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						errmsg("cross-node undo access refused: this node is not an admitted "
+							   "cluster member yet"),
+						errhint("Retry after the node's join completes; local reads are "
+								"unaffected.")));
+	}
+
+	admitted
+		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
+	snap = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+	if (admitted == 0 || snap == NULL || snap->read_epoch < admitted
+		|| (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn) && snap->read_scn != read_scn)) {
+		if (UndoHorizonShmem != NULL)
+			pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						errmsg("cross-node undo access refused: snapshot predates this node's "
+							   "cluster admission"),
+						errhint("Take a new snapshot (new statement or transaction) after the "
+								"join completed and retry.")));
+	}
+
+	/*
+	 * Mixed-capability hard gate (Q3''/S3.3): every MEMBER peer must be
+	 * horizon-capable on its current connection before cross-node
+	 * consumption may trust any owner's retention.
+	 */
+	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+		if (pi == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(pi) == NULL)
+			continue;
+		if (cluster_membership_get_state(pi) != CLUSTER_MEMBER_MEMBER)
+			continue;
+		if (!cluster_sf_peer_supports_undo_horizon(pi)) {
+			static bool nocap_logged = false;
+
+			if (UndoHorizonShmem != NULL)
+				pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
+			if (!nocap_logged) {
+				nocap_logged = true;
+				ereport(LOG, (errmsg("cross-node undo access fail-closed: cluster member %d "
+									 "lacks the undo-horizon capability (mixed-version "
+									 "cluster)",
+									 pi),
+							  errhint("Upgrade every node or keep cross-node consumption "
+									  "GUCs off during the upgrade window.")));
+			}
+			return false; /* caller keeps its UNKNOWN/53R97 fail-closed shape */
+		}
+	}
+
+	return true;
 }
 
 /*

@@ -54,6 +54,17 @@
 
 UT_DEFINE_GLOBALS();
 
+/* spec-5.22e D5-8 stub: cluster_membership_set_state notes self-admission
+ * into the undo horizon shmem (cluster_undo_horizon_ic.c not linked here);
+ * also satisfies the cluster_node_id extern via cluster_guc.o linkage or
+ * local definition in this binary. */
+void cluster_undo_horizon_note_self_member(void);
+void
+cluster_undo_horizon_note_self_member(void)
+{}
+int cluster_node_id = -1; /* GUC global stub (cluster_guc.o not linked) */
+
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
