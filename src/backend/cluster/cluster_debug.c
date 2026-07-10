@@ -2593,11 +2593,13 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis_freshref_verdict_resolved_count()));
 	emit_row(rsinfo, "cr", "vis_freshref_verdict_failclosed_count",
 			 fmt_int64((int64)cluster_vis_freshref_verdict_failclosed_count()));
-	/* spec-5.22d D4-4: dead-owner authority block0 serve outcomes. */
+	/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve outcomes. */
 	emit_row(rsinfo, "cr", "undo_authority_serve_hit_count",
 			 fmt_int64((int64)cluster_undo_authority_serve_hit_count()));
 	emit_row(rsinfo, "cr", "undo_authority_fail_closed_count",
 			 fmt_int64((int64)cluster_undo_authority_fail_closed_count()));
+	emit_row(rsinfo, "cr", "undo_authority_epoch_stale_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_epoch_stale_reject_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

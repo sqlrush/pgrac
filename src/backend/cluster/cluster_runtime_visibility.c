@@ -56,7 +56,6 @@
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
 #include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
-#include "cluster/cluster_undo_smgr.h"		/* cluster_undo_smgr_read_block (D4-4) */
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 
 /*
@@ -507,93 +506,35 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 
 /*
  * rtvis_authority_serve_block0 — D4-4 self-authority dead-owner block0 serve
- * (spec-5.22d §2.4, Route B).
+ * (spec-5.22d §2.4, Route B), requester-leg wrapper.
  *
  *	Self IS the elected serve authority for a dead/absent owner's undo
- *	resource: read the owner's durable block0 straight from shared storage
- *	(AUTHORITY_BLOCK0 intent, read-only) and prove the slot verdict on the
- *	read bytes.  Deliberately NOT an S-grant: the owner is dead and can grant
- *	nothing; block0 is synchronously durable (D2 Q3), so a successful full
- *	read is crash-consistent and no LSN-cover window applies (that gate
- *	belongs to the WAL-replay materialized path, which Route B does not use).
- *
- *	Admissibility = the coverage predicate (约束 #3, three-way AND):
- *	  (i)   claimed_at_epoch -- the route derivation (OK) is still scoped to
- *	        the CURRENT accepted epoch (an epoch move invalidates the claim);
- *	  (ii)  block0_readable  -- the shared block0 bytes were fully read via
- *	        the AUTHORITY_BLOCK0 foreign-owner intent (D4-3);
- *	  (iii) wrap_match       -- the slot-level xid+wrap positive proof
- *	        matched (content-based anti-ABA -- the same proof the live CP3
- *	        leg trusts; a recycled segment changes the slot wrap, so the
- *	        proof fails NONE).
- *	Any term false -> UNKNOWN_FAIL_CLOSED (the consumer keeps 53R97), never
- *	a native CLOG/hint fallback (Rule 8.A).  A proof NONE has no CP5
- *	fallback here: the origin is dead, there is nobody to ask -- the slot
- *	may live in another segment, so NONE proves nothing => fail closed.
+ *	resource.  The read + coverage + proof runs in the SHARED prove core
+ *	(cluster_undo_authority_block0_prove, D4-5) — the same core the
+ *	wire-served LMS authority leg runs, so the self answer and the served
+ *	answer over one (owner, segment, xid) can never diverge (Rule 8.A, the
+ *	same discipline as cluster_lms_undo_verdict_fill_page on the live-owner
+ *	path).  This wrapper only folds the outcome into the rtvis resolve
+ *	counters; the prove core owns the undo_authority_* counters.
  */
 static ClusterUndoVerdictResult
 rtvis_authority_serve_block0(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
 							 const ClusterUndoServeRoute *route)
 {
-	ClusterUndoVerdictResult unknown
-		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
-	PGAlignedBlock page;
-	SCN scn = InvalidScn;
-	uint16 wrap = TT_WRAP_INVALID;
-	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
-	bool claimed;
-	bool readable = false;
+	ClusterUndoVerdictResult r;
 
-	/*
-	 * Segment 0 is bootstrap-only (Assert-fenced in uba_encode): a ref
-	 * carrying it is not resolvable evidence (same pre-validation as the
-	 * live-owner remote leg).
-	 */
-	if (undo_segment_id == 0 || undo_segment_id > UINT16_MAX) {
-		cluster_undo_authority_note_failclosed();
-		cluster_rtvis_resolve_note_failclosed();
-		return unknown;
-	}
+	/* serve_decide only emits SELF_BLOCK0 on an OK route */
+	Assert(route->status == CLUSTER_UNDO_AUTHORITY_OK);
 
-	/* (i) the claim must still be scoped to the CURRENT epoch */
-	claimed = (route->status == CLUSTER_UNDO_AUTHORITY_OK
-			   && cluster_epoch_get_current() == route->reconfig_epoch);
-
-	/* (ii) read the dead owner's shared block0 (read-only foreign intent) */
-	if (claimed)
-		readable = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
-												undo_segment_id, (uint8)(origin_node + 1),
-												0 /* block0 */, page.data);
-
-	/* (iii) slot-level xid+wrap positive proof on the read bytes */
-	if (readable)
-		proof = cluster_vis_tt_block_positive_proof(page.data, undo_segment_id,
-													(uint8)(origin_node + 1), raw_xid, &scn, &wrap);
-
-	if (!cluster_undo_authority_coverage_ok(claimed, readable,
-											proof != CLUSTER_VIS_TT_PROOF_NONE)) {
-		cluster_undo_authority_note_failclosed();
-		cluster_rtvis_resolve_note_failclosed();
-		return unknown;
-	}
-
-	cluster_undo_authority_note_serve_hit();
-	if (proof == CLUSTER_VIS_TT_PROOF_COMMITTED) {
-		ClusterUndoVerdictResult r
-			= { .kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT, .commit_scn = scn, .wrap = wrap };
-
+	r = cluster_undo_authority_block0_prove((int32)origin_node, undo_segment_id, raw_xid,
+											route->reconfig_epoch);
+	if (r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT)
 		cluster_rtvis_resolve_note_committed();
-		return r;
-	}
-
-	/* CLUSTER_VIS_TT_PROOF_ABORTED: terminal, safe to consume */
-	{
-		ClusterUndoVerdictResult r
-			= { .kind = CLUSTER_UNDO_VERDICT_ABORTED, .commit_scn = InvalidScn, .wrap = wrap };
-
+	else if (r.kind == CLUSTER_UNDO_VERDICT_ABORTED)
 		cluster_rtvis_resolve_note_aborted();
-		return r;
-	}
+	else
+		cluster_rtvis_resolve_note_failclosed();
+	return r;
 }
 
 /*

@@ -41,8 +41,9 @@
 #define CLUSTER_UNDO_AUTHORITY_H
 
 #include "c.h"
-#include "cluster/cluster_grd.h"	  /* ClusterResId */
-#include "cluster/cluster_reconfig.h" /* CLUSTER_RECONFIG_DEAD_BITMAP_BYTES */
+#include "cluster/cluster_grd.h"		  /* ClusterResId */
+#include "cluster/cluster_reconfig.h"	  /* CLUSTER_RECONFIG_DEAD_BITMAP_BYTES */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (D4-5) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -197,6 +198,31 @@ cluster_undo_authority_serve_decide(const ClusterUndoServeRoute *route, int32 se
  */
 extern bool cluster_undo_authority_coverage_ok(bool claimed_at_epoch, bool block0_readable,
 											   bool wrap_match);
+
+/*
+ * D4-5 -- shared authority block0 prove core (heavy, snapshot object).  The
+ * ONE implementation both consumers run so the self-authority answer (D4-4
+ * requester leg, cluster_runtime_visibility.c) and the wire-served authority
+ * answer (D4-5/D4-6 LMS leg) over one (owner, segment, xid) can never
+ * diverge (Rule 8.A, the same discipline as cluster_lms_undo_verdict_fill_
+ * page for the live-owner path).
+ *
+ *	Reads the dead owner's durable shared block0 (AUTHORITY_BLOCK0 read-only
+ *	intent) and proves the slot verdict on the read bytes, admissible only
+ *	under the coverage three-way AND (§2.4).  The epoch axis re-checks
+ *	claim_epoch against the CURRENT accepted epoch; a stale claim bumps
+ *	undo_authority_epoch_stale_reject in addition to fail_closed.
+ *
+ *	Returns COMMITTED_EXACT{commit_scn, wrap} / ABORTED{wrap}, or
+ *	UNKNOWN_FAIL_CLOSED for every refusal (malformed input, bootstrap
+ *	segment 0, stale epoch, unreadable block0, no slot proof).  Bumps the
+ *	undo_authority_{serve_hit,fail_closed,epoch_stale_reject} counters
+ *	itself, so no consumer can forget the observability contract.
+ */
+extern ClusterUndoVerdictResult cluster_undo_authority_block0_prove(int32 owner_node,
+																	uint32 segment_id,
+																	TransactionId raw_xid,
+																	uint64 claim_epoch);
 
 #endif /* USE_PGRAC_CLUSTER */
 

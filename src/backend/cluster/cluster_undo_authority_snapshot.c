@@ -30,13 +30,17 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_conf.h"		/* CLUSTER_MAX_NODES */
-#include "cluster/cluster_epoch.h"		/* cluster_epoch_get_current */
-#include "cluster/cluster_membership.h" /* cluster_membership_get_state */
-#include "cluster/cluster_reconfig.h"	/* cluster_reconfig_get_observed_fresh_alive */
-#include "cluster/cluster_scn.h"		/* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_conf.h"				/* CLUSTER_MAX_NODES */
+#include "cluster/cluster_cr.h"					/* undo_authority_* counters (D4-5) */
+#include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current */
+#include "cluster/cluster_membership.h"			/* cluster_membership_get_state */
+#include "cluster/cluster_reconfig.h"			/* cluster_reconfig_get_observed_fresh_alive */
+#include "cluster/cluster_runtime_visibility.h" /* cluster_vis_tt_block_positive_proof */
+#include "cluster/cluster_scn.h"				/* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_tt_slot.h"			/* TT_WRAP_INVALID */
 #include "cluster/cluster_undo_authority.h"
 #include "cluster/cluster_undo_resid.h" /* cluster_undo_resid_master (D1) */
+#include "cluster/cluster_undo_smgr.h"	/* cluster_undo_smgr_read_block (D4-5) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -122,6 +126,77 @@ cluster_undo_serve_authority(const ClusterResId *undo_resid, uint64 reconfig_epo
 
 	st = cluster_undo_serve_authority_lookup(owner_node, reconfig_epoch, &authority_node);
 	return cluster_undo_route_decide(owner_node, reconfig_epoch, st, authority_node);
+}
+
+/*
+ * cluster_undo_authority_block0_prove -- shared authority block0 prove core
+ * (D4-5).  See cluster_undo_authority.h for the contract.
+ *
+ *	The coverage three-way AND (§2.4), with the counters owned HERE so the
+ *	requester self-serve leg (D4-4) and the wire-served LMS leg (D4-5/D4-6)
+ *	cannot drift on the observability contract:
+ *	  (i)   claimed_at_epoch: claim_epoch still IS the current accepted
+ *	        epoch; a stale claim bumps epoch_stale_reject + fail_closed.
+ *	  (ii)  block0_readable: the AUTHORITY_BLOCK0 foreign-owner intent
+ *	        (D4-3) resolved + fully read the shared block0 bytes.
+ *	  (iii) wrap_match: the slot-level xid+wrap positive proof matched
+ *	        (content-based anti-ABA; the same proof the live CP3 leg
+ *	        trusts).  block0 is synchronously durable (D2 Q3): a full read
+ *	        is crash-consistent, no LSN-cover window applies.
+ *	Proof NONE has no CP5 fallback: the owner is dead, there is nobody to
+ *	ask, so NONE proves nothing => fail closed (never a native fallback).
+ */
+ClusterUndoVerdictResult
+cluster_undo_authority_block0_prove(int32 owner_node, uint32 segment_id, TransactionId raw_xid,
+									uint64 claim_epoch)
+{
+	ClusterUndoVerdictResult unknown
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+	PGAlignedBlock page;
+	SCN scn = InvalidScn;
+	uint16 wrap = TT_WRAP_INVALID;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+	bool claimed;
+	bool readable = false;
+
+	/* malformed owner: never provable (defense in depth; the route layers
+	 * upstream already refuse it) */
+	if (owner_node < 0 || owner_node > SCN_MAX_VALID_NODE_ID || !TransactionIdIsNormal(raw_xid)) {
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
+
+	/* segment 0 is bootstrap-only (Assert-fenced in uba_encode): a ref
+	 * carrying it is not resolvable evidence */
+	if (segment_id == 0 || segment_id > UINT16_MAX) {
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
+
+	/* (i) the claim must still be scoped to the CURRENT epoch */
+	claimed = (cluster_epoch_get_current() == claim_epoch);
+	if (!claimed)
+		cluster_undo_authority_note_epoch_stale_reject();
+
+	/* (ii) read the dead owner's shared block0 (read-only foreign intent) */
+	if (claimed)
+		readable = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												segment_id, (uint8)(owner_node + 1), 0 /* block0 */,
+												page.data);
+
+	/* (iii) slot-level xid+wrap positive proof on the read bytes */
+	if (readable)
+		proof = cluster_vis_tt_block_positive_proof(page.data, segment_id, (uint8)(owner_node + 1),
+													raw_xid, &scn, &wrap);
+
+	if (!cluster_undo_authority_coverage_ok(claimed, readable,
+											proof != CLUSTER_VIS_TT_PROOF_NONE)) {
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
+
+	cluster_undo_authority_note_serve_hit();
+	return cluster_undo_verdict_from_block_proof(proof, scn, wrap);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

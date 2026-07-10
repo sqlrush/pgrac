@@ -1854,7 +1854,7 @@ cluster_vis_freshref_verdict_failclosed_count(void)
 {
 	return 0;
 }
-/* spec-5.22d D4-4: dead-owner authority block0 serve counters. */
+/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */
 uint64
 cluster_undo_authority_serve_hit_count(void)
 {
@@ -1862,6 +1862,11 @@ cluster_undo_authority_serve_hit_count(void)
 }
 uint64
 cluster_undo_authority_fail_closed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_epoch_stale_reject_count(void)
 {
 	return 0;
 }
