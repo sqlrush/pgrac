@@ -190,6 +190,8 @@ jobs:
           - { name: stage7-reconfig-liveness, ranges: "362-362", unit: false, regress: false }
           # t/363 spec-2.29a marker-async LMON liveness.
           - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
+          # t/365 spec-7.1a cross-instance write-write MVCC coordination.
+          - { name: stage7-write-write, ranges: "365-365", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
