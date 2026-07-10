@@ -150,6 +150,21 @@ extern bool cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerd
 												 TransactionId asked_xid);
 
 /*
+ * spec-5.22d D4-6: structural gate for an AUTHORITY-served verdict page
+ * (version 2 provenance) + the reply binding predicate.  The authority gate
+ * mirrors the v1 discipline but accepts ONLY version 2 and refuses the
+ * BELOW_HORIZON kind (the block0 prove has no horizon leg); the binding
+ * predicate is the 8.A amend — reply sender == elected authority AND reply
+ * epoch == stamped request epoch EXACTLY (the transport HC100 >= is only a
+ * pre-filter).  Pure: unit truth tables.
+ */
+extern bool
+cluster_vis_undo_authority_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+											   TransactionId asked_xid);
+extern bool cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32 authority_node,
+														uint64 reply_epoch, uint64 stamped_epoch);
+
+/*
  * CP3 + CP5 orchestration (backend): active-runtime resolution of a RECYCLED
  * remote ITL ref.  Two provable legs, both under the co-sampled live
  * authority gate (D-i2):

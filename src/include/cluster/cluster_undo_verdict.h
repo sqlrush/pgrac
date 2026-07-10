@@ -87,6 +87,20 @@ cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
 									TransactionId asked_xid);
 
 /*
+ * spec-5.22d D4-6 authority wire-page pair: the serve side fills a version-2
+ * page from one block0 prove result (refusing every kind the prove cannot
+ * produce), the requester side maps it back through the authority structural
+ * gate.  One fill + one mapper so the two wire ends can never disagree.
+ * Pure: no I/O, no shmem, no elog.
+ */
+extern bool cluster_undo_authority_verdict_page_fill(struct ClusterGcsUndoVerdictPage *v,
+													 TransactionId xid,
+													 const ClusterUndoVerdictResult *r);
+extern ClusterUndoVerdictResult
+cluster_undo_verdict_from_authority_wire_page(const struct ClusterGcsUndoVerdictPage *v,
+											  TransactionId asked_xid);
+
+/*
  * cluster_undo_verdict_from_block_proof -- map a CP3 single-block positive
  * proof to the taxonomy: COMMITTED -> COMMITTED_EXACT{commit_scn,wrap} (the
  * shipped block0 bytes carry the true commit SCN), ABORTED -> ABORTED, NONE ->

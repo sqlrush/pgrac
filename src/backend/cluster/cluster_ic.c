@@ -606,6 +606,10 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 
 	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
 		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
+	/* spec-5.22d D4-6: protocol capability, not runtime policy — this binary
+	 * understands kind-4 / version-2 regardless of any GUC, so advertise
+	 * unconditionally (the serve side's GUC gate refuses at run time). */
+	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 }

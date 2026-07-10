@@ -260,6 +260,150 @@ cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
 }
 
 /*
+ * cluster_vis_undo_authority_verdict_page_usable
+ *
+ * spec-5.22d D4-6 structural validation of an AUTHORITY-served verdict page
+ * (version 2 provenance).  Same field discipline as the v1 gate above with
+ * two deliberate tightenings: ONLY version 2 is evidence (the v1 gate's
+ * strict ==1 refuses version 2 and this gate refuses version 1, so neither
+ * provenance can masquerade as the other), and COMMITTED_BELOW_HORIZON is
+ * refused outright — the authority block0 prove has no horizon leg, so a
+ * bound-carrying page is malformed by construction.  Pure: no I/O, no elog.
+ */
+bool
+cluster_vis_undo_authority_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+											   TransactionId asked_xid)
+{
+	if (v == NULL || !TransactionIdIsNormal(asked_xid))
+		return false;
+
+	if (v->magic != CLUSTER_GCS_UNDO_VERDICT_MAGIC
+		|| v->version != CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY)
+		return false;
+
+	if (v->xid_echo != (uint64)asked_xid)
+		return false;
+
+	for (size_t i = 0; i < sizeof(v->reserved_0); i++)
+		if (v->reserved_0[i] != 0)
+			return false;
+	for (size_t i = 0; i < sizeof(v->reserved_1); i++)
+		if (v->reserved_1[i] != 0)
+			return false;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		return SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	default:
+		/* incl. BELOW_HORIZON: not producible by the block0 prove — refuse */
+		return false;
+	}
+}
+
+/*
+ * cluster_vis_undo_authority_reply_binding_ok
+ *
+ * spec-5.22d D4-6 (8.A amend): an authority reply is evidence ONLY under the
+ * full binding — the reply sender IS the elected authority and the reply
+ * epoch IS the stamped request epoch, EXACTLY.  The transport's HC100 check
+ * admits hdr.epoch >= request_epoch (a general stale-reply pre-filter); on
+ * the authority leg a newer epoch means the election itself may have moved,
+ * so >= is deliberately not enough.  Pure.
+ */
+bool
+cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32 authority_node,
+											uint64 reply_epoch, uint64 stamped_epoch)
+{
+	if (authority_node < 0 || sender_node < 0)
+		return false;
+	if (sender_node != authority_node)
+		return false;
+	return reply_epoch == stamped_epoch;
+}
+
+/*
+ * cluster_undo_authority_verdict_page_fill
+ *
+ * spec-5.22d D4-6 serve-side wire-page fill: one prove result -> one version
+ * 2 page, the exact inverse of the requester's authority gate above so the
+ * two wire ends can never disagree about what an authority page carries.
+ * Refuses every kind the block0 prove cannot legitimately produce (UNKNOWN /
+ * BOUND / IN_PROGRESS — the caller ships DENIED and the requester keeps the
+ * 53R97 fail-closed, Rule 8.A).  Zeroes the whole struct first, so a poison
+ * or stale byte can never leak onto the wire.  Pure.
+ */
+bool
+cluster_undo_authority_verdict_page_fill(struct ClusterGcsUndoVerdictPage *v, TransactionId xid,
+										 const ClusterUndoVerdictResult *r)
+{
+	if (v == NULL || r == NULL || !TransactionIdIsNormal(xid))
+		return false;
+
+	switch (r->kind) {
+	case (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT:
+		if (!SCN_VALID(r->commit_scn))
+			return false; /* an EXACT claim without a scn proves nothing */
+		break;
+	case (uint8)CLUSTER_UNDO_VERDICT_ABORTED:
+		break;
+	default:
+		return false;
+	}
+
+	memset(v, 0, sizeof(*v));
+	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+	v->xid_echo = (uint64)xid;
+	v->commit_scn = InvalidScn;
+	v->horizon_scn = InvalidScn;
+	v->wrap = r->wrap;
+	if (r->kind == (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT) {
+		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+		v->commit_scn = (uint64)r->commit_scn;
+	} else
+		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	return true;
+}
+
+/*
+ * cluster_undo_verdict_from_authority_wire_page
+ *
+ * spec-5.22d D4-6 requester-side mapper: a version-2 AUTHORITY-served page
+ * -> the taxonomy.  Fail-closed by construction: a page that does not pass
+ * the authority structural gate (wrong provenance/version, smuggled bound,
+ * echo mismatch) yields UNKNOWN_FAIL_CLOSED so the caller keeps the 53R97
+ * boundary (Rule 8.A).  Pure: no I/O, no elog.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_authority_wire_page(const struct ClusterGcsUndoVerdictPage *v,
+											  TransactionId asked_xid)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	if (!cluster_vis_undo_authority_verdict_page_usable(v, asked_xid))
+		return r;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = (SCN)v->commit_scn;
+		r.wrap = v->wrap;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	default:
+		/* the authority gate already fenced the kind range; defense in depth */
+		return r;
+	}
+}
+
+/*
  * cluster_undo_verdict_from_block_proof
  *
  * D3-1 pure mapper: a CP3 single-block positive proof (exact xid+wrap slot

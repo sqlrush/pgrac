@@ -511,10 +511,99 @@ UT_TEST(test_clean_xfer_stale_break_predicate)
 }
 
 
+/* spec-5.22d D4-6: reserved_0[6] VALUE 4 = dead-owner AUTHORITY verdict
+ * request.  Pins the value-multiplex against the three existing kinds
+ * (1 = undo-TT fetch, 2 = derived verdict, 3 = authoritative verdict): the
+ * kind-4 predicate must never match 1/2/3 and vice versa, and setting kind 4
+ * must not perturb the widened-xid watermark carrier.  ABI stays 64B. */
+UT_TEST(test_forward_payload_undo_authority_verdict_kind4)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+
+	GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&fwd);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 1);
+	/* kind 4 is NOT one of the owner-served verdict kinds (2/3), NOT the
+	 * undo-TT fetch (1) */
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0, 0);
+
+	/* and the owner-served kinds are NOT the authority kind */
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true /* value 3 */);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, false /* value 2 */);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+	GcsBlockForwardPayloadSetUndoTtFetchRequest(&fwd, true /* value 1 */);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+
+	/* kind 4 must not perturb the widened-xid carrier bytes */
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)0x00000000AABBCCDDULL);
+	GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&fwd);
+	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&fwd),
+				 (long long)0x00000000AABBCCDDULL);
+
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+/* spec-5.22d D4-6: the authority fetch tag carries the dead OWNER in the
+ * previously-empty tag.relNumber as owner+1 (0 stays "absent" so the three
+ * owner-served kinds keep their strict empty-relNumber shape).  The serve
+ * side NEVER blind-trusts this field — it re-derives the authority and
+ * only answers when the triple check passes — but the encode/decode
+ * roundtrip and the 0-absent boundary are pinned here. */
+UT_TEST(test_undo_authority_fetch_tag_owner_roundtrip)
+{
+	BufferTag legacy = GcsBlockUndoFetchTagMake(7, 0);
+	BufferTag tag;
+	uint32 segment_id = 0;
+	uint32 block_no = 99;
+	int32 owner = -1;
+
+	/* legacy owner-served tag: relNumber empty, owner decode refuses */
+	UT_ASSERT_EQ((int)legacy.relNumber, 0);
+	UT_ASSERT_EQ(GcsBlockUndoAuthorityFetchTagDecodeOwner(legacy, &owner) ? 1 : 0, 0);
+
+	/* authority tag: owner 2 rides as relNumber 3; base fields unchanged */
+	tag = GcsBlockUndoAuthorityFetchTagMake(7, 0, 2 /* owner */);
+	UT_ASSERT_EQ((int)tag.relNumber, 3);
+	UT_ASSERT_EQ(GcsBlockUndoFetchTagDecode(tag, &segment_id, &block_no) ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)segment_id, 7);
+	UT_ASSERT_EQ((int)block_no, 0);
+	UT_ASSERT_EQ(GcsBlockUndoAuthorityFetchTagDecodeOwner(tag, &owner) ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)owner, 2);
+
+	/* owner 0 (node id 0) must survive the +1 bias roundtrip */
+	tag = GcsBlockUndoAuthorityFetchTagMake(1, 0, 0);
+	UT_ASSERT_EQ((int)tag.relNumber, 1);
+	UT_ASSERT_EQ(GcsBlockUndoAuthorityFetchTagDecodeOwner(tag, &owner) ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)owner, 0);
+
+	/* wrong magic: never decodes, wherever the relNumber points */
+	tag.spcOid = (Oid)0xDEADBEEF;
+	UT_ASSERT_EQ(GcsBlockUndoAuthorityFetchTagDecodeOwner(tag, &owner) ? 1 : 0, 0);
+}
+
+
+/* spec-5.22d D4-6: the authority-served verdict page version is a DISTINCT
+ * provenance value — an old requester's strict ==1 gate refuses it (fail
+ * closed) and the new authority leg accepts ONLY it (an owner-served v1
+ * page can never masquerade as an authority serve). */
+UT_TEST(test_undo_verdict_version_authority_distinct)
+{
+	UT_ASSERT_EQ((int)CLUSTER_GCS_UNDO_VERDICT_VERSION, 1);
+	UT_ASSERT_EQ((int)CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY, 2);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -536,6 +625,9 @@ main(void)
 	UT_RUN(test_request_payload_direct_land_flag_roundtrip_and_orthogonal);
 	UT_RUN(test_clean_xfer_master_decision_5_branches);
 	UT_RUN(test_clean_xfer_stale_break_predicate);
+	UT_RUN(test_forward_payload_undo_authority_verdict_kind4);
+	UT_RUN(test_undo_authority_fetch_tag_owner_roundtrip);
+	UT_RUN(test_undo_verdict_version_authority_distinct);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

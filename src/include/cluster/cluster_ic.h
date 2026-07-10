@@ -228,6 +228,15 @@ extern const ClusterICOps *ClusterICOps_Active;
 #define PGRAC_IC_CLUSTER_NAME_MAX 24
 #define PGRAC_IC_HELLO_CAPABILITIES_OFFSET 36
 #define PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 ((uint32)0x00000001U)
+/* PGRAC: spec-5.22d D4-6 — this binary understands the kind-4 dead-owner
+ * AUTHORITY verdict request and the version-2 authority-served verdict page.
+ * A PROTOCOL capability: advertised unconditionally (unlike the GUC/tier-
+ * gated smart-fusion bit above) — whether the serve actually runs is the
+ * serve side's runtime GUC gate, which refuses with DENIED and the requester
+ * stays fail-closed.  A requester only routes kind 4 to a peer that
+ * advertised this bit; without it the authority leg fails closed (the
+ * election is NOT re-run against a different node). */
+#define PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 ((uint32)0x00000002U)
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */

@@ -162,22 +162,29 @@ extern ClusterUndoServeRoute cluster_undo_serve_authority(const ClusterResId *un
  * verdict consumer takes:
  *
  *	SERVE_FAIL_CLOSED -- everything unproven: RECOVERING / UNKNOWN, a
- *	                     malformed route, AND an elected PEER authority.  The
- *	                     peer wire serve lands with D4-5/D4-6 (LMS authority
- *	                     serve + capability gate); until then routing a
- *	                     request there would be an unproven path, so it fails
- *	                     closed (never native, Rule 8.A).  Value 0 so a
- *	                     zeroed decision is the safe one.
+ *	                     malformed route (invalid destination or an invalid
+ *	                     self node).  Fail closed (never native, Rule 8.A).
+ *	                     Value 0 so a zeroed decision is the safe one.
  *	SERVE_OWNER_LIVE  -- owner is fresh-alive: stay on the D6 live-owner
  *	                     path, byte-for-byte unchanged.
  *	SERVE_SELF_BLOCK0 -- self IS the elected authority: read the dead
  *	                     owner's shared block0 (AUTHORITY_BLOCK0 intent) and
  *	                     serve the verdict locally.
+ *	SERVE_PEER_BLOCK0 -- a PEER is the elected authority: route the kind-4
+ *	                     verdict request to it over the wire (D4-6).  The
+ *	                     consumer still gates on the peer's HELLO
+ *	                     D4-capability BEFORE sending (an old binary never
+ *	                     sees kind 4 — no capability means fail closed, the
+ *	                     election is NOT re-run against a different node),
+ *	                     and on the reply binding (sender == elected
+ *	                     authority, reply epoch == stamped epoch, version 2
+ *	                     provenance) before trusting any answer.
  */
 typedef enum ClusterUndoAuthorityServeDecision {
 	CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED = 0,
 	CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE,
-	CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0
+	CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0,
+	CLUSTER_UNDO_AUTHORITY_SERVE_PEER_BLOCK0
 } ClusterUndoAuthorityServeDecision;
 
 extern ClusterUndoAuthorityServeDecision

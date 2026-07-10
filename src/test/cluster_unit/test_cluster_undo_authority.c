@@ -312,14 +312,16 @@ UT_TEST(test_serve_decide_self_block0)
 				 CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0);
 }
 
-/* elected authority == a PEER -> fail closed (peer wire serve = D4-5/D4-6) */
-UT_TEST(test_serve_decide_peer_failclosed)
+/* elected authority == a PEER -> route the verdict request over the wire to
+ * that peer (D4-6 kind-4 authority serve; the requester still gates on the
+ * HELLO capability + reply binding before trusting any answer) */
+UT_TEST(test_serve_decide_peer_block0)
 {
 	ClusterUndoServeRoute r
 		= cluster_undo_route_decide(0 /*dead owner*/, 42, CLUSTER_UNDO_AUTHORITY_OK, 3);
 
 	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1 /*self*/),
-				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+				 CLUSTER_UNDO_AUTHORITY_SERVE_PEER_BLOCK0);
 }
 
 /* RECOVERING / UNKNOWN -> fail closed (never native, never a guess) */
@@ -351,6 +353,13 @@ UT_TEST(test_serve_decide_invalid_dest_failclosed)
 				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
 	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1),
 				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+
+	/* malformed: valid peer destination but an invalid SELF node — the
+	 * consumer cannot prove it is not the destination, so neither the self
+	 * leg nor the D4-6 peer wire leg may fire (fail closed, never a guess) */
+	r.destination_node = 3;
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, -1),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
 }
 
 int
@@ -372,7 +381,7 @@ main(void)
 	UT_RUN(test_coverage_three_way_and);
 	UT_RUN(test_serve_decide_owner_live);
 	UT_RUN(test_serve_decide_self_block0);
-	UT_RUN(test_serve_decide_peer_failclosed);
+	UT_RUN(test_serve_decide_peer_block0);
 	UT_RUN(test_serve_decide_recovering_unknown_failclosed);
 	UT_RUN(test_serve_decide_invalid_dest_failclosed);
 	UT_DONE();

@@ -26,6 +26,7 @@
 #include "cluster/cluster_gcs_block.h" /* undo-fetch tag + auth trailer (CP2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* fake TT header blocks (CP3) */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (D4-6) */
 
 #include "unit_test.h"
 
@@ -337,6 +338,180 @@ UT_TEST(test_undo_verdict_page_usable)
 	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
 }
 
+/* spec-5.22d D4-6: structural validation of an AUTHORITY-served verdict page
+ * (version 2 provenance).  Same field discipline as the v1 table above, with
+ * two deliberate tightenings: ONLY version 2 is evidence (a v1 owner-served
+ * page can never masquerade as an authority serve, and vice versa — the v1
+ * gate's strict ==1 already refuses version 2, pinned above), and the
+ * BELOW_HORIZON kind is refused outright — the authority block0 prove has no
+ * horizon leg, so a bound-carrying page is malformed by construction. */
+UT_TEST(test_undo_authority_verdict_page_usable)
+{
+	ClusterGcsUndoVerdictPage v;
+
+	/* Baseline good authority EXACT page. */
+	memset(&v, 0, sizeof(v));
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+	v.xid_echo = 1000;
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v.commit_scn = 777;
+	v.horizon_scn = InvalidScn;
+	v.wrap = 5;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+
+	/* NULL page / invalid asked xid. */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(NULL, 1000), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, InvalidTransactionId), false);
+
+	/* An owner-served v1 page is NOT authority evidence. */
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+
+	/* Wrong magic / echo (incl. poisoned high word). */
+	v.magic = 0xDEADBEEF;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1001), false);
+	v.xid_echo = (((uint64)1) << 32) + 1000;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.xid_echo = 1000;
+
+	/* Non-zero reserved bytes poison the page. */
+	v.reserved_0[5] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.reserved_0[5] = 0;
+	v.reserved_1[2] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.reserved_1[2] = 0;
+
+	/* EXACT kind-field consistency: needs commit_scn, refuses a horizon. */
+	v.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = 777;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* BELOW_HORIZON: refused OUTRIGHT on the authority leg (no horizon leg
+	 * in the block0 prove), even in its v1-legal shape. */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+	v.commit_scn = InvalidScn;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* ABORTED: carries no scn of any kind. */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	v.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = InvalidScn;
+
+	/* Unknown kinds refuse. */
+	v.verdict = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED + 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+}
+
+/* spec-5.22d D4-6 (user 8.A amend #1): the authority reply is evidence ONLY
+ * under the full binding — the reply sender IS the elected authority and the
+ * reply epoch IS the stamped request epoch, exactly.  The transport's HC100
+ * >= check is a general pre-filter and deliberately NOT sufficient here; the
+ * epoch±1 rows pin the strict equality. */
+UT_TEST(test_undo_authority_reply_binding)
+{
+	/* the one admissible shape */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 42, 42), true);
+
+	/* wrong sender: a peer that is not the elected authority (incl. the
+	 * dead owner's id and a negative junk id) is never evidence */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(2, 3, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(4, 3, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(-1, 3, 42, 42), false);
+
+	/* invalid elected authority: nothing can bind to it */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, -1, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(-1, -1, 42, 42), false);
+
+	/* epoch must match EXACTLY: ±1 both refuse (HC100 >= would admit +1) */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 41, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 43, 42), false);
+}
+
+/* spec-5.22d D4-6: serve-side page fill -> requester-side accept closes the
+ * loop over one prove result, so the two wire ends can never disagree about
+ * what an authority page carries.  fill refuses every kind the block0 prove
+ * cannot legitimately produce (UNKNOWN, BOUND, IN_PROGRESS). */
+UT_TEST(test_undo_authority_verdict_page_fill_roundtrip)
+{
+	ClusterGcsUndoVerdictPage v;
+	ClusterUndoVerdictResult r;
+	ClusterUndoVerdictResult mapped;
+
+	/* COMMITTED_EXACT roundtrip: scn + wrap survive, version is 2. */
+	memset(&v, 0xAA, sizeof(v)); /* poison: fill must overwrite everything */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = 777;
+	r.wrap = 5;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), true);
+	UT_ASSERT_EQ(v.version, CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, 777);
+	UT_ASSERT_EQ(mapped.wrap, 5);
+
+	/* ABORTED roundtrip: no scn of any kind on the page. */
+	memset(&v, 0xAA, sizeof(v));
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_ABORTED;
+	r.commit_scn = InvalidScn;
+	r.wrap = 3;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), true);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_ABORTED);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, (long long)InvalidScn);
+
+	/* fill refuses what the prove cannot produce: UNKNOWN / BOUND /
+	 * IN_PROGRESS never become a wire page. */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+	r.commit_scn = 500;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+
+	/* EXACT without a valid scn is not fillable (nothing to prove). */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+
+	/* fill guards its inputs: NULL page / invalid xid. */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(NULL, 1000, &r), false);
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, InvalidTransactionId, &r), false);
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, NULL), false);
+
+	/* the mapper refuses a v1 owner-served page (wrong provenance). */
+	memset(&v, 0, sizeof(v));
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	v.xid_echo = 1000;
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v.commit_scn = 777;
+	v.horizon_scn = InvalidScn;
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, (long long)InvalidScn);
+}
+
 /* CP2: synthetic undo-address tag roundtrip + magic discrimination. */
 UT_TEST(test_undo_fetch_tag_roundtrip)
 {
@@ -362,7 +537,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_covers_when_epoch_match_and_hwm_ge_anchor);
 	UT_RUN(test_failclosed_when_epoch_differs);
 	UT_RUN(test_failclosed_when_hwm_invalid);
@@ -375,6 +550,9 @@ main(void)
 	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
 	UT_RUN(test_undo_verdict_page_usable);
+	UT_RUN(test_undo_authority_verdict_page_usable);
+	UT_RUN(test_undo_authority_reply_binding);
+	UT_RUN(test_undo_authority_verdict_page_fill_roundtrip);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

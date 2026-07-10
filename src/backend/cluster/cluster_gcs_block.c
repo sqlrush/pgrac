@@ -2493,41 +2493,37 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 
 
 /*
- * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — requester-side undo verdict fetch.
+ * gcs_block_undo_verdict_wire_exchange — shared TRANSPORT core of the two
+ * verdict fetch wrappers below (spec-6.12i D-i4 owner-served kinds 2/3 and
+ * spec-5.22d D4-6 authority-served kind 4): reserve slot, stamp, send, wait,
+ * verify status + trailer + checksum, copy the raw reply material out.  ONE
+ * implementation so the two wire legs can never drift apart mechanically
+ * (Rule 8.A, the fill_page discipline); the acceptance POLICY — the page
+ * structural gate, the authority reply binding, the co-sample extraction —
+ * deliberately stays in the wrappers, so the v1 and authority policies can
+ * never cross-contaminate.
  *
- *	Ask origin_node for a COMPLETE own-TT by-xid verdict on `xid`, riding the
- *	same sub-case B wire shape as the undo-TT fetch above.  The asked-for xid
- *	rides the widened watermark carrier; the synthetic tag keeps the ref's
- *	segment for tag validity + observability only (the verdict is complete
- *	over ALL origin segments).
+ *	stamped_epoch is written to BOTH slot->request_epoch and fwd.epoch (one
+ *	read, one value — the pre-refactor code read the clock twice, which
+ *	could straddle an epoch bump; single-stamping is strictly tighter).
  *
- *	true  -> *verdict_out holds the structurally validated verdict page
- *	         (cluster_vis_undo_verdict_page_usable) and *auth_out the
- *	         authority co-sampled with the scan.
- *	false -> fail-closed: timeout, DENIED, checksum failure, missing
- *	         trailer, malformed page (Rule 8.A — the caller keeps its
- *	         unchanged 53R97 refusal).
+ *	true -> *hdr_out / *page_out / *tt_generation_out hold the checksum-
+ *	verified reply material (page_out is the 48-byte verdict struct at the
+ *	head of the BLCKSZ area; the checksum covered the whole area).
+ *	false -> timeout / DENIED / wrong status / missing trailer / checksum
+ *	mismatch (the caller keeps its 53R97 refusal, Rule 8.A).
  */
-bool
-cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
-											  TransactionId xid, bool authoritative,
-											  ClusterGcsUndoVerdictPage *verdict_out,
-											  ClusterLiveAuthority *auth_out)
+static bool
+gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
+									 TransactionId xid, bool authoritative, bool authority_kind,
+									 GcsBlockReplyHeader *hdr_out,
+									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
-	BufferTag tag;
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
 	bool fetched = false;
-
-	if (verdict_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
-		|| !TransactionIdIsNormal(xid))
-		return false;
-
-	memset(verdict_out, 0, sizeof(*verdict_out));
-	memset(auth_out, 0, sizeof(*auth_out));
-	tag = GcsBlockUndoFetchTagMake(segment_id, 0);
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
@@ -2546,29 +2542,38 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
-		slot->request_epoch = cluster_epoch_get_current();
+		slot->request_epoch = stamped_epoch;
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
 		fwd.request_id = request_id;
-		fwd.epoch = cluster_epoch_get_current();
+		fwd.epoch = stamped_epoch;
 		fwd.tag = tag;
 		fwd.original_requester_node = cluster_node_id;
 		fwd.requester_backend_id = (int32)MyBackendId;
 		fwd.master_node = cluster_node_id;
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
-		GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, authoritative);
+		if (authority_kind)
+			GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&fwd);
+		else
+			GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, authoritative);
 		/* The widened xid rides the watermark carrier (upper 32 bits zero). */
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)(uint64)xid);
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-													  (uint32)origin_node, &fwd, sizeof(fwd)))
+													  (uint32)dest_node, &fwd, sizeof(fwd))) {
+			if (authority_kind)
+				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+								errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch "
+									   "to authority node %d",
+									   (int)dest_node)));
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
 							errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch to "
 								   "origin node %d",
-								   (int)origin_node)));
+								   (int)dest_node)));
+		}
 
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -2603,19 +2608,13 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
 			if (expected == got) {
-				const ClusterGcsUndoVerdictPage *v
-					= (const ClusterGcsUndoVerdictPage *)slot->reply_block_data;
-
-				if (cluster_vis_undo_verdict_page_usable(v, xid)) {
-					*verdict_out = *v;
-					auth_out->origin_epoch = slot->reply_header.epoch;
-					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
-					auth_out->tt_generation = slot->reply_undo_tt_generation;
-					/* spec-5.14 D2: the verdict is the origin's volatile
-					 * co-sample — depend on it for fail-stop (D-i3). */
-					gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-					fetched = true;
-				}
+				if (hdr_out != NULL)
+					*hdr_out = slot->reply_header;
+				if (page_out != NULL)
+					memcpy(page_out, slot->reply_block_data, sizeof(*page_out));
+				if (tt_generation_out != NULL)
+					*tt_generation_out = slot->reply_undo_tt_generation;
+				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 			}
@@ -2631,6 +2630,131 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	gcs_block_release_slot(slot);
 
 	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
+}
+
+/*
+ * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — requester-side undo verdict fetch.
+ *
+ *	Ask origin_node for a COMPLETE own-TT by-xid verdict on `xid`, riding the
+ *	same sub-case B wire shape as the undo-TT fetch above.  The asked-for xid
+ *	rides the widened watermark carrier; the synthetic tag keeps the ref's
+ *	segment for tag validity + observability only (the verdict is complete
+ *	over ALL origin segments).
+ *
+ *	true  -> *verdict_out holds the structurally validated verdict page
+ *	         (cluster_vis_undo_verdict_page_usable) and *auth_out the
+ *	         authority co-sampled with the scan.
+ *	false -> fail-closed: timeout, DENIED, checksum failure, missing
+ *	         trailer, malformed page (Rule 8.A — the caller keeps its
+ *	         unchanged 53R97 refusal).
+ */
+bool
+cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
+											  TransactionId xid, bool authoritative,
+											  ClusterGcsUndoVerdictPage *verdict_out,
+											  ClusterLiveAuthority *auth_out)
+{
+	GcsBlockReplyHeader hdr;
+	ClusterGcsUndoVerdictPage page;
+	uint64 tt_generation = 0;
+	BufferTag tag;
+
+	if (verdict_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
+		|| !TransactionIdIsNormal(xid))
+		return false;
+
+	memset(verdict_out, 0, sizeof(*verdict_out));
+	memset(auth_out, 0, sizeof(*auth_out));
+	tag = GcsBlockUndoFetchTagMake(segment_id, 0);
+
+	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, cluster_epoch_get_current(), xid,
+											  authoritative, false /* owner-served kind */, &hdr,
+											  &page, &tt_generation))
+		return false;
+
+	if (!cluster_vis_undo_verdict_page_usable(&page, xid))
+		return false;
+
+	*verdict_out = page;
+	auth_out->origin_epoch = hdr.epoch;
+	auth_out->live_hwm_lsn = (XLogRecPtr)hdr.page_lsn;
+	auth_out->tt_generation = tt_generation;
+	/* spec-5.14 D2: the verdict is the origin's volatile
+	 * co-sample — depend on it for fail-stop (D-i3). */
+	gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	return true;
+}
+
+/*
+ * PGRAC: spec-5.22d D4-6 — requester-side dead-owner AUTHORITY verdict fetch.
+ *
+ *	Ask the elected serve authority (a live survivor, NOT the dead owner) for
+ *	a block0-proven verdict on the dead owner_node's `xid`.  Kind-4 wire: the
+ *	owner rides in tag.relNumber (owner+1), the widened xid in the watermark
+ *	carrier.  The caller has already gated on the peer's HELLO D4 capability.
+ *
+ *	Acceptance is the 8.A-amended FULL binding, strictly tighter than the v1
+ *	leg above: the transport core's status/trailer/checksum verify, PLUS
+ *	sender == elected authority AND reply epoch == stamped epoch EXACTLY
+ *	(cluster_vis_undo_authority_reply_binding_ok; the transport's HC100 >= is
+ *	only a pre-filter), PLUS the version-2 authority structural gate + mapper
+ *	(cluster_undo_verdict_from_authority_wire_page — refuses a v1 page, a
+ *	smuggled horizon bound, an echo mismatch).  The reply's hwm/tt_generation
+ *	carriers are deliberately IGNORED: they describe an origin's own live TT
+ *	plane, which does not exist for a dead owner — the block0 prove on the
+ *	serve side already internalized generation/wrap coverage.
+ *
+ *	true -> *out holds COMMITTED_EXACT{commit_scn, wrap} or ABORTED.  The
+ *	caller MUST Lamport-observe any commit_scn it consumes (AD-008).
+ *	false -> fail-closed (caller keeps the 53R97 refusal, Rule 8.A).
+ */
+bool
+cluster_gcs_block_undo_authority_verdict_fetch_and_wait(int32 authority_node, int32 owner_node,
+														uint32 segment_id, TransactionId xid,
+														ClusterUndoVerdictResult *out)
+{
+	GcsBlockReplyHeader hdr;
+	ClusterGcsUndoVerdictPage page;
+	uint64 tt_generation = 0;
+	BufferTag tag;
+	uint64 stamped_epoch;
+	ClusterUndoVerdictResult r;
+
+	if (out == NULL)
+		return false;
+	out->kind = (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	out->commit_scn = InvalidScn;
+	out->wrap = 0;
+
+	if (authority_node < 0 || authority_node == cluster_node_id || owner_node < 0
+		|| owner_node == cluster_node_id || owner_node == authority_node
+		|| !TransactionIdIsNormal(xid))
+		return false;
+
+	tag = GcsBlockUndoAuthorityFetchTagMake(segment_id, 0, owner_node);
+	stamped_epoch = cluster_epoch_get_current();
+
+	if (!gcs_block_undo_verdict_wire_exchange(authority_node, tag, stamped_epoch, xid,
+											  false /* no owner-served sub-kind */,
+											  true /* kind 4 */, &hdr, &page, &tt_generation))
+		return false;
+
+	/* 8.A amend: full reply binding — sender IS the elected authority and
+	 * the reply epoch IS the stamped epoch, EXACTLY. */
+	if (!cluster_vis_undo_authority_reply_binding_ok((int32)hdr.sender_node, authority_node,
+													 hdr.epoch, stamped_epoch))
+		return false;
+
+	r = cluster_undo_verdict_from_authority_wire_page(&page, xid);
+	if (r.kind == (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED)
+		return false;
+
+	/* spec-5.14 D2: the verdict is the AUTHORITY's volatile derivation —
+	 * depend on the authority for fail-stop (the dead owner cannot fail any
+	 * further). */
+	gcs_block_stamp_touched(authority_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	*out = r;
+	return true;
 }
 
 
@@ -5021,16 +5145,19 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request.  Same
-	 * LMON shape as the two branches above (validate + park only; the
-	 * complete durable-TT scan + CLOG cross-check runs in LMS, the LMON tick
-	 * ships).  MUST branch here, before any holder / GRD logic: the tag is a
-	 * synthetic undo address and the SCN carrier holds the widened xid.  A
-	 * refused park (wave GUC off / malformed tag or carrier / no free slot)
-	 * replies the fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request; spec-5.22d
+	 * D4-6 adds the kind-4 dead-owner AUTHORITY verdict on the same park.
+	 * Same LMON shape as the two branches above (validate + park only; the
+	 * complete durable-TT scan + CLOG cross-check — or the kind-4 authority
+	 * triple check + block0 prove — runs in LMS, the LMON tick ships).  MUST
+	 * branch here, before any holder / GRD logic: the tag is a synthetic
+	 * undo address and the SCN carrier holds the widened xid.  A refused
+	 * park (wave GUC off / malformed tag or carrier / bad owner carrier / no
+	 * free slot) replies the fail-closed DENIED immediately so the requester
+	 * keeps its unchanged 53R97 refusal (Rule 8.A).
 	 */
-	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)) {
+	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)
+		|| GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
 		if (!cluster_lms_undo_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;

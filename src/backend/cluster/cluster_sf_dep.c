@@ -157,6 +157,28 @@ cluster_sf_peer_supports_reply_v2(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2) != 0;
 }
 
+/*
+ * cluster_peer_supports_undo_authority_serve
+ *
+ * spec-5.22d D4-6 capability gate: true iff the peer's verified HELLO
+ * advertised the kind-4 authority-serve protocol bit.  NOT gated on any
+ * local GUC (see cluster_sf_dep.h) — an unknown/old peer reads as false and
+ * the caller's authority leg fails closed (Rule 8.A).
+ */
+bool
+cluster_peer_supports_undo_authority_serve(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = ClusterSfDep->peer_capabilities[peer_id];
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1) != 0;
+}
+
 void
 cluster_sf_handle_durable_gossip(const ClusterICEnvelope *env, const void *payload)
 {

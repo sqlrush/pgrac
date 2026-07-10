@@ -52,6 +52,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_sf_dep.h" /* peer HELLO D4-capability gate (D4-6) */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
@@ -592,14 +593,42 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 		case CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0:
 			/* self IS the elected authority for the dead owner */
 			return rtvis_authority_serve_block0(origin_node, undo_segment_id, raw_xid, &route);
+		case CLUSTER_UNDO_AUTHORITY_SERVE_PEER_BLOCK0: {
+			ClusterUndoVerdictResult r;
+
+			/*
+			 * D4-6: a PEER is the elected authority — kind-4 wire serve.
+			 * Capability gate first (约束/A.1③): never route kind 4 to a
+			 * peer that did not advertise the D4 protocol bit; the election
+			 * is deterministic and NOT re-run against a different node, so
+			 * a non-capable authority means fail closed.  The fetch itself
+			 * fails closed on timeout / DENIED / wrong sender / epoch moved
+			 * / malformed or v1 page (8.A amend binding inside).
+			 */
+			if (!cluster_peer_supports_undo_authority_serve(route.destination_node)
+				|| !cluster_gcs_block_undo_authority_verdict_fetch_and_wait(
+					route.destination_node, origin_node, undo_segment_id, raw_xid, &r)) {
+				cluster_undo_authority_note_failclosed();
+				cluster_rtvis_resolve_note_failclosed();
+				return unknown;
+			}
+
+			/* Lamport-observe the SCN that crossed the wire (AD-008);
+			 * observe of InvalidScn (ABORTED) is a no-op. */
+			cluster_scn_observe(r.commit_scn);
+			if (r.kind == (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT)
+				cluster_rtvis_resolve_note_committed();
+			else
+				cluster_rtvis_resolve_note_aborted();
+			return r;
+		}
 		case CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE:
 			break; /* live owner: unchanged CP3 + CP5 path below */
 		case CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED:
 		default:
 			/*
-			 * Dead owner with a peer/no authority (peer wire serve lands
-			 * with D4-5/D4-6), or owner liveness unproven: fail closed,
-			 * NEVER the native CLOG/hint path (Rule 8.A).
+			 * Owner liveness unproven / no derivable authority: fail
+			 * closed, NEVER the native CLOG/hint path (Rule 8.A).
 			 */
 			cluster_undo_authority_note_failclosed();
 			cluster_rtvis_resolve_note_failclosed();

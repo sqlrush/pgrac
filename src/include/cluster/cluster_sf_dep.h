@@ -141,6 +141,11 @@ extern XLogRecPtr cluster_sf_observed_origin_durable_lsn(int32 origin);
 extern void cluster_sf_publish_origin_durable_lsn(void);
 extern void cluster_sf_note_peer_hello_capabilities(int32 peer_id, uint32 capabilities);
 extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
+/* spec-5.22d D4-6: did the peer's HELLO advertise the kind-4 authority-serve
+ * protocol capability?  Deliberately NOT gated on any local GUC (unlike the
+ * smart-fusion query above): the bit answers "can that binary parse kind 4";
+ * the runtime arm gates live elsewhere. */
+extern bool cluster_peer_supports_undo_authority_serve(int32 peer_id);
 extern void cluster_sf_handle_durable_gossip(const ClusterICEnvelope *env, const void *payload);
 
 extern void cluster_sf_note_dep_touched(Buffer buffer);

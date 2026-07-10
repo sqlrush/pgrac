@@ -124,13 +124,15 @@ cluster_undo_route_decide(int32 owner_node, uint64 reconfig_epoch,
 }
 
 /*
- * cluster_undo_authority_serve_decide -- pure consumer serve decision (D4-4).
+ * cluster_undo_authority_serve_decide -- pure consumer serve decision (D4-4;
+ * D4-6 adds the peer wire leg).
  *
- *	See cluster_undo_authority.h for the contract.  The ONLY two provable
- *	actions are the live-owner path (D6, unchanged) and the self-authority
- *	block0 serve; every other route -- RECOVERING, UNKNOWN, a malformed
- *	destination, and an elected PEER authority (wire serve = D4-5/D4-6) --
- *	fails closed.
+ *	See cluster_undo_authority.h for the contract.  The three provable
+ *	actions are the live-owner path (D6, unchanged), the self-authority
+ *	block0 serve, and the D4-6 kind-4 wire serve to an elected PEER
+ *	authority; every unproven route -- RECOVERING, UNKNOWN, an invalid
+ *	destination, an invalid self node (the consumer cannot prove it is not
+ *	the destination) -- fails closed.
  */
 ClusterUndoAuthorityServeDecision
 cluster_undo_authority_serve_decide(const ClusterUndoServeRoute *route, int32 self_node)
@@ -139,10 +141,11 @@ cluster_undo_authority_serve_decide(const ClusterUndoServeRoute *route, int32 se
 	case CLUSTER_UNDO_AUTHORITY_OWNER_LIVE:
 		return CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE;
 	case CLUSTER_UNDO_AUTHORITY_OK:
-		if (self_node >= 0 && route->destination_node == self_node)
+		if (route->destination_node < 0 || self_node < 0)
+			return CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED;
+		if (route->destination_node == self_node)
 			return CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0;
-		/* peer authority: wire serve lands with D4-5/D4-6; fail closed */
-		return CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED;
+		return CLUSTER_UNDO_AUTHORITY_SERVE_PEER_BLOCK0;
 	case CLUSTER_UNDO_AUTHORITY_RECOVERING:
 	case CLUSTER_UNDO_AUTHORITY_UNKNOWN:
 	default:

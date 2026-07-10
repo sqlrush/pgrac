@@ -1197,7 +1197,9 @@ GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
  * VALUE 1 ([0]=read-image, [1]=X-transfer, [2]=clean-eligible,
  * [3]=downgrade-request/nudge, [4]=CR-request, [5]=spec-6.13 direct-land
  * above; [6] is the last byte, value-multiplexed like [3]: value 1 =
- * undo-TT fetch, value 2 = spec-6.15 D4 xid verdict).
+ * undo-TT fetch, values 2/3 = spec-6.15 D4 / spec-5.22f D6-7 xid verdict
+ * sub-kinds, value 4 = spec-5.22d D4-6 dead-owner authority verdict — see
+ * the per-kind banners below).
  *
  *	Sent REQUESTER -> ORIGIN, riding the same 64B forward wire as the
  *	spec-6.12b CR request.  With this flag set the BufferTag is a SYNTHETIC
@@ -1284,6 +1286,39 @@ GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p
 	return p->reserved_0[6] == (uint8)3;
 }
 
+/* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY
+ * verdict request (the byte's fourth value; 1 = undo-TT fetch, 2 = derived
+ * verdict, 3 = authoritative verdict above).
+ *
+ *	Sent REQUESTER -> elected serve AUTHORITY (a live survivor, NOT the
+ *	owner) when the undo OWNER of the asked-for xid is dead/absent: the
+ *	owner's verdict wire has nobody behind it, so the deterministically
+ *	elected survivor authority answers from the owner's durable shared
+ *	block0 instead (spec-5.22d Route B).  Identity vs destination are
+ *	deliberately separate layers: the request's OWNER (whose xid / whose
+ *	undo segment) never changes and rides in tag.relNumber (see
+ *	GcsBlockUndoAuthorityFetchTagMake below); only the serve DESTINATION
+ *	moves to the authority.  The requester sends this kind ONLY to a peer
+ *	that advertised PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 (an old
+ *	binary never sees kind 4).  The serve side NEVER blind-trusts the wire:
+ *	it re-checks request epoch == its current epoch, re-derives the
+ *	authority for (owner, current epoch) and only serves when that is
+ *	itself, then proves the verdict on the owner's block0 bytes
+ *	(cluster_undo_authority_block0_prove — the same core the requester's
+ *	self-authority leg runs).  Any failed check is a DENIED and the
+ *	requester keeps the 53R97 fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = (uint8)4;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)4;
+}
+
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.
  *
  *	An undo block has no BufferTag (undo segment files live outside shared
@@ -1292,10 +1327,18 @@ GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p
  *	field to carry that address: spcOid holds a magic discriminator (so a
  *	synthetic tag can never be confused with a real relation tag anywhere
  *	it might leak into observability), dbOid carries the segment_id and
- *	blockNum the block_no.  The OWNER is deliberately NOT carried: the
- *	origin only ever serves its own undo (owner_instance derives from the
- *	serving node's own id), so a forged owner field cannot redirect the
- *	read (fail-closed by construction). */
+ *	blockNum the block_no.  On the owner-served kinds (reserved_0[6] values
+ *	1/2/3) the OWNER is deliberately NOT carried — the origin only ever
+ *	serves its own undo (owner_instance derives from the serving node's own
+ *	id), so a forged owner field cannot redirect the read (fail-closed by
+ *	construction), and relNumber stays 0 (the LMON submit refuses a
+ *	non-zero relNumber on those kinds).  The spec-5.22d D4-6 AUTHORITY kind
+ *	(value 4) is the ONE exception: the dead OWNER's node id rides in the
+ *	otherwise-empty relNumber as owner+1 (0 stays "absent"), because the
+ *	serve destination is NOT the owner.  The serve side still never trusts
+ *	it: the authority re-derivation + epoch check + block0 positive proof
+ *	must all pass before a byte is answered (a forged owner is refused,
+ *	never redirected-to). */
 #define GCS_BLOCK_UNDO_FETCH_TAG_MAGIC ((Oid)0x50475549) /* "PGUI" */
 
 static inline BufferTag
@@ -1320,6 +1363,32 @@ GcsBlockUndoFetchTagDecode(BufferTag tag, uint32 *segment_id, uint32 *block_no)
 		*segment_id = (uint32)tag.dbOid;
 	if (block_no != NULL)
 		*block_no = (uint32)tag.blockNum;
+	return true;
+}
+
+/* PGRAC: spec-5.22d D4-6 — authority-kind tag: the dead OWNER rides in the
+ * otherwise-empty relNumber as owner+1 (see the banner above).  Decode is
+ * shape-only (magic + non-zero owner carrier); range and self-exclusion are
+ * the LMON submit's job, and TRUST is nobody's until the serve-side triple
+ * check passes. */
+static inline BufferTag
+GcsBlockUndoAuthorityFetchTagMake(uint32 segment_id, uint32 block_no, int32 owner_node)
+{
+	BufferTag tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
+
+	tag.relNumber = (RelFileNumber)(owner_node + 1);
+	return tag;
+}
+
+static inline bool
+GcsBlockUndoAuthorityFetchTagDecodeOwner(BufferTag tag, int32 *owner_node)
+{
+	if (tag.spcOid != GCS_BLOCK_UNDO_FETCH_TAG_MAGIC)
+		return false;
+	if (tag.relNumber == (RelFileNumber)0)
+		return false; /* owner absent: an owner-served-kind tag */
+	if (owner_node != NULL)
+		*owner_node = (int32)tag.relNumber - 1;
 	return true;
 }
 
@@ -1397,6 +1466,12 @@ ClusterGcsUndoAuthTrailerGetTtGeneration(const ClusterGcsUndoAuthTrailer *t)
  *	failing leg (e) forever. */
 #define CLUSTER_GCS_UNDO_VERDICT_MAGIC ((uint32)0x50475556) /* "PGUV" */
 #define CLUSTER_GCS_UNDO_VERDICT_VERSION ((uint32)1)
+/* PGRAC: spec-5.22d D4-6 — version 2 marks "dead-owner AUTHORITY-served"
+ * provenance (Route B block0 prove).  An old requester's strict ==1 gate
+ * refuses it (fail-closed, never mistaken for owner-served), and the new
+ * authority leg accepts ONLY version 2 (an owner-served v1 page can never
+ * masquerade as an authority serve).  Same 48-byte layout. */
+#define CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY ((uint32)2)
 
 typedef enum ClusterGcsUndoVerdictKind {
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
