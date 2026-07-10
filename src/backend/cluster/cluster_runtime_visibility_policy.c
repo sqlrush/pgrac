@@ -77,44 +77,51 @@ cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAutho
 }
 
 /*
- * cluster_vis_tt_block_positive_proof
+ * cluster_vis_tt_block_xid_scan
  *
- * CP3 positive-proof scan over a D-i1-fetched TT header block.  See the
- * header comment for the full proof discipline (positive proof only; 0-match
- * / multi-match / non-terminal / malformed all refuse).  The block bytes are
- * the origin's own shipped copy, so every refusal is a clean NONE — never an
- * elog — and the caller keeps the 53R97 fail-closed boundary.
+ * spec-5.22d A1 (D4-8): the scan CORE under cluster_vis_tt_block_positive_
+ * proof.  One parse discipline for both consumers — the CP3 single-block
+ * wrapper below and the dead-owner complete-scan prove (which aggregates
+ * nmatch across the owner's whole durable segment set and must treat any
+ * unparseable block as refuse-ALL, never skip-and-continue).  See the header
+ * for the contract.  Pure; no I/O, no elog.
  */
-ClusterVisTtProof
-cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,
-									uint8 expected_owner_instance, TransactionId xid,
-									SCN *out_commit_scn, uint16 *out_wrap)
+ClusterVisTtBlockScanStatus
+cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
+							  uint8 expected_owner_instance, TransactionId xid, int *out_nmatch,
+							  ClusterVisTtProof *out_proof, SCN *out_commit_scn, uint16 *out_wrap)
 {
 	const UndoSegmentHeaderData *hdr;
 	int nmatch = 0;
 	const TTSlot *match = NULL;
 
+	if (out_nmatch != NULL)
+		*out_nmatch = 0;
+	if (out_proof != NULL)
+		*out_proof = CLUSTER_VIS_TT_PROOF_NONE;
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
 	if (out_wrap != NULL)
 		*out_wrap = TT_WRAP_INVALID;
 
+	/* Caller-bug inputs are indistinguishable from unparseable evidence:
+	 * refuse-all, never guess. */
 	if (block == NULL || !TransactionIdIsNormal(xid))
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 	/*
 	 * Header identity sanity: the bytes must provably be the asked-for TT.
 	 * A mismatched segment_id / owner (raced segment reuse on the origin, a
 	 * stale cache pairing, a mis-routed reply) or an over-range slot count
-	 * means the scan below would not be evidence about `xid` — refuse.
+	 * means the scan below would not be evidence about `xid` — poisoned.
 	 */
 	hdr = (const UndoSegmentHeaderData *)block;
 	if (hdr->segment_id != expected_segment_id)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->owner_instance != expected_owner_instance)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->tt_slots_count > TT_SLOTS_PER_SEGMENT)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 	for (int i = 0; i < (int)hdr->tt_slots_count; i++) {
 		const TTSlot *slot = &hdr->tt_slots[i];
@@ -122,10 +129,10 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 		/*
 		 * Any status byte outside the known range poisons the whole block:
 		 * we cannot claim to have understood a TT whose slots we cannot
-		 * parse (this is a shipped COPY — refuse, never PANIC).
+		 * parse (refuse, never PANIC).
 		 */
 		if (slot->status > (uint8)TT_SLOT_RECYCLABLE)
-			return CLUSTER_VIS_TT_PROOF_NONE;
+			return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 		/* UNUSED carries no transaction; its xid bytes are placeholder. */
 		if (slot->status == (uint8)TT_SLOT_UNUSED)
@@ -142,24 +149,54 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 		}
 	}
 
-	if (nmatch != 1)
+	if (out_nmatch != NULL)
+		*out_nmatch = nmatch;
+
+	if (nmatch == 1) {
+		if (match->status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match->commit_scn)) {
+			if (out_proof != NULL)
+				*out_proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+			if (out_commit_scn != NULL)
+				*out_commit_scn = match->commit_scn;
+			if (out_wrap != NULL)
+				*out_wrap = match->wrap;
+		} else if (match->status == (uint8)TT_SLOT_ABORTED) {
+			if (out_proof != NULL)
+				*out_proof = CLUSTER_VIS_TT_PROOF_ABORTED;
+			if (out_wrap != NULL)
+				*out_wrap = match->wrap;
+		}
+		/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: found (nmatch=1) but
+		 * in-doubt — proof stays NONE. */
+	}
+	return CLUSTER_VIS_TT_BLOCK_SCAN_OK;
+}
+
+/*
+ * cluster_vis_tt_block_positive_proof
+ *
+ * CP3 positive-proof scan over a D-i1-fetched TT header block.  See the
+ * header comment for the full proof discipline (positive proof only; 0-match
+ * / multi-match / non-terminal / malformed all refuse).  The block bytes are
+ * the origin's own shipped copy, so every refusal is a clean NONE — never an
+ * elog — and the caller keeps the 53R97 fail-closed boundary.  Since
+ * spec-5.22d A1 a thin wrapper over the scan core above: POISONED and
+ * nmatch != 1 and non-terminal all collapse to NONE, byte-for-byte the
+ * pre-A1 behavior (the pre-A1 unit truth table passes unchanged).
+ */
+ClusterVisTtProof
+cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,
+									uint8 expected_owner_instance, TransactionId xid,
+									SCN *out_commit_scn, uint16 *out_wrap)
+{
+	int nmatch = 0;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+
+	if (cluster_vis_tt_block_xid_scan(block, expected_segment_id, expected_owner_instance, xid,
+									  &nmatch, &proof, out_commit_scn, out_wrap)
+		!= CLUSTER_VIS_TT_BLOCK_SCAN_OK)
 		return CLUSTER_VIS_TT_PROOF_NONE;
-
-	if (match->status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match->commit_scn)) {
-		if (out_commit_scn != NULL)
-			*out_commit_scn = match->commit_scn;
-		if (out_wrap != NULL)
-			*out_wrap = match->wrap;
-		return CLUSTER_VIS_TT_PROOF_COMMITTED;
-	}
-	if (match->status == (uint8)TT_SLOT_ABORTED) {
-		if (out_wrap != NULL)
-			*out_wrap = match->wrap;
-		return CLUSTER_VIS_TT_PROOF_ABORTED;
-	}
-
-	/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: not a terminal proof. */
-	return CLUSTER_VIS_TT_PROOF_NONE;
+	return proof;
 }
 
 /*

@@ -272,13 +272,18 @@ extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);
 extern void cluster_vis_freshref_verdict_note_resolved(void);
 extern void cluster_vis_freshref_verdict_note_failclosed(void);
 
-/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */
+/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters.
+ * A1 (D4-8) adds the complete-scan refusal attribution pair. */
 extern uint64 cluster_undo_authority_serve_hit_count(void);
 extern uint64 cluster_undo_authority_fail_closed_count(void);
 extern uint64 cluster_undo_authority_epoch_stale_reject_count(void);
+extern uint64 cluster_undo_authority_scan_incomplete_reject_count(void);
+extern uint64 cluster_undo_authority_multi_match_reject_count(void);
 extern void cluster_undo_authority_note_serve_hit(void);
 extern void cluster_undo_authority_note_failclosed(void);
 extern void cluster_undo_authority_note_epoch_stale_reject(void);
+extern void cluster_undo_authority_note_scan_incomplete_reject(void);
+extern void cluster_undo_authority_note_multi_match_reject(void);
 
 /*
  * spec-6.12i CP5 (D-i4): origin-side pieces of the cross-instance verdict

@@ -362,10 +362,68 @@ UT_TEST(test_serve_decide_invalid_dest_failclosed)
 				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
 }
 
+/* spec-5.22d A1 (D4-8): the cross-segment scan aggregation fold — the pure
+ * half of the complete-scan prove (truth table A1.2 #7-#12).  Admissible
+ * ONLY when nothing poisoned the set AND the whole owner set holds exactly
+ * one match AND that match is terminal. */
+UT_TEST(test_scan_fold_truth_table)
+{
+	ClusterUndoAuthorityScanAgg agg;
+
+	/* init: empty set proves nothing (#8). */
+	cluster_undo_authority_scan_agg_init(&agg);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+
+	/* one block, unique COMMITTED (#11): admissible, evidence kept. */
+	cluster_undo_authority_scan_fold(&agg, true, 0, CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_COMMITTED, (SCN)777, 5);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 1);
+	UT_ASSERT_EQ(agg.proof, CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ((long long)agg.commit_scn, 777);
+	UT_ASSERT_EQ(agg.wrap, 5);
+
+	/* a second match in ANOTHER block (#9): evidence voided, refuse. */
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_ABORTED, InvalidScn, 4);
+	UT_ASSERT_EQ(agg.total_match, 2);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+	UT_ASSERT_EQ(agg.proof, CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* unique ABORTED (#12): admissible. */
+	cluster_undo_authority_scan_agg_init(&agg);
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_ABORTED, InvalidScn, 2);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 1);
+	UT_ASSERT_EQ(agg.proof, CLUSTER_VIS_TT_PROOF_ABORTED);
+
+	/* unique but NON-terminal (ACTIVE-shaped, #10): found, in-doubt, refuse. */
+	cluster_undo_authority_scan_agg_init(&agg);
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	UT_ASSERT_EQ(agg.total_match, 1);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+
+	/* multi-match INSIDE one block (#9): refuse. */
+	cluster_undo_authority_scan_agg_init(&agg);
+	cluster_undo_authority_scan_fold(&agg, true, 2, CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+
+	/* poison latch (#7): a bad block ANYWHERE voids even a clean unique
+	 * terminal match, before or after it. */
+	cluster_undo_authority_scan_agg_init(&agg);
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_COMMITTED, (SCN)777, 5);
+	cluster_undo_authority_scan_fold(&agg, false, 0, CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+	cluster_undo_authority_scan_agg_init(&agg);
+	cluster_undo_authority_scan_fold(&agg, false, 0, CLUSTER_VIS_TT_PROOF_NONE, InvalidScn, 0);
+	cluster_undo_authority_scan_fold(&agg, true, 1, CLUSTER_VIS_TT_PROOF_COMMITTED, (SCN)777, 5);
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(&agg) ? 1 : 0, 0);
+
+	/* NULL agg is never admissible (defense in depth). */
+	UT_ASSERT_EQ(cluster_undo_authority_scan_admissible(NULL) ? 1 : 0, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_authority_dead_owner_elects_lowest_survivor);
 	UT_RUN(test_authority_owner_live_no_election);
 	UT_RUN(test_authority_owner_undecided_unknown);
@@ -384,6 +442,7 @@ main(void)
 	UT_RUN(test_serve_decide_peer_block0);
 	UT_RUN(test_serve_decide_recovering_unknown_failclosed);
 	UT_RUN(test_serve_decide_invalid_dest_failclosed);
+	UT_RUN(test_scan_fold_truth_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

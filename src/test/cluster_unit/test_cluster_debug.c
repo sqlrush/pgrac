@@ -1870,6 +1870,17 @@ cluster_undo_authority_epoch_stale_reject_count(void)
 {
 	return 0;
 }
+/* spec-5.22d A1 (D4-8): complete-scan refusal attribution. */
+uint64
+cluster_undo_authority_scan_incomplete_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_multi_match_reject_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)

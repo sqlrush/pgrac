@@ -2600,6 +2600,11 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_authority_fail_closed_count()));
 	emit_row(rsinfo, "cr", "undo_authority_epoch_stale_reject_count",
 			 fmt_int64((int64)cluster_undo_authority_epoch_stale_reject_count()));
+	/* spec-5.22d A1 (D4-8): complete-scan refusal attribution. */
+	emit_row(rsinfo, "cr", "undo_authority_scan_incomplete_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_scan_incomplete_reject_count()));
+	emit_row(rsinfo, "cr", "undo_authority_multi_match_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_multi_match_reject_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

@@ -165,4 +165,57 @@ cluster_undo_authority_coverage_ok(bool claimed_at_epoch, bool block0_readable, 
 	return claimed_at_epoch && block0_readable && wrap_match;
 }
 
+/*
+ * A1 (D4-8) -- cross-segment scan aggregation (pure).  See the header for
+ * the contract; the U truth table (test_scan_fold_truth_table) pins the
+ * shape.
+ */
+void
+cluster_undo_authority_scan_agg_init(ClusterUndoAuthorityScanAgg *agg)
+{
+	agg->poisoned = false;
+	agg->total_match = 0;
+	agg->proof = CLUSTER_VIS_TT_PROOF_NONE;
+	agg->commit_scn = InvalidScn;
+	agg->wrap = 0;
+}
+
+void
+cluster_undo_authority_scan_fold(ClusterUndoAuthorityScanAgg *agg, bool block_ok, int nmatch,
+								 ClusterVisTtProof proof, SCN commit_scn, uint16 wrap)
+{
+	if (agg == NULL)
+		return;
+
+	if (!block_ok || nmatch < 0) {
+		agg->poisoned = true; /* latched: the set is not fully parseable */
+		return;
+	}
+
+	agg->total_match += nmatch;
+
+	if (agg->total_match == nmatch && nmatch == 1) {
+		/* first (and so far only) match in the whole set: keep its evidence */
+		agg->proof = proof;
+		agg->commit_scn = commit_scn;
+		agg->wrap = wrap;
+	} else if (agg->total_match > 1) {
+		/* ambiguity anywhere voids kept evidence (never serve two eras) */
+		agg->proof = CLUSTER_VIS_TT_PROOF_NONE;
+		agg->commit_scn = InvalidScn;
+		agg->wrap = 0;
+	}
+}
+
+bool
+cluster_undo_authority_scan_admissible(const ClusterUndoAuthorityScanAgg *agg)
+{
+	if (agg == NULL || agg->poisoned)
+		return false;
+	if (agg->total_match != 1)
+		return false;
+	return agg->proof == CLUSTER_VIS_TT_PROOF_COMMITTED
+		   || agg->proof == CLUSTER_VIS_TT_PROOF_ABORTED;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

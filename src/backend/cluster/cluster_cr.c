@@ -195,6 +195,11 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 undo_authority_serve_hit_count;
 	pg_atomic_uint64 undo_authority_fail_closed_count;
 	pg_atomic_uint64 undo_authority_epoch_stale_reject_count;
+	/* spec-5.22d A1 (D4-8): complete-scan refusal attribution — the durable
+	 * segment-set enumeration/parse was incomplete (refuse-all), or the set
+	 * held more than one match for the asked xid (ambiguity). */
+	pg_atomic_uint64 undo_authority_scan_incomplete_reject_count;
+	pg_atomic_uint64 undo_authority_multi_match_reject_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -282,6 +287,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_epoch_stale_reject_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_scan_incomplete_reject_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_multi_match_reject_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -481,6 +488,21 @@ cluster_undo_authority_note_epoch_stale_reject(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->undo_authority_epoch_stale_reject_count, 1);
 }
+
+/* PGRAC: spec-5.22d A1 (D4-8) — complete-scan refusal attribution. */
+void
+cluster_undo_authority_note_scan_incomplete_reject(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_scan_incomplete_reject_count, 1);
+}
+
+void
+cluster_undo_authority_note_multi_match_reject(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_multi_match_reject_count, 1);
+}
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -527,6 +549,10 @@ CR_COUNTER_ACCESSOR(cluster_undo_authority_serve_hit_count, undo_authority_serve
 CR_COUNTER_ACCESSOR(cluster_undo_authority_fail_closed_count, undo_authority_fail_closed_count)
 CR_COUNTER_ACCESSOR(cluster_undo_authority_epoch_stale_reject_count,
 					undo_authority_epoch_stale_reject_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_scan_incomplete_reject_count,
+					undo_authority_scan_incomplete_reject_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_multi_match_reject_count,
+					undo_authority_multi_match_reject_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)

@@ -33,14 +33,17 @@
 #include "cluster/cluster_conf.h"				/* CLUSTER_MAX_NODES */
 #include "cluster/cluster_cr.h"					/* undo_authority_* counters (D4-5) */
 #include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current */
+#include "cluster/cluster_inject.h"				/* D4-8 L3 prove-refusal injection */
 #include "cluster/cluster_membership.h"			/* cluster_membership_get_state */
 #include "cluster/cluster_reconfig.h"			/* cluster_reconfig_get_observed_fresh_alive */
 #include "cluster/cluster_runtime_visibility.h" /* cluster_vis_tt_block_positive_proof */
 #include "cluster/cluster_scn.h"				/* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_tt_slot.h"			/* TT_WRAP_INVALID */
 #include "cluster/cluster_undo_authority.h"
-#include "cluster/cluster_undo_resid.h" /* cluster_undo_resid_master (D1) */
-#include "cluster/cluster_undo_smgr.h"	/* cluster_undo_smgr_read_block (D4-5) */
+#include "cluster/cluster_undo_resid.h"		   /* cluster_undo_resid_master (D1) */
+#include "cluster/cluster_undo_smgr.h"		   /* cluster_undo_smgr_read_block (D4-5) */
+#include "cluster/storage/cluster_shared_fs.h" /* undo_instance_dir_resolve (A1/D4-8) */
+#include "storage/fd.h"						   /* AllocateDir/ReadDirExtended (A1/D4-8) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -129,22 +132,140 @@ cluster_undo_serve_authority(const ClusterResId *undo_resid, uint64 reconfig_epo
 }
 
 /*
- * cluster_undo_authority_block0_prove -- shared authority block0 prove core
- * (D4-5).  See cluster_undo_authority.h for the contract.
+ * authority_scan_owner_segments -- A1 (D4-8) durable segment-set scan.
  *
- *	The coverage three-way AND (§2.4), with the counters owned HERE so the
- *	requester self-serve leg (D4-4) and the wire-served LMS leg (D4-5/D4-6)
- *	cannot drift on the observability contract:
- *	  (i)   claimed_at_epoch: claim_epoch still IS the current accepted
- *	        epoch; a stale claim bumps epoch_stale_reject + fail_closed.
- *	  (ii)  block0_readable: the AUTHORITY_BLOCK0 foreign-owner intent
- *	        (D4-3) resolved + fully read the shared block0 bytes.
- *	  (iii) wrap_match: the slot-level xid+wrap positive proof matched
- *	        (content-based anti-ABA; the same proof the live CP3 leg
- *	        trusts).  block0 is synchronously durable (D2 Q3): a full read
- *	        is crash-consistent, no LSN-cover window applies.
- *	Proof NONE has no CP5 fallback: the owner is dead, there is nobody to
- *	ask, so NONE proves nothing => fail closed (never a native fallback).
+ *	Enumerate the dead owner's SHARED undo directory (the one namespace
+ *	cluster_shared_fs_undo_path_resolve ever writes into — A1.1) and fold
+ *	every segment's block0 xid scan into *agg.  完备-或-fail-closed: any
+ *	enumeration break, non-canonical entry name, unreadable block0 or
+ *	unparseable block poisons the whole set — the caller must refuse, never
+ *	skip-and-continue (a uniqueness claim needs the full set visible).
+ *
+ *	Writer exclusion (A1.1-bis #1) makes the enumerated set stable: the dead
+ *	owner is dead-decided + write-fenced (its revival forces a reconfig ⇒
+ *	epoch bump ⇒ the caller's post-scan re-check refuses); survivors' only
+ *	foreign-owner intent is AUTHORITY_BLOCK0, whose single I/O consumer is
+ *	the read below (no writer, no unlink/rename path exists).  D5's future
+ *	reclaimer must inherit this invariant before deleting anything here.
+ *
+ *	seg_0 is NOT skipped (A1.1-bis #3): "segment 0 never carries a xact TT
+ *	slot" is not a verified structural invariant (the uba_encode Assert only
+ *	fences record UBAs, and the slot cursor rolls independently), so if a
+ *	shared seg_0 exists it is verified and counted like any other.
+ *
+ *	true = the whole set was enumerated + parsed (agg holds the aggregate);
+ *	false = the set is not provably complete (caller refuses; the caller
+ *	owns the scan_incomplete counter so refusal attribution has one home).
+ */
+static bool
+authority_scan_owner_segments(int32 owner_node, TransactionId raw_xid,
+							  ClusterUndoAuthorityScanAgg *agg)
+{
+	char dirpath[MAXPGPATH];
+	DIR *dir;
+	struct dirent *de;
+	uint8 owner_instance = (uint8)(owner_node + 1);
+	bool complete = true;
+
+	if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, dirpath, sizeof(dirpath)) != 0)
+		return false;
+
+	dir = AllocateDir(dirpath);
+	if (dir == NULL)
+		return false;
+
+	errno = 0;
+	while ((de = ReadDirExtended(dir, dirpath, LOG)) != NULL) {
+		char canon[64];
+		unsigned long id;
+		char *end;
+		PGAlignedBlock page;
+		int nmatch = 0;
+		ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+		SCN scn = InvalidScn;
+		uint16 wrap = TT_WRAP_INVALID;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			errno = 0;
+			continue;
+		}
+
+		/*
+		 * Canonical name gate (A1.1-bis #2): every other entry must be
+		 * EXACTLY seg_<id>.dat as the writer renders it — parse, then
+		 * re-render and compare, so aliases (seg_007.dat), trailing junk
+		 * and out-of-range ids all poison the set instead of hiding
+		 * evidence under a name the scan would skip.
+		 */
+		if (strncmp(de->d_name, "seg_", 4) != 0) {
+			complete = false;
+			break;
+		}
+		errno = 0;
+		id = strtoul(de->d_name + 4, &end, 10);
+		if (errno != 0 || end == de->d_name + 4 || strcmp(end, ".dat") != 0 || id > UINT16_MAX) {
+			complete = false;
+			break;
+		}
+		snprintf(canon, sizeof(canon), "seg_%lu.dat", id);
+		if (strcmp(canon, de->d_name) != 0) {
+			complete = false;
+			break;
+		}
+
+		/* Read + parse this segment's block0; any failure poisons the set. */
+		if (!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+										  (uint32)id, owner_instance, 0 /* block0 */, page.data)) {
+			complete = false;
+			break;
+		}
+		if (cluster_vis_tt_block_xid_scan(page.data, (uint32)id, owner_instance, raw_xid, &nmatch,
+										  &proof, &scn, &wrap)
+			!= CLUSTER_VIS_TT_BLOCK_SCAN_OK) {
+			complete = false;
+			break;
+		}
+		cluster_undo_authority_scan_fold(agg, true, nmatch, proof, scn, wrap);
+		errno = 0;
+	}
+	if (complete && errno != 0)
+		complete = false; /* readdir broke mid-enumeration: set not complete */
+
+	FreeDir(dir);
+	return complete;
+}
+
+/*
+ * cluster_undo_authority_block0_prove -- shared authority prove core (D4-5;
+ * A1/D4-8 widened from single-segment to the owner's COMPLETE durable
+ * segment set).  See cluster_undo_authority.h for the contract.
+ *
+ *	The live CP5 verdict is a complete scan over the origin's LIVE TT
+ *	because a single block0's 0-match proves nothing — the xid's slot may
+ *	live in another segment (the slot cursor rolls independently of the
+ *	record cursor the ref's UBA points at; D4-8 e2e evidence).  For a DEAD
+ *	owner the durable shared segment set is the same authority translated
+ *	to durable state, so THIS is the complete scan: enumerate every shared
+ *	segment (A1.1), demand the whole set parseable, and serve only a
+ *	set-wide UNIQUE terminal match (truth table A1.2).
+ *
+ *	Coverage discipline, counters owned HERE (self + wire legs can never
+ *	drift):
+ *	  (i)   claimed_at_epoch: claim_epoch is the current accepted epoch at
+ *	        entry AND STILL at scan end (A1 约束 3 — a reconfig mid-scan
+ *	        could otherwise stitch a cross-epoch verdict) — else
+ *	        epoch_stale_reject + fail_closed.
+ *	  (ii)  set complete: enumeration + every block0 read + parse succeeded
+ *	        — else scan_incomplete_reject + fail_closed (A1 约束 1).
+ *	  (iii) unique terminal match: exactly one xid+wrap match across the
+ *	        whole set, terminal (COMMITTED-with-scn / ABORTED) — 0-match and
+ *	        non-terminal fail_closed; >=2 matches multi_match_reject +
+ *	        fail_closed (A1 约束 2).
+ *	block0 bytes are synchronously durable (D2 Q3; the commit/abort stamps
+ *	are targeted pre-commit pwrites), so full reads are crash-consistent —
+ *	no LSN-cover window applies.  A regular (non-2PC) abort leaves its slot
+ *	durably ACTIVE (no durable ABORTED stamp exists outside 2PC and the
+ *	owner's own recovery, A1.5): such xids stay in-doubt here by design.
  */
 ClusterUndoVerdictResult
 cluster_undo_authority_block0_prove(int32 owner_node, uint32 segment_id, TransactionId raw_xid,
@@ -152,12 +273,7 @@ cluster_undo_authority_block0_prove(int32 owner_node, uint32 segment_id, Transac
 {
 	ClusterUndoVerdictResult unknown
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
-	PGAlignedBlock page;
-	SCN scn = InvalidScn;
-	uint16 wrap = TT_WRAP_INVALID;
-	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
-	bool claimed;
-	bool readable = false;
+	ClusterUndoAuthorityScanAgg agg;
 
 	/* malformed owner: never provable (defense in depth; the route layers
 	 * upstream already refuse it) */
@@ -166,37 +282,63 @@ cluster_undo_authority_block0_prove(int32 owner_node, uint32 segment_id, Transac
 		return unknown;
 	}
 
-	/* segment 0 is bootstrap-only (Assert-fenced in uba_encode): a ref
-	 * carrying it is not resolvable evidence */
+	/* Malformed-ref precondition ONLY (A1.2): the ref's segment_id no longer
+	 * scopes the scan (the slot may live in any segment), but a ref carrying
+	 * the bootstrap segment or an over-range id is not resolvable evidence. */
 	if (segment_id == 0 || segment_id > UINT16_MAX) {
 		cluster_undo_authority_note_failclosed();
 		return unknown;
 	}
 
-	/* (i) the claim must still be scoped to the CURRENT epoch */
-	claimed = (cluster_epoch_get_current() == claim_epoch);
-	if (!claimed)
+	/* spec-5.22d D4-8 L3 (L408): SKIP forces the coverage-fail refusal under
+	 * a topology that would otherwise serve — proves the fail-closed arm and
+	 * its counter really fire (53R97, never a native answer).  Inert unless
+	 * armed; arm state is process-local, which reaches the SELF leg (this
+	 * runs in the reader backend); the wire leg runs in LMS, where arming is
+	 * the conf-time chaos-harness face (t/015 note). */
+	CLUSTER_INJECTION_POINT("cluster-undo-authority-block0-prove");
+	if (cluster_injection_should_skip("cluster-undo-authority-block0-prove")) {
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
+
+	/* (i) the claim must be scoped to the CURRENT epoch at entry */
+	if (cluster_epoch_get_current() != claim_epoch) {
 		cluster_undo_authority_note_epoch_stale_reject();
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
 
-	/* (ii) read the dead owner's shared block0 (read-only foreign intent) */
-	if (claimed)
-		readable = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
-												segment_id, (uint8)(owner_node + 1), 0 /* block0 */,
-												page.data);
+	/* (ii) enumerate + parse the owner's COMPLETE durable segment set */
+	cluster_undo_authority_scan_agg_init(&agg);
+	if (!authority_scan_owner_segments(owner_node, raw_xid, &agg) || agg.poisoned) {
+		cluster_undo_authority_note_scan_incomplete_reject();
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
 
-	/* (iii) slot-level xid+wrap positive proof on the read bytes */
-	if (readable)
-		proof = cluster_vis_tt_block_positive_proof(page.data, segment_id, (uint8)(owner_node + 1),
-													raw_xid, &scn, &wrap);
+	/* (i-bis) the epoch must not have moved ACROSS the scan window (A1 约束
+	 * 3): the writer-exclusion argument for the enumerated set is scoped to
+	 * one epoch, so a mid-scan reconfig voids the set's stability. */
+	if (cluster_epoch_get_current() != claim_epoch) {
+		cluster_undo_authority_note_epoch_stale_reject();
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
 
-	if (!cluster_undo_authority_coverage_ok(claimed, readable,
-											proof != CLUSTER_VIS_TT_PROOF_NONE)) {
+	/* (iii) set-wide unique terminal match, or refuse */
+	if (agg.total_match >= 2) {
+		cluster_undo_authority_note_multi_match_reject();
+		cluster_undo_authority_note_failclosed();
+		return unknown;
+	}
+	if (!cluster_undo_authority_scan_admissible(&agg)) {
 		cluster_undo_authority_note_failclosed();
 		return unknown;
 	}
 
 	cluster_undo_authority_note_serve_hit();
-	return cluster_undo_verdict_from_block_proof(proof, scn, wrap);
+	return cluster_undo_verdict_from_block_proof(agg.proof, agg.commit_scn, agg.wrap);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

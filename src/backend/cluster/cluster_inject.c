@@ -369,6 +369,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-undo-fetch" },
 	/*
+	 * spec-5.22d D4-8 — dead-owner authority block0-prove refusal injection.
+	 *
+	 *	cluster-undo-authority-block0-prove:
+	 *	  Fires at the head of the shared authority block0 prove core
+	 *	  (cluster_undo_authority_block0_prove), which both the requester's
+	 *	  SELF-authority leg and the kind-4 LMS wire leg run.  SKIP forces
+	 *	  the coverage-fail refusal (undo_authority_fail_closed bumps, the
+	 *	  consumer keeps 53R97) under a topology that would otherwise serve
+	 *	  the dead owner's verdict — TAP L3 pins the fail-closed arm with a
+	 *	  counter delta (L408), never a native CLOG answer.
+	 */
+	{ .name = "cluster-undo-authority-block0-prove" },
+	/*
 	 * spec-6.12e2 — holder-side BAST-nudge refusal injection.
 	 *
 	 *	cluster-gcs-block-bast-nudge:

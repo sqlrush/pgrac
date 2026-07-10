@@ -207,6 +207,29 @@ extern bool cluster_undo_authority_coverage_ok(bool claimed_at_epoch, bool block
 											   bool wrap_match);
 
 /*
+ * A1 (D4-8) -- cross-segment scan aggregation (pure).  The complete-scan
+ * prove folds every enumerated block0's cluster_vis_tt_block_xid_scan result
+ * into this aggregate; the verdict is admissible ONLY when nothing poisoned
+ * the set (block_ok=false latches; 完备-或-fail-closed, A1.1) AND the whole
+ * owner set holds EXACTLY one match AND that match is terminal (truth table
+ * A1.2 #7-#12).  A second match ANYWHERE voids the kept evidence (never
+ * serve an ambiguous identity).  Pure; unit truth table.
+ */
+typedef struct ClusterUndoAuthorityScanAgg {
+	bool poisoned;			 /* latched: any unreadable/unparseable block */
+	int total_match;		 /* xid matches across the whole enumerated set */
+	ClusterVisTtProof proof; /* the unique match's terminal proof (or NONE) */
+	SCN commit_scn;			 /* valid iff proof == COMMITTED */
+	uint16 wrap;			 /* the unique match's wrap evidence */
+} ClusterUndoAuthorityScanAgg;
+
+extern void cluster_undo_authority_scan_agg_init(ClusterUndoAuthorityScanAgg *agg);
+extern void cluster_undo_authority_scan_fold(ClusterUndoAuthorityScanAgg *agg, bool block_ok,
+											 int nmatch, ClusterVisTtProof proof, SCN commit_scn,
+											 uint16 wrap);
+extern bool cluster_undo_authority_scan_admissible(const ClusterUndoAuthorityScanAgg *agg);
+
+/*
  * D4-5 -- shared authority block0 prove core (heavy, snapshot object).  The
  * ONE implementation both consumers run so the self-authority answer (D4-4
  * requester leg, cluster_runtime_visibility.c) and the wire-served authority

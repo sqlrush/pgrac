@@ -237,6 +237,93 @@ UT_TEST(test_ttproof_ambiguity_and_garbage)
 				 CLUSTER_VIS_TT_PROOF_NONE);
 }
 
+/* spec-5.22d A1 (D4-8): the scan CORE under the positive-proof wrapper.
+ * Same parse discipline, but nmatch is reported (the cross-segment
+ * aggregation needs it) and unparseable bytes are a distinct POISONED
+ * status (the aggregate must refuse-all, never skip-and-continue). */
+UT_TEST(test_tt_block_xid_scan_core)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	int nmatch = -1;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+	SCN scn = (SCN)1;
+	uint16 wrap = 1;
+
+	/* OK + 0 matches: parseable block, no evidence; outs reset. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 3000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 0);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+
+	/* OK + unique COMMITTED: terminal, scn/wrap out. */
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(scn, (SCN)777);
+	UT_ASSERT_EQ(wrap, 5);
+
+	/* OK + unique ABORTED: terminal. */
+	set_slot(hdr, 9, 2000, 2, (uint8)TT_SLOT_ABORTED, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_ABORTED);
+	UT_ASSERT_EQ(wrap, 2);
+
+	/* OK + unique ACTIVE: found but NOT terminal (in-doubt) — nmatch says
+	 * "evidence lives here", proof says "not provable". */
+	set_slot(hdr, 12, 2500, 1, (uint8)TT_SLOT_ACTIVE, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2500,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* OK + 2 matches inside one block (RECYCLABLE residue counts). */
+	set_slot(hdr, 7, 1000, 4, (uint8)TT_SLOT_RECYCLABLE, (SCN)555);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 2);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+
+	/* POISONED: header identity mismatch (segment / owner), count over. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG + 1, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER + 1, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT + 1;
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+
+	/* POISONED: a garbage status byte anywhere poisons the whole block,
+	 * whatever xid is asked. */
+	set_slot(hdr, 40, 4000, 1, (uint8)7, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	set_slot(hdr, 40, 0, 0, (uint8)TT_SLOT_UNUSED, InvalidScn);
+
+	/* POISONED: caller-bug inputs refuse-all (NULL block / invalid xid). */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(NULL, PROOF_SEG, PROOF_OWNER, 1000, &nmatch, &proof,
+											   &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER,
+											   InvalidTransactionId, &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+}
+
 /* Header identity mismatches: not provably the asked-for TT -> refuse. */
 UT_TEST(test_ttproof_header_mismatch)
 {
@@ -537,7 +624,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_covers_when_epoch_match_and_hwm_ge_anchor);
 	UT_RUN(test_failclosed_when_epoch_differs);
 	UT_RUN(test_failclosed_when_hwm_invalid);
@@ -547,6 +634,7 @@ main(void)
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
+	UT_RUN(test_tt_block_xid_scan_core);
 	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
 	UT_RUN(test_undo_verdict_page_usable);
