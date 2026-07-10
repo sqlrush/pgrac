@@ -77,6 +77,7 @@ typedef enum ClusterInjectFaultType {
 	CLUSTER_FAULT_SLEEP = 3,
 	CLUSTER_FAULT_CRASH = 4,
 	CLUSTER_FAULT_SKIP = 5,
+	CLUSTER_FAULT_SKIP_N = 6, /* spec-7.2a: count-based skip (:skipn:N drops N times, then stops) */
 } ClusterInjectFaultType;
 
 

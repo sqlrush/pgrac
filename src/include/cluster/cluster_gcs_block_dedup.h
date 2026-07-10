@@ -187,6 +187,87 @@ typedef enum GcsBlockDedupResult {
 
 
 /* ============================================================
+ * Eager reclaim safety decision primitives (spec-7.2a; review r1).
+ *
+ *	These two pure predicates carry the Rule 8.A correctness contract for
+ *	the spec-7.2a eager reclaim path: a completed dedup entry may only be
+ *	reclaimed under cap pressure when doing so cannot cause a retransmitted
+ *	duplicate to be re-served in a way that breaks de-dup correctness.  They
+ *	live in the header (matching the GcsBlockReplyStatus* helpers in
+ *	cluster_gcs_block.h) so the decision logic is unit-testable without
+ *	shmem; the shmem HTAB glue (scan + remove + counters) lives in the .c.
+ * ============================================================ */
+
+/*
+ * GcsBlockReplyStatusIsReclaimIdempotent -- whether a completed dedup entry
+ * carrying this reply status may be reclaimed WHILE the sender's retransmit
+ * budget could still be live (in-window), without breaking retransmit de-dup
+ * correctness (Rule 8.A).
+ *
+ * Default = false (UNSAFE / fail-closed).  A status is admitted here ONLY
+ * after per-site measure-first proves that every master-side install site
+ * which produces it re-serves with NO master state transition and NO
+ * side-effect counter, so a duplicate that MISSes after reclaim re-derives a
+ * bit-for-bit identical verdict.
+ *
+ * Statuses proven NOT idempotent (spec-7.2a §3.2, verified against
+ * cluster_gcs_block.c on stage7-72-integration):
+ *	 GRANTED / READ_IMAGE_FROM_XHOLDER		payload-bearing re-grant
+ *	 *_FROM_HOLDER							forward routing marker
+ *	 GRANTED_STORAGE_FALLBACK				:3305 N->S / :4089 S->X_UPGRADE
+ *	 DENIED_PENDING_X						:4071 broadcast_invalidate
+ *	 DENIED_LOST_WRITE						:4393 lost_write_detected_count++
+ *
+ * The whitelist is currently EMPTY: no status is in-window reclaimable until
+ * its sites are individually proven (follow-on increment, spec-7.2a §11).
+ * Out-of-window (2x) reclaim, handled by GcsBlockDedupEntryIsReclaimSafe
+ * below, is safe for every status regardless.  Kept as an explicit switch so
+ * a proven status is added as a `case ...: return true;` here.
+ */
+static inline bool
+GcsBlockReplyStatusIsReclaimIdempotent(GcsBlockReplyStatus status)
+{
+	switch (status) {
+		/* (no in-window-idempotent status proven yet — spec-7.2a §11) */
+	default:
+		break;
+	}
+	return false;
+}
+
+/*
+ * GcsBlockDedupEntryIsReclaimSafe -- whether a dedup entry may be reclaimed
+ * under cap pressure without breaking retransmit de-dup correctness.
+ *
+ *	out_of_window_us is the 2x total-backoff window (review r1: 1x only
+ *	bounds the sender's last SEND, not the arrival of an in-flight
+ *	retransmit at the master; 2x also covers transit + timing skew — the
+ *	same margin the TTL sweep uses, dedup_expiry_threshold_us()).
+ *
+ *	  in-flight (completed_at_ts == 0)		-> never (still processing)
+ *	  completed, age > out_of_window_us		-> safe for EVERY status
+ *											   (spec-7.2a §3.1 theorem)
+ *	  completed, age <= out_of_window_us	-> safe ONLY if the status is
+ *											   site-proven idempotent
+ */
+static inline bool
+GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now,
+								int64 out_of_window_us)
+{
+	int64 age_us;
+
+	if (entry->completed_at_ts == 0)
+		return false;
+
+	age_us = (int64)(now - entry->completed_at_ts);
+	if (age_us > out_of_window_us)
+		return true;
+
+	return GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus)entry->status);
+}
+
+
+/* ============================================================
  * Public API.
  * ============================================================ */
 
@@ -280,6 +361,8 @@ extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
 extern uint64 cluster_gcs_block_dedup_get_full_count(void);
 extern uint64 cluster_gcs_block_dedup_get_in_flight_count(void);
+extern uint64 cluster_gcs_block_dedup_get_evict_count(void); /* spec-7.2a D5 */
+extern uint64 cluster_gcs_block_dedup_get_max_entries(void); /* spec-7.2a D5 */
 
 
 /* ============================================================

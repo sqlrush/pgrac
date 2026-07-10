@@ -919,11 +919,17 @@ extern int cluster_gcs_reply_timeout_ms;
  *
  *	cluster.gcs_block_dedup_max_entries
  *	  type: int   context: PGC_POSTMASTER
- *	  default: 1024 (min 256, max 16384)
+ *	  default: 16384 (min 256, max 65536;  spec-7.2a D4 raised from
+ *	  1024/16384; 16384 = the measured S1 4-node distinct-read green
+ *	  floor on the RACvsRAC rig)
  *	  Per-node cap for the master-side dedup HTAB.  Each entry occupies
- *	  sizeof(GcsBlockDedupEntry) = 8312B, so default cap → ~8.4 MB shmem
- *	  on each node acting as GCS block-ship master.  HASH_ENTER_NULL on
- *	  cap → DENIED_DEDUP_FULL fail-closed (sender retries via HC96).
+ *	  sizeof(GcsBlockDedupEntry) = 8448B, so default cap → ~138 MB shmem
+ *	  on each node acting as GCS block-ship master.  The effective
+ *	  capacity is auto-sized to at least MaxConnections × declared node
+ *	  count (capped at the ceiling; spec-7.2a D4 Q4).  Under cap pressure
+ *	  the master eagerly reclaims reclaim-safe entries first;
+ *	  HASH_ENTER_NULL on a still-full table → DENIED_DEDUP_FULL
+ *	  fail-closed (sender retries via HC96).
  *
  *	HC97 retry math + HC92 cap + HC93 GC + HC96 transient.
  */
@@ -945,6 +951,15 @@ extern bool cluster_tx_enqueue_wait_enabled; /* spec-5.2 D4 */
 extern bool cluster_ic_duty_lazy;
 extern bool cluster_crossnode_write_write; /* spec-7.1a D0 */
 extern int cluster_gcs_block_dedup_max_entries;
+extern int cluster_gcs_block_drop_target_relfilenode; /* spec-7.2a test-only */
+
+/*
+ * GUC ceiling for cluster.gcs_block_dedup_max_entries.  The spec-7.2a D4
+ * auto-size floor (effective = Max(configured, MaxConnections × declared
+ * node count)) clamps to this so auto-sizing can widen a foot-gun config but
+ * never grows shmem past what the DBA could configure by hand.
+ */
+#define CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING 65536
 
 /* PGRAC: spec-4.7 D1 — bounded wait (ms) on a RECOVERING block resource
  * before fail-closing 53R9L.  See cluster_guc.c for semantics. */

@@ -732,7 +732,13 @@ bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
  * Off keeps the pre-7.1a floor: a TERMINAL remote writer holder fails
  * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
 bool cluster_crossnode_write_write = false;
-int cluster_gcs_block_dedup_max_entries = 1024;
+int cluster_gcs_block_dedup_max_entries = 16384; /* spec-7.2a: raised from 1024 */
+/*
+ * spec-7.2a test-only: when non-zero, the drop-reply injection only fires for
+ * block ships of this relfilenode, so a :skipn:N count lands on the intended
+ * relation and is not consumed by unrelated catalog/internal ships.  0 = any.
+ */
+int cluster_gcs_block_drop_target_relfilenode = 0;
 
 /*
  * PGRAC: spec-4.7 D1 — cluster.gcs_block_recovery_wait_ms.  Bounded backend
@@ -3946,15 +3952,34 @@ cluster_init_guc(void)
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",
 							gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
-							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8312B.  "
-										 "Default 1024 → ~8.4MB shmem on each node serving as "
-										 "GCS block-ship master; bootstrap/initdb with no "
-										 "configured cluster.node_id does not allocate the HTAB.  "
-										 "HASH_ENTER_NULL on cap → "
-										 "DENIED_DEDUP_FULL fail-closed (sender retries via "
-										 "HC96 transient).  HC92.  PGC_POSTMASTER."),
-							&cluster_gcs_block_dedup_max_entries, 1024, 256, 16384, PGC_POSTMASTER,
-							0, NULL, NULL, NULL);
+							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8448B.  "
+										 "Default 16384 → ~138MB shmem on each node serving as "
+										 "GCS block-ship master; ceiling 65536 → ~554MB; "
+										 "bootstrap/initdb with no configured cluster.node_id does "
+										 "not allocate the HTAB.  The effective capacity is never "
+										 "below MaxConnections × declared node count (auto-size "
+										 "floor, capped at the ceiling), so undersized configs do "
+										 "not saturate under distinct-read pressure.  Under cap "
+										 "pressure the master eagerly reclaims reclaim-safe "
+										 "entries before failing closed; HASH_ENTER_NULL on a "
+										 "still-full table → DENIED_DEDUP_FULL fail-closed "
+										 "(sender retries via HC96 transient).  HC92.  "
+										 "PGC_POSTMASTER (restart to change the fixed HTAB size)."),
+							&cluster_gcs_block_dedup_max_entries, 16384, 256,
+							CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING, PGC_POSTMASTER, 0, NULL,
+							NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.gcs_block_drop_target_relfilenode",
+		gettext_noop("Test-only: restrict the drop-reply injection to one relfilenode."),
+		gettext_noop("When non-zero, cluster-gcs-block-drop-reply-before-send only "
+					 "fires for block ships whose physical relfilenode matches this "
+					 "value, so a :skipn:N count is spent on the intended relation and "
+					 "not on unrelated catalog/internal ships.  0 (default) disables "
+					 "the filter; current TAP tests use 0 (the non-zero filter is "
+					 "reserved for non-shared-catalog rigs).  For TAP retransmit-dedup "
+					 "correctness tests only."),
+		&cluster_gcs_block_drop_target_relfilenode, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * PGRAC: spec-2.36 D8 — 3 NEW GUC for CF 3-way (X transfer +
