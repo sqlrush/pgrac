@@ -190,6 +190,12 @@ jobs:
           - { name: stage7-reconfig-liveness, ranges: "362-362", unit: false, regress: false }
           # t/363 spec-2.29a marker-async LMON liveness.
           - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
+          # t/364 + t/367 spec-7.3 LMS worker-pool family (single-node pool
+          # smoke + 2-node topology / multi-tag routing / recycle / N=1
+          # sentinel).  365 = spec-7.1a (main), 366 = spec-7.2a -- hub
+          # number ledger 2026-07-10; every new t/ file lands in a shard
+          # the same commit (L342).
+          - { name: stage7-lms-pool, ranges: "364 367", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
