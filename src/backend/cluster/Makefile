@@ -78,6 +78,7 @@ OBJS = \
 	cluster_gcs.o \
 	cluster_gcs_block.o \
 	cluster_gcs_block_dedup.o \
+	cluster_gcs_block_shard.o \
 	cluster_reconfig.o \
 	cluster_recovery_plan.o \
 	cluster_recovery_worker.o \
