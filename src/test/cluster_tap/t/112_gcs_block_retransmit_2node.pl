@@ -9,7 +9,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline:  9 NEW reliability counters all 0 on both nodes
-#	  L3  pg_cluster_state.gcs has 85 keys (cumulative through spec-7.2 D6 hist)
+#	  L3  pg_cluster_state.gcs has 86 keys (cumulative through spec-7.2 D6 hist)
 #	  L4  2 NEW wait events registered (ClusterGCSBlockRetransmitWait +
 #	       ClusterGCSBlockEpochStaleRetry)
 #	  L5  CLUSTER_WAIT_EVENTS_COUNT = 120 (spec-7.2 +2)
@@ -71,7 +71,7 @@ sub gcs_int
 # ============================================================
 # spec-7.3: cluster.lms_workers defaults to 2, and each node's DATA plane binds
 # a per-worker listener at data_port + worker_id (D3).  Reserve a 2-port span per
-# node so node0's worker-1 port does not collide with node1's base (mirrors t/365).
+# node so node0's worker-1 port does not collide with node1's base (mirrors t/367).
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_retransmit',
 	quorum_voting_disks => 3,
@@ -111,18 +111,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 85 keys (cumulative through spec-7.2 D6 hist).
+# L3: pg_cluster_state.gcs category has 86 keys (cumulative through spec-7.2 D6 hist).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '85',
-   'L3 node0 pg_cluster_state.gcs category has 85 keys');
+   '86',
+   'L3 node0 pg_cluster_state.gcs category has 86 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '85',
-   'L3 node1 pg_cluster_state.gcs category has 85 keys');
+   '86',
+   'L3 node1 pg_cluster_state.gcs category has 86 keys');
 
 
 # ============================================================
@@ -143,7 +143,7 @@ for my $we_name (
 
 
 # ============================================================
-# L5: total wait event count = 85.
+# L5: total wait event count = 120.
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
