@@ -156,6 +156,48 @@ extern ClusterUndoServeRoute cluster_undo_route_decide(int32 owner_node, uint64 
 extern ClusterUndoServeRoute cluster_undo_serve_authority(const ClusterResId *undo_resid,
 														  uint64 reconfig_epoch);
 
+/*
+ * D4-4 -- consumer serve decision (pure).  Maps a route to the ONE action the
+ * verdict consumer takes:
+ *
+ *	SERVE_FAIL_CLOSED -- everything unproven: RECOVERING / UNKNOWN, a
+ *	                     malformed route, AND an elected PEER authority.  The
+ *	                     peer wire serve lands with D4-5/D4-6 (LMS authority
+ *	                     serve + capability gate); until then routing a
+ *	                     request there would be an unproven path, so it fails
+ *	                     closed (never native, Rule 8.A).  Value 0 so a
+ *	                     zeroed decision is the safe one.
+ *	SERVE_OWNER_LIVE  -- owner is fresh-alive: stay on the D6 live-owner
+ *	                     path, byte-for-byte unchanged.
+ *	SERVE_SELF_BLOCK0 -- self IS the elected authority: read the dead
+ *	                     owner's shared block0 (AUTHORITY_BLOCK0 intent) and
+ *	                     serve the verdict locally.
+ */
+typedef enum ClusterUndoAuthorityServeDecision {
+	CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED = 0,
+	CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE,
+	CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0
+} ClusterUndoAuthorityServeDecision;
+
+extern ClusterUndoAuthorityServeDecision
+cluster_undo_authority_serve_decide(const ClusterUndoServeRoute *route, int32 self_node);
+
+/*
+ * D4-4 -- coverage predicate (spec-5.22d §2.4, 约束 #3).  The authority may
+ * serve a dead owner's block0 verdict ONLY under the three-way AND:
+ *	(i)   claimed_at_epoch -- the authority derivation held at the CURRENT
+ *	      reconfig epoch (route OK and the epoch has not moved since);
+ *	(ii)  block0_readable  -- the shared block0 bytes were actually read
+ *	      (AUTHORITY_BLOCK0 path resolve + full-block pread);
+ *	(iii) wrap_match       -- the slot-level xid+wrap positive proof matched
+ *	      (content-based anti-ABA; a recycled segment changes the wrap).
+ * Any term false => not covered => UNKNOWN_FAIL_CLOSED (53R97), never a
+ * native CLOG/hint fallback.  Named (rather than an inline &&) so the
+ * three-term shape is pinned by U5's truth table.
+ */
+extern bool cluster_undo_authority_coverage_ok(bool claimed_at_epoch, bool block0_readable,
+											   bool wrap_match);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_UNDO_AUTHORITY_H */

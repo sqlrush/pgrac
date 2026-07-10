@@ -1854,6 +1854,17 @@ cluster_vis_freshref_verdict_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-5.22d D4-4: dead-owner authority block0 serve counters. */
+uint64
+cluster_undo_authority_serve_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_fail_closed_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)

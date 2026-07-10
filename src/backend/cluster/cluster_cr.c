@@ -180,6 +180,16 @@ typedef struct ClusterCRShared {
 	 */
 	pg_atomic_uint64 vis_freshref_verdict_resolved_count;
 	pg_atomic_uint64 vis_freshref_verdict_failclosed_count;
+	/*
+	 * spec-5.22d D4-4: dead/absent-owner authority block0 serve outcomes.
+	 * serve_hit = self-as-authority served a terminal verdict off the dead
+	 * owner's shared block0 (the D4-8 L1 hard assert lands here, proving the
+	 * Route B serve ran rather than a materialized-copy read); fail_closed =
+	 * the precision chain refused (peer/no authority, epoch moved, block0
+	 * unreadable, or no slot proof) and the caller kept 53R97.
+	 */
+	pg_atomic_uint64 undo_authority_serve_hit_count;
+	pg_atomic_uint64 undo_authority_fail_closed_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -264,6 +274,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -440,6 +452,22 @@ cluster_vis_freshref_verdict_note_failclosed(void)
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->vis_freshref_verdict_failclosed_count, 1);
 }
+
+/* PGRAC: spec-5.22d D4-4 — dead-owner authority block0 serve bumps
+ * (cluster_runtime_visibility.c precision chain, backend context). */
+void
+cluster_undo_authority_note_serve_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_serve_hit_count, 1);
+}
+
+void
+cluster_undo_authority_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_fail_closed_count, 1);
+}
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -481,6 +509,9 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivabl
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count, vis_freshref_verdict_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_failclosed_count,
 					vis_freshref_verdict_failclosed_count)
+/* spec-5.22d D4-4: dead-owner authority block0 serve counters. */
+CR_COUNTER_ACCESSOR(cluster_undo_authority_serve_hit_count, undo_authority_serve_hit_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_fail_closed_count, undo_authority_fail_closed_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)

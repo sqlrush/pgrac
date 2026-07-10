@@ -123,4 +123,43 @@ cluster_undo_route_decide(int32 owner_node, uint64 reconfig_epoch,
 	return r;
 }
 
+/*
+ * cluster_undo_authority_serve_decide -- pure consumer serve decision (D4-4).
+ *
+ *	See cluster_undo_authority.h for the contract.  The ONLY two provable
+ *	actions are the live-owner path (D6, unchanged) and the self-authority
+ *	block0 serve; every other route -- RECOVERING, UNKNOWN, a malformed
+ *	destination, and an elected PEER authority (wire serve = D4-5/D4-6) --
+ *	fails closed.
+ */
+ClusterUndoAuthorityServeDecision
+cluster_undo_authority_serve_decide(const ClusterUndoServeRoute *route, int32 self_node)
+{
+	switch (route->status) {
+	case CLUSTER_UNDO_AUTHORITY_OWNER_LIVE:
+		return CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE;
+	case CLUSTER_UNDO_AUTHORITY_OK:
+		if (self_node >= 0 && route->destination_node == self_node)
+			return CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0;
+		/* peer authority: wire serve lands with D4-5/D4-6; fail closed */
+		return CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED;
+	case CLUSTER_UNDO_AUTHORITY_RECOVERING:
+	case CLUSTER_UNDO_AUTHORITY_UNKNOWN:
+	default:
+		return CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED;
+	}
+}
+
+/*
+ * cluster_undo_authority_coverage_ok -- pure coverage predicate (D4-4).
+ *
+ *	See cluster_undo_authority.h: three-way AND, each term independently
+ *	required (约束 #3; U5 pins the shape).
+ */
+bool
+cluster_undo_authority_coverage_ok(bool claimed_at_epoch, bool block0_readable, bool wrap_match)
+{
+	return claimed_at_epoch && block0_readable && wrap_match;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

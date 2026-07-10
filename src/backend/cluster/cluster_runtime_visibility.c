@@ -53,9 +53,11 @@
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_uba.h"
-#include "cluster/cluster_undo_gcs.h"	  /* cluster_undo_block_acquire_shared (D3-2) */
-#include "cluster/cluster_undo_resid.h"	  /* cluster_undo_resid_encode (D3-2) */
-#include "cluster/cluster_undo_verdict.h" /* verdict taxonomy + entry (D3-3/D3-4) */
+#include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
+#include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
+#include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
+#include "cluster/cluster_undo_smgr.h"		/* cluster_undo_smgr_read_block (D4-4) */
+#include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 
 /*
  * cluster_vis_live_authority_covers
@@ -504,6 +506,97 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 }
 
 /*
+ * rtvis_authority_serve_block0 — D4-4 self-authority dead-owner block0 serve
+ * (spec-5.22d §2.4, Route B).
+ *
+ *	Self IS the elected serve authority for a dead/absent owner's undo
+ *	resource: read the owner's durable block0 straight from shared storage
+ *	(AUTHORITY_BLOCK0 intent, read-only) and prove the slot verdict on the
+ *	read bytes.  Deliberately NOT an S-grant: the owner is dead and can grant
+ *	nothing; block0 is synchronously durable (D2 Q3), so a successful full
+ *	read is crash-consistent and no LSN-cover window applies (that gate
+ *	belongs to the WAL-replay materialized path, which Route B does not use).
+ *
+ *	Admissibility = the coverage predicate (约束 #3, three-way AND):
+ *	  (i)   claimed_at_epoch -- the route derivation (OK) is still scoped to
+ *	        the CURRENT accepted epoch (an epoch move invalidates the claim);
+ *	  (ii)  block0_readable  -- the shared block0 bytes were fully read via
+ *	        the AUTHORITY_BLOCK0 foreign-owner intent (D4-3);
+ *	  (iii) wrap_match       -- the slot-level xid+wrap positive proof
+ *	        matched (content-based anti-ABA -- the same proof the live CP3
+ *	        leg trusts; a recycled segment changes the slot wrap, so the
+ *	        proof fails NONE).
+ *	Any term false -> UNKNOWN_FAIL_CLOSED (the consumer keeps 53R97), never
+ *	a native CLOG/hint fallback (Rule 8.A).  A proof NONE has no CP5
+ *	fallback here: the origin is dead, there is nobody to ask -- the slot
+ *	may live in another segment, so NONE proves nothing => fail closed.
+ */
+static ClusterUndoVerdictResult
+rtvis_authority_serve_block0(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+							 const ClusterUndoServeRoute *route)
+{
+	ClusterUndoVerdictResult unknown
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+	PGAlignedBlock page;
+	SCN scn = InvalidScn;
+	uint16 wrap = TT_WRAP_INVALID;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+	bool claimed;
+	bool readable = false;
+
+	/*
+	 * Segment 0 is bootstrap-only (Assert-fenced in uba_encode): a ref
+	 * carrying it is not resolvable evidence (same pre-validation as the
+	 * live-owner remote leg).
+	 */
+	if (undo_segment_id == 0 || undo_segment_id > UINT16_MAX) {
+		cluster_undo_authority_note_failclosed();
+		cluster_rtvis_resolve_note_failclosed();
+		return unknown;
+	}
+
+	/* (i) the claim must still be scoped to the CURRENT epoch */
+	claimed = (route->status == CLUSTER_UNDO_AUTHORITY_OK
+			   && cluster_epoch_get_current() == route->reconfig_epoch);
+
+	/* (ii) read the dead owner's shared block0 (read-only foreign intent) */
+	if (claimed)
+		readable = cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+												undo_segment_id, (uint8)(origin_node + 1),
+												0 /* block0 */, page.data);
+
+	/* (iii) slot-level xid+wrap positive proof on the read bytes */
+	if (readable)
+		proof = cluster_vis_tt_block_positive_proof(page.data, undo_segment_id,
+													(uint8)(origin_node + 1), raw_xid, &scn, &wrap);
+
+	if (!cluster_undo_authority_coverage_ok(claimed, readable,
+											proof != CLUSTER_VIS_TT_PROOF_NONE)) {
+		cluster_undo_authority_note_failclosed();
+		cluster_rtvis_resolve_note_failclosed();
+		return unknown;
+	}
+
+	cluster_undo_authority_note_serve_hit();
+	if (proof == CLUSTER_VIS_TT_PROOF_COMMITTED) {
+		ClusterUndoVerdictResult r
+			= { .kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT, .commit_scn = scn, .wrap = wrap };
+
+		cluster_rtvis_resolve_note_committed();
+		return r;
+	}
+
+	/* CLUSTER_VIS_TT_PROOF_ABORTED: terminal, safe to consume */
+	{
+		ClusterUndoVerdictResult r
+			= { .kind = CLUSTER_UNDO_VERDICT_ABORTED, .commit_scn = InvalidScn, .wrap = wrap };
+
+		cluster_rtvis_resolve_note_aborted();
+		return r;
+	}
+}
+
+/*
  * cluster_undo_verdict_resolve — D3 cross-node xid -> commit_scn verdict entry
  * (D3-3).  The D6 consumer calls this to decide a seed / fresh-ref tuple.
  *
@@ -540,7 +633,41 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 	if (origin_node == cluster_node_id)
 		return rtvis_resolve_own_xid(raw_xid, read_scn);
 
-	/* master!=self: CP3 owner-as-master S-grant + CP5 origin verdict. */
+	/*
+	 * D4-4 precision chain (spec-5.22d §2.4): under the armed data plane,
+	 * route by owner liveness BEFORE asking the owner.  A dead/absent owner
+	 * cannot serve (its S-grant / verdict wire has nobody behind it); the
+	 * elected survivor authority serves its block0 verdict instead.  Off the
+	 * arm gate the chain is inert and the pre-D4 path below runs verbatim
+	 * (回归安全, §2.6).
+	 */
+	if (cluster_undo_gcs_coherence && cluster_peer_mode_enabled()) {
+		ClusterResId rid;
+		ClusterUndoServeRoute route;
+
+		cluster_undo_resid_encode((int32)origin_node, undo_segment_id, 0 /* block0 */, 0, &rid);
+		route = cluster_undo_serve_authority(&rid, cluster_epoch_get_current());
+		switch (cluster_undo_authority_serve_decide(&route, cluster_node_id)) {
+		case CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0:
+			/* self IS the elected authority for the dead owner */
+			return rtvis_authority_serve_block0(origin_node, undo_segment_id, raw_xid, &route);
+		case CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE:
+			break; /* live owner: unchanged CP3 + CP5 path below */
+		case CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED:
+		default:
+			/*
+			 * Dead owner with a peer/no authority (peer wire serve lands
+			 * with D4-5/D4-6), or owner liveness unproven: fail closed,
+			 * NEVER the native CLOG/hint path (Rule 8.A).
+			 */
+			cluster_undo_authority_note_failclosed();
+			cluster_rtvis_resolve_note_failclosed();
+			return unknown;
+		}
+	}
+
+	/* master!=self, owner live (or data plane unarmed): CP3 S-grant + CP5
+	 * origin verdict, byte-for-byte the pre-D4 path. */
 	if (cluster_runtime_visibility_try_resolve_remote(origin_node, undo_segment_id, raw_xid,
 													  anchor_lsn, read_scn, authoritative, &committed,
 													  &commit_scn, &is_bound))

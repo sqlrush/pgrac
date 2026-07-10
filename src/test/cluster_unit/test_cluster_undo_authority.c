@@ -262,10 +262,101 @@ UT_TEST(test_route_unknown_failclosed)
 	UT_ASSERT_EQ(r.destination_node, -1);
 }
 
+/* ======================================================================
+ * U5 -- coverage predicate (spec-5.22d D4-4, §2.4 约束 #3): the authority
+ * block0 serve is admissible ONLY under the three-way AND
+ *   claimed-at-epoch ∧ block0-readable ∧ wrap-match.
+ * Each term singly false must fail the whole predicate (three negative
+ * sub-cases) -- a future edit cannot silently drop one term.
+ * ====================================================================== */
+UT_TEST(test_coverage_three_way_and)
+{
+	/* all three proven -> covered */
+	UT_ASSERT(cluster_undo_authority_coverage_ok(true, true, true));
+
+	/* (i) authority not claimed at the current epoch -> not covered */
+	UT_ASSERT(!cluster_undo_authority_coverage_ok(false, true, true));
+
+	/* (ii) shared block0 not readable -> not covered */
+	UT_ASSERT(!cluster_undo_authority_coverage_ok(true, false, true));
+
+	/* (iii) generation/wrap mismatch (ABA suspect) -> not covered */
+	UT_ASSERT(!cluster_undo_authority_coverage_ok(true, true, false));
+}
+
+/* ======================================================================
+ * D4-4 serve-decision mapper -- route -> consumer action.  OWNER_LIVE keeps
+ * the D6 live-owner path; OK with destination == self serves the dead
+ * owner's shared block0 locally; EVERYTHING else fails closed, including
+ * an elected PEER authority (its wire serve lands with D4-5/D4-6 -- until
+ * then routing a request there would be an unproven path).
+ * ====================================================================== */
+
+/* owner live -> stay on the live-owner (D6) path, never block0-serve */
+UT_TEST(test_serve_decide_owner_live)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(2 /*owner*/, 42, CLUSTER_UNDO_AUTHORITY_OWNER_LIVE, -1);
+
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1 /*self*/),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_OWNER_LIVE);
+}
+
+/* elected authority == self -> serve the dead owner's shared block0 */
+UT_TEST(test_serve_decide_self_block0)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(0 /*dead owner*/, 42, CLUSTER_UNDO_AUTHORITY_OK, 1);
+
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1 /*self*/),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0);
+}
+
+/* elected authority == a PEER -> fail closed (peer wire serve = D4-5/D4-6) */
+UT_TEST(test_serve_decide_peer_failclosed)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(0 /*dead owner*/, 42, CLUSTER_UNDO_AUTHORITY_OK, 3);
+
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1 /*self*/),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+}
+
+/* RECOVERING / UNKNOWN -> fail closed (never native, never a guess) */
+UT_TEST(test_serve_decide_recovering_unknown_failclosed)
+{
+	ClusterUndoServeRoute r
+		= cluster_undo_route_decide(0, 42, CLUSTER_UNDO_AUTHORITY_RECOVERING, -1);
+
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+
+	r = cluster_undo_route_decide(0, 42, CLUSTER_UNDO_AUTHORITY_UNKNOWN, -1);
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+}
+
+/* defense in depth: an OK route carrying an invalid destination, or an
+ * invalid self node, can never yield a serve decision */
+UT_TEST(test_serve_decide_invalid_dest_failclosed)
+{
+	ClusterUndoServeRoute r;
+
+	/* malformed: OK status but destination -1 (cannot happen through
+	 * route_decide; guard against a hand-rolled route) */
+	r.status = CLUSTER_UNDO_AUTHORITY_OK;
+	r.destination_node = -1;
+	r.reconfig_epoch = 42;
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, -1),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+	UT_ASSERT_EQ(cluster_undo_authority_serve_decide(&r, 1),
+				 CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(18);
 	UT_RUN(test_authority_dead_owner_elects_lowest_survivor);
 	UT_RUN(test_authority_owner_live_no_election);
 	UT_RUN(test_authority_owner_undecided_unknown);
@@ -278,6 +369,12 @@ main(void)
 	UT_RUN(test_route_ok_routes_authority);
 	UT_RUN(test_route_recovering_failclosed_not_node);
 	UT_RUN(test_route_unknown_failclosed);
+	UT_RUN(test_coverage_three_way_and);
+	UT_RUN(test_serve_decide_owner_live);
+	UT_RUN(test_serve_decide_self_block0);
+	UT_RUN(test_serve_decide_peer_failclosed);
+	UT_RUN(test_serve_decide_recovering_unknown_failclosed);
+	UT_RUN(test_serve_decide_invalid_dest_failclosed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
