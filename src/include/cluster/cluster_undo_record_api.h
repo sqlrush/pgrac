@@ -230,8 +230,11 @@ extern bool cluster_undo_test_force_segment_end(void);
 
 /* spec-3.13 D3: cleaner-side segment lifecycle surface. */
 extern uint32 cluster_undo_record_active_segment_id(void);
+/* EPOCH_CHANGED when the spec-5.22e F-D2 fence tripped inside the mutation
+ * lock: the mutation was not performed; abort the whole pass. */
 extern ClusterUndoSegTryRecycle cluster_undo_segment_advance_recyclable(uint32 segment_id,
-																		SCN horizon);
+																		SCN horizon,
+																		uint64 expected_epoch);
 
 /*
  * spec-4.12a D1: record-segment ACTIVE -> COMMITTED drain.  Called at the

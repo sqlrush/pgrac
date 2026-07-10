@@ -90,6 +90,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
 #include "cluster/cluster_xnode_profile.h"	   /* PGRAC: spec-5.59 D7 profiling */
+#include "cluster/cluster_undo_horizon.h" /* epoch fence (spec-5.22e F-D2) */
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
 
@@ -2327,7 +2328,7 @@ cluster_undo_record_active_segment_id(void)
  *	BEFORE this lock (C17).
  */
 ClusterUndoSegTryRecycle
-cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
+cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon, uint64 expected_epoch)
 {
 	ClusterUndoSegTryRecycle result;
 	uint8 owner;
@@ -2342,6 +2343,18 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return CLUSTER_SEG_RECYCLE_NOT_COMMITTED; /* writer-active: never a candidate */
 	}
+
+	/*
+	 * spec-5.22e F-D2 epoch fence, INSIDE the mutation lock and before the
+	 * WAL/pwrite/fsync three-step: a reconfig epoch bump after the floor was
+	 * folded voids its member coverage.  Refuse the mutation; the caller
+	 * aborts the whole pass.
+	 */
+	if (cluster_undo_horizon_epoch_fence_tripped(expected_epoch)) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return CLUSTER_SEG_RECYCLE_EPOCH_CHANGED;
+	}
+
 	result = cluster_undo_segment_try_mark_recyclable(segment_id, owner, horizon);
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 

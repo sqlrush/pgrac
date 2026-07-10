@@ -675,6 +675,13 @@ void
 cluster_sf_dep_shmem_register(void)
 {}
 
+/* spec-5.22e D5-2 stub: cluster_init_shmem_module also calls
+ * cluster_undo_horizon_shmem_register (cluster_undo_horizon_ic.c is not
+ * linked into this standalone test); link-only no-op stub. */
+void
+cluster_undo_horizon_shmem_register(void)
+{}
+
 /*
  * spec-5.52 D9 stub: cluster_init_shmem_module also registers the independent
  * admission reason-counter region (cluster_cr_admit_stat.c is not linked into

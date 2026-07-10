@@ -220,7 +220,10 @@ typedef struct ClusterUndoCleanerPassStats {
  * any seg->lock — spec-3.12 C17).  Shares the recycle transition
  * helper with alloc Pass-2 (C-R1: single typed implementation).
  */
-extern void cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats);
+/* Returns false when the spec-5.22e F-D2 epoch fence tripped mid-scan:
+ * the caller must abort the whole pass immediately. */
+extern bool cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
+											ClusterUndoCleanerPassStats *stats);
 
 /*
  * D2-B: READ-ONLY scan of one segment's durable header TTSlot[]

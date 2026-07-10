@@ -429,6 +429,24 @@ cluster_undo_horizon_required_members(uint8 *required, uint64 *out_epoch)
 	return false;
 }
 
+/*
+ * F-D2 epoch fence: re-verify -- at every recycle mutation point -- that the
+ * reconfig epoch still equals the one the floor was folded at.  A mid-pass
+ * join/epoch bump means the folded floor's member set no longer covers the
+ * cluster (the new MEMBER's snapshots were not required), so the caller must
+ * abort the whole pass immediately, not just wait for the next one.  The
+ * injection point lets the t/370 L6 leg force the tripped arm at the first
+ * mutation without a real reconfig.
+ */
+bool
+cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
+{
+	CLUSTER_INJECTION_POINT("cluster-undo-horizon-epoch-fence");
+	if (cluster_injection_should_skip("cluster-undo-horizon-epoch-fence"))
+		return true;
+	return cluster_epoch_get_current() != expected_epoch;
+}
+
 /* ---------------- observability (D5-5 accessors) ---------------------- */
 
 #define UNDO_HORIZON_NOTE(field)                                                                   \

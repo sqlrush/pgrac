@@ -273,7 +273,14 @@ typedef enum ClusterUndoSegTryRecycle {
 	CLUSTER_SEG_RECYCLE_RETAINED = 2,	   /* predicate says a reader may need it */
 	CLUSTER_SEG_RECYCLE_NOT_COMMITTED = 3, /* ALLOCATED / ACTIVE: not a candidate */
 	CLUSTER_SEG_RECYCLE_READ_FAIL = 4,	   /* absent / I/O / identity mismatch */
-	CLUSTER_SEG_RECYCLE_WRITE_FAIL = 5	   /* pwrite / fsync failed; retry next pass */
+	CLUSTER_SEG_RECYCLE_WRITE_FAIL = 5,	   /* pwrite / fsync failed; retry next pass */
+	CLUSTER_SEG_RECYCLE_EPOCH_CHANGED = 6  /* spec-5.22e F-D2 epoch fence: the
+											* reconfig epoch moved after the
+											* recycle floor was folded; the
+											* mutation was NOT performed and the
+											* caller must abort the whole pass
+											* (the folded floor's member set no
+											* longer covers the cluster) */
 } ClusterUndoSegTryRecycle;
 
 /* Caller holds undo lifecycle_lock and excluded the active record segment. */

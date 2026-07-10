@@ -80,6 +80,16 @@
 
 UT_DEFINE_GLOBALS();
 
+/* spec-5.22e D5-3 stub: the gc pass consults the F-D2 epoch fence
+ * (cluster_undo_horizon_ic.c not linked here); never tripped in unit. */
+bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
+bool
+cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
+{
+	(void)expected_epoch;
+	return false;
+}
+
 
 /* ============================================================
  *	Shmem mock + LWLock stub
@@ -840,7 +850,7 @@ UT_TEST(test_t40_gc_then_alloc_equals_direct_recycle)
 	}
 
 	/* path 2: cleaner GC frees sb, then owner 201 allocates it. */
-	cluster_tt_slot_gc_current_pass((SCN)20, &stats);
+	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)0, &stats);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 1); /* only sb was recyclable */
 	{
 		uint16 got = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)201);
@@ -868,7 +878,7 @@ UT_TEST(test_t41_gc_respects_horizon_retained_slot_untouched)
 	/* alloc_ext below consults the stubbed horizon provider. */
 	mock_retention_horizon = (SCN)20;
 
-	cluster_tt_slot_gc_current_pass((SCN)20, &stats);
+	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)0, &stats);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, sa), 0);
 
@@ -902,7 +912,7 @@ UT_TEST(test_t42_gc_skips_inflight_active)
 
 	sa = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 
-	cluster_tt_slot_gc_current_pass((SCN)1000, &stats);
+	cluster_tt_slot_gc_current_pass((SCN)1000, (uint64)0, &stats);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
 	UT_ASSERT_EQ((int)stats.stale_active_skipped, 0);
 
@@ -937,7 +947,7 @@ UT_TEST(test_t43_wrap_max_slot_is_retired_from_both_paths)
 	/* Each gc+alloc pair bumps wrap by exactly 1 (T40 equivalence). */
 	for (cycles = 0; cycles < (uint32)TT_WRAP_MAX; cycles++) {
 		memset(&stats, 0, sizeof(stats));
-		cluster_tt_slot_gc_current_pass((SCN)1000, &stats);
+		cluster_tt_slot_gc_current_pass((SCN)1000, (uint64)0, &stats);
 		if (stats.shmem_tt_slots_gcd != 1)
 			break; /* retired: stop driving */
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(200 + cycles));
@@ -948,7 +958,7 @@ UT_TEST(test_t43_wrap_max_slot_is_retired_from_both_paths)
 	/* cleaner path refuses + counts. */
 	retired_before = cluster_tt_slot_wrap_retired_count();
 	memset(&stats, 0, sizeof(stats));
-	cluster_tt_slot_gc_current_pass((SCN)1000, &stats);
+	cluster_tt_slot_gc_current_pass((SCN)1000, (uint64)0, &stats);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
 	UT_ASSERT_EQ((int)stats.slots_wrap_retired, 1);
 	UT_ASSERT_EQ((int)(cluster_tt_slot_wrap_retired_count() - retired_before), 1);
