@@ -46,7 +46,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
-        test_cluster_subtrans test_cluster_multixact test_cluster_mxid_stripe \
+        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_served test_cluster_mxid_stripe \
         test_cluster_undo_format \
         test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
@@ -1866,4 +1866,18 @@ test_cluster_mxid_stripe: test_cluster_mxid_stripe.c unit_test.h \
 		$(CLUSTER_MXID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_MXID_STRIPE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-7.1 D3-b (A1): test_cluster_multixact_served — visibility truth table
+# for the pure served-verdict combination resolver.  Links
+# cluster_multixact_served.o standalone; the test provides a local scn_time_cmp
+# stub (as test_cluster_visibility_decide_scn) so cluster_scn.o's PG-core deps
+# are not dragged in.
+CLUSTER_MULTIXACT_SERVED_O = $(top_builddir)/src/backend/cluster/cluster_multixact_served.o
+test_cluster_multixact_served: test_cluster_multixact_served.c unit_test.h \
+		$(CLUSTER_MULTIXACT_SERVED_O) $(CLUSTER_VIS_VERDICT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_MULTIXACT_SERVED_O) \
+		$(CLUSTER_VIS_VERDICT_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
