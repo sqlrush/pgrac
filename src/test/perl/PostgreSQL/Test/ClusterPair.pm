@@ -86,9 +86,13 @@ sub new_pair
 	# spec-7.3 D3: the LMS worker pool binds a listener per worker at
 	# data_port + worker_id, so a test that runs >1 worker needs each node's
 	# [data_port, data_port + span) range free and non-overlapping across the
-	# two same-host nodes.  data_port_span (default 1) keeps the historic
-	# single-port allocation for every existing pair test.
-	my $data_span = $opts{data_port_span} // 1;
+	# two same-host nodes.  The DEFAULT span follows the shipped default
+	# cluster.lms_workers = 2 (spec-7.3 D9 root fix: with a span of 1 any
+	# pair test that leaves the pool at its default binds data_port + 1
+	# on an unreserved port and can FATAL on "Address already in use" --
+	# the D5/D7 point fixes whack-a-moled 8 files of ~85).  Tests that
+	# override cluster.lms_workers above 2 pass data_port_span explicitly.
+	my $data_span = $opts{data_port_span} // 2;
 	my $data_port_0 =
 	  $data_span > 1
 	  ? PostgreSQL::Test::Cluster::get_free_port_range($data_span)
