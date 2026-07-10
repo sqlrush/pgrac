@@ -255,5 +255,51 @@ SKIP:
 		. '(' . (defined $rec_d6 ? 'ok' : "err=$rec_err6") . ')');
 }
 
+# ============================================================
+# L7: spec-7.3 D7 — fence ×N.  A write-fenced node must not ship a CR image on
+# the DATA plane.  The fence gate sits ahead of construction in the inline
+# serve, so forcing it (cluster-lms-cr-fence-refuse) must (a) keep the requester
+# fail-closed 53R9G, (b) bump cr_server_fence_refused_count, (c) NOT construct
+# anything (full/partial counters stay put — the RED signal distinguishing the
+# gate from a construction that merely failed), (d) leave the origin serving,
+# and (e) recover a normal serve once the fence clears.
+# ============================================================
+SKIP:
+{
+	skip "ClusterPair inject SKIP helper missing — fence gate covered by "
+		. "the shared DENIED reply path", 5
+		unless $pair->can('inject_skip_set');
+
+	my $fr_before = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+	my $full_before = state_val($node0, 'cr', 'cr_server_full_count');
+	my $part_before = state_val($node0, 'cr', 'cr_server_partial_count');
+
+	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 100);
+	my ($off_d7, $off_err7) = cr_image($node1, 0, $scn_mid);
+	like($off_err7, qr/(53R9G|cross-instance)/,
+		'L7 write-fenced origin keeps the requester fail-closed 53R9G (fence ×N, 8.A)');
+
+	# The fence gate fired (refused ship) ...
+	my $fr_after = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+	ok($fr_after > $fr_before,
+		"L7 cr_server_fence_refused_count advanced ($fr_before -> $fr_after)");
+
+	# ... and did so WITHOUT constructing anything (gate is ahead of construct).
+	is(state_val($node0, 'cr', 'cr_server_full_count'), $full_before,
+		'L7 no FULL construction happened while fenced (gate precedes construct)');
+	is(state_val($node0, 'cr', 'cr_server_partial_count'), $part_before,
+		'L7 no PARTIAL construction happened while fenced');
+
+	# The origin's serving worker survived the refused serve.
+	is($node0->safe_psql('postgres', 'SELECT 1'), '1',
+		'L7 origin still serving after a fence-refused inline serve');
+
+	$pair->inject_skip_set($node0, 'cluster-lms-cr-fence-refuse', 0);
+	my ($rec_d7, $rec_err7) = cr_image_retry($node1, 0, $scn_mid);
+	is($rec_d7, $auth,
+		'L7 remote CR serve recovers after the fence clears '
+		. '(' . (defined $rec_d7 ? 'ok' : "err=$rec_err7") . ')');
+}
+
 $pair->stop_pair if $pair->can('stop_pair');
 done_testing();

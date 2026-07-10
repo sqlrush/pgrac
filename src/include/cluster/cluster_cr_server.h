@@ -144,7 +144,8 @@ typedef enum ClusterCrServerStat {
 	CLUSTER_CR_SERVER_STAT_UNDO_SERVED = 3,	   /* spec-6.12i D-i1 origin serve */
 	CLUSTER_CR_SERVER_STAT_UNDO_DENIED = 4,	   /* spec-6.12i D-i1 origin refuse */
 	CLUSTER_CR_SERVER_STAT_VERDICT_SERVED = 5, /* spec-6.12i D-i4 verdict serve */
-	CLUSTER_CR_SERVER_STAT_VERDICT_DENIED = 6  /* spec-6.12i D-i4 verdict refuse */
+	CLUSTER_CR_SERVER_STAT_VERDICT_DENIED = 6, /* spec-6.12i D-i4 verdict refuse */
+	CLUSTER_CR_SERVER_STAT_FENCE_REFUSED = 7   /* spec-7.3 D7 write-fenced -> refuse ship */
 } ClusterCrServerStat;
 
 extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);

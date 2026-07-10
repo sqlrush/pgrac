@@ -42,7 +42,8 @@
  *	  This is a pgrac-original file.  Compiled only in --enable-cluster
  *	  builds.
  *	  Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave b/i)
- *	  Spec: spec-7.3-lms-worker-pool.md (D6 — inline serve on the DATA plane)
+ *	  Spec: spec-7.3-lms-worker-pool.md (D6 — inline serve on the DATA plane;
+ *	  D7 — fence ×N: the inline serve refuses to ship on a write-fenced node)
  *
  *-------------------------------------------------------------------------
  */
@@ -66,6 +67,7 @@
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
 #include "cluster/cluster_undo_record_api.h" /* tt_retention_rollover_count */
 #include "cluster/cluster_undo_smgr.h"		 /* cluster_undo_smgr_read_block */
+#include "cluster/cluster_write_fence.h"	 /* PGRAC: spec-7.3 D7 fence ×N gate */
 #include "cluster/cluster_xid_stripe.h"		 /* cluster_xid_is_mine (spec-6.15 D4) */
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -748,6 +750,32 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	slot.transition_id = fwd->transition_id;
 	slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 	slot.req_kind = (uint8)kind;
+
+	/*
+	 * PGRAC: spec-7.3 D7 — fence ×N.  A write-fenced node must not let block
+	 * images / undo bytes / commit verdicts leave: while the cooperative
+	 * write-fence is enforcing but this node is NOT authorized for the live
+	 * epoch, any served payload could be stale relative to the cluster's
+	 * authoritative state — a split-brain read (CR image) or a false-committed
+	 * verdict (stale commit_scn) surface (Rule 8.A).  The worker-0 park ship
+	 * path keeps this gate (cluster_lms.c fence-gates cr_ship_ready); D6's move
+	 * to inline serve dropped it.  Restoring it HERE — ahead of the kind switch
+	 * and any construct/read — covers every worker (0..7) and all three kinds
+	 * uniformly.  Refuse by shipping the pre-set DENIED result WITHOUT reading
+	 * or constructing anything; the requester retransmits within its budget and
+	 * 53R90 fail-closes if the fence outlasts it — never a stale ship.  The
+	 * injection forces the same branch deterministically for the TAP fence leg.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-lms-cr-fence-refuse");
+	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
+		|| cluster_injection_should_skip("cluster-lms-cr-fence-refuse")) {
+		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
+		old = MemoryContextSwitchTo(cr_serve_scratch_context());
+		cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(CrServeScratchCtx);
+		return;
+	}
 
 	switch (kind) {
 	case CLUSTER_LMS_SLOT_KIND_CR:

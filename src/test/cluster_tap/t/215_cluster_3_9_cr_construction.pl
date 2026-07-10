@@ -54,6 +54,7 @@ use Time::HiRes qw(usleep);
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'spec_3_9_cr',
 	quorum_voting_disks => 3,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.pcm_grd_max_entries = 0',
@@ -94,8 +95,8 @@ my $node0 = $pair->node0;
 # ----------
 my $cr_rows = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'});
-is($cr_rows, '57',
-	'L2 cr category has 57 counter rows (9 + 4 cache + 4 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict)');
+is($cr_rows, '58',
+	'L2 cr category has 58 counter rows (9 + 4 cache + 4 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict + 1 spec-7.3 D7 fence-refused)');
 
 
 # ----------

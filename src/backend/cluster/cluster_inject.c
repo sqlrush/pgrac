@@ -360,6 +360,17 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-cr-construct" },
 	/*
+	 * spec-7.3 D7 — DATA-plane inline serve fence refusal injection.
+	 *
+	 *	cluster-lms-cr-fence-refuse:
+	 *	  Fires in cluster_gcs_block_forward_serve_inline ahead of the kind
+	 *	  switch.  SKIP forces the fence-refuse branch (ship DENIED without
+	 *	  reading / constructing), the deterministic trigger for the TAP fence
+	 *	  ×N legs — genuine write-fence enforcement (enforcing && !allowed)
+	 *	  takes the same branch but needs a multi-node voting-disk reconfig.
+	 */
+	{ .name = "cluster-lms-cr-fence-refuse" },
+	/*
 	 * spec-7.2 D6 — LMS data-plane observability injections.
 	 *
 	 *	cluster-lms-data-dispatch:
