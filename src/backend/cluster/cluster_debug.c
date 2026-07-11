@@ -1056,6 +1056,47 @@ dump_scn(ReturnSetInfo *rsinfo)
 			emit_row(rsinfo, "scn", "scn_observed_max_observe_gap_ms",
 					 fmt_int64((int64)cluster_scn_observed_max_observe_gap_ms()));
 		}
+
+		/* PGRAC: spec-7.4 D1 — durable frontier registry + BOC payload
+		 * v1 stats (producer + receive-side reject counters), plus one
+		 * sparse row pair per remote origin with a cached frontier
+		 * claim.  scn_durable_safe_scn is the full 64-bit encoded SCN
+		 * (hex, same convention as scn_current_encoded). */
+		emit_row(rsinfo, "scn", "scn_durable_safe_scn",
+				 fmt_uint64_hex((uint64)cluster_scn_durable_safe_scn()));
+		emit_row(rsinfo, "scn", "scn_durable_pending_count",
+				 fmt_int64((int64)cluster_scn_durable_pending_count()));
+		emit_row(rsinfo, "scn", "scn_durable_frontier_frozen",
+				 fmt_int32(cluster_scn_durable_frontier_frozen() ? 1 : 0));
+		emit_row(rsinfo, "scn", "scn_durable_frontier_overflow_count",
+				 fmt_int64((int64)cluster_scn_durable_frontier_overflow_count()));
+		emit_row(rsinfo, "scn", "scn_durable_frontier_regression_count",
+				 fmt_int64((int64)cluster_scn_durable_frontier_regression_count()));
+		emit_row(rsinfo, "scn", "scn_boc_payload_accept_count",
+				 fmt_int64((int64)cluster_scn_boc_payload_accept_count()));
+		emit_row(rsinfo, "scn", "scn_boc_payload_bad_length_count",
+				 fmt_int64((int64)cluster_scn_boc_payload_bad_length_count()));
+		emit_row(rsinfo, "scn", "scn_boc_payload_node_mismatch_count",
+				 fmt_int64((int64)cluster_scn_boc_payload_node_mismatch_count()));
+		emit_row(rsinfo, "scn", "scn_boc_payload_regression_count",
+				 fmt_int64((int64)cluster_scn_boc_payload_regression_count()));
+
+		{
+			NodeId origin;
+
+			for (origin = 0; origin < CLUSTER_MAX_NODES; origin++) {
+				uint64 repoch = 0;
+				SCN rscn = InvalidScn;
+				char keybuf[64];
+
+				if (!cluster_scn_remote_durable_safe(origin, &repoch, &rscn))
+					continue;
+				snprintf(keybuf, sizeof(keybuf), "scn_remote_durable_node%d", (int)origin);
+				emit_row(rsinfo, "scn", pstrdup(keybuf), fmt_uint64_hex((uint64)rscn));
+				snprintf(keybuf, sizeof(keybuf), "scn_remote_durable_epoch_node%d", (int)origin);
+				emit_row(rsinfo, "scn", pstrdup(keybuf), fmt_int64((int64)repoch));
+			}
+		}
 	}
 }
 
