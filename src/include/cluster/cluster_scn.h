@@ -391,6 +391,14 @@ extern void cluster_scn_lmon_drain_boc_broadcast(void);
  */
 extern uint64 cluster_scn_boc_broadcast_fanout_count(void);
 
+/*
+ * spec-7.4 D4:  event-vs-sweep balance counters.  event_publish = commit-event
+ * driven publishes;  sweep_fallback = sweep-backstop drains with no event
+ * pending.  See cluster_scn.c ClusterScnSharedState.
+ */
+extern uint64 cluster_scn_boc_event_publish_count(void);
+extern uint64 cluster_scn_boc_sweep_fallback_count(void);
+
 
 /*
  * spec-2.11 D1:  cross-instance commit_scn lookup result enum.

@@ -200,6 +200,17 @@ if ($STRICT)
 	cmp_ok($event_p99, '<=', 10, 'L1 STRICT: event-path p99 <= 10ms (local machine)');
 }
 
+# spec-7.4 D4: the event path drove commit-event publishes during L1, and we
+# snapshot the sweep-fallback counter at the L1/L2 boundary so L2 can prove
+# the sweep backstop advanced it while the event path is suppressed.
+cmp_ok($node0->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state WHERE category='scn'
+		   AND key='scn_boc_event_publish_count'}),
+	'>', 0, 'L1 D4: scn_boc_event_publish_count advanced under the event path');
+my $d4_sweep_fb0 = $node0->safe_psql('postgres',
+	q{SELECT value FROM pg_cluster_state WHERE category='scn'
+	   AND key='scn_boc_sweep_fallback_count'});
+
 # ----------
 # L2: suppressed event -> sweep cadence remains a sufficient fallback.
 # ----------
@@ -233,6 +244,14 @@ diag(sprintf('L2 sweep-fallback staleness ms: p50=%.2f max=%.2f',
 
 my $hits1 = ($bg0->query($HITS_SQL) || 0) + 0;
 cmp_ok($hits1, '>', $hits0, 'L2 suppression probe engaged (hits advanced)');
+
+# spec-7.4 D4: the suppressed rounds converged only via the sweep drain, so
+# the sweep-fallback counter must have advanced past the L1/L2 snapshot.
+cmp_ok($node0->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state WHERE category='scn'
+		   AND key='scn_boc_sweep_fallback_count'}),
+	'>', $d4_sweep_fb0,
+	'L2 D4: scn_boc_sweep_fallback_count advanced while the event path was suppressed');
 # A truly suppressed round can only converge on a sweep beat, so its
 # median cannot sit at event-path (sub-sweep-interval) latencies.  This
 # guards against a silently non-functional suppression probe.

@@ -133,6 +133,12 @@ ut_bucket_events(ClusterXnodeBucket b)
 	return pg_atomic_read_u64(&ut_shared.bucket[b].n_events);
 }
 
+static uint64
+ut_hist_count(ClusterXpHistComponent c, int bucket)
+{
+	return pg_atomic_read_u64(&ut_shared.hist[c][bucket]);
+}
+
 /* ----------
  * U1 — bucket enum completeness: every bucket has a unique non-NULL
  * name; out-of-range returns NULL; the enum has the spec'd 23 buckets
@@ -215,7 +221,14 @@ UT_TEST(test_u3_reset)
 	cluster_xp_note_hw_extend(false);
 	cluster_xp_count(CLXP_I_RIGHTMOST_LEAF_PING);
 
+	/* a commit-bucket sample populates the μs histogram too (spec-7.4 D4) */
+	ut_fake_now_ns = 0;
+	cluster_xp_begin(&s, CLXP_C_COMMIT_WAL_FLUSH);
+	ut_fake_now_ns = 100000; /* 100µs -> bucket 3 ([100,200)µs) */
+	cluster_xp_end(&s);
+
 	UT_ASSERT(ut_bucket_nanos(CLXP_R_CR_CONSTRUCT) > 0);
+	UT_ASSERT_EQ(ut_hist_count(CLXP_HIST_WAL_FLUSH, 3), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.read_reship_count), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.read_sholder_hit_count), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.hw_extend_remote_count), 1);
@@ -231,6 +244,7 @@ UT_TEST(test_u3_reset)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.hw_extend_remote_count), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.hw_extend_local_count), 0);
 	UT_ASSERT_EQ(ut_bucket_events(CLXP_I_RIGHTMOST_LEAF_PING), 0);
+	UT_ASSERT_EQ(ut_hist_count(CLXP_HIST_WAL_FLUSH, 3), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_shared.reset_generation), 1);
 
 	cluster_xp_reset();
@@ -278,17 +292,20 @@ UT_TEST(test_u4_off_path_zero_syscall)
 }
 
 /* ----------
- * U5 — dump key surface: 23 buckets x {total_nanos, n_events} plus the
- * 5 probe keys (reset_generation, read probe x2, HW locality x2) = 51
- * keys.  The SRF emission itself is covered end-to-end by cluster_tap
- * (t/017 category list + t/334 legs); the unit level pins the formula
- * and the name table the emission iterates.
+ * U5 — dump key surface: 28 buckets x {total_nanos, n_events} (56) plus the
+ * 5 probe keys (reset_generation, read probe x2, HW locality x2) plus the
+ * spec-7.4 D4 commit-latency histogram (5 components x 12 μs buckets = 60)
+ * = 121 keys.  The SRF emission itself is covered end-to-end by cluster_tap
+ * (t/017 category list + t/334 legs); the unit level pins the formula and
+ * the name tables the emission iterates.
  * ----------
  */
 UT_TEST(test_u5_dump_key_surface)
 {
 	UT_ASSERT_EQ(CLUSTER_XP_N_PROBE_KEYS, 5);
-	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS, 61);
+	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS
+					 + CLXP_HIST_NCOMPONENTS * CLXP_HIST_NBUCKETS,
+				 121);
 }
 
 /* ----------
@@ -355,10 +372,119 @@ UT_TEST(test_u8_null_shmem_safe)
 	cluster_xnode_profile_enabled = false;
 }
 
+/* ----------
+ * U9 — commit-latency histogram bucket classification (spec-7.4 D4):
+ * a nanosecond sample maps to the μs bucket whose upper edge first
+ * exceeds nanos/1000; buckets are half-open [lo,hi) so a value exactly on
+ * an edge lands in the next bucket; the top bucket is the >= last-edge
+ * overflow.  Edges (µs): 20 50 100 200 500 1000 2000 5000 10000 20000
+ * 50000 (11 edges, 12 buckets).
+ * ----------
+ */
+UT_TEST(test_u9_hist_bucket_index)
+{
+	UT_ASSERT_EQ(CLXP_HIST_NBUCKETS, 12);
+	/* below first edge (20µs) -> bucket 0 */
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(0), 0);
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(19999), 0);
+	/* half-open [lo,hi): a value exactly on an edge lands in the next bucket */
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(20000), 1);
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(49999), 1);
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(50000), 2);
+	/* 1ms sample: >= 1000µs edge and < 2000µs -> bucket 6 */
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(1000000), 6);
+	/* last finite bucket (< 50000µs) then the overflow bucket */
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(49999000), 10);
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(50000000), 11);
+	UT_ASSERT_EQ(cluster_xp_hist_bucket_index(1000000000ULL), 11);
+}
+
+/* ----------
+ * U10 — cluster_xp_end folds a commit-bucket sample into the μs histogram
+ * for that component; non-commit buckets never touch the histogram, and
+ * aborted scopes contribute nothing (spec-7.4 D4).
+ * ----------
+ */
+UT_TEST(test_u10_hist_observe)
+{
+	ClusterXpScope s;
+	int c;
+	int b;
+
+	ut_attach_fresh_shared();
+	cluster_xnode_profile_enabled = true;
+
+	/* 30µs undo-flush sample -> UNDO_FLUSH, 20 <= 30 < 50 -> bucket 1 */
+	ut_fake_now_ns = 0;
+	cluster_xp_begin(&s, CLXP_C_COMMIT_UNDO_FLUSH);
+	ut_fake_now_ns = 30000;
+	cluster_xp_end(&s);
+	UT_ASSERT_EQ(ut_hist_count(CLXP_HIST_UNDO_FLUSH, 1), 1);
+	/* the scalar accumulator behaviour is unchanged */
+	UT_ASSERT_EQ(ut_bucket_events(CLXP_C_COMMIT_UNDO_FLUSH), 1);
+
+	/* 3ms wal-flush sample -> WAL_FLUSH, 2000 <= 3000 < 5000 -> bucket 7 */
+	ut_fake_now_ns = 0;
+	cluster_xp_begin(&s, CLXP_C_COMMIT_WAL_FLUSH);
+	ut_fake_now_ns = 3000000;
+	cluster_xp_end(&s);
+	UT_ASSERT_EQ(ut_hist_count(CLXP_HIST_WAL_FLUSH, 7), 1);
+
+	/* a non-commit bucket never populates any histogram bin */
+	ut_fake_now_ns = 0;
+	cluster_xp_begin(&s, CLXP_W_GCS_X_REQUEST);
+	ut_fake_now_ns = 30000;
+	cluster_xp_end(&s);
+	for (c = 0; c < CLXP_HIST_NCOMPONENTS; c++)
+		for (b = 0; b < CLXP_HIST_NBUCKETS; b++)
+			if (!((c == CLXP_HIST_UNDO_FLUSH && b == 1) || (c == CLXP_HIST_WAL_FLUSH && b == 7)))
+				UT_ASSERT_EQ(ut_hist_count((ClusterXpHistComponent)c, b), 0);
+
+	/* aborted commit scope contributes nothing */
+	cluster_xp_begin(&s, CLXP_C_COMMIT_TT_STAMP);
+	cluster_xp_abort(&s);
+	cluster_xp_end(&s);
+	UT_ASSERT_EQ(ut_hist_count(CLXP_HIST_TT_STAMP, 1), 0);
+
+	cluster_xnode_profile_enabled = false;
+}
+
+/* ----------
+ * U11 — histogram component names + edge schema (spec-7.4 D4): every
+ * component has a unique non-NULL name and out-of-range returns NULL
+ * (mirrors the U1 bucket-name contract); the edge array is strictly
+ * increasing and a sample exactly at the top edge lands in the overflow
+ * bucket (classifier/edge-schema agreement).
+ * ----------
+ */
+UT_TEST(test_u11_hist_labels)
+{
+	int i;
+	int j;
+
+	for (i = 0; i < CLXP_HIST_NCOMPONENTS; i++) {
+		const char *name = cluster_xp_hist_component_name((ClusterXpHistComponent)i);
+
+		UT_ASSERT_NOT_NULL((void *)name);
+		UT_ASSERT(strlen(name) > 0);
+		for (j = 0; j < i; j++)
+			UT_ASSERT(strcmp(name, cluster_xp_hist_component_name((ClusterXpHistComponent)j)) != 0);
+	}
+	UT_ASSERT_NULL(
+		(void *)cluster_xp_hist_component_name((ClusterXpHistComponent)CLXP_HIST_NCOMPONENTS));
+	UT_ASSERT_NULL((void *)cluster_xp_hist_component_name((ClusterXpHistComponent)-1));
+
+	for (i = 1; i < CLXP_HIST_NEDGES; i++)
+		UT_ASSERT(cluster_xp_hist_edge_us[i] > cluster_xp_hist_edge_us[i - 1]);
+	UT_ASSERT_EQ(
+		cluster_xp_hist_bucket_index((uint64)cluster_xp_hist_edge_us[CLXP_HIST_NEDGES - 1] * 1000),
+		CLXP_HIST_NEDGES);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(test_u1_bucket_enum_complete);
 	UT_RUN(test_u2_accum_monotonic);
 	UT_RUN(test_u3_reset);
@@ -367,6 +493,9 @@ main(void)
 	UT_RUN(test_u6_shmem_size);
 	UT_RUN(test_u7_relkind_hint);
 	UT_RUN(test_u8_null_shmem_safe);
+	UT_RUN(test_u9_hist_bucket_index);
+	UT_RUN(test_u10_hist_observe);
+	UT_RUN(test_u11_hist_labels);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
