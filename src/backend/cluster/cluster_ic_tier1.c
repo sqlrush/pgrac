@@ -1865,9 +1865,21 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	Tier1Shmem->peers[peer_id].conn_epoch = cluster_epoch_get_current();
 	Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
-	cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
-												Tier1Shmem->peers[peer_id].reconnect_count);
-	tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
+	/*
+	 * spec-5.22e Hardening (RC#1 integration review): peer HELLO capabilities
+	 * live in the SHARED ClusterSfDep store, but their lifecycle is a
+	 * CONTROL-plane (LMON) property.  A transient DATA-plane worker reconnect
+	 * must NOT record/overwrite them here (nor clear them on close, below) --
+	 * otherwise a same-epoch DATA-plane reset wipes the CONTROL-established caps
+	 * and the DATA reconnect cannot re-send the CONTROL-only PEER_CAPS_REPLY, so
+	 * the peer reads NOCAP forever and the D5-8 admission gate fail-closes every
+	 * cross-node write (t/360 L5.5).  CONTROL owns caps; DATA only reads them.
+	 */
+	if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
+		cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
+													Tier1Shmem->peers[peer_id].reconnect_count);
+		tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
+	}
 
 	/* spec-7.3 D3 — tag the DATA-plane CONNECTED log with this worker's
 	 * channel so a 2-node test can prove the shard-aligned i<->i mesh formed
@@ -2071,9 +2083,14 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		Tier1Shmem->peers[learned].conn_epoch = cluster_epoch_get_current();
 		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
 		(void)peer_addr(learned);
-		cluster_sf_note_peer_hello_capabilities_gen(learned, cluster_ic_hello_capabilities(&msg),
-													Tier1Shmem->peers[learned].reconnect_count);
-		tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
+		/* CONTROL owns caps lifecycle (see the named-peer path above); a
+		 * DATA-plane worker only reads the shared store. */
+		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
+			cluster_sf_note_peer_hello_capabilities_gen(learned,
+														cluster_ic_hello_capabilities(&msg),
+														Tier1Shmem->peers[learned].reconnect_count);
+			tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
+		}
 	}
 
 	if (out_learned_peer_id != NULL)
@@ -2414,11 +2431,24 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * this connection was established), so only the matching record is
 		 * invalidated.
 		 */
-		if (Tier1Shmem != NULL)
-			cluster_sf_note_peer_disconnected_gen(peer_id,
-												  Tier1Shmem->peers[peer_id].reconnect_count);
-		else
-			cluster_sf_note_peer_disconnected(peer_id);
+		/*
+		 * spec-5.22e Hardening (RC#1 integration review): ONLY a CONTROL-plane
+		 * (LMON) close clears the shared peer-capability record.  Caps are a
+		 * CONTROL property (see the HELLO-verify record path); a DATA-plane
+		 * worker's transient same-epoch reset must not wipe the
+		 * CONTROL-established caps -- doing so left the peer NOCAP forever (the
+		 * DATA reconnect cannot re-send the CONTROL-only PEER_CAPS_REPLY) and
+		 * the D5-8 admission gate fail-closed every cross-node write (t/360).
+		 * A genuine peer loss still tears down the CONTROL connection, which
+		 * clears here as before (fail-closed preserved).
+		 */
+		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
+			if (Tier1Shmem != NULL)
+				cluster_sf_note_peer_disconnected_gen(peer_id,
+													  Tier1Shmem->peers[peer_id].reconnect_count);
+			else
+				cluster_sf_note_peer_disconnected(peer_id);
+		}
 		/* caps-reply resend state is per-connection too */
 		tier1_caps_reply_wanted[peer_id] = false;
 	}
