@@ -52,6 +52,7 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
 #include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
+#include "cluster/cluster_drm_affinity.h" /* spec-7.6 6.3b D2 — local-master DRM sample */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
@@ -267,6 +268,20 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 			return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 		}
 		pg_atomic_fetch_add_u64(&stub_local_fast_path_count, 1);
+
+		/*
+		 * PGRAC: spec-7.6 6.3b (D2) — DRM affinity admission sample, local-master
+		 * FAST PATH.  This node masters the resource and grants it without the
+		 * wire (S4 is skipped for NEED_PG_NATIVE_LOCK), so the local-master hook
+		 * in ges_send_request_opcode_and_wait never runs on this path — sample
+		 * here instead, under self.  (When the local fast path is disabled the
+		 * request falls through to S4 and that hook covers it; the two paths are
+		 * mutually exclusive.)  Zero cost when DRM is off.  Amend v1.1.2 R2/R3.
+		 */
+		if (cluster_drm_enabled)
+			cluster_drm_affinity_sample(cluster_grd_shard_for_resource(&req->resid), self_node,
+										false /* local */);
+
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	}
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* dispatch to S4 */

@@ -58,6 +58,7 @@ OBJS = \
 	cluster_cssd.o \
 	cluster_debug.o \
 	cluster_diag.o \
+	cluster_drm_affinity.o \
 	cluster_elog.o \
 	cluster_epoch.o \
 	cluster_extend_gate.o \

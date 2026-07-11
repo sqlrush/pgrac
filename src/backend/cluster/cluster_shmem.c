@@ -87,10 +87,11 @@
 #include "cluster/cluster_advisory.h"	   /* cluster_advisory_shmem_register (spec-5.5 D8) */
 #include "cluster/cluster_cf_stats.h"	   /* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
-#include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
-#include "cluster/cluster_grd_pending.h"	/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
-#include "cluster/cluster_ges_dedup.h"		/* cluster_ges_dedup_shmem_register (spec-2.27 D2) */
-#include "cluster/cluster_wal_thread.h"		/* cluster_wal_thread_shmem_register (spec-4.1 D7) */
+#include "cluster/cluster_drm_affinity.h"  /* cluster_drm_affinity_shmem_register (spec-7.6 6.3b) */
+#include "cluster/cluster_grd.h"		   /* cluster_grd_shmem_register (spec-2.14) */
+#include "cluster/cluster_grd_pending.h"   /* cluster_grd_pending_shmem_register (spec-2.16 D3) */
+#include "cluster/cluster_ges_dedup.h"	   /* cluster_ges_dedup_shmem_register (spec-2.27 D2) */
+#include "cluster/cluster_wal_thread.h"	   /* cluster_wal_thread_shmem_register (spec-4.1 D7) */
 #include "cluster/cluster_recovery_plan.h" /* cluster_recovery_plan_shmem_register (spec-4.3 D4) */
 #include "cluster/cluster_block_recovery.h" /* cluster_block_recovery_shmem_register (spec-4.10 D6) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
@@ -662,6 +663,11 @@ cluster_init_shmem_module(void)
 	 * LWTRANCHE_CLUSTER_GES_REPLY_WAIT). */
 	if (cluster_shmem_lookup_region("pgrac cluster ges reply wait") == NULL)
 		cluster_ges_reply_wait_shmem_register();
+
+	/* spec-7.6 6.3b: register the DRM per-shard affinity region (full 4096-slot
+	 * access matrix + atomic dirty bitmap; lock-free, no LWLock tranche). */
+	if (cluster_shmem_lookup_region("pgrac cluster drm affinity") == NULL)
+		cluster_drm_affinity_shmem_register();
 
 	/* spec-2.14 D5: register cluster_grd shmem region (GRD routing
 	 * substrate; 4096 atomic master[] + 5 atomic uint64 counters;

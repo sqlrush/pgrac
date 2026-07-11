@@ -204,6 +204,15 @@ struct PGPROC {
 struct PGPROC *MyProc = NULL;
 
 int cluster_node_id = 0;
+
+/* spec-7.6 6.3b link stubs: cluster_lock_acquire.c's S3 local-master DRM hook
+ * references these (guarded by cluster_drm_enabled = false, never called). */
+bool cluster_drm_enabled = false;
+void
+cluster_drm_affinity_sample(uint32 shard_id pg_attribute_unused(),
+							int32 requesting_node pg_attribute_unused(),
+							bool was_remote pg_attribute_unused())
+{}
 bool cluster_local_fast_path_enabled = true;
 
 /* spec-5.5 D7 — cluster.advisory_lock_enabled gate GUC (default on).  The real

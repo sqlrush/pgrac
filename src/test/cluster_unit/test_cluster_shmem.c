@@ -464,6 +464,12 @@ void
 cluster_tx_enqueue_shmem_register(void)
 {}
 
+/* spec-7.6 6.3b stub: cluster_init_shmem_module also calls
+ * cluster_drm_affinity_shmem_register. */
+void
+cluster_drm_affinity_shmem_register(void)
+{}
+
 /* spec-3.2 D5b stub: cluster_init_shmem_module also calls
  * cluster_visibility_inject_shmem_register. */
 void
@@ -1075,13 +1081,14 @@ UT_TEST(test_cluster_shmem_iter_regions_returns_false_when_uninit)
 UT_TEST(test_cluster_shmem_max_regions_default_value)
 {
 	/*
-	 * The boot-value of cluster.shmem_max_regions is 80 (spec-5.56 raised it
-	 * 64 -> 80 for the per-relation CR generation region; cluster_guc.c static
+	 * The boot-value of cluster.shmem_max_regions is 96 (spec-5.56 raised it
+	 * 64 -> 80 for the per-relation CR generation region; spec-7.6 6.3b raised
+	 * it 80 -> 96 for the DRM affinity region + margin; cluster_guc.c static
 	 * initializer).  Unit test links cluster_guc.o but never calls
 	 * cluster_init_guc, so the C global retains its static-initializer default.
 	 */
 	extern int cluster_shmem_max_regions;
-	UT_ASSERT_EQ(cluster_shmem_max_regions, 80);
+	UT_ASSERT_EQ(cluster_shmem_max_regions, 96);
 }
 
 

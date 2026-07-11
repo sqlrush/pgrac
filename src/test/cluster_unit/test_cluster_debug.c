@@ -115,6 +115,20 @@ int cluster_smart_fusion_origin_durable_gossip_ms = 50;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
+/* spec-7.6 6.3b stubs: cluster_debug.c dump_drm_affinity reads these; the SRF
+ * body is never invoked by the unit test (same as the file's other SRF stubs). */
+bool cluster_drm_enabled = false;
+uint64
+cluster_drm_affinity_get_sample_epoch(void)
+{
+	return 0;
+}
+uint64
+cluster_drm_affinity_get_counter(int which pg_attribute_unused())
+{
+	return 0;
+}
+
 const char *
 cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
 {

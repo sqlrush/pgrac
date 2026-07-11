@@ -405,6 +405,13 @@ extern int cluster_ges_reply_wait_max_entries;
  *   5000ms;  SIGHUP). */
 extern int cluster_grd_remaster_wait_ms;
 extern int cluster_grd_rebuild_timeout_ms;
+
+/* spec-7.6 6.3b: DRM per-shard affinity collection GUCs (default off).  The
+ * remaining ~8 drm.* GUCs (decision + anti-thrash + live remaster) land in
+ * waves 6.3c/6.3f. */
+extern bool cluster_drm_enabled;
+extern int cluster_drm_affinity_sample_rate;
+extern int cluster_drm_min_access_count;
 extern int cluster_hw_remaster_retry_backoff_ms;
 extern int cluster_hw_remaster_retry_max_attempts;
 

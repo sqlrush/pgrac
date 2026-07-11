@@ -38,6 +38,7 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_mode.h"		/* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
+#include "cluster/cluster_drm_affinity.h"	/* spec-7.6 6.3b D2 — DRM affinity sample */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_lmd.h"				 /* cluster_lmd_is_ready */
@@ -754,6 +755,28 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 			 * retransmits hit CACHED_REPLY instead of IN_FLIGHT_DUPLICATE. */
 			break;
 		}
+	}
+
+	/*
+	 * PGRAC: spec-7.6 6.3b (D2) — DRM affinity admission sample (remote path).
+	 * This is the first-logical-request boundary on the CURRENT MASTER: the
+	 * dedup MISS above rejects retransmits, and a remote request only reaches
+	 * this node because it masters the shard.  Record which requesting node
+	 * (env->source_node_id) accessed which shard so DRM can later migrate the
+	 * master to the hottest node.  Only real demand — REQUEST / REQUEST_NOWAIT /
+	 * CONVERT — counts (RELEASE / REDECLARE / rollback are not access demand,
+	 * Amend v1.1.2 R2).  Guarded on cluster_drm_enabled for zero cost when off.
+	 */
+	if (cluster_drm_enabled
+		&& (req->opcode == GES_REQ_OPCODE_REQUEST || req->opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
+			|| req->opcode == GES_REQ_OPCODE_CONVERT)) {
+		ClusterResId drm_resid;
+		uint32 drm_shard;
+
+		memcpy(&drm_resid, req->resid, sizeof(drm_resid));
+		drm_shard = cluster_grd_shard_for_resource(&drm_resid);
+		if (cluster_grd_is_local_master(drm_shard))
+			cluster_drm_affinity_sample(drm_shard, env->source_node_id, true /* remote */);
 	}
 
 	/* Phase 1 (handler):  enqueue into work_queue.  Grant decision runs
@@ -1597,6 +1620,21 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		volatile bool is_victim = false;
 
 		master_gen = cluster_lms_get_shard_master_generation();
+
+		/*
+		 * PGRAC: spec-7.6 6.3b (D2) — DRM affinity admission sample (local
+		 * path).  This node grants without the wire, so record the access under
+		 * cluster_node_id.  Only when this node truly masters the shard
+		 * (master == self, not the -1 "no master yet" sentinel) and only real
+		 * REQUEST / CONVERT demand (Amend v1.1.2 R2).  Zero cost when DRM off.
+		 */
+		if (cluster_drm_enabled && master == cluster_node_id
+			&& (send_opcode == GES_REQ_OPCODE_REQUEST
+				|| send_opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
+				|| send_opcode == GES_REQ_OPCODE_CONVERT))
+			cluster_drm_affinity_sample(cluster_grd_shard_for_resource(resid), cluster_node_id,
+										false /* local */);
+
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
 		action
 			= conditional
