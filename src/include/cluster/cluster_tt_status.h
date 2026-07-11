@@ -290,6 +290,18 @@ extern uint64 cluster_vis_get_prune_remote_keep_count(void);
 extern void cluster_vis_bump_vis_variant_unknown_failclosed_count(void);
 extern uint64 cluster_vis_get_vis_variant_unknown_failclosed_count(void);
 
+/* PGRAC: spec-7.1a D6 -- cross-node write-write chaining counters. */
+extern void cluster_vis_bump_writer_chain_resolved_count(void);
+extern uint64 cluster_vis_get_writer_chain_resolved_count(void);
+extern void cluster_vis_bump_writer_chain_failclosed_count(void);
+extern uint64 cluster_vis_get_writer_chain_failclosed_count(void);
+extern void cluster_vis_bump_xmax_resolved_count(void);
+extern uint64 cluster_vis_get_xmax_resolved_count(void);
+extern void cluster_vis_bump_overlay_refresh_count(void);
+extern uint64 cluster_vis_get_overlay_refresh_count(void);
+extern void cluster_vis_bump_covers_scn_refuse_count(void);
+extern uint64 cluster_vis_get_covers_scn_refuse_count(void);
+
 /* spec-3.15 D9: 2PC counters. */
 extern void cluster_vis_bump_twopc_prepare_records(void);
 extern uint64 cluster_vis_get_twopc_prepare_records(void);

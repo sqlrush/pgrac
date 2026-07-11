@@ -77,6 +77,7 @@
 #include "cluster/cluster_clean_leave.h" /* v1.0.4 — cluster_clean_leave_in_progress (serialize) */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled, cluster_online_join */
 #include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_lmon.h"		 /* cluster_lmon_marker_complete_wakeup */
 #include "cluster/cluster_voting_disk_io.h" /* spec-5.15 D4 — region-3 join-marker slot I/O */
 #include "cluster/cluster_write_fence.h"	/* spec-4.12 D4 — durable fence marker submit */
 #include "cluster/cluster_qvotec.h"			/* cluster_qvotec_in_quorum */
@@ -114,6 +115,38 @@ StaticAssertDecl(CLUSTER_RECONFIG_TOUCH_KIND_COUNT == CLUSTER_TOUCH_KIND_COUNT,
  */
 static ClusterReconfigState *ReconfigShmem = NULL;
 
+typedef struct ClusterReconfigFenceStage {
+	ClusterMarkerAsync async;
+	ReconfigEvent event;
+	ClusterFenceMarker marker;
+	int32 node_id;
+	uint64 last_incarnation;
+	uint64 removal_event_id;
+	bool submitted;
+} ClusterReconfigFenceStage;
+
+typedef struct ClusterReconfigJoinPrepareStage {
+	ClusterMarkerAsync async;
+	ReconfigEvent event;
+	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 joiner_incarnations[CLUSTER_MAX_NODES];
+	int next_node;
+	bool submitted;
+} ClusterReconfigJoinPrepareStage;
+
+typedef struct ClusterReconfigJoinCommitStage {
+	ClusterMarkerAsync async;
+	ClusterJoinCommitMarker marker;
+	int32 node_id;
+	uint64 admitted_incarnation;
+	bool submitted;
+} ClusterReconfigJoinCommitStage;
+
+static ClusterReconfigFenceStage failstop_fence_stage;
+static ClusterReconfigFenceStage node_removed_fence_stage;
+static ClusterReconfigJoinPrepareStage join_prepare_stage;
+static ClusterReconfigJoinCommitStage join_commit_stage;
+
 
 /* ============================================================
  * Shmem region lifecycle.
@@ -144,6 +177,7 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->apply_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->dedup_skip_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->procsig_broadcast_count, 0);
+		pg_atomic_init_u32(&ReconfigShmem->prebump_sync_active, 0); /* spec-2.29a r2 t/274 */
 		/* spec-5.14 D6 — touched_peers observability counters. */
 		pg_atomic_init_u64(&ReconfigShmem->touched_abort_count, 0);
 		pg_atomic_init_u64(&ReconfigShmem->touched_stamp_count, 0);
@@ -211,6 +245,8 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->join_reject_count, 0);
 		pg_atomic_init_u64(&ReconfigShmem->join_timeout_count, 0);
 		pg_atomic_init_u64(&ReconfigShmem->clean_departed_cleared_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->marker_slow_ack_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->marker_timeout_count, 0);
 	}
 
 	/*
@@ -303,6 +339,28 @@ cluster_reconfig_publish_event(const ReconfigEvent *evt)
 		 (unsigned long)published.event_id, published.coordinator_node_id,
 		 (unsigned long)published.old_epoch, (unsigned long)published.new_epoch,
 		 published.observer_role, (unsigned long)published.cssd_dead_generation);
+}
+
+
+static void
+cluster_reconfig_log_failstop_epoch_bump(const ReconfigEvent *evt)
+{
+	char dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
+	int off = 0;
+	int n;
+
+	Assert(evt != NULL);
+
+	dead[0] = '\0';
+	for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
+		if (evt->dead_bitmap[n / 8] & (1 << (n % 8)))
+			off += snprintf(dead + off, sizeof(dead) - off, "%s%d", off ? "," : "", n);
+	}
+
+	ereport(LOG, (errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
+						 "(coordinator node %d, dead node(s) {%s})",
+						 (unsigned long long)evt->old_epoch, (unsigned long long)evt->new_epoch,
+						 (int)evt->coordinator_node_id, dead)));
 }
 
 
@@ -1032,6 +1090,42 @@ cluster_reconfig_get_clean_departed_cleared_count(void)
 								 : pg_atomic_read_u64(&ReconfigShmem->clean_departed_cleared_count);
 }
 
+void
+cluster_reconfig_note_marker_slow_ack(ClusterMarkerAsyncKind kind, int32 target_node,
+									  uint64 elapsed_us)
+{
+	if (ReconfigShmem == NULL || elapsed_us < 1000000ULL)
+		return;
+
+	pg_atomic_fetch_add_u64(&ReconfigShmem->marker_slow_ack_count, 1);
+	ereport(LOG, (errmsg("cluster marker: slow qvotec ACK for %s target node %d took %llu ms",
+						 cluster_marker_async_kind_name(kind), target_node,
+						 (unsigned long long)(elapsed_us / 1000ULL))));
+}
+
+void
+cluster_reconfig_note_marker_timeout(ClusterMarkerAsyncKind kind, int32 target_node,
+									 uint64 elapsed_us)
+{
+	if (ReconfigShmem != NULL)
+		pg_atomic_fetch_add_u64(&ReconfigShmem->marker_timeout_count, 1);
+	ereport(LOG, (errmsg("cluster marker: qvotec marker %s target node %d timed out after %llu ms",
+						 cluster_marker_async_kind_name(kind), target_node,
+						 (unsigned long long)(elapsed_us / 1000ULL))));
+}
+
+uint64
+cluster_reconfig_get_marker_slow_ack_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->marker_slow_ack_count);
+}
+
+uint64
+cluster_reconfig_get_marker_timeout_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->marker_timeout_count);
+}
+
 /*
  * cluster_reconfig_join_in_progress -- Hardening v1.0.4 (spec-5.13 clean-leave x
  * spec-5.15 online-join serialization, P1-1/P2): is a membership JOIN currently in
@@ -1148,6 +1242,422 @@ cluster_reconfig_join_publish_proven(uint64 admitted_epoch)
 	return advanced >= ((members / 2u) + 1u);
 }
 
+static void
+cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
+{
+	cluster_marker_async_release_stage(&stage->async);
+	stage->submitted = false;
+	memset(&stage->event, 0, sizeof(stage->event));
+	memset(&stage->marker, 0, sizeof(stage->marker));
+	stage->node_id = -1;
+	stage->last_incarnation = 0;
+	stage->removal_event_id = 0;
+}
+
+/*
+ * spec-2.29a nightly-regression fix — pre-bump staging window guard.
+ *
+ *	The three pre-bump coordinator paths (fail-stop fence, node-remove,
+ *	join Phase-1) advance the membership epoch at stage-entry but only
+ *	publish the reconfig event once the voting-disk marker ACKs, which now
+ *	spans several LMON ticks instead of the pre-async single-tick spin.
+ *	Between the bump and the publish the GRD recovery IDLE tick would
+ *	re-capture recovery_event_old_epoch as the post-bump value, so its P0
+ *	accept later reads old == cur and wedges WAIT_EPOCH forever (the
+ *	spec-4.6a section 0 shape, here triggered by the coordinator on ITSELF
+ *	— even in a 2-node cluster with no IC piggyback).  While any pre-bump
+ *	stage is live the GRD IDLE tick must hold its last stable (genuine
+ *	pre-reconfig) baseline instead of re-capturing.  join Phase-2 COMMITTED
+ *	does not pre-bump, so it is intentionally excluded.
+ */
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	/* spec-2.29a r2 t/274: the shmem bit covers a BACKEND-context coordinator's
+	 * bump→publish window (LMON cannot see that process's local stage); the
+	 * three LMON-local staged flags cover the LMON-driven paths. */
+	if (ReconfigShmem != NULL && pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0)
+		return true;
+	return failstop_fence_stage.async.has_staged_event
+		   || node_removed_fence_stage.async.has_staged_event
+		   || join_prepare_stage.async.has_staged_event;
+}
+
+static bool
+cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage, ClusterMarkerAsyncKind kind,
+									int32 target_node, TimestampTz now)
+{
+	if (stage->submitted)
+		return true;
+	if (!cluster_write_fence_submit_marker_async(&stage->async, &stage->marker, kind, target_node,
+												 now))
+		return false;
+	stage->submitted = true;
+	return true;
+}
+
+static bool
+cluster_reconfig_poll_failstop_fence_stage(void)
+{
+	TimestampTz now;
+	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+
+	if (!failstop_fence_stage.async.has_staged_event)
+		return false;
+
+	now = GetCurrentTimestamp();
+	if (!cluster_reconfig_submit_fence_stage(&failstop_fence_stage,
+											 CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
+											 failstop_fence_stage.event.coordinator_node_id, now))
+		return true;
+
+	pr = cluster_write_fence_poll_marker_async(&failstop_fence_stage.async, now, &result,
+											   &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return true;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
+											 failstop_fence_stage.event.coordinator_node_id,
+											 elapsed_us);
+		cluster_reconfig_release_fence_stage(&failstop_fence_stage);
+		return true;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
+										  failstop_fence_stage.event.coordinator_node_id,
+										  elapsed_us);
+	if (result == CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+		cluster_reconfig_publish_event(&failstop_fence_stage.event);
+		cluster_reconfig_log_failstop_epoch_bump(&failstop_fence_stage.event);
+		cluster_reconfig_broadcast_local_procsig();
+	} else {
+		ereport(LOG,
+				(errmsg("cluster reconfig: fence marker did not reach a voting-disk majority "
+						"for epoch %llu; not publishing reconfig event (write-fenced, will retry)",
+						(unsigned long long)failstop_fence_stage.event.new_epoch)));
+	}
+	cluster_reconfig_release_fence_stage(&failstop_fence_stage);
+	return true;
+}
+
+static uint64
+cluster_reconfig_poll_node_removed_fence_stage(int32 removed_node_id, uint64 removal_event_id,
+											   uint64 last_incarnation)
+{
+	TimestampTz now;
+	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+
+	if (!node_removed_fence_stage.async.has_staged_event)
+		return 0;
+	if (node_removed_fence_stage.node_id != removed_node_id
+		|| node_removed_fence_stage.removal_event_id != removal_event_id)
+		return 0;
+
+	now = GetCurrentTimestamp();
+	if (!cluster_reconfig_submit_fence_stage(&node_removed_fence_stage,
+											 CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED,
+											 removed_node_id, now))
+		return 0;
+
+	pr = cluster_write_fence_poll_marker_async(&node_removed_fence_stage.async, now, &result,
+											   &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return 0;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED,
+											 removed_node_id, elapsed_us);
+		cluster_reconfig_release_fence_stage(&node_removed_fence_stage);
+		return 0;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED, removed_node_id,
+										  elapsed_us);
+	if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+		ereport(LOG, (errmsg("cluster node removal: fence marker for node %d did not reach a "
+							 "voting-disk majority for epoch %llu; not publishing removal "
+							 "(write-fenced, will retry)",
+							 removed_node_id,
+							 (unsigned long long)node_removed_fence_stage.event.new_epoch)));
+		cluster_reconfig_release_fence_stage(&node_removed_fence_stage);
+		return 0;
+	}
+
+	CLUSTER_INJECTION_POINT("cluster-node-remove-fence-armed");
+	cluster_reconfig_publish_event(&node_removed_fence_stage.event);
+	cluster_reconfig_record_removed(removed_node_id, node_removed_fence_stage.event.new_epoch,
+									false);
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_shrink_to_removed(removed_node_id, last_incarnation);
+	LWLockRelease(&ReconfigShmem->lock);
+
+	{
+		uint64 new_epoch = node_removed_fence_stage.event.new_epoch;
+
+		cluster_reconfig_release_fence_stage(&node_removed_fence_stage);
+		return new_epoch;
+	}
+}
+
+static void
+cluster_reconfig_release_join_prepare_stage(void)
+{
+	cluster_marker_async_release_stage(&join_prepare_stage.async);
+	memset(&join_prepare_stage.event, 0, sizeof(join_prepare_stage.event));
+	memset(join_prepare_stage.join_bitmap, 0, sizeof(join_prepare_stage.join_bitmap));
+	memset(join_prepare_stage.joiner_incarnations, 0,
+		   sizeof(join_prepare_stage.joiner_incarnations));
+	join_prepare_stage.next_node = 0;
+	join_prepare_stage.submitted = false;
+}
+
+/* (spec-2.29a review r1: the former abort_join_prepare_stage — revert
+ * JOINING→DEAD + clear pending on PREPARE failure — was removed.  Q5=A makes
+ * PREPARE strictly best-effort: TIMEOUT / non-ACK advances the queue and the
+ * staged JOIN_PENDING still publishes, so no revert path exists; reverting
+ * would let compute_join_bitmap re-detect the joiner and re-bump the epoch
+ * every deadline period — the P1-1 bump storm.) */
+
+static bool
+cluster_reconfig_submit_join_prepare_current(TimestampTz now)
+{
+	ClusterJoinCommitMarker m;
+	int i;
+
+	for (i = join_prepare_stage.next_node; i < CLUSTER_MAX_NODES; i++) {
+		if (dead_bitmap_test_bit(join_prepare_stage.join_bitmap, i))
+			break;
+	}
+	join_prepare_stage.next_node = i;
+	if (i >= CLUSTER_MAX_NODES) {
+		cluster_reconfig_publish_event(&join_prepare_stage.event);
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_pending_count, 1);
+		cluster_reconfig_broadcast_local_procsig();
+		cluster_reconfig_release_join_prepare_stage();
+		return true;
+	}
+
+	if (join_prepare_stage.submitted)
+		return true;
+
+	memset(&m, 0, sizeof(m));
+	m.magic = CLUSTER_JCMK_MAGIC;
+	m.version = CLUSTER_JCMK_VERSION;
+	m.node_id = i;
+	m.phase = CLUSTER_JCMK_PHASE_PREPARE;
+	m.admitted_incarnation = join_prepare_stage.joiner_incarnations[i];
+	m.generation = join_prepare_stage.joiner_incarnations[i];
+	m.admitted_epoch = join_prepare_stage.event.new_epoch;
+	cluster_join_marker_compute_crc(&m);
+
+	if (!cluster_reconfig_submit_join_marker_async(&join_prepare_stage.async, i, &m,
+												   CLUSTER_MARKER_KIND_JOIN_PREPARE, now))
+		return false;
+	join_prepare_stage.submitted = true;
+	return true;
+}
+
+/*
+ * spec-2.29a review r1 P2 — node-remove driver pre-work gate.
+ *
+ *	While the staged node-removed fence marker from a previous FENCE_ARMING
+ *	tick is still in flight, the driver must not re-run its pre-work
+ *	(REMOVING marker write / stripe retire): the epoch has already been
+ *	self-bumped by the stage-entry, so a re-run would key a SECOND REMOVING
+ *	marker to the post-bump epoch and add voting-disk writes during the
+ *	exact contention window the async stage exists to relieve.
+ */
+bool
+cluster_reconfig_node_removed_fence_stage_pending(void)
+{
+	return node_removed_fence_stage.async.has_staged_event;
+}
+
+static bool
+cluster_reconfig_poll_join_prepare_stage(void)
+{
+	TimestampTz now;
+	uint32 result = CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+	int target;
+
+	if (!join_prepare_stage.async.has_staged_event)
+		return false;
+
+	now = GetCurrentTimestamp();
+	if (!join_prepare_stage.submitted) {
+		(void)cluster_reconfig_submit_join_prepare_current(now);
+		return true;
+	}
+
+	target = join_prepare_stage.next_node;
+	pr = cluster_reconfig_poll_join_marker_async(&join_prepare_stage.async, now, &result,
+												 &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return true;
+
+	/*
+	 * spec-2.29a Q5=A (review r1 P1): PREPARE is best-effort in OUTCOME — the
+	 * pre-async code ignored the submit result and always published
+	 * JOIN_PENDING (only the Phase-2 COMMITTED marker is a commit point, P1-r5).
+	 * A TIMEOUT / non-ACK PREPARE therefore advances the queue instead of
+	 * aborting: aborting would revert the joiner JOINING→DEAD, and the next
+	 * tick's compute_join_bitmap would re-detect it CSSD-alive and RE-BUMP the
+	 * epoch — exactly the per-tick epoch-bump storm the P1-1 staged record
+	 * forbids.  Draining to publish keeps the joiner on a stable JOINING
+	 * (one Phase-1 bump total, regardless of PREPARE outcomes).
+	 */
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_PREPARE, target, elapsed_us);
+	} else {
+		cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_PREPARE, target, elapsed_us);
+		if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+			ereport(LOG,
+					(errmsg("cluster membership: PREPARE join marker for node %d did not reach "
+							"a voting-disk majority; continuing best-effort (COMMITTED is the "
+							"commit point)",
+							target)));
+	}
+
+	join_prepare_stage.submitted = false;
+	join_prepare_stage.next_node++;
+	(void)cluster_reconfig_submit_join_prepare_current(now);
+	return true;
+}
+
+static void
+cluster_reconfig_release_join_commit_stage(void)
+{
+	cluster_marker_async_release_stage(&join_commit_stage.async);
+	memset(&join_commit_stage.marker, 0, sizeof(join_commit_stage.marker));
+	join_commit_stage.node_id = -1;
+	join_commit_stage.admitted_incarnation = 0;
+	join_commit_stage.submitted = false;
+}
+
+static bool
+cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
+									 uint64 expected_epoch)
+{
+	uint64 old_epoch, new_epoch;
+	XLogRecPtr lsn;
+	ReconfigEvent evt;
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 incs[CLUSTER_MAX_NODES];
+
+	if (cluster_epoch_get_current() + 1 != expected_epoch)
+		return false;
+
+	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-marker-durable");
+
+	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
+	if (new_epoch != expected_epoch)
+		return false;
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_record_admitted(node_id, admitted_incarnation);
+	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (cluster_reconfig_is_clean_departed(node_id))
+		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
+	cluster_reconfig_clear_clean_departed(node_id);
+
+	dead_bitmap_set_bit(jb, node_id);
+	memset(incs, 0, sizeof(incs));
+	incs[node_id] = admitted_incarnation;
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = cluster_reconfig_compute_event_id_v2(
+		RECONFIG_KIND_JOIN_COMMITTED, empty_dead, jb, incs, cluster_cssd_get_dead_generation());
+	evt.coordinator_node_id = cluster_node_id;
+	evt.old_epoch = old_epoch;
+	evt.new_epoch = new_epoch;
+	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	evt.applied_at = GetCurrentTimestamp();
+	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	evt.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	evt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+	cluster_reconfig_publish_event(&evt);
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
+
+	return true;
+}
+
+static bool
+cluster_reconfig_poll_join_commit_stage(void)
+{
+	TimestampTz now;
+	uint32 result = CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	uint64 admitted_incarnation = 0;
+	uint64 admitted_generation = 0;
+	ClusterMarkerPollResult pr;
+
+	if (!join_commit_stage.async.has_staged_event)
+		return false;
+
+	now = GetCurrentTimestamp();
+	if (!join_commit_stage.submitted) {
+		if (!cluster_reconfig_submit_join_marker_async(
+				&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
+				CLUSTER_MARKER_KIND_JOIN_COMMITTED, now))
+			return true;
+		join_commit_stage.submitted = true;
+		return true;
+	}
+
+	pr = cluster_reconfig_poll_join_marker_async(&join_commit_stage.async, now, &result,
+												 &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return true;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+											 join_commit_stage.node_id, elapsed_us);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+										  join_commit_stage.node_id, elapsed_us);
+	if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+		ereport(LOG,
+				(errmsg("cluster membership: COMMITTED join marker for node %d did not reach a "
+						"voting-disk majority; not committing (will retry)",
+						join_commit_stage.node_id)));
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	if (!cluster_reconfig_get_observed_slot(join_commit_stage.node_id, &admitted_incarnation,
+											&admitted_generation)
+		|| admitted_incarnation != join_commit_stage.admitted_incarnation
+		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
+										 admitted_generation)
+			   != CLUSTER_JOIN_ACCEPT
+		|| !cluster_reconfig_publish_join_commit(join_commit_stage.node_id,
+												 join_commit_stage.admitted_incarnation,
+												 join_commit_stage.async.staged_expect_epoch)) {
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_release_join_commit_stage();
+	return true;
+}
+
 /*
  * spec-5.15 D4 — coordinator-side join driver (called from the tick when
  * online_join is on and self is the min-MEMBER coordinator).  Phase-1: fresh
@@ -1166,6 +1676,10 @@ cluster_reconfig_drive_joins(int coordinator)
 
 	if (state == NULL)
 		return;
+	if (cluster_reconfig_poll_join_prepare_stage())
+		return;
+	if (cluster_reconfig_poll_join_commit_stage())
+		return;
 
 	/* Phase-1 detection + a snapshot of the current pending set, under the lock
 	 * (compute_join_bitmap reads membership_state). */
@@ -1182,8 +1696,7 @@ cluster_reconfig_drive_joins(int coordinator)
 			(void)cluster_reconfig_get_observed_slot(i, &joiner_incarnations[i], NULL);
 		}
 		cluster_reconfig_apply_join_as_coordinator(join_bitmap, coordinator, joiner_incarnations);
-		/* enter the JOIN_PENDING transition fail-closed on every local backend. */
-		cluster_reconfig_broadcast_local_procsig();
+		return;
 	}
 
 	/* Phase-2: commit pending joins that have converged.  The just-added Phase-1
@@ -1646,6 +2159,7 @@ cluster_reconfig_lmon_tick(void)
 	uint64 cssd_dead_generation;
 	uint64 event_id;
 	int i;
+	bool failstop_stage_handled = false;
 
 	/* L20: runtime feature flag check first line. */
 	if (!cluster_enabled)
@@ -1665,6 +2179,7 @@ cluster_reconfig_lmon_tick(void)
 	self_id = cluster_node_id;
 	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES)
 		return; /* defensive: bad self id, cannot participate */
+	failstop_stage_handled = cluster_reconfig_poll_failstop_fence_stage();
 
 	/*
 	 * §3.1 + F11: build the raw CSSD DEAD bitmap, filtering out un-declared
@@ -1886,7 +2401,7 @@ cluster_reconfig_lmon_tick(void)
 	 * stabilizing the survivor base), THEN the join edge.  Each is an independent
 	 * ReconfigEvent; neither early-returns past the other.
 	 */
-	if (!dead_bitmap_is_zero(dead_bitmap)) {
+	if (!failstop_stage_handled && !dead_bitmap_is_zero(dead_bitmap)) {
 		CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
 
 		/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
@@ -2024,6 +2539,16 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-epoch-bump-pre");
 
+	/*
+	 * spec-2.29a r2 t/274: mark the pre-bump→publish window BEFORE bumping the
+	 * epoch, so a concurrent LMON GRD IDLE tick holds its WAIT_EPOCH baseline
+	 * while this (possibly backend-context, synchronous) path bumps but has not
+	 * yet published.  Cleared at every return below.  Harmless on the LMON /
+	 * fence-off paths (they either hand off to the local staged flag or publish
+	 * within this same call with no intervening tick).
+	 */
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 1);
+
 	/* D18:  atomic CAS-loop increment.  Returns pre/post snapshots. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
 
@@ -2123,13 +2648,44 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 				marker.fenced_dead_bitmap[b] |= removed_bitmap[b];
 		}
 
-		if (cluster_write_fence_submit_marker(&marker) != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
-			ereport(LOG, (errmsg("cluster reconfig: fence marker did not reach a voting-disk "
-								 "majority for epoch %llu; not publishing reconfig event "
-								 "(write-fenced, will retry)",
-								 (unsigned long long)new_epoch)));
-			return; /* fail-closed: epoch bumped, event NOT published, recovery NOT started */
+		/*
+		 * The async stage is process-local by design and is driven only by LMON
+		 * ticks.  Test-only backend callers, such as
+		 * cluster_reconfig_inject_dead_node_test(), would otherwise stage the marker
+		 * in their own process and return with no LMON-visible pending publish
+		 * record.  Keep those non-LMON paths on the old bounded wait: they are not
+		 * transport-liveness actors, so this does not reintroduce the BUG-C1 LMON
+		 * park.
+		 */
+		if (MyBackendType != B_LMON) {
+			ClusterFenceMarkerSubmitResult result;
+
+			result = cluster_write_fence_submit_marker(&marker);
+			if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+				ereport(LOG, (errmsg("cluster reconfig: fence marker did not reach a voting-disk "
+									 "majority for epoch %llu; not publishing reconfig event "
+									 "(write-fenced, will retry)",
+									 (unsigned long long)new_epoch)));
+				pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+				return;
+			}
+
+			cluster_reconfig_publish_event(&evt);
+			cluster_reconfig_log_failstop_epoch_bump(&evt);
+			pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+			return;
 		}
+
+		failstop_fence_stage.event = evt;
+		failstop_fence_stage.marker = marker;
+		failstop_fence_stage.node_id = coordinator_node_id;
+		failstop_fence_stage.async.has_staged_event = true;
+		(void)cluster_reconfig_submit_fence_stage(&failstop_fence_stage,
+												  CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
+												  coordinator_node_id, GetCurrentTimestamp());
+		/* LMON path: the local staged flag now covers the pending window. */
+		pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+		return; /* fail-closed until the staged marker is majority-durable */
 	}
 
 	cluster_reconfig_publish_event(&evt);
@@ -2143,21 +2699,10 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * fixed stack buffer (worst case: 128 node ids x 4 chars) keeps the LMON
 	 * tick free of allocator traffic.
 	 */
-	{
-		char dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8 * 4 + 1];
-		int off = 0;
-		int n;
+	cluster_reconfig_log_failstop_epoch_bump(&evt);
 
-		dead[0] = '\0';
-		for (n = 0; n < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8; n++) {
-			if (dead_bitmap[n / 8] & (1 << (n % 8)))
-				off += snprintf(dead + off, sizeof(dead) - off, "%s%d", off ? "," : "", n);
-		}
-		ereport(LOG, (errmsg("cluster reconfig: fail-stop epoch bump %llu -> %llu published "
-							 "(coordinator node %d, dead node(s) {%s})",
-							 (unsigned long long)old_epoch, (unsigned long long)new_epoch,
-							 (int)coordinator_node_id, dead)));
-	}
+	/* spec-2.29a r2 t/274: fence-off path published within this call. */
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
 }
 
 
@@ -2287,6 +2832,9 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 		return 0;
 	if (removed_node_id < 0 || removed_node_id >= CLUSTER_MAX_NODES)
 		return 0;
+	if (node_removed_fence_stage.async.has_staged_event)
+		return cluster_reconfig_poll_node_removed_fence_stage(removed_node_id, removal_event_id,
+															  last_incarnation);
 
 	CLUSTER_INJECTION_POINT("cluster-node-remove-shrink-committing");
 
@@ -2340,13 +2888,25 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 		 * a concurrent dead set, if any, is carried by its own fail-stop fence. */
 		memcpy(marker.fenced_dead_bitmap, removed_with_n, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 
-		if (cluster_write_fence_submit_marker(&marker) != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
-			ereport(LOG, (errmsg("cluster node removal: fence marker for node %d did not reach a "
-								 "voting-disk majority for epoch %llu; not publishing removal "
-								 "(write-fenced, will retry)",
-								 removed_node_id, (unsigned long long)new_epoch)));
-			return 0; /* fail-closed: epoch bumped, removal NOT published, driver retries */
-		}
+		node_removed_fence_stage.event.event_id
+			= cluster_reconfig_compute_removal_event_id(removed_with_n, removal_event_id);
+		node_removed_fence_stage.event.coordinator_node_id = cluster_node_id;
+		node_removed_fence_stage.event.old_epoch = old_epoch;
+		node_removed_fence_stage.event.new_epoch = new_epoch;
+		memcpy(node_removed_fence_stage.event.dead_bitmap, empty_dead,
+			   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		node_removed_fence_stage.event.applied_at = GetCurrentTimestamp();
+		node_removed_fence_stage.event.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+		node_removed_fence_stage.event.cssd_dead_generation = cssd_dead_generation;
+		node_removed_fence_stage.event.reconfig_kind = RECONFIG_KIND_NODE_REMOVED;
+		node_removed_fence_stage.marker = marker;
+		node_removed_fence_stage.node_id = removed_node_id;
+		node_removed_fence_stage.last_incarnation = last_incarnation;
+		node_removed_fence_stage.removal_event_id = removal_event_id;
+		node_removed_fence_stage.async.has_staged_event = true;
+		(void)cluster_reconfig_poll_node_removed_fence_stage(removed_node_id, removal_event_id,
+															 last_incarnation);
+		return 0; /* fail-closed until the staged fence marker ACKs */
 	}
 
 	CLUSTER_INJECTION_POINT("cluster-node-remove-fence-armed");
@@ -2432,6 +2992,42 @@ cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMa
 }
 
 bool
+cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_node,
+										  const ClusterJoinCommitMarker *m,
+										  ClusterMarkerAsyncKind kind, TimestampTz now)
+{
+	int wait_ms;
+
+	if (ReconfigShmem == NULL || m == NULL || a == NULL)
+		return false;
+	if (target_node < 0 || target_node >= CLUSTER_MAX_NODES)
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	if (cluster_marker_async_mailbox_busy(&ReconfigShmem->join_marker_request_seq,
+										  &ReconfigShmem->join_marker_completion_seq))
+		return false;
+
+	ReconfigShmem->join_marker_target_node_id = target_node;
+	ReconfigShmem->join_pending_marker = *m;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	return cluster_marker_async_submit(
+		a, &ReconfigShmem->join_marker_request_seq, &ReconfigShmem->join_marker_completion_seq,
+		ReconfigShmem->join_qvotec_latch, now, (uint64)wait_ms * 1000ULL, kind, target_node);
+}
+
+ClusterMarkerPollResult
+cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+										uint64 *out_elapsed_us)
+{
+	if (ReconfigShmem == NULL || a == NULL)
+		return CLUSTER_MARKER_POLL_IDLE;
+	return cluster_marker_async_poll(a, &ReconfigShmem->join_marker_completion_seq,
+									 &ReconfigShmem->join_marker_result, now, out_result,
+									 out_elapsed_us);
+}
+
+bool
 cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512)
 {
 	uint64 req;
@@ -2464,6 +3060,7 @@ cluster_reconfig_join_qvotec_complete(bool acked)
 	pg_atomic_write_u64(&ReconfigShmem->join_marker_completion_seq,
 						join_qvotec_inflight_marker_seq);
 	join_qvotec_last_processed_marker_seq = join_qvotec_inflight_marker_seq;
+	cluster_lmon_marker_complete_wakeup();
 }
 
 static void
@@ -2614,27 +3211,6 @@ cluster_reconfig_apply_join_as_coordinator(
 	}
 	LWLockRelease(&ReconfigShmem->lock);
 
-	/* Durable PREPARE marker per joiner (records the presented incarnation; does
-	 * NOT seed — only COMMITTED is a basis).  Best-effort: PREPARE failure does
-	 * not block the JOIN_PENDING publish (the COMMITTED marker in Phase-2 is the
-	 * commit point that must be majority-durable). */
-	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		ClusterJoinCommitMarker m;
-
-		if (!dead_bitmap_test_bit(join_bitmap, i))
-			continue;
-		memset(&m, 0, sizeof(m));
-		m.magic = CLUSTER_JCMK_MAGIC;
-		m.version = CLUSTER_JCMK_VERSION;
-		m.node_id = i;
-		m.phase = CLUSTER_JCMK_PHASE_PREPARE;
-		m.admitted_incarnation = joiner_incarnations[i];
-		m.generation = joiner_incarnations[i]; /* monotonic per node (read-newest intent) */
-		m.admitted_epoch = new_epoch;
-		cluster_join_marker_compute_crc(&m);
-		(void)cluster_reconfig_submit_join_marker(i, &m);
-	}
-
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id
 		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, empty_dead, join_bitmap,
@@ -2647,20 +3223,21 @@ cluster_reconfig_apply_join_as_coordinator(
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
 	evt.reconfig_kind = RECONFIG_KIND_JOIN_PENDING;
-	cluster_reconfig_publish_event(&evt);
-	pg_atomic_fetch_add_u64(&ReconfigShmem->join_pending_count, 1);
+
+	join_prepare_stage.event = evt;
+	memcpy(join_prepare_stage.join_bitmap, join_bitmap, sizeof(join_prepare_stage.join_bitmap));
+	memcpy(join_prepare_stage.joiner_incarnations, joiner_incarnations,
+		   sizeof(join_prepare_stage.joiner_incarnations));
+	join_prepare_stage.next_node = 0;
+	join_prepare_stage.submitted = false;
+	join_prepare_stage.async.has_staged_event = true;
+	(void)cluster_reconfig_poll_join_prepare_stage();
 }
 
 bool
 cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 {
 	ClusterJoinCommitMarker m;
-	uint64 old_epoch, new_epoch;
-	XLogRecPtr lsn;
-	ReconfigEvent evt;
-	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
-	uint64 incs[CLUSTER_MAX_NODES];
 
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return false;
@@ -2704,60 +3281,17 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	m.commit_nonce = ((uint64)cluster_node_id << 56) ^ (uint64)GetCurrentTimestamp();
 	cluster_join_marker_compute_crc(&m);
 
-	if (cluster_reconfig_submit_join_marker(node_id, &m) != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
-		ereport(LOG,
-				(errmsg("cluster membership: COMMITTED join marker for node %d did not reach a "
-						"voting-disk majority; not committing (will retry)",
-						node_id)));
+	if (join_commit_stage.async.has_staged_event)
 		return false;
-	}
+	join_commit_stage.marker = m;
+	join_commit_stage.node_id = node_id;
+	join_commit_stage.admitted_incarnation = admitted_incarnation;
+	join_commit_stage.async.has_staged_event = true;
+	join_commit_stage.async.staged_expect_epoch = m.admitted_epoch;
+	join_commit_stage.submitted = false;
+	(void)cluster_reconfig_poll_join_commit_stage();
 
-	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-marker-durable");
-
-	/*
-	 * ② publish: bump JOIN_COMMITTED epoch + state MEMBER + last_admitted + clear
-	 * pending + clear clean_departed[node] (INV-J10).  Strict order — the publish
-	 * (epoch + state MEMBER) precedes the joiner opening its write gate (D5).
-	 */
-	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
-	lsn = GetXLogInsertRecPtr();
-	cluster_epoch_set_changed_at_lsn((uint64)lsn);
-	cluster_gcs_block_on_epoch_advance(new_epoch);
-	cluster_sinval_reset_all_on_reconfig();
-	cluster_tt_status_flush_all((uint32)new_epoch);
-
-	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_record_admitted(node_id, admitted_incarnation);
-	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
-	LWLockRelease(&ReconfigShmem->lock);
-
-	/* INV-J10: clear the in-shmem clean_departed suppression so a clean-left node
-	 * that just rejoined has its later real fail-stop honored again (the durable
-	 * supersede across restart is resolved by the seed, RC-5). */
-	if (cluster_reconfig_is_clean_departed(node_id))
-		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
-	cluster_reconfig_clear_clean_departed(node_id);
-
-	dead_bitmap_set_bit(jb, node_id);
-	memset(incs, 0, sizeof(incs));
-	incs[node_id] = admitted_incarnation;
-
-	memset(&evt, 0, sizeof(evt));
-	evt.event_id = cluster_reconfig_compute_event_id_v2(
-		RECONFIG_KIND_JOIN_COMMITTED, empty_dead, jb, incs, cluster_cssd_get_dead_generation());
-	evt.coordinator_node_id = cluster_node_id;
-	evt.old_epoch = old_epoch;
-	evt.new_epoch = new_epoch;
-	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
-	evt.applied_at = GetCurrentTimestamp();
-	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
-	evt.cssd_dead_generation = cluster_cssd_get_dead_generation();
-	evt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
-	cluster_reconfig_publish_event(&evt);
-	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
-
-	return true;
+	return false;
 }
 
 

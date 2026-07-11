@@ -173,11 +173,13 @@ extern const char *cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStal
  * sender, SCN, interval range and same-epoch monotonicity before
  * publishing (Q5' amend); invalid frames are counted, never published.
  */
-typedef struct pg_attribute_packed() ClusterUndoHorizonWire {
+typedef struct pg_attribute_packed() ClusterUndoHorizonWire
+{
 	uint64 epoch;			   /* sender's reconfig epoch at sampling */
 	uint64 horizon_scn;		   /* S2.1 sampling rule output */
 	uint32 sender_interval_ms; /* validated to [MIN,MAX] */
-} ClusterUndoHorizonWire;
+}
+ClusterUndoHorizonWire;
 
 /* ---- heavy path (cluster_undo_horizon_ic.c; LMON + cleaner) --------- */
 

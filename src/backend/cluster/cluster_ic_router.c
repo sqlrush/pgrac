@@ -60,6 +60,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"	   /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_lms.h"		   /* PGRAC: spec-7.3 D8 per-worker dispatch counter */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
 
@@ -204,6 +205,25 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	if (dest_node_id == cluster_node_id)
 		return CLUSTER_IC_SEND_DONE;
 
+	/*
+	 * PGRAC: spec-7.2 D3 — (3b) plane gate on the PHYSICAL send leg
+	 * (after the self short-circuit, which stays open to every mask-
+	 * allowed logical producer).  A wire send uses this process's fds,
+	 * so the msg_type's plane must be the plane this process owns:
+	 * LMS emitting a CONTROL message must stage it into the CONTROL
+	 * outbound ring for LMON instead (r4 ruling), and nothing but LMS
+	 * may put a DATA frame on the wire.  ereport — a cross-plane send
+	 * is a coding defect, not a runtime condition to tolerate.
+	 */
+	if ((ClusterICPlane)info->plane != cluster_ic_tier1_my_plane())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_ic msg_type %u (\"%s\") is plane-%d; cannot send from "
+						"plane-%d owner process",
+						msg_type, info->name, (int)info->plane, (int)cluster_ic_tier1_my_plane()),
+				 errhint("Stage the message into the owning plane's outbound ring instead "
+						 "(spec-7.2 staging rule).")));
+
 	/* (4) broadcast destination check (chunk wrap inherits broadcast_ok=true
 	 * implicit -- chunked send is always unicast or broadcast at caller level).
 	 */
@@ -295,6 +315,12 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	if (env->msg_type == PGRAC_IC_CHUNK_MSG_TYPE)
 		return cluster_ic_chunk_dispatch_frame(env, payload, peer_id);
 
+	/* PGRAC: spec-7.3 D8 — per-worker dispatch counter.  A no-op outside an
+	 * LMS process (the bumper resolves the caller's worker slot itself);
+	 * placed after the chunk short-circuit so a chunked message counts once
+	 * (the reassembled inner envelope), not once per wire frame. */
+	cluster_lms_obs_note_dispatch();
+
 	info = &dispatch_table[env->msg_type];
 
 	/* spec-2.3 §1.4 invariant 8 + §3.5b inbound: unregistered msg_type
@@ -316,6 +342,25 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	 */
 	if (env->dest_node_id == PGRAC_IC_BROADCAST && !info->broadcast_ok)
 		return false;
+
+	/*
+	 * PGRAC: spec-7.2 D3 — plane misroute gate.  A msg_type is
+	 * dispatched ONLY in its owning plane's process:  a DATA frame
+	 * arriving in LMON (or a CONTROL frame in LMS) is a wiring or
+	 * routing defect, never "close enough" — drop the frame fail-closed
+	 * and count it (plane_misroute_reject on this plane's tier1
+	 * instance).  Return true: the peer connection itself is healthy
+	 * (unlike the unregistered/forged-broadcast rejections above, which
+	 * are peer-level failures).
+	 */
+	if ((ClusterICPlane)info->plane != cluster_ic_tier1_my_plane()) {
+		cluster_ic_tier1_bump_plane_misroute_reject();
+		ereport(LOG, (errmsg("cluster_ic: dropping msg_type %u (\"%s\") — plane %d frame "
+							 "dispatched in plane-%d owner process",
+							 env->msg_type, info->name, (int)info->plane,
+							 (int)cluster_ic_tier1_my_plane())));
+		return true;
+	}
 
 	/*
 	 * spec-2.3 §3.5 + Q14 + R3 防御层: PG_TRY/PG_CATCH wrap.  Catches

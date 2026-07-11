@@ -182,12 +182,49 @@ jobs:
           # the release-cut 4-node evidence is HG#2a-CI or HG#2a-EXT (external).
           - { name: stage5-beta-chaos-soak, ranges: "344-345", unit: false, regress: false }
           # spec-6.12/6.15 cross-node perf + correctness family (t/346-350:
-          # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash) and
-          # the renumbered t/351-356 family + t/357 multi-xmax alias floor.
+          # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash),
+          # the renumbered t/351-356 family, t/357 multi-xmax alias floor, and
+          # t/361 XID authority native-era adoption.
           # Closes the 346+ shard hole (every new t/ file must land in a shard
           # the same commit; see docs/code-review-checklist.md).
           - { name: stage6-crossnode-a, ranges: "346-350", unit: false, regress: false }
-          - { name: stage6-crossnode-b, ranges: "351-357", unit: false, regress: false }
+          - { name: stage6-crossnode-b, ranges: "351-357 361", unit: false, regress: false }
+          # t/358 spec-7.2 data-plane flip e2e + t/360 data-plane fault legs
+          # (conn-reset injection / KNOWN-BLOCKED docs).  Closes the review
+          # P1-3 shard hole: both files predate this shard and were in NO CI
+          # matrix.  Own shard: the t/360 value gate + reconnect deadline
+          # need the wall clock.  (t/359 gapwalk runs in stage7-multixact.)
+          - { name: stage7-data-plane, ranges: "358 360", unit: false, regress: false }
+          # t/362 spec-4.6a 4-node shared_catalog kill self-heal (L464
+          # occupancy verified against origin branches 2026-07-08).  Own
+          # shard: 4-node formation + kill + convergence needs the wall
+          # clock.
+          - { name: stage7-reconfig-liveness, ranges: "362-362", unit: false, regress: false }
+          # t/363 spec-2.29a marker-async LMON liveness.
+          - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
+          # t/364 + t/367 spec-7.3 LMS worker-pool family (single-node pool
+          # smoke + 2-node topology / multi-tag routing / recycle / N=1
+          # sentinel).  Every new t/ file lands in a shard the same commit
+          # (L342).
+          - { name: stage7-lms-pool, ranges: "364 367", unit: false, regress: false }
+          # t/365 spec-7.1a cross-instance write-write MVCC coordination.
+          - { name: stage7-write-write, ranges: "365-365", unit: false, regress: false }
+          # t/366 spec-7.2a GCS block dedup capacity + eager reclaim.  Own shard:
+          # 2-node shared_catalog bring-up + cross-node distinct-read dedup
+          # pressure + injected retransmit-dedup correctness needs the wall
+          # clock.
+          - { name: stage7-gcs-dedup-capacity, ranges: "366-366", unit: false, regress: false }
+          # t/359 mxid-stripe gapwalk + t/368 multixact member-serve refuse
+          # (spec-7.1 family; 368 renamed from the double-occupied t/360 per
+          # the hub number ledger -- the lms data-plane faults file keeps 360).
+          - { name: stage7-multixact, ranges: "359 368", unit: false, regress: false }
+          # t/369 spec-5.22d dead-owner authority serve + t/370 spec-5.22e
+          # cluster-wide undo retention brake (both 2-node shared-root) +
+          # t/386 spec-2.2 caps-reply directed matrix / rolling-upgrade
+          # compat / generation legs (3-node triple).  Own shard: the brake
+          # legs pin/stall/self-heal on real cleaner cadence and need the
+          # wall clock.
+          - { name: stage5-undo-retention, ranges: "369-370 386", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

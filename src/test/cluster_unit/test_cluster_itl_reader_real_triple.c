@@ -34,6 +34,13 @@
  *	    T23  spec-3.9 L213 redo parity: older write_scn is a monotonic no-op
  *	    T24  spec-3.9 L213 redo parity: InvalidScn write_scn (lock-only) no-op
  *	    T25  spec-3.9 L213 redo parity: newer write_scn advances the watermark
+ *	    T33  spec-7.1 watch-2: marker reuse of a completed DATA slot folds
+ *	         the evicted write_scn into the recycle watermark
+ *	    T34  spec-7.1 watch-2: marker reuse of a completed lock-only slot
+ *	         contributes nothing
+ *	    T35  spec-7.1 watch-2: marker into a FREE slot contributes nothing
+ *	    T36  spec-7.1 watch-2: numeric xid/multixact-id collision must not
+ *	         suppress the fold (new_xid = InvalidTransactionId)
  *
  *	  Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
  *	        (v0.3 FROZEN 2026-05-24)
@@ -826,6 +833,121 @@ UT_TEST(test_t32_redo_recomputes_recycle_watermark)
 /* spec-5.2 §3.5 D11: cluster_itl_page_has_active_slot — the holder-side defer
  * trigger.  In-progress (ACTIVE / LOCK_ONLY_ACTIVE) => true; FREE and all
  * terminal states => false. */
+/* ============================================================
+ *	spec-7.1 watch-2 (spec-3.10 §v0.5 parity):  a MultiXact marker
+ *	stamp that evicts a completed DATA slot drops that slot's undo
+ *	anchor from the per-page CR candidate set exactly like a
+ *	data-writer recycle, so it must fold the evicted write_scn into
+ *	the recycle watermark (otherwise own-instance CR can silently
+ *	reconstruct a post-snapshot version -- false-visible).  T33-T36
+ *	drive the REAL cluster_itl_stamp_multixact_marker through the
+ *	bufmgr globals (BufferBlocks -> synthetic page, Buffer 1): the
+ *	static-inline BufferGetPage compiled into cluster_itl.o resolves
+ *	Buffer 1 to BufferBlocks + 0.
+ * ============================================================ */
+
+static Buffer
+marker_buffer_for(Page page)
+{
+	BufferBlocks = (char *)page;
+	NBuffers = 1;
+	return (Buffer)1;
+}
+
+UT_TEST(test_t33_marker_reuse_completed_data_folds_watermark)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 i;
+	uint8 idx;
+
+	/* Every slot ACTIVE (not FREE, not reusable) except slot 5: a COMMITTED
+	 * data writer -- the only reuse candidate on a full page. */
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
+		slot_at(page, i)->xid = (TransactionId)(1000 + i);
+	}
+	slot_at(page, 5)->flags = ITL_FLAG_COMMITTED;
+	slot_at(page, 5)->xid = (TransactionId)100;
+	slot_at(page, 5)->write_scn = (SCN)5000;
+	slot_at(page, 5)->wrap = 7;
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 5);
+	/* watch-2: the evicted COMMITTED writer's write_scn reached the
+	 * watermark BEFORE the marker overwrote the slot. */
+	UT_ASSERT_EQ((int)(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn == (SCN)5000), 1);
+	UT_ASSERT_EQ((int)(slot_at(page, 5)->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 5)->wrap, 8);
+}
+
+UT_TEST(test_t34_marker_reuse_lock_only_no_fold)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 i;
+	uint8 idx;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
+		slot_at(page, i)->xid = (TransactionId)(1000 + i);
+	}
+	/* Completed lock-only slot: reusable, but it anchors no tuple versions
+	 * (§v0.5 B2/Q1) -- must NOT contribute.  Poison write_scn proves the
+	 * flag predicate, not the SCN_VALID guard, rejects it. */
+	slot_at(page, 3)->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slot_at(page, 3)->xid = (TransactionId)100;
+	slot_at(page, 3)->write_scn = (SCN)5000;
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 3);
+	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
+}
+
+UT_TEST(test_t35_marker_free_slot_no_fold)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 idx;
+
+	/* All slots FREE (build_itl_page zero-fill): marker takes slot 0 with no
+	 * eviction, so the watermark must stay Invalid and wrap must stay 0. */
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 0);
+	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
+	UT_ASSERT_EQ((int)slot_at(page, 0)->wrap, 0);
+}
+
+UT_TEST(test_t36_marker_reuse_xid_mxid_collision_still_folds)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 i;
+	uint8 idx;
+
+	/* 8.A pin: the evicted COMMITTED xid numerically equals the MultiXactId
+	 * being stamped (xid and multixact-id are separate counters and can
+	 * collide in value).  The contribution helper's same-xid reuse exemption
+	 * must NOT fire -- the marker path passes InvalidTransactionId as
+	 * new_xid, never the multixact id. */
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
+		slot_at(page, i)->xid = (TransactionId)(1000 + i);
+	}
+	slot_at(page, 2)->flags = ITL_FLAG_COMMITTED;
+	slot_at(page, 2)->xid = (TransactionId)4242;
+	slot_at(page, 2)->write_scn = (SCN)6000;
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 2);
+	UT_ASSERT_EQ((int)(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn == (SCN)6000), 1);
+}
+
 UT_TEST(test_d11_page_has_active_slot_detects_active)
 {
 	Page page = build_itl_page();
@@ -900,6 +1022,11 @@ main(void)
 	UT_RUN(test_t30_watermark_completed_data_contributes);
 	UT_RUN(test_t31_watermark_advance_monotone);
 	UT_RUN(test_t32_redo_recomputes_recycle_watermark);
+	/* spec-7.1 watch-2: marker reuse folds the recycle watermark. */
+	UT_RUN(test_t33_marker_reuse_completed_data_folds_watermark);
+	UT_RUN(test_t34_marker_reuse_lock_only_no_fold);
+	UT_RUN(test_t35_marker_free_slot_no_fold);
+	UT_RUN(test_t36_marker_reuse_xid_mxid_collision_still_folds);
 	UT_RUN(test_d11_page_has_active_slot_detects_active);
 	UT_RUN(test_d11_page_has_active_slot_no_itl_is_false);
 

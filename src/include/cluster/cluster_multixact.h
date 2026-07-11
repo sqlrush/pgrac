@@ -187,6 +187,42 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 									 const Snapshot snap);
 
 /*
+ * spec-7.1 D3-b: one multixact member's origin-SERVED terminal verdict.
+ *
+ *   Unlike ClusterMultiXactMember (an exact TT key the local resolver looks
+ *   up), this carries the terminal state the ORIGIN already resolved for a
+ *   foreign multi's member -- there is no local TT to consult (that is why the
+ *   overlay missed).  member_status distinguishes updater (4-5) from lock-only
+ *   (0-3, ignored for visibility, A2).  verdict/commit_scn/horizon_scn/wrap
+ *   mirror one ClusterGcsUndoVerdictPage per updater member; lock-only members
+ *   need no verdict.
+ */
+typedef struct ClusterMultiXactServedMember {
+	SCN commit_scn;		 /* COMMITTED_EXACT only, else InvalidScn */
+	SCN horizon_scn;	 /* COMMITTED_BELOW_HORIZON bound, else InvalidScn */
+	TransactionId xid;	 /* member xid (uint32; not full-xid) */
+	uint16 wrap;		 /* COMMITTED_EXACT slot wrap evidence */
+	uint8 verdict;		 /* ClusterGcsUndoVerdictKind; 0 = none (lock-only) */
+	uint8 member_status; /* MultiXactStatus: updater(4-5) vs lock-only(0-3) */
+} ClusterMultiXactServedMember;
+
+/*
+ * cluster_multixact_resolve_visibility_served (spec-7.1 D3-b, A1)
+ *
+ *   Pure combination resolver for a foreign multixact xmax whose members'
+ *   terminal states were SERVED by the origin (no local TT lookup).  Mirrors
+ *   cluster_multixact_resolve_visibility's decision structure verbatim, but
+ *   the per-updater-member terminal comes from the served verdict instead of
+ *   cluster_tt_status_lookup_exact.  8.A: any updater member without a proven
+ *   terminal (verdict 0 / inadmissible below-horizon / unknown) -> UNKNOWN
+ *   (caller fail-closes 53R9C); lock-only members never gate visibility.
+ *   Pure (no shmem / lock / I/O) so cluster_unit exercises the truth table.
+ */
+extern ClusterVisibilityDecision
+cluster_multixact_resolve_visibility_served(const ClusterMultiXactServedMember *members,
+											uint16 member_count, SCN read_scn);
+
+/*
  * cluster_multixact_get_member_count (spec-3.6 D2)
  *
  *   Return member_count of overlay entry for `key`, or 0 on miss.
@@ -203,6 +239,22 @@ extern uint16 cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
 extern void cluster_multixact_purge_epoch(uint32 obsolete_epoch);
 
 /*
+ * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a)
+ *
+ *   One-call reader helper for a DERIVED-foreign multixact xmax:
+ *   builds the overlay key {origin_slot, mxid, current epoch}, looks
+ *   up the member overlay and resolves visibility against snap per
+ *   the OBS-1 truth table.  *overlay_hit reports whether the overlay
+ *   held the entry (miss -> UNKNOWN; the member-serve wire that would
+ *   answer a miss positively is a later deliverable).  UNKNOWN always
+ *   means the caller must fail closed (rule 8.A).
+ */
+extern ClusterVisibilityDecision cluster_multixact_remote_xmax_resolve(uint16 origin_slot,
+																	   MultiXactId mxid,
+																	   Snapshot snap,
+																	   bool *overlay_hit);
+
+/*
  * Counter getters (always linked;return 0 in disable-cluster build).
  */
 extern uint64 cluster_multixact_get_overlay_install_count(void);
@@ -210,6 +262,18 @@ extern uint64 cluster_multixact_get_overlay_lookup_hit_count(void);
 extern uint64 cluster_multixact_get_overlay_miss_count(void);
 extern uint64 cluster_multixact_get_overlay_overflow_count(void);
 extern uint64 cluster_multixact_get_resolve_visibility_count(void);
+extern uint64 cluster_multixact_get_mxid_halfspace_refuse_count(void);
+extern uint64 cluster_multixact_get_mxid_underivable_read_count(void);
+
+/*
+ * spec-7.1 D3-a guardrail bumps (no-op in disable-cluster build).
+ * halfspace_refuse: the striped allocator refused a candidate at or
+ * beyond floor + 2^31 (53RB4).  underivable_read: a reader met a
+ * foreign-evidence multixact whose origin could not be derived
+ * (below-floor / unlatched / beyond-half-space) and failed closed.
+ */
+extern void cluster_multixact_note_halfspace_refuse(void);
+extern void cluster_multixact_note_underivable_read(void);
 
 /*
  * Shmem hooks (defined in cluster_multixact.c when USE_PGRAC_CLUSTER;

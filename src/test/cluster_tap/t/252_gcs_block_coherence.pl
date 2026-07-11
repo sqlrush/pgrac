@@ -86,6 +86,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_coherence',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [ 'autovacuum = off' ]);
 $pair->start_pair;
 usleep(3_000_000);    # let the tier1 mesh settle before the first GCS round-trip

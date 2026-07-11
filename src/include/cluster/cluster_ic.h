@@ -218,6 +218,21 @@ extern const ClusterICOps *ClusterICOps_Active;
  */
 #define PGRAC_IC_HELLO_MAGIC ((uint32)0x4F4C4C48) /* "HLLO" LE */
 #define PGRAC_IC_HELLO_VERSION_V1 ((uint16)1)
+
+/*
+ * PGRAC: spec-7.2 D2 — interconnect plane.  CONTROL is the historic
+ * LMON-owned connection (heartbeat / membership / GES / everything
+ * registered before spec-7.2);  DATA is the LMS-owned connection the
+ * GCS block family migrates to.  Zero MUST stay CONTROL: a pre-7.2
+ * HELLO carries all-zero pad bytes and must keep parsing as a
+ * CONTROL-plane peer.
+ */
+typedef enum ClusterICPlane {
+	CLUSTER_IC_PLANE_CONTROL = 0,
+	CLUSTER_IC_PLANE_DATA = 1
+} ClusterICPlane;
+
+#define CLUSTER_IC_PLANE_N 2
 /*
  * spec-2.3 D3: PGRAC_IC_ENVELOPE_VERSION_V1 is now defined in
  * cluster_ic_envelope.h as ((uint8)1) — the authoritative
@@ -258,6 +273,17 @@ extern const ClusterICOps *ClusterICOps_Active;
  * wait): a missing reply just leaves the dialer's view of the peer's
  * capabilities UNKNOWN, which every consumer treats as fail-closed. */
 #define PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 ((uint32)0x00000008U)
+/*
+ * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
+ * pad region (capabilities precedent: occupy pad bytes, do not resize V1).
+ * A pre-7.2 sender leaves them zero => plane CONTROL, conn_epoch 0.
+ * Offsets 41/42 are reserved for spec-7.3 (worker_id / n_workers) and
+ * stay zero in 7.2;  offset 43 pads the group;  52-63 remain reserved.
+ */
+#define PGRAC_IC_HELLO_PLANE_OFFSET 40
+#define PGRAC_IC_HELLO_WORKER_ID_OFFSET 41 /* spec-7.3 reserved, zero in 7.2 */
+#define PGRAC_IC_HELLO_N_WORKERS_OFFSET 42 /* spec-7.3 reserved, zero in 7.2 */
+#define PGRAC_IC_HELLO_CONN_EPOCH_OFFSET 44
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */
@@ -277,6 +303,52 @@ cluster_ic_hello_capabilities(const ClusterICHelloMsg *msg)
 		return 0;
 	p = msg->_pad;
 	return ((uint32)p[0]) | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+/* PGRAC: spec-7.2 D2 — plane byte accessor (_pad offset 40 - 36 = 4). */
+static inline ClusterICPlane
+cluster_ic_hello_plane(const ClusterICHelloMsg *msg)
+{
+	if (msg == NULL)
+		return CLUSTER_IC_PLANE_CONTROL;
+	return (ClusterICPlane)
+		msg->_pad[PGRAC_IC_HELLO_PLANE_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET];
+}
+
+/* PGRAC: spec-7.2 D2 — connection epoch accessor (_pad offset 44 - 36 = 8;
+ * LE uint64).  Zero = pre-7.2 sender (or CONTROL plane, which does not
+ * enforce it);  the DATA-plane verify path rejects zero fail-closed. */
+static inline uint64
+cluster_ic_hello_conn_epoch(const ClusterICHelloMsg *msg)
+{
+	const uint8 *p;
+	uint64 v = 0;
+	int i;
+
+	if (msg == NULL)
+		return 0;
+	p = msg->_pad + (PGRAC_IC_HELLO_CONN_EPOCH_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET);
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | (uint64)p[i];
+	return v;
+}
+
+/* PGRAC: spec-7.3 D3 — DATA-plane worker_id / n_workers accessors (offsets
+ * 41/42).  Zero for a pre-7.3 sender or a CONTROL-plane HELLO. */
+static inline uint8
+cluster_ic_hello_worker_id(const ClusterICHelloMsg *msg)
+{
+	if (msg == NULL)
+		return 0;
+	return msg->_pad[PGRAC_IC_HELLO_WORKER_ID_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET];
+}
+
+static inline uint8
+cluster_ic_hello_n_workers(const ClusterICHelloMsg *msg)
+{
+	if (msg == NULL)
+		return 0;
+	return msg->_pad[PGRAC_IC_HELLO_N_WORKERS_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET];
 }
 
 
@@ -303,9 +375,19 @@ cluster_ic_hello_capabilities(const ClusterICHelloMsg *msg)
  */
 extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
 								   uint16 envelope_version, int32 source_node_id,
-								   const char *cluster_name);
+								   const char *cluster_name, ClusterICPlane plane,
+								   uint64 conn_epoch);
 extern bool cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
 								   ClusterICHelloMsg *out_msg);
+
+/*
+ * spec-7.3 D3 — write the DATA-plane worker_id / n_workers fields (offsets
+ * 41/42) onto an already-built HELLO buffer.  Only the DATA-plane send path
+ * calls it;  a CONTROL / pre-7.3 HELLO leaves them zero (byte-identical to
+ * spec-7.2).  Kept next to build_hello as the wire-layout authority.
+ */
+extern void cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 worker_id,
+											   uint8 n_workers);
 
 
 /*

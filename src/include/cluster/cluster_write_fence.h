@@ -39,6 +39,8 @@
 #ifndef CLUSTER_WRITE_FENCE_H
 #define CLUSTER_WRITE_FENCE_H
 
+#include "cluster/cluster_marker_async.h"
+
 /*
  * cluster_write_fence_decide -- the PURE cooperative write-fence judge (spec-4.12
  * D3).  A shared-storage write is allowed iff enforcement is on AND the local
@@ -517,6 +519,14 @@ extern void cluster_write_fence_note_baseline_stale(void);
  */
 extern ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
+extern bool cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
+													const ClusterFenceMarker *m,
+													ClusterMarkerAsyncKind kind, int32 target_node,
+													TimestampTz now);
+extern ClusterMarkerPollResult cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a,
+																	 TimestampTz now,
+																	 uint32 *out_result,
+																	 uint64 *out_elapsed_us);
 extern void cluster_write_fence_publish_qvotec_latch(struct Latch *latch);
 extern bool cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out);
 extern void cluster_write_fence_qvotec_complete(bool acked);

@@ -9,7 +9,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline: 7 NEW counters all 0 + catversion >= 202605420
-#	  L3  pg_cluster_state.gcs category has 67 keys (cumulative through spec-6.13)
+#	  L3  pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip) (cumulative through spec-6.13)
 #	  L4  cross-node forward path:  node A read first → master_holder = A;
 #	       force same tag on node B via test-only injection → master
 #	       chooses forward path → A direct-ships to B → block_forward_sent
@@ -73,6 +73,7 @@ sub gcs_int
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_2way',
 	quorum_voting_disks => 3,
+	data_port_span => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 
@@ -108,18 +109,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs has 89 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node0 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node0 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node1 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node1 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip)');
 
 
 # ============================================================
@@ -211,8 +212,8 @@ cmp_ok($catver, '>=', 202605420,
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'121',
-	'L9 pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+	'123',
+	'L9 pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 
 done_testing();

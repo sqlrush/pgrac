@@ -52,27 +52,45 @@ typedef struct ClusterLiveAuthority {
 	uint64 origin_epoch;	 /* origin's view of the membership epoch */
 	XLogRecPtr live_hwm_lsn; /* origin durable AND TT-applied high-water */
 	uint64 tt_generation;	 /* origin TT-slot generation (anti-alias) */
+	SCN authority_scn;		 /* PGRAC: spec-7.1a D3 -- origin SCN clock
+							  * co-sampled with the content; the covers
+							  * gate admits only when it is at/after the
+							  * caller's demand (read_scn or its clock at
+							  * request time).  InvalidScn = absent ->
+							  * refuse fail-closed */
 } ClusterLiveAuthority;
 
 /*
- * PURE gate (D-i2 window check).  Returns true iff the co-sampled authority
- * provably covers `anchor_lsn` (the tuple's page LSN) in the caller's current
- * reconfig generation.  Fail-closed on any doubt:
+ * PURE gate (D-i2 window check; spec-7.1a D3 SCN total order).  Returns true
+ * iff the co-sampled authority provably covers the caller's demand in the
+ * caller's current reconfig generation.  demand_scn is the SCN the answer
+ * must be conclusive for: the snapshot read_scn on MVCC legs, or the
+ * caller's own clock sampled BEFORE the fetch on no-snapshot legs (writer
+ * terminal resolution) -- by AD-008 Lamport, an origin whose co-sampled
+ * clock is at/after the demand has already issued (and pre-commit durably
+ * stamped) every commit the demand could have observed.  The former
+ * `live_hwm_lsn < anchor_lsn` compare was NOT sound across per-thread WAL
+ * streams (a page last written by another thread carries a numerically
+ * incomparable LSN: false-refuse measured, false-pass latent) and is
+ * replaced, never weakened.  Fail-closed on any doubt:
  *   - origin_epoch != local_epoch  -> authority from a different reconfig gen
  *   - live_hwm_lsn invalid         -> no authority sampled
- *   - live_hwm_lsn < anchor_lsn    -> origin durable TT does not yet cover
- *                                     this page version
+ *   - authority_scn invalid        -> older peer / no SCN co-sample
+ *   - demand_scn invalid           -> caller supplied no demand
+ *   - authority_scn before demand  -> origin clock not provably conclusive
+ *                                     for this demand yet (retry self-heals:
+ *                                     the shipped SCNs are Lamport-observed)
  * tt_generation is NOT checked here; it is consumed by the downstream by-xid
  * wrap-qualified resolution (D-i2 condition (a)/(c)).
  */
-extern bool cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn,
-													 ClusterLiveAuthority auth, uint64 local_epoch);
+extern bool cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority auth,
+													 uint64 local_epoch);
 
 /*
  * Runtime wrapper: supplies the local membership epoch to the pure gate.
  * (cluster_runtime_visibility.c; the pure policy above is CP1.)
  */
-extern bool cluster_vis_live_authority_covers(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth);
+extern bool cluster_vis_live_authority_covers(SCN demand_scn, ClusterLiveAuthority auth);
 
 /*
  * D-i1 fetch (spec-6.12i CP2): fetch the TT-bearing undo header block named
@@ -123,9 +141,12 @@ extern bool cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, ch
  * depth.  Pure; no I/O, no shmem, no elog (unit truth table).
  */
 typedef enum ClusterVisTtProof {
-	CLUSTER_VIS_TT_PROOF_NONE = 0, /* fail-closed: caller keeps 53R97 */
-	CLUSTER_VIS_TT_PROOF_COMMITTED = 1,
-	CLUSTER_VIS_TT_PROOF_ABORTED = 2
+	CLUSTER_VIS_TT_PROOF_NONE = 0,		/* fail-closed: caller keeps 53R97 */
+	CLUSTER_VIS_TT_PROOF_COMMITTED = 1, /* EVIDENCE only: stamps land at 2PC
+										 * pre-commit; consumers finalize via
+										 * the origin's C1b verdict leg,
+										 * never conclude committed here */
+	CLUSTER_VIS_TT_PROOF_ABORTED = 2	/* terminal: an abort is irreversible */
 } ClusterVisTtProof;
 
 extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
@@ -187,6 +208,26 @@ extern bool cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32
 														uint64 reply_epoch, uint64 stamped_epoch);
 
 /*
+ * spec-7.1 D3-b pure structural validation of a shipped BATCHED multixact
+ * member-verdict page (see cluster_gcs_block.h for the wire struct).  true
+ * only when the page provably answers the asked-for mxid: magic / version /
+ * widened-mxid echo match, status is SERVED (the only status that ships a
+ * page; a DENIED reply never reaches here), nmembers is in [1, MAX], every
+ * reserved byte is zero, and EACH member is internally consistent -- lock-only
+ * members (status <= MultiXactStatusForUpdate) carry no verdict and no scn;
+ * updater members (4-5) carry a known verdict whose scn fields match the kind
+ * exactly (mirroring cluster_vis_undo_verdict_page_usable).  Anything else
+ * refuses so the caller keeps the 53R97 fail-closed boundary (Rule 8.A).
+ * Pure: no shmem, no locks, no elog (unit truth table).  The read_scn
+ * admissibility of a BELOW_HORIZON bound is decided by the consumer
+ * (cluster_multixact_resolve_visibility_served), not here.
+ */
+struct ClusterGcsUndoMultiVerdictPage; /* cluster_gcs_block.h */
+extern bool
+cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdictPage *v,
+										   MultiXactId asked_mxid);
+
+/*
  * CP3 + CP5 orchestration (backend): active-runtime resolution of a RECYCLED
  * remote ITL ref.  Two provable legs, both under the co-sampled live
  * authority gate (D-i2):
@@ -214,10 +255,9 @@ extern bool cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32
  * pre-existing STALE_OR_AMBIGUOUS -> 53R97 fail-closed.
  */
 extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
-														  TransactionId raw_xid,
-														  XLogRecPtr anchor_lsn, SCN read_scn,
-														  bool authoritative,
-														  bool *out_committed, SCN *out_commit_scn,
+														  TransactionId raw_xid, SCN read_scn,
+														  bool authoritative, bool *out_committed,
+														  SCN *out_commit_scn,
 														  bool *out_commit_scn_is_bound);
 
 #endif /* CLUSTER_RUNTIME_VISIBILITY_H */

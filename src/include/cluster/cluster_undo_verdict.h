@@ -141,8 +141,7 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  */
 extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
 															 uint32 undo_segment_id,
-															 TransactionId raw_xid,
-															 XLogRecPtr anchor_lsn, SCN read_scn,
+															 TransactionId raw_xid, SCN read_scn,
 															 bool authoritative);
 
 #endif /* CLUSTER_UNDO_VERDICT_H */

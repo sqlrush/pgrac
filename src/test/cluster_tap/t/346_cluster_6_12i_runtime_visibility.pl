@@ -120,7 +120,15 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'i612_rtvis',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
+		# spec-7.1a: a LIVE remote ITL ref whose overlay lookup misses is
+		# resolved by the D4 origin pull, and that pull is (by design)
+		# armed by cluster.crossnode_write_write -- without it the
+		# updater-xmax judges on this test's superseded versions stay
+		# UNKNOWN fail-closed once the wave-i aging shape is reached
+		# (same conf evolution as the 6.15 striping arming below).
+		'cluster.crossnode_write_write = on',
 		'autovacuum = off',
 		'cluster.ges_request_timeout_ms = 30000',
 		'cluster.gcs_reply_timeout_ms = 3000',
@@ -243,6 +251,70 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 }
 
 # ============================================================
+# L4c: spec-7.3 D7 -- fence ×N on the undo serve.  A write-fenced origin must
+# not ship undo bytes / a commit verdict on the DATA plane (the 8.A-critical
+# stale-commit_scn surface).  The inline serve's fence gate sits ahead of the
+# undo read / authority co-sample, so forcing it (cluster-lms-cr-fence-refuse,
+# conf-armed + SIGHUP per the t/360 L5 pattern -- review P1-2: the old
+# inject_skip_set guard skipped this leg forever) must keep a fresh node1
+# backend fail-closed 53R97, bump the origin's cr_server_fence_refused_count,
+# and serve NOTHING (undo_served / verdict_served stay put -- the RED signal
+# distinguishing the gate from a serve that failed), then recover once the
+# fence clears.  Shares the single gate with L7 in t/354; counter snapshots
+# are taken AFTER the arm is observably effective so pre-arm serves cannot
+# contaminate the static-counter assertions.
+# ============================================================
+{
+	# Arm on the origin; the LMS workers re-read cluster.injection_points on
+	# SIGHUP, so poll a fresh node1 backend (no per-backend authority memo ->
+	# the fetch rides the wire into the origin's fence gate) until the armed
+	# refusal is observable.
+	$node0->append_conf('postgresql.conf',
+		"cluster.injection_points = 'cluster-lms-cr-fence-refuse:skip'");
+	$node0->reload;
+	my $err = 'arm poll never ran';
+	for my $try (1 .. 60)
+	{
+		my ($rc, $out);
+		($rc, $out, $err) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+		last if defined($err) && $err =~ /cluster TT (status unknown|slot recycled)/;
+		usleep(500_000);
+	}
+	like($err, qr/cluster TT (status unknown|slot recycled)/,
+		'L4c fence ×N: write-fenced origin keeps the undo read fail-closed (53R97)');
+
+	my $fr0 = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+	my $us0 = state_val($node0, 'cr', 'cr_server_undo_served_count');
+	my $vs0 = state_val($node0, 'cr', 'cr_server_verdict_served_count');
+
+	# One deterministic fenced fetch against the armed gate.
+	my ($rc2, $out2, $err2) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+	like($err2, qr/cluster TT (status unknown|slot recycled)/,
+		'L4c armed gate keeps a fresh backend fail-closed (deterministic leg)');
+	cmp_ok(state_val($node0, 'cr', 'cr_server_fence_refused_count'), '>', $fr0,
+		'L4c origin fence-refused counter advanced (undo serve refused pre-read)');
+	is(state_val($node0, 'cr', 'cr_server_undo_served_count'), $us0,
+		'L4c no undo-TT fetch served while fenced (gate precedes the undo read)');
+	is(state_val($node0, 'cr', 'cr_server_verdict_served_count'), $vs0,
+		'L4c no verdict served while fenced');
+
+	# Disarm.  A bare empty list does NOT recall a :skip arm (the assign_hook
+	# only reverts WARNING arms); an explicit ':none' entry re-arms the point
+	# to NONE in every process on SIGHUP.
+	$node0->append_conf('postgresql.conf',
+		"cluster.injection_points = 'cluster-lms-cr-fence-refuse:none'");
+	$node0->reload;
+	my $ok = 0;
+	for my $try (1 .. 20)
+	{
+		my ($rc3, $out3, $err3) = $node1->psql('postgres', 'SELECT count(*) FROM i_t');
+		if (defined $out3 && $out3 =~ /^12$/m) { $ok = 1; last; }
+		usleep(500_000);
+	}
+	ok($ok, 'L4c undo read recovers after the fence clears');
+}
+
+# ============================================================
 # L4b: aged-seed verdict leg (D-i4 / spec-6.15 D4) -- burn write xacts on the
 # origin until the seed xact's durable TT slot recycles; the single-block
 # proof then 0-matches and the read must resolve via the ORIGIN VERDICT
@@ -295,8 +367,18 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), '
 # ============================================================
 {
 	# Warm a session: resolves + populates its per-backend authority memo.
+	# Since the spec-7.1a hardening every COMMITTED stamp is finalized on
+	# the verdict leg, so this fresh session's FIRST read can hit the
+	# leg-(e) clock-skew refusal (the L4b note: an expected transient, the
+	# observe self-heals the next attempt) -- retry until actually warm.
 	my $s = $node1->background_psql('postgres', on_error_stop => 0);
-	my $warm = $s->query('SELECT count(*) FROM i_t');
+	my $warm;
+	for my $try (1 .. 10)
+	{
+		$warm = $s->query('SELECT count(*) FROM i_t');
+		last if defined $warm && $warm =~ /12/;
+		usleep(500_000);
+	}
 	like($warm, qr/12/, 'L5 session warmed (memo + pool populated pre-crash)');
 
 	$pair->kill_node9(0);

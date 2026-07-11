@@ -51,7 +51,8 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	121 /* spec-6.13 D8 RDMA busypoll/inline; spec-5.22b D2-6 +3 undo-block grant-plane waits */
+	123 /* spec-6.13 D8 RDMA included; spec-5.22b D2-6 +3 undo-block grant-plane; \
+		 * spec-7.2 D6 +2 LMS data-plane (merge-window sum: 118 + 3 + 2) */
 
 
 /*

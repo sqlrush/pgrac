@@ -53,7 +53,7 @@
 #include "cluster/cluster_undo_cleaner.h"		/* spec-3.13 D2-A gc pass + stats */
 #include "storage/spin.h"						/* protected-slot map lock (spec-3.15 D6) */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
-#include "cluster/cluster_undo_horizon.h" /* epoch fence (spec-5.22e F-D2) */
+#include "cluster/cluster_undo_horizon.h"		/* epoch fence (spec-5.22e F-D2) */
 #include "miscadmin.h"
 #include "port/atomics.h" /* spec-3.12 D5 retention counters */
 #include "storage/lwlock.h"

@@ -292,6 +292,7 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
 
 	/* L174 idempotent latch wake — LMON drain promptly. */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_TT_HINT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 }
 
@@ -345,6 +346,7 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
 	LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_TT_HINT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 }
 
@@ -409,6 +411,7 @@ cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, ui
 	LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_TT_HINT); /* spec-7.2 D1 */
 	cluster_lmon_wakeup();
 }
 

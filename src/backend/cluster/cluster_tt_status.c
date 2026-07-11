@@ -123,6 +123,13 @@ typedef struct ClusterTTStatusShmem {
 	pg_atomic_uint64 prune_remote_keep_count;
 	pg_atomic_uint64 vis_variant_unknown_failclosed_count;
 
+	/* spec-7.1a D6: cross-node write-write chaining observability. */
+	pg_atomic_uint64 writer_chain_resolved_count;
+	pg_atomic_uint64 writer_chain_failclosed_count;
+	pg_atomic_uint64 xmax_resolved_count;
+	pg_atomic_uint64 overlay_refresh_count;
+	pg_atomic_uint64 covers_scn_refuse_count;
+
 	/* spec-3.15 D9: two-phase commit observability. */
 	pg_atomic_uint64 twopc_prepare_records;
 	pg_atomic_uint64 twopc_prepare_undo_flushes;
@@ -203,6 +210,12 @@ cluster_tt_status_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_conflict_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->prune_remote_keep_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_variant_unknown_failclosed_count, 0);
+		/* PGRAC (spec-7.1a D6) */
+		pg_atomic_init_u64(&ClusterTTStatusState->writer_chain_resolved_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->writer_chain_failclosed_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->xmax_resolved_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->overlay_refresh_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->covers_scn_refuse_count, 0);
 		/* PGRAC (spec-3.15 D9) */
 		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prepare_records, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prepare_undo_flushes, 0);
@@ -999,6 +1012,13 @@ CLUSTER_VIS_BUMP(vis_selftoast_fork_count)
 CLUSTER_VIS_BUMP(vis_conflict_failclosed_count)
 CLUSTER_VIS_BUMP(prune_remote_keep_count)
 CLUSTER_VIS_BUMP(vis_variant_unknown_failclosed_count)
+
+/* spec-7.1a D6: write-write chaining counters (same bump/read shape). */
+CLUSTER_VIS_BUMP(writer_chain_resolved_count)
+CLUSTER_VIS_BUMP(writer_chain_failclosed_count)
+CLUSTER_VIS_BUMP(xmax_resolved_count)
+CLUSTER_VIS_BUMP(overlay_refresh_count)
+CLUSTER_VIS_BUMP(covers_scn_refuse_count)
 
 /* spec-3.15 D9: 2PC counters (same single-writer bump/read shape). */
 CLUSTER_VIS_BUMP(twopc_prepare_records)

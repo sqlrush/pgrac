@@ -379,6 +379,19 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_LMON:
 			return true;
 
+		/* PGRAC: spec-7.3 D6 -- on the DATA plane the LMS master and its
+		 * shard workers serve GCS block / undo-fetch / undo-verdict requests
+		 * INLINE (cluster_gcs_block_forward_serve_inline -> cr_serve_slot),
+		 * which reads relation and undo blocks through the buffer manager;
+		 * that path calls pgstat_count_io_op_time, so both LMS backend types
+		 * must be tracked or the pgstat_tracks_io_op() Assert trips on
+		 * cassert builds (same pattern as B_LMON / B_SINVAL_BCAST above).
+		 * Surfaced by the merge of the DATA plane with the spec-5.22e
+		 * cross-node retention-read path (t/370). */
+		case B_LMS:
+		case B_LMS_WORKER:
+			return true;
+
 		/* PGRAC: cluster aux types that do not perform buffer-manager IO. */
 		case B_CLUSTER_STATS:
 		case B_CSSD:
@@ -387,8 +400,6 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_INTERCONNECT:
 		case B_LCK:
 		case B_LMD:
-		case B_LMS:
-		case B_LMS_WORKER:
 		case B_MRP:
 		case B_QVOTEC:
 		case B_RFS:

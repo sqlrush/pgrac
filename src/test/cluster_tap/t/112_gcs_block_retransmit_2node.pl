@@ -9,14 +9,14 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline:  9 NEW reliability counters all 0 on both nodes
-#	  L3  pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a)
+#	  L3  pg_cluster_state.gcs has 89 keys (cumulative through spec-7.2 D6 hist)
 #	  L4  2 NEW wait events registered (ClusterGCSBlockRetransmitWait +
 #	       ClusterGCSBlockEpochStaleRetry)
-#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 85 (was 83 spec-2.33)
+#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 120 (spec-7.2 +2)
 #	  L6  3 NEW GUC visible + defaults + contexts:
 #	       cluster.gcs_block_retransmit_max_retries PGC_SUSET 4
-#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 100
-#	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 1024
+#	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 10 (spec-7.2 D1)
+#	       cluster.gcs_block_dedup_max_entries PGC_POSTMASTER 16384
 #	  L7  single-shot ship workload — retransmit_attempt_count=0
 #	  L8  inject `cluster-gcs-block-drop-reply-before-send:skip:1` →
 #	       retransmit_send_count grows + WARNING at 3/4 budget
@@ -69,9 +69,13 @@ sub gcs_int
 # ============================================================
 # L1: ClusterPair startup.
 # ============================================================
+# spec-7.3: cluster.lms_workers defaults to 2, and each node's DATA plane binds
+# a per-worker listener at data_port + worker_id (D3).  Reserve a 2-port span per
+# node so node0's worker-1 port does not collide with node1's base (mirrors t/367).
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_retransmit',
 	quorum_voting_disks => 3,
+	data_port_span => 2,
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 
@@ -107,18 +111,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 67 keys (cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs category has 89 keys (cumulative through spec-7.2 D6 hist).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node0 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node0 pg_cluster_state.gcs category has 89 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node1 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node1 pg_cluster_state.gcs category has 89 keys');
 
 
 # ============================================================
@@ -139,13 +143,13 @@ for my $we_name (
 
 
 # ============================================================
-# L5: total wait event count = 85.
+# L5: total wait event count = 120.
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '121',
-   'L5 pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+   '123',
+   'L5 pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 
 # ============================================================
@@ -153,8 +157,8 @@ is($pair->node0->safe_psql(
 # ============================================================
 for my $row (
 	[ 'cluster.gcs_block_retransmit_max_retries', '4', 'superuser' ],
-	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '100', 'superuser' ],
-	[ 'cluster.gcs_block_dedup_max_entries', '1024', 'postmaster' ],
+	[ 'cluster.gcs_block_retransmit_initial_backoff_ms', '10', 'superuser' ],
+	[ 'cluster.gcs_block_dedup_max_entries', '16384', 'postmaster' ],
 )
 {
 	my ($name, $expected_default, $expected_ctx) = @$row;

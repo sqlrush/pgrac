@@ -12,8 +12,8 @@
 #
 #	  L1   ClusterPair startup baseline (both postmasters healthy)
 #	  L2   fresh baseline: 6 NEW spec-2.36 counters all 0
-#	  L3   pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a)
-#	  L4   catversion lower-bound >= 202605430; wait event count == 121
+#	  L3   pg_cluster_state.gcs has 89 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a)
+#	  L4   catversion lower-bound >= 202605430; wait event count == 123
 #	  L5   S barrier injection — DENIED_PENDING_X surfaces under
 #	       cluster-gcs-block-starvation-force-denied inject; reader
 #	       sees starvation_denied_pending_x_count tick
@@ -76,6 +76,7 @@ sub gcs_int
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_3way_2node',
+	data_port_span => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 
@@ -106,18 +107,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 67 keys (cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs has 89 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node0 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node0 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L3 node1 pg_cluster_state.gcs category has 67 keys');
+   '89',
+   'L3 node1 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip)');
 
 
 # ============================================================
@@ -132,8 +133,8 @@ cmp_ok($catver, '>=', 202605430,
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'121',
-	'L4 wait event count == 121 (spec-6.13 RDMA wait surface)');
+	'123',
+	'L4 wait event count == 120 (spec-7.2 D6 LMS data-plane wait surface)');
 
 
 # ============================================================

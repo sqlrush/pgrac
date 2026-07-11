@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '81' : '80'; # spec-5.22e D5-2 +1 undo horizon; spec-5.22b D2-6 +1 undo gcs; spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a)
+  my $expected_region_count = $has_visibility_inject ? '82' : '81'; # spec-5.22e D5-2 +1 undo horizon; spec-5.22b D2-6 +1 undo gcs; spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a); spec-7.2 D4 +1 lms data outbound
 
 
 # ----------
@@ -137,8 +137,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '121',
-   'L9 pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+   '123',
+   'L9 pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 
 # ----------
@@ -157,8 +157,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '161',
-   'L11 pg_stat_cluster_injections is 161 (spec-5.22e D5-7 +2; spec-5.22d D4-8 +1; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 xid herding/hard-limit; spec-6.12 waves a/b/i +3; full breakdown in t/015)');
+   '167',
+   'L11 pg_stat_cluster_injections is 167 (spec-5.22e D5-7 +2; spec-5.22d D4-8 +1; spec-7.3 review P1-1 +1 cluster-lms-cr-fence-recheck; spec-7.1 D3-a +1 cluster-mxid-halfspace-hard-limit; spec-7.3 D7 +1 cluster-lms-cr-fence-refuse; spec-7.2 D6 +2 lms data-dispatch/conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 xid herding/hard-limit; spec-6.12 waves a/b/i +3; full breakdown in t/015)');
 
 
 # ----------
@@ -168,8 +168,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '55',
-   'L12 pg_cluster_state has 55 categories (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
+   '56',
+   'L12 pg_cluster_state has 56 categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '55', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + xid_stripe categories (55 categories; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
+is($smoke_categories, '56', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + xid_stripe + reconfig categories (56 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
 
 
 # ----------

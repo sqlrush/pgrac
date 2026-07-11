@@ -106,7 +106,7 @@ my $open_rr_reader = sub {
 	# spec-6.12b six CR-server counters.
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'59', 'L1b cr category has 59 rows (17 + 5 spec-5.53 + 8 spec-5.54 + 5 spec-5.56 + 6 spec-6.12b + 16 spec-6.12i/6.15 + 2 spec-5.22f D6 fresh-ref verdict)');
+		'78', 'L1b cr category has 78 rows (+ 1 spec-7.3 D7 fence_refused; 17 + 5 spec-5.53 + 8 spec-5.54 + 5 spec-5.56 + 6 spec-6.12b + 16 spec-6.12i/6.15 + 13 spec-7.1 D0/D3-b census & multi-verdict serve + 2 spec-5.22f D6 fresh-ref verdict + 5 spec-5.22d D4 authority serve incl. A1 scan attribution)');
 
 	for my $k (qw(cr_key_mismatch_count cr_epoch_mismatch_count
 		cr_generation_mismatch_count cr_base_lsn_mismatch_count

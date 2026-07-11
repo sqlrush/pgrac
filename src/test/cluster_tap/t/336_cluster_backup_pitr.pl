@@ -34,6 +34,7 @@ my $archive_dir = $node->archive_dir;
 $node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
+	. "cluster.lms_workers = 1\n"
 	. "cluster.allow_single_node = on\n"
 	. "wal_level = replica\n"
 	. "archive_mode = on\n"
@@ -440,6 +441,8 @@ sub configure_pair_restore
 	my ($restore_node, $shared_dir, $target_scn) = @_;
 	my $restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $restore_data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $restore_data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $target_conf = defined($target_scn)
 	  ? "cluster.recovery_target_scn = '$target_scn'\n"
 	  : "";
@@ -452,9 +455,11 @@ name = cluster_backup_pair_restore
 
 [node.0]
 interconnect_addr = 127.0.0.1:$restore_ic0
+data_addr = 127.0.0.1:$restore_data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$restore_ic1
+data_addr = 127.0.0.1:$restore_data_port1
 EOC
 	$restore_node->append_conf('postgresql.conf',
 	  "port = " . $restore_node->port . "\n"
@@ -462,6 +467,7 @@ EOC
 	. "restore_command = 'cp $pair_archive/%f %p'\n"
 	. "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
+	. "cluster.lms_workers = 1\n"
 	. "cluster.allow_single_node = on\n"
 	. "cluster.voting_disks = ''\n"
 	. "cluster.wal_threads_dir = ''\n"
@@ -601,6 +607,7 @@ $bad_target_node->init(allows_streaming => 1);
 $bad_target_node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
+	. "cluster.lms_workers = 1\n"
 	. "cluster.allow_single_node = on\n"
 	. "wal_level = replica\n"
 	. "cluster.recovery_target_scn = '0'\n");
@@ -620,6 +627,7 @@ $multi_target_node->init(allows_streaming => 1);
 $multi_target_node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
+	. "cluster.lms_workers = 1\n"
 	. "cluster.allow_single_node = on\n"
 	. "wal_level = replica\n"
 	. "cluster.recovery_target_scn = '1'\n"
@@ -641,6 +649,7 @@ my $pin_archive = $pin_node->archive_dir;
 $pin_node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
+	. "cluster.lms_workers = 1\n"
 	. "cluster.allow_single_node = on\n"
 	. "wal_level = replica\n"
 	. "archive_mode = on\n"

@@ -32,9 +32,9 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_scn.h"			 /* SCN, InvalidScn */
-#include "cluster/cluster_tt_status.h"		 /* ClusterTTStatus */
-#include "cluster/cluster_undo_verdict.h"	 /* ClusterUndoVerdictResult + kinds */
+#include "cluster/cluster_scn.h"		  /* SCN, InvalidScn */
+#include "cluster/cluster_tt_status.h"	  /* ClusterTTStatus */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult + kinds */
 #include "cluster/cluster_visibility_resolve.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses stdlib
@@ -54,7 +54,7 @@ poison_out(ClusterVisResolve *out)
 	memset(out, 0, sizeof(*out));
 	out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
 	out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
-	out->commit_scn = (SCN) 987654321;
+	out->commit_scn = (SCN)987654321;
 	out->commit_scn_is_bound = true;
 }
 
@@ -63,7 +63,7 @@ make_verdict(ClusterUndoVerdictKind kind, SCN commit_scn)
 {
 	ClusterUndoVerdictResult v = { 0 };
 
-	v.kind = (uint8) kind;
+	v.kind = (uint8)kind;
 	v.commit_scn = commit_scn;
 	return v;
 }
@@ -79,13 +79,13 @@ UT_TEST(test_map_committed_exact)
 
 	poison_out(&out);
 	terminal = cluster_vis_from_undo_verdict(
-		make_verdict(CLUSTER_UNDO_VERDICT_COMMITTED_EXACT, (SCN) 5000), &out);
+		make_verdict(CLUSTER_UNDO_VERDICT_COMMITTED_EXACT, (SCN)5000), &out);
 
-	UT_ASSERT_EQ((int) terminal, 1);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_REMOTE);
-	UT_ASSERT_EQ((int) out.status, (int) CLUSTER_TT_STATUS_COMMITTED);
-	UT_ASSERT_EQ((uint64) out.commit_scn, (uint64) 5000);
-	UT_ASSERT_EQ((int) out.commit_scn_is_bound, 0);
+	UT_ASSERT_EQ((int)terminal, 1);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_REMOTE);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)5000);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 0);
 }
 
 /* ======================================================================
@@ -100,13 +100,13 @@ UT_TEST(test_map_committed_bound_sets_is_bound)
 
 	poison_out(&out);
 	terminal = cluster_vis_from_undo_verdict(
-		make_verdict(CLUSTER_UNDO_VERDICT_COMMITTED_BOUND, (SCN) 6000), &out);
+		make_verdict(CLUSTER_UNDO_VERDICT_COMMITTED_BOUND, (SCN)6000), &out);
 
-	UT_ASSERT_EQ((int) terminal, 1);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_REMOTE);
-	UT_ASSERT_EQ((int) out.status, (int) CLUSTER_TT_STATUS_COMMITTED);
-	UT_ASSERT_EQ((uint64) out.commit_scn, (uint64) 6000);
-	UT_ASSERT_EQ((int) out.commit_scn_is_bound, 1);
+	UT_ASSERT_EQ((int)terminal, 1);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_REMOTE);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)6000);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 1);
 }
 
 /* ======================================================================
@@ -118,14 +118,14 @@ UT_TEST(test_map_aborted)
 	bool terminal;
 
 	poison_out(&out);
-	terminal = cluster_vis_from_undo_verdict(
-		make_verdict(CLUSTER_UNDO_VERDICT_ABORTED, InvalidScn), &out);
+	terminal = cluster_vis_from_undo_verdict(make_verdict(CLUSTER_UNDO_VERDICT_ABORTED, InvalidScn),
+											 &out);
 
-	UT_ASSERT_EQ((int) terminal, 1);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_REMOTE);
-	UT_ASSERT_EQ((int) out.status, (int) CLUSTER_TT_STATUS_ABORTED);
-	UT_ASSERT_EQ((uint64) out.commit_scn, (uint64) InvalidScn);
-	UT_ASSERT_EQ((int) out.commit_scn_is_bound, 0);
+	UT_ASSERT_EQ((int)terminal, 1);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_REMOTE);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)InvalidScn);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 0);
 }
 
 /* ======================================================================
@@ -141,11 +141,11 @@ UT_TEST(test_map_unknown_is_stale_fail_closed)
 	terminal = cluster_vis_from_undo_verdict(
 		make_verdict(CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, InvalidScn), &out);
 
-	UT_ASSERT_EQ((int) terminal, 0);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
-	UT_ASSERT_EQ((int) out.status, (int) CLUSTER_TT_STATUS_UNKNOWN);
-	UT_ASSERT_EQ((uint64) out.commit_scn, (uint64) InvalidScn);
-	UT_ASSERT_EQ((int) out.commit_scn_is_bound, 0);
+	UT_ASSERT_EQ((int)terminal, 0);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)InvalidScn);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 0);
 }
 
 /* ======================================================================
@@ -160,9 +160,9 @@ UT_TEST(test_map_in_progress_is_stale_fail_closed)
 	terminal = cluster_vis_from_undo_verdict(
 		make_verdict(CLUSTER_UNDO_VERDICT_IN_PROGRESS, InvalidScn), &out);
 
-	UT_ASSERT_EQ((int) terminal, 0);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
-	UT_ASSERT_EQ((int) out.status, (int) CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ((int)terminal, 0);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_UNKNOWN);
 }
 
 /* ======================================================================
@@ -175,13 +175,13 @@ UT_TEST(test_map_zero_init_verdict_is_stale)
 	ClusterVisResolve out;
 	bool terminal;
 
-	UT_ASSERT_EQ((int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, 0);
+	UT_ASSERT_EQ((int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, 0);
 
 	poison_out(&out);
 	terminal = cluster_vis_from_undo_verdict(v, &out);
 
-	UT_ASSERT_EQ((int) terminal, 0);
-	UT_ASSERT_EQ((int) out.evidence, (int) CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
+	UT_ASSERT_EQ((int)terminal, 0);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
 }
 
 /* ======================================================================
@@ -194,11 +194,11 @@ UT_TEST(test_map_stale_clears_scn_residue)
 	ClusterVisResolve out;
 
 	poison_out(&out);
-	(void) cluster_vis_from_undo_verdict(
+	(void)cluster_vis_from_undo_verdict(
 		make_verdict(CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, InvalidScn), &out);
 
-	UT_ASSERT_EQ((uint64) out.commit_scn, (uint64) InvalidScn);
-	UT_ASSERT_EQ((int) out.commit_scn_is_bound, 0);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)InvalidScn);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 0);
 }
 
 /* ======================================================================
@@ -206,8 +206,8 @@ UT_TEST(test_map_stale_clears_scn_residue)
  * ====================================================================== */
 UT_TEST(test_origin_corroborated_is_ask)
 {
-	UT_ASSERT_EQ((int) cluster_vis_freshref_origin_decision(2, 2),
-				 (int) CLUSTER_VIS_FRESHREF_ORIGIN_ASK);
+	UT_ASSERT_EQ((int)cluster_vis_freshref_origin_decision(2, 2),
+				 (int)CLUSTER_VIS_FRESHREF_ORIGIN_ASK);
 }
 
 /* ======================================================================
@@ -216,8 +216,8 @@ UT_TEST(test_origin_corroborated_is_ask)
  * ====================================================================== */
 UT_TEST(test_origin_underivable_is_ask_not_failclosed)
 {
-	UT_ASSERT_EQ((int) cluster_vis_freshref_origin_decision(-1, 2),
-				 (int) CLUSTER_VIS_FRESHREF_ORIGIN_ASK);
+	UT_ASSERT_EQ((int)cluster_vis_freshref_origin_decision(-1, 2),
+				 (int)CLUSTER_VIS_FRESHREF_ORIGIN_ASK);
 }
 
 /* ======================================================================
@@ -226,8 +226,8 @@ UT_TEST(test_origin_underivable_is_ask_not_failclosed)
  * ====================================================================== */
 UT_TEST(test_origin_derivable_mismatch_is_stale)
 {
-	UT_ASSERT_EQ((int) cluster_vis_freshref_origin_decision(3, 2),
-				 (int) CLUSTER_VIS_FRESHREF_ORIGIN_STALE);
+	UT_ASSERT_EQ((int)cluster_vis_freshref_origin_decision(3, 2),
+				 (int)CLUSTER_VIS_FRESHREF_ORIGIN_STALE);
 }
 
 int

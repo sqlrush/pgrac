@@ -40,6 +40,7 @@
 #include "utils/timestamp.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D2 HELLO conn_epoch */
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
@@ -600,8 +601,12 @@ rdma_build_private_data(ClusterICRdmaPrivateData *private_data, uint8 lane_type)
 	}
 	private_data->lane_type = lane_type;
 	private_data->capabilities = CLUSTER_IC_RDMA_PRIVATE_CAP_BLOCK_REPLY;
+	/* PGRAC: spec-7.2 D2 — RDMA lanes are CONTROL-plane owned (LMON);
+	 * the DATA plane is TCP-only in 7.2 (RDMA data plane = spec-6.13
+	 * forward).  conn_epoch rides along but is unenforced on CONTROL. */
 	cluster_ic_build_hello(private_data->hello, PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, cluster_name);
+						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, cluster_name,
+						   CLUSTER_IC_PLANE_CONTROL, cluster_epoch_get_current());
 }
 
 static bool

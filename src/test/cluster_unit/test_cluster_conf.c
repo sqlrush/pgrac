@@ -80,6 +80,10 @@ bool cluster_allow_single_node = true; /* spec-2.1 D1; storage stub matches defa
  */
 bool cluster_enabled = true;
 
+/* spec-7.2 flip: post_validate consults the interconnect tier for the
+ * multi-node data_addr gate;  stub = stub tier (gate exempt). */
+int cluster_interconnect_tier = 0;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -247,12 +251,25 @@ UT_TEST(test_rdma_node_field_budgets)
 {
 	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_ADDR_LEN, 64);
 	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_GID_LEN, 40);
-	UT_ASSERT(sizeof(ClusterConf) <= 65536);
+	UT_ASSERT(sizeof(ClusterConf) <= 131072);
 }
 
-UT_TEST(test_conf_size_under_64k)
+/* spec-7.2 D2: budget 64 -> 128 KiB when data_addr joined the node entry
+ * (shmem-only anchor against accidental bloat, not a wire contract). */
+UT_TEST(test_conf_size_under_128k)
 {
-	UT_ASSERT(sizeof(ClusterConf) <= 65536);
+	UT_ASSERT(sizeof(ClusterConf) <= 131072);
+}
+
+/* spec-7.2 D2: data_addr appended to ClusterNodeInfo — budget + the
+ * append-only layout rule (alignment preserved). */
+UT_TEST(test_data_addr_field_budget)
+{
+	ClusterNodeInfo n;
+
+	UT_ASSERT_EQ(sizeof(n.data_addr), CLUSTER_NODE_ADDR_LEN);
+	UT_ASSERT_EQ(sizeof(ClusterNodeInfo) % 8, 0);
+	UT_ASSERT(sizeof(ClusterConf) <= 131072);
 }
 
 
@@ -388,13 +405,14 @@ UT_TEST(test_cluster_enabled_linkable)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
 	UT_RUN(test_node_info_alignment);
 	UT_RUN(test_rdma_node_field_budgets);
-	UT_RUN(test_conf_size_under_64k);
+	UT_RUN(test_conf_size_under_128k);
+	UT_RUN(test_data_addr_field_budget);
 	UT_RUN(test_role_to_string_primary);
 	UT_RUN(test_role_to_string_standby_arbiter);
 	UT_RUN(test_role_from_string_valid);

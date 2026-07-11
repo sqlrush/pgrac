@@ -78,6 +78,7 @@ OBJS = \
 	cluster_gcs.o \
 	cluster_gcs_block.o \
 	cluster_gcs_block_dedup.o \
+	cluster_gcs_block_shard.o \
 	cluster_reconfig.o \
 	cluster_recovery_plan.o \
 	cluster_recovery_worker.o \
@@ -143,6 +144,9 @@ OBJS = \
 	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
+	cluster_lms_data_plane.o \
+	cluster_lms_outbound.o \
+	cluster_lms_shard.o \
 	cluster_lns.o \
 	cluster_membership.o \
 	cluster_mrp.o \
@@ -182,6 +186,7 @@ OBJS = \
 	cluster_undo_cleaner.o \
 	cluster_visibility_resolve.o \
 	cluster_visibility_verdict.o \
+	cluster_writer_chain.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
 	cluster_undo_authority.o \
@@ -222,12 +227,16 @@ OBJS = \
 	cluster_tx_enqueue.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
+	cluster_multixact_served.o \
+	cluster_mxid_stripe.o \
 	cluster_visibility_inject.o \
 	cluster_stats.o \
 	cluster_version.o \
 	cluster_views.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
+	cluster_xid_authority.o \
+	cluster_xid_prehistory.o \
 	cluster_xid_stripe.o \
 	cluster_xid_stripe_boot.o \
 	cluster_xid_stripe_xlog.o \

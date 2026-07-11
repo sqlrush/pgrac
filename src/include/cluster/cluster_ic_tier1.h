@@ -99,6 +99,18 @@ typedef struct ClusterICPeerStateShmem {
 	 * close.
 	 */
 	pg_atomic_uint32 close_requested; /* 0 = idle, 1 = pending close */
+
+	/*
+	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH) — the cluster epoch this
+	 * connection was established under (recorded at the CONNECTED
+	 * transition;  DATA plane only, CONTROL leaves it 0/unenforced).
+	 * The DATA physical-send gate refuses to put bytes on a connection
+	 * whose conn_epoch != current epoch — an epoch bump structurally
+	 * invalidates the old stream and forces close + re-HELLO, so a new
+	 * epoch's frames can never interleave into an old epoch's byte
+	 * stream.  Written and read by the owning plane's process only.
+	 */
+	uint64 conn_epoch;
 } ClusterICPeerStateShmem;
 
 /*
@@ -132,6 +144,42 @@ extern void cluster_ic_tier1_shmem_register(void);
  * to caller for direct LMON WaitEventSet registration.
  */
 extern int cluster_ic_tier1_listener_bind(void);
+
+/*
+ * PGRAC: spec-7.2 D2 — re-aim this process's tier1 working state at a
+ * plane ([0] = CONTROL, [1] = DATA inside the single tier1 region).
+ * Call once at aux-process entry BEFORE any tier1 use (LmsMain → DATA);
+ * processes that never call it stay on CONTROL (LMON, backends, SQL
+ * observers — the historic instance and contract).
+ */
+extern void cluster_ic_tier1_set_my_plane(ClusterICPlane plane);
+extern ClusterICPlane cluster_ic_tier1_my_plane(void);
+
+/*
+ * PGRAC: spec-7.3 D3 — the DATA plane is parallelised across per-worker
+ * channels.  CLUSTER_IC_TIER1_DATA_CHANNELS is the compile-time cap on DATA
+ * worker channels the transport carves shmem for (one ClusterICTier1Shmem
+ * instance each, so every worker has private peers[] / listener metadata and
+ * the send-gate is not clobbered across worker processes).  It must be >=
+ * the LMS worker cap CLUSTER_LMS_MAX_WORKERS (asserted in cluster_lms.c).
+ *
+ *	Channel 0 is worker 0 (the LmsProcess DATA plane) and keeps the spec-7.2
+ *	shmem offset, so cluster.lms_workers = 1 is byte-identical to spec-7.2.
+ *
+ * set_my_data_channel(channel, n_workers) implies the DATA plane and re-aims
+ * this process's tier1 working state at channel's private instance;  the
+ * listener/dial port become (declared data port + channel), and the HELLO
+ * carries (channel as worker_id, n_workers) for the D3 negotiation.  A DATA
+ * process that only calls set_my_plane(DATA) stays on channel 0 (worker 0).
+ */
+#define CLUSTER_IC_TIER1_DATA_CHANNELS 8
+extern void cluster_ic_tier1_set_my_data_channel(int channel, int n_workers);
+extern int cluster_ic_tier1_my_data_channel(void);
+extern int cluster_ic_tier1_my_n_workers(void);
+
+/* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */
+extern void cluster_ic_tier1_bump_plane_misroute_reject(void);
+extern uint64 cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane);
 
 /*
  * Accept exactly one pending connection on the listener fd.  Returns

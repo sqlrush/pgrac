@@ -45,7 +45,9 @@
 #include <unistd.h>
 
 #include "access/xlog_internal.h" /* XLOGDIR */
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_hw.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
@@ -385,8 +387,23 @@ cluster_wal_thread_init(void)
 		cluster_wal_thread_shmem->dir_configured = dir_set ? 1 : 0;
 	}
 
-	if (!dir_set)
+	if (!dir_set) {
+		if (cluster_shared_catalog && cluster_conf_has_peers())
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster.shared_catalog requires cluster.wal_threads_dir in a "
+							"multi-node cluster"),
+					 errhint("Set cluster.wal_threads_dir to the shared per-thread WAL root and "
+							 "initialise each node with pgrac-init --wal-threads-dir.")));
+		if (!cluster_hw_remaster_recoverable())
+			ereport(WARNING,
+					(errmsg("cluster HW remaster is not recoverable because "
+							"cluster.wal_threads_dir is unset"),
+					 errhint("A dead node's adopted HW authority cannot be rebuilt from per-thread "
+							 "WAL until cluster.wal_threads_dir is configured and the node is "
+							 "restarted.")));
 		return; /* flat layout: identity stamping only (Q3-A) */
+	}
 
 	/*
 	 * Configuration coherence, fail-closed (L58: enumerate the

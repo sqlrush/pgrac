@@ -207,6 +207,9 @@ UT_TEST(test_gate_raw_compare_traps)
 }
 
 int
+/* cppcheck-suppress constParameter
+ * Reason: main() keeps the standard test harness signature used by the
+ * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
 	/* stand-in for cluster_pi_shadow_shmem_init over malloc-backed memory */

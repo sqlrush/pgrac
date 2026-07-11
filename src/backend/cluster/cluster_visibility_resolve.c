@@ -121,8 +121,59 @@ cluster_vis_resolve_abort_reset(void)
  * caller fail-closes; the evidence stays REMOTE so there is no PG-native
  * fallback, C-V2).
  */
+/*
+ * resolve_live_overlay_miss_via_origin -- spec-7.1a D4 (live overlay pull).
+ *
+ *	A LIVE remote ITL ref (slot still bound to raw_xid) whose overlay lookup
+ *	missed used to stay UNKNOWN forever when the origin's tt_status_hint
+ *	propagation was lost (HC181: fail-closed but never self-healing; gaps
+ *	§C.3).  Pull the origin's complete own-TT verdict on demand instead --
+ *	the same shipped live-IC verdict machinery the recycled-slot path uses
+ *	(no shared-undo data plane involved; the origin answers only for its own
+ *	xids and only with terminal outcomes).  A genuinely in-progress holder
+ *	still resolves UNKNOWN here (no verdict is served) and the caller keeps
+ *	the fail-closed retry, which converges once the holder terminates.
+ *
+ *	Fills *out and installs the exact-key memo only for exact (non-bound)
+ *	terminal outcomes; a below-horizon bound is snapshot-relative and is
+ *	returned with commit_scn_is_bound so the consumer never stamps it.
+ */
 static void
-resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+resolve_live_overlay_miss_via_origin(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+									 SCN read_scn, const ClusterTTStatusKey *key,
+									 ClusterVisResolve *out)
+{
+	bool committed = false;
+	SCN scn = InvalidScn;
+	bool is_bound = false;
+
+	if (!cluster_crossnode_write_write)
+		return; /* keep the pre-7.1a UNKNOWN floor byte-identical */
+	if ((int32)ref->origin_node_id == cluster_node_id)
+		return;
+
+	if (!cluster_runtime_visibility_try_resolve_remote(
+			(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid, read_scn,
+			false /* keep the serve-side stripe self-check (pre-D6-7 behavior) */, &committed, &scn,
+			&is_bound))
+		return; /* stay UNKNOWN -> caller 53R97 fail-closed */
+
+	cluster_vis_bump_overlay_refresh_count(); /* spec-7.1a D6 */
+	if (committed) {
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = scn;
+		out->commit_scn_is_bound = is_bound;
+		if (!is_bound)
+			cluster_vis_memo_install(key, (uint8)CLUSTER_TT_STATUS_COMMITTED, scn);
+	} else {
+		out->status = CLUSTER_TT_STATUS_ABORTED;
+		out->commit_scn = InvalidScn;
+		cluster_vis_memo_install(key, (uint8)CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	}
+}
+
+static void
+resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, SCN read_scn,
 						ClusterVisResolve *out)
 {
 	ClusterTTStatusKey key;
@@ -191,6 +242,9 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	if (!cluster_tt_status_lookup_exact(&key, &result) || !result.authoritative) {
 		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
+		/* PGRAC: spec-7.1a D4 -- overlay miss on a LIVE remote ref: pull the
+		 * origin verdict instead of staying UNKNOWN forever (HC181). */
+		resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;					   /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
 	}
@@ -207,6 +261,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 		out->status = CLUSTER_TT_STATUS_UNKNOWN;
 		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
+		/* PGRAC: spec-7.1a D4 -- subtrans-chain miss: same origin pull. */
+		resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;
 	}
@@ -445,7 +501,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				bool is_bound = false;
 
 				if (cluster_runtime_visibility_try_resolve_remote(
-						derived_origin, (uint32)ref->undo_segment_id, raw_xid, anchor_lsn, read_scn,
+						derived_origin, (uint32)ref->undo_segment_id, raw_xid, read_scn,
 						false /* derived origin: keep the stripe self-check (6.12i P0) */,
 						&committed, &scn, &is_bound)) {
 					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
@@ -465,7 +521,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 		return;
 	}
 
-	resolve_from_remote_ref(raw_xid, ref, out);
+	resolve_from_remote_ref(raw_xid, ref, read_scn, out);
 
 	/*
 	 * PGRAC: spec-5.22f D6-2 — fresh-remote-ITL-ref widening (root-cause #1
@@ -513,10 +569,9 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * internally (cluster_runtime_visibility.c:424/427/444/446/449), so
 			 * the dedicated fresh-ref counter is the ONLY extra bump here -- an
 			 * explicit rtvis_resolve_note here would double-count. */
-			ClusterUndoVerdictResult v
-				= cluster_undo_verdict_resolve((int)ref->origin_node_id,
-											   (uint32)ref->undo_segment_id, raw_xid, anchor_lsn,
-											   read_scn, true /* fresh ref: physical-binding authority */);
+			ClusterUndoVerdictResult v = cluster_undo_verdict_resolve(
+				(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid, read_scn,
+				true /* fresh ref: physical-binding authority */);
 
 			if (cluster_vis_from_undo_verdict(v, out)) {
 				cluster_vis_freshref_verdict_note_resolved();

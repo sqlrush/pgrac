@@ -181,6 +181,17 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* spec-4.6a Amendment v1.2 (R5): linker-only exception-stack stubs (the
+ * linked cluster_pcm_lock.o now wraps the S->X upgrade in PG_TRY). */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 static BufferTag
 make_tag(uint32 blockno)
 {

@@ -98,15 +98,19 @@ sub write_pair_conf
 	my ($node0, $node1, $cluster_name) = @_;
 	my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 	my $conf = <<EOC;
 [cluster]
 name = $cluster_name
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 
 	PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $conf);
@@ -239,6 +243,10 @@ $primary0->append_conf('postgresql.conf', $primary_common_conf);
 $primary0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $primary1->append_conf('postgresql.conf', $primary_common_conf);
 $primary1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3: pin the pool BEFORE the primaries start (the block further down
+# runs after ->start and cannot help them) -- one data port per node here.
+$primary0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$primary1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 write_pair_conf($primary0, $primary1, 'adg2_primary');
 $primary0->start;
 $primary1->start;
@@ -287,6 +295,13 @@ $standby0->append_conf('postgresql.conf',
 	'cluster.adg_rfs_conninfos = ' . quote_conf($rfs_conninfos) . "\n");
 $standby1->append_conf('postgresql.conf', $standby_common_conf);
 $standby1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$standby0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$standby1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 write_pair_conf($standby0, $standby1, 'adg2_standby');
 
 $standby0->start;

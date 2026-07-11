@@ -415,6 +415,12 @@ extern void cluster_pcm_lock_clear_pending_x(BufferTag tag);
 extern int32 cluster_pcm_lock_query_pending_x_requester(BufferTag tag);
 extern uint64 cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node);
 
+/* PGRAC: spec-4.6a BUG-C2 — failure-path PCM holder cleanup.  Removes a
+ * DEAD node from X/S/PI holder records in this master's PCM directory and
+ * demotes entries to N when no live holder remains.  Idempotent under repeated
+ * dead-sweep ticks. */
+extern uint64 cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node);
+
 /* PGRAC: spec-5.13 D5 (clean-leave PCM release) — a leaving node clears its
  * OWN holder records (X / S / PI) from the local PCM directory after the GCS
  * flush seam has persisted all dirty X blocks (CL-I5).  Demotes an entry's

@@ -110,6 +110,9 @@ sub poll_ok
 sub scn_time
 {
 	my ($v) = @_;
+	# 56-bit mask; the literal exceeds 32 bits so silence the (harmless on
+	# this 64-bit Perl) non-portable-hex warning rather than emit it every run.
+	no warnings 'portable';
 	return $v & 0x00FFFFFFFFFFFFFF;
 }
 

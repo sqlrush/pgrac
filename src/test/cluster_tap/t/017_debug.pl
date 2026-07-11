@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'all 55 categories appear (spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog; L122 alphabetic verify)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'all 56 categories appear (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog; L122 alphabetic verify)');
 
 
 # ----------
@@ -123,15 +123,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'158',
-	'all 158 injection points have a .fault_type entry under inject category (spec-6.14 D5 +2 cluster-relmap-crash-*; spec-6.14 D8 +1 cluster-catalog-services-ready-force-closed; spec-5.6a +1 cluster-recovery-anchor-force-failclosed; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'167',
+	'all 167 injection points have a .fault_type entry (spec-5.22e D5-7 +2; spec-5.22d D4-8 +1; merge sum with 7.x lanes) under inject category (spec-7.3 review P1-1 +1 cluster-lms-cr-fence-recheck; spec-7.1 D3-a +1 cluster-mxid-halfspace-hard-limit; spec-7.3 D7 +1 cluster-lms-cr-fence-refuse; spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5 +2 cluster-relmap-crash-*; spec-6.14 D8 +1 cluster-catalog-services-ready-force-closed; spec-5.6a +1 cluster-recovery-anchor-force-failclosed; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'158',
-	'all 158 injection points have a .hits entry under inject category (spec-6.14 D5 +2 cluster-relmap-crash-*; spec-6.14 D8 +1 cluster-catalog-services-ready-force-closed; spec-5.6a +1 cluster-recovery-anchor-force-failclosed; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
+	'167',
+	'all 167 injection points have a .hits entry (spec-5.22e D5-7 +2; spec-5.22d D4-8 +1; merge sum with 7.x lanes) under inject category (spec-7.3 review P1-1 +1 cluster-lms-cr-fence-recheck; spec-7.1 D3-a +1 cluster-mxid-halfspace-hard-limit; spec-7.3 D7 +1 cluster-lms-cr-fence-refuse; spec-7.2 D6 +2 cluster-lms-data-dispatch + cluster-lms-conn-reset; spec-6.14 D5 +2 cluster-relmap-crash-*; spec-6.14 D8 +1 cluster-catalog-services-ready-force-closed; spec-5.6a +1 cluster-recovery-anchor-force-failclosed; spec-6.12e2 +1 cluster-gcs-block-bast-nudge; spec-6.15 D3 +2 herding-stall + window-hard-limit; spec-6.12i +1 cluster-lms-undo-fetch; spec-6.12b +1 cluster-lms-cr-construct; spec-6.12a ㉕ +1 cluster-gcs-block-remote-downgrade; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2; spec-5.13 H1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
 
 
 # ----------
@@ -157,8 +157,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'121',
-	'pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+	'123',
+	'pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 $node->stop;
 

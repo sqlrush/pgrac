@@ -171,8 +171,8 @@ $stub_node->stop;
 is( $node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-		'121',
-		'pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+		'123',
+		'pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 $node->stop;
 

@@ -744,6 +744,28 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 			return CLUSTER_ITL_SLOT_UNALLOCATED; /* OVERFLOW */
 
 		slot = &slots[idx];
+		/*
+		 * spec-7.1 watch-2 (spec-3.10 §v0.5 parity; latent since spec-3.6):
+		 * evicting a completed DATA slot for a marker drops that slot's
+		 * undo-chain anchor from the per-page CR candidate set exactly like a
+		 * data-writer recycle, so fold its write_scn into the recycle
+		 * watermark BEFORE overwriting -- otherwise own-instance CR silently
+		 * reconstructs post-snapshot versions the dropped anchor guarded
+		 * (false-visible).  new_xid = InvalidTransactionId: the new occupant
+		 * is a MultiXactId, not a data writer, and a completed data slot
+		 * never holds InvalidTransactionId, so the helper's same-xid reuse
+		 * exemption cannot mis-fire on a numeric xid/multixact-id collision.
+		 * FREE / completed lock-only evictions contribute InvalidScn (§v0.5
+		 * B2/Q1) and stay no-ops.  Crash parity holds without a redo change:
+		 * the marker write never travels as an ITL delta (heap_lock_tuple
+		 * keeps cluster_did_lock_stamp false for the marker branch), so the
+		 * eviction and the fold move atomically with the page image --
+		 * FPI/flush carries both, a lost page keeps the old slot as its own
+		 * CR anchor, and the redo-side ACTIVE-only fold stays exact.
+		 */
+		cluster_itl_block_watermark_advance(
+			page, cluster_itl_recycle_watermark_contribution(
+					  slot->flags, slot->xid, slot->write_scn, InvalidTransactionId));
 		if (slot->flags != ITL_FLAG_FREE)
 			slot->wrap++;
 		slot->xid = (TransactionId)multixact_id; /* repurposed as MultiXactId */
@@ -773,8 +795,13 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
  *	reusing its own slot, and lock-only slots (which create no tuple versions
  *	and carry InvalidScn write_scn) contribute nothing (§v0.5 B2 / Q1).
  *
- *	Shared by cluster_itl_stamp_active (primary) and
- *	cluster_itl_redo_apply_block_local_delta (redo) so a primary and a
+ *	Shared by cluster_itl_stamp_active (primary),
+ *	cluster_itl_redo_apply_block_local_delta (redo) and
+ *	cluster_itl_stamp_multixact_marker (spec-7.1 watch-2: a marker eviction
+ *	drops a data slot's undo anchor just like a data-writer recycle;  it
+ *	passes new_xid = InvalidTransactionId since its new occupant is a
+ *	MultiXactId, not a data writer, so the same-xid exemption below cannot
+ *	mis-fire on a numeric xid/multixact-id collision) so a primary and a
  *	crash-recovered / standby node can never diverge on which recycles bump
  *	the watermark (refinement of §v0.5 B5: redo recomputes the watermark from
  *	the same inputs the primary used, mirroring the existing pd_block_scn

@@ -90,7 +90,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
 #include "cluster/cluster_xnode_profile.h"	   /* PGRAC: spec-5.59 D7 profiling */
-#include "cluster/cluster_undo_horizon.h" /* epoch fence (spec-5.22e F-D2) */
+#include "cluster/cluster_undo_horizon.h"	   /* epoch fence (spec-5.22e F-D2) */
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
 

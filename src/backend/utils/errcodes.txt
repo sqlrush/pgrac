@@ -884,6 +884,23 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # the first own checkpoint).
 53RB3    E    ERRCODE_CLUSTER_RECOVERY_ANCHOR_UNAVAILABLE                      cluster_recovery_anchor_unavailable
 
+# spec-7.1 D3-a:  striped multixact id allocation refused because the
+# candidate would leave the half-space [floor, floor + 2^31) above the
+# durable mxid activation floor -- beyond it the 32-bit wraparound makes
+# origin derivation ambiguous, so the allocator fails closed instead of
+# ever letting the derivation window alias (rule 8.A).
+53RB4    E    ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT                            cluster_mxid_halfspace_limit
+# spec-6.15b:  shared XID authority / native-era prehistory unavailable.
+# Under cluster.shared_catalog=on a joiner must reconcile its transaction
+# horizon against the sealed shared XID authority and adopt the native-era
+# prehistory (pg_xact truth for pre-formation seed xids); a missing,
+# unsealed or corrupt authority/prehistory fails closed rather than judge
+# seed rows through a stale horizon or a truthless local CLOG.  Also raised
+# when a cluster.enabled=off boot tries to re-enter the native seed era on
+# a formed cluster's shared tree.  (53RB4 is claimed by the spec-7.1 lane's
+# ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT; do not reuse.)
+53RB5    E    ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE                        cluster_xid_authority_unavailable
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
