@@ -1835,16 +1835,20 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 	if (tier1_peer_fds[peer_id] >= 0) {
 		(void)close(tier1_peer_fds[peer_id]);
 		tier1_peer_fds[peer_id] = -1;
-	}
 
-	/*
-	 * spec-5.22e D5-2 (Q1' amend): HELLO capabilities are a property of the
-	 * connection that carried them.  Clear them in the close funnel so no
-	 * consumer (horizon sender/fold, authority routing, smart fusion) trusts
-	 * a stale capability across the reconnect window; the next verified
-	 * HELLO repopulates.
-	 */
-	cluster_sf_note_peer_disconnected(peer_id);
+		/*
+		 * spec-5.22e D5-2 (Q1' amend): HELLO capabilities are a property of
+		 * the connection that carried them.  Clear them when an ESTABLISHED
+		 * fd is torn down so no consumer (horizon sender/fold, authority
+		 * routing, smart fusion) trusts a stale capability across the
+		 * reconnect window; the next verified HELLO repopulates.  Scoped
+		 * INSIDE the fd guard: close_peer is also called defensively for
+		 * failed dials and duplicate-connection tie-breaks where no
+		 * established link existed -- wiping the surviving connection's
+		 * capabilities there would zero them with no new HELLO to renote.
+		 */
+		cluster_sf_note_peer_disconnected(peer_id);
+	}
 
 	if (Tier1Shmem != NULL) {
 		if (reason != NULL && reason[0] != '\0')

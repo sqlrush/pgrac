@@ -73,8 +73,22 @@ cluster_sf_dep_shmem_size(void)
 {
 	int max_entries;
 
-	if (IsBootstrapProcessingMode() || !cluster_enabled || !cluster_smart_fusion)
+	if (IsBootstrapProcessingMode() || !cluster_enabled)
 		return 0;
+
+	/*
+	 * spec-5.22e D5-2 (latent-bug fix): the header carries the HELLO
+	 * capability store (peer_capabilities + lock), which the undo-horizon
+	 * sender/fold, the D4 authority routing gate AND smart fusion all
+	 * consume -- it must exist in EVERY cluster build.  Sizing the whole
+	 * region to zero under smart_fusion=off (the default) silently killed
+	 * every capability query (ClusterSfDep == NULL reads as "no
+	 * capability"); the D4 peer-authority gate never noticed only because
+	 * its 2-node e2e covers the SELF-authority leg.  Only the dep-vector
+	 * slot array stays smart-fusion-gated.
+	 */
+	if (!cluster_smart_fusion)
+		return MAXALIGN(offsetof(ClusterSfDepShared, slots));
 
 	max_entries = NBuffers > 0 ? NBuffers : 1;
 	return MAXALIGN(offsetof(ClusterSfDepShared, slots)
@@ -96,7 +110,8 @@ cluster_sf_dep_shmem_init(void)
 		int i;
 
 		LWLockInitialize(&ClusterSfDep->lock, LWTRANCHE_CLUSTER_SMART_FUSION);
-		ClusterSfDep->max_entries = NBuffers > 0 ? NBuffers : 1;
+		/* slots exist only under smart_fusion (see shmem_size) */
+		ClusterSfDep->max_entries = cluster_smart_fusion ? (NBuffers > 0 ? NBuffers : 1) : 0;
 		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++)
 			ClusterSfDep->origin_durable[i] = InvalidXLogRecPtr;
 		for (i = 0; i < CLUSTER_MAX_NODES; i++)
