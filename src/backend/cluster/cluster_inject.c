@@ -787,6 +787,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *     exercise the fail-closed leg + guardrail counter).
 	 */
 	{ .name = "cluster-mxid-halfspace-hard-limit" },
+
+	/*
+	 * spec-7.4 D1-2 — durable-frontier commit-event publish.
+	 *   cluster-boc-event-publish: armed-state peek (any fault type)
+	 *     suppresses the commit-side BOC event signal (no dirty flag,
+	 *     no LMON wakeup), degrading propagation to the walwriter
+	 *     sweep cadence.  Drives the t/387 L2 sweep-fallback leg and
+	 *     the L3 commit-unperturbed leg.  Armed-peek style (no
+	 *     CLUSTER_INJECTION_POINT dispatch) because the probe sits on
+	 *     the post-commit path where an armed ERROR/CRASH dispatch
+	 *     could fire after the commit record is already durable.
+	 */
+	{ .name = "cluster-boc-event-publish" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

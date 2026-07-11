@@ -169,7 +169,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	 * address in standalone unit tests. */
 	static union {
 		uint64 force_align;
-		char data[8192]; /* generous;  cluster_scn_shmem_size() << 8KB */
+		char data[16384]; /* generous;  spec-7.4 D1 grew the state past 8KB
+		                   * (durable frontier registry + remote cache) */
 	} scn_buf;
 	static bool scn_initialized = false;
 
@@ -241,6 +242,15 @@ cluster_injection_should_skip(const char *p pg_attribute_unused())
 {
 	return false;
 }
+/* spec-7.4 D1-2: cluster_scn.c's boc-event-publish probe uses the
+ * armed-state peek; this binary never arms, so always report unarmed. */
+bool
+cluster_cr_injection_armed(const char *p pg_attribute_unused(), uint64 *out_param)
+{
+	if (out_param != NULL)
+		*out_param = 0;
+	return false;
+}
 void
 cluster_injection_check(const char *p pg_attribute_unused())
 {}
@@ -248,8 +258,9 @@ cluster_injection_check(const char *p pg_attribute_unused())
 /* fmgr stub for SQL UDFs (address-only) */
 struct FunctionCallInfoBaseData;
 
-/* injection extras (cluster_scn.c references run + armed_count) */
-pg_atomic_uint32 cluster_injection_armed_count;
+/* injection extras (cluster_scn.c references run + armed_count; the gate
+ * is a plain int in cluster_inject.h, mirror that here). */
+int cluster_injection_armed_count;
 void
 cluster_injection_run(const char *p pg_attribute_unused())
 {}
@@ -342,6 +353,30 @@ cluster_conf_node_count(void)
 #include "miscadmin.h"
 volatile uint32 CritSectionCount = 0;
 BackendType MyBackendType = B_LMON;
+
+/* spec-7.4 D1 / L104: cluster_scn.o boc_tick now calls GetFlushRecPtr
+ * for the walwriter async-commit frontier discharge.  Standalone unit
+ * binaries link cluster_scn.o only;  stub returns 0 (InvalidXLogRecPtr)
+ * so discharge_upto is a guarded no-op unless a test drives the API
+ * directly with explicit horizons. */
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *insertTLI)
+{
+	if (insertTLI != NULL)
+		*insertTLI = 0;
+	return 0;
+}
+
+/* spec-7.4 D1-2 / L104: cluster_scn.o now references the event-publish
+ * GUC and the LMON wakeup helper (cluster_lmon.o not linked here).
+ * Event-protocol behavior tests live in test_cluster_scn_frontier.c;
+ * these stubs only satisfy the linker (wakeup vacuous, GUC on). */
+bool cluster_boc_event_publish = true;
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

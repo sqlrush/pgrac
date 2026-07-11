@@ -121,6 +121,16 @@ cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
 	return "stub";
 }
 
+/* spec-7.4 D4 stubs: dump_xnode_profile now also builds the commit-latency
+ * histogram key labels (component name + μs edge schema); the SRF body that
+ * calls them is never invoked by the unit test. */
+const char *
+cluster_xp_hist_component_name(ClusterXpHistComponent c pg_attribute_unused())
+{
+	return "stub";
+}
+const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = { CLXP_HIST_EDGES_US };
+
 /* spec-6.12 stub: dump_xnode_lever reads this pointer (NULL -> all-zero
  * rows); the unit harness does not link cluster_xnode_lever.o. */
 ClusterXnodeLeverShared *ClusterXnodeLeverCtl = NULL;
@@ -3340,6 +3350,19 @@ cluster_scn_boc_broadcast_fanout_count(void)
 	return 0;
 }
 
+/* spec-7.4 D4 stubs: cluster_debug emit_row references the event-vs-sweep
+ * balance accessors; test_cluster_debug does not link cluster_scn.o. */
+uint64
+cluster_scn_boc_event_publish_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_sweep_fallback_count(void)
+{
+	return 0;
+}
+
 /* spec-2.11 D5 / L104 stub: cluster_debug emit_row references new
  * spec-2.11 cluster_scn module accessor;test_cluster_debug standalone
  * binary doesn't link cluster_scn.o,vacuous stub. */
@@ -3359,6 +3382,59 @@ cluster_scn_last_observe_at(void)
 	return 0;
 }
 
+/* Spec-7.4 D1 durable frontier / BOC payload accessor stubs. */
+SCN
+cluster_scn_durable_safe_scn(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_durable_pending_count(void)
+{
+	return 0;
+}
+bool
+cluster_scn_durable_frontier_frozen(void)
+{
+	return false;
+}
+uint64
+cluster_scn_durable_frontier_overflow_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_durable_frontier_regression_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_accept_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_bad_length_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_node_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_regression_count(void)
+{
+	return 0;
+}
+bool
+cluster_scn_remote_durable_safe(NodeId origin pg_attribute_unused(),
+								uint64 *epoch_out pg_attribute_unused(),
+								SCN *scn_out pg_attribute_unused())
+{
+	return false;
+}
 uint64
 cluster_scn_observed_max_observe_gap_ms(void)
 {

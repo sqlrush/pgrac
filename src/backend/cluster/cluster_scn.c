@@ -54,8 +54,10 @@
 #include "cluster/cluster_ic_envelope.h" /* ClusterICEnvelope (spec-2.9 D3) */
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope_fanout + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_lmon.h"	/* cluster_lmon_marker_complete_wakeup (spec-7.4 D1-2) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
+#include "access/xlog.h"				   /* GetFlushRecPtr (spec-7.4 D1 walwriter discharge) */
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -119,6 +121,17 @@ typedef struct ClusterScnSharedState {
 	 */
 	pg_atomic_uint64 boc_broadcast_fanout_count;
 	/*
+	 * spec-7.4 D4:  event-vs-sweep balance observability.
+	 * boc_event_publish_count bumps at the commit-event 0->1 dirty transition
+	 * (a commit event drove an LMON wakeup);  boc_sweep_fallback_count bumps
+	 * when the periodic sweep drain fired with no commit event pending (the
+	 * timer backstop covered a gap, or the event path was off/suppressed).
+	 * Their ratio measures how much the event cadence carries vs the sweep
+	 * backstop (spec-7.4 R2 diagnostic).
+	 */
+	pg_atomic_uint64 boc_event_publish_count;
+	pg_atomic_uint64 boc_sweep_fallback_count;
+	/*
 	 * spec-2.11 D3:  cross-instance commit_scn lookup invocation defer
 	 * counter.
 	 *
@@ -163,6 +176,58 @@ typedef struct ClusterScnSharedState {
 	pg_atomic_uint64 adg_pending_register_count;
 	pg_atomic_uint64 adg_pending_clear_count;
 	pg_atomic_uint64 adg_pending_overflow_count;
+	/*
+	 * spec-7.4 D1: durable_safe_scn frontier registry (own origin).
+	 *
+	 *	Tracks commit SCNs allocated but not yet proven durable, so the
+	 *	published frontier stays a CONTIGUOUS durability claim:  every
+	 *	own-origin commit SCN <= durable_safe_scn is durable on WAL.  A
+	 *	plain atomic-max of flushed commit SCNs would falsely cover a
+	 *	stalled earlier allocation (P0;  mini-plan v1.1 §1.1).
+	 *
+	 *	durable_pending_scn/lsn are parallel arrays under lwlock (lsn is
+	 *	InvalidXLogRecPtr until the commit record is inserted).  Overflow
+	 *	freezes the frontier stickily (until restart);  consumers fall
+	 *	back to the fetch-reply piggyback sampling.  durable_safe_scn is
+	 *	read lock-free (single u64;  monotonic under the lock).
+	 */
+	uint16 durable_pending_count;
+	bool durable_frozen;
+	SCN durable_pending_scn[CLUSTER_SCN_DURABLE_PENDING_MAX];
+	XLogRecPtr durable_pending_lsn[CLUSTER_SCN_DURABLE_PENDING_MAX];
+	SCN durable_last_allocated;
+	pg_atomic_uint64 durable_safe_scn;
+	pg_atomic_uint64 durable_overflow_count;
+	pg_atomic_uint64 durable_regression_count;
+	/*
+	 * spec-7.4 D1: per-origin remote durable frontier cache.
+	 *
+	 *	{epoch, scn} pairs consistency-protected by a per-origin seqlock
+	 *	(remote_durable_seq;  odd = write in progress).  Single writer:
+	 *	the LMON dispatch running the BOC handler.  Readers bounded-spin
+	 *	and fall back (return false) rather than blocking -- the write
+	 *	side has no failure point between seq bumps, and a crashed LMON
+	 *	takes the whole cluster through PG crash-restart (shmem rebuilt),
+	 *	so a stuck-odd seqlock cannot outlive its readers.
+	 */
+	pg_atomic_uint32 remote_durable_seq[CLUSTER_MAX_NODES];
+	uint64 remote_durable_epoch[CLUSTER_MAX_NODES];
+	SCN remote_durable_scn[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 boc_payload_accept_count;
+	pg_atomic_uint64 boc_payload_bad_length_count;
+	pg_atomic_uint64 boc_payload_node_mismatch_count;
+	pg_atomic_uint64 boc_payload_regression_count;
+	/*
+	 * spec-7.4 D1-2: commit-event publish protocol.  Producer (any
+	 * discharge path that ADVANCES the published frontier):  publish
+	 * under the lwlock -> exchange-set dirty -> wake LMON only on the
+	 * 0->1 transition (publish-before-signal, L387;  the exchange makes
+	 * concurrent producers race-free on the single wakeup).  Consumer
+	 * (LMON drain):  exchange-clear dirty BEFORE snapshotting the
+	 * frontier, so a publish racing past the snapshot re-arms a wakeup
+	 * instead of being lost.
+	 */
+	pg_atomic_uint32 boc_event_dirty;
 } ClusterScnSharedState;
 
 /* spec-2.12 D2:  defensive — raw-bits storage of TimestampTz in
@@ -174,12 +239,18 @@ StaticAssertDecl(sizeof(TimestampTz) == sizeof(uint64),
 
 static ClusterScnSharedState *cluster_scn_state = NULL;
 static SCN cluster_scn_backend_pending_commit_scn = InvalidScn;
+/* spec-7.4 D1: this backend's in-flight durable-pending commit SCN. */
+static SCN cluster_scn_backend_durable_pending_scn = InvalidScn;
 
 /* WARNING throttle: at most 1/min */
 static TimestampTz last_warn_emitted_at = 0;
 
 static bool cluster_scn_pending_commit_register_locked(SCN commit_scn);
 static bool cluster_scn_pending_commit_remove_locked(SCN commit_scn);
+static void cluster_scn_durable_pending_register_locked(SCN commit_scn);
+static bool cluster_scn_durable_pending_remove_locked(SCN commit_scn);
+static bool cluster_scn_durable_frontier_publish_locked(void);
+static void cluster_scn_boc_event_signal(void);
 
 
 /*
@@ -627,7 +698,7 @@ cluster_scn_advance_for_commit(void)
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-pre-advance");
 
-	if (cluster_enable_adg) {
+	{
 		NodeId node;
 
 		Assert(cluster_scn_state != NULL);
@@ -637,6 +708,13 @@ cluster_scn_advance_for_commit(void)
 		 * SCN before the pending registry can see it.  The normal
 		 * cluster_scn_advance() hot path publishes with fetch_add first, so
 		 * ADG commit advance uses a register-before-CAS reservation loop.
+		 *
+		 * spec-7.4 D1 extends the same invariant to the durable frontier:
+		 * an allocated commit SCN must be in the durable pending registry
+		 * BEFORE it becomes observable, or a concurrent discharge could
+		 * publish a frontier past it (the atomic-max P0).  The reservation
+		 * loop therefore runs for EVERY commit advance;  the ADG registry
+		 * registration inside it stays gated on cluster_enable_adg.
 		 *
 		 * Other, non-commit SCN advances may still race through the lock-free
 		 * path.  A failed CAS removes only this backend's tentative entry and
@@ -669,7 +747,9 @@ cluster_scn_advance_for_commit(void)
 				continue;
 			}
 
-			(void)cluster_scn_pending_commit_register_locked(scn);
+			if (cluster_enable_adg)
+				(void)cluster_scn_pending_commit_register_locked(scn);
+			cluster_scn_durable_pending_register_locked(scn);
 
 			expected = old_local;
 			if (pg_atomic_compare_exchange_u64(&cluster_scn_state->current_local_scn, &expected,
@@ -678,11 +758,12 @@ cluster_scn_advance_for_commit(void)
 				break;
 			}
 
-			(void)cluster_scn_pending_commit_remove_locked(scn);
+			if (cluster_enable_adg)
+				(void)cluster_scn_pending_commit_remove_locked(scn);
+			(void)cluster_scn_durable_pending_remove_locked(scn);
 			LWLockRelease(&cluster_scn_state->lwlock);
 		}
-	} else
-		scn = cluster_scn_advance();
+	}
 	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-post-advance");
@@ -911,6 +992,385 @@ cluster_scn_adg_pending_overflowed(void)
 }
 
 /*
+ * ============================================================
+ * spec-7.4 D1: durable_safe_scn frontier registry.
+ * ============================================================
+ *
+ *	Register at commit-SCN allocation (inside the reservation loop in
+ *	cluster_scn_advance_for_commit, under lwlock), fill in the commit
+ *	record LSN once XactLogCommitRecord returns, discharge on one of
+ *	three paths:
+ *
+ *	  (a) sync commit -- the committing backend proved its own record
+ *	      durable via XLogFlush;  it discharges by SCN after leaving
+ *	      the commit critical section.
+ *	  (b) async commit -- walwriter discharges every entry whose LSN
+ *	      is at or below the background-flush horizon.
+ *	  (c) abort -- allocation never became a commit;  remove it so the
+ *	      frontier is not blocked forever.
+ *
+ *	The published frontier is min(pending)-1 (time predecessor) while
+ *	entries are pending, else the last allocated commit SCN.  Both are
+ *	safe:  no own-origin commit SCN above the published value is ever
+ *	claimed durable, and every commit SCN at or below it has been
+ *	discharged as durable (aborted allocations are not commits and make
+ *	no durability claim).
+ */
+
+/*
+ * cluster_scn_durable_pending_register_locked -- caller holds lwlock
+ *	LW_EXCLUSIVE.  Registers a freshly allocated commit SCN with an
+ *	unknown LSN.  On overflow the frontier freezes stickily instead of
+ *	risking an unsafe claim (LOG once on the transition;  counter for
+ *	monitoring).
+ */
+static void
+cluster_scn_durable_pending_register_locked(SCN commit_scn)
+{
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return;
+
+	/* Track every commit allocation, frozen or not:  the empty-registry
+	 * frontier re-derivation depends on it. */
+	if (!SCN_VALID(cluster_scn_state->durable_last_allocated)
+		|| scn_total_cmp(commit_scn, cluster_scn_state->durable_last_allocated) > 0)
+		cluster_scn_state->durable_last_allocated = commit_scn;
+
+	if (cluster_scn_state->durable_frozen)
+		return;
+
+	if (cluster_scn_state->durable_pending_count >= CLUSTER_SCN_DURABLE_PENDING_MAX) {
+		cluster_scn_state->durable_frozen = true;
+		pg_atomic_fetch_add_u64(&cluster_scn_state->durable_overflow_count, 1);
+		ereport(LOG, (errmsg("cluster durable SCN frontier frozen: pending registry overflow "
+							 "(more than %d in-flight commits)",
+							 CLUSTER_SCN_DURABLE_PENDING_MAX),
+					  errhint("Remote nodes fall back to fetch-reply SCN sampling until this "
+							  "node restarts.")));
+		return;
+	}
+
+	cluster_scn_state->durable_pending_scn[cluster_scn_state->durable_pending_count] = commit_scn;
+	cluster_scn_state->durable_pending_lsn[cluster_scn_state->durable_pending_count]
+		= InvalidXLogRecPtr;
+	cluster_scn_state->durable_pending_count++;
+	cluster_scn_backend_durable_pending_scn = commit_scn;
+}
+
+/*
+ * cluster_scn_durable_pending_remove_locked -- caller holds lwlock
+ *	LW_EXCLUSIVE.  Swap-removes the entry for commit_scn (order is not
+ *	meaningful;  the frontier is derived by a min scan).  Does NOT
+ *	publish;  callers decide whether removal was a durability proof.
+ */
+static bool
+cluster_scn_durable_pending_remove_locked(SCN commit_scn)
+{
+	uint16 i;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return false;
+
+	for (i = 0; i < cluster_scn_state->durable_pending_count; i++) {
+		if (scn_total_cmp(cluster_scn_state->durable_pending_scn[i], commit_scn) == 0) {
+			uint16 last = (uint16)(cluster_scn_state->durable_pending_count - 1);
+
+			cluster_scn_state->durable_pending_scn[i]
+				= cluster_scn_state->durable_pending_scn[last];
+			cluster_scn_state->durable_pending_lsn[i]
+				= cluster_scn_state->durable_pending_lsn[last];
+			cluster_scn_state->durable_pending_scn[last] = InvalidScn;
+			cluster_scn_state->durable_pending_lsn[last] = InvalidXLogRecPtr;
+			cluster_scn_state->durable_pending_count = last;
+			if (scn_total_cmp(cluster_scn_backend_durable_pending_scn, commit_scn) == 0)
+				cluster_scn_backend_durable_pending_scn = InvalidScn;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * cluster_scn_durable_frontier_publish_locked -- caller holds lwlock
+ *	LW_EXCLUSIVE.  Recomputes the contiguous durable frontier and
+ *	publishes it monotonically.  A recomputed value below the published
+ *	one is a bug in the discharge protocol:  refuse + count (L441
+ *	monotonic discipline), never regress the public claim.  Returns true
+ *	only when the published value STRICTLY advanced (drives the D1-2
+ *	event signal;  republishing an equal claim is not an event).
+ */
+static bool
+cluster_scn_durable_frontier_publish_locked(void)
+{
+	SCN frontier;
+	SCN current;
+
+	if (cluster_scn_state == NULL || cluster_scn_state->durable_frozen)
+		return false;
+
+	if (cluster_scn_state->durable_pending_count > 0) {
+		SCN min_pending = cluster_scn_state->durable_pending_scn[0];
+		uint16 i;
+
+		for (i = 1; i < cluster_scn_state->durable_pending_count; i++) {
+			if (scn_total_cmp(cluster_scn_state->durable_pending_scn[i], min_pending) < 0)
+				min_pending = cluster_scn_state->durable_pending_scn[i];
+		}
+		frontier = cluster_scn_time_predecessor(min_pending);
+	} else
+		frontier = cluster_scn_state->durable_last_allocated;
+
+	if (!SCN_VALID(frontier))
+		return false;
+
+	current = (SCN)pg_atomic_read_u64(&cluster_scn_state->durable_safe_scn);
+	if (SCN_VALID(current)) {
+		int cmp = scn_total_cmp(frontier, current);
+
+		if (cmp < 0) {
+			pg_atomic_fetch_add_u64(&cluster_scn_state->durable_regression_count, 1);
+			return false;
+		}
+		if (cmp == 0)
+			return false; /* republish of the same claim; no event */
+	}
+	pg_atomic_write_u64(&cluster_scn_state->durable_safe_scn, frontier);
+	return true; /* strictly advanced */
+}
+
+/*
+ * cluster_scn_boc_event_signal -- producer half of the D1-2 event
+ *	protocol.  Call AFTER releasing the SCN lwlock, only when the
+ *	publish strictly advanced the frontier.  Publish-before-signal
+ *	(L387) is inherent:  the frontier write happened under the lock
+ *	before this runs.  The injection point suppresses the event to
+ *	prove the sweep cadence remains a sufficient fallback (L2).
+ */
+static void
+cluster_scn_boc_event_signal(void)
+{
+	if (!cluster_boc_event_publish)
+		return;
+	if (cluster_scn_state == NULL)
+		return;
+
+	/*
+	 * Armed-state peek, not CLUSTER_INJECTION_POINT dispatch:  this
+	 * runs on the post-commit path (commit record already durable), so
+	 * an armed ERROR/SLEEP/CRASH dispatch must never fire here.  The
+	 * armed_count fast gate keeps the probe free when no injection is
+	 * armed anywhere in this process.
+	 */
+	if (cluster_injection_armed_count > 0
+		&& cluster_cr_injection_armed("cluster-boc-event-publish", NULL))
+		return;
+	if (pg_atomic_exchange_u32(&cluster_scn_state->boc_event_dirty, 1) == 0) {
+		/* spec-7.4 D4: count the commit-event-driven publish (0->1 wakeup). */
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_event_publish_count, 1);
+		cluster_lmon_marker_complete_wakeup();
+	}
+}
+
+/*
+ * cluster_scn_boc_event_consume -- consumer half:  LMON drain clears
+ *	the dirty flag BEFORE snapshotting the frontier, so a publish that
+ *	races in after the snapshot re-arms a wakeup (no lost update).
+ */
+bool
+cluster_scn_boc_event_consume(void)
+{
+	if (cluster_scn_state == NULL)
+		return false;
+	return pg_atomic_exchange_u32(&cluster_scn_state->boc_event_dirty, 0) != 0;
+}
+
+/*
+ * cluster_scn_durable_safe_scn -- lock-free read of the published
+ *	contiguous durable frontier (InvalidScn until anything published).
+ */
+SCN
+cluster_scn_durable_safe_scn(void)
+{
+	if (cluster_scn_state == NULL)
+		return InvalidScn;
+	return (SCN)pg_atomic_read_u64(&cluster_scn_state->durable_safe_scn);
+}
+
+/*
+ * cluster_scn_durable_pending_fill_lsn -- record the commit-record LSN
+ *	for a pending commit SCN once XactLogCommitRecord has returned.
+ *	Until filled, the walwriter flush horizon can never discharge the
+ *	entry (an unwritten record has no durability horizon).  Pure shmem
+ *	write under the lock;  safe inside the commit critical section.
+ */
+bool
+cluster_scn_durable_pending_fill_lsn(SCN commit_scn, XLogRecPtr commit_lsn)
+{
+	uint16 i;
+	bool found = false;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn) || XLogRecPtrIsInvalid(commit_lsn))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	for (i = 0; i < cluster_scn_state->durable_pending_count; i++) {
+		if (scn_total_cmp(cluster_scn_state->durable_pending_scn[i], commit_scn) == 0) {
+			cluster_scn_state->durable_pending_lsn[i] = commit_lsn;
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return found;
+}
+
+/*
+ * cluster_scn_durable_pending_discharge_scn -- sync-commit discharge:
+ *	the caller proved this commit record durable (its own XLogFlush
+ *	returned).  Runs AFTER the commit critical section (mini-plan v1.1
+ *	ruling #3:  no publish work inside the crit section).
+ */
+bool
+cluster_scn_durable_pending_discharge_scn(SCN commit_scn)
+{
+	bool removed;
+	bool advanced = false;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	removed = cluster_scn_durable_pending_remove_locked(commit_scn);
+	if (removed)
+		advanced = cluster_scn_durable_frontier_publish_locked();
+	LWLockRelease(&cluster_scn_state->lwlock);
+	if (advanced)
+		cluster_scn_boc_event_signal();
+	return removed;
+}
+
+/*
+ * cluster_scn_durable_pending_abort_self -- abort-path cleanup:  this
+ *	backend's in-flight allocation never became a commit;  unblock the
+ *	frontier.  Mirrors cluster_scn_pending_commit_clear_my_pending.
+ *
+ *	Guard:  an entry with a FILLED lsn is a real commit (its commit
+ *	record was inserted;  abort cannot happen past that point without
+ *	PANIC, and an async commit leaves its entry filled for the
+ *	walwriter).  Such an entry is only detached from this backend, never
+ *	removed -- removing it would let the frontier cover an unflushed
+ *	commit (the P0 this registry exists to prevent).
+ */
+bool
+cluster_scn_durable_pending_abort_self(void)
+{
+	SCN pending = cluster_scn_backend_durable_pending_scn;
+	bool removed = false;
+	bool advanced = false;
+	uint16 i;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(pending))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	for (i = 0; i < cluster_scn_state->durable_pending_count; i++) {
+		if (scn_total_cmp(cluster_scn_state->durable_pending_scn[i], pending) == 0) {
+			if (XLogRecPtrIsInvalid(cluster_scn_state->durable_pending_lsn[i])) {
+				removed = cluster_scn_durable_pending_remove_locked(pending);
+				if (removed)
+					advanced = cluster_scn_durable_frontier_publish_locked();
+			}
+			break;
+		}
+	}
+	LWLockRelease(&cluster_scn_state->lwlock);
+	cluster_scn_backend_durable_pending_scn = InvalidScn;
+	if (advanced)
+		cluster_scn_boc_event_signal();
+	return removed;
+}
+
+/*
+ * cluster_scn_durable_pending_discharge_upto -- walwriter discharge:
+ *	every pending entry whose (known) commit-record LSN is at or below
+ *	the background-flush horizon is durable.  Entries with an unknown
+ *	LSN stay pending regardless of the horizon.  Returns the number of
+ *	entries discharged.
+ */
+uint32
+cluster_scn_durable_pending_discharge_upto(XLogRecPtr flushed_lsn)
+{
+	uint32 discharged = 0;
+	bool advanced = false;
+	uint16 i;
+
+	if (cluster_scn_state == NULL || XLogRecPtrIsInvalid(flushed_lsn))
+		return 0;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	i = 0;
+	while (i < cluster_scn_state->durable_pending_count) {
+		XLogRecPtr entry_lsn = cluster_scn_state->durable_pending_lsn[i];
+
+		if (!XLogRecPtrIsInvalid(entry_lsn) && entry_lsn <= flushed_lsn) {
+			/* swap-remove keeps index i pointing at an unvisited entry */
+			(void)cluster_scn_durable_pending_remove_locked(
+				cluster_scn_state->durable_pending_scn[i]);
+			discharged++;
+		} else
+			i++;
+	}
+	if (discharged > 0)
+		advanced = cluster_scn_durable_frontier_publish_locked();
+	LWLockRelease(&cluster_scn_state->lwlock);
+	if (advanced)
+		cluster_scn_boc_event_signal();
+	return discharged;
+}
+
+uint64
+cluster_scn_durable_pending_count(void)
+{
+	uint64 count;
+
+	if (cluster_scn_state == NULL)
+		return 0;
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	count = cluster_scn_state->durable_pending_count;
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return count;
+}
+
+bool
+cluster_scn_durable_frontier_frozen(void)
+{
+	bool frozen;
+
+	if (cluster_scn_state == NULL)
+		return false;
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	frozen = cluster_scn_state->durable_frozen;
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return frozen;
+}
+
+uint64
+cluster_scn_durable_frontier_overflow_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->durable_overflow_count);
+}
+
+uint64
+cluster_scn_durable_frontier_regression_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->durable_regression_count);
+}
+
+/*
  * cluster_scn_current -- read current encoded SCN without advancing.
  *
  *	Returns InvalidScn (= 0) in two cases:
@@ -1028,36 +1488,207 @@ cluster_scn_observe_bump_count(void)
  */
 
 /*
+ * cluster_scn_boc_payload_encode / _decode -- spec-7.4 D1 BOC payload v1.
+ *
+ *	Explicit little-endian, independent of host byte order (the envelope
+ *	wire is LE per spec-2.3;  the payload follows the same convention).
+ *	v1 carries exactly one field:  origin_durable_safe_scn (8 bytes).
+ */
+void
+cluster_scn_boc_payload_encode(SCN scn, uint8 *buf)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_SCN_BOC_PAYLOAD_V1_LEN; i++)
+		buf[i] = (uint8)((scn >> (8 * i)) & 0xFF);
+}
+
+SCN
+cluster_scn_boc_payload_decode(const uint8 *buf)
+{
+	SCN scn = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_SCN_BOC_PAYLOAD_V1_LEN; i++)
+		scn |= ((SCN)buf[i]) << (8 * i);
+	return scn;
+}
+
+/*
  * cluster_scn_boc_broadcast_handler -- spec-2.9 D3 dispatch handler.
  *
  *	Registered via cluster_lmon.c phase 1 (spec-2.9 D1) for msg_type =
  *	PGRAC_IC_MSG_BOC_BROADCAST (= 3).
  *
- *	NO-OP body by design (spec-2.9 §3.0 I6 SCN-via-envelope-piggyback):
+ *	Envelope-side Lamport piggyback is unchanged (spec-2.9 §3.0 I6):
  *	envelope.scn (frozen at offset 20 per spec-2.3) is observed via
  *	cluster_ic_envelope_verify -> cluster_ic_envelope_observe_scn
  *	(spec-2.4 D5) BEFORE this handler fires.  Handler MUST NOT call
  *	cluster_scn_observe directly (spec-2.9 §3.0 I6 + T-scn-13c grep
  *	invariant).
  *
- *	DEBUG2 log is the only side-effect (spec-2.9 §3.0 I5 payload-zero):
- *	BOC pulse traffic is otherwise invisible from SQL surface; this
- *	helps dev/test trace cross-instance pulse arrival.
+ *	spec-7.4 D1 (spec-2.9 I5 v0.5 amend):  payload_length in {0, 8}.
+ *	0 = pre-v1 sender or event publish off -- pulse-only frame, DEBUG2
+ *	trace only.  8 = payload v1 origin_durable_safe_scn (LE):  validate
+ *	length / decodability / SCN node bits == env.source_node_id, then
+ *	update the per-(origin, epoch) cache.  Every reject is a counted
+ *	fail-closed drop;  a lower SCN within the same epoch is a counted
+ *	regression reject (reordered frame);  an epoch change rebuilds the
+ *	entry (R5).
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: spec-7.4 D1 replaced the payload-zero Assert with the
+ * versioned {0, 8} contract above.
+ * Why: the durable frontier rides the existing BOC pulse (zero new
+ * msg_type);  mixed-version peers keep sending 0-byte frames, which
+ * remain valid pulse-only traffic.
  */
 void
-cluster_scn_boc_broadcast_handler(const ClusterICEnvelope *env,
-								  const void *payload pg_attribute_unused())
+cluster_scn_boc_broadcast_handler(const ClusterICEnvelope *env, const void *payload)
 {
-	/* spec-2.9 §3.0 I5 payload-zero invariant:  BOC_BROADCAST carries
-	 * no payload.  Receive-side Assert mirrors send-side payload_len=0
-	 * (cluster_scn_emit_broadcast_pulse, spec-2.9 D2).  Field name on
-	 * the envelope wire is payload_length (uint32, offset 28). */
-	Assert(env != NULL);
-	Assert(env->payload_length == 0);
+	SCN scn;
+	uint32 origin;
+	uint32 seq;
+	bool same_epoch;
+	SCN cached;
 
-	ereport(DEBUG2,
+	Assert(env != NULL);
+
+	if (env->payload_length == 0) {
+		/* Pre-v1 sender / publish off:  pulse-only frame (I5 v0.4
+		 * behavior preserved bit-for-bit). */
+		ereport(
+			DEBUG2,
 			(errmsg("cluster_scn: BOC broadcast received from peer %u (env.scn=" UINT64_FORMAT ")",
 					env->source_node_id, env->scn)));
+		return;
+	}
+
+	if (cluster_scn_state == NULL)
+		return; /* shmem not up; nothing to update */
+
+	if (env->payload_length != CLUSTER_SCN_BOC_PAYLOAD_V1_LEN || payload == NULL) {
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_payload_bad_length_count, 1);
+		ereport(DEBUG1, (errmsg("cluster_scn: dropped BOC payload with bad length %u from peer %u",
+								env->payload_length, env->source_node_id)));
+		return;
+	}
+
+	scn = cluster_scn_boc_payload_decode(payload);
+	if (!SCN_VALID(scn)) {
+		/* Structurally 8 bytes but undecodable (InvalidScn):  count it
+		 * with the malformed-frame drops. */
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_payload_bad_length_count, 1);
+		ereport(DEBUG1, (errmsg("cluster_scn: dropped undecodable BOC payload from peer %u",
+								env->source_node_id)));
+		return;
+	}
+
+	origin = env->source_node_id;
+	if (origin >= CLUSTER_MAX_NODES || (uint32)scn_node_id(scn) != origin) {
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_payload_node_mismatch_count, 1);
+		ereport(DEBUG1, (errmsg("cluster_scn: dropped BOC payload with node mismatch (scn node %d, "
+								"envelope peer %u)",
+								(int)scn_node_id(scn), env->source_node_id)));
+		return;
+	}
+
+	/*
+	 * Per-(origin, epoch) cache update.  Single writer (the LMON dispatch
+	 * running this handler), so reading the current fields directly is
+	 * safe;  the seqlock protects concurrent readers only.
+	 */
+	same_epoch = (cluster_scn_state->remote_durable_epoch[origin] == env->epoch);
+	cached = cluster_scn_state->remote_durable_scn[origin];
+	if (same_epoch && SCN_VALID(cached) && scn_total_cmp(scn, cached) < 0) {
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_payload_regression_count, 1);
+		return; /* reordered older frame; keep the newer claim */
+	}
+
+	seq = pg_atomic_read_u32(&cluster_scn_state->remote_durable_seq[origin]);
+	pg_atomic_write_u32(&cluster_scn_state->remote_durable_seq[origin], seq + 1);
+	pg_write_barrier();
+	cluster_scn_state->remote_durable_epoch[origin] = env->epoch;
+	cluster_scn_state->remote_durable_scn[origin] = scn;
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_scn_state->remote_durable_seq[origin], seq + 2);
+	pg_atomic_fetch_add_u64(&cluster_scn_state->boc_payload_accept_count, 1);
+
+	ereport(DEBUG2, (errmsg("cluster_scn: BOC durable frontier from peer %u = " UINT64_FORMAT
+							" (epoch " UINT64_FORMAT ")",
+							env->source_node_id, scn, env->epoch)));
+}
+
+/*
+ * cluster_scn_remote_durable_safe -- read the cached durable frontier
+ *	claim for a remote origin.  Returns false when the origin is out of
+ *	range, nothing has been cached yet, or the bounded seqlock spin is
+ *	exhausted -- callers fall back to the fetch-reply piggyback sampling
+ *	(never block on this cache).
+ */
+bool
+cluster_scn_remote_durable_safe(NodeId origin, uint64 *epoch_out, SCN *scn_out)
+{
+	int retries;
+
+	if (cluster_scn_state == NULL || origin < 0 || origin >= CLUSTER_MAX_NODES)
+		return false;
+
+	for (retries = 0; retries < 1000; retries++) {
+		uint32 s1 = pg_atomic_read_u32(&cluster_scn_state->remote_durable_seq[origin]);
+		uint64 epoch;
+		SCN scn;
+
+		if (s1 & 1)
+			continue; /* write in progress */
+		pg_read_barrier();
+		epoch = cluster_scn_state->remote_durable_epoch[origin];
+		scn = cluster_scn_state->remote_durable_scn[origin];
+		pg_read_barrier();
+		if (pg_atomic_read_u32(&cluster_scn_state->remote_durable_seq[origin]) != s1)
+			continue; /* torn read; retry */
+
+		if (!SCN_VALID(scn))
+			return false; /* nothing cached for this origin yet */
+		if (epoch_out != NULL)
+			*epoch_out = epoch;
+		if (scn_out != NULL)
+			*scn_out = scn;
+		return true;
+	}
+	return false; /* bounded spin exhausted; fail open to fallback path */
+}
+
+uint64
+cluster_scn_boc_payload_accept_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->boc_payload_accept_count);
+}
+
+uint64
+cluster_scn_boc_payload_bad_length_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->boc_payload_bad_length_count);
+}
+
+uint64
+cluster_scn_boc_payload_node_mismatch_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->boc_payload_node_mismatch_count);
+}
+
+uint64
+cluster_scn_boc_payload_regression_count(void)
+{
+	if (cluster_scn_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_scn_state->boc_payload_regression_count);
 }
 
 /*
@@ -1111,6 +1742,11 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	static uint64 last_drained_sweep_count = 0;
 	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 	uint64 sweep_count;
+	bool event_pending;
+	SCN frontier;
+	uint8 payload[CLUSTER_SCN_BOC_PAYLOAD_V1_LEN];
+	const void *send_payload = NULL;
+	uint32 send_len = 0;
 	int peer;
 	int done = 0;
 	int would_block = 0;
@@ -1124,20 +1760,47 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 
 	Assert(MyBackendType == B_LMON);
 
-	sweep_count = pg_atomic_read_u64(&cluster_scn_state->boc_sweep_count);
-	if (sweep_count == last_drained_sweep_count)
-		return;
-
 	/* v0.3 Q7 / I9: 0 peer means no router/fanout work and no log spam.
-	 * Do not mark the sweep drained here; if a peer becomes alive before
-	 * the next walwriter sweep, LMON may still emit the latest SCN. */
+	 * Checked BEFORE consuming the event flag so neither the sweep nor a
+	 * pending commit event is marked drained;  if a peer becomes alive
+	 * later, LMON still emits the latest state.  (spec-7.4 D1-2 moved
+	 * this check ahead of the sweep gate for exactly that reason.) */
 	if (cluster_cssd_get_alive_peer_count() == 0)
 		return;
+
+	/* spec-7.4 D1-2: exchange-clear the event flag BEFORE snapshotting
+	 * (a publish racing past the snapshot re-arms a wakeup).  Either a
+	 * new sweep beat or a commit event justifies a fanout. */
+	event_pending = cluster_scn_boc_event_consume();
+	sweep_count = pg_atomic_read_u64(&cluster_scn_state->boc_sweep_count);
+	if (sweep_count == last_drained_sweep_count && !event_pending)
+		return;
+
+	/*
+	 * spec-7.4 D4: a drain reached here with no commit event pending is a
+	 * sweep-backstop fanout (the periodic sweep beat advanced while the event
+	 * path missed or is off/suppressed).  Counts the sweep-driven drain, so
+	 * boc_event_publish_count : boc_sweep_fallback_count reads the event/sweep
+	 * balance regardless of fanout delivery outcome.
+	 */
+	if (!event_pending)
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_sweep_fallback_count, 1);
 
 	/* PGRAC: spec-5.59 D2 profiling */
 	cluster_xp_begin(&xps, CLXP_C_SCN_BOC_BROADCAST);
 
-	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_BOC_BROADCAST, NULL, 0, per_peer);
+	/* spec-7.4 D1-2: attach payload v1 (the published durable frontier)
+	 * when event publish is on and a frontier exists;  otherwise keep
+	 * the pre-D1 0-length pulse (byte equivalence when the GUC is off,
+	 * and old receivers treat 0-length as pulse-only either way). */
+	frontier = cluster_scn_durable_safe_scn();
+	if (cluster_boc_event_publish && SCN_VALID(frontier)) {
+		cluster_scn_boc_payload_encode(frontier, payload);
+		send_payload = payload;
+		send_len = CLUSTER_SCN_BOC_PAYLOAD_V1_LEN;
+	}
+
+	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_BOC_BROADCAST, send_payload, send_len, per_peer);
 	last_drained_sweep_count = sweep_count;
 
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
@@ -1214,6 +1877,15 @@ cluster_scn_boc_tick(void)
 		return;
 	if (cluster_scn_state == NULL)
 		return;
+
+	/*
+	 * spec-7.4 D1:  async-commit durable frontier discharge.  Runs on
+	 * every walwriter wakeup (NOT throttled by the sweep interval):  the
+	 * caller sits right behind XLogBackgroundFlush, so the flush horizon
+	 * proves every filled pending entry at or below it durable.  Cheap
+	 * no-op when nothing is pending.
+	 */
+	(void)cluster_scn_durable_pending_discharge_upto(GetFlushRecPtr(NULL));
 
 	now_ts = GetCurrentTimestamp();
 
@@ -1357,6 +2029,28 @@ cluster_scn_boc_broadcast_fanout_count(void)
 }
 
 /*
+ * spec-7.4 D4:  accessors for the event-vs-sweep balance counters.
+ *
+ *	boc_event_publish_count = commit-event-driven publishes (0->1 dirty
+ *	wakeups);  boc_sweep_fallback_count = sweep-backstop drains that fired
+ *	with no commit event pending.  Lock-free atomic reads (mirror
+ *	cluster_scn_boc_broadcast_fanout_count).
+ */
+uint64
+cluster_scn_boc_event_publish_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->boc_event_publish_count);
+}
+
+uint64
+cluster_scn_boc_sweep_fallback_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->boc_sweep_fallback_count);
+}
+
+/*
  * spec-2.11 D2:  cross-instance commit_scn lookup stub.
  *
  *	Skeleton phase:  always returns CLUSTER_SCN_LOOKUP_DEFER + bumps
@@ -1475,6 +2169,9 @@ cluster_scn_shmem_init(void)
 		pg_atomic_init_u64(&cluster_scn_state->boc_max_batch_size, 0);
 		pg_atomic_init_u64(&cluster_scn_state->boc_last_batch_size, 0);
 		pg_atomic_init_u64(&cluster_scn_state->boc_broadcast_fanout_count, 0);
+		/* spec-7.4 D4: event-vs-sweep balance counters. */
+		pg_atomic_init_u64(&cluster_scn_state->boc_event_publish_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_sweep_fallback_count, 0);
 		/* spec-2.11 D3: init skeleton-phase commit_scn lookup defer counter. */
 		pg_atomic_init_u64(&cluster_scn_state->commit_lookup_defer_count, 0);
 		/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
@@ -1486,6 +2183,32 @@ cluster_scn_shmem_init(void)
 		pg_atomic_init_u64(&cluster_scn_state->adg_pending_register_count, 0);
 		pg_atomic_init_u64(&cluster_scn_state->adg_pending_clear_count, 0);
 		pg_atomic_init_u64(&cluster_scn_state->adg_pending_overflow_count, 0);
+		/* spec-7.4 D1: durable_safe_scn frontier registry. */
+		cluster_scn_state->durable_pending_count = 0;
+		cluster_scn_state->durable_frozen = false;
+		memset(cluster_scn_state->durable_pending_scn, 0,
+			   sizeof(cluster_scn_state->durable_pending_scn));
+		memset(cluster_scn_state->durable_pending_lsn, 0,
+			   sizeof(cluster_scn_state->durable_pending_lsn));
+		cluster_scn_state->durable_last_allocated = InvalidScn;
+		pg_atomic_init_u64(&cluster_scn_state->durable_safe_scn, InvalidScn);
+		pg_atomic_init_u64(&cluster_scn_state->durable_overflow_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->durable_regression_count, 0);
+		/* spec-7.4 D1: per-origin remote frontier cache + payload counters. */
+		{
+			int i;
+
+			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+				pg_atomic_init_u32(&cluster_scn_state->remote_durable_seq[i], 0);
+				cluster_scn_state->remote_durable_epoch[i] = 0;
+				cluster_scn_state->remote_durable_scn[i] = InvalidScn;
+			}
+		}
+		pg_atomic_init_u64(&cluster_scn_state->boc_payload_accept_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_payload_bad_length_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_payload_node_mismatch_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_payload_regression_count, 0);
+		pg_atomic_init_u32(&cluster_scn_state->boc_event_dirty, 0);
 	}
 }
 

@@ -68,6 +68,11 @@ static const char *const cluster_xp_bucket_names[CLXP_NBUCKETS] = {
 	[CLXP_I_RIGHTMOST_LEAF_PING] = "i_rightmost_leaf_ping",
 	[CLXP_C_SCN_COMMIT_ADVANCE] = "c_scn_commit_advance",
 	[CLXP_C_SCN_BOC_BROADCAST] = "c_scn_boc_broadcast",
+	[CLXP_C_COMMIT_UNDO_FLUSH] = "c_commit_undo_flush",
+	[CLXP_C_COMMIT_ITL_STAMP] = "c_commit_itl_stamp",
+	[CLXP_C_COMMIT_TT_STAMP] = "c_commit_tt_stamp",
+	[CLXP_C_COMMIT_WAL_FLUSH] = "c_commit_wal_flush",
+	[CLXP_C_COMMIT_QUORUM_READ] = "c_commit_quorum_read",
 	[CLXP_IC_SEND_SERVICE] = "ic_send_service",
 	[CLXP_IC_INBOUND_DISPATCH] = "ic_inbound_dispatch",
 	[CLXP_LOCAL_UNDO_ITL_WAL] = "local_undo_itl_wal",
@@ -79,6 +84,30 @@ cluster_xp_bucket_name(ClusterXnodeBucket b)
 	if ((int)b < 0 || b >= CLXP_NBUCKETS)
 		return NULL;
 	return cluster_xp_bucket_names[b];
+}
+
+/*
+ * spec-7.4 D4 commit-latency histogram support: the μs upper edges (derived
+ * from the single-source CLXP_HIST_EDGES_US macro so the classifier and the
+ * dump labels never drift) and the component names the dump uses to build
+ * "hist.<component>.le_<edge>us" / ".le_inf" keys.
+ */
+const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = { CLXP_HIST_EDGES_US };
+
+static const char *const cluster_xp_hist_component_names[CLXP_HIST_NCOMPONENTS] = {
+	[CLXP_HIST_UNDO_FLUSH] = "commit_undo_flush",
+	[CLXP_HIST_ITL_STAMP] = "commit_itl_stamp",
+	[CLXP_HIST_TT_STAMP] = "commit_tt_stamp",
+	[CLXP_HIST_WAL_FLUSH] = "commit_wal_flush",
+	[CLXP_HIST_SCN_COMMIT_ADVANCE] = "commit_scn_advance",
+};
+
+const char *
+cluster_xp_hist_component_name(ClusterXpHistComponent c)
+{
+	if ((int)c < 0 || c >= CLXP_HIST_NCOMPONENTS)
+		return NULL;
+	return cluster_xp_hist_component_names[c];
 }
 
 /* ============================================================
@@ -103,6 +132,20 @@ cluster_xp_zero_all(ClusterXnodeProfileShared *ctl, bool init)
 		} else {
 			pg_atomic_write_u64(&ctl->bucket[i].total_nanos, 0);
 			pg_atomic_write_u64(&ctl->bucket[i].n_events, 0);
+		}
+	}
+	/* spec-7.4 D4: zero the per-commit-component μs latency histogram. */
+	{
+		int c;
+		int b;
+
+		for (c = 0; c < CLXP_HIST_NCOMPONENTS; c++) {
+			for (b = 0; b < CLXP_HIST_NBUCKETS; b++) {
+				if (init)
+					pg_atomic_init_u64(&ctl->hist[c][b], 0);
+				else
+					pg_atomic_write_u64(&ctl->hist[c][b], 0);
+			}
 		}
 	}
 	if (init) {

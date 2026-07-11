@@ -326,11 +326,18 @@ is($standby_off_after, $standby_off_before,
 # scn keys now 19 after spec-2.12 added 3 convergence boundary keys
 # (scn_last_observe_at + scn_seconds_since_last_observe +
 #  scn_observed_max_observe_gap_ms).
+# scn keys 19 -> 28 after spec-7.4 D1 added 9 durable-frontier / BOC
+# payload v1 rows (safe scn + pending count + frozen + overflow +
+# regression + 4 payload receive counters).  The sparse per-origin
+# scn_remote_durable_* rows never appear single-node (no cached
+# origins), so the count stays deterministic here.
+# scn keys 28 -> 30 after spec-7.4 D4 added the event-vs-sweep balance
+# rows (scn_boc_event_publish_count + scn_boc_sweep_fallback_count).
 my $scn_key_count = $primary->safe_psql('postgres', q{
 	SELECT count(*) FROM pg_cluster_state WHERE category='scn'
 });
-is($scn_key_count, '19',
-	'L11 pg_cluster_state has 19 scn keys after spec-2.12 3 convergence boundary metrics');
+is($scn_key_count, '30',
+	'L11 pg_cluster_state has 30 scn keys after spec-7.4 D4 event/sweep rows');
 
 
 # ----------
