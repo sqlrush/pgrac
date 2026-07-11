@@ -237,6 +237,17 @@ int cluster_hw_remaster_retry_backoff_ms = 1000;
 bool cluster_drm_enabled = false;
 int cluster_drm_affinity_sample_rate = 16;
 int cluster_drm_min_access_count = 1000;
+/* spec-7.6 6.3c: DRM hotness decision + anti-thrash GUCs (conservative defaults;
+ * mechanism aligns to Oracle _gc_affinity_*, numeric values are this project's
+ * own — "not verified against Oracle", tune by measurement (rule 3)). */
+int cluster_drm_affinity_ratio_pct = 70;
+int cluster_drm_consecutive_triggers = 3;
+int cluster_drm_affinity_window_ms = 10000;
+int cluster_drm_cooldown_ms = 600000;
+int cluster_drm_max_migrations_per_scan = 2;
+int cluster_drm_scan_interval_ms = 5000;
+int cluster_drm_migration_cost = 1000;
+bool cluster_drm_manual_only = false;
 int cluster_hw_remaster_retry_max_attempts = 16;
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
@@ -2461,6 +2472,72 @@ cluster_init_guc(void)
 					 "access total * sample_rate stays below this is never considered for "
 					 "remaster."),
 		&cluster_drm_min_access_count, 1000, 0, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	/*
+	 * spec-7.6 6.3c decision + anti-thrash GUCs.  The decision engine + LMON scan
+	 * only PROPOSE remaster (report-only) in this wave; the live-migration
+	 * executor (a later wave) consumes the same knobs.  Mechanism mirrors Oracle
+	 * _gc_affinity_*; the numeric defaults are this project's conservative
+	 * starting points, explicitly NOT verified against Oracle (rule 3).
+	 */
+	DefineCustomIntVariable(
+		"cluster.drm_affinity_ratio_pct",
+		gettext_noop("Minimum dominant-node access share (percent) to remaster a shard."),
+		gettext_noop("Range [1, 100].  Default 70.  A shard is only a migration candidate "
+					 "when its busiest node holds at least this share of the sampled access "
+					 "(confidence shell before the net-benefit test).  Mirrors Oracle "
+					 "_gc_affinity_limit in spirit (value not verified against Oracle)."),
+		&cluster_drm_affinity_ratio_pct, 70, 1, 100, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_consecutive_triggers",
+		gettext_noop("Consecutive hot windows required before a shard is remastered."),
+		gettext_noop("Range [1, 1000000].  Default 3.  Anti-thrash: a shard must read hot for "
+					 "this many consecutive tumbling windows (drm_affinity_window_ms) before it "
+					 "is proposed, so a short burst does not move a master."),
+		&cluster_drm_consecutive_triggers, 3, 1, 1000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_affinity_window_ms",
+		gettext_noop("Tumbling affinity observation window width (ms)."),
+		gettext_noop("Range [100, 2000000000].  Default 10000.  Non-overlapping windows: at each "
+					 "boundary the completed window's hotness updates the consecutive-hot counter "
+					 "and the per-node counts reset.  Mirrors Oracle _gc_affinity_time in spirit "
+					 "(value not verified against Oracle)."),
+		&cluster_drm_affinity_window_ms, 10000, 100, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_cooldown_ms",
+		gettext_noop("Minimum time between remasters of the same shard (ms)."),
+		gettext_noop("Range [0, 2000000000].  Default 600000 (10 min, aligned to Oracle's "
+					 "reputed cooldown; value not verified).  Anti-thrash: a shard remastered "
+					 "within this window is not moved again; oscillation extends it adaptively."),
+		&cluster_drm_cooldown_ms, 600000, 0, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_max_migrations_per_scan",
+		gettext_noop("Maximum shard remasters proposed per LMON decision scan."),
+		gettext_noop("Range [0, 1000000].  Default 2.  Rate-limits how many shards can be "
+					 "proposed for remaster in a single scan so a mass affinity shift cannot "
+					 "storm the cluster.  0 proposes none (observe only)."),
+		&cluster_drm_max_migrations_per_scan, 2, 0, 1000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_scan_interval_ms",
+		gettext_noop("Interval between DRM decision scans on the LMON tick (ms)."),
+		gettext_noop("Range [100, 2000000000].  Default 5000.  The LMON aux process evaluates the "
+					 "candidate shards this often.  Independent of drm_affinity_window_ms: a "
+					 "window is judged at most once even if scanned several times."),
+		&cluster_drm_scan_interval_ms, 5000, 100, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_migration_cost",
+		gettext_noop("Net-benefit threshold (access-equivalent units) to remaster a shard."),
+		gettext_noop("Range [0, 2000000000].  Default 1000.  A shard migrates only when "
+					 "(dominant_access - current_master_access) * expected_residence_windows "
+					 "exceeds this, so a small or short-lived edge does not pay for the move.  "
+					 "This project's own knob (no Oracle equivalent); tune by measurement."),
+		&cluster_drm_migration_cost, 1000, 0, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.drm_manual_only",
+		gettext_noop("Observe and propose remasters but never auto-execute them."),
+		gettext_noop("Off (default) lets the decision scan auto-propose (and, in a later wave, "
+					 "execute).  On keeps the full observability surface but suppresses "
+					 "auto-actionable proposals, leaving remaster to the manual interface."),
+		&cluster_drm_manual_only, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.hw_remaster_retry_backoff_ms",

@@ -128,6 +128,22 @@ cluster_drm_affinity_get_counter(int which pg_attribute_unused())
 {
 	return 0;
 }
+/* spec-7.6 6.3c stubs: dump_drm_affinity's decision-scan surface. */
+uint64
+cluster_drm_affinity_get_scan_counter(int which pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_drm_affinity_get_scan_reason(int reason pg_attribute_unused())
+{
+	return 0;
+}
+const char *
+cluster_drm_reason_name(int reason pg_attribute_unused())
+{
+	return "stub";
+}
 
 const char *
 cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())

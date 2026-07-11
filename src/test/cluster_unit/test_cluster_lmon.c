@@ -517,6 +517,10 @@ bool cluster_drm_enabled = false;
 void
 cluster_drm_affinity_flush_local_ring(void)
 {}
+/* spec-7.6 6.3c: cluster_lmon.c also drives the DRM decision scan (guarded off). */
+void
+cluster_drm_lmon_scan_tick(void)
+{}
 
 /* WaitEventSet API stubs (storage/latch.h).  Never invoked at unit-test
  * runtime because the test doesn't call LmonMain. */

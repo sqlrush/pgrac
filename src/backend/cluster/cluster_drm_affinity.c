@@ -114,6 +114,13 @@ cluster_drm_affinity_shmem_init(void)
 		pg_atomic_init_u64(&drm_state->samples_dropped_stale_epoch, 0);
 		pg_atomic_init_u64(&drm_state->flush_batches, 0);
 
+		/* spec-7.6 6.3c decision-scan observability counters. */
+		pg_atomic_init_u64(&drm_state->scans_run, 0);
+		pg_atomic_init_u64(&drm_state->scan_candidates, 0);
+		pg_atomic_init_u64(&drm_state->scan_proposed, 0);
+		for (i = 0; i < CLUSTER_DRM_SCAN_REASON_SLOTS; i++)
+			pg_atomic_init_u64(&drm_state->scan_reason[i], 0);
+
 		for (i = 0; i < nwords; i++)
 			pg_atomic_init_u64(&drm_state->dirty_shard_bitmap[i], 0);
 
@@ -459,4 +466,178 @@ cluster_drm_affinity_get_counter(int which)
 	default:
 		return 0;
 	}
+}
+
+/* ----------
+ * Tumbling window management (spec-7.6 6.3c, Amend v1.1-b / R5)
+ *
+ * These operate on a PASSED slot and mutate only that slot (INV-DRM9: they never
+ * touch master/lock/GRD state), so they are unit-testable with a stack slot and
+ * add no GRD/decision linkage to this module.  The LMON scan driver
+ * (cluster_drm_scan.c) supplies now_us / window_us / thresholds / identity.
+ * ----------
+ */
+
+/*
+ * A window not judged within this many window widths means the shard went cold
+ * and dropped out of the candidate scan; treat it as a streak discontinuity.
+ */
+#define DRM_WINDOW_OVERDUE_FACTOR 2
+
+bool
+cluster_drm_window_is_open(const ClusterDrmShardAffinity *slot)
+{
+	if (slot == NULL)
+		return false;
+	return pg_atomic_read_u64(unconstify(pg_atomic_uint64 *, &slot->window_start_ts)) != 0;
+}
+
+bool
+cluster_drm_window_due(const ClusterDrmShardAffinity *slot, uint64 now_us, uint64 window_us)
+{
+	uint64 ws;
+
+	if (slot == NULL)
+		return false;
+	ws = pg_atomic_read_u64(unconstify(pg_atomic_uint64 *, &slot->window_start_ts));
+	if (ws == 0)
+		return false;
+	return now_us > ws && (now_us - ws) >= window_us;
+}
+
+void
+cluster_drm_window_open(ClusterDrmShardAffinity *slot, uint64 now_us, uint64 cluster_epoch,
+						uint32 master_generation)
+{
+	if (slot == NULL)
+		return;
+	pg_atomic_write_u64(&slot->window_start_ts, now_us);
+	pg_atomic_write_u64(&slot->window_cluster_epoch, cluster_epoch);
+	pg_atomic_write_u32(&slot->window_master_generation, master_generation);
+}
+
+bool
+cluster_drm_window_judge(ClusterDrmShardAffinity *slot, uint64 now_us, uint64 window_us,
+						 int sample_rate, int min_access, int ratio_pct, uint64 cluster_epoch,
+						 uint32 master_generation)
+{
+	uint64 ws;
+	uint64 total = 0;
+	uint32 dom_access = 0;
+	int rate;
+	int k;
+	bool hot;
+
+	if (slot == NULL)
+		return false;
+
+	/*
+	 * Discontinuity: a remaster moved the shard's {cluster_epoch,
+	 * master_generation} identity, or the window is grossly overdue (the shard
+	 * went cold and stopped being scanned).  Either way the sustained-hotness
+	 * streak must not carry across — clear it and do not count this window as hot.
+	 */
+	ws = pg_atomic_read_u64(&slot->window_start_ts);
+	if (pg_atomic_read_u64(&slot->window_cluster_epoch) != cluster_epoch
+		|| pg_atomic_read_u32(&slot->window_master_generation) != master_generation
+		|| (ws != 0 && now_us > ws
+			&& (now_us - ws) >= (uint64)DRM_WINDOW_OVERDUE_FACTOR * window_us)) {
+		slot->consecutive_hot_windows = 0;
+		return false;
+	}
+
+	for (k = 0; k < CLUSTER_MAX_NODES; k++) {
+		uint32 c = pg_atomic_read_u32(&slot->access_count[k]);
+
+		total += c;
+		if (c > dom_access)
+			dom_access = c;
+	}
+
+	rate = (sample_rate < 1) ? 1 : sample_rate;
+
+	/* Same dual threshold the decision engine applies (absolute + dominant ratio). */
+	hot = total > 0 && (total * (uint64)rate) >= (uint64)min_access
+		  && (uint64)dom_access * 100 >= total * (uint64)ratio_pct;
+
+	if (hot) {
+		if (slot->consecutive_hot_windows < CLUSTER_DRM_WINDOW_CONSECUTIVE_MAX)
+			slot->consecutive_hot_windows++;
+	} else
+		slot->consecutive_hot_windows = 0;
+
+	return hot;
+}
+
+void
+cluster_drm_window_reset(ClusterDrmShardAffinity *slot, uint64 now_us, uint64 cluster_epoch,
+						 uint32 master_generation)
+{
+	int k;
+
+	if (slot == NULL)
+		return;
+	for (k = 0; k < CLUSTER_MAX_NODES; k++)
+		pg_atomic_write_u32(&slot->access_count[k], 0);
+	pg_atomic_write_u64(&slot->window_start_ts, now_us);
+	pg_atomic_write_u64(&slot->window_cluster_epoch, cluster_epoch);
+	pg_atomic_write_u32(&slot->window_master_generation, master_generation);
+}
+
+ClusterDrmShardAffinity *
+cluster_drm_affinity_slot(uint32 shard_id)
+{
+	if (drm_state == NULL || shard_id >= PGRAC_GRD_SHARD_COUNT)
+		return NULL;
+	return &drm_state->shard[shard_id];
+}
+
+/* ----------
+ * Decision-scan observability (dump category drm_affinity)
+ * ----------
+ */
+
+void
+cluster_drm_affinity_record_scan_run(void)
+{
+	if (drm_state == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&drm_state->scans_run, 1);
+}
+
+void
+cluster_drm_affinity_record_verdict(int reason, bool proposed)
+{
+	if (drm_state == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&drm_state->scan_candidates, 1);
+	if (reason >= 0 && reason < CLUSTER_DRM_SCAN_REASON_SLOTS)
+		pg_atomic_fetch_add_u64(&drm_state->scan_reason[reason], 1);
+	if (proposed)
+		pg_atomic_fetch_add_u64(&drm_state->scan_proposed, 1);
+}
+
+uint64
+cluster_drm_affinity_get_scan_counter(int which)
+{
+	if (drm_state == NULL)
+		return 0;
+	switch (which) {
+	case CLUSTER_DRM_AFFINITY_SCAN_RUNS:
+		return pg_atomic_read_u64(&drm_state->scans_run);
+	case CLUSTER_DRM_AFFINITY_SCAN_CANDIDATES:
+		return pg_atomic_read_u64(&drm_state->scan_candidates);
+	case CLUSTER_DRM_AFFINITY_SCAN_PROPOSED:
+		return pg_atomic_read_u64(&drm_state->scan_proposed);
+	default:
+		return 0;
+	}
+}
+
+uint64
+cluster_drm_affinity_get_scan_reason(int reason)
+{
+	if (drm_state == NULL || reason < 0 || reason >= CLUSTER_DRM_SCAN_REASON_SLOTS)
+		return 0;
+	return pg_atomic_read_u64(&drm_state->scan_reason[reason]);
 }

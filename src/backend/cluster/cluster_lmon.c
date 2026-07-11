@@ -66,6 +66,7 @@
 #include "cluster/cluster_gcs_block.h" /* cluster_gcs_register_block_msg_types (spec-2.33 D4) */
 #include "cluster/cluster_gcs_block_dedup.h" /* cluster_gcs_block_dedup_sweep_expired (spec-2.34 D6) */
 #include "cluster/cluster_drm_affinity.h"	 /* spec-7.6 6.3b — DRM ring drain */
+#include "cluster/cluster_drm_scan.h"		 /* spec-7.6 6.3c — DRM decision scan */
 #include "cluster/cluster_grd.h"			 /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_lms.h" /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_native_lock_probe.h"
@@ -1186,8 +1187,12 @@ LmonMain(void)
 			/* spec-7.6 6.3b: drain this LMON process's DRM affinity sample ring
 			 * (remote requests are sampled in cluster_ges_request_handler, which
 			 * runs here, and buffer per-process).  No-op when off / ring empty. */
-			if (cluster_drm_enabled)
+			if (cluster_drm_enabled) {
 				cluster_drm_affinity_flush_local_ring();
+				/* spec-7.6 6.3c: periodic decision scan (self-gated to
+				 * drm_scan_interval_ms; PROPOSES only, no execution). */
+				cluster_drm_lmon_scan_tick();
+			}
 			cluster_grd_deadlock_lmon_tick(); /* spec-2.17 Step 5 */
 
 			/*
@@ -1870,8 +1875,12 @@ LmonMain(void)
 
 			/* spec-7.6 6.3b: drain this LMON process's DRM affinity sample ring
 			 * (remote GES requests sampled here buffer per-process). */
-			if (cluster_drm_enabled)
+			if (cluster_drm_enabled) {
 				cluster_drm_affinity_flush_local_ring();
+				/* spec-7.6 6.3c: periodic decision scan (self-gated to
+				 * drm_scan_interval_ms; PROPOSES only, no execution). */
+				cluster_drm_lmon_scan_tick();
+			}
 
 			/* spec-5.13 D6: clean-leave orchestration before the reconfig tick. */
 			cluster_clean_leave_lmon_tick();

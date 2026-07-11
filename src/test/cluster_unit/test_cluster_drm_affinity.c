@@ -113,6 +113,68 @@ drm_test_reset(void)
 	cluster_drm_affinity_reset_local_sampling(); /* drop carried-over per-backend cadence */
 }
 
+/*
+ * Window-primitive helpers.  The window_* functions are pure with respect to a
+ * PASSED slot (no drm_state needed), so these tests build a stack slot directly.
+ */
+#define WIN_US 10000000ULL /* 10 s window in microseconds */
+
+static void
+init_window_slot(ClusterDrmShardAffinity *slot)
+{
+	int k;
+
+	memset(slot, 0, sizeof(*slot));
+	for (k = 0; k < CLUSTER_MAX_NODES; k++)
+		pg_atomic_init_u32(&slot->access_count[k], 0);
+	pg_atomic_init_u32(&slot->ewma_total, 0);
+	pg_atomic_init_u64(&slot->window_start_ts, 0);
+	pg_atomic_init_u64(&slot->window_cluster_epoch, 0);
+	pg_atomic_init_u32(&slot->window_master_generation, 0);
+	pg_atomic_init_u64(&slot->window_sample_epoch, 0);
+	slot->consecutive_hot_windows = 0;
+	slot->last_migration_ts = 0;
+}
+
+/* node 0 (master) = 10, node 1 (dominant) = 100: total 110, ratio 90% — hot. */
+static void
+set_hot_counts(ClusterDrmShardAffinity *slot)
+{
+	int k;
+
+	for (k = 0; k < CLUSTER_MAX_NODES; k++)
+		pg_atomic_write_u32(&slot->access_count[k], 0);
+	pg_atomic_write_u32(&slot->access_count[0], 10);
+	pg_atomic_write_u32(&slot->access_count[1], 100);
+}
+
+/* total 1 (< min_access 50 at rate 1) — cold. */
+static void
+set_cold_counts(ClusterDrmShardAffinity *slot)
+{
+	int k;
+
+	for (k = 0; k < CLUSTER_MAX_NODES; k++)
+		pg_atomic_write_u32(&slot->access_count[k], 0);
+	pg_atomic_write_u32(&slot->access_count[0], 1);
+}
+
+/* Judge + reset n consecutive hot windows; leaves consecutive_hot_windows == n. */
+static void
+build_hot_streak(ClusterDrmShardAffinity *slot, uint64 *now, int n, uint64 cepoch, uint32 mgen)
+{
+	int i;
+
+	init_window_slot(slot);
+	cluster_drm_window_open(slot, *now, cepoch, mgen);
+	for (i = 0; i < n; i++) {
+		set_hot_counts(slot);
+		*now += WIN_US;
+		cluster_drm_window_judge(slot, *now, WIN_US, 1, 50, 70, cepoch, mgen);
+		cluster_drm_window_reset(slot, *now, cepoch, mgen);
+	}
+}
+
 /* ============================================================
  * U-sample-basic — sample() + flush() records into the master matrix.
  * ============================================================ */
@@ -342,6 +404,155 @@ UT_TEST(test_drm_local_remote_split)
 	UT_ASSERT_EQ(cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_RECORDED), 2);
 }
 
+/* ============================================================
+ * U-window-open-due — a fresh slot is not open; open() anchors + stamps
+ *	identity; the window is due only once window_us has elapsed (Amend v1.1-b).
+ * ============================================================ */
+UT_TEST(test_drm_window_open_and_due)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+
+	init_window_slot(&slot);
+	UT_ASSERT(!cluster_drm_window_is_open(&slot));
+
+	cluster_drm_window_open(&slot, now, 7, 3);
+	UT_ASSERT(cluster_drm_window_is_open(&slot));
+	UT_ASSERT(!cluster_drm_window_due(&slot, now, WIN_US));				 /* just opened  */
+	UT_ASSERT(!cluster_drm_window_due(&slot, now + WIN_US / 2, WIN_US)); /* half window  */
+	UT_ASSERT(cluster_drm_window_due(&slot, now + WIN_US, WIN_US));		 /* full window  */
+
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot.window_cluster_epoch), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot.window_master_generation), 3);
+}
+
+/* ============================================================
+ * U-tumbling — each completed hot window increments consecutive_hot_windows
+ *	exactly once (tumbling / non-overlapping); reset clears the per-node counts.
+ * ============================================================ */
+UT_TEST(test_drm_window_judge_hot_streak)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+	bool hot;
+
+	init_window_slot(&slot);
+	cluster_drm_window_open(&slot, now, 7, 3);
+
+	set_hot_counts(&slot);
+	now += WIN_US;
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 3);
+	UT_ASSERT(hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 1);
+	cluster_drm_window_reset(&slot, now, 7, 3);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot.access_count[1]), 0); /* reset cleared counts */
+
+	set_hot_counts(&slot);
+	now += WIN_US;
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 3);
+	UT_ASSERT(hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 2);
+}
+
+/* ============================================================
+ * U-tumbling-cold — a cold window (below min_access) clears the streak to 0.
+ * ============================================================ */
+UT_TEST(test_drm_window_judge_cold_clears_streak)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+	bool hot;
+
+	build_hot_streak(&slot, &now, 2, 7, 3);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 2);
+
+	set_cold_counts(&slot);
+	now += WIN_US;
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 3);
+	UT_ASSERT(!hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 0);
+}
+
+/* ============================================================
+ * U-window-identity (R5) — a window whose {cluster_epoch, master_generation}
+ *	identity changed spanned a remaster: the streak breaks (no stale heat).
+ * ============================================================ */
+UT_TEST(test_drm_window_judge_identity_change_breaks)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+	bool hot;
+
+	build_hot_streak(&slot, &now, 2, 7, 3);
+
+	set_hot_counts(&slot);
+	now += WIN_US;
+	/* master generation moved 3 -> 4 while the window was open. */
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 4);
+	UT_ASSERT(!hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 0);
+}
+
+/* ============================================================
+ * U-window-overdue — a grossly overdue window means the shard went cold and
+ *	stopped being scanned: the streak breaks even if the counts now look hot.
+ * ============================================================ */
+UT_TEST(test_drm_window_judge_overdue_breaks)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+	bool hot;
+
+	build_hot_streak(&slot, &now, 2, 7, 3);
+
+	set_hot_counts(&slot);
+	now += 3 * WIN_US; /* anchor is > 2*window in the past */
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 3);
+	UT_ASSERT(!hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, 0);
+}
+
+/* ============================================================
+ * U-window-cap — consecutive_hot_windows saturates, never overflows.
+ * ============================================================ */
+UT_TEST(test_drm_window_consecutive_cap)
+{
+	ClusterDrmShardAffinity slot;
+	uint64 now = 1000000000ULL;
+	bool hot;
+
+	init_window_slot(&slot);
+	cluster_drm_window_open(&slot, now, 7, 3);
+	slot.consecutive_hot_windows = CLUSTER_DRM_WINDOW_CONSECUTIVE_MAX;
+
+	set_hot_counts(&slot);
+	now += WIN_US;
+	hot = cluster_drm_window_judge(&slot, now, WIN_US, 1, 50, 70, 7, 3);
+	UT_ASSERT(hot);
+	UT_ASSERT_EQ(slot.consecutive_hot_windows, CLUSTER_DRM_WINDOW_CONSECUTIVE_MAX);
+}
+
+/* ============================================================
+ * U-scan-counters — the LMON scan observability surface tallies runs,
+ *	candidates, per-reason verdicts, and auto-actionable proposals.
+ * ============================================================ */
+UT_TEST(test_drm_scan_observability_counters)
+{
+	drm_test_reset();
+
+	cluster_drm_affinity_record_scan_run();
+	cluster_drm_affinity_record_scan_run();
+	cluster_drm_affinity_record_verdict(0, true);  /* migrate, proposed */
+	cluster_drm_affinity_record_verdict(1, false); /* a skip            */
+	cluster_drm_affinity_record_verdict(1, false); /* a skip            */
+
+	UT_ASSERT_EQ(cluster_drm_affinity_get_scan_counter(CLUSTER_DRM_AFFINITY_SCAN_RUNS), 2);
+	UT_ASSERT_EQ(cluster_drm_affinity_get_scan_counter(CLUSTER_DRM_AFFINITY_SCAN_CANDIDATES), 3);
+	UT_ASSERT_EQ(cluster_drm_affinity_get_scan_counter(CLUSTER_DRM_AFFINITY_SCAN_PROPOSED), 1);
+	UT_ASSERT_EQ(cluster_drm_affinity_get_scan_reason(0), 1);
+	UT_ASSERT_EQ(cluster_drm_affinity_get_scan_reason(1), 2);
+}
+
 /* ============================================================ */
 
 UT_DEFINE_GLOBALS();
@@ -349,7 +560,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(8);
+	UT_PLAN(15);
 	UT_RUN(test_drm_sample_records_to_master_matrix);
 	UT_RUN(test_drm_sample_pure_stats);
 	UT_RUN(test_drm_collect_candidates_threshold);
@@ -358,6 +569,13 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_drm_ring_flush_drops_stale_epoch);
 	UT_RUN(test_drm_window_identity_discards_stale);
 	UT_RUN(test_drm_local_remote_split);
+	UT_RUN(test_drm_window_open_and_due);
+	UT_RUN(test_drm_window_judge_hot_streak);
+	UT_RUN(test_drm_window_judge_cold_clears_streak);
+	UT_RUN(test_drm_window_judge_identity_change_breaks);
+	UT_RUN(test_drm_window_judge_overdue_breaks);
+	UT_RUN(test_drm_window_consecutive_cap);
+	UT_RUN(test_drm_scan_observability_counters);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

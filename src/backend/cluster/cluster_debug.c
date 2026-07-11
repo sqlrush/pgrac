@@ -120,6 +120,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_drm_affinity.h" /* spec-7.6 6.3b — drm_affinity dump */
+#include "cluster/cluster_drm_decision.h" /* spec-7.6 6.3c — reason names for scan tally */
 #include "catalog/pg_control.h"			  /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
@@ -3177,6 +3178,29 @@ dump_drm_affinity(ReturnSetInfo *rsinfo)
 	emit_row(
 		rsinfo, "drm_affinity", "flush_batches",
 		fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_FLUSH_BATCHES)));
+
+	/* spec-7.6 6.3c decision-scan surface: run / candidate / proposal totals plus
+	 * a per-reason verdict tally (stable key "scan_" + ClusterDrmReason name). */
+	emit_row(
+		rsinfo, "drm_affinity", "scans_run",
+		fmt_int64((int64)cluster_drm_affinity_get_scan_counter(CLUSTER_DRM_AFFINITY_SCAN_RUNS)));
+	emit_row(rsinfo, "drm_affinity", "scan_candidates",
+			 fmt_int64((int64)cluster_drm_affinity_get_scan_counter(
+				 CLUSTER_DRM_AFFINITY_SCAN_CANDIDATES)));
+	emit_row(rsinfo, "drm_affinity", "scan_proposed",
+			 fmt_int64(
+				 (int64)cluster_drm_affinity_get_scan_counter(CLUSTER_DRM_AFFINITY_SCAN_PROPOSED)));
+	{
+		int r;
+
+		for (r = 0; r < DRM_REASON__COUNT; r++) {
+			char key[64];
+
+			snprintf(key, sizeof(key), "scan_%s", cluster_drm_reason_name(r));
+			emit_row(rsinfo, "drm_affinity", key,
+					 fmt_int64((int64)cluster_drm_affinity_get_scan_reason(r)));
+		}
+	}
 }
 
 static void

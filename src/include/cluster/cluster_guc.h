@@ -412,6 +412,16 @@ extern int cluster_grd_rebuild_timeout_ms;
 extern bool cluster_drm_enabled;
 extern int cluster_drm_affinity_sample_rate;
 extern int cluster_drm_min_access_count;
+
+/* spec-7.6 6.3c: DRM hotness decision + anti-thrash GUCs. */
+extern int cluster_drm_affinity_ratio_pct;
+extern int cluster_drm_consecutive_triggers;
+extern int cluster_drm_affinity_window_ms;
+extern int cluster_drm_cooldown_ms;
+extern int cluster_drm_max_migrations_per_scan;
+extern int cluster_drm_scan_interval_ms;
+extern int cluster_drm_migration_cost;
+extern bool cluster_drm_manual_only;
 extern int cluster_hw_remaster_retry_backoff_ms;
 extern int cluster_hw_remaster_retry_max_attempts;
 
