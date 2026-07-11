@@ -464,11 +464,25 @@ cluster_undo_verdict_from_authority_wire_page(const struct ClusterGcsUndoVerdict
 /*
  * cluster_undo_verdict_from_block_proof
  *
- * D3-1 pure mapper: a CP3 single-block positive proof (exact xid+wrap slot
- * match on the shipped block0 bytes) -> the taxonomy.  COMMITTED carries the
- * true commit SCN (EXACT); ABORTED is terminal; NONE is UNKNOWN_FAIL_CLOSED,
- * which the orchestrator reads as "fall to the CP5 origin verdict", never as
- * a terminal answer to the caller (Rule 8.A).  Pure.
+ * D3-1 pure mapper: a CP3 single-block positive proof (an xid slot match on the
+ * shipped block0 bytes) -> the taxonomy.  COMMITTED carries the true commit SCN
+ * (EXACT); ABORTED is terminal; NONE is UNKNOWN_FAIL_CLOSED, which the
+ * orchestrator reads as "fall to the CP5 origin verdict", never as a terminal
+ * answer to the caller (Rule 8.A).  Pure.
+ *
+ * UNGATED (spec-5.22c/5.22f Hardening, root-cause-#1 review): this mapper takes
+ * COMMITTED at face value and passes the proof's wrap/scn straight through -- it
+ * has no horizon / expected-wrap / CLOG inputs and applies NO anti-ABA of its
+ * own.  A single-block COMMITTED proof is EVIDENCE, not a verdict: a recycled
+ * slot reused by the same xid reports a bumped wrap and an unrelated commit_scn
+ * (test_cluster_runtime_visibility recycled-same-xid case), and a durable
+ * COMMITTED stamp also lands at 2PC pre-commit, so a stamped-then-crashed xid is
+ * in-doubt.  It is therefore safe to reach ONLY behind a caller that already
+ * applied the anti-ABA + commit-finality: the D4 dead-owner authority
+ * complete-scan (uniqueness over the full durable set), or the CP5 origin
+ * verdict leg (own-CLOG cross-check + wrap-suspect gate).  The single-block
+ * fetch / fresh-ref fast leg MUST NOT call this for COMMITTED -- it breaks to
+ * the verdict leg (C1b, cluster_runtime_visibility.c).
  */
 ClusterUndoVerdictResult
 cluster_undo_verdict_from_block_proof(ClusterVisTtProof proof, SCN commit_scn, uint16 wrap)

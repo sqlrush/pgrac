@@ -258,6 +258,43 @@ UT_TEST(test_ttproof_committed_is_evidence_not_verdict)
 				 CLUSTER_VIS_TT_PROOF_COMMITTED);
 }
 
+/* spec-5.22c/5.22f Hardening (root-cause-#1 integration review, #1) --
+ * "recycled-ref-disguised-as-fresh".  A slot recycled and reused by the SAME
+ * raw xid bytes but a BUMPED wrap, carrying a COMMITTED stamp for a DIFFERENT
+ * commit, still classifies COMMITTED: the scan matches on xid and REPORTS the
+ * slot's current wrap/scn -- it does NOT compare against the ref's expected
+ * wrap (it has none to compare).  So a single-block COMMITTED proof is EVIDENCE
+ * only; the anti-ABA belongs to the caller, applied downstream (D4
+ * complete-scan uniqueness, or the CP5 verdict leg's wrap-suspect gate -- see
+ * test_cluster_tt_durable test_wrap_suspect_below_horizon_unreliable_is_suspect
+ * and the C1b routing pinned by t/365 L4 / t/359 L3).  This case (same xid,
+ * bumped wrap) is distinct from the recycled DIFFERENT-xid -> NONE case pinned
+ * by test_cluster_undo_verdict U12: here the proof is COMMITTED but the
+ * reported scn/wrap are the RECYCLED commit's, so trusting them terminally
+ * would false-commit.  Pin the report-not-gate contract so no future change
+ * lets the fast leg conclude EXACT from a proof's COMMITTED. */
+UT_TEST(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	SCN scn = InvalidScn;
+	uint16 wrap = 0;
+
+	/* A fresh ref bound (xid 1000, wrap 5); the slot's wrap was bumped to 99 by
+	 * a whole-segment recycle, then the bytes reused by the same raw xid with a
+	 * COMMITTED stamp for an unrelated commit (scn 9999). */
+	set_slot(hdr, 4, 1000, 99, (uint8)TT_SLOT_COMMITTED, (SCN)9999);
+
+	/* Still COMMITTED (matches on xid), and it reports the CURRENT slot wrap
+	 * (99) and scn (9999) -- the recycled commit's, NOT the ref's (wrap 5).
+	 * The scan cannot self-detect the ABA; the caller must route to the verdict
+	 * leg so the wrap-suspect gate can refuse. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 &scn, &wrap),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(wrap, 99);
+	UT_ASSERT_EQ((uint64)scn, 9999);
+}
+
 /* 0-match / ACTIVE / COMMITTED-without-scn: never a proof (user boundary:
  * a single fetched block's 0-match is NOT recycled/aborted evidence). */
 UT_TEST(test_ttproof_zero_match_active_invalid_scn)
@@ -823,7 +860,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -835,6 +872,7 @@ main(void)
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
+	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
 	UT_RUN(test_tt_block_xid_scan_core);
