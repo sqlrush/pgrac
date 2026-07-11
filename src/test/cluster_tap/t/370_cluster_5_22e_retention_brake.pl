@@ -100,6 +100,19 @@ sub poll_ok
 	return 0;
 }
 
+# SCN wire encoding is (8-bit node_id || 56-bit local_scn), so the raw
+# horizon_last_floor_scn gauge value carries the pinning node's id in the
+# top byte (diagnostic feature).  Cross-sample floor comparisons must use
+# the 56-bit TIME component only -- the fold's scn_time_cmp min can flip
+# between node encodings across samples, and a raw numeric compare across
+# encodings is meaningless (node1-encoded values are always numerically
+# larger than node0-encoded ones).
+sub scn_time
+{
+	my ($v) = @_;
+	return $v & 0x00FFFFFFFFFFFFFF;
+}
+
 sub arm_conf_injection
 {
 	my ($node, $spec) = @_;
@@ -110,10 +123,18 @@ sub arm_conf_injection
 
 sub disarm_conf_injection
 {
-	my ($node) = @_;
-	$node->safe_psql('postgres', 'ALTER SYSTEM RESET cluster.injection_points');
+	# L477: a colon-typed arm (':skip' etc.) survives the not-in-list
+	# reclaim of a bare RESET (only WARNING arms are reclaimed), so the
+	# disarm must explicitly re-arm the point to ':none' in every process
+	# (t/338 precedent) before clearing the GUC text.
+	my ($node, $point) = @_;
+	$node->safe_psql('postgres',
+		"ALTER SYSTEM SET cluster.injection_points = '$point:none'");
 	$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
 	usleep(1_500_000);
+	$node->safe_psql('postgres', 'ALTER SYSTEM RESET cluster.injection_points');
+	$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
+	usleep(500_000);
 }
 
 # ============================================================
@@ -198,7 +219,7 @@ ok( poll_ok(
 
 	# give the pin one report round to reach node0
 	usleep(3_000_000);
-	my $floor_pinned = state_val($node0, 'undo', 'horizon_last_floor_scn');
+	my $floor_pinned = scn_time(state_val($node0, 'undo', 'horizon_last_floor_scn'));
 	my $gcd_pinned   = state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd');
 
 	# churn: committed xacts whose commit_scn now sits ABOVE node1's pin,
@@ -206,7 +227,7 @@ ok( poll_ok(
 	churn_commits($node0, 12);
 	usleep(4_000_000); # >= a few cleaner passes + report rounds
 
-	my $floor_held = state_val($node0, 'undo', 'horizon_last_floor_scn');
+	my $floor_held = scn_time(state_val($node0, 'undo', 'horizon_last_floor_scn'));
 	my $gcd_held   = state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd');
 	cmp_ok($floor_held, '<=', $floor_pinned + 0,
 		'L1 HARD ASSERT: proven floor froze at the pinned read_scn (no advance past the pin)');
@@ -223,7 +244,7 @@ ok( poll_ok(
 	# release: floor advances past the pin and the held slots recycle
 	ok( poll_ok(
 			sub {
-				state_val($node0, 'undo', 'horizon_last_floor_scn') > $floor_held
+				scn_time(state_val($node0, 'undo', 'horizon_last_floor_scn')) > $floor_held
 				  && state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd') > $gcd_held;
 			},
 			30),
@@ -261,7 +282,7 @@ ok( poll_ok(
 	is(state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd'),
 		$gcd_stalled, 'L2 recycling paused while stalled (no local fallback, Q3\'\')');
 
-	disarm_conf_injection($node0);
+	disarm_conf_injection($node0, 'cluster-undo-horizon-report-drop');
 
 	# self-heal: fresh reports land, the floor advances, recycling resumes
 	ok( poll_ok(
@@ -286,7 +307,7 @@ ok( poll_ok(
 	is(state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd'),
 		$gcd_pre, 'L6 the aborted passes recycled nothing (mutation refused at the fence)');
 
-	disarm_conf_injection($node0);
+	disarm_conf_injection($node0, 'cluster-undo-horizon-epoch-fence');
 	ok( poll_ok(
 			sub { state_val($node0, 'undo', 'cleaner_shmem_tt_slots_gcd') > $gcd_pre }, 30),
 		'L6 disarm: recycling resumed past the fence');
@@ -301,11 +322,29 @@ ok( poll_ok(
 	# node0 dead-decides node1 (heartbeat 2s x deadband 5 = ~10s) and the
 	# reconfig drops it from the required set; the floor then advances
 	# again WITHOUT node1's reports.
+	#
+	# Sample floor_pre BEFORE the churn: node1's last report stays fresh
+	# for ~3s after the kill, so a fold sampled after the churn would
+	# already contain the churn-advanced clock -- and with no commits
+	# after that the self-only fold pins at exactly floor_pre forever
+	# (the no-reader local-horizon fallback is the static Lamport clock).
+	# Churning after the sample guarantees the post-drop fold lands
+	# strictly above it.
+	my $floor_pre = scn_time(state_val($node0, 'undo', 'horizon_last_floor_scn'));
 	churn_commits($node0, 4);
-	my $floor_pre = state_val($node0, 'undo', 'horizon_last_floor_scn');
 	ok( poll_ok(
-			sub { state_val($node0, 'undo', 'horizon_last_floor_scn') > $floor_pre }, 60),
-		'L3 self-heal: floor advances again after the dead member left the required set');
+			sub {
+				scn_time(state_val($node0, 'undo', 'horizon_last_floor_scn')) > $floor_pre;
+			},
+			60),
+		'L3 self-heal: floor advances again after the dead member left the required set')
+	  or diag(sprintf(
+			'floor_pre=%s floor_now=%s local_horizon=%s stall=%s reports=%s',
+			$floor_pre,
+			state_val($node0, 'undo', 'horizon_last_floor_scn'),
+			state_val($node0, 'undo', 'retention_horizon_scn'),
+			state_val($node0, 'undo', 'horizon_stall_count'),
+			state_str($node0, 'undo', 'horizon_peer_reports')));
 }
 
 # ============================================================
