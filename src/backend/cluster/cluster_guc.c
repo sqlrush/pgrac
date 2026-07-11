@@ -1661,28 +1661,6 @@ cluster_init_guc(void)
 		&cluster_crossnode_runtime_visibility, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
-	 * cluster.undo_gcs_coherence -- spec-5.22b D2 master switch for the
-	 * shared-undo block data plane.  OFF (default): undo segments stay on the
-	 * local DataDir and cross-instance undo reads take the 6.12i unmastered
-	 * fetch path (fresh ref => 53R97) -- byte-identical to pre-D2, a safe
-	 * rollback surface.  ON: own-instance runtime AND redo undo writes migrate
-	 * to the shared cluster_fs root (cluster.shared_data_dir), and undo blocks
-	 * become owner-as-master GCS resources (grant / PI land in D2-3/D2-4).
-	 * Gating physical migration on this switch (not merely peer-mode) keeps
-	 * runtime and redo writes consistent -- both move only when it is on, so a
-	 * default deployment never splits runtime-shared vs redo-local
-	 * (Hardening v1.0.1 裁决 A).  PGC_SIGHUP: flippable for the D6 end-to-end
-	 * validation window; a default-ON flip is a separate decision after D3-D6.
-	 */
-	DefineCustomBoolVariable(
-		"cluster.undo_gcs_coherence",
-		gettext_noop("Enable the shared-undo block GCS data plane (spec-5.22b)."),
-		gettext_noop("Off keeps undo on the local data dir and cross-instance undo "
-					 "fail-closed (SQLSTATE 53R97).  Requires cluster.shared_data_dir when on."),
-		&cluster_undo_gcs_coherence, false, PGC_SIGHUP, 0, check_cluster_undo_gcs_coherence, NULL,
-		NULL);
-
-	/*
 	 * cluster.xid_striping -- spec-6.15 D1 (AD-012 exception 10 xid
 	 * space segmentation).  When on, this node only issues 32-bit xids
 	 * congruent to its declared node slot modulo 16, making the xid
@@ -2035,6 +2013,37 @@ cluster_init_guc(void)
 		check_cluster_shared_data_dir, /* check_hook */
 		NULL,						   /* assign_hook */
 		NULL);						   /* show_hook */
+
+	/*
+	 * cluster.undo_gcs_coherence -- spec-5.22b D2 master switch for the
+	 * shared-undo block data plane.  OFF (default): undo segments stay on the
+	 * local DataDir and cross-instance undo reads take the 6.12i unmastered
+	 * fetch path (fresh ref => 53R97) -- byte-identical to pre-D2, a safe
+	 * rollback surface.  ON: own-instance runtime AND redo undo writes migrate
+	 * to the shared cluster_fs root (cluster.shared_data_dir), and undo blocks
+	 * become owner-as-master GCS resources (grant / PI land in D2-3/D2-4).
+	 * Gating physical migration on this switch (not merely peer-mode) keeps
+	 * runtime and redo writes consistent -- both move only when it is on, so a
+	 * default deployment never splits runtime-shared vs redo-local
+	 * (Hardening v1.0.1 裁决 A).  PGC_SIGHUP: flippable for the D6 end-to-end
+	 * validation window; a default-ON flip is a separate decision after D3-D6.
+	 *
+	 * Registration order matters: this block registers AFTER
+	 * cluster.shared_data_dir on purpose.  Boot-time values from
+	 * postgresql.conf / postgresql.auto.conf are applied at registration
+	 * time in registration order, and this GUC's check_hook reads the
+	 * cluster_shared_data_dir global.  Registering before it made a
+	 * conf-file "on" impossible (rejected at every boot), which also made
+	 * crash replay run with coherence silently off -- the redo-local vs
+	 * runtime-shared split-brain that 裁决 A forbids.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.undo_gcs_coherence",
+		gettext_noop("Enable the shared-undo block GCS data plane (spec-5.22b)."),
+		gettext_noop("Off keeps undo on the local data dir and cross-instance undo "
+					 "fail-closed (SQLSTATE 53R97).  Requires cluster.shared_data_dir when on."),
+		&cluster_undo_gcs_coherence, false, PGC_SIGHUP, 0, check_cluster_undo_gcs_coherence, NULL,
+		NULL);
 
 	/*
 	 * cluster.controlfile_shared_authority -- spec-5.6 Da3 opt-in switch for

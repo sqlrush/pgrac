@@ -125,7 +125,11 @@ my %expect_cat = (
 	recovery     => 39,    # 3.16(4)+4.10 block(2)+4.11 thread(4)+4.3 plan(13)+4.4 worker(8)+4.5/4.7 merge(8)
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 10,    # 4.7 warm-recovery(8) + spec-2.41 D7 redo-coverage serve-gate(2)
-	cr           => 64,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
+	cr           => 78,    # (64 -> 78 swept 2026-07-11: main-carry drift from the
+	                       # RC#1 / spec-7.x merge train; this file sits in the
+	                       # t/249-272 nightly shard hole, so CI never catches a
+	                       # stale value here -- spec-5.22b Hardening v1.0.7-④)
+	                       # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
 	                       # + ... + 6.12b(6) + 6.12i/6.15(16) + 2 spec-5.22f D6 fresh-ref verdict
 	                       # + 5 spec-5.22d D4 authority serve (undo_authority_
 	                       # {serve_hit,fail_closed,epoch_stale_reject} + A1
@@ -147,8 +151,9 @@ my %expect_cat = (
 	                       # below_horizon,inadmissible}, cr_server_verdict_{served,
 	                       # denied}, rtvis_underivable_failclosed (all unconditional
 	                       # in dump_cr, so the count is deterministic = 57)
-	pcm          => 22,    # 2.37 PI watermark + lock state + 6.14 D5 aux-deferred release
+	pcm          => 23,    # 2.37 PI watermark + lock state + 6.14 D5 aux-deferred release
 	                       # + spec-6.14a (b)-leg nonholder fail-closed counter
+	                       # (22 -> 23 swept 2026-07-11 with the cr sweep above)
 );
 for my $cat (sort keys %expect_cat)
 {
