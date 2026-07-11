@@ -45,6 +45,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
@@ -53,6 +54,7 @@
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
 #include "cluster/cluster_hw_lease.h"		  /* spec-6.12d lease counter stub */
 #include "cluster/cluster_relmap_authority.h" /* spec-6.14 D5 header-read stub */
+#include "cluster/cluster_xid_authority.h"	  /* spec-6.15b XID authority dump stubs */
 
 #undef printf
 #undef fprintf
@@ -333,11 +335,39 @@ cluster_remote_xact_side_effect_drop_count(void)
 {
 	return 0;
 }
+/* spec-7.1 D3-a stub: dump_state (cluster_debug.o) reads the striped-multixact
+ * origin-derivation observability counters; cluster_multixact.o is not linked
+ * here.  Stub each to return 0 (matches the module-disabled path). */
+uint64
+cluster_multixact_get_mxid_halfspace_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_mxid_underivable_read_count(void)
+{
+	return 0;
+}
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
  * cluster_relmap_authority.o is not linked here.  cluster_shared_catalog is
  * false above, so the read is short-circuited and never called. */
 bool
 cluster_relmap_authority_read_header(bool shared_map, Oid dbid, ClusterRelmapAuthorityHeader *out)
+{
+	return false;
+}
+
+/* spec-6.15b D7 stubs: dump_catalog reads the XID authority observation
+ * keys; this standalone debug unit does not link the file-I/O authority
+ * objects. */
+bool
+cluster_xid_authority_read(ClusterXidAuthorityHeader *out)
+{
+	return false;
+}
+
+bool
+cluster_xid_prehistory_was_adopted(void)
 {
 	return false;
 }
@@ -564,6 +594,9 @@ uint64 cluster_hw_failclosed_count(void);
 uint64 cluster_hw_not_ready_count(void);
 uint64 cluster_hw_remaster_done_count(void);
 uint64 cluster_hw_remaster_blocked_count(void);
+uint64 cluster_hw_remaster_retry_count(void);
+uint64 cluster_hw_remaster_retry_exhausted_count(void);
+bool cluster_hw_remaster_recoverable(void);
 uint64
 cluster_hw_alloc_count(void)
 {
@@ -603,6 +636,21 @@ uint64
 cluster_hw_remaster_blocked_count(void)
 {
 	return 0;
+}
+uint64
+cluster_hw_remaster_retry_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_remaster_retry_exhausted_count(void)
+{
+	return 0;
+}
+bool
+cluster_hw_remaster_recoverable(void)
+{
+	return true;
 }
 
 /* spec-5.7 D4 dump_dl stubs (cluster_dl.c not linked in this binary). */
@@ -940,6 +988,30 @@ cluster_gcs_get_block_request_count(void)
 {
 	return 0;
 }
+/* spec-7.2 D6 stubs: ship-latency histogram accessors. */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	return (bucket == 15) ? UINT64_MAX : (uint64)(bucket + 1) * 1000;
+}
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	(void)bucket;
+	return 0;
+}
+/* spec-7.2 flip stubs: plane facts. */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return false;
+}
+uint64
+cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
 uint64
 cluster_gcs_get_block_reply_count(void)
 {
@@ -1039,6 +1111,28 @@ cluster_gcs_get_block_dedup_collision_count(void)
 }
 uint64
 cluster_gcs_get_block_dedup_full_count(void)
+{
+	return 0;
+}
+
+/* spec-7.2a D5 stubs: 3 NEW dedup capacity/occupancy accessors. */
+uint64
+cluster_gcs_get_block_dedup_entry_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_evict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_max_entries(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_block_dedup_get_misroute_failclosed_count(void)
 {
 	return 0;
 }
@@ -1839,6 +1933,21 @@ cluster_cr_server_verdict_denied_count(void)
 	return 0;
 }
 uint64
+cluster_cr_server_multi_verdict_served_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_multi_verdict_denied_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_fence_refused_count(void)
+{
+	return 0;
+}
+uint64
 cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;
@@ -1878,6 +1987,62 @@ cluster_undo_authority_scan_incomplete_reject_count(void)
 }
 uint64
 cluster_undo_authority_multi_match_reject_count(void)
+{
+	return 0;
+}
+/* spec-7.1 D0/D5: 53R97 per-leg attribution counters. */
+uint64
+cluster_vis53r97_leg_invalid_scn_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_zero_match_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_srv_other_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_covers_refuse_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_unresolvable_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmax_unprovable_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmin_overlay_verdict_ask_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_xmin_overlay_verdict_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_member_serve_ask_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_multi_member_serve_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis53r97_leg_live_upgrade_hit_count(void)
 {
 	return 0;
 }
@@ -2169,6 +2334,32 @@ cluster_thread_recovery_get_replay_failclosed(void)
 }
 XLogRecPtr
 cluster_thread_recovery_get_recovered_through(void)
+{
+	return 0;
+}
+/* spec-7.1a D6 write-write chaining counter accessor stubs. */
+uint64
+cluster_vis_get_writer_chain_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_writer_chain_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_xmax_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_overlay_refresh_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_covers_scn_refuse_count(void)
 {
 	return 0;
 }
@@ -2758,6 +2949,21 @@ cluster_lmon_last_liveness_tick_at(void)
 }
 int64
 cluster_lmon_main_loop_iters(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_last_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_max_iter_us(void)
+{
+	return 0;
+}
+uint64
+cluster_lmon_slow_iter_count(void)
 {
 	return 0;
 }
@@ -3411,15 +3617,77 @@ cluster_grd_deadlock_chunk_oo_buffer_overflow_count(void)
 	return 0;
 }
 
-/* spec-4.6 D5 stub:  dump_grd_recovery consumes the bulk counter
- * snapshot.  Zero-fill;  layout = 13 × uint64 (must track the
- * ClusterGrdRecoveryCounters struct in cluster_grd.h). */
-struct ClusterGrdRecoveryCounters;
-void cluster_grd_recovery_counters_snapshot(struct ClusterGrdRecoveryCounters *out);
-void
-cluster_grd_recovery_counters_snapshot(struct ClusterGrdRecoveryCounters *out)
+uint32
+cluster_grd_recovery_state_value(void)
 {
-	memset(out, 0, 13 * sizeof(uint64));
+	return (uint32)GRD_RECOVERY_IDLE;
+}
+
+const char *
+cluster_grd_recovery_state_name(uint32 state pg_attribute_unused())
+{
+	return "idle";
+}
+
+uint64
+cluster_grd_recovery_last_event_id(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_event_old_epoch(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_episode_epoch_value(void)
+{
+	return 0;
+}
+
+uint32
+cluster_grd_recovery_event_coordinator(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_done_epoch_for(int32 node pg_attribute_unused())
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_done_bitmap_hash_for(int32 node pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+cluster_grd_recovery_block_redeclare_cursor(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_block_redeclare_epoch(void)
+{
+	return 0;
+}
+
+bool
+cluster_grd_recovery_block_redeclare_done(void)
+{
+	return true;
+}
+
+/* spec-4.6 D5 stub: dump_grd_recovery consumes the bulk counter snapshot. */
+void
+cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
+{
+	memset(out, 0, sizeof(*out));
 }
 
 uint32
@@ -3497,6 +3765,16 @@ cluster_reconfig_get_join_timeout_count(void)
 }
 uint64
 cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_slow_ack_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_marker_timeout_count(void)
 {
 	return 0;
 }
@@ -3679,6 +3957,45 @@ uint64
 cluster_lms_get_priority_starvation_observed_count(void)
 {
 	return 0;
+}
+/* spec-7.3 D8 — per-worker observability stubs (+ the pool-size GUC the
+ * dump uses to bound the per-worker rows). */
+int cluster_lms_workers = 2;
+uint64
+cluster_lms_obs_get_dispatch_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_direct_reply_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_conn_reset_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_inline_serve_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_serve_hist(int worker_id pg_attribute_unused(),
+							   int bucket pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_serve_hist_bound_us(int bucket)
+{
+	static const uint64 bounds[15] = { 50,	  100,	 200,	 500,	 1000,	 2000,	  5000,	  10000,
+									   20000, 50000, 100000, 200000, 500000, 1000000, 5000000 };
+
+	if (bucket < 0 || bucket >= 15)
+		return UINT64_MAX;
+	return bounds[bucket];
 }
 const char *
 cluster_lms_state_to_string(int s pg_attribute_unused())

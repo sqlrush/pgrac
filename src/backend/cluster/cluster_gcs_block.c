@@ -38,6 +38,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/multixact.h" /* MultiXactIdIsValid (spec-7.1 D3-b fetch) */
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_clean_leave.h" /* spec-5.13 S6 — CL-I5 serve gate */
@@ -47,24 +48,28 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms_shard.h"		 /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
-#include "cluster/cluster_membership.h"		/* spec-5.16 D3b — is_member master-side gate */
-#include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
-#include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
-#include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D2/D3/D4 profiling buckets */
-#include "cluster/cluster_xnode_lever.h"	/* spec-6.12a — downgrade counters */
+#include "cluster/cluster_membership.h"		 /* spec-5.16 D3b — is_member master-side gate */
+#include "cluster/cluster_qvotec.h"			 /* spec-5.16 D3b — in_quorum master-side gate */
+#include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
+#include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
+#include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h" /* PGRAC: spec-7.3 D5 — my DATA channel = worker id */
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 2 */
 #include "common/hashfn.h"
@@ -119,6 +124,7 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	 * UNDO_TT_FETCH_RESULT reply (epoch / live_hwm ride the header). */
 	bool reply_undo_trailer_valid;
 	uint64 reply_undo_tt_generation;
+	uint64 reply_undo_authority_scn; /* PGRAC: spec-7.1a D3 (trailer SCN) */
 	ConditionVariable reply_cv;
 	/* PGRAC: spec-2.34 D3/D4 — HC100 stale-reply defense + epoch invalidation.
 	 *  request_epoch:        snapshot of cluster_epoch at the time the
@@ -281,10 +287,54 @@ typedef struct ClusterGcsBlockShared {
 					   * comparable version unit (per-thread WAL makes
 					   * cross-node LSN comparison meaningless) */
 	} pi_note_ring[CLUSTER_GCS_PI_NOTE_RING_SIZE];
+
+	/* PGRAC: spec-7.2 D6 — requester-side block-ship latency histogram.
+	 * Bucketed at the single normal-exit funnel of
+	 * cluster_gcs_send_block_request_and_wait (GRANTED / STORAGE_FALLBACK /
+	 * READ_IMAGE completions only;  ereport exits lose the sample, mirroring
+	 * the xp scopes).  This is the ruler for the spec-7.2 value gate
+	 * (ship p99 < 20ms, p50 < 5ms) and the 7.7/7.8 wait-closure legs. */
+	pg_atomic_uint64 ship_latency_hist[CLUSTER_GCS_SHIP_HIST_BUCKETS];
 } ClusterGcsBlockShared;
 
 
 static ClusterGcsBlockShared *ClusterGcsBlock = NULL;
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram bucket upper bounds (us).
+ * 15 bounds -> 16 buckets;  the last bucket is the +inf overflow. */
+static const uint64 gcs_ship_hist_bounds_us[CLUSTER_GCS_SHIP_HIST_BUCKETS - 1]
+	= { 500,	1000,	2000,	 5000,	  10000,   20000,	 50000,	  100000,
+		200000, 500000, 1000000, 2000000, 5000000, 10000000, 30000000 };
+
+/*
+ * PGRAC: spec-7.2 D3/D4 — registry probe:  is the GCS block family on
+ * the DATA plane?  REPLY stands in for all five (they flip atomically,
+ * H-5).  Both LMON tick sites (ship_ready / pi_discard) and the LMS
+ * data-plane loop consult this so the flip commit only edits the six
+ * registration structs and everything pivots at once.
+ */
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	const ClusterICMsgTypeInfo *info = cluster_ic_get_msg_type_info(PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+
+	return info != NULL && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA;
+}
+
+/* Record one completed ship into the histogram (requester context). */
+static void
+gcs_block_ship_hist_record(TimestampTz started_at)
+{
+	uint64 elapsed_us;
+	int b = 0;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+	elapsed_us = (uint64)(GetCurrentTimestamp() - started_at);
+	while (b < CLUSTER_GCS_SHIP_HIST_BUCKETS - 1 && elapsed_us > gcs_ship_hist_bounds_us[b])
+		b++;
+	pg_atomic_fetch_add_u64(&ClusterGcsBlock->ship_latency_hist[b], 1);
+}
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 
 
@@ -381,6 +431,9 @@ cluster_gcs_block_shmem_init(void)
 
 	if (!found) {
 		memset(ClusterGcsBlock, 0, sizeof(*ClusterGcsBlock));
+		/* PGRAC: spec-7.2 D6 — ship-latency histogram buckets. */
+		for (i = 0; i < CLUSTER_GCS_SHIP_HIST_BUCKETS; i++)
+			pg_atomic_init_u64(&ClusterGcsBlock->ship_latency_hist[i], 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_request_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_reply_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_timeout_count, 0);
@@ -1199,6 +1252,39 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 		return GCS_BLOCK_RECOVERING;
 	}
 
+	/*
+	 * r3-P2-1 unseal-safety proof — this predicate is heartbeat LIVENESS
+	 * (CSSD hysteresis flips DEAD->ALIVE on heartbeat receipt alone,
+	 * cluster_cssd.c deadband scan), NOT a direct "instance recovery
+	 * complete" signal.  It is nevertheless safe to return NORMAL here,
+	 * because on a crash-restarted master the heartbeat source itself is
+	 * recovery-gated:
+	 *  (1) CSSD — the only heartbeat sender — is spawned by the cluster
+	 *      phase-4 driver, which the postmaster reaper invokes only at the
+	 *      PM_RUN transition, i.e. after the startup process exited 0 and
+	 *      the node's crash recovery fully replayed its WAL thread to shared
+	 *      storage (the ServerLoop respawn is equally PM_RUN-gated).  A
+	 *      still-recovering node sends NO heartbeats, so a survivor's DEAD
+	 *      verdict cannot flip back early.
+	 *  (2) Belt-and-suspenders: even under a stale-ALIVE view (fast restart
+	 *      inside the deadband), a fetch cannot complete against a
+	 *      still-recovering node.  The master-side handler
+	 *      (cluster_gcs_handle_block_request_envelope) default-denies unless
+	 *      the node is an in-quorum MEMBER, and cluster_qvotec_in_quorum()
+	 *      demands QUORUM_OK plus a live lease — state only the QVOTEC
+	 *      process (phase-4 / post-PM_RUN as well) can establish after a
+	 *      restart wiped shmem.  The deny replies map to bounded 53R9L; an
+	 *      unresponsive endpoint exhausts the retransmit budget into bounded
+	 *      53R90.  Neither path ever falls back to a silent local storage
+	 *      read (STORAGE_FALLBACK is a master REPLY status, not a local
+	 *      fallback).
+	 *  (3) For online_join rejoin, MEMBER additionally requires coordinator
+	 *      admission, which vets the joiner's post-recovery voting slot
+	 *      (the slot_generation != 0 readiness sub-gate).
+	 * So heartbeat-ALIVE implies the returned master completed its own
+	 * instance recovery: its committed WAL is on shared storage and no
+	 * merged-materialization proof is needed for its blocks.
+	 */
 	if (static_master == cluster_node_id
 		|| cluster_cssd_get_peer_state(static_master) != CLUSTER_CSSD_PEER_DEAD)
 		return GCS_BLOCK_NORMAL;
@@ -1221,12 +1307,8 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 
 	/*
 	 * spec-4.7 D7 + D5 — static master is DEAD;  the block is remastered to a
-	 * live survivor (recovery-aware routing).  The survivor may SERVE only
-	 * after the dead origin's merged WAL recovery passes the redo-before-
-	 * unfreeze gate;  before that the shared-storage / re-declared version may
-	 * be stale → fail-closed RECOVERING (never a stale page).
-	 *
-	 * TWO conditions, both required (Q5):
+	 * live survivor (recovery-aware routing).  Two conditions are both
+	 * required before the on-disk version may be served (Q5):
 	 *  (a) is_materialized(origin):  the dead origin's merged replay completed
 	 *      (publish is atomic at end-of-replay with the max EndRecPtr).  This
 	 *      is the cold-block safety door — a block NO survivor observed has no
@@ -1236,12 +1318,20 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 *      survivor DID observe (rebuilt pi_watermark_lsn > 0), the dead
 	 *      origin's recovered_lsn must reach that observed page_lsn — else the
 	 *      dead node wrote a version a survivor saw but whose WAL never durably
-	 *      reached us → lost-write → fail-closed.  This is the LSN comparison
-	 *      (NOT a bool), live in the serve path;  required_lsn == 0 (cold) is
-	 *      trivially covered and (a) carries the safety.
+	 *      reached us → lost-write → fail-closed.
 	 *
-	 * Once both hold → NORMAL → the re-routed survivor serves (rebuilt-from-
-	 * redeclare for held blocks, lazy minimal view for cold blocks).
+	 * spec-4.6a Amendment v1.2 (R1):  this proof is UNCONDITIONAL.  Where
+	 * online thread recovery cannot run (GUC off — the default — or any
+	 * >2-node deployment) the materialization authority is never published,
+	 * so a dead master's blocks stay RECOVERING until the failed node
+	 * restarts and completes its own instance recovery (the unseal above is
+	 * heartbeat liveness; the r3-P2-1 note explains why heartbeats imply
+	 * recovery completion): a bounded, retryable
+	 * ERROR on the request path (53R9L), never an unproven serve.  A scope
+	 * predicate must never gate a correctness proof — a committed write on
+	 * a cold block that only the dead node saw has NO other guard on this
+	 * read path (GRD freeze ends with the episode; the HW gate covers only
+	 * extend high-water marks; pd_block_scn checks ride the ship path).
 	 */
 	if (!cluster_merged_instance_is_materialized(static_master)) {
 		if (ClusterGcsBlock != NULL)
@@ -1330,6 +1420,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	ClusterXpScope xp_recv;
 	bool xp_is_read;
 	bool xp_is_index;
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp. */
+	TimestampTz ship_started_at;
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1380,6 +1472,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		cluster_xp_begin(&xp_idx, CLXP_I_INDEX_BLOCK_XFER);
 	else
 		xp_idx.active = false;
+
+	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp (always on,
+	 * unlike the GUC-gated xp scopes above;  the histogram is the value-
+	 * gate ruler so it must not depend on profiling being enabled). */
+	ship_started_at = GetCurrentTimestamp();
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)transition_id, current_master, &request_id);
@@ -1970,6 +2067,13 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	cluster_xp_end(&xp_idx);
 	cluster_xp_end(&xp_req);
 
+	/* PGRAC: spec-7.2 D6 — record the completed ship into the latency
+	 * histogram (GRANTED / STORAGE_FALLBACK / READ_IMAGE all delivered a
+	 * usable page;  the terminal-denied tail below ereports and loses the
+	 * sample, mirroring the xp scopes). */
+	if (granted || granted_storage_fallback || read_image)
+		gcs_block_ship_hist_record(ship_started_at);
+
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
 	 * the caller must leave buf->pcm_state == N. */
@@ -2411,6 +2515,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2470,6 +2575,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 				auth_out->origin_epoch = slot->reply_header.epoch;
 				auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 				auth_out->tt_generation = slot->reply_undo_tt_generation;
+				auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
 				/* spec-5.14 D2: the authority is the origin's volatile
 				 * co-sample — depend on it for fail-stop (D-i3). */
 				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -2517,7 +2623,8 @@ static bool
 gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
 									 TransactionId xid, bool authoritative, bool authority_kind,
 									 GcsBlockReplyHeader *hdr_out,
-									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out)
+									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out,
+									 uint64 *authority_scn_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -2542,6 +2649,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->reply_undo_trailer_valid = false;
 		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
 		slot->request_epoch = stamped_epoch;
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -2614,6 +2722,11 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 					memcpy(page_out, slot->reply_block_data, sizeof(*page_out));
 				if (tt_generation_out != NULL)
 					*tt_generation_out = slot->reply_undo_tt_generation;
+				/* PGRAC: spec-7.1a D3 — the origin's co-sampled SCN clock
+				 * rides the reply trailer; raw copy-out like the other
+				 * carriers (the acceptance policy stays in the wrappers). */
+				if (authority_scn_out != NULL)
+					*authority_scn_out = slot->reply_undo_authority_scn;
 				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -2657,6 +2770,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	GcsBlockReplyHeader hdr;
 	ClusterGcsUndoVerdictPage page;
 	uint64 tt_generation = 0;
+	uint64 authority_scn = 0;
 	BufferTag tag;
 
 	if (verdict_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
@@ -2669,7 +2783,7 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 
 	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, cluster_epoch_get_current(), xid,
 											  authoritative, false /* owner-served kind */, &hdr,
-											  &page, &tt_generation))
+											  &page, &tt_generation, &authority_scn))
 		return false;
 
 	if (!cluster_vis_undo_verdict_page_usable(&page, xid))
@@ -2679,6 +2793,8 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	auth_out->origin_epoch = hdr.epoch;
 	auth_out->live_hwm_lsn = (XLogRecPtr)hdr.page_lsn;
 	auth_out->tt_generation = tt_generation;
+	/* PGRAC: spec-7.1a D3 — the origin SCN clock co-sampled with the scan. */
+	auth_out->authority_scn = (SCN)authority_scn;
 	/* spec-5.14 D2: the verdict is the origin's volatile
 	 * co-sample — depend on it for fail-stop (D-i3). */
 	gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -2736,7 +2852,9 @@ cluster_gcs_block_undo_authority_verdict_fetch_and_wait(int32 authority_node, in
 
 	if (!gcs_block_undo_verdict_wire_exchange(authority_node, tag, stamped_epoch, xid,
 											  false /* no owner-served sub-kind */,
-											  true /* kind 4 */, &hdr, &page, &tt_generation))
+											  true /* kind 4 */, &hdr, &page, &tt_generation,
+											  NULL /* authority co-sample: live-TT plane
+													* carriers are ignored on kind 4 */))
 		return false;
 
 	/* 8.A amend: full reply binding — sender IS the elected authority and
@@ -2755,6 +2873,177 @@ cluster_gcs_block_undo_authority_verdict_fetch_and_wait(int32 authority_node, in
 	gcs_block_stamp_touched(authority_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	*out = r;
 	return true;
+}
+
+
+/*
+ * PGRAC: spec-7.1 D3-b — requester-side batched multixact member-verdict fetch.
+ *
+ *	Ask origin_node for a per-member verdict on the foreign multixact `mxid`,
+ *	riding the same sub-case B wire shape as the single verdict fetch.  The
+ *	asked-for MXID rides the widened watermark carrier (upper 32 bits zero);
+ *	the synthetic tag keeps a placeholder segment (0) — the member scan is
+ *	complete over the multi's own pg_multixact, so the tag scopes nothing.
+ *
+ *	true  -> page_out (BLCKSZ) holds the structurally validated SERVED page and
+ *	         *auth_out the co-sampled authority; every member SCN that crossed
+ *	         the wire is Lamport-observed (AD-008) so a below-horizon bound is
+ *	         admissible on the next snapshot.
+ *	false -> fail-closed: timeout, DENIED, checksum failure, missing trailer,
+ *	         non-SERVED status, malformed page (Rule 8.A — the caller keeps its
+ *	         unchanged 53R97 refusal).
+ */
+bool
+cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXactId mxid,
+													char *page_out, ClusterLiveAuthority *auth_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	BufferTag tag;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool fetched = false;
+
+	if (page_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
+		|| !MultiXactIdIsValid(mxid))
+		return false;
+
+	memset(page_out, 0, BLCKSZ);
+	memset(auth_out, 0, sizeof(*auth_out));
+	tag = GcsBlockUndoFetchTagMake(0, 0); /* placeholder segment (scan is complete) */
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->reply_undo_trailer_valid = false;
+		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id;
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetUndoMultiVerdictRequest(&fwd, true);
+		/* The widened mxid rides the watermark carrier (upper 32 bits zero). */
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)(uint64)mxid);
+
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)origin_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue undo-multi-verdict fetch "
+								   "to origin node %d",
+								   (int)origin_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
+			&& slot->reply_undo_trailer_valid) {
+			uint32 expected;
+			uint32 got;
+
+			/*
+			 * PGRAC (spec-7.1 D3-b hardening, Rule 15/16): snapshot the volatile
+			 * reply slot into the caller's STABLE page BEFORE checksum /
+			 * validation / observe.  This consume runs without blk->lock, so a
+			 * spec-2.34 retransmit that overwrites reply_block_data between a
+			 * validate-on-slot and the copy would hand a torn, unvalidated
+			 * nmembers to the variable-length member loop downstream (OOB read).
+			 * Validating the LOCAL copy makes the bytes we act on exactly the
+			 * bytes we prove usable: a torn copy fails the checksum (fail-closed),
+			 * and nmembers is bounded to [2, MAX] before any member is read.  The
+			 * checksum is read block-then-header, so an overwrite that lands mid-
+			 * snapshot fails the compare rather than passing on a mixed pair.
+			 */
+			memcpy(page_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+			expected = slot->reply_header.checksum;
+			got = gcs_block_compute_checksum(page_out);
+
+			if (expected == got) {
+				const ClusterGcsUndoMultiVerdictPage *v
+					= (const ClusterGcsUndoMultiVerdictPage *)page_out;
+
+				if (cluster_vis_undo_multi_verdict_page_usable(v, mxid)) {
+					uint16 i;
+
+					auth_out->origin_epoch = slot->reply_header.epoch;
+					auth_out->live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
+					auth_out->tt_generation = slot->reply_undo_tt_generation;
+					auth_out->authority_scn = (SCN)slot->reply_undo_authority_scn;
+					cluster_scn_observe(auth_out->authority_scn);
+					/* AD-008: Lamport-observe every member SCN that crossed the
+					 * wire so a below-horizon bound is admissible next snapshot. */
+					for (i = 0; i < v->nmembers; i++) {
+						if (SCN_VALID(v->members[i].commit_scn))
+							cluster_scn_observe((SCN)v->members[i].commit_scn);
+						if (SCN_VALID(v->members[i].horizon_scn))
+							cluster_scn_observe((SCN)v->members[i].horizon_scn);
+					}
+					/* spec-5.14 D2: depend on the origin's volatile co-sample
+					 * for fail-stop (D-i3). */
+					gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+					fetched = true;
+				}
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
 }
 
 
@@ -3420,6 +3709,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	GcsBlockDedupKey key;
 	GcsBlockDedupEntry cached_entry;
 	GcsBlockDedupResult dr;
+	int dedup_worker_id; /* PGRAC: spec-7.3 D5 — this request's dedup shard */
 	char block_buf[GCS_BLOCK_DATA_SIZE];
 	GcsBlockReplyStatus status;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
@@ -3460,11 +3750,60 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	}
 
+	/*
+	 * PGRAC: spec-7.2 D5 — master-side fail-stop episode fence, symmetric
+	 * with the requester-side acquire gate (cluster_pcm_lock.c).  While a
+	 * dead static master's block resources are mid-episode (survivor
+	 * re-declare not yet complete, or merged replay not yet materialized),
+	 * serving a request here could grant a block whose surviving holder
+	 * has not re-declared yet (phantom-holder overtake window).  The
+	 * requester-side gate cannot close this alone: a remote requester with
+	 * a stale view routes here directly.  Fail-closed before any dedup /
+	 * state change;  DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L
+	 * (retry-safe).  phase_for_tag counts the hit itself.
+	 */
+	if (cluster_gcs_block_phase_for_tag(req->tag) == GCS_BLOCK_RECOVERING) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
+
 	/* HC75 range guard — out of range never enters dedup HTAB. */
 	if (req->transition_id < PCM_TRANS_N_TO_S || req->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
 							 InvalidXLogRecPtr, NULL);
 		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.3 D5 — per-worker dedup shard routing guard.  A block
+	 * request's tag routes to exactly one LMS worker (worker[shard(tag)],
+	 * D4), which owns that tag's private dedup shard.  This handler runs in
+	 * the worker whose DATA channel received the envelope; verify it is the
+	 * routed worker before touching the shard.  A mismatch is a mis-route
+	 * (序破坏, 8.A): D3 negotiates a cluster-wide n_workers and D1 shard()
+	 * is byte-identical on both ends, so this cannot happen without a code
+	 * bug — fail closed (drop; sender retransmits via 53R90) rather than
+	 * serve from, or contend on, a shard this worker does not own.
+	 */
+	dedup_worker_id = cluster_ic_tier1_my_data_channel();
+	{
+		int tag_shard = cluster_lms_shard_for_tag(&req->tag, cluster_lms_workers);
+
+		Assert(tag_shard == dedup_worker_id);
+		if (tag_shard != dedup_worker_id) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block request misrouted to LMS worker %d (tag shard "
+										 "%d); dropping (spec-7.3 D5 8.A fail-closed)",
+										 dedup_worker_id, tag_shard)));
+			}
+			return;
+		}
 	}
 
 	/* PGRAC: spec-2.34 D5 — dedup lookup_or_register (HC90 + HC91 + HC92). */
@@ -3475,8 +3814,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.cluster_epoch = req->epoch;
 	memset(&cached_entry, 0, sizeof(cached_entry));
 
-	dr = cluster_gcs_block_dedup_lookup_or_register(&key, req->tag, req->transition_id,
-													&cached_entry);
+	dr = cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
+													req->transition_id, &cached_entry);
 	switch (dr) {
 	case GCS_BLOCK_DEDUP_CACHED_REPLY:
 		gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
@@ -3932,8 +4271,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					fwd_hdr.sender_node = x_holder;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				cluster_pcm_lock_clear_pending_x(req->tag);
@@ -4274,8 +4614,9 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node;
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(
-						&key, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(dedup_worker_id, &key,
+														  GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER,
+														  &fwd_hdr, NULL);
 					return;
 				}
 				/* Forward send failed — fall through to the fail-closed flow. */
@@ -4345,8 +4686,8 @@ x_path_skipped:
 					fwd_hdr.sender_node = holder_node; /* HC113: holder stored here */
 					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
-					cluster_gcs_block_dedup_install_reply(&key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
-														  &fwd_hdr, NULL);
+					cluster_gcs_block_dedup_install_reply(
+						dedup_worker_id, &key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &fwd_hdr, NULL);
 				}
 				return;
 			}
@@ -4468,7 +4809,7 @@ build_and_send_reply: {
 		hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 	}
 
-	cluster_gcs_block_dedup_install_reply_ex(&key, status, hdr,
+	cluster_gcs_block_dedup_install_reply_ex(dedup_worker_id, &key, status, hdr,
 											 has_block_payload ? block_payload : NULL,
 											 send_sf_dep ? &sf_dep_vec : NULL, send_sf_dep);
 
@@ -4481,13 +4822,31 @@ build_and_send_reply: {
 		 * active on that retry).  Useful for driving the
 		 * retransmit_send_count + dedup_hit_count TAP surfaces.
 		 */
-	CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
-	if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
-		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
-		block_payload_release_cb = NULL;
-		block_payload_release_arg = NULL;
-		pfree(buf);
-		return;
+	/*
+	 * spec-7.2a: gate the drop-reply dispatch on the test target relfilenode.
+	 * A :skipn:N count is per-process global; without this gate an unrelated
+	 * (catalog / internal) block ship consumes the countdown before the test's
+	 * user-relation ship reaches the point.  Gating the CLUSTER_INJECTION_POINT
+	 * itself (not just should_skip) ensures only matching ships consume the
+	 * count.  0 (default) keeps the un-targeted behaviour for spec-2.34 tests.
+	 *
+	 * Current TAP coverage uses target=0 only (shared_catalog remaps the
+	 * catalog-visible relfilenode to a different physical relNumber, so SQL
+	 * cannot name the shipped block); the non-zero filter is reserved for
+	 * precise spec-2.34-style targeting on non-shared-catalog rigs and is not
+	 * yet exercised by any test.
+	 */
+	if (cluster_gcs_block_drop_target_relfilenode == 0
+		|| BufTagGetRelNumber(&req->tag)
+			   == (RelFileNumber)cluster_gcs_block_drop_target_relfilenode) {
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-drop-reply-before-send");
+		if (cluster_injection_should_skip("cluster-gcs-block-drop-reply-before-send")) {
+			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
+			block_payload_release_cb = NULL;
+			block_payload_release_arg = NULL;
+			pfree(buf);
+			return;
+		}
 	}
 
 	{
@@ -4538,6 +4897,11 @@ build_and_send_reply: {
 	pfree(buf);
 }
 }
+
+
+/* cluster_gcs_block_payload_shard (spec-7.3 D4) lives in
+ * cluster_gcs_block_shard.c — extracted at D9 as a pure file so the
+ * cluster_unit suite links the REAL staging-path router. */
 
 
 /* ============================================================
@@ -4879,8 +5243,7 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (env->payload_length == undo_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (h->status != (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
-			&& h->status != (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT)
+		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status))
 			return false;
 		if (out_hdr != NULL)
 			*out_hdr = h;
@@ -5002,6 +5365,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -5022,6 +5386,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_undo_trailer_valid = (undo_trailer != NULL);
 			slot->reply_undo_tt_generation
 				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetTtGeneration(undo_trailer)
+										 : 0;
+			slot->reply_undo_authority_scn
+				= (undo_trailer != NULL) ? ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_trailer)
 										 : 0;
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
@@ -5113,52 +5480,77 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 								 * dedup TTL will sweep stale entry */
 
 	/*
-	 * PGRAC: spec-6.12b — CR-server request.  LMON only validates + parks
-	 * the request for LMS (light-work rule: a CR construction walks undo
-	 * I/O and must never run in this dispatch loop); the LMON tick ships
-	 * the finished result.  A refused park (data plane off / no free slot)
-	 * replies a fail-closed DENIED immediately so the requester keeps its
-	 * unchanged 53R9G refusal (Rule 8.A).  Never falls through to the
-	 * current-image ship below: a CR result is HISTORICAL by intent and
-	 * the lost-write watermark verdict does not apply (the SCN carrier
-	 * holds the requester's read_scn on this path).
+	 * PGRAC: spec-6.12b + spec-7.3 D6 — CR-server request.  When the family is
+	 * on the DATA plane this handler runs in the receiving worker[shard], so it
+	 * serves the request INLINE (construct under the PG_TRY -> DENIED envelope)
+	 * and ships on its own channel — the park -> LMS-poll -> LMON-ship
+	 * indirection is retired there (D6).  On the CONTROL plane the handler runs
+	 * in LMON, whose tight IC dispatch loop must NOT walk undo I/O (the
+	 * light-work rule), so it parks for LMS worker 0 instead; a refused park
+	 * (data plane off / no free slot) replies a fail-closed DENIED immediately.
+	 * Either way the requester keeps its unchanged 53R9G on refusal (Rule 8.A).
+	 * Never falls through to the current-image ship below: a CR result is
+	 * HISTORICAL by intent and the lost-write watermark verdict does not apply
+	 * (the SCN carrier holds the requester's read_scn on this path).
 	 */
 	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
-		if (!cluster_lms_cr_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_CR);
+		else if (!cluster_lms_cr_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i1 — undo-TT fetch request.  Same LMON shape as the
-	 * CR branch above (validate + park only; the undo file read runs in LMS,
-	 * the LMON tick ships).  MUST branch here, before any holder / GRD logic:
-	 * the tag is a synthetic undo address, not a block identity.  A refused
-	 * park (wave GUC off / malformed tag / no free slot) replies the
-	 * fail-closed DENIED immediately so the requester keeps its unchanged
-	 * 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i1 + spec-7.3 D6 — undo-TT fetch request.  DATA plane
+	 * serves inline (the undo file read runs in the worker[shard]); CONTROL
+	 * plane parks for LMS worker 0 (light-work rule).  MUST branch here, before
+	 * any holder / GRD logic: the tag is a synthetic undo address, not a block
+	 * identity.  A refusal (wave GUC off / malformed tag / no free slot) ships
+	 * DENIED so the requester keeps its unchanged 53R97 (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoTtFetchRequest(fwd)) {
-		if (!cluster_lms_undo_fetch_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_FETCH);
+		else if (!cluster_lms_undo_fetch_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
 
 	/*
-	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 — undo-verdict request; spec-5.22d
-	 * D4-6 adds the kind-4 dead-owner AUTHORITY verdict on the same park.
-	 * Same LMON shape as the two branches above (validate + park only; the
-	 * complete durable-TT scan + CLOG cross-check — or the kind-4 authority
-	 * triple check + block0 prove — runs in LMS, the LMON tick ships).  MUST
-	 * branch here, before any holder / GRD logic: the tag is a synthetic
-	 * undo address and the SCN carrier holds the widened xid.  A refused
-	 * park (wave GUC off / malformed tag or carrier / bad owner carrier / no
-	 * free slot) replies the fail-closed DENIED immediately so the requester
-	 * keeps its unchanged 53R97 refusal (Rule 8.A).
+	 * PGRAC: spec-6.12i D-i4 / spec-6.15 D4 + spec-7.3 D6 — undo-verdict
+	 * request; spec-5.22d D4-6 adds the kind-4 dead-owner AUTHORITY verdict
+	 * on the same wire shape (the inline/park carrier decode recognizes the
+	 * owner carrier and cr_serve_slot routes it to the block0 authority
+	 * prove instead of the own-TT scan).  DATA plane serves inline (the
+	 * complete durable-TT scan + CLOG cross-check runs in the worker[shard]);
+	 * CONTROL plane parks for LMS worker 0 (light-work rule).  MUST branch
+	 * here, before any holder / GRD logic: the tag is a synthetic undo
+	 * address and the SCN carrier holds the widened xid.  A refusal (wave
+	 * GUC off / malformed tag or carrier / bad owner carrier / no free slot)
+	 * ships DENIED so the requester keeps its unchanged 53R97 (Rule 8.A).
 	 */
 	if (GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)
 		|| GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
-		if (!cluster_lms_undo_verdict_submit(fwd))
+		if (cluster_gcs_block_family_on_data_plane())
+			cluster_gcs_block_forward_serve_inline(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
+		else if (!cluster_lms_undo_verdict_submit(fwd))
+			gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.1 D3-b — undo-MULTI-verdict request.  Same LMON shape as
+	 * the single verdict branch above (validate + park; the member enumeration
+	 * + per-updater terminal scan runs in LMS, the LMON tick ships).  MUST
+	 * branch here, before any holder / GRD logic: the tag is a synthetic undo
+	 * address and the SCN carrier holds the widened MXID.  A refused park
+	 * (wave GUC off / malformed tag or carrier / no capacity) replies the
+	 * fail-closed DENIED immediately so the requester keeps its unchanged
+	 * 53R97 refusal (Rule 8.A).
+	 */
+	if (GcsBlockForwardPayloadIsUndoMultiVerdictRequest(fwd)) {
+		if (!cluster_lms_undo_multi_verdict_submit(fwd))
 			gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}
@@ -5532,31 +5924,48 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 /* ============================================================
  * Dispatch table registration.
+ *
+ * PGRAC: spec-7.2 flip — the five block-family msg_types (REQUEST /
+ * REPLY / FORWARD / INVALIDATE / INVALIDATE_ACK) are registered on
+ * the DATA plane:  the LMS-owned tier1 instance carries their frames,
+ * the LMS loop dispatches them, and the producer mask admits the LMS
+ * family for the drain-and-send leg.  All five flip in this one edit
+ * (H-5: no half-migrated window;  the registry probe above pivots the
+ * LMON tick sites and the LMS loop automatically).  REDECLARE alone
+ * stays on the CONTROL plane (r4): recovery re-declare must survive a
+ * DATA-mesh teardown mid-episode, and the REDECLARE -> REDECLARE_DONE
+ * pair may not be split across planes.
  * ============================================================ */
 
 static const ClusterICMsgTypeInfo gcs_block_request_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
 	.name = "gcs_block_request",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_request_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_reply_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 	.name = "gcs_block_reply",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_reply_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 /* PGRAC: spec-2.35 D8 — holder-side forward handler msg_type registration. */
 static const ClusterICMsgTypeInfo gcs_block_forward_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 	.name = "gcs_block_forward",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_forward_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6046,6 +6455,36 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	if (inv->checksum != gcs_block_compute_invalidate_checksum(inv))
 		return;
 
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE receive side.  Same invariant as the REQUEST dedup guard
+	 * above: INVALIDATE is staged and routed by shard(tag) (payload_shard),
+	 * so the receiving worker must be the routed worker.  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order invalidate
+	 * could drop a copy a later grant relies on) that cannot happen without
+	 * a code bug — fail closed (drop without ACK; the master's broadcast
+	 * fail-closes on its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&inv->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG,
+						(errmsg_internal("gcs block invalidate misrouted to LMS worker %d (tag "
+										 "shard %d); dropping (spec-7.3 P2-1 8.A fail-closed)",
+										 recv_worker, tag_shard)));
+			}
+			return;
+		}
+	}
+
 	current_epoch = cluster_epoch_get_current();
 
 	/*
@@ -6164,6 +6603,37 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	if (ack->checksum != gcs_block_compute_invalidate_ack_checksum(ack)) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 		return;
+	}
+
+	/*
+	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
+	 * INVALIDATE-ACK receive side (master).  The ACK is direct-sent from
+	 * the holder worker that received the INVALIDATE (worker[shard(tag)]),
+	 * and worker channels pair i<->i across nodes, so a well-routed ACK
+	 * always lands on this master's worker[shard(tag)].  A mismatch is a
+	 * mis-route (per-tag order break, 8.A — an out-of-order ACK could
+	 * certify a drop the holder has not applied yet) that cannot happen
+	 * without a code bug — fail closed (drop; the broadcast fail-closes on
+	 * its own budget) rather than apply out of order.
+	 */
+	{
+		int recv_worker = cluster_ic_tier1_my_data_channel();
+		int tag_shard = cluster_lms_shard_for_tag(&ack->tag, cluster_lms_workers);
+
+		Assert(tag_shard == recv_worker);
+		if (tag_shard != recv_worker) {
+			static bool misroute_logged = false;
+
+			cluster_gcs_block_dedup_note_misroute();
+			if (!misroute_logged) {
+				misroute_logged = true;
+				ereport(LOG, (errmsg_internal("gcs block invalidate-ack misrouted to LMS worker %d "
+											  "(tag shard %d); dropping (spec-7.3 P2-1 8.A "
+											  "fail-closed)",
+											  recv_worker, tag_shard)));
+			}
+			return;
+		}
 	}
 
 	/*
@@ -6288,20 +6758,25 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 }
 
 
+/* PGRAC: spec-7.2 flip — DATA plane (see the dispatch-table comment). */
 static const ClusterICMsgTypeInfo gcs_block_invalidate_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
 	.name = "gcs_block_invalidate",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
 	.name = "gcs_block_invalidate_ack",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_invalidate_ack_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
 
@@ -6388,12 +6863,18 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 }
 
 
+/* PGRAC: spec-7.2 flip (r4) — REDECLARE stays on the CONTROL plane:
+ * survivor re-declare and its DONE barrier belong to the LMON-owned
+ * recovery episode and must not depend on the DATA mesh being up.
+ * None of the five migrated handlers emits REDECLARE (D0-①b audit),
+ * so no cross-plane staging leg is required here. */
 static const ClusterICMsgTypeInfo gcs_block_redeclare_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REDECLARE,
 	.name = "gcs_block_redeclare",
 	.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON,
 	.broadcast_ok = false,
 	.handler = cluster_gcs_handle_block_redeclare_envelope,
+	.plane = CLUSTER_IC_PLANE_CONTROL,
 };
 
 
@@ -6461,6 +6942,25 @@ uint64
 cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_ship_bytes_total) : 0;
+}
+
+/* PGRAC: spec-7.2 D6 — ship-latency histogram accessors (dump + tests). */
+uint64
+cluster_gcs_block_ship_hist_bound_us(int bucket)
+{
+	if (bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	if (bucket == CLUSTER_GCS_SHIP_HIST_BUCKETS - 1)
+		return UINT64_MAX; /* +inf overflow bucket */
+	return gcs_ship_hist_bounds_us[bucket];
+}
+
+uint64
+cluster_gcs_block_ship_hist_count(int bucket)
+{
+	if (ClusterGcsBlock == NULL || bucket < 0 || bucket >= CLUSTER_GCS_SHIP_HIST_BUCKETS)
+		return 0;
+	return pg_atomic_read_u64(&ClusterGcsBlock->ship_latency_hist[bucket]);
 }
 
 /* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
@@ -6849,6 +7349,31 @@ uint64
 cluster_gcs_get_block_dedup_full_count(void)
 {
 	return cluster_gcs_block_dedup_get_full_count();
+}
+
+/*
+ * spec-7.2a D5:  dedup capacity/occupancy observability wrappers.  The
+ * entry_count wrapper reads the historical _get_in_flight_count accessor,
+ * whose backing counter (entry_count) tracks every live entry (in-flight
+ * slots plus completed cached replies) -- that live total is what dump_gcs
+ * surfaces as dedup_entry_count for the saturation ratio.
+ */
+uint64
+cluster_gcs_get_block_dedup_entry_count(void)
+{
+	return cluster_gcs_block_dedup_get_in_flight_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_evict_count(void)
+{
+	return cluster_gcs_block_dedup_get_evict_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_max_entries(void)
+{
+	return cluster_gcs_block_dedup_get_max_entries();
 }
 
 

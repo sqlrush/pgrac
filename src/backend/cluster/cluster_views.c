@@ -276,7 +276,7 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_SINVAL_ACK_SEND,
 	WAIT_EVENT_SINVAL_ACK_RECEIVE,
 
-	/* Cluster: Interconnect (9 = 7 + spec-6.13 busypoll + inline send) */
+	/* Cluster: Interconnect (11 = 9 + spec-7.2 LMS data-plane recv/send) */
 	WAIT_EVENT_INTERCONNECT_RDMA_SEND,
 	WAIT_EVENT_INTERCONNECT_RDMA_RECV,
 	WAIT_EVENT_CLUSTER_IC_RDMA_POLL,
@@ -286,6 +286,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_INTERCONNECT_TCP_FALLBACK,
 	WAIT_EVENT_INTERCONNECT_TIER_SWITCH,
 	WAIT_EVENT_INTERCONNECT_CONNECT_RETRY,
+	WAIT_EVENT_CLUSTER_LMS_DATA_RECV, /* PGRAC spec-7.2 D6 */
+	WAIT_EVENT_CLUSTER_LMS_DATA_SEND, /* PGRAC spec-7.2 D6 */
 
 	/* Cluster: Undo (7 = 4 remote/retention + spec-5.22b D2-6 3 owner-as-master
 	 * grant-plane waits; the I/O-internal CR_CONSTRUCT / TT_DURABLE_IO / BUF_FLUSH

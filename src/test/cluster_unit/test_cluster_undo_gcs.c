@@ -59,6 +59,17 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+/* spec-7.1a D3 spread scn_time_cmp into the linked objects; SCNs here are
+ * plain monotonic test values, so the total-order stub is a raw compare
+ * (test_cluster_runtime_visibility.c pattern). */
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	if (a == b)
+		return 0;
+	return (a > b) ? 1 : -1;
+}
+
 /* ======================================================================
  * U1 -- owner-as-master routing: lookup_master returns the encoded
  * owner_node, never a hash-derived node (spec-5.22b §2.1, Q1)

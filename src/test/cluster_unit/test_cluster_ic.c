@@ -522,7 +522,7 @@ UT_TEST(test_hello_wire_roundtrip)
 	bool ok;
 
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 42,
-						   "pgrac-test");
+						   "pgrac-test", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	ok = cluster_ic_parse_hello(wire, &parsed);
 	UT_ASSERT(ok);
@@ -564,7 +564,7 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * unintended endian flips, and uninitialized memory leakage.
 	 */
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
-						   0x01020304, "AB");
+						   0x01020304, "AB", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	/* magic */
 	UT_ASSERT_EQ(wire[0], 0x48);
@@ -594,9 +594,79 @@ UT_TEST(test_hello_wire_reference_bytes)
 	UT_ASSERT_EQ(wire[37], 0x00);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
-	/* remaining _pad must be all zero */
+	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
+	 * conn_epoch 0 adds nothing past the capability word (spec-7.2 D2
+	 * compat pin -- plane byte 40 and epoch bytes 44-51 stay zero). */
 	for (i = 40; i < PGRAC_IC_HELLO_BYTES; i++)
 		UT_ASSERT_EQ(wire[i], 0);
+}
+
+/*
+ * spec-7.2 D2 — DATA-plane HELLO reference bytes:  plane byte at offset
+ * 40, conn_epoch LE at 44-51, spec-7.3 worker bytes (41/42) still zero,
+ * tail 52-63 still zero.  Plus accessor roundtrip.
+ */
+UT_TEST(test_hello_wire_data_plane_bytes)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	int i;
+
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 3, "AB",
+						   CLUSTER_IC_PLANE_DATA, UINT64CONST(0x1122334455667788));
+
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_PLANE_OFFSET], 1);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 0);
+	UT_ASSERT_EQ(wire[43], 0);
+	/* conn_epoch = 0x1122334455667788 little-endian */
+	UT_ASSERT_EQ(wire[44], 0x88);
+	UT_ASSERT_EQ(wire[45], 0x77);
+	UT_ASSERT_EQ(wire[46], 0x66);
+	UT_ASSERT_EQ(wire[47], 0x55);
+	UT_ASSERT_EQ(wire[48], 0x44);
+	UT_ASSERT_EQ(wire[49], 0x33);
+	UT_ASSERT_EQ(wire[50], 0x22);
+	UT_ASSERT_EQ(wire[51], 0x11);
+	for (i = 52; i < PGRAC_IC_HELLO_BYTES; i++)
+		UT_ASSERT_EQ(wire[i], 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_plane(&parsed), CLUSTER_IC_PLANE_DATA);
+	UT_ASSERT(cluster_ic_hello_conn_epoch(&parsed) == UINT64CONST(0x1122334455667788));
+}
+
+/*
+ * spec-7.3 D3 — the worker_id / n_workers HELLO fields (offsets 41/42) are
+ * written by cluster_ic_hello_set_worker_fields on the DATA-plane send path
+ * and read by the accessors.  build_hello alone leaves them zero, so a plain
+ * DATA HELLO stays byte-identical to spec-7.2 (compat pin).
+ */
+UT_TEST(test_hello_worker_fields_roundtrip)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	/* build_hello alone => worker fields zero (spec-7.2 compat). */
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 3, "AB",
+						   CLUSTER_IC_PLANE_DATA, UINT64CONST(0x99));
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_worker_id(&parsed), 0);
+	UT_ASSERT_EQ(cluster_ic_hello_n_workers(&parsed), 0);
+
+	/* set worker fields => offsets 41/42 carry them; plane/pad/epoch intact. */
+	cluster_ic_hello_set_worker_fields(wire, 3, 5);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_WORKER_ID_OFFSET], 3);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_N_WORKERS_OFFSET], 5);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_PLANE_OFFSET], (uint8)CLUSTER_IC_PLANE_DATA);
+	UT_ASSERT_EQ(wire[43], 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_CONN_EPOCH_OFFSET], 0x99);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_worker_id(&parsed), 3);
+	UT_ASSERT_EQ(cluster_ic_hello_n_workers(&parsed), 5);
 }
 
 UT_TEST(test_hello_smart_fusion_capability_gate)
@@ -612,7 +682,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-off");
+						   "sf-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
 															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
@@ -622,7 +692,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-tier-mismatch");
+						   "sf-tier-mismatch", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
 															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
@@ -632,7 +702,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "sf-tier-match");
+						   "sf-tier-match", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
 				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
@@ -664,7 +734,7 @@ UT_TEST(test_hello_caps_reply_meta_gate)
 	/* default: meta bit advertised */
 	cluster_ic_suppress_caps_reply = false;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "caps-on");
+						   "caps-on", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) != 0);
 
@@ -672,7 +742,7 @@ UT_TEST(test_hello_caps_reply_meta_gate)
 	 * protocol bits untouched */
 	cluster_ic_suppress_caps_reply = true;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
-						   "caps-off");
+						   "caps-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) == 0);
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1) != 0);
@@ -685,7 +755,8 @@ UT_TEST(test_hello_parse_rejects_bad_magic)
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
 
-	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1, "x");
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1, "x",
+						   CLUSTER_IC_PLANE_CONTROL, 0);
 	/* Corrupt magic */
 	wire[0] = 0xDE;
 	wire[1] = 0xAD;
@@ -702,7 +773,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 	const char *long_name = "this-cluster-name-is-way-longer-than-the-fixed-cap-on-purpose";
 
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 7,
-						   long_name);
+						   long_name, CLUSTER_IC_PLANE_CONTROL, 0);
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	/*
@@ -718,7 +789,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(20); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(22); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -738,6 +809,8 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
+	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
 	UT_RUN(test_hello_caps_reply_meta_gate);
 	UT_RUN(test_hello_parse_rejects_bad_magic);

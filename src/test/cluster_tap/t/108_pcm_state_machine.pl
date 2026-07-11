@@ -48,8 +48,8 @@ $node_default->start;
 my $pcm_category_rows = $node_default->safe_psql(
 	'postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category = 'pcm'");
-is($pcm_category_rows, '22',
-   'L1 pg_cluster_state pcm category has 22 rows (spec-2.30 D9 surface + spec-6.14a D5 + spec-6.14 D5 KO-aux-defer counter)');
+is($pcm_category_rows, '23',
+   'L1 pg_cluster_state pcm category has 23 rows (spec-2.30 D9 surface + spec-6.14a D5 + spec-6.14 D5 KO-aux-defer counter + spec-4.6a D12 dead_cleanup_entries)');
 
 # L3 — api_state shows "active" when GUC=-1 default
 my $api_state_default = $node_default->safe_psql(
@@ -81,8 +81,8 @@ is($apply_event, '1',
 # L6 — wait event count baseline through spec-6.1.
 my $wait_event_count = $node_default->safe_psql(
 	'postgres', "SELECT count(*) FROM pg_stat_cluster_wait_events");
-is($wait_event_count, '121',
-   'L6 wait event baseline 121 (spec-6.13 RDMA wait surface)');
+is($wait_event_count, '123',
+   'L6 wait event baseline 118 (spec-6.13 RDMA wait surface)');
 
 # L7 — no PCM wire opcode smoke (no SQL-visible PCM wire opcode enum surface)
 my $pcm_grd_init_event = $node_default->safe_psql(

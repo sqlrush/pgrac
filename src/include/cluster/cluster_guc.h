@@ -210,6 +210,12 @@ extern bool cluster_xid_striping;
 /* spec-6.15 D5/D3: herding slack (jump threshold; seed-floor headroom). */
 extern int cluster_xid_herding_slack;
 
+/* spec-7.1 D3-a: cross-node multixact xmax positive resolution via
+ * origin derivation + member overlay (default on; off = the D3-0
+ * fail-closed floor verbatim: every updater multi in peer mode
+ * refuses 53R9C). */
+extern bool cluster_multi_xmax_remote_resolve;
+
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks
  * the unconsumed tail of oversized HW grants as a per-node lease
@@ -404,6 +410,8 @@ extern int cluster_ges_reply_wait_max_entries;
  *   5000ms;  SIGHUP). */
 extern int cluster_grd_remaster_wait_ms;
 extern int cluster_grd_rebuild_timeout_ms;
+extern int cluster_hw_remaster_retry_backoff_ms;
+extern int cluster_hw_remaster_retry_max_attempts;
 
 /* spec-5.4 D8: SQ sequence lock tunables. */
 extern int cluster_sequence_default_cache;
@@ -474,6 +482,7 @@ extern int cluster_phase4_timeout;
  *	range:        [100, 60000] (millisecond)
  */
 extern int cluster_lmon_main_loop_interval;
+extern int cluster_lmon_slow_iteration_warn_ms;
 
 
 /*
@@ -788,6 +797,22 @@ extern bool cluster_lmd_enabled;
 extern bool cluster_lms_enabled;
 
 /*
+ * spec-7.3 D2 — cluster.lms_workers: size of the LMS DATA-plane worker pool
+ * (worker 0 = LmsProcess, plus workers 1..cluster_lms_workers-1).  PGC_POSTMASTER,
+ * default 2, range [1, CLUSTER_LMS_MAX_WORKERS].  1 = spec-7.2 topology
+ * identity (no worker siblings forked).  Must be cluster-uniform (HELLO
+ * negotiation, spec-7.3 D3).
+ */
+extern int cluster_lms_workers;
+
+/*
+ * spec-7.3 D8 (Q8) — cluster.lms_nice: optional nice value the LMS workers
+ * apply to themselves (setpriority, best-effort).  PGC_SIGHUP, default 0 =
+ * leave the inherited priority alone;  range [-20, 0].
+ */
+extern int cluster_lms_nice;
+
+/*
  * cluster.lock_acquire_cluster_path (spec-2.21 D2).
  *
  *	context: PGC_POSTMASTER
@@ -914,17 +939,25 @@ extern int cluster_gcs_reply_timeout_ms;
  *
  *	cluster.gcs_block_retransmit_initial_backoff_ms
  *	  type: int   context: PGC_SUSET
- *	  default: 100 (min 10, max 5000)
- *	  Backoff before retry 1.  Subsequent retries double:  100 → 200 →
- *	  400 → 800 ms (with default max_retries=4, total backoff = 1500 ms).
+ *	  default: 10 (min 1, max 5000;  spec-7.2 D1 lowered from 100/10)
+ *	  Backoff before retry 1.  Subsequent retries double:  10 → 20 →
+ *	  40 → 80 ms (with default max_retries=4, total backoff = 150 ms).
+ *	  The per-attempt reply wait stays cluster.gcs_reply_timeout_ms;
+ *	  this only paces the fast-deny / timeout retry cadence (HC96).
  *
  *	cluster.gcs_block_dedup_max_entries
  *	  type: int   context: PGC_POSTMASTER
- *	  default: 1024 (min 256, max 16384)
+ *	  default: 16384 (min 256, max 65536;  spec-7.2a D4 raised from
+ *	  1024/16384; 16384 = the measured S1 4-node distinct-read green
+ *	  floor on the RACvsRAC rig)
  *	  Per-node cap for the master-side dedup HTAB.  Each entry occupies
- *	  sizeof(GcsBlockDedupEntry) = 8312B, so default cap → ~8.4 MB shmem
- *	  on each node acting as GCS block-ship master.  HASH_ENTER_NULL on
- *	  cap → DENIED_DEDUP_FULL fail-closed (sender retries via HC96).
+ *	  sizeof(GcsBlockDedupEntry) = 8448B, so default cap → ~138 MB shmem
+ *	  on each node acting as GCS block-ship master.  The effective
+ *	  capacity is auto-sized to at least MaxConnections × declared node
+ *	  count (capped at the ceiling; spec-7.2a D4 Q4).  Under cap pressure
+ *	  the master eagerly reclaims reclaim-safe entries first;
+ *	  HASH_ENTER_NULL on a still-full table → DENIED_DEDUP_FULL
+ *	  fail-closed (sender retries via HC96).
  *
  *	HC97 retry math + HC92 cap + HC93 GC + HC96 transient.
  */
@@ -935,7 +968,26 @@ extern int cluster_gcs_block_retransmit_initial_backoff_ms;
  * (default on).  See cluster_guc.c for semantics. */
 extern bool cluster_gcs_block_local_cache;
 extern bool cluster_tx_enqueue_wait_enabled; /* spec-5.2 D4 */
+
+/*
+ *	cluster.ic_duty_lazy
+ *	  type: bool   context: PGC_SIGHUP   default: on
+ *	  spec-7.2 D1 — gate the lazy-able (queue-consumption) LMON duty
+ *	  families behind producer dirty marks + a >= 1 Hz floor.  Never-lazy
+ *	  correctness families are unaffected.  Off = pre-7.2 behavior.
+ */
+extern bool cluster_ic_duty_lazy;
+extern bool cluster_crossnode_write_write; /* spec-7.1a D0 */
 extern int cluster_gcs_block_dedup_max_entries;
+extern int cluster_gcs_block_drop_target_relfilenode; /* spec-7.2a test-only */
+
+/*
+ * GUC ceiling for cluster.gcs_block_dedup_max_entries.  The spec-7.2a D4
+ * auto-size floor (effective = Max(configured, MaxConnections × declared
+ * node count)) clamps to this so auto-sizing can widen a foot-gun config but
+ * never grows shmem past what the DBA could configure by hand.
+ */
+#define CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING 65536
 
 /* PGRAC: spec-4.7 D1 — bounded wait (ms) on a RECOVERING block resource
  * before fail-closing 53R9L.  See cluster_guc.c for semantics. */

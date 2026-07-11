@@ -188,10 +188,10 @@ UT_TEST(test_beta_sqlstate_acceptance_surface_encodable)
 
 UT_TEST(test_beta_wait_events_count)
 {
-	/* Current surface value.  update-required contract: a future spec adding
-	 * cluster wait events MUST bump this snapshot (and the dump/test baselines
-	 * that count them).  spec-5.22b D2-6: +3 undo-block grant-plane waits -> 121. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 121);
+	/* Current Stage 5 beta surface value.  update-required contract: a future
+	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
+	 * baselines that count them). */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
 }
 
 

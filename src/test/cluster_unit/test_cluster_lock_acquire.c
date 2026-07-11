@@ -365,6 +365,47 @@ cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 	return -1;
 }
 
+/* spec-4.6a: the S4-reject diagnostic references the CSSD peer-state view;
+ * fixture has no CSSD shmem — stub DEAD-free defaults. */
+#include "cluster/cluster_cssd.h"
+ClusterCssdPeerState
+cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
+{
+	return CLUSTER_CSSD_PEER_ALIVE;
+}
+const char *
+cluster_cssd_peer_state_to_string(ClusterCssdPeerState s pg_attribute_unused())
+{
+	return "alive";
+}
+
+/* spec-4.6a: the same diagnostic is the first ereport in this .o — swallow
+ * elog machinery (mirror test_cluster_grd.c pattern). */
+bool
+errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+{
+	return false;
+}
+bool
+errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+{
+	return false;
+}
+void
+errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
+		  const char *fn pg_attribute_unused())
+{}
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errcode(int s pg_attribute_unused())
+{
+	return 0;
+}
+
 /* spec-4.6 P0 regression harness — test-controlled S3/S4 outcomes.
  *	stub_reserve_result default NOT_READY keeps the legacy tests on the
  *	pre-reservation-fail path;  the S4 default-deny test flips it to OK

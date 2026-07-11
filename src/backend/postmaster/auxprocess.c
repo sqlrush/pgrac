@@ -137,9 +137,22 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	case QvotecProcess:
 		MyBackendType = B_QVOTEC;
 		break;
-	/* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process. */
+	/* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process (worker 0). */
 	case LmsProcess:
 		MyBackendType = B_LMS;
+		break;
+	/* PGRAC (spec-7.3 D2): LMS DATA-plane worker pool (worker 1..7).  All
+	 * carry the B_LMS_WORKER display type (Stage 0.10 reserved slot);  the
+	 * distinct AuxProcType per worker is what gives each its own
+	 * BackendStatus / AuxiliaryProc slot. */
+	case LmsWorker1Process:
+	case LmsWorker2Process:
+	case LmsWorker3Process:
+	case LmsWorker4Process:
+	case LmsWorker5Process:
+	case LmsWorker6Process:
+	case LmsWorker7Process:
+		MyBackendType = B_LMS_WORKER;
 		break;
 	/*
 	 * PGRAC (spec-2.19 Sprint A Step 1): LMD aux process.  B_LMD
@@ -224,7 +237,8 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 #ifdef USE_PGRAC_CLUSTER
 	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess
 		&& MyAuxProcType != SinvalBcastProcess && MyAuxProcType != UndoCleanerProcess
-		&& MyAuxProcType != MrpProcess && MyAuxProcType != RfsProcess)
+		&& MyAuxProcType != MrpProcess && MyAuxProcType != RfsProcess
+		&& !AmLmsWorkerProcess()) /* PGRAC: spec-7.3 D2 — workers skip like LMS */
 #endif
 		ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
@@ -251,7 +265,8 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 */
 	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess
 		|| MyAuxProcType == SinvalBcastProcess || MyAuxProcType == UndoCleanerProcess
-		|| MyAuxProcType == MrpProcess || MyAuxProcType == RfsProcess) {
+		|| MyAuxProcType == MrpProcess || MyAuxProcType == RfsProcess
+		|| AmLmsWorkerProcess()) { /* PGRAC: spec-7.3 D2 — workers mirror LMS */
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -348,6 +363,18 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * if the compiler does not honor the attribute. */
 	case LmsProcess:
 		LmsMain();
+		proc_exit(1);
+	/* PGRAC (spec-7.3 D2): LMS DATA-plane worker dispatch.  worker_id is
+	 * 1..7 derived from the AuxProcType offset;  LmsWorkerMain is
+	 * pg_attribute_noreturn(), proc_exit(1) is the defensive bailout. */
+	case LmsWorker1Process:
+	case LmsWorker2Process:
+	case LmsWorker3Process:
+	case LmsWorker4Process:
+	case LmsWorker5Process:
+	case LmsWorker6Process:
+	case LmsWorker7Process:
+		LmsWorkerMain(ClusterLmsWorkerIdForType(MyAuxProcType));
 		proc_exit(1);
 	/* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process dispatch.  LmdMain
 	 * is pg_attribute_noreturn(); proc_exit(1) below is a defensive bailout

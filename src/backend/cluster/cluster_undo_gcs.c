@@ -149,13 +149,22 @@ cluster_undo_grant_admissible(const ClusterResId *undo_resid, uint32 expected_ge
 		return false;
 
 	/*
-	 * (2) Owner-incarnation epoch + durable coverage (D-i2/D-i3).  Reuse the
-	 * pure live-authority window gate: authority sampled under a different
-	 * membership epoch cannot be trusted, a reply with no live authority
-	 * (invalid hwm) is never guessed, and the durable high-water must cover the
-	 * version anchor (Invalid at the block level -> epoch + presence only).
+	 * (2) Owner-incarnation epoch + durable coverage (D-i2/D-i3).  This used
+	 * to reuse cluster_vis_live_authority_covers_policy, but spec-7.1a moved
+	 * that VISIBILITY gate into the SCN domain (demand vs the co-sampled
+	 * authority_scn) -- the D2 grant wire carries no SCN co-sample, and the
+	 * spec-5.22b §3.2 grant contract is epoch-identity + live-authority
+	 * presence + LSN coverage of the version anchor.  Keep that contract
+	 * verbatim (the pre-7.1a policy body): a different membership epoch
+	 * cannot be trusted, a reply with no live authority (invalid hwm) is
+	 * never guessed, and the durable high-water must cover the version
+	 * anchor (Invalid at the block level -> epoch + presence only).
 	 */
-	if (!cluster_vis_live_authority_covers_policy(anchor_lsn, auth, local_epoch))
+	if (auth.origin_epoch != local_epoch)
+		return false;
+	if (XLogRecPtrIsInvalid(auth.live_hwm_lsn))
+		return false;
+	if (auth.live_hwm_lsn < anchor_lsn)
 		return false;
 
 	return true;

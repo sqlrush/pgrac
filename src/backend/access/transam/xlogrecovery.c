@@ -3273,8 +3273,16 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 
 	/*
 	 * ShmemVariableCache->nextXid must be beyond record's xid.
+	 *
+	 * PGRAC: a merged-recovery FOREIGN record belongs to a peer's xid
+	 * authority, not this node's allocator.  Advancing the local nextXid here
+	 * would make StartupCLOG/TrimCLOG expect local pg_xact pages for peer
+	 * striped xids, while the peer outcome truth lives in pg_xact_remote.
 	 */
-	AdvanceNextFullTransactionIdPastXid(record->xl_xid);
+#ifdef USE_PGRAC_CLUSTER
+	if (!(cluster_recmerge_window_active && cluster_recmerge_apply_foreign))
+#endif
+		AdvanceNextFullTransactionIdPastXid(record->xl_xid);
 
 	/*
 	 * Before replaying this record, check if this record causes the current

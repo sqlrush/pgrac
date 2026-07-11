@@ -111,12 +111,25 @@ typedef struct ClusterNodeInfo {
 	uint16 rdma_port;
 	uint16 rdma_pkey;
 	uint32 rdma_qkey;
+
+	/*
+	 * PGRAC: spec-7.2 D2 — DATA-plane (LMS<->LMS) listener address,
+	 * host:port.  Optional: empty means this node offers no DATA plane
+	 * (the CONTROL plane on interconnect_addr is unaffected).  Never
+	 * derived from interconnect_addr by offset — adjacent-port
+	 * collisions on single-host deployments make an implicit default
+	 * unsound (spec-7.2 r1-F2), so it is declared explicitly or the
+	 * data plane stays off (fail-closed once the GCS block family
+	 * flips to the DATA plane).  Appended per the layout-append rule.
+	 */
+	char data_addr[CLUSTER_NODE_ADDR_LEN];
 } ClusterNodeInfo;
 
 
 /*
- * Top-level container in shmem.  Sized to ~64 KiB (accepted overhead
- * given the simplicity it buys; see docs/cluster-conf-design.md §3.2).
+ * Top-level container in shmem.  Sized to ~128 KiB (accepted overhead
+ * given the simplicity it buys; see docs/cluster-conf-design.md §3.2 —
+ * budget raised from 64 KiB when spec-7.2 D2 appended data_addr).
  */
 typedef struct ClusterConf {
 	uint32 magic;
@@ -175,6 +188,19 @@ extern const ClusterNodeInfo *cluster_conf_lookup_node(int32 node_id);
 
 /* Returns ClusterConfShmem->node_count, with NULL safety. */
 extern int cluster_conf_node_count(void);
+
+/*
+ * Pre-shmem topology sniff: count [node.N] section headers straight from
+ * pgrac.conf.  cluster_conf_load() (the real parser, startup SSOT) runs only
+ * after every shmem region is initialised, so size_fn/init_fn-time consumers
+ * that must scale with the declared node count (shared-catalog bootstrap
+ * vetting, spec-7.2a dedup auto-size floor) cannot use
+ * cluster_conf_node_count() and read the file directly instead.  Returns 1
+ * when the file is absent/unreadable (single-node fallback, mirroring the
+ * loader's degraded topology).  Syntax is NOT validated here; the loader
+ * still FATALs later on malformed files.
+ */
+extern int cluster_conf_declared_node_count_early(void);
 
 /*
  * Hot-path peer predicate.  Use this instead of cluster_conf_node_count()

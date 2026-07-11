@@ -103,6 +103,8 @@ my $disks_csv = join(',', @disks);
 # ---- IC ports ----
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ----------
 # Step 0: node0 init -> backup -> node1 init_from_backup (shared sysid).
@@ -161,6 +163,13 @@ $node0->append_conf('postgresql.conf', $common_conf);
 $node0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node1->append_conf('postgresql.conf', $common_conf);
 $node1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$node0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$node1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 
 my $pgrac_conf = <<EOC;
 [cluster]
@@ -168,9 +177,11 @@ name = cf_boot
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);
@@ -446,6 +457,8 @@ my $neg_shared = PostgreSQL::Test::Utils::tempdir();
 mkdir "$neg_shared/global" or die "mkdir neg global: $!";
 my $neg_ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $neg_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $neg_data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $neg_data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 my $neg = PostgreSQL::Test::Cluster->new('cf_boot_neg');
 $neg->init;
@@ -469,9 +482,11 @@ name = cf_boot_neg
 
 [node.0]
 interconnect_addr = 127.0.0.1:$neg_ic0
+data_addr = 127.0.0.1:$neg_data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$neg_ic1
+data_addr = 127.0.0.1:$neg_data_port1
 EOC
 
 my $nret = $neg->start(fail_ok => 1);

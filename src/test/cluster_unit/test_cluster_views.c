@@ -207,7 +207,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_121)
+UT_TEST(test_cluster_wait_events_count_is_123)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -240,9 +240,8 @@ UT_TEST(test_cluster_wait_events_count_is_121)
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	/* spec-6.13 D8: RDMA tier3 wait events -> 118;
-	 * spec-5.22b D2-6: +3 undo-block grant-plane waits -> 121. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 121);
+	/* spec-7.2 D6: +2 LMS data-plane -> 120. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 123);
 }
 
 
@@ -287,7 +286,7 @@ int
 main(void)
 {
 	UT_PLAN(5);
-	UT_RUN(test_cluster_wait_events_count_is_121);
+	UT_RUN(test_cluster_wait_events_count_is_123);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_adg_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);

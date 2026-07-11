@@ -68,6 +68,8 @@ typedef struct ClusterInjectPoint {
 	pg_atomic_uint32 armed_type;   /* ClusterInjectFaultType */
 	pg_atomic_uint64 armed_param;  /* sleep us / SKIP cookie */
 	pg_atomic_uint32 skip_pending; /* set by SKIP dispatch, read+reset by probe */
+	pg_atomic_uint32
+		skip_remaining; /* spec-7.2a: :skipn:N countdown (0 = exhausted or not armed) */
 } ClusterInjectPoint;
 
 /*
@@ -199,6 +201,7 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	/* spec-2.6 Sprint A Step 4 D14 — 5 qvotec / quorum-lite injects. */
 	{ .name = "cluster-qvotec-poll-pre" },
 	{ .name = "cluster-qvotec-poll-post" },
+	{ .name = "cluster-qvotec-marker-service-hold" },
 	{ .name = "cluster-voting-disk-write-fail" },
 	{ .name = "cluster-quorum-loss-broadcast" },
 	{ .name = "cluster-collision-detect" },
@@ -358,6 +361,43 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  that would otherwise serve FULL/PARTIAL.
 	 */
 	{ .name = "cluster-lms-cr-construct" },
+	/*
+	 * spec-7.3 D7 — DATA-plane inline serve fence refusal injection.
+	 *
+	 *	cluster-lms-cr-fence-refuse:
+	 *	  Fires in cluster_gcs_block_forward_serve_inline ahead of the kind
+	 *	  switch.  SKIP forces the fence-refuse branch (ship DENIED without
+	 *	  reading / constructing), the deterministic trigger for the TAP fence
+	 *	  ×N legs — genuine write-fence enforcement (enforcing && !allowed)
+	 *	  takes the same branch but needs a multi-node voting-disk reconfig.
+	 */
+	{ .name = "cluster-lms-cr-fence-refuse" },
+	/*
+	 * spec-7.3 D7 (review P1-1) — inline-serve SHIP-time fence re-check.
+	 *
+	 *	cluster-lms-cr-fence-recheck:
+	 *	  Fires in cluster_gcs_block_forward_serve_inline AFTER cr_serve_slot
+	 *	  and before the reply build.  SKIP forces the ship-time re-check
+	 *	  branch (discard the constructed result, ship DENIED) — the
+	 *	  deterministic trigger for the TAP TOCTOU leg, modelling a qvotec
+	 *	  lease that expires while the serve constructs (not schedulable
+	 *	  from TAP; genuine enforcement takes the same branch).
+	 */
+	{ .name = "cluster-lms-cr-fence-recheck" },
+	/*
+	 * spec-7.2 D6 — LMS data-plane observability injections.
+	 *
+	 *	cluster-lms-data-dispatch:
+	 *	  Fires in the LMS data-plane tick just before the inbound
+	 *	  envelope pump for a readable DATA peer (hit-count surface for
+	 *	  the flip e2e legs).
+	 *	cluster-lms-conn-reset:
+	 *	  Fires in the tick's reset scan;  SKIP forces a one-shot close
+	 *	  of every DATA connection (reconnect + re-HELLO converge), the
+	 *	  L4-family reset/epoch legs' trigger.
+	 */
+	{ .name = "cluster-lms-data-dispatch" },
+	{ .name = "cluster-lms-conn-reset" },
 	/*
 	 * spec-6.12i D-i1 — undo-TT fetch serve refusal injection.
 	 *
@@ -723,6 +763,15 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-xid-herding-stall" },
 	{ .name = "cluster-xid-window-hard-limit" },
+
+	/*
+	 * spec-7.1 D3-a — mxid stripe half-space guardrail.
+	 *   cluster-mxid-halfspace-hard-limit: armed-state peek FORCES the
+	 *     53RB4 refusal branch in GetNewMultiXactId (the organic
+	 *     trigger needs 2^31 multixacts; the armed peek lets a test
+	 *     exercise the fail-closed leg + guardrail counter).
+	 */
+	{ .name = "cluster-mxid-halfspace-hard-limit" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)
@@ -759,6 +808,7 @@ cluster_injection_initialise(void)
 		pg_atomic_init_u32(&cluster_injection_points[i].armed_type, CLUSTER_FAULT_NONE);
 		pg_atomic_init_u64(&cluster_injection_points[i].armed_param, 0);
 		pg_atomic_init_u32(&cluster_injection_points[i].skip_pending, 0);
+		pg_atomic_init_u32(&cluster_injection_points[i].skip_remaining, 0);
 	}
 	cluster_injection_initialised = true;
 }
@@ -800,6 +850,8 @@ parse_fault_type(const char *s)
 		return CLUSTER_FAULT_CRASH;
 	if (pg_strcasecmp(s, "skip") == 0)
 		return CLUSTER_FAULT_SKIP;
+	if (pg_strcasecmp(s, "skipn") == 0)
+		return CLUSTER_FAULT_SKIP_N;
 	return CLUSTER_FAULT_NONE; /* unknown -> NONE; caller may warn */
 }
 
@@ -868,6 +920,8 @@ fault_type_name(ClusterInjectFaultType t)
 		return "crash";
 	case CLUSTER_FAULT_SKIP:
 		return "skip";
+	case CLUSTER_FAULT_SKIP_N:
+		return "skipn";
 	}
 	return "unknown";
 }
@@ -890,6 +944,18 @@ cluster_injection_arm_internal(ClusterInjectPoint *p, ClusterInjectFaultType new
 
 	old_type = pg_atomic_exchange_u32(&p->armed_type, new_type);
 	pg_atomic_write_u64(&p->armed_param, (uint64)param);
+
+	/*
+	 * spec-7.2a: SKIP_N is count-based -- it skips exactly `param` times, then
+	 * falls through (dispatch stops setting skip_pending, so the sender's
+	 * retransmit succeeds instead of exhausting its budget).  Reset the
+	 * countdown on every (re-)arm.  Plain SKIP keeps the legacy unlimited
+	 * "skip while armed" behaviour and leaves the countdown at 0.
+	 */
+	if (new_type == CLUSTER_FAULT_SKIP_N && param > 0)
+		pg_atomic_write_u32(&p->skip_remaining, (uint32)param);
+	else
+		pg_atomic_write_u32(&p->skip_remaining, 0);
 
 	if (old_type == CLUSTER_FAULT_NONE && new_type != CLUSTER_FAULT_NONE)
 		cluster_injection_armed_count++;
@@ -986,8 +1052,29 @@ cluster_injection_run(const char *name)
 		break;
 
 	case CLUSTER_FAULT_SKIP:
+		/* Unlimited skip while armed (legacy: param is ignored). */
 		pg_atomic_write_u32(&p->skip_pending, 1);
 		break;
+
+	case CLUSTER_FAULT_SKIP_N: {
+		/*
+		 * spec-7.2a count-based skip: consume one unit of the countdown and
+		 * only arm skip_pending while units remain.  The CAS loop keeps the
+		 * decrement race-free across concurrent dispatchers and never
+		 * underflows past 0 -- once exhausted the point stops skipping so the
+		 * sender's retransmit lands (and hits the dedup cache).
+		 */
+		uint32 expected = pg_atomic_read_u32(&p->skip_remaining);
+
+		while (expected > 0) {
+			if (pg_atomic_compare_exchange_u32(&p->skip_remaining, &expected, expected - 1)) {
+				pg_atomic_write_u32(&p->skip_pending, 1);
+				break;
+			}
+			/* expected reloaded by the failed CAS; retry */
+		}
+		break;
+	}
 	}
 }
 

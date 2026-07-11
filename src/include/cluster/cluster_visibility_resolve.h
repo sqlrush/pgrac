@@ -54,9 +54,9 @@
 #include "access/xlogdefs.h" /* XLogRecPtr (spec-4.8 D2 anchor_lsn) */
 #include "storage/buf.h"
 
-#include "cluster/cluster_scn.h"	   /* SCN */
-#include "cluster/cluster_tt_slot.h"   /* ClusterUndoTTSlotRef */
-#include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
+#include "cluster/cluster_scn.h"		  /* SCN */
+#include "cluster/cluster_tt_slot.h"	  /* ClusterUndoTTSlotRef */
+#include "cluster/cluster_tt_status.h"	  /* ClusterTTStatus */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22f D6) */
 
 

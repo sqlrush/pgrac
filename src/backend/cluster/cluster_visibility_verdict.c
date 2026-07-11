@@ -268,7 +268,7 @@ cluster_vis_freshref_origin_decision(int derived_slot, int32 ref_origin)
 {
 	if (derived_slot < 0)
 		return CLUSTER_VIS_FRESHREF_ORIGIN_ASK; /* underivable (P1-a) */
-	if (derived_slot == (int) ref_origin)
+	if (derived_slot == (int)ref_origin)
 		return CLUSTER_VIS_FRESHREF_ORIGIN_ASK; /* corroborated */
 	return CLUSTER_VIS_FRESHREF_ORIGIN_STALE;	/* derivable mismatch (8.A) */
 }

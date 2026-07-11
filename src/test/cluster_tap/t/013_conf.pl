@@ -113,13 +113,13 @@ is($cols,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'121',
-	'pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+	'123',
+	'pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'121',
-	'pg_stat_gcluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+	'123',
+	'pg_stat_gcluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
 	'stub',
@@ -270,6 +270,42 @@ ok($start_failed,
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like($log, qr/at line \d+ of/,
 	'startup failure log includes line number context');
+
+
+# ----------
+# spec-7.2 D2: data_addr node key — valid host:port parses and the
+# server starts (the DATA plane consumer lands with the LMS loop; here
+# we only pin parse acceptance);  malformed value is a startup FATAL.
+# ----------
+unlink $conf_path;
+PostgreSQL::Test::Utils::append_to_file($conf_path, <<'EOC');
+[node.0]
+interconnect_addr = 10.0.0.10:6432
+data_addr = 10.0.0.10:6532
+EOC
+
+$node->adjust_conf('postgresql.conf', 'cluster.node_id', '0');
+unlink $node->logfile;
+$node->start;
+is($node->safe_psql('postgres', 'SELECT 1'), '1',
+	'spec-7.2 data_addr host:port accepted at startup');
+$node->stop;
+
+unlink $conf_path;
+PostgreSQL::Test::Utils::append_to_file($conf_path, <<'EOC');
+[node.0]
+interconnect_addr = 10.0.0.10:6432
+data_addr = not-an-addr
+EOC
+
+unlink $node->logfile;
+$start_failed = !$node->start(fail_ok => 1);
+ok($start_failed,
+	'spec-7.2 malformed data_addr refuses startup');
+
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($log, qr/data_addr must be empty or in host:port form/,
+	'spec-7.2 malformed data_addr log names the key');
 
 
 # ----------

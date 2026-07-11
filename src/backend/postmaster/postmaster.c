@@ -187,6 +187,7 @@
 #include "cluster/cluster_catalog_bootstrap.h" /* cluster_catalog_startup_prepare (spec-6.14 D2) */
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
+#include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3 D2) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
@@ -342,6 +343,13 @@ static pid_t QvotecPID = 0;
 
 /* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process pid;same pattern. */
 static pid_t LmsPID = 0;
+/*
+ * PGRAC (spec-7.3 D2): LMS DATA-plane worker pool pids.  Slots [1 ..
+ * cluster_lms_workers-1] are the LmsWorker aux processes;  slot 0 is unused
+ * (worker 0 = LmsPID above).  Same start/reap/signal lifecycle as LmsPID,
+ * driven by the cluster.lms_workers count.
+ */
+static pid_t LmsWorkerPIDs[CLUSTER_LMS_MAX_WORKERS] = {0};
 /* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process pid;same pattern. */
 static pid_t LmdPID = 0;
 /* PGRAC (spec-6.4 D1): ADG Managed Recovery Process pid;same pattern. */
@@ -671,6 +679,16 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartCssd() StartChildProcess(CssdProcess)
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
+/* PGRAC (spec-7.3 D2): spawn LMS DATA-plane worker id (1..7). */
+#define StartLmsWorker(id) StartChildProcess((AuxProcType)(LmsWorker1Process + (id) - 1))
+/* True when every LMS worker slot (1..7) has been reaped (pmState gate). */
+#define LmsWorkersAllReaped()                                                                      \
+	(LmsWorkerPIDs[1] == 0 && LmsWorkerPIDs[2] == 0 && LmsWorkerPIDs[3] == 0                        \
+	 && LmsWorkerPIDs[4] == 0 && LmsWorkerPIDs[5] == 0 && LmsWorkerPIDs[6] == 0                     \
+	 && LmsWorkerPIDs[7] == 0)
+StaticAssertDecl(CLUSTER_LMS_MAX_WORKERS == 8,
+				 "spec-7.3 D2: LmsWorkersAllReaped enumerates worker slots 1..7; "
+				 "update it if CLUSTER_LMS_MAX_WORKERS changes");
 #define StartLmd() StartChildProcess(LmdProcess)
 #define StartMrp() StartChildProcess(MrpProcess)
 #define StartRfs() StartChildProcess(RfsProcess)
@@ -2017,9 +2035,34 @@ ServerLoop(void)
 		 * external child termination paths.  cluster.lms_enabled = off
 		 * (PGC_POSTMASTER) keeps LMS un-forked and leaves the startup-time
 		 * PG-native fallback path active.
+		 *
+		 * PGRAC: spec-7.2 — LMS must also run in HOT STANDBY:  with the
+		 * GCS block family on the LMS-owned DATA plane, an ADG standby
+		 * without an LMS has no DATA listener and every cross-node block
+		 * request from or to it retransmits to exhaustion (t/335).  The
+		 * standby LMS serves the same roles as on a primary (DATA plane
+		 * + CR/undo park-serve);  grant ownership stays with LMON (HC4)
+		 * on every node.
 		 */
-		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0
+			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY))
 			LmsPID = StartLms();
+
+		/*
+		 * PGRAC: spec-7.3 D2 — same ServerLoop (re)spawn for the LMS
+		 * DATA-plane worker pool (workers 1 .. cluster_lms_workers-1).  A zero
+		 * slot in PM_RUN / PM_HOT_STANDBY is (re)spawned, mirroring the LMS
+		 * respawn above.  cluster.lms_workers = 1 forks no workers (spec-7.2
+		 * topology identity).
+		 */
+		if (cluster_enabled && cluster_lms_enabled
+			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY)) {
+			int w;
+
+			for (w = 1; w < cluster_lms_workers; w++)
+				if (LmsWorkerPIDs[w] == 0)
+					LmsWorkerPIDs[w] = StartLmsWorker(w);
+		}
 
 		/*
 		 * PGRAC: spec-2.19 Sprint A — same ServerLoop respawn for LMD
@@ -2947,6 +2990,13 @@ process_pm_reload_request(void)
 			signal_child(QvotecPID, SIGHUP);
 		if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
 			signal_child(LmsPID, SIGHUP);
+		{
+			int w; /* PGRAC: spec-7.3 D2 — forward SIGHUP to LMS workers */
+
+			for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+				if (LmsWorkerPIDs[w] != 0)
+					signal_child(LmsWorkerPIDs[w], SIGHUP);
+		}
 		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 			signal_child(LmdPID, SIGHUP);
 		if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
@@ -3492,6 +3542,25 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMS process"));
 			continue;
 		}
+		/* PGRAC (spec-7.3 D2): LMS DATA-plane worker reaper.  A crashed
+		 * worker takes down the group like any other aux process (its shard
+		 * is unavailable until the ServerLoop respawn re-forks it). */
+		{
+			int w;
+			bool matched = false;
+
+			for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++) {
+				if (pid == LmsWorkerPIDs[w]) {
+					LmsWorkerPIDs[w] = 0;
+					if (!EXIT_STATUS_0(exitstatus))
+						HandleChildCrash(pid, exitstatus, _("LMS worker process"));
+					matched = true;
+					break;
+				}
+			}
+			if (matched)
+				continue;
+		}
 		/* PGRAC (spec-2.19 Sprint A Step 1): LMD reaper. */
 		if (pid == LmdPID) {
 			cluster_lmd_mark_child_exit();
@@ -3958,6 +4027,18 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	else if (LmsPID != 0 && take_action)
 		sigquit_child(LmsPID);
 
+	/* PGRAC (spec-7.3 D2): LMS worker crash handling — same pattern ×N. */
+	{
+		int w;
+
+		for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++) {
+			if (pid == LmsWorkerPIDs[w])
+				LmsWorkerPIDs[w] = 0;
+			else if (LmsWorkerPIDs[w] != 0 && take_action)
+				sigquit_child(LmsWorkerPIDs[w]);
+		}
+	}
+
 	/* PGRAC (spec-2.19 Sprint A Step 1): LMD crash handling. */
 	if (pid == LmdPID)
 		LmdPID = 0;
@@ -4150,6 +4231,15 @@ PostmasterStateMachine(void)
 		/* spec-2.19 Q10 LIFO: LMD next. */
 		if (LmdPID != 0)
 			signal_child(LmdPID, SIGTERM);
+		/* PGRAC: spec-7.3 D2 LIFO — LMS DATA-plane workers before worker 0.
+		 * SIGTERM sets ShutdownRequestPending which each worker loop polls. */
+		{
+			int w;
+
+			for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+				if (LmsWorkerPIDs[w] != 0)
+					signal_child(LmsWorkerPIDs[w], SIGTERM);
+		}
 		/* spec-2.18 Q10 LIFO: LMS next (was last-spawned in Phase 2.C
 		 * skeleton; spawn-integration site in Step 3+).  SIGTERM sets
 		 * ShutdownRequestPending which the LMS main loop polls. */
@@ -4239,6 +4329,8 @@ PostmasterStateMachine(void)
 			QvotecPID == 0 &&
 			/* PGRAC: spec-2.18 Sprint A — same wait for LMS. */
 			LmsPID == 0 &&
+			/* PGRAC: spec-7.3 D2 — same wait for every LMS DATA-plane worker. */
+			LmsWorkersAllReaped() &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
 			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
@@ -4611,6 +4703,13 @@ TerminateChildren(int signal)
 		signal_child(QvotecPID, signal);
 	if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
 		signal_child(LmsPID, signal);
+	{
+		int w; /* PGRAC: spec-7.3 D2 — broadcast to LMS DATA-plane workers */
+
+		for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+			if (LmsWorkerPIDs[w] != 0)
+				signal_child(LmsWorkerPIDs[w], signal);
+	}
 	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 		signal_child(LmdPID, signal);
 	if (MrpPID != 0) /* PGRAC spec-6.4 D1 */

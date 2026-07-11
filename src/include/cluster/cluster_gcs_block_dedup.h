@@ -187,6 +187,87 @@ typedef enum GcsBlockDedupResult {
 
 
 /* ============================================================
+ * Eager reclaim safety decision primitives (spec-7.2a; review r1).
+ *
+ *	These two pure predicates carry the Rule 8.A correctness contract for
+ *	the spec-7.2a eager reclaim path: a completed dedup entry may only be
+ *	reclaimed under cap pressure when doing so cannot cause a retransmitted
+ *	duplicate to be re-served in a way that breaks de-dup correctness.  They
+ *	live in the header (matching the GcsBlockReplyStatus* helpers in
+ *	cluster_gcs_block.h) so the decision logic is unit-testable without
+ *	shmem; the shmem HTAB glue (scan + remove + counters) lives in the .c.
+ * ============================================================ */
+
+/*
+ * GcsBlockReplyStatusIsReclaimIdempotent -- whether a completed dedup entry
+ * carrying this reply status may be reclaimed WHILE the sender's retransmit
+ * budget could still be live (in-window), without breaking retransmit de-dup
+ * correctness (Rule 8.A).
+ *
+ * Default = false (UNSAFE / fail-closed).  A status is admitted here ONLY
+ * after per-site measure-first proves that every master-side install site
+ * which produces it re-serves with NO master state transition and NO
+ * side-effect counter, so a duplicate that MISSes after reclaim re-derives a
+ * bit-for-bit identical verdict.
+ *
+ * Statuses proven NOT idempotent (spec-7.2a §3.2, verified against
+ * cluster_gcs_block.c on stage7-72-integration):
+ *	 GRANTED / READ_IMAGE_FROM_XHOLDER		payload-bearing re-grant
+ *	 *_FROM_HOLDER							forward routing marker
+ *	 GRANTED_STORAGE_FALLBACK				:3305 N->S / :4089 S->X_UPGRADE
+ *	 DENIED_PENDING_X						:4071 broadcast_invalidate
+ *	 DENIED_LOST_WRITE						:4393 lost_write_detected_count++
+ *
+ * The whitelist is currently EMPTY: no status is in-window reclaimable until
+ * its sites are individually proven (follow-on increment, spec-7.2a §11).
+ * Out-of-window (2x) reclaim, handled by GcsBlockDedupEntryIsReclaimSafe
+ * below, is safe for every status regardless.  Kept as an explicit switch so
+ * a proven status is added as a `case ...: return true;` here.
+ */
+static inline bool
+GcsBlockReplyStatusIsReclaimIdempotent(GcsBlockReplyStatus status)
+{
+	switch (status) {
+		/* (no in-window-idempotent status proven yet — spec-7.2a §11) */
+	default:
+		break;
+	}
+	return false;
+}
+
+/*
+ * GcsBlockDedupEntryIsReclaimSafe -- whether a dedup entry may be reclaimed
+ * under cap pressure without breaking retransmit de-dup correctness.
+ *
+ *	out_of_window_us is the 2x total-backoff window (review r1: 1x only
+ *	bounds the sender's last SEND, not the arrival of an in-flight
+ *	retransmit at the master; 2x also covers transit + timing skew — the
+ *	same margin the TTL sweep uses, dedup_expiry_threshold_us()).
+ *
+ *	  in-flight (completed_at_ts == 0)		-> never (still processing)
+ *	  completed, age > out_of_window_us		-> safe for EVERY status
+ *											   (spec-7.2a §3.1 theorem)
+ *	  completed, age <= out_of_window_us	-> safe ONLY if the status is
+ *											   site-proven idempotent
+ */
+static inline bool
+GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now,
+								int64 out_of_window_us)
+{
+	int64 age_us;
+
+	if (entry->completed_at_ts == 0)
+		return false;
+
+	age_us = (int64)(now - entry->completed_at_ts);
+	if (age_us > out_of_window_us)
+		return true;
+
+	return GcsBlockReplyStatusIsReclaimIdempotent((GcsBlockReplyStatus)entry->status);
+}
+
+
+/* ============================================================
  * Public API.
  * ============================================================ */
 
@@ -202,10 +283,19 @@ typedef enum GcsBlockDedupResult {
  *	node-dead cleanup, and backend-exit cleanup can remove entries as soon
  *	as this function releases the dedup lock, so CACHED_REPLY must be
  *	replayed from the copied entry.
+ *
+ *	PGRAC: spec-7.3 D5 — worker_id selects the per-worker dedup shard.  It
+ *	MUST equal cluster_lms_shard_for_tag(tag, cluster_lms_workers): every
+ *	message for a given block tag routes to worker[shard(tag)] (D4), so the
+ *	dedup entry for that request lives in exactly one shard.  The caller
+ *	(master-side handler) asserts shard(tag) == its own DATA channel before
+ *	calling here.  worker_id out of [0, live shard count) is a mis-route
+ *	(序破坏, 8.A): fail-closed → FULL + misroute_failclosed_count++, never
+ *	served from a wrong shard.
  */
 extern GcsBlockDedupResult
-cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTag tag,
-										   uint8 transition_id,
+cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey *key,
+										   BufferTag tag, uint8 transition_id,
 										   GcsBlockDedupEntry *cached_reply_out);
 
 /*
@@ -223,17 +313,20 @@ extern void cluster_gcs_block_dedup_register_backend_exit_hook(void);
  *	block_data may be NULL for non-GRANTED status; the entry's block_data
  *	field is zero-filled in that case.
  */
-extern void cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key,
+extern void cluster_gcs_block_dedup_install_reply(int worker_id, const GcsBlockDedupKey *key,
 												  GcsBlockReplyStatus status,
 												  const GcsBlockReplyHeader *header,
 												  const char *block_data);
-extern void
-cluster_gcs_block_dedup_install_reply_ex(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
-										 const GcsBlockReplyHeader *header, const char *block_data,
-										 const ClusterSfDepVec *sf_dep_vec, bool has_sf_dep);
+extern void cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *key,
+													 GcsBlockReplyStatus status,
+													 const GcsBlockReplyHeader *header,
+													 const char *block_data,
+													 const ClusterSfDepVec *sf_dep_vec,
+													 bool has_sf_dep);
 
-/* Remove a specific entry by key (rare path; mostly used by tests). */
-extern void cluster_gcs_block_dedup_remove(const GcsBlockDedupKey *key);
+/* Remove a specific entry by key (rare path; mostly used by tests).
+ * worker_id selects the shard (spec-7.3 D5). */
+extern void cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key);
 
 
 /* ============================================================
@@ -280,6 +373,23 @@ extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
 extern uint64 cluster_gcs_block_dedup_get_full_count(void);
 extern uint64 cluster_gcs_block_dedup_get_in_flight_count(void);
+extern uint64 cluster_gcs_block_dedup_get_evict_count(void); /* spec-7.2a D5 */
+extern uint64 cluster_gcs_block_dedup_get_max_entries(void); /* spec-7.2a D5 */
+
+/*
+ * PGRAC: spec-7.3 D5 — count of dedup accesses rejected because worker_id
+ * fell outside [0, live shard count).  A mis-route (a block tag reaching
+ * the wrong LMS worker) is a code-path invariant violation (D3 HELLO
+ * negotiates a cluster-wide n_workers; D1 shard() is byte-identical on
+ * both ends), so this stays 0 in a healthy cluster.  A non-zero value is
+ * a fail-closed drop (8.A), never a wrong-shard serve.  Summed across all
+ * shards but stored once in the always-present ctl header.
+ */
+extern uint64 cluster_gcs_block_dedup_get_misroute_failclosed_count(void);
+
+/* Record a mis-routed dedup access (shard(tag) != serving worker); shared
+ * by the module bounds guard and the master-side handler (spec-7.3 D5). */
+extern void cluster_gcs_block_dedup_note_misroute(void);
 
 
 /* ============================================================

@@ -20,7 +20,7 @@
 #	  L7  SQLSTATE 53R93 ERRCODE_CLUSTER_LOST_WRITE_DETECTED literal-
 #	      encodable in PG SQL (catalog 形式 verification)
 #	  L8  GUC switch back to 'error' SHOW returns 'error'
-#	  L9  pg_cluster_state.gcs category has 67 keys (cumulative through spec-6.14a)
+#	  L9  pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)
 #	  L10 Reply status enum value 12 (DENIED_LOST_WRITE) is新增的
 #	      最大 value (baseline workload must not trigger lost-write)
 #	  L11 spec-2.41 D / P1-C — behavioral lost-write inject: a
@@ -71,6 +71,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'gcs_block_lost_write',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	data_port_span      => 2,	# spec-7.3: default lms_workers=2 binds data_port+[0,1]
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.grd_max_entries = 1024',
@@ -101,14 +102,14 @@ cmp_ok($catver, '>=', 202605440,
 
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'121',
-	'L2 pg_stat_cluster_wait_events returns 121 rows (spec-6.13 RDMA wait surface)');
+	'123',
+	'L2 pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L2 pg_cluster_state.gcs category has 67 keys (cumulative through spec-6.14a)');
+   '89',
+   'L2 pg_cluster_state.gcs category has 89 keys (spec-7.2 D6+flip) (cumulative through spec-6.14a)');
 
 
 # ============================================================
@@ -193,13 +194,13 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L9 (alias of L2): gcs key count = 48.
+# L9 (alias of L2): gcs key count = 89.
 # ============================================================
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '67',
-   'L9 node1 pg_cluster_state.gcs has 67 keys (cross-node parity)');
+   '89',
+   'L9 node1 pg_cluster_state.gcs has 89 keys (cross-node parity)');
 
 
 # ============================================================

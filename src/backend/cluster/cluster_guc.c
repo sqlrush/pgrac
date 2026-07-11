@@ -49,6 +49,7 @@
 #include "cluster/cluster_cr_pool.h"			 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lms_shard.h"		  /* CLUSTER_LMS_MAX_WORKERS (spec-7.3 D2) */
 #include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
 #include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
@@ -130,6 +131,9 @@ bool cluster_xid_striping = false;
 /* spec-6.15 D5/D3: herding slack (xid-value gap tolerated between
  * stripe slots; also the seeded activation-floor headroom). */
 int cluster_xid_herding_slack = 4194304;
+/* spec-7.1 D3-a: cross-node multixact xmax positive resolution
+ * (default ON; off = the D3-0 fail-closed floor verbatim). */
+bool cluster_multi_xmax_remote_resolve = true;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -232,6 +236,8 @@ int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
 /* spec-4.6 D4/D1 — failure-driven remaster tunables. */
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
+int cluster_hw_remaster_retry_backoff_ms = 1000;
+int cluster_hw_remaster_retry_max_attempts = 16;
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
 int cluster_sequence_default_cache = 100;		/* CREATE-time CACHE injection default */
@@ -313,6 +319,7 @@ int cluster_phase4_timeout = 30;
  * LMON main-loop tick / WaitLatch timeout in milliseconds.
  */
 int cluster_lmon_main_loop_interval = 1000;
+int cluster_lmon_slow_iteration_warn_ms = 1000;
 
 /* spec-1.12 Sprint B D8: cluster.lck_main_loop_interval (mirror). */
 int cluster_lck_main_loop_interval = 1000;
@@ -629,6 +636,21 @@ bool cluster_lmd_enabled = true;
 bool cluster_lms_enabled = true;
 
 /*
+ * spec-7.3 D2 — cluster.lms_workers: LMS DATA-plane worker pool size.
+ * Default 2; PGC_POSTMASTER (restart required to resize the pool + its shmem
+ * ring group).  1 = spec-7.2 topology identity (worker 0 only).
+ */
+int cluster_lms_workers = 2;
+
+/*
+ * spec-7.3 D8 (Q8) — cluster.lms_nice: optional setpriority for the LMS
+ * DATA-plane workers.  Default 0 = leave the inherited priority alone
+ * (best-effort weak alignment to Oracle's LMS scheduling priority;  the
+ * RT scheduling class is out of scope).  PGC_SIGHUP.
+ */
+int cluster_lms_nice = 0;
+
+/*
  * spec-2.21 D2:cluster.lock_acquire_cluster_path emergency bypass GUC.
  * Default true; PGC_POSTMASTER context.  Set false only for P0 incident
  * response to skip the cluster gate entirely (PG-native lock only).
@@ -717,7 +739,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
  * HC92 + HC97 — see cluster_guc.h for semantics.
  */
 int cluster_gcs_block_retransmit_max_retries = 4;
-int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 10; /* spec-7.2 D1 */
 
 /* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch.
  * ON (default): the bufmgr acquire gate skips the remote master round-trip when
@@ -730,7 +752,19 @@ bool cluster_gcs_block_local_cache = true;
  * remote row-lock conflict block until the holder completes; off reverts to
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
-int cluster_gcs_block_dedup_max_entries = 1024;
+bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
+
+/* PGRAC: spec-7.1a D0 -- cross-node write-write chaining (default off).
+ * Off keeps the pre-7.1a floor: a TERMINAL remote writer holder fails
+ * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
+bool cluster_crossnode_write_write = false;
+int cluster_gcs_block_dedup_max_entries = 16384; /* spec-7.2a: raised from 1024 */
+/*
+ * spec-7.2a test-only: when non-zero, the drop-reply injection only fires for
+ * block ships of this relfilenode, so a :skipn:N count lands on the intended
+ * relation and is not consumed by unrelated catalog/internal ships.  0 = any.
+ */
+int cluster_gcs_block_drop_target_relfilenode = 0;
 
 /*
  * PGRAC: spec-4.7 D1 — cluster.gcs_block_recovery_wait_ms.  Bounded backend
@@ -1663,6 +1697,24 @@ cluster_init_guc(void)
 		&cluster_xid_striping, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
+	 * cluster.multi_xmax_remote_resolve -- spec-7.1 D3-a.  When on
+	 * (default), a reader that meets a foreign-origin updater
+	 * multixact xmax derives the origin from the striped mxid value
+	 * and resolves member visibility through the cluster member
+	 * overlay; anything unprovable still fails closed.  Off = the
+	 * fail-closed floor verbatim (every updater multi in peer mode
+	 * refuses with SQLSTATE 53R9C).  SIGHUP: a pure reader-side
+	 * positive branch, safe to flip at runtime.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.multi_xmax_remote_resolve",
+		gettext_noop(
+			"Resolve foreign multixact xmax through the cluster member overlay (spec-7.1)."),
+		gettext_noop("When off, every updater-bearing multixact xmax on a cluster page "
+					 "read in peer mode fails closed with SQLSTATE 53R9C."),
+		&cluster_multi_xmax_remote_resolve, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
 	 * cluster.xid_herding_slack -- spec-6.15 D5/D3.  Allowed xid-value
 	 * gap between the fastest and slowest stripe slots before a lagging
 	 * node observe-and-jumps its allocator forward (D3), and the extra
@@ -2431,6 +2483,21 @@ cluster_init_guc(void)
 					 "request with a fresh deadline."),
 		&cluster_grd_rebuild_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_backoff_ms",
+		gettext_noop("Initial backoff before retrying a BLOCKED HW remaster worker (ms)."),
+		gettext_noop("Range [100, 60000].  Default 1000.  Same-episode HW remaster "
+					 "retries use exponential backoff capped at 60 seconds; the adopted "
+					 "shards stay frozen while retrying."),
+		&cluster_hw_remaster_retry_backoff_ms, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.hw_remaster_retry_max_attempts",
+		gettext_noop("Maximum same-episode retries for a BLOCKED HW remaster worker."),
+		gettext_noop("Range [0, 1000].  Default 16.  Zero disables same-episode retry.  "
+					 "Raising the value with SIGHUP lets an exhausted episode resume retrying "
+					 "without waiting for a new reconfig episode."),
+		&cluster_hw_remaster_retry_max_attempts, 16, 0, 1000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.23 D11 NEW:  coordinator REPORT collect deadline. */
 	DefineCustomIntVariable("cluster.lmd_probe_collect_timeout_ms",
@@ -2628,6 +2695,15 @@ cluster_init_guc(void)
 					 "LMON has no real consumer work, so any value in range is "
 					 "functionally equivalent."),
 		&cluster_lmon_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.lmon_slow_iteration_warn_ms",
+		gettext_noop("LMON main-loop slow-iteration warning threshold in milliseconds."),
+		gettext_noop("A value greater than zero logs LMON main-loop iterations above this "
+					 "duration; the lmon_slow_iter_count counter is maintained even when "
+					 "logging is disabled with 0."),
+		&cluster_lmon_slow_iteration_warn_ms, 1000, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable(
@@ -3752,6 +3828,29 @@ cluster_init_guc(void)
 					 "startup-time fallback;spec-2.18 §1.4 F1 deferred wording)。"),
 		&cluster_lms_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
+	/* spec-7.3 D2 — cluster.lms_workers: LMS DATA-plane worker pool size. */
+	DefineCustomIntVariable(
+		"cluster.lms_workers",
+		gettext_noop("Number of LMS DATA-plane workers (including worker 0)."),
+		gettext_noop("The LMS DATA plane (spec-7.2) is parallelised across this many "
+					 "workers, each serving the block-family messages of a shard of the "
+					 "BufferTag space.  Worker 0 is the LmsProcess; workers 1.. are "
+					 "LmsWorker aux processes.  1 = the spec-7.2 single-LMS topology.  "
+					 "Must be identical on every node (HELLO negotiation rejects a "
+					 "mismatch).  PGC_POSTMASTER: restart required to resize the pool."),
+		&cluster_lms_workers, 2, 1, CLUSTER_LMS_MAX_WORKERS, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-7.3 D8 (Q8) — cluster.lms_nice: optional LMS scheduling priority. */
+	DefineCustomIntVariable(
+		"cluster.lms_nice",
+		gettext_noop("Nice value applied to the LMS DATA-plane workers (0 = leave alone)."),
+		gettext_noop("When non-zero, every LMS worker applies this nice value to itself via "
+					 "setpriority (best-effort;  a failure is a WARNING, not an error).  The "
+					 "default 0 leaves the inherited priority untouched, and setting the value "
+					 "back to 0 does not restore a previously applied one.  SIGHUP: workers "
+					 "re-apply on config reload."),
+		&cluster_lms_nice, 0, -20, 0, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
 	/* spec-2.21 D2:emergency bypass GUC */
 	DefineCustomBoolVariable("cluster.lock_acquire_cluster_path",
 							 gettext_noop("Enable the cluster lock acquire gate path."),
@@ -3929,27 +4028,71 @@ cluster_init_guc(void)
 							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
 							 NULL);
 
+	DefineCustomBoolVariable(
+		"cluster.ic_duty_lazy",
+		gettext_noop("Run lazy-able LMON duty-chain drains on demand instead of every iteration."),
+		gettext_noop("When on (default), the queue-consumption duty families in the "
+					 "LMON main loop (outbound drains / ship-ready / sinval out / "
+					 "tt-hint / dedup TTL / backup / GES work queue) run only when "
+					 "their producer marked them dirty or on the >= 1 Hz floor.  "
+					 "Correctness families (fence / sweeps / reconfig / recovery) "
+					 "always run every iteration.  Off restores the run-every-"
+					 "iteration behavior (escape hatch).  spec-7.2 D1.  PGC_SIGHUP."),
+		&cluster_ic_duty_lazy, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.crossnode_write_write",
+		gettext_noop("Chain a local write past a terminal remote writer."),
+		gettext_noop("When on, a write that conflicts with a remote writer "
+					 "that already committed or aborted maps the outcome onto "
+					 "the native TM_Result contract (remote UPDATE -> chase the "
+					 "new version via EvalPlanQual; remote DELETE -> deleted; "
+					 "aborted -> proceed).  Off (default) keeps the fail-closed "
+					 "floor: SQLSTATE 53R9H, retry.  Unprovable outcomes fail "
+					 "closed either way.  spec-7.1a D0.  PGC_SUSET."),
+		&cluster_crossnode_write_write, false, PGC_SUSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),
 		gettext_noop("Exponential backoff base for GCS block-ship retransmit:  "
 					 "retry 1 waits this much, retry 2 doubles, etc.  Default "
-					 "100 → 100/200/400/800 ms for N=4 retries (total 1500 ms).  "
-					 "HC97.  PGC_SUSET."),
-		&cluster_gcs_block_retransmit_initial_backoff_ms, 100, 10, 5000, PGC_SUSET, 0, NULL, NULL,
+					 "10 → 10/20/40/80 ms for N=4 retries (total 150 ms;  LAN "
+					 "RTT scale, spec-7.2 D1).  Raise on slow or congested "
+					 "interconnects.  The per-attempt reply wait itself stays "
+					 "cluster.gcs_reply_timeout_ms.  HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_initial_backoff_ms, 10, 1, 5000, PGC_SUSET, 0, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",
 							gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
-							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8312B.  "
-										 "Default 1024 → ~8.4MB shmem on each node serving as "
-										 "GCS block-ship master; bootstrap/initdb with no "
-										 "configured cluster.node_id does not allocate the HTAB.  "
-										 "HASH_ENTER_NULL on cap → "
-										 "DENIED_DEDUP_FULL fail-closed (sender retries via "
-										 "HC96 transient).  HC92.  PGC_POSTMASTER."),
-							&cluster_gcs_block_dedup_max_entries, 1024, 256, 16384, PGC_POSTMASTER,
-							0, NULL, NULL, NULL);
+							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8448B.  "
+										 "Default 16384 → ~138MB shmem on each node serving as "
+										 "GCS block-ship master; ceiling 65536 → ~554MB; "
+										 "bootstrap/initdb with no configured cluster.node_id does "
+										 "not allocate the HTAB.  The effective capacity is never "
+										 "below MaxConnections × declared node count (auto-size "
+										 "floor, capped at the ceiling), so undersized configs do "
+										 "not saturate under distinct-read pressure.  Under cap "
+										 "pressure the master eagerly reclaims reclaim-safe "
+										 "entries before failing closed; HASH_ENTER_NULL on a "
+										 "still-full table → DENIED_DEDUP_FULL fail-closed "
+										 "(sender retries via HC96 transient).  HC92.  "
+										 "PGC_POSTMASTER (restart to change the fixed HTAB size)."),
+							&cluster_gcs_block_dedup_max_entries, 16384, 256,
+							CLUSTER_GCS_BLOCK_DEDUP_MAX_ENTRIES_CEILING, PGC_POSTMASTER, 0, NULL,
+							NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.gcs_block_drop_target_relfilenode",
+		gettext_noop("Test-only: restrict the drop-reply injection to one relfilenode."),
+		gettext_noop("When non-zero, cluster-gcs-block-drop-reply-before-send only "
+					 "fires for block ships whose physical relfilenode matches this "
+					 "value, so a :skipn:N count is spent on the intended relation and "
+					 "not on unrelated catalog/internal ships.  0 (default) disables "
+					 "the filter; current TAP tests use 0 (the non-zero filter is "
+					 "reserved for non-shared-catalog rigs).  For TAP retransmit-dedup "
+					 "correctness tests only."),
+		&cluster_gcs_block_drop_target_relfilenode, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * PGRAC: spec-2.36 D8 — 3 NEW GUC for CF 3-way (X transfer +

@@ -56,4 +56,25 @@ cluster_cr_server_split_classify(const int32 *chain_origins, int nchains, int32 
 	return (prefix == nchains) ? CLUSTER_CR_SPLIT_FULL : CLUSTER_CR_SPLIT_PARTIAL;
 }
 
+/*
+ * cluster_cr_server_invalid_scn_verdict — spec-7.1 D1 serve pure decision.
+ *
+ *	The origin's durable by-xid scan matched our own xid but the slot carries
+ *	no stamped commit_scn (the delayed-cleanout window: XID_MATCH_INVALID_SCN).
+ *	Per IN-5 the real population is aborted-unstamped -- an abort writes no
+ *	durable commit_scn -- so cross-checking CLOG lets us answer a provably
+ *	ABORTED xid positively (invisible at the requester) instead of 53R97.
+ *
+ *	8.A (positive proof only): ONLY an explicit CLOG abort upgrades.  A
+ *	committed-but-unstamped xid (we must never fabricate its commit_scn), an
+ *	in-flight / 2PC-prepared / crashed-without-abort-record xid -- for all of
+ *	which TransactionIdDidAbort is false -- stays REFUSE (fail-closed, the
+ *	refuse direction is unchanged).
+ */
+ClusterCrInvalidScnVerdict
+cluster_cr_server_invalid_scn_verdict(bool clog_did_abort)
+{
+	return clog_did_abort ? CLUSTER_CR_INVALID_SCN_ABORTED : CLUSTER_CR_INVALID_SCN_REFUSE;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

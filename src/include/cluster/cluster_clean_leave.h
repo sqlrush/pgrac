@@ -65,6 +65,8 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_marker_async.h"
+
 /* 128 nodes, same width as ReconfigEvent.dead_bitmap. */
 #define CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES 16
 /* Default drain deadline; aligns with the feature-082 30s barrier. */
@@ -149,11 +151,17 @@ typedef struct ClusterLeaveState {
 	int32 leaving_node_id;	/* -1 if none */
 	uint32 _pad0;
 	uint64 leave_epoch;				/* epoch this leave is bound to (CL-I3 immutable) */
-	uint64 leave_baseline_dead_gen; /* CSSD dead_generation when the leave was bound;
-									 * an unchanged value at the epoch bump means OUR
-									 * clean-leave committed (no real death intruded) */
+	uint64 leave_baseline_dead_gen; /* CSSD dead_generation when the leave was bound
+									 * (retained for observability; the coherence gate
+									 * now uses leave_baseline_others_dead, spec-2.29a
+									 * ②b — the scalar counted the leaving node's own
+									 * expected DEAD and falsely escalated) */
 	uint64 barrier_deadline_us;		/* fail-closed deadline (drain_timeout_ms) */
 	uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES]; /* survivor acks */
+	/* spec-2.29a ②b: CSSD dead set (EXCLUDING the leaving node) snapshotted when
+	 * the leave was bound; the coherence gate escalates only if a THIRD-PARTY
+	 * death changed this set mid-drain. */
+	uint8 leave_baseline_others_dead[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
 	pg_atomic_uint64 ges_drained_count; /* shards/grants drained (observability) */
 	pg_atomic_uint64 gcs_flushed_count; /* dirty/X pages flushed */
 	pg_atomic_uint64 shards_remastered; /* shards moved off leaving node */
@@ -198,6 +206,14 @@ typedef struct ClusterLeaveState {
 	pg_atomic_uint32 commit_point_observed;
 	pg_atomic_uint32 committed_durable_confirmed;
 	pg_atomic_uint32 committed_marker_durable;
+	/* spec-2.29a r3 (evidence latch): the committed epoch E the coordinator's
+	 * LEAVE_COMMITTED attested (the epoch stamped into the majority-durable
+	 * COMMITTED marker).  Written by the leaving node's confirmation handler
+	 * under `lock` BEFORE committed_durable_confirmed is set; consumed once by
+	 * the barrier tick when the evidence latches (so the leaver records the
+	 * exact committed epoch instead of inferring it from its possibly-stale
+	 * local epoch view).  Guarded by `lock`. */
+	uint64 committed_confirmed_epoch;
 
 	/*
 	 * Hardening v1.0.2 fields.
@@ -335,10 +351,33 @@ extern bool cluster_clean_leave_should_abort_writable(bool in_transaction, bool 
 
 /* version-coherent leave (U3 / CL-I3 / L235): the leave is still coherent only
  * if neither the cluster epoch nor the CSSD dead_generation moved since the
- * leave was bound; any external bump (a real death intruding) => not coherent
- * => the caller must ABORTED_ESCALATE. */
+ * leave was bound; any external membership change (a third-party death, or a
+ * third-party fail-stop that already bumped the epoch) => not coherent => the
+ * caller must ABORTED_ESCALATE.  spec-2.29a ②b: the dead set compared here
+ * EXCLUDES the leaving node itself (others-dead bitmap), so the leaving node's
+ * own expected alive→DEAD transition never falsely escalates the leave. */
 extern bool cluster_clean_leave_version_coherent(uint64 bound_epoch, uint64 current_epoch,
-												 uint64 bound_dead_gen, uint64 current_dead_gen);
+												 const uint8 *bound_others_dead,
+												 const uint8 *current_others_dead, int nbytes);
+
+/* spec-2.29a r3: the leaving node's barrier-tick own-commit latch — evidence
+ * over inference.  Latches iff the durable COMMITTED marker for THIS leave
+ * attempt was confirmed (nonce-bound LEAVE_COMMITTED attestation); the two
+ * coherence observations are contract inputs the verdict must ignore (a
+ * third-party transient flap must neither refuse an evidenced latch — the
+ * t/331 C1/C4 false-escalation — nor latch anything without evidence — the
+ * r2 P2-1 refused-leave mis-latch wedge). */
+extern bool cluster_clean_leave_own_commit_latched(bool committed_marker_evidence,
+												   bool others_dead_unchanged,
+												   bool dead_gen_unchanged);
+
+/* spec-2.29a r3: identity gate for a LEAVE_COMMITTED confirmation — accept it
+ * as marker evidence only for THIS node's CURRENT leave attempt (self-
+ * addressed + currently leaving + per-attempt nonce match + committed epoch
+ * past the bound baseline); fail-closed on any mismatch. */
+extern bool cluster_clean_leave_committed_evidence_matches(
+	int32 payload_leaving_node, uint64 payload_nonce, uint64 payload_epoch, int32 self_node,
+	int32 current_leaving_node, uint64 current_attempt_nonce, uint64 bound_leave_epoch);
 
 /* leave-intent marker structural validation (magic/version/CRC/identity).  Pure:
  * computes CRC32C over [magic..phase] and checks magic, version, that the
@@ -408,6 +447,14 @@ extern void cluster_clean_leave_shmem_register(void);
  * ------------------------------------------------------------------ */
 extern ClusterLeaveMarkerSubmitResult
 cluster_clean_leave_submit_marker(const ClusterLeaveIntentMarker *m);
+extern bool cluster_clean_leave_submit_marker_async(ClusterMarkerAsync *a,
+													const ClusterLeaveIntentMarker *m,
+													ClusterMarkerAsyncKind kind, int32 target_node,
+													TimestampTz now);
+extern ClusterMarkerPollResult cluster_clean_leave_poll_marker_async(ClusterMarkerAsync *a,
+																	 TimestampTz now,
+																	 uint32 *out_result,
+																	 uint64 *out_elapsed_us);
 extern bool cluster_clean_leave_qvotec_poll_pending(void *out_slot512);
 extern void cluster_clean_leave_qvotec_complete(bool acked);
 extern void cluster_clean_leave_publish_qvotec_latch(struct Latch *latch);

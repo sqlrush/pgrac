@@ -29,8 +29,10 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_gcs_block.h" /* ClusterGcsUndoVerdictPage (CP5) */
+#include "access/multixact.h"		   /* MultiXactStatusForUpdate / MaxMultiXactStatus (D3-b) */
+#include "cluster/cluster_gcs_block.h" /* ClusterGcsUndo{,Multi}VerdictPage (CP5 / D3-b) */
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_scn.h"		  /* scn_time_cmp / SCN_VALID (spec-7.1a D3) */
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
 #include "cluster/cluster_undo_verdict.h" /* D3 verdict taxonomy + mappers */
 
@@ -43,7 +45,7 @@
  * widens "resolve when provable", never widens "resolve when unprovable").
  */
 bool
-cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAuthority auth,
+cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority auth,
 										 uint64 local_epoch)
 {
 	/*
@@ -57,20 +59,32 @@ cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAutho
 	/*
 	 * (2) Authority actually present.  An undo-block reply that did not carry
 	 * a live authority (older peer / off path) leaves live_hwm_lsn invalid ->
-	 * fail closed, never guess.
+	 * fail closed, never guess.  The SCN co-sample must be present too: an
+	 * older peer ships zero trailer bytes = InvalidScn -> refuse.
 	 */
 	if (XLogRecPtrIsInvalid(auth.live_hwm_lsn))
 		return false;
+	if (!SCN_VALID(auth.authority_scn))
+		return false;
 
 	/*
-	 * (3) Durable coverage of THIS page version.  live_hwm_lsn is the origin's
-	 * durable-and-TT-applied high-water; only if it is at or beyond the
-	 * tuple's page LSN has the origin's durable TT reconciled this version.
-	 * Semantically equivalent to the recovery-side recovered_through >=
-	 * anchor_lsn gate, but sourced from a live durable watermark rather than a
-	 * merge-complete marker (spec-6.12 §2.11 torn-history equivalence).
+	 * (3) SCN-total-order conclusiveness (spec-7.1a D3, replacing the former
+	 * `live_hwm_lsn < anchor_lsn` compare that was unsound across per-thread
+	 * WAL streams: a page last written by another thread carries an LSN from
+	 * a different stream, so the raw compare false-refused live resolutions
+	 * and could false-pass -- both measured/analyzed in gaps §C.2).  The
+	 * caller demands conclusiveness for demand_scn (its snapshot read_scn,
+	 * or its own clock sampled BEFORE the fetch): the origin allocates its
+	 * commit SCNs from the clock this authority co-sampled and durably
+	 * stamps the TT BEFORE the commit record, so authority_scn at/after the
+	 * demand proves every commit the demand could have observed is already
+	 * in the shipped content (AD-008 Lamport total order across threads and
+	 * nodes).  A refusal self-heals: the shipped SCNs are Lamport-observed
+	 * by the consumer, so the next demand is at/after this authority.
 	 */
-	if (auth.live_hwm_lsn < anchor_lsn)
+	if (!SCN_VALID(demand_scn))
+		return false;
+	if (scn_time_cmp(auth.authority_scn, demand_scn) < 0)
 		return false;
 
 	return true;
@@ -85,6 +99,13 @@ cluster_vis_live_authority_covers_policy(XLogRecPtr anchor_lsn, ClusterLiveAutho
  * nmatch across the owner's whole durable segment set and must treat any
  * unparseable block as refuse-ALL, never skip-and-continue).  See the header
  * for the contract.  Pure; no I/O, no elog.
+ *
+ * PROOF_COMMITTED is EVIDENCE, not a verdict (spec-7.1a hardening): durable
+ * COMMITTED stamps land at pre-commit (2PC COMMIT PREPARED stamps before the
+ * commit record — cluster_tt_durable.h), so a stamped-then-crashed xid is
+ * in-doubt.  Consumers must finalize a COMMITTED proof through the origin's
+ * C1b CLOG cross-check (the verdict leg); only PROOF_ABORTED may be consumed
+ * directly (an abort stamp is terminal and irreversible).
  */
 ClusterVisTtBlockScanStatus
 cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
@@ -497,4 +518,84 @@ cluster_undo_verdict_from_resolve(bool ok, bool committed, SCN commit_scn, bool 
 	r.kind = is_bound ? CLUSTER_UNDO_VERDICT_COMMITTED_BOUND : CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
 	r.commit_scn = commit_scn;
 	return r;
+}
+
+/*
+ * cluster_vis_undo_multi_verdict_page_usable — see header for the contract.
+ */
+bool
+cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdictPage *v,
+										   MultiXactId asked_mxid)
+{
+	uint16 i;
+
+	if (v == NULL || !MultiXactIdIsValid(asked_mxid))
+		return false;
+
+	if (v->magic != CLUSTER_GCS_UNDO_MULTI_VERDICT_MAGIC
+		|| v->version != CLUSTER_GCS_UNDO_MULTI_VERDICT_VERSION)
+		return false;
+
+	/* The echo is the widened mxid: upper 32 bits MUST be zero (a non-zero
+	 * high word means a corrupted or foreign carrier, never a valid echo). */
+	if (v->mxid_echo != (uint64)asked_mxid)
+		return false;
+
+	/* Only a fully-proven SERVED page carries consumable members; every other
+	 * status ships as a DENIED reply (no page), so it should never reach here.
+	 * Re-check defensively (8.A): never consume an UNPROVABLE / NOT_MINE page. */
+	if (v->status != (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED)
+		return false;
+
+	/* A real multi always has members; the origin refuses < 2 as NO_MEMBERS.
+	 * Reject < 2 (not a real multi) and anything past the wire capacity, so the
+	 * requester's variable-length member loop is bounded to [2, MAX]. */
+	if (v->nmembers < 2 || v->nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS)
+		return false;
+
+	for (i = 0; i < sizeof(v->reserved_0); i++)
+		if (v->reserved_0[i] != 0)
+			return false;
+
+	for (i = 0; i < v->nmembers; i++) {
+		const ClusterGcsUndoMultiVerdictMember *m = &v->members[i];
+
+		/* member_status must be a real MultiXactStatus (0..5). */
+		if (m->member_status > MaxMultiXactStatus)
+			return false;
+
+		/* Lock-only members (<= MultiXactStatusForUpdate, status 0-3) never
+		 * gate visibility (A2): they carry no verdict and no scn of any kind. */
+		if (m->member_status <= MultiXactStatusForUpdate) {
+			if (m->verdict != 0 || SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			continue;
+		}
+
+		/* Updater members (4-5): the verdict kind must be known and its scn
+		 * fields consistent with the kind, mirroring the single-verdict page
+		 * (any updater without a proven terminal refuses the WHOLE page). */
+		switch (m->verdict) {
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+			/* Exact terminal commit: needs the exact scn, carries no bound. */
+			if (!SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+			/* Bound-only commit: needs the horizon, must NOT claim an exact
+				 * scn (a stray commit_scn could leak into stamp/cache paths). */
+			if (SCN_VALID(m->commit_scn) || !SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+			/* Terminal abort carries no scn of any kind. */
+			if (SCN_VALID(m->commit_scn) || SCN_VALID(m->horizon_scn))
+				return false;
+			break;
+		default:
+			return false; /* unknown kind on an updater: refuse, never guess */
+		}
+	}
+
+	return true;
 }

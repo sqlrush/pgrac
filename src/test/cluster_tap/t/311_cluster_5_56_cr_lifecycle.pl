@@ -106,7 +106,7 @@ my $open_rr_reader = sub {
 		'postmaster', 'L7b rel_generation_slots is PGC_POSTMASTER');
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'59', 'L7c cr category has 59 rows (22 + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict + 2 spec-5.22f D6 fresh-ref verdict)');
+		'78', 'L7c cr category has 78 rows (+ 1 spec-7.3 D7 fence_refused; 22 + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle + 6 spec-6.12b cr-server + 16 spec-6.12i/6.15 runtime-visibility & verdict + 13 spec-7.1 D0/D3-b census & multi-verdict serve + 2 spec-5.22f D6 fresh-ref verdict + 5 spec-5.22d D4 authority serve incl. A1 scan attribution)');
 	for my $k (
 		qw(cr_global_epoch_fallback_bump_count cr_rel_gen_bump_count
 		cr_rel_gen_table_overflow_count cr_retention_horizon_advance_noted_count

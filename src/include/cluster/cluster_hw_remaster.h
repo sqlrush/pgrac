@@ -47,17 +47,91 @@
 #ifndef CLUSTER_HW_REMASTER_H
 #define CLUSTER_HW_REMASTER_H
 
-/*
- * Result of an online-remaster HW authority rebuild for one dead origin.  Only
- * DONE marks the adopted shards rebuilt (opens the serve gate); BLOCKED and
- * NOT_APPLICABLE never do, so a shard whose HWM is not provably rebuilt stays
- * fail-closed (8.A).
- */
-typedef enum ClusterHwRemasterResult {
-	CLUSTER_HW_REMASTER_DONE = 0,		/* rebuilt + adoption snapshot durable + shards marked */
-	CLUSTER_HW_REMASTER_BLOCKED,		/* fail-closed: keep shards frozen (53RA6) */
-	CLUSTER_HW_REMASTER_NOT_APPLICABLE, /* HW authority inactive / no adopted shard / bad input */
-} ClusterHwRemasterResult;
+#include "cluster/cluster_hw.h" /* ClusterHwRemasterResult */
+
+#define CLUSTER_HW_REMASTER_NO_DEADLINE PG_UINT64_MAX
+#define CLUSTER_HW_REMASTER_BACKOFF_CAP_MS 60000
+
+typedef enum ClusterHwRemasterLaunchAction {
+	CLUSTER_HW_REMASTER_LAUNCH_SKIP = 0,
+	CLUSTER_HW_REMASTER_LAUNCH_INITIAL,
+	CLUSTER_HW_REMASTER_LAUNCH_RETRY,
+	CLUSTER_HW_REMASTER_LAUNCH_MARK_EXHAUSTED,
+	CLUSTER_HW_REMASTER_LAUNCH_MARK_STRUCTURAL,
+} ClusterHwRemasterLaunchAction;
+
+typedef struct ClusterHwRemasterRelaunchDecision {
+	ClusterHwRemasterLaunchAction action;
+	uint32 next_attempts;
+	uint64 next_attempt_at;
+	ClusterHwRemasterResult next_result;
+} ClusterHwRemasterRelaunchDecision;
+
+static inline uint32
+cluster_hw_remaster_compute_backoff_ms(int base_ms, uint32 completed_retry_attempts)
+{
+	uint64 ms;
+	uint32 shift;
+
+	if (base_ms < 1)
+		base_ms = 1;
+	ms = (uint64)base_ms;
+	shift = completed_retry_attempts > 0 ? completed_retry_attempts - 1 : 0;
+	while (shift-- > 0 && ms < CLUSTER_HW_REMASTER_BACKOFF_CAP_MS)
+		ms <<= 1;
+	if (ms > CLUSTER_HW_REMASTER_BACKOFF_CAP_MS)
+		ms = CLUSTER_HW_REMASTER_BACKOFF_CAP_MS;
+	return (uint32)ms;
+}
+
+static inline ClusterHwRemasterRelaunchDecision
+cluster_hw_remaster_relaunch_decide(uint64 launched_episode, uint64 current_episode,
+									ClusterHwRemasterResult result, uint32 attempts,
+									uint64 next_attempt_at, uint64 now, int retry_max_attempts)
+{
+	ClusterHwRemasterRelaunchDecision d;
+
+	d.action = CLUSTER_HW_REMASTER_LAUNCH_SKIP;
+	d.next_attempts = attempts;
+	d.next_attempt_at = next_attempt_at;
+	d.next_result = result;
+
+	if (current_episode == 0)
+		return d;
+	if (launched_episode != current_episode || result == CLUSTER_HW_REMASTER_NONE) {
+		d.action = CLUSTER_HW_REMASTER_LAUNCH_INITIAL;
+		d.next_attempts = 0;
+		d.next_attempt_at = 0;
+		d.next_result = CLUSTER_HW_REMASTER_RUNNING;
+		return d;
+	}
+
+	if (result == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL) {
+		if (next_attempt_at != CLUSTER_HW_REMASTER_NO_DEADLINE) {
+			d.action = CLUSTER_HW_REMASTER_LAUNCH_MARK_STRUCTURAL;
+			d.next_attempt_at = CLUSTER_HW_REMASTER_NO_DEADLINE;
+		}
+		return d;
+	}
+	if (result != CLUSTER_HW_REMASTER_BLOCKED)
+		return d;
+
+	if (retry_max_attempts <= 0 || attempts >= (uint32)retry_max_attempts) {
+		if (next_attempt_at != CLUSTER_HW_REMASTER_NO_DEADLINE) {
+			d.action = CLUSTER_HW_REMASTER_LAUNCH_MARK_EXHAUSTED;
+			d.next_attempt_at = CLUSTER_HW_REMASTER_NO_DEADLINE;
+		}
+		return d;
+	}
+	if (next_attempt_at != CLUSTER_HW_REMASTER_NO_DEADLINE && now < next_attempt_at)
+		return d;
+
+	d.action = CLUSTER_HW_REMASTER_LAUNCH_RETRY;
+	d.next_attempts = attempts + 1;
+	d.next_attempt_at = 0;
+	d.next_result = CLUSTER_HW_REMASTER_RUNNING;
+	return d;
+}
 
 #ifndef FRONTEND
 
@@ -81,9 +155,9 @@ extern ClusterHwRemasterResult cluster_hw_remaster_rebuild_origin(int dead_node_
 /*
  * cluster_hw_remaster_worker_main -- dynamic-bgworker entry point (main_arg = the
  * dead origin node id).  Captures the live reconfig episode and drives
- * cluster_hw_remaster_rebuild_origin off the LMON tick.  An abnormal exit simply
- * leaves the shards unmarked -> the serve gate keeps them fail-closed (8.A), so
- * no abnormal-exit handler is needed.
+ * cluster_hw_remaster_rebuild_origin off the LMON tick.  A before_shmem_exit
+ * callback records an abnormal exit as retryable BLOCKED so the same episode can
+ * self-heal instead of staying pinned on the launch idempotency bit.
  */
 extern void cluster_hw_remaster_worker_main(Datum main_arg);
 

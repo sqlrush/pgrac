@@ -296,7 +296,8 @@ cluster_cancel_token_consume(void)
  * completion.  Standalone fixture has no recovery shmem; no-op. */
 void
 cluster_grd_recovery_mark_peer_done(int32 node pg_attribute_unused(),
-									uint64 epoch pg_attribute_unused())
+									uint64 epoch pg_attribute_unused(),
+									uint64 event_id pg_attribute_unused())
 {}
 
 ClusterGrdEntryResult

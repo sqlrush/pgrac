@@ -57,6 +57,17 @@ UT_DEFINE_GLOBALS();
  */
 int cluster_node_id = 0;
 
+/* spec-7.1a D3 spread scn_time_cmp into the linked policy object; SCNs here
+ * are plain monotonic test values, so the total-order stub is a raw compare
+ * (test_cluster_runtime_visibility.c pattern). */
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	if (a == b)
+		return 0;
+	return (a > b) ? 1 : -1;
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -202,31 +213,37 @@ UT_TEST(test_undo_verdict_resid_encode_contract)
 }
 
 /* ======================================================================
- * U6 -- version-coverage gate the D3-2 CP3 path applies on the S-grant
- * authority (D2-deferred, §3.5): hwm >= anchor + matching epoch -> covers;
- * hwm < anchor -> refuse (origin durable TT does not yet cover this tuple
- * version); epoch mismatch -> refuse (authority from a different reconfig
- * generation).  Fail-closed on every doubt (Rule 8.A).
+ * U6 -- version-coverage gate on the S-grant authority (D2-deferred, §3.5):
+ * hwm >= anchor + matching epoch -> covers; hwm < anchor -> refuse (origin
+ * durable TT does not yet cover this tuple version); epoch mismatch ->
+ * refuse (authority from a different reconfig generation).  Fail-closed on
+ * every doubt (Rule 8.A).  spec-7.1a moved the VISIBILITY covers gate into
+ * the SCN domain (truth-tabled in test_cluster_runtime_visibility.c); the
+ * LSN-domain grant contract lives on in cluster_undo_grant_admissible,
+ * which is what this table pins.
  * ====================================================================== */
 UT_TEST(test_undo_verdict_version_coverage_gate)
 {
+	ClusterResId r;
 	ClusterLiveAuthority auth;
 	uint64 epoch = 7;
 
+	cluster_undo_resid_encode(3, 7, 0, 1, &r);
+	memset(&auth, 0, sizeof(auth));
 	auth.origin_epoch = epoch;
 	auth.tt_generation = 1;
 
 	/* hwm >= anchor, epoch matches -> covers */
 	auth.live_hwm_lsn = 2000;
-	UT_ASSERT(cluster_vis_live_authority_covers_policy(1000, auth, epoch));
+	UT_ASSERT(cluster_undo_grant_admissible(&r, 1, auth, epoch, 1000));
 
-	/* hwm < anchor -> does not cover (fall-closed) */
+	/* hwm < anchor -> does not cover (fail-closed) */
 	auth.live_hwm_lsn = 500;
-	UT_ASSERT(!cluster_vis_live_authority_covers_policy(1000, auth, epoch));
+	UT_ASSERT(!cluster_undo_grant_admissible(&r, 1, auth, epoch, 1000));
 
 	/* epoch mismatch -> refuse even with a covering hwm */
 	auth.live_hwm_lsn = 2000;
-	UT_ASSERT(!cluster_vis_live_authority_covers_policy(1000, auth, epoch + 1));
+	UT_ASSERT(!cluster_undo_grant_admissible(&r, 1, auth, epoch + 1, 1000));
 }
 
 /* ======================================================================

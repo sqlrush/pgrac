@@ -784,6 +784,13 @@ cluster_grd_outbound_shmem_register(void)
 void
 cluster_grd_work_queue_shmem_register(void)
 {}
+/* spec-7.2 D4 stubs: DATA-plane outbound ring registration + tranche. */
+void
+cluster_lms_outbound_shmem_register(void)
+{}
+void
+cluster_lms_outbound_request_lwlocks(void)
+{}
 
 /* spec-2.16 cluster_shmem.c also calls RequestNamedLWLockTranche for the
  * 2 NEW Step 2 tranches.  PG built-in stub already declared in this

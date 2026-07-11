@@ -40,6 +40,8 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_lms.h" /* PGRAC: spec-7.2 D4 DATA-ring routing */
+#include "cluster/cluster_guc.h" /* PGRAC: spec-7.3 D4 — cluster_lms_workers */
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
@@ -176,6 +178,9 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 	cluster_grd_outbound_state->ring_head
 		= (cluster_grd_outbound_state->ring_head + 1) % PGRAC_GES_OUTBOUND_RING_CAPACITY;
 	cluster_grd_outbound_state->ring_count++;
+	/* PGRAC: spec-7.2 D1 — mark the drain family dirty inside the push
+	 * helper so every producer (current and future) is covered. */
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND);
 	return true;
 }
 
@@ -207,6 +212,7 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 		= (cluster_grd_outbound_state->reply_dirty_head + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
 	cluster_grd_outbound_state->reply_dirty_count++;
 	cluster_grd_inc_ges_reply_deferred();
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
 }
 
 static void
@@ -239,6 +245,7 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 		= (cluster_grd_outbound_state->cleanup_dirty_head + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
 	cluster_grd_outbound_state->cleanup_dirty_count++;
 	cluster_grd_inc_ges_cleanup_deferred();
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
 }
 
 static void
@@ -283,6 +290,34 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	bool ok;
 
 	Assert(cluster_grd_outbound_state != NULL);
+
+	/*
+	 * PGRAC: spec-7.2 D4 — plane routing at the single backend staging
+	 * entry:  a msg_type registered on the DATA plane goes to the DATA
+	 * twin ring (LMS drains + sends);  everything else stays on this
+	 * CONTROL ring (LMON).  Before the plane flip every type reads
+	 * CONTROL here, so this branch is dormant until the flip commit.
+	 */
+	{
+		const ClusterICMsgTypeInfo *pinfo = cluster_ic_get_msg_type_info(msg_type);
+
+		if (pinfo != NULL && (ClusterICPlane)pinfo->plane == CLUSTER_IC_PLANE_DATA) {
+			/*
+			 * PGRAC: spec-7.3 D4 (8.A) — route this frame to the worker that
+			 * owns its tag's shard, so every message of a tag rides one
+			 * worker<->worker stream (per-tag FIFO).  -1 = a DATA frame with
+			 * no routable tag → refuse to stage it fail-closed rather than
+			 * default a worker (a misroute would break message order).
+			 */
+			int worker = cluster_gcs_block_payload_shard(msg_type, payload, payload_len,
+														 cluster_lms_workers);
+
+			if (worker < 0)
+				return false;
+			return cluster_lms_outbound_enqueue(worker, msg_type, dest_node_id, payload,
+												payload_len);
+		}
+	}
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 

@@ -101,6 +101,8 @@ my $disks_csv = join(',', @disks);
 
 my $ic0 = PostgreSQL::Test::Cluster::get_free_port();
 my $ic1 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port0 = PostgreSQL::Test::Cluster::get_free_port();
+my $data_port1 = PostgreSQL::Test::Cluster::get_free_port();
 
 # ----------
 # Step 0: node0 init -> backup -> node1 init_from_backup (one shared sysid),
@@ -164,6 +166,8 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.online_join = on
+cluster.xid_striping = on
 cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off
@@ -181,6 +185,13 @@ $node0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node1->append_conf('postgresql.conf', $sc_common);
 $node1->append_conf('postgresql.conf', $cluster_conf);
 $node1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3 merge: this hand-rolled rig reserves ONE data port per node; the
+# shipped default cluster.lms_workers=2 binds [data_port, data_port+1] and
+# cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
+# pool to one worker: N=1 is the spec-7.2 topology identity this rig was
+# written against.
+$node0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$node1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 
 my $pgrac_conf = <<EOC;
 [cluster]
@@ -188,9 +199,11 @@ name = sc_rmc
 
 [node.0]
 interconnect_addr = 127.0.0.1:$ic0
+data_addr = 127.0.0.1:$data_port0
 
 [node.1]
 interconnect_addr = 127.0.0.1:$ic1
+data_addr = 127.0.0.1:$data_port1
 EOC
 PostgreSQL::Test::Utils::append_to_file($node0->data_dir . '/pgrac.conf', $pgrac_conf);
 PostgreSQL::Test::Utils::append_to_file($node1->data_dir . '/pgrac.conf', $pgrac_conf);
@@ -216,7 +229,17 @@ for (1 .. 60)
 # ----------
 # R0: both alive; one warm cross-node catalog table; baseline relfilenumber.
 # ----------
-is($node0->safe_psql('postgres', 'SELECT 1'), '1', 'R0: node0 is up');
+# Immediately after online_join + striping activation, a backend's bootstrap
+# catalog read can transiently hit a peer whose block view is still rebuilding.
+# Poll both nodes with the same tolerant shape used by t/339.
+my $n0_up = 0;
+for (1 .. 60)
+{
+	my ($rc) = $node0->psql('postgres', 'SELECT 1');
+	if (defined $rc && $rc == 0) { $n0_up = 1; last; }
+	usleep(500_000);
+}
+is($n0_up, 1, 'R0: node0 is up');
 is($n1_up, 1, 'R0: node1 is up');
 
 $node0->safe_psql('postgres',
