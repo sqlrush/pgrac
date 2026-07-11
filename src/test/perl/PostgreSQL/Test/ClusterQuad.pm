@@ -98,10 +98,17 @@ sub new_quad
 
 	# Allocate 12 distinct free ports (4 PG + 4 IC + 4 DATA).
 	# spec-7.2 D2: DATA-plane ports are allocator-provided, never
-	# offset-derived (r1-F2).
+	# offset-derived (r1-F2).  spec-7.3 D9: the LMS worker pool binds a
+	# listener per worker at data_port + worker_id, so each node needs a
+	# reserved [data_port, data_port + span) range; the default span
+	# follows the shipped default cluster.lms_workers = 2 (same root fix
+	# as ClusterPair/ClusterTriple -- a span of 1 left data_port + 1
+	# unreserved and the quad FATALed at boot on cross-wired worker
+	# listeners).
 	my @pg_ports;
 	my @ic_ports;
 	my @data_ports;
+	my $data_span = $opts{data_port_span} // 2;
 	for (0 .. $NODES - 1)
 	{
 		push @pg_ports, PostgreSQL::Test::Cluster::get_free_port();
@@ -112,7 +119,10 @@ sub new_quad
 	}
 	for (0 .. $NODES - 1)
 	{
-		push @data_ports, PostgreSQL::Test::Cluster::get_free_port();
+		push @data_ports,
+		  $data_span > 1
+		  ? PostgreSQL::Test::Cluster::get_free_port_range($data_span)
+		  : PostgreSQL::Test::Cluster::get_free_port();
 	}
 
 	my @nodes;
