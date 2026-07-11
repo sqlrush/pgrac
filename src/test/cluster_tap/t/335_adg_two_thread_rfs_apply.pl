@@ -243,6 +243,10 @@ $primary0->append_conf('postgresql.conf', $primary_common_conf);
 $primary0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $primary1->append_conf('postgresql.conf', $primary_common_conf);
 $primary1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+# spec-7.3: pin the pool BEFORE the primaries start (the block further down
+# runs after ->start and cannot help them) -- one data port per node here.
+$primary0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
+$primary1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 write_pair_conf($primary0, $primary1, 'adg2_primary');
 $primary0->start;
 $primary1->start;
@@ -296,8 +300,6 @@ $standby1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
 # cross-wires consecutive free ports (HELLO DATA worker mismatch).  Pin the
 # pool to one worker: N=1 is the spec-7.2 topology identity this rig was
 # written against.
-$primary0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
-$primary1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 $standby0->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 $standby1->append_conf('postgresql.conf', "cluster.lms_workers = 1\n");
 write_pair_conf($standby0, $standby1, 'adg2_standby');
