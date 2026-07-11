@@ -343,6 +343,7 @@ extern uint64 cluster_scn_durable_frontier_regression_count(void);
 
 extern void cluster_scn_boc_payload_encode(SCN scn, uint8 *buf);
 extern SCN cluster_scn_boc_payload_decode(const uint8 *buf);
+extern bool cluster_scn_boc_event_consume(void);
 extern bool cluster_scn_remote_durable_safe(NodeId origin, uint64 *epoch_out, SCN *scn_out);
 extern uint64 cluster_scn_boc_payload_accept_count(void);
 extern uint64 cluster_scn_boc_payload_bad_length_count(void);

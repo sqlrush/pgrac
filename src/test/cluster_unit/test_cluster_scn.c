@@ -357,6 +357,16 @@ GetFlushRecPtr(TimeLineID *insertTLI)
 	return 0;
 }
 
+/* spec-7.4 D1-2 / L104: cluster_scn.o now references the event-publish
+ * GUC and the LMON wakeup helper (cluster_lmon.o not linked here).
+ * Event-protocol behavior tests live in test_cluster_scn_frontier.c;
+ * these stubs only satisfy the linker (wakeup vacuous, GUC on). */
+bool cluster_boc_event_publish = true;
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

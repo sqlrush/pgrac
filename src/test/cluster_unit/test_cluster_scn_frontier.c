@@ -238,10 +238,14 @@ superuser(void)
 }
 
 /* injection stub */
+/* spec-7.4 D1-2: configurable suppress-injection stub -- tests set
+ * test_injection_skip_point to a point name to suppress it. */
+const char *test_injection_skip_point = NULL;
+
 bool
-cluster_injection_should_skip(const char *p pg_attribute_unused())
+cluster_injection_should_skip(const char *p)
 {
-	return false;
+	return test_injection_skip_point != NULL && strcmp(p, test_injection_skip_point) == 0;
 }
 void
 cluster_injection_check(const char *p pg_attribute_unused())
@@ -300,12 +304,23 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  *	(handler branch is exercised directly), so the stubs can be vacuous:
  *	all peers PEER_DOWN for fanout, 0 for alive-peer-count.
  */
+/* spec-7.4 D1-2: capturing fanout stub -- drain tests assert on the
+ * last frame's msg_type / payload bytes. */
+int test_fanout_calls = 0;
+uint8 test_fanout_last_msg_type = 0;
+uint32 test_fanout_last_len = 0;
+uint8 test_fanout_last_payload[64];
+
 void
-cluster_ic_send_envelope_fanout(uint8 msg_type pg_attribute_unused(),
-								const void *payload pg_attribute_unused(),
-								uint32 payload_len pg_attribute_unused(),
+cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payload_len,
 								ClusterICFanoutResult per_peer[])
 {
+	test_fanout_calls++;
+	test_fanout_last_msg_type = msg_type;
+	test_fanout_last_len = payload_len;
+	memset(test_fanout_last_payload, 0, sizeof(test_fanout_last_payload));
+	if (payload != NULL && payload_len > 0 && payload_len <= sizeof(test_fanout_last_payload))
+		memcpy(test_fanout_last_payload, payload, payload_len);
 	if (per_peer != NULL) {
 		int i;
 
@@ -314,10 +329,14 @@ cluster_ic_send_envelope_fanout(uint8 msg_type pg_attribute_unused(),
 	}
 }
 
+/* spec-7.4 D1-2: configurable so drain tests can pass the zero-peer
+ * short-circuit (I9). */
+int test_alive_peer_count = 0;
+
 int
 cluster_cssd_get_alive_peer_count(void)
 {
-	return 0;
+	return test_alive_peer_count;
 }
 
 int
@@ -357,6 +376,18 @@ GetFlushRecPtr(TimeLineID *insertTLI)
 		*insertTLI = 0;
 	return 0;
 }
+
+/* spec-7.4 D1-2: LMON wakeup stub counts SetLatch-equivalent signals. */
+int test_lmon_wakeup_count = 0;
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+	test_lmon_wakeup_count++;
+}
+
+/* spec-7.4 D1-2 GUC backing var (cluster_guc.o not linked). */
+bool cluster_boc_event_publish = true;
 
 
 UT_DEFINE_GLOBALS();
@@ -793,6 +824,171 @@ UT_TEST(test_spec74_frontier_abort_self_keeps_filled_entry)
 	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_durable_safe_scn(), s), 0);
 }
 
+
+/* ============================================================
+ * Spec-7.4 D1-2 event protocol tests (dirty + wake + drain payload)
+ * ============================================================
+ *
+ *	Producer protocol (mini-plan v1.1 ruling #4):  publish (under the
+ *	SCN lwlock) -> exchange-set dirty -> SetLatch(LMON) only on the
+ *	0->1 transition.  Consumer (LMON drain):  exchange-clear dirty
+ *	BEFORE snapshotting, so a racing publish re-arms the wakeup.
+ *	cluster.boc_event_publish=off restores payload=0 frames AND no
+ *	wakeups (byte equivalence with the pre-D1 sweep-only channel).
+ */
+
+UT_TEST(test_spec74_event_dirty_wake_on_frontier_advance)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_boc_event_consume(); /* drain stale dirty */
+	test_lmon_wakeup_count = 0;
+
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)11000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 1);
+	UT_ASSERT(cluster_scn_boc_event_consume());
+	UT_ASSERT(!cluster_scn_boc_event_consume());
+}
+
+UT_TEST(test_spec74_event_dirty_dedup_second_advance_no_wake)
+{
+	SCN s1;
+	SCN s2;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_boc_event_consume();
+	test_lmon_wakeup_count = 0;
+
+	s1 = cluster_scn_advance_for_commit();
+	s2 = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s1, (XLogRecPtr)12000));
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s2, (XLogRecPtr)12001));
+
+	/* First advance wakes;  the second finds dirty already set and
+	 * must not signal again (natural batching). */
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s1));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s2));
+
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 1);
+	UT_ASSERT(cluster_scn_boc_event_consume());
+}
+
+UT_TEST(test_spec74_event_no_frontier_advance_no_wake)
+{
+	SCN s1;
+	SCN s2;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_boc_event_consume();
+	test_lmon_wakeup_count = 0;
+
+	s1 = cluster_scn_advance_for_commit();
+	s2 = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s1, (XLogRecPtr)13000));
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s2, (XLogRecPtr)13001));
+
+	/* Discharging the LATER scn first leaves min(pending)=s1:  the
+	 * recomputed frontier equals the already-published value, so no
+	 * event fires. */
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s2));
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 0);
+	UT_ASSERT(!cluster_scn_boc_event_consume());
+
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s1));
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 1);
+	UT_ASSERT(cluster_scn_boc_event_consume());
+}
+
+UT_TEST(test_spec74_event_publish_off_no_dirty_no_wake)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_boc_event_consume();
+	test_lmon_wakeup_count = 0;
+
+	cluster_boc_event_publish = false;
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)14000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+	cluster_boc_event_publish = true;
+
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 0);
+	UT_ASSERT(!cluster_scn_boc_event_consume());
+}
+
+UT_TEST(test_spec74_event_injection_suppresses_signal)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_boc_event_consume();
+	test_lmon_wakeup_count = 0;
+
+	test_injection_skip_point = "cluster-boc-event-publish";
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)15000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+	test_injection_skip_point = NULL;
+
+	/* Suppressed event; the sweep cadence remains the fallback (L2). */
+	UT_ASSERT_EQ(test_lmon_wakeup_count, 0);
+	UT_ASSERT(!cluster_scn_boc_event_consume());
+}
+
+UT_TEST(test_spec74_drain_attaches_payload_v1_when_on)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	test_alive_peer_count = 1;
+
+	/* Arm an event, then drain as LMON would. */
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)16000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+
+	test_fanout_calls = 0;
+	cluster_scn_lmon_drain_boc_broadcast();
+
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_fanout_last_msg_type, PGRAC_IC_MSG_BOC_BROADCAST);
+	UT_ASSERT_EQ(test_fanout_last_len, CLUSTER_SCN_BOC_PAYLOAD_V1_LEN);
+	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_boc_payload_decode(test_fanout_last_payload),
+							   cluster_scn_durable_safe_scn()),
+				 0);
+	test_alive_peer_count = 0;
+}
+
+UT_TEST(test_spec74_drain_zero_len_when_off_even_if_dirty)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	test_alive_peer_count = 1;
+
+	/* Dirty was armed while the GUC was on;  a SIGHUP flips it off
+	 * before the drain runs.  The stale event drains as a 0-byte
+	 * pulse:  off means payload=0 on the wire, unconditionally. */
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)17000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+
+	cluster_boc_event_publish = false;
+	test_fanout_calls = 0;
+	cluster_scn_lmon_drain_boc_broadcast();
+	cluster_boc_event_publish = true;
+
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_fanout_last_msg_type, PGRAC_IC_MSG_BOC_BROADCAST);
+	UT_ASSERT_EQ(test_fanout_last_len, 0);
+	test_alive_peer_count = 0;
+}
+
 /*
  * MUST RUN LAST:  overflow freezes the frontier stickily (until
  * restart);  every test after this one would see frozen state.
@@ -854,6 +1050,13 @@ main(void)
 	UT_RUN(test_spec74_handler_epoch_change_rebuilds_cache);
 	UT_RUN(test_spec74_remote_accessor_unseen_origin_false);
 	UT_RUN(test_spec74_frontier_abort_self_keeps_filled_entry);
+	UT_RUN(test_spec74_event_dirty_wake_on_frontier_advance);
+	UT_RUN(test_spec74_event_dirty_dedup_second_advance_no_wake);
+	UT_RUN(test_spec74_event_no_frontier_advance_no_wake);
+	UT_RUN(test_spec74_event_publish_off_no_dirty_no_wake);
+	UT_RUN(test_spec74_event_injection_suppresses_signal);
+	UT_RUN(test_spec74_drain_attaches_payload_v1_when_on);
+	UT_RUN(test_spec74_drain_zero_len_when_off_even_if_dirty);
 	UT_RUN(test_spec74_frontier_overflow_freezes_sticky);
 
 	UT_DONE();

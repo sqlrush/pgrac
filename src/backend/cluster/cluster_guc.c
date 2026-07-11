@@ -554,6 +554,9 @@ bool cluster_undo_retention_horizon_enabled = true;
  * check_GUC_init Assert (boot_val 与 C-var 初值不一致会触发 guc.c:4820 TRAP). */
 int cluster_boc_sweep_interval_ms = 100;
 
+/* PGRAC: spec-7.4 D1-2 — event-driven BOC durable-frontier publish. */
+bool cluster_boc_event_publish = true;
+
 /* PGRAC: spec-2.12 D1 — SCN cross-instance propagation lag bound.
  *
  *   Configuration bound (NOT enforcement action) — used by TAP 102 as
@@ -3666,6 +3669,18 @@ cluster_init_guc(void)
 		 * 不动(LMON tick 1000ms 是 bottleneck per spec-2.10 §0 Q5 / §3.1).
 		 * Range 1..1000 保持. */
 		&cluster_boc_sweep_interval_ms, 100, 1, 1000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/* PGRAC: spec-7.4 D1-2 — commit-driven BOC publish events.  off =
+	 * sweep-only cadence with 0-length BOC frames (pre-D1 wire bytes)
+	 * and no LMON event wakeups. */
+	DefineCustomBoolVariable(
+		"cluster.boc_event_publish",
+		gettext_noop("Publish the durable SCN frontier on commit events."),
+		gettext_noop("When on, a commit that advances the durable SCN frontier wakes LMON to "
+					 "fan out a BOC frame carrying the frontier immediately; the periodic "
+					 "walwriter sweep remains the fallback cadence.  When off, BOC frames "
+					 "carry no payload and only the sweep cadence runs."),
+		&cluster_boc_event_publish, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* PGRAC: spec-2.12 D1 — SCN cross-instance propagation lag bound.
 	 * Configuration only (no enforcement action — TAP 102 uses this as
