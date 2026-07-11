@@ -239,12 +239,23 @@ superuser(void)
 
 /* injection stub */
 /* spec-7.4 D1-2: configurable suppress-injection stub -- tests set
- * test_injection_skip_point to a point name to suppress it. */
+ * test_injection_skip_point to a point name to make the armed-state
+ * peek (cluster_cr_injection_armed) report it armed.  The production
+ * probe also requires cluster_injection_armed_count > 0 (fast gate),
+ * so tests raise the gate for the suppression window. */
 const char *test_injection_skip_point = NULL;
 
 bool
 cluster_injection_should_skip(const char *p)
 {
+	return test_injection_skip_point != NULL && strcmp(p, test_injection_skip_point) == 0;
+}
+
+bool
+cluster_cr_injection_armed(const char *p, uint64 *out_param)
+{
+	if (out_param != NULL)
+		*out_param = 0;
 	return test_injection_skip_point != NULL && strcmp(p, test_injection_skip_point) == 0;
 }
 void
@@ -254,8 +265,9 @@ cluster_injection_check(const char *p pg_attribute_unused())
 /* fmgr stub for SQL UDFs (address-only) */
 struct FunctionCallInfoBaseData;
 
-/* injection extras (cluster_scn.c references run + armed_count) */
-pg_atomic_uint32 cluster_injection_armed_count;
+/* injection extras (cluster_scn.c references run + armed_count; the
+ * gate is a plain int in cluster_inject.h, mirror that here). */
+int cluster_injection_armed_count;
 void
 cluster_injection_run(const char *p pg_attribute_unused())
 {}
@@ -930,9 +942,11 @@ UT_TEST(test_spec74_event_injection_suppresses_signal)
 	test_lmon_wakeup_count = 0;
 
 	test_injection_skip_point = "cluster-boc-event-publish";
+	cluster_injection_armed_count = 1;
 	s = cluster_scn_advance_for_commit();
 	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)15000));
 	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+	cluster_injection_armed_count = 0;
 	test_injection_skip_point = NULL;
 
 	/* Suppressed event; the sweep cadence remains the fallback (L2). */

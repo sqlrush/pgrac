@@ -1142,7 +1142,16 @@ cluster_scn_boc_event_signal(void)
 		return;
 	if (cluster_scn_state == NULL)
 		return;
-	if (cluster_injection_should_skip("cluster-boc-event-publish"))
+
+	/*
+	 * Armed-state peek, not CLUSTER_INJECTION_POINT dispatch:  this
+	 * runs on the post-commit path (commit record already durable), so
+	 * an armed ERROR/SLEEP/CRASH dispatch must never fire here.  The
+	 * armed_count fast gate keeps the probe free when no injection is
+	 * armed anywhere in this process.
+	 */
+	if (cluster_injection_armed_count > 0
+		&& cluster_cr_injection_armed("cluster-boc-event-publish", NULL))
 		return;
 	if (pg_atomic_exchange_u32(&cluster_scn_state->boc_event_dirty, 1) == 0)
 		cluster_lmon_marker_complete_wakeup();
