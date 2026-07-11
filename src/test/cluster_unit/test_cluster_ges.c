@@ -218,6 +218,20 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
 
 int cluster_node_id = 0;
 
+/* spec-7.6 6.3b link stubs: cluster_ges.c's DRM admission hook references these
+ * (guarded by cluster_drm_enabled = false here, so they are never called). */
+bool cluster_drm_enabled = false;
+void
+cluster_drm_affinity_sample(uint32 shard_id pg_attribute_unused(),
+							int32 requesting_node pg_attribute_unused(),
+							bool was_remote pg_attribute_unused())
+{}
+bool
+cluster_grd_is_local_master(uint32 shard_id pg_attribute_unused())
+{
+	return false;
+}
+
 bool
 cluster_qvotec_in_quorum(void)
 {

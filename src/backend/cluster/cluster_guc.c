@@ -175,7 +175,8 @@ bool cluster_smgr_user_relations = false;
  */
 bool cluster_shared_catalog = false;
 int cluster_oid_lease_size = 8192;
-int cluster_shmem_max_regions = 80; /* spec-5.56: 64 -> 80 (cr relgen region; restore margin) */
+int cluster_shmem_max_regions
+	= 96; /* spec-5.56: 64 -> 80; spec-7.6 6.3b: 80 -> 96 (drm affinity region + margin) */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
@@ -231,6 +232,11 @@ int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
 int cluster_hw_remaster_retry_backoff_ms = 1000;
+
+/* spec-7.6 6.3b — DRM per-shard affinity collection (default off / conservative). */
+bool cluster_drm_enabled = false;
+int cluster_drm_affinity_sample_rate = 16;
+int cluster_drm_min_access_count = 1000;
 int cluster_hw_remaster_retry_max_attempts = 16;
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
@@ -2167,7 +2173,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 80, CLUSTER_SHMEM_MIN_REGIONS, 256,
+							&cluster_shmem_max_regions, 96, CLUSTER_SHMEM_MIN_REGIONS, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -2426,6 +2432,36 @@ cluster_init_guc(void)
 					 "request with a fresh deadline."),
 		&cluster_grd_rebuild_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+
+	/*
+	 * spec-7.6 6.3b — DRM per-shard affinity collection.  Master switch defaults
+	 * OFF (upgrade behaviour == Stage 5, zero hot-path cost); the decision +
+	 * anti-thrash + live-remaster GUCs land in waves 6.3c/6.3f.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.drm_enabled", gettext_noop("Enable DRM per-shard access-affinity collection."),
+		gettext_noop("Off (default) keeps Stage 5 behaviour with zero cost on the lock "
+					 "admission path.  On samples first-logical lock requests on the shard's "
+					 "current master to build the per-node access matrix that the DRM decision "
+					 "engine (a later wave) uses to migrate hot shards' masters."),
+		&cluster_drm_enabled, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_affinity_sample_rate",
+		gettext_noop("Sample 1 in N lock-admission hits for DRM affinity (N)."),
+		gettext_noop("Range [1, 1000000].  Default 16.  Higher values lower the collection "
+					 "cost at the price of coarser affinity resolution.  min_access_count is "
+					 "normalized by this rate, so changing it reopens the current window."),
+		&cluster_drm_affinity_sample_rate, 16, 1, 1000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.drm_min_access_count",
+		gettext_noop(
+			"Absolute (sample-normalized) access floor before a shard is a DRM candidate."),
+		gettext_noop("Range [0, 2000000000].  Default 1000.  Mirrors Oracle _gc_affinity_minimum "
+					 "in spirit (value not verified against Oracle).  A shard whose sampled "
+					 "access total * sample_rate stays below this is never considered for "
+					 "remaster."),
+		&cluster_drm_min_access_count, 1000, 0, 2000000000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"cluster.hw_remaster_retry_backoff_ms",
 		gettext_noop("Initial backoff before retrying a BLOCKED HW remaster worker (ms)."),

@@ -511,6 +511,13 @@ cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
 }
 int cluster_node_id = -1;
 
+/* spec-7.6 6.3b link stubs: cluster_lmon.c drains the DRM ring (guarded by
+ * cluster_drm_enabled = false here, so the flush is never actually called). */
+bool cluster_drm_enabled = false;
+void
+cluster_drm_affinity_flush_local_ring(void)
+{}
+
 /* WaitEventSet API stubs (storage/latch.h).  Never invoked at unit-test
  * runtime because the test doesn't call LmonMain. */
 struct WaitEventSet;

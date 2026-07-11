@@ -119,7 +119,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_cleaner.h" /* dump_undo_cleaner (spec-3.13 D1) */
 #include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
-#include "catalog/pg_control.h" /* DBState (spec-4.3 plan dump) */
+#include "cluster/cluster_drm_affinity.h" /* spec-7.6 6.3b — drm_affinity dump */
+#include "catalog/pg_control.h"			  /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_recovery_merge.h"	  /* is_materialized (spec-4.5a D11) */
@@ -3150,6 +3151,34 @@ dump_xnode_profile(ReturnSetInfo *rsinfo)
  *	(values stay 0) so the key surface is stable for tests and samplers;
  *	later waves append keys, never rename (5.59 Q9-B category paradigm).
  */
+/*
+ * dump_drm_affinity -- spec-7.6 6.3b DRM affinity collection observability.
+ *	Pure counter surface (append-only keys; later waves add decision / anti-
+ *	thrash keys, never rename — 5.59 Q9-B category paradigm).
+ */
+static void
+dump_drm_affinity(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "drm_affinity", "drm_enabled", fmt_int64(cluster_drm_enabled ? 1 : 0));
+	emit_row(rsinfo, "drm_affinity", "sample_epoch",
+			 fmt_int64((int64)cluster_drm_affinity_get_sample_epoch()));
+	emit_row(rsinfo, "drm_affinity", "samples_recorded",
+			 fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_RECORDED)));
+	emit_row(rsinfo, "drm_affinity", "samples_local",
+			 fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_LOCAL)));
+	emit_row(rsinfo, "drm_affinity", "samples_remote",
+			 fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_REMOTE)));
+	emit_row(
+		rsinfo, "drm_affinity", "samples_skipped_off",
+		fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_SKIPPED_OFF)));
+	emit_row(
+		rsinfo, "drm_affinity", "samples_dropped_stale_epoch",
+		fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_DROPPED_STALE)));
+	emit_row(
+		rsinfo, "drm_affinity", "flush_batches",
+		fmt_int64((int64)cluster_drm_affinity_get_counter(CLUSTER_DRM_AFFINITY_CTR_FLUSH_BATCHES)));
+}
+
 static void
 dump_xnode_lever(ReturnSetInfo *rsinfo)
 {
@@ -3321,6 +3350,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_write_fence(rsinfo);
 		dump_hw(rsinfo);
 		dump_dl(rsinfo);
+		dump_drm_affinity(rsinfo); /* spec-7.6 6.3b */
 		dump_ir(rsinfo);
 		dump_ts(rsinfo);
 		dump_ko(rsinfo);

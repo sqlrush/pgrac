@@ -109,9 +109,11 @@ my $has_visibility_inject =
 # between "pgrac cluster cr relgen" and "pgrac cluster cr tuple stats").
 # spec-6.12h D-h3a: +1 "pgrac cluster pi shadow" (PI ship-SCN shadow table;
 # sorts between "pgrac cluster oid lease,pgrac cluster pcm grd" and "pgrac cluster qvotec").
-my $expected_region_count = $has_visibility_inject ? '80' : '79';
+# spec-7.6 6.3b: +1 "pgrac cluster drm affinity" (DRM per-shard access matrix;
+# sorts between "pgrac cluster dl" and "pgrac cluster durable tt counters").
+my $expected_region_count = $has_visibility_inject ? '81' : '80';
 my $expected_regions =
-  'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster catalog stats,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr server,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster hw lease,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lms data outbound,pgrac cluster lock-path counters,pgrac cluster mrp,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster oid lease,pgrac cluster pcm grd,pgrac cluster pi shadow,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smart fusion deps,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
+  'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster catalog stats,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr server,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster drm affinity,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster hw lease,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lms data outbound,pgrac cluster lock-path counters,pgrac cluster mrp,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster oid lease,pgrac cluster pcm grd,pgrac cluster pi shadow,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smart fusion deps,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 # spec-4.12 D7: cooperative write-fence region;  always registered.  Sorts after
@@ -256,14 +258,14 @@ like($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   qr/^integer\|postmaster\|80\|(40|41)\|256$/,
-   'L12 cluster.shmem_max_regions default 80 (spec-5.56: 64 -> 80 for cr relgen region)');
+   qr/^integer\|postmaster\|96\|(40|41)\|256$/,
+   'L12 cluster.shmem_max_regions default 96 (spec-5.56: 64 -> 80; spec-7.6 6.3b: 80 -> 96 for drm affinity region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '80',
+   '96',
    'L13 pg_cluster_state.guc.cluster.shmem_max_regions reflects live GUC');
 
 

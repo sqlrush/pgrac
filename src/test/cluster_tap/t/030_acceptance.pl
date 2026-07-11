@@ -395,8 +395,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'O2 pg_cluster_state has all 56 categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.12 adds xnode_lever; spec-6.2 adds smart_fusion; spec-6.14 adds catalog)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,drm_affinity,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'O2 pg_cluster_state has all 57 categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.12 adds xnode_lever; spec-6.2 adds smart_fusion; spec-6.14 adds catalog; spec-7.6 adds drm_affinity)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),
