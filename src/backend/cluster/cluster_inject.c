@@ -422,6 +422,21 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-undo-authority-block0-prove" },
 	/*
+	 * spec-5.22d Hardening — dead-owner authority durable-segment ENUMERATION
+	 * fault injection.
+	 *
+	 *	cluster-undo-authority-scan:
+	 *	  Fires inside authority_scan_owner_segments' enumeration loop, once
+	 *	  per directory entry, modelling a mid-scan directory read failure
+	 *	  (ReadDir throws at the ERROR elevel).  ERROR arms the throw; the
+	 *	  scan's PG_TRY folds it into a coverage failure so the prove fails
+	 *	  closed via undo_authority_scan_incomplete_reject -- never a truncated
+	 *	  "complete" scan that could serve a false-unique verdict.  TAP L3c
+	 *	  pins the scan-incomplete arm with a counter delta (53R97), proving an
+	 *	  un-completable enumeration is refused, not swallowed.
+	 */
+	{ .name = "cluster-undo-authority-scan" },
+	/*
 	 * spec-5.22e D5-7 — undo horizon report drop injection (TAP L2).
 	 *
 	 *	cluster-undo-horizon-report-drop:

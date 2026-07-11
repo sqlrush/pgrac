@@ -169,7 +169,8 @@ authority_scan_owner_segments(int32 owner_node, TransactionId raw_xid,
 	DIR *dir;
 	struct dirent *de;
 	uint8 owner_instance = (uint8)(owner_node + 1);
-	bool complete = true;
+	volatile bool complete = true;
+	MemoryContext scan_ctx = CurrentMemoryContext;
 
 	if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, dirpath, sizeof(dirpath)) != 0)
 		return false;
@@ -178,62 +179,97 @@ authority_scan_owner_segments(int32 owner_node, TransactionId raw_xid,
 	if (dir == NULL)
 		return false;
 
-	errno = 0;
-	while ((de = ReadDirExtended(dir, dirpath, LOG)) != NULL) {
-		char canon[64];
-		unsigned long id;
-		char *end;
-		PGAlignedBlock page;
-		int nmatch = 0;
-		ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
-		SCN scn = InvalidScn;
-		uint16 wrap = TT_WRAP_INVALID;
+	/*
+	 * 完备-或-fail-closed enumeration (spec-5.22d Hardening, errno-fragility):
+	 * ReadDir uses the ERROR elevel, so a directory read that breaks
+	 * mid-enumeration THROWS rather than returning NULL indistinguishably from
+	 * end-of-directory.  The pre-fix errno-after-loop probe was unreliable --
+	 * ereport can clobber errno on the LOG path, so an EIO-truncated scan could
+	 * be judged "complete" and serve a false-unique verdict.  The PG_TRY folds
+	 * any throw into the same coverage failure the parse/read paths below
+	 * already signal, so BOTH the SELF reader leg and the LMS wire leg fail
+	 * closed identically (Rule 8.A); FreeDir runs on every path (no AllocateDir
+	 * leak on the wire leg's error-swallowing drain envelope).
+	 */
+	PG_TRY();
+	{
+		while ((de = ReadDir(dir, dirpath)) != NULL) {
+			char canon[64];
+			unsigned long id;
+			char *end;
+			PGAlignedBlock page;
+			int nmatch = 0;
+			ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+			SCN scn = InvalidScn;
+			uint16 wrap = TT_WRAP_INVALID;
 
-		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			/*
+			 * spec-5.22d Hardening (errno-fragility): model a mid-enumeration
+			 * directory read failure.  Armed ERROR throws here exactly as a real
+			 * ReadDir I/O error would; the enclosing PG_TRY folds it into a
+			 * coverage failure, never a truncated "complete" scan.
+			 */
+			CLUSTER_INJECTION_POINT("cluster-undo-authority-scan");
+
+			if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+				continue;
+
+			/*
+			 * Canonical name gate (A1.1-bis #2): every other entry must be
+			 * EXACTLY seg_<id>.dat as the writer renders it — parse, then
+			 * re-render and compare, so aliases (seg_007.dat), trailing junk
+			 * and out-of-range ids all poison the set instead of hiding
+			 * evidence under a name the scan would skip.
+			 */
+			if (strncmp(de->d_name, "seg_", 4) != 0) {
+				complete = false;
+				break;
+			}
 			errno = 0;
-			continue;
-		}
+			id = strtoul(de->d_name + 4, &end, 10);
+			if (errno != 0 || end == de->d_name + 4 || strcmp(end, ".dat") != 0
+				|| id > UINT16_MAX) {
+				complete = false;
+				break;
+			}
+			snprintf(canon, sizeof(canon), "seg_%lu.dat", id);
+			if (strcmp(canon, de->d_name) != 0) {
+				complete = false;
+				break;
+			}
 
-		/*
-		 * Canonical name gate (A1.1-bis #2): every other entry must be
-		 * EXACTLY seg_<id>.dat as the writer renders it — parse, then
-		 * re-render and compare, so aliases (seg_007.dat), trailing junk
-		 * and out-of-range ids all poison the set instead of hiding
-		 * evidence under a name the scan would skip.
-		 */
-		if (strncmp(de->d_name, "seg_", 4) != 0) {
-			complete = false;
-			break;
+			/* Read + parse this segment's block0; any failure poisons the set. */
+			if (!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
+											  (uint32)id, owner_instance, 0 /* block0 */,
+											  page.data)) {
+				complete = false;
+				break;
+			}
+			if (cluster_vis_tt_block_xid_scan(page.data, (uint32)id, owner_instance, raw_xid,
+											  &nmatch, &proof, &scn, &wrap)
+				!= CLUSTER_VIS_TT_BLOCK_SCAN_OK) {
+				complete = false;
+				break;
+			}
+			cluster_undo_authority_scan_fold(agg, true, nmatch, proof, scn, wrap);
 		}
-		errno = 0;
-		id = strtoul(de->d_name + 4, &end, 10);
-		if (errno != 0 || end == de->d_name + 4 || strcmp(end, ".dat") != 0 || id > UINT16_MAX) {
-			complete = false;
-			break;
-		}
-		snprintf(canon, sizeof(canon), "seg_%lu.dat", id);
-		if (strcmp(canon, de->d_name) != 0) {
-			complete = false;
-			break;
-		}
-
-		/* Read + parse this segment's block0; any failure poisons the set. */
-		if (!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
-										  (uint32)id, owner_instance, 0 /* block0 */, page.data)) {
-			complete = false;
-			break;
-		}
-		if (cluster_vis_tt_block_xid_scan(page.data, (uint32)id, owner_instance, raw_xid, &nmatch,
-										  &proof, &scn, &wrap)
-			!= CLUSTER_VIS_TT_BLOCK_SCAN_OK) {
-			complete = false;
-			break;
-		}
-		cluster_undo_authority_scan_fold(agg, true, nmatch, proof, scn, wrap);
-		errno = 0;
 	}
-	if (complete && errno != 0)
-		complete = false; /* readdir broke mid-enumeration: set not complete */
+	PG_CATCH();
+	{
+		/*
+		 * A directory read fault (or any throw) during enumeration means the
+		 * set is not provably complete: fold it to a coverage failure and keep
+		 * the reader backend / LMS worker alive (the caller bumps
+		 * scan_incomplete_reject + fail_closed).  cluster_undo_smgr_read_block
+		 * never throws -- it returns false, handled above -- so in practice
+		 * this catches the ReadDir enumeration fault; either way an
+		 * un-completable scan can never masquerade as a complete one.
+		 */
+		MemoryContextSwitchTo(scan_ctx);
+		FlushErrorState();
+		complete = false;
+	}
+	PG_END_TRY();
 
 	FreeDir(dir);
 	return complete;

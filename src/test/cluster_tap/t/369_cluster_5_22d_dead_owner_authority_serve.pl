@@ -383,6 +383,32 @@ ok( poll_until($node1,
 }
 
 # ============================================================
+# L3c: enumeration-fault refusal (spec-5.22d Hardening, errno-fragility).
+#      A directory read that breaks mid-enumeration must fail closed via the
+#      SCAN-INCOMPLETE path (the durable segment set is not provably complete),
+#      NEVER a raw error abort and never a truncated "complete" scan that could
+#      serve a false-unique verdict.  Arm 'error' models the ReadDir throw; the
+#      read of the still-cold s_t2 must reach the prove's enumeration loop and
+#      refuse via the scan-incomplete counter, not a generic head refusal.
+# ============================================================
+{
+	my $incpl_pre =
+		state_val($node1, 'cr', 'undo_authority_scan_incomplete_reject_count');
+	my ($rc, $out, $err) = $node1->psql('postgres', q{
+		SELECT cluster_inject_fault('cluster-undo-authority-scan', 'error', 0);
+		SELECT count(*) FROM s_t2;
+	});
+	isnt($rc, 0, 'L3c armed enum-fault: node1 read of s_t2 errors (fail-closed, not served)');
+	unlike(($out // ''), qr/^\s*5\s*$/m,
+		'L3c armed read did NOT return the 5 rows (an incomplete enumeration never serves a verdict)');
+	like($err, qr/cluster TT status unknown|cluster TT slot recycled/,
+		'L3c the failure is the 53R97 fail-closed boundary (enumeration folded to a coverage failure, never a raw abort)');
+	cmp_ok(state_val($node1, 'cr', 'undo_authority_scan_incomplete_reject_count'),
+		'>', $incpl_pre,
+		'L3c HARD ASSERT: undo_authority_scan_incomplete_reject_count moved (refusal came from the enum-incomplete path, not a generic head refusal)');
+}
+
+# ============================================================
 # L3b: disarm control — a fresh (unarmed) backend re-reads s_t2 and the
 #      serve succeeds, proving L3's refusal was the armed injection.
 # ============================================================
