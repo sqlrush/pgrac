@@ -3227,6 +3227,19 @@ cluster_scn_boc_broadcast_fanout_count(void)
 	return 0;
 }
 
+/* spec-7.4 D4 stubs: cluster_debug emit_row references the event-vs-sweep
+ * balance accessors; test_cluster_debug does not link cluster_scn.o. */
+uint64
+cluster_scn_boc_event_publish_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_sweep_fallback_count(void)
+{
+	return 0;
+}
+
 /* spec-2.11 D5 / L104 stub: cluster_debug emit_row references new
  * spec-2.11 cluster_scn module accessor;test_cluster_debug standalone
  * binary doesn't link cluster_scn.o,vacuous stub. */

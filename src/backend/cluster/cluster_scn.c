@@ -121,6 +121,17 @@ typedef struct ClusterScnSharedState {
 	 */
 	pg_atomic_uint64 boc_broadcast_fanout_count;
 	/*
+	 * spec-7.4 D4:  event-vs-sweep balance observability.
+	 * boc_event_publish_count bumps at the commit-event 0->1 dirty transition
+	 * (a commit event drove an LMON wakeup);  boc_sweep_fallback_count bumps
+	 * when the periodic sweep drain fired with no commit event pending (the
+	 * timer backstop covered a gap, or the event path was off/suppressed).
+	 * Their ratio measures how much the event cadence carries vs the sweep
+	 * backstop (spec-7.4 R2 diagnostic).
+	 */
+	pg_atomic_uint64 boc_event_publish_count;
+	pg_atomic_uint64 boc_sweep_fallback_count;
+	/*
 	 * spec-2.11 D3:  cross-instance commit_scn lookup invocation defer
 	 * counter.
 	 *
@@ -1153,8 +1164,11 @@ cluster_scn_boc_event_signal(void)
 	if (cluster_injection_armed_count > 0
 		&& cluster_cr_injection_armed("cluster-boc-event-publish", NULL))
 		return;
-	if (pg_atomic_exchange_u32(&cluster_scn_state->boc_event_dirty, 1) == 0)
+	if (pg_atomic_exchange_u32(&cluster_scn_state->boc_event_dirty, 1) == 0) {
+		/* spec-7.4 D4: count the commit-event-driven publish (0->1 wakeup). */
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_event_publish_count, 1);
 		cluster_lmon_marker_complete_wakeup();
+	}
 }
 
 /*
@@ -1762,6 +1776,16 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	if (sweep_count == last_drained_sweep_count && !event_pending)
 		return;
 
+	/*
+	 * spec-7.4 D4: a drain reached here with no commit event pending is a
+	 * sweep-backstop fanout (the periodic sweep beat advanced while the event
+	 * path missed or is off/suppressed).  Counts the sweep-driven drain, so
+	 * boc_event_publish_count : boc_sweep_fallback_count reads the event/sweep
+	 * balance regardless of fanout delivery outcome.
+	 */
+	if (!event_pending)
+		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_sweep_fallback_count, 1);
+
 	/* PGRAC: spec-5.59 D2 profiling */
 	cluster_xp_begin(&xps, CLXP_C_SCN_BOC_BROADCAST);
 
@@ -2005,6 +2029,28 @@ cluster_scn_boc_broadcast_fanout_count(void)
 }
 
 /*
+ * spec-7.4 D4:  accessors for the event-vs-sweep balance counters.
+ *
+ *	boc_event_publish_count = commit-event-driven publishes (0->1 dirty
+ *	wakeups);  boc_sweep_fallback_count = sweep-backstop drains that fired
+ *	with no commit event pending.  Lock-free atomic reads (mirror
+ *	cluster_scn_boc_broadcast_fanout_count).
+ */
+uint64
+cluster_scn_boc_event_publish_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->boc_event_publish_count);
+}
+
+uint64
+cluster_scn_boc_sweep_fallback_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->boc_sweep_fallback_count);
+}
+
+/*
  * spec-2.11 D2:  cross-instance commit_scn lookup stub.
  *
  *	Skeleton phase:  always returns CLUSTER_SCN_LOOKUP_DEFER + bumps
@@ -2123,6 +2169,9 @@ cluster_scn_shmem_init(void)
 		pg_atomic_init_u64(&cluster_scn_state->boc_max_batch_size, 0);
 		pg_atomic_init_u64(&cluster_scn_state->boc_last_batch_size, 0);
 		pg_atomic_init_u64(&cluster_scn_state->boc_broadcast_fanout_count, 0);
+		/* spec-7.4 D4: event-vs-sweep balance counters. */
+		pg_atomic_init_u64(&cluster_scn_state->boc_event_publish_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_sweep_fallback_count, 0);
 		/* spec-2.11 D3: init skeleton-phase commit_scn lookup defer counter. */
 		pg_atomic_init_u64(&cluster_scn_state->commit_lookup_defer_count, 0);
 		/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
