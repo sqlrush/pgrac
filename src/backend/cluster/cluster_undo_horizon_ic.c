@@ -92,7 +92,11 @@ typedef struct ClusterUndoHorizonShmem {
 	pg_atomic_uint64 wire_reject_count;
 	pg_atomic_uint64 admission_refuse_count;
 	pg_atomic_uint64 last_floor_scn;	  /* gauge: last OK fold result */
-	pg_atomic_uint64 self_admitted_epoch; /* D5-8: epoch self last became MEMBER */
+	pg_atomic_uint64 self_admitted_epoch; /* D5-8: (epoch self last became
+										   * MEMBER) + 1; 0 = never admitted.
+										   * Biased so a cold-formation
+										   * admission at epoch 0 is distinct
+										   * from the never-admitted sentinel. */
 } ClusterUndoHorizonShmem;
 
 static ClusterUndoHorizonShmem *UndoHorizonShmem = NULL;
@@ -438,14 +442,19 @@ cluster_undo_horizon_required_members(uint8 *required, uint64 *out_epoch)
  * Self admission epoch: the reconfig epoch at which THIS node last became
  * MEMBER (captured by the cluster_membership_set_state choke, so every
  * admission path -- bootstrap formation, online join, rejoin -- records it
- * exactly).  0 = never admitted this incarnation (conservative refuse).
+ * exactly).  Stored BIASED BY ONE: 0 = never admitted this incarnation
+ * (conservative refuse), N+1 = admitted at epoch N.  Cold formation admits
+ * at CLUSTER_EPOCH_INITIAL (= 0), so the raw epoch value cannot double as
+ * the sentinel -- conflating them refused every cross-node read on a
+ * freshly formed cluster with "snapshot predates admission" (t/369 L1-L3b
+ * regression driver).
  */
 void
 cluster_undo_horizon_note_self_member(void)
 {
 	if (UndoHorizonShmem == NULL)
 		return;
-	pg_atomic_write_u64(&UndoHorizonShmem->self_admitted_epoch, cluster_epoch_get_current());
+	pg_atomic_write_u64(&UndoHorizonShmem->self_admitted_epoch, cluster_epoch_get_current() + 1);
 }
 
 /*
@@ -503,10 +512,11 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 								"unaffected.")));
 	}
 
+	/* biased store: 0 = never admitted, N+1 = admitted at epoch N */
 	admitted
 		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
 	snap = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
-	if (admitted == 0 || snap == NULL || snap->read_epoch < admitted
+	if (admitted == 0 || snap == NULL || snap->read_epoch < admitted - 1
 		|| (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn) && snap->read_scn != read_scn)) {
 		if (UndoHorizonShmem != NULL)
 			pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
