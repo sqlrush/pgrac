@@ -686,8 +686,13 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, uint
 		*out_peer_id = msg.source_node_id;
 	if (out_lane_type != NULL)
 		*out_lane_type = private_data->lane_type;
-	cluster_sf_note_peer_hello_capabilities(msg.source_node_id,
-											cluster_ic_hello_capabilities(&msg));
+	/* spec-2.2 additive amendment: generation 0 -- the RDMA lane lifecycle
+	 * has no tier1 reconnect_count notion and never consumed the tier1
+	 * close-funnel clear (pre-existing; registered tier1-only boundary).
+	 * RDMA HELLO exchange is CM-bidirectional (both sides carry HELLO in
+	 * private_data), so no PEER_CAPS_REPLY leg is needed here. */
+	cluster_sf_note_peer_hello_capabilities_gen(msg.source_node_id,
+												cluster_ic_hello_capabilities(&msg), 0);
 	if (out_reason != NULL)
 		*out_reason = NULL;
 	return true;

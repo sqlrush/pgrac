@@ -247,6 +247,17 @@ extern const ClusterICOps *ClusterICOps_Active;
  * (Q3'').  Capability state is connection-bound: cleared on peer close and
  * only reinstated by the next HELLO (Q1' amend). */
 #define PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 ((uint32)0x00000004U)
+/* PGRAC: spec-2.2 additive amendment (spec-5.22e D5 prereq) — META
+ * capability: "this binary registers PGRAC_IC_MSG_PEER_CAPS_REPLY and can
+ * receive it".  Advertised unconditionally (suppressible only by the
+ * test-only cluster.ic_suppress_caps_reply old-binary simulation GUC).
+ * The acceptor sends PEER_CAPS_REPLY back to a verified dialer ONLY when
+ * the dialer's HELLO carried this bit, so an old binary is never sent a
+ * frame whose msg_type it would reject by closing the connection.  The
+ * active handshake sequence is unchanged (send HELLO -> CONNECTED, no
+ * wait): a missing reply just leaves the dialer's view of the peer's
+ * capabilities UNKNOWN, which every consumer treats as fail-closed. */
+#define PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 ((uint32)0x00000008U)
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */

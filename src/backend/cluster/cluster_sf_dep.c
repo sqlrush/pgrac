@@ -46,7 +46,10 @@ typedef struct ClusterSfDepShared {
 	LWLock lock;
 	int max_entries;
 	XLogRecPtr origin_durable[CLUSTER_SF_DEP_MAX_ORIGINS];
-	uint32 peer_capabilities[CLUSTER_MAX_NODES];
+	/* generation-bound per-peer HELLO capability records (spec-2.2 additive
+	 * amendment; spec-5.22e D5 prereq) */
+	ClusterSfPeerCap peer_capabilities[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 caps_reply_reject_count;
 	pg_atomic_uint64 install_count;
 	pg_atomic_uint64 touch_count;
 	pg_atomic_uint64 dbwr_brake_count;
@@ -114,8 +117,12 @@ cluster_sf_dep_shmem_init(void)
 		ClusterSfDep->max_entries = cluster_smart_fusion ? (NBuffers > 0 ? NBuffers : 1) : 0;
 		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++)
 			ClusterSfDep->origin_durable[i] = InvalidXLogRecPtr;
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
-			ClusterSfDep->peer_capabilities[i] = 0;
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			ClusterSfDep->peer_capabilities[i].bits = 0;
+			ClusterSfDep->peer_capabilities[i].generation = 0;
+			ClusterSfDep->peer_capabilities[i].valid = false;
+		}
+		pg_atomic_init_u64(&ClusterSfDep->caps_reply_reject_count, 0);
 		pg_atomic_init_u64(&ClusterSfDep->install_count, 0);
 		pg_atomic_init_u64(&ClusterSfDep->touch_count, 0);
 		pg_atomic_init_u64(&ClusterSfDep->dbwr_brake_count, 0);
@@ -146,14 +153,24 @@ cluster_sf_dep_shmem_register(void)
 	cluster_shmem_register_region(&cluster_sf_dep_region);
 }
 
+/*
+ * cluster_sf_note_peer_hello_capabilities_gen
+ *
+ * spec-2.2 additive amendment (spec-5.22e D5 prereq): record the peer's
+ * verified HELLO capability word, bound to the connection generation that
+ * carried it (tier1: the peer's reconnect_count while the connection was
+ * established).  Called from the acceptor's HELLO verify, from the dialer's
+ * PEER_CAPS_REPLY handler, and from RDMA verify (generation 0; tier1-only
+ * generation boundary, see cluster_sf_dep.h).
+ */
 void
-cluster_sf_note_peer_hello_capabilities(int32 peer_id, uint32 capabilities)
+cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities, uint32 generation)
 {
 	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
-	ClusterSfDep->peer_capabilities[peer_id] = capabilities;
+	cluster_sf_peer_cap_note(&ClusterSfDep->peer_capabilities[peer_id], capabilities, generation);
 	LWLockRelease(&ClusterSfDep->lock);
 }
 
@@ -167,7 +184,7 @@ cluster_sf_peer_supports_reply_v2(int32 peer_id)
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	capabilities = ClusterSfDep->peer_capabilities[peer_id];
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
 	LWLockRelease(&ClusterSfDep->lock);
 	return (capabilities & PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2) != 0;
 }
@@ -189,7 +206,7 @@ cluster_peer_supports_undo_authority_serve(int32 peer_id)
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	capabilities = ClusterSfDep->peer_capabilities[peer_id];
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
 	LWLockRelease(&ClusterSfDep->lock);
 	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1) != 0;
 }
@@ -213,21 +230,43 @@ cluster_sf_peer_supports_undo_horizon(int32 peer_id)
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	capabilities = ClusterSfDep->peer_capabilities[peer_id];
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
 	LWLockRelease(&ClusterSfDep->lock);
 	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1) != 0;
 }
 
 /*
+ * cluster_sf_note_peer_disconnected_gen
+ *
+ * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: capability
+ * state is a property of the CONNECTION that carried the HELLO, not of the
+ * peer's identity.  Called from the transport close funnel with the CLOSING
+ * connection's generation; clears the record only when the generations
+ * match, so a defensive close of a failed dial or of an older connection
+ * never wipes a record the surviving connection installed.  The next
+ * verified HELLO repopulates.  Clearing is uniformly the conservative
+ * direction for every existing consumer: smart-fusion falls back to v1
+ * replies, the D4 authority leg fails closed, and the D5 horizon
+ * sender/fold skip/stall.
+ */
+void
+cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation)
+{
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	(void)cluster_sf_peer_cap_invalidate_gen(&ClusterSfDep->peer_capabilities[peer_id], generation);
+	LWLockRelease(&ClusterSfDep->lock);
+}
+
+/*
  * cluster_sf_note_peer_disconnected
  *
- * spec-5.22e D5-2 (Q1' amend): capability state is a property of the
- * CONNECTION that carried the HELLO, not of the peer's identity.  Called
- * from the transport close funnel; clears every advertised bit so nothing
- * consumes a stale capability across a reconnect window.  The next verified
- * HELLO repopulates.  Clearing is uniformly the conservative direction for
- * every existing consumer: smart-fusion falls back to v1 replies, the D4
- * authority leg fails closed, and the D5 horizon sender/fold skip/stall.
+ * Unconditional clear -- the fail-closed fallback for close paths that have
+ * no connection-generation notion (tier1 keeps it for the Tier1Shmem==NULL
+ * defensive branch only).  Losing a live capability record is always the
+ * conservative direction; trusting a stale one never is.
  */
 void
 cluster_sf_note_peer_disconnected(int32 peer_id)
@@ -236,8 +275,58 @@ cluster_sf_note_peer_disconnected(int32 peer_id)
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
-	ClusterSfDep->peer_capabilities[peer_id] = 0;
+	ClusterSfDep->peer_capabilities[peer_id].bits = 0;
+	ClusterSfDep->peer_capabilities[peer_id].valid = false;
 	LWLockRelease(&ClusterSfDep->lock);
+}
+
+/*
+ * cluster_sf_peer_capabilities_summary
+ *
+ * Dump-surface line for pg_cluster_state ("ic" / "peer_capabilities"):
+ * one "n<id>:bits=0x<hex>,gen=<gen>,v=<valid>" token per declared peer,
+ * space-separated.  Diagnostic only; takes the store lock shared.
+ */
+const char *
+cluster_sf_peer_capabilities_summary(void)
+{
+	static char buf[CLUSTER_MAX_NODES * 48];
+	size_t off = 0;
+	int i;
+
+	buf[0] = '\0';
+	if (ClusterSfDep == NULL)
+		return buf;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	for (i = 0; i < CLUSTER_MAX_NODES && off + 48 < sizeof(buf); i++) {
+		const ClusterSfPeerCap *cap = &ClusterSfDep->peer_capabilities[i];
+
+		if (i == cluster_node_id || cluster_conf_lookup_node(i) == NULL)
+			continue;
+		off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%sn%d:bits=0x%X,gen=%u,v=%d",
+								off > 0 ? " " : "", i, cap->valid ? cap->bits : 0, cap->generation,
+								cap->valid ? 1 : 0);
+	}
+	LWLockRelease(&ClusterSfDep->lock);
+	return buf;
+}
+
+/* PEER_CAPS_REPLY frames dropped by the dialer-side validation core
+ * (spec-2.2 additive amendment §3.4: drop + count, never reconnect). */
+void
+cluster_sf_note_caps_reply_rejected(void)
+{
+	if (ClusterSfDep != NULL)
+		pg_atomic_fetch_add_u64(&ClusterSfDep->caps_reply_reject_count, 1);
+}
+
+uint64
+cluster_sf_caps_reply_reject_count(void)
+{
+	if (ClusterSfDep == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ClusterSfDep->caps_reply_reject_count);
 }
 
 void

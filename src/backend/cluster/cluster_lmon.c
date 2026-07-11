@@ -459,6 +459,17 @@ cluster_lmon_shmem_init(void)
 			undo_horizon_registered = true;
 		}
 	}
+	/* spec-2.2 additive amendment (spec-5.22e D5 prereq): register the
+	 * PEER_CAPS_REPLY capability exchange (LMON-only producer; p2p,
+	 * capability-gated on the dialer's CAPS_REPLY_V1 HELLO bit). */
+	{
+		static bool caps_reply_registered = false;
+
+		if (!caps_reply_registered) {
+			cluster_ic_tier1_register_caps_reply_msg_type();
+			caps_reply_registered = true;
+		}
+	}
 }
 
 

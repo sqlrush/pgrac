@@ -2085,6 +2085,19 @@ cluster_sf_dep_retry_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): the ic dump rows read
+ * the per-peer capability summary + PEER_CAPS_REPLY reject counter from
+ * cluster_sf_dep.c, which is not linked here; stub both. */
+const char *
+cluster_sf_peer_capabilities_summary(void)
+{
+	return "";
+}
+uint64
+cluster_sf_caps_reply_reject_count(void)
+{
+	return 0;
+}
 /* spec-4.8: tt_recovery counter accessors (cluster_tt_durable_stat.c) are not
  * linked here; stub the 8 accessors the tt_recovery dump rows read. */
 uint64

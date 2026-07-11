@@ -73,6 +73,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h"
+#include "cluster/cluster_epoch.h" /* caps-reply epoch recheck (spec-2.2 amendment) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_reset_peer (spec-2.4) */
 #include "cluster/cluster_ic.h"
@@ -183,6 +184,22 @@ static int tier1_hello_send_remaining[CLUSTER_MAX_NODES];
  */
 static uint8 tier1_anon_hello_buf[CLUSTER_MAX_NODES][PGRAC_IC_HELLO_BYTES];
 static int tier1_anon_hello_len[CLUSTER_MAX_NODES];
+
+/*
+ * spec-2.2 additive amendment (spec-5.22e D5 prereq): accept-side
+ * PEER_CAPS_REPLY resend state (LMON process-local, like the fd table).
+ * The reply sent at HELLO-verify time is stamped with this node's CURRENT
+ * epoch; when this node is a rejoiner still at a stale epoch, the dialer's
+ * envelope verify drops that one-shot frame (spec-2.4 Invariant 2) and
+ * nothing would ever retry -- the dialer's view of this node's
+ * capabilities would stay UNKNOWN until the next reconnect.  So remember,
+ * per accepted dialer, that it wants replies and which epoch the last
+ * reply was stamped with; the recv drain re-sends after every epoch
+ * advance (idempotent on the receiving store).  Steady state (epochs
+ * equal) sends nothing.
+ */
+static bool tier1_caps_reply_wanted[CLUSTER_MAX_NODES];
+static uint64 tier1_caps_reply_epoch[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.4 hardening v1.0.1 F2: outbound tail buffer is now dynamic
@@ -1291,6 +1308,184 @@ cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
 	return true;
 }
 
+/*
+ * tier1_maybe_send_caps_reply -- accept-side leg of the spec-2.2 additive
+ *	capability exchange (spec-5.22e D5 prereq, B3).
+ *
+ *	Called after a dialer's HELLO fully verified and its capabilities were
+ *	noted.  Sends PEER_CAPS_REPLY (payload = this node's own standard 64-byte
+ *	HELLO) back to the dialer ONLY when the dialer's HELLO advertised
+ *	CAPS_REPLY_V1 -- an old dialer without the bit is never sent a frame
+ *	whose msg_type it would reject by closing the connection.  The test-only
+ *	suppression GUC additionally simulates an old acceptor (no reply even to
+ *	a capable dialer).
+ *
+ *	Fire-and-forget: a lost or failed reply only leaves the dialer's view of
+ *	this node's capabilities UNKNOWN, which every consumer treats as
+ *	fail-closed (D4 authority leg refuses, D5 horizon fold stalls NOCAP);
+ *	it must never trigger transport reconnect or membership change.
+ */
+static void
+tier1_maybe_send_caps_reply(int32 peer_id, uint32 dialer_caps)
+{
+	uint8 self_hello[PGRAC_IC_HELLO_BYTES];
+	const char *self_cluster_name;
+
+	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES)
+		tier1_caps_reply_wanted[peer_id] = false;
+
+	if ((dialer_caps & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) == 0)
+		return; /* old dialer: never send it an unknown msg_type */
+	if (cluster_ic_suppress_caps_reply)
+		return; /* test-only old-acceptor simulation */
+
+	self_cluster_name = (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "";
+	cluster_ic_build_hello(self_hello, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+						   cluster_node_id, self_cluster_name);
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_PEER_CAPS_REPLY, peer_id, self_hello,
+								   PGRAC_IC_HELLO_BYTES);
+	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES) {
+		tier1_caps_reply_wanted[peer_id] = true;
+		tier1_caps_reply_epoch[peer_id] = cluster_epoch_get_current();
+	}
+	elog(DEBUG1, "cluster_ic tier1 sent PEER_CAPS_REPLY to peer %d", peer_id);
+}
+
+/*
+ * tier1_caps_reply_epoch_recheck -- resend leg of the capability exchange.
+ *
+ *	Called from the recv drain after every successfully dispatched envelope
+ *	from peer_id.  If this node previously sent that dialer a
+ *	PEER_CAPS_REPLY and the local epoch has advanced past the epoch the
+ *	last reply was stamped with, the old frame may have been stale-epoch
+ *	dropped on the dialer (this node was a rejoiner still behind) -- resend
+ *	stamped with the current epoch.  Receiving a verified envelope is
+ *	exactly the moment this node's epoch has caught up (envelope verify
+ *	observe-advances it), so one resend per epoch advance suffices; equal
+ *	epochs (steady state) send nothing.
+ */
+static void
+tier1_caps_reply_epoch_recheck(int32 peer_id)
+{
+	uint8 self_hello[PGRAC_IC_HELLO_BYTES];
+	const char *self_cluster_name;
+	uint64 now_epoch;
+
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return;
+	if (!tier1_caps_reply_wanted[peer_id])
+		return;
+	if (cluster_ic_suppress_caps_reply)
+		return; /* test-only old-acceptor simulation */
+	now_epoch = cluster_epoch_get_current();
+	if (now_epoch == tier1_caps_reply_epoch[peer_id])
+		return;
+
+	self_cluster_name = (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "";
+	cluster_ic_build_hello(self_hello, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+						   cluster_node_id, self_cluster_name);
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_PEER_CAPS_REPLY, peer_id, self_hello,
+								   PGRAC_IC_HELLO_BYTES);
+	tier1_caps_reply_epoch[peer_id] = now_epoch;
+	elog(DEBUG1, "cluster_ic tier1 resent PEER_CAPS_REPLY to peer %d after epoch advance", peer_id);
+}
+
+/*
+ * tier1_peer_caps_reply_handler -- dialer-side leg of the spec-2.2 additive
+ *	capability exchange (spec-5.22e D5 prereq, B2).
+ *
+ *	Envelope handler for PGRAC_IC_MSG_PEER_CAPS_REPLY.  The payload is the
+ *	acceptor's standard 64-byte HELLO; it passes the same validation core as
+ *	a first-class HELLO (parse + version + cluster_name + sender identity)
+ *	before its capability word is noted, bound to the CURRENT connection's
+ *	generation.  Any mismatch drops the frame with a DEBUG1 + reject counter
+ *	-- NEVER a close/reconnect (the peer stays CONNECTED with capabilities
+ *	UNKNOWN, the fail-closed direction).  Plane/channel note: today there is
+ *	a single CONTROL plane, so envelope arrival on this connection IS the
+ *	channel check; a future multi-plane split (7.3) revalidates here.
+ */
+static void
+tier1_peer_caps_reply_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterICHelloMsg msg;
+	const char *self_cluster_name;
+	int32 sender;
+
+	if (env == NULL || payload == NULL || env->payload_length != PGRAC_IC_HELLO_BYTES) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: bad payload length");
+		return;
+	}
+
+	sender = (int32)env->source_node_id;
+	if (sender < 0 || sender >= CLUSTER_MAX_NODES) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: sender %d out of range", sender);
+		return;
+	}
+
+	if (!cluster_ic_parse_hello((const uint8 *)payload, &msg)) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: embedded HELLO bad magic");
+		return;
+	}
+
+	if (msg.hello_version != PGRAC_IC_HELLO_VERSION_V1
+		|| msg.envelope_version != PGRAC_IC_ENVELOPE_VERSION_V1) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: version mismatch (hello=%u env=%u)",
+			 msg.hello_version, msg.envelope_version);
+		return;
+	}
+
+	self_cluster_name = (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "";
+	if (ClusterConfShmem != NULL && strcmp(msg.cluster_name, self_cluster_name) != 0) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: cluster_name mismatch (\"%s\")",
+			 msg.cluster_name);
+		return;
+	}
+
+	/* the embedded HELLO must be the envelope sender's own */
+	if (msg.source_node_id != sender) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: embedded node %d != sender %d",
+			 msg.source_node_id, sender);
+		return;
+	}
+
+	if (Tier1Shmem == NULL) {
+		cluster_sf_note_caps_reply_rejected();
+		elog(DEBUG1, "cluster_ic tier1 PEER_CAPS_REPLY dropped: no tier1 shmem");
+		return;
+	}
+
+	cluster_sf_note_peer_hello_capabilities_gen(sender, cluster_ic_hello_capabilities(&msg),
+												Tier1Shmem->peers[sender].reconnect_count);
+	elog(DEBUG1, "cluster_ic tier1 learned peer %d capabilities 0x%X via PEER_CAPS_REPLY", sender,
+		 cluster_ic_hello_capabilities(&msg));
+}
+
+/*
+ * cluster_ic_tier1_register_caps_reply_msg_type -- register the
+ *	PEER_CAPS_REPLY envelope msg_type (LMON-only producer; p2p, never
+ *	broadcast).  Called from LMON's phase-1 msg-type registration block
+ *	alongside the other subsystem registrations.
+ */
+void
+cluster_ic_tier1_register_caps_reply_msg_type(void)
+{
+	static const ClusterICMsgTypeInfo caps_reply_info = {
+		.msg_type = PGRAC_IC_MSG_PEER_CAPS_REPLY,
+		.name = "peer_caps_reply",
+		.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+		.broadcast_ok = false,
+		.handler = tier1_peer_caps_reply_handler,
+	};
+
+	cluster_ic_register_msg_type(&caps_reply_info);
+}
+
 bool
 cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 {
@@ -1364,7 +1559,9 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
 	Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
-	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
+	cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
+												Tier1Shmem->peers[peer_id].reconnect_count);
+	tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
 
 	ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
 	return true;
@@ -1527,7 +1724,9 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
 		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
 		(void)peer_addr(learned);
-		cluster_sf_note_peer_hello_capabilities(learned, cluster_ic_hello_capabilities(&msg));
+		cluster_sf_note_peer_hello_capabilities_gen(learned, cluster_ic_hello_capabilities(&msg),
+													Tier1Shmem->peers[learned].reconnect_count);
+		tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
 	}
 
 	if (out_learned_peer_id != NULL)
@@ -1814,6 +2013,14 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			return false;
 		}
 
+		/*
+		 * spec-2.2 additive amendment: a successfully dispatched envelope
+		 * means verify observe-advanced our epoch to at least the peer's --
+		 * the moment a rejoining acceptor's earlier (stale-stamped, hence
+		 * dialer-dropped) PEER_CAPS_REPLY becomes worth resending.
+		 */
+		tier1_caps_reply_epoch_recheck(peer_id);
+
 		/* Reset phase state for next frame. */
 		tier1_recv_buf_len[peer_id] = 0;
 		tier1_recv_phase[peer_id] = 0;
@@ -1837,17 +2044,28 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		tier1_peer_fds[peer_id] = -1;
 
 		/*
-		 * spec-5.22e D5-2 (Q1' amend): HELLO capabilities are a property of
-		 * the connection that carried them.  Clear them when an ESTABLISHED
-		 * fd is torn down so no consumer (horizon sender/fold, authority
-		 * routing, smart fusion) trusts a stale capability across the
-		 * reconnect window; the next verified HELLO repopulates.  Scoped
-		 * INSIDE the fd guard: close_peer is also called defensively for
-		 * failed dials and duplicate-connection tie-breaks where no
-		 * established link existed -- wiping the surviving connection's
-		 * capabilities there would zero them with no new HELLO to renote.
+		 * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: HELLO
+		 * capabilities are a property of the connection that carried them.
+		 * Clear them when an ESTABLISHED fd is torn down so no consumer
+		 * (horizon sender/fold, authority routing, smart fusion) trusts a
+		 * stale capability across the reconnect window; the next verified
+		 * HELLO repopulates.  Scoped INSIDE the fd guard AND generation-
+		 * matched: close_peer is also called defensively for failed dials
+		 * and duplicate-connection tie-breaks where no established link
+		 * existed -- wiping the surviving connection's capabilities there
+		 * would zero them with no new HELLO to renote.  The generation of
+		 * the closing connection is the peer's reconnect_count BEFORE the
+		 * increment below (the same value the learn sites stamped while
+		 * this connection was established), so only the matching record is
+		 * invalidated.
 		 */
-		cluster_sf_note_peer_disconnected(peer_id);
+		if (Tier1Shmem != NULL)
+			cluster_sf_note_peer_disconnected_gen(peer_id,
+												  Tier1Shmem->peers[peer_id].reconnect_count);
+		else
+			cluster_sf_note_peer_disconnected(peer_id);
+		/* caps-reply resend state is per-connection too */
+		tier1_caps_reply_wanted[peer_id] = false;
 	}
 
 	if (Tier1Shmem != NULL) {

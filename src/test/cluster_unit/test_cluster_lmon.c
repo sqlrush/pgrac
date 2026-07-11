@@ -503,6 +503,13 @@ void
 cluster_sf_dep_register_ic_msg_types(void)
 {}
 
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq) stub:
+ * cluster_lmon_shmem_init registers the PEER_CAPS_REPLY msg type; this
+ * standalone unit binary does not link cluster_ic_tier1.o. */
+void
+cluster_ic_tier1_register_caps_reply_msg_type(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

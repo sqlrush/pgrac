@@ -176,7 +176,8 @@ bool cluster_smgr_user_relations = false;
  */
 bool cluster_shared_catalog = false;
 int cluster_oid_lease_size = 8192;
-int cluster_shmem_max_regions = 96; /* spec-5.22e: 80 -> 96 (undo horizon region; restore margin); spec-5.56: 64 -> 80 */
+int cluster_shmem_max_regions
+	= 96; /* spec-5.22e: 80 -> 96 (undo horizon region; restore margin); spec-5.56: 64 -> 80 */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
@@ -406,6 +407,10 @@ int cluster_fence_audit_log = 1;		   /* CLUSTER_FENCE_AUDIT_LOG_LOG */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
 int cluster_interconnect_connect_timeout_ms = 5000;
 int cluster_interconnect_recv_timeout_ms = 30000;
+
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq) -- test-only
+ * old-binary simulation for the PEER_CAPS_REPLY capability exchange. */
+bool cluster_ic_suppress_caps_reply = false;
 
 /* spec-2.4 D9 -- chunked framing + TCP KeepAlive tuning (PGC_POSTMASTER). */
 int cluster_interconnect_payload_max_bytes = 64 * 1024 * 1024; /* 64 MB */
@@ -2801,6 +2806,23 @@ cluster_init_guc(void)
 										 "timeout windows."),
 							&cluster_interconnect_connect_timeout_ms, 5000, 1000, 60000,
 							PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only
+	 * old-binary simulation for the PEER_CAPS_REPLY capability exchange.
+	 * With it on, this node's HELLO omits the CAPS_REPLY_V1 meta bit and
+	 * its acceptor never sends PEER_CAPS_REPLY -- exactly the two visible
+	 * behaviors of a binary that predates the amendment.  Consumed by LMON,
+	 * so PGC_SIGHUP (postgresql.conf + reload); a session-level SET could
+	 * never reach the process that builds HELLOs.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ic_suppress_caps_reply",
+		gettext_noop("Test-only: simulate a pre-CAPS_REPLY binary on this node."),
+		gettext_noop("Suppresses the CAPS_REPLY_V1 HELLO capability bit and the "
+					 "accept-side PEER_CAPS_REPLY send.  Rolling-upgrade compat "
+					 "tests use it; production leaves it off."),
+		&cluster_ic_suppress_caps_reply, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.interconnect_recv_timeout_ms",
 							gettext_noop("Tier1 IC per-peer recv read deadline in milliseconds."),

@@ -162,6 +162,62 @@ UT_TEST(test_gcs_block_reply_v2_dep_extract_accepts_empty_v2_no_dep)
 	UT_ASSERT(cluster_sf_dep_vec_is_empty(&vec));
 }
 
+/*
+ * spec-2.2 additive amendment (spec-5.22e D5 prereq, B4): the per-peer HELLO
+ * capability record is generation-bound.  A clear only applies when the
+ * caller's connection generation matches the generation recorded at learn
+ * time, so a defensive close of a failed dial or of an OLDER connection can
+ * never wipe the surviving connection's capability record.
+ */
+UT_TEST(test_peer_cap_gen_note_query_invalidate)
+{
+	ClusterSfPeerCap cap;
+
+	memset(&cap, 0, sizeof(cap));
+
+	/* an unset record reads as "no capability" (UNKNOWN) */
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0);
+
+	/* note stamps bits + generation and turns the record valid */
+	cluster_sf_peer_cap_note(&cap, (uint32)0x0E, (uint32)3);
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x0E);
+
+	/* mismatched-generation invalidate must NOT clear the record */
+	UT_ASSERT(!cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)2));
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x0E);
+	UT_ASSERT(!cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)4));
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x0E);
+
+	/* matching generation clears exactly once */
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)3));
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0);
+	UT_ASSERT(!cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)3));
+}
+
+UT_TEST(test_peer_cap_gen_renote_after_reconnect)
+{
+	ClusterSfPeerCap cap;
+
+	memset(&cap, 0, sizeof(cap));
+
+	/* connection gen 3 learns, closes (matched clear), gen 4 relearns */
+	cluster_sf_peer_cap_note(&cap, (uint32)0x0E, (uint32)3);
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)3));
+	cluster_sf_peer_cap_note(&cap, (uint32)0x04, (uint32)4);
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x04);
+
+	/* a straggler clear for the OLD generation must not touch gen 4 */
+	UT_ASSERT(!cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)3));
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x04);
+
+	/* same-generation re-note (HELLO then CAPS_REPLY on one connection)
+	 * is a plain overwrite, not an error */
+	cluster_sf_peer_cap_note(&cap, (uint32)0x0E, (uint32)4);
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0x0E);
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, (uint32)4));
+	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0);
+}
+
 int
 main(void)
 {
@@ -172,5 +228,7 @@ main(void)
 	UT_RUN(test_gcs_block_reply_v2_dep_extract_valid);
 	UT_RUN(test_gcs_block_reply_v2_dep_extract_rejects_malformed);
 	UT_RUN(test_gcs_block_reply_v2_dep_extract_accepts_empty_v2_no_dep);
+	UT_RUN(test_peer_cap_gen_note_query_invalidate);
+	UT_RUN(test_peer_cap_gen_renote_after_reconnect);
 	UT_DONE();
 }

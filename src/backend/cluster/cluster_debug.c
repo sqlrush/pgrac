@@ -113,12 +113,12 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
-#include "cluster/cluster_cssd.h"		  /* cluster_cssd_status (spec-2.5 D12) */
-#include "cluster/cluster_stats.h"		  /* cluster_stats_status (spec-1.14 D12) */
+#include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
+#include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_horizon.h" /* D5-5 brake observability (spec-5.22e) */ /* dump_undo_cleaner (spec-3.13 D1) */
-#include "cluster/cluster_undo_gcs.h"	  /* undo GCS grant-plane counters (spec-5.22b D2-6) */
-#include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
+#include "cluster/cluster_undo_gcs.h" /* undo GCS grant-plane counters (spec-5.22b D2-6) */
+#include "cluster/cluster_lmon.h"	  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "catalog/pg_control.h" /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
@@ -404,6 +404,16 @@ dump_ic(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ic", "tier1_listener_port",
 				 fmt_int32((int32)cluster_ic_tier1_get_listener_port()));
 	}
+
+	/*
+	 * spec-2.2 additive amendment (spec-5.22e D5 prereq): per-peer learned
+	 * HELLO capability records (generation-bound) + the PEER_CAPS_REPLY
+	 * validation-drop counter.  The directed capability matrix TAP legs and
+	 * rolling-upgrade compat legs read these.
+	 */
+	emit_row(rsinfo, "ic", "peer_capabilities", cluster_sf_peer_capabilities_summary());
+	emit_row(rsinfo, "ic", "caps_reply_reject_count",
+			 psprintf(UINT64_FORMAT, cluster_sf_caps_reply_reject_count()));
 }
 
 static void
@@ -2493,8 +2503,7 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_horizon_admission_refuse_count()));
 	emit_row(rsinfo, "undo", "horizon_last_floor_scn",
 			 fmt_int64((int64)cluster_undo_horizon_last_floor()));
-	emit_row(rsinfo, "undo", "horizon_peer_reports",
-			 cluster_undo_horizon_peer_reports_summary());
+	emit_row(rsinfo, "undo", "horizon_peer_reports", cluster_undo_horizon_peer_reports_summary());
 	emit_row(rsinfo, "undo", "cleaner_header_tt_slots_below_horizon",
 			 fmt_int64((int64)cluster_undo_cleaner_header_tt_slots_below_horizon()));
 

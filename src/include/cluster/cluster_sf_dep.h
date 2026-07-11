@@ -54,6 +54,50 @@ typedef struct ClusterSfDepEntry {
 	uint64 installed_scn;
 } ClusterSfDepEntry;
 
+/*
+ * Per-peer HELLO capability record (spec-2.2 additive amendment; spec-5.22e
+ * D5 prereq).  Capability state is a property of the CONNECTION that carried
+ * the HELLO / PEER_CAPS_REPLY, so the record binds the learned bits to the
+ * transport connection generation (tier1: the peer's reconnect_count while
+ * that connection was established).  A clear only applies when the caller's
+ * generation matches the recorded one: a defensive close of a failed dial or
+ * of an OLDER connection can never wipe the surviving connection's record
+ * (forward hazard for the 7.3 multi-channel plane).  The helpers are pure so
+ * cluster_unit can lock the matrix; cluster_sf_dep.c wraps them in the store
+ * LWLock.
+ */
+typedef struct ClusterSfPeerCap {
+	uint32 bits;	   /* learned HELLO capability word (0 when !valid) */
+	uint32 generation; /* connection generation at learn time */
+	bool valid;		   /* record live?  false reads as "no capability" */
+} ClusterSfPeerCap;
+
+static inline void
+cluster_sf_peer_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation)
+{
+	cap->bits = bits;
+	cap->generation = generation;
+	cap->valid = true;
+}
+
+static inline uint32
+cluster_sf_peer_cap_bits(const ClusterSfPeerCap *cap)
+{
+	return cap->valid ? cap->bits : 0;
+}
+
+/* Returns true iff the record was live for exactly this generation and got
+ * cleared; a mismatch (older/newer generation, already invalid) is a no-op. */
+static inline bool
+cluster_sf_peer_cap_invalidate_gen(ClusterSfPeerCap *cap, uint32 generation)
+{
+	if (!cap->valid || cap->generation != generation)
+		return false;
+	cap->valid = false;
+	cap->bits = 0;
+	return true;
+}
+
 static inline void
 cluster_sf_dep_vec_reset(ClusterSfDepVec *vec)
 {
@@ -139,7 +183,15 @@ extern int cluster_sf_dep_suspect_origin_dead(int32 origin);
 extern void cluster_sf_observe_origin_durable_lsn(int32 origin, XLogRecPtr durable_lsn);
 extern XLogRecPtr cluster_sf_observed_origin_durable_lsn(int32 origin);
 extern void cluster_sf_publish_origin_durable_lsn(void);
-extern void cluster_sf_note_peer_hello_capabilities(int32 peer_id, uint32 capabilities);
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): capability learn +
+ * clear are generation-bound (see ClusterSfPeerCap above).  Learn sites pass
+ * the connection generation that carried the HELLO / PEER_CAPS_REPLY; the
+ * tier1 close funnel passes the closing connection's generation so only the
+ * matching record is invalidated.  RDMA verify passes generation 0 (its
+ * lifecycle never consumed the tier1 clear even before this amendment;
+ * registered tier1-only boundary). */
+extern void cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities,
+														uint32 generation);
 extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
 /* spec-5.22d D4-6: did the peer's HELLO advertise the kind-4 authority-serve
  * protocol capability?  Deliberately NOT gated on any local GUC (unlike the
@@ -147,9 +199,13 @@ extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
  * the runtime arm gates live elsewhere. */
 extern bool cluster_peer_supports_undo_authority_serve(int32 peer_id);
 /* spec-5.22e D5-2: undo-horizon report capability (connection-bound; see
- * cluster_sf_note_peer_disconnected) + the close-funnel reset hook. */
+ * cluster_sf_note_peer_disconnected_gen) + the close-funnel reset hooks. */
 extern bool cluster_sf_peer_supports_undo_horizon(int32 peer_id);
+extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
+extern const char *cluster_sf_peer_capabilities_summary(void);
+extern uint64 cluster_sf_caps_reply_reject_count(void);
+extern void cluster_sf_note_caps_reply_rejected(void);
 extern void cluster_sf_handle_durable_gossip(const ClusterICEnvelope *env, const void *payload);
 
 extern void cluster_sf_note_dep_touched(Buffer buffer);

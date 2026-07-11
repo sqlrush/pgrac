@@ -570,6 +570,13 @@ extern int cluster_interconnect_heartbeat_interval_ms;
 extern int cluster_interconnect_connect_timeout_ms;
 extern int cluster_interconnect_recv_timeout_ms;
 
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only old-binary
+ * simulation — suppress the CAPS_REPLY_V1 HELLO meta bit AND the acceptor's
+ * PEER_CAPS_REPLY send on this node.  Consumed by LMON (build_hello + the
+ * accept-side reply gate), hence PGC_SIGHUP (conf + reload), never a
+ * session SET. */
+extern bool cluster_ic_suppress_caps_reply;
+
 /* spec-2.4 D9: chunked framing + TCP KeepAlive 5 GUC. */
 extern int cluster_interconnect_payload_max_bytes;
 extern int cluster_interconnect_chunk_reassembly_timeout_ms;

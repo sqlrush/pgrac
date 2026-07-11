@@ -243,11 +243,17 @@ typedef enum ClusterICMsgType {
 			   * metadata or fail-closed NAK reason. */
 	PGRAC_IC_MSG_SMART_FUSION_DURABLE = 35, /* PGRAC: spec-6.2 D8 — origin durable-LSN
 			   * gossip for Smart Fusion dependency release. */
-	PGRAC_IC_MSG_UNDO_HORIZON = 36	/* PGRAC: spec-5.22e D5-2 — per-peer undo
+	PGRAC_IC_MSG_UNDO_HORIZON = 36,			/* PGRAC: spec-5.22e D5-2 — per-peer undo
 			   * retention horizon report (LMON-only producer; p2p, never
 			   * broadcast; capability-gated on UNDO_HORIZON_V1 so an old
 			   * peer never sees an unregistered msg_type). */
-	/* values 37..255 available for future sub-spec; never reuse 0..36 */
+	PGRAC_IC_MSG_PEER_CAPS_REPLY = 37		/* PGRAC: spec-2.2 additive amendment
+			   * (spec-5.22e D5 prereq) — acceptor -> dialer capability
+			   * reply carrying the acceptor's own standard 64-byte HELLO
+			   * as payload (LMON-only producer; p2p, never broadcast;
+			   * capability-gated on the dialer's CAPS_REPLY_V1 HELLO bit
+			   * so an old dialer never sees an unregistered msg_type). */
+	/* values 38..255 available for future sub-spec; never reuse 0..37 */
 } ClusterICMsgType;
 
 
