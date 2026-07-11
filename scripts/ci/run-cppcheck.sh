@@ -153,6 +153,12 @@ SHAREDFS_SUPP=(
   # Reason: same PG-Assert-non-trapping pattern -- Assert(lease != NULL);
   # lease->next in cluster_oid_lease_consume (spec-6.14 D6).
   --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_oid_lease.c
+  # Reason: spec-5.22e D5 cluster_undo_horizon_cluster_floor uses the same
+  # Assert(out_floor != NULL && out_reason != NULL && out_blame_node != NULL);
+  # then writes *out_floor / *out_reason / *out_blame_node -- PG Assert is
+  # non-trapping to cppcheck, so the four post-Assert out-param writes read as
+  # redundant null checks (identical false positive to cluster_shmem.c above).
+  --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_undo_horizon.c
   # Reason: spec-2.3 D1 cluster_ic_envelope.h uses pg_attribute_packed()
   # macro from c.h to honor spec-2.0 §4 frozen offsets (uint64 epoch at
   # offset 12 / scn at offset 20 are non-8-aligned naturally; without
