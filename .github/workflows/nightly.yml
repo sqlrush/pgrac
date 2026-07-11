@@ -224,7 +224,7 @@ jobs:
           # compat / generation legs (3-node triple).  Own shard: the brake
           # legs pin/stall/self-heal on real cleaner cadence and need the
           # wall clock.
-          - { name: stage5-undo-retention, ranges: "369-370 386", unit: false, regress: false }
+          - { name: stage5-undo-retention, ranges: "369-370 386 389", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

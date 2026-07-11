@@ -713,18 +713,19 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 	/*
 	 * Step 6: fsync the parent directory (instance_<N>/).  Required for
 	 * the create case (Step 2 with O_CREAT) so the dirent is durable;
-	 * harmless for the already-exists case.  fsync_parent_path is
-	 * idempotent and tolerates missing intermediate directories.
+	 * harmless for the already-exists case.  The directory is derived
+	 * from the path Step 2 opened, never rebuilt from DataDir: under
+	 * cluster.undo_gcs_coherence the resolver routes the segment to the
+	 * shared cluster_fs root (D2-2), and a DataDir rebuild here fsync'd
+	 * the wrong (local) tree -- or PANIC'd recovery when the local
+	 * instance dir was never created.
 	 */
 	{
 		char dir[MAXPGPATH];
-		int dret;
 
-		/* directory uses cluster_node_id (= owner_instance - 1) per Hardening v1.0.4 P1-1 */
-		dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%u", DataDir,
-						(unsigned)(hdr->instance - 1));
-		if (dret >= 0 && (size_t)dret < sizeof(dir))
-			fsync_fname(dir, true);
+		strlcpy(dir, path, sizeof(dir));
+		get_parent_directory(dir);
+		fsync_fname(dir, true);
 	}
 
 	cluster_vis_bump_recovery_undo_redo_applies(); /* spec-3.16 D5 */

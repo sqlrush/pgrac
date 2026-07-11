@@ -462,15 +462,20 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	 * Hardening v1.0.4 P1-2: fsync parent directory after file creation /
 	 * truncate.  Required for the create case so the dirent is durable;
 	 * harmless for the already-exists case.  Mirrors redo handler.
+	 *
+	 * The directory is derived from the very path the segment was created
+	 * at, never rebuilt from DataDir: under cluster.undo_gcs_coherence the
+	 * resolver lands the segment on the shared cluster_fs root (D2-2), and
+	 * rebuilding from DataDir fsync'd the local instance dir instead -- a
+	 * PANIC when that dir was never created (first coherent write on a
+	 * cloned node), a silently-undurable shared dirent when it was.
 	 */
 	{
 		char dir[MAXPGPATH];
-		int dret;
 
-		dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%u", DataDir,
-						(unsigned)(owner_instance - 1));
-		if (dret >= 0 && (size_t)dret < sizeof(dir))
-			fsync_fname(dir, true);
+		strlcpy(dir, path, sizeof(dir));
+		get_parent_directory(dir);
+		fsync_fname(dir, true);
 	}
 
 	/*
