@@ -521,4 +521,61 @@ cluster_shared_fs_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
 	cluster_shared_fs_active_ops->writeback(handle, blocknum, nblocks);
 }
 
+
+/*
+ * cluster_shared_fs_undo_path_resolve -- resolve an undo segment's path on
+ *	the shared cluster_fs root (spec-5.22b D2-2 undo namespace).
+ *
+ *	Undo is not a RelFileLocator, so it is addressed by resolving the SAME
+ *	absolute path under cluster.shared_data_dir on every node -- exactly the
+ *	pattern the shared-root sentinel, recovery anchor, and CF authority use.
+ *	Owner-partitioned: the directory component is owner_instance-1 (= the
+ *	owning node_id), a straight lift of the local $PGDATA/pg_undo layout so a
+ *	segment's shared and local paths differ only in their root.
+ *
+ *	Fail-closed (return -1) when the shared root is unset: this resolver is
+ *	only reached on the RUNTIME_SHARED + coherence-on branch, so an unset root
+ *	is a deployment error and must never silently fall back to a bogus path
+ *	(mirrors build_anchor_path; the caller propagates -1 to a fail-closed
+ *	read/write, and the GUC check-hook rejects coherence-on without a root).
+ */
+int
+cluster_shared_fs_undo_path_resolve(uint8 owner_instance, uint32 segment_id, char *buf,
+									size_t buf_size)
+{
+	int ret;
+
+	if (buf == NULL || buf_size == 0)
+		return -1;
+	Assert(owner_instance >= 1);
+
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return -1;
+
+	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", cluster_shared_data_dir,
+				   (unsigned)(owner_instance - 1), (unsigned)segment_id);
+	if (ret < 0 || (size_t)ret >= buf_size)
+		return -1;
+	return 0;
+}
+
+int
+cluster_shared_fs_undo_instance_dir_resolve(uint8 owner_instance, char *buf, size_t buf_size)
+{
+	int ret;
+
+	if (buf == NULL || buf_size == 0)
+		return -1;
+	Assert(owner_instance >= 1);
+
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return -1;
+
+	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u", cluster_shared_data_dir,
+				   (unsigned)(owner_instance - 1));
+	if (ret < 0 || (size_t)ret >= buf_size)
+		return -1;
+	return 0;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

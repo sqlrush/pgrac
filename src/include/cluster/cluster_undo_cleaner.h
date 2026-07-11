@@ -189,6 +189,7 @@ extern int64 cluster_undo_cleaner_main_loop_iters(void);
 
 /* D6 counter accessors (dump_undo + tests). */
 extern uint64 cluster_undo_cleaner_pass_count(void);
+extern uint64 cluster_undo_cleaner_header_tt_slots_below_horizon(void); /* spec-5.22e D5-5 */
 extern uint64 cluster_undo_cleaner_shmem_tt_slots_gcd(void);
 extern uint64 cluster_undo_cleaner_segments_marked_recyclable(void);
 extern uint64 cluster_undo_cleaner_stale_active_skipped(void);
@@ -220,7 +221,10 @@ typedef struct ClusterUndoCleanerPassStats {
  * any seg->lock — spec-3.12 C17).  Shares the recycle transition
  * helper with alloc Pass-2 (C-R1: single typed implementation).
  */
-extern void cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats);
+/* Returns false when the spec-5.22e F-D2 epoch fence tripped mid-scan:
+ * the caller must abort the whole pass immediately. */
+extern bool cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
+											ClusterUndoCleanerPassStats *stats);
 
 /*
  * D2-B: READ-ONLY scan of one segment's durable header TTSlot[]

@@ -85,6 +85,9 @@ int cluster_node_id = -1;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
 bool cluster_smart_fusion = false;
 int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only old-binary
+ * simulation gate consumed by cluster_ic.c::cluster_ic_build_hello. */
+bool cluster_ic_suppress_caps_reply = false;
 
 /* spec-5.59 D1 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -548,7 +551,14 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * Bytes 8-11:   04 03 02 01            source_node_id = 0x01020304 (LE)
 	 * Bytes 12-13:  41 42                  "AB"
 	 * Bytes 14-35:  00..00                 cluster_name NUL pad
-	 * Bytes 36-63:  00..00                 _pad (must be zero)
+	 * Bytes 36-39:  0E 00 00 00            capability bitmap (LE): the
+	 *                                      PROTOCOL capabilities advertised
+	 *                                      unconditionally by this binary --
+	 *                                      D4-6 authority-serve (0x2), D5-2
+	 *                                      undo-horizon (0x4) and the
+	 *                                      spec-2.2 additive-amendment
+	 *                                      CAPS_REPLY_V1 meta bit (0x8)
+	 * Bytes 40-63:  00..00                 _pad (must be zero)
 	 *
 	 * Locking these exact bytes guards against compiler-pad drift,
 	 * unintended endian flips, and uninitialized memory leakage.
@@ -577,9 +587,17 @@ UT_TEST(test_hello_wire_reference_bytes)
 	UT_ASSERT_EQ(wire[13], 'B');
 	for (i = 14; i < 36; i++)
 		UT_ASSERT_EQ(wire[i], 0);
-	/* _pad must be all zero: a CONTROL-plane HELLO with conn_epoch 0 is
-	 * byte-identical to the pre-7.2 wire (spec-7.2 D2 compat pin). */
-	for (i = 36; i < PGRAC_IC_HELLO_BYTES; i++)
+	/* capability bitmap: the unconditional protocol bits -- D4-6
+	 * authority-serve (0x2) + spec-5.22e D5-2 undo-horizon (0x4) +
+	 * CAPS_REPLY_V1 meta bit (0x8) (smart-fusion is off in this fixture) */
+	UT_ASSERT_EQ(wire[36], 0x0E);
+	UT_ASSERT_EQ(wire[37], 0x00);
+	UT_ASSERT_EQ(wire[38], 0x00);
+	UT_ASSERT_EQ(wire[39], 0x00);
+	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
+	 * conn_epoch 0 adds nothing past the capability word (spec-7.2 D2
+	 * compat pin -- plane byte 40 and epoch bytes 44-51 stay zero). */
+	for (i = 40; i < PGRAC_IC_HELLO_BYTES; i++)
 		UT_ASSERT_EQ(wire[i], 0);
 }
 
@@ -656,13 +674,19 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
 
+	/* the spec-5.22d D4-6 authority-serve + spec-5.22e undo-horizon +
+	 * CAPS_REPLY_V1 meta bits are unconditional, so they are the
+	 * capability-word BASELINE in every row below; only the smart-fusion
+	 * bit is GUC/tier-gated */
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+															 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -670,7 +694,9 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-tier-mismatch", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+															 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -678,11 +704,50 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-tier-match", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
+				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
+					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+}
+
+/*
+ * spec-2.2 additive amendment (spec-5.22e D5 prereq, B1): the CAPS_REPLY_V1
+ * meta bit ("I can receive PEER_CAPS_REPLY") is advertised unconditionally,
+ * UNLESS the test-only old-binary simulation GUC suppresses it.  Old-binary
+ * compat rests on this bit: an acceptor only sends PEER_CAPS_REPLY to a
+ * dialer whose HELLO carried the bit, so a peer without it (an actual old
+ * binary, or a node simulating one) is never sent a frame it cannot parse.
+ */
+UT_TEST(test_hello_caps_reply_meta_gate)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	/* wire id + bit value are frozen protocol constants */
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1, (uint32)0x00000008U);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PEER_CAPS_REPLY, 37);
+
+	/* default: meta bit advertised */
+	cluster_ic_suppress_caps_reply = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "caps-on", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) != 0);
+
+	/* suppressed (old-binary simulation): meta bit absent, the other
+	 * protocol bits untouched */
+	cluster_ic_suppress_caps_reply = true;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "caps-off", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) == 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1) != 0);
+
+	cluster_ic_suppress_caps_reply = false;
 }
 
 UT_TEST(test_hello_parse_rejects_bad_magic)
@@ -747,6 +812,7 @@ main(void)
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
+	UT_RUN(test_hello_caps_reply_meta_gate);
 	UT_RUN(test_hello_parse_rejects_bad_magic);
 	UT_RUN(test_hello_build_truncates_long_name);
 	UT_DONE();

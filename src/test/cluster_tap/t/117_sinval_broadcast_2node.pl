@@ -93,7 +93,7 @@ cmp_ok($catver, '>=', 202605450,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'120',
+	'123',
 	'L3 wait event count == 120 (spec-7.2 D6 LMS data-plane wait surface)');
 
 

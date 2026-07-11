@@ -38,7 +38,11 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
-#include "cluster/cluster_scn.h" /* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_guc.h"	  /* cluster_undo_gcs_coherence */
+#include "cluster/cluster_mode.h"	  /* cluster_peer_mode_enabled */
+#include "common/file_perm.h"		  /* pg_mkdir_p / pg_dir_create_mode (shared subdir, D2-2) */
+#include "cluster/cluster_scn.h"	  /* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_undo_gcs.h" /* path intent + shared-root decision */
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_record_api.h" /* reuse counter note (3.13) */
@@ -48,7 +52,8 @@
 #include "cluster/cluster_undo_segment_init.h" /* fresh header builder (D4 reuse) */
 #include "access/xlog.h"					   /* XLogFlush (3.13 v0.3 (1)) */
 #include "cluster/storage/cluster_undo_alloc.h"
-#include "cluster/storage/cluster_undo_buf.h" /* invalidate_segment on reuse (3.18 D3.2) */
+#include "cluster/storage/cluster_shared_fs.h" /* undo namespace on shared root (D2-2) */
+#include "cluster/storage/cluster_undo_buf.h"  /* invalidate_segment on reuse (3.18 D3.2) */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
@@ -79,7 +84,8 @@ extern int cluster_node_id;
  *   the assert catches sentinel-0 misuse.
  */
 int
-cluster_undo_path_resolve(uint8 owner_instance, uint32 segment_id, char *buf, size_t buf_size)
+cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, uint32 segment_id,
+						  char *buf, size_t buf_size)
 {
 	int ret;
 
@@ -87,7 +93,60 @@ cluster_undo_path_resolve(uint8 owner_instance, uint32 segment_id, char *buf, si
 		return -1;
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
-	/* directory uses cluster_node_id (= owner_instance - 1) */
+	/*
+	 * spec-5.22b D2-2 (threading strategy B): every caller derives intent via
+	 * cluster_undo_intent_for_owner(owner), so in D2 RUNTIME_SHARED ⟺ own
+	 * instance and MATERIALIZED_LOCAL ⟺ a foreign dead-origin owner.
+	 *
+	 * spec-5.22d D4-3: the dead-owner authority serve introduces exactly one
+	 * sanctioned foreign-owner shared read -- RUNTIME_SHARED_AUTHORITY_BLOCK0,
+	 * which by construction targets a foreign owner (owner != self).  Relax
+	 * the invariant to admit that one case ONLY:
+	 *   - a plain RUNTIME_SHARED with a foreign owner is still a loud
+	 *     split-brain bug (it would silently read the shared copy of a
+	 *     segment it does not own);
+	 *   - AUTHORITY_BLOCK0 with owner == self is likewise rejected (a live
+	 *     owner serves via the D6 path, never via the authority block0 route).
+	 * The read stays block0-only by the call-site contract (§2.3/§3.6); this
+	 * assert only governs the owner-vs-self / intent pairing.
+	 */
+	Assert(((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			== (owner_instance == (uint8)(cluster_node_id + 1)))
+		   || (intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0
+			   && owner_instance != (uint8)(cluster_node_id + 1)));
+
+	/*
+	 * spec-5.22e D5-4: the pairing above is a WRITER-EXCLUSION pillar (the
+	 * D4 complete-scan prove and the D5 retention brake both argue "no
+	 * foreign writer can exist in an owner's shared namespace"), so an
+	 * Assert alone is not enough -- production builds must fail closed too
+	 * (rule 12: Assert never substitutes for a runtime guard).  Callers
+	 * resolve paths outside critical sections (the 53R9D discipline), so
+	 * an ERROR here is safe.
+	 */
+	if (!((((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			== (owner_instance == (uint8)(cluster_node_id + 1)))
+		   || (intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0
+			   && owner_instance != (uint8)(cluster_node_id + 1)))))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("undo path intent/ownership violation: intent %d, owner %u, self node %d",
+						(int)intent, (unsigned)owner_instance, cluster_node_id),
+				 errhint("Foreign-owner shared undo is only reachable through the dead-owner "
+						 "authority block0 route; anything else is a split-brain bug "
+						 "(spec-5.22e writer-exclusion guard).")));
+
+	/*
+	 * RUNTIME_SHARED own undo migrates to the shared cluster_fs root only
+	 * under peer-mode + cluster.undo_gcs_coherence; MATERIALIZED_LOCAL and
+	 * every non-coherent mode stay on the local DataDir (P1-3 / 裁决 A).  An
+	 * unset shared root on the shared branch fails closed (resolver -1).
+	 */
+	if (cluster_undo_path_uses_shared_root(intent, cluster_peer_mode_enabled(),
+										   cluster_undo_gcs_coherence))
+		return cluster_shared_fs_undo_path_resolve(owner_instance, segment_id, buf, buf_size);
+
+	/* local DataDir: directory uses cluster_node_id (= owner_instance - 1) */
 	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir,
 				   (unsigned)(owner_instance - 1), (unsigned)segment_id);
 	if (ret < 0 || (size_t)ret >= buf_size)
@@ -146,7 +205,29 @@ ensure_instance_subdir(uint8 owner_instance)
 
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
-	/* directory uses cluster_node_id (= owner_instance - 1); see
+	/*
+	 * spec-5.22b D2-2: own-instance allocation under coherence lands the
+	 * segment on the shared cluster_fs root, whose pg_undo/instance_<N> tree
+	 * is not seeded by initdb -- create the whole path (idempotent).  Foreign
+	 * owners never reach the allocator (single-writer), so only the shared
+	 * branch differs from the pre-D2 local mkdir.
+	 */
+	if (cluster_undo_path_uses_shared_root(cluster_undo_intent_for_owner(owner_instance),
+										   cluster_peer_mode_enabled(),
+										   cluster_undo_gcs_coherence)) {
+		if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, path, sizeof(path)) != 0)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("undo shared instance subdir unresolved: owner_instance=%u "
+								   "(cluster.shared_data_dir unset)",
+								   (unsigned)owner_instance)));
+		if (pg_mkdir_p(path, pg_dir_create_mode) != 0 && errno != EEXIST)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create undo shared instance subdir \"%s\": %m", path)));
+		return;
+	}
+
+	/* local DataDir: directory uses cluster_node_id (= owner_instance - 1); see
 	 * cluster_undo_path_resolve docstring. */
 	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir,
 				   (unsigned)(owner_instance - 1));
@@ -270,7 +351,9 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 							(unsigned)owner_instance, cluster_node_id, cluster_node_id + 1)));
 	}
 
-	if (cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path)) != 0)
+	if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
+								  segment_id, path, sizeof(path))
+		!= 0)
 		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
 						errmsg("undo segment path too long: instance=%u seg=%u",
 							   (unsigned)owner_instance, (unsigned)segment_id)));
@@ -477,7 +560,8 @@ static bool
 read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *blockbuf,
 							 UndoSegmentHeaderData **out_hdr)
 {
-	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, blockbuf))
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance), segment_id,
+									  owner_instance, 0, blockbuf))
 		return false;
 	*out_hdr = (UndoSegmentHeaderData *)blockbuf;
 	return true;
@@ -487,7 +571,8 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 static bool
 write_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, const char *blockbuf)
 {
-	return cluster_undo_smgr_write_block(segment_id, owner_instance, 0, blockbuf, true);
+	return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance), segment_id,
+										 owner_instance, 0, blockbuf, true);
 }
 
 
@@ -870,7 +955,13 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 	 * within that lock so current_pool_size is non-stale.
 	 */
 	{
-		extern int cluster_undo_segments_max_per_instance;
+		/*
+		 * cluster_undo_segments_max_per_instance is declared in
+		 * cluster/cluster_guc.h (included above), so no local extern is
+		 * needed here.  PGRAC: D2-2 added that include for
+		 * cluster_undo_gcs_coherence; dropping the redundant local extern
+		 * avoids a shadowed-declaration static-analysis finding.
+		 */
 		int guc_val = cluster_undo_segments_max_per_instance;
 		uint32 current_pool_size = 0;
 		uint32 probe_slot;
@@ -889,7 +980,8 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 				= (uint32)(owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + probe_slot + 1;
 
 			path_ret
-				= cluster_undo_path_resolve(owner_instance, probe_segment_id, path, sizeof(path));
+				= cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance),
+											owner_instance, probe_segment_id, path, sizeof(path));
 			if (path_ret != 0)
 				break;
 
@@ -927,7 +1019,8 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 		int fd;
 		uint32 new_segment_id = base_segment_id + slot;
 
-		ret = cluster_undo_path_resolve(owner_instance, new_segment_id, path, sizeof(path));
+		ret = cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance),
+										owner_instance, new_segment_id, path, sizeof(path));
 		if (ret != 0)
 			continue;
 
@@ -1015,7 +1108,8 @@ cluster_undo_segment_scan_max_existing(uint8 owner_instance)
 		int fd;
 		uint32 probe_id = base_segment_id + slot;
 
-		ret = cluster_undo_path_resolve(owner_instance, probe_id, path, sizeof(path));
+		ret = cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance),
+										owner_instance, probe_id, path, sizeof(path));
 		if (ret != 0)
 			break;
 
@@ -1047,7 +1141,9 @@ cluster_undo_segment_file_exists(uint8 owner_instance, uint32 segment_id)
 
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return false;
-	if (cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path)) != 0)
+	if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
+								  segment_id, path, sizeof(path))
+		!= 0)
 		return false;
 	return access(path, F_OK) == 0;
 }

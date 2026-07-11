@@ -199,6 +199,11 @@ extern bool cluster_past_image;
  * (undo-block CF fetch + live authority gate; default off = 53R97). */
 extern bool cluster_crossnode_runtime_visibility;
 
+/* spec-5.22b D2-2: shared-undo GCS coherence master switch (default off =
+ * undo stays on the local DataDir; on = own-instance runtime + redo undo
+ * migrate to the shared cluster_fs root under owner-as-master GCS). */
+extern bool cluster_undo_gcs_coherence;
+
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * off = vanilla dense per-node xid allocation). */
 extern bool cluster_xid_striping;
@@ -573,6 +578,13 @@ extern bool cluster_join_remaster_enabled;			/* spec-5.16 D6 */
 extern int cluster_interconnect_heartbeat_interval_ms;
 extern int cluster_interconnect_connect_timeout_ms;
 extern int cluster_interconnect_recv_timeout_ms;
+
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only old-binary
+ * simulation — suppress the CAPS_REPLY_V1 HELLO meta bit AND the acceptor's
+ * PEER_CAPS_REPLY send on this node.  Consumed by LMON (build_hello + the
+ * accept-side reply gate), hence PGC_SIGHUP (conf + reload), never a
+ * session SET. */
+extern bool cluster_ic_suppress_caps_reply;
 
 /* spec-2.4 D9: chunked framing + TCP KeepAlive 5 GUC. */
 extern int cluster_interconnect_payload_max_bytes;

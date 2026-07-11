@@ -190,4 +190,87 @@ cluster_vis_dirty_verdict(ClusterTTStatus status, bool is_xmax, bool is_delete)
 	}
 }
 
+/* ============================================================
+ *	spec-5.22f D6-1: fresh-remote-ITL-ref visibility consumer helpers.
+ *
+ *	Two PURE helpers the classify_ref_guts fresh-ref widening (D6-2) calls
+ *	to consume a D3 cross-node verdict.  No I/O, no shmem, no elog, so they
+ *	unit-test by full enumeration (test_cluster_vis_undo_verdict_map,
+ *	U1-U10) alongside the OBS-2~5 tables above.
+ * ============================================================ */
+
+/*
+ * cluster_vis_from_undo_verdict -- map a D3 five-value verdict onto the local
+ * visibility out-params.  See the header for the truth table.  EVERY branch
+ * overwrites commit_scn + commit_scn_is_bound so a non-terminal verdict never
+ * leaks a residual scn (U7).  Returns true iff a terminal (COMMITTED/ABORTED)
+ * outcome was produced; false keeps the caller on the 53R97 fail-closed path.
+ */
+bool
+cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out)
+{
+	switch (v.kind) {
+	case CLUSTER_UNDO_VERDICT_COMMITTED_EXACT:
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = v.commit_scn;
+		out->commit_scn_is_bound = false;
+		return true;
+
+	case CLUSTER_UNDO_VERDICT_COMMITTED_BOUND:
+		/*
+		 * A below-horizon bound decides correctly ONLY against the read_scn
+		 * this resolve ran under; commit_scn_is_bound forbids stamping/caching
+		 * it as an exact commit_scn (spec-6.12i CP5 / Rule 8.A).
+		 */
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = v.commit_scn;
+		out->commit_scn_is_bound = true;
+		return true;
+
+	case CLUSTER_UNDO_VERDICT_ABORTED:
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_ABORTED;
+		out->commit_scn = InvalidScn;
+		out->commit_scn_is_bound = false;
+		return true;
+
+	case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
+	case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+	default:
+		/*
+		 * Not proven terminal -> STALE_OR_AMBIGUOUS so the caller keeps 53R97
+		 * (Rule 8.A / L10: a zero / unknown verdict is never visible).  D3
+		 * folds a proven-live xid to UNKNOWN already; IN_PROGRESS is handled
+		 * here only defensively.
+		 */
+		out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+		out->status = CLUSTER_TT_STATUS_UNKNOWN;
+		out->commit_scn = InvalidScn;
+		out->commit_scn_is_bound = false;
+		return false;
+	}
+}
+
+/*
+ * cluster_vis_freshref_origin_decision -- the fresh-ref origin decision
+ * (spec-5.22f Q2 / Option B, P1-a).  A fresh ref's ref_origin is the tuple
+ * page's physical ITL binding (the true owner); the value-derived slot is only
+ * a derivable-time integrity cross-check.  Underivable (-1) is deliberately
+ * ASK, not fail-closed: the physical binding is authoritative and D3's
+ * wrap-suspect / covers / serve gates fail-close every unproven leg inside the
+ * verdict.  A derivable mismatch is a striping bug / page corruption / alias
+ * -> STALE (Rule 8.A integrity guard).  Pure.
+ */
+ClusterVisFreshRefOriginDecision
+cluster_vis_freshref_origin_decision(int derived_slot, int32 ref_origin)
+{
+	if (derived_slot < 0)
+		return CLUSTER_VIS_FRESHREF_ORIGIN_ASK; /* underivable (P1-a) */
+	if (derived_slot == (int)ref_origin)
+		return CLUSTER_VIS_FRESHREF_ORIGIN_ASK; /* corroborated */
+	return CLUSTER_VIS_FRESHREF_ORIGIN_STALE;	/* derivable mismatch (8.A) */
+}
+
 #endif /* USE_PGRAC_CLUSTER */

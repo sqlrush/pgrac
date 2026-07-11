@@ -61,7 +61,8 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_scn.h"
-#include "storage/buf_internals.h" /* BufferTag */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
+#include "storage/buf_internals.h"		  /* BufferTag */
 
 /* Split verdict for the server-side construction (see banner). */
 typedef enum ClusterCrServerSplit {
@@ -159,6 +160,18 @@ typedef struct ClusterLmsCrSlot {
 	uint32 undo_segment_id;
 	uint32 undo_block_no;
 	TransactionId undo_xid;
+	/* spec-5.22f D6-7: the KIND_UNDO_VERDICT request was AUTHORITATIVE (origin
+	 * chosen from the fresh ref's physical ITL binding, wire value 3) -> the
+	 * serve skips the cluster_xid_is_mine stripe self-check and answers an
+	 * underivable own xid over its durable-TT + CLOG authority.  false for the
+	 * derived (recycled) path, which keeps the self-check (6.12i P0 guard). */
+	bool undo_authoritative;
+	/* spec-5.22d D4-6: the dead OWNER a kind-4 AUTHORITY verdict request asks
+	 * about, decoded from tag.relNumber at submit time (in-memory only, not
+	 * wire ABI).  -1 for every owner-served kind.  >= 0 switches the drain to
+	 * the authority serve (triple check + block0 prove), which never consults
+	 * this node's own TT. */
+	int32 undo_owner;
 	ClusterLiveAuthority undo_auth;
 	char result_page[BLCKSZ]; /* the constructed CR page (FULL/PARTIAL), the
 							   * fetched undo header block (UNDO_FETCH), the
@@ -215,6 +228,14 @@ extern bool cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd);
  * requester keeps its unchanged 53R97). */
 extern bool cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd);
 
+/* spec-5.22c D3-4: resolve an OWN xid into a verdict page over the complete
+ * own durable TT + own CLOG.  Shared by the origin-served verdict
+ * (lms_undo_verdict_serve) and the master==self local verdict resolve so the
+ * two answers over one xid can never diverge (Rule 8.A).  The caller zeroes
+ * the page buffer and owns any authority co-sampling; true = *v holds the
+ * verdict, false = refuse (caller keeps 53R97 fail-closed). */
+extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+											   ClusterGcsUndoVerdictPage *v);
 /* LMON dispatch side (spec-7.1 D3-b): park a validated undo-MULTI-verdict
  * request (the asked-for MXID rides the widened watermark carrier; a carrier
  * with non-zero upper 32 bits or an invalid mxid is malformed).  false = wave
@@ -274,10 +295,24 @@ extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 s
  * The caller MUST Lamport-observe verdict_out->horizon_scn (and any
  * commit_scn) it consumes — SCNs that crossed the wire (AD-008). */
 extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
-														  TransactionId xid,
+														  TransactionId xid, bool authoritative,
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);
 
+/* Requester side (backend, spec-5.22d D4-6): ask the elected serve AUTHORITY
+ * (a live survivor — NOT the dead owner) for a block0-proven verdict on the
+ * dead owner_node's `xid` (kind-4 wire; owner rides in tag.relNumber).  The
+ * caller has already gated on the peer's HELLO D4 capability.  On success
+ * *out holds the mapped COMMITTED_EXACT / ABORTED verdict; false or an
+ * UNKNOWN_FAIL_CLOSED kind = fail-closed (timeout / DENIED / checksum /
+ * trailer missing / wrong sender / epoch moved / malformed or v1 page —
+ * caller keeps the 53R97 refusal, Rule 8.A).  The caller MUST Lamport-
+ * observe any commit_scn it consumes (AD-008). */
+extern bool cluster_gcs_block_undo_authority_verdict_fetch_and_wait(int32 authority_node,
+																	int32 owner_node,
+																	uint32 segment_id,
+																	TransactionId xid,
+																	ClusterUndoVerdictResult *out);
 /* Requester side (backend, spec-7.1 D3-b): ask origin_node for a batched
  * member verdict on the foreign multixact `mxid` over the same wire.  On
  * success copies the structurally-validated (cluster_vis_undo_multi_verdict_

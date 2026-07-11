@@ -409,6 +409,54 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-lms-undo-fetch" },
 	/*
+	 * spec-5.22d D4-8 — dead-owner authority block0-prove refusal injection.
+	 *
+	 *	cluster-undo-authority-block0-prove:
+	 *	  Fires at the head of the shared authority block0 prove core
+	 *	  (cluster_undo_authority_block0_prove), which both the requester's
+	 *	  SELF-authority leg and the kind-4 LMS wire leg run.  SKIP forces
+	 *	  the coverage-fail refusal (undo_authority_fail_closed bumps, the
+	 *	  consumer keeps 53R97) under a topology that would otherwise serve
+	 *	  the dead owner's verdict — TAP L3 pins the fail-closed arm with a
+	 *	  counter delta (L408), never a native CLOG answer.
+	 */
+	{ .name = "cluster-undo-authority-block0-prove" },
+	/*
+	 * spec-5.22d Hardening — dead-owner authority durable-segment ENUMERATION
+	 * fault injection.
+	 *
+	 *	cluster-undo-authority-scan:
+	 *	  Fires inside authority_scan_owner_segments' enumeration loop, once
+	 *	  per directory entry, modelling a mid-scan directory read failure
+	 *	  (ReadDir throws at the ERROR elevel).  ERROR arms the throw; the
+	 *	  scan's PG_TRY folds it into a coverage failure so the prove fails
+	 *	  closed via undo_authority_scan_incomplete_reject -- never a truncated
+	 *	  "complete" scan that could serve a false-unique verdict.  TAP L3c
+	 *	  pins the scan-incomplete arm with a counter delta (53R97), proving an
+	 *	  un-completable enumeration is refused, not swallowed.
+	 */
+	{ .name = "cluster-undo-authority-scan" },
+	/*
+	 * spec-5.22e D5-7 — undo horizon report drop injection (TAP L2).
+	 *
+	 *	cluster-undo-horizon-report-drop:
+	 *	  Fires in the LMON receive handler before validation/publish; SKIP
+	 *	  drops the peer's report so its slot ages into a fold stall
+	 *	  (undo_horizon_stall_count bumps, recycling pauses) and self-heals
+	 *	  once disarmed — pins the stall leg with a counter delta (L408).
+	 */
+	{ .name = "cluster-undo-horizon-report-drop" },
+	/*
+	 * spec-5.22e D5-7 — undo horizon epoch fence injection (TAP L6).
+	 *
+	 *	cluster-undo-horizon-epoch-fence:
+	 *	  Fires in the cleaner pass between the fold and the first recycle
+	 *	  mutation; SKIP simulates a mid-pass reconfig epoch bump so the
+	 *	  fence aborts the pass (undo_horizon_pass_abort_count bumps, zero
+	 *	  recycles this pass) — pins the F-D2 fence with a counter delta.
+	 */
+	{ .name = "cluster-undo-horizon-epoch-fence" },
+	/*
 	 * spec-6.12e2 — holder-side BAST-nudge refusal injection.
 	 *
 	 *	cluster-gcs-block-bast-nudge:

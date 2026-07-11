@@ -1674,6 +1674,37 @@ cluster_undo_reader_lookup_count(void)
 {
 	return 0;
 }
+/* spec-5.22b D2-6 stubs: 6 undo GCS grant-plane counters referenced by dump_undo. */
+uint64
+cluster_undo_gcs_grant_shared_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_grant_exclusive_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_ship_bytes(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_invalidate_notify_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_remaster_deny_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_gcs_local_fast_path_count(void)
+{
+	return 0;
+}
 /* spec-3.8 D11 stubs: 4 NEW lifecycle counters referenced by dump_undo. */
 uint64
 cluster_undo_autoextend_count(void)
@@ -1928,6 +1959,44 @@ cluster_cr_server_fence_refused_count(void)
 }
 uint64
 cluster_rtvis_underivable_failclosed_count(void)
+{
+	return 0;
+}
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+uint64
+cluster_vis_freshref_verdict_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_freshref_verdict_failclosed_count(void)
+{
+	return 0;
+}
+/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */
+uint64
+cluster_undo_authority_serve_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_fail_closed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_epoch_stale_reject_count(void)
+{
+	return 0;
+}
+/* spec-5.22d A1 (D4-8): complete-scan refusal attribution. */
+uint64
+cluster_undo_authority_scan_incomplete_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_authority_multi_match_reject_count(void)
 {
 	return 0;
 }
@@ -2191,6 +2260,19 @@ cluster_sf_dep_retry_failclosed_count(void)
 {
 	return 0;
 }
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq): the ic dump rows read
+ * the per-peer capability summary + PEER_CAPS_REPLY reject counter from
+ * cluster_sf_dep.c, which is not linked here; stub both. */
+const char *
+cluster_sf_peer_capabilities_summary(void)
+{
+	return "";
+}
+uint64
+cluster_sf_caps_reply_reject_count(void)
+{
+	return 0;
+}
 /* spec-4.8: tt_recovery counter accessors (cluster_tt_durable_stat.c) are not
  * linked here; stub the 8 accessors the tt_recovery dump rows read. */
 uint64
@@ -2426,6 +2508,47 @@ uint64
 cluster_undo_cleaner_pass_count(void)
 {
 	return 0;
+}
+/* spec-5.22e D5-5 stubs: retention brake observability rows. */
+uint64
+cluster_undo_cleaner_header_tt_slots_below_horizon(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_stall_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_peer_stale_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_pass_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_wire_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_horizon_admission_refuse_count(void)
+{
+	return 0;
+}
+SCN
+cluster_undo_horizon_last_floor(void)
+{
+	return (SCN)0;
+}
+const char *
+cluster_undo_horizon_peer_reports_summary(void)
+{
+	return "";
 }
 uint64
 cluster_undo_cleaner_shmem_tt_slots_gcd(void)

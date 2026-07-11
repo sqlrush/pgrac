@@ -731,6 +731,32 @@ UT_TEST(test_sharedfs_sentinel_symbols_linkable)
 	UT_ASSERT_NOT_NULL((void *)has_fn);
 }
 
+/* ============================================================
+ * spec-5.22b D2-2: undo namespace path resolve on the shared root.
+ * Non-RelFileLocator; mirrors build_anchor_path (fail-closed when the
+ * shared root is unset), owner-partitioned instance_<owner-1>.
+ * ============================================================ */
+UT_TEST(test_undo_shared_path_resolve)
+{
+	char buf[MAXPGPATH];
+
+	/* fail-closed when the shared root is unset: never resolve a bogus path */
+	cluster_shared_data_dir = NULL;
+	UT_ASSERT_EQ(cluster_shared_fs_undo_path_resolve(1, 1, buf, sizeof(buf)), -1);
+
+	/* owner-partitioned instance_<N> under the shared root; the directory uses
+	 * owner_instance-1 (= node_id), matching the local $PGDATA/pg_undo layout */
+	cluster_shared_data_dir = "/u01/pgrac/shared";
+	UT_ASSERT_EQ(cluster_shared_fs_undo_path_resolve(1, 1, buf, sizeof(buf)), 0);
+	UT_ASSERT_STR_EQ(buf, "/u01/pgrac/shared/pg_undo/instance_0/seg_1.dat");
+
+	cluster_shared_data_dir = "/mnt/shared";
+	UT_ASSERT_EQ(cluster_shared_fs_undo_path_resolve(3, 257, buf, sizeof(buf)), 0);
+	UT_ASSERT_STR_EQ(buf, "/mnt/shared/pg_undo/instance_2/seg_257.dat");
+
+	cluster_shared_data_dir = NULL; /* restore stub default */
+}
+
 
 /* ============================================================
  * Test runner
@@ -739,7 +765,7 @@ UT_TEST(test_sharedfs_sentinel_symbols_linkable)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_shared_fs_backend_max_constant);
 	UT_RUN(test_shared_fs_backend_id_enum_frozen);
 	UT_RUN(test_shared_fs_vtable_struct_nonempty);
@@ -755,6 +781,7 @@ main(void)
 	UT_RUN(test_sharedfs_vtable_callbacks_nonnull);
 	UT_RUN(test_sharedfs_vtable_identity);
 	UT_RUN(test_sharedfs_sentinel_symbols_linkable);
+	UT_RUN(test_undo_shared_path_resolve);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

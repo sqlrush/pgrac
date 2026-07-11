@@ -61,6 +61,15 @@
 
 UT_DEFINE_GLOBALS();
 
+/* spec-5.22e D5-8 stub: cluster_membership_set_state notes self-admission
+ * into the undo horizon shmem (cluster_undo_horizon_ic.c not linked here);
+ * also satisfies the cluster_node_id extern via cluster_guc.o linkage or
+ * local definition in this binary. */
+void cluster_undo_horizon_note_self_member(void);
+void
+cluster_undo_horizon_note_self_member(void)
+{}
+
 /* spec-2.29a: cluster_reconfig.c gates the async marker stage on
  * MyBackendType == B_LMON.  The fixture exercises the pre-2.29a bounded-wait
  * semantics (write_fence submit stub returns FAILED synchronously), so run as

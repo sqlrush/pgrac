@@ -424,6 +424,11 @@ cluster_tt_status_shmem_register(void)
 void
 cluster_tt_local_shmem_register(void)
 {}
+/* spec-5.22b D2-6 stub: cluster_init_shmem_module also calls
+ * cluster_undo_gcs_shmem_register. */
+void
+cluster_undo_gcs_shmem_register(void)
+{}
 
 /* spec-3.2 D3 stub: cluster_init_shmem_module also calls
  * cluster_tt_status_hint_shmem_register. */
@@ -668,6 +673,13 @@ cluster_tt_durable_shmem_register(void)
  * doesn't link that object; provide a no-op stub. */
 void
 cluster_sf_dep_shmem_register(void)
+{}
+
+/* spec-5.22e D5-2 stub: cluster_init_shmem_module also calls
+ * cluster_undo_horizon_shmem_register (cluster_undo_horizon_ic.c is not
+ * linked into this standalone test); link-only no-op stub. */
+void
+cluster_undo_horizon_shmem_register(void)
 {}
 
 /*
@@ -1075,13 +1087,13 @@ UT_TEST(test_cluster_shmem_iter_regions_returns_false_when_uninit)
 UT_TEST(test_cluster_shmem_max_regions_default_value)
 {
 	/*
-	 * The boot-value of cluster.shmem_max_regions is 80 (spec-5.56 raised it
-	 * 64 -> 80 for the per-relation CR generation region; cluster_guc.c static
+	 * The boot-value of cluster.shmem_max_regions is 96 (spec-5.22e raised it
+	 * 80 -> 96 for the undo horizon region + headroom; cluster_guc.c static
 	 * initializer).  Unit test links cluster_guc.o but never calls
 	 * cluster_init_guc, so the C global retains its static-initializer default.
 	 */
 	extern int cluster_shmem_max_regions;
-	UT_ASSERT_EQ(cluster_shmem_max_regions, 80);
+	UT_ASSERT_EQ(cluster_shmem_max_regions, 96);
 }
 
 

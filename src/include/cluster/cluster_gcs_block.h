@@ -1226,7 +1226,9 @@ GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
  * VALUE 1 ([0]=read-image, [1]=X-transfer, [2]=clean-eligible,
  * [3]=downgrade-request/nudge, [4]=CR-request, [5]=spec-6.13 direct-land
  * above; [6] is the last byte, value-multiplexed like [3]: value 1 =
- * undo-TT fetch, value 2 = spec-6.15 D4 xid verdict).
+ * undo-TT fetch, values 2/3 = spec-6.15 D4 / spec-5.22f D6-7 xid verdict
+ * sub-kinds, value 4 = spec-5.22d D4-6 dead-owner authority verdict — see
+ * the per-kind banners below).
  *
  *	Sent REQUESTER -> ORIGIN, riding the same 64B forward wire as the
  *	spec-6.12b CR request.  With this flag set the BufferTag is a SYNTHETIC
@@ -1284,16 +1286,77 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  *	complete durable-TT scan + CLOG cross-check + retention origin legs and
  *	ships UNDO_VERDICT_RESULT, or a DENIED status which the requester maps
  *	to the unchanged 53R97 fail-closed (Rule 8.A). */
+/*
+ * PGRAC: spec-5.22f D6-7 — reserved_0[6] value-multiplexes the verdict request
+ * into two sub-kinds: VALUE 2 = a DERIVED verdict (the spec-6.15 D4 recycled
+ * path, whose origin was derived from the xid value; the serve keeps the
+ * cluster_xid_is_mine self-check that guards the 6.12i P0 wrong-origin match),
+ * VALUE 5 = an AUTHORITATIVE verdict (the spec-5.22f fresh-ref path, whose
+ * origin is the tuple page's PHYSICAL ITL binding — the requester already
+ * proved this is the correct owner, so the serve skips the stripe pre-filter
+ * and answers underivable own xids over its own durable-TT + CLOG authority;
+ * the positive-proof gates are unchanged, Rule 8.A).
+ *
+ * spec-5.22f Hardening (RC#1 integration review): the AUTHORITATIVE sub-kind
+ * originally reused VALUE 3, which COLLIDES with the spec-7.1 D3-b
+ * undo-MULTI-verdict request (also VALUE 3 below).  IsUndoVerdictRequest then
+ * matched a multi request and the forward handler's single-verdict branch stole
+ * it before the multi branch, so a cross-node multixact member serve refused and
+ * the requester fail-closed (t/359_mxid G5 red on the branch, green on main).
+ * The byte legend is now 0=none, 1=undo-TT fetch, 2=derived verdict, 3=MULTI
+ * verdict (7.1 D3-b, unchanged), 4=dead-owner authority verdict (5.22d D4-6),
+ * 5=authoritative single verdict (moved off the multi value).  Multi keeps its
+ * shipped value 3; only this unshipped-on-main sub-kind moves.
+ */
 static inline void
-GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool undo_verdict)
+GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
 {
-	p->reserved_0[6] = undo_verdict ? (uint8)2 : (uint8)0;
+	p->reserved_0[6] = authoritative ? (uint8)5 : (uint8)2;
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)2;
+	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)5;
+}
+
+/* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY
+ * verdict request (the byte's fourth value; 1 = undo-TT fetch, 2 = derived
+ * verdict, 3 = authoritative verdict above).
+ *
+ *	Sent REQUESTER -> elected serve AUTHORITY (a live survivor, NOT the
+ *	owner) when the undo OWNER of the asked-for xid is dead/absent: the
+ *	owner's verdict wire has nobody behind it, so the deterministically
+ *	elected survivor authority answers from the owner's durable shared
+ *	block0 instead (spec-5.22d Route B).  Identity vs destination are
+ *	deliberately separate layers: the request's OWNER (whose xid / whose
+ *	undo segment) never changes and rides in tag.relNumber (see
+ *	GcsBlockUndoAuthorityFetchTagMake below); only the serve DESTINATION
+ *	moves to the authority.  The requester sends this kind ONLY to a peer
+ *	that advertised PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 (an old
+ *	binary never sees kind 4).  The serve side NEVER blind-trusts the wire:
+ *	it re-checks request epoch == its current epoch, re-derives the
+ *	authority for (owner, current epoch) and only serves when that is
+ *	itself, then proves the verdict on the owner's block0 bytes
+ *	(cluster_undo_authority_block0_prove — the same core the requester's
+ *	self-authority leg runs).  Any failed check is a DENIED and the
+ *	requester keeps the 53R97 fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = (uint8)4;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)4;
 }
 
 /* PGRAC: spec-7.1 D3-b — undo-MULTI-verdict request carried in reserved_0[6]
@@ -1332,10 +1395,18 @@ GcsBlockForwardPayloadIsUndoMultiVerdictRequest(const GcsBlockForwardPayload *p)
  *	field to carry that address: spcOid holds a magic discriminator (so a
  *	synthetic tag can never be confused with a real relation tag anywhere
  *	it might leak into observability), dbOid carries the segment_id and
- *	blockNum the block_no.  The OWNER is deliberately NOT carried: the
- *	origin only ever serves its own undo (owner_instance derives from the
- *	serving node's own id), so a forged owner field cannot redirect the
- *	read (fail-closed by construction). */
+ *	blockNum the block_no.  On the owner-served kinds (reserved_0[6] values
+ *	1/2/3) the OWNER is deliberately NOT carried — the origin only ever
+ *	serves its own undo (owner_instance derives from the serving node's own
+ *	id), so a forged owner field cannot redirect the read (fail-closed by
+ *	construction), and relNumber stays 0 (the LMON submit refuses a
+ *	non-zero relNumber on those kinds).  The spec-5.22d D4-6 AUTHORITY kind
+ *	(value 4) is the ONE exception: the dead OWNER's node id rides in the
+ *	otherwise-empty relNumber as owner+1 (0 stays "absent"), because the
+ *	serve destination is NOT the owner.  The serve side still never trusts
+ *	it: the authority re-derivation + epoch check + block0 positive proof
+ *	must all pass before a byte is answered (a forged owner is refused,
+ *	never redirected-to). */
 #define GCS_BLOCK_UNDO_FETCH_TAG_MAGIC ((Oid)0x50475549) /* "PGUI" */
 
 static inline BufferTag
@@ -1360,6 +1431,32 @@ GcsBlockUndoFetchTagDecode(BufferTag tag, uint32 *segment_id, uint32 *block_no)
 		*segment_id = (uint32)tag.dbOid;
 	if (block_no != NULL)
 		*block_no = (uint32)tag.blockNum;
+	return true;
+}
+
+/* PGRAC: spec-5.22d D4-6 — authority-kind tag: the dead OWNER rides in the
+ * otherwise-empty relNumber as owner+1 (see the banner above).  Decode is
+ * shape-only (magic + non-zero owner carrier); range and self-exclusion are
+ * the LMON submit's job, and TRUST is nobody's until the serve-side triple
+ * check passes. */
+static inline BufferTag
+GcsBlockUndoAuthorityFetchTagMake(uint32 segment_id, uint32 block_no, int32 owner_node)
+{
+	BufferTag tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
+
+	tag.relNumber = (RelFileNumber)(owner_node + 1);
+	return tag;
+}
+
+static inline bool
+GcsBlockUndoAuthorityFetchTagDecodeOwner(BufferTag tag, int32 *owner_node)
+{
+	if (tag.spcOid != GCS_BLOCK_UNDO_FETCH_TAG_MAGIC)
+		return false;
+	if (tag.relNumber == (RelFileNumber)0)
+		return false; /* owner absent: an owner-served-kind tag */
+	if (owner_node != NULL)
+		*owner_node = (int32)tag.relNumber - 1;
 	return true;
 }
 
@@ -1471,6 +1568,12 @@ ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
  *	failing leg (e) forever. */
 #define CLUSTER_GCS_UNDO_VERDICT_MAGIC ((uint32)0x50475556) /* "PGUV" */
 #define CLUSTER_GCS_UNDO_VERDICT_VERSION ((uint32)1)
+/* PGRAC: spec-5.22d D4-6 — version 2 marks "dead-owner AUTHORITY-served"
+ * provenance (Route B block0 prove).  An old requester's strict ==1 gate
+ * refuses it (fail-closed, never mistaken for owner-served), and the new
+ * authority leg accepts ONLY version 2 (an owner-served v1 page can never
+ * masquerade as an authority serve).  Same 48-byte layout. */
+#define CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY ((uint32)2)
 
 typedef enum ClusterGcsUndoVerdictKind {
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
@@ -2079,6 +2182,9 @@ extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
 extern uint64 cluster_gcs_block_pi_note_presync_snapshot(void);
 extern void cluster_gcs_block_pi_note_confirm(uint64 presync_seq);
 extern void cluster_gcs_block_pi_discard_drain(void);
+/* spec-5.22b D2-4 — single-target PI_DISCARD send, reused by the shared-undo
+ * owner-as-master data plane (LMON-context; caller owns self/range guard). */
+extern void cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 target_node);
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);

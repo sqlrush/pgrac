@@ -156,6 +156,28 @@ extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
 															 uint16 *out_wrap);
 
 /*
+ * spec-5.22d A1 (D4-8): the scan CORE under the positive-proof wrapper.
+ * Same parse discipline, exposed for the dead-owner complete-scan prove:
+ * the per-block match COUNT is reported (cross-segment uniqueness is the
+ * aggregate's to decide) and unparseable bytes are a DISTINCT status so the
+ * aggregate refuses the whole set instead of skip-and-continue (A1.1
+ * 完备-或-fail-closed).  OK + nmatch==1 fills out_proof (terminal COMMITTED
+ * with a valid scn / terminal ABORTED / NONE for in-doubt shapes) and, on a
+ * terminal proof, out_commit_scn / out_wrap.  POISONED covers NULL block,
+ * invalid xid, header identity mismatch, over-range slot count, and any
+ * out-of-range slot status byte.  Pure; unit truth table.
+ */
+typedef enum ClusterVisTtBlockScanStatus {
+	CLUSTER_VIS_TT_BLOCK_SCAN_OK = 0,
+	CLUSTER_VIS_TT_BLOCK_SCAN_POISONED = 1
+} ClusterVisTtBlockScanStatus;
+
+extern ClusterVisTtBlockScanStatus
+cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
+							  uint8 expected_owner_instance, TransactionId xid, int *out_nmatch,
+							  ClusterVisTtProof *out_proof, SCN *out_commit_scn, uint16 *out_wrap);
+
+/*
  * CP5 (D-i4) pure structural validation of a shipped verdict page (see
  * cluster_gcs_block.h for the wire struct and the verdict taxonomy).  true
  * only when the page provably answers the asked-for xid: magic / version /
@@ -169,6 +191,21 @@ extern ClusterVisTtProof cluster_vis_tt_block_positive_proof(const char *block,
 struct ClusterGcsUndoVerdictPage; /* cluster_gcs_block.h */
 extern bool cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 												 TransactionId asked_xid);
+
+/*
+ * spec-5.22d D4-6: structural gate for an AUTHORITY-served verdict page
+ * (version 2 provenance) + the reply binding predicate.  The authority gate
+ * mirrors the v1 discipline but accepts ONLY version 2 and refuses the
+ * BELOW_HORIZON kind (the block0 prove has no horizon leg); the binding
+ * predicate is the 8.A amend — reply sender == elected authority AND reply
+ * epoch == stamped request epoch EXACTLY (the transport HC100 >= is only a
+ * pre-filter).  Pure: unit truth tables.
+ */
+extern bool
+cluster_vis_undo_authority_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+											   TransactionId asked_xid);
+extern bool cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32 authority_node,
+														uint64 reply_epoch, uint64 stamped_epoch);
 
 /*
  * spec-7.1 D3-b pure structural validation of a shipped BATCHED multixact
@@ -219,7 +256,8 @@ cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdi
  */
 extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
 														  TransactionId raw_xid, SCN read_scn,
-														  bool *out_committed, SCN *out_commit_scn,
+														  bool authoritative, bool *out_committed,
+														  SCN *out_commit_scn,
 														  bool *out_commit_scn_is_bound);
 
 #endif /* CLUSTER_RUNTIME_VISIBILITY_H */

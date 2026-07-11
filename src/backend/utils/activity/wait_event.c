@@ -1308,6 +1308,15 @@ pgstat_get_wait_cluster_undo(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM:
 		event_name = "ClusterUndoExtentClaim"; /* spec-3.18 D7 */
 		break;
+	case WAIT_EVENT_UNDO_BLOCK_GRANT_WAIT:
+		event_name = "UndoBlockGrantWait"; /* spec-5.22b D2-6 */
+		break;
+	case WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT:
+		event_name = "UndoBlockInvalidateWait"; /* spec-5.22b D2-6 */
+		break;
+	case WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT:
+		event_name = "UndoBlockRemasterWait"; /* spec-5.22b D2-6 */
+		break;
 	default:
 		break;
 	}

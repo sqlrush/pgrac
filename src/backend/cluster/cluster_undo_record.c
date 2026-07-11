@@ -90,6 +90,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
 #include "cluster/cluster_xnode_profile.h"	   /* PGRAC: spec-5.59 D7 profiling */
+#include "cluster/cluster_undo_horizon.h"	   /* epoch fence (spec-5.22e F-D2) */
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
 
@@ -760,7 +761,8 @@ cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance,
 	if (UndoRecordShared == NULL || seg == 0)
 		return;
 
-	if (!cluster_undo_smgr_read_block(seg, owner_instance, 0, blockbuf.data))
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance), seg,
+									  owner_instance, 0, blockbuf.data))
 		return; /* read fail -> retain (best-effort) */
 	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, seg, owner_instance))
 		return; /* L212: identity, not template bytes -> retain */
@@ -801,7 +803,8 @@ cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance,
 	}
 
 	if (dirty)
-		(void)cluster_undo_smgr_write_block(seg, owner_instance, 0, blockbuf.data, true);
+		(void)cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance), seg,
+											owner_instance, 0, blockbuf.data, true);
 }
 
 uint64
@@ -864,7 +867,8 @@ read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *
 	 */
 	img = cluster_undo_buf_pin(segment_id, owner_instance, block_no, CLUSTER_UNDO_BUF_SHARED, &pin);
 	if (img == NULL)
-		return cluster_undo_smgr_read_block(segment_id, owner_instance, block_no, buf);
+		return cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance),
+											segment_id, owner_instance, block_no, buf);
 	memcpy(buf, img, BLCKSZ);
 	cluster_undo_buf_unpin(&pin);
 	return true;
@@ -893,7 +897,8 @@ write_undo_block_ext(uint32 segment_id, uint8 owner_instance, uint32 block_no, c
 	 * do_fsync request goes straight to the direct smgr write.
 	 */
 	if (do_fsync)
-		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, true);
+		return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance),
+											 segment_id, owner_instance, block_no, buf, true);
 
 	/*
 	 * Write-through the pool for DATA blocks:  update the cached image and
@@ -911,7 +916,8 @@ write_undo_block_ext(uint32 segment_id, uint8 owner_instance, uint32 block_no, c
 		 */
 		if (keep_clean)
 			return false;
-		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, false);
+		return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance),
+											 segment_id, owner_instance, block_no, buf, false);
 	}
 
 	/*
@@ -1760,14 +1766,29 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	 * blanket-converted to ERROR.  The CR-construct caller no longer relies on
 	 * this branch: the spec-5.57 D2 pre-check in cluster_cr.c fail-closes a
 	 * runtime-warm cross-instance origin with 53R9G BEFORE this read, so for the
-	 * CR path the boundary is consolidated to one errcode.  The runtime
-	 * cross-instance undo data plane lands in Stage 6 (#119). */
+	 * CR path the boundary is consolidated to one errcode.
+	 *
+	 * spec-5.22b D2 (#119) — this wall now formally ENFORCES invariant #8: a
+	 * peer NEVER self-reads a foreign owner's undo bytes.  The coherent runtime
+	 * cross-instance undo read is cluster_undo_block_acquire_shared (D2-3): the
+	 * owner is the master AND the holder, so it ships its own block image over
+	 * owner-as-master routing and the requesting peer consumes THAT shipped
+	 * image, never opening the foreign pg_undo/instance_<origin> tree here.
+	 * Hence this local-open path correctly STAYS fail-closed for a runtime-warm
+	 * foreign owner -- the coherent bytes come from the grant, not from this
+	 * read (admitting a local foreign read here would BREAK invariant #8).  The
+	 * admit set is unchanged (own-instance OR materialized-remote, both P1-3
+	 * local): only this contract text is updated (spec-5.22b Q-D24-1=A, zero
+	 * behaviour change).  Routing the recovery/SRF/CR callers onto the grant
+	 * (so a runtime-warm foreign read reaches acquire_shared instead of this
+	 * warning) is the D6 consumer wiring. */
 	if (owner_instance != (uint8)(cluster_node_id + 1)
 		&& !cluster_merged_instance_is_materialized((int)owner_instance - 1)) {
 		ereport(WARNING,
 				(errmsg("cluster_undo_get_record: runtime cross-instance undo read not supported"),
-				 errhint("Cross-instance undo/CR data plane lands in Stage 6 (#119 undo-block "
-						 "Cache Fusion); see Spec: spec-5.57.")));
+				 errhint("The coherent cross-instance undo path is the owner's shipped block "
+						 "image (spec-5.22b #119 undo-block Cache Fusion), not a local read; "
+						 "see Spec: spec-5.57.")));
 		return 0;
 	}
 	if (owner_instance != (uint8)(cluster_node_id + 1))
@@ -2307,7 +2328,7 @@ cluster_undo_record_active_segment_id(void)
  *	BEFORE this lock (C17).
  */
 ClusterUndoSegTryRecycle
-cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
+cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon, uint64 expected_epoch)
 {
 	ClusterUndoSegTryRecycle result;
 	uint8 owner;
@@ -2322,6 +2343,18 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return CLUSTER_SEG_RECYCLE_NOT_COMMITTED; /* writer-active: never a candidate */
 	}
+
+	/*
+	 * spec-5.22e F-D2 epoch fence, INSIDE the mutation lock and before the
+	 * WAL/pwrite/fsync three-step: a reconfig epoch bump after the floor was
+	 * folded voids its member coverage.  Refuse the mutation; the caller
+	 * aborts the whole pass.
+	 */
+	if (cluster_undo_horizon_epoch_fence_tripped(expected_epoch)) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return CLUSTER_SEG_RECYCLE_EPOCH_CHANGED;
+	}
+
 	result = cluster_undo_segment_try_mark_recyclable(segment_id, owner, horizon);
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 

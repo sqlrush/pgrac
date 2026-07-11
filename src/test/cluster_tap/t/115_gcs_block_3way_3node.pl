@@ -125,7 +125,7 @@ for my $i (0 .. 2)
 
 	is($node->safe_psql('postgres',
 			'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-		'120',
+		'123',
 		"L4 node$i wait event count == 120 (spec-7.2 D6 LMS data-plane wait surface)");
 
 	is($node->safe_psql('postgres',

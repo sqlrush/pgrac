@@ -125,7 +125,12 @@ my %expect_cat = (
 	recovery     => 39,    # 3.16(4)+4.10 block(2)+4.11 thread(4)+4.3 plan(13)+4.4 worker(8)+4.5/4.7 merge(8)
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 10,    # 4.7 warm-recovery(8) + spec-2.41 D7 redo-coverage serve-gate(2)
-	cr           => 41,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
+	cr           => 64,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
+	                       # + ... + 6.12b(6) + 6.12i/6.15(16) + 2 spec-5.22f D6 fresh-ref verdict
+	                       # + 5 spec-5.22d D4 authority serve (undo_authority_
+	                       # {serve_hit,fail_closed,epoch_stale_reject} + A1
+	                       # {scan_incomplete,multi_match}_reject,
+	                       # unconditional in dump_cr)
 	                       # + 11 post-5.54 keys the baseline missed (stale on
 	                       # main; first caught by a local full run): 6.12b
 	                       # cr_server_{full,partial,denied} +
@@ -134,6 +139,14 @@ my %expect_cat = (
 	                       # cr_global_epoch_fallback_bump,
 	                       # cr_retention_horizon_advance_noted,
 	                       # cr_reconfig_intra_survived
+	                       # + 16 more still stale on main (reconciled 2026-07-09,
+	                       # a full-band run under spec-5.22b): 6.12i runtime
+	                       # visibility rtvis_undo_fetch_{wire,cache_hit,failclosed},
+	                       # cr_server_undo_{served,denied}, rtvis_resolve_{committed,
+	                       # aborted,failclosed}, rtvis_verdict_{wire,failclosed,exact,
+	                       # below_horizon,inadmissible}, cr_server_verdict_{served,
+	                       # denied}, rtvis_underivable_failclosed (all unconditional
+	                       # in dump_cr, so the count is deterministic = 57)
 	pcm          => 22,    # 2.37 PI watermark + lock state + 6.14 D5 aux-deferred release
 	                       # + spec-6.14a (b)-leg nonholder fail-closed counter
 );

@@ -53,6 +53,7 @@
 #include "cluster/cluster_undo_cleaner.h"		/* spec-3.13 D2-A gc pass + stats */
 #include "storage/spin.h"						/* protected-slot map lock (spec-3.15 D6) */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
+#include "cluster/cluster_undo_horizon.h"		/* epoch fence (spec-5.22e F-D2) */
 #include "miscadmin.h"
 #include "port/atomics.h" /* spec-3.12 D5 retention counters */
 #include "storage/lwlock.h"
@@ -474,22 +475,24 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
  *	current segment), NOT crash residue — they are simply skipped and
  *	NOT counted as stale (HC6 stale accounting is durable-side only).
  */
-void
-cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats)
+bool
+cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
+								ClusterUndoCleanerPassStats *stats)
 {
 	uint32 segment_id;
 	ClusterTTSlotAllocPerSegment *seg;
 	uint32 gcd = 0;
+	bool fence_ok = true;
 	int i;
 
 	Assert(stats != NULL);
 
 	if (ClusterTTSlotShm == NULL || cluster_node_id < 0)
-		return;
+		return true;
 
 	segment_id = cluster_tt_slot_current_segment(cluster_node_id);
 	if (segment_id == 0)
-		return; /* no binding yet this incarnation */
+		return true; /* no binding yet this incarnation */
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
@@ -505,6 +508,16 @@ cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats)
 			tt_slot_count_wrap_retired();
 			stats->slots_wrap_retired++;
 			continue; /* D5: ABA guard exhausted; wait for rollover/reuse */
+		}
+
+		/*
+		 * spec-5.22e F-D2 epoch fence: re-verify the reconfig epoch before
+		 * every slot FREE.  A mid-pass epoch bump voids the folded floor's
+		 * member coverage -- stop mutating and abort the whole pass.
+		 */
+		if (cluster_undo_horizon_epoch_fence_tripped(expected_epoch)) {
+			fence_ok = false;
+			break;
 		}
 
 		if (e->status == CTS_COMMITTED && ClusterTTSlotShm != NULL) {
@@ -525,6 +538,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, ClusterUndoCleanerPassStats *stats)
 
 	stats->shmem_tt_slots_gcd += gcd;
 	stats->segments_scanned++;
+	return fence_ok;
 }
 
 

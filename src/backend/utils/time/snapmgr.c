@@ -707,6 +707,19 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 		/* Mark it as "registered" in FirstXactSnapshot */
 		FirstXactSnapshot->regd_count++;
 		pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * spec-5.22e D5-1 (S3.0 row 2): publish the imported snapshot's
+		 * read_scn IMMEDIATELY, exactly as the GetTransactionSnapshot
+		 * register path does.  Without this, the exporter could release
+		 * its pin before our first PushActiveSnapshot recompute, leaving
+		 * a window where this node's published retention floor (and hence
+		 * its cluster horizon report) sits above a live imported snapshot
+		 * -- breaking the report lower-bound theorem the cluster-wide
+		 * recycle brake is built on.
+		 */
+		cluster_recompute_proc_read_scn();
+#endif
 	}
 
 	FirstSnapshotSet = true;

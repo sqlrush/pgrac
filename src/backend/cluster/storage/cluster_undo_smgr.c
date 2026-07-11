@@ -41,6 +41,7 @@
 #include "storage/ipc.h" /* before_shmem_exit (fd cache cleanup) */
 #include "utils/elog.h"
 
+#include "cluster/cluster_undo_gcs.h"		 /* cluster_undo_intent_for_owner (D2-2) */
 #include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
@@ -61,6 +62,13 @@
  */
 static uint32 cached_fd_segment = 0; /* 0 = empty */
 static uint8 cached_fd_owner = 0;
+/*
+ * spec-5.22b D2-2: the intent is part of the cache key.  A given (segment,
+ * owner) resolves to a DIFFERENT physical path for RUNTIME_SHARED (shared
+ * root) vs MATERIALIZED_LOCAL (local DataDir), so a cached fd opened under
+ * one intent must never be reused for the other.
+ */
+static ClusterUndoPathIntent cached_fd_intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
 static int cached_fd = -1;
 static bool cached_fd_exit_registered = false;
 
@@ -90,17 +98,18 @@ fd_cache_on_exit(int code, Datum arg)
  *	NOT close the returned fd (the cache owns it).
  */
 static int
-get_segment_fd(uint32 segment_id, uint8 owner_instance)
+get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance)
 {
 	char path[MAXPGPATH];
 	int fd;
 
-	if (cached_fd >= 0 && cached_fd_segment == segment_id && cached_fd_owner == owner_instance)
+	if (cached_fd >= 0 && cached_fd_segment == segment_id && cached_fd_owner == owner_instance
+		&& cached_fd_intent == intent)
 		return cached_fd; /* hit */
 
 	fd_cache_close(); /* miss: drop the stale fd first */
 
-	if (cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path)) != 0)
+	if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0)
@@ -110,6 +119,7 @@ get_segment_fd(uint32 segment_id, uint8 owner_instance)
 	cached_fd = fd;
 	cached_fd_segment = segment_id;
 	cached_fd_owner = owner_instance;
+	cached_fd_intent = intent;
 	if (!cached_fd_exit_registered) {
 		before_shmem_exit(fd_cache_on_exit, (Datum)0);
 		cached_fd_exit_registered = true;
@@ -129,7 +139,8 @@ cluster_undo_smgr_fd_cache_reset(void)
 
 
 bool
-cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *buf)
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+							 uint32 block_no, char *buf)
 {
 	int fd;
 	off_t offset;
@@ -139,7 +150,7 @@ cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance, uint32 blo
 	if (buf == NULL || block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return false;
 
-	fd = get_segment_fd(segment_id, owner_instance);
+	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
@@ -152,8 +163,8 @@ cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance, uint32 blo
 
 
 bool
-cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
-							  const char *buf, bool do_fsync)
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+							  uint32 block_no, const char *buf, bool do_fsync)
 {
 	int fd;
 	off_t offset;
@@ -163,7 +174,7 @@ cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 bl
 	if (buf == NULL || block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return false;
 
-	fd = get_segment_fd(segment_id, owner_instance);
+	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
@@ -195,8 +206,8 @@ cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 bl
  *   must stay inside block 0 (BLCKSZ).
  */
 bool
-cluster_undo_smgr_read_header_bytes(uint32 segment_id, uint8 owner_instance, uint32 offset,
-									char *buf, uint32 len)
+cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
+									uint8 owner_instance, uint32 offset, char *buf, uint32 len)
 {
 	int fd;
 	ssize_t nread;
@@ -204,7 +215,7 @@ cluster_undo_smgr_read_header_bytes(uint32 segment_id, uint8 owner_instance, uin
 	if (buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
 		return false;
 
-	fd = get_segment_fd(segment_id, owner_instance);
+	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
@@ -214,8 +225,9 @@ cluster_undo_smgr_read_header_bytes(uint32 segment_id, uint8 owner_instance, uin
 }
 
 bool
-cluster_undo_smgr_write_header_bytes(uint32 segment_id, uint8 owner_instance, uint32 offset,
-									 const char *buf, uint32 len)
+cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
+									 uint8 owner_instance, uint32 offset, const char *buf,
+									 uint32 len)
 {
 	int fd;
 	ssize_t nwritten;
@@ -223,7 +235,7 @@ cluster_undo_smgr_write_header_bytes(uint32 segment_id, uint8 owner_instance, ui
 	if (buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
 		return false;
 
-	fd = get_segment_fd(segment_id, owner_instance);
+	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
@@ -253,7 +265,8 @@ cluster_undo_smgr_create_segment_file(uint32 segment_id, uint8 owner_instance)
 		int ret;
 		int fd;
 
-		ret = cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path));
+		ret = cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance),
+										owner_instance, segment_id, path, sizeof(path));
 		if (ret != 0)
 			return -2;
 
@@ -272,7 +285,7 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 {
 	int fd;
 
-	fd = get_segment_fd(segment_id, owner_instance);
+	fd = get_segment_fd(cluster_undo_intent_for_owner(owner_instance), segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 

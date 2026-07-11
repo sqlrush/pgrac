@@ -269,6 +269,24 @@ extern void cluster_rtvis_verdict_note_inadmissible(void);
 extern uint64 cluster_rtvis_underivable_failclosed_count(void);
 extern void cluster_rtvis_note_underivable_failclosed(void);
 
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
+extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);
+extern void cluster_vis_freshref_verdict_note_resolved(void);
+extern void cluster_vis_freshref_verdict_note_failclosed(void);
+
+/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters.
+ * A1 (D4-8) adds the complete-scan refusal attribution pair. */
+extern uint64 cluster_undo_authority_serve_hit_count(void);
+extern uint64 cluster_undo_authority_fail_closed_count(void);
+extern uint64 cluster_undo_authority_epoch_stale_reject_count(void);
+extern uint64 cluster_undo_authority_scan_incomplete_reject_count(void);
+extern uint64 cluster_undo_authority_multi_match_reject_count(void);
+extern void cluster_undo_authority_note_serve_hit(void);
+extern void cluster_undo_authority_note_failclosed(void);
+extern void cluster_undo_authority_note_epoch_stale_reject(void);
+extern void cluster_undo_authority_note_scan_incomplete_reject(void);
+extern void cluster_undo_authority_note_multi_match_reject(void);
 /* spec-7.1 D0/D5: 53R97 per-leg attribution (3 server legs + 3 requester
  * legs; see the ClusterCRShared field comment for each leg's meaning). */
 extern uint64 cluster_vis53r97_leg_invalid_scn_refuse_count(void);

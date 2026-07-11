@@ -496,11 +496,29 @@ void
 cluster_backup_lmon_tick(void)
 {}
 
+/* spec-5.22e D5-2 stub: LmonMain also ticks the undo horizon publisher and
+ * registers its msg type (cluster_undo_horizon_ic.c not linked here). */
+void cluster_undo_horizon_lmon_tick(void);
+void
+cluster_undo_horizon_lmon_tick(void)
+{}
+void cluster_undo_horizon_register_ic_msg_types(void);
+void
+cluster_undo_horizon_register_ic_msg_types(void)
+{}
+
 /* spec-6.2 D7 stub: cluster_lmon_shmem_init registers Smart Fusion durable
  * gossip IC msg types; this standalone unit binary does not link
  * cluster_sf_dep.o. */
 void
 cluster_sf_dep_register_ic_msg_types(void)
+{}
+
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq) stub:
+ * cluster_lmon_shmem_init registers the PEER_CAPS_REPLY msg type; this
+ * standalone unit binary does not link cluster_ic_tier1.o. */
+void
+cluster_ic_tier1_register_caps_reply_msg_type(void)
 {}
 
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */

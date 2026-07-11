@@ -57,6 +57,7 @@
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server result ship */
 #include "cluster/cluster_backup.h" /* cluster_backup_register_ic_msg_types + lmon_tick (spec-6.5) */
+#include "cluster/cluster_undo_horizon.h" /* cluster_undo_horizon_register_ic_msg_types + lmon_tick (spec-5.22e D5-2) */
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
@@ -447,6 +448,27 @@ cluster_lmon_shmem_init(void)
 		if (!smart_fusion_registered) {
 			cluster_sf_dep_register_ic_msg_types();
 			smart_fusion_registered = true;
+		}
+	}
+	/* spec-5.22e D5-2: register the undo retention horizon report (LMON-only
+	 * producer; capability-gated per-peer p2p, never broadcast). */
+	{
+		static bool undo_horizon_registered = false;
+
+		if (!undo_horizon_registered) {
+			cluster_undo_horizon_register_ic_msg_types();
+			undo_horizon_registered = true;
+		}
+	}
+	/* spec-2.2 additive amendment (spec-5.22e D5 prereq): register the
+	 * PEER_CAPS_REPLY capability exchange (LMON-only producer; p2p,
+	 * capability-gated on the dialer's CAPS_REPLY_V1 HELLO bit). */
+	{
+		static bool caps_reply_registered = false;
+
+		if (!caps_reply_registered) {
+			cluster_ic_tier1_register_caps_reply_msg_type();
+			caps_reply_registered = true;
 		}
 	}
 }
@@ -1276,6 +1298,15 @@ LmonMain(void)
 				cluster_tt_status_hint_drain_outbound();
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
 				cluster_backup_lmon_tick();
+			/* spec-5.22e D5-2: publish this node's undo retention horizon
+			 * report per-peer (capability-gated; internally rate-limited to
+			 * one send per lmon_main_loop_interval).  Deliberately NOT
+			 * producer-gated behind a lazy duty: the report is the
+			 * cluster-wide retention brake's liveness signal, and an idle
+			 * node's silence stalls every peer's recycling (the fold treats
+			 * a missing report as STALLED, never as consent).  Time-based
+			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
+			cluster_undo_horizon_lmon_tick();
 
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
@@ -1908,6 +1939,15 @@ LmonMain(void)
 				cluster_tt_status_hint_drain_outbound();
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
 				cluster_backup_lmon_tick();
+			/* spec-5.22e D5-2: publish this node's undo retention horizon
+			 * report per-peer (capability-gated; internally rate-limited to
+			 * one send per lmon_main_loop_interval).  Deliberately NOT
+			 * producer-gated behind a lazy duty: the report is the
+			 * cluster-wide retention brake's liveness signal, and an idle
+			 * node's silence stalls every peer's recycling (the fold treats
+			 * a missing report as STALLED, never as consent).  Time-based
+			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
+			cluster_undo_horizon_lmon_tick();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB.
 			 * PGRAC: spec-7.2 D1 — TTL/time-based, floor-driven. */

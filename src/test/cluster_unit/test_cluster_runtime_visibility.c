@@ -27,6 +27,7 @@
 #include "cluster/cluster_gcs_block.h" /* undo-fetch tag + auth trailer (CP2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_undo_segment.h" /* fake TT header blocks (CP3) */
+#include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (D4-6) */
 
 #include "unit_test.h"
 
@@ -257,6 +258,43 @@ UT_TEST(test_ttproof_committed_is_evidence_not_verdict)
 				 CLUSTER_VIS_TT_PROOF_COMMITTED);
 }
 
+/* spec-5.22c/5.22f Hardening (root-cause-#1 integration review, #1) --
+ * "recycled-ref-disguised-as-fresh".  A slot recycled and reused by the SAME
+ * raw xid bytes but a BUMPED wrap, carrying a COMMITTED stamp for a DIFFERENT
+ * commit, still classifies COMMITTED: the scan matches on xid and REPORTS the
+ * slot's current wrap/scn -- it does NOT compare against the ref's expected
+ * wrap (it has none to compare).  So a single-block COMMITTED proof is EVIDENCE
+ * only; the anti-ABA belongs to the caller, applied downstream (D4
+ * complete-scan uniqueness, or the CP5 verdict leg's wrap-suspect gate -- see
+ * test_cluster_tt_durable test_wrap_suspect_below_horizon_unreliable_is_suspect
+ * and the C1b routing pinned by t/365 L4 / t/359 L3).  This case (same xid,
+ * bumped wrap) is distinct from the recycled DIFFERENT-xid -> NONE case pinned
+ * by test_cluster_undo_verdict U12: here the proof is COMMITTED but the
+ * reported scn/wrap are the RECYCLED commit's, so trusting them terminally
+ * would false-commit.  Pin the report-not-gate contract so no future change
+ * lets the fast leg conclude EXACT from a proof's COMMITTED. */
+UT_TEST(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	SCN scn = InvalidScn;
+	uint16 wrap = 0;
+
+	/* A fresh ref bound (xid 1000, wrap 5); the slot's wrap was bumped to 99 by
+	 * a whole-segment recycle, then the bytes reused by the same raw xid with a
+	 * COMMITTED stamp for an unrelated commit (scn 9999). */
+	set_slot(hdr, 4, 1000, 99, (uint8)TT_SLOT_COMMITTED, (SCN)9999);
+
+	/* Still COMMITTED (matches on xid), and it reports the CURRENT slot wrap
+	 * (99) and scn (9999) -- the recycled commit's, NOT the ref's (wrap 5).
+	 * The scan cannot self-detect the ABA; the caller must route to the verdict
+	 * leg so the wrap-suspect gate can refuse. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+													 &scn, &wrap),
+				 CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(wrap, 99);
+	UT_ASSERT_EQ((uint64)scn, 9999);
+}
+
 /* 0-match / ACTIVE / COMMITTED-without-scn: never a proof (user boundary:
  * a single fetched block's 0-match is NOT recycled/aborted evidence). */
 UT_TEST(test_ttproof_zero_match_active_invalid_scn)
@@ -302,6 +340,93 @@ UT_TEST(test_ttproof_ambiguity_and_garbage)
 	UT_ASSERT_EQ(cluster_vis_tt_block_positive_proof(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
 													 NULL, NULL),
 				 CLUSTER_VIS_TT_PROOF_NONE);
+}
+
+/* spec-5.22d A1 (D4-8): the scan CORE under the positive-proof wrapper.
+ * Same parse discipline, but nmatch is reported (the cross-segment
+ * aggregation needs it) and unparseable bytes are a distinct POISONED
+ * status (the aggregate must refuse-all, never skip-and-continue). */
+UT_TEST(test_tt_block_xid_scan_core)
+{
+	UndoSegmentHeaderData *hdr = mk_header(PROOF_SEG, PROOF_OWNER, TT_SLOTS_PER_SEGMENT);
+	int nmatch = -1;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+	SCN scn = (SCN)1;
+	uint16 wrap = 1;
+
+	/* OK + 0 matches: parseable block, no evidence; outs reset. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 3000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 0);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+
+	/* OK + unique COMMITTED: terminal, scn/wrap out. */
+	set_slot(hdr, 3, 1000, 5, (uint8)TT_SLOT_COMMITTED, (SCN)777);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(scn, (SCN)777);
+	UT_ASSERT_EQ(wrap, 5);
+
+	/* OK + unique ABORTED: terminal. */
+	set_slot(hdr, 9, 2000, 2, (uint8)TT_SLOT_ABORTED, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_ABORTED);
+	UT_ASSERT_EQ(wrap, 2);
+
+	/* OK + unique ACTIVE: found but NOT terminal (in-doubt) — nmatch says
+	 * "evidence lives here", proof says "not provable". */
+	set_slot(hdr, 12, 2500, 1, (uint8)TT_SLOT_ACTIVE, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2500,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 1);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+
+	/* OK + 2 matches inside one block (RECYCLABLE residue counts). */
+	set_slot(hdr, 7, 1000, 4, (uint8)TT_SLOT_RECYCLABLE, (SCN)555);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(nmatch, 2);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+
+	/* POISONED: header identity mismatch (segment / owner), count over. */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG + 1, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER + 1, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT + 1;
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 1000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+
+	/* POISONED: a garbage status byte anywhere poisons the whole block,
+	 * whatever xid is asked. */
+	set_slot(hdr, 40, 4000, 1, (uint8)7, InvalidScn);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER, 2000,
+											   &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	set_slot(hdr, 40, 0, 0, (uint8)TT_SLOT_UNUSED, InvalidScn);
+
+	/* POISONED: caller-bug inputs refuse-all (NULL block / invalid xid). */
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(NULL, PROOF_SEG, PROOF_OWNER, 1000, &nmatch, &proof,
+											   &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(proof_block.data, PROOF_SEG, PROOF_OWNER,
+											   InvalidTransactionId, &nmatch, &proof, &scn, &wrap),
+				 CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
 }
 
 /* Header identity mismatches: not provably the asked-for TT -> refuse. */
@@ -403,6 +528,180 @@ UT_TEST(test_undo_verdict_page_usable)
 	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
 	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED + 1;
 	UT_ASSERT_EQ(cluster_vis_undo_verdict_page_usable(&v, 1000), false);
+}
+
+/* spec-5.22d D4-6: structural validation of an AUTHORITY-served verdict page
+ * (version 2 provenance).  Same field discipline as the v1 table above, with
+ * two deliberate tightenings: ONLY version 2 is evidence (a v1 owner-served
+ * page can never masquerade as an authority serve, and vice versa — the v1
+ * gate's strict ==1 already refuses version 2, pinned above), and the
+ * BELOW_HORIZON kind is refused outright — the authority block0 prove has no
+ * horizon leg, so a bound-carrying page is malformed by construction. */
+UT_TEST(test_undo_authority_verdict_page_usable)
+{
+	ClusterGcsUndoVerdictPage v;
+
+	/* Baseline good authority EXACT page. */
+	memset(&v, 0, sizeof(v));
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+	v.xid_echo = 1000;
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v.commit_scn = 777;
+	v.horizon_scn = InvalidScn;
+	v.wrap = 5;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+
+	/* NULL page / invalid asked xid. */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(NULL, 1000), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, InvalidTransactionId), false);
+
+	/* An owner-served v1 page is NOT authority evidence. */
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+
+	/* Wrong magic / echo (incl. poisoned high word). */
+	v.magic = 0xDEADBEEF;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1001), false);
+	v.xid_echo = (((uint64)1) << 32) + 1000;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.xid_echo = 1000;
+
+	/* Non-zero reserved bytes poison the page. */
+	v.reserved_0[5] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.reserved_0[5] = 0;
+	v.reserved_1[2] = 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.reserved_1[2] = 0;
+
+	/* EXACT kind-field consistency: needs commit_scn, refuses a horizon. */
+	v.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = 777;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* BELOW_HORIZON: refused OUTRIGHT on the authority leg (no horizon leg
+	 * in the block0 prove), even in its v1-legal shape. */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+	v.commit_scn = InvalidScn;
+	v.horizon_scn = 500;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.horizon_scn = InvalidScn;
+
+	/* ABORTED: carries no scn of any kind. */
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	v.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.commit_scn = InvalidScn;
+
+	/* Unknown kinds refuse. */
+	v.verdict = 0;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED + 1;
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), false);
+}
+
+/* spec-5.22d D4-6 (user 8.A amend #1): the authority reply is evidence ONLY
+ * under the full binding — the reply sender IS the elected authority and the
+ * reply epoch IS the stamped request epoch, exactly.  The transport's HC100
+ * >= check is a general pre-filter and deliberately NOT sufficient here; the
+ * epoch±1 rows pin the strict equality. */
+UT_TEST(test_undo_authority_reply_binding)
+{
+	/* the one admissible shape */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 42, 42), true);
+
+	/* wrong sender: a peer that is not the elected authority (incl. the
+	 * dead owner's id and a negative junk id) is never evidence */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(2, 3, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(4, 3, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(-1, 3, 42, 42), false);
+
+	/* invalid elected authority: nothing can bind to it */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, -1, 42, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(-1, -1, 42, 42), false);
+
+	/* epoch must match EXACTLY: ±1 both refuse (HC100 >= would admit +1) */
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 41, 42), false);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_reply_binding_ok(3, 3, 43, 42), false);
+}
+
+/* spec-5.22d D4-6: serve-side page fill -> requester-side accept closes the
+ * loop over one prove result, so the two wire ends can never disagree about
+ * what an authority page carries.  fill refuses every kind the block0 prove
+ * cannot legitimately produce (UNKNOWN, BOUND, IN_PROGRESS). */
+UT_TEST(test_undo_authority_verdict_page_fill_roundtrip)
+{
+	ClusterGcsUndoVerdictPage v;
+	ClusterUndoVerdictResult r;
+	ClusterUndoVerdictResult mapped;
+
+	/* COMMITTED_EXACT roundtrip: scn + wrap survive, version is 2. */
+	memset(&v, 0xAA, sizeof(v)); /* poison: fill must overwrite everything */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = 777;
+	r.wrap = 5;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), true);
+	UT_ASSERT_EQ(v.version, CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, 777);
+	UT_ASSERT_EQ(mapped.wrap, 5);
+
+	/* ABORTED roundtrip: no scn of any kind on the page. */
+	memset(&v, 0xAA, sizeof(v));
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_ABORTED;
+	r.commit_scn = InvalidScn;
+	r.wrap = 3;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), true);
+	UT_ASSERT_EQ(cluster_vis_undo_authority_verdict_page_usable(&v, 1000), true);
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_ABORTED);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, (long long)InvalidScn);
+
+	/* fill refuses what the prove cannot produce: UNKNOWN / BOUND /
+	 * IN_PROGRESS never become a wire page. */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+	r.commit_scn = 500;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+
+	/* EXACT without a valid scn is not fillable (nothing to prove). */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, &r), false);
+
+	/* fill guards its inputs: NULL page / invalid xid. */
+	r.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = 777;
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(NULL, 1000, &r), false);
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, InvalidTransactionId, &r), false);
+	UT_ASSERT_EQ(cluster_undo_authority_verdict_page_fill(&v, 1000, NULL), false);
+
+	/* the mapper refuses a v1 owner-served page (wrong provenance). */
+	memset(&v, 0, sizeof(v));
+	v.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	v.xid_echo = 1000;
+	v.verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	v.commit_scn = 777;
+	v.horizon_scn = InvalidScn;
+	mapped = cluster_undo_verdict_from_authority_wire_page(&v, 1000);
+	UT_ASSERT_EQ(mapped.kind, (uint8)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((long long)mapped.commit_scn, (long long)InvalidScn);
 }
 
 /* spec-7.1 D3-b: structural validation of a batched multixact member-verdict
@@ -561,7 +860,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(23);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -573,11 +872,16 @@ main(void)
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
+	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);
 	UT_RUN(test_ttproof_ambiguity_and_garbage);
+	UT_RUN(test_tt_block_xid_scan_core);
 	UT_RUN(test_ttproof_header_mismatch);
 	UT_RUN(test_undo_auth_trailer_roundtrip);
 	UT_RUN(test_undo_verdict_page_usable);
+	UT_RUN(test_undo_authority_verdict_page_usable);
+	UT_RUN(test_undo_authority_reply_binding);
+	UT_RUN(test_undo_authority_verdict_page_fill_roundtrip);
 	UT_RUN(test_undo_multi_verdict_page_usable);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_DONE();

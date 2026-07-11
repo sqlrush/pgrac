@@ -623,6 +623,19 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 
 	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
 		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
+	/* spec-5.22d D4-6: protocol capability, not runtime policy — this binary
+	 * understands kind-4 / version-2 regardless of any GUC, so advertise
+	 * unconditionally (the serve side's GUC gate refuses at run time). */
+	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1;
+	/* spec-5.22e D5-2: same protocol-capability discipline for the undo
+	 * horizon report msg_type. */
+	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1;
+	/* spec-2.2 additive amendment (spec-5.22e D5 prereq): META capability --
+	 * "I can receive PEER_CAPS_REPLY".  Same unconditional discipline; the
+	 * test-only suppression GUC simulates an old binary (no bit on the
+	 * wire, so a new acceptor never sends this node a reply). */
+	if (!cluster_ic_suppress_caps_reply)
+		capabilities |= PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

@@ -114,10 +114,12 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
-#include "cluster/cluster_cssd.h"		  /* cluster_cssd_status (spec-2.5 D12) */
-#include "cluster/cluster_stats.h"		  /* cluster_stats_status (spec-1.14 D12) */
-#include "cluster/cluster_undo_cleaner.h" /* dump_undo_cleaner (spec-3.13 D1) */
-#include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
+#include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
+#include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
+#include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_undo_horizon.h" /* D5-5 brake observability (spec-5.22e) */ /* dump_undo_cleaner (spec-3.13 D1) */
+#include "cluster/cluster_undo_gcs.h" /* undo GCS grant-plane counters (spec-5.22b D2-6) */
+#include "cluster/cluster_lmon.h"	  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "catalog/pg_control.h" /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
@@ -405,6 +407,16 @@ dump_ic(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ic", "tier1_listener_port",
 				 fmt_int32((int32)cluster_ic_tier1_get_listener_port()));
 	}
+
+	/*
+	 * spec-2.2 additive amendment (spec-5.22e D5 prereq): per-peer learned
+	 * HELLO capability records (generation-bound) + the PEER_CAPS_REPLY
+	 * validation-drop counter.  The directed capability matrix TAP legs and
+	 * rolling-upgrade compat legs read these.
+	 */
+	emit_row(rsinfo, "ic", "peer_capabilities", cluster_sf_peer_capabilities_summary());
+	emit_row(rsinfo, "ic", "caps_reply_reject_count",
+			 psprintf(UINT64_FORMAT, cluster_sf_caps_reply_reject_count()));
 }
 
 static void
@@ -2272,7 +2284,7 @@ dump_gcs(ReturnSetInfo *rsinfo)
 /*
  * dump_undo -- spec-3.7 D10 + D6 真激活 counter observability.
  *
- *	Emits 53 rows under category='undo': 5 record-level allocator counters
+ *	Emits 59 rows under category='undo': 5 record-level allocator counters
  *	(spec-3.7) + 4 segment-lifecycle counters (spec-3.8) + 3 commit-fsync +
  *	4 smgr counters (the latter 7 added by the perf-merge undo
  *	instrumentation) + 5 durable TT slot counters (spec-3.11 D8) + 5 retention
@@ -2282,7 +2294,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
  *	6 cleaner/reuse counters (spec-3.13 D6) +
  *	4 checkpoint-writeback boundary counters (spec-4.8ab D7:
  *	undo_buf_held_wal / undo_buf_held_evidence / undo_buf_boundary_violations /
- *	undo_buf_remote_evidence_holds).  Backs
+ *	undo_buf_remote_evidence_holds) +
+ *	6 owner-as-master undo GCS grant-plane counters (spec-5.22b D2-6:
+ *	grant_shared / grant_exclusive / ship_bytes / invalidate_notify /
+ *	remaster_deny / local_fast_path).  Backs
  *	cluster_tap t/213 + t/214 + t/219 L2 + t/220 + t/270 verification + perf
  *	class 7 baseline tracking.
  */
@@ -2678,6 +2693,25 @@ dump_undo(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo", "tt_slot_wrap_retired_count",
 			 fmt_int64((int64)cluster_tt_slot_wrap_retired_count()));
 
+	/* spec-5.22e D5-5: cluster retention brake observability (32 -> 40 rows).
+	 * Stall/abort/reject/admission counters + the last proven floor gauge +
+	 * the previously accessor-less below-horizon inventory counter. */
+	emit_row(rsinfo, "undo", "horizon_stall_count",
+			 fmt_int64((int64)cluster_undo_horizon_stall_count()));
+	emit_row(rsinfo, "undo", "horizon_peer_stale_count",
+			 fmt_int64((int64)cluster_undo_horizon_peer_stale_count()));
+	emit_row(rsinfo, "undo", "horizon_pass_abort_count",
+			 fmt_int64((int64)cluster_undo_horizon_pass_abort_count()));
+	emit_row(rsinfo, "undo", "horizon_wire_reject_count",
+			 fmt_int64((int64)cluster_undo_horizon_wire_reject_count()));
+	emit_row(rsinfo, "undo", "horizon_admission_refuse_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_refuse_count()));
+	emit_row(rsinfo, "undo", "horizon_last_floor_scn",
+			 fmt_int64((int64)cluster_undo_horizon_last_floor()));
+	emit_row(rsinfo, "undo", "horizon_peer_reports", cluster_undo_horizon_peer_reports_summary());
+	emit_row(rsinfo, "undo", "cleaner_header_tt_slots_below_horizon",
+			 fmt_int64((int64)cluster_undo_cleaner_header_tt_slots_below_horizon()));
+
 	/* spec-4.8ab D7: 4 checkpoint-writeback boundary counters (grown into the
 	 * existing undo buffer pool region -- D0 finding-3, no new region). */
 	emit_row(rsinfo, "undo", "undo_buf_held_wal",
@@ -2688,6 +2722,22 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_buf_get_boundary_violation_count()));
 	emit_row(rsinfo, "undo", "undo_buf_remote_evidence_holds",
 			 fmt_int64((int64)cluster_undo_buf_get_remote_evidence_hold_count()));
+
+	/* spec-5.22b D2-6: owner-as-master undo GCS grant-plane counters (6).
+	 * Register-ahead of the D6 consumer -> read 0 at rest, but the surface is
+	 * present + queryable now. */
+	emit_row(rsinfo, "undo", "undo_gcs_grant_shared_count",
+			 fmt_int64((int64)cluster_undo_gcs_grant_shared_count()));
+	emit_row(rsinfo, "undo", "undo_gcs_grant_exclusive_count",
+			 fmt_int64((int64)cluster_undo_gcs_grant_exclusive_count()));
+	emit_row(rsinfo, "undo", "undo_gcs_ship_bytes",
+			 fmt_int64((int64)cluster_undo_gcs_ship_bytes()));
+	emit_row(rsinfo, "undo", "undo_gcs_invalidate_notify_count",
+			 fmt_int64((int64)cluster_undo_gcs_invalidate_notify_count()));
+	emit_row(rsinfo, "undo", "undo_gcs_remaster_deny_count",
+			 fmt_int64((int64)cluster_undo_gcs_remaster_deny_count()));
+	emit_row(rsinfo, "undo", "undo_gcs_local_fast_path_count",
+			 fmt_int64((int64)cluster_undo_gcs_local_fast_path_count()));
 }
 
 /*
@@ -2782,6 +2832,23 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcomes. */
+	emit_row(rsinfo, "cr", "vis_freshref_verdict_resolved_count",
+			 fmt_int64((int64)cluster_vis_freshref_verdict_resolved_count()));
+	emit_row(rsinfo, "cr", "vis_freshref_verdict_failclosed_count",
+			 fmt_int64((int64)cluster_vis_freshref_verdict_failclosed_count()));
+	/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve outcomes. */
+	emit_row(rsinfo, "cr", "undo_authority_serve_hit_count",
+			 fmt_int64((int64)cluster_undo_authority_serve_hit_count()));
+	emit_row(rsinfo, "cr", "undo_authority_fail_closed_count",
+			 fmt_int64((int64)cluster_undo_authority_fail_closed_count()));
+	emit_row(rsinfo, "cr", "undo_authority_epoch_stale_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_epoch_stale_reject_count()));
+	/* spec-5.22d A1 (D4-8): complete-scan refusal attribution. */
+	emit_row(rsinfo, "cr", "undo_authority_scan_incomplete_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_scan_incomplete_reject_count()));
+	emit_row(rsinfo, "cr", "undo_authority_multi_match_reject_count",
+			 fmt_int64((int64)cluster_undo_authority_multi_match_reject_count()));
 	/* spec-7.1 D0/D5: 53R97 per-leg attribution (census + error-closure dial). */
 	emit_row(rsinfo, "cr", "vis53r97_leg_invalid_scn_refuse_count",
 			 fmt_int64((int64)cluster_vis53r97_leg_invalid_scn_refuse_count()));

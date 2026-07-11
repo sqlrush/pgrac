@@ -1,0 +1,261 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_undo_gcs.c
+ *	  Shared-undo block GCS integration -- owner-as-master routing +
+ *	  coherent grant / PI data plane (spec-5.22b D2).
+ *
+ *	  D2-1 (this increment) ships owner-as-master routing: the two routing
+ *	  predicates that keep undo resources off the GRD/GCS hash-master path
+ *	  (their authority lives at the owning instance).  The grant / PI /
+ *	  serve-gate / physical-migration legs (D2-2 .. D2-5) land here as they
+ *	  are implemented.
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_undo_gcs.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-5.22b-undo-block-gcs-integration.md (D2, §2.1)
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "cluster/cluster_mode.h" /* cluster_node_id */
+#include "cluster/cluster_undo_gcs.h"
+#include "cluster/cluster_undo_resid.h"
+
+/*
+ * cluster_undo_block_lookup_master -- owner-as-master routing entry.
+ *
+ *	The master of an undo resource is the encoded owner_node (D1's
+ *	cluster_undo_resid_master), never a shard hash: the undo authority lives
+ *	at the owning instance.  This is the single legal master-lookup entry for
+ *	the undo class; cluster_grd_lookup_master / cluster_gcs_lookup_master fail
+ *	closed on it (D1-5 guard, 53R9Q).
+ */
+int32
+cluster_undo_block_lookup_master(const ClusterResId *undo_resid)
+{
+	Assert(undo_resid != NULL);
+	Assert(cluster_undo_resid_is_undo(undo_resid));
+
+	return cluster_undo_resid_master(undo_resid);
+}
+
+/*
+ * cluster_undo_block_master_is_self -- local fast-path routing gate.
+ *
+ *	true iff this instance owns the undo resource (owner_node ==
+ *	cluster_node_id), so the owner can read/write its own undo without a
+ *	network grant.  The owner-incarnation epoch self-check that L364 requires
+ *	before actually serving from the local fast path is applied on the
+ *	grant/acquire path (D2-3), where the co-sampled live-authority triple is
+ *	available; this predicate is the pure node-id half.
+ */
+bool
+cluster_undo_block_master_is_self(const ClusterResId *undo_resid)
+{
+	Assert(undo_resid != NULL);
+	Assert(cluster_undo_resid_is_undo(undo_resid));
+
+	return cluster_undo_resid_master(undo_resid) == cluster_node_id;
+}
+
+/*
+ * cluster_undo_path_uses_shared_root -- pure physical-root decision (D2-2).
+ *
+ *	The single source of truth that both undo path builders consult:
+ *	cluster_undo_path_resolve (runtime segment I/O) and the redo write
+ *	surface in cluster_undo_xlog.c.  Keeping the decision here (not
+ *	duplicated in each builder) is what prevents own-instance undo
+ *	split-brain -- runtime reading the shared copy while redo stamps the
+ *	local copy (Hardening v1.0.1 裁决 A).
+ */
+bool
+cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode, bool coherence_on)
+{
+	/*
+	 * P1-3 hard contract: a dead-origin materialized copy (recovery rebuilt
+	 * it in the local DataDir) NEVER migrates to the shared root, in any
+	 * mode.  Redirecting it would send dead-origin resolve / CR reads to an
+	 * empty shared path (spec-5.22b §3.6, R1).
+	 */
+	if (intent == CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL)
+		return false;
+
+	/*
+	 * spec-5.22d D4-3: RUNTIME_SHARED (own live undo) and
+	 * RUNTIME_SHARED_AUTHORITY_BLOCK0 (a survivor authority reading a dead
+	 * owner's durable block0 from shared storage) both resolve to the shared
+	 * cluster_fs root under the SAME arm gate.  MATERIALIZED_LOCAL already
+	 * returned above; any other value is a caller bug.
+	 */
+	Assert(intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		   || intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0);
+
+	/*
+	 * The shared migration is armed only under a declared multi-node
+	 * deployment (peer_mode) AND cluster.undo_gcs_coherence on.  Either off
+	 * => local DataDir, so both the own-instance runtime path (D2, 裁决 A)
+	 * and the dead-owner authority block0 serve (D4) land inert at the
+	 * default.
+	 */
+	return peer_mode && coherence_on;
+}
+
+/*
+ * cluster_undo_grant_armed -- pure coherence gate (D2-3).
+ *
+ *	See cluster_undo_gcs.h for the contract.  Mirrors the physical-migration
+ *	gate above (peer_mode && coherence_on): the grant/PI data plane and the
+ *	physical migration arm together, so a peer never grants against undo bytes
+ *	that were never migrated to the shared root.
+ */
+bool
+cluster_undo_grant_armed(bool coherence_on, bool peer_mode)
+{
+	return coherence_on && peer_mode;
+}
+
+/*
+ * cluster_undo_grant_admissible -- pure reader S-grant admissibility (D2-3).
+ *
+ *	See cluster_undo_gcs.h for the two-dimension fail-closed contract.  The two
+ *	admit conditions are ANDed; any single failure returns false so the caller
+ *	keeps the pre-existing 53R97 fail-closed boundary (Rule 8.A -- this only
+ *	widens "admit when provable", never "admit when unprovable").
+ */
+bool
+cluster_undo_grant_admissible(const ClusterResId *undo_resid, uint32 expected_generation,
+							  ClusterLiveAuthority auth, uint64 local_epoch, XLogRecPtr anchor_lsn)
+{
+	if (undo_resid == NULL)
+		return false;
+
+	/*
+	 * (1) Segment-generation anti-ABA (D1 §3.3 dim 1).  A recycled segment
+	 * reuses (undo_segment, block_no) for different content, so a generation
+	 * mismatch means the reference is stale -- fail closed, never a match.
+	 */
+	if (!cluster_undo_resid_generation_matches(undo_resid, expected_generation))
+		return false;
+
+	/*
+	 * (2) Owner-incarnation epoch + durable coverage (D-i2/D-i3).  This used
+	 * to reuse cluster_vis_live_authority_covers_policy, but spec-7.1a moved
+	 * that VISIBILITY gate into the SCN domain (demand vs the co-sampled
+	 * authority_scn) -- the D2 grant wire carries no SCN co-sample, and the
+	 * spec-5.22b §3.2 grant contract is epoch-identity + live-authority
+	 * presence + LSN coverage of the version anchor.  Keep that contract
+	 * verbatim (the pre-7.1a policy body): a different membership epoch
+	 * cannot be trusted, a reply with no live authority (invalid hwm) is
+	 * never guessed, and the durable high-water must cover the version
+	 * anchor (Invalid at the block level -> epoch + presence only).
+	 */
+	if (auth.origin_epoch != local_epoch)
+		return false;
+	if (XLogRecPtrIsInvalid(auth.live_hwm_lsn))
+		return false;
+	if (auth.live_hwm_lsn < anchor_lsn)
+		return false;
+
+	return true;
+}
+
+/*
+ * cluster_undo_grant_reader_pcm_mode / _transition -- reader lock contract
+ * (D2-3).  The reader takes the undo block in PCM S mode via the read-first
+ * N->S transition (the legal read-first pair; cluster_pcm_lock owns and tests
+ * the transition-legality table).  The writer/cleaner X path is D2-4.
+ */
+PcmState
+cluster_undo_grant_reader_pcm_mode(void)
+{
+	return PCM_LOCK_MODE_S;
+}
+
+PcmLockTransition
+cluster_undo_grant_reader_pcm_transition(void)
+{
+	return PCM_TRANS_N_TO_S;
+}
+
+/*
+ * cluster_undo_grant_writer_pcm_mode / _transition -- writer/cleaner lock
+ * contract (D2-4).  The owner takes its own undo block in PCM X via the
+ * write-first N->X transition before mutating/recycling it.  See
+ * cluster_undo_gcs.h for the contract; cluster_pcm_lock owns and tests the
+ * transition-legality table.
+ */
+PcmState
+cluster_undo_grant_writer_pcm_mode(void)
+{
+	return PCM_LOCK_MODE_X;
+}
+
+PcmLockTransition
+cluster_undo_grant_writer_pcm_transition(void)
+{
+	return PCM_TRANS_N_TO_X;
+}
+
+/*
+ * cluster_undo_pi_discard_covered -- pure PI-discard coverage judge (D2-4).
+ *
+ *	Delegates to the shipped cross-node coverage primitive
+ *	cluster_pcm_pi_discard_covered (SCN-only, scn_local order).  This undo
+ *	domain wrapper exists to (a) name the owner-write "did my durable copy
+ *	obsolete peer PIs" decision in the undo data plane and (b) pin the
+ *	Q-D24-2 resolution at the type boundary: the judge is SCN-only, the LSN
+ *	redo-coverage dimension is discharged by the collect (both-watermark
+ *	clear) + retire_if_durable, never re-judged here.  See cluster_undo_gcs.h.
+ */
+bool
+cluster_undo_pi_discard_covered(SCN wm_scn, SCN written_scn)
+{
+	return cluster_pcm_pi_discard_covered(wm_scn, written_scn);
+}
+
+/*
+ * cluster_undo_pi_discard_notify_target -- pure PI-discard targeting (D2-4).
+ *
+ *	A peer `node` receives a PI_DISCARD iff its bit is set in `holders`, it is
+ *	not `self_node` (the owner is the writer, never a PI holder of its own
+ *	block), and its id is a valid 32-wide bitmap slot.  Any out-of-range id
+ *	fails closed (never index the bitmap out of bounds).  See
+ *	cluster_undo_gcs.h.
+ */
+bool
+cluster_undo_pi_discard_notify_target(uint32 holders, int32 node, int32 self_node)
+{
+	if (node < 0 || node >= 32)
+		return false; /* invalid slot -> never a target (no OOB shift) */
+	if (node == self_node)
+		return false; /* owner never notifies itself */
+	return (holders & ((uint32)1u << (uint32)node)) != 0;
+}
+
+/*
+ * cluster_undo_serve_allowed -- pure owner-as-master remaster serve-gate (D2-5).
+ *
+ *	See cluster_undo_gcs.h for the full contract.  A live-owner undo grant may
+ *	proceed only when the owner is CSSD-alive AND no remaster episode is fencing
+ *	its shard; either doubt fails closed so the caller denies with
+ *	DENIED_RESOURCE_RECOVERING (dead-owner SERVE is D4, never a D2 false-resolve
+ *	-- Rule 8.A/8.B).  Undo folds into the reconfig episode by READING its state
+ *	(this predicate's two inputs), never by joining the hash-shard master map
+ *	(undo is owner-as-master, D1-5).
+ */
+bool
+cluster_undo_serve_allowed(bool owner_alive, bool remaster_in_progress)
+{
+	return owner_alive && !remaster_in_progress;
+}

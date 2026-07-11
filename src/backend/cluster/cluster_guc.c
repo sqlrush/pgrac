@@ -120,6 +120,11 @@ bool cluster_past_image = false;
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * resolution via undo-block CF fetch (default OFF = 53R97). */
 bool cluster_crossnode_runtime_visibility = false;
+/* spec-5.22b D2-2: shared-undo GCS coherence master switch (default OFF =
+ * undo stays on the local DataDir, inert -- 6.12i unmastered fetch path; ON =
+ * own-instance runtime AND redo undo migrate to the shared cluster_fs root
+ * under owner-as-master GCS grant/PI).  PGC_SIGHUP. */
+bool cluster_undo_gcs_coherence = false;
 /* spec-6.15 D1: xid space segmentation -- striped allocation (default
  * OFF = vanilla dense per-node xid allocation). */
 bool cluster_xid_striping = false;
@@ -175,7 +180,8 @@ bool cluster_smgr_user_relations = false;
  */
 bool cluster_shared_catalog = false;
 int cluster_oid_lease_size = 8192;
-int cluster_shmem_max_regions = 80; /* spec-5.56: 64 -> 80 (cr relgen region; restore margin) */
+int cluster_shmem_max_regions
+	= 96; /* spec-5.22e: 80 -> 96 (undo horizon region; restore margin); spec-5.56: 64 -> 80 */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
@@ -408,6 +414,10 @@ int cluster_fence_audit_log = 1;		   /* CLUSTER_FENCE_AUDIT_LOG_LOG */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
 int cluster_interconnect_connect_timeout_ms = 5000;
 int cluster_interconnect_recv_timeout_ms = 30000;
+
+/* spec-2.2 additive amendment (spec-5.22e D5 prereq) -- test-only
+ * old-binary simulation for the PEER_CAPS_REPLY capability exchange. */
+bool cluster_ic_suppress_caps_reply = false;
 
 /* spec-2.4 D9 -- chunked framing + TCP KeepAlive tuning (PGC_POSTMASTER). */
 int cluster_interconnect_payload_max_bytes = 64 * 1024 * 1024; /* 64 MB */
@@ -1022,6 +1032,31 @@ check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * check_cluster_undo_gcs_coherence -- GUC check_hook for
+ *	cluster.undo_gcs_coherence (spec-5.22b D2-2).
+ *
+ *	Turning the shared-undo data plane ON physically migrates own-instance
+ *	runtime + redo undo onto the shared cluster_fs root, so it REQUIRES
+ *	cluster.shared_data_dir to name that root.  Reject the ON transition when
+ *	the root is unset: a clear config-time error beats a runtime read that has
+ *	to fail closed with a generic SQLSTATE.  (The runtime path additionally
+ *	fails closed -- an unresolvable shared path yields the 53R97 visibility
+ *	fail-close, never a bogus local fallback -- so this hook is operability,
+ *	not the correctness backstop.)
+ */
+static bool
+check_cluster_undo_gcs_coherence(bool *newval, void **extra, GucSource source)
+{
+	if (*newval && (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')) {
+		GUC_check_errdetail(
+			"cluster.undo_gcs_coherence requires cluster.shared_data_dir to name the shared "
+			"cluster_fs mount (the same root used by shared_catalog and the recovery anchor).");
+		return false;
+	}
+	return true;
+}
+
 static bool
 check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 {
@@ -1626,6 +1661,28 @@ cluster_init_guc(void)
 		&cluster_crossnode_runtime_visibility, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
+	 * cluster.undo_gcs_coherence -- spec-5.22b D2 master switch for the
+	 * shared-undo block data plane.  OFF (default): undo segments stay on the
+	 * local DataDir and cross-instance undo reads take the 6.12i unmastered
+	 * fetch path (fresh ref => 53R97) -- byte-identical to pre-D2, a safe
+	 * rollback surface.  ON: own-instance runtime AND redo undo writes migrate
+	 * to the shared cluster_fs root (cluster.shared_data_dir), and undo blocks
+	 * become owner-as-master GCS resources (grant / PI land in D2-3/D2-4).
+	 * Gating physical migration on this switch (not merely peer-mode) keeps
+	 * runtime and redo writes consistent -- both move only when it is on, so a
+	 * default deployment never splits runtime-shared vs redo-local
+	 * (Hardening v1.0.1 裁决 A).  PGC_SIGHUP: flippable for the D6 end-to-end
+	 * validation window; a default-ON flip is a separate decision after D3-D6.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.undo_gcs_coherence",
+		gettext_noop("Enable the shared-undo block GCS data plane (spec-5.22b)."),
+		gettext_noop("Off keeps undo on the local data dir and cross-instance undo "
+					 "fail-closed (SQLSTATE 53R97).  Requires cluster.shared_data_dir when on."),
+		&cluster_undo_gcs_coherence, false, PGC_SIGHUP, 0, check_cluster_undo_gcs_coherence, NULL,
+		NULL);
+
+	/*
 	 * cluster.xid_striping -- spec-6.15 D1 (AD-012 exception 10 xid
 	 * space segmentation).  When on, this node only issues 32-bit xids
 	 * congruent to its declared node slot modulo 16, making the xid
@@ -2170,7 +2227,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 80, CLUSTER_SHMEM_MIN_REGIONS, 256,
+							&cluster_shmem_max_regions, 96, CLUSTER_SHMEM_MIN_REGIONS, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -2828,6 +2885,23 @@ cluster_init_guc(void)
 										 "timeout windows."),
 							&cluster_interconnect_connect_timeout_ms, 5000, 1000, 60000,
 							PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only
+	 * old-binary simulation for the PEER_CAPS_REPLY capability exchange.
+	 * With it on, this node's HELLO omits the CAPS_REPLY_V1 meta bit and
+	 * its acceptor never sends PEER_CAPS_REPLY -- exactly the two visible
+	 * behaviors of a binary that predates the amendment.  Consumed by LMON,
+	 * so PGC_SIGHUP (postgresql.conf + reload); a session-level SET could
+	 * never reach the process that builds HELLOs.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ic_suppress_caps_reply",
+		gettext_noop("Test-only: simulate a pre-CAPS_REPLY binary on this node."),
+		gettext_noop("Suppresses the CAPS_REPLY_V1 HELLO capability bit and the "
+					 "accept-side PEER_CAPS_REPLY send.  Rolling-upgrade compat "
+					 "tests use it; production leaves it off."),
+		&cluster_ic_suppress_caps_reply, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.interconnect_recv_timeout_ms",
 							gettext_noop("Tier1 IC per-peer recv read deadline in milliseconds."),

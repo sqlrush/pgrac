@@ -177,6 +177,37 @@ typedef struct ClusterCRShared {
 	 */
 	pg_atomic_uint64 rtvis_underivable_failclosed_count;
 	/*
+	 * spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters.  A
+	 * fresh ref (local_xid == raw_xid, origin != self) that missed the overlay
+	 * and was resolved by the D3 cross-node verdict (classify_ref_guts D6
+	 * branch): resolved = a terminal COMMITTED/ABORTED verdict consumed
+	 * (the L1 root-cause-#1 hard assert lands here, proving the fresh-ref path
+	 * ran rather than an overlay / ordinary-propagation hit); failclosed = a
+	 * STALE integrity mismatch or an UNKNOWN verdict kept 53R97.
+	 */
+	pg_atomic_uint64 vis_freshref_verdict_resolved_count;
+	pg_atomic_uint64 vis_freshref_verdict_failclosed_count;
+	/*
+	 * spec-5.22d D4-4: dead/absent-owner authority block0 serve outcomes.
+	 * serve_hit = self-as-authority served a terminal verdict off the dead
+	 * owner's shared block0 (the D4-8 L1 hard assert lands here, proving the
+	 * Route B serve ran rather than a materialized-copy read); fail_closed =
+	 * the precision chain refused (peer/no authority, epoch moved, block0
+	 * unreadable, or no slot proof) and the caller kept 53R97;
+	 * epoch_stale_reject (D4-5) = the specific epoch axis of a refusal (the
+	 * claim's reconfig epoch no longer is the current one) -- bumped IN
+	 * ADDITION to fail_closed, so fail_closed stays the total-refusal count
+	 * (D4-8 L3 asserts the axis, not just the total).
+	 */
+	pg_atomic_uint64 undo_authority_serve_hit_count;
+	pg_atomic_uint64 undo_authority_fail_closed_count;
+	pg_atomic_uint64 undo_authority_epoch_stale_reject_count;
+	/* spec-5.22d A1 (D4-8): complete-scan refusal attribution — the durable
+	 * segment-set enumeration/parse was incomplete (refuse-all), or the set
+	 * held more than one match for the asked xid (ambiguity). */
+	pg_atomic_uint64 undo_authority_scan_incomplete_reject_count;
+	pg_atomic_uint64 undo_authority_multi_match_reject_count;
+	/*
 	 * spec-7.1 D0/D5: 53R97 per-leg attribution.  Every fail-closed refusal
 	 * on the cross-instance read path is attributed to the leg that produced
 	 * it, so the census (D0 before / D4 after) can prove each leg's zeroing
@@ -314,6 +345,13 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_fence_refused_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
+		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_epoch_stale_reject_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_scan_incomplete_reject_count, 0);
+		pg_atomic_init_u64(&CRShared->undo_authority_multi_match_reject_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_invalid_scn_refuse_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_zero_match_refuse_count, 0);
 		pg_atomic_init_u64(&CRShared->vis53r97_leg_srv_other_refuse_count, 0);
@@ -495,6 +533,59 @@ cluster_rtvis_note_underivable_failclosed(void)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
 }
 
+/* PGRAC: spec-5.22f D6-3 — fresh-remote-ITL-ref widening outcome bumps
+ * (classify_ref_guts, backend context). */
+void
+cluster_vis_freshref_verdict_note_resolved(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis_freshref_verdict_resolved_count, 1);
+}
+
+void
+cluster_vis_freshref_verdict_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->vis_freshref_verdict_failclosed_count, 1);
+}
+
+/* PGRAC: spec-5.22d D4-4 — dead-owner authority block0 serve bumps
+ * (cluster_runtime_visibility.c precision chain, backend context). */
+void
+cluster_undo_authority_note_serve_hit(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_serve_hit_count, 1);
+}
+
+void
+cluster_undo_authority_note_failclosed(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_fail_closed_count, 1);
+}
+
+void
+cluster_undo_authority_note_epoch_stale_reject(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_epoch_stale_reject_count, 1);
+}
+
+/* PGRAC: spec-5.22d A1 (D4-8) — complete-scan refusal attribution. */
+void
+cluster_undo_authority_note_scan_incomplete_reject(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_scan_incomplete_reject_count, 1);
+}
+
+void
+cluster_undo_authority_note_multi_match_reject(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->undo_authority_multi_match_reject_count, 1);
+}
 /* PGRAC: spec-7.1 D0/D5 — 53R97 per-leg attribution bumps (see the struct
  * comment for each leg's meaning; server legs run in LMS drain context,
  * requester legs in backend context — all plain atomic adds). */
@@ -631,6 +722,20 @@ CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_denied_count,
 					cr_server_multi_verdict_denied_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_fence_refused_count, cr_server_fence_refused_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
+/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
+CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count,
+					vis_freshref_verdict_resolved_count)
+CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_failclosed_count,
+					vis_freshref_verdict_failclosed_count)
+/* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */
+CR_COUNTER_ACCESSOR(cluster_undo_authority_serve_hit_count, undo_authority_serve_hit_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_fail_closed_count, undo_authority_fail_closed_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_epoch_stale_reject_count,
+					undo_authority_epoch_stale_reject_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_scan_incomplete_reject_count,
+					undo_authority_scan_incomplete_reject_count)
+CR_COUNTER_ACCESSOR(cluster_undo_authority_multi_match_reject_count,
+					undo_authority_multi_match_reject_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_invalid_scn_refuse_count,
 					vis53r97_leg_invalid_scn_refuse_count)
 CR_COUNTER_ACCESSOR(cluster_vis53r97_leg_zero_match_refuse_count,

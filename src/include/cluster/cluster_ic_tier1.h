@@ -223,6 +223,13 @@ extern bool cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd);
 extern bool cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd);
 
 /*
+ * spec-2.2 additive amendment (spec-5.22e D5 prereq): register the
+ * PEER_CAPS_REPLY msg_type + dialer-side handler (LMON-only producer;
+ * p2p, never broadcast).  Called from LMON's phase-1 registration block.
+ */
+extern void cluster_ic_tier1_register_caps_reply_msg_type(void);
+
+/*
  * Send a HEARTBEAT message to a CONNECTED peer (no-op for non-CONNECTED).
  * Updates heartbeat_send_count + last_heartbeat_sent_at on DONE.
  *

@@ -1986,7 +1986,9 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						cluster_vis53r97_note_xmin_overlay_verdict_ask();
 						if (cluster_runtime_visibility_try_resolve_remote(
 								d1_origin, (uint32)res.ref.undo_segment_id, raw_xmin,
-								snapshot->read_scn, &d1_committed, &d1_scn, &d1_is_bound)) {
+								snapshot->read_scn,
+								false /* derived origin: keep the stripe self-check */,
+								&d1_committed, &d1_scn, &d1_is_bound)) {
 							if (!d1_committed) {
 								/* origin proved ABORTED -> this xmin was never
 								 * visible to any snapshot. */

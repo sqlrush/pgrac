@@ -302,6 +302,38 @@ extern void cluster_shared_fs_writeback(ClusterSharedFsHandle *handle, BlockNumb
 										BlockNumber nblocks);
 
 
+/* ----------
+ * Undo namespace on the shared root (spec-5.22b D2-2)
+ *
+ *	Undo segments are NOT RelFileLocator relations, so the RelFileLocator
+ *	vtable above cannot address them (see the shared-root sentinel note in
+ *	cluster_shared_fs_sharedfs.c: non-RelFileLocator shared files are reached
+ *	by resolving the SAME absolute path under cluster.shared_data_dir on every
+ *	node, exactly as the recovery anchor and CF authority do).  This resolver
+ *	is that namespace for undo: it builds an owner-partitioned undo segment
+ *	path under the shared root.  cluster_undo_path_resolve routes here only for
+ *	the CLUSTER_UNDO_PATH_RUNTIME_SHARED intent under peer-mode +
+ *	cluster.undo_gcs_coherence.
+ *
+ *	Returns 0 on success; -1 when the shared root is unset (fail-closed, so a
+ *	misconfigured deployment never resolves a bogus path) or on buffer
+ *	overflow.  Caller supplies buf with capacity >= MAXPGPATH.
+ * ----------
+ */
+extern int cluster_shared_fs_undo_path_resolve(uint8 owner_instance, uint32 segment_id, char *buf,
+											   size_t buf_size);
+
+/*
+ * cluster_shared_fs_undo_instance_dir_resolve -- resolve the owner's undo
+ *	instance DIRECTORY on the shared root (<shared_data_dir>/pg_undo/
+ *	instance_<owner-1>).  Unlike the local DataDir (where initdb pre-creates
+ *	pg_undo), the shared root has no pre-seeded undo tree, so the caller
+ *	pg_mkdir_p's this path before first use.  Returns 0 / -1 (unset root).
+ */
+extern int cluster_shared_fs_undo_instance_dir_resolve(uint8 owner_instance, char *buf,
+													   size_t buf_size);
+
+
 /*
  * Internal: built-in vtable instances exposed for cluster_shared_fs_init's
  * registration path and for cluster_unit linkage assertions.  Backend

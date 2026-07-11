@@ -183,7 +183,8 @@ tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, Tran
 
 	cluster_tt_durable_io_wait_start();
 
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
@@ -196,8 +197,8 @@ tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, Tran
 	slot.commit_scn = commit_scn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): no stale head */
 
-	if (!cluster_undo_smgr_write_header_bytes(segment_id, owner, off, (const char *)&slot,
-											  sizeof(slot))) {
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											  owner, off, (const char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
@@ -283,7 +284,8 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 
 	cluster_tt_durable_io_wait_start();
 
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
@@ -296,8 +298,8 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): cleared; 0x90 re-attaches */
 
-	if (!cluster_undo_smgr_write_header_bytes(segment_id, owner, off, (const char *)&slot,
-											  sizeof(slot))) {
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											  owner, off, (const char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
@@ -336,7 +338,8 @@ cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset, Transact
 
 	cluster_tt_durable_io_wait_start();
 
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
@@ -347,8 +350,8 @@ cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset, Transact
 	 * (xid, wrap); a recycled slot belongs to a newer owner -> leave untouched. */
 	if (slot.xid == xid && slot.wrap == wrap) {
 		slot.first_undo_block = first_undo_block;
-		if (!cluster_undo_smgr_write_header_bytes(segment_id, owner, off, (const char *)&slot,
-												  sizeof(slot))) {
+		if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+												  owner, off, (const char *)&slot, sizeof(slot))) {
 			cluster_tt_durable_io_wait_end();
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
@@ -375,7 +378,8 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false; /* segment absent / I/O -> miss (caller fail-closes) */
@@ -416,8 +420,8 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&first,
-											 sizeof(first))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&first, sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -436,8 +440,8 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	}
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&second,
-											 sizeof(second))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&second, sizeof(second))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -665,7 +669,8 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data)) {
+		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
+										  0, blockbuf.data)) {
 			/* absent segment -> sound skip; existing+unreadable -> incomplete. */
 			if (cluster_undo_segment_file_exists(owner, segment_id))
 				scan_complete = false;
@@ -763,7 +768,8 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 
 	/* Whole-block read mirrors the by-xid scan shape (one smgr surface). */
 	cluster_undo_cleaner_scan_wait_start();
-	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance), segment_id,
+									  owner_instance, 0, block.data)) {
 		cluster_undo_cleaner_scan_wait_end();
 		return false; /* absent / I/O: caller counts and moves on */
 	}

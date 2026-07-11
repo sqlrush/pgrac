@@ -243,6 +243,36 @@ typedef enum ClusterICPlane {
 #define PGRAC_IC_CLUSTER_NAME_MAX 24
 #define PGRAC_IC_HELLO_CAPABILITIES_OFFSET 36
 #define PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 ((uint32)0x00000001U)
+/* PGRAC: spec-5.22d D4-6 — this binary understands the kind-4 dead-owner
+ * AUTHORITY verdict request and the version-2 authority-served verdict page.
+ * A PROTOCOL capability: advertised unconditionally (unlike the GUC/tier-
+ * gated smart-fusion bit above) — whether the serve actually runs is the
+ * serve side's runtime GUC gate, which refuses with DENIED and the requester
+ * stays fail-closed.  A requester only routes kind 4 to a peer that
+ * advertised this bit; without it the authority leg fails closed (the
+ * election is NOT re-run against a different node). */
+#define PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 ((uint32)0x00000002U)
+/* PGRAC: spec-5.22e D5-2 — this binary registers PGRAC_IC_MSG_UNDO_HORIZON
+ * and publishes/consumes undo retention horizon reports.  A PROTOCOL
+ * capability, advertised unconditionally.  Send-side hard gate: a report is
+ * only sent to a peer whose CURRENT connection advertised this bit (an old
+ * peer treats the unregistered msg_type as a peer-level failure and closes
+ * the connection).  Fold-side: a required MEMBER peer without this bit
+ * stalls recycling (NOCAP) — never a fallback to local-horizon recycling
+ * (Q3'').  Capability state is connection-bound: cleared on peer close and
+ * only reinstated by the next HELLO (Q1' amend). */
+#define PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 ((uint32)0x00000004U)
+/* PGRAC: spec-2.2 additive amendment (spec-5.22e D5 prereq) — META
+ * capability: "this binary registers PGRAC_IC_MSG_PEER_CAPS_REPLY and can
+ * receive it".  Advertised unconditionally (suppressible only by the
+ * test-only cluster.ic_suppress_caps_reply old-binary simulation GUC).
+ * The acceptor sends PEER_CAPS_REPLY back to a verified dialer ONLY when
+ * the dialer's HELLO carried this bit, so an old binary is never sent a
+ * frame whose msg_type it would reject by closing the connection.  The
+ * active handshake sequence is unchanged (send HELLO -> CONNECTED, no
+ * wait): a missing reply just leaves the dialer's view of the peer's
+ * capabilities UNKNOWN, which every consumer treats as fail-closed. */
+#define PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 ((uint32)0x00000008U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

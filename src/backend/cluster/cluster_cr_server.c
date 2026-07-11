@@ -70,8 +70,10 @@
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_conf.h"			 /* CLUSTER_MAX_NODES (D4-6 owner range) */
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
+#include "cluster/cluster_undo_authority.h"	 /* authority lookup + block0 prove (D4-6) */
 #include "cluster/cluster_undo_record_api.h" /* tt_retention_rollover_count */
 #include "cluster/cluster_undo_smgr.h"		 /* cluster_undo_smgr_read_block */
 #include "cluster/cluster_write_fence.h"	 /* PGRAC: spec-7.3 D7 fence ×N gate */
@@ -240,6 +242,7 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 		slot->undo_segment_id = segment_id;
 		slot->undo_block_no = block_no;
 		slot->undo_xid = InvalidTransactionId;
+		slot->undo_owner = -1; /* D4-6: never inherit a recycled slot's owner */
 		memset(&slot->undo_auth, 0, sizeof(slot->undo_auth));
 
 		/* Publish the request fields before LMS can observe PENDING. */
@@ -254,20 +257,26 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 
 /*
  * cluster_lms_undo_verdict_submit — CONTROL-plane park (spec-6.12i D-i4 /
- * spec-6.15 D4).
+ * spec-6.15 D4 / spec-5.22d D4-6).
  *
- *	Park a complete-scan verdict request.  The asked-for xid rides the
- *	widened watermark carrier: any non-zero upper 32 bits or a non-normal
- *	32-bit value is a malformed carrier — refuse (the caller replies the
+ *	Park a complete-scan verdict request (kinds 2/3) or a kind-4 dead-owner
+ *	AUTHORITY verdict request.  The asked-for xid rides the widened
+ *	watermark carrier: any non-zero upper 32 bits or a non-normal 32-bit
+ *	value is a malformed carrier — refuse (the caller replies the
  *	fail-closed DENIED; the requester keeps 53R97, Rule 8.A).  The synthetic
- *	tag is validated for shape only; the verdict scan is complete over ALL
- *	self-owned segments, so the tag's segment does not scope the answer.
+ *	tag is validated for shape only; on kinds 2/3 the verdict scan is
+ *	complete over ALL self-owned segments (the tag's segment does not scope
+ *	the answer) and the owner carrier MUST be empty, on kind 4 the dead
+ *	OWNER is decoded from tag.relNumber (range-checked, never self — the
+ *	live-owner kinds answer own xids) and the serve-side triple check owns
+ *	all trust decisions.
  */
 bool
 cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 {
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
+	int32 wire_owner = -1;
 	uint64 carrier;
 
 	if (CrServerShared == NULL || fwd == NULL)
@@ -276,6 +285,17 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		return false;
 	if (!GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no))
 		return false;
+
+	if (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
+		/* kind 4: decode + range-check the owner carrier; a request naming
+		 * US as the (dead) owner is malformed — our own xids are answered
+		 * by the live-owner kinds, never by an authority detour. */
+		if (!GcsBlockUndoAuthorityFetchTagDecodeOwner(fwd->tag, &wire_owner))
+			return false;
+		if (wire_owner < 0 || wire_owner >= CLUSTER_MAX_NODES || wire_owner == cluster_node_id)
+			return false;
+	} else if (fwd->tag.relNumber != (RelFileNumber)0)
+		return false; /* owner-served kinds must leave the carrier empty */
 
 	carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
 	if (carrier > (uint64)PG_UINT32_MAX || !TransactionIdIsNormal((TransactionId)carrier))
@@ -301,6 +321,8 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		slot->undo_segment_id = segment_id;
 		slot->undo_block_no = block_no;
 		slot->undo_xid = (TransactionId)carrier;
+		slot->undo_authoritative = GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
+		slot->undo_owner = wire_owner; /* -1 on kinds 2/3; the dead owner on kind 4 */
 		memset(&slot->undo_auth, 0, sizeof(slot->undo_auth));
 
 		/* Publish the request fields before LMS can observe PENDING. */
@@ -430,7 +452,8 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 
 	/* Serve only SELF-owned undo: the owner derives from this node's own
 	 * id, never from the wire (a forged request cannot redirect the read). */
-	return cluster_undo_smgr_read_block(slot->undo_segment_id, (uint8)(cluster_node_id + 1),
+	return cluster_undo_smgr_read_block(cluster_undo_intent_for_owner((uint8)(cluster_node_id + 1)),
+										slot->undo_segment_id, (uint8)(cluster_node_id + 1),
 										slot->undo_block_no, slot->result_page);
 }
 
@@ -630,8 +653,14 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		return false;
 	}
 
-	/* spec-6.15 D4: only answer for provably-own xids (see banner). */
-	if (!cluster_xid_is_mine(xid)) {
+	/*
+	 * spec-6.15 D4: only answer for provably-own xids (see banner) -- UNLESS
+	 * the request is spec-5.22f D6-7 AUTHORITATIVE (origin chosen from the fresh
+	 * ref's physical ITL binding, so the requester already proved this is the
+	 * correct owner; the underivable own seed xid is answered over the durable-TT
+	 * + CLOG authority below, the positive proof unchanged).
+	 */
+	if (!slot->undo_authoritative && !cluster_xid_is_mine(xid)) {
 		cluster_vis53r97_note_srv_other();
 		return false;
 	}
@@ -664,7 +693,147 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		return false;
 	}
 
+	/*
+	 * Zero the full BLCKSZ wire page (the reply checksum covers it all) and
+	 * fill the verdict fields from the values the shared core just proved.
+	 * The master==self local verdict resolve (D3-4 fill_page) runs the SAME
+	 * lms_resolve_own_xid_verdict core, so the served and self answers over
+	 * one xid can never diverge (Rule 8.A).
+	 */
 	memset(slot->result_page, 0, BLCKSZ);
+	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	v->xid_echo = (uint64)xid;
+	v->verdict = verdict;
+	v->commit_scn = commit_scn;
+	v->horizon_scn = horizon_scn;
+	v->wrap = wrap;
+	return true;
+}
+
+/*
+ * lms_undo_authority_verdict_serve — LMS side of one kind-4 dead-owner
+ * AUTHORITY verdict slot (spec-5.22d D4-6).
+ *
+ *	WE are asked to serve a verdict about a DEAD owner's xid from that
+ *	owner's durable shared block0 — never from our own TT (the xid is not
+ *	ours).  The wire is never trusted: the spec-5.22d §2.4 triple check must
+ *	pass before a byte is answered —
+ *
+ *	  (a) request epoch == our CURRENT epoch (slot->epoch carries fwd.epoch,
+ *	      which the requester stamped from its current epoch; any reconfig
+ *	      since then invalidates the election the request was routed under);
+ *	  (b) re-derive: the elected authority for (owner, current epoch) is
+ *	      US (this implicitly re-proves the owner is dead-decided — a live
+ *	      or undecided owner never elects an authority);
+ *	  (c) the shared block0 prove passes (cluster_undo_authority_block0_
+ *	      prove — the SAME core the requester's self-authority leg runs, so
+ *	      the wire-served and self answers over one (owner, segment, xid)
+ *	      can never diverge, Rule 8.A; it re-checks the epoch axis, reads
+ *	      the owner's block0 under the AUTHORITY_BLOCK0 intent and demands
+ *	      the exact xid+wrap positive proof, bumping the undo_authority_*
+ *	      counters itself).
+ *
+ *	The reply page carries the version-2 AUTHORITY provenance (an old
+ *	requester's strict ==1 gate refuses it).  slot->undo_auth: origin_epoch
+ *	is our current epoch — the ship path copies it into hdr.epoch, which the
+ *	requester binds strictly == its stamped epoch (8.A amend); live_hwm_lsn
+ *	and tt_generation ride as ZERO — they describe an origin's OWN live TT
+ *	plane, which does not exist for a dead owner; the prove already
+ *	internalized generation/wrap coverage and the requester's authority leg
+ *	ignores both.
+ *
+ *	true = result_page holds the version-2 ClusterGcsUndoVerdictPage;
+ *	false = refuse (caller ships DENIED — requester keeps 53R97).  Runs
+ *	under the drain's PG_TRY: any throw becomes a refusal, never an LMS
+ *	exit.
+ */
+static bool
+lms_undo_authority_verdict_serve(ClusterLmsCrSlot *slot)
+{
+	ClusterGcsUndoVerdictPage *v = (ClusterGcsUndoVerdictPage *)slot->result_page;
+	TransactionId xid = slot->undo_xid;
+	uint64 cur_epoch;
+	int32 authority = -1;
+	ClusterUndoVerdictResult r;
+
+	if (!cluster_crossnode_runtime_visibility)
+		return false;
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	if (slot->undo_owner < 0 || slot->undo_owner == cluster_node_id)
+		return false;
+
+	/* (a) the request's epoch must still be OUR current epoch */
+	cur_epoch = cluster_epoch_get_current();
+	if (slot->epoch != cur_epoch)
+		return false;
+
+	/* (b) re-derive: the elected authority for (owner, cur) must be US */
+	if (cluster_undo_serve_authority_lookup(slot->undo_owner, cur_epoch, &authority)
+			!= CLUSTER_UNDO_AUTHORITY_OK
+		|| authority != cluster_node_id)
+		return false;
+
+	/* the reply's epoch carrier (see banner); hwm/tt_gen deliberately zero */
+	slot->undo_auth.origin_epoch = cur_epoch;
+	slot->undo_auth.live_hwm_lsn = 0;
+	slot->undo_auth.tt_generation = 0;
+
+	/* (c) shared block0 prove core (the D4-4 self leg's implementation) */
+	r = cluster_undo_authority_block0_prove(slot->undo_owner, slot->undo_segment_id, xid,
+											cur_epoch);
+
+	memset(slot->result_page, 0, BLCKSZ);
+	return cluster_undo_authority_verdict_page_fill(v, xid, &r);
+}
+
+/*
+ * cluster_lms_undo_verdict_fill_page -- resolve an OWN xid into a verdict page
+ * over the COMPLETE own durable TT (cluster_tt_slot_durable_resolve_by_xid)
+ * cross-checked against the OWN CLOG (AD-006: CLOG is the committed-ness
+ * authority; the TT carries commit_scn).  The caller has already zeroed the
+ * page buffer (origin: the full BLCKSZ wire page; D3-4 self: sizeof the
+ * struct) and owns any authority co-sampling; this fills only
+ * magic/version/xid_echo and the verdict taxonomy fields.  true = *v holds
+ * the verdict; false = refuse (in-doubt / ambiguous / not-own / unresolvable
+ * -> caller keeps the 53R97 fail-closed boundary, Rule 8.A).  Shared so the
+ * origin-served verdict and the master==self local verdict are byte-for-byte
+ * the same decision.
+ */
+bool
+cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+								   ClusterGcsUndoVerdictPage *v)
+{
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	/* spec-6.15 D4: only answer for provably-own xids (see banner) -- UNLESS the
+	 * caller is spec-5.22f D6-7 AUTHORITATIVE (physical-binding fresh ref), in
+	 * which case the durable-TT + CLOG core below is the authority for an
+	 * underivable own xid.  The derived (recycled) and master==self callers pass
+	 * false and keep the self-check. */
+	if (!authoritative && !cluster_xid_is_mine(xid))
+		return false;
+
+	/* One decision core for the served and self answers (Rule 8.A): the
+	 * spec-7.1 refactor moved the scan + C1b CLOG cross-check + invalid-scn
+	 * abort upgrade into lms_resolve_own_xid_verdict; this wrapper only
+	 * shapes the page.  Census attribution is the caller's (the self leg
+	 * keeps the rtvis counters; this core bumps none). */
+	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	case LMS_OWN_XID_PROVEN:
+	case LMS_OWN_XID_PROVEN_UPGRADE:
+		break;
+	default:
+		return false; /* refuse: caller keeps 53R97 fail-closed */
+	}
+
 	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
 	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
 	v->xid_echo = (uint64)xid;
@@ -839,7 +1008,11 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 					served = lms_undo_multi_verdict_serve(slot);
 					break;
 				case (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT:
-					served = lms_undo_verdict_serve(slot);
+					/* spec-5.22d D4-6: a verdict slot carrying a dead owner
+					 * is the kind-4 authority serve (block0 prove), never
+					 * the own-TT scan. */
+					served = slot->undo_owner >= 0 ? lms_undo_authority_verdict_serve(slot)
+												   : lms_undo_verdict_serve(slot);
 					break;
 				default:
 					served = lms_undo_fetch_serve(slot);
@@ -1114,6 +1287,10 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	slot.transition_id = fwd->transition_id;
 	slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 	slot.req_kind = (uint8)kind;
+	/* spec-5.22d D4-6: -1 = live-owner kinds; only a decoded kind-4 owner
+	 * carrier below may set it (memset left 0, which is a VALID node id —
+	 * never let it leak into the authority routing). */
+	slot.undo_owner = -1;
 
 	/*
 	 * PGRAC: spec-7.3 D7 — fence ×N.  A write-fenced node must not let block
@@ -1172,6 +1349,26 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 			= (carrier <= (uint64)PG_UINT32_MAX && TransactionIdIsNormal((TransactionId)carrier))
 				  ? (TransactionId)carrier
 				  : InvalidTransactionId;
+		/* spec-5.22f D6-7: the AUTHORITATIVE sub-flag widens the own-xid
+		 * gate on the serve side (same decode as the park path). */
+		slot.undo_authoritative = GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
+		/* spec-5.22d D4-6: kind-4 dead-owner AUTHORITY verdict — decode +
+		 * range-check the owner carrier exactly as the park path does; a
+		 * malformed or self-naming carrier leaves the xid Invalid so the
+		 * serve refuses (our own xids are answered by the live-owner
+		 * kinds, never by an authority detour). */
+		if (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
+			int32 wire_owner = -1;
+
+			if (!GcsBlockUndoAuthorityFetchTagDecodeOwner(fwd->tag, &wire_owner) || wire_owner < 0
+				|| wire_owner >= CLUSTER_MAX_NODES || wire_owner == cluster_node_id)
+				slot.undo_xid = InvalidTransactionId;
+			else
+				slot.undo_owner = wire_owner;
+		} else if (fwd->tag.relNumber != (RelFileNumber)0) {
+			/* owner-served kinds must leave the owner carrier empty */
+			slot.undo_xid = InvalidTransactionId;
+		}
 		break;
 	}
 	}

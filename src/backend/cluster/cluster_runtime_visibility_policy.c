@@ -34,6 +34,7 @@
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_scn.h"		  /* scn_time_cmp / SCN_VALID (spec-7.1a D3) */
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData, TTSlot */
+#include "cluster/cluster_undo_verdict.h" /* D3 verdict taxonomy + mappers */
 
 /*
  * cluster_vis_live_authority_covers_policy
@@ -90,13 +91,14 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
 }
 
 /*
- * cluster_vis_tt_block_positive_proof
+ * cluster_vis_tt_block_xid_scan
  *
- * CP3 positive-proof scan over a D-i1-fetched TT header block.  See the
- * header comment for the full proof discipline (positive proof only; 0-match
- * / multi-match / non-terminal / malformed all refuse).  The block bytes are
- * the origin's own shipped copy, so every refusal is a clean NONE — never an
- * elog — and the caller keeps the 53R97 fail-closed boundary.
+ * spec-5.22d A1 (D4-8): the scan CORE under cluster_vis_tt_block_positive_
+ * proof.  One parse discipline for both consumers — the CP3 single-block
+ * wrapper below and the dead-owner complete-scan prove (which aggregates
+ * nmatch across the owner's whole durable segment set and must treat any
+ * unparseable block as refuse-ALL, never skip-and-continue).  See the header
+ * for the contract.  Pure; no I/O, no elog.
  *
  * PROOF_COMMITTED is EVIDENCE, not a verdict (spec-7.1a hardening): durable
  * COMMITTED stamps land at pre-commit (2PC COMMIT PREPARED stamps before the
@@ -105,36 +107,42 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
  * C1b CLOG cross-check (the verdict leg); only PROOF_ABORTED may be consumed
  * directly (an abort stamp is terminal and irreversible).
  */
-ClusterVisTtProof
-cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,
-									uint8 expected_owner_instance, TransactionId xid,
-									SCN *out_commit_scn, uint16 *out_wrap)
+ClusterVisTtBlockScanStatus
+cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
+							  uint8 expected_owner_instance, TransactionId xid, int *out_nmatch,
+							  ClusterVisTtProof *out_proof, SCN *out_commit_scn, uint16 *out_wrap)
 {
 	const UndoSegmentHeaderData *hdr;
 	int nmatch = 0;
 	const TTSlot *match = NULL;
 
+	if (out_nmatch != NULL)
+		*out_nmatch = 0;
+	if (out_proof != NULL)
+		*out_proof = CLUSTER_VIS_TT_PROOF_NONE;
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
 	if (out_wrap != NULL)
 		*out_wrap = TT_WRAP_INVALID;
 
+	/* Caller-bug inputs are indistinguishable from unparseable evidence:
+	 * refuse-all, never guess. */
 	if (block == NULL || !TransactionIdIsNormal(xid))
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 	/*
 	 * Header identity sanity: the bytes must provably be the asked-for TT.
 	 * A mismatched segment_id / owner (raced segment reuse on the origin, a
 	 * stale cache pairing, a mis-routed reply) or an over-range slot count
-	 * means the scan below would not be evidence about `xid` — refuse.
+	 * means the scan below would not be evidence about `xid` — poisoned.
 	 */
 	hdr = (const UndoSegmentHeaderData *)block;
 	if (hdr->segment_id != expected_segment_id)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->owner_instance != expected_owner_instance)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->tt_slots_count > TT_SLOTS_PER_SEGMENT)
-		return CLUSTER_VIS_TT_PROOF_NONE;
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 	for (int i = 0; i < (int)hdr->tt_slots_count; i++) {
 		const TTSlot *slot = &hdr->tt_slots[i];
@@ -142,10 +150,10 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 		/*
 		 * Any status byte outside the known range poisons the whole block:
 		 * we cannot claim to have understood a TT whose slots we cannot
-		 * parse (this is a shipped COPY — refuse, never PANIC).
+		 * parse (refuse, never PANIC).
 		 */
 		if (slot->status > (uint8)TT_SLOT_RECYCLABLE)
-			return CLUSTER_VIS_TT_PROOF_NONE;
+			return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 		/* UNUSED carries no transaction; its xid bytes are placeholder. */
 		if (slot->status == (uint8)TT_SLOT_UNUSED)
@@ -162,24 +170,54 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 		}
 	}
 
-	if (nmatch != 1)
+	if (out_nmatch != NULL)
+		*out_nmatch = nmatch;
+
+	if (nmatch == 1) {
+		if (match->status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match->commit_scn)) {
+			if (out_proof != NULL)
+				*out_proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+			if (out_commit_scn != NULL)
+				*out_commit_scn = match->commit_scn;
+			if (out_wrap != NULL)
+				*out_wrap = match->wrap;
+		} else if (match->status == (uint8)TT_SLOT_ABORTED) {
+			if (out_proof != NULL)
+				*out_proof = CLUSTER_VIS_TT_PROOF_ABORTED;
+			if (out_wrap != NULL)
+				*out_wrap = match->wrap;
+		}
+		/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: found (nmatch=1) but
+		 * in-doubt — proof stays NONE. */
+	}
+	return CLUSTER_VIS_TT_BLOCK_SCAN_OK;
+}
+
+/*
+ * cluster_vis_tt_block_positive_proof
+ *
+ * CP3 positive-proof scan over a D-i1-fetched TT header block.  See the
+ * header comment for the full proof discipline (positive proof only; 0-match
+ * / multi-match / non-terminal / malformed all refuse).  The block bytes are
+ * the origin's own shipped copy, so every refusal is a clean NONE — never an
+ * elog — and the caller keeps the 53R97 fail-closed boundary.  Since
+ * spec-5.22d A1 a thin wrapper over the scan core above: POISONED and
+ * nmatch != 1 and non-terminal all collapse to NONE, byte-for-byte the
+ * pre-A1 behavior (the pre-A1 unit truth table passes unchanged).
+ */
+ClusterVisTtProof
+cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_id,
+									uint8 expected_owner_instance, TransactionId xid,
+									SCN *out_commit_scn, uint16 *out_wrap)
+{
+	int nmatch = 0;
+	ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+
+	if (cluster_vis_tt_block_xid_scan(block, expected_segment_id, expected_owner_instance, xid,
+									  &nmatch, &proof, out_commit_scn, out_wrap)
+		!= CLUSTER_VIS_TT_BLOCK_SCAN_OK)
 		return CLUSTER_VIS_TT_PROOF_NONE;
-
-	if (match->status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match->commit_scn)) {
-		if (out_commit_scn != NULL)
-			*out_commit_scn = match->commit_scn;
-		if (out_wrap != NULL)
-			*out_wrap = match->wrap;
-		return CLUSTER_VIS_TT_PROOF_COMMITTED;
-	}
-	if (match->status == (uint8)TT_SLOT_ABORTED) {
-		if (out_wrap != NULL)
-			*out_wrap = match->wrap;
-		return CLUSTER_VIS_TT_PROOF_ABORTED;
-	}
-
-	/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: not a terminal proof. */
-	return CLUSTER_VIS_TT_PROOF_NONE;
+	return proof;
 }
 
 /*
@@ -230,6 +268,270 @@ cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 	default:
 		return false; /* unknown kind: refuse, never guess */
 	}
+}
+
+/*
+ * cluster_undo_verdict_from_wire_page
+ *
+ * D3-1 pure mapper: a CP5 origin verdict page -> the five-value taxonomy.
+ * Fail-closed by construction: a page that does not structurally answer
+ * asked_xid (cluster_vis_undo_verdict_page_usable) yields UNKNOWN_FAIL_CLOSED,
+ * so the caller keeps the 53R97 boundary (Rule 8.A).  A BELOW_HORIZON page
+ * maps to COMMITTED_BOUND unconditionally -- the read_scn admissibility of
+ * that bound (requester leg (e)) needs scn_time_cmp and is applied by the
+ * D3-3 consumer, deliberately outside this dependency-free policy object (see
+ * cluster_vis_undo_verdict_page_usable NOTES).  Pure: no I/O, no elog.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
+									TransactionId asked_xid)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	/* Structural gate first: an unusable page is not evidence about the xid. */
+	if (!cluster_vis_undo_verdict_page_usable(v, asked_xid))
+		return r;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = (SCN)v->commit_scn;
+		r.wrap = v->wrap;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		/* Bound-only commit: kind == BOUND is itself the "never stamp the
+			 * scn as exact" marker.  The read_scn gate is the consumer's. */
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+		r.commit_scn = (SCN)v->horizon_scn;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	default:
+		/* page_usable() already fenced the kind range; defense in depth. */
+		return r;
+	}
+}
+
+/*
+ * cluster_vis_undo_authority_verdict_page_usable
+ *
+ * spec-5.22d D4-6 structural validation of an AUTHORITY-served verdict page
+ * (version 2 provenance).  Same field discipline as the v1 gate above with
+ * two deliberate tightenings: ONLY version 2 is evidence (the v1 gate's
+ * strict ==1 refuses version 2 and this gate refuses version 1, so neither
+ * provenance can masquerade as the other), and COMMITTED_BELOW_HORIZON is
+ * refused outright — the authority block0 prove has no horizon leg, so a
+ * bound-carrying page is malformed by construction.  Pure: no I/O, no elog.
+ */
+bool
+cluster_vis_undo_authority_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
+											   TransactionId asked_xid)
+{
+	if (v == NULL || !TransactionIdIsNormal(asked_xid))
+		return false;
+
+	if (v->magic != CLUSTER_GCS_UNDO_VERDICT_MAGIC
+		|| v->version != CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY)
+		return false;
+
+	if (v->xid_echo != (uint64)asked_xid)
+		return false;
+
+	for (size_t i = 0; i < sizeof(v->reserved_0); i++)
+		if (v->reserved_0[i] != 0)
+			return false;
+	for (size_t i = 0; i < sizeof(v->reserved_1); i++)
+		if (v->reserved_1[i] != 0)
+			return false;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		return SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	default:
+		/* incl. BELOW_HORIZON: not producible by the block0 prove — refuse */
+		return false;
+	}
+}
+
+/*
+ * cluster_vis_undo_authority_reply_binding_ok
+ *
+ * spec-5.22d D4-6 (8.A amend): an authority reply is evidence ONLY under the
+ * full binding — the reply sender IS the elected authority and the reply
+ * epoch IS the stamped request epoch, EXACTLY.  The transport's HC100 check
+ * admits hdr.epoch >= request_epoch (a general stale-reply pre-filter); on
+ * the authority leg a newer epoch means the election itself may have moved,
+ * so >= is deliberately not enough.  Pure.
+ */
+bool
+cluster_vis_undo_authority_reply_binding_ok(int32 sender_node, int32 authority_node,
+											uint64 reply_epoch, uint64 stamped_epoch)
+{
+	if (authority_node < 0 || sender_node < 0)
+		return false;
+	if (sender_node != authority_node)
+		return false;
+	return reply_epoch == stamped_epoch;
+}
+
+/*
+ * cluster_undo_authority_verdict_page_fill
+ *
+ * spec-5.22d D4-6 serve-side wire-page fill: one prove result -> one version
+ * 2 page, the exact inverse of the requester's authority gate above so the
+ * two wire ends can never disagree about what an authority page carries.
+ * Refuses every kind the block0 prove cannot legitimately produce (UNKNOWN /
+ * BOUND / IN_PROGRESS — the caller ships DENIED and the requester keeps the
+ * 53R97 fail-closed, Rule 8.A).  Zeroes the whole struct first, so a poison
+ * or stale byte can never leak onto the wire.  Pure.
+ */
+bool
+cluster_undo_authority_verdict_page_fill(struct ClusterGcsUndoVerdictPage *v, TransactionId xid,
+										 const ClusterUndoVerdictResult *r)
+{
+	if (v == NULL || r == NULL || !TransactionIdIsNormal(xid))
+		return false;
+
+	switch (r->kind) {
+	case (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT:
+		if (!SCN_VALID(r->commit_scn))
+			return false; /* an EXACT claim without a scn proves nothing */
+		break;
+	case (uint8)CLUSTER_UNDO_VERDICT_ABORTED:
+		break;
+	default:
+		return false;
+	}
+
+	memset(v, 0, sizeof(*v));
+	v->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	v->version = CLUSTER_GCS_UNDO_VERDICT_VERSION_AUTHORITY;
+	v->xid_echo = (uint64)xid;
+	v->commit_scn = InvalidScn;
+	v->horizon_scn = InvalidScn;
+	v->wrap = r->wrap;
+	if (r->kind == (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT) {
+		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+		v->commit_scn = (uint64)r->commit_scn;
+	} else
+		v->verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+	return true;
+}
+
+/*
+ * cluster_undo_verdict_from_authority_wire_page
+ *
+ * spec-5.22d D4-6 requester-side mapper: a version-2 AUTHORITY-served page
+ * -> the taxonomy.  Fail-closed by construction: a page that does not pass
+ * the authority structural gate (wrong provenance/version, smuggled bound,
+ * echo mismatch) yields UNKNOWN_FAIL_CLOSED so the caller keeps the 53R97
+ * boundary (Rule 8.A).  Pure: no I/O, no elog.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_authority_wire_page(const struct ClusterGcsUndoVerdictPage *v,
+											  TransactionId asked_xid)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	if (!cluster_vis_undo_authority_verdict_page_usable(v, asked_xid))
+		return r;
+
+	switch (v->verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = (SCN)v->commit_scn;
+		r.wrap = v->wrap;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	default:
+		/* the authority gate already fenced the kind range; defense in depth */
+		return r;
+	}
+}
+
+/*
+ * cluster_undo_verdict_from_block_proof
+ *
+ * D3-1 pure mapper: a CP3 single-block positive proof (an xid slot match on the
+ * shipped block0 bytes) -> the taxonomy.  COMMITTED carries the true commit SCN
+ * (EXACT); ABORTED is terminal; NONE is UNKNOWN_FAIL_CLOSED, which the
+ * orchestrator reads as "fall to the CP5 origin verdict", never as a terminal
+ * answer to the caller (Rule 8.A).  Pure.
+ *
+ * UNGATED (spec-5.22c/5.22f Hardening, root-cause-#1 review): this mapper takes
+ * COMMITTED at face value and passes the proof's wrap/scn straight through -- it
+ * has no horizon / expected-wrap / CLOG inputs and applies NO anti-ABA of its
+ * own.  A single-block COMMITTED proof is EVIDENCE, not a verdict: a recycled
+ * slot reused by the same xid reports a bumped wrap and an unrelated commit_scn
+ * (test_cluster_runtime_visibility recycled-same-xid case), and a durable
+ * COMMITTED stamp also lands at 2PC pre-commit, so a stamped-then-crashed xid is
+ * in-doubt.  It is therefore safe to reach ONLY behind a caller that already
+ * applied the anti-ABA + commit-finality: the D4 dead-owner authority
+ * complete-scan (uniqueness over the full durable set), or the CP5 origin
+ * verdict leg (own-CLOG cross-check + wrap-suspect gate).  The single-block
+ * fetch / fresh-ref fast leg MUST NOT call this for COMMITTED -- it breaks to
+ * the verdict leg (C1b, cluster_runtime_visibility.c).
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_block_proof(ClusterVisTtProof proof, SCN commit_scn, uint16 wrap)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	switch (proof) {
+	case CLUSTER_VIS_TT_PROOF_COMMITTED:
+		r.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		r.commit_scn = commit_scn;
+		r.wrap = wrap;
+		return r;
+
+	case CLUSTER_VIS_TT_PROOF_ABORTED:
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	case CLUSTER_VIS_TT_PROOF_NONE:
+	default:
+		return r;
+	}
+}
+
+/*
+ * cluster_undo_verdict_from_resolve
+ *
+ * D3-3 Amendment-2 folding point: collapse the runtime resolver's
+ * (ok, committed, commit_scn, is_bound) outcome into the taxonomy so the
+ * legacy is_bound boolean never escapes to a consumer.  is_bound maps to
+ * COMMITTED_BOUND (never COMMITTED_EXACT), so a switch that only handles
+ * EXACT falls to fail-closed on a bound -- a horizon bound is never stamped
+ * or cached as an exact commit SCN.  Pure.
+ */
+ClusterUndoVerdictResult
+cluster_undo_verdict_from_resolve(bool ok, bool committed, SCN commit_scn, bool is_bound)
+{
+	ClusterUndoVerdictResult r
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
+
+	if (!ok)
+		return r; /* fetch / covers / deny miss -> fail-closed */
+	if (!committed) {
+		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+	}
+	r.kind = is_bound ? CLUSTER_UNDO_VERDICT_COMMITTED_BOUND : CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	r.commit_scn = commit_scn;
+	return r;
 }
 
 /*

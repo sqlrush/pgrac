@@ -63,6 +63,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"			 /* cluster_storage_mode_enabled */
+#include "cluster/cluster_undo_horizon.h"	 /* cluster floor + fence (spec-5.22e D5-3) */
 #include "cluster/cluster_undo_retention.h"	 /* horizon (C17: once per pass) */
 #include "cluster/cluster_tt_slot.h"		 /* current TT segment (exclusion) */
 #include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
@@ -366,12 +367,76 @@ undo_cleaner_run_pass(void)
 	 * D2 (step 3): horizon ONCE per pass, BEFORE any seg->lock (C17).
 	 * With the retention gate GUC off there is nothing to pre-free —
 	 * alloc Pass-2 recycles immediately (C6) — so the pass only ticks.
+	 *
+	 * spec-5.22e D5-3: the pass input is no longer the bare local horizon
+	 * but the CLUSTER floor {scn, epoch}: the scn_time_cmp-min of the local
+	 * horizon and every required MEMBER peer's accepted report.  An empty
+	 * required set (single node / cold formation) folds to the local value
+	 * on today's path; any unproven required peer STALLS the pass — the
+	 * whole recycle stage (shmem TT GC included, Q8: one horizon input) is
+	 * skipped, never run against a floor we could not prove (rule 8.A /
+	 * Q3'': NO fallback to local recycling, whatever the stall reason).
+	 * The floor's epoch rides through the pass and is re-verified at every
+	 * mutation (F-D2 fence); a mid-pass bump aborts the pass immediately.
 	 */
 	memset(&stats, 0, sizeof(stats));
 	if (cluster_undo_retention_horizon_enabled) {
-		SCN horizon = cluster_undo_retention_horizon();
+		SCN local_horizon = cluster_undo_retention_horizon();
+		ClusterUndoHorizonFloor floor;
+		ClusterUndoHorizonStallReason stall_reason = CLUSTER_UNDO_HORIZON_STALL_NONE;
+		int32 stall_blame = -1;
+		bool stalled = false;
+		bool fence_aborted = false;
+		static bool stall_logged = false;
+		SCN horizon;
 
-		cluster_tt_slot_gc_current_pass(horizon, &stats);
+		{
+			ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+			uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+			uint64 fold_epoch;
+			int nviews;
+
+			nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+			if (!cluster_undo_horizon_required_members(required, &fold_epoch)) {
+				/* reconfig in flight: the member set would not hold still */
+				stalled = true;
+				stall_reason = CLUSTER_UNDO_HORIZON_STALL_EPOCH;
+			} else if (cluster_undo_horizon_cluster_floor(
+						   local_horizon, views, nviews, required, cluster_node_id, fold_epoch,
+						   (uint64)GetCurrentTimestamp(), (uint32)cluster_lmon_main_loop_interval,
+						   &floor, &stall_reason, &stall_blame)
+					   == CLUSTER_UNDO_HORIZON_FOLD_STALLED)
+				stalled = true;
+		}
+
+		if (stalled) {
+			cluster_undo_horizon_note_stall();
+			if (stall_blame >= 0 && stall_blame != cluster_node_id)
+				cluster_undo_horizon_note_peer_stale();
+			if (!stall_logged) {
+				stall_logged = true;
+				ereport(LOG,
+						(errmsg("cluster undo cleaner: recycle stalled, cluster horizon "
+								"unproven (reason \"%s\", node %d)",
+								cluster_undo_horizon_stall_reason_name(stall_reason), stall_blame),
+						 errhint("Recycling pauses until every MEMBER peer publishes a "
+								 "fresh horizon report at the current epoch. Undo segment "
+								 "pool may grow until then (53R9E at the hard cap).")));
+			}
+			goto pass_account; /* 只扫不收: skip the whole recycle stage */
+		}
+		if (stall_logged) {
+			stall_logged = false;
+			ereport(LOG, (errmsg("cluster undo cleaner: cluster horizon proven again; "
+								 "recycling resumes")));
+		}
+		horizon = floor.scn;
+		cluster_undo_horizon_note_floor(floor.scn);
+
+		if (!cluster_tt_slot_gc_current_pass(horizon, floor.epoch, &stats)) {
+			cluster_undo_horizon_note_pass_abort();
+			goto pass_account; /* F-D2: epoch moved mid-scan; abort the pass */
+		}
 
 		/*
 		 * D2-B + D3: walk this instance's rolled-away segment inventory,
@@ -435,9 +500,19 @@ undo_cleaner_run_pass(void)
 				if (cluster_undo_record_segment_commit_on_rollover)
 					cluster_undo_segment_advance_committed(cur);
 
-				if (cluster_undo_segment_advance_recyclable(cur, horizon)
-					== CLUSTER_SEG_RECYCLE_ADVANCED)
-					stats.segments_marked_recyclable++;
+				{
+					ClusterUndoSegTryRecycle rr
+						= cluster_undo_segment_advance_recyclable(cur, horizon, floor.epoch);
+
+					if (rr == CLUSTER_SEG_RECYCLE_EPOCH_CHANGED) {
+						/* F-D2: epoch moved inside the mutation lock; the
+						 * mutation did not run.  Abort the whole pass NOW. */
+						fence_aborted = true;
+						break;
+					}
+					if (rr == CLUSTER_SEG_RECYCLE_ADVANCED)
+						stats.segments_marked_recyclable++;
+				}
 			}
 
 			/*
@@ -446,9 +521,13 @@ undo_cleaner_run_pass(void)
 			 * is needed; same-process happens-before across passes).
 			 */
 			undo_cleaner_state->scan_resume_seg = seg;
+
+			if (fence_aborted)
+				cluster_undo_horizon_note_pass_abort();
 		}
 	}
 
+pass_account:
 	Assert(undo_cleaner_state != NULL);
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 	undo_cleaner_state->pass_count++;
@@ -602,6 +681,7 @@ UNDO_CLEANER_COUNTER_ACCESSOR(pass_count)
 UNDO_CLEANER_COUNTER_ACCESSOR(shmem_tt_slots_gcd)
 UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
 UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
+UNDO_CLEANER_COUNTER_ACCESSOR(header_tt_slots_below_horizon) /* spec-5.22e D5-5 */
 
 
 /* ============================================================

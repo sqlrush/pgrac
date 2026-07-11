@@ -63,6 +63,14 @@
 
 UT_DEFINE_GLOBALS();
 
+/*
+ * Self-node stub: cluster_undo_buf.o now derives the undo path intent via the
+ * cluster_undo_intent_for_owner inline (spec-5.22b D2-2), which reads
+ * cluster_node_id.  The buffer-pool unit exercises own-instance segments, so
+ * node 0 keeps every smgr call on the RUNTIME_SHARED (own) branch.
+ */
+int cluster_node_id = 0;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -217,7 +225,8 @@ static uint32 smgr_last_write_block = 0;
 static char smgr_last_write_byte0 = 0;
 
 bool
-cluster_undo_smgr_read_block(uint32 segment_id pg_attribute_unused(),
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
+							 uint32 segment_id pg_attribute_unused(),
 							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	smgr_read_calls++;
@@ -227,7 +236,8 @@ cluster_undo_smgr_read_block(uint32 segment_id pg_attribute_unused(),
 }
 
 bool
-cluster_undo_smgr_write_block(uint32 segment_id pg_attribute_unused(),
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused(),
+							  uint32 segment_id pg_attribute_unused(),
 							  uint8 owner_instance pg_attribute_unused(), uint32 block_no,
 							  const char *buf, bool do_fsync)
 {

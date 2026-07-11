@@ -43,13 +43,18 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
+#include "cluster/cluster_guc.h"				/* cluster_undo_gcs_coherence (D2-2) */
 #include "cluster/cluster_hw.h"					/* spec-5.7 D1 HW authority apply/encode */
+#include "cluster/cluster_mode.h"				/* cluster_peer_mode_enabled (D2-2) */
 #include "cluster/cluster_tt_status.h"			/* spec-3.16 D5 recovery counters */
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
+#include "cluster/cluster_undo_gcs.h"			/* shared-root decision (D2-2 裁决 A) */
 #include "cluster/cluster_undo_segment.h"		/* UNDO_SEGMENT_SIZE_BYTES */
-#include "cluster/storage/cluster_undo_alloc.h" /* header identity check (3.13 reuse redo) */
+#include "cluster/storage/cluster_shared_fs.h"	/* undo shared-root dir resolve (D2-2) */
+#include "cluster/storage/cluster_undo_alloc.h" /* path resolve + intent (3.13 reuse redo) */
 #include "cluster/storage/cluster_undo_buf.h"	/* spec-3.18 D2b write-back gate */
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "common/file_perm.h" /* pg_mkdir_p / pg_dir_create_mode (shared subdir, D2-2) */
 #include "miscadmin.h"
 #include "storage/bufpage.h"
 #include "storage/fd.h"
@@ -57,35 +62,27 @@
 
 
 /*
- * Build a path: $PGDATA/pg_undo/instance_<N>/seg_<segment_id>.dat
+ * Build the undo segment path for the REDO write surface.
  *
- *   Both encoder (cluster_undo_emit_segment_init) and decoder
- *   (cluster_undo_redo) use this layout.  pg_undo subdir is
- *   established by initdb (D4).  instance_<N> subdir is created
- *   on demand by cluster_undo_redo_segment_init (Stage 1.22 ships
- *   only instance_0 from initdb; redo path may need other instance
- *   subdirs on standbys / cross-instance crash recovery).
+ *   spec-5.22b D2-2 (Hardening v1.0.1 裁决 A): the redo write surface must
+ *   resolve to the SAME physical root as the runtime write surface, or an
+ *   own-instance segment would be read from the shared root (runtime) while
+ *   redo re-stamps the local copy -- own-instance undo split-brain (block-0
+ *   TT is WAL-redo-only, so a lost redo write on the shared copy is a
+ *   false-invisible 8.A hazard).  So this delegates to the ONE decision
+ *   source, cluster_undo_path_resolve: own redo (rec->instance == self) under
+ *   coherence resolves to the shared cluster_fs root; a foreign rec->instance
+ *   (dead-origin materialization rebuilt locally) resolves to the local
+ *   DataDir.  Callers pass cluster_undo_intent_for_owner(rec->instance).
  *
- *   Hardening v1.0.4 P1-1: directory naming uses cluster_node_id
- *   (= owner_instance - 1) so that single-node default
- *   (cluster_node_id = 0, owner_instance = 1) lands at instance_0/
- *   matching the initdb seed.  See cluster_undo_alloc.c
- *   cluster_undo_path_resolve docstring for full rationale.
- *
- *   Returns 0 on success, -1 on path-too-long.  Caller supplies
- *   buf with capacity >= MAXPGPATH.
+ *   Returns 0 on success, -1 on path-too-long / unset shared root (fail-
+ *   closed).  Caller supplies buf with capacity >= MAXPGPATH.
  */
 static int
-build_undo_segment_path(uint8 owner_instance, uint32 segment_id, char *buf, size_t buf_size)
+build_undo_segment_path(ClusterUndoPathIntent intent, uint8 owner_instance, uint32 segment_id,
+						char *buf, size_t buf_size)
 {
-	int ret;
-
-	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
-	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir,
-				   (unsigned)(owner_instance - 1), (unsigned)segment_id);
-	if (ret < 0 || (size_t)ret >= buf_size)
-		return -1;
-	return 0;
+	return cluster_undo_path_resolve(intent, owner_instance, segment_id, buf, buf_size);
 }
 
 
@@ -108,7 +105,28 @@ ensure_undo_instance_subdir(uint8 owner_instance)
 
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
-	/* directory uses cluster_node_id (= owner_instance - 1) per Hardening v1.0.4 P1-1 */
+	/*
+	 * spec-5.22b D2-2: own-instance redo under coherence materializes the
+	 * segment on the shared cluster_fs root, whose pg_undo/instance_<N> tree
+	 * is not seeded by initdb -- create the whole path (idempotent).  A
+	 * foreign owner (dead-origin materialization) stays on the local DataDir
+	 * (裁决 A), so only own redo under coherence takes the shared branch.
+	 */
+	if (cluster_undo_path_uses_shared_root(cluster_undo_intent_for_owner(owner_instance),
+										   cluster_peer_mode_enabled(),
+										   cluster_undo_gcs_coherence)) {
+		if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, path, sizeof(path)) != 0)
+			ereport(PANIC, (errmsg("undo shared instance subdir unresolved: owner_instance=%u "
+								   "(cluster.shared_data_dir unset)",
+								   (unsigned)owner_instance)));
+		if (pg_mkdir_p(path, pg_dir_create_mode) != 0 && errno != EEXIST)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not create undo shared instance subdir \"%s\": %m", path)));
+		return;
+	}
+
+	/* local DataDir: pg_undo seeded by initdb; single-level mkdir (P1-1 naming). */
 	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir,
 				   (unsigned)(owner_instance - 1));
 	if (ret < 0 || (size_t)ret >= sizeof(path))
@@ -633,7 +651,9 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 	hdr = (xl_cluster_undo_segment_init *)payload;
 	page_image = payload + sizeof(*hdr);
 
-	if (build_undo_segment_path(hdr->instance, hdr->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(hdr->instance), hdr->instance,
+								hdr->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", hdr->instance,
 							   hdr->segment_id)));
 
@@ -760,7 +780,9 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 		ereport(PANIC, (errmsg("TT slot commit redo: slot_offset %u out of range (max %d)",
 							   slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (build_undo_segment_path(instance, segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+								sizeof(path))
+		!= 0)
 		ereport(PANIC,
 				(errmsg("undo segment path too long: instance=%u seg=%u", instance, segment_id)));
 
@@ -889,7 +911,9 @@ cluster_undo_redo_tt_slot_abort(XLogReaderState *record)
 		ereport(PANIC, (errmsg("XLOG_UNDO_TT_SLOT_ABORT slot_offset %u out of range (max %d)",
 							   rec->slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
@@ -998,7 +1022,9 @@ cluster_undo_redo_tt_slot_set_head(XLogReaderState *record)
 		ereport(PANIC, (errmsg("XLOG_UNDO_TT_SLOT_SET_HEAD slot_offset %u out of range (max %d)",
 							   rec->slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
@@ -1094,7 +1120,9 @@ cluster_undo_redo_segment_recycle(XLogReaderState *record)
 							   XLogRecGetDataLen(record))));
 	rec = (xl_undo_segment_recycle *)XLogRecGetData(record);
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
@@ -1202,7 +1230,9 @@ cluster_undo_redo_segment_reuse(XLogReaderState *record)
 	rec = (xl_undo_segment_reuse *)XLogRecGetData(record);
 	image = XLogRecGetData(record) + sizeof(*rec);
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
@@ -1355,7 +1385,9 @@ cluster_undo_redo_block_write(XLogReaderState *record)
 	if (rec->block_no == 0)
 		ereport(PANIC, (errmsg("XLOG_UNDO_BLOCK_WRITE redo: block_no 0 is the segment header")));
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
@@ -1474,7 +1506,9 @@ cluster_undo_redo_block_write_multi(XLogReaderState *record)
 		ereport(PANIC,
 				(errmsg("XLOG_UNDO_BLOCK_WRITE_MULTI redo: block_no 0 is the segment header")));
 
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
+								rec->segment_id, path, sizeof(path))
+		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
 							   rec->segment_id)));
 
