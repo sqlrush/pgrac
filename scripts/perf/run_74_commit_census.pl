@@ -152,6 +152,13 @@ my $CS_STALE_N     = $ENV{CS_STALE_N} // 100;
 my $CS_E_ROUNDS    = $ENV{CS_E_ROUNDS} // 30;
 my $PGBENCH        = $ENV{PGBENCH} // 'pgbench';
 
+# Leg F (spec-7.4 D2) -- group-commit tuning matrix knobs.
+my @CS_F_DELAYS    = split /,/, ($ENV{CS_F_DELAYS}   // '10,25,50,100,200');
+my @CS_F_SIBLINGS  = split /,/, ($ENV{CS_F_SIBLINGS} // '5');
+my @CS_F_LADDER    = split /,/, ($ENV{CS_F_LADDER}   // '1,4,8,16,32');
+my $CS_F_PAIRS     = $ENV{CS_F_PAIRS} // 4;
+my $CS_F_SECS      = $ENV{CS_F_SECS}  // 3;
+
 my $REPO_ROOT = File::Spec->rel2abs("$FindBin::RealBin/../..");
 my $CS_OUT    = $ENV{CS_OUT}
   // File::Spec->catfile($REPO_ROOT, 'scripts', 'perf', 'results',
@@ -396,6 +403,142 @@ sub pgbench_commit_run
 	}
 	return () unless defined $tps && defined $xacts && $xacts > 0;
 	return ($tps + 0.0, $xacts, $end_ms);
+}
+
+# ----------
+# Leg F helpers (spec-7.4 D2) -- GUC set, pg_stat_wal fsync counting,
+# whole-transaction p99 via pgbench --log, and interleaved paired runs.
+# ----------
+sub set_guc
+{
+	my ($node, %g) = @_;
+	for my $k (sort keys %g)
+	{
+		$node->safe_psql('postgres', "ALTER SYSTEM SET $k = $g{$k}");
+	}
+	$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
+	return;
+}
+
+# pg_stat_wal snapshot: wal_write / wal_sync are the authoritative real
+# fsync counters (pgstat_wal.c:118-119).  Q6: xp wal_flush timing alone
+# cannot tell a real fsync drop from a follower's short XLogFlush.
+sub wal_stat
+{
+	my ($node) = @_;
+	my $row = $node->safe_psql('postgres',
+		'SELECT wal_write, wal_sync FROM pg_stat_wal');
+	my ($w, $s) = split /\|/, ($row // '0|0');
+	return { write => ($w // 0) + 0, sync => ($s // 0) + 0 };
+}
+
+# Stop a node that may have crashed mid-census.  A crashed node makes
+# PostgreSQL::Test::Cluster->stop call BAIL_OUT ("pg_ctl stop failed"), which
+# eval cannot trap; if the node is already dead we clear its pid so both this
+# call and the END teardown skip the failing pg_ctl stop.
+sub safe_stop
+{
+	my ($node) = @_;
+	return unless $node;
+	my $alive = eval { $node->safe_psql('postgres', 'SELECT 1'); 1 };
+	if ($alive) { eval { $node->stop }; }
+	else { $node->{_pid} = undef; }
+	return;
+}
+
+# Commit workload window that also captures whole-transaction latency
+# percentiles from pgbench --log (col 6 = time_us).  END; mean still comes
+# from -r (D0-comparable); p50/p99 are the whole-script latency proxy.
+sub pgbench_commit_p99
+{
+	my ($node, $secs, $clients) = @_;
+	my $tmp   = File::Temp->newdir();
+	my $pref  = $tmp->dirname . '/pgb';
+	my $out   = `$PGBENCH -n -T $secs -c $clients -j 2 -r --log --log-prefix=$pref --sampling-rate=0.25 -D scale=$CS_SCALE -f $COMMIT_SCRIPT @{[conn_args($node)]} 2>&1`;
+	my @lat;
+	for my $lf (glob "$pref.*")
+	{
+		open my $fh, '<', $lf or next;
+		while (my $l = <$fh>)
+		{
+			# pgbench --log: col 3 (index 2) = per-transaction latency us
+			# (col 6 time_us is the epoch fractional part, NOT latency).
+			my @c = split /\s+/, $l;
+			push @lat, $c[2] + 0 if defined $c[2] && $c[2] =~ /^\d+$/;
+		}
+		close $fh;
+	}
+	my ($tps)   = $out =~ /tps\s*=\s*([\d.]+)/;
+	my ($xacts) = $out =~ /number of transactions actually processed:\s*(\d+)/;
+	my $end_ms;
+	for my $line (split /\n/, $out)
+	{
+		$end_ms = $1 + 0.0 if $line =~ /^\s*([\d.]+)\s+(?:\d+\s+)?END;/;
+	}
+	return {
+		tps    => ($tps // 0) + 0.0,
+		xacts  => ($xacts // 0) + 0,
+		end_ms => $end_ms,
+		p50_us => pctile(50, @lat),
+		p99_us => pctile(99, @lat),
+		n      => scalar(@lat),
+	};
+}
+
+# Interleaved paired baseline(commit_delay=0) vs candidate(commit_delay=$delay)
+# on $node; returns median paired metrics + relative deltas.  Interleaving
+# (A/B/A/B) cancels runner speed drift (3% p99 discipline).
+sub paired_delay_run
+{
+	my ($node, $c, $delay, $sib, $pairs, $secs) = @_;
+	my (@bt, @ct, @be, @ce, @bs, @cs, @bp, @cp, @bw, @cw);
+	for my $i (1 .. $pairs)
+	{
+		my $ok = eval {
+			set_guc($node, commit_delay => 0, commit_siblings => $sib);
+			my $w0 = wal_stat($node);
+			my $b  = pgbench_commit_p99($node, $secs, $c);
+			my $w1 = wal_stat($node);
+			set_guc($node, commit_delay => $delay, commit_siblings => $sib);
+			my $x0 = wal_stat($node);
+			my $cc = pgbench_commit_p99($node, $secs, $c);
+			my $x1 = wal_stat($node);
+			if ($b->{xacts} > 0 && $cc->{xacts} > 0)
+			{
+				push @bt, $b->{tps};
+				push @ct, $cc->{tps};
+				push @be, $b->{end_ms} if defined $b->{end_ms};
+				push @ce, $cc->{end_ms} if defined $cc->{end_ms};
+				push @bs, ($w1->{sync} - $w0->{sync}) / $b->{xacts};
+				push @cs, ($x1->{sync} - $x0->{sync}) / $cc->{xacts};
+				push @bw, ($w1->{write} - $w0->{write}) / $b->{xacts};
+				push @cw, ($x1->{write} - $x0->{write}) / $cc->{xacts};
+				push @bp, $b->{p99_us} if defined $b->{p99_us};
+				push @cp, $cc->{p99_us} if defined $cc->{p99_us};
+			}
+			1;
+		};
+		# A mid-run node death (undo buffer PANIC family, known-issue #1)
+		# aborts this cell; report a crash instead of dying the census.
+		return { crashed => 1, err => ($@ || 'node died'), n => scalar(@bt) }
+		  if !$ok;
+	}
+	my $bt = median(@bt);
+	my $ct = median(@ct);
+	my $be = median(@be);
+	my $ce = median(@ce);
+	my $bp = median(@bp);
+	my $cp = median(@cp);
+	return {
+		b_tps  => $bt, c_tps => $ct, b_end => $be, c_end => $ce,
+		b_sync => median(@bs), c_sync => median(@cs),
+		b_write => median(@bw), c_write => median(@cw),
+		b_p99  => $bp, c_p99 => $cp,
+		dtps   => (defined $bt && $bt > 0) ? 100 * ($ct - $bt) / $bt : undef,
+		dend   => (defined $be && $be > 0) ? 100 * ($ce - $be) / $be : undef,
+		dp99   => (defined $bp && $bp > 0) ? 100 * ($cp - $bp) / $bp : undef,
+		n      => scalar(@bt),
+	};
 }
 
 # ----------
@@ -903,6 +1046,183 @@ report("");
 report(sprintf("host: %s | legs: %s | install: %s",
 	`hostname -s` =~ s/\s+//gr, $CS_LEGS, $ENV{CS_INSTALL} // '(PATH)'));
 
+sub leg_f
+{
+	report("");
+	report("## Leg F -- group-commit tuning matrix (solo, PG native GUC; spec-7.4 D2)");
+	report("");
+	report(sprintf(
+		"solo node; %ds x %d interleaved paired windows (baseline commit_delay=0 vs "
+		  . "candidate). candidate gate = dTPS >= 5%% AND dp99 <= 3%% (paired medians). "
+		  . "wal_sync/commit from pg_stat_wal (real fsync count).",
+		$CS_F_SECS, $CS_F_PAIRS));
+	report("");
+	report("Note: Leg F forces `wal_sync_method = fsync` (macOS default "
+		  . "open_datasync reports wal_sync=0 since WAL writes carry O_DSYNC); "
+		  . "this makes the fsync merge measurable and matches Linux fdatasync "
+		  . "production semantics.");
+
+	# ---- F1: fsync=on main grid ----
+	my $reboot_n = 0;
+	progress("Leg F1: boot solo (fsync=on)");
+	my $solo = boot_solo('on', 'f');
+	# Suppress per-commit cluster LOG chatter (a 3-min census can emit >1 GB
+	# of node log otherwise) and force fsync so wal_sync counts real fsyncs.
+	set_guc($solo, wal_sync_method => "'fsync'",
+		log_min_messages => "'warning'",
+		log_min_duration_statement => -1, log_statement => "'none'");
+	pgbench_init($solo) or die "pgbench init (solo f) failed\n";
+	for my $sib (@CS_F_SIBLINGS)
+	{
+		report("");
+		report("### F1 fsync=on, commit_siblings=$sib");
+		report("| clients | delay us | base TPS | cand TPS | dTPS% | base END ms | cand END ms | "
+			  . "base sync/commit | cand sync/commit | base p99 us | cand p99 us | dp99% | verdict |");
+		report("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--|");
+		for my $c (@CS_F_LADDER)
+		{
+			my $crashed = 0;
+			for my $delay (@CS_F_DELAYS)
+			{
+				my $r = paired_delay_run($solo, $c, $delay, $sib, $CS_F_PAIRS, $CS_F_SECS);
+				if ($r->{crashed})
+				{
+					report(sprintf(
+						"| %d | %d | CRASH | -- | -- | -- | -- | -- | -- | -- | -- | -- | undo-PANIC |",
+						$c, $delay));
+					progress("Leg F1: sib=$sib c=$c delay=$delay CRASHED (undo buffer PANIC, known-issue #1)");
+					$crashed = 1;
+					last;
+				}
+				my $cand = (defined $r->{dtps} && $r->{dtps} >= 5
+					  && defined $r->{dp99} && $r->{dp99} <= 3) ? 'CAND' : '--';
+				report(sprintf(
+					"| %d | %d | %.0f | %.0f | %s | %.3f | %.3f | %.2f | %.2f | %.0f | %.0f | %s | %s |",
+					$c, $delay, $r->{b_tps} // 0, $r->{c_tps} // 0,
+					defined $r->{dtps} ? sprintf("%+.1f", $r->{dtps}) : 'n/a',
+					$r->{b_end} // 0, $r->{c_end} // 0,
+					$r->{b_sync} // 0, $r->{c_sync} // 0,
+					$r->{b_p99} // 0, $r->{c_p99} // 0,
+					defined $r->{dp99} ? sprintf("%+.1f", $r->{dp99}) : 'n/a', $cand));
+				$TSV{"f1.s$sib.c$c.d$delay.dtps"} =
+					defined $r->{dtps} ? sprintf("%.1f", $r->{dtps}) : '';
+				$TSV{"f1.s$sib.c$c.d$delay.dp99"} =
+					defined $r->{dp99} ? sprintf("%.1f", $r->{dp99}) : '';
+				progress(sprintf(
+					"Leg F1: sib=%d c=%d delay=%d dTPS=%s dp99=%s sync %.2f->%.2f %s",
+					$sib, $c, $delay,
+					defined $r->{dtps} ? sprintf("%+.1f%%", $r->{dtps}) : 'n/a',
+					defined $r->{dp99} ? sprintf("%+.1f%%", $r->{dp99}) : 'n/a',
+					$r->{b_sync} // 0, $r->{c_sync} // 0, $cand));
+			}
+			if ($crashed)
+			{
+				report("");
+				report(sprintf(
+					"**ceiling-by-crash at c=%d**: the solo cluster hit an undo-buffer "
+					  . "PANIC (pinned slot in a segment being reused; spec-3.18 pin<->reuse "
+					  . "interlock, known-issue #1).  The group-commit workload cannot climb "
+					  . "past this rung, so higher client rungs are skipped.  This IS a D2 "
+					  . "finding: the group-commit census hits the undo crash wall (the 7.4a "
+					  . "lever) before flush tuning can be characterised at high concurrency.",
+					$c));
+				progress("Leg F1: rebooting solo after crash (for F3)");
+				safe_stop($solo);
+				$reboot_n++;
+				$solo = boot_solo('on', "fr$reboot_n");
+				set_guc($solo, wal_sync_method => "'fsync'",
+					log_min_messages => "'warning'",
+					log_min_duration_statement => -1, log_statement => "'none'");
+				pgbench_init($solo);
+				last;
+			}
+		}
+	}
+	set_guc($solo, commit_delay => 0, commit_siblings => 5);
+
+	# ---- F3: wal_writer_* negative-control (solo, fsync=on) ----
+	report("");
+	report("### F3 wal_writer_* negative-control (not a sync-commit group-commit control; BOC cadence side-effect)");
+	report("| wal_writer_delay | wal_writer_flush_after | TPS | END ms | p99 us | boc sweep delta | note |");
+	report("|:--|:--|---:|---:|---:|---:|:--|");
+	for my $wc (['200ms', '1MB'], ['10ms', '128kB'])
+	{
+		my ($wd, $wf) = @$wc;
+		my $ok = eval {
+			set_guc($solo, commit_delay => 0, commit_siblings => 5,
+				wal_writer_delay => "'$wd'", wal_writer_flush_after => "'$wf'");
+			my $pre  = cat_snapshot($solo, 'scn');
+			my $r    = pgbench_commit_p99($solo, $CS_F_SECS * 2, 16);
+			my $post = cat_snapshot($solo, 'scn');
+			my $sweeps = ($post->{scn_boc_sweep_fallback_count} // 0)
+				  - ($pre->{scn_boc_sweep_fallback_count} // 0);
+			report(sprintf("| %s | %s | %.0f | %.3f | %.0f | %d | negative-control |",
+				$wd, $wf, $r->{tps} // 0, $r->{end_ms} // 0, $r->{p99_us} // 0, $sweeps));
+			1;
+		};
+		if (!$ok)
+		{
+			report(sprintf(
+				"| %s | %s | CRASH | -- | -- | -- | undo-PANIC (known-issue #1) |",
+				$wd, $wf));
+			last;
+		}
+	}
+	eval { set_guc($solo, wal_writer_delay => "'200ms'",
+			wal_writer_flush_after => "'1MB'") };
+
+	# ---- F1b: fsync=off sentinel (CommitDelay inert; xlog.c:2744 enableFsync gate) ----
+	report("");
+	report("### F1b fsync=off sentinel (CommitDelay not reached; expect dTPS~0, dp99~0)");
+	report("| clients | delay us | base TPS | cand TPS | dTPS% | dp99% | note |");
+	report("|---:|---:|---:|---:|---:|---:|:--|");
+	progress("Leg F1b: boot solo (fsync=off sentinel)");
+	my $solo_off = boot_solo('off', 'fb');
+	set_guc($solo_off, log_min_messages => "'warning'",
+		log_min_duration_statement => -1, log_statement => "'none'");
+	pgbench_init($solo_off) or die "pgbench init (solo fb) failed\n";
+	{
+		my $r = paired_delay_run($solo_off, 16, 200, 5, $CS_F_PAIRS, $CS_F_SECS);
+		report(sprintf("| 16 | 200 | %.0f | %.0f | %s | %s | delay inert under fsync=off |",
+			$r->{b_tps} // 0, $r->{c_tps} // 0,
+			defined $r->{dtps} ? sprintf("%+.1f", $r->{dtps}) : 'n/a',
+			defined $r->{dp99} ? sprintf("%+.1f", $r->{dp99}) : 'n/a'));
+	}
+	safe_stop($solo_off);
+	safe_stop($solo);
+
+	# ---- F2: pair node0 c=1 compatibility gate (zero-effect) ----
+	if ($ENV{CS_F_PAIR} // 1)
+	{
+	report("");
+	report("### F2 pair node0 c=1 compatibility gate (zero-effect; c=1 skips CommitDelay sleep, xlog.c:2744)");
+	progress("Leg F2: boot pair (fsync=on)");
+	my $pair = boot_pair('on', 'f2');
+	for my $pn ($pair->node0, $pair->node1)
+	{
+		set_guc($pn, wal_sync_method => "'fsync'",
+			log_min_messages => "'warning'",
+			log_min_duration_statement => -1, log_statement => "'none'");
+	}
+	pgbench_init($pair->node0) or die "pgbench init (pair f2) failed\n";
+	report("| delay us | base END ms | cand END ms | dEND% | base p99 us | cand p99 us | dp99% | verdict |");
+	report("|---:|---:|---:|---:|---:|---:|---:|:--|");
+	for my $delay (50, 200)
+	{
+		my $r = paired_delay_run($pair->node0, 1, $delay, 5, $CS_F_PAIRS, $CS_F_SECS);
+		my $v = (defined $r->{dp99} && abs($r->{dp99}) <= 3) ? 'ZERO-EFFECT' : 'CHECK';
+		report(sprintf("| %d | %.3f | %.3f | %s | %.0f | %.0f | %s | %s |",
+			$delay, $r->{b_end} // 0, $r->{c_end} // 0,
+			defined $r->{dend} ? sprintf("%+.1f", $r->{dend}) : 'n/a',
+			$r->{b_p99} // 0, $r->{c_p99} // 0,
+			defined $r->{dp99} ? sprintf("%+.1f", $r->{dp99}) : 'n/a', $v));
+	}
+	safe_stop($pair->node0);
+	safe_stop($pair->node1);
+	}
+	return;
+}
+
 if ($CS_LEGS =~ /a/)
 {
 	leg_a('off');
@@ -912,6 +1232,7 @@ leg_b() if $CS_LEGS =~ /b/;
 leg_c() if $CS_LEGS =~ /c/;
 # Leg D runs inside leg_a (shares the pair); standalone only with A.
 leg_e() if $CS_LEGS =~ /e/;
+leg_f() if $CS_LEGS =~ /f/;
 
 make_path(dirname($CS_OUT));
 open my $out, '>', $CS_OUT or die "cannot write $CS_OUT: $!";
