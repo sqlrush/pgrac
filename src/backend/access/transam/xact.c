@@ -162,6 +162,7 @@
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
+#include "cluster/cluster_xnode_profile.h"	  /* PGRAC: spec-7.4 D0 commit census probes */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -1607,6 +1608,10 @@ RecordTransactionCommit(void)
 		{
 			if (cluster_storage_mode_enabled())
 			{
+				/* PGRAC: spec-7.4 D0 -- commit-path decomposition probes
+				 * (GUC-gated, zero cost while cluster.xnode_profile is off). */
+				ClusterXpScope commit_xps;
+
 				/*
 				 * P0 perf hardening (2026-05-31): make this xact's undo durable
 				 * BEFORE the commit becomes visible.  Durable ordering:
@@ -1617,7 +1622,9 @@ RecordTransactionCommit(void)
 				 * START_CRIT_SECTION, so an fsync failure ereport(ERROR)s into a
 				 * clean abort (an aborted xact's un-fsync'd undo is irrelevant).
 				 */
+				cluster_xp_begin(&commit_xps, CLXP_C_COMMIT_UNDO_FLUSH);
 				cluster_undo_xact_precommit_flush();
+				cluster_xp_end(&commit_xps);
 
 				cluster_backup_pending_commit_enter();
 				commit_scn = cluster_scn_advance_for_commit();
@@ -1637,7 +1644,12 @@ RecordTransactionCommit(void)
 				 * transactions, autovacuum, etc.).
 				 */
 				if (cluster_itl_touch_has_pending())
+				{
+					/* PGRAC: spec-7.4 D0 census component. */
+					cluster_xp_begin(&commit_xps, CLXP_C_COMMIT_ITL_STAMP);
 					cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
+					cluster_xp_end(&commit_xps);
+				}
 
 				/*
 				 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
@@ -1652,8 +1664,11 @@ RecordTransactionCommit(void)
 				 * cluster_tt_local_record_commit() overlay install (C1b: this only
 				 * stamps commit_scn; committed-ness stays CLOG's authority).
 				 */
+				/* PGRAC: spec-7.4 D0 census component. */
+				cluster_xp_begin(&commit_xps, CLXP_C_COMMIT_TT_STAMP);
 				has_tt_fold =
 					cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
+				cluster_xp_end(&commit_xps);
 			}
 
 			/*
@@ -1746,8 +1761,16 @@ RecordTransactionCommit(void)
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
 		forceSyncCommit || nrels > 0)
 		{
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: spec-7.4 D0 -- commit-record flush component (includes
+			 * any group-commit queueing inside XLogFlush).  GUC-gated. */
+			ClusterXpScope commit_flush_xps;
+
+			cluster_xp_begin(&commit_flush_xps, CLXP_C_COMMIT_WAL_FLUSH);
+#endif
 			XLogFlush(XactLastRecEnd);
 #ifdef USE_PGRAC_CLUSTER
+			cluster_xp_end(&commit_flush_xps);
 			if (cluster_smart_fusion)
 				cluster_sf_publish_origin_durable_lsn();
 #endif
@@ -2641,6 +2664,11 @@ CommitTransaction(void)
 		&& cluster_voting_disks != NULL
 		&& cluster_voting_disks[0] != '\0')
 	{
+		/* PGRAC: spec-7.4 D0 -- quorum/lease-read census component (the
+		 * ERROR path simply discards the started scope). */
+		ClusterXpScope quorum_xps;
+
+		cluster_xp_begin(&quorum_xps, CLXP_C_COMMIT_QUORUM_READ);
 		if (!cluster_qvotec_in_quorum())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_QUORUM_LOST),
@@ -2648,6 +2676,7 @@ CommitTransaction(void)
 							" rejecting commit to prevent split-brain"),
 					 errhint("check pg_cluster_quorum_state.in_quorum and"
 							 " pg_cluster_voting_disks for disk health")));
+		cluster_xp_end(&quorum_xps);
 	}
 
 	/*

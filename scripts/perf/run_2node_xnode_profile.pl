@@ -8,7 +8,7 @@
 #    shared_buffers 64MB): (a) native, (b) solo cluster node, (c) 2-node
 #    ClusterPair (shared_data + 3 voting disks) -- cluster tiers with
 #    cluster.xnode_profile = on.  Drives the four axis scenarios against
-#    the pair, snapshotting the full xnode_profile dump (all 51 keys) per
+#    the pair, snapshotting the full xnode_profile dump (all 61 keys) per
 #    node before/after each scenario and reporting per-bucket deltas:
 #      W  pgbench -n -N -c 1 on node0 with peer online (M3 single-writer),
 #         interleaved with native + solo rounds (three-tier medians =>
@@ -158,7 +158,8 @@ my $XP_NETEM_MS  = $ENV{XP_NETEM_MS} // '';
 die "XP_STORAGE must be '' or 'block_device' (got '$XP_STORAGE')\n"
   unless $XP_STORAGE eq '' || $XP_STORAGE eq 'block_device';
 
-# The 23 buckets of cluster_xnode_profile.h, dump-key order.
+# The 28 buckets of cluster_xnode_profile.h, dump-key order (23 spec-5.59
+# originals + 5 spec-7.4 D0 commit-decomposition buckets).
 my @ALL_BUCKETS = qw(
 	w_gcs_x_request w_gcs_x_receive w_gcs_x_install w_gcs_x_invalidate
 	w_ges_enqueue w_ges_convert w_ges_wait w_ges_wake w_hw_extend
@@ -168,6 +169,8 @@ my @ALL_BUCKETS = qw(
 	c_scn_commit_advance c_scn_boc_broadcast
 	ic_send_service ic_inbound_dispatch
 	local_undo_itl_wal
+	c_commit_undo_flush c_commit_itl_stamp c_commit_tt_stamp
+	c_commit_wal_flush c_commit_quorum_read
 );
 
 # Table 1: requester decision buckets -- the ONLY set pp-folding is valid
@@ -194,6 +197,11 @@ my %SERVICE_NOTE = (
 	i_index_block_xfer    => 'overlay (also counted in GCS buckets)',
 	i_rightmost_leaf_ping => 'count-only probe (GUC-gated)',
 	c_scn_boc_broadcast   => 'service-side (BOC fanout send)',
+	c_commit_undo_flush   => 'spec-7.4 commit census (folded by run_74 only)',
+	c_commit_itl_stamp    => 'spec-7.4 commit census (folded by run_74 only)',
+	c_commit_tt_stamp     => 'spec-7.4 commit census (folded by run_74 only)',
+	c_commit_wal_flush    => 'spec-7.4 commit census (folded by run_74 only)',
+	c_commit_quorum_read  => 'spec-7.4 commit census (folded by run_74 only)',
 	ic_send_service       => 'service-side (IC one-way send)',
 	ic_inbound_dispatch   => 'service-side (IC inbound dispatch)',
 );
@@ -264,7 +272,7 @@ sub poll_sql_eq
 }
 
 # ----------
-# xnode_profile dump snapshots (all 51 keys) + deltas
+# xnode_profile dump snapshots (all 61 keys) + deltas
 # ----------
 sub xp_snapshot
 {
