@@ -1291,28 +1291,39 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  * into two sub-kinds: VALUE 2 = a DERIVED verdict (the spec-6.15 D4 recycled
  * path, whose origin was derived from the xid value; the serve keeps the
  * cluster_xid_is_mine self-check that guards the 6.12i P0 wrong-origin match),
- * VALUE 3 = an AUTHORITATIVE verdict (the spec-5.22f fresh-ref path, whose
+ * VALUE 5 = an AUTHORITATIVE verdict (the spec-5.22f fresh-ref path, whose
  * origin is the tuple page's PHYSICAL ITL binding — the requester already
  * proved this is the correct owner, so the serve skips the stripe pre-filter
  * and answers underivable own xids over its own durable-TT + CLOG authority;
  * the positive-proof gates are unchanged, Rule 8.A).
+ *
+ * spec-5.22f Hardening (RC#1 integration review): the AUTHORITATIVE sub-kind
+ * originally reused VALUE 3, which COLLIDES with the spec-7.1 D3-b
+ * undo-MULTI-verdict request (also VALUE 3 below).  IsUndoVerdictRequest then
+ * matched a multi request and the forward handler's single-verdict branch stole
+ * it before the multi branch, so a cross-node multixact member serve refused and
+ * the requester fail-closed (t/359_mxid G5 red on the branch, green on main).
+ * The byte legend is now 0=none, 1=undo-TT fetch, 2=derived verdict, 3=MULTI
+ * verdict (7.1 D3-b, unchanged), 4=dead-owner authority verdict (5.22d D4-6),
+ * 5=authoritative single verdict (moved off the multi value).  Multi keeps its
+ * shipped value 3; only this unshipped-on-main sub-kind moves.
  */
 static inline void
 GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
 {
-	p->reserved_0[6] = authoritative ? (uint8)3 : (uint8)2;
+	p->reserved_0[6] = authoritative ? (uint8)5 : (uint8)2;
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)3;
+	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5;
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)3;
+	return p->reserved_0[6] == (uint8)5;
 }
 
 /* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY

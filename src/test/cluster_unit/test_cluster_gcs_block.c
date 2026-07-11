@@ -513,10 +513,10 @@ UT_TEST(test_clean_xfer_stale_break_predicate)
 
 
 /* spec-5.22d D4-6: reserved_0[6] VALUE 4 = dead-owner AUTHORITY verdict
- * request.  Pins the value-multiplex against the three existing kinds
- * (1 = undo-TT fetch, 2 = derived verdict, 3 = authoritative verdict): the
- * kind-4 predicate must never match 1/2/3 and vice versa, and setting kind 4
- * must not perturb the widened-xid watermark carrier.  ABI stays 64B. */
+ * request.  Pins the value-multiplex against the other kinds (1 = undo-TT
+ * fetch, 2 = derived verdict, 3 = MULTI verdict, 5 = authoritative verdict):
+ * the kind-4 predicate must never match 1/2/3/5 and vice versa, and setting
+ * kind 4 must not perturb the widened-xid watermark carrier.  ABI stays 64B. */
 UT_TEST(test_forward_payload_undo_authority_verdict_kind4)
 {
 	GcsBlockForwardPayload fwd;
@@ -533,7 +533,7 @@ UT_TEST(test_forward_payload_undo_authority_verdict_kind4)
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0, 0);
 
 	/* and the owner-served kinds are NOT the authority kind */
-	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true /* value 3 */);
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true /* value 5 */);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
 	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, false /* value 2 */);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
@@ -548,6 +548,48 @@ UT_TEST(test_forward_payload_undo_authority_verdict_kind4)
 				 (long long)0x00000000AABBCCDDULL);
 
 	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+/* spec-5.22f Hardening (RC#1 integration review): the AUTHORITATIVE single
+ * verdict sub-kind (spec-5.22f D6-7) must NOT share reserved_0[6] value 3 with
+ * the spec-7.1 D3-b MULTI verdict request.  It originally did, so
+ * IsUndoVerdictRequest matched a multi request and the forward handler's
+ * single-verdict branch stole it before the multi branch -> a cross-node
+ * multixact member serve refused and the requester fail-closed 53R97
+ * (t/359_mxid G5 red on the branch, green on main).  Lock the full byte legend
+ * (1 fetch / 2 derived / 3 MULTI / 4 authority / 5 authoritative) so the five
+ * request kinds stay mutually exclusive across every Is* predicate. */
+UT_TEST(test_forward_payload_undo_verdict_kinds_no_collision)
+{
+	GcsBlockForwardPayload fwd;
+
+	/* MULTI verdict (value 3): matched ONLY by the multi predicate. */
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetUndoMultiVerdictRequest(&fwd, true);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 0); /* the collision */
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0, 0);
+
+	/* AUTHORITATIVE single verdict (value 5): a verdict request, authoritative,
+	 * but NOT a multi and NOT the dead-owner authority kind. */
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0, 0);
+
+	/* DERIVED single verdict (value 2): a verdict request, NOT authoritative,
+	 * NOT a multi. */
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, false);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0, 0);
 }
 
 
@@ -604,7 +646,7 @@ UT_TEST(test_undo_verdict_version_authority_distinct)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -627,6 +669,7 @@ main(void)
 	UT_RUN(test_clean_xfer_master_decision_5_branches);
 	UT_RUN(test_clean_xfer_stale_break_predicate);
 	UT_RUN(test_forward_payload_undo_authority_verdict_kind4);
+	UT_RUN(test_forward_payload_undo_verdict_kinds_no_collision);
 	UT_RUN(test_undo_authority_fetch_tag_owner_roundtrip);
 	UT_RUN(test_undo_verdict_version_authority_distinct);
 	UT_DONE();
