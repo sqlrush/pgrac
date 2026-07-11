@@ -31,6 +31,15 @@
  *	    path) deliberately skipped -- only top-level abort decisions
  *	    advance SCN per Q4.
  *
+ *	What changed (spec-7.4 D1):
+ *	  - RecordTransactionCommit(): durable-frontier wiring.  LSN fill-in
+ *	    after XactLogCommitRecord (crit-section-safe shmem write);  a
+ *	    local commit_record_flushed flag set after our own XLogFlush;
+ *	    frontier discharge AFTER END_CRIT_SECTION (sync commits only --
+ *	    async commits leave the entry for the walwriter flush horizon).
+ *	    Precommit PG_CATCH + AbortTransaction() unblock the frontier via
+ *	    cluster_scn_durable_pending_abort_self().
+ *
  *	What changed (spec-2.6 v0.2 D6 — Sprint A Step 3):
  *	  - CommitTransaction(): added cluster fail-closed commit-boundary
  *	    check after PreCommit_Portals loop, before CallXactCallbacks
@@ -1476,6 +1485,13 @@ RecordTransactionCommit(void)
 	 * additional SCN allocation.
 	 */
 	SCN			tt_commit_scn = InvalidScn;
+	bool		commit_record_flushed = false;	/* PGRAC: spec-7.4 D1 -- set
+												 * inside the commit critical
+												 * section after our own
+												 * XLogFlush; consumed AFTER
+												 * END_CRIT_SECTION (no publish
+												 * work inside the crit
+												 * section) */
 #endif
 
 	/*
@@ -1685,6 +1701,11 @@ RecordTransactionCommit(void)
 		PG_CATCH();
 		{
 			cluster_backup_pending_commit_abort(0, (Datum)0);
+			/* PGRAC: spec-7.4 D1 -- an ERROR escaped the precommit gap;
+			 * the allocated commit SCN never became a commit record.
+			 * Unblock the durable frontier (lsn-filled entries are kept
+			 * by the guard inside). */
+			(void)cluster_scn_durable_pending_abort_self();
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1707,6 +1728,12 @@ RecordTransactionCommit(void)
 							has_tt_fold ? &tt_fold : NULL); /* PGRAC: spec-3.18 D4.1 */
 #ifdef USE_PGRAC_CLUSTER
 		cluster_backup_pending_commit_exit();
+		/* PGRAC: spec-7.4 D1 -- the commit record now exists;  record its
+		 * end LSN on the durable-pending entry so the walwriter flush
+		 * horizon can discharge it (async commits never flush here).  Pure
+		 * shmem write under the SCN lwlock; crit-section safe. */
+		if (SCN_VALID(tt_commit_scn))
+			(void) cluster_scn_durable_pending_fill_lsn(tt_commit_scn, XactLastRecEnd);
 #endif
 
 		if (replorigin)
@@ -1773,6 +1800,11 @@ RecordTransactionCommit(void)
 			cluster_xp_end(&commit_flush_xps);
 			if (cluster_smart_fusion)
 				cluster_sf_publish_origin_durable_lsn();
+			/* PGRAC: spec-7.4 D1 -- our commit record is durable; only mark
+			 * a local flag here.  The frontier discharge + publish happens
+			 * after END_CRIT_SECTION (mini-plan v1.1 ruling #3: no publish
+			 * step may run inside the commit critical section). */
+			commit_record_flushed = true;
 #endif
 
 			/*
@@ -1821,6 +1853,11 @@ RecordTransactionCommit(void)
 		(void)cluster_scn_pending_commit_clear(tt_commit_scn);
 		if (SCN_VALID(tt_commit_scn))
 			(void)cluster_adg_emit_thread_barrier();
+		/* PGRAC: spec-7.4 D1 -- sync-commit frontier discharge, outside the
+		 * critical section.  Async commits leave their (lsn-filled) entry
+		 * for the walwriter flush horizon. */
+		if (commit_record_flushed && SCN_VALID(tt_commit_scn))
+			(void)cluster_scn_durable_pending_discharge_scn(tt_commit_scn);
 	}
 #endif
 
@@ -3312,6 +3349,11 @@ AbortTransaction(void)
 	 * escaped the precommit gap, so ADG thread-safe-SCN publication does not
 	 * freeze permanently on an aborted local transaction. */
 	(void)cluster_scn_pending_commit_clear_my_pending();
+
+	/* spec-7.4 D1: same discipline for the durable frontier registry --
+	 * an aborted allocation must not block the frontier forever.  The
+	 * lsn-filled guard inside keeps real (async) commits pending. */
+	(void)cluster_scn_durable_pending_abort_self();
 
 	/* spec-6.14 D8: an ERROR escaping mid-resolve unwinds past the resolver's
 	 * no-recursion depth decrement; reset it so the catalog-snapshot guard

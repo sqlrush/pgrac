@@ -297,6 +297,58 @@ extern SCN cluster_scn_adg_thread_safe_scn(void);
 extern uint64 cluster_scn_adg_pending_count(void);
 extern bool cluster_scn_adg_pending_overflowed(void);
 
+/*
+ * spec-7.4 D1 durable_safe_scn frontier registry.
+ *
+ * The frontier is the CONTIGUOUS durable watermark this origin publishes on
+ * the BOC channel:  every own-origin commit SCN <= the frontier is durable
+ * on WAL.  A plain atomic-max of flushed commit SCNs is forbidden (P0):
+ * a stalled earlier allocation would be falsely claimed durable.
+ *
+ * Lifecycle:  cluster_scn_advance_for_commit() registers the returned SCN
+ * with an unknown LSN;  the commit path fills in the commit-record LSN once
+ * known;  discharge happens on one of three paths (sync commit after its
+ * own XLogFlush, walwriter behind XLogBackgroundFlush for async commits,
+ * abort cleanup).  Registry overflow freezes the frontier stickily (until
+ * restart) rather than publishing an unsafe claim;  consumers fall back to
+ * the existing fetch-reply piggyback sampling.
+ */
+#define CLUSTER_SCN_DURABLE_PENDING_MAX 256
+
+extern SCN cluster_scn_durable_safe_scn(void);
+extern bool cluster_scn_durable_pending_fill_lsn(SCN commit_scn, XLogRecPtr commit_lsn);
+extern bool cluster_scn_durable_pending_discharge_scn(SCN commit_scn);
+extern bool cluster_scn_durable_pending_abort_self(void);
+extern uint32 cluster_scn_durable_pending_discharge_upto(XLogRecPtr flushed_lsn);
+extern uint64 cluster_scn_durable_pending_count(void);
+extern bool cluster_scn_durable_frontier_frozen(void);
+extern uint64 cluster_scn_durable_frontier_overflow_count(void);
+extern uint64 cluster_scn_durable_frontier_regression_count(void);
+
+/*
+ * spec-7.4 D1: BOC payload v1 (wire) + per-origin remote frontier cache.
+ *
+ * Wire contract (spec-2.9 I5 v0.5 amend):  BOC_BROADCAST payload_length is
+ * 0 (pre-v1 sender / event publish off) or 8 (v1 = origin_durable_safe_scn,
+ * explicit little-endian).  Any other length is a counted fail-closed drop.
+ * The v2 WAL-LSN field (7.5 Smart Fusion) will be a separate appended
+ * field;  SCN and WAL-LSN domains never share bytes (L457).
+ *
+ * Accepted values land in a per-(origin, epoch) seqlock cache (single
+ * writer:  the LMON dispatch that runs the handler).  Readers use
+ * cluster_scn_remote_durable_safe();  a bounded-spin failure returns false
+ * so consumers fall back to the fetch-reply piggyback sampling.
+ */
+#define CLUSTER_SCN_BOC_PAYLOAD_V1_LEN 8
+
+extern void cluster_scn_boc_payload_encode(SCN scn, uint8 *buf);
+extern SCN cluster_scn_boc_payload_decode(const uint8 *buf);
+extern bool cluster_scn_remote_durable_safe(NodeId origin, uint64 *epoch_out, SCN *scn_out);
+extern uint64 cluster_scn_boc_payload_accept_count(void);
+extern uint64 cluster_scn_boc_payload_bad_length_count(void);
+extern uint64 cluster_scn_boc_payload_node_mismatch_count(void);
+extern uint64 cluster_scn_boc_payload_regression_count(void);
+
 /* spec-1.16 stat accessors (LW_SHARED). */
 extern uint64 cluster_scn_commit_advance_count(void);
 extern uint64 cluster_scn_abort_advance_count(void);

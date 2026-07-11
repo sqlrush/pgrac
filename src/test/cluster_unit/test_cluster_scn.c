@@ -169,7 +169,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	 * address in standalone unit tests. */
 	static union {
 		uint64 force_align;
-		char data[8192]; /* generous;  cluster_scn_shmem_size() << 8KB */
+		char data[16384]; /* generous;  spec-7.4 D1 grew the state past 8KB
+		                   * (durable frontier registry + remote cache) */
 	} scn_buf;
 	static bool scn_initialized = false;
 
@@ -342,6 +343,20 @@ cluster_conf_node_count(void)
 #include "miscadmin.h"
 volatile uint32 CritSectionCount = 0;
 BackendType MyBackendType = B_LMON;
+
+/* spec-7.4 D1 / L104: cluster_scn.o boc_tick now calls GetFlushRecPtr
+ * for the walwriter async-commit frontier discharge.  Standalone unit
+ * binaries link cluster_scn.o only;  stub returns 0 (InvalidXLogRecPtr)
+ * so discharge_upto is a guarded no-op unless a test drives the API
+ * directly with explicit horizons. */
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *insertTLI)
+{
+	if (insertTLI != NULL)
+		*insertTLI = 0;
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 
