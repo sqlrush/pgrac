@@ -6,11 +6,13 @@
  *
  *	  This file ships the backend-pure layer: the undo resid
  *	  encoder/decoder, the class discriminator, the owner-as-master
- *	  routing function, and the anti-ABA generation predicate.  None of
- *	  these touch elog / shmem / locks, so the cluster_unit test links the
- *	  object standalone.  The data plane that consumes this identity
- *	  (grant / PI / block serving / recovery materialization / retention)
- *	  lands with later deliverables.
+ *	  routing function, and the anti-ABA generation predicate.  These touch
+ *	  only elog (the spec-5.22d Hardening fail-closed identity guards below
+ *	  ereport 53R9R on a non-undo-class resid or an out-of-range owner) --
+ *	  no shmem / locks -- so the cluster_unit test still links the object
+ *	  standalone against a small errstart/errfinish trampoline.  The data
+ *	  plane that consumes this identity (grant / PI / block serving /
+ *	  recovery materialization / retention) lands with later deliverables.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -30,8 +32,9 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_scn.h" /* SCN_NODE_ID_VALID */
+#include "cluster/cluster_scn.h" /* SCN_NODE_ID_VALID / SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_resid.h"
+#include "utils/errcodes.h" /* ERRCODE_CLUSTER_UNDO_RESID_INVALID (fail-closed guards) */
 
 /*
  * cluster_undo_resid_encode -- build the undo-block resource id.
@@ -49,7 +52,16 @@ cluster_undo_resid_encode(int32 owner_node, uint32 undo_segment, uint32 block_no
 	Assert(dst != NULL);
 	if (dst == NULL)
 		return;
-	Assert(SCN_NODE_ID_VALID(owner_node));
+	/*
+	 * Fail closed on an out-of-range owner (spec-5.22d Hardening): a no-op
+	 * Assert let --disable-cassert builds truncate the owner into the uint16
+	 * field4 and silently misroute the undo authority.  Symmetric with the
+	 * GRD-side 53R9Q hash-route guard.
+	 */
+	if (!SCN_NODE_ID_VALID(owner_node))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RESID_INVALID),
+						errmsg("undo resid owner_node %d out of range [0, %d]", owner_node,
+							   SCN_MAX_VALID_NODE_ID)));
 
 	dst->field1 = undo_segment;
 	dst->field2 = block_no;
@@ -62,9 +74,9 @@ cluster_undo_resid_encode(int32 owner_node, uint32 undo_segment, uint32 block_no
 /*
  * cluster_undo_resid_decode -- split an undo resid back into its fields.
  *
- *	The caller must pass an undo-class resid (Assert enforced); the
- *	decoder is the wire-ABI boundary, so it never guesses at foreign
- *	classes.
+ *	The caller must pass an undo-class resid (fail-closed 53R9R on a
+ *	foreign class); the decoder is the wire-ABI boundary, so it never
+ *	guesses at foreign classes.
  */
 void
 cluster_undo_resid_decode(const ClusterResId *rid, int32 *owner_node, uint32 *undo_segment,
@@ -74,7 +86,13 @@ cluster_undo_resid_decode(const ClusterResId *rid, int32 *owner_node, uint32 *un
 	if (rid == NULL || owner_node == NULL || undo_segment == NULL || block_no == NULL
 		|| generation == NULL)
 		return;
-	Assert(rid->type == CLUSTER_UNDO_RESID_TYPE);
+	/* Fail closed on a foreign class (spec-5.22d Hardening): the decoder is the
+	 * wire-ABI boundary, so a non-undo resid must never be reinterpreted as
+	 * undo fields (a no-op Assert did this silently under --disable-cassert). */
+	if (rid->type != CLUSTER_UNDO_RESID_TYPE)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_UNDO_RESID_INVALID),
+				 errmsg("undo resid decode on non-undo class 0x%02x", (unsigned int)rid->type)));
 
 	*owner_node = (int32)rid->field4;
 	*undo_segment = rid->field1;
@@ -110,7 +128,14 @@ cluster_undo_resid_master(const ClusterResId *rid)
 	Assert(rid != NULL);
 	if (rid == NULL)
 		return -1;
-	Assert(rid->type == CLUSTER_UNDO_RESID_TYPE);
+	/* Fail closed on a foreign class (spec-5.22d Hardening): returning field4
+	 * of a non-undo resid would route the authority to a bogus node (a no-op
+	 * Assert did this silently under --disable-cassert).  Symmetric with the
+	 * GRD-side 53R9Q hash-route guard. */
+	if (rid->type != CLUSTER_UNDO_RESID_TYPE)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RESID_INVALID),
+						errmsg("undo resid master lookup on non-undo class 0x%02x",
+							   (unsigned int)rid->type)));
 
 	return (int32)rid->field4;
 }
@@ -128,7 +153,13 @@ cluster_undo_resid_generation_matches(const ClusterResId *rid, uint32 expected_g
 	Assert(rid != NULL);
 	if (rid == NULL)
 		return false;
-	Assert(rid->type == CLUSTER_UNDO_RESID_TYPE);
+	/* Fail closed on a foreign class (spec-5.22d Hardening): comparing field3
+	 * of a non-undo resid would fabricate an anti-ABA verdict (a no-op Assert
+	 * did this silently under --disable-cassert). */
+	if (rid->type != CLUSTER_UNDO_RESID_TYPE)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RESID_INVALID),
+						errmsg("undo resid generation check on non-undo class 0x%02x",
+							   (unsigned int)rid->type)));
 
 	return rid->field3 == expected_generation;
 }

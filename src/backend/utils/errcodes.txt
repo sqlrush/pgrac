@@ -754,6 +754,15 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # X-transfer band below).
 53R9Q    E    ERRCODE_CLUSTER_UNDO_RESID_HASH_ROUTED                           cluster_undo_resid_hash_routed
 
+# spec-5.22d Hardening:  the undo resid derived primitives (decode / master /
+# generation_matches / encode) previously guarded their class byte and owner
+# range with Assert only -- a no-op under --disable-cassert, so production could
+# decode / route a non-undo-class resid, or encode an out-of-range owner (uint16
+# field4 wrap), and silently misroute the undo authority.  They now fail closed
+# with 53R9R, symmetric with the GRD-side 53R9Q hash-route guard above.  R is the
+# next free slot in the 53R9 family.
+53R9R    E    ERRCODE_CLUSTER_UNDO_RESID_INVALID                               cluster_undo_resid_invalid
+
 # spec-5.2a D6:  clean-page X-transfer enabler terminal fail-closed.  A clean
 # (sequence) page X-transfer could not complete safely and there is no proven-
 # safe fallback:  a 3-node third-party master clean transfer (out of the 2-node

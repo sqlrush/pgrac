@@ -59,6 +59,43 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+/*
+ * spec-5.22d Hardening — cluster_undo_resid.o now fail-closes with
+ * ereport(53R9R) on an invalid-identity resid; these link stubs satisfy the
+ * reference.  Every resid this test builds is a valid undo resid, so the guard
+ * never fires (errfinish aborts if it ever does, surfacing the surprise).
+ */
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return elevel >= 21;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 /* spec-7.1a D3 spread scn_time_cmp into the linked objects; SCNs here are
  * plain monotonic test values, so the total-order stub is a raw compare
  * (test_cluster_runtime_visibility.c pattern). */
