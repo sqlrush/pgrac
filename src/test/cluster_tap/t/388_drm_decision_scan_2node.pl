@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 371_drm_decision_scan_2node.pl
+# 388_drm_decision_scan_2node.pl
 #	  spec-7.6 6.3c — DRM hotness decision scan, 2-node value leg.
 #
 #	  End-to-end proof that the decision half runs on top of the 6.3b collection
@@ -78,7 +78,7 @@ my $SKEW_BASE = 5_100_000;
 my $SKEW_KEYS = 24;
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
-	'drm371',
+	'drm388',
 	quorum_voting_disks => 3,
 	extra_conf => [
 		'cluster.shared_storage_backend = local',
