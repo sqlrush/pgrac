@@ -92,7 +92,7 @@ cluster_xp_bucket_name(ClusterXnodeBucket b)
  * dump labels never drift) and the component names the dump uses to build
  * "hist.<component>.le_<edge>us" / ".le_inf" keys.
  */
-const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = {CLXP_HIST_EDGES_US};
+const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = { CLXP_HIST_EDGES_US };
 
 static const char *const cluster_xp_hist_component_names[CLXP_HIST_NCOMPONENTS] = {
 	[CLXP_HIST_UNDO_FLUSH] = "commit_undo_flush",
@@ -136,8 +136,8 @@ cluster_xp_zero_all(ClusterXnodeProfileShared *ctl, bool init)
 	}
 	/* spec-7.4 D4: zero the per-commit-component μs latency histogram. */
 	{
-		int			c;
-		int			b;
+		int c;
+		int b;
 
 		for (c = 0; c < CLXP_HIST_NCOMPONENTS; c++) {
 			for (b = 0; b < CLXP_HIST_NBUCKETS; b++) {

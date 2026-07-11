@@ -129,7 +129,7 @@ cluster_xp_hist_component_name(ClusterXpHistComponent c pg_attribute_unused())
 {
 	return "stub";
 }
-const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = {CLXP_HIST_EDGES_US};
+const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = { CLXP_HIST_EDGES_US };
 
 /* spec-6.12 stub: dump_xnode_lever reads this pointer (NULL -> all-zero
  * rows); the unit harness does not link cluster_xnode_lever.o. */

@@ -224,7 +224,7 @@ UT_TEST(test_u3_reset)
 	/* a commit-bucket sample populates the μs histogram too (spec-7.4 D4) */
 	ut_fake_now_ns = 0;
 	cluster_xp_begin(&s, CLXP_C_COMMIT_WAL_FLUSH);
-	ut_fake_now_ns = 100000;	/* 100µs -> bucket 3 ([100,200)µs) */
+	ut_fake_now_ns = 100000; /* 100µs -> bucket 3 ([100,200)µs) */
 	cluster_xp_end(&s);
 
 	UT_ASSERT(ut_bucket_nanos(CLXP_R_CR_CONSTRUCT) > 0);
@@ -304,7 +304,8 @@ UT_TEST(test_u5_dump_key_surface)
 {
 	UT_ASSERT_EQ(CLUSTER_XP_N_PROBE_KEYS, 5);
 	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS
-				 + CLXP_HIST_NCOMPONENTS * CLXP_HIST_NBUCKETS, 121);
+					 + CLXP_HIST_NCOMPONENTS * CLXP_HIST_NBUCKETS,
+				 121);
 }
 
 /* ----------
@@ -407,8 +408,8 @@ UT_TEST(test_u9_hist_bucket_index)
 UT_TEST(test_u10_hist_observe)
 {
 	ClusterXpScope s;
-	int			c;
-	int			b;
+	int c;
+	int b;
 
 	ut_attach_fresh_shared();
 	cluster_xnode_profile_enabled = true;
@@ -436,8 +437,7 @@ UT_TEST(test_u10_hist_observe)
 	cluster_xp_end(&s);
 	for (c = 0; c < CLXP_HIST_NCOMPONENTS; c++)
 		for (b = 0; b < CLXP_HIST_NBUCKETS; b++)
-			if (!((c == CLXP_HIST_UNDO_FLUSH && b == 1) ||
-				  (c == CLXP_HIST_WAL_FLUSH && b == 7)))
+			if (!((c == CLXP_HIST_UNDO_FLUSH && b == 1) || (c == CLXP_HIST_WAL_FLUSH && b == 7)))
 				UT_ASSERT_EQ(ut_hist_count((ClusterXpHistComponent)c, b), 0);
 
 	/* aborted commit scope contributes nothing */
@@ -459,8 +459,8 @@ UT_TEST(test_u10_hist_observe)
  */
 UT_TEST(test_u11_hist_labels)
 {
-	int			i;
-	int			j;
+	int i;
+	int j;
 
 	for (i = 0; i < CLXP_HIST_NCOMPONENTS; i++) {
 		const char *name = cluster_xp_hist_component_name((ClusterXpHistComponent)i);
@@ -470,13 +470,15 @@ UT_TEST(test_u11_hist_labels)
 		for (j = 0; j < i; j++)
 			UT_ASSERT(strcmp(name, cluster_xp_hist_component_name((ClusterXpHistComponent)j)) != 0);
 	}
-	UT_ASSERT_NULL((void *)cluster_xp_hist_component_name((ClusterXpHistComponent)CLXP_HIST_NCOMPONENTS));
+	UT_ASSERT_NULL(
+		(void *)cluster_xp_hist_component_name((ClusterXpHistComponent)CLXP_HIST_NCOMPONENTS));
 	UT_ASSERT_NULL((void *)cluster_xp_hist_component_name((ClusterXpHistComponent)-1));
 
 	for (i = 1; i < CLXP_HIST_NEDGES; i++)
 		UT_ASSERT(cluster_xp_hist_edge_us[i] > cluster_xp_hist_edge_us[i - 1]);
-	UT_ASSERT_EQ(cluster_xp_hist_bucket_index((uint64)cluster_xp_hist_edge_us[CLXP_HIST_NEDGES - 1] * 1000),
-				 CLXP_HIST_NEDGES);
+	UT_ASSERT_EQ(
+		cluster_xp_hist_bucket_index((uint64)cluster_xp_hist_edge_us[CLXP_HIST_NEDGES - 1] * 1000),
+		CLXP_HIST_NEDGES);
 }
 
 int

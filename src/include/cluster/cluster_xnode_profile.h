@@ -132,9 +132,9 @@ typedef enum ClusterXpHistComponent {
 static inline int
 cluster_xp_hist_bucket_index(uint64 nanos)
 {
-	static const uint32 edges[CLXP_HIST_NEDGES] = {CLXP_HIST_EDGES_US};
-	uint64		us = nanos / 1000;
-	int			i;
+	static const uint32 edges[CLXP_HIST_NEDGES] = { CLXP_HIST_EDGES_US };
+	uint64 us = nanos / 1000;
+	int i;
 
 	for (i = 0; i < CLXP_HIST_NEDGES; i++) {
 		if (us < edges[i])
@@ -151,18 +151,18 @@ static inline int
 cluster_xp_hist_slot_for(ClusterXnodeBucket b)
 {
 	switch (b) {
-		case CLXP_C_COMMIT_UNDO_FLUSH:
-			return CLXP_HIST_UNDO_FLUSH;
-		case CLXP_C_COMMIT_ITL_STAMP:
-			return CLXP_HIST_ITL_STAMP;
-		case CLXP_C_COMMIT_TT_STAMP:
-			return CLXP_HIST_TT_STAMP;
-		case CLXP_C_COMMIT_WAL_FLUSH:
-			return CLXP_HIST_WAL_FLUSH;
-		case CLXP_C_SCN_COMMIT_ADVANCE:
-			return CLXP_HIST_SCN_COMMIT_ADVANCE;
-		default:
-			return -1;
+	case CLXP_C_COMMIT_UNDO_FLUSH:
+		return CLXP_HIST_UNDO_FLUSH;
+	case CLXP_C_COMMIT_ITL_STAMP:
+		return CLXP_HIST_ITL_STAMP;
+	case CLXP_C_COMMIT_TT_STAMP:
+		return CLXP_HIST_TT_STAMP;
+	case CLXP_C_COMMIT_WAL_FLUSH:
+		return CLXP_HIST_WAL_FLUSH;
+	case CLXP_C_SCN_COMMIT_ADVANCE:
+		return CLXP_HIST_SCN_COMMIT_ADVANCE;
+	default:
+		return -1;
 	}
 }
 
@@ -256,18 +256,17 @@ cluster_xp_abort(ClusterXpScope *s)
 static inline void
 cluster_xp_end(ClusterXpScope *s)
 {
-	instr_time	now;
-	uint64		nanos;
-	int			slot;
+	instr_time now;
+	uint64 nanos;
+	int slot;
 
 	if (!s->active)
 		return;
 	s->active = false;
 	INSTR_TIME_SET_CURRENT(now);
 	INSTR_TIME_SUBTRACT(now, s->start);
-	nanos = (uint64) INSTR_TIME_GET_NANOSEC(now);
-	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].total_nanos,
-							nanos);
+	nanos = (uint64)INSTR_TIME_GET_NANOSEC(now);
+	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].total_nanos, nanos);
 	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].n_events, 1);
 
 	/*
@@ -278,8 +277,8 @@ cluster_xp_end(ClusterXpScope *s)
 	 */
 	slot = cluster_xp_hist_slot_for(s->bucket);
 	if (slot >= 0)
-		pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->hist[slot][cluster_xp_hist_bucket_index(nanos)],
-								1);
+		pg_atomic_fetch_add_u64(
+			&ClusterXnodeProfileCtl->hist[slot][cluster_xp_hist_bucket_index(nanos)], 1);
 }
 
 #endif /* !FRONTEND */
