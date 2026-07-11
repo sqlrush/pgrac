@@ -242,6 +242,15 @@ cluster_injection_should_skip(const char *p pg_attribute_unused())
 {
 	return false;
 }
+/* spec-7.4 D1-2: cluster_scn.c's boc-event-publish probe uses the
+ * armed-state peek; this binary never arms, so always report unarmed. */
+bool
+cluster_cr_injection_armed(const char *p pg_attribute_unused(), uint64 *out_param)
+{
+	if (out_param != NULL)
+		*out_param = 0;
+	return false;
+}
 void
 cluster_injection_check(const char *p pg_attribute_unused())
 {}
@@ -249,8 +258,9 @@ cluster_injection_check(const char *p pg_attribute_unused())
 /* fmgr stub for SQL UDFs (address-only) */
 struct FunctionCallInfoBaseData;
 
-/* injection extras (cluster_scn.c references run + armed_count) */
-pg_atomic_uint32 cluster_injection_armed_count;
+/* injection extras (cluster_scn.c references run + armed_count; the gate
+ * is a plain int in cluster_inject.h, mirror that here). */
+int cluster_injection_armed_count;
 void
 cluster_injection_run(const char *p pg_attribute_unused())
 {}
