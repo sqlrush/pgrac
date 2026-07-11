@@ -121,6 +121,16 @@ cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
 	return "stub";
 }
 
+/* spec-7.4 D4 stubs: dump_xnode_profile now also builds the commit-latency
+ * histogram key labels (component name + μs edge schema); the SRF body that
+ * calls them is never invoked by the unit test. */
+const char *
+cluster_xp_hist_component_name(ClusterXpHistComponent c pg_attribute_unused())
+{
+	return "stub";
+}
+const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES] = {CLXP_HIST_EDGES_US};
+
 /* spec-6.12 stub: dump_xnode_lever reads this pointer (NULL -> all-zero
  * rows); the unit harness does not link cluster_xnode_lever.o. */
 ClusterXnodeLeverShared *ClusterXnodeLeverCtl = NULL;

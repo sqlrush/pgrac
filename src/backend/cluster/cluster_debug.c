@@ -3181,6 +3181,30 @@ dump_xnode_profile(ReturnSetInfo *rsinfo)
 			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_local_count) : 0));
 	emit_row(rsinfo, "xnode_profile", "hw_extend_remote_count",
 			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_remote_count) : 0));
+
+	/*
+	 * spec-7.4 D4: per-commit-component μs latency histogram.  Non-cumulative
+	 * bucket counts keyed by upper edge ("hist.<component>.le_<edge>us", or
+	 * ".le_inf" for the >= last-edge overflow bucket); the edge schema is
+	 * cluster_xp_hist_edge_us[].  Emitted even while cluster.xnode_profile is
+	 * off (values stay 0) so the key surface is stable for tests and samplers.
+	 */
+	for (int c = 0; c < CLXP_HIST_NCOMPONENTS; c++) {
+		const char *cname = cluster_xp_hist_component_name((ClusterXpHistComponent)c);
+
+		for (int b = 0; b < CLXP_HIST_NBUCKETS; b++) {
+			char key[96];
+			uint64 count = 0;
+
+			if (ctl != NULL)
+				count = pg_atomic_read_u64(&ctl->hist[c][b]);
+			if (b < CLXP_HIST_NEDGES)
+				snprintf(key, sizeof(key), "hist.%s.le_%uus", cname, cluster_xp_hist_edge_us[b]);
+			else
+				snprintf(key, sizeof(key), "hist.%s.le_inf", cname);
+			emit_row(rsinfo, "xnode_profile", key, fmt_int64((int64)count));
+		}
+	}
 }
 
 /*

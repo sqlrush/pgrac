@@ -156,11 +156,16 @@ ok(1, 'L1b single cluster node boots');
 # Dump surface exists and is all-zero while the GUC is off.
 my $key_count = $solo->safe_psql('postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category='xnode_profile'");
-is($key_count, '61', 'xnode_profile dump surface: 61 keys (28 buckets x2 + 5 probes)');
+is($key_count, '121',
+	'xnode_profile dump surface: 121 keys (28 buckets x2 + 5 probes + 5 hist components x 12 μs buckets)');
+# spec-7.4 D4: commit-latency histogram keys present (5 components x 12 buckets).
+my $hist_key_count = $solo->safe_psql('postgres',
+	"SELECT count(*) FROM pg_cluster_state WHERE category='xnode_profile' AND key LIKE 'hist.%'");
+is($hist_key_count, '60', 'spec-7.4 D4: 60 commit-latency histogram keys');
 my $nonzero_off = $solo->safe_psql('postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category='xnode_profile' "
-	. "AND key LIKE 'bucket.%' AND value <> '0'");
-is($nonzero_off, '0', 'GUC off: all buckets zero');
+	. "AND (key LIKE 'bucket.%' OR key LIKE 'hist.%') AND value <> '0'");
+is($nonzero_off, '0', 'GUC off: all buckets and histogram bins zero');
 
 # L8: off -> on -> off toggle with a small write workload at each step.
 $solo->safe_psql('postgres',
