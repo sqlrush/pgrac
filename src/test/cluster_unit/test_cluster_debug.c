@@ -3236,6 +3236,59 @@ cluster_scn_last_observe_at(void)
 	return 0;
 }
 
+/* Spec-7.4 D1 durable frontier / BOC payload accessor stubs. */
+SCN
+cluster_scn_durable_safe_scn(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_durable_pending_count(void)
+{
+	return 0;
+}
+bool
+cluster_scn_durable_frontier_frozen(void)
+{
+	return false;
+}
+uint64
+cluster_scn_durable_frontier_overflow_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_durable_frontier_regression_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_accept_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_bad_length_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_node_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_boc_payload_regression_count(void)
+{
+	return 0;
+}
+bool
+cluster_scn_remote_durable_safe(NodeId origin pg_attribute_unused(),
+								uint64 *epoch_out pg_attribute_unused(),
+								SCN *scn_out pg_attribute_unused())
+{
+	return false;
+}
 uint64
 cluster_scn_observed_max_observe_gap_ms(void)
 {

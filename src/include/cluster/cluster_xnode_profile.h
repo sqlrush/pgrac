@@ -78,6 +78,22 @@ typedef enum ClusterXnodeBucket {
 	CLXP_IC_INBOUND_DISPATCH, /* recv side: verify + dispatch */
 	/* --- local write-side machinery (undo + ITL + WAL, per DML) --- */
 	CLXP_LOCAL_UNDO_ITL_WAL,
+	/*
+	 * Commit-path decomposition (spec-7.4 D0 census; D4 makes them a
+	 * permanent surface).  All are requester-exclusive-wait: the
+	 * committing backend alone spends the interval, so per-commit
+	 * nanos/event means are directly comparable against the client-side
+	 * end-to-end commit latency denominator.
+	 *
+	 * APPENDED at the tail on purpose: bucket indexes address a shmem
+	 * array, so the enum is append-only (an insertion renumbers every
+	 * later bucket and any stale .o keeps writing the old index).
+	 */
+	CLXP_C_COMMIT_UNDO_FLUSH,  /* pre-commit undo segment fsync */
+	CLXP_C_COMMIT_ITL_STAMP,   /* pre-commit ITL COMMITTED stamp + WAL */
+	CLXP_C_COMMIT_TT_STAMP,	   /* pre-commit durable TT slot commit_scn stamp */
+	CLXP_C_COMMIT_WAL_FLUSH,   /* commit-record XLogFlush (incl. group-commit queue) */
+	CLXP_C_COMMIT_QUORUM_READ, /* PRE_COMMIT local quorum/lease read */
 	CLXP_NBUCKETS
 } ClusterXnodeBucket;
 

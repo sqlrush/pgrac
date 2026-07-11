@@ -93,6 +93,13 @@
  *	    XactLog{Commit,Abort}Record with the same byte-identical-WAL
  *	    guarantee when --disable-cluster (InvalidScn suppresses section).
  *
+ *	What changed (spec-7.4 D1):
+ *	  - RecordTransactionCommitPrepared(): durable-frontier LSN fill-in
+ *	    after XactLogCommitRecord;  frontier discharge after
+ *	    END_CRIT_SECTION (prepared commits always XLogFlush).
+ *	  - FinishPreparedTransaction() commit-path PG_CATCH: unblock the
+ *	    durable frontier on a precommit ERROR.
+ *
  *	Why:
  *	  Spec-1.16 v0.2 Q5 REVISED -- PG's durable commit point for 2PC is
  *	  RecordTransactionCommitPrepared, not PREPARE.  PREPARE leaves the
@@ -1544,6 +1551,9 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		PG_CATCH();
 		{
 			cluster_backup_pending_commit_abort(0, (Datum)0);
+			/* PGRAC: spec-7.4 D1 -- unblock the durable frontier; the
+			 * allocated commit SCN never became a commit record. */
+			(void)cluster_scn_durable_pending_abort_self();
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -2387,6 +2397,15 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 								 commit_scn,	/* PGRAC: spec-1.18 */
 								 NULL);			/* PGRAC: spec-3.18 D4.1: 2PC keeps standalone 0x30 */
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-7.4 D1 -- record the commit-record LSN on the durable
+	 * pending entry (crit-section-safe shmem write).  Prepared commits
+	 * always flush below, so the discharge happens after END_CRIT_SECTION
+	 * in this same function. */
+	if (SCN_VALID(commit_scn))
+		(void) cluster_scn_durable_pending_fill_lsn(commit_scn, recptr);
+#endif
+
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */
 		replorigin_session_advance(replorigin_session_origin_lsn, XactLastRecEnd);
@@ -2425,7 +2444,12 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 #ifdef USE_PGRAC_CLUSTER
 	(void)cluster_scn_pending_commit_clear(commit_scn);
 	if (SCN_VALID(commit_scn))
+	{
 		(void)cluster_adg_emit_thread_barrier();
+		/* PGRAC: spec-7.4 D1 -- prepared commits always XLogFlush above;
+		 * discharge the durable frontier outside the critical section. */
+		(void)cluster_scn_durable_pending_discharge_scn(commit_scn);
+	}
 #endif
 
 	/*

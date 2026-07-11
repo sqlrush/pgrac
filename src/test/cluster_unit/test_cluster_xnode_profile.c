@@ -135,7 +135,8 @@ ut_bucket_events(ClusterXnodeBucket b)
 
 /* ----------
  * U1 — bucket enum completeness: every bucket has a unique non-NULL
- * name; out-of-range returns NULL; the enum has the spec'd 23 buckets.
+ * name; out-of-range returns NULL; the enum has the spec'd 23 buckets
+ * (spec-5.59) + 5 commit-decomposition buckets (spec-7.4 D0) = 28.
  * ----------
  */
 UT_TEST(test_u1_bucket_enum_complete)
@@ -143,7 +144,7 @@ UT_TEST(test_u1_bucket_enum_complete)
 	int i;
 	int j;
 
-	UT_ASSERT_EQ(CLXP_NBUCKETS, 23);
+	UT_ASSERT_EQ(CLXP_NBUCKETS, 28);
 	for (i = 0; i < CLXP_NBUCKETS; i++) {
 		const char *name = cluster_xp_bucket_name((ClusterXnodeBucket)i);
 
@@ -287,7 +288,7 @@ UT_TEST(test_u4_off_path_zero_syscall)
 UT_TEST(test_u5_dump_key_surface)
 {
 	UT_ASSERT_EQ(CLUSTER_XP_N_PROBE_KEYS, 5);
-	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS, 51);
+	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS, 61);
 }
 
 /* ----------

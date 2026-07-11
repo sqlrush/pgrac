@@ -594,6 +594,10 @@ extern int cluster_interconnect_rdma_max_send_wr;
  * rate caps actual sweep frequency (Min(WalWriterDelay, this)).
  */
 extern int cluster_boc_sweep_interval_ms;
+/* spec-7.4 D1-2: event-driven BOC durable-frontier publish (dirty +
+ * LMON wakeup + payload v1 attach).  off = pre-D1 sweep-only channel,
+ * byte-identical 0-length BOC frames and no event wakeups. */
+extern bool cluster_boc_event_publish;
 
 
 /*
