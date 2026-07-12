@@ -81,6 +81,7 @@ bool cluster_enabled = true;
 int cluster_node_id = 0;
 int cluster_gcs_block_dedup_max_entries = 4;
 int cluster_gcs_block_retransmit_max_retries = 4;
+int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int MaxConnections = 1;
 bool IsUnderPostmaster = false;
@@ -93,11 +94,13 @@ static TimestampTz fake_now = 1000000000;
 static int fake_declared_nodes = 1;
 
 /*
- * With backoff 100ms x (2^4 - 1) = 1500ms total budget, the 2x
- * out-of-window threshold used by both eager reclaim and the TTL sweep is
- * 3,000,000 us.  Tests age entries past it by advancing fake_now.
+ * The out-of-window threshold covers the LEGAL request lifetime: backoff
+ * 100ms x (2^4 - 1) = 1500ms PLUS (4 + 1) reply-timeout windows x 5000ms
+ * = 25000ms, doubled = 53,000,000 us.  (The pre-lifetime-fix threshold,
+ * 2x backoff only, was 3,000,000 us — it swept entries of still-live
+ * requests mid-flight.)  Tests age entries past it by advancing fake_now.
  */
-#define UT_OUT_OF_WINDOW_US INT64CONST(3000000)
+#define UT_OUT_OF_WINDOW_US INT64CONST(53000000)
 
 /* ============================================================
  * Stubs to link cluster_gcs_block_dedup.o standalone.

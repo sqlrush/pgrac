@@ -392,9 +392,23 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 		 * duplicate.  This branch fires WHETHER OR NOT completed_at_ts
 		 * is zero — the forward install_reply path stamps completed_at_ts
 		 * so TTL sweep can age the entry; consumers distinguish FORWARDED
-		 * from genuine CACHED_REPLY via the status field. */
+		 * from genuine CACHED_REPLY via the status field.
+		 *
+		 * A READ_IMAGE_FROM_XHOLDER entry is a forward marker TOO when it
+		 * came from the xheld-read FORWARD install (no page payload;
+		 * forwarding_master_node stamped).  Classifying that marker as
+		 * CACHED_REPLY resends it payload-less: its header checksum was
+		 * never computed (0), and the 31-hash of the all-zero page is also
+		 * 0, so the resend VERIFIES at the requester and installs a zero
+		 * page — a PageIsNew false-empty read (8.A).  The master-DIRECT
+		 * xheld serve also installs READ_IMAGE but WITH the page and with
+		 * NO_FORWARDING_MASTER — that one is a genuine cached reply, so the
+		 * forwarding_master_node field is the discriminator. */
 		if (entry->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-			|| entry->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+			|| entry->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+			|| (entry->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+				&& GcsBlockReplyHeaderGetForwardingMasterNode(&entry->reply_header)
+					   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)) {
 			if (cached_reply_out != NULL)
 				*cached_reply_out = *entry;
 			LWLockRelease(&shard->lock.lock);
@@ -548,18 +562,23 @@ cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key)
 
 /*
  * Compute the configured expiry threshold in microseconds.  The threshold
- * is 2 × the total exponential backoff window (so both completed and
- * in-flight entries are gone before the next retry round could possibly
- * re-arrive after a hot reconfig).  We approximate using the GUC
- * defaults; configurable backoff bases produce slightly larger thresholds
- * — sweeping conservatively biases toward retention.
+ * is 2 × the LEGAL REQUEST LIFETIME: every attempt may wait out a full
+ * cluster.gcs_reply_timeout_ms before its retry fires, so the lifetime is
+ * (max_retries + 1) reply-timeout windows PLUS the exponential backoff
+ * total.  The pre-fix formula covered only the backoff component — with
+ * the defaults that swept a still-live request's entry at 3s while its
+ * attempts legally span ~26.5s (S3 rig: 25.5s vs 57.75s), so a late
+ * retransmit re-registered as a MISS and re-executed a request whose
+ * earlier attempt may already have granted.  Sweeping conservatively
+ * biases toward retention.
  */
 static int64
 dedup_expiry_threshold_us(void)
 {
 	int64 initial_ms;
 	int max_retries;
-	int64 total_backoff_ms;
+	int64 reply_timeout_ms;
+	int64 lifetime_ms;
 
 	initial_ms = cluster_gcs_block_retransmit_initial_backoff_ms > 0
 					 ? cluster_gcs_block_retransmit_initial_backoff_ms
@@ -567,13 +586,15 @@ dedup_expiry_threshold_us(void)
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
 					  : 4;
+	reply_timeout_ms = cluster_gcs_reply_timeout_ms > 0 ? cluster_gcs_reply_timeout_ms : 5000;
 
-	/* total = initial × (2^max_retries - 1);  pin small max_retries to
-	 * keep arithmetic in int64. */
+	/* backoff total = initial × (2^max_retries - 1);  pin small max_retries
+	 * to keep arithmetic in int64. */
 	if (max_retries > 30)
 		max_retries = 30;
-	total_backoff_ms = initial_ms * ((int64)((1u << max_retries) - 1));
-	return total_backoff_ms * 1000 * 2; /* × 2 safety margin (HC93) */
+	lifetime_ms = initial_ms * ((int64)((1u << max_retries) - 1))
+				  + (int64)(max_retries + 1) * reply_timeout_ms;
+	return lifetime_ms * 1000 * 2; /* × 2 safety margin (HC93) */
 }
 
 /*

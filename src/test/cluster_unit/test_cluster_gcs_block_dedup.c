@@ -20,7 +20,7 @@
  *	  cluster_tap t/112_gcs_block_retransmit_2node.pl;  the multi-tag ->
  *	  multi-worker dispatch e2e + injection-forced misroute land in D9.
  *
- *	  Tests (U1-U9):
+ *	  Tests (U1-U12):
  *	    U1  per-worker isolation: install on shard 0 is invisible to shard 1
  *	    U2  dedup per-shard: MISS -> IN_FLIGHT_DUPLICATE -> CACHED_REPLY
  *	    U3  counter accessors sum across shards
@@ -30,6 +30,9 @@
  *	    U7  per-shard cap: fill shard 0 to cap -> FULL + full_count++
  *	    U8  cross-shard TTL sweep reaches every shard
  *	    U9  backend-exit cleanup reaches every shard
+ *	    U10 remove releases an IN_FLIGHT entry for re-evaluation
+ *	    U11 READ_IMAGE forward marker -> FORWARDED; direct serve -> CACHED
+ *	    U12 TTL threshold covers the (retries+1) x reply-timeout lifetime
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -94,6 +97,7 @@ int MaxConnections = 1; /* spec-7.2a D4 floor input (x declared nodes = 1) */
 int cluster_gcs_block_dedup_max_entries = 8;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int cluster_gcs_block_retransmit_max_retries = 4;
+int cluster_gcs_reply_timeout_ms = 5000;
 int MyBackendId = 1;
 bool IsUnderPostmaster = true;
 
@@ -630,10 +634,107 @@ UT_TEST(u10_remove_reopens_in_flight_entry)
 }
 
 
+/* ============================================================
+ * U11 — a READ_IMAGE forward MARKER classifies FORWARDED, a master-direct
+ * READ_IMAGE cached serve stays CACHED.
+ *
+ *	The xheld-read FORWARD install stamps forwarding_master_node and
+ *	carries no page; treating it as CACHED_REPLY resends a payload-less
+ *	header whose never-computed checksum (0) matches the 31-hash of the
+ *	all-zero page — a verifying zero-page install at the requester
+ *	(PageIsNew false-empty read, 8.A).  The master-DIRECT xheld serve
+ *	installs READ_IMAGE with NO_FORWARDING_MASTER + the real page and
+ *	must keep resending as a genuine cached reply.
+ * ============================================================ */
+UT_TEST(u11_read_image_marker_classifies_forwarded)
+{
+	GcsBlockDedupKey km = make_key(0, 4, 500, 7);
+	GcsBlockDedupKey kd = make_key(0, 4, 501, 7);
+	BufferTag t = make_tag(95);
+	GcsBlockDedupEntry cached;
+	GcsBlockReplyHeader hdr;
+	static char page[GCS_BLOCK_DATA_SIZE];
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	/* forward MARKER: forwarding_master_node stamped, no payload. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.request_id = 500;
+	hdr.sender_node = 2; /* holder id rides here (HC113) */
+	hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, 0);
+	cluster_gcs_block_dedup_install_reply(0, &km, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &hdr,
+										  NULL);
+	memset(&cached, 0, sizeof(cached));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ((int)cached.reply_header.sender_node, 2);
+
+	/* master-DIRECT cached serve: NO_FORWARDING_MASTER + real page. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.request_id = 501;
+	hdr.sender_node = 0;
+	hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	memset(page, 0x3c, sizeof(page));
+	cluster_gcs_block_dedup_install_reply(0, &kd, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &hdr,
+										  page);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+}
+
+
+/* ============================================================
+ * U12 — the TTL threshold covers the LEGAL request lifetime.
+ *
+ *	Every attempt may wait a full cluster.gcs_reply_timeout_ms before its
+ *	retry fires, so an in-flight entry is live for up to
+ *	(max_retries + 1) x reply_timeout + total backoff.  The pre-fix
+ *	threshold (2 x backoff only) swept a still-live request's entry
+ *	mid-flight (S3 rig: 25.5s TTL vs 57.75s lifetime) — the late
+ *	retransmit then re-registered as MISS and re-executed a request whose
+ *	earlier attempt may already have granted.
+ * ============================================================ */
+UT_TEST(u12_ttl_covers_reply_timeout_lifetime)
+{
+	GcsBlockDedupKey k = make_key(0, 5, 600, 7);
+	BufferTag t = make_tag(96);
+	GcsBlockDedupEntry cached;
+	TimestampTz t0;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	/* S3 rig shape: 8 retries x 50ms backoff base, 5s reply timeout ->
+	 * lifetime = 12.75s backoff + 45s reply windows = 57.75s. */
+	cluster_gcs_block_retransmit_initial_backoff_ms = 50;
+	cluster_gcs_block_retransmit_max_retries = 8;
+	cluster_gcs_reply_timeout_ms = 5000;
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	t0 = GetCurrentTimestamp();
+
+	/* 40s in: inside the legal lifetime — must SURVIVE the sweep. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)40 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+
+	/* far past 2 x lifetime — must be swept. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)300 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+	cluster_gcs_block_retransmit_max_retries = 4;
+	cluster_gcs_reply_timeout_ms = 5000;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);
@@ -644,6 +745,8 @@ main(void)
 	UT_RUN(u8_ttl_sweep_all_shards);
 	UT_RUN(u9_backend_exit_cleanup_all_shards);
 	UT_RUN(u10_remove_reopens_in_flight_entry);
+	UT_RUN(u11_read_image_marker_classifies_forwarded);
+	UT_RUN(u12_ttl_covers_reply_timeout_lifetime);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

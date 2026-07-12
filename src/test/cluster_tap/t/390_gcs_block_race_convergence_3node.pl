@@ -334,7 +334,7 @@ for my $i (1 .. 14)
 		# restorable by a plain node2 re-read below.
 		wait_probe_done($node0, "UPDATE $t %", 15);
 		cont_n2_lms();
-		$bg->quit;
+		eval { $bg->quit };
 		if (read_retry($node2, "SELECT sum(v) FROM $t"))
 		{
 			push @local_up, $t;
@@ -346,7 +346,7 @@ for my $i (1 .. 14)
 		# conclude on its own (grant or bounded error), then discard.
 		cont_n2_lms();
 		wait_probe_done($node0, "UPDATE $t %", 30);
-		$bg->quit;
+		eval { $bg->quit };
 	}
 	note("L3 probe $t is_local=$is_local");
 }
@@ -378,8 +378,8 @@ SKIP:
 
 	wait_probe_done($node0, "UPDATE $ta %", 15);
 	wait_probe_done($node0, "UPDATE $tb %", 15);
-	$bgA->quit;
-	$bgB->quit;
+	eval { $bgA->quit };
+	eval { $bgB->quit };
 
 	my ($va) = $node0->safe_psql('postgres', "SELECT v FROM $ta WHERE id = 2");
 	my ($vb) = $node0->safe_psql('postgres', "SELECT v FROM $tb WHERE id = 2");
