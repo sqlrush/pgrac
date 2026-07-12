@@ -461,7 +461,7 @@ ut_drain_and_collect(int rx_fd, char *acc, long acc_cap, long expected)
 static int ut_tx_fd = -1;			  /* tier1's registered peer fd (we hold a copy) */
 static int ut_rx_fd = -1;			  /* our end of the wire */
 static char ut_acc[64 * 1024 * 1024]; /* shared stream accumulator */
-static long ut_junk_a = 0; /* junk bytes written ahead of frame A / frame B */
+static long ut_junk_a = 0;			  /* junk bytes written ahead of frame A / frame B */
 static long ut_junk_b = 0;
 
 UT_TEST(test_connect_registers_peer_fd)
