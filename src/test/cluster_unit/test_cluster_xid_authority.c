@@ -561,15 +561,13 @@ UT_TEST(test_mark_raw_reused_upgrades_old_magic_copies)
 	cluster_xid_authority_mark_native_raw_reused();
 
 	read_raw_image(primary_path, image, sizeof(image));
-	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)),
-				 CLUSTER_XID_AUTHORITY_VALID);
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)), CLUSTER_XID_AUTHORITY_VALID);
 	memcpy(&hdr, image, sizeof(hdr));
 	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
 	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
 
 	read_raw_image(bak_path, image, sizeof(image));
-	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)),
-				 CLUSTER_XID_AUTHORITY_VALID);
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)), CLUSTER_XID_AUTHORITY_VALID);
 	memcpy(&hdr, image, sizeof(hdr));
 	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
 	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
