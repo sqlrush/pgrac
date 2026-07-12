@@ -496,8 +496,12 @@ test_cluster_oid_lease: test_cluster_oid_lease.c unit_test.h \
 # openers, pg_fsync, durable_rename and the ereport machinery are stubbed
 # locally; CRC32C comes from libpgport.  The startup wiring (bootstrap adopt,
 # StartupXLOG horizon merge, shutdown-checkpoint publish) is TAP territory.
+# GCS-race round-2 review F1: the provable_full judge widens through
+# cluster_xid_widen, so cluster_xid_stripe.o joins the link (its runtime
+# wrapper deps are abort-stubbed; only the pure widen path runs).
 CLUSTER_XID_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_xid_authority.o \
-	$(top_builddir)/src/backend/cluster/cluster_xid_prehistory.o
+	$(top_builddir)/src/backend/cluster/cluster_xid_prehistory.o \
+	$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 		$(CLUSTER_XID_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

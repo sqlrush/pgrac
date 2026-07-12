@@ -269,6 +269,16 @@ extern void cluster_rtvis_verdict_note_inadmissible(void);
 extern uint64 cluster_rtvis_underivable_failclosed_count(void);
 extern void cluster_rtvis_note_underivable_failclosed(void);
 
+/*
+ * GCS-race round-2 RC-E: native-prehistory coverage latch + LOCAL-routing
+ * counter.  The latch is write-once per boot (startup process, post-recovery
+ * verify); 0 = coverage not proven, resolver stays fail-closed (53R97).
+ */
+extern void cluster_cr_native_prehistory_latch(uint64 native_hw_full);
+extern uint64 cluster_cr_native_prehistory_covered_hw(void);
+extern uint64 cluster_rtvis_native_prehistory_local_count(void);
+extern void cluster_rtvis_note_native_prehistory_local(void);
+
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
 extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);

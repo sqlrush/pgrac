@@ -2832,6 +2832,10 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* GCS-race round-2 RC-E: recycled refs the native-prehistory gate routed
+	 * to the local adopted CLOG instead of failing closed. */
+	emit_row(rsinfo, "cr", "rtvis_native_prehistory_local_count",
+			 fmt_int64((int64)cluster_rtvis_native_prehistory_local_count()));
 	/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcomes. */
 	emit_row(rsinfo, "cr", "vis_freshref_verdict_resolved_count",
 			 fmt_int64((int64)cluster_vis_freshref_verdict_resolved_count()));
@@ -3381,6 +3385,10 @@ dump_catalog(ReturnSetInfo *rsinfo)
 				 fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) != 0));
 		emit_row(rsinfo, "catalog", "xid_prehistory_adopted",
 				 fmt_bool(cluster_xid_prehistory_was_adopted()));
+		/* GCS-race round-2 RC-E: post-recovery verified coverage latch
+		 * (0 = not proven this boot; resolver stays fail-closed). */
+		emit_row(rsinfo, "catalog", "xid_native_prehistory_covered_hw",
+				 fmt_int64((int64)cluster_cr_native_prehistory_covered_hw()));
 	}
 
 	/*

@@ -181,9 +181,89 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 			 errhint(
 				 "Start the seed with cluster.enabled=off, stop it cleanly, then start joiners.")));
 
-	if (cluster_catalog_backup_label_present())
-		elog(LOG, "cluster shared_catalog: skipped XID prehistory adopt on backup_label boot");
-	else {
+	if (cluster_catalog_backup_label_present()) {
+		uint64 own_next = 0;
+
+		/*
+		 * PGRAC (GCS-race round-2 RC-E supply-side fix): a backup_label boot
+		 * used to skip the adopt unconditionally, assuming a post-seed
+		 * backup whose pg_xact already carries the native bits.  A PRE-seed
+		 * base backup (the RACvsRAC S3 bring-up) breaks that assumption:
+		 * the clone's pg_xact predates every native seed xid, recovery
+		 * replays only the clone's own pre-seed WAL window, and the sealed
+		 * blob is the ONLY supply of the native outcomes -- skipping left
+		 * the joiner unable to prove any native xid (155k fail-closed storm
+		 * on xid 815).
+		 *
+		 * Adoption is lineage-safe exactly here: backup_label still present
+		 * means this node has NEVER completed a boot since it was cloned
+		 * (the first recovery renames the label), so its entire local
+		 * history is a subset of the seed lineage by construction -- a
+		 * clone that ran standalone would have consumed the label and takes
+		 * the anchor + prefix-check path below.
+		 *
+		 * Within the same lineage the adopt needs NO horizon comparison --
+		 * overwriting [blob start, native_hw) is idempotent same-lineage
+		 * truth on any clone that already carries (possibly torn) native
+		 * bits, and the post-recovery verify (StartupXLOG tail) re-proves
+		 * the whole range before the resolver may route native xids locally.
+		 *
+		 * One gate stands (round-2 review F3): the clone's OWN xid epoch.  A
+		 * clone taken after an xid epoch rollover reuses the pg_xact
+		 * positions below the native high-water for cluster-era xids;
+		 * adopting native bits over them would corrupt live outcomes.  The
+		 * clone's own pre-adopt nextFullXid comes from the local control
+		 * file when it is still per-node, or from the pre-migration epoch
+		 * witness under cluster.controlfile_shared_authority (the local
+		 * global/pg_control is then a symlink to the SHARED authority whose
+		 * checkpoint fields belong to the last permitted writer, not to
+		 * this clone -- reading it through the symlink would compare the
+		 * seed's own high-water against itself; the B3 trap).
+		 */
+		if (!cluster_controlfile_shared_authority)
+			own_next = U64FromFullTransactionId(cf->checkPointCopy.nextXid);
+		else if (!cluster_xid_epoch_witness_read(DataDir, &own_next))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("local xid epoch witness is unavailable for the backup_label "
+							"prehistory adopt"),
+					 errdetail("Under cluster.controlfile_shared_authority the local control "
+							   "file is the shared symlink, and no pre-migration witness "
+							   "\"%s\" passes validation.",
+							   CLUSTER_XID_EPOCH_WITNESS_REL_PATH),
+					 errhint("Re-provision this node from the seed lineage.")));
+
+		if (own_next >= auth.native_hw_full) {
+			/*
+			 * Round-3 review P0-2: the pre-adopt horizon is NOT donor-local
+			 * truth.  pg_basebackup follows the shared-authority symlink
+			 * (basebackup.c Dc6), so the clone's control file -- and the
+			 * witness derived from it -- carries the LAST PERMITTED WRITER's
+			 * checkpointed nextXid, which can lag the actual donor (another
+			 * node may have allocated far past it, even across an epoch
+			 * rollover).  The only value this horizon can PROVE is "the
+			 * authority was last checkpointed strictly before the seal", and
+			 * that is exactly own_next < native_hw_full: no cluster-era xid
+			 * (>= stripe floor >= hw) can exist anywhere under that reading,
+			 * so the clone's lineage is a seed-lineage subset and the adopt
+			 * is idempotent truth.  Anything else -- post-seal backups
+			 * (native bits already carried), epoch rollovers (pg_xact
+			 * positions reused) -- skips: the coverage verify + repair path
+			 * (or 53R97) covers those without ever overwriting live
+			 * outcomes.  Same predicate as the anchor path's adopt gate.
+			 */
+			elog(LOG,
+				 "cluster shared_catalog: skipped XID prehistory adopt on backup_label boot; "
+				 "pre-adopt nextXid %llu is not strictly below the native high-water %llu",
+				 (unsigned long long)own_next, (unsigned long long)auth.native_hw_full);
+		} else {
+			cluster_xid_prehistory_adopt(DataDir, auth.native_hw_full);
+			elog(LOG,
+				 "cluster shared_catalog: adopted XID prehistory through native high-water %llu "
+				 "on backup_label boot",
+				 (unsigned long long)auth.native_hw_full);
+		}
+	} else {
 		ClusterRecoveryAnchor ra;
 		uint64 own_next;
 
@@ -215,8 +295,18 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf,
 		 * and truncated away are no alibi for the surviving range, and a
 		 * missing local page inside the comparable range fails closed
 		 * (UNAVAILABLE) instead of passing as a shorter clone.
+		 *
+		 * Epoch gate (round-2 review F3): past an xid epoch rollover the
+		 * node's pg_xact positions below the native high-water belong to
+		 * cluster-era xids, so the byte compare against the native blob is
+		 * meaningless -- it would FATAL a legitimate wrap-era node.  The
+		 * 32-bit oldestXid raw value cannot express the epoch, so gate on
+		 * the anchor's full nextXid instead; post-wrap the prehistory
+		 * machinery is dead anyway (the coverage latch refuses to engage
+		 * and the resolver's widen judge proves nothing native).
 		 */
-		if ((uint64)ra.checkPointCopy.oldestXid <= auth.native_hw_full) {
+		if (own_next <= (uint64)PG_UINT32_MAX
+			&& (uint64)ra.checkPointCopy.oldestXid <= auth.native_hw_full) {
 			ClusterXidPrefixVerdict pv;
 
 			pv = cluster_xid_prehistory_prefix_check(DataDir, auth.native_hw_full,

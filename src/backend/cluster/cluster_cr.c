@@ -188,6 +188,19 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 vis_freshref_verdict_resolved_count;
 	pg_atomic_uint64 vis_freshref_verdict_failclosed_count;
 	/*
+	 * GCS-race round-2 RC-E: native-prehistory LOCAL routing.
+	 * native_prehistory_covered_hw is a WRITE-ONCE latch (not a counter):
+	 * the startup process stores the sealed native high-water here after
+	 * the post-recovery verify proved the local pg_xact byte-matches the
+	 * sealed prehistory blob over the whole surviving native range.  0
+	 * means "not proven this boot" and keeps the resolver fail-closed for
+	 * below-floor xids (53R97).  rtvis_native_prehistory_local_count counts
+	 * recycled-ref resolutions the latch routed to the local adopted CLOG
+	 * instead of failing closed.
+	 */
+	pg_atomic_uint64 native_prehistory_covered_hw;
+	pg_atomic_uint64 rtvis_native_prehistory_local_count;
+	/*
 	 * spec-5.22d D4-4: dead/absent-owner authority block0 serve outcomes.
 	 * serve_hit = self-as-authority served a terminal verdict off the dead
 	 * owner's shared block0 (the D4-8 L1 hard assert lands here, proving the
@@ -347,6 +360,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->native_prehistory_covered_hw, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_native_prehistory_local_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_epoch_stale_reject_count, 0);
@@ -531,6 +546,37 @@ cluster_rtvis_note_underivable_failclosed(void)
 {
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
+}
+
+/*
+ * PGRAC: GCS-race round-2 RC-E — native-prehistory coverage latch.
+ *
+ * The setter runs exactly once per boot, in the startup process after the
+ * post-recovery verify proved local pg_xact == sealed prehistory blob over
+ * [oldestXid, native_hw).  Backends fork after (or read the atomic after) the
+ * store, so a nonzero read is always a fully-verified high-water; readers
+ * that observe 0 simply stay fail-closed (never wrong, at worst 53R97).
+ */
+void
+cluster_cr_native_prehistory_latch(uint64 native_hw_full)
+{
+	if (CRShared != NULL)
+		pg_atomic_write_u64(&CRShared->native_prehistory_covered_hw, native_hw_full);
+}
+
+uint64
+cluster_cr_native_prehistory_covered_hw(void)
+{
+	if (CRShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&CRShared->native_prehistory_covered_hw);
+}
+
+void
+cluster_rtvis_note_native_prehistory_local(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_native_prehistory_local_count, 1);
 }
 
 /* PGRAC: spec-5.22f D6-3 — fresh-remote-ITL-ref widening outcome bumps
@@ -725,6 +771,9 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivabl
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count,
 					vis_freshref_verdict_resolved_count)
+/* GCS-race round-2 RC-E: native-prehistory LOCAL routing counter. */
+CR_COUNTER_ACCESSOR(cluster_rtvis_native_prehistory_local_count,
+					rtvis_native_prehistory_local_count)
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_failclosed_count,
 					vis_freshref_verdict_failclosed_count)
 /* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */

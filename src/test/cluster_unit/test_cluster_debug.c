@@ -1962,6 +1962,17 @@ cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;
 }
+/* GCS-race round-2 RC-E: native-prehistory coverage latch + LOCAL counter. */
+uint64
+cluster_cr_native_prehistory_covered_hw(void)
+{
+	return 0;
+}
+uint64
+cluster_rtvis_native_prehistory_local_count(void)
+{
+	return 0;
+}
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 uint64
 cluster_vis_freshref_verdict_resolved_count(void)
