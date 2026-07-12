@@ -38,6 +38,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/file.h> /* round-3b P0-1: flock mutation lock */
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -409,6 +410,99 @@ write_header_both(ClusterXidAuthorityHeader *hdr)
 }
 
 /*
+ * Round-3b review P0-1: cross-node authority mutation lock.
+ *
+ * Every transition below is a read-modify-write of the SAME shared file
+ * pair from multiple nodes (concurrent first cluster boots stamping
+ * CLUSTER_ERA, every LMON re-asserting NATIVE_RAW_REUSED inside the same
+ * herding window, a follow-up native run unsealing).  The per-writer tmp
+ * names only keep the STAGING private; two unserialized read-modify-writes
+ * can still install each other's stale header -- erasing a one-way flag or
+ * the RAW_REUSED magic -- and the LMON never re-reads after marked/done,
+ * so a lost stamp could let a later boot re-latch the native prehistory
+ * after the wrap (rule 8.A).  Serialize with flock(2) on a dedicated lock
+ * file in the shared root: the kernel drops the lock on any process exit
+ * (crash-safe, no stale-lockfile recovery), and the shared-FS tier
+ * presents it cluster-wide.  Every transition re-reads the freshest header
+ * INSIDE the critical section, applies its change to that image (one-way
+ * flag ORs and monotone maxes make sequential application a merge), writes,
+ * and read-back-verifies both installed copies.
+ *
+ * Mixed-version (round-4 review): a pre-flock binary does not take this
+ * lock, and the barrier bit (XID_NATIVE_DISABLE_V1) does NOT prove the
+ * flock protocol -- a round-3b binary advertises it while still writing
+ * lock-free.  The wrap barrier therefore refuses to open the allocation
+ * gate until every conf-declared member is connected and advertises the
+ * DISTINCT XID_AUTHORITY_FLOCK_V2 capability; pre-gate erases by such a
+ * writer are harmless (no epoch-1 xid exists yet) and are repaired by the
+ * tick's settle re-assert.  Post-stamp, an old binary fail-closes on the
+ * RAW_REUSED magic before it can reach any transition write.  Cross-host
+ * advisory-lock fidelity is a property of the shared-FS tier; the
+ * production backend contract (spec-6.0a) must pin it, and the gate's
+ * settle re-verify stays the last line either way.
+ */
+static int
+authority_mutation_lock(void)
+{
+	char path[MAXPGPATH];
+	int fd;
+
+	if (!build_path(path, sizeof(path), CLUSTER_XID_AUTHORITY_LOCK_REL_PATH))
+		return -1; /* no shared root configured: nothing shared to race */
+	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", path)));
+	while (flock(fd, LOCK_EX) != 0) {
+		if (errno == EINTR)
+			continue;
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not lock file \"%s\": %m", path)));
+	}
+	return fd;
+}
+
+static void
+authority_mutation_unlock(int lockfd)
+{
+	if (lockfd < 0)
+		return;
+	/* the flock drops with the descriptor */
+	if (CloseTransientFile(lockfd) != 0)
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m",
+														  CLUSTER_XID_AUTHORITY_LOCK_REL_PATH)));
+}
+
+/*
+ * verify_installed -- read back one installed copy and require it to match
+ * the just-written header exactly (magic / flags / high-waters; the CRC is
+ * implied by classify).  Under the mutation lock nobody else may write, so
+ * any mismatch means the durable rename did not land what we staged --
+ * storage-level damage, not a concurrency artifact -- and consuming it
+ * could hand out a pre-transition image (rule 8.A).  PANIC.
+ */
+static void
+verify_installed(const char *relpath, const ClusterXidAuthorityHeader *want)
+{
+	ClusterXidAuthorityHeader got;
+	char path[MAXPGPATH];
+	char image[CLUSTER_XID_AUTHORITY_FILE_SIZE];
+
+	if (!build_path(path, sizeof(path), relpath))
+		return;
+	if (read_image(path, image) != CLUSTER_XID_AUTHORITY_VALID)
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						errmsg("shared XID authority read-back failed for \"%s\" after install",
+							   relpath)));
+	memcpy(&got, image, sizeof(got));
+	if (got.magic != want->magic || got.flags != want->flags
+		|| got.native_hw_full != want->native_hw_full || got.next_multi != want->next_multi)
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						errmsg("shared XID authority read-back mismatch for \"%s\" after install",
+							   relpath),
+						errdetail("magic %08X/%08X flags %04X/%04X (installed/expected).",
+								  got.magic, want->magic, got.flags, want->flags)));
+}
+
+/*
  * cluster_xid_authority_seed_if_absent -- read-then-seed: if the authority is
  * already present (any trustworthy image) do nothing; otherwise create the
  * unsealed initial image.  Returns true when this call created it.
@@ -417,21 +511,30 @@ bool
 cluster_xid_authority_seed_if_absent(uint64 initial_native_hw)
 {
 	ClusterXidAuthorityHeader hdr;
+	int lockfd;
 
-	if (cluster_xid_authority_read(&hdr))
-		return false; /* already seeded (join node / prior seed) */
+	/* round-4 P0-1 (review P1): the read AND the corrupt-vs-absent probe
+	 * both run under the lock -- a pre-lock probe could see a concurrent
+	 * seeder's half-visible install and mis-FATAL a healthy tree. */
+	lockfd = authority_mutation_lock();
+	if (cluster_xid_authority_read(&hdr)) {
+		/* already seeded (join node / prior seed / concurrent seeder) */
+		authority_mutation_unlock(lockfd);
+		return false;
+	}
 	if (cluster_xid_authority_present())
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 						errmsg("shared XID authority is present but corrupt at seed"),
 						errhint("Restore \"%s\" (or its .bak) from a backup of the shared tree; "
 								"do not re-seed from a stale xid high-water.",
 								CLUSTER_XID_AUTHORITY_REL_PATH)));
-
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.flags = 0;
 	hdr.native_hw_full = initial_native_hw;
 	hdr.next_multi = 0;
 	write_header(&hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
 	return true;
 }
 
@@ -446,7 +549,10 @@ void
 cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 next_multi, bool seal)
 {
 	ClusterXidAuthorityHeader hdr;
+	int lockfd;
 
+	/* round-3b P0-1: fresh read + apply + install are one critical section */
+	lockfd = authority_mutation_lock();
 	if (!cluster_xid_authority_read(&hdr)) {
 		if (cluster_xid_authority_present())
 			ereport(PANIC,
@@ -466,6 +572,8 @@ cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 next_multi, b
 		hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_SEALED;
 
 	write_header(&hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
 }
 
 /*
@@ -482,17 +590,25 @@ void
 cluster_xid_authority_mark_cluster_era(void)
 {
 	ClusterXidAuthorityHeader hdr;
+	int lockfd;
 
+	/* round-3b P0-1: fresh read + apply + install are one critical section */
+	lockfd = authority_mutation_lock();
 	if (!cluster_xid_authority_read(&hdr))
 		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 						errmsg("shared XID authority is missing or corrupt at cluster-era stamp")));
 
 	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA) != 0
-		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA, 0))
+		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA, 0)) {
+		authority_mutation_unlock(lockfd);
 		return; /* transition complete in both copies */
+	}
 
 	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA;
 	write_header_both(&hdr); /* review F1 variant: one-way flag in BOTH copies */
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_BAK_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
 }
 
 /*
@@ -512,18 +628,38 @@ void
 cluster_xid_authority_mark_native_raw_reused(void)
 {
 	ClusterXidAuthorityHeader hdr;
+	int lockfd;
 
+	/* round-3b P0-1: fresh read + apply + install are one critical section */
+	lockfd = authority_mutation_lock();
 	if (!cluster_xid_authority_read(&hdr))
 		ereport(PANIC,
 				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 				 errmsg("shared XID authority is missing or corrupt at native-raw-reused stamp")));
 
 	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0
-		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED, 0))
+		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED, 0)) {
+		authority_mutation_unlock(lockfd);
 		return; /* transition complete in both copies */
+	}
 
 	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED;
 	write_header_both(&hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_BAK_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
+}
+
+/*
+ * Round-3b P0-1: durable settle probe for the wrap barrier's gate-open
+ * re-verify.  True only when BOTH copies validate, carry the flag, and
+ * carry the stamped magic (the settle predicate already enforces the
+ * magic for RAW_REUSED, review P0-4).
+ */
+bool
+cluster_xid_authority_raw_reused_settled(void)
+{
+	return both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED, 0);
 }
 
 /*
@@ -556,7 +692,11 @@ void
 cluster_xid_authority_begin_native_run(void)
 {
 	ClusterXidAuthorityHeader hdr;
+	int lockfd;
 
+	/* round-3b P0-1: fresh read + apply + install are one critical section
+	 * (FATAL/PANIC exits drop the flock with the process) */
+	lockfd = authority_mutation_lock();
 	if (!cluster_xid_authority_read(&hdr))
 		ereport(PANIC, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 						errmsg("shared XID authority is missing or corrupt at native-run open")));
@@ -567,9 +707,14 @@ cluster_xid_authority_begin_native_run(void)
 				 errmsg("native seed era cannot be re-entered on a formed shared catalog tree")));
 
 	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0
-		&& both_copies_flags_settled(0, CLUSTER_XID_AUTHORITY_FLAG_SEALED))
+		&& both_copies_flags_settled(0, CLUSTER_XID_AUTHORITY_FLAG_SEALED)) {
+		authority_mutation_unlock(lockfd);
 		return; /* open, and no copy retains SEALED */
+	}
 
 	hdr.flags &= ~CLUSTER_XID_AUTHORITY_FLAG_SEALED;
 	write_header_both(&hdr); /* review F1: no copy may retain SEALED */
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_BAK_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
 }

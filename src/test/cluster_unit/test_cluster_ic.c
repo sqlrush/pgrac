@@ -91,6 +91,7 @@ bool cluster_ic_suppress_caps_reply = false;
 /* GCS-race round-2 RC-F mixed-version leg: same discipline for the
  * GCS_DONE_V1 completion-proof capability bit. */
 bool cluster_ic_suppress_gcs_done_cap = false;
+bool cluster_ic_suppress_xid_flock_cap = false;
 
 /* spec-5.59 D1 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -593,9 +594,9 @@ UT_TEST(test_hello_wire_reference_bytes)
 	/* capability bitmap: the unconditional protocol bits -- D4-6
 	 * authority-serve (0x2) + spec-5.22e D5-2 undo-horizon (0x4) +
 	 * CAPS_REPLY_V1 meta bit (0x8) + GCS-race round-2 F6 completion-proof
-	 * (0x10) + round-3 P0-1 xid wrap barrier (0x20) (smart-fusion is off
-	 * in this fixture) */
-	UT_ASSERT_EQ(wire[36], 0x3E);
+	 * (0x10) + round-3 P0-1 xid wrap barrier (0x20) + round-4 P0-1
+	 * authority flock (0x40) (smart-fusion is off in this fixture) */
+	UT_ASSERT_EQ(wire[36], 0x7E);
 	UT_ASSERT_EQ(wire[37], 0x00);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
@@ -692,7 +693,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
 				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
 					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
+					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
+					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -703,7 +705,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
 				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
 					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
+					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
+					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -715,7 +718,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
 					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
 					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1
-					 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
+					 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
+					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;

@@ -44,7 +44,9 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <sys/file.h> /* round-3b P0-1 lock interleave leg */
 #include <sys/stat.h>
+#include <sys/wait.h> /* round-3b P0-1 fork leg */
 #include <unistd.h>
 
 #include "access/clog.h"		/* GCS-race round-2 RC-E stub signatures */
@@ -568,6 +570,177 @@ UT_TEST(test_mark_raw_reused_upgrades_old_magic_copies)
 
 	read_raw_image(bak_path, image, sizeof(image));
 	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)), CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
+}
+
+/* Round-3b P0-1: the authority mutation flock serializes cross-process
+ * read-modify-writes, and a transition blocked on the lock re-reads the
+ * FRESHEST header once it gets in -- a stamp installed while it waited is
+ * merged (one-way OR), never erased.  Deterministic interleave: the parent
+ * holds the lock, forks a child whose mark_cluster_era blocks on it,
+ * installs a completed RAW_REUSED stamp (flag + stamped magic, both
+ * copies), then releases; the child's transition must land the UNION with
+ * the stamped magic in BOTH copies. */
+UT_TEST(test_mutation_lock_serializes_and_merges)
+{
+	ClusterXidAuthorityHeader hdr;
+	char lock_path[MAXPGPATH];
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char image[sizeof(ClusterXidAuthorityHeader)];
+	int lockfd;
+	pid_t child;
+	int status;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+
+	snprintf(lock_path, sizeof(lock_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_LOCK_REL_PATH);
+	snprintf(primary_path, sizeof(primary_path), "%s/%s", test_root,
+			 CLUSTER_XID_AUTHORITY_REL_PATH);
+	snprintf(bak_path, sizeof(bak_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+
+	lockfd = open(lock_path, O_RDWR | O_CREAT, 0600);
+	UT_ASSERT(lockfd >= 0);
+	UT_ASSERT_EQ(flock(lockfd, LOCK_EX), 0);
+
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		/* drop the INHERITED lock fd: flock lives on the open file
+		 * description, and a forked dup would keep the lock alive past
+		 * the parent's release */
+		close(lockfd);
+		cluster_xid_authority_mark_cluster_era();
+		_exit(0);
+	}
+
+	/* the child is (or will be) parked on the flock; install a COMPLETED
+	 * peer stamp under the lock: RAW_REUSED flag + stamped magic, both
+	 * copies */
+	usleep(200 * 1000);
+	read_raw_image(primary_path, image, sizeof(image));
+	memcpy(&hdr, image, sizeof(hdr));
+	hdr.magic = CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED;
+	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED;
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(hdr.crc);
+	memcpy(image, &hdr, sizeof(hdr));
+	write_raw_image(primary_path, image, sizeof(image));
+	write_raw_image(bak_path, image, sizeof(image));
+
+	close(lockfd); /* release: the child proceeds on the fresh image */
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* union in BOTH copies, stamped magic preserved */
+	read_raw_image(primary_path, image, sizeof(image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)), CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT_EQ(hdr.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+	read_raw_image(bak_path, image, sizeof(image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)), CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT_EQ(hdr.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+}
+
+/* Round-3b P0-1: a primary-only publish (roll-to-.bak write) re-reads the
+ * fresh header under the lock, so a completed stamp is never erased by a
+ * later high-water raise. */
+UT_TEST(test_publish_preserves_stamp)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+	cluster_xid_authority_mark_native_raw_reused();
+
+	cluster_xid_authority_publish_native(900, 1, false);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 900);
+	UT_ASSERT_EQ(got.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+}
+
+/* Round-3b RISK-1: full CLOG-alphabet truth table for the prehistory
+ * status mapper -- SUB_COMMITTED and out-of-alphabet values must be
+ * UNRESOLVED (fail-closed), never folded into ABORTED. */
+UT_TEST(test_native_prehistory_status_map)
+{
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(CLUSTER_NATIVE_CLOG_COMMITTED),
+				 CLUSTER_NATIVE_PREHISTORY_COMMITTED);
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(CLUSTER_NATIVE_CLOG_ABORTED),
+				 CLUSTER_NATIVE_PREHISTORY_ABORTED);
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(CLUSTER_NATIVE_CLOG_IN_PROGRESS),
+				 CLUSTER_NATIVE_PREHISTORY_ABORTED);
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(CLUSTER_NATIVE_CLOG_SUB_COMMITTED),
+				 CLUSTER_NATIVE_PREHISTORY_UNRESOLVED);
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(7), CLUSTER_NATIVE_PREHISTORY_UNRESOLVED);
+	UT_ASSERT_EQ(cluster_native_prehistory_map_status(-1), CLUSTER_NATIVE_PREHISTORY_UNRESOLVED);
+}
+
+/* Round-4 P0-1: a pre-flock (lock-free) writer that cached a pre-stamp
+ * header can install it over a completed stamp -- erasing the flag AND the
+ * stamped magic in both copies.  The durable settle probe must read false
+ * (the wrap barrier holds its gate on it) and the next re-assert must
+ * repair both copies.  This is the "old writer without the lock" forced
+ * interleave: the overwrite deliberately bypasses the mutation lock. */
+UT_TEST(test_old_writer_erase_settle_repair)
+{
+	ClusterXidAuthorityHeader hdr;
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char image[sizeof(ClusterXidAuthorityHeader)];
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_raw_reused_settled(), true);
+
+	snprintf(primary_path, sizeof(primary_path), "%s/%s", test_root,
+			 CLUSTER_XID_AUTHORITY_REL_PATH);
+	snprintf(bak_path, sizeof(bak_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+
+	/* the old writer's cached pre-stamp header: old magic, no RAW_REUSED */
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	hdr.version = CLUSTER_XID_AUTHORITY_VERSION;
+	hdr.flags = CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA;
+	hdr.native_hw_full = 816;
+	hdr.next_multi = 1;
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(hdr.crc);
+	memcpy(image, &hdr, sizeof(hdr));
+	write_raw_image(primary_path, image, sizeof(image));
+	write_raw_image(bak_path, image, sizeof(image));
+
+	/* the erase is DETECTED: the gate-side settle probe fails closed */
+	UT_ASSERT_EQ(cluster_xid_authority_raw_reused_settled(), false);
+
+	/* the tick re-assert repairs both copies, stamped magic included */
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_raw_reused_settled(), true);
+	read_raw_image(primary_path, image, sizeof(image));
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	read_raw_image(bak_path, image, sizeof(image));
 	memcpy(&hdr, image, sizeof(hdr));
 	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
 	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
@@ -1178,7 +1351,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(23);
+	UT_PLAN(27);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -1188,6 +1361,10 @@ main(void)
 	UT_RUN(test_mark_native_raw_reused_one_way);
 	UT_RUN(test_raw_reused_magic_truth_table);
 	UT_RUN(test_mark_raw_reused_upgrades_old_magic_copies);
+	UT_RUN(test_mutation_lock_serializes_and_merges);
+	UT_RUN(test_publish_preserves_stamp);
+	UT_RUN(test_native_prehistory_status_map);
+	UT_RUN(test_old_writer_erase_settle_repair);
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
 	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);

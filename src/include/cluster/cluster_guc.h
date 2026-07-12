@@ -592,6 +592,7 @@ extern bool cluster_ic_suppress_caps_reply;
  * that predates the completion-proof protocol).  Same PGC_SIGHUP posture as
  * cluster_ic_suppress_caps_reply. */
 extern bool cluster_ic_suppress_gcs_done_cap;
+extern bool cluster_ic_suppress_xid_flock_cap;
 
 /* GCS-race round-3 P0-1: test-only margin override — LMON treats the xid
  * wrap-barrier margin as reached and runs the full real path (durable

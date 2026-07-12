@@ -71,6 +71,18 @@
  */
 static int8 vis_origin_materialized_cache[CLUSTER_WAL_STATE_SLOT_COUNT]; /* 0 ? / 1 / -1 */
 
+/* Round-3b RISK-1: the pure prehistory status mapper mirrors the CLOG
+ * alphabet without dragging clog.h into the standalone unit layer; pin the
+ * mirror to the real constants here, at the consumer that has both. */
+StaticAssertDecl(CLUSTER_NATIVE_CLOG_IN_PROGRESS == TRANSACTION_STATUS_IN_PROGRESS,
+				 "prehistory status mirror drifted from clog.h");
+StaticAssertDecl(CLUSTER_NATIVE_CLOG_COMMITTED == TRANSACTION_STATUS_COMMITTED,
+				 "prehistory status mirror drifted from clog.h");
+StaticAssertDecl(CLUSTER_NATIVE_CLOG_ABORTED == TRANSACTION_STATUS_ABORTED,
+				 "prehistory status mirror drifted from clog.h");
+StaticAssertDecl(CLUSTER_NATIVE_CLOG_SUB_COMMITTED == TRANSACTION_STATUS_SUB_COMMITTED,
+				 "prehistory status mirror drifted from clog.h");
+
 static bool
 vis_origin_materialized(int origin)
 {
@@ -440,11 +452,13 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 		 * real SCNs are >= 1, so scn_time_cmp((SCN) 1, read_scn) <= 0
 		 * decides VISIBLE for every valid read_scn; commit_scn_is_bound
 		 * forbids stamping the fabricated value into a (recycled) ITL slot.
-		 * Any other status is ABORTED: the seed's seal proof covers
-		 * crash-aborted IN_PROGRESS, and the boot verify refused to latch
-		 * on any SUB_COMMITTED byte.  C-V1's no-CLOG-on-remote rule targets
-		 * cross-instance raw-xid aliasing; below the sealed native
-		 * high-water the adopted CLOG is alias-free by construction.
+		 * ABORTED and IN_PROGRESS (crash-aborted under the seal proof) map
+		 * ABORTED; SUB_COMMITTED and anything outside the CLOG alphabet
+		 * map UNRESOLVED -> fail-closed (round-3b RISK-1 -- the boot
+		 * verify's SUB_COMMITTED refusal is never trusted at runtime).
+		 * C-V1's no-CLOG-on-remote rule targets cross-instance raw-xid
+		 * aliasing; below the sealed native high-water the adopted CLOG is
+		 * alias-free by construction.
 		 */
 		if (cluster_cr_native_prehistory_covered_hw() != 0) {
 			bool prehistory_resolved = false;
@@ -459,18 +473,36 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				if (!TransactionIdPrecedes(raw_xid, ShmemVariableCache->oldestClogXid)) {
 					XidStatus native_status = TransactionIdGetStatus(raw_xid, &clog_lsn);
 
-					cluster_rtvis_note_native_prehistory_local();
-					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
-					if (native_status == TRANSACTION_STATUS_COMMITTED) {
+					/*
+					 * Round-3b RISK-1: explicit status mapping.  The boot
+					 * verify refused to latch on any SUB_COMMITTED byte,
+					 * but that claim is never trusted at runtime:
+					 * SUB_COMMITTED and out-of-alphabet values map
+					 * UNRESOLVED and fall through fail-closed (53R97)
+					 * instead of being folded into ABORTED.
+					 */
+					switch (cluster_native_prehistory_map_status((int)native_status)) {
+					case CLUSTER_NATIVE_PREHISTORY_COMMITTED:
+						cluster_rtvis_note_native_prehistory_local();
+						out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 						out->status = CLUSTER_TT_STATUS_COMMITTED;
 						out->commit_scn = (SCN)1;
 						out->commit_scn_is_bound = true;
-					} else {
+						prehistory_resolved = true;
+						break;
+					case CLUSTER_NATIVE_PREHISTORY_ABORTED:
+						/* literal ABORTED, or IN_PROGRESS = crash-aborted
+						 * under the seal proof */
+						cluster_rtvis_note_native_prehistory_local();
+						out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 						out->status = CLUSTER_TT_STATUS_ABORTED;
 						out->commit_scn = InvalidScn;
 						out->commit_scn_is_bound = false;
+						prehistory_resolved = true;
+						break;
+					case CLUSTER_NATIVE_PREHISTORY_UNRESOLVED:
+						break; /* fail closed below */
 					}
-					prehistory_resolved = true;
 				}
 				LWLockRelease(XactTruncationLock);
 			}

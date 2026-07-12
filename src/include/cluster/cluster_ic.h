@@ -294,6 +294,21 @@ typedef enum ClusterICPlane {
  * candidates fail-closed -- the correct posture for a mixed-version
  * cluster near the xid boundary (upgrade the old binary to proceed). */
 #define PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 ((uint32)0x00000020U)
+/* PGRAC: GCS-race round-4 P0-1 — this binary serializes every shared XID
+ * authority mutation through the flock critical section and writes the
+ * stamped (RAW_REUSED) magic protocol.  DISTINCT from the barrier bit
+ * above: 0x20 only proves the DISABLE/ACK wire is understood; a 0x20-only
+ * binary still runs lock-free authority read-modify-writes and can erase
+ * a concurrent stamp with its stale header.  The wrap barrier therefore
+ * refuses to open the allocation gate until EVERY conf-declared member is
+ * connected and advertises THIS bit (declared-but-unreachable could be
+ * exactly such a writer mid-boot) -- the stop-the-world-upgrade posture.
+ * Post-stamp, an old binary fail-closes on the stamped magic before it
+ * can reach any transition write, so the exposure window is only ever
+ * pre-gate-open, where epoch>=1 xids cannot exist and a re-latch is
+ * harmless; the LMON tick's settle re-verify + re-assert repairs any
+ * erased stamp until the gate's admission holds. */
+#define PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 ((uint32)0x00000040U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

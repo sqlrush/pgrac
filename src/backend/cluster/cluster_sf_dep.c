@@ -284,6 +284,30 @@ cluster_sf_peer_supports_xid_native_disable(int32 peer_id)
 }
 
 /*
+ * cluster_sf_peer_supports_xid_authority_flock
+ *
+ * GCS-race round-4 P0-1: true iff the peer's verified HELLO on the CURRENT
+ * connection advertised the authority flock/stamped-magic protocol bit
+ * (0x40) -- DISTINCT from the barrier bit above, which a round-3b
+ * lock-free-writer binary also advertises.  Connection-bound: a declared
+ * but unreachable peer reads false, and the wrap barrier holds its gate
+ * (such a peer could be exactly an old writer mid-boot).
+ */
+bool
+cluster_sf_peer_supports_xid_authority_flock(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2) != 0;
+}
+
+/*
  * cluster_sf_note_peer_disconnected_gen
  *
  * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: capability

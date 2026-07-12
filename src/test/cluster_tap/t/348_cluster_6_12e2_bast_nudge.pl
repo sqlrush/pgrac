@@ -87,8 +87,19 @@ for my $from (0 .. 2)
 			"L1 node$from sees node$to connected");
 	}
 }
-is($node0->safe_psql('postgres', 'SHOW cluster.ges_bast'), 'off',
-	'L1 cluster.ges_bast default off');
+is($node0->safe_psql('postgres', 'SHOW cluster.ges_bast'), 'on',
+	'L1 cluster.ges_bast default on (round-4 FUNC-1 live-X handoff activation)');
+
+# The L2 leg proves the DISARMED terminal-deny behaviour, so force the
+# escape hatch off everywhere first; L3 re-arms it below.
+for my $n ($node0, $node1, $node2)
+{
+	$n->safe_psql('postgres', 'ALTER SYSTEM SET cluster.ges_bast = off');
+	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
+usleep(1_000_000);
+is($node1->safe_psql('postgres', 'SHOW cluster.ges_bast'), 'off',
+	'L1b cluster.ges_bast disarmed for the off leg');
 
 # ============================================================
 # L2 (off leg): eight probe tables; node2 X-holds each (quiescent after a

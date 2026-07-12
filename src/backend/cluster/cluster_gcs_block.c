@@ -1961,6 +1961,38 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				break;
 			}
 
+			/*
+			 * PGRAC: GCS-race round-4 FUNC-1 — third-party live-X handoff.
+			 * A direct-from-master DENIED_MASTER_NOT_HOLDER on a WRITE
+			 * transition is the HG7 live-X wall; with the BAST nudge armed
+			 * the master has already asked the holder for the quiescent
+			 * X->S yield and dropped the dedup entry, so a backed-off retry
+			 * is re-evaluated against the post-yield state and converges
+			 * through the S-invalidate + storage-fallback grant.  Reuse the
+			 * starvation backoff knobs/wait event (same "wait for the
+			 * holder to yield" semantics).  Budget exhaustion falls through
+			 * to the terminal consume below (holder stayed unyielding:
+			 * active ITL / pinned for the whole window) -- the pre-FUNC-1
+			 * 0A000, never a guess.  Nudge disarmed -> terminal immediately
+			 * (no progress to wait for).
+			 */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+				&& final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+				&& cluster_ges_bast && transition_id != PCM_TRANS_N_TO_S
+				&& retry_attempt < max_retries) {
+				long lx_backoff_ms;
+
+				lx_backoff_ms = (long)cluster_gcs_block_starvation_backoff_ms
+								* (1L << (retry_attempt < 16 ? retry_attempt : 16));
+				if (lx_backoff_ms > 25000)
+					lx_backoff_ms = 25000;
+				(void)WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, lx_backoff_ms,
+								WAIT_EVENT_GCS_BLOCK_STARVATION_RETRY);
+				ResetLatch(MyLatch);
+				current_master = cluster_gcs_lookup_master(tag);
+				continue;
+			}
+
 			/* PGRAC: spec-2.36 D6 (HC117) — reader starvation guard transient
 			 * denial.  N→S request was rejected because an X writer's broadcast
 			 * is in flight at the master;  reader exponential-backoffs per
@@ -4265,8 +4297,19 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		 * safe; after ㉕ the quiescent downgrade deliberately creates
 		 * "requester holds S, other nodes hold S" and the blanket deny would
 		 * make every downgraded block permanently unwritable by its former
-		 * holder.  Taking the block from a live X HOLDER remains wave-g
-		 * territory and stays denied.
+		 * holder.
+		 *
+		 * PGRAC: GCS-race round-4 FUNC-1 — the live X-HOLDER deny below is
+		 * no longer terminal in the default configuration: with
+		 * cluster.ges_bast on, the nudge (sent just below) asks the holder
+		 * for the quiescent X->S yield, the dedup entry is dropped so the
+		 * requester's bounded backoff-retry is re-evaluated, and the retry
+		 * converges through the shipped S-invalidate + storage-fallback
+		 * grant path (the holder's yield flushed the page storage-current).
+		 * No double-X window exists at any step: X is only granted after
+		 * every S copy is invalidated, and the holder's yield itself blocks
+		 * further local writes.  The direct wire-ship 3-way transfer
+		 * (retain-X-until-post-install-ACK) remains wave-g territory.
 		 */
 		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
 			&& cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
@@ -4304,6 +4347,17 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+			/*
+			 * GCS-race round-4 FUNC-1: with the nudge armed this deny is a
+			 * RETRYABLE step of the live-X handoff, not a terminal wall --
+			 * the requester backs off and re-asks while the holder yields
+			 * X->S, and the retry must be re-evaluated against the
+			 * post-yield state.  Drop the in-flight dedup entry (same
+			 * (request_id, epoch) key) or the retry is swallowed as
+			 * IN_FLIGHT_DUPLICATE until the TTL sweep (PENDING_X deny
+			 * precedent above).
+			 */
+			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
 								 InvalidXLogRecPtr, NULL);
 			return;

@@ -62,6 +62,8 @@ static bool wb_logged_started = false;
 static bool wb_logged_done = false;
 static bool wb_logged_wide_conf = false;
 static uint64 wb_logged_nocap_mask = 0;
+/* round-4 P0-1: LOG-once per declared member missing the flock capability */
+static uint64 wb_logged_noflock_mask = 0;
 
 static pg_crc32c
 wb_payload_crc(const ClusterXidNativeDisablePayload *p)
@@ -222,6 +224,23 @@ cluster_xid_wrap_barrier_startup_init(void)
 	cluster_xid_wrap_barrier_set_marked();
 
 	if (U64FromFullTransactionId(ReadNextFullTransactionId()) > (uint64)PG_UINT32_MAX) {
+		/*
+		 * Round-4 P0-1: the boot shortcut runs the SAME durable admission
+		 * as the tick (settled stamp in both copies, stamped magic).  The
+		 * distributed half (every declared member flock-capable) was
+		 * proven by the FIRST gate -- an epoch-1 xid can only exist after
+		 * it passed -- and post-stamp a pre-flock binary fail-closes on
+		 * the stamped magic before it can boot, so that fact is permanent.
+		 * A boot that finds the stamp UNSETTLED here (single-copy erase
+		 * plus crash before the re-assert landed) holds the gate; the
+		 * LMON tick re-asserts and re-admits.
+		 */
+		if (!cluster_xid_authority_raw_reused_settled()) {
+			ereport(LOG, (errmsg("cluster xid wrap barrier: counter is past the native era but the "
+								 "durable stamp is not settled; epoch allocation stays gated until "
+								 "the re-assert lands")));
+			return;
+		}
 		cluster_xid_wrap_barrier_set_done();
 		ereport(LOG, (errmsg("cluster xid wrap barrier: counter already past the native era; "
 							 "epoch allocation gate open (boot shortcut)")));
@@ -293,6 +312,49 @@ cluster_xid_wrap_barrier_lmon_tick(void)
 	pending = (uint64)alive_mask & ~cluster_xid_wrap_barrier_ack_bitmap();
 
 	if (pending == 0) {
+		/*
+		 * Round-4 P0-1: final admission before the gate opens.  The alive
+		 * mask only covers members CURRENTLY connected; a conf-declared
+		 * node that is down or mid-boot could be a pre-flock binary whose
+		 * lock-free authority write would erase the stamp (the barrier bit
+		 * 0x20 does not prove the flock protocol).  Require every declared
+		 * member to be connected AND advertise XID_AUTHORITY_FLOCK_V2 --
+		 * the stop-the-world-upgrade posture; the operator upgrades or
+		 * removes the member to proceed.  Erases inside the held window
+		 * are harmless (no epoch-1 xid exists yet; a re-latch is the
+		 * normal pre-wrap state) and the settle re-assert below repairs
+		 * them each tick.
+		 */
+		for (n = 0; n < 32; n++) {
+			if (n == cluster_node_id || cluster_conf_lookup_node(n) == NULL)
+				continue;
+			if (!cluster_sf_peer_supports_xid_authority_flock(n)) {
+				if ((wb_logged_noflock_mask & (UINT64CONST(1) << n)) == 0)
+					ereport(LOG,
+							(errmsg("cluster xid wrap barrier: declared node %d is unreachable "
+									"or does not advertise the authority-flock capability; "
+									"epoch allocation stays gated until it is upgraded, "
+									"connected, or removed",
+									n)));
+				wb_logged_noflock_mask |= UINT64CONST(1) << n;
+				return;
+			}
+		}
+
+		/*
+		 * Round-3b P0-1: re-verify the DURABLE stamp right before opening
+		 * the gate.  The shmem marked bit only proves this process once
+		 * ran the mark; if the on-disk transition were lost (torn install,
+		 * an unserialized writer -- excluded among flock-capable members
+		 * and repaired here otherwise), opening would let epoch-1 xids
+		 * exist while a future boot could still re-latch the prehistory.
+		 * Not settled -> re-assert and hold until a later tick sees the
+		 * durable truth.
+		 */
+		if (!cluster_xid_authority_raw_reused_settled()) {
+			cluster_xid_authority_mark_native_raw_reused();
+			return;
+		}
 		cluster_xid_wrap_barrier_set_done();
 		if (!wb_logged_done)
 			ereport(LOG, (errmsg("cluster xid wrap barrier complete: every member disabled native "
