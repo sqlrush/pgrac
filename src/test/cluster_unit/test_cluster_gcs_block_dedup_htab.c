@@ -81,6 +81,7 @@ bool cluster_enabled = true;
 int cluster_node_id = 0;
 int cluster_gcs_block_dedup_max_entries = 4;
 int cluster_gcs_block_retransmit_max_retries = 4;
+int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int MaxConnections = 1;
 bool IsUnderPostmaster = false;

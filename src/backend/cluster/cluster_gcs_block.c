@@ -3537,6 +3537,21 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 		}
 		hdrv2->sf_dep_count = (uint8)n;
 	}
+	/* A READ_IMAGE forward MARKER (forwarding_master_node stamped, no
+	 * payload, header checksum never computed) must never reach this
+	 * resend — the dedup lookup classifies it FORWARDED.  Fail closed if
+	 * one does: the requester times out and its retransmit takes the
+	 * re-forward path.  (Resending would ship a zero page whose 31-hash
+	 * checksum, 0, matches the never-computed header field — a verifying
+	 * false-empty install, 8.A.)  The master-DIRECT xheld serve entry
+	 * (NO_FORWARDING_MASTER + real page) resends normally below. */
+	if (entry->status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+		&& GcsBlockReplyHeaderGetForwardingMasterNode(&entry->reply_header)
+			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
+		Assert(false); /* classification bug — lookup must route FORWARDED */
+		pfree(buf);
+		return;
+	}
 	block_data = buf + header_len;
 	has_block_payload = entry->status == GCS_BLOCK_REPLY_GRANTED
 						|| entry->status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
@@ -3878,6 +3893,18 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 * page's pd_block_scn before ship. */
 			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 				&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
+			/* A READ_IMAGE forward marker must replay as a READ-IMAGE
+			 * forward: without the flag the holder treats the replay as a
+			 * holder-transfer and gives up its X.  (The marker itself must
+			 * never be CACHED-resent — its header checksum was never
+			 * computed and the entry carries no page, and the 31-hash of an
+			 * all-zero page is ALSO 0, so a resent marker VERIFIES and
+			 * installs a zero page: a PageIsNew false-empty read, 8.A.) */
+			if (cached_entry.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+				GcsBlockForwardPayloadSetReadImage(&fwd, true);
+				if (cluster_read_scache)
+					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+			}
 
 			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 										 sizeof(fwd))
@@ -6101,7 +6128,6 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 		return false;
 
 	cluster_xp_begin(&xp_inv, CLXP_W_GCS_X_INVALIDATE);
-	current_epoch = cluster_epoch_get_current();
 
 	/* Claim and stamp the broadcast slot as one critical section.  ACK
 	 * validation reads the same identity under this lock, so a late ACK from
@@ -6114,7 +6140,14 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	 * blocks — collide here, and the pre-wait behavior surfaced the loser as
 	 * a spurious "S->X upgrade invalidate did not complete" ERROR (the
 	 * S3-observed low-concurrency failure class).  Bound the wait by the
-	 * same ACK-collection budget;  a genuine exhaustion still returns false. */
+	 * same ACK-collection budget;  a genuine exhaustion still returns false.
+	 *
+	 * Exact-epoch fence #1: the epoch is captured INSIDE the claim critical
+	 * section, after any wait.  Capturing it before the wait would stamp the
+	 * slot with a pre-reconfiguration epoch: every holder at the new epoch
+	 * answers epoch_stale (no drop), and worse, an ACK produced at the old
+	 * epoch could still match the stale slot identity — an old-epoch drop
+	 * proof authorizing a new-epoch grant (8.A stale-proof). */
 	{
 		TimestampTz claim_deadline
 			= GetCurrentTimestamp() + (TimestampTz)timeout_ms * (TimestampTz)1000;
@@ -6127,6 +6160,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 
 			LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
 			if (pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id) == 0) {
+				current_epoch = cluster_epoch_get_current();
 				ClusterGcsBlock->invalidate_broadcast_epoch = current_epoch;
 				ClusterGcsBlock->invalidate_broadcast_tag = req->tag;
 				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, holders_bm);
@@ -6158,51 +6192,85 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 		}
 	}
 
-	/* Build and dispatch INVALIDATE to each holder bit. */
-	memset(&inv, 0, sizeof(inv));
-	inv.request_id = req->request_id;
-	inv.epoch = current_epoch;
-	inv.tag = req->tag;
-	inv.master_node = cluster_node_id;
-	inv.invalidating_for_x_node = (uint8)(req->sender_node & 0xff);
-	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
+	/* The slot is held from here on.  Any ereport out of the send/wait
+	 * region (an armed :error injection, a future throwing send path)
+	 * would otherwise leak the claimed singleton forever — every later
+	 * local upgrade on this node would wait out its claim budget and
+	 * fail.  PG_CATCH releases the slot, wakes claim waiters, re-throws. */
+	PG_TRY();
+	{
+		/* Build and dispatch INVALIDATE to each holder bit. */
+		memset(&inv, 0, sizeof(inv));
+		inv.request_id = req->request_id;
+		inv.epoch = current_epoch;
+		inv.tag = req->tag;
+		inv.master_node = cluster_node_id;
+		inv.invalidating_for_x_node = (uint8)(req->sender_node & 0xff);
+		inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
 
-	for (n = 0; n < 32; n++) {
-		if ((holders_bm & ((uint32)1u << n)) == 0)
-			continue;
-		/* D16 inject — drop a single broadcast envelope. */
-		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
-		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
-			continue;
-		/* PGRAC: spec-6.12a — a backend-context caller (local-master S->X
-		 * upgrade) cannot use the LMON-owned connections directly; route
-		 * through the backend outbound ring instead (LMON flushes it). */
-		if (via_outbound_ring)
-			(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
-														   (uint32)n, &inv, sizeof(inv));
-		else
-			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
-		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
-	}
-
-	/* Poll-with-CV wait for full ack collection or timeout. */
-	start_lsn = (long)GetCurrentTimestamp();
-	ConditionVariablePrepareToSleep(&ClusterGcsBlock->invalidate_broadcast_cv);
-	for (;;) {
-		acked_bm = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm);
-		if ((acked_bm & holders_bm) == holders_bm) {
-			full_ack = true;
-			break;
+		for (n = 0; n < 32; n++) {
+			if ((holders_bm & ((uint32)1u << n)) == 0)
+				continue;
+			/* D16 inject — drop a single broadcast envelope. */
+			CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
+			if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
+				continue;
+			/* PGRAC: spec-6.12a — a backend-context caller (local-master S->X
+			 * upgrade) cannot use the LMON-owned connections directly; route
+			 * through the backend outbound ring instead (LMON flushes it). */
+			if (via_outbound_ring)
+				(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+															   (uint32)n, &inv, sizeof(inv));
+			else
+				(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
+											   sizeof(inv));
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 		}
-		elapsed_ms = (long)((GetCurrentTimestamp() - start_lsn) / 1000);
-		if (elapsed_ms >= timeout_ms)
-			break;
-		if (ConditionVariableTimedSleep(&ClusterGcsBlock->invalidate_broadcast_cv,
-										timeout_ms - elapsed_ms,
-										WAIT_EVENT_GCS_BLOCK_INVALIDATE_ACK_WAIT))
-			break; /* timeout */
+
+		/* Poll-with-CV wait for full ack collection or timeout. */
+		start_lsn = (long)GetCurrentTimestamp();
+		ConditionVariablePrepareToSleep(&ClusterGcsBlock->invalidate_broadcast_cv);
+		for (;;) {
+			acked_bm = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm);
+			if ((acked_bm & holders_bm) == holders_bm) {
+				full_ack = true;
+				break;
+			}
+			elapsed_ms = (long)((GetCurrentTimestamp() - start_lsn) / 1000);
+			if (elapsed_ms >= timeout_ms)
+				break;
+			if (ConditionVariableTimedSleep(&ClusterGcsBlock->invalidate_broadcast_cv,
+											timeout_ms - elapsed_ms,
+											WAIT_EVENT_GCS_BLOCK_INVALIDATE_ACK_WAIT))
+				break; /* timeout */
+		}
+		ConditionVariableCancelSleep();
 	}
-	ConditionVariableCancelSleep();
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
+		pg_atomic_write_u64(&ClusterGcsBlock->invalidate_broadcast_request_id, 0);
+		ClusterGcsBlock->invalidate_broadcast_epoch = 0;
+		memset(&ClusterGcsBlock->invalidate_broadcast_tag, 0,
+			   sizeof(ClusterGcsBlock->invalidate_broadcast_tag));
+		pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, 0);
+		pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+		LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+		ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * Exact-epoch fence #3: a full bitmap collected across an epoch bump is
+	 * an old-epoch proof — after a reconfiguration the S set may have been
+	 * rebuilt (rejoin re-declare), so certifying those drops would authorize
+	 * an X grant against holders the acks never covered (8.A stale-proof).
+	 * Fail closed; the caller surfaces the retryable "did not complete".
+	 */
+	if (full_ack && cluster_epoch_get_current() != current_epoch)
+		full_ack = false;
 
 	/* Release the slot.  Broadcast the CV afterwards: concurrent claimants
 	 * sleep on the same invalidate_broadcast_cv (see the bounded claim-wait
@@ -6527,35 +6595,58 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 
 	cluster_pcm_lock_set_pending_x(tag, cluster_node_id, (uint64)GetXLogInsertRecPtr());
 
-	holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
-	if (holders_bm != 0) {
-		memset(&synth, 0, sizeof(synth));
-		/* PGRAC: spec-6.14a D1 — domain-tagged id (top bit = local-upgrade
-		 * domain; holds for node 0 too).  See cluster_gcs_reqid.h. */
-		synth.request_id = gcs_reqid_local_upgrade(
-			cluster_node_id,
-			pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1);
-		synth.epoch = cluster_epoch_get_current();
-		synth.tag = tag;
-		synth.sender_node = cluster_node_id;
+	/* pending_x is armed from here on: readers are being PENDING_X-denied.
+	 * A throw anywhere below (cancel in the claim wait, an armed :error
+	 * injection) must not leak it, or every reader of this tag starves
+	 * behind a barrier nobody clears. */
+	PG_TRY();
+	{
+		uint64 upgrade_epoch = cluster_epoch_get_current();
+		bool covered = true;
 
-		if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true)) {
-			cluster_pcm_lock_clear_pending_x(tag);
-			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
-			return false;
+		holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
+		if (holders_bm != 0) {
+			memset(&synth, 0, sizeof(synth));
+			/* PGRAC: spec-6.14a D1 — domain-tagged id (top bit = local-upgrade
+			 * domain; holds for node 0 too).  See cluster_gcs_reqid.h. */
+			synth.request_id = gcs_reqid_local_upgrade(
+				cluster_node_id,
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1);
+			synth.epoch = upgrade_epoch;
+			synth.tag = tag;
+			synth.sender_node = cluster_node_id;
+
+			if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true)
+				/* Exact-epoch fence (grant side): the acks certify drops at
+				 * the epoch the broadcast ran under.  If the epoch moved at
+				 * any point across this upgrade, the rebuilt S set may not
+				 * be covered — fail closed, retryable (8.A stale-proof). */
+				|| cluster_epoch_get_current() != upgrade_epoch) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
+				covered = false;
+			} else {
+				/* Acks certify the drops; clear the acked bits on the
+				 * authoritative entry (idempotent vs racing releases). */
+				for (n = 0; n < 32; n++) {
+					if ((holders_bm & ((uint32)1u << n)) == 0)
+						continue;
+					(void)cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE,
+																n);
+				}
+			}
 		}
 
-		/* Acks certify the drops; clear the acked bits on the
-		 * authoritative entry (idempotent vs racing releases). */
-		for (n = 0; n < 32; n++) {
-			if ((holders_bm & ((uint32)1u << n)) == 0)
-				continue;
-			(void)cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE, n);
-		}
+		if (covered)
+			upgraded = cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE,
+															 cluster_node_id);
 	}
+	PG_CATCH();
+	{
+		cluster_pcm_lock_clear_pending_x(tag);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	upgraded
-		= cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE, cluster_node_id);
 	if (upgraded)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 1);
 	cluster_pcm_lock_clear_pending_x(tag);
@@ -6853,7 +6944,13 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	}
 
 	expected_epoch = ClusterGcsBlock->invalidate_broadcast_epoch;
-	if (ack->epoch != expected_epoch
+	/* Exact-epoch fence #2: the ACK must match the slot's epoch AND the slot
+	 * epoch must still be the CURRENT epoch.  An ACK produced before a
+	 * reconfiguration can arrive after it; the slot identity (stamped at the
+	 * same old epoch) would match, and the old-epoch drop proof would fill
+	 * the bitmap toward a new-epoch X grant (8.A stale-proof).  The slotless
+	 * e2 branch above already carries the same current-epoch requirement. */
+	if (ack->epoch != expected_epoch || expected_epoch != cluster_epoch_get_current()
 		|| !BufferTagsEqual(&ack->tag, &ClusterGcsBlock->invalidate_broadcast_tag)
 		|| ack->ack_status > 2 || ack->ack_status == 1) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
