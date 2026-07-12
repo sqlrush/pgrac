@@ -202,10 +202,36 @@ UT_TEST(test_r12_in_window_verdict_tracks_whitelist)
 	}
 }
 
+/*
+ * R13 (review F5): the pinned registration-time lifetime, not the caller's
+ * recomputed window, decides out-of-window.  A requester window longer
+ * than the master's current GUC posture must keep the entry unreclaimable
+ * until the PINNED lifetime elapses (early reclaim re-opens the replayed
+ * retransmit re-execution P0); a zero pin falls back to the caller window.
+ */
+UT_TEST(test_r13_pinned_lifetime_beats_caller_window)
+{
+	TimestampTz now = 1000000;
+	GcsBlockDedupEntry e = make_completed_entry(GCS_BLOCK_REPLY_GRANTED, now, 2000);
+
+	/* age 2000us: past the caller window (1000us) but inside the PINNED
+	 * lifetime (10000us) -> NOT reclaimable (pre-F5 code said true). */
+	e.pinned_lifetime_us = 10000;
+	UT_ASSERT_EQ(false, GcsBlockDedupEntryIsReclaimSafe(&e, now, 1000));
+
+	/* past the pinned lifetime -> reclaimable regardless of the caller. */
+	UT_ASSERT_EQ(true, GcsBlockDedupEntryIsReclaimSafe(&e, now + 9000, 1000));
+
+	/* zero pin (pre-pin builds): the caller window is the fallback. */
+	e.pinned_lifetime_us = 0;
+	UT_ASSERT_EQ(true, GcsBlockDedupEntryIsReclaimSafe(&e, now, 1000));
+	UT_ASSERT_EQ(false, GcsBlockDedupEntryIsReclaimSafe(&e, now, 5000));
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_r1_whitelist_empty_all_statuses_in_window_unsafe);
 	UT_RUN(test_r2_payload_granted_never_in_window);
 	UT_RUN(test_r3_storage_fallback_never_in_window);
@@ -218,6 +244,7 @@ main(void)
 	UT_RUN(test_r10_in_window_payload_granted_not_safe);
 	UT_RUN(test_r11_out_of_window_boundary_is_strict);
 	UT_RUN(test_r12_in_window_verdict_tracks_whitelist);
+	UT_RUN(test_r13_pinned_lifetime_beats_caller_window);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

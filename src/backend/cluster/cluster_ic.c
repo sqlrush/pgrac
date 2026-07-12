@@ -636,6 +636,9 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * wire, so a new acceptor never sends this node a reply). */
 	if (!cluster_ic_suppress_caps_reply)
 		capabilities |= PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1;
+	/* GCS-race round-2 review F6: completion-proof protocol capability,
+	 * same unconditional discipline (see cluster_ic.h). */
+	capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

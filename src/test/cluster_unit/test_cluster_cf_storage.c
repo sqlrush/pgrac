@@ -38,6 +38,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_xid_authority.h" /* epoch-witness stub signature (review F3) */
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
@@ -199,6 +200,17 @@ cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf pg_attr
 void
 cluster_recovery_anchor_write(const ClusterRecoveryAnchor *ra pg_attribute_unused())
 {}
+
+/* GCS-race round-2 review F3: the migrate arm persists the pre-migration
+ * epoch witness before the symlink flip; the witness file I/O itself is
+ * unit-covered by test_cluster_xid_authority (u20), so a functional no-op
+ * keeps this binary standalone. */
+bool
+cluster_xid_epoch_witness_write(const char *local_pgdata pg_attribute_unused(),
+								uint64 next_full_xid pg_attribute_unused())
+{
+	return true;
+}
 bool
 cluster_recovery_anchor_read(uint64 expected_sysid pg_attribute_unused(),
 							 ClusterRecoveryAnchor *out pg_attribute_unused(),

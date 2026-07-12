@@ -2073,6 +2073,22 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
 	emit_row(rsinfo, "gcs", "stale_reply_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_stale_reply_drop_count()));
+	/* PGRAC: GCS-race round-2 RC-F — DONE completion-proof protocol rows:
+	 * requester-side proofs sent, master-side proofs stamped (entry moved
+	 * to its short done-linger quarantine) vs dropped (miss / identity or
+	 * state mismatch — TTL backstop stays in charge). */
+	emit_row(rsinfo, "gcs", "done_sent_count",
+			 fmt_int64((int64)cluster_gcs_get_block_done_sent_count()));
+	emit_row(rsinfo, "gcs", "dedup_done_marked_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_marked_count()));
+	emit_row(rsinfo, "gcs", "dedup_done_mismatch_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_mismatch_count()));
+	emit_row(rsinfo, "gcs", "dedup_hint_violation_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_hint_violation_count()));
+	emit_row(rsinfo, "gcs", "dedup_legacy_pin_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_legacy_pin_count()));
+	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
+			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
 
 	/* PGRAC: spec-2.35 D13 — 7 NEW counter rows for CF 2-way protocol. */
 	emit_row(rsinfo, "gcs", "block_forward_sent_count",

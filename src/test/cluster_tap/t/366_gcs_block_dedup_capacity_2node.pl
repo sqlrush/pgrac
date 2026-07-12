@@ -34,6 +34,13 @@
 #          and the data node1 reads stays correct.
 #      L5  dump_gcs surfaces the 3 NEW spec-7.2a D5 observability rows:
 #          dedup_entry_count / dedup_evict_count / dedup_max_entries.
+#      L6  (GCS-race round-2) the completion-proof chain is alive and clean:
+#          done_sent / done_marked > 0; mismatch, enqueue-drop, hint
+#          violation and legacy pin all exactly 0.
+#      L7  (GCS-race round-2 RC-F closure) at the boot-time 256 floor cap:
+#          green -- distinct-block pressure far past the cap with DONE live
+#          keeps dedup_full at 0;  RED -- the done-drop injection suppresses
+#          the proof and the SAME pressure drives dedup_full > 0.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -228,6 +235,12 @@ cluster.cssd_heartbeat_interval_ms = 2000
 cluster.cssd_dead_deadband_factor = 10
 cluster.cf_enqueue_timeout_ms = 30000
 cluster.wal_threads_dir = '$wal_root'
+# GCS-race round-2 RC-F closure: the WHOLE file runs at the 256 FLOOR cap.
+# With the completion-proof chain live this is survivable by design (L2/L7
+# green); pre-fix it was not.  A full-cluster restart mid-file to flip the
+# cap is not an option: cold restart of a formed 2-node cluster trips the
+# pre-existing TT-unknown login wall (orthogonal gap, spec-5.22 territory).
+cluster.gcs_block_dedup_max_entries = 256
 EOC
 
 $node0->append_conf('postgresql.conf', $cluster_conf);
@@ -277,11 +290,17 @@ ok($n0_up, 'bring-up: node0 answers on the shared-sysid cluster');
 
 
 # ============================================================
-# L1: default GUC value = 16384 (spec-7.2a D4).
+# L1: default GUC value = 16384 (spec-7.2a D4).  The rig itself runs at the
+# 256 floor (see the conf above), so read the DEFAULT from boot_val.
 # ============================================================
-is($node0->safe_psql('postgres', 'SHOW cluster.gcs_block_dedup_max_entries'),
+is($node0->safe_psql('postgres',
+		q{SELECT boot_val FROM pg_settings
+		  WHERE name = 'cluster.gcs_block_dedup_max_entries'}),
 	'16384',
 	'L1 cluster.gcs_block_dedup_max_entries default = 16384 (spec-7.2a D4)');
+is($node0->safe_psql('postgres', 'SHOW cluster.gcs_block_dedup_max_entries'),
+	'256',
+	'L1 rig runs at the 256 floor cap (RC-F closure posture)');
 
 
 # ============================================================
@@ -330,8 +349,8 @@ cmp_ok($miss_post, '>', $miss_pre,
 	. "(dedup_miss $miss_pre -> $miss_post) -- cross-node ship path fired");
 
 is($full_ct, 0,
-	"L2 dedup_full_count = 0 at the raised default under distinct reads "
-	. "(S1 saturation mode does not recur)");
+	"L2 dedup_full_count = 0 at the 256 floor cap under distinct reads "
+	. "(RC-F: the DONE chain keeps the cap breathing; S1 saturation does not recur)");
 
 # No client saw the 53R90 retransmit-exhaustion escalation.
 my ($no_53r90, $sel_out) = psql_retry($node1,
@@ -447,34 +466,18 @@ for my $round (1 .. 6)
 	}, 30);
 	usleep(700_000);
 }
-# Let the TTL sweep (LMON, ~1Hz) run past the out-of-window threshold.  The
-# threshold now covers the LEGAL request lifetime — 2 x (backoff total +
-# (retries+1) reply-timeout windows), ~53s under the defaults — so shrink
-# the lifetime GUCs for the aging wait only (the sweep reads them at sweep
-# time and no read traffic runs during the wait), then reset.
-for my $n ($node0, $node1)
-{
-	$n->safe_psql('postgres',
-		'ALTER SYSTEM SET cluster.gcs_block_retransmit_max_retries = 0');
-	$n->safe_psql('postgres',
-		'ALTER SYSTEM SET cluster.gcs_block_retransmit_initial_backoff_ms = 10');
-	$n->safe_psql('postgres', 'ALTER SYSTEM SET cluster.gcs_reply_timeout_ms = 100');
-	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
-}
-usleep(4_000_000);
+# GCS-race round-2 F5: TTL posture is PINNED at registration (a sweep-time
+# GUC change no longer re-shortens live entries -- that recomputation was
+# the early-reclaim P0).  The fast aging path is now the DONE proof itself:
+# each consumed reply sends GCS_BLOCK_DONE, and a DONE-proven entry ages out
+# on its pinned done-linger (2 x reply-timeout = 10s under the defaults)
+# instead of the full ~53s pinned lifetime.  Wait past the linger plus a
+# couple of ~1Hz sweep cycles.
+usleep(13_000_000);
 
 my $evict_post = gcs_int_both($node0, $node1, 'dedup_evict_count');
-for my $n ($node0, $node1)
-{
-	$n->safe_psql('postgres',
-		'ALTER SYSTEM RESET cluster.gcs_block_retransmit_max_retries');
-	$n->safe_psql('postgres',
-		'ALTER SYSTEM RESET cluster.gcs_block_retransmit_initial_backoff_ms');
-	$n->safe_psql('postgres', 'ALTER SYSTEM RESET cluster.gcs_reply_timeout_ms');
-	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
-}
 cmp_ok($evict_post, '>', $evict_pre,
-	"L4 reclaim/TTL sweep removed aged entries "
+	"L4 DONE-linger TTL sweep removed proven entries "
 	. "(dedup_evict_count $evict_pre -> $evict_post)");
 
 # Read from node0 (the writer): reclaim only touches the dedup HTAB in shmem,
@@ -502,13 +505,161 @@ for my $key (qw(dedup_entry_count dedup_evict_count dedup_max_entries))
 	   "L5 dump_gcs exposes $key (spec-7.2a D5)");
 }
 
-# dedup_max_entries reflects the effective cap (16384) on a serving node.
+# dedup_max_entries reflects the effective cap (the 256 rig floor).
 is($node0->safe_psql('postgres',
 		q{SELECT value FROM pg_cluster_state
 		  WHERE category='gcs' AND key='dedup_max_entries'}),
-   '16384',
-   'L5 dedup_max_entries reports the effective cap (16384)');
+   '256',
+   'L5 dedup_max_entries reports the effective cap (256 rig floor)');
 
+
+
+# ============================================================
+# L6 (GCS-race round-2 F4/F6/F7): the completion-proof chain is ALIVE and
+# clean.  Requesters sent DONE (F4 router + funnel), masters consumed it
+# (identity-verified mark), and every violation/loss surface stayed zero:
+# no transport-identity mismatch (F6), no outbound-ring drop (F7 -- the
+# first-round closure gate demands exactly 0), no hint violation and no
+# legacy pin (both binaries advertise GCS_DONE_V1; F5 calibration 2).
+# ============================================================
+{
+	my $done_sent = gcs_int_both($node0, $node1, 'done_sent_count');
+	my $done_marked = gcs_int_both($node0, $node1, 'dedup_done_marked_count');
+	my $done_mismatch = gcs_int_both($node0, $node1, 'dedup_done_mismatch_count');
+	my $done_drop = gcs_int_both($node0, $node1, 'done_enqueue_drop_count');
+	my $hint_viol = gcs_int_both($node0, $node1, 'dedup_hint_violation_count');
+	my $legacy_pin = gcs_int_both($node0, $node1, 'dedup_legacy_pin_count');
+
+	cmp_ok($done_sent, '>', 0, "L6 requesters sent completion proofs (done_sent $done_sent)");
+	cmp_ok($done_marked, '>', 0,
+		"L6 masters consumed identity-verified DONEs (done_marked $done_marked)");
+	is($done_mismatch, 0, 'L6 zero DONE identity mismatches (F6 binding held)');
+	is($done_drop, 0, 'L6 zero DONE outbound-ring drops (F7 first-round gate)');
+	is($hint_viol, 0, 'L6 zero lifetime-hint violations (capable peers carry sane hints)');
+	is($legacy_pin, 0, 'L6 zero legacy pins (both binaries advertise GCS_DONE_V1)');
+}
+
+
+# ============================================================
+# L7 (GCS-race round-2 RC-F closure): capacity leg at the FLOOR cap (256).
+#
+#   The rig has run at the floor cap since boot (the HTAB is sized at
+#   shmem init; a mid-file full-cluster restart would trip the pre-existing
+#   cold-restart TT-unknown wall).  Green leg: with the DONE chain live, a
+#   distinct-block sweep far wider than the cap keeps dedup_full_count at 0
+#   -- DONE-proven entries are reclaim-safe immediately, so cap pressure
+#   evicts them instead of failing closed (S3's 280 DENIED_DEDUP_FULL
+#   signature cannot recur).  RED counterpart: arm the done-drop injection
+#   (requesters silently skip the proof -- the pre-fix wire shape) and the
+#   SAME pressure now drives dedup_full_count > 0: completed-but-unproven
+#   entries pin their ~53s lifetime and nothing in-window is safe to
+#   reclaim.  The pinned TTL remains the loss backstop by design.
+# ============================================================
+# A second, wider relation so the distinct-block universe comfortably
+# exceeds the cap even on the remote-mastered half (~500 remote blocks
+# across both tables vs cap 256).
+my ($wide_ok) = psql_retry($node0, q{
+	CREATE TABLE dedup_probe_wide (id int PRIMARY KEY, pad text);
+	INSERT INTO dedup_probe_wide
+	  SELECT g, repeat('y', 400) FROM generate_series(1, 12000) g;
+}, 60);
+ok($wide_ok, 'L7 node0 created + filled dedup_probe_wide (12000 rows)');
+my ($wseen, $wseen_out) = psql_retry($node1,
+	'SELECT count(*) FROM dedup_probe_wide', 120);
+ok($wseen && defined($wseen_out) && $wseen_out eq '12000',
+	'L7 node1 sees dedup_probe_wide via shared catalog');
+
+# Drain the rejoin window before the strict legs (same as L3's settle).
+for (1 .. 60)
+{
+	my ($rc) = $node1->psql('postgres',
+		'SELECT count(*) FROM dedup_probe_wide WHERE id BETWEEN 6000 AND 6200');
+	last if defined $rc && $rc == 0;
+	usleep(500_000);
+}
+
+# --- L7 green: DONE keeps the floor cap breathing. ---
+my $full_pre7 = gcs_int_both($node0, $node1, 'dedup_full_count');
+for my $round (1 .. 6)
+{
+	psql_retry($node1, q{
+		SELECT count(*) FROM dedup_probe_wide
+		 WHERE id = ANY (ARRAY(SELECT (random()*11999)::int + 1
+		                       FROM generate_series(1, 600)))
+	}, 30);
+	psql_retry($node1, q{
+		SELECT count(*) FROM dedup_probe_t
+		 WHERE id = ANY (ARRAY(SELECT (random()*5999)::int + 1
+		                       FROM generate_series(1, 400)))
+	}, 30);
+}
+my $full_post7 = gcs_int_both($node0, $node1, 'dedup_full_count');
+is($full_post7 - $full_pre7, 0,
+	'L7 green: distinct-block pressure far past cap 256 with the DONE chain '
+	. 'live never fails closed (dedup_full delta 0)');
+# Writer-side (L4 discipline): a LATE cross-node re-read can fail-close on
+# the aged-xid TT visibility boundary -- orthogonal to dedup capacity and
+# not what this leg asserts.  node1's cross-node coverage of this relation
+# was proven above, before the aging churn.
+my ($g7ok, $g7out) = psql_retry($node0,
+	'SELECT count(*) FROM dedup_probe_wide', 30);
+ok($g7ok && defined($g7out) && $g7out eq '12000',
+	'L7 green: data intact after floor-cap distinct-block pressure (writer-side)');
+is(gcs_int_both($node0, $node1, 'done_enqueue_drop_count'), 0,
+	'L7 green: outbound-ring DONE drops stay exactly 0 under pressure (F7 gate)');
+
+# --- L7 RED: suppress the proof; the same pressure now fails closed. ---
+arm_inject($node0, 'cluster-gcs-block-done-drop:skip');
+arm_inject($node1, 'cluster-gcs-block-done-drop:skip');
+usleep(700_000);
+
+# A FRESH, never-cached relation is the pressure source: node1's local
+# block cache (cluster.gcs_block_local_cache) holds every block it already
+# read, so re-reads of the earlier tables register nothing -- only new
+# distinct blocks demand cross-node ships.  ~315 remote-mastered blocks of
+# DONE-suppressed (unproven, 53s-pinned) registrations against the 256 cap
+# must start denying: nothing in-window is reclaim-safe without the proof.
+my ($red_ok) = psql_retry($node0, q{
+	CREATE TABLE dedup_probe_red (id int PRIMARY KEY, pad text);
+	INSERT INTO dedup_probe_red
+	  SELECT g, repeat('z', 400) FROM generate_series(1, 12000) g;
+}, 60);
+ok($red_ok, 'L7 RED: node0 created + filled dedup_probe_red (never cached on node1)');
+
+my $full_red_pre = gcs_int_both($node0, $node1, 'dedup_full_count');
+my $miss_red_pre = gcs_int_both($node0, $node1, 'dedup_miss_count');
+my $full_red_post = $full_red_pre;
+for my $round (1 .. 30)
+{
+	# Reads may error once retransmit budgets exhaust -- tolerated here,
+	# the counter is the subject.
+	$node1->psql('postgres', q{
+		SELECT count(*) FROM dedup_probe_red
+		 WHERE id = ANY (ARRAY(SELECT (random()*11999)::int + 1
+		                       FROM generate_series(1, 600)))
+	});
+	$full_red_post = gcs_int_both($node0, $node1, 'dedup_full_count');
+	last if $full_red_post > $full_red_pre;
+	usleep(300_000);
+}
+cmp_ok($full_red_post, '>', $full_red_pre,
+	"L7 RED: with DONE suppressed the same pressure drives DENIED_DEDUP_FULL "
+	. "(dedup_full $full_red_pre -> $full_red_post) -- the completion proof, "
+	. "not luck, is what keeps the floor cap alive");
+my $miss_red_post = gcs_int_both($node0, $node1, 'dedup_miss_count');
+cmp_ok($miss_red_post, '>', $miss_red_pre,
+	"L7 RED trigger probe (8.B honesty): the cold relation drove real "
+	. "cross-node registrations (dedup_miss $miss_red_pre -> $miss_red_post), "
+	. "so the FULL denials above came from live pressure, not leftovers");
+
+arm_inject($node0, '');
+arm_inject($node1, '');
+
+# Writer-side integrity is untouched by the dedup churn either way.
+my ($w7ok, $w7out) = psql_retry($node0,
+	'SELECT count(*) FROM dedup_probe_wide', 30);
+ok($w7ok && defined($w7out) && $w7out eq '12000',
+	'L7 writer-side data intact after the RED leg');
 
 $node0->stop;
 $node1->stop;

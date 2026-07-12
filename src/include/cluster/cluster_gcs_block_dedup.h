@@ -81,7 +81,7 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
 
 
 /* ============================================================
- * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8448B).
+ * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8472B).
  *
  *	Layout (offsets explicit so alignment review is mechanical):
  *	  [    0,    24) key                 GcsBlockDedupKey (24B)
@@ -98,11 +98,13 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	  [  240,  8432) block_data          char[GCS_BLOCK_DATA_SIZE]
  *	  [ 8432,  8440) completed_at_ts     TimestampTz (TTL sweep — replied)
  *	  [ 8440,  8448) registered_at_ts    TimestampTz (TTL sweep — in-flight)
+ *	  [ 8448,  8456) done_at_ts          TimestampTz (round-2 DONE proof)
+ *	  [ 8456,  8464) pinned_lifetime_us  int64 (round-2 pinned TTL)
+ *	  [ 8464,  8472) pinned_done_linger_us int64 (round-2 pinned quarantine)
  *
  *	reply_header lands at offset 56 = 8 × 7, satisfying the 8-byte
  *	alignment required by reply_header.request_id (uint64).  block_data
- *	is BLCKSZ.  Both TimestampTz fields are 8-aligned (int64) at offsets
- *	8432 and 8440.
+ *	is BLCKSZ.  All five int64-family tail fields are 8-aligned.
  *
  *	GRANTED replies fill block_data with the page bytes; non-GRANTED
  *	replies leave block_data zeroed but still occupy 8KB (PG dynahash
@@ -115,6 +117,26 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	earlier of the two thresholds so abandoned in-flight slots (master
  *	crashed mid-reply, network drop before reply install) are also
  *	garbage-collected.
+ *
+ *	GCS-race round-2 RC-F lifecycle fields:
+ *	  done_at_ts            requester completion proof consumed (an
+ *	                        identity-verified GCS_BLOCK_DONE arrived for
+ *	                        a COMPLETED entry).  A done entry only
+ *	                        lingers pinned_done_linger_us for retransmit
+ *	                        reorder slop, then ages out -- and it is
+ *	                        reclaim-SAFE under cap pressure immediately
+ *	                        (the completion proof is exactly what the
+ *	                        §3.1 in-window whitelist was waiting for).
+ *	  pinned_lifetime_us    the legal-request-lifetime threshold, pinned
+ *	                        at REGISTRATION from the requester's wire
+ *	                        hint (2x margin applied) or, absent a hint,
+ *	                        from the master's GUCs at that moment.  GC
+ *	                        never re-reads GUCs: a master-local SUSET
+ *	                        change cannot silently shorten the window a
+ *	                        live remote request was registered under.
+ *	  pinned_done_linger_us the post-DONE quarantine, pinned at
+ *	                        registration (2x the reply-timeout then in
+ *	                        force).
  * ============================================================ */
 typedef struct GcsBlockDedupEntry {
 	GcsBlockDedupKey key;				  /* 24B — HTAB key */
@@ -131,12 +153,15 @@ typedef struct GcsBlockDedupEntry {
 	char block_data[GCS_BLOCK_DATA_SIZE]; /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		  /*  8B — TTL sweep replied */
 	TimestampTz registered_at_ts;		  /*  8B — TTL sweep in-flight */
+	TimestampTz done_at_ts;				  /*  8B — round-2: DONE proof consumed */
+	int64 pinned_lifetime_us;			  /*  8B — round-2: TTL pinned at register */
+	int64 pinned_done_linger_us;		  /*  8B — round-2: quarantine pinned */
 } GcsBlockDedupEntry;
 
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, sf_dep_vec) == 112,
 				 "spec-6.2 GcsBlockDedupEntry dep vector offset must be 112");
-StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8448,
-				 "spec-6.2 GcsBlockDedupEntry 8448B with cached Smart Fusion deps");
+StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8472,
+				 "GcsBlockDedupEntry 8472B (8448 spec-6.2 + 24 round-2 DONE lifecycle)");
 
 
 /* ============================================================
@@ -236,28 +261,77 @@ GcsBlockReplyStatusIsReclaimIdempotent(GcsBlockReplyStatus status)
 }
 
 /*
+ * Protocol upper bounds (GCS-race round-2 review F5 / calibration 2).
+ * These MIRROR the GUC registration maxima in cluster_guc.c
+ * (gcs_block_retransmit_initial_backoff_ms max 5000, _max_retries max 8,
+ * gcs_reply_timeout_ms max 60000) — keep both sides in sync.  No legal
+ * configuration of ANY peer can produce a request lifetime above
+ * GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS (= 5000×(2^8−1) + 9×60000 =
+ * 1,815,000 ms), so:
+ *	 - a wire hint above it is a protocol violation (counted, denied), and
+ *	 - a legacy peer (no GCS_DONE_V1 capability, hint unknowable) is pinned
+ *	   AT it — ~1 h with the 2x margin; an availability cost during rolling
+ *	   upgrade, never a correctness one (a master-formula fallback would
+ *	   re-open the early-reclaim re-execution P0).
+ */
+#define GCS_BLOCK_RETRANSMIT_INITIAL_BACKOFF_MS_MAX 5000
+#define GCS_BLOCK_RETRANSMIT_MAX_RETRIES_MAX 8
+#define GCS_REPLY_TIMEOUT_MS_MAX 60000
+#define GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS                                                   \
+	((int64)GCS_BLOCK_RETRANSMIT_INITIAL_BACKOFF_MS_MAX                                            \
+		 * ((1 << GCS_BLOCK_RETRANSMIT_MAX_RETRIES_MAX) - 1)                                       \
+	 + (int64)(GCS_BLOCK_RETRANSMIT_MAX_RETRIES_MAX + 1) * GCS_REPLY_TIMEOUT_MS_MAX)
+
+/*
  * GcsBlockDedupEntryIsReclaimSafe -- whether a dedup entry may be reclaimed
  * under cap pressure without breaking retransmit de-dup correctness.
  *
- *	out_of_window_us is the 2x total-backoff window (review r1: 1x only
+ *	fallback_out_of_window_us is consumed ONLY for an entry with no pinned
+ *	lifetime (impossible after this build's registration path, cheap to
+ *	guard); it is the caller's 2x total-backoff window (review r1: 1x only
  *	bounds the sender's last SEND, not the arrival of an in-flight
  *	retransmit at the master; 2x also covers transit + timing skew — the
  *	same margin the TTL sweep uses, dedup_expiry_threshold_us()).
  *
  *	  in-flight (completed_at_ts == 0)		-> never (still processing)
- *	  completed, age > out_of_window_us		-> safe for EVERY status
+ *	  DONE-proven (done_at_ts != 0)			-> safe immediately
+ *	  completed, age > pinned lifetime		-> safe for EVERY status
  *											   (spec-7.2a §3.1 theorem)
- *	  completed, age <= out_of_window_us	-> safe ONLY if the status is
+ *	  completed, age <= pinned lifetime		-> safe ONLY if the status is
  *											   site-proven idempotent
  */
 static inline bool
 GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now,
-								int64 out_of_window_us)
+								int64 fallback_out_of_window_us)
 {
 	int64 age_us;
+	int64 out_of_window_us;
 
 	if (entry->completed_at_ts == 0)
 		return false;
+
+	/*
+	 * GCS-race round-2 RC-F: a requester completion proof makes the entry
+	 * reclaim-safe immediately.  The identity-verified GCS_BLOCK_DONE
+	 * proves the terminal reply was received, CRC-verified, and consumed
+	 * on the requester, so no live retransmit of this request can still
+	 * demand a re-serve.  This populates the §3.1 in-window whitelist by
+	 * PROOF instead of per-status site audits (which stay empty below).
+	 */
+	if (entry->done_at_ts != 0)
+		return true;
+
+	/*
+	 * GCS-race round-2 review F5: age against the entry's PINNED
+	 * registration-time lifetime, never a caller-recomputed GUC threshold.
+	 * The requester's legal window (wire hint, or the legacy protocol
+	 * maximum) can be LONGER than this master's current GUC posture -- a
+	 * SUSET change, or a legacy peer whose GUCs are longer than this
+	 * master's; reclaiming on the shorter recomputation re-opens the
+	 * replayed-retransmit re-execution window (the original P0 sequence).
+	 */
+	out_of_window_us
+		= entry->pinned_lifetime_us > 0 ? entry->pinned_lifetime_us : fallback_out_of_window_us;
 
 	age_us = (int64)(now - entry->completed_at_ts);
 	if (age_us > out_of_window_us)
@@ -293,10 +367,54 @@ GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now
  *	(序破坏, 8.A): fail-closed → FULL + misroute_failclosed_count++, never
  *	served from a wrong shard.
  */
-extern GcsBlockDedupResult
-cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey *key,
-										   BufferTag tag, uint8 transition_id,
-										   GcsBlockDedupEntry *cached_reply_out);
+/*
+ *	GCS-race round-2 RC-F + review F5 (calibration 2): the entry's TTL is
+ *	pinned at registration by capability routing, and GC paths never
+ *	re-read GUCs for a live entry.
+ *
+ *	  requester_done_capable (peer HELLO advertised GCS_DONE_V1):
+ *	    hint in (0, protocol max]	-> pin 2x hint (the requester's own
+ *									   legal-request lifetime carried on
+ *									   the request wire, reserved_0[2..5])
+ *	    hint == 0 or > protocol max	-> protocol violation: counted
+ *									   (hint_violation_count) and DENIED
+ *									   (VALIDATION_FAIL), never served
+ *	  legacy peer (no capability, hint unknowable even if nonzero):
+ *	    pin 2x GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS (counted,
+ *	    legacy_pin_count) -- capacity pressure surfaces as DENIED FULL,
+ *	    never as an early reclaim.
+ */
+extern GcsBlockDedupResult cluster_gcs_block_dedup_lookup_or_register(
+	int worker_id, const GcsBlockDedupKey *key, BufferTag tag, uint8 transition_id,
+	uint32 requester_lifetime_hint_ms, bool requester_done_capable,
+	GcsBlockDedupEntry *cached_reply_out);
+
+/*
+ * cluster_gcs_block_dedup_mark_done — consume a requester completion proof
+ * (GCS_BLOCK_DONE).  Under the shard's exclusive lock, verifies the FULL
+ * identity (key 4-tuple locates the entry; tag + transition_id must match
+ * the entry's HC91 fields; the entry must be COMPLETED) and only then
+ * stamps done_at_ts.  Returns true when stamped; false on any mismatch or
+ * miss (caller counts and drops -- DONE is advisory, TTL remains the
+ * backstop).  Never removes the entry outright: the pinned done-linger
+ * quarantine absorbs retransmit reorder slop, and eager reclaim may take
+ * the entry immediately under cap pressure (IsReclaimSafe).
+ */
+extern bool cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key,
+											  const BufferTag *tag, uint8 transition_id);
+
+/* Count a handler-level DONE drop (transport identity / reserved-pad
+ * validation, review F6) on the shard that would have consumed it. */
+extern void cluster_gcs_block_dedup_note_done_mismatch(int worker_id);
+
+/*
+ * cluster_gcs_block_dedup_lifetime_ms — pure legal-request-lifetime
+ * formula shared by both wire sides: backoff total + (retries+1) reply
+ * timeouts.  The requester stamps its OWN GUC values into the request
+ * hint; the master uses its own values only as the no-hint fallback.
+ */
+extern uint32 cluster_gcs_block_dedup_lifetime_ms(int initial_backoff_ms, int max_retries,
+												  int reply_timeout_ms);
 
 /*
  * Register the local backend cleanup hook.  This must be called from
@@ -373,8 +491,12 @@ extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
 extern uint64 cluster_gcs_block_dedup_get_full_count(void);
 extern uint64 cluster_gcs_block_dedup_get_in_flight_count(void);
-extern uint64 cluster_gcs_block_dedup_get_evict_count(void); /* spec-7.2a D5 */
-extern uint64 cluster_gcs_block_dedup_get_max_entries(void); /* spec-7.2a D5 */
+extern uint64 cluster_gcs_block_dedup_get_evict_count(void);		  /* spec-7.2a D5 */
+extern uint64 cluster_gcs_block_dedup_get_max_entries(void);		  /* spec-7.2a D5 */
+extern uint64 cluster_gcs_block_dedup_get_done_marked_count(void);	  /* RC-F DONE */
+extern uint64 cluster_gcs_block_dedup_get_done_mismatch_count(void);  /* RC-F DONE */
+extern uint64 cluster_gcs_block_dedup_get_hint_violation_count(void); /* review F5 */
+extern uint64 cluster_gcs_block_dedup_get_legacy_pin_count(void);	  /* review F5 */
 
 /*
  * PGRAC: spec-7.3 D5 — count of dedup accesses rejected because worker_id

@@ -201,6 +201,12 @@ extern bool cluster_peer_supports_undo_authority_serve(int32 peer_id);
 /* spec-5.22e D5-2: undo-horizon report capability (connection-bound; see
  * cluster_sf_note_peer_disconnected_gen) + the close-funnel reset hooks. */
 extern bool cluster_sf_peer_supports_undo_horizon(int32 peer_id);
+/* GCS-race round-2 review F6: GCS completion-proof capability
+ * (connection-bound, same discipline).  An unknown/old/reconnecting peer
+ * reads false, which every consumer treats in the SAFE direction: the
+ * requester withholds DONE (TTL backstop), the master pins the legacy
+ * protocol-maximum lifetime instead of trusting a hint. */
+extern bool cluster_sf_peer_supports_gcs_done(int32 peer_id);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
 extern const char *cluster_sf_peer_capabilities_summary(void);

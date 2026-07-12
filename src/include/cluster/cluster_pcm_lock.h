@@ -412,6 +412,10 @@ extern void cluster_pcm_lock_module_init(void);
  * ============================================================ */
 extern void cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node, uint64 current_lsn);
 extern void cluster_pcm_lock_clear_pending_x(BufferTag tag);
+/* Identity-safe compare-and-clear: clears only while the mark still names
+ * expected_requester (request-scoped clears MUST use this form; round-2
+ * additional hardening).  Returns true when this call cleared it. */
+extern bool cluster_pcm_lock_clear_pending_x_if(BufferTag tag, int32 expected_requester);
 extern int32 cluster_pcm_lock_query_pending_x_requester(BufferTag tag);
 extern uint64 cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node);
 

@@ -247,13 +247,18 @@ typedef enum ClusterICMsgType {
 			   * retention horizon report (LMON-only producer; p2p, never
 			   * broadcast; capability-gated on UNDO_HORIZON_V1 so an old
 			   * peer never sees an unregistered msg_type). */
-	PGRAC_IC_MSG_PEER_CAPS_REPLY = 37		/* PGRAC: spec-2.2 additive amendment
+	PGRAC_IC_MSG_PEER_CAPS_REPLY = 37,		/* PGRAC: spec-2.2 additive amendment
 			   * (spec-5.22e D5 prereq) — acceptor -> dialer capability
 			   * reply carrying the acceptor's own standard 64-byte HELLO
 			   * as payload (LMON-only producer; p2p, never broadcast;
 			   * capability-gated on the dialer's CAPS_REPLY_V1 HELLO bit
 			   * so an old dialer never sees an unregistered msg_type). */
-	/* values 38..255 available for future sub-spec; never reuse 0..37 */
+	PGRAC_IC_MSG_GCS_BLOCK_DONE = 38		/* PGRAC: GCS-race round-2 RC-F —
+			   * requester -> master completion proof for an accepted
+			   * terminal block reply; the master verifies full identity
+			   * and stamps the dedup entry done (advisory: loss is
+			   * absorbed by the pinned TTL backstop). */
+	/* values 39..255 available for future sub-spec; never reuse 0..38 */
 } ClusterICMsgType;
 
 

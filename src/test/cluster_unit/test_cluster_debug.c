@@ -1157,6 +1157,38 @@ cluster_gcs_get_block_stale_reply_drop_count(void)
 	return 0;
 }
 
+/* GCS-race round-2 RC-F stubs: 3 NEW DONE completion-proof counters. */
+uint64
+cluster_gcs_get_block_done_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_done_marked_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_done_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_hint_violation_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_legacy_pin_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_done_enqueue_drop_count(void)
+{
+	return 0;
+}
+
 /* spec-2.35 D12 stubs: 7 NEW CF 2-way protocol counter accessors. */
 uint64
 cluster_gcs_get_block_forward_sent_count(void)
