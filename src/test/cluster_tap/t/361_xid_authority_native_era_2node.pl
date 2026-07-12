@@ -952,6 +952,69 @@ SELECT value FROM pg_cluster_state
 	wait_sql_eq($p1, q{SELECT count(*) FROM sxid_2pc.rows}, '20',
 		'C4: joiner sees the native-era rows (prepared insert rolled back)');
 
+	# ---------------------------------------------------------------------
+	# W legs (GCS-race round-3 P0-1): xid wrap barrier.  The test-only
+	# force GUC makes node0's LMON treat the 2^32 margin as reached and
+	# run the FULL real path: durable NATIVE_RAW_REUSED stamp -> own latch
+	# disable -> DISABLE broadcast to node1 -> ack round -> allocation
+	# gate open.  Only the margin trigger is simulated (a genuine 2^32
+	# approach is not drivable in a test); everything downstream is the
+	# production path.  Precondition: C2 proved both-node coverage latched.
+	# ---------------------------------------------------------------------
+	$p0->append_conf('postgresql.conf', "cluster.xid_wrap_barrier_force = on\n");
+	$p0->reload;
+
+	# W1: the one-way stamp lands durably in the shared authority (0x0004).
+	my $w_tries = 120;
+	my $w_flags = 0;
+	while ($w_tries-- > 0)
+	{
+		$p_auth = read_xid_authority($p_shared);
+		$w_flags = $p_auth->{flags};
+		last if ($w_flags & 0x0004) != 0;
+		usleep(250_000);
+	}
+	ok(($w_flags & 0x0004) != 0,
+		'W1: NATIVE_RAW_REUSED stamped durably in the shared authority');
+
+	# W2: the coordinator collects the peer ack and opens its gate.
+	wait_sql_eq($p0, q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_wrap_barrier_done'},
+		't', 'W2: barrier ack round complete on the coordinator');
+
+	# W3: both latches are one-way disabled -- node0 by its own tick,
+	# node1 by the DISABLE broadcast -- and covered_hw reads 0.
+	wait_sql_eq($p0, q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_native_prehistory_disabled'},
+		't', 'W3: coordinator coverage latch disabled');
+	wait_sql_eq($p1, q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_native_prehistory_disabled'},
+		't', 'W3: joiner coverage latch disabled via DISABLE broadcast');
+	wait_sql_eq($p1, q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_native_prehistory_covered_hw'},
+		'0', 'W3: joiner covered high-water cleared');
+
+	# W4: a reboot on the stamped authority never latches again (the boot
+	# gate in the coverage verify), independent of any broadcast.
+	$p1->stop;
+	$p1->start;
+	wait_sql_eq($p1, 'SELECT 1', '1', 'W4: joiner rejoined after the stamp');
+	like(PostgreSQL::Test::Utils::slurp_file($p1->logfile),
+		qr/native raw xid space has been reused/,
+		'W4: boot gate names the permanent latch-off');
+	wait_sql_eq($p1, q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_native_raw_reused'},
+		't', 'W4: dump mirrors the durable authority flag');
+	is($p1->safe_psql('postgres', q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_native_prehistory_covered_hw'}),
+		'0', 'W4: no re-latch after the stamp');
+
 	$p1->stop;
 	$p0->stop;
 }

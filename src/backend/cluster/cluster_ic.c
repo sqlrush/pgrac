@@ -637,8 +637,14 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	if (!cluster_ic_suppress_caps_reply)
 		capabilities |= PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1;
 	/* GCS-race round-2 review F6: completion-proof protocol capability,
-	 * same unconditional discipline (see cluster_ic.h). */
-	capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	 * same unconditional discipline (see cluster_ic.h).  The test-only
+	 * suppression GUC simulates a pre-GCS_DONE binary (no bit on the wire,
+	 * so peers pin this node's requests by the legacy protocol ceiling). */
+	if (!cluster_ic_suppress_gcs_done_cap)
+		capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	/* GCS-race round-3 P0-1: xid wrap-barrier protocol capability, same
+	 * unconditional discipline (see cluster_ic.h). */
+	capabilities |= PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

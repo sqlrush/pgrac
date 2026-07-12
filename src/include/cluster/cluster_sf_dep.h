@@ -207,6 +207,11 @@ extern bool cluster_sf_peer_supports_undo_horizon(int32 peer_id);
  * requester withholds DONE (TTL backstop), the master pins the legacy
  * protocol-maximum lifetime instead of trusting a hint. */
 extern bool cluster_sf_peer_supports_gcs_done(int32 peer_id);
+/* GCS-race round-3 P0-1: xid wrap-barrier capability (connection-bound, same
+ * discipline).  False for an unknown/old/reconnecting peer, which fails the
+ * barrier SAFE: the coordinator withholds DISABLE, the ack bitmap never
+ * fills, and the allocation gate keeps refusing epoch>=1 candidates. */
+extern bool cluster_sf_peer_supports_xid_native_disable(int32 peer_id);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
 extern const char *cluster_sf_peer_capabilities_summary(void);

@@ -2133,7 +2133,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		 * silent.
 		 */
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-done-drop");
-		if (cluster_sf_peer_supports_gcs_done(done_master_node)
+		if (!cluster_ic_suppress_gcs_done_cap /* test-only old-binary sim */
+			&& cluster_sf_peer_supports_gcs_done(done_master_node)
 			&& !cluster_injection_should_skip("cluster-gcs-block-done-drop")) {
 			GcsBlockDonePayload done;
 

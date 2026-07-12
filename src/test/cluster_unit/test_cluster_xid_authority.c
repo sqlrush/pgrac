@@ -102,6 +102,12 @@ cluster_cr_native_prehistory_latch(uint64 native_hw_full pg_attribute_unused())
 	printf("# unexpected cluster_cr_native_prehistory_latch call in unit context -- aborting\n");
 	abort();
 }
+void
+cluster_cr_native_prehistory_disable(void)
+{
+	printf("# unexpected cluster_cr_native_prehistory_disable call in unit context -- aborting\n");
+	abort();
+}
 
 /* ---- GCS-race round-2 review F1: provable_full widens through
  * cluster_xid_widen, so cluster_xid_stripe.o joins the link.  Only the
@@ -429,6 +435,54 @@ UT_TEST(test_mark_cluster_era_one_way)
 	UT_ASSERT_EQ(got.native_hw_full, 900);
 	UT_ASSERT_EQ(got.flags,
 				 CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
+}
+
+/* GCS-race round-3 P0-1: NATIVE_RAW_REUSED is one-way, coexists with the
+ * other flags, survives later publishes, and re-running the stamp is an
+ * idempotent no-op (both-copies re-assert discipline). */
+UT_TEST(test_mark_native_raw_reused_one_way)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* idempotent re-assert: still stamped, other flags untouched */
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* later publishes never clear it (monotone flags, hw never lowered) */
+	cluster_xid_authority_publish_native(900, 1, false);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 900);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* .bak roll carries the flag too (both-copies discipline): corrupt the
+	 * primary in place and the fallback image still shows the stamp */
+	{
+		char p[MAXPGPATH];
+		int fd;
+
+		snprintf(p, sizeof(p), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_REL_PATH);
+		fd = open(p, O_RDWR, 0600);
+		(void)!write(fd, "garbage!", 8);
+		close(fd);
+	}
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT((got.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
 }
 
 UT_TEST(test_primary_corrupt_falls_back_to_bak)
@@ -1036,13 +1090,14 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
 	UT_RUN(test_seed_if_absent_creates_unsealed);
 	UT_RUN(test_publish_monotone_and_seal);
 	UT_RUN(test_mark_cluster_era_one_way);
+	UT_RUN(test_mark_native_raw_reused_one_way);
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
 	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);

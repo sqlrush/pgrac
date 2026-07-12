@@ -209,11 +209,12 @@ jobs:
           - { name: stage7-lms-pool, ranges: "364 367", unit: false, regress: false }
           # t/365 spec-7.1a cross-instance write-write MVCC coordination.
           - { name: stage7-write-write, ranges: "365-365", unit: false, regress: false }
-          # t/366 spec-7.2a GCS block dedup capacity + eager reclaim.  Own shard:
-          # 2-node shared_catalog bring-up + cross-node distinct-read dedup
-          # pressure + injected retransmit-dedup correctness needs the wall
-          # clock.
-          - { name: stage7-gcs-dedup-capacity, ranges: "366-366", unit: false, regress: false }
+          # t/366 spec-7.2a GCS block dedup capacity + eager reclaim, plus
+          # t/371 GCS_DONE mixed-version compat (suppressed pre-protocol
+          # binary at the default cap).  Own shard: 2-node shared_catalog
+          # bring-up + cross-node distinct-read dedup pressure + injected
+          # retransmit-dedup correctness needs the wall clock.
+          - { name: stage7-gcs-dedup-capacity, ranges: "366 371", unit: false, regress: false }
           # t/359 mxid-stripe gapwalk + t/368 multixact member-serve refuse
           # (spec-7.1 family; 368 renamed from the double-occupied t/360 per
           # the hub number ledger -- the lms data-plane faults file keeps 360).

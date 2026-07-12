@@ -68,6 +68,16 @@
 #define CLUSTER_XID_AUTHORITY_FLAG_SEALED 0x0001
 /* A cluster.enabled=on boot closed the native era forever (one-way). */
 #define CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA 0x0002
+/*
+ * The cluster is about to (or did) allocate the first epoch>=1 xid, so raw
+ * 32-bit values below the native high-water are no longer alias-free
+ * native-era identities (GCS-race round-3 P0-1).  One-way; stamped durably
+ * BEFORE the first epoch carry by the LMON wrap barrier.  Once set, no boot
+ * may latch the native-prehistory coverage again (below-hw recycled refs
+ * stay fail-closed 53R97 forever) and every serving reader's latch is
+ * cleared through the barrier broadcast before allocation proceeds.
+ */
+#define CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED 0x0004
 
 typedef struct ClusterXidAuthorityHeader {
 	uint32 magic;
@@ -200,6 +210,15 @@ extern void cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 n
  * torn previous stamp); no-write no-op once both are stamped.
  */
 extern void cluster_xid_authority_mark_cluster_era(void);
+
+/*
+ * One-way: stamp NATIVE_RAW_REUSED (LMON wrap barrier, strictly before the
+ * cluster's first epoch>=1 xid allocation).  Same idempotent both-copies
+ * re-assert discipline as the cluster-era stamp; PANICs on a missing or
+ * corrupt authority (the bootstrap seeded it long before any allocator can
+ * approach the epoch boundary).
+ */
+extern void cluster_xid_authority_mark_native_raw_reused(void);
 
 /*
  * A follow-up native-era (cluster.enabled=off) boot on a sealed authority

@@ -184,6 +184,31 @@ GetNewTransactionId(bool isSubXact)
 			}
 		}
 	}
+
+	/*
+	 * PGRAC: GCS-race round-3 P0-1 — xid wrap-barrier allocation gate.
+	 *
+	 * No epoch>=1 xid may be issued until this node holds proof that every
+	 * member's native-prehistory coverage latch is off (durable
+	 * NATIVE_RAW_REUSED stamp + LMON ack round, or the boot shortcut on an
+	 * already-wrapped counter).  A raw 32-bit value below the native
+	 * high-water stops being an alias-free native-era identity the moment
+	 * the first epoch-1 xid exists anywhere; issuing one before the barrier
+	 * completes could feed a still-latched epoch-0 peer a false LOCAL
+	 * visibility verdict (rule 8.A).  Fail-closed and retryable (53RB5,
+	 * mirroring the 53RB2 posture above): the LMON barrier is
+	 * margin-triggered ~16M xids ahead and normally completes within a
+	 * tick, so hitting this gate means the round is still in flight (or a
+	 * member cannot participate — see the barrier's LOG lines).
+	 */
+	if (cluster_enabled && cluster_shared_catalog
+		&& EpochFromFullTransactionId(full_xid) > 0
+		&& !cluster_xid_wrap_barrier_passed())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("refusing to assign a new transaction ID: xid epoch rollover barrier is not complete"),
+				 errdetail("The first epoch-1 transaction ID may not be issued until every cluster member has durably disabled native-era prehistory routing."),
+				 errhint("The barrier completes automatically within about a second; retry the transaction. If this persists, check cluster connectivity and that every member runs a barrier-capable binary.")));
 #endif
 
 	/*----------
@@ -293,6 +318,17 @@ GetNewTransactionId(bool isSubXact)
 				xid = XidFromFullTransactionId(full_xid);
 			}
 		}
+
+		/* PGRAC: GCS-race round-3 P0-1 — re-assert the wrap-barrier gate on
+		 * the re-derived candidate (same predicate as the first derivation). */
+		if (cluster_enabled && cluster_shared_catalog
+			&& EpochFromFullTransactionId(full_xid) > 0
+			&& !cluster_xid_wrap_barrier_passed())
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("refusing to assign a new transaction ID: xid epoch rollover barrier is not complete"),
+					 errdetail("The first epoch-1 transaction ID may not be issued until every cluster member has durably disabled native-era prehistory routing."),
+					 errhint("The barrier completes automatically within about a second; retry the transaction. If this persists, check cluster connectivity and that every member runs a barrier-capable binary.")));
 #endif
 	}
 

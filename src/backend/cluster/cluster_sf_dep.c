@@ -260,6 +260,30 @@ cluster_sf_peer_supports_gcs_done(int32 peer_id)
 }
 
 /*
+ * cluster_sf_peer_supports_xid_native_disable
+ *
+ * GCS-race round-3 P0-1: true iff the peer's verified HELLO on the CURRENT
+ * connection advertised the xid wrap-barrier protocol bit.  Same
+ * connection-bound, no-local-GUC discipline as the queries above; an
+ * unknown/old/reconnecting peer reads false and the barrier degrades in
+ * the safe direction (DISABLE withheld, ack bitmap never fills, the
+ * allocation gate keeps refusing epoch>=1 candidates fail-closed).
+ */
+bool
+cluster_sf_peer_supports_xid_native_disable(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1) != 0;
+}
+
+/*
  * cluster_sf_note_peer_disconnected_gen
  *
  * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: capability

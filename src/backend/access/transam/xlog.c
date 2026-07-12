@@ -202,6 +202,7 @@
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
+#include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
@@ -6256,6 +6257,16 @@ StartupXLOG(void)
 	 * wrong, at worst degraded to today's fail-closed behaviour.
 	 */
 	cluster_xid_prehistory_verify_native_coverage();
+
+	/*
+	 * PGRAC (GCS-race round-3 P0-1): mirror a durable NATIVE_RAW_REUSED
+	 * stamp into shmem BEFORE backends are admitted -- a stamped authority
+	 * disables the coverage latch outright, and an already-wrapped counter
+	 * takes the allocation-gate boot shortcut (the first carry was gated,
+	 * so "every latch off" is a permanent global fact).  Must run after
+	 * the verify above so a same-boot latch can never outlive the mirror.
+	 */
+	cluster_xid_wrap_barrier_startup_init();
 #endif
 
 	/*

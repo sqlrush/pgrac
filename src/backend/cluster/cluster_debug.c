@@ -3405,6 +3405,17 @@ dump_catalog(ReturnSetInfo *rsinfo)
 		 * (0 = not proven this boot; resolver stays fail-closed). */
 		emit_row(rsinfo, "catalog", "xid_native_prehistory_covered_hw",
 				 fmt_int64((int64)cluster_cr_native_prehistory_covered_hw()));
+		/* GCS-race round-3 P0-1: xid wrap barrier faces.  raw_reused = the
+		 * durable one-way authority stamp; disabled = this node's one-way
+		 * latch disable; barrier_done = this boot may issue epoch>=1 xids
+		 * (every member's latch proven off). */
+		emit_row(
+			rsinfo, "catalog", "xid_native_raw_reused",
+			fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0));
+		emit_row(rsinfo, "catalog", "xid_native_prehistory_disabled",
+				 fmt_bool(cluster_cr_native_prehistory_disabled()));
+		emit_row(rsinfo, "catalog", "xid_wrap_barrier_done",
+				 fmt_bool(cluster_xid_wrap_barrier_passed()));
 	}
 
 	/*

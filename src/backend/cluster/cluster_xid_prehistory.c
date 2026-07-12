@@ -567,6 +567,23 @@ cluster_xid_prehistory_verify_native_coverage(void)
 		return;
 	if (!cluster_xid_authority_read_checked(&auth, &from_bak))
 		return; /* bootstrap already vetted presence; stay unlatched */
+
+	/*
+	 * NATIVE_RAW_REUSED boot gate (round-3 P0-1): once the wrap barrier has
+	 * stamped the authority, some node has (or is about to have) allocated
+	 * epoch>=1 xids, so a raw 32-bit value below the native high-water is no
+	 * longer an alias-free native-era identity ANYWHERE in the cluster --
+	 * even on a node whose own counter still reads epoch 0 (herding lag).
+	 * Permanent skip leg: mirror the flag into the one-way shmem disable and
+	 * never latch again (below-hw recycled refs stay fail-closed 53R97).
+	 */
+	if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) {
+		cluster_cr_native_prehistory_disable();
+		elog(LOG, "cluster shared_catalog: native raw xid space has been reused by a later "
+				  "epoch; prehistory coverage latch is permanently off");
+		return;
+	}
+
 	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0 || auth.native_hw_full == 0)
 		return;
 	if (cluster_xid_prehistory_payload_bytes(auth.native_hw_full) == 0)

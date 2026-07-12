@@ -119,6 +119,20 @@ typedef struct ClusterXidStripeBootShmem {
 	pg_atomic_uint64 cluster_max_active_hwm;
 
 	/*
+	 * GCS-race round-3 P0-1: xid wrap barrier (native raw reuse).
+	 * wrap_barrier_marked mirrors "NATIVE_RAW_REUSED is durably stamped in
+	 * the shared authority"; wrap_barrier_done latches "every current
+	 * member's native-prehistory latch is provably off" (own LMON ack round
+	 * this boot, or the boot shortcut on an already-wrapped counter).  The
+	 * allocation gate reads wrap_barrier_done lock-free before issuing any
+	 * epoch>=1 candidate; ack_bitmap collects the DISABLE_ACK bits of the
+	 * in-flight round (LMON-only writer).
+	 */
+	pg_atomic_uint32 wrap_barrier_marked;
+	pg_atomic_uint32 wrap_barrier_done;
+	pg_atomic_uint64 wrap_barrier_ack_bitmap;
+
+	/*
 	 * Replay-learned stripe knowledge (D5d): written ONLY by WAL redo
 	 * (startup process), consumed by the hot-standby KnownAssignedXids
 	 * gap-fill in the same process (atomics are for cross-process
@@ -177,6 +191,9 @@ cluster_xid_stripe_shmem_init(void)
 		pg_atomic_init_u64(&StripeBootShmem->herding_floor_full, 0);
 		pg_atomic_init_u64(&StripeBootShmem->cluster_min_active_hwm, 0);
 		pg_atomic_init_u64(&StripeBootShmem->cluster_max_active_hwm, 0);
+		pg_atomic_init_u32(&StripeBootShmem->wrap_barrier_marked, 0);
+		pg_atomic_init_u32(&StripeBootShmem->wrap_barrier_done, 0);
+		pg_atomic_init_u64(&StripeBootShmem->wrap_barrier_ack_bitmap, 0);
 	}
 }
 
@@ -1380,6 +1397,66 @@ cluster_xid_stripe_window_exceeded(FullTransactionId candidate)
 	if (min_hwm == 0)
 		return false;
 	return cand > min_hwm && cand - min_hwm > hard;
+}
+
+/* ============================================================
+ * GCS-race round-3 P0-1: xid wrap barrier shmem face.
+ *
+ * The protocol lives in cluster_xid_wrap_barrier.c (LMON tick + IC
+ * handlers); this module only owns the atomics because they sit next to
+ * the other allocation-hot-path fields.  All writers are one-way (0 -> 1
+ * marks, monotone bitmap OR), so plain atomic read/write suffices.
+ * ============================================================ */
+
+bool
+cluster_xid_wrap_barrier_passed(void)
+{
+	return StripeBootShmem != NULL && pg_atomic_read_u32(&StripeBootShmem->wrap_barrier_done) != 0;
+}
+
+void
+cluster_xid_wrap_barrier_set_done(void)
+{
+	if (StripeBootShmem != NULL)
+		pg_atomic_write_u32(&StripeBootShmem->wrap_barrier_done, 1);
+}
+
+bool
+cluster_xid_wrap_barrier_marked(void)
+{
+	return StripeBootShmem != NULL
+		   && pg_atomic_read_u32(&StripeBootShmem->wrap_barrier_marked) != 0;
+}
+
+void
+cluster_xid_wrap_barrier_set_marked(void)
+{
+	if (StripeBootShmem != NULL)
+		pg_atomic_write_u32(&StripeBootShmem->wrap_barrier_marked, 1);
+}
+
+void
+cluster_xid_wrap_barrier_note_ack(int32 node_id)
+{
+	if (StripeBootShmem == NULL || node_id < 0 || node_id >= 64)
+		return;
+	pg_atomic_fetch_or_u64(&StripeBootShmem->wrap_barrier_ack_bitmap, UINT64CONST(1) << node_id);
+}
+
+uint64
+cluster_xid_wrap_barrier_ack_bitmap(void)
+{
+	if (StripeBootShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&StripeBootShmem->wrap_barrier_ack_bitmap);
+}
+
+uint64
+cluster_xid_stripe_cluster_max_hwm(void)
+{
+	if (StripeBootShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&StripeBootShmem->cluster_max_active_hwm);
 }
 
 /* ============================================================

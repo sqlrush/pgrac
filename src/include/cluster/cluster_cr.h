@@ -279,6 +279,14 @@ extern uint64 cluster_cr_native_prehistory_covered_hw(void);
 extern uint64 cluster_rtvis_native_prehistory_local_count(void);
 extern void cluster_rtvis_note_native_prehistory_local(void);
 
+/*
+ * GCS-race round-3 P0-1: one-way latch disable (wrap barrier / authority
+ * NATIVE_RAW_REUSED mirror).  Once disabled, covered_hw reads 0 forever and
+ * a late latch store is void; below-floor recycled refs stay 53R97.
+ */
+extern void cluster_cr_native_prehistory_disable(void);
+extern bool cluster_cr_native_prehistory_disabled(void);
+
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
 extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);

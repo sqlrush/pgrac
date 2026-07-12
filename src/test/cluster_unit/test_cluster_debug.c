@@ -2000,6 +2000,17 @@ cluster_cr_native_prehistory_covered_hw(void)
 {
 	return 0;
 }
+/* GCS-race round-3 P0-1: wrap-barrier dump faces. */
+bool
+cluster_cr_native_prehistory_disabled(void)
+{
+	return false;
+}
+bool
+cluster_xid_wrap_barrier_passed(void)
+{
+	return false;
+}
 uint64
 cluster_rtvis_native_prehistory_local_count(void)
 {
