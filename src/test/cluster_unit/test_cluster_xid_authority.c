@@ -487,6 +487,54 @@ UT_TEST(test_mark_native_raw_reused_one_way)
 	UT_ASSERT((got.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
 }
 
+UT_TEST(test_mark_epoch_gate_admitted_one_way)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+	cluster_xid_authority_mark_native_raw_reused();
+
+	/* not admitted yet: raw_reused settles alone, the admission probe holds */
+	UT_ASSERT_EQ(cluster_xid_authority_raw_reused_settled(), true);
+	UT_ASSERT_EQ(cluster_xid_authority_epoch_gate_admitted_settled(), false);
+
+	cluster_xid_authority_mark_epoch_gate_admitted();
+	UT_ASSERT_EQ(cluster_xid_authority_epoch_gate_admitted_settled(), true);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED
+								| CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED);
+	/* stamped magic preserved (P0-4 downlevel gate still armed) */
+	UT_ASSERT_EQ(got.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+
+	/* idempotent re-assert */
+	cluster_xid_authority_mark_epoch_gate_admitted();
+	UT_ASSERT_EQ(cluster_xid_authority_epoch_gate_admitted_settled(), true);
+}
+
+UT_TEST(test_mark_epoch_gate_admitted_implies_raw_reused)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+
+	/* the post-done settle watch repairs with a SINGLE admitted call --
+	 * it must re-assert RAW_REUSED (and its stamped magic) too */
+	cluster_xid_authority_mark_epoch_gate_admitted();
+	UT_ASSERT_EQ(cluster_xid_authority_raw_reused_settled(), true);
+	UT_ASSERT_EQ(cluster_xid_authority_epoch_gate_admitted_settled(), true);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT((got.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
+	UT_ASSERT_EQ(got.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+}
+
 /* raw image helpers (defined with the torn-crash fixtures below) */
 static void write_raw_image(const char *path, const char *image, size_t len);
 static void read_raw_image(const char *path, char *image, size_t len);
@@ -1351,7 +1399,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(27);
+	UT_PLAN(29);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -1361,6 +1409,8 @@ main(void)
 	UT_RUN(test_mark_native_raw_reused_one_way);
 	UT_RUN(test_raw_reused_magic_truth_table);
 	UT_RUN(test_mark_raw_reused_upgrades_old_magic_copies);
+	UT_RUN(test_mark_epoch_gate_admitted_one_way);
+	UT_RUN(test_mark_epoch_gate_admitted_implies_raw_reused);
 	UT_RUN(test_mutation_lock_serializes_and_merges);
 	UT_RUN(test_publish_preserves_stamp);
 	UT_RUN(test_native_prehistory_status_map);

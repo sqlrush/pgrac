@@ -663,6 +663,56 @@ cluster_xid_authority_raw_reused_settled(void)
 }
 
 /*
+ * cluster_xid_authority_mark_epoch_gate_admitted -- one-way admission proof
+ * (GCS-race round-4c P0-1 residual #2).  The wrap-barrier coordinator calls
+ * this AFTER the full admission held (every declared member connected +
+ * flock-capable + ack'd) and RAW_REUSED settled, right BEFORE opening the
+ * epoch-allocation gate.  Also re-asserts RAW_REUSED (admission implies the
+ * stamp; keeps a single repair call sufficient for the post-done settle
+ * watch).  Same idempotent both-copies discipline as the other one-way
+ * flags; missing/corrupt authority PANICs (bootstrap seeded it long ago).
+ */
+void
+cluster_xid_authority_mark_epoch_gate_admitted(void)
+{
+	ClusterXidAuthorityHeader hdr;
+	int lockfd;
+	uint32 want = CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED
+				  | CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED;
+
+	lockfd = authority_mutation_lock();
+	if (!cluster_xid_authority_read(&hdr))
+		ereport(
+			PANIC,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("shared XID authority is missing or corrupt at epoch-gate-admitted stamp")));
+
+	if ((hdr.flags & want) == want && both_copies_flags_settled(want, 0)) {
+		authority_mutation_unlock(lockfd);
+		return; /* transition complete in both copies */
+	}
+
+	hdr.flags |= want;
+	write_header_both(&hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_REL_PATH, &hdr);
+	verify_installed(CLUSTER_XID_AUTHORITY_BAK_REL_PATH, &hdr);
+	authority_mutation_unlock(lockfd);
+}
+
+/*
+ * Settle probe for the boot shortcut + the post-done settle watch: true only
+ * when BOTH copies validate and carry BOTH one-way flags (the settle
+ * predicate enforces the stamped magic for RAW_REUSED, review P0-4).
+ */
+bool
+cluster_xid_authority_epoch_gate_admitted_settled(void)
+{
+	return both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED
+										 | CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED,
+									 0);
+}
+
+/*
  * cluster_xid_authority_begin_native_run -- re-open the native era for a
  * follow-up cluster.enabled=off seed run (spec-6.15b §3.1 multi-pass arm).
  *

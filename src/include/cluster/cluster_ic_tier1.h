@@ -253,6 +253,19 @@ extern ClusterICSendResult cluster_ic_tier1_send_heartbeat(int32 peer_id);
 extern bool cluster_ic_tier1_pending_outbound(int32 peer_id);
 
 /*
+ * PGRAC: GCS-race round-4c tier1-partial-IO F2 — standalone drain entry for
+ * a WL_SOCKET_WRITEABLE wakeup on a CONNECTED peer with pending outbound
+ * bytes.  Pushes ONLY the backpressured tail (never injects a new frame —
+ * unlike the CONTROL plane's idempotent-heartbeat re-entry).  DONE = tail
+ * fully drained (drop WRITEABLE interest);  WOULD_BLOCK = still
+ * backpressured (keep it);  HARD_ERROR = dead socket / corrupt drain state
+ * (caller must close the peer).  get_writable_drain aggregates the drain
+ * wakeup counter per plane (DATA sums its worker channels).
+ */
+extern ClusterICSendResult cluster_ic_tier1_drain_outbound(int32 peer_id);
+extern uint64 cluster_ic_tier1_get_writable_drain(ClusterICPlane plane);
+
+/*
  * spec-2.4 D10 per-peer counter bumpers.  Used by envelope_verify
  * (stale_epoch_drop), envelope_observe_scn (lamport_advance), and
  * cluster_ic_chunk reassembly state machine (timeout / active).

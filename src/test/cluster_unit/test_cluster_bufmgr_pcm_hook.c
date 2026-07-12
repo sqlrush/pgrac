@@ -394,6 +394,16 @@ void
 cluster_gcs_block_bump_master_holder_lifecycle(void)
 {}
 
+/* GCS-race round-4c FUNC-1 stub: the tag-only local-master grant tail calls
+ * the storage-fallback SCN verify.  The standalone fixture has no
+ * ClusterGcsBlockShared / no watermark (query returns InvalidScn), so the
+ * real helper would short-circuit to a no-op — mirror that here. */
+void
+cluster_gcs_block_fallback_verify_refresh(struct BufferDesc *buf pg_attribute_unused(),
+										  BufferTag tag pg_attribute_unused(),
+										  SCN expected_scn pg_attribute_unused())
+{}
+
 Size
 hash_estimate_size(long num_entries, Size entry_size)
 {

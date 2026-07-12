@@ -92,6 +92,20 @@
  */
 #define CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED 0x0004
 
+/*
+ * GCS-race round-4c P0-1 residual #2 — durable admission proof for the wrap
+ * barrier's epoch-allocation gate.  The barrier coordinator stamps this
+ * (under the authority flock, after RAW_REUSED settled in both copies)
+ * ONLY once the full admission held: every conf-declared member connected,
+ * advertising XID_AUTHORITY_FLOCK_V2, and ack'd latch-off.  The boot
+ * shortcut (counter already past the native era) may only open the gate on
+ * this flag: RAW_REUSED alone proves the stamp landed, not that the
+ * admission round ever completed (a coordinator crash between stamp and
+ * gate-open would otherwise let a reboot skip the distributed proof).
+ * One-way; re-asserted by the LMON tick like the other one-way flags.
+ */
+#define CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED 0x0008
+
 typedef struct ClusterXidAuthorityHeader {
 	uint32 magic;
 	uint32 version;
@@ -285,6 +299,15 @@ extern void cluster_xid_authority_mark_native_raw_reused(void);
  * gate -- shmem marked/done state alone never stands in for the disk.
  */
 extern bool cluster_xid_authority_raw_reused_settled(void);
+
+/*
+ * GCS-race round-4c P0-1 residual #2 — EPOCH_GATE_ADMITTED one-way stamp +
+ * settle probe (see the flag comment above).  mark also re-asserts
+ * RAW_REUSED (admission implies the stamp);  settled requires BOTH flags in
+ * BOTH copies under the stamped magic.
+ */
+extern void cluster_xid_authority_mark_epoch_gate_admitted(void);
+extern bool cluster_xid_authority_epoch_gate_admitted_settled(void);
 
 /*
  * A follow-up native-era (cluster.enabled=off) boot on a sealed authority

@@ -118,6 +118,10 @@ typedef struct ClusterICTier1Shmem {
 	/* PGRAC: spec-7.2 D3 — frames dropped by the dispatch plane gate
 	 * (a msg_type dispatched in the wrong plane's owner process). */
 	pg_atomic_uint64 plane_misroute_reject;
+	/* PGRAC: GCS-race round-4c tier1-partial-IO F2 — backpressured outbound
+	 * tails drained by this plane instance on a WL_SOCKET_WRITEABLE wakeup
+	 * (the DATA plane previously parked such tails forever — 56s wall). */
+	pg_atomic_uint64 writable_drain_count;
 	ClusterICPeerStateShmem peers[CLUSTER_MAX_NODES];
 } ClusterICTier1Shmem;
 
@@ -262,6 +266,14 @@ static uint64 tier1_caps_reply_epoch[CLUSTER_MAX_NODES];
 static uint8 *tier1_outbound_buf_dyn[CLUSTER_MAX_NODES];
 static int tier1_outbound_buf_dyn_size[CLUSTER_MAX_NODES];
 static int tier1_outbound_remaining[CLUSTER_MAX_NODES];
+/* PGRAC: GCS-race round-4c tier1-partial-IO F1 — the queued TAIL FRAME
+ * length.  tier1_outbound_buf_dyn_size is the grow-only allocation
+ * CAPACITY and must never be used as a resume cursor base: the tail is
+ * always memcpy'd at offset 0, so with a reused larger buffer
+ * (capacity - remaining) pointed into stale bytes of a PREVIOUS frame and
+ * put them on the wire (frame corruption -> reply discarded -> retransmit
+ * budget wall, the 56s stall root cause #1). */
+static int tier1_outbound_queued_total[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.4 hardening v1.0.1 F1: variable-length payload recv state.
@@ -504,6 +516,7 @@ tier1_shmem_init(void)
 			s->listener_pid = 0;
 			s->listener_incarnation = 0;
 			pg_atomic_init_u64(&s->plane_misroute_reject, 0);
+			pg_atomic_init_u64(&s->writable_drain_count, 0);
 
 			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 				s->peers[i].node_id = -1;
@@ -631,6 +644,33 @@ cluster_ic_tier1_get_plane_misroute_reject(ClusterICPlane plane)
 	return pg_atomic_read_u64(&Tier1ShmemSlots[0]->plane_misroute_reject);
 }
 
+/* PGRAC: GCS-race round-4c tier1-partial-IO F2 — WRITEABLE-drain wakeup
+ * counter, plane-scoped (DATA aggregates its worker channels;  mirrors
+ * get_plane_misroute_reject above). */
+uint64
+cluster_ic_tier1_get_writable_drain(ClusterICPlane plane)
+{
+	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N)
+		return 0;
+
+	if (plane == CLUSTER_IC_PLANE_DATA) {
+		uint64 sum = 0;
+		int c;
+
+		for (c = 0; c < CLUSTER_IC_TIER1_DATA_CHANNELS; c++) {
+			int slot = tier1_slot_of(CLUSTER_IC_PLANE_DATA, c);
+
+			if (Tier1ShmemSlots[slot] != NULL)
+				sum += pg_atomic_read_u64(&Tier1ShmemSlots[slot]->writable_drain_count);
+		}
+		return sum;
+	}
+
+	if (Tier1ShmemSlots[0] == NULL)
+		return 0;
+	return pg_atomic_read_u64(&Tier1ShmemSlots[0]->writable_drain_count);
+}
+
 static const ClusterShmemRegion cluster_ic_tier1_region = {
 	.name = "pgrac cluster_ic_tier1",
 	.size_fn = tier1_shmem_size,
@@ -646,6 +686,92 @@ cluster_ic_tier1_shmem_register(void)
 	cluster_shmem_register_region(&cluster_ic_tier1_region);
 }
 
+
+/*
+ * PGRAC: GCS-race round-4c tier1-partial-IO F1 — drain the backpressured
+ * outbound tail for one peer.  Shared by the top of tier1_send_bytes (drain
+ * before any new payload) and the standalone WL_SOCKET_WRITEABLE drain
+ * entry cluster_ic_tier1_drain_outbound (F2: the DATA plane needs a drain
+ * that injects NO new frame — the CONTROL plane re-enters via its
+ * idempotent heartbeat, which the DATA plane has no equivalent of).
+ *
+ *	Resume cursor = queued_total - remaining.  queued_total is the tail
+ *	frame length stamped at queue time; tier1_outbound_buf_dyn_size is the
+ *	grow-only allocation capacity and using it here sent stale bytes of a
+ *	previous frame after buffer reuse (root cause #1 of the 56s retransmit
+ *	wall).  Returns DONE when nothing is pending or the tail fully drained,
+ *	WOULD_BLOCK while backpressured, HARD_ERROR on a dead socket or a
+ *	corrupt drain state (caller closes the peer; close_peer resets the
+ *	tail — a byte-stream continuation must never survive a reconnect).
+ */
+static ClusterICSendResult
+tier1_drain_pending(int32 target_node_id, int fd)
+{
+	int rem = tier1_outbound_remaining[target_node_id];
+	int total = tier1_outbound_queued_total[target_node_id];
+	int off = total - rem;
+	ssize_t drained;
+
+	if (rem <= 0)
+		return CLUSTER_IC_SEND_DONE;
+
+	if (off < 0 || tier1_outbound_buf_dyn[target_node_id] == NULL
+		|| total > tier1_outbound_buf_dyn_size[target_node_id]) {
+		peer_record_error(target_node_id, 0, "08006",
+						  "outbound drain state corrupt (rem=%d total=%d cap=%d)", rem, total,
+						  tier1_outbound_buf_dyn_size[target_node_id]);
+		tier1_outbound_remaining[target_node_id] = 0;
+		tier1_outbound_queued_total[target_node_id] = 0;
+		return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_IC_TCP_SEND);
+	drained = send(fd, &tier1_outbound_buf_dyn[target_node_id][off], (size_t)rem, 0);
+	pgstat_report_wait_end();
+	if (drained < 0) {
+		int saved = errno;
+
+		if (saved == EAGAIN || saved == EWOULDBLOCK)
+			return CLUSTER_IC_SEND_WOULD_BLOCK; /* still backpressured */
+		peer_record_error(target_node_id, saved, "08006", "send (drain): %s", strerror(saved));
+		return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+	}
+	tier1_outbound_remaining[target_node_id] -= (int)drained;
+	if (Tier1Shmem != NULL && drained > 0) {
+		pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)drained);
+		Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
+	}
+	if (tier1_outbound_remaining[target_node_id] > 0)
+		return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
+	tier1_outbound_queued_total[target_node_id] = 0;
+	return CLUSTER_IC_SEND_DONE;
+}
+
+/*
+ * PGRAC: GCS-race round-4c tier1-partial-IO F2 — standalone drain entry for
+ * a WL_SOCKET_WRITEABLE wakeup.  Resolves the peer fd internally (same
+ * registry as tier1_send_bytes) and pushes ONLY the pending tail; never
+ * injects a new frame.  Bumps this plane instance's writable_drain_count
+ * so the S3 gate can prove the drain path actually fired under load.
+ */
+ClusterICSendResult
+cluster_ic_tier1_drain_outbound(int32 peer_id)
+{
+	int fd;
+	ClusterICSendResult rc;
+
+	peer_fds_lazy_init();
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	fd = tier1_peer_fds[peer_id];
+	if (fd < 0)
+		return CLUSTER_IC_SEND_HARD_ERROR; /* not connected: caller resets peer state */
+
+	rc = tier1_drain_pending(peer_id, fd);
+	if (Tier1Shmem != NULL)
+		pg_atomic_fetch_add_u64(&Tier1Shmem->writable_drain_count, 1);
+	return rc;
+}
 
 /* ============================================================
  * Vtable hooks (called from cluster_ic.c through ClusterICOps_Active
@@ -735,31 +861,11 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	 *                  and re-enter on writability;NEVER close peer
 	 *   HARD_ERROR  -> socket dead;caller MUST close peer
 	 */
-	if (tier1_outbound_remaining[target_node_id] > 0) {
-		int rem = tier1_outbound_remaining[target_node_id];
-		int off = tier1_outbound_buf_dyn_size[target_node_id] - rem;
-		ssize_t drained;
+	{
+		ClusterICSendResult drain_rc = tier1_drain_pending(target_node_id, fd);
 
-		Assert(tier1_outbound_buf_dyn[target_node_id] != NULL);
-
-		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_IC_TCP_SEND);
-		drained = send(fd, &tier1_outbound_buf_dyn[target_node_id][off], (size_t)rem, 0);
-		pgstat_report_wait_end();
-		if (drained < 0) {
-			int saved = errno;
-
-			if (saved == EAGAIN || saved == EWOULDBLOCK)
-				return CLUSTER_IC_SEND_WOULD_BLOCK; /* still backpressured */
-			peer_record_error(target_node_id, saved, "08006", "send (drain): %s", strerror(saved));
-			return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
-		}
-		tier1_outbound_remaining[target_node_id] -= (int)drained;
-		if (Tier1Shmem != NULL && drained > 0) {
-			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)drained);
-			Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
-		}
-		if (tier1_outbound_remaining[target_node_id] > 0)
-			return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
+		if (drain_rc != CLUSTER_IC_SEND_DONE)
+			return drain_rc; /* WOULD_BLOCK: defer new payload;  HARD_ERROR: caller closes */
 	}
 
 	/*
@@ -805,6 +911,9 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 			}
 			memcpy(tier1_outbound_buf_dyn[target_node_id], buf, len);
 			tier1_outbound_remaining[target_node_id] = (int)len;
+			/* Round-4c F1: stamp the queued tail length — the resume
+			 * cursor base (dyn_size is capacity, never a cursor base). */
+			tier1_outbound_queued_total[target_node_id] = (int)len;
 
 			return CLUSTER_IC_SEND_WOULD_BLOCK;
 		}
@@ -846,6 +955,9 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		}
 		memcpy(tier1_outbound_buf_dyn[target_node_id], (const char *)buf + sent, tail_len);
 		tier1_outbound_remaining[target_node_id] = (int)tail_len;
+		/* Round-4c F1: stamp the queued tail length — the resume cursor
+		 * base (dyn_size is capacity, never a cursor base). */
+		tier1_outbound_queued_total[target_node_id] = (int)tail_len;
 
 		if (Tier1Shmem != NULL && sent > 0) {
 			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)sent);
@@ -2452,6 +2564,18 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		/* caps-reply resend state is per-connection too */
 		tier1_caps_reply_wanted[peer_id] = false;
 	}
+
+	/*
+	 * PGRAC: GCS-race round-4c tier1-partial-IO F4 — a backpressured
+	 * outbound tail is a per-CONNECTION byte-stream continuation; it must
+	 * never survive onto a reconnected socket (mid-frame bytes at
+	 * start-of-stream = guaranteed permanent desync of the new stream).
+	 * Reset unconditionally: with the fd already gone the pending state is
+	 * unusable garbage either way (idempotent for defensive closes).  The
+	 * dyn buffer allocation itself is kept for reuse.
+	 */
+	tier1_outbound_remaining[peer_id] = 0;
+	tier1_outbound_queued_total[peer_id] = 0;
 
 	if (Tier1Shmem != NULL) {
 		if (reason != NULL && reason[0] != '\0')
