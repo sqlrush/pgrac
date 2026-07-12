@@ -321,6 +321,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-drop-reply-before-send" },
 	{ .name = "cluster-gcs-block-force-epoch-stale-reply" },
 	/*
+	 *	cluster-gcs-block-duplicate-grant-reply:
+	 *	  Fires inside the master build_and_send_reply tail after the dedup
+	 *	  install.  SKIP ships the cached copy AHEAD of the normal send so
+	 *	  the requester receives the same reply twice — deterministic
+	 *	  coverage for the requester-side first-reply-wins guard (a slot
+	 *	  whose reply_received is already set drops the duplicate,
+	 *	  stale_reply_drop_count++, never overwrites mid-consume).
+	 */
+	{ .name = "cluster-gcs-block-duplicate-grant-reply" },
+	/*
 	 * spec-2.35 D15 — CF 2-way protocol fault injection.
 	 *
 	 *	cluster-gcs-block-forward-master-side:

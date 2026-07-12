@@ -225,6 +225,12 @@ jobs:
           # legs pin/stall/self-heal on real cleaner cadence and need the
           # wall clock.
           - { name: stage5-undo-retention, ranges: "369-370 386 389", unit: false, regress: false }
+          # t/390 GCS block-ship race convergence (3-node triple): PENDING_X
+          # dedup re-evaluation (no reply-timeout burn), invalidate-slot
+          # bounded claim wait, duplicate-reply first-reply-wins.  Own shard:
+          # triple bring-up + injection legs need the wall clock (L342: every
+          # new t/ file lands in a shard the same commit).
+          - { name: stage7-gcs-block-race, ranges: "390-390", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
