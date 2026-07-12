@@ -485,6 +485,96 @@ UT_TEST(test_mark_native_raw_reused_one_way)
 	UT_ASSERT((got.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
 }
 
+/* raw image helpers (defined with the torn-crash fixtures below) */
+static void write_raw_image(const char *path, const char *image, size_t len);
+static void read_raw_image(const char *path, char *image, size_t len);
+
+/* Round-3b P0-4: the downlevel gate lives in the MAGIC, not the version
+ * field -- classify never checked version, so a version bump would be
+ * invisible to a pre-barrier binary.  A stamped image must classify VALID
+ * on this binary and must be byte-distinguishable for the old single-magic
+ * check (INVALID_MAGIC -> bootstrap 53RB5 / verify no-latch, both
+ * fail-closed). */
+UT_TEST(test_raw_reused_magic_truth_table)
+{
+	ClusterXidAuthorityHeader hdr;
+	char buf[sizeof(ClusterXidAuthorityHeader)];
+
+	/* the two magics must differ: the pre-barrier binary's single-magic
+	 * check is exactly what fail-closes it on a stamped authority */
+	UT_ASSERT(CLUSTER_XID_AUTHORITY_MAGIC != CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+
+	/* stamped magic + valid CRC classifies VALID on this binary */
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED;
+	hdr.version = CLUSTER_XID_AUTHORITY_VERSION;
+	hdr.flags = CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+				| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED;
+	hdr.native_hw_full = 816;
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(hdr.crc);
+	memcpy(buf, &hdr, sizeof(hdr));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(buf, sizeof(buf)), CLUSTER_XID_AUTHORITY_VALID);
+
+	/* stamped magic does not weaken integrity: payload corruption still
+	 * CRC-fails */
+	buf[16] ^= 0x01;
+	UT_ASSERT_EQ(cluster_xid_authority_classify(buf, sizeof(buf)),
+				 CLUSTER_XID_AUTHORITY_INVALID_CRC);
+}
+
+/* Round-3b P0-4 settle upgrade: a RAW_REUSED flag written under the OLD
+ * magic (pre-hardening tree) is readable by a pre-barrier binary, so it is
+ * NOT a settled transition -- the next mark must rewrite BOTH copies with
+ * the stamped magic instead of skipping on the flag mirror. */
+UT_TEST(test_mark_raw_reused_upgrades_old_magic_copies)
+{
+	ClusterXidAuthorityHeader hdr;
+	char primary_path[MAXPGPATH];
+	char bak_path[MAXPGPATH];
+	char image[sizeof(ClusterXidAuthorityHeader)];
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+
+	snprintf(primary_path, sizeof(primary_path), "%s/%s", test_root,
+			 CLUSTER_XID_AUTHORITY_REL_PATH);
+	snprintf(bak_path, sizeof(bak_path), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+
+	/* simulate the pre-hardening stamp: flag set, OLD magic, valid CRC,
+	 * installed as BOTH copies */
+	read_raw_image(primary_path, image, sizeof(image));
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC);
+	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED;
+	INIT_CRC32C(hdr.crc);
+	COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(hdr.crc);
+	memcpy(image, &hdr, sizeof(hdr));
+	write_raw_image(primary_path, image, sizeof(image));
+	write_raw_image(bak_path, image, sizeof(image));
+
+	/* NOT settled under the old magic: the mark rewrites instead of skipping */
+	cluster_xid_authority_mark_native_raw_reused();
+
+	read_raw_image(primary_path, image, sizeof(image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)),
+				 CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
+
+	read_raw_image(bak_path, image, sizeof(image));
+	UT_ASSERT_EQ(cluster_xid_authority_classify(image, sizeof(image)),
+				 CLUSTER_XID_AUTHORITY_VALID);
+	memcpy(&hdr, image, sizeof(hdr));
+	UT_ASSERT_EQ(hdr.magic, CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED);
+	UT_ASSERT((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
+}
+
 UT_TEST(test_primary_corrupt_falls_back_to_bak)
 {
 	ClusterXidAuthorityHeader got;
@@ -1090,7 +1180,7 @@ main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
@@ -1098,6 +1188,8 @@ main(void)
 	UT_RUN(test_publish_monotone_and_seal);
 	UT_RUN(test_mark_cluster_era_one_way);
 	UT_RUN(test_mark_native_raw_reused_one_way);
+	UT_RUN(test_raw_reused_magic_truth_table);
+	UT_RUN(test_mark_raw_reused_upgrades_old_magic_copies);
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
 	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);

@@ -580,6 +580,7 @@ for (1 .. 60)
 
 # --- L7 green: DONE keeps the floor cap breathing. ---
 my $full_pre7 = gcs_int_both($node0, $node1, 'dedup_full_count');
+my $miss_pre7 = gcs_int_both($node0, $node1, 'dedup_miss_count');
 for my $round (1 .. 6)
 {
 	psql_retry($node1, q{
@@ -597,6 +598,14 @@ my $full_post7 = gcs_int_both($node0, $node1, 'dedup_full_count');
 is($full_post7 - $full_pre7, 0,
 	'L7 green: distinct-block pressure far past cap 256 with the DONE chain '
 	. 'live never fails closed (dedup_full delta 0)');
+# R3b honesty probe (8.B, mirrors the RED leg): the green rounds must have
+# driven REAL cross-node registrations -- a warm local cache would make the
+# "full delta 0" above vacuously true.
+my $miss_post7 = gcs_int_both($node0, $node1, 'dedup_miss_count');
+cmp_ok($miss_post7, '>', $miss_pre7,
+	"L7 green trigger probe: the sweep drove real cross-node registrations "
+	. "(dedup_miss $miss_pre7 -> $miss_post7), so the zero-full result above "
+	. "came from live pressure, not a warm cache");
 # Writer-side (L4 discipline): a LATE cross-node re-read can fail-close on
 # the aged-xid TT visibility boundary -- orthogonal to dedup capacity and
 # not what this leg asserts.  node1's cross-node coverage of this relation

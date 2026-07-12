@@ -287,6 +287,16 @@ extern void cluster_rtvis_note_native_prehistory_local(void);
 extern void cluster_cr_native_prehistory_disable(void);
 extern bool cluster_cr_native_prehistory_disabled(void);
 
+/*
+ * GCS-race round-3b: consume/disable drain.  classify_ref_guts holds the
+ * shared side across its proof -> adopted-CLOG read -> verdict window; the
+ * disable clears the latch under the exclusive side and the wb DISABLE
+ * handler ACKs only after it returns, so no consumer straddles the epoch
+ * rollover (remote raw-xid reuse has no local CLOG write to synchronize on).
+ */
+extern void cluster_cr_native_prehistory_reader_lock(void);
+extern void cluster_cr_native_prehistory_reader_unlock(void);
+
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
 extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);

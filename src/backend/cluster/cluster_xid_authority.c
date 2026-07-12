@@ -66,7 +66,12 @@ cluster_xid_authority_classify(const char *buf, size_t len)
 
 	memcpy(&hdr, buf, sizeof(hdr));
 
-	if (hdr.magic != CLUSTER_XID_AUTHORITY_MAGIC)
+	/* Round-3b P0-4: stamped images carry the RAW_REUSED magic; this
+	 * binary accepts both, a pre-barrier binary rejects the stamped one
+	 * (its only-magic check) and fail-closes instead of ignoring the
+	 * flag it cannot understand. */
+	if (hdr.magic != CLUSTER_XID_AUTHORITY_MAGIC
+		&& hdr.magic != CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED)
 		return CLUSTER_XID_AUTHORITY_INVALID_MAGIC;
 
 	INIT_CRC32C(crc);
@@ -187,6 +192,13 @@ copy_flags_settled(const char *relpath, uint32 must_set, uint32 must_clear)
 	if (read_image(path, image) != CLUSTER_XID_AUTHORITY_VALID)
 		return false;
 	memcpy(&hdr, image, sizeof(hdr));
+	/* Round-3b P0-4: the RAW_REUSED transition is settled only once the copy
+	 * ALSO carries the stamped magic -- a flag written under the old magic
+	 * (pre-hardening tree) stays readable to a pre-barrier binary, so the
+	 * re-assert must upgrade it. */
+	if ((must_set & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED)
+		&& hdr.magic != CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED)
+		return false;
 	return (hdr.flags & must_set) == must_set && (hdr.flags & must_clear) == 0;
 }
 
@@ -283,6 +295,36 @@ cluster_xid_authority_present(void)
 }
 
 /*
+ * build_writer_tmp_path -- per-writer staging name (round-3b P0-1).
+ *
+ * Every node's LMON crosses the wrap-barrier margin within the same
+ * herding window and re-asserts the one-way flags concurrently
+ * (mark_native_raw_reused; concurrent first cluster boots do the same
+ * with mark_cluster_era), so a SHARED tmp name would let two writers
+ * truncate each other's staging file mid-write and fail the durable
+ * rename PANIC-hard.  A per-writer suffix keeps staging private while
+ * the final rename stays atomic; concurrent read-modify-write converges
+ * because the flags are one-way ORs and the high-waters monotone maxes,
+ * so whichever install lands last carries the same transition.  The
+ * node id is the stable suffix (bounded leftover set); a pre-identity
+ * writer falls back to its pid.
+ */
+static bool
+build_writer_tmp_path(char *dst, size_t dstlen, const char *relpath)
+{
+	size_t used;
+
+	if (!build_path(dst, dstlen, relpath))
+		return false;
+	used = strlen(dst);
+	if (cluster_node_id >= 0)
+		snprintf(dst + used, dstlen - used, ".n%d", cluster_node_id);
+	else
+		snprintf(dst + used, dstlen - used, ".p%d", (int)getpid());
+	return true;
+}
+
+/*
  * write_header -- CRC-stamp and atomically install an authority header.
  */
 static void
@@ -296,11 +338,15 @@ write_header(ClusterXidAuthorityHeader *hdr)
 
 	if (!build_path(primary, sizeof(primary), CLUSTER_XID_AUTHORITY_REL_PATH)
 		|| !build_path(bak, sizeof(bak), CLUSTER_XID_AUTHORITY_BAK_REL_PATH)
-		|| !build_path(tmp, sizeof(tmp), CLUSTER_XID_AUTHORITY_TMP_REL_PATH)
-		|| !build_path(baktmp, sizeof(baktmp), CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH))
+		|| !build_writer_tmp_path(tmp, sizeof(tmp), CLUSTER_XID_AUTHORITY_TMP_REL_PATH)
+		|| !build_writer_tmp_path(baktmp, sizeof(baktmp), CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH))
 		ereport(PANIC, (errmsg("cluster shared_data_dir is not configured")));
 
-	hdr->magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	/* Round-3b P0-4: a stamped image switches to the RAW_REUSED magic so a
+	 * pre-barrier binary fail-closes on it instead of ignoring the flag. */
+	hdr->magic = (hdr->flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED)
+					 ? CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED
+					 : CLUSTER_XID_AUTHORITY_MAGIC;
 	hdr->version = CLUSTER_XID_AUTHORITY_VERSION;
 	hdr->reserved = 0;
 	INIT_CRC32C(hdr->crc);
@@ -340,11 +386,15 @@ write_header_both(ClusterXidAuthorityHeader *hdr)
 
 	if (!build_path(primary, sizeof(primary), CLUSTER_XID_AUTHORITY_REL_PATH)
 		|| !build_path(bak, sizeof(bak), CLUSTER_XID_AUTHORITY_BAK_REL_PATH)
-		|| !build_path(tmp, sizeof(tmp), CLUSTER_XID_AUTHORITY_TMP_REL_PATH)
-		|| !build_path(baktmp, sizeof(baktmp), CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH))
+		|| !build_writer_tmp_path(tmp, sizeof(tmp), CLUSTER_XID_AUTHORITY_TMP_REL_PATH)
+		|| !build_writer_tmp_path(baktmp, sizeof(baktmp), CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH))
 		ereport(PANIC, (errmsg("cluster shared_data_dir is not configured")));
 
-	hdr->magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	/* Round-3b P0-4: a stamped image switches to the RAW_REUSED magic so a
+	 * pre-barrier binary fail-closes on it instead of ignoring the flag. */
+	hdr->magic = (hdr->flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED)
+					 ? CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED
+					 : CLUSTER_XID_AUTHORITY_MAGIC;
 	hdr->version = CLUSTER_XID_AUTHORITY_VERSION;
 	hdr->reserved = 0;
 	INIT_CRC32C(hdr->crc);

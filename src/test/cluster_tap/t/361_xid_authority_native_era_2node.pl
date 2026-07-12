@@ -337,6 +337,19 @@ $node0->safe_psql('postgres', q{
 CREATE TABLE sxid.reuse (k int PRIMARY KEY, v int);
 INSERT INTO sxid.reuse SELECT g, 0 FROM generate_series(1, 20) g;
 });
+# G7b prep (round-3b P0-2): native-era DELETE.  The committed native deleter
+# leaves xmax = a native xid with NO ITL binding (native writers predate the
+# ITL era), so these tuples resolve through the PG-native body over the
+# byte-verified adopted CLOG -- a native RAW xmax can never reach
+# classify_ref with a live ref (the only rebinding writer of a version is
+# the cluster-era xact that kills it, which stamps its own cluster xid as
+# xmax).  This leg guards that the round-3b REMOTE-terminal rework left the
+# native xmax path intact: committed-deleted rows stay invisible cluster-wide.
+$node0->safe_psql('postgres', q{
+CREATE TABLE sxid.del_rows (k int PRIMARY KEY, v int);
+INSERT INTO sxid.del_rows SELECT g, 0 FROM generate_series(1, 30) g;
+DELETE FROM sxid.del_rows WHERE k <= 10;
+});
 my $native_row_xid = $node0->safe_psql('postgres',
 	q{SELECT max((xmin::text)::bigint)::text FROM sxid.reuse});
 
@@ -460,6 +473,18 @@ SELECT value FROM pg_cluster_state
  WHERE category = 'cr' AND key = 'rtvis_native_prehistory_local_count'});
 ok(($g7_hits // '') =~ /^\d+$/ && $g7_hits > 0,
 	'G7: native-prehistory LOCAL routing counter moved');
+
+# G7b (round-3b P0-2): native committed deleter stays invisible everywhere.
+# The 10 native-deleted rows must not resurrect through the cluster read
+# path, and the 20 survivors must all show -- both under crossnode
+# visibility on the joiner and natively on the seed.
+my ($g7b_rc, $g7b_out, $g7b_err) = $node1->psql('postgres', q{
+SET cluster.crossnode_runtime_visibility = on;
+SELECT count(*) FROM sxid.del_rows});
+is($g7b_rc, 0, 'G7b: joiner scan of the native-deleted table succeeds');
+is($g7b_out, '20', 'G7b: native committed deleter invisible, survivors intact');
+is($node0->safe_psql('postgres', q{SELECT count(*) FROM sxid.del_rows}),
+	'20', 'G7b: seed agrees after the joiner scan (no poison stamp)');
 
 # -------------------------------------------------------------------------
 # G8 (round-2): solo joiner restart.  The second boot has no backup_label
@@ -976,6 +1001,12 @@ SELECT value FROM pg_cluster_state
 	}
 	ok(($w_flags & 0x0004) != 0,
 		'W1: NATIVE_RAW_REUSED stamped durably in the shared authority');
+	# Round-3b P0-4: the stamp must switch the MAGIC (0x0143D617), not just
+	# set a flag -- classify never checks version, so the magic is the only
+	# field a pre-barrier binary verifies; the old magic would leave a
+	# downlevel joiner silently ignoring the stamp.
+	is(sprintf('0x%08X', $p_auth->{magic}), '0x0143D617',
+		'W1b: stamped authority carries the RAW_REUSED magic (downlevel gate)');
 
 	# W2: the coordinator collects the peer ack and opens its gate.
 	wait_sql_eq($p0, q{

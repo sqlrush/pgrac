@@ -356,6 +356,11 @@ typedef enum BuiltinTrancheIds {
 		LWTRANCHE_CLUSTER_XID_STRIPE,
 		/* PGRAC: spec-6.14 D6 — shared-catalog OID lease node-level region. */
 		LWTRANCHE_CLUSTER_OID_LEASE,
+		/* PGRAC: GCS-race round-3b — native-prehistory consume/disable drain.
+		 * Readers hold SHARED across proof -> adopted-CLOG read -> verdict;
+		 * the wrap-barrier DISABLE clears the latch under EXCLUSIVE and only
+		 * ACKs after release, so no reader can straddle the epoch rollover. */
+		LWTRANCHE_CLUSTER_NATIVE_PREHISTORY,
 	#endif
 		LWTRANCHE_FIRST_USER_DEFINED
 	} BuiltinTrancheIds;

@@ -31,11 +31,13 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h" /* GCS-race round-3b P0-2: inline native-prehistory status */
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/lwlock.h"	  /* GCS-race round-3b: XactTruncationLock CLOG gate */
 #include "utils/wait_event.h" /* spec-6.14 D10b ClusterCatalogVisResolve */
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b counters */
@@ -390,18 +392,95 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 		 * authority for it: the native era predates every cluster-era
 		 * allocation (stripe floor >= native_hw), and the post-recovery
 		 * verify proved this node's pg_xact byte-matches the seed's sealed
-		 * truth.  Route LOCAL -- the same evidence the self-origin
-		 * below-floor shortcut above yields on the seed node itself.  Every
-		 * doubt leg (latch unset, wrap recurrence, value >= hw, including
-		 * the whole [native_hw, stripe floor) gap) falls through to the
-		 * existing fail-closed machinery (53R97).
+		 * truth.  Every doubt leg (latch unset, wrap recurrence, value >=
+		 * hw, including the whole [native_hw, stripe floor) gap) falls
+		 * through to the existing fail-closed machinery (53R97).
+		 *
+		 * PGRAC (GCS-race round-3b P0-2): consume the adopted CLOG INLINE
+		 * instead of returning LOCAL evidence.  LOCAL defers the verdict to
+		 * a PG-native CLOG read the caller performs OUTSIDE this gate:
+		 * between the provable check and that later read, the xid wrap
+		 * barrier can complete and the first epoch-1 xid can REUSE this
+		 * raw value -- a false verdict with no fail-closed net.
+		 *
+		 * Drain proof (round-3b review P0): the epoch-1 reuser is allocated
+		 * on the WRAPPING PEER and writes only that peer's pg_xact, so
+		 * there is NO local CLOG write for a barrier-based recheck to
+		 * synchronize with; relaxed atomics cannot prove this backend
+		 * observes the latch drop in time.  Instead the whole consume
+		 * window (provable check -> CLOG read -> verdict fill) runs under
+		 * the native_prehistory_lock held SHARED, and the wrap-barrier
+		 * DISABLE clears the latch under EXCLUSIVE and only ACKs after the
+		 * release (cluster_cr.c).  A reader that saw the latch up therefore
+		 * finished its verdict BEFORE the ACK left this node -- i.e. before
+		 * the first epoch-1 xid could exist anywhere -- and a reader
+		 * arriving after the release pairs with it and fails closed.  The
+		 * unlocked covered_hw pre-filter only skips the lock when the latch
+		 * is provably down/never up; staleness in either direction is safe
+		 * (spurious lock = re-checked under the lock; spurious skip =
+		 * fail-closed).
+		 *
+		 * Truncation gate (round-3b review P1): the boot verify covers
+		 * [oldestXid, native_hw) as of the seal, but VACUUM may later
+		 * advance oldestClogXid past still-referenced native xids and
+		 * truncate their pg_xact segments; a raw TransactionIdGetStatus
+		 * would then surface an SLRU could-not-access ERROR.  Mirror the
+		 * upstream pg_xact_status pattern (xid8funcs.c): lookups of
+		 * arbitrary xids hold XactTruncationLock SHARED from the
+		 * oldestClogXid test through lookup completion, and the advance
+		 * side (AdvanceOldestClogXid, varsup.c) takes it EXCLUSIVE -- the
+		 * advance drains in-flight lookups, later lookups see the new
+		 * floor and refuse, and only then is the physical truncate safe
+		 * (the truncate itself runs unlocked by design).  A
+		 * below-oldestClogXid xid falls through to the ordinary
+		 * fail-closed leg (53R97).
+		 *
+		 * COMMITTED surfaces as a REMOTE terminal verdict with commit_scn =
+		 * (SCN) 1: the native era predates every cluster snapshot and all
+		 * real SCNs are >= 1, so scn_time_cmp((SCN) 1, read_scn) <= 0
+		 * decides VISIBLE for every valid read_scn; commit_scn_is_bound
+		 * forbids stamping the fabricated value into a (recycled) ITL slot.
+		 * Any other status is ABORTED: the seed's seal proof covers
+		 * crash-aborted IN_PROGRESS, and the boot verify refused to latch
+		 * on any SUB_COMMITTED byte.  C-V1's no-CLOG-on-remote rule targets
+		 * cross-instance raw-xid aliasing; below the sealed native
+		 * high-water the adopted CLOG is alias-free by construction.
 		 */
-		if (cluster_xid_native_prehistory_provable_full(
-				U64FromFullTransactionId(ReadNextFullTransactionId()),
-				cluster_cr_native_prehistory_covered_hw(), raw_xid)) {
-			out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
-			cluster_rtvis_note_native_prehistory_local();
-			return;
+		if (cluster_cr_native_prehistory_covered_hw() != 0) {
+			bool prehistory_resolved = false;
+
+			cluster_cr_native_prehistory_reader_lock();
+			if (cluster_xid_native_prehistory_provable_full(
+					U64FromFullTransactionId(ReadNextFullTransactionId()),
+					cluster_cr_native_prehistory_covered_hw(), raw_xid)) {
+				XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+
+				LWLockAcquire(XactTruncationLock, LW_SHARED);
+				if (!TransactionIdPrecedes(raw_xid, ShmemVariableCache->oldestClogXid)) {
+					XidStatus native_status = TransactionIdGetStatus(raw_xid, &clog_lsn);
+
+					cluster_rtvis_note_native_prehistory_local();
+					out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+					if (native_status == TRANSACTION_STATUS_COMMITTED) {
+						out->status = CLUSTER_TT_STATUS_COMMITTED;
+						out->commit_scn = (SCN)1;
+						out->commit_scn_is_bound = true;
+					} else {
+						out->status = CLUSTER_TT_STATUS_ABORTED;
+						out->commit_scn = InvalidScn;
+						out->commit_scn_is_bound = false;
+					}
+					prehistory_resolved = true;
+				}
+				LWLockRelease(XactTruncationLock);
+			}
+			cluster_cr_native_prehistory_reader_unlock();
+
+			if (prehistory_resolved)
+				return;
+			/* Latch down under the lock (wrap barrier fired), not provable,
+			 * or CLOG truncated below raw_xid: no trustworthy native bytes
+			 * -- fail closed below. */
 		}
 
 		/*

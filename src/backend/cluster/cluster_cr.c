@@ -76,9 +76,11 @@
 /*
  * ClusterCRShared -- per-instance shmem counters (spec-3.9 §2.5).
  *
- *	9 atomic counters, no LWLock (region lwlock_count = 0): counters are
- *	bumped with pg_atomic_fetch_add_u64 from the constructing backend,
- *	read lock-free by dump_state / pg_cluster_state.
+ *	Atomic counters bumped with pg_atomic_fetch_add_u64 from the
+ *	constructing backend, read lock-free by dump_state / pg_cluster_state,
+ *	plus ONE embedded LWLock (region lwlock_count = 1): the GCS-race
+ *	round-3b native-prehistory consume/disable drain lock (see the field
+ *	comment below) -- counters stay lock-free.
  */
 typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_construct_count;
@@ -210,6 +212,21 @@ typedef struct ClusterCRShared {
 	 * stay fail-closed (53R97) for below-floor refs forever.
 	 */
 	pg_atomic_uint64 native_prehistory_disabled;
+	/*
+	 * GCS-race round-3b review P0: consume/disable drain lock.  The remote
+	 * raw-xid reuse hazard has NO local CLOG write to synchronize on (the
+	 * first epoch-1 xid is allocated on the WRAPPING node and only that
+	 * node's pg_xact changes), so relaxed atomics + barriers cannot prove a
+	 * local reader observes the latch drop before consuming.  Readers hold
+	 * this SHARED across proof -> adopted-CLOG read -> verdict production;
+	 * cluster_cr_native_prehistory_disable() clears the latch under
+	 * EXCLUSIVE, and the wb DISABLE handler only ACKs after the release.
+	 * The exclusive acquisition therefore drains every in-flight reader
+	 * BEFORE the ACK leaves (their verdicts predate any epoch-1 allocation
+	 * = genuinely native), and every later reader's SHARED acquisition
+	 * pairs with the release (sees the latch down -> fail-closed).
+	 */
+	LWLock native_prehistory_lock;
 	/*
 	 * spec-5.22d D4-4: dead/absent-owner authority block0 serve outcomes.
 	 * serve_hit = self-as-authority served a terminal verdict off the dead
@@ -373,6 +390,7 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->native_prehistory_covered_hw, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_native_prehistory_local_count, 0);
 		pg_atomic_init_u64(&CRShared->native_prehistory_disabled, 0);
+		LWLockInitialize(&CRShared->native_prehistory_lock, LWTRANCHE_CLUSTER_NATIVE_PREHISTORY);
 		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_epoch_stale_reject_count, 0);
@@ -400,7 +418,7 @@ static const ClusterShmemRegion cluster_cr_region = {
 	.name = "pgrac cluster cr counters",
 	.size_fn = cluster_cr_shmem_size,
 	.init_fn = cluster_cr_shmem_init,
-	.lwlock_count = 0, /* atomic counters only; no LWLock */
+	.lwlock_count = 1, /* native_prehistory_lock (round-3b drain); counters lock-free */
 	.owner_subsys = "cluster_cr",
 	.reserved_flags = 0,
 };
@@ -601,14 +619,56 @@ cluster_cr_native_prehistory_covered_hw(void)
  * broadcast, or the 1Hz authority-flag mirror).  Order matters: the disable
  * marker is set BEFORE covered_hw is zeroed so a concurrent latch store
  * cannot resurrect a nonzero value past its own recheck.  Idempotent.
+ *
+ * GCS-race round-3b review P0 (drain): the stores run under the
+ * native_prehistory_lock held EXCLUSIVE.  The hazard is REMOTE raw-xid
+ * reuse -- the first epoch-1 xid is allocated on the wrapping peer and
+ * writes only that peer's pg_xact, so there is NO local CLOG write a
+ * barrier-based reader recheck could synchronize with; relaxed atomics
+ * alone cannot prove a local consumer observes this latch drop in time.
+ * The exclusive acquisition instead DRAINS every reader holding the lock
+ * SHARED across its proof -> adopted-CLOG read -> verdict window: their
+ * verdicts complete before this store (and the caller's ACK only leaves
+ * AFTER we return, i.e. after the release), so they predate any epoch-1
+ * allocation and are genuinely native; every reader arriving after the
+ * release pairs with it via its SHARED acquisition and sees the latch
+ * down -> fail-closed.  LWLock acquire/release provide the memory
+ * ordering (PG's sanctioned primitives; no bare-barrier pairing claims).
  */
 void
 cluster_cr_native_prehistory_disable(void)
 {
 	if (CRShared == NULL)
 		return;
+	LWLockAcquire(&CRShared->native_prehistory_lock, LW_EXCLUSIVE);
 	pg_atomic_write_u64(&CRShared->native_prehistory_disabled, 1);
 	pg_atomic_write_u64(&CRShared->native_prehistory_covered_hw, 0);
+	LWLockRelease(&CRShared->native_prehistory_lock);
+}
+
+/*
+ * GCS-race round-3b — reader side of the consume/disable drain.
+ *
+ * classify_ref_guts holds this SHARED across the native-prehistory consume
+ * window (provable check -> XactTruncationLock CLOG read -> verdict fill).
+ * Callers already hold the buffer content lock; lock order is
+ * content_lock -> native_prehistory_lock -> XidGenLock (inside
+ * ReadNextFullTransactionId) -> XactTruncationLock -> SLRU ControlLock,
+ * and no path acquires any of those while holding this lock exclusively
+ * (the disable side takes ONLY this lock).
+ */
+void
+cluster_cr_native_prehistory_reader_lock(void)
+{
+	if (CRShared != NULL)
+		LWLockAcquire(&CRShared->native_prehistory_lock, LW_SHARED);
+}
+
+void
+cluster_cr_native_prehistory_reader_unlock(void)
+{
+	if (CRShared != NULL)
+		LWLockRelease(&CRShared->native_prehistory_lock);
 }
 
 bool

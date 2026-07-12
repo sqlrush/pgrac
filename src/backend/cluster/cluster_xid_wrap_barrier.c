@@ -60,6 +60,7 @@
 /* per-boot LOG-once latches (LMON is the only writer of all of these) */
 static bool wb_logged_started = false;
 static bool wb_logged_done = false;
+static bool wb_logged_wide_conf = false;
 static uint64 wb_logged_nocap_mask = 0;
 
 static pg_crc32c
@@ -124,6 +125,9 @@ wb_disable_handler(const ClusterICEnvelope *env, const void *payload)
 	const ClusterXidNativeDisablePayload *p = (const ClusterXidNativeDisablePayload *)payload;
 	ClusterXidNativeDisablePayload ack;
 
+	/* R3b P1: exact wire size before touching any field (KO precedent). */
+	if (env->payload_length != (uint32)sizeof(ClusterXidNativeDisablePayload))
+		return;
 	if (!wb_payload_valid(p))
 		return;
 	/* F6 discipline: the body's claimed sender must be the wire sender. */
@@ -143,6 +147,9 @@ wb_ack_handler(const ClusterICEnvelope *env, const void *payload)
 {
 	const ClusterXidNativeDisablePayload *p = (const ClusterXidNativeDisablePayload *)payload;
 
+	/* R3b P1: exact wire size before touching any field (KO precedent). */
+	if (env->payload_length != (uint32)sizeof(ClusterXidNativeDisablePayload))
+		return;
 	if (!wb_payload_valid(p))
 		return;
 	if (p->node_id != (int32)env->source_node_id)
@@ -201,6 +208,17 @@ cluster_xid_wrap_barrier_startup_init(void)
 		return;
 
 	cluster_cr_native_prehistory_disable();
+
+	/*
+	 * Round-3b P0-3: re-assert the stamp on EVERY boot that sees it (the
+	 * mark_cluster_era discipline).  A crash between write_header_both's
+	 * two renames leaves primary stamped / .bak stale, and once the marked
+	 * mirror is set the LMON tick never calls the stamp again -- without
+	 * this re-assert a later primary corruption would fall back to the
+	 * pre-stamp .bak and resurrect the un-disabled state.  Idempotent
+	 * no-write no-op once both copies are settled.
+	 */
+	cluster_xid_authority_mark_native_raw_reused();
 	cluster_xid_wrap_barrier_set_marked();
 
 	if (U64FromFullTransactionId(ReadNextFullTransactionId()) > (uint64)PG_UINT32_MAX) {
@@ -250,6 +268,26 @@ cluster_xid_wrap_barrier_lmon_tick(void)
 
 	/* self is a member too (idempotent) */
 	cluster_cr_native_prehistory_disable();
+
+	/*
+	 * R3b P1: the alive mask (and this round's ack bitmap walk) cover node
+	 * ids 0..31 only.  A conf declaring a higher id could never be proven
+	 * disabled through this round, so the gate must not open under it:
+	 * hold fail-closed (allocation keeps refusing at the boundary) and say
+	 * why once.  Unreachable in supported deployments (the xid stripe
+	 * bounds the cluster to 16 slots), so this is a config-error backstop,
+	 * not a live path.
+	 */
+	for (n = 32; n < CLUSTER_MAX_NODES; n++) {
+		if (cluster_conf_lookup_node(n) != NULL) {
+			if (!wb_logged_wide_conf)
+				ereport(LOG, (errmsg("cluster xid wrap barrier: declared node %d is beyond the "
+									 "barrier's 32-node proof range; epoch allocation stays gated",
+									 n)));
+			wb_logged_wide_conf = true;
+			return;
+		}
+	}
 
 	alive_mask = cluster_sinval_compute_alive_peer_mask();
 	pending = (uint64)alive_mask & ~cluster_xid_wrap_barrier_ack_bitmap();
