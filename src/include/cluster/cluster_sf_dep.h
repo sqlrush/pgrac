@@ -212,6 +212,7 @@ extern bool cluster_sf_peer_supports_gcs_done(int32 peer_id);
  * barrier SAFE: the coordinator withholds DISABLE, the ack bitmap never
  * fills, and the allocation gate keeps refusing epoch>=1 candidates. */
 extern bool cluster_sf_peer_supports_xid_native_disable(int32 peer_id);
+extern bool cluster_sf_peer_supports_xid_authority_flock(int32 peer_id);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
 extern const char *cluster_sf_peer_capabilities_summary(void);

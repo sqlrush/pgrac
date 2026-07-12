@@ -2380,12 +2380,35 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 					entry->s_holder_refcount_local = 0;
 					LWLockRelease(&entry->entry_lock.lock);
 				}
+				/* PGRAC: GCS-race round-4c FUNC-1 (local-master flavour) —
+				 * this node held NO local S bit, so the buffer bytes are a
+				 * bare ReadBuffer pre-read; a remote X holder may have
+				 * yield-flushed a newer version between that pre-read and
+				 * this upgrade (the invalidate ACKs above just advanced the
+				 * local authoritative watermark).  Prove the copy current
+				 * or discard-and-re-read shared storage. */
+				cluster_gcs_block_fallback_verify_refresh(
+					buf, tag, cluster_pcm_lock_pi_watermark_scn_query(tag));
 				return true;
 			}
 		}
 	}
 
 	cluster_pcm_lock_acquire(tag, mode);
+	/*
+	 * PGRAC: GCS-race round-4c FUNC-1 (local-master flavour) — the tag-only
+	 * grant ships no image, so the buffer keeps this backend's pre-read
+	 * bytes.  The same pre-read-vs-yield-flush window as the remote storage
+	 * fallback applies when a remote X holder yielded between our ReadBuffer
+	 * and this grant: prove the local bytes current against the local
+	 * authoritative pi_watermark_scn or discard-and-re-read shared storage.
+	 * Watermark InvalidScn (never remotely written / untracked / extension
+	 * block) is a SKIP — no cost beyond one GRD lookup.  Query AFTER the
+	 * acquire: a mode=X acquire may have just collected invalidate ACKs,
+	 * which advance the watermark with the dropped copies' page SCNs.
+	 */
+	cluster_gcs_block_fallback_verify_refresh(buf, tag,
+											  cluster_pcm_lock_pi_watermark_scn_query(tag));
 	return true;
 }
 

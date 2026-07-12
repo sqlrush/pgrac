@@ -92,6 +92,20 @@
  */
 #define CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED 0x0004
 
+/*
+ * GCS-race round-4c P0-1 residual #2 — durable admission proof for the wrap
+ * barrier's epoch-allocation gate.  The barrier coordinator stamps this
+ * (under the authority flock, after RAW_REUSED settled in both copies)
+ * ONLY once the full admission held: every conf-declared member connected,
+ * advertising XID_AUTHORITY_FLOCK_V2, and ack'd latch-off.  The boot
+ * shortcut (counter already past the native era) may only open the gate on
+ * this flag: RAW_REUSED alone proves the stamp landed, not that the
+ * admission round ever completed (a coordinator crash between stamp and
+ * gate-open would otherwise let a reboot skip the distributed proof).
+ * One-way; re-asserted by the LMON tick like the other one-way flags.
+ */
+#define CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED 0x0008
+
 typedef struct ClusterXidAuthorityHeader {
 	uint32 magic;
 	uint32 version;
@@ -122,6 +136,10 @@ StaticAssertDecl(sizeof(ClusterXidAuthorityHeader) == 40,
 #define CLUSTER_XID_AUTHORITY_BAK_REL_PATH "global/pgrac_xid_authority.bak"
 #define CLUSTER_XID_AUTHORITY_TMP_REL_PATH "global/pgrac_xid_authority.tmp"
 #define CLUSTER_XID_AUTHORITY_BAK_TMP_REL_PATH "global/pgrac_xid_authority.bak.tmp"
+/* Round-3b P0-1: cross-node mutation lock file (flock).  Serializes every
+ * authority read-modify-write across nodes; the kernel drops the lock on
+ * any process exit, so a crash never leaves a stale lock behind. */
+#define CLUSTER_XID_AUTHORITY_LOCK_REL_PATH "global/pgrac_xid_authority.lock"
 
 typedef enum ClusterXidAuthorityValidity {
 	CLUSTER_XID_AUTHORITY_VALID = 0,
@@ -183,6 +201,47 @@ extern uint32 cluster_xid_prehistory_payload_bytes(uint64 native_hw_full);
 
 extern ClusterXidAuthorityValidity cluster_xid_prehistory_classify(const char *buf, size_t len);
 
+/*
+ * Round-3b RISK-1: runtime mapping of an adopted native CLOG status to a
+ * prehistory verdict.  COMMITTED and ABORTED are literal; IN_PROGRESS is
+ * terminal ONLY under the seal proof (a clean native shutdown sealed with
+ * no prepared and no active xacts, so a below-hw in-progress bit is a
+ * crash-aborted xact that can never resolve).  SUB_COMMITTED -- and any
+ * value outside the 2-bit CLOG alphabet -- is NEVER trusted at runtime,
+ * even though the boot verify refuses to latch on such bytes: the consumer
+ * falls through fail-closed (53R97) instead of guessing (rule 8.A).
+ *
+ * The status values mirror the CLOG alphabet without dragging clog.h into
+ * the pure layer (same pattern as cluster_xid_prehistory_payload_bytes);
+ * cluster_xid_authority.c pins them to TRANSACTION_STATUS_* with
+ * StaticAsserts.
+ */
+#define CLUSTER_NATIVE_CLOG_IN_PROGRESS 0x00
+#define CLUSTER_NATIVE_CLOG_COMMITTED 0x01
+#define CLUSTER_NATIVE_CLOG_ABORTED 0x02
+#define CLUSTER_NATIVE_CLOG_SUB_COMMITTED 0x03
+
+typedef enum ClusterNativePrehistoryVerdict {
+	CLUSTER_NATIVE_PREHISTORY_COMMITTED = 0,
+	CLUSTER_NATIVE_PREHISTORY_ABORTED,
+	CLUSTER_NATIVE_PREHISTORY_UNRESOLVED
+} ClusterNativePrehistoryVerdict;
+
+static inline ClusterNativePrehistoryVerdict
+cluster_native_prehistory_map_status(int native_status)
+{
+	switch (native_status) {
+	case CLUSTER_NATIVE_CLOG_COMMITTED:
+		return CLUSTER_NATIVE_PREHISTORY_COMMITTED;
+	case CLUSTER_NATIVE_CLOG_ABORTED:
+	case CLUSTER_NATIVE_CLOG_IN_PROGRESS:
+		return CLUSTER_NATIVE_PREHISTORY_ABORTED;
+	case CLUSTER_NATIVE_CLOG_SUB_COMMITTED:
+	default:
+		return CLUSTER_NATIVE_PREHISTORY_UNRESOLVED;
+	}
+}
+
 /* ============================================================
  * Torn-safe authority file I/O (mirrors cluster_oid_lease.c).
  * ============================================================ */
@@ -232,6 +291,23 @@ extern void cluster_xid_authority_mark_cluster_era(void);
  * approach the epoch boundary).
  */
 extern void cluster_xid_authority_mark_native_raw_reused(void);
+
+/*
+ * Round-3b P0-1: is the NATIVE_RAW_REUSED transition settled in BOTH
+ * on-disk copies (flag present AND stamped magic)?  The wrap barrier
+ * re-verifies this durable truth right before opening the allocation
+ * gate -- shmem marked/done state alone never stands in for the disk.
+ */
+extern bool cluster_xid_authority_raw_reused_settled(void);
+
+/*
+ * GCS-race round-4c P0-1 residual #2 — EPOCH_GATE_ADMITTED one-way stamp +
+ * settle probe (see the flag comment above).  mark also re-asserts
+ * RAW_REUSED (admission implies the stamp);  settled requires BOTH flags in
+ * BOTH copies under the stamped magic.
+ */
+extern void cluster_xid_authority_mark_epoch_gate_admitted(void);
+extern bool cluster_xid_authority_epoch_gate_admitted_settled(void);
 
 /*
  * A follow-up native-era (cluster.enabled=off) boot on a sealed authority

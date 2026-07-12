@@ -111,9 +111,10 @@ bool cluster_crossnode_cr_data_plane = false;
 /* spec-6.12g: block self-containment (active-ITL migration + opportunistic
  * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
 bool cluster_block_self_contained = false;
-/* spec-6.12e2: master->holder BAST nudge on live-X-holder deny (default
- * OFF = e1 release-side handoff only). */
-bool cluster_ges_bast = false;
+/* spec-6.12e2: master->holder BAST nudge on live-X-holder deny.  Default
+ * ON since GCS-race round-4 FUNC-1: the nudge + requester bounded retry
+ * activate the third-party live-X handoff. */
+bool cluster_ges_bast = true;
 /* spec-6.12h: keep a Past Image on block transfer/invalidate (default
  * OFF = flush + drop the copy). */
 bool cluster_past_image = false;
@@ -422,6 +423,9 @@ bool cluster_ic_suppress_caps_reply = false;
 /* GCS-race round-2 RC-F mixed-version leg -- test-only old-binary
  * simulation for the GCS_BLOCK_DONE completion-proof protocol. */
 bool cluster_ic_suppress_gcs_done_cap = false;
+/* GCS-race round-4 P0-1 (test-only): suppress the authority-flock HELLO
+ * capability to simulate a round-3b lock-free-writer binary. */
+bool cluster_ic_suppress_xid_flock_cap = false;
 
 /* GCS-race round-3 P0-1 -- test-only margin override for the xid wrap
  * barrier (drives the full real barrier path in TAP). */
@@ -1754,15 +1758,23 @@ cluster_init_guc(void)
 	 * S-invalidate grant path (Oracle BAST -> holder LMS background
 	 * yield; the foreground session is never interrupted).  The nudge is
 	 * advisory: any refusal (active ITL, pinned, raced) leaves the
-	 * deny-retry (e1 release-side) path untouched.  Default OFF =
-	 * byte-identical deny behaviour.  SUSET for measurement windows.
+	 * deny-retry (e1 release-side) path untouched.
+	 *
+	 * GCS-race round-4 FUNC-1: default ON.  Together with the requester's
+	 * bounded backoff-retry of the direct-master deny and the master-side
+	 * dedup drop before that deny, this activates the third-party live-X
+	 * writer handoff (deny+nudge -> holder X->S yield -> S-invalidate ->
+	 * storage-fallback grant) that the HG7 gate alone kept terminal.  Off
+	 * restores the terminal deny (escape hatch).  SUSET.
 	 */
 	DefineCustomBoolVariable(
 		"cluster.ges_bast",
 		gettext_noop("Send a BAST nudge to a live X holder blocking a peer writer "
 					 "(spec-6.12e2)."),
-		gettext_noop("Off keeps the deny-and-retry path without nudging the holder."),
-		&cluster_ges_bast, false, PGC_SUSET, 0, NULL, NULL, NULL);
+		gettext_noop("On (default) activates the third-party live-X handoff: the "
+					 "denied writer backs off and retries while the nudged holder "
+					 "yields X->S.  Off keeps the terminal deny (escape hatch)."),
+		&cluster_ges_bast, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.past_image -- spec-6.12 wave h (AD-002 PI orthogonal state).
@@ -2937,6 +2949,14 @@ cluster_init_guc(void)
 					 "requester-side GCS_BLOCK_DONE send.  Rolling-upgrade compat "
 					 "tests use it; production leaves it off."),
 		&cluster_ic_suppress_gcs_done_cap, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+	/* GCS-race round-4 P0-1 (test-only): no-bit HELLO simulation of a
+	 * pre-flock binary; the wrap barrier must hold its gate against it. */
+	DefineCustomBoolVariable(
+		"cluster.ic_suppress_xid_flock_cap",
+		gettext_noop("Test-only: suppress the XID_AUTHORITY_FLOCK_V2 HELLO capability."),
+		gettext_noop("Simulates a binary that runs lock-free authority writes."),
+		&cluster_ic_suppress_xid_flock_cap, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	/*
 	 * GCS-race round-3 P0-1: test-only margin override for the xid wrap

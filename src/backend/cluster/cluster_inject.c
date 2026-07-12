@@ -340,6 +340,25 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-block-done-drop" },
 	/*
+	 *	cluster-gcs-block-fallback-refresh-stale (GCS-race round-4c FUNC-1):
+	 *	  Fires in the requester's storage-fallback verify AFTER the
+	 *	  stale-local-copy refresh re-read succeeded.  SKIP forces the
+	 *	  re-verdict input to InvalidScn (tracked-but-unstamped ANOMALY) so
+	 *	  the requester-side lost-write detector fail-closes 53R93 —
+	 *	  deterministic coverage for a storage copy still below the master
+	 *	  pi_watermark_scn (t/348 L7).
+	 */
+	{ .name = "cluster-gcs-block-fallback-refresh-stale" },
+	/*
+	 *	cluster-gcs-block-yield-notify-drop (GCS-race round-4c P1):
+	 *	  Fires in the holder's quiescent X->S self-downgrade right before
+	 *	  the master notify.  SKIP simulates the notify being lost AFTER
+	 *	  the transport handoff (fire-and-forget has no ACK): the local
+	 *	  pcm_state flips to S while the master keeps recording X@us —
+	 *	  deterministic drive for the nudge-renotify self-heal (t/348 L8).
+	 */
+	{ .name = "cluster-gcs-block-yield-notify-drop" },
+	/*
 	 * spec-2.35 D15 — CF 2-way protocol fault injection.
 	 *
 	 *	cluster-gcs-block-forward-master-side:

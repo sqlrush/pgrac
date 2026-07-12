@@ -171,6 +171,12 @@ cluster_ic_tier1_get_listener_port(void)
 {
 	return -1;
 }
+uint64
+cluster_ic_tier1_get_writable_drain(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
 
 /* cluster_inject (armed_count + iterator) */
 int cluster_injection_armed_count = 0;
@@ -1185,6 +1191,23 @@ cluster_gcs_get_block_dedup_legacy_pin_count(void)
 }
 uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
+{
+	return 0;
+}
+
+/* GCS-race round-4c FUNC-1 stubs: 3 storage-fallback SCN verify accessors. */
+uint64
+cluster_gcs_get_fallback_scn_verify_pass_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_fallback_scn_refresh_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_fallback_scn_failclosed_count(void)
 {
 	return 0;
 }

@@ -179,6 +179,15 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
 	pg_atomic_uint64 done_sent_count;
 	pg_atomic_uint64 done_enqueue_drop_count; /* review F7: outbound ring full */
+	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify/refresh.
+	 * A state=N GRANTED_STORAGE_FALLBACK now carries the master's
+	 * pi_watermark_scn (reply page_lsn field reused as an SCN carrier); the
+	 * requester proves its pre-read local copy current against it, or
+	 * discards the bytes and re-reads the shared-storage page (closing the
+	 * pre-read-vs-yield-flush lost-update window the R4 S3 53R93s hit). */
+	pg_atomic_uint64 fallback_scn_verify_pass_count; /* local copy proven current (no I/O) */
+	pg_atomic_uint64 fallback_scn_refresh_count;	 /* stale local copy re-read from storage */
+	pg_atomic_uint64 fallback_scn_failclosed_count;	 /* dirty-stale / still-stale → 53R93 */
 	/* PGRAC: spec-2.35 D12 — 7 NEW counters for CF 2-way protocol. */
 	pg_atomic_uint64 block_forward_sent_count;	   /* master→holder FORWARD emitted */
 	pg_atomic_uint64 block_forward_received_count; /* holder received FORWARD */
@@ -452,6 +461,9 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_refresh_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_received_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_from_holder_ship_count, 0);
@@ -1153,6 +1165,92 @@ gcs_block_stamp_touched(int32 sender_node, int32 forwarding_master)
 	cluster_touched_peers_stamp(sender_node, CLUSTER_TOUCH_GCS_BLOCK);
 	if (forwarding_master != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
 		cluster_touched_peers_stamp(forwarding_master, CLUSTER_TOUCH_GCS_BLOCK);
+}
+
+
+/*
+ * PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify / refresh.
+ *
+ *	A GRANTED_STORAGE_FALLBACK grant ships no page image: the requester is
+ *	expected to use the shared-storage copy.  But the buffer bytes were
+ *	pre-read by ReadBuffer BEFORE the acquire-gate negotiation, and the
+ *	negotiation itself may have driven the live X holder through the BAST
+ *	yield chain (X->S self-downgrade + FlushBuffer) — shared storage can
+ *	then hold a NEWER version than the pre-read, and writing on the stale
+ *	pre-read silently overwrites the flushed version (lost update; §2.6).
+ *
+ *	expected_scn is the master's authoritative pi_watermark_scn(tag)
+ *	carried in the fallback reply's page_lsn field (the state=N site in
+ *	gcs_block_produce_reply), or queried directly on the local-master
+ *	tag-only grant paths (cluster_pcm_lock_acquire_buffer).  Decision:
+ *
+ *	  expected == InvalidScn  SKIP — old-binary master, holder re-ack
+ *	                          (requester copy authoritative), or the block
+ *	                          is not SCN-tracked.  Keep the local bytes
+ *	                          (pre-fix behaviour).  A brand-new extension
+ *	                          block always lands here, so the refresh can
+ *	                          never smgrread past storage EOF.
+ *	  local >= expected       PASS — local copy proven current; no I/O.
+ *	  local stale/unstamped   discard + re-read the shared-storage page,
+ *	                          then re-verdict: still below the watermark →
+ *	                          53R93 fail-closed (action GUC: ERROR default,
+ *	                          WARNING for staging diagnostics).
+ *
+ *	A DIRTY local copy is NEVER overwritten (the bufmgr helper refuses and
+ *	we fail closed): real data dirt requires a covering X — those
+ *	requesters take the holder re-ack fallbacks, which carry expected==0 —
+ *	so dirt here is at most concurrent hint-bit dirt on a page whose
+ *	staleness was just proven.  Flushing it would clobber the newer storage
+ *	version and proceeding would lose the update, so ERROR is the only
+ *	Rule-8.A-safe move (retry renegotiates from a clean slate).
+ */
+void
+cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN expected_scn)
+{
+	SCN page_scn;
+	GcsLostWriteVerdict verdict;
+
+	if (buf == NULL || !SCN_VALID(expected_scn))
+		return;
+
+	page_scn = cluster_bufmgr_read_block_scn_for_gcs(buf);
+	verdict = gcs_block_lost_write_verdict(expected_scn, page_scn);
+	if (verdict == GCS_LOST_WRITE_PASS) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 1);
+		return;
+	}
+
+	/* Local copy provably stale (or unstamped on a tracked tag): re-read. */
+	if (cluster_bufmgr_refresh_block_from_storage_for_gcs(buf, &page_scn)) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_refresh_count, 1);
+
+		/* Deterministic fail-closed drive (t/348 L7): pretend the storage
+		 * copy came back unstamped (ANOMALY) — mirrors the master-direct
+		 * cluster-gcs-block-stale-ship injection. */
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-fallback-refresh-stale");
+		if (cluster_injection_should_skip("cluster-gcs-block-fallback-refresh-stale"))
+			page_scn = InvalidScn;
+
+		verdict = gcs_block_lost_write_verdict(expected_scn, page_scn);
+		if (verdict == GCS_LOST_WRITE_PASS)
+			return;
+	}
+
+	/* Refresh refused (dirty local copy) or the storage page is itself
+	 * still below the master watermark: fail closed / staging WARN. */
+	pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 1);
+	if (cluster_gcs_block_lost_write_action == 0 /* ERROR */)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
+						errmsg("cluster_gcs_block: stale storage-fallback copy detected on tag "
+							   "spc=%u db=%u rel=%u block=%u",
+							   tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
+						errhint("The local/storage page pd_block_scn is below the master "
+								"pi_watermark_scn carried by the GRANTED_STORAGE_FALLBACK "
+								"reply.  Inspect dump_gcs.fallback_scn_failclosed_count.  "
+								"Retry is safe (the next attempt renegotiates).")));
+	ereport(WARNING, (errmsg("cluster_gcs_block: stale storage-fallback copy on tag "
+							 "spc=%u db=%u rel=%u block=%u (action=warn)",
+							 tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum)));
 }
 
 
@@ -1961,6 +2059,38 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				break;
 			}
 
+			/*
+			 * PGRAC: GCS-race round-4 FUNC-1 — third-party live-X handoff.
+			 * A direct-from-master DENIED_MASTER_NOT_HOLDER on a WRITE
+			 * transition is the HG7 live-X wall; with the BAST nudge armed
+			 * the master has already asked the holder for the quiescent
+			 * X->S yield and dropped the dedup entry, so a backed-off retry
+			 * is re-evaluated against the post-yield state and converges
+			 * through the S-invalidate + storage-fallback grant.  Reuse the
+			 * starvation backoff knobs/wait event (same "wait for the
+			 * holder to yield" semantics).  Budget exhaustion falls through
+			 * to the terminal consume below (holder stayed unyielding:
+			 * active ITL / pinned for the whole window) -- the pre-FUNC-1
+			 * 0A000, never a guess.  Nudge disarmed -> terminal immediately
+			 * (no progress to wait for).
+			 */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+				&& final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+				&& cluster_ges_bast && transition_id != PCM_TRANS_N_TO_S
+				&& retry_attempt < max_retries) {
+				long lx_backoff_ms;
+
+				lx_backoff_ms = (long)cluster_gcs_block_starvation_backoff_ms
+								* (1L << (retry_attempt < 16 ? retry_attempt : 16));
+				if (lx_backoff_ms > 25000)
+					lx_backoff_ms = 25000;
+				(void)WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, lx_backoff_ms,
+								WAIT_EVENT_GCS_BLOCK_STARVATION_RETRY);
+				ResetLatch(MyLatch);
+				current_master = cluster_gcs_lookup_master(tag);
+				continue;
+			}
+
 			/* PGRAC: spec-2.36 D6 (HC117) — reader starvation guard transient
 			 * denial.  N→S request was rejected because an X writer's broadcast
 			 * is in flight at the master;  reader exponential-backoffs per
@@ -2099,6 +2229,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
 				 errhint("a node is leaving the cluster and may not yet have flushed this block; "
 						 "retry after the leave commits — retry is safe")));
+
+	/*
+	 * PGRAC: GCS-race round-4c FUNC-1 — a storage fallback ships no image:
+	 * the buffer still holds whatever this backend pre-read BEFORE the
+	 * acquire-gate negotiation (ReadBuffer runs first).  When the reply
+	 * carried a valid master pi_watermark_scn, prove the local copy current
+	 * or discard-and-re-read the shared-storage page; a terminal 53R93 here
+	 * loses the xp/hist sample like every other terminal ereport above.
+	 */
+	if (granted_storage_fallback)
+		cluster_gcs_block_fallback_verify_refresh(buf, tag, (SCN)final_page_lsn);
 
 	/* PGRAC: spec-5.59 D2/D3/D4 — close the requester-wait (and index
 	 * overlay) scopes at the single normal-exit funnel; terminal ereport
@@ -3710,6 +3851,27 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 	found = cluster_bufmgr_probe_block_for_gcs(req->tag);
 
 	if (!found && state == PCM_LOCK_MODE_N) {
+		SCN fallback_watermark_scn;
+
+		/*
+		 * PGRAC: GCS-race round-4c FUNC-1 — a state=N grant ships no image,
+		 * so the requester keeps whatever bytes it PRE-READ from shared
+		 * storage before this negotiation.  If the previous live X holder's
+		 * BAST-yield flush landed in between, that pre-read is a stale
+		 * version and writing on it silently overwrites the flushed one
+		 * (the R4 S3 lost-update chain).  Snapshot the authoritative
+		 * pi_watermark_scn BEFORE the transition mutates the entry and
+		 * carry it in the reply's page_lsn field so the requester can prove
+		 * its copy current or refresh (cluster_gcs_block_fallback_verify_
+		 * refresh).  Wire compat: fallback replies historically carried
+		 * page_lsn == 0 and old requesters ignore the field; an old master
+		 * sends 0 == InvalidScn which a new requester maps to verdict SKIP
+		 * (the pre-fix behaviour).  The holder re-ack fallbacks below and
+		 * in the X path intentionally KEEP the zero carrier: there the
+		 * requester's own copy is authoritative (it may hold a shipped
+		 * image newer than storage) and must never be overwritten.
+		 */
+		fallback_watermark_scn = cluster_pcm_lock_pi_watermark_scn_query(req->tag);
 		if (!cluster_pcm_lock_apply_gcs_transition(req->tag, (PcmLockTransition)req->transition_id,
 												   req->sender_node)) {
 			*out_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
@@ -3717,6 +3879,7 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 		}
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
 		*out_status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+		*out_page_lsn = (XLogRecPtr)fallback_watermark_scn;
 		return true;
 	}
 
@@ -4265,8 +4428,19 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		 * safe; after ㉕ the quiescent downgrade deliberately creates
 		 * "requester holds S, other nodes hold S" and the blanket deny would
 		 * make every downgraded block permanently unwritable by its former
-		 * holder.  Taking the block from a live X HOLDER remains wave-g
-		 * territory and stays denied.
+		 * holder.
+		 *
+		 * PGRAC: GCS-race round-4 FUNC-1 — the live X-HOLDER deny below is
+		 * no longer terminal in the default configuration: with
+		 * cluster.ges_bast on, the nudge (sent just below) asks the holder
+		 * for the quiescent X->S yield, the dedup entry is dropped so the
+		 * requester's bounded backoff-retry is re-evaluated, and the retry
+		 * converges through the shipped S-invalidate + storage-fallback
+		 * grant path (the holder's yield flushed the page storage-current).
+		 * No double-X window exists at any step: X is only granted after
+		 * every S copy is invalidated, and the holder's yield itself blocks
+		 * further local writes.  The direct wire-ship 3-way transfer
+		 * (retain-X-until-post-install-ACK) remains wave-g territory.
 		 */
 		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
 			&& cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
@@ -4304,6 +4478,17 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+			/*
+			 * GCS-race round-4 FUNC-1: with the nudge armed this deny is a
+			 * RETRYABLE step of the live-X handoff, not a terminal wall --
+			 * the requester backs off and re-asks while the holder yields
+			 * X->S, and the retry must be re-evaluated against the
+			 * post-yield state.  Drop the in-flight dedup entry (same
+			 * (request_id, epoch) key) or the retry is swallowed as
+			 * IN_FLIGHT_DUPLICATE until the TTL sweep (PENDING_X deny
+			 * precedent above).
+			 */
+			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
 								 InvalidXLogRecPtr, NULL);
 			return;
@@ -5797,8 +5982,26 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		bool yielded = false;
 
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-bast-nudge");
-		if (cluster_ges_bast && !cluster_injection_should_skip("cluster-gcs-block-bast-nudge"))
+		if (cluster_ges_bast && !cluster_injection_should_skip("cluster-gcs-block-bast-nudge")) {
 			yielded = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(fwd->tag, fwd->master_node);
+
+			/*
+			 * PGRAC: GCS-race round-4c P1 — yield-notify liveness self-heal.
+			 * A nudge for a block we ALREADY hold in S means our earlier
+			 * yield's fire-and-forget notify was lost (the master still
+			 * records X@us, or it would have served the S state instead of
+			 * nudging).  Re-send the idempotent downgrade notify so the
+			 * master converges; a master that already knows rejects the
+			 * duplicate transition and nothing changes.  Counted as a
+			 * refusal (no fresh yield happened) — the requester's bounded
+			 * deny-retry picks up the healed state on its next attempt.
+			 */
+			if (!yielded && cluster_bufmgr_renotify_s_for_gcs(fwd->tag, fwd->master_node))
+				ereport(DEBUG1, (errmsg("cluster_gcs_block: re-sent lost X->S yield notify for tag "
+										"spc=%u db=%u rel=%u block=%u to master node %d",
+										fwd->tag.spcOid, fwd->tag.dbOid, fwd->tag.relNumber,
+										fwd->tag.blockNum, (int)fwd->master_node)));
+		}
 		cluster_lever_e2_note_nudge_result(yielded);
 		return;
 	}
@@ -7463,6 +7666,27 @@ uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->done_enqueue_drop_count) : 0;
+}
+
+/* PGRAC: GCS-race round-4c FUNC-1 — 3 storage-fallback verify accessors. */
+uint64
+cluster_gcs_get_fallback_scn_verify_pass_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_fallback_scn_refresh_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->fallback_scn_refresh_count) : 0;
+}
+
+uint64
+cluster_gcs_get_fallback_scn_failclosed_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->fallback_scn_failclosed_count)
+						   : 0;
 }
 
 /* PGRAC: spec-2.35 D12 — 7 NEW counter accessors. */

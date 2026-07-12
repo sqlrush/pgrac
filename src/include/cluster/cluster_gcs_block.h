@@ -1839,6 +1839,22 @@ extern Buffer cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, Fo
 extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
+
+/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify / refresh.
+ * read_block_scn: snapshot pd_block_scn under content_lock SHARED (page-
+ * header contents are content-lock protected; a raw read could tear the
+ * 8-byte SCN against a concurrent EXCLUSIVE writer).
+ * refresh_block_from_storage: discard the CLEAN local bytes and re-read the
+ * shared-storage page under content_lock EXCLUSIVE; returns false WITHOUT
+ * touching the bytes when the buffer is dirty (caller fail-closes — dirt
+ * could be a newer local version and must never be overwritten or flushed
+ * over the newer storage copy).  Caller holds a pin (LockBuffer contract).
+ * fallback_verify_refresh: the requester-side decision (verdict on the
+ * local copy → PASS keep / stale → refresh + re-verdict → 53R93). */
+extern SCN cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf);
+extern bool cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page_scn);
+extern void cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag,
+													  SCN expected_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop
  * with NO GCS release wire, for the holder-side X-transfer branch running in
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
@@ -1878,6 +1894,12 @@ extern bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
  * master refused; caller falls back to the one-shot read-image ship. */
 extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
+
+/* PGRAC: GCS-race round-4c P1 — re-send the (idempotent) X->S downgrade
+ * notify when a BAST nudge arrives for a block this node already holds in
+ * S: the original fire-and-forget yield notify may have been lost on the
+ * wire, leaving the master recording X@us and nudging forever. */
+extern bool cluster_bufmgr_renotify_s_for_gcs(BufferTag tag, int32 master_node);
 
 /* PGRAC: spec-5.2a D4 (backend eager flush) — flush a cluster sequence page to
  * shared storage from the BACKEND that just wrote it.  Caller holds a pin and
@@ -2167,6 +2189,9 @@ extern uint64 cluster_gcs_get_block_dedup_done_marked_count(void);	  /* RC-F DON
 extern uint64 cluster_gcs_get_block_dedup_done_mismatch_count(void);  /* RC-F DONE */
 extern uint64 cluster_gcs_get_block_dedup_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_get_block_dedup_legacy_pin_count(void);	  /* review F5 */
+extern uint64 cluster_gcs_get_fallback_scn_verify_pass_count(void);	  /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_refresh_count(void);		  /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_failclosed_count(void);	  /* round-4c FUNC-1 */
 
 /*
  * PGRAC: spec-2.35 D12 — 7 NEW reliability/lifecycle counter accessors

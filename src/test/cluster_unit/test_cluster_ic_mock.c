@@ -73,6 +73,7 @@ int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 bool cluster_ic_suppress_caps_reply = false;
 /* GCS-race round-2 RC-F: build_hello gate for the GCS_DONE_V1 bit. */
 bool cluster_ic_suppress_gcs_done_cap = false;
+bool cluster_ic_suppress_xid_flock_cap = false;
 
 /* spec-5.59 D6 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o

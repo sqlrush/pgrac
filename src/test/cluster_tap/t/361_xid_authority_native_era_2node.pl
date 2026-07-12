@@ -978,6 +978,57 @@ SELECT value FROM pg_cluster_state
 		'C4: joiner sees the native-era rows (prepared insert rolled back)');
 
 	# ---------------------------------------------------------------------
+	# W0 legs (round-4 P0-1): mixed-version admission.  node1 restarts with
+	# the flock capability SUPPRESSED (simulating a round-3b lock-free
+	# writer binary); the barrier must stamp and collect the ack (0x20 is
+	# still advertised) but HOLD the allocation gate -- a declared member
+	# without the flock protocol could erase the stamp with a stale header.
+	# ---------------------------------------------------------------------
+	$p1->append_conf('postgresql.conf', "cluster.ic_suppress_xid_flock_cap = on\n");
+	$p1->stop;
+	# p0 is live, so the rejoin rendezvous is immediate: plain blocking
+	# start (G8 precedent; background-start races the pidfile).
+	$p1->start;
+	wait_sql_eq($p1, 'SELECT 1', '1', 'W0: suppressed-cap node1 is back up');
+	wait_sql_eq($p0,
+		"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1",
+		't', 'W0: node0 sees suppressed node1 heartbeats');
+
+	$p0->append_conf('postgresql.conf', "cluster.xid_wrap_barrier_force = on\n");
+	$p0->reload;
+
+	# W0a: the stamp itself lands (marking is independent of admission).
+	my $w0_tries = 120;
+	my $w0_flags = 0;
+	while ($w0_tries-- > 0)
+	{
+		my $a = read_xid_authority($p_shared);
+		$w0_flags = $a->{flags};
+		last if ($w0_flags & 0x0004) != 0;
+		usleep(250_000);
+	}
+	ok(($w0_flags & 0x0004) != 0, 'W0a: stamp lands while the gate is held');
+
+	# W0b: the gate stays HELD against the suppressed peer (negative
+	# assert: still false well past several ticks), and the LMON says why.
+	usleep(4_000_000);
+	is($p0->safe_psql('postgres', q{
+SELECT value FROM pg_cluster_state
+ WHERE category = 'catalog' AND key = 'xid_wrap_barrier_done'}),
+		'f', 'W0b: allocation gate held against a flock-incapable member');
+	like(PostgreSQL::Test::Utils::slurp_file($p0->logfile),
+		qr/does not advertise the authority-flock capability/,
+		'W0b: LMON names the flock-incapable member');
+
+	# Restore node1 to the real (capable) binary behaviour; the existing
+	# W1-W4 legs below prove the gate then opens through the full path.
+	$p1->append_conf('postgresql.conf', "cluster.ic_suppress_xid_flock_cap = off\n");
+	$p1->stop;
+	$p1->start;
+	wait_sql_eq($p1, 'SELECT 1', '1', 'W0c: capable node1 is back up');
+
+	# ---------------------------------------------------------------------
 	# W legs (GCS-race round-3 P0-1): xid wrap barrier.  The test-only
 	# force GUC makes node0's LMON treat the 2^32 margin as reached and
 	# run the FULL real path: durable NATIVE_RAW_REUSED stamp -> own latch
@@ -986,8 +1037,6 @@ SELECT value FROM pg_cluster_state
 	# approach is not drivable in a test); everything downstream is the
 	# production path.  Precondition: C2 proved both-node coverage latched.
 	# ---------------------------------------------------------------------
-	$p0->append_conf('postgresql.conf', "cluster.xid_wrap_barrier_force = on\n");
-	$p0->reload;
 
 	# W1: the one-way stamp lands durably in the shared authority (0x0004).
 	my $w_tries = 120;

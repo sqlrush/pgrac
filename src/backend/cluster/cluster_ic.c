@@ -645,6 +645,13 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	/* GCS-race round-3 P0-1: xid wrap-barrier protocol capability, same
 	 * unconditional discipline (see cluster_ic.h). */
 	capabilities |= PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1;
+	/* GCS-race round-4 P0-1: authority flock/stamped-magic protocol
+	 * capability (distinct from the barrier bit above).  The test-only
+	 * suppression GUC simulates a round-3b binary: barrier-capable but
+	 * still running lock-free authority writes, so the wrap barrier must
+	 * hold its gate. */
+	if (!cluster_ic_suppress_xid_flock_cap)
+		capabilities |= PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

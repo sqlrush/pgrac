@@ -88,6 +88,14 @@ static int dp_listener_fd = -1;
 static WaitEventSet *dp_wes = NULL;
 static bool dp_wes_dirty = true;
 static bool dp_enabled = false;
+/* PGRAC: GCS-race round-4c tier1-partial-IO F3 — whether the CURRENT
+ * WaitEventSet registered WRITEABLE interest for each CONNECTED peer.
+ * Compared against cluster_ic_tier1_pending_outbound() at the top of every
+ * tick: a handler send during the previous dispatch batch can queue a
+ * backpressured tail (pending 0 -> >0) without touching dp_wes_dirty, and
+ * a completed drain must conversely REVOKE the interest (a level-triggered
+ * WRITEABLE on an idle healthy socket would busy-spin the worker). */
+static bool dp_wes_writable[CLUSTER_MAX_NODES];
 
 /*
  * cluster_lms_data_plane_startup — bind the DATA listener + init the mesh.
@@ -161,6 +169,11 @@ dp_rebuild_wes(void)
 {
 	int32 pi;
 
+	/* Round-4c F3: the skip branches below (fd < 0 / non-CONNECTED
+	 * substates) never reach the per-peer assignment — reset first so no
+	 * stale WRITEABLE-interest record survives a peer teardown. */
+	memset(dp_wes_writable, 0, sizeof(dp_wes_writable));
+
 	if (dp_wes != NULL) {
 		FreeWaitEventSet(dp_wes);
 		dp_wes = NULL;
@@ -195,6 +208,9 @@ dp_rebuild_wes(void)
 			continue;
 		}
 
+		/* Round-4c F3: remember the registered WRITEABLE interest so the
+		 * tick can detect pending-state drift without a rebuild. */
+		dp_wes_writable[pi] = (events & WL_SOCKET_WRITEABLE) != 0;
 		AddWaitEventToSet(dp_wes, events, dp_track[pi].fd, NULL, (void *)(intptr_t)pi);
 	}
 
@@ -377,6 +393,25 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		}
 	}
 
+	/*
+	 * PGRAC: GCS-race round-4c tier1-partial-IO F3 — re-align WES WRITEABLE
+	 * interest with the actual pending-outbound state.  A dispatch handler's
+	 * reply send during the PREVIOUS event batch may have queued a
+	 * backpressured tail (pending 0 -> >0) without touching dp_wes_dirty;
+	 * without this the tail parks until an unrelated rebuild — under load
+	 * that was the requester's full 9-round retransmit budget (~56s wall,
+	 * root cause #2).  The reverse drift (drained tail, interest still
+	 * registered) must equally rebuild, or the level-triggered WRITEABLE on
+	 * a healthy idle socket busy-spins this worker.
+	 */
+	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+		if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
+			&& cluster_ic_tier1_pending_outbound(pi) != dp_wes_writable[pi]) {
+			dp_wes_dirty = true;
+			break;
+		}
+	}
+
 	if (dp_wes_dirty)
 		dp_rebuild_wes();
 
@@ -461,18 +496,54 @@ cluster_lms_data_plane_tick(long timeout_ms)
 					dp_track[peer].substate = LMS_DP_DOWN;
 					dp_wes_dirty = true;
 				}
-			} else if (dp_track[peer].substate == LMS_DP_CONNECTED
-					   && (ev[i].events & WL_SOCKET_READABLE)) {
-				CLUSTER_INJECTION_POINT("cluster-lms-data-dispatch");
-				/* Generic envelope pump: recv + verify + dispatch.  No
-				 * DATA msg_type is registered before the D3/D4 flip, so
-				 * pre-flip traffic is limited to HELLO/errors;  post-
-				 * flip this is the block-family dispatch entry. */
-				if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
-					cluster_ic_tier1_close_peer(peer, "data-plane recv failed");
-					dp_track[peer].fd = -1;
-					dp_track[peer].substate = LMS_DP_DOWN;
-					dp_wes_dirty = true;
+			} else if (dp_track[peer].substate == LMS_DP_CONNECTED) {
+				bool peer_up = true;
+
+				if (ev[i].events & WL_SOCKET_READABLE) {
+					CLUSTER_INJECTION_POINT("cluster-lms-data-dispatch");
+					/* Generic envelope pump: recv + verify + dispatch.  No
+					 * DATA msg_type is registered before the D3/D4 flip, so
+					 * pre-flip traffic is limited to HELLO/errors;  post-
+					 * flip this is the block-family dispatch entry. */
+					if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
+						cluster_ic_tier1_close_peer(peer, "data-plane recv failed");
+						dp_track[peer].fd = -1;
+						dp_track[peer].substate = LMS_DP_DOWN;
+						dp_wes_dirty = true;
+						peer_up = false;
+					}
+				}
+
+				/*
+				 * PGRAC: GCS-race round-4c tier1-partial-IO F2 (56s wall
+				 * root cause #2) — drain the backpressured outbound tail on
+				 * WL_SOCKET_WRITEABLE.  The CONTROL plane (LMON) has done
+				 * this since spec-2.3 v1.0.1 F1;  the DATA plane only ever
+				 * handled READABLE, so a partial/EAGAIN reply tail parked
+				 * in tier1_outbound_remaining forever and the requester ran
+				 * its full retransmit budget.  Same event can carry both
+				 * bits: recv first, then drain (a handler reply enqueued by
+				 * the recv may itself have queued a tail).  Mirrors the
+				 * LMON drain arm, but through the frame-free drain entry —
+				 * the DATA plane has no idempotent heartbeat to re-enter
+				 * tier1_send_bytes with.
+				 */
+				if (peer_up && (ev[i].events & WL_SOCKET_WRITEABLE)
+					&& cluster_ic_tier1_pending_outbound(peer)) {
+					switch (cluster_ic_tier1_drain_outbound(peer)) {
+					case CLUSTER_IC_SEND_DONE:
+					case CLUSTER_IC_SEND_WOULD_BLOCK:
+						/* Drained or still backpressured: re-align the
+						 * WRITEABLE interest either way. */
+						dp_wes_dirty = true;
+						break;
+					case CLUSTER_IC_SEND_HARD_ERROR:
+						cluster_ic_tier1_close_peer(peer, "data-plane outbound drain hard error");
+						dp_track[peer].fd = -1;
+						dp_track[peer].substate = LMS_DP_DOWN;
+						dp_wes_dirty = true;
+						break;
+					}
 				}
 			}
 		} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {

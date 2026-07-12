@@ -255,6 +255,8 @@ fault_type_to_text(ClusterInjectFaultType t)
 		return "crash";
 	case CLUSTER_FAULT_SKIP:
 		return "skip";
+	case CLUSTER_FAULT_SKIP_N:
+		return "skipn"; /* spec-7.2a count-based skip (:skipn:N arm syntax) */
 	}
 	return "unknown";
 }
@@ -406,6 +408,15 @@ dump_ic(ReturnSetInfo *rsinfo)
 				 psprintf(UINT64_FORMAT, cluster_ic_tier1_get_listener_incarnation()));
 		emit_row(rsinfo, "ic", "tier1_listener_port",
 				 fmt_int32((int32)cluster_ic_tier1_get_listener_port()));
+		/* PGRAC: GCS-race round-4c tier1-partial-IO F2 — backpressured-tail
+		 * drain wakeups per plane (the DATA plane parked such tails forever
+		 * before the fix;  a loaded S3 run must show the DATA row moving). */
+		emit_row(
+			rsinfo, "ic", "tier1_writable_drain_control",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_writable_drain(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(
+			rsinfo, "ic", "tier1_writable_drain_data",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_writable_drain(CLUSTER_IC_PLANE_DATA)));
 	}
 
 	/*
@@ -2090,6 +2101,16 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
 
+	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify rows:
+	 * local pre-read proven current (no I/O) / stale pre-read re-read from
+	 * shared storage / still-stale-or-dirty fail-closed (53R93). */
+	emit_row(rsinfo, "gcs", "fallback_scn_verify_pass_count",
+			 fmt_int64((int64)cluster_gcs_get_fallback_scn_verify_pass_count()));
+	emit_row(rsinfo, "gcs", "fallback_scn_refresh_count",
+			 fmt_int64((int64)cluster_gcs_get_fallback_scn_refresh_count()));
+	emit_row(rsinfo, "gcs", "fallback_scn_failclosed_count",
+			 fmt_int64((int64)cluster_gcs_get_fallback_scn_failclosed_count()));
+
 	/* PGRAC: spec-2.35 D13 — 7 NEW counter rows for CF 2-way protocol. */
 	emit_row(rsinfo, "gcs", "block_forward_sent_count",
 			 fmt_int64((int64)cluster_gcs_get_block_forward_sent_count()));
@@ -3416,6 +3437,11 @@ dump_catalog(ReturnSetInfo *rsinfo)
 				 fmt_bool(cluster_cr_native_prehistory_disabled()));
 		emit_row(rsinfo, "catalog", "xid_wrap_barrier_done",
 				 fmt_bool(cluster_xid_wrap_barrier_passed()));
+		/* Round-4c P0-1 residual #2: durable admission proof (the boot
+		 * shortcut's gate; raw_reused alone no longer opens it). */
+		emit_row(
+			rsinfo, "catalog", "xid_epoch_gate_admitted",
+			fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_EPOCH_GATE_ADMITTED) != 0));
 	}
 
 	/*

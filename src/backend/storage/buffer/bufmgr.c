@@ -68,6 +68,7 @@
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
+#include "cluster/cluster_inject.h" /* GCS-race round-4c P1 — yield-notify-drop point */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -7186,7 +7187,19 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 	if (dirty)
 		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 
-	if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node))
+	/*
+	 * PGRAC: GCS-race round-4c P1 (yield-notify liveness) — deterministic
+	 * wire-loss simulation.  SKIP models the notify being handed to the
+	 * transport and then LOST (fire-and-forget has no ACK): the local state
+	 * flips to S exactly as on a successful handoff, but the master keeps
+	 * recording X@us.  Drives the renotify self-heal TAP leg (t/348 L8).
+	 */
+	CLUSTER_INJECTION_POINT("cluster-gcs-block-yield-notify-drop");
+	if (cluster_injection_should_skip("cluster-gcs-block-yield-notify-drop"))
+	{
+		/* simulated post-handoff loss: fall through to the S flip */
+	}
+	else if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node))
 	{
 		/* Notify not handed to transport — keep local X, master unchanged. */
 		LWLockRelease(content_lock);
@@ -7199,6 +7212,58 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
 	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — GCS-race round-4c P1 (yield-notify
+ *   liveness self-heal).
+ *
+ *   cluster_bufmgr_renotify_s_for_gcs(tag, master_node) — the X->S yield
+ *   notify above is fire-and-forget; if it is lost on the wire the master
+ *   keeps recording X@us and keeps BAST-nudging, while the local state is
+ *   already S so the downgrade helper refuses every nudge — the requester
+ *   starves to its retransmit budget.  When a nudge arrives for a block we
+ *   already hold in S, re-send the (idempotent) downgrade notify: a master
+ *   that already applied it rejects the duplicate as an illegal S->S
+ *   transition and nothing changes;  the lost-notify master applies it and
+ *   the requester's next retry proceeds.  Returns true when a notify was
+ *   re-sent.
+ * ======================================================================== */
+bool
+cluster_bufmgr_renotify_s_for_gcs(BufferTag tag, int32 master_node)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	bool		is_s;
+
+	if (master_node < 0 || master_node == cluster_node_id)
+		return false;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	is_s = BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0
+		&& (PcmState) buf->pcm_state == PCM_STATE_S;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	if (!is_s)
+		return false;
+
+	return cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node);
 }
 
 /*
@@ -7516,6 +7581,89 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
+	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — GCS-race round-4c FUNC-1 (storage-
+ *   fallback SCN verify / refresh; the spec-2.41 lost-write detector
+ *   extended to the GRANTED_STORAGE_FALLBACK consume side).
+ *
+ *   cluster_bufmgr_read_block_scn_for_gcs(buf) — snapshot pd_block_scn
+ *   under content_lock SHARED.  Page-header contents are content-lock
+ *   protected, NOT buffer-header protected; a raw read could tear the
+ *   8-byte SCN against a concurrent content_lock-EXCLUSIVE writer (the
+ *   same rule as the invalidate wrapper above).
+ *
+ *   cluster_bufmgr_refresh_block_from_storage_for_gcs(buf, out_scn) —
+ *   discard the CLEAN local bytes and re-read the shared-storage page
+ *   into the buffer.  The physical read + verify runs OUTSIDE the content
+ *   lock into a scratch block, then the copy happens under content_lock
+ *   EXCLUSIVE with BM_DIRTY re-checked inside that hold (hint-bit setters
+ *   need at least content SHARE, so the flag cannot flip mid-copy).
+ *   Returns false WITHOUT touching the bytes when the buffer is dirty:
+ *   dirt could be a newer local version and must never be overwritten
+ *   (nor may a provably-stale page ever be flushed over the newer storage
+ *   copy) — the caller fail-closes.  The caller holds a pin (LockBuffer
+ *   contract), so the buffer identity is stable throughout.
+ * ======================================================================== */
+SCN
+cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf)
+{
+	LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
+	SCN			scn;
+
+	LWLockAcquire(content_lock, LW_SHARED);
+	scn = ((PageHeader) BufHdrGetBlock(buf))->pd_block_scn;
+	LWLockRelease(content_lock);
+	return scn;
+}
+
+bool
+cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page_scn)
+{
+	PGAlignedBlock scratch;
+	BufferTag	tag = buf->tag;
+	SMgrRelation reln;
+	LWLock	   *content_lock;
+	uint32		buf_state;
+	bool		dirty;
+
+	if (out_page_scn != NULL)
+		*out_page_scn = InvalidScn;
+
+	/*
+	 * Physical read + verify outside the content lock.  The caller only
+	 * reaches this with a VALID master pi_watermark_scn for the tag, which
+	 * implies a previous X holder flushed this block (the watermark advances
+	 * on yield/invalidate flush paths) — so the block exists on storage and
+	 * this cannot read past EOF (a concurrent truncate would ereport here,
+	 * which is the correct fail-closed outcome for a dropped block).
+	 */
+	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+								PIV_LOG_WARNING | PIV_REPORT_STAT))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
+						tag.blockNum, tag.relNumber)));
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	LWLockAcquire(content_lock, LW_EXCLUSIVE);
+	buf_state = LockBufHdr(buf);
+	dirty = (buf_state & BM_DIRTY) != 0;
+	UnlockBufHdr(buf, buf_state);
+	if (dirty)
+	{
+		LWLockRelease(content_lock);
+		return false;
+	}
+	memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
+	LWLockRelease(content_lock);
+
+	if (out_page_scn != NULL)
+		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
 	return true;
 }
 
