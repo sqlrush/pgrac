@@ -447,10 +447,32 @@ for my $round (1 .. 6)
 	}, 30);
 	usleep(700_000);
 }
-# Let the TTL sweep (LMON, ~1Hz) run past the 2x retransmit window.
+# Let the TTL sweep (LMON, ~1Hz) run past the out-of-window threshold.  The
+# threshold now covers the LEGAL request lifetime — 2 x (backoff total +
+# (retries+1) reply-timeout windows), ~53s under the defaults — so shrink
+# the lifetime GUCs for the aging wait only (the sweep reads them at sweep
+# time and no read traffic runs during the wait), then reset.
+for my $n ($node0, $node1)
+{
+	$n->safe_psql('postgres',
+		'ALTER SYSTEM SET cluster.gcs_block_retransmit_max_retries = 0');
+	$n->safe_psql('postgres',
+		'ALTER SYSTEM SET cluster.gcs_block_retransmit_initial_backoff_ms = 10');
+	$n->safe_psql('postgres', 'ALTER SYSTEM SET cluster.gcs_reply_timeout_ms = 100');
+	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
 usleep(4_000_000);
 
 my $evict_post = gcs_int_both($node0, $node1, 'dedup_evict_count');
+for my $n ($node0, $node1)
+{
+	$n->safe_psql('postgres',
+		'ALTER SYSTEM RESET cluster.gcs_block_retransmit_max_retries');
+	$n->safe_psql('postgres',
+		'ALTER SYSTEM RESET cluster.gcs_block_retransmit_initial_backoff_ms');
+	$n->safe_psql('postgres', 'ALTER SYSTEM RESET cluster.gcs_reply_timeout_ms');
+	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
 cmp_ok($evict_post, '>', $evict_pre,
 	"L4 reclaim/TTL sweep removed aged entries "
 	. "(dedup_evict_count $evict_pre -> $evict_post)");
