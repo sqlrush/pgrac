@@ -599,10 +599,41 @@ UT_TEST(u9_backend_exit_cleanup_all_shards)
 }
 
 
+/* ============================================================
+ * U10 — remove releases an IN_FLIGHT entry for re-evaluation.
+ *
+ *	The retryable-deny paths (DENIED_PENDING_X / direct-land deny) call
+ *	cluster_gcs_block_dedup_remove before replying, because the
+ *	requester's convergence retry reuses the same key: a leftover
+ *	in-flight entry would swallow it as IN_FLIGHT_DUPLICATE until the
+ *	TTL sweep (the S3 RC-B reply-timeout burn).  remove must turn the
+ *	next same-key lookup back into MISS_REGISTERED.
+ * ============================================================ */
+UT_TEST(u10_remove_reopens_in_flight_entry)
+{
+	GcsBlockDedupKey k = make_key(0, 3, 400, 7);
+	BufferTag t = make_tag(90);
+	GcsBlockDedupEntry cached;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	/* leftover in-flight entry swallows the same-key retry ... */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	/* ... and remove re-opens it for a fresh master evaluation. */
+	cluster_gcs_block_dedup_remove(0, &k);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);
@@ -612,6 +643,7 @@ main(void)
 	UT_RUN(u7_per_shard_cap_full);
 	UT_RUN(u8_ttl_sweep_all_shards);
 	UT_RUN(u9_backend_exit_cleanup_all_shards);
+	UT_RUN(u10_remove_reopens_in_flight_entry);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

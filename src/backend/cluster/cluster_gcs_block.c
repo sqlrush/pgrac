@@ -1712,6 +1712,16 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				LWLockRelease(&blk->lock.lock);
 			}
 
+			/*
+			 * Lock-free consume invariant (S3 RC-A):  every delivery path
+			 * (wire reply handler, direct-land completion, direct fail-slot)
+			 * refuses to touch reply_header/reply_block_data once
+			 * reply_received is set, so from the have_reply observation above
+			 * until this backend rearms the slot the reply fields are
+			 * immutable and may be read without blk->lock.  A duplicate
+			 * reply (dedup CACHED_REPLY resend / re-forward) is dropped at
+			 * delivery, counted in stale_reply_drop_count.
+			 */
 			final_status = slot->reply_header.status;
 			final_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 			/* spec-2.35 HC105:  capture forward source so DENIED_MASTER_
@@ -3910,6 +3920,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-starvation-force-denied");
 		if (cluster_injection_should_skip("cluster-gcs-block-starvation-force-denied")) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+			/* A retry-driven denial must not leave the IN_FLIGHT dedup entry
+			 * behind:  the requester's backoff retry reuses the same
+			 * (request_id, epoch) key, so a leftover entry swallows the retry
+			 * as IN_FLIGHT_DUPLICATE until the TTL sweep — each swallowed
+			 * round burns a full cluster.gcs_reply_timeout_ms and the
+			 * convergence the deny promises never re-evaluates. */
+			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
 								 InvalidXLogRecPtr, NULL);
 			return;
@@ -3918,6 +3935,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		pending_x = cluster_pcm_lock_query_pending_x_requester(req->tag);
 		if (pending_x >= 0 && pending_x != req->sender_node) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+			/* Same dedup-entry release as the inject branch above: the deny
+			 * contract is "back off and retry, the retry re-evaluates". */
+			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
 								 InvalidXLogRecPtr, NULL);
 			return;
@@ -4236,6 +4256,12 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				}
 				if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
 					cluster_pcm_lock_clear_pending_x(req->tag);
+					/* The direct-land deny asks the requester to retry with
+					 * direct-land suppressed — same (request_id, epoch) key,
+					 * so drop the in-flight dedup entry or the retry is
+					 * swallowed as IN_FLIGHT_DUPLICATE (see the PENDING_X
+					 * sites; S3 RC-B). */
+					cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 					(void)gcs_block_deny_direct_armed_forward_request(req);
 					return;
 				}
@@ -4416,6 +4442,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				}
 				gcs_block_broadcast_invalidate_nowait(req, holders_bm);
 				cluster_pcm_lock_clear_pending_x(req->tag);
+				/* Release the IN_FLIGHT dedup entry BEFORE the deny goes out:
+				 * the convergence this reply promises ("a following retry
+				 * finds no remote holder left and grants") only works if the
+				 * retry is re-evaluated.  The retry reuses the same
+				 * (request_id, epoch) dedup key, so a leftover in-flight
+				 * entry silently swallows it (IN_FLIGHT_DUPLICATE) until the
+				 * TTL sweep — every swallowed round burns a full
+				 * cluster.gcs_reply_timeout_ms at the requester and the
+				 * S3-observed 53R90 retransmit-exhaustion storm follows. */
+				cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 				gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
 									 InvalidXLogRecPtr, NULL);
 				return;
@@ -4573,8 +4609,13 @@ x_path_skipped:
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
-				if (gcs_block_deny_direct_armed_forward_request(req))
+				if (gcs_block_deny_direct_armed_forward_request(req)) {
+					/* Retry comes back with the same (request_id, epoch)
+					 * key and direct-land suppressed — release the in-flight
+					 * dedup entry so it is re-evaluated (S3 RC-B). */
+					cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 					return;
+				}
 
 				memset(&fwd, 0, sizeof(fwd));
 				fwd.request_id = req->request_id;
@@ -4646,8 +4687,13 @@ x_path_skipped:
 									 InvalidXLogRecPtr, NULL);
 				return;
 			}
-			if (gcs_block_deny_direct_armed_forward_request(req))
+			if (gcs_block_deny_direct_armed_forward_request(req)) {
+				/* Retry comes back with the same (request_id, epoch) key and
+				 * direct-land suppressed — release the in-flight dedup entry
+				 * so it is re-evaluated (S3 RC-B). */
+				cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 				return;
+			}
 
 			/* Build and send GCS_BLOCK_FORWARD to holder. */
 			memset(&fwd, 0, sizeof(fwd));
@@ -4812,6 +4858,26 @@ build_and_send_reply: {
 	cluster_gcs_block_dedup_install_reply_ex(dedup_worker_id, &key, status, hdr,
 											 has_block_payload ? block_payload : NULL,
 											 send_sf_dep ? &sf_dep_vec : NULL, send_sf_dep);
+
+	/*
+	 * Duplicate-reply injection (S3 RC-A test surface).  When armed with
+	 * SKIP, ship the just-installed cached copy AHEAD of the normal send so
+	 * the requester receives the same reply twice back-to-back — the
+	 * deterministic stand-in for the protocol-normal duplicate (dedup
+	 * CACHED_REPLY resend racing the original under retransmit).  The
+	 * requester-side first-reply-wins guard must drop the second delivery
+	 * (stale_reply_drop_count++) instead of overwriting the slot mid-consume.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-gcs-block-duplicate-grant-reply");
+	if (cluster_injection_should_skip("cluster-gcs-block-duplicate-grant-reply")) {
+		GcsBlockDedupEntry dup_entry;
+
+		memset(&dup_entry, 0, sizeof(dup_entry));
+		if (cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
+													   req->transition_id, &dup_entry)
+			== GCS_BLOCK_DEDUP_CACHED_REPLY)
+			gcs_block_resend_cached_reply(req->sender_node, &dup_entry);
+	}
 
 	/*
 		 * spec-2.34 D17 — drop-reply injection.  When active with SKIP,
@@ -5016,7 +5082,13 @@ gcs_block_direct_fail_slot(ClusterGcsBlockBackendBlock *blk, ClusterGcsBlockOuts
 	slot->direct_target_lkey = 0;
 	slot->direct_target_prepared = false;
 	gcs_block_note_direct_abort();
-	if (authoritative_denial && hdr != NULL) {
+	/* First-reply-wins (S3 RC-A): if a wire reply already landed for this
+	 * attempt, leave the slot reply fields untouched — the requester may be
+	 * consuming them without the lock — and do not mark stale either (the
+	 * landed reply is the outcome).  Just signal. */
+	if (slot->reply_received) {
+		/* keep landed reply */
+	} else if (authoritative_denial && hdr != NULL) {
 		slot->reply_header = *hdr;
 		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 		slot->reply_received = true;
@@ -5117,6 +5189,15 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 	}
 	if (!success_status) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_STATUS, true, hdr);
+		return;
+	}
+
+	/* First-reply-wins (S3 RC-A): a wire reply that already landed for this
+	 * attempt owns the slot reply fields (the requester may be consuming
+	 * them without the lock).  Clean up the direct target without touching
+	 * them; the landed reply is the outcome. */
+	if (slot->reply_received) {
+		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_TIMEOUT, false, NULL);
 		return;
 	}
 
@@ -5313,6 +5394,23 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		if (slot->in_use && slot->request_id == hdr->request_id) {
 			int32 fwd_master;
 			bool authorized = false;
+
+			/*
+			 * First-reply-wins (S3 RC-A).  Duplicate replies for the same
+			 * armed attempt are protocol-normal (dedup CACHED_REPLY resend
+			 * after a requester retransmit, FORWARDED re-forward), but the
+			 * requester consumes reply_header/reply_block_data WITHOUT this
+			 * lock once it has observed reply_received under it — the slot
+			 * reply fields are immutable from reply_received=true until the
+			 * owner rearms the slot.  Overwriting here mid-consume tears the
+			 * 8KB image under the CRC32C verify and surfaces a false
+			 * DENIED_CHECKSUM_FAIL (the S3 loopback "CRC verify reject").
+			 */
+			if (slot->reply_received) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+				LWLockRelease(&blk->lock.lock);
+				return;
+			}
 
 			if (slot->direct_state == GCS_BLOCK_DIRECT_ARMED
 				|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED
@@ -6007,19 +6105,58 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 
 	/* Claim and stamp the broadcast slot as one critical section.  ACK
 	 * validation reads the same identity under this lock, so a late ACK from
-	 * an older broadcast cannot match a newly claimed slot by request_id alone. */
-	LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
-	if (pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id) != 0) {
-		LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
-		cluster_xp_abort(&xp_inv); /* PGRAC: spec-5.59 — slot busy, no sample */
-		return false;
+	 * an older broadcast cannot match a newly claimed slot by request_id alone.
+	 *
+	 * The slot is a node-wide singleton, and every caller of this blocking
+	 * variant runs in BACKEND context (the LMON/LMS dispatch paths use the
+	 * nowait fan-out instead), so a busy slot must be WAITED OUT, not failed
+	 * instantly:  two concurrent local S->X upgrades — even on unrelated
+	 * blocks — collide here, and the pre-wait behavior surfaced the loser as
+	 * a spurious "S->X upgrade invalidate did not complete" ERROR (the
+	 * S3-observed low-concurrency failure class).  Bound the wait by the
+	 * same ACK-collection budget;  a genuine exhaustion still returns false. */
+	{
+		TimestampTz claim_deadline
+			= GetCurrentTimestamp() + (TimestampTz)timeout_ms * (TimestampTz)1000;
+		bool claimed = false;
+
+		ConditionVariablePrepareToSleep(&ClusterGcsBlock->invalidate_broadcast_cv);
+		for (;;) {
+			TimestampTz now;
+			long remaining_ms;
+
+			LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id) == 0) {
+				ClusterGcsBlock->invalidate_broadcast_epoch = current_epoch;
+				ClusterGcsBlock->invalidate_broadcast_tag = req->tag;
+				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, holders_bm);
+				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+				pg_atomic_write_u64(&ClusterGcsBlock->invalidate_broadcast_request_id,
+									req->request_id);
+				LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+				claimed = true;
+				break;
+			}
+			LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+
+			CHECK_FOR_INTERRUPTS();
+			now = GetCurrentTimestamp();
+			if (now >= claim_deadline)
+				break;
+			remaining_ms = (long)((claim_deadline - now) / 1000);
+			if (remaining_ms <= 0)
+				remaining_ms = 1;
+			(void)ConditionVariableTimedSleep(&ClusterGcsBlock->invalidate_broadcast_cv,
+											  remaining_ms,
+											  WAIT_EVENT_GCS_BLOCK_INVALIDATE_ACK_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (!claimed) {
+			cluster_xp_abort(&xp_inv); /* PGRAC: spec-5.59 — slot busy, no sample */
+			return false;
+		}
 	}
-	ClusterGcsBlock->invalidate_broadcast_epoch = current_epoch;
-	ClusterGcsBlock->invalidate_broadcast_tag = req->tag;
-	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, holders_bm);
-	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
-	pg_atomic_write_u64(&ClusterGcsBlock->invalidate_broadcast_request_id, req->request_id);
-	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 
 	/* Build and dispatch INVALIDATE to each holder bit. */
 	memset(&inv, 0, sizeof(inv));
@@ -6067,7 +6204,10 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	}
 	ConditionVariableCancelSleep();
 
-	/* Release the slot. */
+	/* Release the slot.  Broadcast the CV afterwards: concurrent claimants
+	 * sleep on the same invalidate_broadcast_cv (see the bounded claim-wait
+	 * above), so the release must wake them or they only recheck on their
+	 * timeout slices. */
 	LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
 	pg_atomic_write_u64(&ClusterGcsBlock->invalidate_broadcast_request_id, 0);
 	ClusterGcsBlock->invalidate_broadcast_epoch = 0;
@@ -6076,6 +6216,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, 0);
 	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
 	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+	ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
 
 	cluster_xp_end(&xp_inv); /* PGRAC: spec-5.59 D2 */
 	return full_ack;
