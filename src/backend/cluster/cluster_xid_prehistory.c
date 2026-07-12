@@ -46,8 +46,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/clog.h"		 /* GCS-race round-2 RC-E: verify reads through the
+							 * SLRU (TransactionIdGetStatus) and repairs holes
+							 * with ClusterClogAdoptNativeStatus */
+#include "access/transam.h"		 /* ShmemVariableCache->oldestXid */
+#include "cluster/cluster_cr.h"	 /* native-prehistory coverage latch */
 #include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_xid_authority.h"
+#include "cluster/cluster_xid_stripe.h" /* cluster_xid_widen (review F1) */
 #include "storage/fd.h"
 
 /*
@@ -453,6 +459,248 @@ cluster_xid_prehistory_was_adopted(void)
 }
 
 /* ============================================================
+ * Post-recovery coverage verify + latch (GCS-race round-2 RC-E).
+ * ============================================================ */
+
+/*
+ * cluster_xid_native_prehistory_provable_full -- pure judge: is `xid`
+ * provably a native-era transaction whose outcome the local adopted CLOG
+ * answers alias-free?
+ *
+ * Three conditions, each fail-closed on doubt:
+ *	 covered_hw_full != 0	the post-recovery verify proved local pg_xact ==
+ *							sealed blob over the whole surviving native range
+ *							THIS boot (0 = not proven -> never route).
+ *	 widen succeeds			the bare 32-bit tuple value is given its full
+ *							64-bit identity in the signed +/- 2^31 window
+ *							around the live counter (cluster_xid_widen) -- a
+ *							bare compare with a "no wraparound yet" sentinel
+ *							misjudges both halfspaces near an epoch boundary
+ *							(review F1): a counter one shy of 2^32 makes a
+ *							small value the NEXT epoch's upcoming allocation,
+ *							not native prehistory.  Widen failure (special
+ *							value, invalid counter, behind-window underflow)
+ *							stays unprovable.
+ *	 widened < native_hw	cluster-era xids start at the stripe activation
+ *							floor, which is >= the native high-water, so a
+ *							full identity below hw cannot have been allocated
+ *							by any cluster-era writer (wrapped identities
+ *							carry their epoch and compare above every epoch-0
+ *							hw by construction).
+ */
+bool
+cluster_xid_native_prehistory_provable_full(uint64 next_full_xid, uint64 covered_hw_full,
+											TransactionId xid)
+{
+	FullTransactionId widened;
+
+	if (covered_hw_full == 0)
+		return false;
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	widened = cluster_xid_widen(xid, FullTransactionIdFromU64(next_full_xid));
+	if (!FullTransactionIdIsValid(widened))
+		return false;
+	return U64FromFullTransactionId(widened) < covered_hw_full;
+}
+
+/*
+ * cluster_xid_prehistory_verify_native_coverage -- StartupXLOG-tail boot
+ * latch: prove local CLOG == sealed native prehistory, repair legitimate
+ * replay-wiped holes, and only then enable native-era LOCAL routing.
+ *
+ * Runs in the startup process after redo (all boots, recovery or not),
+ * before backends are admitted.  Reads the local side THROUGH the SLRU
+ * (TransactionIdGetStatus), so no CLOG flush-timing assumption is made; the
+ * blob side is the CRC-validated whole image (primary then .bak).
+ *
+ * Verdicts per xid in [max(oldestXid, FirstNormal), native_hw):
+ *	 SUB_COMMITTED either side -> latch REJECTED (WARNING, return unlatched):
+ *								  the prehistory carries no child->parent map,
+ *								  so a sub-committed bit can never be proven
+ *								  resolved or crash-aborted (review F2 /
+ *								  calibration 1).  Both lineages can carry it
+ *								  legitimately after a native-era crash mid
+ *								  subcommit, so this is unprovable, NOT
+ *								  divergent -- degrade to 53R97, never FATAL.
+ *	 equal                     -> ok.  This includes IN_PROGRESS ==
+ *								  IN_PROGRESS: the seal itself is the proof
+ *								  (a true shutdown checkpoint seals only with
+ *								  zero prepared and zero active xacts), so a
+ *								  sealed in-progress bit is crash-aborted
+ *								  forever -- no future can resolve it.
+ *	 local IN_PROGRESS, blob
+ *	 terminal                  -> repairable hole: a base-backup boot adopts
+ *								  the blob into pg_xact files BEFORE redo, and
+ *								  replaying the backup window's CLOG-extend
+ *								  records legitimately re-zeroes pages the
+ *								  adopt had filled.  Repair through the SLRU
+ *								  and continue.
+ *	 any other mismatch        -> FATAL: the node's own CLOG claims a
+ *								  DIFFERENT outcome than the sealed history --
+ *								  a divergent lineage the bootstrap prefix
+ *								  check could not see (same class as review F2
+ *								  / t/361 N5), never maskable.
+ *
+ * Every skip leg (authority unsealed/absent, over-cap era, native range
+ * frozen away, blob unreadable) leaves the latch at 0: the resolver simply
+ * keeps today's fail-closed 53R97 for below-floor xids -- degraded, never
+ * wrong.
+ */
+void
+cluster_xid_prehistory_verify_native_coverage(void)
+{
+	ClusterXidAuthorityHeader auth;
+	bool from_bak = false;
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char page[BLCKSZ];
+	const char *src_path = NULL;
+	ClusterXidPrehistoryHeader hdr;
+	uint32 pages = 0;
+	uint32 p;
+	uint64 oldest;
+	uint64 repaired = 0;
+	int src;
+
+	if (!cluster_shared_catalog || !cluster_enabled)
+		return;
+	if (!cluster_xid_authority_read_checked(&auth, &from_bak))
+		return; /* bootstrap already vetted presence; stay unlatched */
+
+	/*
+	 * NATIVE_RAW_REUSED boot gate (round-3 P0-1): once the wrap barrier has
+	 * stamped the authority, some node has (or is about to have) allocated
+	 * epoch>=1 xids, so a raw 32-bit value below the native high-water is no
+	 * longer an alias-free native-era identity ANYWHERE in the cluster --
+	 * even on a node whose own counter still reads epoch 0 (herding lag).
+	 * Permanent skip leg: mirror the flag into the one-way shmem disable and
+	 * never latch again (below-hw recycled refs stay fail-closed 53R97).
+	 */
+	if (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) {
+		cluster_cr_native_prehistory_disable();
+		elog(LOG, "cluster shared_catalog: native raw xid space has been reused by a later "
+				  "epoch; prehistory coverage latch is permanently off");
+		return;
+	}
+
+	if ((auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0 || auth.native_hw_full == 0)
+		return;
+	if (cluster_xid_prehistory_payload_bytes(auth.native_hw_full) == 0)
+		return; /* over-cap era publishes nothing: never latched */
+
+	/*
+	 * Epoch gate (round-2 review F3): past an xid epoch rollover the local
+	 * pg_xact positions below the native high-water belong to cluster-era
+	 * xids -- "repairing" them from the blob would corrupt live outcomes,
+	 * and a latch would prove nothing (the resolver's widen judge already
+	 * rejects every bare value there).  Runs post-redo, so the counter is
+	 * the recovered cluster truth.  Skip leg: latch stays off, 53R97.
+	 */
+	if (U64FromFullTransactionId(ReadNextFullTransactionId()) > (uint64)PG_UINT32_MAX) {
+		elog(LOG, "cluster shared_catalog: xid epoch advanced past the native era; "
+				  "prehistory coverage latch stays off");
+		return;
+	}
+
+	oldest = (uint64)ShmemVariableCache->oldestXid;
+	if (oldest < (uint64)FirstNormalTransactionId)
+		oldest = (uint64)FirstNormalTransactionId;
+	if (oldest >= auth.native_hw_full)
+		return; /* native range frozen + truncated away: nothing to prove */
+
+	if (!build_path(primary, sizeof(primary), CLUSTER_XID_PREHISTORY_REL_PATH)
+		|| !build_path(bak, sizeof(bak), CLUSTER_XID_PREHISTORY_BAK_REL_PATH))
+		return;
+	if (verify_blob(primary, auth.native_hw_full, &pages))
+		src_path = primary;
+	else if (verify_blob(bak, auth.native_hw_full, &pages))
+		src_path = bak;
+	else {
+		ereport(WARNING,
+				(errmsg("shared XID prehistory is unreadable for the post-recovery coverage "
+						"verify; native-era xids will fail closed on this node"),
+				 errhint("Restore \"%s\" (or its .bak) under cluster.shared_data_dir to "
+						 "re-enable native-era local CLOG routing.",
+						 CLUSTER_XID_PREHISTORY_REL_PATH)));
+		return;
+	}
+
+	src = OpenTransientFile(src_path, O_RDONLY | PG_BINARY);
+	if (src < 0 || read(src, &hdr, sizeof(hdr)) != sizeof(hdr))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						errmsg("could not re-open shared XID prehistory \"%s\": %m", src_path)));
+
+	for (p = 0; p < pages; p++) {
+		uint64 page_first = (uint64)p * PREHISTORY_XACTS_PER_PAGE;
+		uint64 lo;
+		uint64 hi;
+		uint64 x;
+
+		if (read(src, page, BLCKSZ) != BLCKSZ)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("short read of shared XID prehistory \"%s\" page %u", src_path, p)));
+
+		lo = Max(oldest, page_first);
+		hi = Min(auth.native_hw_full, page_first + PREHISTORY_XACTS_PER_PAGE);
+		for (x = lo; x < hi; x++) {
+			uint32 idx = (uint32)(x - page_first);
+			int blob_status = (page[idx / 4] >> ((idx % 4) * 2)) & 0x03;
+			XLogRecPtr lsn;
+			int local_status = (int)TransactionIdGetStatus((TransactionId)x, &lsn);
+
+			/*
+			 * SUB_COMMITTED on either side: unprovable, reject the latch
+			 * (review F2 / calibration 1) -- see the verdict table above.
+			 */
+			if (blob_status == TRANSACTION_STATUS_SUB_COMMITTED
+				|| local_status == TRANSACTION_STATUS_SUB_COMMITTED) {
+				CloseTransientFile(src);
+				ereport(WARNING,
+						(errmsg("native-era xid " UINT64_FORMAT " is sub-committed (local %d, "
+								"sealed blob %d); coverage cannot be proven, native-era xids "
+								"will fail closed on this node",
+								x, local_status, blob_status),
+						 errhint("The native era crashed mid-subcommit; its sub-transaction "
+								 "outcomes are unresolvable from the sealed prehistory.")));
+				return;
+			}
+			if (local_status == blob_status)
+				continue;
+			if (local_status == TRANSACTION_STATUS_IN_PROGRESS) {
+				ClusterClogAdoptNativeStatus((TransactionId)x, (XidStatus)blob_status);
+				repaired++;
+				continue;
+			}
+			CloseTransientFile(src);
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("local pg_xact contradicts the sealed native-era prehistory after "
+							"recovery"),
+					 errdetail("xid " UINT64_FORMAT " is %d locally but %d in the sealed blob; "
+							   "divergent native-era lineage.",
+							   x, local_status, blob_status),
+					 errhint("This node is not a clone of the seed lineage; destroy and "
+							 "re-provision it from the shared tree.")));
+		}
+	}
+	CloseTransientFile(src);
+
+	if (repaired > 0)
+		elog(LOG,
+			 "cluster shared_catalog: repaired " UINT64_FORMAT " native-era pg_xact statuses "
+			 "wiped by backup-window replay",
+			 repaired);
+
+	cluster_cr_native_prehistory_latch(auth.native_hw_full);
+	elog(LOG,
+		 "cluster shared_catalog: native XID prehistory coverage verified through " UINT64_FORMAT
+		 "; native-era local CLOG routing enabled",
+		 auth.native_hw_full);
+}
+
+/* ============================================================
  * Divergent-lineage guard (review F2; spec Q6 amendment).
  * ============================================================ */
 
@@ -647,4 +895,89 @@ cluster_xid_prehistory_prefix_check(const char *local_pgdata, uint64 native_hw_f
 	}
 	CloseTransientFile(src);
 	return CLUSTER_XID_PREFIX_CONSISTENT;
+}
+
+/* ============================================================
+ * Pre-migrate xid epoch witness (round-2 review F3).
+ * ============================================================ */
+
+/*
+ * cluster_xid_epoch_witness_write -- durably persist this node's own
+ * pre-migration nextFullXid under local_pgdata.  See the header for why
+ * this must happen BEFORE the shared-authority symlink flip.  tmp + fsync
+ * + durable_rename keeps it torn-safe; rewriting on a crash-retry of the
+ * migrate arm is idempotent (the local control file is still real there).
+ */
+bool
+cluster_xid_epoch_witness_write(const char *local_pgdata, uint64 next_full_xid)
+{
+	ClusterXidEpochWitness w;
+	char tmp[MAXPGPATH];
+	char final[MAXPGPATH];
+	pg_crc32c crc;
+	int fd;
+
+	if (snprintf(final, sizeof(final), "%s/%s", local_pgdata, CLUSTER_XID_EPOCH_WITNESS_REL_PATH)
+			>= (int)sizeof(final)
+		|| snprintf(tmp, sizeof(tmp), "%s/%s", local_pgdata, CLUSTER_XID_EPOCH_WITNESS_TMP_REL_PATH)
+			   >= (int)sizeof(tmp))
+		return false;
+
+	memset(&w, 0, sizeof(w));
+	w.magic = CLUSTER_PGXW_MAGIC;
+	w.version = CLUSTER_PGXW_VERSION;
+	w.next_full_xid = next_full_xid;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &w, offsetof(ClusterXidEpochWitness, crc));
+	FIN_CRC32C(crc);
+	w.crc = crc;
+
+	fd = OpenTransientFile(tmp, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+		return false;
+	if (write(fd, &w, sizeof(w)) != (ssize_t)sizeof(w) || pg_fsync(fd) != 0) {
+		CloseTransientFile(fd);
+		unlink(tmp);
+		return false;
+	}
+	if (CloseTransientFile(fd) != 0)
+		return false;
+	if (durable_rename(tmp, final, LOG) != 0)
+		return false;
+	return true;
+}
+
+/*
+ * cluster_xid_epoch_witness_read -- read the witness back; every doubt leg
+ * (absent, short, bad magic/version/CRC) returns false.
+ */
+bool
+cluster_xid_epoch_witness_read(const char *local_pgdata, uint64 *next_full_xid)
+{
+	ClusterXidEpochWitness w;
+	char path[MAXPGPATH];
+	pg_crc32c crc;
+	int fd;
+	int r;
+
+	if (snprintf(path, sizeof(path), "%s/%s", local_pgdata, CLUSTER_XID_EPOCH_WITNESS_REL_PATH)
+		>= (int)sizeof(path))
+		return false;
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		return false;
+	r = (int)read(fd, &w, sizeof(w));
+	CloseTransientFile(fd);
+	if (r != (int)sizeof(w))
+		return false;
+	if (w.magic != CLUSTER_PGXW_MAGIC || w.version != CLUSTER_PGXW_VERSION)
+		return false;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &w, offsetof(ClusterXidEpochWitness, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, w.crc))
+		return false;
+	*next_full_xid = w.next_full_xid;
+	return true;
 }

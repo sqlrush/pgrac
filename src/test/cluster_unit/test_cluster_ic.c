@@ -88,6 +88,9 @@ int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 /* spec-2.2 additive amendment (spec-5.22e D5 prereq): test-only old-binary
  * simulation gate consumed by cluster_ic.c::cluster_ic_build_hello. */
 bool cluster_ic_suppress_caps_reply = false;
+/* GCS-race round-2 RC-F mixed-version leg: same discipline for the
+ * GCS_DONE_V1 completion-proof capability bit. */
+bool cluster_ic_suppress_gcs_done_cap = false;
 
 /* spec-5.59 D1 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -589,8 +592,10 @@ UT_TEST(test_hello_wire_reference_bytes)
 		UT_ASSERT_EQ(wire[i], 0);
 	/* capability bitmap: the unconditional protocol bits -- D4-6
 	 * authority-serve (0x2) + spec-5.22e D5-2 undo-horizon (0x4) +
-	 * CAPS_REPLY_V1 meta bit (0x8) (smart-fusion is off in this fixture) */
-	UT_ASSERT_EQ(wire[36], 0x0E);
+	 * CAPS_REPLY_V1 meta bit (0x8) + GCS-race round-2 F6 completion-proof
+	 * (0x10) + round-3 P0-1 xid wrap barrier (0x20) (smart-fusion is off
+	 * in this fixture) */
+	UT_ASSERT_EQ(wire[36], 0x3E);
 	UT_ASSERT_EQ(wire[37], 0x00);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
@@ -684,9 +689,10 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
-															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
-															 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
+				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
+					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -694,9 +700,10 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-tier-mismatch", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
-															 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
-															 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
+				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
+					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -707,7 +714,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
 				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
 					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
-					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1);
+					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1
+					 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
@@ -750,6 +758,46 @@ UT_TEST(test_hello_caps_reply_meta_gate)
 	cluster_ic_suppress_caps_reply = false;
 }
 
+/*
+ * GCS-race round-2 RC-F mixed-version leg + round-3 P0-1: the GCS_DONE_V1
+ * bit yields to its test-only old-binary simulation GUC (same discipline as
+ * the CAPS_REPLY_V1 gate above), while the wrap-barrier bit stays
+ * unconditional; both wire ids are frozen protocol constants.
+ */
+UT_TEST(test_hello_gcs_done_and_wrap_barrier_gates)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_DONE_V1, (uint32)0x00000010U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1, (uint32)0x00000020U);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_DONE, 38);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_XID_NATIVE_DISABLE, 39);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_XID_NATIVE_DISABLE_ACK, 40);
+
+	/* default: both bits advertised */
+	cluster_ic_suppress_gcs_done_cap = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "done-on", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_GCS_DONE_V1) != 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1)
+			  != 0);
+
+	/* suppressed (old-binary simulation): DONE bit absent, the other
+	 * protocol bits untouched */
+	cluster_ic_suppress_gcs_done_cap = true;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "done-off", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_GCS_DONE_V1) == 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1)
+			  != 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) != 0);
+
+	cluster_ic_suppress_gcs_done_cap = false;
+}
+
 UT_TEST(test_hello_parse_rejects_bad_magic)
 {
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
@@ -789,7 +837,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(22); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(23); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -813,6 +861,7 @@ main(void)
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
 	UT_RUN(test_hello_caps_reply_meta_gate);
+	UT_RUN(test_hello_gcs_done_and_wrap_barrier_gates);
 	UT_RUN(test_hello_parse_rejects_bad_magic);
 	UT_RUN(test_hello_build_truncates_long_name);
 	UT_DONE();

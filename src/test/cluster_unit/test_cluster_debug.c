@@ -1157,6 +1157,38 @@ cluster_gcs_get_block_stale_reply_drop_count(void)
 	return 0;
 }
 
+/* GCS-race round-2 RC-F stubs: 3 NEW DONE completion-proof counters. */
+uint64
+cluster_gcs_get_block_done_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_done_marked_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_done_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_hint_violation_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_legacy_pin_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_done_enqueue_drop_count(void)
+{
+	return 0;
+}
+
 /* spec-2.35 D12 stubs: 7 NEW CF 2-way protocol counter accessors. */
 uint64
 cluster_gcs_get_block_forward_sent_count(void)
@@ -1959,6 +1991,28 @@ cluster_cr_server_fence_refused_count(void)
 }
 uint64
 cluster_rtvis_underivable_failclosed_count(void)
+{
+	return 0;
+}
+/* GCS-race round-2 RC-E: native-prehistory coverage latch + LOCAL counter. */
+uint64
+cluster_cr_native_prehistory_covered_hw(void)
+{
+	return 0;
+}
+/* GCS-race round-3 P0-1: wrap-barrier dump faces. */
+bool
+cluster_cr_native_prehistory_disabled(void)
+{
+	return false;
+}
+bool
+cluster_xid_wrap_barrier_passed(void)
+{
+	return false;
+}
+uint64
+cluster_rtvis_native_prehistory_local_count(void)
 {
 	return 0;
 }

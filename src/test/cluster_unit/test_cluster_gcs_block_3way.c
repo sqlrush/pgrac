@@ -236,6 +236,11 @@ UT_TEST(test_s_barrier_set_pending_x_prototype_linkable)
 UT_TEST(test_s_barrier_clear_pending_x_prototype_linkable)
 {
 	void (*fp)(BufferTag) = &cluster_pcm_lock_clear_pending_x;
+	/* round-2 additional hardening: the identity-safe variant is linkable
+	 * with the compare-and-clear prototype. */
+	bool (*fp_if)(BufferTag, int32) = &cluster_pcm_lock_clear_pending_x_if;
+
+	UT_ASSERT(fp_if != NULL);
 
 	UT_ASSERT(fp != NULL);
 }

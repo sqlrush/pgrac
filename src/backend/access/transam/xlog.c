@@ -202,6 +202,7 @@
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
+#include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
@@ -6244,6 +6245,28 @@ StartupXLOG(void)
 	 * No-op unless this startup acquired the claim.
 	 */
 	cluster_recovery_merge_claim_release_if_held();
+
+	/*
+	 * PGRAC (GCS-race round-2 RC-E): with redo complete and the CLOG SLRU
+	 * trimmed, prove that local pg_xact matches the sealed native-era
+	 * prehistory over the surviving native range, repairing holes that the
+	 * backup-window replay legitimately re-zeroed.  Only this verify may
+	 * latch the coverage high-water that lets the visibility resolver route
+	 * a provably-native below-floor xid to the local adopted CLOG instead
+	 * of failing closed (53R97).  Skip legs leave the latch unset -- never
+	 * wrong, at worst degraded to today's fail-closed behaviour.
+	 */
+	cluster_xid_prehistory_verify_native_coverage();
+
+	/*
+	 * PGRAC (GCS-race round-3 P0-1): mirror a durable NATIVE_RAW_REUSED
+	 * stamp into shmem BEFORE backends are admitted -- a stamped authority
+	 * disables the coverage latch outright, and an already-wrapped counter
+	 * takes the allocation-gate boot shortcut (the first carry was gated,
+	 * so "every latch off" is a permanent global fact).  Must run after
+	 * the verify above so a same-boot latch can never outlive the mirror.
+	 */
+	cluster_xid_wrap_barrier_startup_init();
 #endif
 
 	/*
@@ -7607,6 +7630,15 @@ CreateCheckPoint(int flags)
 	 *   the refusal still lands fail-closed on every joiner (53RB5,
 	 *   authority unsealed), but the seed itself can shut down cleanly
 	 *   instead of wedging every later shutdown/boot in a FATAL loop.
+	 *
+	 * The seal is also a PROOF (round-2 review F2): the coverage verify
+	 * latches a blob-IN_PROGRESS == local-IN_PROGRESS xid as "crash-aborted
+	 * forever, never resolvable" on the strength of the seal alone.  That
+	 * holds only when the sealing shutdown can prove no in-progress bit has
+	 * a future: a PREPARED transaction survives clean shutdown as an
+	 * in-progress CLOG bit that COMMIT PREPARED may later flip, and any
+	 * still-active xact makes the image non-final.  Either condition skips
+	 * the seal (WARNING, joiners fail closed) instead of publishing a lie.
 	 */
 	if (shutdown && !(flags & CHECKPOINT_END_OF_RECOVERY)
 		&& cluster_shared_catalog && !cluster_enabled)
@@ -7621,6 +7653,23 @@ CreateCheckPoint(int flags)
 							   checkPoint.nextMulti, FirstMultiXactId),
 					 errhint("Joiners will fail closed (53RB5); recreate the seed without "
 							 "MultiXact-producing operations, or move the load in-protocol.")));
+		else if (GetNumberOfPreparedTransactions() > 0)
+			ereport(WARNING,
+					(errmsg("prepared transactions survive this shutdown; "
+							"leaving the shared XID authority unsealed"),
+					 errdetail("A sealed native-era history must prove every in-progress "
+							   "xid crash-aborted, but %d prepared transaction(s) may still "
+							   "commit or abort later.",
+							   GetNumberOfPreparedTransactions()),
+					 errhint("Joiners will fail closed (53RB5); resolve them with "
+							 "COMMIT PREPARED or ROLLBACK PREPARED and shut down cleanly again.")));
+		else if (TransactionIdPrecedes(GetOldestActiveTransactionId(),
+									   XidFromFullTransactionId(checkPoint.nextXid)))
+			ereport(WARNING,
+					(errmsg("active transactions survive this shutdown checkpoint; "
+							"leaving the shared XID authority unsealed"),
+					 errhint("Joiners will fail closed (53RB5); shut the seed down cleanly "
+							 "with no concurrent activity to seal the native era.")));
 		else if (cluster_xid_prehistory_payload_bytes(native_hw) == 0)
 			ereport(WARNING,
 					(errmsg("native-era xid high-water %llu is outside the prehistory publish "

@@ -176,6 +176,9 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 retransmit_exhausted_count;
 	pg_atomic_uint64 epoch_invalidate_wake_count;
 	pg_atomic_uint64 stale_reply_drop_count;
+	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
+	pg_atomic_uint64 done_sent_count;
+	pg_atomic_uint64 done_enqueue_drop_count; /* review F7: outbound ring full */
 	/* PGRAC: spec-2.35 D12 — 7 NEW counters for CF 2-way protocol. */
 	pg_atomic_uint64 block_forward_sent_count;	   /* master→holder FORWARD emitted */
 	pg_atomic_uint64 block_forward_received_count; /* holder received FORWARD */
@@ -447,6 +450,8 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->retransmit_exhausted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->epoch_invalidate_wake_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_received_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_from_holder_ship_count, 0);
@@ -1414,6 +1419,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	int retry_attempt;
 	int max_retries;
 	int current_master;
+	/* GCS-race round-2 review F4: the accepted attempt's identity, captured
+	 * BEFORE gcs_block_release_slot zeroes the slot (use-after-release). */
+	uint64 done_request_epoch = 0;
+	int32 done_master_node = -1;
 	/* PGRAC: spec-5.59 D2/D3/D4 — requester-wait + index-overlay scopes. */
 	ClusterXpScope xp_req;
 	ClusterXpScope xp_idx;
@@ -1531,6 +1540,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			/* spec-5.2a D1/D2: mark a deliberately-clean (sequence-refill) X
 			 * request so the master takes the clean-page X-transfer path. */
 			GcsBlockRequestPayloadSetCleanEligible(&payload, clean_eligible);
+			/* GCS-race round-2 RC-F: carry THIS requester's legal-request
+			 * lifetime so the master pins the dedup entry TTL to the wire
+			 * truth at registration (never to its own later GUC reads). */
+			GcsBlockRequestPayloadSetLifetimeHintMs(
+				&payload,
+				cluster_gcs_block_dedup_lifetime_ms(cluster_gcs_block_retransmit_initial_backoff_ms,
+													cluster_gcs_block_retransmit_max_retries,
+													cluster_gcs_reply_timeout_ms));
 
 			/* PGRAC: spec-2.34 HC100 — install the next attempt identity
 			 * and clear any previous reply in a single critical section.
@@ -2050,6 +2067,18 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	}
 	PG_END_TRY();
 
+	/*
+	 * GCS-race round-2 review F4: capture the accepted attempt's identity
+	 * BEFORE the release -- gcs_block_release_slot zeroes request_epoch and
+	 * expected_master_node, so the DONE funnel below reading the slot was a
+	 * use-after-release that stamped epoch 0 (never matching the master's
+	 * dedup key).  expected_master_node is the node the accepted attempt's
+	 * REQUEST was sent to -- the dedup entry's owner (the reply's sender
+	 * can legitimately be a forwarding holder instead).
+	 */
+	done_request_epoch = slot->request_epoch;
+	done_master_node = slot->expected_master_node;
+
 	gcs_block_release_slot(slot);
 
 	/*
@@ -2081,8 +2110,48 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	 * histogram (GRANTED / STORAGE_FALLBACK / READ_IMAGE all delivered a
 	 * usable page;  the terminal-denied tail below ereports and loses the
 	 * sample, mirroring the xp scopes). */
-	if (granted || granted_storage_fallback || read_image)
+	if (granted || granted_storage_fallback || read_image) {
 		gcs_block_ship_hist_record(ship_started_at);
+
+		/*
+		 * PGRAC: GCS-race round-2 RC-F — completion proof.  The terminal
+		 * reply was verified and consumed, so no retransmit of this
+		 * request can ever fire again from this backend; tell the master
+		 * so it can retire the dedup entry within its short done-linger
+		 * quarantine instead of holding the 8KB slot for the full pinned
+		 * lifetime.  Best-effort: enqueue failure or wire loss simply
+		 * leaves the TTL backstop in charge.  The identity is the accepted
+		 * attempt's REQUEST epoch + target master, captured before the
+		 * slot release above (review F4) — the master's dedup key was
+		 * built from req->epoch.
+		 *
+		 * Review F6 capability gate: only a peer that advertised
+		 * GCS_DONE_V1 registers the DONE msg_type — sending it to an old
+		 * binary would make the peer close the connection.  No capability
+		 * -> no send, the pinned TTL stays in charge.  Review F7: a full
+		 * outbound ring is COUNTED (done_enqueue_drop_count), never
+		 * silent.
+		 */
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-done-drop");
+		if (!cluster_ic_suppress_gcs_done_cap /* test-only old-binary sim */
+			&& cluster_sf_peer_supports_gcs_done(done_master_node)
+			&& !cluster_injection_should_skip("cluster-gcs-block-done-drop")) {
+			GcsBlockDonePayload done;
+
+			memset(&done, 0, sizeof(done));
+			done.request_id = request_id;
+			done.epoch = done_request_epoch;
+			done.tag = tag;
+			done.sender_node = cluster_node_id;
+			done.requester_backend_id = (int32)MyBackendId;
+			done.transition_id = (uint8)transition_id;
+			if (cluster_grd_outbound_enqueue_backend_msg(
+					PGRAC_IC_MSG_GCS_BLOCK_DONE, (uint32)done_master_node, &done, sizeof(done)))
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_sent_count, 1);
+			else
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_enqueue_drop_count, 1);
+		}
+	}
 
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
@@ -3839,8 +3908,10 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.cluster_epoch = req->epoch;
 	memset(&cached_entry, 0, sizeof(cached_entry));
 
-	dr = cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
-													req->transition_id, &cached_entry);
+	dr = cluster_gcs_block_dedup_lookup_or_register(
+		dedup_worker_id, &key, req->tag, req->transition_id,
+		GcsBlockRequestPayloadGetLifetimeHintMs(req),
+		cluster_sf_peer_supports_gcs_done(req->sender_node), &cached_entry);
 	switch (dr) {
 	case GCS_BLOCK_DEDUP_CACHED_REPLY:
 		gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
@@ -4263,7 +4334,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 * barriered (HG3).  Covers an N→X/S→X re-request from the node
 			 * that already holds X. */
 			if (x_holder == req->sender_node) {
-				cluster_pcm_lock_clear_pending_x(req->tag);
+				(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
 				status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
 				page_lsn = InvalidXLogRecPtr;
@@ -4276,13 +4347,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				uint64 current_epoch = cluster_epoch_get_current();
 
 				if (req->epoch < current_epoch) {
-					cluster_pcm_lock_clear_pending_x(req->tag);
+					(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 					gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_EPOCH_STALE,
 										 InvalidXLogRecPtr, NULL);
 					return;
 				}
 				if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
-					cluster_pcm_lock_clear_pending_x(req->tag);
+					(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 					/* The direct-land deny asks the requester to retry with
 					 * direct-land suppressed — same (request_id, epoch) key,
 					 * so drop the in-flight dedup entry or the retry is
@@ -4329,13 +4400,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 														  &fwd_hdr, NULL);
 					return;
 				}
-				cluster_pcm_lock_clear_pending_x(req->tag);
+				(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 				status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 				page_lsn = InvalidXLogRecPtr;
 				block_payload = NULL;
 				goto build_and_send_reply;
 			}
-			cluster_pcm_lock_clear_pending_x(req->tag);
+			(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 			status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 			page_lsn = InvalidXLogRecPtr;
 			block_payload = NULL;
@@ -4468,7 +4539,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					block_payload = NULL;
 				}
 				gcs_block_broadcast_invalidate_nowait(req, holders_bm);
-				cluster_pcm_lock_clear_pending_x(req->tag);
+				(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 				/* Release the IN_FLIGHT dedup entry BEFORE the deny goes out:
 				 * the convergence this reply promises ("a following retry
 				 * finds no remote holder left and grants") only works if the
@@ -4485,6 +4556,33 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			}
 
 			/*
+			 * GCS-race round-2 additional hardening: exact-epoch recheck
+			 * before EITHER holders-cleared grant leg below.  The invalidate
+			 * round-trips above span reconfiguration windows; granting X to
+			 * a stale-epoch request would hand out ownership computed from a
+			 * bitmap a newer epoch's rebuild may have re-seeded.  Same deny
+			 * idiom as the X-branch forward leg (HC73 recheck), incl. the
+			 * dedup release (the epoch-bumped retry uses a NEW key; the old
+			 * in-flight entry would only waste a slot until the sweep).
+			 */
+			{
+				uint64 grant_epoch = cluster_epoch_get_current();
+
+				if (req->epoch < grant_epoch) {
+					if (xvs_b2_captured) {
+						gcs_block_release_ship_image(block_payload_release_cb,
+													 block_payload_release_arg);
+						block_payload = NULL;
+					}
+					(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
+					cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
+					gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_EPOCH_STALE,
+										 InvalidXLogRecPtr, NULL);
+					return;
+				}
+			}
+
+			/*
 			 * PGRAC: spec-4.7a D3 — explicit X grant to the upgrading S holder.
 			 * After the OTHER S holders are invalidated the requester is the
 			 * sole remaining S holder, so S→X_UPGRADE is now legal:  apply it
@@ -4498,7 +4596,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (requester_is_s_holder
 				&& cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_X_UPGRADE,
 														 req->sender_node)) {
-				cluster_pcm_lock_clear_pending_x(req->tag);
+				(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
 				status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
 				page_lsn = InvalidXLogRecPtr;
@@ -4518,7 +4616,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (!requester_is_s_holder && xvs_b2_captured) {
 				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn,
 												   (SCN)((PageHeader)block_payload)->pd_block_scn);
-				cluster_pcm_lock_clear_pending_x(req->tag);
+				(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count, 1);
 				status = GCS_BLOCK_REPLY_GRANTED;
 				goto build_and_send_reply;
@@ -4779,7 +4877,7 @@ scache_downgraded_fall_through:
 								  &block_payload_lkey, &block_payload_release_cb,
 								  &block_payload_release_arg, &sf_dep_vec, &sf_dep_valid);
 	if (req->transition_id == PCM_TRANS_N_TO_X || req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-		cluster_pcm_lock_clear_pending_x(req->tag);
+		(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 
 	/* PGRAC: spec-2.41 D1 — master-direct ship self-checks lost-write via SCN.
 	 *
@@ -4900,8 +4998,10 @@ build_and_send_reply: {
 		GcsBlockDedupEntry dup_entry;
 
 		memset(&dup_entry, 0, sizeof(dup_entry));
-		if (cluster_gcs_block_dedup_lookup_or_register(dedup_worker_id, &key, req->tag,
-													   req->transition_id, &dup_entry)
+		if (cluster_gcs_block_dedup_lookup_or_register(
+				dedup_worker_id, &key, req->tag, req->transition_id,
+				GcsBlockRequestPayloadGetLifetimeHintMs(req),
+				cluster_sf_peer_supports_gcs_done(req->sender_node), &dup_entry)
 			== GCS_BLOCK_DEDUP_CACHED_REPLY)
 			gcs_block_resend_cached_reply(req->sender_node, &dup_entry);
 	}
@@ -6082,6 +6182,80 @@ static const ClusterICMsgTypeInfo gcs_block_reply_info = {
 	.plane = CLUSTER_IC_PLANE_DATA,
 };
 
+/*
+ * cluster_gcs_handle_block_done_envelope — GCS-race round-2 RC-F: master-side
+ * completion-proof consumer.  Verifies the shard route (mirror of the REQUEST
+ * handler's spec-7.3 D5 guard) and hands the FULL identity to
+ * cluster_gcs_block_dedup_mark_done, which checks key + tag + transition +
+ * COMPLETED under the shard lock.  Every mismatch/miss is counted there and
+ * dropped: DONE is advisory, the entry's pinned TTL remains the backstop, so
+ * this handler never replies and never errors.
+ */
+static void
+cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void *payload)
+{
+	const GcsBlockDonePayload *done;
+	GcsBlockDedupKey key;
+	int dedup_worker_id;
+
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockDonePayload))
+		return;
+	done = (const GcsBlockDonePayload *)payload;
+
+	dedup_worker_id = cluster_ic_tier1_my_data_channel();
+	{
+		int tag_shard = cluster_lms_shard_for_tag(&done->tag, cluster_lms_workers);
+
+		Assert(tag_shard == dedup_worker_id);
+		if (tag_shard != dedup_worker_id) {
+			cluster_gcs_block_dedup_note_misroute();
+			return;
+		}
+	}
+
+	/*
+	 * GCS-race round-2 review F6: bind the wire identity to the transport
+	 * and reject unknown payload bits.  The dedup key's origin node MUST
+	 * be the connection's verified source (a forged sender_node would let
+	 * one node retire another node's entry -> premature reclaim ->
+	 * re-execution), and the reserved pad must be all-zero so a future
+	 * sender cannot smuggle semantics past this validator.  Count + drop;
+	 * DONE stays advisory.
+	 */
+	if (done->sender_node != (int32)env->source_node_id) {
+		cluster_gcs_block_dedup_note_done_mismatch(dedup_worker_id);
+		return;
+	}
+	{
+		int i;
+
+		for (i = 0; i < (int)sizeof(done->reserved_0); i++)
+			if (done->reserved_0[i] != 0) {
+				cluster_gcs_block_dedup_note_done_mismatch(dedup_worker_id);
+				return;
+			}
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = (uint32)done->sender_node;
+	key.requester_backend_id = done->requester_backend_id;
+	key.request_id = done->request_id;
+	key.cluster_epoch = done->epoch;
+
+	(void)cluster_gcs_block_dedup_mark_done(dedup_worker_id, &key, &done->tag, done->transition_id);
+}
+
+/* PGRAC: GCS-race round-2 RC-F — completion-proof msg_type registration. */
+static const ClusterICMsgTypeInfo gcs_block_done_info = {
+	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_DONE,
+	.name = "gcs_block_done",
+	.allowed_producer_mask
+	= CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,
+	.broadcast_ok = false,
+	.handler = cluster_gcs_handle_block_done_envelope,
+	.plane = CLUSTER_IC_PLANE_DATA,
+};
+
 /* PGRAC: spec-2.35 D8 — holder-side forward handler msg_type registration. */
 static const ClusterICMsgTypeInfo gcs_block_forward_info = {
 	.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
@@ -6642,14 +6816,14 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 	}
 	PG_CATCH();
 	{
-		cluster_pcm_lock_clear_pending_x(tag);
+		(void)cluster_pcm_lock_clear_pending_x_if(tag, cluster_node_id);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	if (upgraded)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 1);
-	cluster_pcm_lock_clear_pending_x(tag);
+	(void)cluster_pcm_lock_clear_pending_x_if(tag, cluster_node_id);
 	return upgraded;
 }
 
@@ -7121,6 +7295,7 @@ cluster_gcs_register_block_msg_types(void)
 {
 	cluster_ic_register_msg_type(&gcs_block_request_info);
 	cluster_ic_register_msg_type(&gcs_block_reply_info);
+	cluster_ic_register_msg_type(&gcs_block_done_info);
 	cluster_ic_register_msg_type(&gcs_block_forward_info);
 	cluster_ic_register_msg_type(&gcs_block_invalidate_info);
 	cluster_ic_register_msg_type(&gcs_block_invalidate_ack_info);
@@ -7275,6 +7450,19 @@ uint64
 cluster_gcs_get_block_stale_reply_drop_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->stale_reply_drop_count) : 0;
+}
+
+/* PGRAC: GCS-race round-2 RC-F — requester-side DONE emission counter. */
+uint64
+cluster_gcs_get_block_done_sent_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->done_sent_count) : 0;
+}
+
+uint64
+cluster_gcs_get_block_done_enqueue_drop_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->done_enqueue_drop_count) : 0;
 }
 
 /* PGRAC: spec-2.35 D12 — 7 NEW counter accessors. */
@@ -7612,6 +7800,31 @@ uint64
 cluster_gcs_get_block_dedup_max_entries(void)
 {
 	return cluster_gcs_block_dedup_get_max_entries();
+}
+
+/* PGRAC: GCS-race round-2 RC-F — master-side DONE consumption counters. */
+uint64
+cluster_gcs_get_block_dedup_done_marked_count(void)
+{
+	return cluster_gcs_block_dedup_get_done_marked_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_done_mismatch_count(void)
+{
+	return cluster_gcs_block_dedup_get_done_mismatch_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_hint_violation_count(void)
+{
+	return cluster_gcs_block_dedup_get_hint_violation_count();
+}
+
+uint64
+cluster_gcs_get_block_dedup_legacy_pin_count(void)
+{
+	return cluster_gcs_block_dedup_get_legacy_pin_count();
 }
 
 

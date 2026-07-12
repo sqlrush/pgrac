@@ -586,6 +586,19 @@ extern int cluster_interconnect_recv_timeout_ms;
  * session SET. */
 extern bool cluster_ic_suppress_caps_reply;
 
+/* GCS-race round-2 RC-F mixed-version leg: test-only old-binary simulation —
+ * suppress the GCS_DONE_V1 HELLO capability bit AND the requester-side
+ * GCS_BLOCK_DONE send on this node (the two visible behaviors of a binary
+ * that predates the completion-proof protocol).  Same PGC_SIGHUP posture as
+ * cluster_ic_suppress_caps_reply. */
+extern bool cluster_ic_suppress_gcs_done_cap;
+
+/* GCS-race round-3 P0-1: test-only margin override — LMON treats the xid
+ * wrap-barrier margin as reached and runs the full real path (durable
+ * stamp + DISABLE fanout + ack round); a genuine 2^32 approach is not
+ * drivable in a test.  Consumed by LMON, hence PGC_SIGHUP. */
+extern bool cluster_xid_wrap_barrier_force;
+
 /* spec-2.4 D9: chunked framing + TCP KeepAlive 5 GUC. */
 extern int cluster_interconnect_payload_max_bytes;
 extern int cluster_interconnect_chunk_reassembly_timeout_ms;

@@ -188,6 +188,29 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 vis_freshref_verdict_resolved_count;
 	pg_atomic_uint64 vis_freshref_verdict_failclosed_count;
 	/*
+	 * GCS-race round-2 RC-E: native-prehistory LOCAL routing.
+	 * native_prehistory_covered_hw is a WRITE-ONCE latch (not a counter):
+	 * the startup process stores the sealed native high-water here after
+	 * the post-recovery verify proved the local pg_xact byte-matches the
+	 * sealed prehistory blob over the whole surviving native range.  0
+	 * means "not proven this boot" and keeps the resolver fail-closed for
+	 * below-floor xids (53R97).  rtvis_native_prehistory_local_count counts
+	 * recycled-ref resolutions the latch routed to the local adopted CLOG
+	 * instead of failing closed.
+	 */
+	pg_atomic_uint64 native_prehistory_covered_hw;
+	pg_atomic_uint64 rtvis_native_prehistory_local_count;
+	/*
+	 * GCS-race round-3 P0-1: one-way latch disable.  Set (0 -> 1, never
+	 * cleared) when the wrap barrier tells this node that raw 32-bit values
+	 * below the native high-water are about to be reused by epoch>=1 xids,
+	 * so the adopted prehistory can no longer answer alias-free.  A set
+	 * disable both zeroes covered_hw and makes any concurrent latch store
+	 * void (store-then-recheck in the latch closes the race); readers then
+	 * stay fail-closed (53R97) for below-floor refs forever.
+	 */
+	pg_atomic_uint64 native_prehistory_disabled;
+	/*
 	 * spec-5.22d D4-4: dead/absent-owner authority block0 serve outcomes.
 	 * serve_hit = self-as-authority served a terminal verdict off the dead
 	 * owner's shared block0 (the D4-8 L1 hard assert lands here, proving the
@@ -347,6 +370,9 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
+		pg_atomic_init_u64(&CRShared->native_prehistory_covered_hw, 0);
+		pg_atomic_init_u64(&CRShared->rtvis_native_prehistory_local_count, 0);
+		pg_atomic_init_u64(&CRShared->native_prehistory_disabled, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_serve_hit_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_fail_closed_count, 0);
 		pg_atomic_init_u64(&CRShared->undo_authority_epoch_stale_reject_count, 0);
@@ -531,6 +557,73 @@ cluster_rtvis_note_underivable_failclosed(void)
 {
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->rtvis_underivable_failclosed_count, 1);
+}
+
+/*
+ * PGRAC: GCS-race round-2 RC-E — native-prehistory coverage latch.
+ *
+ * The setter runs exactly once per boot, in the startup process after the
+ * post-recovery verify proved local pg_xact == sealed prehistory blob over
+ * [oldestXid, native_hw).  Backends fork after (or read the atomic after) the
+ * store, so a nonzero read is always a fully-verified high-water; readers
+ * that observe 0 simply stay fail-closed (never wrong, at worst 53R97).
+ */
+void
+cluster_cr_native_prehistory_latch(uint64 native_hw_full)
+{
+	if (CRShared == NULL)
+		return;
+	/* Round-3 P0-1: a disabled latch is void.  Store-then-recheck: if the
+	 * one-way disable lands between the check and the store, the recheck
+	 * zeroes the freshly stored value, so no reader can win a nonzero
+	 * covered_hw after the disable is set. */
+	if (pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0)
+		return;
+	pg_atomic_write_u64(&CRShared->native_prehistory_covered_hw, native_hw_full);
+	if (pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0)
+		pg_atomic_write_u64(&CRShared->native_prehistory_covered_hw, 0);
+}
+
+uint64
+cluster_cr_native_prehistory_covered_hw(void)
+{
+	if (CRShared == NULL)
+		return 0;
+	if (pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0)
+		return 0;
+	return pg_atomic_read_u64(&CRShared->native_prehistory_covered_hw);
+}
+
+/*
+ * PGRAC: GCS-race round-3 P0-1 — one-way native-prehistory latch disable.
+ *
+ * Called by the LMON wrap barrier (own margin trigger, a peer's DISABLE
+ * broadcast, or the 1Hz authority-flag mirror).  Order matters: the disable
+ * marker is set BEFORE covered_hw is zeroed so a concurrent latch store
+ * cannot resurrect a nonzero value past its own recheck.  Idempotent.
+ */
+void
+cluster_cr_native_prehistory_disable(void)
+{
+	if (CRShared == NULL)
+		return;
+	pg_atomic_write_u64(&CRShared->native_prehistory_disabled, 1);
+	pg_atomic_write_u64(&CRShared->native_prehistory_covered_hw, 0);
+}
+
+bool
+cluster_cr_native_prehistory_disabled(void)
+{
+	if (CRShared == NULL)
+		return false;
+	return pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0;
+}
+
+void
+cluster_rtvis_note_native_prehistory_local(void)
+{
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->rtvis_native_prehistory_local_count, 1);
 }
 
 /* PGRAC: spec-5.22f D6-3 — fresh-remote-ITL-ref widening outcome bumps
@@ -725,6 +818,9 @@ CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivabl
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count,
 					vis_freshref_verdict_resolved_count)
+/* GCS-race round-2 RC-E: native-prehistory LOCAL routing counter. */
+CR_COUNTER_ACCESSOR(cluster_rtvis_native_prehistory_local_count,
+					rtvis_native_prehistory_local_count)
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_failclosed_count,
 					vis_freshref_verdict_failclosed_count)
 /* spec-5.22d D4-4/D4-5: dead-owner authority block0 serve counters. */

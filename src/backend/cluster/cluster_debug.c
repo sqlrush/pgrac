@@ -2073,6 +2073,22 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
 	emit_row(rsinfo, "gcs", "stale_reply_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_stale_reply_drop_count()));
+	/* PGRAC: GCS-race round-2 RC-F — DONE completion-proof protocol rows:
+	 * requester-side proofs sent, master-side proofs stamped (entry moved
+	 * to its short done-linger quarantine) vs dropped (miss / identity or
+	 * state mismatch — TTL backstop stays in charge). */
+	emit_row(rsinfo, "gcs", "done_sent_count",
+			 fmt_int64((int64)cluster_gcs_get_block_done_sent_count()));
+	emit_row(rsinfo, "gcs", "dedup_done_marked_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_marked_count()));
+	emit_row(rsinfo, "gcs", "dedup_done_mismatch_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_mismatch_count()));
+	emit_row(rsinfo, "gcs", "dedup_hint_violation_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_hint_violation_count()));
+	emit_row(rsinfo, "gcs", "dedup_legacy_pin_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_legacy_pin_count()));
+	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
+			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
 
 	/* PGRAC: spec-2.35 D13 — 7 NEW counter rows for CF 2-way protocol. */
 	emit_row(rsinfo, "gcs", "block_forward_sent_count",
@@ -2832,6 +2848,10 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
+	/* GCS-race round-2 RC-E: recycled refs the native-prehistory gate routed
+	 * to the local adopted CLOG instead of failing closed. */
+	emit_row(rsinfo, "cr", "rtvis_native_prehistory_local_count",
+			 fmt_int64((int64)cluster_rtvis_native_prehistory_local_count()));
 	/* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcomes. */
 	emit_row(rsinfo, "cr", "vis_freshref_verdict_resolved_count",
 			 fmt_int64((int64)cluster_vis_freshref_verdict_resolved_count()));
@@ -3381,6 +3401,21 @@ dump_catalog(ReturnSetInfo *rsinfo)
 				 fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) != 0));
 		emit_row(rsinfo, "catalog", "xid_prehistory_adopted",
 				 fmt_bool(cluster_xid_prehistory_was_adopted()));
+		/* GCS-race round-2 RC-E: post-recovery verified coverage latch
+		 * (0 = not proven this boot; resolver stays fail-closed). */
+		emit_row(rsinfo, "catalog", "xid_native_prehistory_covered_hw",
+				 fmt_int64((int64)cluster_cr_native_prehistory_covered_hw()));
+		/* GCS-race round-3 P0-1: xid wrap barrier faces.  raw_reused = the
+		 * durable one-way authority stamp; disabled = this node's one-way
+		 * latch disable; barrier_done = this boot may issue epoch>=1 xids
+		 * (every member's latch proven off). */
+		emit_row(
+			rsinfo, "catalog", "xid_native_raw_reused",
+			fmt_bool(xaok && (xahdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0));
+		emit_row(rsinfo, "catalog", "xid_native_prehistory_disabled",
+				 fmt_bool(cluster_cr_native_prehistory_disabled()));
+		emit_row(rsinfo, "catalog", "xid_wrap_barrier_done",
+				 fmt_bool(cluster_xid_wrap_barrier_passed()));
 	}
 
 	/*

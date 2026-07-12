@@ -116,6 +116,20 @@ make_invalidate(BufferTag tag)
 	return p;
 }
 
+/* Review F4: a DONE with a NONZERO epoch -- the router must key on the
+ * tag alone;  an epoch-0-only fixture would green-light a router that
+ * accidentally reads the epoch field. */
+static GcsBlockDonePayload
+make_done(BufferTag tag)
+{
+	GcsBlockDonePayload p;
+
+	memset(&p, 0, sizeof(p));
+	p.epoch = 7;
+	p.tag = tag;
+	return p;
+}
+
 /* ======================================================================
  * U1 -- each staging type routes to exactly shard_for_tag(tag, N): the
  *		 payload router adds no input of its own (double-end agreement,
@@ -131,6 +145,7 @@ UT_TEST(test_route_matches_shard_for_tag)
 		GcsBlockRequestPayload req = make_request(tag);
 		GcsBlockForwardPayload fwd = make_forward(tag);
 		GcsBlockInvalidatePayload inv = make_invalidate(tag);
+		GcsBlockDonePayload done = make_done(tag);
 
 		for (n = 1; n <= CLUSTER_LMS_MAX_WORKERS; n++) {
 			int expect = cluster_lms_shard_for_tag(&tag, n);
@@ -143,6 +158,11 @@ UT_TEST(test_route_matches_shard_for_tag)
 						 expect);
 			UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, &inv,
 														 sizeof(inv), n),
+						 expect);
+			/* review F4: DONE rides the same tag shard as the REQUEST it
+			 * retires (it must land on the dedup entry's worker). */
+			UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE, &done,
+														 sizeof(done), n),
 						 expect);
 			UT_ASSERT(expect >= 0);
 			UT_ASSERT(expect < n);
@@ -193,6 +213,7 @@ UT_TEST(test_route_registry_partition)
 	GcsBlockRequestPayload req = make_request(tag);
 	GcsBlockForwardPayload fwd = make_forward(tag);
 	GcsBlockInvalidatePayload inv = make_invalidate(tag);
+	GcsBlockDonePayload done = make_done(tag);
 	uint8 raw[64];
 
 	memset(raw, 0, sizeof(raw));
@@ -205,6 +226,9 @@ UT_TEST(test_route_registry_partition)
 											  CLUSTER_LMS_MAX_WORKERS)
 			  >= 0);
 	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, &inv, sizeof(inv),
+											  CLUSTER_LMS_MAX_WORKERS)
+			  >= 0);
+	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE, &done, sizeof(done),
 											  CLUSTER_LMS_MAX_WORKERS)
 			  >= 0);
 
@@ -227,6 +251,7 @@ UT_TEST(test_route_unroutable_fail_closed)
 {
 	BufferTag tag = make_tag(1663, 5, 16384, MAIN_FORKNUM, 7);
 	GcsBlockRequestPayload req = make_request(tag);
+	GcsBlockDonePayload done = make_done(tag);
 	uint8 raw[64];
 
 	memset(raw, 0, sizeof(raw));
@@ -237,6 +262,10 @@ UT_TEST(test_route_unroutable_fail_closed)
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(0xFF, raw, sizeof(raw), CLUSTER_LMS_MAX_WORKERS),
 				 -1);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(0, raw, sizeof(raw), CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE, &done,
+												 (uint16)(sizeof(done) - 1),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, NULL, sizeof(req),
 												 CLUSTER_LMS_MAX_WORKERS),
 				 -1);
@@ -254,11 +283,12 @@ UT_TEST(test_route_length_mismatch_refused)
 	GcsBlockRequestPayload req = make_request(tag);
 	GcsBlockForwardPayload fwd = make_forward(tag);
 	GcsBlockInvalidatePayload inv = make_invalidate(tag);
+	GcsBlockDonePayload done = make_done(tag);
 	struct {
 		uint8 msg_type;
 		const void *payload;
 		uint16 good_len;
-	} cases[3];
+	} cases[4];
 	int i;
 
 	cases[0].msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
@@ -270,8 +300,11 @@ UT_TEST(test_route_length_mismatch_refused)
 	cases[2].msg_type = PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE;
 	cases[2].payload = &inv;
 	cases[2].good_len = sizeof(inv);
+	cases[3].msg_type = PGRAC_IC_MSG_GCS_BLOCK_DONE;
+	cases[3].payload = &done;
+	cases[3].good_len = sizeof(done);
 
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < 4; i++) {
 		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type, cases[i].payload,
 													 cases[i].good_len - 1,
 													 CLUSTER_LMS_MAX_WORKERS),

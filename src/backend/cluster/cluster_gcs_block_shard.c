@@ -39,8 +39,8 @@
  * cluster_gcs_block_payload_shard — spec-7.3 D4 (8.A).
  *
  *	Pick the DATA worker for a staged block-family frame by hashing its
- *	BufferTag.  Only the three tag-carrying staging-path types reach the
- *	outbound ring (REQUEST / FORWARD / INVALIDATE — each with the tag at a
+ *	BufferTag.  Only the four tag-carrying staging-path types reach the
+ *	outbound ring (REQUEST / FORWARD / INVALIDATE / DONE — each with the tag at a
  *	fixed offset);  REPLY (no tag, request_id-correlated) and INVALIDATE-ACK
  *	are sent DIRECTLY from the receiving worker's dispatch handler, so they
  *	already ride the correct worker channel and never reach this function.
@@ -61,6 +61,8 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, tag) == 16,
 				 "spec-7.3 D4: GcsBlockForwardPayload.tag offset moved");
 StaticAssertDecl(offsetof(GcsBlockInvalidatePayload, tag) == 16,
 				 "spec-7.3 D4: GcsBlockInvalidatePayload.tag offset moved");
+StaticAssertDecl(offsetof(GcsBlockDonePayload, tag) == 16,
+				 "GCS-race round-2 review F4: GcsBlockDonePayload.tag offset moved");
 
 int
 cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payload_len,
@@ -86,6 +88,16 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		if (payload_len != sizeof(GcsBlockInvalidatePayload))
 			return -1;
 		tag = &((const GcsBlockInvalidatePayload *)payload)->tag;
+		break;
+	case PGRAC_IC_MSG_GCS_BLOCK_DONE:
+		/* GCS-race round-2 review F4: the completion proof is a staged
+		 * tag-carrying frame like REQUEST -- without this case every DONE
+		 * was refused (-1) at the ring and the whole RC-F chain sent
+		 * nothing.  Same shard key as the REQUEST it retires, so it lands
+		 * on the worker that owns the dedup entry. */
+		if (payload_len != sizeof(GcsBlockDonePayload))
+			return -1;
+		tag = &((const GcsBlockDonePayload *)payload)->tag;
 		break;
 	default:
 		/* REPLY / INVALIDATE-ACK are direct-sent, not staged;  any other

@@ -732,6 +732,64 @@ GcsBlockRequestPayloadIsDirectLandArmed(const GcsBlockRequestPayload *p)
 	return p->reserved_0[1] != 0;
 }
 
+/* PGRAC: GCS-race round-2 RC-F — requester legal-lifetime hint carried in
+ * REQUEST reserved_0[2..5] (uint32 ms, little-endian byte overlay; [0] is
+ * clean-eligible, [1] direct-land above).  0 = no hint (older wire peer):
+ * the master pins the entry TTL from its own GUCs at registration. */
+static inline void
+GcsBlockRequestPayloadSetLifetimeHintMs(GcsBlockRequestPayload *p, uint32 lifetime_ms)
+{
+	p->reserved_0[2] = (uint8)(lifetime_ms & 0xFF);
+	p->reserved_0[3] = (uint8)((lifetime_ms >> 8) & 0xFF);
+	p->reserved_0[4] = (uint8)((lifetime_ms >> 16) & 0xFF);
+	p->reserved_0[5] = (uint8)((lifetime_ms >> 24) & 0xFF);
+}
+
+static inline uint32
+GcsBlockRequestPayloadGetLifetimeHintMs(const GcsBlockRequestPayload *p)
+{
+	return (uint32)p->reserved_0[2] | ((uint32)p->reserved_0[3] << 8)
+		   | ((uint32)p->reserved_0[4] << 16) | ((uint32)p->reserved_0[5] << 24);
+}
+
+
+/* ============================================================
+ * GcsBlockDonePayload -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_DONE
+ *                        (GCS-race round-2 RC-F completion proof).
+ *
+ *	Sent by the requester AFTER it has accepted a terminal reply
+ *	(status verified, CRC passed, image installed/consumed).  The master
+ *	verifies the FULL identity against its dedup entry and stamps the
+ *	completion proof (cluster_gcs_block_dedup_mark_done); every mismatch
+ *	is counted and dropped -- DONE is advisory, the pinned TTL remains
+ *	the loss backstop.
+ *
+ *	epoch carries the REQUEST epoch (slot->request_epoch): the master's
+ *	dedup key was built from req->epoch, so a reply-time epoch would
+ *	never match the entry.
+ *
+ *	Layout mirrors GcsBlockRequestPayload (64B fixed):
+ *	  [  0,   8) request_id
+ *	  [  8,  16) epoch                   -- REQUEST epoch (key match)
+ *	  [ 16,  36) tag                     -- shard routing + identity
+ *	  [ 36,  40) sender_node             -- requester (key origin)
+ *	  [ 40,  44) requester_backend_id
+ *	  [ 44,  45) transition_id
+ *	  [ 45,  64) reserved_0[19]          -- zero
+ * ============================================================ */
+typedef struct GcsBlockDonePayload {
+	uint64 request_id;			/*  8B [  0,   8) */
+	uint64 epoch;				/*  8B [  8,  16) — REQUEST epoch */
+	BufferTag tag;				/* 20B [ 16,  36) */
+	int32 sender_node;			/*  4B [ 36,  40) */
+	int32 requester_backend_id; /* 4B [ 40,  44) */
+	uint8 transition_id;		/*  1B [ 44,  45) */
+	uint8 reserved_0[19];		/* 19B [ 45,  64) */
+} GcsBlockDonePayload;
+
+StaticAssertDecl(sizeof(GcsBlockDonePayload) == 64,
+				 "GCS-race round-2 GcsBlockDonePayload wire ABI 64B (mirrors request)");
+
 
 /* ============================================================
  * GcsBlockReplyHeader -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -2087,6 +2145,9 @@ extern uint64 cluster_gcs_get_install_copy_count(void);
  *	  dedup_full_count               — # of HC92 cap-full DENIED_DEDUP_FULL
  *	  epoch_invalidate_wake_count    — # of CV signals from eager wake hook
  *	  stale_reply_drop_count         — # of HC100 stale-reply drops
+ *	  done_sent_count                — # of GCS_BLOCK_DONE proofs sent (RC-F)
+ *	  dedup_done_marked_count        — # of DONE proofs stamped on master (RC-F)
+ *	  dedup_done_mismatch_count      — # of DONE proofs dropped on master (RC-F)
  * ============================================================ */
 extern uint64 cluster_gcs_get_block_retransmit_attempt_count(void);
 extern uint64 cluster_gcs_get_block_retransmit_send_count(void);
@@ -2100,6 +2161,12 @@ extern uint64 cluster_gcs_get_block_dedup_evict_count(void); /* spec-7.2a D5 */
 extern uint64 cluster_gcs_get_block_dedup_max_entries(void); /* spec-7.2a D5 */
 extern uint64 cluster_gcs_get_block_epoch_invalidate_wake_count(void);
 extern uint64 cluster_gcs_get_block_stale_reply_drop_count(void);
+extern uint64 cluster_gcs_get_block_done_sent_count(void);			  /* RC-F DONE */
+extern uint64 cluster_gcs_get_block_done_enqueue_drop_count(void);	  /* review F7 */
+extern uint64 cluster_gcs_get_block_dedup_done_marked_count(void);	  /* RC-F DONE */
+extern uint64 cluster_gcs_get_block_dedup_done_mismatch_count(void);  /* RC-F DONE */
+extern uint64 cluster_gcs_get_block_dedup_hint_violation_count(void); /* review F5 */
+extern uint64 cluster_gcs_get_block_dedup_legacy_pin_count(void);	  /* review F5 */
 
 /*
  * PGRAC: spec-2.35 D12 — 7 NEW reliability/lifecycle counter accessors

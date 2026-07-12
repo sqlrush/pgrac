@@ -240,6 +240,7 @@ OBJS = \
 	cluster_xid_stripe.o \
 	cluster_xid_stripe_boot.o \
 	cluster_xid_stripe_xlog.o \
+	cluster_xid_wrap_barrier.o \
 	cluster_xnode_lever.o \
 	cluster_xnode_profile.o \
 	storage/cluster_shared_fs.o \

@@ -331,6 +331,15 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-block-duplicate-grant-reply" },
 	/*
+	 *	cluster-gcs-block-done-drop (GCS-race round-2 RC-F):
+	 *	  Fires at the requester's single normal-exit funnel once a usable
+	 *	  page (GRANTED / STORAGE_FALLBACK / READ_IMAGE) has been consumed.
+	 *	  SKIP suppresses the GCS_BLOCK_DONE completion-proof send, leaving
+	 *	  the master's dedup entry to the pinned-lifetime TTL backstop —
+	 *	  deterministic coverage for wire loss of the DONE message.
+	 */
+	{ .name = "cluster-gcs-block-done-drop" },
+	/*
 	 * spec-2.35 D15 — CF 2-way protocol fault injection.
 	 *
 	 *	cluster-gcs-block-forward-master-side:

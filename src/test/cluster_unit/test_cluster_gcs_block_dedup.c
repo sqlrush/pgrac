@@ -20,7 +20,7 @@
  *	  cluster_tap t/112_gcs_block_retransmit_2node.pl;  the multi-tag ->
  *	  multi-worker dispatch e2e + injection-forced misroute land in D9.
  *
- *	  Tests (U1-U12):
+ *	  Tests (U1-U15):
  *	    U1  per-worker isolation: install on shard 0 is invisible to shard 1
  *	    U2  dedup per-shard: MISS -> IN_FLIGHT_DUPLICATE -> CACHED_REPLY
  *	    U3  counter accessors sum across shards
@@ -33,6 +33,11 @@
  *	    U10 remove releases an IN_FLIGHT entry for re-evaluation
  *	    U11 READ_IMAGE forward marker -> FORWARDED; direct serve -> CACHED
  *	    U12 TTL threshold covers the (retries+1) x reply-timeout lifetime
+ *	    U13 mark_done truth table: identity gates + idempotent stamp (RC-F)
+ *	    U14 TTL posture pinned at registration: hint beats GUCs, no re-read
+ *	    U15 DONE linger ages a proven entry out before the full lifetime
+ *	    U16 capability-routed registration: violations denied, legacy pinned
+ *	        at the protocol maximum (review F5 / calibration 2)
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -387,20 +392,24 @@ UT_TEST(u1_per_worker_isolation)
 
 	/* Register the same key on shard 0 and shard 1 — separate tables, so
 	 * both see a fresh MISS. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 
 	/* Complete shard 0's entry only. */
 	install_granted(0, &key);
 
 	/* Shard 0 now serves a cached reply; shard 1 is untouched (still
 	 * in-flight) — proves zero cross-worker sharing. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
 }
 
 
@@ -415,15 +424,18 @@ UT_TEST(u2_dedup_lifecycle_per_shard)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	/* retransmit before reply installed */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
 	install_granted(0, &key);
 	/* retransmit after reply installed → cached replay */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_CACHED_REPLY);
 }
 
 
@@ -440,9 +452,9 @@ UT_TEST(u3_counters_sum_across_shards)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 
 	/* miss on shard 0 + miss on shard 1 = 2 (aggregate view). */
@@ -465,8 +477,8 @@ UT_TEST(u4_cleanup_on_node_dead_all_shards)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, &cached);
-	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, 0, false, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, 0, false, &cached);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 2);
 
 	cluster_gcs_block_dedup_cleanup_on_node_dead(3);
@@ -490,10 +502,12 @@ UT_TEST(u5_out_of_range_worker_fail_closed)
 	before = cluster_gcs_block_dedup_get_misroute_failclosed_count();
 
 	/* worker_id >= live shard count → fail-closed, no crash, no store. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(99, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_FULL);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(-1, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(99, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(-1, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_FULL);
 
 	UT_ASSERT_EQ((int)(cluster_gcs_block_dedup_get_misroute_failclosed_count() - before), 2);
 	/* nothing was stored */
@@ -514,11 +528,13 @@ UT_TEST(u6_n1_only_shard0)
 	reset_fake_dedup(1, FAKE_DEDUP_CAP);
 	before = cluster_gcs_block_dedup_get_misroute_failclosed_count();
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	/* worker 1 does not exist when lms_workers=1 → fail-closed. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, &cached),
-				 (int)GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(1, &key, tag, 1, 0, false, &cached),
+		(int)GCS_BLOCK_DEDUP_FULL);
 	UT_ASSERT_EQ((int)(cluster_gcs_block_dedup_get_misroute_failclosed_count() - before), 1);
 }
 
@@ -537,13 +553,15 @@ UT_TEST(u7_per_shard_cap_full)
 	for (i = 0; i < FAKE_DEDUP_CAP; i++) {
 		GcsBlockDedupKey k = make_key(0, 1, (uint64)(100 + i), 7);
 
-		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, tag, 1, &cached),
-					 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+		UT_ASSERT_EQ(
+			(int)cluster_gcs_block_dedup_lookup_or_register(0, &k, tag, 1, 0, false, &cached),
+			(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	}
 	{
 		GcsBlockDedupKey overflow = make_key(0, 1, 999, 7);
 
-		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &overflow, tag, 1, &cached),
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &overflow, tag, 1, 0, false,
+																	 &cached),
 					 (int)GCS_BLOCK_DEDUP_FULL);
 	}
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_full_count(), 1);
@@ -552,8 +570,9 @@ UT_TEST(u7_per_shard_cap_full)
 		GcsBlockDedupKey k = make_key(0, 2, 500, 7);
 		BufferTag t1 = make_tag(61);
 
-		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(1, &k, t1, 1, &cached),
-					 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+		UT_ASSERT_EQ(
+			(int)cluster_gcs_block_dedup_lookup_or_register(1, &k, t1, 1, 0, false, &cached),
+			(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	}
 }
 
@@ -571,8 +590,8 @@ UT_TEST(u8_ttl_sweep_all_shards)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, &cached);
-	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, 0, false, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, 0, false, &cached);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 2);
 
 	/* now far past the expiry threshold → both shards swept. */
@@ -594,8 +613,8 @@ UT_TEST(u9_backend_exit_cleanup_all_shards)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, &cached);
-	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(0, &ka, ta, 1, 0, false, &cached);
+	(void)cluster_gcs_block_dedup_lookup_or_register(1, &kb, tb, 1, 0, false, &cached);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 2);
 
 	cluster_gcs_block_dedup_cleanup_on_backend_exit(0, 9);
@@ -621,15 +640,15 @@ UT_TEST(u10_remove_reopens_in_flight_entry)
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	/* leftover in-flight entry swallows the same-key retry ... */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
 	/* ... and remove re-opens it for a fresh master evaluation. */
 	cluster_gcs_block_dedup_remove(0, &k);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 }
 
@@ -658,7 +677,7 @@ UT_TEST(u11_read_image_marker_classifies_forwarded)
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 
 	/* forward MARKER: forwarding_master_node stamped, no payload. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.request_id = 500;
@@ -668,12 +687,12 @@ UT_TEST(u11_read_image_marker_classifies_forwarded)
 	cluster_gcs_block_dedup_install_reply(0, &km, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &hdr,
 										  NULL);
 	memset(&cached, 0, sizeof(cached));
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &km, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
 	UT_ASSERT_EQ((int)cached.reply_header.sender_node, 2);
 
 	/* master-DIRECT cached serve: NO_FORWARDING_MASTER + real page. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.request_id = 501;
@@ -683,7 +702,7 @@ UT_TEST(u11_read_image_marker_classifies_forwarded)
 	memset(page, 0x3c, sizeof(page));
 	cluster_gcs_block_dedup_install_reply(0, &kd, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &hdr,
 										  page);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, 0, false, &cached),
 				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
 }
 
@@ -713,7 +732,7 @@ UT_TEST(u12_ttl_covers_reply_timeout_lifetime)
 	cluster_gcs_block_retransmit_max_retries = 8;
 	cluster_gcs_reply_timeout_ms = 5000;
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 57750, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	t0 = GetCurrentTimestamp();
 
@@ -731,10 +750,207 @@ UT_TEST(u12_ttl_covers_reply_timeout_lifetime)
 }
 
 
+/* ============================================================
+ * U13 — mark_done truth table (GCS-race round-2 RC-F).
+ *
+ *	DONE is advisory: every identity or state doubt drops the proof
+ *	(done_mismatch_count++) and leaves the TTL backstop in charge.  Only
+ *	a full 4-tuple key + tag + transition_id match on a COMPLETED entry
+ *	stamps done_at_ts; a duplicate DONE is idempotent-true.
+ * ============================================================ */
+UT_TEST(u13_mark_done_truth_table)
+{
+	GcsBlockDedupKey k = make_key(0, 6, 700, 7);
+	BufferTag t = make_tag(97);
+	BufferTag wrong_tag = make_tag(98);
+	GcsBlockDedupEntry cached;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	/* miss: DONE for a key that was never registered. */
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_mismatch_count(), 1);
+
+	/* in-flight: entry exists but no reply installed (not COMPLETED). */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_mismatch_count(), 2);
+
+	/* completed, but identity mismatches refuse the stamp. */
+	install_granted(0, &k);
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &k, &wrong_tag, 1));
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &k, &t, 2));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_mismatch_count(), 4);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_marked_count(), 0);
+
+	/* exact identity on a COMPLETED entry stamps the proof. */
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_marked_count(), 1);
+
+	/* duplicate DONE (retransmit reorder) is idempotent-true. */
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_marked_count(), 2);
+
+	/* the entry still serves its cached reply inside the done-linger
+	 * quarantine — DONE never removes it outright. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &k, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+}
+
+
+/* ============================================================
+ * U14 — the TTL posture is PINNED at registration (RC-F).
+ *
+ *	A nonzero wire hint (the requester's own legal lifetime) beats the
+ *	master's GUC-derived threshold; and once registered, a master-local
+ *	GUC change never re-shortens a live entry's window (GC paths do not
+ *	re-read GUCs).
+ * ============================================================ */
+UT_TEST(u14_pinned_ttl_wire_hint_and_no_guc_reread)
+{
+	GcsBlockDedupKey kh = make_key(0, 7, 800, 7);
+	GcsBlockDedupKey kg = make_key(0, 7, 801, 7);
+	BufferTag t = make_tag(99);
+	GcsBlockDedupEntry cached;
+	TimestampTz t0;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	/* master GUCs describe an ENORMOUS lifetime (~1590s threshold). */
+	cluster_gcs_block_retransmit_initial_backoff_ms = 1000;
+	cluster_gcs_block_retransmit_max_retries = 8;
+	cluster_gcs_reply_timeout_ms = 60000;
+
+	/* hint 1000ms pins 2s: the sweep obeys the requester's budget, not
+	 * the master's huge threshold. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kh, t, 1, 1000, true, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	t0 = GetCurrentTimestamp();
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)1 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)3 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	/* legacy peer (no capability): the PROTOCOL-MAXIMUM lifetime is pinned
+	 * at registration (review F5 / calibration 2); shrinking the GUCs
+	 * afterwards must NOT shorten the live window. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kg, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	t0 = GetCurrentTimestamp();
+	cluster_gcs_block_retransmit_initial_backoff_ms = 50;
+	cluster_gcs_block_retransmit_max_retries = 0;
+	cluster_gcs_reply_timeout_ms = 100; /* new threshold would be 200ms */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)10 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+
+	cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+	cluster_gcs_block_retransmit_max_retries = 4;
+	cluster_gcs_reply_timeout_ms = 5000;
+}
+
+
+/* ============================================================
+ * U15 — the DONE proof shortens a completed entry to its pinned
+ * done-linger quarantine (RC-F).
+ *
+ *	The wire hint pins lifetime 53s; default GUCs pin linger 10s.  A completed-but-not-done
+ *	sibling survives the same sweeps that age out the DONE-proven entry —
+ *	the proof, not the timestamps, is what releases the slot early.
+ * ============================================================ */
+UT_TEST(u15_done_linger_beats_full_lifetime)
+{
+	GcsBlockDedupKey kd = make_key(0, 8, 900, 7);
+	GcsBlockDedupKey ks = make_key(0, 8, 901, 7);
+	BufferTag t = make_tag(100);
+	GcsBlockDedupEntry cached;
+	TimestampTz t0;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &kd, t, 1, 26500, true, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &ks, t, 1, 26500, true, &cached),
+		(int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(0, &kd);
+	install_granted(0, &ks);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &kd, &t, 1));
+	t0 = GetCurrentTimestamp();
+
+	/* inside the 10s linger both survive. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)5 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 2);
+
+	/* past the linger, inside the 53s lifetime: only the DONE-proven
+	 * entry ages out. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)11 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(0, &ks, t, 1, 26500, true, &cached),
+		(int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+
+	/* past the pinned lifetime the sibling goes too. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)60 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
+
+/* ============================================================
+ * U16 — capability-routed registration (review F5 / calibration 2).
+ *
+ *	A GCS_DONE_V1-capable peer MUST carry a sane lifetime hint: zero or
+ *	over-protocol-maximum is counted and DENIED without claiming a slot.
+ *	A legacy peer's window is unknowable, so it pins the protocol-maximum
+ *	lifetime (counted) -- capacity pressure surfaces as FULL, never as an
+ *	early reclaim.
+ * ============================================================ */
+UT_TEST(u16_capability_routing_truth_table)
+{
+	GcsBlockDedupKey kv = make_key(0, 9, 950, 7);
+	GcsBlockDedupKey ko = make_key(0, 9, 951, 7);
+	GcsBlockDedupKey kl = make_key(0, 9, 952, 7);
+	BufferTag t = make_tag(101);
+	GcsBlockDedupEntry cached;
+	TimestampTz t0;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	/* capable + hint 0: protocol violation -> denied, counted, no slot. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kv, t, 1, 0, true, &cached),
+				 (int)GCS_BLOCK_DEDUP_VALIDATION_FAIL);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_hint_violation_count(), 1);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	/* capable + over-maximum hint (would pin the slot for days): same. */
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_lookup_or_register(
+			0, &ko, t, 1, (uint32)(GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS + 1), true, &cached),
+		(int)GCS_BLOCK_DEDUP_VALIDATION_FAIL);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_hint_violation_count(), 2);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	/* legacy peer: registered, counted, pinned at the protocol maximum. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &kl, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_legacy_pin_count(), 1);
+
+	/* far past any GUC posture (600s) but inside the 2x protocol maximum
+	 * (3630s): the legacy entry must SURVIVE the sweep... */
+	t0 = GetCurrentTimestamp();
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)600 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+
+	/* ...and past it, age out. */
+	cluster_gcs_block_dedup_sweep_expired(t0 + (TimestampTz)3700 * 1000 * 1000);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(16);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);
@@ -747,6 +963,10 @@ main(void)
 	UT_RUN(u10_remove_reopens_in_flight_entry);
 	UT_RUN(u11_read_image_marker_classifies_forwarded);
 	UT_RUN(u12_ttl_covers_reply_timeout_lifetime);
+	UT_RUN(u13_mark_done_truth_table);
+	UT_RUN(u14_pinned_ttl_wire_hint_and_no_guc_reread);
+	UT_RUN(u15_done_linger_beats_full_lifetime);
+	UT_RUN(u16_capability_routing_truth_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

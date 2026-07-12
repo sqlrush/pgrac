@@ -99,6 +99,8 @@ static int fake_declared_nodes = 1;
  * = 25000ms, doubled = 53,000,000 us.  (The pre-lifetime-fix threshold,
  * 2x backoff only, was 3,000,000 us — it swept entries of still-live
  * requests mid-flight.)  Tests age entries past it by advancing fake_now.
+ * Review F5: registrations carry hint 26500ms as a CAPABLE peer, pinning
+ * exactly this window (26.5s x2) — reclaim consumes the pinned value.
  */
 #define UT_OUT_OF_WINDOW_US INT64CONST(53000000)
 
@@ -409,7 +411,10 @@ register_key(uint64 request_id)
 	GcsBlockDedupKey key = make_key(request_id);
 	BufferTag tag = make_tag((uint32)request_id);
 
-	return cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, NULL);
+	/* review F5: a capable requester pins its own lifetime; 26500ms x2
+	 * lands exactly on UT_OUT_OF_WINDOW_US so the aging arithmetic below
+	 * is unchanged. */
+	return cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, 1, 26500, true, NULL);
 }
 
 static void
@@ -499,7 +504,7 @@ UT_TEST(test_u5_reclaimed_key_re_registers_without_double_count)
 	 * again, so its registration eager-reclaims exactly one more aged
 	 * completed entry. */
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_MISS_REGISTERED,
-				 cluster_gcs_block_dedup_lookup_or_register(0, &key0, tag0, 1, NULL));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &key0, tag0, 1, 26500, true, NULL));
 	UT_ASSERT_EQ(2, (int)cluster_gcs_block_dedup_get_evict_count());
 	UT_ASSERT_EQ(2, (int)cluster_gcs_block_dedup_get_full_count());
 	UT_ASSERT_EQ(4, (int)cluster_gcs_block_dedup_get_in_flight_count());
@@ -509,8 +514,8 @@ UT_TEST(test_u5_reclaimed_key_re_registers_without_double_count)
 	/* Dedup still works on the re-registered entry: complete it, then a
 	 * same-key retransmit hits the cached reply. */
 	complete_key(0, GCS_BLOCK_REPLY_GRANTED);
-	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_CACHED_REPLY,
-				 cluster_gcs_block_dedup_lookup_or_register(0, &key0, tag0, 1, &cached));
+	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_CACHED_REPLY, cluster_gcs_block_dedup_lookup_or_register(
+												   0, &key0, tag0, 1, 26500, true, &cached));
 	UT_ASSERT_EQ(1, (int)cluster_gcs_block_dedup_get_hit_count());
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED, (int)cached.status);
 }

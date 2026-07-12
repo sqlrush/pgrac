@@ -1402,6 +1402,17 @@ UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
 	UT_ASSERT_EQ((uint64)cluster_pcm_lock_clear_pending_x_for_node(2), (uint64)1);
 	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), -1);
 	UT_ASSERT_EQ((uint64)cluster_pcm_lock_clear_pending_x_for_node(2), (uint64)0);
+
+	/* GCS-race round-2 additional hardening: identity-safe compare-and-
+	 * clear.  A mismatched identity must NOT wipe another requester's
+	 * pending-X (the starvation guard a newer writer relies on); the
+	 * matching identity clears exactly once. */
+	cluster_pcm_lock_set_pending_x(stag, 2, 1234);
+	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 3), false);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), true);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), -1);
+	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), false);
 }
 
 /* spec-5.2a D2 (U1): clean-page X-transfer arm is one-shot.  arm(true) sets

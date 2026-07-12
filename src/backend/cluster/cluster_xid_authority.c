@@ -446,6 +446,37 @@ cluster_xid_authority_mark_cluster_era(void)
 }
 
 /*
+ * cluster_xid_authority_mark_native_raw_reused -- one-way NATIVE_RAW_REUSED
+ * stamp (GCS-race round-3 P0-1).  The LMON wrap barrier stamps this durably
+ * BEFORE any node may allocate an epoch>=1 xid: from that point on a raw
+ * 32-bit value below the native high-water is no longer an alias-free
+ * native-era identity, so no future boot may latch the native-prehistory
+ * coverage (below-hw recycled refs stay fail-closed 53R97).  Same idempotent
+ * both-copies re-assert discipline as the cluster-era stamp: re-run until
+ * BOTH copies carry the flag (repairing a torn previous stamp), then a
+ * no-write no-op.  A missing/corrupt authority PANICs -- the bootstrap
+ * seeded it long before any allocator can approach the epoch boundary, so
+ * absence here is real damage.
+ */
+void
+cluster_xid_authority_mark_native_raw_reused(void)
+{
+	ClusterXidAuthorityHeader hdr;
+
+	if (!cluster_xid_authority_read(&hdr))
+		ereport(PANIC,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("shared XID authority is missing or corrupt at native-raw-reused stamp")));
+
+	if ((hdr.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0
+		&& both_copies_flags_settled(CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED, 0))
+		return; /* transition complete in both copies */
+
+	hdr.flags |= CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED;
+	write_header_both(&hdr);
+}
+
+/*
  * cluster_xid_authority_begin_native_run -- re-open the native era for a
  * follow-up cluster.enabled=off seed run (spec-6.15b §3.1 multi-pass arm).
  *

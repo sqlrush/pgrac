@@ -47,7 +47,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/clog.h"		/* GCS-race round-2 RC-E stub signatures */
+#include "access/transam.h"		/* VariableCache stub */
+#include "cluster/cluster_cr.h" /* native-prehistory latch stub signature */
 #include "cluster/cluster_xid_authority.h"
+#include "cluster/cluster_xid_stripe_boot.h" /* lazy-latch stub signature (F1 link) */
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
@@ -69,6 +73,60 @@ UT_DEFINE_GLOBALS();
 
 /* Global read by cluster_xid_authority.o's file I/O. */
 char *cluster_shared_data_dir = NULL;
+
+/* ---- GCS-race round-2 RC-E: stubs for the post-recovery verify's backend
+ * deps.  The unit layer exercises the PURE provable_full judge plus the
+ * publish/adopt/prefix file paths; the verify orchestration (SLRU reads,
+ * repair writes, latch) is TAP t/361 territory and is never invoked here,
+ * but the standalone link still needs the symbols resolved. ---- */
+bool cluster_enabled = false;
+bool cluster_shared_catalog = false;
+VariableCache ShmemVariableCache = NULL;
+XidStatus
+TransactionIdGetStatus(TransactionId xid pg_attribute_unused(),
+					   XLogRecPtr *lsn pg_attribute_unused())
+{
+	printf("# unexpected TransactionIdGetStatus call in unit context -- aborting\n");
+	abort();
+}
+void
+ClusterClogAdoptNativeStatus(TransactionId xid pg_attribute_unused(),
+							 XidStatus status pg_attribute_unused())
+{
+	printf("# unexpected ClusterClogAdoptNativeStatus call in unit context -- aborting\n");
+	abort();
+}
+void
+cluster_cr_native_prehistory_latch(uint64 native_hw_full pg_attribute_unused())
+{
+	printf("# unexpected cluster_cr_native_prehistory_latch call in unit context -- aborting\n");
+	abort();
+}
+void
+cluster_cr_native_prehistory_disable(void)
+{
+	printf("# unexpected cluster_cr_native_prehistory_disable call in unit context -- aborting\n");
+	abort();
+}
+
+/* ---- GCS-race round-2 review F1: provable_full widens through
+ * cluster_xid_widen, so cluster_xid_stripe.o joins the link.  Only the
+ * pure widen path runs here; the stripe runtime wrappers and their
+ * backend deps must never be reached. ---- */
+int cluster_node_id = -1;
+bool cluster_xid_striping = false;
+FullTransactionId
+ReadNextFullTransactionId(void)
+{
+	printf("# unexpected ReadNextFullTransactionId call in unit context -- aborting\n");
+	abort();
+}
+void
+cluster_xid_stripe_lazy_latch(void)
+{
+	printf("# unexpected cluster_xid_stripe_lazy_latch call in unit context -- aborting\n");
+	abort();
+}
 
 /* ---- Assert + ereport machinery (aborts on ERROR; the read paths never
  * ereport, the write paths only PANIC on real I/O failure). ---- */
@@ -377,6 +435,54 @@ UT_TEST(test_mark_cluster_era_one_way)
 	UT_ASSERT_EQ(got.native_hw_full, 900);
 	UT_ASSERT_EQ(got.flags,
 				 CLUSTER_XID_AUTHORITY_FLAG_SEALED | CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA);
+}
+
+/* GCS-race round-3 P0-1: NATIVE_RAW_REUSED is one-way, coexists with the
+ * other flags, survives later publishes, and re-running the stamp is an
+ * idempotent no-op (both-copies re-assert discipline). */
+UT_TEST(test_mark_native_raw_reused_one_way)
+{
+	ClusterXidAuthorityHeader got;
+
+	unlink_files();
+	UT_ASSERT_EQ(cluster_xid_authority_seed_if_absent(791), true);
+	cluster_xid_authority_publish_native(816, 1, true);
+	cluster_xid_authority_mark_cluster_era();
+
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* idempotent re-assert: still stamped, other flags untouched */
+	cluster_xid_authority_mark_native_raw_reused();
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* later publishes never clear it (monotone flags, hw never lowered) */
+	cluster_xid_authority_publish_native(900, 1, false);
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT_EQ(got.native_hw_full, 900);
+	UT_ASSERT_EQ(got.flags, CLUSTER_XID_AUTHORITY_FLAG_SEALED
+								| CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA
+								| CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED);
+
+	/* .bak roll carries the flag too (both-copies discipline): corrupt the
+	 * primary in place and the fallback image still shows the stamp */
+	{
+		char p[MAXPGPATH];
+		int fd;
+
+		snprintf(p, sizeof(p), "%s/%s", test_root, CLUSTER_XID_AUTHORITY_REL_PATH);
+		fd = open(p, O_RDWR, 0600);
+		(void)!write(fd, "garbage!", 8);
+		close(fd);
+	}
+	UT_ASSERT_EQ(cluster_xid_authority_read(&got), true);
+	UT_ASSERT((got.flags & CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED) != 0);
 }
 
 UT_TEST(test_primary_corrupt_falls_back_to_bak)
@@ -861,18 +967,137 @@ UT_TEST(test_begin_native_run_unseals_before_cluster_era)
 	UT_ASSERT_EQ(got.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED, CLUSTER_XID_AUTHORITY_FLAG_SEALED);
 }
 
+/*
+ * GCS-race round-2 RC-E: pure provable_full truth table.  hw is the FIRST
+ * xid the native era did NOT consume, so hw itself is never native.  The
+ * judge widens the bare tuple value to its full 64-bit identity in the
+ * signed +/- 2^31 window around the live counter (cluster_xid_widen) and
+ * compares full-vs-full against hw -- both halfspaces near an epoch
+ * boundary must resolve to the WIDENED identity, never to the bare value
+ * (round-2 review F1: the bare compare + local wrap sentinel misjudged
+ * exactly there).  Unset latch (hw = 0) and widen failure stay false.
+ */
+static void
+test_native_prehistory_provable_truth_table(void)
+{
+	const uint64 hw = 816;
+	const uint64 no_wrap_next = 100000;				 /* epoch 0 */
+	const uint64 epoch0_max = (uint64)PG_UINT32_MAX; /* last epoch-0 counter value */
+	const uint64 wrapped_next = ((uint64)1 << 32);	 /* first epoch-1 value */
+
+	/* unlatched (hw = 0): never provable, whatever the value */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, 0, 815));
+
+	/* invalid live counter: widen cannot anchor -> never provable */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(0, hw, 815));
+
+	/* latched + widened identity below hw (plain epoch 0): provable */
+	UT_ASSERT(cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 815));
+	UT_ASSERT(cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 3));
+
+	/* hw boundary: hw is the first unconsumed xid -> not native */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 816));
+	/* [native_hw, stripe floor) gap and cluster-era values: not native */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 90000));
+
+	/* special xids (Invalid / Bootstrap / Frozen): never provable */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 0));
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 1));
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(no_wrap_next, hw, 2));
+
+	/*
+	 * FUTURE halfspace at the epoch-0 ceiling: with the counter one shy of
+	 * wrapping, a small raw value widens FORWARD to the next epoch's
+	 * upcoming allocation (2^32 + 815), never to native 815.  The round-1
+	 * bare compare + "next <= 2^32-1" sentinel wrongly held this provable.
+	 */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(epoch0_max, hw, 815));
+
+	/* wrap recurrence: past the boundary the widened value carries the
+	 * epoch and can never fall below an epoch-0 hw */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(wrapped_next, hw, 815));
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(wrapped_next + 5, hw, 815));
+
+	/* PAST halfspace across the boundary: a raw value just below the
+	 * ceiling widens BACKWARD to its epoch-0 identity; that identity is
+	 * >= hw here, so still not provable */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(wrapped_next + 5, hw,
+														   (TransactionId)(PG_UINT32_MAX - 10)));
+
+	/* ... and when the epoch-0 identity IS below a (near-ceiling) native
+	 * hw, the past-halfspace widening proves it native -- the bare-value
+	 * wrap sentinel could only deny this leg wholesale */
+	UT_ASSERT(cluster_xid_native_prehistory_provable_full(
+		wrapped_next + 5, (uint64)PG_UINT32_MAX - 5, (TransactionId)(PG_UINT32_MAX - 10)));
+
+	/* behind-window underflow: an interpretation preceding full xid 0 is
+	 * impossible -- widen fails closed */
+	UT_ASSERT(
+		!cluster_xid_native_prehistory_provable_full((uint64)500, hw, (TransactionId)3000000000U));
+
+	/* deep epoch skew: whatever epoch the local counter sits in, a bare
+	 * value widens into that epoch's window, far above any epoch-0 hw */
+	UT_ASSERT(!cluster_xid_native_prehistory_provable_full(((uint64)5 << 32) + 100000, hw, 815));
+}
+
+/*
+ * Round-2 review F3: pre-migrate epoch witness round trip.  Absent, torn
+ * (short), and corrupt (CRC) reads all fail closed; a valid write reads
+ * back the exact nextFullXid, including an epoch-carrying one; rewrite
+ * (crash-retry of the migrate arm) is idempotent.
+ */
+UT_TEST(test_epoch_witness_round_trip)
+{
+	uint64 got = 0;
+	char p[MAXPGPATH];
+	int fd;
+
+	snprintf(p, sizeof(p), "%s/%s", test_root, CLUSTER_XID_EPOCH_WITNESS_REL_PATH);
+	unlink(p);
+
+	/* absent: no proof */
+	UT_ASSERT(!cluster_xid_epoch_witness_read(test_root, &got));
+
+	/* epoch-0 value round-trips exactly */
+	UT_ASSERT(cluster_xid_epoch_witness_write(test_root, 815));
+	UT_ASSERT(cluster_xid_epoch_witness_read(test_root, &got));
+	UT_ASSERT_EQ(got, 815);
+
+	/* rewrite is idempotent and epoch-carrying values survive */
+	UT_ASSERT(cluster_xid_epoch_witness_write(test_root, ((uint64)3 << 32) + 42));
+	UT_ASSERT(cluster_xid_epoch_witness_read(test_root, &got));
+	UT_ASSERT_EQ(got, ((uint64)3 << 32) + 42);
+
+	/* corrupt payload byte: CRC rejects */
+	fd = open(p, O_RDWR, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(lseek(fd, (off_t)offsetof(ClusterXidEpochWitness, next_full_xid), SEEK_SET),
+				 (off_t)offsetof(ClusterXidEpochWitness, next_full_xid));
+	UT_ASSERT_EQ(write(fd, "!", 1), 1);
+	close(fd);
+	UT_ASSERT(!cluster_xid_epoch_witness_read(test_root, &got));
+
+	/* short (torn) file: rejected */
+	UT_ASSERT(cluster_xid_epoch_witness_write(test_root, 815));
+	UT_ASSERT_EQ(truncate(p, (off_t)sizeof(ClusterXidEpochWitness) - 4), 0);
+	UT_ASSERT(!cluster_xid_epoch_witness_read(test_root, &got));
+
+	unlink(p);
+}
+
 int
 main(void)
 {
 	setup_shared_dir();
 
-	UT_PLAN(18);
+	UT_PLAN(21);
 	UT_RUN(test_layout_offsets_locked);
 	UT_RUN(test_classify_short_magic_crc_valid);
 	UT_RUN(test_payload_bytes_boundaries);
 	UT_RUN(test_seed_if_absent_creates_unsealed);
 	UT_RUN(test_publish_monotone_and_seal);
 	UT_RUN(test_mark_cluster_era_one_way);
+	UT_RUN(test_mark_native_raw_reused_one_way);
 	UT_RUN(test_begin_native_run_unseals_before_cluster_era);
 	UT_RUN(test_unseal_survives_primary_corruption_via_bak);
 	UT_RUN(test_mark_cluster_era_survives_primary_corruption_via_bak);
@@ -885,6 +1110,8 @@ main(void)
 	UT_RUN(test_prefix_check_divergence_truth_table);
 	UT_RUN(test_prefix_check_front_truncation);
 	UT_RUN(test_prehistory_classify_corrupt);
+	UT_RUN(test_native_prehistory_provable_truth_table);
+	UT_RUN(test_epoch_witness_round_trip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

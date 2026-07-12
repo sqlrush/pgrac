@@ -207,6 +207,19 @@ extern void cluster_xid_stripe_herding_tick(const int *fds, int n_disks);
 extern FullTransactionId cluster_xid_stripe_herding_floor(void);
 extern bool cluster_xid_stripe_window_exceeded(FullTransactionId candidate);
 
+/*
+ * GCS-race round-3 P0-1: xid wrap barrier shmem face (protocol in
+ * cluster_xid_wrap_barrier.c).  passed() is the lock-free allocation gate:
+ * no epoch>=1 candidate may be issued while it reads false.
+ */
+extern bool cluster_xid_wrap_barrier_passed(void);
+extern void cluster_xid_wrap_barrier_set_done(void);
+extern bool cluster_xid_wrap_barrier_marked(void);
+extern void cluster_xid_wrap_barrier_set_marked(void);
+extern void cluster_xid_wrap_barrier_note_ack(int32 node_id);
+extern uint64 cluster_xid_wrap_barrier_ack_bitmap(void);
+extern uint64 cluster_xid_stripe_cluster_max_hwm(void);
+
 extern void cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot);
 extern void cluster_xid_stripe_replay_note_retire(int slot);
 extern bool cluster_xid_stripe_replay_filter_active(void);

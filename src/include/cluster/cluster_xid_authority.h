@@ -68,6 +68,16 @@
 #define CLUSTER_XID_AUTHORITY_FLAG_SEALED 0x0001
 /* A cluster.enabled=on boot closed the native era forever (one-way). */
 #define CLUSTER_XID_AUTHORITY_FLAG_CLUSTER_ERA 0x0002
+/*
+ * The cluster is about to (or did) allocate the first epoch>=1 xid, so raw
+ * 32-bit values below the native high-water are no longer alias-free
+ * native-era identities (GCS-race round-3 P0-1).  One-way; stamped durably
+ * BEFORE the first epoch carry by the LMON wrap barrier.  Once set, no boot
+ * may latch the native-prehistory coverage again (below-hw recycled refs
+ * stay fail-closed 53R97 forever) and every serving reader's latch is
+ * cleared through the barrier broadcast before allocation proceeds.
+ */
+#define CLUSTER_XID_AUTHORITY_FLAG_NATIVE_RAW_REUSED 0x0004
 
 typedef struct ClusterXidAuthorityHeader {
 	uint32 magic;
@@ -202,6 +212,15 @@ extern void cluster_xid_authority_publish_native(uint64 native_hw_full, uint64 n
 extern void cluster_xid_authority_mark_cluster_era(void);
 
 /*
+ * One-way: stamp NATIVE_RAW_REUSED (LMON wrap barrier, strictly before the
+ * cluster's first epoch>=1 xid allocation).  Same idempotent both-copies
+ * re-assert discipline as the cluster-era stamp; PANICs on a missing or
+ * corrupt authority (the bootstrap seeded it long before any allocator can
+ * approach the epoch boundary).
+ */
+extern void cluster_xid_authority_mark_native_raw_reused(void);
+
+/*
  * A follow-up native-era (cluster.enabled=off) boot on a sealed authority
  * re-opens the era: clears SEALED so a crash of this run never exposes the
  * previous pass's stale high-water to joiners.  Caller vets CLUSTER_ERA
@@ -232,6 +251,70 @@ extern void cluster_xid_prehistory_publish(const char *local_pgdata, uint64 nati
  */
 extern void cluster_xid_prehistory_adopt(const char *local_pgdata, uint64 native_hw_full);
 extern bool cluster_xid_prehistory_was_adopted(void);
+
+/* ============================================================
+ * Post-recovery coverage verify + latch (GCS-race round-2 RC-E).
+ * ============================================================ */
+
+/*
+ * Pure judge: is `xid` provably a native-era transaction whose outcome the
+ * local adopted CLOG answers alias-free?  True only when the coverage latch
+ * is set (covered_hw_full != 0) and the value's full 64-bit identity --
+ * widened in the signed +/- 2^31 window around next_full_xid via
+ * cluster_xid_widen -- lies below the native high-water.  Widen failure and
+ * every other doubt leg return false (resolver keeps 53R97).
+ */
+extern bool cluster_xid_native_prehistory_provable_full(uint64 next_full_xid,
+														uint64 covered_hw_full, TransactionId xid);
+
+/*
+ * StartupXLOG-tail boot latch: prove local CLOG == sealed native prehistory
+ * over [oldestXid, native_hw), repair replay-wiped holes through the SLRU,
+ * then latch the covered high-water (cluster_cr_native_prehistory_latch).
+ * FATALs on a terminal-vs-terminal contradiction (divergent lineage); every
+ * skip leg leaves the latch unset (resolver stays fail-closed).
+ */
+extern void cluster_xid_prehistory_verify_native_coverage(void);
+
+/* ============================================================
+ * Pre-migrate xid epoch witness (round-2 review F3).
+ * ============================================================
+ *
+ * Under cluster.controlfile_shared_authority the local global/pg_control
+ * becomes a symlink to the SHARED authority, erasing the last local record
+ * of this node's OWN nextFullXid.  The backup_label prehistory adopt needs
+ * that value: a clone taken after an xid epoch rollover reuses pg_xact
+ * positions below the native high-water for cluster-era xids, and adopting
+ * native bits over them would corrupt live outcomes.  The witness persists
+ * the pre-migration nextFullXid durably in the LOCAL data directory before
+ * the symlink flip; magic "PGXW" + CRC32C, torn-safe via tmp+rename.
+ */
+#define CLUSTER_XID_EPOCH_WITNESS_REL_PATH "global/pgrac_xid_epoch_witness"
+#define CLUSTER_XID_EPOCH_WITNESS_TMP_REL_PATH "global/pgrac_xid_epoch_witness.tmp"
+#define CLUSTER_PGXW_MAGIC 0x50475857 /* "PGXW" */
+#define CLUSTER_PGXW_VERSION 1
+
+typedef struct ClusterXidEpochWitness {
+	uint32 magic;		  /* CLUSTER_PGXW_MAGIC */
+	uint32 version;		  /* CLUSTER_PGXW_VERSION */
+	uint64 next_full_xid; /* this node's own pre-migration nextFullXid */
+	uint32 crc;			  /* CRC32C over the fields above */
+	uint32 pad;			  /* zero */
+} ClusterXidEpochWitness;
+
+/*
+ * Durable write of the witness under local_pgdata (tmp + fsync + rename;
+ * idempotent -- re-running the migrate arm rewrites the same value).
+ * Returns false on any I/O failure (caller fails the migration closed).
+ */
+extern bool cluster_xid_epoch_witness_write(const char *local_pgdata, uint64 next_full_xid);
+
+/*
+ * Read the witness back; false when absent, short, or failing
+ * magic/version/CRC validation (callers treat all of those as "no proof"
+ * and fail closed).
+ */
+extern bool cluster_xid_epoch_witness_read(const char *local_pgdata, uint64 *next_full_xid);
 
 /* ============================================================
  * Divergent-lineage guard (review F2; spec Q6 amendment).

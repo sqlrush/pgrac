@@ -548,6 +548,42 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag)
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
 
+/*
+ * cluster_pcm_lock_clear_pending_x_if -- identity-safe compare-and-clear
+ * (GCS-race round-2 additional hardening).  Clears the pending-X mark ONLY
+ * while it still names expected_requester.  Every request-scoped clear
+ * must use this form: between a request's set and its clear the mark can
+ * be legitimately cleared and RE-SET by a different requester (dead-node
+ * sweep + a new upgrader, or a converged retry), and an unconditional
+ * clear would wipe the newer writer's starvation guard -- readers then
+ * slip N->S under a live X transfer.  Returns true when this call cleared
+ * the mark.
+ */
+bool
+cluster_pcm_lock_clear_pending_x_if(BufferTag tag, int32 expected_requester)
+{
+	struct GrdEntry *entry;
+	bool found;
+	bool cleared = false;
+
+	if (cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (entry->pending_x_requester_node == expected_requester) {
+			entry->pending_x_requester_node = -1;
+			entry->pending_x_since_lsn = 0;
+			cleared = true;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return cleared;
+}
+
 int32
 cluster_pcm_lock_query_pending_x_requester(BufferTag tag)
 {

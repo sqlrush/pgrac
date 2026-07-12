@@ -58,6 +58,7 @@
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server result ship */
 #include "cluster/cluster_backup.h" /* cluster_backup_register_ic_msg_types + lmon_tick (spec-6.5) */
 #include "cluster/cluster_undo_horizon.h" /* cluster_undo_horizon_register_ic_msg_types + lmon_tick (spec-5.22e D5-2) */
+#include "cluster/cluster_xid_wrap_barrier.h" /* register + lmon_tick (GCS-race round-3 P0-1) */
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
@@ -469,6 +470,16 @@ cluster_lmon_shmem_init(void)
 		if (!caps_reply_registered) {
 			cluster_ic_tier1_register_caps_reply_msg_type();
 			caps_reply_registered = true;
+		}
+	}
+	/* GCS-race round-3 P0-1: register the xid wrap barrier DISABLE + ACK
+	 * (LMON-only producer; p2p, capability-gated on XID_NATIVE_DISABLE_V1). */
+	{
+		static bool xid_wrap_barrier_registered = false;
+
+		if (!xid_wrap_barrier_registered) {
+			cluster_xid_wrap_barrier_register_ic_msg_types();
+			xid_wrap_barrier_registered = true;
 		}
 	}
 }
@@ -1308,6 +1319,12 @@ LmonMain(void)
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
 			cluster_undo_horizon_lmon_tick();
 
+			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
+			 * durable stamp -> DISABLE fanout -> ack round -> gate open).
+			 * Zero cost before the 2^32 margin and after the gate opens;
+			 * time-based, rides the >= 1 Hz floor like the tick above. */
+			cluster_xid_wrap_barrier_lmon_tick();
+
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
 			 * dedup HTAB.  Removes completed entries past
@@ -1948,6 +1965,12 @@ LmonMain(void)
 			 * a missing report as STALLED, never as consent).  Time-based
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
 			cluster_undo_horizon_lmon_tick();
+
+			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
+			 * durable stamp -> DISABLE fanout -> ack round -> gate open).
+			 * Zero cost before the 2^32 margin and after the gate opens;
+			 * time-based, rides the >= 1 Hz floor like the tick above. */
+			cluster_xid_wrap_barrier_lmon_tick();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB.
 			 * PGRAC: spec-7.2 D1 — TTL/time-based, floor-driven. */

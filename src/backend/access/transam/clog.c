@@ -396,6 +396,58 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 }
 
 /*
+ * ClusterClogAdoptNativeStatus
+ *		PGRAC (GCS-race round-2 RC-E): SLRU-coherent repair write of one
+ *		native-era commit status during the post-recovery prehistory verify.
+ *
+ * A pre-seed base-backup joiner adopts the sealed native prehistory into
+ * its pg_xact files before recovery; replaying the backup's WAL window can
+ * then re-zero a CLOG page the adopt had filled (CLOG extend records), so
+ * xids beyond the replay window on that page read IN_PROGRESS again.  The
+ * StartupXLOG-tail verify detects those holes against the CRC-validated
+ * blob and repairs them HERE -- through the SLRU, never behind its back --
+ * before the coverage latch may enable native-era LOCAL routing.
+ *
+ * No WAL: the authoritative WAL for these bits is the seed node's own
+ * native-era history, already durable in the sealed blob; a crash before
+ * the next CLOG flush just re-runs the same idempotent verify+repair on
+ * the following boot.  Runs single-threaded (startup process before
+ * backends are admitted), status must be terminal, and the slot must
+ * currently read IN_PROGRESS (TransactionIdSetStatusBit asserts that).
+ */
+void
+ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status)
+{
+	int			pageno = TransactionIdToPage(xid);
+	int			slotno;
+
+	Assert(TransactionIdIsNormal(xid));
+
+	/*
+	 * Terminal-only, enforced at RUNTIME (round-2 review F2 / calibration 1):
+	 * a sealed prehistory can legitimately carry SUB_COMMITTED bits (a
+	 * native-era crash mid-subcommit leaves them behind, and the blob has no
+	 * child->parent map to resolve them), and an Assert vanishes in
+	 * production builds.  Materializing a non-terminal status as local truth
+	 * would launder an unprovable state; fail closed instead.
+	 */
+	if (status != TRANSACTION_STATUS_COMMITTED &&
+		status != TRANSACTION_STATUS_ABORTED)
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot adopt non-terminal native-era commit status %d for transaction %u",
+						(int) status, xid),
+				 errhint("The sealed native prehistory carries an unresolvable status; "
+						 "this node must stay fail-closed.")));
+
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	slotno = SimpleLruReadPage(XactCtl, pageno, true, xid);
+	TransactionIdSetStatusBit(xid, status, InvalidXLogRecPtr, slotno);
+	XactCtl->shared->page_dirty[slotno] = true;
+	LWLockRelease(XactSLRULock);
+}
+
+/*
  * When we cannot immediately acquire XactSLRULock in exclusive mode at
  * commit time, add ourselves to a list of processes that need their XIDs
  * status update.  The first process to add itself to the list will acquire

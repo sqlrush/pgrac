@@ -17,7 +17,7 @@
  *	  live):
  *	    L1  GcsBlockReplyStatus enum extends to 8 values (DENIED_DEDUP_FULL=7)
  *	    L2  GcsBlockDedupKey == 24B + offset lock
- *	    L3  GcsBlockDedupEntry == 8448B fixed-size StaticAssertDecl
+ *	    L3  GcsBlockDedupEntry == 8472B fixed-size StaticAssertDecl (8448 + 24 RC-F DONE)
  *	    L4  GcsBlockDedupEntry.sf_dep_vec offset 112, block_data offset 240
  *	    L5  GcsBlockDedupEntry.reply_header offset 56 (8-aligned for uint64)
  *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8432 + registered 8440
@@ -108,9 +108,10 @@ UT_TEST(test_dedup_key_size_and_offsets)
 }
 
 
-UT_TEST(test_dedup_entry_size_locked_at_8448)
+UT_TEST(test_dedup_entry_size_locked_at_8472)
 {
-	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8448);
+	/* 8448 (spec-6.2) + 24 (GCS-race round-2 RC-F DONE lifecycle tail). */
+	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8472);
 }
 
 
@@ -137,6 +138,11 @@ UT_TEST(test_dedup_entry_ttl_anchor_offsets)
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts), 8440);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts) % 8, 0);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts) % 8, 0);
+	/* GCS-race round-2 RC-F: DONE-lifecycle tail, all 8-aligned. */
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, done_at_ts), 8448);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_lifetime_us), 8456);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_done_linger_us), 8464);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, done_at_ts) % 8, 0);
 }
 
 
@@ -303,7 +309,7 @@ main(void)
 	UT_PLAN(24);
 	UT_RUN(test_dedup_full_status_enum_value);
 	UT_RUN(test_dedup_key_size_and_offsets);
-	UT_RUN(test_dedup_entry_size_locked_at_8448);
+	UT_RUN(test_dedup_entry_size_locked_at_8472);
 	UT_RUN(test_dedup_entry_smart_fusion_dep_and_block_offsets);
 	UT_RUN(test_dedup_entry_reply_header_offset_8_aligned);
 	UT_RUN(test_dedup_entry_ttl_anchor_offsets);

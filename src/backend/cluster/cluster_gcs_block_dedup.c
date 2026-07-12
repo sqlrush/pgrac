@@ -79,7 +79,13 @@ typedef struct ClusterGcsBlockDedupShard {
 	pg_atomic_uint64 collision_count; /* HC91 VALIDATION_FAIL */
 	pg_atomic_uint64 full_count;	  /* HC92 FULL */
 	pg_atomic_uint64 evict_count;	  /* spec-7.2a: eager reclaim + TTL sweep removed */
-	pg_atomic_uint32 entry_count;	  /* live in-flight + completed entries */
+	/* GCS-race round-2 RC-F: completion-proof outcomes. */
+	pg_atomic_uint64 done_marked_count;	  /* identity-verified DONE stamped */
+	pg_atomic_uint64 done_mismatch_count; /* DONE dropped: miss / identity / in-flight */
+	/* GCS-race round-2 review F5 (calibration 2): registration routing. */
+	pg_atomic_uint64 hint_violation_count; /* capable peer, hint 0 / over-max: denied */
+	pg_atomic_uint64 legacy_pin_count;	   /* no-capability peer: protocol-max pin */
+	pg_atomic_uint32 entry_count;		   /* live in-flight + completed entries */
 } ClusterGcsBlockDedupShard;
 
 typedef struct ClusterGcsBlockDedupCtl {
@@ -256,6 +262,10 @@ cluster_gcs_block_dedup_shmem_init(void)
 			pg_atomic_init_u64(&shard->collision_count, 0);
 			pg_atomic_init_u64(&shard->full_count, 0);
 			pg_atomic_init_u64(&shard->evict_count, 0);
+			pg_atomic_init_u64(&shard->done_marked_count, 0);
+			pg_atomic_init_u64(&shard->done_mismatch_count, 0);
+			pg_atomic_init_u64(&shard->hint_violation_count, 0);
+			pg_atomic_init_u64(&shard->legacy_pin_count, 0);
 			pg_atomic_init_u32(&shard->entry_count, 0);
 		}
 	}
@@ -355,6 +365,8 @@ cluster_gcs_block_dedup_register_backend_exit_hook(void)
 GcsBlockDedupResult
 cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey *key,
 										   BufferTag tag, uint8 transition_id,
+										   uint32 requester_lifetime_hint_ms,
+										   bool requester_done_capable,
 										   GcsBlockDedupEntry *cached_reply_out)
 {
 	ClusterGcsBlockDedupShard *shard;
@@ -427,6 +439,22 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 		return GCS_BLOCK_DEDUP_CACHED_REPLY;
 	}
 
+	/*
+	 * MISS path — registration-time TTL routing (review F5 / calibration 2).
+	 * Validate the wire hint BEFORE inserting: a violating request never
+	 * claims a slot.  A GCS_DONE_V1-capable peer MUST carry its legal
+	 * lifetime -- hint 0 (protocol violation) or a hint above what any
+	 * legal configuration could produce (would pin the 8KB slot for days)
+	 * is counted and DENIED, never served.
+	 */
+	if (requester_done_capable
+		&& (requester_lifetime_hint_ms == 0
+			|| (int64)requester_lifetime_hint_ms > GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS)) {
+		pg_atomic_fetch_add_u64(&shard->hint_violation_count, 1);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
+	}
+
 	/* MISS path — insert new in-flight slot.  HASH_ENTER_NULL → may fail
 	 * with cap reached; convert to FULL fail-closed (HC92). */
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
@@ -455,12 +483,116 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	entry->completed_at_ts = 0;
 	entry->registered_at_ts = GetCurrentTimestamp();
 
+	/*
+	 * GCS-race round-2 RC-F + review F5: pin the entry's whole TTL posture
+	 * NOW, by capability.  A capable peer's validated wire hint is its own
+	 * legal-request lifetime (backoff + reply-timeout budget); a legacy
+	 * peer's window is unknowable (its GUCs may all be longer than this
+	 * master's), so it pins the PROTOCOL-MAXIMUM lifetime -- an ~1 h
+	 * availability cost under cap pressure (DENIED FULL), never an early
+	 * reclaim (the master-formula fallback re-opened the re-execution P0).
+	 * Sweep and reclaim consume only these pinned values -- a later SUSET
+	 * change on the master can never re-shorten the window a live request
+	 * registered under.
+	 */
+	entry->done_at_ts = 0;
+	if (requester_done_capable)
+		entry->pinned_lifetime_us = (int64)requester_lifetime_hint_ms * 1000 * 2;
+	else {
+		entry->pinned_lifetime_us = GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS * 1000 * 2;
+		pg_atomic_fetch_add_u64(&shard->legacy_pin_count, 1);
+	}
+	entry->pinned_done_linger_us
+		= (int64)(cluster_gcs_reply_timeout_ms > 0 ? cluster_gcs_reply_timeout_ms : 5000) * 1000
+		  * 2;
+
 	pg_atomic_fetch_add_u32(&shard->entry_count, 1);
 	pg_atomic_fetch_add_u64(&shard->miss_count, 1);
 	result = GCS_BLOCK_DEDUP_MISS_REGISTERED;
 
 	LWLockRelease(&shard->lock.lock);
 	return result;
+}
+
+/*
+ * cluster_gcs_block_dedup_mark_done — GCS-race round-2 RC-F: consume a
+ * requester completion proof.  Full identity verification + COMPLETED
+ * check happen under the same exclusive shard lock as the stamp, so a
+ * concurrent retransmit lookup can never observe a half-marked entry.
+ */
+bool
+cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+								  uint8 transition_id)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+	bool stamped = false;
+
+	Assert(key != NULL);
+	Assert(tag != NULL);
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return false;
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (found && memcmp(&entry->tag, tag, sizeof(BufferTag)) == 0
+		&& entry->transition_id == transition_id && entry->completed_at_ts != 0) {
+		if (entry->done_at_ts == 0)
+			entry->done_at_ts = GetCurrentTimestamp();
+		stamped = true; /* duplicate DONE re-stamps nothing: idempotent */
+		pg_atomic_fetch_add_u64(&shard->done_marked_count, 1);
+	} else
+		pg_atomic_fetch_add_u64(&shard->done_mismatch_count, 1);
+	LWLockRelease(&shard->lock.lock);
+	return stamped;
+}
+
+/*
+ * cluster_gcs_block_dedup_note_done_mismatch — count a handler-level DONE
+ * drop (transport identity binding / reserved-pad validation, review F6)
+ * on the shard that would have consumed it.  Same counter as mark_done's
+ * internal mismatch arm: operators read one "DONE dropped" surface.
+ */
+void
+cluster_gcs_block_dedup_note_done_mismatch(int worker_id)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&shard->done_mismatch_count, 1);
+}
+
+/*
+ * cluster_gcs_block_dedup_lifetime_ms — pure shared lifetime formula
+ * (mirrors dedup_expiry_threshold_us WITHOUT the x2 margin or the us
+ * conversion; the consumer applies its own margin).
+ */
+uint32
+cluster_gcs_block_dedup_lifetime_ms(int initial_backoff_ms, int max_retries, int reply_timeout_ms)
+{
+	int64 lifetime_ms;
+
+	if (initial_backoff_ms <= 0)
+		initial_backoff_ms = 100;
+	if (max_retries < 0)
+		max_retries = 4;
+	if (max_retries > 30)
+		max_retries = 30;
+	if (reply_timeout_ms <= 0)
+		reply_timeout_ms = 5000;
+
+	lifetime_ms = (int64)initial_backoff_ms * ((int64)((1u << max_retries) - 1))
+				  + (int64)(max_retries + 1) * reply_timeout_ms;
+	if (lifetime_ms > (int64)PG_UINT32_MAX)
+		lifetime_ms = (int64)PG_UINT32_MAX;
+	return (uint32)lifetime_ms;
 }
 
 void
@@ -703,13 +835,32 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
 			TimestampTz anchor;
 			int64 age_us;
+			int64 deadline_us;
 
-			anchor = entry->completed_at_ts != 0 ? entry->completed_at_ts : entry->registered_at_ts;
+			/*
+			 * GCS-race round-2 RC-F: per-entry pinned deadlines.  A
+			 * DONE-proven entry only lingers its pinned quarantine (reorder
+			 * slop) from the proof; everything else ages its pinned
+			 * registration-time lifetime from the reply/registration
+			 * anchor.  Entries with no pinned value (0 — impossible after
+			 * this build's registration path, but cheap to guard) fall
+			 * back to the sweep-time threshold.
+			 */
+			if (entry->done_at_ts != 0) {
+				anchor = entry->done_at_ts;
+				deadline_us = entry->pinned_done_linger_us;
+			} else {
+				anchor = entry->completed_at_ts != 0 ? entry->completed_at_ts
+													 : entry->registered_at_ts;
+				deadline_us = entry->pinned_lifetime_us;
+			}
 			if (anchor == 0)
 				continue;
+			if (deadline_us <= 0)
+				deadline_us = threshold_us;
 
 			age_us = (int64)(now - anchor);
-			if (age_us > threshold_us) {
+			if (age_us > deadline_us) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 				removed++;
 			}
@@ -855,6 +1006,32 @@ uint64
 cluster_gcs_block_dedup_get_evict_count(void)
 {
 	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, evict_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_done_marked_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, done_marked_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_done_mismatch_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(
+		offsetof(ClusterGcsBlockDedupShard, done_mismatch_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_hint_violation_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(
+		offsetof(ClusterGcsBlockDedupShard, hint_violation_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_legacy_pin_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, legacy_pin_count));
 }
 
 /*

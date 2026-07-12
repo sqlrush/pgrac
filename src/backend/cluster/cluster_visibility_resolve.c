@@ -53,6 +53,7 @@
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
+#include "cluster/cluster_xid_authority.h" /* GCS-race round-2 RC-E: native-prehistory gate */
 #include "cluster/cluster_xid_stripe.h"	   /* spec-6.15 D4: origin derivation */
 #include "cluster/cluster_xnode_lever.h"   /* spec-6.12c: terminal memo + D0 counters */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
@@ -381,6 +382,28 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 	}
 
 	if (ref->local_xid != raw_xid) {
+		/*
+		 * PGRAC (GCS-race round-2 RC-E): native-prehistory gate.  A recycled
+		 * slot proves nothing about raw_xid -- but when raw_xid is provably
+		 * NATIVE-ERA (below the sealed native high-water, no wraparound yet,
+		 * coverage verified this boot), the local adopted CLOG is alias-free
+		 * authority for it: the native era predates every cluster-era
+		 * allocation (stripe floor >= native_hw), and the post-recovery
+		 * verify proved this node's pg_xact byte-matches the seed's sealed
+		 * truth.  Route LOCAL -- the same evidence the self-origin
+		 * below-floor shortcut above yields on the seed node itself.  Every
+		 * doubt leg (latch unset, wrap recurrence, value >= hw, including
+		 * the whole [native_hw, stripe floor) gap) falls through to the
+		 * existing fail-closed machinery (53R97).
+		 */
+		if (cluster_xid_native_prehistory_provable_full(
+				U64FromFullTransactionId(ReadNextFullTransactionId()),
+				cluster_cr_native_prehistory_covered_hw(), raw_xid)) {
+			out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
+			cluster_rtvis_note_native_prehistory_local();
+			return;
+		}
+
 		/*
 		 * The available evidence says REMOTE, but the slot no longer belongs
 		 * to this tuple-side xid.  Do NOT fall through to PG-native local CLOG;

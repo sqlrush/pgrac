@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/transam.h" /* U64FromFullTransactionId (epoch witness, review F3) */
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -45,6 +46,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_xid_authority.h" /* cluster_xid_epoch_witness_write (review F3) */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -715,6 +717,22 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 				cluster_recovery_anchor_write(&ra);
 			}
 		}
+
+		/*
+		 * PGRAC (GCS-race round-2 review F3): persist this node's own
+		 * pre-migration nextFullXid as the local epoch witness BEFORE the
+		 * symlink flip erases the last local copy of that value.  A
+		 * backup_label first boot consumes it to refuse the native-prehistory
+		 * adopt when the clone was taken after an xid epoch rollover (its
+		 * pg_xact positions below the native high-water are reused by
+		 * cluster-era xids; adopting native bits over them would corrupt live
+		 * outcomes).  Written durably before the flip (same R7 ordering as
+		 * the recovery anchor); a crash in between re-runs this arm with the
+		 * local control file still real, so the rewrite is idempotent.
+		 */
+		if (!cluster_xid_epoch_witness_write(
+				local_pgdata, U64FromFullTransactionId(local_cf.checkPointCopy.nextXid)))
+			return false;
 
 		if (!cluster_cf_contract_persist(local_pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED,
 										 shared_cf.system_identifier))

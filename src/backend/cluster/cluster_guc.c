@@ -419,6 +419,14 @@ int cluster_interconnect_recv_timeout_ms = 30000;
  * old-binary simulation for the PEER_CAPS_REPLY capability exchange. */
 bool cluster_ic_suppress_caps_reply = false;
 
+/* GCS-race round-2 RC-F mixed-version leg -- test-only old-binary
+ * simulation for the GCS_BLOCK_DONE completion-proof protocol. */
+bool cluster_ic_suppress_gcs_done_cap = false;
+
+/* GCS-race round-3 P0-1 -- test-only margin override for the xid wrap
+ * barrier (drives the full real barrier path in TAP). */
+bool cluster_xid_wrap_barrier_force = false;
+
 /* spec-2.4 D9 -- chunked framing + TCP KeepAlive tuning (PGC_POSTMASTER). */
 int cluster_interconnect_payload_max_bytes = 64 * 1024 * 1024; /* 64 MB */
 int cluster_interconnect_chunk_reassembly_timeout_ms = 10000;  /* 10s */
@@ -2911,6 +2919,41 @@ cluster_init_guc(void)
 					 "accept-side PEER_CAPS_REPLY send.  Rolling-upgrade compat "
 					 "tests use it; production leaves it off."),
 		&cluster_ic_suppress_caps_reply, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+	/*
+	 * GCS-race round-2 RC-F mixed-version leg: test-only old-binary
+	 * simulation for the GCS_BLOCK_DONE completion proof.  With it on, this
+	 * node's HELLO omits the GCS_DONE_V1 capability bit and its requesters
+	 * never send GCS_BLOCK_DONE -- exactly the two visible behaviors of a
+	 * binary that predates the protocol, so masters must fall back to the
+	 * legacy protocol-ceiling pin (legacy_pin_count moves, TTL backstop
+	 * carries GC).  HELLO is built by LMON, the DONE send by backends;
+	 * PGC_SIGHUP reaches both.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ic_suppress_gcs_done_cap",
+		gettext_noop("Test-only: simulate a pre-GCS_DONE binary on this node."),
+		gettext_noop("Suppresses the GCS_DONE_V1 HELLO capability bit and the "
+					 "requester-side GCS_BLOCK_DONE send.  Rolling-upgrade compat "
+					 "tests use it; production leaves it off."),
+		&cluster_ic_suppress_gcs_done_cap, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+	/*
+	 * GCS-race round-3 P0-1: test-only margin override for the xid wrap
+	 * barrier.  With it on, LMON treats the 2^32 margin as already reached
+	 * and runs the full REAL barrier path (durable NATIVE_RAW_REUSED stamp
+	 * + DISABLE fanout + ack round + gate open) -- a genuine 2^32 approach
+	 * is not drivable in a test.  One-way in effect: the stamp it triggers
+	 * is permanent.  Consumed by LMON, so PGC_SIGHUP.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.xid_wrap_barrier_force",
+		gettext_noop("Test-only: force the xid wrap barrier to run now."),
+		gettext_noop("Makes LMON treat the xid epoch-rollover margin as reached and run "
+					 "the full barrier (durable native-raw-reused stamp + cluster-wide "
+					 "native prehistory disable).  The stamp is permanent; tests only, "
+					 "production leaves it off."),
+		&cluster_xid_wrap_barrier_force, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.interconnect_recv_timeout_ms",
 							gettext_noop("Tier1 IC per-peer recv read deadline in milliseconds."),

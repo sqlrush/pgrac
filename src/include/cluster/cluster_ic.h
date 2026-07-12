@@ -273,6 +273,27 @@ typedef enum ClusterICPlane {
  * wait): a missing reply just leaves the dialer's view of the peer's
  * capabilities UNKNOWN, which every consumer treats as fail-closed. */
 #define PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 ((uint32)0x00000008U)
+/* PGRAC: GCS-race round-2 review F6 — this binary registers
+ * PGRAC_IC_MSG_GCS_BLOCK_DONE, SENDS the completion proof after consuming a
+ * terminal reply, and pins its dedup registrations with a wire lifetime
+ * hint.  A PROTOCOL capability, advertised unconditionally.  Send-side hard
+ * gate: a requester only sends DONE to a peer that advertised this bit (an
+ * old peer treats the unregistered msg_type as a peer-level failure and
+ * closes the connection); without it the entry simply ages out on its
+ * pinned TTL.  Master-side consumption: a request from a peer WITHOUT this
+ * bit is a legacy registration (pinned at the protocol-maximum lifetime,
+ * never reclaimed early); a peer WITH the bit that sends hint==0 or an
+ * over-maximum hint is a protocol violation (counted, denied). */
+#define PGRAC_IC_HELLO_CAP_GCS_DONE_V1 ((uint32)0x00000010U)
+/* PGRAC: GCS-race round-3 P0-1 — this binary registers
+ * PGRAC_IC_MSG_XID_NATIVE_DISABLE(_ACK) and participates in the xid wrap
+ * barrier.  A PROTOCOL capability, advertised unconditionally.  Send-side
+ * hard gate: the barrier coordinator only sends DISABLE to a peer that
+ * advertised this bit; a member without it can never ACK, so the barrier
+ * stays incomplete and the allocation gate keeps refusing epoch>=1
+ * candidates fail-closed -- the correct posture for a mixed-version
+ * cluster near the xid boundary (upgrade the old binary to proceed). */
+#define PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 ((uint32)0x00000020U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

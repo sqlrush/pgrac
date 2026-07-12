@@ -39,6 +39,8 @@ typedef struct xl_clog_truncate
 extern void TransactionIdSetTreeStatus(TransactionId xid, int nsubxids,
 									   TransactionId *subxids, XidStatus status, XLogRecPtr lsn);
 extern XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
+/* PGRAC: startup-only native-prehistory repair write (GCS-race round-2 RC-E) */
+extern void ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status);
 
 extern Size CLOGShmemBuffers(void);
 extern Size CLOGShmemSize(void);

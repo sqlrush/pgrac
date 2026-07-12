@@ -198,62 +198,77 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_KO_FLUSH_ACK = 25,	  /* PGRAC: spec-5.7 D6 — KO apply-after-drop ACK
 		   * (KoFlushAckHeader: batch_id + acker_node + status), peer -> the dropping node,
 		   * sent ONLY after the peer has really dropped the relfilenode's buffers. */
-	PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE = 26, /* PGRAC: spec-5.13 D8 — leaving node ->
+	PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE = 26,	 /* PGRAC: spec-5.13 D8 — leaving node ->
 		   * survivors (ClusterLeaveAnnouncePayload: leaving_node + leave_epoch +
 		   * preflight flag).  preflight=1 probes peer clean_leave_enabled; preflight=0
 		   * is the real "I am leaving" announce that enters survivors into leave-aware
 		   * reconfig.  Consumed in the membership layer (NOT gated by clean_leave_enabled
 		   * GUC) so a disabled survivor still replies LEAVE_DRAIN_NAK rather than going
 		   * silent (§3.4 mixed-mode). */
-	PGRAC_IC_MSG_LEAVE_DRAIN_ACK = 27,		/* PGRAC: spec-5.13 D8 — survivor -> leaving node
+	PGRAC_IC_MSG_LEAVE_DRAIN_ACK = 27,		 /* PGRAC: spec-5.13 D8 — survivor -> leaving node
 		   * (ClusterLeaveAckPayload, nak=0): "dropped all refs to the leaving node +
 		   * accepted remaster handoff + ready-to-commit".  PRE-epoch readiness ACK
 		   * (does NOT wait for / include cache invalidate — §3.1 F1 non-cycle). */
-	PGRAC_IC_MSG_LEAVE_DRAIN_NAK = 28,		/* PGRAC: spec-5.13 D8 — survivor -> leaving node
+	PGRAC_IC_MSG_LEAVE_DRAIN_NAK = 28,		 /* PGRAC: spec-5.13 D8 — survivor -> leaving node
 		   * (ClusterLeaveAckPayload, nak=1): refuse the clean leave (peer disabled /
 		   * not in quorum).  Leaving node CLUSTER_LEAVE_ABORTED (clean abort, no
 		   * escalate, no epoch bump) on any NAK (§3.4). */
-	PGRAC_IC_MSG_LEAVE_COMMIT_READY = 29,	/* PGRAC: spec-5.13 D6 — leaving node ->
+	PGRAC_IC_MSG_LEAVE_COMMIT_READY = 29,	 /* PGRAC: spec-5.13 D6 — leaving node ->
 		   * survivor coordinator (ClusterLeaveAnnouncePayload, preflight=0): "I have
 		   * drained + every survivor acked; bump the leave epoch now".  The leaving
 		   * node self-drives the drain but the survivor coordinator owns the epoch
 		   * bump (Q6-A); this is the readiness handoff that triggers the coordinator's
 		   * two-phase commit.  Idempotent (re-sent each tick until the CLEAN_LEAVE
 		   * commit is observed; the coordinator ignores it once clean_departed). */
-	PGRAC_IC_MSG_LEAVE_COMMITTED = 30,		/* PGRAC: spec-5.13 Hardening v1.0.1 (P1-V0.7) —
+	PGRAC_IC_MSG_LEAVE_COMMITTED = 30,		 /* PGRAC: spec-5.13 Hardening v1.0.1 (P1-V0.7) —
 		   * survivor coordinator -> leaving node (ClusterLeaveAnnouncePayload, preflight=0):
 		   * "the COMMITTED marker is majority-durable; the durable truth-source exists,
 		   * you may exit".  Gates the leaving node's BARRIER_WAIT -> COMMITTED transition
 		   * so it never departs before the marker is durable (§2.5 exit gate); re-sent
 		   * each tick while the leaver is alive (idempotent; best-effort delivery). */
-	PGRAC_IC_MSG_NODE_REMOVE_ANNOUNCE = 31, /* PGRAC: spec-5.18 D10 — removal coordinator ->
+	PGRAC_IC_MSG_NODE_REMOVE_ANNOUNCE = 31,	 /* PGRAC: spec-5.18 D10 — removal coordinator ->
 		   * survivors (ClusterNodeRemoveAnnouncePayload: coordinator + target + remove_epoch +
 		   * removal_event_id).  Survivors drop their refs to the removed node + reply
 		   * REMOVE_CLEANUP_ACK. */
-	PGRAC_IC_MSG_REMOVE_CLEANUP_ACK = 32,	/* PGRAC: spec-5.18 D10 — survivor -> removal
+	PGRAC_IC_MSG_REMOVE_CLEANUP_ACK = 32,	 /* PGRAC: spec-5.18 D10 — survivor -> removal
 		   * coordinator (ClusterNodeRemoveCleanupAckPayload): "I dropped all refs to the removed
 		   * node + accepted the permanent remaster"; sets the survivor's bit in the coordinator's
 		   * cleanup ACK barrier. */
-	PGRAC_IC_MSG_BACKUP_REQUEST = 33,		/* PGRAC: spec-6.5 D1/D4 — backup coordinator ->
+	PGRAC_IC_MSG_BACKUP_REQUEST = 33,		 /* PGRAC: spec-6.5 D1/D4 — backup coordinator ->
 		   * peers (ClusterBackupWireRequest): START / STOP / ABORT / RESTORE_POINT request.
 		   * LMON-mediated; peer LMON executes the local native backup/restore-point leg and
 		   * replies with BACKUP_ACK. */
-	PGRAC_IC_MSG_BACKUP_ACK = 34,			/* PGRAC: spec-6.5 D1/D4 — peer -> backup
+	PGRAC_IC_MSG_BACKUP_ACK = 34,			 /* PGRAC: spec-6.5 D1/D4 — peer -> backup
 			   * coordinator (ClusterBackupWireAck): local thread REDO/checkpoint/stop-cut
 			   * metadata or fail-closed NAK reason. */
-	PGRAC_IC_MSG_SMART_FUSION_DURABLE = 35, /* PGRAC: spec-6.2 D8 — origin durable-LSN
+	PGRAC_IC_MSG_SMART_FUSION_DURABLE = 35,	 /* PGRAC: spec-6.2 D8 — origin durable-LSN
 			   * gossip for Smart Fusion dependency release. */
-	PGRAC_IC_MSG_UNDO_HORIZON = 36,			/* PGRAC: spec-5.22e D5-2 — per-peer undo
+	PGRAC_IC_MSG_UNDO_HORIZON = 36,			 /* PGRAC: spec-5.22e D5-2 — per-peer undo
 			   * retention horizon report (LMON-only producer; p2p, never
 			   * broadcast; capability-gated on UNDO_HORIZON_V1 so an old
 			   * peer never sees an unregistered msg_type). */
-	PGRAC_IC_MSG_PEER_CAPS_REPLY = 37		/* PGRAC: spec-2.2 additive amendment
+	PGRAC_IC_MSG_PEER_CAPS_REPLY = 37,		 /* PGRAC: spec-2.2 additive amendment
 			   * (spec-5.22e D5 prereq) — acceptor -> dialer capability
 			   * reply carrying the acceptor's own standard 64-byte HELLO
 			   * as payload (LMON-only producer; p2p, never broadcast;
 			   * capability-gated on the dialer's CAPS_REPLY_V1 HELLO bit
 			   * so an old dialer never sees an unregistered msg_type). */
-	/* values 38..255 available for future sub-spec; never reuse 0..37 */
+	PGRAC_IC_MSG_GCS_BLOCK_DONE = 38,		 /* PGRAC: GCS-race round-2 RC-F —
+			   * requester -> master completion proof for an accepted
+			   * terminal block reply; the master verifies full identity
+			   * and stamps the dedup entry done (advisory: loss is
+			   * absorbed by the pinned TTL backstop). */
+	PGRAC_IC_MSG_XID_NATIVE_DISABLE = 39,	 /* PGRAC: GCS-race round-3 P0-1 —
+			   * wrap-barrier coordinator -> member: clear your
+			   * native-prehistory coverage latch (one-way) and ACK; the
+			   * NATIVE_RAW_REUSED authority stamp is already durable
+			   * (LMON-only producer; p2p per alive member;
+			   * capability-gated on XID_NATIVE_DISABLE_V1). */
+	PGRAC_IC_MSG_XID_NATIVE_DISABLE_ACK = 40 /* PGRAC: GCS-race round-3 P0-1 —
+			   * member -> coordinator: my latch is off; sets the member's
+			   * bit in the barrier ack bitmap (LMON-only producer; p2p,
+			   * never broadcast). */
+	/* values 41..255 available for future sub-spec; never reuse 0..40 */
 } ClusterICMsgType;
 
 
