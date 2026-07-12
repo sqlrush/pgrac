@@ -256,6 +256,8 @@ static const char *const BuiltinTrancheNames[] = {
 		"ClusterXidStripe",
 		/* PGRAC LWTRANCHE_CLUSTER_OID_LEASE: spec-6.14 D6 OID lease region */
 		"ClusterOidLease",
+		/* PGRAC LWTRANCHE_CLUSTER_NATIVE_PREHISTORY: GCS-race round-3b drain */
+		"ClusterNativePrehistory",
 	#endif
 	};
 

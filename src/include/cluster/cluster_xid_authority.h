@@ -59,6 +59,19 @@
  * ============================================================ */
 
 #define CLUSTER_XID_AUTHORITY_MAGIC 0x0141D617
+/*
+ * Round-3b P0-4: an image carrying NATIVE_RAW_REUSED is written with THIS
+ * magic instead.  A pre-barrier binary validates the magic but knows
+ * nothing of the flag; on the old magic it would silently ignore the bit
+ * and re-latch the native prehistory (wrong LOCAL verdicts while newer
+ * nodes allocate epoch>=1 xids).  The stamped magic makes every such
+ * binary FAIL the read outright and fail-close (bootstrap 53RB5 refuses
+ * the boot; the coverage verify leaves the latch off).  Barrier-capable
+ * binaries accept both magics; the one-way settle predicate additionally
+ * requires the stamped magic, so a flag written under the old magic (a
+ * pre-hardening test tree) is upgraded by the next re-assert.
+ */
+#define CLUSTER_XID_AUTHORITY_MAGIC_RAW_REUSED 0x0143D617
 #define CLUSTER_XID_AUTHORITY_VERSION 1
 
 /* A clean native-era shutdown published a complete hw + prehistory.
