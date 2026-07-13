@@ -1992,6 +1992,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	HeapTuple	heaptup;
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
+	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC (spec-3.4a D3 / spec-3.4b D5): hoisted to function scope per PG style. */
@@ -2141,6 +2142,22 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 #endif
 
 	/* NO EREPORT(ERROR) from here till changes are logged */
+	/*
+	 * PGRAC: take the visibility-map page's content lock BEFORE the critical
+	 * section when this mutation will clear its bit.  In cluster mode the
+	 * LockBuffer may perform a cross-node PCM X acquire that can ereport --
+	 * safe here, but an ERROR inside the critical section escalates to PANIC
+	 * (CritSectionCount > 0).  Holding the content lock across the section
+	 * also blocks the (content-lock serialized) BAST downgrade, so the
+	 * coverage cannot be revoked before the in-crit clear runs.
+	 */
+	vm_locked = false;
+	if (PageIsAllVisible(BufferGetPage(buffer)) && BufferIsValid(vmbuffer))
+	{
+		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		vm_locked = true;
+	}
+
 	START_CRIT_SECTION();
 
 	RelationPutHeapTuple(relation, buffer, heaptup,
@@ -2158,9 +2175,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	{
 		all_visible_cleared = true;
 		PageClearAllVisible(BufferGetPage(buffer));
-		visibilitymap_clear(relation,
-							ItemPointerGetBlockNumber(&(heaptup->t_self)),
-							vmbuffer, VISIBILITYMAP_VALID_BITS);
+		visibilitymap_clear_locked(relation,
+								   ItemPointerGetBlockNumber(&(heaptup->t_self)),
+								   vmbuffer, VISIBILITYMAP_VALID_BITS);
 	}
 
 	/*
@@ -2292,6 +2309,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	}
 
 	END_CRIT_SECTION();
+
+	if (vm_locked)
+		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -2435,6 +2455,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	PGAlignedBlock scratch;
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
+	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	bool		needwal;
 	Size		saveFreeSpace;
 	bool		need_tuple_data = RelationIsLogicallyLogged(relation);
@@ -2585,6 +2606,15 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		}
 #endif
 
+		/* PGRAC: pre-crit VM content lock — see heap_insert. */
+		vm_locked = false;
+		if (PageIsAllVisible(page) && !(options & HEAP_INSERT_FROZEN)
+			&& BufferIsValid(vmbuffer))
+		{
+			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			vm_locked = true;
+		}
+
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
 
@@ -2645,9 +2675,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		{
 			all_visible_cleared = true;
 			PageClearAllVisible(page);
-			visibilitymap_clear(relation,
-								BufferGetBlockNumber(buffer),
-								vmbuffer, VISIBILITYMAP_VALID_BITS);
+			visibilitymap_clear_locked(relation,
+									   BufferGetBlockNumber(buffer),
+									   vmbuffer, VISIBILITYMAP_VALID_BITS);
 		}
 		else if (all_frozen_set)
 			PageSetAllVisible(page);
@@ -2808,6 +2838,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		}
 
 		END_CRIT_SECTION();
+
+		if (vm_locked)
+			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
@@ -3414,6 +3447,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	BlockNumber block;
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
+	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	TransactionId new_xmax;
 	uint16		new_infomask,
 				new_infomask2;
@@ -3812,6 +3846,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 #endif
 
+	/* PGRAC: pre-crit VM content lock — see heap_insert. */
+	vm_locked = false;
+	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+	{
+		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		vm_locked = true;
+	}
+
 	START_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3836,8 +3878,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	{
 		all_visible_cleared = true;
 		PageClearAllVisible(page);
-		visibilitymap_clear(relation, BufferGetBlockNumber(buffer),
-							vmbuffer, VISIBILITYMAP_VALID_BITS);
+		visibilitymap_clear_locked(relation, BufferGetBlockNumber(buffer),
+								   vmbuffer, VISIBILITYMAP_VALID_BITS);
 	}
 
 	/* store transaction information of xact deleting the tuple */
@@ -3955,6 +3997,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 
 	END_CRIT_SECTION();
+
+	if (vm_locked)
+		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC (spec-3.4a D5): register touched ITL handle outside CRIT. */
@@ -4095,6 +4140,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				newbuf,
 				vmbuffer = InvalidBuffer,
 				vmbuffer_new = InvalidBuffer;
+	bool		vm_locked;		/* PGRAC: pre-crit VM content lock held */
+	bool		vm_locked_new;
 	bool		need_toast;
 	Size		newtupsize,
 				pagefree;
@@ -4760,6 +4807,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 		Assert(HEAP_XMAX_IS_LOCKED_ONLY(infomask_lock_old_tuple));
 
+		/* PGRAC: pre-crit VM content lock — see heap_insert. */
+		vm_locked = false;
+		if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+		{
+			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			vm_locked = true;
+		}
+
 		START_CRIT_SECTION();
 
 		/* Clear obsolete visibility flags ... */
@@ -4783,8 +4838,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		 * worthwhile.
 		 */
 		if (PageIsAllVisible(page) &&
-			visibilitymap_clear(relation, block, vmbuffer,
-								VISIBILITYMAP_ALL_FROZEN))
+			visibilitymap_clear_locked(relation, block, vmbuffer,
+									   VISIBILITYMAP_ALL_FROZEN))
 			cleared_all_frozen = true;
 
 		MarkBufferDirty(buffer);
@@ -4809,6 +4864,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		}
 
 		END_CRIT_SECTION();
+
+		if (vm_locked)
+			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
@@ -5060,6 +5118,50 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 #endif
 
+	/*
+	 * PGRAC: pre-crit VM content locks (both heap pages) — see heap_insert.
+	 * One VM page covers ~32K heap blocks, so the two heap pages VERY often
+	 * share one VM buffer: lock it ONCE (a second acquire of the
+	 * non-reentrant content lock self-deadlocks — caught live by PG219
+	 * hanging at test 110).  When the two VM buffers differ, lock in
+	 * ascending buffer-id order so reverse-direction concurrent updates
+	 * cannot ABBA.
+	 */
+	vm_locked = false;
+	vm_locked_new = false;
+	{
+		bool		need_old = PageIsAllVisible(BufferGetPage(buffer))
+			&& BufferIsValid(vmbuffer);
+		bool		need_new = newbuf != buffer
+			&& PageIsAllVisible(BufferGetPage(newbuf))
+			&& BufferIsValid(vmbuffer_new);
+
+		if (need_old && need_new && vmbuffer_new == vmbuffer)
+			need_new = false;	/* same map page: one lock covers both */
+
+		if (need_old && need_new
+			&& vmbuffer_new < vmbuffer)
+		{
+			LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
+			vm_locked_new = true;
+			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			vm_locked = true;
+		}
+		else
+		{
+			if (need_old)
+			{
+				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				vm_locked = true;
+			}
+			if (need_new)
+			{
+				LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
+				vm_locked_new = true;
+			}
+		}
+	}
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
@@ -5137,15 +5239,15 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	{
 		all_visible_cleared = true;
 		PageClearAllVisible(BufferGetPage(buffer));
-		visibilitymap_clear(relation, BufferGetBlockNumber(buffer),
-							vmbuffer, VISIBILITYMAP_VALID_BITS);
+		visibilitymap_clear_locked(relation, BufferGetBlockNumber(buffer),
+								   vmbuffer, VISIBILITYMAP_VALID_BITS);
 	}
 	if (newbuf != buffer && PageIsAllVisible(BufferGetPage(newbuf)))
 	{
 		all_visible_cleared_new = true;
 		PageClearAllVisible(BufferGetPage(newbuf));
-		visibilitymap_clear(relation, BufferGetBlockNumber(newbuf),
-							vmbuffer_new, VISIBILITYMAP_VALID_BITS);
+		visibilitymap_clear_locked(relation, BufferGetBlockNumber(newbuf),
+								   vmbuffer_new, VISIBILITYMAP_VALID_BITS);
 	}
 
 	if (newbuf != buffer)
@@ -5187,6 +5289,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 
 	END_CRIT_SECTION();
+
+	if (vm_locked)
+		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+	if (vm_locked_new)
+		LockBuffer(vmbuffer_new, BUFFER_LOCK_UNLOCK);
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -5655,6 +5762,8 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	ItemId		lp;
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
+
+	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	BlockNumber block;
 	TransactionId xid,
 				xmax;
@@ -6843,6 +6952,14 @@ failed:
 	}
 #endif
 
+	/* PGRAC: pre-crit VM content lock — see heap_insert. */
+	vm_locked = false;
+	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+	{
+		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		vm_locked = true;
+	}
+
 	START_CRIT_SECTION();
 
 	/*
@@ -6875,8 +6992,8 @@ failed:
 
 	/* Clear only the all-frozen bit on visibility map if needed */
 	if (PageIsAllVisible(page) &&
-		visibilitymap_clear(relation, block, vmbuffer,
-							VISIBILITYMAP_ALL_FROZEN))
+		visibilitymap_clear_locked(relation, block, vmbuffer,
+								   VISIBILITYMAP_ALL_FROZEN))
 		cleared_all_frozen = true;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -6980,6 +7097,9 @@ failed:
 	}
 
 	END_CRIT_SECTION();
+
+	if (vm_locked)
+		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
 	result = TM_Ok;
 

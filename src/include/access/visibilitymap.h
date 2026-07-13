@@ -28,6 +28,9 @@
 
 extern bool visibilitymap_clear(Relation rel, BlockNumber heapBlk,
 								Buffer vmbuf, uint8 flags);
+/* PGRAC: in-crit variant, map page content lock held by the caller. */
+extern bool visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk,
+									   Buffer vmbuf, uint8 flags);
 extern void visibilitymap_pin(Relation rel, BlockNumber heapBlk,
 							  Buffer *vmbuf);
 extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);

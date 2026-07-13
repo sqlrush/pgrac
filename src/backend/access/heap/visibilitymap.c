@@ -22,24 +22,23 @@
  *
  * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
  *
- *	visibilitymap_pin now PREFETCHES the cluster PCM X grant for the map
- *	page (a momentary LockBuffer EXCLUSIVE/UNLOCK pair, cluster mode only).
- *	Heap mutators clear map bits from INSIDE their WAL critical section
- *	(heap_insert/update/delete -> visibilitymap_clear -> LockBuffer), and
- *	in cluster mode that LockBuffer may need a cross-node X transfer that
+ *	visibilitymap_clear is split into a lock/unlock shell plus
+ *	visibilitymap_clear_locked (the bit clear itself, caller holds the map
+ *	page's content lock).  Heap mutators clear map bits from INSIDE their
+ *	WAL critical section, and in cluster mode the LockBuffer hidden inside
+ *	the old monolithic clear could need a cross-node PCM X transfer that
  *	can fail: an ereport(ERROR) with CritSectionCount > 0 escalates to
  *	PANIC and fail-stops the node (observed live: heap_update ->
- *	visibilitymap_clear -> X-transfer timeout -> PANIC).  This function is
- *	the documented "do the failure-prone work BEFORE the critical section"
- *	hook for exactly those callers, so the cross-node acquire is hoisted
- *	here: with cluster.gcs_block_local_cache (hold-until-revoked) the X
- *	then stays resident and the in-crit clear takes the owned-cover fast
- *	path with no wire traffic.  A revoke landing in the narrow pin->crit
- *	window can still force an in-crit transfer (BAST X->S is content-lock
- *	serialized, not crit-aware); that residual is a bounded fail-stop, not
- *	a silent-corruption risk, and is tracked as a known issue.
- *	Single-node / cluster-off builds and paths are unaffected
- *	(cluster_pcm_is_active() gates to a no-op).
+ *	visibilitymap_clear -> X-transfer timeout -> PANIC).  The heapam
+ *	callers therefore take the map page's content lock BEFORE
+ *	START_CRIT_SECTION (where a cross-node acquire may safely ERROR) and
+ *	call the _locked variant inside the critical section, releasing after
+ *	END_CRIT_SECTION.  Holding the content lock across the section also
+ *	makes the coverage IRREVOCABLE: a cluster BAST X->S downgrade is
+ *	content-lock serialized, so no revoke can slip in between the pre-crit
+ *	acquire and the in-crit clear (no residual PANIC window at all).
+ *	Out-of-crit callers keep using visibilitymap_clear unchanged, and
+ *	single-node builds see only the (behavior-identical) split.
  *
  *	Spec: spec-2.36-gcs-block-transfer.md
  *
@@ -120,9 +119,6 @@
 #include "storage/smgr.h"
 #include "utils/inval.h"
 
-#ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_pcm_lock.h"	/* PGRAC: cluster_pcm_is_active */
-#endif
 
 
 /*#define TRACE_VISIBILITYMAP */
@@ -185,6 +181,35 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
 
 	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	cleared = visibilitymap_clear_locked(rel, heapBlk, vmbuf, flags);
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+
+	return cleared;
+}
+
+/*
+ *	visibilitymap_clear_locked - clear bits, map page content lock HELD
+ *
+ * PGRAC: the body of visibilitymap_clear without the lock/unlock shell, for
+ * callers that must clear from inside a WAL critical section: they acquire
+ * the map page's content lock BEFORE the section (where a cluster PCM
+ * cross-node acquire may safely ereport) and release it after, so no
+ * failure-capable work remains inside (see the file header).
+ */
+bool
+visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
+	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
+	uint8		mask = flags << mapOffset;
+	char	   *map;
+	bool		cleared = false;
+
+	Assert(flags & VISIBILITYMAP_VALID_BITS);
+	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
+	Assert(BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock);
+
 	map = PageGetContents(BufferGetPage(vmbuf));
 
 	if (map[mapByte] & mask)
@@ -194,8 +219,6 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		MarkBufferDirty(vmbuf);
 		cleared = true;
 	}
-
-	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
 }
@@ -225,42 +248,11 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	if (BufferIsValid(*vmbuf))
 	{
 		if (BufferGetBlockNumber(*vmbuf) == mapBlock)
-		{
-#ifdef USE_PGRAC_CLUSTER
-			/*
-			 * PGRAC: re-establish cluster X coverage even on buffer reuse —
-			 * a revoke may have downgraded the grant since the earlier pin
-			 * (see PGRAC MODIFICATIONS in the file header).
-			 */
-			if (cluster_pcm_is_active())
-			{
-				LockBuffer(*vmbuf, BUFFER_LOCK_EXCLUSIVE);
-				LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
-			}
-#endif
 			return;
-		}
 
 		ReleaseBuffer(*vmbuf);
 	}
 	*vmbuf = vm_readbuf(rel, mapBlock, true);
-
-#ifdef USE_PGRAC_CLUSTER
-	/*
-	 * PGRAC: prefetch the cluster PCM X grant OUTSIDE the caller's upcoming
-	 * critical section, so the in-crit visibilitymap_clear takes the
-	 * owned-cover fast path instead of a cross-node transfer whose failure
-	 * would escalate ERROR -> PANIC under CritSectionCount > 0 (see the
-	 * PGRAC MODIFICATIONS note in the file header).  The momentary
-	 * EXCLUSIVE/UNLOCK pair is what registers the grant; with the
-	 * hold-until-revoked cache the X residency survives the unlock.
-	 */
-	if (cluster_pcm_is_active() && BufferIsValid(*vmbuf))
-	{
-		LockBuffer(*vmbuf, BUFFER_LOCK_EXCLUSIVE);
-		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
-	}
-#endif
 }
 
 /*

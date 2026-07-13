@@ -78,7 +78,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'cluster.crossnode_runtime_visibility = off',
 		'cluster.gcs_block_local_cache = on',
 		'cluster.gcs_reply_timeout_ms = 2000',
-		'cluster.gcs_block_retransmit_max_retries = 12',
+		'cluster.gcs_block_retransmit_max_retries = 8',
 		'cluster.gcs_block_starvation_max_retries = 60' ]);
 $pair->start_pair;
 usleep(3_000_000);
@@ -110,6 +110,13 @@ usleep(300_000);
 
 my $tt_b = tt_noise_sum();
 my $lw_b = lost_write_sum();
+# Cross-node motion baselines: the ping-pong MUST move ownership over the
+# wire (review blocker: a fixture that degrades to local-only writes would
+# pass a bare row count).
+my $xfer_b = state_int($n0, 'gcs', 'block_x_granted_from_holder_count')
+	+ state_int($n1, 'gcs', 'block_x_granted_from_holder_count')
+	+ state_int($n0, 'gcs', 'block_from_holder_ship_count')
+	+ state_int($n1, 'gcs', 'block_from_holder_ship_count');
 
 # Ping-pong: each INSERT needs X on block 0 (fillfactor keeps every row
 # there), so ownership crosses the wire every iteration.  INSERT-only: no
@@ -139,9 +146,24 @@ my $elapsed = time() - $t0;
 diag(sprintf("ping-pong: %d writes (+%d retried aborts) in %.1fs (%.0fms/write)",
 		$writes, $aborts, $elapsed, 1000 * $elapsed / $writes));
 
-# L3 — bounded (generous: 2s/write would already be pathological).
-cmp_ok($elapsed, '<', 2 * $writes,
-	'L3 ping-pong completed inside the wall-clock budget (no wedge)');
+# L3 — bounded.  Review blocker: the budget must be tight enough that a
+# regression to timeout-mediated progress (>= 1.5s per blocked round) FAILS:
+# 30 cross-node writes complete in ~0.3s healthy, so 10s total (330ms/write)
+# leaves 30x headroom while any per-round timeout burn blows straight past it.
+cmp_ok($elapsed, '<', 10,
+	'L3 ping-pong completed inside the tight wall-clock budget '
+	  . '(timeout-mediated progress would fail this)');
+
+# L3 — the ownership really crossed the wire, repeatedly.
+my $xfer_d = state_int($n0, 'gcs', 'block_x_granted_from_holder_count')
+	+ state_int($n1, 'gcs', 'block_x_granted_from_holder_count')
+	+ state_int($n0, 'gcs', 'block_from_holder_ship_count')
+	+ state_int($n1, 'gcs', 'block_from_holder_ship_count')
+	- $xfer_b;
+diag("cross-node X-transfer delta = $xfer_d");
+cmp_ok($xfer_d, '>=', $ROUNDS,
+	'L3 ownership crossed the wire at least once per round (real ping-pong, '
+	  . 'not local writes)');
 
 # L2 — exact convergence via the SHARED-STORAGE ground truth.  Any row read
 # would trip the orthogonal fresh-cluster low-xid 53R97 fail-close (tasks
@@ -183,6 +205,25 @@ my $normal = $by_flag{1};
 my $want_n = 1 + $writes;
 diag("shared-storage page 0: pd_lower=$pd_lower lp=$nline "
 	. "(normal=$by_flag{1} unused=$by_flag{0} redirect=$by_flag{2} dead=$by_flag{3})");
+
+# Value-level physical verification (review blocker: LP count alone cannot
+# catch a torn/overwritten tuple body).  For each NORMAL pointer decode the
+# heap tuple: t_hoff at byte 22 of the header, then two int4 columns (k, v)
+# -- the fixture has no NULLs and no varlena.  The v-sum has one exact
+# closed form; any stale-copy body overwrite breaks it.
+my $vsum = 0;
+for my $i (0 .. $nline - 1) {
+	my $lp = unpack('V', substr($page, 24 + 4 * $i, 4));
+	next unless ((($lp >> 15) & 0x3) == 1);
+	my $off = $lp & 0x7FFF;
+	my $t_hoff = unpack('C', substr($page, $off + 22, 1));
+	my (undef, $v) = unpack('ll', substr($page, $off + $t_hoff, 8));
+	$vsum += $v;
+}
+my $want_sum = 0;
+for my $r (1 .. $ROUNDS) { $want_sum += ($r * 10 + 0) + ($r * 10 + 1); }
+is($vsum, $want_sum,
+	"L2 physical tuple v-sum exact ($want_sum; no torn or stale-copy body)");
 # Every committed write is one line pointer; an ABORTED attempt (counted
 # above, fail-closed retryable) also leaves a DEAD line pointer.  So the
 # exact closed-form is [want, want + aborts]: any lost insert or stale-copy

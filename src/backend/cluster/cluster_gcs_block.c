@@ -6737,9 +6737,25 @@ static const ClusterICMsgTypeInfo gcs_block_forward_info = {
  *	holders / timeouts surface as `return false` → master replies
  *	DENIED_INVALIDATE_TIMEOUT (status 11) → sender 53R91.
  * ============================================================ */
+/*
+ * Ruling ② review P1 — explicit per-round outcome, so a BUSY negative ACK can
+ * never mask a harder failure: an epoch fence or a dropped send must surface
+ * as fail-closed (no retry-with-backoff), and only a PURE busy round is the
+ * caller's cue to retry.  Priority: EPOCH_STALE > SEND_FAIL > BUSY (TIMEOUT
+ * is mutually exclusive with BUSY -- the busy wake breaks the wait early).
+ */
+typedef enum GcsInvalRoundOutcome {
+	GCS_INVAL_ROUND_FULL_ACK = 0,
+	GCS_INVAL_ROUND_EPOCH_STALE,
+	GCS_INVAL_ROUND_SEND_FAIL,
+	GCS_INVAL_ROUND_BUSY,
+	GCS_INVAL_ROUND_TIMEOUT,
+} GcsInvalRoundOutcome;
+
 static bool
 gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, uint32 holders_bm,
-											bool via_outbound_ring, bool *out_busy)
+											bool via_outbound_ring,
+											GcsInvalRoundOutcome *out_outcome)
 {
 	GcsBlockInvalidatePayload inv;
 	uint64 current_epoch;
@@ -6753,8 +6769,11 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	 * (runs at the master; service-time when master != requester). */
 	ClusterXpScope xp_inv;
 
-	if (out_busy != NULL)
-		*out_busy = false;
+	bool send_fail = false;
+	bool round_busy = false;
+
+	if (out_outcome != NULL)
+		*out_outcome = GCS_INVAL_ROUND_TIMEOUT;
 	if (ClusterGcsBlock == NULL)
 		return false;
 
@@ -6865,6 +6884,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 															  (uint32)n, &inv, sizeof(inv))) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count,
 											1);
+					send_fail = true;
 					continue;
 				}
 			} else
@@ -6875,10 +6895,13 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 		}
 
-		/* Poll-with-CV wait for full ack collection or timeout. */
+		/* Poll-with-CV wait for full ack collection or timeout.  A dropped
+		 * send makes full collection impossible -- fail the round honestly
+		 * NOW instead of burning the budget against a holder that never got
+		 * the directive (review P1: send-fail must not be masked). */
 		start_lsn = (long)GetCurrentTimestamp();
 		ConditionVariablePrepareToSleep(&ClusterGcsBlock->invalidate_broadcast_cv);
-		for (;;) {
+		for (; !send_fail;) {
 			acked_bm = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm);
 			if ((acked_bm & holders_bm) == holders_bm) {
 				full_ack = true;
@@ -6890,8 +6913,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 			 * clears pending_x, backs off briefly and retries with a NEW
 			 * round identity. */
 			if (pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_busy) != 0) {
-				if (out_busy != NULL)
-					*out_busy = true;
+				round_busy = true;
 				break;
 			}
 			elapsed_ms = (long)((GetCurrentTimestamp() - start_lsn) / 1000);
@@ -6930,6 +6952,20 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	 */
 	if (full_ack && cluster_epoch_get_current() != current_epoch)
 		full_ack = false;
+
+	/* Review P1 — resolve the round outcome with hard failures first. */
+	if (out_outcome != NULL) {
+		if (full_ack)
+			*out_outcome = GCS_INVAL_ROUND_FULL_ACK;
+		else if (cluster_epoch_get_current() != current_epoch)
+			*out_outcome = GCS_INVAL_ROUND_EPOCH_STALE;
+		else if (send_fail)
+			*out_outcome = GCS_INVAL_ROUND_SEND_FAIL;
+		else if (round_busy)
+			*out_outcome = GCS_INVAL_ROUND_BUSY;
+		else
+			*out_outcome = GCS_INVAL_ROUND_TIMEOUT;
+	}
 
 	/* Release the slot.  Broadcast the CV afterwards: concurrent claimants
 	 * sleep on the same invalidate_broadcast_cv (see the bounded claim-wait
@@ -7276,7 +7312,7 @@ cluster_gcs_block_local_x_upgrade_ext(BufferTag tag, bool *out_busy)
 
 		holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
 		if (holders_bm != 0) {
-			bool round_busy = false;
+			GcsInvalRoundOutcome outcome = GCS_INVAL_ROUND_TIMEOUT;
 
 			memset(&synth, 0, sizeof(synth));
 			/* PGRAC: spec-6.14a D1 — domain-tagged id (top bit = local-upgrade
@@ -7288,20 +7324,29 @@ cluster_gcs_block_local_x_upgrade_ext(BufferTag tag, bool *out_busy)
 			synth.tag = tag;
 			synth.sender_node = cluster_node_id;
 
-			if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true, &round_busy)
+			if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true, &outcome)
 				/* Exact-epoch fence (grant side): the acks certify drops at
 				 * the epoch the broadcast ran under.  If the epoch moved at
 				 * any point across this upgrade, the rebuilt S set may not
 				 * be covered — fail closed, retryable (8.A stale-proof). */
 				|| cluster_epoch_get_current() != upgrade_epoch) {
-				/* Ruling ② — BUSY is a deliberate negative ACK, not a lost
-				 * holder: report it to the caller (which backs off + retries
-				 * with a new round identity) and keep the timeout counter
-				 * for genuine timeouts only. */
-				if (round_busy) {
+				/* Ruling ② review P1 — only a PURE busy round retries with
+				 * backoff.  The OUTER epoch fence takes priority over BUSY
+				 * too (review round 2): the epoch can move between the
+				 * upgrade_epoch capture and the slot claim, in which case
+				 * the round runs (and may collect a BUSY) entirely at the
+				 * NEW epoch — the inner outcome then reads BUSY while the
+				 * upgrade's own epoch premise is already dead.  Retrying
+				 * that with backoff would spin against a fence; it must
+				 * fail closed to the statement level like any epoch move.
+				 * A dropped send / genuine timeout are lost-directive
+				 * shapes counted as timeouts (never masked by BUSY). */
+				if (outcome == GCS_INVAL_ROUND_BUSY
+					&& cluster_epoch_get_current() == upgrade_epoch) {
 					if (out_busy != NULL)
 						*out_busy = true;
-				} else
+				} else if (outcome != GCS_INVAL_ROUND_EPOCH_STALE
+						   && cluster_epoch_get_current() == upgrade_epoch)
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
 				covered = false;
 			} else {
@@ -7691,6 +7736,20 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		return;
 
 	/*
+	 * Review P0 (ownership-gen wave) — bind inv->master_node to the
+	 * transport source.  The execute path sends the (possibly holder-state-
+	 * mutating) ACK to inv->master_node and consults the BUSY capability of
+	 * that node: a forged master_node would steer the drop proof to a node
+	 * that never ran the broadcast (its slot logic drops it) while the REAL
+	 * master times out and retries against an already-dropped copy.  Count
+	 * via the dedup misroute counter family; drop without executing.
+	 */
+	if (inv->master_node != (int32)env->source_node_id) {
+		cluster_gcs_block_dedup_note_misroute();
+		return;
+	}
+
+	/*
 	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
 	 * INVALIDATE receive side.  Same invariant as the REQUEST dedup guard
 	 * above: INVALIDATE is staged and routed by shard(tag) (payload_shard),
@@ -7765,6 +7824,20 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		return;
 
 	if (ack->checksum != gcs_block_compute_invalidate_ack_checksum(ack)) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+		return;
+	}
+
+	/*
+	 * Review P0 (ownership-gen wave) — bind the payload identity to the
+	 * TRANSPORT.  Every consumer below keys off ack->sender_node (the
+	 * slotless S-bit clear, the PI notes, acked_bm, the BUSY abort): a
+	 * mismatched sender could forge a drop proof for ANOTHER holder (the
+	 * master clears that holder's bit / fills its acked_bm slot -> grants X
+	 * against a copy that still exists, 8.A).  Same discipline as the DONE
+	 * handler's F6 validator.  Count + drop; no state may change.
+	 */
+	if (ack->sender_node != (int32)env->source_node_id) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 		return;
 	}

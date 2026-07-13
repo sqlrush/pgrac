@@ -232,6 +232,13 @@ jobs:
           # triple bring-up + injection legs need the wall clock (L342: every
           # new t/ file lands in a shard the same commit).
           - { name: stage7-gcs-block-race, ranges: "390-390", unit: false, regress: false }
+          # t/392-397 GCS-race round-2 + ownership-generation wave (2-node
+          # pairs): raw-xid visibility collision, copy->drop lost-write
+          # window, W1 cached-cover / W2 restore-ABA / W3 grant-finalize
+          # window REDs, and the no-injection ownership convergence gate.
+          # Own shard: six ClusterPair bring-ups need the wall clock
+          # (L342: every new t/ file lands in a shard the same commit).
+          - { name: stage7-gcs-ownership-gen, ranges: "392-397", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

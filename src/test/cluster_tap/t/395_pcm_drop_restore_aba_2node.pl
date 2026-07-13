@@ -116,7 +116,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		# into a stale_reply_drop (a test-parameter artifact, not a defect).
 		'cluster.gcs_block_invalidate_ack_timeout_ms = 4000',
 		'cluster.gcs_reply_timeout_ms = 2000',
-		'cluster.gcs_block_retransmit_max_retries = 12',
+		'cluster.gcs_block_retransmit_max_retries = 8',
 		'cluster.gcs_block_starvation_max_retries = 60' ]);
 $pair->start_pair;
 usleep(3_000_000);
@@ -191,13 +191,28 @@ my $pin_elapsed = time() - $t_pin;
 $reqh->finish;
 my $req_elapsed = time() - $t_req;
 disarm($n0);
+
+# L2 — the W2 fix contract, full-chain proven (review blocker: these MUST be
+# hard assertions, not just a polled diag — without them a broken restore
+# guard regresses silently).
+my $aba_d = state_int($n0, 'pcm', 'restore_aba_detected_count') - $aba_b;
+diag(sprintf("aba delta=%d; reader elapsed=%.2fs out=[%s] err=[%s]",
+		$aba_d, $pin_elapsed, $pin_out // '',
+		($pin_err // '') =~ s/\n.*//sr));
+cmp_ok($aba_d, '>=', 1,
+	'L2 restore-ABA detected (restore_aba_detected_count advanced; old code '
+	  . 'silently restored the stale pre-drop X here)');
+like(($pin_out // ''), qr/^1$/m,
+	'L2 the pinning reader completed cleanly (count=1)');
+
 # L3 — convergence.  With ruling ②'s RETRYABLE_BUSY the requester no longer
 # burns its ACK budget against the circular wait (reader's in-flight S acquire
 # holds GRANT_PENDING -> INVALIDATE parks -> upgrade waits): the holder answers
 # BUSY, the master aborts the round, clears pending_x (unblocking that very
 # reader) and retries with a fresh round identity after a short backoff — so
-# the SAME statement completes.  The VM-page X prefetch (visibilitymap_pin)
-# keeps the in-crit VM clear off the wire, so no ERROR->PANIC escalation
+# the SAME statement completes.  The pre-crit VM content lock (heapam +
+# visibilitymap_clear_locked) keeps every failure-capable PCM acquire out of
+# the critical section, so no ERROR->PANIC escalation
 # either.  A bounded number of statement-level retries is tolerated (the
 # prepin sleep can still eat one serve); a wedge or a PANIC is a failure.
 my $att_ok = ($reqh->result // 1) == 0 && ($rerr // '') =~ /^\s*$/;
