@@ -7717,7 +7717,14 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
 	{
 		buf_state = LockBufHdr(buf);
-		if (BufferTagsEqual(&buf->tag, &tag))
+		/* PGRAC: GCS serve-stall round-6 (gap (c)) — restore the staged N only
+		 * when it is still staged.  The header spinlock was dropped for the
+		 * InvalidateBufferTry attempt, so a concurrent grant / transition could
+		 * have moved pcm_state off the staged N; an unconditional write-back
+		 * would clobber that newer authoritative state with our stale saved
+		 * value (Rule 8.A stale-grant).  Restore only if nobody else changed it. */
+		if (BufferTagsEqual(&buf->tag, &tag) &&
+			buf->pcm_state == (uint8) PCM_STATE_N)
 			buf->pcm_state = saved_pcm_state;
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
@@ -7945,7 +7952,8 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
  *   no-stale-flush.
  * ======================================================================== */
 ClusterBufmgrGcsDropResult
-cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn)
+cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn,
+										  XLogRecPtr *out_page_lsn)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -7998,6 +8006,26 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 		page_lsn = PageGetLSN(page);
 	}
 
+	/*
+	 * PGRAC: GCS serve-stall round-6 — generation gate.  A local writer that
+	 * held a cached X grant could commit to this page in the window between
+	 * the transfer's ship-image copy and this drop (gaps (a) cached-X
+	 * no-reverify + (b) copy->drop admission).  Its pin is already gone (the
+	 * refcount check above passed), so PINNED cannot catch it; the page LSN,
+	 * read here under the same header spinlock that the writer's unpin
+	 * released, is the generation token.  A LSN past the caller's copy-time
+	 * expected_lsn means the captured ship image is STALE: refuse the drop so
+	 * the caller fail-closes with a retryable deny and the re-serve copies the
+	 * current page (Rule 8.A — never grant a stale image over a committed
+	 * write).  expected_lsn == Invalid skips the gate.
+	 */
+	if (!XLogRecPtrIsInvalid(expected_lsn) && page_lsn != expected_lsn)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
+	}
+
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -8038,6 +8066,18 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
+	/* PGRAC: GCS serve-stall round-6 — re-check the generation gate under
+	 * this second header-lock hold: a local writer could have committed
+	 * during the (blocking) XLogFlush window above.  A LSN past expected_lsn
+	 * means the ship image is stale; refuse without touching pcm_state
+	 * (Rule 8.A). */
+	if (!XLogRecPtrIsInvalid(expected_lsn) &&
+		PageGetLSN((Page) BufHdrGetBlock(buf)) != expected_lsn)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
+	}
+
 	saved_pcm_state = buf->pcm_state;
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
@@ -8051,7 +8091,14 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
 	{
 		buf_state = LockBufHdr(buf);
-		if (BufferTagsEqual(&buf->tag, &tag))
+		/* PGRAC: GCS serve-stall round-6 (gap (c)) — restore the staged N only
+		 * when it is still staged.  The header spinlock was dropped for the
+		 * InvalidateBufferTry attempt, so a concurrent grant / transition could
+		 * have moved pcm_state off the staged N; an unconditional write-back
+		 * would clobber that newer authoritative state with our stale saved
+		 * value (Rule 8.A stale-grant).  Restore only if nobody else changed it. */
+		if (BufferTagsEqual(&buf->tag, &tag) &&
+			buf->pcm_state == (uint8) PCM_STATE_N)
 			buf->pcm_state = saved_pcm_state;
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;

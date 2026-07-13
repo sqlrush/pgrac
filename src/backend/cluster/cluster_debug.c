@@ -2167,7 +2167,12 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	 * dispatch pump never waits on a foreign pin);  park_expired /
 	 * park_overflow = directives the master's ack budget fail-closes;
 	 * drop_pinned_deny = grant/transfer drops refused with a retryable
-	 * deny because a foreign pin held the copy. */
+	 * deny because a foreign pin held the copy.  xfer_stale_deny (round-6)
+	 * = a grant/transfer drop refused because a local writer committed to
+	 * the page between the ship-image copy and the drop (page LSN advanced
+	 * past copy-time = generation gate); the re-serve ships the current
+	 * page — a non-zero delta proves the copy->drop window was exercised
+	 * and closed instead of silently losing the write. */
 	emit_row(rsinfo, "gcs", "invalidate_parked_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_parked_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
@@ -2176,6 +2181,8 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_invalidate_park_overflow_count()));
 	emit_row(rsinfo, "gcs", "drop_pinned_deny_count",
 			 fmt_int64((int64)cluster_gcs_get_drop_pinned_deny_count()));
+	emit_row(rsinfo, "gcs", "xfer_stale_deny_count",
+			 fmt_int64((int64)cluster_gcs_get_xfer_stale_deny_count()));
 
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify rows:
 	 * local pre-read proven current (no I/O) / stale pre-read re-read from

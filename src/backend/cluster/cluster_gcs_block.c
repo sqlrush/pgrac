@@ -205,6 +205,13 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 invalidate_park_expired_count;
 	pg_atomic_uint64 invalidate_park_overflow_count;
 	pg_atomic_uint64 drop_pinned_deny_count;
+	/* PGRAC: GCS serve-stall round-6 — the generation gate refused a drop
+	 * because a local writer committed to the page between the ship-image
+	 * copy and the drop (page LSN advanced past copy-time); the serve
+	 * fail-closes with a retryable deny so the re-serve ships the current
+	 * page.  A non-zero delta over a workload proves the copy->drop window
+	 * was actually exercised and closed (the silent-lost-write guard). */
+	pg_atomic_uint64 xfer_stale_deny_count;
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify/refresh.
 	 * A state=N GRANTED_STORAGE_FALLBACK now carries the master's
 	 * pi_watermark_scn (reply page_lsn field reused as an SCN carrier); the
@@ -497,6 +504,7 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_expired_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_overflow_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->drop_pinned_deny_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->xfer_stale_deny_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_refresh_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 0);
@@ -3637,6 +3645,30 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 	 * never a silent stale grant (Rule 8.A). */
 	if (clean_eligible)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+
+	/*
+	 * PGRAC: GCS serve-stall round-6 — a transient revoke deny (the holder
+	 * fail-closed the drop with DENIED_MASTER_NOT_HOLDER / DENIED_PENDING_X
+	 * because the copy was pinned (round-5 A2) or a local writer committed
+	 * inside the copy->drop window (round-6 generation gate)) is a RETRYABLE
+	 * condition: the re-serve ships the current page once the pin clears / the
+	 * window is done.  Surface the retryable class-53 code (53R9X) so an
+	 * application driver retries the statement, instead of FEATURE_NOT_SUPPORTED
+	 * (0A000), which reads as "permanently unsupported" and is never retried.
+	 * A genuine timeout (got_reply == false) keeps 0A000: we could not prove
+	 * the holder's state, so it is not a bounded transient.
+	 */
+	if (got_reply
+		&& (reply_status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+			|| reply_status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE),
+						errmsg("cluster_gcs_block: X holder %d transiently refused the transfer "
+							   "for tag spc=%u db=%u relNumber=%u block=%u",
+							   holder_node, tag.spcOid, tag.dbOid,
+							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
+						errhint("The holder's copy was pinned, or a local writer committed during "
+								"the transfer; retry the transaction.")));
+
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_gcs_block: could not obtain X transfer from X holder %d "
 						   "for tag spc=%u db=%u relNumber=%u block=%u",
@@ -4472,14 +4504,33 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					 * deny contract is "back off and retry, the retry
 					 * re-evaluates".
 					 */
-					if (cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn)
-						== CLUSTER_BUFMGR_GCS_DROP_PINNED) {
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count, 1);
-						cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
-						gcs_block_send_reply(req->sender_node, req,
-											 GCS_BLOCK_REPLY_DENIED_PENDING_X, InvalidXLogRecPtr,
-											 NULL);
-						return;
+					/* GCS serve-stall round-6 RED harness: hold the copy->drop
+					 * window open (see cluster_inject.c registry note). */
+					CLUSTER_INJECTION_POINT("cluster-gcs-xfer-copy-drop-window");
+					{
+						/* GCS serve-stall round-6: pass the copy-time page_lsn
+						 * (captured by get_ship_image above) as the generation
+						 * token.  PINNED (a live foreign pin) and STALE (a local
+						 * writer committed since the copy) both mean the shipped
+						 * image must NOT be granted — fail-closed with the same
+						 * retryable deny so the requester re-asks and the re-serve
+						 * copies the current page (Rule 8.A). */
+						ClusterBufmgrGcsDropResult dres = cluster_bufmgr_drop_block_for_gcs_no_wire(
+							req->tag, page_lsn, &drop_lsn);
+
+						if (dres == CLUSTER_BUFMGR_GCS_DROP_PINNED
+							|| dres == CLUSTER_BUFMGR_GCS_DROP_STALE) {
+							if (dres == CLUSTER_BUFMGR_GCS_DROP_STALE)
+								pg_atomic_fetch_add_u64(&ClusterGcsBlock->xfer_stale_deny_count, 1);
+							else
+								pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count,
+														1);
+							cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
+							gcs_block_send_reply(req->sender_node, req,
+												 GCS_BLOCK_REPLY_DENIED_PENDING_X,
+												 InvalidXLogRecPtr, NULL);
+							return;
+						}
 					}
 					/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
 					 * conversion (inside the drop above) samples its
@@ -6404,29 +6455,48 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					 * keep our X untouched.  NOT_RESIDENT still grants: no
 					 * copy left to stale-flush.
 					 */
-					if (cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn)
-						== CLUSTER_BUFMGR_GCS_DROP_PINNED) {
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count, 1);
-						/* undo the from-holder ship count taken with the
-						 * grant status above — this reply is a deny now */
-						pg_atomic_fetch_sub_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
-						hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
-					} else {
-						/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
-						 * conversion (inside the drop above) precedes the reply
-						 * send at the bottom of this handler
-						 * (cluster_ic_rdma_send_envelope_sge), so the requester
-						 * observes an envelope stamped at-or-above the ship-SCN
-						 * boundary (cluster_pi_shadow.h proof item 2). */
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
-						if (GcsBlockForwardPayloadIsCleanEligible(fwd))
-							pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
-						/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
-						 * outgoing copy as a Past Image, report it to the master
-						 * (unsolicited PI_KEPT ride; fire-and-forget — a lost note
-						 * only leaves the PI untracked, fail-safe lingering). */
-						if (cluster_bufmgr_block_is_pi(fwd->tag))
-							gcs_block_pi_kept_note_send(fwd->tag, fwd->master_node);
+					/* GCS serve-stall round-6 RED harness: hold the copy->drop
+					 * window open (see cluster_inject.c registry note). */
+					CLUSTER_INJECTION_POINT("cluster-gcs-xfer-copy-drop-window");
+					/* GCS serve-stall round-6: page_lsn (copy-time, from
+					 * get_ship_image above) is the generation token.  STALE (a
+					 * local writer committed since the copy) joins PINNED as a
+					 * retryable deny — never ship a stale image over a committed
+					 * write (Rule 8.A). */
+					{
+						ClusterBufmgrGcsDropResult dres = cluster_bufmgr_drop_block_for_gcs_no_wire(
+							fwd->tag, page_lsn, &drop_lsn);
+
+						if (dres == CLUSTER_BUFMGR_GCS_DROP_PINNED
+							|| dres == CLUSTER_BUFMGR_GCS_DROP_STALE) {
+							if (dres == CLUSTER_BUFMGR_GCS_DROP_STALE)
+								pg_atomic_fetch_add_u64(&ClusterGcsBlock->xfer_stale_deny_count, 1);
+							else
+								pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count,
+														1);
+							/* undo the from-holder ship count taken with the
+							 * grant status above — this reply is a deny now */
+							pg_atomic_fetch_sub_u64(&ClusterGcsBlock->block_from_holder_ship_count,
+													1);
+							hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+						} else {
+							/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
+							 * conversion (inside the drop above) precedes the reply
+							 * send at the bottom of this handler
+							 * (cluster_ic_rdma_send_envelope_sge), so the requester
+							 * observes an envelope stamped at-or-above the ship-SCN
+							 * boundary (cluster_pi_shadow.h proof item 2). */
+							pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count,
+													1);
+							if (GcsBlockForwardPayloadIsCleanEligible(fwd))
+								pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
+							/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
+							 * outgoing copy as a Past Image, report it to the master
+							 * (unsolicited PI_KEPT ride; fire-and-forget — a lost note
+							 * only leaves the PI untracked, fail-safe lingering). */
+							if (cluster_bufmgr_block_is_pi(fwd->tag))
+								gcs_block_pi_kept_note_send(fwd->tag, fwd->master_node);
+						}
 					}
 				}
 			}
@@ -7313,8 +7383,12 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		ack_status = 2; /* race: not resident */
 		break;
 	case CLUSTER_BUFMGR_GCS_DROP_PINNED:
+	case CLUSTER_BUFMGR_GCS_DROP_STALE:
 		/* GCS serve-stall round-5 (A2): nothing changed, no ACK — the
-		 * caller parks the directive and the LMS loop retries it. */
+		 * caller parks the directive and the LMS loop retries it.  STALE is
+		 * unreachable here (the invalidate wrapper passes no expected_lsn, so
+		 * its generation gate never fires); treated like PINNED defensively
+		 * (round-6). */
 		return false;
 	}
 
@@ -8046,6 +8120,12 @@ uint64
 cluster_gcs_get_drop_pinned_deny_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->drop_pinned_deny_count) : 0;
+}
+
+uint64
+cluster_gcs_get_xfer_stale_deny_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->xfer_stale_deny_count) : 0;
 }
 
 /* PGRAC: GCS-race round-4c FUNC-1 — 3 storage-fallback verify accessors. */

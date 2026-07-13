@@ -1858,11 +1858,21 @@ extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
  *	                (no state cleared, no flush relied upon).  The caller
  *	                parks the job and retries, or fail-closes with a
  *	                retryable deny — never spins.
+ *	  STALE         GCS serve-stall round-6:  a local writer committed to
+ *	                the page between the ship-image copy and this drop (the
+ *	                page LSN advanced past the caller's expected copy-time
+ *	                LSN), so the already-captured ship image is stale.
+ *	                NOTHING was changed;  the caller MUST NOT grant the
+ *	                stale image — it fail-closes with a retryable deny so
+ *	                the re-serve copies the current page (the generation
+ *	                binding that closes the copy->drop silent-lost-write
+ *	                window, gaps (a)+(b)).
  */
 typedef enum ClusterBufmgrGcsDropResult {
 	CLUSTER_BUFMGR_GCS_DROP_DROPPED = 0,
 	CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT,
 	CLUSTER_BUFMGR_GCS_DROP_PINNED,
+	CLUSTER_BUFMGR_GCS_DROP_STALE,
 } ClusterBufmgrGcsDropResult;
 
 extern ClusterBufmgrGcsDropResult cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag,
@@ -1890,7 +1900,8 @@ extern void cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern ClusterBufmgrGcsDropResult
-cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
+cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn,
+										  XLogRecPtr *out_page_lsn);
 
 /* PGRAC: spec-6.12h D-h2 — Past Image discard helpers.
  * block_is_pi: does this tag's resident buffer hold a D-h1 Past Image
@@ -2178,6 +2189,7 @@ extern uint64 cluster_gcs_get_invalidate_parked_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_expired_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_overflow_count(void);
 extern uint64 cluster_gcs_get_drop_pinned_deny_count(void);
+extern uint64 cluster_gcs_get_xfer_stale_deny_count(void);
 
 /* ============================================================
  * Observability accessors (dump_gcs +8 NEW rows for block plane).

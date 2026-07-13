@@ -65,12 +65,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 108 keys (round-4c fallback-scn + spec-7.2 D6 hist).
+# L1 — pg_cluster_state.gcs surface has 109 keys (round-4c fallback-scn + spec-7.2 D6 hist).
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '108',
-   'L1 pg_cluster_state.gcs category has 108 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6)');
+   '109',
+   'L1 pg_cluster_state.gcs category has 109 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows; round-6 +1 xfer_stale_deny) (spec-7.2 D6)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.
