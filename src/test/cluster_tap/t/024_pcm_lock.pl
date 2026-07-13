@@ -62,8 +62,8 @@ $node->start;
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-   '23',
-   'L1 pg_cluster_state.pcm category has 23 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5 + spec-4.6a D12)');
+   '27',
+   'L1 pg_cluster_state.pcm category has 27 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5 + spec-4.6a D12 + ownership-gen wave 4: writer_cover_stale_detected + writer_reverify_reacquire + restore_aba_detected + invalidate_parked_grant_pending)');
 
 
 # ----------

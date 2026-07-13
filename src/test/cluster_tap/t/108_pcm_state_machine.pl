@@ -48,8 +48,8 @@ $node_default->start;
 my $pcm_category_rows = $node_default->safe_psql(
 	'postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category = 'pcm'");
-is($pcm_category_rows, '23',
-   'L1 pg_cluster_state pcm category has 23 rows (spec-2.30 D9 surface + spec-6.14a D5 + spec-6.14 D5 KO-aux-defer counter + spec-4.6a D12 dead_cleanup_entries)');
+is($pcm_category_rows, '27',
+   'L1 pg_cluster_state pcm category has 27 rows (spec-2.30 D9 surface + spec-6.14a D5 + spec-6.14 D5 KO-aux-defer counter + spec-4.6a D12 dead_cleanup_entries + ownership-gen wave 4: writer_cover_stale_detected + writer_reverify_reacquire + restore_aba_detected + invalidate_parked_grant_pending)');
 
 # L3 — api_state shows "active" when GUC=-1 default
 my $api_state_default = $node_default->safe_psql(
