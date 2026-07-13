@@ -266,6 +266,39 @@ typedef enum ClusterVisFreshRefOriginDecision {
 extern ClusterVisFreshRefOriginDecision cluster_vis_freshref_origin_decision(int derived_slot,
 																			 int32 ref_origin);
 
+/*
+ * cluster_vis_evidence_route -- evidence -> consumer route (spec-3.14
+ * hardening, serve-stall round-6).
+ *
+ *	With xid striping off (or below the activation floor) the per-node xid
+ *	value spaces overlap, so a raw TransactionIdIsCurrentTransactionId()
+ *	match does NOT prove the xid is ours: a remote writer's raw xid can
+ *	collide with the reader's own in-progress xid.  Every HeapTupleSatisfies*
+ *	cluster fork therefore resolves the tuple's ITL evidence FIRST and only
+ *	consults the raw current-xid test on the no-remote-evidence arms:
+ *	  REMOTE evidence   -> follow the resolved verdict, even on a raw
+ *	                       current-xid match (the physical ITL origin is the
+ *	                       authority; the raw match is the collision);
+ *	  STALE/AMBIGUOUS   -> 53R97 fail-closed, even on a raw current-xid
+ *	                       match (recycled slot, origin underivable: a
+ *	                       "current" raw value proves nothing);
+ *	  LOCAL / NONE      -> PG-native primitives; only here is the raw
+ *	                       current-xid test meaningful (NATIVE_SELF routes
+ *	                       the fork's own-xact semantics, NATIVE the plain
+ *	                       local-xid semantics).
+ *	Pure; unit-enumerated (8 rows).  Single source of truth for the
+ *	resolve-before-self ordering -- forks must not reorder around it.
+ */
+typedef enum ClusterVisEvidenceRoute {
+	CLUSTER_VIS_ROUTE_REMOTE_VERDICT = 0,	  /* follow remote verdict */
+	CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN = 1, /* 53R97 fail-closed */
+	CLUSTER_VIS_ROUTE_NATIVE_SELF = 2,		  /* own xact: native self/cmin */
+	CLUSTER_VIS_ROUTE_NATIVE = 3			  /* local/no evidence: native */
+} ClusterVisEvidenceRoute;
+
+extern ClusterVisEvidenceRoute cluster_vis_evidence_route(ClusterVisEvidence evidence,
+														  bool xid_is_current);
+
 
 /*
  * spec-3.14 D5: cheap "does this tuple have any REMOTE writer evidence"

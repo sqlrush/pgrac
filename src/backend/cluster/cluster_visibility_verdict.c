@@ -273,4 +273,32 @@ cluster_vis_freshref_origin_decision(int derived_slot, int32 ref_origin)
 	return CLUSTER_VIS_FRESHREF_ORIGIN_STALE;	/* derivable mismatch (8.A) */
 }
 
+/*
+ * cluster_vis_evidence_route -- evidence -> consumer route (spec-3.14
+ * hardening, serve-stall round-6; see the header comment for the table).
+ *
+ *	The single load-bearing property: xid_is_current NEVER routes away from
+ *	REMOTE or STALE evidence.  A raw TransactionIdIsCurrentTransactionId()
+ *	match proves nothing about the xid's origin when the per-node value
+ *	spaces overlap (striping off / below the activation floor): a remote
+ *	writer's raw xid can equal the reader's own in-progress xid, and the
+ *	pre-round-6 "own xid first" early returns turned that collision into a
+ *	native cmin/CID misjudgment ("attempted to update invisible tuple" /
+ *	a remote lock silently read as one's own).  Pure; unit-enumerated.
+ */
+ClusterVisEvidenceRoute
+cluster_vis_evidence_route(ClusterVisEvidence evidence, bool xid_is_current)
+{
+	switch (evidence) {
+	case CLUSTER_VIS_EVIDENCE_REMOTE:
+		return CLUSTER_VIS_ROUTE_REMOTE_VERDICT;
+	case CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS:
+		return CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN;
+	case CLUSTER_VIS_EVIDENCE_NONE:
+	case CLUSTER_VIS_EVIDENCE_LOCAL:
+	default:
+		return xid_is_current ? CLUSTER_VIS_ROUTE_NATIVE_SELF : CLUSTER_VIS_ROUTE_NATIVE;
+	}
+}
+
 #endif /* USE_PGRAC_CLUSTER */

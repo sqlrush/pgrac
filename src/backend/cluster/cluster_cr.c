@@ -2955,8 +2955,8 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		else
 			cr_xmax = HeapTupleHeaderGetRawXmax(cr_tup);
 
-		if (!TransactionIdIsValid(cr_xmax) || TransactionIdIsCurrentTransactionId(cr_xmax)) {
-			/* lockers-only multi, or our own delete (native handles self). */
+		if (!TransactionIdIsValid(cr_xmax)) {
+			/* lockers-only multi: no update xid -> never a delete. */
 			*out_visible = true;
 			return CLUSTER_CR_DECIDED;
 		}
@@ -2968,6 +2968,12 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 		 * read_scn IFF the commit SCN is after read_scn (delete committed
 		 * after the snapshot -> row was live -> VISIBLE); ABORTED deleter ->
 		 * the row was never deleted -> VISIBLE; INDOUBT -> fail closed.
+		 *
+		 * PGRAC serve-stall round-6: checked BEFORE the raw current-xid test
+		 * below -- on a materialized chain a raw match can be a below-floor
+		 * collision with the merged peer's xid; "our own delete" may only be
+		 * concluded on the own-instance arm, where tier-3 (chain UBA origin ==
+		 * self) makes the raw xid alias-free.
 		 */
 		if (remote_materialized) {
 			/*
@@ -2997,8 +3003,13 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 				return CLUSTER_CR_FAILCLOSED;
 			}
 		}
-		/* Own-instance authoritative classification of the deleting xact. */
-		else if (TransactionIdIsInProgress(cr_xmax))
+		/* Own-instance authoritative classification of the deleting xact
+		 * (tier-3: chain UBA origin == self, so the raw xid is alias-free). */
+		else if (TransactionIdIsCurrentTransactionId(cr_xmax)) {
+			/* our own delete (native handles self) */
+			*out_visible = true;
+			return CLUSTER_CR_DECIDED;
+		} else if (TransactionIdIsInProgress(cr_xmax))
 			xmax_status = CLUSTER_TT_STATUS_IN_PROGRESS;
 		else if (!TransactionIdDidCommit(cr_xmax))
 			xmax_status = CLUSTER_TT_STATUS_ABORTED;
