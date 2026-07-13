@@ -197,6 +197,15 @@ cluster_pcm_own_set_flags(BufferDesc *buf, uint32 set_flags, uint32 clear_flags)
 }
 
 /*
+ * W2 RED substrate — process-local marker: true while a GCS drop's
+ * InvalidateBufferTry attempt is in flight, so the drop-prepin inject inside
+ * InvalidateBufferTry fires ONLY for GCS drops (never for plain evictions).
+ * The drop runs to completion in one call chain in the pump process, so a
+ * plain static is race-free.
+ */
+static bool cluster_bufmgr_in_gcs_drop = false;
+
+/*
  * cluster_pcm_own_read: read the coherent (pcm_state, generation, flags) triple
  * under the header spinlock.  Used by the cached-X writer re-verify and the
  * drop-restore ABA check.  Any *out may be NULL.
@@ -675,6 +684,9 @@ static bool cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_stat
 /* PGRAC: spec-6.12h D-h2 — FlushBuffer write-note (cluster_gcs_block.h is
  * included mid-file, after FlushBuffer; redeclare the one symbol it needs). */
 extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
+/* PGRAC ownership-generation wave (W3) — RED delivery shim, used by LockBuffer
+ * (before the mid-file include; same redeclare pattern as above). */
+extern bool cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag);
 #endif
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
@@ -1915,6 +1927,21 @@ InvalidateBufferTry(BufferDesc *buf)
 
 	oldHash = BufTableHashCode(&oldTag);
 	oldPartitionLock = BufMappingPartitionLock(oldHash);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC ownership-generation wave (W2) — drop-prepin window.  The header
+	 * spinlock was released above and the partition lock is not yet taken, so
+	 * this is the only gap where a foreign pin can slip in and fail the
+	 * refcount recheck below (a continuously-held pin is caught by the drop's
+	 * entry gates BEFORE staging N and never reaches this function).  The
+	 * sleep inject holds the gap open so the W2 RED can place that pin
+	 * deterministically.  Gated to GCS drops only — plain evictions must not
+	 * stall.  No lock is held across the sleep.
+	 */
+	if (cluster_bufmgr_in_gcs_drop)
+		CLUSTER_INJECTION_POINT("cluster-pcm-drop-prepin-window");
+#endif
 
 	/*
 	 * Acquire exclusive mapping lock in preparation for changing the buffer's
@@ -5751,7 +5778,29 @@ LockBuffer(Buffer buffer, int mode)
 		 * GRANT_PENDING consult parks it instead of acking the grant away.
 		 */
 		if (pcm_acquired && pcm_pending_set && pcm_mode == PCM_LOCK_MODE_X)
+		{
 			CLUSTER_INJECTION_POINT("cluster-pcm-grant-finalize-window");
+
+			/*
+			 * W3 RED delivery — when armed (:skip, one-shot), drive the REAL
+			 * invalidate handler with a synthetic same-tag directive right
+			 * here, while pcm_state is still N and GRANT_PENDING is set.  A
+			 * master INVALIDATE cannot be steered into this window from SQL
+			 * (it targets S-holders; a mirror-N node is the X-grantee and is
+			 * served by X-forward instead — the real producers are
+			 * master/mirror asymmetry races, e.g. a deferred eviction
+			 * release).  The shim must observe the park (return false +
+			 * parked counter); an already_invalidated ACK here is the W3
+			 * defect.
+			 */
+			if (cluster_injection_should_skip(
+					"cluster-pcm-grant-finalize-deliver-invalidate"))
+			{
+				if (cluster_gcs_block_test_deliver_self_invalidate(buf->tag))
+					elog(WARNING,
+						 "cluster W3 delivery shim: synthetic INVALIDATE was ACKed instead of parked (GRANT_PENDING not honored)");
+			}
+		}
 
 		if (pcm_acquired)
 		{
@@ -7945,8 +7994,11 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * mode (it was cleared for the eviction hook) so the still-resident
 	 * copy keeps its true PCM state.
 	 */
+	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
 	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
 	{
+		cluster_bufmgr_in_gcs_drop = false;
+
 		/*
 		 * GCS serve-stall round-6 wave-2 — restore-ABA window.  The header
 		 * spinlock was dropped for the InvalidateBufferTry attempt, so a full
@@ -7957,6 +8009,18 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 * mechanism is what closes it.
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-window");
+
+		/*
+		 * W2 RED force-round — when armed (:skip, one-shot), complete the
+		 * concurrent ownership round at the exact window point: one coherent
+		 * transition leaving pcm_state at N with the generation bumped, which
+		 * is indistinguishable to the guard below from a real N->X->N round
+		 * (grant finalize bump + drop-back-to-N bump).  Same force-behavior
+		 * inject pattern as cluster-gcs-block-duplicate-grant-reply.
+		 */
+		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+
 		buf_state = LockBufHdr(buf);
 		/*
 		 * PGRAC ownership-generation wave (W2) — restore the staged N ONLY when
@@ -7980,6 +8044,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
+	cluster_bufmgr_in_gcs_drop = false;
 
 	return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 }
@@ -8381,8 +8446,11 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
 	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
+	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
 	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
 	{
+		cluster_bufmgr_in_gcs_drop = false;
+
 		/*
 		 * GCS serve-stall round-6 wave-2 — restore-ABA window.  The header
 		 * spinlock was dropped for the InvalidateBufferTry attempt, so a full
@@ -8393,6 +8461,11 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		 * mechanism is what closes it.
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-window");
+
+		/* W2 RED force-round — see the twin arm above. */
+		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+
 		buf_state = LockBufHdr(buf);
 		/*
 		 * PGRAC ownership-generation wave (W2) — see the twin arm above: restore
@@ -8411,6 +8484,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
+	cluster_bufmgr_in_gcs_drop = false;
 
 	return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 }

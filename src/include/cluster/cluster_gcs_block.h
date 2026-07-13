@@ -1835,6 +1835,10 @@ extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
  * install (GRANT_PENDING) on this node?  The invalidate handler consults it
  * before treating a pcm_state==N block as already-invalidated. */
 extern bool cluster_bufmgr_block_grant_pending(BufferTag tag);
+/* PGRAC ownership-generation wave (W3) test-only delivery shim: drive the real
+ * invalidate handler with a synthetic same-tag directive from inside the
+ * grant-finalize window (armed inject only; see cluster_gcs_block.c). */
+extern bool cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag);
 /* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
  * ITL stamp; residency proves ownership (a self-contained transfer drops the
  * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */

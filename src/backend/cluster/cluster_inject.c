@@ -618,6 +618,33 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-pcm-grant-finalize-window" },
 	/*
+	 * cluster-pcm-grant-finalize-deliver-invalidate (W3 RED delivery, :skip):
+	 *   One-shot: inside the grant-finalize window above, drive the REAL
+	 *   invalidate handler with a synthetic same-tag directive (a master
+	 *   INVALIDATE cannot be steered into this window from SQL — INVALIDATE
+	 *   targets S-holders; a mirror-N node is the X-grantee and is served by
+	 *   X-forward instead).  The handler must PARK on GRANT_PENDING, not ack
+	 *   already_invalidated.  See cluster_gcs_block_test_deliver_self_invalidate.
+	 *
+	 * cluster-pcm-drop-prepin-window (W2 RED, sleep):
+	 *   Fires inside InvalidateBufferTry — after the header spinlock is
+	 *   released, before the partition lock is taken — ONLY for GCS-drop
+	 *   callers.  This is the sole gap where a foreign pin can appear and
+	 *   fail the refcount recheck (a continuously-held pin is refused at the
+	 *   drop's entry gates and never reaches the restore arm).  The sleep
+	 *   lets the W2 RED place that pin deterministically.
+	 *
+	 * cluster-pcm-restore-aba-force-round (W2 RED, :skip):
+	 *   One-shot: at the drop's restore-ABA window point, complete a
+	 *   simulated concurrent ownership round (coherent transition to N with a
+	 *   generation bump) — indistinguishable to the restore guard from a real
+	 *   N->X->N.  The guard must refuse the stale restore and bump
+	 *   pcm.restore_aba_detected_count.
+	 */
+	{ .name = "cluster-pcm-grant-finalize-deliver-invalidate" },
+	{ .name = "cluster-pcm-drop-prepin-window" },
+	{ .name = "cluster-pcm-restore-aba-force-round" },
+	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
 	 *	cluster-gcs-block-stale-ship:

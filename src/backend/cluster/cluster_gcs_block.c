@@ -7522,6 +7522,47 @@ cluster_gcs_block_invalidate_park_tick(void)
 	}
 }
 
+/*
+ * cluster_gcs_block_test_deliver_self_invalidate — ownership-generation wave
+ * (W3) test-only delivery shim.
+ *
+ *	Drives the REAL invalidate handler (gcs_block_invalidate_execute) with a
+ *	synthetic same-tag directive from inside the LockBuffer grant-finalize
+ *	window (armed via the cluster-pcm-grant-finalize-deliver-invalidate
+ *	inject).  Rationale: the mis-ack race this exercises is real but not
+ *	SQL-deterministic — a master INVALIDATE targets S-holders (bitmap), so
+ *	it reaches a mirror-N node only through master/mirror asymmetry (e.g. a
+ *	deferred eviction release) racing a fresh re-acquire; timing that from
+ *	SQL is not deterministic.  The shim delivers the directive at the exact
+ *	window point instead.  Same force-behavior inject pattern as
+ *	cluster-gcs-block-duplicate-grant-reply / -stale-ship.
+ *
+ *	With GRANT_PENDING staged the handler parks (returns false, bumps
+ *	pcm.invalidate_parked_grant_pending_count) BEFORE any wire send, so the
+ *	synthetic request_id/master_node never reach the ACK path.  Without the
+ *	park fix it would have acked already_invalidated (the W3 defect) — the
+ *	ACK then goes to a stale request_id slot and is rejected (HC100), so
+ *	even the defect arm cannot corrupt master state from this shim.
+ *
+ *	Caller (bufmgr LockBuffer) holds the buffer's content lock; the handler's
+ *	park path takes only the mapping partition (SHARED) + header spinlock —
+ *	the same order the by-tag probes use from LMS context (no path acquires
+ *	a content lock while holding a partition lock, so partition-under-content
+ *	cannot invert).
+ */
+bool
+cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag)
+{
+	GcsBlockInvalidatePayload inv;
+
+	memset(&inv, 0, sizeof(inv));
+	inv.request_id = 0;			/* synthetic; never reaches the ACK path */
+	inv.epoch = cluster_epoch_get_current();
+	inv.tag = tag;
+	inv.master_node = cluster_node_id;
+	return gcs_block_invalidate_execute(&inv);
+}
+
 static void
 cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
 {
