@@ -12,7 +12,7 @@
 #
 #	  L1   ClusterPair startup baseline (both postmasters healthy)
 #	  L2   fresh baseline: 6 NEW spec-2.36 counters all 0
-#	  L3   pg_cluster_state.gcs has 108 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a)
+#	  L3   pg_cluster_state.gcs has 109 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a)
 #	  L4   catversion lower-bound >= 202605430; wait event count == 123
 #	  L5   S barrier injection — DENIED_PENDING_X surfaces under
 #	       cluster-gcs-block-starvation-force-denied inject; reader
@@ -107,18 +107,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 108 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs has 109 keys (spec-7.2 D6+flip; was 67 cumulative through spec-6.14a).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '108',
-   'L3 node0 pg_cluster_state.gcs category has 108 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
+   '109',
+   'L3 node0 pg_cluster_state.gcs category has 109 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '108',
-   'L3 node1 pg_cluster_state.gcs category has 108 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
+   '109',
+   'L3 node1 pg_cluster_state.gcs category has 109 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
 
 
 # ============================================================

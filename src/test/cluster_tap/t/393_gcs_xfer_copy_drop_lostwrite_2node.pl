@@ -1,5 +1,13 @@
 # X-transfer copy->drop window silent lost write (2-node, deterministic).
 #
+# SCOPE: this test covers exactly ONE defect -- the copy->drop page-LSN
+# stale-image window (adjudication gaps (a) cached-X no-reverify and (b)
+# copy->drop admission, which manifest as a single physical interleave).
+# It does NOT prove a full REVOKING/generation linearization, does NOT
+# assert two-node re-serve convergence to a final value, and does NOT
+# cover the pcm_state restore ABA (gap (c)).  See the closure doc for the
+# remaining follow-ups.
+#
 # The destructive X-transfer serve captures the ship image (stable copy)
 # and then drops the local copy as two separate steps with no admission
 # barrier between them.  A LOCAL writer holding a cached X grant
@@ -9,27 +17,32 @@
 # lands on the local page after the copy was taken, the drop then discards
 # the page, and the pre-write image ships to the requester.  The write is
 # durably committed (WAL flushed by the drop) yet absent from the live
-# block everywhere -- the silent lost write the REVOKING+generation
-# linearization closes (adjudication gaps (a) cached-X no-reverify and
-# (b) copy->drop admission, one interleave).
+# block everywhere -- a silent lost write.  The page-LSN generation gate
+# refuses the stale-image drop, so the committed write is not lost.
 #
 # Deterministic rig: the cluster-gcs-xfer-copy-drop-window sleep inject
 # holds the window open for 1.5s on the serving node; the local writer runs
-# inside it, then the inject is disarmed so the requester's retry re-serves
-# cleanly.  Interleave validity is asserted, not assumed: the requester's
-# UPDATE must have waited through at least one stall (elapsed >= 1.3s) and
-# the window write must have run unblocked (elapsed < 1s, i.e. it was
-# admitted, not queued behind the transfer).
+# inside it.  Interleave validity is asserted, not assumed: the requester's
+# UPDATE must have waited through the stall (elapsed >= 1.3s) and the window
+# write must have run unblocked (elapsed < 1s, i.e. it was admitted, not
+# queued behind the transfer).
 #
 #	L1  pair boots, cached-X local cache on.
-#	L2  window write is admitted and commits inside the stall.
-#	L3  the committed window write survives the transfer -- final value on
-#	    BOTH nodes reflects seed(1) + window(+100) + requester(+10) = 111.
-#	    A broken window ships the pre-write image: both nodes read 11 and
-#	    the +100 is silently gone.
-#	L4  the generation gate fired: xfer_stale_deny_count advanced (the
-#	    window was exercised and CLOSED, not merely avoided) and the
-#	    requester UPDATE ultimately succeeded on the re-serve.
+#	L2  window write is admitted and commits inside the stall; the first
+#	    requester attempt fails closed with the RETRYABLE transient revoke
+#	    deny (53R9X) -- never a silent stale grant.
+#	L3  the committed window write SURVIVES the transfer -- read on the
+#	    writer node (node0, own-xid, no cross-node resolve): v >= 101 (the
+#	    +100 is present).  A broken window drops node0's committed page and
+#	    ships the pre-write image, leaving v < 101 (the +100 silently gone).
+#	L3b BEST-EFFORT ONLY: the requester's +10 retry.  It is cross-node and
+#	    on a fresh cluster may persistently hit the ORTHOGONAL low-xid
+#	    53R97 (a separate, already-fail-closed path), so its success is
+#	    NOT asserted -- two-node re-serve convergence is a follow-up, not
+#	    proven here.
+#	L4  the generation gate fired (xfer_stale_deny advanced: the window was
+#	    exercised and closed, not merely avoided) and the lost-write
+#	    detector did NOT fire (the write was never dropped).
 #
 # Author: SqlRush <sqlrush@gmail.com>
 # Portions Copyright (c) 2026, pgrac contributors
