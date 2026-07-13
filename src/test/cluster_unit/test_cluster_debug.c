@@ -1388,6 +1388,11 @@ cluster_pcm_get_writer_reverify_reacquire_count(void)
 {
 	return 0;
 }
+uint64
+cluster_pcm_get_restore_aba_detected_count(void)
+{
+	return 0;
+}
 /* spec-6.14 D10b catalog counters (cluster_catalog_stats.o not linked) */
 uint64
 cluster_catalog_stats_vis_resolve_count(void)

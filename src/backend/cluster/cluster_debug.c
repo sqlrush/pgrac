@@ -1954,6 +1954,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_pcm_get_writer_cover_stale_detected_count()));
 	emit_row(rsinfo, "pcm", "writer_reverify_reacquire_count",
 			 fmt_int64((int64)cluster_pcm_get_writer_reverify_reacquire_count()));
+	emit_row(rsinfo, "pcm", "restore_aba_detected_count",
+			 fmt_int64((int64)cluster_pcm_get_restore_aba_detected_count()));
 }
 
 

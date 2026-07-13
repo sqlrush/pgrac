@@ -7778,6 +7778,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	SCN			page_scn = InvalidScn;	/* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
 	bool		was_dirty = false;
 	uint8		saved_pcm_state;
+	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
 
 	(void) expected_mode;
 
@@ -7892,6 +7893,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	}
 
 	saved_pcm_state = buf->pcm_state;
+	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
@@ -7918,13 +7920,25 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-window");
 		buf_state = LockBufHdr(buf);
-		/* PGRAC: GCS serve-stall round-6 (gap (c)) — restore the staged N only
-		 * when it is still staged.  NOTE: the ==N guard blocks a simple
-		 * overwrite but NOT an N->X->N ABA (state is N again); the
-		 * ownership-generation compare is added by wave-2. */
+		/*
+		 * PGRAC ownership-generation wave (W2) — restore the staged N ONLY when
+		 * it is still the same ownership epoch we staged.  The ==N guard alone
+		 * blocks a plain overwrite but NOT an N->X->N ABA: a concurrent round
+		 * that granted X (finalize bumped the generation) and then dropped back
+		 * to N leaves pcm_state==N again with a NEW generation.  Restoring
+		 * saved_pcm_state (the stale pre-drop X/S) over that re-owned block
+		 * would resurrect a dead grant (Rule 8.A double/stale holder).  Gate the
+		 * restore on the generation being unchanged; if it moved, the block was
+		 * legitimately re-owned and dropped in between, so leave it at N.
+		 */
 		if (BufferTagsEqual(&buf->tag, &tag) &&
-			buf->pcm_state == (uint8) PCM_STATE_N)
+			buf->pcm_state == (uint8) PCM_STATE_N &&
+			cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
 			buf->pcm_state = saved_pcm_state;
+		else if (BufferTagsEqual(&buf->tag, &tag) &&
+				 buf->pcm_state == (uint8) PCM_STATE_N &&
+				 cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
+			cluster_pcm_note_restore_aba_detected();
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
@@ -8202,6 +8216,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
 	bool		was_dirty = false;
 	uint8		saved_pcm_state;
+	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -8318,6 +8333,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	}
 
 	saved_pcm_state = buf->pcm_state;
+	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping (the
@@ -8340,13 +8356,20 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-window");
 		buf_state = LockBufHdr(buf);
-		/* PGRAC: GCS serve-stall round-6 (gap (c)) — restore the staged N only
-		 * when it is still staged.  NOTE: the ==N guard blocks a simple
-		 * overwrite but NOT an N->X->N ABA (state is N again); the
-		 * ownership-generation compare is added by wave-2. */
+		/*
+		 * PGRAC ownership-generation wave (W2) — see the twin arm above: restore
+		 * the staged N only when the ownership generation is unchanged, so an
+		 * N->X->N ABA that re-owned and dropped the block in the InvalidateBuffer
+		 * window does not get a stale pre-drop state restored over it.
+		 */
 		if (BufferTagsEqual(&buf->tag, &tag) &&
-			buf->pcm_state == (uint8) PCM_STATE_N)
+			buf->pcm_state == (uint8) PCM_STATE_N &&
+			cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
 			buf->pcm_state = saved_pcm_state;
+		else if (BufferTagsEqual(&buf->tag, &tag) &&
+				 buf->pcm_state == (uint8) PCM_STATE_N &&
+				 cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
+			cluster_pcm_note_restore_aba_detected();
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
