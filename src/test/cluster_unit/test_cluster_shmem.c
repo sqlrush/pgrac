@@ -817,6 +817,13 @@ void
 cluster_smgr_shmem_register(void)
 {}
 
+/* ownership-generation wave stub: cluster_pcm_own shmem region
+ * (cluster_pcm_own.o is not in the cluster_unit link set). */
+void cluster_pcm_own_shmem_register(void);
+void
+cluster_pcm_own_shmem_register(void)
+{}
+
 /* spec-2.6 Sprint A Step 1 stub: cluster_qvotec shmem region. */
 void
 cluster_qvotec_shmem_register(void)
