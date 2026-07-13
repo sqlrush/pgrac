@@ -572,6 +572,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-relmap-crash-after-stage" },
 	{ .name = "cluster-relmap-crash-before-publish" },
 	/*
+	 * GCS serve-stall round-6 — X-transfer copy->drop generation RED.
+	 *
+	 *	cluster-gcs-xfer-copy-drop-window:
+	 *	  Fires in BOTH destructive X-transfer branches (master==holder
+	 *	  self-ship and holder-forward), AFTER the ship image was captured
+	 *	  and BEFORE the local drop.  SLEEP holds the copy->drop window
+	 *	  open so a cached-X local writer can be admitted inside it (the
+	 *	  write lands after the copy, the drop then discards it): the
+	 *	  silent-lost-write interleave the generation gate closes (the
+	 *	  drop's page-LSN check refuses the stale-image drop, retryable).
+	 *	  No lock/pin is held across the point.  Driven by t/393.
+	 */
+	{ .name = "cluster-gcs-xfer-copy-drop-window" },
+	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
 	 *	cluster-gcs-block-stale-ship:

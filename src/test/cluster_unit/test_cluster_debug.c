@@ -1271,6 +1271,11 @@ cluster_gcs_get_drop_pinned_deny_count(void)
 {
 	return 0;
 }
+uint64
+cluster_gcs_get_xfer_stale_deny_count(void)
+{
+	return 0;
+}
 
 /* GCS-race round-4c FUNC-1 stubs: 3 storage-fallback SCN verify accessors. */
 uint64
