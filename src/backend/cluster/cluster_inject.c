@@ -586,6 +586,28 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-xfer-copy-drop-window" },
 	/*
+	 * GCS serve-stall round-6 wave-2 — ownership-generation P0 REDs.
+	 *
+	 *	cluster-pcm-writer-cached-x-stall:
+	 *	  Fires in LockBuffer(EXCLUSIVE) AFTER the cached-X cover fast path
+	 *	  decided "already hold X" and BEFORE the content-lock acquire, only
+	 *	  on the covered-X write path.  SLEEP holds that window open so a
+	 *	  peer read can drive a BAST X->S self-downgrade before the writer
+	 *	  takes the content lock; without the post-lock ownership-generation
+	 *	  re-verify the writer then writes on the stale X grant.  Driven by
+	 *	  the cached-X RED.
+	 *
+	 *	cluster-pcm-restore-aba-window:
+	 *	  Fires in the GCS drop bounded-restore arm AFTER InvalidateBufferTry
+	 *	  failed (pin raced) and BEFORE the saved pcm_state is written back,
+	 *	  with no spinlock held.  SLEEP holds the restore window open so a
+	 *	  concurrent ownership round (N->X->N) can complete; without the
+	 *	  generation-token match the blind restore clobbers the new state
+	 *	  with the stale saved value (ABA).  Driven by the restore-ABA RED.
+	 */
+	{ .name = "cluster-pcm-writer-cached-x-stall" },
+	{ .name = "cluster-pcm-restore-aba-window" },
+	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
 	 *	cluster-gcs-block-stale-ship:
