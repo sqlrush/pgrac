@@ -248,10 +248,25 @@ cluster_bufmgr_pcm_gate_direct_lock(BufferDesc *buf)
 		!(cluster_gcs_block_local_cache &&
 		  cluster_pcm_mode_covers((PcmLockMode) buf->pcm_state, PCM_LOCK_MODE_X)))
 	{
+		/*
+		 * PGRAC ownership-generation wave (W3 cover) — this direct-lock gate is
+		 * an X install that BYPASSES LockBuffer (RBM_ZERO_AND_LOCK /
+		 * EB_LOCK_FIRST), so it needs the same in-flight-grant protocol: mark
+		 * GRANT_PENDING before the request goes out so a same-tag INVALIDATE
+		 * arriving while pcm_state is still N parks (does not ack the grant
+		 * away), then finalize through the coherent transition so pcm_state=X,
+		 * the ownership generation bumps, and PENDING clears under one lock.
+		 */
+		cluster_pcm_own_set_flags(buf, PCM_OWN_FLAG_GRANT_PENDING, 0);
+
 		if (cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X))
-			cluster_buffer_desc_apply_pcm_ownership_fields(&buf->buffer_type,
-														   &buf->pcm_state,
-														   PCM_LOCK_MODE_X);
+		{
+			buf->buffer_type = (uint8) BUF_TYPE_XCUR;
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_X, 0,
+									   PCM_OWN_FLAG_GRANT_PENDING);
+		}
+		else
+			cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
 	}
 }
 #endif
@@ -1843,6 +1858,11 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 		cluster_pcm_lock_release_buffer_for_eviction(buf, old_mode);
 		ClearBufferTag(&buf->tag);
 		buf->pcm_state = (uint8) PCM_STATE_N;
+		/* PGRAC ownership-gen: bump under the held header spinlock so a buf_id
+		 * reuse after this eviction cannot alias a stale captured generation
+		 * (the classic ABA across tag reuse); also clear any lingering markers. */
+		cluster_pcm_own_bump_locked(buf, 0,
+								    PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING);
 	}
 #endif
 
@@ -2013,7 +2033,11 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 		buf_hdr->tag = tag;	/* restore for release helper (cleared above) */
 		cluster_pcm_lock_release_buffer_for_eviction(buf_hdr, old_mode);
 		ClearBufferTag(&buf_hdr->tag);
-		buf_hdr->pcm_state = (uint8) PCM_STATE_N;
+		/* PGRAC ownership-gen: coherent N-flip + generation bump (the header
+		 * spinlock was dropped above at UnlockBufHdr) so a buf_id reuse after
+		 * this victim eviction cannot alias a stale captured generation. */
+		cluster_pcm_own_transition(buf_hdr, (uint8) PCM_STATE_N, 0,
+								   PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING);
 	}
 #endif
 
@@ -5766,7 +5790,7 @@ LockBuffer(Buffer buffer, int mode)
 	 */
 	if (mode == BUFFER_LOCK_UNLOCK
 		&& buf->pcm_state == (uint8) PCM_STATE_READ_IMAGE)
-		buf->pcm_state = (uint8) PCM_STATE_N;
+		cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
 
 	if (mode == BUFFER_LOCK_UNLOCK &&
 		cluster_pcm_is_active() &&
@@ -5794,7 +5818,11 @@ LockBuffer(Buffer buffer, int mode)
 		if (!cluster_gcs_block_local_cache)
 		{
 			cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
-			buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
+			/* PGRAC ownership-gen: coherent state mirror + generation bump for
+			 * the cache-off X-release (X -> queried state). */
+			cluster_pcm_own_transition(buf,
+									   (uint8) cluster_pcm_lock_query(buf->tag),
+									   0, 0);
 		}
 	}
 #endif
@@ -5804,6 +5832,16 @@ LockBuffer(Buffer buffer, int mode)
  * Acquire the content_lock for the buffer, but only if we don't have to wait.
  *
  * This assumes the caller wants BUFFER_LOCK_EXCLUSIVE mode.
+ *
+ * PGRAC ownership-generation audit — this is NOT a PCM bypass entrance for the
+ * ownership-generation wave: it acquires only the content lock and never reads
+ * or mutates the (pcm_state, ownership generation, flags) triple, so it cannot
+ * create a stale-generation TOCTOU (W1) nor an install/drop window (W2/W3).  It
+ * deliberately does NOT register a PCM X grant: a caller that then WRITES the
+ * page is backstopped by cluster_bufmgr_block_write_permitted() at write time
+ * (which fails closed on a non-X pcm_state) regardless of how the content lock
+ * was obtained, and adding a (blocking) PCM acquire here would violate the
+ * don't-wait contract.  Out-of-window by construction.
  */
 bool
 ConditionalLockBuffer(Buffer buffer)
@@ -8655,6 +8693,9 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
 			 */
 			buf_state = LockBufHdr(bufHdr);
 			bufHdr->pcm_state = (uint8) PCM_STATE_N;
+			/* PGRAC ownership-gen: bump under the held spinlock (X -> N release
+			 * after the block is durable on shared storage). */
+			cluster_pcm_own_bump_locked(bufHdr, 0, 0);
 			UnlockBufHdr(bufHdr, buf_state);
 
 			UnpinBuffer(bufHdr);
