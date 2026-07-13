@@ -274,8 +274,10 @@ UT_TEST(test_s_holders_bitmap_query_prototype_linkable)
 UT_TEST(test_bufmgr_invalidate_block_for_gcs_prototype_linkable)
 {
 	/* HC118 + HC123 — by-tag invalidate helper in bufmgr.c.  spec-2.41 D3 added
-	 * the *out_page_scn out-param (ACK SCN carrier source). */
-	bool (*fp)(BufferTag, PcmLockMode, XLogRecPtr *, SCN *)
+	 * the *out_page_scn out-param (ACK SCN carrier source);  GCS serve-stall
+	 * round-5 A2 made the drop bounded (tri-state result, PINNED never
+	 * waits). */
+	ClusterBufmgrGcsDropResult (*fp)(BufferTag, PcmLockMode, XLogRecPtr *, SCN *)
 		= &cluster_bufmgr_invalidate_block_for_gcs;
 
 	UT_ASSERT(fp != NULL);
