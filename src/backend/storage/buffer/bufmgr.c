@@ -5793,6 +5793,7 @@ LockBuffer(Buffer buffer, int mode)
 			 * parked counter); an already_invalidated ACK here is the W3
 			 * defect.
 			 */
+			CLUSTER_INJECTION_POINT("cluster-pcm-grant-finalize-deliver-invalidate");
 			if (cluster_injection_should_skip(
 					"cluster-pcm-grant-finalize-deliver-invalidate"))
 			{
@@ -8018,6 +8019,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 * (grant finalize bump + drop-back-to-N bump).  Same force-behavior
 		 * inject pattern as cluster-gcs-block-duplicate-grant-reply.
 		 */
+		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
 			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
 
@@ -8463,6 +8465,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-window");
 
 		/* W2 RED force-round — see the twin arm above. */
+		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
 			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
 
