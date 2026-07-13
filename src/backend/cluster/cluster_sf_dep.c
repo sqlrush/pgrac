@@ -308,6 +308,30 @@ cluster_sf_peer_supports_xid_authority_flock(int32 peer_id)
 }
 
 /*
+ * cluster_sf_peer_supports_gcs_inval_busy
+ *
+ * PGRAC ownership-generation wave (ruling ②): true iff the peer's verified
+ * HELLO on the CURRENT connection advertised the INVALIDATE RETRYABLE_BUSY
+ * negative-ACK protocol bit.  Same connection-bound, no-local-GUC discipline
+ * as the queries above; an unknown/old/reconnecting peer reads false and the
+ * holder degrades in the safe direction (round-5 park, the master burns its
+ * timeout exactly as the pre-BUSY protocol did).
+ */
+bool
+cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1) != 0;
+}
+
+/*
  * cluster_sf_note_peer_disconnected_gen
  *
  * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: capability

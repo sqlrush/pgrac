@@ -1250,6 +1250,16 @@ cluster_gcs_get_invalidate_send_not_admitted_count(void)
 {
 	return 0;
 }
+uint64
+cluster_gcs_get_invalidate_busy_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_busy_received_count(void)
+{
+	return 0;
+}
 /* GCS serve-stall round-5 A2 stubs: 4 bounded-drop accessors. */
 uint64
 cluster_gcs_get_invalidate_parked_count(void)

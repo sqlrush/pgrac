@@ -652,6 +652,10 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * hold its gate. */
 	if (!cluster_ic_suppress_xid_flock_cap)
 		capabilities |= PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2;
+	/* PGRAC ownership-generation wave (ruling ②): RETRYABLE_BUSY invalidate
+	 * negative-ACK protocol capability, same unconditional discipline (see
+	 * cluster_ic.h). */
+	capabilities |= PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

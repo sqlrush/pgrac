@@ -1829,9 +1829,8 @@ cluster_pcm_note_writer_reverify_reacquire(void)
 uint64
 cluster_pcm_get_writer_cover_stale_detected_count(void)
 {
-	return ClusterPcm != NULL
-			   ? pg_atomic_read_u64(&ClusterPcm->writer_cover_stale_detected_count)
-			   : 0;
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->writer_cover_stale_detected_count)
+							  : 0;
 }
 
 uint64
@@ -1852,8 +1851,7 @@ cluster_pcm_note_restore_aba_detected(void)
 uint64
 cluster_pcm_get_restore_aba_detected_count(void)
 {
-	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->restore_aba_detected_count)
-							  : 0;
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->restore_aba_detected_count) : 0;
 }
 
 /*

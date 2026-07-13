@@ -1950,7 +1950,8 @@ InvalidateBufferTry(BufferDesc *buf)
 	 * deterministically.  Gated to GCS drops only — plain evictions must not
 	 * stall.  No lock is held across the sleep.
 	 */
-	if (cluster_bufmgr_in_gcs_drop)
+	if (cluster_bufmgr_in_gcs_drop
+		&& BufTagGetForkNum(&oldTag) == MAIN_FORKNUM)
 		CLUSTER_INJECTION_POINT("cluster-pcm-drop-prepin-window");
 #endif
 
@@ -5730,7 +5731,11 @@ LockBuffer(Buffer buffer, int mode)
 		 * that window open so the RED can drive the downgrade deterministically;
 		 * the post-content-lock re-verify below is what closes it.
 		 */
-		if (pcm_covered && pcm_mode == PCM_LOCK_MODE_X)
+		/* MAIN-fork gate: the visibilitymap_pin X prefetch also runs a
+		 * covered-X LockBuffer on the VM page and would otherwise consume
+		 * the stall ahead of the heap block under test. */
+		if (pcm_covered && pcm_mode == PCM_LOCK_MODE_X
+			&& BufTagGetForkNum(&buf->tag) == MAIN_FORKNUM)
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{

@@ -203,6 +203,10 @@ typedef struct ClusterGcsBlockShared {
 	 * deny instead (drop_pinned_deny). */
 	pg_atomic_uint64 invalidate_parked_count;
 	pg_atomic_uint64 invalidate_park_expired_count;
+	/* PGRAC ownership-generation wave (ruling ②): RETRYABLE_BUSY negative
+	 * ACKs — holder side sent / master side consumed (slot-matching). */
+	pg_atomic_uint64 invalidate_busy_sent_count;
+	pg_atomic_uint64 invalidate_busy_received_count;
 	pg_atomic_uint64 invalidate_park_overflow_count;
 	pg_atomic_uint64 drop_pinned_deny_count;
 	/* PGRAC: GCS serve-stall round-6 — the generation gate refused a drop
@@ -290,7 +294,12 @@ typedef struct ClusterGcsBlockShared {
 	BufferTag invalidate_broadcast_tag;				   /* HC116/HC100 validation */
 	pg_atomic_uint32 invalidate_broadcast_expected_bm; /* holders we awaited */
 	pg_atomic_uint32 invalidate_broadcast_acked_bm;	   /* holders ack'd so far */
-	LWLockPadded invalidate_broadcast_lock;			   /* protects identity + ack bitmap */
+	/* PGRAC ownership-generation wave (ruling ②): a slot-matching
+	 * RETRYABLE_BUSY(5) ACK arrived — the waiter aborts the round
+	 * immediately instead of burning its timeout.  Claimed/released with
+	 * the slot. */
+	pg_atomic_uint32 invalidate_broadcast_busy;
+	LWLockPadded invalidate_broadcast_lock; /* protects identity + ack bitmap */
 	ConditionVariable invalidate_broadcast_cv;
 	/* PGRAC: spec-6.12a — request-id source for the LOCAL-master S->X
 	 * upgrade's invalidate broadcast (backend-context caller has no wire
@@ -501,6 +510,8 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_queued_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_parked_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_busy_sent_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_busy_received_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_expired_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_overflow_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->drop_pinned_deny_count, 0);
@@ -557,6 +568,7 @@ cluster_gcs_block_shmem_init(void)
 			   sizeof(ClusterGcsBlock->invalidate_broadcast_tag));
 		pg_atomic_init_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, 0);
 		pg_atomic_init_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+		pg_atomic_init_u32(&ClusterGcsBlock->invalidate_broadcast_busy, 0);
 		LWLockInitialize(&ClusterGcsBlock->invalidate_broadcast_lock.lock,
 						 LWTRANCHE_CLUSTER_GCS_BLOCK);
 		ConditionVariableInit(&ClusterGcsBlock->invalidate_broadcast_cv);
@@ -6727,7 +6739,7 @@ static const ClusterICMsgTypeInfo gcs_block_forward_info = {
  * ============================================================ */
 static bool
 gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, uint32 holders_bm,
-											bool via_outbound_ring)
+											bool via_outbound_ring, bool *out_busy)
 {
 	GcsBlockInvalidatePayload inv;
 	uint64 current_epoch;
@@ -6741,6 +6753,8 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	 * (runs at the master; service-time when master != requester). */
 	ClusterXpScope xp_inv;
 
+	if (out_busy != NULL)
+		*out_busy = false;
 	if (ClusterGcsBlock == NULL)
 		return false;
 
@@ -6782,6 +6796,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 				ClusterGcsBlock->invalidate_broadcast_tag = req->tag;
 				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, holders_bm);
 				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+				pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_busy, 0);
 				pg_atomic_write_u64(&ClusterGcsBlock->invalidate_broadcast_request_id,
 									req->request_id);
 				LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
@@ -6845,16 +6860,14 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 			 * permanent upgrade wedge.  Count the drop and do NOT count it as
 			 * broadcast; the wait below then fails fast and honest.
 			 */
-			if (via_outbound_ring)
-			{
+			if (via_outbound_ring) {
 				if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
-															  (uint32)n, &inv, sizeof(inv)))
-				{
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count, 1);
+															  (uint32)n, &inv, sizeof(inv))) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count,
+											1);
 					continue;
 				}
-			}
-			else
+			} else
 				cluster_gcs_block_note_send_outcome(
 					GCS_BLOCK_SEND_FAMILY_INVALIDATE,
 					cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
@@ -6869,6 +6882,16 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 			acked_bm = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm);
 			if ((acked_bm & holders_bm) == holders_bm) {
 				full_ack = true;
+				break;
+			}
+			/* Ruling ② — a slot-matching RETRYABLE_BUSY aborts the round NOW:
+			 * the blocked holder cannot make progress while this waiter holds
+			 * pending_x, so waiting longer only burns the budget.  The caller
+			 * clears pending_x, backs off briefly and retries with a NEW
+			 * round identity. */
+			if (pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_busy) != 0) {
+				if (out_busy != NULL)
+					*out_busy = true;
 				break;
 			}
 			elapsed_ms = (long)((GetCurrentTimestamp() - start_lsn) / 1000);
@@ -6891,6 +6914,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 			   sizeof(ClusterGcsBlock->invalidate_broadcast_tag));
 		pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, 0);
 		pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+		pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_busy, 0);
 		LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 		ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
 		PG_RE_THROW();
@@ -6918,6 +6942,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 		   sizeof(ClusterGcsBlock->invalidate_broadcast_tag));
 	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm, 0);
 	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
+	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_busy, 0);
 	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 	ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
 
@@ -7223,13 +7248,16 @@ cluster_gcs_block_pi_discard_drain(void)
  *	invalidate).
  * ============================================================ */
 bool
-cluster_gcs_block_local_x_upgrade(BufferTag tag)
+cluster_gcs_block_local_x_upgrade_ext(BufferTag tag, bool *out_busy)
 {
 	GcsBlockRequestPayload synth;
 	uint32 holders_bm;
 	uint32 self_bit;
 	int n;
 	bool upgraded = false;
+
+	if (out_busy != NULL)
+		*out_busy = false;
 
 	if (ClusterGcsBlock == NULL || cluster_node_id < 0 || cluster_node_id >= 32)
 		return false;
@@ -7248,6 +7276,8 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 
 		holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
 		if (holders_bm != 0) {
+			bool round_busy = false;
+
 			memset(&synth, 0, sizeof(synth));
 			/* PGRAC: spec-6.14a D1 — domain-tagged id (top bit = local-upgrade
 			 * domain; holds for node 0 too).  See cluster_gcs_reqid.h. */
@@ -7258,13 +7288,21 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 			synth.tag = tag;
 			synth.sender_node = cluster_node_id;
 
-			if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true)
+			if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true, &round_busy)
 				/* Exact-epoch fence (grant side): the acks certify drops at
 				 * the epoch the broadcast ran under.  If the epoch moved at
 				 * any point across this upgrade, the rebuilt S set may not
 				 * be covered — fail closed, retryable (8.A stale-proof). */
 				|| cluster_epoch_get_current() != upgrade_epoch) {
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
+				/* Ruling ② — BUSY is a deliberate negative ACK, not a lost
+				 * holder: report it to the caller (which backs off + retries
+				 * with a new round identity) and keep the timeout counter
+				 * for genuine timeouts only. */
+				if (round_busy) {
+					if (out_busy != NULL)
+						*out_busy = true;
+				} else
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
 				covered = false;
 			} else {
 				/* Acks certify the drops; clear the acked bits on the
@@ -7293,6 +7331,42 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 1);
 	(void)cluster_pcm_lock_clear_pending_x_if(tag, cluster_node_id);
 	return upgraded;
+}
+
+/*
+ * cluster_gcs_block_local_x_upgrade — ruling ② busy-retry wrapper.
+ *
+ *	A RETRYABLE_BUSY round is not a failure of the protocol, it is the
+ *	holder saying "the thing blocking me is YOUR pending_x" — by the time
+ *	the round aborted, pending_x was cleared (the _ext exit path), so the
+ *	blocked acquire drains and an immediate short-backoff retry usually
+ *	completes.  Each attempt mints a fresh request_id inside _ext (the new
+ *	round identity: a late BUSY/ACK from an aborted round cannot match the
+ *	next round's slot).  Genuine timeouts / epoch fences are NOT retried
+ *	here — they stay fail-closed retryable at the statement level, the
+ *	posture for lost packets and dead nodes.
+ */
+#define GCS_INVAL_BUSY_MAX_RETRIES 5
+#define GCS_INVAL_BUSY_BACKOFF_BASE_US 2000L /* 2,4,8,16,32ms — 62ms total */
+
+bool
+cluster_gcs_block_local_x_upgrade(BufferTag tag)
+{
+	int attempt;
+
+	for (attempt = 0; attempt <= GCS_INVAL_BUSY_MAX_RETRIES; attempt++) {
+		bool round_busy = false;
+
+		if (attempt > 0) {
+			pg_usleep(GCS_INVAL_BUSY_BACKOFF_BASE_US << (attempt - 1));
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (cluster_gcs_block_local_x_upgrade_ext(tag, &round_busy))
+			return true;
+		if (!round_busy)
+			return false;
+	}
+	return false; /* busy budget exhausted — caller fail-closes retryable */
 }
 
 /* ============================================================
@@ -7364,15 +7438,24 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		 * A2 park lot); the LMS-loop retry re-runs once the grant finalized
 		 * (PENDING cleared), and then sees the real X/S and invalidates it.
 		 */
-		if (cluster_bufmgr_block_grant_pending(inv->tag))
-		{
+		if (cluster_bufmgr_block_grant_pending(inv->tag)) {
 			cluster_pcm_note_invalidate_parked_grant_pending();
-			/* XXX TEMP probe — remove before commit */
-			elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " N-park (GRANT_PENDING)", inv->request_id);
+			/*
+			 * Ruling ② — a BUSY-capable master gets the negative ACK RIGHT
+			 * NOW instead of a silent park: it aborts the round (clears
+			 * pending_x, releases the slot) and retries with a new round
+			 * identity, which breaks the timeout-mediated loop (the
+			 * GRANT_PENDING owner is typically an S acquire waiting on that
+			 * very pending_x).  Nothing local changed; terminal for THIS
+			 * directive.  An old master falls back to the round-5 park.
+			 */
+			if (cluster_sf_peer_supports_gcs_inval_busy(inv->master_node)) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_busy_sent_count, 1);
+				ack_status = (uint8)GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY;
+				goto send_ack;
+			}
 			return false;
 		}
-		/* XXX TEMP probe — remove before commit */
-		elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " already_invalidated", inv->request_id);
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;
 	}
@@ -7424,16 +7507,22 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		 * caller parks the directive and the LMS loop retries it.  STALE is
 		 * unreachable here (the invalidate wrapper passes no expected_lsn, so
 		 * its generation gate never fires); treated like PINNED defensively
-		 * (round-6). */
-		/* XXX TEMP probe — remove before commit */
-		elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " PINNED-park", inv->request_id);
+		 * (round-6).
+		 *
+		 * Ruling ② — a BUSY-capable master gets the negative ACK instead
+		 * (same rationale as the GRANT_PENDING arm above: the pin's holder
+		 * is often itself waiting behind the master's pending_x, so parking
+		 * only burns the master's timeout).  Nothing local changed.
+		 */
+		if (cluster_sf_peer_supports_gcs_inval_busy(inv->master_node)) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_busy_sent_count, 1);
+			ack_status = (uint8)GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY;
+			goto send_ack;
+		}
 		return false;
 	}
 
 send_ack:
-	/* XXX TEMP probe — remove before commit */
-	elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " send_ack status=%u to=%d",
-		 inv->request_id, (unsigned) ack_status, inv->master_node);
 	memset(&ack, 0, sizeof(ack));
 	ack.request_id = inv->request_id;
 	ack.epoch = inv->epoch;
@@ -7581,7 +7670,7 @@ cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag)
 	GcsBlockInvalidatePayload inv;
 
 	memset(&inv, 0, sizeof(inv));
-	inv.request_id = 0;			/* synthetic; never reaches the ACK path */
+	inv.request_id = 0; /* synthetic; never reaches the ACK path */
 	inv.epoch = cluster_epoch_get_current();
 	inv.tag = tag;
 	inv.master_node = cluster_node_id;
@@ -7592,10 +7681,6 @@ static void
 cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockInvalidatePayload *inv = (const GcsBlockInvalidatePayload *)payload;
-
-	/* XXX TEMP probe — remove before commit */
-	elog(LOG, "INVAL-RECV req_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " blk=%u from=%u",
-		 inv->request_id, inv->epoch, inv->tag.blockNum, env->source_node_id);
 
 	/* D16 inject — stall ack for timeout testing. */
 	CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-stall-ack");
@@ -7734,6 +7819,40 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		if (ack->epoch == cluster_epoch_get_current() && ack->sender_node >= 0
 			&& ack->sender_node < 32)
 			cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
+		return;
+	}
+
+	/*
+	 * PGRAC ownership-generation wave (ruling ②) — RETRYABLE_BUSY(5),
+	 * solicited negative ACK.  Diverted BEFORE the slotless S-bit clear (a
+	 * BUSY holder changed NOTHING locally — crediting a drop would be a
+	 * false proof) and BEFORE the HC100 slot logic (which rejects status>2
+	 * as stale).  Full slot-identity validation under the slot lock — the
+	 * same request_id + epoch + tag + expected-sender checks a positive ACK
+	 * must pass — so a late BUSY from an older round cannot abort a newer
+	 * round (round-identity ABA).  On a match: flag the slot busy and wake
+	 * the waiter; it aborts the round (no acked_bm credit, no holder clear,
+	 * no watermark advance, no X grant), clears pending_x, releases the
+	 * slot and retries with a NEW round identity after a short backoff.
+	 */
+	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY) {
+		LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id) == ack->request_id
+			&& ack->epoch == ClusterGcsBlock->invalidate_broadcast_epoch
+			&& ClusterGcsBlock->invalidate_broadcast_epoch == cluster_epoch_get_current()
+			&& BufferTagsEqual(&ack->tag, &ClusterGcsBlock->invalidate_broadcast_tag)
+			&& ack->sender_node >= 0 && ack->sender_node < 32
+			&& (pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm)
+				& ((uint32)1u << ack->sender_node))
+				   != 0) {
+			pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_busy, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_busy_received_count, 1);
+			LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+			ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
+		} else {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+			LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+		}
 		return;
 	}
 
@@ -8179,6 +8298,20 @@ cluster_gcs_get_invalidate_send_not_admitted_count(void)
 	return ClusterGcsBlock
 			   ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count)
 			   : 0;
+}
+
+/* PGRAC ownership-generation wave (ruling ②): RETRYABLE_BUSY accessors. */
+uint64
+cluster_gcs_get_invalidate_busy_sent_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_busy_sent_count) : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_busy_received_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_busy_received_count)
+						   : 0;
 }
 
 /* PGRAC: GCS serve-stall round-5 A2 — 4 bounded-drop accessors. */

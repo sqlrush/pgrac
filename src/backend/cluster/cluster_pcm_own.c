@@ -39,7 +39,7 @@ ClusterPcmOwnEntry *ClusterPcmOwnArray = NULL;
 Size
 cluster_pcm_own_shmem_size(void)
 {
-	return mul_size((Size) NBuffers, sizeof(ClusterPcmOwnEntry));
+	return mul_size((Size)NBuffers, sizeof(ClusterPcmOwnEntry));
 }
 
 void
@@ -47,9 +47,8 @@ cluster_pcm_own_shmem_init(void)
 {
 	bool found;
 
-	ClusterPcmOwnArray
-		= (ClusterPcmOwnEntry *) ShmemInitStruct("pgrac cluster pcm ownership",
-												 cluster_pcm_own_shmem_size(), &found);
+	ClusterPcmOwnArray = (ClusterPcmOwnEntry *)ShmemInitStruct(
+		"pgrac cluster pcm ownership", cluster_pcm_own_shmem_size(), &found);
 	if (!found) {
 		int i;
 
@@ -76,4 +75,4 @@ cluster_pcm_own_shmem_register(void)
 	cluster_shmem_register_region(&cluster_pcm_own_region);
 }
 
-#endif							/* USE_PGRAC_CLUSTER */
+#endif /* USE_PGRAC_CLUSTER */

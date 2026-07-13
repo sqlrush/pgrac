@@ -2187,6 +2187,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	 * and closed instead of silently losing the write. */
 	emit_row(rsinfo, "gcs", "invalidate_parked_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_parked_count()));
+	emit_row(rsinfo, "gcs", "invalidate_busy_sent_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_sent_count()));
+	emit_row(rsinfo, "gcs", "invalidate_busy_received_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_received_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_park_expired_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_overflow_count",

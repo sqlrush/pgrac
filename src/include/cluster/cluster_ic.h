@@ -333,6 +333,23 @@ typedef enum ClusterICPlane {
  * harmless; the LMON tick's settle re-verify + re-assert repairs any
  * erased stamp until the gate's admission holds. */
 #define PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 ((uint32)0x00000040U)
+/* PGRAC: ownership-generation wave (user ruling ②) — this binary understands
+ * INVALIDATE-ACK status RETRYABLE_BUSY(5): a holder that cannot invalidate
+ * RIGHT NOW (in-flight grant marked GRANT_PENDING, or a pinned copy) replies
+ * BUSY instead of parking silently, and this master aborts the invalidate
+ * round immediately (no acked_bm credit, no holder clear, no watermark
+ * advance, no X grant), clears pending_x, releases the node-wide broadcast
+ * slot and retries with a NEW round identity after a short backoff.  Kills
+ * the timeout-mediated progress loop (a reader's S acquire waits on
+ * pending_x while the writer waits on an ACK the reader's GRANT_PENDING
+ * parks).  A PROTOCOL capability, advertised unconditionally.  Send-side
+ * hard gate: a holder replies BUSY only to a master whose CURRENT connection
+ * advertised this bit — an old master's ACK handler drops status>2 as a
+ * stale reply and would still burn its full timeout; the holder falls back
+ * to the round-5 park (old behavior) so mixed-version degrades to exactly
+ * the pre-BUSY protocol.  Timeout stays the backstop for packet loss / dead
+ * nodes. */
+#define PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 ((uint32)0x00000080U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

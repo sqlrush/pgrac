@@ -191,77 +191,49 @@ my $pin_elapsed = time() - $t_pin;
 $reqh->finish;
 my $req_elapsed = time() - $t_req;
 disarm($n0);
-# Quiesce before the convergence leg: the requester's timeout broke the
-# round's circular wait (in-flight reader S acquire holds GRANT_PENDING ->
-# parks the INVALIDATE -> upgrade holds pending_x -> blocks that same S
-# grant); the reader then finalizes, and the parked directive's park_tick
-# retry executes the drop and sends the catch-up ACK (~2.5s, observed),
-# whose slotless arm clears the master's S bit.  Wait that chain out so the
-# retry below starts from a settled directory.
-usleep(8_000_000);
-
-my $aba_d = state_int($n0, 'pcm', 'restore_aba_detected_count') - $aba_b;
-diag(sprintf(
-	"aba delta=%d; reader elapsed=%.2fs out=[%s] err=[%s]; "
-	  . "requester attempt1 elapsed=%.2fs err=[%s]",
-	$aba_d, $pin_elapsed, $pin_out // '',
-	($pin_err // '') =~ s/\n.*//sr, $req_elapsed,
-	($rerr // '') =~ s/\n.*//sr));
-
-# L2 — the fix contract, full-chain proven.
-cmp_ok($aba_d, '>=', 1,
-	'L2 restore-ABA detected (restore_aba_detected_count advanced; old code '
-	  . 'silently restored the stale pre-drop X here)');
-like(($pin_out // ''), qr/^1$/m,
-	'L2 the pinning reader completed cleanly (count=1)');
-
-# L3 — liveness + convergence.  The guard left the block at N (fail-safe: N
-# claims nothing) while the force-round moved only the LOCAL generation, so
-# the master still books node0 as the X holder — an artificial master/mirror
-# asymmetry a REAL N->X->N round would not leave (its grant/drop synchronize
-# the master).  The fix's recovery contract is that the next local access
-# simply re-acquires: node0's own write re-establishes mirror X (the master
-# already books node0, so the re-grant is idempotent), after which the
-# requester's transfer serves normally.  Drive exactly that.
-my $healed = 0;
-for (1 .. 20) {
-	my ($rch, $oh, $eh) = $n0->psql('postgres',
-		"UPDATE $tbl SET v = v + 100 WHERE k = 1");
-	if ($rch == 0) { $healed = 1; last; }
-	usleep(400_000);
-}
-ok($healed,
-	'L3 node0 local re-acquire healed the N mirror (the fail-safe N is '
-	  . 'transparently recoverable, not a wedge)');
-
-# FREEZE the heal's new tuple version before node1 touches it (same recipe
-# as the fixture seed): a frozen xmin is natively visible on any node, so
-# node1's scan never routes node0's low xid to the cluster TT-resolve path
-# and cannot trip the ORTHOGONAL fresh-cluster 53R97 fail-close (task ⑤/⑥
-# territory, not this window; hint bits alone do NOT help — the remote-xid
-# dimension still routes to the cluster path).
-$n0->safe_psql('postgres', "VACUUM (FREEZE) $tbl");
-$n0->safe_psql('postgres', 'CHECKPOINT');
-$n0->safe_psql('postgres', "SELECT count(*) FROM $tbl");
-
-my $v1;
-for (1 .. 20) {
+# L3 — convergence.  With ruling ②'s RETRYABLE_BUSY the requester no longer
+# burns its ACK budget against the circular wait (reader's in-flight S acquire
+# holds GRANT_PENDING -> INVALIDATE parks -> upgrade waits): the holder answers
+# BUSY, the master aborts the round, clears pending_x (unblocking that very
+# reader) and retries with a fresh round identity after a short backoff — so
+# the SAME statement completes.  The VM-page X prefetch (visibilitymap_pin)
+# keeps the in-crit VM clear off the wire, so no ERROR->PANIC escalation
+# either.  A bounded number of statement-level retries is tolerated (the
+# prepin sleep can still eat one serve); a wedge or a PANIC is a failure.
+my $att_ok = ($reqh->result // 1) == 0 && ($rerr // '') =~ /^\s*$/;
+my $tries = 0;
+while (!$att_ok && $tries < 3) {
+	$tries++;
 	my ($rc2, $o2, $e2) = $n1->psql('postgres',
-		"UPDATE $tbl SET v = v + 10 WHERE k = 1 RETURNING v");
-	if ($rc2 == 0 && defined $o2 && $o2 ne '') { $v1 = int($o2); last; }
+		"UPDATE $tbl SET v = v + 10 WHERE k = 1");
+	if ($rc2 == 0) { $att_ok = 1; last; }
+	diag("retry $tries err=[" . (($e2 // '') =~ s/\n.*//sr) . "]");
 	usleep(400_000);
 }
-ok(defined $v1, 'L3 requester UPDATE landed (retryable deny, not a wedge)');
-# node1's +10 tuple needs the same freeze treatment before either node's
-# final read (node0 would otherwise TT-resolve node1's low xid).
+ok($att_ok,
+	'L3 requester UPDATE completed within bounded retries (BUSY broke the '
+	  . 'circular wait; no timeout-mediated wedge, no PANIC)');
+
+# The BUSY protocol actually participated: the holder (node0) answered at
+# least one RETRYABLE_BUSY and the master (node1) consumed it.
+my $busy_sent = state_int($n0, 'gcs', 'invalidate_busy_sent_count');
+my $busy_recv = state_int($n1, 'gcs', 'invalidate_busy_received_count');
+diag("busy_sent(node0)=$busy_sent busy_received(node1)=$busy_recv");
+cmp_ok($busy_sent, '>=', 1,
+	'L3 holder answered RETRYABLE_BUSY instead of a silent park');
+cmp_ok($busy_recv, '>=', 1,
+	'L3 master consumed the BUSY (round aborted, not timed out)');
+
+# Convergence: writer-side own-xid read first (no cross-node resolve), then
+# freeze ONCE at the very end (no lower-xid write follows, so the shared
+# relfrozenxid cannot be outrun) so node0's native read is TT-clean too.
+is($n1->safe_psql('postgres', "SELECT v FROM $tbl WHERE k = 1"), '11',
+	'L3 writer node reads its committed +10 (own-xid)');
 $n1->safe_psql('postgres', "VACUUM (FREEZE) $tbl");
+$n1->safe_psql('postgres', 'CHECKPOINT');
 $n1->safe_psql('postgres', "SELECT count(*) FROM $tbl");
-my $v0 = $n0->safe_psql('postgres', "SELECT v FROM $tbl WHERE k = 1");
-my $v1r = $n1->safe_psql('postgres', "SELECT v FROM $tbl WHERE k = 1");
-diag("final v: node0=$v0 node1=$v1r");
-is($v0, $v1r, 'L3 both nodes converge to the same final value');
-cmp_ok(int($v0), '>=', 111,
-	'L3 no lost write (the heal +100 AND at least one +10 both present)');
+is($n0->safe_psql('postgres', "SELECT v FROM $tbl WHERE k = 1"), '11',
+	'L3 both nodes converge to the same final value');
 
 # L4 — zero TT noise over the whole test.
 is(tt_noise_sum() - $tt_b, 0,

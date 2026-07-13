@@ -51,8 +51,8 @@
 #include "port/atomics.h"
 
 /* Transient ownership flags (per buffer). */
-#define PCM_OWN_FLAG_GRANT_PENDING ((uint32) 0x1) /* a grant is in flight to install */
-#define PCM_OWN_FLAG_REVOKING ((uint32) 0x2)	  /* a revoke (downgrade/invalidate) started */
+#define PCM_OWN_FLAG_GRANT_PENDING ((uint32)0x1) /* a grant is in flight to install */
+#define PCM_OWN_FLAG_REVOKING ((uint32)0x2)		 /* a revoke (downgrade/invalidate) started */
 
 typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 generation; /* monotone; bumped on every committed transition */
@@ -96,7 +96,7 @@ cluster_pcm_own_gen_bump(int buf_id)
 {
 	if (ClusterPcmOwnArray == NULL || buf_id < 0)
 		return;
-	(void) pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[buf_id].generation, 1);
+	(void)pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[buf_id].generation, 1);
 }
 
 static inline void
@@ -112,4 +112,4 @@ cluster_pcm_own_flags_apply(int buf_id, uint32 set, uint32 clear)
 	pg_atomic_write_u32(&ClusterPcmOwnArray[buf_id].flags, (old | set) & ~clear);
 }
 
-#endif							/* CLUSTER_PCM_OWN_H */
+#endif /* CLUSTER_PCM_OWN_H */

@@ -85,7 +85,7 @@
 #include "cluster/cluster_ko.h"			   /* cluster_ko_shmem_register (spec-5.7 D6) */
 #include "cluster/cluster_ges.h"		   /* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_advisory.h"	   /* cluster_advisory_shmem_register (spec-5.5 D8) */
-#include "cluster/cluster_pcm_own.h"		   /* cluster_pcm_own_shmem_register (ownership-gen wave) */
+#include "cluster/cluster_pcm_own.h"	   /* cluster_pcm_own_shmem_register (ownership-gen wave) */
 #include "cluster/cluster_cf_stats.h"	   /* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
