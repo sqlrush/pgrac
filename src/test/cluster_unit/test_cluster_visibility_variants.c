@@ -201,6 +201,39 @@ UT_TEST(test_obs_cr_xmax_full_table)
 		(int)CVV_FAILCLOSED_UNKNOWN);
 }
 
+
+/*
+ * Serve-stall round-6: evidence -> consumer route, full 8-row enumeration.
+ * The load-bearing rows: a raw current-xid match NEVER routes away from
+ * REMOTE or STALE evidence (striping-off/below-floor raw-xid collision with
+ * a remote writer must follow the resolved verdict / fail closed, never the
+ * native self/cmin path).
+ */
+UT_TEST(test_evidence_route_full_table)
+{
+	/* REMOTE: verdict wins, current-xid match irrelevant. */
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_REMOTE, false),
+				 (int)CLUSTER_VIS_ROUTE_REMOTE_VERDICT);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_REMOTE, true),
+				 (int)CLUSTER_VIS_ROUTE_REMOTE_VERDICT);
+
+	/* STALE/AMBIGUOUS: fail-closed, current-xid match irrelevant. */
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS, false),
+				 (int)CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS, true),
+				 (int)CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN);
+
+	/* LOCAL / NONE: only here may the raw current-xid test route to self. */
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_LOCAL, true),
+				 (int)CLUSTER_VIS_ROUTE_NATIVE_SELF);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_LOCAL, false),
+				 (int)CLUSTER_VIS_ROUTE_NATIVE);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_NONE, true),
+				 (int)CLUSTER_VIS_ROUTE_NATIVE_SELF);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_NONE, false),
+				 (int)CLUSTER_VIS_ROUTE_NATIVE);
+}
+
 int
 main(void)
 {
@@ -211,6 +244,7 @@ main(void)
 	UT_RUN(test_obs3_dirty_full_table);
 	UT_RUN(test_obs_cr_xmax_full_table);
 	UT_RUN(test_all_verdicts_in_range);
+	UT_RUN(test_evidence_route_full_table);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

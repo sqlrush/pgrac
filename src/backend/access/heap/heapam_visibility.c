@@ -77,7 +77,12 @@
  *	  and spec-7.1 D3-a (multixact xmax positive resolution: origin derived
  *	  from the striped mxid value, member overlay resolve in the MVCC D6
  *	  branch and the G6 keeps-visible multi arm; underivable stays the
- *	  fail-closed floor).
+ *	  fail-closed floor).  Serve-stall round-6: every variant fork resolves
+ *	  ITL evidence BEFORE the raw current-xid test and routes through
+ *	  cluster_vis_evidence_route -- a raw TransactionIdIsCurrentTransactionId
+ *	  match can be a striping-off/below-floor collision with a remote
+ *	  writer's xid and must never divert REMOTE/STALE evidence to the
+ *	  native self/cmin paths (spec-3.14 / spec-5.22f contract).
  *
  *-------------------------------------------------------------------------
  */
@@ -326,6 +331,12 @@ HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, Tran
  *	(the static SnapshotSelf is always LOCAL).  When xmin is remote we
  *	must not fall through (PG would re-judge it via local CLOG); local
  *	xmax is judged with PG primitives (correct for a local xid).
+ *
+ *	PGRAC serve-stall round-6: ITL evidence is resolved BEFORE the raw
+ *	current-xid test on both xid legs (cluster_vis_evidence_route) -- a
+ *	raw match can be a striping-off/below-floor collision with a remote
+ *	writer's xid, so only the no-remote-evidence routes may treat it as
+ *	our own transaction.
  */
 static bool
 cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
@@ -339,16 +350,20 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 		return false;
 	if (!PageHasItl(BufferGetPage(buffer)))
 		return false;
-	if (TransactionIdIsCurrentTransactionId(raw_xid))
-		return false;
 
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xid))) {
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
 						errhint("Remote commit_scn not yet propagated; retry or abort.")));
-	if (r.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
-		return false; /* local xmin: PG-native (xmax also judged there) */
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+	case CLUSTER_VIS_ROUTE_NATIVE:
+		return false; /* own insert / local xmin: PG-native (xmax judged there) */
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
+		break;
+	}
 
 	switch (cluster_vis_self_verdict(r.status)) {
 	case CVV_INVISIBLE:
@@ -379,22 +394,19 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 		return true;
 	}
 
-	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
-		*visible = false; /* deleted by our own xact */
-		return true;
-	}
-
 	{
 		ClusterVisResolve xr;
 
 		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
-		if (xr.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS) {
+		switch (cluster_vis_evidence_route(xr.evidence,
+										   TransactionIdIsCurrentTransactionId(raw_xmax))) {
+		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			raw_xid = raw_xmax;
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 							errmsg("cluster TT status unknown for xid %u", raw_xid),
 							errhint("Remote commit_scn not yet propagated; retry or abort.")));
-		}
-		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			break;
+		case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 			switch (cluster_vis_self_verdict(xr.status)) {
 			case CVV_VISIBLE:
 				*visible = false; /* deleter committed -> deleted */
@@ -410,6 +422,12 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 				*visible = true; /* deleter in-progress/aborted -> not deleted */
 				return true;
 			}
+			break;
+		case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+			*visible = false; /* deleted by our own xact */
+			return true;
+		case CLUSTER_VIS_ROUTE_NATIVE:
+			break;
 		}
 		/* local xmax: PG primitives are correct for a local xid. */
 		if (TransactionIdDidCommit(raw_xmax))
@@ -636,16 +654,23 @@ cluster_satisfies_toast_fork(HeapTuple htup, Buffer buffer, bool *visible)
 		return false;
 	if (!PageHasItl(BufferGetPage(buffer)))
 		return false;
-	if (TransactionIdIsCurrentTransactionId(raw_xid))
-		return false;
 
+	/* PGRAC serve-stall round-6: resolve ITL evidence BEFORE the raw
+	 * current-xid test (a raw match can be a below-floor collision with a
+	 * remote xid); only the no-remote-evidence routes fall to PG-native. */
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xid))) {
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
 						errhint("Remote commit_scn not yet propagated; retry or abort.")));
-	if (r.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+	case CLUSTER_VIS_ROUTE_NATIVE:
 		return false;
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
+		break;
+	}
 
 	switch (cluster_vis_toast_verdict(r.status)) {
 	case CVV_INVISIBLE:
@@ -796,17 +821,26 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	if (!PageHasItl(BufferGetPage(buffer)))
 		return false;
 
-	/* Our own insert: PG-native handles cmin / self-modified correctly. */
-	if (TransactionIdIsCurrentTransactionId(raw_xmin))
-		return false;
-
-	/* ---- xmin ---- */
+	/* ---- xmin ----
+	 *
+	 * PGRAC serve-stall round-6: ITL evidence is resolved BEFORE the raw
+	 * current-xid test (cluster_vis_evidence_route).  A raw match can be a
+	 * striping-off/below-floor collision with a remote inserter's xid; the
+	 * pre-round-6 early return handed that collision to the PG-native cmin
+	 * path -> "attempted to update invisible tuple".  Only the no-remote-
+	 * evidence route treats the raw match as our own insert.
+	 */
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &r);
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xmin))) {
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT slot recycled for xmin %u", raw_xmin),
 						errhint("ITL slot no longer maps to this xid; retry.")));
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+		/* Our own insert: PG-native handles cmin / self-modified correctly. */
+		return false;
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 		switch (cluster_vis_update_xmin_verdict(r.status)) {
 		case CVV_INVISIBLE:
 			*res = TM_Invisible;
@@ -822,6 +856,9 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 		default:
 			break;
 		}
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE:
+		break;
 	}
 	/* xmin NONE/LOCAL: leave xmin to PG unless we must intercept the xmax. */
 
@@ -859,26 +896,30 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 		return false; /* fully local: PG-native */
 	}
 
-	/* Our own xmax: PG-native (self-modified). */
-	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
-		if (xmin_remote_visible) {
-			*res = TM_SelfModified;
-			return true;
-		}
-		return false;
-	}
-
 	lock_only = HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask);
 	is_delete = !lock_only && !HeapTupleHeaderIndicatesMovedPartitions(tuple)
 				&& ItemPointerEquals(&htup->t_self, &tuple->t_ctid);
 	kind = lock_only ? CLUSTER_VIS_XMAX_LOCK_ONLY : CLUSTER_VIS_XMAX_UPDATE;
 
+	/* PGRAC serve-stall round-6: resolve ITL evidence BEFORE the raw
+	 * current-xid test (see the xmin leg above).  A raw match can be a
+	 * below-floor collision with a remote deleter/locker; the pre-round-6
+	 * early return misread that as TM_SelfModified. */
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, kind, &r);
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xmax))) {
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT slot recycled for xmax %u", raw_xmax),
 						errhint("ITL slot no longer maps to this xid; retry.")));
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+		/* Our own xmax: PG-native (self-modified). */
+		if (xmin_remote_visible) {
+			*res = TM_SelfModified;
+			return true;
+		}
+		return false;
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 		switch (cluster_vis_update_xmax_verdict(r.status, is_delete)) {
 		case CVV_VISIBLE:
 			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
@@ -903,6 +944,9 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 		default:
 			break;
 		}
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE:
+		break;
 	}
 
 	/*
@@ -1211,15 +1255,21 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 		return false;
 	if (!PageHasItl(BufferGetPage(buffer)))
 		return false;
-	if (TransactionIdIsCurrentTransactionId(raw_xid))
-		return false;
 
+	/* PGRAC serve-stall round-6: resolve ITL evidence BEFORE the raw
+	 * current-xid test (a raw match can be a below-floor collision with a
+	 * remote xid); only the no-remote-evidence routes fall to PG-native. */
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xid))) {
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
 						errhint("Remote commit_scn not yet propagated; retry or abort.")));
-	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		break;
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+	case CLUSTER_VIS_ROUTE_NATIVE:
+		return false; /* own insert / local / no evidence: PG-native */
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 		switch (cluster_vis_dirty_verdict(r.status, false, false)) {
 		case CVV_FAILCLOSED_CONFLICT:
 			ereport(ERROR,
@@ -1238,10 +1288,7 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 		default:
 			break; /* CVV_VISIBLE: xmin committed, check xmax */
 		}
-	} else if (r.evidence != CLUSTER_VIS_EVIDENCE_LOCAL) {
-		return false; /* NONE: local xmin path, PG-native */
-	} else {
-		return false; /* LOCAL xmin: PG-native */
+		break;
 	}
 
 	/* xmin remote committed: judge xmax (cannot fall through). */
@@ -1264,22 +1311,24 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 		return true;
 	}
 
-	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
-		*visible = false; /* deleted by self */
-		return true;
-	}
-
 	{
 		ClusterVisResolve xr;
 
+		/* PGRAC serve-stall round-6: resolve BEFORE the raw current-xid
+		 * test (see the xmin leg above). */
 		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
-		if (xr.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS) {
+		switch (cluster_vis_evidence_route(xr.evidence,
+										   TransactionIdIsCurrentTransactionId(raw_xmax))) {
+		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			raw_xid = raw_xmax;
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 							errmsg("cluster TT status unknown for xid %u", raw_xid),
 							errhint("Remote commit_scn not yet propagated; retry or abort.")));
-		}
-		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			break;
+		case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+			*visible = false; /* deleted by self */
+			return true;
+		case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 			switch (cluster_vis_dirty_verdict(xr.status, true, false)) {
 			case CVV_FAILCLOSED_CONFLICT:
 				ereport(ERROR,
@@ -1301,6 +1350,9 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 				*visible = true;
 				return true;
 			}
+			break;
+		case CLUSTER_VIS_ROUTE_NATIVE:
+			break;
 		}
 		/* local xmax. */
 		if (TransactionIdIsInProgress(raw_xmax)) {
@@ -1605,23 +1657,21 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		xmax = HeapTupleHeaderGetRawXmax(tuple);
 	if (!TransactionIdIsValid(xmax))
 		return 1; /* lockers-only multi: no update xid -> never a delete */
-	if (TransactionIdIsCurrentTransactionId(xmax)) {
-		/* Our own in-progress delete of the (remote-origin) row: native
-		 * command-id semantics apply -- deleted before this scan started
-		 * means invisible. */
-		if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-			return 1; /* deleted after scan started */
-		return 0;	  /* deleted before scan started */
-	}
 
 	/* PGRAC: spec-6.12i CP5 — the _scn variant threads the snapshot read_scn
 	 * down so a below-horizon origin verdict is judged admissible (leg (e))
 	 * inside the resolver; a returned bound decides correctly against THIS
-	 * read_scn (see commit_scn_is_bound). */
+	 * read_scn (see commit_scn_is_bound).
+	 *
+	 * PGRAC serve-stall round-6: resolved BEFORE the raw current-xid test
+	 * (cluster_vis_evidence_route) -- a raw match can be a below-floor
+	 * collision with a remote deleter's xid, and reading the remote tuple's
+	 * cmax against the LOCAL command counter is meaningless. */
 	cluster_visibility_resolve_tuple_scn(buffer, tuple, xmax, CLUSTER_VIS_XMAX_UPDATE,
 										 snapshot->read_scn, &xr);
 
-	if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+	switch (cluster_vis_evidence_route(xr.evidence, TransactionIdIsCurrentTransactionId(xmax))) {
+	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 		if (xr.status == CLUSTER_TT_STATUS_COMMITTED || xr.status == CLUSTER_TT_STATUS_CLEANED_OUT)
 			scn_decision = cluster_visibility_decide_by_scn(xr.commit_scn, snapshot->read_scn);
 
@@ -1637,6 +1687,20 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 			cluster_vis53r97_note_xmax_unprovable();
 			return -1; /* unknown / unresolved -> fail closed */
 		}
+		break;
+	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
+		/* PGRAC: spec-7.1 D0 census — deleting-xmax unproven leg. */
+		cluster_vis53r97_note_xmax_unprovable();
+		return -1; /* recycled/ambiguous deleter evidence -> fail closed */
+	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+		/* Our own in-progress delete of the (remote-origin) row: native
+		 * command-id semantics apply -- deleted before this scan started
+		 * means invisible. */
+		if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+			return 1; /* deleted after scan started */
+		return 0;	  /* deleted before scan started */
+	case CLUSTER_VIS_ROUTE_NATIVE:
+		break;
 	}
 
 	/*

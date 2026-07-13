@@ -3362,6 +3362,42 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 							  "enable cluster.crossnode_write_write or retry the "
 							  "transaction.")));
 }
+
+/*
+ * cluster_xwait_has_remote_evidence -- PGRAC serve-stall round-6.
+ *
+ *	Does the tuple's xmax (xwait) carry a fresh REMOTE ITL binding?  Guard
+ *	for heap_lock_tuple's native "locker is ourselves" raw-xid shortcuts:
+ *	with xid striping off (or below the activation floor) a remote locker's
+ *	raw xid can equal the current transaction's own xid, and taking the
+ *	self shortcut on such a collision silently treats a live remote lock as
+ *	already granted (or overwrites it).  When this returns true the caller
+ *	must stand down the shortcut and let the sleep path's evidence-first
+ *	bridge (cluster_heap_writer_wait_failclosed) classify the holder.
+ *
+ *	Only the xmax side is probed -- a remote xmin must NOT suppress a self
+ *	shortcut for a genuinely-own xmax.  A recycled binding (slot xid no
+ *	longer matches xwait) returns false: no proof of a remote holder; the
+ *	fork / bridge fail-closed legs own that shape.  Caller must hold the
+ *	buffer content lock (ITL slot read).
+ */
+static bool
+cluster_xwait_has_remote_evidence(Page page, HeapTupleHeader tuple, TransactionId xwait,
+								  uint16 infomask)
+{
+	ClusterUndoTTSlotRef ref;
+
+	if (!cluster_peer_mode_enabled() || !PageHasItl(page))
+		return false;
+	if (infomask & HEAP_XMAX_IS_MULTI)
+		return false; /* multixact evidence is the marker's job (spec-3.6) */
+	if (HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+		return cluster_itl_find_lock_tt_ref_by_xmax(page, xwait, &ref) && ref.tt_slot_id != 0
+			   && (int32) ref.origin_node_id != cluster_node_id && ref.local_xid == xwait;
+	return tuple->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
+		   && cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) && ref.tt_slot_id != 0
+		   && (int32) ref.origin_node_id != cluster_node_id && ref.local_xid == xwait;
+}
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -5681,12 +5717,28 @@ l3:
 		uint16		infomask2;
 		bool		require_sleep;
 		ItemPointerData t_ctid;
+#ifdef USE_PGRAC_CLUSTER
+		bool		cluster_xwait_remote;
+#endif
 
 		/* must copy state data before unlocking buffer */
 		xwait = HeapTupleHeaderGetRawXmax(tuple->t_data);
 		infomask = tuple->t_data->t_infomask;
 		infomask2 = tuple->t_data->t_infomask2;
 		ItemPointerCopy(&tuple->t_data->t_ctid, &t_ctid);
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC serve-stall round-6: probe (still under the content lock)
+		 * whether xwait carries fresh remote ITL evidence.  A raw
+		 * TransactionIdIsCurrentTransactionId(xwait) match below can be a
+		 * striping-off/below-floor collision with a remote locker's xid; the
+		 * native "locker is ourselves" shortcuts must stand down so the
+		 * sleep path's evidence-first bridge classifies the holder.
+		 */
+		cluster_xwait_remote = cluster_xwait_has_remote_evidence(BufferGetPage(*buffer),
+																 tuple->t_data, xwait, infomask);
+#endif
 
 		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 
@@ -5753,7 +5805,14 @@ l3:
 				if (members)
 					pfree(members);
 			}
-			else if (TransactionIdIsCurrentTransactionId(xwait))
+			else if (TransactionIdIsCurrentTransactionId(xwait)
+#ifdef USE_PGRAC_CLUSTER
+					 /* PGRAC serve-stall round-6: raw match may be a remote
+					  * locker collision -- no self shortcut on remote
+					  * evidence (bridge classifies on the sleep path). */
+					 && !cluster_xwait_remote
+#endif
+				)
 			{
 				switch (mode)
 				{
@@ -5982,7 +6041,14 @@ l3:
 		 * is well equipped to deal with this situation on its own.
 		 */
 		if (require_sleep && !(infomask & HEAP_XMAX_IS_MULTI) &&
-			TransactionIdIsCurrentTransactionId(xwait))
+			TransactionIdIsCurrentTransactionId(xwait)
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC serve-stall round-6: same collision guard as the
+			 * first_time arm above -- a remote-evidenced xwait is not "the
+			 * sole locker is ourselves" even on a raw current-xid match. */
+			&& !cluster_xwait_remote
+#endif
+			)
 		{
 			/* ... but if the xmax changed in the meantime, start over */
 			LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
