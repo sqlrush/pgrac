@@ -6834,10 +6834,26 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 				continue;
 			/* PGRAC: spec-6.12a — a backend-context caller (local-master S->X
 			 * upgrade) cannot use the LMON-owned connections directly; route
-			 * through the backend outbound ring instead (LMON flushes it). */
+			 * through the backend outbound ring instead (LMON flushes it).
+			 *
+			 * PGRAC ownership-generation wave — the enqueue CAN fail (DATA-
+			 * plane shard refuse, LMS outbound ring full, CONTROL ring
+			 * reserved-budget refuse).  The old (void) swallow made a dropped
+			 * INVALIDATE indistinguishable from a sent one: the ack wait then
+			 * times out every round while the master's stale S bit never
+			 * clears (the holder never receives what it should drop) — a
+			 * permanent upgrade wedge.  Count the drop and do NOT count it as
+			 * broadcast; the wait below then fails fast and honest.
+			 */
 			if (via_outbound_ring)
-				(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
-															   (uint32)n, &inv, sizeof(inv));
+			{
+				if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+															  (uint32)n, &inv, sizeof(inv)))
+				{
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count, 1);
+					continue;
+				}
+			}
 			else
 				cluster_gcs_block_note_send_outcome(
 					GCS_BLOCK_SEND_FAMILY_INVALIDATE,
@@ -7351,8 +7367,12 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		if (cluster_bufmgr_block_grant_pending(inv->tag))
 		{
 			cluster_pcm_note_invalidate_parked_grant_pending();
+			/* XXX TEMP probe — remove before commit */
+			elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " N-park (GRANT_PENDING)", inv->request_id);
 			return false;
 		}
+		/* XXX TEMP probe — remove before commit */
+		elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " already_invalidated", inv->request_id);
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;
 	}
@@ -7405,10 +7425,15 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		 * unreachable here (the invalidate wrapper passes no expected_lsn, so
 		 * its generation gate never fires); treated like PINNED defensively
 		 * (round-6). */
+		/* XXX TEMP probe — remove before commit */
+		elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " PINNED-park", inv->request_id);
 		return false;
 	}
 
 send_ack:
+	/* XXX TEMP probe — remove before commit */
+	elog(LOG, "INVAL-EXEC req_id=" UINT64_FORMAT " send_ack status=%u to=%d",
+		 inv->request_id, (unsigned) ack_status, inv->master_node);
 	memset(&ack, 0, sizeof(ack));
 	ack.request_id = inv->request_id;
 	ack.epoch = inv->epoch;
@@ -7567,6 +7592,10 @@ static void
 cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockInvalidatePayload *inv = (const GcsBlockInvalidatePayload *)payload;
+
+	/* XXX TEMP probe — remove before commit */
+	elog(LOG, "INVAL-RECV req_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " blk=%u from=%u",
+		 inv->request_id, inv->epoch, inv->tag.blockNum, env->source_node_id);
 
 	/* D16 inject — stall ack for timeout testing. */
 	CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-stall-ack");

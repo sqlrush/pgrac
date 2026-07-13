@@ -268,14 +268,25 @@ cluster_bufmgr_pcm_gate_direct_lock(BufferDesc *buf)
 		 */
 		cluster_pcm_own_set_flags(buf, PCM_OWN_FLAG_GRANT_PENDING, 0);
 
-		if (cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X))
+		PG_TRY();
 		{
-			buf->buffer_type = (uint8) BUF_TYPE_XCUR;
-			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_X, 0,
-									   PCM_OWN_FLAG_GRANT_PENDING);
+			if (cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X))
+			{
+				buf->buffer_type = (uint8) BUF_TYPE_XCUR;
+				cluster_pcm_own_transition(buf, (uint8) PCM_STATE_X, 0,
+										   PCM_OWN_FLAG_GRANT_PENDING);
+			}
+			else
+				cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
 		}
-		else
+		PG_CATCH();
+		{
+			/* W3 — never leak GRANT_PENDING past a throwing acquire (a stale
+			 * marker parks every later same-tag INVALIDATE; liveness). */
 			cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 }
 #endif
@@ -5684,7 +5695,24 @@ LockBuffer(Buffer buffer, int mode)
 			 * mirror below is skipped and buf->pcm_state is left at N (the
 			 * next access re-fetches — a cached copy with no invalidation
 			 * path would go stale, Rule 8.A). */
-			pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+			PG_TRY();
+			{
+				pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+			}
+			PG_CATCH();
+			{
+				/*
+				 * W3 — an acquire that THREW (upgrade-invalidate timeout,
+				 * transfer deny, ...) must not leak GRANT_PENDING: a stale
+				 * marker parks every later same-tag INVALIDATE on this node
+				 * (never ACKed -> remote upgrades wedge, liveness).  The
+				 * later PG_CATCH below only covers the content-lock window,
+				 * not this acquire.
+				 */
+				cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 		}
 	}
 #endif
