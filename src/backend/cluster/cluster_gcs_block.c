@@ -7349,7 +7349,10 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 		 * (PENDING cleared), and then sees the real X/S and invalidates it.
 		 */
 		if (cluster_bufmgr_block_grant_pending(inv->tag))
+		{
+			cluster_pcm_note_invalidate_parked_grant_pending();
 			return false;
+		}
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;
 	}

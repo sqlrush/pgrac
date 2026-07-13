@@ -382,6 +382,8 @@ extern uint64 cluster_pcm_get_writer_cover_stale_detected_count(void);
 extern uint64 cluster_pcm_get_writer_reverify_reacquire_count(void);
 extern void cluster_pcm_note_restore_aba_detected(void);
 extern uint64 cluster_pcm_get_restore_aba_detected_count(void);
+extern void cluster_pcm_note_invalidate_parked_grant_pending(void);
+extern uint64 cluster_pcm_get_invalidate_parked_grant_pending_count(void);
 extern uint64 cluster_pcm_get_trans_x_to_n_downgrade_count(void);
 extern uint64 cluster_pcm_get_trans_x_to_n_release_count(void);
 extern uint64 cluster_pcm_get_trans_s_to_n_invalidate_count(void);
