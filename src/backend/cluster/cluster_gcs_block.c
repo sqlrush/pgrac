@@ -179,6 +179,21 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
 	pg_atomic_uint64 done_sent_count;
 	pg_atomic_uint64 done_enqueue_drop_count; /* review F7: outbound ring full */
+	/* PGRAC: GCS serve-stall round-5 — per-family send admission outcomes
+	 * under the four-state ownership contract (see ClusterICSendResult).
+	 * queued = the transport ADMITTED the frame behind a backpressured
+	 * tail (tier1 per-peer FIFO;  pre-fix these frames were silently
+	 * LOST — the 33-54s S3 stall wall);  not_admitted = the transport
+	 * REFUSED the frame (FIFO at capacity / peer mid-HELLO), retransmit
+	 * machinery self-heals.  Families: REPLY (all master/holder reply
+	 * sends incl. cached resends), FORWARD (master→holder), INVALIDATE
+	 * (invalidate + invalidate-ack + redeclare). */
+	pg_atomic_uint64 reply_send_queued_count;
+	pg_atomic_uint64 reply_send_not_admitted_count;
+	pg_atomic_uint64 forward_send_queued_count;
+	pg_atomic_uint64 forward_send_not_admitted_count;
+	pg_atomic_uint64 invalidate_send_queued_count;
+	pg_atomic_uint64 invalidate_send_not_admitted_count;
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify/refresh.
 	 * A state=N GRANTED_STORAGE_FALLBACK now carries the master's
 	 * pi_watermark_scn (reply page_lsn field reused as an SCN carrier); the
@@ -461,6 +476,12 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->reply_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->reply_send_not_admitted_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->forward_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->forward_send_not_admitted_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_refresh_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 0);
@@ -3622,6 +3643,79 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
  *	Transition apply MUST NOT precede buffer availability decision (HC88).
  * ============================================================ */
 
+/*
+ * cluster_gcs_block_note_send_outcome — GCS serve-stall round-5.
+ *
+ *	Per-family admission accounting under the four-state send ownership
+ *	contract (see ClusterICSendResult).  DONE needs no extra row (the
+ *	existing sent counters cover it);  WOULD_BLOCK = admitted into the
+ *	tier1 per-peer FIFO (pre-fix: silently lost);  NOT_ADMITTED = the
+ *	transport refused and the retransmit machinery self-heals (nonzero
+ *	deltas here are the capacity red flag the S3 gate watches);
+ *	HARD_ERROR is recorded at the tier1 peer-error surface already.
+ *	Exported so cluster_cr_server's direct REPLY sends share the same
+ *	accounting.
+ */
+void
+cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc)
+{
+	pg_atomic_uint64 *counter = NULL;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+
+	switch (rc) {
+	case CLUSTER_IC_SEND_WOULD_BLOCK:
+		switch (family) {
+		case GCS_BLOCK_SEND_FAMILY_REPLY:
+			counter = &ClusterGcsBlock->reply_send_queued_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_FORWARD:
+			counter = &ClusterGcsBlock->forward_send_queued_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_INVALIDATE:
+			counter = &ClusterGcsBlock->invalidate_send_queued_count;
+			break;
+		}
+		break;
+	case CLUSTER_IC_SEND_NOT_ADMITTED:
+		switch (family) {
+		case GCS_BLOCK_SEND_FAMILY_REPLY:
+			counter = &ClusterGcsBlock->reply_send_not_admitted_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_FORWARD:
+			counter = &ClusterGcsBlock->forward_send_not_admitted_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_INVALIDATE:
+			counter = &ClusterGcsBlock->invalidate_send_not_admitted_count;
+			break;
+		}
+		break;
+	case CLUSTER_IC_SEND_DONE:
+	case CLUSTER_IC_SEND_HARD_ERROR:
+		break;
+	}
+
+	if (counter != NULL)
+		pg_atomic_fetch_add_u64(counter, 1);
+}
+
+/*
+ * gcs_block_forward_send_admitted — send one FORWARD frame and report
+ * whether the transport now owns it (DONE on the wire, or WOULD_BLOCK
+ * admitted into the per-peer FIFO — both deliver in order, so the
+ * caller's forward-in-flight state installs either way).
+ */
+static bool
+gcs_block_forward_send_admitted(int32 holder_node, const GcsBlockForwardPayload *fwd)
+{
+	ClusterICSendResult rc
+		= cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, fwd, sizeof(*fwd));
+
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, rc);
+	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
+}
+
 static void
 gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBlockReplyStatus status,
 					 XLogRecPtr page_lsn, const char *block_data)
@@ -3681,7 +3775,11 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 		pfree(buf);
 	}
 
-	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+	/* Round-5: an admitted reply (WOULD_BLOCK) is a sent reply — the
+	 * transport owns the copy and delivers it in order. */
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);
+	if ((rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+		&& ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 }
 
@@ -3769,7 +3867,9 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 		memcpy(block_data, entry->block_data, GCS_BLOCK_DATA_SIZE);
 	/* else: block_data already zeroed by palloc0 */
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total);
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total));
 	pfree(buf);
 }
 
@@ -4140,11 +4240,15 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 			}
 
-			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-										 sizeof(fwd))
-				== CLUSTER_IC_SEND_DONE) {
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->forward_replay_count, 1);
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+			{
+				ClusterICSendResult fwd_rc = cluster_ic_send_envelope(
+					PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd, sizeof(fwd));
+
+				cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, fwd_rc);
+				if (fwd_rc == CLUSTER_IC_SEND_DONE || fwd_rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->forward_replay_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+				}
 			}
 		}
 		return;
@@ -4471,10 +4575,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					nudge.master_node = cluster_node_id;
 					nudge.transition_id = req->transition_id;
 					GcsBlockForwardPayloadSetBastNudge(&nudge);
-					if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, nudge_holder,
-												 &nudge, sizeof(nudge))
-						== CLUSTER_IC_SEND_DONE)
-						cluster_lever_e2_note_nudge_sent();
+					{
+						ClusterICSendResult nudge_rc = cluster_ic_send_envelope(
+							PGRAC_IC_MSG_GCS_BLOCK_FORWARD, nudge_holder, &nudge, sizeof(nudge));
+
+						cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD,
+															nudge_rc);
+						if (nudge_rc == CLUSTER_IC_SEND_DONE
+							|| nudge_rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+							cluster_lever_e2_note_nudge_sent();
+					}
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
@@ -4563,9 +4673,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
-				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, x_holder, &fwd,
-											 sizeof(fwd))
-					== CLUSTER_IC_SEND_DONE) {
+				if (gcs_block_forward_send_admitted(x_holder, &fwd)) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_forward_sent_count, 1);
 					/* HC111 / HC118:  do NOT switch master_holder.node_id /
 					 * x_holder_node here.  The current X holder retains its
@@ -4951,9 +5059,7 @@ x_path_skipped:
 				else
 					cluster_lever_a_note_fwd_oneshot();
 
-				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-											 sizeof(fwd))
-					== CLUSTER_IC_SEND_DONE) {
+				if (gcs_block_forward_send_admitted(holder_node, &fwd)) {
 					GcsBlockReplyHeader fwd_hdr;
 
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
@@ -5021,9 +5127,7 @@ x_path_skipped:
 			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 				&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
-			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-										 sizeof(fwd))
-				== CLUSTER_IC_SEND_DONE) {
+			if (gcs_block_forward_send_admitted(holder_node, &fwd)) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->s_holders_bitmap_redirect_count, 1);
 
@@ -5263,7 +5367,10 @@ build_and_send_reply: {
 											   total);
 		}
 
-		if (send_rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+		/* Round-5: an admitted reply (WOULD_BLOCK) is a sent reply. */
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
+		if ((send_rc == CLUSTER_IC_SEND_DONE || send_rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+			&& ClusterGcsBlock != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
 			gcs_block_note_live_sge_send();
@@ -5845,8 +5952,10 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 	deny_hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 	GcsBlockReplyHeaderSetForwardingMasterNode(deny_hdr, fwd->master_node);
 	deny_hdr->checksum = cluster_gcs_block_compute_checksum(deny_buf + sizeof(GcsBlockReplyHeader));
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node,
-								   deny_buf, deny_total);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+										cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+																 fwd->original_requester_node,
+																 deny_buf, deny_total));
 	pfree(deny_buf);
 }
 
@@ -6331,6 +6440,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		sge[1].release_arg = block_payload_release_arg;
 		send_rc = cluster_ic_rdma_send_envelope_sge(
 			PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node, sge, lengthof(sge), total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
 		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
 			gcs_block_note_live_sge_send();
 		block_payload_release_cb = NULL;
@@ -6339,8 +6449,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node,
-									   buf, total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+																	 fwd->original_requester_node,
+																	 buf, total));
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
@@ -6599,8 +6711,10 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 				(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
 															   (uint32)n, &inv, sizeof(inv));
 			else
-				(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
-											   sizeof(inv));
+				cluster_gcs_block_note_send_outcome(
+					GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+					cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
+											 sizeof(inv)));
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 		}
 
@@ -6698,7 +6812,9 @@ gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req, uint32 
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
 		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
 			continue;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		cluster_gcs_block_note_send_outcome(
+			GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+			cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv)));
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 	}
 }
@@ -6816,8 +6932,10 @@ gcs_block_pi_kept_note_send(BufferTag tag, int32 master_node)
 		note.sender_node = cluster_node_id;
 		note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE;
 		note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
-									   sizeof(note));
+		cluster_gcs_block_note_send_outcome(
+			GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+			cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
+									 sizeof(note)));
 	}
 }
 
@@ -6842,8 +6960,9 @@ cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 target_node)
 	inv.invalidating_for_x_node = 0;
 	inv.reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD;
 	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, target_node, &inv,
-								   sizeof(inv));
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+										cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+																 target_node, &inv, sizeof(inv)));
 }
 
 /*
@@ -6924,8 +7043,10 @@ cluster_gcs_block_pi_discard_drain(void)
 			note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE;
 			GcsBlockInvalidateAckPayloadSetPageScn(&note, page_scn);
 			note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
-			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node,
-										   &note, sizeof(note));
+			cluster_gcs_block_note_send_outcome(
+				GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+				cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
+										 sizeof(note)));
 		}
 	}
 }
@@ -7182,8 +7303,10 @@ send_ack:
 	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
 	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
-								   sizeof(ack));
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
+								 sizeof(ack)));
 }
 
 
@@ -7420,7 +7543,9 @@ cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page
 	p.held_mode = held_mode;
 	p.checksum = gcs_block_compute_redeclare_checksum(&p);
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p));
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p)));
 	if (ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 1);
 }
@@ -7666,6 +7791,47 @@ uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->done_enqueue_drop_count) : 0;
+}
+
+/* PGRAC: GCS serve-stall round-5 — 6 per-family send admission accessors. */
+uint64
+cluster_gcs_get_reply_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->reply_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_reply_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->reply_send_not_admitted_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_forward_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->forward_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_forward_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->forward_send_not_admitted_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count)
+			   : 0;
 }
 
 /* PGRAC: GCS-race round-4c FUNC-1 — 3 storage-fallback verify accessors. */

@@ -261,6 +261,13 @@ cluster_ic_tier1_pending_outbound(int32 peer_id pg_attribute_unused())
 {
 	return false;
 }
+/* GCS serve-stall round-5: LMON's WRITEABLE arm drains via the frame-free
+ * entry now (never re-enters send_heartbeat while backpressured). */
+ClusterICSendResult
+cluster_ic_tier1_drain_outbound(int32 peer_id pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_DONE;
+}
 
 ClusterICPeerTransport
 cluster_ic_mux_peer_transport(int32 peer_id pg_attribute_unused())

@@ -209,6 +209,8 @@ cluster_lms_shmem_init(void)
 				pg_atomic_init_u64(&cluster_lms_state->worker_direct_reply_count[w], 0);
 				pg_atomic_init_u64(&cluster_lms_state->worker_conn_reset_count[w], 0);
 				pg_atomic_init_u64(&cluster_lms_state->worker_inline_serve_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_outbound_not_admitted_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_outbound_requeue_drop_count[w], 0);
 				for (b = 0; b < CLUSTER_LMS_SERVE_HIST_BUCKETS; b++)
 					pg_atomic_init_u64(&cluster_lms_state->worker_serve_hist[w][b], 0);
 			}
@@ -1083,6 +1085,44 @@ lms_obs_read(const pg_atomic_uint64 *arr, int worker_id)
 	for (w = 0; w < CLUSTER_LMS_MAX_WORKERS; w++)
 		sum += pg_atomic_read_u64(unconstify(pg_atomic_uint64 *, &arr[w]));
 	return sum;
+}
+
+/*
+ * GCS serve-stall round-5 — outbound-ring drain honesty bumpers.  Take the
+ * draining worker's ring id explicitly (the drain loop knows which ring it
+ * owns;  requeue-drops must be attributed to that ring regardless of the
+ * caller's own slot resolution).
+ */
+void
+cluster_lms_obs_note_outbound_not_admitted(int worker_id)
+{
+	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_outbound_not_admitted_count[worker_id], 1);
+}
+
+void
+cluster_lms_obs_note_outbound_requeue_drop(int worker_id)
+{
+	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_outbound_requeue_drop_count[worker_id], 1);
+}
+
+uint64
+cluster_lms_obs_get_outbound_not_admitted(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_outbound_not_admitted_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_outbound_requeue_drop(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_outbound_requeue_drop_count, worker_id);
 }
 
 uint64

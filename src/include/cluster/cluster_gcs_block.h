@@ -2113,6 +2113,33 @@ extern void cluster_gcs_handle_block_forward_envelope(const struct ClusterICEnve
 
 
 /* ============================================================
+ * GCS serve-stall round-5 — per-family send admission accounting.
+ *
+ *	One shared funnel for every block-family send site (replies incl.
+ *	cached resends and cluster_cr_server's direct REPLY sends, FORWARD,
+ *	INVALIDATE + acks + redeclare) under the four-state ownership
+ *	contract (ClusterICSendResult in cluster_ic.h).  WOULD_BLOCK =
+ *	admitted into the tier1 per-peer FIFO (queued counter);
+ *	NOT_ADMITTED = refused, retransmit self-heals (red-flag counter).
+ * ============================================================ */
+#include "cluster/cluster_ic.h" /* ClusterICSendResult */
+
+typedef enum GcsBlockSendFamily {
+	GCS_BLOCK_SEND_FAMILY_REPLY = 0,
+	GCS_BLOCK_SEND_FAMILY_FORWARD,
+	GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+} GcsBlockSendFamily;
+
+extern void cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc);
+
+extern uint64 cluster_gcs_get_reply_send_queued_count(void);
+extern uint64 cluster_gcs_get_reply_send_not_admitted_count(void);
+extern uint64 cluster_gcs_get_forward_send_queued_count(void);
+extern uint64 cluster_gcs_get_forward_send_not_admitted_count(void);
+extern uint64 cluster_gcs_get_invalidate_send_queued_count(void);
+extern uint64 cluster_gcs_get_invalidate_send_not_admitted_count(void);
+
+/* ============================================================
  * Observability accessors (dump_gcs +8 NEW rows for block plane).
  *
  *  Each accessor returns a uint64 counter.  Returns 0 when module is

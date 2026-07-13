@@ -152,11 +152,35 @@ typedef enum ClusterICTier {
  * return value caused spec-2.2 v1.0.1 F1's per-peer outbound buffer
  * to be silently bypassed -- LMON closed the peer on the very first
  * EAGAIN, and the tail-drain path was never reached.
+ *
+ * GCS serve-stall round-5: four-state FRAME-OWNERSHIP contract.
+ * WOULD_BLOCK was ambiguous — "transport retained the frame" (partial
+ * write / initial-EAGAIN tail queue) and "transport REFUSED the frame"
+ * (a previous tail still pending / peer mid-HELLO) both returned it.
+ * Producers that trusted the documented "retained" reading silently
+ * lost every frame sent while an older tail was backpressured (a lost
+ * GCS reply = the requester burns its full reply-wait + retransmit
+ * budget = the 33-54s S3 stall wall);  ring drains that assumed the
+ * "refused" reading resubmitted frames the transport HAD retained
+ * (duplicate frames on the per-peer stream).  The contract is now:
+ *
+ *   DONE          full frame on the wire.
+ *   WOULD_BLOCK   frame ADMITTED: the transport owns a private copy
+ *                 (partial-write tail or per-peer outbound FIFO) and
+ *                 will finish it on WL_SOCKET_WRITEABLE.  The caller
+ *                 must NEVER resubmit the frame.
+ *   NOT_ADMITTED  frame REFUSED: the transport took no copy (peer not
+ *                 CONNECTED yet, or the bounded per-peer FIFO is
+ *                 full).  The caller retains ownership: keep it in
+ *                 the upper-layer queue / retry later / count the
+ *                 refusal.  Never treat as peer death.
+ *   HARD_ERROR    socket dead;caller MUST close the peer.
  */
 typedef enum ClusterICSendResult {
-	CLUSTER_IC_SEND_DONE = 0,	 /* full frame sent;counter advance */
-	CLUSTER_IC_SEND_WOULD_BLOCK, /* EAGAIN or partial;outbound buffer holds tail */
-	CLUSTER_IC_SEND_HARD_ERROR,	 /* socket dead;caller MUST close peer */
+	CLUSTER_IC_SEND_DONE = 0,	  /* full frame sent;counter advance */
+	CLUSTER_IC_SEND_WOULD_BLOCK,  /* frame admitted;transport owns a copy */
+	CLUSTER_IC_SEND_HARD_ERROR,	  /* socket dead;caller MUST close peer */
+	CLUSTER_IC_SEND_NOT_ADMITTED, /* frame refused;caller retains ownership */
 } ClusterICSendResult;
 
 typedef struct ClusterICOps {

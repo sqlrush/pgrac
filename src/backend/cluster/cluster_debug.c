@@ -417,6 +417,35 @@ dump_ic(ReturnSetInfo *rsinfo)
 		emit_row(
 			rsinfo, "ic", "tier1_writable_drain_data",
 			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_writable_drain(CLUSTER_IC_PLANE_DATA)));
+
+		/* PGRAC: GCS serve-stall round-5 — per-peer outbound FIFO accounting
+		 * per plane.  admitted - promoted = frames currently queued (the S3
+		 * gate proves the queue bounds and returns to zero);  not_admitted
+		 * counts explicit refusals (peer mid-HELLO or FIFO at capacity). */
+		emit_row(
+			rsinfo, "ic", "tier1_fifo_admitted_control",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_fifo_admitted(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(
+			rsinfo, "ic", "tier1_fifo_admitted_data",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_fifo_admitted(CLUSTER_IC_PLANE_DATA)));
+		emit_row(
+			rsinfo, "ic", "tier1_fifo_promoted_control",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_fifo_promoted(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(
+			rsinfo, "ic", "tier1_fifo_promoted_data",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_fifo_promoted(CLUSTER_IC_PLANE_DATA)));
+		emit_row(rsinfo, "ic", "tier1_send_not_admitted_control",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_send_not_admitted(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(
+			rsinfo, "ic", "tier1_send_not_admitted_data",
+			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_send_not_admitted(CLUSTER_IC_PLANE_DATA)));
+		emit_row(rsinfo, "ic", "tier1_fifo_dropped_close_control",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_fifo_dropped_close(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(rsinfo, "ic", "tier1_fifo_dropped_close_data",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_fifo_dropped_close(CLUSTER_IC_PLANE_DATA)));
 	}
 
 	/*
@@ -1405,6 +1434,14 @@ dump_lms(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lms_obs_get_conn_reset_count(-1)));
 	emit_row(rsinfo, "lms", "lms_inline_serve_count",
 			 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(-1)));
+	/* PGRAC: GCS serve-stall round-5 — outbound-ring drain honesty rows.
+	 * not_admitted = frames the transport refused (retained in per-peer
+	 * order);  requeue_drop = retained frames lost to a producer-refilled
+	 * ring (expected 0;  the S3 gate asserts on the delta). */
+	emit_row(rsinfo, "lms", "lms_outbound_not_admitted_count",
+			 fmt_int64((int64)cluster_lms_obs_get_outbound_not_admitted(-1)));
+	emit_row(rsinfo, "lms", "lms_outbound_requeue_drop_count",
+			 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(-1)));
 	{
 		int w, hb;
 
@@ -1422,6 +1459,12 @@ dump_lms(ReturnSetInfo *rsinfo)
 			snprintf(wkey, sizeof(wkey), "lms_inline_serve_count_w%d", w);
 			emit_row(rsinfo, "lms", wkey,
 					 fmt_int64((int64)cluster_lms_obs_get_inline_serve_count(w)));
+			snprintf(wkey, sizeof(wkey), "lms_outbound_not_admitted_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_outbound_not_admitted(w)));
+			snprintf(wkey, sizeof(wkey), "lms_outbound_requeue_drop_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(w)));
 		}
 
 		/* Inline-serve duration histogram: aggregate 16 rows + per live
@@ -2100,6 +2143,24 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_legacy_pin_count()));
 	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
+
+	/* PGRAC: GCS serve-stall round-5 — per-family send admission outcomes.
+	 * queued = admitted into the tier1 per-peer outbound FIFO behind a
+	 * backpressured tail (pre-fix: silently lost);  not_admitted = refused
+	 * at capacity (retransmit self-heals;  nonzero delta = capacity red
+	 * flag for the S3 gate). */
+	emit_row(rsinfo, "gcs", "reply_send_queued_count",
+			 fmt_int64((int64)cluster_gcs_get_reply_send_queued_count()));
+	emit_row(rsinfo, "gcs", "reply_send_not_admitted_count",
+			 fmt_int64((int64)cluster_gcs_get_reply_send_not_admitted_count()));
+	emit_row(rsinfo, "gcs", "forward_send_queued_count",
+			 fmt_int64((int64)cluster_gcs_get_forward_send_queued_count()));
+	emit_row(rsinfo, "gcs", "forward_send_not_admitted_count",
+			 fmt_int64((int64)cluster_gcs_get_forward_send_not_admitted_count()));
+	emit_row(rsinfo, "gcs", "invalidate_send_queued_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_send_queued_count()));
+	emit_row(rsinfo, "gcs", "invalidate_send_not_admitted_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_send_not_admitted_count()));
 
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify rows:
 	 * local pre-read proven current (no I/O) / stale pre-read re-read from

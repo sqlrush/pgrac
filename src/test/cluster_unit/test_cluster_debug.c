@@ -177,6 +177,31 @@ cluster_ic_tier1_get_writable_drain(ClusterICPlane plane)
 	(void)plane;
 	return 0;
 }
+/* GCS serve-stall round-5 stubs: outbound FIFO accounting accessors. */
+uint64
+cluster_ic_tier1_get_fifo_admitted(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_fifo_promoted(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_send_not_admitted(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_fifo_dropped_close(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
 
 /* cluster_inject (armed_count + iterator) */
 int cluster_injection_armed_count = 0;
@@ -1191,6 +1216,37 @@ cluster_gcs_get_block_dedup_legacy_pin_count(void)
 }
 uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
+{
+	return 0;
+}
+/* GCS serve-stall round-5 stubs: 6 per-family send admission accessors. */
+uint64
+cluster_gcs_get_reply_send_queued_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_reply_send_not_admitted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_forward_send_queued_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_forward_send_not_admitted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_send_queued_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_send_not_admitted_count(void)
 {
 	return 0;
 }
@@ -4131,6 +4187,17 @@ cluster_lms_obs_get_conn_reset_count(int worker_id pg_attribute_unused())
 }
 uint64
 cluster_lms_obs_get_inline_serve_count(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+/* GCS serve-stall round-5 stubs: outbound-ring drain honesty accessors. */
+uint64
+cluster_lms_obs_get_outbound_not_admitted(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_lms_obs_get_outbound_requeue_drop(int worker_id pg_attribute_unused())
 {
 	return 0;
 }
