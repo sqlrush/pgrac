@@ -163,6 +163,8 @@ $n0->safe_psql('postgres', "SELECT count(*) FROM $tbl");        # own-xid cleano
 usleep(300_000);
 
 my $dg_base = dg_sum();
+my $detect_base = state_int($n0, 'pcm', 'writer_cover_stale_detected_count');
+my $reacq_base = state_int($n0, 'pcm', 'writer_reverify_reacquire_count');
 
 # Arm the cached-X stall on node0 (GUC -> every node0 backend). 3s window.
 arm($n0, 'cluster-pcm-writer-cached-x-stall:sleep:3000000');
@@ -215,16 +217,31 @@ cmp_ok($dg, '>=', 1,
 cmp_ok($stall_elapsed, '>', 2.5,
 	'L2d node0 writer waited through the stall (interleave really happened)');
 
-# The writer's OUTCOME is diagnostic only, NOT a RED assertion: on the current
-# (pre-fix) code this exact interleave is observed to fail-closed with
-#   ERROR: cannot write a block held in X by a remote node with an uncommitted
-#          transaction
-# i.e. an EXISTING guard already refuses THIS stale-authority write.  The
-# ownership-generation fix must make this deterministic across ALL W1 sub-
-# interleaves; the silent-corruption assertion is fix-coupled and owned by the
-# fix implementer.  We only prove the interleave (a/b/c/d) here.
-diag(sprintf("writer outcome: rc=%s (0=clean commit; nonzero=fail-closed) err=[%s]",
-		$h->result, ($err // '') =~ s/\n.*//sr));
+# FIX-COUPLED assertions (ownership-generation).  Pre-fix, the covered-X writer
+# reached the ITL stamp holding stale authority and, on THIS heap sub-interleave,
+# was refused by the existing spec-6.12a S-deny backstop (retryable
+# CROSS_NODE_WRITE_CONFLICT) -- a liveness cost, and NO backstop at all on the
+# non-ITL (index) write path (silent divergence).  The fix makes the writer
+# RE-VERIFY under the content lock: it detects the revoked cover and transparently
+# re-acquires X before writing.  We prove the mechanism fired via its counters
+# (uniform for every PCM-tracked write, ITL or not) and that the writer committed
+# cleanly rather than fail-closing.
+my $detect_delta = state_int($n0, 'pcm', 'writer_cover_stale_detected_count') - $detect_base;
+my $reacq_delta = state_int($n0, 'pcm', 'writer_reverify_reacquire_count') - $reacq_base;
+diag(sprintf("writer outcome: rc=%s err=[%s]; cover_stale_detected delta=%d "
+		. "reverify_reacquire delta=%d",
+		$h->result, ($err // '') =~ s/\n.*//sr, $detect_delta, $reacq_delta));
+
+cmp_ok($detect_delta, '>=', 1,
+	'L4a the re-verify DETECTED the stale cover (generation/covers/pending caught '
+	  . 'the raced X->S downgrade)');
+cmp_ok($reacq_delta, '>=', 1,
+	'L4b the writer transparently RE-ACQUIRED X (ownership re-verify action fired)');
+like(($err // ''), qr/^\s*$/,
+	'L4c the writer committed CLEANLY after re-acquire (no error output; the fix '
+	  . 'is transparent, not fail-closed CROSS_NODE_WRITE_CONFLICT)');
+unlike(($err // ''), qr/held in X by a remote node|CROSS_NODE_WRITE_CONFLICT/,
+	'L4d no stale-authority write-conflict error surfaced');
 
 # (c) the entire fixture stayed TT-clean.
 my $tt_delta = tt_noise_sum() - $tt_base;

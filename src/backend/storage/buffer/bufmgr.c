@@ -181,6 +181,22 @@ cluster_pcm_own_bump_locked(BufferDesc *buf, uint32 set_flags, uint32 clear_flag
 }
 
 /*
+ * cluster_pcm_own_set_flags: apply flag bits WITHOUT changing pcm_state or
+ * bumping the generation (a GRANT_PENDING / REVOKING marker is not itself an
+ * ownership transition; the finalize that follows is).  Under the header
+ * spinlock so a lock-free reader of the triple sees a coherent flags value.
+ */
+static inline void
+cluster_pcm_own_set_flags(BufferDesc *buf, uint32 set_flags, uint32 clear_flags)
+{
+	uint32		buf_state;
+
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_flags_apply(buf->buf_id, set_flags, clear_flags);
+	UnlockBufHdr(buf, buf_state);
+}
+
+/*
  * cluster_pcm_own_read: read the coherent (pcm_state, generation, flags) triple
  * under the header spinlock.  Used by the cached-X writer re-verify and the
  * drop-restore ABA check.  Any *out may be NULL.
@@ -5539,6 +5555,8 @@ LockBuffer(Buffer buffer, int mode)
 	bool		pcm_acquired = false;
 	PcmLockMode pcm_mode = PCM_LOCK_MODE_N;
 	bool		pcm_covered = false;	/* took the cached-cover fast path */
+	uint64		pcm_covered_gen = 0;	/* ownership generation captured at cover */
+	bool		pcm_pending_set = false;	/* we set GRANT_PENDING (W3), must clear */
 #endif
 
 	Assert(BufferIsPinned(buffer));
@@ -5586,6 +5604,11 @@ LockBuffer(Buffer buffer, int mode)
 			 * below, so this cover must be RE-VERIFIED after the content lock
 			 * (ownership-generation P0). */
 			pcm_covered = true;
+			/* Capture the ownership generation NOW (header spinlock), so the
+			 * post-content-lock re-verify can detect any ownership round that
+			 * raced the content-lock window (a BAST X->S, or an N->X->N ABA)
+			 * even when pcm_state looks unchanged (ownership-generation P0). */
+			cluster_pcm_own_read(buf, NULL, &pcm_covered_gen, NULL);
 
 			/* PGRAC: spec-5.59 §3.6 read amortization probe — a share
 			 * acquire served entirely from locally-held PCM state is the
@@ -5595,6 +5618,16 @@ LockBuffer(Buffer buffer, int mode)
 		}
 		else
 		{
+			/* PGRAC ownership-generation wave (W3): mark GRANT_PENDING before
+			 * the request goes out.  Between the install (inside acquire, done
+			 * under its own content lock) and this backend's finalize below,
+			 * pcm_state is still N; a same-tag INVALIDATE arriving in that
+			 * window must NOT treat N as already-invalidated and ACK away this
+			 * in-flight grant (which would strand a stale X after finalize).
+			 * The invalidate handler parks/denies while PENDING is set. */
+			cluster_pcm_own_set_flags(buf, PCM_OWN_FLAG_GRANT_PENDING, 0);
+			pcm_pending_set = true;
+
 			/* PGRAC: spec-5.2 D2 — a one-shot READ_IMAGE returns false (no
 			 * durable grant); pcm_acquired stays false so the ownership
 			 * mirror below is skipped and buf->pcm_state is left at N (the
@@ -5628,6 +5661,44 @@ LockBuffer(Buffer buffer, int mode)
 			else
 				LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC ownership-generation wave (W1) — cached-cover re-verify.
+			 * The cover fast path decided we already held the mode on a raw,
+			 * unlocked pcm_state read.  A BAST X->S downgrade (or any ownership
+			 * round) can have raced this content-lock window and revoked the
+			 * cover.  Re-read the coherent (pcm_state, generation, flags) triple
+			 * under the header spinlock: if the generation moved, the mode no
+			 * longer covers, or a grant/revoke is in flight, the cover is STALE
+			 * -- writing/reading a block we no longer own is the Rule 8.A
+			 * violation.  Release, do a real master re-acquire, re-take the
+			 * content lock.  Bounded: after a real acquire we hold the content
+			 * lock and the downgrade path serializes under it, so no further
+			 * downgrade can intervene -- at most one fallback.
+			 */
+			if (pcm_covered)
+			{
+				uint8		cur_state;
+				uint64		cur_gen;
+				uint32		cur_flags;
+
+				cluster_pcm_own_read(buf, &cur_state, &cur_gen, &cur_flags);
+				if (cur_gen != pcm_covered_gen
+					|| !cluster_pcm_mode_covers((PcmLockMode) cur_state, pcm_mode)
+					|| (cur_flags & (PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING)) != 0)
+				{
+					cluster_pcm_note_writer_cover_stale_detected();
+					pcm_covered = false;
+					LWLockRelease(BufferDescriptorGetContentLock(buf));
+					cluster_pcm_own_set_flags(buf, PCM_OWN_FLAG_GRANT_PENDING, 0);
+					pcm_pending_set = true;
+					pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+					if (mode == BUFFER_LOCK_SHARE)
+						LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+					else
+						LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+					cluster_pcm_note_writer_reverify_reacquire();
+				}
+			}
 		}
 		PG_CATCH();
 		{
@@ -5640,14 +5711,35 @@ LockBuffer(Buffer buffer, int mode)
 				 * partial acquire does not leak a stale holder). */
 				cluster_pcm_lock_release_buffer_for_eviction(buf, pcm_mode);
 			}
+			/* W3: an acquire that threw leaves GRANT_PENDING set -- clear it so
+			 * a later invalidate is not blocked by a phantom in-flight grant. */
+			if (pcm_pending_set)
+				cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
 		if (pcm_acquired)
-			cluster_buffer_desc_apply_pcm_ownership_fields(&buf->buffer_type,
-														   &buf->pcm_state,
-														   pcm_mode);
+		{
+			/*
+			 * Finalize the grant under the header spinlock: set buffer_type +
+			 * pcm_state, bump the ownership generation, and clear GRANT_PENDING
+			 * atomically.  Consumers that captured the generation before this
+			 * point now observe the change (ownership-generation P0).
+			 */
+			buf->buffer_type = (pcm_mode == PCM_LOCK_MODE_S) ? (uint8) BUF_TYPE_SCUR
+															 : (uint8) BUF_TYPE_XCUR;
+			cluster_pcm_own_transition(buf,
+									   (pcm_mode == PCM_LOCK_MODE_S) ? (uint8) PCM_STATE_S
+																	 : (uint8) PCM_STATE_X,
+									   0, PCM_OWN_FLAG_GRANT_PENDING);
+		}
+		else if (pcm_pending_set)
+		{
+			/* No durable grant (one-shot READ_IMAGE): clear the PENDING marker
+			 * we set before the acquire so it does not linger. */
+			cluster_pcm_own_set_flags(buf, 0, PCM_OWN_FLAG_GRANT_PENDING);
+		}
 #endif
 	}
 
@@ -7178,7 +7270,11 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 		return false;
 	}
 
-	buf->pcm_state = (uint8) PCM_STATE_S;
+	/* PGRAC ownership-generation wave: the X->S downgrade is a committed
+	 * ownership transition -- set pcm_state and bump the generation atomically
+	 * (header spinlock) so a cached-X writer racing the content-lock window
+	 * detects the revoke even across an X->S->X ABA. */
+	cluster_pcm_own_transition(buf, (uint8) PCM_STATE_S, 0, 0);
 
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
@@ -7385,7 +7481,11 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 		return false;
 	}
 
-	buf->pcm_state = (uint8) PCM_STATE_S;
+	/* PGRAC ownership-generation wave: the X->S downgrade is a committed
+	 * ownership transition -- set pcm_state and bump the generation atomically
+	 * (header spinlock) so a cached-X writer racing the content-lock window
+	 * detects the revoke even across an X->S->X ABA. */
+	cluster_pcm_own_transition(buf, (uint8) PCM_STATE_S, 0, 0);
 
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
