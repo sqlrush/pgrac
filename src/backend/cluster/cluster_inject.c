@@ -586,6 +586,65 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-xfer-copy-drop-window" },
 	/*
+	 * GCS serve-stall round-6 wave-2 — ownership-generation P0 REDs.
+	 *
+	 *	cluster-pcm-writer-cached-x-stall:
+	 *	  Fires in LockBuffer(EXCLUSIVE) AFTER the cached-X cover fast path
+	 *	  decided "already hold X" and BEFORE the content-lock acquire, only
+	 *	  on the covered-X write path.  SLEEP holds that window open so a
+	 *	  peer read can drive a BAST X->S self-downgrade before the writer
+	 *	  takes the content lock; without the post-lock ownership-generation
+	 *	  re-verify the writer then writes on the stale X grant.  Driven by
+	 *	  the cached-X RED.
+	 *
+	 *	cluster-pcm-restore-aba-window:
+	 *	  Fires in the GCS drop bounded-restore arm AFTER InvalidateBufferTry
+	 *	  failed (pin raced) and BEFORE the saved pcm_state is written back,
+	 *	  with no spinlock held.  SLEEP holds the restore window open so a
+	 *	  concurrent ownership round (N->X->N) can complete; without the
+	 *	  generation-token match the blind restore clobbers the new state
+	 *	  with the stale saved value (ABA).  Driven by the restore-ABA RED.
+	 */
+	{ .name = "cluster-pcm-writer-cached-x-stall" },
+	{ .name = "cluster-pcm-restore-aba-window" },
+	/*
+	 * cluster-pcm-grant-finalize-window (W3):
+	 *   Fires in LockBuffer AFTER a real X acquire installed the grant and
+	 *   BEFORE the finalize sets pcm_state=X, i.e. while pcm_state is still N
+	 *   and GRANT_PENDING is set.  SLEEP holds that window open so a peer's
+	 *   INVALIDATE for the same tag can arrive; without the GRANT_PENDING
+	 *   consult the holder treats N as already-invalidated and ACKs the
+	 *   in-flight grant away (double X holder).  Driven by the W3 RED.
+	 */
+	{ .name = "cluster-pcm-grant-finalize-window" },
+	/*
+	 * cluster-pcm-grant-finalize-deliver-invalidate (W3 RED delivery, :skip):
+	 *   One-shot: inside the grant-finalize window above, drive the REAL
+	 *   invalidate handler with a synthetic same-tag directive (a master
+	 *   INVALIDATE cannot be steered into this window from SQL — INVALIDATE
+	 *   targets S-holders; a mirror-N node is the X-grantee and is served by
+	 *   X-forward instead).  The handler must PARK on GRANT_PENDING, not ack
+	 *   already_invalidated.  See cluster_gcs_block_test_deliver_self_invalidate.
+	 *
+	 * cluster-pcm-drop-prepin-window (W2 RED, sleep):
+	 *   Fires inside InvalidateBufferTry — after the header spinlock is
+	 *   released, before the partition lock is taken — ONLY for GCS-drop
+	 *   callers.  This is the sole gap where a foreign pin can appear and
+	 *   fail the refcount recheck (a continuously-held pin is refused at the
+	 *   drop's entry gates and never reaches the restore arm).  The sleep
+	 *   lets the W2 RED place that pin deterministically.
+	 *
+	 * cluster-pcm-restore-aba-force-round (W2 RED, :skip):
+	 *   One-shot: at the drop's restore-ABA window point, complete a
+	 *   simulated concurrent ownership round (coherent transition to N with a
+	 *   generation bump) — indistinguishable to the restore guard from a real
+	 *   N->X->N.  The guard must refuse the stale restore and bump
+	 *   pcm.restore_aba_detected_count.
+	 */
+	{ .name = "cluster-pcm-grant-finalize-deliver-invalidate" },
+	{ .name = "cluster-pcm-drop-prepin-window" },
+	{ .name = "cluster-pcm-restore-aba-force-round" },
+	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
 	 *	cluster-gcs-block-stale-ship:

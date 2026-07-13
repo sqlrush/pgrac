@@ -8,6 +8,16 @@
  * IDENTIFICATION
  *	  contrib/pg_surgery/heap_surgery.c
  *
+ * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
+ *
+ *	The visibility-map clear moved to the pre-crit lock + in-crit
+ *	visibilitymap_clear_locked pattern (see visibilitymap.c header): in
+ *	cluster mode the LockBuffer hidden inside the monolithic clear could
+ *	need a cross-node PCM X acquire whose failure escalates ERROR -> PANIC
+ *	inside the critical section.  Holding the lock across the section also
+ *	puts the in-crit log_newpage_buffer(vmbuf) under the exclusive lock it
+ *	expects.  Spec: spec-2.36-gcs-block-transfer.md
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -143,6 +153,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 	{
 		Buffer		buf;
 		Buffer		vmbuf = InvalidBuffer;
+		bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 		Page		page;
 		BlockNumber blkno;
 		OffsetNumber curoff;
@@ -236,6 +247,15 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 		if (heap_force_opt == HEAP_FORCE_KILL && PageIsAllVisible(page))
 			visibilitymap_pin(rel, blkno, &vmbuf);
 
+		/* PGRAC: pre-crit VM content lock — see the file header. */
+		vm_locked = false;
+		if (heap_force_opt == HEAP_FORCE_KILL && PageIsAllVisible(page)
+			&& BufferIsValid(vmbuf))
+		{
+			LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+			vm_locked = true;
+		}
+
 		/* No ereport(ERROR) from here until all the changes are logged. */
 		START_CRIT_SECTION();
 
@@ -264,8 +284,8 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 				if (PageIsAllVisible(page))
 				{
 					PageClearAllVisible(page);
-					visibilitymap_clear(rel, blkno, vmbuf,
-										VISIBILITYMAP_VALID_BITS);
+					visibilitymap_clear_locked(rel, blkno, vmbuf,
+											   VISIBILITYMAP_VALID_BITS);
 					did_modify_vm = true;
 				}
 			}
@@ -325,6 +345,9 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 			log_newpage_buffer(vmbuf, false);
 
 		END_CRIT_SECTION();
+
+		if (vm_locked)
+			LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 		UnlockReleaseBuffer(buf);
 

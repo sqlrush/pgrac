@@ -1250,6 +1250,16 @@ cluster_gcs_get_invalidate_send_not_admitted_count(void)
 {
 	return 0;
 }
+uint64
+cluster_gcs_get_invalidate_busy_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_busy_received_count(void)
+{
+	return 0;
+}
 /* GCS serve-stall round-5 A2 stubs: 4 bounded-drop accessors. */
 uint64
 cluster_gcs_get_invalidate_parked_count(void)
@@ -1375,6 +1385,26 @@ cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 }
 uint64
 cluster_pcm_get_evict_release_deferred_aux_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_writer_cover_stale_detected_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_writer_reverify_reacquire_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_restore_aba_detected_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_invalidate_parked_grant_pending_count(void)
 {
 	return 0;
 }

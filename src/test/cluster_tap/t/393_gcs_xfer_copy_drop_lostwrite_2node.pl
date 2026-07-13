@@ -99,7 +99,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		# The requester must outlast one stall + STALE deny + a clean
 		# re-serve, so give it a generous retransmit budget and reply window.
 		'cluster.gcs_reply_timeout_ms = 2000',
-		'cluster.gcs_block_retransmit_max_retries = 12',
+		'cluster.gcs_block_retransmit_max_retries = 8',
 		'cluster.gcs_block_starvation_max_retries = 60' ]);
 $pair->start_pair;
 usleep(3_000_000);

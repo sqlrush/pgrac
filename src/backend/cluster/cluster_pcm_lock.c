@@ -301,6 +301,17 @@ typedef struct ClusterPcmShared {
 	 * ride the GCS request wire; remote S release deferred, master keeps a
 	 * phantom-holder bit until the next acquire / GRD reclaim. */
 	pg_atomic_uint64 evict_release_deferred_aux_count;
+	/* PGRAC ownership-generation wave: the cached-X writer re-verify.
+	 * cover_stale_detected = a writer took the cached-cover fast path and, after
+	 * taking the content lock, found the ownership generation changed / no longer
+	 * covering / pending|revoking (a BAST X->S or any ownership round raced the
+	 * content-lock window).  reverify_reacquire = of those, the ones that fell
+	 * back to a real master re-acquire (the fix ACTION; detected without the
+	 * action is the pre-fix bug surface). */
+	pg_atomic_uint64 writer_cover_stale_detected_count;
+	pg_atomic_uint64 writer_reverify_reacquire_count;
+	pg_atomic_uint64 restore_aba_detected_count;
+	pg_atomic_uint64 invalidate_parked_grant_pending_count;
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -1800,6 +1811,70 @@ cluster_pcm_get_evict_release_deferred_aux_count(void)
 							  : 0;
 }
 
+/* PGRAC ownership-generation wave: cached-X writer re-verify observability. */
+void
+cluster_pcm_note_writer_cover_stale_detected(void)
+{
+	if (ClusterPcm != NULL)
+		pg_atomic_fetch_add_u64(&ClusterPcm->writer_cover_stale_detected_count, 1);
+}
+
+void
+cluster_pcm_note_writer_reverify_reacquire(void)
+{
+	if (ClusterPcm != NULL)
+		pg_atomic_fetch_add_u64(&ClusterPcm->writer_reverify_reacquire_count, 1);
+}
+
+uint64
+cluster_pcm_get_writer_cover_stale_detected_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->writer_cover_stale_detected_count)
+							  : 0;
+}
+
+uint64
+cluster_pcm_get_writer_reverify_reacquire_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->writer_reverify_reacquire_count)
+							  : 0;
+}
+
+/* PGRAC ownership-generation wave (W2): drop-restore ABA observability. */
+void
+cluster_pcm_note_restore_aba_detected(void)
+{
+	if (ClusterPcm != NULL)
+		pg_atomic_fetch_add_u64(&ClusterPcm->restore_aba_detected_count, 1);
+}
+
+uint64
+cluster_pcm_get_restore_aba_detected_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->restore_aba_detected_count) : 0;
+}
+
+/*
+ * PGRAC ownership-generation wave (W3): count invalidate directives parked
+ * because a grant for the same tag was in flight (GRANT_PENDING) while the
+ * local pcm_state still read N.  A non-zero delta proves the handler declined
+ * to ack the in-flight grant away.
+ */
+void
+cluster_pcm_note_invalidate_parked_grant_pending(void)
+{
+	if (ClusterPcm != NULL)
+		pg_atomic_fetch_add_u64(&ClusterPcm->invalidate_parked_grant_pending_count, 1);
+}
+
+uint64
+cluster_pcm_get_invalidate_parked_grant_pending_count(void)
+{
+	return ClusterPcm != NULL
+			   ? pg_atomic_read_u64(&ClusterPcm->invalidate_parked_grant_pending_count)
+			   : 0;
+}
+
 uint64
 cluster_pcm_get_trans_x_to_n_downgrade_count(void)
 {
@@ -2960,6 +3035,10 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_cleanout_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->evict_release_deferred_aux_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->writer_cover_stale_detected_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->writer_reverify_reacquire_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->restore_aba_detected_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->invalidate_parked_grant_pending_count, 0);
 	}
 
 	/*

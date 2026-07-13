@@ -549,6 +549,17 @@ GcsBlockInvalidateAckPayloadGetPageScn(const GcsBlockInvalidateAckPayload *p)
 #define GCS_BLOCK_INVALIDATE_ACK_KEPT_PI 1
 #define GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE 3
 #define GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE 4
+/* PGRAC ownership-generation wave (ruling ②) — solicited negative ACK: the
+ * holder cannot invalidate RIGHT NOW (GRANT_PENDING in-flight grant, or a
+ * pinned copy) and did NOT change any local state.  The master must not
+ * credit acked_bm / clear the holder bit / advance watermarks / grant X; it
+ * aborts the round immediately (pending_x cleared, slot released) and
+ * retries with a NEW round identity after a short backoff.  Values 3/4 are
+ * taken by the PI note rides above; 5 is the next free value.  Send-side
+ * gated on PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 (an old master drops
+ * status>2 as stale and would burn its timeout; the holder then falls back
+ * to the round-5 park). */
+#define GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY 5
 
 
 /* ============================================================
@@ -1831,6 +1842,14 @@ extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRe
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
+/* PGRAC ownership-generation wave (W3): is a grant for this tag in flight to
+ * install (GRANT_PENDING) on this node?  The invalidate handler consults it
+ * before treating a pcm_state==N block as already-invalidated. */
+extern bool cluster_bufmgr_block_grant_pending(BufferTag tag);
+/* PGRAC ownership-generation wave (W3) test-only delivery shim: drive the real
+ * invalidate handler with a synthetic same-tag directive from inside the
+ * grant-finalize window (armed inject only; see cluster_gcs_block.c). */
+extern bool cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag);
 /* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
  * ITL stamp; residency proves ownership (a self-contained transfer drops the
  * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */
@@ -1928,6 +1947,7 @@ extern bool cluster_bufmgr_snapshot_pi_block(BufferTag tag, char *dst, SCN *out_
  * False = slot busy / ack timeout / raced state (caller stays on the
  * pre-6.12a bounded fail-closed, Rule 8.A). */
 extern bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
+extern bool cluster_gcs_block_local_x_upgrade_ext(BufferTag tag, bool *out_busy);
 
 /* PGRAC: spec-6.12a — master==holder quiescent X->S self-downgrade.  Flushes
  * a dirty page to shared storage first (every S copy stays storage-
@@ -2187,6 +2207,8 @@ extern uint64 cluster_gcs_get_invalidate_send_not_admitted_count(void);
 extern void cluster_gcs_block_invalidate_park_tick(void);
 extern uint64 cluster_gcs_get_invalidate_parked_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_expired_count(void);
+extern uint64 cluster_gcs_get_invalidate_busy_sent_count(void);
+extern uint64 cluster_gcs_get_invalidate_busy_received_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_overflow_count(void);
 extern uint64 cluster_gcs_get_drop_pinned_deny_count(void);
 extern uint64 cluster_gcs_get_xfer_stale_deny_count(void);

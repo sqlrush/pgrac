@@ -43,6 +43,7 @@ OBJS = \
 	cluster_adg_xlog.o \
 	cluster_apply_master_election.o \
 	cluster_advisory.o \
+	cluster_pcm_own.o \
 	cluster_cancel_token.o \
 	cluster_backup.o \
 	cluster_backup_manifest.o \

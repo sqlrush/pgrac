@@ -20,6 +20,28 @@
  *		visibilitymap_prepare_truncate -
  *			prepare for truncation of the visibility map
  *
+ * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
+ *
+ *	visibilitymap_clear is split into a lock/unlock shell plus
+ *	visibilitymap_clear_locked (the bit clear itself, caller holds the map
+ *	page's content lock).  Heap mutators clear map bits from INSIDE their
+ *	WAL critical section, and in cluster mode the LockBuffer hidden inside
+ *	the old monolithic clear could need a cross-node PCM X transfer that
+ *	can fail: an ereport(ERROR) with CritSectionCount > 0 escalates to
+ *	PANIC and fail-stops the node (observed live: heap_update ->
+ *	visibilitymap_clear -> X-transfer timeout -> PANIC).  The heapam
+ *	callers therefore take the map page's content lock BEFORE
+ *	START_CRIT_SECTION (where a cross-node acquire may safely ERROR) and
+ *	call the _locked variant inside the critical section, releasing after
+ *	END_CRIT_SECTION.  Holding the content lock across the section also
+ *	makes the coverage IRREVOCABLE: a cluster BAST X->S downgrade is
+ *	content-lock serialized, so no revoke can slip in between the pre-crit
+ *	acquire and the in-crit clear (no residual PANIC window at all).
+ *	Out-of-crit callers keep using visibilitymap_clear unchanged, and
+ *	single-node builds see only the (behavior-identical) split.
+ *
+ *	Spec: spec-2.36-gcs-block-transfer.md
+ *
  * NOTES
  *
  * The visibility map is a bitmap with two bits (all-visible and all-frozen)
@@ -98,6 +120,7 @@
 #include "utils/inval.h"
 
 
+
 /*#define TRACE_VISIBILITYMAP */
 
 /*
@@ -158,6 +181,35 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
 
 	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	cleared = visibilitymap_clear_locked(rel, heapBlk, vmbuf, flags);
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+
+	return cleared;
+}
+
+/*
+ *	visibilitymap_clear_locked - clear bits, map page content lock HELD
+ *
+ * PGRAC: the body of visibilitymap_clear without the lock/unlock shell, for
+ * callers that must clear from inside a WAL critical section: they acquire
+ * the map page's content lock BEFORE the section (where a cluster PCM
+ * cross-node acquire may safely ereport) and release it after, so no
+ * failure-capable work remains inside (see the file header).
+ */
+bool
+visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
+	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
+	uint8		mask = flags << mapOffset;
+	char	   *map;
+	bool		cleared = false;
+
+	Assert(flags & VISIBILITYMAP_VALID_BITS);
+	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
+	Assert(BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock);
+
 	map = PageGetContents(BufferGetPage(vmbuf));
 
 	if (map[mapByte] & mask)
@@ -167,8 +219,6 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		MarkBufferDirty(vmbuf);
 		cleared = true;
 	}
-
-	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
 }

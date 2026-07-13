@@ -1946,6 +1946,18 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_pcm_get_local_s_revoke_nonholder_failclosed_count()));
 	emit_row(rsinfo, "pcm", "evict_release_deferred_aux_count",
 			 fmt_int64((int64)cluster_pcm_get_evict_release_deferred_aux_count()));
+	/* PGRAC ownership-generation wave: cached-X writer re-verify.  detected =
+	 * a covered-X writer found the ownership generation changed after taking the
+	 * content lock (a BAST X->S / ownership round raced the window); reacquire =
+	 * those that fell back to a real master re-acquire (the fix). */
+	emit_row(rsinfo, "pcm", "writer_cover_stale_detected_count",
+			 fmt_int64((int64)cluster_pcm_get_writer_cover_stale_detected_count()));
+	emit_row(rsinfo, "pcm", "writer_reverify_reacquire_count",
+			 fmt_int64((int64)cluster_pcm_get_writer_reverify_reacquire_count()));
+	emit_row(rsinfo, "pcm", "restore_aba_detected_count",
+			 fmt_int64((int64)cluster_pcm_get_restore_aba_detected_count()));
+	emit_row(rsinfo, "pcm", "invalidate_parked_grant_pending_count",
+			 fmt_int64((int64)cluster_pcm_get_invalidate_parked_grant_pending_count()));
 }
 
 
@@ -2175,6 +2187,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	 * and closed instead of silently losing the write. */
 	emit_row(rsinfo, "gcs", "invalidate_parked_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_parked_count()));
+	emit_row(rsinfo, "gcs", "invalidate_busy_sent_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_sent_count()));
+	emit_row(rsinfo, "gcs", "invalidate_busy_received_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_received_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_park_expired_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_overflow_count",

@@ -595,8 +595,9 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * authority-serve (0x2) + spec-5.22e D5-2 undo-horizon (0x4) +
 	 * CAPS_REPLY_V1 meta bit (0x8) + GCS-race round-2 F6 completion-proof
 	 * (0x10) + round-3 P0-1 xid wrap barrier (0x20) + round-4 P0-1
-	 * authority flock (0x40) (smart-fusion is off in this fixture) */
-	UT_ASSERT_EQ(wire[36], 0x7E);
+	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
+	 * (0x80) (smart-fusion is off in this fixture) */
+	UT_ASSERT_EQ(wire[36], 0xFE);
 	UT_ASSERT_EQ(wire[37], 0x00);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
@@ -694,7 +695,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
 					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
 					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
+					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
+					 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -706,7 +708,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
 					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
 					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
+					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
+					 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -714,12 +717,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-tier-match", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
-				 PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2
-					 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
-					 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1
-					 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2);
+	UT_ASSERT_EQ(
+		cluster_ic_hello_capabilities(&parsed),
+		PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1
+			| PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
+			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
@@ -841,7 +844,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(23); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(24); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
