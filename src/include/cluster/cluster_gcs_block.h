@@ -1837,8 +1837,38 @@ extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
 extern Buffer cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
 													 BlockNumber blocknum);
 extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
-extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
-													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
+
+/*
+ * PGRAC: GCS serve-stall round-5 (A2) — bounded drop result.
+ *
+ *	The GCS drop/invalidate wrappers run in the LMS / LMON IC-dispatch
+ *	context and must NEVER wait on a foreign buffer pin: the pin's holder
+ *	may itself be waiting on a GCS reply only this dispatch loop can
+ *	deliver (a circular wait resolved only by the reply-wait timeout —
+ *	the measured 33-96s S3 serve-stall wall, R-state stack samples all
+ *	parked in InvalidateBuffer's pin-wait retry loop).
+ *
+ *	  DROPPED       copy invalidated (or kept as a Past Image — the
+ *	                caller checks cluster_bufmgr_block_is_pi as before);
+ *	                page_lsn/page_scn outputs valid;  WAL flushed when
+ *	                the page was dirty (HC123).
+ *	  NOT_RESIDENT  no validly-resident copy (BufTable miss / tag moved /
+ *	                !BM_VALID) — the pre-round-5 `false`.
+ *	  PINNED        a foreign pin holds the buffer;  NOTHING was changed
+ *	                (no state cleared, no flush relied upon).  The caller
+ *	                parks the job and retries, or fail-closes with a
+ *	                retryable deny — never spins.
+ */
+typedef enum ClusterBufmgrGcsDropResult {
+	CLUSTER_BUFMGR_GCS_DROP_DROPPED = 0,
+	CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT,
+	CLUSTER_BUFMGR_GCS_DROP_PINNED,
+} ClusterBufmgrGcsDropResult;
+
+extern ClusterBufmgrGcsDropResult cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag,
+																		  PcmLockMode expected_mode,
+																		  XLogRecPtr *out_page_lsn,
+																		  SCN *out_page_scn);
 
 /* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify / refresh.
  * read_block_scn: snapshot pd_block_scn under content_lock SHARED (page-
@@ -1859,7 +1889,8 @@ extern void cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag
  * with NO GCS release wire, for the holder-side X-transfer branch running in
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
-extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
+extern ClusterBufmgrGcsDropResult
+cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
 
 /* PGRAC: spec-6.12h D-h2 — Past Image discard helpers.
  * block_is_pi: does this tag's resident buffer hold a D-h1 Past Image
@@ -2111,6 +2142,42 @@ extern void cluster_gcs_handle_block_reply_envelope(const struct ClusterICEnvelo
 extern void cluster_gcs_handle_block_forward_envelope(const struct ClusterICEnvelope *env,
 													  const void *payload);
 
+
+/* ============================================================
+ * GCS serve-stall round-5 — per-family send admission accounting.
+ *
+ *	One shared funnel for every block-family send site (replies incl.
+ *	cached resends and cluster_cr_server's direct REPLY sends, FORWARD,
+ *	INVALIDATE + acks + redeclare) under the four-state ownership
+ *	contract (ClusterICSendResult in cluster_ic.h).  WOULD_BLOCK =
+ *	admitted into the tier1 per-peer FIFO (queued counter);
+ *	NOT_ADMITTED = refused, retransmit self-heals (red-flag counter).
+ * ============================================================ */
+#include "cluster/cluster_ic.h" /* ClusterICSendResult */
+
+typedef enum GcsBlockSendFamily {
+	GCS_BLOCK_SEND_FAMILY_REPLY = 0,
+	GCS_BLOCK_SEND_FAMILY_FORWARD,
+	GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+} GcsBlockSendFamily;
+
+extern void cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc);
+
+extern uint64 cluster_gcs_get_reply_send_queued_count(void);
+extern uint64 cluster_gcs_get_reply_send_not_admitted_count(void);
+extern uint64 cluster_gcs_get_forward_send_queued_count(void);
+extern uint64 cluster_gcs_get_forward_send_not_admitted_count(void);
+extern uint64 cluster_gcs_get_invalidate_send_queued_count(void);
+extern uint64 cluster_gcs_get_invalidate_send_not_admitted_count(void);
+
+/* PGRAC: GCS serve-stall round-5 A2 — bounded-drop machinery.  The LMS
+ * worker loop retries PINNED invalidate directives parked by the handler
+ * (per-worker process-local lot;  see the invalidate handler notes). */
+extern void cluster_gcs_block_invalidate_park_tick(void);
+extern uint64 cluster_gcs_get_invalidate_parked_count(void);
+extern uint64 cluster_gcs_get_invalidate_park_expired_count(void);
+extern uint64 cluster_gcs_get_invalidate_park_overflow_count(void);
+extern uint64 cluster_gcs_get_drop_pinned_deny_count(void);
 
 /* ============================================================
  * Observability accessors (dump_gcs +8 NEW rows for block plane).

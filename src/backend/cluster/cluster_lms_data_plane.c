@@ -537,6 +537,11 @@ cluster_lms_data_plane_tick(long timeout_ms)
 						 * WRITEABLE interest either way. */
 						dp_wes_dirty = true;
 						break;
+					case CLUSTER_IC_SEND_NOT_ADMITTED:
+						/* Unreachable: the drain entry never admits a new
+						 * frame.  Keep the WES aligned anyway. */
+						dp_wes_dirty = true;
+						break;
 					case CLUSTER_IC_SEND_HARD_ERROR:
 						cluster_ic_tier1_close_peer(peer, "data-plane outbound drain hard error");
 						dp_track[peer].fd = -1;

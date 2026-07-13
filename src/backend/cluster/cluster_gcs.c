@@ -512,7 +512,7 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
 		return cluster_grd_outbound_enqueue_backend_msg(msg_type, (uint32)dest_node, payload,
 														(uint16)payload_len)
 				   ? CLUSTER_IC_SEND_DONE
-				   : CLUSTER_IC_SEND_WOULD_BLOCK;
+				   : CLUSTER_IC_SEND_NOT_ADMITTED; /* ring full — caller retries */
 
 	rc = cluster_ic_send_envelope(msg_type, dest_node, payload, payload_len);
 	return rc;
@@ -576,14 +576,22 @@ gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id,
 		 * production spec-2.32 master==self short-circuit ensures we never
 		 * reach this function.
 		 */
-		if (gcs_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
-										  sizeof(payload))
-			!= CLUSTER_IC_SEND_DONE) {
-			if (throw_on_send_fail)
-				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("cluster_gcs: failed to send GCS request to node %d",
-									   master_node)));
-			send_failed = true;
+		{
+			/* GCS serve-stall round-5: WOULD_BLOCK = the transport ADMITTED
+			 * the frame (per-peer FIFO) and delivers it in order — that is
+			 * a successful send for the wait loop below, not a failure.
+			 * Only an explicit refusal (NOT_ADMITTED) or a dead peer keeps
+			 * the fail-and-retry path. */
+			ClusterICSendResult send_rc = gcs_send_envelope_or_loopback(
+				PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload, sizeof(payload));
+
+			if (send_rc != CLUSTER_IC_SEND_DONE && send_rc != CLUSTER_IC_SEND_WOULD_BLOCK) {
+				if (throw_on_send_fail)
+					ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+									errmsg("cluster_gcs: failed to send GCS request to node %d",
+										   master_node)));
+				send_failed = true;
+			}
 		}
 
 		/*
@@ -738,9 +746,14 @@ cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_i
 	 * (CONTROL plane) must stage into the outbound ring for LMON (the
 	 * D0-①b staging case).  LMON callers keep the direct send.
 	 */
-	return gcs_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
-										 sizeof(payload))
-		   == CLUSTER_IC_SEND_DONE;
+	{
+		/* Round-5: admitted (WOULD_BLOCK) counts as sent — the transport
+		 * owns a copy and delivers in order. */
+		ClusterICSendResult send_rc = gcs_send_envelope_or_loopback(
+			PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload, sizeof(payload));
+
+		return send_rc == CLUSTER_IC_SEND_DONE || send_rc == CLUSTER_IC_SEND_WOULD_BLOCK;
+	}
 }
 
 

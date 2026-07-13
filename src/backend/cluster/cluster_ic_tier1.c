@@ -122,6 +122,22 @@ typedef struct ClusterICTier1Shmem {
 	 * tails drained by this plane instance on a WL_SOCKET_WRITEABLE wakeup
 	 * (the DATA plane previously parked such tails forever — 56s wall). */
 	pg_atomic_uint64 writable_drain_count;
+	/* PGRAC: GCS serve-stall round-5 — per-peer outbound FIFO accounting.
+	 * admitted = whole frames copied into the FIFO because an older tail
+	 * was still backpressured (pre-fix these frames were silently LOST);
+	 * promoted = frames that left the FIFO for the wire (tail promotion);
+	 * not_admitted = sends refused with CLUSTER_IC_SEND_NOT_ADMITTED
+	 * (peer mid-HELLO or FIFO at capacity — the caller retained the
+	 * frame).  admitted - promoted = frames currently queued, summed
+	 * over this plane instance's peers. */
+	pg_atomic_uint64 fifo_admitted_count;
+	pg_atomic_uint64 fifo_promoted_count;
+	pg_atomic_uint64 send_not_admitted_count;
+	/* Frames freed by close_peer without reaching the wire (per-connection
+	 * continuations;  the retransmit machinery re-drives their messages).
+	 * Keeps the depth identity honest: admitted - promoted - dropped_close
+	 * = frames currently queued. */
+	pg_atomic_uint64 fifo_dropped_close_count;
 	ClusterICPeerStateShmem peers[CLUSTER_MAX_NODES];
 } ClusterICTier1Shmem;
 
@@ -274,6 +290,44 @@ static int tier1_outbound_remaining[CLUSTER_MAX_NODES];
  * put them on the wire (frame corruption -> reply discarded -> retransmit
  * budget wall, the 56s stall root cause #1). */
 static int tier1_outbound_queued_total[CLUSTER_MAX_NODES];
+
+/*
+ * PGRAC: GCS serve-stall round-5 — per-peer bounded whole-frame outbound
+ * FIFO behind the single in-flight tail.
+ *
+ *	The tail buffer above holds exactly ONE frame's unsent bytes.  Any
+ *	frame handed to tier1_send_bytes while that tail is backpressured
+ *	used to be REFUSED without the caller knowing (WOULD_BLOCK, no
+ *	copy) — GCS reply producers treated WOULD_BLOCK as "transport
+ *	retained the frame" per the L68 contract and the reply was lost:
+ *	the requester burned its full 5s reply wait + retransmit budget
+ *	per lost frame (the 33-54s S3 serve-stall wall).
+ *
+ *	Now such frames are copied into this per-peer FIFO (admission =
+ *	CLUSTER_IC_SEND_WOULD_BLOCK; the transport owns the copy) and are
+ *	promoted into the tail buffer in submission order as it drains.
+ *	The FIFO is BOUNDED by frames and bytes; at capacity the send is
+ *	refused with CLUSTER_IC_SEND_NOT_ADMITTED so the caller keeps
+ *	ownership — never a silent drop.  Frames never survive a peer
+ *	close (byte-stream continuation rule, round-4c F4).
+ *
+ *	Bytes cap == PGRAC_IC_PAYLOAD_MAX so any single legal frame can be
+ *	admitted once the queue empties (a frame larger than the cap could
+ *	otherwise never be admitted and would starve forever).
+ */
+typedef struct Tier1OutboundFrame {
+	struct Tier1OutboundFrame *next;
+	int len;
+	uint8 data[FLEXIBLE_ARRAY_MEMBER];
+} Tier1OutboundFrame;
+
+#define PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_FRAMES 2048
+#define PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_BYTES PGRAC_IC_PAYLOAD_MAX
+
+static Tier1OutboundFrame *tier1_outbound_fifo_head[CLUSTER_MAX_NODES];
+static Tier1OutboundFrame *tier1_outbound_fifo_tail[CLUSTER_MAX_NODES];
+static int tier1_outbound_fifo_frames[CLUSTER_MAX_NODES];
+static Size tier1_outbound_fifo_bytes[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.4 hardening v1.0.1 F1: variable-length payload recv state.
@@ -517,6 +571,10 @@ tier1_shmem_init(void)
 			s->listener_incarnation = 0;
 			pg_atomic_init_u64(&s->plane_misroute_reject, 0);
 			pg_atomic_init_u64(&s->writable_drain_count, 0);
+			pg_atomic_init_u64(&s->fifo_admitted_count, 0);
+			pg_atomic_init_u64(&s->fifo_promoted_count, 0);
+			pg_atomic_init_u64(&s->send_not_admitted_count, 0);
+			pg_atomic_init_u64(&s->fifo_dropped_close_count, 0);
 
 			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 				s->peers[i].node_id = -1;
@@ -671,6 +729,62 @@ cluster_ic_tier1_get_writable_drain(ClusterICPlane plane)
 	return pg_atomic_read_u64(&Tier1ShmemSlots[0]->writable_drain_count);
 }
 
+/*
+ * PGRAC: GCS serve-stall round-5 — plane-scoped readers for the outbound
+ * FIFO accounting (admitted / promoted / not-admitted).  Same aggregation
+ * shape as get_writable_drain: CONTROL reads slot 0, DATA sums the worker
+ * channel slots.  admitted - promoted = frames currently queued across the
+ * plane (the S3 gate proves the queue BOUNDS and then RETURNS TO ZERO).
+ */
+static uint64
+tier1_sum_plane_counter(ClusterICPlane plane, size_t counter_off)
+{
+	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N)
+		return 0;
+
+	if (plane == CLUSTER_IC_PLANE_DATA) {
+		uint64 sum = 0;
+		int c;
+
+		for (c = 0; c < CLUSTER_IC_TIER1_DATA_CHANNELS; c++) {
+			int slot = tier1_slot_of(CLUSTER_IC_PLANE_DATA, c);
+
+			if (Tier1ShmemSlots[slot] != NULL)
+				sum += pg_atomic_read_u64(
+					(pg_atomic_uint64 *)((char *)Tier1ShmemSlots[slot] + counter_off));
+		}
+		return sum;
+	}
+
+	if (Tier1ShmemSlots[0] == NULL)
+		return 0;
+	return pg_atomic_read_u64((pg_atomic_uint64 *)((char *)Tier1ShmemSlots[0] + counter_off));
+}
+
+uint64
+cluster_ic_tier1_get_fifo_admitted(ClusterICPlane plane)
+{
+	return tier1_sum_plane_counter(plane, offsetof(ClusterICTier1Shmem, fifo_admitted_count));
+}
+
+uint64
+cluster_ic_tier1_get_fifo_promoted(ClusterICPlane plane)
+{
+	return tier1_sum_plane_counter(plane, offsetof(ClusterICTier1Shmem, fifo_promoted_count));
+}
+
+uint64
+cluster_ic_tier1_get_send_not_admitted(ClusterICPlane plane)
+{
+	return tier1_sum_plane_counter(plane, offsetof(ClusterICTier1Shmem, send_not_admitted_count));
+}
+
+uint64
+cluster_ic_tier1_get_fifo_dropped_close(ClusterICPlane plane)
+{
+	return tier1_sum_plane_counter(plane, offsetof(ClusterICTier1Shmem, fifo_dropped_close_count));
+}
+
 static const ClusterShmemRegion cluster_ic_tier1_region = {
 	.name = "pgrac cluster_ic_tier1",
 	.size_fn = tier1_shmem_size,
@@ -699,52 +813,164 @@ cluster_ic_tier1_shmem_register(void)
  *	frame length stamped at queue time; tier1_outbound_buf_dyn_size is the
  *	grow-only allocation capacity and using it here sent stale bytes of a
  *	previous frame after buffer reuse (root cause #1 of the 56s retransmit
- *	wall).  Returns DONE when nothing is pending or the tail fully drained,
- *	WOULD_BLOCK while backpressured, HARD_ERROR on a dead socket or a
- *	corrupt drain state (caller closes the peer; close_peer resets the
- *	tail — a byte-stream continuation must never survive a reconnect).
+ *	wall).
+ *
+ *	GCS serve-stall round-5: after the tail fully drains, the next FIFO
+ *	frame (if any) is PROMOTED into the tail buffer and pushed in the same
+ *	call, in submission order, until the socket backpressures again or the
+ *	queue empties.  Returns DONE when nothing at all is pending,
+ *	WOULD_BLOCK while backpressured (tail and/or FIFO still hold bytes),
+ *	HARD_ERROR on a dead socket or a corrupt drain state (caller closes
+ *	the peer; close_peer resets the tail AND frees the FIFO — a
+ *	byte-stream continuation must never survive a reconnect).
  */
 static ClusterICSendResult
 tier1_drain_pending(int32 target_node_id, int fd)
 {
-	int rem = tier1_outbound_remaining[target_node_id];
-	int total = tier1_outbound_queued_total[target_node_id];
-	int off = total - rem;
-	ssize_t drained;
+	for (;;) {
+		int rem = tier1_outbound_remaining[target_node_id];
+		int total = tier1_outbound_queued_total[target_node_id];
+		int off = total - rem;
+		ssize_t drained;
+		Tier1OutboundFrame *frame;
 
-	if (rem <= 0)
-		return CLUSTER_IC_SEND_DONE;
+		if (rem > 0) {
+			if (off < 0 || tier1_outbound_buf_dyn[target_node_id] == NULL
+				|| total > tier1_outbound_buf_dyn_size[target_node_id]) {
+				peer_record_error(target_node_id, 0, "08006",
+								  "outbound drain state corrupt (rem=%d total=%d cap=%d)", rem,
+								  total, tier1_outbound_buf_dyn_size[target_node_id]);
+				tier1_outbound_remaining[target_node_id] = 0;
+				tier1_outbound_queued_total[target_node_id] = 0;
+				return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+			}
 
-	if (off < 0 || tier1_outbound_buf_dyn[target_node_id] == NULL
-		|| total > tier1_outbound_buf_dyn_size[target_node_id]) {
-		peer_record_error(target_node_id, 0, "08006",
-						  "outbound drain state corrupt (rem=%d total=%d cap=%d)", rem, total,
-						  tier1_outbound_buf_dyn_size[target_node_id]);
-		tier1_outbound_remaining[target_node_id] = 0;
-		tier1_outbound_queued_total[target_node_id] = 0;
-		return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+			pgstat_report_wait_start(WAIT_EVENT_CLUSTER_IC_TCP_SEND);
+			drained = send(fd, &tier1_outbound_buf_dyn[target_node_id][off], (size_t)rem, 0);
+			pgstat_report_wait_end();
+			if (drained < 0) {
+				int saved = errno;
+
+				if (saved == EAGAIN || saved == EWOULDBLOCK)
+					return CLUSTER_IC_SEND_WOULD_BLOCK; /* still backpressured */
+				peer_record_error(target_node_id, saved, "08006", "send (drain): %s",
+								  strerror(saved));
+				return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+			}
+			tier1_outbound_remaining[target_node_id] -= (int)drained;
+			if (Tier1Shmem != NULL && drained > 0) {
+				pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send,
+										(uint64)drained);
+				Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
+			}
+			if (tier1_outbound_remaining[target_node_id] > 0)
+				return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
+			tier1_outbound_queued_total[target_node_id] = 0;
+		}
+
+		/* Tail is empty — promote the next queued whole frame, if any. */
+		frame = tier1_outbound_fifo_head[target_node_id];
+		if (frame == NULL)
+			return CLUSTER_IC_SEND_DONE;
+
+		tier1_outbound_fifo_head[target_node_id] = frame->next;
+		if (tier1_outbound_fifo_head[target_node_id] == NULL)
+			tier1_outbound_fifo_tail[target_node_id] = NULL;
+		tier1_outbound_fifo_frames[target_node_id]--;
+		tier1_outbound_fifo_bytes[target_node_id] -= (Size)frame->len;
+
+		if (tier1_outbound_buf_dyn[target_node_id] == NULL
+			|| tier1_outbound_buf_dyn_size[target_node_id] < frame->len) {
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+			if (tier1_outbound_buf_dyn[target_node_id] != NULL)
+				pfree(tier1_outbound_buf_dyn[target_node_id]);
+			tier1_outbound_buf_dyn[target_node_id] = palloc((Size)frame->len);
+			tier1_outbound_buf_dyn_size[target_node_id] = frame->len;
+			MemoryContextSwitchTo(oldctx);
+		}
+		memcpy(tier1_outbound_buf_dyn[target_node_id], frame->data, (size_t)frame->len);
+		tier1_outbound_remaining[target_node_id] = frame->len;
+		tier1_outbound_queued_total[target_node_id] = frame->len;
+		pfree(frame);
+		if (Tier1Shmem != NULL)
+			pg_atomic_fetch_add_u64(&Tier1Shmem->fifo_promoted_count, 1);
+		/* Loop: push the promoted tail in this same call. */
+	}
+}
+
+/*
+ * PGRAC: GCS serve-stall round-5 — admit one whole frame into the per-peer
+ * outbound FIFO while an older tail is still backpressured.
+ *
+ *	WOULD_BLOCK  = admitted; the transport owns the copy (drains in
+ *	               submission order behind the tail).
+ *	NOT_ADMITTED = FIFO at capacity; the CALLER keeps ownership (upper-
+ *	               layer queue / retransmit machinery).  Counted — a
+ *	               bounded queue must refuse loudly, never drop silently.
+ */
+static ClusterICSendResult
+tier1_fifo_admit(int32 target_node_id, const void *buf, size_t len)
+{
+	Tier1OutboundFrame *frame;
+	MemoryContext oldctx;
+
+	if (len > PGRAC_IC_PAYLOAD_MAX) {
+		peer_record_error(target_node_id, 0, "08006", "queued frame %zu > 16 MB hard cap", len);
+		return CLUSTER_IC_SEND_HARD_ERROR;
 	}
 
-	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_IC_TCP_SEND);
-	drained = send(fd, &tier1_outbound_buf_dyn[target_node_id][off], (size_t)rem, 0);
-	pgstat_report_wait_end();
-	if (drained < 0) {
-		int saved = errno;
+	if (tier1_outbound_fifo_frames[target_node_id] >= PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_FRAMES
+		|| tier1_outbound_fifo_bytes[target_node_id] + len
+			   > PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_BYTES) {
+		if (Tier1Shmem != NULL)
+			pg_atomic_fetch_add_u64(&Tier1Shmem->send_not_admitted_count, 1);
+		return CLUSTER_IC_SEND_NOT_ADMITTED;
+	}
 
-		if (saved == EAGAIN || saved == EWOULDBLOCK)
-			return CLUSTER_IC_SEND_WOULD_BLOCK; /* still backpressured */
-		peer_record_error(target_node_id, saved, "08006", "send (drain): %s", strerror(saved));
-		return CLUSTER_IC_SEND_HARD_ERROR; /* caller closes peer */
+	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+	frame = (Tier1OutboundFrame *)palloc(offsetof(Tier1OutboundFrame, data) + len);
+	MemoryContextSwitchTo(oldctx);
+	frame->next = NULL;
+	frame->len = (int)len;
+	memcpy(frame->data, buf, len);
+
+	if (tier1_outbound_fifo_tail[target_node_id] != NULL)
+		tier1_outbound_fifo_tail[target_node_id]->next = frame;
+	else
+		tier1_outbound_fifo_head[target_node_id] = frame;
+	tier1_outbound_fifo_tail[target_node_id] = frame;
+	tier1_outbound_fifo_frames[target_node_id]++;
+	tier1_outbound_fifo_bytes[target_node_id] += len;
+
+	if (Tier1Shmem != NULL)
+		pg_atomic_fetch_add_u64(&Tier1Shmem->fifo_admitted_count, 1);
+	return CLUSTER_IC_SEND_WOULD_BLOCK;
+}
+
+/*
+ * PGRAC: GCS serve-stall round-5 — free every queued frame for one peer.
+ * Called from close_peer: queued frames are per-connection byte-stream
+ * continuations and must never survive onto a reconnected socket.
+ */
+static void
+tier1_fifo_reset(int32 peer_id)
+{
+	Tier1OutboundFrame *frame = tier1_outbound_fifo_head[peer_id];
+	int dropped = tier1_outbound_fifo_frames[peer_id];
+
+	while (frame != NULL) {
+		Tier1OutboundFrame *next = frame->next;
+
+		pfree(frame);
+		frame = next;
 	}
-	tier1_outbound_remaining[target_node_id] -= (int)drained;
-	if (Tier1Shmem != NULL && drained > 0) {
-		pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)drained);
-		Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
-	}
-	if (tier1_outbound_remaining[target_node_id] > 0)
-		return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
-	tier1_outbound_queued_total[target_node_id] = 0;
-	return CLUSTER_IC_SEND_DONE;
+	tier1_outbound_fifo_head[peer_id] = NULL;
+	tier1_outbound_fifo_tail[peer_id] = NULL;
+	tier1_outbound_fifo_frames[peer_id] = 0;
+	tier1_outbound_fifo_bytes[peer_id] = 0;
+	if (Tier1Shmem != NULL && dropped > 0)
+		pg_atomic_fetch_add_u64(&Tier1Shmem->fifo_dropped_close_count, (uint64)dropped);
 }
 
 /*
@@ -829,9 +1055,17 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	 *	SCN_BROADCAST / SI / FENCE / RECONFIG that may share the same
 	 *	vtable path).
 	 */
+	/* GCS serve-stall round-5: an un-CONNECTED peer REFUSES the frame —
+	 * the caller keeps ownership and retries.  (Pre-fix WOULD_BLOCK here
+	 * falsely claimed the transport had retained it.)  Frames must not
+	 * be queued either: envelope bytes ahead of the HELLO handshake are
+	 * the L66 bad-magic close loop. */
 	if (Tier1Shmem == NULL
-		|| Tier1Shmem->peers[target_node_id].state != (int32)CLUSTER_IC_PEER_CONNECTED)
-		return CLUSTER_IC_SEND_WOULD_BLOCK; /* HELLO pending; caller retries */
+		|| Tier1Shmem->peers[target_node_id].state != (int32)CLUSTER_IC_PEER_CONNECTED) {
+		if (Tier1Shmem != NULL)
+			pg_atomic_fetch_add_u64(&Tier1Shmem->send_not_admitted_count, 1);
+		return CLUSTER_IC_SEND_NOT_ADMITTED; /* HELLO pending; caller retries */
+	}
 
 	/*
 	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH sender gate) — never put a
@@ -854,18 +1088,22 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	 * the new caller-supplied buf when the buffer is empty (otherwise
 	 * we'd corrupt the byte stream by interleaving frames).
 	 *
-	 * Three-state return contract:
-	 *   DONE        -> full send;counter advance OK
-	 *   WOULD_BLOCK -> EAGAIN or partial;outbound buffer holds tail;
-	 *                  caller MUST register WL_SOCKET_WRITEABLE for fd
-	 *                  and re-enter on writability;NEVER close peer
-	 *   HARD_ERROR  -> socket dead;caller MUST close peer
+	 * GCS serve-stall round-5: when the drain cannot complete, the new
+	 * frame is ADMITTED into the per-peer FIFO (WOULD_BLOCK = the
+	 * transport owns a copy and will deliver it in order) or refused
+	 * loudly (NOT_ADMITTED at capacity).  Pre-fix code returned
+	 * WOULD_BLOCK here WITHOUT taking the frame — every producer that
+	 * trusted the "outbound buffer holds tail" reading lost the frame.
+	 * See ClusterICSendResult for the full four-state ownership
+	 * contract.
 	 */
 	{
 		ClusterICSendResult drain_rc = tier1_drain_pending(target_node_id, fd);
 
-		if (drain_rc != CLUSTER_IC_SEND_DONE)
-			return drain_rc; /* WOULD_BLOCK: defer new payload;  HARD_ERROR: caller closes */
+		if (drain_rc == CLUSTER_IC_SEND_HARD_ERROR)
+			return drain_rc; /* caller closes peer */
+		if (drain_rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+			return tier1_fifo_admit(target_node_id, buf, len);
 	}
 
 	/*
@@ -989,7 +1227,9 @@ cluster_ic_tier1_pending_outbound(int32 peer_id)
 {
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return false;
-	return tier1_outbound_remaining[peer_id] > 0;
+	/* GCS serve-stall round-5: queued whole frames count as pending too —
+	 * the WRITEABLE drain path is their only way onto the wire. */
+	return tier1_outbound_remaining[peer_id] > 0 || tier1_outbound_fifo_frames[peer_id] > 0;
 }
 
 /* ============================================================
@@ -2576,6 +2816,9 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 	 */
 	tier1_outbound_remaining[peer_id] = 0;
 	tier1_outbound_queued_total[peer_id] = 0;
+	/* GCS serve-stall round-5: queued whole frames are per-connection
+	 * continuations too — free them all (same F4 argument). */
+	tier1_fifo_reset(peer_id);
 
 	if (Tier1Shmem != NULL) {
 		if (reason != NULL && reason[0] != '\0')

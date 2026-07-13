@@ -1466,6 +1466,11 @@ LmonMain(void)
 						/* Transport-retained frame; arrange the next drain wake. */
 						wes_dirty = true;
 						break;
+					case CLUSTER_IC_SEND_NOT_ADMITTED:
+						/* Refused (queue at capacity / mid-HELLO);  the
+						 * heartbeat is idempotent — next tick re-sends. */
+						wes_dirty = true;
+						break;
 					case CLUSTER_IC_SEND_HARD_ERROR:
 						cluster_ic_tier1_close_peer(pi, "heartbeat send hard error");
 						lmon_peer_track[pi].fd = -1;
@@ -1547,6 +1552,9 @@ LmonMain(void)
 								fanout_rc = CLUSTER_IC_FANOUT_DONE;
 								break;
 							case CLUSTER_IC_SEND_WOULD_BLOCK:
+							case CLUSTER_IC_SEND_NOT_ADMITTED:
+								/* Queued-but-admitted and refused both map
+								 * to the retryable fanout bucket. */
 								fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
 								break;
 							case CLUSTER_IC_SEND_HARD_ERROR:
@@ -1776,21 +1784,30 @@ LmonMain(void)
 
 					/*
 					 * spec-2.3 hardening v1.0.1 F1 (L68): drain pending
-					 * outbound buffer on WL_SOCKET_WRITEABLE.  Re-enters
-					 * tier1_send_bytes via send_heartbeat; the top-of-
-					 * function drain path pushes the buffered tail.
-					 * Heartbeat counter is bumped only on DONE.
+					 * outbound buffer on WL_SOCKET_WRITEABLE.
+					 *
+					 * GCS serve-stall round-5: use the frame-free drain
+					 * entry (round-4c F2) instead of re-entering
+					 * tier1_send_bytes via send_heartbeat — with the
+					 * per-peer FIFO, a send_bytes re-entry would ENQUEUE a
+					 * fresh heartbeat frame on every WRITEABLE wake while
+					 * backpressured (junk growth), whereas the drain entry
+					 * only pushes bytes the transport already owns (tail +
+					 * queued frames, in order).
 					 */
 					if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
 						&& (ev[i].events & WL_SOCKET_WRITEABLE)
 						&& cluster_ic_tier1_pending_outbound(peer)) {
-						ClusterICSendResult drc = cluster_ic_tier1_send_heartbeat(peer);
-
-						switch (drc) {
+						switch (cluster_ic_tier1_drain_outbound(peer)) {
 						case CLUSTER_IC_SEND_DONE:
 						case CLUSTER_IC_SEND_WOULD_BLOCK:
 							/* Either drained fully or still buffered;
 							 * wes_dirty rebuild reflects pending state. */
+							wes_dirty = true;
+							break;
+						case CLUSTER_IC_SEND_NOT_ADMITTED:
+							/* Unreachable: the drain entry never admits a
+							 * new frame.  Keep the WES aligned anyway. */
 							wes_dirty = true;
 							break;
 						case CLUSTER_IC_SEND_HARD_ERROR:

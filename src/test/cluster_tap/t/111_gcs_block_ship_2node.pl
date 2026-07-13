@@ -8,7 +8,7 @@
 #
 #	  L1  ClusterPair startup — both postmasters healthy + tier1 connected
 #	  L2  fresh baseline gcs counters on both nodes (block_* counters = 0)
-#	  L3  pg_cluster_state.gcs category has 98 keys (spec-7.2 D6+flip) (cumulative through
+#	  L3  pg_cluster_state.gcs category has 108 keys (spec-7.2 D6+flip) (cumulative through
 #	       spec-6.13 direct-land observability)
 #	  L4  4 NEW wait events registered in pg_stat_cluster_wait_events:
 #	       ClusterGCSBlockShipWait, ClusterGCSBlockRequestDispatch,
@@ -114,19 +114,19 @@ for my $node ($pair->node0, $pair->node1) {
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 98 keys (spec-7.2 D6+flip)
+# L3: pg_cluster_state.gcs category has 108 keys (spec-7.2 D6+flip)
 #	  (cumulative GCS surface through spec-6.13 direct-land observability).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '98',
-   'L3 node0 pg_cluster_state.gcs category has 98 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows) (spec-7.2 D6+flip)');
+   '108',
+   'L3 node0 pg_cluster_state.gcs category has 108 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '98',
-   'L3 node1 pg_cluster_state.gcs category has 98 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows) (spec-7.2 D6+flip)');
+   '108',
+   'L3 node1 pg_cluster_state.gcs category has 108 keys (round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
 
 
 # ============================================================

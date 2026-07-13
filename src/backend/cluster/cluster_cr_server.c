@@ -1135,7 +1135,12 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 	}
 	hdr->checksum = cluster_gcs_block_compute_checksum(buf + header_len);
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf, total);
+	/* GCS serve-stall round-5: share the block-family send admission
+	 * accounting (an admitted reply is queued;  a refused one is the
+	 * capacity red flag the S3 gate watches). */
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf, total));
 	pfree(buf);
 }
 

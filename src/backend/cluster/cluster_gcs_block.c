@@ -179,6 +179,32 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
 	pg_atomic_uint64 done_sent_count;
 	pg_atomic_uint64 done_enqueue_drop_count; /* review F7: outbound ring full */
+	/* PGRAC: GCS serve-stall round-5 — per-family send admission outcomes
+	 * under the four-state ownership contract (see ClusterICSendResult).
+	 * queued = the transport ADMITTED the frame behind a backpressured
+	 * tail (tier1 per-peer FIFO;  pre-fix these frames were silently
+	 * LOST — the 33-54s S3 stall wall);  not_admitted = the transport
+	 * REFUSED the frame (FIFO at capacity / peer mid-HELLO), retransmit
+	 * machinery self-heals.  Families: REPLY (all master/holder reply
+	 * sends incl. cached resends), FORWARD (master→holder), INVALIDATE
+	 * (invalidate + invalidate-ack + redeclare). */
+	pg_atomic_uint64 reply_send_queued_count;
+	pg_atomic_uint64 reply_send_not_admitted_count;
+	pg_atomic_uint64 forward_send_queued_count;
+	pg_atomic_uint64 forward_send_not_admitted_count;
+	pg_atomic_uint64 invalidate_send_queued_count;
+	pg_atomic_uint64 invalidate_send_not_admitted_count;
+	/* PGRAC: GCS serve-stall round-5 A2 — bounded-drop outcomes.  The
+	 * dispatch pump never waits on a foreign buffer pin any more:
+	 * a PINNED invalidate directive parks (parked) and retries from the
+	 * LMS loop until the master's ack budget (park_expired = master
+	 * timeout fail-closes;  park_overflow = lot full, same shape);  a
+	 * PINNED drop on a grant/transfer path fail-closes with a retryable
+	 * deny instead (drop_pinned_deny). */
+	pg_atomic_uint64 invalidate_parked_count;
+	pg_atomic_uint64 invalidate_park_expired_count;
+	pg_atomic_uint64 invalidate_park_overflow_count;
+	pg_atomic_uint64 drop_pinned_deny_count;
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify/refresh.
 	 * A state=N GRANTED_STORAGE_FALLBACK now carries the master's
 	 * pi_watermark_scn (reply page_lsn field reused as an SCN carrier); the
@@ -461,6 +487,16 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->reply_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->reply_send_not_admitted_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->forward_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->forward_send_not_admitted_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_queued_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_parked_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_expired_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->invalidate_park_overflow_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->drop_pinned_deny_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_refresh_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 0);
@@ -3622,6 +3658,79 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
  *	Transition apply MUST NOT precede buffer availability decision (HC88).
  * ============================================================ */
 
+/*
+ * cluster_gcs_block_note_send_outcome — GCS serve-stall round-5.
+ *
+ *	Per-family admission accounting under the four-state send ownership
+ *	contract (see ClusterICSendResult).  DONE needs no extra row (the
+ *	existing sent counters cover it);  WOULD_BLOCK = admitted into the
+ *	tier1 per-peer FIFO (pre-fix: silently lost);  NOT_ADMITTED = the
+ *	transport refused and the retransmit machinery self-heals (nonzero
+ *	deltas here are the capacity red flag the S3 gate watches);
+ *	HARD_ERROR is recorded at the tier1 peer-error surface already.
+ *	Exported so cluster_cr_server's direct REPLY sends share the same
+ *	accounting.
+ */
+void
+cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc)
+{
+	pg_atomic_uint64 *counter = NULL;
+
+	if (ClusterGcsBlock == NULL)
+		return;
+
+	switch (rc) {
+	case CLUSTER_IC_SEND_WOULD_BLOCK:
+		switch (family) {
+		case GCS_BLOCK_SEND_FAMILY_REPLY:
+			counter = &ClusterGcsBlock->reply_send_queued_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_FORWARD:
+			counter = &ClusterGcsBlock->forward_send_queued_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_INVALIDATE:
+			counter = &ClusterGcsBlock->invalidate_send_queued_count;
+			break;
+		}
+		break;
+	case CLUSTER_IC_SEND_NOT_ADMITTED:
+		switch (family) {
+		case GCS_BLOCK_SEND_FAMILY_REPLY:
+			counter = &ClusterGcsBlock->reply_send_not_admitted_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_FORWARD:
+			counter = &ClusterGcsBlock->forward_send_not_admitted_count;
+			break;
+		case GCS_BLOCK_SEND_FAMILY_INVALIDATE:
+			counter = &ClusterGcsBlock->invalidate_send_not_admitted_count;
+			break;
+		}
+		break;
+	case CLUSTER_IC_SEND_DONE:
+	case CLUSTER_IC_SEND_HARD_ERROR:
+		break;
+	}
+
+	if (counter != NULL)
+		pg_atomic_fetch_add_u64(counter, 1);
+}
+
+/*
+ * gcs_block_forward_send_admitted — send one FORWARD frame and report
+ * whether the transport now owns it (DONE on the wire, or WOULD_BLOCK
+ * admitted into the per-peer FIFO — both deliver in order, so the
+ * caller's forward-in-flight state installs either way).
+ */
+static bool
+gcs_block_forward_send_admitted(int32 holder_node, const GcsBlockForwardPayload *fwd)
+{
+	ClusterICSendResult rc
+		= cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, fwd, sizeof(*fwd));
+
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, rc);
+	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
+}
+
 static void
 gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBlockReplyStatus status,
 					 XLogRecPtr page_lsn, const char *block_data)
@@ -3681,7 +3790,11 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 		pfree(buf);
 	}
 
-	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+	/* Round-5: an admitted reply (WOULD_BLOCK) is a sent reply — the
+	 * transport owns the copy and delivers it in order. */
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);
+	if ((rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+		&& ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 }
 
@@ -3769,7 +3882,9 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 		memcpy(block_data, entry->block_data, GCS_BLOCK_DATA_SIZE);
 	/* else: block_data already zeroed by palloc0 */
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total);
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total));
 	pfree(buf);
 }
 
@@ -4140,11 +4255,15 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 			}
 
-			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-										 sizeof(fwd))
-				== CLUSTER_IC_SEND_DONE) {
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->forward_replay_count, 1);
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+			{
+				ClusterICSendResult fwd_rc = cluster_ic_send_envelope(
+					PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd, sizeof(fwd));
+
+				cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, fwd_rc);
+				if (fwd_rc == CLUSTER_IC_SEND_DONE || fwd_rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->forward_replay_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+				}
 			}
 		}
 		return;
@@ -4337,17 +4456,31 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 
 					/*
 					 * The image is already captured (copy_block_for_gcs succeeded
-					 * above) BEFORE this drop.  The drop's bool is intentionally
-					 * ignored: it returns false ONLY when the buffer is not validly
-					 * resident (BufTable miss / tag-mismatch / !BM_VALID), i.e.
-					 * there is no local copy left to stale-flush — exactly the safe
-					 * precondition for granting.  (A resident-but-pinned buffer does
-					 * not return false; it makes InvalidateBuffer wait — tracked
-					 * separately as the LMON pin-wait follow-up.)  So in every case
-					 * reachable here there is no stale copy when we hand X to the
-					 * requester.  Rule 8.A holds.
+					 * above) BEFORE this drop.  NOT_RESIDENT is fine: no local
+					 * copy left to stale-flush — exactly the safe precondition
+					 * for granting.
+					 *
+					 * GCS serve-stall round-5 (A2): PINNED no longer parks this
+					 * dispatch worker in InvalidateBuffer's pin-wait loop (the
+					 * old "LMON pin-wait follow-up").  Granting with a live
+					 * pinned copy would leave a stale local X resident (8.A),
+					 * so fail-closed with the retryable PENDING_X deny — the
+					 * requester's starvation backoff re-asks and the pin (its
+					 * holder is typically a backend waiting on a reply this
+					 * very worker delivers once unblocked) clears meanwhile.
+					 * Same dedup-entry release as every retryable deny: the
+					 * deny contract is "back off and retry, the retry
+					 * re-evaluates".
 					 */
-					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
+					if (cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn)
+						== CLUSTER_BUFMGR_GCS_DROP_PINNED) {
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count, 1);
+						cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
+						gcs_block_send_reply(req->sender_node, req,
+											 GCS_BLOCK_REPLY_DENIED_PENDING_X, InvalidXLogRecPtr,
+											 NULL);
+						return;
+					}
 					/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
 					 * conversion (inside the drop above) samples its
 					 * ship-SCN stamp BEFORE the grant reply leaves
@@ -4471,10 +4604,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					nudge.master_node = cluster_node_id;
 					nudge.transition_id = req->transition_id;
 					GcsBlockForwardPayloadSetBastNudge(&nudge);
-					if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, nudge_holder,
-												 &nudge, sizeof(nudge))
-						== CLUSTER_IC_SEND_DONE)
-						cluster_lever_e2_note_nudge_sent();
+					{
+						ClusterICSendResult nudge_rc = cluster_ic_send_envelope(
+							PGRAC_IC_MSG_GCS_BLOCK_FORWARD, nudge_holder, &nudge, sizeof(nudge));
+
+						cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD,
+															nudge_rc);
+						if (nudge_rc == CLUSTER_IC_SEND_DONE
+							|| nudge_rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+							cluster_lever_e2_note_nudge_sent();
+					}
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
@@ -4563,9 +4702,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
-				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, x_holder, &fwd,
-											 sizeof(fwd))
-					== CLUSTER_IC_SEND_DONE) {
+				if (gcs_block_forward_send_admitted(x_holder, &fwd)) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_forward_sent_count, 1);
 					/* HC111 / HC118:  do NOT switch master_holder.node_id /
 					 * x_holder_node here.  The current X holder retains its
@@ -4679,23 +4816,35 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				XLogRecPtr self_lsn = InvalidXLogRecPtr;
 				SCN self_scn = InvalidScn;
 
-				(void)cluster_bufmgr_invalidate_block_for_gcs(req->tag, PCM_LOCK_MODE_S, &self_lsn,
-															  &self_scn);
-				(void)cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_N_INVALIDATE,
-															cluster_node_id);
-				/* PGRAC: spec-6.12h D-h2 — the self-drop may have kept a Past
-				 * Image (D-h1 conversion inside the helper); master == self,
-				 * so record it on the authoritative PI bitmap directly (the
-				 * wire kept_pi ACK flag cannot self-deliver either). */
-				if (cluster_bufmgr_block_is_pi(req->tag))
-					cluster_pcm_lock_pi_holder_note(req->tag, cluster_node_id);
-				/* PGRAC: spec-6.12h D-h3a — ordering pin: this
-				 * self-conversion runs before the X grant is issued below,
-				 * and the grant envelope leaves this same node stamped
-				 * scn_current >= the ship-SCN stamp, so the upgrader's
-				 * observe puts every post-upgrade record strictly above the
-				 * boundary (cluster_pi_shadow.h proof item 2). */
-				holders_bm &= ~((uint32)1u << cluster_node_id);
+				/*
+				 * GCS serve-stall round-5 (A2): the self-drop is bounded now.
+				 * PINNED keeps our S bit SET (clearing it with the copy still
+				 * resident would let this node's readers keep serving a page
+				 * the grant machinery believes is gone — 8.A) and this deny
+				 * round replies PENDING_X below as before;  the requester's
+				 * retry re-attempts the self-drop once the pin clears.
+				 */
+				if (cluster_bufmgr_invalidate_block_for_gcs(req->tag, PCM_LOCK_MODE_S, &self_lsn,
+															&self_scn)
+					== CLUSTER_BUFMGR_GCS_DROP_PINNED) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count, 1);
+				} else {
+					(void)cluster_pcm_lock_apply_gcs_transition(
+						req->tag, PCM_TRANS_S_TO_N_INVALIDATE, cluster_node_id);
+					/* PGRAC: spec-6.12h D-h2 — the self-drop may have kept a Past
+					 * Image (D-h1 conversion inside the helper); master == self,
+					 * so record it on the authoritative PI bitmap directly (the
+					 * wire kept_pi ACK flag cannot self-deliver either). */
+					if (cluster_bufmgr_block_is_pi(req->tag))
+						cluster_pcm_lock_pi_holder_note(req->tag, cluster_node_id);
+					/* PGRAC: spec-6.12h D-h3a — ordering pin: this
+					 * self-conversion runs before the X grant is issued below,
+					 * and the grant envelope leaves this same node stamped
+					 * scn_current >= the ship-SCN stamp, so the upgrader's
+					 * observe puts every post-upgrade record strictly above the
+					 * boundary (cluster_pi_shadow.h proof item 2). */
+					holders_bm &= ~((uint32)1u << cluster_node_id);
+				}
 			}
 
 			if (holders_bm != 0) {
@@ -4951,9 +5100,7 @@ x_path_skipped:
 				else
 					cluster_lever_a_note_fwd_oneshot();
 
-				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-											 sizeof(fwd))
-					== CLUSTER_IC_SEND_DONE) {
+				if (gcs_block_forward_send_admitted(holder_node, &fwd)) {
 					GcsBlockReplyHeader fwd_hdr;
 
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
@@ -5021,9 +5168,7 @@ x_path_skipped:
 			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 				&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
-			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
-										 sizeof(fwd))
-				== CLUSTER_IC_SEND_DONE) {
+			if (gcs_block_forward_send_admitted(holder_node, &fwd)) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->s_holders_bitmap_redirect_count, 1);
 
@@ -5263,7 +5408,10 @@ build_and_send_reply: {
 											   total);
 		}
 
-		if (send_rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+		/* Round-5: an admitted reply (WOULD_BLOCK) is a sent reply. */
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
+		if ((send_rc == CLUSTER_IC_SEND_DONE || send_rc == CLUSTER_IC_SEND_WOULD_BLOCK)
+			&& ClusterGcsBlock != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
 			gcs_block_note_live_sge_send();
@@ -5845,8 +5993,10 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 	deny_hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 	GcsBlockReplyHeaderSetForwardingMasterNode(deny_hdr, fwd->master_node);
 	deny_hdr->checksum = cluster_gcs_block_compute_checksum(deny_buf + sizeof(GcsBlockReplyHeader));
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node,
-								   deny_buf, deny_total);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+										cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+																 fwd->original_requester_node,
+																 deny_buf, deny_total));
 	pfree(deny_buf);
 }
 
@@ -6230,10 +6380,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 						 * for this tag (the master is node1), so there is no local
 						 * GRD state to transition — clearing the BufferDesc
 						 * pcm_state to N inside the helper is the full release.
-						 * The drop's bool is intentionally ignored: false = buffer
-						 * not validly resident (no stale copy); the image was
-						 * already shipped into the reply above (Rule 8.A; same
-						 * reasoning as the path-B drop site).
+						 * NOT_RESIDENT is fine: no stale copy left, the image
+						 * was already shipped into the reply above (Rule 8.A;
+						 * same reasoning as the path-B drop site).  PINNED is
+						 * handled below (round-5 A2 retryable deny).
 						 */
 					/*
 					 * PGRAC: spec-5.2a D4 — a clean (sequence) eligible page has
@@ -6244,23 +6394,40 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					 * storage is already current for the stale-holder
 					 * storage-fallback); drop_no_wire's XLogFlush of the
 					 * already-flushed page_lsn satisfies WAL-before-share.  A
-					 * clean transfer increments clean_page_xfer_count too. */
-					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
-					/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
-					 * conversion (inside the drop above) precedes the reply
-					 * send at the bottom of this handler
-					 * (cluster_ic_rdma_send_envelope_sge), so the requester
-					 * observes an envelope stamped at-or-above the ship-SCN
-					 * boundary (cluster_pi_shadow.h proof item 2). */
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
-					if (GcsBlockForwardPayloadIsCleanEligible(fwd))
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
-					/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
-					 * outgoing copy as a Past Image, report it to the master
-					 * (unsolicited PI_KEPT ride; fire-and-forget — a lost note
-					 * only leaves the PI untracked, fail-safe lingering). */
-					if (cluster_bufmgr_block_is_pi(fwd->tag))
-						gcs_block_pi_kept_note_send(fwd->tag, fwd->master_node);
+					 * clean transfer increments clean_page_xfer_count too.
+					 *
+					 * GCS serve-stall round-5 (A2): the drop is bounded.  On
+					 * PINNED we must NOT ship X while a live pinned copy stays
+					 * resident here (stale local X, 8.A) — flip the reply to
+					 * the HC105 retryable deny (the requester's retransmit
+					 * budget covers recovery, exactly like the evict race) and
+					 * keep our X untouched.  NOT_RESIDENT still grants: no
+					 * copy left to stale-flush.
+					 */
+					if (cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn)
+						== CLUSTER_BUFMGR_GCS_DROP_PINNED) {
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->drop_pinned_deny_count, 1);
+						/* undo the from-holder ship count taken with the
+						 * grant status above — this reply is a deny now */
+						pg_atomic_fetch_sub_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+						hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+					} else {
+						/* PGRAC: spec-6.12h D-h3a — ordering pin: the PI
+						 * conversion (inside the drop above) precedes the reply
+						 * send at the bottom of this handler
+						 * (cluster_ic_rdma_send_envelope_sge), so the requester
+						 * observes an envelope stamped at-or-above the ship-SCN
+						 * boundary (cluster_pi_shadow.h proof item 2). */
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
+						if (GcsBlockForwardPayloadIsCleanEligible(fwd))
+							pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
+						/* PGRAC: spec-6.12h D-h2 — if the D-h1 conversion kept our
+						 * outgoing copy as a Past Image, report it to the master
+						 * (unsolicited PI_KEPT ride; fire-and-forget — a lost note
+						 * only leaves the PI untracked, fail-safe lingering). */
+						if (cluster_bufmgr_block_is_pi(fwd->tag))
+							gcs_block_pi_kept_note_send(fwd->tag, fwd->master_node);
+					}
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
@@ -6331,6 +6498,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		sge[1].release_arg = block_payload_release_arg;
 		send_rc = cluster_ic_rdma_send_envelope_sge(
 			PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node, sge, lengthof(sge), total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
 		if (send_rc == CLUSTER_IC_SEND_DONE && live_sge_payload)
 			gcs_block_note_live_sge_send();
 		block_payload_release_cb = NULL;
@@ -6339,8 +6507,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node,
-									   buf, total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+																	 fwd->original_requester_node,
+																	 buf, total));
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
@@ -6599,8 +6769,10 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 				(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
 															   (uint32)n, &inv, sizeof(inv));
 			else
-				(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
-											   sizeof(inv));
+				cluster_gcs_block_note_send_outcome(
+					GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+					cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv,
+											 sizeof(inv)));
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 		}
 
@@ -6698,7 +6870,9 @@ gcs_block_broadcast_invalidate_nowait(const GcsBlockRequestPayload *req, uint32 
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
 		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
 			continue;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		cluster_gcs_block_note_send_outcome(
+			GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+			cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv)));
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 	}
 }
@@ -6816,8 +6990,10 @@ gcs_block_pi_kept_note_send(BufferTag tag, int32 master_node)
 		note.sender_node = cluster_node_id;
 		note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE;
 		note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
-									   sizeof(note));
+		cluster_gcs_block_note_send_outcome(
+			GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+			cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
+									 sizeof(note)));
 	}
 }
 
@@ -6842,8 +7018,9 @@ cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 target_node)
 	inv.invalidating_for_x_node = 0;
 	inv.reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD;
 	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, target_node, &inv,
-								   sizeof(inv));
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+										cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+																 target_node, &inv, sizeof(inv)));
 }
 
 /*
@@ -6924,8 +7101,10 @@ cluster_gcs_block_pi_discard_drain(void)
 			note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE;
 			GcsBlockInvalidateAckPayloadSetPageScn(&note, page_scn);
 			note.checksum = gcs_block_compute_invalidate_ack_checksum(&note);
-			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node,
-										   &note, sizeof(note));
+			cluster_gcs_block_note_send_outcome(
+				GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+				cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, master_node, &note,
+										 sizeof(note)));
 		}
 	}
 }
@@ -7040,21 +7219,223 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
  *	  - InvalidateBuffer
  *	then applies PCM transition (S→N invalidate or X→N downgrade) and
  *	replies ACK msg_type 18 to master.
+ *
+ *	GCS serve-stall round-5 (A2): the drop is BOUNDED now.  A foreign
+ *	pin no longer parks this dispatch worker in InvalidateBuffer's
+ *	pin-wait loop (the measured 33-96s stall: the pin's holder is
+ *	typically a backend waiting on a GCS reply only this worker can
+ *	deliver — a circular wait the reply-wait timeout alone resolved).
+ *	A PINNED drop parks the directive in a bounded per-worker lot and
+ *	the LMS loop retries it each pass;  the ACK is sent only when the
+ *	drop really happened (deny direction preserved — the master's ack
+ *	budget fail-closes if the pin outlives it, exactly as an unreachable
+ *	holder would).
  * ============================================================ */
-extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
-													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 
-static void
-cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
+/*
+ * gcs_block_invalidate_execute — apply one INVALIDATE directive + ACK.
+ *
+ *	Returns true when the directive reached a terminal outcome (ACK
+ *	sent);  false when the local copy was PINNED — nothing was changed,
+ *	no ACK was sent, and the caller parks the directive for retry.
+ */
+static bool
+gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 {
-	const GcsBlockInvalidatePayload *inv = (const GcsBlockInvalidatePayload *)payload;
 	GcsBlockInvalidateAckPayload ack;
 	PcmLockMode pre_state;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	SCN page_scn = InvalidScn; /* spec-2.41 D3 — ACK SCN carrier */
 	uint8 ack_status = 0;	   /* OK */
 	bool kept_pi = false;	   /* spec-6.12h D-h2 — drop converted to a PI */
-	uint64 current_epoch;
+	uint64 current_epoch = cluster_epoch_get_current();
+
+	if (inv->epoch < current_epoch) {
+		ack_status = 1; /* epoch_stale */
+		goto send_ack;
+	}
+
+	/*
+	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — this handler runs on the
+	 * HOLDER, so the residency question must be answered by the node-local
+	 * buffer mirror, NOT cluster_pcm_lock_query: that reads the local MASTER
+	 * hash table, which on a non-master holder has no entry and always
+	 * answered N — every remote-holder INVALIDATE short-circuited to
+	 * "already invalidated" while the cached S copy silently survived
+	 * (Rule 8.A stale-S; masked pre-㉕ by the AD-015 phantom-harness
+	 * divergence deferral, exposed by the ㉕ remote-downgrade S caches).
+	 */
+	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
+	if (pre_state == PCM_LOCK_MODE_N) {
+		ack_status = 2; /* already_invalidated */
+		goto send_ack;
+	}
+
+	/*
+	 * PGRAC: spec-4.7a invariant note (D2/D4).  With hold-until-revoked X
+	 * (D2), pre_state can now be X here, which would drive an X->N downgrade
+	 * whose remote release path (cluster_pcm_lock_release_buffer_for_eviction
+	 * -> send_transition_and_wait) blocks on the very master that is
+	 * invalidating us.  In 4.7a scope that case is UNREACHABLE: D4 bounded-
+	 * fail-closes the only trigger that could make a peer acquire X while this
+	 * node holds X (cross-node writer transfer), so a live X holder never
+	 * receives an INVALIDATE; the S->X grant path uses S_TO_N_INVALIDATE on S
+	 * holders only.  When the deferred writer-transfer (spec-2.36 / 4.7 /
+	 * Stage 6) lands, this X branch goes live and must be hardened against the
+	 * release-to-the-invalidating-master round-trip (codereview P2-1).
+	 */
+	switch (cluster_bufmgr_invalidate_block_for_gcs(inv->tag, pre_state, &page_lsn, &page_scn)) {
+	case CLUSTER_BUFMGR_GCS_DROP_DROPPED: {
+		PcmLockTransition trans = (pre_state == PCM_LOCK_MODE_X) ? PCM_TRANS_X_TO_N_DOWNGRADE
+																 : PCM_TRANS_S_TO_N_INVALIDATE;
+		(void)cluster_pcm_lock_apply_gcs_transition(inv->tag, trans, cluster_node_id);
+
+		/* spec-2.41 D3: the dropping page's pd_block_scn is carried back in the
+		 * ACK (replacing the spec-2.37 page_lsn carrier) and applied to the
+		 * master's detector SCN watermark by the ACK handler.  Do not advance
+		 * the holder-local HTAB: the master GrdEntry is the authoritative owner. */
+
+		/* PGRAC: spec-6.12h D-h2 — the D-h1 conversion may have kept our
+		 * dropped copy as a Past Image; flag it on the solicited ACK so the
+		 * master records this node on the PI holder bitmap. */
+		kept_pi = cluster_bufmgr_block_is_pi(inv->tag);
+
+		/* PGRAC: spec-6.12h D-h3a — ordering pin (two-hop chain): the PI
+		 * conversion (inside the invalidate above) samples its ship-SCN
+		 * stamp before this ACK is sent below; the master observes the ACK
+		 * envelope and only then clears our holder bit and grants X, and
+		 * the upgrader observes the grant envelope — each observe is a
+		 * strict Lamport bump (max+1), so every post-upgrade record sits
+		 * strictly above the boundary (cluster_pi_shadow.h proof item 2). */
+		break;
+	}
+	case CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT:
+		ack_status = 2; /* race: not resident */
+		break;
+	case CLUSTER_BUFMGR_GCS_DROP_PINNED:
+		/* GCS serve-stall round-5 (A2): nothing changed, no ACK — the
+		 * caller parks the directive and the LMS loop retries it. */
+		return false;
+	}
+
+send_ack:
+	memset(&ack, 0, sizeof(ack));
+	ack.request_id = inv->request_id;
+	ack.epoch = inv->epoch;
+	ack.tag = inv->tag;
+	ack.sender_node = cluster_node_id;
+	ack.ack_status = ack_status;
+	/* PGRAC: spec-6.12h D-h2 — kept-PI report ride (checksum-covered). */
+	ack.reserved_0[0] = kept_pi ? (uint8)GCS_BLOCK_INVALIDATE_ACK_KEPT_PI : (uint8)0;
+	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
+	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
+
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
+								 sizeof(ack)));
+	return true;
+}
+
+/*
+ * GCS serve-stall round-5 (A2) — bounded per-worker parking lot for
+ * PINNED invalidate directives.
+ *
+ *	Process-local (each LMS worker process owns its own lot — the shard
+ *	router already pins a tag to exactly one worker).  Entries are
+ *	deduped by tag (a master retransmit replaces the parked directive)
+ *	and expire at the master's own ack budget — an expired entry is
+ *	dropped WITHOUT an ACK, which is exactly the unreachable-holder
+ *	shape the master's timeout machinery already fail-closes (counted,
+ *	never silent).
+ */
+#define GCS_BLOCK_INVALIDATE_PARK_MAX 64
+
+typedef struct GcsBlockParkedInvalidate {
+	bool in_use;
+	GcsBlockInvalidatePayload inv;
+	TimestampTz deadline;
+} GcsBlockParkedInvalidate;
+
+static GcsBlockParkedInvalidate gcs_block_invalidate_park[GCS_BLOCK_INVALIDATE_PARK_MAX];
+
+static void
+gcs_block_invalidate_park_add(const GcsBlockInvalidatePayload *inv)
+{
+	int free_slot = -1;
+	int i;
+	TimestampTz deadline
+		= GetCurrentTimestamp()
+		  + (TimestampTz)cluster_gcs_block_invalidate_ack_timeout_ms * (TimestampTz)1000;
+
+	for (i = 0; i < GCS_BLOCK_INVALIDATE_PARK_MAX; i++) {
+		if (gcs_block_invalidate_park[i].in_use) {
+			if (BufferTagsEqual(&gcs_block_invalidate_park[i].inv.tag, &inv->tag)) {
+				/* master retransmit — the newer directive replaces ours */
+				gcs_block_invalidate_park[i].inv = *inv;
+				gcs_block_invalidate_park[i].deadline = deadline;
+				return;
+			}
+		} else if (free_slot < 0)
+			free_slot = i;
+	}
+
+	if (free_slot < 0) {
+		static bool overflow_logged = false;
+
+		if (ClusterGcsBlock != NULL)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_park_overflow_count, 1);
+		if (!overflow_logged) {
+			overflow_logged = true;
+			ereport(LOG, (errmsg_internal("gcs block invalidate parking lot full; directive "
+										  "dropped (master ack budget fail-closes)")));
+		}
+		return;
+	}
+
+	gcs_block_invalidate_park[free_slot].in_use = true;
+	gcs_block_invalidate_park[free_slot].inv = *inv;
+	gcs_block_invalidate_park[free_slot].deadline = deadline;
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_parked_count, 1);
+}
+
+/*
+ * cluster_gcs_block_invalidate_park_tick — retry parked invalidates.
+ *
+ *	Called from the LMS worker loop each pass.  One bounded execute
+ *	attempt per parked directive;  success (or any terminal outcome)
+ *	frees the slot, a still-pinned entry stays until its deadline.
+ */
+void
+cluster_gcs_block_invalidate_park_tick(void)
+{
+	TimestampTz now = 0;
+	int i;
+
+	for (i = 0; i < GCS_BLOCK_INVALIDATE_PARK_MAX; i++) {
+		if (!gcs_block_invalidate_park[i].in_use)
+			continue;
+
+		if (gcs_block_invalidate_execute(&gcs_block_invalidate_park[i].inv)) {
+			gcs_block_invalidate_park[i].in_use = false;
+			continue;
+		}
+
+		if (now == 0)
+			now = GetCurrentTimestamp();
+		if (now >= gcs_block_invalidate_park[i].deadline) {
+			gcs_block_invalidate_park[i].in_use = false;
+			if (ClusterGcsBlock != NULL)
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_park_expired_count, 1);
+		}
+	}
+}
+
+static void
+cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
+{
+	const GcsBlockInvalidatePayload *inv = (const GcsBlockInvalidatePayload *)payload;
 
 	/* D16 inject — stall ack for timeout testing. */
 	CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-stall-ack");
@@ -7094,8 +7475,6 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		}
 	}
 
-	current_epoch = cluster_epoch_get_current();
-
 	/*
 	 * PGRAC: spec-6.12h D-h2 — PI_DISCARD directive ride.  Strictly drops a
 	 * BUF_TYPE_PI buffer (a live current copy is never touched — the strict
@@ -7105,85 +7484,16 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	 * reconfig epoch bump owns cross-generation hygiene.
 	 */
 	if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PI_DISCARD) {
-		if (inv->epoch == current_epoch)
+		if (inv->epoch == cluster_epoch_get_current())
 			cluster_lever_h_note_discard_result(cluster_bufmgr_discard_pi_block(inv->tag));
 		return;
 	}
 
-	if (inv->epoch < current_epoch) {
-		ack_status = 1; /* epoch_stale */
-		goto send_ack;
-	}
-
-	/*
-	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — this handler runs on the
-	 * HOLDER, so the residency question must be answered by the node-local
-	 * buffer mirror, NOT cluster_pcm_lock_query: that reads the local MASTER
-	 * hash table, which on a non-master holder has no entry and always
-	 * answered N — every remote-holder INVALIDATE short-circuited to
-	 * "already invalidated" while the cached S copy silently survived
-	 * (Rule 8.A stale-S; masked pre-㉕ by the AD-015 phantom-harness
-	 * divergence deferral, exposed by the ㉕ remote-downgrade S caches).
-	 */
-	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
-	if (pre_state == PCM_LOCK_MODE_N) {
-		ack_status = 2; /* already_invalidated */
-		goto send_ack;
-	}
-
-	/*
-	 * PGRAC: spec-4.7a invariant note (D2/D4).  With hold-until-revoked X
-	 * (D2), pre_state can now be X here, which would drive an X->N downgrade
-	 * whose remote release path (cluster_pcm_lock_release_buffer_for_eviction
-	 * -> send_transition_and_wait) blocks on the very master that is
-	 * invalidating us.  In 4.7a scope that case is UNREACHABLE: D4 bounded-
-	 * fail-closes the only trigger that could make a peer acquire X while this
-	 * node holds X (cross-node writer transfer), so a live X holder never
-	 * receives an INVALIDATE; the S->X grant path uses S_TO_N_INVALIDATE on S
-	 * holders only.  When the deferred writer-transfer (spec-2.36 / 4.7 /
-	 * Stage 6) lands, this X branch goes live and must be hardened against the
-	 * release-to-the-invalidating-master round-trip (codereview P2-1).
-	 */
-	if (cluster_bufmgr_invalidate_block_for_gcs(inv->tag, pre_state, &page_lsn, &page_scn)) {
-		PcmLockTransition trans = (pre_state == PCM_LOCK_MODE_X) ? PCM_TRANS_X_TO_N_DOWNGRADE
-																 : PCM_TRANS_S_TO_N_INVALIDATE;
-		(void)cluster_pcm_lock_apply_gcs_transition(inv->tag, trans, cluster_node_id);
-
-		/* spec-2.41 D3: the dropping page's pd_block_scn is carried back in the
-		 * ACK (replacing the spec-2.37 page_lsn carrier) and applied to the
-		 * master's detector SCN watermark by the ACK handler.  Do not advance
-		 * the holder-local HTAB: the master GrdEntry is the authoritative owner. */
-
-		/* PGRAC: spec-6.12h D-h2 — the D-h1 conversion may have kept our
-		 * dropped copy as a Past Image; flag it on the solicited ACK so the
-		 * master records this node on the PI holder bitmap. */
-		kept_pi = cluster_bufmgr_block_is_pi(inv->tag);
-
-		/* PGRAC: spec-6.12h D-h3a — ordering pin (two-hop chain): the PI
-		 * conversion (inside the invalidate above) samples its ship-SCN
-		 * stamp before this ACK is sent below; the master observes the ACK
-		 * envelope and only then clears our holder bit and grants X, and
-		 * the upgrader observes the grant envelope — each observe is a
-		 * strict Lamport bump (max+1), so every post-upgrade record sits
-		 * strictly above the boundary (cluster_pi_shadow.h proof item 2). */
-	} else {
-		ack_status = 2; /* race: not resident */
-	}
-
-send_ack:
-	memset(&ack, 0, sizeof(ack));
-	ack.request_id = inv->request_id;
-	ack.epoch = inv->epoch;
-	ack.tag = inv->tag;
-	ack.sender_node = cluster_node_id;
-	ack.ack_status = ack_status;
-	/* PGRAC: spec-6.12h D-h2 — kept-PI report ride (checksum-covered). */
-	ack.reserved_0[0] = kept_pi ? (uint8)GCS_BLOCK_INVALIDATE_ACK_KEPT_PI : (uint8)0;
-	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
-	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
-
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
-								   sizeof(ack));
+	/* GCS serve-stall round-5 (A2): a PINNED local copy parks the
+	 * directive instead of spinning the dispatch pump (see the header
+	 * note above). */
+	if (!gcs_block_invalidate_execute(inv))
+		gcs_block_invalidate_park_add(inv);
 }
 
 
@@ -7420,7 +7730,9 @@ cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page
 	p.held_mode = held_mode;
 	p.checksum = gcs_block_compute_redeclare_checksum(&p);
 
-	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p));
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p)));
 	if (ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 1);
 }
@@ -7666,6 +7978,74 @@ uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->done_enqueue_drop_count) : 0;
+}
+
+/* PGRAC: GCS serve-stall round-5 — 6 per-family send admission accessors. */
+uint64
+cluster_gcs_get_reply_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->reply_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_reply_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->reply_send_not_admitted_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_forward_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->forward_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_forward_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->forward_send_not_admitted_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_send_queued_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_send_queued_count) : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_send_not_admitted_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_send_not_admitted_count)
+			   : 0;
+}
+
+/* PGRAC: GCS serve-stall round-5 A2 — 4 bounded-drop accessors. */
+uint64
+cluster_gcs_get_invalidate_parked_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_parked_count) : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_park_expired_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_park_expired_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_invalidate_park_overflow_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->invalidate_park_overflow_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_drop_pinned_deny_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->drop_pinned_deny_count) : 0;
 }
 
 /* PGRAC: GCS-race round-4c FUNC-1 — 3 storage-fallback verify accessors. */

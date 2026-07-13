@@ -509,25 +509,37 @@ cluster_grd_outbound_lmon_drain_send(void)
 {
 	ClusterGrdOutboundSlot slot;
 	int sent = 0;
+	int scanned = 0;
+	bool peer_blocked[CLUSTER_MAX_NODES] = { 0 };
 
 	if (cluster_grd_outbound_state == NULL || cluster_grd_outbound_lock == NULL)
 		return 0;
 
 	(void)cluster_grd_outbound_drain_dirty_lists();
 
-	while (sent < 64 && cluster_grd_outbound_dequeue(&slot)) {
+	/*
+	 * GCS serve-stall round-5 — four-state send ownership contract (see
+	 * ClusterICSendResult).  WOULD_BLOCK now always means the transport
+	 * ADMITTED the frame (tier1 per-peer FIFO), so the old
+	 * "WOULD_BLOCK && peer_has_pending" accepted/pending probe and the
+	 * pre-send pending check are gone;  NOT_ADMITTED is an explicit
+	 * refusal — requeue the slot (its origin-class queue) and stop
+	 * handing this peer frames for the rest of the batch, WITHOUT
+	 * breaking the batch: one mid-HELLO peer must not head-of-line
+	 * block GCS_REQUEST traffic to every other master (this ring is the
+	 * backend REQUEST staging path, gcs.c owner-plane rule).  scanned
+	 * bounds the batch so requeued frames cannot spin it forever.
+	 */
+	while (sent < 64 && scanned < 64 && cluster_grd_outbound_dequeue(&slot)) {
 		ClusterICSendResult rc;
 
-		/*
-		 * If tier1 already has a pending partial frame for this peer, do not
-		 * hand it a new frame.  Requeue the current slot so the byte stream is
-		 * not duplicated or interleaved.
-		 */
-		if (cluster_ic_mux_peer_has_pending_outbound((int32)slot.dest_node_id)) {
+		scanned++;
+
+		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
 			LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 			requeue_slot(&slot);
 			LWLockRelease(cluster_grd_outbound_lock);
-			break;
+			continue;
 		}
 
 		if (slot.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
@@ -537,21 +549,23 @@ cluster_grd_outbound_lmon_drain_send(void)
 
 		rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
 									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);
-		if (rc == CLUSTER_IC_SEND_DONE
-			|| (rc == CLUSTER_IC_SEND_WOULD_BLOCK
-				&& cluster_ic_mux_peer_has_pending_outbound((int32)slot.dest_node_id))) {
+		switch (rc) {
+		case CLUSTER_IC_SEND_DONE:
+		case CLUSTER_IC_SEND_WOULD_BLOCK:
+			/* On the wire or admitted (transport owns a copy). */
 			sent++;
-			continue;
-		}
-
-		if (rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
+			break;
+		case CLUSTER_IC_SEND_NOT_ADMITTED:
+			if (slot.dest_node_id < CLUSTER_MAX_NODES)
+				peer_blocked[slot.dest_node_id] = true;
 			LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 			requeue_slot(&slot);
 			LWLockRelease(cluster_grd_outbound_lock);
 			break;
+		case CLUSTER_IC_SEND_HARD_ERROR:
+			/* peer-down style failures are retried by higher layers. */
+			break;
 		}
-
-		/* HARD_ERROR/peer-down style failures are retried by higher layers. */
 	}
 
 	return sent;

@@ -14,9 +14,11 @@
  *
  *	  Ordering note (INV-7.2-DATA-FIFO): per-peer DATA frames keep a
  *	  single ordered stream because (a) this ring is FIFO, (b) LMS is
- *	  its only consumer, and (c) LMS sends on per-peer sockets with the
- *	  tier1 partial-frame buffer (WOULD_BLOCK requeues at the head
- *	  before anything newer is sent to that peer).
+ *	  its only consumer, and (c) tier1 owns per-peer ordering below us —
+ *	  an ADMITTED frame (send result DONE or WOULD_BLOCK) is delivered
+ *	  in submission order by the tier1 outbound FIFO, and a REFUSED
+ *	  frame (NOT_ADMITTED) is retained here ahead of anything newer for
+ *	  the same peer (GCS serve-stall round-5 ownership contract).
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -172,31 +174,36 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 	return true;
 }
 
-/* Head-requeue for WOULD_BLOCK (preserves this worker's per-peer FIFO). */
-static void
-lms_outbound_requeue_head(int worker_id, const ClusterLmsOutboundSlot *slot)
-{
-	ClusterLmsOutboundState *ring = OB_RING(worker_id);
-	LWLock *lock = OB_LOCK(worker_id);
-
-	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count < PGRAC_LMS_OUTBOUND_CAPACITY) {
-		ring->tail = (ring->tail + PGRAC_LMS_OUTBOUND_CAPACITY - 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
-		ring->ring[ring->tail] = *slot;
-		ring->count++;
-	}
-	/* full → drop;  fire-and-forget layers self-heal via retransmit */
-	LWLockRelease(lock);
-}
-
 /*
  * cluster_lms_outbound_drain_send — one worker drains + sends its own ring.
  *
- *	Bounded batch per call.  WOULD_BLOCK requeues at the HEAD so the
- *	per-peer byte stream is never reordered (INV-7.2-DATA-FIFO).  worker c
- *	only ever touches rings[c], so the single-consumer-single-tail
- *	guarantee holds per worker (spec-7.3 D4).  The GCS block REQUEST
- *	pre-send hook (direct-land arm) rides along with the DATA consumer.
+ *	Bounded batch per call.  worker c only ever touches rings[c], so the
+ *	single-consumer-single-tail guarantee holds per worker (spec-7.3 D4).
+ *	The GCS block REQUEST pre-send hook (direct-land arm) rides along
+ *	with the DATA consumer.
+ *
+ *	GCS serve-stall round-5 — the drain follows the four-state send
+ *	ownership contract (see ClusterICSendResult):
+ *
+ *	  DONE / WOULD_BLOCK  frame is on the wire or ADMITTED into tier1's
+ *	                      per-peer FIFO;  the slot is consumed and the
+ *	                      frame is NEVER resubmitted.  (Pre-fix code
+ *	                      head-requeued on WOULD_BLOCK — a duplicate
+ *	                      frame on the per-peer stream, because tier1
+ *	                      had usually retained the original.)
+ *	  NOT_ADMITTED        transport refused;  the frame is RETAINED and
+ *	                      the peer is marked blocked for the rest of the
+ *	                      batch so its later frames keep per-peer order
+ *	                      behind it.  Other peers keep flowing — one
+ *	                      backpressured peer must not head-of-line block
+ *	                      the worker ring (pre-fix code broke the batch).
+ *	  HARD_ERROR          peer down — drop;  requesters retry
+ *	                      fail-closed.
+ *
+ *	Retained frames go back at the HEAD in original order after the
+ *	batch.  Producers may have refilled the ring meanwhile;  a retained
+ *	frame that no longer fits is counted (requeue_drop, expected 0) —
+ *	never silently discarded.
  */
 int
 cluster_lms_outbound_drain_send(int worker_id)
@@ -204,6 +211,10 @@ cluster_lms_outbound_drain_send(int worker_id)
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	int sent = 0;
+	int scanned = 0;
+	ClusterLmsOutboundSlot retained[64];
+	int n_retained = 0;
+	bool peer_blocked[CLUSTER_MAX_NODES] = { 0 };
 
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return 0;
@@ -215,7 +226,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 
-	while (sent < 64) {
+	while (scanned < 64) {
 		ClusterLmsOutboundSlot slot;
 		ClusterICSendResult rc;
 		bool got = false;
@@ -230,6 +241,15 @@ cluster_lms_outbound_drain_send(int worker_id)
 		LWLockRelease(lock);
 		if (!got)
 			break;
+		scanned++;
+
+		/* A peer that refused a frame this batch keeps its later frames
+		 * queued BEHIND the refused one (per-peer order). */
+		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
+			Assert(n_retained < (int)lengthof(retained));
+			retained[n_retained++] = slot;
+			continue;
+		}
 
 		if (slot.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 			&& slot.payload_len == sizeof(GcsBlockRequestPayload))
@@ -238,15 +258,45 @@ cluster_lms_outbound_drain_send(int worker_id)
 
 		rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
 									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);
-		if (rc == CLUSTER_IC_SEND_DONE) {
+		switch (rc) {
+		case CLUSTER_IC_SEND_DONE:
+		case CLUSTER_IC_SEND_WOULD_BLOCK:
+			/* On the wire or admitted (transport owns a copy). */
 			sent++;
-			continue;
-		}
-		if (rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
-			lms_outbound_requeue_head(worker_id, &slot);
+			break;
+		case CLUSTER_IC_SEND_NOT_ADMITTED:
+			if (slot.dest_node_id < CLUSTER_MAX_NODES)
+				peer_blocked[slot.dest_node_id] = true;
+			Assert(n_retained < (int)lengthof(retained));
+			retained[n_retained++] = slot;
+			cluster_lms_obs_note_outbound_not_admitted(worker_id);
+			break;
+		case CLUSTER_IC_SEND_HARD_ERROR:
+			/* peer down — drop;  requesters retry fail-closed. */
 			break;
 		}
-		/* HARD_ERROR: peer down — drop;  requesters retry fail-closed. */
+	}
+
+	/* Put retained frames back at the head, original order preserved
+	 * (reverse-order head pushes).  count can only have grown from
+	 * producers since the dequeues above, so a full ring is possible:
+	 * count the drop — the retransmit machinery self-heals, but the S3
+	 * gate treats a nonzero delta as a capacity red flag. */
+	if (n_retained > 0) {
+		int i;
+
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		for (i = n_retained - 1; i >= 0; i--) {
+			if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+				cluster_lms_obs_note_outbound_requeue_drop(worker_id);
+				continue;
+			}
+			ring->tail
+				= (ring->tail + PGRAC_LMS_OUTBOUND_CAPACITY - 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+			ring->ring[ring->tail] = retained[i];
+			ring->count++;
+		}
+		LWLockRelease(lock);
 	}
 
 	return sent;

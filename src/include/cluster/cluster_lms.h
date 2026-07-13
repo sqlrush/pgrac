@@ -306,6 +306,21 @@ typedef struct ClusterLmsSharedState {
 	pg_atomic_uint64 worker_conn_reset_count[CLUSTER_LMS_MAX_WORKERS];
 	pg_atomic_uint64 worker_inline_serve_count[CLUSTER_LMS_MAX_WORKERS];
 	pg_atomic_uint64 worker_serve_hist[CLUSTER_LMS_MAX_WORKERS][CLUSTER_LMS_SERVE_HIST_BUCKETS];
+
+	/*
+	 * GCS serve-stall round-5 — outbound-ring drain honesty counters (×N).
+	 *
+	 *	worker_outbound_not_admitted_count:  frames the transport refused
+	 *	    (CLUSTER_IC_SEND_NOT_ADMITTED — peer mid-HELLO or tier1 FIFO
+	 *	    at capacity);  the drain retained them in per-peer order.
+	 *	worker_outbound_requeue_drop_count:  retained frames LOST because
+	 *	    producers refilled the ring during the drain batch.  Expected
+	 *	    to stay 0;  requesters self-heal via retransmit, but a nonzero
+	 *	    value is a capacity red flag (the S3 gate asserts on the
+	 *	    delta).
+	 */
+	pg_atomic_uint64 worker_outbound_not_admitted_count[CLUSTER_LMS_MAX_WORKERS];
+	pg_atomic_uint64 worker_outbound_requeue_drop_count[CLUSTER_LMS_MAX_WORKERS];
 } ClusterLmsSharedState;
 
 
@@ -451,6 +466,15 @@ extern uint64 cluster_lms_obs_get_conn_reset_count(int worker_id);
 extern uint64 cluster_lms_obs_get_inline_serve_count(int worker_id);
 extern uint64 cluster_lms_obs_get_serve_hist(int worker_id, int bucket);
 extern uint64 cluster_lms_obs_serve_hist_bound_us(int bucket);
+
+/* GCS serve-stall round-5 — outbound-ring drain honesty counters (the
+ * note_* bumpers take the DRAINING worker's ring id explicitly because
+ * the drain runs before lms_obs_my_slot resolution is meaningful for a
+ * requeue-drop;  get_* readers follow the -1 = pool aggregate idiom). */
+extern void cluster_lms_obs_note_outbound_not_admitted(int worker_id);
+extern void cluster_lms_obs_note_outbound_requeue_drop(int worker_id);
+extern uint64 cluster_lms_obs_get_outbound_not_admitted(int worker_id);
+extern uint64 cluster_lms_obs_get_outbound_requeue_drop(int worker_id);
 
 /* spec-7.3 D8 (Q8) — apply cluster.lms_nice to the calling LMS process
  * (setpriority, best-effort;  0 = leave the inherited priority alone). */
