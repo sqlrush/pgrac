@@ -608,6 +608,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-pcm-writer-cached-x-stall" },
 	{ .name = "cluster-pcm-restore-aba-window" },
 	/*
+	 * cluster-pcm-grant-finalize-window (W3):
+	 *   Fires in LockBuffer AFTER a real X acquire installed the grant and
+	 *   BEFORE the finalize sets pcm_state=X, i.e. while pcm_state is still N
+	 *   and GRANT_PENDING is set.  SLEEP holds that window open so a peer's
+	 *   INVALIDATE for the same tag can arrive; without the GRANT_PENDING
+	 *   consult the holder treats N as already-invalidated and ACKs the
+	 *   in-flight grant away (double X holder).  Driven by the W3 RED.
+	 */
+	{ .name = "cluster-pcm-grant-finalize-window" },
+	/*
 	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
 	 *
 	 *	cluster-gcs-block-stale-ship:

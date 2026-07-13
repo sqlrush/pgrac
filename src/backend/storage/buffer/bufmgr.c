@@ -5719,6 +5719,16 @@ LockBuffer(Buffer buffer, int mode)
 		}
 		PG_END_TRY();
 
+		/*
+		 * PGRAC ownership-generation wave (W3) — grant-finalize window.  A real
+		 * X acquire has installed the grant but pcm_state is still N with
+		 * GRANT_PENDING set (finalize below flips it to X).  This inject holds
+		 * that window open so the RED can land a peer INVALIDATE and prove the
+		 * GRANT_PENDING consult parks it instead of acking the grant away.
+		 */
+		if (pcm_acquired && pcm_pending_set && pcm_mode == PCM_LOCK_MODE_X)
+			CLUSTER_INJECTION_POINT("cluster-pcm-grant-finalize-window");
+
 		if (pcm_acquired)
 		{
 			/*
@@ -8108,6 +8118,46 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
 	LWLockRelease(partition_lock);
 
 	return mode;
+}
+
+/*
+ * PGRAC ownership-generation wave (W3) — is a grant for this tag in flight to
+ * install on THIS node?  Between the install (inside acquire, under its own
+ * content lock) and the LockBuffer finalize, pcm_state is still N but the
+ * GRANT_PENDING flag is set.  An invalidate handler that sees N must consult
+ * this before treating the block as already-invalidated: acking it away would
+ * strand a stale grant after finalize.  Same by-tag lookup as
+ * cluster_bufmgr_block_pcm_state; returns false when the block is not resident.
+ */
+bool
+cluster_bufmgr_block_grant_pending(BufferTag tag)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	bool		pending = false;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0)
+		pending = (cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_GRANT_PENDING) != 0;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	return pending;
 }
 
 /* ========================================================================

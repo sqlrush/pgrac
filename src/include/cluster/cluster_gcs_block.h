@@ -1831,6 +1831,10 @@ extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRe
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
+/* PGRAC ownership-generation wave (W3): is a grant for this tag in flight to
+ * install (GRANT_PENDING) on this node?  The invalidate handler consults it
+ * before treating a pcm_state==N block as already-invalidated. */
+extern bool cluster_bufmgr_block_grant_pending(BufferTag tag);
 /* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
  * ITL stamp; residency proves ownership (a self-contained transfer drops the
  * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */

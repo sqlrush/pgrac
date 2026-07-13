@@ -7337,6 +7337,19 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 	 */
 	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
 	if (pre_state == PCM_LOCK_MODE_N) {
+		/*
+		 * PGRAC ownership-generation wave (W3) — do NOT treat N as
+		 * already-invalidated while a grant for this tag is in flight to
+		 * install (GRANT_PENDING).  The requester's install completes and its
+		 * LockBuffer finalize then sets pcm_state=X; acking already_invalidated
+		 * here would let the master clear this node's holder bit and re-grant X
+		 * elsewhere, stranding the just-finalized stale X (double X holder,
+		 * Rule 8.A).  Return false so the caller PARKS the directive (the round-5
+		 * A2 park lot); the LMS-loop retry re-runs once the grant finalized
+		 * (PENDING cleared), and then sees the real X/S and invalidates it.
+		 */
+		if (cluster_bufmgr_block_grant_pending(inv->tag))
+			return false;
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;
 	}
