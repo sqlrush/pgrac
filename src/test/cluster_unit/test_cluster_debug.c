@@ -1250,6 +1250,27 @@ cluster_gcs_get_invalidate_send_not_admitted_count(void)
 {
 	return 0;
 }
+/* GCS serve-stall round-5 A2 stubs: 4 bounded-drop accessors. */
+uint64
+cluster_gcs_get_invalidate_parked_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_park_expired_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_park_overflow_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_drop_pinned_deny_count(void)
+{
+	return 0;
+}
 
 /* GCS-race round-4c FUNC-1 stubs: 3 storage-fallback SCN verify accessors. */
 uint64

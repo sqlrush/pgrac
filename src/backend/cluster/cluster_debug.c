@@ -2162,6 +2162,21 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "gcs", "invalidate_send_not_admitted_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_send_not_admitted_count()));
 
+	/* PGRAC: GCS serve-stall round-5 A2 — bounded-drop outcomes.  parked =
+	 * PINNED invalidate directives deferred to the LMS-loop retry (the
+	 * dispatch pump never waits on a foreign pin);  park_expired /
+	 * park_overflow = directives the master's ack budget fail-closes;
+	 * drop_pinned_deny = grant/transfer drops refused with a retryable
+	 * deny because a foreign pin held the copy. */
+	emit_row(rsinfo, "gcs", "invalidate_parked_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_parked_count()));
+	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_park_expired_count()));
+	emit_row(rsinfo, "gcs", "invalidate_park_overflow_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_park_overflow_count()));
+	emit_row(rsinfo, "gcs", "drop_pinned_deny_count",
+			 fmt_int64((int64)cluster_gcs_get_drop_pinned_deny_count()));
+
 	/* PGRAC: GCS-race round-4c FUNC-1 — storage-fallback SCN verify rows:
 	 * local pre-read proven current (no I/O) / stale pre-read re-read from
 	 * shared storage / still-stale-or-dirty fail-closed (53R93). */

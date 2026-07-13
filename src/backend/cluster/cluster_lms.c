@@ -826,6 +826,10 @@ LmsMain(void)
 				cluster_gcs_block_pi_discard_drain();
 			}
 			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
+			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
+			 * directives parked by the dispatch handler (bounded, one
+			 * attempt each;  never waits on a pin). */
+			cluster_gcs_block_invalidate_park_tick();
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -960,6 +964,9 @@ LmsWorkerMain(int worker_id)
 			 * sent directly from the dispatch handler in THIS process, so
 			 * they already ride this worker's channel. */
 			(void)cluster_lms_outbound_drain_send(worker_id);
+			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
+			 * directives parked by this worker's dispatch handler. */
+			cluster_gcs_block_invalidate_park_tick();
 			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -589,6 +589,11 @@ static void TerminateBufferIO(BufferDesc *buf, bool clear_dirty,
 							  uint32 set_flag_bits);
 static void shared_buffer_write_error_callback(void *arg);
 static void local_buffer_write_error_callback(void *arg);
+/* PGRAC: GCS serve-stall round-5 — InvalidateBuffer tail extraction + the
+ * bounded non-waiting variant for the IC dispatch pump. */
+static void InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
+										 LWLock *oldPartitionLock, uint32 buf_state);
+static bool InvalidateBufferTry(BufferDesc *buf);
 static BufferDesc *BufferAlloc(SMgrRelation smgr,
 							   char relpersistence,
 							   ForkNumber forkNum,
@@ -1627,6 +1632,18 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
  *
  * The buffer could get reclaimed by someone else while we are waiting
  * to acquire the necessary locks; if so, don't mess it up.
+ *
+ * PGRAC modifications by SqlRush:
+ *   What changed: the commit tail (clear tag/flags -> eviction hook ->
+ *   BufTableDelete -> StrategyFreeBuffer) is extracted into
+ *   InvalidateBufferCommitLocked so the GCS serve-stall round-5
+ *   InvalidateBufferTry variant below can share it verbatim.  The retry
+ *   loop and every effect of this function are unchanged.
+ *   Why: the LMS DATA dispatch pump must never enter this function's
+ *   unbounded pin-wait loop (a foreign pin held by a backend that is
+ *   itself waiting on a GCS reply this pump would deliver = a circular
+ *   wait resolved only by the reply-wait timeout — the measured 33-96s
+ *   S3 serve-stall wall).
  */
 static void
 InvalidateBuffer(BufferDesc *buf)
@@ -1634,7 +1651,6 @@ InvalidateBuffer(BufferDesc *buf)
 	BufferTag	oldTag;
 	uint32		oldHash;		/* hash value for oldTag */
 	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
-	uint32		oldFlags;
 	uint32		buf_state;
 
 	/* Save the original buffer tag before dropping the spinlock */
@@ -1691,6 +1707,24 @@ retry:
 		goto retry;
 	}
 
+	InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state);
+}
+
+/*
+ * InvalidateBufferCommitLocked -- shared commit tail of InvalidateBuffer
+ * and InvalidateBufferTry.
+ *
+ * Entry: buffer header spinlock held, oldPartitionLock held EXCLUSIVE,
+ * tag verified equal to *oldTag, refcount known zero.  Releases both
+ * locks.  This is the original InvalidateBuffer tail, extracted verbatim
+ * (PGRAC GCS serve-stall round-5; see the InvalidateBuffer header note).
+ */
+static void
+InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
+							 LWLock *oldPartitionLock, uint32 buf_state)
+{
+	uint32		oldFlags;
+
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that
 	 * linear scans of the buffer array don't think the buffer is valid.
@@ -1717,12 +1751,12 @@ retry:
 	 * BufferDesc.tag was just cleared above.
 	 */
 	if (cluster_pcm_is_active()
-		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&oldTag))
+		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(oldTag))
 		&& buf->pcm_state != (uint8) PCM_STATE_N)
 	{
 		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
 
-		buf->tag = oldTag;	/* temporary restore so the release helper sees
+		buf->tag = *oldTag; /* temporary restore so the release helper sees
 							 * the right tag — release sets pcm_state to N
 							 * but does not write tag */
 		cluster_pcm_lock_release_buffer_for_eviction(buf, old_mode);
@@ -1735,7 +1769,7 @@ retry:
 	 * Remove the buffer from the lookup hashtable, if it was in there.
 	 */
 	if (oldFlags & BM_TAG_VALID)
-		BufTableDelete(&oldTag, oldHash);
+		BufTableDelete(oldTag, oldHash);
 
 	/*
 	 * Done with mapping lock.
@@ -1746,6 +1780,69 @@ retry:
 	 * Insert the buffer at the head of the list of free buffers.
 	 */
 	StrategyFreeBuffer(buf);
+}
+
+/*
+ * InvalidateBufferTry -- bounded, non-waiting variant of InvalidateBuffer
+ * (PGRAC GCS serve-stall round-5).
+ *
+ * Same entry contract as InvalidateBuffer (buffer header spinlock held;
+ * dropped before returning) and the same effects on success, but a
+ * foreign pin FAILS the call instead of entering the pin-wait retry loop:
+ * the IC dispatch pump (LMS / LMON context) must never block on a pin
+ * whose holder may itself be waiting on a reply only this pump can
+ * deliver.  Returns true when the buffer was invalidated OR was already
+ * re-tagged (nothing left to invalidate — same silent-success as
+ * InvalidateBuffer's tag-changed arm);  false when a pin held it and
+ * NOTHING was changed (the caller parks the job and retries later, or
+ * fail-closes with a retryable deny).
+ */
+static bool
+InvalidateBufferTry(BufferDesc *buf)
+{
+	BufferTag	oldTag;
+	uint32		oldHash;		/* hash value for oldTag */
+	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
+	uint32		buf_state;
+
+	/* Save the original buffer tag before dropping the spinlock */
+	oldTag = buf->tag;
+
+	buf_state = pg_atomic_read_u32(&buf->state);
+	Assert(buf_state & BM_LOCKED);
+	UnlockBufHdr(buf, buf_state);
+
+	oldHash = BufTableHashCode(&oldTag);
+	oldPartitionLock = BufMappingPartitionLock(oldHash);
+
+	/*
+	 * Acquire exclusive mapping lock in preparation for changing the buffer's
+	 * association.  Single attempt — no retry loop.
+	 */
+	LWLockAcquire(oldPartitionLock, LW_EXCLUSIVE);
+
+	buf_state = LockBufHdr(buf);
+
+	/* If it's changed while we were waiting for lock, do nothing */
+	if (!BufferTagsEqual(&buf->tag, &oldTag))
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(oldPartitionLock);
+		return true;
+	}
+
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(oldPartitionLock);
+		/* safety check: should definitely not be our *own* pin */
+		if (GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0)
+			elog(ERROR, "buffer is pinned in InvalidateBufferTry");
+		return false;			/* foreign pin — caller parks / fail-closes */
+	}
+
+	InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state);
+	return true;
 }
 
 /*
@@ -7467,14 +7564,17 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  *   so the invalidate ACK can carry the cross-node version:
  *
  *     1. Partition lookup by tag.
- *     2. Header lock + tag recheck + BM_VALID gate.
+ *     2. Header lock + tag recheck + BM_VALID gate + foreign-pin fast
+ *        fail (GCS serve-stall round-5: PINNED result, nothing changed).
  *     3. XLogFlush(page_lsn) when BM_DIRTY (HC123 invariant — lost-
  *        write safety since spec-2.36 ships no PI buffer copy).
- *     4. InvalidateBuffer to drop the local copy (best-effort).
+ *     4. InvalidateBufferTry to drop the local copy — bounded;  a raced
+ *        pin re-fails with PINNED (round-5;  see
+ *        ClusterBufmgrGcsDropResult in cluster_gcs_block.h).
  *
  *   `expected_mode` is advisory.
  * ======================================================================== */
-bool
+ClusterBufmgrGcsDropResult
 cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 										XLogRecPtr *out_page_lsn, SCN *out_page_scn)
 {
@@ -7486,6 +7586,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
 	SCN			page_scn = InvalidScn;	/* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
 	bool		was_dirty = false;
+	uint8		saved_pcm_state;
 
 	(void) expected_mode;
 
@@ -7502,7 +7603,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	if (buf_id < 0)
 	{
 		LWLockRelease(partition_lock);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
@@ -7514,7 +7615,21 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	{
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
+	}
+
+	/*
+	 * PGRAC: GCS serve-stall round-5 (A2) — fast pin fail.  A foreign pin
+	 * means the drop cannot complete without InvalidateBuffer's unbounded
+	 * pin-wait loop, which this IC-dispatch context must never enter (see
+	 * ClusterBufmgrGcsDropResult).  Bail before the WAL flush — nothing is
+	 * dropped, so the HC123 flush-before-drop invariant is not owed yet.
+	 */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 	was_dirty = (buf_state & BM_DIRTY) != 0;
 
@@ -7571,17 +7686,44 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
 	{
 		UnlockBufHdr(buf, buf_state);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
+
+	/*
+	 * PGRAC: GCS serve-stall round-5 (A2) — a pin acquired while we were
+	 * unpinned for the XLogFlush re-fails the drop (bounded contract; the
+	 * pcm_state is untouched so nothing observes a half-dropped state).
+	 */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
+
+	saved_pcm_state = buf->pcm_state;
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
 	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
-		return true;
+		return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 
-	InvalidateBuffer(buf);		/* releases the header spinlock */
+	/*
+	 * PGRAC: GCS serve-stall round-5 (A2) — bounded drop.  A pinner racing
+	 * in between the refcount check above and the Try variant's own
+	 * partition-ordered recheck fails the call;  restore the residency
+	 * mode (it was cleared for the eviction hook) so the still-resident
+	 * copy keeps its true PCM state.
+	 */
+	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
+	{
+		buf_state = LockBufHdr(buf);
+		if (BufferTagsEqual(&buf->tag, &tag))
+			buf->pcm_state = saved_pcm_state;
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
 
-	return true;
+	return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 }
 
 /* ========================================================================
@@ -7802,7 +7944,7 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
  *   data, and the XLogFlush + InvalidateBuffer pair preserves Rule 8.A
  *   no-stale-flush.
  * ======================================================================== */
-bool
+ClusterBufmgrGcsDropResult
 cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn)
 {
 	uint32		hashcode;
@@ -7812,6 +7954,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	uint32		buf_state;
 	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
 	bool		was_dirty = false;
+	uint8		saved_pcm_state;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -7824,7 +7967,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	if (buf_id < 0)
 	{
 		LWLockRelease(partition_lock);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
@@ -7833,7 +7976,20 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	{
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
+	}
+
+	/*
+	 * PGRAC: GCS serve-stall round-5 (A2) — fast pin fail (see
+	 * ClusterBufmgrGcsDropResult;  the X-transfer caller fail-closes with a
+	 * retryable deny instead of parking InvalidateBuffer's pin-wait loop in
+	 * the dispatch pump).
+	 */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 	was_dirty = (buf_state & BM_DIRTY) != 0;
 	{
@@ -7871,18 +8027,37 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
 	{
 		UnlockBufHdr(buf, buf_state);
-		return false;
+		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
+
+	/* PGRAC: GCS serve-stall round-5 (A2) — a pin acquired during the
+	 * XLogFlush window re-fails the drop (nothing observed half-dropped). */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
+
+	saved_pcm_state = buf->pcm_state;
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping (the
 	 * shipped current went to the new holder; our copy becomes the PI). */
 	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
-		return true;
+		return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 
-	InvalidateBuffer(buf);		/* releases the header spinlock */
+	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
+	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
+	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
+	{
+		buf_state = LockBufHdr(buf);
+		if (BufferTagsEqual(&buf->tag, &tag))
+			buf->pcm_state = saved_pcm_state;
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
 
-	return true;
+	return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
 }
 
 /* ========================================================================
