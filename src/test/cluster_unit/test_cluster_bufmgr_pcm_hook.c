@@ -143,7 +143,10 @@ uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
 static union {
 	uint64 force_align;
-	char data[4096];
+	/* Sized above sizeof(ClusterPcmShared): the S3-forensics step-1b
+	 * per-tag watermark provenance table (8192 x 64B slots + lock) grew
+	 * the header past 512KB;  the fake ShmemInitStruct asserts fit. */
+	char data[1048576];
 } fake_pcm_header;
 
 static union {

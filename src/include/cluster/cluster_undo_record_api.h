@@ -204,6 +204,12 @@ extern uint64 cluster_undo_segment_hard_cap_fail_count(void);
 extern uint32 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id,
 											  bool *out_at_hard_cap);
 extern uint64 cluster_undo_tt_retention_rollover_count(void);
+/* S3 forensics step 1a — TT-rollover FAILURE split (hard cap vs autoextend);
+ * counts only cluster_undo_tt_rollover_locked fails, NOT the record-extent
+ * CLAIM path's segment_hard_cap_fail_count. */
+extern uint64 cluster_undo_tt_rollover_fail_hard_cap_count(void);
+extern uint64 cluster_undo_tt_rollover_fail_extend_count(void);
+extern uint64 cluster_undo_tt_rollover_fail_activate_count(void);
 extern uint64 cluster_undo_segment_retain_skip_count(void);
 
 /* P0 perf hardening: per-commit undo fsync counters. */

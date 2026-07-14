@@ -1120,10 +1120,23 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errmsg("cluster LMS not ready, fail-closed (spec-2.21 HC1)"),
 							errhint("Wait for cluster_lms_is_ready() == LMS_READY before acquiring "
 									"cluster-aware locks.")));
-		case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT:
+		case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT: {
+			/* PGRAC: S3 forensics step 1 — FAIL_TIMEOUT folds nine distinct
+			 * GES-side failure sites (capacity, send-fail, retransmit budget,
+			 * native probe, true CV wait) into this single message; surface
+			 * the fine-grained attribution recorded at the failing site so a
+			 * timeout storm is diagnosable without guessing. */
+			const ClusterGesTimeoutDetail *ges_td = cluster_ges_timeout_detail_get();
+
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("cluster lock acquire timeout"),
+					 errdetail("source=%s master=%d elapsed_ms=%ld attempts=%d "
+							   "conflict_holders=%d effective_timeout_ms=%d.",
+							   cluster_ges_timeout_src_text(ges_td->source), ges_td->master_node,
+							   ges_td->elapsed_ms, ges_td->attempts, ges_td->conflict_holders,
+							   ges_td->timeout_ms),
 					 errhint("Consider increasing cluster.ges_request_timeout_ms.")));
+		}
 		case CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING:
 			/* PGRAC: spec-4.6 D4 — shard frozen by failure-driven remaster. */
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),

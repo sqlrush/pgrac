@@ -216,6 +216,21 @@ bool cluster_advisory_lock_enabled = true;
  * the existing HC23/HC24/HC27 behaviour for all other tests. */
 bool cluster_shared_catalog = false;
 
+/* S3 forensics step 1 stubs — the timeout-source detail setter/reset live in
+ * cluster_ges.o (not linked standalone); the seven-step reset and the S3
+ * native-probe set-point are inert no-ops here. */
+void
+cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src pg_attribute_unused(),
+							   int32 master_node pg_attribute_unused(),
+							   long elapsed_ms pg_attribute_unused(),
+							   int attempts pg_attribute_unused(),
+							   int conflict_holders pg_attribute_unused(),
+							   int timeout_ms pg_attribute_unused())
+{}
+void
+cluster_ges_timeout_detail_reset(void)
+{}
+
 /* spec-5.5 D8 — UL counter stubs:  cluster_lock_release() bumps the session-
  * release counter, but this fixture links neither the advisory shmem region nor
  * cluster_advisory.o.  The real counter behaviour is covered by

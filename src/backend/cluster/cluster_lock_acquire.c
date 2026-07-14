@@ -264,6 +264,9 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 			&& !cluster_lms_native_probe_wait_clear(&req->resid, req->lockmode, &req->holder,
 													/* timeout_ms */ 0)) {
 			(void)cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
+			/* S3 forensics step 1 — attribute the FAIL_TIMEOUT fold. */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT, self_node, 0, 0,
+										   -1, 0);
 			return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 		}
 		pg_atomic_fetch_add_u64(&stub_local_fast_path_count, 1);
@@ -676,6 +679,11 @@ ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 {
 	ClusterLockAcquireResult r;
+
+	/* S3 forensics step 1 — clear the backend-local timeout-source detail at
+	 * the single dispatch funnel so a FAIL_TIMEOUT surfaced by lock.c never
+	 * reads a stale attribution from a previous acquire. */
+	cluster_ges_timeout_detail_reset();
 
 	/*
 	 * spec-2.22 D8 / spec-5.9 D3 — cancel check point (a): seven-step top

@@ -347,16 +347,64 @@ diag(
 # ----------
 my $h11 = $n0->background_psql('postgres', on_error_die => 1);
 $h11->query_safe("SELECT pg_advisory_lock(73)");    # node0 holds X(73)
+
+# S3 forensics step 1a — pre-capture the breakdown counters so the asserts
+# below are DELTA-based (a prior leg's bump can never satisfy them).
+my $split_query = q{
+	SELECT COALESCE(sum(value::bigint), 0) FROM pg_cluster_state
+	WHERE category = 'ges'
+	  AND key IN ('ges_timeout_true_wait_count',
+				  'ges_timeout_retransmit_exhausted_count')};
+my $split_before = $n1->safe_psql('postgres', $split_query);
+
 # node1 blocks on the held key with a short finite per-session timeout; the wait
 # must resolve (53R70) rather than hang -- this is the bound that protects a
 # cross-node deadlock from hanging forever (real detection is forward spec-5.8).
+my $t11_start = Time::HiRes::time();
 my ($rc11, $out11, $err11) = $n1->psql(
 	'postgres',
 	"SET cluster.ges_request_timeout_ms = '3s'; SELECT pg_advisory_lock(73)",
 	timeout => 40);
+my $client11_ms = int((Time::HiRes::time() - $t11_start) * 1000);
 isnt($rc11, 0, 'L11: blocking advisory acquire on a held key fails (does not hang)');
 like($err11, qr/cluster lock acquire timeout|53R70|not available/i,
 	'L11: ... with a finite-timeout 53R70 (bounded deadlock resolution)');
+
+# S3 forensics step 1/1a — the folded 53R70 text must carry a fine-grained
+# source attribution (errdetail) whose elapsed_ms is TRUE wall-clock (a
+# genuine bounded wait burns >= 1s of the 3s window; a capacity fail would
+# read ~0), and bump the matching dump_ges breakdown counter (delta-based).
+# The wait resolves as either the CV deadline or the retransmit budget
+# depending on which node masters the key (local- vs remote-master loop).
+like(
+	$err11,
+	qr/source=(cv-wait-timeout|retransmit-exhausted)/,
+	'L11b: 53R70 errdetail carries the timeout-source attribution');
+if ($err11 =~ /elapsed_ms=(\d+)/)
+{
+	my $elapsed = $1;
+
+	# S3 forensics step 1b — qualify elapsed_ms against the CLIENT-observed
+	# wall clock instead of hardcoded bounds.  client - elapsed >= 0 catches
+	# a filled-in configured value (a hardcoded 3000 fails on the retransmit
+	# path where the client only saw ~1.7s);  the <= 1500 slack catches a
+	# stale/zero fill (psql spawn + SET + connect overhead stay well under
+	# 1.5s), so elapsed_ms must genuinely track this wait's wall clock.
+	cmp_ok($client11_ms - $elapsed, '>=', 0,
+		"L11b2: elapsed_ms=$elapsed never exceeds the client wall clock (client=${client11_ms}ms)");
+	cmp_ok($client11_ms - $elapsed, '<=', 1500,
+		"L11b3: elapsed_ms=$elapsed tracks the client wall clock (client=${client11_ms}ms)");
+}
+else
+{
+	fail('L11b2: errdetail carries elapsed_ms');
+	fail('L11b3: errdetail carries elapsed_ms');
+}
+my $split_after = $n1->safe_psql('postgres', $split_query);
+cmp_ok($split_after, '>', $split_before,
+	'L11c: dump_ges timeout-source breakdown counter bumped by THIS bounded wait '
+	. "($split_before -> $split_after)");
+
 $h11->query_safe("SELECT pg_advisory_unlock(73)");
 $h11->quit;
 
@@ -389,6 +437,69 @@ is(try_lock($n1, 'pg_try_advisory_lock(151)'),
 $hm->quit;                                               # backend exit drains the session holder
 ok(wait_until_acquirable($n1, 'pg_try_advisory_lock(151)', 15),
 	'L13: released after backend exit (mixed-owner drain — single holder, no double release)');
+
+# ----------
+# L14 (S3 forensics step 1a): a MASTER-side capacity rejection must surface
+#   with source=master-reject-queue-full in the folded 53R70 errdetail and
+#   bump the capacity breakdown counter — never "unattributed".  The inject
+#   forces node1's GES_REQUEST handler into the WORK_QUEUE_FULL reject reply,
+#   so node0 trips it only on keys node1 masters (locally-mastered keys grant
+#   without touching the wire handler and are skipped by the probe loop).
+#   elapsed_ms must read (near) zero: the reject is immediate — the exact
+#   "surfaced as timeout but never waited" class the S3 storm hid.
+# ----------
+$n1->safe_psql('postgres',
+	"ALTER SYSTEM SET cluster.injection_points = 'cluster-ges-master-work-queue-full:skip'");
+$n1->safe_psql('postgres', 'SELECT pg_reload_conf()');
+
+my $cap_query = q{
+	SELECT COALESCE(sum(value::bigint), 0) FROM pg_cluster_state
+	WHERE category = 'ges' AND key = 'ges_timeout_capacity_count'};
+my $cap_before = $n0->safe_psql('postgres', $cap_query);
+my $mr_err = '';
+my $mr_client_ms = 0;
+for my $k (211 .. 226)
+{
+	my $t0 = Time::HiRes::time();
+	my ($rc, $out, $err) = $n0->psql(
+		'postgres',
+		"SET cluster.ges_request_timeout_ms = '3s'; SELECT pg_advisory_lock($k)",
+		timeout => 30);
+	my $probe_ms = int((Time::HiRes::time() - $t0) * 1000);
+	if ($rc != 0 && defined $err && $err =~ /master-reject-queue-full/)
+	{
+		$mr_err = $err;
+		$mr_client_ms = $probe_ms;
+		last;
+	}
+	# Locally-mastered key (granted): release and probe the next key.
+	$n0->psql('postgres', 'SELECT pg_advisory_unlock_all()');
+}
+$n1->safe_psql('postgres', 'ALTER SYSTEM RESET cluster.injection_points');
+$n1->safe_psql('postgres', 'SELECT pg_reload_conf()');
+
+isnt($mr_err, '', 'L14: a remote-master capacity reject was driven (inject)');
+like($mr_err, qr/cluster lock acquire timeout/,
+	'L14b: ... surfaced through the folded 53R70 text');
+like($mr_err, qr/source=master-reject-queue-full/,
+	'L14c: ... with the master-reject attribution (never unattributed)');
+if ($mr_err =~ /elapsed_ms=(\d+)/)
+{
+	# step 1b: an immediate reject reads near-zero on ITS OWN clock — and can
+	# never exceed the client-observed wall time for the same statement.
+	cmp_ok($1, '<=', 500,
+		"L14d: errdetail elapsed_ms=$1 shows the reject was immediate");
+	cmp_ok($1, '<=', $mr_client_ms,
+		"L14d2: elapsed_ms=$1 within the client wall clock (client=${mr_client_ms}ms)");
+}
+else
+{
+	fail('L14d: errdetail carries elapsed_ms');
+	fail('L14d2: errdetail carries elapsed_ms');
+}
+my $cap_after = $n0->safe_psql('postgres', $cap_query);
+cmp_ok($cap_after, '>', $cap_before,
+	"L14e: capacity breakdown counter bumped by the master reject ($cap_before -> $cap_after)");
 
 $pair->stop_pair;
 done_testing();

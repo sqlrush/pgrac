@@ -83,9 +83,75 @@
 typedef struct ClusterGesSharedState {
 	pg_atomic_uint64 request_defer_count;
 	pg_atomic_uint64 reply_defer_count;
+	/* S3 forensics step 1 (07-14) — fine-grained breakdown of every
+	 * GES-side failure that lock.c folds into the single "cluster lock
+	 * acquire timeout" text.  Proves how many "timeouts" never waited
+	 * (capacity / send-fail classes) vs genuinely ran out the clock. */
+	pg_atomic_uint64 timeout_true_wait_count; /* CV wait ran out the deadline */
+	pg_atomic_uint64 timeout_capacity_count;  /* reply-wait table / master wait queue full */
+	pg_atomic_uint64 timeout_send_fail_count; /* outbound ring enqueue failed */
+	pg_atomic_uint64 timeout_retransmit_exhausted_count; /* retransmit budget burned */
+	pg_atomic_uint64 timeout_native_probe_count;		 /* native-lock probe fail-closed */
+	/* S3 forensics step 1b — master replied TIMEOUT (its own wait/probe ran
+	 * out remotely);  neither a local wait nor a local capacity event, so it
+	 * gets its own ledger bucket: every detail_set with a real source bumps
+	 * EXACTLY one of the six breakdown counters. */
+	pg_atomic_uint64 timeout_master_reject_count;
 	/* Future spec-2.14+ adds: GRD shard table, hash routing state,
 	 * grant table, convert queue, deadlock graph, etc. */
 } ClusterGesSharedState;
+
+/*
+ * S3 forensics step 1 (07-14) — backend-local detail of the LAST GES-side
+ * failure that will surface as CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT.
+ *
+ *	GesRejectReason folds nine distinct failure sites into TIMEOUT /
+ *	WORK_QUEUE_FULL, and cluster_lock_acquire.c folds those (plus the
+ *	native-probe and convert paths) into one FAIL_TIMEOUT whose lock.c
+ *	ereport reads "cluster lock acquire timeout".  The setter records the
+ *	fine source (and bumps the matching shmem counter) at each site; the
+ *	seven-step dispatcher resets it on entry; lock.c reads it into the
+ *	53R70-surface errdetail.  Backend-local (set and read within one
+ *	synchronous acquire), so no locking.
+ */
+typedef enum ClusterGesTimeoutSrc {
+	CLUSTER_GES_TSRC_NONE = 0,				   /* no GES detail recorded (unattributed) */
+	CLUSTER_GES_TSRC_NULL_ARG,				   /* internal: NULL resid/holder */
+	CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL,	   /* capacity: reply-wait table full */
+	CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL,   /* capacity: GRD wait queue / not-ready */
+	CLUSTER_GES_TSRC_OUTBOUND_RING_FULL,	   /* send-fail: outbound ring enqueue failed */
+	CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,		   /* true wait: CV sleep ran out the deadline */
+	CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED,	   /* retransmit budget burned before grant */
+	CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT,	   /* native-lock probe could not prove clear */
+	CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, /* capacity: master REPLIED WORK_QUEUE_FULL
+											    * (dedup table / work queue / wait queue full
+											    * on the master — the reply-tail fold) */
+	CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT,	   /* master replied TIMEOUT (reply-tail fold) */
+} ClusterGesTimeoutSrc;
+
+typedef struct ClusterGesTimeoutDetail {
+	ClusterGesTimeoutSrc source;
+	int32 master_node;	  /* target master (self for local-master path); -1 unknown */
+	long elapsed_ms;	  /* wall time actually waited (0 = immediate failure) */
+	int attempts;		  /* retransmit attempts consumed (0 = none) */
+	int conflict_holders; /* conflicting holders seen at enqueue; -1 unknown */
+	int timeout_ms;		  /* effective timeout in force (-1 = perpetual) */
+} ClusterGesTimeoutDetail;
+
+extern void cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node,
+										   long elapsed_ms, int attempts, int conflict_holders,
+										   int timeout_ms);
+extern void cluster_ges_timeout_detail_reset(void);
+extern const ClusterGesTimeoutDetail *cluster_ges_timeout_detail_get(void);
+extern const char *cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src);
+
+/* dump_ges observability getters for the six breakdown counters. */
+extern uint64 cluster_ges_timeout_true_wait_count(void);
+extern uint64 cluster_ges_timeout_capacity_count(void);
+extern uint64 cluster_ges_timeout_send_fail_count(void);
+extern uint64 cluster_ges_timeout_retransmit_exhausted_count(void);
+extern uint64 cluster_ges_timeout_native_probe_count(void);
+extern uint64 cluster_ges_timeout_master_reject_count(void);
 
 /*
  * Shmem region lifecycle (mirror cluster_scn / cluster_lmon pattern).

@@ -84,7 +84,10 @@ uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
 static union {
 	uint64 force_align;
-	char data[4096];
+	/* Sized above sizeof(ClusterPcmShared): the S3-forensics step-1b
+	 * per-tag watermark provenance table (8192 x 64B slots + lock) grew
+	 * the header past 512KB;  the fake ShmemInitStruct asserts fit. */
+	char data[1048576];
 } fake_pcm_header;
 
 static union {
@@ -1341,6 +1344,73 @@ UT_TEST(test_pcm_d3_not_double_x)
 	}
 }
 
+/*
+ * S3 forensics step 1a — SCN-watermark advance provenance ring.
+ *	Every feed records {source, sender, request_id, epoch, old->new,
+ *	advanced}; the latest record per tag is queryable.  The key semantic:
+ *	a LATE / stale feed is recorded with advanced=false and the watermark
+ *	unchanged — the branch-3 (watermark false-positive) discriminator a
+ *	53R93 emit site attaches to its errdetail / LOG line.
+ */
+UT_TEST(test_pcm_wm_prov_table_keeps_last_advance)
+{
+	BufferTag tag = make_tag(95);
+	BufferTag other = make_tag(96);
+	ClusterPcmWmProv prov;
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+
+	/* No feed yet — a definite NONE (no insert has ever been dropped). */
+	UT_ASSERT(!cluster_pcm_lock_pi_watermark_prov_query(tag, &prov));
+	UT_ASSERT_EQ((long)prov.source, (long)CLUSTER_PCM_WM_SRC_NONE);
+	UT_ASSERT(!prov.table_full);
+
+	/* Redeclare feed (real inline writer path): advancing feed recorded. */
+	cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_S, (XLogRecPtr)0x1000,
+													(SCN)0x2000, 2, 7);
+	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(tag, &prov));
+	UT_ASSERT_EQ((long)prov.source, (long)CLUSTER_PCM_WM_SRC_REDECLARE);
+	UT_ASSERT_EQ((long)prov.sender_node, 2L);
+	UT_ASSERT_EQ((long)prov.epoch, 7L);
+	UT_ASSERT_EQ((long)prov.new_scn, 0x2000L);
+
+	/* ACK feed advances further: the tag's single slot is updated in place
+	 * with the new advance's full wire identity. */
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x3000, CLUSTER_PCM_WM_SRC_ACK_SLOT, 3,
+											  4242, 9);
+	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(tag, &prov));
+	UT_ASSERT_EQ((long)prov.source, (long)CLUSTER_PCM_WM_SRC_ACK_SLOT);
+	UT_ASSERT_EQ((long)prov.sender_node, 3L);
+	UT_ASSERT_EQ((long)prov.request_id, 4242L);
+	UT_ASSERT_EQ((long)prov.epoch, 9L);
+	UT_ASSERT_EQ((long)prov.old_scn, 0x2000L);
+	UT_ASSERT_EQ((long)prov.new_scn, 0x3000L);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag), (uint64)0x3000);
+
+	/* A LATE / stale feed must NOT enter the table (step 1b): the query
+	 * still returns the ACK_SLOT advance that produced the CURRENT
+	 * watermark, and its new_scn equals that watermark. */
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x100, CLUSTER_PCM_WM_SRC_ACK_SLOTLESS, 1,
+											  4243, 5);
+	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(tag, &prov));
+	UT_ASSERT_EQ((long)prov.source, (long)CLUSTER_PCM_WM_SRC_ACK_SLOT);
+	UT_ASSERT_EQ((long)prov.sender_node, 3L);
+	UT_ASSERT_EQ((long)prov.request_id, 4242L);
+	UT_ASSERT_EQ((long)prov.new_scn, 0x3000L);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag), (uint64)0x3000);
+	UT_ASSERT_EQ((uint64)prov.new_scn, (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag));
+
+	/* A second tag gets its own slot (open addressing, insert-once). */
+	cluster_gcs_block_master_rebuild_from_redeclare(other, (uint8)PCM_STATE_S, (XLogRecPtr)0x1000,
+													(SCN)0x5000, 1, 7);
+	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(other, &prov));
+	UT_ASSERT_EQ((long)prov.source, (long)CLUSTER_PCM_WM_SRC_REDECLARE);
+	UT_ASSERT_EQ((long)prov.new_scn, 0x5000L);
+	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(tag, &prov));
+	UT_ASSERT_EQ((long)prov.new_scn, 0x3000L);
+}
+
 UT_TEST(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades)
 {
 	BufferTag tag = make_tag(96);
@@ -1458,7 +1528,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(42);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -1497,6 +1567,7 @@ main(void)
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
 	UT_RUN(test_pcm_d3_not_double_x);
+	UT_RUN(test_pcm_wm_prov_table_keeps_last_advance);
 	UT_RUN(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades);
 	UT_RUN(test_pcm_dead_node_cleanup_drops_holder_records);
 	UT_RUN(test_clean_page_xfer_arm_is_one_shot);

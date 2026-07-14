@@ -61,6 +61,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
+#include "cluster/cluster_inject.h"		   /* S3 forensics step 1a stub prototypes */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 
@@ -89,6 +90,22 @@
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+
+/* S3 forensics step 1a stubs — cluster_ges.c now carries the
+ * cluster-ges-master-work-queue-full injection point; this standalone
+ * binary links no cluster_inject.o.  armed_count 0 keeps the macro's
+ * fast-path gate closed; the helpers are link-only. */
+int cluster_injection_armed_count = 0;
+
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
+bool
+cluster_injection_should_skip(const char *name pg_attribute_unused())
+{
+	return false;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),

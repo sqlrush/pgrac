@@ -274,15 +274,20 @@ sub arm_stale_ship
 	return;
 }
 
-# Tolerant nextval: the 53R93 fail-closed is by design;  capture its text.
+# Tolerant nextval: the 53R93 fail-closed is by design;  capture its text
+# (S3 forensics step 1a — the errdetail asserts below need the full error).
 my $saw_53r93 = 0;
+my $err_53r93 = '';
 sub try_nextval
 {
 	my ($node) = @_;
 	my ($rc, $out, $err) =
 		$node->psql('postgres', "SELECT nextval('lw_seq')", timeout => 30);
-	$saw_53r93 = 1
-		if defined $err && $err =~ /53R93|lost write detected/i;
+	if (defined $err && $err =~ /53R93|lost write detected/i)
+	{
+		$saw_53r93 = 1;
+		$err_53r93 = $err;
+	}
 	return;
 }
 
@@ -315,6 +320,43 @@ cmp_ok($det_after, '>', $det_before,
 	'L11 the anomaly counts as a detected lost write (DENIED_LOST_WRITE)');
 ok($saw_53r93,
 	'L11 requester saw 53R93 / "lost write detected" (action=error, fail-closed)');
+
+# ----------
+# L11b (S3 forensics step 1a): the 53R93 must be QUALIFIABLE, not just
+#   detected.  The requester errdetail carries its local SCN/gen view; the
+#   producer LOG line carries the verdict (expected, shipped) SCN pair plus
+#   the {requester, request_id, epoch, tag} correlation identity; the
+#   master-direct twin additionally carries the provenance of the watermark
+#   advance that produced expected_scn (wm_src=... — the branch-3 watermark
+#   false-positive discriminator).
+# ----------
+like(
+	$err_53r93,
+	qr/pi_watermark_scn[a-z ]*=\d+/,
+	'L11b requester errdetail carries a watermark view (local / master-now / sent)');
+like($err_53r93, qr/ownership_gen=\d+/,
+	'L11b2 requester errdetail carries the ownership generation');
+
+my $prod_line = '';
+for my $node ($pair->node0, $pair->node1)
+{
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+	if ($log =~ /(cluster_gcs_block: lost-write verdict [^\n]+)/)
+	{
+		$prod_line = $1;
+		last;
+	}
+}
+isnt($prod_line, '', 'L11c producer-side verdict LOG line present');
+like(
+	$prod_line,
+	qr/expected pi_watermark_scn=\d+ shipped pd_block_scn=\d+/,
+	'L11c2 producer LOG carries the verdict (expected, shipped) SCN pair');
+like($prod_line, qr/request_id=\d+/, 'L11c3 producer LOG carries request_id');
+like($prod_line, qr/epoch=\d+/,      'L11c4 producer LOG carries epoch');
+like($prod_line, qr/wm_src=\S+/,
+	'L11c5 master-direct producer LOG carries watermark-advance provenance')
+	if $prod_line =~ /master-direct/;
 
 
 # ============================================================
