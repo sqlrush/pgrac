@@ -44,7 +44,7 @@
 #include "cluster/cluster_tt_local.h"			/* binding export/reset */
 #include "cluster/cluster_tt_slot.h"			/* protected-slot map (D6/V-4) */
 #include "cluster/cluster_tt_status.h"			/* SUBCOMMITTED overlay rebuild */
-#include "cluster/cluster_undo_record_api.h"	/* xact_reset (PostPrepare) */
+#include "cluster/cluster_undo_record_api.h"	/* full undo teardown (PostPrepare) */
 #include "cluster/cluster_tt_durable.h"			/* durable 0x30 commit (prefinish) */
 #include "cluster/cluster_tt_status_hint.h"		/* cross-node hint emit (prefinish) */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
@@ -111,7 +111,7 @@ AtPrepare_ClusterTT(void)
 	/*
 	 * spec-4.8 D7-A: capture each binding's latest undo-chain head into the v2
 	 * heads[] section.  The head is backend-local (cluster_undo_record.c) and is
-	 * reset at xact end, so it must be read here at PREPARE while still live;
+	 * cleared by PostPrepare, so it must be read here at PREPARE while still live;
 	 * the durable TT slot header does not persist it (deferred).  A binding with
 	 * no undo this xact gets InvalidUba (-> D7 physical rollback no-op for it).
 	 */
@@ -145,10 +145,9 @@ AtPrepare_ClusterTT(void)
  * PostPrepare_ClusterTT -- ownership transfer after EndPrepare succeeded.
  *
  *	The 2PC record is now the single authority (C-P4): drop the backend-
- *	local TT bindings, the SUBCOMMITTED link list, and the ITL touch
- *	list (V-2: droppable -- overlay/durable TT are authoritative and the
- *	3.4c lazy cleanout re-stamps page ITLs on later reads).  Nothing
- *	here touches shmem or durable state.
+ *	local TT bindings, the SUBCOMMITTED link list, the ITL touch list, and the
+ *	backend-local undo lifecycle state.  Undo teardown unregisters the active
+ *	writer from shmem; no durable state is changed here.
  */
 void
 PostPrepare_ClusterTT(void)
@@ -159,7 +158,7 @@ PostPrepare_ClusterTT(void)
 	cluster_tt_local_reset_binding();
 	cluster_subtrans_reset_local_links();
 	cluster_itl_touch_reset_at_end_xact();
-	cluster_undo_record_xact_reset(); /* touched-undo list + D16 flag */
+	cluster_undo_record_xact_reset(); /* full backend-local undo teardown */
 	cluster_vis_bump_twopc_postprepare_transfers();
 }
 

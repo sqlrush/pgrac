@@ -163,7 +163,7 @@
 #include "cluster/cluster_itl_touch.h" /* PGRAC: spec-3.4a D6 pre-commit/abort */
 #include "cluster/cluster_tt_2pc.h"	 /* PGRAC: spec-3.15 PREPARE record */
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
-#include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
+#include "cluster/cluster_undo_record_api.h"  /* PGRAC: undo xact lifecycle */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC: spec-6.14 D8 depth reset */
 #include "cluster/cluster_relmap_lock.h"		  /* PGRAC: spec-6.14 D5 abort release */
@@ -2958,14 +2958,9 @@ CommitTransaction(void)
 	s->state = TRANS_DEFAULT;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC (spec-4.12a D6): release this backend's active-write undo boundary
-	 * at commit so a committed transaction's first_undo_scn stops pinning the
-	 * record-segment drain boundary.  The full cluster_undo_record_xact_reset()
-	 * runs only on the PREPARE (PrepareTransaction) and ABORT (CleanupTransaction)
-	 * paths -- a persistent (pooled) connection that commits and stays open would
-	 * otherwise keep its first transaction registered for the life of the backend
-	 * (re-opening the spec-4.13 undo-pool leak).  8.A-safe: only enables
-	 * ACTIVE->COMMITTED; the retention horizon still gates the actual reclaim. */
+	/* PGRAC: release the active-write boundary and clear O(1) transaction-local
+	 * undo bookkeeping.  Preserve backend caches; PREPARE/ABORT use the full
+	 * teardown.  Spec: spec-4.12a-undo-record-segment-reclaim.md */
 	cluster_undo_record_xact_commit_release();
 #endif
 
@@ -3296,8 +3291,8 @@ PrepareTransaction(void)
 	s->state = TRANS_DEFAULT;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
-	 * end of xact (commit path).  Backend reuse → next xact starts fresh. */
+	/* PGRAC: PostPrepare transfers undo ownership and fully tears down the
+	 * backend-local PREPARE state. */
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on commit. */
 	cluster_touched_peers_reset();
@@ -3547,8 +3542,7 @@ CleanupTransaction(void)
 	AtEOXact_Snapshot(false, true); /* and release the transaction's snapshots */
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
-	 * end of xact (abort path).  Backend reuse → next xact starts fresh. */
+	/* PGRAC: fully tear down backend-local undo state on abort. */
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on abort/cleanup. */
 	cluster_touched_peers_reset();

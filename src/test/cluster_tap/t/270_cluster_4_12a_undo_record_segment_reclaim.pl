@@ -20,6 +20,8 @@
 #   L3  quiesce -> after writes stop (registry empty => boundary infinite),
 #       further rollovers keep REUSING the recycled pool rather than creating
 #       new files, i.e. the pool stays bounded with no new transactions.
+#   L10 persistent backend -> normal COMMIT clears transaction-local undo-head
+#       bookkeeping while retaining the reusable extent and file descriptor.
 #
 # Spec: spec-4.12a-undo-record-segment-reclaim.md
 use strict;
@@ -555,6 +557,77 @@ sub common_conf
 		'3', 'L9 all rows committed correctly after residual revalidation + re-claim');
 
 	$nh->stop;
+}
+
+# ===========================================================================
+# L10 -- A persistent backend must not carry transaction-local undo heads across
+#        normal COMMIT.  An older snapshot prevents TT-slot recycling, so 1030
+#        autocommit writes visit more than the 1024 local-head capacity and
+#        force at least 21 retention rollovers.  Before the fix, write 1025
+#        fails with 53R9D because local-head entries leak between transactions.
+# ===========================================================================
+{
+	my $ni = PgracClusterNode->new('commit_local_head_reset');
+	$ni->init;
+	$ni->append_conf('postgresql.conf',
+		common_conf(64, 'on') . "cluster.undo_cleaner_enabled = off\n");
+	$ni->start;
+
+	$ni->safe_psql('postgres', 'CREATE TABLE t270_commit_pin (id int)');
+	$ni->safe_psql('postgres', 'INSERT INTO t270_commit_pin VALUES (1)');
+
+	# Materialize a snapshot on a cluster table before subject-table setup.  A
+	# catalog-only read does not register the cluster retention horizon.  Taking
+	# the counter baseline after setup excludes recycling of pre-pin setup slots.
+	my $pin = $ni->background_psql('postgres', on_error_die => 1);
+	$pin->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$pin->query_safe('SELECT count(*) FROM t270_commit_pin');
+	# Consume every pre-pin recyclable slot before taking the evidence baseline.
+	# One full 48-slot segment plus headroom makes the measured loop all-retained.
+	$ni->safe_psql('postgres', 'UPDATE t270_commit_pin SET id = id') for (1 .. 64);
+
+	$ni->safe_psql('postgres',
+		'CREATE TABLE t270_commit_reset (id int PRIMARY KEY, v int)');
+	$ni->safe_psql('postgres', 'INSERT INTO t270_commit_reset VALUES (1, 0)');
+
+	my $rollovers_before = undo_counter($ni, 'tt_retention_rollover_count');
+	my $recycles_before = undo_counter($ni, 'retention_recycle_count');
+
+	my $persistent = $ni->background_psql('postgres', on_error_die => 0);
+	my $committed = 0;
+	my $write_error = '';
+	for (1 .. 1030)
+	{
+		my $write_ok = eval {
+			# Each call is one implicit transaction on the same backend.
+			$persistent->query_safe(
+				'UPDATE t270_commit_reset SET v = v + 1 WHERE id = 1');
+			1;
+		};
+		if (!$write_ok)
+		{
+			$write_error = $@;
+			last;
+		}
+		$committed++;
+	}
+	eval { $persistent->quit; };
+
+	is($committed, 1030,
+		'L10 persistent backend completes 1030 autocommit undo writes');
+	diag("L10 persistent write error after $committed commits: $write_error")
+		if $committed != 1030;
+	is($ni->safe_psql('postgres',
+		'SELECT v FROM t270_commit_reset WHERE id = 1'),
+		'1030', 'L10 all writes committed without a hidden 53R9D failure');
+	cmp_ok(undo_counter($ni, 'tt_retention_rollover_count') - $rollovers_before,
+		'>=', 21, 'L10 workload crosses at least 21 TT retention rollovers');
+	is(undo_counter($ni, 'retention_recycle_count') - $recycles_before,
+		0, 'L10 pinned snapshot prevents TT-slot recycling during the workload');
+
+	$pin->query_safe('ROLLBACK');
+	$pin->quit;
+	$ni->stop;
 }
 
 done_testing();

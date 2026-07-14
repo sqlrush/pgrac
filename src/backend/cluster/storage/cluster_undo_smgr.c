@@ -55,10 +55,10 @@
  *	(8.5 open + 8.5 close per TPC-B txn).  Cache ONE O_RDWR fd for the
  *	most-recently-used (segment, owner) — O_RDWR serves both read_block and
  *	write_block.  Self-heals on (segment, owner) mismatch (close old + open
- *	new), bounding stale-fd exposure (e.g. a recycled segment) further by an
- *	xact-end reset (cluster_undo_record_xact_reset -> _fd_cache_reset) and a
- *	before_shmem_exit close.  Per-backend fds to a shared segment file are
- *	independent; each pwrites its own offset range, so no cross-backend hazard.
+ *	new).  Normal COMMIT preserves the cache; PREPARE/ABORT full teardown,
+ *	cache-key mismatch, and before_shmem_exit close it.  Per-backend fds to a
+ *	shared segment file are independent; each pwrites its own offset range, so
+ *	there is no cross-backend hazard.
  */
 static uint32 cached_fd_segment = 0; /* 0 = empty */
 static uint8 cached_fd_owner = 0;
@@ -128,8 +128,8 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 }
 
 /*
- * cluster_undo_smgr_fd_cache_reset -- close the cached fd (xact end / segment
- *	recycle).  Called from cluster_undo_record_xact_reset.
+ * cluster_undo_smgr_fd_cache_reset -- close the cached fd during full local
+ *	teardown or explicit cache invalidation.  Normal COMMIT does not call it.
  */
 void
 cluster_undo_smgr_fd_cache_reset(void)

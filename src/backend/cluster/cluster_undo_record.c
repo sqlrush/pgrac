@@ -10,15 +10,16 @@
  *	    - cluster_undo_record_alloc()  — write one undo record + durable flush
  *	    - cluster_undo_get_record()    — read one undo record by UBA
  *	    - cluster_undo_record_shmem_register/size/init
- *	    - cluster_undo_record_xact_reset()  — end-of-xact hook
- *	    - cluster_undo_record_is_touched()  — for D16 PREPARE guard
+ *	    - cluster_undo_record_xact_commit_release() — normal COMMIT cleanup
+ *	    - cluster_undo_record_xact_reset()  — PREPARE/ABORT full teardown
+ *	    - cluster_undo_record_is_touched()  — legacy write marker accessor
  *
  *	  Concurrency model(MVP):
  *	    - single per-instance LWLock(`cursor_lock`)protects active segment
  *	      cursor advance(active_segment_id / current_block / free_offset /
  *	      slot_count).多 backend 写同 instance → serialize on this lock.
- *	    - per-backend `cluster_undo_touched` static bool tracks D16 state;
- *	      reset on xact end.
+ *	    - per-backend transaction-local state is reset by the normal-COMMIT
+ *	      hook or the PREPARE/ABORT full teardown.
  *
  *	  Block boundary contract(per spec-3.7 §3.2):record 不跨 block。
  *	  block 不够时 advance 到下一 block;segment 不够时 ereport 53R9D
@@ -59,7 +60,7 @@
 #include <sys/stat.h>
 
 #include "miscadmin.h"
-#include "access/twophase.h" /* spec-4.12a D1: prepared-xact guard (硬门 6) */
+#include "access/twophase.h" /* spec-4.12a D1: prepared-xact retention guard */
 #include "access/xact.h"
 #include "port/atomics.h"
 #include "storage/fd.h"
@@ -238,28 +239,28 @@ static ClusterUndoRecordShared *UndoRecordShared = NULL;
  */
 static SCN *cluster_undo_write_registry = NULL;
 
-/* This backend already registered first_undo_scn for the current top-xact
- * (idempotent guard; cleared in cluster_undo_record_xact_reset). */
+/* This backend already registered first_undo_scn for the current top-xact.
+ * Cleared by normal-COMMIT cleanup or PREPARE/ABORT full teardown. */
 static bool cluster_undo_write_registered = false;
 
 /* spec-4.12a Hardening v1.0.1 (P0 8.A): this backend already revalidated its
  * carried-over residual extent for the current top-xact.  The carried residual
  * is only stale at the txn's first undo alloc (another backend may have rolled
  * the segment away since the previous xact); after the one locked revalidation
- * the extent is current-xact-owned and reused lock-free.  Cleared in
- * cluster_undo_record_xact_reset. */
+ * the extent is current-xact-owned and reused lock-free.  Re-armed by
+ * normal-COMMIT cleanup or PREPARE/ABORT full teardown. */
 static bool cluster_undo_residual_validated_this_xact = false;
 
-/* Per-backend state(D16 PREPARE guard support). */
+/* Legacy write marker retained as transaction-local API state. */
 static bool cluster_undo_touched_in_xact = false;
 
 /*
  * spec-3.18 D3:  the backend's currently-held undo extent.  segment_id ==
  * CLUSTER_UNDO_EXTENT_NONE means "no extent held" (claim one on next write).
  * The cursor (cur_block / cur_free_offset / cur_slot_count) advances lock-free
- * within the extent;  only claiming a new extent touches lifecycle_lock.  Reset
- * to NONE at end of xact (cluster_undo_record_xact_reset) -- residual blocks
- * are dropped (D3.3 will add the Q2 hybrid residual cache).
+ * within the extent; only claiming a new extent touches lifecycle_lock.  A
+ * residual extent is deliberately carried across transactions and revalidated
+ * under lifecycle_lock before the next top-xact reuses it.
  */
 static ClusterUndoExtent cluster_undo_current_extent = { 0 };
 
@@ -322,7 +323,8 @@ static bool cluster_undo_pending_flush_internal(bool error_on_fail);
  *
  *	Top-xact aggregation: subxact undo writes append to the same per-backend
  *	list and are flushed by the parent's precommit (no per-savepoint fsync).
- *	Reset (clear) happens at end of top-xact in cluster_undo_record_xact_reset.
+ *	Normal COMMIT clears the live count in its O(1) cleanup hook.  PREPARE and
+ *	ABORT clear it in cluster_undo_record_xact_reset().
  *	Overflow (> MAX distinct segments in one xact — pathological) degrades to an
  *	inline fsync of the overflowing segment, never back to per-record fsync.
  */
@@ -380,8 +382,9 @@ cluster_undo_record_touched_segment(uint32 segment_id, uint8 owner_instance)
  * undo UBA.  Existing spec-3.4b DML callers still pass the TT-only UBA as
  * `prev_uba` on every operation, so the record allocator must maintain the
  * true per-xact undo chain locally until later specs persist the TT head in
- * the undo segment header.  This state is reset at xact end together with
- * cluster_undo_touched_in_xact.
+ * the undo segment header.  Only entries below cluster_undo_local_head_count
+ * are live; normal COMMIT resets that count in O(1), while PREPARE/ABORT also
+ * zero the backing array during full teardown.
  */
 typedef struct ClusterUndoLocalHead {
 	uint16 tt_slot_segment_id;
@@ -433,7 +436,7 @@ cluster_undo_local_head_ensure(uint16 tt_slot_segment_id, uint16 tt_slot_offset,
  *	undo-chain head for a TT slot (segment_id, slot_offset), or InvalidUba if
  *	this backend wrote no undo for that slot this transaction.  Used by
  *	AtPrepare_ClusterTT to capture the head into the 2PC record while it is
- *	still in memory (the local head array is reset at xact end).
+ *	still in memory, before PostPrepare performs the full local teardown.
  */
 UBA
 cluster_undo_local_head_get(uint16 tt_slot_segment_id, uint16 tt_slot_offset)
@@ -606,11 +609,10 @@ cluster_undo_active_write_register(SCN first_undo_scn)
 
 /*
  * cluster_undo_active_write_unregister -- drop this backend's registry entry at
- *	end of top-xact (commit / abort / PREPARE; all route through
- *	cluster_undo_record_xact_reset).  On PREPARE the prepared-xact guard (硬门
- *	6) takes over keeping the undo alive -- see cluster_undo_any_unresolved_
- *	prepared(); the GlobalTransaction is already in TwoPhaseState (EndPrepare)
- *	before PostPrepare_ClusterTT reaches here, so the handoff has no gap.
+ *	end of top-xact.  Normal COMMIT calls the dedicated cleanup hook; PREPARE
+ *	and ABORT call the full reset.  On PREPARE, the prepared-xact guard takes
+ *	over retention after EndPrepare and before PostPrepare_ClusterTT unregisters
+ *	the active writer, so the handoff has no gap.
  */
 static void
 cluster_undo_active_write_unregister(void)
@@ -633,8 +635,7 @@ cluster_undo_active_write_unregister(void)
 }
 
 /*
- * cluster_undo_record_xact_commit_release -- spec-4.12a D6: release this
- *	backend's active-write boundary slot at COMMIT.
+ * cluster_undo_record_xact_commit_release -- normal-COMMIT undo cleanup.
  *
  *	The active-write boundary (cluster_undo_active_write_boundary) keeps a record
  *	segment retained from the ACTIVE -> COMMITTED drain only while an in-flight
@@ -643,27 +644,32 @@ cluster_undo_active_write_unregister(void)
  *	still gates COMMITTED -> RECYCLABLE), so the boundary entry must drop here --
  *	otherwise it pins the drain boundary for the life of the backend.
  *
- *	This is the missing commit-path release.  cluster_undo_record_xact_reset (the
- *	full per-xact undo teardown) only runs on the PREPARE (PrepareTransaction) and
- *	ABORT (CleanupTransaction) paths, NOT CommitTransaction -- so a short-lived
- *	connection was saved only by backend exit, while a persistent (pooled)
- *	connection that COMMITs and stays open kept its first transaction's
- *	first_undo_scn registered forever (register is idempotent per top-xact), which
- *	pinned the boundary and re-opened the spec-4.13 leak for every long-lived
- *	connection.  Commit needs only the boundary release, not the fd-cache /
- *	local-head teardown, so this is a dedicated minimal hook (avoids fd-cache
- *	churn on the commit hot path).
+ *	The full reset only runs on PREPARE and ABORT.  Normal COMMIT therefore
+ *	releases the active-write registry entry and clears all O(1) top-transaction
+ *	bookkeeping here: the touched marker, live local-head count, touched-segment
+ *	count, and residual-revalidation gate.  The residual extent and fd cache are
+ *	backend caches, not transaction state, and remain available for reuse.
  *
  *	8.A-safe: dropping the boundary only enables ACTIVE -> COMMITTED; the horizon
  *	still gates the actual reclaim (COMMITTED -> RECYCLABLE), so a committed xact's
  *	undo that an older snapshot still needs stays retained until the horizon
- *	passes.  Mirrors the PREPARE handoff, where the boundary also drops and the
- *	prepared-xact guard (硬门 6) takes over keeping the undo alive.
+ *	passes.  PREPARE uses the full reset after its prepared-xact retention guard
+ *	has taken over.
+ *
+ *	Spec: spec-4.12a-undo-record-segment-reclaim.md
  */
 void
 cluster_undo_record_xact_commit_release(void)
 {
+	/* Precommit is the release-build fail-closed boundary; keep a debug check at
+	 * the post-commit cleanup site to catch lifecycle regressions early. */
+	Assert(!cluster_undo_pending.active);
+
 	cluster_undo_active_write_unregister();
+	cluster_undo_touched_in_xact = false;
+	cluster_undo_local_head_count = 0;
+	cluster_undo_touched_seg_count = 0;
+
 	/* spec-4.12a Hardening v1.0.1: re-arm residual revalidation for the next
 	 * top-xact.  xact_reset (which also clears this) runs only on PREPARE/ABORT,
 	 * so the commit path must re-arm it here -- otherwise a persistent connection
@@ -1725,7 +1731,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, 1);
 
-	/* Mark backend touched for D16 PREPARE guard. */
+	/* Mark transaction-local undo state as touched. */
 	cluster_undo_touched_in_xact = true;
 
 	/* P0 perf hardening: record the dirtied undo segment for a single per-xact
@@ -1848,8 +1854,9 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
  *	critical section, so the xact aborts cleanly (its un-fsync'd undo blocks are
  *	irrelevant to an aborted xact) — never a silent half-durable commit.
  *
- *	No-op for a xact that wrote no undo (DDL-only / read-only).  The touched
- *	list is cleared by cluster_undo_record_xact_reset at end of xact.
+ *	No-op for a xact that wrote no undo (DDL-only / read-only).  Normal COMMIT
+ *	clears the touched list in its O(1) cleanup hook; PREPARE/ABORT use the full
+ *	reset.
  */
 void
 cluster_undo_xact_precommit_flush(void)
@@ -1863,6 +1870,11 @@ cluster_undo_xact_precommit_flush(void)
 	 * pending image exists exactly on the write-back path.
 	 */
 	(void)cluster_undo_pending_flush_internal(true);
+	if (unlikely(cluster_undo_pending.active))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster undo block remained pending before transaction finish"),
+						errhint("Retry the transaction and inspect the server log for an undo WAL "
+								"flush failure.")));
 
 	if (cluster_undo_touched_seg_count == 0)
 		return;
@@ -1901,14 +1913,11 @@ cluster_undo_xact_precommit_flush(void)
 
 
 /*
- * cluster_undo_record_xact_reset -- end-of-xact hook;  reset per-backend
- *	touched flag.  Called from xact.c CommitTransaction / AbortTransaction.
+ * cluster_undo_record_xact_reset -- PREPARE/ABORT full per-backend teardown.
  *
- *	Also clears the per-xact touched-undo-segment list.  On commit the list was
- *	already fsync'd by cluster_undo_xact_precommit_flush; on abort it is simply
- *	dropped (un-fsync'd undo of an aborted xact needs no durability) — this is
- *	the lazy/best-effort abort path.  Clearing here prevents leakage into the
- *	next xact on this backend.
+ *	PREPARE already flushed the touched undo segments before EndPrepare.  On
+ *	ABORT the list is simply dropped because aborted undo needs no durability.
+ *	Normal COMMIT uses cluster_undo_record_xact_commit_release() instead.
  */
 void
 cluster_undo_record_xact_reset(void)
@@ -1933,9 +1942,7 @@ cluster_undo_record_xact_reset(void)
 	}
 
 	cluster_undo_touched_in_xact = false;
-	/* spec-4.12a D1: drop this backend's active-write registry entry (commit /
-	 * abort / PREPARE all reach here).  On PREPARE the prepared-xact guard (硬门
-	 * 6) keeps the undo alive past this point. */
+	/* PREPARE's durable guard keeps its undo alive after this handoff. */
 	cluster_undo_active_write_unregister();
 	/* spec-4.12a Hardening v1.0.1: re-arm residual revalidation for the next
 	 * top-xact (its carried residual must be re-checked under lifecycle_lock). */
@@ -1953,14 +1960,13 @@ cluster_undo_record_xact_reset(void)
 	 * recycled, so a residual in it is always safe).  A block may then hold
 	 * records from several transactions -- correct (UBA addresses by row).
 	 */
-	/* P0 perf hardening: drop the cached undo segment fd at xact end to bound
-	 * stale-fd exposure (e.g. a recycled segment) across transactions. */
+	/* Full PREPARE/ABORT teardown closes the cache.  Normal COMMIT preserves it. */
 	cluster_undo_smgr_fd_cache_reset();
 }
 
 
 /*
- * cluster_undo_record_is_touched -- D16 PREPARE TRANSACTION guard helper.
+ * cluster_undo_record_is_touched -- legacy transaction-local write marker.
  */
 bool
 cluster_undo_record_is_touched(void)
