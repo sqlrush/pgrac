@@ -911,6 +911,17 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *     could fire after the commit record is already durable.
 	 */
 	{ .name = "cluster-boc-event-publish" },
+
+	/*
+	 * S3 forensics step 1a — GES timeout-source semantic RED.
+	 *   cluster-ges-master-work-queue-full: fires in the master-side
+	 *     GES_REQUEST handler just before the work-queue enqueue;  SKIP
+	 *     forces the WORK_QUEUE_FULL reject reply so a remote requester
+	 *     deterministically exercises the reply-tail attribution
+	 *     (source=master-reject-queue-full + capacity counter) that the
+	 *     S3 storm's dominant "cluster lock acquire timeout" fold hides.
+	 */
+	{ .name = "cluster-ges-master-work-queue-full" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

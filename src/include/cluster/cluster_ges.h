@@ -110,14 +110,18 @@ typedef struct ClusterGesSharedState {
  *	synchronous acquire), so no locking.
  */
 typedef enum ClusterGesTimeoutSrc {
-	CLUSTER_GES_TSRC_NONE = 0,				 /* no GES detail recorded (unattributed) */
-	CLUSTER_GES_TSRC_NULL_ARG,				 /* internal: NULL resid/holder */
-	CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL,	 /* capacity: reply-wait table full */
-	CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, /* capacity: GRD wait queue / not-ready */
-	CLUSTER_GES_TSRC_OUTBOUND_RING_FULL,	 /* send-fail: outbound ring enqueue failed */
-	CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,		 /* true wait: CV sleep ran out the deadline */
-	CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED,	 /* retransmit budget burned before grant */
-	CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT,	 /* native-lock probe could not prove clear */
+	CLUSTER_GES_TSRC_NONE = 0,				   /* no GES detail recorded (unattributed) */
+	CLUSTER_GES_TSRC_NULL_ARG,				   /* internal: NULL resid/holder */
+	CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL,	   /* capacity: reply-wait table full */
+	CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL,   /* capacity: GRD wait queue / not-ready */
+	CLUSTER_GES_TSRC_OUTBOUND_RING_FULL,	   /* send-fail: outbound ring enqueue failed */
+	CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,		   /* true wait: CV sleep ran out the deadline */
+	CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED,	   /* retransmit budget burned before grant */
+	CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT,	   /* native-lock probe could not prove clear */
+	CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, /* capacity: master REPLIED WORK_QUEUE_FULL
+											    * (dedup table / work queue / wait queue full
+											    * on the master — the reply-tail fold) */
+	CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT,	   /* master replied TIMEOUT (reply-tail fold) */
 } ClusterGesTimeoutSrc;
 
 typedef struct ClusterGesTimeoutDetail {

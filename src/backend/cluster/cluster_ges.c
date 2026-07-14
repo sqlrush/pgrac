@@ -40,6 +40,7 @@
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_inject.h"				 /* S3 forensics — master work-queue-full RED */
 #include "cluster/cluster_lmd.h"				 /* cluster_lmd_is_ready */
 #include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — shmem REPORT collect_receive */
 #include "cluster/cluster_cancel_token.h"		 /* spec-5.9 D3 cluster_cancel_token_consume */
@@ -764,8 +765,12 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 
 	/* Phase 1 (handler):  enqueue into work_queue.  Grant decision runs
 	 * Phase 2 in LMON tick body (Step 4 D9 wires).  work_queue full →
-	 * REJECT_BUSY reply via reserved pool (I46 nofail). */
-	if (!cluster_grd_work_queue_enqueue(env->source_node_id, payload, sizeof(*req))) {
+	 * REJECT_BUSY reply via reserved pool (I46 nofail).
+	 * S3 forensics step 1a inject — SKIP forces the full-queue reject so the
+	 * requester-side reply-tail attribution RED is deterministic. */
+	CLUSTER_INJECTION_POINT("cluster-ges-master-work-queue-full");
+	if (cluster_injection_should_skip("cluster-ges-master-work-queue-full")
+		|| !cluster_grd_work_queue_enqueue(env->source_node_id, payload, sizeof(*req))) {
 		GesReplyPayload reject;
 
 		cluster_grd_inc_ges_work_queue_full();
@@ -1475,6 +1480,7 @@ cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node, long
 		break;
 	case CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL:
 	case CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL:
+	case CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL:
 		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_capacity_count, 1);
 		break;
 	case CLUSTER_GES_TSRC_OUTBOUND_RING_FULL:
@@ -1485,6 +1491,10 @@ cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node, long
 		break;
 	case CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT:
 		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_native_probe_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT:
+		/* master-reported timeout: neither a local wait nor a local capacity
+		 * event — visible via the errdetail source text only. */
 		break;
 	case CLUSTER_GES_TSRC_NONE:
 	case CLUSTER_GES_TSRC_NULL_ARG:
@@ -1504,6 +1514,15 @@ const ClusterGesTimeoutDetail *
 cluster_ges_timeout_detail_get(void)
 {
 	return &ges_timeout_detail;
+}
+
+/* True wall-clock spent in the current send-and-wait (NOT the configured
+ * timeout): capacity/send failures report the ~0ms they really took, so the
+ * "surfaced as timeout but never waited" class is provable per incident. */
+static inline long
+ges_forens_elapsed_ms(TimestampTz start)
+{
+	return (long)((GetCurrentTimestamp() - start) / 1000);
 }
 
 const char *
@@ -1526,6 +1545,10 @@ cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src)
 		return "retransmit-exhausted";
 	case CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT:
 		return "native-probe-timeout";
+	case CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL:
+		return "master-reject-queue-full";
+	case CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT:
+		return "master-reject-timeout";
 	}
 	return "unknown";
 }
@@ -1675,13 +1698,16 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	uint32 wait_ev = (wait_event != 0) ? wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	ClusterXpScope xp_enqueue; /* PGRAC: spec-5.59 D2 profiling */
 	ClusterXpScope xp_wait;	   /* PGRAC: spec-5.59 D2 profiling */
+	/* S3 forensics step 1a — wall-clock base for the timeout-source detail. */
+	TimestampTz forens_start = GetCurrentTimestamp();
 
 	/* PGRAC: spec-5.59 D2 profiling — whole-body REQUEST send -> grant/reject */
 	cluster_xp_begin(&xp_enqueue, CLXP_W_GES_ENQUEUE);
 
 	if (resid == NULL || holder == NULL) {
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1, 0, 0, -1, timeout_ms);
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1,
+									   ges_forens_elapsed_ms(forens_start), 0, -1, timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -1757,7 +1783,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, cluster_node_id,
-										   0, 0, n_conflict, timeout_ms);
+										   ges_forens_elapsed_ms(forens_start), 0, n_conflict,
+										   timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 
@@ -1789,7 +1816,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, cluster_node_id,
-										   0, 0, n_conflict, perpetual ? -1 : effective_timeout_ms);
+										   ges_forens_elapsed_ms(forens_start), 0, n_conflict,
+										   perpetual ? -1 : effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 		}
 
@@ -1874,7 +1902,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			if (cluster_grd_cancel_waiter_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK) {
 				/* timed_out only sets in finite mode: effective_timeout_ms valid. */
 				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, cluster_node_id,
-											   (long)effective_timeout_ms, 0, n_conflict,
+											   ges_forens_elapsed_ms(forens_start), 0, n_conflict,
 											   effective_timeout_ms);
 				return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 			}
@@ -1885,7 +1913,17 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		cluster_ges_reply_wait_delete(&key);
 		/* GRANT (reject_reason == NONE) -> holder registered by the drain; S5
 		 * verify-only.  A non-NONE reject means the drain consumed the waiter
-		 * with a rejection — fail closed with that reason. */
+		 * with a rejection — fail closed with that reason.
+		 * S3 forensics step 1a — a drain-REPLIED rejection that lock.c folds
+		 * into "cluster lock acquire timeout" must not surface unattributed. */
+		if (reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL,
+										   cluster_node_id, ges_forens_elapsed_ms(forens_start), 0,
+										   n_conflict, perpetual ? -1 : effective_timeout_ms);
+		else if (reject_reason == GES_REJECT_REASON_TIMEOUT)
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT, cluster_node_id,
+										   ges_forens_elapsed_ms(forens_start), 0, n_conflict,
+										   perpetual ? -1 : effective_timeout_ms);
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 		return reject_reason;
 	}
@@ -1933,7 +1971,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 								 "(request_id=" UINT64_FORMAT " dest=%d) — fail closed",
 								 request_id, master)));
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, master, 0, 0, -1,
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, master,
+									   ges_forens_elapsed_ms(forens_start), 0, -1,
 									   effective_timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
@@ -1962,7 +2001,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		/* Outbound ring full — fail closed.  Caller may retry. */
 		cluster_ges_reply_wait_delete(&key);
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, 0, -1,
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master,
+									   ges_forens_elapsed_ms(forens_start), 0, -1,
 									   effective_timeout_ms);
 		return GES_REJECT_REASON_WORK_QUEUE_FULL;
 	}
@@ -2046,7 +2086,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 				cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, master,
-											   (long)effective_timeout_ms, attempt, -1,
+											   ges_forens_elapsed_ms(forens_start), attempt, -1,
 											   effective_timeout_ms);
 				return GES_REJECT_REASON_TIMEOUT;
 			}
@@ -2073,15 +2113,13 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 
 		if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
-			long forens_elapsed_ms
-				= (long)effective_timeout_ms - (long)((deadline - GetCurrentTimestamp()) / 1000);
-
 			ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED, master,
-										   forens_elapsed_ms, attempt, -1, effective_timeout_ms);
+										   ges_forens_elapsed_ms(forens_start), attempt, -1,
+										   effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 
@@ -2118,8 +2156,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, attempt,
-										   -1, effective_timeout_ms);
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master,
+										   ges_forens_elapsed_ms(forens_start), attempt, -1,
+										   effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 		if (cluster_ges_state != NULL)
@@ -2135,6 +2174,19 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	/* Capture verdict, then delete entry (HC17 pairing invariant). */
 	reject_reason = entry->reject_reason;
 	cluster_ges_reply_wait_delete(&key);
+
+	/* S3 forensics step 1a — the REMOTE master's replied rejection (dedup
+	 * table / work queue / wait queue full) folds into lock.c's "cluster
+	 * lock acquire timeout"; attribute it here so the dominant S3 error is
+	 * never counted as an unattributed local wait. */
+	if (reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, master,
+									   ges_forens_elapsed_ms(forens_start), attempt, -1,
+									   effective_timeout_ms);
+	else if (reject_reason == GES_REJECT_REASON_TIMEOUT)
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT, master,
+									   ges_forens_elapsed_ms(forens_start), attempt, -1,
+									   effective_timeout_ms);
 
 	cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 	return reject_reason;
@@ -2409,13 +2461,16 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	bool local_master;
 	ClusterXpScope xp_convert; /* PGRAC: spec-5.59 D2 profiling */
 	ClusterXpScope xp_wait;	   /* PGRAC: spec-5.59 D2 profiling */
+	/* S3 forensics step 1a — wall-clock base for the timeout-source detail. */
+	TimestampTz forens_start = GetCurrentTimestamp();
 
 	/* PGRAC: spec-5.59 D2 profiling — whole-body CONVERT send -> grant/reject */
 	cluster_xp_begin(&xp_convert, CLXP_W_GES_CONVERT);
 
 	if (resid == NULL || holder == NULL) {
 		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
-		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1, 0, 0, -1, timeout_ms);
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1,
+									   ges_forens_elapsed_ms(forens_start), 0, -1, timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -2437,7 +2492,8 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 												 effective_timeout_ms)) {
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT, cluster_node_id,
-										   (long)effective_timeout_ms, 0, -1, effective_timeout_ms);
+										   ges_forens_elapsed_ms(forens_start), 0, -1,
+										   effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 	}
@@ -2452,9 +2508,9 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	entry = cluster_ges_reply_wait_insert(&key, deadline);
 	if (entry == NULL) {
 		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
-		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL,
-									   local_master ? cluster_node_id : master, 0, 0, -1,
-									   effective_timeout_ms);
+		cluster_ges_timeout_detail_set(
+			CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, local_master ? cluster_node_id : master,
+			ges_forens_elapsed_ms(forens_start), 0, -1, effective_timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -2482,14 +2538,16 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			cluster_ges_reply_wait_delete(&key);
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, cluster_node_id,
-										   0, 0, -1, effective_timeout_ms);
+										   ges_forens_elapsed_ms(forens_start), 0, -1,
+										   effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 	} else {
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
-			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, 0, -1,
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master,
+										   ges_forens_elapsed_ms(forens_start), 0, -1,
 										   effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
@@ -2541,9 +2599,9 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
-			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,
-										   local_master ? cluster_node_id : master,
-										   (long)effective_timeout_ms, 0, -1, effective_timeout_ms);
+			cluster_ges_timeout_detail_set(
+				CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, local_master ? cluster_node_id : master,
+				ges_forens_elapsed_ms(forens_start), 0, -1, effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 		remaining_ms = (long)((deadline - now) / 1000);
@@ -2558,6 +2616,16 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 
 	reject_reason = entry->reject_reason;
 	cluster_ges_reply_wait_delete(&key);
+	/* S3 forensics step 1a — attribute a master-replied CONVERT rejection
+	 * that the S5 mapping folds into FAIL_TIMEOUT (see the REQUEST tails). */
+	if (reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
+		cluster_ges_timeout_detail_set(
+			CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, local_master ? cluster_node_id : master,
+			ges_forens_elapsed_ms(forens_start), 0, -1, effective_timeout_ms);
+	else if (reject_reason == GES_REJECT_REASON_TIMEOUT)
+		cluster_ges_timeout_detail_set(
+			CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT, local_master ? cluster_node_id : master,
+			ges_forens_elapsed_ms(forens_start), 0, -1, effective_timeout_ms);
 	cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 	return reject_reason;
 }

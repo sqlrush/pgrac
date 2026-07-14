@@ -87,8 +87,8 @@ my $node0 = $pair->node0;
 # ----------
 my $undo_row_count = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='undo'});
-is($undo_row_count, '68',
-	"L2 undo category has 68 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 9 terminal-authority [spec-6.2] + 6 cleaner + 4 buf/extent obs [spec-3.18 D7] + 1 spec-3.22 retention_off_recycle + 4 checkpoint-writeback boundary [spec-4.8ab D7] + 2 record-segment reclaim [spec-4.12a D5] + 1 residual-revalidate-drop [spec-4.12a Hardening v1.0.1] + 1 retention_max_recycle_horizon [spec-6.15 D4] + 6 undo GCS grant-plane [spec-5.22b D2-6] + 8 horizon brake observability [spec-5.22e D5-5, D5 lane 漏更 t/214])"
+is($undo_row_count, '70',
+	"L2 undo category has 70 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 9 terminal-authority [spec-6.2] + 6 cleaner + 4 buf/extent obs [spec-3.18 D7] + 1 spec-3.22 retention_off_recycle + 4 checkpoint-writeback boundary [spec-4.8ab D7] + 2 record-segment reclaim [spec-4.12a D5] + 1 residual-revalidate-drop [spec-4.12a Hardening v1.0.1] + 1 retention_max_recycle_horizon [spec-6.15 D4] + 6 undo GCS grant-plane [spec-5.22b D2-6] + 8 horizon brake observability [spec-5.22e D5-5, D5 lane 漏更 t/214] + 2 TT-rollover failure split [S3 forensics step 1a])"
 );
 
 

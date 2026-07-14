@@ -2807,6 +2807,11 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_slot_retention_off_recycle_count()));
 	emit_row(rsinfo, "undo", "tt_retention_rollover_count",
 			 fmt_int64((int64)cluster_undo_tt_retention_rollover_count()));
+	/* S3 forensics step 1a — TT-rollover failure split (writer 53R9E family). */
+	emit_row(rsinfo, "undo", "tt_rollover_fail_hard_cap_count",
+			 fmt_int64((int64)cluster_undo_tt_rollover_fail_hard_cap_count()));
+	emit_row(rsinfo, "undo", "tt_rollover_fail_extend_count",
+			 fmt_int64((int64)cluster_undo_tt_rollover_fail_extend_count()));
 
 	/* spec-6.2: Smart Fusion terminal-authority substrate counters. */
 	emit_row(rsinfo, "undo", "terminal_authority_check_count",

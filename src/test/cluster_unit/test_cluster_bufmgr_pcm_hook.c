@@ -143,7 +143,9 @@ uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
 static union {
 	uint64 force_align;
-	char data[4096];
+	/* Sized above sizeof(ClusterPcmShared): the S3-forensics watermark
+	 * provenance ring (256 x 64B) grew the header past the old 4096. */
+	char data[32768];
 } fake_pcm_header;
 
 static union {

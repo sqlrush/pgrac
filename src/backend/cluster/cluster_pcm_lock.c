@@ -312,6 +312,24 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 writer_reverify_reacquire_count;
 	pg_atomic_uint64 restore_aba_detected_count;
 	pg_atomic_uint64 invalidate_parked_grant_pending_count;
+	/* S3 forensics step 1a — SCN-watermark advance provenance ring (see
+	 * cluster_pcm_lock.h ClusterPcmWmProv).  Slots are claimed with a
+	 * fetch-add on wm_prov_next; each entry is stamped with its claim seq
+	 * AFTER the payload (write barrier) so a torn wrap-around read is
+	 * detectable.  Diagnostic-only: readers tolerate a missed entry. */
+	pg_atomic_uint32 wm_prov_next;
+	struct {
+		BufferTag tag;	   /* 20B */
+		uint32 seq;		   /* claim seq + 1 (0 = never written) */
+		SCN old_scn;	   /* watermark before the feed */
+		SCN new_scn;	   /* fed page_scn */
+		uint64 request_id; /* wire identity (0 = none) */
+		uint64 epoch;	   /* wire epoch (0 = none) */
+		int32 sender_node; /* -1 = local/unknown */
+		uint8 source;	   /* ClusterPcmWmSrc */
+		uint8 advanced;	   /* monotone max actually raised */
+		uint16 _pad;
+	} wm_prov[256];
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -339,6 +357,11 @@ static int pcm_grd_effective = 0;
 
 /* Forward decl — file-private HTAB lazy-alloc helper defined below init_fn. */
 static struct GrdEntry *pcm_get_or_create_entry(BufferTag tag);
+/* S3 forensics step 1a — watermark-advance provenance recorder (defined with
+ * the watermark helpers below; used by the inline writer sites above them). */
+static void pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, bool advanced,
+							   ClusterPcmWmSrc source, int32 sender_node, uint64 request_id,
+							   uint64 epoch);
 static struct GrdEntry *pcm_find_entry(BufferTag tag);
 static void pcm_entry_lock_exclusive(struct GrdEntry *entry);
 static uint32 pcm_holder_bit(int holder_node_id);
@@ -1000,7 +1023,8 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 	struct GrdEntry *entry;
 	uint32 holder_bit;
 
-	(void)cluster_epoch; /* already gated by the handler (L235/L236);  D3 may re-pin */
+	/* epoch already gated by the handler (L235/L236); recorded below as the
+	 * re-declare feed's provenance epoch (S3 forensics step 1a). */
 
 	if (cluster_pcm_htab == NULL)
 		return false;
@@ -1070,10 +1094,18 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 		entry->pi_watermark_lsn = (uint64)page_lsn;
 	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
-	if (SCN_VALID(page_scn)
-		&& scn_local(page_scn)
-			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
-		entry->pi_watermark_scn = page_scn;
+	if (SCN_VALID(page_scn)) {
+		SCN wm_old = entry->pi_watermark_scn;
+		bool wm_advanced = false;
+
+		if (scn_local(page_scn)
+			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
+			entry->pi_watermark_scn = page_scn;
+			wm_advanced = true;
+		}
+		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_REDECLARE,
+						   source_node, 0, cluster_epoch);
+	}
 
 	LWLockRelease(&entry->entry_lock.lock);
 	return true; /* holder recorded */
@@ -1129,10 +1161,17 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
 		entry->pi_watermark_lsn = (uint64)page_lsn;
 	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
-	if (SCN_VALID(page_scn)
-		&& scn_local(page_scn)
-			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
-		entry->pi_watermark_scn = page_scn;
+	if (SCN_VALID(page_scn)) {
+		SCN wm_old = entry->pi_watermark_scn;
+		bool wm_advanced = false;
+
+		if (scn_local(page_scn)
+			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
+			entry->pi_watermark_scn = page_scn;
+			wm_advanced = true;
+		}
+		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_TAKE_X, -1, 0, 0);
+	}
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -1183,10 +1222,18 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 		entry->pi_watermark_lsn = (uint64)page_lsn;
 	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
-	if (SCN_VALID(page_scn)
-		&& scn_local(page_scn)
-			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
-		entry->pi_watermark_scn = page_scn;
+	if (SCN_VALID(page_scn)) {
+		SCN wm_old = entry->pi_watermark_scn;
+		bool wm_advanced = false;
+
+		if (scn_local(page_scn)
+			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
+			entry->pi_watermark_scn = page_scn;
+			wm_advanced = true;
+		}
+		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_GRANT_X,
+						   requester_node, 0, 0);
+	}
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -1254,14 +1301,113 @@ cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr page_lsn)
 }
 
 /*
+ * S3 forensics step 1a — SCN-watermark advance provenance ring.
+ *
+ *	pcm_wm_prov_record claims a slot with a fetch-add, invalidates it
+ *	(seq=0), writes the payload, then stamps seq+1 behind a write barrier;
+ *	the seq1/payload/seq2 read protocol in prov_query detects a torn
+ *	wrap-around rewrite.  Diagnostic-only ring: a missed or overwritten
+ *	record degrades to "no provenance", never to a wrong record.
+ */
+static void
+pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, bool advanced, ClusterPcmWmSrc source,
+				   int32 sender_node, uint64 request_id, uint64 epoch)
+{
+	uint32 seq;
+	uint32 idx;
+
+	if (ClusterPcm == NULL)
+		return;
+	seq = pg_atomic_fetch_add_u32(&ClusterPcm->wm_prov_next, 1);
+	idx = seq % (uint32)lengthof(ClusterPcm->wm_prov);
+	ClusterPcm->wm_prov[idx].seq = 0; /* invalidate while rewriting */
+	pg_write_barrier();
+	ClusterPcm->wm_prov[idx].tag = tag;
+	ClusterPcm->wm_prov[idx].old_scn = old_scn;
+	ClusterPcm->wm_prov[idx].new_scn = new_scn;
+	ClusterPcm->wm_prov[idx].request_id = request_id;
+	ClusterPcm->wm_prov[idx].epoch = epoch;
+	ClusterPcm->wm_prov[idx].sender_node = sender_node;
+	ClusterPcm->wm_prov[idx].source = (uint8)source;
+	ClusterPcm->wm_prov[idx].advanced = advanced ? 1 : 0;
+	pg_write_barrier();
+	ClusterPcm->wm_prov[idx].seq = seq + 1;
+}
+
+const char *
+cluster_pcm_wm_src_text(ClusterPcmWmSrc src)
+{
+	switch (src) {
+	case CLUSTER_PCM_WM_SRC_NONE:
+		return "none";
+	case CLUSTER_PCM_WM_SRC_REDECLARE:
+		return "redeclare";
+	case CLUSTER_PCM_WM_SRC_TAKE_X:
+		return "take-x-after-transfer";
+	case CLUSTER_PCM_WM_SRC_GRANT_X:
+		return "grant-x-ship";
+	case CLUSTER_PCM_WM_SRC_ACK_SLOTLESS:
+		return "invalidate-ack-slotless";
+	case CLUSTER_PCM_WM_SRC_ACK_SLOT:
+		return "invalidate-ack-slot";
+	}
+	return "unknown";
+}
+
+bool
+cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag, ClusterPcmWmProv *out)
+{
+	uint32 best_seq = 0;
+	bool found = false;
+	int i;
+
+	if (ClusterPcm == NULL || out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->sender_node = -1;
+	for (i = 0; i < (int)lengthof(ClusterPcm->wm_prov); i++) {
+		uint32 seq1 = ClusterPcm->wm_prov[i].seq;
+		BufferTag etag;
+		ClusterPcmWmProv cand;
+		uint32 seq2;
+
+		if (seq1 == 0)
+			continue;
+		pg_read_barrier();
+		etag = ClusterPcm->wm_prov[i].tag;
+		cand.source = (ClusterPcmWmSrc)ClusterPcm->wm_prov[i].source;
+		cand.sender_node = ClusterPcm->wm_prov[i].sender_node;
+		cand.request_id = ClusterPcm->wm_prov[i].request_id;
+		cand.epoch = ClusterPcm->wm_prov[i].epoch;
+		cand.old_scn = ClusterPcm->wm_prov[i].old_scn;
+		cand.new_scn = ClusterPcm->wm_prov[i].new_scn;
+		cand.advanced = ClusterPcm->wm_prov[i].advanced != 0;
+		pg_read_barrier();
+		seq2 = ClusterPcm->wm_prov[i].seq;
+		if (seq1 != seq2 || !BufferTagsEqual(&etag, &tag))
+			continue;
+		if (seq1 > best_seq) {
+			best_seq = seq1;
+			*out = cand;
+			found = true;
+		}
+	}
+	return found;
+}
+
+/*
  * PGRAC: spec-2.41 D2 §2.8.1 — SCN watermark (lost-write detector ONLY).
  *	Monotone-max of the cross-node pd_block_scn observed for this tag; the
  *	detector compares a shipped page's pd_block_scn against this (§2.6).  Fed
  *	by the local-page sources today; the ack/redeclare wire sources feed it
  *	once D3 carries pd_block_scn on the wire.
+ *	S3 forensics step 1a: every feed records its provenance (source enum +
+ *	wire identity + old->new + advanced?) so a 53R93's expected_scn can be
+ *	traced to the advance that produced it.
  */
 void
-cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn)
+cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn, ClusterPcmWmSrc source,
+										  int32 sender_node, uint64 request_id, uint64 epoch)
 {
 	struct GrdEntry *entry;
 	bool found;
@@ -1272,13 +1418,21 @@ cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
+		SCN wm_old;
+		bool wm_advanced = false;
+
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		wm_old = entry->pi_watermark_scn;
 		/* monotone-max by local_scn (scn_time_cmp order); page_scn already
 		 * SCN_VALID-checked above. */
 		if (scn_local(page_scn)
-			> scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
 			entry->pi_watermark_scn = page_scn;
+			wm_advanced = true;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
+		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, source, sender_node, request_id,
+						   epoch);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
@@ -3039,6 +3193,9 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->writer_reverify_reacquire_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->restore_aba_detected_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->invalidate_parked_grant_pending_count, 0);
+		/* S3 forensics step 1a — provenance ring (entries zeroed by the
+		 * memset above; seq 0 marks never-written slots). */
+		pg_atomic_init_u32(&ClusterPcm->wm_prov_next, 0);
 	}
 
 	/*

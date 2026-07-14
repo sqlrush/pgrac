@@ -537,7 +537,44 @@ cluster_pcm_mode_covers(PcmLockMode have, PcmLockMode want)
  */
 extern void cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr page_lsn);
 extern XLogRecPtr cluster_pcm_lock_pi_watermark_lsn_query(BufferTag tag);
-extern void cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn);
+
+/*
+ * S3 forensics step 1a — SCN-watermark advance PROVENANCE.
+ *
+ *	The lost-write detector's expected_scn is only as trustworthy as the
+ *	last advance that produced it: a late / wrong-generation invalidate-ACK
+ *	feeding the monotone max would fabricate lost-write verdicts against
+ *	perfectly current pages.  Every SCN-watermark feed site therefore
+ *	records {source, sender, request_id, epoch, old->new, advanced?} into a
+ *	small shmem ring; the 53R93 emit sites on the MASTER (the only node
+ *	whose ring is authoritative for its tags) attach the latest record so a
+ *	shipped<expected verdict can be qualified as branch-3 (watermark
+ *	false-positive) without a rerun.
+ */
+typedef enum ClusterPcmWmSrc {
+	CLUSTER_PCM_WM_SRC_NONE = 0,	 /* no advance recorded for the tag */
+	CLUSTER_PCM_WM_SRC_REDECLARE,	 /* survivor re-declare wire (rebuild) */
+	CLUSTER_PCM_WM_SRC_TAKE_X,		 /* local-master take-X after holder transfer */
+	CLUSTER_PCM_WM_SRC_GRANT_X,		 /* master grant-X ship to remote requester */
+	CLUSTER_PCM_WM_SRC_ACK_SLOTLESS, /* invalidate-ACK slotless e2 fan-out feed */
+	CLUSTER_PCM_WM_SRC_ACK_SLOT,	 /* invalidate-ACK slot-claimed blocking feed */
+} ClusterPcmWmSrc;
+
+typedef struct ClusterPcmWmProv {
+	ClusterPcmWmSrc source;
+	int32 sender_node; /* wire sender / requester; -1 = local/unknown */
+	uint64 request_id; /* wire request id; 0 = none */
+	uint64 epoch;	   /* wire epoch; 0 = none */
+	SCN old_scn;	   /* watermark before the feed */
+	SCN new_scn;	   /* fed page_scn (proposed value) */
+	bool advanced;	   /* did the feed actually raise the monotone max? */
+} ClusterPcmWmProv;
+
+extern const char *cluster_pcm_wm_src_text(ClusterPcmWmSrc src);
+extern void cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn,
+													  ClusterPcmWmSrc source, int32 sender_node,
+													  uint64 request_id, uint64 epoch);
+extern bool cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag, ClusterPcmWmProv *out);
 extern SCN cluster_pcm_lock_pi_watermark_scn_query(BufferTag tag);
 extern void cluster_pcm_lock_pi_watermark_retire_for_tag(BufferTag tag);
 extern uint64 cluster_pcm_lock_pi_watermark_retire_for_relation_fork(Oid db_oid,

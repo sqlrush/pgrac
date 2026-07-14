@@ -153,6 +153,14 @@ typedef struct ClusterUndoRecordShared {
 	 * allocator rebound to a fresh one instead of erroring "48 slots full"). */
 	pg_atomic_uint64 tt_retention_rollover_count;
 
+	/* S3 forensics step 1a: TT-rollover FAILURES, split by cause.  The
+	 * record-extent CLAIM path has its own segment_hard_cap_fail_count
+	 * above — these two count ONLY cluster_undo_tt_rollover_locked fails
+	 * (the writer-facing "retention rollover failed" error), so the TT
+	 * errdetail never cites another path's counter. */
+	pg_atomic_uint64 tt_rollover_fail_hard_cap_count; /* pool at hard cap */
+	pg_atomic_uint64 tt_rollover_fail_extend_count;	  /* autoextend / FS fail */
+
 	/* spec-3.18 D3: extent claims (one per ~undo_extent_blocks records per
 	 * backend instead of one cursor_lock acquire per record). */
 	pg_atomic_uint64 extent_claim_count;
@@ -496,6 +504,8 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_hard_cap_fail_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_reuse_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_retention_rollover_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_hard_cap_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_retain_skip_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->extent_claim_count, 0); /* spec-3.18 D3 */
 
@@ -2065,6 +2075,12 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 	}
 	PG_END_TRY();
 	if (new_segment_id == 0) {
+		/* S3 forensics step 1a — TT-rollover-specific failure split (the
+		 * record-extent CLAIM path counts its own hard-cap fails). */
+		if (out_at_hard_cap != NULL && *out_at_hard_cap)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_hard_cap_count, 1);
+		else
+			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return 0;
 	}
@@ -2127,6 +2143,23 @@ cluster_undo_tt_retention_rollover_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->tt_retention_rollover_count);
+}
+
+/* S3 forensics step 1a — TT-rollover failure split accessors. */
+uint64
+cluster_undo_tt_rollover_fail_hard_cap_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->tt_rollover_fail_hard_cap_count);
+}
+
+uint64
+cluster_undo_tt_rollover_fail_extend_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->tt_rollover_fail_extend_count);
 }
 
 uint64

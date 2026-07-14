@@ -1303,31 +1303,54 @@ cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN ex
 	 * local copy refused refresh" (page_scn is then the pre-refresh local
 	 * read). */
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 1);
-	if (cluster_gcs_block_lost_write_action == 0 /* ERROR */)
+	{
+		/* Step 1a — best-effort local provenance view: authoritative when this
+		 * node masters the tag; otherwise the master's LOG line rules. */
+		ClusterPcmWmProv wm_prov;
+		bool wm_have = cluster_pcm_lock_pi_watermark_prov_query(tag, &wm_prov);
+
+		if (cluster_gcs_block_lost_write_action == 0 /* ERROR */)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
+				 errmsg("cluster_gcs_block: stale storage-fallback copy detected on tag "
+						"spc=%u db=%u rel=%u block=%u",
+						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
+				 errdetail(
+					 "expected pi_watermark_scn=" UINT64_FORMAT " %s pd_block_scn=" UINT64_FORMAT
+					 " local pi_watermark_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
+					 " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
+					 " wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT " wm_new=" UINT64_FORMAT
+					 " wm_advanced=%d.",
+					 (uint64)expected_scn, refreshed ? "storage" : "local(dirty-refused)",
+					 (uint64)page_scn, (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
+					 cluster_pcm_own_gen_get(buf->buf_id),
+					 cluster_pcm_wm_src_text(wm_have ? wm_prov.source : CLUSTER_PCM_WM_SRC_NONE),
+					 wm_have ? wm_prov.sender_node : -1, wm_have ? wm_prov.request_id : 0,
+					 wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
+					 wm_have ? (uint64)wm_prov.new_scn : 0, wm_have ? (int)wm_prov.advanced : -1),
+				 errhint("The local/storage page pd_block_scn is below the master "
+						 "pi_watermark_scn carried by the GRANTED_STORAGE_FALLBACK "
+						 "reply.  Inspect dump_gcs.fallback_scn_failclosed_count.  "
+						 "Retry is safe (the next attempt renegotiates).")));
 		ereport(
-			ERROR,
-			(errcode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
-			 errmsg("cluster_gcs_block: stale storage-fallback copy detected on tag "
-					"spc=%u db=%u rel=%u block=%u",
-					tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
-			 errdetail("expected pi_watermark_scn=" UINT64_FORMAT " %s pd_block_scn=" UINT64_FORMAT
-					   " local pi_watermark_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT ".",
-					   (uint64)expected_scn, refreshed ? "storage" : "local(dirty-refused)",
-					   (uint64)page_scn, (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
-					   cluster_pcm_own_gen_get(buf->buf_id)),
-			 errhint("The local/storage page pd_block_scn is below the master "
-					 "pi_watermark_scn carried by the GRANTED_STORAGE_FALLBACK "
-					 "reply.  Inspect dump_gcs.fallback_scn_failclosed_count.  "
-					 "Retry is safe (the next attempt renegotiates).")));
-	ereport(WARNING,
+			WARNING,
 			(errmsg("cluster_gcs_block: stale storage-fallback copy on tag "
 					"spc=%u db=%u rel=%u block=%u (action=warn)",
 					tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
-			 errdetail("expected pi_watermark_scn=" UINT64_FORMAT " %s pd_block_scn=" UINT64_FORMAT
-					   " local pi_watermark_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT ".",
-					   (uint64)expected_scn, refreshed ? "storage" : "local(dirty-refused)",
-					   (uint64)page_scn, (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
-					   cluster_pcm_own_gen_get(buf->buf_id))));
+			 errdetail(
+				 "expected pi_watermark_scn=" UINT64_FORMAT " %s pd_block_scn=" UINT64_FORMAT
+				 " local pi_watermark_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
+				 " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT " wm_epoch=" UINT64_FORMAT
+				 " wm_old=" UINT64_FORMAT " wm_new=" UINT64_FORMAT " wm_advanced=%d.",
+				 (uint64)expected_scn, refreshed ? "storage" : "local(dirty-refused)",
+				 (uint64)page_scn, (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
+				 cluster_pcm_own_gen_get(buf->buf_id),
+				 cluster_pcm_wm_src_text(wm_have ? wm_prov.source : CLUSTER_PCM_WM_SRC_NONE),
+				 wm_have ? wm_prov.sender_node : -1, wm_have ? wm_prov.request_id : 0,
+				 wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
+				 wm_have ? (uint64)wm_prov.new_scn : 0, wm_have ? (int)wm_prov.advanced : -1)));
+	}
 }
 
 
@@ -3646,6 +3669,10 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 		SCN forens_master_wm_now = cluster_pcm_lock_pi_watermark_scn_query(tag);
 		SCN forens_local_scn = cluster_bufmgr_read_block_scn_for_gcs(buf);
 		uint64 forens_own_gen = cluster_pcm_own_gen_get(buf->buf_id);
+		/* Step 1a — this node is the master: the provenance of the advance
+		 * that produced the expected watermark is authoritative here. */
+		ClusterPcmWmProv wm_prov;
+		bool wm_have = cluster_pcm_lock_pi_watermark_prov_query(tag, &wm_prov);
 
 		if (cluster_gcs_block_lost_write_action == 0 /* ERROR */)
 			ereport(
@@ -3655,29 +3682,45 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 						"spc=%u db=%u relNumber=%u block=%u",
 						tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
 						(unsigned int)tag.blockNum),
-				 errdetail("request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " holder=%d"
-						   " expected pi_watermark_scn sent=" UINT64_FORMAT
-						   " master pi_watermark_scn now=" UINT64_FORMAT
-						   " local pd_block_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT ".",
-						   request_id, fwd.epoch, holder_node, (uint64)forens_expected_sent,
-						   (uint64)forens_master_wm_now, (uint64)forens_local_scn, forens_own_gen),
+				 errdetail(
+					 "request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " holder=%d"
+					 " expected pi_watermark_scn sent=" UINT64_FORMAT
+					 " master pi_watermark_scn now=" UINT64_FORMAT
+					 " local pd_block_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
+					 " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
+					 " wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT " wm_new=" UINT64_FORMAT
+					 " wm_advanced=%d.",
+					 request_id, fwd.epoch, holder_node, (uint64)forens_expected_sent,
+					 (uint64)forens_master_wm_now, (uint64)forens_local_scn, forens_own_gen,
+					 cluster_pcm_wm_src_text(wm_have ? wm_prov.source : CLUSTER_PCM_WM_SRC_NONE),
+					 wm_have ? wm_prov.sender_node : -1, wm_have ? wm_prov.request_id : 0,
+					 wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
+					 wm_have ? (uint64)wm_prov.new_scn : 0, wm_have ? (int)wm_prov.advanced : -1),
 				 errhint("The holder-forward shipped block.pd_block_scn is below the "
 						 "master pi_watermark_scn (or a tracked block shipped an "
 						 "unstamped page).  Inspect dump_gcs.lost_write_detected_count "
 						 "and cluster_pcm_grd to find the stale source.  spec-2.41 D5.")));
 		else
-			ereport(WARNING, (errmsg("cluster_gcs_block: lost write detected on tag "
-									 "spc=%u db=%u relNumber=%u block=%u (action=warn)",
-									 tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
-									 (unsigned int)tag.blockNum),
-							  errdetail("request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT
-										" holder=%d expected pi_watermark_scn sent=" UINT64_FORMAT
-										" master pi_watermark_scn now=" UINT64_FORMAT
-										" local pd_block_scn=" UINT64_FORMAT
-										" ownership_gen=" UINT64_FORMAT ".",
-										request_id, fwd.epoch, holder_node,
-										(uint64)forens_expected_sent, (uint64)forens_master_wm_now,
-										(uint64)forens_local_scn, forens_own_gen)));
+			ereport(
+				WARNING,
+				(errmsg("cluster_gcs_block: lost write detected on tag "
+						"spc=%u db=%u relNumber=%u block=%u (action=warn)",
+						tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+						(unsigned int)tag.blockNum),
+				 errdetail(
+					 "request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+					 " holder=%d expected pi_watermark_scn sent=" UINT64_FORMAT
+					 " master pi_watermark_scn now=" UINT64_FORMAT
+					 " local pd_block_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
+					 " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
+					 " wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT " wm_new=" UINT64_FORMAT
+					 " wm_advanced=%d.",
+					 request_id, fwd.epoch, holder_node, (uint64)forens_expected_sent,
+					 (uint64)forens_master_wm_now, (uint64)forens_local_scn, forens_own_gen,
+					 cluster_pcm_wm_src_text(wm_have ? wm_prov.source : CLUSTER_PCM_WM_SRC_NONE),
+					 wm_have ? wm_prov.sender_node : -1, wm_have ? wm_prov.request_id : 0,
+					 wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
+					 wm_have ? (uint64)wm_prov.new_scn : 0, wm_have ? (int)wm_prov.advanced : -1)));
 	}
 
 	/*
@@ -5382,17 +5425,32 @@ scache_downgraded_fall_through:
 		} else if (verdict == GCS_LOST_WRITE_FAIL_STALE || verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
 			/* S3 forensics step 1 — the (expected, shipped) verdict SCN pair is
 			 * only known on this producer; LOG it so the requester's 53R93
-			 * errdetail correlates by (tag, request_id) for the three-branch
-			 * lost-write qualification. */
-			ereport(LOG, (errmsg_internal(
-							 "cluster_gcs_block: lost-write verdict %s on master-direct ship: tag "
-							 "spc=%u db=%u rel=%u block=%u expected pi_watermark_scn=" UINT64_FORMAT
-							 " shipped pd_block_scn=" UINT64_FORMAT
-							 " requester=%d request_id=" UINT64_FORMAT " transition=%d",
-							 verdict == GCS_LOST_WRITE_FAIL_STALE ? "STALE" : "ANOMALY",
-							 req->tag.spcOid, req->tag.dbOid, req->tag.relNumber, req->tag.blockNum,
-							 (uint64)expected_scn, (uint64)shipped_scn, req->sender_node,
-							 req->request_id, (int)req->transition_id)));
+			 * errdetail correlates by the unambiguous {requester, request_id,
+			 * epoch, tag} 4-tuple.  Step 1a: THIS node is the master, so the
+			 * provenance of the LAST advance that produced expected_scn is
+			 * queryable here — the branch-3 (watermark false-positive)
+			 * discriminator. */
+			ClusterPcmWmProv wm_prov;
+			bool wm_have = cluster_pcm_lock_pi_watermark_prov_query(req->tag, &wm_prov);
+
+			ereport(
+				LOG,
+				(errmsg_internal(
+					"cluster_gcs_block: lost-write verdict %s on master-direct ship: tag "
+					"spc=%u db=%u rel=%u block=%u expected pi_watermark_scn=" UINT64_FORMAT
+					" shipped pd_block_scn=" UINT64_FORMAT " requester=%d request_id=" UINT64_FORMAT
+					" epoch=" UINT64_FORMAT
+					" transition=%d wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
+					" wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT " wm_new=" UINT64_FORMAT
+					" wm_advanced=%d",
+					verdict == GCS_LOST_WRITE_FAIL_STALE ? "STALE" : "ANOMALY", req->tag.spcOid,
+					req->tag.dbOid, req->tag.relNumber, req->tag.blockNum, (uint64)expected_scn,
+					(uint64)shipped_scn, req->sender_node, req->request_id,
+					cluster_epoch_get_current(), (int)req->transition_id,
+					cluster_pcm_wm_src_text(wm_have ? wm_prov.source : CLUSTER_PCM_WM_SRC_NONE),
+					wm_have ? wm_prov.sender_node : -1, wm_have ? wm_prov.request_id : 0,
+					wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
+					wm_have ? (uint64)wm_prov.new_scn : 0, wm_have ? (int)wm_prov.advanced : -1)));
 			status = GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
 			page_lsn = InvalidXLogRecPtr;
 			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
@@ -8077,7 +8135,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 			SCN pre_scn = GcsBlockInvalidateAckPayloadGetPageScn(ack);
 
 			if (SCN_VALID(pre_scn)) {
-				cluster_pcm_lock_pi_watermark_scn_advance(ack->tag, pre_scn);
+				cluster_pcm_lock_pi_watermark_scn_advance(
+					ack->tag, pre_scn, CLUSTER_PCM_WM_SRC_ACK_SLOTLESS, ack->sender_node,
+					ack->request_id, ack->epoch);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
 			}
 		}
@@ -8136,7 +8196,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 			 * advance the detector's SCN watermark.  The redo-coverage LSN
 			 * watermark is NOT fed from the ACK: recovery rebuilds it from the
 			 * REDECLARE wire (§2.8.2; the F-ACK test at D9 proves this is safe). */
-			cluster_pcm_lock_pi_watermark_scn_advance(ack_tag, ack_page_scn);
+			cluster_pcm_lock_pi_watermark_scn_advance(ack_tag, ack_page_scn,
+													  CLUSTER_PCM_WM_SRC_ACK_SLOT, ack->sender_node,
+													  ack->request_id, ack->epoch);
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
 		}
 		ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);

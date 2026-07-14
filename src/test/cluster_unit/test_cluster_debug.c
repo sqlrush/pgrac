@@ -2858,6 +2858,18 @@ cluster_undo_tt_retention_rollover_count(void)
 	return 0;
 }
 
+/* S3 forensics step 1a stubs — TT-rollover failure split (dump_undo rows). */
+uint64
+cluster_undo_tt_rollover_fail_hard_cap_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_tt_rollover_fail_extend_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {
