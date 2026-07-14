@@ -150,9 +150,9 @@ extern bool cluster_tt_2pc_parse_record(const void *recdata, uint32 len, Cluster
  * chains at step 4).  AtPrepare serializes only -- NO state mutation
  * (PG two-phase contract; an EndPrepare failure must still abort with
  * the backend-local state intact).  PostPrepare transfers ownership to
- * the 2PC record: clears the backend-local TT bindings, sub-links and
- * the ITL touch list (V-2: the touch list is droppable -- overlay /
- * durable TT are authoritative and 3.4c lazy cleanout re-stamps pages).
+ * the 2PC record: clears the backend-local TT bindings, sub-links, ITL touch
+ * list, and undo lifecycle state.  The undo reset also removes the active-write
+ * registry entry after the prepared-xact retention guard has taken over.
  */
 extern void AtPrepare_ClusterTT(void);
 extern void PostPrepare_ClusterTT(void);

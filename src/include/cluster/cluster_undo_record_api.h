@@ -124,8 +124,8 @@ extern size_t cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_s
 /*
  * cluster_undo_local_head_get -- spec-4.8 D7-A: backend-local latest undo-chain
  *	head for a TT slot (segment_id, slot_offset), or InvalidUba if none this
- *	xact.  Captured into the 2PC record at PREPARE (the local head is reset at
- *	xact end, so this must be read before PostPrepare/commit).
+ *	xact.  Captured into the 2PC record at PREPARE, before PostPrepare performs
+ *	the full local teardown.
  */
 extern UBA cluster_undo_local_head_get(uint16 tt_slot_segment_id, uint16 tt_slot_offset);
 
@@ -141,26 +141,22 @@ extern void cluster_undo_record_shmem_init(void);
 
 
 /*
- * cluster_undo_record_xact_reset -- reset per-xid binding at end of xact
- *	(commit / abort).  Called from xact.c CommitTransaction /
- *	AbortTransaction hook (spec-3.7 D6 integration).
+ * cluster_undo_record_xact_reset -- full local teardown for PREPARE/ABORT.
+ *	Normal COMMIT uses the dedicated O(1) cleanup hook below.
  */
 extern void cluster_undo_record_xact_reset(void);
 
 /*
- * cluster_undo_record_xact_commit_release -- spec-4.12a D6: release this
- *	backend's active-write boundary slot at COMMIT (CommitTransaction hook).
- *	The full xact_reset only runs on the PREPARE / ABORT paths, so without this
- *	a persistent connection's committed transaction would pin the undo drain
- *	boundary forever.  8.A-safe: only enables ACTIVE->COMMITTED; the retention
- *	horizon still gates the actual reclaim.
+ * cluster_undo_record_xact_commit_release -- O(1) normal-COMMIT cleanup.
+ *	Releases the active-write boundary and clears transaction-local counts and
+ *	flags while preserving the residual extent and fd cache.  The retention
+ *	horizon continues to gate actual reclaim.
  */
 extern void cluster_undo_record_xact_commit_release(void);
 
 
 /*
- * cluster_undo_record_is_touched -- did current xact write any undo record?
- *	Used by D16 PREPARE TRANSACTION guard.
+ * cluster_undo_record_is_touched -- legacy transaction-local write marker.
  */
 extern bool cluster_undo_record_is_touched(void);
 
@@ -170,7 +166,8 @@ extern bool cluster_undo_record_is_touched(void);
  *	fsync this xact's dirtied undo segment files ONCE, on the commit path,
  *	BEFORE the commit becomes visible (replaces per-record fsync).  ereport(ERROR)
  *	on fsync failure (runs before the commit critical section -> clean abort).
- *	No-op for a xact that wrote no undo.
+ *	No-op for a xact that wrote no undo.  A release-build runtime guard rejects
+ *	any deferred block that remains pending after the flush.
  */
 extern void cluster_undo_xact_precommit_flush(void);
 
