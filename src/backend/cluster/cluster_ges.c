@@ -1625,10 +1625,12 @@ cluster_ges_timeout_master_reject_count(void)
 #define GES_ORPHAN_TOMBSTONE_TTL_MS 30000
 
 /*
- * spec-5.16 — on a bounded GES timeout, abandon the reply-wait entry as a tombstone
- * (so a late orphan GRANT is auto-released by the reply handler) instead of deleting
- * it.  If a GRANT raced just ahead of this timeout, release the unwanted grant here
- * (backend context).  `req` carries the holder tuple the master will match.
+ * P0#3 — on a bounded GES timeout, first dequeue a blocking REQUEST from the
+ * remote master by its exact holder identity + the wait_seq carried on the
+ * original wire request.  Then abandon the reply-wait entry as a tombstone (so
+ * a late orphan GRANT is auto-released by the reply handler) instead of deleting
+ * it.  If a GRANT raced just ahead of this timeout, release the unwanted grant
+ * here (backend context).  `req` carries the holder tuple the master will match.
  */
 static void
 ges_abandon_wait_or_release(const GesReplyWaitKey *key, const GesRequestPayload *req, int32 master,
@@ -1667,6 +1669,29 @@ ges_abandon_wait_or_release(const GesReplyWaitKey *key, const GesRequestPayload 
 	if (cluster_cssd_get_peer_state(master) == CLUSTER_CSSD_PEER_DEAD) {
 		cluster_ges_reply_wait_delete(key);
 		return;
+	}
+
+	/*
+	 * A blocking REQUEST installs both a GRD waiter and a WFG edge on the
+	 * remote master.  A requester-side timeout used to leave both behind until
+	 * an unrelated revalidation/sweep.  Reuse the deadlock-victim authority:
+	 * CANCEL_WAIT is wait_seq-exact, reliable-staged, and idempotent.  Use the
+	 * sequence sampled into the ORIGINAL request, never a second MyProc read
+	 * (the local wait-state may already have advanced while timeout cleanup is
+	 * running).  REQUEST_NOWAIT never enqueues and therefore must not cancel.
+	 */
+	if (send_opcode == (uint32)GES_REQ_OPCODE_REQUEST) {
+		ClusterResId resid;
+		ClusterGrdHolderId waiter;
+
+		memcpy(&resid, req->resid, sizeof(resid));
+		memset(&waiter, 0, sizeof(waiter));
+		waiter.node_id = (int32)req->holder_node_id;
+		waiter.procno = req->holder_procno;
+		waiter.cluster_epoch = ges_request_holder_epoch(req);
+		waiter.request_id = ges_request_holder_request_id(req);
+		cluster_ges_send_cancel_wait(master, &resid, &waiter, req->wait_seq, 0,
+									 GES_CANCEL_WAIT_KIND_REQUEST);
 	}
 
 	tombstone = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), GES_ORPHAN_TOMBSTONE_TTL_MS);

@@ -24,16 +24,18 @@
  *	                             ges_reply_dropped_count++ (backend retry
  *	                             via timeout converges) — REJECT_BUSY reply
  *	                             100% 可落地 (递归 nofail 五检查 I54).
- *	    CLEANUP_RELEASE full:    cleanup dirty-list (LMON-private,
- *	                             physically separate from reply dirty-list;
- *	                             tick body continuously drains).
+ *	    CLEANUP_RELEASE full:    fixed-capacity reliable retry list
+ *	                             (LMON-private, physically separate from
+ *	                             reply dirty-list; never overwrite).  An
+ *	                             exhausted retry list fails closed explicitly.
  *
  *	  spec-2.16 v0.6 L1.1 nofail 五检查 (I54):
  *	    (a) shmem 预分配固定容量 (compile-time constant)
  *	    (b) bounded ring-buffer (no dynamic resize)
  *	    (c) handler path 禁 palloc / malloc / ereport ERROR / wait
- *	    (d) full → drop oldest + counter
- *	    (e) backend timeout retry converges via GES_REQUEST re-route
+ *	    (d) reply full → drop oldest + counter; cleanup full → fail closed
+ *	    (e) cleanup retries until transport admission; backend timeout retry
+ *	        converges via GES_REQUEST re-route
  *
  *	  Step 2 (this spec) ships the ring + 5 API + reserved pool + 2
  *	  dirty-list infrastructure.  Step 3 D6 wires LMON tick body drain.
@@ -91,11 +93,46 @@ typedef enum ClusterGrdOutboundOrigin {
 #define PGRAC_GES_OUTBOUND_RING_CAPACITY 256
 #define PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET 64
 #define PGRAC_GES_OUTBOUND_CLEANUP_BUDGET 64
+#define PGRAC_GES_OUTBOUND_LMON_DRAIN_BATCH 64
 
 /* dirty-list bounded sizes — separately预分配 reply vs cleanup paths
  * (I54 + I46 — physically separated; do not share buffer). */
 #define PGRAC_GES_REPLY_DIRTY_BUDGET 64
-#define PGRAC_GES_CLEANUP_DIRTY_BUDGET 64
+/*
+ * P0#3: REQUEST timeout cleanup is correctness state, not telemetry.  The
+ * sizing model is a finite burst budget, not a proof that exhaustion is
+ * unreachable:
+ *
+ *   timeout slots = 2 * MaxBackends * timeout_abort_waves_per_LMON_stall
+ *   total slots   = timeout slots + backend-exit RELEASEs + LMD/native frames
+ *
+ * Here timeout_abort_waves_per_LMON_stall is the per-backend timeout/abort
+ * rate multiplied by the interval in which LMON makes no successful drain.
+ *
+ * A backend has at most one synchronous reply wait at a time.  One timed-out
+ * blocking request emits one exact CANCEL_WAIT plus, only when GRANT raced the
+ * timeout, one RELEASE: at most two frames per backend per abort wave.  Thus
+ * 1024 holds one full two-frame wave for 512 backends.  The LMON sender drains
+ * at most PGRAC_GES_OUTBOUND_LMON_DRAIN_BATCH=64 frames per iteration, so the
+ * retry budget is 16 full drain batches.  Producers wake LMON, while
+ * cluster.lmon_main_loop_interval is the missed-wakeup backstop.
+ *
+ * Backend-exit sweeps can additionally emit one RELEASE per remote holder;
+ * LMD cancel/ack and native-probe traffic also share this pool; and a stalled
+ * LMON permits more than one abort wave.  Those terms are workload/runtime
+ * bounded, not compile-time bounded.  Therefore 1024 is deliberately guarded
+ * by 50%/90% lifetime warnings and an explicit PANIC at exhaustion; it must
+ * never be described as unreachable or silently overwrite the oldest exact
+ * cleanup.
+ */
+#define PGRAC_GES_CLEANUP_DIRTY_BUDGET 1024
+#define PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH (PGRAC_GES_CLEANUP_DIRTY_BUDGET / 2)
+#define PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH ((PGRAC_GES_CLEANUP_DIRTY_BUDGET * 9 + 9) / 10)
+
+StaticAssertDecl(PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH < PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH,
+				 "cleanup retry warning thresholds must be ordered");
+StaticAssertDecl(PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH < PGRAC_GES_CLEANUP_DIRTY_BUDGET,
+				 "cleanup retry 90 percent warning must precede exhaustion");
 
 /*
  * Max payload bytes per ring slot.  This MUST be >= the largest wire payload
@@ -145,8 +182,9 @@ extern void cluster_grd_outbound_shmem_register(void);
  *   Return:  true if slot inserted into ring or dirty-list (i.e. will
  *            eventually be sent);  false ONLY on caller contract
  *            violation (invalid msg_type / origin / payload_len
- *            > PAYLOAD_MAX);  never false due to "full" — full path
- *            walks reserved → dirty-list → drop oldest per origin.
+ *            > PAYLOAD_MAX).  Cleanup producers are void/nofail: ring
+ *            saturation enters the fixed retry list; retry-list exhaustion
+ *            fails closed instead of losing cleanup state.
  *
  *   enqueue_backend_request:  backend producer.  Ring full →
  *                             returns false (caller waits latch +
@@ -156,9 +194,8 @@ extern void cluster_grd_outbound_shmem_register(void);
  *                             ges_reply_dropped_count++ (NEVER returns
  *                             false; REJECT_BUSY 100% 可落地 contract).
  *   enqueue_cleanup_release:  LockReleaseAll / abort producer.
- *                             Ring full → cleanup dirty-list +
- *                             ges_cleanup_deferred_count++ (NEVER
- *                             returns false).
+ *                             Ring full → reliable cleanup retry list +
+ *                             ges_cleanup_deferred_count++; no overwrite.
  */
 extern bool cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
 														 uint16 payload_len);
@@ -210,6 +247,8 @@ extern int cluster_grd_outbound_lmon_drain_send(void);
 extern uint32 cluster_grd_outbound_ring_depth(void); /* in-ring slot count */
 extern uint32 cluster_grd_outbound_reply_dirty_depth(void);
 extern uint32 cluster_grd_outbound_cleanup_dirty_depth(void);
+extern uint64 cluster_grd_outbound_cleanup_retry_warn50_count(void);
+extern uint64 cluster_grd_outbound_cleanup_retry_warn90_count(void);
 
 #endif /* !FRONTEND */
 

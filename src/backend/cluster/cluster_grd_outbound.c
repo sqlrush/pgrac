@@ -16,7 +16,8 @@
  *	    - All enqueue/dequeue under cluster_grd_outbound_lock (LWLock).
  *	    - Counter bumps are atomic outside any other lock.
  *	    - No palloc / malloc / ereport ERROR / wait inside enqueue.
- *	    - dirty-list overflow → drop oldest (NOT crash;NOT ERROR).
+ *	    - reply dirty overflow → drop oldest + counter; correctness cleanup
+ *	      overflow → explicit fail-closed PANIC (never overwrite silently).
  *
  *	  Spec: spec-2.16-cross-node-grant-convert-mvp.md (DRAFT v0.1)
  *
@@ -100,10 +101,18 @@ typedef struct ClusterGrdOutboundShared {
 	uint32 cleanup_dirty_tail;
 	uint32 cleanup_dirty_count;
 	ClusterGrdOutboundSlot cleanup_dirty[PGRAC_GES_CLEANUP_DIRTY_BUDGET];
+
+	/* Lifetime LOG-once state + exported threshold-crossing counters. */
+	uint8 cleanup_retry_warned_mask;
+	uint64 cleanup_retry_warn50_count;
+	uint64 cleanup_retry_warn90_count;
 } ClusterGrdOutboundShared;
 
 static ClusterGrdOutboundShared *cluster_grd_outbound_state = NULL;
 static LWLock *cluster_grd_outbound_lock = NULL;
+
+#define CLEANUP_RETRY_WARN50_BIT 0x01
+#define CLEANUP_RETRY_WARN90_BIT 0x02
 
 
 /* ============================================================
@@ -215,22 +224,28 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
 }
 
-static void
+static bool
 cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload,
-				   uint16 payload_len)
+				   uint16 payload_len, uint8 *new_warnings, uint32 *depth_after)
 {
 	ClusterGrdOutboundSlot *slot;
+	uint8 warnings = 0;
+
+	if (new_warnings != NULL)
+		*new_warnings = 0;
+	if (depth_after != NULL)
+		*depth_after = cluster_grd_outbound_state->cleanup_dirty_count;
 
 	if (payload_len > PGRAC_GES_OUTBOUND_PAYLOAD_MAX)
-		return;
+		return false;
 
-	/* Bounded same as reply_dirty.  Cleanup release is best-effort:
-	 * if dirty-list also full, drop (LockReleaseAll cannot wait). */
-	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_BUDGET) {
-		cluster_grd_outbound_state->cleanup_dirty_tail
-			= (cluster_grd_outbound_state->cleanup_dirty_tail + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
-		cluster_grd_outbound_state->cleanup_dirty_count--;
-	}
+	/*
+	 * P0#3: cleanup frames carry correctness state (exact CANCEL_WAIT / RELEASE).
+	 * Never overwrite the oldest entry.  The void producer APIs turn false into
+	 * an explicit fail-closed PANIC after releasing the outbound LWLock.
+	 */
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_BUDGET)
+		return false;
 
 	slot = &cluster_grd_outbound_state
 				->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_head];
@@ -244,30 +259,83 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 	cluster_grd_outbound_state->cleanup_dirty_head
 		= (cluster_grd_outbound_state->cleanup_dirty_head + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
 	cluster_grd_outbound_state->cleanup_dirty_count++;
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH
+		&& (cluster_grd_outbound_state->cleanup_retry_warned_mask & CLEANUP_RETRY_WARN50_BIT)
+			   == 0) {
+		cluster_grd_outbound_state->cleanup_retry_warned_mask |= CLEANUP_RETRY_WARN50_BIT;
+		cluster_grd_outbound_state->cleanup_retry_warn50_count++;
+		warnings |= CLEANUP_RETRY_WARN50_BIT;
+	}
+	if (cluster_grd_outbound_state->cleanup_dirty_count >= PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH
+		&& (cluster_grd_outbound_state->cleanup_retry_warned_mask & CLEANUP_RETRY_WARN90_BIT)
+			   == 0) {
+		cluster_grd_outbound_state->cleanup_retry_warned_mask |= CLEANUP_RETRY_WARN90_BIT;
+		cluster_grd_outbound_state->cleanup_retry_warn90_count++;
+		warnings |= CLEANUP_RETRY_WARN90_BIT;
+	}
+	if (new_warnings != NULL)
+		*new_warnings = warnings;
+	if (depth_after != NULL)
+		*depth_after = cluster_grd_outbound_state->cleanup_dirty_count;
 	cluster_grd_inc_ges_cleanup_deferred();
 	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND); /* spec-7.2 D1 */
+	return true;
 }
 
-static void
-requeue_slot(const ClusterGrdOutboundSlot *slot)
+static bool
+requeue_slot(const ClusterGrdOutboundSlot *slot, uint8 *new_warnings, uint32 *depth_after)
 {
 	Assert(slot != NULL);
 
 	switch ((ClusterGrdOutboundOrigin)slot->origin) {
 	case CLUSTER_GRD_OUTBOUND_LMON_REPLY:
 		reply_dirty_push(slot->dest_node_id, slot->payload, slot->payload_len);
-		break;
+		return true;
 	case CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE:
 	case CLUSTER_GRD_OUTBOUND_LMD_CANCEL:
-		cleanup_dirty_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
-						   slot->payload_len);
-		break;
+	case CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE:
+		return cleanup_dirty_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
+								  slot->payload_len, new_warnings, depth_after);
 	case CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST:
 	default:
-		(void)ring_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
-						slot->payload_len);
-		break;
+		return ring_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
+						 slot->payload_len);
 	}
+}
+
+static void
+cleanup_retry_log_pressure(uint8 new_warnings, uint32 depth)
+{
+	if ((new_warnings & CLEANUP_RETRY_WARN50_BIT) != 0)
+		ereport(LOG, (errmsg_internal("cluster GES reliable cleanup retry queue reached 50%% "
+									  "(depth=%u capacity=%u max_backends=%d lmon_interval_ms=%d); "
+									  "warning is emitted once per postmaster lifetime",
+									  depth, PGRAC_GES_CLEANUP_DIRTY_BUDGET, MaxBackends,
+									  cluster_lmon_main_loop_interval)));
+	if ((new_warnings & CLEANUP_RETRY_WARN90_BIT) != 0)
+		ereport(LOG, (errmsg_internal("cluster GES reliable cleanup retry queue reached 90%% "
+									  "(depth=%u capacity=%u max_backends=%d lmon_interval_ms=%d); "
+									  "exhaustion will PANIC fail closed, warning is emitted once "
+									  "per postmaster lifetime",
+									  depth, PGRAC_GES_CLEANUP_DIRTY_BUDGET, MaxBackends,
+									  cluster_lmon_main_loop_interval)));
+}
+
+static inline bool
+cleanup_origin_requires_retry(uint8 origin)
+{
+	return origin == CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE
+		   || origin == CLUSTER_GRD_OUTBOUND_LMD_CANCEL
+		   || origin == CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE;
+}
+
+static void
+cleanup_retry_exhausted(uint8 origin, uint32 dest_node_id)
+{
+	ereport(PANIC,
+			(errmsg_internal("cluster GES reliable cleanup retry queue exhausted "
+							 "(capacity=%u origin=%u dest=%u); refusing to lose cleanup state",
+							 PGRAC_GES_CLEANUP_DIRTY_BUDGET, (uint32)origin, dest_node_id)));
 }
 
 
@@ -361,18 +429,27 @@ void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *payload,
 											 uint16 payload_len)
 {
+	bool queued;
+	uint8 new_warnings = 0;
+	uint32 depth_after = 0;
+
 	Assert(cluster_grd_outbound_state != NULL);
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 
 	/* CLEANUP_RELEASE shares main ring with backend pool.  If full →
-	 * cleanup dirty-list (LockReleaseAll cannot wait). */
-	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id,
-				   payload, payload_len))
-		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE,
-						   dest_node_id, payload, payload_len);
+	 * fixed reliable retry list (LockReleaseAll cannot wait). */
+	queued = ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id,
+					   payload, payload_len);
+	if (!queued)
+		queued
+			= cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE,
+								 dest_node_id, payload, payload_len, &new_warnings, &depth_after);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cleanup_retry_log_pressure(new_warnings, depth_after);
+	if (!queued)
+		cleanup_retry_exhausted(CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id);
 	cluster_lmon_wakeup();
 }
 
@@ -382,7 +459,7 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *pa
  *	Reliability contract per spec-2.24 §1.4 example 2 — cancel forward
  *	MUST NOT use the silent-fail backend_request path (loss → deadlock
  *	not resolved).  Mirror CLEANUP_RELEASE semantics:  share main ring;
- *	on full → cleanup dirty-list nofail.  cluster_grd_outbound origin
+ *	on full → reliable cleanup retry list (no overwrite).  cluster_grd_outbound origin
  *	CLUSTER_GRD_OUTBOUND_LMD_CANCEL identifies the producer in pg_stat
  *	rollups.
  */
@@ -390,16 +467,25 @@ void
 cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload,
 										uint16 payload_len)
 {
+	bool queued;
+	uint8 new_warnings = 0;
+	uint32 depth_after = 0;
+
 	Assert(cluster_grd_outbound_state != NULL);
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 
-	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id, payload,
-				   payload_len))
-		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id,
-						   payload, payload_len);
+	queued = ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id,
+					   payload, payload_len);
+	if (!queued)
+		queued
+			= cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL,
+								 dest_node_id, payload, payload_len, &new_warnings, &depth_after);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cleanup_retry_log_pressure(new_warnings, depth_after);
+	if (!queued)
+		cleanup_retry_exhausted(CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id);
 	cluster_lmon_wakeup();
 }
 
@@ -411,7 +497,7 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload
  *	never replies → LMS collector slot retries on poll, but if every probe
  *	silently drops the requester eventually hits the retry budget and
  *	returns 53R83 erroneously).  Mirror CLEANUP_RELEASE / LMD_CANCEL
- *	semantics:  ring full → cleanup dirty-list nofail per L141 family
+ *	semantics:  ring full → reliable cleanup retry list per L141 family
  *	pattern (the CV-broadcast wake is owned by the LMS collector slot,
  *	not this enqueue path — outbound ring is LMON-polled).
  *
@@ -423,16 +509,25 @@ void
 cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *payload,
 											  uint16 payload_len)
 {
+	bool queued;
+	uint8 new_warnings = 0;
+	uint32 depth_after = 0;
+
 	Assert(cluster_grd_outbound_state != NULL);
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 
-	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE, dest_node_id,
-				   payload, payload_len))
-		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE,
-						   dest_node_id, payload, payload_len);
+	queued = ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE,
+					   dest_node_id, payload, payload_len);
+	if (!queued)
+		queued
+			= cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE,
+								 dest_node_id, payload, payload_len, &new_warnings, &depth_after);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cleanup_retry_log_pressure(new_warnings, depth_after);
+	if (!queued)
+		cleanup_retry_exhausted(CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE, dest_node_id);
 	cluster_lmon_wakeup();
 }
 
@@ -504,6 +599,22 @@ cluster_grd_outbound_drain_dirty_lists(void)
 	return drained;
 }
 
+static void
+requeue_after_send_refusal(const ClusterGrdOutboundSlot *slot)
+{
+	bool queued;
+	uint8 new_warnings = 0;
+	uint32 depth_after = 0;
+
+	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
+	queued = requeue_slot(slot, &new_warnings, &depth_after);
+	LWLockRelease(cluster_grd_outbound_lock);
+	cleanup_retry_log_pressure(new_warnings, depth_after);
+
+	if (!queued && cleanup_origin_requires_retry(slot->origin))
+		cleanup_retry_exhausted(slot->origin, slot->dest_node_id);
+}
+
 int
 cluster_grd_outbound_lmon_drain_send(void)
 {
@@ -530,15 +641,15 @@ cluster_grd_outbound_lmon_drain_send(void)
 	 * backend REQUEST staging path, gcs.c owner-plane rule).  scanned
 	 * bounds the batch so requeued frames cannot spin it forever.
 	 */
-	while (sent < 64 && scanned < 64 && cluster_grd_outbound_dequeue(&slot)) {
+	while (sent < PGRAC_GES_OUTBOUND_LMON_DRAIN_BATCH
+		   && scanned < PGRAC_GES_OUTBOUND_LMON_DRAIN_BATCH
+		   && cluster_grd_outbound_dequeue(&slot)) {
 		ClusterICSendResult rc;
 
 		scanned++;
 
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
-			LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
-			requeue_slot(&slot);
-			LWLockRelease(cluster_grd_outbound_lock);
+			requeue_after_send_refusal(&slot);
 			continue;
 		}
 
@@ -558,12 +669,17 @@ cluster_grd_outbound_lmon_drain_send(void)
 		case CLUSTER_IC_SEND_NOT_ADMITTED:
 			if (slot.dest_node_id < CLUSTER_MAX_NODES)
 				peer_blocked[slot.dest_node_id] = true;
-			LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
-			requeue_slot(&slot);
-			LWLockRelease(cluster_grd_outbound_lock);
+			requeue_after_send_refusal(&slot);
 			break;
 		case CLUSTER_IC_SEND_HARD_ERROR:
-			/* peer-down style failures are retried by higher layers. */
+			/* Backend requests/replies have higher-layer retry.  Exact cleanup
+			 * frames do not: retain them in the fixed retry list until transport
+			 * admission (or explicit fail-closed exhaustion). */
+			if (cleanup_origin_requires_retry(slot.origin)) {
+				if (slot.dest_node_id < CLUSTER_MAX_NODES)
+					peer_blocked[slot.dest_node_id] = true;
+				requeue_after_send_refusal(&slot);
+			}
 			break;
 		}
 	}
@@ -610,4 +726,30 @@ cluster_grd_outbound_cleanup_dirty_depth(void)
 	depth = cluster_grd_outbound_state->cleanup_dirty_count;
 	LWLockRelease(cluster_grd_outbound_lock);
 	return depth;
+}
+
+uint64
+cluster_grd_outbound_cleanup_retry_warn50_count(void)
+{
+	uint64 count;
+
+	if (cluster_grd_outbound_state == NULL || cluster_grd_outbound_lock == NULL)
+		return 0;
+	LWLockAcquire(cluster_grd_outbound_lock, LW_SHARED);
+	count = cluster_grd_outbound_state->cleanup_retry_warn50_count;
+	LWLockRelease(cluster_grd_outbound_lock);
+	return count;
+}
+
+uint64
+cluster_grd_outbound_cleanup_retry_warn90_count(void)
+{
+	uint64 count;
+
+	if (cluster_grd_outbound_state == NULL || cluster_grd_outbound_lock == NULL)
+		return 0;
+	LWLockAcquire(cluster_grd_outbound_lock, LW_SHARED);
+	count = cluster_grd_outbound_state->cleanup_retry_warn90_count;
+	LWLockRelease(cluster_grd_outbound_lock);
+	return count;
 }

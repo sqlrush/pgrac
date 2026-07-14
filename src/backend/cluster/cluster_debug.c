@@ -1272,6 +1272,10 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int32((int32)cluster_grd_outbound_reply_dirty_depth()));
 	emit_row(rsinfo, "grd", "grd_outbound_cleanup_dirty_depth",
 			 fmt_int32((int32)cluster_grd_outbound_cleanup_dirty_depth()));
+	emit_row(rsinfo, "grd", "grd_outbound_cleanup_retry_warn50_count",
+			 fmt_int64((int64)cluster_grd_outbound_cleanup_retry_warn50_count()));
+	emit_row(rsinfo, "grd", "grd_outbound_cleanup_retry_warn90_count",
+			 fmt_int64((int64)cluster_grd_outbound_cleanup_retry_warn90_count()));
 	emit_row(rsinfo, "grd", "grd_work_queue_depth",
 			 fmt_int32((int32)cluster_grd_work_queue_depth()));
 	emit_row(rsinfo, "grd", "grd_pending_count", fmt_int64((int64)cluster_grd_pending_count()));

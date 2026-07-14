@@ -4029,6 +4029,16 @@ cluster_grd_outbound_cleanup_dirty_depth(void)
 {
 	return 0;
 }
+uint64
+cluster_grd_outbound_cleanup_retry_warn50_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_outbound_cleanup_retry_warn90_count(void)
+{
+	return 0;
+}
 uint32
 cluster_grd_work_queue_depth(void)
 {
