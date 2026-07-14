@@ -160,6 +160,7 @@ typedef struct ClusterUndoRecordShared {
 	 * errdetail never cites another path's counter. */
 	pg_atomic_uint64 tt_rollover_fail_hard_cap_count; /* pool at hard cap */
 	pg_atomic_uint64 tt_rollover_fail_extend_count;	  /* autoextend / FS fail */
+	pg_atomic_uint64 tt_rollover_fail_activate_count; /* mark_active refused (step 1b) */
 
 	/* spec-3.18 D3: extent claims (one per ~undo_extent_blocks records per
 	 * backend instead of one cursor_lock acquire per record). */
@@ -506,6 +507,7 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->tt_retention_rollover_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_hard_cap_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_activate_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_retain_skip_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->extent_claim_count, 0); /* spec-3.18 D3 */
 
@@ -2082,6 +2084,10 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 		else
 			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		/* step 1b: a rollover failure is EXACTLY when RECYCLABLE supply is the
+		 * bottleneck — nudge the cleaner now instead of waiting out its tick
+		 * (lifecycle_lock already released; wakeup is a latch set, lock-free). */
+		cluster_undo_cleaner_wakeup();
 		return 0;
 	}
 
@@ -2092,7 +2098,11 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 	 * ACTIVE -> COMMITTED -> RECYCLABLE.
 	 */
 	if (!cluster_undo_segment_mark_active(new_segment_id, owner_instance)) {
+		/* step 1b: activation refused on a fresh segment — its own bucket (the
+		 * extend/hard-cap split above cannot see this failure). */
+		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_activate_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		cluster_undo_cleaner_wakeup();
 		return 0;
 	}
 
@@ -2160,6 +2170,14 @@ cluster_undo_tt_rollover_fail_extend_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->tt_rollover_fail_extend_count);
+}
+
+uint64
+cluster_undo_tt_rollover_fail_activate_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->tt_rollover_fail_activate_count);
 }
 
 uint64

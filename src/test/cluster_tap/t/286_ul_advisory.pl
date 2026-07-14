@@ -360,10 +360,12 @@ my $split_before = $n1->safe_psql('postgres', $split_query);
 # node1 blocks on the held key with a short finite per-session timeout; the wait
 # must resolve (53R70) rather than hang -- this is the bound that protects a
 # cross-node deadlock from hanging forever (real detection is forward spec-5.8).
+my $t11_start = Time::HiRes::time();
 my ($rc11, $out11, $err11) = $n1->psql(
 	'postgres',
 	"SET cluster.ges_request_timeout_ms = '3s'; SELECT pg_advisory_lock(73)",
 	timeout => 40);
+my $client11_ms = int((Time::HiRes::time() - $t11_start) * 1000);
 isnt($rc11, 0, 'L11: blocking advisory acquire on a held key fails (does not hang)');
 like($err11, qr/cluster lock acquire timeout|53R70|not available/i,
 	'L11: ... with a finite-timeout 53R70 (bounded deadlock resolution)');
@@ -381,9 +383,17 @@ like(
 if ($err11 =~ /elapsed_ms=(\d+)/)
 {
 	my $elapsed = $1;
-	cmp_ok($elapsed, '>=', 1000,
-		"L11b2: errdetail elapsed_ms=$elapsed is true wall-clock (>= 1s of the 3s window)");
-	cmp_ok($elapsed, '<=', 40_000, 'L11b3: ... and bounded by the psql timeout');
+
+	# S3 forensics step 1b — qualify elapsed_ms against the CLIENT-observed
+	# wall clock instead of hardcoded bounds.  client - elapsed >= 0 catches
+	# a filled-in configured value (a hardcoded 3000 fails on the retransmit
+	# path where the client only saw ~1.7s);  the <= 1500 slack catches a
+	# stale/zero fill (psql spawn + SET + connect overhead stay well under
+	# 1.5s), so elapsed_ms must genuinely track this wait's wall clock.
+	cmp_ok($client11_ms - $elapsed, '>=', 0,
+		"L11b2: elapsed_ms=$elapsed never exceeds the client wall clock (client=${client11_ms}ms)");
+	cmp_ok($client11_ms - $elapsed, '<=', 1500,
+		"L11b3: elapsed_ms=$elapsed tracks the client wall clock (client=${client11_ms}ms)");
 }
 else
 {
@@ -447,15 +457,19 @@ my $cap_query = q{
 	WHERE category = 'ges' AND key = 'ges_timeout_capacity_count'};
 my $cap_before = $n0->safe_psql('postgres', $cap_query);
 my $mr_err = '';
+my $mr_client_ms = 0;
 for my $k (211 .. 226)
 {
+	my $t0 = Time::HiRes::time();
 	my ($rc, $out, $err) = $n0->psql(
 		'postgres',
 		"SET cluster.ges_request_timeout_ms = '3s'; SELECT pg_advisory_lock($k)",
 		timeout => 30);
+	my $probe_ms = int((Time::HiRes::time() - $t0) * 1000);
 	if ($rc != 0 && defined $err && $err =~ /master-reject-queue-full/)
 	{
 		$mr_err = $err;
+		$mr_client_ms = $probe_ms;
 		last;
 	}
 	# Locally-mastered key (granted): release and probe the next key.
@@ -471,12 +485,17 @@ like($mr_err, qr/source=master-reject-queue-full/,
 	'L14c: ... with the master-reject attribution (never unattributed)');
 if ($mr_err =~ /elapsed_ms=(\d+)/)
 {
-	cmp_ok($1, '<', 3000,
-		"L14d: errdetail elapsed_ms=$1 shows the reject never consumed the 3s window");
+	# step 1b: an immediate reject reads near-zero on ITS OWN clock — and can
+	# never exceed the client-observed wall time for the same statement.
+	cmp_ok($1, '<=', 500,
+		"L14d: errdetail elapsed_ms=$1 shows the reject was immediate");
+	cmp_ok($1, '<=', $mr_client_ms,
+		"L14d2: elapsed_ms=$1 within the client wall clock (client=${mr_client_ms}ms)");
 }
 else
 {
 	fail('L14d: errdetail carries elapsed_ms');
+	fail('L14d2: errdetail carries elapsed_ms');
 }
 my $cap_after = $n0->safe_psql('postgres', $cap_query);
 cmp_ok($cap_after, '>', $cap_before,

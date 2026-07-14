@@ -1756,6 +1756,8 @@ dump_ges(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_ges_timeout_retransmit_exhausted_count()));
 	emit_row(rsinfo, "ges", "ges_timeout_native_probe_count",
 			 fmt_int64((int64)cluster_ges_timeout_native_probe_count()));
+	emit_row(rsinfo, "ges", "ges_timeout_master_reject_count",
+			 fmt_int64((int64)cluster_ges_timeout_master_reject_count()));
 }
 
 
@@ -1971,6 +1973,10 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_pcm_get_restore_aba_detected_count()));
 	emit_row(rsinfo, "pcm", "invalidate_parked_grant_pending_count",
 			 fmt_int64((int64)cluster_pcm_get_invalidate_parked_grant_pending_count()));
+	/* S3 forensics step 1b — watermark-advance provenance table insert drops
+	 * (table full): non-zero means prov_query absence is inconclusive. */
+	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
+			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
 }
 
 
@@ -2812,6 +2818,8 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_tt_rollover_fail_hard_cap_count()));
 	emit_row(rsinfo, "undo", "tt_rollover_fail_extend_count",
 			 fmt_int64((int64)cluster_undo_tt_rollover_fail_extend_count()));
+	emit_row(rsinfo, "undo", "tt_rollover_fail_activate_count",
+			 fmt_int64((int64)cluster_undo_tt_rollover_fail_activate_count()));
 
 	/* spec-6.2: Smart Fusion terminal-authority substrate counters. */
 	emit_row(rsinfo, "undo", "terminal_authority_check_count",

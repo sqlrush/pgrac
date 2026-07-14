@@ -92,6 +92,11 @@ typedef struct ClusterGesSharedState {
 	pg_atomic_uint64 timeout_send_fail_count; /* outbound ring enqueue failed */
 	pg_atomic_uint64 timeout_retransmit_exhausted_count; /* retransmit budget burned */
 	pg_atomic_uint64 timeout_native_probe_count;		 /* native-lock probe fail-closed */
+	/* S3 forensics step 1b — master replied TIMEOUT (its own wait/probe ran
+	 * out remotely);  neither a local wait nor a local capacity event, so it
+	 * gets its own ledger bucket: every detail_set with a real source bumps
+	 * EXACTLY one of the six breakdown counters. */
+	pg_atomic_uint64 timeout_master_reject_count;
 	/* Future spec-2.14+ adds: GRD shard table, hash routing state,
 	 * grant table, convert queue, deadlock graph, etc. */
 } ClusterGesSharedState;
@@ -140,12 +145,13 @@ extern void cluster_ges_timeout_detail_reset(void);
 extern const ClusterGesTimeoutDetail *cluster_ges_timeout_detail_get(void);
 extern const char *cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src);
 
-/* dump_ges observability getters for the five breakdown counters. */
+/* dump_ges observability getters for the six breakdown counters. */
 extern uint64 cluster_ges_timeout_true_wait_count(void);
 extern uint64 cluster_ges_timeout_capacity_count(void);
 extern uint64 cluster_ges_timeout_send_fail_count(void);
 extern uint64 cluster_ges_timeout_retransmit_exhausted_count(void);
 extern uint64 cluster_ges_timeout_native_probe_count(void);
+extern uint64 cluster_ges_timeout_master_reject_count(void);
 
 /*
  * Shmem region lifecycle (mirror cluster_scn / cluster_lmon pattern).

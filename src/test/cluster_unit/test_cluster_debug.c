@@ -1408,6 +1408,11 @@ cluster_pcm_get_invalidate_parked_grant_pending_count(void)
 {
 	return 0;
 }
+uint64
+cluster_pcm_get_wm_prov_insert_fail_count(void)
+{
+	return 0;
+}
 /* spec-6.14 D10b catalog counters (cluster_catalog_stats.o not linked) */
 uint64
 cluster_catalog_stats_vis_resolve_count(void)
@@ -2869,6 +2874,11 @@ cluster_undo_tt_rollover_fail_extend_count(void)
 {
 	return 0;
 }
+uint64
+cluster_undo_tt_rollover_fail_activate_count(void)
+{
+	return 0;
+}
 
 Size
 cluster_shmem_get_total_bytes(void)
@@ -3685,6 +3695,11 @@ cluster_ges_timeout_retransmit_exhausted_count(void)
 
 uint64
 cluster_ges_timeout_native_probe_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ges_timeout_master_reject_count(void)
 {
 	return 0;
 }

@@ -173,6 +173,7 @@ cluster_ges_shmem_init(void)
 		pg_atomic_init_u64(&cluster_ges_state->timeout_send_fail_count, 0);
 		pg_atomic_init_u64(&cluster_ges_state->timeout_retransmit_exhausted_count, 0);
 		pg_atomic_init_u64(&cluster_ges_state->timeout_native_probe_count, 0);
+		pg_atomic_init_u64(&cluster_ges_state->timeout_master_reject_count, 0);
 	}
 }
 
@@ -1493,8 +1494,10 @@ cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node, long
 		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_native_probe_count, 1);
 		break;
 	case CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT:
-		/* master-reported timeout: neither a local wait nor a local capacity
-		 * event — visible via the errdetail source text only. */
+		/* master-reported timeout (possibly a remote native-probe timeout):
+		 * neither a local wait nor a local capacity event — own bucket so
+		 * the six-way breakdown ledger closes (step 1b). */
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_master_reject_count, 1);
 		break;
 	case CLUSTER_GES_TSRC_NONE:
 	case CLUSTER_GES_TSRC_NULL_ARG:
@@ -1586,6 +1589,13 @@ cluster_ges_timeout_native_probe_count(void)
 {
 	Assert(cluster_ges_state != NULL);
 	return pg_atomic_read_u64(&cluster_ges_state->timeout_native_probe_count);
+}
+
+uint64
+cluster_ges_timeout_master_reject_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_master_reject_count);
 }
 
 

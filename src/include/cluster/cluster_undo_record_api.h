@@ -209,6 +209,7 @@ extern uint64 cluster_undo_tt_retention_rollover_count(void);
  * CLAIM path's segment_hard_cap_fail_count. */
 extern uint64 cluster_undo_tt_rollover_fail_hard_cap_count(void);
 extern uint64 cluster_undo_tt_rollover_fail_extend_count(void);
+extern uint64 cluster_undo_tt_rollover_fail_activate_count(void);
 extern uint64 cluster_undo_segment_retain_skip_count(void);
 
 /* P0 perf hardening: per-commit undo fsync counters. */

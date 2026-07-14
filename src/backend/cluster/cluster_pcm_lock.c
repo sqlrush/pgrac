@@ -283,6 +283,26 @@ StaticAssertDecl(sizeof(struct GrdEntry) == 264,
  *	Per-entry locks protect entry-local state after a stable pointer has been
  *	obtained; they do not make concurrent HASH_ENTER_NULL safe by themselves.
  */
+/*
+ * S3 forensics step 1b — one advance-provenance slot (64B).  Insert-once:
+ * `used` is never cleared, so open-addressing probe chains stay valid for
+ * the region's lifetime (mirrors the GRD HTAB's never-freed entries).
+ */
+#define CLUSTER_PCM_WM_PROV_SLOTS 8192
+
+typedef struct ClusterPcmWmProvSlot {
+	bool used;	  /* slot claimed (never cleared) */
+	uint8 source; /* ClusterPcmWmSrc */
+	int16 _pad1;
+	int32 sender_node; /* -1 = local/unknown */
+	BufferTag tag;	   /* 20B */
+	int32 _pad2;
+	SCN old_scn;	   /* watermark before the advancing feed */
+	SCN new_scn;	   /* fed page_scn == watermark right after the feed */
+	uint64 request_id; /* wire identity (0 = none) */
+	uint64 epoch;	   /* wire epoch (0 = none) */
+} ClusterPcmWmProvSlot;
+
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
 	pg_atomic_uint64 trans_n_to_s_count;
@@ -312,24 +332,22 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 writer_reverify_reacquire_count;
 	pg_atomic_uint64 restore_aba_detected_count;
 	pg_atomic_uint64 invalidate_parked_grant_pending_count;
-	/* S3 forensics step 1a — SCN-watermark advance provenance ring (see
-	 * cluster_pcm_lock.h ClusterPcmWmProv).  Slots are claimed with a
-	 * fetch-add on wm_prov_next; each entry is stamped with its claim seq
-	 * AFTER the payload (write barrier) so a torn wrap-around read is
-	 * detectable.  Diagnostic-only: readers tolerate a missed entry. */
-	pg_atomic_uint32 wm_prov_next;
-	struct {
-		BufferTag tag;	   /* 20B */
-		uint32 seq;		   /* claim seq + 1 (0 = never written) */
-		SCN old_scn;	   /* watermark before the feed */
-		SCN new_scn;	   /* fed page_scn */
-		uint64 request_id; /* wire identity (0 = none) */
-		uint64 epoch;	   /* wire epoch (0 = none) */
-		int32 sender_node; /* -1 = local/unknown */
-		uint8 source;	   /* ClusterPcmWmSrc */
-		uint8 advanced;	   /* monotone max actually raised */
-		uint16 _pad;
-	} wm_prov[256];
+	/* S3 forensics step 1b — per-tag SCN-watermark advance provenance table
+	 * (see cluster_pcm_lock.h ClusterPcmWmProv).  Replaces the step-1a
+	 * 256-slot ring: under S3 fan-out the ring recycled in milliseconds, so
+	 * by the time a 53R93 emitted, the tag's advancing feed was overwritten
+	 * and the query returned an unrelated late feed.  Open-addressed,
+	 * insert-once-never-evict; one slot per tag holds the LAST feed that
+	 * actually advanced the monotone-max watermark (non-advancing feeds
+	 * never enter), so new_scn always explains the CURRENT watermark.
+	 * Writers hold the tag's GRD entry_lock and take wm_prov_lock EXCLUSIVE
+	 * around probe+store (entry_lock -> wm_prov_lock, strict leaf);  readers
+	 * probe under SHARED.  When the table fills, further first-feeds are
+	 * dropped and counted (wm_prov_insert_fail_count) so a query reports
+	 * "absence inconclusive" instead of a false NONE. */
+	LWLockPadded wm_prov_lock;
+	pg_atomic_uint64 wm_prov_insert_fail_count;
+	ClusterPcmWmProvSlot wm_prov[CLUSTER_PCM_WM_PROV_SLOTS];
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -357,11 +375,11 @@ static int pcm_grd_effective = 0;
 
 /* Forward decl — file-private HTAB lazy-alloc helper defined below init_fn. */
 static struct GrdEntry *pcm_get_or_create_entry(BufferTag tag);
-/* S3 forensics step 1a — watermark-advance provenance recorder (defined with
- * the watermark helpers below; used by the inline writer sites above them). */
-static void pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, bool advanced,
-							   ClusterPcmWmSrc source, int32 sender_node, uint64 request_id,
-							   uint64 epoch);
+/* S3 forensics step 1b — watermark-advance provenance recorder (defined with
+ * the watermark helpers below; used by the inline writer sites above them).
+ * Caller MUST hold the tag's GRD entry_lock and call ONLY on actual advance. */
+static void pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, ClusterPcmWmSrc source,
+							   int32 sender_node, uint64 request_id, uint64 epoch);
 static struct GrdEntry *pcm_find_entry(BufferTag tag);
 static void pcm_entry_lock_exclusive(struct GrdEntry *entry);
 static uint32 pcm_holder_bit(int holder_node_id);
@@ -1096,15 +1114,14 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
 	if (SCN_VALID(page_scn)) {
 		SCN wm_old = entry->pi_watermark_scn;
-		bool wm_advanced = false;
 
 		if (scn_local(page_scn)
 			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
 			entry->pi_watermark_scn = page_scn;
-			wm_advanced = true;
+			/* step 1b: only an ACTUAL advance is recorded (per-tag table). */
+			pcm_wm_prov_record(tag, wm_old, page_scn, CLUSTER_PCM_WM_SRC_REDECLARE, source_node, 0,
+							   cluster_epoch);
 		}
-		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_REDECLARE,
-						   source_node, 0, cluster_epoch);
 	}
 
 	LWLockRelease(&entry->entry_lock.lock);
@@ -1130,7 +1147,8 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
  *	Mirrors the X branch of cluster_gcs_block_master_rebuild_from_redeclare.
  */
 void
-cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn, SCN page_scn)
+cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn, SCN page_scn,
+											  int32 holder_node, uint64 request_id, uint64 epoch)
 {
 	struct GrdEntry *entry;
 
@@ -1163,14 +1181,14 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
 	if (SCN_VALID(page_scn)) {
 		SCN wm_old = entry->pi_watermark_scn;
-		bool wm_advanced = false;
 
 		if (scn_local(page_scn)
 			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
 			entry->pi_watermark_scn = page_scn;
-			wm_advanced = true;
+			/* step 1b: record the shipping holder's wire identity on advance. */
+			pcm_wm_prov_record(tag, wm_old, page_scn, CLUSTER_PCM_WM_SRC_TAKE_X, holder_node,
+							   request_id, epoch);
 		}
-		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_TAKE_X, -1, 0, 0);
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 }
@@ -1193,7 +1211,7 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
  */
 void
 cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecPtr page_lsn,
-								   SCN page_scn)
+								   SCN page_scn, uint64 request_id, uint64 epoch)
 {
 	struct GrdEntry *entry;
 
@@ -1224,15 +1242,14 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
 	if (SCN_VALID(page_scn)) {
 		SCN wm_old = entry->pi_watermark_scn;
-		bool wm_advanced = false;
 
 		if (scn_local(page_scn)
 			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
 			entry->pi_watermark_scn = page_scn;
-			wm_advanced = true;
+			/* step 1b: record the granted requester's wire identity on advance. */
+			pcm_wm_prov_record(tag, wm_old, page_scn, CLUSTER_PCM_WM_SRC_GRANT_X, requester_node,
+							   request_id, epoch);
 		}
-		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, CLUSTER_PCM_WM_SRC_GRANT_X,
-						   requester_node, 0, 0);
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 }
@@ -1301,37 +1318,71 @@ cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr page_lsn)
 }
 
 /*
- * S3 forensics step 1a — SCN-watermark advance provenance ring.
+ * S3 forensics step 1b — per-tag SCN-watermark advance provenance table.
  *
- *	pcm_wm_prov_record claims a slot with a fetch-add, invalidates it
- *	(seq=0), writes the payload, then stamps seq+1 behind a write barrier;
- *	the seq1/payload/seq2 read protocol in prov_query detects a torn
- *	wrap-around rewrite.  Diagnostic-only ring: a missed or overwritten
- *	record degrades to "no provenance", never to a wrong record.
+ *	pcm_wm_prov_record stores the advancing feed into the tag's single
+ *	insert-once slot (open addressing, linear probe;  slots are never
+ *	evicted so probe chains stay valid).  The caller holds the tag's GRD
+ *	entry_lock EXCLUSIVE — the advance and its record form one critical
+ *	section, so the slot's new_scn always equals the watermark the feed
+ *	produced (two racing advances cannot store out of order).  wm_prov_lock
+ *	is a strict leaf below entry_lock (nothing is acquired under it).
+ *	Table full + unknown tag: drop the record and count — the query then
+ *	reports absence as inconclusive rather than a definite NONE.
  */
+static uint32
+pcm_wm_prov_hash(const BufferTag *tag)
+{
+	/* FNV-1a over the tag fields — file-private so the standalone unit
+	 * binaries need no extra hash-library stub. */
+	uint32 h = 0x811c9dc5;
+
+#define PCM_WM_PROV_HASH_MIX(v)                                                                    \
+	do {                                                                                           \
+		h ^= (uint32)(v);                                                                          \
+		h *= 0x01000193;                                                                           \
+	} while (0)
+	PCM_WM_PROV_HASH_MIX(tag->spcOid);
+	PCM_WM_PROV_HASH_MIX(tag->dbOid);
+	PCM_WM_PROV_HASH_MIX(tag->relNumber);
+	PCM_WM_PROV_HASH_MIX(tag->forkNum);
+	PCM_WM_PROV_HASH_MIX(tag->blockNum);
+#undef PCM_WM_PROV_HASH_MIX
+	return h;
+}
+
 static void
-pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, bool advanced, ClusterPcmWmSrc source,
+pcm_wm_prov_record(BufferTag tag, SCN old_scn, SCN new_scn, ClusterPcmWmSrc source,
 				   int32 sender_node, uint64 request_id, uint64 epoch)
 {
-	uint32 seq;
-	uint32 idx;
+	uint32 start;
+	uint32 probe;
 
 	if (ClusterPcm == NULL)
 		return;
-	seq = pg_atomic_fetch_add_u32(&ClusterPcm->wm_prov_next, 1);
-	idx = seq % (uint32)lengthof(ClusterPcm->wm_prov);
-	ClusterPcm->wm_prov[idx].seq = 0; /* invalidate while rewriting */
-	pg_write_barrier();
-	ClusterPcm->wm_prov[idx].tag = tag;
-	ClusterPcm->wm_prov[idx].old_scn = old_scn;
-	ClusterPcm->wm_prov[idx].new_scn = new_scn;
-	ClusterPcm->wm_prov[idx].request_id = request_id;
-	ClusterPcm->wm_prov[idx].epoch = epoch;
-	ClusterPcm->wm_prov[idx].sender_node = sender_node;
-	ClusterPcm->wm_prov[idx].source = (uint8)source;
-	ClusterPcm->wm_prov[idx].advanced = advanced ? 1 : 0;
-	pg_write_barrier();
-	ClusterPcm->wm_prov[idx].seq = seq + 1;
+	start = pcm_wm_prov_hash(&tag) % (uint32)CLUSTER_PCM_WM_PROV_SLOTS;
+	LWLockAcquire(&ClusterPcm->wm_prov_lock.lock, LW_EXCLUSIVE);
+	for (probe = 0; probe < (uint32)CLUSTER_PCM_WM_PROV_SLOTS; probe++) {
+		ClusterPcmWmProvSlot *slot
+			= &ClusterPcm->wm_prov[(start + probe) % (uint32)CLUSTER_PCM_WM_PROV_SLOTS];
+
+		if (slot->used && !BufferTagsEqual(&slot->tag, &tag))
+			continue;
+		/* a free slot (first advance for the tag) or the tag's own slot */
+		slot->used = true;
+		slot->tag = tag;
+		slot->old_scn = old_scn;
+		slot->new_scn = new_scn;
+		slot->request_id = request_id;
+		slot->epoch = epoch;
+		slot->sender_node = sender_node;
+		slot->source = (uint8)source;
+		LWLockRelease(&ClusterPcm->wm_prov_lock.lock);
+		return;
+	}
+	/* table full and the tag has no slot: the advance goes unrecorded */
+	pg_atomic_fetch_add_u64(&ClusterPcm->wm_prov_insert_fail_count, 1);
+	LWLockRelease(&ClusterPcm->wm_prov_lock.lock);
 }
 
 const char *
@@ -1354,45 +1405,49 @@ cluster_pcm_wm_src_text(ClusterPcmWmSrc src)
 	return "unknown";
 }
 
+/*
+ * S3 forensics step 1b — query the tag's advance-provenance slot.
+ *
+ *	Returns true + the record of the LAST advancing feed for the tag.
+ *	Returns false with out->table_full=false for a definite "no advance
+ *	ever recorded", or out->table_full=true when the table has dropped
+ *	inserts (the tag's advance may simply have gone unrecorded).
+ */
 bool
 cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag, ClusterPcmWmProv *out)
 {
-	uint32 best_seq = 0;
-	bool found = false;
-	int i;
+	uint32 start;
+	uint32 probe;
+	bool full_seen;
 
 	if (ClusterPcm == NULL || out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
+	out->source = CLUSTER_PCM_WM_SRC_NONE;
 	out->sender_node = -1;
-	for (i = 0; i < (int)lengthof(ClusterPcm->wm_prov); i++) {
-		uint32 seq1 = ClusterPcm->wm_prov[i].seq;
-		BufferTag etag;
-		ClusterPcmWmProv cand;
-		uint32 seq2;
+	start = pcm_wm_prov_hash(&tag) % (uint32)CLUSTER_PCM_WM_PROV_SLOTS;
+	LWLockAcquire(&ClusterPcm->wm_prov_lock.lock, LW_SHARED);
+	for (probe = 0; probe < (uint32)CLUSTER_PCM_WM_PROV_SLOTS; probe++) {
+		ClusterPcmWmProvSlot *slot
+			= &ClusterPcm->wm_prov[(start + probe) % (uint32)CLUSTER_PCM_WM_PROV_SLOTS];
 
-		if (seq1 == 0)
+		if (!slot->used)
+			break; /* insert-once: an unused slot terminates the probe chain */
+		if (!BufferTagsEqual(&slot->tag, &tag))
 			continue;
-		pg_read_barrier();
-		etag = ClusterPcm->wm_prov[i].tag;
-		cand.source = (ClusterPcmWmSrc)ClusterPcm->wm_prov[i].source;
-		cand.sender_node = ClusterPcm->wm_prov[i].sender_node;
-		cand.request_id = ClusterPcm->wm_prov[i].request_id;
-		cand.epoch = ClusterPcm->wm_prov[i].epoch;
-		cand.old_scn = ClusterPcm->wm_prov[i].old_scn;
-		cand.new_scn = ClusterPcm->wm_prov[i].new_scn;
-		cand.advanced = ClusterPcm->wm_prov[i].advanced != 0;
-		pg_read_barrier();
-		seq2 = ClusterPcm->wm_prov[i].seq;
-		if (seq1 != seq2 || !BufferTagsEqual(&etag, &tag))
-			continue;
-		if (seq1 > best_seq) {
-			best_seq = seq1;
-			*out = cand;
-			found = true;
-		}
+		out->source = (ClusterPcmWmSrc)slot->source;
+		out->sender_node = slot->sender_node;
+		out->request_id = slot->request_id;
+		out->epoch = slot->epoch;
+		out->old_scn = slot->old_scn;
+		out->new_scn = slot->new_scn;
+		LWLockRelease(&ClusterPcm->wm_prov_lock.lock);
+		return true;
 	}
-	return found;
+	full_seen = pg_atomic_read_u64(&ClusterPcm->wm_prov_insert_fail_count) > 0;
+	LWLockRelease(&ClusterPcm->wm_prov_lock.lock);
+	out->table_full = full_seen;
+	return false;
 }
 
 /*
@@ -1401,9 +1456,9 @@ cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag, ClusterPcmWmProv *out)
  *	detector compares a shipped page's pd_block_scn against this (§2.6).  Fed
  *	by the local-page sources today; the ack/redeclare wire sources feed it
  *	once D3 carries pd_block_scn on the wire.
- *	S3 forensics step 1a: every feed records its provenance (source enum +
- *	wire identity + old->new + advanced?) so a 53R93's expected_scn can be
- *	traced to the advance that produced it.
+ *	S3 forensics step 1b: every feed that ACTUALLY advances the max records
+ *	its provenance (source enum + wire identity + old->new) into the per-tag
+ *	table so a 53R93's expected_scn traces to the advance that produced it.
  */
 void
 cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn, ClusterPcmWmSrc source,
@@ -1419,7 +1474,6 @@ cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn, ClusterPc
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		SCN wm_old;
-		bool wm_advanced = false;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		wm_old = entry->pi_watermark_scn;
@@ -1428,11 +1482,12 @@ cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn, ClusterPc
 		if (scn_local(page_scn)
 			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
 			entry->pi_watermark_scn = page_scn;
-			wm_advanced = true;
+			/* step 1b: record INSIDE the entry_lock critical section so the
+			 * per-tag slot's new_scn always equals the watermark this feed
+			 * produced;  non-advancing (late) feeds are never recorded. */
+			pcm_wm_prov_record(tag, wm_old, page_scn, source, sender_node, request_id, epoch);
 		}
 		LWLockRelease(&entry->entry_lock.lock);
-		pcm_wm_prov_record(tag, wm_old, page_scn, wm_advanced, source, sender_node, request_id,
-						   epoch);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
@@ -2027,6 +2082,14 @@ cluster_pcm_get_invalidate_parked_grant_pending_count(void)
 	return ClusterPcm != NULL
 			   ? pg_atomic_read_u64(&ClusterPcm->invalidate_parked_grant_pending_count)
 			   : 0;
+}
+
+/* S3 forensics step 1b — advance-provenance table insert drops (table full
+ * with no slot for the tag;  absence of a record is then inconclusive). */
+uint64
+cluster_pcm_get_wm_prov_insert_fail_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->wm_prov_insert_fail_count) : 0;
 }
 
 uint64
@@ -3193,9 +3256,10 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->writer_reverify_reacquire_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->restore_aba_detected_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->invalidate_parked_grant_pending_count, 0);
-		/* S3 forensics step 1a — provenance ring (entries zeroed by the
-		 * memset above; seq 0 marks never-written slots). */
-		pg_atomic_init_u32(&ClusterPcm->wm_prov_next, 0);
+		/* S3 forensics step 1b — per-tag advance-provenance table (slots
+		 * zeroed by the memset above; used=false marks free slots). */
+		LWLockInitialize(&ClusterPcm->wm_prov_lock.lock, LWTRANCHE_CLUSTER_PCM);
+		pg_atomic_init_u64(&ClusterPcm->wm_prov_insert_fail_count, 0);
 	}
 
 	/*

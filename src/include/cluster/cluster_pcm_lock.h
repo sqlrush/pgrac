@@ -288,14 +288,19 @@ extern bool cluster_pcm_clean_page_xfer_consume(void);
 extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode);
 extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
 /* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
- * writer-transfer (the remote holder shipped + released its X). */
+ * writer-transfer (the remote holder shipped + released its X).  S3 forensics
+ * step 1b: the shipping holder + wire request_id/epoch ride along so the
+ * watermark-advance provenance table records WHO produced the advance. */
 extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn,
-														  SCN page_scn);
+														  SCN page_scn, int32 holder_node,
+														  uint64 request_id, uint64 epoch);
 /* PGRAC: spec-5.2 D11 path B — master==holder==self ships its X image to a
  * remote requester and records the requester as the new X holder (single-phase
- * writer-transfer-revoke; caller drops self's copy no-wire before calling). */
+ * writer-transfer-revoke; caller drops self's copy no-wire before calling).
+ * S3 forensics step 1b: request_id/epoch ride along for advance provenance. */
 extern void cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node,
-											   XLogRecPtr page_lsn, SCN page_scn);
+											   XLogRecPtr page_lsn, SCN page_scn, uint64 request_id,
+											   uint64 epoch);
 
 /*
  * PGRAC: spec-2.35 D3 (HC110) — master_holder lookup for forward routing.
@@ -384,6 +389,8 @@ extern void cluster_pcm_note_restore_aba_detected(void);
 extern uint64 cluster_pcm_get_restore_aba_detected_count(void);
 extern void cluster_pcm_note_invalidate_parked_grant_pending(void);
 extern uint64 cluster_pcm_get_invalidate_parked_grant_pending_count(void);
+/* S3 forensics step 1b — advance-provenance table insert drops (table full). */
+extern uint64 cluster_pcm_get_wm_prov_insert_fail_count(void);
 extern uint64 cluster_pcm_get_trans_x_to_n_downgrade_count(void);
 extern uint64 cluster_pcm_get_trans_x_to_n_release_count(void);
 extern uint64 cluster_pcm_get_trans_s_to_n_invalidate_count(void);
@@ -539,17 +546,21 @@ extern void cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr 
 extern XLogRecPtr cluster_pcm_lock_pi_watermark_lsn_query(BufferTag tag);
 
 /*
- * S3 forensics step 1a — SCN-watermark advance PROVENANCE.
+ * S3 forensics step 1a/1b — SCN-watermark advance PROVENANCE.
  *
  *	The lost-write detector's expected_scn is only as trustworthy as the
  *	last advance that produced it: a late / wrong-generation invalidate-ACK
  *	feeding the monotone max would fabricate lost-write verdicts against
- *	perfectly current pages.  Every SCN-watermark feed site therefore
- *	records {source, sender, request_id, epoch, old->new, advanced?} into a
- *	small shmem ring; the 53R93 emit sites on the MASTER (the only node
- *	whose ring is authoritative for its tags) attach the latest record so a
- *	shipped<expected verdict can be qualified as branch-3 (watermark
- *	false-positive) without a rerun.
+ *	perfectly current pages.  Every SCN-watermark feed site that ACTUALLY
+ *	advances the monotone max records {source, sender, request_id, epoch,
+ *	old->new} into a per-tag shmem table (step 1b: one insert-once slot per
+ *	tag holding the LAST advancing feed — non-advancing late feeds never
+ *	enter, so the record always explains the CURRENT watermark; the step-1a
+ *	ring recycled under load and could return an unrelated late feed).  The
+ *	53R93 emit sites on the MASTER (the only node whose table is
+ *	authoritative for its tags) attach the record so a shipped<expected
+ *	verdict can be qualified as branch-3 (watermark false-positive) without
+ *	a rerun.
  */
 typedef enum ClusterPcmWmSrc {
 	CLUSTER_PCM_WM_SRC_NONE = 0,	 /* no advance recorded for the tag */
@@ -561,13 +572,15 @@ typedef enum ClusterPcmWmSrc {
 } ClusterPcmWmSrc;
 
 typedef struct ClusterPcmWmProv {
-	ClusterPcmWmSrc source;
-	int32 sender_node; /* wire sender / requester; -1 = local/unknown */
-	uint64 request_id; /* wire request id; 0 = none */
-	uint64 epoch;	   /* wire epoch; 0 = none */
-	SCN old_scn;	   /* watermark before the feed */
-	SCN new_scn;	   /* fed page_scn (proposed value) */
-	bool advanced;	   /* did the feed actually raise the monotone max? */
+	ClusterPcmWmSrc source; /* SRC_NONE = no advance recorded for the tag */
+	int32 sender_node;		/* wire sender / requester; -1 = local/unknown */
+	uint64 request_id;		/* wire request id; 0 = none */
+	uint64 epoch;			/* wire epoch; 0 = none */
+	SCN old_scn;			/* watermark before the advancing feed */
+	SCN new_scn;			/* fed page_scn == watermark right after the feed */
+	bool table_full;		/* only when source==SRC_NONE: the table has dropped
+						* at least one insert, so absence is INCONCLUSIVE
+						* (the tag's advance may have gone unrecorded) */
 } ClusterPcmWmProv;
 
 extern const char *cluster_pcm_wm_src_text(ClusterPcmWmSrc src);
