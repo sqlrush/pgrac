@@ -357,6 +357,25 @@ my ($rc11, $out11, $err11) = $n1->psql(
 isnt($rc11, 0, 'L11: blocking advisory acquire on a held key fails (does not hang)');
 like($err11, qr/cluster lock acquire timeout|53R70|not available/i,
 	'L11: ... with a finite-timeout 53R70 (bounded deadlock resolution)');
+
+# S3 forensics step 1 — the folded 53R70 text must carry a fine-grained
+# source attribution (errdetail) and bump the matching dump_ges breakdown
+# counter on the timing-out node.  A genuine bounded wait resolves as either
+# the CV deadline or the retransmit budget depending on which node masters
+# the key (local- vs remote-master wait loop).
+like(
+	$err11,
+	qr/source=(cv-wait-timeout|retransmit-exhausted)/,
+	'L11b: 53R70 errdetail carries the timeout-source attribution');
+my $to_split_sum = $n1->safe_psql(
+	'postgres', q{
+	SELECT COALESCE(sum(value::bigint), 0) FROM pg_cluster_state
+	WHERE category = 'ges'
+	  AND key IN ('ges_timeout_true_wait_count',
+				  'ges_timeout_retransmit_exhausted_count')});
+cmp_ok($to_split_sum, '>=', 1,
+	'L11c: dump_ges timeout-source breakdown counter bumped by the bounded wait');
+
 $h11->query_safe("SELECT pg_advisory_unlock(73)");
 $h11->quit;
 

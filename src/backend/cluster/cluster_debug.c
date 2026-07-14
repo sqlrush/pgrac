@@ -1743,6 +1743,19 @@ dump_ges(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_txw_get_wakeup_count()));
 	emit_row(rsinfo, "ges", "tx_enqueue_timeout_count",
 			 fmt_int64((int64)cluster_txw_get_timeout_count()));
+	/* S3 forensics step 1 — breakdown of the "cluster lock acquire timeout"
+	 * fold: how many surfaced timeouts genuinely ran out the clock vs failed
+	 * immediately on capacity / send / probe (never waited at all). */
+	emit_row(rsinfo, "ges", "ges_timeout_true_wait_count",
+			 fmt_int64((int64)cluster_ges_timeout_true_wait_count()));
+	emit_row(rsinfo, "ges", "ges_timeout_capacity_count",
+			 fmt_int64((int64)cluster_ges_timeout_capacity_count()));
+	emit_row(rsinfo, "ges", "ges_timeout_send_fail_count",
+			 fmt_int64((int64)cluster_ges_timeout_send_fail_count()));
+	emit_row(rsinfo, "ges", "ges_timeout_retransmit_exhausted_count",
+			 fmt_int64((int64)cluster_ges_timeout_retransmit_exhausted_count()));
+	emit_row(rsinfo, "ges", "ges_timeout_native_probe_count",
+			 fmt_int64((int64)cluster_ges_timeout_native_probe_count()));
 }
 
 

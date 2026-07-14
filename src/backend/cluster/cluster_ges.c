@@ -166,6 +166,12 @@ cluster_ges_shmem_init(void)
 		/* spec-2.13 D3 init zero (Q4.1=A all-atomic, no LWLock). */
 		pg_atomic_init_u64(&cluster_ges_state->request_defer_count, 0);
 		pg_atomic_init_u64(&cluster_ges_state->reply_defer_count, 0);
+		/* S3 forensics step 1 — timeout-source breakdown counters. */
+		pg_atomic_init_u64(&cluster_ges_state->timeout_true_wait_count, 0);
+		pg_atomic_init_u64(&cluster_ges_state->timeout_capacity_count, 0);
+		pg_atomic_init_u64(&cluster_ges_state->timeout_send_fail_count, 0);
+		pg_atomic_init_u64(&cluster_ges_state->timeout_retransmit_exhausted_count, 0);
+		pg_atomic_init_u64(&cluster_ges_state->timeout_native_probe_count, 0);
 	}
 }
 
@@ -1439,6 +1445,128 @@ cluster_ges_reply_defer_count(void)
 
 
 /* ============================================================
+ * S3 forensics step 1 (07-14) — GES timeout-source breakdown.
+ *
+ *	Backend-local detail of the LAST failure site that will surface as
+ *	FAIL_TIMEOUT / "cluster lock acquire timeout" (see cluster_ges.h).
+ *	The setter also bumps the matching shmem breakdown counter so the
+ *	aggregate split (true wait vs capacity vs send-fail vs retransmit
+ *	vs native-probe) is provable from dump_ges after a bench run.
+ * ============================================================ */
+
+static ClusterGesTimeoutDetail ges_timeout_detail; /* backend-local */
+
+void
+cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node, long elapsed_ms,
+							   int attempts, int conflict_holders, int timeout_ms)
+{
+	ges_timeout_detail.source = src;
+	ges_timeout_detail.master_node = master_node;
+	ges_timeout_detail.elapsed_ms = elapsed_ms;
+	ges_timeout_detail.attempts = attempts;
+	ges_timeout_detail.conflict_holders = conflict_holders;
+	ges_timeout_detail.timeout_ms = timeout_ms;
+
+	if (cluster_ges_state == NULL)
+		return;
+	switch (src) {
+	case CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT:
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_true_wait_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL:
+	case CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL:
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_capacity_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_OUTBOUND_RING_FULL:
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_send_fail_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED:
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_retransmit_exhausted_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT:
+		pg_atomic_fetch_add_u64(&cluster_ges_state->timeout_native_probe_count, 1);
+		break;
+	case CLUSTER_GES_TSRC_NONE:
+	case CLUSTER_GES_TSRC_NULL_ARG:
+		break;
+	}
+}
+
+void
+cluster_ges_timeout_detail_reset(void)
+{
+	memset(&ges_timeout_detail, 0, sizeof(ges_timeout_detail));
+	ges_timeout_detail.master_node = -1;
+	ges_timeout_detail.conflict_holders = -1;
+}
+
+const ClusterGesTimeoutDetail *
+cluster_ges_timeout_detail_get(void)
+{
+	return &ges_timeout_detail;
+}
+
+const char *
+cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src)
+{
+	switch (src) {
+	case CLUSTER_GES_TSRC_NONE:
+		return "unattributed";
+	case CLUSTER_GES_TSRC_NULL_ARG:
+		return "null-argument";
+	case CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL:
+		return "reply-wait-table-full";
+	case CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL:
+		return "master-wait-queue-full";
+	case CLUSTER_GES_TSRC_OUTBOUND_RING_FULL:
+		return "outbound-ring-full";
+	case CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT:
+		return "cv-wait-timeout";
+	case CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED:
+		return "retransmit-exhausted";
+	case CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT:
+		return "native-probe-timeout";
+	}
+	return "unknown";
+}
+
+uint64
+cluster_ges_timeout_true_wait_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_true_wait_count);
+}
+
+uint64
+cluster_ges_timeout_capacity_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_capacity_count);
+}
+
+uint64
+cluster_ges_timeout_send_fail_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_send_fail_count);
+}
+
+uint64
+cluster_ges_timeout_retransmit_exhausted_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_retransmit_exhausted_count);
+}
+
+uint64
+cluster_ges_timeout_native_probe_count(void)
+{
+	Assert(cluster_ges_state != NULL);
+	return pg_atomic_read_u64(&cluster_ges_state->timeout_native_probe_count);
+}
+
+
+/* ============================================================
  * spec-2.21 D8 — GES request/release send-and-wait stubs.
  *
  *	Minimal real implementation for the ADVISORY MVP single-node case.
@@ -1553,6 +1681,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 
 	if (resid == NULL || holder == NULL) {
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1, 0, 0, -1, timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -1627,6 +1756,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
 			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, cluster_node_id,
+										   0, 0, n_conflict, timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 
@@ -1656,7 +1787,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		entry = cluster_ges_reply_wait_insert(&key, deadline);
 		if (entry == NULL) {
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
-			cluster_xp_end(&xp_enqueue);	  /* PGRAC: spec-5.59 D2 profiling */
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, cluster_node_id,
+										   0, 0, n_conflict, perpetual ? -1 : effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 		}
 
@@ -1738,9 +1871,14 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			 * here.  cancel_waiter removes a still-queued waiter (OK -> timeout)
 			 * or reports NOT_FOUND (already granted -> accept the grant). */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-			if (cluster_grd_cancel_waiter_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK)
+			if (cluster_grd_cancel_waiter_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK) {
+				/* timed_out only sets in finite mode: effective_timeout_ms valid. */
+				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, cluster_node_id,
+											   (long)effective_timeout_ms, 0, n_conflict,
+											   effective_timeout_ms);
 				return GES_REJECT_REASON_TIMEOUT; /* fail closed */
-			return GES_REJECT_REASON_NONE;		  /* grant won the race */
+			}
+			return GES_REJECT_REASON_NONE; /* grant won the race */
 		}
 
 		reject_reason = entry->reject_reason;
@@ -1795,6 +1933,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 								 "(request_id=" UINT64_FORMAT " dest=%d) — fail closed",
 								 request_id, master)));
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, master, 0, 0, -1,
+									   effective_timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -1822,6 +1962,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		/* Outbound ring full — fail closed.  Caller may retry. */
 		cluster_ges_reply_wait_delete(&key);
 		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, 0, -1,
+									   effective_timeout_ms);
 		return GES_REJECT_REASON_WORK_QUEUE_FULL;
 	}
 
@@ -1903,6 +2045,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				ConditionVariableCancelSleep();
 				cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 				cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, master,
+											   (long)effective_timeout_ms, attempt, -1,
+											   effective_timeout_ms);
 				return GES_REJECT_REASON_TIMEOUT;
 			}
 			remaining_ms = (long)((deadline - now) / 1000);
@@ -1928,10 +2073,15 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 
 		if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
+			long forens_elapsed_ms
+				= (long)effective_timeout_ms - (long)((deadline - GetCurrentTimestamp()) / 1000);
+
 			ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED, master,
+										   forens_elapsed_ms, attempt, -1, effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 
@@ -1968,6 +2118,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, attempt,
+										   -1, effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 		if (cluster_ges_state != NULL)
@@ -2263,6 +2415,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 
 	if (resid == NULL || holder == NULL) {
 		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NULL_ARG, -1, 0, 0, -1, timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -2283,6 +2436,8 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		if (!cluster_lms_native_probe_wait_clear(resid, (LOCKMODE)requested_mode, holder,
 												 effective_timeout_ms)) {
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT, cluster_node_id,
+										   (long)effective_timeout_ms, 0, -1, effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 	}
@@ -2297,6 +2452,9 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	entry = cluster_ges_reply_wait_insert(&key, deadline);
 	if (entry == NULL) {
 		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+		cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL,
+									   local_master ? cluster_node_id : master, 0, 0, -1,
+									   effective_timeout_ms);
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -2323,12 +2481,16 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		if (!cluster_grd_work_queue_enqueue(cluster_node_id, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, cluster_node_id,
+										   0, 0, -1, effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 	} else {
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, master, 0, 0, -1,
+										   effective_timeout_ms);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 	}
@@ -2379,6 +2541,9 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			ConditionVariableCancelSleep();
 			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
 			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
+			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,
+										   local_master ? cluster_node_id : master,
+										   (long)effective_timeout_ms, 0, -1, effective_timeout_ms);
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 		remaining_ms = (long)((deadline - now) / 1000);

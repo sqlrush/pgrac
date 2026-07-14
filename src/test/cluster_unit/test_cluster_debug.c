@@ -3645,6 +3645,38 @@ cluster_ges_reply_defer_count(void)
 	return 0;
 }
 
+/* S3 forensics step 1 / L104 stubs: dump_ges timeout-source breakdown
+ * counters (cluster_ges.o not linked standalone). */
+uint64
+cluster_ges_timeout_true_wait_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_timeout_capacity_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_timeout_send_fail_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_timeout_retransmit_exhausted_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_timeout_native_probe_count(void)
+{
+	return 0;
+}
+
 /* spec-2.14 D12 / L104 stubs: cluster_debug dump_grd references 7 new
  * spec-2.14 cluster_grd module accessors;  test_cluster_debug standalone
  * binary doesn't link cluster_grd.o,  vacuous stubs. */

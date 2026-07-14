@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_scn.h" /* S3 forensics — floor-lag vs current SCN in errdetail */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D4 durable commit */
 #include "cluster/cluster_tt_local.h"
@@ -253,12 +254,19 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 		if (off == INVALID_TT_SLOT_OFFSET) {
 			if (!retained_pressure)
 				/* All 48 slots ACTIVE -- genuine in-flight concurrency limit. */
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
-								seg),
-						 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
-								 "shorter transactions commit or abort.")));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
+							seg),
+					 errdetail("node=%d retention_horizon_scn=" UINT64_FORMAT
+							   " current_scn=" UINT64_FORMAT " retain_skip=" UINT64_FORMAT
+							   " retention_recycle=" UINT64_FORMAT ".",
+							   cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
+							   (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
+							   cluster_tt_slot_retention_recycle_count()),
+					 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
+							 "shorter transactions commit or abort.")));
 
 			/*
 			 * spec-3.12 D2b / C3b: retained COMMITTED slots (a long reader holds
@@ -271,15 +279,36 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 					= cluster_undo_tt_rollover_locked(cluster_node_id, seg, &at_hard_cap);
 
 				if (new_seg == 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("cluster TT slot allocator: retention rollover failed for "
-									"segment %u (%s)",
-									seg,
-									at_hard_cap ? "undo segment pool hard cap reached"
-												: "undo segment autoextend failed"),
-							 errhint("A long-running reader is retaining committed undo; end it, "
-									 "or raise cluster.undo_segments_max_per_instance.")));
+					/* S3 forensics step 1 — the errdetail separates "cleaner
+					 * stopped reclaiming" (recycle counters flat, horizon far
+					 * behind current_scn) from "pool genuinely at capacity
+					 * under live retention" before anyone reaches for the GUC. */
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("cluster TT slot allocator: retention rollover failed for "
+								"segment %u (%s)",
+								seg,
+								at_hard_cap ? "undo segment pool hard cap reached"
+											: "undo segment autoextend failed"),
+						 errdetail(
+							 "node=%d retention_horizon_scn=" UINT64_FORMAT
+							 " current_scn=" UINT64_FORMAT " retain_skip=" UINT64_FORMAT
+							 " retention_recycle=" UINT64_FORMAT
+							 " retention_off_recycle=" UINT64_FORMAT " wrap_retired=" UINT64_FORMAT
+							 " segment_reuse=" UINT64_FORMAT " segment_switch=" UINT64_FORMAT
+							 " hard_cap_fail=" UINT64_FORMAT " segments_max_per_instance=%d.",
+							 cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
+							 (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
+							 cluster_tt_slot_retention_recycle_count(),
+							 cluster_tt_slot_retention_off_recycle_count(),
+							 cluster_tt_slot_wrap_retired_count(),
+							 cluster_undo_segment_reuse_count(),
+							 cluster_undo_segment_switch_count(),
+							 cluster_undo_segment_hard_cap_fail_count(),
+							 cluster_undo_segments_max_per_instance),
+						 errhint("A long-running reader is retaining committed undo; end it, "
+								 "or raise cluster.undo_segments_max_per_instance.")));
 
 				seg = new_seg;
 				off = cluster_tt_slot_alloc(seg, top_xid);
