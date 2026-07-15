@@ -1482,6 +1482,12 @@ cluster_gcs_get_lost_write_not_scn_tracked_skip_count(void)
 {
 	return 0;
 }
+/* branch-1 stub: master-direct storage-fallback rescue accessor. */
+uint64
+cluster_gcs_get_lost_write_master_direct_storage_fallback_count(void)
+{
+	return 0;
+}
 uint64
 cluster_gcs_get_redo_coverage_required_lsn_zero_count(void)
 {

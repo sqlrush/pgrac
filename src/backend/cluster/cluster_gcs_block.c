@@ -257,6 +257,12 @@ typedef struct ClusterGcsBlockShared {
 		lost_write_invalidscn_failclosed_count; /* §2.6 b2: tracked block, shipped InvalidScn */
 	pg_atomic_uint64
 		lost_write_not_scn_tracked_skip_count; /* §2.6 b1: expected InvalidScn → skip */
+	/* PGRAC: branch-1 (S3 step-2 forensics) — a STALE master-direct ship whose
+	 * shared-storage version covers the watermark is rescued to
+	 * GRANTED_STORAGE_FALLBACK instead of DENIED_LOST_WRITE (availability:
+	 * the requester reads storage instead of aborting 53R93).  The refused
+	 * twin (storage unprovable) keeps bumping lost_write_detected_count. */
+	pg_atomic_uint64 lost_write_master_direct_storage_fallback_count;
 	pg_atomic_uint64
 		redo_coverage_required_lsn_zero_count;		 /* serve-gate required_lsn==0 (cold/degrade) */
 	pg_atomic_uint64 redo_coverage_gate_block_count; /* serve-gate not-covered (block) */
@@ -544,6 +550,7 @@ cluster_gcs_block_shmem_init(void)
 		/* PGRAC: spec-2.41 D7 — 4 NEW SCN detector + redo-coverage counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_invalidscn_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_not_scn_tracked_skip_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_master_direct_storage_fallback_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->redo_coverage_required_lsn_zero_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->redo_coverage_gate_block_count, 0);
 		/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter init. */
@@ -5435,6 +5442,22 @@ scache_downgraded_fall_through:
 		if (cluster_injection_should_skip("cluster-gcs-block-stale-ship"))
 			shipped_scn = InvalidScn;
 
+		/* branch-1 (S3 step-2 forensics) inject — simulate a RETAINED STALE
+		 * RESIDENT (a kept Past Image serving as the grant payload): force the
+		 * SHIPPED pd_block_scn one time-step below the valid watermark so the
+		 * verdict is STALE (§2.6 branch 1) while shared storage keeps its real
+		 * version.  Master-direct site ONLY — the holder-forward twin must not
+		 * fire this, so a test that greens can only have exercised THIS path.
+		 * The predecessor comes from the SCN layer (fails closed to InvalidScn
+		 * = leave the shipped value alone; the test round simply retries). */
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-stale-ship-resident");
+		if (cluster_injection_should_skip("cluster-gcs-block-stale-ship-resident")) {
+			SCN forced_stale_scn = cluster_scn_time_predecessor(expected_scn);
+
+			if (SCN_VALID(forced_stale_scn))
+				shipped_scn = forced_stale_scn;
+		}
+
 		verdict = gcs_block_lost_write_verdict(expected_scn, shipped_scn);
 		if (verdict == GCS_LOST_WRITE_SKIP) {
 			/* spec-2.41 D7 observability — block not SCN-tracked (no fire). */
@@ -5473,6 +5496,70 @@ scache_downgraded_fall_through:
 					wm_have ? wm_prov.epoch : 0, wm_have ? (uint64)wm_prov.old_scn : 0,
 					wm_have ? (uint64)wm_prov.new_scn : 0,
 					wm_have ? (int)(wm_prov.new_scn == expected_scn) : -1)));
+
+			/*
+			 * PGRAC: branch-1 (S3 step-2 forensics) — storage-fallback rescue.
+			 *
+			 *	A STALE verdict here means the master is holding a RETAINED
+			 *	stale resident (a kept Past Image) as the would-be grant
+			 *	payload.  When the shared-storage page already covers the
+			 *	authoritative watermark, the cluster-proven current version is
+			 *	durably readable: convert the reply to
+			 *	GRANTED_STORAGE_FALLBACK (ship no image; page_lsn carries the
+			 *	watermark — the same contract as the state=N grant above) so
+			 *	the requester proves/refreshes its copy through
+			 *	cluster_gcs_block_fallback_verify_refresh instead of aborting
+			 *	53R93 on every hit.  The verdict re-check uses the same
+			 *	gcs_block_lost_write_verdict SCN order the detector itself
+			 *	trusts (spec-2.41 §2.6).
+			 *
+			 *	ANOMALY (shipped InvalidScn on a tracked tag) is NOT rescued:
+			 *	an unstamped resident says the master's own view is broken —
+			 *	stay fail-closed.  A failed/unverifiable storage read keeps
+			 *	the fail-closed DENIED too (Rule 8.A).
+			 */
+			if (verdict == GCS_LOST_WRITE_FAIL_STALE) {
+				SCN storage_scn = InvalidScn;
+				bool storage_read_ok
+					= cluster_bufmgr_read_storage_scn_for_gcs(req->tag, &storage_scn);
+
+				/* Test hook: pretend storage is unverifiable so the rescue
+				 * refuses and the original fail-closed DENIED ships. */
+				CLUSTER_INJECTION_POINT("cluster-gcs-block-master-direct-fallback-storage-stale");
+				if (cluster_injection_should_skip(
+						"cluster-gcs-block-master-direct-fallback-storage-stale"))
+					storage_scn = InvalidScn;
+
+				if (storage_read_ok
+					&& gcs_block_lost_write_verdict(expected_scn, storage_scn)
+						   == GCS_LOST_WRITE_PASS) {
+					ereport(
+						LOG,
+						(errmsg_internal(
+							"cluster_gcs_block: master-direct stale ship rescued to "
+							"GRANTED_STORAGE_FALLBACK: tag spc=%u db=%u rel=%u block=%u "
+							"fork=%d expected pi_watermark_scn=" UINT64_FORMAT
+							" shipped pd_block_scn=" UINT64_FORMAT
+							" storage pd_block_scn=" UINT64_FORMAT
+							" requester=%d request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT,
+							req->tag.spcOid, req->tag.dbOid, req->tag.relNumber, req->tag.blockNum,
+							(int)req->tag.forkNum, (uint64)expected_scn, (uint64)shipped_scn,
+							(uint64)storage_scn, req->sender_node, req->request_id, req->epoch)));
+					status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+					page_lsn = (XLogRecPtr)expected_scn;
+					gcs_block_release_ship_image(block_payload_release_cb,
+												 block_payload_release_arg);
+					block_payload = NULL;
+					block_payload_lkey = 0;
+					block_payload_release_cb = NULL;
+					block_payload_release_arg = NULL;
+					if (ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(
+							&ClusterGcsBlock->lost_write_master_direct_storage_fallback_count, 1);
+					goto build_and_send_reply;
+				}
+			}
+
 			status = GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
 			page_lsn = InvalidXLogRecPtr;
 			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
@@ -8768,6 +8855,15 @@ uint64
 cluster_gcs_get_lost_write_avoid_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->lost_write_avoid_count) : 0;
+}
+
+/* PGRAC: branch-1 master-direct storage-fallback rescue accessor. */
+uint64
+cluster_gcs_get_lost_write_master_direct_storage_fallback_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(
+								 &ClusterGcsBlock->lost_write_master_direct_storage_fallback_count)
+						   : 0;
 }
 
 /* PGRAC: spec-2.41 D7 — SCN detector + redo-coverage observability accessors. */

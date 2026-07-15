@@ -6994,6 +6994,36 @@ cluster_bufmgr_probe_block_for_gcs(BufferTag tag)
 }
 
 /*
+ * Read the shared-storage version for a GCS lost-write rescue probe.  This is
+ * deliberately independent of the local buffer table: a BM_VALID mirror is
+ * residency only and must not be consulted as the storage-version carrier (the
+ * resident copy is exactly what the caller has just proven stale).  The
+ * physical read happens without any PCM/GRD lock held by the caller.
+ *
+ * Returns false (with *out_page_scn = InvalidScn) when the page fails
+ * verification; the caller must then keep its fail-closed verdict.
+ */
+bool
+cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
+{
+	PGAlignedBlock scratch;
+	SMgrRelation reln;
+
+	if (out_page_scn != NULL)
+		*out_page_scn = InvalidScn;
+
+	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+								PIV_LOG_WARNING | PIV_REPORT_STAT))
+		return false;
+
+	if (out_page_scn != NULL)
+		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
+	return true;
+}
+
+/*
  * Copy the 8KB block bytes for `tag` into *dst, flushing WAL up to the
  * page's LSN before reading the bytes (HC82 I-WAL-before-ship).  Sets
  * *out_page_lsn to the page LSN observed at the second-stable revalidation.

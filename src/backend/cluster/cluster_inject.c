@@ -662,6 +662,26 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-block-stale-ship" },
 	/*
+	 * branch-1 master-direct storage-fallback (S3 step-2 forensics verdict:
+	 * a master-retained Past Image served as the master-direct grant payload).
+	 *
+	 *	cluster-gcs-block-stale-ship-resident:
+	 *	  Fires ONLY at the master-direct self-check.  SKIP forces the
+	 *	  SHIPPED pd_block_scn to (valid watermark - 1) — §2.6 branch 1
+	 *	  STALE with a real shared-storage version left intact — so the
+	 *	  ship converts to GRANTED_STORAGE_FALLBACK when storage covers the
+	 *	  watermark (lost_write_master_direct_storage_fallback_count grows)
+	 *	  instead of failing the requester with 53R93.
+	 *
+	 *	cluster-gcs-block-master-direct-fallback-storage-stale:
+	 *	  Fires inside the fallback rescue probe.  SKIP forces the storage
+	 *	  pd_block_scn read to InvalidScn so the rescue is REFUSED and the
+	 *	  original fail-closed DENIED_LOST_WRITE ships — proves the rescue
+	 *	  never converts when shared storage cannot be proven current.
+	 */
+	{ .name = "cluster-gcs-block-stale-ship-resident" },
+	{ .name = "cluster-gcs-block-master-direct-fallback-storage-stale" },
+	/*
 	 * spec-2.38 D14 — SI Broadcaster fault injection.
 	 *
 	 *	cluster-sinval-broadcast-drop-send:
