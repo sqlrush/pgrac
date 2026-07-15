@@ -4025,6 +4025,13 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	memset(out, 0, sizeof(*out));
 }
 
+/* Shape A stub: dump_grd_recovery emits the crash-rejoin fence counter. */
+uint64
+cluster_grd_offpath_crash_rejoin_fenced_count(void)
+{
+	return 0;
+}
+
 uint32
 cluster_grd_outbound_ring_depth(void)
 {

@@ -439,6 +439,32 @@ void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set);
 void
 cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set pg_attribute_unused())
 {}
+
+/* Shape A (crash-rejoin re-declare barrier) stubs — the off-path rejoin tick
+ * references these; the reconfig unit legs do not exercise the crash-rejoin
+ * arm, so inert stubs suffice. */
+int
+cluster_conf_node_count(void)
+{
+	int n = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (ut_declared_set[i])
+			n++;
+	return n;
+}
+bool
+cluster_qvotec_prior_unclean_death(void)
+{
+	return false;
+}
+void
+cluster_grd_set_offpath_boot_decided(void)
+{}
+void
+cluster_grd_inc_offpath_crash_rejoin_fenced(void)
+{}
 /* spec-6.15 D5b: stripe joiner gate (not exercised here) — PROCEED so
  * the vanilla membership legs run unchanged. */
 #include "cluster/cluster_xid_stripe_boot.h"

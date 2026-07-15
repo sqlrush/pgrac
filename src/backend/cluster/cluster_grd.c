@@ -763,11 +763,14 @@ cluster_grd_shmem_init(void)
 		for (i = 0; i < CLUSTER_MAX_NODES; i++)
 			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_member_epoch[i], 0);
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
+		/* Shape A: off-path boot barrier starts UNDECIDED (fail-closed). */
+		pg_atomic_init_u32(&cluster_grd_state->offpath_boot_decided, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_done_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_shards_remastered_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_block_views_rebuilt_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_block_recovering_failclosed_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->offpath_crash_rejoin_fenced_count, 0);
 	}
 
 	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
@@ -1797,6 +1800,53 @@ cluster_grd_inc_join_block_failclosed(void)
 {
 	if (cluster_grd_state != NULL)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->join_block_recovering_failclosed_count, 1);
+}
+
+/*
+ * Shape A (crash-rejoin re-declare barrier) — off-path boot-barrier flag.
+ *
+ *	cluster_grd_offpath_boot_decided() -- false until the off-path rejoin
+ *	tick has classified this incarnation (bootstrap vs crash-rejoin).  The
+ *	phase gate fences self-home blocks RECOVERING while false, so a node
+ *	that self-admits at boot with cluster.online_join=off cannot cold-serve
+ *	its home blocks before it has proven their ownership (Rule 8.A).
+ *	Defaults DECIDED (true) when the GRD region is absent so a cluster-off
+ *	build never fences.
+ */
+bool
+cluster_grd_offpath_boot_decided(void)
+{
+	if (cluster_grd_state == NULL)
+		return true;
+	return pg_atomic_read_u32(&cluster_grd_state->offpath_boot_decided) != 0;
+}
+
+/* Mark the off-path boot decision complete (idempotent; single writer = the
+ * reconfig LMON tick).  After this the boot barrier lifts; on a crash-rejoin
+ * the caller has already armed the self-fence, which keeps home blocks
+ * RECOVERING via the existing join fence check. */
+void
+cluster_grd_set_offpath_boot_decided(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_write_u32(&cluster_grd_state->offpath_boot_decided, 1);
+}
+
+/* Shape A observability: count an off-path crash-rejoin fence-arm (LMON single
+ * writer; read for dump_grd + t/404). */
+void
+cluster_grd_inc_offpath_crash_rejoin_fenced(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->offpath_crash_rejoin_fenced_count, 1);
+}
+
+uint64
+cluster_grd_offpath_crash_rejoin_fenced_count(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->offpath_crash_rejoin_fenced_count);
 }
 
 /* spec-4.6 D5 — bulk counter snapshot for the dump path. */

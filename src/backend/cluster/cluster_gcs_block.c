@@ -1275,8 +1275,42 @@ cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN ex
 	GcsLostWriteVerdict verdict;
 	bool refreshed = false; /* S3 forensics — storage re-read happened */
 
-	if (buf == NULL || !SCN_VALID(expected_scn))
+	if (buf == NULL)
 		return;
+
+	/*
+	 * fix 2 (crash-rejoin re-declare barrier, defense in depth): an InvalidScn
+	 * master watermark normally SKIPs (not SCN-tracked / old-binary master /
+	 * holder re-ack).  But if THIS self-home block is under the off-path crash-
+	 * rejoin fence, the local GRD watermark was wiped by the restart, so an
+	 * Invalid watermark can mask a stale home block — fail-closed instead of
+	 * SKIP, except for a genuine extension block (never cross-node written).
+	 * This is a second line behind the phase-gate boot barrier, which already
+	 * fences the self-home block before the acquire reaches here.
+	 */
+	{
+		bool self_fenced
+			= (!cluster_online_join && cluster_gcs_lookup_master_static(tag) == cluster_node_id
+			   && cluster_conf_node_count() > 1 && !cluster_grd_offpath_boot_decided());
+		ClusterColdGrdVerdict cv = cluster_gcs_cold_grd_watermark_verdict(
+			SCN_VALID(expected_scn), self_fenced,
+			self_fenced && cluster_bufmgr_block_is_extension_for_gcs(tag));
+
+		if (cv == CLUSTER_COLD_GRD_SKIP)
+			return;
+		if (cv == CLUSTER_COLD_GRD_FAIL_CLOSED) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_failclosed_count, 1);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GCS_BLOCK_RESOURCE_RECOVERING),
+					 errmsg("crash-rejoin: cannot prove home block ownership after restart "
+							"(cold GRD watermark) for tag spc=%u db=%u rel=%u block=%u",
+							tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
+					 errhint("The block resource is recovering after an unclean restart; retry the "
+							 "transaction, or enable cluster.online_join for an online re-declare "
+							 "rejoin.")));
+		}
+		/* CLUSTER_COLD_GRD_PROVE: expected_scn valid — run the normal verdict. */
+	}
 
 	page_scn = cluster_bufmgr_read_block_scn_for_gcs(buf);
 	verdict = gcs_block_lost_write_verdict(expected_scn, page_scn);
@@ -1449,6 +1483,28 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 * (unchanged).
 	 */
 	static_master = cluster_gcs_lookup_master_static(tag);
+
+	/*
+	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot
+	 * barrier.  With cluster.online_join=off a node that boots into a running
+	 * cluster self-admits immediately (cluster_reconfig.c:206) with an EMPTY
+	 * GRD and NO re-declare episode: for a block whose STATIC home is self,
+	 * the acquire path would find master==self, read the empty local GRD, and
+	 * cold-grant from the stale/empty disk page — a silent stale READ and a
+	 * silently-diverging WRITE (the P0).  Until the off-path rejoin tick has
+	 * classified this incarnation (crash-rejoin -> self-fence armed;
+	 * bootstrap -> nothing), self cannot prove its home blocks' ownership, so
+	 * fence them RECOVERING.  Both reads and writes reach this gate via
+	 * cluster_pcm_lock_acquire_buffer, so this closes the boot-to-decision
+	 * race with ZERO cold-serve window (Rule 8.A: uncertain -> fail-closed).
+	 * Skipped for online_join=on (its admission + join fence govern) and for
+	 * a single declared node (no peer can hold a conflicting copy).
+	 */
+	if (!cluster_online_join && static_master == cluster_node_id && cluster_conf_node_count() > 1
+		&& !cluster_grd_offpath_boot_decided()) {
+		cluster_grd_inc_join_block_failclosed();
+		return GCS_BLOCK_RECOVERING;
+	}
 
 	/*
 	 * spec-5.16 D3 (r1 P1-C) — online-join PCM block snap-back fence, placed

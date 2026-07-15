@@ -328,6 +328,9 @@ extern const char *cluster_qvotec_get_collision_state_name(void);
  *	survives Q4 lease expiry can pass the commit gate.
  * ---------- */
 extern bool cluster_qvotec_in_quorum(void);
+/* Shape A (crash-rejoin re-declare barrier): prior-incarnation self-slot
+ * carried ALIVE at startup => this boot follows an UNCLEAN death. */
+extern bool cluster_qvotec_prior_unclean_death(void);
 
 
 /* ----------

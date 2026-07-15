@@ -398,6 +398,19 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 join_pcm_fence_member_epoch[CLUSTER_MAX_NODES];
 	pg_atomic_uint32 recovery_direction;
 
+	/*
+	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot
+	 * barrier.  0 = the online_join=off rejoin/bootstrap decision has NOT
+	 * run this incarnation, so this node cannot prove ownership of its
+	 * home blocks; the phase gate fences self-home blocks RECOVERING until
+	 * it flips (fail-closed boot-race elimination).  Set to 1 by the
+	 * off-path rejoin tick once it has DECIDED (crash-rejoin -> also armed
+	 * the self-fence; cold-bootstrap -> no fence).  Per-incarnation:
+	 * re-zeroed by the !found shmem init.  online_join=on never consults
+	 * it (that path has its own admission + join fence).
+	 */
+	pg_atomic_uint32 offpath_boot_decided;
+
 	/* spec-5.16 D5 — join-direction remaster counters (dump_grd grd_recovery
 	 * segment;  kept distinct from the failure-driven remaster_* counters so
 	 * ops can tell the two remaster kinds apart — §8 Q6-A). */
@@ -406,6 +419,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 join_shards_remastered_count;			 /* GRD shards moved to joiner */
 	pg_atomic_uint64 join_block_views_rebuilt_count;		 /* joiner-home fences lifted */
 	pg_atomic_uint64 join_block_recovering_failclosed_count; /* 53R9L denied (both gates) */
+	pg_atomic_uint64 offpath_crash_rejoin_fenced_count;		 /* Shape A: off-path crash-rejoin
+															  * fence-arm events (LMON) */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -669,6 +684,11 @@ extern void cluster_grd_inc_stale_request_drop(void);
 extern void cluster_grd_inc_block_path_failclosed(void);
 /* spec-5.16 D5 — join-direction 53R9L fail-closed bump (requester + master gate). */
 extern void cluster_grd_inc_join_block_failclosed(void);
+/* Shape A (crash-rejoin re-declare barrier) — off-path boot barrier flag. */
+extern bool cluster_grd_offpath_boot_decided(void);
+extern void cluster_grd_set_offpath_boot_decided(void);
+extern void cluster_grd_inc_offpath_crash_rejoin_fenced(void);
+extern uint64 cluster_grd_offpath_crash_rejoin_fenced_count(void);
 
 /* spec-4.6 D5 — bulk snapshot of the 13 grd_recovery counters for the
  * pg_cluster_state dump (category 'grd_recovery';  one t/249 leg each). */

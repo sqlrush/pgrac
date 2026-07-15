@@ -195,6 +195,41 @@ UT_TEST(test_lost_write_verdict_branches)
 }
 
 
+/*
+ * fix 2 (crash-rejoin cold-GRD watermark) — the pure verdict truth table.
+ * Positive legs: a valid watermark PROVEs; an Invalid watermark under a
+ * self-fence FAIL-CLOSEs a pre-existing block.  Negative legs: no fence, or a
+ * genuine extension block, both SKIP (never over-fail-closed).
+ */
+UT_TEST(test_cold_grd_watermark_verdict_truth_table)
+{
+	/* valid watermark -> always PROVE regardless of fence / extension */
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(true, false, false),
+				 CLUSTER_COLD_GRD_PROVE);
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(true, true, false),
+				 CLUSTER_COLD_GRD_PROVE);
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(true, true, true),
+				 CLUSTER_COLD_GRD_PROVE);
+
+	/* NEGATIVE leg 1: Invalid watermark, NO self-fence -> SKIP (legit
+	 * never-tracked / holder re-ack; must not over-fail-closed) */
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(false, false, false),
+				 CLUSTER_COLD_GRD_SKIP);
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(false, false, true),
+				 CLUSTER_COLD_GRD_SKIP);
+
+	/* NEGATIVE leg 2: Invalid watermark, self-fence, but a GENUINE extension
+	 * block -> SKIP (never cross-node written; Invalid is correct) */
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(false, true, true),
+				 CLUSTER_COLD_GRD_SKIP);
+
+	/* POSITIVE leg: Invalid watermark, self-fence, pre-existing (non-extension)
+	 * block -> FAIL_CLOSED (wiped/cold GRD watermark, ambiguous, Rule 8.A) */
+	UT_ASSERT_EQ((int)cluster_gcs_cold_grd_watermark_verdict(false, true, false),
+				 CLUSTER_COLD_GRD_FAIL_CLOSED);
+}
+
+
 UT_TEST(test_invalidate_ack_page_scn_helper_round_trip)
 {
 	GcsBlockInvalidateAckPayload ack;
@@ -440,6 +475,7 @@ main(void)
 	UT_RUN(test_forward_payload_expected_pi_watermark_scn_offset_49);
 	UT_RUN(test_expected_pi_watermark_scn_helper_round_trip);
 	UT_RUN(test_lost_write_verdict_branches);
+	UT_RUN(test_cold_grd_watermark_verdict_truth_table);
 	UT_RUN(test_invalidate_ack_page_scn_helper_round_trip);
 	UT_RUN(test_redeclare_dual_carrier_round_trip);
 	UT_RUN(test_pi_watermark_advance_prototype_linkable);
