@@ -53,6 +53,14 @@
 #	  L8  wake-up self-heal: node1's first cross-node read after the
 #	      storm succeeds (bounded retries allowed: the inadmissible
 #	      BELOW_HORIZON arm is fail-closed and observe heals it)
+#	  L10 GATED self-heal proof (runs before L9), RED->GREEN twin
+#	      on ONE driver with NO cleanout bypass: a recycled node0
+#	      xid first fails closed 53R97 under the default
+#	      cluster.crossnode_runtime_visibility = off (verdict wire
+#	      provably untouched), then -- GUC flipped on, nothing else
+#	      changed -- resolves through the COMMITTED_BELOW_HORIZON
+#	      origin-verdict arm: exact data terminal + rtvis verdict
+#	      counter evidence
 #	  L9  restart clean
 #
 # Spec: spec-5.22e (cluster undo retention brake) S2.1 sampling rule +
@@ -499,6 +507,238 @@ for my $i (1 .. 10)
 	usleep(1_000_000);
 }
 is($sum, '64|t', "L8 node1 cross-node read healed (tries=$tries)");
+
+# ============================================================
+# L10: the GATED wake-up self-heal, for real -- the
+# COMMITTED_BELOW_HORIZON resolve arm under
+# cluster.crossnode_runtime_visibility = on, with NO owner-side
+# cleanout bypass (no FREEZE, no CHECKPOINT).
+#
+# L8 above only proves the read heals AFTER a VACUUM (FREEZE)
+# removed the remote ITL refs -- the rtvis resolve machinery
+# (cluster_runtime_visibility.c rtvis_try_origin_verdict) never ran
+# there because the GUC defaults off.  This leg drives it as a
+# RED->GREEN twin on ONE driver:
+#
+#  1. cluster.tt_status_hint_emit_mode = disabled (PGC_SIGHUP,
+#     default all_status) BEFORE the fixture write: otherwise the
+#     V4 hint wire installs the fixture xid's terminal status into
+#     node1's TT overlay at commit time and the read resolves from
+#     the overlay without ever touching the verdict wire.  This is
+#     NOT an assertion-weakening bypass: it deterministically
+#     manufactures the "hint never arrived" state the resolve path
+#     exists for (the 256-slot outbound ring drops hints under
+#     storm load anyway), FORCING the mechanism under test to carry
+#     the read.  cluster.crossnode_runtime_visibility stays at its
+#     default (off) until the RED twin below has run.
+#  2. Fixture: ONE node0 transaction inserts 64 rows -> a single
+#     fresh remote ITL ref (local_xid == raw_xid).  With
+#     cluster.xid_striping off in this rig, cluster_xid_is_mine()
+#     is always false at the origin, so ONLY the spec-5.22f
+#     fresh-ref AUTHORITATIVE ask is ever served -- the fixture must
+#     stay fresh (single writer xact, page never revisited by
+#     node0, so no delayed cleanout stamps it).
+#  3. Churn: a node0 writer laps the TT pool (same
+#     tt_retention_rollover_count evidence as L2), so the fixture
+#     xid's TT slot is provably rebound; the origin's complete
+#     by-xid scan then 0-matches and -- retention legs (a)-(d) +
+#     CLOG committed -- serves COMMITTED_BELOW_HORIZON{H}.
+#  4. RED twin: with the GUC still off, node1's read of the fixture
+#     MUST fail closed 53R97 ("cluster TT status unknown",
+#     heapam_visibility.c) and node1's verdict-wire counter MUST
+#     stay flat (cluster_runtime_visibility.c gates the whole
+#     resolve on the GUC before any wire touch).  This proves the
+#     recycled-slot window is genuinely open at the moment the
+#     GREEN twin runs -- the GREEN result cannot be an overlay /
+#     hint / cleanout side door.
+#  5. cluster.crossnode_runtime_visibility = on (PGC_SUSET, reload)
+#     on BOTH nodes: the requester's classify / fresh-ref widening
+#     gates on it AND the origin's lms_undo_verdict_serve refuses
+#     while it is off (cluster_cr_server.c).
+#  6. GREEN twin: node1 re-reads the same fixture.  A snapshot
+#     read_scn behind the shipped horizon takes the inadmissible
+#     fail-closed arm and the Lamport observe heals the NEXT
+#     snapshot (bounded retries, the documented self-heal); the
+#     healed snapshot admits the bound and every row resolves
+#     visible.
+#
+# HARD ASSERTS: RED twin fails closed with the wire flat + exact
+# terminal data on the GREEN twin (count=64 AND sum=2080 -- not
+# L8's sum >= 0 shape) + node1's rtvis verdict counters moved
+# (below_horizon / exact), proving the verdict wire resolved the
+# read rather than an overlay / hint / cleanout side door.
+#
+# Known hazard (documented, not worked around): if L8 had to bounce
+# node1, the pre-existing rejoin silent-empty-read defect (see L8
+# comment) can surface here as count=0 -- that is a REAL defect this
+# leg must fail on, not paper over.
+# ============================================================
+for my $node ($pair->node0, $pair->node1)
+{
+	$node->safe_psql('postgres',
+		"ALTER SYSTEM SET cluster.tt_status_hint_emit_mode = 'disabled'");
+	$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
+ok( wait_for(
+		sub {
+			$pair->node0->safe_psql('postgres',
+				'SHOW cluster.tt_status_hint_emit_mode') eq 'disabled'
+			  && $pair->node1->safe_psql('postgres',
+				'SHOW cluster.tt_status_hint_emit_mode') eq 'disabled';
+		},
+		15),
+	'L10a status-hint wire disabled via reload (both nodes)');
+
+# Coinciding-filepath fixture on shared storage (same t/394 recipe as
+# L1b; no shared catalog in this rig).
+my $l10tbl;
+for my $i (1 .. 12)
+{
+	my $t = "t403l10_$i";
+	$_->safe_psql('postgres', "CREATE TABLE $t (k int, v int)")
+	  for ($pair->node0, $pair->node1);
+	my $p0 = $pair->node0->safe_psql('postgres', "SELECT pg_relation_filepath('$t')");
+	my $p1 = $pair->node1->safe_psql('postgres', "SELECT pg_relation_filepath('$t')");
+	if (($p0 // '') eq ($p1 // '')) { $l10tbl = $t; last; }
+}
+ok(defined $l10tbl, 'L10b coinciding-filepath fixture table found');
+die 'no coinciding filepath found for L10' unless defined $l10tbl;
+diag("L10 fixture table=$l10tbl");
+
+# ONE transaction writes all 64 rows: exact expected terminal data is
+# count=64, sum(v)=sum(1..64)=2080, and the page ITL stays a single
+# fresh entry bound to this xid.
+$pair->node0->safe_psql('postgres',
+	"INSERT INTO $l10tbl SELECT g, g FROM generate_series(1, 64) g");
+
+# Churn phase: lap the TT pool on node0 so the fixture xid's slot is
+# rebound (>= 2 laps hard floor, target 3; single background writer on
+# a node0-only table so the fixture pages are never revisited).
+$pair->node0->safe_psql('postgres', 'CREATE TABLE t403l10_churn (k int)');
+my $churnfile = "$tmpdir/churn.sql";
+{
+	open(my $fh, '>', $churnfile) or die "cannot write $churnfile: $!";
+	print $fh "INSERT INTO t403l10_churn VALUES (1);\n" for (1 .. $WRITER_LINES);
+	close($fh);
+}
+my $roll_pre_l10 = state_val($pair->node0, 'undo', 'tt_retention_rollover_count');
+my ($c_in, $c_out, $c_err) = ('', '', '');
+my $churn = IPC::Run::start(
+	[
+		'psql', '-X', '-A', '-t', '-q',
+		'-d', $pair->node0->connstr('postgres'),
+		'-f', $churnfile
+	],
+	\$c_in, \$c_out, \$c_err);
+my $churn_t0 = time();
+my $roll_delta_l10 = 0;
+while (time() - $churn_t0 < 120)
+{
+	$roll_delta_l10 =
+	  state_val($pair->node0, 'undo', 'tt_retention_rollover_count') - $roll_pre_l10;
+	last if $roll_delta_l10 >= 3 * $POOL_SEGMENTS;
+	usleep(400_000);
+}
+$churn->kill_kill;
+diag(sprintf('L10 churn: %d TT rollovers in %.0fs (hard floor %d)',
+	$roll_delta_l10, time() - $churn_t0, 2 * $POOL_SEGMENTS));
+cmp_ok($roll_delta_l10, '>=', 2 * $POOL_SEGMENTS,
+	'L10c churn lapped the TT pool (fixture slot provably rebound)');
+
+# ------------------------------------------------------------
+# RED twin: cluster.crossnode_runtime_visibility is still at its
+# default (off).  The same read the GREEN twin will heal below MUST
+# fail closed here -- 53R97 "cluster TT status unknown"
+# (heapam_visibility.c) -- and node1's verdict-wire counter MUST stay
+# flat: cluster_runtime_visibility.c refuses before any wire touch
+# while the GUC is off, so a moving counter (or a succeeding read)
+# would mean a side door carried it.  Transient non-53R97 errors
+# (post-churn GES tail, the L8 class) are retried; a SUCCEEDING read
+# is a hard fail, never retried.
+# ------------------------------------------------------------
+my $wire_pre_neg = state_val($pair->node1, 'cr', 'rtvis_verdict_wire_count');
+my ($neg_hit_53r97, $neg_unexpected) = (0, '');
+for my $i (1 .. 10)
+{
+	my ($rc, $stdout, $stderr) =
+	  $pair->node1->psql('postgres', "SELECT count(*), sum(v) FROM $l10tbl");
+	if ($rc == 0)
+	{
+		$neg_unexpected = 'read SUCCEEDED with rtvis off: [' . ($stdout // '') . ']';
+		last;
+	}
+	if (($stderr // '') =~ /cluster TT status unknown for xid/)
+	{
+		$neg_hit_53r97 = 1;
+		last;
+	}
+	$neg_unexpected = join(' / ', split(/\n/, $stderr // ''));
+	diag(sprintf('L10d RED-twin attempt %d: rc=%d non-53R97 err=[%s]',
+		$i, $rc, $neg_unexpected));
+	usleep(1_500_000);
+}
+ok($neg_hit_53r97,
+	'L10d RED twin HARD ASSERT: rtvis off fails the read closed 53R97 '
+	  . '(cluster TT status unknown)')
+  or diag("L10d terminal state: $neg_unexpected");
+is(state_val($pair->node1, 'cr', 'rtvis_verdict_wire_count') - $wire_pre_neg,
+	0, 'L10e RED twin: verdict wire provably untouched while the GUC is off');
+
+# GREEN twin arming: flip ONLY the GUC; driver and fixture unchanged.
+for my $node ($pair->node0, $pair->node1)
+{
+	$node->safe_psql('postgres',
+		'ALTER SYSTEM SET cluster.crossnode_runtime_visibility = on');
+	$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
+ok( wait_for(
+		sub {
+			$pair->node0->safe_psql('postgres',
+				'SHOW cluster.crossnode_runtime_visibility') eq 'on'
+			  && $pair->node1->safe_psql('postgres',
+				'SHOW cluster.crossnode_runtime_visibility') eq 'on';
+		},
+		15),
+	'L10f crossnode_runtime_visibility on via reload (both nodes)');
+
+# Requester-side rtvis verdict counters live on node1 (category 'cr').
+my $bh_pre    = state_val($pair->node1, 'cr', 'rtvis_verdict_below_horizon_count');
+my $ex_pre    = state_val($pair->node1, 'cr', 'rtvis_verdict_exact_count');
+my $inadm_pre = state_val($pair->node1, 'cr', 'rtvis_verdict_inadmissible_count');
+my $wire_pre  = state_val($pair->node1, 'cr', 'rtvis_verdict_wire_count');
+
+# node1 cross-node read, bounded retries: the inadmissible
+# BELOW_HORIZON arm is fail-closed and the wire observe heals the next
+# snapshot (plus post-churn GES tail tolerance, as in L8).
+my ($l10_out, $l10_tries) = ('', 0);
+for my $i (1 .. 15)
+{
+	$l10_tries = $i;
+	my ($rc, $stdout, $stderr) =
+	  $pair->node1->psql('postgres', "SELECT count(*), sum(v) FROM $l10tbl");
+	if ($rc == 0 && $stdout =~ /^64\|2080$/)
+	{
+		$l10_out = $stdout;
+		last;
+	}
+	diag(sprintf('L10 attempt %d: rc=%d out=[%s] err=[%s]',
+		$i, $rc, $stdout // '', join(' / ', split(/\n/, $stderr // ''))));
+	usleep(1_500_000);
+}
+is($l10_out, '64|2080',
+	"L10 HARD ASSERT: node1 healed read returned exact terminal data (tries=$l10_tries)");
+
+my $bh_d    = state_val($pair->node1, 'cr', 'rtvis_verdict_below_horizon_count') - $bh_pre;
+my $ex_d    = state_val($pair->node1, 'cr', 'rtvis_verdict_exact_count') - $ex_pre;
+my $inadm_d = state_val($pair->node1, 'cr', 'rtvis_verdict_inadmissible_count') - $inadm_pre;
+my $wire_d  = state_val($pair->node1, 'cr', 'rtvis_verdict_wire_count') - $wire_pre;
+diag("L10 node1 rtvis verdict deltas: wire=$wire_d below_horizon=$bh_d "
+	  . "exact=$ex_d inadmissible=$inadm_d");
+cmp_ok($bh_d + $ex_d, '>', 0,
+	'L10g HARD ASSERT: verdict resolve path really carried the read '
+	  . '(below_horizon + exact advanced)');
+cmp_ok($bh_d, '>', 0,
+	'L10h below-horizon arm served the recycled fixture xid');
 
 # ============================================================
 # L9: restart clean.
