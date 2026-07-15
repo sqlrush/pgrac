@@ -353,15 +353,28 @@ undo_cleaner_advance_liveness_tick(void)
  *	  - storage-mode gate: no cluster storage mode -> no work (HC4);
  *	  - cluster.undo_cleaner_enabled=off -> no work (diagnostic
  *	    parity with 3.12 lazy-only mode).
+ *
+ *	Returns true when the recycle stage could NOT run to completion
+ *	against a proven cluster floor (fold stalled, member set unstable,
+ *	or the F-D2 epoch fence aborted the pass).  These causes normally
+ *	clear at the horizon-report cadence (~one LMON tick: epoch views
+ *	converge and every peer re-publishes), so the caller retries the
+ *	pass at that cadence instead of sleeping a full recycle interval —
+ *	the S3 undo-pool exhaustion amplifier (a ~1s transient froze
+ *	cluster-wide COMMITTED recycling for 30-60s).  Rule 8.A unchanged:
+ *	a retry still recycles ONLY on a proven floor; a persistent cause
+ *	keeps every retry stalled.
  */
-static void
+static bool
 undo_cleaner_run_pass(void)
 {
 	ClusterUndoCleanerPassStats stats;
+	bool floor_retry_needed = false;
+
 	if (!cluster_undo_cleaner_enabled)
-		return;
+		return false;
 	if (!cluster_storage_mode_enabled())
-		return;
+		return false;
 
 	/*
 	 * D2 (step 3): horizon ONCE per pass, BEFORE any seg->lock (C17).
@@ -410,6 +423,7 @@ undo_cleaner_run_pass(void)
 		}
 
 		if (stalled) {
+			floor_retry_needed = true;
 			cluster_undo_horizon_note_stall();
 			if (stall_blame >= 0 && stall_blame != cluster_node_id)
 				cluster_undo_horizon_note_peer_stale();
@@ -434,6 +448,7 @@ undo_cleaner_run_pass(void)
 		cluster_undo_horizon_note_floor(floor.scn);
 
 		if (!cluster_tt_slot_gc_current_pass(horizon, floor.epoch, &stats)) {
+			floor_retry_needed = true;
 			cluster_undo_horizon_note_pass_abort();
 			goto pass_account; /* F-D2: epoch moved mid-scan; abort the pass */
 		}
@@ -522,8 +537,10 @@ undo_cleaner_run_pass(void)
 			 */
 			undo_cleaner_state->scan_resume_seg = seg;
 
-			if (fence_aborted)
+			if (fence_aborted) {
+				floor_retry_needed = true;
 				cluster_undo_horizon_note_pass_abort();
+			}
 		}
 	}
 
@@ -559,6 +576,8 @@ pass_account:
 			pinned_logged = false;
 		}
 	}
+
+	return floor_retry_needed;
 }
 
 
@@ -614,6 +633,7 @@ UndoCleanerMain(void)
 	for (;;) {
 		int rc;
 		int timeout_ms;
+		bool floor_retry;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -629,13 +649,30 @@ UndoCleanerMain(void)
 
 		CLUSTER_INJECTION_POINT("undo-cleaner-main-loop-iter");
 
-		undo_cleaner_run_pass();
+		floor_retry = undo_cleaner_run_pass();
 
 		/*
 		 * interval 0 = pressure-wakeup only (Q8): block without
 		 * timeout; otherwise wake at the configured cadence.
+		 *
+		 * TT lane (P1#4): a pass that could not prove the cluster floor
+		 * (stall / member churn / F-D2 abort) re-arms at the horizon-
+		 * report cadence instead — that is when new reports and epoch
+		 * convergence can actually arrive (one LMON tick).  Sleeping the
+		 * full recycle interval here turned ~1s transients into 30-60s
+		 * cluster-wide COMMITTED-recycle freezes (S3 undo-pool
+		 * exhaustion, 25,715 x 53R9E on node0).  Fail-closed is
+		 * untouched: the retried pass re-proves or re-stalls; this also
+		 * bounds the interval=0 mode, whose stalled pass previously
+		 * waited on a latch nobody was obliged to set.
 		 */
 		timeout_ms = cluster_undo_cleaner_interval_ms;
+		if (floor_retry) {
+			int retry_ms = Max(cluster_lmon_main_loop_interval, 200);
+
+			if (timeout_ms <= 0 || retry_ms < timeout_ms)
+				timeout_ms = retry_ms;
+		}
 		rc = WaitLatch(
 			MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (timeout_ms > 0 ? WL_TIMEOUT : 0),
 			timeout_ms > 0 ? timeout_ms : -1L, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);

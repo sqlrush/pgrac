@@ -63,6 +63,7 @@
 #include <string.h>
 
 #include "access/transam.h"
+#include "cluster/cluster_conf.h" /* ClusterConfShmem (peer-mode test topology) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_cleaner.h" /* gc pass + stats (spec-3.13) */
@@ -222,6 +223,10 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 SCN mock_retention_horizon = InvalidScn;
 bool cluster_undo_retention_horizon_enabled = true;
 
+/* cluster_mode.h derives peer mode from this topology SSOT. */
+static ClusterConf mock_cluster_conf;
+ClusterConf *ClusterConfShmem = &mock_cluster_conf;
+
 /* spec-3.15 D6 stub: protected-map spinlock (single-threaded unit). */
 int
 s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
@@ -279,6 +284,7 @@ reset_allocator(void)
 	/* Default: no retention constraint (cluster-disabled sentinel), gate on. */
 	mock_retention_horizon = InvalidScn;
 	cluster_undo_retention_horizon_enabled = true;
+	mock_cluster_conf.node_count = 1;
 }
 
 
@@ -1049,6 +1055,98 @@ UT_TEST(test_t47_protect_idempotent_and_conflict)
 	(void)cluster_tt_slot_unprotect_xid((TransactionId)902);
 }
 
+UT_TEST(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner)
+{
+	/*
+	 * A peer can hold a read_scn below this node's LOCAL ProcArray horizon.
+	 * Therefore allocator Pass 2 must not consume a locally-eligible
+	 * COMMITTED slot in peer mode.  Only the cleaner, after it receives an
+	 * epoch-paired proven CLUSTER floor, may turn that slot into FREE.
+	 */
+	ClusterUndoCleanerPassStats stats = { 0 };
+	uint16 off;
+	uint16 result;
+	bool retained = false;
+	int i;
+
+	reset_allocator();
+	mock_cluster_conf.node_count = 2; /* cluster_peer_mode_enabled() */
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
+	mock_retention_horizon = (SCN)100; /* local-only floor would recycle */
+
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
+
+	/* No cluster-floor proof has run: retain old xid/wrap and roll over. */
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+
+	/* A remote-reader floor below the commit still retains it. */
+	cluster_tt_slot_gc_current_pass((SCN)5, (uint64)7, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
+	retained = false;
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+
+	/* Once the proven cluster floor passes the commit, cleaner owns recycle. */
+	memset(&stats, 0, sizeof(stats));
+	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)7, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 1);
+	result = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
+	UT_ASSERT_EQ((int)result, (int)off);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 1);
+}
+
+UT_TEST(test_t49_peer_mode_aborted_remains_directly_recyclable)
+{
+	/* ABORTED is invisible to every local or remote snapshot, so the peer-mode
+	 * COMMITTED proof gate must not force unnecessary rollover for it. */
+	uint16 off;
+	uint16 result;
+	int i;
+
+	reset_allocator();
+	mock_cluster_conf.node_count = 2;
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	cluster_tt_slot_mark_aborted(NODE0_SEG, off, (TransactionId)100);
+
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
+
+	result = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
+	UT_ASSERT_EQ((int)result, (int)off);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 1);
+}
+
+UT_TEST(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor)
+{
+	/* The diagnostic local-retention bypass is not a proof about peer
+	 * snapshots.  In peer mode its safe result is rollover/fail-closed. */
+	uint16 off;
+	uint16 result;
+	bool retained = false;
+	int i;
+
+	reset_allocator();
+	mock_cluster_conf.node_count = 2;
+	cluster_undo_retention_horizon_enabled = false;
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
+
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
+
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+}
+
 
 int
 main(void)
@@ -1104,6 +1202,9 @@ main(void)
 	UT_RUN(test_t45_protected_map_basics);
 	UT_RUN(test_t46_alloc_gate_skips_protected_free_slot);
 	UT_RUN(test_t47_protect_idempotent_and_conflict);
+	UT_RUN(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner);
+	UT_RUN(test_t49_peer_mode_aborted_remains_directly_recyclable);
+	UT_RUN(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }
