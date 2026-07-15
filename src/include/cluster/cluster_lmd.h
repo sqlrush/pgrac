@@ -613,6 +613,16 @@ extern void cluster_lmd_graph_shmem_init(void);
 
 /* Graph low-level mutators (used by cluster_lmd_tarjan.c + D16 SRF). */
 extern bool cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge);
+/*
+ * spec-2.36a C2 -- atomically replace one waiter's complete blocker set.
+ * The graph either publishes exactly the distinct blocker identities supplied
+ * here, or leaves the previous set untouched (including on capacity failure).
+ * A zero-length set is an atomic remove-all.  Callers must hold no queue,
+ * buffer, or GRD locks while invoking this API.
+ */
+extern bool cluster_lmd_graph_replace_waiter_edges(const ClusterLmdVertex *waiter,
+												   const ClusterLmdVertex *blockers, int nblockers,
+												   uint64 request_id);
 extern bool cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter);
 extern bool cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter);
 extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_edges,

@@ -97,6 +97,57 @@ UT_DEFINE_GLOBALS();
 
 bool IsUnderPostmaster = false;
 
+void *
+palloc(Size size)
+{
+	void *ptr = malloc(size);
+
+	if (ptr == NULL)
+		abort();
+	return ptr;
+}
+
+void *
+repalloc(void *pointer, Size size)
+{
+	void *ptr = realloc(pointer, size);
+
+	if (ptr == NULL)
+		abort();
+	return ptr;
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return true;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
 /*
  * cluster_lmd_graph.c reads cluster.lmd_max_wait_edges (cluster_guc.c GUC).
  * The standalone harness defines it directly to avoid pulling cluster_guc.o.
@@ -160,6 +211,8 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 static int fake_htab_token;
 static int fake_htab_count;
 static int fake_htab_seq_index;
+static int fake_htab_seq_init_count;
+static int fake_hash_enter_null_fail_after = -1;
 static Size fake_htab_entrysize;
 static Size fake_htab_keysize;
 static union {
@@ -199,6 +252,8 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 	fake_htab_keysize = infoP->keysize;
 	fake_htab_count = 0;
 	fake_htab_seq_index = 0;
+	fake_htab_seq_init_count = 0;
+	fake_hash_enter_null_fail_after = -1;
 	memset(&fake_htab, 0, sizeof(fake_htab));
 	return (HTAB *)&fake_htab_token;
 }
@@ -238,9 +293,15 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr, HASHACTION ac
 	if (action == HASH_FIND || action == HASH_REMOVE)
 		return NULL;
 
-	if (action == HASH_ENTER_NULL) {
+	if (action == HASH_ENTER_NULL || action == HASH_ENTER) {
 		char *entry;
 
+		if (action == HASH_ENTER_NULL && fake_hash_enter_null_fail_after >= 0) {
+			if (fake_hash_enter_null_fail_after-- == 0) {
+				fake_hash_enter_null_fail_after = -1;
+				return NULL;
+			}
+		}
 		if (fake_htab_count >= FAKE_LMD_HTAB_MAX_ENTRIES)
 			return NULL;
 
@@ -257,6 +318,7 @@ void
 hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
 {
 	fake_htab_seq_index = 0;
+	fake_htab_seq_init_count++;
 }
 
 void *
@@ -459,6 +521,314 @@ UT_TEST(test_duplicate_edge_is_idempotent)
 	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 1);
 	gen_after = cluster_lmd_graph_generation_get();
 	UT_ASSERT(gen_after > gen_before);
+}
+
+
+/* ============================================================
+ * U1e-U1j -- spec-2.36a C2 atomic blocker-set replacement.
+ *
+ * A PCM convert waiter cannot publish blockers as cancel + N independent
+ * adds: a concurrent snapshot could observe an empty/partial set, and an add
+ * failure would strand only a prefix.  The batch API is all-or-nothing.
+ * ============================================================ */
+
+UT_TEST(test_replace_waiter_edges_publishes_exact_batch)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex blockers[3]
+		= { mkvertex(0, 300, 7, 7000), mkvertex(2, 301, 7, 7001), mkvertex(3, 302, 7, 7002) };
+	ClusterLmdWaitEdge snap[8];
+	uint64 gen;
+	int n;
+
+	reset_graph();
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w, blockers, 3, w.request_id));
+
+	n = cluster_lmd_graph_snapshot_copy(snap, 8, &gen);
+	UT_ASSERT_EQ(n, 3);
+	UT_ASSERT_EQ(count_edges(snap, n, &w, &old), 0);
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &blockers[i]), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_full_preserves_previous_set)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex other = mkvertex(2, 101, 7, 5001);
+	ClusterLmdVertex old[2] = { mkvertex(0, 200, 7, 6000), mkvertex(3, 201, 7, 6001) };
+	ClusterLmdVertex replacement[3]
+		= { mkvertex(0, 300, 7, 7000), mkvertex(2, 301, 7, 7001), mkvertex(3, 302, 7, 7002) };
+	ClusterLmdWaitEdge snap[64];
+	uint64 gen_before;
+	uint64 gen_after;
+	uint64 full_before;
+	int n;
+
+	cluster_lmd_max_wait_edges = 64;
+	reset_graph();
+	cluster_lmd_max_wait_edges = 1024;
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old[i], w.request_id));
+	/* graph minimum capacity is 64; fill the remaining 62 entries. */
+	for (int i = 0; i < 62; i++) {
+		ClusterLmdVertex b = mkvertex(0, 1000 + (uint32)i, 7, 8000 + (uint64)i);
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&other, &b, other.request_id));
+	}
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 64);
+	gen_before = cluster_lmd_graph_generation_get();
+	full_before = cluster_lmd_wait_edge_full_count_get();
+
+	UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, replacement, 3, w.request_id));
+	gen_after = cluster_lmd_graph_generation_get();
+	UT_ASSERT_EQ(gen_after, gen_before);
+	UT_ASSERT_EQ(cluster_lmd_wait_edge_full_count_get(), full_before + 1);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 64);
+
+	n = cluster_lmd_graph_snapshot_copy(snap, 64, NULL);
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &old[i]), 1);
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &replacement[i]), 0);
+}
+
+UT_TEST(test_replace_waiter_edges_can_shrink_at_capacity)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex other = mkvertex(2, 101, 7, 5001);
+	ClusterLmdVertex old1 = mkvertex(0, 200, 7, 6000);
+	ClusterLmdVertex old2 = mkvertex(3, 201, 7, 6001);
+	ClusterLmdVertex replacement = mkvertex(2, 300, 7, 7000);
+	ClusterLmdVertex extra = mkvertex(3, 999, 7, 9999);
+
+	cluster_lmd_max_wait_edges = 64;
+	reset_graph();
+	cluster_lmd_max_wait_edges = 1024;
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old1, w.request_id));
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old2, w.request_id));
+	for (int i = 0; i < 62; i++) {
+		ClusterLmdVertex b = mkvertex(0, 1000 + (uint32)i, 7, 8000 + (uint64)i);
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&other, &b, other.request_id));
+	}
+
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w, &replacement, 1, w.request_id));
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 63);
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&other, &extra, other.request_id));
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 64);
+}
+
+UT_TEST(test_replace_waiter_edges_deduplicates_blocker_identities)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex b1 = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex b2 = mkvertex(3, 201, 7, 6001);
+	ClusterLmdVertex blockers[3] = { b1, b1, b2 };
+	ClusterLmdWaitEdge snap[4];
+	int n;
+
+	reset_graph();
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w, blockers, 3, w.request_id));
+	n = cluster_lmd_graph_snapshot_copy(snap, 4, NULL);
+	UT_ASSERT_EQ(n, 2);
+	UT_ASSERT_EQ(count_edges(snap, n, &w, &b1), 1);
+	UT_ASSERT_EQ(count_edges(snap, n, &w, &b2), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_rejects_self_cycle_without_mutation)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex blockers[2] = { mkvertex(3, 300, 7, 7000), w };
+	ClusterLmdWaitEdge snap[4];
+	uint64 gen_before;
+	int n;
+
+	reset_graph();
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+	gen_before = cluster_lmd_graph_generation_get();
+	UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, blockers, 2, w.request_id));
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);
+	n = cluster_lmd_graph_snapshot_copy(snap, 4, NULL);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT_EQ(count_edges(snap, n, &w, &old), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_empty_set_removes_only_that_waiter)
+{
+	ClusterLmdVertex w1 = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex w2 = mkvertex(2, 101, 7, 5001);
+	ClusterLmdVertex b1 = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex b2 = mkvertex(3, 201, 7, 6001);
+
+	reset_graph();
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w1, &b1, w1.request_id));
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w2, &b2, w2.request_id));
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w1, NULL, 0, w1.request_id));
+	UT_ASSERT(!cluster_lmd_graph_has_waiter(&w1));
+	UT_ASSERT(cluster_lmd_graph_has_waiter(&w2));
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_more_than_batch_at_capacity)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex other = mkvertex(2, 101, 7, 5001);
+	ClusterLmdVertex old[40];
+	ClusterLmdVertex replacement[40];
+	ClusterLmdWaitEdge snap[64];
+	uint64 gen_before;
+	int scans_before;
+	int n;
+
+	cluster_lmd_max_wait_edges = 64;
+	reset_graph();
+	cluster_lmd_max_wait_edges = 1024;
+	for (int i = 0; i < 40; i++) {
+		old[i] = mkvertex(0, 2000 + (uint32)i, 7, 6000 + (uint64)i);
+		replacement[i] = mkvertex(3, 3000 + (uint32)i, 7, 7000 + (uint64)i);
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old[i], w.request_id));
+	}
+	for (int i = 0; i < 24; i++) {
+		ClusterLmdVertex b = mkvertex(0, 4000 + (uint32)i, 7, 8000 + (uint64)i);
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&other, &b, other.request_id));
+	}
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 64);
+	gen_before = cluster_lmd_graph_generation_get();
+	scans_before = fake_htab_seq_init_count;
+
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w, replacement, 40, w.request_id));
+	UT_ASSERT_EQ(fake_htab_seq_init_count - scans_before, 1);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 64);
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before + 80);
+
+	n = cluster_lmd_graph_snapshot_copy(snap, 64, NULL);
+	UT_ASSERT_EQ(n, 64);
+	for (int i = 0; i < 40; i++) {
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &old[i]), 0);
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &replacement[i]), 1);
+	}
+}
+
+UT_TEST(test_replace_waiter_edges_rejects_conflicting_duplicate_metadata)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex duplicate = mkvertex(3, 300, 7, 7000);
+	ClusterLmdWaitEdge snap[4];
+	uint64 gen_before;
+	int n;
+
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterLmdVertex blockers[2] = { duplicate, duplicate };
+
+		reset_graph();
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+		gen_before = cluster_lmd_graph_generation_get();
+		if (variant == 0)
+			blockers[1].wait_seq++;
+		else if (variant == 1)
+			blockers[1].xid++;
+		else
+			blockers[1].local_start_ts_ms++;
+
+		UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, blockers, 2, w.request_id));
+		UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);
+		UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 1);
+		n = cluster_lmd_graph_snapshot_copy(snap, 4, NULL);
+		UT_ASSERT_EQ(n, 1);
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &old), 1);
+	}
+}
+
+UT_TEST(test_replace_waiter_edges_insert_failure_rolls_back_exactly)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old[2] = { mkvertex(0, 200, 7, 6000), mkvertex(2, 201, 7, 6001) };
+	ClusterLmdVertex replacement[3]
+		= { mkvertex(0, 300, 7, 7000), mkvertex(2, 301, 7, 7001), mkvertex(3, 302, 7, 7002) };
+	ClusterLmdWaitEdge snap[8];
+	uint64 gen_before;
+	uint64 full_before;
+	int n;
+
+	reset_graph();
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old[i], w.request_id));
+	gen_before = cluster_lmd_graph_generation_get();
+	full_before = cluster_lmd_wait_edge_full_count_get();
+	/* Let one replacement insert succeed, then fail the second non-throwing enter. */
+	fake_hash_enter_null_fail_after = 1;
+
+	UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, replacement, 3, w.request_id));
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 2);
+	UT_ASSERT_EQ(cluster_lmd_wait_edge_full_count_get(), full_before + 1);
+	n = cluster_lmd_graph_snapshot_copy(snap, 8, NULL);
+	UT_ASSERT_EQ(n, 2);
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &old[i]), 1);
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(count_edges(snap, n, &w, &replacement[i]), 0);
+}
+
+UT_TEST(test_replace_waiter_edges_rejects_request_id_mismatch)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex replacement = mkvertex(3, 300, 7, 7000);
+	uint64 gen_before;
+
+	reset_graph();
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+	gen_before = cluster_lmd_graph_generation_get();
+	UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, &replacement, 1, w.request_id + 1));
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_rejects_raw_count_above_graph_bound)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	ClusterLmdVertex old = mkvertex(2, 200, 7, 6000);
+	ClusterLmdVertex replacement = mkvertex(3, 300, 7, 7000);
+	uint64 gen_before;
+
+	cluster_lmd_max_wait_edges = 64;
+	reset_graph();
+	cluster_lmd_max_wait_edges = 1024;
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+	gen_before = cluster_lmd_graph_generation_get();
+	/* The raw count is rejected before the one-element pointer can be read. */
+	UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, &replacement, 65, w.request_id));
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 1);
+}
+
+UT_TEST(test_replace_waiter_edges_scan_growth_retry_has_no_generation_side_effect)
+{
+	ClusterLmdVertex w = mkvertex(1, 100, 7, 5000);
+	uint64 gen_before;
+	uint64 full_before;
+	int scans_before;
+
+	cluster_lmd_max_wait_edges = 64;
+	reset_graph();
+	cluster_lmd_max_wait_edges = 1024;
+	for (int i = 0; i < 40; i++) {
+		ClusterLmdVertex old = mkvertex(0, 2000 + (uint32)i, 7, 6000 + (uint64)i);
+		UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w, &old, w.request_id));
+	}
+	gen_before = cluster_lmd_graph_generation_get();
+	full_before = cluster_lmd_wait_edge_full_count_get();
+	scans_before = fake_htab_seq_init_count;
+
+	/* Empty replacement starts with capacity 32, forcing one lock-free grow/retry. */
+	UT_ASSERT(cluster_lmd_graph_replace_waiter_edges(&w, NULL, 0, w.request_id));
+	UT_ASSERT_EQ(fake_htab_seq_init_count - scans_before, 2);
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before + 40);
+	UT_ASSERT_EQ(cluster_lmd_wait_edge_full_count_get(), full_before);
+	UT_ASSERT_EQ((int)cluster_lmd_wait_edge_count_get(), 0);
 }
 
 
@@ -689,11 +1059,23 @@ UT_TEST(test_probe_round_two_identical_partial_subsets_never_complete)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(29);
 	UT_RUN(test_multi_blocker_edges_not_overwritten);
 	UT_RUN(test_remove_by_waiter_removes_all_blocker_edges);
 	UT_RUN(test_distinct_waiters_isolated);
 	UT_RUN(test_duplicate_edge_is_idempotent);
+	UT_RUN(test_replace_waiter_edges_publishes_exact_batch);
+	UT_RUN(test_replace_waiter_edges_full_preserves_previous_set);
+	UT_RUN(test_replace_waiter_edges_can_shrink_at_capacity);
+	UT_RUN(test_replace_waiter_edges_deduplicates_blocker_identities);
+	UT_RUN(test_replace_waiter_edges_rejects_self_cycle_without_mutation);
+	UT_RUN(test_replace_waiter_edges_empty_set_removes_only_that_waiter);
+	UT_RUN(test_replace_waiter_edges_more_than_batch_at_capacity);
+	UT_RUN(test_replace_waiter_edges_rejects_conflicting_duplicate_metadata);
+	UT_RUN(test_replace_waiter_edges_insert_failure_rolls_back_exactly);
+	UT_RUN(test_replace_waiter_edges_rejects_request_id_mismatch);
+	UT_RUN(test_replace_waiter_edges_rejects_raw_count_above_graph_bound);
+	UT_RUN(test_replace_waiter_edges_scan_growth_retry_has_no_generation_side_effect);
 	UT_RUN(test_resolve_tx_placeholder_closes_cross_node_cycle);
 	UT_RUN(test_resolve_tx_placeholder_no_match_unchanged);
 	UT_RUN(test_resolve_tx_placeholder_invalid_xid_never_matches);
