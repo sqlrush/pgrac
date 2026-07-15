@@ -309,6 +309,9 @@ cluster_tt_slot_id_to_offset(uint32 tt_slot_id)
  *	    1) reuse a slot already owned by `top_xid` (idempotent)
  *	    2) take any FREE slot
  *	    3) recycle a COMMITTED / ABORTED slot, wrap++
+ *	  In peer mode, direct Pass-2 reuse is limited to ABORTED.  COMMITTED
+ *	  evidence is first recycled to FREE by the epoch-fenced cluster-horizon
+ *	  cleaner, then consumed through Pass 1.
  *	  Returns offset in [0, TT_SLOTS_PER_SEGMENT) on success, or
  *	  INVALID_TT_SLOT_OFFSET when all slots are ACTIVE.  Caller MUST be
  *	  outside critical section (function takes LWLock).

@@ -46,6 +46,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_guc.h"   /* cluster_undo_retention_horizon_enabled */
+#include "cluster/cluster_mode.h"  /* cluster_peer_mode_enabled */
 #include "cluster/cluster_scn.h"   /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_shmem.h" /* ClusterShmemRegion */
 #include "cluster/cluster_tt_slot.h"
@@ -322,6 +323,12 @@ tt_slot_entry_recycle_locked(ClusterTTSlotAllocEntry *e, TransactionId new_owner
  *	the horizon
  *	(cluster_tt_slot_recyclable); ABORTED is always eligible (C7).  When the
  *	retention GUC is off, the gate is bypassed (spec-3.11 immediate recycle, C6).
+ *	In peer mode, allocator Pass 2 never recycles COMMITTED directly: the local
+ *	ProcArray horizon does not cover remote snapshots.  The cluster undo cleaner
+ *	is the sole COMMITTED recycler there; it folds every required peer report
+ *	into an epoch-paired cluster floor and fences each COMMITTED -> FREE mutation.
+ *	Allocator Pass 1 may then consume that proven FREE slot.  ABORTED remains
+ *	immediately reusable because it is invisible to every snapshot.
  *
  *	Returns INVALID_TT_SLOT_OFFSET when no slot can be handed out.  In that
  *	case *out_retained_pressure (when non-NULL) distinguishes the two reasons:
@@ -342,6 +349,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	int free_idx = -1;
 	bool retained_pressure = false;
 	bool gate_enabled;
+	bool peer_mode;
 	SCN horizon = InvalidScn;
 	uint16 chosen;
 	uint64 retain_skip_seen = 0; /* spec-3.12 D5 */
@@ -359,6 +367,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	 * GUC is off we skip the scan entirely and bypass the gate.
 	 */
 	gate_enabled = cluster_undo_retention_horizon_enabled;
+	peer_mode = cluster_peer_mode_enabled();
 	if (gate_enabled) {
 		horizon = cluster_undo_retention_horizon();
 		/* spec-3.12 D5 / C16: sample the horizon gauge at the decision point. */
@@ -382,9 +391,20 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 			if (free_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
 				free_idx = i;
 		} else if (e->status == CTS_COMMITTED || e->status == CTS_ABORTED) {
-			bool recyclable = gate_enabled
-								  ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
-								  : true; /* GUC off: spec-3.11 immediate recycle (C6) */
+			/*
+			 * A local ProcArray horizon cannot authorize destruction of evidence
+			 * still needed by a peer snapshot.  In peer mode COMMITTED reclamation
+			 * is delegated to cluster_tt_slot_gc_current_pass(), whose production
+			 * caller supplies the epoch-paired proven cluster floor and rechecks
+			 * the epoch at the mutation.  This also overrides the diagnostic GUC-off
+			 * bypass: without a cluster proof the safe outcome is rollover/fail-closed.
+			 */
+			bool recyclable
+				= (e->status == CTS_COMMITTED && peer_mode)
+					  ? false
+					  : (gate_enabled
+							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
+							 : true); /* single-node GUC off: immediate recycle (C6) */
 
 			/* D5: wrap-retired entries are never re-selected this generation;
 			 * they read as pressure so the caller can roll over (C3b family). */
@@ -398,7 +418,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 				if (reusable_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
 					reusable_idx = i;
 			} else {
-				/* COMMITTED and not older than horizon: retention keeps it alive. */
+				/* COMMITTED lacks a cluster recycle proof, or is not older than horizon. */
 				retained_pressure = true;
 				retain_skip_seen++; /* C16: per skip event, not de-duped */
 			}
