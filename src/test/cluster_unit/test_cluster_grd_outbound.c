@@ -3,6 +3,15 @@
  * test_cluster_grd_outbound.c
  *    Standalone regression tests for reliable GES cleanup staging.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *    src/test/cluster_unit/test_cluster_grd_outbound.c
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
