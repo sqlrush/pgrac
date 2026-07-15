@@ -2740,6 +2740,11 @@ cluster_undo_horizon_admission_refuse_count(void)
 {
 	return 0;
 }
+uint64
+cluster_undo_horizon_idle_sentinel_sent_count(void)
+{
+	return 0;
+}
 SCN
 cluster_undo_horizon_last_floor(void)
 {

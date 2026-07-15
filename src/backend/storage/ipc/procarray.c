@@ -2264,6 +2264,56 @@ cluster_undo_retention_horizon(void)
 
 	return SCN_VALID(min) ? min : cluster_scn_current();
 }
+
+/*
+ * cluster_undo_retention_all_quiescent -- TT lane (S3 idle-peer floor pin).
+ *
+ * True iff this node provably holds no undo retention constraint at this
+ * instant: no ProcArray entry has an assigned xid, an xmin, or a published
+ * CLUSTER read_scn.  Both predicate legs (zero active transactions AND
+ * zero held snapshots) are required; any doubt answers false and the
+ * horizon-report sender falls back to the conservative clock sample.
+ *
+ * Prepared transactions' dummy PGPROCs sit in the ProcArray with a valid
+ * xid, so an unresolved prepared xact makes this node non-quiescent — the
+ * conservative direction (its undo must stay reachable).  Walsenders /
+ * background workers with an xmin likewise read as constraints.
+ *
+ * Same locking contract as cluster_undo_retention_horizon() above: SHARED
+ * ProcArrayLock, never called under seg->lock / undo lifecycle_lock (C17).
+ * The xid reads follow the ComputeXidHorizons dense-array access pattern.
+ */
+bool
+cluster_undo_retention_all_quiescent(void)
+{
+	ProcArrayStruct *arrayP = procArray;
+	TransactionId *other_xids = ProcGlobal->xids;
+	bool		quiescent = true;
+	int			index;
+
+	if (cluster_node_id < 0)
+		return false;			/* cluster disabled: never claim idle */
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
+		TransactionId xid = UINT32_ACCESS_ONCE(other_xids[index]);
+		TransactionId xmin = UINT32_ACCESS_ONCE(proc->xmin);
+		SCN			r = (SCN) pg_atomic_read_u64(&proc->cluster_read_scn_atomic);
+
+		if (TransactionIdIsValid(xid) || TransactionIdIsValid(xmin)
+			|| SCN_VALID(r))
+		{
+			quiescent = false;
+			break;
+		}
+	}
+	LWLockRelease(ProcArrayLock);
+
+	return quiescent;
+}
 #endif
 
 /*

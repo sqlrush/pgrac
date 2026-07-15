@@ -48,6 +48,18 @@
  */
 extern SCN cluster_undo_retention_horizon(void);
 
+/*
+ * cluster_undo_retention_all_quiescent -- TT lane (S3 idle-peer floor pin):
+ *	true iff this node PROVABLY holds no retention constraint right now:
+ *	every ProcArray entry has no assigned xid, no xmin and no published
+ *	CLUSTER read_scn (zero active transactions AND zero held snapshots —
+ *	both legs required).  Anything uncertain (cluster disabled, any live
+ *	xid/xmin/read_scn, prepared-xact dummy PGPROCs with an xid) returns
+ *	false so the caller falls back to the conservative clock sample.  Same
+ *	locking contract as cluster_undo_retention_horizon().
+ */
+extern bool cluster_undo_retention_all_quiescent(void);
+
 
 /*
  * Pure retention predicates (spec-3.12 D2/D3).  No shmem / no LWLock / no I/O;

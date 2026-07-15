@@ -201,6 +201,10 @@ extern bool cluster_peer_supports_undo_authority_serve(int32 peer_id);
 /* spec-5.22e D5-2: undo-horizon report capability (connection-bound; see
  * cluster_sf_note_peer_disconnected_gen) + the close-funnel reset hooks. */
 extern bool cluster_sf_peer_supports_undo_horizon(int32 peer_id);
+/* TT lane (S3 idle-peer floor pin): idle-unconstrained sentinel report
+ * capability (connection-bound, same discipline).  SENDER-side gate only:
+ * an old peer keeps receiving the conservative clock sample. */
+extern bool cluster_sf_peer_supports_undo_horizon_idle(int32 peer_id);
 /* GCS-race round-2 review F6: GCS completion-proof capability
  * (connection-bound, same discipline).  An unknown/old/reconnecting peer
  * reads false, which every consumer treats in the SAFE direction: the

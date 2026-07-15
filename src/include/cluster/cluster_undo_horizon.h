@@ -55,6 +55,25 @@
 #define CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS 100
 #define CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS 60000
 
+/*
+ * Idle-unconstrained sentinel report value (TT lane, S3 idle-peer floor
+ * pin).  A PROVABLY idle sender (cluster_undo_retention_all_quiescent():
+ * zero active xacts AND zero held snapshots) publishes this instead of its
+ * clock sample, telling the fold "I hold no retention constraint": the
+ * time-axis-min fold ignores it structurally (scn_local == SCN_MAX_LOCAL
+ * never wins a min), so a lone writer's floor becomes its own local
+ * horizon instead of trailing the idle peers' report cadence.  All other
+ * proof obligations (capability, presence, stability, epoch, freshness)
+ * still apply to a sentinel report — an idle peer that stops reporting
+ * still stalls the fold.  A sender that wakes mid-report-window self-fences
+ * through the BELOW_HORIZON read_scn admissibility gate (fail-closed,
+ * observe heals the next snapshot), so rule 8.A polarity is unchanged.
+ * The value deliberately has all node bits set (node id 255 is invalid)
+ * and local == SCN_MAX_LOCAL (the wraparound-guard ceiling): no lawful
+ * clock sample can ever collide with it.
+ */
+#define CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED ((SCN)UINT64_MAX)
+
 typedef enum ClusterUndoHorizonFoldStatus {
 	CLUSTER_UNDO_HORIZON_FOLD_OK = 0,
 	CLUSTER_UNDO_HORIZON_FOLD_STALLED
@@ -208,6 +227,9 @@ extern void cluster_undo_horizon_note_wire_reject(void);
 extern uint64 cluster_undo_horizon_wire_reject_count(void);
 extern void cluster_undo_horizon_note_admission_refuse(void);
 extern uint64 cluster_undo_horizon_admission_refuse_count(void);
+/* TT lane: idle-unconstrained sentinel reports sent (sender-side gauge of
+ * the provably-idle predicate actually firing; one bump per peer send). */
+extern uint64 cluster_undo_horizon_idle_sentinel_sent_count(void);
 extern const char *cluster_undo_horizon_peer_reports_summary(void);
 extern void cluster_undo_horizon_note_floor(SCN scn);
 extern SCN cluster_undo_horizon_last_floor(void);

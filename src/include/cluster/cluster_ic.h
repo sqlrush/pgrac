@@ -350,6 +350,20 @@ typedef enum ClusterICPlane {
  * the pre-BUSY protocol.  Timeout stays the backstop for packet loss / dead
  * nodes. */
 #define PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 ((uint32)0x00000080U)
+/* PGRAC: TT lane (S3 idle-peer floor pin) — this binary understands the
+ * UNDO_HORIZON idle-unconstrained sentinel report (horizon_scn ==
+ * UINT64_MAX): a provably idle sender (zero active xacts AND zero held
+ * snapshots) publishes "no retention constraint" instead of its clock
+ * sample, so a lone writer's recycle floor no longer trails the idle
+ * peers' report cadence (the S3 floor-lag pin: lag x write-rate exceeded
+ * the whole TT slot pool).  A PROTOCOL capability, advertised
+ * unconditionally.  Send-side hard gate: the sentinel is only sent to a
+ * peer whose CURRENT connection advertised this bit — an old receiver
+ * would fold the raw sentinel VALUE harmlessly (a max value never wins a
+ * min fold) but would latch a spurious same-epoch REGRESSION stall when
+ * the sender wakes and reports a real value again, so old peers keep
+ * receiving the conservative clock sample instead. */
+#define PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 ((uint32)0x00000100U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

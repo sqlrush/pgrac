@@ -2877,6 +2877,8 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_horizon_admission_refuse_count()));
 	emit_row(rsinfo, "undo", "horizon_last_floor_scn",
 			 fmt_int64((int64)cluster_undo_horizon_last_floor()));
+	emit_row(rsinfo, "undo", "horizon_idle_sentinel_sent_count",
+			 fmt_int64((int64)cluster_undo_horizon_idle_sentinel_sent_count()));
 	emit_row(rsinfo, "undo", "horizon_peer_reports", cluster_undo_horizon_peer_reports_summary());
 	emit_row(rsinfo, "undo", "cleaner_header_tt_slots_below_horizon",
 			 fmt_int64((int64)cluster_undo_cleaner_header_tt_slots_below_horizon()));

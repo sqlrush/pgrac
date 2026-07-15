@@ -91,8 +91,9 @@ typedef struct ClusterUndoHorizonShmem {
 	pg_atomic_uint64 pass_abort_count;
 	pg_atomic_uint64 wire_reject_count;
 	pg_atomic_uint64 admission_refuse_count;
-	pg_atomic_uint64 last_floor_scn;	  /* gauge: last OK fold result */
-	pg_atomic_uint64 self_admitted_epoch; /* D5-8: (epoch self last became
+	pg_atomic_uint64 idle_sentinel_sent_count; /* TT lane: sentinel sends */
+	pg_atomic_uint64 last_floor_scn;		   /* gauge: last OK fold result */
+	pg_atomic_uint64 self_admitted_epoch;	   /* D5-8: (epoch self last became
 										   * MEMBER) + 1; 0 = never admitted.
 										   * Biased so a cold-formation
 										   * admission at epoch 0 is distinct
@@ -126,6 +127,7 @@ cluster_undo_horizon_shmem_init(void)
 		pg_atomic_init_u64(&shmem->pass_abort_count, 0);
 		pg_atomic_init_u64(&shmem->wire_reject_count, 0);
 		pg_atomic_init_u64(&shmem->admission_refuse_count, 0);
+		pg_atomic_init_u64(&shmem->idle_sentinel_sent_count, 0);
 		pg_atomic_init_u64(&shmem->last_floor_scn, 0);
 		pg_atomic_init_u64(&shmem->self_admitted_epoch, 0);
 	}
@@ -239,18 +241,33 @@ cluster_undo_horizon_report_handler(const ClusterICEnvelope *env, const void *pa
 	 * snapshot BELOW the accepted bound exists over there -- latch the
 	 * violation (the fold stalls, U14) and do not move the payload.  A
 	 * later conforming report clears the latch.
+	 *
+	 * The idle-unconstrained sentinel (TT lane) is OUTSIDE the monotone
+	 * sequence: it claims "no constraint", not a bound, so it neither
+	 * regresses against the accepted base (its scn_local is the ceiling
+	 * anyway) nor BECOMES the base -- otherwise the sender's first real
+	 * report after waking (its clock, numerically below the sentinel)
+	 * would latch a spurious regression and stall the fold on every
+	 * idle->active transition.  A real report after a sentinel still
+	 * compares against the last REAL accepted value (the sender's clock
+	 * is monotone, so that comparison holds across the idle gap).
 	 */
-	if (slot->accepted_any && slot->accepted_epoch == wire.epoch
-		&& scn_time_cmp((SCN)wire.horizon_scn, (SCN)slot->accepted_scn) < 0) {
-		undo_horizon_reject("same-epoch regression", sender);
-		undo_horizon_slot_publish(slot, &wire, now_us, true);
+	if ((SCN)wire.horizon_scn != CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED) {
+		if (slot->accepted_any && slot->accepted_epoch == wire.epoch
+			&& scn_time_cmp((SCN)wire.horizon_scn, (SCN)slot->accepted_scn) < 0) {
+			undo_horizon_reject("same-epoch regression", sender);
+			undo_horizon_slot_publish(slot, &wire, now_us, true);
+			return;
+		}
+
+		undo_horizon_slot_publish(slot, &wire, now_us, false);
+		slot->accepted_scn = wire.horizon_scn;
+		slot->accepted_epoch = wire.epoch;
+		slot->accepted_any = true;
 		return;
 	}
 
 	undo_horizon_slot_publish(slot, &wire, now_us, false);
-	slot->accepted_scn = wire.horizon_scn;
-	slot->accepted_epoch = wire.epoch;
-	slot->accepted_any = true;
 }
 
 void
@@ -305,6 +322,7 @@ cluster_undo_horizon_lmon_tick(void)
 	ClusterUndoHorizonWire wire;
 	uint64 now_us;
 	SCN report;
+	bool unconstrained;
 	int pi;
 
 	if (!cluster_enabled || cluster_node_id < 0 || UndoHorizonShmem == NULL)
@@ -320,11 +338,25 @@ cluster_undo_horizon_lmon_tick(void)
 		return;
 	last_sent_us = now_us;
 
+	/*
+	 * TT lane (S3 idle-peer floor pin): a PROVABLY idle node (zero active
+	 * xacts AND zero held snapshots) reports the unconstrained sentinel so
+	 * its clock-sample lag stops pinning a lone writer's recycle floor.
+	 * MRP-active standbys are never "idle" in this sense (their future
+	 * snapshots read at consistent_scn, S3.0 row 4), and any uncertainty
+	 * in the probe answers false -- the conservative sample then flows
+	 * exactly as before.  The probe runs AFTER the sample: a snapshot
+	 * appearing in between flips it to false (conservative); one
+	 * disappearing in between just means the constraint is gone.
+	 */
+	unconstrained = !cluster_mrp_should_start() && cluster_undo_retention_all_quiescent();
+
 	wire.epoch = cluster_epoch_get_current();
-	wire.horizon_scn = (uint64)report;
 	wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
 
 	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+		bool sentinel;
+
 		if (pi == cluster_node_id)
 			continue;
 		if (cluster_conf_lookup_node(pi) == NULL)
@@ -339,6 +371,18 @@ cluster_undo_horizon_lmon_tick(void)
 		 */
 		if (!cluster_sf_peer_supports_undo_horizon(pi))
 			continue;
+
+		/*
+		 * Sentinel send-side hard gate: an old receiver would fold the
+		 * raw sentinel value harmlessly but latch a spurious same-epoch
+		 * regression when this node wakes, so it keeps getting the
+		 * conservative clock sample instead (see cluster_ic.h).
+		 */
+		sentinel = unconstrained && cluster_sf_peer_supports_undo_horizon_idle(pi);
+		wire.horizon_scn
+			= sentinel ? (uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED : (uint64)report;
+		if (sentinel)
+			pg_atomic_fetch_add_u64(&UndoHorizonShmem->idle_sentinel_sent_count, 1);
 
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
 		/* fire-and-forget (L456): transport retention / errors surface
@@ -633,6 +677,16 @@ UNDO_HORIZON_NOTE(peer_stale)
 UNDO_HORIZON_NOTE(pass_abort)
 UNDO_HORIZON_NOTE(wire_reject)
 UNDO_HORIZON_NOTE(admission_refuse)
+
+/* TT lane: sender-side sentinel gauge (bumped inline in the tick; only the
+ * reader half of the NOTE pattern is needed). */
+uint64
+cluster_undo_horizon_idle_sentinel_sent_count(void)
+{
+	return UndoHorizonShmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&UndoHorizonShmem->idle_sentinel_sent_count);
+}
 
 void
 cluster_undo_horizon_note_floor(SCN scn)
