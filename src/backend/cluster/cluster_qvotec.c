@@ -140,11 +140,34 @@ typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 poll_cycle_count;
 	pg_atomic_uint32 torn_write_detect_count;
 	pg_atomic_uint32 _pad;
-	uint8 _reserved[64];
+	/*
+	 * Merge-order reservation (守门 07-15): the convert-queue lane claims
+	 * offset 64..71 for its self_incarnation (pg_atomic_uint64, commit
+	 * ee536b5bb7, StaticAssert-pinned).  Queue merges first; this lane rebases
+	 * after and drops this placeholder so self_incarnation occupies 64..71 and
+	 * prior_unclean_death stays at 72.  Keeping the byte layout identical now
+	 * makes that rebase a no-op on the wire/shmem image.
+	 */
+	uint8 _reserved_queue_self_incarnation[8]; /* offset 64..71 */
+	/*
+	 * Crash-rejoin re-declare barrier (Shape A) — set ONCE at qvotec startup
+	 * (before the READY publish), read-only thereafter: 1 iff this node's
+	 * prior-incarnation self-slot on the voting disk still had the ALIVE flag
+	 * set (a clean shutdown clears it via qvotec_clear_self_alive_on_clean_
+	 * shutdown; a crash / immediate stop does NOT), i.e. this boot follows an
+	 * UNCLEAN death.  The off-path rejoin tick fences self-home blocks +
+	 * closes the write gate on this, so a crash-rejoined node never cold-
+	 * serves stale ownership even when it restarts faster than the survivor's
+	 * dead-deadband (the epoch signal is INITIAL on both sides in that race).
+	 */
+	pg_atomic_uint32 prior_unclean_death; /* offset 72..75 */
+	uint8 _reserved[52];
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == 128,
 				 "ClusterQvotecShmem must be exactly 128 bytes (2 cache lines)");
+StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_unclean_death) == 72,
+				 "prior_unclean_death must sit at offset 72 (queue lane owns 64..71)");
 
 
 static ClusterQvotecShmem *QvotecShmem = NULL;
@@ -267,6 +290,9 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->poll_cycle_count, 0);
 		pg_atomic_init_u32(&QvotecShmem->torn_write_detect_count, 0);
 		pg_atomic_init_u32(&QvotecShmem->_pad, 0);
+		memset(QvotecShmem->_reserved_queue_self_incarnation, 0,
+			   sizeof(QvotecShmem->_reserved_queue_self_incarnation));
+		pg_atomic_init_u32(&QvotecShmem->prior_unclean_death, 0);
 		memset(QvotecShmem->_reserved, 0, sizeof(QvotecShmem->_reserved));
 	}
 }
@@ -370,6 +396,23 @@ cluster_qvotec_get_disks_total_count(void)
 	if (QvotecShmem == NULL)
 		return 0;
 	return (int)pg_atomic_read_u32(&QvotecShmem->disks_total_count);
+}
+
+/*
+ * cluster_qvotec_prior_unclean_death -- crash-rejoin re-declare barrier
+ * (Shape A).  True iff this node's prior-incarnation self-slot on the voting
+ * disk still carried the ALIVE flag at startup (an unclean death: a crash /
+ * immediate stop that skipped the clean-shutdown ALIVE blank).  Latched once
+ * before the READY publish; stable for the incarnation.  False when qvotec is
+ * absent (no voting disks) so a diskless / single-node deployment is never
+ * fenced by this signal.
+ */
+bool
+cluster_qvotec_prior_unclean_death(void)
+{
+	if (QvotecShmem == NULL)
+		return false;
+	return pg_atomic_read_u32(&QvotecShmem->prior_unclean_death) != 0;
 }
 
 uint64
@@ -1749,7 +1792,7 @@ ClusterQvotecMain(void)
 		bool ghost_fresh = false;
 		int d;
 
-		for (d = 0; d < qvotec_n_disks && !ghost_fresh; d++) {
+		for (d = 0; d < qvotec_n_disks; d++) {
 			ClusterVotingSlot probe;
 			ClusterVotingDiskIoState rrc;
 
@@ -1759,14 +1802,29 @@ ClusterQvotecMain(void)
 			if (probe.generation == 0)
 				continue; /* never written */
 			if (!(probe.flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE))
-				continue; /* prior shutdown cleared ALIVE — ok */
+				continue; /* prior shutdown cleared ALIVE — clean death, ok */
 			if (probe.incarnation == qvotec_self_incarnation)
 				continue; /* same incarnation — impossible but defensive */
+
+			/*
+			 * Crash-rejoin re-declare barrier (Shape A) — a prior-incarnation
+			 * self-slot that still carries ALIVE means the previous postmaster
+			 * of THIS node died WITHOUT running the clean-shutdown blank
+			 * (qvotec_clear_self_alive_on_clean_shutdown), i.e. an UNCLEAN
+			 * death.  Latch it REGARDLESS of freshness: a stale ALIVE ghost is
+			 * still proof we crashed (we just crashed longer ago), and the
+			 * fence must engage on a fast rejoin where the survivor has not yet
+			 * advanced its epoch (the epoch signal is INITIAL on both sides).
+			 * Single writer, before the READY publish; read-only afterwards.
+			 */
+			if (QvotecShmem != NULL)
+				pg_atomic_write_u32(&QvotecShmem->prior_unclean_death, 1);
+
 			if (probe.heartbeat_ts_us == 0)
 				continue;
 			if (now_us > probe.heartbeat_ts_us
 				&& (now_us - probe.heartbeat_ts_us) > heartbeat_timeout_us)
-				continue; /* already stale */
+				continue; /* already stale — no fast-restart Q6 sleep needed */
 			ghost_fresh = true;
 		}
 

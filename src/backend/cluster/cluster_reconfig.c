@@ -2191,9 +2191,33 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		return;
 	}
 
-	if (cluster_reconfig_cluster_already_running()) {
+	/*
+	 * REJOIN when EITHER signal fires:
+	 *   already_running        -- a declared peer is observed past INITIAL (the
+	 *                             survivor already reconfigured; slow rejoin).
+	 *   prior_unclean_death    -- this node's prior-incarnation voting-disk
+	 *                             self-slot still carried ALIVE (an unclean
+	 *                             death).  This is the ONLY signal that fires on
+	 *                             a FAST rejoin, where the node restarts inside
+	 *                             the survivor's dead-deadband so BOTH sides are
+	 *                             still at epoch INITIAL and the epoch signal is
+	 *                             blind (守门裁决 07-15: ALIVE bit, not epoch).
+	 * The clean-shutdown blank clears ALIVE (keeps epoch), so a genuine clean
+	 * co-boot never trips prior_unclean_death.
+	 */
+	if (cluster_reconfig_cluster_already_running() || cluster_qvotec_prior_unclean_death()) {
 		uint8 self_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 
+		/*
+		 * Arm the epoch-keyed join fence too (belt: it engages on a SLOW
+		 * rejoin where this node adopted a peer epoch > INITIAL).  On a FAST
+		 * rejoin this node is still at CLUSTER_EPOCH_INITIAL, so the monotonic-
+		 * max fence epoch cannot rise above 0 and the join fence is a no-op —
+		 * the READ fence is therefore carried by the boot barrier below, which
+		 * is epoch-independent: we deliberately DO NOT set offpath_boot_decided,
+		 * so the phase gate keeps self-home blocks RECOVERING for the whole
+		 * incarnation (fail-closed until a clean restart / online_join).
+		 */
 		self_set[cluster_node_id >> 3] = (uint8)(1u << (cluster_node_id & 7));
 		cluster_grd_arm_join_pcm_fence(self_set); /* fence FIRST (8.A) */
 
@@ -2201,22 +2225,30 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		ReconfigShmem->self_join_admitted = 0; /* then close the write gate */
 		LWLockRelease(&ReconfigShmem->lock);
 
-		cluster_grd_set_offpath_boot_decided();
+		/* NB: offpath_boot_decided stays 0 -> the boot barrier persists as the
+		 * read fence for this incarnation.  offpath_decided_local latches the
+		 * tick so it does not re-arm / re-log every cycle. */
+		cluster_grd_inc_offpath_crash_rejoin_fenced();
 		offpath_decided_local = true;
 
 		ereport(LOG,
-				(errmsg("cluster membership: node %d crash-rejoined a running cluster with "
-						"cluster.online_join=off — home blocks fenced and writes closed "
-						"(53R60) to avoid serving stale ownership",
-						cluster_node_id),
-				 errhint("Enable cluster.online_join for an online re-declare rejoin, or "
-						 "cold-restart the cluster. Reads of peer-mastered blocks and "
-						 "non-home work are unaffected.")));
+				(errmsg("cluster membership: node %d crash-rejoin detected (cluster.online_join="
+						"off%s) — home blocks fenced and writes closed (53R60) to avoid serving "
+						"stale ownership",
+						cluster_node_id,
+						cluster_qvotec_prior_unclean_death() ? ", prior unclean shutdown" : ""),
+				 errhint("Enable cluster.online_join for an online re-declare rejoin (admission "
+						 "self-heal is spec-5.22 follow-up), or cold-restart the cluster after a "
+						 "full clean shutdown. Reads of peer-mastered blocks and non-home work "
+						 "are unaffected.")));
 		return;
 	}
 
 	if (cluster_reconfig_bootstrap_quorum_at_initial()) {
-		/* Cold bootstrap: fresh cluster at INITIAL, no stale home blocks. */
+		/* Clean cold bootstrap: fresh cluster co-booting at INITIAL, ALIVE was
+		 * cleared on the prior clean shutdown (or never written) — no stale
+		 * home blocks.  The !prior_unclean_death predicate is already proven by
+		 * the REJOIN arm above (守门裁决 07-15 point 5②). */
 		cluster_grd_set_offpath_boot_decided();
 		offpath_decided_local = true;
 		return;

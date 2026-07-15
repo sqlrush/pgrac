@@ -1371,6 +1371,10 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)c.join_block_views_rebuilt));
 	emit_row(rsinfo, "grd_recovery", "join_block_recovering_failclosed",
 			 fmt_int64((int64)c.join_block_recovering_failclosed));
+	/* Shape A (crash-rejoin re-declare barrier): off-path crash-rejoin fence-arm
+	 * events (standalone counter, not part of the snapshot struct). */
+	emit_row(rsinfo, "grd_recovery", "offpath_crash_rejoin_fenced",
+			 fmt_int64((int64)cluster_grd_offpath_crash_rejoin_fenced_count()));
 }
 
 /*

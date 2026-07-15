@@ -8149,6 +8149,29 @@ cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf)
 	return scn;
 }
 
+/*
+ * cluster_bufmgr_block_is_extension_for_gcs -- fix 2 (crash-rejoin cold-GRD
+ * watermark) extension-block whitelist input.
+ *
+ *	True iff the tag's block number is at or beyond the relation's current
+ *	durable size, i.e. a freshly-extended block that has never been written to
+ *	shared storage (its InvalidScn watermark is correct, so the cold-GRD gate
+ *	must SKIP it, not fail-closed).  A pre-existing block (blockNum < nblocks)
+ *	returns false, so an Invalid watermark on it under a self-fence is treated
+ *	as a wiped/cold GRD watermark and fails closed.  Invalidates the cached
+ *	size first so a concurrent extension is not missed (cheap: one lseek).
+ */
+bool
+cluster_bufmgr_block_is_extension_for_gcs(BufferTag tag)
+{
+	SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+	ForkNumber	fork = BufTagGetForkNum(&tag);
+
+	/* Drop any cached size so a concurrent extension is not missed. */
+	smgrrelease(reln);
+	return tag.blockNum >= smgrnblocks(reln, fork);
+}
+
 bool
 cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page_scn)
 {

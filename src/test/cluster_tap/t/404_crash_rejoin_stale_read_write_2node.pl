@@ -84,6 +84,19 @@ sub psql_row
 	return ($rc, $out, (split(/\n/, $err // ''))[0] // '');
 }
 
+sub wait_for
+{
+	my ($cond, $timeout_s, $step_us) = @_;
+	$step_us //= 500_000;
+	my $deadline = time() + $timeout_s;
+	while (time() < $deadline)
+	{
+		return 1 if $cond->();
+		usleep($step_us);
+	}
+	return $cond->() ? 1 : 0;
+}
+
 sub state_val
 {
 	my ($node, $cat, $key) = @_;
@@ -129,14 +142,28 @@ $pair->node0->safe_psql('postgres',
   for @cands;
 
 # ============================================================
-# Bounce node1 (crash-rejoin, online_join=off default).
+# CRASH node1 (online_join=off default).  stop('immediate') is SIGQUIT
+# = an UNCLEAN death: the clean-shutdown ALIVE blank does NOT run, so
+# node1's prior voting-disk self-slot keeps CLUSTER_VOTING_SLOT_FLAG_ALIVE
+# — the signal the off-path rejoin tick fences on (守门裁决 07-15: ALIVE
+# bit, not epoch, because a fast rejoin leaves both sides at epoch INITIAL).
 # ============================================================
-$pair->node1->stop('fast');
+$pair->node1->stop('immediate');
 $pair->node1->start;
 ok($pair->wait_for_peer_state(0, 1, 'connected', 60)
 	  && $pair->wait_for_peer_state(1, 0, 'connected', 60),
-	'L1c node1 rebounced and transport reconnected');
+	'L1c node1 re-crashed and transport reconnected');
 usleep(2_000_000);
+
+# ============================================================
+# L3a HARD: the off-path rejoin tick detected the unclean death and armed
+# the fence THIS incarnation (counter is per-incarnation shmem, so a fresh
+# value >= 1 proves the ALIVE-bit signal fired).
+# ============================================================
+ok(wait_for(sub {
+		state_val($pair->node1, 'grd_recovery', 'offpath_crash_rejoin_fenced') >= 1
+	}, 30),
+	'L3a HARD: node1 armed the crash-rejoin fence (offpath_crash_rejoin_fenced >= 1)');
 
 # ============================================================
 # L3: DIAGNOSTIC — the membership split (never fails the run; pins the
@@ -180,23 +207,26 @@ SKIP: {
 	# ========================================================
 	my ($wr, $wo, $we) = psql_row($pair->node1, "INSERT INTO $vuln VALUES (1000, 1000)");
 	diag("L5 node1 write on home block: rc=$wr err=[$we]");
-	my $n1 = $pair->node1->safe_psql('postgres', "SELECT count(*) FROM $vuln");
-	my $n0 = $pair->node0->safe_psql('postgres', "SELECT count(*) FROM $vuln");
+	# Reads may themselves fail-closed now (node1-home fenced), so use the
+	# non-dying psql_row; a fenced write ($wr != 0) is coherent by construction.
+	my (undef, $n1, undef) = psql_row($pair->node1, "SELECT count(*) FROM $vuln");
+	my (undef, $n0, undef) = psql_row($pair->node0, "SELECT count(*) FROM $vuln");
 	diag("L5 divergence: node1=[$n1] node0=[$n0]");
 	# coherent: write refused (fail-closed) OR both nodes agree afterwards.
 	ok($wr != 0 || ($n1 eq $n0),
 		'L5 HARD: home-block write is fail-closed or coherent, never a silent split');
 
 	# ========================================================
-	# L5b HARD (boot-race, Shape A命门): reads issued CONCURRENTLY, the
-	# instant node1 accepts connections after a fresh bounce, must ALL be
-	# fail-closed for a node1-home table — not one silent 0 may slip
-	# through the boot-to-decision window.  The phase-gate boot barrier
-	# (flag defaults 0 at shmem init) fences self-home blocks RECOVERING
-	# from process start, so every early read errors 53R9L; RED on the
-	# pre-fix binary (a burst of silent 0s).
+	# L5b HARD (boot-race, Shape A命门): after a CRASH restart, every read
+	# issued the instant node1 accepts connections must be fail-closed for a
+	# node1-home table — not one silent 0 may slip through the boot-to-
+	# decision window.  The phase-gate boot barrier (flag defaults 0 at shmem
+	# init, BEFORE any LMON tick or the qvotec prior_unclean_death probe)
+	# fences self-home blocks RECOVERING from process start, and the crash-
+	# rejoin arm then keeps the flag 0, so every read errors 53R9L for the
+	# whole incarnation.  RED on the pre-fix binary (a burst of silent 0s).
 	# ========================================================
-	$pair->node1->stop('fast');
+	$pair->node1->stop('immediate');
 	$pair->node1->start;   # do NOT wait for settle — probe the boot window
 	my ($silent0, $failclosed, $coherent) = (0, 0, 0);
 	for my $i (1 .. 40)
@@ -204,13 +234,13 @@ SKIP: {
 		my ($rc, $out, $err) = psql_row($pair->node1, "SELECT count(*) FROM $vuln");
 		if    ($rc != 0)               { $failclosed++; }
 		elsif ($out eq '0')            { $silent0++; }
-		else                           { $coherent++; }   # 64 = decided+served
-		last if $coherent >= 3;        # barrier lifted + coherent: window over
+		else                           { $coherent++; }   # 64 = coherent serve
 		usleep(150_000);
 	}
 	diag("L5b boot-window reads: fail-closed=$failclosed silent0=$silent0 coherent=$coherent");
 	is($silent0, 0,
-		'L5b HARD: zero silent 0-row reads in the boot-to-decision window');
+		'L5b HARD: zero silent 0-row reads across the crash-rejoin boot window');
+	cmp_ok($failclosed, '>=', 1, 'L5b node1-home reads fail-closed after the crash restart');
 	# resettle for L6
 	$pair->wait_for_peer_state(0, 1, 'connected', 60);
 	usleep(1_000_000);
@@ -245,13 +275,62 @@ SKIP: {
 }
 
 # ============================================================
-# L7: fence observability (soft until fix 1 lands) — the join-block
-# fail-closed counter moved, proving the self-fence armed on the off path.
+# L7 NEGATIVE (full-outage crash co-boot, 守门裁决 07-15 point 4): crash
+# BOTH nodes (immediate = ALIVE left set on both), restart both.  With
+# online_join=off, neither may silently auto-form — each detects its own
+# prior unclean death and fences + closes its write gate (53R60).  This
+# pins the approved semantic consequence: after a full-outage crash the
+# cluster waits for spec-5.22 admission / ops, it never self-serves stale.
+# (A genuine CLEAN full shutdown clears ALIVE and co-boots normally — that
+# is the L6 path above, which served fine.)
 # ============================================================
-my $failclosed =
-  state_val($pair->node1, 'grd_recovery', 'join_block_recovering_failclosed');
-diag("L7 join_block_failclosed_count on node1 = $failclosed "
-	  . '(soft: > 0 once fix 1 arms the crash-rejoin self-fence)');
-ok(1, 'L7 fence counter recorded (soft)');
+$pair->node0->stop('immediate');
+$pair->node1->stop('immediate');
+$pair->node0->start;
+$pair->node1->start;
+usleep(3_000_000);
+$pair->wait_for_peer_state(0, 1, 'connected', 60);
+
+ok(wait_for(sub {
+		state_val($pair->node0, 'grd_recovery', 'offpath_crash_rejoin_fenced') >= 1
+		  && state_val($pair->node1, 'grd_recovery', 'offpath_crash_rejoin_fenced') >= 1
+	}, 30),
+	'L7 NEGATIVE: full-outage crash co-boot fences BOTH nodes (no silent auto-formation)');
+
+# Both write gates closed => writes fail-closed 53R60 (retryable), not silent.
+{
+	my $t = $cands[0];
+	my ($w0r, undef, $w0e) = psql_row($pair->node0, "INSERT INTO $t VALUES (2000, 1)");
+	my ($w1r, undef, $w1e) = psql_row($pair->node1, "INSERT INTO $t VALUES (2001, 1)");
+	diag("L7 post-full-crash writes: node0 rc=$w0r err=[$w0e]; node1 rc=$w1r err=[$w1e]");
+	ok($w0r != 0 && $w1r != 0,
+		'L7b NEGATIVE: both nodes fail-closed writes after a full-outage crash (53R60/53R9L)');
+}
+
+# ============================================================
+# L9: a CLEAN full restart clears ALIVE on both nodes, so the co-boot is
+# no longer an unclean rejoin — the fence lifts, the cluster serves again,
+# and node0's committed rows are intact (the fence is fail-closed, never a
+# permanent wedge on a clean restart).
+# ============================================================
+$pair->node0->stop('fast');
+$pair->node1->stop('fast');
+$pair->node0->start;
+$pair->node1->start;
+usleep(3_000_000);
+ok($pair->wait_for_peer_state(0, 1, 'connected', 60)
+	  && $pair->wait_for_peer_state(1, 0, 'connected', 60),
+	'L9 cluster restarted clean after both legs');
+
+my $readback = '';
+for my $i (1 .. 10)
+{
+	my ($rc, $out, $err) =
+	  psql_row($pair->node0, "SELECT count(*) FROM $cands[0] WHERE v = 0");
+	if ($rc == 0) { $readback = $out; last; }
+	usleep(1_000_000);
+}
+cmp_ok($readback eq '' ? -1 : $readback + 0, '>=', 64,
+	'L9 committed rows intact + cluster usable after a clean restart (fence not permanent)');
 
 done_testing();

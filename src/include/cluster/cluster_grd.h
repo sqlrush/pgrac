@@ -419,6 +419,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 join_shards_remastered_count;			 /* GRD shards moved to joiner */
 	pg_atomic_uint64 join_block_views_rebuilt_count;		 /* joiner-home fences lifted */
 	pg_atomic_uint64 join_block_recovering_failclosed_count; /* 53R9L denied (both gates) */
+	pg_atomic_uint64 offpath_crash_rejoin_fenced_count;		 /* Shape A: off-path crash-rejoin
+															  * fence-arm events (LMON) */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -685,6 +687,8 @@ extern void cluster_grd_inc_join_block_failclosed(void);
 /* Shape A (crash-rejoin re-declare barrier) — off-path boot barrier flag. */
 extern bool cluster_grd_offpath_boot_decided(void);
 extern void cluster_grd_set_offpath_boot_decided(void);
+extern void cluster_grd_inc_offpath_crash_rejoin_fenced(void);
+extern uint64 cluster_grd_offpath_crash_rejoin_fenced_count(void);
 
 /* spec-4.6 D5 — bulk snapshot of the 13 grd_recovery counters for the
  * pg_cluster_state dump (category 'grd_recovery';  one t/249 leg each). */

@@ -1118,6 +1118,51 @@ gcs_block_lost_write_verdict(SCN expected_scn, SCN shipped_scn)
 	return GCS_LOST_WRITE_PASS;
 }
 
+/*
+ * fix 2 (crash-rejoin re-declare barrier, defense in depth) — cold-GRD
+ * watermark verdict.
+ *
+ * The storage-fallback / local-master freshness gate normally SKIPs when the
+ * master pi_watermark_scn is InvalidScn (an old-binary master, a holder
+ * re-ack whose requester copy is authoritative, or a block that is simply not
+ * SCN-tracked).  But a crash-rejoined node's LOCAL GRD watermark was WIPED by
+ * the restart, so within an active self-fence an InvalidScn watermark can mask
+ * a stale home block whose peer holds a newer version — a SKIP there is a
+ * silent fail-OPEN.  This is a second line behind the phase-gate boot barrier,
+ * which already fences self-home blocks RECOVERING before the acquire reaches
+ * the freshness gate; it exists so any future path that reaches the freshness
+ * gate with a wiped watermark still fails closed.
+ *
+ * Pure truth table (header-only, unit-testable — no shmem, no I/O):
+ *	expected_scn_valid                       -> PROVE       (run the normal verdict)
+ *	!valid, no self-fence                    -> SKIP        (legit never-tracked / re-ack)
+ *	!valid, self-fence, extension block      -> SKIP        (genuine new block, never
+ *	                                                         cross-node written -> Invalid
+ *	                                                         is correct; the storage refresh
+ *	                                                         would read past EOF otherwise)
+ *	!valid, self-fence, NOT an extension     -> FAIL_CLOSED (wiped/cold GRD watermark on a
+ *	                                                         pre-existing block — ambiguous,
+ *	                                                         must not serve, Rule 8.A)
+ */
+typedef enum ClusterColdGrdVerdict {
+	CLUSTER_COLD_GRD_PROVE,		  /* watermark valid: run the lost-write verdict */
+	CLUSTER_COLD_GRD_SKIP,		  /* Invalid watermark, provably safe to keep local */
+	CLUSTER_COLD_GRD_FAIL_CLOSED, /* Invalid watermark under a self-fence: refuse */
+} ClusterColdGrdVerdict;
+
+static inline ClusterColdGrdVerdict
+cluster_gcs_cold_grd_watermark_verdict(bool expected_scn_valid, bool self_fence_active,
+									   bool is_extension_block)
+{
+	if (expected_scn_valid)
+		return CLUSTER_COLD_GRD_PROVE;
+	if (!self_fence_active)
+		return CLUSTER_COLD_GRD_SKIP;
+	if (is_extension_block)
+		return CLUSTER_COLD_GRD_SKIP;
+	return CLUSTER_COLD_GRD_FAIL_CLOSED;
+}
+
 /* PGRAC: spec-5.2 D2 — read-image intent flag carried in reserved_0[0].
  *
  *	When the master forwards an N→S read request to a node that holds the
@@ -1913,6 +1958,8 @@ extern ClusterBufmgrGcsDropResult cluster_bufmgr_invalidate_block_for_gcs(Buffer
  * local copy → PASS keep / stale → refresh + re-verdict → 53R93). */
 extern SCN cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf);
 extern bool cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page_scn);
+/* fix 2 (crash-rejoin cold-GRD watermark) extension-block whitelist input. */
+extern bool cluster_bufmgr_block_is_extension_for_gcs(BufferTag tag);
 extern void cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag,
 													  SCN expected_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop

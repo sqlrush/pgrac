@@ -402,8 +402,8 @@ is($rc5, 0,
 # ----------
 is($pair->node1->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state() WHERE category = 'grd_recovery'}),
-	'31',
-	'L7 grd_recovery dump category exposes 31 keys (spec-4.6 D5 + spec-5.16 join + spec-4.6a)');
+	'32',
+	'L7 grd_recovery dump category exposes 32 keys (spec-4.6 D5 + spec-5.16 join + spec-4.6a + crash-rejoin barrier)');
 
 is($pair->node1->safe_psql('postgres', q{
 	SELECT string_agg(key, ',' ORDER BY key) FROM cluster_dump_state()
@@ -414,7 +414,7 @@ is($pair->node1->safe_psql('postgres', q{
 	. 'event_old_epoch,holders_rebound,holders_redeclared,'
 	. 'join_block_recovering_failclosed,join_block_views_rebuilt,'
 	. 'join_remaster_done,join_remaster_started,join_shards_remastered,'
-	. 'last_event_id,rebuild_timeout,remaster_done,remaster_failed,'
+	. 'last_event_id,offpath_crash_rejoin_fenced,rebuild_timeout,remaster_done,remaster_failed,'
 	. 'remaster_started,shards_remastered,stale_holder_swept,'
 	. 'stale_request_drop,state,state_enum_value,unaffected_holder_survived,'
 	. 'wait_epoch_escape,waiters_requeued',
