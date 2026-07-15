@@ -38,6 +38,8 @@
 #	S3 step-2 forensics bundle (RACvsRAC bench/results/
 #	s3-step2-forensics-20260714-112856) branch-1 verdict.
 #
+# Author: SqlRush <sqlrush@gmail.com>
+#
 #-------------------------------------------------------------------------
 
 use strict;
@@ -328,6 +330,22 @@ diag("L3 lost_write_detected_count $det_l3_before->$det_l3_after");
 arm_points('');
 is(retry_safe_sql($pair->node0, 'UPDATE lw_b1 SET v = v + 1 RETURNING v > 0'),
 	't', 'L3d write path stays usable after the rescue');
+
+# Hard gates for the GREEN-leg claims (branch-1 review P1-3): the rescued
+# leg must be 53R93-free, and both nodes must agree on the data end value
+# — a rescue that let the requester consume a stale storage version would
+# diverge the two readbacks.
+is($saw_53r93, 0, 'L3e rescued leg surfaced zero 53R93 client aborts')
+	or diag("53R93 err: $err_53r93");
+# Quiesce first (owner-side ITL cleanout, the t/394 recipe used by the
+# warm-up above): without it the cross-node readback can trip the known
+# low-xid "TT slot recycled" TAP artifact past the retry budget.
+retry_safe_sql($pair->node0, 'VACUUM lw_b1');
+my $v_n0 = retry_safe_sql($pair->node0, 'SELECT v FROM lw_b1');
+my $v_n1 = retry_safe_sql($pair->node1, 'SELECT v FROM lw_b1');
+is($v_n1, $v_n0, "L3f cross-node readback agrees after rescue (v=$v_n0)");
+cmp_ok($v_n0, '>=', 9,
+	'L3g end value covers the 8 warm-up increments plus L3d');
 
 
 # ============================================================

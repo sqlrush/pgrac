@@ -5520,8 +5520,41 @@ scache_downgraded_fall_through:
 			 */
 			if (verdict == GCS_LOST_WRITE_FAIL_STALE) {
 				SCN storage_scn = InvalidScn;
-				bool storage_read_ok
-					= cluster_bufmgr_read_storage_scn_for_gcs(req->tag, &storage_scn);
+				bool storage_read_ok = false;
+				MemoryContext probe_cxt = CurrentMemoryContext;
+
+				/*
+				 * PGRAC: the storage probe is the only disk I/O on this
+				 * self-check path and smgrread can ereport(ERROR) (short
+				 * read on a concurrent truncate/drop, real I/O failure).
+				 * An uncaught throw here would leak the ship image — a
+				 * live_sge borrow is a raw pin outside ResourceOwner
+				 * tracking — and drop the reply after produce_reply already
+				 * applied the PCM transition, wedging the requester.  Catch
+				 * locally and fall through to the fail-closed DENIED arm,
+				 * which releases the image and still replies (Rule 8.A).
+				 */
+				PG_TRY();
+				{
+					storage_read_ok
+						= cluster_bufmgr_read_storage_scn_for_gcs(req->tag, &storage_scn);
+				}
+				PG_CATCH();
+				{
+					ErrorData *edata;
+
+					MemoryContextSwitchTo(probe_cxt);
+					edata = CopyErrorData();
+					FlushErrorState();
+					ereport(LOG, (errmsg_internal(
+									 "cluster_gcs_block: master-direct storage-fallback probe "
+									 "failed; keeping fail-closed DENIED_LOST_WRITE: %s",
+									 edata->message != NULL ? edata->message : "(no message)")));
+					FreeErrorData(edata);
+					storage_read_ok = false;
+					storage_scn = InvalidScn;
+				}
+				PG_END_TRY();
 
 				/* Test hook: pretend storage is unverifiable so the rescue
 				 * refuses and the original fail-closed DENIED ships. */
