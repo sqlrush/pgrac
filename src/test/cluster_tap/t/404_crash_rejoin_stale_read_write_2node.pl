@@ -162,7 +162,7 @@ for my $t (@cands)
 diag("selected vuln=" . ($vuln // 'NONE') . " safe=" . ($safe // 'none'));
 
 SKIP: {
-	skip 'no node1-home candidate surfaced this run', 3 unless defined $vuln;
+	skip 'no node1-home candidate surfaced this run', 4 unless defined $vuln;
 
 	# ========================================================
 	# L4 HARD: node1's read of its home table is COHERENT or FAIL-CLOSED,
@@ -186,6 +186,34 @@ SKIP: {
 	# coherent: write refused (fail-closed) OR both nodes agree afterwards.
 	ok($wr != 0 || ($n1 eq $n0),
 		'L5 HARD: home-block write is fail-closed or coherent, never a silent split');
+
+	# ========================================================
+	# L5b HARD (boot-race, Shape A命门): reads issued CONCURRENTLY, the
+	# instant node1 accepts connections after a fresh bounce, must ALL be
+	# fail-closed for a node1-home table — not one silent 0 may slip
+	# through the boot-to-decision window.  The phase-gate boot barrier
+	# (flag defaults 0 at shmem init) fences self-home blocks RECOVERING
+	# from process start, so every early read errors 53R9L; RED on the
+	# pre-fix binary (a burst of silent 0s).
+	# ========================================================
+	$pair->node1->stop('fast');
+	$pair->node1->start;   # do NOT wait for settle — probe the boot window
+	my ($silent0, $failclosed, $coherent) = (0, 0, 0);
+	for my $i (1 .. 40)
+	{
+		my ($rc, $out, $err) = psql_row($pair->node1, "SELECT count(*) FROM $vuln");
+		if    ($rc != 0)               { $failclosed++; }
+		elsif ($out eq '0')            { $silent0++; }
+		else                           { $coherent++; }   # 64 = decided+served
+		last if $coherent >= 3;        # barrier lifted + coherent: window over
+		usleep(150_000);
+	}
+	diag("L5b boot-window reads: fail-closed=$failclosed silent0=$silent0 coherent=$coherent");
+	is($silent0, 0,
+		'L5b HARD: zero silent 0-row reads in the boot-to-decision window');
+	# resettle for L6
+	$pair->wait_for_peer_state(0, 1, 'connected', 60);
+	usleep(1_000_000);
 
 	# ========================================================
 	# L6 HARD (blast radius): node1-first / node0-last flush, then a full

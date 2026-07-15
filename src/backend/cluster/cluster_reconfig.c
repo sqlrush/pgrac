@@ -2136,6 +2136,96 @@ cluster_reconfig_joiner_self_tick(void)
 }
 
 
+/*
+ * cluster_reconfig_offpath_rejoin_tick -- crash-rejoin re-declare barrier
+ * (Shape A), the cluster.online_join=off counterpart of the joiner self-tick.
+ *
+ *	With online_join=off the joiner self-tick above early-returns, so a node
+ *	that crash-restarts into a running cluster keeps its shmem-init
+ *	self_join_admitted = 1 (cluster_reconfig.c:206) and boots straight to a
+ *	writable MEMBER with an EMPTY GRD and no re-declare episode.  For a block
+ *	whose static home is self, the acquire path then cold-grants from the
+ *	stale/empty disk page (silent stale read / silently-diverging write — the
+ *	P0).  The phase-gate boot barrier (cluster_gcs_block.c) fences self-home
+ *	blocks RECOVERING from process start (the flag defaults 0) until THIS tick
+ *	classifies the incarnation, so there is zero cold-serve window.
+ *
+ *	Decision (LMON single-writer; the barrier flag and self_join_admitted are
+ *	both flipped here):
+ *	  - single declared node       -> decided, no fence (no peer can conflict)
+ *	  - crash-rejoin (already run)  -> arm the self-fence, THEN demote
+ *	                                   self_join_admitted to 0 (Rule 8.A: never
+ *	                                   raised to 1 before the fence is armed);
+ *	                                   home blocks stay RECOVERING via the join
+ *	                                   fence, writes fail-closed 53R60.  The
+ *	                                   survivor re-declare self-heal (fence
+ *	                                   lift) is a separate spec (Shape B).
+ *	  - cold bootstrap at INITIAL   -> decided, no fence (fresh cluster, no
+ *	                                   stale home blocks)
+ *	  - undecided                   -> leave the barrier up (fail-closed),
+ *	                                   retry next tick
+ *
+ *	online_join=on takes its own joiner_self_tick / note_self_admitted path
+ *	and never enters here.
+ */
+static void
+cluster_reconfig_offpath_rejoin_tick(void)
+{
+	static bool offpath_decided_local = false;
+
+	if (ReconfigShmem == NULL || cluster_online_join)
+		return; /* off path only */
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+	if (offpath_decided_local)
+		return; /* once per incarnation (LMON-local) */
+	if (cluster_reconfig_is_removed_unlocked(cluster_node_id))
+		return; /* a removed node keeps its 53R64 self-demote gate */
+
+	if (cluster_conf_node_count() <= 1) {
+		/* Lone declared node: no peer can hold a conflicting copy, so there is
+		 * nothing to re-declare — decide at once so the boot barrier never
+		 * fences a single-node deployment. */
+		cluster_grd_set_offpath_boot_decided();
+		offpath_decided_local = true;
+		return;
+	}
+
+	if (cluster_reconfig_cluster_already_running()) {
+		uint8 self_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+
+		self_set[cluster_node_id >> 3] = (uint8)(1u << (cluster_node_id & 7));
+		cluster_grd_arm_join_pcm_fence(self_set); /* fence FIRST (8.A) */
+
+		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		ReconfigShmem->self_join_admitted = 0; /* then close the write gate */
+		LWLockRelease(&ReconfigShmem->lock);
+
+		cluster_grd_set_offpath_boot_decided();
+		offpath_decided_local = true;
+
+		ereport(LOG,
+				(errmsg("cluster membership: node %d crash-rejoined a running cluster with "
+						"cluster.online_join=off — home blocks fenced and writes closed "
+						"(53R60) to avoid serving stale ownership",
+						cluster_node_id),
+				 errhint("Enable cluster.online_join for an online re-declare rejoin, or "
+						 "cold-restart the cluster. Reads of peer-mastered blocks and "
+						 "non-home work are unaffected.")));
+		return;
+	}
+
+	if (cluster_reconfig_bootstrap_quorum_at_initial()) {
+		/* Cold bootstrap: fresh cluster at INITIAL, no stale home blocks. */
+		cluster_grd_set_offpath_boot_decided();
+		offpath_decided_local = true;
+		return;
+	}
+
+	/* UNDECIDED: keep the boot barrier up (fail-closed) and retry next tick. */
+}
+
+
 /* ============================================================
  * Step 2 D2 — cluster_reconfig_lmon_tick body.
  *
@@ -2207,6 +2297,14 @@ cluster_reconfig_lmon_tick(void)
 	 * self-state below reflects the gate.
 	 */
 	cluster_reconfig_joiner_self_tick();
+
+	/*
+	 * Shape A (crash-rejoin re-declare barrier) — the online_join=off
+	 * counterpart: arm the self-fence + close the write gate if THIS node
+	 * crash-rejoined a running cluster, and lift the boot barrier once the
+	 * bootstrap-vs-rejoin classification is proven.  No-op on online_join=on.
+	 */
+	cluster_reconfig_offpath_rejoin_tick();
 
 	/*
 	 * spec-5.15 D1 (INV-J8): the membership-state table — NOT raw CSSD — is the

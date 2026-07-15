@@ -1451,6 +1451,28 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	static_master = cluster_gcs_lookup_master_static(tag);
 
 	/*
+	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot
+	 * barrier.  With cluster.online_join=off a node that boots into a running
+	 * cluster self-admits immediately (cluster_reconfig.c:206) with an EMPTY
+	 * GRD and NO re-declare episode: for a block whose STATIC home is self,
+	 * the acquire path would find master==self, read the empty local GRD, and
+	 * cold-grant from the stale/empty disk page — a silent stale READ and a
+	 * silently-diverging WRITE (the P0).  Until the off-path rejoin tick has
+	 * classified this incarnation (crash-rejoin -> self-fence armed;
+	 * bootstrap -> nothing), self cannot prove its home blocks' ownership, so
+	 * fence them RECOVERING.  Both reads and writes reach this gate via
+	 * cluster_pcm_lock_acquire_buffer, so this closes the boot-to-decision
+	 * race with ZERO cold-serve window (Rule 8.A: uncertain -> fail-closed).
+	 * Skipped for online_join=on (its admission + join fence govern) and for
+	 * a single declared node (no peer can hold a conflicting copy).
+	 */
+	if (!cluster_online_join && static_master == cluster_node_id
+		&& cluster_conf_node_count() > 1 && !cluster_grd_offpath_boot_decided()) {
+		cluster_grd_inc_join_block_failclosed();
+		return GCS_BLOCK_RECOVERING;
+	}
+
+	/*
 	 * spec-5.16 D3 (r1 P1-C) — online-join PCM block snap-back fence, placed
 	 * BEFORE the non-DEAD-static-master early NORMAL below.  When a joiner (a
 	 * non-DEAD static master) rejoins, block routing snaps its home blocks back
