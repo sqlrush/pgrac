@@ -53,6 +53,7 @@
 
 #include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -326,10 +327,12 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+static int32 stub_remote_master = -1;
+
 int32
 cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
 {
-	return cluster_node_id;
+	return stub_remote_master >= 0 ? stub_remote_master : cluster_node_id;
 }
 
 void
@@ -355,6 +358,11 @@ static uint64 stub_lmd_cancel_enqueue_count = 0;
 static uint32 stub_lmd_cancel_last_source = 0;
 static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
+static uint64 stub_backend_request_enqueue_count = 0;
+static GesRequestPayload stub_backend_request_last;
+static uint64 stub_cancel_wait_enqueue_count = 0;
+static uint32 stub_cancel_wait_last_dest = 0;
+static GesCancelWaitPayload stub_cancel_wait_last;
 
 void
 cluster_grd_inc_ges_work_queue_full(void)
@@ -484,10 +492,12 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
  * coverage lives in TAP 108/109 where real backend wiring runs. */
 
 bool
-cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(),
-											 const void *p pg_attribute_unused(),
-											 uint16 l pg_attribute_unused())
+cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), const void *p,
+											 uint16 l)
 {
+	stub_backend_request_enqueue_count++;
+	if (p != NULL && l == sizeof(GesRequestPayload))
+		memcpy(&stub_backend_request_last, p, sizeof(stub_backend_request_last));
 	return true;
 }
 
@@ -520,10 +530,15 @@ pfree(void *p)
 
 /* spec-2.24 D14 stub audit. */
 void
-cluster_grd_outbound_enqueue_lmd_cancel(uint32 d pg_attribute_unused(),
-										const void *p pg_attribute_unused(),
-										uint16 l pg_attribute_unused())
-{}
+cluster_grd_outbound_enqueue_lmd_cancel(uint32 d, const void *p, uint16 l)
+{
+	if (p != NULL && l == sizeof(GesCancelWaitPayload)
+		&& ((const GesCancelWaitPayload *)p)->opcode == GES_REQ_OPCODE_CANCEL_WAIT) {
+		stub_cancel_wait_enqueue_count++;
+		stub_cancel_wait_last_dest = d;
+		memcpy(&stub_cancel_wait_last, p, sizeof(stub_cancel_wait_last));
+	}
+}
 bool
 cluster_lmd_cancel_queue_enqueue(uint32 s, const void *p pg_attribute_unused(),
 								 uint16 l pg_attribute_unused())
@@ -714,40 +729,42 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attr
 }
 
 /* cluster_ges_reply_wait API stubs (spec-2.23 D1). */
-struct GesReplyWaitKey;
-struct GesReplyWaitEntry;
-struct GesReplyWaitEntry *
-cluster_ges_reply_wait_insert(const struct GesReplyWaitKey *k pg_attribute_unused(),
-							  int64 deadline pg_attribute_unused())
+static bool stub_reply_wait_insert_enabled = false;
+static GesReplyWaitEntry stub_reply_wait_entry;
+
+GesReplyWaitEntry *
+cluster_ges_reply_wait_insert(const GesReplyWaitKey *k pg_attribute_unused(),
+							  TimestampTz deadline pg_attribute_unused())
 {
-	return NULL;
+	if (!stub_reply_wait_insert_enabled)
+		return NULL;
+	memset(&stub_reply_wait_entry, 0, sizeof(stub_reply_wait_entry));
+	return &stub_reply_wait_entry;
 }
-struct GesReplyWaitEntry *
-cluster_ges_reply_wait_lookup(const struct GesReplyWaitKey *k pg_attribute_unused())
+GesReplyWaitEntry *
+cluster_ges_reply_wait_lookup(const GesReplyWaitKey *k pg_attribute_unused())
 {
 	return NULL;
 }
 void
-cluster_ges_reply_wait_wake(struct GesReplyWaitEntry *e pg_attribute_unused(),
+cluster_ges_reply_wait_wake(GesReplyWaitEntry *e pg_attribute_unused(),
 							uint32 opcode pg_attribute_unused(),
 							uint32 reason pg_attribute_unused())
 {}
 void
-cluster_ges_reply_wait_delete(const struct GesReplyWaitKey *k pg_attribute_unused())
+cluster_ges_reply_wait_delete(const GesReplyWaitKey *k pg_attribute_unused())
 {}
-/* spec-5.16 orphan-grant stubs (deliver / mark_abandoned).  int/int64 returns mirror
- * the minimal-stub style above (reply_wait.h not included here); cluster_ges.o links
- * by symbol name and the inert bodies keep the standalone harness coverage unchanged. */
-int
-cluster_ges_reply_wait_deliver(const struct GesReplyWaitKey *k pg_attribute_unused(),
+/* spec-5.16 orphan-grant stubs (deliver / mark_abandoned). */
+GesReplyDeliverResult
+cluster_ges_reply_wait_deliver(const GesReplyWaitKey *k pg_attribute_unused(),
 							   uint32 opcode pg_attribute_unused(),
 							   uint32 reason pg_attribute_unused())
 {
-	return 0; /* GES_REPLY_DELIVER_NO_WAITER */
+	return GES_REPLY_DELIVER_NO_WAITER;
 }
 bool
-cluster_ges_reply_wait_mark_abandoned(const struct GesReplyWaitKey *k pg_attribute_unused(),
-									  int64 tombstone_deadline pg_attribute_unused())
+cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *k pg_attribute_unused(),
+									  TimestampTz tombstone_deadline pg_attribute_unused())
 {
 	return false;
 }
@@ -910,10 +927,15 @@ DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 	return false;
 }
 
-int64
+static bool stub_clock_advances = false;
+static TimestampTz stub_now = 0;
+
+TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	if (stub_clock_advances)
+		stub_now += 1000;
+	return stub_now;
 }
 
 void *MyProc;
@@ -1263,10 +1285,59 @@ UT_TEST(test_ges_native_lock_probe_reply_dispatch)
 	UT_ASSERT_EQ(stub_native_probe_recv_calls, pre_recv + 1);
 }
 
+/*
+ * P0#3 regression: a finite remote REQUEST timeout must remove the exact
+ * master-side waiter.  The deadlock-victim path already sends CANCEL_WAIT;
+ * the ordinary timeout path historically left the waiter + WFG edge behind.
+ */
+UT_TEST(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0x5A, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x1122334455667788);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_now = 0;
+	stub_backend_request_enqueue_count = 0;
+	stub_cancel_wait_enqueue_count = 0;
+	memset(&stub_backend_request_last, 0, sizeof(stub_backend_request_last));
+	memset(&stub_cancel_wait_last, 0, sizeof(stub_cancel_wait_last));
+
+	result = cluster_ges_send_request_and_wait(&resid, AccessExclusiveLock, &holder,
+											   holder.request_id, 1, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_cancel_wait_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_cancel_wait_last_dest, (uint32)7);
+	UT_ASSERT_EQ(stub_cancel_wait_last.opcode, (uint32)GES_REQ_OPCODE_CANCEL_WAIT);
+	UT_ASSERT_EQ(stub_cancel_wait_last.kind, (uint32)GES_CANCEL_WAIT_KIND_REQUEST);
+	UT_ASSERT_EQ(stub_cancel_wait_last.waiter_node_id, holder.node_id);
+	UT_ASSERT_EQ(stub_cancel_wait_last.waiter_procno, holder.procno);
+	UT_ASSERT_EQ(stub_cancel_wait_last.waiter_cluster_epoch, holder.cluster_epoch);
+	UT_ASSERT_EQ(stub_cancel_wait_last.waiter_request_id, holder.request_id);
+	UT_ASSERT_EQ(stub_cancel_wait_last.wait_seq, stub_backend_request_last.wait_seq);
+	UT_ASSERT(memcmp(stub_cancel_wait_last.resid, &resid, sizeof(resid)) == 0);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_now = 0;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1284,6 +1355,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_native_lock_probe_opcode_enum_extension);
 	UT_RUN(test_ges_native_lock_probe_request_dispatch);
 	UT_RUN(test_ges_native_lock_probe_reply_dispatch);
+	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

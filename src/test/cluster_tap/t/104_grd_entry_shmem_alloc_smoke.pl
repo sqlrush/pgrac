@@ -132,11 +132,23 @@ is($node->safe_psql('postgres',
 # convert verdict counters (granted_inplace / enqueued / illegal),
 # spec-6.3a adds 4 entry lifecycle reclaim counters, and
 # spec-5.10 D7 adds 4 starvation-fairness counters (boost / barrier_enqueued
-# / barrier_publish_fail / max_skip_observed).
+# / barrier_publish_fail / max_skip_observed), and P0#3 reliable cleanup adds
+# 2 lifetime retry-pressure warning counters.
 is($node->safe_psql('postgres',
 		q{SELECT count(*)::int FROM pg_cluster_state WHERE category='grd'}),
-   '51',
-   'L4b dump_grd category="grd" emits 51 rows (adds spec-6.3a entry lifecycle counters)');
+   '53',
+   'L4b dump_grd category="grd" emits 53 rows (adds reliable cleanup pressure counters)');
+
+is($node->safe_psql('postgres',
+		q{SELECT (SELECT value FROM pg_cluster_state
+		           WHERE category='grd'
+		             AND key='grd_outbound_cleanup_retry_warn50_count')
+		    || '|' ||
+		         (SELECT value FROM pg_cluster_state
+		           WHERE category='grd'
+		             AND key='grd_outbound_cleanup_retry_warn90_count')}),
+   '0|0',
+   'L4b2 reliable cleanup 50/90 percent warning counters exported at zero baseline');
 
 # All 3 NEW atomic counter baseline 0 (本 spec 0 caller invokes
 # cluster_grd_entry_lookup_or_create).
