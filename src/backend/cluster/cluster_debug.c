@@ -2286,6 +2286,9 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_lost_write_invalidscn_failclosed_count()));
 	emit_row(rsinfo, "gcs", "lost_write_not_scn_tracked_skip_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_not_scn_tracked_skip_count()));
+	/* PGRAC: branch-1 — master-direct stale ship rescued via shared storage. */
+	emit_row(rsinfo, "gcs", "lost_write_master_direct_storage_fallback_count",
+			 fmt_int64((int64)cluster_gcs_get_lost_write_master_direct_storage_fallback_count()));
 	/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter. */
 	emit_row(rsinfo, "gcs", "cf_xheld_read_ship_count",
 			 fmt_int64((int64)cluster_gcs_get_cf_xheld_read_ship_count()));

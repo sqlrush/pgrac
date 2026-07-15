@@ -1827,6 +1827,7 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "access/xlogdefs.h"		  /* XLogRecPtr */
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
+extern bool cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
 extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 														 void **out_page_addr,
@@ -2334,6 +2335,8 @@ extern uint64 cluster_gcs_get_lost_write_detected_count(void);
 extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
 /* PGRAC: spec-2.41 D7 — SCN detector + redo-coverage observability accessors. */
 extern uint64 cluster_gcs_get_lost_write_invalidscn_failclosed_count(void);
+/* PGRAC: branch-1 master-direct storage-fallback rescue accessor. */
+extern uint64 cluster_gcs_get_lost_write_master_direct_storage_fallback_count(void);
 extern uint64 cluster_gcs_get_lost_write_not_scn_tracked_skip_count(void);
 extern uint64 cluster_gcs_get_redo_coverage_required_lsn_zero_count(void);
 extern uint64 cluster_gcs_get_redo_coverage_gate_block_count(void);
