@@ -364,12 +364,23 @@ undo_cleaner_advance_liveness_tick(void)
  *	cluster-wide COMMITTED recycling for 30-60s).  Rule 8.A unchanged:
  *	a retry still recycles ONLY on a proven floor; a persistent cause
  *	keeps every retry stalled.
+ *
+ *	*out_work_remaining (TT lane, S3 idle-peer floor pin H2): true when
+ *	this pass BOTH consumed its whole segment batch AND made recycle
+ *	progress — the backlog is bigger than one batch, so the caller
+ *	re-runs immediately (pressure-driven continuous mode) instead of
+ *	sleeping the recycle interval.  Pure cadence: what may be recycled
+ *	is still decided only by the proven floor above.  A pinned pass
+ *	(zero progress) or a drained backlog (batch not exhausted) reports
+ *	false, so the continuous mode can never busy-spin.
  */
 static bool
-undo_cleaner_run_pass(void)
+undo_cleaner_run_pass(bool *out_work_remaining)
 {
 	ClusterUndoCleanerPassStats stats;
 	bool floor_retry_needed = false;
+
+	*out_work_remaining = false;
 
 	if (!cluster_undo_cleaner_enabled)
 		return false;
@@ -540,6 +551,17 @@ undo_cleaner_run_pass(void)
 			if (fence_aborted) {
 				floor_retry_needed = true;
 				cluster_undo_horizon_note_pass_abort();
+			} else if (batch == 0
+					   && (stats.segments_marked_recyclable > 0 || stats.shmem_tt_slots_gcd > 0
+						   || stats.header_tt_slots_below_horizon > 0)) {
+				/*
+				 * H2 continuous mode: the batch budget ran out while
+				 * recycle progress was still being made -- more eligible
+				 * inventory is waiting than one batch covers.  Ask the
+				 * caller to re-run now rather than let a write storm
+				 * outrun the interval cadence.
+				 */
+				*out_work_remaining = true;
 			}
 		}
 	}
@@ -634,6 +656,7 @@ UndoCleanerMain(void)
 		int rc;
 		int timeout_ms;
 		bool floor_retry;
+		bool work_remaining;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -649,7 +672,20 @@ UndoCleanerMain(void)
 
 		CLUSTER_INJECTION_POINT("undo-cleaner-main-loop-iter");
 
-		floor_retry = undo_cleaner_run_pass();
+		floor_retry = undo_cleaner_run_pass(&work_remaining);
+
+		/*
+		 * TT lane H2 (pressure-driven continuous mode): a pass that
+		 * exhausted its segment batch while still recycling has a backlog
+		 * bigger than one batch -- under a write storm the interval
+		 * cadence is orders of magnitude too slow (12k xacts/s consume a
+		 * 48-slot segment every ~4ms), so loop straight into the next
+		 * pass.  The loop head re-checks interrupts / reload / shutdown,
+		 * and the signal requires PROGRESS, so a pinned or stalled floor
+		 * always falls through to the waits below.
+		 */
+		if (work_remaining)
+			continue;
 
 		/*
 		 * interval 0 = pressure-wakeup only (Q8): block without

@@ -451,6 +451,61 @@ UT_TEST(test_u16b_blame_order)
 	UT_ASSERT_EQ(r.blame, 1);
 }
 
+/* ---- U17: idle-unconstrained sentinel never wins the min fold -------- */
+UT_TEST(test_u17_idle_sentinel_skipped)
+{
+	uint8 req[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	ClusterUndoHorizonReportView views[3];
+	FoldResult r;
+
+	views[0] = mk_view(0); /* self slot: ignored */
+	views[1] = mk_view((uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED);
+	views[2] = mk_view(900);
+	bm_set(req, 1);
+	bm_set(req, 2);
+
+	/* the sentinel peer contributes nothing; min(local 800, peer2 900) */
+	r = run_fold((SCN)800, views, 3, req);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_OK);
+	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)800);
+	UT_ASSERT_EQ(r.floor.epoch, TEST_EPOCH);
+
+	/* every required peer idle => floor is exactly the local horizon */
+	views[2] = mk_view((uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED);
+	r = run_fold((SCN)800, views, 3, req);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_OK);
+	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)800);
+}
+
+/* ---- U17b: sentinel reports still owe every proof obligation --------- */
+UT_TEST(test_u17b_idle_sentinel_still_proven)
+{
+	uint8 req[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	ClusterUndoHorizonReportView views[2];
+	FoldResult r;
+
+	/* a STALE sentinel stalls exactly like a stale real report: an idle
+	 * peer that stops reporting is unproven coverage, not "unconstrained
+	 * forever" */
+	views[0] = mk_view(0);
+	views[1] = mk_view((uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED);
+	views[1].recv_at_us = TEST_NOW_US - (uint64)10 * 1000 * 1000; /* 10s old */
+	bm_set(req, 1);
+
+	r = run_fold((SCN)800, views, 2, req);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_STALLED);
+	UT_ASSERT_EQ(r.reason, CLUSTER_UNDO_HORIZON_STALL_STALE);
+	UT_ASSERT_EQ(r.blame, 1);
+
+	/* an epoch-mismatched sentinel stalls too */
+	views[1] = mk_view((uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED);
+	views[1].epoch = TEST_EPOCH - 1;
+	r = run_fold((SCN)800, views, 2, req);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_STALLED);
+	UT_ASSERT_EQ(r.reason, CLUSTER_UNDO_HORIZON_STALL_EPOCH);
+	UT_ASSERT_EQ(r.blame, 1);
+}
+
 /* ---- reason names cover every enum arm ------------------------------ */
 UT_TEST(test_reason_names)
 {
@@ -475,7 +530,7 @@ UT_TEST(test_reason_names)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 
 	UT_RUN(test_u1_no_required_peer);
 	UT_RUN(test_u2_all_fresh_min);
@@ -495,6 +550,8 @@ main(void)
 	UT_RUN(test_u14_regression);
 	UT_RUN(test_u16_nocap);
 	UT_RUN(test_u16b_blame_order);
+	UT_RUN(test_u17_idle_sentinel_skipped);
+	UT_RUN(test_u17b_idle_sentinel_still_proven);
 	UT_RUN(test_reason_names);
 
 	UT_DONE();

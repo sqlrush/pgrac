@@ -236,6 +236,30 @@ cluster_sf_peer_supports_undo_horizon(int32 peer_id)
 }
 
 /*
+ * cluster_sf_peer_supports_undo_horizon_idle
+ *
+ * TT lane (S3 idle-peer floor pin) capability gate: true iff the peer's
+ * verified HELLO on the CURRENT connection advertised the idle-unconstrained
+ * sentinel report bit.  Same connection-bound, no-local-GUC discipline as
+ * the queries above.  Consumed by the SENDER only: a provably idle node
+ * sends the sentinel exclusively to peers that understand it; an old peer
+ * keeps receiving the conservative clock sample (see cluster_ic.h).
+ */
+bool
+cluster_sf_peer_supports_undo_horizon_idle(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1) != 0;
+}
+
+/*
  * cluster_sf_peer_supports_gcs_done
  *
  * GCS-race round-2 review F6: true iff the peer's verified HELLO on the

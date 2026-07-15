@@ -596,9 +596,10 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * CAPS_REPLY_V1 meta bit (0x8) + GCS-race round-2 F6 completion-proof
 	 * (0x10) + round-3 P0-1 xid wrap barrier (0x20) + round-4 P0-1
 	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
-	 * (0x80) (smart-fusion is off in this fixture) */
+	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100)
+	 * (smart-fusion is off in this fixture) */
 	UT_ASSERT_EQ(wire[36], 0xFE);
-	UT_ASSERT_EQ(wire[37], 0x00);
+	UT_ASSERT_EQ(wire[37], 0x01);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
 	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
@@ -691,12 +692,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-off", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
-				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
-					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
-					 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
+	UT_ASSERT_EQ(
+		cluster_ic_hello_capabilities(&parsed),
+		PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+			| PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
+			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
+			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -704,12 +705,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
 						   "sf-tier-mismatch", CLUSTER_IC_PLANE_CONTROL, 0);
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed),
-				 PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
-					 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-					 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
-					 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
+	UT_ASSERT_EQ(
+		cluster_ic_hello_capabilities(&parsed),
+		PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+			| PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1 | PGRAC_IC_HELLO_CAP_GCS_DONE_V1
+			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
+			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -722,7 +723,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 		PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 | PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1 | PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1
 			| PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
-			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1);
+			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1
+			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;

@@ -239,6 +239,14 @@ jobs:
           # Own shard: six ClusterPair bring-ups need the wall clock
           # (L342: every new t/ file lands in a shard the same commit).
           - { name: stage7-gcs-ownership-gen, ranges: "392-397", unit: false, regress: false }
+          # t/401 GCS master-direct STALE-ship storage rescue (PR#55) +
+          # t/402 undo cleaner stall-retry cadence (PR#56) + t/403 TT-lane
+          # idle-peer floor pin under write load (all 2-node pairs from the
+          # S3 wave).  t/401/402 predate this shard and were in NO CI
+          # matrix -- closes that hole (L342: every new t/ file lands in a
+          # shard the same commit).  Own shard: three ClusterPair bring-ups
+          # + the t/403 sustained write phase need the wall clock.
+          - { name: stage7-s3-wave, ranges: "401-403", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
