@@ -147,7 +147,10 @@ $node->stop;
 	my $nb = $pair->node1;
 
 	$pair->start_pair;
-	$pair->wait_for_peer_state(0, 1, 'connected', 30);
+	ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
+		'L5 DATA/control peer formation is connected');
+	ok($pair->wait_for_pcm_x_active(30),
+		'L5 PCM-X formation is ACTIVE on both writers before DML');
 
 	# Same DDL on both sides = same relfilenode into the shared root
 	# (the harness naming premise; t/248 L0 pins it, here just bail).

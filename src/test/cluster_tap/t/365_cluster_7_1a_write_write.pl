@@ -40,11 +40,9 @@
 #          PREPARED (the same durable COMMITTED stamp that would be
 #          in-doubt in the crash window, now finalized by the commit
 #          record) node1's read heals to the 2PC value through the C1b
-#          verdict discipline.  The peer WRITE on that block stays
-#          fail-closed behind the deferred writer-transfer image
-#          (pre-existing availability boundary, asserted as such and
-#          escalated to the integration owner); the owner closes the
-#          value chain.
+#          verdict discipline.  The convert queue then transfers X for a
+#          peer WRITE on that block; a second owner-side write proves the
+#          resulting value chain contains both increments.
 #
 #    KNOWN-BLOCKED (honest, 规则 18 -- not SKIPed, not faked green):
 #      - D0 writer-chain gain legs (blocked UPDATE wakes onto TM_Ok /
@@ -258,8 +256,9 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'on',
 
 	my ($rc, $out, $err) = $node1->psql('postgres', 'UPDATE ww_t SET ctr = ctr + 1 WHERE id = 1');
 	isnt($rc, 0, 'L3 GUC on: in-flight conflict still fails closed (no unsound chain)');
-	like($err, qr/cluster TT (status unknown|slot recycled)/,
-		'L3 the failure is still the cluster fail-closed judge');
+	like($err,
+		qr/cluster TT (?:status unknown|slot recycled)|cluster PCM ownership transition conflicts with an active reservation/,
+		'L3 the failure is still an explicit cluster fail-closed judge');
 
 	$h0->query_safe('COMMIT');
 	$h0->quit;
@@ -390,15 +389,10 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'on',
 	ok(wait_for_val($node1, 'SELECT ctr FROM ww_t WHERE id = 2', '500', 30),
 		'L6c after COMMIT PREPARED node1 heals to the 2PC value');
 
-	# Peer-write availability boundary (pre-existing; escalated to the
-	# integration owner, NOT a 7.1a regression): COMMIT PREPARED leaves the
-	# page ITL unstamped (a prepared xact's touched-buffer list is gone, so
-	# no fast-commit stamp), the owner deferred the writer-transfer on that
-	# uncommitted-looking ITL, and node1's cached DEFERRED read-image never
-	# re-requests X -- so node1 writes on this block stay fail-closed
-	# (retryable) even after owner-side xact churn recycles the cold ITL.
-	# Fail-closed is the correct 8.A direction (never a false chain):
-	# assert the boundary, then close the value chain from the owner side.
+	# COMMIT PREPARED leaves the page ITL unstamped (the prepared xact's
+	# touched-buffer list is gone), so churn first forces terminal verdict
+	# resolution.  The convert queue must then transfer X to node1 instead of
+	# preserving the former deferred-image availability boundary.
 	my $churned = 0;
 	for my $i (1 .. 10)
 	{
@@ -407,13 +401,13 @@ is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'on',
 	is($churned, 10, 'L6c owner-side xact churn completes (cold 2PC ITL recycled)');
 	my ($wrc2, $wout2, $werr2)
 		= $node1->psql('postgres', 'UPDATE ww_t SET ctr = ctr + 1 WHERE id = 2');
-	isnt($wrc2, 0, 'L6c peer write on the 2PC-touched block stays fail-closed (deferred image)');
-	like($werr2, qr/cannot write a block held in X by a remote node|cluster TT/,
-		'L6c the refusal is the writer-transfer defer gate, never a silent wrong write');
+	is($wrc2, 0, 'L6c peer write obtains X for the decided 2PC-touched block');
+	is($node1->safe_psql('postgres', 'SELECT ctr FROM ww_t WHERE id = 2'), '501',
+		'L6c peer write applies exactly once on the decided 2PC value');
 	ok(write_retry($node0, 'UPDATE ww_t SET ctr = ctr + 1 WHERE id = 2'),
-		'L6c owner applies +1 on top of the decided 2PC value');
-	is($node0->safe_psql('postgres', 'SELECT ctr FROM ww_t WHERE id = 2'), '501',
-		'L6c final value chains the 2PC commit and the +1');
+		'L6c owner reacquires X and applies the second +1');
+	is($node0->safe_psql('postgres', 'SELECT ctr FROM ww_t WHERE id = 2'), '502',
+		'L6c final value chains the 2PC commit and both cross-node increments');
 }
 
 $pair->stop_pair;

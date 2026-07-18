@@ -932,11 +932,17 @@ UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 {
 	static const char *const prepare_contract[]
-		= { "expected_n->pcm_state != (uint8)PCM_STATE_N",
+		= { "PGIOAlignedBlock scratch",
+			"expected_n->pcm_state != (uint8)PCM_STATE_N",
+			"ReservePrivateRefCountEntry",
+			"ResourceOwnerEnlargeBuffers(CurrentResourceOwner)",
 			"cluster_pcm_own_snapshot_matches_locked",
 			"BM_VALID",
-			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
 			"BM_IO_ERROR",
+			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+			"PinBuffer_Locked",
+			"FlushBuffer",
+			"UnpinBuffer",
 			"BM_IO_IN_PROGRESS",
 			"cluster_pcm_own_reservation_begin_exact",
 			"PCM_OWN_FLAG_REVOKING",
@@ -946,8 +952,8 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 			"cluster_pcm_own_snapshot_matches_locked",
 			"PCM_OWN_FLAG_REVOKING",
 			"BM_VALID",
-			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
 			"BM_IO_ERROR",
+			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
 			"BM_IO_IN_PROGRESS",
 			"memcpy((char *)BufHdrGetBlock(buf), scratch.data, BLCKSZ)",
 			"buf->buffer_type = (uint8)BUF_TYPE_CURRENT",
@@ -958,7 +964,11 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 	char *source = read_bufmgr_source();
 
 	/* READY may be built only after one verified storage scratch has replaced
-	 * the exact fenced N descriptor and supplied all image evidence. */
+	 * the exact fenced N descriptor and supplied all image evidence.  A dirty
+	 * pre-grant N page is legal (extension / redo dirt): the contract now pins
+	 * the flush-then-BUSY convergence (reserve/pin under the header lock,
+	 * WAL-first FlushBuffer, unpin) ahead of the reservation, with BM_IO_ERROR
+	 * judged before the dirty branch on both passes. */
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_prepare_n_source_image(",
 							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_s_revoke(",
 							   prepare_contract, lengthof(prepare_contract));

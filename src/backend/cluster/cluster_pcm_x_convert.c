@@ -5620,6 +5620,8 @@ pcm_x_master_blocker_stage_begin_precheck_locked(const PcmXMasterTicketSlot *tic
 	PcmXAllocatorView blocker_view;
 	uint64 current_generation;
 	uint32 state;
+	bool current_probe_source;
+	bool published_source;
 
 	if (ticket == NULL || begin == NULL || !pcm_x_master_blocker_stage_metadata_valid(ticket)
 		|| !pcm_x_allocator_view(PCM_X_ALLOC_BLOCKER, &blocker_view))
@@ -5653,7 +5655,8 @@ pcm_x_master_blocker_stage_begin_precheck_locked(const PcmXMasterTicketSlot *tic
 				   ? PCM_X_QUEUE_DUPLICATE
 				   : PCM_X_QUEUE_STALE;
 	}
-	if (!pcm_x_master_probe_source_exact(ticket, source_node, source_session)
+	current_probe_source = pcm_x_master_probe_source_exact(ticket, source_node, source_session);
+	if (!current_probe_source
 		&& !pcm_x_master_blocker_ack_replay_exact(ticket, source_node, source_session))
 		return PCM_X_QUEUE_STALE;
 	if (ticket->blocker_stage_set_generation != 0) {
@@ -5666,14 +5669,27 @@ pcm_x_master_blocker_stage_begin_precheck_locked(const PcmXMasterTicketSlot *tic
 		return begin->set_generation <= ticket->blocker_stage_set_generation ? PCM_X_QUEUE_STALE
 																			 : PCM_X_QUEUE_BUSY;
 	}
-	if (begin->set_generation == current_generation) {
+	published_source
+		= pcm_x_master_blocker_published_source_exact(ticket, source_node, source_session);
+	if (begin->set_generation == current_generation && published_source) {
 		return begin->nblockers == ticket->blocker_count
 					   && begin->set_crc32c == ticket->blocker_set_crc32c
-					   && pcm_x_master_blocker_published_source_exact(ticket, source_node,
-																	  source_session)
 				   ? PCM_X_QUEUE_DUPLICATE
 				   : PCM_X_QUEUE_STALE;
 	}
+	/* set_generation belongs to the holder's local tag, so another exact
+	 * holder may legitimately publish the same (or a lower) numeric value.
+	 * The authenticated source tuple completes its namespace.  Before
+	 * replacing a previous holder's set, require that exact set to have
+	 * reached the graph-commit boundary. */
+	if (current_probe_source && !published_source) {
+		if (current_generation != 0 && ticket->graph_generation == 0)
+			return PCM_X_QUEUE_NOT_READY;
+		return PCM_X_QUEUE_OK;
+	}
+	/* A non-current source can only be replaying the last published set. */
+	if (!current_probe_source)
+		return PCM_X_QUEUE_STALE;
 	if (begin->set_generation < current_generation)
 		return PCM_X_QUEUE_STALE;
 	if (current_generation == UINT64_MAX || begin->set_generation == UINT64_MAX)
@@ -8493,6 +8509,32 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 		result = PCM_X_QUEUE_STALE;
 		goto arm_done;
 	}
+	/* The retry driver scans the fixed participant bitmap from node zero on
+	 * every pass.  Once an earlier responder has ACKed, a later responder may
+	 * own the one reliable leg.  Classify the completed responder before the
+	 * generic cross-responder BUSY check, otherwise that later leg permanently
+	 * hides itself behind the first completed node. */
+	if ((kind == PCM_X_TERMINAL_LEG_DRAIN
+		 && (state == PCM_XT_RETIRE_CREDIT || (ticket->drained_nodes_bitmap & responder_bit) != 0))
+		|| (kind == PCM_X_TERMINAL_LEG_RETIRE && state == PCM_XT_RETIRE_CREDIT
+			&& (ticket->retire_acked_nodes_bitmap & responder_bit) != 0)) {
+		/* A same-phase leg cannot remain armed after its responder bit commits.
+		 * Do not let the retry classification conceal that structural split. */
+		if (!pcm_x_master_terminal_leg_is_clear(&ticket->reliable)
+			&& ticket->reliable.pending_opcode == (uint16)kind
+			&& ticket->reliable.phase == (uint16)kind
+			&& ticket->reliable.expected_responder_node == responder_node) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else
+			result = PCM_X_QUEUE_NOT_READY;
+		goto arm_done;
+	}
+	if ((kind == PCM_X_TERMINAL_LEG_DRAIN && state == PCM_XT_RETIRE_CREDIT)
+		|| (kind == PCM_X_TERMINAL_LEG_RETIRE && state != PCM_XT_RETIRE_CREDIT)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto arm_done;
+	}
 	if (!pcm_x_master_terminal_leg_is_clear(&ticket->reliable)) {
 		if (ticket->reliable.pending_opcode == (uint16)kind
 			&& ticket->reliable.phase == (uint16)kind
@@ -8510,18 +8552,6 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 		} else
 			result = PCM_X_QUEUE_BUSY;
 		goto arm_done;
-	}
-	if (kind == PCM_X_TERMINAL_LEG_DRAIN) {
-		if (state == PCM_XT_RETIRE_CREDIT || (ticket->drained_nodes_bitmap & responder_bit) != 0) {
-			result = PCM_X_QUEUE_NOT_READY;
-			goto arm_done;
-		}
-	} else {
-		if (state != PCM_XT_RETIRE_CREDIT
-			|| (ticket->retire_acked_nodes_bitmap & responder_bit) != 0) {
-			result = PCM_X_QUEUE_NOT_READY;
-			goto arm_done;
-		}
 	}
 	if (!cluster_pcm_x_generation_next(ticket->reliable.state_sequence, &next_sequence)) {
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;

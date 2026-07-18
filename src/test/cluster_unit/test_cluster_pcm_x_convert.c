@@ -5808,6 +5808,52 @@ UT_TEST(test_master_blocker_wire_stage_commits_exact_canonical_set)
 				 PCM_X_QUEUE_OK);
 }
 
+UT_TEST(test_master_blocker_generation_is_scoped_by_holder_source)
+{
+	PcmXMasterAdmission admission;
+	PcmXMasterBlockerSnapshot first_snapshot;
+	PcmXMasterBlockerSnapshot second_snapshot;
+	PcmXBlockerSetHeaderPayload first;
+	PcmXBlockerSetHeaderPayload second;
+	const uint64 first_session = UINT64_C(82511);
+	const uint64 second_session = UINT64_C(82512);
+
+	init_active_pcm_x(UINT64_C(77));
+	admit_active_probe(791, 0, 12, UINT64_C(8252), UINT64_C(7252), 1, &admission);
+
+	/* Each holder owns an independent local tag and therefore starts its
+	 * blocker-set generation at one.  The authenticated source tuple, not a
+	 * ticket-global comparison with the previous holder, namespaces that
+	 * generation. */
+	arm_blocker_probe(&admission.ref, 2, first_session);
+	first = make_blocker_header(&admission.ref, 1, NULL, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_begin_exact(&first, 2, first_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(&first, 2, first_session, NULL, 0,
+																 &first_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_graph_commit_exact(&first_snapshot, NULL, 0, UINT64_C(92511)),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_probe_complete_exact(&admission.ref, 1, 2, first_session),
+		PCM_X_QUEUE_OK);
+
+	arm_blocker_probe(&admission.ref, 3, second_session);
+	second = make_blocker_header(&admission.ref, 1, NULL, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_begin_exact(&second, 3, second_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(&second, 3, second_session, NULL,
+																 0, &second_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_graph_commit_exact(&second_snapshot, NULL, 0, UINT64_C(92512)),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_probe_complete_exact(&admission.ref, 1, 3, second_session),
+		PCM_X_QUEUE_OK);
+}
+
 UT_TEST(test_master_blocker_crc_ignores_vertex_abi_padding)
 {
 	ClusterLmdVertex zero_padding;
@@ -7957,6 +8003,71 @@ UT_TEST(test_terminal_detach_missing_retire_ack_is_retryable_not_ready)
 	arm_and_ack_master_terminal_leg(&admission.ref, PCM_X_TERMINAL_LEG_RETIRE, 1);
 	UT_ASSERT_EQ(cluster_pcm_x_master_detach_terminal_exact(&admission.ref), PCM_X_QUEUE_OK);
 	assert_master_queue_baseline(header);
+}
+
+UT_TEST(test_terminal_retry_skips_drained_responder_while_next_leg_is_armed)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterTicketSlot *ticket;
+	PcmXEnqueuePayload request;
+	PcmXTerminalLegToken pending;
+	PcmXTerminalLegToken replay;
+	PcmXTerminalLegToken skipped;
+	PcmXRetirePayload retire_ack;
+	uint64 session0;
+	uint64 session1 = UINT64_C(6804);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	request = make_enqueue(make_wait_identity(754, 0, 2, UINT64_C(66004)), UINT64_C(6803), 1);
+	bind_enqueue_peer(&request);
+	UT_ASSERT_EQ(cluster_pcm_x_peer_bind_ack_publish(1, request.identity.cluster_epoch, session1),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &admission), PCM_X_QUEUE_OK);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+	ticket->involved_nodes_bitmap |= UINT32_C(1) << 1;
+	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission.ref), PCM_X_QUEUE_OK);
+	session0 = header->peer_frontiers[0].sender_session_incarnation;
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_DRAIN, 0, session0, &skipped),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_ack_exact(&admission.ref,
+															 PCM_X_TERMINAL_LEG_DRAIN, 0, session0),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_DRAIN, 1, session1, &pending),
+				 PCM_X_QUEUE_OK);
+
+	/* The retry driver scans participants from node zero on every pass.  A
+	 * completed earlier responder must not hide the exact later leg behind
+	 * BUSY, or the later DRAIN can never be resent. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_DRAIN, 0, session0, &skipped),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_DRAIN, 1, session1, &replay),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT(memcmp(&replay, &pending, sizeof(replay)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_ack_exact(&admission.ref,
+															 PCM_X_TERMINAL_LEG_DRAIN, 1, session1),
+				 PCM_X_QUEUE_OK);
+
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_RETIRE, 0, session0, &skipped),
+				 PCM_X_QUEUE_OK);
+	retire_ack = make_retire_ack(&admission.ref, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_master_retire_ack_exact(&retire_ack, 0, session0), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_RETIRE, 1, session1, &pending),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_RETIRE, 0, session0, &skipped),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &admission.ref, PCM_X_TERMINAL_LEG_RETIRE, 1, session1, &replay),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT(memcmp(&replay, &pending, sizeof(replay)) == 0);
 }
 
 UT_TEST(test_terminal_detach_rejects_pending_leg)
@@ -14029,7 +14140,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(244);
+	UT_PLAN(246);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -14137,6 +14248,7 @@ main(void)
 	UT_RUN(test_master_blocker_snapshot_validates_every_owner_field);
 	UT_RUN(test_master_blocker_sets_are_isolated_across_tickets);
 	UT_RUN(test_master_blocker_wire_stage_commits_exact_canonical_set);
+	UT_RUN(test_master_blocker_generation_is_scoped_by_holder_source);
 	UT_RUN(test_master_blocker_crc_ignores_vertex_abi_padding);
 	UT_RUN(test_master_blocker_wire_stage_crc_rejects_content_mismatch);
 	UT_RUN(test_master_blocker_stage_abort_reclaims_mixed_chain_and_fences_aba);
@@ -14175,6 +14287,7 @@ main(void)
 	UT_RUN(test_terminal_outcome_mask_corruption_is_fail_closed);
 	UT_RUN(test_terminal_bitmap_superset_is_fail_closed_before_arm_or_ack_mutation);
 	UT_RUN(test_terminal_detach_missing_retire_ack_is_retryable_not_ready);
+	UT_RUN(test_terminal_retry_skips_drained_responder_while_next_leg_is_armed);
 	UT_RUN(test_terminal_detach_rejects_pending_leg);
 	UT_RUN(test_master_terminal_detach_rejects_hot_link_and_drain_corruption);
 	UT_RUN(test_master_terminal_detach_preserves_same_node_successor);

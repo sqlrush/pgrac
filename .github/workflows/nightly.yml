@@ -247,6 +247,12 @@ jobs:
           # shard the same commit).  Own shard: three ClusterPair bring-ups
           # + the t/403 sustained write phase need the wall clock.
           - { name: stage7-s3-wave, ranges: "401-403", unit: false, regress: false }
+          # t/400 PCM-X convert-queue 4-node liveness (ClusterQuad bring-up)
+          # + t/404 crash-rejoin stale-read/write fence (2-node with a full
+          # crash/restart cycle).  Both were in NO CI matrix (L342: every new
+          # t/ file lands in a shard the same commit).  Own shard: the quad
+          # formation and the rejoin crash cycle dominate the wall clock.
+          - { name: stage7-queue-liveness-rejoin, ranges: "400 404", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

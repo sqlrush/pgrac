@@ -83,6 +83,8 @@ my $node0 = $pair->node0;
 my $node1 = $pair->node1;
 
 $pair->start_pair;
+ok($pair->wait_for_pcm_x_active(30),
+	'L1 PCM-X formation is ACTIVE on both writers before DML');
 
 # ============================================================
 # L1: both nodes validated + claimed their thread directories.

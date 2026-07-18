@@ -16,9 +16,10 @@
  *	      (D0-① WATCH: the ACK direct-sends from worker[shard(tag)]'s
  *	      dispatch process, the re-REQUEST stages back to shard(tag);
  *	      equal shards == one worker stream == order preserved),
- *	    - the DATA-plane registry partition is pinned: REPLY and
- *	      INVALIDATE-ACK are the explicit direct-send whitelist (they
- *	      carry no tag and never reach a ring;  spec-7.3 §3.6), and any
+ *	    - the DATA-plane registry partition is pinned: REPLY is the explicit
+ *	      direct-send whitelist, while INVALIDATE-ACK may be staged for a
+ *	      local master so the DATA worker performs the required self-dispatch;
+ *	      any
  *	      OTHER msg_type is refused (-1) -- the 8.A fail-closed contract
  *	      that an undeclared DATA frame is never defaulted to a worker,
  *	    - the payload-length ABI pin: a size mismatch can never read a
@@ -200,10 +201,9 @@ UT_TEST(test_route_ack_request_interleave_affinity)
 /* ======================================================================
  * U3 -- legacy DATA-plane registry partition pin ("every DATA msg_type has a
  *		 declared shard key or is explicitly direct-send"): REQUEST / FORWARD /
- *		 INVALIDATE / DONE are ring-routable; REPLY and INVALIDATE-ACK are
- *		 the whitelist
- *		 (no tag; direct-sent from the receiving worker's own dispatch,
- *		 so they already ride the correct channel).  A NEW DATA type that
+ *		 INVALIDATE / DONE are ring-routable; INVALIDATE-ACK must also be
+ *		 routable because a local master cannot use the generic IC self-send
+ *		 no-op.  REPLY remains the direct-send whitelist.  A NEW DATA type that
  *		 tries to stage without a key is refused at runtime by this same
  *		 -1 (fail-closed, never defaulted -- 8.A);  this test pins the
  *		 declared partition so a silent re-plumb fails loudly.
@@ -214,10 +214,12 @@ UT_TEST(test_route_registry_partition)
 	GcsBlockRequestPayload req = make_request(tag);
 	GcsBlockForwardPayload fwd = make_forward(tag);
 	GcsBlockInvalidatePayload inv = make_invalidate(tag);
+	GcsBlockInvalidateAckPayload ack = { 0 };
 	GcsBlockDonePayload done = make_done(tag);
 	uint8 raw[64];
 
 	memset(raw, 0, sizeof(raw));
+	ack.tag = tag;
 
 	/* Routable staging types. */
 	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, &req, sizeof(req),
@@ -229,6 +231,9 @@ UT_TEST(test_route_registry_partition)
 	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, &inv, sizeof(inv),
 											  CLUSTER_LMS_MAX_WORKERS)
 			  >= 0);
+	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, &ack,
+											  sizeof(ack), CLUSTER_LMS_MAX_WORKERS)
+			  >= 0);
 	UT_ASSERT(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE, &done, sizeof(done),
 											  CLUSTER_LMS_MAX_WORKERS)
 			  >= 0);
@@ -236,9 +241,6 @@ UT_TEST(test_route_registry_partition)
 	/* Direct-send whitelist: no shard key by design (spec-7.3 §3.6). */
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REPLY, raw, sizeof(raw),
 												 CLUSTER_LMS_MAX_WORKERS),
-				 -1);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, raw,
-												 sizeof(raw), CLUSTER_LMS_MAX_WORKERS),
 				 -1);
 }
 

@@ -11205,7 +11205,7 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 											  char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 											  uint64 *out_page_scn)
 {
-	PGAlignedBlock scratch;
+	PGIOAlignedBlock scratch;
 	BufferTag tag;
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult abort_result;
@@ -11233,11 +11233,34 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	tag = expected_n->tag;
+	/* The dirty-page branch below may pin under the header lock. */
+	ReservePrivateRefCountEntry();
+	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 	buf_state = LockBufHdr(buf);
 	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_n) || (buf_state & BM_VALID) == 0)
 		result = CLUSTER_PCM_OWN_STALE;
-	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR)) != 0)
+	else if ((buf_state & BM_IO_ERROR) != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
+	{
+		/*
+		 * PGRAC: a dirty N page here is legitimate, not corruption evidence:
+		 * relation extension (PageInit + MarkBufferDirty) and recovery redo
+		 * both dirty a page before any PCM grant exists, so the first
+		 * cluster-aware writer meets its own pre-grant dirt.  The N-source
+		 * contract serves STORAGE bytes and overwrites the resident copy, so
+		 * consuming the page now would discard the newer local bytes (a lost
+		 * write).  Push the local bytes out first (FlushBuffer is WAL-first)
+		 * and report BUSY: one flush converges the state and the image pump
+		 * retries against a clean page.
+		 */
+		PinBuffer_Locked(buf);	/* consumes the buffer header lock */
+		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		UnpinBuffer(buf);
+		return CLUSTER_PCM_OWN_BUSY;
+	}
 	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
 		result = CLUSTER_PCM_OWN_BUSY;
 	else {
@@ -11257,7 +11280,9 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
 		if (!PageIsVerifiedExtended((Page)scratch.data, tag.blockNum,
 									PIV_LOG_WARNING | PIV_REPORT_STAT))
+		{
 			result = CLUSTER_PCM_OWN_CORRUPT;
+		}
 
 		if (result == CLUSTER_PCM_OWN_OK) {
 			LWLockAcquire(content_lock, LW_EXCLUSIVE);
@@ -11267,9 +11292,16 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 				|| live.flags != PCM_OWN_FLAG_REVOKING || live.pcm_state != (uint8)PCM_STATE_N
 				|| (buf_state & BM_VALID) == 0)
 				result = CLUSTER_PCM_OWN_STALE;
-			else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR))
-					 != 0)
+			else if ((buf_state & BM_IO_ERROR) != 0)
 				result = CLUSTER_PCM_OWN_CORRUPT;
+			else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
+			{
+				/* PGRAC: REVOKING already blocks data writes, so dirt appearing
+				 * between the flush above and this recheck can only be an
+				 * idempotent hint-bit write.  Retry via BUSY; the next pass
+				 * flushes it and converges. */
+				result = CLUSTER_PCM_OWN_BUSY;
+			}
 			else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
 				result = CLUSTER_PCM_OWN_BUSY;
 			else {
