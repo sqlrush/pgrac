@@ -1211,15 +1211,17 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	if (conditional != NULL) {
 		const char *content
 			= strstr(conditional, "LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf)");
+		const char *ownership = strstr(conditional, "buf->pcm_state != (uint8) PCM_STATE_X");
 		const char *flags = strstr(conditional, "cluster_pcm_own_flags_get(buf->buf_id) != 0");
 		const char *release
 			= strstr(conditional, "LWLockRelease(BufferDescriptorGetContentLock(buf))");
 
 		UT_ASSERT_NOT_NULL(content);
+		UT_ASSERT_NOT_NULL(ownership);
 		UT_ASSERT_NOT_NULL(flags);
 		UT_ASSERT_NOT_NULL(release);
-		if (content != NULL && flags != NULL && release != NULL)
-			UT_ASSERT(content < flags && flags < release);
+		if (content != NULL && ownership != NULL && flags != NULL && release != NULL)
+			UT_ASSERT(content < ownership && ownership < flags && flags < release);
 	}
 	if (resident_stamp != NULL) {
 		const char *content = strstr(
@@ -1408,6 +1410,8 @@ UT_TEST(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock)
 	static const char *const wait_contract[]
 		= { "content_lock == NULL || LWLockHeldByMe(content_lock)",
 			"ereport(ERROR",
+			"cluster_pcm_x_nested_wait_guard_before_block()",
+			"cluster_bufmgr_pcm_x_holder_report_failure(",
 			"cluster_pcm_x_holder_retry_delay_ms(wait_index)",
 			"CHECK_FOR_INTERRUPTS()",
 			"WaitLatch(MyLatch",
