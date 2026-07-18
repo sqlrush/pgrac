@@ -338,7 +338,9 @@ is($self_write_rc, 0, 'L2S sole-S requester completed S-to-X conversion')
 
 my ($self_handoff_after, $self_handoff_drain_after);
 my $self_drain_deadline = time() + 15;
-do
+# NB: a do{}while body is not a loop block in Perl -- "last" inside one is a
+# runtime error that fired exactly when the polled counters advanced.
+while (1)
 {
 	$self_handoff_after = state_int($quad->node0, 'gcs',
 		'pcm_x_self_handoff_count');
@@ -346,8 +348,9 @@ do
 		'pcm_x_self_handoff_drain_count');
 	last if $self_handoff_after > $self_handoff_before
 		&& $self_handoff_drain_after > $self_handoff_drain_before;
+	last if time() >= $self_drain_deadline;
 	usleep(100_000);
-} while (time() < $self_drain_deadline);
+}
 
 cmp_ok($self_handoff_after - $self_handoff_before, '>', 0,
 	'L2S sole-requester S source exercised the fused revoke-to-grant handoff');
