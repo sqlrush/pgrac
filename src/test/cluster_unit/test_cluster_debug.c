@@ -953,6 +953,19 @@ cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *b
 	return false;
 }
 
+bool
+cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	return false;
+}
+
+bool
+cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
+								 uint32 *count_out)
+{
+	return false;
+}
+
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)

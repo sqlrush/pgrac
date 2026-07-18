@@ -1207,7 +1207,26 @@ typedef struct PcmXShmemHeader {
 	 * Readers are diagnostic-only (pg_cluster_state dump) and tolerate an
 	 * in-progress overwrite after such a reactivation. */
 	char fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
+	/* Terminal-kick termination evidence: the arm (PCM_X_TERMINAL_NOTE_*) and
+	 * result that ended the most recent terminal kick on this node, with a
+	 * same-shape repetition count.  Last-writer-wins diagnostics only. */
+	uint32 terminal_note_op;
+	uint32 terminal_note_result;
+	uint32 terminal_note_count;
+	uint32 terminal_note_reserved;
+	uint64 terminal_note_ticket;
 } PcmXShmemHeader;
+
+/* Terminal-kick note arms (diagnostic identifiers, not protocol state). */
+#define PCM_X_TERMINAL_NOTE_NONE 0
+#define PCM_X_TERMINAL_NOTE_DETACH 1
+#define PCM_X_TERMINAL_NOTE_CANCEL_CLEANUP 2
+#define PCM_X_TERMINAL_NOTE_ARM_DRAIN 3
+#define PCM_X_TERMINAL_NOTE_ARM_RETIRE 4
+#define PCM_X_TERMINAL_NOTE_DRAIN_STAGE 5
+#define PCM_X_TERMINAL_NOTE_RETIRE_STAGE 6
+#define PCM_X_TERMINAL_NOTE_RETIRE_LOCAL 7
+#define PCM_X_TERMINAL_NOTE_RETIRE_ACK_RESOLVE 8
 
 StaticAssertDecl(sizeof(PcmXShmemLayout) == 440, "PCM-X shmem layout ABI");
 StaticAssertDecl(sizeof(PcmXAllocatorState) == 32, "PCM-X allocator state ABI");
@@ -1233,7 +1252,7 @@ StaticAssertDecl(offsetof(PcmXShmemHeader, peer_frontiers) == 33664,
 StaticAssertDecl(offsetof(PcmXShmemHeader, stats) == 35200, "PCM-X stats offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35376,
 				 "PCM-X outbound target frontier array offset");
-StaticAssertDecl(sizeof(PcmXShmemHeader) == 36480, "PCM-X shmem header ABI");
+StaticAssertDecl(sizeof(PcmXShmemHeader) == 36504, "PCM-X shmem header ABI");
 
 typedef enum PcmXAttachResult {
 	PCM_X_ATTACH_OK = 0,
@@ -1306,6 +1325,12 @@ extern bool cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out
 												Size buflen);
 extern bool cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf,
 												   Size buflen);
+extern bool cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf,
+											   Size buflen);
+/* Terminal-kick termination note: which arm/result ended the latest kick. */
+extern void cluster_pcm_x_terminal_note(uint32 op, uint32 result, uint64 ticket_id);
+extern bool cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
+											 uint32 *count_out);
 extern PcmXStepResult cluster_pcm_x_master_step(PcmXMasterTicketState current,
 												PcmXMasterEvent event, uint32 guards,
 												PcmXMasterTicketState *next);

@@ -2215,7 +2215,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35376);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36480);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36504);
 }
 
 UT_TEST(test_lwlock_held_limit_is_shared_200)

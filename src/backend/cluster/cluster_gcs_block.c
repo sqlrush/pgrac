@@ -8086,6 +8086,12 @@ static int gcs_block_pcm_x_requester_fail_line = 0;
 		goto requester_done;                                                                       \
 	} while (0)
 
+#define GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED()                                                    \
+	do {                                                                                           \
+		gcs_block_pcm_x_requester_fail_line = __LINE__;                                            \
+		goto requester_fail_closed;                                                                \
+	} while (0)
+
 int
 cluster_gcs_pcm_x_requester_last_fail_line(void)
 {
@@ -8489,7 +8495,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (result == PCM_X_QUEUE_OK)
 			break;
 		if (result == PCM_X_QUEUE_CORRUPT)
-			goto requester_fail_closed;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (!cluster_gcs_pcm_x_nested_guard_retryable(result))
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
@@ -8507,7 +8513,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		result = gcs_block_pcm_x_fetch_own_result(own_result);
 		if (result != PCM_X_QUEUE_OK) {
 			if (result == PCM_X_QUEUE_CORRUPT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 		if (!BufferTagsEqual(&initial_own.tag, &buf->tag) || initial_own.generation == UINT64_MAX) {
@@ -8518,7 +8524,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 			= cluster_pcm_own_classify_live_flags(initial_own.flags, initial_own.reservation_token);
 		result = gcs_block_pcm_x_fetch_own_result(live_result);
 		if (result == PCM_X_QUEUE_CORRUPT)
-			goto requester_fail_closed;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (initial_own.pcm_state == (uint8)PCM_STATE_READ_IMAGE || result == PCM_X_QUEUE_BUSY) {
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
@@ -8557,7 +8563,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		retry_action
 			= cluster_gcs_pcm_x_requester_retry_action(GCS_BLOCK_PCM_X_RETRY_SITE_JOIN, result);
 		if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-			goto requester_fail_closed;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 												  cluster_epoch, master_session)) {
 			result = PCM_X_QUEUE_NOT_READY;
@@ -8582,7 +8588,7 @@ requester_role_dispatch:
 			retry_action = cluster_gcs_pcm_x_requester_retry_action(
 				GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
@@ -8601,7 +8607,7 @@ requester_role_dispatch:
 			retry_action = cluster_gcs_pcm_x_requester_retry_action(
 				GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
@@ -8620,7 +8626,7 @@ requester_role_dispatch:
 			retry_action = cluster_gcs_pcm_x_requester_retry_action(
 				GCS_BLOCK_PCM_X_RETRY_SITE_CUTOFF, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			gcs_block_pcm_x_requester_cleanup_context.cutoff_started = false;
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
@@ -8639,7 +8645,7 @@ requester_role_dispatch:
 					= cluster_lmd_graph_remove_edge_by_waiter_exact_result(&waiter_vertex);
 				if (remove_result == CLUSTER_LMD_GRAPH_REMOVE_STALE) {
 					cluster_lmd_pcm_convert_wfg_note_exact_remove_stale();
-					goto requester_fail_closed;
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 				if (remove_result == CLUSTER_LMD_GRAPH_REMOVE_REMOVED)
 					cluster_lmd_pcm_convert_wfg_note_remove();
@@ -8647,7 +8653,7 @@ requester_role_dispatch:
 																	  follower_graph_generation);
 				cluster_pcm_x_stats_note_queue_result(result);
 				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
-					goto requester_fail_closed;
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				follower_graph_generation = 0;
 				gcs_block_pcm_x_requester_cleanup_context.wfg_live = false;
 				gcs_block_pcm_x_requester_cleanup_context.wfg_generation = 0;
@@ -8667,7 +8673,7 @@ requester_role_dispatch:
 				if (result == PCM_X_QUEUE_OK) {
 					fail_site = "follower-refresh-compare";
 					if (!cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle))
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					handle = fresh_handle;
 					gcs_block_pcm_x_requester_cleanup_context.handle = handle;
 					goto requester_role_dispatch;
@@ -8683,12 +8689,12 @@ requester_role_dispatch:
 					}
 					continue;
 				}
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			}
 			retry_action = cluster_gcs_pcm_x_requester_retry_action(
 				GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 
 			fail_site = "follower-wfg-snapshot";
 			result = cluster_pcm_x_local_follower_wfg_snapshot_exact(&handle, &follower_snapshot);
@@ -8701,7 +8707,7 @@ requester_role_dispatch:
 					&waiter_vertex, &blocker_vertex, 1, handle.identity.request_id);
 				if (follower_graph_generation == 0) {
 					cluster_lmd_pcm_convert_wfg_note_replace_fail();
-					goto requester_fail_closed;
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 				cluster_lmd_pcm_convert_wfg_note_replace();
 				gcs_block_pcm_x_requester_cleanup_context.wfg_live = true;
@@ -8717,7 +8723,7 @@ requester_role_dispatch:
 						= cluster_lmd_graph_remove_edge_by_waiter_exact_result(&waiter_vertex);
 					if (remove_result == CLUSTER_LMD_GRAPH_REMOVE_STALE) {
 						cluster_lmd_pcm_convert_wfg_note_exact_remove_stale();
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					}
 					if (remove_result == CLUSTER_LMD_GRAPH_REMOVE_REMOVED)
 						cluster_lmd_pcm_convert_wfg_note_remove();
@@ -8725,7 +8731,7 @@ requester_role_dispatch:
 					gcs_block_pcm_x_requester_cleanup_context.wfg_live = false;
 					gcs_block_pcm_x_requester_cleanup_context.wfg_generation = 0;
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			} else {
 				retry_action = cluster_gcs_pcm_x_requester_retry_action(
@@ -8742,7 +8748,7 @@ requester_role_dispatch:
 					if (result == PCM_X_QUEUE_OK) {
 						fail_site = "follower-refresh-compare";
 						if (!cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle))
-							goto requester_fail_closed;
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 						handle = fresh_handle;
 						gcs_block_pcm_x_requester_cleanup_context.handle = handle;
 						goto requester_role_dispatch;
@@ -8751,7 +8757,7 @@ requester_role_dispatch:
 						GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH, result);
 				}
 				if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-					goto requester_fail_closed;
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			}
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
@@ -8763,7 +8769,7 @@ requester_role_dispatch:
 		GCS_BLOCK_PCM_X_REQUESTER_DONE();
 	} else {
 		result = PCM_X_QUEUE_CORRUPT;
-		goto requester_fail_closed;
+		GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 	}
 
 	/* Node leader: every iteration reconstructs the exact durable outbound
@@ -8779,12 +8785,12 @@ requester_role_dispatch:
 			retry_action = cluster_gcs_pcm_x_requester_retry_action(
 				GCS_BLOCK_PCM_X_RETRY_SITE_PROGRESS, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			goto requester_wait;
 		}
 		if (progress.role != PCM_X_LOCAL_ROLE_NODE_LEADER || progress.master_node != master_node
 			|| progress.master_session_incarnation != master_session)
-			goto requester_fail_closed;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 
 		if (progress.member_state == PCM_XL_NODE_LEADER) {
 			if ((progress.pending_opcode == 0 && progress.last_response_opcode == 0)
@@ -8803,7 +8809,7 @@ requester_role_dispatch:
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
 						&& retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			} else if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM
 					   || (progress.pending_opcode == 0
@@ -8822,7 +8828,7 @@ requester_role_dispatch:
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
 						&& retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			}
 		} else if (progress.member_state == PCM_XL_REMOTE_WAIT) {
@@ -8835,7 +8841,7 @@ requester_role_dispatch:
 					own_result = cluster_bufmgr_pcm_own_snapshot(buf, &reservation_base);
 					result = gcs_block_pcm_x_fetch_own_result(own_result);
 					if (result != PCM_X_QUEUE_OK)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					self_source = progress.image.source_node == (uint32)cluster_node_id;
 					if (self_source)
 						result = cluster_gcs_pcm_x_adopt_self_image(buf, &handle, &reservation_base,
@@ -8845,14 +8851,14 @@ requester_role_dispatch:
 																				&progress.identity);
 						cluster_pcm_x_stats_note_queue_result(result);
 						if (result != PCM_X_QUEUE_OK)
-							goto requester_fail_closed;
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 						own_result = cluster_bufmgr_pcm_own_begin_x_reservation(
 							buf, &reservation_base, &reservation_token);
 						result = gcs_block_pcm_x_fetch_own_result(own_result);
 					}
 					cluster_pcm_x_stats_note_queue_result(result);
 					if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					reservation_started = true;
 					gcs_block_pcm_x_requester_cleanup_context.reservation_started = true;
 				}
@@ -8869,7 +8875,7 @@ requester_role_dispatch:
 						retry_action = cluster_gcs_pcm_x_requester_retry_action(
 							GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH, result);
 						if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
-							goto requester_fail_closed;
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					}
 				}
 				if (image_installed) {
@@ -8886,7 +8892,7 @@ requester_role_dispatch:
 							GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 						if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
 							&& retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
-							goto requester_fail_closed;
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					}
 				}
 			}
@@ -8908,7 +8914,7 @@ requester_role_dispatch:
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
 						&& retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			} else if (progress.pending_opcode == 0
 					   && progress.last_response_opcode == PGRAC_IC_MSG_PCM_X_COMMIT_X) {
@@ -8927,7 +8933,7 @@ requester_role_dispatch:
 					}
 					cluster_pcm_x_stats_note_queue_result(result);
 					if (result != PCM_X_QUEUE_OK)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					ownership_committed = true;
 					gcs_block_pcm_x_requester_cleanup_context.ownership_committed = true;
 				}
@@ -8939,7 +8945,7 @@ requester_role_dispatch:
 					staged = cluster_gcs_pcm_x_stage_frame(
 						PGRAC_IC_MSG_PCM_X_FINAL_ACK, master_node, &final_ack, sizeof(final_ack));
 				else
-					goto requester_fail_closed;
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			} else if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
 				PcmXFinalAckPayload final_ack;
 				PcmXLocalReliableToken token;
@@ -8955,7 +8961,7 @@ requester_role_dispatch:
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
-						goto requester_fail_closed;
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			}
 		} else if (progress.member_state == PCM_XL_GRANTED) {
@@ -8976,9 +8982,9 @@ requester_role_dispatch:
 				result = PCM_X_QUEUE_OK;
 				break;
 			} else
-				goto requester_fail_closed;
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		} else
-			goto requester_fail_closed;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 
 	requester_wait:
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
@@ -11951,6 +11957,8 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 	if (ref->grant_generation == 0) {
 		result = gcs_block_pcm_x_cancel_terminal_cleanup_exact(ref);
 		cluster_pcm_x_stats_note_queue_result(result);
+		cluster_pcm_x_terminal_note(PCM_X_TERMINAL_NOTE_CANCEL_CLEANUP, (uint32)result,
+									ref->handle.ticket_id);
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
 			gcs_block_pcm_x_master_drive_fail_closed(result);
 			return;
@@ -11988,6 +11996,8 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 		/* All ACKs may already be present.  Detach first; global ticket order is
 		 * enforced inside the engine and the periodic oldest-ticket scan retries. */
 		result = cluster_pcm_x_master_detach_terminal_exact(ref);
+		cluster_pcm_x_terminal_note(PCM_X_TERMINAL_NOTE_DETACH, (uint32)result,
+									ref->handle.ticket_id);
 		if (result == PCM_X_QUEUE_OK) {
 			gcs_block_pcm_x_master_drive_tag(&ref->identity.tag, ref->identity.cluster_epoch);
 			return;
@@ -12038,8 +12048,13 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 					ref, (PcmXTerminalLegKind)kind, node, responder_session, &token);
 				if (result == PCM_X_QUEUE_STALE || result == PCM_X_QUEUE_NOT_READY)
 					continue;
-				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
+				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
+					cluster_pcm_x_terminal_note(kind == PCM_X_TERMINAL_LEG_DRAIN
+													? PCM_X_TERMINAL_NOTE_ARM_DRAIN
+													: PCM_X_TERMINAL_NOTE_ARM_RETIRE,
+												(uint32)result, ref->handle.ticket_id);
 					return;
+				}
 				if (kind == PCM_X_TERMINAL_LEG_DRAIN) {
 					memset(&poll, 0, sizeof(poll));
 					poll.ref = *ref;
@@ -12047,8 +12062,13 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 					/* Even self DRAIN is application traffic.  Dispatch it through
 					 * the tag shard so holder-byte release and terminal publication
 					 * remain one single-consumer action. */
-					(void)cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_DRAIN_POLL, node, &poll,
-														sizeof(poll));
+					cluster_pcm_x_terminal_note(
+						PCM_X_TERMINAL_NOTE_DRAIN_STAGE,
+						cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_DRAIN_POLL, node, &poll,
+													  sizeof(poll))
+							? (uint32)PCM_X_QUEUE_OK
+							: (uint32)PCM_X_QUEUE_NOT_READY,
+						ref->handle.ticket_id);
 					return;
 				} else {
 					runtime = cluster_pcm_x_runtime_snapshot();
@@ -12058,15 +12078,24 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 					retire.retire_through_ticket_id = ref->handle.ticket_id;
 					retire.sender_node = node;
 					if (node != cluster_node_id) {
-						(void)gcs_block_pcm_x_stage_retire_up_to(node, &retire, &ref->identity.tag);
+						cluster_pcm_x_terminal_note(
+							PCM_X_TERMINAL_NOTE_RETIRE_STAGE,
+							gcs_block_pcm_x_stage_retire_up_to(node, &retire, &ref->identity.tag)
+								? (uint32)PCM_X_QUEUE_OK
+								: (uint32)PCM_X_QUEUE_NOT_READY,
+							ref->handle.ticket_id);
 						return;
 					}
 					result = gcs_block_pcm_x_local_retire_apply_and_wake(&retire, cluster_node_id,
 																		 responder_session);
+					cluster_pcm_x_terminal_note(PCM_X_TERMINAL_NOTE_RETIRE_LOCAL, (uint32)result,
+												ref->handle.ticket_id);
 					if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
 						return;
 					result = cluster_pcm_x_master_retire_ack_resolve_exact(
 						&retire, cluster_node_id, responder_session, &resolved);
+					cluster_pcm_x_terminal_note(PCM_X_TERMINAL_NOTE_RETIRE_ACK_RESOLVE,
+												(uint32)result, ref->handle.ticket_id);
 				}
 				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
 					return;

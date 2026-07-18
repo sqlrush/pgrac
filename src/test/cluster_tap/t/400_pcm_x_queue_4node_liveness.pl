@@ -468,7 +468,8 @@ for my $i (0 .. 3)
 					q{SELECT string_agg(key || '=[' || value || ']', ' ' ORDER BY key)
 					  FROM pg_cluster_state
 					  WHERE category = 'pcm'
-						AND (key LIKE 'pcm_x_tag_%' OR key LIKE 'pcm_x_ticket_%')},
+						AND (key LIKE 'pcm_x_tag_%' OR key LIKE 'pcm_x_ticket_%'
+							OR key LIKE 'pcm_x_ltag_%' OR key = 'pcm_x_terminal_last_note')},
 					timeout => 10);
 			} // 'probe-failed';
 			$slots =~ s/\n/ | /g;

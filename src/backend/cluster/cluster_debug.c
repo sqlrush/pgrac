@@ -2017,7 +2017,7 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		{
 			Size cursor = 0;
 			Size index = 0;
-			char line[256];
+			char line[384];
 			char key[64];
 
 			while (cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line))) {
@@ -2028,6 +2028,25 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			while (cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line))) {
 				snprintf(key, sizeof(key), "pcm_x_ticket_%zu", index);
 				emit_row(rsinfo, "pcm", key, line);
+			}
+			cursor = 0;
+			while (cluster_pcm_x_local_tag_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_ltag_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+			{
+				uint32 note_op = 0;
+				uint32 note_result = 0;
+				uint32 note_count = 0;
+				uint64 note_ticket = 0;
+
+				if (cluster_pcm_x_terminal_note_read(&note_op, &note_result, &note_ticket,
+													 &note_count)) {
+					snprintf(line, sizeof(line),
+							 "op=%u result=%u ticket=" UINT64_FORMAT " count=%u", note_op,
+							 note_result, note_ticket, note_count);
+					emit_row(rsinfo, "pcm", "pcm_x_terminal_last_note", line);
+				}
 			}
 		}
 		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));

@@ -564,6 +564,8 @@ typedef enum PcmXDirectoryMatch {
 static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line);
 static PcmXSlotHeader *pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref,
 										 const BufferTag *expected_tag, uint32 allowed_state_mask);
+static void pcm_x_local_gate_acquire_guarded(LWLock *lock, LWLockMode mode,
+											 PcmXLocalTagSlot *tag_slot);
 
 /* Capture each internal fail-closed arm (file:line) while keeping the many
  * zero-argument call sites in this file textually unchanged. */
@@ -1237,6 +1239,105 @@ cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *b
 	}
 	*cursor_io = view.capacity;
 	return false;
+}
+
+
+/* Diagnostic iterator over live local tag slots; partition-lock coherent copy
+ * like the master iterators, but under the local lock partition. */
+bool
+cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXLocalTagSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXLocalTagSlot *raw = (PcmXLocalTagSlot *)pcm_x_allocator_slot(&view, i);
+		PcmXLocalTagSlot *locked;
+		PcmXSlotRef tag_ref;
+		BufferTag tag;
+		uint32 partition;
+
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
+			continue;
+		tag_ref.slot_index = i;
+		tag = raw->tag;
+		pg_read_barrier();
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		pcm_x_local_gate_acquire_guarded(&header->local_locks[partition].lock, LW_SHARED, NULL);
+		locked = (PcmXLocalTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_LOCAL_TAG, tag_ref, &tag,
+													   PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (locked == NULL) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->local_locks[partition].lock);
+		snprintf(buf, buflen,
+				 "rel=%u blk=%u flags=0x%x round=%u master=%d ref_node=%d ref_ticket=" UINT64_FORMAT
+				 " ref_grant=" UINT64_FORMAT " holder_ticket=" UINT64_FORMAT
+				 " blocker_ticket=" UINT64_FORMAT " drain_gen=" UINT64_FORMAT
+				 " holder_drain_gen=" UINT64_FORMAT
+				 " members=%zu head=%ld leader=%ld active_writer=%ld",
+				 copy.tag.relNumber, copy.tag.blockNum, pcm_x_slot_flags_read(&copy.slot),
+				 copy.local_round, copy.master_node, copy.ref.identity.node_id,
+				 copy.ref.handle.ticket_id, copy.ref.grant_generation,
+				 copy.holder_ref.handle.ticket_id, copy.blocker_snapshot_ref.handle.ticket_id,
+				 copy.terminal_drain_generation, copy.holder_terminal_drain_generation,
+				 copy.membership_count, pcm_x_debug_index(copy.head_index),
+				 pcm_x_debug_index(copy.leader_index), pcm_x_debug_index(copy.active_writer_index));
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
+void
+cluster_pcm_x_terminal_note(uint32 op, uint32 result, uint64 ticket_id)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL)
+		return;
+	if (header->terminal_note_op == op && header->terminal_note_result == result
+		&& header->terminal_note_ticket == ticket_id)
+		header->terminal_note_count++;
+	else {
+		header->terminal_note_op = op;
+		header->terminal_note_result = result;
+		header->terminal_note_ticket = ticket_id;
+		header->terminal_note_count = 1;
+	}
+}
+
+
+bool
+cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
+								 uint32 *count_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL || header->terminal_note_count == 0)
+		return false;
+	if (op_out != NULL)
+		*op_out = header->terminal_note_op;
+	if (result_out != NULL)
+		*result_out = header->terminal_note_result;
+	if (ticket_out != NULL)
+		*ticket_out = header->terminal_note_ticket;
+	if (count_out != NULL)
+		*count_out = header->terminal_note_count;
+	return true;
 }
 
 
