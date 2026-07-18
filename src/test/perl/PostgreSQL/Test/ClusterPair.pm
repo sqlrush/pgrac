@@ -458,4 +458,41 @@ sub wait_for_peer_state
 }
 
 
+#-----------------------------------------------------------------------
+# wait_for_pcm_x_active($self, $timeout_s)
+#
+#	PCM-X formation follows DATA-channel HELLO asynchronously.  Tests which
+#	write through a live pair must wait for BOTH runtimes to publish ACTIVE;
+#	CONNECTED alone is not an application-protocol readiness proof.
+#-----------------------------------------------------------------------
+sub wait_for_pcm_x_active
+{
+	my ($self, $timeout_s) = @_;
+	$timeout_s //= 30;
+	my $deadline = time + $timeout_s;
+	my @last = ('(never-queried)', '(never-queried)');
+
+	while (time < $deadline)
+	{
+		my $all_active = 1;
+		for my $i (0, 1)
+		{
+			my $node = $i == 0 ? $self->{node0} : $self->{node1};
+			my $state = $node->safe_psql('postgres',
+				q{SELECT value FROM pg_cluster_state }
+				  . q{WHERE category='pcm' AND key='pcm_x_runtime_state'});
+			$last[$i] = defined $state && $state ne '' ? $state : '(null)';
+			$all_active = 0 unless $last[$i] eq '1';
+		}
+		return 1 if $all_active;
+		select(undef, undef, undef, 0.10);
+	}
+
+	Test::More::diag(
+		"wait_for_pcm_x_active TIMEOUT after ${timeout_s}s: "
+		  . "node0=$last[0] node1=$last[1]");
+	return 0;
+}
+
+
 1;

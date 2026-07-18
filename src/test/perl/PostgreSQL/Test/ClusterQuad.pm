@@ -90,7 +90,8 @@ sub _relocate_backup_pg_wal
 #	  wal_threads_root    : 1  -> shared per-thread WAL root
 #	  shared_data         : 1  -> shared data root (cluster_fs backend)
 #	  shared_catalog      : 1  -> t/337-style shared-catalog formation;
-#	                        implies shared_data + wal_threads_root
+#	                        implies shared_data + wal_threads_root and enables
+#	                        the required online-join/XID-striping substrate
 #-----------------------------------------------------------------------
 sub new_quad
 {
@@ -261,6 +262,10 @@ EOC
 					"cluster.shared_catalog = on\n");
 				$node->append_conf('postgresql.conf',
 					"cluster.merged_recovery = on\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.online_join = on\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.xid_striping = on\n");
 			}
 		}
 
