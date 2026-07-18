@@ -7343,6 +7343,33 @@ UT_TEST(test_runtime_fail_closed_records_winning_site_only)
 	UT_ASSERT(strcmp(site, first) == 0);
 }
 
+UT_TEST(test_master_debug_iterators_report_live_slots)
+{
+	PcmXMasterAdmission admission;
+	PcmXEnqueuePayload request;
+	Size cursor = 0;
+	Size index = 0;
+	char line[256];
+
+	init_active_pcm_x(UINT64_C(77));
+	/* Nothing admitted yet: both iterators must report no occupied slots. */
+	UT_ASSERT(!cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line)));
+	cursor = 0;
+	UT_ASSERT(!cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line)));
+	request = make_enqueue(make_wait_identity(716, 0, 25, UINT64_C(21001)), UINT64_C(2201),
+						   UINT64_C(1));
+	bind_enqueue_peer(&request);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &admission), PCM_X_QUEUE_OK);
+	cursor = 0;
+	UT_ASSERT(cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line)));
+	UT_ASSERT(strstr(line, "queued=") != NULL);
+	UT_ASSERT(!cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line)));
+	cursor = 0;
+	UT_ASSERT(cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line)));
+	UT_ASSERT(strstr(line, "state=") != NULL);
+	UT_ASSERT(strstr(line, "leg_op=") != NULL);
+}
+
 UT_TEST(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage)
 {
 	PcmXShmemHeader *header;
@@ -14299,6 +14326,7 @@ main(void)
 	UT_RUN(test_recovery_blocked_runtime_cannot_promote_or_begin_transfer);
 	UT_RUN(test_recovery_blocked_runtime_refuses_ack_and_local_mutators);
 	UT_RUN(test_runtime_fail_closed_records_winning_site_only);
+	UT_RUN(test_master_debug_iterators_report_live_slots);
 	UT_RUN(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage);
 	UT_RUN(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot);
 	UT_RUN(test_master_prehandle_identity_alias_is_corruption_not_stale_cancel);

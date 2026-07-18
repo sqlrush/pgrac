@@ -1300,6 +1300,12 @@ extern void cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site
 #define cluster_pcm_x_runtime_fail_closed() cluster_pcm_x_runtime_fail_closed_at(__FILE__, __LINE__)
 /* Copies the recorded fail-closed site into buf; false when never fused. */
 extern bool cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen);
+/* Diagnostic iterators over live master tag / occupied ticket slots for the
+ * pg_cluster_state dump; racy-tolerant, never used for protocol decisions. */
+extern bool cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf,
+												Size buflen);
+extern bool cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf,
+												   Size buflen);
 extern PcmXStepResult cluster_pcm_x_master_step(PcmXMasterTicketState current,
 												PcmXMasterEvent event, uint32 guards,
 												PcmXMasterTicketState *next);

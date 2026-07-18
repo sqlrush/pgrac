@@ -2010,6 +2010,26 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		if (!cluster_pcm_x_runtime_fail_closed_site(fail_closed_site, sizeof(fail_closed_site)))
 			strlcpy(fail_closed_site, "(none)", sizeof(fail_closed_site));
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", fail_closed_site);
+
+		/* Text-valued per-slot diagnostic rows; present only while master tag
+		 * or ticket slots are occupied, so the quiescent key count above is
+		 * unchanged. */
+		{
+			Size cursor = 0;
+			Size index = 0;
+			char line[256];
+			char key[64];
+
+			while (cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_tag_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+			cursor = 0;
+			while (cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_ticket_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+		}
 		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", fmt_int64((int64)stats.admit_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", fmt_int64((int64)stats.confirm_count));

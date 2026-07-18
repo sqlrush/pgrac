@@ -1107,6 +1107,112 @@ cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
 }
 
 
+/* Map an FIFO index to a printable value: PCM_X_INVALID_SLOT_INDEX -> -1. */
+static long
+pcm_x_debug_index(Size index)
+{
+	return index == PCM_X_INVALID_SLOT_INDEX ? -1L : (long)index;
+}
+
+
+/* Diagnostic iterator over live master tag slots.  Lock-free and
+ * racy-tolerant: each slot is copied under a generation double-read and
+ * formatted only from the stable local copy; slots that mutate mid-copy are
+ * skipped.  Diagnostic surface only — never used for protocol decisions. */
+bool
+cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXMasterTagSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TAG, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXMasterTagSlot *raw = (PcmXMasterTagSlot *)pcm_x_allocator_slot(&view, i);
+		uint64 gen_before;
+		uint64 gen_after;
+
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &gen_before))
+			continue;
+		memcpy(&copy, raw, sizeof(copy));
+		pg_read_barrier();
+		if (!pcm_x_slot_generation_read(&raw->slot, &gen_after) || gen_after != gen_before
+			|| pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE)
+			continue;
+		snprintf(buf, buflen,
+				 "rel=%u blk=%u head=%ld tail=%ld active=%ld queued=0x%x qseq=" UINT64_FORMAT
+				 " outstanding=%zu",
+				 copy.tag.relNumber, copy.tag.blockNum, pcm_x_debug_index(copy.head_index),
+				 pcm_x_debug_index(copy.tail_index), pcm_x_debug_index(copy.active_index),
+				 pg_atomic_read_u32(&copy.queued_node_bitmap), copy.queue_state_sequence,
+				 copy.outstanding_ticket_count);
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
+/* Diagnostic iterator over occupied master ticket slots; same racy-tolerant
+ * contract as the tag iterator. */
+bool
+cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXMasterTicketSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXMasterTicketSlot *raw = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(&view, i);
+		uint64 gen_before;
+		uint64 gen_after;
+		uint32 state;
+
+		if (raw == NULL)
+			continue;
+		state = pcm_x_slot_state_read(&raw->slot);
+		if (state == PCM_XT_FREE || state == PCM_XT_RESERVED_NONVISIBLE)
+			continue;
+		if (!pcm_x_slot_generation_read(&raw->slot, &gen_before))
+			continue;
+		memcpy(&copy, raw, sizeof(copy));
+		pg_read_barrier();
+		if (!pcm_x_slot_generation_read(&raw->slot, &gen_after) || gen_after != gen_before)
+			continue;
+		snprintf(buf, buflen,
+				 "state=%u flags=0x%x node=%d ticket=" UINT64_FORMAT " grant=" UINT64_FORMAT
+				 " tomb=0x%llx involved=0x%x drained=0x%x retire_acked=0x%x pending_s=0x%x"
+				 " acked_s=0x%x leg_op=%u leg_phase=%u leg_flags=0x%x leg_retry=%u leg_node=%d"
+				 " leg_deadline=" UINT64_FORMAT,
+				 pcm_x_slot_state_read(&copy.slot), pcm_x_slot_flags_read(&copy.slot),
+				 copy.ref.identity.node_id, copy.ref.handle.ticket_id, copy.ref.grant_generation,
+				 (unsigned long long)copy.reliable.response_tombstone_mask,
+				 copy.involved_nodes_bitmap, copy.drained_nodes_bitmap,
+				 copy.retire_acked_nodes_bitmap, copy.pending_s_holders_bitmap,
+				 copy.acked_s_holders_bitmap, copy.reliable.pending_opcode, copy.reliable.phase,
+				 copy.reliable.flags, copy.reliable.retry_count,
+				 copy.reliable.expected_responder_node, copy.reliable.retry_deadline_ms);
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
 /* Reserve one slot under the sole allocator authority. */
 PcmXAllocatorResult
 cluster_pcm_x_allocator_reserve(PcmXAllocatorKind kind, PcmXSlotRef *ref_out,

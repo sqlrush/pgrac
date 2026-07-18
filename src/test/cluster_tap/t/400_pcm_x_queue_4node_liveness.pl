@@ -463,6 +463,15 @@ for my $i (0 .. 3)
 					  FROM pg_cluster_ic_peers},
 					timeout => 10);
 			} // 'probe-failed';
+			my $slots = eval {
+				$quad->node($i)->safe_psql('postgres',
+					q{SELECT string_agg(key || '=[' || value || ']', ' ' ORDER BY key)
+					  FROM pg_cluster_state
+					  WHERE category = 'pcm'
+						AND (key LIKE 'pcm_x_tag_%' OR key LIKE 'pcm_x_ticket_%')},
+					timeout => 10);
+			} // 'probe-failed';
+			$slots =~ s/\n/ | /g;
 			$samples[$offset][$i] = eval {
 				state_snapshot($quad->node($i), 'pcm', \@pcm_x_pcm_keys);
 			};
@@ -470,6 +479,7 @@ for my $i (0 .. 3)
 				. ($samples[$offset][$i] ? '' : ' snapshot-failed'));
 			diag("L3 mid-leg t+$offset node$i aux=[$aux]");
 			diag("L3 mid-leg t+$offset node$i wire=[$wire]");
+			diag("L3 mid-leg t+$offset node$i slots=[$slots]");
 		}
 	}
 
