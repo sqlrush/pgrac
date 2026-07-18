@@ -116,13 +116,14 @@ ClusterLmdWaitStateReadResult
 cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws, ClusterLmdWaitStateSnapshot *out)
 {
 	ClusterLmdWaitStateSnapshot snapshot;
-	uint32 before;
-	uint32 after;
 	int retry;
 
 	memset(out, 0, sizeof(*out));
 
 	for (retry = 0; retry < CLUSTER_LMD_WAIT_STATE_READ_RETRIES; retry++) {
+		uint32 before;
+		uint32 after;
+
 		before = pg_atomic_read_u32(&ws->change_seq);
 		if ((before & 1U) != 0)
 			continue;

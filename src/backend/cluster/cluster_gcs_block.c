@@ -8378,6 +8378,10 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		|| MyProc->pgprocno < 0 || MyBackendId <= 0 || cluster_node_id < 0
 		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return PCM_X_QUEUE_INVALID;
+	memset(&handle, 0, sizeof(handle));
+	handle.tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
+	handle.membership_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
+	memset(&progress, 0, sizeof(progress));
 	for (;;) {
 		GcsBlockPcmXFormationAction formation_action;
 
@@ -8476,9 +8480,6 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		}
 		break;
 	}
-	memset(&handle, 0, sizeof(handle));
-	handle.tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
-	handle.membership_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
 	for (;;) {
 		PcmXWaitIdentity identity;
 
@@ -10398,6 +10399,10 @@ gcs_block_pcm_x_probe_collect_and_stage(const PcmXPhasePayload *probe, int32 mas
 	if (result != PCM_X_QUEUE_OK)
 		goto probe_done;
 	if (holder_snapshot.holder_count != 0) {
+		if (holders == NULL) {
+			result = PCM_X_QUEUE_CORRUPT;
+			goto probe_done;
+		}
 		if (ProcGlobal == NULL) {
 			result = PCM_X_QUEUE_NOT_READY;
 			goto probe_done;
