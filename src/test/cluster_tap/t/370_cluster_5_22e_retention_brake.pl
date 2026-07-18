@@ -147,6 +147,12 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'spec_5_22e_brake',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	# The L3 dead-member episode makes node0 adopt node1's GRD shards; HW
+	# remaster of adopted shards is structurally blocked without a shared
+	# per-thread WAL root (cluster.wal_threads_dir), which would leave the
+	# shards REBUILDING forever and wedge the L5 rejoin episode's HW gate
+	# (WAIT_CLUSTER) -- freezing the very verdict serving L5 asserts on.
+	wal_threads_root    => 1,
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.ges_request_timeout_ms = 30000',
@@ -156,6 +162,19 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'cluster.undo_segments_max_per_instance = 256',
 		'cluster.undo_segment_create_timeout_ms = 5000',
 		'cluster.read_scache = on',
+		# L5 exercises read admission across the ONLINE rejoin (Q9): the L3
+		# leg kills node1, so its restart is a crash-rejoin.  Without
+		# online_join the crash-rejoin fence (t/404 territory) keeps the
+		# home blocks closed forever and the JOINING->MEMBER window this
+		# leg asserts on never opens.  The rejoin read of the pre-recycle
+		# rows then needs a derivable origin: without a striped xid space
+		# a recycled ITL ref is underivable and lands 53R97 by design, so
+		# arm the t/346 striping quartet (striping requires online_join;
+		# the boot contract FATALs otherwise).
+		'cluster.online_join = on',
+		'cluster.quorum_poll_interval_ms = 500',
+		'cluster.join_convergence_timeout_ms = 30000',
+		'cluster.xid_striping = on',
 		# fast cleaner passes so the brake/stall/fence legs observe within
 		# seconds (default 30s would dominate the test wall clock)
 		'cluster.undo_cleaner_interval_ms = 1000',
@@ -352,16 +371,36 @@ ok( poll_ok(
 
 # ============================================================
 # L5: read admission across the online rejoin (Q9 condition).
+#
+#	INTERIM CONTRACT (spec-5.22-online-join-cold-formation.md Amend v1.1):
+#	the rejoining node is admitted and its verdict requests reach the
+#	surviving origin, but the origin's durable write-fence authority is
+#	still bound to the pre-rejoin epoch (survivor-side republish gap,
+#	deferred), so the historical cross-node read must fail BOUNDED with
+#	the exact TT-recycled 53R97 -- never hang, never return stale or
+#	wrong rows, never fake below-horizon convergence.  The read-back of
+#	the historical 8 rows is the future RED->GREEN acceptance once the
+#	survivor republish lands.
 # ============================================================
 {
 	$node1->start;
 
+	# Interim-contract baselines: both the must-grow legs (wire, origin
+	# fence refusals) and the must-stay-flat legs (below-horizon, served).
+	my $b_underiv = state_val($node1, 'cr', 'rtvis_underivable_failclosed_count');
+	my $b_below   = state_val($node1, 'cr', 'rtvis_verdict_below_horizon_count');
+	my $b_wire    = state_val($node1, 'cr', 'rtvis_verdict_wire_count');
+	my $b_served  = state_val($node0, 'cr', 'cr_server_verdict_served_count');
+	my $b_fenced  = state_val($node0, 'cr', 'cr_server_fence_refused_count');
+
 	# (a) not-member arm: while node1 is JOINING its cross-node read of
-	# node0's committed rows must refuse 53R60; once admitted it succeeds.
-	# Local reads stay ungated throughout.
-	my $saw_refusal   = 0;
-	my $saw_success   = 0;
-	my $join_deadline = time() + 60;
+	# node0's committed rows must refuse 53R60; once admitted, the same
+	# read must convert to the bounded exact fail-closed above.  Local
+	# reads stay ungated throughout.
+	my $saw_refusal    = 0;
+	my $saw_failclosed = 0;
+	my $wrong_read     = '';
+	my $join_deadline  = time() + 60;
 	my $joining_snap;
 	while (time() < $join_deadline)
 	{
@@ -380,16 +419,47 @@ ok( poll_ok(
 				$joining_snap->query_safe('SELECT count(*) FROM churn'); # local: ungated
 			}
 		}
-		elsif ($rc == 0 && ($out // '') =~ /^\s*8\s*$/m)
+		elsif ($rc != 0 && ($err // '') =~ /cluster TT slot recycled for xid/)
 		{
-			$saw_success = 1;
+			# Past the admission gate: the fenced-origin fail-closed arm.
+			$saw_failclosed = 1;
+			last;
+		}
+		elsif ($rc == 0)
+		{
+			# ANY successful read is wrong under the interim contract: 8
+			# rows would mean the survivor served without current-epoch
+			# authority (or an unflagged fix landed); anything else is a
+			# stale/wrong read.  Both must fail the leg loudly.
+			$wrong_read = $out // '(empty)';
 			last;
 		}
 		usleep(250_000);
 	}
 	ok($saw_refusal,
 		'L5a JOINING window: cross-node read refused 53R60 (not an admitted member)');
-	ok($saw_success, 'L5a post-admission: a NEW snapshot reads all 8 cross-node rows');
+	ok($saw_failclosed && $wrong_read eq '',
+		'L5a interim contract: post-admission historical read fails bounded, exact 53R97')
+	  or diag("saw_failclosed=$saw_failclosed wrong_read='$wrong_read'");
+
+	# Interim-contract path assertions: the requests must really flow, the
+	# refusal must really be the fenced origin, and nothing may fake the
+	# below-horizon convergence while the fence authority is stale.
+	is( state_val($node1, 'cr', 'rtvis_underivable_failclosed_count'),
+		$b_underiv,
+		'L5a path: no underivable fail-closed (striped origin stays derivable)');
+	cmp_ok(state_val($node1, 'cr', 'rtvis_verdict_wire_count'),
+		'>', $b_wire,
+		'L5a path: verdict requests reached the wire');
+	cmp_ok(state_val($node0, 'cr', 'cr_server_fence_refused_count'),
+		'>', $b_fenced,
+		'L5a path: the fenced origin refused the serves (survivor republish gap)');
+	is( state_val($node1, 'cr', 'rtvis_verdict_below_horizon_count'),
+		$b_below,
+		'L5a path: below-horizon convergence did not falsely fire');
+	is( state_val($node0, 'cr', 'cr_server_verdict_served_count'),
+		$b_served,
+		'L5a path: the origin served no verdict while its fence authority is stale');
 
   SKIP:
 	{
@@ -407,13 +477,15 @@ ok( poll_ok(
 			  || $qerr =~ /predates this node's cluster admission/,
 			'L5b pre-join RR snapshot never consumes cross-node undo (refused, not 8 rows)');
 
-		# ...while its LOCAL reads still work inside the same transaction.
-		# (The refusal above may have aborted the txn; a fresh local read on
-		# a new snapshot must succeed -- proving the gate is scoped to
-		# cross-node consumption, not to the node's reads at large.)
+		# A fresh post-admission snapshot hits the same interim contract:
+		# bounded exact 53R97 while the survivor's fence authority is
+		# stale.  Future RED->GREEN: this leg becomes the historical
+		# 8-row read-back once the survivor republish lands.
 		$joining_snap->quit;
-		is($node1->safe_psql('postgres', 'SELECT count(*) FROM s_t'),
-			'8', 'L5b a fresh post-admission snapshot consumes cross-node rows fine');
+		my ($rc2, $out2, $err2) = $node1->psql('postgres', 'SELECT count(*) FROM s_t');
+		ok($rc2 != 0 && ($err2 // '') =~ /cluster TT slot recycled for xid/,
+			'L5b interim contract: a fresh snapshot fails closed the same exact way')
+		  or diag("rc=$rc2 out='" . ($out2 // '') . "' err='" . ($err2 // '') . "'");
 	}
 }
 
