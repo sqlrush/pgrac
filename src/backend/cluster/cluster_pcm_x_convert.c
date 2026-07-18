@@ -562,6 +562,8 @@ typedef enum PcmXDirectoryMatch {
 
 
 static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line);
+static PcmXSlotHeader *pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref,
+										 const BufferTag *expected_tag, uint32 allowed_state_mask);
 
 /* Capture each internal fail-closed arm (file:line) while keeping the many
  * zero-argument call sites in this file textually unchanged. */
