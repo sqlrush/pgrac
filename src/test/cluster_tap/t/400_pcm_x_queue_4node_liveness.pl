@@ -422,6 +422,41 @@ for my $i (0 .. 3)
 	push @runs, \%run;
 }
 
+# Mid-leg probe: while the four writers are (potentially) stalled, capture
+# each node's writer wait state and the live queue gauges.  A post-mortem
+# probe cannot see this — a wedged writer holds no cluster state after
+# kill_kill.  Diagnostic only; every query is bounded and failure-tolerant.
+{
+	my $probe_at = $quad->node0->safe_psql('postgres',
+		"SELECT GREATEST(0.0, EXTRACT(EPOCH FROM "
+		. "(TIMESTAMPTZ '$start_at' + interval '8 seconds' - clock_timestamp())))");
+	sleep($probe_at) if $probe_at > 0;
+	for my $i (0 .. 3)
+	{
+		my $waits = eval {
+			$quad->node($i)->safe_psql('postgres',
+				q{SELECT pid || ':' || state || ':' || coalesce(wait_event_type, '-')
+					|| '/' || coalesce(wait_event, '-')
+				  FROM pg_stat_activity
+				  WHERE query LIKE 'UPDATE pcm_xq_hot%'},
+				timeout => 10);
+		} // 'probe-failed';
+		$waits =~ s/\n/ | /g;
+		my $gauges = eval {
+			$quad->node($i)->safe_psql('postgres',
+				q{SELECT string_agg(key || '=' || value, ' ' ORDER BY key)
+				  FROM pg_cluster_state
+				  WHERE category = 'pcm'
+					AND key IN ('pcm_x_runtime_state', 'pcm_x_queue_depth',
+						'pcm_x_queue_live_tickets', 'pcm_x_queue_active_tags',
+						'pcm_x_queue_promotion_count', 'pcm_x_queue_stale_count',
+						'pcm_x_queue_recovery_blocked_count')},
+				timeout => 10);
+		} // 'probe-failed';
+		diag("L3 mid-leg node$i waits=[$waits] gauges=[$gauges]");
+	}
+}
+
 for my $i (0 .. 3)
 {
 	my $run = $runs[$i];
