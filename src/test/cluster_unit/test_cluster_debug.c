@@ -933,6 +933,14 @@ cluster_pcm_x_runtime_snapshot(void)
 	return snapshot;
 }
 
+bool
+cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
+{
+	if (buf != NULL && buflen > 0)
+		buf[0] = '\0';
+	return false;
+}
+
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)

@@ -466,6 +466,25 @@ diag('L3 path probes: pcm_x_queue_enqueue_delta='
 	. ($denied_after - $denied_before)
 	. ' passive_s_release_delta='
 	. ($passive_s_after - $passive_s_before));
+
+# Per-node runtime probe: the aggregate sums above cannot distinguish which
+# node fused.  Name the fused node and its fail-closed arm (file:line).
+for my $i (0 .. 3)
+{
+	my $site = $quad->node($i)->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state
+		  WHERE category = 'pcm' AND key = 'pcm_x_runtime_fail_closed_site'});
+	diag("L3 node$i runtime probe:"
+		. " state=$pcm_after_by_node[$i]{pcm_x_runtime_state}"
+		. " generation=$pcm_after_by_node[$i]{pcm_x_runtime_generation}"
+		. ' generation_delta='
+		. ($pcm_after_by_node[$i]{pcm_x_runtime_generation}
+			- $pcm_before_by_node[$i]{pcm_x_runtime_generation})
+		. ' recovery_blocked_delta='
+		. ($pcm_after_by_node[$i]{pcm_x_queue_recovery_blocked_count}
+			- $pcm_before_by_node[$i]{pcm_x_queue_recovery_blocked_count})
+		. " fail_closed_site=[$site]");
+}
 for my $key (@pcm_x_pcm_keys)
 {
 	diag("L3 PCM-X state $key=$pcm_after{$key} delta="

@@ -250,6 +250,10 @@ cluster_shmem_register_region(const ClusterShmemRegion *region)
 	registered_region_count++;
 }
 
+/* Referenced by the fail-closed logging guard in cluster_pcm_x_convert.c;
+ * unit tests never run inside a critical section. */
+volatile uint32 CritSectionCount = 0;
+
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
@@ -2211,7 +2215,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35376);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36400);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36480);
 }
 
 UT_TEST(test_lwlock_held_limit_is_shared_200)
@@ -7316,6 +7320,27 @@ UT_TEST(test_recovery_blocked_runtime_refuses_ack_and_local_mutators)
 				 PCM_X_QUEUE_NOT_READY);
 	UT_ASSERT(memcmp(tag_slot, &tag_before, sizeof(*tag_slot)) == 0);
 	UT_ASSERT(memcmp(member, &member_before, sizeof(*member)) == 0);
+}
+
+UT_TEST(test_runtime_fail_closed_records_winning_site_only)
+{
+	char		site[PCM_X_FAIL_CLOSED_SITE_LEN];
+	char		first[PCM_X_FAIL_CLOSED_SITE_LEN];
+
+	init_active_pcm_x(UINT64_C(77));
+	/* Before any fuse the site is absent and the buffer is cleared. */
+	site[0] = 'x';
+	UT_ASSERT(!cluster_pcm_x_runtime_fail_closed_site(site, sizeof(site)));
+	UT_ASSERT_EQ(site[0], '\0');
+	/* The macro records this file:line as the fusing arm. */
+	cluster_pcm_x_runtime_fail_closed();
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(cluster_pcm_x_runtime_fail_closed_site(first, sizeof(first)));
+	UT_ASSERT(strncmp(first, "test_cluster_pcm_x_convert.c:", 29) == 0);
+	/* A losing caller (runtime already blocked) must not clobber the site. */
+	cluster_pcm_x_runtime_fail_closed();
+	UT_ASSERT(cluster_pcm_x_runtime_fail_closed_site(site, sizeof(site)));
+	UT_ASSERT(strcmp(site, first) == 0);
 }
 
 UT_TEST(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage)
@@ -14273,6 +14298,7 @@ main(void)
 	UT_RUN(test_delayed_pretransfer_cancel_fences_active_transfer);
 	UT_RUN(test_recovery_blocked_runtime_cannot_promote_or_begin_transfer);
 	UT_RUN(test_recovery_blocked_runtime_refuses_ack_and_local_mutators);
+	UT_RUN(test_runtime_fail_closed_records_winning_site_only);
 	UT_RUN(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage);
 	UT_RUN(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot);
 	UT_RUN(test_master_prehandle_identity_alias_is_corruption_not_stale_cancel);

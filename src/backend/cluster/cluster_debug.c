@@ -1995,15 +1995,21 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
 
-	/* PCM-X queue core: 30 stable keys in the existing pcm category. */
+	/* PCM-X queue core: 30 stable integer keys in the existing pcm category,
+	 * plus one text-valued fail-closed provenance key (excluded from the
+	 * integer-only snapshot tooling in the TAP suite). */
 	{
 		PcmXStatsSnapshot stats = { 0 };
 		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
+		char		fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
 
 		(void)cluster_pcm_x_stats_snapshot(&stats);
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
 				 fmt_int64((int64)runtime.gate_generation));
+		if (!cluster_pcm_x_runtime_fail_closed_site(fail_closed_site, sizeof(fail_closed_site)))
+			strlcpy(fail_closed_site, "(none)", sizeof(fail_closed_site));
+		emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", fail_closed_site);
 		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", fmt_int64((int64)stats.admit_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", fmt_int64((int64)stats.confirm_count));

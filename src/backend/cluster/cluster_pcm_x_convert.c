@@ -1046,7 +1046,7 @@ cluster_pcm_x_stats_note_own_corrupt(void)
 
 
 static void
-pcm_x_runtime_fail_closed(void)
+pcm_x_runtime_fail_closed(const char *site_file, int site_line)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	bool transitioned;
@@ -1057,14 +1057,51 @@ pcm_x_runtime_fail_closed(void)
 		transitioned = cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_SHUTTING_DOWN,
 														PCM_X_RUNTIME_RECOVERY_BLOCKED);
 	if (transitioned && header != NULL)
+	{
+		const char *base;
+
+		/* Record the fusing arm.  Single writer: only the CAS winner above
+		 * reaches this block, and a second fuse requires a full reactivation
+		 * in between, so writes are serialized. */
+		base = strrchr(site_file, '/');
+		base = (base != NULL) ? base + 1 : site_file;
+		snprintf(header->fail_closed_site, sizeof(header->fail_closed_site), "%s:%d", base,
+				 site_line);
 		pcm_x_stats_increment(&header->stats.recovery_blocked_count);
+
+		/* At most one log line per ACTIVE generation (single CAS winner), so
+		 * this cannot flood.  Skip inside critical sections; the shmem site
+		 * above stays observable through pg_cluster_state either way. */
+		if (CritSectionCount == 0)
+			ereport(LOG,
+					(errmsg("cluster PCM-X runtime fail-closed (recovery blocked) at %s:%d", base,
+							site_line),
+					 errhint("Writer conversions on this node stay fail-closed until the PCM-X "
+							 "runtime is reformed.")));
+	}
 }
 
 
 void
-cluster_pcm_x_runtime_fail_closed(void)
+cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line)
 {
-	pcm_x_runtime_fail_closed();
+	pcm_x_runtime_fail_closed(site_file, site_line);
+}
+
+
+bool
+cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (buf == NULL || buflen == 0)
+		return false;
+	buf[0] = '\0';
+	if (header == NULL || header->fail_closed_site[0] == '\0')
+		return false;
+	strlcpy(buf, header->fail_closed_site,
+			Min(buflen, sizeof(header->fail_closed_site)));
+	return true;
 }
 
 
