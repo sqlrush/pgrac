@@ -44,6 +44,7 @@ OBJS = \
 	cluster_apply_master_election.o \
 	cluster_advisory.o \
 	cluster_pcm_own.o \
+	cluster_pcm_direct_init.o \
 	cluster_cancel_token.o \
 	cluster_backup.o \
 	cluster_backup_manifest.o \
@@ -156,6 +157,8 @@ OBJS = \
 	cluster_node_remove_policy.o \
 	cluster_node_remove_views.o \
 	cluster_pcm_lock.o \
+	cluster_pcm_x_convert.o \
+	cluster_pcm_x_image_fetch.o \
 	cluster_pgstat.o \
 	cluster_pi_recovery_srf.o \
 	cluster_pi_shadow.o \

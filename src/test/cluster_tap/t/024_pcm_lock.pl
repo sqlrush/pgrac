@@ -3,8 +3,8 @@
 # 024_pcm_lock.pl
 #    End-to-end regression for the PCM lock framework surface.  This
 #    started as the stage-1.7 scaffolding test, but spec-2.30 activates
-#    the local PCM state machine and expands dump_pcm from the 6-row
-#    stub surface to the active 20-row diagnostic surface.
+#    the local PCM state machine; the current active diagnostic surface
+#    is 58 rows after the 30-key PCM-X FIFO/ownership/runtime addition.
 #
 #    Verifies the SQL surface backed by spec-1.7 Deliverable 4 (pcm
 #    category) + Deliverable 5 (4 PCM inject points, registry 24->28)
@@ -55,15 +55,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 23 keys (spec-2.30 + spec-6.14a D5 + spec-6.14 D5
-# + spec-4.6a D12 dead_cleanup_entries)
+# L1: pg_cluster_state.pcm category has 58 keys, including the 30-key PCM-X FIFO surface.
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-   '28',
-   'L1 pg_cluster_state.pcm category has 28 keys (spec-2.30 surface + spec-6.14a D5 + spec-6.14 D5 + spec-4.6a D12 + ownership-gen wave 4: writer_cover_stale_detected + writer_reverify_reacquire + restore_aba_detected + invalidate_parked_grant_pending + S3-forensics wm_prov_insert_fail_count)');
+	'58',
+	'L1 pg_cluster_state.pcm category has 58 keys (existing 28 + PCM-X FIFO/ownership/runtime 30)');
 
 
 # ----------
@@ -161,10 +160,10 @@ is($node->safe_psql(
 # release-post -> release-pre).
 # ----------
 is($node->safe_psql(
-		'postgres',
-		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '181',
-   'L6a pg_stat_cluster_injections has 181 entries (stale-baseline catch-up, t/017-family: ownership-gen wave +6 cluster-pcm-*; +1 earlier-wave undercount; S3 forensics step 1a +1 cluster-ges-master-work-queue-full) (gcs-race-round4c +2 cluster-gcs-block-fallback-refresh-stale + cluster-gcs-block-yield-notify-drop; gcs-race-fix-2 +1 cluster-gcs-block-done-drop; gcs-race-fix +1 cluster-gcs-block-duplicate-grant-reply; spec-5.22d Hardening +1 cluster-undo-authority-scan; D5 lane 漏更本文件含 spec-5.22d D4-8 +1 + spec-5.22e D5-7 +2; spec-7.3 review P1-1 +1 cluster-lms-cr-fence-recheck; spec-7.1 D3-a +1 cluster-mxid-halfspace-hard-limit; spec-7.3 D7 +1 cluster-lms-cr-fence-refuse; spec-7.2 D6 +2 lms data-dispatch/conn-reset; spec-6.14 D5+D8 +3; spec-5.6a +1; spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable; spec-2.29a +1 cluster-qvotec-marker-service-hold)');
+			'postgres',
+			'SELECT count(*) FROM pg_stat_cluster_injections'),
+	   '183',
+	   'L6a pg_stat_cluster_injections has 183 entries (matches t/015 registry authority)');
 
 is($node->safe_psql(
 		'postgres',

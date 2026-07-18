@@ -660,6 +660,9 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * sentinel protocol capability, same unconditional discipline (see
 	 * cluster_ic.h). */
 	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1;
+	/* PCM-X conversion is a protocol capability.  Every opcode has a distinct
+	 * registered DATA-plane type, so mixed-version senders gate on this bit. */
+	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

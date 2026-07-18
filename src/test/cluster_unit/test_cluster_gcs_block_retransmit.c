@@ -18,7 +18,7 @@
  *	    L1  GcsBlockReplyStatus enum extends to 8 values (DENIED_DEDUP_FULL=7)
  *	    L2  GcsBlockDedupKey == 24B + offset lock
  *	    L3  GcsBlockDedupEntry == 8472B fixed-size StaticAssertDecl (8448 + 24 RC-F DONE)
- *	    L4  GcsBlockDedupEntry.sf_dep_vec offset 112, block_data offset 240
+ *	    L4  GcsBlockDedupEntry.payload_meta offset 112, block_data offset 240
  *	    L5  GcsBlockDedupEntry.reply_header offset 56 (8-aligned for uint64)
  *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8432 + registered 8440
  *	    L7  GcsBlockDedupResult enum 5 values
@@ -117,7 +117,7 @@ UT_TEST(test_dedup_entry_size_locked_at_8472)
 
 UT_TEST(test_dedup_entry_smart_fusion_dep_and_block_offsets)
 {
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, sf_dep_vec), 112);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, payload_meta), 112);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 240);
 	UT_ASSERT_EQ((int)GCS_BLOCK_DATA_SIZE, BLCKSZ);
 }

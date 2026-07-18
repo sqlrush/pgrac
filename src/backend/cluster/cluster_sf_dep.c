@@ -355,6 +355,43 @@ cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1) != 0;
 }
 
+/* PCM-X conversion frames are never sent until the current connection's
+ * verified HELLO advertises the complete byte-exact protocol family. */
+bool
+cluster_sf_peer_supports_pcm_x_convert(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0;
+}
+
+/* Return one lock-coherent snapshot of the capability-record generation whose
+ * verified HELLO advertised PCM-X.  Tier1 owns this record on CONTROL and can
+ * sample it around another authority read to reject reconnect ABA; RDMA keeps
+ * its existing registered generation-0 lifecycle. */
+bool
+cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_generation_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, generation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
 /*
  * cluster_sf_note_peer_disconnected_gen
  *

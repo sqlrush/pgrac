@@ -125,7 +125,9 @@
  *	  52..55  uint32 poll_cycle_count
  *	  56..59  uint32 torn_write_detect_count
  *	  60..63  uint32 _pad
- *	  64..127 uint8[64] _reserved          (future expansion)
+ *	  64..71  uint64 self_incarnation      (canonical boot session)
+ *	  72..75  uint32 prior_unclean_death   (crash-rejoin barrier)
+ *	  76..127 uint8[52] _reserved          (future expansion)
  * ============================================================ */
 typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 state;		   /* ClusterQvotecStatus */
@@ -140,15 +142,7 @@ typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 poll_cycle_count;
 	pg_atomic_uint32 torn_write_detect_count;
 	pg_atomic_uint32 _pad;
-	/*
-	 * Merge-order reservation (守门 07-15): the convert-queue lane claims
-	 * offset 64..71 for its self_incarnation (pg_atomic_uint64, commit
-	 * ee536b5bb7, StaticAssert-pinned).  Queue merges first; this lane rebases
-	 * after and drops this placeholder so self_incarnation occupies 64..71 and
-	 * prior_unclean_death stays at 72.  Keeping the byte layout identical now
-	 * makes that rebase a no-op on the wire/shmem image.
-	 */
-	uint8 _reserved_queue_self_incarnation[8]; /* offset 64..71 */
+	pg_atomic_uint64 self_incarnation;
 	/*
 	 * Crash-rejoin re-declare barrier (Shape A) — set ONCE at qvotec startup
 	 * (before the READY publish), read-only thereafter: 1 iff this node's
@@ -166,6 +160,8 @@ typedef struct ClusterQvotecShmem {
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == 128,
 				 "ClusterQvotecShmem must be exactly 128 bytes (2 cache lines)");
+StaticAssertDecl(offsetof(ClusterQvotecShmem, self_incarnation) == 64,
+				 "ClusterQvotecShmem self incarnation offset");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_unclean_death) == 72,
 				 "prior_unclean_death must sit at offset 72 (queue lane owns 64..71)");
 
@@ -290,8 +286,7 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->poll_cycle_count, 0);
 		pg_atomic_init_u32(&QvotecShmem->torn_write_detect_count, 0);
 		pg_atomic_init_u32(&QvotecShmem->_pad, 0);
-		memset(QvotecShmem->_reserved_queue_self_incarnation, 0,
-			   sizeof(QvotecShmem->_reserved_queue_self_incarnation));
+		pg_atomic_init_u64(&QvotecShmem->self_incarnation, 0);
 		pg_atomic_init_u32(&QvotecShmem->prior_unclean_death, 0);
 		memset(QvotecShmem->_reserved, 0, sizeof(QvotecShmem->_reserved));
 	}
@@ -421,6 +416,21 @@ cluster_qvotec_get_current_epoch_at_boot(void)
 	if (QvotecShmem == NULL)
 		return 0;
 	return pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
+}
+
+void
+cluster_qvotec_publish_self_incarnation(uint64 incarnation)
+{
+	if (QvotecShmem != NULL)
+		pg_atomic_write_u64(&QvotecShmem->self_incarnation, incarnation);
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	if (QvotecShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&QvotecShmem->self_incarnation);
 }
 
 const char *
@@ -1758,6 +1768,7 @@ ClusterQvotecMain(void)
 	 * resets and is freed automatically at proc_exit.
 	 */
 	qvotec_self_incarnation = (uint64)GetCurrentTimestamp();
+	cluster_qvotec_publish_self_incarnation(qvotec_self_incarnation);
 	qvotec_slot_generation = 0;
 	qvotec_slot_matrix = (ClusterVotingSlot *)MemoryContextAllocZero(
 		TopMemoryContext, sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
@@ -2139,6 +2150,14 @@ cluster_qvotec_get_disks_total_count(void)
 }
 uint64
 cluster_qvotec_get_current_epoch_at_boot(void)
+{
+	return 0;
+}
+void
+cluster_qvotec_publish_self_incarnation(uint64 incarnation pg_attribute_unused())
+{}
+uint64
+cluster_qvotec_get_self_incarnation(void)
 {
 	return 0;
 }

@@ -953,6 +953,23 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 	UT_ASSERT_EQ(pi_total, 1);
 }
 
+UT_TEST(test_pcm_grd_entry_abi_remains_264_bytes)
+{
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(fake_pcm_entrysize, 264);
+}
+
+UT_TEST(test_pcm_grd_convert_queue_placeholder_remains_null)
+{
+	BufferTag tag = make_tag(64);
+	int n_count, s_count, x_count, pi_total, convert_q;
+
+	reset_fake_pcm_runtime(4);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_grd_get_summary(&n_count, &s_count, &x_count, &pi_total, &convert_q);
+	UT_ASSERT_EQ(convert_q, 0);
+}
+
 
 UT_TEST(test_pcm_real_wait_event_call_sites_are_exercised)
 {
@@ -1495,6 +1512,341 @@ UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
 	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), false);
 }
 
+static PcmXGrdHandoffToken
+make_pcm_x_grd_handoff_token(BufferTag tag, const PcmAuthoritySnapshot *authority,
+							 int32 source_node, int32 requester_node, uint32 requester_procno,
+							 uint64 request_id)
+{
+	PcmXGrdHandoffToken token;
+
+	memset(&token, 0, sizeof(token));
+	token.tag = tag;
+	token.authority = *authority;
+	token.cluster_epoch = 17;
+	token.request_id = request_id;
+	token.ticket_id = request_id;
+	token.grant_generation = 23;
+	UT_ASSERT(cluster_pcm_x_image_id_encode(0, 29, &token.image_id));
+	token.source_own_generation = 31;
+	token.page_scn = 0x4000;
+	token.page_lsn = 0x5000;
+	token.requester_node = requester_node;
+	token.source_node = source_node;
+	token.requester_procno = requester_procno;
+	token.page_checksum = 37;
+	return token;
+}
+
+UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
+{
+	BufferTag tag = make_tag(97);
+	PcmAuthoritySnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_set_pending_x(tag, 3, 0x1234);
+
+	memset(&snapshot, 0x7f, sizeof(snapshot));
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ((int)snapshot.state, (int)PCM_STATE_S);
+	UT_ASSERT_EQ(snapshot.x_holder_node, -1);
+	UT_ASSERT_EQ(snapshot.s_holders_bitmap, (uint32)((1u << 1) | (1u << 2)));
+	UT_ASSERT_EQ(snapshot.master_holder.node_id, (uint32)1);
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 3);
+	UT_ASSERT_EQ(snapshot.pending_x_since_lsn, (uint64)0x1234);
+	UT_ASSERT(snapshot.transition_count > 0);
+}
+
+UT_TEST(test_pcm_queue_pending_x_reservation_never_overwrites_another_node)
+{
+	BufferTag tag = make_tag(101);
+	PcmAuthoritySnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	/* Both producers lazily create the canonical N authority for a cold tag. */
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 2, 0x1111), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ((int)snapshot.state, (int)PCM_STATE_N);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+	/* A delayed same-node legacy clear cannot erase a queue-kind claim. */
+	UT_ASSERT(!cluster_pcm_lock_clear_pending_x_if(tag, 2));
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+	UT_ASSERT(cluster_pcm_lock_clear_queue_pending_x_exact(tag, 2, 0x1111));
+
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 2, 0x1111), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 2);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+
+	/* Legacy producers obey the same idle-only rule, including same-node. */
+	UT_ASSERT_EQ(cluster_pcm_lock_set_pending_x(tag, 3, 0x1212), PCM_PENDING_X_RESERVE_OCCUPIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_set_pending_x(tag, 2, 0x1313), PCM_PENDING_X_RESERVE_OCCUPIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 2);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+
+	/* A different queue head cannot overwrite the live barrier. */
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 0x2222),
+				 PCM_PENDING_X_RESERVE_OCCUPIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 2);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+
+	/* A same-node legacy round is not ticket-exact replay proof. */
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 2, 0x3333),
+				 PCM_PENDING_X_RESERVE_OCCUPIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 2);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 2, 0x1111));
+
+	UT_ASSERT(cluster_pcm_lock_clear_queue_pending_x_exact(tag, 2, 0x1111));
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 0x4444), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ(snapshot.pending_x_requester_node, 3);
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 3, 0x4444));
+	/* A replay of the old release cannot erase the successor cookie. */
+	UT_ASSERT(!cluster_pcm_lock_clear_queue_pending_x_exact(tag, 2, 0x1111));
+	UT_ASSERT(cluster_pcm_lock_queue_pending_x_exact(tag, 3, 0x4444));
+	UT_ASSERT(cluster_pcm_lock_clear_queue_pending_x_exact(tag, 3, 0x4444));
+
+	tag = make_tag(102);
+	UT_ASSERT_EQ(cluster_pcm_lock_set_pending_x(tag, 2, 0x5555), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &snapshot));
+	UT_ASSERT_EQ((int)snapshot.state, (int)PCM_STATE_N);
+	UT_ASSERT(cluster_pcm_lock_clear_pending_x_if(tag, 2));
+
+	reset_fake_pcm_runtime(1);
+	UT_ASSERT_EQ(cluster_pcm_lock_set_pending_x(make_tag(103), 2, 0x6666),
+				 PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(make_tag(104), 3, 0x7777),
+				 PCM_PENDING_X_RESERVE_NO_CAPACITY);
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_rejects_authority_drift)
+{
+	BufferTag tag = make_tag(98);
+	PcmAuthoritySnapshot before;
+	PcmAuthoritySnapshot after;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9001), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 1, 3, 41, 9001);
+
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_STALE);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_S);
+	UT_ASSERT_EQ(after.s_holders_bitmap, (uint32)((1u << 1) | (1u << 2)));
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_rejects_residual_s_holder)
+{
+	BufferTag tag = make_tag(99);
+	PcmAuthoritySnapshot before;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9002), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 1, 3, 42, 9002);
+
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_BAD_STATE);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_STATE_S);
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_commits_full_identity_and_replays)
+{
+	BufferTag tag = make_tag(100);
+	PcmAuthoritySnapshot before;
+	PcmAuthoritySnapshot after;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9003), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 1, 3, 43, 9003);
+	token.cluster_epoch = 0;
+	token.source_own_generation = 0;
+	{
+		PcmXGrdHandoffToken wrong_ticket = token;
+
+		wrong_ticket.ticket_id++;
+		UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&wrong_ticket),
+					 PCM_X_GRD_HANDOFF_BAD_STATE);
+		UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_STATE_S);
+	}
+
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.x_holder_node, 3);
+	UT_ASSERT_EQ(after.s_holders_bitmap, (uint32)0);
+	UT_ASSERT_EQ(after.pending_x_requester_node, -1);
+	UT_ASSERT_EQ(after.master_holder.node_id, (uint32)3);
+	UT_ASSERT_EQ(after.master_holder.procno, (uint32)43);
+	UT_ASSERT_EQ(after.master_holder.cluster_epoch, (uint64)0);
+	UT_ASSERT_EQ(after.master_holder.request_id, (uint64)9003);
+	UT_ASSERT_EQ(after.transition_count, before.transition_count + 1);
+	/* FINAL preserves page_lsn in the immutable A-record only.  It must not
+	 * promote one node's WAL position into the cross-node GRD version floor. */
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tag), (uint64)InvalidXLogRecPtr);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag), (uint64)0x4000);
+
+	/* SCN-only authority is a legal shape.  Exact replay must not depend on a
+	 * same-stream LSN floor that the GRD cannot establish across nodes. */
+	cluster_pcm_lock_pi_watermark_retire_for_tag(tag);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, token.page_scn, CLUSTER_PCM_WM_SRC_REDECLARE, 1,
+											  7000, 17);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tag), (uint64)InvalidXLogRecPtr);
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_DUPLICATE);
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_accepts_global_n_with_real_image)
+{
+	BufferTag tag = make_tag(105);
+	PcmAuthoritySnapshot before;
+	PcmAuthoritySnapshot after;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9004), PCM_PENDING_X_RESERVE_OK);
+	cluster_pcm_lock_pi_watermark_lsn_advance(tag, (XLogRecPtr)0x4000);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x3000, CLUSTER_PCM_WM_SRC_REDECLARE, 1,
+											  7001, 17);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	UT_ASSERT_EQ((int)before.state, (int)PCM_STATE_N);
+	UT_ASSERT_EQ(before.master_holder.node_id, UINT32_MAX);
+	token = make_pcm_x_grd_handoff_token(tag, &before, 3, 3, 44, 9004);
+
+	UT_ASSERT(token.image_id != 0);
+	{
+		PcmXGrdHandoffToken malformed = token;
+
+		malformed.source_node = 2;
+		UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&malformed),
+					 PCM_X_GRD_HANDOFF_BAD_STATE);
+		malformed = token;
+		malformed.ticket_id++;
+		UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&malformed),
+					 PCM_X_GRD_HANDOFF_BAD_STATE);
+		malformed = token;
+		malformed.image_id = 29;
+		UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&malformed), PCM_X_GRD_HANDOFF_INVALID);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.x_holder_node, 3);
+	UT_ASSERT_EQ(after.s_holders_bitmap, (uint32)0);
+	UT_ASSERT_EQ(after.pending_x_requester_node, -1);
+	UT_ASSERT_EQ(after.master_holder.node_id, (uint32)3);
+	UT_ASSERT_EQ(after.master_holder.procno, (uint32)44);
+	UT_ASSERT_EQ(after.transition_count, before.transition_count + 1);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tag), (uint64)0x4000);
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_accepts_ordered_self_x)
+{
+	BufferTag tag = make_tag(106);
+	PcmAuthoritySnapshot before;
+	PcmAuthoritySnapshot after;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 2, 9005), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	UT_ASSERT_EQ((int)before.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(before.x_holder_node, 2);
+	token = make_pcm_x_grd_handoff_token(tag, &before, 2, 2, 45, 9005);
+
+	UT_ASSERT(token.image_id != 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.x_holder_node, 2);
+	UT_ASSERT_EQ(after.pending_x_requester_node, -1);
+	UT_ASSERT_EQ(after.master_holder.procno, (uint32)45);
+	UT_ASSERT_EQ(after.transition_count, before.transition_count + 1);
+}
+
+UT_TEST(test_pcm_queue_handoff_x_exact_uses_scn_not_cross_stream_lsn)
+{
+	BufferTag tag = make_tag(107);
+	PcmAuthoritySnapshot before;
+	PcmAuthoritySnapshot after;
+	PcmXGrdHandoffToken token;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 3;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9006), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 3, 3, 46, 9006);
+
+	/* Per-node WAL streams make page_lsn incomparable across holders.  A
+	 * numerically larger historical LSN must not reject an image whose Lamport
+	 * page SCN is newer; page_lsn remains A-record evidence, not GRD version
+	 * authority. */
+	cluster_pcm_lock_pi_watermark_lsn_advance(tag, (XLogRecPtr)(token.page_lsn + 1));
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)(token.page_scn - 1),
+											  CLUSTER_PCM_WM_SRC_REDECLARE, 1, 7002, 17);
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.pending_x_requester_node, -1);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tag),
+				 (uint64)(token.page_lsn + 1));
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag), (uint64)token.page_scn);
+
+	tag = make_tag(108);
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 3;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9007), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 3, 3, 47, 9007);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)(token.page_scn + 1),
+											  CLUSTER_PCM_WM_SRC_REDECLARE, 1, 7003, 17);
+	token.page_scn = (SCN)0;
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_BAD_STATE);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.pending_x_requester_node, 3);
+
+	tag = make_tag(109);
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 3;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9008), PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	token = make_pcm_x_grd_handoff_token(tag, &before, 3, 3, 48, 9008);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)(token.page_scn + 1),
+											  CLUSTER_PCM_WM_SRC_REDECLARE, 1, 7004, 17);
+	UT_ASSERT_EQ(cluster_pcm_lock_queue_handoff_x_exact(&token), PCM_X_GRD_HANDOFF_BAD_STATE);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(after.pending_x_requester_node, 3);
+}
+
 /* spec-5.2a D2 (U1): clean-page X-transfer arm is one-shot.  arm(true) sets
  * the backend-local flag; consume() reads-and-clears it (the acquire path
  * calls consume() once so the eligibility can never leak into a SUBSEQUENT
@@ -1528,7 +1880,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(52);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -1554,6 +1906,8 @@ main(void)
 	UT_RUN(test_pcm_real_x_release_and_downgrade_require_owner);
 	UT_RUN(test_pcm_real_upgrade_requires_single_s_holder);
 	UT_RUN(test_pcm_real_summary_counts_live_entries);
+	UT_RUN(test_pcm_grd_entry_abi_remains_264_bytes);
+	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
 	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);
 	UT_RUN(test_pcm_H2_last_s_release_transitions_to_n);
@@ -1570,6 +1924,14 @@ main(void)
 	UT_RUN(test_pcm_wm_prov_table_keeps_last_advance);
 	UT_RUN(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades);
 	UT_RUN(test_pcm_dead_node_cleanup_drops_holder_records);
+	UT_RUN(test_pcm_authority_snapshot_is_one_entry_lock_view);
+	UT_RUN(test_pcm_queue_pending_x_reservation_never_overwrites_another_node);
+	UT_RUN(test_pcm_queue_handoff_x_exact_rejects_authority_drift);
+	UT_RUN(test_pcm_queue_handoff_x_exact_rejects_residual_s_holder);
+	UT_RUN(test_pcm_queue_handoff_x_exact_commits_full_identity_and_replays);
+	UT_RUN(test_pcm_queue_handoff_x_exact_accepts_global_n_with_real_image);
+	UT_RUN(test_pcm_queue_handoff_x_exact_accepts_ordered_self_x);
+	UT_RUN(test_pcm_queue_handoff_x_exact_uses_scn_not_cross_stream_lsn);
 	UT_RUN(test_clean_page_xfer_arm_is_one_shot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

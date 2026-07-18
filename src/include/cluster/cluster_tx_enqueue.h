@@ -48,7 +48,10 @@
 typedef enum ClusterTxwResult {
 	CLUSTER_TXW_RESOLVED = 0, /* holder committed/aborted — re-judge */
 	CLUSTER_TXW_TIMEOUT,	  /* finite timeout elapsed — caller ERRORs (53R70) */
-	CLUSTER_TXW_DEAD_HOLDER	  /* holder node fenced / TT ABORTED — re-judge */
+	CLUSTER_TXW_DEAD_HOLDER,  /* holder node fenced / TT ABORTED — re-judge */
+	/* A PCM-X freeze made sleeping under another held content lock unsafe.
+	 * Process-local only: callers must retry/fail before any terminal handler. */
+	CLUSTER_TXW_RETRY
 } ClusterTxwResult;
 
 /*
@@ -59,7 +62,9 @@ typedef enum ClusterTxwResult {
  *   effective_timeout_ms:  finite wait budget; values <= 0 are clamped to a
  *     finite default (perpetual -1 is forbidden, Q6 / 5.1b clause 8).
  *
- * Returns RESOLVED / TIMEOUT / DEAD_HOLDER.  Does not change any tuple.
+ * Returns RESOLVED / TIMEOUT / DEAD_HOLDER / RETRY.  RETRY means the caller
+ * must leave the current PCM-X freeze window before attempting another wait.
+ * Does not change any tuple.
  */
 extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,
 												int effective_timeout_ms);

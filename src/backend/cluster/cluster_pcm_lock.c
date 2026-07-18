@@ -194,15 +194,16 @@ struct GrdEntry {
 	 *								flight (master-side broadcast pending).
 	 *								Read by N→S handler to short-circuit
 	 *								with DENIED_PENDING_X reply (HC117).
-	 * pending_x_since_lsn:		observability only — XLogCtl LSN at the
-	 *								moment pending_x was set;  do NOT use
-	 *								for timeout / retry math (LSN does not
-	 *								advance on idle DB;  see Q7 rationale).
+	 * pending_x_since_lsn:		legacy requests store a low-63-bit XLogCtl
+	 *								LSN for observability; PCM-X queue heads
+	 *								store high-bit|ticket_id as an exact cookie.
+	 *								Decode the namespace before displaying it;
+	 *								never use either form for timeout math.
 	 * Cleared paths: (a) X grant install ack;  (b) reconfig epoch advance;
 	 * (c) HC124 LMON node-dead sweep when requester crashes. */
 	int32 pending_x_requester_node; /*  4B [ 88,  92) -1 = none */
 	int32 _pad_pending_x;			/*  4B [ 92,  96) 8B align */
-	uint64 pending_x_since_lsn;		/*  8B [ 96, 104) HC117 observability */
+	uint64 pending_x_since_lsn;		/*  8B [ 96, 104) LSN or queue cookie */
 	/* PGRAC: spec-2.37 D2 HC125+HC126 NEW — single max-historical PI watermark.
 	 *
 	 *	pi_watermark_lsn:	max(holder_last_page_lsn) observed across all
@@ -481,9 +482,18 @@ pcm_master_holder_set_node(struct GrdEntry *entry, int32 node_id)
 	if (entry->master_holder.node_id == (uint32)node_id)
 		return; /* no-op; do not bump lifecycle counter */
 	entry->master_holder.node_id = (uint32)node_id;
-	/* procno / cluster_epoch / request_id intentionally left at current
-	 * values (zero on fresh entry from pcm_get_or_create_entry); spec-2.35
-	 * scope does not consume them.  HC110. */
+	/* procno / cluster_epoch / request_id intentionally remain zero on a
+	 * fresh entry; node_id starts at the no-holder sentinel and is set here.
+	 * HC110. */
+	cluster_gcs_block_bump_master_holder_lifecycle();
+}
+
+static inline void
+pcm_master_holder_set_exact(struct GrdEntry *entry, const ClusterGrdHolderId *holder)
+{
+	if (memcmp(&entry->master_holder, holder, sizeof(*holder)) == 0)
+		return;
+	entry->master_holder = *holder;
 	cluster_gcs_block_bump_master_holder_lifecycle();
 }
 
@@ -501,6 +511,30 @@ static inline bool
 pcm_master_holder_is_valid(const struct GrdEntry *entry)
 {
 	return entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE;
+}
+
+static void
+pcm_authority_snapshot_locked(struct GrdEntry *entry, PcmAuthoritySnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->master_holder = entry->master_holder;
+	out->transition_count = pg_atomic_read_u64(&entry->transition_count_local);
+	out->pending_x_since_lsn = entry->pending_x_since_lsn;
+	out->state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	out->x_holder_node = entry->x_holder_node;
+	out->s_holders_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	out->pending_x_requester_node = entry->pending_x_requester_node;
+}
+
+static bool
+pcm_authority_snapshot_equal(const PcmAuthoritySnapshot *left, const PcmAuthoritySnapshot *right)
+{
+	return memcmp(&left->master_holder, &right->master_holder, sizeof(left->master_holder)) == 0
+		   && left->transition_count == right->transition_count
+		   && left->pending_x_since_lsn == right->pending_x_since_lsn && left->state == right->state
+		   && left->x_holder_node == right->x_holder_node
+		   && left->s_holders_bitmap == right->s_holders_bitmap
+		   && left->pending_x_requester_node == right->pending_x_requester_node;
 }
 
 static inline int32
@@ -542,6 +576,161 @@ cluster_pcm_master_holder_node_by_tag(BufferTag tag)
 	return node_id;
 }
 
+/*
+ * Return a single-entry-lock view of the PCM authority.  A missing entry is
+ * represented by false; out is still initialized to the canonical empty
+ * sentinels so diagnostic callers never observe uninitialized bytes.
+ */
+bool
+cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (out == NULL)
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	out->state = PCM_STATE_N;
+	out->x_holder_node = -1;
+	out->pending_x_requester_node = -1;
+	out->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
+
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		pcm_authority_snapshot_locked(entry, out);
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return found && entry != NULL;
+}
+
+/*
+ * Atomically install the queue winner as the sole X holder, but only if the
+ * authority still exactly matches the snapshot captured when the transfer
+ * began.  No engine lock is held here; callers prepare an immutable token,
+ * perform this GRD barrier, then finalize their queue state.
+ */
+PcmXGrdHandoffResult
+cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
+{
+	struct GrdEntry *entry;
+	PcmAuthoritySnapshot current;
+	ClusterGrdHolderId requester;
+	PcmXGrdHandoffResult result = PCM_X_GRD_HANDOFF_BAD_STATE;
+	bool found;
+	bool broadcast = false;
+	uint64 pending_x_value;
+	uint32 source_bit;
+
+	if (token == NULL || token->requester_node < 0 || token->requester_node >= 32
+		|| token->source_node < 0 || token->source_node >= 32 || token->request_id == 0
+		|| token->grant_generation == 0
+		|| !cluster_pcm_x_image_id_decode(token->image_id, NULL, NULL))
+		return PCM_X_GRD_HANDOFF_INVALID;
+	if (!PcmPendingXQueueValue(token->ticket_id, &pending_x_value))
+		return PCM_X_GRD_HANDOFF_INVALID;
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return PCM_X_GRD_HANDOFF_NOT_FOUND;
+
+	requester.node_id = (uint32)token->requester_node;
+	requester.procno = token->requester_procno;
+	requester.cluster_epoch = token->cluster_epoch;
+	requester.request_id = token->request_id;
+	source_bit = (uint32)1u << (uint32)token->source_node;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &token->tag, HASH_FIND, &found);
+	if (!found || entry == NULL) {
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_X_GRD_HANDOFF_NOT_FOUND;
+	}
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pcm_authority_snapshot_locked(entry, &current);
+
+	/* A retry after the commit barrier is harmless only for the same full
+	 * requester identity and an image no newer than the installed Lamport-SCN
+	 * authority.  page_lsn is per-node A-record evidence, not a cross-node
+	 * version comparator. */
+	if (current.state == PCM_STATE_X && current.x_holder_node == token->requester_node
+		&& current.s_holders_bitmap == 0 && current.pending_x_requester_node == -1
+		&& memcmp(&current.master_holder, &requester, sizeof(requester)) == 0
+		&& (!SCN_VALID(token->page_scn)
+			|| scn_local(entry->pi_watermark_scn) >= scn_local(token->page_scn))) {
+		result = PCM_X_GRD_HANDOFF_DUPLICATE;
+		goto done;
+	}
+
+	if (!pcm_authority_snapshot_equal(&current, &token->authority)) {
+		result = PCM_X_GRD_HANDOFF_STALE;
+		goto done;
+	}
+	if (current.pending_x_requester_node != token->requester_node
+		|| current.pending_x_since_lsn != pending_x_value)
+		goto done;
+	/* The authority snapshot deliberately excludes watermarks, so close the
+	 * SCN window under the same entry lock as the pending-X cookie and GRD
+	 * transition.  Cross-node version authority is Lamport page_scn only;
+	 * page_lsn belongs to its source WAL stream and remains A-record evidence. */
+	if (SCN_VALID(entry->pi_watermark_scn)
+		&& (!SCN_VALID(token->page_scn)
+			|| scn_local(token->page_scn) < scn_local(entry->pi_watermark_scn)))
+		goto done;
+
+	if (current.state == PCM_STATE_X) {
+		if (current.x_holder_node != token->source_node || current.s_holders_bitmap != 0
+			|| current.master_holder.node_id != (uint32)token->source_node)
+			goto done;
+	} else if (current.state == PCM_STATE_S) {
+		if (current.x_holder_node != -1 || current.s_holders_bitmap != source_bit
+			|| current.master_holder.node_id != (uint32)token->source_node)
+			goto done;
+	} else if (current.state == PCM_STATE_N) {
+		/* A cold global-N round has no physical cache holder.  The queue names
+		 * the requester as synthetic source so the existing image/A-record path
+		 * remains mandatory and the final barrier stays ticket-exact. */
+		if (token->source_node != token->requester_node || current.x_holder_node != -1
+			|| current.s_holders_bitmap != 0 || pcm_master_holder_is_valid(entry))
+			goto done;
+	} else {
+		goto done;
+	}
+
+	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+	entry->x_holder_node = token->requester_node;
+	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	entry->s_holder_refcount_local = 0;
+	pcm_master_holder_set_exact(entry, &requester);
+	entry->pending_x_requester_node = -1;
+	entry->pending_x_since_lsn = 0;
+	if (SCN_VALID(token->page_scn)
+		&& scn_local(token->page_scn) > scn_local(entry->pi_watermark_scn)) {
+		SCN old_scn = entry->pi_watermark_scn;
+
+		entry->pi_watermark_scn = token->page_scn;
+		pcm_wm_prov_record(token->tag, old_scn, token->page_scn, CLUSTER_PCM_WM_SRC_GRANT_X,
+						   token->source_node, token->request_id, token->cluster_epoch);
+	}
+	entry->last_transition_at = GetCurrentTimestamp();
+	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	broadcast = true;
+	result = PCM_X_GRD_HANDOFF_OK;
+
+done:
+	LWLockRelease(&entry->entry_lock.lock);
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return result;
+}
+
 
 /* ============================================================
  * PGRAC: spec-2.36 D5 HC117 / HC124 — S barrier helpers.
@@ -560,24 +749,112 @@ cluster_pcm_master_holder_node_by_tag(BufferTag tag)
  *	  htab_lock SHARED;  per-entry mutation under entry_lock
  *	  EXCLUSIVE;  idempotent recheck inside the lock.
  * ============================================================ */
-void
-cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node, uint64 current_lsn)
+static PcmPendingXReserveResult
+pcm_lock_try_reserve_pending_x_value(BufferTag tag, int32 requester_node, uint64 value)
 {
 	struct GrdEntry *entry;
 	bool found;
+	PcmPendingXReserveResult result = PCM_PENDING_X_RESERVE_OCCUPIED;
 
-	if (cluster_pcm_htab == NULL)
-		return;
-
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || requester_node < 0
+		|| requester_node >= 32)
+		return PCM_PENDING_X_RESERVE_INVALID;
+	/* Admission itself is the first authoritative touch for a cold tag.  Use
+	 * the canonical lazy allocator so both legacy and queue writers can arm
+	 * the barrier before any transition exists. */
+	if (pcm_get_or_create_entry(tag) == NULL)
+		return PCM_PENDING_X_RESERVE_NO_CAPACITY;
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		entry->pending_x_requester_node = requester_node;
-		entry->pending_x_since_lsn = current_lsn;
+		if (entry->pending_x_requester_node == -1) {
+			entry->pending_x_requester_node = requester_node;
+			entry->pending_x_since_lsn = value;
+			result = PCM_PENDING_X_RESERVE_OK;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return result;
+}
+
+PcmPendingXReserveResult
+cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node, uint64 current_lsn)
+{
+	if ((current_lsn & PCM_PENDING_X_QUEUE_KIND) != 0)
+		return PCM_PENDING_X_RESERVE_INVALID;
+	return pcm_lock_try_reserve_pending_x_value(tag, requester_node, current_lsn);
+}
+
+/*
+ * Reserve the one GrdEntry pending-X barrier for an active PCM-X queue head.
+ *
+ * Legacy request paths still use cluster_pcm_lock_set_pending_x() for their
+ * request-scoped round.  Queue arbitration cannot: a delayed drive of another
+ * tag-head must never overwrite the requester that owns the live transfer.
+ * A node-only match is not replay proof: a legacy request from the same node
+ * may own that mark.  This primitive therefore succeeds only on the idle
+ * transition; the queue engine separately persists the exact ticket claim.
+ */
+PcmPendingXReserveResult
+cluster_pcm_lock_try_reserve_pending_x(BufferTag tag, int32 requester_node, uint64 ticket_id)
+{
+	uint64 value;
+
+	if (!PcmPendingXQueueValue(ticket_id, &value))
+		return PCM_PENDING_X_RESERVE_INVALID;
+	return pcm_lock_try_reserve_pending_x_value(tag, requester_node, value);
+}
+
+bool
+cluster_pcm_lock_queue_pending_x_exact(BufferTag tag, int32 requester_node, uint64 ticket_id)
+{
+	struct GrdEntry *entry;
+	uint64 expected;
+	bool found;
+	bool exact = false;
+
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || requester_node < 0 || requester_node >= 32
+		|| !PcmPendingXQueueValue(ticket_id, &expected))
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		exact = entry->pending_x_requester_node == requester_node
+				&& entry->pending_x_since_lsn == expected;
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return exact;
+}
+
+bool
+cluster_pcm_lock_clear_queue_pending_x_exact(BufferTag tag, int32 requester_node, uint64 ticket_id)
+{
+	struct GrdEntry *entry;
+	uint64 expected;
+	bool found;
+	bool cleared = false;
+
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || requester_node < 0 || requester_node >= 32
+		|| !PcmPendingXQueueValue(ticket_id, &expected))
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (entry->pending_x_requester_node == requester_node
+			&& entry->pending_x_since_lsn == expected) {
+			entry->pending_x_requester_node = -1;
+			entry->pending_x_since_lsn = 0;
+			cleared = true;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return cleared;
 }
 
 void
@@ -593,8 +870,10 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag)
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		entry->pending_x_requester_node = -1;
-		entry->pending_x_since_lsn = 0;
+		if ((entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
+			entry->pending_x_requester_node = -1;
+			entry->pending_x_since_lsn = 0;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -625,7 +904,8 @@ cluster_pcm_lock_clear_pending_x_if(BufferTag tag, int32 expected_requester)
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		if (entry->pending_x_requester_node == expected_requester) {
+		if (entry->pending_x_requester_node == expected_requester
+			&& (entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared = true;
@@ -2826,15 +3106,10 @@ cluster_pcm_lock_release(BufferTag tag)
  * eviction) so X locks release with X→N rather than the S→N transition.
  */
 void
-cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
+cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode)
 {
-	BufferTag tag;
 	int master_node;
 	PcmLockTransition trans;
-
-	if (buf == NULL)
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_pcm_lock_release_buffer_for_eviction: NULL BufferDesc")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -2856,7 +3131,6 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
 		return;
 
-	tag = buf->tag;
 	master_node = cluster_gcs_lookup_master(tag);
 
 	if (master_node != cluster_node_id) {
@@ -2899,6 +3173,16 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 	 * one place.
 	 */
 	cluster_pcm_lock_release(tag);
+}
+
+void
+cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
+{
+	if (buf == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_pcm_lock_release_buffer_for_eviction: NULL BufferDesc")));
+
+	cluster_pcm_lock_release_saved_tag_for_eviction(buf->tag, mode);
 }
 
 /*
@@ -3312,6 +3596,7 @@ pcm_get_or_create_entry(BufferTag tag)
 		entry->tag = saved_tag;
 		pg_atomic_init_u32(&entry->master_state, (uint32)PCM_STATE_N);
 		entry->x_holder_node = -1;
+		entry->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
 		pg_atomic_init_u32(&entry->s_holders_bitmap, 0);
 		pg_atomic_init_u32(&entry->pi_holders_bitmap, 0);
 		pg_atomic_init_u64(&entry->transition_count_local, 0);

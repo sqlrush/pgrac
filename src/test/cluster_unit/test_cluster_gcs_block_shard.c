@@ -51,6 +51,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
 #undef printf
@@ -197,10 +198,10 @@ UT_TEST(test_route_ack_request_interleave_affinity)
 }
 
 /* ======================================================================
- * U3 -- DATA-plane registry partition pin ("every DATA msg_type has a
- *		 declared shard key or is explicitly direct-send"): of the five
- *		 registered DATA types, exactly REQUEST / FORWARD / INVALIDATE
- *		 are ring-routable;  REPLY and INVALIDATE-ACK are the whitelist
+ * U3 -- legacy DATA-plane registry partition pin ("every DATA msg_type has a
+ *		 declared shard key or is explicitly direct-send"): REQUEST / FORWARD /
+ *		 INVALIDATE / DONE are ring-routable; REPLY and INVALIDATE-ACK are
+ *		 the whitelist
  *		 (no tag; direct-sent from the receiving worker's own dispatch,
  *		 so they already ride the correct channel).  A NEW DATA type that
  *		 tries to stage without a key is refused at runtime by this same
@@ -380,10 +381,71 @@ UT_TEST(test_route_ignores_non_tag_fields)
 	}
 }
 
+/* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
+ * direct-send members because their compact payload intentionally has no tag. */
+UT_TEST(test_pcm_x_route_truth_table)
+{
+	BufferTag tag = make_tag(1663, 5, 24001, MAIN_FORKNUM, 73);
+	union {
+		PcmXGrantPayload largest;
+		uint8 bytes[sizeof(PcmXGrantPayload)];
+	} payload;
+	struct {
+		uint8 msg_type;
+		uint16 payload_len;
+	} staged[] = {
+		{ PGRAC_IC_MSG_PCM_X_ENQUEUE, sizeof(PcmXEnqueuePayload) },
+		{ PGRAC_IC_MSG_PCM_X_ADMIT_ACK, sizeof(PcmXAdmitAckPayload) },
+		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_BEGIN, sizeof(PcmXBlockerSetHeaderPayload) },
+		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_EDGE, sizeof(PcmXBlockerChunkPayload) },
+		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT, sizeof(PcmXBlockerSetHeaderPayload) },
+		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_REVOKE, sizeof(PcmXRevokePayload) },
+		{ PGRAC_IC_MSG_PCM_X_IMAGE_READY, sizeof(PcmXGrantPayload) },
+		{ PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, sizeof(PcmXGrantPayload) },
+		{ PGRAC_IC_MSG_PCM_X_INSTALL_READY, sizeof(PcmXInstallReadyPayload) },
+		{ PGRAC_IC_MSG_PCM_X_COMMIT_X, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_FINAL_ACK, sizeof(PcmXFinalAckPayload) },
+		{ PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL, sizeof(PcmXPrehandleCancelPayload) },
+		{ PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL_ACK, sizeof(PcmXAdmitAckPayload) },
+		{ PGRAC_IC_MSG_PCM_X_CANCEL, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_CANCEL_ACK, sizeof(PcmXPhasePayload) },
+		{ PGRAC_IC_MSG_PCM_X_DRAIN_POLL, sizeof(PcmXDrainPollPayload) },
+		{ PGRAC_IC_MSG_PCM_X_DRAIN_ACK, sizeof(PcmXPhasePayload) },
+	};
+	Size i;
+	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+
+	memset(&payload, 0, sizeof(payload));
+	memcpy(payload.bytes, &tag, sizeof(tag));
+	for (i = 0; i < lengthof(staged); i++) {
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(staged[i].msg_type, payload.bytes,
+													 staged[i].payload_len,
+													 CLUSTER_LMS_MAX_WORKERS),
+					 expected);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(staged[i].msg_type, payload.bytes,
+													 staged[i].payload_len - 1,
+													 CLUSTER_LMS_MAX_WORKERS),
+					 -1);
+	}
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO, payload.bytes,
+												 sizeof(PcmXRetirePayload),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_PCM_X_RETIRE_ACK, payload.bytes,
+												 sizeof(PcmXRetirePayload),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -391,6 +453,7 @@ main(void)
 	UT_RUN(test_route_length_mismatch_refused);
 	UT_RUN(test_route_n1_degenerate_zero);
 	UT_RUN(test_route_ignores_non_tag_fields);
+	UT_RUN(test_pcm_x_route_truth_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

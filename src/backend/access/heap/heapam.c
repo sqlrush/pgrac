@@ -3238,6 +3238,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 				ClusterTxwResult txw;
 
 				txw = cluster_tx_enqueue_wait(&ckey, cluster_ges_request_timeout_ms);
+				if (txw == CLUSTER_TXW_RETRY)
+					ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+									errmsg("remote writer wait blocked by a PCM-X holder probe"),
+									errhint("Retry the transaction after the current Cache Fusion "
+											"conversion round completes.")));
 				if (txw == CLUSTER_TXW_TIMEOUT) {
 					cluster_vis_bump_vis_conflict_failclosed_count();
 					ereport(ERROR,
@@ -6451,8 +6456,16 @@ l3:
 									{
 										ClusterTxwResult txw;
 
-										txw = cluster_tx_enqueue_wait(&ckey,
-																	  cluster_ges_request_timeout_ms);
+										txw = cluster_tx_enqueue_wait(
+											&ckey, cluster_ges_request_timeout_ms);
+										if (txw == CLUSTER_TXW_RETRY)
+											ereport(ERROR,
+													(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+													 errmsg("remote row-lock wait blocked by a "
+															"PCM-X holder probe"),
+													 errhint("Retry the transaction after the "
+															 "current Cache Fusion "
+															 "conversion round completes.")));
 										if (txw == CLUSTER_TXW_TIMEOUT)
 											ereport(ERROR,
 													(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),

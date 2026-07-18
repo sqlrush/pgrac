@@ -52,6 +52,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_shmem.h"
 
 /*
@@ -384,6 +385,11 @@ int cluster_cr_cache_max_blocks = 64;
 
 void
 cluster_pcm_lock_module_init(void)
+{}
+
+/* spec-2.36a S3-core stub: the PCM-X substrate has its own unit binary. */
+void
+cluster_pcm_x_convert_shmem_register(void)
 {}
 
 /* Spec-2.32 D2 stub: cluster_init_shmem_module also calls

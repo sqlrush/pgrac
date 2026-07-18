@@ -227,7 +227,7 @@ UT_TEST(test_s_barrier_set_pending_x_prototype_linkable)
 	/* Compile-time guard that the prototype matches the header decl.
 	 * NULL call is unreachable at runtime but ensures the symbol
 	 * compiles into the test binary's external reference table. */
-	void (*fp)(BufferTag, int32, uint64) = &cluster_pcm_lock_set_pending_x;
+	PcmPendingXReserveResult (*fp)(BufferTag, int32, uint64) = &cluster_pcm_lock_set_pending_x;
 
 	UT_ASSERT(fp != NULL);
 }

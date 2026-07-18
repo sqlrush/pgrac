@@ -55,6 +55,8 @@
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "port/pg_crc32c.h"
+#include "storage/bufpage.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -83,9 +85,13 @@ typedef struct ClusterGcsBlockDedupShard {
 	pg_atomic_uint64 done_marked_count;	  /* identity-verified DONE stamped */
 	pg_atomic_uint64 done_mismatch_count; /* DONE dropped: miss / identity / in-flight */
 	/* GCS-race round-2 review F5 (calibration 2): registration routing. */
-	pg_atomic_uint64 hint_violation_count; /* capable peer, hint 0 / over-max: denied */
-	pg_atomic_uint64 legacy_pin_count;	   /* no-capability peer: protocol-max pin */
-	pg_atomic_uint32 entry_count;		   /* live in-flight + completed entries */
+	pg_atomic_uint64 hint_violation_count;	 /* capable peer, hint 0 / over-max: denied */
+	pg_atomic_uint64 legacy_pin_count;		 /* no-capability peer: protocol-max pin */
+	pg_atomic_uint64 pcm_x_stage_count;		 /* RESERVED -> immutable image */
+	pg_atomic_uint64 pcm_x_replay_count;	 /* exact image replay */
+	pg_atomic_uint64 pcm_x_release_count;	 /* exact terminal release */
+	pg_atomic_uint64 pcm_x_failclosed_count; /* malformed, stale, or full image leg */
+	pg_atomic_uint32 entry_count;			 /* live in-flight + completed entries */
 } ClusterGcsBlockDedupShard;
 
 typedef struct ClusterGcsBlockDedupCtl {
@@ -102,6 +108,18 @@ static ClusterGcsBlockDedupShard *cluster_gcs_block_dedup_shards = NULL;
 static HTAB *cluster_gcs_block_dedup_htabs[CLUSTER_LMS_MAX_WORKERS];
 static int cluster_gcs_block_dedup_n_shards = 0;
 static bool dedup_backend_exit_hook_registered = false;
+/* Process-local LMS cursors.  Each DATA worker owns exactly one shard in one
+ * process, so this adds no shared-memory region or cross-worker authority. */
+static GcsBlockDedupKey dedup_pcm_x_work_cursor[CLUSTER_LMS_MAX_WORKERS];
+static bool dedup_pcm_x_work_cursor_valid[CLUSTER_LMS_MAX_WORKERS];
+/* When both classes stay runnable, alternate the single-work LMS tick budget.
+ * The initial false value preserves RESERVED-first admission while bounding a
+ * READY replay behind at most one reservation tick. */
+static bool dedup_pcm_x_prefer_ready_next[CLUSTER_LMS_MAX_WORKERS];
+/* Process-local wake hint.  An empty scan clears it; exact reserve/rearm sets
+ * it.  This keeps ordinary GCS traffic from rescanning every 8KB entry on
+ * every LMS tick when no PCM-X image work exists. */
+static bool dedup_pcm_x_work_pending[CLUSTER_LMS_MAX_WORKERS];
 
 /*
  * Upper bound on entries examined per cap-full eager-reclaim probe.  We do
@@ -243,6 +261,12 @@ cluster_gcs_block_dedup_shmem_init(void)
 	cluster_gcs_block_dedup_shards
 		= (ClusterGcsBlockDedupShard *)(base + MAXALIGN(sizeof(ClusterGcsBlockDedupCtl)));
 	cluster_gcs_block_dedup_n_shards = n;
+	memset(dedup_pcm_x_work_cursor, 0, sizeof(dedup_pcm_x_work_cursor));
+	memset(dedup_pcm_x_work_cursor_valid, 0, sizeof(dedup_pcm_x_work_cursor_valid));
+	memset(dedup_pcm_x_prefer_ready_next, 0, sizeof(dedup_pcm_x_prefer_ready_next));
+	memset(dedup_pcm_x_work_pending, 0, sizeof(dedup_pcm_x_work_pending));
+	for (i = 0; i < n; i++)
+		dedup_pcm_x_work_pending[i] = true;
 
 	if (!found) {
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_ctl->misroute_failclosed_count, 0);
@@ -266,6 +290,10 @@ cluster_gcs_block_dedup_shmem_init(void)
 			pg_atomic_init_u64(&shard->done_mismatch_count, 0);
 			pg_atomic_init_u64(&shard->hint_violation_count, 0);
 			pg_atomic_init_u64(&shard->legacy_pin_count, 0);
+			pg_atomic_init_u64(&shard->pcm_x_stage_count, 0);
+			pg_atomic_init_u64(&shard->pcm_x_replay_count, 0);
+			pg_atomic_init_u64(&shard->pcm_x_release_count, 0);
+			pg_atomic_init_u64(&shard->pcm_x_failclosed_count, 0);
 			pg_atomic_init_u32(&shard->entry_count, 0);
 		}
 	}
@@ -359,6 +387,142 @@ cluster_gcs_block_dedup_register_backend_exit_hook(void)
 
 
 /* ============================================================
+ * PCM-X image-entry validation.
+ * ============================================================ */
+
+static void
+dedup_pcm_x_note_failclosed(ClusterGcsBlockDedupShard *shard)
+{
+	if (shard != NULL)
+		pg_atomic_fetch_add_u64(&shard->pcm_x_failclosed_count, 1);
+}
+
+static uint32
+dedup_pcm_x_block_checksum(const char *block_data)
+{
+	pg_crc32c crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, block_data, GCS_BLOCK_DATA_SIZE);
+	FIN_CRC32C(crc);
+	return (uint32)crc;
+}
+
+static bool
+dedup_pcm_x_key_valid(const GcsBlockDedupKey *key)
+{
+	return key != NULL && key->origin_node_id < PCM_X_PROTOCOL_NODE_LIMIT
+		   && key->requester_backend_id > 0
+		   && cluster_pcm_x_image_id_decode(key->request_id, NULL, NULL);
+}
+
+static bool
+dedup_pcm_x_binding_valid(const GcsBlockDedupKey *key, const BufferTag *tag,
+						  const GcsBlockPcmXImageBinding *binding, bool reserved)
+{
+	const PcmXTicketRef *ref;
+	const PcmXImageToken *image;
+	int32 requester_node;
+	int32 requester_backend_id;
+
+	if (!dedup_pcm_x_key_valid(key) || tag == NULL || binding == NULL
+		|| binding->master_session == 0)
+		return false;
+
+	ref = &binding->identity.ref;
+	image = &binding->identity.image;
+	if (memcmp(&ref->identity.tag, tag, sizeof(*tag)) != 0
+		|| ref->identity.node_id != (int32)key->origin_node_id
+		|| ref->identity.cluster_epoch != key->cluster_epoch || ref->identity.wait_seq == 0
+		|| ref->handle.ticket_id == 0 || ref->handle.queue_generation == 0
+		|| ref->grant_generation == 0 || image->image_id != key->request_id
+		|| image->source_node >= PCM_X_PROTOCOL_NODE_LIMIT || cluster_node_id < 0
+		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| image->source_node != (uint32)cluster_node_id)
+		return false;
+
+	if (!cluster_gcs_requester_id_decode(ref->identity.request_id, &requester_node,
+										 &requester_backend_id, NULL)
+		|| requester_node != ref->identity.node_id
+		|| requester_backend_id != key->requester_backend_id)
+		return false;
+
+	if (reserved && (image->page_scn != 0 || image->page_lsn != 0 || image->page_checksum != 0))
+		return false;
+	return true;
+}
+
+static bool
+dedup_pcm_x_reservation_equal(const GcsBlockDedupEntry *entry,
+							  const GcsBlockPcmXImageBinding *binding)
+{
+	const GcsBlockPcmXImageIdentity *stored = &entry->payload_meta.pcm_x_identity;
+	const GcsBlockPcmXImageIdentity *incoming = &binding->identity;
+
+	return entry->pcm_x_master_session == binding->master_session
+		   && memcmp(&stored->ref, &incoming->ref, sizeof(stored->ref)) == 0
+		   && stored->image.image_id == incoming->image.image_id
+		   && stored->image.source_own_generation == incoming->image.source_own_generation
+		   && stored->image.source_node == incoming->image.source_node;
+}
+
+static bool
+dedup_pcm_x_ready_payload_valid(const GcsBlockDedupKey *key, const BufferTag *tag,
+								const GcsBlockPcmXImageBinding *binding,
+								const GcsBlockReplyHeader *reply_header, const char *block_data)
+{
+	const PcmXImageToken *image;
+	PageHeaderData page_header;
+	static const uint8 zero_reserved[sizeof(reply_header->reserved_0)] = { 0 };
+
+	if (!dedup_pcm_x_binding_valid(key, tag, binding, false) || reply_header == NULL
+		|| block_data == NULL)
+		return false;
+
+	image = &binding->identity.image;
+	if (reply_header->request_id != key->request_id || reply_header->page_lsn != image->page_lsn
+		|| reply_header->epoch != key->cluster_epoch
+		|| reply_header->checksum != image->page_checksum
+		|| reply_header->sender_node != (int32)image->source_node
+		|| reply_header->requester_backend_id != key->requester_backend_id
+		|| reply_header->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| reply_header->status != (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+		|| GcsBlockReplyHeaderGetForwardingMasterNode(reply_header)
+			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+		|| memcmp(reply_header->reserved_0, zero_reserved, sizeof(zero_reserved)) != 0)
+		return false;
+
+	memcpy(&page_header, block_data, sizeof(page_header));
+	return image->page_lsn == (uint64)PageXLogRecPtrGet(page_header.pd_lsn)
+		   && image->page_scn == (uint64)page_header.pd_block_scn
+		   && image->page_checksum == dedup_pcm_x_block_checksum(block_data);
+}
+
+static bool
+dedup_pcm_x_entry_payload_valid(const GcsBlockDedupKey *key, const BufferTag *tag,
+								const GcsBlockDedupEntry *entry)
+{
+	GcsBlockPcmXImageBinding binding;
+
+	binding.identity = entry->payload_meta.pcm_x_identity;
+	binding.master_session = entry->pcm_x_master_session;
+	return entry->transition_id == (uint8)PCM_TRANS_N_TO_S
+		   && entry->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+		   && dedup_pcm_x_ready_payload_valid(key, tag, &binding, &entry->reply_header,
+											  entry->block_data);
+}
+
+
+static bool
+dedup_pcm_x_entry_ready_valid(const GcsBlockDedupKey *key, const BufferTag *tag,
+							  const GcsBlockDedupEntry *entry)
+{
+	return entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+		   && dedup_pcm_x_entry_payload_valid(key, tag, entry);
+}
+
+
+/* ============================================================
  * Public API.
  * ============================================================ */
 
@@ -382,12 +546,22 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
 	if (shard == NULL)
 		return GCS_BLOCK_DEDUP_FULL; /* not initialized / mis-route; fail closed */
+	if (cluster_pcm_x_image_id_decode(key->request_id, NULL, NULL)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
+	}
 
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
 
 	if (found) {
+		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
+			dedup_pcm_x_note_failclosed(shard);
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
+		}
+
 		/* HC91 — entry value collision check */
 		if (memcmp(&entry->tag, &tag, sizeof(BufferTag)) != 0
 			|| entry->transition_id != transition_id) {
@@ -480,6 +654,7 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	entry->tag = tag;
 	entry->transition_id = transition_id;
 	entry->status = 0;
+	entry->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
 	entry->completed_at_ts = 0;
 	entry->registered_at_ts = GetCurrentTimestamp();
 
@@ -514,6 +689,660 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	return result;
 }
 
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_reserve(int worker_id, const GcsBlockDedupKey *key,
+									  const BufferTag *tag,
+									  const GcsBlockPcmXImageBinding *reserved_binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_binding_valid(key, tag, reserved_binding, true)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (found) {
+		if ((entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+			 || entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+			 || entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED)
+			&& entry->transition_id == (uint8)PCM_TRANS_N_TO_S
+			&& memcmp(&entry->tag, tag, sizeof(*tag)) == 0
+			&& dedup_pcm_x_reservation_equal(entry, reserved_binding)) {
+			dedup_pcm_x_work_pending[worker_id] = true;
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+		}
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
+	if (entry == NULL
+		&& dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1) > 0)
+		entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
+	if (entry == NULL || found) {
+		pg_atomic_fetch_add_u64(&shard->full_count, 1);
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	}
+
+	memset(((char *)entry) + sizeof(GcsBlockDedupKey), 0,
+		   sizeof(GcsBlockDedupEntry) - sizeof(GcsBlockDedupKey));
+	entry->tag = *tag;
+	entry->transition_id = (uint8)PCM_TRANS_N_TO_S;
+	entry->entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED;
+	entry->pcm_x_master_session = reserved_binding->master_session;
+	entry->payload_meta.pcm_x_identity = reserved_binding->identity;
+	entry->registered_at_ts = GetCurrentTimestamp();
+	pg_atomic_fetch_add_u32(&shard->entry_count, 1);
+	dedup_pcm_x_work_pending[worker_id] = true;
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_RESERVED;
+}
+
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_materialize(int worker_id, const GcsBlockDedupKey *key,
+										  const BufferTag *tag,
+										  const GcsBlockPcmXImageBinding *ready_binding,
+										  const GcsBlockReplyHeader *reply_header,
+										  const char *block_data)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_ready_payload_valid(key, tag, ready_binding, reply_header, block_data)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+		|| entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED) {
+		GcsBlockPcmXImageBinding stored_binding;
+
+		stored_binding.identity = entry->payload_meta.pcm_x_identity;
+		stored_binding.master_session = entry->pcm_x_master_session;
+		if (entry->transition_id == (uint8)PCM_TRANS_N_TO_S
+			&& memcmp(&entry->tag, tag, sizeof(*tag)) == 0
+			&& GcsBlockPcmXImageBindingEqual(&stored_binding, ready_binding)
+			&& dedup_pcm_x_entry_payload_valid(key, tag, entry)
+			&& memcmp(&entry->reply_header, reply_header, sizeof(*reply_header)) == 0
+			&& memcmp(entry->block_data, block_data, GCS_BLOCK_DATA_SIZE) == 0) {
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+		}
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| !dedup_pcm_x_reservation_equal(entry, ready_binding)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+
+	{
+		GcsBlockPcmXImageIdentity reserved_identity = entry->payload_meta.pcm_x_identity;
+		GcsBlockPcmXImageBinding stored_binding;
+
+		entry->reply_header = *reply_header;
+		entry->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+		entry->payload_meta.pcm_x_identity = ready_binding->identity;
+		memcpy(entry->block_data, block_data, GCS_BLOCK_DATA_SIZE);
+		entry->completed_at_ts = GetCurrentTimestamp();
+		stored_binding.identity = entry->payload_meta.pcm_x_identity;
+		stored_binding.master_session = entry->pcm_x_master_session;
+		if (!dedup_pcm_x_ready_payload_valid(key, tag, &stored_binding, &entry->reply_header,
+											 entry->block_data)) {
+			memset(&entry->reply_header, 0, sizeof(entry->reply_header));
+			memset(entry->block_data, 0, GCS_BLOCK_DATA_SIZE);
+			entry->payload_meta.pcm_x_identity = reserved_identity;
+			entry->status = 0;
+			entry->completed_at_ts = 0;
+			dedup_pcm_x_note_failclosed(shard);
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+		}
+	}
+	entry->entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED;
+	pg_atomic_fetch_add_u64(&shard->pcm_x_stage_count, 1);
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_STORED;
+}
+
+
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_publish_ready_exact(int worker_id, const GcsBlockDedupKey *key,
+												  const BufferTag *tag,
+												  const GcsBlockPcmXImageBinding *ready_binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding stored_binding;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_binding_valid(key, tag, ready_binding, false)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	stored_binding.identity = entry->payload_meta.pcm_x_identity;
+	stored_binding.master_session = entry->pcm_x_master_session;
+	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| !GcsBlockPcmXImageBindingEqual(&stored_binding, ready_binding)
+		|| !dedup_pcm_x_entry_payload_valid(key, tag, entry)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE) {
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+	}
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+
+	entry->entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE;
+	dedup_pcm_x_work_pending[worker_id] = true;
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_STORED;
+}
+
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_lookup(int worker_id, const GcsBlockDedupKey *key,
+									 const BufferTag *tag,
+									 const GcsBlockPcmXImageBinding *expected_binding,
+									 GcsBlockDedupEntry *cached_reply_out)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding stored_binding;
+	bool found = false;
+	bool binding_is_reserved;
+
+	if (cached_reply_out != NULL)
+		memset(cached_reply_out, 0, sizeof(*cached_reply_out));
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	binding_is_reserved = expected_binding != NULL && expected_binding->identity.image.page_scn == 0
+						  && expected_binding->identity.image.page_lsn == 0
+						  && expected_binding->identity.image.page_checksum == 0;
+	if (!dedup_pcm_x_binding_valid(key, tag, expected_binding, binding_is_reserved)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+			&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+			&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	stored_binding.identity = entry->payload_meta.pcm_x_identity;
+	stored_binding.master_session = entry->pcm_x_master_session;
+	if (!GcsBlockPcmXImageBindingEqual(&stored_binding, expected_binding)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_READY;
+	}
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED) {
+		if (!dedup_pcm_x_entry_payload_valid(key, tag, entry)) {
+			dedup_pcm_x_note_failclosed(shard);
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PCM_X_IMAGE_STALE;
+		}
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_READY;
+	}
+	if (!dedup_pcm_x_entry_ready_valid(key, tag, entry)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+
+	if (cached_reply_out != NULL)
+		*cached_reply_out = *entry;
+	pg_atomic_fetch_add_u64(&shard->pcm_x_replay_count, 1);
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_REPLAY;
+}
+
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_release_exact(int worker_id, const GcsBlockDedupKey *key,
+											const BufferTag *tag,
+											const GcsBlockPcmXImageBinding *binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding stored_binding;
+	bool found = false;
+	bool binding_is_reserved;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	binding_is_reserved = binding != NULL && binding->identity.image.page_scn == 0
+						  && binding->identity.image.page_lsn == 0
+						  && binding->identity.image.page_checksum == 0;
+	if (!dedup_pcm_x_binding_valid(key, tag, binding, binding_is_reserved)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	stored_binding.identity = entry->payload_meta.pcm_x_identity;
+	stored_binding.master_session = entry->pcm_x_master_session;
+	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+			&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+			&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED)
+		|| !GcsBlockPcmXImageBindingEqual(&stored_binding, binding)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+
+	(void)hash_search(htab, key, HASH_REMOVE, &found);
+	Assert(found);
+	pg_atomic_fetch_sub_u32(&shard->entry_count, 1);
+	pg_atomic_fetch_add_u64(&shard->pcm_x_release_count, 1);
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_RELEASED;
+}
+
+
+static void
+dedup_pcm_x_copy_work(const GcsBlockDedupEntry *entry, GcsBlockPcmXImageWork *work)
+{
+	memset(work, 0, sizeof(*work));
+	work->key = entry->key;
+	work->binding.identity = entry->payload_meta.pcm_x_identity;
+	work->binding.master_session = entry->pcm_x_master_session;
+	work->tag = entry->tag;
+	work->entry_kind = entry->entry_kind;
+}
+
+
+static int
+dedup_pcm_x_key_compare(const GcsBlockDedupKey *left, const GcsBlockDedupKey *right)
+{
+	if (left->origin_node_id != right->origin_node_id)
+		return left->origin_node_id < right->origin_node_id ? -1 : 1;
+	if (left->requester_backend_id != right->requester_backend_id)
+		return left->requester_backend_id < right->requester_backend_id ? -1 : 1;
+	if (left->request_id != right->request_id)
+		return left->request_id < right->request_id ? -1 : 1;
+	if (left->cluster_epoch != right->cluster_epoch)
+		return left->cluster_epoch < right->cluster_epoch ? -1 : 1;
+	return 0;
+}
+
+
+static void
+dedup_pcm_x_consider_work(const GcsBlockDedupEntry *entry, const GcsBlockDedupKey *cursor,
+						  bool cursor_valid, GcsBlockPcmXImageWork *after, bool *have_after,
+						  GcsBlockPcmXImageWork *wrap, bool *have_wrap)
+{
+	bool is_after = cursor_valid && dedup_pcm_x_key_compare(&entry->key, cursor) > 0;
+
+	if (is_after && (!*have_after || dedup_pcm_x_key_compare(&entry->key, &after->key) < 0)) {
+		dedup_pcm_x_copy_work(entry, after);
+		*have_after = true;
+	}
+	if (!*have_wrap || dedup_pcm_x_key_compare(&entry->key, &wrap->key) < 0) {
+		dedup_pcm_x_copy_work(entry, wrap);
+		*have_wrap = true;
+	}
+}
+
+
+/* Return at most one immutable work token per LMS tick.  RESERVED wins the
+ * first mixed-class tick, then mixed-class selections alternate so neither
+ * fresh byte materialization nor READY replay can starve.  Within each class
+ * a process-local exact-key cursor prevents one pinned holder from
+ * monopolizing every tick. */
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_next_work(int worker_id, GcsBlockPcmXImageWork *work_out)
+{
+	ClusterGcsBlockDedupShard *shard;
+	GcsBlockPcmXImageWork ready_after;
+	GcsBlockPcmXImageWork ready_wrap;
+	GcsBlockPcmXImageWork reserved_after;
+	GcsBlockPcmXImageWork reserved_wrap;
+	HTAB *htab = NULL;
+	HASH_SEQ_STATUS scan;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding binding;
+	GcsBlockPcmXImageResult result = GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	bool have_ready_after = false;
+	bool have_ready_wrap = false;
+	bool have_reserved_after = false;
+	bool have_reserved_wrap = false;
+
+	if (work_out != NULL)
+		memset(work_out, 0, sizeof(*work_out));
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (work_out == NULL) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+	if (!dedup_pcm_x_work_pending[worker_id])
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	hash_seq_init(&scan, htab);
+	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
+		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+			&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE)
+			continue;
+		/* A READY entry admitted to the outbound ring sleeps until an exact
+		 * type-49 retransmit clears this marker. */
+		if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE && entry->done_at_ts != 0)
+			continue;
+		binding.identity = entry->payload_meta.pcm_x_identity;
+		binding.master_session = entry->pcm_x_master_session;
+		if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+			|| (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+				&& !dedup_pcm_x_binding_valid(&entry->key, &entry->tag, &binding, true))
+			|| (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+				&& !dedup_pcm_x_entry_ready_valid(&entry->key, &entry->tag, entry))) {
+			dedup_pcm_x_note_failclosed(shard);
+			result = GCS_BLOCK_PCM_X_IMAGE_INVALID;
+			break;
+		}
+		if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED) {
+			dedup_pcm_x_consider_work(entry, &dedup_pcm_x_work_cursor[worker_id],
+									  dedup_pcm_x_work_cursor_valid[worker_id], &reserved_after,
+									  &have_reserved_after, &reserved_wrap, &have_reserved_wrap);
+		} else
+			dedup_pcm_x_consider_work(entry, &dedup_pcm_x_work_cursor[worker_id],
+									  dedup_pcm_x_work_cursor_valid[worker_id], &ready_after,
+									  &have_ready_after, &ready_wrap, &have_ready_wrap);
+	}
+	/* hash_seq_search() terminates a naturally exhausted scan itself.  Only
+	 * the validation-failure break above leaves an open scan to close here. */
+	if (result != GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND)
+		hash_seq_term(&scan);
+	if (result == GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND) {
+		bool have_ready = have_ready_after || have_ready_wrap;
+		bool have_reserved = have_reserved_after || have_reserved_wrap;
+		bool choose_ready = have_ready && have_reserved && dedup_pcm_x_prefer_ready_next[worker_id];
+
+		if (have_reserved && !choose_ready) {
+			*work_out = have_reserved_after ? reserved_after : reserved_wrap;
+			result = GCS_BLOCK_PCM_X_IMAGE_RESERVED;
+		} else if (have_ready) {
+			*work_out = have_ready_after ? ready_after : ready_wrap;
+			result = GCS_BLOCK_PCM_X_IMAGE_REPLAY;
+		}
+		if (result != GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND) {
+			dedup_pcm_x_work_cursor[worker_id] = work_out->key;
+			dedup_pcm_x_work_cursor_valid[worker_id] = true;
+			if (have_ready && have_reserved)
+				dedup_pcm_x_prefer_ready_next[worker_id] = !choose_ready;
+		}
+	}
+	if (result == GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND || result == GCS_BLOCK_PCM_X_IMAGE_INVALID)
+		dedup_pcm_x_work_pending[worker_id] = false;
+	LWLockRelease(&shard->lock.lock);
+	return result;
+}
+
+
+/* Mark only outbound-ring admission, not application completion.  The exact
+ * DRAIN_POLL consumer remains the sole owner of byte release. */
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_mark_staged_exact(int worker_id, const GcsBlockDedupKey *key,
+												const BufferTag *tag,
+												const GcsBlockPcmXImageBinding *ready_binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding stored_binding;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_binding_valid(key, tag, ready_binding, false)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	stored_binding.identity = entry->payload_meta.pcm_x_identity;
+	stored_binding.master_session = entry->pcm_x_master_session;
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| !GcsBlockPcmXImageBindingEqual(&stored_binding, ready_binding)
+		|| !dedup_pcm_x_entry_ready_valid(key, tag, entry)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->done_at_ts != 0) {
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+	}
+	entry->done_at_ts = GetCurrentTimestamp();
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_STAGED;
+}
+
+
+/* Roll back only a failed outbound-ring admission.  The complete READY
+ * binding is required because the reservation-shaped type-49 rearm API has a
+ * different authority: it is remote retransmit evidence, not a local enqueue
+ * transaction. */
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_unmark_staged_exact(int worker_id, const GcsBlockDedupKey *key,
+												  const BufferTag *tag,
+												  const GcsBlockPcmXImageBinding *ready_binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockPcmXImageBinding stored_binding;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_binding_valid(key, tag, ready_binding, false)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	stored_binding.identity = entry->payload_meta.pcm_x_identity;
+	stored_binding.master_session = entry->pcm_x_master_session;
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| !GcsBlockPcmXImageBindingEqual(&stored_binding, ready_binding)
+		|| !dedup_pcm_x_entry_ready_valid(key, tag, entry)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->done_at_ts == 0) {
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+	}
+	entry->done_at_ts = 0;
+	dedup_pcm_x_work_pending[worker_id] = true;
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_REARMED;
+}
+
+
+/* A byte-exact type-49 retransmit means the master has not applied type 50.
+ * It may re-open only the matching READY outbound marker; a still-RESERVED
+ * entry already appears in the normal work scan and needs no state change. */
+GcsBlockPcmXImageResult
+cluster_gcs_block_dedup_pcm_x_rearm_exact(int worker_id, const GcsBlockDedupKey *key,
+										  const BufferTag *tag,
+										  const GcsBlockPcmXImageBinding *reserved_binding)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PCM_X_IMAGE_FULL;
+	if (!dedup_pcm_x_binding_valid(key, tag, reserved_binding, true)) {
+		dedup_pcm_x_note_failclosed(shard);
+		return GCS_BLOCK_PCM_X_IMAGE_INVALID;
+	}
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if ((entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+		 && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE)
+		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| !dedup_pcm_x_reservation_equal(entry, reserved_binding)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED) {
+		dedup_pcm_x_work_pending[worker_id] = true;
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_NOT_READY;
+	}
+	if (!dedup_pcm_x_entry_ready_valid(key, tag, entry)) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
+	if (entry->done_at_ts == 0) {
+		dedup_pcm_x_work_pending[worker_id] = true;
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_DUPLICATE;
+	}
+	entry->done_at_ts = 0;
+	dedup_pcm_x_work_pending[worker_id] = true;
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PCM_X_IMAGE_REARMED;
+}
+
+
+/* A newly forked LMS has no proof about which instruction the previous owner
+ * completed.  Any dedicated entry is therefore retained recovery evidence;
+ * the caller transitions the PCM-X runtime to RECOVERY_BLOCKED. */
+bool
+cluster_gcs_block_dedup_pcm_x_restart_audit(int worker_id)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	HASH_SEQ_STATUS scan;
+	GcsBlockDedupEntry *entry;
+	bool evidence_found = false;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return true;
+
+	LWLockAcquire(&shard->lock.lock, LW_SHARED);
+	hash_seq_init(&scan, htab);
+	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
+		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
+			evidence_found = true;
+			hash_seq_term(&scan);
+			break;
+		}
+	}
+	if (evidence_found)
+		dedup_pcm_x_note_failclosed(shard);
+	LWLockRelease(&shard->lock.lock);
+	return evidence_found;
+}
+
 /*
  * cluster_gcs_block_dedup_mark_done — GCS-race round-2 RC-F: consume a
  * requester completion proof.  Full identity verification + COMPLETED
@@ -539,14 +1368,18 @@ cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key, co
 
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
-	if (found && memcmp(&entry->tag, tag, sizeof(BufferTag)) == 0
-		&& entry->transition_id == transition_id && entry->completed_at_ts != 0) {
+	if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		&& memcmp(&entry->tag, tag, sizeof(BufferTag)) == 0 && entry->transition_id == transition_id
+		&& entry->completed_at_ts != 0) {
 		if (entry->done_at_ts == 0)
 			entry->done_at_ts = GetCurrentTimestamp();
 		stamped = true; /* duplicate DONE re-stamps nothing: idempotent */
 		pg_atomic_fetch_add_u64(&shard->done_marked_count, 1);
-	} else
+	} else {
+		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+			dedup_pcm_x_note_failclosed(shard);
 		pg_atomic_fetch_add_u64(&shard->done_mismatch_count, 1);
+	}
 	LWLockRelease(&shard->lock.lock);
 	return stamped;
 }
@@ -624,6 +1457,11 @@ cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *
 		LWLockRelease(&shard->lock.lock);
 		return;
 	}
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return;
+	}
 
 	entry->status = (uint8)status;
 	entry->reply_header = *header;
@@ -631,14 +1469,14 @@ cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *
 	entry->sf_flags
 		= has_sf_dep ? (GCS_BLOCK_REPLY_SF_HAS_DEP_VEC | GCS_BLOCK_REPLY_SF_EARLY_TRANSFER) : 0;
 	entry->sf_dep_count = 0;
-	cluster_sf_dep_vec_reset(&entry->sf_dep_vec);
+	cluster_sf_dep_vec_reset(&entry->payload_meta.sf_dep_vec);
 	if (has_sf_dep && sf_dep_vec != NULL) {
 		int i;
 
 		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
 			if (XLogRecPtrIsInvalid(sf_dep_vec->required[i]))
 				continue;
-			entry->sf_dep_vec.required[i] = sf_dep_vec->required[i];
+			entry->payload_meta.sf_dep_vec.required[i] = sf_dep_vec->required[i];
 			entry->sf_dep_count++;
 		}
 	}
@@ -668,6 +1506,7 @@ cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key)
 {
 	ClusterGcsBlockDedupShard *shard;
 	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
 	bool found;
 
 	Assert(key != NULL);
@@ -677,9 +1516,13 @@ cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key)
 		return;
 
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
-	(void)hash_search(htab, key, HASH_REMOVE, &found);
-	if (found)
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
+		(void)hash_search(htab, key, HASH_REMOVE, &found);
+		Assert(found);
 		pg_atomic_fetch_sub_u32(&shard->entry_count, 1);
+	} else if (found)
+		dedup_pcm_x_note_failclosed(shard);
 	LWLockRelease(&shard->lock.lock);
 }
 
@@ -837,6 +1680,9 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 			int64 age_us;
 			int64 deadline_us;
 
+			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+				continue;
+
 			/*
 			 * GCS-race round-2 RC-F: per-entry pinned deadlines.  A
 			 * DONE-proven entry only lingers its pinned quarantine (reorder
@@ -897,7 +1743,8 @@ cluster_gcs_block_dedup_cleanup_on_backend_exit(uint32 origin_node_id, int32 bac
 		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 		hash_seq_init(&seq, htab);
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
-			if (entry->key.origin_node_id == origin_node_id
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+				&& entry->key.origin_node_id == origin_node_id
 				&& entry->key.requester_backend_id == backend_id) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 				removed++;
@@ -930,7 +1777,8 @@ cluster_gcs_block_dedup_cleanup_on_node_dead(uint32 node_id)
 		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 		hash_seq_init(&seq, htab);
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
-			if (entry->key.origin_node_id == node_id) {
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+				&& entry->key.origin_node_id == node_id) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 				removed++;
 			}
@@ -1032,6 +1880,32 @@ uint64
 cluster_gcs_block_dedup_get_legacy_pin_count(void)
 {
 	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, legacy_pin_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_pcm_x_stage_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, pcm_x_stage_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_pcm_x_replay_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(offsetof(ClusterGcsBlockDedupShard, pcm_x_replay_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_pcm_x_release_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(
+		offsetof(ClusterGcsBlockDedupShard, pcm_x_release_count));
+}
+
+uint64
+cluster_gcs_block_dedup_get_pcm_x_failclosed_count(void)
+{
+	return cluster_gcs_block_dedup_sum_u64(
+		offsetof(ClusterGcsBlockDedupShard, pcm_x_failclosed_count));
 }
 
 /*

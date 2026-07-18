@@ -444,6 +444,16 @@ extern uint64 cluster_lmd_revalidate_fail_count_get(void);
 extern uint64 cluster_lmd_cross_node_victim_pending_count_get(void);
 extern uint64 cluster_lmd_inject_call_count_get(void);
 
+/* PCM-X connector-owned WFG accounting; generic graph calls do not bump it. */
+extern uint64 cluster_lmd_pcm_convert_wfg_replace_count_get(void);
+extern uint64 cluster_lmd_pcm_convert_wfg_remove_count_get(void);
+extern uint64 cluster_lmd_pcm_convert_wfg_replace_fail_count_get(void);
+extern uint64 cluster_lmd_pcm_convert_wfg_exact_remove_stale_count_get(void);
+extern void cluster_lmd_pcm_convert_wfg_note_replace(void);
+extern void cluster_lmd_pcm_convert_wfg_note_remove(void);
+extern void cluster_lmd_pcm_convert_wfg_note_replace_fail(void);
+extern void cluster_lmd_pcm_convert_wfg_note_exact_remove_stale(void);
+
 /* spec-2.23 D8 — coordinator probe counters. */
 extern uint64 cluster_lmd_probe_broadcast_count_get(void);
 extern uint64 cluster_lmd_probe_partial_count_get(void);
@@ -613,8 +623,36 @@ extern void cluster_lmd_graph_shmem_init(void);
 
 /* Graph low-level mutators (used by cluster_lmd_tarjan.c + D16 SRF). */
 extern bool cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge);
+/*
+ * spec-2.36a C2 -- atomically replace one waiter's complete blocker set.
+ * The graph either publishes exactly the distinct blocker identities supplied
+ * here, or leaves the previous set untouched (including on capacity failure).
+ * A zero-length set is an atomic remove-all.  Callers must hold no queue,
+ * buffer, or GRD locks while invoking this API.
+ */
+extern uint64 cluster_lmd_graph_replace_waiter_edges_exact(const ClusterLmdVertex *waiter,
+														   const ClusterLmdVertex *blockers,
+														   int nblockers, uint64 request_id);
+extern bool cluster_lmd_graph_replace_waiter_edges(const ClusterLmdVertex *waiter,
+												   const ClusterLmdVertex *blockers, int nblockers,
+												   uint64 request_id);
 extern bool cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter);
 extern bool cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter);
+
+/*
+ * An exact removal distinguishes a stable no-edge observation from an ABA
+ * mismatch.  STALE never mutates the newer wait instance.  The legacy bool
+ * wrapper below remains true only for REMOVED.
+ */
+typedef enum ClusterLmdGraphRemoveResult {
+	CLUSTER_LMD_GRAPH_REMOVE_REMOVED = 0,
+	CLUSTER_LMD_GRAPH_REMOVE_ABSENT,
+	CLUSTER_LMD_GRAPH_REMOVE_STALE
+} ClusterLmdGraphRemoveResult;
+
+extern ClusterLmdGraphRemoveResult
+cluster_lmd_graph_remove_edge_by_waiter_exact_result(const ClusterLmdVertex *waiter);
+extern bool cluster_lmd_graph_remove_edge_by_waiter_exact(const ClusterLmdVertex *waiter);
 extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_edges,
 										   uint64 *out_gen_at_snapshot);
 

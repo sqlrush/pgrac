@@ -40,7 +40,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr \
         test_cluster_scn test_cluster_scn_frontier test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source test_cluster_itl_touch test_cluster_itl_wal test_cluster_uba \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_pcm_x_convert test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source test_cluster_itl_touch test_cluster_itl_wal test_cluster_uba \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_marker_async \
@@ -96,10 +96,10 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
         test_cluster_undo_verdict \
-        test_cluster_vis_undo_verdict_map \
-        test_cluster_undo_horizon \
-        test_cluster_lms_shard \
-        test_cluster_gcs_block_dedup \
+		test_cluster_vis_undo_verdict_map \
+		test_cluster_undo_horizon \
+		test_cluster_lms_shard test_cluster_pcm_x_image_fetch \
+		test_cluster_gcs_block_dedup \
         test_cluster_gcs_block_shard
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
@@ -164,6 +164,9 @@ CLUSTER_LOCK_ACQUIRE_O = $(top_builddir)/src/backend/cluster/cluster_lock_acquir
 # the transition validator + counter accessors standalone (20 PG-runtime
 # deps stubbed in the test binary).
 CLUSTER_PCM_LOCK_O = $(top_builddir)/src/backend/cluster/cluster_pcm_lock.o
+CLUSTER_PCM_OWN_O = $(top_builddir)/src/backend/cluster/cluster_pcm_own.o
+CLUSTER_PCM_DIRECT_INIT_O = $(top_builddir)/src/backend/cluster/cluster_pcm_direct_init.o
+CLUSTER_PCM_X_CONVERT_O = $(top_builddir)/src/backend/cluster/cluster_pcm_x_convert.o
 CLUSTER_IC_TIER1_O = $(top_builddir)/src/backend/cluster/cluster_ic_tier1.o
 CLUSTER_GCS_O = $(top_builddir)/src/backend/cluster/cluster_gcs.o
 
@@ -201,6 +204,13 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+CLUSTER_PCM_X_IMAGE_FETCH_O = $(top_builddir)/src/backend/cluster/cluster_pcm_x_image_fetch.o
+test_cluster_pcm_x_image_fetch: test_cluster_pcm_x_image_fetch.c unit_test.h \
+		$(CLUSTER_PCM_X_IMAGE_FETCH_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_PCM_X_IMAGE_FETCH_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 # spec-7.3 D9: test_cluster_gcs_block_shard links cluster_gcs_block_shard.o
 # (the REAL staging-path payload -> worker router, extracted as a pure file)
 # + cluster_lms_shard.o so the route == shard_for_tag agreement is asserted
@@ -229,7 +239,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_served test_cluster_pcm_lock test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_pcm_x_convert test_cluster_pcm_x_image_fetch test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1277,12 +1287,15 @@ test_cluster_lmd_graph: test_cluster_lmd_graph.c unit_test.h \
 # standalone.  The wait-state object depends only on pg_atomic (libpgport);
 # the test exercises publish / clear / read / reset + wait_seq ABA on a
 # ClusterLmdProcWaitState directly (no PGPROC / shmem needed).
+$(CLUSTER_LMD_WAIT_STATE_O): $(top_srcdir)/src/include/cluster/cluster_lmd_wait_state.h
+
 test_cluster_lmd_wait_state: test_cluster_lmd_wait_state.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_lmd_wait_state.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_WAIT_STATE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_WAIT_STATE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
 
 # spec-5.9 D3: test_cluster_cancel_token links cluster_cancel_token.o
 # standalone.  The match logic (consume_against) only needs the spinlock +
@@ -1345,6 +1358,37 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# spec-2.36a C1/D5a: the real cluster_pcm_own object is linked against a
+# fake shmem region.  The test also reads the production bufmgr source through
+# an explicit build-time path so the D5a lock-order contract is paired with
+# the shared decision helpers instead of being represented by a fake bufmgr.
+test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
+		$(CLUSTER_PCM_OWN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# S3-core direct-init proof is a dependency-light, process-local decision
+# layer.  The real bufmgr captures/revalidates the snapshots under its header
+# spinlock; this test pins the byte-exact operation and rejection matrix.
+test_cluster_pcm_direct_init: test_cluster_pcm_direct_init.c unit_test.h \
+		$(CLUSTER_PCM_DIRECT_INIT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		-DVM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/visibilitymap.c"' \
+		-DFSM_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/freespace/freespace.c"' \
+		$< \
+		$(CLUSTER_PCM_DIRECT_INIT_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.36a S3-core: wire ABI + checked five-pool external shmem layout.
+test_cluster_pcm_x_convert: test_cluster_pcm_x_convert.c unit_test.h \
+		$(CLUSTER_PCM_X_CONVERT_O)
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_PCM_X_CONVERT_O) \
+		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
+
 # GCS-race round-4c tier1-partial-IO: test_cluster_ic_tier1_partial links
 # cluster_ic_tier1.o standalone and drives the PRODUCTION outbound-tail
 # queue/drain state machine over a real localhost TCP pair (initial-EAGAIN
@@ -1403,7 +1447,10 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # link cluster_gcs_block.o.  Behavioral coverage (HC82 / HC83 / HC84 /
 # HC88 / HC89 paths) lives in cluster_tap t/111.
 test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
+		$< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

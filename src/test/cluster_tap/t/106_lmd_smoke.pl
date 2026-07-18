@@ -20,9 +20,8 @@
 #	    L7: L122 alphabetic order — pg_cluster_state ORDER BY category
 #	        emits 'lmd' between 'lck' and 'lmon' (actual psql output
 #	        verify;**禁止凭字典直觉 sed** — ASCII `d` 0x64 < `o` 0x6F)
-#	    L8: dump_lmd contributes 24 rows under category='lmd'
-#	        (spec-2.19 daemon rows + spec-2.22 graph/Tarjan rows + spec-
-#	        2.24 D + cleanup rows)
+#	    L8: dump_lmd contributes 51 rows under category='lmd'
+#	        (existing daemon/graph/cancel/recovery rows + 4 PCM-X WFG rows)
 #	        in pg_cluster_state
 #	    L9: pg_cluster_lmd view explicit column count = 10
 #	        (regression防御 against view schema drift)
@@ -169,11 +168,12 @@ is($cat_order, 'lck,lmd,lmon,lms',
 
 
 # ----------
-# L8:  dump_lmd contributes 45 rows under category='lmd' in
+# L8:  dump_lmd contributes 51 rows under category='lmd' in
 # pg_cluster_state:
 #   - spec-2.19 daemon state surface: state + ready_at_us + 5 counters
 #   - spec-2.22 graph/Tarjan surface: 9 graph/deadlock rows
 #   - spec-2.23 probe: 2 rows;  spec-2.24 cancel/cleanup: 6 rows
+#   - PCM-X connector WFG replace/remove/failure/exact-remove-stale accounting: 4 rows
 #   - spec-5.8 D6: 3 rows (deadlock_confirmed / confirm_unconfirmed /
 #     reconfig_discard — coordinator two-round confirm + reconfig gate)
 #   - spec-5.8 D8: 5 rows (probe_report_enqueue / probe_drop_stale /
@@ -188,8 +188,8 @@ is($cat_order, 'lck,lmd,lmon,lms',
 # ----------
 my $lmd_rows = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='lmd'});
-is($lmd_rows, '47',
-   "L8 dump_lmd emits 47 rows under category='lmd' (daemon + graph/Tarjan/probe + spec-2.24 cancel/cleanup + spec-5.8 D6 confirm/reconfig + D8 shmem collector + spec-5.9 D10 victim-policy/cancel-robustness surface + Hardening v1.0.1 cancel_ack_mismatch + spec-5.8 Hardening v1.0.1 member_incomplete_count)");
+is($lmd_rows, '51',
+	"L8 dump_lmd emits 51 rows under category='lmd' (existing 47 + PCM-X connector WFG 4)");
 
 
 # ----------

@@ -661,7 +661,7 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	if (PageIsNew(BufferGetPage(buf)))
 	{
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		LockBufferForVisibilityMapPageInit(buf);
 		if (PageIsNew(BufferGetPage(buf)))
 			PageInit(BufferGetPage(buf), BLCKSZ, 0);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);

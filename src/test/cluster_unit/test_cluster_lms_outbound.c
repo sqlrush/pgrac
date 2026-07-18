@@ -54,6 +54,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -70,6 +71,35 @@ UT_DEFINE_GLOBALS();
 
 ProcessingMode Mode = NormalProcessing;
 BackendType MyBackendType = B_LMS;
+int cluster_node_id = 0;
+static PcmXRuntimeState ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
+static bool ut_write_fence_enforcing = false;
+static bool ut_write_fence_allowed = true;
+
+PcmXRuntimeSnapshot
+cluster_pcm_x_runtime_snapshot(void)
+{
+	PcmXRuntimeSnapshot snapshot = { 0 };
+
+	snapshot.state = ut_pcm_x_runtime_state;
+	if (snapshot.state == PCM_X_RUNTIME_ACTIVE) {
+		snapshot.master_session_incarnation = 1;
+		snapshot.gate_generation = 1;
+	}
+	return snapshot;
+}
+
+bool
+cluster_write_fence_enforcing(void)
+{
+	return ut_write_fence_enforcing;
+}
+
+bool
+cluster_write_fence_allowed(void)
+{
+	return ut_write_fence_allowed;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -190,6 +220,33 @@ typedef struct UtSentRec {
 static UtSentRec ut_sent_log[64];
 static int ut_sent_n = 0;
 static ClusterICSendResult ut_peer_rc[CLUSTER_MAX_NODES];
+static int ut_local_dispatch_count = 0;
+static uint8 ut_local_dispatch_marker = 0;
+
+bool
+cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
+						  uint32 dest_node_id, const void *payload, uint32 payload_length)
+{
+	memset(out_env, 0, sizeof(*out_env));
+	out_env->msg_type = msg_type;
+	out_env->source_node_id = source_node_id;
+	out_env->dest_node_id = dest_node_id;
+	out_env->payload_length = payload_length;
+	(void)payload;
+	return true;
+}
+
+bool
+cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
+{
+	UT_ASSERT(env != NULL);
+	UT_ASSERT_EQ((int32)env->source_node_id, cluster_node_id);
+	UT_ASSERT_EQ((int32)env->dest_node_id, cluster_node_id);
+	UT_ASSERT_EQ(peer_id, cluster_node_id);
+	ut_local_dispatch_count++;
+	ut_local_dispatch_marker = env->payload_length > 0 ? *(const uint8 *)payload : 0;
+	return true;
+}
 
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
@@ -221,13 +278,24 @@ static void
 ut_reset_log(void)
 {
 	ut_sent_n = 0;
+	ut_local_dispatch_count = 0;
+	ut_local_dispatch_marker = 0;
+	ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
+	ut_write_fence_enforcing = false;
+	ut_write_fence_allowed = true;
 	memset(ut_sent_log, 0, sizeof(ut_sent_log));
+}
+
+static bool
+ut_enqueue_typed_marker(int worker_id, uint8 msg_type, int32 dest, uint8 marker)
+{
+	return cluster_lms_outbound_enqueue(worker_id, msg_type, (uint32)dest, &marker, 1);
 }
 
 static bool
 ut_enqueue_marker(int worker_id, int32 dest, uint8 marker)
 {
-	return cluster_lms_outbound_enqueue(worker_id, UT_MSG_TYPE, (uint32)dest, &marker, 1);
+	return ut_enqueue_typed_marker(worker_id, UT_MSG_TYPE, dest, marker);
 }
 
 /* ============================================================
@@ -364,16 +432,85 @@ UT_TEST(test_blocked_peer_batch_keeps_per_peer_order)
 	UT_ASSERT(d1_idx < d2_idx);
 }
 
+/*
+ * PCM-X can hash a tag to the local node's master.  A DATA frame staged by a
+ * backend must still execute on that tag's LMS worker: the generic IC send
+ * self-shortcut reports DONE without dispatching, which would otherwise turn
+ * ENQUEUE/ACK into a silent no-op.  The worker therefore loopback-dispatches
+ * self frames and never hands them to the transport.
+ */
+UT_TEST(test_self_frame_dispatches_on_owning_worker)
+{
+	ut_reset_log();
+
+	UT_ASSERT(ut_enqueue_marker(5, cluster_node_id, 0xE1));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(5), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(5), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_local_dispatch_count, 1);
+	UT_ASSERT_EQ(ut_local_dispatch_marker, 0xE1);
+}
+
+
+/* A fail-closed runtime must retain a grant leg before transport admission.
+ * Later frames for the same peer stay behind it, while unrelated peers keep
+ * flowing.  Core has no recovery proof that could make these old-incarnation
+ * frames runnable, so repeated drains must keep them parked. */
+UT_TEST(test_pcm_x_grant_frame_waits_for_active_runtime)
+{
+	ut_reset_log();
+	ut_pcm_x_runtime_state = PCM_X_RUNTIME_RECOVERY_BLOCKED;
+
+	UT_ASSERT(ut_enqueue_typed_marker(6, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_X, 0xF1));
+	UT_ASSERT(ut_enqueue_marker(6, UT_PEER_X, 0xF2));
+	UT_ASSERT(ut_enqueue_marker(6, UT_PEER_Y, 0xF3));
+	(void)cluster_lms_outbound_drain_send(6);
+
+	UT_ASSERT_EQ(ut_count_marker(0xF1), 0);
+	UT_ASSERT_EQ(ut_count_marker(0xF2), 0);
+	UT_ASSERT_EQ(ut_count_marker(0xF3), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(6), 2);
+
+	(void)cluster_lms_outbound_drain_send(6);
+	UT_ASSERT_EQ(ut_count_marker(0xF1), 0);
+	UT_ASSERT_EQ(ut_count_marker(0xF2), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(6), 2);
+}
+
+
+UT_TEST(test_pcm_x_grant_frame_waits_behind_write_fence)
+{
+	ut_reset_log();
+	ut_write_fence_enforcing = true;
+	ut_write_fence_allowed = false;
+
+	UT_ASSERT(ut_enqueue_typed_marker(7, PGRAC_IC_MSG_PCM_X_COMMIT_X, UT_PEER_X, 0xF4));
+	UT_ASSERT(ut_enqueue_marker(7, UT_PEER_Y, 0xF5));
+	(void)cluster_lms_outbound_drain_send(7);
+
+	UT_ASSERT_EQ(ut_count_marker(0xF4), 0);
+	UT_ASSERT_EQ(ut_count_marker(0xF5), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 1);
+
+	ut_write_fence_allowed = true;
+	(void)cluster_lms_outbound_drain_send(7);
+	UT_ASSERT_EQ(ut_count_marker(0xF4), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(8);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
 	UT_RUN(test_blocked_peer_does_not_starve_other_peer);
 	UT_RUN(test_refused_frame_retained_and_delivered);
 	UT_RUN(test_blocked_peer_batch_keeps_per_peer_order);
+	UT_RUN(test_self_frame_dispatches_on_owning_worker);
+	UT_RUN(test_pcm_x_grant_frame_waits_for_active_runtime);
+	UT_RUN(test_pcm_x_grant_frame_waits_behind_write_fence);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

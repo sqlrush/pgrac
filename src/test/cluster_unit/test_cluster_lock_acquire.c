@@ -51,6 +51,7 @@
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
+#include "cluster/cluster_pcm_x_convert.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -487,6 +488,16 @@ cluster_lms_native_probe_wait_clear(const ClusterResId *resid pg_attribute_unuse
 /* spec-4.6 P0 regression harness — test-controlled GES reject reason
  * (GesRejectReason values; 0 = GRANT). */
 static uint32 stub_ges_reject_reason = 0;
+static PcmXQueueResult stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
+static int stub_ges_request_wait_calls;
+static int stub_ges_request_nowait_wait_calls;
+static int stub_ges_convert_wait_calls;
+
+PcmXQueueResult
+cluster_pcm_x_nested_wait_guard_before_block(void)
+{
+	return stub_pcm_x_nested_guard_result;
+}
 
 uint32
 cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
@@ -496,6 +507,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 								  int timeout_ms pg_attribute_unused(),
 								  uint32 wait_event pg_attribute_unused())
 {
+	stub_ges_request_wait_calls++;
 	return stub_ges_reject_reason;
 }
 
@@ -508,6 +520,7 @@ cluster_ges_send_request_nowait_and_wait(
 	uint64 request_id pg_attribute_unused(), int timeout_ms pg_attribute_unused(),
 	uint32 wait_event pg_attribute_unused())
 {
+	stub_ges_request_nowait_wait_calls++;
 	return stub_ges_reject_reason;
 }
 
@@ -537,6 +550,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint64 convert_request_id pg_attribute_unused(),
 								  int timeout_ms pg_attribute_unused())
 {
+	stub_ges_convert_wait_calls++;
 	return stub_ges_reject_reason;
 }
 
@@ -940,6 +954,7 @@ UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 {
 	ClusterLockAcquireRequest req;
 	int saved_node = cluster_node_id;
+	int nowait_calls = stub_ges_request_nowait_wait_calls;
 	uint32 saved_reject = stub_ges_reject_reason;
 	ClusterLockAcquireResult r;
 
@@ -967,6 +982,7 @@ UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 	stub_ges_reject_reason = GES_REJECT_REASON_TIMEOUT;
 	r = cluster_lock_acquire_s4_remote_request_wait(&req);
 	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+	UT_ASSERT_EQ(stub_ges_request_nowait_wait_calls, nowait_calls + 3);
 
 	/* BLOCKING + LOCK_CONFLICT is a protocol violation (blocking conflicts
 	 * enqueue a waiter, never REJECT) → FAIL_INTERNAL, never NOT_AVAIL. */
@@ -977,6 +993,49 @@ UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 
 	stub_ges_reject_reason = saved_reject;
 	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	int request_calls;
+	int convert_calls;
+
+	memset(&req, 0, sizeof(req));
+	req.lockmode = AccessExclusiveLock;
+	req.current_mode = AccessShareLock;
+	req.request_id = UINT64_C(88001);
+	request_calls = stub_ges_request_wait_calls;
+	convert_calls = stub_ges_convert_wait_calls;
+
+	stub_pcm_x_nested_guard_result = PCM_X_QUEUE_BARRIER_CLOSED;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING);
+	UT_ASSERT_EQ(stub_ges_request_wait_calls, request_calls);
+
+	req.op = CLUSTER_LOCK_OP_CONVERT;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING);
+	UT_ASSERT_EQ(stub_ges_convert_wait_calls, convert_calls);
+
+	stub_pcm_x_nested_guard_result = PCM_X_QUEUE_BUSY;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING);
+	UT_ASSERT_EQ(stub_ges_request_wait_calls, request_calls);
+
+	stub_pcm_x_nested_guard_result = PCM_X_QUEUE_CORRUPT;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(stub_ges_convert_wait_calls, convert_calls);
+
+	/* A positive leg proves the convert stub counter is wired to the actual
+	 * CONVERT sender rather than the unrelated REQUEST_NOWAIT sender. */
+	stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
+	stub_ges_reject_reason = GES_REJECT_REASON_NONE;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(stub_ges_convert_wait_calls, convert_calls + 1);
 }
 
 
@@ -1055,7 +1114,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1069,6 +1128,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
 	UT_RUN(test_ul_session_advisory_globalize_gate);
 	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
+	UT_RUN(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
 

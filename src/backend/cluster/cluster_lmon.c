@@ -1287,6 +1287,7 @@ LmonMain(void)
 			 * (event/epoch source) and AFTER dead_sweep (I47, P2).
 			 */
 			cluster_grd_recovery_lmon_tick();
+			cluster_gcs_block_pcm_x_formation_tick();
 
 			/*
 			 * spec-2.9 D2 review fix: BOC_BROADCAST is triggered by
@@ -1937,6 +1938,7 @@ LmonMain(void)
 			cluster_reconfig_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
 			cluster_grd_recovery_lmon_tick();
+			cluster_gcs_block_pcm_x_formation_tick();
 
 			/*
 			 * PGRAC: spec-5.3 — drain the GRD work queue in the stub /

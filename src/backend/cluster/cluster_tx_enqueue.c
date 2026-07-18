@@ -52,6 +52,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -271,39 +272,45 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	 */
 	PG_TRY();
 	{
-		for (;;) {
-			ClusterTTStatusResult cres;
-			bool found;
-			TimestampTz now;
-			long wait_ms;
+		PcmXQueueResult guard_result;
 
-			ResetLatch(MyLatch);
+		guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+		if (guard_result != PCM_X_QUEUE_OK)
+			result = CLUSTER_TXW_RETRY;
+		else
+			for (;;) {
+				ClusterTTStatusResult cres;
+				bool found;
+				TimestampTz now;
+				long wait_ms;
 
-			/* Re-check the holder's TT status (closes the register/wake race:
-			 * a terminal status published before we slept is seen here). */
-			found = cluster_tt_status_lookup_exact(holder_key, &cres);
-			if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
-				result = CLUSTER_TXW_RESOLVED;
-				break;
+				ResetLatch(MyLatch);
+
+				/* Re-check the holder's TT status (closes the register/wake race:
+				 * a terminal status published before we slept is seen here). */
+				found = cluster_tt_status_lookup_exact(holder_key, &cres);
+				if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
+					result = CLUSTER_TXW_RESOLVED;
+					break;
+				}
+
+				now = GetCurrentTimestamp();
+				if (now >= deadline) {
+					result = CLUSTER_TXW_TIMEOUT;
+					pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
+					break;
+				}
+
+				wait_ms = (long)((deadline - now) / 1000);
+				if (wait_ms <= 0)
+					wait_ms = 1;
+				if (wait_ms > CLUSTER_TXW_TICK_MS)
+					wait_ms = CLUSTER_TXW_TICK_MS;
+
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
+								WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
+				CHECK_FOR_INTERRUPTS();
 			}
-
-			now = GetCurrentTimestamp();
-			if (now >= deadline) {
-				result = CLUSTER_TXW_TIMEOUT;
-				pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
-				break;
-			}
-
-			wait_ms = (long)((deadline - now) / 1000);
-			if (wait_ms <= 0)
-				wait_ms = 1;
-			if (wait_ms > CLUSTER_TXW_TICK_MS)
-				wait_ms = CLUSTER_TXW_TICK_MS;
-
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
-							WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
-			CHECK_FOR_INTERRUPTS();
-		}
 	}
 	PG_CATCH();
 	{

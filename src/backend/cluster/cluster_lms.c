@@ -747,6 +747,7 @@ LmsMain(void)
 	 * the new generation. */
 	cluster_lms_bump_restart_generation_at_main_entry();
 	(void)cluster_ges_dedup_drop_stale_entries();
+	cluster_gcs_block_pcm_x_owner_start(0);
 
 	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
 	 * mesh (false = plane off for this node;  the loop below then keeps
@@ -817,14 +818,18 @@ LmsMain(void)
 			 * and a fenced node's reads must keep flowing exactly as
 			 * they do on the ungated CONTROL ring pre-flip;  gating
 			 * them wedges post-crash rejoin behind its own catalog
-			 * reads.  Thaw wakes the latch and the held image legs
-			 * resume (pure-read probe, no-throw, per the
-			 * write_fence_allowed contract). */
+			 * reads.  PCM-X types 50-56 are the exception: the ring
+			 * drain retains those grant legs behind its final runtime +
+			 * fence gate while unrelated read traffic keeps flowing.
+			 * Thaw wakes the latch and the held image legs resume
+			 * (pure-read probe, no-throw, per the write_fence_allowed
+			 * contract). */
 			if (cluster_gcs_block_family_on_data_plane()
 				&& !(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
 				cluster_lms_cr_ship_ready();
 				cluster_gcs_block_pi_discard_drain();
 			}
+			cluster_gcs_block_pcm_x_image_pump_tick(0);
 			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
 			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by the dispatch handler (bounded, one
@@ -922,6 +927,7 @@ LmsWorkerMain(int worker_id)
 
 	ereport(LOG, (errmsg("cluster_lms: DATA-plane worker %d started (pid %d)", worker_id,
 						 (int)MyProcPid)));
+	cluster_gcs_block_pcm_x_owner_start(worker_id);
 
 	/*
 	 * PGRAC: spec-7.3 D3 — bring up this worker's DATA-plane channel + mesh
@@ -963,6 +969,7 @@ LmsWorkerMain(int worker_id)
 			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
 			 * sent directly from the dispatch handler in THIS process, so
 			 * they already ride this worker's channel. */
+			cluster_gcs_block_pcm_x_image_pump_tick(worker_id);
 			(void)cluster_lms_outbound_drain_send(worker_id);
 			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by this worker's dispatch handler. */
