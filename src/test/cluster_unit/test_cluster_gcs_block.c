@@ -2188,6 +2188,8 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 	const char *install_runtime_before;
 	const char *install_publish;
 	const char *install_runtime_after;
+	const char *recovering_retry;
+	const char *reply_validation;
 	char *reply_handler;
 
 	UT_ASSERT_NOT_NULL(source);
@@ -2205,6 +2207,12 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 		UT_ASSERT_NOT_NULL(strstr(fetch, "cluster_pcm_x_image_fetch_reservation_exact("));
 		UT_ASSERT_NOT_NULL(strstr(fetch, "gcs_block_pcm_x_install_reserved_image_exact("));
 		UT_ASSERT_NOT_NULL(strstr(fetch, "gcs_block_release_slot(slot)"));
+		recovering_retry = strstr(fetch, "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING");
+		reply_validation = strstr(fetch, "cluster_pcm_x_image_fetch_reply_exact(");
+		UT_ASSERT_NOT_NULL(recovering_retry);
+		UT_ASSERT(recovering_retry == NULL || recovering_retry < fetch_end);
+		UT_ASSERT(recovering_retry == NULL || reply_validation == NULL
+				  || recovering_retry < reply_validation);
 		backoff_branch = strstr(fetch, "if (retry_attempt > 0)");
 		backoff_wait
 			= backoff_branch != NULL ? strstr(backoff_branch, "(void)WaitLatch(MyLatch") : NULL;

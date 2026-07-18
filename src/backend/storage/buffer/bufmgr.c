@@ -1195,6 +1195,8 @@ StaticAssertDecl(lengthof(cluster_bufmgr_pcm_x_writer_ledger) == LWLOCK_MAX_HELD
 				 "PCM-X writer ledger must match the process held-LWLock bound");
 
 static ClusterPcmXWriterLedgerEntry *cluster_bufmgr_pcm_x_writer_find(BufferDesc *buf);
+static void cluster_bufmgr_pcm_x_holder_report_failure(PcmXQueueResult result, BufferDesc *buf,
+													   const char *operation);
 static bool cluster_bufmgr_pcm_x_writer_claim_entry_exact(const ClusterPcmXWriterLedgerEntry *entry,
 														  BufferDesc *buf);
 static bool cluster_bufmgr_pcm_x_writer_entry_exact(const ClusterPcmXWriterLedgerEntry *entry,
@@ -1210,6 +1212,7 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 								   uint32 wait_index)
 {
 	long		delay_ms;
+	PcmXQueueResult guard_result;
 
 	/*
 	 * This is a production lock-order guard.  Waiting while the page content
@@ -1220,6 +1223,15 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cannot wait for a cluster PCM-X holder gate while holding content authority"),
 				 errdetail("buffer=%d wait_index=%u", buffer_id, wait_index)));
+	/* A different held content lock may itself be the holder that a frozen
+	 * PROBE is draining.  Reuse the protocol's exact held-lock snapshot so a
+	 * safe lock-coupling path can still wait, but never sleep across a closed
+	 * holder barrier or a torn snapshot.
+	 */
+	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+	if (guard_result != PCM_X_QUEUE_OK)
+		cluster_bufmgr_pcm_x_holder_report_failure(
+			guard_result, GetBufferDescriptor(buffer_id), "retry wait nested guard");
 	delay_ms = cluster_pcm_x_holder_retry_delay_ms(wait_index);
 	CHECK_FOR_INTERRUPTS();
 	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
@@ -8381,15 +8393,12 @@ LockBufferForFreeSpaceMapPageInit(Buffer buffer)
  * This assumes the caller wants BUFFER_LOCK_EXCLUSIVE mode.
  *
  * PGRAC ownership-generation audit — this is NOT a PCM bypass entrance for the
- * ownership-generation wave: it acquires only the content lock and never reads
- * or mutates the (pcm_state, generation, reservation_token, flags) tuple, so
- * it cannot create a stale-generation TOCTOU (W1) nor an install/drop window
- * (W2/W3).  It deliberately does NOT register a PCM X grant: a caller that
- * then WRITES the page is backstopped by
- * cluster_bufmgr_block_write_permitted() at write time.  The post-acquire
- * reservation check below additionally refuses protocol-owned bytes without
- * adding a blocking PCM round trip, which would violate this API's don't-wait
- * contract.
+ * ownership-generation wave: it acquires only the content lock and never
+ * initiates a PCM conversion.  A shared-buffer caller may therefore succeed
+ * only when the coherent ownership tuple already names an unencumbered local
+ * X image.  N/S ownership, retained bytes, or a live transition returns false
+ * so the caller cannot write around the queue while preserving this API's
+ * don't-wait contract.
  */
 bool
 ConditionalLockBuffer(Buffer buffer)
@@ -8419,6 +8428,7 @@ ConditionalLockBuffer(Buffer buffer)
 		 */
 		buf_state = LockBufHdr(buf);
 		blocked = cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
+			|| buf->pcm_state != (uint8) PCM_STATE_X
 			|| cluster_pcm_own_flags_get(buf->buf_id) != 0;
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
