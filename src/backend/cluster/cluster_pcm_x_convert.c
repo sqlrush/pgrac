@@ -19080,6 +19080,33 @@ pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag
 }
 
 
+/*
+ * A fully-drained cross-lane holder/blocker terminal (no writer-terminal
+ * companion, so it is not a same-ref dual) belongs to an already-revoked older
+ * cohort: its S lane has finished DRAIN and it carries a completed grant.  The
+ * newer writer's REVOKE_BARRIER guards that writer's own revoke round, not this
+ * older holder lane's terminal cleanup, so the older lane may retire itself
+ * while every writer ref / round / barrier / FIFO field is preserved.  Retiring
+ * it also clears HOLDER_TERMINAL_MASK, which lets the empty-frozen-round path
+ * finally drop the REVOKE_BARRIER.  Cancel-duals (grant_generation == 0) are
+ * routed through the same-ref-dual path and are excluded here.
+ *
+ * Precondition: the caller MUST have validated
+ * pcm_x_local_holder_lane_retire_state() == OK before consulting this helper.
+ * The flags-only test here does not itself re-prove the DRAIN evidence
+ * (holder_terminal_drain_generation, a clear reliable leg, a DRAIN_POLL last
+ * response); both call sites run that check immediately above the guard.
+ */
+static inline bool
+pcm_x_local_cross_lane_holder_terminal_retirable(uint32 flags, const PcmXTicketRef *external_ref)
+{
+	return (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
+		   && (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+				  == PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
+		   && external_ref != NULL && external_ref->grant_generation != 0;
+}
+
+
 static PcmXQueueResult
 pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *request,
 								int32 authenticated_master_node,
@@ -19189,7 +19216,8 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 		if (external_ref->handle.ticket_id == request->retire_through_ticket_id)
 			*contains_watermark_out = true;
 		if (external_ref->handle.ticket_id <= request->retire_through_ticket_id) {
-			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual) {
+			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+				&& !pcm_x_local_cross_lane_holder_terminal_retirable(flags, external_ref)) {
 				result = PCM_X_QUEUE_NOT_READY;
 				goto candidate_done;
 			}
@@ -19298,7 +19326,8 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 			goto holder_detach_release_gate;
 		goto holder_detach_domain_done;
 	}
-	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual) {
+	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+		&& !pcm_x_local_cross_lane_holder_terminal_retirable(flags, external_ref)) {
 		result = PCM_X_QUEUE_NOT_READY;
 		goto holder_detach_release_gate;
 	}
