@@ -13255,10 +13255,28 @@ send_ack:
 	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
 	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
-		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
-								 sizeof(ack)));
+	/*
+	 * The generic IC path deliberately treats dest=self as a successful
+	 * no-op.  That is not delivery for this application ACK: a resource
+	 * master which is also an S holder must consume its own drop proof before
+	 * it can advance the PCM-X transfer.  Stage only that local arm through
+	 * the tag-sharded DATA ring; its LMS worker performs real loopback
+	 * dispatch and preserves same-tag ordering.  Keep remote ACKs on their
+	 * existing direct DATA connection.
+	 */
+	if (inv->master_node == cluster_node_id) {
+		ClusterICSendResult local_result
+			= cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
+													   (uint32)inv->master_node, &ack, sizeof(ack))
+				  ? CLUSTER_IC_SEND_DONE
+				  : CLUSTER_IC_SEND_NOT_ADMITTED;
+
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE, local_result);
+	} else
+		cluster_gcs_block_note_send_outcome(
+			GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+			cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
+									 sizeof(ack)));
 	return true;
 }
 

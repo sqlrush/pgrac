@@ -61,6 +61,8 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, tag) == 16,
 				 "spec-7.3 D4: GcsBlockForwardPayload.tag offset moved");
 StaticAssertDecl(offsetof(GcsBlockInvalidatePayload, tag) == 16,
 				 "spec-7.3 D4: GcsBlockInvalidatePayload.tag offset moved");
+StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, tag) == 16,
+				 "spec-7.3 D4: GcsBlockInvalidateAckPayload.tag offset moved");
 StaticAssertDecl(offsetof(GcsBlockDonePayload, tag) == 16,
 				 "GCS-race round-2 review F4: GcsBlockDonePayload.tag offset moved");
 StaticAssertDecl(offsetof(PcmXWaitIdentity, tag) == 0, "PCM-X wait tag must lead payloads");
@@ -98,6 +100,11 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		if (payload_len != sizeof(GcsBlockInvalidatePayload))
 			return -1;
 		tag = &((const GcsBlockInvalidatePayload *)payload)->tag;
+		break;
+	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK:
+		if (payload_len != sizeof(GcsBlockInvalidateAckPayload))
+			return -1;
+		tag = &((const GcsBlockInvalidateAckPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_DONE:
 		/* GCS-race round-2 review F4: the completion proof is a staged
