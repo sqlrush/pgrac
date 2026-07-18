@@ -1297,8 +1297,7 @@ extern bool cluster_pcm_x_runtime_transition(PcmXRuntimeState expected, PcmXRunt
  * queue work.  The macro records the fusing arm (file:line) so a fused node
  * can be diagnosed post-mortem without per-site plumbing. */
 extern void cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line);
-#define cluster_pcm_x_runtime_fail_closed() \
-	cluster_pcm_x_runtime_fail_closed_at(__FILE__, __LINE__)
+#define cluster_pcm_x_runtime_fail_closed() cluster_pcm_x_runtime_fail_closed_at(__FILE__, __LINE__)
 /* Copies the recorded fail-closed site into buf; false when never fused. */
 extern bool cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen);
 extern PcmXStepResult cluster_pcm_x_master_step(PcmXMasterTicketState current,

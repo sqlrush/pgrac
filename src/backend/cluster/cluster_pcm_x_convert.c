@@ -1060,8 +1060,7 @@ pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 	if (!transitioned)
 		transitioned = cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_SHUTTING_DOWN,
 														PCM_X_RUNTIME_RECOVERY_BLOCKED);
-	if (transitioned && header != NULL)
-	{
+	if (transitioned && header != NULL) {
 		const char *base;
 
 		/* Record the fusing arm.  Single writer: only the CAS winner above
@@ -1103,8 +1102,7 @@ cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
 	buf[0] = '\0';
 	if (header == NULL || header->fail_closed_site[0] == '\0')
 		return false;
-	strlcpy(buf, header->fail_closed_site,
-			Min(buflen, sizeof(header->fail_closed_site)));
+	strlcpy(buf, header->fail_closed_site, Min(buflen, sizeof(header->fail_closed_site)));
 	return true;
 }
 

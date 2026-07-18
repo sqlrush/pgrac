@@ -7324,8 +7324,8 @@ UT_TEST(test_recovery_blocked_runtime_refuses_ack_and_local_mutators)
 
 UT_TEST(test_runtime_fail_closed_records_winning_site_only)
 {
-	char		site[PCM_X_FAIL_CLOSED_SITE_LEN];
-	char		first[PCM_X_FAIL_CLOSED_SITE_LEN];
+	char site[PCM_X_FAIL_CLOSED_SITE_LEN];
+	char first[PCM_X_FAIL_CLOSED_SITE_LEN];
 
 	init_active_pcm_x(UINT64_C(77));
 	/* Before any fuse the site is absent and the buffer is cleared. */

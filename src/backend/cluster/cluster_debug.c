@@ -2001,7 +2001,7 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	{
 		PcmXStatsSnapshot stats = { 0 };
 		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
-		char		fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
+		char fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
 
 		(void)cluster_pcm_x_stats_snapshot(&stats);
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
