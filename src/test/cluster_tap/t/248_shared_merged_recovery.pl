@@ -211,6 +211,19 @@ sub patch_local_pg_xact_aborted
 	return $saved;
 }
 
+# Read one transaction's two-bit on-disk pg_xact status without applying
+# txid_status()'s local nextXid horizon check.  Remote-origin xids are allowed
+# to be future relative to this node; this helper verifies the falsified local
+# bytes directly, which is exactly the L5 fixture premise.
+sub local_pg_xact_status_bits
+{
+	my ($datadir, $xid) = @_;
+	my $img = read_file_raw("$datadir/pg_xact/0000");
+	my $byte = int($xid / 4);
+	my $shift = ($xid % 4) * 2;
+	return (unpack('C', substr($img, $byte, 1)) >> $shift) & 0x3;
+}
+
 # Rewrite a node's pgrac.conf to declare ONLY itself (single-node
 # disaster-recovery form).  declared_count == 1 makes block-master
 # lookup resolve to self, so post-recovery data reads bypass GCS
@@ -571,9 +584,9 @@ ok(dumpkey($na, 'remote_uba_resolved') > 0,
 # ----------------------------------------------------------------
 $na->stop;
 my $saved_xact = patch_local_pg_xact_aborted($na->data_dir, $kc);
+is(local_pg_xact_status_bits($na->data_dir, $kc), 2,
+	'L5 the falsified local pg_xact contains ABORTED bits (patch took)');
 $na->start;
-is(query_retry($na, "SELECT txid_status($kc)"), 'aborted',
-	'L5 the falsified local pg_xact reads back aborted (patch took)');
 is($na->safe_psql('postgres', 'SELECT v FROM t_l4 WHERE k = 1'), '11',
 	"L5 B's committed update stays visible: A's pg_xact is never consulted");
 $na->stop;

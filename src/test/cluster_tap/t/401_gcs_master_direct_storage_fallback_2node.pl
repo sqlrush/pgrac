@@ -19,7 +19,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  NEW counter lost_write_master_direct_storage_fallback_count
-#	      present (= 0) on both nodes;  gcs category has 112 keys
+#	      present (= 0) on both nodes;  gcs category has 119 keys
 #	  L3  GREEN leg: warmed cross-node heap block + CHECKPOINT (storage
 #	      current), then cluster-gcs-block-stale-ship-resident forces a
 #	      STALE master-direct ship → rescue converts it to
@@ -115,8 +115,8 @@ for my $node ($pair->node0, $pair->node1)
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '112',
-   'L2 pg_cluster_state.gcs category has 112 keys (branch-1 +1 rescue counter)');
+   '119',
+   'L2 pg_cluster_state.gcs category has 119 keys (convert-queue image/holder observability +7)');
 
 
 # ============================================================
