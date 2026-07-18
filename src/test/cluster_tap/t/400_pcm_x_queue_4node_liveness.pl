@@ -446,11 +446,30 @@ for my $i (0 .. 3)
 					timeout => 10);
 			} // 'probe-failed';
 			$waits =~ s/\n/ | /g;
+			my $aux = eval {
+				$quad->node($i)->safe_psql('postgres',
+					q{SELECT backend_type || ':' || coalesce(wait_event, '-')
+					  FROM pg_stat_activity
+					  WHERE backend_type IN ('lmon', 'lms', 'lms worker', 'lck',
+						'cssd', 'diag', 'cluster stats', 'qvotec')
+					  ORDER BY backend_type},
+					timeout => 10);
+			} // 'probe-failed';
+			$aux =~ s/\n/ | /g;
+			my $wire = eval {
+				$quad->node($i)->safe_psql('postgres',
+					q{SELECT string_agg('peer' || node_id || ':s' || msg_send_count
+						|| ':r' || msg_recv_count, ' ' ORDER BY node_id)
+					  FROM pg_cluster_ic_peers},
+					timeout => 10);
+			} // 'probe-failed';
 			$samples[$offset][$i] = eval {
 				state_snapshot($quad->node($i), 'pcm', \@pcm_x_pcm_keys);
 			};
 			diag("L3 mid-leg t+$offset node$i waits=[$waits]"
 				. ($samples[$offset][$i] ? '' : ' snapshot-failed'));
+			diag("L3 mid-leg t+$offset node$i aux=[$aux]");
+			diag("L3 mid-leg t+$offset node$i wire=[$wire]");
 		}
 	}
 
