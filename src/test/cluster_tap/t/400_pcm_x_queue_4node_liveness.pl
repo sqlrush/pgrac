@@ -450,8 +450,8 @@ for my $i (0 .. 3)
 				$quad->node($i)->safe_psql('postgres',
 					q{SELECT backend_type || ':' || coalesce(wait_event, '-')
 					  FROM pg_stat_activity
-					  WHERE backend_type IN ('lmon', 'lms', 'lms worker', 'lck',
-						'cssd', 'diag', 'cluster stats', 'qvotec')
+					  WHERE backend_type IN ('lmon', 'lms', 'lms worker', 'lck', 'lmd',
+						'cssd', 'diag', 'cluster stats', 'qvotec', 'interconnect listener')
 					  ORDER BY backend_type},
 					timeout => 10);
 			} // 'probe-failed';
