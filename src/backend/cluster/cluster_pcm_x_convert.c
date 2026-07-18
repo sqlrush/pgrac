@@ -561,7 +561,11 @@ typedef enum PcmXDirectoryMatch {
 } PcmXDirectoryMatch;
 
 
-static void pcm_x_runtime_fail_closed(void);
+static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line);
+
+/* Capture each internal fail-closed arm (file:line) while keeping the many
+ * zero-argument call sites in this file textually unchanged. */
+#define pcm_x_runtime_fail_closed() pcm_x_runtime_fail_closed_impl(__FILE__, __LINE__)
 
 
 /* Required runtime precondition: never nest allocator under a tag domain. */
@@ -1046,7 +1050,7 @@ cluster_pcm_x_stats_note_own_corrupt(void)
 
 
 static void
-pcm_x_runtime_fail_closed(const char *site_file, int site_line)
+pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	bool transitioned;
@@ -1085,7 +1089,7 @@ pcm_x_runtime_fail_closed(const char *site_file, int site_line)
 void
 cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line)
 {
-	pcm_x_runtime_fail_closed(site_file, site_line);
+	pcm_x_runtime_fail_closed_impl(site_file, site_line);
 }
 
 
