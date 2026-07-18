@@ -69,12 +69,1042 @@
 #define CLUSTER_GCS_BLOCK_H
 
 #include "c.h"
+#include "cluster/cluster_gcs_reqid.h"
+#include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
-#include "cluster/cluster_sf_dep.h"	  /* ClusterSfDepVec / max origins */
-#include "storage/block.h"			  /* BLCKSZ */
-#include "storage/buf_internals.h"	  /* BufferTag, BufferDesc */
+#include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
+#include "storage/block.h"			/* BLCKSZ */
+#include "storage/buf_internals.h"	/* BufferTag, BufferDesc */
 
 #ifdef USE_PGRAC_CLUSTER
+
+/* A RETIRE wake is only a latency hint, but it still must never target a
+ * recycled PGPROC wait generation.  Keep the tuple classifier pure so the
+ * seqlock reader and GCS adapter share one executable definition of exact. */
+static inline bool
+cluster_gcs_pcm_x_wait_identity_matches(const PcmXWaitIdentity *identity, int32 local_node,
+										uint32 all_proc_count,
+										ClusterLmdWaitStateReadResult read_result,
+										const ClusterLmdWaitStateSnapshot *snapshot)
+{
+	return identity != NULL && snapshot != NULL && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && identity->node_id == local_node
+		   && identity->procno < all_proc_count && identity->request_id != 0
+		   && identity->wait_seq != 0 && read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE
+		   && snapshot->active && snapshot->kind == CLUSTER_LMD_WAIT_PCM_CONVERT
+		   && snapshot->request_id == identity->request_id
+		   && snapshot->cluster_epoch == identity->cluster_epoch
+		   && snapshot->wait_seq == identity->wait_seq && snapshot->xid == identity->xid;
+}
+
+/* One lock-free authority observation.  The qvotec slot tuple and the
+ * connection capability record have different publishers, so consumers must
+ * sample both ends and reject a change as retryable rather than accepting a
+ * half-old identity.  Zero is a valid value for INITIAL epoch and for the
+ * registered RDMA connection generation; the explicit *_valid bits carry
+ * presence. */
+typedef struct ClusterGcsPcmXAuthSample {
+	uint64 session_before;
+	uint64 session_after;
+	uint64 slot_generation_before;
+	uint64 slot_generation_after;
+	uint64 observed_epoch_before;
+	uint64 observed_epoch_after;
+	uint32 connection_generation_before;
+	uint32 connection_generation_after;
+	bool connection_before_valid;
+	bool connection_after_valid;
+	bool slot_before_valid;
+	bool slot_after_valid;
+	bool fresh_before;
+	bool fresh_after;
+} ClusterGcsPcmXAuthSample;
+
+typedef enum PcmXSessionAuthResult {
+	PCM_X_SESSION_AUTH_INVALID = 0,
+	PCM_X_SESSION_AUTH_OK,
+	PCM_X_SESSION_AUTH_CONNECTION_NOT_READY,
+	PCM_X_SESSION_AUTH_SLOT_NOT_READY,
+	PCM_X_SESSION_AUTH_EPOCH_NOT_READY,
+	PCM_X_SESSION_AUTH_FRESH_NOT_READY,
+	PCM_X_SESSION_AUTH_SLOT_TORN,
+	PCM_X_SESSION_AUTH_EPOCH_TORN,
+	PCM_X_SESSION_AUTH_CONNECTION_TORN
+} PcmXSessionAuthResult;
+
+static inline PcmXSessionAuthResult
+cluster_gcs_pcm_x_auth_sample_classify(const ClusterGcsPcmXAuthSample *sample,
+									   uint64 expected_epoch)
+{
+	if (sample == NULL)
+		return PCM_X_SESSION_AUTH_INVALID;
+	if (!sample->connection_before_valid || !sample->connection_after_valid)
+		return PCM_X_SESSION_AUTH_CONNECTION_NOT_READY;
+	if (!sample->slot_before_valid || !sample->slot_after_valid || sample->session_before == 0
+		|| sample->session_after == 0 || sample->slot_generation_before == 0
+		|| sample->slot_generation_after == 0)
+		return PCM_X_SESSION_AUTH_SLOT_NOT_READY;
+	if (sample->observed_epoch_before != expected_epoch
+		|| sample->observed_epoch_after != expected_epoch)
+		return sample->observed_epoch_before == sample->observed_epoch_after
+				   ? PCM_X_SESSION_AUTH_EPOCH_NOT_READY
+				   : PCM_X_SESSION_AUTH_EPOCH_TORN;
+	if (!sample->fresh_before || !sample->fresh_after)
+		return PCM_X_SESSION_AUTH_FRESH_NOT_READY;
+	if (sample->session_before != sample->session_after
+		|| sample->slot_generation_before != sample->slot_generation_after)
+		return PCM_X_SESSION_AUTH_SLOT_TORN;
+	if (sample->observed_epoch_before != sample->observed_epoch_after)
+		return PCM_X_SESSION_AUTH_EPOCH_TORN;
+	if (sample->connection_generation_before != sample->connection_generation_after)
+		return PCM_X_SESSION_AUTH_CONNECTION_TORN;
+	return PCM_X_SESSION_AUTH_OK;
+}
+
+typedef enum GcsBlockPcmXRequesterSite {
+	GCS_BLOCK_PCM_X_RETRY_SITE_JOIN = 0,
+	GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY,
+	GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH,
+	GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM,
+	GCS_BLOCK_PCM_X_RETRY_SITE_CUTOFF,
+	GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT,
+	GCS_BLOCK_PCM_X_RETRY_SITE_WFG_COMMIT,
+	GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR,
+	GCS_BLOCK_PCM_X_RETRY_SITE_PROGRESS,
+	GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM,
+	GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH,
+	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM,
+	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM
+} GcsBlockPcmXRequesterSite;
+
+typedef enum GcsBlockPcmXRetryAction {
+	GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED = 0,
+	GCS_BLOCK_PCM_X_RETRY_WAIT,
+	GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS,
+	GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG
+} GcsBlockPcmXRetryAction;
+
+typedef enum GcsBlockPcmXFormationAction {
+	GCS_BLOCK_PCM_X_FORMATION_FAIL_CLOSED = 0,
+	GCS_BLOCK_PCM_X_FORMATION_WAIT,
+	GCS_BLOCK_PCM_X_FORMATION_PROCEED
+} GcsBlockPcmXFormationAction;
+
+/* A pristine startup has never published a queue authority token, so a
+ * writer may wait interruptibly for LMON formation.  Once any generation or
+ * session has been published, a non-ACTIVE state is fail-stop evidence and
+ * must never be mistaken for startup or routed through the legacy protocol. */
+static inline GcsBlockPcmXFormationAction
+cluster_gcs_pcm_x_requester_formation_action(const PcmXRuntimeSnapshot *runtime)
+{
+	if (runtime == NULL)
+		return GCS_BLOCK_PCM_X_FORMATION_FAIL_CLOSED;
+	if (runtime->state == PCM_X_RUNTIME_ACTIVE && runtime->gate_generation != 0
+		&& runtime->master_session_incarnation != 0)
+		return GCS_BLOCK_PCM_X_FORMATION_PROCEED;
+	if (runtime->state == PCM_X_RUNTIME_RECOVERY_BLOCKED && runtime->gate_generation == 0
+		&& runtime->master_session_incarnation == 0)
+		return GCS_BLOCK_PCM_X_FORMATION_WAIT;
+	return GCS_BLOCK_PCM_X_FORMATION_FAIL_CLOSED;
+}
+
+/* Every retry in one admitted request remains subordinate to the exact
+ * formation token captured before publishing PCM_CONVERT. */
+static inline bool
+cluster_gcs_pcm_x_requester_runtime_exact(const PcmXRuntimeSnapshot *start,
+										  const PcmXRuntimeSnapshot *current)
+{
+	return start != NULL && current != NULL && start->state == PCM_X_RUNTIME_ACTIVE
+		   && current->state == PCM_X_RUNTIME_ACTIVE && start->gate_generation != 0
+		   && start->gate_generation == current->gate_generation
+		   && start->master_session_incarnation != 0
+		   && start->master_session_incarnation == current->master_session_incarnation;
+}
+
+/* A generation/locator handoff while validating already-held content locks is
+ * a normal transient.  It is safe to retry only while the requester's
+ * PCM_CONVERT wait identity remains published.  BARRIER_CLOSED is deliberately
+ * excluded: a barrier frozen before this wait cannot acquire the nested edge
+ * retroactively, so the requester must unwind without sleeping. */
+static inline bool
+cluster_gcs_pcm_x_nested_guard_retryable(PcmXQueueResult result)
+{
+	return result == PCM_X_QUEUE_BUSY || result == PCM_X_QUEUE_GATE_RETRY
+		   || result == PCM_X_QUEUE_STALE;
+}
+
+/* A local promotion changes only the role byte.  Every locator and immutable
+ * waiter field must still name the exact same membership; accepting a fresh
+ * handle with any other change would turn an alias/ABA into writer authority. */
+static inline bool
+cluster_gcs_pcm_x_role_refresh_exact(const PcmXLocalHandle *follower,
+									 const PcmXLocalHandle *promoted)
+{
+	return follower != NULL && promoted != NULL && follower->flags == 0 && promoted->flags == 0
+		   && follower->role == PCM_X_LOCAL_ROLE_FOLLOWER
+		   && promoted->role == PCM_X_LOCAL_ROLE_NODE_LEADER
+		   && BufferTagsEqual(&follower->identity.tag, &promoted->identity.tag)
+		   && follower->identity.node_id == promoted->identity.node_id
+		   && follower->identity.procno == promoted->identity.procno
+		   && follower->identity.xid == promoted->identity.xid
+		   && follower->identity.cluster_epoch == promoted->identity.cluster_epoch
+		   && follower->identity.request_id == promoted->identity.request_id
+		   && follower->identity.wait_seq == promoted->identity.wait_seq
+		   && follower->identity.base_own_generation == promoted->identity.base_own_generation
+		   && follower->tag_slot.slot_index == promoted->tag_slot.slot_index
+		   && follower->tag_slot.slot_generation == promoted->tag_slot.slot_generation
+		   && follower->membership_slot.slot_index == promoted->membership_slot.slot_index
+		   && follower->membership_slot.slot_generation == promoted->membership_slot.slot_generation
+		   && follower->local_sequence == promoted->local_sequence
+		   && follower->local_round == promoted->local_round;
+}
+
+/* A queue result is meaningful only at the operation that produced it.
+ * Immutable-token failures (especially STALE) must never enter a generic
+ * retry loop.  An arm may race a newer progress publication; a WFG commit
+ * may race its exact blocker; both have an explicit recovery action. */
+static inline GcsBlockPcmXRetryAction
+cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQueueResult result)
+{
+	switch (site) {
+	case GCS_BLOCK_PCM_X_RETRY_SITE_JOIN:
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_NO_CAPACITY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY:
+	case GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH:
+	case GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM:
+	case GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT:
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_CUTOFF:
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_WFG_COMMIT:
+		if (result == PCM_X_QUEUE_STALE || result == PCM_X_QUEUE_NOT_READY
+			|| result == PCM_X_QUEUE_BUSY || result == PCM_X_QUEUE_GATE_RETRY
+			|| result == PCM_X_QUEUE_BARRIER_CLOSED)
+			return GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_PROGRESS:
+		/* local_progress reports BUSY while a promoted leader's admission
+		 * rekey owns the cross-lock gate.  The resident identity is deliberately
+		 * unreadable in that window; wait and reload instead of treating the
+		 * fail-closed snapshot discipline itself as corruption. */
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM:
+		if (result == PCM_X_QUEUE_BAD_STATE)
+			return GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS;
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH:
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_NO_CAPACITY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM:
+		if (result == PCM_X_QUEUE_BAD_STATE)
+			return GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR:
+	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM:
+		break;
+	}
+	return GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED;
+}
+
+static inline uint32
+cluster_gcs_pcm_x_requester_wait_index_advance(uint32 wait_index)
+{
+	const uint32 maximum = (uint32)CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS - 1;
+
+	return wait_index < maximum ? wait_index + 1 : maximum;
+}
+
+typedef enum GcsBlockPcmXCleanupAction {
+	GCS_BLOCK_PCM_X_CLEANUP_NONE = 0,
+	GCS_BLOCK_PCM_X_CLEANUP_CANCEL_LOCAL,
+	GCS_BLOCK_PCM_X_CLEANUP_PRESERVE_FAIL_CLOSED
+} GcsBlockPcmXCleanupAction;
+
+/* Before cohort freeze/PREPARE, an exact local membership (and its active
+ * writer claim) can be unwound without inventing remote state.  Once an
+ * irreversible local or ownership boundary exists, only recovery resolves it. */
+static inline GcsBlockPcmXCleanupAction
+cluster_gcs_pcm_x_requester_cleanup_action(bool handle_live, bool claim_live,
+										   bool irreversible_started, bool ownership_committed)
+{
+	if (irreversible_started || ownership_committed || (claim_live && !handle_live))
+		return GCS_BLOCK_PCM_X_CLEANUP_PRESERVE_FAIL_CLOSED;
+	if (handle_live)
+		return GCS_BLOCK_PCM_X_CLEANUP_CANCEL_LOCAL;
+	return GCS_BLOCK_PCM_X_CLEANUP_NONE;
+}
+
+/* PREPARE may publish GRANT_PENDING only from the exact clean N tuple named
+ * by the active queue identity.  A nonzero idle reservation token is valid;
+ * only live flags denote an overlapping ownership lifecycle. */
+static inline PcmXQueueResult
+cluster_gcs_pcm_x_remote_reservation_preflight(const ClusterPcmOwnSnapshot *live,
+											   const PcmXWaitIdentity *identity)
+{
+	ClusterPcmOwnResult live_result;
+
+	if (live == NULL || identity == NULL)
+		return PCM_X_QUEUE_INVALID;
+	if (!BufferTagsEqual(&live->tag, &identity->tag)
+		|| live->generation != identity->base_own_generation)
+		return PCM_X_QUEUE_STALE;
+	if (live->generation == UINT64_MAX)
+		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
+	live_result = cluster_pcm_own_classify_live_flags(live->flags, live->reservation_token);
+	if (live_result == CLUSTER_PCM_OWN_CORRUPT)
+		return PCM_X_QUEUE_CORRUPT;
+	if (live_result == CLUSTER_PCM_OWN_BUSY)
+		return PCM_X_QUEUE_BUSY;
+	if (live->pcm_state != (uint8)PCM_STATE_N)
+		return PCM_X_QUEUE_STALE;
+	return PCM_X_QUEUE_OK;
+}
+
+/* A requester-domain id carries the authenticated backend ordinal used by
+ * the existing per-backend block-reply table. */
+static inline bool
+cluster_gcs_requester_id_decode(uint64 request_id, int32 *node_out, int32 *backend_id_out,
+								uint64 *sequence_out)
+{
+	uint64 sequence;
+	int32 node;
+	int32 backend_id;
+
+	if ((request_id & GCS_REQID_LOCAL_DOMAIN_FLAG) != 0)
+		return false;
+	sequence = request_id & GCS_REQID_REQUESTER_SEQ_MASK;
+	if (sequence == 0)
+		return false;
+	node = (int32)((request_id >> GCS_REQID_NODE_SHIFT) & GCS_REQID_NODE_MASK);
+	backend_id = (int32)(((request_id >> GCS_REQID_BACKEND_SHIFT) & GCS_REQID_BACKEND_MASK) + 1);
+	if (node < 0 || node >= PCM_X_PROTOCOL_NODE_LIMIT || backend_id <= 0)
+		return false;
+	if (node_out != NULL)
+		*node_out = node;
+	if (backend_id_out != NULL)
+		*backend_id_out = backend_id;
+	if (sequence_out != NULL)
+		*sequence_out = sequence;
+	return true;
+}
+
+typedef struct GcsBlockPcmXImageIdentity {
+	PcmXTicketRef ref;
+	PcmXImageToken image;
+} GcsBlockPcmXImageIdentity;
+
+typedef struct GcsBlockPcmXImageBinding {
+	GcsBlockPcmXImageIdentity identity;
+	uint64 master_session;
+} GcsBlockPcmXImageBinding;
+
+StaticAssertDecl(sizeof(GcsBlockPcmXImageIdentity) == 128,
+				 "PCM-X image identity must fit the existing dedup 128-byte metadata cell");
+StaticAssertDecl(sizeof(GcsBlockPcmXImageBinding) == 136,
+				 "PCM-X image binding is identity plus authenticated master session");
+
+static inline bool
+GcsBlockPcmXImageIdentityEqual(const GcsBlockPcmXImageIdentity *left,
+							   const GcsBlockPcmXImageIdentity *right)
+{
+	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
+}
+
+static inline bool
+GcsBlockPcmXImageBindingEqual(const GcsBlockPcmXImageBinding *left,
+							  const GcsBlockPcmXImageBinding *right)
+{
+	return left != NULL && right != NULL && left->master_session == right->master_session
+		   && GcsBlockPcmXImageIdentityEqual(&left->identity, &right->identity);
+}
+
+/*
+ * A formation tick may compare the active runtime only after two complete,
+ * byte-identical authority samples.  A membership/session read that changes
+ * while either sample is collected is transient evidence, not proof of drift;
+ * the caller leaves ACTIVE unchanged and samples again on the next tick.
+ */
+static inline bool
+cluster_gcs_pcm_x_formation_samples_stable(bool before_complete,
+										   const PcmXPeerBinding before[PCM_X_PROTOCOL_NODE_LIMIT],
+										   bool after_complete,
+										   const PcmXPeerBinding after[PCM_X_PROTOCOL_NODE_LIMIT])
+{
+	return before_complete && after_complete && before != NULL && after != NULL
+		   && memcmp(before, after, sizeof(PcmXPeerBinding) * PCM_X_PROTOCOL_NODE_LIMIT) == 0;
+}
+
+
+/* Derive the complete holder set and one image source from a coherent GRD
+ * snapshot.  The active queue requester must still own the pending-X gate.
+ * A canonical N authority and an ordered self-X round use the requester as a
+ * synthetic source.  They still materialize a normal immutable A-record and
+ * therefore do not introduce a no-image wire arm or bypass the FIFO ticket. */
+static inline PcmXQueueResult
+cluster_gcs_pcm_x_authority_holders_exact(const PcmAuthoritySnapshot *authority,
+										  int32 requester_node, uint64 ticket_id,
+										  uint32 *holders_out, int32 *source_out)
+{
+	uint64 pending_x_value;
+
+	if (holders_out != NULL)
+		*holders_out = 0;
+	if (source_out != NULL)
+		*source_out = -1;
+	if (authority == NULL || holders_out == NULL || source_out == NULL || requester_node < 0
+		|| requester_node >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return PCM_X_QUEUE_INVALID;
+	if (!PcmPendingXQueueValue(ticket_id, &pending_x_value))
+		return PCM_X_QUEUE_INVALID;
+	if (authority->reserved[0] != 0 || authority->reserved[1] != 0)
+		return PCM_X_QUEUE_CORRUPT;
+	if (authority->pending_x_requester_node != requester_node
+		|| authority->pending_x_since_lsn != pending_x_value)
+		return PCM_X_QUEUE_STALE;
+	if (authority->state == PCM_STATE_N) {
+		if (authority->x_holder_node != -1 || authority->s_holders_bitmap != 0
+			|| authority->master_holder.node_id != UINT32_MAX)
+			return PCM_X_QUEUE_CORRUPT;
+		*holders_out = UINT32_C(1) << requester_node;
+		*source_out = requester_node;
+		return PCM_X_QUEUE_OK;
+	}
+	if (authority->state == PCM_STATE_X) {
+		if (authority->x_holder_node < 0 || authority->x_holder_node >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| authority->s_holders_bitmap != 0
+			|| authority->master_holder.node_id != (uint32)authority->x_holder_node)
+			return PCM_X_QUEUE_CORRUPT;
+		*holders_out = UINT32_C(1) << authority->x_holder_node;
+		*source_out = authority->x_holder_node;
+		return PCM_X_QUEUE_OK;
+	}
+	if (authority->state != PCM_STATE_S)
+		return PCM_X_QUEUE_CORRUPT;
+	if (authority->x_holder_node != -1 || authority->s_holders_bitmap == 0
+		|| authority->master_holder.node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| (authority->s_holders_bitmap & (UINT32_C(1) << authority->master_holder.node_id)) == 0)
+		return PCM_X_QUEUE_CORRUPT;
+
+	*holders_out = authority->s_holders_bitmap;
+	/* A requester that already owns S must be the image source.  Invalidating
+	 * its resident S mirror would bump the immutable identity base before the
+	 * later X commit, while FINAL_ACK is exact at base+1.  The source handoff
+	 * instead reuses S+REVOKING as GRANT_PENDING and performs the sole bump at
+	 * COMMIT_X.  A non-holder requester uses the canonical GRD master_holder. */
+	if ((authority->s_holders_bitmap & (UINT32_C(1) << requester_node)) != 0)
+		*source_out = requester_node;
+	else
+		*source_out = (int32)authority->master_holder.node_id;
+	return PCM_X_QUEUE_OK;
+}
+
+
+/* Select one deterministic holder while preserving an exact bitmap ledger. */
+static inline PcmXQueueResult
+cluster_gcs_pcm_x_next_unacked_holder(uint32 pending, uint32 acked, int32 *holder_out)
+{
+	uint32 unacked;
+	int32 node;
+
+	if (holder_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	*holder_out = -1;
+	if ((acked & ~pending) != 0)
+		return PCM_X_QUEUE_CORRUPT;
+	unacked = pending & ~acked;
+	if (unacked == 0)
+		return PCM_X_QUEUE_NOT_FOUND;
+	for (node = 0; node < PCM_X_PROTOCOL_NODE_LIMIT; node++) {
+		if ((unacked & (UINT32_C(1) << node)) != 0) {
+			*holder_out = node;
+			return PCM_X_QUEUE_OK;
+		}
+	}
+	return PCM_X_QUEUE_CORRUPT;
+}
+
+
+/* Build the process-local GRD commit token from an already validated engine
+ * FINAL_ACK barrier.  No wire or shared-memory layout is changed here. */
+static inline bool
+cluster_gcs_pcm_x_grd_handoff_token_build(const PcmXMasterFinalAckToken *final,
+										  const PcmAuthoritySnapshot *authority,
+										  PcmXGrdHandoffToken *handoff_out)
+{
+	const PcmXWaitIdentity *identity;
+
+	if (handoff_out != NULL)
+		memset(handoff_out, 0, sizeof(*handoff_out));
+	if (final == NULL || authority == NULL || handoff_out == NULL)
+		return false;
+	identity = &final->final_ack.ref.identity;
+	if (identity->node_id < 0 || identity->node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| identity->request_id == 0 || final->final_ack.ref.handle.ticket_id == 0
+		|| final->final_ack.ref.grant_generation == 0 || final->final_ack.image_id == 0
+		|| final->final_ack.committed_own_generation == 0 || final->image.image_id == 0
+		|| final->image.image_id != final->final_ack.image_id
+		|| final->image.source_node >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return false;
+	handoff_out->tag = identity->tag;
+	handoff_out->authority = *authority;
+	handoff_out->cluster_epoch = identity->cluster_epoch;
+	handoff_out->request_id = identity->request_id;
+	handoff_out->ticket_id = final->final_ack.ref.handle.ticket_id;
+	handoff_out->grant_generation = final->final_ack.ref.grant_generation;
+	handoff_out->image_id = final->image.image_id;
+	handoff_out->source_own_generation = final->image.source_own_generation;
+	handoff_out->page_scn = (SCN) final->image.page_scn;
+	handoff_out->page_lsn = final->image.page_lsn;
+	handoff_out->requester_node = identity->node_id;
+	handoff_out->source_node = (int32) final->image.source_node;
+	handoff_out->requester_procno = identity->procno;
+	handoff_out->page_checksum = final->image.page_checksum;
+	return true;
+}
+
+
+static inline bool
+cluster_gcs_pcm_x_holder_image_identity_exact(const PcmXLocalHolderProgress *progress,
+											  const PcmXTicketRef *ref, uint64 image_id,
+											  int32 source_node)
+{
+	return progress != NULL && ref != NULL && image_id != 0 && source_node >= 0
+		   && source_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && memcmp(&progress->ref, ref, sizeof(*ref)) == 0 && progress->image.image_id == image_id
+		   && progress->image.source_node == (uint32)source_node;
+}
+
+
+/* image_id exists from REVOKE onward.  The reliable leg, not generation,
+ * proves that the rest of the image token has been published. */
+static inline bool
+cluster_gcs_pcm_x_holder_image_ready_exact(const PcmXLocalHolderProgress *progress,
+										   const PcmXTicketRef *ref, uint64 image_id,
+										   int32 source_node)
+{
+	return cluster_gcs_pcm_x_holder_image_identity_exact(progress, ref, image_id, source_node)
+		   && progress->pending_opcode == PGRAC_IC_MSG_PCM_X_IMAGE_READY
+		   && progress->phase == PGRAC_IC_MSG_PCM_X_IMAGE_READY
+		   && progress->last_response_opcode == PGRAC_IC_MSG_PCM_X_REVOKE
+		   && (progress->flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) == 0;
+}
+
+
+/* DRAIN clears the reliable leg but retains the exact holder image until
+ * RETIRE.  This is the post-transition capture used to release the dedup and
+ * retained-image substrates without treating generation zero as absence. */
+static inline bool
+cluster_gcs_pcm_x_holder_image_drained_exact(const PcmXLocalHolderProgress *progress,
+											 const PcmXTicketRef *ref, uint64 image_id,
+											 int32 source_node)
+{
+	return cluster_gcs_pcm_x_holder_image_identity_exact(progress, ref, image_id, source_node)
+		   && progress->pending_opcode == 0 && progress->phase == 0
+		   && progress->last_response_opcode == PGRAC_IC_MSG_PCM_X_DRAIN_POLL
+		   && (progress->flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+				  == PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK;
+}
+
+
+/* Before the GRD handoff, 0/REVOKE is the only transfer phase that still
+ * depends on the pending-X cookie.  Later reliable phases carry their own
+ * exact replay evidence after the handoff has atomically cleared that cookie. */
+static inline bool
+cluster_gcs_pcm_x_transfer_pre_handoff_phase(uint16 pending_opcode)
+{
+	return pending_opcode == 0 || pending_opcode == PGRAC_IC_MSG_PCM_X_REVOKE;
+}
+
+
+/* A graph published for this confirm must be removed by the full waiter
+ * identity if engine revalidation does not accept that exact publication. */
+static inline bool
+cluster_gcs_pcm_x_confirm_compensation_required(uint64 graph_generation,
+												PcmXQueueResult revalidate_result)
+{
+	return graph_generation != 0 && revalidate_result != PCM_X_QUEUE_OK
+		   && revalidate_result != PCM_X_QUEUE_DUPLICATE;
+}
+
+
+/*
+ * Authenticate a tag-bearing PCM-X admission request before it can touch the
+ * master queue.  Session/frontier and process-capacity checks remain in the
+ * queue engine; this boundary binds the immutable identity to the DATA
+ * connection, current epoch, and authoritative tag master.
+ */
+static inline bool
+cluster_gcs_pcm_x_enqueue_ingress_valid(const PcmXEnqueuePayload *request, Size payload_length,
+										int32 authenticated_node, uint64 current_epoch,
+										int32 tag_master, int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->identity.node_id == authenticated_node
+		   && request->identity.cluster_epoch == current_epoch && tag_master == local_node
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->identity.request_id != 0 && request->identity.wait_seq != 0
+		   && request->prehandle.sender_session_incarnation != 0
+		   && request->prehandle.prehandle_sequence != 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_admit_confirm_ingress_valid(const PcmXPhasePayload *request, Size payload_length,
+											  int32 authenticated_node, uint64 current_epoch,
+											  int32 tag_master, int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->ref.identity.node_id == authenticated_node
+		   && request->ref.identity.cluster_epoch == current_epoch && tag_master == local_node
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->ref.identity.request_id != 0 && request->ref.identity.wait_seq != 0
+		   && request->ref.handle.ticket_id != 0 && request->ref.handle.queue_generation != 0
+		   && request->ref.grant_generation == 0 && request->reason == 0
+		   && request->phase == PCM_X_LOCAL_RELIABLE_PHASE_ADMIT_CONFIRM && request->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_admit_confirm_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+												  int32 authenticated_node, uint64 current_epoch,
+												  int32 tag_master, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && ack->ref.identity.node_id == local_node
+		   && ack->ref.identity.cluster_epoch == current_epoch && tag_master == authenticated_node
+		   && ack->ref.identity.request_id != 0 && ack->ref.identity.wait_seq != 0
+		   && ack->ref.handle.ticket_id != 0 && ack->ref.handle.queue_generation != 0
+		   && ack->ref.grant_generation == 0 && ack->reason == 0
+		   && ack->phase == PCM_X_LOCAL_RELIABLE_PHASE_ADMIT_CONFIRM && ack->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_ticket_ref_wire_valid(const PcmXTicketRef *ref, uint64 current_epoch)
+{
+	return ref != NULL && ref->identity.node_id >= 0
+		   && ref->identity.node_id < PCM_X_PROTOCOL_NODE_LIMIT
+		   && ref->identity.cluster_epoch == current_epoch && ref->identity.request_id != 0
+		   && ref->identity.wait_seq != 0 && ref->handle.ticket_id != 0
+		   && ref->handle.queue_generation != 0 && ref->grant_generation == 0;
+}
+
+/* BLOCKER_SET originates at the probed holder, not at the ticket requester. */
+static inline bool
+cluster_gcs_pcm_x_blocker_header_ingress_valid(const PcmXBlockerSetHeaderPayload *header,
+											   Size payload_length, int32 authenticated_node,
+											   uint64 current_epoch, int32 tag_master,
+											   int32 local_node)
+{
+	return header != NULL && payload_length == sizeof(*header) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_ticket_ref_wire_valid(&header->ref, current_epoch)
+		   && header->set_generation != 0 && header->set_generation != UINT64_MAX
+		   && header->nblockers <= INT_MAX;
+}
+
+static inline bool
+cluster_gcs_pcm_x_blocker_edge_ingress_valid(const PcmXBlockerChunkPayload *edge,
+											 Size payload_length, int32 authenticated_node,
+											 uint64 current_epoch, int32 tag_master,
+											 int32 local_node)
+{
+	return edge != NULL && payload_length == sizeof(*edge) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && edge->requester_node >= 0 && edge->requester_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && edge->cluster_epoch == current_epoch && edge->request_id != 0
+		   && edge->handle.ticket_id != 0 && edge->handle.queue_generation != 0
+		   && edge->grant_generation == 0 && edge->set_generation != 0
+		   && edge->set_generation != UINT64_MAX && edge->blocker.node_id == authenticated_node
+		   && edge->blocker.cluster_epoch == current_epoch && edge->blocker.wait_seq != 0
+		   && (edge->blocker.request_id != 0 || TransactionIdIsValid(edge->blocker.xid));
+}
+
+/*
+ * PcmXPhasePayload has exactly 64 non-ref bits at bytes [88,96).  Type 48
+ * uses all of them as one lossless set_generation: zero is the
+ * master-to-holder PROBE arm; nonzero is the generation-exact ACK arm, so a
+ * delayed ACK can never acknowledge a newer set on the same ticket.
+ */
+static inline void
+cluster_gcs_pcm_x_blocker_ack_set_generation(PcmXPhasePayload *ack, uint64 set_generation)
+{
+	if (ack == NULL)
+		return;
+	ack->reason = (uint32)set_generation;
+	ack->phase = (uint16)(set_generation >> 32);
+	ack->flags = (uint16)(set_generation >> 48);
+}
+
+static inline uint64
+cluster_gcs_pcm_x_blocker_ack_generation(const PcmXPhasePayload *ack)
+{
+	if (ack == NULL)
+		return 0;
+	return (uint64)ack->reason | ((uint64)ack->phase << 32) | ((uint64)ack->flags << 48);
+}
+
+/* Build only the nonzero ACK arm.  Invalid generations leave a zeroed
+ * payload, so production callers cannot accidentally emit the reserved
+ * all-zero PROBE encoding in non-assert builds. */
+static inline bool
+cluster_gcs_pcm_x_blocker_ack_build(const PcmXTicketRef *ref, uint64 set_generation,
+									PcmXPhasePayload *ack)
+{
+	if (ack == NULL)
+		return false;
+	memset(ack, 0, sizeof(*ack));
+	if (ref == NULL || set_generation == 0 || set_generation == UINT64_MAX)
+		return false;
+	ack->ref = *ref;
+	cluster_gcs_pcm_x_blocker_ack_set_generation(ack, set_generation);
+	return true;
+}
+
+static inline bool
+cluster_gcs_pcm_x_blocker_control_ingress_valid(const PcmXPhasePayload *control,
+												Size payload_length, int32 authenticated_node,
+												uint64 current_epoch, int32 tag_master,
+												int32 local_node)
+{
+	return control != NULL && payload_length == sizeof(*control) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_ticket_ref_wire_valid(&control->ref, current_epoch);
+}
+
+static inline bool
+cluster_gcs_pcm_x_blocker_probe_ingress_valid(const PcmXPhasePayload *probe, Size payload_length,
+											  int32 authenticated_node, uint64 current_epoch,
+											  int32 tag_master, int32 local_node)
+{
+	return cluster_gcs_pcm_x_blocker_control_ingress_valid(
+			   probe, payload_length, authenticated_node, current_epoch, tag_master, local_node)
+		   && cluster_gcs_pcm_x_blocker_ack_generation(probe) == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_blocker_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+											int32 authenticated_node, uint64 current_epoch,
+											int32 tag_master, int32 local_node)
+{
+	uint64 set_generation = cluster_gcs_pcm_x_blocker_ack_generation(ack);
+
+	return cluster_gcs_pcm_x_blocker_control_ingress_valid(ack, payload_length, authenticated_node,
+														   current_epoch, tag_master, local_node)
+		   && set_generation != 0 && set_generation != UINT64_MAX;
+}
+
+/* Transfer messages are legal only after the master assigns a grant generation. */
+static inline bool
+cluster_gcs_pcm_x_transfer_ref_wire_valid(const PcmXTicketRef *ref, uint64 current_epoch)
+{
+	return ref != NULL && ref->identity.node_id >= 0
+		   && ref->identity.node_id < PCM_X_PROTOCOL_NODE_LIMIT
+		   && ref->identity.cluster_epoch == current_epoch && ref->identity.request_id != 0
+		   && ref->identity.wait_seq != 0 && ref->handle.ticket_id != 0
+		   && ref->handle.queue_generation != 0 && ref->grant_generation != 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_image_id_master_wire_valid(uint64 image_id, int32 expected_master_node)
+{
+	int32 encoded_master_node;
+
+	return expected_master_node >= 0 && expected_master_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && cluster_pcm_x_image_id_decode(image_id, &encoded_master_node, NULL)
+		   && encoded_master_node == expected_master_node;
+}
+
+static inline bool
+cluster_gcs_pcm_x_image_token_wire_valid(const PcmXImageToken *image, int32 expected_master_node)
+{
+	return image != NULL && image->source_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && cluster_gcs_pcm_x_image_id_master_wire_valid(image->image_id, expected_master_node);
+}
+
+/* REVOKE is master -> current holder; the requester identity is third-party. */
+static inline bool
+cluster_gcs_pcm_x_revoke_ingress_valid(const PcmXRevokePayload *request, Size payload_length,
+									   int32 authenticated_node, uint64 current_epoch,
+									   int32 tag_master, int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&request->ref, current_epoch)
+		   && cluster_gcs_pcm_x_image_id_master_wire_valid(request->image_id, authenticated_node);
+}
+
+/* IMAGE_READY is current holder -> master and binds the image to that holder. */
+static inline bool
+cluster_gcs_pcm_x_image_ready_ingress_valid(const PcmXGrantPayload *ready, Size payload_length,
+											int32 authenticated_node, uint64 current_epoch,
+											int32 tag_master, int32 local_node)
+{
+	return ready != NULL && payload_length == sizeof(*ready) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ready->ref, current_epoch)
+		   && cluster_gcs_pcm_x_image_token_wire_valid(&ready->image, local_node)
+		   && ready->image.source_node == (uint32)authenticated_node;
+}
+
+/* PREPARE_GRANT is master -> exact requester and may carry a third-party image. */
+static inline bool
+cluster_gcs_pcm_x_prepare_grant_ingress_valid(const PcmXGrantPayload *grant, Size payload_length,
+											  int32 authenticated_node, uint64 current_epoch,
+											  int32 tag_master, int32 local_node)
+{
+	return grant != NULL && payload_length == sizeof(*grant) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&grant->ref, current_epoch)
+		   && grant->ref.identity.node_id == local_node
+		   && cluster_gcs_pcm_x_image_token_wire_valid(&grant->image, authenticated_node);
+}
+
+/* INSTALL_READY is one canonical requester -> master application ACK. */
+static inline bool
+cluster_gcs_pcm_x_install_ready_ingress_valid(const PcmXInstallReadyPayload *ready,
+											  Size payload_length, int32 authenticated_node,
+											  uint64 current_epoch, int32 tag_master,
+											  int32 local_node)
+{
+	return ready != NULL && payload_length == sizeof(*ready) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ready->ref, current_epoch)
+		   && ready->ref.identity.node_id == authenticated_node
+		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ready->image_id, local_node)
+		   && ready->result == PCM_X_QUEUE_OK && ready->phase == PGRAC_IC_MSG_PCM_X_INSTALL_READY
+		   && ready->flags == 0;
+}
+
+/* COMMIT_X is one canonical master -> exact requester application command. */
+static inline bool
+cluster_gcs_pcm_x_commit_x_ingress_valid(const PcmXPhasePayload *commit, Size payload_length,
+										 int32 authenticated_node, uint64 current_epoch,
+										 int32 tag_master, int32 local_node)
+{
+	return commit != NULL && payload_length == sizeof(*commit) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&commit->ref, current_epoch)
+		   && commit->ref.identity.node_id == local_node && commit->reason == 0
+		   && commit->phase == PGRAC_IC_MSG_PCM_X_COMMIT_X && commit->flags == 0;
+}
+
+/* FINAL_ACK proves the requester committed exactly one ownership generation. */
+static inline bool
+cluster_gcs_pcm_x_final_ack_ingress_valid(const PcmXFinalAckPayload *ack, Size payload_length,
+										  int32 authenticated_node, uint64 current_epoch,
+										  int32 tag_master, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ack->ref, current_epoch)
+		   && ack->ref.identity.node_id == authenticated_node
+		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ack->image_id, local_node)
+		   && ack->ref.identity.base_own_generation != UINT64_MAX
+		   && ack->committed_own_generation == ack->ref.identity.base_own_generation + 1;
+}
+
+/* FINAL_COMMIT_ACK is the canonical master -> requester application ACK. */
+static inline bool
+cluster_gcs_pcm_x_final_commit_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+												 int32 authenticated_node, uint64 current_epoch,
+												 int32 tag_master, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ack->ref, current_epoch)
+		   && ack->ref.identity.node_id == local_node && ack->reason == 0
+		   && ack->phase == PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK && ack->flags == 0;
+}
+
+/* FINAL_CONFIRM is the canonical requester -> master terminal confirmation. */
+static inline bool
+cluster_gcs_pcm_x_final_confirm_ingress_valid(const PcmXPhasePayload *confirm, Size payload_length,
+											  int32 authenticated_node, uint64 current_epoch,
+											  int32 tag_master, int32 local_node)
+{
+	return confirm != NULL && payload_length == sizeof(*confirm) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&confirm->ref, current_epoch)
+		   && confirm->ref.identity.node_id == authenticated_node && confirm->reason == 0
+		   && confirm->phase == PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM && confirm->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_prehandle_cancel_ingress_valid(const PcmXPrehandleCancelPayload *request,
+												 Size payload_length, int32 authenticated_node,
+												 uint64 current_epoch, int32 tag_master,
+												 int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->identity.node_id == authenticated_node
+		   && request->identity.cluster_epoch == current_epoch && tag_master == local_node
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->identity.request_id != 0 && request->identity.wait_seq != 0
+		   && request->prehandle.sender_session_incarnation != 0
+		   && request->prehandle.prehandle_sequence != 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_prehandle_cancel_ack_ingress_valid(const PcmXAdmitAckPayload *ack,
+													 Size payload_length, int32 authenticated_node,
+													 uint64 current_epoch, int32 tag_master,
+													 int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && ack->ref.identity.node_id == local_node
+		   && ack->ref.identity.cluster_epoch == current_epoch && tag_master == authenticated_node
+		   && ack->ref.identity.request_id != 0 && ack->ref.identity.wait_seq != 0
+		   && ack->ref.handle.ticket_id != 0 && ack->ref.handle.queue_generation != 0
+		   && ack->ref.grant_generation == 0 && ack->prehandle.sender_session_incarnation != 0
+		   && ack->prehandle.prehandle_sequence != 0 && ack->result == PCM_X_QUEUE_OK
+		   && ack->phase == PCM_X_LOCAL_RELIABLE_PHASE_PREHANDLE_CANCEL && ack->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_cancel_ingress_valid(const PcmXPhasePayload *request, Size payload_length,
+									   int32 authenticated_node, uint64 current_epoch,
+									   int32 tag_master, int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->ref.identity.node_id == authenticated_node
+		   && request->ref.identity.cluster_epoch == current_epoch && tag_master == local_node
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && request->ref.identity.request_id != 0 && request->ref.identity.wait_seq != 0
+		   && request->ref.handle.ticket_id != 0 && request->ref.handle.queue_generation != 0
+		   && request->ref.grant_generation == 0 && request->reason == 0
+		   && request->phase == PCM_X_LOCAL_RELIABLE_PHASE_CANCEL && request->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_cancel_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+										   int32 authenticated_node, uint64 current_epoch,
+										   int32 tag_master, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && ack->ref.identity.node_id == local_node
+		   && ack->ref.identity.cluster_epoch == current_epoch && tag_master == authenticated_node
+		   && ack->ref.identity.request_id != 0 && ack->ref.identity.wait_seq != 0
+		   && ack->ref.handle.ticket_id != 0 && ack->ref.handle.queue_generation != 0
+		   && ack->ref.grant_generation == 0 && ack->reason == 0
+		   && ack->phase == PCM_X_LOCAL_RELIABLE_PHASE_CANCEL && ack->flags == 0;
+}
+
+/* Terminal messages bind the final, non-sentinel grant generation as well. */
+static inline bool
+cluster_gcs_pcm_x_terminal_ref_wire_valid(const PcmXTicketRef *ref, uint64 current_epoch)
+{
+	return ref != NULL && ref->identity.node_id >= 0
+		   && ref->identity.node_id < PCM_X_PROTOCOL_NODE_LIMIT
+		   && ref->identity.cluster_epoch == current_epoch && ref->identity.request_id != 0
+		   && ref->identity.wait_seq != 0 && ref->handle.ticket_id != 0
+		   && ref->handle.queue_generation != 0 && ref->grant_generation != UINT64_MAX;
+}
+
+/* DRAIN_POLL is authoritative only from the current master of this tag. */
+static inline bool
+cluster_gcs_pcm_x_drain_poll_ingress_valid(const PcmXDrainPollPayload *poll, Size payload_length,
+										   int32 authenticated_node, uint64 current_epoch,
+										   int32 tag_master, int32 local_node)
+{
+	return poll != NULL && payload_length == sizeof(*poll) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && cluster_gcs_pcm_x_terminal_ref_wire_valid(&poll->ref, current_epoch)
+		   && poll->drain_generation != 0 && poll->drain_generation != UINT64_MAX;
+}
+
+/* DRAIN_ACK may come from any involved participant, but only to this master. */
+static inline bool
+cluster_gcs_pcm_x_drain_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+										  int32 authenticated_node, uint64 current_epoch,
+										  int32 tag_master, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+		   && cluster_gcs_pcm_x_terminal_ref_wire_valid(&ack->ref, current_epoch)
+		   && ack->reason == 0 && ack->phase == 0 && ack->flags == 0;
+}
+
+/* RETIRE_UP_TO is tagless; bind it to the DATA peer session and local target. */
+static inline bool
+cluster_gcs_pcm_x_retire_request_ingress_valid(const PcmXRetirePayload *request,
+											   Size payload_length, int32 authenticated_node,
+											   uint64 authenticated_session, uint64 current_epoch,
+											   int32 local_node)
+{
+	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && authenticated_session != 0
+		   && request->cluster_epoch == current_epoch
+		   && request->master_session_incarnation == authenticated_session
+		   && request->retire_through_ticket_id != 0 && request->sender_node == local_node
+		   && request->flags == 0;
+}
+
+/* RETIRE_ACK names its authenticated responder and this master's session. */
+static inline bool
+cluster_gcs_pcm_x_retire_ack_ingress_valid(const PcmXRetirePayload *ack, Size payload_length,
+										   int32 authenticated_node, uint64 current_epoch,
+										   uint64 master_session, int32 local_node)
+{
+	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
+		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
+		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && ack->cluster_epoch == current_epoch
+		   && master_session != 0 && ack->master_session_incarnation == master_session
+		   && ack->retire_through_ticket_id != 0 && ack->sender_node == authenticated_node
+		   && ack->flags == 0;
+}
+
+static inline void
+cluster_gcs_pcm_x_vertex_from_identity(const PcmXWaitIdentity *identity, ClusterLmdVertex *vertex)
+{
+	if (vertex == NULL)
+		return;
+	memset(vertex, 0, sizeof(*vertex));
+	if (identity == NULL)
+		return;
+	vertex->node_id = identity->node_id;
+	vertex->procno = identity->procno;
+	vertex->cluster_epoch = identity->cluster_epoch;
+	vertex->request_id = identity->request_id;
+	vertex->xid = identity->xid;
+	vertex->wait_seq = identity->wait_seq;
+}
 
 /* ============================================================
  * GCS_BLOCK_DATA_SIZE -- block bytes carried in every reply.
@@ -560,6 +1590,51 @@ GcsBlockInvalidateAckPayloadGetPageScn(const GcsBlockInvalidateAckPayload *p)
  * status>2 as stale and would burn its timeout; the holder then falls back
  * to the round-5 park). */
 #define GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY 5
+
+/* Slot occupancy, not epoch value, proves that an outstanding request exists.
+ * The first legal reconfiguration advances epoch 0 to 1 and must wake those
+ * initial-formation requests just like every later epoch transition. */
+static inline bool
+cluster_gcs_block_epoch_advance_stales_slot(bool in_use, uint64 request_epoch, uint64 new_epoch)
+{
+	return in_use && request_epoch < new_epoch;
+}
+
+/*
+ * Classify an INVALIDATE_ACK against one exact queue transfer round.  A
+ * nonmatching tag/epoch/request belongs to the legacy invalidate machinery;
+ * once that identity matches, however, an unexpected or already-credited
+ * sender is consumed here so it cannot mutate GRD through the legacy
+ * slotless path.  The caller authenticates the transport/session separately.
+ */
+static inline PcmXQueueResult
+cluster_gcs_pcm_x_invalidate_ack_match_exact(const PcmXMasterDriveSnapshot *snapshot,
+											 const GcsBlockInvalidateAckPayload *ack,
+											 uint64 current_epoch, int32 authenticated_source)
+{
+	uint32 source_bit;
+
+	if (snapshot == NULL || ack == NULL || authenticated_source < 0
+		|| authenticated_source >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return PCM_X_QUEUE_INVALID;
+	if (snapshot->ticket_state != PCM_XT_ACTIVE_TRANSFER
+		|| snapshot->ref.identity.cluster_epoch != current_epoch || ack->epoch != current_epoch
+		|| ack->request_id != snapshot->ref.identity.request_id
+		|| !BufferTagsEqual(&ack->tag, &snapshot->ref.identity.tag))
+		return PCM_X_QUEUE_NOT_FOUND;
+	if (ack->sender_node != authenticated_source)
+		return PCM_X_QUEUE_STALE;
+	source_bit = UINT32_C(1) << (uint32)authenticated_source;
+	if ((snapshot->pending_s_holders_bitmap & source_bit) == 0)
+		return PCM_X_QUEUE_STALE;
+	if ((snapshot->acked_s_holders_bitmap & source_bit) != 0)
+		return PCM_X_QUEUE_DUPLICATE;
+	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY)
+		return PCM_X_QUEUE_BUSY;
+	if (ack->ack_status == 0 || ack->ack_status == 2)
+		return PCM_X_QUEUE_OK;
+	return PCM_X_QUEUE_BAD_STATE;
+}
 
 
 /* ============================================================
@@ -2257,6 +3332,9 @@ extern uint64 cluster_gcs_get_invalidate_parked_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_expired_count(void);
 extern uint64 cluster_gcs_get_invalidate_busy_sent_count(void);
 extern uint64 cluster_gcs_get_invalidate_busy_received_count(void);
+extern uint64 cluster_gcs_get_invalidate_passive_s_release_count(void);
+extern uint64 cluster_gcs_get_pcm_x_self_handoff_count(void);
+extern uint64 cluster_gcs_get_pcm_x_self_handoff_drain_count(void);
 extern uint64 cluster_gcs_get_invalidate_park_overflow_count(void);
 extern uint64 cluster_gcs_get_drop_pinned_deny_count(void);
 extern uint64 cluster_gcs_get_xfer_stale_deny_count(void);
@@ -2338,9 +3416,13 @@ extern uint64 cluster_gcs_get_block_dedup_done_marked_count(void);	  /* RC-F DON
 extern uint64 cluster_gcs_get_block_dedup_done_mismatch_count(void);  /* RC-F DONE */
 extern uint64 cluster_gcs_get_block_dedup_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_get_block_dedup_legacy_pin_count(void);	  /* review F5 */
-extern uint64 cluster_gcs_get_fallback_scn_verify_pass_count(void);	  /* round-4c FUNC-1 */
-extern uint64 cluster_gcs_get_fallback_scn_refresh_count(void);		  /* round-4c FUNC-1 */
-extern uint64 cluster_gcs_get_fallback_scn_failclosed_count(void);	  /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_block_dedup_pcm_x_stage_count(void);
+extern uint64 cluster_gcs_get_block_dedup_pcm_x_replay_count(void);
+extern uint64 cluster_gcs_get_block_dedup_pcm_x_release_count(void);
+extern uint64 cluster_gcs_get_block_dedup_pcm_x_failclosed_count(void);
+extern uint64 cluster_gcs_get_fallback_scn_verify_pass_count(void); /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_refresh_count(void);		/* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_failclosed_count(void);	/* round-4c FUNC-1 */
 
 /*
  * PGRAC: spec-2.35 D12 — 7 NEW reliability/lifecycle counter accessors
@@ -2478,6 +3560,34 @@ extern void cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node
 extern void cluster_gcs_block_lmon_abort_direct_land_peer(int32 peer_node,
 														  ClusterGcsBlockDirectAbortReason reason);
 extern int cluster_gcs_block_lmon_drain_direct_land_aborts(void);
+extern void cluster_gcs_block_pcm_x_formation_tick(void);
+extern void cluster_gcs_block_pcm_x_owner_start(int worker_id);
+extern void cluster_gcs_block_pcm_x_image_pump_tick(int worker_id);
+extern void cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref);
+/* Type-48 zero-generation arm.  One call stages at most one exact PROBE;
+ * duplicate calls replay the same durable master leg. */
+extern void cluster_gcs_pcm_x_blocker_probe_kick(const PcmXTicketRef *ref, int32 holder_node);
+
+/* Stage one PCM-X application frame onto the BufferTag-owning DATA worker.
+ * This is also the loopback path when the target is this node: the LMS worker
+ * dispatches the frame locally instead of relying on the IC self-send no-op. */
+extern bool cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, const void *payload,
+										  uint16 payload_len);
+/* Join the node-local FIFO, drive the sole remote queue request when this
+ * backend is leader, and return one exact writer claim.  claim_handed_off is
+ * published before requester cleanup authority is dropped, closing the
+ * owner-exit gap while bufmgr adopts the claim.  The caller must keep the
+ * claim through content-lock ownership and release it after UNLOCK. */
+extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
+														PcmXLocalWriterClaim *claim_out,
+														bool *claim_handed_off);
+extern PcmXQueueResult
+cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(const PcmXLocalWriterClaim *claim);
+/* Error/owner-exit cleanup adapter: never propagates ERROR.  A caught ERROR
+ * closes the runtime and returns CORRUPT while leaving the exact claim in the
+ * caller's ledger for fail-closed evidence/retry. */
+extern PcmXQueueResult
+cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(const PcmXLocalWriterClaim *claim);
 
 
 /* ============================================================

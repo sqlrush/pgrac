@@ -74,6 +74,18 @@
  *	  quick, before we're queued, since after Phase 2 we're already queued.
  * -------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	  Use the held-LWLock ceiling exported by storage/lwlock.h so cluster
+ *	  shared-memory sizing and the lock manager share one definition.
+ *
+ *	  Spec: spec-2.36a-gcs-writer-convert-queue.md
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
 #include "miscadmin.h"
@@ -258,6 +270,12 @@ static const char *const BuiltinTrancheNames[] = {
 		"ClusterOidLease",
 		/* PGRAC LWTRANCHE_CLUSTER_NATIVE_PREHISTORY: GCS-race round-3b drain */
 		"ClusterNativePrehistory",
+		/* PGRAC LWTRANCHE_CLUSTER_PCM_X_ALLOCATOR: spec-2.36a five-pool metadata */
+		"ClusterPcmXAllocator",
+		/* PGRAC LWTRANCHE_CLUSTER_PCM_X_MASTER: spec-2.36a master queue partitions */
+		"ClusterPcmXMaster",
+		/* PGRAC LWTRANCHE_CLUSTER_PCM_X_LOCAL: spec-2.36a local coordinator */
+		"ClusterPcmXLocal",
 	#endif
 	};
 
@@ -286,8 +304,6 @@ LWLockPadded *MainLWLockArray = NULL;
  * occasionally the number can be much higher; for example, the pg_buffercache
  * extension locks all buffer partitions simultaneously.
  */
-#define MAX_SIMUL_LWLOCKS 200
-
 /* struct representing the LWLocks we're holding */
 typedef struct LWLockHandle {
 	LWLock *lock;
@@ -295,7 +311,7 @@ typedef struct LWLockHandle {
 } LWLockHandle;
 
 static int num_held_lwlocks = 0;
-static LWLockHandle held_lwlocks[MAX_SIMUL_LWLOCKS];
+static LWLockHandle held_lwlocks[LWLOCK_MAX_HELD_BY_PROC];
 
 /* struct representing the LWLock tranche request for named tranche */
 typedef struct NamedLWLockTrancheRequest {
@@ -1244,7 +1260,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	Assert(!(proc == NULL && IsUnderPostmaster));
 
 	/* Ensure we will have room to remember the lock */
-	if (num_held_lwlocks >= MAX_SIMUL_LWLOCKS)
+	if (num_held_lwlocks >= LWLOCK_MAX_HELD_BY_PROC)
 		elog(ERROR, "too many LWLocks taken");
 
 	/*
@@ -1389,7 +1405,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 	PRINT_LWDEBUG("LWLockConditionalAcquire", lock, mode);
 
 	/* Ensure we will have room to remember the lock */
-	if (num_held_lwlocks >= MAX_SIMUL_LWLOCKS)
+	if (num_held_lwlocks >= LWLOCK_MAX_HELD_BY_PROC)
 		elog(ERROR, "too many LWLocks taken");
 
 	/*
@@ -1450,7 +1466,7 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 	PRINT_LWDEBUG("LWLockAcquireOrWait", lock, mode);
 
 	/* Ensure we will have room to remember the lock */
-	if (num_held_lwlocks >= MAX_SIMUL_LWLOCKS)
+	if (num_held_lwlocks >= LWLOCK_MAX_HELD_BY_PROC)
 		elog(ERROR, "too many LWLocks taken");
 
 	/*

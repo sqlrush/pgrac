@@ -53,6 +53,7 @@
 #include "c.h"
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6), INVALID_NODE_ID */
 #include "cluster/cluster_conf.h"		 /* cluster_conf_has_peers */
+#include "cluster/cluster_grd.h"		 /* ClusterGrdHolderId */
 #include "cluster/cluster_scn.h"		 /* spec-2.41 D2 — SCN dual watermark */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
@@ -113,6 +114,88 @@ typedef enum PcmLockTransition {
  *	convert queues without leaking layout into callers.
  */
 typedef struct GrdEntry GrdEntry;
+
+
+/*
+ * Coherent, process-local view of one PCM authority entry.
+ *
+ * Every field is copied while the entry lock is held.  Callers may retain the
+ * value as an optimistic token and later require an exact match before an
+ * ownership handoff.  This is not a wire structure and adds no GrdEntry
+ * fields.
+ */
+typedef struct PcmAuthoritySnapshot {
+	ClusterGrdHolderId master_holder;
+	uint64 transition_count;
+	uint64 pending_x_since_lsn;
+	PcmState state;
+	int32 x_holder_node;
+	uint32 s_holders_bitmap;
+	int32 pending_x_requester_node;
+	uint32 reserved[2];
+} PcmAuthoritySnapshot;
+
+StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
+				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
+
+/*
+ * Exact queue-to-GRD X handoff token.  The queue engine builds this only
+ * after the source image and every required invalidation are acknowledged.
+ * It is deliberately process-local: changing it does not change wire ABI.
+ */
+typedef struct PcmXGrdHandoffToken {
+	BufferTag tag;
+	PcmAuthoritySnapshot authority;
+	uint64 cluster_epoch;
+	uint64 request_id;
+	uint64 ticket_id;
+	uint64 grant_generation;
+	uint64 image_id;
+	uint64 source_own_generation;
+	SCN page_scn;
+	uint64 page_lsn;
+	int32 requester_node;
+	int32 source_node;
+	uint32 requester_procno;
+	uint32 page_checksum;
+} PcmXGrdHandoffToken;
+
+StaticAssertDecl(sizeof(PcmXGrdHandoffToken) == 168,
+				 "PcmXGrdHandoffToken process-local layout must remain 168 bytes");
+
+typedef enum PcmXGrdHandoffResult {
+	PCM_X_GRD_HANDOFF_OK = 0,
+	PCM_X_GRD_HANDOFF_DUPLICATE,
+	PCM_X_GRD_HANDOFF_NOT_FOUND,
+	PCM_X_GRD_HANDOFF_STALE,
+	PCM_X_GRD_HANDOFF_BAD_STATE,
+	PCM_X_GRD_HANDOFF_INVALID
+} PcmXGrdHandoffResult;
+
+typedef enum PcmPendingXReserveResult {
+	PCM_PENDING_X_RESERVE_INVALID = -2,
+	PCM_PENDING_X_RESERVE_NO_CAPACITY = -1,
+	PCM_PENDING_X_RESERVE_OCCUPIED = 0,
+	PCM_PENDING_X_RESERVE_OK = 1
+} PcmPendingXReserveResult;
+
+/* Process-local queue cookie stored in GrdEntry.pending_x_since_lsn.  Keep
+ * the encoder shared by the PCM owner and coherent authority snapshots so a
+ * same-node legacy mark or successor ticket can never satisfy an active
+ * convert round. */
+#define PCM_PENDING_X_QUEUE_KIND UINT64_C(0x8000000000000000)
+#define PCM_PENDING_X_VALUE_MASK UINT64_C(0x7fffffffffffffff)
+
+static inline bool
+PcmPendingXQueueValue(uint64 ticket_id, uint64 *value_out)
+{
+	if (value_out != NULL)
+		*value_out = 0;
+	if (ticket_id == 0 || ticket_id > PCM_PENDING_X_VALUE_MASK || value_out == NULL)
+		return false;
+	*value_out = PCM_PENDING_X_QUEUE_KIND | ticket_id;
+	return true;
+}
 
 
 /*
@@ -286,6 +369,7 @@ extern bool cluster_pcm_clean_page_xfer_consume(void);
  *	    caller does not need to remember which mode was last held.
  */
 extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode);
+extern void cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode);
 extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
 /* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
  * writer-transfer (the remote holder shipped + released its X).  S3 forensics
@@ -334,6 +418,9 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
  *	  initializes the header, HTAB, HTAB lock, and per-entry locks lazily.
  */
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
+extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
+extern PcmXGrdHandoffResult
+cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
 extern int cluster_pcm_grd_count(void);
 extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
 										int *pi_holders_total, int *convert_queue_active);
@@ -426,7 +513,18 @@ extern void cluster_pcm_lock_module_init(void);
  *     pending_x_requester_node matching the dead node.  Must
  *     be idempotent under concurrent X grant clear races.
  * ============================================================ */
-extern void cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node, uint64 current_lsn);
+/* Legacy request-scoped producer.  OCCUPIED means a live barrier is already
+ * present; callers must retry/deny without overwriting it. */
+extern PcmPendingXReserveResult cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node,
+															   uint64 current_lsn);
+/* Queue-head reservation: claim only an idle barrier.  Even the same node is
+ * occupied without separate ticket-exact queue-engine proof. */
+extern PcmPendingXReserveResult
+cluster_pcm_lock_try_reserve_pending_x(BufferTag tag, int32 requester_node, uint64 ticket_id);
+extern bool cluster_pcm_lock_queue_pending_x_exact(BufferTag tag, int32 requester_node,
+												   uint64 ticket_id);
+extern bool cluster_pcm_lock_clear_queue_pending_x_exact(BufferTag tag, int32 requester_node,
+														 uint64 ticket_id);
 extern void cluster_pcm_lock_clear_pending_x(BufferTag tag);
 /* Identity-safe compare-and-clear: clears only while the mark still names
  * expected_requester (request-scoped clears MUST use this form; round-2

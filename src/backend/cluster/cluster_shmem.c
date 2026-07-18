@@ -102,6 +102,7 @@
 #include "cluster/cluster_gcs_block.h"		/* cluster_gcs_block_module_init (spec-2.33 D3) */
 #include "cluster/cluster_gcs_block_dedup.h" /* cluster_gcs_block_dedup_module_init (spec-2.34 D2) */
 #include "cluster/cluster_pcm_lock.h"		 /* cluster_pcm_lock_module_init (stage 1.7) */
+#include "cluster/cluster_pcm_x_convert.h"	 /* PCM-X external shmem substrate */
 #include "cluster/cluster_sinval.h"			 /* cluster_sinval_module_init (spec-2.38 D2/D3) */
 #include "cluster/cluster_tt_status.h"		 /* cluster_tt_status_shmem_register (spec-3.1 D2) */
 #include "cluster/cluster_tt_local.h"		 /* cluster_tt_local_shmem_register (spec-3.1 D5) */
@@ -411,6 +412,10 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster pcm grd") == NULL)
 		cluster_pcm_lock_module_init();
+
+	/* spec-2.36a S3-core: one external region for the five PCM-X pools. */
+	if (cluster_shmem_lookup_region(PCM_X_SHMEM_REGION_NAME) == NULL)
+		cluster_pcm_x_convert_shmem_register();
 
 	/*
 	 * spec-2.32 D2: register cluster_gcs shmem region (outstanding-request

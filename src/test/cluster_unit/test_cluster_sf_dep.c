@@ -218,6 +218,48 @@ UT_TEST(test_peer_cap_gen_renote_after_reconnect)
 	UT_ASSERT_EQ(cluster_sf_peer_cap_bits(&cap), (uint32)0);
 }
 
+UT_TEST(test_pcm_x_capability_does_not_alias_idle_horizon)
+{
+	ClusterSfPeerCap cap;
+
+	memset(&cap, 0, sizeof(cap));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1, (uint32)0x00000100U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, (uint32)0x00000200U);
+	UT_ASSERT((PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) == 0);
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1, 7);
+	UT_ASSERT((cluster_sf_peer_cap_bits(&cap) & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) == 0);
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, 8);
+	UT_ASSERT((cluster_sf_peer_cap_bits(&cap) & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0);
+}
+
+UT_TEST(test_pcm_x_capability_generation_snapshot_is_exact)
+{
+	ClusterSfPeerCap cap;
+	uint32 generation = UINT32_MAX;
+
+	memset(&cap, 0, sizeof(cap));
+	UT_ASSERT(!cluster_sf_peer_cap_generation_for_bits(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+													   &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1, 7);
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_cap_generation_for_bits(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+													   &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, 8);
+	UT_ASSERT(cluster_sf_peer_cap_generation_for_bits(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+													  &generation));
+	UT_ASSERT_EQ(generation, (uint32)8);
+
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, 8));
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_cap_generation_for_bits(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+													   &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+}
+
 int
 main(void)
 {
@@ -230,5 +272,7 @@ main(void)
 	UT_RUN(test_gcs_block_reply_v2_dep_extract_accepts_empty_v2_no_dep);
 	UT_RUN(test_peer_cap_gen_note_query_invalidate);
 	UT_RUN(test_peer_cap_gen_renote_after_reconnect);
+	UT_RUN(test_pcm_x_capability_does_not_alias_idle_horizon);
+	UT_RUN(test_pcm_x_capability_generation_snapshot_is_exact);
 	UT_DONE();
 }

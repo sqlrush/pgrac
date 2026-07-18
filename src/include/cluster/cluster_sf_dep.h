@@ -86,6 +86,23 @@ cluster_sf_peer_cap_bits(const ClusterSfPeerCap *cap)
 	return cap->valid ? cap->bits : 0;
 }
 
+/* Snapshot the capability-record generation that authenticated every
+ * requested bit.  Tier1 records are CONTROL-owned; RDMA records use their
+ * registered generation 0 convention.  False always zeroes the output. */
+static inline bool
+cluster_sf_peer_cap_generation_for_bits(const ClusterSfPeerCap *cap, uint32 required_bits,
+										uint32 *generation)
+{
+	if (generation != NULL)
+		*generation = 0;
+	if (cap == NULL || !cap->valid || required_bits == 0
+		|| (cap->bits & required_bits) != required_bits)
+		return false;
+	if (generation != NULL)
+		*generation = cap->generation;
+	return true;
+}
+
 /* Returns true iff the record was live for exactly this generation and got
  * cleared; a mismatch (older/newer generation, already invalid) is a no-op. */
 static inline bool
@@ -218,6 +235,8 @@ extern bool cluster_sf_peer_supports_gcs_done(int32 peer_id);
 extern bool cluster_sf_peer_supports_xid_native_disable(int32 peer_id);
 extern bool cluster_sf_peer_supports_xid_authority_flock(int32 peer_id);
 extern bool cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id);
+extern bool cluster_sf_peer_supports_pcm_x_convert(int32 peer_id);
+extern bool cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
 extern const char *cluster_sf_peer_capabilities_summary(void);

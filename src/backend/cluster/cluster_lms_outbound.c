@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -115,6 +116,24 @@ static const ClusterShmemRegion cluster_lms_outbound_region = {
 	.owner_subsys = "cluster_lms_outbound",
 	.reserved_flags = 0,
 };
+
+
+/* Type 50 reports the holder's irreversible X->N handoff; types 51-56 drive
+ * the resulting X grant to completion.  None may cross the final DATA
+ * transport boundary while the protocol runtime or node write authority is
+ * closed.  Admission/cancel/drain traffic remains independently routable. */
+static bool
+lms_outbound_pcm_x_grant_held(uint8 msg_type)
+{
+	PcmXRuntimeSnapshot runtime;
+
+	if (msg_type < PGRAC_IC_MSG_PCM_X_IMAGE_READY || msg_type > PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM)
+		return false;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE)
+		return true;
+	return cluster_write_fence_enforcing() && !cluster_write_fence_allowed();
+}
 
 void
 cluster_lms_outbound_shmem_register(void)
@@ -251,13 +270,47 @@ cluster_lms_outbound_drain_send(int worker_id)
 			continue;
 		}
 
+		/* Revalidate irreversible PCM-X grant authority immediately before
+		 * transport admission.  Retaining also blocks later same-peer frames,
+		 * preserving the DATA FIFO while unrelated peers keep flowing. */
+		if (lms_outbound_pcm_x_grant_held(slot.msg_type)) {
+			if (slot.dest_node_id < CLUSTER_MAX_NODES)
+				peer_blocked[slot.dest_node_id] = true;
+			Assert(n_retained < (int)lengthof(retained));
+			retained[n_retained++] = slot;
+			continue;
+		}
+
 		if (slot.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 			&& slot.payload_len == sizeof(GcsBlockRequestPayload))
 			cluster_gcs_block_lmon_prepare_outbound_request((GcsBlockRequestPayload *)slot.payload,
 															(int32)slot.dest_node_id);
 
-		rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
-									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);
+		/*
+		 * The generic IC send path deliberately treats dest=self as a no-op
+		 * DONE.  That is correct for transport diagnostics, but not for a
+		 * staged DATA actor: PCM-X frequently maps a tag's resource master to
+		 * the requesting node, and its ENQUEUE/ACK must still execute on the
+		 * tag-owning LMS worker.  Build the same envelope and dispatch it here,
+		 * after dequeue and without the ring lock.  A handler response is
+		 * staged back onto this tag's ring, preserving the one-worker FIFO and
+		 * avoiding recursive handler execution.
+		 */
+		if ((int32)slot.dest_node_id == cluster_node_id) {
+			ClusterICEnvelope env;
+
+			if (cluster_ic_envelope_build(
+					&env, slot.msg_type, (uint32)cluster_node_id, slot.dest_node_id,
+					slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len)
+				&& cluster_ic_dispatch_envelope(&env, slot.payload_len > 0 ? slot.payload : NULL,
+												cluster_node_id))
+				rc = CLUSTER_IC_SEND_DONE;
+			else
+				rc = CLUSTER_IC_SEND_HARD_ERROR;
+		} else
+			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
+										  slot.payload_len > 0 ? slot.payload : NULL,
+										  slot.payload_len);
 		switch (rc) {
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:

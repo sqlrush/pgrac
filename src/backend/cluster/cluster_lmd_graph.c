@@ -53,6 +53,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
+#include "utils/palloc.h"
 
 
 /* ============================================================
@@ -148,7 +149,25 @@ typedef struct ClusterLmdGraphShared {
 	 * never honored, so it cannot wrongly clear / escalate the live victim. */
 	pg_atomic_uint64 cancel_ack_mismatch_count;
 	int max_edges; /* snapshot of cluster.lmd_max_wait_edges at init */
+	/* Appended connector accounting; existing field offsets stay unchanged. */
+	pg_atomic_uint64 pcm_convert_wfg_replace_count;
+	pg_atomic_uint64 pcm_convert_wfg_remove_count;
+	pg_atomic_uint64 pcm_convert_wfg_replace_fail_count;
+	pg_atomic_uint64 pcm_convert_wfg_exact_remove_stale_count;
 } ClusterLmdGraphShared;
+
+/* Pin the old tail and the appended connector counters byte-for-byte. */
+StaticAssertDecl(offsetof(ClusterLmdGraphShared, max_edges) == 296,
+				 "LMD graph max_edges offset ABI");
+StaticAssertDecl(offsetof(ClusterLmdGraphShared, pcm_convert_wfg_replace_count) == 304,
+				 "LMD graph PCM-X replace counter offset ABI");
+StaticAssertDecl(offsetof(ClusterLmdGraphShared, pcm_convert_wfg_remove_count) == 312,
+				 "LMD graph PCM-X remove counter offset ABI");
+StaticAssertDecl(offsetof(ClusterLmdGraphShared, pcm_convert_wfg_replace_fail_count) == 320,
+				 "LMD graph PCM-X replace-fail counter offset ABI");
+StaticAssertDecl(offsetof(ClusterLmdGraphShared, pcm_convert_wfg_exact_remove_stale_count) == 328,
+				 "LMD graph PCM-X exact-remove-stale counter offset ABI");
+StaticAssertDecl(sizeof(ClusterLmdGraphShared) == 336, "LMD graph shared-memory ABI");
 
 static ClusterLmdGraphShared *cluster_lmd_graph_state = NULL;
 static HTAB *cluster_lmd_graph_htab = NULL;
@@ -162,6 +181,15 @@ static void fill_vertex_key(const ClusterLmdVertex *v, LmdVertexKey *out);
 static void make_key(const ClusterLmdVertex *waiter, const ClusterLmdVertex *blocker,
 					 LmdEdgeKey *out);
 static bool key_waiter_matches(const LmdEdgeKey *key, const ClusterLmdVertex *waiter);
+static bool vertex_identity_equal(const ClusterLmdVertex *a, const ClusterLmdVertex *b);
+static int vertex_identity_qsort_cmp(const void *a, const void *b);
+static bool vertex_metadata_equal(const ClusterLmdVertex *a, const ClusterLmdVertex *b);
+static void restore_replaced_waiter_set(const ClusterLmdVertex *waiter,
+										const ClusterLmdVertex *new_blockers, int inserted_count,
+										const ClusterLmdWaitEdge *old_edges, int removed_count,
+										uint64 edge_count_before, uint64 generation_before);
+
+#define LMD_REMOVE_BATCH 32
 
 
 /* ============================================================
@@ -210,6 +238,10 @@ cluster_lmd_graph_shmem_init(void)
 		pg_atomic_init_u64(&cluster_lmd_graph_state->victim_cancel_sent_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->revalidate_fail_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cross_node_victim_pending_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->pcm_convert_wfg_remove_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_fail_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->pcm_convert_wfg_exact_remove_stale_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->probe_broadcast_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->probe_partial_count, 0);
 		/* spec-2.24 D12 init. */
@@ -281,6 +313,80 @@ key_waiter_matches(const LmdEdgeKey *key, const ClusterLmdVertex *waiter)
 		   && key->waiter.request_id == waiter->request_id;
 }
 
+static bool
+vertex_identity_equal(const ClusterLmdVertex *a, const ClusterLmdVertex *b)
+{
+	return a->node_id == b->node_id && a->procno == b->procno
+		   && a->cluster_epoch == b->cluster_epoch && a->request_id == b->request_id;
+}
+
+static int
+vertex_identity_qsort_cmp(const void *a, const void *b)
+{
+	const ClusterLmdVertex *va = (const ClusterLmdVertex *)a;
+	const ClusterLmdVertex *vb = (const ClusterLmdVertex *)b;
+
+	if (va->node_id != vb->node_id)
+		return va->node_id < vb->node_id ? -1 : 1;
+	if (va->procno != vb->procno)
+		return va->procno < vb->procno ? -1 : 1;
+	if (va->cluster_epoch != vb->cluster_epoch)
+		return va->cluster_epoch < vb->cluster_epoch ? -1 : 1;
+	if (va->request_id != vb->request_id)
+		return va->request_id < vb->request_id ? -1 : 1;
+	return 0;
+}
+
+static bool
+vertex_metadata_equal(const ClusterLmdVertex *a, const ClusterLmdVertex *b)
+{
+	return a->xid == b->xid && a->local_start_ts_ms == b->local_start_ts_ms
+		   && a->wait_seq == b->wait_seq;
+}
+
+/*
+ * Roll back a replacement that hit the dynahash's non-throwing insertion
+ * guard after mutation began.  The caller holds the graph lock EXCLUSIVE.
+ * Removing the inserted prefix recreates exactly removed_count free slots,
+ * so restoring that many saved old edges cannot normally fail.  A failure in
+ * that second invariant means the shared graph itself is corrupt; continuing
+ * would let the deadlock detector act on a partial graph, so PANIC is the only
+ * fail-closed outcome.
+ */
+static void
+restore_replaced_waiter_set(const ClusterLmdVertex *waiter, const ClusterLmdVertex *new_blockers,
+							int inserted_count, const ClusterLmdWaitEdge *old_edges,
+							int removed_count, uint64 edge_count_before, uint64 generation_before)
+{
+	int i;
+
+	for (i = 0; i < inserted_count; i++) {
+		LmdEdgeKey key;
+		bool found;
+
+		make_key(waiter, &new_blockers[i], &key);
+		(void)hash_search(cluster_lmd_graph_htab, &key, HASH_REMOVE, &found);
+		if (!found)
+			ereport(PANIC, (errmsg("could not roll back partial LMD blocker-set replacement")));
+	}
+
+	for (i = 0; i < removed_count; i++) {
+		LmdEdgeKey key;
+		LmdEdgeEntry *entry;
+		bool found;
+
+		make_key(&old_edges[i].waiter, &old_edges[i].blocker, &key);
+		entry = (LmdEdgeEntry *)hash_search(cluster_lmd_graph_htab, &key, HASH_ENTER_NULL, &found);
+		if (entry == NULL || found)
+			ereport(PANIC, (errmsg("could not restore LMD blocker set after replacement failure")));
+		entry->edge = old_edges[i];
+	}
+
+	/* No snapshot can have observed the intermediate values under EXCLUSIVE. */
+	pg_atomic_write_u64(&cluster_lmd_graph_state->edge_count, edge_count_before);
+	pg_atomic_write_u64(&cluster_lmd_graph_state->generation, generation_before);
+}
+
 bool
 cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
 {
@@ -335,6 +441,205 @@ cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
 	return true;
 }
 
+/*
+ * spec-2.36a C2 -- publish a waiter's complete blocker set atomically.
+ *
+ * The old cancel-then-submit loop exposes an empty or partial graph to a
+ * concurrent Tarjan snapshot and cannot roll back a prefix when the graph is
+ * full.  This operation holds the graph LWLock across capacity reservation,
+ * removal, and insertion.  Capacity is reserved against the FINAL cardinality
+ * before the first mutation, so a normal saturation failure leaves the prior
+ * set and graph generation untouched.
+ *
+ * The dynahash is fixed-size and the exclusive lock prevents competing
+ * inserts between the final-cardinality check and HASH_ENTER_NULL.  A
+ * surprising insertion NULL is nevertheless handled: remove the inserted
+ * prefix, restore the saved old set and its count/generation, then return
+ * false.  If that restoration invariant itself fails, PANIC prevents any
+ * detector from acting on a partial shared graph.  The exact entry point
+ * returns the graph generation committed by this batch while still holding
+ * the graph lock; zero means no batch was published.  The legacy boolean API
+ * remains a compatibility wrapper.
+ */
+uint64
+cluster_lmd_graph_replace_waiter_edges_exact(const ClusterLmdVertex *waiter,
+											 const ClusterLmdVertex *blockers, int nblockers,
+											 uint64 request_id)
+{
+	HASH_SEQ_STATUS scan;
+	LmdEdgeEntry *e;
+	ClusterLmdVertex *canonical = NULL;
+	ClusterLmdWaitEdge *old_edges;
+	uint64 cur_count;
+	uint64 committed_generation;
+	uint64 generation_before;
+	uint64 survivor_count;
+	int old_capacity;
+	int old_count;
+	int unique_count = 0;
+	int i;
+
+	if (waiter == NULL || nblockers < 0 || (nblockers > 0 && blockers == NULL)
+		|| cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL
+		|| request_id != waiter->request_id || nblockers > cluster_lmd_graph_state->max_edges)
+		return 0;
+
+	/*
+	 * Canonicalize outside the global graph lock.  Equal identities may be
+	 * folded only when victim-selection/ABA metadata is also exact; silently
+	 * choosing one of two wait_seq values could cancel a reused backend wait.
+	 */
+	if (nblockers > 0) {
+		canonical = palloc_array(ClusterLmdVertex, nblockers);
+		memcpy(canonical, blockers, sizeof(ClusterLmdVertex) * nblockers);
+		qsort(canonical, nblockers, sizeof(ClusterLmdVertex), vertex_identity_qsort_cmp);
+
+		for (i = 0; i < nblockers; i++) {
+			if (vertex_identity_equal(waiter, &canonical[i])) {
+				pfree(canonical);
+				return 0;
+			}
+			if (unique_count > 0
+				&& vertex_identity_equal(&canonical[unique_count - 1], &canonical[i])) {
+				if (!vertex_metadata_equal(&canonical[unique_count - 1], &canonical[i])) {
+					pfree(canonical);
+					return 0;
+				}
+				continue;
+			}
+			canonical[unique_count++] = canonical[i];
+		}
+	}
+
+	/*
+	 * Save the old edge payloads both for O(old_count) deletion and for exact
+	 * rollback if HASH_ENTER_NULL reports an invariant failure.  Size the
+	 * first pass from the replacement, then grow outside the LWLock if a
+	 * waiter currently has a larger set.
+	 */
+	old_capacity = Max(LMD_REMOVE_BATCH, unique_count);
+	old_capacity = Min(old_capacity, cluster_lmd_graph_state->max_edges);
+	old_edges = palloc_array(ClusterLmdWaitEdge, old_capacity);
+
+	for (;;) {
+		bool overflow = false;
+
+		old_count = 0;
+		LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
+		hash_seq_init(&scan, cluster_lmd_graph_htab);
+		while ((e = (LmdEdgeEntry *)hash_seq_search(&scan)) != NULL) {
+			if (!key_waiter_matches(&e->key, waiter))
+				continue;
+			if (old_count == old_capacity) {
+				overflow = true;
+				hash_seq_term(&scan);
+				break;
+			}
+			old_edges[old_count++] = e->edge;
+		}
+		if (!overflow)
+			break;
+
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		if (old_capacity == cluster_lmd_graph_state->max_edges) {
+			pfree(old_edges);
+			if (canonical != NULL)
+				pfree(canonical);
+			return 0;
+		}
+		old_capacity = Min(old_capacity * 2, cluster_lmd_graph_state->max_edges);
+		old_edges = repalloc_array(old_edges, ClusterLmdWaitEdge, old_capacity);
+	}
+
+	cur_count = pg_atomic_read_u64(&cluster_lmd_graph_state->edge_count);
+	Assert((uint64)old_count <= cur_count);
+	if ((uint64)old_count > cur_count) {
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		pfree(old_edges);
+		if (canonical != NULL)
+			pfree(canonical);
+		return 0;
+	}
+	survivor_count = cur_count - (uint64)old_count;
+	if (survivor_count > (uint64)cluster_lmd_graph_state->max_edges
+		|| (uint64)unique_count > (uint64)cluster_lmd_graph_state->max_edges - survivor_count) {
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->wait_edge_full_count, 1);
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		pfree(old_edges);
+		if (canonical != NULL)
+			pfree(canonical);
+		return 0;
+	}
+	generation_before = pg_atomic_read_u64(&cluster_lmd_graph_state->generation);
+
+	/* Delete the saved exact set in O(old_count), still under EXCLUSIVE. */
+	for (i = 0; i < old_count; i++) {
+		LmdEdgeKey key;
+		bool found;
+
+		make_key(&old_edges[i].waiter, &old_edges[i].blocker, &key);
+		(void)hash_search(cluster_lmd_graph_htab, &key, HASH_REMOVE, &found);
+		if (!found) {
+			restore_replaced_waiter_set(waiter, canonical, 0, old_edges, i, cur_count,
+										generation_before);
+			LWLockRelease(&cluster_lmd_graph_state->lwlock);
+			pfree(old_edges);
+			if (canonical != NULL)
+				pfree(canonical);
+			return 0;
+		}
+		pg_atomic_fetch_sub_u64(&cluster_lmd_graph_state->edge_count, 1);
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+	}
+
+	/* Insert the canonical set.  A surprising NULL is rolled back exactly. */
+	for (i = 0; i < unique_count; i++) {
+		ClusterLmdWaitEdge edge;
+		LmdEdgeKey key;
+		LmdEdgeEntry *entry;
+		bool found;
+
+		memset(&edge, 0, sizeof(edge));
+		edge.waiter = *waiter;
+		edge.blocker = canonical[i];
+		edge.request_id = request_id;
+		make_key(waiter, &canonical[i], &key);
+		entry = (LmdEdgeEntry *)hash_search(cluster_lmd_graph_htab, &key, HASH_ENTER_NULL, &found);
+		if (entry == NULL) {
+			pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->wait_edge_full_count, 1);
+			restore_replaced_waiter_set(waiter, canonical, i, old_edges, old_count, cur_count,
+										generation_before);
+			LWLockRelease(&cluster_lmd_graph_state->lwlock);
+			pfree(old_edges);
+			if (canonical != NULL)
+				pfree(canonical);
+			return 0;
+		}
+		if (found)
+			ereport(PANIC, (errmsg("duplicate LMD edge appeared during atomic replacement")));
+		entry->edge = edge;
+		entry->edge.graph_generation
+			= pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->edge_count, 1);
+	}
+
+	committed_generation = pg_atomic_read_u64(&cluster_lmd_graph_state->generation);
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	pfree(old_edges);
+	if (canonical != NULL)
+		pfree(canonical);
+	return committed_generation;
+}
+
+bool
+cluster_lmd_graph_replace_waiter_edges(const ClusterLmdVertex *waiter,
+									   const ClusterLmdVertex *blockers, int nblockers,
+									   uint64 request_id)
+{
+	return cluster_lmd_graph_replace_waiter_edges_exact(waiter, blockers, nblockers, request_id)
+		   != 0;
+}
+
 bool
 cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter)
 {
@@ -380,8 +685,6 @@ cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter)
  *	the generic graph.  Held EXCLUSIVE across the whole operation so a
  *	waiter's edges are removed atomically.
  */
-#define LMD_REMOVE_BATCH 32
-
 bool
 cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter)
 {
@@ -428,6 +731,88 @@ cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter)
 	}
 	LWLockRelease(&cluster_lmd_graph_state->lwlock);
 	return removed_any;
+}
+
+/*
+ * PCM-X cancellation additionally binds removal to the backend wait_seq.  The
+ * graph key intentionally remains the canonical waiter 4-tuple, so first
+ * prove that every matching edge still belongs to this exact wait instance;
+ * a stale cancel must leave a newer instance byte-stable.  The exclusive lock
+ * makes ABSENT a stable observation relative to graph writers, rather than a
+ * false alias for STALE.
+ */
+ClusterLmdGraphRemoveResult
+cluster_lmd_graph_remove_edge_by_waiter_exact_result(const ClusterLmdVertex *waiter)
+{
+	HASH_SEQ_STATUS proof_scan;
+	LmdEdgeEntry *entry;
+	bool matched_any = false;
+	bool removed_any = false;
+
+	Assert(waiter != NULL);
+	if (waiter == NULL || waiter->wait_seq == 0)
+		return CLUSTER_LMD_GRAPH_REMOVE_STALE;
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
+		return CLUSTER_LMD_GRAPH_REMOVE_STALE;
+
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
+	hash_seq_init(&proof_scan, cluster_lmd_graph_htab);
+	while ((entry = (LmdEdgeEntry *)hash_seq_search(&proof_scan)) != NULL) {
+		if (!key_waiter_matches(&entry->key, waiter))
+			continue;
+		matched_any = true;
+		if (entry->edge.waiter.wait_seq != waiter->wait_seq) {
+			hash_seq_term(&proof_scan);
+			LWLockRelease(&cluster_lmd_graph_state->lwlock);
+			return CLUSTER_LMD_GRAPH_REMOVE_STALE;
+		}
+	}
+	if (!matched_any) {
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		return CLUSTER_LMD_GRAPH_REMOVE_ABSENT;
+	}
+
+	for (;;) {
+		HASH_SEQ_STATUS scan;
+		LmdEdgeEntry *candidate;
+		LmdEdgeKey batch[LMD_REMOVE_BATCH];
+		int nbatch = 0;
+		bool more = false;
+		int i;
+
+		hash_seq_init(&scan, cluster_lmd_graph_htab);
+		while ((candidate = (LmdEdgeEntry *)hash_seq_search(&scan)) != NULL) {
+			if (!key_waiter_matches(&candidate->key, waiter))
+				continue;
+			if (nbatch == LMD_REMOVE_BATCH) {
+				more = true;
+				hash_seq_term(&scan);
+				break;
+			}
+			batch[nbatch++] = candidate->key;
+		}
+		for (i = 0; i < nbatch; i++) {
+			bool found;
+
+			(void)hash_search(cluster_lmd_graph_htab, &batch[i], HASH_REMOVE, &found);
+			if (found) {
+				pg_atomic_fetch_sub_u64(&cluster_lmd_graph_state->edge_count, 1);
+				pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+				removed_any = true;
+			}
+		}
+		if (!more)
+			break;
+	}
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	return removed_any ? CLUSTER_LMD_GRAPH_REMOVE_REMOVED : CLUSTER_LMD_GRAPH_REMOVE_STALE;
+}
+
+bool
+cluster_lmd_graph_remove_edge_by_waiter_exact(const ClusterLmdVertex *waiter)
+{
+	return cluster_lmd_graph_remove_edge_by_waiter_exact_result(waiter)
+		   == CLUSTER_LMD_GRAPH_REMOVE_REMOVED;
 }
 
 int
@@ -486,6 +871,68 @@ cluster_lmd_wait_edge_full_count_get(void)
 	if (cluster_lmd_graph_state == NULL)
 		return 0;
 	return pg_atomic_read_u64(&cluster_lmd_graph_state->wait_edge_full_count);
+}
+
+uint64
+cluster_lmd_pcm_convert_wfg_replace_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_count);
+}
+
+uint64
+cluster_lmd_pcm_convert_wfg_remove_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->pcm_convert_wfg_remove_count);
+}
+
+uint64
+cluster_lmd_pcm_convert_wfg_replace_fail_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_fail_count);
+}
+
+uint64
+cluster_lmd_pcm_convert_wfg_exact_remove_stale_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->pcm_convert_wfg_exact_remove_stale_count);
+}
+
+void
+cluster_lmd_pcm_convert_wfg_note_replace(void)
+{
+	if (cluster_lmd_graph_state != NULL)
+		(void)pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_count, 1);
+}
+
+void
+cluster_lmd_pcm_convert_wfg_note_remove(void)
+{
+	if (cluster_lmd_graph_state != NULL)
+		(void)pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->pcm_convert_wfg_remove_count, 1);
+}
+
+void
+cluster_lmd_pcm_convert_wfg_note_replace_fail(void)
+{
+	if (cluster_lmd_graph_state != NULL)
+		(void)pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->pcm_convert_wfg_replace_fail_count,
+									  1);
+}
+
+void
+cluster_lmd_pcm_convert_wfg_note_exact_remove_stale(void)
+{
+	if (cluster_lmd_graph_state != NULL)
+		(void)pg_atomic_fetch_add_u64(
+			&cluster_lmd_graph_state->pcm_convert_wfg_exact_remove_stale_count, 1);
 }
 
 uint64

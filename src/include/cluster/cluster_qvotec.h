@@ -309,6 +309,10 @@ extern int cluster_qvotec_get_quorum_state(void);
 extern int cluster_qvotec_get_disks_ok_count(void);
 extern int cluster_qvotec_get_disks_total_count(void);
 extern uint64 cluster_qvotec_get_current_epoch_at_boot(void);
+/* Canonical boot session published by QVOTEC into its existing shared-memory
+ * region.  QVOTEC is the sole writer; LMS/backends are read-only consumers. */
+extern void cluster_qvotec_publish_self_incarnation(uint64 incarnation);
+extern uint64 cluster_qvotec_get_self_incarnation(void);
 extern const char *cluster_qvotec_get_collision_state_name(void);
 
 

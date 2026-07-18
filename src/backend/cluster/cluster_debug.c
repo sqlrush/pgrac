@@ -141,6 +141,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
 #include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_pcm_x_convert.h"	 /* PCM-X external FIFO observability */
 #include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
 #include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
 #include "cluster/cluster_gcs_block_dedup.h" /* per-worker dedup-shard counters (spec-7.3 D5/D9) */
@@ -1508,7 +1509,7 @@ dump_lms(ReturnSetInfo *rsinfo)
 /*
  * dump_lmd -- spec-2.19 Sprint A Step 4 D10.
  *
- *	Emits 47 rows under category='lmd' (spec-2.19 daemon state/counters +
+ *	Emits 51 rows under category='lmd' (spec-2.19 daemon state/counters +
  *	spec-2.22 graph/Tarjan + spec-2.23 probe + spec-2.24 cancel/cleanup +
  *	spec-5.8 D6 two-round-confirm/reconfig-gate + spec-5.8 Hardening v1.0.1
  *	FC1 member_incomplete_count + spec-5.8 D8 shmem REPORT-collector
@@ -1547,6 +1548,14 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_victim_cancel_sent_count_get()));
 	emit_row(rsinfo, "lmd", "revalidate_fail_count",
 			 fmt_int64((int64)cluster_lmd_revalidate_fail_count_get()));
+	emit_row(rsinfo, "lmd", "pcm_convert_wfg_replace_count",
+			 fmt_int64((int64)cluster_lmd_pcm_convert_wfg_replace_count_get()));
+	emit_row(rsinfo, "lmd", "pcm_convert_wfg_remove_count",
+			 fmt_int64((int64)cluster_lmd_pcm_convert_wfg_remove_count_get()));
+	emit_row(rsinfo, "lmd", "pcm_convert_wfg_replace_fail_count",
+			 fmt_int64((int64)cluster_lmd_pcm_convert_wfg_replace_fail_count_get()));
+	emit_row(rsinfo, "lmd", "pcm_convert_wfg_exact_remove_stale_count",
+			 fmt_int64((int64)cluster_lmd_pcm_convert_wfg_exact_remove_stale_count_get()));
 	emit_row(rsinfo, "lmd", "cross_node_victim_pending_count",
 			 fmt_int64((int64)cluster_lmd_cross_node_victim_pending_count_get()));
 	emit_row(rsinfo, "lmd", "inject_call_count",
@@ -1985,6 +1994,56 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 * (table full): non-zero means prov_query absence is inconclusive. */
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
+
+	/* PCM-X queue core: 30 stable keys in the existing pcm category. */
+	{
+		PcmXStatsSnapshot stats = { 0 };
+		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
+
+		(void)cluster_pcm_x_stats_snapshot(&stats);
+		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
+		emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
+				 fmt_int64((int64)runtime.gate_generation));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", fmt_int64((int64)stats.admit_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", fmt_int64((int64)stats.confirm_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_promotion_count",
+				 fmt_int64((int64)stats.promotion_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_transfer_count",
+				 fmt_int64((int64)stats.transfer_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_complete_count",
+				 fmt_int64((int64)stats.complete_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_cancel_count", fmt_int64((int64)stats.cancel_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_revoke_count", fmt_int64((int64)stats.revoke_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_coalesced_count",
+				 fmt_int64((int64)stats.coalesced_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_wait_count", fmt_int64((int64)stats.wait_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_full_count", fmt_int64((int64)stats.full_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_stale_count", fmt_int64((int64)stats.stale_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_miss_count", fmt_int64((int64)stats.miss_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_recovery_blocked_count",
+				 fmt_int64((int64)stats.recovery_blocked_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_activating_reset_count",
+				 fmt_int64((int64)stats.activating_reset_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_depth", fmt_int64((int64)stats.depth));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_depth_high_water",
+				 fmt_int64((int64)stats.depth_high_water));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_active_tags", fmt_int64((int64)stats.active_tags));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_live_tickets", fmt_int64((int64)stats.live_tickets));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_live_slots", fmt_int64((int64)stats.live_slots));
+		emit_row(rsinfo, "pcm", "pcm_x_local_retire_gate",
+				 fmt_int64((int64)stats.local_retire_gate));
+		emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_count",
+				 fmt_int64((int64)stats.local_retire_marker_count));
+		emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_ticket_id",
+				 fmt_int64((int64)stats.local_retire_marker_ticket_id));
+		emit_row(rsinfo, "pcm", "pcm_x_own_begin_count", fmt_int64((int64)stats.own_begin_count));
+		emit_row(rsinfo, "pcm", "pcm_x_own_commit_count", fmt_int64((int64)stats.own_commit_count));
+		emit_row(rsinfo, "pcm", "pcm_x_own_abort_count", fmt_int64((int64)stats.own_abort_count));
+		emit_row(rsinfo, "pcm", "pcm_x_own_busy_count", fmt_int64((int64)stats.own_busy_count));
+		emit_row(rsinfo, "pcm", "pcm_x_own_corrupt_count",
+				 fmt_int64((int64)stats.own_corrupt_count));
+	}
 }
 
 
@@ -2180,6 +2239,14 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_hint_violation_count()));
 	emit_row(rsinfo, "gcs", "dedup_legacy_pin_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_legacy_pin_count()));
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_stage_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_stage_count()));
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_replay_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_replay_count()));
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_release_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_release_count()));
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_failclosed_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_failclosed_count()));
 	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
 
@@ -2218,6 +2285,12 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_sent_count()));
 	emit_row(rsinfo, "gcs", "invalidate_busy_received_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_busy_received_count()));
+	emit_row(rsinfo, "gcs", "invalidate_passive_s_release_count",
+			 fmt_int64((int64)cluster_gcs_get_invalidate_passive_s_release_count()));
+	emit_row(rsinfo, "gcs", "pcm_x_self_handoff_count",
+			 fmt_int64((int64)cluster_gcs_get_pcm_x_self_handoff_count()));
+	emit_row(rsinfo, "gcs", "pcm_x_self_handoff_drain_count",
+			 fmt_int64((int64)cluster_gcs_get_pcm_x_self_handoff_drain_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_park_expired_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_overflow_count",

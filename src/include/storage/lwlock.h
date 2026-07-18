@@ -11,6 +11,18 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	  Export the per-process held-LWLock ceiling for checked cluster shared
+ *	  memory capacity calculations.
+ *
+ *	  Spec: spec-2.36a-gcs-writer-convert-queue.md
+ *
+ *-------------------------------------------------------------------------
+ */
 #ifndef LWLOCK_H
 #define LWLOCK_H
 
@@ -22,6 +34,9 @@
 #include "storage/proclist_types.h"
 
 struct PGPROC;
+
+/* PGRAC: shared ceiling for per-process held-LWLock capacity calculations. */
+#define LWLOCK_MAX_HELD_BY_PROC 200
 
 /* what state of the wait process is a backend in */
 typedef enum LWLockWaitState {
@@ -361,6 +376,12 @@ typedef enum BuiltinTrancheIds {
 		 * the wrap-barrier DISABLE clears the latch under EXCLUSIVE and only
 		 * ACKs after release, so no reader can straddle the epoch rollover. */
 		LWTRANCHE_CLUSTER_NATIVE_PREHISTORY,
+		/* PGRAC (spec-2.36a): PCM-X external queue allocator/directory lock. */
+		LWTRANCHE_CLUSTER_PCM_X_ALLOCATOR,
+		/* PGRAC (spec-2.36a): PCM-X BufferTag master-queue partitions. */
+		LWTRANCHE_CLUSTER_PCM_X_MASTER,
+		/* PGRAC (spec-2.36a): PCM-X node-local coordinator partitions. */
+		LWTRANCHE_CLUSTER_PCM_X_LOCAL,
 	#endif
 		LWTRANCHE_FIRST_USER_DEFINED
 	} BuiltinTrancheIds;

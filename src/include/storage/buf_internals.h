@@ -524,6 +524,40 @@ GetBufferDescriptor(uint32 id)
 	return &(BufferDescriptors[id]).bufferdesc;
 }
 
+/*
+ * Reverse-map only the exact content_lock embedded in a shared BufferDesc.
+ * A coarse BufferDescriptors address-range test is insufficient in cluster
+ * builds because the same padded slot also embeds pcm_lock.  Keep this helper
+ * shared by bufmgr diagnostics and the PCM-X nested-wait guard so neither can
+ * reinterpret pcm_lock (or a future embedded LWLock) as a content lock.
+ */
+static inline BufferDesc *
+BufferDescriptorFromContentLock(LWLock *lock)
+{
+	uintptr_t addr;
+	uintptr_t end;
+	uintptr_t start;
+	Size offset;
+	Size span;
+
+	if (lock == NULL || BufferDescriptors == NULL || NBuffers <= 0)
+		return NULL;
+	if ((Size)NBuffers > SIZE_MAX / sizeof(BufferDescPadded))
+		return NULL;
+	span = (Size)NBuffers * sizeof(BufferDescPadded);
+	start = (uintptr_t)BufferDescriptors;
+	addr = (uintptr_t)lock;
+	if (span > UINTPTR_MAX - start)
+		return NULL;
+	end = start + span;
+	if (addr < start || addr >= end)
+		return NULL;
+	offset = (Size)(addr - start);
+	if (offset % sizeof(BufferDescPadded) != offsetof(BufferDesc, content_lock))
+		return NULL;
+	return &BufferDescriptors[offset / sizeof(BufferDescPadded)].bufferdesc;
+}
+
 static inline BufferDesc *
 GetLocalBufferDescriptor(uint32 id)
 {

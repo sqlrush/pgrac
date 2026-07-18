@@ -619,7 +619,9 @@ fsm_readbuf(Relation rel, FSMAddress addr, bool extend)
 	 */
 	if (PageIsNew(BufferGetPage(buf)))
 	{
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		/* PGRAC: authorize this known FSM zero-page initialization without
+		 * admitting an ordinary N->X writer outside the PCM-X queue. */
+		LockBufferForFreeSpaceMapPageInit(buf);
 		if (PageIsNew(BufferGetPage(buf)))
 			PageInit(BufferGetPage(buf), BLCKSZ, 0);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);

@@ -243,6 +243,9 @@ extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
+/* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
+extern void LockBufferForVisibilityMapPageInit(Buffer buffer);
+extern void LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);

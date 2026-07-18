@@ -364,6 +364,10 @@ typedef enum ClusterICPlane {
  * the sender wakes and reports a real value again, so old peers keep
  * receiving the conservative clock sample instead. */
 #define PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 ((uint32)0x00000100U)
+/* This binary registers and enforces the byte-exact PCM-X conversion message
+ * family.  A sender must not transmit any PCM-X frame to a peer that did not
+ * advertise this bit; an old peer would treat the type as unregistered. */
+#define PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 ((uint32)0x00000200U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

@@ -61,6 +61,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
 #include "storage/latch.h"				  /* spec-4.6 D4 — freeze-gate WaitLatch */
@@ -106,6 +107,27 @@ ensure_counter_initialized(void)
 		pg_atomic_init_u64(&stub_s7_cleanup_count, 0);
 		pg_atomic_init_u64(&stub_local_fast_path_count, 0);
 		stub_counter_initialized = true;
+	}
+}
+
+
+/* A backend holding a frozen buffer content lock must fail before entering a
+ * second distributed wait.  BUSY/NOT_READY are retryable closed decisions;
+ * structural corruption remains an internal fail-closed error. */
+static ClusterLockAcquireResult
+cluster_lock_pcm_x_nested_guard_result(PcmXQueueResult result)
+{
+	switch (result) {
+	case PCM_X_QUEUE_OK:
+		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	case PCM_X_QUEUE_BARRIER_CLOSED:
+	case PCM_X_QUEUE_BUSY:
+	case PCM_X_QUEUE_NOT_READY:
+	case PCM_X_QUEUE_STALE:
+	case PCM_X_QUEUE_GATE_RETRY:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
+	default:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 }
 
@@ -327,6 +349,7 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		 * waiter edge (spec-5.8 D1b/D1e).
 		 */
 		ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
+		volatile PcmXQueueResult guard_result = PCM_X_QUEUE_OK;
 
 		if (ws != NULL)
 			(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
@@ -334,9 +357,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 												 GetTopTransactionIdIfAny());
 		PG_TRY();
 		{
-			reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
-													   &req->holder, req->request_id,
-													   req->timeout_ms, req->wait_event);
+			guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+			if (guard_result == PCM_X_QUEUE_OK)
+				reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
+														   &req->holder, req->request_id,
+														   req->timeout_ms, req->wait_event);
 		}
 		PG_CATCH();
 		{
@@ -347,6 +372,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		PG_END_TRY();
 		if (ws != NULL)
 			cluster_lmd_wait_state_clear(ws);
+		if (guard_result != PCM_X_QUEUE_OK)
+			return cluster_lock_pcm_x_nested_guard_result((PcmXQueueResult)guard_result);
 	}
 	if (reject == GES_REJECT_REASON_NONE) {
 		if (dontwait && is_advisory)
@@ -450,6 +477,7 @@ static ClusterLockAcquireResult
 cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 {
 	uint32 reject;
+	volatile PcmXQueueResult guard_result = PCM_X_QUEUE_OK;
 	/* spec-5.8 D1d — a cross-node CONVERT (S->X upgrade) blocks and can
 	 * deadlock; publish/clear the wait-state around it like the S4 request
 	 * wait so the resolver can revalidate the victim. */
@@ -461,9 +489,11 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 											 GetTopTransactionIdIfAny());
 	PG_TRY();
 	{
-		reject = cluster_ges_send_convert_and_wait(&req->resid, (uint32)req->lockmode,
-												   (uint32)req->current_mode, &req->holder,
-												   req->request_id, /* timeout = GUC default */ 0);
+		guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+		if (guard_result == PCM_X_QUEUE_OK)
+			reject = cluster_ges_send_convert_and_wait(
+				&req->resid, (uint32)req->lockmode, (uint32)req->current_mode, &req->holder,
+				req->request_id, /* timeout = GUC default */ 0);
 	}
 	PG_CATCH();
 	{
@@ -474,6 +504,8 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 	PG_END_TRY();
 	if (ws != NULL)
 		cluster_lmd_wait_state_clear(ws);
+	if (guard_result != PCM_X_QUEUE_OK)
+		return cluster_lock_pcm_x_nested_guard_result((PcmXQueueResult)guard_result);
 
 	if (reject == GES_REJECT_REASON_NONE) {
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);

@@ -775,6 +775,7 @@ UT_TEST(test_qvotec_accessors_null_safe_pre_init)
 	UT_ASSERT_EQ(cluster_qvotec_get_disks_ok_count(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_disks_total_count(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_current_epoch_at_boot(), 0);
+	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), 0);
 	UT_ASSERT_STR_EQ(cluster_qvotec_get_collision_state_name(), "(uninitialised)");
 }
 
@@ -788,6 +789,9 @@ UT_TEST(test_qvotec_accessors_post_init)
 	UT_ASSERT_EQ(cluster_qvotec_get_disks_ok_count(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_disks_total_count(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_current_epoch_at_boot(), 0);
+	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), 0);
+	cluster_qvotec_publish_self_incarnation(919);
+	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), 919);
 	UT_ASSERT_STR_EQ(cluster_qvotec_get_collision_state_name(), "none");
 }
 

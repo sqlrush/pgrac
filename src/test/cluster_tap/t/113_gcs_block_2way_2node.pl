@@ -9,7 +9,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline: 7 NEW counters all 0 + catversion >= 202605420
-#	  L3  pg_cluster_state.gcs category has 112 keys (branch-1 +1 master-direct rescue; spec-7.2 D6+flip) (cumulative through spec-6.13)
+#	  L3  pg_cluster_state.gcs category has 119 keys (PCM-X queue observability +3)
 #	  L4  cross-node forward path:  node A read first → master_holder = A;
 #	       force same tag on node B via test-only injection → master
 #	       chooses forward path → A direct-ships to B → block_forward_sent
@@ -109,18 +109,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 112 keys (branch-1 +1 master-direct rescue; spec-7.2 D6+flip; was 67 cumulative through spec-6.14a).
+# L3: pg_cluster_state.gcs has 119 keys (PCM-X queue observability +3).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '112',
-   'L3 node0 pg_cluster_state.gcs category has 112 keys (branch-1 +1 master-direct rescue; round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
+   '119',
+   'L3 node0 pg_cluster_state.gcs category has 119 keys (PCM-X queue observability +3)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '112',
-   'L3 node1 pg_cluster_state.gcs category has 112 keys (branch-1 +1 master-direct rescue; round-4c +3 fallback-scn rows; gcs-race-fix-2 +6 rows; serve-stall round-5 +6 send-admission +4 bounded-drop rows) (spec-7.2 D6+flip)');
+   '119',
+   'L3 node1 pg_cluster_state.gcs category has 119 keys (PCM-X queue observability +3)');
 
 
 # ============================================================

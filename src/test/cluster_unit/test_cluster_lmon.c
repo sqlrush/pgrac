@@ -709,6 +709,10 @@ void
 cluster_grd_recovery_lmon_tick(void)
 {}
 
+void
+cluster_gcs_block_pcm_x_formation_tick(void)
+{}
+
 /* spec-2.34 D6 L104 stub:  cluster_lmon.c LMON tick body calls
  * cluster_gcs_block_dedup_sweep_expired(now).  Standalone fixture has
  * no dedup HTAB linked; vacuous stub. */

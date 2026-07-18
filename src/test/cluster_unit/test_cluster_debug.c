@@ -34,10 +34,9 @@
  * NOTES
  *	  This is a pgrac-original file.  cluster_debug.c is a cross-module
  *	  aggregator -- linking it standalone requires stubs for the public
- *	  symbols from seven other cluster_*.o files.  The stubs below are
- *	  the minimum set; the SRF body itself is never invoked from the
- *	  unit test (we only take its address), so stub return values are
- *	  inert.
+ *	  symbols from other cluster_*.o files.  The stubs below are the
+ *	  minimum set.  The SRF body is invoked to validate its category/key
+ *	  surface, while stub return values remain inert zero-state inputs.
  *
  *-------------------------------------------------------------------------
  */
@@ -48,7 +47,8 @@
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
-#include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
+#include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h"	  /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
@@ -68,6 +68,12 @@
 #undef strerror_r
 
 #include "unit_test.h"
+
+
+#define CAPTURED_DUMP_ROWS_MAX 2048
+static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
+static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
+static int captured_dump_row_count;
 
 
 /* ----------
@@ -908,6 +914,25 @@ cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count, int *pi_ho
 	*convert_queue_active = 0;
 }
 
+bool
+cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
+{
+	if (snapshot_out == NULL)
+		return false;
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	return false;
+}
+
+PcmXRuntimeSnapshot
+cluster_pcm_x_runtime_snapshot(void)
+{
+	PcmXRuntimeSnapshot snapshot = { 0 };
+
+	snapshot.state = PCM_X_RUNTIME_ACTIVE;
+	snapshot.gate_generation = 1;
+	return snapshot;
+}
+
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)
@@ -1215,6 +1240,26 @@ cluster_gcs_get_block_dedup_legacy_pin_count(void)
 	return 0;
 }
 uint64
+cluster_gcs_get_block_dedup_pcm_x_stage_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_pcm_x_replay_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_pcm_x_release_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_pcm_x_failclosed_count(void)
+{
+	return 0;
+}
+uint64
 cluster_gcs_get_block_done_enqueue_drop_count(void)
 {
 	return 0;
@@ -1257,6 +1302,21 @@ cluster_gcs_get_invalidate_busy_sent_count(void)
 }
 uint64
 cluster_gcs_get_invalidate_busy_received_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_invalidate_passive_s_release_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_pcm_x_self_handoff_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_pcm_x_self_handoff_drain_count(void)
 {
 	return 0;
 }
@@ -3051,14 +3111,21 @@ InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
 
 void
 tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
-					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
+					 TupleDesc tdesc pg_attribute_unused(), Datum *values,
 					 bool *isnull pg_attribute_unused())
-{}
+{
+	UT_ASSERT(captured_dump_row_count < CAPTURED_DUMP_ROWS_MAX);
+	if (captured_dump_row_count >= CAPTURED_DUMP_ROWS_MAX)
+		return;
+	captured_dump_categories[captured_dump_row_count] = (const char *)DatumGetPointer(values[0]);
+	captured_dump_keys[captured_dump_row_count] = (const char *)DatumGetPointer(values[1]);
+	captured_dump_row_count++;
+}
 
 text *
-cstring_to_text(const char *s pg_attribute_unused())
+cstring_to_text(const char *s)
 {
-	return NULL;
+	return (text *)s;
 }
 
 char *
@@ -4146,6 +4213,93 @@ UT_TEST(test_debug_dump_srf_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_dump_state);
 }
 
+static int
+captured_dump_count(const char *category, const char *key)
+{
+	int count = 0;
+	int i;
+
+	for (i = 0; i < captured_dump_row_count; i++) {
+		if (strcmp(captured_dump_categories[i], category) != 0)
+			continue;
+		if (key == NULL || strcmp(captured_dump_keys[i], key) == 0)
+			count++;
+	}
+	return count;
+}
+
+UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
+{
+	static const char *const pcm_keys[] = {
+		"pcm_x_runtime_state",
+		"pcm_x_runtime_generation",
+		"pcm_x_queue_enqueue_count",
+		"pcm_x_queue_admit_count",
+		"pcm_x_queue_confirm_count",
+		"pcm_x_queue_promotion_count",
+		"pcm_x_queue_transfer_count",
+		"pcm_x_queue_complete_count",
+		"pcm_x_queue_cancel_count",
+		"pcm_x_queue_revoke_count",
+		"pcm_x_queue_coalesced_count",
+		"pcm_x_queue_wait_count",
+		"pcm_x_queue_full_count",
+		"pcm_x_queue_stale_count",
+		"pcm_x_queue_miss_count",
+		"pcm_x_queue_recovery_blocked_count",
+		"pcm_x_queue_activating_reset_count",
+		"pcm_x_queue_depth",
+		"pcm_x_queue_depth_high_water",
+		"pcm_x_queue_active_tags",
+		"pcm_x_queue_live_tickets",
+		"pcm_x_queue_live_slots",
+		"pcm_x_local_retire_gate",
+		"pcm_x_local_retire_marker_count",
+		"pcm_x_local_retire_marker_ticket_id",
+		"pcm_x_own_begin_count",
+		"pcm_x_own_commit_count",
+		"pcm_x_own_abort_count",
+		"pcm_x_own_busy_count",
+		"pcm_x_own_corrupt_count",
+	};
+	static const char *const lmd_keys[] = {
+		"pcm_convert_wfg_replace_count",
+		"pcm_convert_wfg_remove_count",
+		"pcm_convert_wfg_replace_fail_count",
+		"pcm_convert_wfg_exact_remove_stale_count",
+	};
+	static const char *const gcs_keys[] = {
+		"dedup_pcm_x_stage_count",
+		"dedup_pcm_x_replay_count",
+		"dedup_pcm_x_release_count",
+		"dedup_pcm_x_failclosed_count",
+		"invalidate_passive_s_release_count",
+		"pcm_x_self_handoff_count",
+		"pcm_x_self_handoff_drain_count",
+	};
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int i;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	captured_dump_row_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 58);
+	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
+	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 119);
+	for (i = 0; i < (int)lengthof(pcm_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
+	for (i = 0; i < (int)lengthof(lmd_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("lmd", lmd_keys[i]), 1);
+	for (i = 0; i < (int)lengthof(gcs_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 1);
+}
+
 
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
@@ -4371,10 +4525,10 @@ cluster_lms_state_to_string(int s pg_attribute_unused())
  * cluster_lmd_* accessors via cluster_debug.o; standalone test
  * harness must provide local zero-returning stubs.
  */
-int
+ClusterLmdState
 cluster_lmd_get_state(void)
 {
-	return 0;
+	return CLUSTER_LMD_NOT_STARTED;
 }
 uint64
 cluster_lmd_get_started_count(void)
@@ -4407,7 +4561,7 @@ cluster_lmd_get_error_count(void)
 	return 0;
 }
 const char *
-cluster_lmd_state_to_string(int s pg_attribute_unused())
+cluster_lmd_state_to_string(ClusterLmdState s pg_attribute_unused())
 {
 	return "(stub)";
 }
@@ -4445,6 +4599,26 @@ cluster_lmd_victim_cancel_sent_count_get(void)
 }
 uint64
 cluster_lmd_revalidate_fail_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_pcm_convert_wfg_replace_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_pcm_convert_wfg_remove_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_pcm_convert_wfg_replace_fail_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_pcm_convert_wfg_exact_remove_stale_count_get(void)
 {
 	return 0;
 }
@@ -4697,8 +4871,9 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_debug_dump_srf_linkable);
+	UT_RUN(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);
