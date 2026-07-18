@@ -8121,12 +8121,18 @@ gcs_block_pcm_x_requester_clear_wait(GcsBlockPcmXRequesterCleanupContext *cleanu
 	cleanup->wait_published = false;
 }
 
+/* Bound the STALE cancel refresh loop:  each retry means the slot churned
+ * again inside a lock-to-lock window, so more than a few consecutive hits
+ * are no longer plausible scheduling and keep the fail-closed verdict. */
+#define GCS_BLOCK_PCM_X_CLEANUP_REFRESH_MAX 3
+
 static PcmXQueueResult
 gcs_block_pcm_x_requester_cleanup_impl(GcsBlockPcmXRequesterCleanupContext *cleanup,
 									   bool owner_exit)
 {
 	GcsBlockPcmXCleanupAction action;
 	PcmXLocalHandle promoted;
+	PcmXLocalHandle refreshed;
 	PcmXQueueResult result;
 	PcmXRuntimeSnapshot runtime;
 
@@ -8204,12 +8210,32 @@ gcs_block_pcm_x_requester_cleanup_impl(GcsBlockPcmXRequesterCleanupContext *clea
 		return PCM_X_QUEUE_NOT_READY;
 	}
 	if (action == GCS_BLOCK_PCM_X_CLEANUP_CANCEL_LOCAL) {
-		memset(&promoted, 0, sizeof(promoted));
-		result = cluster_pcm_x_local_cancel_exact(&cleanup->handle, &promoted);
-		cluster_pcm_x_stats_note_queue_result(result);
-		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
-			result = cluster_pcm_x_local_detach_terminal_exact(&cleanup->handle);
+		int refresh_attempts = 0;
+
+		for (;;) {
+			memset(&promoted, 0, sizeof(promoted));
+			result = cluster_pcm_x_local_cancel_exact(&cleanup->handle, &promoted);
 			cluster_pcm_x_stats_note_queue_result(result);
+			if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+				result = cluster_pcm_x_local_detach_terminal_exact(&cleanup->handle);
+				cluster_pcm_x_stats_note_queue_result(result);
+			}
+			if (result != PCM_X_QUEUE_STALE
+				|| refresh_attempts >= GCS_BLOCK_PCM_X_CLEANUP_REFRESH_MAX)
+				break;
+			/* STALE proves the membership advanced (promotion or round churn)
+			 * under an identity that is still exactly ours.  Cancelling
+			 * releases rather than confers authority, so rebuild the handle
+			 * from the live slot and retry;  a vanished membership is already
+			 * terminal and leaves nothing to cancel. */
+			refresh_attempts++;
+			result = cluster_pcm_x_local_lookup_exact(&cleanup->handle.identity, &refreshed);
+			cluster_pcm_x_stats_note_queue_result(result);
+			if (result == PCM_X_QUEUE_NOT_FOUND)
+				break;
+			if (result != PCM_X_QUEUE_OK)
+				break;
+			cleanup->handle = refreshed;
 		}
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_NOT_FOUND) {
 			runtime = cluster_pcm_x_runtime_snapshot();
@@ -8687,6 +8713,26 @@ requester_role_dispatch:
 			} else {
 				retry_action = cluster_gcs_pcm_x_requester_retry_action(
 					GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT, result);
+				if (retry_action == GCS_BLOCK_PCM_X_RETRY_REFRESH_ROLE) {
+					/* The snapshot proved this handle no longer byte-matches
+					 * its membership slot -- the same promotion / round churn
+					 * the claim site recovers from.  Rebuild the handle and
+					 * re-dispatch by its current role instead of closing the
+					 * runtime over a normal FIFO progress event. */
+					fail_site = "follower-refresh-lookup";
+					result = cluster_pcm_x_local_lookup_exact(&handle.identity, &fresh_handle);
+					cluster_pcm_x_stats_note_queue_result(result);
+					if (result == PCM_X_QUEUE_OK) {
+						fail_site = "follower-refresh-compare";
+						if (!cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle))
+							goto requester_fail_closed;
+						handle = fresh_handle;
+						gcs_block_pcm_x_requester_cleanup_context.handle = handle;
+						goto requester_role_dispatch;
+					}
+					retry_action = cluster_gcs_pcm_x_requester_retry_action(
+						GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH, result);
+				}
 				if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 					goto requester_fail_closed;
 			}
@@ -9266,6 +9312,13 @@ gcs_block_pcm_x_master_drive_fail_closed(PcmXQueueResult result)
 }
 
 
+/* Process-local BAD_STATE damping for the drive dispatch (one table per
+ * driving process;  LMON's periodic retry tick is the guaranteed observer
+ * that escalates a persisting per-ticket anomaly to the fail-closed verdict). */
+static GcsBlockPcmXDriveAnomaly
+	gcs_block_pcm_x_drive_anomaly_table[GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS];
+
+
 static PcmXQueueResult
 gcs_block_pcm_x_master_authority(const PcmXMasterDriveSnapshot *snapshot,
 								 PcmAuthoritySnapshot *authority_out, uint32 *holders_out,
@@ -9305,8 +9358,22 @@ gcs_block_pcm_x_ensure_pending_x_claim(const PcmXMasterDriveSnapshot *snapshot)
 	if (claimed) {
 		if (!cluster_pcm_lock_queue_pending_x_exact(snapshot->ref.identity.tag,
 													snapshot->ref.identity.node_id,
-													snapshot->ref.handle.ticket_id))
-			return PCM_X_QUEUE_BAD_STATE;
+													snapshot->ref.handle.ticket_id)) {
+			/* Mirror the reserve-path recheck below:  CANCEL clears the GRD
+			 * cookie before it finalizes the ticket, so a missing cookie can
+			 * be an in-progress cancel rather than corruption.  Re-read the
+			 * ticket under its own domain lock;  durable cancel/terminal
+			 * progress is retryable, and only a ticket that still claims with
+			 * no cookie stays anomalous for the caller's damping streak. */
+			claimed = false;
+			result = cluster_pcm_x_master_pending_x_claim_state_exact(&snapshot->ref, &claimed);
+			if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_STALE
+				|| result == PCM_X_QUEUE_NOT_FOUND || result == PCM_X_QUEUE_RETIRED)
+				return PCM_X_QUEUE_NOT_READY;
+			if (result != PCM_X_QUEUE_OK)
+				return result;
+			return claimed ? PCM_X_QUEUE_BAD_STATE : PCM_X_QUEUE_NOT_READY;
+		}
 		return PCM_X_QUEUE_OK;
 	}
 
@@ -9639,6 +9706,11 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 	result = cluster_pcm_x_master_promote_head_exact(tag, cluster_epoch, &active);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_BUSY) {
+		/* No promotable head means any earlier per-ticket anomaly for this
+		 * tag has resolved (cancelled / retired);  settle its streaks. */
+		if (result == PCM_X_QUEUE_NOT_FOUND)
+			cluster_gcs_pcm_x_drive_anomaly_settle(gcs_block_pcm_x_drive_anomaly_table,
+												   GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag);
 		gcs_block_pcm_x_master_drive_fail_closed(result);
 		return;
 	}
@@ -9662,6 +9734,21 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 	else
 		result = PCM_X_QUEUE_CORRUPT;
 	cluster_pcm_x_stats_note_queue_result(result);
+	/* Only definite drive progress settles the tag;  indeterminate results
+	 * (NOT_READY / BUSY / STALE) must not reset a live streak, or a real
+	 * wedge interleaved with transients would never fuse. */
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+		cluster_gcs_pcm_x_drive_anomaly_settle(gcs_block_pcm_x_drive_anomaly_table,
+											   GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag);
+	/* A lone dispatch BAD_STATE can be another actor's two-phase window (an
+	 * in-progress claimed cancel, an identity-keyed serve-path clear).  Damp
+	 * it per ticket and let the periodic re-drive re-observe;  only a streak
+	 * that survives consecutive ticks reaches the runtime fuse. */
+	if (result == PCM_X_QUEUE_BAD_STATE
+		&& !cluster_gcs_pcm_x_drive_anomaly_note(gcs_block_pcm_x_drive_anomaly_table,
+												 GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag,
+												 snapshot.ref.handle.ticket_id))
+		return;
 	gcs_block_pcm_x_master_drive_fail_closed(result);
 }
 

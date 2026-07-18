@@ -183,8 +183,88 @@ typedef enum GcsBlockPcmXRetryAction {
 	GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED = 0,
 	GCS_BLOCK_PCM_X_RETRY_WAIT,
 	GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS,
-	GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG
+	GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG,
+	GCS_BLOCK_PCM_X_RETRY_REFRESH_ROLE
 } GcsBlockPcmXRetryAction;
+
+/*
+ * Drive-tick anomaly damping.  A master ticket can legally be observed
+ * CLAIMED with its GRD pending-X cookie absent while another actor sits
+ * between the two halves of a claimed cancel (the cookie is cleared before
+ * the ticket finalizes) or of an identity-keyed serve-path clear.  One such
+ * observation is therefore not corruption evidence;  the same per-ticket
+ * observation persisting across consecutive periodic drive ticks is.  The
+ * table lives in process-local memory:  LMON's retry tick is the guaranteed
+ * periodic observer, so a real invariant violation still reaches the
+ * fail-closed verdict after GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE observations
+ * of its tag (the retry tick sweeps one pending tag per pass, so wall-clock
+ * latency scales with the number of concurrently pending tags).
+ */
+typedef struct GcsBlockPcmXDriveAnomaly {
+	BufferTag tag;
+	uint64 ticket_id;
+	uint32 streak;
+	bool in_use;
+} GcsBlockPcmXDriveAnomaly;
+
+#define GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS 64
+#define GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE 8
+
+/* Returns true once the anomaly has persisted long enough to fail closed. */
+static inline bool
+cluster_gcs_pcm_x_drive_anomaly_note(GcsBlockPcmXDriveAnomaly *table, int nslots,
+									 const BufferTag *tag, uint64 ticket_id)
+{
+	int victim_slot = -1;
+	bool victim_in_use = true;
+	uint32 victim_streak = 0;
+	int i;
+
+	if (table == NULL || nslots <= 0 || tag == NULL)
+		return true; /* no tracking substrate -- keep fail-closed */
+	for (i = 0; i < nslots; i++) {
+		if (table[i].in_use && table[i].ticket_id == ticket_id
+			&& BufferTagsEqual(&table[i].tag, tag)) {
+			table[i].streak++;
+			return table[i].streak >= GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE;
+		}
+		/* Prefer a free slot;  under pressure recycle the lowest streak.
+		 * Resolved tickets leave stale entries behind (settle fires only on
+		 * definite progress for the tag), while a truly persisting anomaly
+		 * keeps growing its streak and therefore survives the recycling. */
+		if (!table[i].in_use) {
+			if (victim_in_use) {
+				victim_slot = i;
+				victim_in_use = false;
+			}
+		} else if (victim_in_use && (victim_slot < 0 || table[i].streak < victim_streak)) {
+			victim_slot = i;
+			victim_streak = table[i].streak;
+		}
+	}
+	table[victim_slot].tag = *tag;
+	table[victim_slot].ticket_id = ticket_id;
+	table[victim_slot].streak = 1;
+	table[victim_slot].in_use = true;
+	return false;
+}
+
+/* Any non-anomalous drive completion for the tag settles its streaks. */
+static inline void
+cluster_gcs_pcm_x_drive_anomaly_settle(GcsBlockPcmXDriveAnomaly *table, int nslots,
+									   const BufferTag *tag)
+{
+	int i;
+
+	if (table == NULL || nslots <= 0 || tag == NULL)
+		return;
+	for (i = 0; i < nslots; i++) {
+		if (table[i].in_use && BufferTagsEqual(&table[i].tag, tag)) {
+			table[i].in_use = false;
+			table[i].streak = 0;
+		}
+	}
+}
 
 typedef enum GcsBlockPcmXFormationAction {
 	GCS_BLOCK_PCM_X_FORMATION_FAIL_CLOSED = 0,
@@ -277,7 +357,17 @@ cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQue
 	case GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY:
 	case GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH:
 	case GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM:
+		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
+			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
 	case GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT:
+		/* STALE proves the handle no longer byte-matches its membership slot.
+		 * That is the same promotion / round-advance churn the claim site
+		 * already recovers from with a refresh lookup, so route it to the
+		 * exact re-dispatch instead of the kill path. */
+		if (result == PCM_X_QUEUE_STALE)
+			return GCS_BLOCK_PCM_X_RETRY_REFRESH_ROLE;
 		if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
 			|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED)
 			return GCS_BLOCK_PCM_X_RETRY_WAIT;

@@ -2863,7 +2863,12 @@ UT_TEST(test_pcm_x_requester_retry_policy_is_operation_exact)
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT, PCM_X_QUEUE_BARRIER_CLOSED,
 		  GCS_BLOCK_PCM_X_RETRY_WAIT },
+		/* STALE at the follower WFG snapshot is the same slot-churn signal
+		 * (promotion / round advance) the claim site recovers from with a
+		 * refresh lookup;  it must re-dispatch, not close the runtime. */
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT, PCM_X_QUEUE_STALE,
+		  GCS_BLOCK_PCM_X_RETRY_REFRESH_ROLE },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_FOLLOWER_SNAPSHOT, PCM_X_QUEUE_CORRUPT,
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_COMMIT, PCM_X_QUEUE_STALE,
 		  GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG },
@@ -2942,6 +2947,148 @@ UT_TEST(test_pcm_x_requester_retry_policy_is_operation_exact)
 	current.state = PCM_X_RUNTIME_SHUTTING_DOWN;
 	UT_ASSERT_EQ(cluster_gcs_pcm_x_requester_formation_action(&current),
 				 GCS_BLOCK_PCM_X_FORMATION_FAIL_CLOSED);
+}
+
+
+/* One CLAIMED-without-cookie observation is a legal cancel/serve two-phase
+ * window;  only a per-ticket streak that survives consecutive periodic drive
+ * ticks may close the runtime.  Any settled drive for the tag resets it. */
+UT_TEST(test_pcm_x_drive_anomaly_streak_gates_fail_closed)
+{
+	GcsBlockPcmXDriveAnomaly table[4];
+	BufferTag tag_a;
+	BufferTag tag_b;
+	uint32 i;
+
+	memset(table, 0, sizeof(table));
+	memset(&tag_a, 0, sizeof(tag_a));
+	memset(&tag_b, 0, sizeof(tag_b));
+	tag_a.blockNum = 1;
+	tag_b.blockNum = 2;
+
+	for (i = 1; i < GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE; i++)
+		UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 7));
+	UT_ASSERT(cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 7));
+
+	/* A different ticket on the same tag counts independently. */
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 8));
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_b, 7));
+
+	/* Settling the tag clears every streak bound to it, and only it. */
+	cluster_gcs_pcm_x_drive_anomaly_settle(table, 4, &tag_a);
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 7));
+	for (i = 2; i < GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE; i++)
+		UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_b, 7));
+	UT_ASSERT(cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_b, 7));
+
+	/* A missing tracking substrate stays fail-closed. */
+	UT_ASSERT(cluster_gcs_pcm_x_drive_anomaly_note(NULL, 4, &tag_a, 7));
+	UT_ASSERT(cluster_gcs_pcm_x_drive_anomaly_note(table, 0, &tag_a, 7));
+
+	/* Table pressure recycles the lowest streak:  stale one-shot entries are
+	 * evicted while a persisting anomaly keeps its count uninterrupted. */
+	cluster_gcs_pcm_x_drive_anomaly_settle(table, 4, &tag_a);
+	cluster_gcs_pcm_x_drive_anomaly_settle(table, 4, &tag_b);
+	tag_a.blockNum = 50;
+	for (i = 1; i <= 3; i++)
+		UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 9));
+	tag_a.blockNum = 100;
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 1));
+	tag_a.blockNum = 101;
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 1));
+	tag_a.blockNum = 102;
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 1));
+	tag_a.blockNum = 103;
+	UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 1));
+	tag_a.blockNum = 50;
+	for (i = 4; i < GCS_BLOCK_PCM_X_DRIVE_ANOMALY_FUSE; i++)
+		UT_ASSERT(!cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 9));
+	UT_ASSERT(cluster_gcs_pcm_x_drive_anomaly_note(table, 4, &tag_a, 9));
+}
+
+
+/* Pin the four transient-churn recovery arms in the source:  benign slot
+ * churn and two-phase cookie windows must route to per-request refresh or
+ * per-ticket damping instead of an immediate runtime fuse. */
+UT_TEST(test_pcm_x_transient_churn_recovers_without_runtime_fuse)
+{
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+	const char *cleanup;
+	const char *cleanup_end;
+	const char *ensure;
+	const char *ensure_end;
+	const char *drive;
+	const char *drive_end;
+	const char *scan;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+
+	/* (a) follower WFG snapshot STALE takes the claim-site refresh lookup:
+	 * the driver must contain a second handle-identity lookup site. */
+	driver = strstr(source, "\ngcs_block_pcm_x_acquire_writer_impl(");
+	driver_end = driver != NULL ? strstr(driver, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	scan = driver != NULL ? strstr(driver, "cluster_pcm_x_local_lookup_exact(&handle.identity")
+						  : NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	scan = scan != NULL ? strstr(scan + 1, "cluster_pcm_x_local_lookup_exact(&handle.identity")
+						: NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	if (scan != NULL && driver_end != NULL)
+		UT_ASSERT(scan < driver_end);
+
+	/* (b) cleanup CANCEL_LOCAL retries a STALE cancel through a refreshed
+	 * handle for the exact same identity before any fail-closed verdict. */
+	cleanup = strstr(source, "\ngcs_block_pcm_x_requester_cleanup_impl(");
+	cleanup_end = cleanup != NULL ? strstr(cleanup, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(cleanup);
+	UT_ASSERT_NOT_NULL(cleanup_end);
+	scan = cleanup != NULL
+			   ? strstr(cleanup, "cluster_pcm_x_local_lookup_exact(&cleanup->handle.identity")
+			   : NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	if (scan != NULL && cleanup_end != NULL)
+		UT_ASSERT(scan < cleanup_end);
+
+	/* (c) the already-claimed ensure arm rechecks the ticket under its own
+	 * domain lock before calling a missing cookie BAD_STATE. */
+	ensure = strstr(source, "\ngcs_block_pcm_x_ensure_pending_x_claim(");
+	ensure_end = ensure != NULL ? strstr(ensure, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(ensure);
+	UT_ASSERT_NOT_NULL(ensure_end);
+	scan = ensure != NULL ? strstr(ensure, "cluster_pcm_x_master_pending_x_claim_state_exact(")
+						  : NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	scan = scan != NULL ? strstr(scan + 1, "cluster_pcm_x_master_pending_x_claim_state_exact(")
+						: NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	scan = scan != NULL ? strstr(scan + 1, "cluster_pcm_x_master_pending_x_claim_state_exact(")
+						: NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	if (scan != NULL && ensure_end != NULL)
+		UT_ASSERT(scan < ensure_end);
+
+	/* (d) the drive dispatch damps BAD_STATE through the per-ticket streak
+	 * and settles it on any non-anomalous completion. */
+	drive = strstr(source, "\ngcs_block_pcm_x_master_drive_tag(");
+	drive_end = drive != NULL ? strstr(drive, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(drive);
+	UT_ASSERT_NOT_NULL(drive_end);
+	scan = drive != NULL ? strstr(drive, "cluster_gcs_pcm_x_drive_anomaly_note(") : NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	if (scan != NULL && drive_end != NULL)
+		UT_ASSERT(scan < drive_end);
+	scan = drive != NULL ? strstr(drive, "cluster_gcs_pcm_x_drive_anomaly_settle(") : NULL;
+	UT_ASSERT_NOT_NULL(scan);
+	if (scan != NULL && drive_end != NULL)
+		UT_ASSERT(scan < drive_end);
+
+	free(source);
 }
 
 
@@ -3333,6 +3480,8 @@ main(void)
 	UT_RUN(test_pcm_x_retire_wake_identity_is_wait_generation_exact);
 	UT_RUN(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles);
 	UT_RUN(test_pcm_x_requester_retry_policy_is_operation_exact);
+	UT_RUN(test_pcm_x_drive_anomaly_streak_gates_fail_closed);
+	UT_RUN(test_pcm_x_transient_churn_recovers_without_runtime_fuse);
 	UT_RUN(test_pcm_x_remote_reservation_preflight_binds_identity_base);
 	UT_RUN(test_pcm_x_requester_wait_backoff_saturates);
 	UT_RUN(test_pcm_x_requester_cleanup_never_guesses_after_irreversible_boundary);
