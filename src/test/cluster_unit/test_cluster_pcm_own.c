@@ -1211,17 +1211,15 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	if (conditional != NULL) {
 		const char *content
 			= strstr(conditional, "LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf)");
-		const char *ownership = strstr(conditional, "buf->pcm_state != (uint8) PCM_STATE_X");
-		const char *flags = strstr(conditional, "cluster_pcm_own_flags_get(buf->buf_id) != 0");
+		const char *ownership = strstr(conditional, "cluster_pcm_x_conditional_lock_allowed(");
 		const char *release
 			= strstr(conditional, "LWLockRelease(BufferDescriptorGetContentLock(buf))");
 
 		UT_ASSERT_NOT_NULL(content);
 		UT_ASSERT_NOT_NULL(ownership);
-		UT_ASSERT_NOT_NULL(flags);
 		UT_ASSERT_NOT_NULL(release);
-		if (content != NULL && ownership != NULL && flags != NULL && release != NULL)
-			UT_ASSERT(content < ownership && ownership < flags && flags < release);
+		if (content != NULL && ownership != NULL && release != NULL)
+			UT_ASSERT(content < ownership && ownership < release);
 	}
 	if (resident_stamp != NULL) {
 		const char *content = strstr(
@@ -1659,6 +1657,18 @@ UT_TEST(test_current_image_shape_accepts_monotone_xcur_after_x_to_s_yield)
 	UT_ASSERT(!cluster_pcm_x_current_image_shape((uint8)PCM_STATE_S, (uint8)BUF_TYPE_XCUR, false));
 }
 
+UT_TEST(test_conditional_lock_preserves_native_off_and_enforces_tracked_x)
+{
+	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(false, true, false, (uint8)PCM_STATE_N, 0));
+	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(true, false, false, (uint8)PCM_STATE_N, 0));
+	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_N, 0));
+	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0));
+	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(false, false, true, (uint8)PCM_STATE_X, 0));
+	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(false, false, false, (uint8)PCM_STATE_X,
+													  PCM_OWN_FLAG_GRANT_PENDING));
+}
+
 UT_TEST(test_queue_passive_n_mirror_is_never_gcs_ship_authority)
 {
 	static const char *const probe_contract[]
@@ -1977,7 +1987,7 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2017,6 +2027,7 @@ main(void)
 	UT_RUN(test_queue_holder_snapshot_by_tag_is_mapping_and_header_exact);
 	UT_RUN(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership);
 	UT_RUN(test_current_image_shape_accepts_monotone_xcur_after_x_to_s_yield);
+	UT_RUN(test_conditional_lock_preserves_native_off_and_enforces_tracked_x);
 	UT_RUN(test_queue_installed_image_publication_is_exact_and_content_locked);
 	UT_RUN(test_queue_self_source_handoff_is_single_lifecycle_and_readonly_drain);
 	UT_RUN(test_queue_passive_n_mirror_is_never_gcs_ship_authority);

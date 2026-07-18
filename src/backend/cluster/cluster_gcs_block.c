@@ -297,13 +297,16 @@ typedef struct ClusterGcsBlockShared {
 		clean_page_xfer_stale_holder_recover_count; /* RESERVED Stage 6 (was DENIED recover) */
 	pg_atomic_uint64 clean_page_xfer_third_party_denied_count; /* 3-node third-party master DENY */
 	/* PGRAC: spec-4.7 D6 — GCS/PCM warm-recovery observability (dump category
-	 * 'gcs_recovery').  8 counters per spec §2.4. */
+	 * 'gcs_recovery'). */
 	pg_atomic_uint64 recovery_block_resources_recovering; /* phase_for_tag → RECOVERING hits */
-	pg_atomic_uint64 recovery_buffers_redeclared;		  /* survivor re-declare sent (D2) */
-	pg_atomic_uint64 recovery_block_state_rebuilt;		  /* master rebuild applied (D2/D3) */
-	pg_atomic_uint64 recovery_redo_boundary_waits;		  /* redo gate: not yet covered (D5) */
-	pg_atomic_uint64 recovery_redo_boundary_reached;	  /* redo gate: covered (D5) */
-	pg_atomic_uint64 recovery_stale_block_drop; /* re-declare dropped: off-epoch/bad (D2) */
+	/* PCM-X requester received a retryable RESOURCE_RECOVERING denial while
+	 * fetching its generation-exact holder image. */
+	pg_atomic_uint64 pcm_x_image_fetch_recovering_retry_count;
+	pg_atomic_uint64 recovery_buffers_redeclared;	 /* survivor re-declare sent (D2) */
+	pg_atomic_uint64 recovery_block_state_rebuilt;	 /* master rebuild applied (D2/D3) */
+	pg_atomic_uint64 recovery_redo_boundary_waits;	 /* redo gate: not yet covered (D5) */
+	pg_atomic_uint64 recovery_redo_boundary_reached; /* redo gate: covered (D5) */
+	pg_atomic_uint64 recovery_stale_block_drop;		 /* re-declare dropped: off-epoch/bad (D2) */
 	pg_atomic_uint64 recovery_ambiguous_owner_failclosed; /* not-double-X conflict (D3) */
 	pg_atomic_uint64 recovery_before_boundary_failclosed; /* served-before-redo gate fail (D5) */
 	/* PGRAC: spec-2.36 D3 (HC116) — master broadcast invalidate slot.
@@ -600,6 +603,7 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_third_party_denied_count, 0);
 		/* PGRAC: spec-4.7 D6 — 8 NEW warm-recovery counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_block_resources_recovering, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->pcm_x_image_fetch_recovering_retry_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_block_state_rebuilt, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_redo_boundary_waits, 0);
@@ -3379,6 +3383,9 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 				|| reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING) {
 				if (reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+				else
+					pg_atomic_fetch_add_u64(
+						&ClusterGcsBlock->pcm_x_image_fetch_recovering_retry_count, 1);
 				continue;
 			}
 			if (!cluster_pcm_x_image_fetch_reply_exact(&reply, reply_block, &progress_now,
@@ -14478,6 +14485,14 @@ cluster_gcs_get_recovery_block_resources_recovering(void)
 {
 	return ClusterGcsBlock
 			   ? pg_atomic_read_u64(&ClusterGcsBlock->recovery_block_resources_recovering)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_pcm_x_image_fetch_recovering_retry_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->pcm_x_image_fetch_recovering_retry_count)
 			   : 0;
 }
 uint64
