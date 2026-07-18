@@ -165,6 +165,18 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0;
 }
 
+/* ConditionalLockBuffer cannot initiate a PCM conversion.  Preserve native
+ * PostgreSQL behavior while PCM is inactive and for relations outside the
+ * coherence domain; an active tracked page must already hold exact X.  Live
+ * transition/retained evidence remains closed regardless of runtime state. */
+static inline bool
+cluster_pcm_x_conditional_lock_allowed(bool runtime_active, bool tracked, bool retained_image,
+									   uint8 pcm_state, uint32 flags)
+{
+	return !retained_image && flags == 0
+		   && (!runtime_active || !tracked || pcm_state == (uint8)PCM_STATE_X);
+}
+
 typedef ClusterPcmOwnSnapshot ClusterPcmOwnEvictionCapture;
 
 typedef enum ClusterPcmXGrantReservationKind {

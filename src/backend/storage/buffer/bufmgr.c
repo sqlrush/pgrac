@@ -8427,9 +8427,10 @@ ConditionalLockBuffer(Buffer buffer)
 		 * GRANT_PENDING must not modify protocol-owned bytes.
 		 */
 		buf_state = LockBufHdr(buf);
-		blocked = cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
-			|| buf->pcm_state != (uint8) PCM_STATE_X
-			|| cluster_pcm_own_flags_get(buf->buf_id) != 0;
+		blocked = !cluster_pcm_x_conditional_lock_allowed(
+			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
+			cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
+			cluster_pcm_own_flags_get(buf->buf_id));
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
 		{
