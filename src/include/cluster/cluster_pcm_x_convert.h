@@ -1652,6 +1652,9 @@ extern PcmXQueueResult cluster_pcm_x_local_probe_freeze_snapshot_exact(
  * ForEachLWLockHeldByMe callback, then rejects any tag whose local PROBE
  * barrier is closed.  BUSY/CORRUPT are closed decisions, never "inactive". */
 extern PcmXQueueResult cluster_pcm_x_nested_wait_guard_before_block(void);
+/* Diagnostic: the held content-lock tag and result of this backend's most
+ * recent nested-guard refusal; false when the guard never refused. */
+extern bool cluster_pcm_x_nested_wait_guard_last_block(BufferTag *tag_out, int *result_out);
 extern PcmXQueueResult
 cluster_pcm_x_local_holder_snapshot_revalidate(const BufferTag *tag,
 											   const PcmXLocalHolderSnapshot *snapshot);

@@ -3672,6 +3672,9 @@ extern bool cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, co
 extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
 														PcmXLocalWriterClaim *claim_out,
 														bool *claim_handed_off);
+/* Diagnostic: source line of this backend's most recent non-OK
+ * acquire-writer exit (0 when it never failed). */
+extern int cluster_gcs_pcm_x_requester_last_fail_line(void);
 extern PcmXQueueResult
 cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(const PcmXLocalWriterClaim *claim);
 /* Error/owner-exit cleanup adapter: never propagates ERROR.  A caught ERROR

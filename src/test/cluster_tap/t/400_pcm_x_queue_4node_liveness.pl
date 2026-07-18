@@ -429,7 +429,7 @@ for my $i (0 .. 3)
 {
 	my @samples;
 
-	for my $offset (8, 12)
+	for my $offset (1, 3, 8)
 	{
 		my $probe_at = $quad->node0->safe_psql('postgres',
 			"SELECT GREATEST(0.0, EXTRACT(EPOCH FROM "
@@ -483,20 +483,24 @@ for my $i (0 .. 3)
 		}
 	}
 
-	# During a pure stall the t+8 -> t+12 per-node counter movement names the
-	# spinning arm: whatever still ticks is the live retry loop, whatever is
-	# frozen is wedged.
-	for my $i (0 .. 3)
+	# Early samples catch the terminal handoff mid-flight; the late pair
+	# separates the live retry loop (still ticking) from the wedged stages
+	# (frozen).
+	for my $pair ([1, 3], [3, 8])
 	{
-		next unless $samples[8][$i] && $samples[12][$i];
-		my @moved;
-		for my $key (@pcm_x_pcm_keys)
+		my ($from, $to) = @{$pair};
+		for my $i (0 .. 3)
 		{
-			my $d = $samples[12][$i]{$key} - $samples[8][$i]{$key};
-			push @moved, "$key:+$d" if $d != 0;
+			next unless $samples[$from][$i] && $samples[$to][$i];
+			my @moved;
+			for my $key (@pcm_x_pcm_keys)
+			{
+				my $d = $samples[$to][$i]{$key} - $samples[$from][$i]{$key};
+				push @moved, "$key:+$d" if $d != 0;
+			}
+			diag("L3 mid-leg node$i t+$from..t+$to moved: "
+				. (@moved ? join(' ', @moved) : '(all frozen)'));
 		}
-		diag("L3 mid-leg node$i t+8..t+12 moved: "
-			. (@moved ? join(' ', @moved) : '(all frozen)'));
 	}
 }
 

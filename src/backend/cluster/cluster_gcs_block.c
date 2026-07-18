@@ -8075,6 +8075,23 @@ typedef struct GcsBlockPcmXRequesterCleanupContext {
 static GcsBlockPcmXRequesterCleanupContext gcs_block_pcm_x_requester_cleanup_context;
 static bool gcs_block_pcm_x_requester_exit_hook_registered = false;
 
+/* Source line of this backend's most recent non-OK acquire_writer_impl exit.
+ * Diagnostic only: consumed by the bufmgr failure report so a client-visible
+ * writer error names the exact escape arm instead of just the result code. */
+static int gcs_block_pcm_x_requester_fail_line = 0;
+
+#define GCS_BLOCK_PCM_X_REQUESTER_DONE()                                                           \
+	do {                                                                                           \
+		gcs_block_pcm_x_requester_fail_line = __LINE__;                                            \
+		goto requester_done;                                                                       \
+	} while (0)
+
+int
+cluster_gcs_pcm_x_requester_last_fail_line(void)
+{
+	return gcs_block_pcm_x_requester_fail_line;
+}
+
 static bool gcs_block_pcm_x_revalidate_peer_binding(int32 node_id, uint64 epoch, uint64 session);
 
 static void
@@ -8456,7 +8473,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	if (wait_seq == 0) {
 		cluster_pcm_x_runtime_fail_closed();
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
-		goto requester_done;
+		GCS_BLOCK_PCM_X_REQUESTER_DONE();
 	}
 	wait_published = true;
 	gcs_block_pcm_x_requester_cleanup_context.wait_published = true;
@@ -8474,11 +8491,11 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (result == PCM_X_QUEUE_CORRUPT)
 			goto requester_fail_closed;
 		if (!cluster_gcs_pcm_x_nested_guard_retryable(result))
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 												  cluster_epoch, master_session)) {
 			result = PCM_X_QUEUE_NOT_READY;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}
 
@@ -8491,11 +8508,11 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (result != PCM_X_QUEUE_OK) {
 			if (result == PCM_X_QUEUE_CORRUPT)
 				goto requester_fail_closed;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 		if (!BufferTagsEqual(&initial_own.tag, &buf->tag) || initial_own.generation == UINT64_MAX) {
 			result = PCM_X_QUEUE_STALE;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 		live_result
 			= cluster_pcm_own_classify_live_flags(initial_own.flags, initial_own.reservation_token);
@@ -8506,17 +8523,17 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
-				goto requester_done;
+				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 			continue;
 		}
 		if (result != PCM_X_QUEUE_OK)
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		if (initial_own.pcm_state != (uint8)PCM_STATE_N
 			&& initial_own.pcm_state != (uint8)PCM_STATE_S
 			&& initial_own.pcm_state != (uint8)PCM_STATE_X) {
 			result = PCM_X_QUEUE_STALE;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 		break;
 	}
@@ -8544,7 +8561,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 												  cluster_epoch, master_session)) {
 			result = PCM_X_QUEUE_NOT_READY;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}
 	gcs_block_pcm_x_requester_cleanup_context.handle = handle;
@@ -8569,7 +8586,7 @@ requester_role_dispatch:
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
-				goto requester_done;
+				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
 		for (;;) {
@@ -8588,7 +8605,7 @@ requester_role_dispatch:
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
-				goto requester_done;
+				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
 		for (;;) {
@@ -8608,7 +8625,7 @@ requester_role_dispatch:
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
-				goto requester_done;
+				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
 	} else if (handle.role == PCM_X_LOCAL_ROLE_FOLLOWER) {
@@ -8662,7 +8679,7 @@ requester_role_dispatch:
 															  master_node, cluster_epoch,
 															  master_session)) {
 						result = PCM_X_QUEUE_NOT_READY;
-						goto requester_done;
+						GCS_BLOCK_PCM_X_REQUESTER_DONE();
 					}
 					continue;
 				}
@@ -8739,11 +8756,11 @@ requester_role_dispatch:
 			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 													  cluster_epoch, master_session)) {
 				result = PCM_X_QUEUE_NOT_READY;
-				goto requester_done;
+				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
 		result = PCM_X_QUEUE_OK;
-		goto requester_done;
+		GCS_BLOCK_PCM_X_REQUESTER_DONE();
 	} else {
 		result = PCM_X_QUEUE_CORRUPT;
 		goto requester_fail_closed;
@@ -8967,10 +8984,10 @@ requester_role_dispatch:
 		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
 												  cluster_epoch, master_session)) {
 			result = PCM_X_QUEUE_NOT_READY;
-			goto requester_done;
+			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}
-	goto requester_done;
+	GCS_BLOCK_PCM_X_REQUESTER_DONE();
 
 requester_fail_closed:
 	/* Cleanup may cancel a purely local membership.  PREPARE/COMMIT evidence

@@ -1115,10 +1115,12 @@ pcm_x_debug_index(Size index)
 }
 
 
-/* Diagnostic iterator over live master tag slots.  Lock-free and
- * racy-tolerant: each slot is copied under a generation double-read and
- * formatted only from the stable local copy; slots that mutate mid-copy are
- * skipped.  Diagnostic surface only — never used for protocol decisions. */
+/* Diagnostic iterator over live master tag slots.  Coherence contract: the
+ * candidate is identified by a racy pre-read, then revalidated and copied
+ * under the matching master partition shared lock (the same lock every
+ * in-place tag/ticket field mutation holds), so the printed combination is a
+ * state that actually existed.  Diagnostic surface only — never used for
+ * protocol decisions. */
 bool
 cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
 {
@@ -1129,21 +1131,32 @@ cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf,
 
 	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
 		return false;
-	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TAG, &view))
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TAG, &view))
 		return false;
 	for (i = *cursor_io; i < view.capacity; i++) {
 		PcmXMasterTagSlot *raw = (PcmXMasterTagSlot *)pcm_x_allocator_slot(&view, i);
-		uint64 gen_before;
-		uint64 gen_after;
+		PcmXMasterTagSlot *locked;
+		PcmXSlotRef tag_ref;
+		BufferTag tag;
+		uint32 partition;
 
 		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
-			|| !pcm_x_slot_generation_read(&raw->slot, &gen_before))
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
 			continue;
-		memcpy(&copy, raw, sizeof(copy));
+		tag_ref.slot_index = i;
+		tag = raw->tag;
 		pg_read_barrier();
-		if (!pcm_x_slot_generation_read(&raw->slot, &gen_after) || gen_after != gen_before
-			|| pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE)
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+		locked = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref, &tag,
+														PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (locked == NULL) {
+			LWLockRelease(&header->master_locks[partition].lock);
 			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->master_locks[partition].lock);
 		snprintf(buf, buflen,
 				 "rel=%u blk=%u head=%ld tail=%ld active=%ld queued=0x%x qseq=" UINT64_FORMAT
 				 " outstanding=%zu",
@@ -1160,8 +1173,8 @@ cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf,
 }
 
 
-/* Diagnostic iterator over occupied master ticket slots; same racy-tolerant
- * contract as the tag iterator. */
+/* Diagnostic iterator over occupied master ticket slots; same partition-lock
+ * coherence contract as the tag iterator. */
 bool
 cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
 {
@@ -1172,12 +1185,15 @@ cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *b
 
 	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
 		return false;
-	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &view))
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &view))
 		return false;
 	for (i = *cursor_io; i < view.capacity; i++) {
 		PcmXMasterTicketSlot *raw = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(&view, i);
-		uint64 gen_before;
-		uint64 gen_after;
+		PcmXMasterTicketSlot *locked;
+		PcmXSlotRef ticket_ref;
+		BufferTag tag;
+		uint32 partition;
 		uint32 state;
 
 		if (raw == NULL)
@@ -1185,12 +1201,21 @@ cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *b
 		state = pcm_x_slot_state_read(&raw->slot);
 		if (state == PCM_XT_FREE || state == PCM_XT_RESERVED_NONVISIBLE)
 			continue;
-		if (!pcm_x_slot_generation_read(&raw->slot, &gen_before))
+		if (!pcm_x_slot_generation_read(&raw->slot, &ticket_ref.slot_generation))
 			continue;
-		memcpy(&copy, raw, sizeof(copy));
+		ticket_ref.slot_index = i;
+		tag = raw->ref.identity.tag;
 		pg_read_barrier();
-		if (!pcm_x_slot_generation_read(&raw->slot, &gen_after) || gen_after != gen_before)
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+		locked = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
+														   &tag, PCM_X_MASTER_TICKET_DOMAIN_STATES);
+		if (locked == NULL) {
+			LWLockRelease(&header->master_locks[partition].lock);
 			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->master_locks[partition].lock);
 		snprintf(buf, buflen,
 				 "state=%u flags=0x%x node=%d ticket=" UINT64_FORMAT " grant=" UINT64_FORMAT
 				 " tomb=0x%llx involved=0x%x drained=0x%x retire_acked=0x%x pending_s=0x%x"
@@ -11620,6 +11645,23 @@ pcm_x_local_nested_wait_guard_tag(const BufferTag *tag)
 }
 
 
+/* This backend's most recent nested-guard refusal: the held content-lock tag
+ * that closed the guard and the refusing result.  Diagnostic only. */
+static BufferTag pcm_x_nested_guard_block_tag;
+static int pcm_x_nested_guard_block_result = PCM_X_QUEUE_OK;
+
+bool
+cluster_pcm_x_nested_wait_guard_last_block(BufferTag *tag_out, int *result_out)
+{
+	if (pcm_x_nested_guard_block_result == PCM_X_QUEUE_OK)
+		return false;
+	if (tag_out != NULL)
+		*tag_out = pcm_x_nested_guard_block_tag;
+	if (result_out != NULL)
+		*result_out = pcm_x_nested_guard_block_result;
+	return true;
+}
+
 PcmXQueueResult
 cluster_pcm_x_nested_wait_guard_before_block(void)
 {
@@ -11635,8 +11677,11 @@ cluster_pcm_x_nested_wait_guard_before_block(void)
 	}
 	for (i = 0; i < snapshot.count; i++) {
 		result = pcm_x_local_nested_wait_guard_tag(&snapshot.tags[i]);
-		if (result != PCM_X_QUEUE_OK)
+		if (result != PCM_X_QUEUE_OK) {
+			pcm_x_nested_guard_block_tag = snapshot.tags[i];
+			pcm_x_nested_guard_block_result = (int)result;
 			return result;
+		}
 	}
 	return PCM_X_QUEUE_OK;
 }

@@ -34,9 +34,9 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
-#include "access/xlog.h"		/* PGRAC (spec-6.14 D8): GetXLogInsertRecPtr */
+#include "access/xlog.h" /* PGRAC (spec-6.14 D8): GetXLogInsertRecPtr */
 #ifdef USE_PGRAC_CLUSTER
-#include "access/transam.h"		/* FirstNormalObjectId */
+#include "access/transam.h" /* FirstNormalObjectId */
 #endif
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
@@ -54,26 +54,26 @@
 #include "postmaster/bgwriter.h"
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b — catalog buf hit/miss */
-#include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
+#include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b — catalog buf hit/miss */
+#include "cluster/cluster_mode.h"		   /* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
-#include "cluster/cluster_grd.h"		/* existing block-path fail-closed counter */
-#include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
+#include "cluster/cluster_grd.h"			/* existing block-path fail-closed counter */
+#include "cluster/cluster_guc.h"			/* spec-4.7a D2 — cluster_gcs_block_local_cache */
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
 #include "cluster/cluster_xnode_lever.h"	/* spec-6.12h — PI keep counter */
-#include "cluster/cluster_pi_shadow.h"	/* spec-6.12h D-h3a — PI ship-SCN stamp */
-#include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
-#include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
+#include "cluster/cluster_pi_shadow.h"		/* spec-6.12h D-h3a — PI ship-SCN stamp */
+#include "cluster/cluster_hw_lease.h"		/* spec-6.12d — per-node HW space leases */
+#include "cluster/cluster_extend_gate.h"	/* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_epoch.h"
-#include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
-#include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
-#include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
-#include "cluster/cluster_inject.h" /* GCS-race round-4c P1 — yield-notify-drop point */
-#include "cluster/cluster_pcm_own.h" /* ownership-generation wave — per-buffer gen + flags */
+#include "cluster/cluster_sf_dep.h"		   /* spec-6.2 Smart Fusion DBWR brake */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3/D4 — read probe + relkind hint */
+#include "cluster/cluster_itl.h"		   /* spec-6.12a — quiescent check for X->S downgrade */
+#include "cluster/cluster_inject.h"		   /* GCS-race round-4c P1 — yield-notify-drop point */
+#include "cluster/cluster_pcm_own.h"	  /* ownership-generation wave — per-buffer gen + flags */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* spec-2.36a C1 opaque reservation API */
 #include "cluster/cluster_pcm_x_convert.h"
 
@@ -103,18 +103,17 @@ extern bool ignore_checksum_failure;
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
-#define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
-#define BufferGetLSN(bufHdr)	(PageGetLSN(BufHdrGetBlock(bufHdr)))
+#define BufHdrGetBlock(bufHdr) ((Block)(BufferBlocks + ((Size)(bufHdr)->buf_id) * BLCKSZ))
+#define BufferGetLSN(bufHdr) (PageGetLSN(BufHdrGetBlock(bufHdr)))
 
 /* Note: this macro only works on local buffers, not shared ones! */
-#define LocalBufHdrGetBlock(bufHdr) \
-	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
+#define LocalBufHdrGetBlock(bufHdr) LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
 
 /* Bits in SyncOneBuffer's return value */
-#define BUF_WRITTEN				0x01
-#define BUF_REUSABLE			0x02
+#define BUF_WRITTEN 0x01
+#define BUF_REUSABLE 0x02
 
-#define RELS_BSEARCH_THRESHOLD		20
+#define RELS_BSEARCH_THRESHOLD 20
 
 #ifdef USE_PGRAC_CLUSTER
 /*
@@ -135,7 +134,7 @@ extern bool ignore_checksum_failure;
 static inline bool
 cluster_bufmgr_reln_pcm_tracked(RelFileNumber relnum)
 {
-	return cluster_shared_catalog || relnum >= (RelFileNumber) FirstNormalObjectId;
+	return cluster_shared_catalog || relnum >= (RelFileNumber)FirstNormalObjectId;
 }
 
 static inline bool
@@ -173,33 +172,33 @@ cluster_pcm_own_bump_failure(BufferDesc *buf, uint64 generation, uint32 *out_fla
 }
 
 static void
-cluster_pcm_own_report_bump_failure(BufferDesc *buf, ClusterPcmOwnResult result,
-								   uint64 generation, uint32 flags, const char *context)
+cluster_pcm_own_report_bump_failure(BufferDesc *buf, ClusterPcmOwnResult result, uint64 generation,
+									uint32 flags, const char *context)
 {
 	if (result == CLUSTER_PCM_OWN_BUSY)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cluster PCM ownership transition conflicts with an active reservation"),
-				 errdetail("context=%s buffer=%d generation=%llu flags=0x%x", context,
-						   buf->buf_id, (unsigned long long) generation, flags)));
+				 errdetail("context=%s buffer=%d generation=%llu flags=0x%x", context, buf->buf_id,
+						   (unsigned long long)generation, flags)));
 	if (result == CLUSTER_PCM_OWN_EXHAUSTED)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cluster PCM ownership generation exhausted for buffer %d", buf->buf_id),
 				 errdetail("context=%s generation=%llu flags=0x%x", context,
-						   (unsigned long long) generation, flags)));
+						   (unsigned long long)generation, flags)));
 
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("cluster PCM ownership generation bump failed for buffer %d", buf->buf_id),
 			 errdetail("context=%s generation=%llu flags=0x%x result=%d", context,
-					   (unsigned long long) generation, flags, (int) result)));
+					   (unsigned long long)generation, flags, (int)result)));
 }
 
-static inline ClusterPcmOwnResult cluster_pcm_own_bump_locked(BufferDesc *buf,
-													  uint32 set_flags, uint32 clear_flags,
-													  uint64 *out_generation,
-													  uint32 *out_flags);
+static inline ClusterPcmOwnResult cluster_pcm_own_bump_locked(BufferDesc *buf, uint32 set_flags,
+															  uint32 clear_flags,
+															  uint64 *out_generation,
+															  uint32 *out_flags);
 
 /*
  * PGRAC ownership-generation wave — coherent
@@ -227,12 +226,12 @@ cluster_pcm_own_transition(BufferDesc *buf, uint8 new_pcm_state, uint32 set_flag
 	uint64 new_generation;
 
 	buf_state = LockBufHdr(buf);
-	bump_result = cluster_pcm_own_bump_locked(buf, set_flags, clear_flags,
-										  &new_generation, &observed_flags);
+	bump_result = cluster_pcm_own_bump_locked(buf, set_flags, clear_flags, &new_generation,
+											  &observed_flags);
 	if (bump_result != CLUSTER_PCM_OWN_OK) {
 		UnlockBufHdr(buf, buf_state);
-		cluster_pcm_own_report_bump_failure(buf, bump_result, new_generation,
-										observed_flags, "ownership transition");
+		cluster_pcm_own_report_bump_failure(buf, bump_result, new_generation, observed_flags,
+											"ownership transition");
 	}
 	buf->pcm_state = new_pcm_state;
 	UnlockBufHdr(buf, buf_state);
@@ -285,8 +284,7 @@ cluster_pcm_own_snapshot_locked(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 static inline bool
 cluster_bufmgr_pcm_x_retained_image_locked(BufferDesc *buf, uint32 buf_state)
 {
-	return buf != NULL && buf->buffer_type == (uint8) BUF_TYPE_PI
-		&& (buf_state & BM_VALID) != 0;
+	return buf != NULL && buf->buffer_type == (uint8)BUF_TYPE_PI && (buf_state & BM_VALID) != 0;
 }
 
 /* A resident mapping is GCS-shippable only while its node owns matching PCM
@@ -296,13 +294,12 @@ static inline bool
 cluster_bufmgr_pcm_current_image_locked(BufferDesc *buf, uint32 buf_state)
 {
 	return buf != NULL
-		&& cluster_pcm_x_current_image_shape(buf->pcm_state, buf->buffer_type,
-										 (buf_state & BM_VALID) != 0);
+		   && cluster_pcm_x_current_image_shape(buf->pcm_state, buf->buffer_type,
+												(buf_state & BM_VALID) != 0);
 }
 
 static inline bool
-cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(BufferDesc *buf,
-												  uint32 buf_state)
+cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(BufferDesc *buf, uint32 buf_state)
 {
 	uint32 flags;
 
@@ -315,14 +312,13 @@ cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(BufferDesc *buf,
 	 * material.  Its monotonic token may legitimately still be zero before
 	 * the first reservation, so flags -- not token value -- are the active
 	 * lifecycle authority.  Every live or malformed shape remains blocked. */
-	return buf->pcm_state != (uint8) PCM_STATE_N
-		|| (buf_state
-			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR)) != 0
-		|| flags != 0;
+	return buf->pcm_state != (uint8)PCM_STATE_N
+		   || (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR)) != 0
+		   || flags != 0;
 }
 
-static inline bool cluster_pcm_own_snapshot_matches_locked(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected);
+static inline bool cluster_pcm_own_snapshot_matches_locked(BufferDesc *buf,
+														   const ClusterPcmOwnSnapshot *expected);
 
 static inline void
 cluster_pcm_own_eviction_capture_locked(BufferDesc *buf, ClusterPcmOwnEvictionCapture *out)
@@ -331,8 +327,7 @@ cluster_pcm_own_eviction_capture_locked(BufferDesc *buf, ClusterPcmOwnEvictionCa
 }
 
 static ClusterPcmOwnResult
-cluster_pcm_own_eviction_commit_locked(BufferDesc *buf,
-									   const ClusterPcmOwnEvictionCapture *capture,
+cluster_pcm_own_eviction_commit_locked(BufferDesc *buf, const ClusterPcmOwnEvictionCapture *capture,
 									   uint64 *out_generation, uint32 *out_flags)
 {
 	ClusterPcmOwnResult result;
@@ -340,8 +335,7 @@ cluster_pcm_own_eviction_commit_locked(BufferDesc *buf,
 	if (!cluster_pcm_own_snapshot_matches_locked(buf, capture))
 		return CLUSTER_PCM_OWN_STALE;
 	if (!cluster_pcm_own_eviction_reuse_allowed(capture)) {
-		result = cluster_pcm_own_classify_live_flags(capture->flags,
-													 capture->reservation_token);
+		result = cluster_pcm_own_classify_live_flags(capture->flags, capture->reservation_token);
 		return result != CLUSTER_PCM_OWN_OK ? result : CLUSTER_PCM_OWN_EXHAUSTED;
 	}
 
@@ -366,7 +360,7 @@ cluster_pcm_own_snapshot_matches_locked(BufferDesc *buf, const ClusterPcmOwnSnap
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out_snapshot)
 {
-	uint32		buf_state;
+	uint32 buf_state;
 
 	if (buf == NULL || out_snapshot == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -382,17 +376,17 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out_snap
 bool
 cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf)
 {
-	bool		permitted;
-	uint32		buf_state;
-	uint32		flags;
+	bool permitted;
+	uint32 buf_state;
+	uint32 flags;
 
 	if (buf == NULL)
 		return false;
 	buf_state = LockBufHdr(buf);
 	flags = cluster_pcm_own_flags_get(buf->buf_id);
 	permitted = (flags & PCM_OWN_FLAG_REVOKING) == 0
-		&& (!cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
-			|| flags == PCM_OWN_FLAG_GRANT_PENDING);
+				&& (!cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
+					|| flags == PCM_OWN_FLAG_GRANT_PENDING);
 	UnlockBufHdr(buf, buf_state);
 	return permitted;
 }
@@ -402,11 +396,11 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 									   ClusterPcmOwnSnapshot *out_snapshot)
 {
 	BufferDesc *buf;
-	BufferTag	lookup_tag;
-	LWLock	   *partition_lock;
-	uint32		hashcode;
-	uint32		buf_state;
-	int			buf_id;
+	BufferTag lookup_tag;
+	LWLock *partition_lock;
+	uint32 hashcode;
+	uint32 buf_state;
+	int buf_id;
 	ClusterPcmOwnResult result;
 
 	if (out_buffer_id != NULL)
@@ -423,8 +417,7 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 	partition_lock = BufMappingPartitionLock(hashcode);
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&lookup_tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return CLUSTER_PCM_OWN_STALE;
 	}
@@ -432,8 +425,7 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 	buf_state = LockBufHdr(buf);
 	if (!BufferTagsEqual(&buf->tag, tag) || (buf_state & BM_VALID) == 0)
 		result = CLUSTER_PCM_OWN_STALE;
-	else
-	{
+	else {
 		cluster_pcm_own_snapshot_locked(buf, out_snapshot);
 		*out_buffer_id = buf_id;
 		result = CLUSTER_PCM_OWN_OK;
@@ -454,31 +446,29 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
  * present.  Queue JOIN/WAIT never sets a reservation flag here.
  */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_finish_s_release_to_n(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s,
-	ClusterPcmOwnSnapshot *out_n_snapshot)
+cluster_bufmgr_pcm_own_finish_s_release_to_n(BufferDesc *buf,
+											 const ClusterPcmOwnSnapshot *expected_s,
+											 ClusterPcmOwnSnapshot *out_n_snapshot)
 {
 	ClusterPcmOwnResult result;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	if (buf == NULL || expected_s == NULL || out_n_snapshot == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	memset(out_n_snapshot, 0, sizeof(*out_n_snapshot));
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
-	if (expected_s->pcm_state != (uint8) PCM_STATE_S || expected_s->flags != 0)
+	if (expected_s->pcm_state != (uint8)PCM_STATE_S || expected_s->flags != 0)
 		return CLUSTER_PCM_OWN_STALE;
 
 	buf_state = LockBufHdr(buf);
 	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_s))
 		result = CLUSTER_PCM_OWN_STALE;
-	else
-	{
+	else {
 		result = cluster_pcm_own_bump_locked(buf, 0, 0, NULL, NULL);
-		if (result == CLUSTER_PCM_OWN_OK)
-		{
-			buf->pcm_state = (uint8) PCM_STATE_N;
-			buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+		if (result == CLUSTER_PCM_OWN_OK) {
+			buf->pcm_state = (uint8)PCM_STATE_N;
+			buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
 			cluster_pcm_own_snapshot_locked(buf, out_n_snapshot);
 		}
 	}
@@ -500,8 +490,7 @@ cluster_bufmgr_pcm_own_finish_s_release_to_n(
  * pin-only readers may consume bytes without that content-lock gate.
  */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
-												XLogRecPtr *out_page_lsn,
+cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag, XLogRecPtr *out_page_lsn,
 												uint64 *out_page_scn)
 {
 	BufferTag lookup_tag;
@@ -537,8 +526,7 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 	partition_lock = BufMappingPartitionLock(hashcode);
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&lookup_tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return CLUSTER_PCM_OWN_STALE;
 	}
@@ -546,15 +534,14 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 	buf_state = LockBufHdr(buf);
 	if (!BufferTagsEqual(&buf->tag, tag) || (buf_state & BM_VALID) == 0)
 		result = CLUSTER_PCM_OWN_STALE;
-	else
-	{
+	else {
 		shared_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 		token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, token);
 		if (live_result == CLUSTER_PCM_OWN_CORRUPT)
 			result = live_result;
-		else if (buf->pcm_state != (uint8) PCM_STATE_S)
+		else if (buf->pcm_state != (uint8)PCM_STATE_S)
 			result = CLUSTER_PCM_OWN_STALE;
 		else if (flags != 0)
 			result = CLUSTER_PCM_OWN_BUSY;
@@ -567,8 +554,7 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 		else if (cluster_pcm_x_revoke_finish_mode(tag, shared_refcount)
 				 != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
 			result = CLUSTER_PCM_OWN_BUSY;
-		else
-		{
+		else {
 			cluster_pcm_own_snapshot_locked(buf, &expected_s);
 			cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
 			buf_state = 0;
@@ -591,11 +577,10 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 			|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
 			|| (buf_state & BM_IO_IN_PROGRESS) != 0)
 			result = CLUSTER_PCM_OWN_STALE;
-		else
-		{
-			page = (Page) BufHdrGetBlock(buf);
+		else {
+			page = (Page)BufHdrGetBlock(buf);
 			page_lsn = PageGetLSN(page);
-			page_scn = (uint64) ((PageHeader) page)->pd_block_scn;
+			page_scn = (uint64)((PageHeader)page)->pd_block_scn;
 			dirty = (buf_state & BM_DIRTY) != 0;
 		}
 		UnlockBufHdr(buf, buf_state);
@@ -603,29 +588,24 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 		if (result == CLUSTER_PCM_OWN_OK && dirty && !XLogRecPtrIsInvalid(page_lsn))
 			XLogFlush(cluster_gcs_clamp_ship_flush_lsn(page_lsn));
 
-		if (result == CLUSTER_PCM_OWN_OK)
-		{
+		if (result == CLUSTER_PCM_OWN_OK) {
 			buf_state = LockBufHdr(buf);
-			page = (Page) BufHdrGetBlock(buf);
+			page = (Page)BufHdrGetBlock(buf);
 			if (!cluster_pcm_own_snapshot_matches_locked(buf, &expected_s)
 				|| (buf_state & BM_VALID) == 0
 				|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
-				|| (buf_state & BM_IO_IN_PROGRESS) != 0
-				|| PageGetLSN(page) != page_lsn)
+				|| (buf_state & BM_IO_IN_PROGRESS) != 0 || PageGetLSN(page) != page_lsn)
 				result = CLUSTER_PCM_OWN_STALE;
-			else
-			{
+			else {
 				result = cluster_pcm_own_bump_locked(buf, 0, 0, NULL, NULL);
-				if (result == CLUSTER_PCM_OWN_OK)
-				{
-					buf->pcm_state = (uint8) PCM_STATE_N;
+				if (result == CLUSTER_PCM_OWN_OK) {
+					buf->pcm_state = (uint8)PCM_STATE_N;
 					/* PI+BM_VALID is the established never-write/never-serve shape.
 					 * Unlike a source retain it has no live reservation flag (the
 					 * monotonic token remains idle): the next exact GRANT_PENDING
 					 * install may overwrite it, then republishes CURRENT. */
-					buf->buffer_type = (uint8) BUF_TYPE_PI;
-					buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-								   | BM_IO_ERROR);
+					buf->buffer_type = (uint8)BUF_TYPE_PI;
+					buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
 				}
 			}
 			UnlockBufHdr(buf, buf_state);
@@ -644,8 +624,7 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 	PG_END_TRY();
 
 	cluster_bufmgr_unpin_for_gcs(buf);
-	if (result == CLUSTER_PCM_OWN_OK)
-	{
+	if (result == CLUSTER_PCM_OWN_OK) {
 		*out_page_lsn = page_lsn;
 		*out_page_scn = page_scn;
 	}
@@ -655,8 +634,9 @@ cluster_bufmgr_pcm_own_release_pinned_s_for_gcs(const BufferTag *tag,
 /* Make freshly installed bytes visible only while the same queue
  * reservation still owns both the descriptor and content EXCLUSIVE. */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_publish_installed_x_image(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected, uint64 reservation_token)
+cluster_bufmgr_pcm_own_publish_installed_x_image(BufferDesc *buf,
+												 const ClusterPcmOwnSnapshot *expected,
+												 uint64 reservation_token)
 {
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
 	uint32 buf_state;
@@ -667,7 +647,7 @@ cluster_bufmgr_pcm_own_publish_installed_x_image(
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
-	if (expected->pcm_state != (uint8) PCM_STATE_N || expected->flags != 0
+	if (expected->pcm_state != (uint8)PCM_STATE_N || expected->flags != 0
 		|| expected->reservation_token == UINT64_MAX
 		|| reservation_token != expected->reservation_token + 1)
 		return CLUSTER_PCM_OWN_STALE;
@@ -677,12 +657,11 @@ cluster_bufmgr_pcm_own_publish_installed_x_image(
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected->generation
 		|| cluster_pcm_own_reservation_token_get(buf->buf_id) != reservation_token
 		|| cluster_pcm_own_flags_get(buf->buf_id) != PCM_OWN_FLAG_GRANT_PENDING
-		|| buf->pcm_state != (uint8) PCM_STATE_N)
+		|| buf->pcm_state != (uint8)PCM_STATE_N)
 		result = CLUSTER_PCM_OWN_STALE;
-	else
-	{
+	else {
 		buf_state |= BM_VALID;
-		buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+		buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
 	}
 	UnlockBufHdr(buf, buf_state);
 	return result;
@@ -985,8 +964,7 @@ cluster_pcm_own_abort_grant_after_master_rollback(BufferDesc *buf,
 	return result;
 }
 
-pg_attribute_noreturn() static void
-cluster_pcm_own_rollback_grant_after_error_and_rethrow(
+pg_attribute_noreturn() static void cluster_pcm_own_rollback_grant_after_error_and_rethrow(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token,
 	PcmLockMode acquired_mode, bool has_reservation, ErrorData *original_error,
 	MemoryContext caller_context)
@@ -1025,15 +1003,15 @@ cluster_pcm_own_rollback_grant_after_error_and_rethrow(
 
 	if (master_released) {
 		if (has_reservation) {
-			rollback_result = cluster_pcm_own_abort_grant_after_master_rollback(
-				buf, base, reservation_token);
+			rollback_result
+				= cluster_pcm_own_abort_grant_after_master_rollback(buf, base, reservation_token);
 			if (rollback_result != CLUSTER_PCM_OWN_OK)
 				elog(LOG,
 					 "failed to converge local cluster PCM state after content-lock error "
 					 "master rollback: buffer=%d token=%llu result=%d; reservation remains "
 					 "fail-closed",
-					 buf != NULL ? buf->buf_id : -1,
-					 (unsigned long long)reservation_token, (int)rollback_result);
+					 buf != NULL ? buf->buf_id : -1, (unsigned long long)reservation_token,
+					 (int)rollback_result);
 		} else
 			elog(LOG,
 				 "cluster PCM content-lock error rolled back a master grant without local "
@@ -1127,7 +1105,7 @@ static bool cluster_bufmgr_in_gcs_drop = false;
 static inline void
 cluster_pcm_own_read(BufferDesc *buf, uint8 *out_state, uint64 *out_gen, uint32 *out_flags)
 {
-	uint32		buf_state;
+	uint32 buf_state;
 
 	buf_state = LockBufHdr(buf);
 	if (out_state != NULL)
@@ -1143,8 +1121,7 @@ cluster_pcm_own_read(BufferDesc *buf, uint8 *out_state, uint64 *out_gen, uint32 
  * bounded by PG's own held-LWLock ceiling and stores the complete exact
  * handle returned by PCM-X; error cleanup never reconstructs identity from a
  * possibly changed BufferDesc ownership mirror. */
-typedef enum ClusterPcmXHolderLedgerPhase
-{
+typedef enum ClusterPcmXHolderLedgerPhase {
 	PCM_X_HOLDER_LEDGER_UNUSED = 0,
 	PCM_X_HOLDER_LEDGER_ACQUIRING,
 	PCM_X_HOLDER_LEDGER_ACTIVE,
@@ -1152,16 +1129,14 @@ typedef enum ClusterPcmXHolderLedgerPhase
 	PCM_X_HOLDER_LEDGER_DEFERRED
 } ClusterPcmXHolderLedgerPhase;
 
-typedef struct ClusterPcmXHolderLedgerEntry
-{
+typedef struct ClusterPcmXHolderLedgerEntry {
 	ClusterPcmXHolderLedgerPhase phase;
-	int32		buffer_id;
-	LWLock	   *content_lock;
+	int32 buffer_id;
+	LWLock *content_lock;
 	PcmXLocalHolderHandle handle;
 } ClusterPcmXHolderLedgerEntry;
 
-static ClusterPcmXHolderLedgerEntry
-	cluster_bufmgr_pcm_x_holder_ledger[LWLOCK_MAX_HELD_BY_PROC];
+static ClusterPcmXHolderLedgerEntry cluster_bufmgr_pcm_x_holder_ledger[LWLOCK_MAX_HELD_BY_PROC];
 static uint64 cluster_bufmgr_pcm_x_holder_identity = 0;
 
 StaticAssertDecl(lengthof(cluster_bufmgr_pcm_x_holder_ledger) == LWLOCK_MAX_HELD_BY_PROC,
@@ -1208,10 +1183,9 @@ static void cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint
 														   ClusterPcmDirectInitSnapshot *out);
 
 static void
-cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
-								   uint32 wait_index)
+cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id, uint32 wait_index)
 {
-	long		delay_ms;
+	long delay_ms;
 	PcmXQueueResult guard_result;
 
 	/*
@@ -1219,10 +1193,11 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 	 * lock is held would make RETIRE depend on the holder it is draining.
 	 */
 	if (content_lock == NULL || LWLockHeldByMe(content_lock))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot wait for a cluster PCM-X holder gate while holding content authority"),
-				 errdetail("buffer=%d wait_index=%u", buffer_id, wait_index)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("cannot wait for a cluster PCM-X holder gate while holding content authority"),
+			 errdetail("buffer=%d wait_index=%u", buffer_id, wait_index)));
 	/* A different held content lock may itself be the holder that a frozen
 	 * PROBE is draining.  Reuse the protocol's exact held-lock snapshot so a
 	 * safe lock-coupling path can still wait, but never sleep across a closed
@@ -1230,24 +1205,23 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 	 */
 	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
 	if (guard_result != PCM_X_QUEUE_OK)
-		cluster_bufmgr_pcm_x_holder_report_failure(
-			guard_result, GetBufferDescriptor(buffer_id), "retry wait nested guard");
+		cluster_bufmgr_pcm_x_holder_report_failure(guard_result, GetBufferDescriptor(buffer_id),
+												   "retry wait nested guard");
 	delay_ms = cluster_pcm_x_holder_retry_delay_ms(wait_index);
 	CHECK_FOR_INTERRUPTS();
-	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
-					 WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	(void)WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
+					WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
 	CHECK_FOR_INTERRUPTS();
 }
 
 static ClusterPcmXHolderLedgerEntry *
 cluster_bufmgr_pcm_x_holder_find(BufferDesc *buf)
 {
-	int			i;
+	int i;
 
 	if (buf == NULL)
 		return NULL;
-	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++)
-	{
+	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++) {
 		ClusterPcmXHolderLedgerEntry *entry = &cluster_bufmgr_pcm_x_holder_ledger[i];
 
 		if (entry->phase != PCM_X_HOLDER_LEDGER_UNUSED && entry->buffer_id == buf->buf_id)
@@ -1259,7 +1233,7 @@ cluster_bufmgr_pcm_x_holder_find(BufferDesc *buf)
 static ClusterPcmXHolderLedgerEntry *
 cluster_bufmgr_pcm_x_holder_free_entry(void)
 {
-	int			i;
+	int i;
 
 	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++)
 		if (cluster_bufmgr_pcm_x_holder_ledger[i].phase == PCM_X_HOLDER_LEDGER_UNUSED)
@@ -1268,11 +1242,10 @@ cluster_bufmgr_pcm_x_holder_free_entry(void)
 }
 
 static bool
-cluster_bufmgr_pcm_x_holder_entry_exact(const ClusterPcmXHolderLedgerEntry *entry,
-										BufferDesc *buf)
+cluster_bufmgr_pcm_x_holder_entry_exact(const ClusterPcmXHolderLedgerEntry *entry, BufferDesc *buf)
 {
 	PcmXRuntimeSnapshot runtime;
-	uint64		cluster_epoch;
+	uint64 cluster_epoch;
 
 	if (entry == NULL || buf == NULL)
 		return false;
@@ -1283,8 +1256,7 @@ cluster_bufmgr_pcm_x_holder_entry_exact(const ClusterPcmXHolderLedgerEntry *entr
 		return false;
 	if (cluster_node_id < 0 || cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
 		|| entry->handle.key.identity.node_id != cluster_node_id || MyProc == NULL
-		|| MyProc->pgprocno < 0
-		|| entry->handle.key.identity.procno != (uint32) MyProc->pgprocno
+		|| MyProc->pgprocno < 0 || entry->handle.key.identity.procno != (uint32)MyProc->pgprocno
 		|| entry->handle.key.identity.request_id == 0
 		|| entry->handle.key.identity.wait_seq != entry->handle.key.identity.request_id
 		|| entry->handle.tag_slot.slot_index == PCM_X_INVALID_SLOT_INDEX
@@ -1300,22 +1272,20 @@ cluster_bufmgr_pcm_x_holder_entry_exact(const ClusterPcmXHolderLedgerEntry *entr
 
 static void
 cluster_bufmgr_pcm_x_holder_report_failure(PcmXQueueResult result, BufferDesc *buf,
-											const char *operation)
+										   const char *operation)
 {
 	if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
 		|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
 		|| result == PCM_X_QUEUE_NO_CAPACITY)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("cluster PCM-X holder operation is not ready"),
-				 errdetail("operation=%s buffer=%d result=%d", operation,
-						   buf != NULL ? buf->buf_id : -1, (int) result)));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
+						errmsg("cluster PCM-X holder operation is not ready"),
+						errdetail("operation=%s buffer=%d result=%d", operation,
+								  buf != NULL ? buf->buf_id : -1, (int)result)));
 
 	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("cluster PCM-X holder operation failed"),
+			(errcode(ERRCODE_DATA_CORRUPTED), errmsg("cluster PCM-X holder operation failed"),
 			 errdetail("operation=%s buffer=%d result=%d", operation,
-					   buf != NULL ? buf->buf_id : -1, (int) result)));
+					   buf != NULL ? buf->buf_id : -1, (int)result)));
 }
 
 static void
@@ -1341,37 +1311,36 @@ cluster_bufmgr_pcm_x_holder_defer_fail_closed(ClusterPcmXHolderLedgerEntry *entr
 static void
 cluster_bufmgr_pcm_x_holder_drain_deferred_nowait(void)
 {
-	int			i;
+	int i;
 
-	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++)
-	{
+	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++) {
 		ClusterPcmXHolderLedgerEntry *entry = &cluster_bufmgr_pcm_x_holder_ledger[i];
 		PcmXQueueResult result;
 
 		if (entry->phase != PCM_X_HOLDER_LEDGER_DEFERRED)
 			continue;
-		if (entry->content_lock == NULL)
-		{
+		if (entry->content_lock == NULL) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
-			elog(LOG, "could not drain deferred cluster PCM-X holder with no content lock: buffer=%d",
+			elog(LOG,
+				 "could not drain deferred cluster PCM-X holder with no content lock: buffer=%d",
 				 entry->buffer_id);
 			continue;
 		}
-		if (LWLockHeldByMe(entry->content_lock))
-		{
-			elog(LOG, "could not drain deferred cluster PCM-X holder while content lock is held: buffer=%d",
+		if (LWLockHeldByMe(entry->content_lock)) {
+			elog(LOG,
+				 "could not drain deferred cluster PCM-X holder while content lock is held: "
+				 "buffer=%d",
 				 entry->buffer_id);
 			continue;
 		}
 		result = cluster_pcm_x_local_holder_exceptional_detach_exact(&entry->handle,
-														  entry->content_lock);
+																	 entry->content_lock);
 		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_NOT_FOUND)
 			cluster_bufmgr_pcm_x_holder_clear(entry);
-		else if (result != PCM_X_QUEUE_GATE_RETRY && result != PCM_X_QUEUE_BUSY)
-		{
+		else if (result != PCM_X_QUEUE_GATE_RETRY && result != PCM_X_QUEUE_BUSY) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 			elog(LOG, "could not drain deferred exact cluster PCM-X holder: buffer=%d result=%d",
-				 entry->buffer_id, (int) result);
+				 entry->buffer_id, (int)result);
 		}
 	}
 }
@@ -1384,51 +1353,42 @@ static void
 cluster_bufmgr_pcm_x_holder_drain_deferred(ClusterPcmXHolderLedgerEntry *entry)
 {
 	PcmXRuntimeSnapshot runtime;
-	uint32		wait_index = 0;
+	uint32 wait_index = 0;
 
 	if (entry == NULL || entry->phase != PCM_X_HOLDER_LEDGER_DEFERRED)
 		return;
-	for (;;)
-	{
+	for (;;) {
 		PcmXQueueResult result;
 		ClusterPcmXHolderRetryAction action;
 
-		if (entry->content_lock == NULL || LWLockHeldByMe(entry->content_lock))
-		{
+		if (entry->content_lock == NULL || LWLockHeldByMe(entry->content_lock)) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 			cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE,
-											 GetBufferDescriptor(entry->buffer_id),
-											 "deferred detach lock order");
+													   GetBufferDescriptor(entry->buffer_id),
+													   "deferred detach lock order");
 		}
 		result = cluster_pcm_x_local_holder_exceptional_detach_exact(&entry->handle,
-														  entry->content_lock);
+																	 entry->content_lock);
 		action = cluster_pcm_x_holder_unregister_retry_action(result, 0);
-		if (action == CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE)
-		{
+		if (action == CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE) {
 			cluster_bufmgr_pcm_x_holder_clear(entry);
 			return;
 		}
-		if (action != CLUSTER_PCM_X_HOLDER_RETRY_WAIT)
-		{
+		if (action != CLUSTER_PCM_X_HOLDER_RETRY_WAIT) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
-			cluster_bufmgr_pcm_x_holder_report_failure(result,
-											 GetBufferDescriptor(entry->buffer_id),
-											 "deferred detach");
+			cluster_bufmgr_pcm_x_holder_report_failure(
+				result, GetBufferDescriptor(entry->buffer_id), "deferred detach");
 		}
-		cluster_bufmgr_pcm_x_holder_retry_wait(
-			entry->content_lock, entry->buffer_id,
-			wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
+		cluster_bufmgr_pcm_x_holder_retry_wait(entry->content_lock, entry->buffer_id,
+											   wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
 		wait_index++;
-		if (wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS == 0)
-		{
+		if (wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS == 0) {
 			runtime = cluster_pcm_x_runtime_snapshot();
-			if (runtime.state != PCM_X_RUNTIME_ACTIVE
-				|| runtime.master_session_incarnation == 0)
-			{
+			if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0) {
 				cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
-				cluster_bufmgr_pcm_x_holder_report_failure(
-					PCM_X_QUEUE_NOT_READY, GetBufferDescriptor(entry->buffer_id),
-					"deferred detach runtime");
+				cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_NOT_READY,
+														   GetBufferDescriptor(entry->buffer_id),
+														   "deferred detach runtime");
 			}
 		}
 	}
@@ -1454,19 +1414,16 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 
 	cluster_bufmgr_pcm_x_holder_drain_deferred_nowait();
 	entry = cluster_bufmgr_pcm_x_holder_find(buf);
-	if (entry != NULL && entry->phase == PCM_X_HOLDER_LEDGER_DEFERRED)
-	{
+	if (entry != NULL && entry->phase == PCM_X_HOLDER_LEDGER_DEFERRED) {
 		cluster_bufmgr_pcm_x_holder_drain_deferred(entry);
 		entry = NULL;
 	}
-	if (entry != NULL)
-	{
+	if (entry != NULL) {
 		if (entry->phase != PCM_X_HOLDER_LEDGER_ACQUIRING
-			|| !cluster_bufmgr_pcm_x_holder_entry_exact(entry, buf))
-		{
+			|| !cluster_bufmgr_pcm_x_holder_entry_exact(entry, buf)) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 			cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE, buf,
-											 "reuse existing holder ledger");
+													   "reuse existing holder ledger");
 		}
 		if (LWLockHeldByMe(entry->content_lock))
 			ereport(ERROR,
@@ -1506,18 +1463,15 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 				 errmsg("cannot register a cluster PCM-X holder for a pre-held content lock"),
 				 errdetail("buffer=%d", buf->buf_id)));
 	entry = cluster_bufmgr_pcm_x_holder_free_entry();
-	if (entry == NULL)
-	{
-		int			i;
+	if (entry == NULL) {
+		int i;
 
 		/*
 		 * Deferred exact handles do not consume the ledger forever.  If every
 		 * slot is occupied, wait for one safe detach before declaring a real
 		 * held-LWLock bound violation. */
-		for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++)
-		{
-			ClusterPcmXHolderLedgerEntry *candidate
-				= &cluster_bufmgr_pcm_x_holder_ledger[i];
+		for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++) {
+			ClusterPcmXHolderLedgerEntry *candidate = &cluster_bufmgr_pcm_x_holder_ledger[i];
 
 			if (candidate->phase != PCM_X_HOLDER_LEDGER_DEFERRED)
 				continue;
@@ -1527,10 +1481,9 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 		}
 	}
 	if (entry == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cluster PCM-X holder ledger is full"),
-				 errdetail("maximum entries=%d", LWLOCK_MAX_HELD_BY_PROC)));
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster PCM-X holder ledger is full"),
+						errdetail("maximum entries=%d", LWLOCK_MAX_HELD_BY_PROC)));
 
 	cluster_pcm_own_read(buf, NULL, &own_generation, NULL);
 	cluster_epoch = cluster_epoch_get_current();
@@ -1562,8 +1515,7 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 		key.identity.base_own_generation = own_generation;
 	}
 	key.buffer_id = buf->buf_id;
-	for (;;)
-	{
+	for (;;) {
 		ClusterPcmXHolderRetryAction action;
 		PcmXRuntimeSnapshot current_runtime;
 
@@ -1595,8 +1547,7 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 		if (action != CLUSTER_PCM_X_HOLDER_RETRY_WAIT)
 			cluster_bufmgr_pcm_x_holder_report_failure(result, buf, "register");
 		cluster_bufmgr_pcm_x_holder_retry_wait(
-			content_lock, buf->buf_id,
-			wait_index++ % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
+			content_lock, buf->buf_id, wait_index++ % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
 	}
 
 	return entry;
@@ -1610,12 +1561,12 @@ cluster_bufmgr_pcm_x_holder_activate(ClusterPcmXHolderLedgerEntry *entry)
 	if (entry == NULL)
 		return;
 	if (entry->phase != PCM_X_HOLDER_LEDGER_ACQUIRING)
-		cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE,
-											 GetBufferDescriptor(entry->buffer_id), "activate phase");
+		cluster_bufmgr_pcm_x_holder_report_failure(
+			PCM_X_QUEUE_BAD_STATE, GetBufferDescriptor(entry->buffer_id), "activate phase");
 	result = cluster_pcm_x_local_holder_activate_exact(&entry->handle);
 	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
-		cluster_bufmgr_pcm_x_holder_report_failure(result,
-										 GetBufferDescriptor(entry->buffer_id), "activate");
+		cluster_bufmgr_pcm_x_holder_report_failure(result, GetBufferDescriptor(entry->buffer_id),
+												   "activate");
 	entry->phase = PCM_X_HOLDER_LEDGER_ACTIVE;
 }
 
@@ -1627,13 +1578,12 @@ cluster_bufmgr_pcm_x_holder_mark_releasing(ClusterPcmXHolderLedgerEntry *entry)
 	if (entry == NULL)
 		return;
 	if (entry->phase != PCM_X_HOLDER_LEDGER_ACTIVE)
-		cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE,
-											 GetBufferDescriptor(entry->buffer_id),
-											 "mark releasing phase");
+		cluster_bufmgr_pcm_x_holder_report_failure(
+			PCM_X_QUEUE_BAD_STATE, GetBufferDescriptor(entry->buffer_id), "mark releasing phase");
 	result = cluster_pcm_x_local_holder_mark_releasing_exact(&entry->handle);
 	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
-		cluster_bufmgr_pcm_x_holder_report_failure(result,
-										 GetBufferDescriptor(entry->buffer_id), "mark releasing");
+		cluster_bufmgr_pcm_x_holder_report_failure(result, GetBufferDescriptor(entry->buffer_id),
+												   "mark releasing");
 	entry->phase = PCM_X_HOLDER_LEDGER_RELEASING;
 }
 
@@ -1641,42 +1591,35 @@ static void
 cluster_bufmgr_pcm_x_holder_unregister(ClusterPcmXHolderLedgerEntry *entry)
 {
 	PcmXQueueResult result;
-	uint32		waits_used = 0;
+	uint32 waits_used = 0;
 
 	if (entry == NULL)
 		return;
 	if (entry->phase != PCM_X_HOLDER_LEDGER_RELEASING)
-		cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE,
-											 GetBufferDescriptor(entry->buffer_id),
-											 "unregister phase");
+		cluster_bufmgr_pcm_x_holder_report_failure(
+			PCM_X_QUEUE_BAD_STATE, GetBufferDescriptor(entry->buffer_id), "unregister phase");
 	if (entry->content_lock == NULL || LWLockHeldByMe(entry->content_lock))
-		cluster_bufmgr_pcm_x_holder_report_failure(PCM_X_QUEUE_BAD_STATE,
-											 GetBufferDescriptor(entry->buffer_id),
-											 "unregister lock order");
-	for (;;)
-	{
+		cluster_bufmgr_pcm_x_holder_report_failure(
+			PCM_X_QUEUE_BAD_STATE, GetBufferDescriptor(entry->buffer_id), "unregister lock order");
+	for (;;) {
 		ClusterPcmXHolderRetryAction action;
 
 		result = cluster_pcm_x_local_holder_unregister_exact(&entry->handle);
 		action = cluster_pcm_x_holder_unregister_retry_action(result, waits_used);
-		if (action == CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE)
-		{
+		if (action == CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE) {
 			cluster_bufmgr_pcm_x_holder_clear(entry);
 			return;
 		}
-		if (action == CLUSTER_PCM_X_HOLDER_RETRY_DEFER)
-		{
+		if (action == CLUSTER_PCM_X_HOLDER_RETRY_DEFER) {
 			entry->phase = PCM_X_HOLDER_LEDGER_DEFERRED;
 			return;
 		}
-		if (action != CLUSTER_PCM_X_HOLDER_RETRY_WAIT)
-		{
+		if (action != CLUSTER_PCM_X_HOLDER_RETRY_WAIT) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 			cluster_bufmgr_pcm_x_holder_report_failure(
 				result, GetBufferDescriptor(entry->buffer_id), "unregister");
 		}
-		cluster_bufmgr_pcm_x_holder_retry_wait(entry->content_lock, entry->buffer_id,
-											 waits_used++);
+		cluster_bufmgr_pcm_x_holder_retry_wait(entry->content_lock, entry->buffer_id, waits_used++);
 	}
 }
 
@@ -1687,8 +1630,7 @@ cluster_bufmgr_pcm_x_holder_abort_acquiring(ClusterPcmXHolderLedgerEntry *entry)
 
 	if (entry == NULL)
 		return;
-	if (entry->content_lock == NULL)
-	{
+	if (entry->content_lock == NULL) {
 		cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 		elog(LOG, "could not abort cluster PCM-X ACQUIRING holder with no content lock: buffer=%d",
 			 entry->buffer_id);
@@ -1701,46 +1643,45 @@ cluster_bufmgr_pcm_x_holder_abort_acquiring(ClusterPcmXHolderLedgerEntry *entry)
 		cluster_bufmgr_pcm_x_holder_clear(entry);
 	else if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BUSY)
 		entry->phase = PCM_X_HOLDER_LEDGER_DEFERRED;
-	else
-	{
+	else {
 		cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 		elog(LOG, "could not abort exact cluster PCM-X ACQUIRING holder: buffer=%d result=%d",
-			 entry->buffer_id, (int) result);
+			 entry->buffer_id, (int)result);
 	}
 }
 
 static void
 cluster_bufmgr_pcm_x_holder_exception_cleanup_all(void)
 {
-	int			i;
+	int i;
 
-	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++)
-	{
+	for (i = 0; i < lengthof(cluster_bufmgr_pcm_x_holder_ledger); i++) {
 		ClusterPcmXHolderLedgerEntry *entry = &cluster_bufmgr_pcm_x_holder_ledger[i];
 		PcmXQueueResult result;
 
 		if (entry->phase == PCM_X_HOLDER_LEDGER_UNUSED)
 			continue;
-		if (entry->content_lock == NULL)
-		{
+		if (entry->content_lock == NULL) {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
-			elog(LOG, "could not detach cluster PCM-X holder after error with no content lock: buffer=%d",
-				 entry->buffer_id);
+			elog(
+				LOG,
+				"could not detach cluster PCM-X holder after error with no content lock: buffer=%d",
+				entry->buffer_id);
 			continue;
 		}
 		if (LWLockHeldByMe(entry->content_lock))
 			continue;
 		result = cluster_pcm_x_local_holder_exceptional_detach_exact(&entry->handle,
-														  entry->content_lock);
+																	 entry->content_lock);
 		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_NOT_FOUND)
 			cluster_bufmgr_pcm_x_holder_clear(entry);
 		else if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BUSY)
 			entry->phase = PCM_X_HOLDER_LEDGER_DEFERRED;
-		else
-		{
+		else {
 			cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
-			elog(LOG, "could not detach exact cluster PCM-X holder after error: buffer=%d result=%d",
-				 entry->buffer_id, (int) result);
+			elog(LOG,
+				 "could not detach exact cluster PCM-X holder after error: buffer=%d result=%d",
+				 entry->buffer_id, (int)result);
 		}
 	}
 }
@@ -1748,8 +1689,7 @@ cluster_bufmgr_pcm_x_holder_exception_cleanup_all(void)
 static void
 cluster_bufmgr_pcm_x_holder_reset(void)
 {
-	MemSet(cluster_bufmgr_pcm_x_holder_ledger, 0,
-		   sizeof(cluster_bufmgr_pcm_x_holder_ledger));
+	MemSet(cluster_bufmgr_pcm_x_holder_ledger, 0, sizeof(cluster_bufmgr_pcm_x_holder_ledger));
 	cluster_bufmgr_pcm_x_holder_identity = 0;
 }
 
@@ -1812,18 +1752,30 @@ static void
 cluster_bufmgr_pcm_x_writer_report_failure(PcmXQueueResult result, BufferDesc *buf,
 										   const char *operation)
 {
+	BufferTag guard_tag;
+	int guard_result = 0;
+	char guard_detail[96];
+
+	/* Name the exact requester escape arm and, for a nested-guard refusal,
+	 * the held content-lock tag that closed the guard. */
+	guard_detail[0] = '\0';
+	if (cluster_pcm_x_nested_wait_guard_last_block(&guard_tag, &guard_result))
+		snprintf(guard_detail, sizeof(guard_detail), " guard_result=%d guard_rel=%u guard_blk=%u",
+				 guard_result, guard_tag.relNumber, guard_tag.blockNum);
 	if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY
 		|| result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
 		|| result == PCM_X_QUEUE_NO_CAPACITY)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
 						errmsg("cluster PCM-X writer operation is not ready"),
-						errdetail("operation=%s buffer=%d result=%d", operation,
-								  buf != NULL ? buf->buf_id : -1, (int)result)));
+						errdetail("operation=%s buffer=%d result=%d fail_line=%d%s", operation,
+								  buf != NULL ? buf->buf_id : -1, (int)result,
+								  cluster_gcs_pcm_x_requester_last_fail_line(), guard_detail)));
 
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED), errmsg("cluster PCM-X writer operation failed"),
-			 errdetail("operation=%s buffer=%d result=%d", operation,
-					   buf != NULL ? buf->buf_id : -1, (int)result)));
+			 errdetail("operation=%s buffer=%d result=%d fail_line=%d%s", operation,
+					   buf != NULL ? buf->buf_id : -1, (int)result,
+					   cluster_gcs_pcm_x_requester_last_fail_line(), guard_detail)));
 }
 
 static void
@@ -2240,8 +2192,7 @@ static inline int32 GetPrivateRefCount(Buffer buffer);
  * serialized by the BufferDesc header lock.  The private refcount table is
  * process-local and cannot change concurrently inside this backend. */
 static void
-cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint32 buf_state,
-											   bool page_is_new,
+cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint32 buf_state, bool page_is_new,
 											   ClusterPcmDirectInitSnapshot *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -2257,37 +2208,34 @@ cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint32 buf_state
 	out->page_is_new = page_is_new;
 }
 
-pg_attribute_noreturn() static void
-cluster_bufmgr_pcm_direct_init_report_failure(BufferDesc *buf, ClusterPcmOwnResult result,
-											  const ClusterPcmDirectInitSnapshot *observed,
-											  const char *context)
+pg_attribute_noreturn() static void cluster_bufmgr_pcm_direct_init_report_failure(
+	BufferDesc *buf, ClusterPcmOwnResult result, const ClusterPcmDirectInitSnapshot *observed,
+	const char *context)
 {
-	uint64		generation = observed != NULL ? observed->generation : 0;
-	uint32		flags = observed != NULL ? observed->flags : 0;
+	uint64 generation = observed != NULL ? observed->generation : 0;
+	uint32 flags = observed != NULL ? observed->flags : 0;
 
 	cluster_grd_inc_block_path_failclosed();
-	if (result == CLUSTER_PCM_OWN_BUSY || result == CLUSTER_PCM_OWN_CORRUPT ||
-		result == CLUSTER_PCM_OWN_EXHAUSTED || result == CLUSTER_PCM_OWN_NOT_READY)
+	if (result == CLUSTER_PCM_OWN_BUSY || result == CLUSTER_PCM_OWN_CORRUPT
+		|| result == CLUSTER_PCM_OWN_EXHAUSTED || result == CLUSTER_PCM_OWN_NOT_READY)
 		cluster_pcm_own_report_bump_failure(buf, result, generation, flags, context);
 
-	ereport(ERROR,
-			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("cluster PCM direct initialization lacks an exact live proof"),
-			 errdetail("context=%s buffer=%d result=%d generation=%llu flags=0x%x",
-					   context, buf != NULL ? buf->buf_id : -1, (int) result,
-					   (unsigned long long) generation, flags)));
+	ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cluster PCM direct initialization lacks an exact live proof"),
+					errdetail("context=%s buffer=%d result=%d generation=%llu flags=0x%x", context,
+							  buf != NULL ? buf->buf_id : -1, (int)result,
+							  (unsigned long long)generation, flags)));
 }
 
-pg_attribute_noreturn() static void
-cluster_bufmgr_pcm_direct_init_no_grant_failclosed(BufferDesc *buf,
-												  ClusterPcmDirectInitKind kind)
+pg_attribute_noreturn() static void cluster_bufmgr_pcm_direct_init_no_grant_failclosed(
+	BufferDesc *buf, ClusterPcmDirectInitKind kind)
 {
 	cluster_grd_inc_block_path_failclosed();
 	ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("cluster PCM direct initialization did not obtain X ownership"),
 			 errdetail("buffer=%d operation=%d returned a one-shot image without a durable grant",
-					   buf != NULL ? buf->buf_id : -1, (int) kind)));
+					   buf != NULL ? buf->buf_id : -1, (int)kind)));
 }
 
 /* Arm only at a source-authorized operation site.  This does not reserve the
@@ -2299,21 +2247,20 @@ cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kin
 {
 	ClusterPcmDirectInitSnapshot observed;
 	ClusterPcmOwnResult result;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	memset(proof, 0, sizeof(*proof));
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
 		return;
 
 	buf_state = LockBufHdr(buf);
-	cluster_bufmgr_pcm_direct_init_snapshot_locked(
-		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
+	cluster_bufmgr_pcm_direct_init_snapshot_locked(buf, buf_state,
+												   PageIsNew((Page)BufHdrGetBlock(buf)), &observed);
 	result = cluster_pcm_direct_init_proof_arm(kind, &observed, proof);
 	UnlockBufHdr(buf, buf_state);
 
 	if (result != CLUSTER_PCM_OWN_OK)
-		cluster_bufmgr_pcm_direct_init_report_failure(buf, result, &observed,
-												  "direct-init arm");
+		cluster_bufmgr_pcm_direct_init_report_failure(buf, result, &observed, "direct-init arm");
 }
 
 /*
@@ -2330,26 +2277,25 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	ClusterPcmDirectInitSnapshot observed;
 	ClusterPcmOwnSnapshot pending_base;
 	ClusterPcmOwnResult pending_result;
-	bool		grant_acquired = false;
-	uint32		buf_state;
-	uint64		pending_token = 0;
-	uint64		committed_generation;
+	bool grant_acquired = false;
+	uint32 buf_state;
+	uint64 pending_token = 0;
+	uint64 committed_generation;
 
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
 		return;
 	if (proof == NULL)
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, CLUSTER_PCM_OWN_INVALID, NULL,
-												  "direct-init missing proof");
+													  "direct-init missing proof");
 
 	buf_state = LockBufHdr(buf);
-	cluster_bufmgr_pcm_direct_init_snapshot_locked(
-		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
+	cluster_bufmgr_pcm_direct_init_snapshot_locked(buf, buf_state,
+												   PageIsNew((Page)BufHdrGetBlock(buf)), &observed);
 	pending_result = cluster_pcm_direct_init_proof_consume(kind, &observed, proof);
 	if (pending_result == CLUSTER_PCM_OWN_OK)
 		pending_result = cluster_pcm_own_reservation_begin_exact(
 			buf->buf_id, observed.generation, PCM_OWN_FLAG_GRANT_PENDING, &pending_token);
-	if (pending_result == CLUSTER_PCM_OWN_OK)
-	{
+	if (pending_result == CLUSTER_PCM_OWN_OK) {
 		memset(&pending_base, 0, sizeof(pending_base));
 		pending_base.tag = observed.tag;
 		pending_base.generation = observed.generation;
@@ -2361,7 +2307,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 
 	if (pending_result != CLUSTER_PCM_OWN_OK)
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, pending_result, &observed,
-												  "direct-init consume");
+													  "direct-init consume");
 
 	PG_TRY();
 	{
@@ -2377,12 +2323,11 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 
 	if (grant_acquired)
 		cluster_pcm_own_finish_grant_or_rollback(buf, &pending_base, pending_token,
-											 (uint8) PCM_STATE_X, PCM_LOCK_MODE_X,
-											 &committed_generation);
-	else
-	{
+												 (uint8)PCM_STATE_X, PCM_LOCK_MODE_X,
+												 &committed_generation);
+	else {
 		cluster_pcm_own_abort_grant_or_error(buf, &pending_base, pending_token,
-												 "direct-init read-image");
+											 "direct-init read-image");
 		cluster_bufmgr_pcm_direct_init_no_grant_failclosed(buf, kind);
 	}
 }
@@ -2395,12 +2340,11 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
  * being dropped. For the relations with size below this threshold, we find
  * the buffers by doing lookups in BufMapping table.
  */
-#define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
+#define BUF_DROP_FULL_SCAN_THRESHOLD (uint64)(NBuffers / 32)
 
-typedef struct PrivateRefCountEntry
-{
-	Buffer		buffer;
-	int32		refcount;
+typedef struct PrivateRefCountEntry {
+	Buffer buffer;
+	int32 refcount;
 } PrivateRefCountEntry;
 
 /* 64 bytes, about the size of a cache line on common systems */
@@ -2410,10 +2354,9 @@ typedef struct PrivateRefCountEntry
  * Status of buffers to checkpoint for a particular tablespace, used
  * internally in BufferSync.
  */
-typedef struct CkptTsStatus
-{
+typedef struct CkptTsStatus {
 	/* oid of the tablespace */
-	Oid			tsId;
+	Oid tsId;
 
 	/*
 	 * Checkpoint progress for this tablespace. To make progress comparable
@@ -2422,16 +2365,16 @@ typedef struct CkptTsStatus
 	 * page checkpointed in this tablespace increments this space's progress
 	 * by progress_slice.
 	 */
-	float8		progress;
-	float8		progress_slice;
+	float8 progress;
+	float8 progress_slice;
 
 	/* number of to-be checkpointed pages in this tablespace */
-	int			num_to_scan;
+	int num_to_scan;
 	/* already processed pages in this tablespace */
-	int			num_scanned;
+	int num_scanned;
 
 	/* current offset in CkptBufferIds for this tablespace */
-	int			index;
+	int index;
 } CkptTsStatus;
 
 /*
@@ -2441,17 +2384,16 @@ typedef struct CkptTsStatus
  * DropRelationsAllBuffers. Pointer to this struct and RelFileLocator must be
  * compatible.
  */
-typedef struct SMgrSortArray
-{
-	RelFileLocator rlocator;	/* This must be the first member */
+typedef struct SMgrSortArray {
+	RelFileLocator rlocator; /* This must be the first member */
 	SMgrRelation srel;
 } SMgrSortArray;
 
 /* GUC variables */
-bool		zero_damaged_pages = false;
-int			bgwriter_lru_maxpages = 100;
-double		bgwriter_lru_multiplier = 2.0;
-bool		track_io_timing = false;
+bool zero_damaged_pages = false;
+int bgwriter_lru_maxpages = 100;
+double bgwriter_lru_multiplier = 2.0;
+bool track_io_timing = false;
 
 /*
  * How many buffers PrefetchBuffer callers should try to stay ahead of their
@@ -2459,22 +2401,22 @@ bool		track_io_timing = false;
  * for buffers not belonging to tablespaces that have their
  * effective_io_concurrency parameter set.
  */
-int			effective_io_concurrency = DEFAULT_EFFECTIVE_IO_CONCURRENCY;
+int effective_io_concurrency = DEFAULT_EFFECTIVE_IO_CONCURRENCY;
 
 /*
  * Like effective_io_concurrency, but used by maintenance code paths that might
  * benefit from a higher setting because they work on behalf of many sessions.
  * Overridden by the tablespace setting of the same name.
  */
-int			maintenance_io_concurrency = DEFAULT_MAINTENANCE_IO_CONCURRENCY;
+int maintenance_io_concurrency = DEFAULT_MAINTENANCE_IO_CONCURRENCY;
 
 /*
  * GUC variables about triggering kernel writeback for buffers written; OS
  * dependent defaults are set via the GUC mechanism.
  */
-int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
-int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
-int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+int checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
+int bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
+int backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
@@ -2538,16 +2480,14 @@ ReservePrivateRefCountEntry(void)
 	 * majority of cases.
 	 */
 	{
-		int			i;
+		int i;
 
-		for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++)
-		{
+		for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++) {
 			PrivateRefCountEntry *res;
 
 			res = &PrivateRefCountArray[i];
 
-			if (res->buffer == InvalidBuffer)
-			{
+			if (res->buffer == InvalidBuffer) {
 				ReservedRefCountEntry = res;
 				return;
 			}
@@ -2564,19 +2504,17 @@ ReservePrivateRefCountEntry(void)
 		 * hashtable. Use that slot.
 		 */
 		PrivateRefCountEntry *hashent;
-		bool		found;
+		bool found;
 
 		/* select victim slot */
-		ReservedRefCountEntry =
-			&PrivateRefCountArray[PrivateRefCountClock++ % REFCOUNT_ARRAY_ENTRIES];
+		ReservedRefCountEntry
+			= &PrivateRefCountArray[PrivateRefCountClock++ % REFCOUNT_ARRAY_ENTRIES];
 
 		/* Better be used, otherwise we shouldn't get here. */
 		Assert(ReservedRefCountEntry->buffer != InvalidBuffer);
 
 		/* enter victim array entry into hashtable */
-		hashent = hash_search(PrivateRefCountHash,
-							  &(ReservedRefCountEntry->buffer),
-							  HASH_ENTER,
+		hashent = hash_search(PrivateRefCountHash, &(ReservedRefCountEntry->buffer), HASH_ENTER,
 							  &found);
 		Assert(!found);
 		hashent->refcount = ReservedRefCountEntry->refcount;
@@ -2622,7 +2560,7 @@ static PrivateRefCountEntry *
 GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 {
 	PrivateRefCountEntry *res;
-	int			i;
+	int i;
 
 	Assert(BufferIsValid(buffer));
 	Assert(!BufferIsLocal(buffer));
@@ -2631,8 +2569,7 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 	 * First search for references in the array, that'll be sufficient in the
 	 * majority of cases.
 	 */
-	for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++)
-	{
+	for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++) {
 		res = &PrivateRefCountArray[i];
 
 		if (res->buffer == buffer)
@@ -2653,15 +2590,12 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 
 	if (res == NULL)
 		return NULL;
-	else if (!do_move)
-	{
+	else if (!do_move) {
 		/* caller doesn't want us to move the hash entry into the array */
 		return res;
-	}
-	else
-	{
+	} else {
 		/* move buffer from hashtable into the free array slot */
-		bool		found;
+		bool found;
 		PrivateRefCountEntry *free;
 
 		/* Ensure there's a free array slot */
@@ -2720,9 +2654,7 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 {
 	Assert(ref->refcount == 0);
 
-	if (ref >= &PrivateRefCountArray[0] &&
-		ref < &PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES])
-	{
+	if (ref >= &PrivateRefCountArray[0] && ref < &PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES]) {
 		ref->buffer = InvalidBuffer;
 
 		/*
@@ -2731,11 +2663,9 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 		 * entries.
 		 */
 		ReservedRefCountEntry = ref;
-	}
-	else
-	{
-		bool		found;
-		Buffer		buffer = ref->buffer;
+	} else {
+		bool found;
+		Buffer buffer = ref->buffer;
 
 		hash_search(PrivateRefCountHash, &buffer, HASH_REMOVE, &found);
 		Assert(found);
@@ -2751,38 +2681,23 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
  *		NOTE: what we check here is that *this* backend holds a pin on
  *		the buffer.  We do not care whether some other backend does.
  */
-#define BufferIsPinned(bufnum) \
-( \
-	!BufferIsValid(bufnum) ? \
-		false \
-	: \
-		BufferIsLocal(bufnum) ? \
-			(LocalRefCount[-(bufnum) - 1] > 0) \
-		: \
-	(GetPrivateRefCount(bufnum) > 0) \
-)
+#define BufferIsPinned(bufnum)                                                                     \
+	(!BufferIsValid(bufnum)	 ? false                                                               \
+	 : BufferIsLocal(bufnum) ? (LocalRefCount[-(bufnum) - 1] > 0)                                  \
+							 : (GetPrivateRefCount(bufnum) > 0))
 
 
-static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence,
-								ForkNumber forkNum, BlockNumber blockNum,
-								ReadBufferMode mode, BufferAccessStrategy strategy,
-								bool *hit);
-static BlockNumber ExtendBufferedRelCommon(BufferManagerRelation bmr,
-										   ForkNumber fork,
-										   BufferAccessStrategy strategy,
-										   uint32 flags,
-										   uint32 extend_by,
-										   BlockNumber extend_upto,
-										   Buffer *buffers,
-										   uint32 *extended_by);
-static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
-										   ForkNumber fork,
-										   BufferAccessStrategy strategy,
-										   uint32 flags,
-										   uint32 extend_by,
-										   BlockNumber extend_upto,
-										   Buffer *buffers,
-										   uint32 *extended_by);
+static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+								BlockNumber blockNum, ReadBufferMode mode,
+								BufferAccessStrategy strategy, bool *hit);
+static BlockNumber ExtendBufferedRelCommon(BufferManagerRelation bmr, ForkNumber fork,
+										   BufferAccessStrategy strategy, uint32 flags,
+										   uint32 extend_by, BlockNumber extend_upto,
+										   Buffer *buffers, uint32 *extended_by);
+static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork,
+										   BufferAccessStrategy strategy, uint32 flags,
+										   uint32 extend_by, BlockNumber extend_upto,
+										   Buffer *buffers, uint32 *extended_by);
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
@@ -2800,12 +2715,10 @@ extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
 extern bool cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag);
 #endif
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
-static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
-						  WritebackContext *wb_context);
+static int SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
 static bool StartBufferIO(BufferDesc *buf, bool forInput);
-static void TerminateBufferIO(BufferDesc *buf, bool clear_dirty,
-							  uint32 set_flag_bits);
+static void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
 static void shared_buffer_write_error_callback(void *arg);
 static void local_buffer_write_error_callback(void *arg);
 
@@ -2814,56 +2727,46 @@ static void local_buffer_write_error_callback(void *arg);
 static bool InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 										 LWLock *oldPartitionLock, uint32 buf_state);
 static void InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
-										 LWLock *oldPartitionLock, uint32 buf_state,
-										 uint8 old_pcm_mode, bool release_pcm_holder);
+											 LWLock *oldPartitionLock, uint32 buf_state,
+											 uint8 old_pcm_mode, bool release_pcm_holder);
 static bool InvalidateBufferTry(BufferDesc *buf);
-static BufferDesc *BufferAlloc(SMgrRelation smgr,
-							   char relpersistence,
-							   ForkNumber forkNum,
-							   BlockNumber blockNum,
-							   BufferAccessStrategy strategy,
-							   bool *foundPtr, IOContext io_context);
+static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+							   BlockNumber blockNum, BufferAccessStrategy strategy, bool *foundPtr,
+							   IOContext io_context);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
-static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
-static void FindAndDropRelationBuffers(RelFileLocator rlocator,
-									   ForkNumber forkNum,
-									   BlockNumber nForkBlock,
-									   BlockNumber firstDelBlock);
-static void RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
-										   RelFileLocator dstlocator,
+static void FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+						IOContext io_context);
+static void FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
+									   BlockNumber nForkBlock, BlockNumber firstDelBlock);
+static void RelationCopyStorageUsingBuffer(RelFileLocator srclocator, RelFileLocator dstlocator,
 										   ForkNumber forkNum, bool permanent);
 static void AtProcExit_Buffers(int code, Datum arg);
 static void CheckForBufferLeaks(void);
 #ifdef USE_ASSERT_CHECKING
-static void AssertNotCatalogBufferLock(LWLock *lock, LWLockMode mode,
-									   void *unused_context);
+static void AssertNotCatalogBufferLock(LWLock *lock, LWLockMode mode, void *unused_context);
 #endif
-static int	rlocator_comparator(const void *p1, const void *p2);
+static int rlocator_comparator(const void *p1, const void *p2);
 static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
-static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
+static int ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
 
 /*
  * Implementation of PrefetchBuffer() for shared buffers.
  */
 PrefetchBufferResult
-PrefetchSharedBuffer(SMgrRelation smgr_reln,
-					 ForkNumber forkNum,
-					 BlockNumber blockNum)
+PrefetchSharedBuffer(SMgrRelation smgr_reln, ForkNumber forkNum, BlockNumber blockNum)
 {
-	PrefetchBufferResult result = {InvalidBuffer, false};
-	BufferTag	newTag;			/* identity of requested block */
-	uint32		newHash;		/* hash value for newTag */
-	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
-	int			buf_id;
+	PrefetchBufferResult result = { InvalidBuffer, false };
+	BufferTag newTag;		  /* identity of requested block */
+	uint32 newHash;			  /* hash value for newTag */
+	LWLock *newPartitionLock; /* buffer partition lock for it */
+	int buf_id;
 
 	Assert(BlockNumberIsValid(blockNum));
 
 	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr_reln->smgr_rlocator.locator,
-				  forkNum, blockNum);
+	InitBufferTag(&newTag, &smgr_reln->smgr_rlocator.locator, forkNum, blockNum);
 
 	/* determine its hash code and partition lock ID */
 	newHash = BufTableHashCode(&newTag);
@@ -2875,22 +2778,17 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 	LWLockRelease(newPartitionLock);
 
 	/* If not in buffers, initiate prefetch */
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 #ifdef USE_PREFETCH
 		/*
 		 * Try to initiate an asynchronous read.  This returns false in
 		 * recovery if the relation file doesn't exist.
 		 */
-		if ((io_direct_flags & IO_DIRECT_DATA) == 0 &&
-			smgrprefetch(smgr_reln, forkNum, blockNum))
-		{
+		if ((io_direct_flags & IO_DIRECT_DATA) == 0 && smgrprefetch(smgr_reln, forkNum, blockNum)) {
 			result.initiated_io = true;
 		}
-#endif							/* USE_PREFETCH */
-	}
-	else
-	{
+#endif /* USE_PREFETCH */
+	} else {
 		/*
 		 * Report the buffer it was in at that time.  The caller may be able
 		 * to avoid a buffer table lookup, but it's not pinned and it must be
@@ -2944,19 +2842,15 @@ PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
 	Assert(RelationIsValid(reln));
 	Assert(BlockNumberIsValid(blockNum));
 
-	if (RelationUsesLocalBuffers(reln))
-	{
+	if (RelationUsesLocalBuffers(reln)) {
 		/* see comments in ReadBufferExtended */
 		if (RELATION_IS_OTHER_TEMP(reln))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot access temporary tables of other sessions")));
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot access temporary tables of other sessions")));
 
 		/* pass it off to localbuf.c */
 		return PrefetchLocalBuffer(RelationGetSmgr(reln), forkNum, blockNum);
-	}
-	else
-	{
+	} else {
 		/* pass it to the shared buffer version */
 		return PrefetchSharedBuffer(RelationGetSmgr(reln), forkNum, blockNum);
 	}
@@ -2974,9 +2868,9 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 				 Buffer recent_buffer)
 {
 	BufferDesc *bufHdr;
-	BufferTag	tag;
-	uint32		buf_state;
-	bool		have_private_ref;
+	BufferTag tag;
+	uint32 buf_state;
+	bool have_private_ref;
 
 	Assert(BufferIsValid(recent_buffer));
 
@@ -2984,25 +2878,21 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	ReservePrivateRefCountEntry();
 	InitBufferTag(&tag, &rlocator, forkNum, blockNum);
 
-	if (BufferIsLocal(recent_buffer))
-	{
-		int			b = -recent_buffer - 1;
+	if (BufferIsLocal(recent_buffer)) {
+		int b = -recent_buffer - 1;
 
 		bufHdr = GetLocalBufferDescriptor(b);
 		buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 		/* Is it still valid and holding the right tag? */
-		if ((buf_state & BM_VALID) && BufferTagsEqual(&tag, &bufHdr->tag))
-		{
+		if ((buf_state & BM_VALID) && BufferTagsEqual(&tag, &bufHdr->tag)) {
 			PinLocalBuffer(bufHdr, true);
 
 			pgBufferUsage.local_blks_hit++;
 
 			return true;
 		}
-	}
-	else
-	{
+	} else {
 		bufHdr = GetBufferDescriptor(recent_buffer - 1);
 		have_private_ref = GetPrivateRefCount(recent_buffer) > 0;
 
@@ -3016,17 +2906,16 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 		else
 			buf_state = LockBufHdr(bufHdr);
 
-		if ((buf_state & BM_VALID) && BufferTagsEqual(&tag, &bufHdr->tag))
-		{
+		if ((buf_state & BM_VALID) && BufferTagsEqual(&tag, &bufHdr->tag)) {
 			/*
 			 * It's now safe to pin the buffer.  We can't pin first and ask
 			 * questions later, because it might confuse code paths like
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
 			if (have_private_ref)
-				PinBuffer(bufHdr, NULL);	/* bump pin count */
+				PinBuffer(bufHdr, NULL); /* bump pin count */
 			else
-				PinBuffer_Locked(bufHdr);	/* pin for first time */
+				PinBuffer_Locked(bufHdr); /* pin for first time */
 
 			pgBufferUsage.shared_blks_hit++;
 
@@ -3093,11 +2982,11 @@ ReadBuffer(Relation reln, BlockNumber blockNum)
  * See buffer/README for details.
  */
 Buffer
-ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
-				   ReadBufferMode mode, BufferAccessStrategy strategy)
+ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum, ReadBufferMode mode,
+				   BufferAccessStrategy strategy)
 {
-	bool		hit;
-	Buffer		buf;
+	bool hit;
+	Buffer buf;
 
 	/*
 	 * Reject attempts to read non-local temporary relations; we would be
@@ -3105,9 +2994,8 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 	 * session's local buffers.
 	 */
 	if (RELATION_IS_OTHER_TEMP(reln))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot access temporary tables of other sessions")));
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot access temporary tables of other sessions")));
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -3118,15 +3006,12 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 	 * hint by exact BufferTag match.  Profiling-only, GUC-gated inside the
 	 * setter, no behavior change.
 	 */
-	if (unlikely(cluster_xnode_profile_enabled) &&
-		blockNum != P_NEW &&
-		!RelationUsesLocalBuffers(reln))
-	{
-		BufferTag	xp_tag;
+	if (unlikely(cluster_xnode_profile_enabled) && blockNum != P_NEW
+		&& !RelationUsesLocalBuffers(reln)) {
+		BufferTag xp_tag;
 
 		InitBufferTag(&xp_tag, &reln->rd_locator, forkNum, blockNum);
-		cluster_xp_relkind_hint_set(&xp_tag,
-									reln->rd_rel->relkind == RELKIND_INDEX);
+		cluster_xp_relkind_hint_set(&xp_tag, reln->rd_rel->relkind == RELKIND_INDEX);
 	}
 #endif
 
@@ -3135,8 +3020,8 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 	 * miss.
 	 */
 	pgstat_count_buffer_read(reln);
-	buf = ReadBuffer_common(RelationGetSmgr(reln), reln->rd_rel->relpersistence,
-							forkNum, blockNum, mode, strategy, &hit);
+	buf = ReadBuffer_common(RelationGetSmgr(reln), reln->rd_rel->relpersistence, forkNum, blockNum,
+							mode, strategy, &hit);
 	if (hit)
 		pgstat_count_buffer_hit(reln);
 	return buf;
@@ -3154,33 +3039,28 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
  * BackendId).
  */
 Buffer
-ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum,
-						  BlockNumber blockNum, ReadBufferMode mode,
-						  BufferAccessStrategy strategy, bool permanent)
+ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockNum,
+						  ReadBufferMode mode, BufferAccessStrategy strategy, bool permanent)
 {
-	bool		hit;
+	bool hit;
 
 	SMgrRelation smgr = smgropen(rlocator, InvalidBackendId);
 
-	return ReadBuffer_common(smgr, permanent ? RELPERSISTENCE_PERMANENT :
-							 RELPERSISTENCE_UNLOGGED, forkNum, blockNum,
-							 mode, strategy, &hit);
+	return ReadBuffer_common(smgr, permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED,
+							 forkNum, blockNum, mode, strategy, &hit);
 }
 
 /*
  * Convenience wrapper around ExtendBufferedRelBy() extending by one block.
  */
 Buffer
-ExtendBufferedRel(BufferManagerRelation bmr,
-				  ForkNumber forkNum,
-				  BufferAccessStrategy strategy,
+ExtendBufferedRel(BufferManagerRelation bmr, ForkNumber forkNum, BufferAccessStrategy strategy,
 				  uint32 flags)
 {
-	Buffer		buf;
-	uint32		extend_by = 1;
+	Buffer buf;
+	uint32 extend_by = 1;
 
-	ExtendBufferedRelBy(bmr, forkNum, strategy, flags, extend_by,
-						&buf, &extend_by);
+	ExtendBufferedRelBy(bmr, forkNum, strategy, flags, extend_by, &buf, &extend_by);
 
 	return buf;
 }
@@ -3203,26 +3083,19 @@ ExtendBufferedRel(BufferManagerRelation bmr,
  * be empty.
  */
 BlockNumber
-ExtendBufferedRelBy(BufferManagerRelation bmr,
-					ForkNumber fork,
-					BufferAccessStrategy strategy,
-					uint32 flags,
-					uint32 extend_by,
-					Buffer *buffers,
-					uint32 *extended_by)
+ExtendBufferedRelBy(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+					uint32 flags, uint32 extend_by, Buffer *buffers, uint32 *extended_by)
 {
 	Assert((bmr.rel != NULL) != (bmr.smgr != NULL));
 	Assert(bmr.smgr == NULL || bmr.relpersistence != 0);
 	Assert(extend_by > 0);
 
-	if (bmr.smgr == NULL)
-	{
+	if (bmr.smgr == NULL) {
 		bmr.smgr = RelationGetSmgr(bmr.rel);
 		bmr.relpersistence = bmr.rel->rd_rel->relpersistence;
 	}
 
-	return ExtendBufferedRelCommon(bmr, fork, strategy, flags,
-								   extend_by, InvalidBlockNumber,
+	return ExtendBufferedRelCommon(bmr, fork, strategy, flags, extend_by, InvalidBlockNumber,
 								   buffers, extended_by);
 }
 
@@ -3235,24 +3108,19 @@ ExtendBufferedRelBy(BufferManagerRelation bmr,
  * crash recovery).
  */
 Buffer
-ExtendBufferedRelTo(BufferManagerRelation bmr,
-					ForkNumber fork,
-					BufferAccessStrategy strategy,
-					uint32 flags,
-					BlockNumber extend_to,
-					ReadBufferMode mode)
+ExtendBufferedRelTo(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+					uint32 flags, BlockNumber extend_to, ReadBufferMode mode)
 {
 	BlockNumber current_size;
-	uint32		extended_by = 0;
-	Buffer		buffer = InvalidBuffer;
-	Buffer		buffers[64];
+	uint32 extended_by = 0;
+	Buffer buffer = InvalidBuffer;
+	Buffer buffers[64];
 
 	Assert((bmr.rel != NULL) != (bmr.smgr != NULL));
 	Assert(bmr.smgr == NULL || bmr.relpersistence != 0);
 	Assert(extend_to != InvalidBlockNumber && extend_to > 0);
 
-	if (bmr.smgr == NULL)
-	{
+	if (bmr.smgr == NULL) {
 		bmr.smgr = RelationGetSmgr(bmr.rel);
 		bmr.relpersistence = bmr.rel->rd_rel->relpersistence;
 	}
@@ -3262,11 +3130,10 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	 * smgr_cached_nblocks[fork] is positive then it must exist, no need for
 	 * an smgrexists call.
 	 */
-	if ((flags & EB_CREATE_FORK_IF_NEEDED) &&
-		(bmr.smgr->smgr_cached_nblocks[fork] == 0 ||
-		 bmr.smgr->smgr_cached_nblocks[fork] == InvalidBlockNumber) &&
-		!smgrexists(bmr.smgr, fork))
-	{
+	if ((flags & EB_CREATE_FORK_IF_NEEDED)
+		&& (bmr.smgr->smgr_cached_nblocks[fork] == 0
+			|| bmr.smgr->smgr_cached_nblocks[fork] == InvalidBlockNumber)
+		&& !smgrexists(bmr.smgr, fork)) {
 		LockRelationForExtension(bmr.rel, ExclusiveLock);
 
 		/* could have been closed while waiting for lock */
@@ -3302,23 +3169,20 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
 		flags |= EB_LOCK_TARGET;
 
-	while (current_size < extend_to)
-	{
-		uint32		num_pages = lengthof(buffers);
+	while (current_size < extend_to) {
+		uint32 num_pages = lengthof(buffers);
 		BlockNumber first_block;
 
-		if ((uint64) current_size + num_pages > extend_to)
+		if ((uint64)current_size + num_pages > extend_to)
 			num_pages = extend_to - current_size;
 
-		first_block = ExtendBufferedRelCommon(bmr, fork, strategy, flags,
-											  num_pages, extend_to,
+		first_block = ExtendBufferedRelCommon(bmr, fork, strategy, flags, num_pages, extend_to,
 											  buffers, &extended_by);
 
 		current_size = first_block + extended_by;
 		Assert(num_pages != 0 || current_size >= extend_to);
 
-		for (int i = 0; i < extended_by; i++)
-		{
+		for (int i = 0; i < extended_by; i++) {
 			if (first_block + i != extend_to - 1)
 				ReleaseBuffer(buffers[i]);
 			else
@@ -3332,14 +3196,12 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	 *
 	 * XXX: Should we control this via a flag?
 	 */
-	if (buffer == InvalidBuffer)
-	{
-		bool		hit;
+	if (buffer == InvalidBuffer) {
+		bool hit;
 
 		Assert(extended_by == 0);
-		buffer = ReadBuffer_common(bmr.smgr, bmr.relpersistence,
-								   fork, extend_to - 1, mode, strategy,
-								   &hit);
+		buffer = ReadBuffer_common(bmr.smgr, bmr.relpersistence, fork, extend_to - 1, mode,
+								   strategy, &hit);
 	}
 
 	return buffer;
@@ -3351,16 +3213,15 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
  * *hit is set to true if the request was satisfied from shared buffer cache.
  */
 static Buffer
-ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
-				  BlockNumber blockNum, ReadBufferMode mode,
-				  BufferAccessStrategy strategy, bool *hit)
+ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
+				  ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit)
 {
 	BufferDesc *bufHdr;
-	Block		bufBlock;
-	bool		found;
-	IOContext	io_context;
-	IOObject	io_object;
-	bool		isLocalBuf = SmgrIsTemp(smgr);
+	Block bufBlock;
+	bool found;
+	IOContext io_context;
+	IOObject io_object;
+	bool isLocalBuf = SmgrIsTemp(smgr);
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPcmDirectInitProof direct_init_proof;
 #endif
@@ -3372,9 +3233,8 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * instead, as acquiring the extension lock inside ExtendBufferedRel()
 	 * scales a lot better.
 	 */
-	if (unlikely(blockNum == P_NEW))
-	{
-		uint32		flags = EB_SKIP_EXTENSION_LOCK;
+	if (unlikely(blockNum == P_NEW)) {
+		uint32 flags = EB_SKIP_EXTENSION_LOCK;
 
 		/*
 		 * Since no-one else can be looking at the page contents yet, there is
@@ -3384,21 +3244,17 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
 			flags |= EB_LOCK_FIRST;
 
-		return ExtendBufferedRel(BMR_SMGR(smgr, relpersistence),
-								 forkNum, strategy, flags);
+		return ExtendBufferedRel(BMR_SMGR(smgr, relpersistence), forkNum, strategy, flags);
 	}
 
 	/* Make sure we will have room to remember the buffer pin */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum,
-									   smgr->smgr_rlocator.locator.spcOid,
-									   smgr->smgr_rlocator.locator.dbOid,
-									   smgr->smgr_rlocator.locator.relNumber,
-									   smgr->smgr_rlocator.backend);
+	TRACE_POSTGRESQL_BUFFER_READ_START(
+		forkNum, blockNum, smgr->smgr_rlocator.locator.spcOid, smgr->smgr_rlocator.locator.dbOid,
+		smgr->smgr_rlocator.locator.relNumber, smgr->smgr_rlocator.backend);
 
-	if (isLocalBuf)
-	{
+	if (isLocalBuf) {
 		/*
 		 * We do not use a BufferAccessStrategy for I/O of temporary tables.
 		 * However, in some cases, the "strategy" may not be NULL, so we can't
@@ -3410,24 +3266,19 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, &found);
 		if (found)
 			pgBufferUsage.local_blks_hit++;
-		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
-				 mode == RBM_ZERO_ON_ERROR)
+		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG || mode == RBM_ZERO_ON_ERROR)
 			pgBufferUsage.local_blks_read++;
-	}
-	else
-	{
+	} else {
 		/*
 		 * lookup the buffer.  IO_IN_PROGRESS is set if the requested block is
 		 * not currently in memory.
 		 */
 		io_context = IOContextForStrategy(strategy);
 		io_object = IOOBJECT_RELATION;
-		bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum,
-							 strategy, &found, io_context);
+		bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum, strategy, &found, io_context);
 		if (found)
 			pgBufferUsage.shared_blks_hit++;
-		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
-				 mode == RBM_ZERO_ON_ERROR)
+		else if (mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG || mode == RBM_ZERO_ON_ERROR)
 			pgBufferUsage.shared_blks_read++;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3439,10 +3290,8 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * transfer -- the cache-locality signal the A-L9 observability leg
 		 * watches.
 		 */
-		if (cluster_shared_catalog &&
-			smgr->smgr_rlocator.locator.relNumber <
-			(RelFileNumber) FirstNormalObjectId)
-		{
+		if (cluster_shared_catalog
+			&& smgr->smgr_rlocator.locator.relNumber < (RelFileNumber)FirstNormalObjectId) {
 			if (found)
 				cluster_catalog_stats_buf_hit_inc();
 			else
@@ -3454,8 +3303,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	/* At this point we do NOT hold any locks. */
 
 	/* if it was already in the buffer pool, we're done */
-	if (found)
-	{
+	if (found) {
 		/* Just need to update stats before we exit */
 		*hit = true;
 		VacuumPageHit++;
@@ -3464,19 +3312,16 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		if (VacuumCostActive)
 			VacuumCostBalance += VacuumCostPageHit;
 
-		TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
-										  smgr->smgr_rlocator.locator.spcOid,
+		TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum, smgr->smgr_rlocator.locator.spcOid,
 										  smgr->smgr_rlocator.locator.dbOid,
 										  smgr->smgr_rlocator.locator.relNumber,
-										  smgr->smgr_rlocator.backend,
-										  found);
+										  smgr->smgr_rlocator.backend, found);
 
 		/*
 		 * In RBM_ZERO_AND_LOCK mode the caller expects the page to be locked
 		 * on return.
 		 */
-		if (!isLocalBuf)
-		{
+		if (!isLocalBuf) {
 			if (mode == RBM_ZERO_AND_LOCK)
 				LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_EXCLUSIVE);
 			else if (mode == RBM_ZERO_AND_CLEANUP_LOCK)
@@ -3491,7 +3336,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * page but its contents are not yet valid.  IO_IN_PROGRESS is set for it,
 	 * if it's a shared buffer.
 	 */
-	Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID));	/* spinlock not needed */
+	Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
 
 	bufBlock = isLocalBuf ? LocalBufHdrGetBlock(bufHdr) : BufHdrGetBlock(bufHdr);
 
@@ -3499,28 +3344,24 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * Read in the page, unless the caller intends to overwrite it and just
 	 * wants us to allocate a buffer.
 	 */
-	if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
-	{
-		MemSet((char *) bufBlock, 0, BLCKSZ);
+	if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) {
+		MemSet((char *)bufBlock, 0, BLCKSZ);
 #ifdef USE_PGRAC_CLUSTER
 		if (!isLocalBuf)
-			cluster_bufmgr_pcm_arm_direct_init(
-				bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
+			cluster_bufmgr_pcm_arm_direct_init(bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+											   &direct_init_proof);
 #endif
-	}
-	else
-	{
-		instr_time	io_start = pgstat_prepare_io_time();
-		bool		verified;
+	} else {
+		instr_time io_start = pgstat_prepare_io_time();
+		bool verified;
 
 		smgrread(smgr, forkNum, blockNum, bufBlock);
 
-		pgstat_count_io_op_time(io_object, io_context,
-								IOOP_READ, io_start, 1);
+		pgstat_count_io_op_time(io_object, io_context, IOOP_READ, io_start, 1);
 
 		/* check for garbage data */
-		verified = PageIsVerifiedExtended((Page) bufBlock, blockNum,
-										  PIV_LOG_WARNING | PIV_REPORT_STAT);
+		verified
+			= PageIsVerifiedExtended((Page)bufBlock, blockNum, PIV_LOG_WARNING | PIV_REPORT_STAT);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -3538,34 +3379,27 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * ignore_checksum_failure's "return the page as-is" remains the
 		 * fallback (verified stays true).
 		 */
-		if (!verified)
-		{
+		if (!verified) {
 			if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
-				&& cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock))
+				&& cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *)bufBlock))
 				verified = true;
-		}
-		else if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
-				 && ignore_checksum_failure && cluster_online_block_recovery
-				 && cluster_block_recovery_checksum_mismatch((char *) bufBlock, blockNum))
-		{
-			(void) cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock);
+		} else if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
+				   && ignore_checksum_failure && cluster_online_block_recovery
+				   && cluster_block_recovery_checksum_mismatch((char *)bufBlock, blockNum)) {
+			(void)cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *)bufBlock);
 		}
 #endif
 
-		if (!verified)
-		{
-			if (mode == RBM_ZERO_ON_ERROR || zero_damaged_pages)
-			{
+		if (!verified) {
+			if (mode == RBM_ZERO_ON_ERROR || zero_damaged_pages) {
 				ereport(WARNING,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("invalid page in block %u of relation %s; zeroing out page",
-								blockNum,
-								relpath(smgr->smgr_rlocator, forkNum))));
-				MemSet((char *) bufBlock, 0, BLCKSZ);
+								blockNum, relpath(smgr->smgr_rlocator, forkNum))));
+				MemSet((char *)bufBlock, 0, BLCKSZ);
 			}
 #ifdef USE_PGRAC_CLUSTER
-			else if (cluster_online_block_recovery)
-			{
+			else if (cluster_online_block_recovery) {
 				/*
 				 * Online recovery on but the block could not be rebuilt.
 				 * PANIC escalation (operator opt-in) is restricted to the
@@ -3573,14 +3407,14 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 				 * reconstructible from scratch, so an unrebuildable one
 				 * should fail the query (ERROR), not crash the instance.
 				 */
-				int			elevel = (cluster_block_recovery_on_unrecoverable == CLUSTER_BLKREC_ACTION_PANIC
-									  && forkNum == MAIN_FORKNUM)
-					? PANIC : ERROR;
+				int elevel = (cluster_block_recovery_on_unrecoverable == CLUSTER_BLKREC_ACTION_PANIC
+							  && forkNum == MAIN_FORKNUM)
+								 ? PANIC
+								 : ERROR;
 
 				ereport(elevel,
 						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid page in block %u of relation %s",
-								blockNum,
+						 errmsg("invalid page in block %u of relation %s", blockNum,
 								relpath(smgr->smgr_rlocator, forkNum)),
 						 errhint("online block recovery could not rebuild this block from WAL "
 								 "(no full-page-image base in retained WAL, an unsupported "
@@ -3588,11 +3422,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			}
 #endif
 			else
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid page in block %u of relation %s",
-								blockNum,
-								relpath(smgr->smgr_rlocator, forkNum))));
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("invalid page in block %u of relation %s", blockNum,
+									   relpath(smgr->smgr_rlocator, forkNum))));
 		}
 	}
 
@@ -3607,26 +3439,21 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * that we cannot use LockBuffer() or LockBufferForCleanup() here, because
 	 * they assert that the buffer is already valid.)
 	 */
-	if ((mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) &&
-		!isLocalBuf)
-	{
+	if ((mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) && !isLocalBuf) {
 #ifdef USE_PGRAC_CLUSTER
-		cluster_bufmgr_pcm_gate_direct_init(
-			bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
+		cluster_bufmgr_pcm_gate_direct_init(bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+											&direct_init_proof);
 #endif
 		LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
 	}
 
-	if (isLocalBuf)
-	{
+	if (isLocalBuf) {
 		/* Only need to adjust flags */
-		uint32		buf_state = pg_atomic_read_u32(&bufHdr->state);
+		uint32 buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 		buf_state |= BM_VALID;
 		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
-	}
-	else
-	{
+	} else {
 		/* Set BM_VALID, terminate IO, and wake up any waiters */
 		TerminateBufferIO(bufHdr, false, BM_VALID);
 	}
@@ -3635,12 +3462,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if (VacuumCostActive)
 		VacuumCostBalance += VacuumCostPageMiss;
 
-	TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
-									  smgr->smgr_rlocator.locator.spcOid,
-									  smgr->smgr_rlocator.locator.dbOid,
-									  smgr->smgr_rlocator.locator.relNumber,
-									  smgr->smgr_rlocator.backend,
-									  found);
+	TRACE_POSTGRESQL_BUFFER_READ_DONE(
+		forkNum, blockNum, smgr->smgr_rlocator.locator.spcOid, smgr->smgr_rlocator.locator.dbOid,
+		smgr->smgr_rlocator.locator.relNumber, smgr->smgr_rlocator.backend, found);
 
 	return BufferDescriptorGetBuffer(bufHdr);
 }
@@ -3669,18 +3493,16 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
  * No locks are held either at entry or exit.
  */
 static BufferDesc *
-BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
-			BlockNumber blockNum,
-			BufferAccessStrategy strategy,
-			bool *foundPtr, IOContext io_context)
+BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
+			BufferAccessStrategy strategy, bool *foundPtr, IOContext io_context)
 {
-	BufferTag	newTag;			/* identity of requested block */
-	uint32		newHash;		/* hash value for newTag */
-	LWLock	   *newPartitionLock;	/* buffer partition lock for it */
-	int			existing_buf_id;
-	Buffer		victim_buffer;
+	BufferTag newTag;		  /* identity of requested block */
+	uint32 newHash;			  /* hash value for newTag */
+	LWLock *newPartitionLock; /* buffer partition lock for it */
+	int existing_buf_id;
+	Buffer victim_buffer;
 	BufferDesc *victim_buf_hdr;
-	uint32		victim_buf_state;
+	uint32 victim_buf_state;
 
 	/* create a tag so we can lookup the buffer */
 	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
@@ -3692,10 +3514,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	/* see if the block is in the buffer pool already */
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
-	if (existing_buf_id >= 0)
-	{
+	if (existing_buf_id >= 0) {
 		BufferDesc *buf;
-		bool		valid;
+		bool valid;
 
 		/*
 		 * Found it.  Now, pin the buffer so no one can steal it from the
@@ -3711,8 +3532,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		*foundPtr = true;
 
-		if (!valid)
-		{
+		if (!valid) {
 			/*
 			 * We can only get here if (a) someone else is still reading in
 			 * the page, or (b) a previous read attempt failed.  We have to
@@ -3720,8 +3540,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			 * own read attempt if the page is still not BM_VALID.
 			 * StartBufferIO does it all.
 			 */
-			if (StartBufferIO(buf, true))
-			{
+			if (StartBufferIO(buf, true)) {
 				/*
 				 * If we get here, previous attempts to read the buffer must
 				 * have failed ... but we shall bravely try again.
@@ -3754,10 +3573,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 */
 	LWLockAcquire(newPartitionLock, LW_EXCLUSIVE);
 	existing_buf_id = BufTableInsert(&newTag, newHash, victim_buf_hdr->buf_id);
-	if (existing_buf_id >= 0)
-	{
+	if (existing_buf_id >= 0) {
 		BufferDesc *existing_buf_hdr;
-		bool		valid;
+		bool valid;
 
 		/*
 		 * Got a collision. Someone has already done what we were about to do.
@@ -3789,8 +3607,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		*foundPtr = true;
 
-		if (!valid)
-		{
+		if (!valid) {
 			/*
 			 * We can only get here if (a) someone else is still reading in
 			 * the page, or (b) a previous read attempt failed.  We have to
@@ -3798,8 +3615,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			 * own read attempt if the page is still not BM_VALID.
 			 * StartBufferIO does it all.
 			 */
-			if (StartBufferIO(existing_buf_hdr, true))
-			{
+			if (StartBufferIO(existing_buf_hdr, true)) {
 				/*
 				 * If we get here, previous attempts to read the buffer must
 				 * have failed ... but we shall bravely try again.
@@ -3882,10 +3698,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 static void
 InvalidateBuffer(BufferDesc *buf)
 {
-	BufferTag	oldTag;
-	uint32		oldHash;		/* hash value for oldTag */
-	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
-	uint32		buf_state;
+	BufferTag oldTag;
+	uint32 oldHash;			  /* hash value for oldTag */
+	LWLock *oldPartitionLock; /* buffer partition lock for it */
+	uint32 buf_state;
 
 	/* Save the original buffer tag before dropping the spinlock */
 	oldTag = buf->tag;
@@ -3914,8 +3730,7 @@ retry:
 	buf_state = LockBufHdr(buf);
 
 	/* If it's changed while we were waiting for lock, do nothing */
-	if (!BufferTagsEqual(&buf->tag, &oldTag))
-	{
+	if (!BufferTagsEqual(&buf->tag, &oldTag)) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(oldPartitionLock);
 		return;
@@ -3930,8 +3745,7 @@ retry:
 	 * yet done StartBufferIO, WaitIO will fall through and we'll effectively
 	 * be busy-looping here.)
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(oldPartitionLock);
 		/* safety check: should definitely not be our *own* pin */
@@ -3941,8 +3755,7 @@ retry:
 		goto retry;
 	}
 
-	if (!InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state))
-	{
+	if (!InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state)) {
 		pg_usleep(1000L);
 		goto retry;
 	}
@@ -3959,15 +3772,15 @@ retry:
  */
 static bool
 InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
-								 LWLock *oldPartitionLock, uint32 buf_state)
+							 LWLock *oldPartitionLock, uint32 buf_state)
 {
-	uint8		old_pcm_mode = 0;
-	bool		release_pcm_holder = false;
+	uint8 old_pcm_mode = 0;
+	bool release_pcm_holder = false;
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPcmOwnEvictionCapture eviction_capture;
 	ClusterPcmOwnResult eviction_result;
-	uint32		observed_flags = 0;
-	uint64		observed_generation = 0;
+	uint32 observed_flags = 0;
+	uint64 observed_generation = 0;
 
 	/*
 	 * D5a: descriptor reuse is an exact ownership-tuple commit.  Refuse to
@@ -3977,24 +3790,22 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 	 * succeed.
 	 */
 	cluster_pcm_own_eviction_capture_locked(buf, &eviction_capture);
-	eviction_result = cluster_pcm_own_eviction_commit_locked(
-		buf, &eviction_capture, &observed_generation, &observed_flags);
-	if (eviction_result != CLUSTER_PCM_OWN_OK)
-	{
+	eviction_result = cluster_pcm_own_eviction_commit_locked(buf, &eviction_capture,
+															 &observed_generation, &observed_flags);
+	if (eviction_result != CLUSTER_PCM_OWN_OK) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(oldPartitionLock);
 		if (eviction_result == CLUSTER_PCM_OWN_BUSY || eviction_result == CLUSTER_PCM_OWN_STALE)
 			return false;
-		cluster_pcm_own_report_bump_failure(buf, eviction_result,
-										observed_generation != 0 ? observed_generation
-																 : eviction_capture.generation,
-										observed_flags != 0 ? observed_flags : eviction_capture.flags,
-										"buffer eviction");
+		cluster_pcm_own_report_bump_failure(
+			buf, eviction_result,
+			observed_generation != 0 ? observed_generation : eviction_capture.generation,
+			observed_flags != 0 ? observed_flags : eviction_capture.flags, "buffer eviction");
 	}
 	old_pcm_mode = eviction_capture.pcm_state;
-	release_pcm_holder = cluster_pcm_is_active()
-		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(oldTag))
-		&& (old_pcm_mode == (uint8) PCM_LOCK_MODE_S || old_pcm_mode == (uint8) PCM_LOCK_MODE_X);
+	release_pcm_holder
+		= cluster_pcm_is_active() && cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(oldTag))
+		  && (old_pcm_mode == (uint8)PCM_LOCK_MODE_S || old_pcm_mode == (uint8)PCM_LOCK_MODE_X);
 #endif
 
 	InvalidateBufferCommitTailLocked(buf, oldTag, oldHash, oldPartitionLock, buf_state,
@@ -4012,10 +3823,10 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
  */
 static void
 InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
-								 LWLock *oldPartitionLock, uint32 buf_state,
-								 uint8 old_pcm_mode, bool release_pcm_holder)
+								 LWLock *oldPartitionLock, uint32 buf_state, uint8 old_pcm_mode,
+								 bool release_pcm_holder)
 {
-	uint32		oldFlags;
+	uint32 oldFlags;
 
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that
@@ -4032,7 +3843,7 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
 	 * inherit a stale BUF_TYPE_PI (the PI shape must stay reachable ONLY
 	 * through cluster_bufmgr_convert_to_pi_locked, or the D-h3 shadow stamp
 	 * could be paired with another residency's bytes). */
-	buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+	buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
 #endif
 	UnlockBufHdr(buf, buf_state);
 
@@ -4053,18 +3864,17 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
 	 * immutable capture avoids the old temporary tag restoration race.  On a
 	 * throwing release the buffer is absent from the mapping table but is not
 	 * yet reusable, which is the fail-closed state. */
-	if (release_pcm_holder)
-	{
+	if (release_pcm_holder) {
 		PG_TRY();
 		{
-			cluster_pcm_lock_release_saved_tag_for_eviction(*oldTag, (PcmLockMode) old_pcm_mode);
+			cluster_pcm_lock_release_saved_tag_for_eviction(*oldTag, (PcmLockMode)old_pcm_mode);
 		}
 		PG_CATCH();
 		{
 			elog(LOG,
 				 "cluster PCM saved-tag eviction release failed for buffer %d mode=%d; "
 				 "old mapping is removed and descriptor was not returned to the freelist",
-				 buf->buf_id, (int) old_pcm_mode);
+				 buf->buf_id, (int)old_pcm_mode);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -4095,10 +3905,10 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
 static bool
 InvalidateBufferTry(BufferDesc *buf)
 {
-	BufferTag	oldTag;
-	uint32		oldHash;		/* hash value for oldTag */
-	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
-	uint32		buf_state;
+	BufferTag oldTag;
+	uint32 oldHash;			  /* hash value for oldTag */
+	LWLock *oldPartitionLock; /* buffer partition lock for it */
+	uint32 buf_state;
 
 	/* Save the original buffer tag before dropping the spinlock */
 	oldTag = buf->tag;
@@ -4122,8 +3932,7 @@ InvalidateBufferTry(BufferDesc *buf)
 	 * deterministically.  Gated to GCS drops only — plain evictions must
 	 * not stall.  No lock is held across the sleep.
 	 */
-	if (cluster_bufmgr_in_gcs_drop
-		&& BufTagGetForkNum(&oldTag) == MAIN_FORKNUM)
+	if (cluster_bufmgr_in_gcs_drop && BufTagGetForkNum(&oldTag) == MAIN_FORKNUM)
 		CLUSTER_INJECTION_POINT("cluster-pcm-drop-prepin-window");
 #endif
 
@@ -4136,21 +3945,19 @@ InvalidateBufferTry(BufferDesc *buf)
 	buf_state = LockBufHdr(buf);
 
 	/* If it's changed while we were waiting for lock, do nothing */
-	if (!BufferTagsEqual(&buf->tag, &oldTag))
-	{
+	if (!BufferTagsEqual(&buf->tag, &oldTag)) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(oldPartitionLock);
 		return true;
 	}
 
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(oldPartitionLock);
 		/* safety check: should definitely not be our *own* pin */
 		if (GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0)
 			elog(ERROR, "buffer is pinned in InvalidateBufferTry");
-		return false;			/* foreign pin — caller parks / fail-closes */
+		return false; /* foreign pin — caller parks / fail-closes */
 	}
 
 	return InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state);
@@ -4168,10 +3975,10 @@ InvalidateBufferTry(BufferDesc *buf)
 static bool
 InvalidateVictimBuffer(BufferDesc *buf_hdr)
 {
-	uint32		buf_state;
-	uint32		hash;
-	LWLock	   *partition_lock;
-	BufferTag	tag;
+	uint32 buf_state;
+	uint32 hash;
+	LWLock *partition_lock;
+	BufferTag tag;
 
 	Assert(GetPrivateRefCount(BufferDescriptorGetBuffer(buf_hdr)) == 1);
 
@@ -4198,8 +4005,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	/* PCM-X retained images deliberately keep BM_VALID and may still have this
 	 * victim pin.  The live REVOKING token, not passive refcount, is the reuse
 	 * authority; never let the clock-sweep shortcut bypass D5a. */
-	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(buf_hdr, buf_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(buf_hdr, buf_state)) {
 		UnlockBufHdr(buf_hdr, buf_state);
 		LWLockRelease(partition_lock);
 		return false;
@@ -4210,8 +4016,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * If somebody else pinned the buffer since, or even worse, dirtied it,
 	 * give up on this buffer: It's clearly in use.
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY))
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY)) {
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
 		UnlockBufHdr(buf_hdr, buf_state);
@@ -4235,7 +4040,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * PGRAC: spec-6.12h D-h3a — victim reuse retags this buffer; reset the
 	 * cluster copy label under the header lock (same stale-BUF_TYPE_PI
 	 * containment as InvalidateBuffer above). */
-	buf_hdr->buffer_type = (uint8) BUF_TYPE_CURRENT;
+	buf_hdr->buffer_type = (uint8)BUF_TYPE_CURRENT;
 #endif
 	UnlockBufHdr(buf_hdr, buf_state);
 
@@ -4249,13 +4054,11 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * the cache-residency bit + propagate master_holder lifecycle (HC110)
 	 * before BufTableDelete completes the eviction.
 	 */
-	if (cluster_pcm_is_active()
-		&& cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&tag))
-		&& buf_hdr->pcm_state != (uint8) PCM_STATE_N)
-	{
-		PcmLockMode old_mode = (PcmLockMode) buf_hdr->pcm_state;
+	if (cluster_pcm_is_active() && cluster_bufmgr_reln_pcm_tracked(BufTagGetRelNumber(&tag))
+		&& buf_hdr->pcm_state != (uint8)PCM_STATE_N) {
+		PcmLockMode old_mode = (PcmLockMode)buf_hdr->pcm_state;
 
-		buf_hdr->tag = tag;	/* restore for release helper (cleared above) */
+		buf_hdr->tag = tag; /* restore for release helper (cleared above) */
 		cluster_pcm_lock_release_buffer_for_eviction(buf_hdr, old_mode);
 		ClearBufferTag(&buf_hdr->tag);
 
@@ -4263,7 +4066,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 		 * PGRAC ownership-gen: coherent N-flip + generation bump (the header
 		 * spinlock was dropped above at UnlockBufHdr) so a buf_id reuse after
 		 * this victim eviction cannot alias a stale captured generation. */
-		cluster_pcm_own_transition(buf_hdr, (uint8) PCM_STATE_N, 0,
+		cluster_pcm_own_transition(buf_hdr, (uint8)PCM_STATE_N, 0,
 								   PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING);
 	}
 #endif
@@ -4284,9 +4087,9 @@ static Buffer
 GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 {
 	BufferDesc *buf_hdr;
-	Buffer		buf;
-	uint32		buf_state;
-	bool		from_ring;
+	Buffer buf;
+	uint32 buf_state;
+	bool from_ring;
 
 	/*
 	 * Ensure, while the spinlock's not yet held, that there's a free refcount
@@ -4322,9 +4125,8 @@ again:
 	 * our share-lock won't prevent hint-bit updates).  We will recheck the
 	 * dirty bit after re-locking the buffer header.
 	 */
-	if (buf_state & BM_DIRTY)
-	{
-		LWLock	   *content_lock;
+	if (buf_state & BM_DIRTY) {
+		LWLock *content_lock;
 
 		Assert(buf_state & BM_TAG_VALID);
 		Assert(buf_state & BM_VALID);
@@ -4344,8 +4146,7 @@ again:
 		 * from StrategyGetBuffer.)
 		 */
 		content_lock = BufferDescriptorGetContentLock(buf_hdr);
-		if (!LWLockConditionalAcquire(content_lock, LW_SHARED))
-		{
+		if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
 			/*
 			 * Someone else has locked the buffer, so give it up and loop back
 			 * to get another one.
@@ -4361,18 +4162,15 @@ again:
 		 * lock to inspect the page LSN, so this can't be done inside
 		 * StrategyGetBuffer.
 		 */
-		if (strategy != NULL)
-		{
-			XLogRecPtr	lsn;
+		if (strategy != NULL) {
+			XLogRecPtr lsn;
 
 			/* Read the LSN while holding buffer header lock */
 			buf_state = LockBufHdr(buf_hdr);
 			lsn = BufferGetLSN(buf_hdr);
 			UnlockBufHdr(buf_hdr, buf_state);
 
-			if (XLogNeedsFlush(lsn)
-				&& StrategyRejectBuffer(strategy, buf_hdr, from_ring))
-			{
+			if (XLogNeedsFlush(lsn) && StrategyRejectBuffer(strategy, buf_hdr, from_ring)) {
 				LWLockRelease(content_lock);
 				UnpinBuffer(buf_hdr);
 				goto again;
@@ -4383,13 +4181,11 @@ again:
 		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
 		LWLockRelease(content_lock);
 
-		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &buf_hdr->tag);
+		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context, &buf_hdr->tag);
 	}
 
 
-	if (buf_state & BM_VALID)
-	{
+	if (buf_state & BM_VALID) {
 		/*
 		 * When a BufferAccessStrategy is in use, blocks evicted from shared
 		 * buffers are counted as IOOP_EVICT in the corresponding context
@@ -4406,8 +4202,7 @@ again:
 		 * we may have been forced to release the buffer due to concurrent
 		 * pinners or erroring out.
 		 */
-		pgstat_count_io_op(IOOBJECT_RELATION, io_context,
-						   from_ring ? IOOP_REUSE : IOOP_EVICT);
+		pgstat_count_io_op(IOOBJECT_RELATION, io_context, from_ring ? IOOP_REUSE : IOOP_EVICT);
 	}
 
 	/*
@@ -4415,8 +4210,7 @@ again:
 	 * can fail because another backend could have pinned or dirtied the
 	 * buffer.
 	 */
-	if ((buf_state & BM_TAG_VALID) && !InvalidateVictimBuffer(buf_hdr))
-	{
+	if ((buf_state & BM_TAG_VALID) && !InvalidateVictimBuffer(buf_hdr)) {
 		UnpinBuffer(buf_hdr);
 		goto again;
 	}
@@ -4449,8 +4243,8 @@ again:
 static void
 LimitAdditionalPins(uint32 *additional_pins)
 {
-	uint32		max_backends;
-	int			max_proportional_pins;
+	uint32 max_backends;
+	int max_proportional_pins;
 
 	if (*additional_pins <= 1)
 		return;
@@ -4478,41 +4272,28 @@ LimitAdditionalPins(uint32 *additional_pins)
  * avoid duplicating the tracing and relpersistence related logic.
  */
 static BlockNumber
-ExtendBufferedRelCommon(BufferManagerRelation bmr,
-						ForkNumber fork,
-						BufferAccessStrategy strategy,
-						uint32 flags,
-						uint32 extend_by,
-						BlockNumber extend_upto,
-						Buffer *buffers,
+ExtendBufferedRelCommon(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+						uint32 flags, uint32 extend_by, BlockNumber extend_upto, Buffer *buffers,
 						uint32 *extended_by)
 {
 	BlockNumber first_block;
 
-	TRACE_POSTGRESQL_BUFFER_EXTEND_START(fork,
-										 bmr.smgr->smgr_rlocator.locator.spcOid,
-										 bmr.smgr->smgr_rlocator.locator.dbOid,
-										 bmr.smgr->smgr_rlocator.locator.relNumber,
-										 bmr.smgr->smgr_rlocator.backend,
-										 extend_by);
+	TRACE_POSTGRESQL_BUFFER_EXTEND_START(
+		fork, bmr.smgr->smgr_rlocator.locator.spcOid, bmr.smgr->smgr_rlocator.locator.dbOid,
+		bmr.smgr->smgr_rlocator.locator.relNumber, bmr.smgr->smgr_rlocator.backend, extend_by);
 
 	if (bmr.relpersistence == RELPERSISTENCE_TEMP)
-		first_block = ExtendBufferedRelLocal(bmr, fork, flags,
-											 extend_by, extend_upto,
-											 buffers, &extend_by);
+		first_block
+			= ExtendBufferedRelLocal(bmr, fork, flags, extend_by, extend_upto, buffers, &extend_by);
 	else
-		first_block = ExtendBufferedRelShared(bmr, fork, strategy, flags,
-											  extend_by, extend_upto,
+		first_block = ExtendBufferedRelShared(bmr, fork, strategy, flags, extend_by, extend_upto,
 											  buffers, &extend_by);
 	*extended_by = extend_by;
 
-	TRACE_POSTGRESQL_BUFFER_EXTEND_DONE(fork,
-										bmr.smgr->smgr_rlocator.locator.spcOid,
+	TRACE_POSTGRESQL_BUFFER_EXTEND_DONE(fork, bmr.smgr->smgr_rlocator.locator.spcOid,
 										bmr.smgr->smgr_rlocator.locator.dbOid,
 										bmr.smgr->smgr_rlocator.locator.relNumber,
-										bmr.smgr->smgr_rlocator.backend,
-										*extended_by,
-										first_block);
+										bmr.smgr->smgr_rlocator.backend, *extended_by, first_block);
 
 	return first_block;
 }
@@ -4522,18 +4303,13 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
  * shared buffers.
  */
 static BlockNumber
-ExtendBufferedRelShared(BufferManagerRelation bmr,
-						ForkNumber fork,
-						BufferAccessStrategy strategy,
-						uint32 flags,
-						uint32 extend_by,
-						BlockNumber extend_upto,
-						Buffer *buffers,
+ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+						uint32 flags, uint32 extend_by, BlockNumber extend_upto, Buffer *buffers,
 						uint32 *extended_by)
 {
 	BlockNumber first_block;
-	IOContext	io_context = IOContextForStrategy(strategy);
-	instr_time	io_start;
+	IOContext io_context = IOContextForStrategy(strategy);
+	instr_time io_start;
 
 #ifdef USE_PGRAC_CLUSTER
 	/*----------
@@ -4565,14 +4341,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 *----------
 	 */
 	ClusterHwClass hwc = CLUSTER_HW_NATIVE_LOCAL;
-	HwLock		hwlk;
+	HwLock hwlk;
 	ClusterResId hw_resid;
-	uint32		hw_lease_tail = 0;	/* spec-6.12d: parked grant tail */
+	uint32 hw_lease_tail = 0; /* spec-6.12d: parked grant tail */
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
-		&& bmr.rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
-	{
+		&& bmr.rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP) {
 		/*
 		 * Decide whether to engage the cross-node authority from runtime
 		 * liveness, not the static configured node count (spec-5.7 §3.1d,
@@ -4583,14 +4358,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		ClusterExtendEngage engage = cluster_extend_liveness_engage(true);
 
 		if (engage == CLUSTER_EXTEND_ENGAGE_FAIL_CLOSED)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-					 errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
-							RelationGetRelationName(bmr.rel)),
-					 errdetail("The cluster coordination substrate is not ready and an alive peer could not be ruled out.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+							errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
+								   RelationGetRelationName(bmr.rel)),
+							errdetail("The cluster coordination substrate is not ready and an "
+									  "alive peer could not be ruled out.")));
 
-		if (engage == CLUSTER_EXTEND_ENGAGE_COORDINATE)
-		{
+		if (engage == CLUSTER_EXTEND_ENGAGE_COORDINATE) {
 			/*
 			 * A peer is alive and the substrate is ready: a permanent
 			 * relation is GLOBALIZE (authority-owned from block 0); an
@@ -4599,11 +4373,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 */
 			hwc = cluster_hw_classify_persistence(bmr.rel->rd_rel->relpersistence, true);
 			if (hwc == CLUSTER_HW_FAIL_CLOSED)
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-						 errmsg("unlogged relation \"%s\" cannot be safely extended in a multi-node cluster",
-								RelationGetRelationName(bmr.rel)),
-						 errhint("Unlogged relations have no WAL authority to coordinate cross-node extension.")));
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+								errmsg("unlogged relation \"%s\" cannot be safely extended in a "
+									   "multi-node cluster",
+									   RelationGetRelationName(bmr.rel)),
+								errhint("Unlogged relations have no WAL authority to coordinate "
+										"cross-node extension.")));
 		}
 
 		/*
@@ -4625,15 +4400,14 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * These pages are pinned by us and not valid. While we hold the pin they
 	 * can't be acquired as victim buffers by another backend.
 	 */
-	for (uint32 i = 0; i < extend_by; i++)
-	{
-		Block		buf_block;
+	for (uint32 i = 0; i < extend_by; i++) {
+		Block buf_block;
 
 		buffers[i] = GetVictimBuffer(strategy, io_context);
 		buf_block = BufHdrGetBlock(GetBufferDescriptor(buffers[i] - 1));
 
 		/* new buffers are zero-filled */
-		MemSet((char *) buf_block, 0, BLCKSZ);
+		MemSet((char *)buf_block, 0, BLCKSZ);
 	}
 
 	/* in case we need to pin an existing buffer below */
@@ -4661,31 +4435,26 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * reconfig-revoke (AD-013) + backend-exit cleanup as the backstop on an
 	 * error path, mirroring CF (spec-5.6).
 	 */
-	if (hwc == CLUSTER_HW_GLOBALIZE)
-	{
+	if (hwc == CLUSTER_HW_GLOBALIZE) {
 		cluster_hw_resid_encode(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork, &hw_resid);
-		if (!cluster_hw_lock(&hw_resid, &hwlk))
-		{
+		if (!cluster_hw_lock(&hw_resid, &hwlk)) {
 			/* release the victim buffers pinned above (the extension lock is not
 			 * held yet) before failing closed, symmetric with the allocate-fail
 			 * path below (review P2). */
-			for (uint32 i = 0; i < extend_by; i++)
-			{
+			for (uint32 i = 0; i < extend_by; i++) {
 				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
 
 				StrategyFreeBuffer(buf_hdr);
 				UnpinBuffer(buf_hdr);
 			}
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-					 errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
-							RelationGetRelationName(bmr.rel))));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+							errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
+								   RelationGetRelationName(bmr.rel))));
 		}
 	}
 #endif
 
-	if (!(flags & EB_SKIP_EXTENSION_LOCK))
-	{
+	if (!(flags & EB_SKIP_EXTENSION_LOCK)) {
 		LockRelationForExtension(bmr.rel, ExclusiveLock);
 		if (bmr.rel)
 			bmr.smgr = RelationGetSmgr(bmr.rel);
@@ -4699,9 +4468,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		bmr.smgr->smgr_cached_nblocks[fork] = InvalidBlockNumber;
 
 #ifdef USE_PGRAC_CLUSTER
-	if (hwc == CLUSTER_HW_GLOBALIZE)
-	{
-		uint32		hw_granted = 0;
+	if (hwc == CLUSTER_HW_GLOBALIZE) {
+		uint32 hw_granted = 0;
 		BlockNumber seed_nblocks;
 
 		/*
@@ -4736,52 +4504,45 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * the only shape the hio.c lease consumer serves.
 		 */
 		{
-			uint32		hw_want = extend_by;
+			uint32 hw_want = extend_by;
 
-			if (cluster_hw_lease_active() &&
-				extend_upto == InvalidBlockNumber &&
-				bmr.rel->rd_rel->relkind == RELKIND_RELATION &&
-				(uint32) cluster_space_lease_blocks > extend_by)
-				hw_want = (uint32) cluster_space_lease_blocks;
+			if (cluster_hw_lease_active() && extend_upto == InvalidBlockNumber
+				&& bmr.rel->rd_rel->relkind == RELKIND_RELATION
+				&& (uint32)cluster_space_lease_blocks > extend_by)
+				hw_want = (uint32)cluster_space_lease_blocks;
 
 			first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
 											  hw_want, seed_nblocks, &hw_granted);
 		}
 		cluster_hw_unlock(&hwlk);
 
-		if (first_block == InvalidBlockNumber || hw_granted == 0)
-		{
+		if (first_block == InvalidBlockNumber || hw_granted == 0) {
 			/* fail closed: release the extension lock + all victim buffers, then
 			 * raise 53RA6 (we are outside any critical section). */
 			if (!(flags & EB_SKIP_EXTENSION_LOCK))
 				UnlockRelationForExtension(bmr.rel, ExclusiveLock);
-			for (uint32 i = 0; i < extend_by; i++)
-			{
+			for (uint32 i = 0; i < extend_by; i++) {
 				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
 
 				StrategyFreeBuffer(buf_hdr);
 				UnpinBuffer(buf_hdr);
 			}
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-					 errmsg("cluster relation-extend authority unavailable for \"%s\"",
-							RelationGetRelationName(bmr.rel)),
-					 errhint("The HW_ALLOC round trip to the resource master could not be proven; retry.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+							errmsg("cluster relation-extend authority unavailable for \"%s\"",
+								   RelationGetRelationName(bmr.rel)),
+							errhint("The HW_ALLOC round trip to the resource master could not be "
+									"proven; retry.")));
 		}
 
-		if (hw_granted < extend_by)
-		{
-			for (uint32 i = hw_granted; i < extend_by; i++)
-			{
+		if (hw_granted < extend_by) {
+			for (uint32 i = hw_granted; i < extend_by; i++) {
 				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
 
 				StrategyFreeBuffer(buf_hdr);
 				UnpinBuffer(buf_hdr);
 			}
 			extend_by = hw_granted;
-		}
-		else
-		{
+		} else {
 			/*
 			 * PGRAC: spec-6.12d -- the over-ask surplus becomes this node's
 			 * lease.  It MUST also be zero-extended below: the HWM advance
@@ -4792,10 +4553,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 */
 			hw_lease_tail = hw_granted - extend_by;
 		}
-	}
-	else
+	} else
 #endif
-	first_block = smgrnblocks(bmr.smgr, fork);
+		first_block = smgrnblocks(bmr.smgr, fork);
 
 	/*
 	 * Now that we have the accurate relation size, check if the caller wants
@@ -4803,17 +4563,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * extensions, we might have acquired too many buffers and need to release
 	 * them.
 	 */
-	if (extend_upto != InvalidBlockNumber)
-	{
-		uint32		orig_extend_by = extend_by;
+	if (extend_upto != InvalidBlockNumber) {
+		uint32 orig_extend_by = extend_by;
 
 		if (first_block > extend_upto)
 			extend_by = 0;
-		else if ((uint64) first_block + extend_by > extend_upto)
+		else if ((uint64)first_block + extend_by > extend_upto)
 			extend_by = extend_upto - first_block;
 
-		for (uint32 i = extend_by; i < orig_extend_by; i++)
-		{
+		for (uint32 i = extend_by; i < orig_extend_by; i++) {
 			BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
 
 			/*
@@ -4824,8 +4582,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			UnpinBuffer(buf_hdr);
 		}
 
-		if (extend_by == 0)
-		{
+		if (extend_by == 0) {
 			if (!(flags & EB_SKIP_EXTENSION_LOCK))
 				UnlockRelationForExtension(bmr.rel, ExclusiveLock);
 			*extended_by = extend_by;
@@ -4834,12 +4591,10 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	}
 
 	/* Fail if relation is already at maximum possible length */
-	if ((uint64) first_block + extend_by >= MaxBlockNumber)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cannot extend relation %s beyond %u blocks",
-						relpath(bmr.smgr->smgr_rlocator, fork),
-						MaxBlockNumber)));
+	if ((uint64)first_block + extend_by >= MaxBlockNumber)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cannot extend relation %s beyond %u blocks",
+							   relpath(bmr.smgr->smgr_rlocator, fork), MaxBlockNumber)));
 
 	/*
 	 * Insert buffers into buffer table, mark as IO_IN_PROGRESS.
@@ -4847,14 +4602,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * This needs to happen before we extend the relation, because as soon as
 	 * we do, other backends can start to read in those pages.
 	 */
-	for (int i = 0; i < extend_by; i++)
-	{
-		Buffer		victim_buf = buffers[i];
+	for (int i = 0; i < extend_by; i++) {
+		Buffer victim_buf = buffers[i];
 		BufferDesc *victim_buf_hdr = GetBufferDescriptor(victim_buf - 1);
-		BufferTag	tag;
-		uint32		hash;
-		LWLock	   *partition_lock;
-		int			existing_id;
+		BufferTag tag;
+		uint32 hash;
+		LWLock *partition_lock;
+		int existing_id;
 
 		InitBufferTag(&tag, &bmr.smgr->smgr_rlocator.locator, fork, first_block + i);
 		hash = BufTableHashCode(&tag);
@@ -4878,11 +4632,10 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * overwrite.  Since the legitimate cases should always have left a
 		 * zero-filled buffer, complain if not PageIsNew.
 		 */
-		if (existing_id >= 0)
-		{
+		if (existing_id >= 0) {
 			BufferDesc *existing_hdr = GetBufferDescriptor(existing_id);
-			Block		buf_block;
-			bool		valid;
+			Block buf_block;
+			bool valid;
 
 			/*
 			 * Pin the existing buffer before releasing the partition lock,
@@ -4902,13 +4655,14 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			buffers[i] = BufferDescriptorGetBuffer(existing_hdr);
 			buf_block = BufHdrGetBlock(existing_hdr);
 
-			if (valid && !PageIsNew((Page) buf_block))
+			if (valid && !PageIsNew((Page)buf_block))
 				ereport(ERROR,
 						(errmsg("unexpected data beyond EOF in block %u of relation %s",
 								existing_hdr->tag.blockNum, relpath(bmr.smgr->smgr_rlocator, fork)),
-						 errhint("This has been seen to occur with buggy kernels; consider updating your system.")));
+						 errhint("This has been seen to occur with buggy kernels; consider "
+								 "updating your system.")));
 
-			/*
+				/*
 			 * We *must* do smgr[zero]extend before succeeding, else the page
 			 * will not be reserved by the kernel, and the next P_NEW call
 			 * will decide to return the same page.  Clear the BM_VALID bit,
@@ -4920,31 +4674,27 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 */
 #ifdef USE_PGRAC_CLUSTER
 			{
-				uint32		cluster_state = LockBufHdr(existing_hdr);
-				bool		blocked
+				uint32 cluster_state = LockBufHdr(existing_hdr);
+				bool blocked
 					= cluster_bufmgr_pcm_x_retained_image_locked(existing_hdr, cluster_state)
-					|| (cluster_pcm_own_flags_get(existing_hdr->buf_id)
-						& PCM_OWN_FLAG_REVOKING) != 0;
+					  || (cluster_pcm_own_flags_get(existing_hdr->buf_id) & PCM_OWN_FLAG_REVOKING)
+							 != 0;
 
 				UnlockBufHdr(existing_hdr, cluster_state);
 				if (blocked)
-					ereport(ERROR,
-							(errcode(ERRCODE_OBJECT_IN_USE),
-							 errmsg("cannot reuse retained cluster PCM image during "
-									"relation extension")));
+					ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
+									errmsg("cannot reuse retained cluster PCM image during "
+										   "relation extension")));
 			}
 #endif
-			do
-			{
-				uint32		buf_state = LockBufHdr(existing_hdr);
+			do {
+				uint32 buf_state = LockBufHdr(existing_hdr);
 
 				buf_state &= ~BM_VALID;
 				UnlockBufHdr(existing_hdr, buf_state);
 			} while (!StartBufferIO(existing_hdr, true));
-		}
-		else
-		{
-			uint32		buf_state;
+		} else {
+			uint32 buf_state;
 
 			buf_state = LockBufHdr(victim_buf_hdr);
 
@@ -4993,12 +4743,10 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * no lease is installed and the range degrades to the documented
 	 * orphan-zero-page fail-safe once a later extend covers it.
 	 */
-	if (hw_lease_tail > 0)
-	{
-		smgrzeroextend(bmr.smgr, fork, first_block + extend_by,
-					   (int) hw_lease_tail, false);
-		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork,
-								 first_block + extend_by, hw_lease_tail);
+	if (hw_lease_tail > 0) {
+		smgrzeroextend(bmr.smgr, fork, first_block + extend_by, (int)hw_lease_tail, false);
+		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork, first_block + extend_by,
+								 hw_lease_tail);
 	}
 #endif
 
@@ -5012,36 +4760,32 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
 		UnlockRelationForExtension(bmr.rel, ExclusiveLock);
 
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
-							io_start, extend_by);
+	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND, io_start, extend_by);
 
 	/* Set BM_VALID, terminate IO, and wake up any waiters */
-	for (int i = 0; i < extend_by; i++)
-	{
-		Buffer		buf = buffers[i];
+	for (int i = 0; i < extend_by; i++) {
+		Buffer buf = buffers[i];
 		BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
-		bool		lock = false;
+		bool lock = false;
 
 		if (flags & EB_LOCK_FIRST && i == 0)
 			lock = true;
-		else if (flags & EB_LOCK_TARGET)
-		{
+		else if (flags & EB_LOCK_TARGET) {
 			Assert(extend_upto != InvalidBlockNumber);
 			if (first_block + i + 1 == extend_upto)
 				lock = true;
 		}
 
-		if (lock)
-		{
+		if (lock) {
 #ifdef USE_PGRAC_CLUSTER
 			ClusterPcmDirectInitProof direct_init_proof;
 
 			/* This exact buffer is in the range successfully zeroextended above
 			 * and still owns BM_IO_IN_PROGRESS + !BM_VALID. */
-			cluster_bufmgr_pcm_arm_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
-			cluster_bufmgr_pcm_gate_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
+			cluster_bufmgr_pcm_arm_direct_init(buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
+											   &direct_init_proof);
+			cluster_bufmgr_pcm_gate_direct_init(buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
+												&direct_init_proof);
 #endif
 			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
 		}
@@ -5069,14 +4813,13 @@ void
 MarkBufferDirty(Buffer buffer)
 {
 	BufferDesc *bufHdr;
-	uint32		buf_state;
-	uint32		old_buf_state;
+	uint32 buf_state;
+	uint32 old_buf_state;
 
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
 
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		MarkLocalBufferDirty(buffer);
 		return;
 	}
@@ -5084,8 +4827,7 @@ MarkBufferDirty(Buffer buffer)
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
 	Assert(BufferIsPinned(buffer));
-	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-								LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE));
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -5095,20 +4837,17 @@ MarkBufferDirty(Buffer buffer)
 	 * retain/release boundary.
 	 */
 	buf_state = LockBufHdr(bufHdr);
-	if (cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, buf_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, buf_state)) {
 		UnlockBufHdr(bufHdr, buf_state);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot dirty a retained cluster PCM image"),
-				 errdetail("buffer=%d", bufHdr->buf_id)));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cannot dirty a retained cluster PCM image"),
+						errdetail("buffer=%d", bufHdr->buf_id)));
 	}
 	UnlockBufHdr(bufHdr, buf_state);
 #endif
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
-	for (;;)
-	{
+	for (;;) {
 		if (old_buf_state & BM_LOCKED)
 			old_buf_state = WaitBufHdrUnlocked(bufHdr);
 
@@ -5117,16 +4856,14 @@ MarkBufferDirty(Buffer buffer)
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 		buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
 
-		if (pg_atomic_compare_exchange_u32(&bufHdr->state, &old_buf_state,
-										   buf_state))
+		if (pg_atomic_compare_exchange_u32(&bufHdr->state, &old_buf_state, buf_state))
 			break;
 	}
 
 	/*
 	 * If the buffer was not dirty already, do vacuum accounting.
 	 */
-	if (!(old_buf_state & BM_DIRTY))
-	{
+	if (!(old_buf_state & BM_DIRTY)) {
 		VacuumPageDirty++;
 		pgBufferUsage.shared_blks_dirtied++;
 		if (VacuumCostActive)
@@ -5148,32 +4885,26 @@ MarkBufferDirty(Buffer buffer)
  * but can save some tests in the caller.
  */
 Buffer
-ReleaseAndReadBuffer(Buffer buffer,
-					 Relation relation,
-					 BlockNumber blockNum)
+ReleaseAndReadBuffer(Buffer buffer, Relation relation, BlockNumber blockNum)
 {
-	ForkNumber	forkNum = MAIN_FORKNUM;
+	ForkNumber forkNum = MAIN_FORKNUM;
 	BufferDesc *bufHdr;
 
-	if (BufferIsValid(buffer))
-	{
+	if (BufferIsValid(buffer)) {
 		Assert(BufferIsPinned(buffer));
-		if (BufferIsLocal(buffer))
-		{
+		if (BufferIsLocal(buffer)) {
 			bufHdr = GetLocalBufferDescriptor(-buffer - 1);
-			if (bufHdr->tag.blockNum == blockNum &&
-				BufTagMatchesRelFileLocator(&bufHdr->tag, &relation->rd_locator) &&
-				BufTagGetForkNum(&bufHdr->tag) == forkNum)
+			if (bufHdr->tag.blockNum == blockNum
+				&& BufTagMatchesRelFileLocator(&bufHdr->tag, &relation->rd_locator)
+				&& BufTagGetForkNum(&bufHdr->tag) == forkNum)
 				return buffer;
 			UnpinLocalBuffer(buffer);
-		}
-		else
-		{
+		} else {
 			bufHdr = GetBufferDescriptor(buffer - 1);
 			/* we have pin, so it's ok to examine tag without spinlock */
-			if (bufHdr->tag.blockNum == blockNum &&
-				BufTagMatchesRelFileLocator(&bufHdr->tag, &relation->rd_locator) &&
-				BufTagGetForkNum(&bufHdr->tag) == forkNum)
+			if (bufHdr->tag.blockNum == blockNum
+				&& BufTagMatchesRelFileLocator(&bufHdr->tag, &relation->rd_locator)
+				&& BufTagGetForkNum(&bufHdr->tag) == forkNum)
 				return buffer;
 			UnpinBuffer(bufHdr);
 		}
@@ -5207,25 +4938,23 @@ ReleaseAndReadBuffer(Buffer buffer,
 static bool
 PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 {
-	Buffer		b = BufferDescriptorGetBuffer(buf);
-	bool		result;
+	Buffer b = BufferDescriptorGetBuffer(buf);
+	bool result;
 	PrivateRefCountEntry *ref;
 
 	Assert(!BufferIsLocal(b));
 
 	ref = GetPrivateRefCountEntry(b, true);
 
-	if (ref == NULL)
-	{
-		uint32		buf_state;
-		uint32		old_buf_state;
+	if (ref == NULL) {
+		uint32 buf_state;
+		uint32 old_buf_state;
 
 		ReservePrivateRefCountEntry();
 		ref = NewPrivateRefCountEntry(b);
 
 		old_buf_state = pg_atomic_read_u32(&buf->state);
-		for (;;)
-		{
+		for (;;) {
 			if (old_buf_state & BM_LOCKED)
 				old_buf_state = WaitBufHdrUnlocked(buf);
 
@@ -5234,14 +4963,11 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			/* increase refcount */
 			buf_state += BUF_REFCOUNT_ONE;
 
-			if (strategy == NULL)
-			{
+			if (strategy == NULL) {
 				/* Default case: increase usagecount unless already max. */
 				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
 					buf_state += BUF_USAGECOUNT_ONE;
-			}
-			else
-			{
+			} else {
 				/*
 				 * Ring buffers shouldn't evict others from pool.  Thus we
 				 * don't make usagecount more than 1.
@@ -5250,9 +4976,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 					buf_state += BUF_USAGECOUNT_ONE;
 			}
 
-			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
-											   buf_state))
-			{
+			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state, buf_state)) {
 				result = (buf_state & BM_VALID) != 0;
 
 				/*
@@ -5266,9 +4990,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				break;
 			}
 		}
-	}
-	else
-	{
+	} else {
 		/*
 		 * If we previously pinned the buffer, it must surely be valid.
 		 *
@@ -5312,9 +5034,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 static void
 PinBuffer_Locked(BufferDesc *buf)
 {
-	Buffer		b;
+	Buffer b;
 	PrivateRefCountEntry *ref;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	/*
 	 * As explained, We don't expect any preexisting pins. That allows us to
@@ -5356,7 +5078,7 @@ static void
 UnpinBuffer(BufferDesc *buf)
 {
 	PrivateRefCountEntry *ref;
-	Buffer		b = BufferDescriptorGetBuffer(buf);
+	Buffer b = BufferDescriptorGetBuffer(buf);
 
 	Assert(!BufferIsLocal(b));
 
@@ -5368,10 +5090,9 @@ UnpinBuffer(BufferDesc *buf)
 
 	Assert(ref->refcount > 0);
 	ref->refcount--;
-	if (ref->refcount == 0)
-	{
-		uint32		buf_state;
-		uint32		old_buf_state;
+	if (ref->refcount == 0) {
+		uint32 buf_state;
+		uint32 old_buf_state;
 
 		/*
 		 * Mark buffer non-accessible to Valgrind.
@@ -5392,8 +5113,7 @@ UnpinBuffer(BufferDesc *buf)
 		 * it's not safe to use atomic decrement here; thus use a CAS loop.
 		 */
 		old_buf_state = pg_atomic_read_u32(&buf->state);
-		for (;;)
-		{
+		for (;;) {
 			if (old_buf_state & BM_LOCKED)
 				old_buf_state = WaitBufHdrUnlocked(buf);
 
@@ -5401,14 +5121,12 @@ UnpinBuffer(BufferDesc *buf)
 
 			buf_state -= BUF_REFCOUNT_ONE;
 
-			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
-											   buf_state))
+			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state, buf_state))
 				break;
 		}
 
 		/* Support LockBufferForCleanup() */
-		if (buf_state & BM_PIN_COUNT_WAITER)
-		{
+		if (buf_state & BM_PIN_COUNT_WAITER) {
 			/*
 			 * Acquire the buffer header lock, re-check that there's a waiter.
 			 * Another backend could have unpinned this buffer, and already
@@ -5418,17 +5136,14 @@ UnpinBuffer(BufferDesc *buf)
 			 */
 			buf_state = LockBufHdr(buf);
 
-			if ((buf_state & BM_PIN_COUNT_WAITER) &&
-				BUF_STATE_GET_REFCOUNT(buf_state) == 1)
-			{
+			if ((buf_state & BM_PIN_COUNT_WAITER) && BUF_STATE_GET_REFCOUNT(buf_state) == 1) {
 				/* we just released the last pin other than the waiter's */
-				int			wait_backend_pgprocno = buf->wait_backend_pgprocno;
+				int wait_backend_pgprocno = buf->wait_backend_pgprocno;
 
 				buf_state &= ~BM_PIN_COUNT_WAITER;
 				UnlockBufHdr(buf, buf_state);
 				ProcSendSignal(wait_backend_pgprocno);
-			}
-			else
+			} else
 				UnlockBufHdr(buf, buf_state);
 		}
 		ForgetPrivateRefCountEntry(ref);
@@ -5455,17 +5170,17 @@ UnpinBuffer(BufferDesc *buf)
 static void
 BufferSync(int flags)
 {
-	uint32		buf_state;
-	int			buf_id;
-	int			num_to_scan;
-	int			num_spaces;
-	int			num_processed;
-	int			num_written;
+	uint32 buf_state;
+	int buf_id;
+	int num_to_scan;
+	int num_spaces;
+	int num_processed;
+	int num_written;
 	CkptTsStatus *per_ts_stat = NULL;
-	Oid			last_tsid;
+	Oid last_tsid;
 	binaryheap *ts_heap;
-	int			i;
-	int			mask = BM_DIRTY;
+	int i;
+	int mask = BM_DIRTY;
 	WritebackContext wb_context;
 
 	/* Make sure we can handle the pin inside SyncOneBuffer */
@@ -5476,8 +5191,7 @@ BufferSync(int flags)
 	 * we write only permanent, dirty buffers.  But at shutdown or end of
 	 * recovery, we write all dirty buffers.
 	 */
-	if (!((flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY |
-					CHECKPOINT_FLUSH_ALL))))
+	if (!((flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_FLUSH_ALL))))
 		mask |= BM_PERMANENT;
 
 	/*
@@ -5497,8 +5211,7 @@ BufferSync(int flags)
 	 * certainly need to be written for the next checkpoint attempt, too.
 	 */
 	num_to_scan = 0;
-	for (buf_id = 0; buf_id < NBuffers; buf_id++)
-	{
+	for (buf_id = 0; buf_id < NBuffers; buf_id++) {
 		BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
 
 		/*
@@ -5507,8 +5220,7 @@ BufferSync(int flags)
 		 */
 		buf_state = LockBufHdr(bufHdr);
 
-		if ((buf_state & mask) == mask)
-		{
+		if ((buf_state & mask) == mask) {
 			CkptSortItem *item;
 
 			buf_state |= BM_CHECKPOINT_NEEDED;
@@ -5529,7 +5241,7 @@ BufferSync(int flags)
 	}
 
 	if (num_to_scan == 0)
-		return;					/* nothing to do */
+		return; /* nothing to do */
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
 
@@ -5551,10 +5263,9 @@ BufferSync(int flags)
 	 * be flushed. This requires the to-be-flushed array to be sorted.
 	 */
 	last_tsid = InvalidOid;
-	for (i = 0; i < num_to_scan; i++)
-	{
+	for (i = 0; i < num_to_scan; i++) {
 		CkptTsStatus *s;
-		Oid			cur_tsid;
+		Oid cur_tsid;
 
 		cur_tsid = CkptBufferIds[i].tsId;
 
@@ -5562,9 +5273,8 @@ BufferSync(int flags)
 		 * Grow array of per-tablespace status structs, every time a new
 		 * tablespace is found.
 		 */
-		if (last_tsid == InvalidOid || last_tsid != cur_tsid)
-		{
-			Size		sz;
+		if (last_tsid == InvalidOid || last_tsid != cur_tsid) {
+			Size sz;
 
 			num_spaces++;
 
@@ -5575,9 +5285,9 @@ BufferSync(int flags)
 			sz = sizeof(CkptTsStatus) * num_spaces;
 
 			if (per_ts_stat == NULL)
-				per_ts_stat = (CkptTsStatus *) palloc(sz);
+				per_ts_stat = (CkptTsStatus *)palloc(sz);
 			else
-				per_ts_stat = (CkptTsStatus *) repalloc(per_ts_stat, sz);
+				per_ts_stat = (CkptTsStatus *)repalloc(per_ts_stat, sz);
 
 			s = &per_ts_stat[num_spaces - 1];
 			memset(s, 0, sizeof(*s));
@@ -5596,9 +5306,7 @@ BufferSync(int flags)
 			 */
 
 			last_tsid = cur_tsid;
-		}
-		else
-		{
+		} else {
 			s = &per_ts_stat[num_spaces - 1];
 		}
 
@@ -5616,15 +5324,12 @@ BufferSync(int flags)
 	 * and compute how large a portion of the total progress a single
 	 * processed buffer is.
 	 */
-	ts_heap = binaryheap_allocate(num_spaces,
-								  ts_ckpt_progress_comparator,
-								  NULL);
+	ts_heap = binaryheap_allocate(num_spaces, ts_ckpt_progress_comparator, NULL);
 
-	for (i = 0; i < num_spaces; i++)
-	{
+	for (i = 0; i < num_spaces; i++) {
 		CkptTsStatus *ts_stat = &per_ts_stat[i];
 
-		ts_stat->progress_slice = (float8) num_to_scan / ts_stat->num_to_scan;
+		ts_stat->progress_slice = (float8)num_to_scan / ts_stat->num_to_scan;
 
 		binaryheap_add_unordered(ts_heap, PointerGetDatum(ts_stat));
 	}
@@ -5639,11 +5344,9 @@ BufferSync(int flags)
 	 */
 	num_processed = 0;
 	num_written = 0;
-	while (!binaryheap_empty(ts_heap))
-	{
+	while (!binaryheap_empty(ts_heap)) {
 		BufferDesc *bufHdr = NULL;
-		CkptTsStatus *ts_stat = (CkptTsStatus *)
-			DatumGetPointer(binaryheap_first(ts_heap));
+		CkptTsStatus *ts_stat = (CkptTsStatus *)DatumGetPointer(binaryheap_first(ts_heap));
 
 		buf_id = CkptBufferIds[ts_stat->index].buf_id;
 		Assert(buf_id != -1);
@@ -5664,10 +5367,8 @@ BufferSync(int flags)
 		 * write the buffer though we didn't need to.  It doesn't seem worth
 		 * guarding against this, though.
 		 */
-		if (pg_atomic_read_u32(&bufHdr->state) & BM_CHECKPOINT_NEEDED)
-		{
-			if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN)
-			{
+		if (pg_atomic_read_u32(&bufHdr->state) & BM_CHECKPOINT_NEEDED) {
+			if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN) {
 				TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
 				PendingCheckpointerStats.buf_written_checkpoints++;
 				num_written++;
@@ -5683,12 +5384,9 @@ BufferSync(int flags)
 		ts_stat->index++;
 
 		/* Have all the buffers from the tablespace been processed? */
-		if (ts_stat->num_scanned == ts_stat->num_to_scan)
-		{
+		if (ts_stat->num_scanned == ts_stat->num_to_scan) {
 			binaryheap_remove_first(ts_heap);
-		}
-		else
-		{
+		} else {
 			/* update heap with the new progress */
 			binaryheap_replace_first(ts_heap, PointerGetDatum(ts_stat));
 		}
@@ -5698,7 +5396,7 @@ BufferSync(int flags)
 		 *
 		 * (This will check for barrier events even if it doesn't sleep.)
 		 */
-		CheckpointWriteDelay(flags, (double) num_processed / num_to_scan);
+		CheckpointWriteDelay(flags, (double)num_processed / num_to_scan);
 	}
 
 	/*
@@ -5735,18 +5433,18 @@ bool
 BgBufferSync(WritebackContext *wb_context)
 {
 	/* info obtained from freelist.c */
-	int			strategy_buf_id;
-	uint32		strategy_passes;
-	uint32		recent_alloc;
+	int strategy_buf_id;
+	uint32 strategy_passes;
+	uint32 recent_alloc;
 
 	/*
 	 * Information saved between calls so we can determine the strategy
 	 * point's advance rate and avoid scanning already-cleaned buffers.
 	 */
 	static bool saved_info_valid = false;
-	static int	prev_strategy_buf_id;
+	static int prev_strategy_buf_id;
 	static uint32 prev_strategy_passes;
-	static int	next_to_clean;
+	static int next_to_clean;
 	static uint32 next_passes;
 
 	/* Moving averages of allocation rate and clean-buffer density */
@@ -5754,26 +5452,26 @@ BgBufferSync(WritebackContext *wb_context)
 	static float smoothed_density = 10.0;
 
 	/* Potentially these could be tunables, but for now, not */
-	float		smoothing_samples = 16;
-	float		scan_whole_pool_milliseconds = 120000.0;
+	float smoothing_samples = 16;
+	float scan_whole_pool_milliseconds = 120000.0;
 
 	/* Used to compute how far we scan ahead */
-	long		strategy_delta;
-	int			bufs_to_lap;
-	int			bufs_ahead;
-	float		scans_per_alloc;
-	int			reusable_buffers_est;
-	int			upcoming_alloc_est;
-	int			min_scan_buffers;
+	long strategy_delta;
+	int bufs_to_lap;
+	int bufs_ahead;
+	float scans_per_alloc;
+	int reusable_buffers_est;
+	int upcoming_alloc_est;
+	int min_scan_buffers;
 
 	/* Variables for the scanning loop proper */
-	int			num_to_scan;
-	int			num_written;
-	int			reusable_buffers;
+	int num_to_scan;
+	int num_written;
+	int reusable_buffers;
 
 	/* Variables for final smoothed_density update */
-	long		new_strategy_delta;
-	uint32		new_recent_alloc;
+	long new_strategy_delta;
+	uint32 new_recent_alloc;
 
 	/*
 	 * Find out where the freelist clock sweep currently is, and how many
@@ -5789,8 +5487,7 @@ BgBufferSync(WritebackContext *wb_context)
 	 * stuff.  We mark the saved state invalid so that we can recover sanely
 	 * if LRU scan is turned back on later.
 	 */
-	if (bgwriter_lru_maxpages <= 0)
-	{
+	if (bgwriter_lru_maxpages <= 0) {
 		saved_info_valid = false;
 		return true;
 	}
@@ -5803,64 +5500,48 @@ BgBufferSync(WritebackContext *wb_context)
 	 * weird-looking coding of xxx_passes comparisons are to avoid bogus
 	 * behavior when the passes counts wrap around.
 	 */
-	if (saved_info_valid)
-	{
-		int32		passes_delta = strategy_passes - prev_strategy_passes;
+	if (saved_info_valid) {
+		int32 passes_delta = strategy_passes - prev_strategy_passes;
 
 		strategy_delta = strategy_buf_id - prev_strategy_buf_id;
-		strategy_delta += (long) passes_delta * NBuffers;
+		strategy_delta += (long)passes_delta * NBuffers;
 
 		Assert(strategy_delta >= 0);
 
-		if ((int32) (next_passes - strategy_passes) > 0)
-		{
+		if ((int32)(next_passes - strategy_passes) > 0) {
 			/* we're one pass ahead of the strategy point */
 			bufs_to_lap = strategy_buf_id - next_to_clean;
 #ifdef BGW_DEBUG
-			elog(DEBUG2, "bgwriter ahead: bgw %u-%u strategy %u-%u delta=%ld lap=%d",
-				 next_passes, next_to_clean,
-				 strategy_passes, strategy_buf_id,
-				 strategy_delta, bufs_to_lap);
+			elog(DEBUG2, "bgwriter ahead: bgw %u-%u strategy %u-%u delta=%ld lap=%d", next_passes,
+				 next_to_clean, strategy_passes, strategy_buf_id, strategy_delta, bufs_to_lap);
 #endif
-		}
-		else if (next_passes == strategy_passes &&
-				 next_to_clean >= strategy_buf_id)
-		{
+		} else if (next_passes == strategy_passes && next_to_clean >= strategy_buf_id) {
 			/* on same pass, but ahead or at least not behind */
 			bufs_to_lap = NBuffers - (next_to_clean - strategy_buf_id);
 #ifdef BGW_DEBUG
-			elog(DEBUG2, "bgwriter ahead: bgw %u-%u strategy %u-%u delta=%ld lap=%d",
-				 next_passes, next_to_clean,
-				 strategy_passes, strategy_buf_id,
-				 strategy_delta, bufs_to_lap);
+			elog(DEBUG2, "bgwriter ahead: bgw %u-%u strategy %u-%u delta=%ld lap=%d", next_passes,
+				 next_to_clean, strategy_passes, strategy_buf_id, strategy_delta, bufs_to_lap);
 #endif
-		}
-		else
-		{
+		} else {
 			/*
 			 * We're behind, so skip forward to the strategy point and start
 			 * cleaning from there.
 			 */
 #ifdef BGW_DEBUG
-			elog(DEBUG2, "bgwriter behind: bgw %u-%u strategy %u-%u delta=%ld",
-				 next_passes, next_to_clean,
-				 strategy_passes, strategy_buf_id,
-				 strategy_delta);
+			elog(DEBUG2, "bgwriter behind: bgw %u-%u strategy %u-%u delta=%ld", next_passes,
+				 next_to_clean, strategy_passes, strategy_buf_id, strategy_delta);
 #endif
 			next_to_clean = strategy_buf_id;
 			next_passes = strategy_passes;
 			bufs_to_lap = NBuffers;
 		}
-	}
-	else
-	{
+	} else {
 		/*
 		 * Initializing at startup or after LRU scanning had been off. Always
 		 * start at the strategy point.
 		 */
 #ifdef BGW_DEBUG
-		elog(DEBUG2, "bgwriter initializing: strategy %u-%u",
-			 strategy_passes, strategy_buf_id);
+		elog(DEBUG2, "bgwriter initializing: strategy %u-%u", strategy_passes, strategy_buf_id);
 #endif
 		strategy_delta = 0;
 		next_to_clean = strategy_buf_id;
@@ -5879,11 +5560,9 @@ BgBufferSync(WritebackContext *wb_context)
 	 *
 	 * If the strategy point didn't move, we don't update the density estimate
 	 */
-	if (strategy_delta > 0 && recent_alloc > 0)
-	{
-		scans_per_alloc = (float) strategy_delta / (float) recent_alloc;
-		smoothed_density += (scans_per_alloc - smoothed_density) /
-			smoothing_samples;
+	if (strategy_delta > 0 && recent_alloc > 0) {
+		scans_per_alloc = (float)strategy_delta / (float)recent_alloc;
+		smoothed_density += (scans_per_alloc - smoothed_density) / smoothing_samples;
 	}
 
 	/*
@@ -5892,21 +5571,20 @@ BgBufferSync(WritebackContext *wb_context)
 	 * density estimate.
 	 */
 	bufs_ahead = NBuffers - bufs_to_lap;
-	reusable_buffers_est = (float) bufs_ahead / smoothed_density;
+	reusable_buffers_est = (float)bufs_ahead / smoothed_density;
 
 	/*
 	 * Track a moving average of recent buffer allocations.  Here, rather than
 	 * a true average we want a fast-attack, slow-decline behavior: we
 	 * immediately follow any increase.
 	 */
-	if (smoothed_alloc <= (float) recent_alloc)
+	if (smoothed_alloc <= (float)recent_alloc)
 		smoothed_alloc = recent_alloc;
 	else
-		smoothed_alloc += ((float) recent_alloc - smoothed_alloc) /
-			smoothing_samples;
+		smoothed_alloc += ((float)recent_alloc - smoothed_alloc) / smoothing_samples;
 
 	/* Scale the estimate by a GUC to allow more aggressive tuning. */
-	upcoming_alloc_est = (int) (smoothed_alloc * bgwriter_lru_multiplier);
+	upcoming_alloc_est = (int)(smoothed_alloc * bgwriter_lru_multiplier);
 
 	/*
 	 * If recent_alloc remains at zero for many cycles, smoothed_alloc will
@@ -5929,10 +5607,9 @@ BgBufferSync(WritebackContext *wb_context)
 	 * the BGW will be called during the scan_whole_pool time; slice the
 	 * buffer pool into that many sections.
 	 */
-	min_scan_buffers = (int) (NBuffers / (scan_whole_pool_milliseconds / BgWriterDelay));
+	min_scan_buffers = (int)(NBuffers / (scan_whole_pool_milliseconds / BgWriterDelay));
 
-	if (upcoming_alloc_est < (min_scan_buffers + reusable_buffers_est))
-	{
+	if (upcoming_alloc_est < (min_scan_buffers + reusable_buffers_est)) {
 #ifdef BGW_DEBUG
 		elog(DEBUG2, "bgwriter: alloc_est=%d too small, using min=%d + reusable_est=%d",
 			 upcoming_alloc_est, min_scan_buffers, reusable_buffers_est);
@@ -5955,39 +5632,33 @@ BgBufferSync(WritebackContext *wb_context)
 	reusable_buffers = reusable_buffers_est;
 
 	/* Execute the LRU scan */
-	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est)
-	{
-		int			sync_state = SyncOneBuffer(next_to_clean, true,
-											   wb_context);
+	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est) {
+		int sync_state = SyncOneBuffer(next_to_clean, true, wb_context);
 
-		if (++next_to_clean >= NBuffers)
-		{
+		if (++next_to_clean >= NBuffers) {
 			next_to_clean = 0;
 			next_passes++;
 		}
 		num_to_scan--;
 
-		if (sync_state & BUF_WRITTEN)
-		{
+		if (sync_state & BUF_WRITTEN) {
 			reusable_buffers++;
-			if (++num_written >= bgwriter_lru_maxpages)
-			{
+			if (++num_written >= bgwriter_lru_maxpages) {
 				PendingBgWriterStats.maxwritten_clean++;
 				break;
 			}
-		}
-		else if (sync_state & BUF_REUSABLE)
+		} else if (sync_state & BUF_REUSABLE)
 			reusable_buffers++;
 	}
 
 	PendingBgWriterStats.buf_written_clean += num_written;
 
 #ifdef BGW_DEBUG
-	elog(DEBUG1, "bgwriter: recent_alloc=%u smoothed=%.2f delta=%ld ahead=%d density=%.2f reusable_est=%d upcoming_est=%d scanned=%d wrote=%d reusable=%d",
-		 recent_alloc, smoothed_alloc, strategy_delta, bufs_ahead,
-		 smoothed_density, reusable_buffers_est, upcoming_alloc_est,
-		 bufs_to_lap - num_to_scan,
-		 num_written,
+	elog(DEBUG1,
+		 "bgwriter: recent_alloc=%u smoothed=%.2f delta=%ld ahead=%d density=%.2f reusable_est=%d "
+		 "upcoming_est=%d scanned=%d wrote=%d reusable=%d",
+		 recent_alloc, smoothed_alloc, strategy_delta, bufs_ahead, smoothed_density,
+		 reusable_buffers_est, upcoming_alloc_est, bufs_to_lap - num_to_scan, num_written,
 		 reusable_buffers - reusable_buffers_est);
 #endif
 
@@ -6001,16 +5672,13 @@ BgBufferSync(WritebackContext *wb_context)
 	 */
 	new_strategy_delta = bufs_to_lap - num_to_scan;
 	new_recent_alloc = reusable_buffers - reusable_buffers_est;
-	if (new_strategy_delta > 0 && new_recent_alloc > 0)
-	{
-		scans_per_alloc = (float) new_strategy_delta / (float) new_recent_alloc;
-		smoothed_density += (scans_per_alloc - smoothed_density) /
-			smoothing_samples;
+	if (new_strategy_delta > 0 && new_recent_alloc > 0) {
+		scans_per_alloc = (float)new_strategy_delta / (float)new_recent_alloc;
+		smoothed_density += (scans_per_alloc - smoothed_density) / smoothing_samples;
 
 #ifdef BGW_DEBUG
 		elog(DEBUG2, "bgwriter: cleaner density alloc=%u scan=%ld density=%.2f new smoothed=%.2f",
-			 new_recent_alloc, new_strategy_delta,
-			 scans_per_alloc, smoothed_density);
+			 new_recent_alloc, new_strategy_delta, scans_per_alloc, smoothed_density);
 #endif
 	}
 
@@ -6038,9 +5706,9 @@ static int
 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 {
 	BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
-	int			result = 0;
-	uint32		buf_state;
-	BufferTag	tag;
+	int result = 0;
+	uint32 buf_state;
+	BufferTag tag;
 
 	ReservePrivateRefCountEntry();
 
@@ -6061,27 +5729,21 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * A live retained image is neither reusable nor writable.  Test before
 	 * advertising BUF_REUSABLE; finish/release serialize the later race with
 	 * the content-lock recheck below. */
-	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(bufHdr, buf_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(bufHdr, buf_state)) {
 		UnlockBufHdr(bufHdr, buf_state);
 		return 0;
 	}
 #endif
 
-	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 && BUF_STATE_GET_USAGECOUNT(buf_state) == 0) {
 		result |= BUF_REUSABLE;
-	}
-	else if (skip_recently_used)
-	{
+	} else if (skip_recently_used) {
 		/* Caller told us not to write recently-used buffers */
 		UnlockBufHdr(bufHdr, buf_state);
 		return result;
 	}
 
-	if (!(buf_state & BM_VALID) || !(buf_state & BM_DIRTY))
-	{
+	if (!(buf_state & BM_VALID) || !(buf_state & BM_DIRTY)) {
 		/* It's clean, so nothing to do */
 		UnlockBufHdr(bufHdr, buf_state);
 		return result;
@@ -6101,8 +5763,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * the transition is now complete and stable.
 	 */
 	buf_state = LockBufHdr(bufHdr);
-	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(bufHdr, buf_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(bufHdr, buf_state)) {
 		UnlockBufHdr(bufHdr, buf_state);
 		LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 		UnpinBuffer(bufHdr);
@@ -6166,7 +5827,7 @@ AtEOXact_Buffers(bool isCommit)
 void
 InitBufferPoolAccess(void)
 {
-	HASHCTL		hash_ctl;
+	HASHCTL hash_ctl;
 
 	memset(&PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
 #ifdef USE_PGRAC_CLUSTER
@@ -6177,8 +5838,7 @@ InitBufferPoolAccess(void)
 	hash_ctl.keysize = sizeof(int32);
 	hash_ctl.entrysize = sizeof(PrivateRefCountEntry);
 
-	PrivateRefCountHash = hash_create("PrivateRefCount", 100, &hash_ctl,
-									  HASH_ELEM | HASH_BLOBS);
+	PrivateRefCountHash = hash_create("PrivateRefCount", 100, &hash_ctl, HASH_ELEM | HASH_BLOBS);
 
 	/*
 	 * AtProcExit_Buffers needs LWLock access, and thereby has to be called at
@@ -6218,30 +5878,26 @@ static void
 CheckForBufferLeaks(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	int			RefCountErrors = 0;
+	int RefCountErrors = 0;
 	PrivateRefCountEntry *res;
-	int			i;
+	int i;
 
 	/* check the array */
-	for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++)
-	{
+	for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++) {
 		res = &PrivateRefCountArray[i];
 
-		if (res->buffer != InvalidBuffer)
-		{
+		if (res->buffer != InvalidBuffer) {
 			PrintBufferLeakWarning(res->buffer);
 			RefCountErrors++;
 		}
 	}
 
 	/* if necessary search the hash */
-	if (PrivateRefCountOverflowed)
-	{
+	if (PrivateRefCountOverflowed) {
 		HASH_SEQ_STATUS hstat;
 
 		hash_seq_init(&hstat, PrivateRefCountHash);
-		while ((res = (PrivateRefCountEntry *) hash_seq_search(&hstat)) != NULL)
-		{
+		while ((res = (PrivateRefCountEntry *)hash_seq_search(&hstat)) != NULL) {
 			PrintBufferLeakWarning(res->buffer);
 			RefCountErrors++;
 		}
@@ -6276,11 +5932,10 @@ AssertBufferLocksPermitCatalogRead(void)
 }
 
 static void
-AssertNotCatalogBufferLock(LWLock *lock, LWLockMode mode,
-						   void *unused_context)
+AssertNotCatalogBufferLock(LWLock *lock, LWLockMode mode, void *unused_context)
 {
 	BufferDesc *bufHdr;
-	BufferTag	tag;
+	BufferTag tag;
 	Oid relid;
 
 	if (mode != LW_EXCLUSIVE)
@@ -6336,34 +5991,29 @@ void
 PrintBufferLeakWarning(Buffer buffer)
 {
 	BufferDesc *buf;
-	int32		loccount;
-	char	   *path;
-	BackendId	backend;
-	uint32		buf_state;
+	int32 loccount;
+	char *path;
+	BackendId backend;
+	uint32 buf_state;
 
 	Assert(BufferIsValid(buffer));
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		buf = GetLocalBufferDescriptor(-buffer - 1);
 		loccount = LocalRefCount[-buffer - 1];
 		backend = MyBackendId;
-	}
-	else
-	{
+	} else {
 		buf = GetBufferDescriptor(buffer - 1);
 		loccount = GetPrivateRefCount(buffer);
 		backend = InvalidBackendId;
 	}
 
 	/* theoretically we should lock the bufhdr here */
-	path = relpathbackend(BufTagGetRelFileLocator(&buf->tag), backend,
-						  BufTagGetForkNum(&buf->tag));
+	path = relpathbackend(BufTagGetRelFileLocator(&buf->tag), backend, BufTagGetForkNum(&buf->tag));
 	buf_state = pg_atomic_read_u32(&buf->state);
 	elog(WARNING,
 		 "buffer refcount leak: [%03d] "
 		 "(rel=%s, blockNum=%u, flags=0x%x, refcount=%u %d)",
-		 buffer, path,
-		 buf->tag.blockNum, buf_state & BUF_FLAG_MASK,
+		 buffer, path, buf->tag.blockNum, buf_state & BUF_FLAG_MASK,
 		 BUF_STATE_GET_REFCOUNT(buf_state), loccount);
 	pfree(path);
 }
@@ -6412,8 +6062,7 @@ BufferGetBlockNumber(Buffer buffer)
  *		a buffer.
  */
 void
-BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
-			 BlockNumber *blknum)
+BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum, BlockNumber *blknum)
 {
 	BufferDesc *bufHdr;
 
@@ -6451,15 +6100,14 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  * as the second parameter.  If not, pass NULL.
  */
 static void
-FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object, IOContext io_context)
 {
-	XLogRecPtr	recptr;
+	XLogRecPtr recptr;
 	ErrorContextCallback errcallback;
-	instr_time	io_start;
-	Block		bufBlock;
-	char	   *bufToWrite;
-	uint32		buf_state;
+	instr_time io_start;
+	Block bufBlock;
+	char *bufToWrite;
+	uint32 buf_state;
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -6469,8 +6117,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * enter StartBufferIO for old transfer bytes.
 	 */
 	buf_state = LockBufHdr(buf);
-	if (cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)) {
 		UnlockBufHdr(buf, buf_state);
 		return;
 	}
@@ -6501,7 +6148,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
-	errcallback.arg = (void *) buf;
+	errcallback.arg = (void *)buf;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
@@ -6509,11 +6156,9 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (reln == NULL)
 		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId);
 
-	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
-										buf->tag.blockNum,
-										reln->smgr_rlocator.locator.spcOid,
-										reln->smgr_rlocator.locator.dbOid,
-										reln->smgr_rlocator.locator.relNumber);
+	TRACE_POSTGRESQL_BUFFER_FLUSH_START(
+		BufTagGetForkNum(&buf->tag), buf->tag.blockNum, reln->smgr_rlocator.locator.spcOid,
+		reln->smgr_rlocator.locator.dbOid, reln->smgr_rlocator.locator.relNumber);
 
 	buf_state = LockBufHdr(buf);
 
@@ -6562,8 +6207,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * the only local additions on top of a shipped image are hint-class
 	 * changes (ITL lazy cleanout, index kill bits), which emit no WAL.
 	 */
-	if (cluster_storage_mode_enabled() && !RecoveryInProgress()
-		&& recptr > GetXLogInsertRecPtr())
+	if (cluster_storage_mode_enabled() && !RecoveryInProgress() && recptr > GetXLogInsertRecPtr())
 		recptr = InvalidXLogRecPtr;
 #endif
 	if (buf_state & BM_PERMANENT)
@@ -6581,18 +6225,14 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * buffer, other processes might be updating hint bits in it, so we must
 	 * copy the page to private storage if we do checksumming.
 	 */
-	bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf->tag.blockNum);
+	bufToWrite = PageSetChecksumCopy((Page)bufBlock, buf->tag.blockNum);
 
 	io_start = pgstat_prepare_io_time();
 
 	/*
 	 * bufToWrite is either the shared buffer or a copy, as appropriate.
 	 */
-	smgrwrite(reln,
-			  BufTagGetForkNum(&buf->tag),
-			  buf->tag.blockNum,
-			  bufToWrite,
-			  false);
+	smgrwrite(reln, BufTagGetForkNum(&buf->tag), buf->tag.blockNum, bufToWrite, false);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -6610,9 +6250,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * the master's watermark check and the holder's strict PI-only drop own
 	 * correctness).
 	 */
-	if (cluster_past_image && buf->pcm_state != (uint8) PCM_STATE_N)
-		cluster_gcs_block_pi_write_note(buf->tag,
-										((PageHeader) bufToWrite)->pd_block_scn);
+	if (cluster_past_image && buf->pcm_state != (uint8)PCM_STATE_N)
+		cluster_gcs_block_pi_write_note(buf->tag, ((PageHeader)bufToWrite)->pd_block_scn);
 #endif
 
 	/*
@@ -6633,8 +6272,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * When a strategy is not in use, the write can only be a "regular" write
 	 * of a dirty shared buffer (IOCONTEXT_NORMAL IOOP_WRITE).
 	 */
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
-							IOOP_WRITE, io_start, 1);
+	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_WRITE, io_start, 1);
 
 	pgBufferUsage.shared_blks_written++;
 
@@ -6644,11 +6282,9 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	TerminateBufferIO(buf, true, 0);
 
-	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&buf->tag),
-									   buf->tag.blockNum,
-									   reln->smgr_rlocator.locator.spcOid,
-									   reln->smgr_rlocator.locator.dbOid,
-									   reln->smgr_rlocator.locator.relNumber);
+	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(
+		BufTagGetForkNum(&buf->tag), buf->tag.blockNum, reln->smgr_rlocator.locator.spcOid,
+		reln->smgr_rlocator.locator.dbOid, reln->smgr_rlocator.locator.relNumber);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
@@ -6665,28 +6301,24 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 BlockNumber
 RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 {
-	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
-	{
+	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind)) {
 		/*
 		 * Not every table AM uses BLCKSZ wide fixed size blocks. Therefore
 		 * tableam returns the size in bytes - but for the purpose of this
 		 * routine, we want the number of blocks. Therefore divide, rounding
 		 * up.
 		 */
-		uint64		szbytes;
+		uint64 szbytes;
 
 		szbytes = table_relation_size(relation, forkNum);
 
 		return (szbytes + (BLCKSZ - 1)) / BLCKSZ;
-	}
-	else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
-	{
+	} else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind)) {
 		return smgrnblocks(RelationGetSmgr(relation), forkNum);
-	}
-	else
+	} else
 		Assert(false);
 
-	return 0;					/* keep compiler quiet */
+	return 0; /* keep compiler quiet */
 }
 
 /*
@@ -6727,10 +6359,10 @@ BufferIsPermanent(Buffer buffer)
 XLogRecPtr
 BufferGetLSNAtomic(Buffer buffer)
 {
-	char	   *page = BufferGetPage(buffer);
+	char *page = BufferGetPage(buffer);
 	BufferDesc *bufHdr;
-	XLogRecPtr	lsn;
-	uint32		buf_state;
+	XLogRecPtr lsn;
+	uint32 buf_state;
 
 	/*
 	 * If we don't need locking for correctness, fastpath out.
@@ -6772,25 +6404,22 @@ BufferGetLSNAtomic(Buffer buffer)
  * --------------------------------------------------------------------
  */
 void
-DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
-					int nforks, BlockNumber *firstDelBlock)
+DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum, int nforks,
+					BlockNumber *firstDelBlock)
 {
-	int			i;
-	int			j;
+	int i;
+	int j;
 	RelFileLocatorBackend rlocator;
 	BlockNumber nForkBlock[MAX_FORKNUM];
-	uint64		nBlocksToInvalidate = 0;
+	uint64 nBlocksToInvalidate = 0;
 
 	rlocator = smgr_reln->smgr_rlocator;
 
 	/* If it's a local relation, it's localbuf.c's problem. */
-	if (RelFileLocatorBackendIsTemp(rlocator))
-	{
-		if (rlocator.backend == MyBackendId)
-		{
+	if (RelFileLocatorBackendIsTemp(rlocator)) {
+		if (rlocator.backend == MyBackendId) {
 			for (j = 0; j < nforks; j++)
-				DropRelationLocalBuffers(rlocator.locator, forkNum[j],
-										 firstDelBlock[j]);
+				DropRelationLocalBuffers(rlocator.locator, forkNum[j], firstDelBlock[j]);
 		}
 		return;
 	}
@@ -6817,13 +6446,11 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	 * that should be fine because there must not be any buffers after that
 	 * file size.
 	 */
-	for (i = 0; i < nforks; i++)
-	{
+	for (i = 0; i < nforks; i++) {
 		/* Get the number of blocks for a relation's fork */
 		nForkBlock[i] = smgrnblocks_cached(smgr_reln, forkNum[i]);
 
-		if (nForkBlock[i] == InvalidBlockNumber)
-		{
+		if (nForkBlock[i] == InvalidBlockNumber) {
 			nBlocksToInvalidate = InvalidBlockNumber;
 			break;
 		}
@@ -6836,19 +6463,17 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	 * We apply the optimization iff the total number of blocks to invalidate
 	 * is below the BUF_DROP_FULL_SCAN_THRESHOLD.
 	 */
-	if (BlockNumberIsValid(nBlocksToInvalidate) &&
-		nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD)
-	{
+	if (BlockNumberIsValid(nBlocksToInvalidate)
+		&& nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD) {
 		for (j = 0; j < nforks; j++)
-			FindAndDropRelationBuffers(rlocator.locator, forkNum[j],
-									   nForkBlock[j], firstDelBlock[j]);
+			FindAndDropRelationBuffers(rlocator.locator, forkNum[j], nForkBlock[j],
+									   firstDelBlock[j]);
 		return;
 	}
 
-	for (i = 0; i < NBuffers; i++)
-	{
+	for (i = 0; i < NBuffers; i++) {
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		/*
 		 * We can make this a tad faster by prechecking the buffer tag before
@@ -6871,13 +6496,11 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 
 		buf_state = LockBufHdr(bufHdr);
 
-		for (j = 0; j < nforks; j++)
-		{
-			if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator.locator) &&
-				BufTagGetForkNum(&bufHdr->tag) == forkNum[j] &&
-				bufHdr->tag.blockNum >= firstDelBlock[j])
-			{
-				InvalidateBuffer(bufHdr);	/* releases spinlock */
+		for (j = 0; j < nforks; j++) {
+			if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator.locator)
+				&& BufTagGetForkNum(&bufHdr->tag) == forkNum[j]
+				&& bufHdr->tag.blockNum >= firstDelBlock[j]) {
+				InvalidateBuffer(bufHdr); /* releases spinlock */
 				break;
 			}
 		}
@@ -6897,29 +6520,26 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 void
 DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 {
-	int			i;
-	int			n = 0;
+	int i;
+	int n = 0;
 	SMgrRelation *rels;
-	BlockNumber (*block)[MAX_FORKNUM + 1];
-	uint64		nBlocksToInvalidate = 0;
+	BlockNumber(*block)[MAX_FORKNUM + 1];
+	uint64 nBlocksToInvalidate = 0;
 	RelFileLocator *locators;
-	bool		cached = true;
-	bool		use_bsearch;
+	bool cached = true;
+	bool use_bsearch;
 
 	if (nlocators == 0)
 		return;
 
-	rels = palloc(sizeof(SMgrRelation) * nlocators);	/* non-local relations */
+	rels = palloc(sizeof(SMgrRelation) * nlocators); /* non-local relations */
 
 	/* If it's a local relation, it's localbuf.c's problem. */
-	for (i = 0; i < nlocators; i++)
-	{
-		if (RelFileLocatorBackendIsTemp(smgr_reln[i]->smgr_rlocator))
-		{
+	for (i = 0; i < nlocators; i++) {
+		if (RelFileLocatorBackendIsTemp(smgr_reln[i]->smgr_rlocator)) {
 			if (smgr_reln[i]->smgr_rlocator.backend == MyBackendId)
 				DropRelationAllLocalBuffers(smgr_reln[i]->smgr_rlocator.locator);
-		}
-		else
+		} else
 			rels[n++] = smgr_reln[i];
 	}
 
@@ -6927,8 +6547,7 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	 * If there are no non-local relations, then we're done. Release the
 	 * memory and return.
 	 */
-	if (n == 0)
-	{
+	if (n == 0) {
 		pfree(rels);
 		return;
 	}
@@ -6937,23 +6556,19 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	 * This is used to remember the number of blocks for all the relations
 	 * forks.
 	 */
-	block = (BlockNumber (*)[MAX_FORKNUM + 1])
-		palloc(sizeof(BlockNumber) * n * (MAX_FORKNUM + 1));
+	block = (BlockNumber(*)[MAX_FORKNUM + 1]) palloc(sizeof(BlockNumber) * n * (MAX_FORKNUM + 1));
 
 	/*
 	 * We can avoid scanning the entire buffer pool if we know the exact size
 	 * of each of the given relation forks. See DropRelationBuffers.
 	 */
-	for (i = 0; i < n && cached; i++)
-	{
-		for (int j = 0; j <= MAX_FORKNUM; j++)
-		{
+	for (i = 0; i < n && cached; i++) {
+		for (int j = 0; j <= MAX_FORKNUM; j++) {
 			/* Get the number of blocks for a relation's fork. */
 			block[i][j] = smgrnblocks_cached(rels[i], j);
 
 			/* We need to only consider the relation forks that exists. */
-			if (block[i][j] == InvalidBlockNumber)
-			{
+			if (block[i][j] == InvalidBlockNumber) {
 				if (!smgrexists(rels[i], j))
 					continue;
 				cached = false;
@@ -6969,19 +6584,15 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	 * We apply the optimization iff the total number of blocks to invalidate
 	 * is below the BUF_DROP_FULL_SCAN_THRESHOLD.
 	 */
-	if (cached && nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD)
-	{
-		for (i = 0; i < n; i++)
-		{
-			for (int j = 0; j <= MAX_FORKNUM; j++)
-			{
+	if (cached && nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD) {
+		for (i = 0; i < n; i++) {
+			for (int j = 0; j <= MAX_FORKNUM; j++) {
 				/* ignore relation forks that doesn't exist */
 				if (!BlockNumberIsValid(block[i][j]))
 					continue;
 
 				/* drop all the buffers for a particular relation fork */
-				FindAndDropRelationBuffers(rels[i]->smgr_rlocator.locator,
-										   j, block[i][j], 0);
+				FindAndDropRelationBuffers(rels[i]->smgr_rlocator.locator, j, block[i][j], 0);
 			}
 		}
 
@@ -6991,7 +6602,7 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	}
 
 	pfree(block);
-	locators = palloc(sizeof(RelFileLocator) * n);	/* non-local relations */
+	locators = palloc(sizeof(RelFileLocator) * n); /* non-local relations */
 	for (i = 0; i < n; i++)
 		locators[i] = rels[i]->smgr_rlocator.locator;
 
@@ -7007,37 +6618,30 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	if (use_bsearch)
 		pg_qsort(locators, n, sizeof(RelFileLocator), rlocator_comparator);
 
-	for (i = 0; i < NBuffers; i++)
-	{
+	for (i = 0; i < NBuffers; i++) {
 		RelFileLocator *rlocator = NULL;
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		/*
 		 * As in DropRelationBuffers, an unlocked precheck should be safe and
 		 * saves some cycles.
 		 */
 
-		if (!use_bsearch)
-		{
-			int			j;
+		if (!use_bsearch) {
+			int j;
 
-			for (j = 0; j < n; j++)
-			{
-				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &locators[j]))
-				{
+			for (j = 0; j < n; j++) {
+				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &locators[j])) {
 					rlocator = &locators[j];
 					break;
 				}
 			}
-		}
-		else
-		{
+		} else {
 			RelFileLocator locator;
 
 			locator = BufTagGetRelFileLocator(&bufHdr->tag);
-			rlocator = bsearch((const void *) &(locator),
-							   locators, n, sizeof(RelFileLocator),
+			rlocator = bsearch((const void *)&(locator), locators, n, sizeof(RelFileLocator),
 							   rlocator_comparator);
 		}
 
@@ -7047,7 +6651,7 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 
 		buf_state = LockBufHdr(bufHdr);
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
+			InvalidateBuffer(bufHdr); /* releases spinlock */
 		else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
@@ -7066,20 +6670,18 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
  * --------------------------------------------------------------------
  */
 static void
-FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
-						   BlockNumber nForkBlock,
+FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber nForkBlock,
 						   BlockNumber firstDelBlock)
 {
 	BlockNumber curBlock;
 
-	for (curBlock = firstDelBlock; curBlock < nForkBlock; curBlock++)
-	{
-		uint32		bufHash;	/* hash value for tag */
-		BufferTag	bufTag;		/* identity of requested block */
-		LWLock	   *bufPartitionLock;	/* buffer partition lock for it */
-		int			buf_id;
+	for (curBlock = firstDelBlock; curBlock < nForkBlock; curBlock++) {
+		uint32 bufHash;			  /* hash value for tag */
+		BufferTag bufTag;		  /* identity of requested block */
+		LWLock *bufPartitionLock; /* buffer partition lock for it */
+		int buf_id;
 		BufferDesc *bufHdr;
-		uint32		buf_state;
+		uint32 buf_state;
 
 		/* create a tag so we can lookup the buffer */
 		InitBufferTag(&bufTag, &rlocator, forkNum, curBlock);
@@ -7106,10 +6708,9 @@ FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 		 */
 		buf_state = LockBufHdr(bufHdr);
 
-		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator) &&
-			BufTagGetForkNum(&bufHdr->tag) == forkNum &&
-			bufHdr->tag.blockNum >= firstDelBlock)
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
+		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator)
+			&& BufTagGetForkNum(&bufHdr->tag) == forkNum && bufHdr->tag.blockNum >= firstDelBlock)
+			InvalidateBuffer(bufHdr); /* releases spinlock */
 		else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
@@ -7129,17 +6730,16 @@ FindAndDropRelationBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 void
 DropDatabaseBuffers(Oid dbid)
 {
-	int			i;
+	int i;
 
 	/*
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.
 	 */
 
-	for (i = 0; i < NBuffers; i++)
-	{
+	for (i = 0; i < NBuffers; i++) {
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		/*
 		 * As in DropRelationBuffers, an unlocked precheck should be safe and
@@ -7150,7 +6750,7 @@ DropDatabaseBuffers(Oid dbid)
 
 		buf_state = LockBufHdr(bufHdr);
 		if (bufHdr->tag.dbOid == dbid)
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
+			InvalidateBuffer(bufHdr); /* releases spinlock */
 		else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
@@ -7167,22 +6767,20 @@ DropDatabaseBuffers(Oid dbid)
 void
 PrintBufferDescs(void)
 {
-	int			i;
+	int i;
 
-	for (i = 0; i < NBuffers; ++i)
-	{
+	for (i = 0; i < NBuffers; ++i) {
 		BufferDesc *buf = GetBufferDescriptor(i);
-		Buffer		b = BufferDescriptorGetBuffer(buf);
+		Buffer b = BufferDescriptorGetBuffer(buf);
 
 		/* theoretically we should lock the bufhdr here */
 		elog(LOG,
 			 "[%02d] (freeNext=%d, rel=%s, "
 			 "blockNum=%u, flags=0x%x, refcount=%u %d)",
 			 i, buf->freeNext,
-			 relpathbackend(BufTagGetRelFileLocator(&buf->tag),
-							InvalidBackendId, BufTagGetForkNum(&buf->tag)),
-			 buf->tag.blockNum, buf->flags,
-			 buf->refcount, GetPrivateRefCount(b));
+			 relpathbackend(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId,
+							BufTagGetForkNum(&buf->tag)),
+			 buf->tag.blockNum, buf->flags, buf->refcount, GetPrivateRefCount(b));
 	}
 }
 #endif
@@ -7191,24 +6789,20 @@ PrintBufferDescs(void)
 void
 PrintPinnedBufs(void)
 {
-	int			i;
+	int i;
 
-	for (i = 0; i < NBuffers; ++i)
-	{
+	for (i = 0; i < NBuffers; ++i) {
 		BufferDesc *buf = GetBufferDescriptor(i);
-		Buffer		b = BufferDescriptorGetBuffer(buf);
+		Buffer b = BufferDescriptorGetBuffer(buf);
 
-		if (GetPrivateRefCount(b) > 0)
-		{
+		if (GetPrivateRefCount(b) > 0) {
 			/* theoretically we should lock the bufhdr here */
 			elog(LOG,
 				 "[%02d] (freeNext=%d, rel=%s, "
 				 "blockNum=%u, flags=0x%x, refcount=%u %d)",
 				 i, buf->freeNext,
-				 relpathperm(BufTagGetRelFileLocator(&buf->tag),
-							 BufTagGetForkNum(&buf->tag)),
-				 buf->tag.blockNum, buf->flags,
-				 buf->refcount, GetPrivateRefCount(b));
+				 relpathperm(BufTagGetRelFileLocator(&buf->tag), BufTagGetForkNum(&buf->tag)),
+				 buf->tag.blockNum, buf->flags, buf->refcount, GetPrivateRefCount(b));
 		}
 	}
 }
@@ -7235,29 +6829,26 @@ PrintPinnedBufs(void)
 void
 FlushRelationBuffers(Relation rel)
 {
-	int			i;
+	int i;
 	BufferDesc *bufHdr;
 
-	if (RelationUsesLocalBuffers(rel))
-	{
-		for (i = 0; i < NLocBuffer; i++)
-		{
-			uint32		buf_state;
-			instr_time	io_start;
+	if (RelationUsesLocalBuffers(rel)) {
+		for (i = 0; i < NLocBuffer; i++) {
+			uint32 buf_state;
+			instr_time io_start;
 
 			bufHdr = GetLocalBufferDescriptor(i);
-			if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator) &&
-				((buf_state = pg_atomic_read_u32(&bufHdr->state)) &
-				 (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-			{
+			if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator)
+				&& ((buf_state = pg_atomic_read_u32(&bufHdr->state)) & (BM_VALID | BM_DIRTY))
+					   == (BM_VALID | BM_DIRTY)) {
 				ErrorContextCallback errcallback;
-				Page		localpage;
+				Page localpage;
 
-				localpage = (char *) LocalBufHdrGetBlock(bufHdr);
+				localpage = (char *)LocalBufHdrGetBlock(bufHdr);
 
 				/* Setup error traceback support for ereport() */
 				errcallback.callback = local_buffer_write_error_callback;
-				errcallback.arg = (void *) bufHdr;
+				errcallback.arg = (void *)bufHdr;
 				errcallback.previous = error_context_stack;
 				error_context_stack = &errcallback;
 
@@ -7265,14 +6856,10 @@ FlushRelationBuffers(Relation rel)
 
 				io_start = pgstat_prepare_io_time();
 
-				smgrwrite(RelationGetSmgr(rel),
-						  BufTagGetForkNum(&bufHdr->tag),
-						  bufHdr->tag.blockNum,
-						  localpage,
-						  false);
+				smgrwrite(RelationGetSmgr(rel), BufTagGetForkNum(&bufHdr->tag),
+						  bufHdr->tag.blockNum, localpage, false);
 
-				pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION,
-										IOCONTEXT_NORMAL, IOOP_WRITE,
+				pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_WRITE,
 										io_start, 1);
 
 				buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED);
@@ -7291,9 +6878,8 @@ FlushRelationBuffers(Relation rel)
 	/* Make sure we can handle the pin inside the loop */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	for (i = 0; i < NBuffers; i++)
-	{
-		uint32		buf_state;
+	for (i = 0; i < NBuffers; i++) {
+		uint32 buf_state;
 
 		bufHdr = GetBufferDescriptor(i);
 
@@ -7307,16 +6893,14 @@ FlushRelationBuffers(Relation rel)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
-		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator) &&
-			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
+		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator)
+			&& (buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY)) {
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, RelationGetSmgr(rel), IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
-		}
-		else
+		} else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
 }
@@ -7333,9 +6917,9 @@ FlushRelationBuffers(Relation rel)
 void
 FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 {
-	int			i;
+	int i;
 	SMgrSortArray *srels;
-	bool		use_bsearch;
+	bool use_bsearch;
 
 	if (nrels == 0)
 		return;
@@ -7343,8 +6927,7 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 	/* fill-in array for qsort */
 	srels = palloc(sizeof(SMgrSortArray) * nrels);
 
-	for (i = 0; i < nrels; i++)
-	{
+	for (i = 0; i < nrels; i++) {
 		Assert(!RelFileLocatorBackendIsTemp(smgrs[i]->smgr_rlocator));
 
 		srels[i].rlocator = smgrs[i]->smgr_rlocator.locator;
@@ -7364,37 +6947,30 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 	/* Make sure we can handle the pin inside the loop */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	for (i = 0; i < NBuffers; i++)
-	{
+	for (i = 0; i < NBuffers; i++) {
 		SMgrSortArray *srelent = NULL;
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		/*
 		 * As in DropRelationBuffers, an unlocked precheck should be safe and
 		 * saves some cycles.
 		 */
 
-		if (!use_bsearch)
-		{
-			int			j;
+		if (!use_bsearch) {
+			int j;
 
-			for (j = 0; j < nrels; j++)
-			{
-				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srels[j].rlocator))
-				{
+			for (j = 0; j < nrels; j++) {
+				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srels[j].rlocator)) {
 					srelent = &srels[j];
 					break;
 				}
 			}
-		}
-		else
-		{
+		} else {
 			RelFileLocator rlocator;
 
 			rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
-			srelent = bsearch((const void *) &(rlocator),
-							  srels, nrels, sizeof(SMgrSortArray),
+			srelent = bsearch((const void *)&(rlocator), srels, nrels, sizeof(SMgrSortArray),
 							  rlocator_comparator);
 		}
 
@@ -7405,16 +6981,14 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
-		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srelent->rlocator) &&
-			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
+		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srelent->rlocator)
+			&& (buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY)) {
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
-		}
-		else
+		} else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
 
@@ -7432,15 +7006,14 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
  * --------------------------------------------------------------------
  */
 static void
-RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
-							   RelFileLocator dstlocator,
+RelationCopyStorageUsingBuffer(RelFileLocator srclocator, RelFileLocator dstlocator,
 							   ForkNumber forkNum, bool permanent)
 {
-	Buffer		srcBuf;
-	Buffer		dstBuf;
-	Page		srcPage;
-	Page		dstPage;
-	bool		use_wal;
+	Buffer srcBuf;
+	Buffer dstBuf;
+	Page srcPage;
+	Page dstPage;
+	bool use_wal;
 	BlockNumber nblocks;
 	BlockNumber blkno;
 	PGIOAlignedBlock buf;
@@ -7455,8 +7028,7 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	use_wal = XLogIsNeeded() && (permanent || forkNum == INIT_FORKNUM);
 
 	/* Get number of blocks in the source relation. */
-	nblocks = smgrnblocks(smgropen(srclocator, InvalidBackendId),
-						  forkNum);
+	nblocks = smgrnblocks(smgropen(srclocator, InvalidBackendId), forkNum);
 
 	/* Nothing to copy; just return. */
 	if (nblocks == 0)
@@ -7467,28 +7039,24 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	 * relation before starting to copy block by block.
 	 */
 	memset(buf.data, 0, BLCKSZ);
-	smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1,
-			   buf.data, true);
+	smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1, buf.data, true);
 
 	/* This is a bulk operation, so use buffer access strategies. */
 	bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
 	bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
 
 	/* Iterate over each block of the source relation file. */
-	for (blkno = 0; blkno < nblocks; blkno++)
-	{
+	for (blkno = 0; blkno < nblocks; blkno++) {
 		CHECK_FOR_INTERRUPTS();
 
 		/* Read block from source relation. */
-		srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno,
-										   RBM_NORMAL, bstrategy_src,
+		srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno, RBM_NORMAL, bstrategy_src,
 										   permanent);
 		LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
 		srcPage = BufferGetPage(srcBuf);
 
-		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno,
-										   RBM_ZERO_AND_LOCK, bstrategy_dst,
-										   permanent);
+		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno, RBM_ZERO_AND_LOCK,
+										   bstrategy_dst, permanent);
 		dstPage = BufferGetPage(dstBuf);
 
 		START_CRIT_SECTION();
@@ -7523,15 +7091,13 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
  * --------------------------------------------------------------------
  */
 void
-CreateAndCopyRelationData(RelFileLocator src_rlocator,
-						  RelFileLocator dst_rlocator, bool permanent)
+CreateAndCopyRelationData(RelFileLocator src_rlocator, RelFileLocator dst_rlocator, bool permanent)
 {
 	RelFileLocatorBackend rlocator;
-	char		relpersistence;
+	char relpersistence;
 
 	/* Set the relpersistence. */
-	relpersistence = permanent ?
-		RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED;
+	relpersistence = permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED;
 
 	/*
 	 * Create and copy all forks of the relation.  During create database we
@@ -7542,15 +7108,11 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	RelationCreateStorage(dst_rlocator, relpersistence, false);
 
 	/* copy main fork. */
-	RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, MAIN_FORKNUM,
-								   permanent);
+	RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, MAIN_FORKNUM, permanent);
 
 	/* copy those extra forks that exist */
-	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
-		 forkNum <= MAX_FORKNUM; forkNum++)
-	{
-		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum))
-		{
+	for (ForkNumber forkNum = MAIN_FORKNUM + 1; forkNum <= MAX_FORKNUM; forkNum++) {
+		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum)) {
 			smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
 
 			/*
@@ -7561,8 +7123,7 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 				log_smgrcreate(&dst_rlocator, forkNum);
 
 			/* Copy a fork's data, block by block. */
-			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
-										   permanent);
+			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum, permanent);
 		}
 	}
 
@@ -7594,15 +7155,14 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 void
 FlushDatabaseBuffers(Oid dbid)
 {
-	int			i;
+	int i;
 	BufferDesc *bufHdr;
 
 	/* Make sure we can handle the pin inside the loop */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	for (i = 0; i < NBuffers; i++)
-	{
-		uint32		buf_state;
+	for (i = 0; i < NBuffers; i++) {
+		uint32 buf_state;
 
 		bufHdr = GetBufferDescriptor(i);
 
@@ -7616,16 +7176,14 @@ FlushDatabaseBuffers(Oid dbid)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
-		if (bufHdr->tag.dbOid == dbid &&
-			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
+		if (bufHdr->tag.dbOid == dbid
+			&& (buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY)) {
 			PinBuffer_Locked(bufHdr);
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 			UnpinBuffer(bufHdr);
-		}
-		else
+		} else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
 }
@@ -7693,8 +7251,7 @@ IncrBufferRefCount(Buffer buffer)
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 	if (BufferIsLocal(buffer))
 		LocalRefCount[-buffer - 1]++;
-	else
-	{
+	else {
 		PrivateRefCountEntry *ref;
 
 		ref = GetPrivateRefCountEntry(buffer, true);
@@ -7722,16 +7279,15 @@ void
 MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 {
 	BufferDesc *bufHdr;
-	Page		page = BufferGetPage(buffer);
+	Page page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
-	uint32		retained_state;
+	uint32 retained_state;
 #endif
 
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
 
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		MarkLocalBufferDirty(buffer);
 		return;
 	}
@@ -7750,8 +7306,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	 * dirty state and become eligible for stale output.
 	 */
 	retained_state = LockBufHdr(bufHdr);
-	if (cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, retained_state))
-	{
+	if (cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, retained_state)) {
 		UnlockBufHdr(bufHdr, retained_state);
 		return;
 	}
@@ -7769,13 +7324,12 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	 * is only intended to be used in cases where failing to write out the
 	 * data would be harmless anyway, it doesn't really matter.
 	 */
-	if ((pg_atomic_read_u32(&bufHdr->state) & (BM_DIRTY | BM_JUST_DIRTIED)) !=
-		(BM_DIRTY | BM_JUST_DIRTIED))
-	{
-		XLogRecPtr	lsn = InvalidXLogRecPtr;
-		bool		dirtied = false;
-		bool		delayChkptFlags = false;
-		uint32		buf_state;
+	if ((pg_atomic_read_u32(&bufHdr->state) & (BM_DIRTY | BM_JUST_DIRTIED))
+		!= (BM_DIRTY | BM_JUST_DIRTIED)) {
+		XLogRecPtr lsn = InvalidXLogRecPtr;
+		bool dirtied = false;
+		bool delayChkptFlags = false;
+		uint32 buf_state;
 
 		/*
 		 * If we need to protect hint bit updates from torn writes, WAL-log a
@@ -7786,9 +7340,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 		 * We don't check full_page_writes here because that logic is included
 		 * when we call XLogInsert() since the value changes dynamically.
 		 */
-		if (XLogHintBitIsNeeded() &&
-			(pg_atomic_read_u32(&bufHdr->state) & BM_PERMANENT))
-		{
+		if (XLogHintBitIsNeeded() && (pg_atomic_read_u32(&bufHdr->state) & BM_PERMANENT)) {
 			/*
 			 * If we must not write WAL, due to a relfilelocator-specific
 			 * condition or being in recovery, don't dirty the page.  We can
@@ -7797,8 +7349,8 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 			 *
 			 * See src/backend/storage/page/README for longer discussion.
 			 */
-			if (RecoveryInProgress() ||
-				RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
+			if (RecoveryInProgress()
+				|| RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
 				return;
 
 			/*
@@ -7834,9 +7386,8 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
-		if (!(buf_state & BM_DIRTY))
-		{
-			dirtied = true;		/* Means "will be dirtied by this action" */
+		if (!(buf_state & BM_DIRTY)) {
+			dirtied = true; /* Means "will be dirtied by this action" */
 
 			/*
 			 * Set the page LSN if we wrote a backup block. We aren't supposed
@@ -7861,8 +7412,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 		if (delayChkptFlags)
 			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 
-		if (dirtied)
-		{
+		if (dirtied) {
 			VacuumPageDirty++;
 			pgBufferUsage.shared_blks_dirtied++;
 			if (VacuumCostActive)
@@ -7885,9 +7435,8 @@ UnlockBuffers(void)
 {
 	BufferDesc *buf = PinCountWaitBuf;
 
-	if (buf)
-	{
-		uint32		buf_state;
+	if (buf) {
+		uint32 buf_state;
 
 		buf_state = LockBufHdr(buf);
 
@@ -7895,8 +7444,8 @@ UnlockBuffers(void)
 		 * Don't complain if flag bit not set; it could have been reset but we
 		 * got a cancel/die interrupt before getting the signal.
 		 */
-		if ((buf_state & BM_PIN_COUNT_WAITER) != 0 &&
-			buf->wait_backend_pgprocno == MyProc->pgprocno)
+		if ((buf_state & BM_PIN_COUNT_WAITER) != 0
+			&& buf->wait_backend_pgprocno == MyProc->pgprocno)
 			buf_state &= ~BM_PIN_COUNT_WAITER;
 
 		UnlockBufHdr(buf, buf_state);
@@ -7921,16 +7470,16 @@ LockBuffer(Buffer buffer, int mode)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
-	bool		pcm_acquired = false;
+	bool pcm_acquired = false;
 	PcmLockMode pcm_mode = PCM_LOCK_MODE_N;
-	bool		pcm_covered = false;	/* took the cached-cover fast path */
-	uint64		pcm_covered_gen = 0;	/* ownership generation captured at cover */
-	bool		pcm_pending_set = false;	/* we set GRANT_PENDING (W3), must clear */
+	bool pcm_covered = false;	  /* took the cached-cover fast path */
+	uint64 pcm_covered_gen = 0;	  /* ownership generation captured at cover */
+	bool pcm_pending_set = false; /* we set GRANT_PENDING (W3), must clear */
 	MemoryContext pcm_error_context = CurrentMemoryContext;
 	ClusterPcmOwnSnapshot pcm_pending_base;
 	ClusterPcmOwnResult pcm_pending_result = CLUSTER_PCM_OWN_OK;
-	uint64		pcm_pending_token = 0;
-	uint64		pcm_committed_generation = 0;
+	uint64 pcm_pending_token = 0;
+	uint64 pcm_committed_generation = 0;
 	ClusterPcmXHolderLedgerEntry *pcm_x_holder = NULL;
 	ClusterPcmXWriterLedgerEntry *pcm_x_writer = NULL;
 	bool pcm_x_writer_managed = false;
@@ -7938,22 +7487,18 @@ LockBuffer(Buffer buffer, int mode)
 
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
-		return;					/* local buffers need no lock */
+		return; /* local buffers need no lock */
 
 	buf = GetBufferDescriptor(buffer - 1);
 
-	if (mode != BUFFER_LOCK_UNLOCK &&
-		mode != BUFFER_LOCK_SHARE &&
-		mode != BUFFER_LOCK_EXCLUSIVE)
+	if (mode != BUFFER_LOCK_UNLOCK && mode != BUFFER_LOCK_SHARE && mode != BUFFER_LOCK_EXCLUSIVE)
 		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
 
 #ifdef USE_PGRAC_CLUSTER
-	if (mode != BUFFER_LOCK_UNLOCK &&
-		cluster_pcm_is_active() &&
-		cluster_bufmgr_should_pcm_track(buf))
-	{
-		uint8		pcm_initial_state = (uint8)PCM_STATE_N;
-		uint32		pcm_initial_flags = 0;
+	if (mode != BUFFER_LOCK_UNLOCK && cluster_pcm_is_active()
+		&& cluster_bufmgr_should_pcm_track(buf)) {
+		uint8 pcm_initial_state = (uint8)PCM_STATE_N;
+		uint32 pcm_initial_flags = 0;
 
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 
@@ -7963,10 +7508,10 @@ LockBuffer(Buffer buffer, int mode)
 		 * re-enqueues the same node X.  The post-content-lock generation
 		 * check below remains the race-closing authority. */
 		if (pcm_mode == PCM_LOCK_MODE_X && cluster_gcs_block_local_cache) {
-			cluster_pcm_own_read(buf, &pcm_initial_state, &pcm_covered_gen,
-								 &pcm_initial_flags);
-			pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(cluster_gcs_block_local_cache,
-				pcm_mode == PCM_LOCK_MODE_X, pcm_initial_state, pcm_initial_flags);
+			cluster_pcm_own_read(buf, &pcm_initial_state, &pcm_covered_gen, &pcm_initial_flags);
+			pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(
+				cluster_gcs_block_local_cache, pcm_mode == PCM_LOCK_MODE_X, pcm_initial_state,
+				pcm_initial_flags);
 		}
 
 		if (!pcm_covered)
@@ -8076,8 +7621,7 @@ LockBuffer(Buffer buffer, int mode)
 	}
 #endif
 
-	if (mode == BUFFER_LOCK_UNLOCK)
-	{
+	if (mode == BUFFER_LOCK_UNLOCK) {
 #ifdef USE_PGRAC_CLUSTER
 		pcm_x_writer = cluster_bufmgr_pcm_x_writer_find(buf);
 		pcm_x_writer_managed = pcm_x_writer != NULL;
@@ -8090,9 +7634,7 @@ LockBuffer(Buffer buffer, int mode)
 		cluster_bufmgr_pcm_x_writer_release(pcm_x_writer);
 		cluster_bufmgr_pcm_x_holder_unregister(pcm_x_holder);
 #endif
-	}
-	else
-	{
+	} else {
 #ifdef USE_PGRAC_CLUSTER
 		/*
 		 * GCS serve-stall round-6 (ownership P0) — cached-X BAST window.
@@ -8137,17 +7679,15 @@ LockBuffer(Buffer buffer, int mode)
 			 * content lock and the downgrade path serializes under it, so no
 			 * further downgrade can intervene -- at most one fallback.
 			 */
-			if (pcm_covered)
-			{
-				uint8		cur_state;
-				uint64		cur_gen;
-				uint32		cur_flags;
+			if (pcm_covered) {
+				uint8 cur_state;
+				uint64 cur_gen;
+				uint32 cur_flags;
 
 				cluster_pcm_own_read(buf, &cur_state, &cur_gen, &cur_flags);
 				if (cur_gen != pcm_covered_gen
-					|| !cluster_pcm_mode_covers((PcmLockMode) cur_state, pcm_mode)
-					|| (cur_flags & (PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING)) != 0)
-				{
+					|| !cluster_pcm_mode_covers((PcmLockMode)cur_state, pcm_mode)
+					|| (cur_flags & (PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING)) != 0) {
 					cluster_pcm_note_writer_cover_stale_detected();
 					pcm_covered = false;
 					LWLockRelease(BufferDescriptorGetContentLock(buf));
@@ -8171,7 +7711,7 @@ LockBuffer(Buffer buffer, int mode)
 		}
 		PG_CATCH();
 		{
-			ErrorData  *original_error;
+			ErrorData *original_error;
 
 			/*
 			 * Holder detach is itself allowed to encounter an LWLock ERROR.
@@ -8207,7 +7747,7 @@ LockBuffer(Buffer buffer, int mode)
 			 */
 			else if (pcm_pending_set)
 				cluster_pcm_own_abort_grant_after_error(buf, &pcm_pending_base, pcm_pending_token,
-												"LockBuffer content-lock acquire");
+														"LockBuffer content-lock acquire");
 			ReThrowError(original_error);
 		}
 		PG_END_TRY();
@@ -8220,8 +7760,7 @@ LockBuffer(Buffer buffer, int mode)
 		 * prove the GRANT_PENDING consult parks it instead of acking the
 		 * grant away.
 		 */
-		if (pcm_acquired && pcm_pending_set && pcm_mode == PCM_LOCK_MODE_X)
-		{
+		if (pcm_acquired && pcm_pending_set && pcm_mode == PCM_LOCK_MODE_X) {
 			CLUSTER_INJECTION_POINT("cluster-pcm-grant-finalize-window");
 
 			/*
@@ -8237,17 +7776,14 @@ LockBuffer(Buffer buffer, int mode)
 			 * W3 defect.
 			 */
 			CLUSTER_INJECTION_POINT("cluster-pcm-grant-finalize-deliver-invalidate");
-			if (cluster_injection_should_skip(
-					"cluster-pcm-grant-finalize-deliver-invalidate"))
-			{
+			if (cluster_injection_should_skip("cluster-pcm-grant-finalize-deliver-invalidate")) {
 				if (cluster_gcs_block_test_deliver_self_invalidate(buf->tag))
-					elog(WARNING,
-						 "cluster W3 delivery shim: synthetic INVALIDATE was ACKed instead of parked (GRANT_PENDING not honored)");
+					elog(WARNING, "cluster W3 delivery shim: synthetic INVALIDATE was ACKed "
+								  "instead of parked (GRANT_PENDING not honored)");
 			}
 		}
 
-		if (pcm_acquired)
-		{
+		if (pcm_acquired) {
 			/*
 			 * Finalize the grant under the header spinlock: set buffer_type +
 			 * pcm_state, bump the ownership generation, and clear
@@ -8257,12 +7793,9 @@ LockBuffer(Buffer buffer, int mode)
 			 */
 			cluster_pcm_own_finish_grant_or_rollback(
 				buf, &pcm_pending_base, pcm_pending_token,
-				(pcm_mode == PCM_LOCK_MODE_S) ? (uint8) PCM_STATE_S : (uint8) PCM_STATE_X,
-				pcm_mode,
+				(pcm_mode == PCM_LOCK_MODE_S) ? (uint8)PCM_STATE_S : (uint8)PCM_STATE_X, pcm_mode,
 				&pcm_committed_generation);
-		}
-		else if (pcm_pending_set)
-		{
+		} else if (pcm_pending_set) {
 			/* No durable grant (one-shot READ_IMAGE): clear the PENDING marker
 			 * we set before the acquire so it does not linger. */
 			cluster_pcm_own_abort_grant_or_error(buf, &pcm_pending_base, pcm_pending_token,
@@ -8283,22 +7816,18 @@ LockBuffer(Buffer buffer, int mode)
 	 * LockBuffer re-acquires (cluster_pcm_mode_covers(N, ...) is false),
 	 * getting real X once the remote holder is terminal.
 	 */
-	if (mode == BUFFER_LOCK_UNLOCK
-		&& buf->pcm_state == (uint8) PCM_STATE_READ_IMAGE)
-		cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+	if (mode == BUFFER_LOCK_UNLOCK && buf->pcm_state == (uint8)PCM_STATE_READ_IMAGE)
+		cluster_pcm_own_transition(buf, (uint8)PCM_STATE_N, 0, 0);
 
-	if (mode == BUFFER_LOCK_UNLOCK &&
-		cluster_pcm_is_active() &&
-		cluster_bufmgr_should_pcm_track(buf) &&
-		buf->pcm_state != (uint8) PCM_STATE_N)
-	{
+	if (mode == BUFFER_LOCK_UNLOCK && cluster_pcm_is_active()
+		&& cluster_bufmgr_should_pcm_track(buf) && buf->pcm_state != (uint8)PCM_STATE_N) {
 		/* PGRAC: spec-2.35 D4 (HC111 + HC112) — content-lock unlock path.
 		 * SCUR preserves cache residency (bit stays set so CF 2-way
 		 * forward can still target this node).  XCUR delegates to the
 		 * eviction release (single-holder semantic preserved).  Real
 		 * cache eviction is handled by the InvalidateBuffer /
 		 * InvalidateVictimBuffer / Drop*Buffers hook points (below). */
-		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
+		PcmLockMode old_mode = (PcmLockMode)buf->pcm_state;
 
 		/*
 		 * PGRAC: spec-4.7a D2 — hold-until-revoked.  With the node-level
@@ -8342,11 +7871,10 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 		return;
 
 	buf = GetBufferDescriptor(buffer - 1);
-	if (cluster_pcm_is_active() && cluster_bufmgr_should_pcm_track(buf))
-	{
+	if (cluster_pcm_is_active() && cluster_bufmgr_should_pcm_track(buf)) {
 		ClusterPcmDirectInitProof direct_init_proof;
-		uint8		pcm_state;
-		uint32		flags;
+		uint8 pcm_state;
+		uint32 flags;
 
 		/*
 		 * A concurrent initializer may already have established X while the
@@ -8354,8 +7882,7 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 		 * path revalidates that grant after taking the content lock.
 		 */
 		cluster_pcm_own_read(buf, &pcm_state, NULL, &flags);
-		if (pcm_state == (uint8) PCM_STATE_X && flags == 0)
-		{
+		if (pcm_state == (uint8)PCM_STATE_X && flags == 0) {
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 			return;
 		}
@@ -8404,23 +7931,21 @@ bool
 ConditionalLockBuffer(Buffer buffer)
 {
 	BufferDesc *buf;
-	bool		acquired;
+	bool acquired;
 #ifdef USE_PGRAC_CLUSTER
-	bool		blocked;
-	uint32		buf_state;
+	bool blocked;
+	uint32 buf_state;
 #endif
 
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
-		return true;			/* act as though we got it */
+		return true; /* act as though we got it */
 
 	buf = GetBufferDescriptor(buffer - 1);
 
-	acquired = LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf),
-									  LW_EXCLUSIVE);
+	acquired = LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
-	if (acquired)
-	{
+	if (acquired) {
 		/* This API bypasses LockBuffer/W1.  Recreate its reservation boundary
 		 * after acquiring content authority: an already-running user wins and
 		 * serializes before revoke finish; a user arriving after REVOKING or
@@ -8432,8 +7957,7 @@ ConditionalLockBuffer(Buffer buffer)
 			cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
 			cluster_pcm_own_flags_get(buf->buf_id));
 		UnlockBufHdr(buf, buf_state);
-		if (blocked)
-		{
+		if (blocked) {
 			LWLockRelease(BufferDescriptorGetContentLock(buf));
 			return false;
 		}
@@ -8451,17 +7975,12 @@ ConditionalLockBuffer(Buffer buffer)
 void
 CheckBufferIsPinnedOnce(Buffer buffer)
 {
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		if (LocalRefCount[-buffer - 1] != 1)
-			elog(ERROR, "incorrect local pin count: %d",
-				 LocalRefCount[-buffer - 1]);
-	}
-	else
-	{
+			elog(ERROR, "incorrect local pin count: %d", LocalRefCount[-buffer - 1]);
+	} else {
 		if (GetPrivateRefCount(buffer) != 1)
-			elog(ERROR, "incorrect local pin count: %d",
-				 GetPrivateRefCount(buffer));
+			elog(ERROR, "incorrect local pin count: %d", GetPrivateRefCount(buffer));
 	}
 }
 
@@ -8491,8 +8010,8 @@ LockBufferForCleanup(Buffer buffer)
 {
 	BufferDesc *bufHdr;
 	TimestampTz waitStart = 0;
-	bool		waiting = false;
-	bool		logged_recovery_conflict = false;
+	bool waiting = false;
+	bool logged_recovery_conflict = false;
 
 	Assert(BufferIsPinned(buffer));
 	Assert(PinCountWaitBuf == NULL);
@@ -8505,17 +8024,15 @@ LockBufferForCleanup(Buffer buffer)
 
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
-	for (;;)
-	{
-		uint32		buf_state;
+	for (;;) {
+		uint32 buf_state;
 
 		/* Try to acquire lock */
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		buf_state = LockBufHdr(bufHdr);
 
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-		if (BUF_STATE_GET_REFCOUNT(buf_state) == 1)
-		{
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 1) {
 			/* Successfully acquired exclusive lock with pincount 1 */
 			UnlockBufHdr(bufHdr, buf_state);
 
@@ -8525,12 +8042,10 @@ LockBufferForCleanup(Buffer buffer)
 			 * deadlock_timeout for it.
 			 */
 			if (logged_recovery_conflict)
-				LogRecoveryConflict(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN,
-									waitStart, GetCurrentTimestamp(),
-									NULL, false);
+				LogRecoveryConflict(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN, waitStart,
+									GetCurrentTimestamp(), NULL, false);
 
-			if (waiting)
-			{
+			if (waiting) {
 				/* reset ps display to remove the suffix if we added one */
 				set_ps_display_remove_suffix();
 				waiting = false;
@@ -8538,8 +8053,7 @@ LockBufferForCleanup(Buffer buffer)
 			return;
 		}
 		/* Failed, so mark myself as waiting for pincount 1 */
-		if (buf_state & BM_PIN_COUNT_WAITER)
-		{
+		if (buf_state & BM_PIN_COUNT_WAITER) {
 			UnlockBufHdr(bufHdr, buf_state);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			elog(ERROR, "multiple backends attempting to wait for pincount 1");
@@ -8551,10 +8065,8 @@ LockBufferForCleanup(Buffer buffer)
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 		/* Wait to be signaled by UnpinBuffer() */
-		if (InHotStandby)
-		{
-			if (!waiting)
-			{
+		if (InHotStandby) {
+			if (!waiting) {
 				/* adjust the process title to indicate that it's waiting */
 				set_ps_display_suffix("waiting");
 				waiting = true;
@@ -8568,15 +8080,12 @@ LockBufferForCleanup(Buffer buffer)
 			 * not started waiting yet in this case. So, the wait start
 			 * timestamp is set after this logic.
 			 */
-			if (waitStart != 0 && !logged_recovery_conflict)
-			{
+			if (waitStart != 0 && !logged_recovery_conflict) {
 				TimestampTz now = GetCurrentTimestamp();
 
-				if (TimestampDifferenceExceeds(waitStart, now,
-											   DeadlockTimeout))
-				{
-					LogRecoveryConflict(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN,
-										waitStart, now, NULL, true);
+				if (TimestampDifferenceExceeds(waitStart, now, DeadlockTimeout)) {
+					LogRecoveryConflict(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN, waitStart, now, NULL,
+										true);
 					logged_recovery_conflict = true;
 				}
 			}
@@ -8594,8 +8103,7 @@ LockBufferForCleanup(Buffer buffer)
 			ResolveRecoveryConflictWithBufferPin();
 			/* Reset the published bufid */
 			SetStartupBufferPinWaitBufId(-1);
-		}
-		else
+		} else
 			ProcWaitForSignal(PG_WAIT_BUFFER_PIN);
 
 		/*
@@ -8607,8 +8115,8 @@ LockBufferForCleanup(Buffer buffer)
 		 * better be safe.
 		 */
 		buf_state = LockBufHdr(bufHdr);
-		if ((buf_state & BM_PIN_COUNT_WAITER) != 0 &&
-			bufHdr->wait_backend_pgprocno == MyProc->pgprocno)
+		if ((buf_state & BM_PIN_COUNT_WAITER) != 0
+			&& bufHdr->wait_backend_pgprocno == MyProc->pgprocno)
 			buf_state &= ~BM_PIN_COUNT_WAITER;
 		UnlockBufHdr(bufHdr, buf_state);
 
@@ -8624,7 +8132,7 @@ LockBufferForCleanup(Buffer buffer)
 bool
 HoldingBufferPinThatDelaysRecovery(void)
 {
-	int			bufid = GetStartupBufferPinWaitBufId();
+	int bufid = GetStartupBufferPinWaitBufId();
 
 	/*
 	 * If we get woken slowly then it's possible that the Startup process was
@@ -8651,13 +8159,11 @@ bool
 ConditionalLockBufferForCleanup(Buffer buffer)
 {
 	BufferDesc *bufHdr;
-	uint32		buf_state,
-				refcount;
+	uint32 buf_state, refcount;
 
 	Assert(BufferIsValid(buffer));
 
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		refcount = LocalRefCount[-buffer - 1];
 		/* There should be exactly one pin */
 		Assert(refcount > 0);
@@ -8682,8 +8188,7 @@ ConditionalLockBufferForCleanup(Buffer buffer)
 	refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 
 	Assert(refcount > 0);
-	if (refcount == 1)
-	{
+	if (refcount == 1) {
 		/* Successfully acquired exclusive lock with pincount 1 */
 		UnlockBufHdr(bufHdr, buf_state);
 		return true;
@@ -8707,12 +8212,11 @@ bool
 IsBufferCleanupOK(Buffer buffer)
 {
 	BufferDesc *bufHdr;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	Assert(BufferIsValid(buffer));
 
-	if (BufferIsLocal(buffer))
-	{
+	if (BufferIsLocal(buffer)) {
 		/* There should be exactly one pin */
 		if (LocalRefCount[-buffer - 1] != 1)
 			return false;
@@ -8727,14 +8231,12 @@ IsBufferCleanupOK(Buffer buffer)
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
 	/* caller must hold exclusive lock on buffer */
-	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-								LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE));
 
 	buf_state = LockBufHdr(bufHdr);
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-	if (BUF_STATE_GET_REFCOUNT(buf_state) == 1)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 1) {
 		/* pincount is OK. */
 		UnlockBufHdr(bufHdr, buf_state);
 		return true;
@@ -8763,9 +8265,8 @@ WaitIO(BufferDesc *buf)
 	ConditionVariable *cv = BufferDescriptorGetIOCV(buf);
 
 	ConditionVariablePrepareToSleep(cv);
-	for (;;)
-	{
-		uint32		buf_state;
+	for (;;) {
+		uint32 buf_state;
 
 		/*
 		 * It may not be necessary to acquire the spinlock to check the flag
@@ -8818,15 +8319,14 @@ WaitIO(BufferDesc *buf)
 static bool
 StartBufferIO(BufferDesc *buf, bool forInput)
 {
-	uint32		buf_state;
+	uint32 buf_state;
 #ifdef USE_PGRAC_CLUSTER
-	bool		pi_implicit_discard = false;
+	bool pi_implicit_discard = false;
 #endif
 
 	ResourceOwnerEnlargeBufferIOs(CurrentResourceOwner);
 
-	for (;;)
-	{
+	for (;;) {
 		buf_state = LockBufHdr(buf);
 
 		if (!(buf_state & BM_IO_IN_PROGRESS))
@@ -8837,8 +8337,7 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 
 	/* Once we get here, there is definitely no I/O active on this buffer */
 
-	if (forInput ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY))
-	{
+	if (forInput ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY)) {
 		/* someone else already did the I/O */
 		UnlockBufHdr(buf, buf_state);
 		return false;
@@ -8846,9 +8345,8 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: spec-6.12h D-h3a — see the function header note. */
-	if (forInput && buf->buffer_type == (uint8) BUF_TYPE_PI)
-	{
-		buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+	if (forInput && buf->buffer_type == (uint8)BUF_TYPE_PI) {
+		buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
 		pi_implicit_discard = true;
 	}
 #endif
@@ -8861,8 +8359,7 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 		cluster_lever_h_note_pi_implicit_discard();
 #endif
 
-	ResourceOwnerRememberBufferIO(CurrentResourceOwner,
-								  BufferDescriptorGetBuffer(buf));
+	ResourceOwnerRememberBufferIO(CurrentResourceOwner, BufferDescriptorGetBuffer(buf));
 
 	return true;
 }
@@ -8886,7 +8383,7 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 static void
 TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
 {
-	uint32		buf_state;
+	uint32 buf_state;
 
 	buf_state = LockBufHdr(buf);
 
@@ -8899,8 +8396,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
 	buf_state |= set_flag_bits;
 	UnlockBufHdr(buf, buf_state);
 
-	ResourceOwnerForgetBufferIO(CurrentResourceOwner,
-								BufferDescriptorGetBuffer(buf));
+	ResourceOwnerForgetBufferIO(CurrentResourceOwner, BufferDescriptorGetBuffer(buf));
 
 	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
 }
@@ -8918,34 +8414,28 @@ void
 AbortBufferIO(Buffer buffer)
 {
 	BufferDesc *buf_hdr = GetBufferDescriptor(buffer - 1);
-	uint32		buf_state;
+	uint32 buf_state;
 
 	buf_state = LockBufHdr(buf_hdr);
 	Assert(buf_state & (BM_IO_IN_PROGRESS | BM_TAG_VALID));
 
-	if (!(buf_state & BM_VALID))
-	{
+	if (!(buf_state & BM_VALID)) {
 		Assert(!(buf_state & BM_DIRTY));
 		UnlockBufHdr(buf_hdr, buf_state);
-	}
-	else
-	{
+	} else {
 		Assert(buf_state & BM_DIRTY);
 		UnlockBufHdr(buf_hdr, buf_state);
 
 		/* Issue notice if this is not the first failure... */
-		if (buf_state & BM_IO_ERROR)
-		{
+		if (buf_state & BM_IO_ERROR) {
 			/* Buffer is pinned, so we can read tag without spinlock */
-			char	   *path;
+			char *path;
 
 			path = relpathperm(BufTagGetRelFileLocator(&buf_hdr->tag),
 							   BufTagGetForkNum(&buf_hdr->tag));
-			ereport(WARNING,
-					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("could not write block %u of %s",
-							buf_hdr->tag.blockNum, path),
-					 errdetail("Multiple failures --- write error might be permanent.")));
+			ereport(WARNING, (errcode(ERRCODE_IO_ERROR),
+							  errmsg("could not write block %u of %s", buf_hdr->tag.blockNum, path),
+							  errdetail("Multiple failures --- write error might be permanent.")));
 			pfree(path);
 		}
 	}
@@ -8959,16 +8449,14 @@ AbortBufferIO(Buffer buffer)
 static void
 shared_buffer_write_error_callback(void *arg)
 {
-	BufferDesc *bufHdr = (BufferDesc *) arg;
+	BufferDesc *bufHdr = (BufferDesc *)arg;
 
 	/* Buffer is pinned, so we can read the tag without locking the spinlock */
-	if (bufHdr != NULL)
-	{
-		char	   *path = relpathperm(BufTagGetRelFileLocator(&bufHdr->tag),
-									   BufTagGetForkNum(&bufHdr->tag));
+	if (bufHdr != NULL) {
+		char *path
+			= relpathperm(BufTagGetRelFileLocator(&bufHdr->tag), BufTagGetForkNum(&bufHdr->tag));
 
-		errcontext("writing block %u of relation %s",
-				   bufHdr->tag.blockNum, path);
+		errcontext("writing block %u of relation %s", bufHdr->tag.blockNum, path);
 		pfree(path);
 	}
 }
@@ -8979,16 +8467,13 @@ shared_buffer_write_error_callback(void *arg)
 static void
 local_buffer_write_error_callback(void *arg)
 {
-	BufferDesc *bufHdr = (BufferDesc *) arg;
+	BufferDesc *bufHdr = (BufferDesc *)arg;
 
-	if (bufHdr != NULL)
-	{
-		char	   *path = relpathbackend(BufTagGetRelFileLocator(&bufHdr->tag),
-										  MyBackendId,
-										  BufTagGetForkNum(&bufHdr->tag));
+	if (bufHdr != NULL) {
+		char *path = relpathbackend(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId,
+									BufTagGetForkNum(&bufHdr->tag));
 
-		errcontext("writing block %u of relation %s",
-				   bufHdr->tag.blockNum, path);
+		errcontext("writing block %u of relation %s", bufHdr->tag.blockNum, path);
 		pfree(path);
 	}
 }
@@ -8999,8 +8484,8 @@ local_buffer_write_error_callback(void *arg)
 static int
 rlocator_comparator(const void *p1, const void *p2)
 {
-	RelFileLocator n1 = *(const RelFileLocator *) p1;
-	RelFileLocator n2 = *(const RelFileLocator *) p2;
+	RelFileLocator n1 = *(const RelFileLocator *)p1;
+	RelFileLocator n2 = *(const RelFileLocator *)p2;
 
 	if (n1.relNumber < n2.relNumber)
 		return -1;
@@ -9027,14 +8512,13 @@ uint32
 LockBufHdr(BufferDesc *desc)
 {
 	SpinDelayStatus delayStatus;
-	uint32		old_buf_state;
+	uint32 old_buf_state;
 
 	Assert(!BufferIsLocal(BufferDescriptorGetBuffer(desc)));
 
 	init_local_spin_delay(&delayStatus);
 
-	while (true)
-	{
+	while (true) {
 		/* set BM_LOCKED flag */
 		old_buf_state = pg_atomic_fetch_or_u32(&desc->state, BM_LOCKED);
 		/* if it wasn't set before we're OK */
@@ -9057,14 +8541,13 @@ static uint32
 WaitBufHdrUnlocked(BufferDesc *buf)
 {
 	SpinDelayStatus delayStatus;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	init_local_spin_delay(&delayStatus);
 
 	buf_state = pg_atomic_read_u32(&buf->state);
 
-	while (buf_state & BM_LOCKED)
-	{
+	while (buf_state & BM_LOCKED) {
 		perform_spin_delay(&delayStatus);
 		buf_state = pg_atomic_read_u32(&buf->state);
 	}
@@ -9080,7 +8563,7 @@ WaitBufHdrUnlocked(BufferDesc *buf)
 static inline int
 buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
 {
-	int			ret;
+	int ret;
 	RelFileLocator rlocatora;
 	RelFileLocator rlocatorb;
 
@@ -9145,8 +8628,8 @@ ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b)
 static int
 ts_ckpt_progress_comparator(Datum a, Datum b, void *arg)
 {
-	CkptTsStatus *sa = (CkptTsStatus *) a;
-	CkptTsStatus *sb = (CkptTsStatus *) b;
+	CkptTsStatus *sa = (CkptTsStatus *)a;
+	CkptTsStatus *sb = (CkptTsStatus *)b;
 
 	/* we want a min-heap, so return 1 for the a < b */
 	if (sa->progress < sb->progress)
@@ -9178,8 +8661,7 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
  * Add buffer to list of pending writeback requests.
  */
 void
-ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
-							  BufferTag *tag)
+ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context, BufferTag *tag)
 {
 	PendingWriteback *pending;
 
@@ -9190,8 +8672,7 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 	 * Add buffer to the pending writeback array, unless writeback control is
 	 * disabled.
 	 */
-	if (*wb_context->max_pending > 0)
-	{
+	if (*wb_context->max_pending > 0) {
 		Assert(*wb_context->max_pending <= WRITEBACK_MAX_PENDING_FLUSHES);
 
 		pending = &wb_context->pending_writebacks[wb_context->nr_pending++];
@@ -9225,8 +8706,8 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 void
 IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 {
-	instr_time	io_start;
-	int			i;
+	instr_time io_start;
+	int i;
 
 	if (wb_context->nr_pending == 0)
 		return;
@@ -9235,8 +8716,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 	 * Executing the writes in-order can make them a lot faster, and allows to
 	 * merge writeback requests to consecutive blocks into larger writebacks.
 	 */
-	sort_pending_writebacks(wb_context->pending_writebacks,
-							wb_context->nr_pending);
+	sort_pending_writebacks(wb_context->pending_writebacks, wb_context->nr_pending);
 
 	io_start = pgstat_prepare_io_time();
 
@@ -9245,15 +8725,14 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 	 * through the, now sorted, array of pending flushes, and look forward to
 	 * find all neighbouring (or identical) writes.
 	 */
-	for (i = 0; i < wb_context->nr_pending; i++)
-	{
+	for (i = 0; i < wb_context->nr_pending; i++) {
 		PendingWriteback *cur;
 		PendingWriteback *next;
 		SMgrRelation reln;
-		int			ahead;
-		BufferTag	tag;
+		int ahead;
+		BufferTag tag;
 		RelFileLocator currlocator;
-		Size		nblocks = 1;
+		Size nblocks = 1;
 
 		cur = &wb_context->pending_writebacks[i];
 		tag = cur->tag;
@@ -9263,15 +8742,12 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		 * Peek ahead, into following writeback requests, to see if they can
 		 * be combined with the current one.
 		 */
-		for (ahead = 0; i + ahead + 1 < wb_context->nr_pending; ahead++)
-		{
-
+		for (ahead = 0; i + ahead + 1 < wb_context->nr_pending; ahead++) {
 			next = &wb_context->pending_writebacks[i + ahead + 1];
 
 			/* different file, stop */
-			if (!RelFileLocatorEquals(currlocator,
-									  BufTagGetRelFileLocator(&next->tag)) ||
-				BufTagGetForkNum(&cur->tag) != BufTagGetForkNum(&next->tag))
+			if (!RelFileLocatorEquals(currlocator, BufTagGetRelFileLocator(&next->tag))
+				|| BufTagGetForkNum(&cur->tag) != BufTagGetForkNum(&next->tag))
 				break;
 
 			/* ok, block queued twice, skip */
@@ -9297,8 +8773,8 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 	 * Assume that writeback requests are only issued for buffers containing
 	 * blocks of permanent relations.
 	 */
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
-							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
+	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_WRITEBACK, io_start,
+							wb_context->nr_pending);
 
 	wb_context->nr_pending = 0;
 }
@@ -9315,9 +8791,7 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
 {
 	if (RelationAllowsEarlyPruning(relation)
 		&& (snapshot)->whenTaken < GetOldSnapshotThresholdTimestamp())
-		ereport(ERROR,
-				(errcode(ERRCODE_SNAPSHOT_TOO_OLD),
-				 errmsg("snapshot too old")));
+		ereport(ERROR, (errcode(ERRCODE_SNAPSHOT_TOO_OLD), errmsg("snapshot too old")));
 }
 
 
@@ -9391,7 +8865,7 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
 static XLogRecPtr
 cluster_gcs_clamp_ship_flush_lsn(XLogRecPtr page_lsn)
 {
-	XLogRecPtr	local_insert;
+	XLogRecPtr local_insert;
 
 	if (XLogRecPtrIsInvalid(page_lsn) || RecoveryInProgress())
 		return page_lsn;
@@ -9420,41 +8894,35 @@ cluster_bufmgr_pin_for_gcs_locked(BufferDesc *buf, uint32 buf_state)
 static void
 cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
 {
-	uint32		buf_state;
-	uint32		old_buf_state;
+	uint32 buf_state;
+	uint32 old_buf_state;
 
 	Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
 
 	VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
 
 	old_buf_state = pg_atomic_read_u32(&buf->state);
-	for (;;)
-	{
+	for (;;) {
 		if (old_buf_state & BM_LOCKED)
 			old_buf_state = WaitBufHdrUnlocked(buf);
 
 		buf_state = old_buf_state;
 		buf_state -= BUF_REFCOUNT_ONE;
 
-		if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
-										   buf_state))
+		if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state, buf_state))
 			break;
 	}
 
-	if (buf_state & BM_PIN_COUNT_WAITER)
-	{
+	if (buf_state & BM_PIN_COUNT_WAITER) {
 		buf_state = LockBufHdr(buf);
 
-		if ((buf_state & BM_PIN_COUNT_WAITER) &&
-			BUF_STATE_GET_REFCOUNT(buf_state) == 1)
-		{
-			int			wait_backend_pgprocno = buf->wait_backend_pgprocno;
+		if ((buf_state & BM_PIN_COUNT_WAITER) && BUF_STATE_GET_REFCOUNT(buf_state) == 1) {
+			int wait_backend_pgprocno = buf->wait_backend_pgprocno;
 
 			buf_state &= ~BM_PIN_COUNT_WAITER;
 			UnlockBufHdr(buf, buf_state);
 			ProcSendSignal(wait_backend_pgprocno);
-		}
-		else
+		} else
 			UnlockBufHdr(buf, buf_state);
 	}
 }
@@ -9473,21 +8941,20 @@ cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
 bool
 cluster_bufmgr_probe_block_for_gcs(BufferTag tag)
 {
-	uint32		hashcode = BufTableHashCode(&tag);
-	LWLock	   *partition_lock = BufMappingPartitionLock(hashcode);
-	int			buf_id;
-	bool		valid = false;
+	uint32 hashcode = BufTableHashCode(&tag);
+	LWLock *partition_lock = BufMappingPartitionLock(hashcode);
+	int buf_id;
+	bool valid = false;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id >= 0)
-	{
+	if (buf_id >= 0) {
 		BufferDesc *buf = GetBufferDescriptor(buf_id);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		buf_state = LockBufHdr(buf);
 		valid = BufferTagsEqual(&buf->tag, &tag)
-			&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
+				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
 		UnlockBufHdr(buf, buf_state);
 	}
 	LWLockRelease(partition_lock);
@@ -9516,12 +8983,12 @@ cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
 
 	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+	if (!PageIsVerifiedExtended((Page)scratch.data, tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
 
 	if (out_page_scn != NULL)
-		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
+		*out_page_scn = ((PageHeader)scratch.data)->pd_block_scn;
 	return true;
 }
 
@@ -9544,16 +9011,16 @@ cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
 bool
 cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	LWLock	   *content_lock;
-	XLogRecPtr	first_lsn;
-	XLogRecPtr	second_lsn;
-	int			retries;
-	bool		stable;
-	Page		page;
+	LWLock *content_lock;
+	XLogRecPtr first_lsn;
+	XLogRecPtr second_lsn;
+	int retries;
+	bool stable;
+	Page page;
 
 	Assert(dst != NULL);
 	Assert(out_page_lsn != NULL);
@@ -9563,8 +9030,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
@@ -9572,19 +9038,17 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 
 	/* Partition lock keeps the buffer from being recycled before we raw-pin. */
 	{
-		uint32		buf_state;
+		uint32 buf_state;
 
 		buf_state = LockBufHdr(buf);
 		/* Re-verify tag under header lock to defend against tag-rewrite
 		 * races between the partition-lock-protected lookup and the pin. */
-		if (!BufferTagsEqual(&buf->tag, &tag))
-		{
+		if (!BufferTagsEqual(&buf->tag, &tag)) {
 			UnlockBufHdr(buf, buf_state);
 			LWLockRelease(partition_lock);
 			return false;
 		}
-		if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
-		{
+		if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state)) {
 			UnlockBufHdr(buf, buf_state);
 			LWLockRelease(partition_lock);
 			return false;
@@ -9594,7 +9058,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	LWLockRelease(partition_lock);
 
 	content_lock = BufferDescriptorGetContentLock(buf);
-	page = (Page) BufHdrGetBlock(buf);
+	page = (Page)BufHdrGetBlock(buf);
 
 	/*
 	 * HC89: revalidation loop with single retry budget. retries = 0 — first
@@ -9602,8 +9066,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	 * fail-closed
 	 */
 	stable = false;
-	for (retries = 0; retries < 2; retries++)
-	{
+	for (retries = 0; retries < 2; retries++) {
 		/* Read page_lsn under content_lock SHARED. */
 		LWLockAcquire(content_lock, LW_SHARED);
 		first_lsn = PageGetLSN(page);
@@ -9617,7 +9080,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 		 */
 #ifdef USE_CLUSTER_UNIT
 		if (cluster_gcs_block_test_xlog_flush_hook != NULL)
-			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
+			cluster_gcs_block_test_xlog_flush_hook((uint64)first_lsn);
 #endif
 		if (!XLogRecPtrIsInvalid(first_lsn))
 			XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
@@ -9632,11 +9095,10 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 		{
 			uint32 buf_state = LockBufHdr(buf);
 			bool current = BufferTagsEqual(&buf->tag, &tag)
-				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
+						   && cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
 
 			UnlockBufHdr(buf, buf_state);
-			if (!current)
-			{
+			if (!current) {
 				LWLockRelease(content_lock);
 				break;
 			}
@@ -9650,17 +9112,15 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 		 * consecutive LSN drift events.  retries 0 + drift available means
 		 * second_lsn != first_lsn synthetically.
 		 */
-		if (cluster_gcs_block_test_lsn_drift_hook != NULL)
-		{
-			int			drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
+		if (cluster_gcs_block_test_lsn_drift_hook != NULL) {
+			int drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
 
 			if (drift_remaining > retries)
-				second_lsn = first_lsn + 1;	/* synthetic mismatch */
+				second_lsn = first_lsn + 1; /* synthetic mismatch */
 		}
 #endif
 
-		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn)
-		{
+		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn) {
 			memcpy(dst, page, BLCKSZ);
 			*out_page_lsn = second_lsn;
 			LWLockRelease(content_lock);
@@ -9690,15 +9150,15 @@ bool
 cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 											 void **out_page_addr, BufferDesc **out_buf)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	LWLock	   *content_lock;
-	XLogRecPtr	first_lsn;
-	XLogRecPtr	second_lsn;
-	int			retries;
-	Page		page;
+	LWLock *content_lock;
+	XLogRecPtr first_lsn;
+	XLogRecPtr second_lsn;
+	int retries;
+	Page page;
 
 	Assert(out_page_lsn != NULL);
 	Assert(out_page_addr != NULL);
@@ -9713,20 +9173,18 @@ cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	{
-		uint32		buf_state;
+		uint32 buf_state;
 
 		buf_state = LockBufHdr(buf);
 		if (!BufferTagsEqual(&buf->tag, &tag)
-			|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
-		{
+			|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state)) {
 			UnlockBufHdr(buf, buf_state);
 			LWLockRelease(partition_lock);
 			return false;
@@ -9736,17 +9194,16 @@ cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page
 	LWLockRelease(partition_lock);
 
 	content_lock = BufferDescriptorGetContentLock(buf);
-	page = (Page) BufHdrGetBlock(buf);
+	page = (Page)BufHdrGetBlock(buf);
 
-	for (retries = 0; retries < 2; retries++)
-	{
+	for (retries = 0; retries < 2; retries++) {
 		LWLockAcquire(content_lock, LW_SHARED);
 		first_lsn = PageGetLSN(page);
 		LWLockRelease(content_lock);
 
 #ifdef USE_CLUSTER_UNIT
 		if (cluster_gcs_block_test_xlog_flush_hook != NULL)
-			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
+			cluster_gcs_block_test_xlog_flush_hook((uint64)first_lsn);
 #endif
 		if (!XLogRecPtrIsInvalid(first_lsn))
 			XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
@@ -9755,11 +9212,10 @@ cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page
 		{
 			uint32 buf_state = LockBufHdr(buf);
 			bool current = BufferTagsEqual(&buf->tag, &tag)
-				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
+						   && cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
 
 			UnlockBufHdr(buf, buf_state);
-			if (!current)
-			{
+			if (!current) {
 				LWLockRelease(content_lock);
 				break;
 			}
@@ -9767,17 +9223,15 @@ cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page
 		second_lsn = PageGetLSN(page);
 
 #ifdef USE_CLUSTER_UNIT
-		if (cluster_gcs_block_test_lsn_drift_hook != NULL)
-		{
-			int			drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
+		if (cluster_gcs_block_test_lsn_drift_hook != NULL) {
+			int drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
 
 			if (drift_remaining > retries)
 				second_lsn = first_lsn + 1;
 		}
 #endif
 
-		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn)
-		{
+		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn) {
 			*out_page_lsn = second_lsn;
 			*out_page_addr = page;
 			*out_buf = buf;
@@ -9809,7 +9263,7 @@ bool
 cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag,
 												  void **out_page_addr)
 {
-	uint32		buf_state;
+	uint32 buf_state;
 
 	Assert(out_page_addr != NULL);
 
@@ -9818,11 +9272,8 @@ cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag
 		return false;
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| (buf_state & BM_TAG_VALID) == 0
-		|| (buf_state & BM_VALID) != 0
-		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_TAG_VALID) == 0
+		|| (buf_state & BM_VALID) != 0 || (buf_state & BM_IO_IN_PROGRESS) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		return false;
 	}
@@ -9843,23 +9294,20 @@ cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag
  * BM_VALID through TerminateBufferIO.  On failure, leave the buffer invalid.
  */
 void
-cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
-												 XLogRecPtr page_lsn)
+cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid, XLogRecPtr page_lsn)
 {
 	if (buf == NULL)
 		return;
 
-	if (valid)
-	{
-		LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
-		Page		page = (Page) BufHdrGetBlock(buf);
+	if (valid) {
+		LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+		Page page = (Page)BufHdrGetBlock(buf);
 
 		LWLockAcquire(content_lock, LW_EXCLUSIVE);
 		PageSetLSN(page, page_lsn);
 		LWLockRelease(content_lock);
 		TerminateBufferIO(buf, false, BM_VALID);
-	}
-	else
+	} else
 		TerminateBufferIO(buf, false, 0);
 }
 
@@ -9894,29 +9342,27 @@ cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
 bool
 cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	LWLock	   *content_lock;
-	uint32		buf_state;
-	bool		dirty;
+	LWLock *content_lock;
+	uint32 buf_state;
+	bool dirty;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return false;
@@ -9926,8 +9372,7 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
-	if (!cluster_bufmgr_pcm_x_content_write_permitted(buf))
-	{
+	if (!cluster_bufmgr_pcm_x_content_write_permitted(buf)) {
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		return false;
@@ -9939,10 +9384,8 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 	 * this in-memory copy for its commit stamp (the P0-2 dependency) — the
 	 * caller falls back to the one-shot read-image ship.
 	 */
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| (PcmState) buf->pcm_state != PCM_STATE_X
-		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (PcmState)buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page)BufHdrGetBlock(buf))) {
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		return false;
@@ -9955,9 +9398,7 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 	if (dirty)
 		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 
-	if (!cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE,
-											   cluster_node_id))
-	{
+	if (!cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE, cluster_node_id)) {
 		/* Master refused (state moved under us) — leave local X untouched. */
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
@@ -9968,7 +9409,7 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 	 * ownership transition -- set pcm_state and bump the generation atomically
 	 * (header spinlock) so a cached-X writer racing the content-lock window
 	 * detects the revoke even across an X->S->X ABA. */
-	cluster_pcm_own_transition(buf, (uint8) PCM_STATE_S, 0, 0);
+	cluster_pcm_own_transition(buf, (uint8)PCM_STATE_S, 0, 0);
 
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
@@ -10003,11 +9444,11 @@ Buffer
 cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
 									   BlockNumber blocknum)
 {
-	BufferTag	tag;
-	uint32		hashcode;
-	uint32		buf_state;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	BufferTag tag;
+	uint32 hashcode;
+	uint32 buf_state;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
 
 	InitBufferTag(&tag, &rlocator, forknum, blocknum);
@@ -10019,8 +9460,7 @@ cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forkn
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		/* Not resident -> transferred away (or never cached).  Skip stamp. */
 		LWLockRelease(partition_lock);
 		return InvalidBuffer;
@@ -10055,11 +9495,9 @@ cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forkn
 	 * legal commit-stamp target.
 	 */
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0
 		|| cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
-		|| (cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_REVOKING) != 0)
-	{
+		|| (cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_REVOKING) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
 		ReleaseBuffer(BufferDescriptorGetBuffer(buf));
@@ -10115,13 +9553,13 @@ cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
 bool
 cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	LWLock	   *content_lock;
-	uint32		buf_state;
-	bool		dirty;
+	LWLock *content_lock;
+	uint32 buf_state;
+	bool dirty;
 
 	if (master_node < 0 || master_node == cluster_node_id)
 		return false;
@@ -10131,16 +9569,14 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return false;
@@ -10150,18 +9586,15 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
-	if (!cluster_bufmgr_pcm_x_content_write_permitted(buf))
-	{
+	if (!cluster_bufmgr_pcm_x_content_write_permitted(buf)) {
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		return false;
 	}
 
 	/* Same re-verify as the local variant: tag, PCM X, quiescent. */
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| (PcmState) buf->pcm_state != PCM_STATE_X
-		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (PcmState)buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page)BufHdrGetBlock(buf))) {
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		return false;
@@ -10182,12 +9615,9 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 	 * recording X@us.  Drives the renotify self-heal TAP leg (t/348 L8).
 	 */
 	CLUSTER_INJECTION_POINT("cluster-gcs-block-yield-notify-drop");
-	if (cluster_injection_should_skip("cluster-gcs-block-yield-notify-drop"))
-	{
+	if (cluster_injection_should_skip("cluster-gcs-block-yield-notify-drop")) {
 		/* simulated post-handoff loss: fall through to the S flip */
-	}
-	else if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node))
-	{
+	} else if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node)) {
 		/* Notify not handed to transport — keep local X, master unchanged. */
 		LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
@@ -10198,7 +9628,7 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 	 * ownership transition -- set pcm_state and bump the generation atomically
 	 * (header spinlock) so a cached-X writer racing the content-lock window
 	 * detects the revoke even across an X->S->X ABA. */
-	cluster_pcm_own_transition(buf, (uint8) PCM_STATE_S, 0, 0);
+	cluster_pcm_own_transition(buf, (uint8)PCM_STATE_S, 0, 0);
 
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
@@ -10223,12 +9653,12 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
 bool
 cluster_bufmgr_renotify_s_for_gcs(BufferTag tag, int32 master_node)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	bool		is_s;
+	uint32 buf_state;
+	bool is_s;
 
 	if (master_node < 0 || master_node == cluster_node_id)
 		return false;
@@ -10238,8 +9668,7 @@ cluster_bufmgr_renotify_s_for_gcs(BufferTag tag, int32 master_node)
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
@@ -10247,7 +9676,7 @@ cluster_bufmgr_renotify_s_for_gcs(BufferTag tag, int32 master_node)
 
 	buf_state = LockBufHdr(buf);
 	is_s = BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0
-		&& (PcmState) buf->pcm_state == PCM_STATE_S;
+		   && (PcmState)buf->pcm_state == PCM_STATE_S;
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -10269,17 +9698,17 @@ bool
 cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
 											   ClusterSfDepVec *out_dep_vec)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	LWLock	   *content_lock;
-	XLogRecPtr	first_lsn;
-	XLogRecPtr	second_lsn;
-	int			retries;
-	bool		copied_stable;
-	bool		stable;
-	Page		page;
+	LWLock *content_lock;
+	XLogRecPtr first_lsn;
+	XLogRecPtr second_lsn;
+	int retries;
+	bool copied_stable;
+	bool stable;
+	Page page;
 
 	if (dst == NULL || out_page_lsn == NULL || out_dep_vec == NULL)
 		return false;
@@ -10292,20 +9721,18 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	{
-		uint32		buf_state;
+		uint32 buf_state;
 
 		buf_state = LockBufHdr(buf);
 		if (!BufferTagsEqual(&buf->tag, &tag)
-			|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
-		{
+			|| !cluster_bufmgr_pcm_current_image_locked(buf, buf_state)) {
 			UnlockBufHdr(buf, buf_state);
 			LWLockRelease(partition_lock);
 			return false;
@@ -10315,20 +9742,18 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
 	LWLockRelease(partition_lock);
 
 	content_lock = BufferDescriptorGetContentLock(buf);
-	page = (Page) BufHdrGetBlock(buf);
+	page = (Page)BufHdrGetBlock(buf);
 	copied_stable = false;
 	stable = false;
-	for (retries = 0; retries < 2; retries++)
-	{
+	for (retries = 0; retries < 2; retries++) {
 		LWLockAcquire(content_lock, LW_SHARED);
 		{
 			uint32 buf_state = LockBufHdr(buf);
 			bool current = BufferTagsEqual(&buf->tag, &tag)
-				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
+						   && cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
 
 			UnlockBufHdr(buf, buf_state);
-			if (!current)
-			{
+			if (!current) {
 				LWLockRelease(content_lock);
 				break;
 			}
@@ -10337,8 +9762,7 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
 		memcpy(dst, page, BLCKSZ);
 		second_lsn = PageGetLSN(page);
 		if (BufferTagsEqual(&buf->tag, &tag) && !XLogRecPtrIsInvalid(first_lsn)
-			&& first_lsn == second_lsn)
-		{
+			&& first_lsn == second_lsn) {
 			*out_page_lsn = second_lsn;
 			LWLockRelease(content_lock);
 			copied_stable = true;
@@ -10347,12 +9771,11 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
 		LWLockRelease(content_lock);
 	}
 
-	if (copied_stable)
-	{
+	if (copied_stable) {
 		ClusterSfDepVec existing_vec;
-		bool		has_existing_deps;
-		bool		add_local_dep;
-		uint32		buf_state;
+		bool has_existing_deps;
+		bool add_local_dep;
+		uint32 buf_state;
 
 		/*
 		 * Keep lock ordering compatible with receiver install:
@@ -10361,18 +9784,17 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
 		 * the dep store after releasing content_lock, while the raw pin keeps
 		 * this descriptor/tag from being recycled.
 		 */
-		has_existing_deps =
-			cluster_sf_dep_vec_for_ship(BufferDescriptorGetBuffer(buf), &existing_vec);
+		has_existing_deps
+			= cluster_sf_dep_vec_for_ship(BufferDescriptorGetBuffer(buf), &existing_vec);
 		cluster_sf_dep_vec_reset(out_dep_vec);
 		if (has_existing_deps)
-			(void) cluster_sf_dep_vec_union(out_dep_vec, &existing_vec);
+			(void)cluster_sf_dep_vec_union(out_dep_vec, &existing_vec);
 
 		buf_state = LockBufHdr(buf);
-		add_local_dep = (buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
-						|| !has_existing_deps;
+		add_local_dep = (buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0 || !has_existing_deps;
 		UnlockBufHdr(buf, buf_state);
 		if (add_local_dep)
-			(void) cluster_sf_dep_vec_set(out_dep_vec, cluster_node_id, *out_page_lsn);
+			(void)cluster_sf_dep_vec_set(out_dep_vec, cluster_node_id, *out_page_lsn);
 		stable = !cluster_sf_dep_vec_is_empty(out_dep_vec);
 	}
 
@@ -10401,11 +9823,11 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
  *	authoritative lost-write check).  No PCM state is mutated.
  */
 int
-cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
-									ClusterGcsRedeclareCallback cb, void *arg)
+cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan, ClusterGcsRedeclareCallback cb,
+									void *arg)
 {
-	int			i;
-	int			end;
+	int i;
+	int end;
 
 	Assert(cb != NULL);
 
@@ -10415,23 +9837,20 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 	if (end > NBuffers)
 		end = NBuffers;
 
-	for (i = start_buf; i < end; i++)
-	{
+	for (i = start_buf; i < end; i++) {
 		BufferDesc *buf = GetBufferDescriptor(i);
-		uint32		buf_state;
-		uint8		mode;
-		BufferTag	tag;
-		LWLock	   *content_lock;
-		XLogRecPtr	page_lsn;
-		SCN			page_scn;	/* spec-2.41 D3 — re-declare SCN carrier */
+		uint32 buf_state;
+		uint8 mode;
+		BufferTag tag;
+		LWLock *content_lock;
+		XLogRecPtr page_lsn;
+		SCN page_scn; /* spec-2.41 D3 — re-declare SCN carrier */
 
 		buf_state = LockBufHdr(buf);
 		mode = buf->pcm_state;
-		if ((buf_state & BM_VALID) == 0
-			|| (buf_state & BM_IO_IN_PROGRESS) != 0
-			|| (mode != (uint8) PCM_STATE_S && mode != (uint8) PCM_STATE_X)
-			|| !cluster_bufmgr_should_pcm_track(buf))
-		{
+		if ((buf_state & BM_VALID) == 0 || (buf_state & BM_IO_IN_PROGRESS) != 0
+			|| (mode != (uint8)PCM_STATE_S && mode != (uint8)PCM_STATE_X)
+			|| !cluster_bufmgr_should_pcm_track(buf)) {
 			UnlockBufHdr(buf, buf_state);
 			continue;
 		}
@@ -10441,11 +9860,11 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 
 		content_lock = BufferDescriptorGetContentLock(buf);
 		LWLockAcquire(content_lock, LW_SHARED);
-		page_lsn = PageGetLSN((Page) BufHdrGetBlock(buf));
+		page_lsn = PageGetLSN((Page)BufHdrGetBlock(buf));
 		/* PGRAC: spec-2.41 D3 — also read pd_block_scn so the re-declare carries
 		 * the cross-node version for the detector's SCN watermark (alongside
 		 * page_lsn for the redo-coverage required_lsn). */
-		page_scn = ((PageHeader) BufHdrGetBlock(buf))->pd_block_scn;
+		page_scn = ((PageHeader)BufHdrGetBlock(buf))->pd_block_scn;
 		LWLockRelease(content_lock);
 
 		cluster_bufmgr_unpin_for_gcs(buf);
@@ -10485,18 +9904,18 @@ ClusterBufmgrGcsDropResult
 cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 										XLogRecPtr *out_page_lsn, SCN *out_page_scn)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
-	SCN			page_scn = InvalidScn;	/* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
-	bool		was_dirty = false;
-	uint8		saved_pcm_state;
-	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
+	uint32 buf_state;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	SCN page_scn = InvalidScn; /* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
+	bool was_dirty = false;
+	uint8 saved_pcm_state;
+	uint64 staged_gen; /* PGRAC W2: ownership gen captured at stage-N */
 
-	(void) expected_mode;
+	(void)expected_mode;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -10508,8 +9927,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
@@ -10519,8 +9937,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	/* Re-verify tag under the header lock to defend against a tag-rewrite race
 	 * between the partition-lock lookup and the raw pin (copy_block_for_gcs
 	 * convention). */
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
@@ -10533,8 +9950,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * ClusterBufmgrGcsDropResult).  Bail before the WAL flush — nothing is
 	 * dropped, so the HC123 flush-before-drop invariant is not owed yet.
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
@@ -10555,15 +9971,15 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * cluster_bufmgr_copy_block_for_gcs and cluster_bufmgr_redeclare_scan_chunk.
 	 * The pin keeps the buffer identity stable, so the pre-pin tag match holds.
 	 */
-	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);	/* raw-pin + unlock header */
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state); /* raw-pin + unlock header */
 	LWLockRelease(partition_lock);
 	{
-		LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
-		Page		page = (Page) BufHdrGetBlock(buf);
+		LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+		Page page = (Page)BufHdrGetBlock(buf);
 
 		LWLockAcquire(content_lock, LW_SHARED);
 		page_lsn = PageGetLSN(page);
-		page_scn = ((PageHeader) page)->pd_block_scn;
+		page_scn = ((PageHeader)page)->pd_block_scn;
 		LWLockRelease(content_lock);
 	}
 	cluster_bufmgr_unpin_for_gcs(buf);
@@ -10591,8 +10007,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * cluster_bufmgr_drop_block_for_gcs_no_wire below).
 	 */
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
@@ -10602,15 +10017,14 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * unpinned for the XLogFlush re-fails the drop (bounded contract; the
 	 * pcm_state is untouched so nothing observes a half-dropped state).
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
 	saved_pcm_state = buf->pcm_state;
-	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
-	buf->pcm_state = (uint8) PCM_STATE_N;
+	staged_gen = cluster_pcm_own_gen_get(buf->buf_id); /* PGRAC W2 */
+	buf->pcm_state = (uint8)PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
 	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
@@ -10623,8 +10037,8 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * (it was cleared for the eviction hook) so the still-resident copy keeps
 	 * its true PCM state.
 	 */
-	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
+	cluster_bufmgr_in_gcs_drop = true; /* gates the drop-prepin inject */
+	if (!InvalidateBufferTry(buf))	   /* releases the header spinlock */
 	{
 		cluster_bufmgr_in_gcs_drop = false;
 
@@ -10649,7 +10063,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
-			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+			cluster_pcm_own_transition(buf, (uint8)PCM_STATE_N, 0, 0);
 
 		buf_state = LockBufHdr(buf);
 
@@ -10665,13 +10079,11 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 * moved, the block was legitimately re-owned and dropped in between,
 		 * so leave it at N.
 		 */
-		if (BufferTagsEqual(&buf->tag, &tag) &&
-			buf->pcm_state == (uint8) PCM_STATE_N &&
-			cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
+		if (BufferTagsEqual(&buf->tag, &tag) && buf->pcm_state == (uint8)PCM_STATE_N
+			&& cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
 			buf->pcm_state = saved_pcm_state;
-		else if (BufferTagsEqual(&buf->tag, &tag) &&
-				 buf->pcm_state == (uint8) PCM_STATE_N &&
-				 cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
+		else if (BufferTagsEqual(&buf->tag, &tag) && buf->pcm_state == (uint8)PCM_STATE_N
+				 && cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
 			cluster_pcm_note_restore_aba_detected();
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
@@ -10707,11 +10119,11 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 SCN
 cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf)
 {
-	LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
-	SCN			scn;
+	LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+	SCN scn;
 
 	LWLockAcquire(content_lock, LW_SHARED);
-	scn = ((PageHeader) BufHdrGetBlock(buf))->pd_block_scn;
+	scn = ((PageHeader)BufHdrGetBlock(buf))->pd_block_scn;
 	LWLockRelease(content_lock);
 	return scn;
 }
@@ -10732,7 +10144,7 @@ bool
 cluster_bufmgr_block_is_extension_for_gcs(BufferTag tag)
 {
 	SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	ForkNumber	fork = BufTagGetForkNum(&tag);
+	ForkNumber fork = BufTagGetForkNum(&tag);
 
 	/* Drop any cached size so a concurrent extension is not missed. */
 	smgrrelease(reln);
@@ -10743,12 +10155,12 @@ bool
 cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page_scn)
 {
 	PGAlignedBlock scratch;
-	BufferTag	tag = buf->tag;
+	BufferTag tag = buf->tag;
 	SMgrRelation reln;
-	LWLock	   *content_lock;
-	uint32		buf_state;
-	bool		dirty;
-	bool		write_permitted;
+	LWLock *content_lock;
+	uint32 buf_state;
+	bool dirty;
+	bool write_permitted;
 
 	if (out_page_scn != NULL)
 		*out_page_scn = InvalidScn;
@@ -10763,12 +10175,13 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	 */
 	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+	if (!PageIsVerifiedExtended((Page)scratch.data, tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
-						tag.blockNum, tag.relNumber)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
+					tag.blockNum, tag.relNumber)));
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
@@ -10776,16 +10189,15 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	buf_state = LockBufHdr(buf);
 	dirty = (buf_state & BM_DIRTY) != 0;
 	UnlockBufHdr(buf, buf_state);
-	if (dirty || !write_permitted)
-	{
+	if (dirty || !write_permitted) {
 		LWLockRelease(content_lock);
 		return false;
 	}
-	memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
+	memcpy((char *)BufHdrGetBlock(buf), scratch.data, BLCKSZ);
 	LWLockRelease(content_lock);
 
 	if (out_page_scn != NULL)
-		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
+		*out_page_scn = ((PageHeader)scratch.data)->pd_block_scn;
 	return true;
 }
 
@@ -10829,9 +10241,8 @@ static bool
 cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
 {
 	if (!cluster_past_image)
-		return false;			/* wave off: caller drops as today */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+		return false; /* wave off: caller drops as today */
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		/* Pinned: fail-safe fallback to the plain drop (single lock-free
 		 * atomic tick; same class as PG's own buf->state atomics under
 		 * this spinlock). */
@@ -10840,7 +10251,7 @@ cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
 	}
 
 	buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
-	buf->buffer_type = (uint8) BUF_TYPE_PI;
+	buf->buffer_type = (uint8)BUF_TYPE_PI;
 	/* D-h3a ship-SCN boundary stamp — see the header note on why the
 	 * clock sample must sit inside this lock hold.  An unarmed clock
 	 * stamps InvalidScn and the D-h3 gate fails closed to UNUSABLE. */
@@ -10866,11 +10277,11 @@ cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
 PcmLockMode
 cluster_bufmgr_block_pcm_state(BufferTag tag)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
+	uint32 buf_state;
 	PcmLockMode mode = PCM_LOCK_MODE_N;
 
 	hashcode = BufTableHashCode(&tag);
@@ -10878,8 +10289,7 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return PCM_LOCK_MODE_N;
 	}
@@ -10887,7 +10297,7 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
 
 	buf_state = LockBufHdr(buf);
 	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0)
-		mode = (PcmLockMode) buf->pcm_state;
+		mode = (PcmLockMode)buf->pcm_state;
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -10906,20 +10316,19 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
 bool
 cluster_bufmgr_block_grant_pending(BufferTag tag)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	bool		pending = false;
+	uint32 buf_state;
+	bool pending = false;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
@@ -10968,15 +10377,15 @@ ClusterBufmgrGcsDropResult
 cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn,
 										  XLogRecPtr *out_page_lsn)
 {
-	uint32		hashcode;
-	LWLock	   *partition_lock;
-	int			buf_id;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
-	bool		was_dirty = false;
-	uint8		saved_pcm_state;
-	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
+	uint32 buf_state;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	bool was_dirty = false;
+	uint8 saved_pcm_state;
+	uint64 staged_gen; /* PGRAC W2: ownership gen captured at stage-N */
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -10986,16 +10395,14 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
@@ -11007,15 +10414,14 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	 * retryable deny instead of parking InvalidateBuffer's pin-wait loop in
 	 * the dispatch pump).
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 	was_dirty = (buf_state & BM_DIRTY) != 0;
 	{
-		Page		page = (Page) BufHdrGetBlock(buf);
+		Page page = (Page)BufHdrGetBlock(buf);
 
 		page_lsn = PageGetLSN(page);
 	}
@@ -11033,8 +10439,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	 * the current page (Rule 8.A — never grant a stale image over a
 	 * committed write).  expected_lsn == Invalid skips the gate.
 	 */
-	if (!XLogRecPtrIsInvalid(expected_lsn) && page_lsn != expected_lsn)
-	{
+	if (!XLogRecPtrIsInvalid(expected_lsn) && page_lsn != expected_lsn) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_STALE;
@@ -11066,16 +10471,14 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	 * one -- BLOCKER A).
 	 */
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
 	}
 
 	/* PGRAC: GCS serve-stall round-5 (A2) — a pin acquired during the
 	 * XLogFlush window re-fails the drop (nothing observed half-dropped). */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
@@ -11086,16 +10489,15 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	 * during the (blocking) XLogFlush window above.  A LSN past expected_lsn
 	 * means the ship image is stale; refuse without touching pcm_state
 	 * (Rule 8.A). */
-	if (!XLogRecPtrIsInvalid(expected_lsn) &&
-		PageGetLSN((Page) BufHdrGetBlock(buf)) != expected_lsn)
-	{
+	if (!XLogRecPtrIsInvalid(expected_lsn)
+		&& PageGetLSN((Page)BufHdrGetBlock(buf)) != expected_lsn) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 	}
 
 	saved_pcm_state = buf->pcm_state;
-	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
-	buf->pcm_state = (uint8) PCM_STATE_N;
+	staged_gen = cluster_pcm_own_gen_get(buf->buf_id); /* PGRAC W2 */
+	buf->pcm_state = (uint8)PCM_STATE_N;
 
 	/*
 	 * PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping (the
@@ -11106,8 +10508,8 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
 	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
-	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	if (!InvalidateBufferTry(buf))	/* releases the header spinlock */
+	cluster_bufmgr_in_gcs_drop = true; /* gates the drop-prepin inject */
+	if (!InvalidateBufferTry(buf))	   /* releases the header spinlock */
 	{
 		cluster_bufmgr_in_gcs_drop = false;
 
@@ -11125,7 +10527,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		/* W2 RED force-round — see the twin arm above. */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
-			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+			cluster_pcm_own_transition(buf, (uint8)PCM_STATE_N, 0, 0);
 
 		buf_state = LockBufHdr(buf);
 
@@ -11136,13 +10538,11 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		 * the InvalidateBuffer window does not get a stale pre-drop state
 		 * restored over it.
 		 */
-		if (BufferTagsEqual(&buf->tag, &tag) &&
-			buf->pcm_state == (uint8) PCM_STATE_N &&
-			cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
+		if (BufferTagsEqual(&buf->tag, &tag) && buf->pcm_state == (uint8)PCM_STATE_N
+			&& cluster_pcm_own_gen_get(buf->buf_id) == staged_gen)
 			buf->pcm_state = saved_pcm_state;
-		else if (BufferTagsEqual(&buf->tag, &tag) &&
-				 buf->pcm_state == (uint8) PCM_STATE_N &&
-				 cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
+		else if (BufferTagsEqual(&buf->tag, &tag) && buf->pcm_state == (uint8)PCM_STATE_N
+				 && cluster_pcm_own_gen_get(buf->buf_id) != staged_gen)
 			cluster_pcm_note_restore_aba_detected();
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
@@ -11241,8 +10641,7 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 		result = CLUSTER_PCM_OWN_STALE;
 	else if ((buf_state & BM_IO_ERROR) != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
-	{
+	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0) {
 		/*
 		 * PGRAC: a dirty N page here is legitimate, not corruption evidence:
 		 * relation extension (PageInit + MarkBufferDirty) and recovery redo
@@ -11254,14 +10653,13 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 		 * and report BUSY: one flush converges the state and the image pump
 		 * retries against a clean page.
 		 */
-		PinBuffer_Locked(buf);	/* consumes the buffer header lock */
+		PinBuffer_Locked(buf); /* consumes the buffer header lock */
 		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
 		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
 		UnpinBuffer(buf);
 		return CLUSTER_PCM_OWN_BUSY;
-	}
-	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+	} else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
 		result = CLUSTER_PCM_OWN_BUSY;
 	else {
 		result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, expected_n->generation,
@@ -11279,8 +10677,7 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
 		if (!PageIsVerifiedExtended((Page)scratch.data, tag.blockNum,
-									PIV_LOG_WARNING | PIV_REPORT_STAT))
-		{
+									PIV_LOG_WARNING | PIV_REPORT_STAT)) {
 			result = CLUSTER_PCM_OWN_CORRUPT;
 		}
 
@@ -11294,15 +10691,13 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 				result = CLUSTER_PCM_OWN_STALE;
 			else if ((buf_state & BM_IO_ERROR) != 0)
 				result = CLUSTER_PCM_OWN_CORRUPT;
-			else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
-			{
+			else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0) {
 				/* PGRAC: REVOKING already blocks data writes, so dirt appearing
 				 * between the flush above and this recheck can only be an
 				 * idempotent hint-bit write.  Retry via BUSY; the next pass
 				 * flushes it and converges. */
 				result = CLUSTER_PCM_OWN_BUSY;
-			}
-			else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+			} else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
 				result = CLUSTER_PCM_OWN_BUSY;
 			else {
 				memcpy((char *)BufHdrGetBlock(buf), scratch.data, BLCKSZ);
@@ -11359,35 +10754,32 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
  * the final byte boundary is serialized by the content lock instead.
  */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf,
-									 const ClusterPcmOwnSnapshot *expected_s,
-									 ClusterPcmOwnSnapshot *out_revoking)
+cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s,
+									  ClusterPcmOwnSnapshot *out_revoking)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result;
-	uint64		live_token;
-	uint64		reservation_token = 0;
-	uint32		flags;
-	uint32		buf_state;
+	uint64 live_token;
+	uint64 reservation_token = 0;
+	uint32 flags;
+	uint32 buf_state;
 
 	if (buf == NULL || expected_s == NULL || out_revoking == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	memset(out_revoking, 0, sizeof(*out_revoking));
-	if (expected_s->pcm_state != (uint8) PCM_STATE_S || expected_s->flags != 0)
+	if (expected_s->pcm_state != (uint8)PCM_STATE_S || expected_s->flags != 0)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &expected_s->tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &expected_s->tag) || (buf_state & BM_VALID) == 0
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected_s->generation
-		|| buf->pcm_state != (uint8) PCM_STATE_S)
+		|| buf->pcm_state != (uint8)PCM_STATE_S)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11395,11 +10787,9 @@ cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf,
 			result = live_result;
 		else if (live_token != expected_s->reservation_token)
 			result = CLUSTER_PCM_OWN_STALE;
-		else
-		{
+		else {
 			result = cluster_pcm_own_reservation_begin_exact(
-				buf->buf_id, expected_s->generation, PCM_OWN_FLAG_REVOKING,
-				&reservation_token);
+				buf->buf_id, expected_s->generation, PCM_OWN_FLAG_REVOKING, &reservation_token);
 			if (result == CLUSTER_PCM_OWN_OK)
 				cluster_pcm_own_snapshot_locked(buf, out_revoking);
 		}
@@ -11411,17 +10801,17 @@ cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf,
 /* Abort only the matching S-source staging reservation. */
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
-									 const ClusterPcmOwnSnapshot *expected_revoking)
+									  const ClusterPcmOwnSnapshot *expected_revoking)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result;
-	uint64		live_token;
-	uint32		flags;
-	uint32		buf_state;
+	uint64 live_token;
+	uint32 flags;
+	uint32 buf_state;
 
 	if (buf == NULL || expected_revoking == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
-	if (expected_revoking->pcm_state != (uint8) PCM_STATE_S
+	if (expected_revoking->pcm_state != (uint8)PCM_STATE_S
 		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
 		|| expected_revoking->reservation_token == 0)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -11429,15 +10819,13 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &expected_revoking->tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &expected_revoking->tag) || (buf_state & BM_VALID) == 0
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected_revoking->generation
-		|| buf->pcm_state != (uint8) PCM_STATE_S)
+		|| buf->pcm_state != (uint8)PCM_STATE_S)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11451,8 +10839,8 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 			result = CLUSTER_PCM_OWN_STALE;
 		else
 			result = cluster_pcm_own_reservation_abort_exact(
-				buf->buf_id, expected_revoking->generation,
-				expected_revoking->reservation_token, PCM_OWN_FLAG_REVOKING);
+				buf->buf_id, expected_revoking->generation, expected_revoking->reservation_token,
+				PCM_OWN_FLAG_REVOKING);
 	}
 	UnlockBufHdr(buf, buf_state);
 	return result;
@@ -11466,35 +10854,32 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
  * abort, and retained finish; callers never inspect the ownership sidecar.
  */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf,
-									 const ClusterPcmOwnSnapshot *expected_x,
-									 ClusterPcmOwnSnapshot *out_revoking)
+cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_x,
+									  ClusterPcmOwnSnapshot *out_revoking)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result;
-	uint64		live_token;
-	uint64		reservation_token = 0;
-	uint32		flags;
-	uint32		buf_state;
+	uint64 live_token;
+	uint64 reservation_token = 0;
+	uint32 flags;
+	uint32 buf_state;
 
 	if (buf == NULL || expected_x == NULL || out_revoking == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	memset(out_revoking, 0, sizeof(*out_revoking));
-	if (expected_x->pcm_state != (uint8) PCM_STATE_X || expected_x->flags != 0)
+	if (expected_x->pcm_state != (uint8)PCM_STATE_X || expected_x->flags != 0)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &expected_x->tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &expected_x->tag) || (buf_state & BM_VALID) == 0
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected_x->generation
-		|| buf->pcm_state != (uint8) PCM_STATE_X)
+		|| buf->pcm_state != (uint8)PCM_STATE_X)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11502,11 +10887,9 @@ cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf,
 			result = live_result;
 		else if (live_token != expected_x->reservation_token)
 			result = CLUSTER_PCM_OWN_STALE;
-		else
-		{
+		else {
 			result = cluster_pcm_own_reservation_begin_exact(
-				buf->buf_id, expected_x->generation, PCM_OWN_FLAG_REVOKING,
-				&reservation_token);
+				buf->buf_id, expected_x->generation, PCM_OWN_FLAG_REVOKING, &reservation_token);
 			if (result == CLUSTER_PCM_OWN_OK)
 				cluster_pcm_own_snapshot_locked(buf, out_revoking);
 		}
@@ -11520,17 +10903,17 @@ cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf,
  */
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
-									 const ClusterPcmOwnSnapshot *expected_revoking)
+									  const ClusterPcmOwnSnapshot *expected_revoking)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result;
-	uint64		live_token;
-	uint32		flags;
-	uint32		buf_state;
+	uint64 live_token;
+	uint32 flags;
+	uint32 buf_state;
 
 	if (buf == NULL || expected_revoking == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
-	if (expected_revoking->pcm_state != (uint8) PCM_STATE_X
+	if (expected_revoking->pcm_state != (uint8)PCM_STATE_X
 		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
 		|| expected_revoking->reservation_token == 0)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -11538,15 +10921,13 @@ cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &expected_revoking->tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &expected_revoking->tag) || (buf_state & BM_VALID) == 0
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected_revoking->generation
-		|| buf->pcm_state != (uint8) PCM_STATE_X)
+		|| buf->pcm_state != (uint8)PCM_STATE_X)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11560,8 +10941,8 @@ cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 			result = CLUSTER_PCM_OWN_STALE;
 		else
 			result = cluster_pcm_own_reservation_abort_exact(
-				buf->buf_id, expected_revoking->generation,
-				expected_revoking->reservation_token, PCM_OWN_FLAG_REVOKING);
+				buf->buf_id, expected_revoking->generation, expected_revoking->reservation_token,
+				PCM_OWN_FLAG_REVOKING);
 	}
 	UnlockBufHdr(buf, buf_state);
 	return result;
@@ -11662,30 +11043,30 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
  * REVOKING token prevents reuse until DRAIN.
  */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_finish_revoke_retain(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
-	XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained)
+cluster_bufmgr_pcm_own_finish_revoke_retain(BufferDesc *buf,
+											const ClusterPcmOwnSnapshot *expected_revoking,
+											XLogRecPtr expected_lsn,
+											ClusterPcmOwnSnapshot *out_retained)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
-	BufferTag	tag;
-	LWLock	   *content_lock;
-	uint64		committed_generation;
-	uint64		live_token;
-	uint32		flags;
-	uint32		buf_state;
-	bool		source_is_s;
-	bool		source_is_x;
+	BufferTag tag;
+	LWLock *content_lock;
+	uint64 committed_generation;
+	uint64 live_token;
+	uint32 flags;
+	uint32 buf_state;
+	bool source_is_s;
+	bool source_is_x;
 	ClusterPcmXRevokeFinishMode finish_mode;
 
 	if (out_retained != NULL)
 		memset(out_retained, 0, sizeof(*out_retained));
 	if (buf == NULL || expected_revoking == NULL || out_retained == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
-	source_is_s = expected_revoking->pcm_state == (uint8) PCM_STATE_S;
-	source_is_x = expected_revoking->pcm_state == (uint8) PCM_STATE_X;
-	if ((!source_is_s && !source_is_x)
-		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
+	source_is_s = expected_revoking->pcm_state == (uint8)PCM_STATE_S;
+	source_is_x = expected_revoking->pcm_state == (uint8)PCM_STATE_X;
+	if ((!source_is_s && !source_is_x) || expected_revoking->flags != PCM_OWN_FLAG_REVOKING
 		|| expected_revoking->reservation_token == 0)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
@@ -11703,8 +11084,7 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| (buf_state & BM_VALID) == 0
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0
 		|| cluster_pcm_own_gen_get(buf->buf_id) != expected_revoking->generation
 		|| buf->pcm_state != expected_revoking->pcm_state)
 		result = CLUSTER_PCM_OWN_STALE;
@@ -11712,8 +11092,7 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 		result = CLUSTER_PCM_OWN_CORRUPT;
 	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
 		result = CLUSTER_PCM_OWN_BUSY;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11725,21 +11104,18 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			result = CLUSTER_PCM_OWN_BUSY;
 		else if (live_token != expected_revoking->reservation_token)
 			result = CLUSTER_PCM_OWN_STALE;
-		else if (PageGetLSN((Page) BufHdrGetBlock(buf)) != expected_lsn)
+		else if (PageGetLSN((Page)BufHdrGetBlock(buf)) != expected_lsn)
 			result = CLUSTER_PCM_OWN_STALE;
 	}
 
-	if (result == CLUSTER_PCM_OWN_OK)
-	{
+	if (result == CLUSTER_PCM_OWN_OK) {
 		result = cluster_pcm_own_revoke_retain_commit_exact(
-			buf->buf_id, expected_revoking->generation,
-			expected_revoking->reservation_token, &committed_generation);
-		if (result == CLUSTER_PCM_OWN_OK)
-		{
-			buf->pcm_state = (uint8) PCM_STATE_N;
-			buf->buffer_type = (uint8) BUF_TYPE_PI;
-			buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED |
-						   BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
+			buf->buf_id, expected_revoking->generation, expected_revoking->reservation_token,
+			&committed_generation);
+		if (result == CLUSTER_PCM_OWN_OK) {
+			buf->pcm_state = (uint8)PCM_STATE_N;
+			buf->buffer_type = (uint8)BUF_TYPE_PI;
+			buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
 			cluster_pcm_own_snapshot_locked(buf, out_retained);
 		}
 	}
@@ -11753,22 +11129,21 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
  * generation+1 and current token bind a DRAIN to one image round; a delayed
  * DRAIN cannot clear REVOKING on a later transfer. */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
-											  uint64 source_generation)
+cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag, uint64 source_generation)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
 	BufferDesc *buf;
-	BufferTag	lookup_tag;
-	LWLock	   *content_lock;
-	LWLock	   *partition_lock;
-	uint64		committed_generation;
-	uint64		live_token;
-	uint64		retained_token = 0;
-	uint32		hashcode;
-	uint32		flags;
-	uint32		buf_state;
-	int			buf_id;
+	BufferTag lookup_tag;
+	LWLock *content_lock;
+	LWLock *partition_lock;
+	uint64 committed_generation;
+	uint64 live_token;
+	uint64 retained_token = 0;
+	uint32 hashcode;
+	uint32 flags;
+	uint32 buf_state;
+	int buf_id;
 
 	if (tag == NULL || source_generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -11780,8 +11155,7 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 	partition_lock = BufMappingPartitionLock(hashcode);
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&lookup_tag, hashcode);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return CLUSTER_PCM_OWN_STALE;
 	}
@@ -11795,14 +11169,11 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 	 * ordinary content-lock callers).
 	 */
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, tag)
-		|| (buf_state & BM_VALID) == 0
-		|| buf->buffer_type != (uint8) BUF_TYPE_PI
-		|| buf->pcm_state != (uint8) PCM_STATE_N
+	if (!BufferTagsEqual(&buf->tag, tag) || (buf_state & BM_VALID) == 0
+		|| buf->buffer_type != (uint8)BUF_TYPE_PI || buf->pcm_state != (uint8)PCM_STATE_N
 		|| cluster_pcm_own_gen_get(buf->buf_id) != committed_generation)
 		result = CLUSTER_PCM_OWN_STALE;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11824,17 +11195,13 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, tag)
-		|| (buf_state & BM_VALID) == 0
-		|| buf->buffer_type != (uint8) BUF_TYPE_PI
-		|| buf->pcm_state != (uint8) PCM_STATE_N
+	if (!BufferTagsEqual(&buf->tag, tag) || (buf_state & BM_VALID) == 0
+		|| buf->buffer_type != (uint8)BUF_TYPE_PI || buf->pcm_state != (uint8)PCM_STATE_N
 		|| cluster_pcm_own_gen_get(buf->buf_id) != committed_generation)
 		result = CLUSTER_PCM_OWN_STALE;
-	else if ((buf_state
-			  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR)) != 0)
+	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR)) != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else
-	{
+	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 		flags = cluster_pcm_own_flags_get(buf->buf_id);
 		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
@@ -11847,8 +11214,8 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 		else if (live_token != retained_token)
 			result = CLUSTER_PCM_OWN_STALE;
 		else {
-			result = cluster_pcm_own_revoke_retain_release_exact(
-				buf->buf_id, committed_generation, retained_token);
+			result = cluster_pcm_own_revoke_retain_release_exact(buf->buf_id, committed_generation,
+																 retained_token);
 			if (result == CLUSTER_PCM_OWN_OK) {
 				/*
 				 * The exact token is the last stale-write fence.  Release it
@@ -11943,25 +11310,23 @@ cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_
 bool
 cluster_bufmgr_block_is_pi(BufferTag tag)
 {
-	uint32		hash = BufTableHashCode(&tag);
-	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
-	int			buf_id;
+	uint32 hash = BufTableHashCode(&tag);
+	LWLock *partition_lock = BufMappingPartitionLock(hash);
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	bool		is_pi;
+	uint32 buf_state;
+	bool is_pi;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hash);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 	buf_state = LockBufHdr(buf);
-	is_pi = BufferTagsEqual(&buf->tag, &tag)
-		&& buf->buffer_type == (uint8) BUF_TYPE_PI
-		&& (buf_state & BM_VALID) == 0;
+	is_pi = BufferTagsEqual(&buf->tag, &tag) && buf->buffer_type == (uint8)BUF_TYPE_PI
+			&& (buf_state & BM_VALID) == 0;
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -11971,11 +11336,11 @@ cluster_bufmgr_block_is_pi(BufferTag tag)
 bool
 cluster_bufmgr_discard_pi_block(BufferTag tag)
 {
-	uint32		hash = BufTableHashCode(&tag);
-	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
-	int			buf_id;
+	uint32 hash = BufTableHashCode(&tag);
+	LWLock *partition_lock = BufMappingPartitionLock(hash);
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
+	uint32 buf_state;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hash);
@@ -11985,11 +11350,8 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 
 	buf = GetBufferDescriptor(buf_id);
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| buf->buffer_type != (uint8) BUF_TYPE_PI
-		|| (buf_state & BM_VALID) != 0
-		|| BUF_STATE_GET_REFCOUNT(buf_state) != 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || buf->buffer_type != (uint8)BUF_TYPE_PI
+		|| (buf_state & BM_VALID) != 0 || BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		return false;
 	}
@@ -11998,14 +11360,14 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	 * A PI carries no residency claim (D-h1 set pcm_state N at conversion),
 	 * but clear it again under the lock so InvalidateBuffer's eviction hook
 	 * can never see a stale mode and emit a release wire from LMON. */
-	buf->pcm_state = (uint8) PCM_STATE_N;
+	buf->pcm_state = (uint8)PCM_STATE_N;
 	/* PGRAC: spec-6.12h D-h3a — hygiene: drop the shadow stamp with the PI.
 	 * Correctness never depends on this clear (the D-h3 consumer
 	 * re-validates the PI shape + tag under this same header lock, and
 	 * InvalidateBuffer below breaks the shape), but a directive-discarded
 	 * slot should not linger as a plausible-looking stamp. */
 	cluster_pi_shadow_clear(buf->buf_id);
-	InvalidateBuffer(buf);		/* releases the header spinlock */
+	InvalidateBuffer(buf); /* releases the header spinlock */
 
 	return true;
 }
@@ -12034,57 +11396,50 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 bool
 cluster_bufmgr_snapshot_pi_block(BufferTag tag, char *dst, SCN *out_ship_scn)
 {
-	uint32		hash = BufTableHashCode(&tag);
-	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
-	int			buf_id;
+	uint32 hash = BufTableHashCode(&tag);
+	LWLock *partition_lock = BufMappingPartitionLock(hash);
+	int buf_id;
 	BufferDesc *buf;
-	uint32		buf_state;
-	SCN			ship_scn;
-	bool		intact;
+	uint32 buf_state;
+	SCN ship_scn;
+	bool intact;
 
 	*out_ship_scn = InvalidScn;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hash);
-	if (buf_id < 0)
-	{
+	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
-	if (!BufferTagsEqual(&buf->tag, &tag)
-		|| buf->buffer_type != (uint8) BUF_TYPE_PI
-		|| (buf_state & BM_VALID) != 0
-		|| (buf_state & BM_TAG_VALID) == 0
-		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
-	{
+	if (!BufferTagsEqual(&buf->tag, &tag) || buf->buffer_type != (uint8)BUF_TYPE_PI
+		|| (buf_state & BM_VALID) != 0 || (buf_state & BM_TAG_VALID) == 0
+		|| (buf_state & BM_IO_IN_PROGRESS) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return false;
 	}
 	ship_scn = cluster_pi_shadow_read(buf->buf_id);
-	if (!SCN_VALID(ship_scn))
-	{
+	if (!SCN_VALID(ship_scn)) {
 		/* Unstamped PI (clock unarmed at conversion): the recovery boundary
 		 * is unprovable, so the PI is useless as a base (gate UNUSABLE). */
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return false;
 	}
-	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);	/* raw-pin + unlock header */
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state); /* raw-pin + unlock header */
 	LWLockRelease(partition_lock);
 
-	memcpy(dst, (char *) BufHdrGetBlock(buf), BLCKSZ);
+	memcpy(dst, (char *)BufHdrGetBlock(buf), BLCKSZ);
 
 	buf_state = LockBufHdr(buf);
 	/* SCN_CMP_OK: identity recheck of the same slot (same-stamp equality),
 	 * not a Lamport-order comparison. */
-	intact = BufferTagsEqual(&buf->tag, &tag)
-		&& buf->buffer_type == (uint8) BUF_TYPE_PI
-		&& (buf_state & BM_VALID) == 0
-		&& cluster_pi_shadow_read(buf->buf_id) == ship_scn;
+	intact = BufferTagsEqual(&buf->tag, &tag) && buf->buffer_type == (uint8)BUF_TYPE_PI
+			 && (buf_state & BM_VALID) == 0 && cluster_pi_shadow_read(buf->buf_id) == ship_scn;
 	UnlockBufHdr(buf, buf_state);
 	cluster_bufmgr_unpin_for_gcs(buf);
 
@@ -12115,7 +11470,7 @@ cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 {
 	Assert(BufferIsValid(buffer));
 	if (BufferIsLocal(buffer))
-		return;					/* temp/local buffers are never CF-shared */
+		return; /* temp/local buffers are never CF-shared */
 	FlushOneBuffer(buffer);
 }
 
@@ -12167,8 +11522,8 @@ cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 uint32
 cluster_bufmgr_flush_and_release_x_for_leave(void)
 {
-	uint32		flushed = 0;
-	int			i;
+	uint32 flushed = 0;
+	int i;
 
 	/* CL-I9: must run with a real ResourceOwner (backend/checkpointer). */
 	Assert(CurrentResourceOwner != NULL);
@@ -12179,22 +11534,20 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
 	 */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 
-	for (i = 0; i < NBuffers; i++)
-	{
+	for (i = 0; i < NBuffers; i++) {
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint32		buf_state;
+		uint32 buf_state;
 
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
-		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY) &&
-			(PcmState) bufHdr->pcm_state == PCM_STATE_X)
-		{
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY)
+			&& (PcmState)bufHdr->pcm_state == PCM_STATE_X) {
 			ClusterPcmOwnResult bump_result;
-			uint32		observed_flags = 0;
-			uint64		observed_generation = 0;
+			uint32 observed_flags = 0;
+			uint64 observed_generation = 0;
 
-			PinBuffer_Locked(bufHdr);	/* releases the header spinlock */
+			PinBuffer_Locked(bufHdr); /* releases the header spinlock */
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
@@ -12207,22 +11560,20 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
 			buf_state = LockBufHdr(bufHdr);
 			/* PGRAC ownership-gen: bump under the held spinlock (X -> N release
 			 * after the block is durable on shared storage). */
-			bump_result = cluster_pcm_own_bump_locked(bufHdr, 0, 0,
-												&observed_generation, &observed_flags);
-			if (bump_result != CLUSTER_PCM_OWN_OK)
-			{
+			bump_result
+				= cluster_pcm_own_bump_locked(bufHdr, 0, 0, &observed_generation, &observed_flags);
+			if (bump_result != CLUSTER_PCM_OWN_OK) {
 				UnlockBufHdr(bufHdr, buf_state);
 				UnpinBuffer(bufHdr);
 				cluster_pcm_own_report_bump_failure(bufHdr, bump_result, observed_generation,
-												  observed_flags, "clean-leave X release");
+													observed_flags, "clean-leave X release");
 			}
-			bufHdr->pcm_state = (uint8) PCM_STATE_N;
+			bufHdr->pcm_state = (uint8)PCM_STATE_N;
 			UnlockBufHdr(bufHdr, buf_state);
 
 			UnpinBuffer(bufHdr);
 			flushed++;
-		}
-		else
+		} else
 			UnlockBufHdr(bufHdr, buf_state);
 	}
 
@@ -12264,19 +11615,18 @@ bool
 cluster_bufmgr_block_write_permitted(Buffer buffer)
 {
 	BufferDesc *buf;
-	PcmState	state;
-	uint32		buf_state;
-	uint32		own_flags;
+	PcmState state;
+	uint32 buf_state;
+	uint32 own_flags;
 
 	if (BufferIsLocal(buffer))
-		return true;			/* temp / local buffers are never CF-shared */
+		return true; /* temp / local buffers are never CF-shared */
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
-	state = (PcmState) buf->pcm_state;
+	state = (PcmState)buf->pcm_state;
 	own_flags = cluster_pcm_own_flags_get(buf->buf_id);
 	if (cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
-		|| (own_flags & PCM_OWN_FLAG_REVOKING) != 0)
-	{
+		|| (own_flags & PCM_OWN_FLAG_REVOKING) != 0) {
 		UnlockBufHdr(buf, buf_state);
 		return false;
 	}
@@ -12284,8 +11634,8 @@ cluster_bufmgr_block_write_permitted(Buffer buffer)
 	if (state == PCM_STATE_READ_IMAGE)
 		return false;
 	if (cluster_read_scache && state == PCM_STATE_S)
-		return false;			/* spec-6.12a: S is a revoked-write state */
+		return false; /* spec-6.12a: S is a revoked-write state */
 	return true;
 }
 
-#endif							/* USE_PGRAC_CLUSTER */
+#endif /* USE_PGRAC_CLUSTER */
