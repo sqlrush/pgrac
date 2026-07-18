@@ -3370,8 +3370,15 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 			reply = slot->reply_header;
 			memcpy(reply_block, slot->reply_block_data, sizeof(reply_block));
 			LWLockRelease(&blk->lock.lock);
-			if (reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER) {
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+			/* Both denials describe transient source authority, not malformed
+			 * image bytes.  Re-arm the same generation-exact request within the
+			 * existing bounded retry budget; only a putative READ_IMAGE reply is
+			 * eligible for byte/checksum validation below.
+			 */
+			if (reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+				|| reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING) {
+				if (reply.status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
 				continue;
 			}
 			if (!cluster_pcm_x_image_fetch_reply_exact(&reply, reply_block, &progress_now,
