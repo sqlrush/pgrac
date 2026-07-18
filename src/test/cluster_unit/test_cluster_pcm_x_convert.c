@@ -1152,6 +1152,15 @@ make_blocker(int32 node_id, uint32 procno, uint64 request_id)
 	return blocker;
 }
 
+static bool
+blockers_equal(const ClusterLmdVertex *left, const ClusterLmdVertex *right)
+{
+	return left->node_id == right->node_id && left->procno == right->procno
+		   && left->cluster_epoch == right->cluster_epoch && left->request_id == right->request_id
+		   && left->xid == right->xid && left->local_start_ts_ms == right->local_start_ts_ms
+		   && left->wait_seq == right->wait_seq;
+}
+
 static uint32
 blocker_set_crc32c(const ClusterLmdVertex *blockers, Size nblockers)
 {
@@ -5410,8 +5419,8 @@ UT_TEST(test_master_blocker_replace_canonical_snapshot_and_revalidate)
 	UT_ASSERT_EQ(snapshot.set_generation, 1);
 	UT_ASSERT_EQ(snapshot.blocker_count, 2);
 	UT_ASSERT_EQ(snapshot.set_crc32c, UINT32_C(0x11111111));
-	UT_ASSERT(memcmp(&entries[0].blocker, &b1, sizeof(b1)) == 0);
-	UT_ASSERT(memcmp(&entries[1].blocker, &b2, sizeof(b2)) == 0);
+	UT_ASSERT(blockers_equal(&entries[0].blocker, &b1));
+	UT_ASSERT(blockers_equal(&entries[1].blocker, &b2));
 	for (Size i = 0; i < lengthof(entries); i++) {
 		UT_ASSERT_EQ(entries[i].chunk_no, i);
 		UT_ASSERT_EQ(entries[i].reserved, 0);
@@ -5783,8 +5792,8 @@ UT_TEST(test_master_blocker_wire_stage_commits_exact_canonical_set)
 	UT_ASSERT_EQ(snapshot.set_generation, 1);
 	UT_ASSERT_EQ(snapshot.blocker_count, 2);
 	UT_ASSERT_EQ(snapshot.set_crc32c, begin.set_crc32c);
-	UT_ASSERT(memcmp(&entries[0].blocker, &blockers[0], sizeof(blockers[0])) == 0);
-	UT_ASSERT(memcmp(&entries[1].blocker, &blockers[1], sizeof(blockers[1])) == 0);
+	UT_ASSERT(blockers_equal(&entries[0].blocker, &blockers[0]));
+	UT_ASSERT(blockers_equal(&entries[1].blocker, &blockers[1]));
 	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(&begin, 2, source_session, entries,
 																 lengthof(entries), &snapshot),
 				 PCM_X_QUEUE_DUPLICATE);
