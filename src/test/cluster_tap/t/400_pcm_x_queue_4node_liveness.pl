@@ -427,33 +427,47 @@ for my $i (0 .. 3)
 # probe cannot see this — a wedged writer holds no cluster state after
 # kill_kill.  Diagnostic only; every query is bounded and failure-tolerant.
 {
-	my $probe_at = $quad->node0->safe_psql('postgres',
-		"SELECT GREATEST(0.0, EXTRACT(EPOCH FROM "
-		. "(TIMESTAMPTZ '$start_at' + interval '8 seconds' - clock_timestamp())))");
-	sleep($probe_at) if $probe_at > 0;
+	my @samples;
+
+	for my $offset (8, 12)
+	{
+		my $probe_at = $quad->node0->safe_psql('postgres',
+			"SELECT GREATEST(0.0, EXTRACT(EPOCH FROM "
+			. "(TIMESTAMPTZ '$start_at' + interval '$offset seconds' - clock_timestamp())))");
+		sleep($probe_at) if $probe_at > 0;
+		for my $i (0 .. 3)
+		{
+			my $waits = eval {
+				$quad->node($i)->safe_psql('postgres',
+					q{SELECT pid || ':' || state || ':' || coalesce(wait_event_type, '-')
+						|| '/' || coalesce(wait_event, '-')
+					  FROM pg_stat_activity
+					  WHERE query LIKE 'UPDATE pcm_xq_hot%'},
+					timeout => 10);
+			} // 'probe-failed';
+			$waits =~ s/\n/ | /g;
+			$samples[$offset][$i] = eval {
+				state_snapshot($quad->node($i), 'pcm', \@pcm_x_pcm_keys);
+			};
+			diag("L3 mid-leg t+$offset node$i waits=[$waits]"
+				. ($samples[$offset][$i] ? '' : ' snapshot-failed'));
+		}
+	}
+
+	# During a pure stall the t+8 -> t+12 per-node counter movement names the
+	# spinning arm: whatever still ticks is the live retry loop, whatever is
+	# frozen is wedged.
 	for my $i (0 .. 3)
 	{
-		my $waits = eval {
-			$quad->node($i)->safe_psql('postgres',
-				q{SELECT pid || ':' || state || ':' || coalesce(wait_event_type, '-')
-					|| '/' || coalesce(wait_event, '-')
-				  FROM pg_stat_activity
-				  WHERE query LIKE 'UPDATE pcm_xq_hot%'},
-				timeout => 10);
-		} // 'probe-failed';
-		$waits =~ s/\n/ | /g;
-		my $gauges = eval {
-			$quad->node($i)->safe_psql('postgres',
-				q{SELECT string_agg(key || '=' || value, ' ' ORDER BY key)
-				  FROM pg_cluster_state
-				  WHERE category = 'pcm'
-					AND key IN ('pcm_x_runtime_state', 'pcm_x_queue_depth',
-						'pcm_x_queue_live_tickets', 'pcm_x_queue_active_tags',
-						'pcm_x_queue_promotion_count', 'pcm_x_queue_stale_count',
-						'pcm_x_queue_recovery_blocked_count')},
-				timeout => 10);
-		} // 'probe-failed';
-		diag("L3 mid-leg node$i waits=[$waits] gauges=[$gauges]");
+		next unless $samples[8][$i] && $samples[12][$i];
+		my @moved;
+		for my $key (@pcm_x_pcm_keys)
+		{
+			my $d = $samples[12][$i]{$key} - $samples[8][$i]{$key};
+			push @moved, "$key:+$d" if $d != 0;
+		}
+		diag("L3 mid-leg node$i t+8..t+12 moved: "
+			. (@moved ? join(' ', @moved) : '(all frozen)'));
 	}
 }
 
