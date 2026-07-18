@@ -1650,6 +1650,11 @@ cluster_gcs_get_recovery_block_resources_recovering(void)
 	return 0;
 }
 uint64
+cluster_gcs_get_pcm_x_image_fetch_recovering_retry_count(void)
+{
+	return 0;
+}
+uint64
 cluster_gcs_get_recovery_buffers_redeclared(void)
 {
 	return 0;

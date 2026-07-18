@@ -3513,6 +3513,7 @@ extern void cluster_gcs_block_send_pi_discard_invalidate(BufferTag tag, int32 ta
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);
+extern uint64 cluster_gcs_get_pcm_x_image_fetch_recovering_retry_count(void);
 extern uint64 cluster_gcs_get_recovery_buffers_redeclared(void);
 extern uint64 cluster_gcs_get_recovery_block_state_rebuilt(void);
 extern uint64 cluster_gcs_get_recovery_redo_boundary_waits(void);

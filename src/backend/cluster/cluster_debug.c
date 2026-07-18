@@ -2411,6 +2411,8 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	/* PGRAC: spec-4.7 D6 — 8 NEW counter rows for GCS/PCM warm recovery. */
 	emit_row(rsinfo, "gcs_recovery", "block_resources_recovering",
 			 fmt_int64((int64)cluster_gcs_get_recovery_block_resources_recovering()));
+	emit_row(rsinfo, "gcs_recovery", "pcm_x_image_fetch_recovering_retry_count",
+			 fmt_int64((int64)cluster_gcs_get_pcm_x_image_fetch_recovering_retry_count()));
 	emit_row(rsinfo, "gcs_recovery", "buffers_redeclared",
 			 fmt_int64((int64)cluster_gcs_get_recovery_buffers_redeclared()));
 	emit_row(rsinfo, "gcs_recovery", "block_state_rebuilt",

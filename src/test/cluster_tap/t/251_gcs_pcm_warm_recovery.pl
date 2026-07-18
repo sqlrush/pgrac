@@ -69,7 +69,7 @@
 #      L2/L3 (sig b/c) DEFERRED to D1-D5 acceptance + cluster_unit (L239,
 #           see finding above).  SKIPed here with reason.
 #      Lobs (D6/observability, FLIPPED) gcs_recovery dump category exposes the
-#           8 warm-recovery counters under category='gcs_recovery'.
+#           warm-recovery counters under category='gcs_recovery'.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -215,19 +215,19 @@ SKIP: {
 #     8 warm-recovery counters: block_resources_recovering / buffers_redeclared /
 #     block_state_rebuilt / redo_boundary_waits / redo_boundary_reached /
 #     stale_block_drop / ambiguous_owner_failclosed / before_boundary_failclosed).
-#     spec-2.41 D7 adds 2 redo-coverage serve-gate counters to the same category
-#     (redo_coverage_required_lsn_zero_count / redo_coverage_gate_block_count) → 10.
+#     spec-2.41 D7 adds 2 redo-coverage serve-gate counters to the same category;
+#     PCM-X adds one image-fetch RESOURCE_RECOVERING retry counter → 11.
 # ----------
 is($triple->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state()
 		    WHERE category = 'gcs_recovery'}),
-	'10',
-	'Lobs (D6 flipped + spec-2.41 D7): gcs_recovery dump category exposes 10 '
+	'11',
+	'Lobs (D6 flipped + spec-2.41 D7 + PCM-X): gcs_recovery dump category exposes 11 '
 	. 'counters — 8 warm-recovery (block_resources_recovering / buffers_redeclared / '
 	. 'block_state_rebuilt / redo_boundary_waits / redo_boundary_reached / '
 	. 'stale_block_drop / ambiguous_owner_failclosed / before_boundary_failclosed) '
 	. '+ 2 redo-coverage serve-gate (redo_coverage_required_lsn_zero_count / '
-	. 'redo_coverage_gate_block_count)');
+	. 'redo_coverage_gate_block_count) + 1 PCM-X image-fetch recovering retry');
 
 
 $triple->stop_triple;
