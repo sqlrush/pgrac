@@ -11192,6 +11192,9 @@ gcs_block_pcm_x_stage_ready_work(int worker_id, const GcsBlockPcmXImageWork *wor
 }
 
 
+static void gcs_block_pcm_x_revoke_refusal_note(const char *site, int own_result,
+												const ClusterPcmOwnSnapshot *snap);
+
 static void
 gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImageWork *work)
 {
@@ -11218,10 +11221,16 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 	int buffer_id;
 
 	holder_result = cluster_pcm_x_local_holder_snapshot(&work->tag, NULL, 0, &holder_snapshot);
-	if (holder_result == PCM_X_QUEUE_NO_CAPACITY && holder_snapshot.holder_count > 0)
+	if (holder_result == PCM_X_QUEUE_NO_CAPACITY && holder_snapshot.holder_count > 0) {
+		gcs_block_pcm_x_revoke_refusal_note("materialize-holder-capacity", (int)holder_result,
+											NULL);
 		return;
-	if (holder_result == PCM_X_QUEUE_NOT_READY || holder_result == PCM_X_QUEUE_BUSY)
+	}
+	if (holder_result == PCM_X_QUEUE_NOT_READY || holder_result == PCM_X_QUEUE_BUSY) {
+		gcs_block_pcm_x_revoke_refusal_note("materialize-holder-snapshot", (int)holder_result,
+											NULL);
 		return;
+	}
 	if (holder_result != PCM_X_QUEUE_OK || holder_snapshot.holder_count != 0) {
 		cluster_pcm_x_runtime_fail_closed();
 		return;
@@ -11229,8 +11238,10 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 
 	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&work->tag, &buffer_id, &current);
 	gcs_block_pcm_x_note_own_result(own_result);
-	if (own_result == CLUSTER_PCM_OWN_NOT_READY)
+	if (own_result == CLUSTER_PCM_OWN_NOT_READY) {
+		gcs_block_pcm_x_revoke_refusal_note("materialize-snapshot", (int)own_result, &current);
 		return;
+	}
 	source_is_n = current.pcm_state == (uint8)PCM_STATE_N;
 	source_is_s = current.pcm_state == (uint8)PCM_STATE_S;
 	source_is_x = current.pcm_state == (uint8)PCM_STATE_X;
@@ -11252,8 +11263,10 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 	else
 		own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
 	gcs_block_pcm_x_note_own_result(own_result);
-	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY)
+	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY) {
+		gcs_block_pcm_x_revoke_refusal_note("materialize-begin", (int)own_result, &current);
 		return;
+	}
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		(void)gcs_block_pcm_x_release_image_exact(worker_id, work, &work->binding);
 		cluster_pcm_x_runtime_fail_closed();
@@ -11419,6 +11432,45 @@ cluster_gcs_block_pcm_x_image_pump_tick(int worker_id)
 /* 49 only installs the holder-side revoke ledger and wakes exact registered
  * holders.  It never copies a page, drops ownership, or synthesizes type 50
  * inside the IC handler. */
+/* Log-once evidence for a repeating source-side REVOKE refusal: the live
+ * descriptor lifecycle blocking the transfer leg must name itself, because
+ * every refusal arm here is silent and the master keeps re-sending forever.
+ * A NULL site resets the streak (the revoke made progress). */
+static void
+gcs_block_pcm_x_revoke_refusal_note(const char *site, int own_result,
+									const ClusterPcmOwnSnapshot *snap)
+{
+	static const char *last_site = NULL;
+	static uint32 last_flags = 0;
+	static int last_result = 0;
+	static bool logged = false;
+	uint32 flags = snap != NULL ? snap->flags : 0;
+
+	if (site == NULL) {
+		last_site = NULL;
+		logged = false;
+		return;
+	}
+	if (site == last_site && own_result == last_result && flags == last_flags) {
+		if (!logged) {
+			logged = true;
+			ereport(LOG,
+					(errmsg("PCM-X source revoke is repeating a refusal at %s", site),
+					 errdetail("result=%d pcm_state=%u own_flags=%u generation=%llu token=%llu",
+							   own_result, (unsigned int)(snap != NULL ? snap->pcm_state : 0),
+							   (unsigned int)flags,
+							   (unsigned long long)(snap != NULL ? snap->generation : 0),
+							   (unsigned long long)(snap != NULL ? snap->reservation_token : 0))));
+		}
+		return;
+	}
+	last_site = site;
+	last_result = own_result;
+	last_flags = flags;
+	logged = false;
+}
+
+
 static void
 cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const void *payload)
 {
@@ -11511,8 +11563,10 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 		source_is_s = own_snapshot.pcm_state == (uint8)PCM_STATE_S;
 		source_is_x = own_snapshot.pcm_state == (uint8)PCM_STATE_X;
 		if (own_result != CLUSTER_PCM_OWN_OK || (!source_is_n && !source_is_s && !source_is_x)
-			|| own_snapshot.flags != 0)
+			|| own_snapshot.flags != 0) {
+			gcs_block_pcm_x_revoke_refusal_note("ingress-snapshot", (int)own_result, &own_snapshot);
 			return;
+		}
 		source_generation = own_snapshot.generation;
 	}
 	gcs_block_pcm_x_reserved_binding(revoke, source_generation, source_session, &reserved_binding);
@@ -11534,12 +11588,13 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 	}
 	result = cluster_pcm_x_local_holder_revoke_apply_exact(revoke, source_node, source_session);
 	cluster_pcm_x_stats_note_queue_result(result);
-	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+		gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL);
 		gcs_block_pcm_x_wake_registered_holders(&revoke->ref.identity.tag);
-	else if (new_reservation
-			 && cluster_gcs_block_dedup_pcm_x_release_exact(
-					worker_id, &image_key, &revoke->ref.identity.tag, &reserved_binding)
-					!= GCS_BLOCK_PCM_X_IMAGE_RELEASED)
+	} else if (new_reservation
+			   && cluster_gcs_block_dedup_pcm_x_release_exact(
+					  worker_id, &image_key, &revoke->ref.identity.tag, &reserved_binding)
+					  != GCS_BLOCK_PCM_X_IMAGE_RELEASED)
 		cluster_pcm_x_runtime_fail_closed();
 }
 
