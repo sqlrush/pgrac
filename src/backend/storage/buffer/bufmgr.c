@@ -1108,10 +1108,11 @@ cluster_pcm_own_finish_grant_or_rollback(BufferDesc *buf, const ClusterPcmOwnSna
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("could not finish exact cluster PCM grant reservation: result=%d",
 					(int)finish_result),
-			 errdetail("master grant was rolled back for buffer %d token=%llu; "
+			 errdetail("master grant was rolled back for buffer %d token=%llu target=%u; "
 					   "live state=%u gen=%llu token=%llu flags=%u vs "
 					   "base state=%u gen=%llu token=%llu flags=%u",
 					   buf != NULL ? buf->buf_id : -1, (unsigned long long)reservation_token,
+					   (unsigned int)new_pcm_state,
 					   (unsigned int)live.pcm_state, (unsigned long long)live.generation,
 					   (unsigned long long)live.reservation_token, (unsigned int)live.flags,
 					   base != NULL ? (unsigned int)base->pcm_state : 0,
