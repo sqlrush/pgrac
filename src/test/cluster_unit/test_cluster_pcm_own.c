@@ -322,23 +322,22 @@ UT_TEST(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle)
 }
 
 /*
- * RED for the t/400 fast-fail finish family (2026-07-20, loop9 DETAIL): an
- * S holder upgrading to X through the legacy master acquire begins a
- * fresh-token GRANT_PENDING reservation from S/flags=0 -- the begin side
- * and the S-base abort path have always supported that shape -- but the
- * grant-reservation classifier only enumerated N_NEW and the three revoke
- * handoffs, so EVERY such upgrade failed its finish deterministically,
- * rolled back a durable master grant and surfaced result=1 to the client
- * (live S/gen/token+1/GRANT_PENDING vs base S/gen/token/0).
+ * Protocol pin for the t/400 fast-fail finish family (2026-07-20, loop9 and
+ * loop10b DETAIL): a fresh-token GRANT_PENDING reservation taken from an
+ * S/flags=0 base ("S_NEW" -- a stale-cover fallback wrongly entering the
+ * legacy master acquire after an in-window X->S downgrade) must NEVER
+ * become a legal finish shape.  Writer conversions are ordered by the
+ * convert queue's FIFO/WFG; legalizing this shape at the finish would let
+ * that fallback bypass the arbitration entirely (the original S3 unordered
+ * multi-writer defect).  The fallback must re-enter the queue instead;
+ * this classifier keeps refusing the bypass.
  */
-UT_TEST(test_s_upgrade_fresh_token_is_a_legal_grant_finish_shape)
+UT_TEST(test_s_new_fresh_token_finish_shape_stays_invalid)
 {
 	ClusterPcmOwnSnapshot base;
 	ClusterPcmOwnSnapshot live;
-	uint64 committed = UINT64_MAX;
-	uint64 token;
 
-	/* The exact loop9 production tuple. */
+	/* The exact loop9/loop10b production tuple stays refused. */
 	memset(&base, 0, sizeof(base));
 	base.generation = 10;
 	base.reservation_token = 5;
@@ -347,30 +346,16 @@ UT_TEST(test_s_upgrade_fresh_token_is_a_legal_grant_finish_shape)
 	live.reservation_token = 6;
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, 6),
-				 CLUSTER_PCM_X_GRANT_RESERVATION_S_UPGRADE);
-
-	/* A non-adjacent token is never an upgrade. */
-	live.reservation_token = 7;
-	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, 7),
 				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
 
-	/* A fresh-token X base stays deliberately unenumerated: a live X cover
-	 * never re-acquires through this path. */
+	/* A fresh-token X base is refused the same way: a live X cover never
+	 * re-acquires through this path. */
 	base.pcm_state = (uint8)PCM_STATE_X;
 	live = base;
 	live.reservation_token = 6;
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, 6),
 				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
-
-	/* Full entry lifecycle: begin from the S base, commit bumps once. */
-	reset_fixture();
-	pg_atomic_write_u64(&ClusterPcmOwnArray[0].generation, 7);
-	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 7, PCM_OWN_FLAG_GRANT_PENDING, &token),
-				 CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_own_grant_commit_exact(0, 7, token, &committed), CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(committed, 8);
-	assert_entry(8, token, 0);
 }
 
 UT_TEST(test_revoke_commit_is_exact_and_classifies_live_races)
@@ -2157,7 +2142,7 @@ main(void)
 	UT_RUN(test_grant_commit_is_exact_and_bumps_once);
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
-	UT_RUN(test_s_upgrade_fresh_token_is_a_legal_grant_finish_shape);
+	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
 	UT_RUN(test_revoke_commit_is_exact_and_classifies_live_races);
 	UT_RUN(test_revoke_retain_commit_keeps_exact_token_until_release);
 	UT_RUN(test_revoke_commit_exhaustion_is_side_effect_free);
