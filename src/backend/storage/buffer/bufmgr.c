@@ -1239,6 +1239,46 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 	CHECK_FOR_INTERRUPTS();
 }
 
+/*
+ * PGRAC (t/400 L3 review R2 P0-2): a legacy grant reservation that observes
+ * a live GRANT_PENDING/REVOKING lifecycle sits in a normal ms-scale revoke or
+ * grant window — for a reader (or a rare un-valid-page writer) that is a
+ * transient to wait out off-lock, not a client ERROR.  The retry is only a
+ * fresh begin against the re-sampled complete ownership tuple; another
+ * lifecycle's token/flags are never touched.  No content lock is held at
+ * either call site, and a backend holding OTHER frozen-tag content locks
+ * must not sleep (nested-guard discipline) — both the guard refusal and the
+ * bounded-wait exhaustion fall back to the historical fail-closed report in
+ * the caller.
+ */
+#define CLUSTER_BUFMGR_PCM_RESERVATION_MAX_WAITS 64
+
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
+												ClusterPcmOwnSnapshot *base_out,
+												uint64 *token_out)
+{
+	ClusterPcmOwnResult result;
+	uint32		waits = 0;
+
+	for (;;)
+	{
+		result = cluster_pcm_own_begin_grant_reservation(buf, base_out, token_out);
+		if (result != CLUSTER_PCM_OWN_BUSY
+			|| waits >= CLUSTER_BUFMGR_PCM_RESERVATION_MAX_WAITS)
+			return result;
+		if (cluster_pcm_x_nested_wait_guard_before_block() != PCM_X_QUEUE_OK)
+			return result;
+		cluster_pcm_x_stats_note_own_busy();
+		CHECK_FOR_INTERRUPTS();
+		(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 cluster_pcm_x_holder_retry_delay_ms(waits),
+						 WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+		CHECK_FOR_INTERRUPTS();
+		waits++;
+	}
+}
+
 static ClusterPcmXHolderLedgerEntry *
 cluster_bufmgr_pcm_x_holder_find(BufferDesc *buf)
 {
@@ -8074,8 +8114,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 				 * JOIN/WAIT and call begin_x_reservation only from
 				 * ACTIVE_TRANSFER/PREPARE.
 				 */
-				pcm_pending_result = cluster_pcm_own_begin_grant_reservation(buf, &pcm_pending_base,
-																			 &pcm_pending_token);
+				pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
+					buf, &pcm_pending_base, &pcm_pending_token);
 				if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 					cluster_pcm_own_report_bump_failure(
 						buf, pcm_pending_result, pcm_pending_base.generation,
@@ -8188,7 +8228,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					cluster_pcm_note_writer_cover_stale_detected();
 					pcm_covered = false;
 					LWLockRelease(BufferDescriptorGetContentLock(buf));
-					pcm_pending_result = cluster_pcm_own_begin_grant_reservation(
+					pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
 						buf, &pcm_pending_base, &pcm_pending_token);
 					if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 						cluster_pcm_own_report_bump_failure(

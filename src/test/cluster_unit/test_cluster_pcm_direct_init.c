@@ -373,7 +373,7 @@ UT_TEST(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire)
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
 		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
-			"cluster_pcm_own_begin_grant_reservation(buf, &pcm_pending_base",
+			"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
 			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode)" };
 
 	UT_ASSERT(source != NULL);

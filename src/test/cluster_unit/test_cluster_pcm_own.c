@@ -776,11 +776,13 @@ UT_TEST(test_bufmgr_generation_bump_failure_is_classified_under_header_lock)
 UT_TEST(test_lockbuffer_reservation_failures_use_busy_corrupt_classifier)
 {
 	static const char *const initial_reservation_contract[]
-		= { "cluster_pcm_own_begin_grant_reservation", "pcm_pending_result != CLUSTER_PCM_OWN_OK",
-			"cluster_pcm_own_report_bump_failure", "pcm_pending_set = true" };
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait",
+			"pcm_pending_result != CLUSTER_PCM_OWN_OK", "cluster_pcm_own_report_bump_failure",
+			"pcm_pending_set = true" };
 	static const char *const revalidate_reservation_contract[]
-		= { "cluster_pcm_own_begin_grant_reservation", "pcm_pending_result != CLUSTER_PCM_OWN_OK",
-			"cluster_pcm_own_report_bump_failure", "pcm_pending_set = true" };
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait",
+			"pcm_pending_result != CLUSTER_PCM_OWN_OK", "cluster_pcm_own_report_bump_failure",
+			"pcm_pending_set = true" };
 	char *source = read_bufmgr_source();
 
 	/* A live queue reservation is BUSY, not damaged metadata.  Both legacy
@@ -1207,7 +1209,8 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 		UT_ASSERT(strstr(hint, "cluster_bufmgr_pcm_x_retained_image_locked")
 				  < strstr(hint, "BM_DIRTY | BM_JUST_DIRTIED"));
 	if (lockbuffer != NULL) {
-		const char *reserve = strstr(lockbuffer, "cluster_pcm_own_begin_grant_reservation(");
+		const char *reserve
+			= strstr(lockbuffer, "cluster_bufmgr_pcm_begin_grant_reservation_wait(");
 		const char *content
 			= strstr(lockbuffer, "LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)");
 		const char *w1_revoke
