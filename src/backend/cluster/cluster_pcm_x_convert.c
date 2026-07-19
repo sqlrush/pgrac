@@ -18382,6 +18382,20 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 									 int32 authenticated_master_node,
 									 uint64 authenticated_master_session)
 {
+	return cluster_pcm_x_local_drain_poll_certificate_exact(poll, authenticated_master_node,
+															authenticated_master_session, NULL);
+}
+
+
+/* First-consumption variant: capture the completion certificate under the
+ * same tag lock that publishes TERMINAL_DRAINED, so the caller can release
+ * the self-source immutable record against the exact protocol ledger. */
+PcmXQueueResult
+cluster_pcm_x_local_drain_poll_certificate_exact(const PcmXDrainPollPayload *poll,
+												 int32 authenticated_master_node,
+												 uint64 authenticated_master_session,
+												 PcmXLocalDrainCertificate *certificate_out)
+{
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
 	PcmXPeerFrontier *frontier;
@@ -18400,6 +18414,8 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 	bool fail_closed = false;
 	bool promote_candidate;
 
+	if (certificate_out != NULL)
+		memset(certificate_out, 0, sizeof(*certificate_out));
 	if (header == NULL || poll == NULL || !pcm_x_local_terminal_ref_valid(&poll->ref)
 		|| poll->drain_generation == 0 || poll->drain_generation == UINT64_MAX
 		|| authenticated_master_node < 0 || authenticated_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
@@ -18595,6 +18611,18 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 	tag_slot->terminal_drain_generation = poll->drain_generation;
 	pg_write_barrier();
 	(void)pcm_x_slot_flags_fetch_or(&tag_slot->slot, PCM_X_LOCAL_TAG_F_TERMINAL_DRAINED);
+	/* Completion certificate: the writer-round ledger is captured under this
+	 * same lock, before RETIRE can clear it, so the caller can verify the
+	 * self-source release against the exact protocol evidence instead of the
+	 * live descriptor (which may legitimately have moved on or been evicted). */
+	if (certificate_out != NULL) {
+		certificate_out->ref = tag_slot->ref;
+		certificate_out->image = tag_slot->image;
+		certificate_out->committed_own_generation = tag_slot->committed_own_generation;
+		certificate_out->master_session_incarnation = tag_slot->master_session_incarnation;
+		certificate_out->master_node = tag_slot->master_node;
+		certificate_out->valid = true;
+	}
 	result = PCM_X_QUEUE_OK;
 
 drain_release_gate:

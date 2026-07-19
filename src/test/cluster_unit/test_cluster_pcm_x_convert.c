@@ -9413,6 +9413,7 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	PcmXPhasePayload final_confirm;
 	PcmXPhasePayload duplicate_confirm;
 	PcmXDrainPollPayload poll;
+	PcmXLocalDrainCertificate drain_certificate;
 	PcmXRetirePayload retire;
 	PcmXLocalReliableToken token;
 	PcmXLocalReliableToken retry_token;
@@ -9677,9 +9678,24 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&writer_claim), PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&follower, NULL), PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&follower), PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session),
+	/* First consumption captures the completion certificate under the same
+	 * tag lock; a DUPLICATE replay must not fabricate one. */
+	memset(&drain_certificate, 0xff, sizeof(drain_certificate));
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_certificate_exact(&poll, 1, master_session,
+																  &drain_certificate),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(drain_certificate.valid);
+	UT_ASSERT(ticket_refs_equal(&drain_certificate.ref, &poll.ref));
+	UT_ASSERT_EQ(drain_certificate.master_node, 1);
+	UT_ASSERT_EQ(drain_certificate.master_session_incarnation, master_session);
+	UT_ASSERT_EQ(drain_certificate.committed_own_generation, tag_slot->committed_own_generation);
+	UT_ASSERT_EQ(drain_certificate.image.image_id, tag_slot->image.image_id);
+	UT_ASSERT_EQ(drain_certificate.image.source_own_generation,
+				 tag_slot->image.source_own_generation);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_certificate_exact(&poll, 1, master_session,
+																  &drain_certificate),
 				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT(!drain_certificate.valid);
 	UT_ASSERT_EQ(cluster_pcm_x_local_progress_exact(&leader, &progress), PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(progress.member_state, PCM_XL_GRANTED);
 	UT_ASSERT_EQ(progress.pending_opcode, 0);

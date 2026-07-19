@@ -12011,19 +12011,21 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 	return result;
 }
 
-/* Prove that a sole-requester source image was adopted by the exact S->X
- * handoff.  This is intentionally read-only: a delayed DRAIN may release its
- * immutable A-record, but it must never mutate the current X descriptor. */
+/* Corruption-only probe under a delayed self-source DRAIN.  The release
+ * authority is the exact protocol completion certificate captured by the
+ * DRAIN consumption; the live descriptor is NOT that authority, because its
+ * per-buf_id generation is no BufferTag lineage - the tag may legitimately
+ * have moved on (X->S downgrade for a reader, a later lifecycle) or been
+ * evicted and reloaded on another descriptor.  This probe is intentionally
+ * read-only and only reports a structurally malformed flags/token shape. */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_generation,
-											ClusterPcmOwnSelfHandoffSample *sample_out)
+cluster_bufmgr_pcm_own_self_handoff_probe(const BufferTag *tag,
+										  ClusterPcmOwnSelfHandoffSample *sample_out)
 {
 	ClusterPcmOwnResult live_result;
-	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
 	BufferDesc *buf;
 	BufferTag lookup_tag;
 	LWLock *partition_lock;
-	uint64 live_generation;
 	uint64 live_token;
 	uint32 flags;
 	uint32 hashcode;
@@ -12032,7 +12034,7 @@ cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_
 
 	if (sample_out != NULL)
 		memset(sample_out, 0, sizeof(*sample_out));
-	if (tag == NULL || source_generation == UINT64_MAX)
+	if (tag == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
@@ -12043,17 +12045,16 @@ cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_
 	buf_id = BufTableLookup(&lookup_tag, hashcode);
 	if (buf_id < 0) {
 		LWLockRelease(partition_lock);
-		return CLUSTER_PCM_OWN_STALE;
+		return CLUSTER_PCM_OWN_OK;
 	}
 	buf = GetBufferDescriptor(buf_id);
 	buf_state = LockBufHdr(buf);
-	live_generation = cluster_pcm_own_gen_get(buf->buf_id);
 	live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 	flags = cluster_pcm_own_flags_get(buf->buf_id);
 	live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
 	if (sample_out != NULL) {
 		/* Snapshot under the header lock only; the caller logs after unlock. */
-		sample_out->live_generation = live_generation;
+		sample_out->live_generation = cluster_pcm_own_gen_get(buf->buf_id);
 		sample_out->live_token = live_token;
 		sample_out->own_flags = flags;
 		sample_out->pcm_state = buf->pcm_state;
@@ -12061,18 +12062,9 @@ cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_
 		sample_out->bm_valid = (buf_state & BM_VALID) != 0;
 		sample_out->buffer_found = BufferTagsEqual(&buf->tag, tag);
 	}
-	if (!BufferTagsEqual(&buf->tag, tag) || live_generation != source_generation + 1)
-		result = CLUSTER_PCM_OWN_STALE;
-	else if (live_result == CLUSTER_PCM_OWN_CORRUPT)
-		result = live_result;
-	else if (flags != 0)
-		result = CLUSTER_PCM_OWN_BUSY;
-	else if (live_token == 0 || (buf_state & BM_VALID) == 0 || buf->pcm_state != (uint8)PCM_STATE_X
-			 || buf->buffer_type != (uint8)BUF_TYPE_XCUR)
-		result = CLUSTER_PCM_OWN_STALE;
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
-	return result;
+	return live_result == CLUSTER_PCM_OWN_CORRUPT ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_OK;
 }
 
 /* ========================================================================

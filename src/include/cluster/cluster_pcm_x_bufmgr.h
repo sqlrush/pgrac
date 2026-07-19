@@ -362,9 +362,9 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	ClusterPcmOwnSnapshot *out_retained);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 																		 uint64 source_generation);
-/* Process-local descriptor evidence captured by the DRAIN proof below so the
- * caller can log the exact refusal shape before deciding fail-closed.  The
- * fields are one header-locked snapshot; never persisted or sent on wire. */
+/* Process-local descriptor evidence captured by the DRAIN-time probe below
+ * so the caller can log the observed shape as diagnostics.  The fields are
+ * one header-locked snapshot; never persisted or sent on wire. */
 typedef struct ClusterPcmOwnSelfHandoffSample {
 	uint64 live_generation;
 	uint64 live_token;
@@ -375,11 +375,12 @@ typedef struct ClusterPcmOwnSelfHandoffSample {
 	bool buffer_found;
 } ClusterPcmOwnSelfHandoffSample;
 
-/* Read-only DRAIN proof for a sole-requester source that committed S->X in
- * place.  Exact base+1 X/XCUR authority means DRAIN may release only the
- * immutable dedup record and must not invalidate this descriptor. */
+/* Read-only corruption probe for a delayed sole-requester source DRAIN.  The
+ * release authority is the protocol completion certificate; the descriptor
+ * may legitimately have moved on or been evicted, so this only reports a
+ * structurally malformed flags/token shape (and never mutates anything). */
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_generation,
-											ClusterPcmOwnSelfHandoffSample *sample_out);
+cluster_bufmgr_pcm_own_self_handoff_probe(const BufferTag *tag,
+										  ClusterPcmOwnSelfHandoffSample *sample_out);
 
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

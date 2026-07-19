@@ -1657,6 +1657,24 @@ extern PcmXQueueResult cluster_pcm_x_local_terminal_publish_exact(
 extern PcmXQueueResult cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 															int32 authenticated_master_node,
 															uint64 authenticated_master_session);
+
+/* Process-local completion certificate captured under the tag lock by the
+ * first (writer-lane) DRAIN consumption.  The exact protocol ledger - not
+ * the live buffer descriptor, whose per-buf_id generation may legitimately
+ * move on or vanish behind eviction - is the release authority for the
+ * self-source immutable image record.  Never persisted or sent on wire. */
+typedef struct PcmXLocalDrainCertificate {
+	PcmXTicketRef ref;
+	PcmXImageToken image;
+	uint64 committed_own_generation;
+	uint64 master_session_incarnation;
+	int32 master_node;
+	bool valid;
+} PcmXLocalDrainCertificate;
+
+extern PcmXQueueResult cluster_pcm_x_local_drain_poll_certificate_exact(
+	const PcmXDrainPollPayload *poll, int32 authenticated_master_node,
+	uint64 authenticated_master_session, PcmXLocalDrainCertificate *certificate_out);
 extern PcmXQueueResult cluster_pcm_x_local_retire_up_to_exact(const PcmXRetirePayload *request,
 															  int32 authenticated_master_node,
 															  uint64 authenticated_master_session);

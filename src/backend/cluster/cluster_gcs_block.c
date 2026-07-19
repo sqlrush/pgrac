@@ -11928,12 +11928,14 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 	GcsBlockPcmXImageBinding binding;
 	GcsBlockDedupKey key;
 	PcmXLocalHolderProgress progress;
+	PcmXLocalDrainCertificate certificate;
 	PcmXQueueResult progress_result;
 	PcmXQueueResult result;
 	ClusterPcmOwnSelfHandoffSample handoff_sample;
 	ClusterPcmOwnResult handoff_result;
 	ClusterPcmXRevokeFinishMode finish_mode;
 	uint64 holder_image_id = 0;
+	bool certificate_exact;
 	bool holder_image = false;
 	bool holder_ref = false;
 	bool self_source_handoff = false;
@@ -11946,8 +11948,8 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 	} else if (progress_result != PCM_X_QUEUE_OK && progress_result != PCM_X_QUEUE_NOT_FOUND)
 		return progress_result;
 
-	result = cluster_pcm_x_local_drain_poll_exact(poll, authenticated_master_node,
-												  authenticated_master_session);
+	result = cluster_pcm_x_local_drain_poll_certificate_exact(
+		poll, authenticated_master_node, authenticated_master_session, &certificate);
 	if (result != PCM_X_QUEUE_OK)
 		return result;
 
@@ -11986,28 +11988,60 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 	self_source_handoff = binding.identity.image.source_node == (uint32)cluster_node_id
 						  && poll->ref.identity.node_id == cluster_node_id;
 	if (self_source_handoff) {
-		handoff_result = cluster_bufmgr_pcm_own_self_handoff_x_exact(
-			&poll->ref.identity.tag, binding.identity.image.source_own_generation, &handoff_sample);
-		if (handoff_result != CLUSTER_PCM_OWN_OK) {
-			/* FINAL makes the in-place X descriptor authoritative before DRAIN.
-			 * Preserve the immutable record if that exact proof is missing.
-			 * The refusal shape is one-shot evidence: this arm fuses the node,
-			 * so the descriptor snapshot must reach the log before it does. */
-			ereport(
-				LOG,
-				(errmsg("PCM-X self-source DRAIN proof refused"),
-				 errdetail("result=%d source_gen=%llu live_gen=%llu own_flags=%u "
-						   "own_token=%llu pcm_state=%u buffer_type=%u bm_valid=%d found=%d",
-						   (int)handoff_result,
-						   (unsigned long long)binding.identity.image.source_own_generation,
-						   (unsigned long long)handoff_sample.live_generation,
-						   (unsigned int)handoff_sample.own_flags,
-						   (unsigned long long)handoff_sample.live_token,
-						   (unsigned int)handoff_sample.pcm_state,
-						   (unsigned int)handoff_sample.buffer_type,
-						   handoff_sample.bm_valid ? 1 : 0, handoff_sample.buffer_found ? 1 : 0)));
+		/* The exact completion certificate - the writer-round protocol ledger
+		 * captured under the drain's own tag lock - is the release authority.
+		 * The live descriptor is NOT: its per-buf_id generation carries no
+		 * BufferTag lineage, and the tag may legitimately have moved on
+		 * (X->S downgrade for a reader, a later lifecycle) or been evicted
+		 * since FINAL_ACK.  The descriptor probe below only reports a
+		 * structurally malformed flags/token shape. */
+		certificate_exact
+			= certificate.valid && gcs_block_pcm_x_ticket_ref_equal(&certificate.ref, &poll->ref)
+			  && certificate.image.image_id == binding.identity.image.image_id
+			  && certificate.image.source_own_generation
+					 == binding.identity.image.source_own_generation
+			  && certificate.image.source_node == binding.identity.image.source_node
+			  && certificate.master_node == authenticated_master_node
+			  && certificate.master_session_incarnation == authenticated_master_session
+			  && certificate.committed_own_generation
+					 == binding.identity.image.source_own_generation + 1;
+		handoff_result
+			= cluster_bufmgr_pcm_own_self_handoff_probe(&poll->ref.identity.tag, &handoff_sample);
+		if (handoff_result == CLUSTER_PCM_OWN_CORRUPT) {
+			ereport(LOG, (errmsg("PCM-X self-source DRAIN found a malformed descriptor lifecycle"),
+						  errdetail("own_flags=%u own_token=%llu live_gen=%llu pcm_state=%u "
+									"buffer_type=%u bm_valid=%d found=%d",
+									(unsigned int)handoff_sample.own_flags,
+									(unsigned long long)handoff_sample.live_token,
+									(unsigned long long)handoff_sample.live_generation,
+									(unsigned int)handoff_sample.pcm_state,
+									(unsigned int)handoff_sample.buffer_type,
+									handoff_sample.bm_valid ? 1 : 0,
+									handoff_sample.buffer_found ? 1 : 0)));
 			cluster_pcm_x_runtime_fail_closed();
 			return PCM_X_QUEUE_CORRUPT;
+		}
+		if (!certificate_exact) {
+			/* Preserve the immutable record: without the exact certificate the
+			 * release cannot be proven, but a mismatched ledger is not node
+			 * corruption.  The master's next poll replays as DUPLICATE. */
+			ereport(LOG,
+					(errmsg("PCM-X self-source DRAIN certificate is not exact"),
+					 errdetail("valid=%d cert_committed=%llu cert_image=%llu cert_source_gen=%llu "
+							   "image=%llu source_gen=%llu source_node=%u live_gen=%llu "
+							   "own_flags=%u pcm_state=%u found=%d",
+							   certificate.valid ? 1 : 0,
+							   (unsigned long long)certificate.committed_own_generation,
+							   (unsigned long long)certificate.image.image_id,
+							   (unsigned long long)certificate.image.source_own_generation,
+							   (unsigned long long)binding.identity.image.image_id,
+							   (unsigned long long)binding.identity.image.source_own_generation,
+							   (unsigned int)binding.identity.image.source_node,
+							   (unsigned long long)handoff_sample.live_generation,
+							   (unsigned int)handoff_sample.own_flags,
+							   (unsigned int)handoff_sample.pcm_state,
+							   handoff_sample.buffer_found ? 1 : 0)));
+			return PCM_X_QUEUE_NOT_READY;
 		}
 	}
 	if (cluster_gcs_block_dedup_pcm_x_release_exact(worker_id, &key, &poll->ref.identity.tag,

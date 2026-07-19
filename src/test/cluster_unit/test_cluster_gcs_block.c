@@ -2101,9 +2101,17 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		UT_ASSERT_NOT_NULL(strstr(abort, "cluster_bufmgr_pcm_own_abort_x_revoke("));
 	}
 	if (drain != NULL) {
-		const char *local_drain = strstr(drain, "cluster_pcm_x_local_drain_poll_exact(");
+		const char *local_drain
+			= strstr(drain, "cluster_pcm_x_local_drain_poll_certificate_exact(");
 		const char *duplicate_guard
 			= local_drain != NULL ? strstr(local_drain, "if (result != PCM_X_QUEUE_OK)") : NULL;
+		/* The self-source release authority is the exact completion
+		 * certificate; an inexact ledger preserves the record without a
+		 * node fuse (the descriptor probe alone may report corruption). */
+		const char *certificate_policy = strstr(drain, "source_own_generation + 1");
+		const char *certificate_refusal = certificate_policy != NULL
+											  ? strstr(certificate_policy, "PCM_X_QUEUE_NOT_READY")
+											  : NULL;
 		const char *release_record = strstr(drain, "cluster_gcs_block_dedup_pcm_x_release_exact(");
 		const char *finish_mode_gate = strstr(drain, "cluster_pcm_x_revoke_finish_mode(");
 		const char *drop_arm = strstr(drain, "CLUSTER_PCM_X_REVOKE_FINISH_DROP");
@@ -2112,15 +2120,19 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 
 		UT_ASSERT_NOT_NULL(local_drain);
 		UT_ASSERT_NOT_NULL(duplicate_guard);
+		UT_ASSERT_NOT_NULL(certificate_policy);
+		UT_ASSERT_NOT_NULL(certificate_refusal);
 		UT_ASSERT_NOT_NULL(release_record);
 		UT_ASSERT_NOT_NULL(finish_mode_gate);
 		UT_ASSERT_NOT_NULL(drop_arm);
 		UT_ASSERT_NOT_NULL(release_retained);
-		if (local_drain != NULL && duplicate_guard != NULL && release_record != NULL
-			&& finish_mode_gate != NULL && drop_arm != NULL && release_retained != NULL)
-			UT_ASSERT(local_drain < duplicate_guard && duplicate_guard < release_record
-					  && release_record < finish_mode_gate && finish_mode_gate < drop_arm
-					  && drop_arm < release_retained);
+		if (local_drain != NULL && duplicate_guard != NULL && certificate_policy != NULL
+			&& certificate_refusal != NULL && release_record != NULL && finish_mode_gate != NULL
+			&& drop_arm != NULL && release_retained != NULL)
+			UT_ASSERT(local_drain < duplicate_guard && duplicate_guard < certificate_policy
+					  && certificate_policy < certificate_refusal
+					  && certificate_refusal < release_record && release_record < finish_mode_gate
+					  && finish_mode_gate < drop_arm && drop_arm < release_retained);
 	}
 	if (generic_install != NULL) {
 		const char *content = strstr(generic_install, "LWLockAcquire(content_lock, LW_EXCLUSIVE)");
@@ -2542,7 +2554,7 @@ UT_TEST(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x)
 	if (self_arm != NULL && remote_finish != NULL && materialize_end != NULL)
 		UT_ASSERT(self_arm < remote_finish && remote_finish < materialize_end);
 
-	verify_x = strstr(drain, "cluster_bufmgr_pcm_own_self_handoff_x_exact(");
+	verify_x = strstr(drain, "cluster_bufmgr_pcm_own_self_handoff_probe(");
 	release_record = strstr(drain, "cluster_gcs_block_dedup_pcm_x_release_exact(");
 	self_return
 		= release_record != NULL ? strstr(release_record, "if (self_source_handoff)") : NULL;

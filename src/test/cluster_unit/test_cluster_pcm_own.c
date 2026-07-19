@@ -1756,12 +1756,12 @@ UT_TEST(test_queue_self_source_handoff_is_single_lifecycle_and_readonly_drain)
 													"cluster_pcm_own_revoke_to_grant_handoff_exact",
 													"UnlockBufHdr" };
 	static const char *const drain_proof_contract[] = { "BufMappingPartitionLock",
+														"BufTableLookup",
+														"CLUSTER_PCM_OWN_OK",
 														"LockBufHdr",
-														"source_generation + 1",
-														"flags != 0",
-														"PCM_STATE_X",
-														"BUF_TYPE_XCUR",
-														"UnlockBufHdr" };
+														"cluster_pcm_own_classify_live_flags",
+														"UnlockBufHdr",
+														"CLUSTER_PCM_OWN_CORRUPT" };
 	char *source = read_bufmgr_source();
 	const char *handoff;
 	const char *handoff_end;
@@ -1785,7 +1785,7 @@ UT_TEST(test_queue_self_source_handoff_is_single_lifecycle_and_readonly_drain)
 		forbidden = strstr(handoff, "cluster_pcm_own_reservation_abort_exact(");
 		UT_ASSERT(forbidden == NULL || forbidden >= handoff_end);
 	}
-	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_self_handoff_x_exact(",
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_self_handoff_probe(",
 							   "\n/* ==========", drain_proof_contract,
 							   lengthof(drain_proof_contract));
 	free(source);
