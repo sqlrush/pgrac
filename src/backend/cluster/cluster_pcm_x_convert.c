@@ -19842,6 +19842,18 @@ pcm_x_local_wake_actual_match(const PcmXLocalWakeBatch *wake_batch,
 }
 
 
+/* One-shot evidence ahead of the retire-collect fuse: every corruption arm
+ * funnels to the same fail-closed line, so name the arm and its uncoerced
+ * detail here.  For scan arms a/b are the slot index and the raw result;
+ * for the wake-count arm they are the projected and actual wake counts. */
+static void
+pcm_x_local_retire_collect_note(const char *site, uint64 a, uint64 b)
+{
+	ereport(LOG, (errmsg("PCM-X local retire collect fails closed at %s (a=%llu, b=%llu)", site,
+						 (unsigned long long)a, (unsigned long long)b)));
+}
+
+
 PcmXQueueResult
 cluster_pcm_x_local_retire_up_to_collect_exact(const PcmXRetirePayload *request,
 											   int32 authenticated_master_node,
@@ -19933,6 +19945,7 @@ claim_done:
 		return result;
 	}
 	if (!pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view)) {
+		pcm_x_local_retire_collect_note("allocator-view", 0, 0);
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto retire_failed;
@@ -19983,6 +19996,7 @@ claim_done:
 				&writer_candidate_ref, &writer_candidate, &holder_candidate, &candidate,
 				&contains_watermark, &holder_wake, &holder_wake_candidate);
 			if (result != PCM_X_QUEUE_OK) {
+				pcm_x_local_retire_collect_note("second-pass-candidate", (uint64)i, (uint64)result);
 				fail_closed = true;
 				result = PCM_X_QUEUE_CORRUPT;
 				goto retire_failed;
@@ -20006,6 +20020,9 @@ claim_done:
 				}
 			}
 			if (result != PCM_X_QUEUE_OK) {
+				pcm_x_local_retire_collect_note(holder_candidate ? "holder-detach"
+																 : "writer-detach",
+												(uint64)i, (uint64)result);
 				fail_closed = true;
 				result = PCM_X_QUEUE_CORRUPT;
 				goto retire_failed;
@@ -20014,6 +20031,7 @@ claim_done:
 				result = pcm_x_local_wake_actual_match(wake_batch, &writer_wake,
 													   projected_wake_count, &actual_wake_count);
 				if (result != PCM_X_QUEUE_OK) {
+					pcm_x_local_retire_collect_note("wake-match", (uint64)i, (uint64)result);
 					fail_closed = true;
 					result = PCM_X_QUEUE_CORRUPT;
 					goto retire_failed;
@@ -20022,6 +20040,8 @@ claim_done:
 		} while (candidate);
 	}
 	if (wake_batch != NULL && actual_wake_count != projected_wake_count) {
+		pcm_x_local_retire_collect_note("wake-count", (uint64)projected_wake_count,
+										(uint64)actual_wake_count);
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto retire_failed;
@@ -20059,6 +20079,7 @@ retire_preflight_failed:
 	/* No tag was mutated, so a retryable/stale preflight can release the claim.
 	 * Structural corruption retains both exact episode witnesses. */
 	if (result == PCM_X_QUEUE_CORRUPT) {
+		pcm_x_local_retire_collect_note("preflight", 0, (uint64)result);
 		fail_closed = true;
 		goto retire_failed;
 	}
