@@ -1528,6 +1528,25 @@ init_active_pcm_x(uint64 master_session_incarnation)
 	UT_ASSERT(cluster_pcm_x_runtime_activate(master_session_incarnation));
 }
 
+/*
+ * A' rebase: the formation-wide V2 coverage flag is written before activation
+ * and immutable for the runtime's lifetime; an ACTIVE snapshot exposes it and
+ * an activation without the flag (a formation with any old member) leaves
+ * rebase publication disabled.
+ */
+UT_TEST(test_runtime_rebase_wire_active_is_activation_bound)
+{
+	init_active_pcm_x(UINT64_C(77));
+	UT_ASSERT(!cluster_pcm_x_runtime_snapshot().rebase_wire_active);
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	cluster_pcm_x_runtime_set_rebase_wire_active(true);
+	UT_ASSERT(cluster_pcm_x_runtime_activate(UINT64_C(77)));
+	UT_ASSERT(cluster_pcm_x_runtime_snapshot().rebase_wire_active);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
 static bool
 ticket_refs_equal(const PcmXTicketRef *left, const PcmXTicketRef *right)
 {
@@ -2096,7 +2115,9 @@ UT_TEST(test_wire_abi_sizes_are_exact)
 	UT_ASSERT_EQ(sizeof(PcmXPhasePayload), 96);
 	UT_ASSERT_EQ(sizeof(PcmXRevokePayload), 96);
 	UT_ASSERT_EQ(sizeof(PcmXGrantPayload), 128);
-	UT_ASSERT_EQ(sizeof(PcmXInstallReadyPayload), 104);
+	UT_ASSERT_EQ(sizeof(PcmXInstallReadyPayload), 112);
+	UT_ASSERT_EQ(offsetof(PcmXInstallReadyPayload, rebased_own_generation),
+				 PCM_X_INSTALL_READY_V1_LEN);
 	UT_ASSERT_EQ(sizeof(PcmXFinalAckPayload), 104);
 	UT_ASSERT_EQ(sizeof(PcmXBlockerSetHeaderPayload), 104);
 	UT_ASSERT_EQ(sizeof(PcmXBlockerChunkPayload), 128);
@@ -2162,7 +2183,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, slot_generation_hi), 16);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, state_flags), 20);
 	UT_ASSERT_EQ(sizeof(PcmXReliableLegState), 56);
-	UT_ASSERT_EQ(sizeof(PcmXLocalProgress), 240);
+	UT_ASSERT_EQ(sizeof(PcmXLocalProgress), 248);
 	UT_ASSERT_EQ(offsetof(PcmXLocalProgress, master_session_incarnation), 224);
 	UT_ASSERT_EQ(offsetof(PcmXLocalProgress, master_node), 232);
 	UT_ASSERT_EQ(sizeof(PcmXLocalHolderProgress), 160);
@@ -2170,9 +2191,11 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXLocalHolderProgress, master_node), 152);
 	UT_ASSERT_EQ(sizeof(PcmXLocalBlockerSnapshot), 112);
 	UT_ASSERT_EQ(sizeof(PcmXMasterTagSlot), 120);
-	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 384);
+	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 392);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, grant_base_own_generation), 384);
 	UT_ASSERT_EQ(sizeof(PcmXBlockerSlot), 128);
-	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 752);
+	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 760);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, grant_base_own_generation), 752);
 	UT_ASSERT_EQ(sizeof(PcmXLocalMembershipSlot), 168);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
 	UT_ASSERT_EQ(sizeof(PcmXPeerBinding), 16);
@@ -2215,7 +2238,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35376);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36504);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36512);
 }
 
 UT_TEST(test_lwlock_held_limit_is_shared_200)
@@ -6275,7 +6298,7 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	install_ready.result = PCM_X_QUEUE_OK;
 	install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 	UT_ASSERT_EQ(
-		cluster_pcm_x_master_install_ready_exact(&install_ready, 0, requester_session, &commit),
+		cluster_pcm_x_master_install_ready_exact(&install_ready, 0, 0, requester_session, &commit),
 		PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(commit.phase, PGRAC_IC_MSG_PCM_X_COMMIT_X);
 
@@ -6325,6 +6348,252 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	UT_ASSERT_EQ(test_slot_flags(&ticket->slot), 0);
 	UT_ASSERT_EQ(cluster_pcm_x_master_final_confirm_exact(&final_confirm, 0, requester_session),
 				 PCM_X_QUEUE_DUPLICATE);
+}
+
+/* Admit with an explicit nonzero enqueue-time base_own_generation, so the
+ * strictly-newer rebase arms have a real lower bound to violate. */
+static void
+admit_active_probe_with_base(BlockNumber block, int32 node_id, uint32 procno, uint64 request_id,
+							 uint64 sender_session, uint64 prehandle_sequence,
+							 uint64 base_own_generation, PcmXMasterAdmission *admission_out)
+{
+	PcmXWaitIdentity identity = make_wait_identity(block, node_id, procno, request_id);
+	PcmXEnqueuePayload request;
+	PcmXTicketRef active;
+
+	identity.base_own_generation = base_own_generation;
+	request = make_enqueue(identity, sender_session, prehandle_sequence);
+	bind_enqueue_peer(&request);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, admission_out), PCM_X_QUEUE_OK);
+	UT_ASSERT_NOT_NULL(admission_out);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_admit_confirm_exact(&admission_out->ref, UINT64_C(9000) + request_id),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_promote_head_exact(&identity.tag, identity.cluster_epoch, &active),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT(ticket_refs_equal(&active, &admission_out->ref));
+}
+
+/* Drive an admitted ACTIVE_PROBE ticket through blocker commit, transfer,
+ * revoke and IMAGE_READY, leaving its reliable leg armed at PREPARE_GRANT. */
+static void
+drive_master_ticket_to_prepared(PcmXMasterAdmission *admission, uint64 source_session,
+								uint64 graph_generation, PcmXTicketRef *transfer_out,
+								uint64 *image_id_out)
+{
+	PcmXMasterBlockerSnapshot snapshot;
+	PcmXBlockerSetHeaderPayload blocker_commit;
+	PcmXRevokePayload revoke;
+	PcmXGrantPayload image_ready;
+	PcmXGrantPayload prepare;
+
+	arm_blocker_probe(&admission->ref, 2, source_session);
+	blocker_commit = make_blocker_header(&admission->ref, 1, NULL, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_begin_exact(&blocker_commit, 2, source_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(&blocker_commit, 2, source_session,
+																 NULL, 0, &snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_graph_commit_exact(&snapshot, NULL, 0, graph_generation),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_probe_complete_exact(&admission->ref, 1, 2, source_session),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_begin_transfer_exact(&admission->ref, graph_generation, transfer_out),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_revoke_arm_exact(transfer_out, 2, source_session, &revoke),
+				 PCM_X_QUEUE_OK);
+	memset(&image_ready, 0, sizeof(image_ready));
+	image_ready.ref = *transfer_out;
+	image_ready.image.image_id = revoke.image_id;
+	image_ready.image.source_own_generation = UINT64_C(44);
+	image_ready.image.page_scn = UINT64_C(55);
+	image_ready.image.page_lsn = UINT64_C(66);
+	image_ready.image.source_node = 2;
+	image_ready.image.page_checksum = UINT32_C(77);
+	UT_ASSERT_EQ(cluster_pcm_x_master_image_ready_exact(&image_ready, 2, source_session, &prepare),
+				 PCM_X_QUEUE_OK);
+	*image_id_out = revoke.image_id;
+}
+
+/*
+ * A' rebase (t/400 item 2): an interleaved revoke on the requester node
+ * consumes the enqueue-time base_own_generation while the request is queued.
+ * INSTALL_READY may publish a strictly-newer effective grant base exactly
+ * once; the ticket persists it and every later exact "+1" check runs against
+ * the effective base while the wire ref identity stays immutable.
+ */
+UT_TEST(test_master_install_ready_rebase_grant_base_is_one_shot)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTicketRef transfer;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXMasterFinalAckToken final_ack_token;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	uint64 image_id;
+	const uint64 requester_session = UINT64_C(7281);
+	const uint64 source_session = UINT64_C(8281);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	admit_active_probe_with_base(810, 0, 20, UINT64_C(8281), requester_session, 1, UINT64_C(5),
+								 &admission);
+	drive_master_ticket_to_prepared(&admission, source_session, UINT64_C(9281), &transfer,
+									&image_id);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, 0);
+
+	memset(&install_ready, 0, sizeof(install_ready));
+	install_ready.ref = transfer;
+	install_ready.image_id = image_id;
+	install_ready.result = PCM_X_QUEUE_OK;
+	install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+
+	/* Shape violation: the exhausted sentinel can never be a grant base. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_MAX, 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_INVALID);
+	/* Not strictly newer than the enqueue-time base: lower, then equal. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(4), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(5), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, 0);
+	UT_ASSERT_EQ(ticket->reliable.pending_opcode, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT);
+
+	/* One-shot publish of a >1 drift (5 -> 8), then a same-value replay. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(8), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(commit.phase, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, UINT64_C(8));
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(8), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, UINT64_C(8));
+
+	/* The effective grant base now drives the exact final-ack "+1" math: the
+	 * enqueue-time math (5+1) is refused, the rebased math (8+1) commits. */
+	memset(&final_ack, 0, sizeof(final_ack));
+	final_ack.ref = transfer;
+	final_ack.image_id = image_id;
+	final_ack.committed_own_generation = UINT64_C(6);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_STALE);
+	final_ack.committed_own_generation = UINT64_C(9);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_finalize_exact(&final_ack_token, &final_commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(final_commit.phase, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK);
+	memset(&final_confirm, 0, sizeof(final_confirm));
+	final_confirm.ref = transfer;
+	final_confirm.phase = PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM;
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_confirm_exact(&final_confirm, 0, requester_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(test_slot_state(&ticket->slot), PCM_XT_COMPLETE);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+/* A second, different rebase value is evidence divergence, never contention. */
+UT_TEST(test_master_install_ready_rebase_conflict_fails_closed)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTicketRef transfer;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	uint64 image_id;
+	const uint64 requester_session = UINT64_C(7282);
+	const uint64 source_session = UINT64_C(8282);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	admit_active_probe_with_base(811, 0, 21, UINT64_C(8282), requester_session, 1, UINT64_C(5),
+								 &admission);
+	drive_master_ticket_to_prepared(&admission, source_session, UINT64_C(9282), &transfer,
+									&image_id);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+
+	memset(&install_ready, 0, sizeof(install_ready));
+	install_ready.ref = transfer;
+	install_ready.image_id = image_id;
+	install_ready.result = PCM_X_QUEUE_OK;
+	install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(8), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, UINT64_C(9), 0,
+														  requester_session, &commit),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, UINT64_C(8));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+/* Without a rebase the ticket keeps the enqueue-time math bit for bit, and
+ * the locked exact check still refuses a wrong committed generation. */
+UT_TEST(test_master_install_ready_no_drift_keeps_identity_base_math)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTicketRef transfer;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXMasterFinalAckToken final_ack_token;
+	PcmXPhasePayload final_commit;
+	uint64 image_id;
+	const uint64 requester_session = UINT64_C(7283);
+	const uint64 source_session = UINT64_C(8283);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	admit_active_probe_with_base(812, 0, 22, UINT64_C(8283), requester_session, 1, UINT64_C(5),
+								 &admission);
+	drive_master_ticket_to_prepared(&admission, source_session, UINT64_C(9283), &transfer,
+									&image_id);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+
+	memset(&install_ready, 0, sizeof(install_ready));
+	install_ready.ref = transfer;
+	install_ready.image_id = image_id;
+	install_ready.result = PCM_X_QUEUE_OK;
+	install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_install_ready_exact(&install_ready, 0, 0, requester_session, &commit),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(ticket->grant_base_own_generation, 0);
+
+	memset(&final_ack, 0, sizeof(final_ack));
+	final_ack.ref = transfer;
+	final_ack.image_id = image_id;
+	/* Monotonic but not exactly base+1: passes ingress sanity, refused by the
+	 * locked exact check. */
+	final_ack.committed_own_generation = UINT64_C(7);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_STALE);
+	final_ack.committed_own_generation = UINT64_C(6);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_finalize_exact(&final_ack_token, &final_commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
 UT_TEST(test_master_grant_generation_exhaustion_never_wraps)
@@ -10065,6 +10334,201 @@ UT_TEST(test_local_cross_lane_retire_exemption_requires_distinct_ticket)
 	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
 	tag_slot->ref = saved_ref;
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+typedef struct TestLocalRebaseFixture {
+	PcmXLocalHandle writer;
+	PcmXLocalWriterClaim writer_claim;
+	PcmXAdmitAckPayload admit_ack;
+	PcmXGrantPayload prepare;
+	PcmXLocalTagSlot *tag_slot;
+	uint64 master_session;
+} TestLocalRebaseFixture;
+
+/* Drive a local leader with a nonzero enqueue-time base (=5) through the
+ * production chain to the exact PREPARE_GRANT-applied, pre-INSTALL window
+ * where an interleaved revoke would have moved the own generation. */
+static void
+prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
+							 TestLocalRebaseFixture *fixture)
+{
+	PcmXLocalHolderKey holder_key;
+	PcmXLocalHolderHandle holder;
+	PcmXLocalHolderHandle holder_copy;
+	PcmXLocalHolderSnapshot holder_snapshot;
+	PcmXLocalBlockerSnapshot blocker_snapshot;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXPhasePayload admit_confirm;
+	PcmXLocalCutoff cutoff;
+	PcmXLocalReliableToken token;
+
+	UT_ASSERT_NOT_NULL(fixture);
+	memset(fixture, 0, sizeof(*fixture));
+	fixture->master_session = master_session;
+	init_active_pcm_x(UINT64_C(77));
+	bind_local_master(1, UINT64_C(9), master_session);
+	holder_key = make_local_holder_key(block, 0, 2, master_session + UINT64_C(1), 3);
+	UT_ASSERT_EQ(register_active_local_holder(&holder_key, &holder), PCM_X_QUEUE_OK);
+	identity = make_wait_identity(block, 0, 3, master_session + UINT64_C(2));
+	identity.base_own_generation = UINT64_C(5);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, &fixture->writer),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&fixture->writer, &fixture->writer_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(fixture->writer_claim.grant_base_own_generation, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(&fixture->writer, &cutoff),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&fixture->writer, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&fixture->admit_ack, 0, sizeof(fixture->admit_ack));
+	fixture->admit_ack.ref.identity = identity;
+	fixture->admit_ack.ref.handle.ticket_id = master_session + UINT64_C(100);
+	fixture->admit_ack.ref.handle.queue_generation = UINT64_C(1);
+	fixture->admit_ack.prehandle = enqueue.prehandle;
+	fixture->admit_ack.result = PCM_X_QUEUE_OK;
+	fixture->admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
+	UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(&fixture->writer, &fixture->admit_ack, 1,
+														   master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_admit_confirm_arm_exact(&fixture->writer, &admit_confirm, &token),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_admit_confirm_ack_exact(&fixture->writer, &admit_confirm, 1,
+															 master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
+					 &fixture->admit_ack.ref, 1, master_session, &holder_copy, 1, &holder_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
+					 &fixture->admit_ack.ref, 1, master_session, &holder_snapshot, &holder_copy, 1,
+					 NULL, 0, &blocker_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(
+					 &fixture->admit_ack.ref, blocker_snapshot.set_generation, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(release_active_local_holder(&holder), PCM_X_QUEUE_OK);
+
+	memset(&fixture->prepare, 0, sizeof(fixture->prepare));
+	fixture->prepare.ref = fixture->admit_ack.ref;
+	fixture->prepare.ref.grant_generation = UINT64_C(1);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(200),
+											&fixture->prepare.image.image_id));
+	fixture->prepare.image.source_own_generation = UINT64_C(9);
+	fixture->prepare.image.page_scn = UINT64_C(10);
+	fixture->prepare.image.page_lsn = UINT64_C(11);
+	fixture->prepare.image.source_node = 2;
+	fixture->prepare.image.page_checksum = UINT32_C(12);
+	UT_ASSERT_EQ(cluster_pcm_x_local_prepare_grant_exact(&fixture->writer, &fixture->prepare, 1,
+														 master_session),
+				 PCM_X_QUEUE_OK);
+	fixture->tag_slot
+		= &local_tag_slots(ClusterPcmXConvertShmem)[fixture->writer.tag_slot.slot_index];
+	UT_ASSERT_EQ(fixture->tag_slot->grant_base_own_generation, 0);
+}
+
+/*
+ * A' rebase, local plane: the one-shot pre-reservation publication of the
+ * effective grant base and the exact final-ack math that follows it.  The
+ * wire V2 field is emitted from the persisted value, never from a caller
+ * argument, and the enqueue-time math is refused once a rebase is live.
+ */
+UT_TEST(test_local_grant_rebase_publish_is_one_shot_and_effective)
+{
+	TestLocalRebaseFixture fixture;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXLocalReliableToken token;
+	PcmXDrainPollPayload poll;
+	PcmXRetirePayload retire;
+	PcmXLocalProgress progress;
+	const uint64 master_session = UINT64_C(1811);
+
+	prepare_local_rebase_fixture(7120, master_session, &fixture);
+
+	/* Shape and strictly-newer gates. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, 0),
+				 PCM_X_QUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_MAX),
+				 PCM_X_QUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(4)),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(5)),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(fixture.tag_slot->grant_base_own_generation, 0);
+
+	/* One-shot publish of a >1 drift (5 -> 8), then a same-value replay. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(fixture.tag_slot->grant_base_own_generation, UINT64_C(8));
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_progress_exact(&fixture.writer, &progress), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(progress.grant_base_own_generation, UINT64_C(8));
+
+	/* The armed INSTALL_READY emits the persisted value on the V2 field. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_install_ready_arm_exact(&fixture.writer, &fixture.prepare.ref,
+															 &fixture.prepare.image, &install_ready,
+															 &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(install_ready.rebased_own_generation, UINT64_C(8));
+	/* Once the leg is armed the publish window is closed. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+				 PCM_X_QUEUE_BAD_STATE);
+
+	memset(&commit, 0, sizeof(commit));
+	commit.ref = fixture.prepare.ref;
+	commit.phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	UT_ASSERT_EQ(cluster_pcm_x_local_commit_x_exact(&fixture.writer, &commit, 1, master_session),
+				 PCM_X_QUEUE_OK);
+
+	/* The enqueue-time math (5+1) is refused; the rebased math (8+1) arms. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_final_ack_arm_exact(&fixture.writer, UINT64_C(6), &final_ack, &token),
+		PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_final_ack_arm_exact(&fixture.writer, UINT64_C(9), &final_ack, &token),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(final_ack.committed_own_generation, UINT64_C(9));
+	memset(&final_commit, 0, sizeof(final_commit));
+	final_commit.ref = fixture.prepare.ref;
+	final_commit.phase = PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK;
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_commit_ack_exact(&fixture.writer, &final_commit, 1,
+															master_session, &final_confirm, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&fixture.writer_claim),
+				 PCM_X_QUEUE_OK);
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = fixture.prepare.ref;
+	poll.drain_generation = UINT64_C(43);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.prepare.ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.prepare.ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+/* A second, different local rebase value is evidence divergence. */
+UT_TEST(test_local_grant_rebase_conflict_fails_closed)
+{
+	TestLocalRebaseFixture fixture;
+	const uint64 master_session = UINT64_C(1813);
+
+	prepare_local_rebase_fixture(7121, master_session, &fixture);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(9)),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(fixture.tag_slot->grant_base_own_generation, UINT64_C(8));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
 }
 
 UT_TEST(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly)
@@ -14575,6 +15039,7 @@ main(void)
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
 	UT_RUN(test_runtime_layout_abi_and_offsets_are_exact);
+	UT_RUN(test_runtime_rebase_wire_active_is_activation_bound);
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);
 	UT_RUN(test_exactly_five_pools_and_bounded_directories);
@@ -14689,6 +15154,9 @@ main(void)
 	UT_RUN(test_master_drive_bitmap_replace_rejects_reliable_leg_drift);
 	UT_RUN(test_master_drive_snapshot_fails_closed_on_bitmap_corruption);
 	UT_RUN(test_master_transfer_wire_49_56_is_generation_exact);
+	UT_RUN(test_master_install_ready_rebase_grant_base_is_one_shot);
+	UT_RUN(test_master_install_ready_rebase_conflict_fails_closed);
+	UT_RUN(test_master_install_ready_no_drift_keeps_identity_base_math);
 	UT_RUN(test_master_grant_generation_exhaustion_never_wraps);
 	UT_RUN(test_master_image_id_allocator_encodes_node31_and_never_wraps);
 	UT_RUN(test_master_blocker_wire_stage_preserves_old_set_until_commit);
@@ -14742,6 +15210,8 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_grant_rebase_publish_is_one_shot_and_effective);
+	UT_RUN(test_local_grant_rebase_conflict_fails_closed);
 	UT_RUN(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly);
 	UT_RUN(test_local_cancelled_participant_gen0_drain_requires_frozen_round);
 	UT_RUN(test_local_holder_drain_validates_frozen_round_before_terminal_publish);

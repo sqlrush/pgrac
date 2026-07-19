@@ -1312,6 +1312,29 @@ UT_TEST(test_pcm_x_install_ready_ingress_is_canonical_requester_ack)
 	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
 	UT_ASSERT(cluster_pcm_x_image_id_encode(3, 37, &ready.image_id));
 	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+
+	/* A' rebase: both exact frame lengths are legal, nothing in between; a
+	 * V1-length frame must carry a zero rebase and a V2 rebase must be
+	 * strictly newer than the immutable identity base and not the exhausted
+	 * sentinel. */
+	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 37, &ready.image_id));
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
+															11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN + 4,
+															 1, 11, 2, 2));
+	ready.ref.identity.base_own_generation = 5;
+	ready.rebased_own_generation = 8;
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
+															 11, 2, 2));
+	ready.rebased_own_generation = 5;
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	ready.rebased_own_generation = 4;
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	ready.rebased_own_generation = UINT64_MAX;
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	ready.rebased_own_generation = 0;
+	ready.ref.identity.base_own_generation = 0;
 }
 
 
@@ -1334,7 +1357,7 @@ UT_TEST(test_pcm_x_commit_x_ingress_is_canonical_master_phase)
 }
 
 
-UT_TEST(test_pcm_x_final_ack_ingress_binds_exact_committed_generation)
+UT_TEST(test_pcm_x_final_ack_ingress_binds_monotonic_committed_floor)
 {
 	PcmXFinalAckPayload ack;
 	uint64 image_id;
@@ -1348,8 +1371,19 @@ UT_TEST(test_pcm_x_final_ack_ingress_binds_exact_committed_generation)
 
 	UT_ASSERT(cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
 	UT_ASSERT(!cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 3, 11, 2, 2));
+	/* A' rebase: the wire check is only a monotonic floor (committed > base);
+	 * a published rebase legally lifts committed past base+1 and the exact
+	 * "+1" proof runs under the master ticket lock against the effective
+	 * grant base.  At or below the base stays refused. */
 	ack.committed_own_generation = 2;
+	UT_ASSERT(cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
+	ack.ref.identity.base_own_generation = 5;
+	ack.committed_own_generation = 5;
 	UT_ASSERT(!cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
+	ack.committed_own_generation = 4;
+	UT_ASSERT(!cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
+	ack.committed_own_generation = 9;
+	UT_ASSERT(cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
 	ack.ref.identity.base_own_generation = UINT64_MAX;
 	ack.committed_own_generation = 0;
 	UT_ASSERT(!cluster_gcs_pcm_x_final_ack_ingress_valid(&ack, sizeof(ack), 1, 11, 2, 2));
@@ -3488,7 +3522,7 @@ main(void)
 	UT_RUN(test_pcm_x_prepare_grant_ingress_binds_master_to_requester);
 	UT_RUN(test_pcm_x_install_ready_ingress_is_canonical_requester_ack);
 	UT_RUN(test_pcm_x_commit_x_ingress_is_canonical_master_phase);
-	UT_RUN(test_pcm_x_final_ack_ingress_binds_exact_committed_generation);
+	UT_RUN(test_pcm_x_final_ack_ingress_binds_monotonic_committed_floor);
 	UT_RUN(test_pcm_x_final_commit_ack_ingress_is_canonical_master_phase);
 	UT_RUN(test_pcm_x_final_confirm_ingress_is_canonical_requester_phase);
 	UT_RUN(test_pcm_x_master_drive_selects_exact_authority_and_next_holder);

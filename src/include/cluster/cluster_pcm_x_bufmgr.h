@@ -131,7 +131,14 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 	return claim != NULL && granted != NULL && live != NULL && claim->flags == 0
 		   && claim->writer.flags == 0 && claim->claim_generation != 0
 		   && claim->writer.identity.base_own_generation != UINT64_MAX
-		   && granted->generation == claim->writer.identity.base_own_generation + 1
+		   && claim->grant_base_own_generation != UINT64_MAX
+		   /* A' rebase: the requester copies the published effective grant
+			* base into the claim; zero keeps the enqueue-time identity base. */
+		   && granted->generation
+				  == (claim->grant_base_own_generation != 0
+						  ? claim->grant_base_own_generation
+						  : claim->writer.identity.base_own_generation)
+						 + 1
 		   && granted->reservation_token != 0 && granted->flags == 0
 		   && granted->pcm_state == (uint8)PCM_STATE_X
 		   && BufferTagsEqual(&granted->tag, &claim->writer.identity.tag)

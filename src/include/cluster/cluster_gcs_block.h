@@ -984,16 +984,25 @@ cluster_gcs_pcm_x_prepare_grant_ingress_valid(const PcmXGrantPayload *grant, Siz
 		   && cluster_gcs_pcm_x_image_token_wire_valid(&grant->image, authenticated_node);
 }
 
-/* INSTALL_READY is one canonical requester -> master application ACK. */
+/* INSTALL_READY is one canonical requester -> master application ACK.  Both
+ * the V1 (104-byte, no rebase) and V2 (112-byte) exact frames are legal; the
+ * caller normalizes a V1 frame to rebased_own_generation == 0 before this
+ * check.  A V1 frame carrying a nonzero rebase is impossible by construction
+ * and a V2 rebase must be strictly newer than the immutable identity base. */
 static inline bool
 cluster_gcs_pcm_x_install_ready_ingress_valid(const PcmXInstallReadyPayload *ready,
 											  Size payload_length, int32 authenticated_node,
 											  uint64 current_epoch, int32 tag_master,
 											  int32 local_node)
 {
-	return ready != NULL && payload_length == sizeof(*ready) && authenticated_node >= 0
-		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
-		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+	return ready != NULL
+		   && (payload_length == sizeof(*ready) || payload_length == PCM_X_INSTALL_READY_V1_LEN)
+		   && (payload_length == sizeof(*ready) || ready->rebased_own_generation == 0)
+		   && (ready->rebased_own_generation == 0
+			   || (ready->rebased_own_generation != UINT64_MAX
+				   && ready->rebased_own_generation > ready->ref.identity.base_own_generation))
+		   && authenticated_node >= 0 && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
 		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ready->ref, current_epoch)
 		   && ready->ref.identity.node_id == authenticated_node
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ready->image_id, local_node)
@@ -1015,7 +1024,10 @@ cluster_gcs_pcm_x_commit_x_ingress_valid(const PcmXPhasePayload *commit, Size pa
 		   && commit->phase == PGRAC_IC_MSG_PCM_X_COMMIT_X && commit->flags == 0;
 }
 
-/* FINAL_ACK proves the requester committed exactly one ownership generation. */
+/* FINAL_ACK proves the requester committed exactly one ownership generation.
+ * The wire check is only a monotonic floor against the immutable identity
+ * base: a published INSTALL_READY rebase may have moved the effective grant
+ * base, and the exact "+1" proof runs under the master ticket lock. */
 static inline bool
 cluster_gcs_pcm_x_final_ack_ingress_valid(const PcmXFinalAckPayload *ack, Size payload_length,
 										  int32 authenticated_node, uint64 current_epoch,
@@ -1028,7 +1040,7 @@ cluster_gcs_pcm_x_final_ack_ingress_valid(const PcmXFinalAckPayload *ack, Size p
 		   && ack->ref.identity.node_id == authenticated_node
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ack->image_id, local_node)
 		   && ack->ref.identity.base_own_generation != UINT64_MAX
-		   && ack->committed_own_generation == ack->ref.identity.base_own_generation + 1;
+		   && ack->committed_own_generation > ack->ref.identity.base_own_generation;
 }
 
 /* FINAL_COMMIT_ACK is the canonical master -> requester application ACK. */

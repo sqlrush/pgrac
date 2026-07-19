@@ -371,6 +371,22 @@ cluster_sf_peer_supports_pcm_x_convert(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0;
 }
 
+/* A' rebase: the V2 INSTALL_READY frame is legal on this connection only when
+ * its verified HELLO advertised the rebase protocol capability. */
+bool
+cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1) != 0;
+}
+
 /* Return one lock-coherent snapshot of the capability-record generation whose
  * verified HELLO advertised PCM-X.  Tier1 owns this record on CONTROL and can
  * sample it around another authority read to reject reconnect ABA; RDMA keeps

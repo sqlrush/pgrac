@@ -3203,7 +3203,10 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 		return queue_result;
 	if (!BufferTagsEqual(&buf->tag, &reservation_base->tag)
 		|| !BufferTagsEqual(&leader->identity.tag, &reservation_base->tag)
-		|| reservation_base->generation != leader->identity.base_own_generation)
+		|| reservation_base->generation
+			   != (progress_before.grant_base_own_generation != 0
+					   ? progress_before.grant_base_own_generation
+					   : leader->identity.base_own_generation))
 		return PCM_X_QUEUE_STALE;
 	if (!cluster_pcm_x_image_fetch_build_request(&progress_before, cluster_node_id,
 												 (int32)MyBackendId, &request))
@@ -8086,6 +8089,7 @@ static int gcs_block_pcm_x_requester_fail_line = 0;
  * non-N pcm_state vs a live lifecycle flag) without a debugger. */
 typedef struct GcsBlockPcmXPreflightEvidence {
 	bool valid;
+	bool rebase_wire_active;
 	uint8 pcm_state;
 	uint32 own_flags;
 	uint64 live_generation;
@@ -8093,6 +8097,40 @@ typedef struct GcsBlockPcmXPreflightEvidence {
 } GcsBlockPcmXPreflightEvidence;
 
 static GcsBlockPcmXPreflightEvidence gcs_block_pcm_x_requester_preflight_evidence;
+
+/* A' rebase: publication is legal only under an ACTIVE runtime whose bound
+ * formation had full PCM_X_REBASE_V1 coverage at activation. */
+static bool
+gcs_block_pcm_x_rebase_wire_active(const PcmXRuntimeSnapshot *runtime)
+{
+	return runtime != NULL && runtime->state == PCM_X_RUNTIME_ACTIVE && runtime->rebase_wire_active;
+}
+
+/* The V2 (112-byte) frame exists on the wire only to carry a nonzero rebase;
+ * every other INSTALL_READY stays the V1 104-byte exact frame, so a formation
+ * without full V2 coverage never emits a length an old master would refuse
+ * (a nonzero rebase is impossible there: publication is gated on coverage). */
+static uint16
+gcs_block_pcm_x_install_ready_wire_len(const PcmXInstallReadyPayload *install_ready)
+{
+	return install_ready->rebased_own_generation != 0 ? (uint16)sizeof(*install_ready)
+													  : (uint16)PCM_X_INSTALL_READY_V1_LEN;
+}
+
+/* Drift is rebase-eligible only as the exact clean-N shape: same tag, idle
+ * lifecycle flags, pcm_state N and a strictly newer live generation.  Any
+ * other preflight STALE (tag churn, non-N state, live flags) keeps the
+ * fail-closed verdict, as does a formation without full V2 coverage. */
+static bool
+gcs_block_pcm_x_reservation_rebase_eligible(const ClusterPcmOwnSnapshot *live,
+											const PcmXWaitIdentity *identity,
+											const PcmXRuntimeSnapshot *runtime)
+{
+	return gcs_block_pcm_x_rebase_wire_active(runtime) && live != NULL && identity != NULL
+		   && BufferTagsEqual(&live->tag, &identity->tag) && live->pcm_state == (uint8)PCM_STATE_N
+		   && live->flags == 0 && live->generation != UINT64_MAX
+		   && live->generation > identity->base_own_generation;
+}
 
 #define GCS_BLOCK_PCM_X_REQUESTER_DONE()                                                           \
 	do {                                                                                           \
@@ -8867,11 +8905,30 @@ requester_role_dispatch:
 						result = cluster_gcs_pcm_x_remote_reservation_preflight(&reservation_base,
 																				&progress.identity);
 						cluster_pcm_x_stats_note_queue_result(result);
+						if (result == PCM_X_QUEUE_STALE
+							&& gcs_block_pcm_x_reservation_rebase_eligible(
+								&reservation_base, &progress.identity, &request_runtime)) {
+							/* An interleaved revoke consumed the enqueue-time
+							 * base while this request was queued.  Publish the
+							 * live clean-N generation as the effective grant
+							 * base (one-shot; replays are DUPLICATE) and carry
+							 * it on the writer claim for the bufmgr cross
+							 * check.  The immutable identity never changes. */
+							result = cluster_pcm_x_local_grant_rebase_publish_exact(
+								&handle, reservation_base.generation);
+							cluster_pcm_x_stats_note_queue_result(result);
+							if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+								claim_out->grant_base_own_generation = reservation_base.generation;
+								result = PCM_X_QUEUE_OK;
+							}
+						}
 						if (result != PCM_X_QUEUE_OK) {
 							GcsBlockPcmXPreflightEvidence *evidence
 								= &gcs_block_pcm_x_requester_preflight_evidence;
 
 							evidence->valid = true;
+							evidence->rebase_wire_active
+								= gcs_block_pcm_x_rebase_wire_active(&request_runtime);
 							evidence->pcm_state = reservation_base.pcm_state;
 							evidence->own_flags = reservation_base.flags;
 							evidence->live_generation = reservation_base.generation;
@@ -8914,9 +8971,9 @@ requester_role_dispatch:
 					cluster_pcm_x_stats_note_queue_result(arm_result);
 					result = arm_result;
 					if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-						staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_INSTALL_READY,
-															   master_node, &install_ready,
-															   sizeof(install_ready));
+						staged = cluster_gcs_pcm_x_stage_frame(
+							PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
+							gcs_block_pcm_x_install_ready_wire_len(&install_ready));
 					else {
 						retry_action = cluster_gcs_pcm_x_requester_retry_action(
 							GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
@@ -8936,9 +8993,9 @@ requester_role_dispatch:
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
 				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_INSTALL_READY,
-														   master_node, &install_ready,
-														   sizeof(install_ready));
+					staged = cluster_gcs_pcm_x_stage_frame(
+						PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
+						gcs_block_pcm_x_install_ready_wire_len(&install_ready));
 				else {
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
@@ -9042,12 +9099,13 @@ requester_fail_closed:
 			LOG,
 			(errmsg("PCM-X requester reservation-preflight evidence"),
 			 errdetail(
-				 "live_gen=%llu base_gen=%llu pcm_state=%u own_flags=%u",
+				 "live_gen=%llu base_gen=%llu pcm_state=%u own_flags=%u rebase_active=%d",
 				 (unsigned long long)gcs_block_pcm_x_requester_preflight_evidence.live_generation,
 				 (unsigned long long)
 					 gcs_block_pcm_x_requester_preflight_evidence.base_own_generation,
 				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.pcm_state,
-				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.own_flags)));
+				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.own_flags,
+				 gcs_block_pcm_x_requester_preflight_evidence.rebase_wire_active ? 1 : 0)));
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		result = PCM_X_QUEUE_CORRUPT;
 
@@ -9149,7 +9207,7 @@ gcs_block_pcm_x_source_capable(int32 node_id)
  */
 static bool
 gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT],
-								  uint64 *epoch_out, uint64 *self_session_out)
+								  uint64 *epoch_out, uint64 *self_session_out, bool *rebase_all_out)
 {
 	ClusterMembershipState membership_after[CLUSTER_MAX_NODES];
 	ClusterMembershipState membership_before[CLUSTER_MAX_NODES];
@@ -9158,6 +9216,8 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 	uint64 peer_session;
 	int i;
 
+	if (rebase_all_out != NULL)
+		*rebase_all_out = true;
 	if (bindings == NULL || epoch_out == NULL || self_session_out == NULL || cluster_node_id < 0
 		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return false;
@@ -9181,6 +9241,11 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 			return false;
 		if (i != cluster_node_id && !cluster_sf_peer_supports_pcm_x_convert(i))
 			return false;
+		/* Rebase coverage never refuses the base protocol: a member without
+		 * the V2 bit only pins the whole formation to V1 frames. */
+		if (rebase_all_out != NULL && i != cluster_node_id
+			&& !cluster_sf_peer_supports_pcm_x_rebase(i))
+			*rebase_all_out = false;
 		auth_result
 			= gcs_block_pcm_x_authenticated_session_result(i, epoch_before, &peer_session, NULL);
 		if (auth_result != PCM_X_SESSION_AUTH_OK)
@@ -9228,6 +9293,7 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	uint64 epoch_before;
 	uint64 self_session_after;
 	uint64 self_session_before;
+	bool rebase_all = false;
 	int i;
 
 	runtime = cluster_pcm_x_runtime_snapshot();
@@ -9237,10 +9303,11 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 		 * runtime.  Both complete samples must first agree; any transient read,
 		 * including an unrelated membership flip, is a no-op for this tick.
 		 */
-		if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before,
-											   &self_session_before))
+		if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before,
+											   NULL))
 			return;
-		if (!gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after, &self_session_after))
+		if (!gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after, &self_session_after,
+											   NULL))
 			return;
 		if (!cluster_gcs_pcm_x_formation_samples_stable(true, bindings_before, true, bindings_after)
 			|| epoch_before != epoch_after || self_session_before != self_session_after)
@@ -9268,8 +9335,13 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	/* ACTIVATING and any post-activation BLOCKED state are non-pristine. */
 	if (runtime.gate_generation != 0 || runtime.master_session_incarnation != 0)
 		return;
-	if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before))
+	if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before,
+										   &rebase_all))
 		return;
+	/* Connection-bound capabilities are stable for the runtime's lifetime (a
+	 * peer restart changes its session incarnation and permanently closes the
+	 * steady-state core), so formation-wide V2 coverage is sampled once. */
+	cluster_pcm_x_runtime_set_rebase_wire_active(rebase_all);
 	(void)cluster_pcm_x_runtime_activate_bound(self_session_before, bindings_before);
 	return;
 
@@ -11477,7 +11549,7 @@ cluster_gcs_handle_pcm_x_prepare_grant_envelope(const ClusterICEnvelope *env, co
 static void
 cluster_gcs_handle_pcm_x_install_ready_envelope(const ClusterICEnvelope *env, const void *payload)
 {
-	const PcmXInstallReadyPayload *install_ready;
+	PcmXInstallReadyPayload frame;
 	PcmXPhasePayload commit;
 	PcmXQueueResult result;
 	uint64 current_epoch;
@@ -11485,21 +11557,25 @@ cluster_gcs_handle_pcm_x_install_ready_envelope(const ClusterICEnvelope *env, co
 	int32 source_node;
 	int32 tag_master;
 
-	if (env == NULL || payload == NULL || env->payload_length != sizeof(PcmXInstallReadyPayload)
+	/* Both exact lengths are legal: the V1 104-byte frame normalizes to a
+	 * zero rebase, the V2 112-byte frame carries the published grant base. */
+	if (env == NULL || payload == NULL
+		|| (env->payload_length != sizeof(PcmXInstallReadyPayload)
+			&& env->payload_length != PCM_X_INSTALL_READY_V1_LEN)
 		|| env->source_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return;
 	source_node = (int32)env->source_node_id;
-	install_ready = (const PcmXInstallReadyPayload *)payload;
+	memset(&frame, 0, sizeof(frame));
+	memcpy(&frame, payload, env->payload_length);
 	current_epoch = cluster_epoch_get_current();
-	tag_master = cluster_gcs_lookup_master(install_ready->ref.identity.tag);
-	if (!cluster_gcs_pcm_x_install_ready_ingress_valid(install_ready, env->payload_length,
-													   source_node, current_epoch, tag_master,
-													   cluster_node_id)
-		|| !gcs_block_pcm_x_transfer_ingress_authorized(
-			&install_ready->ref.identity.tag, source_node, current_epoch, &source_session))
+	tag_master = cluster_gcs_lookup_master(frame.ref.identity.tag);
+	if (!cluster_gcs_pcm_x_install_ready_ingress_valid(&frame, env->payload_length, source_node,
+													   current_epoch, tag_master, cluster_node_id)
+		|| !gcs_block_pcm_x_transfer_ingress_authorized(&frame.ref.identity.tag, source_node,
+														current_epoch, &source_session))
 		return;
-	result = cluster_pcm_x_master_install_ready_exact(install_ready, source_node, source_session,
-													  &commit);
+	result = cluster_pcm_x_master_install_ready_exact(&frame, frame.rebased_own_generation,
+													  source_node, source_session, &commit);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		(void)cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_COMMIT_X,

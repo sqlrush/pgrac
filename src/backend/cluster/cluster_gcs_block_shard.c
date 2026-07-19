@@ -149,7 +149,13 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		pcm_x_expected_len = sizeof(PcmXGrantPayload);
 		break;
 	case PGRAC_IC_MSG_PCM_X_INSTALL_READY:
-		pcm_x_expected_len = sizeof(PcmXInstallReadyPayload);
+		/* A' rebase: the V1 104-byte and V2 112-byte exact frames are both
+		 * legal; the tag prefix is identical, so the shard key is too. */
+		if (payload_len != sizeof(PcmXInstallReadyPayload)
+			&& payload_len != PCM_X_INSTALL_READY_V1_LEN)
+			return -1;
+		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
+		tag = &pcm_x_tag;
 		break;
 	case PGRAC_IC_MSG_PCM_X_FINAL_ACK:
 		pcm_x_expected_len = sizeof(PcmXFinalAckPayload);

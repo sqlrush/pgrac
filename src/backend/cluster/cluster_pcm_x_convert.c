@@ -2564,6 +2564,7 @@ cluster_pcm_x_runtime_snapshot(void)
 	PcmXRuntimeSnapshot snapshot = { 0 };
 	uint32 gate1;
 	uint32 gate2;
+	uint32 rebase_wire_active;
 	uint32 state1;
 	uint64 session;
 
@@ -2581,6 +2582,7 @@ cluster_pcm_x_runtime_snapshot(void)
 
 	pg_read_barrier();
 	session = ClusterPcmXConvertShmem->master_session_incarnation;
+	rebase_wire_active = ClusterPcmXConvertShmem->rebase_wire_active;
 	pg_read_barrier();
 	gate2 = pg_atomic_read_u32(&ClusterPcmXConvertShmem->runtime_gate);
 	if (gate1 != gate2 || session == 0)
@@ -2588,7 +2590,17 @@ cluster_pcm_x_runtime_snapshot(void)
 
 	snapshot.state = PCM_X_RUNTIME_ACTIVE;
 	snapshot.master_session_incarnation = session;
+	snapshot.rebase_wire_active = rebase_wire_active != 0;
 	return snapshot;
+}
+
+
+void
+cluster_pcm_x_runtime_set_rebase_wire_active(bool active)
+{
+	if (ClusterPcmXConvertShmem == NULL)
+		return;
+	ClusterPcmXConvertShmem->rebase_wire_active = active ? 1 : 0;
 }
 
 
@@ -2975,6 +2987,17 @@ pcm_x_local_handle_clear(PcmXLocalHandle *handle)
 	memset(handle, 0, sizeof(*handle));
 	handle->tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
 	handle->membership_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
+}
+
+
+/* The exact commit proof runs against the effective grant base: the one-shot
+ * pre-reservation rebase when an interleaved revoke consumed the enqueue-time
+ * base on this node, the immutable identity base otherwise. */
+static inline uint64
+pcm_x_local_effective_grant_base(const PcmXLocalTagSlot *tag_slot)
+{
+	return tag_slot->grant_base_own_generation != 0 ? tag_slot->grant_base_own_generation
+													: tag_slot->ref.identity.base_own_generation;
 }
 
 
@@ -3619,6 +3642,7 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 	ticket->blocker_stage_source_node = -1;
 	ticket->blocker_set_source_node = -1;
 	ticket->involved_nodes_bitmap = node_bit;
+	ticket->grant_base_own_generation = 0;
 
 	if (new_tag) {
 		directory_result = pcm_x_directory_insert_locked(
@@ -7494,10 +7518,21 @@ cluster_pcm_x_master_image_ready_exact(const PcmXGrantPayload *image_ready,
 }
 
 
+/* The exact commit proof runs against the effective grant base: the one-shot
+ * INSTALL_READY rebase when an interleaved revoke consumed the enqueue-time
+ * base on the requester node, the immutable identity base otherwise. */
+static inline uint64
+pcm_x_master_ticket_effective_grant_base(const PcmXMasterTicketSlot *ticket)
+{
+	return ticket->grant_base_own_generation != 0 ? ticket->grant_base_own_generation
+												  : ticket->ref.identity.base_own_generation;
+}
+
+
 PcmXQueueResult
 cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_ready,
-										 int32 authenticated_node, uint64 authenticated_session,
-										 PcmXPhasePayload *commit_out)
+										 uint64 rebased_own_generation, int32 authenticated_node,
+										 uint64 authenticated_session, PcmXPhasePayload *commit_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -7514,8 +7549,14 @@ cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_
 		|| install_ready->phase != PGRAC_IC_MSG_PCM_X_INSTALL_READY || install_ready->flags != 0
 		|| authenticated_node < 0 || authenticated_node >= PCM_X_PROTOCOL_NODE_LIMIT
 		|| authenticated_session == 0 || install_ready->ref.identity.node_id != authenticated_node
-		|| !pcm_x_wait_identity_valid(&install_ready->ref.identity))
+		|| !pcm_x_wait_identity_valid(&install_ready->ref.identity)
+		|| rebased_own_generation == UINT64_MAX)
 		return PCM_X_QUEUE_INVALID;
+	/* A nonzero rebase must name a strictly newer effective grant base than
+	 * the enqueue-time identity base it supersedes. */
+	if (rebased_own_generation != 0
+		&& rebased_own_generation <= install_ready->ref.identity.base_own_generation)
+		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
 		return PCM_X_QUEUE_NOT_READY;
@@ -7540,12 +7581,22 @@ cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_COMMIT_X,
 									  authenticated_node, authenticated_session))
-		result = PCM_X_QUEUE_DUPLICATE;
-	else
+		/* Replay after COMMIT_X armed: the published grant base is frozen; a
+		 * different value is evidence divergence, never contention. */
+		result = ticket->grant_base_own_generation == rebased_own_generation ? PCM_X_QUEUE_DUPLICATE
+																			 : PCM_X_QUEUE_CORRUPT;
+	else {
 		result = pcm_x_transfer_leg_advance_locked(
 			ticket, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, authenticated_node, authenticated_session,
 			PGRAC_IC_MSG_PCM_X_INSTALL_READY, PGRAC_IC_MSG_PCM_X_COMMIT_X, authenticated_node,
 			authenticated_session);
+		if (result == PCM_X_QUEUE_OK && rebased_own_generation != 0) {
+			/* One-shot publish, atomic with arming COMMIT_X under this lock:
+			 * a committed COMMIT_X leg implies the grant base is persisted. */
+			ticket->grant_base_own_generation = rebased_own_generation;
+			pg_write_barrier();
+		}
+	}
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		commit_out->ref = ticket->ref;
 		commit_out->phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
@@ -7580,10 +7631,13 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 		|| final_ack->ref.identity.node_id != authenticated_node
 		|| !pcm_x_wait_identity_valid(&final_ack->ref.identity))
 		return PCM_X_QUEUE_INVALID;
+	/* Monotonic ingress floor only: the exact "+1" proof runs under the ticket
+	 * lock against the effective grant base, which a published INSTALL_READY
+	 * rebase may have moved past the enqueue-time identity base. */
 	if (!cluster_pcm_x_generation_next(final_ack->ref.identity.base_own_generation,
 									   &expected_generation))
 		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-	if (final_ack->committed_own_generation != expected_generation)
+	if (final_ack->committed_own_generation < expected_generation)
 		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
@@ -7608,6 +7662,11 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 		result = claim_result;
 	else if (ticket->image.image_id != final_ack->image_id
 			 || !pcm_x_image_token_valid(&ticket->image))
+		result = PCM_X_QUEUE_STALE;
+	else if (!cluster_pcm_x_generation_next(pcm_x_master_ticket_effective_grant_base(ticket),
+											&expected_generation)
+			 || final_ack->committed_own_generation != expected_generation)
+		/* FINAL_ACK proves exactly one ownership round under this grant. */
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK,
 									  authenticated_node, authenticated_session))
@@ -7662,10 +7721,12 @@ cluster_pcm_x_master_final_ack_finalize_exact(const PcmXMasterFinalAckToken *tok
 		|| !pcm_x_image_token_valid(&token->image)
 		|| token->image.image_id != token->final_ack.image_id)
 		return PCM_X_QUEUE_INVALID;
+	/* Monotonic floor only; the exact "+1" proof re-runs under the ticket lock
+	 * against the effective grant base. */
 	if (!cluster_pcm_x_generation_next(token->final_ack.ref.identity.base_own_generation,
 									   &expected_generation))
 		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-	if (token->final_ack.committed_own_generation != expected_generation)
+	if (token->final_ack.committed_own_generation < expected_generation)
 		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0
@@ -7695,6 +7756,10 @@ cluster_pcm_x_master_final_ack_finalize_exact(const PcmXMasterFinalAckToken *tok
 			 || ticket->image.image_id != token->final_ack.image_id
 			 || !pcm_x_transfer_peer_exact(ticket, token->authenticated_node,
 										   token->authenticated_session))
+		result = PCM_X_QUEUE_STALE;
+	else if (!cluster_pcm_x_generation_next(pcm_x_master_ticket_effective_grant_base(ticket),
+											&expected_generation)
+			 || token->final_ack.committed_own_generation != expected_generation)
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK,
 									  token->authenticated_node, token->authenticated_session)) {
@@ -9995,6 +10060,7 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	tag_slot->closed_round_member_count = 0;
 	tag_slot->terminal_drain_generation = 0;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	memset(&tag_slot->holder_reliable, 0, sizeof(tag_slot->holder_reliable));
@@ -10153,7 +10219,7 @@ pcm_x_local_writer_holder_authority_check(const PcmXLocalHolderKey *key,
 		|| tag_slot->ref.grant_generation == 0
 		|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity, &leader->identity)
 		|| tag_slot->committed_own_generation == 0
-		|| !cluster_pcm_x_generation_next(leader->identity.base_own_generation,
+		|| !cluster_pcm_x_generation_next(pcm_x_local_effective_grant_base(tag_slot),
 										  &expected_generation)
 		|| tag_slot->committed_own_generation != expected_generation)
 		return PCM_X_QUEUE_CORRUPT;
@@ -13755,6 +13821,7 @@ cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle, PcmXLocalProgr
 	progress_out->phase = tag_slot->reliable.phase;
 	progress_out->master_session_incarnation = tag_slot->master_session_incarnation;
 	progress_out->master_node = tag_slot->master_node;
+	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
 	result = PCM_X_QUEUE_OK;
 
 progress_done:
@@ -14378,7 +14445,7 @@ rekey_allocator_lookup_done:
 	}
 	memset(&zero_image, 0, sizeof(zero_image));
 	if (!pcm_x_image_token_equal(&tag_slot->image, &zero_image)
-		|| tag_slot->committed_own_generation != 0) {
+		|| tag_slot->committed_own_generation != 0 || tag_slot->grant_base_own_generation != 0) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto rekey_local_done;
@@ -14779,6 +14846,7 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 	claim_out->claim_generation = next_claim_generation;
 	claim_out->local_round = member->admitted_round;
 	claim_out->role = member->role;
+	claim_out->grant_base_own_generation = 0;
 	result = PCM_X_QUEUE_OK;
 
 claim_release_gate:
@@ -15983,6 +16051,7 @@ cluster_pcm_x_local_prepare_grant_exact(const PcmXLocalHandle *leader,
 	tag_slot->ref = prepare->ref;
 	tag_slot->image = prepare->image;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 	tag_slot->reliable.last_responder_node = (uint32)authenticated_node;
 	tag_slot->reliable.last_response_opcode = PGRAC_IC_MSG_PCM_X_PREPARE_GRANT;
 	pg_write_barrier();
@@ -16036,10 +16105,12 @@ pcm_x_local_transfer_arm_exact(const PcmXLocalHandle *leader, uint16 opcode,
 		|| !pcm_x_wait_identity_valid(&leader->identity))
 		return PCM_X_QUEUE_INVALID;
 	if (opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
+		/* Monotonic floor only; the exact "+1" proof re-runs under the local
+		 * lock against the effective grant base. */
 		if (!cluster_pcm_x_generation_next(leader->identity.base_own_generation,
 										   &expected_generation))
 			return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-		if (committed_own_generation != expected_generation)
+		if (committed_own_generation < expected_generation)
 			return PCM_X_QUEUE_STALE;
 	}
 	runtime = cluster_pcm_x_runtime_snapshot();
@@ -16109,6 +16180,19 @@ pcm_x_local_transfer_arm_exact(const PcmXLocalHandle *leader, uint16 opcode,
 		result = PCM_X_QUEUE_BAD_STATE;
 		goto arm_done;
 	}
+	if (opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
+		if (!cluster_pcm_x_generation_next(pcm_x_local_effective_grant_base(tag_slot),
+										   &expected_generation)) {
+			result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
+			fail_closed = true;
+			goto arm_done;
+		}
+		/* FINAL_ACK proves exactly one ownership round under this grant. */
+		if (committed_own_generation != expected_generation) {
+			result = PCM_X_QUEUE_STALE;
+			goto arm_done;
+		}
+	}
 	if (!cluster_pcm_x_generation_next(tag_slot->reliable.state_sequence, &next_sequence)) {
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		fail_closed = true;
@@ -16137,6 +16221,7 @@ arm_output:
 			install_ready_out->image_id = tag_slot->image.image_id;
 			install_ready_out->result = PCM_X_QUEUE_OK;
 			install_ready_out->phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+			install_ready_out->rebased_own_generation = tag_slot->grant_base_own_generation;
 		} else {
 			final_ack_out->ref = tag_slot->ref;
 			final_ack_out->image_id = tag_slot->image.image_id;
@@ -16146,6 +16231,80 @@ arm_output:
 	}
 
 arm_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * One-shot pre-reservation publication of the effective grant base for a
+ * prepared transfer whose enqueue-time base was consumed by an interleaved
+ * revoke.  Runs strictly between PREPARE_GRANT apply and the INSTALL_READY
+ * arm: the reliable leg must be clear with PREPARE_GRANT as its last
+ * response.  A same-value replay is DUPLICATE; a different second value is
+ * evidence divergence and fails the runtime closed.  The immutable identity
+ * (directory key) is never touched.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_grant_rebase_publish_exact(const PcmXLocalHandle *leader,
+											   uint64 rebased_own_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || rebased_own_generation == 0
+		|| rebased_own_generation == UINT64_MAX || !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	if (rebased_own_generation <= leader->identity.base_own_generation)
+		return PCM_X_QUEUE_STALE;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_transfer_slots_exact(leader, tag_ref, member_ref, &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto rebase_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto rebase_done;
+	}
+	/* Only a prepared, not-yet-armed transfer may move its grant base. */
+	if (tag_slot->ref.grant_generation == 0 || !pcm_x_image_token_valid(&tag_slot->image)
+		|| pcm_x_slot_state_read(&member->slot) != PCM_XL_REMOTE_WAIT
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode != PGRAC_IC_MSG_PCM_X_PREPARE_GRANT) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation == rebased_own_generation) {
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto rebase_done;
+	}
+	tag_slot->grant_base_own_generation = rebased_own_generation;
+	pg_write_barrier();
+	result = PCM_X_QUEUE_OK;
+
+rebase_done:
 	LWLockRelease(&header->local_locks[partition].lock);
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
@@ -18624,6 +18783,7 @@ pcm_x_local_reset_holder_only_queue(PcmXLocalTagSlot *tag_slot)
 	tag_slot->active_writer_slot_generation = 0;
 	tag_slot->closed_round_member_count = 0;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 }
 
 
@@ -18869,6 +19029,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		 * and its generation rekey correctly classifies the tag as corrupt. */
 		memset(&tag_slot->image, 0, sizeof(tag_slot->image));
 		tag_slot->committed_own_generation = 0;
+		tag_slot->grant_base_own_generation = 0;
 		/* DRAIN closes the old round by leaving its response opcode as a replay
 		 * tombstone.  RETIRE consumes that tombstone with the membership: a
 		 * promoted successor must see a pristine application leg or the requester

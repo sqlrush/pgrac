@@ -1822,6 +1822,19 @@ UT_TEST(test_queue_writer_grant_snapshot_is_claim_and_generation_exact)
 	live.pcm_state = (uint8)PCM_STATE_S;
 	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
 	live = granted;
+	/* A' rebase: a published effective grant base supersedes the enqueue-time
+	 * identity base in the exact granted-generation binding. */
+	claim.grant_base_own_generation = 14;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	granted.generation = 15;
+	live = granted;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.grant_base_own_generation = UINT64_MAX;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.grant_base_own_generation = 0;
+	granted.generation = 11;
+	live = granted;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
 	claim.active_slot.slot_generation++;
 	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
 
