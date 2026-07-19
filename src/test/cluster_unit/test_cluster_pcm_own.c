@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
@@ -2007,10 +2008,94 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 	free(source);
 }
 
+/* review P1-4: deterministic execution of the preflight transient-BUSY arm
+ * over the REAL ownership object.  A live GRANT_PENDING (then REVOKING)
+ * lifecycle preflights BUSY and the requester site classifies WAIT -- never
+ * fail-closed; once the lifecycle clears, the SAME identity's re-snapshot
+ * preflights OK and the real grant reservation begins on the idle tuple.
+ * Formation/session drift observed across the wait fails the exact runtime
+ * proof, so the driver exits before touching the reservation. */
+UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
+{
+	ClusterPcmOwnSnapshot live;
+	PcmXWaitIdentity identity;
+	PcmXRuntimeSnapshot current;
+	PcmXRuntimeSnapshot start;
+	uint64 blocker_token = 0;
+	uint64 token = 0;
+
+	reset_fixture();
+	memset(&identity, 0, sizeof(identity));
+	identity.tag.relNumber = 20001;
+	identity.tag.blockNum = 3;
+	identity.base_own_generation = 0;
+	memset(&live, 0, sizeof(live));
+	live.tag = identity.tag;
+	live.pcm_state = (uint8)PCM_STATE_N;
+
+	/* A concurrent grant lifecycle holds GRANT_PENDING: BUSY -> WAIT. */
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING,
+														 &blocker_token),
+				 CLUSTER_PCM_OWN_OK);
+	live.generation = pg_atomic_read_u64(&ClusterPcmOwnArray[0].generation);
+	live.reservation_token = pg_atomic_read_u64(&ClusterPcmOwnArray[0].reservation_token);
+	live.flags = pg_atomic_read_u32(&ClusterPcmOwnArray[0].flags);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_remote_reservation_preflight(&live, &identity),
+				 PCM_X_QUEUE_BUSY);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_requester_retry_action(
+					 GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_BUSY),
+				 GCS_BLOCK_PCM_X_RETRY_WAIT);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, 0, blocker_token,
+														 PCM_OWN_FLAG_GRANT_PENDING),
+				 CLUSTER_PCM_OWN_OK);
+
+	/* A live revoke lifecycle classifies exactly the same way. */
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_REVOKING,
+														 &blocker_token),
+				 CLUSTER_PCM_OWN_OK);
+	live.reservation_token = pg_atomic_read_u64(&ClusterPcmOwnArray[0].reservation_token);
+	live.flags = pg_atomic_read_u32(&ClusterPcmOwnArray[0].flags);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_remote_reservation_preflight(&live, &identity),
+				 PCM_X_QUEUE_BUSY);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_requester_retry_action(
+					 GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_BUSY),
+				 GCS_BLOCK_PCM_X_RETRY_WAIT);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_abort_exact(0, 0, blocker_token, PCM_OWN_FLAG_REVOKING),
+		CLUSTER_PCM_OWN_OK);
+
+	/* The wait ends: the clean-N re-snapshot (idle nonzero token is legal)
+	 * preflights OK and the REAL reservation begins on the same tuple. */
+	live.reservation_token = pg_atomic_read_u64(&ClusterPcmOwnArray[0].reservation_token);
+	live.flags = pg_atomic_read_u32(&ClusterPcmOwnArray[0].flags);
+	UT_ASSERT_EQ(live.flags, (uint32)0);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_remote_reservation_preflight(&live, &identity), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING, &token),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT(token > blocker_token);
+	assert_entry(0, token, PCM_OWN_FLAG_GRANT_PENDING);
+
+	/* Formation/session drift across the wait refuses the re-entry. */
+	memset(&start, 0, sizeof(start));
+	start.state = PCM_X_RUNTIME_ACTIVE;
+	start.gate_generation = 3;
+	start.master_session_incarnation = 9;
+	current = start;
+	UT_ASSERT(cluster_gcs_pcm_x_requester_runtime_exact(&start, &current));
+	current.gate_generation = 4;
+	UT_ASSERT(!cluster_gcs_pcm_x_requester_runtime_exact(&start, &current));
+	current = start;
+	current.master_session_incarnation = 10;
+	UT_ASSERT(!cluster_gcs_pcm_x_requester_runtime_exact(&start, &current));
+	current = start;
+	current.state = PCM_X_RUNTIME_RECOVERY_BLOCKED;
+	UT_ASSERT(!cluster_gcs_pcm_x_requester_runtime_exact(&start, &current));
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2056,6 +2141,7 @@ main(void)
 	UT_RUN(test_queue_passive_n_mirror_is_never_gcs_ship_authority);
 	UT_RUN(test_queue_writer_grant_snapshot_is_claim_and_generation_exact);
 	UT_RUN(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_authority);
+	UT_RUN(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
