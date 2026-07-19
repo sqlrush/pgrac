@@ -2242,10 +2242,64 @@ UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
 	UT_ASSERT(!cluster_gcs_pcm_x_requester_runtime_exact(&start, &current));
 }
 
+UT_TEST(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit)
+{
+	static const char *const exact_begin_contract[]
+		= { "cluster_pcm_own_reservation_begin_exact", "PCM_OWN_FLAG_GRANT_PENDING",
+			"UnlockBufHdr", "result == CLUSTER_PCM_OWN_OK",
+			"cluster_pcm_x_stats_note_own_begin();" };
+	static const char *const handoff_begin_contract[]
+		= { "flags == PCM_OWN_FLAG_GRANT_PENDING", "result = CLUSTER_PCM_OWN_OK",
+			"cluster_pcm_own_revoke_to_grant_handoff_exact",
+			"handoff_transitioned = result == CLUSTER_PCM_OWN_OK", "UnlockBufHdr",
+			"if (handoff_transitioned)", "cluster_pcm_x_stats_note_own_begin();" };
+	static const char *const direct_init_begin_contract[]
+		= { "cluster_pcm_own_reservation_begin_exact", "PCM_OWN_FLAG_GRANT_PENDING",
+			"UnlockBufHdr", "pending_result == CLUSTER_PCM_OWN_OK",
+			"cluster_pcm_x_stats_note_own_begin();" };
+	static const char *const x_commit_contract[]
+		= { "cluster_pcm_own_grant_commit_exact", "UnlockBufHdr",
+			"result == CLUSTER_PCM_OWN_OK && new_pcm_state == (uint8)PCM_STATE_X",
+			"cluster_pcm_x_stats_note_own_commit();" };
+	char *source = read_bufmgr_source();
+
+	/* t/400 own-lifecycle counters: every counted begin sits after the header
+	 * spinlock proved an exact GRANT_PENDING linearization (a fresh token, a
+	 * REVOKING->GRANT_PENDING handoff, or a consumed direct-init proof), and
+	 * a replayed/refused begin never counts.  The idempotent duplicate
+	 * PREPARE that merely observes GRANT_PENDING must stay uncounted, so the
+	 * handoff increments only behind its transition evidence. */
+	assert_ordered_in_function(source, "\ncluster_pcm_own_begin_grant_reservation(",
+							   "\ncluster_bufmgr_pcm_own_begin_x_reservation(",
+							   exact_begin_contract, lengthof(exact_begin_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_begin_x_reservation(",
+							   "\ncluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(",
+							   exact_begin_contract, lengthof(exact_begin_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(",
+							   "\ncluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation(",
+							   handoff_begin_contract, lengthof(handoff_begin_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_gate_direct_init(",
+							   "#define BUF_DROP_FULL_SCAN_THRESHOLD", direct_init_begin_contract,
+							   lengthof(direct_init_begin_contract));
+
+	/* The X ownership commit counts exactly once, at the single exact-commit
+	 * funnel shared by the queue finish, the LockBuffer finalize, and the
+	 * direct-init grant; an S-grant finish and every refusal stay silent. */
+	assert_ordered_in_function(source, "\ncluster_pcm_own_finish_grant_reservation(",
+							   "\ncluster_bufmgr_pcm_own_finish_x_commit(", x_commit_contract,
+							   lengthof(x_commit_contract));
+
+	/* Pin the production wiring against silent duplication or removal: four
+	 * begin sites, one commit funnel, no counter call under LockBufHdr. */
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_pcm_x_stats_note_own_begin();"), 4);
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_pcm_x_stats_note_own_commit();"), 1);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(51);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2296,6 +2350,7 @@ main(void)
 	UT_RUN(test_queue_writer_grant_snapshot_is_claim_and_generation_exact);
 	UT_RUN(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_authority);
 	UT_RUN(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation);
+	UT_RUN(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
