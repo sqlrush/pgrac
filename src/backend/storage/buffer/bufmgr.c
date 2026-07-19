@@ -819,10 +819,18 @@ cluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation(
 																  out_token);
 }
 
+/*
+ * PGRAC: live_out, when non-NULL, receives the descriptor tuple sampled
+ * under the header lock at classification time, so a failing finish can
+ * report exactly which term diverged from the reservation base.  The
+ * post-rollback descriptor is useless for that: the rollback itself
+ * mutates the flags and possibly the generation.
+ */
 static ClusterPcmOwnResult
 cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 										 uint64 reservation_token, uint8 new_pcm_state,
-										 uint64 *out_committed_generation)
+										 uint64 *out_committed_generation,
+										 ClusterPcmOwnSnapshot *live_out)
 {
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmXGrantReservationKind kind;
@@ -839,6 +847,8 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 
 	buf_state = LockBufHdr(buf);
 	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (live_out != NULL)
+		*live_out = live;
 	kind = cluster_pcm_x_grant_reservation_kind(&live, base, reservation_token);
 	if (kind == CLUSTER_PCM_X_GRANT_RESERVATION_INVALID) {
 		ClusterPcmOwnResult live_shape
@@ -871,7 +881,8 @@ cluster_bufmgr_pcm_own_finish_x_commit(BufferDesc *buf, const ClusterPcmOwnSnaps
 			&& expected->pcm_state != (uint8)PCM_STATE_X))
 		return CLUSTER_PCM_OWN_STALE;
 	return cluster_pcm_own_finish_grant_reservation(buf, expected, reservation_token,
-													(uint8)PCM_STATE_X, out_committed_generation);
+													(uint8)PCM_STATE_X, out_committed_generation,
+													NULL);
 }
 
 static ClusterPcmOwnResult
@@ -1050,11 +1061,13 @@ cluster_pcm_own_finish_grant_or_rollback(BufferDesc *buf, const ClusterPcmOwnSna
 										 PcmLockMode acquired_mode,
 										 uint64 *out_committed_generation)
 {
+	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult finish_result;
 	ClusterPcmOwnResult rollback_result;
 
+	memset(&live, 0, sizeof(live));
 	finish_result = cluster_pcm_own_finish_grant_reservation(
-		buf, base, reservation_token, new_pcm_state, out_committed_generation);
+		buf, base, reservation_token, new_pcm_state, out_committed_generation, &live);
 	if (finish_result == CLUSTER_PCM_OWN_OK)
 		return;
 
@@ -1095,8 +1108,16 @@ cluster_pcm_own_finish_grant_or_rollback(BufferDesc *buf, const ClusterPcmOwnSna
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("could not finish exact cluster PCM grant reservation: result=%d",
 					(int)finish_result),
-			 errdetail("master grant was rolled back for buffer %d token=%llu",
-					   buf != NULL ? buf->buf_id : -1, (unsigned long long)reservation_token)));
+			 errdetail("master grant was rolled back for buffer %d token=%llu; "
+					   "live state=%u gen=%llu token=%llu flags=%u vs "
+					   "base state=%u gen=%llu token=%llu flags=%u",
+					   buf != NULL ? buf->buf_id : -1, (unsigned long long)reservation_token,
+					   (unsigned int)live.pcm_state, (unsigned long long)live.generation,
+					   (unsigned long long)live.reservation_token, (unsigned int)live.flags,
+					   base != NULL ? (unsigned int)base->pcm_state : 0,
+					   (unsigned long long)(base != NULL ? base->generation : 0),
+					   (unsigned long long)(base != NULL ? base->reservation_token : 0),
+					   base != NULL ? (unsigned int)base->flags : 0)));
 }
 
 ClusterPcmOwnResult
