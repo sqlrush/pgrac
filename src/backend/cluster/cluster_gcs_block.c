@@ -11597,10 +11597,14 @@ cluster_gcs_handle_pcm_x_install_ready_envelope(const ClusterICEnvelope *env, co
 	tag_master = cluster_gcs_lookup_master(frame.ref.identity.tag);
 	/* Receiver-side V2 admission: the sender-side coverage gate is not an
 	 * ingress invariant, so a V2 frame re-proves BOTH the activated
-	 * formation-wide coverage and the source connection's REBASE HELLO. */
+	 * formation-wide coverage and the source's REBASE capability.  A
+	 * SELF-loopback frame (master == requester node) has no HELLO record —
+	 * exactly like gcs_block_pcm_x_source_capable, its capability is the
+	 * local binary itself; the coverage flag still applies. */
 	if (env->payload_length == sizeof(frame)) {
 		rebase_wire_active = cluster_pcm_x_runtime_snapshot().rebase_wire_active;
-		source_rebase_capable = cluster_sf_peer_supports_pcm_x_rebase(source_node);
+		source_rebase_capable
+			= source_node == cluster_node_id || cluster_sf_peer_supports_pcm_x_rebase(source_node);
 	}
 	if (!cluster_gcs_pcm_x_install_ready_ingress_valid(&frame, env->payload_length, source_node,
 													   current_epoch, tag_master, cluster_node_id,

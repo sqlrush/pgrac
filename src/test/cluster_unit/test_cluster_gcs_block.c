@@ -1172,6 +1172,39 @@ UT_TEST(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop)
 }
 
 
+/* review R2 P0-1: a SELF-loopback V2 INSTALL_READY (master == requester
+ * node) has no HELLO capability record; the handler must treat self as
+ * rebase-capable (the local binary) while still requiring the
+ * activation-bound coverage flag.  The regression silently dropped the
+ * self V2 frame, froze the PREPARE->INSTALL chain on the master ticket and
+ * leaked the remote retained source. */
+UT_TEST(test_pcm_x_install_ready_v2_self_loopback_is_admissible)
+{
+	char *source = read_gcs_block_source();
+	const char *handler;
+	const char *self_arm;
+	const char *peer_arm;
+	const char *valid_call;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source != NULL) {
+		handler = strstr(source, "\ncluster_gcs_handle_pcm_x_install_ready_envelope(");
+		UT_ASSERT_NOT_NULL(handler);
+		self_arm = handler != NULL ? strstr(handler, "source_node == cluster_node_id") : NULL;
+		UT_ASSERT_NOT_NULL(self_arm);
+		peer_arm = self_arm != NULL
+					   ? strstr(self_arm, "cluster_sf_peer_supports_pcm_x_rebase(source_node)")
+					   : NULL;
+		UT_ASSERT_NOT_NULL(peer_arm);
+		valid_call = peer_arm != NULL
+						 ? strstr(peer_arm, "cluster_gcs_pcm_x_install_ready_ingress_valid(")
+						 : NULL;
+		UT_ASSERT_NOT_NULL(valid_call);
+		free(source);
+	}
+}
+
+
 /* review P0-2: the collector binds capability bits to the peer session only
  * through one lock-coherent (bits, generation) sample taken on BOTH sides of
  * the authority pass; a reconnect between the samples changes the record
@@ -3543,7 +3576,7 @@ UT_TEST(test_pcm_x_role_refresh_accepts_only_same_member_promotion)
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(80);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3582,6 +3615,7 @@ main(void)
 	UT_RUN(test_pcm_x_blocker_ack_carries_full_generation_and_binds_master_source);
 	UT_RUN(test_pcm_x_formation_identical_complete_samples_may_revalidate);
 	UT_RUN(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop);
+	UT_RUN(test_pcm_x_install_ready_v2_self_loopback_is_admissible);
 	UT_RUN(test_pcm_x_formation_samples_capability_family_atomically);
 	UT_RUN(test_pcm_x_confirm_publish_then_stale_requires_exact_graph_close);
 	UT_RUN(test_pcm_x_drain_poll_binds_exact_master_and_generation);
