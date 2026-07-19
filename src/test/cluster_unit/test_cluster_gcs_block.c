@@ -1172,6 +1172,50 @@ UT_TEST(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop)
 }
 
 
+/* review P0-2: the collector binds capability bits to the peer session only
+ * through one lock-coherent (bits, generation) sample taken on BOTH sides of
+ * the authority pass; a reconnect between the samples changes the record
+ * generation and rejects the tick, so a stale connection's REBASE bit can
+ * never activate V2 against a fresh session. */
+UT_TEST(test_pcm_x_formation_samples_capability_family_atomically)
+{
+	char *source = read_gcs_block_source();
+	const char *collect;
+	const char *first_sample;
+	const char *barrier;
+	const char *second_sample;
+	const char *end;
+	const char *stray;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source != NULL) {
+		collect = strstr(source, "\ngcs_block_pcm_x_collect_formation(");
+		UT_ASSERT_NOT_NULL(collect);
+		end = collect != NULL ? strstr(collect, "\n#define PCM_X_MASTER_DRIVE_SCAN_BUDGET") : NULL;
+		UT_ASSERT_NOT_NULL(end);
+		first_sample
+			= collect != NULL ? strstr(collect, "cluster_sf_peer_pcm_x_capability_sample(") : NULL;
+		UT_ASSERT_NOT_NULL(first_sample);
+		barrier = first_sample != NULL ? strstr(first_sample, "pg_read_barrier();") : NULL;
+		UT_ASSERT_NOT_NULL(barrier);
+		second_sample
+			= barrier != NULL ? strstr(barrier, "cluster_sf_peer_pcm_x_capability_sample(") : NULL;
+		UT_ASSERT_NOT_NULL(second_sample);
+		if (second_sample != NULL && end != NULL)
+			UT_ASSERT(second_sample < end);
+		/* The separate single-shot capability reads are gone from the
+		 * collector: only the atomic family sample may feed it. */
+		if (collect != NULL && end != NULL) {
+			stray = strstr(collect, "cluster_sf_peer_supports_pcm_x_convert(");
+			UT_ASSERT(stray == NULL || stray > end);
+			stray = strstr(collect, "cluster_sf_peer_supports_pcm_x_rebase(");
+			UT_ASSERT(stray == NULL || stray > end);
+		}
+		free(source);
+	}
+}
+
+
 UT_TEST(test_pcm_x_confirm_publish_then_stale_requires_exact_graph_close)
 {
 	UT_ASSERT(cluster_gcs_pcm_x_confirm_compensation_required(UINT64_C(7001), PCM_X_QUEUE_STALE));
@@ -1297,21 +1341,21 @@ UT_TEST(test_pcm_x_install_ready_ingress_is_canonical_requester_ack)
 	ready.result = PCM_X_QUEUE_OK;
 	ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 
-	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 3, 11, 2, 2));
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 3, 11, 2, 2, true, true));
 	ready.result = PCM_X_QUEUE_DUPLICATE;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	ready.result = PCM_X_QUEUE_OK;
 	ready.phase = PGRAC_IC_MSG_PCM_X_PREPARE_GRANT;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 	ready.flags = 1;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	ready.flags = 0;
 	ready.image_id = UINT64CONST(0xf000000000000025);
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	UT_ASSERT(cluster_pcm_x_image_id_encode(3, 37, &ready.image_id));
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 
 	/* A' rebase: both exact frame lengths are legal, nothing in between; a
 	 * V1-length frame must carry a zero rebase and a V2 rebase must be
@@ -1319,22 +1363,37 @@ UT_TEST(test_pcm_x_install_ready_ingress_is_canonical_requester_ack)
 	 * sentinel. */
 	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 37, &ready.image_id));
 	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
-															11, 2, 2));
+															11, 2, 2, true, true));
 	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN + 4,
-															 1, 11, 2, 2));
+															 1, 11, 2, 2, true, true));
 	ready.ref.identity.base_own_generation = 5;
 	ready.rebased_own_generation = 8;
-	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
-															 11, 2, 2));
+															 11, 2, 2, true, true));
 	ready.rebased_own_generation = 5;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	ready.rebased_own_generation = 4;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
 	ready.rebased_own_generation = UINT64_MAX;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+
+	/* Receiver-side V2 admission (review P1-3): a 112-byte frame is refused
+	 * unless BOTH this node's activated formation has full V2 coverage and
+	 * the source's current connection advertised the REBASE capability.  The
+	 * sender-side coverage gate is not a receiver invariant. */
+	ready.rebased_own_generation = 8;
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 false, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, false));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 false, false));
 	ready.rebased_own_generation = 0;
 	ready.ref.identity.base_own_generation = 0;
+	/* V1 frames stay independent of the rebase capability pair. */
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
+															11, 2, 2, false, false));
 }
 
 
@@ -3473,7 +3532,7 @@ UT_TEST(test_pcm_x_role_refresh_accepts_only_same_member_promotion)
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(79);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3512,6 +3571,7 @@ main(void)
 	UT_RUN(test_pcm_x_blocker_ack_carries_full_generation_and_binds_master_source);
 	UT_RUN(test_pcm_x_formation_identical_complete_samples_may_revalidate);
 	UT_RUN(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop);
+	UT_RUN(test_pcm_x_formation_samples_capability_family_atomically);
 	UT_RUN(test_pcm_x_confirm_publish_then_stale_requires_exact_graph_close);
 	UT_RUN(test_pcm_x_drain_poll_binds_exact_master_and_generation);
 	UT_RUN(test_pcm_x_drain_ack_binds_participant_and_canonical_payload);

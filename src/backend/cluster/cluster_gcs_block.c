@@ -9211,6 +9211,8 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 {
 	ClusterMembershipState membership_after[CLUSTER_MAX_NODES];
 	ClusterMembershipState membership_before[CLUSTER_MAX_NODES];
+	uint32 cap_generation_before[CLUSTER_MAX_NODES];
+	bool cap_rebase_before[CLUSTER_MAX_NODES];
 	uint64 epoch_after;
 	uint64 epoch_before;
 	uint64 peer_session;
@@ -9222,6 +9224,8 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return false;
 	memset(bindings, 0, sizeof(PcmXPeerBinding) * PCM_X_PROTOCOL_NODE_LIMIT);
+	memset(cap_generation_before, 0, sizeof(cap_generation_before));
+	memset(cap_rebase_before, 0, sizeof(cap_rebase_before));
 	*epoch_out = 0;
 	*self_session_out = 0;
 	epoch_before = cluster_epoch_get_current();
@@ -9239,13 +9243,19 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 			continue;
 		if (i >= PCM_X_PROTOCOL_NODE_LIMIT)
 			return false;
-		if (i != cluster_node_id && !cluster_sf_peer_supports_pcm_x_convert(i))
-			return false;
-		/* Rebase coverage never refuses the base protocol: a member without
-		 * the V2 bit only pins the whole formation to V1 frames. */
-		if (rebase_all_out != NULL && i != cluster_node_id
-			&& !cluster_sf_peer_supports_pcm_x_rebase(i))
-			*rebase_all_out = false;
+		/* review P0-2: the CONVERT requirement, the REBASE coverage bit and
+		 * the capability-record generation are one lock-coherent sample, so
+		 * the after-pass below can prove the peer connection that advertised
+		 * them is the SAME one the session binding names.  Rebase coverage
+		 * never refuses the base protocol: a member without the V2 bit only
+		 * pins the whole formation to V1 frames. */
+		if (i != cluster_node_id) {
+			if (!cluster_sf_peer_pcm_x_capability_sample(i, &cap_rebase_before[i],
+														 &cap_generation_before[i]))
+				return false;
+			if (rebase_all_out != NULL && !cap_rebase_before[i])
+				*rebase_all_out = false;
+		}
 		auth_result
 			= gcs_block_pcm_x_authenticated_session_result(i, epoch_before, &peer_session, NULL);
 		if (auth_result != PCM_X_SESSION_AUTH_OK)
@@ -9261,6 +9271,20 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 	if (epoch_before != epoch_after || !cluster_qvotec_in_quorum()
 		|| memcmp(membership_before, membership_after, sizeof(membership_before)) != 0)
 		return false;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		bool cap_rebase_after;
+		uint32 cap_generation_after;
+
+		if (membership_before[i] != CLUSTER_MEMBER_MEMBER || i == cluster_node_id)
+			continue;
+		/* review P0-2 after-pass: any reconnect inside this collection moved
+		 * the capability-record generation; refuse the tick rather than bind
+		 * a stale connection's capability word to the fresh session. */
+		if (!cluster_sf_peer_pcm_x_capability_sample(i, &cap_rebase_after, &cap_generation_after)
+			|| cap_rebase_after != cap_rebase_before[i]
+			|| cap_generation_after != cap_generation_before[i])
+			return false;
+	}
 
 	*epoch_out = epoch_before;
 	*self_session_out = bindings[cluster_node_id].peer_session_incarnation;
@@ -11556,6 +11580,8 @@ cluster_gcs_handle_pcm_x_install_ready_envelope(const ClusterICEnvelope *env, co
 	uint64 source_session;
 	int32 source_node;
 	int32 tag_master;
+	bool rebase_wire_active = false;
+	bool source_rebase_capable = false;
 
 	/* Both exact lengths are legal: the V1 104-byte frame normalizes to a
 	 * zero rebase, the V2 112-byte frame carries the published grant base. */
@@ -11569,8 +11595,16 @@ cluster_gcs_handle_pcm_x_install_ready_envelope(const ClusterICEnvelope *env, co
 	memcpy(&frame, payload, env->payload_length);
 	current_epoch = cluster_epoch_get_current();
 	tag_master = cluster_gcs_lookup_master(frame.ref.identity.tag);
+	/* Receiver-side V2 admission: the sender-side coverage gate is not an
+	 * ingress invariant, so a V2 frame re-proves BOTH the activated
+	 * formation-wide coverage and the source connection's REBASE HELLO. */
+	if (env->payload_length == sizeof(frame)) {
+		rebase_wire_active = cluster_pcm_x_runtime_snapshot().rebase_wire_active;
+		source_rebase_capable = cluster_sf_peer_supports_pcm_x_rebase(source_node);
+	}
 	if (!cluster_gcs_pcm_x_install_ready_ingress_valid(&frame, env->payload_length, source_node,
-													   current_epoch, tag_master, cluster_node_id)
+													   current_epoch, tag_master, cluster_node_id,
+													   rebase_wire_active, source_rebase_capable)
 		|| !gcs_block_pcm_x_transfer_ingress_authorized(&frame.ref.identity.tag, source_node,
 														current_epoch, &source_session))
 		return;

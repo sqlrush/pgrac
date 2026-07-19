@@ -103,6 +103,28 @@ cluster_sf_peer_cap_generation_for_bits(const ClusterSfPeerCap *cap, uint32 requ
 	return true;
 }
 
+/* review P0-2: one record-coherent sample of a capability family.  True iff
+ * every required bit is present on the CURRENT connection's record; the
+ * optional-bit presence and the record generation come from the SAME read,
+ * so a caller sampling this on both sides of an authority pass rejects any
+ * reconnect in between (the generation moves) instead of pairing a stale
+ * connection's optional bit with a fresh session.  False zeroes both
+ * outputs. */
+static inline bool
+cluster_sf_peer_cap_family_sample(const ClusterSfPeerCap *cap, uint32 required_bits,
+								  uint32 optional_bits, bool *optional_out,
+								  uint32 *generation_out)
+{
+	if (optional_out != NULL)
+		*optional_out = false;
+	if (!cluster_sf_peer_cap_generation_for_bits(cap, required_bits, generation_out))
+		return false;
+	if (optional_out != NULL)
+		*optional_out = (cluster_sf_peer_cap_bits(cap) & optional_bits) == optional_bits
+						&& optional_bits != 0;
+	return true;
+}
+
 /* Returns true iff the record was live for exactly this generation and got
  * cleared; a mismatch (older/newer generation, already invalid) is a no-op. */
 static inline bool
@@ -237,6 +259,10 @@ extern bool cluster_sf_peer_supports_xid_authority_flock(int32 peer_id);
 extern bool cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_convert(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id);
+/* review P0-2: lock-coherent (CONVERT supported, REBASE bit, record
+ * generation) triple for the formation collector's double sample. */
+extern bool cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out,
+													uint32 *generation_out);
 extern bool cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);
