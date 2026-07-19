@@ -10912,6 +10912,104 @@ UT_TEST(test_local_independent_dual_terminal_single_watermark_covers_both_lanes)
 }
 
 /*
+ * RED (2026-07-20 adversarial review P0-12, leg 1): a next-round follower
+ * cancelled BEFORE the writer's watermark leaves an unlinked CANCELLED
+ * membership on the tag.  Its own detach must release exactly that
+ * membership while both terminals, the barrier and the master binding stay
+ * byte-exact -- before the fix the detach answered NOT_READY under the
+ * writer terminal and the eligibility mismatch (members>1, empty FIFO)
+ * refused the writer lane forever.
+ */
+UT_TEST(test_local_independent_dual_terminal_cancel_before_writer_watermark_converges)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalHandle follower;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXRetirePayload retire;
+	uint32 flags;
+	const uint64 master_session = UINT64_C(1825);
+
+	prepare_local_independent_dual_terminal(7124, master_session, UINT64_C(96001), UINT64_C(96002),
+											false, &fixture);
+	tag_slot = fixture.tag_slot;
+	join_independent_dual_follower(&fixture, 5, master_session + UINT64_C(10), &follower);
+	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&follower, NULL), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(tag_slot->membership_count, 2);
+	UT_ASSERT_EQ(tag_slot->head_index, PCM_X_INVALID_SLOT_INDEX);
+
+	/* Writer lane refuses retryably while the cancelled membership lingers. */
+	retire_watermark(fixture.writer_ref.identity.cluster_epoch, master_session,
+					 fixture.writer_ref.handle.ticket_id, &retire);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* The cancelled member's own detach releases only its membership. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&follower), PCM_X_QUEUE_OK);
+	flags = test_slot_flags(&tag_slot->slot);
+	UT_ASSERT_EQ(flags, PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+							| PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT_EQ(tag_slot->membership_count, 1);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 1);
+	UT_ASSERT_EQ(tag_slot->ref.handle.ticket_id, fixture.writer_ref.handle.ticket_id);
+	UT_ASSERT_EQ(tag_slot->holder_ref.handle.ticket_id, fixture.holder_ref.handle.ticket_id);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	retire_watermark(fixture.holder_ref.identity.cluster_epoch, master_session,
+					 fixture.holder_ref.handle.ticket_id, &retire);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
+/*
+ * RED (P0-12, leg 2): the follower cancelled BETWEEN the two watermarks.
+ * Before the fix the holder RETIRE's frozen-round close saw membership=1
+ * with an empty FIFO and fused the runtime; it must instead wait retryably
+ * for the cancelled member's own detach, byte-exact, then close.
+ */
+UT_TEST(test_local_independent_dual_terminal_cancel_between_watermarks_converges)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalHandle follower;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXRetirePayload retire;
+	uint64 holder_drain_before;
+	const uint64 master_session = UINT64_C(1827);
+
+	prepare_local_independent_dual_terminal(7125, master_session, UINT64_C(96001), UINT64_C(96002),
+											false, &fixture);
+	tag_slot = fixture.tag_slot;
+	retire_watermark(fixture.writer_ref.identity.cluster_epoch, master_session,
+					 fixture.writer_ref.handle.ticket_id, &retire);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	join_independent_dual_follower(&fixture, 5, master_session + UINT64_C(10), &follower);
+	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&follower, NULL), PCM_X_QUEUE_OK);
+	holder_drain_before = tag_slot->holder_terminal_drain_generation;
+
+	/* Holder RETIRE waits retryably; the holder lane stays byte-exact. */
+	retire_watermark(fixture.holder_ref.identity.cluster_epoch, master_session,
+					 fixture.holder_ref.handle.ticket_id, &retire);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
+				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(tag_slot->holder_terminal_drain_generation, holder_drain_before);
+	UT_ASSERT_EQ(tag_slot->holder_ref.handle.ticket_id, fixture.holder_ref.handle.ticket_id);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&follower), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
+/*
  * RED (leg: non-narrow refusal is byte-exact): breaking one eligibility
  * invariant must leave the whole tag slot untouched under a retryable
  * NOT_READY -- never a mutation, never a fuse -- and the retire must
@@ -15728,7 +15826,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(265);
+	UT_PLAN(267);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -15909,6 +16007,8 @@ main(void)
 	UT_RUN(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed);
 	UT_RUN(test_local_independent_dual_terminal_supports_pre_joined_follower);
 	UT_RUN(test_local_independent_dual_terminal_promotes_follower_joined_between_watermarks);
+	UT_RUN(test_local_independent_dual_terminal_cancel_before_writer_watermark_converges);
+	UT_RUN(test_local_independent_dual_terminal_cancel_between_watermarks_converges);
 	UT_RUN(test_local_independent_dual_terminal_staged_retire_of_cancelled_external);
 	UT_RUN(test_local_independent_dual_terminal_single_watermark_covers_both_lanes);
 	UT_RUN(test_local_independent_dual_terminal_non_narrow_refusal_is_byte_exact);

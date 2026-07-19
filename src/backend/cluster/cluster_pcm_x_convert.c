@@ -18165,6 +18165,12 @@ pcm_x_local_independent_holder_close_plan_locked(PcmXLocalTagSlot *tag_slot, Pcm
 		projected_membership = tag_slot->membership_count;
 		projected_closed = tag_slot->closed_round_member_count;
 	}
+	/* Unlinked CANCELLED next-round members awaiting their own detach leave
+	 * the FIFO empty while the membership count is still nonzero.  That is
+	 * a legal transient, not corruption: wait for their backends to release
+	 * them (retire-gated episodes never race those detaches). */
+	if (tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX && projected_membership > 0)
+		return PCM_X_QUEUE_NOT_READY;
 	if (tag_slot->local_round == 0 || tag_slot->local_round == UINT32_MAX
 		|| tag_slot->next_sequence == 0 || tag_slot->cutoff_sequence >= tag_slot->next_sequence
 		|| projected_closed != 0
@@ -19101,6 +19107,23 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		goto detach_local_domain_done;
 	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
+	/* An exact unlinked next-round CANCELLED member detaches by releasing
+	 * only its own membership even while terminal evidence occupies the tag:
+	 * it was never part of the frozen round, so the dual terminals, the
+	 * holder lane, the barrier and the master binding all stay byte-exact.
+	 * Without this arm the cancelled membership lingers (the generic path
+	 * refuses under terminal evidence) and wedges both the writer-lane
+	 * eligibility and the holder RETIRE's frozen-round close. */
+	if (!retire_protocol && pcm_x_slot_state_read(&member->slot) == PCM_XL_CANCELLED
+		&& member->admitted_round == tag_slot->local_round + 1
+		&& (flags & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK))
+			   != 0) {
+		tag_slot->membership_count--;
+		pg_write_barrier();
+		pcm_x_slot_state_write(&member->slot, PCM_XL_DETACHING);
+		result = PCM_X_QUEUE_OK;
+		goto detach_local_domain_done;
+	}
 	if ((flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) != 0) {
 		uint32 terminal_flags = flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK;
 
