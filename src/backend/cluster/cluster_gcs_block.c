@@ -8080,6 +8080,20 @@ static bool gcs_block_pcm_x_requester_exit_hook_registered = false;
  * writer error names the exact escape arm instead of just the result code. */
 static int gcs_block_pcm_x_requester_fail_line = 0;
 
+/* Own-tuple evidence captured at the most recent non-OK remote-reservation
+ * preflight.  Diagnostic only: printed by the fail-closed LOG so a STALE
+ * verdict names which preflight arm fired (base-generation drift vs a
+ * non-N pcm_state vs a live lifecycle flag) without a debugger. */
+typedef struct GcsBlockPcmXPreflightEvidence {
+	bool valid;
+	uint8 pcm_state;
+	uint32 own_flags;
+	uint64 live_generation;
+	uint64 base_own_generation;
+} GcsBlockPcmXPreflightEvidence;
+
+static GcsBlockPcmXPreflightEvidence gcs_block_pcm_x_requester_preflight_evidence;
+
 #define GCS_BLOCK_PCM_X_REQUESTER_DONE()                                                           \
 	do {                                                                                           \
 		gcs_block_pcm_x_requester_fail_line = __LINE__;                                            \
@@ -8441,6 +8455,9 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		|| MyProc->pgprocno < 0 || MyBackendId <= 0 || cluster_node_id < 0
 		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return PCM_X_QUEUE_INVALID;
+	/* Preflight evidence must belong to this acquire, never a previous one. */
+	memset(&gcs_block_pcm_x_requester_preflight_evidence, 0,
+		   sizeof(gcs_block_pcm_x_requester_preflight_evidence));
 	memset(&handle, 0, sizeof(handle));
 	handle.tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
 	handle.membership_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
@@ -8850,8 +8867,21 @@ requester_role_dispatch:
 						result = cluster_gcs_pcm_x_remote_reservation_preflight(&reservation_base,
 																				&progress.identity);
 						cluster_pcm_x_stats_note_queue_result(result);
-						if (result != PCM_X_QUEUE_OK)
-							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+						if (result != PCM_X_QUEUE_OK) {
+							GcsBlockPcmXPreflightEvidence *evidence
+								= &gcs_block_pcm_x_requester_preflight_evidence;
+
+							evidence->valid = true;
+							evidence->pcm_state = reservation_base.pcm_state;
+							evidence->own_flags = reservation_base.flags;
+							evidence->live_generation = reservation_base.generation;
+							evidence->base_own_generation = progress.identity.base_own_generation;
+							retry_action = cluster_gcs_pcm_x_requester_retry_action(
+								GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, result);
+							if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
+								GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+							goto requester_wait;
+						}
 						own_result = cluster_bufmgr_pcm_own_begin_x_reservation(
 							buf, &reservation_base, &reservation_token);
 						result = gcs_block_pcm_x_fetch_own_result(own_result);
@@ -9007,6 +9037,17 @@ requester_fail_closed:
 					   (unsigned int)progress.pending_opcode,
 					   (unsigned int)progress.last_response_opcode, (unsigned long long)request_id,
 					   (unsigned long long)wait_seq)));
+	if (gcs_block_pcm_x_requester_preflight_evidence.valid)
+		ereport(
+			LOG,
+			(errmsg("PCM-X requester reservation-preflight evidence"),
+			 errdetail(
+				 "live_gen=%llu base_gen=%llu pcm_state=%u own_flags=%u",
+				 (unsigned long long)gcs_block_pcm_x_requester_preflight_evidence.live_generation,
+				 (unsigned long long)
+					 gcs_block_pcm_x_requester_preflight_evidence.base_own_generation,
+				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.pcm_state,
+				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.own_flags)));
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		result = PCM_X_QUEUE_CORRUPT;
 

@@ -176,7 +176,8 @@ typedef enum GcsBlockPcmXRequesterSite {
 	GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM,
 	GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH,
 	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM,
-	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM
+	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM,
+	GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT
 } GcsBlockPcmXRequesterSite;
 
 typedef enum GcsBlockPcmXRetryAction {
@@ -406,6 +407,15 @@ cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQue
 	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM:
 		if (result == PCM_X_QUEUE_BAD_STATE)
 			return GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT:
+		/* BUSY is a transient own-slot lifecycle flag (a revoke/grant on this
+		 * node mid-flight); wait and re-snapshot.  STALE means an interleaved
+		 * revoke consumed the queued identity's base_own_generation, which the
+		 * grant/final-ack chain cannot absorb without a master-visible rebase;
+		 * keep the fail-closed verdict until that amendment lands. */
+		if (result == PCM_X_QUEUE_BUSY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
 		break;
 	case GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR:
 	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM:

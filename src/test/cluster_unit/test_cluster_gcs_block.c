@@ -2821,6 +2821,22 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	UT_ASSERT_NOT_NULL(
 		strstr(driver, "cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle)"));
 	UT_ASSERT_NOT_NULL(strstr(driver, "initial_own.pcm_state != (uint8)PCM_STATE_X"));
+	{
+		const char *preflight;
+		const char *preflight_retry;
+
+		preflight = strstr(driver, "cluster_gcs_pcm_x_remote_reservation_preflight(");
+		preflight_retry
+			= preflight != NULL
+				  ? strstr(preflight, "GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT")
+				  : NULL;
+		UT_ASSERT_NOT_NULL(preflight);
+		UT_ASSERT_NOT_NULL(preflight_retry);
+		/* The transient-BUSY wait dispatch must sit between the preflight and
+		 * the image fetch;  a non-wait verdict is the only fail-closed exit. */
+		if (preflight != NULL && preflight_retry != NULL && remote_fetch != NULL)
+			UT_ASSERT(preflight < preflight_retry && preflight_retry < remote_fetch);
+	}
 	if (follower_snapshot != NULL && graph_replace != NULL && graph_clear != NULL)
 		UT_ASSERT(graph_clear < follower_snapshot && follower_snapshot < graph_replace
 				  && graph_replace < driver_end);
@@ -2894,6 +2910,20 @@ UT_TEST(test_pcm_x_requester_retry_policy_is_operation_exact)
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, PCM_X_QUEUE_BAD_STATE,
 		  GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, PCM_X_QUEUE_STALE,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		/* Remote-reservation preflight: BUSY is a transient own-slot lifecycle
+		 * (a revoke/grant flag mid-flight on this node) and must wait, never
+		 * close the runtime.  STALE stays fail-closed for now: it means the
+		 * enqueue-time base_own_generation was consumed by a revoke while the
+		 * request was queued, which the grant/final-ack chain cannot absorb
+		 * without a master-visible rebase (pending protocol amendment). */
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_BUSY,
+		  GCS_BLOCK_PCM_X_RETRY_WAIT },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_STALE,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_CORRUPT,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_COUNTER_EXHAUSTED,
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
 	};
 	size_t i;
