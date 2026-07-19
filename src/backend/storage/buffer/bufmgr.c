@@ -707,6 +707,10 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, ClusterPcmOwnSnapshot *
 	result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, out_base->generation,
 													 PCM_OWN_FLAG_GRANT_PENDING, out_token);
 	UnlockBufHdr(buf, buf_state);
+	/* Exact begin allocated a fresh token under header authority; a replayed
+	 * or refused begin reports BUSY/STALE and never reaches here. */
+	if (result == CLUSTER_PCM_OWN_OK)
+		cluster_pcm_x_stats_note_own_begin();
 	return result;
 }
 
@@ -732,6 +736,8 @@ cluster_bufmgr_pcm_own_begin_x_reservation(BufferDesc *buf, const ClusterPcmOwnS
 		result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, expected->generation,
 														 PCM_OWN_FLAG_GRANT_PENDING, out_token);
 	UnlockBufHdr(buf, buf_state);
+	if (result == CLUSTER_PCM_OWN_OK)
+		cluster_pcm_x_stats_note_own_begin();
 	return result;
 }
 
@@ -754,6 +760,7 @@ cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(
 	bool source_is_n;
 	bool source_is_s;
 	bool source_is_x;
+	bool handoff_transitioned = false;
 
 	if (out_token != NULL)
 		*out_token = 0;
@@ -801,11 +808,21 @@ cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(
 	else if (flags != PCM_OWN_FLAG_REVOKING)
 		result = CLUSTER_PCM_OWN_BUSY;
 	else
+	{
 		result = cluster_pcm_own_revoke_to_grant_handoff_exact(
 			buf->buf_id, expected_revoking->generation, expected_revoking->reservation_token);
+		handoff_transitioned = result == CLUSTER_PCM_OWN_OK;
+	}
 	UnlockBufHdr(buf, buf_state);
 	if (result == CLUSTER_PCM_OWN_OK)
+	{
+		/* Count only the REVOKING->GRANT_PENDING linearization; the exact
+		 * duplicate PREPARE that already observes GRANT_PENDING is an
+		 * idempotent replay and must not advance the begin counter. */
+		if (handoff_transitioned)
+			cluster_pcm_x_stats_note_own_begin();
 		*out_token = expected_revoking->reservation_token;
+	}
 	return result;
 }
 
@@ -859,6 +876,10 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 		}
 	}
 	UnlockBufHdr(buf, buf_state);
+	/* Every X ownership commit funnels through this exact commit; the S-grant
+	 * finish and every STALE/INVALID/CORRUPT refusal stay uncounted. */
+	if (result == CLUSTER_PCM_OWN_OK && new_pcm_state == (uint8)PCM_STATE_X)
+		cluster_pcm_x_stats_note_own_commit();
 	return result;
 }
 
@@ -2444,7 +2465,9 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	}
 	UnlockBufHdr(buf, buf_state);
 
-	if (pending_result != CLUSTER_PCM_OWN_OK)
+	if (pending_result == CLUSTER_PCM_OWN_OK)
+		cluster_pcm_x_stats_note_own_begin();
+	else
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, pending_result, &observed,
 												  "direct-init consume");
 
