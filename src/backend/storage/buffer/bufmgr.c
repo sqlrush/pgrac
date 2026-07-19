@@ -8280,20 +8280,66 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					cluster_pcm_note_writer_cover_stale_detected();
 					pcm_covered = false;
 					LWLockRelease(BufferDescriptorGetContentLock(buf));
-					pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
-						buf, &pcm_pending_base, &pcm_pending_token);
-					if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
-						cluster_pcm_own_report_bump_failure(
-							buf, pcm_pending_result, pcm_pending_base.generation,
-							pcm_pending_base.flags, "LockBuffer revalidate reservation");
-					pcm_pending_set = true;
-					pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
-					pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
-					if (mode == BUFFER_LOCK_SHARE)
-						LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+
+					/*
+					 * PGRAC (t/400 fast-fail finish family): a stale X cover
+					 * means an ownership round moved this block while we
+					 * raced the content-lock window (a BAST X->S downgrade
+					 * being the production case).  A writer re-acquire from
+					 * that state is a NEW writer conversion and MUST go back
+					 * through the convert queue's FIFO/WFG arbitration -- the
+					 * legacy master begin from an S base would both bypass
+					 * the queue (the original S3 unordered multi-writer
+					 * defect) and mint the S_NEW reservation shape the finish
+					 * classifier refuses by design.  Detach the ACQUIRING
+					 * holder prepared above first; the queue grant binds a
+					 * fresh one.
+					 */
+					if (pcm_mode == PCM_LOCK_MODE_X)
+					{
+						if (pcm_x_holder != NULL)
+						{
+							cluster_bufmgr_pcm_x_holder_abort_acquiring(pcm_x_holder);
+							pcm_x_holder = NULL;
+						}
+						pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
+																		   pcm_barrier_refused);
+					}
+					if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+					{
+						/*
+						 * The queue gate refused under a frozen barrier; the
+						 * barrier-aware caller owns the unwind.  No lock is
+						 * retaken and no holder is bound (the post-PG_TRY
+						 * refusal exit returns before any mirror update).
+						 */
+					}
 					else
-						LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
-					cluster_pcm_note_writer_reverify_reacquire();
+					{
+						if (pcm_x_writer == NULL)
+						{
+							/*
+							 * Share-mode refresh, or the convert queue is not
+							 * managing this relation: the legacy master
+							 * acquire remains the ordered path.
+							 */
+							pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
+								buf, &pcm_pending_base, &pcm_pending_token);
+							if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
+								cluster_pcm_own_report_bump_failure(
+									buf, pcm_pending_result, pcm_pending_base.generation,
+									pcm_pending_base.flags, "LockBuffer revalidate reservation");
+							pcm_pending_set = true;
+							pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+						}
+						pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
+						if (mode == BUFFER_LOCK_SHARE)
+							LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+						else
+							LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+						cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
+						cluster_pcm_note_writer_reverify_reacquire();
+					}
 				}
 			}
 			cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder);
