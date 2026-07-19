@@ -9181,6 +9181,17 @@ cluster_pcm_x_master_retire_ack_resolve_exact(const PcmXRetirePayload *ack,
 PcmXQueueResult
 cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out)
 {
+	return cluster_pcm_x_master_terminal_work_next_after(0, ref_out);
+}
+
+
+/* Floor-scoped scan for the retry driver's fairness loop: the oldest ticket
+ * keeps frontier priority, but its stuck RETIRE preflight may be waiting for
+ * a younger ticket's DRAIN evidence (cross-lane holder interlock), so the
+ * driver walks every terminal ticket in ticket-id order per pass. */
+PcmXQueueResult
+cluster_pcm_x_master_terminal_work_next_after(uint64 after_ticket_id, PcmXTicketRef *ref_out)
+{
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
 	PcmXAllocatorView view;
@@ -9255,7 +9266,8 @@ cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out)
 				break;
 			continue;
 		}
-		if (ticket->ref.handle.ticket_id < best_ticket_id) {
+		if (ticket->ref.handle.ticket_id > after_ticket_id
+			&& ticket->ref.handle.ticket_id < best_ticket_id) {
 			best_ticket_id = ticket->ref.handle.ticket_id;
 			*ref_out = ticket->ref;
 		}

@@ -1518,6 +1518,8 @@ extern PcmXQueueResult cluster_pcm_x_master_retire_ack_resolve_exact(const PcmXR
 																	 uint64 authenticated_session,
 																	 PcmXTicketRef *ref_out);
 extern PcmXQueueResult cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out);
+extern PcmXQueueResult cluster_pcm_x_master_terminal_work_next_after(uint64 after_ticket_id,
+																	 PcmXTicketRef *ref_out);
 extern PcmXQueueResult cluster_pcm_x_master_detach_terminal_exact(const PcmXTicketRef *ref);
 extern PcmXQueueResult cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity,
 													  int32 master_node,

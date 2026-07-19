@@ -12393,15 +12393,25 @@ gcs_block_pcm_x_master_drive_retry_tick(void)
 }
 
 
+#define GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET 8
+
 static void
 gcs_block_pcm_x_terminal_retry_tick(void)
 {
 	PcmXTicketRef ref;
-	PcmXQueueResult result;
+	uint64 after = 0;
+	int kicks;
 
-	result = cluster_pcm_x_master_terminal_work_next(&ref);
-	if (result == PCM_X_QUEUE_OK)
+	/* The oldest ticket keeps frontier priority, but a stuck head must not
+	 * starve younger terminal tickets: the head's own RETIRE preflight can be
+	 * waiting for exactly the younger ticket's DRAIN evidence (cross-lane
+	 * holder interlock), so each tick walks the terminal set in id order. */
+	for (kicks = 0; kicks < GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET; kicks++) {
+		if (cluster_pcm_x_master_terminal_work_next_after(after, &ref) != PCM_X_QUEUE_OK)
+			return;
 		cluster_gcs_pcm_x_terminal_kick(&ref);
+		after = ref.handle.ticket_id;
+	}
 }
 
 

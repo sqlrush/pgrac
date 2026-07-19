@@ -7743,6 +7743,40 @@ UT_TEST(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage)
 	assert_master_queue_baseline(header);
 }
 
+UT_TEST(test_master_terminal_work_scan_covers_younger_tickets)
+{
+	PcmXMasterAdmission admission[3];
+	PcmXTicketRef work;
+	int i;
+
+	init_active_pcm_x(UINT64_C(77));
+	for (i = 0; i < 3; i++) {
+		PcmXEnqueuePayload request
+			= make_enqueue(make_wait_identity(707, i, (uint32)(24 + i), UINT64_C(6101) + i),
+						   UINT64_C(1101) + i, UINT64_C(1));
+
+		bind_enqueue_peer(&request);
+		UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &admission[i]), PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(cluster_pcm_x_master_admit_confirm_exact(&admission[i].ref, UINT64_C(300) + i),
+					 PCM_X_QUEUE_OK);
+	}
+	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[1].ref), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[2].ref), PCM_X_QUEUE_OK);
+	/* Frontier priority: the plain scan still returns the oldest terminal. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_work_next(&work), PCM_X_QUEUE_OK);
+	UT_ASSERT(ticket_refs_equal(&work, &admission[1].ref));
+	/* A stuck head must not hide younger terminal work from the retry tick:
+	 * the head's own RETIRE preflight can be waiting for exactly the younger
+	 * ticket's DRAIN evidence (cross-lane holder interlock). */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_terminal_work_next_after(admission[1].ref.handle.ticket_id, &work),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT(ticket_refs_equal(&work, &admission[2].ref));
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_terminal_work_next_after(admission[2].ref.handle.ticket_id, &work),
+		PCM_X_QUEUE_NOT_FOUND);
+}
+
 UT_TEST(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot)
 {
 	PcmXShmemHeader *header;
@@ -15123,7 +15157,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(257);
+	UT_PLAN(258);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -15263,6 +15297,7 @@ main(void)
 	UT_RUN(test_runtime_fail_closed_records_winning_site_only);
 	UT_RUN(test_master_debug_iterators_report_live_slots);
 	UT_RUN(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage);
+	UT_RUN(test_master_terminal_work_scan_covers_younger_tickets);
 	UT_RUN(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot);
 	UT_RUN(test_master_prehandle_identity_alias_is_corruption_not_stale_cancel);
 	UT_RUN(test_master_prehandle_cancel_first_publishes_terminal_tombstone_before_late_enqueue);
