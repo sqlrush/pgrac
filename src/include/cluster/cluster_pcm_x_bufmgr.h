@@ -362,10 +362,24 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	ClusterPcmOwnSnapshot *out_retained);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 																		 uint64 source_generation);
+/* Process-local descriptor evidence captured by the DRAIN proof below so the
+ * caller can log the exact refusal shape before deciding fail-closed.  The
+ * fields are one header-locked snapshot; never persisted or sent on wire. */
+typedef struct ClusterPcmOwnSelfHandoffSample {
+	uint64 live_generation;
+	uint64 live_token;
+	uint32 own_flags;
+	uint8 pcm_state;
+	uint8 buffer_type;
+	bool bm_valid;
+	bool buffer_found;
+} ClusterPcmOwnSelfHandoffSample;
+
 /* Read-only DRAIN proof for a sole-requester source that committed S->X in
  * place.  Exact base+1 X/XCUR authority means DRAIN may release only the
  * immutable dedup record and must not invalidate this descriptor. */
-extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag,
-																	   uint64 source_generation);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_generation,
+											ClusterPcmOwnSelfHandoffSample *sample_out);
 
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

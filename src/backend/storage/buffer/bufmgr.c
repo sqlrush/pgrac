@@ -12015,19 +12015,23 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
  * handoff.  This is intentionally read-only: a delayed DRAIN may release its
  * immutable A-record, but it must never mutate the current X descriptor. */
 ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_generation)
+cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_generation,
+											ClusterPcmOwnSelfHandoffSample *sample_out)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
 	BufferDesc *buf;
 	BufferTag lookup_tag;
 	LWLock *partition_lock;
+	uint64 live_generation;
 	uint64 live_token;
 	uint32 flags;
 	uint32 hashcode;
 	uint32 buf_state;
 	int buf_id;
 
+	if (sample_out != NULL)
+		memset(sample_out, 0, sizeof(*sample_out));
 	if (tag == NULL || source_generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
@@ -12043,11 +12047,21 @@ cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag, uint64 source_
 	}
 	buf = GetBufferDescriptor(buf_id);
 	buf_state = LockBufHdr(buf);
+	live_generation = cluster_pcm_own_gen_get(buf->buf_id);
 	live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
 	flags = cluster_pcm_own_flags_get(buf->buf_id);
 	live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
-	if (!BufferTagsEqual(&buf->tag, tag)
-		|| cluster_pcm_own_gen_get(buf->buf_id) != source_generation + 1)
+	if (sample_out != NULL) {
+		/* Snapshot under the header lock only; the caller logs after unlock. */
+		sample_out->live_generation = live_generation;
+		sample_out->live_token = live_token;
+		sample_out->own_flags = flags;
+		sample_out->pcm_state = buf->pcm_state;
+		sample_out->buffer_type = buf->buffer_type;
+		sample_out->bm_valid = (buf_state & BM_VALID) != 0;
+		sample_out->buffer_found = BufferTagsEqual(&buf->tag, tag);
+	}
+	if (!BufferTagsEqual(&buf->tag, tag) || live_generation != source_generation + 1)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (live_result == CLUSTER_PCM_OWN_CORRUPT)
 		result = live_result;

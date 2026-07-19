@@ -11835,6 +11835,8 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 	PcmXLocalHolderProgress progress;
 	PcmXQueueResult progress_result;
 	PcmXQueueResult result;
+	ClusterPcmOwnSelfHandoffSample handoff_sample;
+	ClusterPcmOwnResult handoff_result;
 	ClusterPcmXRevokeFinishMode finish_mode;
 	uint64 holder_image_id = 0;
 	bool holder_image = false;
@@ -11888,14 +11890,30 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 		return PCM_X_QUEUE_OK;
 	self_source_handoff = binding.identity.image.source_node == (uint32)cluster_node_id
 						  && poll->ref.identity.node_id == cluster_node_id;
-	if (self_source_handoff
-		&& cluster_bufmgr_pcm_own_self_handoff_x_exact(&poll->ref.identity.tag,
-													   binding.identity.image.source_own_generation)
-			   != CLUSTER_PCM_OWN_OK) {
-		/* FINAL makes the in-place X descriptor authoritative before DRAIN.
-		 * Preserve the immutable record if that exact proof is missing. */
-		cluster_pcm_x_runtime_fail_closed();
-		return PCM_X_QUEUE_CORRUPT;
+	if (self_source_handoff) {
+		handoff_result = cluster_bufmgr_pcm_own_self_handoff_x_exact(
+			&poll->ref.identity.tag, binding.identity.image.source_own_generation, &handoff_sample);
+		if (handoff_result != CLUSTER_PCM_OWN_OK) {
+			/* FINAL makes the in-place X descriptor authoritative before DRAIN.
+			 * Preserve the immutable record if that exact proof is missing.
+			 * The refusal shape is one-shot evidence: this arm fuses the node,
+			 * so the descriptor snapshot must reach the log before it does. */
+			ereport(
+				LOG,
+				(errmsg("PCM-X self-source DRAIN proof refused"),
+				 errdetail("result=%d source_gen=%llu live_gen=%llu own_flags=%u "
+						   "own_token=%llu pcm_state=%u buffer_type=%u bm_valid=%d found=%d",
+						   (int)handoff_result,
+						   (unsigned long long)binding.identity.image.source_own_generation,
+						   (unsigned long long)handoff_sample.live_generation,
+						   (unsigned int)handoff_sample.own_flags,
+						   (unsigned long long)handoff_sample.live_token,
+						   (unsigned int)handoff_sample.pcm_state,
+						   (unsigned int)handoff_sample.buffer_type,
+						   handoff_sample.bm_valid ? 1 : 0, handoff_sample.buffer_found ? 1 : 0)));
+			cluster_pcm_x_runtime_fail_closed();
+			return PCM_X_QUEUE_CORRUPT;
+		}
 	}
 	if (cluster_gcs_block_dedup_pcm_x_release_exact(worker_id, &key, &poll->ref.identity.tag,
 													&binding)
