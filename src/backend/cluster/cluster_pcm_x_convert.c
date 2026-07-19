@@ -19091,19 +19091,40 @@ pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag
  * finally drop the REVOKE_BARRIER.  Cancel-duals (grant_generation == 0) are
  * routed through the same-ref-dual path and are excluded here.
  *
+ * The exemption is strictly cross-lane: a writer-lane ref that aliases the
+ * external ref (or merely collides with its master-unique ticket id) cannot
+ * be an older cohort and keeps the pre-exemption NOT_READY verdict.  There is
+ * deliberately no ticket-order requirement beyond that: a cancelled
+ * predecessor leader's duplicate-ACK tombstone legally lingers in
+ * tag_slot->ref with an OLDER ticket until the successor's ENQUEUE arm
+ * retires it, and refusing retirement there could wedge the empty-frozen
+ * path permanently if the successor exits before arming.
+ *
  * Precondition: the caller MUST have validated
  * pcm_x_local_holder_lane_retire_state() == OK before consulting this helper.
- * The flags-only test here does not itself re-prove the DRAIN evidence
+ * The test here does not itself re-prove the DRAIN evidence
  * (holder_terminal_drain_generation, a clear reliable leg, a DRAIN_POLL last
  * response); both call sites run that check immediately above the guard.
  */
 static inline bool
-pcm_x_local_cross_lane_holder_terminal_retirable(uint32 flags, const PcmXTicketRef *external_ref)
+pcm_x_local_cross_lane_holder_terminal_retirable(const PcmXLocalTagSlot *tag_slot, uint32 flags,
+												 const PcmXTicketRef *external_ref)
 {
-	return (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
-		   && (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
-				  == PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
-		   && external_ref != NULL && external_ref->grant_generation != 0;
+	if (tag_slot == NULL || external_ref == NULL)
+		return false;
+	if ((flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) != 0
+		|| (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+			   != PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
+		|| external_ref->grant_generation == 0)
+		return false;
+	/* Per-session ticket ids are master-unique (monotonic allocator, exhaustion
+	 * fails closed), so id equality alone is complete for the alias class.  Do
+	 * not "simplify" this to full-ref equality: that would stop refusing an id
+	 * collision under a distinct identity and REDUCE fail-closed coverage. */
+	if (!pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+		&& external_ref->handle.ticket_id == tag_slot->ref.handle.ticket_id)
+		return false;
+	return true;
 }
 
 
@@ -19217,7 +19238,8 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			*contains_watermark_out = true;
 		if (external_ref->handle.ticket_id <= request->retire_through_ticket_id) {
 			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
-				&& !pcm_x_local_cross_lane_holder_terminal_retirable(flags, external_ref)) {
+				&& !pcm_x_local_cross_lane_holder_terminal_retirable(tag_slot, flags,
+																	 external_ref)) {
 				result = PCM_X_QUEUE_NOT_READY;
 				goto candidate_done;
 			}
@@ -19327,7 +19349,7 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 		goto holder_detach_domain_done;
 	}
 	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
-		&& !pcm_x_local_cross_lane_holder_terminal_retirable(flags, external_ref)) {
+		&& !pcm_x_local_cross_lane_holder_terminal_retirable(tag_slot, flags, external_ref)) {
 		result = PCM_X_QUEUE_NOT_READY;
 		goto holder_detach_release_gate;
 	}

@@ -9689,50 +9689,107 @@ UT_TEST(test_local_non_source_blocker_participant_drains_and_retires_exactly)
 	assert_local_queue_baseline(header);
 }
 
+typedef struct TestLocalCrossLaneWedge {
+	PcmXLocalHandle writer;
+	PcmXLocalWriterClaim writer_claim;
+	PcmXLocalCutoff writer_cutoff;
+	PcmXAdmitAckPayload admit_ack;
+	PcmXTicketRef external_ref;
+	PcmXLocalTagSlot *tag_slot;
+	uint64 master_session;
+} TestLocalCrossLaneWedge;
+
 /*
- * RED for the t/400 cross-lane retirement deadlock (2026-07-18): a fully
- * DRAINED external holder/blocker terminal (an older granted cohort) must be
- * able to retire its own holder lane even while a newer QUEUED writer still
- * holds the tag's REVOKE_BARRIER.  Before the fix the (REVOKE_BARRIER &&
- * !same_ref_dual) guard at cluster_pcm_x_convert.c:19192 / :19301 returns
- * NOT_READY, the RETIRE watermark never advances, and the FIFO wedges.
+ * Build the exact t/400 cross-lane wedge shape through production paths only.
+ *
+ * Older external cohort (external_ticket): this node participates as two S
+ * holders; PROBE freezes them, the blocker ACK tombstones the set, and DRAIN
+ * later upgrades the locator in place to the completed grant ref, leaving
+ * HOLDER_TERMINAL_READY|DRAINED on the tag.
+ *
+ * Newer local writer (writer_ticket > external_ticket): joins the same tag
+ * through join -> claim -> revoke-cutoff (the production REVOKE_BARRIER set
+ * point, closing a round of one) -> ENQUEUE arm -> ADMIT_ACK (installs the
+ * ticketed writer ref into tag_slot->ref) -> ADMIT_CONFIRM arm/ack.
+ *
+ * Final flags shape is the t/400 dump's 0x31: REVOKE_BARRIER +
+ * HOLDER_TERMINAL_READY|DRAINED with no writer-terminal bits.
  */
-UT_TEST(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier)
+static void
+prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 external_ticket,
+							   uint64 writer_ticket, TestLocalCrossLaneWedge *fixture)
 {
 	PcmXShmemHeader *header;
 	PcmXLocalHolderKey holder_keys[2];
-	PcmXLocalHolderKey new_holder_key;
 	PcmXLocalHolderHandle holders[2];
-	PcmXLocalHolderHandle new_holder;
 	PcmXLocalHolderHandle holder_copies[2];
 	PcmXLocalHolderSnapshot holder_snapshot;
 	PcmXLocalBlockerSnapshot blocker_snapshot;
-	PcmXLocalCutoff cutoff;
-	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalCutoff participant_cutoff;
+	PcmXWaitIdentity writer_identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXPhasePayload admit_confirm;
+	PcmXLocalReliableToken token;
 	PcmXTicketRef probe_ref;
-	PcmXTicketRef writer_ref_before;
 	PcmXDrainPollPayload poll;
-	PcmXRetirePayload retire;
-	PcmXSlotRef found;
-	const uint64 master_session = UINT64_C(1801);
-	uint32 flags_before;
+	uint32 flags;
 	int i;
 
+	UT_ASSERT_NOT_NULL(fixture);
+	memset(fixture, 0, sizeof(*fixture));
+	fixture->master_session = master_session;
 	init_active_pcm_x(UINT64_C(77));
 	header = ClusterPcmXConvertShmem;
 	bind_local_master(1, UINT64_C(9), master_session);
 	for (i = 0; i < 2; i++) {
-		holder_keys[i]
-			= make_local_holder_key(7115, 0, (uint32)(21 + i), UINT64_C(71501) + i, 4 + i);
+		holder_keys[i] = make_local_holder_key(block, 0, (uint32)(21 + i),
+											   master_session + UINT64_C(1) + (uint64)i, 4 + i);
 		UT_ASSERT_EQ(register_active_local_holder(&holder_keys[i], &holders[i]), PCM_X_QUEUE_OK);
 	}
+	/* The newer local writer queues first through the production chain (join
+	 * -> claim -> revoke-cutoff -> ENQUEUE -> ADMIT).  The older external
+	 * cohort was enqueued at the master before it (external_ticket <
+	 * writer_ticket), so its grant-time PROBE reaches this node only after
+	 * the local writer's round has closed -- the t/400 interleaving. */
+	writer_identity = make_wait_identity(block, 0, 3, master_session + UINT64_C(4));
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_join_begin(&writer_identity, 1, master_session, &fixture->writer),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(fixture->writer.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&fixture->writer, &fixture->writer_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_begin_revoke_cutoff_exact(&fixture->writer, &fixture->writer_cutoff),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&fixture->writer, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&fixture->admit_ack, 0, sizeof(fixture->admit_ack));
+	fixture->admit_ack.ref.identity = writer_identity;
+	fixture->admit_ack.ref.handle.ticket_id = writer_ticket;
+	fixture->admit_ack.ref.handle.queue_generation = UINT64_C(1);
+	fixture->admit_ack.prehandle = enqueue.prehandle;
+	fixture->admit_ack.result = PCM_X_QUEUE_OK;
+	fixture->admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
+	UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(&fixture->writer, &fixture->admit_ack, 1,
+														   master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_admit_confirm_arm_exact(&fixture->writer, &admit_confirm, &token),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_admit_confirm_ack_exact(&fixture->writer, &admit_confirm, 1,
+															 master_session),
+				 PCM_X_QUEUE_OK);
+
+	/* The older cohort's grant-time PROBE now freezes this node's S holders;
+	 * the blocker ACK tombstones the set. */
 	memset(&probe_ref, 0, sizeof(probe_ref));
-	probe_ref.identity = make_wait_identity(7115, 3, 23, UINT64_C(71503));
-	probe_ref.handle.ticket_id = UINT64_C(95001);
+	probe_ref.identity = make_wait_identity(block, 3, 23, master_session + UINT64_C(3));
+	probe_ref.handle.ticket_id = external_ticket;
 	probe_ref.handle.queue_generation = UINT64_C(11);
 	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
 					 &probe_ref, 1, master_session, holder_copies, 2, &holder_snapshot),
 				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(holder_snapshot.holder_count, 2);
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
 																&holder_snapshot, holder_copies, 2,
 																NULL, 0, &blocker_snapshot),
@@ -9740,56 +9797,274 @@ UT_TEST(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier)
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref, blocker_snapshot.set_generation,
 													   1, master_session),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_local_current_cutoff_snapshot_exact(&probe_ref.identity.tag,
-																   probe_ref.identity.cluster_epoch,
-																   1, master_session, &cutoff),
+	UT_ASSERT_EQ(cluster_pcm_x_local_current_cutoff_snapshot_exact(
+					 &probe_ref.identity.tag, probe_ref.identity.cluster_epoch, 1, master_session,
+					 &participant_cutoff),
 				 PCM_X_QUEUE_OK);
 	for (i = 0; i < 2; i++)
 		UT_ASSERT_EQ(release_active_local_holder(&holders[i]), PCM_X_QUEUE_OK);
 
-	tag_slot = &local_tag_slots(header)[holder_snapshot.tag_slot.slot_index];
+	/* The older cohort's DRAIN closes after the newer writer queued. */
 	memset(&poll, 0, sizeof(poll));
 	poll.ref = probe_ref;
 	poll.ref.grant_generation = UINT64_C(101);
 	poll.drain_generation = UINT64_C(42);
 	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
+	fixture->external_ref = poll.ref;
+
+	/* Pin the wedge shape: same tag slot for both cohorts, dump flags 0x31,
+	 * a ticketed queued writer and a closed round of exactly one member. */
+	UT_ASSERT_EQ(fixture->writer.tag_slot.slot_index, holder_snapshot.tag_slot.slot_index);
+	fixture->tag_slot = &local_tag_slots(header)[holder_snapshot.tag_slot.slot_index];
+	flags = test_slot_flags(&fixture->tag_slot->slot);
+	UT_ASSERT((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
 				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.ticket_id, writer_ticket);
+	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.queue_generation, UINT64_C(1));
+	UT_ASSERT_EQ(fixture->tag_slot->ref.grant_generation, 0);
+	UT_ASSERT(memcmp(&fixture->tag_slot->ref.identity, &writer_identity, sizeof(writer_identity))
+			  == 0);
+	UT_ASSERT_EQ(fixture->tag_slot->membership_count, 1);
+	UT_ASSERT_EQ(fixture->tag_slot->closed_round_member_count, 1);
+	UT_ASSERT_EQ(fixture->tag_slot->head_index, fixture->writer.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->tail_index, fixture->writer.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->leader_index, fixture->writer.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->active_writer_index,
+				 fixture->writer.membership_slot.slot_index);
+	UT_ASSERT(ticket_refs_equal(&fixture->tag_slot->blocker_snapshot_ref, &fixture->external_ref));
+	UT_ASSERT_EQ(fixture->tag_slot->holder_terminal_drain_generation, poll.drain_generation);
+}
 
-	/* Keep the tag resident for the newer writer cohort. */
-	new_holder_key = make_local_holder_key(7115, 0, 24, UINT64_C(71504), 6);
-	UT_ASSERT_EQ(register_active_local_holder(&new_holder_key, &new_holder), PCM_X_QUEUE_OK);
+/*
+ * RED for the t/400 cross-lane retirement deadlock (2026-07-18): a fully
+ * DRAINED external holder/blocker terminal (an older granted cohort) must be
+ * able to retire its own holder lane even while a newer QUEUED writer still
+ * holds the tag's REVOKE_BARRIER.  Before the fix the (REVOKE_BARRIER &&
+ * !same_ref_dual) guard at cluster_pcm_x_convert.c:19192 / :19301 returns
+ * NOT_READY, the RETIRE watermark never advances, and the FIFO wedges.
+ *
+ * Rebuilt 2026-07-19 (review follow-up): the newer writer is a real
+ * production cohort (join -> claim -> revoke-cutoff -> ENQUEUE -> ADMIT),
+ * so the barrier, the closed round of one and the ticketed writer ref are
+ * all genuine; the retire must consume exactly the holder lane, keep every
+ * writer/round/FIFO byte, and the writer must afterwards progress through
+ * its full grant chain to the queue baseline (no barrier or tag leak).
+ */
+UT_TEST(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXShmemHeader *header;
+	PcmXLocalHolderHandle holder_copy;
+	PcmXLocalHolderSnapshot holder_snapshot;
+	PcmXLocalBlockerSnapshot blocker_snapshot;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalHandle refreshed;
+	PcmXLocalProgress progress;
+	PcmXGrantPayload prepare;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXLocalReliableToken token;
+	PcmXTicketRef writer_ref_before;
+	PcmXReliableLegState writer_reliable_before;
+	PcmXDrainPollPayload poll;
+	PcmXRetirePayload retire;
+	PcmXSlotRef found;
+	const uint64 master_session = UINT64_C(1801);
+	uint64 cutoff_sequence_before;
+	uint64 next_sequence_before;
+	Size membership_before;
+	Size closed_before;
+	Size head_before;
+	Size tail_before;
+	Size leader_before;
+	Size active_writer_before;
+	uint32 local_round_before;
 
-	/* Model the newer writer's in-flight revoke round: REVOKE_BARRIER set with
-	 * no writer terminal bits (same_ref_dual stays false) -- exactly the t/400
-	 * dump flags=0x31 with the external blocker ticket == RETIRE watermark. */
-	pg_atomic_write_u32(&tag_slot->slot.state_flags,
-						pg_atomic_read_u32(&tag_slot->slot.state_flags)
-							| (PCM_X_LOCAL_TAG_F_REVOKE_BARRIER << PCM_X_SLOT_FLAGS_SHIFT));
-	flags_before = test_slot_flags(&tag_slot->slot);
-	UT_ASSERT((flags_before & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
-	UT_ASSERT_EQ(flags_before & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+	prepare_local_cross_lane_wedge(7115, master_session, UINT64_C(95001), UINT64_C(95002),
+								   &fixture);
+	header = ClusterPcmXConvertShmem;
+	tag_slot = fixture.tag_slot;
 	writer_ref_before = tag_slot->ref;
+	writer_reliable_before = tag_slot->reliable;
+	cutoff_sequence_before = tag_slot->cutoff_sequence;
+	next_sequence_before = tag_slot->next_sequence;
+	membership_before = tag_slot->membership_count;
+	closed_before = tag_slot->closed_round_member_count;
+	head_before = tag_slot->head_index;
+	tail_before = tag_slot->tail_index;
+	leader_before = tag_slot->leader_index;
+	active_writer_before = tag_slot->active_writer_index;
+	local_round_before = tag_slot->local_round;
 
+	/* RETIRE watermark covers only the older external ticket. */
 	memset(&retire, 0, sizeof(retire));
-	retire.cluster_epoch = probe_ref.identity.cluster_epoch;
+	retire.cluster_epoch = fixture.external_ref.identity.cluster_epoch;
 	retire.master_session_incarnation = master_session;
-	retire.retire_through_ticket_id = poll.ref.handle.ticket_id;
+	retire.retire_through_ticket_id = fixture.external_ref.handle.ticket_id;
 	retire.sender_node = 0;
-
-	/* The older cross-lane holder terminal must retire its own lane. */
 	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
 				 PCM_X_QUEUE_OK);
 
-	/* Holder terminal lane cleared; the newer writer's REVOKE_BARRIER and ref
-	 * are preserved and the tag stays resident. */
+	/* Exactly the holder lane was consumed: blocker locator, its reliable leg
+	 * and the drain generation are gone and HOLDER_TERMINAL_MASK cleared. */
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK, 0);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->blocker_snapshot_ref, &(PcmXTicketRef){ 0 }));
+	UT_ASSERT_EQ(tag_slot->blocker_set_generation, 0);
+	UT_ASSERT_EQ(tag_slot->holder_terminal_drain_generation, 0);
+
+	/* The newer writer's round is byte-stable: barrier, ticketed ref, closed
+	 * round, FIFO indexes and the writer reliable leg are all untouched. */
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->ref, &writer_ref_before));
+	UT_ASSERT(memcmp(&tag_slot->reliable, &writer_reliable_before, sizeof(writer_reliable_before))
+			  == 0);
+	UT_ASSERT_EQ(tag_slot->cutoff_sequence, cutoff_sequence_before);
+	UT_ASSERT_EQ(tag_slot->next_sequence, next_sequence_before);
+	UT_ASSERT_EQ(tag_slot->membership_count, membership_before);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, closed_before);
+	UT_ASSERT_EQ(tag_slot->head_index, head_before);
+	UT_ASSERT_EQ(tag_slot->tail_index, tail_before);
+	UT_ASSERT_EQ(tag_slot->leader_index, leader_before);
+	UT_ASSERT_EQ(tag_slot->active_writer_index, active_writer_before);
+	UT_ASSERT_EQ(tag_slot->local_round, local_round_before);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_TAG,
+											  &fixture.external_ref.identity.tag, &found),
+				 PCM_X_DIRECTORY_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_lookup_exact(&fixture.writer.identity, &refreshed),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(refreshed.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_local_progress_exact(&fixture.writer, &progress), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(progress.member_state, PCM_XL_REMOTE_WAIT);
+
+	/* The unwedged writer must now progress through its full production grant
+	 * chain and drain to the queue baseline -- the deadlock did not merely
+	 * move into a barrier or tag leak.  Its closed revoke round has no S
+	 * holders left (new pins are correctly fenced BARRIER_CLOSED), so the
+	 * writer's own PROBE freezes an empty set. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
+					 &fixture.admit_ack.ref, 1, master_session, &holder_copy, 1, &holder_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(holder_snapshot.holder_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
+					 &fixture.admit_ack.ref, 1, master_session, &holder_snapshot, NULL, 0, NULL, 0,
+					 &blocker_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(
+					 &fixture.admit_ack.ref, blocker_snapshot.set_generation, 1, master_session),
+				 PCM_X_QUEUE_OK);
+
+	memset(&prepare, 0, sizeof(prepare));
+	prepare.ref = fixture.admit_ack.ref;
+	prepare.ref.grant_generation = UINT64_C(102);
+	UT_ASSERT(
+		cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(200), &prepare.image.image_id));
+	prepare.image.source_own_generation = UINT64_C(9);
+	prepare.image.page_scn = UINT64_C(10);
+	prepare.image.page_lsn = UINT64_C(11);
+	prepare.image.source_node = 2;
+	prepare.image.page_checksum = UINT32_C(12);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_prepare_grant_exact(&fixture.writer, &prepare, 1, master_session),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_install_ready_arm_exact(
+					 &fixture.writer, &prepare.ref, &prepare.image, &install_ready, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&commit, 0, sizeof(commit));
+	commit.ref = prepare.ref;
+	commit.phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	UT_ASSERT_EQ(cluster_pcm_x_local_commit_x_exact(&fixture.writer, &commit, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_ack_arm_exact(&fixture.writer, 1, &final_ack, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&final_commit, 0, sizeof(final_commit));
+	final_commit.ref = prepare.ref;
+	final_commit.phase = PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK;
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_commit_ack_exact(&fixture.writer, &final_commit, 1,
+															master_session, &final_confirm, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&fixture.writer_claim),
+				 PCM_X_QUEUE_OK);
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = prepare.ref;
+	poll.drain_generation = UINT64_C(43);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = prepare.ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = prepare.ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_progress_exact(&fixture.writer, &progress),
+				 PCM_X_QUEUE_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_TAG,
+											  &fixture.external_ref.identity.tag, &found),
+				 PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(header);
+}
+
+/*
+ * Defense probes for the cross-lane retirement exemption: it must stay
+ * strictly cross-lane.  A holder lane that aliases the writer lane's ref (or
+ * collides with its ticket id) keeps the pre-exemption NOT_READY verdict.
+ * Both alias states are protocol-impossible (master tickets are unique and
+ * same-ref forms route through the same-ref-dual path), so they are built by
+ * direct slot pokes like the CORRUPT arms elsewhere in this file.  A distinct
+ * OLDER writer-lane ref, however, is legal (a cancelled predecessor leader's
+ * duplicate-ACK tombstone lingers in tag_slot->ref until the successor's
+ * ENQUEUE arm retires it), so the exemption deliberately has no ticket-order
+ * requirement: refusing there could wedge the empty-frozen path permanently
+ * if the successor dies before arming.
+ */
+UT_TEST(test_local_cross_lane_retire_exemption_requires_distinct_ticket)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXTicketRef saved_ref;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1809);
+
+	prepare_local_cross_lane_wedge(7116, master_session, UINT64_C(95001), UINT64_C(95002),
+								   &fixture);
+	tag_slot = fixture.tag_slot;
+	saved_ref = tag_slot->ref;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.external_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.external_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	/* Sub-case order matters: the two NOT_READY alias probes must run before
+	 * the distinct-older-ticket case, which consumes the holder lane. */
+
+	/* Full alias: writer lane ref == external holder lane ref. */
+	tag_slot->ref = fixture.external_ref;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+
+	/* Ticket-id collision under a distinct identity. */
+	tag_slot->ref = saved_ref;
+	tag_slot->ref.handle.ticket_id = fixture.external_ref.handle.ticket_id;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+
+	/* Distinct older writer-lane ref (cancelled-predecessor tombstone shape):
+	 * the exemption must still let the external holder lane retire. */
+	tag_slot->ref = saved_ref;
+	tag_slot->ref.handle.ticket_id = fixture.external_ref.handle.ticket_id - 1;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK, 0);
 	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
-	UT_ASSERT(ticket_refs_equal(&tag_slot->ref, &writer_ref_before));
-	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_TAG, &probe_ref.identity.tag, &found),
-				 PCM_X_DIRECTORY_OK);
-
-	UT_ASSERT_EQ(release_active_local_holder(&new_holder), PCM_X_QUEUE_OK);
+	tag_slot->ref = saved_ref;
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
 UT_TEST(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly)
@@ -14466,6 +14741,7 @@ main(void)
 	UT_RUN(test_local_tag_only_holder_transfer_persists_until_exact_drain);
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
+	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
 	UT_RUN(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly);
 	UT_RUN(test_local_cancelled_participant_gen0_drain_requires_frozen_round);
 	UT_RUN(test_local_holder_drain_validates_frozen_round_before_terminal_publish);
