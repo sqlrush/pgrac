@@ -3479,6 +3479,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
+	CommandId	pgrac_entry_cid = cid;	/* PGRAC: restored on barrier requalify */
 	TransactionId new_xmax;
 	uint16		new_infomask,
 				new_infomask2;
@@ -3892,9 +3893,18 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			 * Release our own lock, resolve the conversion unlocked, and
 			 * requalify from scratch: the ITL slot pick is idempotent and an
 			 * unstamped undo record is unreachable garbage, exactly as after
-			 * any pre-crit ERROR.
+			 * any pre-crit ERROR.  The entry cid is restored (no
+			 * combo-of-combo) and the abandoned replica-identity copy freed.
 			 */
 			vm_barrier_retries++;
+			cid = pgrac_entry_cid;
+			iscombo = false;
+			if (old_key_tuple != NULL && old_key_copied)
+			{
+				heap_freetuple(old_key_tuple);
+				old_key_tuple = NULL;
+				old_key_copied = false;
+			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			cluster_heap_vm_barrier_warm(vmbuffer);
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -4193,6 +4203,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		vm_locked_new;
 	bool		old_tuple_temp_locked = false;	/* PGRAC: t/400 L3 item 3 */
 	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
+	CommandId	pgrac_entry_cid = cid;	/* PGRAC: restored on barrier requalify */
 	bool		need_toast;
 	Size		newtupsize,
 				pagefree;
@@ -4870,9 +4881,13 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				 * PGRAC: vm barrier unwind (update pre-toast) — the old
 				 * tuple carries no temporary lock yet and nothing
 				 * irreversible has happened in this pass, so a full
-				 * requalify is required and sufficient.
+				 * requalify is required and sufficient.  Restore the entry
+				 * cid: a pass-1 combo cmax must not feed requalification or
+				 * be recombined into a combo-of-combo.
 				 */
 				vm_barrier_retries++;
+				cid = pgrac_entry_cid;
+				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				cluster_heap_vm_barrier_warm(vmbuffer);
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -5057,6 +5072,13 @@ l_pgrac_reacquire:
 	 * one pin is held.
 	 */
 
+	/*
+	 * PGRAC (t/400 L3 item 3 review): pass-local decision — the VM-barrier
+	 * reacquire can flip same-page <-> cross-page between passes, and a
+	 * stale HOT verdict on a cross-page retry would skip index entries.
+	 */
+	use_hot_update = false;
+	summarized_update = false;
 	if (newbuf == buffer)
 	{
 		/*
@@ -5104,6 +5126,17 @@ l_pgrac_reacquire:
 	 * EXCLUSIVE content locks already held; OVERFLOW raises ERROR
 	 * before the critical section.
 	 */
+	/*
+	 * PGRAC (t/400 L3 item 3 review): the VM-barrier unwind can abandon a
+	 * pass and re-enter this block with a DIFFERENT page choice (a cross-page
+	 * pass may retry same-page once the old page regains space).  Every pick
+	 * below is pass-local: reset both pairs so a stale cross-page slot index
+	 * can never be stamped onto a page it was not chosen on.
+	 */
+	cluster_itl_old_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	cluster_itl_new_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	cluster_itl_old_active = false;
+	cluster_itl_new_active = false;
 	if (cluster_itl_write_path_enabled(relation) && PageHasItl(BufferGetPage(buffer)))
 	{
 		/* spec-3.4b D5: single xact-local TT binding shared by both stamps (F11). */
@@ -5314,6 +5347,8 @@ l_pgrac_reacquire:
 				 * abandoned safely (idempotent pick, unreachable record).
 				 */
 				Assert(newbuf == buffer);
+				cid = pgrac_entry_cid;
+				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				cluster_heap_vm_barrier_warm(refused_vm);
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
