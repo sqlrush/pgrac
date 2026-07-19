@@ -19655,6 +19655,13 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 																		  &close_plan);
 				if (result != PCM_X_QUEUE_OK)
 					goto candidate_done;
+				/* The close this episode will apply promotes that follower;
+				 * project its wake now or the promotion degrades to the
+				 * waiters' poll interval. */
+				if (close_plan.candidate != NULL) {
+					*holder_wake_out = close_plan.candidate->identity;
+					*holder_wake_candidate_out = true;
+				}
 			}
 		}
 		if (tag_slot->ref.handle.ticket_id == request->retire_through_ticket_id)
@@ -19706,6 +19713,11 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 																		  &close_plan);
 				if (result != PCM_X_QUEUE_OK)
 					goto candidate_done;
+				/* Project the promotion this close will apply. */
+				if (close_plan.candidate != NULL) {
+					*holder_wake_out = close_plan.candidate->identity;
+					*holder_wake_candidate_out = true;
+				}
 			}
 			/* A generation-zero dual terminal must validate and consume the
 			 * CANCELLED membership before its blocker evidence disappears.  Keep
@@ -19723,7 +19735,7 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			*candidate_out = true;
 		}
 	}
-	if (result == PCM_X_QUEUE_OK && *holder_candidate_out)
+	if (result == PCM_X_QUEUE_OK && *holder_candidate_out && !*holder_wake_candidate_out)
 		result = pcm_x_local_ready_leader_wake_locked(tag_slot, tag_ref, holder_wake_out, NULL,
 													  holder_wake_candidate_out);
 
@@ -19858,6 +19870,13 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 	tag_slot->holder_terminal_drain_generation = 0;
 	(void)pcm_x_slot_flags_fetch_and(&tag_slot->slot, ~PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
 	pcm_x_local_empty_frozen_round_apply_locked(tag_slot, &round_plan);
+	/* Report the promoted next-round leader through the same wake output the
+	 * preflight projected; without it the promotion is only discovered by
+	 * the waiter's poll interval. */
+	if (round_plan.close_round && round_plan.candidate != NULL) {
+		ready_leader = round_plan.candidate->identity;
+		ready_leader_candidate = true;
+	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
 	detach_tag
 		= tag_slot->membership_count == 0 && tag_slot->closed_round_member_count == 0

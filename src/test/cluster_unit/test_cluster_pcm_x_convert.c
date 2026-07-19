@@ -11010,6 +11010,112 @@ UT_TEST(test_local_independent_dual_terminal_cancel_between_watermarks_converges
 }
 
 /*
+ * RED (2026-07-20 review P1): the frozen-round close's follower promotion
+ * must travel through the RETIRE wake batch -- capacity 0 refuses the whole
+ * episode with NO_CAPACITY and zero mutation, capacity 1 delivers exactly
+ * the promoted identity.  Without it the promotion is only discovered by
+ * the waiter's poll interval (a 2-32ms hot-block regression).
+ */
+UT_TEST(test_local_independent_dual_terminal_collect_reports_promotion_wake)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalHandle follower;
+	PcmXLocalHandle refreshed;
+	PcmXLocalTagSlot saved;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXWaitIdentity wake_items[2];
+	PcmXLocalWakeBatch wake_batch;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1829);
+
+	prepare_local_independent_dual_terminal(7126, master_session, UINT64_C(96001), UINT64_C(96002),
+											false, &fixture);
+	tag_slot = fixture.tag_slot;
+	retire_watermark(fixture.writer_ref.identity.cluster_epoch, master_session,
+					 fixture.writer_ref.handle.ticket_id, &retire);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	join_independent_dual_follower(&fixture, 5, master_session + UINT64_C(10), &follower);
+
+	/* Zero capacity refuses before any mutation. */
+	retire_watermark(fixture.holder_ref.identity.cluster_epoch, master_session,
+					 fixture.holder_ref.handle.ticket_id, &retire);
+	wake_batch.items = NULL;
+	wake_batch.capacity = 0;
+	wake_batch.count = 0;
+	saved = *tag_slot;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retire_up_to_collect_exact(&retire, 1, master_session, &wake_batch),
+		PCM_X_QUEUE_NO_CAPACITY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(memcmp(&saved, tag_slot, sizeof(saved)) == 0);
+
+	/* Capacity one delivers exactly the promoted follower. */
+	memset(wake_items, 0, sizeof(wake_items));
+	wake_batch.items = wake_items;
+	wake_batch.capacity = 1;
+	wake_batch.count = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retire_up_to_collect_exact(&retire, 1, master_session, &wake_batch),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(wake_batch.count, 1);
+	UT_ASSERT(memcmp(&wake_items[0], &follower.identity, sizeof(wake_items[0])) == 0);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_lookup_exact(&follower.identity, &refreshed), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(refreshed.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+/*
+ * RED (review P1, single-watermark form): one watermark covering both lanes
+ * with a pre-joined follower must deliver the same promotion wake through
+ * the batch it validated in the writer arm's projected rehearsal.
+ */
+UT_TEST(test_local_independent_dual_terminal_single_watermark_reports_promotion_wake)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalHandle follower;
+	PcmXLocalHandle refreshed;
+	PcmXLocalTagSlot saved;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXWaitIdentity wake_items[2];
+	PcmXLocalWakeBatch wake_batch;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1831);
+
+	prepare_local_independent_dual_terminal(7127, master_session, UINT64_C(96001), UINT64_C(96002),
+											false, &fixture);
+	tag_slot = fixture.tag_slot;
+	join_independent_dual_follower(&fixture, 5, master_session + UINT64_C(10), &follower);
+
+	retire_watermark(fixture.holder_ref.identity.cluster_epoch, master_session,
+					 fixture.holder_ref.handle.ticket_id, &retire);
+	wake_batch.items = NULL;
+	wake_batch.capacity = 0;
+	wake_batch.count = 0;
+	saved = *tag_slot;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retire_up_to_collect_exact(&retire, 1, master_session, &wake_batch),
+		PCM_X_QUEUE_NO_CAPACITY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(memcmp(&saved, tag_slot, sizeof(saved)) == 0);
+
+	memset(wake_items, 0, sizeof(wake_items));
+	wake_batch.items = wake_items;
+	wake_batch.capacity = 1;
+	wake_batch.count = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retire_up_to_collect_exact(&retire, 1, master_session, &wake_batch),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(wake_batch.count, 1);
+	UT_ASSERT(memcmp(&wake_items[0], &follower.identity, sizeof(wake_items[0])) == 0);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_lookup_exact(&follower.identity, &refreshed), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(refreshed.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+/*
  * RED (leg: non-narrow refusal is byte-exact): breaking one eligibility
  * invariant must leave the whole tag slot untouched under a retryable
  * NOT_READY -- never a mutation, never a fuse -- and the retire must
@@ -15826,7 +15932,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(267);
+	UT_PLAN(269);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16009,6 +16115,8 @@ main(void)
 	UT_RUN(test_local_independent_dual_terminal_promotes_follower_joined_between_watermarks);
 	UT_RUN(test_local_independent_dual_terminal_cancel_before_writer_watermark_converges);
 	UT_RUN(test_local_independent_dual_terminal_cancel_between_watermarks_converges);
+	UT_RUN(test_local_independent_dual_terminal_collect_reports_promotion_wake);
+	UT_RUN(test_local_independent_dual_terminal_single_watermark_reports_promotion_wake);
 	UT_RUN(test_local_independent_dual_terminal_staged_retire_of_cancelled_external);
 	UT_RUN(test_local_independent_dual_terminal_single_watermark_covers_both_lanes);
 	UT_RUN(test_local_independent_dual_terminal_non_narrow_refusal_is_byte_exact);
