@@ -25,6 +25,7 @@
 #include <setjmp.h>
 
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/buf_internals.h"
@@ -10348,9 +10349,13 @@ typedef struct TestLocalRebaseFixture {
 /* Drive a local leader with a nonzero enqueue-time base (=5) through the
  * production chain to the exact PREPARE_GRANT-applied, pre-INSTALL window
  * where an interleaved revoke would have moved the own generation. */
+static void prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
+											TestLocalRebaseFixture *fixture);
+
 static void
-prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
-							 TestLocalRebaseFixture *fixture)
+prepare_local_rebase_fixture_with_follower(BlockNumber block, uint64 master_session,
+										   TestLocalRebaseFixture *fixture,
+										   PcmXLocalHandle *same_round_follower_out)
 {
 	PcmXLocalHolderKey holder_key;
 	PcmXLocalHolderHandle holder;
@@ -10377,6 +10382,18 @@ prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
 	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&fixture->writer, &fixture->writer_claim),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(fixture->writer_claim.grant_base_own_generation, 0);
+	if (same_round_follower_out != NULL) {
+		/* Joined before the cutoff freezes the round: a same-round FIFO
+		 * follower with its own enqueue-time identity base. */
+		PcmXWaitIdentity follower_identity
+			= make_wait_identity(block, 0, 4, master_session + UINT64_C(3));
+
+		follower_identity.base_own_generation = UINT64_C(5);
+		UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&follower_identity, 1, master_session,
+													same_round_follower_out),
+					 PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(same_round_follower_out->role, PCM_X_LOCAL_ROLE_FOLLOWER);
+	}
 	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(&fixture->writer, &cutoff),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&fixture->writer, &enqueue, &token),
@@ -10425,6 +10442,13 @@ prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
 	fixture->tag_slot
 		= &local_tag_slots(ClusterPcmXConvertShmem)[fixture->writer.tag_slot.slot_index];
 	UT_ASSERT_EQ(fixture->tag_slot->grant_base_own_generation, 0);
+}
+
+static void
+prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
+							 TestLocalRebaseFixture *fixture)
+{
+	prepare_local_rebase_fixture_with_follower(block, master_session, fixture, NULL);
 }
 
 /*
@@ -10529,6 +10553,64 @@ UT_TEST(test_local_grant_rebase_conflict_fails_closed)
 				 PCM_X_QUEUE_CORRUPT);
 	UT_ASSERT_EQ(fixture.tag_slot->grant_base_own_generation, UINT64_C(8));
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+/* A' rebase, same-node FIFO: a follower claiming after the leader's one-shot
+ * publish must inherit the published effective grant base from the tag slot;
+ * with its enqueue-time identity base it would verify the new X against the
+ * stale base+1 and fail closed (t/400 L3 review P0-1). */
+UT_TEST(test_local_follower_claim_inherits_published_rebase)
+{
+	TestLocalRebaseFixture fixture;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXLocalReliableToken token;
+	PcmXLocalHandle follower;
+	PcmXLocalWriterClaim follower_claim;
+	ClusterPcmOwnSnapshot granted;
+	const uint64 master_session = UINT64_C(1815);
+
+	prepare_local_rebase_fixture_with_follower(7122, master_session, &fixture, &follower);
+	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+				 PCM_X_QUEUE_OK);
+
+	/* Leader finishes its grant on the rebased math and releases the claim. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_install_ready_arm_exact(&fixture.writer, &fixture.prepare.ref,
+															 &fixture.prepare.image, &install_ready,
+															 &token),
+				 PCM_X_QUEUE_OK);
+	memset(&commit, 0, sizeof(commit));
+	commit.ref = fixture.prepare.ref;
+	commit.phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	UT_ASSERT_EQ(cluster_pcm_x_local_commit_x_exact(&fixture.writer, &commit, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_final_ack_arm_exact(&fixture.writer, UINT64_C(9), &final_ack, &token),
+		PCM_X_QUEUE_OK);
+	memset(&final_commit, 0, sizeof(final_commit));
+	final_commit.ref = fixture.prepare.ref;
+	final_commit.phase = PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK;
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_commit_ack_exact(&fixture.writer, &final_commit, 1,
+															master_session, &final_confirm, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&fixture.writer_claim),
+				 PCM_X_QUEUE_OK);
+
+	/* The follower's claim carries the effective grant base, and the bufmgr
+	 * grant-snapshot proof accepts exactly rebased+1. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&follower, &follower_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(follower_claim.grant_base_own_generation, UINT64_C(8));
+	memset(&granted, 0, sizeof(granted));
+	granted.tag = follower_claim.writer.identity.tag;
+	granted.generation = UINT64_C(9);
+	granted.reservation_token = UINT64_C(77);
+	granted.flags = 0;
+	granted.pcm_state = (uint8)PCM_STATE_X;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&follower_claim, &granted, &granted));
 }
 
 UT_TEST(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly)
@@ -15034,7 +15116,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(247);
+	UT_PLAN(257);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -15212,6 +15294,7 @@ main(void)
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
 	UT_RUN(test_local_grant_rebase_publish_is_one_shot_and_effective);
 	UT_RUN(test_local_grant_rebase_conflict_fails_closed);
+	UT_RUN(test_local_follower_claim_inherits_published_rebase);
 	UT_RUN(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly);
 	UT_RUN(test_local_cancelled_participant_gen0_drain_requires_frozen_round);
 	UT_RUN(test_local_holder_drain_validates_frozen_round_before_terminal_publish);

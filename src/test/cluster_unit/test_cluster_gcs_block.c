@@ -3473,7 +3473,7 @@ UT_TEST(test_pcm_x_role_refresh_accepts_only_same_member_promotion)
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(78);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);

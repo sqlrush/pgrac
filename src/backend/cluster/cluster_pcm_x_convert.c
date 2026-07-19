@@ -14860,7 +14860,11 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 	claim_out->claim_generation = next_claim_generation;
 	claim_out->local_round = member->admitted_round;
 	claim_out->role = member->role;
-	claim_out->grant_base_own_generation = 0;
+	/* A' rebase: every same-round claim inherits the published effective
+	 * grant base under this partition lock; zero (no rebase) keeps the
+	 * enqueue-time identity math.  Without this a FIFO follower would verify
+	 * the rebased X against its stale base+1 and fail closed. */
+	claim_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
 	result = PCM_X_QUEUE_OK;
 
 claim_release_gate:
