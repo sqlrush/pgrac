@@ -9850,12 +9850,44 @@ gcs_block_pcm_x_master_drive_cancel_requested(const PcmXMasterDriveSnapshot *sna
 }
 
 
+/* Log-once evidence for the periodic master drive: a non-progress result
+ * that repeats consecutively with the same shape is a stalled drive, and a
+ * frozen wedge must name its refusing arm.  Progress resets the streak. */
+static void
+gcs_block_pcm_x_master_drive_note(const char *stage, PcmXQueueResult result, uint64 ticket_id)
+{
+	static const char *last_stage = NULL;
+	static uint64 last_ticket = 0;
+	static int last_result = 0;
+	static bool logged = false;
+
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+		last_stage = NULL;
+		logged = false;
+		return;
+	}
+	if (stage == last_stage && (int)result == last_result && ticket_id == last_ticket) {
+		if (!logged) {
+			logged = true;
+			ereport(LOG, (errmsg("PCM-X master drive is repeating %s (result %d, ticket %llu)",
+								 stage, (int)result, (unsigned long long)ticket_id)));
+		}
+		return;
+	}
+	last_stage = stage;
+	last_result = (int)result;
+	last_ticket = ticket_id;
+	logged = false;
+}
+
+
 static void
 gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 {
 	PcmXMasterDriveSnapshot snapshot;
 	PcmXTicketRef active;
 	PcmXQueueResult result;
+	const char *drive_stage;
 
 	if (tag == NULL || cluster_epoch != cluster_epoch_get_current() || cluster_node_id < 0
 		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
@@ -9871,29 +9903,37 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 		if (result == PCM_X_QUEUE_NOT_FOUND)
 			cluster_gcs_pcm_x_drive_anomaly_settle(gcs_block_pcm_x_drive_anomaly_table,
 												   GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag);
+		gcs_block_pcm_x_master_drive_note("promote", result, 0);
 		gcs_block_pcm_x_master_drive_fail_closed(result);
 		return;
 	}
 	result = cluster_pcm_x_master_drive_snapshot_exact(tag, cluster_epoch, &snapshot);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK) {
+		gcs_block_pcm_x_master_drive_note("snapshot", result, 0);
 		gcs_block_pcm_x_master_drive_fail_closed(result);
 		return;
 	}
 	if (snapshot.ticket_state == PCM_XT_ACTIVE_PROBE
 		&& snapshot.flags
 			   == (PCM_X_MASTER_TICKET_F_PENDING_X_CLAIMED
-				   | PCM_X_MASTER_TICKET_F_PENDING_X_CANCEL_REQUESTED))
+				   | PCM_X_MASTER_TICKET_F_PENDING_X_CANCEL_REQUESTED)) {
+		drive_stage = "cancel-requested";
 		result = gcs_block_pcm_x_master_drive_cancel_requested(&snapshot);
-	else if (snapshot.ticket_state == PCM_XT_ACTIVE_PROBE) {
+	} else if (snapshot.ticket_state == PCM_XT_ACTIVE_PROBE) {
+		drive_stage = "probe";
 		result = gcs_block_pcm_x_ensure_pending_x_claim(&snapshot);
 		if (result == PCM_X_QUEUE_OK)
 			result = gcs_block_pcm_x_master_drive_probe(&snapshot);
-	} else if (snapshot.ticket_state == PCM_XT_ACTIVE_TRANSFER)
+	} else if (snapshot.ticket_state == PCM_XT_ACTIVE_TRANSFER) {
+		drive_stage = "transfer";
 		result = gcs_block_pcm_x_master_drive_transfer(&snapshot);
-	else
+	} else {
+		drive_stage = "state";
 		result = PCM_X_QUEUE_CORRUPT;
+	}
 	cluster_pcm_x_stats_note_queue_result(result);
+	gcs_block_pcm_x_master_drive_note(drive_stage, result, snapshot.ref.handle.ticket_id);
 	/* Only definite drive progress settles the tag;  indeterminate results
 	 * (NOT_READY / BUSY / STALE) must not reset a live streak, or a real
 	 * wedge interleaved with transients would never fuse. */

@@ -6275,6 +6275,11 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	UT_ASSERT_EQ(header->next_image_id, 2);
 	UT_ASSERT_EQ(cluster_pcm_x_master_revoke_arm_exact(&transfer, 2, source_session, &revoke),
 				 PCM_X_QUEUE_DUPLICATE);
+	/* Each exact re-arm is one retry-pump pass; leg_retry must count it. */
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 1);
+	UT_ASSERT_EQ(cluster_pcm_x_master_revoke_arm_exact(&transfer, 2, source_session, &revoke),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 2);
 
 	memset(&image_ready, 0, sizeof(image_ready));
 	image_ready.ref = transfer;
@@ -8044,6 +8049,8 @@ UT_TEST(test_terminal_ack_wire_fields_are_exact_and_zero_side_effect)
 					 request.prehandle.sender_session_incarnation, &replay),
 				 PCM_X_QUEUE_DUPLICATE);
 	UT_ASSERT(memcmp(&replay, &drain, sizeof(replay)) == 0);
+	/* Each exact re-arm is one retry-pump pass; leg_retry must count it. */
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 1);
 	before = *ticket;
 
 	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_ack_exact(&admission.ref, drain.kind, 1,

@@ -7378,9 +7378,13 @@ cluster_pcm_x_master_revoke_arm_exact(const PcmXTicketRef *ref, int32 responder_
 	else if (!pcm_x_transfer_leg_is_clear(&ticket->reliable)) {
 		if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_REVOKE, responder_node,
 									 responder_session)
-			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node)
+			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node) {
+			/* Diagnostic: the transfer driver re-arms this exact REVOKE leg on
+			 * every pass; count it so leg_retry exposes a live retry pump. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
-		else
+		} else
 			result = PCM_X_QUEUE_BUSY;
 	} else if (ticket->image.image_id != 0) {
 		result = ticket->reliable.last_response_opcode == PGRAC_IC_MSG_PCM_X_IMAGE_READY
@@ -7421,9 +7425,13 @@ cluster_pcm_x_master_revoke_arm_exact(const PcmXTicketRef *ref, int32 responder_
 	else if (!pcm_x_transfer_leg_is_clear(&ticket->reliable)) {
 		if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_REVOKE, responder_node,
 									 responder_session)
-			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node)
+			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node) {
+			/* Diagnostic: the transfer driver re-arms this exact REVOKE leg on
+			 * every pass; count it so leg_retry exposes a live retry pump. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
-		else
+		} else
 			result = PCM_X_QUEUE_BUSY;
 	} else if (ticket->image.image_id != 0)
 		result = PCM_X_QUEUE_CORRUPT;
@@ -8900,6 +8908,11 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 				= kind == PCM_X_TERMINAL_LEG_DRAIN ? ticket->drain_generation : 0;
 			token_out->expected_responder_node = responder_node;
 			token_out->kind = (uint16)kind;
+			/* Diagnostic: an exact re-arm is the retry pump re-staging this
+			 * leg.  The count reaches the per-slot dump as leg_retry, so a
+			 * frozen wedge separates a dead pump from a refusing responder. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
 		} else
 			result = PCM_X_QUEUE_BUSY;
