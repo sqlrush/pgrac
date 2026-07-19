@@ -191,14 +191,20 @@ typedef enum ClusterPcmXGrantReservationKind {
 	CLUSTER_PCM_X_GRANT_RESERVATION_N_NEW,
 	CLUSTER_PCM_X_GRANT_RESERVATION_N_REVOKE_HANDOFF,
 	CLUSTER_PCM_X_GRANT_RESERVATION_S_REVOKE_HANDOFF,
-	CLUSTER_PCM_X_GRANT_RESERVATION_X_REVOKE_HANDOFF
+	CLUSTER_PCM_X_GRANT_RESERVATION_X_REVOKE_HANDOFF,
+	CLUSTER_PCM_X_GRANT_RESERVATION_S_UPGRADE
 } ClusterPcmXGrantReservationKind;
 
 /* Classify every legal PREPARE reservation shape.  Ordinary remote-image N
- * acquisition allocates the next monotonic token.  A requester acting as its
- * own N/S/X image source instead reuses the already-live revoke token and
- * changes only its role.  Every shape retains tag/generation/pcm_state until
- * the single grant commit. */
+ * acquisition allocates the next monotonic token, and so does an S holder
+ * upgrading itself to X through the legacy master acquire (the reservation
+ * begin snapshots whatever coherent state it finds; the S-base abort path
+ * has always demoted S to N on rollback for exactly that shape).  A
+ * requester acting as its own N/S/X image source instead reuses the
+ * already-live revoke token and changes only its role.  Every shape retains
+ * tag/generation/pcm_state until the single grant commit.  A fresh-token X
+ * base is deliberately NOT enumerated: a live X cover never re-acquires
+ * through this path (cluster_pcm_x_cached_cover_bypasses_queue). */
 static inline ClusterPcmXGrantReservationKind
 cluster_pcm_x_grant_reservation_kind(const ClusterPcmOwnSnapshot *live,
 									 const ClusterPcmOwnSnapshot *base, uint64 reservation_token)
@@ -209,10 +215,13 @@ cluster_pcm_x_grant_reservation_kind(const ClusterPcmOwnSnapshot *live,
 		|| live->pcm_state != base->pcm_state)
 		return CLUSTER_PCM_X_GRANT_RESERVATION_INVALID;
 
-	if (base->pcm_state == (uint8)PCM_STATE_N && base->flags == 0
-		&& base->reservation_token != UINT64_MAX
-		&& reservation_token == base->reservation_token + 1)
-		return CLUSTER_PCM_X_GRANT_RESERVATION_N_NEW;
+	if (base->flags == 0 && base->reservation_token != UINT64_MAX
+		&& reservation_token == base->reservation_token + 1) {
+		if (base->pcm_state == (uint8)PCM_STATE_N)
+			return CLUSTER_PCM_X_GRANT_RESERVATION_N_NEW;
+		if (base->pcm_state == (uint8)PCM_STATE_S)
+			return CLUSTER_PCM_X_GRANT_RESERVATION_S_UPGRADE;
+	}
 	if (base->flags == PCM_OWN_FLAG_REVOKING && base->reservation_token != 0
 		&& reservation_token == base->reservation_token) {
 		if (base->pcm_state == (uint8)PCM_STATE_N)
