@@ -1209,7 +1209,7 @@ static void cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint
 
 static void
 cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
-								   uint32 wait_index)
+								   uint32 wait_index, bool *barrier_refused)
 {
 	long		delay_ms;
 	PcmXQueueResult guard_result;
@@ -1230,8 +1230,23 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 	 */
 	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
 	if (guard_result != PCM_X_QUEUE_OK)
+	{
+		/*
+		 * PGRAC (t/400 L3 item 3, holder lane): a barrier-aware caller owns
+		 * the unwind for the frozen-barrier refusal — it releases its own
+		 * outer lock and resolves the conversion unlocked.  Every other
+		 * guard verdict, and every non-aware caller, keeps the historical
+		 * fail-closed report.
+		 */
+		if (barrier_refused != NULL && guard_result == PCM_X_QUEUE_BARRIER_CLOSED)
+		{
+			*barrier_refused = true;
+			cluster_pcm_x_stats_note_barrier_unwind();
+			return;
+		}
 		cluster_bufmgr_pcm_x_holder_report_failure(
 			guard_result, GetBufferDescriptor(buffer_id), "retry wait nested guard");
+	}
 	delay_ms = cluster_pcm_x_holder_retry_delay_ms(wait_index);
 	CHECK_FOR_INTERRUPTS();
 	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
@@ -1457,7 +1472,7 @@ cluster_bufmgr_pcm_x_holder_drain_deferred(ClusterPcmXHolderLedgerEntry *entry)
 		}
 		cluster_bufmgr_pcm_x_holder_retry_wait(
 			entry->content_lock, entry->buffer_id,
-			wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
+			wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS, NULL);
 		wait_index++;
 		if (wait_index % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS == 0)
 		{
@@ -1475,7 +1490,7 @@ cluster_bufmgr_pcm_x_holder_drain_deferred(ClusterPcmXHolderLedgerEntry *entry)
 }
 
 static ClusterPcmXHolderLedgerEntry *
-cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
+cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 {
 	ClusterPcmXHolderLedgerEntry *entry;
 	ClusterPcmXWriterLedgerEntry *writer_entry;
@@ -1636,7 +1651,9 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf)
 			cluster_bufmgr_pcm_x_holder_report_failure(result, buf, "register");
 		cluster_bufmgr_pcm_x_holder_retry_wait(
 			content_lock, buf->buf_id,
-			wait_index++ % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
+			wait_index++ % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS, barrier_refused);
+		if (barrier_refused != NULL && *barrier_refused)
+			return NULL;
 	}
 
 	return entry;
@@ -1716,7 +1733,7 @@ cluster_bufmgr_pcm_x_holder_unregister(ClusterPcmXHolderLedgerEntry *entry)
 				result, GetBufferDescriptor(entry->buffer_id), "unregister");
 		}
 		cluster_bufmgr_pcm_x_holder_retry_wait(entry->content_lock, entry->buffer_id,
-											 waits_used++);
+											 waits_used++, NULL);
 	}
 }
 
@@ -2096,7 +2113,8 @@ cluster_bufmgr_pcm_x_writer_release(ClusterPcmXWriterLedgerEntry *entry)
 		}
 		cluster_bufmgr_pcm_x_holder_retry_wait(entry->content_lock, entry->buffer_id,
 											   waits_used++
-												   % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS);
+												   % CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS,
+											   NULL);
 	}
 }
 
@@ -8190,7 +8208,20 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{
-			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf);
+			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, pcm_barrier_refused);
+			if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+			{
+				/*
+				 * PGRAC (t/400 L3 item 3, holder lane): the holder gate
+				 * refused under the frozen barrier.  Roll the granted writer
+				 * claim back exactly like the ERROR path would and take
+				 * nothing; the barrier-aware caller owns the unwind.
+				 */
+				if (pcm_x_writer != NULL)
+					cluster_bufmgr_pcm_x_writer_abort_acquiring(pcm_x_writer);
+			}
+			else
+			{
 #endif
 			if (mode == BUFFER_LOCK_SHARE)
 				LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
@@ -8236,7 +8267,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 							pcm_pending_base.flags, "LockBuffer revalidate reservation");
 					pcm_pending_set = true;
 					pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
-					pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf);
+					pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
 					if (mode == BUFFER_LOCK_SHARE)
 						LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
 					else
@@ -8245,6 +8276,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 				}
 			}
 			cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder);
+			}
 		}
 		PG_CATCH();
 		{
@@ -8288,6 +8320,11 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			ReThrowError(original_error);
 		}
 		PG_END_TRY();
+
+		/* PGRAC (t/400 L3 item 3, holder lane): nothing is held and the
+		 * writer claim was rolled back — hand the refusal to the caller. */
+		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+			return;
 
 		/*
 		 * PGRAC ownership-generation wave (W3) — grant-finalize window.  A

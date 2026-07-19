@@ -1319,10 +1319,10 @@ UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
 			"cluster_bufmgr_pcm_x_holder_unregister" };
 	static const char *const acquire_contract[]
-		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf)",
+		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
-			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf)",
+			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder)" };
 	char *source = read_bufmgr_source();
@@ -1877,7 +1877,7 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 	static const char *const acquire_contract[]
 		= { "pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(",
 			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
-			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf)",
+			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)" };
 	static const char *const cleanup_contract[]
