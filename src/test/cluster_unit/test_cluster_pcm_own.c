@@ -2034,9 +2034,9 @@ UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
 	live.pcm_state = (uint8)PCM_STATE_N;
 
 	/* A concurrent grant lifecycle holds GRANT_PENDING: BUSY -> WAIT. */
-	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING,
-														 &blocker_token),
-				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING, &blocker_token),
+		CLUSTER_PCM_OWN_OK);
 	live.generation = pg_atomic_read_u64(&ClusterPcmOwnArray[0].generation);
 	live.reservation_token = pg_atomic_read_u64(&ClusterPcmOwnArray[0].reservation_token);
 	live.flags = pg_atomic_read_u32(&ClusterPcmOwnArray[0].flags);
@@ -2045,14 +2045,14 @@ UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
 	UT_ASSERT_EQ(cluster_gcs_pcm_x_requester_retry_action(
 					 GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT, PCM_X_QUEUE_BUSY),
 				 GCS_BLOCK_PCM_X_RETRY_WAIT);
-	UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, 0, blocker_token,
-														 PCM_OWN_FLAG_GRANT_PENDING),
-				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_abort_exact(0, 0, blocker_token, PCM_OWN_FLAG_GRANT_PENDING),
+		CLUSTER_PCM_OWN_OK);
 
 	/* A live revoke lifecycle classifies exactly the same way. */
-	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_REVOKING,
-														 &blocker_token),
-				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_REVOKING, &blocker_token),
+		CLUSTER_PCM_OWN_OK);
 	live.reservation_token = pg_atomic_read_u64(&ClusterPcmOwnArray[0].reservation_token);
 	live.flags = pg_atomic_read_u32(&ClusterPcmOwnArray[0].flags);
 	UT_ASSERT_EQ(cluster_gcs_pcm_x_remote_reservation_preflight(&live, &identity),

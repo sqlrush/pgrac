@@ -10350,7 +10350,7 @@ typedef struct TestLocalRebaseFixture {
  * production chain to the exact PREPARE_GRANT-applied, pre-INSTALL window
  * where an interleaved revoke would have moved the own generation. */
 static void prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
-											TestLocalRebaseFixture *fixture);
+										 TestLocalRebaseFixture *fixture);
 
 static void
 prepare_local_rebase_fixture_with_follower(BlockNumber block, uint64 master_session,

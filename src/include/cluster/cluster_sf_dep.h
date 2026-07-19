@@ -112,8 +112,7 @@ cluster_sf_peer_cap_generation_for_bits(const ClusterSfPeerCap *cap, uint32 requ
  * outputs. */
 static inline bool
 cluster_sf_peer_cap_family_sample(const ClusterSfPeerCap *cap, uint32 required_bits,
-								  uint32 optional_bits, bool *optional_out,
-								  uint32 *generation_out)
+								  uint32 optional_bits, bool *optional_out, uint32 *generation_out)
 {
 	if (optional_out != NULL)
 		*optional_out = false;

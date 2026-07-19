@@ -1341,21 +1341,28 @@ UT_TEST(test_pcm_x_install_ready_ingress_is_canonical_requester_ack)
 	ready.result = PCM_X_QUEUE_OK;
 	ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 
-	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 3, 11, 2, 2, true, true));
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 3, 11, 2, 2,
+															 true, true));
 	ready.result = PCM_X_QUEUE_DUPLICATE;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	ready.result = PCM_X_QUEUE_OK;
 	ready.phase = PGRAC_IC_MSG_PCM_X_PREPARE_GRANT;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 	ready.flags = 1;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	ready.flags = 0;
 	ready.image_id = UINT64CONST(0xf000000000000025);
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	UT_ASSERT(cluster_pcm_x_image_id_encode(3, 37, &ready.image_id));
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 
 	/* A' rebase: both exact frame lengths are legal, nothing in between; a
 	 * V1-length frame must carry a zero rebase and a V2 rebase must be
@@ -1368,15 +1375,19 @@ UT_TEST(test_pcm_x_install_ready_ingress_is_canonical_requester_ack)
 															 1, 11, 2, 2, true, true));
 	ready.ref.identity.base_own_generation = 5;
 	ready.rebased_own_generation = 8;
-	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															true, true));
 	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, PCM_X_INSTALL_READY_V1_LEN, 1,
 															 11, 2, 2, true, true));
 	ready.rebased_own_generation = 5;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	ready.rebased_own_generation = 4;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 	ready.rebased_own_generation = UINT64_MAX;
-	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2, true, true));
+	UT_ASSERT(!cluster_gcs_pcm_x_install_ready_ingress_valid(&ready, sizeof(ready), 1, 11, 2, 2,
+															 true, true));
 
 	/* Receiver-side V2 admission (review P1-3): a 112-byte frame is refused
 	 * unless BOTH this node's activated formation has full V2 coverage and

@@ -411,10 +411,9 @@ cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out, uint32 
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	supported = cluster_sf_peer_cap_family_sample(&ClusterSfDep->peer_capabilities[peer_id],
-												  PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
-												  PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, rebase_out,
-												  generation_out);
+	supported = cluster_sf_peer_cap_family_sample(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+		PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, rebase_out, generation_out);
 	LWLockRelease(&ClusterSfDep->lock);
 	return supported;
 }

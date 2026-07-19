@@ -999,8 +999,7 @@ cluster_gcs_pcm_x_install_ready_ingress_valid(const PcmXInstallReadyPayload *rea
 	return ready != NULL
 		   && (payload_length == sizeof(*ready) || payload_length == PCM_X_INSTALL_READY_V1_LEN)
 		   && (payload_length == sizeof(*ready) || ready->rebased_own_generation == 0)
-		   && (payload_length != sizeof(*ready)
-			   || (rebase_wire_active && source_supports_rebase))
+		   && (payload_length != sizeof(*ready) || (rebase_wire_active && source_supports_rebase))
 		   && (ready->rebased_own_generation == 0
 			   || (ready->rebased_own_generation != UINT64_MAX
 				   && ready->rebased_own_generation > ready->ref.identity.base_own_generation))
