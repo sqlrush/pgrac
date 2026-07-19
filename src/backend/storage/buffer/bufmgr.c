@@ -1316,6 +1316,36 @@ cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
 	}
 }
 
+/*
+ * PGRAC (t/400 S_NEW forensics): a legacy grant reservation that opens from
+ * a non-N base is the protocol-violating shape behind the deterministic
+ * S_NEW finish refusals — an X convert must ride the convert queue, and an
+ * S refresh over a held S must be served by the local cover gate.  Log the
+ * complete begin-time context (buffer identity, validity bit, the exact
+ * ownership tuple the reservation snapshotted, and the acquire mode) so the
+ * producing entry path can be identified from a live run.
+ */
+static void
+cluster_bufmgr_pcm_legacy_begin_probe(BufferDesc *buf, PcmLockMode pcm_mode,
+									  const ClusterPcmOwnSnapshot *base,
+									  const char *site)
+{
+	uint32		buf_state;
+
+	if (base->pcm_state == (uint8) PCM_STATE_N)
+		return;
+	buf_state = pg_atomic_read_u32(&buf->state);
+	elog(LOG,
+		 "cluster PCM legacy reservation opened from a non-N base: site=%s mode=%d buffer=%d rel=%u fork=%d blk=%u valid=%d base_state=%u base_gen=%llu base_token=%llu base_flags=0x%x pcm_state_now=%u",
+		 site, (int) pcm_mode, buf->buf_id,
+		 buf->tag.relNumber, (int) buf->tag.forkNum, buf->tag.blockNum,
+		 (buf_state & BM_VALID) != 0 ? 1 : 0,
+		 base->pcm_state,
+		 (unsigned long long) base->generation,
+		 (unsigned long long) base->reservation_token,
+		 base->flags, buf->pcm_state);
+}
+
 static ClusterPcmXHolderLedgerEntry *
 cluster_bufmgr_pcm_x_holder_find(BufferDesc *buf)
 {
@@ -8160,6 +8190,9 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					cluster_pcm_own_report_bump_failure(
 						buf, pcm_pending_result, pcm_pending_base.generation,
 						pcm_pending_base.flags, "LockBuffer master reservation");
+				cluster_bufmgr_pcm_legacy_begin_probe(buf, pcm_mode,
+													  &pcm_pending_base,
+													  "master-reservation");
 				pcm_pending_set = true;
 
 				/*
@@ -8330,6 +8363,9 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 								cluster_pcm_own_report_bump_failure(
 									buf, pcm_pending_result, pcm_pending_base.generation,
 									pcm_pending_base.flags, "LockBuffer revalidate reservation");
+							cluster_bufmgr_pcm_legacy_begin_probe(
+								buf, pcm_mode, &pcm_pending_base,
+								"revalidate-reservation");
 							pcm_pending_set = true;
 							pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
 						}
