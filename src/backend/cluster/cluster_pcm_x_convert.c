@@ -838,6 +838,7 @@ pcm_x_init_stats(PcmXStats *stats)
 	pg_atomic_init_u64(&stats->own_abort_count, 0);
 	pg_atomic_init_u64(&stats->own_busy_count, 0);
 	pg_atomic_init_u64(&stats->own_corrupt_count, 0);
+	pg_atomic_init_u64(&stats->barrier_unwind_count, 0);
 }
 
 
@@ -940,6 +941,7 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	snapshot_out->own_abort_count = pg_atomic_read_u64(&header->stats.own_abort_count);
 	snapshot_out->own_busy_count = pg_atomic_read_u64(&header->stats.own_busy_count);
 	snapshot_out->own_corrupt_count = pg_atomic_read_u64(&header->stats.own_corrupt_count);
+	snapshot_out->barrier_unwind_count = pg_atomic_read_u64(&header->stats.barrier_unwind_count);
 	snapshot_out->active_tags = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TAG].used;
 	snapshot_out->live_tickets = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
 	snapshot_out->local_retire_gate = (uint64)pg_atomic_read_u32(&header->local_retire_gate);
@@ -1050,6 +1052,18 @@ cluster_pcm_x_stats_note_own_corrupt(void)
 
 	if (header != NULL)
 		pcm_x_stats_increment(&header->stats.own_corrupt_count);
+}
+
+
+/* t/400 L3 item 3: a BARRIER_CLOSED refusal consumed by a barrier-aware
+ * LockBuffer caller (unwound in place of a client ERROR). */
+void
+cluster_pcm_x_stats_note_barrier_unwind(void)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header != NULL)
+		pcm_x_stats_increment(&header->stats.barrier_unwind_count);
 }
 
 

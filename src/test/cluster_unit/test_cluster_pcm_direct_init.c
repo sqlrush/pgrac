@@ -23,6 +23,9 @@ UT_DEFINE_GLOBALS();
 #ifndef FSM_SOURCE_PATH
 #error "FSM_SOURCE_PATH must identify production freespace.c"
 #endif
+#ifndef HEAPAM_SOURCE_PATH
+#error "HEAPAM_SOURCE_PATH must identify production heapam.c"
+#endif
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -369,7 +372,7 @@ UT_TEST(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode)",
+		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
 			"cluster_pcm_own_begin_grant_reservation(buf, &pcm_pending_base",
 			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode)" };
 
@@ -409,10 +412,71 @@ UT_TEST(test_wire_throw_exact_aborts_reservation_before_rethrow)
 	}
 }
 
+/* t/400 L3 item 3 — a nested-guard BARRIER_CLOSED at the pre-crit VM lock
+ * must unwind to the caller that owns the outer heap content lock instead of
+ * escaping as a client ERROR.  bufmgr exposes the refusal (never releasing
+ * the foreign lock itself); heapam releases its own lock(s), warms the map
+ * page's node X while holding no content lock, and re-enters a proven
+ * requalify/reacquire point. */
+UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	char *heapam = read_source(HEAPAM_SOURCE_PATH);
+
+	UT_ASSERT(bufmgr != NULL);
+	UT_ASSERT(heapam != NULL);
+	if (bufmgr != NULL) {
+		/* The refusal arm sits between the queue acquire and the ERROR
+		 * report, and only the barrier-aware entry can consume it. */
+		static const char *const refusal_order[]
+			= { "cluster_gcs_pcm_x_acquire_writer(buf, &entry->claim",
+				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
+				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
+
+		UT_ASSERT(strstr(bufmgr, "ClusterLockBufferExclusiveBarrierAware(Buffer buffer)") != NULL);
+		assert_ordered(bufmgr, refusal_order, lengthof(refusal_order));
+		free(bufmgr);
+	}
+	if (heapam != NULL) {
+		static const char *const pretoast_order[]
+			= { "PGRAC: vm barrier unwind (update pre-toast)",
+				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
+				"LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE)", "goto l2;" };
+		static const char *const requalify_order[]
+			= { "PGRAC: vm barrier unwind (update requalify)",
+				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
+				"LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE)", "goto l2;" };
+		static const char *const reacquire_order[]
+			= { "PGRAC: vm barrier unwind (update reacquire)",
+				"LockBuffer(newbuf, BUFFER_LOCK_UNLOCK)",
+				"ReleaseBuffer(newbuf)",
+				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
+				"cluster_heap_vm_barrier_warm",
+				"goto l_pgrac_reacquire;" };
+		static const char *const delete_order[]
+			= { "PGRAC: vm barrier unwind (delete requalify)",
+				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
+				"LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE)", "goto l1;" };
+
+		/* The warm helper itself may only run with no content lock held:
+		 * it must take and drop the map-page lock, nothing else. */
+		static const char *const warm_order[] = { "cluster_heap_vm_barrier_warm(Buffer vmbuf)",
+												  "LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE)",
+												  "LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK)" };
+
+		assert_ordered(heapam, warm_order, lengthof(warm_order));
+		assert_ordered(heapam, pretoast_order, lengthof(pretoast_order));
+		assert_ordered(heapam, requalify_order, lengthof(requalify_order));
+		assert_ordered(heapam, reacquire_order, lengthof(reacquire_order));
+		assert_ordered(heapam, delete_order, lengthof(delete_order));
+		free(heapam);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -430,6 +494,7 @@ main(void)
 	UT_RUN(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire);
 	UT_RUN(test_direct_init_one_shot_image_cannot_return_without_x);
 	UT_RUN(test_wire_throw_exact_aborts_reservation_before_rethrow);
+	UT_RUN(test_precrit_vm_barrier_refusal_unwinds_to_caller);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

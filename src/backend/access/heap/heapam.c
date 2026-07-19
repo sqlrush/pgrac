@@ -3438,6 +3438,31 @@ cluster_xwait_has_remote_evidence(Page page, HeapTupleHeader tuple, TransactionI
 }
 #endif /* USE_PGRAC_CLUSTER */
 
+/*
+ * PGRAC (t/400 L3 item 3): bound for the BARRIER_CLOSED caller-owned unwind
+ * at the pre-crit VM lock sites.  The all-visible clear race is one-shot per
+ * page (whoever clears first removes the need for every later contender), so
+ * the retry converges; the bound only guards the no-node-cache configuration
+ * where the warmed conversion can be revoked before the re-attempt.  Once
+ * exhausted, the plain LockBuffer restores the historical fail-closed ERROR.
+ */
+#define CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES 16
+
+/*
+ * PGRAC (t/400 L3 item 3): resolve a refused map-page conversion while the
+ * caller holds NO content lock.  Blocking is legal here (the nested guard
+ * only refuses a wait entered while a frozen-tag content lock is held);
+ * hold-until-revoked retains the node X after the local release, so the
+ * caller's re-attempt is normally served by the cached-cover fast path
+ * without consulting the guard again.
+ */
+static void
+cluster_heap_vm_barrier_warm(Buffer vmbuf)
+{
+	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+}
+
 
 TM_Result
 heap_delete(Relation relation, ItemPointer tid,
@@ -3453,6 +3478,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
+	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
 	TransactionId new_xmax;
 	uint16		new_infomask,
 				new_infomask2;
@@ -3855,7 +3881,25 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	vm_locked = false;
 	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
 	{
-		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		if (vm_barrier_retries >= CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES)
+			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		else if (!ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+		{
+			/*
+			 * PGRAC: vm barrier unwind (delete requalify) — this backend
+			 * holds the heap page whose tag sits under a frozen revoke
+			 * barrier, so it may not sleep on the map-page conversion.
+			 * Release our own lock, resolve the conversion unlocked, and
+			 * requalify from scratch: the ITL slot pick is idempotent and an
+			 * unstamped undo record is unreachable garbage, exactly as after
+			 * any pre-crit ERROR.
+			 */
+			vm_barrier_retries++;
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			cluster_heap_vm_barrier_warm(vmbuffer);
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			goto l1;
+		}
 		vm_locked = true;
 	}
 
@@ -4147,6 +4191,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				vmbuffer_new = InvalidBuffer;
 	bool		vm_locked;		/* PGRAC: pre-crit VM content lock held */
 	bool		vm_locked_new;
+	bool		old_tuple_temp_locked = false;	/* PGRAC: t/400 L3 item 3 */
+	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
 	bool		need_toast;
 	Size		newtupsize,
 				pagefree;
@@ -4816,7 +4862,22 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		vm_locked = false;
 		if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
 		{
-			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			if (vm_barrier_retries >= CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES)
+				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			else if (!ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+			{
+				/*
+				 * PGRAC: vm barrier unwind (update pre-toast) — the old
+				 * tuple carries no temporary lock yet and nothing
+				 * irreversible has happened in this pass, so a full
+				 * requalify is required and sufficient.
+				 */
+				vm_barrier_retries++;
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				cluster_heap_vm_barrier_warm(vmbuffer);
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				goto l2;
+			}
 			vm_locked = true;
 		}
 
@@ -4870,6 +4931,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 		END_CRIT_SECTION();
 
+		/* PGRAC (t/400 L3 item 3): the lock-only xmax now shields the old
+		 * tuple from concurrent updaters, so later unlocked windows (the
+		 * page-reacquire loop below) do not require requalification. */
+		old_tuple_temp_locked = true;
+
 		if (vm_locked)
 			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
@@ -4914,6 +4980,16 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		 * pins; but if we don't, we have to handle that here.  Hence we need
 		 * a loop.
 		 */
+		/*
+		 * PGRAC (t/400 L3 item 3): the VM-barrier unwind re-enters here with
+		 * both content locks released (and a foreign newbuf unpinned) after
+		 * resolving the refused map-page conversion.  The lock-only xmax
+		 * stamped above makes requalification unnecessary, exactly as for
+		 * the stock unlocked TOAST window; everything below — page choice,
+		 * serializable-conflict check, HOT decision, replica identity, ITL
+		 * pick and undo emit — is re-derived on the way back down.
+		 */
+l_pgrac_reacquire:
 		for (;;)
 		{
 			if (newtupsize > pagefree)
@@ -5140,6 +5216,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		bool		need_new = newbuf != buffer
 			&& PageIsAllVisible(BufferGetPage(newbuf))
 			&& BufferIsValid(vmbuffer_new);
+		bool		barrier_aware = vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES;
+		Buffer		refused_vm = InvalidBuffer;
 
 		if (need_old && need_new && vmbuffer_new == vmbuffer)
 			need_new = false;	/* same map page: one lock covers both */
@@ -5147,23 +5225,116 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		if (need_old && need_new
 			&& vmbuffer_new < vmbuffer)
 		{
-			LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
-			vm_locked_new = true;
-			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-			vm_locked = true;
+			if (!barrier_aware)
+			{
+				LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
+				vm_locked_new = true;
+				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				vm_locked = true;
+			}
+			else
+			{
+				if (ClusterLockBufferExclusiveBarrierAware(vmbuffer_new))
+					vm_locked_new = true;
+				else
+					refused_vm = vmbuffer_new;
+				if (refused_vm == InvalidBuffer)
+				{
+					if (ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+						vm_locked = true;
+					else
+						refused_vm = vmbuffer;
+				}
+			}
 		}
 		else
 		{
 			if (need_old)
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-				vm_locked = true;
+				if (!barrier_aware)
+				{
+					LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+					vm_locked = true;
+				}
+				else if (ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+					vm_locked = true;
+				else
+					refused_vm = vmbuffer;
 			}
-			if (need_new)
+			if (need_new && refused_vm == InvalidBuffer)
 			{
-				LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
-				vm_locked_new = true;
+				if (!barrier_aware)
+				{
+					LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
+					vm_locked_new = true;
+				}
+				else if (ClusterLockBufferExclusiveBarrierAware(vmbuffer_new))
+					vm_locked_new = true;
+				else
+					refused_vm = vmbuffer_new;
 			}
+		}
+
+		if (refused_vm != InvalidBuffer)
+		{
+			/*
+			 * PGRAC: BARRIER_CLOSED caller-owned unwind.  This backend holds
+			 * heap content lock(s) whose tag sits under a frozen revoke
+			 * barrier; sleeping on the map-page conversion here could
+			 * deadlock across locks, and bufmgr must never release the
+			 * outer lock itself.  Release our OWN locks, resolve the
+			 * conversion while holding no content lock, then re-enter a
+			 * proven point.
+			 */
+			vm_barrier_retries++;
+			if (vm_locked_new)
+			{
+				LockBuffer(vmbuffer_new, BUFFER_LOCK_UNLOCK);
+				vm_locked_new = false;
+			}
+			if (vm_locked)
+			{
+				LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+				vm_locked = false;
+			}
+			if (old_key_tuple != NULL && old_key_copied)
+			{
+				heap_freetuple(old_key_tuple);
+				old_key_tuple = NULL;
+				old_key_copied = false;
+			}
+			if (!old_tuple_temp_locked)
+			{
+				/*
+				 * PGRAC: vm barrier unwind (update requalify) — no
+				 * temporary lock protects the old tuple yet (same-page
+				 * non-TOAST path, so newbuf == buffer), hence a concurrent
+				 * updater may win the race while we are unlocked: requalify
+				 * from scratch.  ITL pick and undo emit of this pass are
+				 * abandoned safely (idempotent pick, unreachable record).
+				 */
+				Assert(newbuf == buffer);
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				cluster_heap_vm_barrier_warm(refused_vm);
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				goto l2;
+			}
+
+			/*
+			 * PGRAC: vm barrier unwind (update reacquire) — the lock-only
+			 * xmax shields the old tuple, so re-entering the page-reacquire
+			 * loop (stock unlocked-TOAST idiom) is sufficient.  A distinct
+			 * newbuf is unlocked AND unpinned: the loop re-picks the target
+			 * page through RelationGetBufferForTuple.
+			 */
+			if (newbuf != buffer)
+			{
+				LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
+				ReleaseBuffer(newbuf);
+			}
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			cluster_heap_vm_barrier_warm(refused_vm);
+			goto l_pgrac_reacquire;
 		}
 	}
 

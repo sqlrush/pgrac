@@ -1877,7 +1877,7 @@ cluster_bufmgr_pcm_x_writer_drain_deferred_nowait(void)
 }
 
 static ClusterPcmXWriterLedgerEntry *
-cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode)
+cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *barrier_refused)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmDirectInitSnapshot observed;
@@ -1932,6 +1932,21 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode)
 													   "failed claim handoff");
 		}
 		cluster_bufmgr_pcm_x_writer_clear(entry);
+
+		/*
+		 * PGRAC (t/400 L3 item 3): a nested-guard BARRIER_CLOSED means this
+		 * backend already holds another content lock whose tag sits under a
+		 * frozen revoke barrier; the requester unwound cleanly (no claim, no
+		 * wait identity).  A barrier-aware caller owns the unwind: hand the
+		 * refusal back instead of escalating to a client ERROR.  bufmgr must
+		 * never release the foreign content lock itself.
+		 */
+		if (result == PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL)
+		{
+			*barrier_refused = true;
+			cluster_pcm_x_stats_note_barrier_unwind();
+			return NULL;
+		}
 		cluster_bufmgr_pcm_x_writer_report_failure(result, buf, "queue acquire");
 	}
 	if (!entry->claim_handed_off) {
@@ -7927,9 +7942,16 @@ UnlockBuffers(void)
  * PGRAC: spec-2.31 wires the PCM state machine as the outer lock for
  * shared-buffer content locks.  PCM acquisition happens before the local
  * content_lock; release happens after the local content_lock is released.
+ *
+ * PGRAC (t/400 L3 item 3): pcm_barrier_refused, when non-NULL, arms the
+ * barrier-aware mode used by ClusterLockBufferExclusiveBarrierAware(): a
+ * nested-guard BARRIER_CLOSED from the PCM-X queue acquire sets the flag and
+ * returns WITHOUT taking the content lock, leaving the unwind to the caller
+ * that owns the outer (frozen-tag) content lock.  A NULL pointer keeps the
+ * historical behavior (the refusal escalates to a client ERROR).
  */
-void
-LockBuffer(Buffer buffer, int mode)
+static void
+LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
@@ -7982,7 +8004,10 @@ LockBuffer(Buffer buffer, int mode)
 		}
 
 		if (!pcm_covered)
-			pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode);
+			pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
+															   pcm_barrier_refused);
+		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+			return;				/* barrier-aware caller owns the unwind */
 		if (pcm_x_writer == NULL && !pcm_covered) {
 			/*
 			 * PGRAC: spec-4.7a D2 — hold-until-revoked acquire gate.
@@ -8337,6 +8362,34 @@ LockBuffer(Buffer buffer, int mode)
 		}
 	}
 #endif
+}
+
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	LockBufferInternal(buffer, mode, NULL);
+}
+
+/*
+ * PGRAC (t/400 L3 item 3): EXCLUSIVE LockBuffer that reports a nested-guard
+ * BARRIER_CLOSED refusal instead of raising a client ERROR.
+ *
+ * Returns true with the content lock held (every non-barrier path behaves
+ * exactly like LockBuffer, including its error surface).  Returns false with
+ * NOTHING held when the PCM-X queue acquire refused because this backend
+ * already holds another content lock whose tag sits under a frozen revoke
+ * barrier: sleeping here could deadlock across locks and the frozen barrier
+ * snapshot cannot see the nested edge.  The caller — the owner of that outer
+ * content lock — must release its own lock(s), resolve the map-page
+ * conversion while holding no content lock, and re-enter a requalify point.
+ */
+bool
+ClusterLockBufferExclusiveBarrierAware(Buffer buffer)
+{
+	bool		barrier_refused = false;
+
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused);
+	return !barrier_refused;
 }
 
 /* VM/FSM pages read with RBM_ZERO_ON_ERROR become BM_VALID before their

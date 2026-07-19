@@ -1378,6 +1378,7 @@ test_cluster_pcm_direct_init: test_cluster_pcm_direct_init.c unit_test.h \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		-DVM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/visibilitymap.c"' \
 		-DFSM_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/freespace/freespace.c"' \
+		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
 		$< \
 		$(CLUSTER_PCM_DIRECT_INIT_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

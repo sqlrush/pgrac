@@ -740,7 +740,7 @@ UT_TEST(test_lockbuffer_content_error_uses_post_master_rollback_contract)
 	assert_ordered_in_function(source, "\ncluster_pcm_own_rollback_grant_after_error_and_rethrow(",
 							   "\nstatic ", rethrow_contract, lengthof(rethrow_contract));
 	assert_ordered_in_function(
-		source, "\nLockBuffer(Buffer buffer, int mode)",
+		source, "\nLockBufferInternal(Buffer buffer, int mode",
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		content_error_contract, lengthof(content_error_contract));
 	free(source);
@@ -1161,7 +1161,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	flush = strstr(source, "\nFlushBuffer(");
 	dirty = strstr(source, "\nMarkBufferDirty(Buffer buffer)");
 	hint = strstr(source, "\nMarkBufferDirtyHint(Buffer buffer, bool buffer_std)");
-	lockbuffer = strstr(source, "\nLockBuffer(Buffer buffer, int mode)");
+	lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
 	conditional = strstr(source, "\nConditionalLockBuffer(Buffer buffer)");
 	resident_stamp = strstr(source, "\ncluster_bufmgr_lock_resident_for_stamp(");
 	storage_refresh = strstr(source, "\ncluster_bufmgr_refresh_block_from_storage_for_gcs(");
@@ -1327,11 +1327,11 @@ UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 	 * published across the W1 release/reacquire fallback.  Normal release
 	 * publishes RELEASING before unlocking and unlinks only afterwards. */
 	assert_ordered_in_function(
-		source, "\nLockBuffer(Buffer buffer, int mode)",
+		source, "\nLockBufferInternal(Buffer buffer, int mode",
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		unlock_contract, lengthof(unlock_contract));
 	assert_ordered_in_function(
-		source, "\nLockBuffer(Buffer buffer, int mode)",
+		source, "\nLockBufferInternal(Buffer buffer, int mode",
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		acquire_contract, lengthof(acquire_contract));
 	free(source);
@@ -1872,7 +1872,7 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 			"cluster_pcm_lock_unlock_content_buffer(buf, old_mode)" };
 	static const char *const acquire_contract[]
 		= { "pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(",
-			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode)",
+			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
 			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf)",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)" };
@@ -1977,11 +1977,11 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 							   writer_holder_runtime_contract,
 							   lengthof(writer_holder_runtime_contract));
 	assert_ordered_in_function(
-		source, "\nLockBuffer(Buffer buffer, int mode)",
+		source, "\nLockBufferInternal(Buffer buffer, int mode",
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		acquire_contract, lengthof(acquire_contract));
 	assert_ordered_in_function(
-		source, "\nLockBuffer(Buffer buffer, int mode)",
+		source, "\nLockBufferInternal(Buffer buffer, int mode",
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		unlock_contract, lengthof(unlock_contract));
 	assert_ordered_in_function(source, "\nUnlockBuffers(void)",

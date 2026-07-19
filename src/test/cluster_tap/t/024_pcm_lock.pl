@@ -55,14 +55,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 59 keys, including the 31-key PCM-X FIFO surface.
+# L1: pg_cluster_state.pcm category has 60 keys, including the 32-key PCM-X FIFO surface.
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-	'59',
-	'L1 pg_cluster_state.pcm category has 59 keys (existing 28 + PCM-X FIFO/ownership/runtime 30 + fail-closed site)');
+	'60',
+	'L1 pg_cluster_state.pcm category has 60 keys (existing 28 + PCM-X FIFO/ownership/runtime 31 + fail-closed site)');
 
 
 # ----------

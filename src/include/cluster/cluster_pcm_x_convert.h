@@ -32,7 +32,8 @@
 #define PCM_X_PROTOCOL_NODE_LIMIT 32
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)12)
+/* 13: A' rebase slot growth (ticket 392 / local tag 760 / header stats). */
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)13)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -1153,6 +1154,9 @@ typedef struct PcmXStats {
 	pg_atomic_uint64 own_abort_count;
 	pg_atomic_uint64 own_busy_count;
 	pg_atomic_uint64 own_corrupt_count;
+	/* t/400 L3 item 3: BARRIER_CLOSED refusals handed back to a
+	 * barrier-aware LockBuffer caller instead of escaping as ERROR. */
+	pg_atomic_uint64 barrier_unwind_count;
 } PcmXStats;
 
 /* Process-local copy used by debug views and acceptance gates. */
@@ -1188,6 +1192,7 @@ typedef struct PcmXStatsSnapshot {
 	uint64 own_abort_count;
 	uint64 own_busy_count;
 	uint64 own_corrupt_count;
+	uint64 barrier_unwind_count;
 } PcmXStatsSnapshot;
 
 /* Optional peer authority installed while the runtime gate is ACTIVATING. */
@@ -1272,8 +1277,8 @@ typedef struct PcmXShmemHeader {
 StaticAssertDecl(sizeof(PcmXShmemLayout) == 440, "PCM-X shmem layout ABI");
 StaticAssertDecl(sizeof(PcmXAllocatorState) == 32, "PCM-X allocator state ABI");
 StaticAssertDecl(sizeof(PcmXPeerFrontier) == 48, "PCM-X peer frontier ABI");
-StaticAssertDecl(sizeof(PcmXStats) == 176, "PCM-X stats ABI");
-StaticAssertDecl(sizeof(PcmXStatsSnapshot) == 224, "PCM-X stats snapshot ABI");
+StaticAssertDecl(sizeof(PcmXStats) == 184, "PCM-X stats ABI");
+StaticAssertDecl(sizeof(PcmXStatsSnapshot) == 232, "PCM-X stats snapshot ABI");
 StaticAssertDecl(sizeof(PcmXPeerBinding) == 16, "PCM-X peer binding ABI");
 StaticAssertDecl(sizeof(PcmXOutboundTargetFrontier) == 32, "PCM-X outbound target frontier ABI");
 StaticAssertDecl(offsetof(PcmXOutboundTargetFrontier, mint_gate) == 0,
@@ -1291,9 +1296,9 @@ StaticAssertDecl(offsetof(PcmXShmemHeader, local_locks) == 17280, "PCM-X local l
 StaticAssertDecl(offsetof(PcmXShmemHeader, peer_frontiers) == 33664,
 				 "PCM-X peer frontier array offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, stats) == 35200, "PCM-X stats offset");
-StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35376,
+StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35384,
 				 "PCM-X outbound target frontier array offset");
-StaticAssertDecl(sizeof(PcmXShmemHeader) == 36512, "PCM-X shmem header ABI");
+StaticAssertDecl(sizeof(PcmXShmemHeader) == 36520, "PCM-X shmem header ABI");
 
 typedef enum PcmXAttachResult {
 	PCM_X_ATTACH_OK = 0,
@@ -1343,6 +1348,7 @@ extern void cluster_pcm_x_stats_note_own_commit(void);
 extern void cluster_pcm_x_stats_note_own_abort(void);
 extern void cluster_pcm_x_stats_note_own_busy(void);
 extern void cluster_pcm_x_stats_note_own_corrupt(void);
+extern void cluster_pcm_x_stats_note_barrier_unwind(void);
 extern bool cluster_pcm_x_runtime_activate(uint64 master_session_incarnation);
 /* A' rebase: publish formation-wide PCM_X_REBASE_V1 coverage.  Legal only
  * from the activating formation tick, strictly before activate_bound(). */

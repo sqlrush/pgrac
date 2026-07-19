@@ -2169,13 +2169,13 @@ UT_TEST(test_wire_abi_offsets_are_exact)
 
 UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 {
-	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 12);
+	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 13);
 	UT_ASSERT_EQ(PCM_X_LOCK_PARTITIONS, NUM_BUFFER_PARTITIONS);
 	UT_ASSERT_EQ(PCM_X_LWLOCK_COUNT, 257);
 	UT_ASSERT_EQ(sizeof(PcmXShmemLayout), 440);
 	UT_ASSERT_EQ(sizeof(PcmXAllocatorState), 32);
-	UT_ASSERT_EQ(sizeof(PcmXStats), 176);
-	UT_ASSERT_EQ(sizeof(PcmXStatsSnapshot), 224);
+	UT_ASSERT_EQ(sizeof(PcmXStats), 184);
+	UT_ASSERT_EQ(sizeof(PcmXStatsSnapshot), 232);
 	UT_ASSERT_EQ(sizeof(PcmXSlotHeader), 24);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, next_free), 0);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, generation_change_seq), 8);
@@ -2237,8 +2237,8 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, local_locks), 17280);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
-	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35376);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36512);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35384);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36520);
 }
 
 UT_TEST(test_lwlock_held_limit_is_shared_200)
@@ -2286,19 +2286,19 @@ UT_TEST(test_exactly_five_pools_and_bounded_directories)
 	UT_ASSERT_EQ(layout.local_holder.directory_capacity, layout.local_holder.capacity * 2);
 }
 
-UT_TEST(test_layout_v12_records_transfer_and_terminal_frontiers)
+UT_TEST(test_layout_v13_records_transfer_and_terminal_frontiers)
 {
 	PcmXShmemLayout layout;
 
 	cluster_pcm_x_layout_compute(122, 25, 16384, 1024, &layout);
-	UT_ASSERT_EQ(layout.version, 12);
+	UT_ASSERT_EQ(layout.version, 13);
 	UT_ASSERT_EQ(layout.lock_partition_count, PCM_X_LOCK_PARTITIONS);
 	UT_ASSERT_EQ(layout.lwlock_count, PCM_X_LWLOCK_COUNT);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
 	UT_ASSERT_EQ(sizeof(PcmXOutboundTargetFrontier), 32);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
-	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35376);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35384);
 }
 
 UT_TEST(test_offsets_are_aligned_ordered_and_bounded)
@@ -15043,7 +15043,7 @@ main(void)
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);
 	UT_RUN(test_exactly_five_pools_and_bounded_directories);
-	UT_RUN(test_layout_v12_records_transfer_and_terminal_frontiers);
+	UT_RUN(test_layout_v13_records_transfer_and_terminal_frontiers);
 	UT_RUN(test_offsets_are_aligned_ordered_and_bounded);
 	UT_RUN(test_membership_wait_and_holder_partitions_do_not_overlap);
 	UT_RUN(test_generation_zero_advances_without_being_a_sentinel);

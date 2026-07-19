@@ -2088,6 +2088,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "pcm", "pcm_x_own_busy_count", fmt_int64((int64)stats.own_busy_count));
 		emit_row(rsinfo, "pcm", "pcm_x_own_corrupt_count",
 				 fmt_int64((int64)stats.own_corrupt_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
+				 fmt_int64((int64)stats.barrier_unwind_count));
 	}
 }
 

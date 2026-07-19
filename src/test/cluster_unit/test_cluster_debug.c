@@ -4328,7 +4328,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
 	(void)cluster_dump_state(fcinfo);
 
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 59);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 60);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
 	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 119);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
