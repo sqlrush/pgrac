@@ -16868,15 +16868,28 @@ pcm_x_local_same_ref_dual_retire_state(const PcmXLocalTagSlot *tag_slot, uint32 
 	source_holder = !pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref);
 	external_ref = source_holder ? &tag_slot->holder_ref : &tag_slot->blocker_snapshot_ref;
 	memset(&zero_image, 0, sizeof(zero_image));
+	/* Per-lane completeness comes first: each terminal lane must carry its
+	 * own full DRAIN evidence before any dual/independent classification. */
 	if (writer_flags != PCM_X_LOCAL_TAG_F_TERMINAL_MASK
 		|| holder_flags != PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK || tag_slot->membership_count == 0
-		|| pcm_x_ticket_ref_is_zero(external_ref)
-		|| !pcm_x_ticket_ref_equal(&tag_slot->ref, external_ref)
-		|| tag_slot->terminal_drain_generation == 0
+		|| pcm_x_ticket_ref_is_zero(external_ref) || tag_slot->terminal_drain_generation == 0
 		|| tag_slot->terminal_drain_generation == UINT64_MAX
-		|| tag_slot->terminal_drain_generation != tag_slot->holder_terminal_drain_generation
 		|| !pcm_x_local_terminal_pending_clear(tag_slot)
 		|| pcm_x_local_holder_lane_retire_state(tag_slot, flags) != PCM_X_QUEUE_OK)
+		return PCM_X_QUEUE_CORRUPT;
+	if (!pcm_x_ticket_ref_equal(&tag_slot->ref, external_ref)) {
+		/* Two complete terminals under DISTINCT master tickets are the legal
+		 * independent form: a granted writer awaiting RETIRE plus a newer
+		 * revoked holder lane on the same tag (the t/400 dump-0x3d shape).
+		 * Not a dual -- each lane retires by its own watermark.  A ticket-id
+		 * collision under a different ref can only be corruption: per-session
+		 * ticket ids are master-unique (see the cross-lane alias-class note
+		 * at pcm_x_local_cross_lane_holder_terminal_retirable). */
+		if (external_ref->handle.ticket_id != tag_slot->ref.handle.ticket_id)
+			return PCM_X_QUEUE_OK;
+		return PCM_X_QUEUE_CORRUPT;
+	}
+	if (tag_slot->terminal_drain_generation != tag_slot->holder_terminal_drain_generation)
 		return PCM_X_QUEUE_CORRUPT;
 	if (external_ref->grant_generation == 0) {
 		if (source_holder || tag_slot->ref.grant_generation != 0
@@ -18889,6 +18902,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 	bool detach_after_close = false;
 	bool detach_tag = false;
 	bool gate_claimed = false;
+	bool retain_independent_holder = false;
 	bool same_ref_dual = false;
 	bool ready_leader_candidate = false;
 	bool target_in_closed_round;
@@ -19013,6 +19027,36 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 				goto detach_local_domain_done;
 			}
 		}
+		/* Independent dual terminal (dump-0x3d): a complete writer terminal
+		 * and a complete holder terminal under DISTINCT master tickets.  Only
+		 * the exact proven narrow shape may retire its writer lane while the
+		 * holder lane, the barrier and the master binding stay byte-exact on
+		 * the LIVE tag for the holder ticket's own later watermark: one
+		 * unlinked terminal membership, every FIFO/holder index invalid and
+		 * a clear writer application leg.  Any other distinct-ticket dual is
+		 * unproven and stays NOT_READY with zero mutation. */
+		if (!same_ref_dual && !cancel_same_ref_dual
+			&& (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+				   == PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
+			&& (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == PCM_X_LOCAL_TAG_F_TERMINAL_MASK) {
+			const PcmXTicketRef *external_ref = pcm_x_local_external_terminal_ref(tag_slot);
+
+			retain_independent_holder
+				= external_ref != NULL && external_ref->grant_generation != 0
+				  && external_ref->handle.ticket_id != tag_slot->ref.handle.ticket_id
+				  && tag_slot->membership_count == 1
+				  && tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX
+				  && tag_slot->tail_index == PCM_X_INVALID_SLOT_INDEX
+				  && tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+				  && tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX
+				  && tag_slot->active_holder_head_index == PCM_X_INVALID_SLOT_INDEX
+				  && pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+				  && pcm_x_local_holder_lane_retire_state(tag_slot, flags) == PCM_X_QUEUE_OK;
+			if (!retain_independent_holder) {
+				result = PCM_X_QUEUE_NOT_READY;
+				goto detach_local_domain_done;
+			}
+		}
 	}
 	target_in_closed_round = (flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0
 							 && member->admitted_round == tag_slot->local_round
@@ -19027,7 +19071,8 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		result = PCM_X_QUEUE_CORRUPT;
 		goto detach_local_domain_done;
 	}
-	if (retire_protocol && target_in_closed_round && tag_slot->closed_round_member_count == 1) {
+	if (retire_protocol && !retain_independent_holder && target_in_closed_round
+		&& tag_slot->closed_round_member_count == 1) {
 		result = pcm_x_local_final_member_round_plan_locked(tag_slot, tag_ref, &round_plan);
 		if (result != PCM_X_QUEUE_OK)
 			goto detach_local_domain_done;
@@ -19045,10 +19090,14 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		/* Writer membership and holder transfer are independent lifetimes on
 		 * the same tag.  Neither returning to holder-only form nor deleting the
 		 * tag may erase the master binding while an exact holder ticket, send
-		 * leg, or terminal-drain outcome remains authoritative. */
-		if (!pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
-			|| !pcm_x_transfer_leg_is_clear(&tag_slot->holder_reliable)
-			|| ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0 && !cancel_same_ref_dual)) {
+		 * leg, or terminal-drain outcome remains authoritative.  The proven
+		 * independent dual terminal is the one exception: its writer lane may
+		 * retire alone, leaving the holder lane authoritative on the tag. */
+		if (!retain_independent_holder
+			&& (!pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
+				|| !pcm_x_transfer_leg_is_clear(&tag_slot->holder_reliable)
+				|| ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
+					&& !cancel_same_ref_dual))) {
 			result = PCM_X_QUEUE_NOT_READY;
 			goto detach_local_domain_done;
 		}
@@ -19061,7 +19110,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 				goto detach_local_domain_done;
 			}
 			pcm_x_local_reset_holder_only_queue(tag_slot);
-		} else if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) == 0) {
+		} else if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) == 0 && !retain_independent_holder) {
 			pg_write_barrier();
 			pcm_x_slot_state_write(&tag_slot->slot, PCM_X_TAG_DETACHING);
 			detach_tag = true;
@@ -19446,6 +19495,22 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			result = PCM_X_QUEUE_NOT_READY;
 			goto candidate_done;
 		}
+		/* An independent (distinct-ticket) dual terminal may offer its writer
+		 * lane only in the exact proven narrow shape; see the retain arm in
+		 * pcm_x_local_detach_terminal_common.  Refusing here keeps the whole
+		 * RETIRE preflight retryable instead of tripping the second-pass
+		 * fail-closed exit on an unproven wider shape. */
+		if ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0 && !same_ref_dual
+			&& !cancel_same_ref_dual
+			&& (tag_slot->membership_count != 1 || tag_slot->head_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->tail_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->active_writer_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->active_holder_head_index != PCM_X_INVALID_SLOT_INDEX
+				|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable))) {
+			result = PCM_X_QUEUE_NOT_READY;
+			goto candidate_done;
+		}
 		if (tag_slot->ref.handle.ticket_id == request->retire_through_ticket_id)
 			*contains_watermark_out = true;
 		if (tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id) {
@@ -19604,6 +19669,31 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 	tag_slot->holder_terminal_drain_generation = 0;
 	(void)pcm_x_slot_flags_fetch_and(&tag_slot->slot, ~PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
+	/* An independent dual terminal retires its writer lane first while the
+	 * holder lane keeps the writer round's REVOKE_BARRIER standing (the
+	 * writer detach skips its final-member round close to preserve the
+	 * holder evidence).  Once the holder lane is consumed too and the tag is
+	 * otherwise empty, close the frozen round exactly like
+	 * pcm_x_local_empty_frozen_round_apply_locked would with no successor:
+	 * advance the round and drop the barrier.  All guards are read-only and
+	 * the mutation is infallible, so no retryable result can strand the
+	 * already-consumed holder lane. */
+	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0
+		&& (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
+		&& tag_slot->closed_round_member_count == 0 && tag_slot->membership_count == 0
+		&& tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->tail_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->active_holder_head_index == PCM_X_INVALID_SLOT_INDEX
+		&& pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+		&& pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable) && tag_slot->local_round != 0
+		&& tag_slot->local_round != UINT32_MAX) {
+		tag_slot->local_round++;
+		pg_write_barrier();
+		(void)pcm_x_slot_flags_fetch_and(&tag_slot->slot, ~PCM_X_LOCAL_TAG_F_REVOKE_BARRIER);
+		flags = pcm_x_slot_flags_read(&tag_slot->slot);
+	}
 	detach_tag
 		= tag_slot->membership_count == 0 && tag_slot->closed_round_member_count == 0
 		  && tag_slot->active_holder_head_index == PCM_X_INVALID_SLOT_INDEX

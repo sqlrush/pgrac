@@ -2059,6 +2059,13 @@ test_slot_flags(PcmXSlotHeader *slot)
 	return pg_atomic_read_u32(&slot->state_flags) >> PCM_X_SLOT_FLAGS_SHIFT;
 }
 
+/* Direct poke for protocol-impossible flag shapes (CORRUPT-arm probes). */
+static void
+test_clear_slot_flags(PcmXSlotHeader *slot, uint32 flags_to_clear)
+{
+	pg_atomic_fetch_and_u32(&slot->state_flags, ~(flags_to_clear << PCM_X_SLOT_FLAGS_SHIFT));
+}
+
 static PcmXSlotHeader *
 reserve_slot(PcmXAllocatorKind kind, PcmXSlotRef *ref)
 {
@@ -10394,6 +10401,330 @@ UT_TEST(test_local_cross_lane_retire_exemption_requires_distinct_ticket)
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
+typedef struct TestLocalIndependentDualTerminal {
+	PcmXLocalHandle writer;
+	PcmXTicketRef writer_ref;
+	PcmXTicketRef holder_ref;
+	PcmXLocalTagSlot *tag_slot;
+	uint64 master_session;
+} TestLocalIndependentDualTerminal;
+
+/*
+ * Build the exact t/400 independent dual-terminal shape (dump flags 0x3d)
+ * through production paths only, in the production interleaving:
+ *
+ * Older local writer (writer_ticket): full grant chain (join -> claim ->
+ * revoke-cutoff -> ENQUEUE -> ADMIT -> its own empty PROBE -> PREPARE_GRANT
+ * -> INSTALL_READY -> COMMIT_X -> FINAL_ACK -> FINAL_COMMIT_ACK), with its
+ * writer-lane DRAIN deliberately delayed.
+ *
+ * Newer external cohort (holder_ticket > writer_ticket): REVOKEs this node
+ * as its image source before that delayed DRAIN lands (empty PROBE ->
+ * blocker ACK -> REVOKE apply publishes holder_ref -> IMAGE_READY).  Both
+ * lanes then DRAIN, leaving TERMINAL_READY|DRAINED on the writer lane and
+ * HOLDER_TERMINAL_READY|DRAINED on the holder lane under one REVOKE_BARRIER
+ * with two DISTINCT master tickets -- the 2026-07-19 t/400 first-fuse shape.
+ */
+static void
+prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session,
+										uint64 writer_ticket, uint64 holder_ticket,
+										TestLocalIndependentDualTerminal *fixture)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalWriterClaim writer_claim;
+	PcmXLocalCutoff writer_cutoff;
+	PcmXLocalHolderHandle holder_copy;
+	PcmXLocalHolderSnapshot holder_snapshot;
+	PcmXLocalBlockerSnapshot blocker_snapshot;
+	PcmXWaitIdentity writer_identity;
+	PcmXAdmitAckPayload admit_ack;
+	PcmXEnqueuePayload enqueue;
+	PcmXPhasePayload admit_confirm;
+	PcmXGrantPayload prepare;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXLocalReliableToken token;
+	PcmXTicketRef probe_ref;
+	PcmXRevokePayload revoke;
+	PcmXGrantPayload ready;
+	PcmXGrantPayload replay;
+	PcmXDrainPollPayload poll;
+	uint32 flags;
+
+	UT_ASSERT_NOT_NULL(fixture);
+	memset(fixture, 0, sizeof(*fixture));
+	fixture->master_session = master_session;
+	init_active_pcm_x(UINT64_C(78));
+	header = ClusterPcmXConvertShmem;
+	bind_local_master(1, UINT64_C(9), master_session);
+
+	/* Older local writer through the full production grant chain. */
+	writer_identity = make_wait_identity(block, 0, 3, master_session + UINT64_C(4));
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_join_begin(&writer_identity, 1, master_session, &fixture->writer),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(fixture->writer.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&fixture->writer, &writer_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(&fixture->writer, &writer_cutoff),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&fixture->writer, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&admit_ack, 0, sizeof(admit_ack));
+	admit_ack.ref.identity = writer_identity;
+	admit_ack.ref.handle.ticket_id = writer_ticket;
+	admit_ack.ref.handle.queue_generation = UINT64_C(1);
+	admit_ack.prehandle = enqueue.prehandle;
+	admit_ack.result = PCM_X_QUEUE_OK;
+	admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_apply_admit_ack_exact(&fixture->writer, &admit_ack, 1, master_session),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_admit_confirm_arm_exact(&fixture->writer, &admit_confirm, &token),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_admit_confirm_ack_exact(&fixture->writer, &admit_confirm, 1,
+															 master_session),
+				 PCM_X_QUEUE_OK);
+	/* The writer's grant-time PROBE targets only nodes holding S pins; this
+	 * node has none, so no blocker tombstone is planted here (the production
+	 * shape: the later external PROBE must not find a stale locator). */
+	memset(&prepare, 0, sizeof(prepare));
+	prepare.ref = admit_ack.ref;
+	prepare.ref.grant_generation = UINT64_C(2);
+	UT_ASSERT(
+		cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(300), &prepare.image.image_id));
+	prepare.image.source_own_generation = UINT64_C(9);
+	prepare.image.page_scn = UINT64_C(10);
+	prepare.image.page_lsn = UINT64_C(11);
+	prepare.image.source_node = 2;
+	prepare.image.page_checksum = UINT32_C(12);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_prepare_grant_exact(&fixture->writer, &prepare, 1, master_session),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_install_ready_arm_exact(
+					 &fixture->writer, &prepare.ref, &prepare.image, &install_ready, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&commit, 0, sizeof(commit));
+	commit.ref = prepare.ref;
+	commit.phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	UT_ASSERT_EQ(cluster_pcm_x_local_commit_x_exact(&fixture->writer, &commit, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_ack_arm_exact(&fixture->writer, 1, &final_ack, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&final_commit, 0, sizeof(final_commit));
+	final_commit.ref = prepare.ref;
+	final_commit.phase = PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK;
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_commit_ack_exact(&fixture->writer, &final_commit, 1,
+															master_session, &final_confirm, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&writer_claim), PCM_X_QUEUE_OK);
+	fixture->writer_ref = prepare.ref;
+
+	/* The newer external cohort REVOKEs this node as image source before the
+	 * writer-lane DRAIN lands (the production interleaving). */
+	memset(&probe_ref, 0, sizeof(probe_ref));
+	probe_ref.identity = make_wait_identity(block, 3, 23, master_session + UINT64_C(3));
+	probe_ref.handle.ticket_id = holder_ticket;
+	probe_ref.handle.queue_generation = UINT64_C(11);
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(&probe_ref, 1, master_session,
+																 &holder_copy, 1, &holder_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(holder_snapshot.holder_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
+																&holder_snapshot, NULL, 0, NULL, 0,
+																&blocker_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref, blocker_snapshot.set_generation,
+													   1, master_session),
+				 PCM_X_QUEUE_OK);
+	memset(&revoke, 0, sizeof(revoke));
+	revoke.ref = probe_ref;
+	revoke.ref.grant_generation = UINT64_C(2);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(400), &revoke.image_id));
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	memset(&ready, 0, sizeof(ready));
+	ready.ref = revoke.ref;
+	ready.image.image_id = revoke.image_id;
+	ready.image.source_own_generation = UINT64_C(61);
+	ready.image.page_scn = UINT64_C(62);
+	ready.image.page_lsn = UINT64_C(63);
+	ready.image.source_node = 0;
+	ready.image.page_checksum = UINT32_C(64);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_holder_image_ready_arm_exact(&ready, 1, master_session, &replay),
+		PCM_X_QUEUE_OK);
+	fixture->holder_ref = revoke.ref;
+
+	/* Both lanes now DRAIN: the delayed writer leg first, then the holder. */
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = fixture->writer_ref;
+	poll.drain_generation = UINT64_C(7);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = fixture->holder_ref;
+	poll.drain_generation = UINT64_C(7);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+
+	/* Pin the t/400 dump shape: 0x3d, two distinct tickets, one unlinked
+	 * terminal membership, every FIFO index invalid. */
+	fixture->tag_slot = &local_tag_slots(header)[fixture->writer.tag_slot.slot_index];
+	flags = test_slot_flags(&fixture->tag_slot->slot);
+	UT_ASSERT((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, PCM_X_LOCAL_TAG_F_TERMINAL_MASK);
+	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
+				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.ticket_id, writer_ticket);
+	UT_ASSERT_EQ(fixture->tag_slot->ref.grant_generation, UINT64_C(2));
+	UT_ASSERT_EQ(fixture->tag_slot->holder_ref.handle.ticket_id, holder_ticket);
+	UT_ASSERT_EQ(fixture->tag_slot->membership_count, 1);
+	UT_ASSERT_EQ(fixture->tag_slot->head_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(fixture->tag_slot->tail_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(fixture->tag_slot->leader_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(fixture->tag_slot->active_writer_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT(fixture->tag_slot->terminal_drain_generation != 0);
+	UT_ASSERT(fixture->tag_slot->holder_terminal_drain_generation != 0);
+}
+
+/*
+ * RED for the t/400 independent dual-terminal false fuse (2026-07-19): a
+ * fully DRAINED older writer terminal (T) and a fully DRAINED newer holder
+ * terminal (H, distinct master ticket) legally share one tag under the
+ * writer round's REVOKE_BARRIER.  Before the fix the same-ref-dual
+ * classifier coerces the distinct-ticket shape to CORRUPT (the ref-equality
+ * arm of pcm_x_local_same_ref_dual_retire_state), RETIRE_UP_TO(T) blocks the
+ * runtime, and the master's RETIRE leg retries forever -- the 20088-family
+ * first fuse in loop3/loop4b.  After the fix RETIRE_UP_TO(T) must consume
+ * exactly the writer lane (holder lane byte-exact, tag LIVE) and a later
+ * RETIRE_UP_TO(H) must drain the tag to the queue baseline.
+ */
+UT_TEST(test_local_independent_dual_terminal_retires_writer_then_holder)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalProgress progress;
+	PcmXTicketRef holder_ref_before;
+	PcmXImageToken holder_image_before;
+	PcmXReliableLegState holder_reliable_before;
+	PcmXRetirePayload retire;
+	PcmXSlotRef found;
+	uint64 holder_drain_before;
+	uint64 reliable_sequence_before;
+	const uint64 master_session = UINT64_C(1811);
+
+	prepare_local_independent_dual_terminal(7117, master_session, UINT64_C(96001), UINT64_C(96002),
+											&fixture);
+	tag_slot = fixture.tag_slot;
+	holder_ref_before = tag_slot->holder_ref;
+	holder_image_before = tag_slot->holder_image;
+	holder_reliable_before = tag_slot->holder_reliable;
+	holder_drain_before = tag_slot->holder_terminal_drain_generation;
+	reliable_sequence_before = tag_slot->reliable.state_sequence;
+
+	/* RETIRE watermark covers only the older writer ticket. */
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.writer_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.writer_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* Exactly the writer lane was consumed... */
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->ref, &(PcmXTicketRef){ 0 }));
+	UT_ASSERT_EQ(tag_slot->terminal_drain_generation, 0);
+	UT_ASSERT_EQ(tag_slot->committed_own_generation, 0);
+	UT_ASSERT_EQ(tag_slot->membership_count, 0);
+	UT_ASSERT_EQ(tag_slot->reliable.state_sequence, reliable_sequence_before);
+	UT_ASSERT_EQ(cluster_pcm_x_local_progress_exact(&fixture.writer, &progress),
+				 PCM_X_QUEUE_NOT_FOUND);
+
+	/* ...while the holder lane, its master binding and the barrier survive
+	 * byte-exact on the still-LIVE tag. */
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
+				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &holder_ref_before));
+	UT_ASSERT(memcmp(&tag_slot->holder_image, &holder_image_before, sizeof(holder_image_before))
+			  == 0);
+	UT_ASSERT(
+		memcmp(&tag_slot->holder_reliable, &holder_reliable_before, sizeof(holder_reliable_before))
+		== 0);
+	UT_ASSERT_EQ(tag_slot->holder_terminal_drain_generation, holder_drain_before);
+	UT_ASSERT_EQ(tag_slot->master_node, 1);
+	UT_ASSERT_EQ(tag_slot->master_session_incarnation, master_session);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_TAG, &fixture.writer_ref.identity.tag, &found),
+		PCM_X_DIRECTORY_OK);
+
+	/* The later watermark drains the holder lane and the tag to baseline. */
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_TAG, &fixture.writer_ref.identity.tag, &found),
+		PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
+/*
+ * Defense probes for the independent dual-terminal classification: it must
+ * stay strictly distinct-ticket.  A ticket-id collision under a different
+ * ref, a half-drained writer mask and a poisoned holder drain leg are all
+ * protocol-impossible shapes and must keep the CORRUPT fail-closed verdict
+ * (direct slot pokes, like the CORRUPT arms elsewhere in this file).
+ */
+UT_TEST(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1813);
+
+	/* Ticket-id collision under a distinct holder ref. */
+	prepare_local_independent_dual_terminal(7118, master_session, UINT64_C(96001), UINT64_C(96002),
+											&fixture);
+	tag_slot = fixture.tag_slot;
+	tag_slot->holder_ref.handle.ticket_id = fixture.writer_ref.handle.ticket_id;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.writer_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.writer_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+
+	/* Half-drained writer mask: READY without DRAINED is not independent. */
+	prepare_local_independent_dual_terminal(7118, master_session, UINT64_C(96001), UINT64_C(96002),
+											&fixture);
+	tag_slot = fixture.tag_slot;
+	test_clear_slot_flags(&tag_slot->slot, PCM_X_LOCAL_TAG_F_TERMINAL_DRAINED);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+
+	/* Poisoned holder drain leg: a response tombstone is never clean. */
+	prepare_local_independent_dual_terminal(7118, master_session, UINT64_C(96001), UINT64_C(96002),
+											&fixture);
+	tag_slot = fixture.tag_slot;
+	tag_slot->holder_reliable.response_tombstone_mask = UINT32_C(1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
 typedef struct TestLocalRebaseFixture {
 	PcmXLocalHandle writer;
 	PcmXLocalWriterClaim writer_claim;
@@ -15173,7 +15504,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(258);
+	UT_PLAN(260);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -15350,6 +15681,8 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_independent_dual_terminal_retires_writer_then_holder);
+	UT_RUN(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed);
 	UT_RUN(test_local_grant_rebase_publish_is_one_shot_and_effective);
 	UT_RUN(test_local_grant_rebase_conflict_fails_closed);
 	UT_RUN(test_local_follower_claim_inherits_published_rebase);
