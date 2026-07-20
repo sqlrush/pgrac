@@ -1203,6 +1203,14 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 												   "cluster_bufmgr_pcm_current_image_locked",
 												   "BM_IO_IN_PROGRESS",
 												   "PageGetLSN",
+												   "UnlockBufHdr",
+												   "FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL)",
+												   "LockBufHdr",
+												   "cluster_pcm_own_gen_get",
+												   "cluster_bufmgr_pcm_current_image_locked",
+												   "BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+												   "result = CLUSTER_PCM_OWN_BUSY",
+												   "PageGetLSN",
 												   "cluster_pcm_own_revoke_retain_commit_exact",
 												   "buf->pcm_state = (uint8) PCM_STATE_N",
 												   "buf->buffer_type = (uint8) BUF_TYPE_PI",
@@ -1384,9 +1392,22 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	if (dirty != NULL)
 		UT_ASSERT(strstr(dirty, "cluster_bufmgr_pcm_x_retained_image_locked")
 				  < strstr(dirty, "buf_state |= BM_DIRTY"));
-	if (hint != NULL)
-		UT_ASSERT(strstr(hint, "cluster_bufmgr_pcm_x_retained_image_locked")
-				  < strstr(hint, "BM_DIRTY | BM_JUST_DIRTIED"));
+	if (hint != NULL) {
+		const char *tracked = strstr(hint, "cluster_bufmgr_should_pcm_track(bufHdr)");
+		const char *current = strstr(hint, "cluster_bufmgr_pcm_current_image_locked");
+		const char *refuse = current != NULL ? strstr(current, "return;") : NULL;
+		const char *dirty_flags = strstr(hint, "BM_DIRTY | BM_JUST_DIRTIED");
+
+		/* Hint dirt is optional.  A kept pinned N/PI mirror may have its
+		 * in-memory hint byte touched, but without live S/X current authority it
+		 * must not regain writeback eligibility and block a later storage refresh. */
+		UT_ASSERT_NOT_NULL(tracked);
+		UT_ASSERT_NOT_NULL(current);
+		UT_ASSERT_NOT_NULL(refuse);
+		UT_ASSERT_NOT_NULL(dirty_flags);
+		if (tracked != NULL && current != NULL && refuse != NULL && dirty_flags != NULL)
+			UT_ASSERT(tracked < current && current < refuse && refuse < dirty_flags);
+	}
 	if (lockbuffer != NULL) {
 		const char *reserve
 			= strstr(lockbuffer, "cluster_bufmgr_pcm_begin_grant_reservation_wait(");
@@ -1816,9 +1837,11 @@ UT_TEST(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership)
 			"LWLockAcquire(content_lock, LW_EXCLUSIVE)",
 			"cluster_pcm_own_snapshot_matches_locked",
 			"PageGetLSN",
-			"XLogFlush",
+			"FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL)",
 			"LockBufHdr",
 			"cluster_pcm_own_snapshot_matches_locked",
+			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+			"result = CLUSTER_PCM_OWN_BUSY",
 			"cluster_pcm_own_bump_locked",
 			"buf->pcm_state = (uint8) PCM_STATE_N",
 			"buf->buffer_type = (uint8) BUF_TYPE_PI",
@@ -1864,23 +1887,25 @@ UT_TEST(test_queue_passive_n_mirror_is_never_gcs_ship_authority)
 	static const char *const probe_contract[]
 		= { "LockBufHdr", "cluster_bufmgr_pcm_current_image_locked", "UnlockBufHdr" };
 	static const char *const copy_contract[] = { "LockBufHdr",
+											 "cluster_bufmgr_pcm_current_image_locked",
+											 "cluster_bufmgr_pin_for_gcs_locked",
+											 "LWLockConditionalAcquire(content_lock, LW_SHARED)",
+											 "cluster_bufmgr_pcm_current_image_locked",
+											 "FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL)",
+											 "BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+											 "memcpy(dst, page, BLCKSZ)" };
+	static const char *const live_sge_contract[] = { "LockBufHdr",
 												 "cluster_bufmgr_pcm_current_image_locked",
 												 "cluster_bufmgr_pin_for_gcs_locked",
-												 "LWLockAcquire(content_lock, LW_SHARED)",
+												 "LWLockConditionalAcquire(content_lock, LW_SHARED)",
 												 "cluster_bufmgr_pcm_current_image_locked",
-												 "memcpy(dst, page, BLCKSZ)" };
-	static const char *const live_sge_contract[] = { "LockBufHdr",
-													 "cluster_bufmgr_pcm_current_image_locked",
-													 "cluster_bufmgr_pin_for_gcs_locked",
-													 "LWLockAcquire(content_lock, LW_SHARED)",
-													 "cluster_bufmgr_pcm_current_image_locked",
-													 "*out_page_addr = page" };
+												 "*out_page_addr = page" };
 	static const char *const smart_contract[] = { "LockBufHdr",
-												  "cluster_bufmgr_pcm_current_image_locked",
-												  "cluster_bufmgr_pin_for_gcs_locked",
-												  "LWLockAcquire(content_lock, LW_SHARED)",
-												  "cluster_bufmgr_pcm_current_image_locked",
-												  "memcpy(dst, page, BLCKSZ)" };
+											  "cluster_bufmgr_pcm_current_image_locked",
+											  "cluster_bufmgr_pin_for_gcs_locked",
+											  "LWLockConditionalAcquire(content_lock, LW_SHARED)",
+											  "cluster_bufmgr_pcm_current_image_locked",
+											  "memcpy(dst, page, BLCKSZ)" };
 	char *source = read_bufmgr_source();
 
 	assert_ordered_in_function(source, "\ncluster_bufmgr_probe_block_for_gcs(",

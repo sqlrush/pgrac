@@ -1200,6 +1200,68 @@ UT_TEST(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop)
 }
 
 
+/* P0-20: a post-handoff COMMIT_X ticket can remain freshly armed while the
+ * production LMON path silently exits before retry mutation.  Every
+ * pre-mutation boundary must therefore leave one bounded, stage-specific
+ * breadcrumb; otherwise t/400 cannot distinguish formation rejection from a
+ * missed work scan or a drive precheck refusal. */
+UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
+{
+	char *source = read_gcs_block_source();
+	const char *formation;
+	const char *formation_end;
+	const char *retry_tick;
+	const char *retry_tick_end;
+	const char *drive;
+	const char *drive_end;
+	const char *transfer;
+	const char *transfer_end;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source != NULL) {
+		formation = strstr(source, "\ncluster_gcs_block_pcm_x_formation_tick(");
+		formation_end = formation != NULL ? strstr(formation, "\nfail_closed:") : NULL;
+		UT_ASSERT_NOT_NULL(formation);
+		UT_ASSERT_NOT_NULL(formation_end);
+		if (formation != NULL && formation_end != NULL) {
+			UT_ASSERT_NOT_NULL(strstr(formation, "\"collect-before\""));
+			UT_ASSERT_NOT_NULL(strstr(formation, "\"collect-after\""));
+			UT_ASSERT_NOT_NULL(strstr(formation, "\"stability\""));
+			UT_ASSERT_NOT_NULL(strstr(formation, "\"peer-revalidate\""));
+			UT_ASSERT_NOT_NULL(strstr(formation, "\"runtime-resample\""));
+		}
+
+		retry_tick = strstr(source, "\ngcs_block_pcm_x_master_drive_retry_tick(");
+		retry_tick_end = retry_tick != NULL ? strstr(retry_tick, "\n}\n") : NULL;
+		UT_ASSERT_NOT_NULL(retry_tick);
+		UT_ASSERT_NOT_NULL(retry_tick_end);
+		if (retry_tick != NULL && retry_tick_end != NULL) {
+			UT_ASSERT_NOT_NULL(strstr(retry_tick, "\"work-next\""));
+			UT_ASSERT_NOT_NULL(strstr(retry_tick, "cursor_before"));
+		}
+		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_stats_snapshot(&stats)"));
+		UT_ASSERT_NOT_NULL(strstr(source, "stats.live_tickets == 0"));
+
+		drive = strstr(source, "\ngcs_block_pcm_x_master_drive_tag(");
+		drive_end = drive != NULL ? strstr(drive, "\n}\n") : NULL;
+		UT_ASSERT_NOT_NULL(drive);
+		UT_ASSERT_NOT_NULL(drive_end);
+		if (drive != NULL && drive_end != NULL) {
+			UT_ASSERT_NOT_NULL(strstr(drive, "\"drive-precheck-"));
+		}
+
+		transfer = strstr(source, "\ngcs_block_pcm_x_master_drive_transfer(");
+		transfer_end = transfer != NULL ? strstr(transfer, "\n}\n") : NULL;
+		UT_ASSERT_NOT_NULL(transfer);
+		UT_ASSERT_NOT_NULL(transfer_end);
+		if (transfer != NULL && transfer_end != NULL) {
+			UT_ASSERT_NOT_NULL(strstr(transfer, "\"commit-retry\""));
+		}
+		free(source);
+	}
+}
+
+
 /* review R2 P0-1: a SELF-loopback V2 INSTALL_READY (master == requester
  * node) has no HELLO capability record; the handler must treat self as
  * rebase-capable (the local binary) while still requiring the
@@ -3666,15 +3728,31 @@ UT_TEST(test_revoke_handler_silent_refusal_arms_all_note)
 {
 	char *source = read_gcs_block_source();
 	const char *handler = strstr(source, "\ncluster_gcs_handle_pcm_x_revoke_envelope(");
+	const char *materialize = strstr(source, "\ngcs_block_pcm_x_materialize_reserved_work(");
+	const char *publish;
+	const char *reset;
 
 	/* The master re-sends REVOKE forever, so every refusal arm in the source
 	 * handler must name itself through the log-once streak note (t/400 form-B
 	 * wedges previously refused silently at un-instrumented arms): ingress
 	 * auth, holder-ledger stale, holder-progress error, image reserve, apply,
-	 * ingress snapshot, plus the progress reset. */
+	 * and ingress snapshot.  Merely accepting/re-arming work is not progress;
+	 * the streak resets only after exact READY publication. */
 	UT_ASSERT_NOT_NULL(handler);
 	if (handler != NULL)
-		UT_ASSERT(count_occurrences(handler, "gcs_block_pcm_x_revoke_refusal_note(") >= 7);
+		UT_ASSERT(count_occurrences(handler, "gcs_block_pcm_x_revoke_refusal_note(") >= 6);
+	UT_ASSERT_NOT_NULL(materialize);
+	if (materialize != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(materialize, "\"materialize-copy\""));
+		UT_ASSERT_NOT_NULL(strstr(materialize, "\"materialize-finish\""));
+	}
+	publish = materialize != NULL
+			  ? strstr(materialize, "cluster_gcs_block_dedup_pcm_x_publish_ready_exact(")
+			  : NULL;
+	reset = publish != NULL ? strstr(publish, "gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL)")
+							: NULL;
+	UT_ASSERT_NOT_NULL(publish);
+	UT_ASSERT_NOT_NULL(reset);
 	free(source);
 }
 
@@ -3682,7 +3760,7 @@ UT_TEST(test_revoke_handler_silent_refusal_arms_all_note)
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(83);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3721,6 +3799,7 @@ main(void)
 	UT_RUN(test_pcm_x_blocker_ack_carries_full_generation_and_binds_master_source);
 	UT_RUN(test_pcm_x_formation_identical_complete_samples_may_revalidate);
 	UT_RUN(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop);
+	UT_RUN(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage);
 	UT_RUN(test_pcm_x_install_ready_v2_self_loopback_is_admissible);
 	UT_RUN(test_pcm_x_formation_samples_capability_family_atomically);
 	UT_RUN(test_pcm_x_confirm_publish_then_stale_requires_exact_graph_close);

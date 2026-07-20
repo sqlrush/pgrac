@@ -9486,6 +9486,10 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 
 static void gcs_block_pcm_x_master_drive_retry_tick(void);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
+static void gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result,
+											 int32 peer_node, Size cursor_before,
+											 Size cursor_after, const BufferTag *tag,
+											 uint64 cluster_epoch);
 static PcmXQueueResult
 gcs_block_pcm_x_cancel_claimed_probe_exact(const PcmXMasterPendingXReleaseToken *token);
 
@@ -9518,14 +9522,23 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 		 * including an unrelated membership flip, is a no-op for this tick.
 		 */
 		if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before,
-											   NULL))
+											   NULL)) {
+			gcs_block_pcm_x_master_retry_observe("collect-before", PCM_X_QUEUE_NOT_READY, -1, 0,
+											  0, NULL, 0);
 			return;
+		}
 		if (!gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after, &self_session_after,
-											   NULL))
+											   NULL)) {
+			gcs_block_pcm_x_master_retry_observe("collect-after", PCM_X_QUEUE_NOT_READY, -1, 0,
+											  0, NULL, 0);
 			return;
+		}
 		if (!cluster_gcs_pcm_x_formation_samples_stable(true, bindings_before, true, bindings_after)
-			|| epoch_before != epoch_after || self_session_before != self_session_after)
+			|| epoch_before != epoch_after || self_session_before != self_session_after) {
+			gcs_block_pcm_x_master_retry_observe("stability", PCM_X_QUEUE_NOT_READY, -1, 0, 0,
+											  NULL, epoch_before);
 			return;
+		}
 		for (i = 0; i < PCM_X_PROTOCOL_NODE_LIMIT; i++) {
 			if (bindings_before[i].peer_session_incarnation == 0)
 				continue;
@@ -9533,14 +9546,20 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 				i, bindings_before[i].cluster_epoch, bindings_before[i].peer_session_incarnation);
 			if (result == PCM_X_QUEUE_STALE || result == PCM_X_QUEUE_CORRUPT)
 				goto fail_closed;
-			if (result != PCM_X_QUEUE_OK)
+			if (result != PCM_X_QUEUE_OK) {
+				gcs_block_pcm_x_master_retry_observe("peer-revalidate", result, i, 0, 0, NULL,
+												  epoch_before);
 				return;
+			}
 		}
 		runtime_after = cluster_pcm_x_runtime_snapshot();
 		if (runtime_after.state != PCM_X_RUNTIME_ACTIVE
 			|| runtime_after.gate_generation != runtime.gate_generation
-			|| runtime_after.master_session_incarnation != runtime.master_session_incarnation)
+			|| runtime_after.master_session_incarnation != runtime.master_session_incarnation) {
+			gcs_block_pcm_x_master_retry_observe("runtime-resample", PCM_X_QUEUE_NOT_READY, -1,
+											  0, 0, NULL, epoch_before);
 			return;
+		}
 		gcs_block_pcm_x_master_drive_retry_tick();
 		gcs_block_pcm_x_terminal_retry_tick();
 		return;
@@ -9560,7 +9579,8 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	return;
 
 fail_closed:
-	(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
+									   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 }
 
 
@@ -9658,7 +9678,7 @@ gcs_block_pcm_x_master_drive_fail_closed(PcmXQueueResult result)
 		|| result == PCM_X_QUEUE_BAD_STATE || result == PCM_X_QUEUE_INVALID
 		|| result == PCM_X_QUEUE_NO_CAPACITY)
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 }
 
 
@@ -9892,8 +9912,13 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 	if (snapshot->pending_opcode == PGRAC_IC_MSG_PCM_X_COMMIT_X) {
 		now_ms = (uint64)(GetCurrentTimestamp() / 1000);
 		retry_delay_ms = (uint64)Max(cluster_lmon_main_loop_interval, 1);
-		return cluster_pcm_x_master_commit_retry_drive(
+		result = cluster_pcm_x_master_commit_retry_drive(
 			snapshot, now_ms, retry_delay_ms, gcs_block_pcm_x_stage_frame_callback, NULL, &retried);
+		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
+			gcs_block_pcm_x_master_retry_observe("commit-retry", result, -1, 0, 0,
+											  &snapshot->ref.identity.tag,
+											  snapshot->ref.identity.cluster_epoch);
+		return result;
 	}
 	if (!cluster_gcs_pcm_x_transfer_pre_handoff_phase(snapshot->pending_opcode))
 		return PCM_X_QUEUE_NOT_READY;
@@ -10132,6 +10157,49 @@ gcs_block_pcm_x_master_drive_note(const char *stage, PcmXQueueResult result, uin
 }
 
 
+/* One breadcrumb per stable pre-mutation refusal shape.  A healthy idle LMON
+ * may observe NOT_FOUND forever, so the first observation logs and identical
+ * repeats stay silent until the exit shape changes. */
+static void
+gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result, int32 peer_node,
+									Size cursor_before, Size cursor_after, const BufferTag *tag,
+									uint64 cluster_epoch)
+{
+	static const char *last_stage = NULL;
+	static PcmXQueueResult last_result = PCM_X_QUEUE_OK;
+	static int32 last_peer_node = -1;
+	PcmXStatsSnapshot stats;
+	bool same;
+
+	if (stage == NULL || result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+		last_stage = NULL;
+		return;
+	}
+	if (!cluster_pcm_x_stats_snapshot(&stats) || stats.live_tickets == 0) {
+		last_stage = NULL;
+		return;
+	}
+	same = stage == last_stage && result == last_result && peer_node == last_peer_node;
+	if (same)
+		return;
+	last_stage = stage;
+	last_result = result;
+	last_peer_node = peer_node;
+	if (tag != NULL)
+		ereport(LOG,
+				(errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
+						"cursor %zu->%zu, epoch %llu, rel %u, block %u)",
+						stage, (int)result, peer_node, cursor_before, cursor_after,
+						(unsigned long long)cluster_epoch, tag->relNumber, tag->blockNum)));
+	else
+		ereport(LOG,
+				(errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
+						"cursor %zu->%zu, epoch %llu)",
+						stage, (int)result, peer_node, cursor_before, cursor_after,
+						(unsigned long long)cluster_epoch)));
+}
+
+
 static void
 gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 {
@@ -10140,12 +10208,41 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 	PcmXQueueResult result;
 	const char *drive_stage;
 
-	if (tag == NULL || cluster_epoch != cluster_epoch_get_current() || cluster_node_id < 0
-		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
-		|| cluster_gcs_lookup_master(*tag) != cluster_node_id
-		|| cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING
-		|| !cluster_qvotec_in_quorum() || !cluster_membership_is_member(cluster_node_id))
+	if (tag == NULL) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-tag", PCM_X_QUEUE_INVALID, -1, 0, 0,
+											  NULL, cluster_epoch);
 		return;
+	}
+	if (cluster_epoch != cluster_epoch_get_current()) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-epoch", PCM_X_QUEUE_STALE, -1, 0,
+											  0, tag, cluster_epoch);
+		return;
+	}
+	if (cluster_node_id < 0 || cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-node", PCM_X_QUEUE_INVALID,
+											  cluster_node_id, 0, 0, tag, cluster_epoch);
+		return;
+	}
+	if (cluster_gcs_lookup_master(*tag) != cluster_node_id) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-master", PCM_X_QUEUE_STALE,
+											  cluster_node_id, 0, 0, tag, cluster_epoch);
+		return;
+	}
+	if (cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-recovering", PCM_X_QUEUE_NOT_READY,
+											  -1, 0, 0, tag, cluster_epoch);
+		return;
+	}
+	if (!cluster_qvotec_in_quorum()) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-quorum", PCM_X_QUEUE_NOT_READY, -1,
+											  0, 0, tag, cluster_epoch);
+		return;
+	}
+	if (!cluster_membership_is_member(cluster_node_id)) {
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-member", PCM_X_QUEUE_NOT_READY,
+											  cluster_node_id, 0, 0, tag, cluster_epoch);
+		return;
+	}
 	result = cluster_pcm_x_master_promote_head_exact(tag, cluster_epoch, &active);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_BUSY) {
@@ -10653,11 +10750,11 @@ cluster_gcs_handle_pcm_x_blocker_set_commit_envelope(const ClusterICEnvelope *en
 	if (result == PCM_X_QUEUE_DUPLICATE && snapshot.graph_generation != 0)
 		goto complete_blocker_probe;
 	result = cluster_pcm_x_master_blocker_snapshot_revalidate_exact(&snapshot, entries,
-																	commit->nblockers);
+													commit->nblockers);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK) {
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		goto blocker_commit_done;
 	}
 	for (i = 0; i < commit->nblockers; i++)
@@ -10669,7 +10766,7 @@ cluster_gcs_handle_pcm_x_blocker_set_commit_envelope(const ClusterICEnvelope *en
 	if (graph_generation == 0) {
 		cluster_lmd_pcm_convert_wfg_note_replace_fail();
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		goto blocker_commit_done;
 	}
 	cluster_lmd_pcm_convert_wfg_note_replace();
@@ -10681,7 +10778,7 @@ cluster_gcs_handle_pcm_x_blocker_set_commit_envelope(const ClusterICEnvelope *en
 		 * could delete a concurrently newer graph generation; retain evidence
 		 * and close the runtime for recovery instead. */
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		goto blocker_commit_done;
 	}
 
@@ -10694,7 +10791,7 @@ complete_blocker_probe:
 	if (!cluster_gcs_pcm_x_blocker_ack_build(&commit->ref, commit->set_generation, &ack)) {
 		Assert(false);
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		goto blocker_commit_done;
 	}
 	if (!cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK, source_node, &ack,
@@ -10713,7 +10810,7 @@ complete_blocker_probe:
 		 * classifier keeps BAD_STATE/STALE/NOT_READY/BUSY benign in that replay
 		 * case while structural CORRUPT still halts the runtime. */
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		goto blocker_commit_done;
 	}
 	gcs_block_pcm_x_master_drive_tag(&commit->ref.identity.tag, commit->ref.identity.cluster_epoch);
@@ -11529,6 +11626,8 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 	}
 
 	if (!source_is_n && !cluster_bufmgr_copy_block_for_gcs(work->tag, &page_lsn, block_data)) {
+		gcs_block_pcm_x_revoke_refusal_note("materialize-copy", (int)CLUSTER_PCM_OWN_BUSY,
+											  &revoking);
 		gcs_block_pcm_x_abort_image_before_finish(worker_id, work, &work->binding, buf, &revoking,
 												  true);
 		return;
@@ -11587,6 +11686,8 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 			= cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &revoking, page_lsn, &retained);
 		gcs_block_pcm_x_note_own_result(own_result);
 		if (own_result != CLUSTER_PCM_OWN_OK) {
+			gcs_block_pcm_x_revoke_refusal_note("materialize-finish", (int)own_result,
+											  &revoking);
 			gcs_block_pcm_x_abort_image_before_finish(worker_id, work, &ready_binding, buf,
 													  &revoking, true);
 			return;
@@ -11626,6 +11727,7 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 
 		ready_work.binding = ready_binding;
 		ready_work.entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE;
+		gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL);
 		gcs_block_pcm_x_stage_ready_work(worker_id, &ready_work);
 	}
 }
@@ -11851,7 +11953,8 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 	result = cluster_pcm_x_local_holder_revoke_apply_exact(revoke, source_node, source_session);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
-		gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL);
+		/* Ingress only installs/re-arms holder work.  It does not prove the
+		 * materializer advanced, so only a READY image resets the refusal streak. */
 		gcs_block_pcm_x_wake_registered_holders(&revoke->ref.identity.tag);
 	} else {
 		gcs_block_pcm_x_revoke_refusal_note("apply", (int)result, NULL);
@@ -12051,13 +12154,13 @@ cluster_gcs_handle_pcm_x_final_ack_envelope(const ClusterICEnvelope *env, const 
 	if (!cluster_pcm_lock_authority_snapshot(final_ack->ref.identity.tag, &authority)
 		|| !cluster_gcs_pcm_x_grd_handoff_token_build(&token, &authority, &handoff)) {
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		return;
 	}
 	handoff_result = cluster_pcm_lock_queue_handoff_x_exact(&handoff);
 	if (handoff_result != PCM_X_GRD_HANDOFF_OK && handoff_result != PCM_X_GRD_HANDOFF_DUPLICATE) {
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		return;
 	}
 	result = cluster_pcm_x_master_final_ack_finalize_exact(&token, &final_commit);
@@ -12066,7 +12169,7 @@ cluster_gcs_handle_pcm_x_final_ack_envelope(const ClusterICEnvelope *env, const 
 		/* GRD already committed; retaining the engine/image evidence and
 		 * closing the runtime is the only 8.A-safe outcome. */
 		(void)cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
-											   PCM_X_RUNTIME_RECOVERY_BLOCKED);
+										   PCM_X_RUNTIME_RECOVERY_BLOCKED);
 		return;
 	}
 	(void)cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK,
@@ -12683,12 +12786,18 @@ gcs_block_pcm_x_master_drive_retry_tick(void)
 {
 	static Size cursor = 0;
 	BufferTag tag;
+	PcmXQueueResult result;
+	Size cursor_before;
 	uint64 cluster_epoch;
 
-	if (cluster_pcm_x_master_drive_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &tag,
-											 &cluster_epoch)
-		== PCM_X_QUEUE_OK)
+	cursor_before = cursor;
+	result = cluster_pcm_x_master_drive_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &tag,
+											  &cluster_epoch);
+	if (result == PCM_X_QUEUE_OK)
 		gcs_block_pcm_x_master_drive_tag(&tag, cluster_epoch);
+	else
+		gcs_block_pcm_x_master_retry_observe("work-next", result, -1, cursor_before, cursor, NULL,
+											  cluster_epoch);
 }
 
 
