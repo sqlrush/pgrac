@@ -9776,11 +9776,23 @@ gcs_block_pcm_x_stage_queue_invalidations(const PcmXMasterDriveSnapshot *snapsho
 }
 
 
+static bool
+gcs_block_pcm_x_stage_frame_callback(uint8 msg_type, int32 dest_node_id, const void *payload,
+									 Size payload_len, void *callback_arg)
+{
+	(void)callback_arg;
+	return cluster_gcs_pcm_x_stage_frame(msg_type, dest_node_id, payload, payload_len);
+}
+
+
 static PcmXQueueResult
 gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 {
+	PcmXMasterDriveSnapshot retried;
 	PcmXRevokePayload revoke;
 	PcmXQueueResult result;
+	uint64 now_ms;
+	uint64 retry_delay_ms;
 	uint64 source_session = 0;
 	uint32 source_bit;
 	uint32 unacked;
@@ -9788,6 +9800,12 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 
 	if (snapshot == NULL || snapshot->ticket_state != PCM_XT_ACTIVE_TRANSFER)
 		return PCM_X_QUEUE_INVALID;
+	if (snapshot->pending_opcode == PGRAC_IC_MSG_PCM_X_COMMIT_X) {
+		now_ms = (uint64)(GetCurrentTimestamp() / 1000);
+		retry_delay_ms = (uint64)Max(cluster_lmon_main_loop_interval, 1);
+		return cluster_pcm_x_master_commit_retry_drive(
+			snapshot, now_ms, retry_delay_ms, gcs_block_pcm_x_stage_frame_callback, NULL, &retried);
+	}
 	if (!cluster_gcs_pcm_x_transfer_pre_handoff_phase(snapshot->pending_opcode))
 		return PCM_X_QUEUE_NOT_READY;
 	if (!cluster_pcm_lock_queue_pending_x_exact(snapshot->ref.identity.tag,

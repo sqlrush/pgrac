@@ -6432,6 +6432,209 @@ drive_master_ticket_to_prepared(PcmXMasterAdmission *admission, uint64 source_se
 	*image_id_out = revoke.image_id;
 }
 
+typedef struct CommitRetryStageCapture {
+	int calls;
+	bool accept;
+	uint8 msg_type;
+	int32 dest_node_id;
+	Size payload_len;
+	PcmXPhasePayload payload;
+} CommitRetryStageCapture;
+
+static bool
+capture_commit_retry_stage(uint8 msg_type, int32 dest_node_id, const void *payload,
+						   Size payload_len, void *callback_arg)
+{
+	CommitRetryStageCapture *capture = (CommitRetryStageCapture *)callback_arg;
+
+	capture->calls++;
+	capture->msg_type = msg_type;
+	capture->dest_node_id = dest_node_id;
+	capture->payload_len = payload_len;
+	memset(&capture->payload, 0, sizeof(capture->payload));
+	if (payload != NULL && payload_len == sizeof(capture->payload))
+		memcpy(&capture->payload, payload, sizeof(capture->payload));
+	return capture->accept;
+}
+
+/*
+ * P0-14: the master has crossed the handoff boundary and durably armed type
+ * 53, but the first COMMIT_X frame is dropped.  The real bounded master-work
+ * scan must still select the ACTIVE_TRANSFER ticket; an exact deadline retry
+ * then reconstructs the same logical leg without minting a ticket or moving
+ * authority.  FINAL_ACK remains the only exact successor that consumes it.
+ */
+UT_TEST(test_master_periodic_drive_replays_post_handoff_commit_x_exactly)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterDriveSnapshot armed;
+	PcmXMasterDriveSnapshot retried;
+	PcmXMasterDriveSnapshot retried_again;
+	PcmXMasterDriveSnapshot stale;
+	PcmXMasterTicketSlot before_blocked;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTicketRef transfer;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload first_commit;
+	PcmXPhasePayload retry_commit;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXFinalAckPayload final_ack;
+	PcmXMasterFinalAckToken final_ack_token;
+	PcmXQueueResult result;
+	CommitRetryStageCapture stage;
+	BufferTag drive_tag;
+	Size cursor;
+	uint64 drive_epoch;
+	uint64 image_id;
+	const uint64 requester_session = UINT64_C(7384);
+	const uint64 source_session = UINT64_C(8384);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	admit_active_probe_with_base(813, 0, 23, UINT64_C(8384), requester_session, 1, UINT64_C(5),
+								 &admission);
+	drive_master_ticket_to_prepared(&admission, source_session, UINT64_C(9384), &transfer,
+									&image_id);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+
+	memset(&install_ready, 0, sizeof(install_ready));
+	install_ready.ref = transfer;
+	install_ready.image_id = image_id;
+	install_ready.result = PCM_X_QUEUE_OK;
+	install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+	UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, 0, 0, requester_session,
+														  &first_commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(first_commit.phase, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT(ticket_refs_equal(&first_commit.ref, &transfer));
+	UT_ASSERT_EQ(ticket->reliable.pending_opcode, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 0);
+	UT_ASSERT_EQ(ticket->reliable.retry_deadline_ms, 0);
+
+	/* Drop first_commit: no requester delivery and therefore no FINAL_ACK. */
+	cursor = admission.tag_slot.slot_index;
+	UT_ASSERT_EQ(cluster_pcm_x_master_drive_work_next(&cursor, 1, &drive_tag, &drive_epoch),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(BufferTagsEqual(&drive_tag, &transfer.identity.tag));
+	UT_ASSERT_EQ(drive_epoch, transfer.identity.cluster_epoch);
+	UT_ASSERT_EQ(cluster_pcm_x_master_drive_snapshot_exact(&drive_tag, drive_epoch, &armed),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(armed.ticket_state, PCM_XT_ACTIVE_TRANSFER);
+	UT_ASSERT_EQ(armed.pending_opcode, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT_EQ(armed.expected_responder_session, requester_session);
+
+	memset(&stage, 0, sizeof(stage));
+	stage.accept = true;
+	result = cluster_pcm_x_master_commit_retry_drive(&armed, UINT64_C(1000), UINT64_C(100),
+													 capture_commit_retry_stage, &stage, &retried);
+	UT_ASSERT_EQ(result, PCM_X_QUEUE_OK);
+	if (result != PCM_X_QUEUE_OK)
+		return;
+	UT_ASSERT_EQ(stage.calls, 1);
+	UT_ASSERT_EQ(stage.msg_type, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT_EQ(stage.dest_node_id, transfer.identity.node_id);
+	UT_ASSERT_EQ(stage.payload_len, sizeof(PcmXPhasePayload));
+	UT_ASSERT_EQ(stage.payload.phase, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT(ticket_refs_equal(&stage.payload.ref, &first_commit.ref));
+	UT_ASSERT_EQ(retried.state_sequence, armed.state_sequence);
+	UT_ASSERT_EQ(retried.retry_count, 1);
+	UT_ASSERT_EQ(retried.retry_deadline_ms, UINT64_C(1100));
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 1);
+
+	/* A periodic pass before the deadline is a byte-stable no-op. */
+	memset(&retried_again, 0xA5, sizeof(retried_again));
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_drive(&retried, UINT64_C(1099), UINT64_C(100),
+														 capture_commit_retry_stage, &stage,
+														 &retried_again),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(memcmp(&retried_again, &(PcmXMasterDriveSnapshot){ 0 }, sizeof(retried_again)) == 0);
+	UT_ASSERT_EQ(stage.calls, 1);
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 1);
+	UT_ASSERT_EQ(ticket->reliable.retry_deadline_ms, UINT64_C(1100));
+
+	/* The pre-retry token and a forged responder session cannot mutate it. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_exact(&armed, UINT64_C(1100), UINT64_C(1200),
+														 &retry_commit, &retried_again),
+				 PCM_X_QUEUE_STALE);
+	stale = retried;
+	stale.expected_responder_session++;
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_exact(&stale, UINT64_C(1100), UINT64_C(1200),
+														 &retry_commit, &retried_again),
+				 PCM_X_QUEUE_STALE);
+
+	/* A full outbound ring still advances the deadline and cannot busy-spin. */
+	stage.accept = false;
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_drive(&retried, UINT64_C(1100), UINT64_C(100),
+														 capture_commit_retry_stage, &stage,
+														 &retried_again),
+				 PCM_X_QUEUE_BUSY);
+	UT_ASSERT_EQ(stage.calls, 2);
+	UT_ASSERT(ticket_refs_equal(&stage.payload.ref, &transfer));
+	UT_ASSERT_EQ(retried_again.state_sequence, armed.state_sequence);
+	UT_ASSERT_EQ(retried_again.retry_count, 2);
+	UT_ASSERT_EQ(retried_again.retry_deadline_ms, UINT64_C(1200));
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_drive(&retried_again, UINT64_C(1100),
+														 UINT64_C(100), capture_commit_retry_stage,
+														 &stage, &stale),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(stage.calls, 2);
+
+	/* Deadline expiry stages the same logical leg and advances scheduling. */
+	stage.accept = true;
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_drive(&retried_again, UINT64_C(1200),
+														 UINT64_C(100), capture_commit_retry_stage,
+														 &stage, &stale),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(stage.calls, 3);
+	UT_ASSERT(ticket_refs_equal(&stage.payload.ref, &transfer));
+	UT_ASSERT_EQ(stale.state_sequence, armed.state_sequence);
+	UT_ASSERT_EQ(stale.retry_count, 3);
+	UT_ASSERT_EQ(stale.retry_deadline_ms, UINT64_C(1300));
+
+	/* Old-session ACK is refused; exact FINAL_ACK advances and replays idempotently. */
+	memset(&final_ack, 0, sizeof(final_ack));
+	final_ack.ref = transfer;
+	final_ack.image_id = image_id;
+	final_ack.committed_own_generation = UINT64_C(6);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session + 1,
+															  &final_ack_token),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(ticket->reliable.pending_opcode, PGRAC_IC_MSG_PCM_X_COMMIT_X);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_finalize_exact(&final_ack_token, &final_commit),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+															  &final_ack_token),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_finalize_exact(&final_ack_token, &final_commit),
+				 PCM_X_QUEUE_DUPLICATE);
+
+	memset(&final_confirm, 0, sizeof(final_confirm));
+	final_confirm.ref = transfer;
+	final_confirm.phase = PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM;
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_confirm_exact(&final_confirm, 0, requester_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(test_slot_state(&ticket->slot), PCM_XT_COMPLETE);
+	UT_ASSERT_EQ(ticket->reliable.pending_opcode, 0);
+	UT_ASSERT_EQ(ticket->reliable.retry_count, 0);
+	UT_ASSERT_EQ(ticket->reliable.retry_deadline_ms, 0);
+
+	/* A non-ACTIVE runtime never resurrects or replays the consumed leg. */
+	before_blocked = *ticket;
+	UT_ASSERT(
+		cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE, PCM_X_RUNTIME_RECOVERY_BLOCKED));
+	UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_drive(&stale, UINT64_C(1300), UINT64_C(100),
+														 capture_commit_retry_stage, &stage,
+														 &armed),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(stage.calls, 3);
+	UT_ASSERT(memcmp(ticket, &before_blocked, sizeof(*ticket)) == 0);
+}
+
 /*
  * A' rebase (t/400 item 2): an interleaved revoke on the requester node
  * consumes the enqueue-time base_own_generation while the request is queued.
@@ -15932,7 +16135,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(269);
+	UT_PLAN(270);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16052,6 +16255,7 @@ main(void)
 	UT_RUN(test_master_drive_bitmap_replace_rejects_reliable_leg_drift);
 	UT_RUN(test_master_drive_snapshot_fails_closed_on_bitmap_corruption);
 	UT_RUN(test_master_transfer_wire_49_56_is_generation_exact);
+	UT_RUN(test_master_periodic_drive_replays_post_handoff_commit_x_exactly);
 	UT_RUN(test_master_install_ready_rebase_grant_base_is_one_shot);
 	UT_RUN(test_master_install_ready_rebase_conflict_fails_closed);
 	UT_RUN(test_master_install_ready_no_drift_keeps_identity_base_math);

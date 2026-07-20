@@ -104,6 +104,10 @@ static bool pcm_x_stats_depth_increment(PcmXShmemHeader *header);
 static bool pcm_x_stats_depth_decrement(PcmXShmemHeader *header);
 static bool pcm_x_master_terminal_leg_is_clear(const PcmXReliableLegState *leg);
 static bool pcm_x_master_blocker_stage_metadata_valid(const PcmXMasterTicketSlot *ticket);
+static bool pcm_x_transfer_leg_exact(const PcmXReliableLegState *leg, uint16 opcode,
+									 int32 responder_node, uint64 responder_session);
+static bool pcm_x_transfer_peer_exact(const PcmXMasterTicketSlot *ticket, int32 responder_node,
+									  uint64 responder_session);
 static void pcm_x_master_blocker_snapshot_clear(PcmXMasterBlockerSnapshot *snapshot);
 static bool pcm_x_ticket_ref_is_zero(const PcmXTicketRef *ref);
 static bool pcm_x_local_terminal_ref_valid(const PcmXTicketRef *ref);
@@ -4892,6 +4896,120 @@ snapshot_done:
 	if (result == PCM_X_QUEUE_CORRUPT)
 		pcm_x_runtime_fail_closed();
 	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 next_retry_deadline_ms, PcmXPhasePayload *commit_out,
+										PcmXMasterDriveSnapshot *snapshot_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXMasterDriveSnapshot current;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+
+	if (commit_out != NULL)
+		memset(commit_out, 0, sizeof(*commit_out));
+	pcm_x_master_drive_snapshot_clear(snapshot_out);
+	if (header == NULL || expected == NULL || commit_out == NULL || snapshot_out == NULL
+		|| next_retry_deadline_ms <= now_ms || expected->ticket_state != PCM_XT_ACTIVE_TRANSFER
+		|| expected->pending_opcode != PGRAC_IC_MSG_PCM_X_COMMIT_X
+		|| expected->phase != PGRAC_IC_MSG_PCM_X_COMMIT_X || expected->reserved != 0
+		|| expected->expected_responder_node != expected->ref.identity.node_id
+		|| expected->expected_responder_session == 0
+		|| !pcm_x_wait_identity_valid(&expected->ref.identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(&expected->ref, &ticket_ref, &ticket);
+	if (result == PCM_X_QUEUE_OK) {
+		tag_ref.slot_index = ticket->tag_slot_index;
+		tag_ref.slot_generation = ticket->tag_slot_generation;
+	}
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&expected->ref.identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref,
+													  &expected->ref.identity.tag,
+													  PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
+													   &expected->ref.identity.tag,
+													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
+											   &current);
+	if (result != PCM_X_QUEUE_OK)
+		goto retry_done;
+	if (!pcm_x_master_drive_snapshot_equal(&current, expected)) {
+		result = PCM_X_QUEUE_STALE;
+		goto retry_done;
+	}
+	if (!pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_COMMIT_X,
+								  ticket->ref.identity.node_id,
+								  ticket->reliable.expected_responder_session)
+		|| !pcm_x_transfer_peer_exact(ticket, ticket->ref.identity.node_id,
+									  ticket->reliable.expected_responder_session)) {
+		result = PCM_X_QUEUE_STALE;
+		goto retry_done;
+	}
+	if (ticket->reliable.retry_deadline_ms != 0 && now_ms < ticket->reliable.retry_deadline_ms) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto retry_done;
+	}
+
+	if (ticket->reliable.retry_count != PG_UINT32_MAX)
+		ticket->reliable.retry_count++;
+	ticket->reliable.retry_deadline_ms = next_retry_deadline_ms;
+	pg_write_barrier();
+	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
+											   snapshot_out);
+	if (result == PCM_X_QUEUE_OK) {
+		commit_out->ref = ticket->ref;
+		commit_out->phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	}
+
+retry_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result == PCM_X_QUEUE_CORRUPT)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_commit_retry_drive(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 retry_delay_ms, PcmXStageFrameCallback stage_frame,
+										void *callback_arg, PcmXMasterDriveSnapshot *snapshot_out)
+{
+	PcmXPhasePayload commit;
+	PcmXQueueResult result;
+	uint64 next_retry_deadline_ms;
+
+	pcm_x_master_drive_snapshot_clear(snapshot_out);
+	if (expected == NULL || stage_frame == NULL || snapshot_out == NULL || retry_delay_ms == 0
+		|| now_ms == UINT64_MAX)
+		return PCM_X_QUEUE_INVALID;
+	next_retry_deadline_ms
+		= now_ms > UINT64_MAX - retry_delay_ms ? UINT64_MAX : now_ms + retry_delay_ms;
+	result = cluster_pcm_x_master_commit_retry_exact(expected, now_ms, next_retry_deadline_ms,
+													 &commit, snapshot_out);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	return stage_frame(PGRAC_IC_MSG_PCM_X_COMMIT_X, commit.ref.identity.node_id, &commit,
+					   sizeof(commit), callback_arg)
+			   ? PCM_X_QUEUE_OK
+			   : PCM_X_QUEUE_BUSY;
 }
 
 

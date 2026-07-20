@@ -1420,6 +1420,16 @@ extern PcmXQueueResult cluster_pcm_x_master_drive_work_next(Size *cursor_io, Siz
 extern PcmXQueueResult
 cluster_pcm_x_master_drive_snapshot_exact(const BufferTag *tag, uint64 cluster_epoch,
 										  PcmXMasterDriveSnapshot *snapshot_out);
+extern PcmXQueueResult
+cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 next_retry_deadline_ms, PcmXPhasePayload *commit_out,
+										PcmXMasterDriveSnapshot *snapshot_out);
+typedef bool (*PcmXStageFrameCallback)(uint8 msg_type, int32 dest_node_id, const void *payload,
+									   Size payload_len, void *callback_arg);
+extern PcmXQueueResult
+cluster_pcm_x_master_commit_retry_drive(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 retry_delay_ms, PcmXStageFrameCallback stage_frame,
+										void *callback_arg, PcmXMasterDriveSnapshot *snapshot_out);
 extern PcmXQueueResult cluster_pcm_x_master_drive_bitmap_replace_exact(
 	const PcmXMasterDriveSnapshot *expected, uint32 pending_s_holders_bitmap,
 	uint32 acked_s_holders_bitmap, PcmXMasterDriveSnapshot *snapshot_out);
