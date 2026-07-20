@@ -1335,6 +1335,10 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
 	gcs_block_note_install_copy();
 	PageSetLSN(page, page_lsn);
+	/* The shipped image just proved these bytes current: a kept-pinned
+	 * retained PI mirror regains CURRENT inside the same content-EXCLUSIVE
+	 * hold, or the grant finish would refuse the frozen PI shape. */
+	cluster_bufmgr_pcm_own_republish_grant_pending_image(buf);
 	LWLockRelease(content_lock);
 }
 
@@ -1529,6 +1533,10 @@ cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN ex
 	verdict = gcs_block_lost_write_verdict(expected_scn, page_scn);
 	if (verdict == GCS_LOST_WRITE_PASS) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->fallback_scn_verify_pass_count, 1);
+		/* SCN proof: the local bytes (possibly a kept-pinned retained PI
+		 * mirror) are at least the master watermark — republish CURRENT so
+		 * the grant finish can commit over them. */
+		cluster_bufmgr_pcm_own_republish_grant_pending_image(buf);
 		return;
 	}
 
@@ -1545,8 +1553,12 @@ cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN ex
 			page_scn = InvalidScn;
 
 		verdict = gcs_block_lost_write_verdict(expected_scn, page_scn);
-		if (verdict == GCS_LOST_WRITE_PASS)
+		if (verdict == GCS_LOST_WRITE_PASS) {
+			/* Refreshed from shared storage and proven: same republish as
+			 * the direct PASS proof above. */
+			cluster_bufmgr_pcm_own_republish_grant_pending_image(buf);
 			return;
+		}
 	}
 
 	/* Refresh refused (dirty local copy) or the storage page is itself

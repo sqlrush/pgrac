@@ -915,6 +915,26 @@ UT_TEST(test_retained_release_retag_respects_pin_contract)
 	UT_ASSERT(!cluster_pcm_x_retained_release_retag(&buf.buffer_type, &buf_state));
 	UT_ASSERT(buf_state & BM_VALID);
 	UT_ASSERT_EQ(buf.buffer_type, (uint8)BUF_TYPE_PI);
+
+	/* The kept mirror is republished CURRENT only by a byte-currency proof
+	 * inside the exact open legacy grant lifecycle (a shipped-image install,
+	 * a storage refresh, or an SCN PASS proof): pcm N + live GRANT_PENDING +
+	 * nonzero token + BM_VALID + PI.  Anything else must stay frozen so the
+	 * finish valid-image gate keeps refusing an unproven stale cover. */
+	UT_ASSERT(cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_N, PCM_OWN_FLAG_GRANT_PENDING, 7, true, (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_S, PCM_OWN_FLAG_GRANT_PENDING, 7, true, (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape((uint8)PCM_STATE_N, 0, 7, true,
+														   (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_N, PCM_OWN_FLAG_REVOKING, 7, true, (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_N, PCM_OWN_FLAG_GRANT_PENDING, 0, true, (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_N, PCM_OWN_FLAG_GRANT_PENDING, 7, false, (uint8)BUF_TYPE_PI));
+	UT_ASSERT(!cluster_pcm_x_grant_pending_republish_shape(
+		(uint8)PCM_STATE_N, PCM_OWN_FLAG_GRANT_PENDING, 7, true, (uint8)BUF_TYPE_CURRENT));
 }
 
 UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
@@ -948,6 +968,23 @@ UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
 							   finish_valid_gate, lengthof(finish_valid_gate));
 	UT_ASSERT_NULL(strstr(source, "cluster_bufmgr_pcm_reload_invalid_pinned"));
 	free(source);
+}
+
+UT_TEST(test_legacy_byte_proof_republishes_kept_pi_mirror)
+{
+	static const char *const republish_contract[]
+		= { "cluster_pcm_x_grant_pending_republish_shape", "BUF_TYPE_CURRENT", "UnlockBufHdr" };
+	char *bufmgr_source = read_bufmgr_source();
+
+	/* A kept-pinned PI mirror regains CURRENT only where its bytes were just
+	 * proven current inside the still-open legacy grant lifecycle (the
+	 * gcs_block install / storage-fallback call sites are pinned in
+	 * test_cluster_gcs_block).  The helper flips only the exact republish
+	 * shape under header authority. */
+	assert_ordered_in_function(
+		bufmgr_source, "\ncluster_bufmgr_pcm_own_republish_grant_pending_image(",
+		"\nstatic ClusterPcmOwnResult", republish_contract, lengthof(republish_contract));
+	free(bufmgr_source);
 }
 
 UT_TEST(test_d5a_release_error_keeps_descriptor_out_of_freelist)
@@ -2208,7 +2245,7 @@ UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(50);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2218,6 +2255,7 @@ main(void)
 	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
 	UT_RUN(test_retained_release_retag_respects_pin_contract);
 	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
+	UT_RUN(test_legacy_byte_proof_republishes_kept_pi_mirror);
 	UT_RUN(test_revoke_commit_is_exact_and_classifies_live_races);
 	UT_RUN(test_revoke_retain_commit_keeps_exact_token_until_release);
 	UT_RUN(test_revoke_commit_exhaustion_is_side_effect_free);

@@ -130,6 +130,34 @@ read_gcs_block_source(void)
 }
 
 
+static void
+assert_ordered_in_function(const char *source, const char *function_start, const char *function_end,
+						   const char *const *needles, int needle_count)
+{
+	const char *cursor = strstr(source, function_start);
+	const char *end;
+	int i;
+
+	UT_ASSERT_NOT_NULL(cursor);
+	if (cursor == NULL)
+		return;
+	end = strstr(cursor + strlen(function_start), function_end);
+	UT_ASSERT_NOT_NULL(end);
+	if (end == NULL)
+		return;
+
+	for (i = 0; i < needle_count; i++) {
+		cursor = strstr(cursor, needles[i]);
+		UT_ASSERT_NOT_NULL(cursor);
+		if (cursor == NULL)
+			return;
+		UT_ASSERT(cursor < end);
+		if (cursor >= end)
+			return;
+		cursor += strlen(needles[i]);
+	}
+}
+
 static int
 count_occurrences(const char *source, const char *needle)
 {
@@ -3584,11 +3612,36 @@ UT_TEST(test_pcm_x_role_refresh_accepts_only_same_member_promotion)
 	UT_ASSERT(!cluster_gcs_pcm_x_role_refresh_exact(&follower, &promoted));
 }
 
+UT_TEST(test_legacy_byte_proof_sites_republish_kept_pi_mirror)
+{
+	static const char *const install_contract[]
+		= { "cluster_bufmgr_pcm_x_content_write_permitted", "memcpy", "PageSetLSN",
+			"cluster_bufmgr_pcm_own_republish_grant_pending_image", "LWLockRelease" };
+	static const char *const fallback_contract[]
+		= { "GCS_LOST_WRITE_PASS", "cluster_bufmgr_pcm_own_republish_grant_pending_image",
+			"cluster_bufmgr_refresh_block_from_storage_for_gcs", "GCS_LOST_WRITE_PASS",
+			"cluster_bufmgr_pcm_own_republish_grant_pending_image" };
+	char *source = read_gcs_block_source();
+
+	/* A retained-image release now keeps a frozen PI+BM_VALID N mirror for
+	 * pre-existing pins.  Its bytes regain CURRENT only where a legacy grant
+	 * just proved them: the shipped-image install memcpy (still under the
+	 * same content EXCLUSIVE hold) and both storage-fallback PASS proofs
+	 * (direct SCN PASS, and refresh-then-PASS).  The SKIP arms must leave PI
+	 * frozen so the finish valid-image gate keeps failing closed on unproven
+	 * bytes. */
+	assert_ordered_in_function(source, "\ngcs_block_install_block(", "\nstatic ", install_contract,
+							   lengthof(install_contract));
+	assert_ordered_in_function(source, "\ncluster_gcs_block_fallback_verify_refresh(", "\nstatic ",
+							   fallback_contract, lengthof(fallback_contract));
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(80);
+	UT_PLAN(81);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3669,6 +3722,7 @@ main(void)
 	UT_RUN(test_pcm_x_retire_commit_wakes_exact_waiters_before_ack_or_resolve);
 	UT_RUN(test_pcm_x_tagless_retire_uses_explicit_data_plane_handoff);
 	UT_RUN(test_pcm_x_role_refresh_accepts_only_same_member_promotion);
+	UT_RUN(test_legacy_byte_proof_sites_republish_kept_pi_mirror);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

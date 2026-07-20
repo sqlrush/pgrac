@@ -711,6 +711,30 @@ cluster_bufmgr_pcm_own_publish_installed_x_image(
 	return result;
 }
 
+/* Republish a kept-pinned retained PI mirror as the CURRENT image.  The
+ * caller stands at a byte-currency proof point of the still-open legacy
+ * grant (a shipped-image install under content EXCLUSIVE, a storage refresh,
+ * or an SCN PASS proof); only the exact republish shape is flipped, under
+ * header authority, and every other descriptor state is left untouched so
+ * the grant-finish valid-image gate keeps failing closed on unproven
+ * bytes. */
+void
+cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf)
+{
+	uint32		buf_state;
+
+	if (buf == NULL || ClusterPcmOwnArray == NULL)
+		return;
+	buf_state = LockBufHdr(buf);
+	if (cluster_pcm_x_grant_pending_republish_shape(buf->pcm_state,
+													cluster_pcm_own_flags_get(buf->buf_id),
+													cluster_pcm_own_reservation_token_get(buf->buf_id),
+													(buf_state & BM_VALID) != 0,
+													buf->buffer_type))
+		buf->buffer_type = (uint8) BUF_TYPE_CURRENT;
+	UnlockBufHdr(buf, buf_state);
+}
+
 static ClusterPcmOwnResult
 cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, ClusterPcmOwnSnapshot *out_base,
 										uint64 *out_token)

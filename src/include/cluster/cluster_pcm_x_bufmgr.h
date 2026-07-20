@@ -293,6 +293,20 @@ cluster_pcm_x_retained_release_retag(uint8 *buffer_type, uint32 *buf_state)
 	return false;
 }
 
+/* A frozen PI mirror kept for pre-existing pins regains CURRENT only while
+ * the exact legacy grant lifecycle that just proved its bytes (a shipped
+ * install, a storage refresh, or an SCN PASS proof) is still open: pcm N +
+ * live GRANT_PENDING + nonzero token + BM_VALID + PI.  Every other shape
+ * stays frozen so the grant-finish valid-image gate keeps failing closed on
+ * an unproven stale cover. */
+static inline bool
+cluster_pcm_x_grant_pending_republish_shape(uint8 pcm_state, uint32 flags, uint64 token, bool valid,
+											uint8 buffer_type)
+{
+	return pcm_state == (uint8)PCM_STATE_N && flags == PCM_OWN_FLAG_GRANT_PENDING && token != 0
+		   && valid && buffer_type == (uint8)BUF_TYPE_PI;
+}
+
 /* Token zero is valid before the first reservation; a completed reservation
  * leaves a nonzero monotonic token idle.  In both cases flags alone say
  * whether a lifecycle is currently active. */
@@ -315,6 +329,7 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
  * LockBuffer/W1.  GRANT_PENDING image installation is permitted; a live
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
 extern bool cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf);
+extern void cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf);
 /* Called only after the requester has proved the exact remote master's S->N
  * RELEASE application ACK.  Atomically normalizes the matching descriptor
  * tuple and returns the fresh N snapshot used by the later PREPARE leg. */
