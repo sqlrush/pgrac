@@ -882,13 +882,19 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 			   && (new_pcm_state != (uint8)PCM_STATE_X
 				   || !LWLockHeldByMe(BufferDescriptorGetContentLock(buf))))
 		result = CLUSTER_PCM_OWN_INVALID;
-	else if ((buf_state & BM_VALID) == 0 || buf->buffer_type == (uint8) BUF_TYPE_PI)
+	else if (buf->buffer_type == (uint8) BUF_TYPE_PI
+			 || (buf_state & (BM_VALID | BM_IO_IN_PROGRESS)) == 0)
 		/* Never commit a durable S/X mirror over a page image that is not
-		 * current: a dropped image (!BM_VALID) or a frozen PI mirror carries
+		 * current: a frozen PI mirror or a dropped image (!BM_VALID) carries
 		 * no bytes this grant may serve, so a commit here would silently
 		 * cover stale or absent data (Rule 8.A).  A grant that installs the
 		 * shipped image sets BM_VALID + CURRENT before this finish; the
-		 * !BM_VALID revoke-handoff precedent likewise fails closed. */
+		 * !BM_VALID revoke-handoff precedent likewise fails closed.  The one
+		 * legal !BM_VALID commit shape is the direct-init window (EXTEND /
+		 * READ_MISS): its gate runs between StartBufferIO and
+		 * TerminateBufferIO(BM_VALID), so the descriptor still owns
+		 * BM_IO_IN_PROGRESS and the zeroed page is published only after the
+		 * caller initializes it under content EXCLUSIVE. */
 		result = CLUSTER_PCM_OWN_CORRUPT;
 	else {
 		result = cluster_pcm_own_grant_commit_exact(buf->buf_id, base->generation,

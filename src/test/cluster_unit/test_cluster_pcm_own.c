@@ -923,8 +923,9 @@ UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
 		= { "cluster_pcm_own_revoke_retain_release_exact", "cluster_pcm_x_retained_release_retag",
 			"UnlockBufHdr" };
 	static const char *const finish_valid_gate[]
-		= { "cluster_pcm_x_grant_reservation_kind", "(buf_state & BM_VALID) == 0", "BUF_TYPE_PI",
-			"CLUSTER_PCM_OWN_CORRUPT", "cluster_pcm_own_grant_commit_exact" };
+		= { "cluster_pcm_x_grant_reservation_kind", "BUF_TYPE_PI",
+			"(buf_state & (BM_VALID | BM_IO_IN_PROGRESS)) == 0", "CLUSTER_PCM_OWN_CORRUPT",
+			"cluster_pcm_own_grant_commit_exact" };
 	char *source = read_bufmgr_source();
 
 	/* The retained release must route its descriptor retag through the shared
@@ -934,8 +935,11 @@ UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
 	 * a PI mirror): that silent cover of stale bytes is how the pinned
 	 * descriptor was previously stamped S over an invalid base, re-arming the
 	 * refused legacy S_NEW convert (deterministic client ERROR) -- and, on
-	 * the PI arm, a Rule 8.A stale read.  Reloading the bytes in place under
-	 * a foreign pin is equally forbidden. */
+	 * the PI arm, a Rule 8.A stale read.  The one legal !BM_VALID commit
+	 * shape is the direct-init window (EXTEND/READ_MISS), whose gate still
+	 * owns BM_IO_IN_PROGRESS between StartBufferIO and
+	 * TerminateBufferIO(BM_VALID).  Reloading the bytes in place under a
+	 * foreign pin is equally forbidden. */
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_release_retained_image(",
 							   "\ncluster_bufmgr_pcm_own_self_handoff_probe(",
 							   release_retag_contract, lengthof(release_retag_contract));
