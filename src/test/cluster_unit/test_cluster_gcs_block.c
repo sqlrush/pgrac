@@ -3638,10 +3638,27 @@ UT_TEST(test_legacy_byte_proof_sites_republish_kept_pi_mirror)
 }
 
 
+UT_TEST(test_revoke_handler_silent_refusal_arms_all_note)
+{
+	char *source = read_gcs_block_source();
+	const char *handler = strstr(source, "\ncluster_gcs_handle_pcm_x_revoke_envelope(");
+
+	/* The master re-sends REVOKE forever, so every refusal arm in the source
+	 * handler must name itself through the log-once streak note (t/400 form-B
+	 * wedges previously refused silently at un-instrumented arms): ingress
+	 * auth, holder-ledger stale, holder-progress error, image reserve, apply,
+	 * ingress snapshot, plus the progress reset. */
+	UT_ASSERT_NOT_NULL(handler);
+	if (handler != NULL)
+		UT_ASSERT(count_occurrences(handler, "gcs_block_pcm_x_revoke_refusal_note(") >= 7);
+	free(source);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(81);
+	UT_PLAN(82);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3723,6 +3740,7 @@ main(void)
 	UT_RUN(test_pcm_x_tagless_retire_uses_explicit_data_plane_handoff);
 	UT_RUN(test_pcm_x_role_refresh_accepts_only_same_member_promotion);
 	UT_RUN(test_legacy_byte_proof_sites_republish_kept_pi_mirror);
+	UT_RUN(test_revoke_handler_silent_refusal_arms_all_note);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

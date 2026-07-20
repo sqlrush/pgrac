@@ -11514,8 +11514,10 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 	if (!cluster_gcs_pcm_x_revoke_ingress_valid(revoke, env->payload_length, source_node,
 												current_epoch, tag_master, cluster_node_id)
 		|| !gcs_block_pcm_x_transfer_ingress_authorized(&revoke->ref.identity.tag, source_node,
-														current_epoch, &source_session))
+														current_epoch, &source_session)) {
+		gcs_block_pcm_x_revoke_refusal_note("ingress-auth", 0, NULL);
 		return;
+	}
 	if (!gcs_block_pcm_x_handler_tag_shard_exact(&revoke->ref.identity.tag))
 		return;
 	worker_id = cluster_ic_tier1_my_data_channel();
@@ -11534,6 +11536,8 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 		if (!gcs_block_pcm_x_ticket_ref_equal(&holder_progress.ref, &revoke->ref)
 			|| holder_progress.image.image_id != revoke->image_id) {
 			cluster_pcm_x_stats_note_queue_result(PCM_X_QUEUE_STALE);
+			gcs_block_pcm_x_revoke_refusal_note("holder-ledger-stale", (int)PCM_X_QUEUE_STALE,
+												NULL);
 			return;
 		}
 		if ((holder_progress.flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0) {
@@ -11559,6 +11563,7 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 		}
 	} else if (progress_result != PCM_X_QUEUE_NOT_FOUND) {
 		cluster_pcm_x_stats_note_queue_result(progress_result);
+		gcs_block_pcm_x_revoke_refusal_note("holder-progress", (int)progress_result, NULL);
 		return;
 	}
 
@@ -11585,8 +11590,10 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 	image_result = cluster_gcs_block_dedup_pcm_x_reserve(
 		worker_id, &image_key, &revoke->ref.identity.tag, &reserved_binding);
 	if (image_result != GCS_BLOCK_PCM_X_IMAGE_RESERVED
-		&& image_result != GCS_BLOCK_PCM_X_IMAGE_DUPLICATE)
+		&& image_result != GCS_BLOCK_PCM_X_IMAGE_DUPLICATE) {
+		gcs_block_pcm_x_revoke_refusal_note("image-reserve", (int)image_result, NULL);
 		return;
+	}
 	new_reservation = image_result == GCS_BLOCK_PCM_X_IMAGE_RESERVED;
 	if (!new_reservation) {
 		image_result = cluster_gcs_block_dedup_pcm_x_rearm_exact(
@@ -11603,11 +11610,14 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL);
 		gcs_block_pcm_x_wake_registered_holders(&revoke->ref.identity.tag);
-	} else if (new_reservation
-			   && cluster_gcs_block_dedup_pcm_x_release_exact(
-					  worker_id, &image_key, &revoke->ref.identity.tag, &reserved_binding)
-					  != GCS_BLOCK_PCM_X_IMAGE_RELEASED)
-		cluster_pcm_x_runtime_fail_closed();
+	} else {
+		gcs_block_pcm_x_revoke_refusal_note("apply", (int)result, NULL);
+		if (new_reservation
+			&& cluster_gcs_block_dedup_pcm_x_release_exact(
+				   worker_id, &image_key, &revoke->ref.identity.tag, &reserved_binding)
+				   != GCS_BLOCK_PCM_X_IMAGE_RELEASED)
+			cluster_pcm_x_runtime_fail_closed();
+	}
 }
 
 
