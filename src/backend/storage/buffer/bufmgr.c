@@ -225,6 +225,14 @@ cluster_pcm_own_transition(BufferDesc *buf, uint8 new_pcm_state, uint32 set_flag
 	uint32 buf_state;
 	uint32 observed_flags = 0;
 	uint64 new_generation;
+	/* Evidence for an S/X mirror transition over invalid page bytes: sampled
+	 * under the header lock, logged after.  The reservation finish itself
+	 * fails closed on this shape; this covers the direct-transition mirror. */
+	bool		fx_log = false;
+	BufferTag	fx_tag = {0};
+	uint8		fx_old_state = 0;
+	uint64		fx_token = 0;
+	uint32		fx_refcount = 0;
 
 	buf_state = LockBufHdr(buf);
 	bump_result = cluster_pcm_own_bump_locked(buf, set_flags, clear_flags,
@@ -234,8 +242,23 @@ cluster_pcm_own_transition(BufferDesc *buf, uint8 new_pcm_state, uint32 set_flag
 		cluster_pcm_own_report_bump_failure(buf, bump_result, new_generation,
 										observed_flags, "ownership transition");
 	}
+	if ((new_pcm_state == (uint8) PCM_STATE_S || new_pcm_state == (uint8) PCM_STATE_X)
+		&& (buf_state & BM_VALID) == 0)
+	{
+		fx_log = true;
+		fx_tag = buf->tag;
+		fx_old_state = buf->pcm_state;
+		fx_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+		fx_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
+	}
 	buf->pcm_state = new_pcm_state;
 	UnlockBufHdr(buf, buf_state);
+	if (fx_log)
+		elog(LOG,
+			 "cluster PCM own S/X over !BM_VALID: site=own-transition buffer=%d rel=%u fork=%d blk=%u target=%u refcount=%u old_state=%u gen=%llu token=%llu",
+			 buf->buf_id, fx_tag.relNumber, (int) fx_tag.forkNum, fx_tag.blockNum,
+			 (unsigned) new_pcm_state, fx_refcount, (unsigned) fx_old_state,
+			 (unsigned long long) new_generation, (unsigned long long) fx_token);
 }
 
 /*
@@ -859,6 +882,14 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 			   && (new_pcm_state != (uint8)PCM_STATE_X
 				   || !LWLockHeldByMe(BufferDescriptorGetContentLock(buf))))
 		result = CLUSTER_PCM_OWN_INVALID;
+	else if ((buf_state & BM_VALID) == 0 || buf->buffer_type == (uint8) BUF_TYPE_PI)
+		/* Never commit a durable S/X mirror over a page image that is not
+		 * current: a dropped image (!BM_VALID) or a frozen PI mirror carries
+		 * no bytes this grant may serve, so a commit here would silently
+		 * cover stale or absent data (Rule 8.A).  A grant that installs the
+		 * shipped image sets BM_VALID + CURRENT before this finish; the
+		 * !BM_VALID revoke-handoff precedent likewise fails closed. */
+		result = CLUSTER_PCM_OWN_CORRUPT;
 	else {
 		result = cluster_pcm_own_grant_commit_exact(buf->buf_id, base->generation,
 													reservation_token, out_committed_generation);
@@ -12015,6 +12046,10 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 	uint32		flags;
 	uint32		buf_state;
 	int			buf_id;
+	/* Release evidence: sampled under the header lock, logged after. */
+	bool		fx_log = false;
+	bool		fx_dropped = false;
+	uint32		fx_refcount = 0;
 
 	if (tag == NULL || source_generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -12097,21 +12132,35 @@ cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 				buf->buf_id, committed_generation, retained_token);
 			if (result == CLUSTER_PCM_OWN_OK) {
 				/*
-				 * The exact token is the last stale-write fence.  Release it
-				 * before making the retained PI reloadable, while content
-				 * EXCLUSIVE and the header lock keep page bytes invalid.
-				 * Keep the mapping so any pre-existing pin can leave
-				 * normally; the next ordinary read reloads the current page
-				 * image.
+				 * The exact token was the last stale-write fence; release it
+				 * first, then retag under the same header-lock hold.  With no
+				 * pins the image is dropped so the next ordinary read reloads
+				 * the current page bytes.  With a pre-existing pin the frozen
+				 * PI+BM_VALID N mirror is kept byte-exact instead: clearing
+				 * BM_VALID under a pin holder would let a later LockBuffer
+				 * open a legacy master reservation over an invalid base and
+				 * stamp S/X ownership onto it (the deterministic S_NEW finish
+				 * refusals), while reloading in place would swap the page
+				 * image under the pin (both violate the pin contract).  See
+				 * cluster_pcm_x_retained_release_retag.
 				 */
-				buf_state &= ~BM_VALID;
-				buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
+				fx_dropped = cluster_pcm_x_retained_release_retag(&buf->buffer_type,
+																  &buf_state);
+				fx_log = true;
+				fx_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 			}
 		}
 	}
 
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(content_lock);
+	if (fx_log)
+		elog(LOG,
+			 "cluster PCM retained image released: image=%s buffer=%d rel=%u fork=%d blk=%u refcount=%u gen=%llu token=%llu",
+			 fx_dropped ? "dropped" : "kept-pinned-pi", buf->buf_id,
+			 tag->relNumber, (int) tag->forkNum, tag->blockNum,
+			 fx_refcount, (unsigned long long) committed_generation,
+			 (unsigned long long) retained_token);
 	return result;
 }
 

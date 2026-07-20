@@ -271,6 +271,28 @@ cluster_pcm_x_current_image_shape(uint8 pcm_state, uint8 buffer_type, bool valid
 			   || (pcm_state == (uint8)PCM_STATE_X && buffer_type == (uint8)BUF_TYPE_XCUR));
 }
 
+/* Post-release retag of a retained PI whose exact write-fence token was just
+ * released, applied under the same header-lock hold.  With no pins the image
+ * is dropped -- !BM_VALID plus a BUF_TYPE_CURRENT retag makes the next
+ * ordinary read reload the current page bytes.  With a pre-existing pin the
+ * frozen bytes must neither vanish nor change under the pin holder
+ * (PostgreSQL pin contract): keep the established PI+BM_VALID
+ * never-write/never-serve N mirror (the passive-pin invalidate release
+ * shape).  The next S acquire begins an exact GRANT_PENDING install that may
+ * overwrite it and republish CURRENT, an X convert rides the convert queue,
+ * and eviction retags once the last pin drains.  Returns true when the image
+ * was dropped. */
+static inline bool
+cluster_pcm_x_retained_release_retag(uint8 *buffer_type, uint32 *buf_state)
+{
+	if (BUF_STATE_GET_REFCOUNT(*buf_state) == 0) {
+		*buf_state &= ~BM_VALID;
+		*buffer_type = (uint8)BUF_TYPE_CURRENT;
+		return true;
+	}
+	return false;
+}
+
 /* Token zero is valid before the first reservation; a completed reservation
  * leaves a nonzero monotonic token idle.  In both cases flags alone say
  * whether a lifecycle is currently active. */

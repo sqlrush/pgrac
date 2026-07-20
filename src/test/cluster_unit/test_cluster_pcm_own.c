@@ -874,6 +874,78 @@ UT_TEST(test_bufmgr_finish_and_abort_gate_on_exact_base_state)
 	free(source);
 }
 
+UT_TEST(test_retained_release_retag_respects_pin_contract)
+{
+	BufferDesc buf;
+	uint32 buf_state;
+	uint8 type_before;
+	uint32 state_before;
+
+	/* Unpinned: the released retained image is dropped -- !BM_VALID plus a
+	 * BUF_TYPE_CURRENT retag makes the next ordinary read reload the current
+	 * page bytes through the buffer-IO protocol. */
+	memset(&buf, 0, sizeof(buf));
+	buf.buffer_type = (uint8)BUF_TYPE_PI;
+	buf_state = BM_VALID | BM_TAG_VALID;
+	UT_ASSERT(cluster_pcm_x_retained_release_retag(&buf.buffer_type, &buf_state));
+	UT_ASSERT_EQ(buf_state & BM_VALID, 0);
+	UT_ASSERT_EQ(buf.buffer_type, (uint8)BUF_TYPE_CURRENT);
+
+	/* Pinned: a pre-existing PG pin freezes the page image -- the bytes may
+	 * neither vanish (!BM_VALID under a pin breaks the pin contract and
+	 * re-arms the legacy begin-over-invalid-base S_NEW mint) nor be reloaded
+	 * in place (an image swap under the pin holder).  The release must keep
+	 * the established PI+BM_VALID never-write/never-serve N mirror byte-exact
+	 * (the passive-pin invalidate release shape): the next S acquire installs
+	 * over it via an exact GRANT_PENDING and republishes CURRENT, an X
+	 * convert rides the convert queue, and eviction retags after the last
+	 * pin drains. */
+	memset(&buf, 0, sizeof(buf));
+	buf.buffer_type = (uint8)BUF_TYPE_PI;
+	buf_state = (BM_VALID | BM_TAG_VALID) + BUF_REFCOUNT_ONE * 2;
+	type_before = buf.buffer_type;
+	state_before = buf_state;
+	UT_ASSERT(!cluster_pcm_x_retained_release_retag(&buf.buffer_type, &buf_state));
+	UT_ASSERT_EQ(buf.buffer_type, type_before);
+	UT_ASSERT_EQ(buf_state, state_before);
+
+	/* One pin behaves like many. */
+	buf.buffer_type = (uint8)BUF_TYPE_PI;
+	buf_state = (BM_VALID | BM_TAG_VALID) + BUF_REFCOUNT_ONE;
+	UT_ASSERT(!cluster_pcm_x_retained_release_retag(&buf.buffer_type, &buf_state));
+	UT_ASSERT(buf_state & BM_VALID);
+	UT_ASSERT_EQ(buf.buffer_type, (uint8)BUF_TYPE_PI);
+}
+
+UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
+{
+	static const char *const release_retag_contract[]
+		= { "cluster_pcm_own_revoke_retain_release_exact", "cluster_pcm_x_retained_release_retag",
+			"UnlockBufHdr" };
+	static const char *const finish_valid_gate[]
+		= { "cluster_pcm_x_grant_reservation_kind", "(buf_state & BM_VALID) == 0", "BUF_TYPE_PI",
+			"CLUSTER_PCM_OWN_CORRUPT", "cluster_pcm_own_grant_commit_exact" };
+	char *source = read_bufmgr_source();
+
+	/* The retained release must route its descriptor retag through the shared
+	 * pin-aware decision helper under the same header-lock hold that released
+	 * the exact write-fence token.  And a grant finish must never commit a
+	 * durable S/X mirror over a page image that is not current (!BM_VALID or
+	 * a PI mirror): that silent cover of stale bytes is how the pinned
+	 * descriptor was previously stamped S over an invalid base, re-arming the
+	 * refused legacy S_NEW convert (deterministic client ERROR) -- and, on
+	 * the PI arm, a Rule 8.A stale read.  Reloading the bytes in place under
+	 * a foreign pin is equally forbidden. */
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_release_retained_image(",
+							   "\ncluster_bufmgr_pcm_own_self_handoff_probe(",
+							   release_retag_contract, lengthof(release_retag_contract));
+	assert_ordered_in_function(source, "\ncluster_pcm_own_finish_grant_reservation(",
+							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_x_commit(",
+							   finish_valid_gate, lengthof(finish_valid_gate));
+	UT_ASSERT_NULL(strstr(source, "cluster_bufmgr_pcm_reload_invalid_pinned"));
+	free(source);
+}
+
 UT_TEST(test_d5a_release_error_keeps_descriptor_out_of_freelist)
 {
 	static const char *const fail_closed_contract[]
@@ -1298,12 +1370,9 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 
 UT_TEST(test_retained_drain_retags_invalid_only_after_exact_token_release)
 {
-	static const char *const drain_contract[] = { "cluster_pcm_own_revoke_retain_release_exact",
-												  "result == CLUSTER_PCM_OWN_OK",
-												  "buf_state &= ~BM_VALID",
-												  "buf->buffer_type",
-												  "BUF_TYPE_CURRENT",
-												  "UnlockBufHdr" };
+	static const char *const drain_contract[]
+		= { "cluster_pcm_own_revoke_retain_release_exact", "result == CLUSTER_PCM_OWN_OK",
+			"cluster_pcm_x_retained_release_retag", "&buf->buffer_type", "UnlockBufHdr" };
 	char *source = read_bufmgr_source();
 	const char *release;
 	const char *release_end;
@@ -2135,7 +2204,7 @@ UT_TEST(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(49);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2143,6 +2212,8 @@ main(void)
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
 	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
+	UT_RUN(test_retained_release_retag_respects_pin_contract);
+	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
 	UT_RUN(test_revoke_commit_is_exact_and_classifies_live_races);
 	UT_RUN(test_revoke_retain_commit_keeps_exact_token_until_release);
 	UT_RUN(test_revoke_commit_exhaustion_is_side_effect_free);
