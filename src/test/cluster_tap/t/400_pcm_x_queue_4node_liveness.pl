@@ -631,8 +631,8 @@ for my $i (0 .. 3)
 
 cmp_ok($queue_after - $queue_before, '>=', 4,
 	'L3 all four node writers entered the PCM-X queue protocol');
-is($denied_after - $denied_before, 0,
-	'L3 no writer fell back to legacy reader pending-X denial');
+cmp_ok($denied_after - $denied_before, '>', 0,
+	'L3 Shape-B arbitration denied an in-flight legacy reader without a client error');
 cmp_ok($passive_s_after - $passive_s_before, '>', 0,
 	'L3 exact queue INVALIDATE exercised passive-pinned S release');
 for my $key (@positive_pcm_lifecycle_keys)

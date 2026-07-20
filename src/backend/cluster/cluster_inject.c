@@ -538,8 +538,7 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *
 	 *	cluster-gcs-block-starvation-force-denied:
 	 *	  Fires inside master N→S handler.  SKIP forces DENIED_PENDING_X
-	 *	  reply unconditionally so TAP can drive reader backoff retry +
-	 *	  53R92 ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED.
+	 *	  reply so TAP can drive exact abort + fresh-identity backoff retry.
 	 *
 	 *	cluster-catalog-services-ready-force-closed:
 	 *	  Fires inside cluster_catalog_services_ready (spec-6.14 D8).  SKIP

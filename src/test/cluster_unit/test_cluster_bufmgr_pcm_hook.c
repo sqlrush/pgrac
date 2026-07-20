@@ -370,7 +370,8 @@ bool
 cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
 										PcmLockTransition trans pg_attribute_unused(),
 										int master_node pg_attribute_unused(),
-										bool clean_eligible pg_attribute_unused())
+										bool clean_eligible pg_attribute_unused(),
+										bool *out_retry_denied pg_attribute_unused())
 {
 	abort();
 }

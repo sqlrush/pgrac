@@ -689,6 +689,214 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 	return result;
 }
 
+static bool
+dedup_pending_x_denial_is_exact(const GcsBlockDedupEntry *entry)
+{
+	const GcsBlockReplyHeader *header = &entry->reply_header;
+
+	return entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		   && entry->transition_id == (uint8)PCM_TRANS_N_TO_S
+		   && entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
+		   && entry->completed_at_ts != 0
+		   && header->request_id == entry->key.request_id
+		   && header->epoch == entry->key.cluster_epoch
+		   && header->sender_node == cluster_node_id
+		   && header->requester_backend_id == entry->key.requester_backend_id
+		   && header->transition_id == (uint8)PCM_TRANS_N_TO_S
+		   && header->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
+		   && GcsBlockReplyHeaderGetForwardingMasterNode(header)
+			  == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+}
+
+static bool
+dedup_pending_x_entry_has_legacy_s_right(const GcsBlockDedupEntry *entry)
+{
+	GcsBlockReplyStatus status;
+
+	if (entry->completed_at_ts == 0)
+		return true;
+	status = (GcsBlockReplyStatus)entry->status;
+	return status == GCS_BLOCK_REPLY_GRANTED
+		   || status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK
+		   || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+		   || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+}
+
+static void
+dedup_pending_x_install_denial(GcsBlockDedupEntry *entry)
+{
+	GcsBlockReplyHeader denial;
+
+	memset(&denial, 0, sizeof(denial));
+	denial.request_id = entry->key.request_id;
+	denial.epoch = entry->key.cluster_epoch;
+	denial.sender_node = cluster_node_id;
+	denial.requester_backend_id = entry->key.requester_backend_id;
+	denial.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	denial.status = (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&denial, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+
+	entry->status = (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	entry->reply_header = denial;
+	entry->has_sf_dep = false;
+	entry->sf_flags = 0;
+	entry->sf_dep_count = 0;
+	cluster_sf_dep_vec_reset(&entry->payload_meta.sf_dep_vec);
+	memset(entry->block_data, 0, sizeof(entry->block_data));
+	entry->completed_at_ts = GetCurrentTimestamp();
+	entry->done_at_ts = 0;
+}
+
+/* PCM-X queue arbitration must revoke the right of an older legacy reader
+ * before type-49 can wait on that reader's GRANT_PENDING reservation.  The
+ * scan returns at most one newly terminated identity per call so the caller
+ * can send it without a bounded/sentinel array; after all live rights are
+ * gone it returns one unacknowledged cached denial for loss recovery. */
+GcsBlockPendingXDenyResult
+cluster_gcs_block_dedup_pending_x_deny_next(int worker_id, const BufferTag *tag,
+											GcsBlockDedupEntry *denied_out)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	HASH_SEQ_STATUS scan;
+	GcsBlockDedupEntry *entry;
+	GcsBlockDedupEntry replay;
+	bool have_replay = false;
+
+	Assert(tag != NULL);
+	Assert(denied_out != NULL);
+	if (tag == NULL || denied_out == NULL)
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+	memset(denied_out, 0, sizeof(*denied_out));
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	hash_seq_init(&scan, htab);
+	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
+		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
+			|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+			|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0 || entry->done_at_ts != 0)
+			continue;
+
+		if (dedup_pending_x_denial_is_exact(entry)) {
+			if (!have_replay) {
+				replay = *entry;
+				have_replay = true;
+			}
+			continue;
+		}
+		if (entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
+			&& entry->completed_at_ts != 0) {
+			dedup_pcm_x_note_failclosed(shard);
+			hash_seq_term(&scan);
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PENDING_X_DENY_INVALID;
+		}
+		if (!dedup_pending_x_entry_has_legacy_s_right(entry))
+			continue;
+
+		dedup_pending_x_install_denial(entry);
+		*denied_out = *entry;
+		hash_seq_term(&scan);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PENDING_X_DENY_NEW;
+	}
+
+	if (have_replay)
+		*denied_out = replay;
+	LWLockRelease(&shard->lock.lock);
+	return have_replay ? GCS_BLOCK_PENDING_X_DENY_REPLAY
+					   : GCS_BLOCK_PENDING_X_DENY_NOT_FOUND;
+}
+
+GcsBlockPendingXDenyResult
+cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupKey *key,
+											 const BufferTag *tag, uint8 transition_id,
+											 GcsBlockDedupEntry *denied_out)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+
+	Assert(key != NULL);
+	Assert(tag != NULL);
+	Assert(denied_out != NULL);
+	if (key == NULL || tag == NULL || denied_out == NULL
+		|| transition_id != (uint8)PCM_TRANS_N_TO_S)
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+	memset(denied_out, 0, sizeof(*denied_out));
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
+		|| entry->transition_id != transition_id) {
+		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+			dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+	}
+	if (dedup_pending_x_denial_is_exact(entry)) {
+		*denied_out = *entry;
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PENDING_X_DENY_REPLAY;
+	}
+	if (entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
+		&& entry->completed_at_ts != 0) {
+		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PENDING_X_DENY_INVALID;
+	}
+
+	dedup_pending_x_install_denial(entry);
+	*denied_out = *entry;
+	LWLockRelease(&shard->lock.lock);
+	return GCS_BLOCK_PENDING_X_DENY_NEW;
+}
+
+bool
+cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDedupKey *key,
+											const BufferTag *tag, uint8 transition_id,
+											uint8 request_flags)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+	bool updated = false;
+
+	Assert(key != NULL);
+	Assert(tag != NULL);
+	if (key == NULL || tag == NULL
+		|| (request_flags & ~GCS_BLOCK_DEDUP_REQUEST_F_VALID_MASK) != 0)
+		return false;
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return false;
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
+	if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		&& memcmp(&entry->tag, tag, sizeof(*tag)) == 0
+		&& entry->transition_id == transition_id) {
+		uint8 pinned_flags = GCS_BLOCK_DEDUP_REQUEST_F_PINNED | request_flags;
+
+		if (entry->request_flags == 0)
+			entry->request_flags = pinned_flags;
+		updated = entry->request_flags == pinned_flags;
+	} else if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+		dedup_pcm_x_note_failclosed(shard);
+	LWLockRelease(&shard->lock.lock);
+	return updated;
+}
+
 GcsBlockPcmXImageResult
 cluster_gcs_block_dedup_pcm_x_reserve(int worker_id, const GcsBlockDedupKey *key,
 									  const BufferTag *tag,
@@ -1459,6 +1667,14 @@ cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *
 	}
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
 		dedup_pcm_x_note_failclosed(shard);
+		LWLockRelease(&shard->lock.lock);
+		return;
+	}
+	/* A queue-kind pending-X claim has already terminated this exact legacy
+	 * reader.  Any asynchronous old producer has permanently lost the right
+	 * to restore GRANTED/FORWARD/page bytes; preserve the cached denial for
+	 * retransmit until exact DONE. */
+	if (dedup_pending_x_denial_is_exact(entry)) {
 		LWLockRelease(&shard->lock.lock);
 		return;
 	}

@@ -315,9 +315,12 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  * Returns true if a DURABLE PCM grant was recorded (caller mirrors ownership
  * into buf->pcm_state).  Returns false for a spec-5.2 D2 one-shot READ_IMAGE:
  * bytes were installed for this read only and the caller MUST leave
- * buf->pcm_state == N so the next access re-fetches.
+ * buf->pcm_state == N so the next access re-fetches.  A false return with
+ * *out_retry_denied set is instead a queue-arbitration retry boundary; the
+ * caller must exact-abort and replace its GRANT_PENDING reservation.
  */
-extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
+extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode,
+											bool *out_retry_denied);
 
 /*
  * PGRAC: spec-5.2a D2 — clean-page X-transfer arm (backend-local, one-shot).

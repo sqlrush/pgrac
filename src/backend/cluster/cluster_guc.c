@@ -800,8 +800,9 @@ int cluster_gcs_block_recovery_wait_ms = 200;
  *     DENIED_INVALIDATE_TIMEOUT reply (status 11) → 53R91 SQLSTATE.
  *   cluster_gcs_block_starvation_backoff_ms (HC117):  reader backoff
  *     base for DENIED_PENDING_X retry loop;  backoff = base × 2^attempt.
- *   cluster_gcs_block_starvation_max_retries (HC117):  reader retry
- *     budget;  exhaustion → 53R92 SQLSTATE.
+ *   cluster_gcs_block_starvation_max_retries (HC117): retained as a
+ *     configuration-compatibility surface.  Queue-arbitrated reader retry is
+ *     now unbounded/cancelable and does not consume this legacy budget.
  */
 int cluster_gcs_block_invalidate_ack_timeout_ms = 1500;
 int cluster_gcs_block_starvation_backoff_ms = 100;
@@ -4204,10 +4205,12 @@ cluster_init_guc(void)
 					 "2^attempt.  HC117.  PGC_SUSET."),
 		&cluster_gcs_block_starvation_backoff_ms, 100, 1, 60000, PGC_SUSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable(
-		"cluster.gcs_block_starvation_max_retries", gettext_noop("S barrier reader retry budget."),
-		gettext_noop("Reader DENIED_PENDING_X retry budget.  Budget exhausted → "
-					 "ereport(53R92);  upper-layer transaction may retry the "
-					 "whole statement.  HC117.  PGC_SUSET."),
+		"cluster.gcs_block_starvation_max_retries",
+		gettext_noop("Legacy S barrier reader retry budget compatibility setting."),
+		gettext_noop("Retained for configuration compatibility.  DENIED_PENDING_X now "
+					 "exact-aborts its old reservation and retries with fresh identities "
+					 "until success or query cancellation; this value no longer causes "
+					 "a client error.  HC117.  PGC_SUSET."),
 		&cluster_gcs_block_starvation_max_retries, 8, 0, 64, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*

@@ -169,7 +169,7 @@ typedef struct GcsBlockDedupEntry {
 	uint8 transition_id;				   /*  1B — HC91 collision check */
 	uint8 status;						   /*  1B — GcsBlockReplyStatus */
 	uint8 entry_kind;					   /*  1B — GcsBlockDedupEntryKind */
-	uint8 _pad0;						   /*  1B — session @ 48 */
+	uint8 request_flags;				   /*  1B — original request properties */
 	uint64 pcm_x_master_session;		   /*  8B — PCM-X kind only */
 	GcsBlockReplyHeader reply_header;	   /* 48B — full reply header (HC99) */
 	bool has_sf_dep;					   /*  1B — spec-6.2 v2 dep vector present */
@@ -184,6 +184,10 @@ typedef struct GcsBlockDedupEntry {
 	int64 pinned_lifetime_us;			   /*  8B — round-2: TTL pinned at register */
 	int64 pinned_done_linger_us;		   /*  8B — round-2: quarantine pinned */
 } GcsBlockDedupEntry;
+
+#define GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND UINT8_C(0x01)
+#define GCS_BLOCK_DEDUP_REQUEST_F_VALID_MASK GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND
+#define GCS_BLOCK_DEDUP_REQUEST_F_PINNED UINT8_C(0x80)
 
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, entry_kind) == 46,
 				 "dedup entry kind occupies established padding at offset 46");
@@ -271,6 +275,17 @@ typedef enum GcsBlockDedupResult {
 												* fall through to retransmit
 												* path rather than re-broadcast. */
 } GcsBlockDedupResult;
+
+/* Result of advancing the exact legacy-reader termination set after a
+ * queue-kind pending-X claim has become authoritative.  NEW means one live
+ * N->S identity was atomically replaced with a cached retry denial; REPLAY
+ * returns an already-denied identity that still lacks exact DONE proof. */
+typedef enum GcsBlockPendingXDenyResult {
+	GCS_BLOCK_PENDING_X_DENY_INVALID = -1,
+	GCS_BLOCK_PENDING_X_DENY_NOT_FOUND = 0,
+	GCS_BLOCK_PENDING_X_DENY_NEW = 1,
+	GCS_BLOCK_PENDING_X_DENY_REPLAY = 2
+} GcsBlockPendingXDenyResult;
 
 
 /* ============================================================
@@ -452,6 +467,19 @@ extern GcsBlockDedupResult cluster_gcs_block_dedup_lookup_or_register(
 	int worker_id, const GcsBlockDedupKey *key, BufferTag tag, uint8 transition_id,
 	uint32 requester_lifetime_hint_ms, bool requester_done_capable,
 	GcsBlockDedupEntry *cached_reply_out);
+
+/* Under the routed shard lock, terminate one same-tag, still-live legacy
+ * N->S grant/forward identity after PCM-X publishes its queue-kind claim.
+ * A by-value cached denial is returned for initial send or periodic replay;
+ * exact DONE removes it from the replay set. */
+extern GcsBlockPendingXDenyResult cluster_gcs_block_dedup_pending_x_deny_next(
+	int worker_id, const BufferTag *tag, GcsBlockDedupEntry *denied_out);
+extern GcsBlockPendingXDenyResult cluster_gcs_block_dedup_pending_x_deny_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag, uint8 transition_id,
+	GcsBlockDedupEntry *denied_out);
+extern bool cluster_gcs_block_dedup_set_request_flags_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag, uint8 transition_id,
+	uint8 request_flags);
 
 /* Dedicated PCM-X image storage over the existing dedup entry pool.  Reserve
  * claims capacity before the revoke lifecycle starts.  Materialize publishes

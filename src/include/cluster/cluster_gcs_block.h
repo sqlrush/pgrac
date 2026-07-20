@@ -3281,14 +3281,15 @@ extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 /*
  * Returns true if a DURABLE PCM grant was acquired (GRANTED / STORAGE_
  * FALLBACK — the caller mirrors PCM ownership into buf->pcm_state).  Returns
- * false for a spec-5.2 D2 one-shot READ_IMAGE: the bytes were installed for
- * this read only, no S holder was registered, and the caller MUST leave
- * buf->pcm_state == N so the next access re-fetches.  Terminal denials
- * ereport(ERROR) and do not return.
+ * false for a spec-5.2 D2 one-shot READ_IMAGE, or for an authoritative
+ * DENIED_PENDING_X with *out_retry_denied set.  In the latter case the caller
+ * must exact-abort its GRANT_PENDING reservation before waiting/re-entering.
+ * Terminal denials ereport(ERROR) and do not return.
  */
 extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
-													PcmLockTransition transition_id,
-													int master_node, bool clean_eligible);
+											PcmLockTransition transition_id,
+											int master_node, bool clean_eligible,
+											bool *out_retry_denied);
 
 /*
  * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by

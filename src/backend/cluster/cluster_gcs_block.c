@@ -1893,7 +1893,8 @@ cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr required_lsn)
 
 bool
 cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
-										int master_node, bool clean_eligible)
+										int master_node, bool clean_eligible,
+										bool *out_retry_denied)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -1903,6 +1904,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool granted_storage_fallback = false;
 	bool read_image = false; /* spec-5.2 D2: one-shot read image, non-durable */
 	bool terminal_denied = false;
+	bool retry_denied = false;
 	bool retransmit_warning_emitted = false;
 	bool suppress_direct_land = false;
 	uint8 final_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
@@ -1924,6 +1926,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	/* PGRAC: spec-7.2 D6 — ship-latency histogram start stamp. */
 	TimestampTz ship_started_at;
 
+	Assert(out_retry_denied != NULL);
+	if (out_retry_denied == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster_gcs_send_block_request_and_wait: NULL retry result")));
+	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc")));
@@ -2485,34 +2493,13 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				continue;
 			}
 
-			/* PGRAC: spec-2.36 D6 (HC117) — reader starvation guard transient
-			 * denial.  N→S request was rejected because an X writer's broadcast
-			 * is in flight at the master;  reader exponential-backoffs per
-			 * cluster.gcs_block_starvation_max_retries and
-			 * cluster.gcs_block_starvation_backoff_ms.  Budget exhaustion
-			 * surfaces as 53R92 ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED. */
+			/* Queue arbitration owns this retry boundary.  Consume the exact
+			 * denial, release this request slot, and return to bufmgr so it can
+			 * abort the matching GRANT_PENDING token before any backoff.  The
+			 * next acquire mints both a fresh token and a fresh request_id; a
+			 * fixed starvation budget must never surface a client ERROR. */
 			if (final_status == GCS_BLOCK_REPLY_DENIED_PENDING_X) {
-				int starvation_attempt = retry_attempt;
-				int starvation_max = cluster_gcs_block_starvation_max_retries;
-				long backoff_ms;
-
-				if (starvation_attempt >= starvation_max) {
-					terminal_denied = true;
-					ereport(ERROR, (errcode(ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED),
-									errmsg("cluster_gcs_block: reader starvation retry budget "
-										   "exhausted (HC117)")));
-					break;
-				}
-				backoff_ms = (long)cluster_gcs_block_starvation_backoff_ms
-							 * (1L << (starvation_attempt < 16 ? starvation_attempt : 16));
-				if (backoff_ms > 25000)
-					backoff_ms = 25000;
-				(void)WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, backoff_ms,
-								WAIT_EVENT_GCS_BLOCK_STARVATION_RETRY);
-				ResetLatch(MyLatch);
-				current_master = cluster_gcs_lookup_master(tag);
-				if (retry_attempt < max_retries)
-					continue;
+				retry_denied = true;
 				break;
 			}
 
@@ -2677,9 +2664,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	 * histogram (GRANTED / STORAGE_FALLBACK / READ_IMAGE all delivered a
 	 * usable page;  the terminal-denied tail below ereports and loses the
 	 * sample, mirroring the xp scopes). */
-	if (granted || granted_storage_fallback || read_image) {
+	if (granted || granted_storage_fallback || read_image)
 		gcs_block_ship_hist_record(ship_started_at);
 
+	if (granted || granted_storage_fallback || read_image || retry_denied) {
 		/*
 		 * PGRAC: GCS-race round-2 RC-F — completion proof.  The terminal
 		 * reply was verified and consumed, so no retransmit of this
@@ -2727,6 +2715,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		return true;
 	if (read_image)
 		return false;
+	if (retry_denied) {
+		*out_retry_denied = true;
+		return false;
+	}
 
 	if (terminal_denied) {
 		switch ((GcsBlockReplyStatus)final_status) {
@@ -4874,6 +4866,26 @@ gcs_block_forward_send_admitted(int32 holder_node, const GcsBlockForwardPayload 
 	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
 }
 
+/* The generic IC sender intentionally treats self-destination as a no-op.
+ * GCS block replies are completion signals, so a same-node denial must enter
+ * the normal registered handler just like a wire reply. */
+static ClusterICSendResult
+gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *payload,
+								   uint32 payload_len)
+{
+	ClusterICEnvelope envelope;
+
+	if (dest_node != cluster_node_id)
+		return cluster_ic_send_envelope(msg_type, dest_node, payload, payload_len);
+	if (payload == NULL
+		|| !cluster_ic_envelope_build(&envelope, msg_type, (uint32)cluster_node_id,
+								  (uint32)cluster_node_id, payload, payload_len))
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	return cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id)
+			   ? CLUSTER_IC_SEND_DONE
+			   : CLUSTER_IC_SEND_HARD_ERROR;
+}
+
 static void
 gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBlockReplyStatus status,
 					 XLogRecPtr page_lsn, const char *block_data)
@@ -4894,7 +4906,7 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 	if (status == GCS_BLOCK_REPLY_GRANTED && block_data != NULL)
 		hdr.checksum = gcs_block_compute_checksum(block_data);
 
-	if (GcsBlockRequestPayloadIsDirectLandArmed(req)) {
+	if (GcsBlockRequestPayloadIsDirectLandArmed(req) && dest_node != cluster_node_id) {
 		if (status != GCS_BLOCK_REPLY_GRANTED || block_data == NULL) {
 			char zero_page[GCS_BLOCK_DATA_SIZE];
 
@@ -4929,7 +4941,8 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 		wire_hdr = (GcsBlockReplyHeader *)buf;
 		*wire_hdr = hdr;
 		wire_hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
-		rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total);
+		rc = gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf,
+											  total);
 		pfree(buf);
 	}
 
@@ -4971,7 +4984,7 @@ gcs_block_deny_direct_armed_forward_request(const GcsBlockRequestPayload *req)
  *	then issues a new request with a fresh 4-tuple key (different cluster_
  *	epoch field) which will MISS_REGISTERED and produce a fresh reply.
  */
-static void
+static bool
 gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 {
 	uint32 header_len;
@@ -4980,6 +4993,10 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 	GcsBlockReplyHeader *hdr;
 	char *block_data;
 	bool has_block_payload;
+	ClusterICSendResult rc;
+
+	if (entry == NULL)
+		return false;
 
 	header_len = entry->has_sf_dep && entry->sf_dep_count > 0
 					 ? (uint32)sizeof(GcsBlockReplyHeaderV2)
@@ -5016,7 +5033,7 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
 		Assert(false); /* classification bug — lookup must route FORWARDED */
 		pfree(buf);
-		return;
+		return false;
 	}
 	block_data = buf + header_len;
 	has_block_payload = entry->status == GCS_BLOCK_REPLY_GRANTED
@@ -5024,11 +5041,19 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 	if (has_block_payload)
 		memcpy(block_data, entry->block_data, GCS_BLOCK_DATA_SIZE);
 	/* else: block_data already zeroed by palloc0 */
+	hdr->checksum = gcs_block_compute_checksum(block_data);
 
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_REPLY,
-		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total));
+	if ((entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND) != 0
+		&& dest_node != cluster_node_id) {
+		(void)gcs_block_try_send_direct_reply(dest_node, true, hdr,
+										  has_block_payload ? block_data : NULL, 0, NULL, NULL);
+		pfree(buf);
+		return true;
+	}
+	rc = gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);
 	pfree(buf);
+	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
 }
 
 
@@ -5299,6 +5324,17 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 	return true;
 }
 
+static bool
+gcs_block_queue_pending_x_authoritative(BufferTag tag)
+{
+	PcmAuthoritySnapshot authority;
+
+	if (!cluster_pcm_lock_authority_snapshot(tag, &authority))
+		return false;
+	return authority.pending_x_requester_node >= 0
+		   && (authority.pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) != 0;
+}
+
 /*
  * cluster_gcs_handle_block_request_envelope — master-side dispatcher.
  *
@@ -5334,6 +5370,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	void *block_payload_release_arg = NULL;
 	ClusterSfDepVec sf_dep_vec;
 	bool sf_dep_valid = false;
+	bool queue_pending_x_before = false;
+	uint8 request_flags = 0;
 
 	(void)env;
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
@@ -5434,11 +5472,60 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.request_id = req->request_id;
 	key.cluster_epoch = req->epoch;
 	memset(&cached_entry, 0, sizeof(cached_entry));
+	if (req->transition_id == PCM_TRANS_N_TO_S)
+		queue_pending_x_before = gcs_block_queue_pending_x_authoritative(req->tag);
 
 	dr = cluster_gcs_block_dedup_lookup_or_register(
 		dedup_worker_id, &key, req->tag, req->transition_id,
 		GcsBlockRequestPayloadGetLifetimeHintMs(req),
 		cluster_sf_peer_supports_gcs_done(req->sender_node), &cached_entry);
+	if (dr != GCS_BLOCK_DEDUP_VALIDATION_FAIL && dr != GCS_BLOCK_DEDUP_FULL) {
+		if (GcsBlockRequestPayloadIsDirectLandArmed(req))
+			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND;
+		if (!cluster_gcs_block_dedup_set_request_flags_exact(
+				dedup_worker_id, &key, &req->tag, req->transition_id, request_flags)) {
+			/* The tuple was removed/replaced or its immutable request properties
+			 * changed between lookup and pinning.  Neither case may inherit the
+			 * earlier entry's grant rights. */
+			gcs_block_send_reply(req->sender_node, req,
+								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
+								 NULL);
+			return;
+		}
+	}
+
+	/* Check both sides of registration.  A queue claim that linearized before
+	 * lookup routes this request directly to a cached exact denial; a claim
+	 * that races after lookup is caught either here or by the claim-side scan.
+	 * Queue ownership has no same-node exemption. */
+	if (req->transition_id == PCM_TRANS_N_TO_S
+		&& (queue_pending_x_before || gcs_block_queue_pending_x_authoritative(req->tag))) {
+		GcsBlockPendingXDenyResult deny_result;
+
+		if (dr == GCS_BLOCK_DEDUP_VALIDATION_FAIL) {
+			gcs_block_send_reply(req->sender_node, req,
+								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
+								 NULL);
+			return;
+		}
+		if (dr == GCS_BLOCK_DEDUP_FULL) {
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_DEDUP_FULL,
+								 InvalidXLogRecPtr, NULL);
+			return;
+		}
+		deny_result = cluster_gcs_block_dedup_pending_x_deny_exact(
+			dedup_worker_id, &key, &req->tag, req->transition_id, &cached_entry);
+		if (deny_result != GCS_BLOCK_PENDING_X_DENY_NEW
+			&& deny_result != GCS_BLOCK_PENDING_X_DENY_REPLAY) {
+			gcs_block_send_reply(req->sender_node, req,
+								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
+								 NULL);
+			return;
+		}
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+		(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
+		return;
+	}
 	switch (dr) {
 	case GCS_BLOCK_DEDUP_CACHED_REPLY:
 		gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
@@ -5545,30 +5632,38 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		int32 pending_x;
 
 		/* spec-2.36 D16 inject — force DENIED_PENDING_X for TAP coverage of
-		 * reader starvation backoff + 53R92 budget exhaustion. */
+		 * exact abort + fresh-identity reader backoff. */
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-starvation-force-denied");
 		if (cluster_injection_should_skip("cluster-gcs-block-starvation-force-denied")) {
+			GcsBlockPendingXDenyResult deny_result;
+
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
-			/* A retry-driven denial must not leave the IN_FLIGHT dedup entry
-			 * behind:  the requester's backoff retry reuses the same
-			 * (request_id, epoch) key, so a leftover entry swallows the retry
-			 * as IN_FLIGHT_DUPLICATE until the TTL sweep — each swallowed
-			 * round burns a full cluster.gcs_reply_timeout_ms and the
-			 * convergence the deny promises never re-evaluates. */
-			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
-			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
-								 InvalidXLogRecPtr, NULL);
+			deny_result = cluster_gcs_block_dedup_pending_x_deny_exact(
+				dedup_worker_id, &key, &req->tag, req->transition_id, &cached_entry);
+			if (deny_result == GCS_BLOCK_PENDING_X_DENY_NEW
+				|| deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
+				(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
+			else
+				gcs_block_send_reply(req->sender_node, req,
+									 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+									 InvalidXLogRecPtr, NULL);
 			return;
 		}
 
 		pending_x = cluster_pcm_lock_query_pending_x_requester(req->tag);
 		if (pending_x >= 0 && pending_x != req->sender_node) {
+			GcsBlockPendingXDenyResult deny_result;
+
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
-			/* Same dedup-entry release as the inject branch above: the deny
-			 * contract is "back off and retry, the retry re-evaluates". */
-			cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
-			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
-								 InvalidXLogRecPtr, NULL);
+			deny_result = cluster_gcs_block_dedup_pending_x_deny_exact(
+				dedup_worker_id, &key, &req->tag, req->transition_id, &cached_entry);
+			if (deny_result == GCS_BLOCK_PENDING_X_DENY_NEW
+				|| deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
+				(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
+			else
+				gcs_block_send_reply(req->sender_node, req,
+									 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+									 InvalidXLogRecPtr, NULL);
 			return;
 		}
 	}
@@ -9605,6 +9700,43 @@ gcs_block_pcm_x_ensure_pending_x_claim(const PcmXMasterDriveSnapshot *snapshot)
 	return PCM_X_QUEUE_OK;
 }
 
+/* Once the queue-kind cookie is visible, every older same-tag legacy reader
+ * must lose its grant/forward right before PROBE/REVOKE can advance.  Drain
+ * NEW victims one by one (no bounded receiver array), then replay one exact
+ * unacknowledged denial per drive tick until requester DONE removes it. */
+static PcmXQueueResult
+gcs_block_pcm_x_deny_legacy_readers(const PcmXMasterDriveSnapshot *snapshot)
+{
+	GcsBlockDedupEntry denied;
+	GcsBlockPendingXDenyResult deny_result;
+	int worker_id;
+
+	if (snapshot == NULL
+		|| !cluster_pcm_lock_queue_pending_x_exact(snapshot->ref.identity.tag,
+												snapshot->ref.identity.node_id,
+												snapshot->ref.handle.ticket_id))
+		return PCM_X_QUEUE_BAD_STATE;
+	worker_id = cluster_lms_shard_for_tag(&snapshot->ref.identity.tag, cluster_lms_workers);
+	if (worker_id < 0 || worker_id >= cluster_lms_workers)
+		return PCM_X_QUEUE_INVALID;
+
+	for (;;) {
+		memset(&denied, 0, sizeof(denied));
+		deny_result = cluster_gcs_block_dedup_pending_x_deny_next(
+			worker_id, &snapshot->ref.identity.tag, &denied);
+		if (deny_result == GCS_BLOCK_PENDING_X_DENY_NOT_FOUND)
+			return PCM_X_QUEUE_OK;
+		if (deny_result != GCS_BLOCK_PENDING_X_DENY_NEW
+			&& deny_result != GCS_BLOCK_PENDING_X_DENY_REPLAY)
+			return PCM_X_QUEUE_CORRUPT;
+		if (denied.key.origin_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| !gcs_block_resend_cached_reply((int32)denied.key.origin_node_id, &denied))
+			return PCM_X_QUEUE_BUSY;
+		if (deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
+			return PCM_X_QUEUE_OK;
+	}
+}
+
 
 static PcmXQueueResult
 gcs_block_pcm_x_stage_queue_invalidations(const PcmXMasterDriveSnapshot *snapshot,
@@ -9936,10 +10068,14 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 		drive_stage = "probe";
 		result = gcs_block_pcm_x_ensure_pending_x_claim(&snapshot);
 		if (result == PCM_X_QUEUE_OK)
+			result = gcs_block_pcm_x_deny_legacy_readers(&snapshot);
+		if (result == PCM_X_QUEUE_OK)
 			result = gcs_block_pcm_x_master_drive_probe(&snapshot);
 	} else if (snapshot.ticket_state == PCM_XT_ACTIVE_TRANSFER) {
 		drive_stage = "transfer";
-		result = gcs_block_pcm_x_master_drive_transfer(&snapshot);
+		result = gcs_block_pcm_x_deny_legacy_readers(&snapshot);
+		if (result == PCM_X_QUEUE_OK)
+			result = gcs_block_pcm_x_master_drive_transfer(&snapshot);
 	} else {
 		drive_stage = "state";
 		result = PCM_X_QUEUE_CORRUPT;

@@ -2747,12 +2747,18 @@ cluster_pcm_clean_page_xfer_consume(void)
  *	(HC84 PageSetLSN + memcpy under content_lock EXCLUSIVE).
  */
 bool
-cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
+cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_retry_denied)
 {
 	BufferTag tag;
 	int master_node;
 	bool clean_eligible;
 
+	Assert(out_retry_denied != NULL);
+	if (out_retry_denied == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster_pcm_lock_acquire_buffer: NULL retry result")));
+	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
@@ -2857,8 +2863,8 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 		 * spec-5.2a D2/D3: carry clean-page eligibility (X only) so the remote
 		 * master takes the dedicated clean-page X-transfer path rather than the
 		 * conservative HG7 fail-closed DENY. */
-		return cluster_gcs_send_block_request_and_wait(buf, trans, master_node,
-													   clean_eligible && mode == PCM_LOCK_MODE_X);
+		return cluster_gcs_send_block_request_and_wait(
+			buf, trans, master_node, clean_eligible && mode == PCM_LOCK_MODE_X, out_retry_denied);
 	}
 
 	/*

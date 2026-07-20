@@ -528,7 +528,8 @@ bool
 cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
 										PcmLockTransition trans pg_attribute_unused(),
 										int master_node pg_attribute_unused(),
-										bool clean_eligible pg_attribute_unused())
+										bool clean_eligible pg_attribute_unused(),
+										bool *out_retry_denied pg_attribute_unused())
 {
 	abort();
 }
@@ -1250,13 +1251,14 @@ UT_TEST(test_pcm_b_local_master_remote_x_holder_fail_closed)
 UT_TEST(test_pcm_d1_recovering_gate_fail_closed)
 {
 	BufferDesc buf;
+	bool retry_denied = false;
 
 	reset_fake_pcm_runtime(2);
 	buf.tag = make_tag(77);
 
 	fake_block_phase = GCS_BLOCK_RECOVERING;
 	cluster_gcs_block_recovery_wait_ms = 0; /* immediate fail-closed, no sleep */
-	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_S));
+	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_S, &retry_denied));
 	fake_block_phase = GCS_BLOCK_NORMAL;
 	cluster_gcs_block_recovery_wait_ms = 200;
 }
@@ -1433,6 +1435,7 @@ UT_TEST(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades)
 	BufferTag tag = make_tag(96);
 	BufferDesc buf;
 	bool save = cluster_gcs_block_local_cache;
+	bool retry_denied = false;
 
 	reset_fake_pcm_runtime(4);
 	fake_cssd_dead_node = -1;
@@ -1447,7 +1450,8 @@ UT_TEST(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades)
 	buf.tag = tag;
 	buf.pcm_state = (uint8)PCM_STATE_N;
 	cluster_node_id = 0;
-	UT_ASSERT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_X));
+	UT_ASSERT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_X, &retry_denied));
+	UT_ASSERT(!retry_denied);
 	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_X);
 	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tag, 0));
 	UT_ASSERT(cluster_pcm_master_requester_is_holder(tag, 0, PCM_TRANS_N_TO_X));

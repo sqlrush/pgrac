@@ -1345,12 +1345,10 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
  * fresh begin against the re-sampled complete ownership tuple; another
  * lifecycle's token/flags are never touched.  No content lock is held at
  * either call site, and a backend holding OTHER frozen-tag content locks
- * must not sleep (nested-guard discipline) — both the guard refusal and the
- * bounded-wait exhaustion fall back to the historical fail-closed report in
- * the caller.
+ * must not sleep (nested-guard discipline).  There is deliberately no retry
+ * budget: ordinary ownership competition is cancelable waiting, never a
+ * client-visible exhaustion error.
  */
-#define CLUSTER_BUFMGR_PCM_RESERVATION_MAX_WAITS 64
-
 static ClusterPcmOwnResult
 cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
 												ClusterPcmOwnSnapshot *base_out,
@@ -1362,8 +1360,7 @@ cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
 	for (;;)
 	{
 		result = cluster_pcm_own_begin_grant_reservation(buf, base_out, token_out);
-		if (result != CLUSTER_PCM_OWN_BUSY
-			|| waits >= CLUSTER_BUFMGR_PCM_RESERVATION_MAX_WAITS)
+		if (result != CLUSTER_PCM_OWN_BUSY)
 			return result;
 		if (cluster_pcm_x_nested_wait_guard_before_block() != PCM_X_QUEUE_OK)
 			return result;
@@ -1373,7 +1370,8 @@ cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
 						 cluster_pcm_x_holder_retry_delay_ms(waits),
 						 WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
 		CHECK_FOR_INTERRUPTS();
-		waits++;
+		if (waits < PG_UINT32_MAX)
+			waits++;
 	}
 }
 
@@ -1405,6 +1403,84 @@ cluster_bufmgr_pcm_legacy_begin_probe(BufferDesc *buf, PcmLockMode pcm_mode,
 		 (unsigned long long) base->generation,
 		 (unsigned long long) base->reservation_token,
 		 base->flags, buf->pcm_state);
+}
+
+typedef enum ClusterBufmgrPcmRetryRearmResult
+{
+	CLUSTER_BUFMGR_PCM_RETRY_REARMED = 0,
+	CLUSTER_BUFMGR_PCM_RETRY_COVERED,
+	CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED
+} ClusterBufmgrPcmRetryRearmResult;
+
+/* Consume one authoritative DENIED_PENDING_X.  The exact old reservation is
+ * aborted before sleeping; STALE is an ABA-safe zero-mutation result and is
+ * handled by re-sampling the complete ownership tuple.  A successful rearm
+ * always publishes a fresh token, while the subsequent GCS call allocates a
+ * fresh request_id. */
+static ClusterBufmgrPcmRetryRearmResult
+cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
+										 ClusterPcmOwnSnapshot *base,
+										 uint64 *reservation_token, uint32 wait_index,
+										 bool *barrier_refused, uint64 *covered_generation)
+{
+	ClusterPcmOwnResult own_result;
+	PcmXQueueResult guard_result;
+	uint8 current_state;
+	uint32 current_flags;
+	long backoff_ms;
+
+	if (buf == NULL || base == NULL || reservation_token == NULL
+		|| covered_generation == NULL)
+	{
+		cluster_pcm_own_report_bump_failure(buf, CLUSTER_PCM_OWN_INVALID, 0, 0,
+										"pending-X retry arguments");
+		return CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED;
+	}
+	own_result = cluster_pcm_own_abort_grant_reservation(buf, base, *reservation_token);
+	if (own_result != CLUSTER_PCM_OWN_OK && own_result != CLUSTER_PCM_OWN_STALE)
+		cluster_pcm_own_report_bump_failure(buf, own_result, base->generation, base->flags,
+										"pending-X exact abort");
+
+	/* A stale exact abort never touches the successor.  If that successor is
+	 * already a stable covering grant, rejoin the normal post-content-lock
+	 * generation check instead of opening another reservation over it. */
+	cluster_pcm_own_read(buf, &current_state, covered_generation, &current_flags);
+	if (current_flags == 0 && cluster_gcs_block_local_cache
+		&& cluster_pcm_mode_covers((PcmLockMode) current_state, pcm_mode))
+		return CLUSTER_BUFMGR_PCM_RETRY_COVERED;
+
+	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+	if (guard_result != PCM_X_QUEUE_OK)
+	{
+		if (barrier_refused != NULL && guard_result == PCM_X_QUEUE_BARRIER_CLOSED)
+		{
+			*barrier_refused = true;
+			cluster_pcm_x_stats_note_barrier_unwind();
+			return CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED;
+		}
+		cluster_bufmgr_pcm_x_holder_report_failure(guard_result, buf,
+											  "pending-X retry nested guard");
+	}
+
+	backoff_ms = (long) cluster_gcs_block_starvation_backoff_ms
+				 * (1L << (wait_index < 16 ? wait_index : 16));
+	if (backoff_ms <= 0)
+		backoff_ms = 1;
+	if (backoff_ms > 25000)
+		backoff_ms = 25000;
+	CHECK_FOR_INTERRUPTS();
+	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, backoff_ms,
+					 WAIT_EVENT_GCS_BLOCK_STARVATION_RETRY);
+	ResetLatch(MyLatch);
+	CHECK_FOR_INTERRUPTS();
+
+	own_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, base,
+													 reservation_token);
+	if (own_result != CLUSTER_PCM_OWN_OK)
+		cluster_pcm_own_report_bump_failure(buf, own_result, base->generation, base->flags,
+										"pending-X retry reservation");
+	cluster_bufmgr_pcm_legacy_begin_probe(buf, pcm_mode, base, "pending-X retry reservation");
+	return CLUSTER_BUFMGR_PCM_RETRY_REARMED;
 }
 
 static ClusterPcmXHolderLedgerEntry *
@@ -2529,7 +2605,9 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	ClusterPcmOwnSnapshot pending_base;
 	ClusterPcmOwnResult pending_result;
 	bool		grant_acquired = false;
+	bool		retry_denied = false;
 	uint32		buf_state;
+	uint32		retry_wait_index = 0;
 	uint64		pending_token = 0;
 	uint64		committed_generation;
 
@@ -2561,17 +2639,34 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, pending_result, &observed,
 												  "direct-init consume");
 
-	PG_TRY();
+	for (;;)
 	{
-		grant_acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X);
-	}
-	PG_CATCH();
-	{
-		cluster_pcm_own_abort_grant_after_error(buf, &pending_base, pending_token,
+		ClusterBufmgrPcmRetryRearmResult rearm_result;
+		uint64 covered_generation = 0;
+
+		retry_denied = false;
+		PG_TRY();
+		{
+			grant_acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X, &retry_denied);
+		}
+		PG_CATCH();
+		{
+			cluster_pcm_own_abort_grant_after_error(buf, &pending_base, pending_token,
 												"direct-init acquire");
-		PG_RE_THROW();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!retry_denied)
+			break;
+		rearm_result = cluster_bufmgr_pcm_retry_denied_rearm(
+			buf, PCM_LOCK_MODE_X, &pending_base, &pending_token, retry_wait_index, NULL,
+			&covered_generation);
+		if (retry_wait_index < PG_UINT32_MAX)
+			retry_wait_index++;
+		if (rearm_result != CLUSTER_BUFMGR_PCM_RETRY_REARMED)
+			cluster_bufmgr_pcm_direct_init_report_failure(
+				buf, CLUSTER_PCM_OWN_STALE, &observed, "direct-init pending-X rearm");
 	}
-	PG_END_TRY();
 
 	if (grant_acquired)
 		cluster_pcm_own_finish_grant_or_rollback(buf, &pending_base, pending_token,
@@ -8139,6 +8234,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 	ClusterPcmXHolderLedgerEntry *pcm_x_holder = NULL;
 	ClusterPcmXWriterLedgerEntry *pcm_x_writer = NULL;
 	bool pcm_x_writer_managed = false;
+	bool pcm_retry_denied = false;
+	uint32 pcm_retry_wait_index = 0;
 #endif
 
 	Assert(BufferIsPinned(buffer));
@@ -8263,25 +8360,44 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 				 * left at N (the next access re-fetches — a cached copy
 				 * with no invalidation path would go stale, Rule 8.A).
 				 */
-				PG_TRY();
+				for (;;)
 				{
-					pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+					ClusterBufmgrPcmRetryRearmResult rearm_result;
+
+					pcm_retry_denied = false;
+					PG_TRY();
+					{
+						pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode,
+														 &pcm_retry_denied);
+					}
+					PG_CATCH();
+					{
+						/* An acquire that throws must not leak the exact
+						 * GRANT_PENDING marker into later INVALIDATEs. */
+						cluster_pcm_own_abort_grant_after_error(
+							buf, &pcm_pending_base, pcm_pending_token,
+							"LockBuffer master acquire");
+						PG_RE_THROW();
+					}
+					PG_END_TRY();
+					if (!pcm_retry_denied)
+						break;
+
+					pcm_pending_set = false;
+					rearm_result = cluster_bufmgr_pcm_retry_denied_rearm(
+						buf, pcm_mode, &pcm_pending_base, &pcm_pending_token,
+						pcm_retry_wait_index, pcm_barrier_refused, &pcm_covered_gen);
+					if (pcm_retry_wait_index < PG_UINT32_MAX)
+						pcm_retry_wait_index++;
+					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
+						return;
+					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
+					{
+						pcm_covered = true;
+						break;
+					}
+					pcm_pending_set = true;
 				}
-				PG_CATCH();
-				{
-					/*
-					 * W3 — an acquire that THREW (upgrade-invalidate
-					 * timeout, transfer deny, ...) must not leak
-					 * GRANT_PENDING: a stale marker parks every later
-					 * same-tag INVALIDATE on this node (never ACKed -> remote
-					 * upgrades wedge, liveness).  The later PG_CATCH below
-					 * only covers the content-lock window, not this acquire.
-					 */
-					cluster_pcm_own_abort_grant_after_error(
-						buf, &pcm_pending_base, pcm_pending_token, "LockBuffer master acquire");
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
 			}
 		}
 	}
@@ -8413,6 +8529,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					{
 						if (pcm_x_writer == NULL)
 						{
+							ClusterBufmgrPcmRetryRearmResult rearm_result;
+
 							/*
 							 * Share-mode refresh, or the convert queue is not
 							 * managing this relation: the legacy master
@@ -8428,15 +8546,41 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 								buf, pcm_mode, &pcm_pending_base,
 								"revalidate-reservation");
 							pcm_pending_set = true;
-							pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+							for (;;)
+							{
+								pcm_retry_denied = false;
+								pcm_acquired = cluster_pcm_lock_acquire_buffer(
+									buf, pcm_mode, &pcm_retry_denied);
+								if (!pcm_retry_denied)
+									break;
+								pcm_pending_set = false;
+								rearm_result = cluster_bufmgr_pcm_retry_denied_rearm(
+									buf, pcm_mode, &pcm_pending_base, &pcm_pending_token,
+									pcm_retry_wait_index, pcm_barrier_refused,
+									&pcm_covered_gen);
+								if (pcm_retry_wait_index < PG_UINT32_MAX)
+									pcm_retry_wait_index++;
+								if (rearm_result
+									== CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
+									break;
+								if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
+								{
+									pcm_covered = true;
+									break;
+								}
+								pcm_pending_set = true;
+							}
 						}
-						pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
-						if (mode == BUFFER_LOCK_SHARE)
-							LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
-						else
-							LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
-						cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
-						cluster_pcm_note_writer_reverify_reacquire();
+						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+						{
+							pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
+							if (mode == BUFFER_LOCK_SHARE)
+								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+							else
+								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+							cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
+							cluster_pcm_note_writer_reverify_reacquire();
+						}
 					}
 				}
 			}
