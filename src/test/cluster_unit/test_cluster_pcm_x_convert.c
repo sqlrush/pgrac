@@ -15699,6 +15699,15 @@ requester_wait_revalidate(void *callback_arg)
 	return capture->revalidate_ok;
 }
 
+static PcmXQueueResult
+requester_wait_revalidate_result(void *callback_arg)
+{
+	RequesterWaitCapture *capture = (RequesterWaitCapture *)callback_arg;
+
+	capture->revalidate_calls++;
+	return capture->revalidate_ok ? PCM_X_QUEUE_OK : PCM_X_QUEUE_BARRIER_CLOSED;
+}
+
 static void
 requester_wait_block(void *callback_arg)
 {
@@ -15748,6 +15757,37 @@ UT_TEST(test_queue_wait_count_tracks_only_linearized_requester_waits)
 	UT_ASSERT_EQ(capture.count_seen_at_wait, 3);
 	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
 	UT_ASSERT_EQ(stats.wait_count, 3);
+}
+
+
+UT_TEST(test_requester_wait_preserves_late_revoke_barrier_refusal)
+{
+	RequesterWaitCapture capture = { 0 };
+	PcmXStatsSnapshot stats;
+
+	init_active_pcm_x(UINT64_C(82));
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 0);
+
+	/* A type-49 barrier that freezes after initial admission but before the
+	 * next WaitLatch must escape as BARRIER_CLOSED.  Sleeping here would keep
+	 * the source holder registered and deadlock IMAGE_READY forever. */
+	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(
+					 requester_wait_revalidate_result, requester_wait_block, &capture),
+				 PCM_X_QUEUE_BARRIER_CLOSED);
+	UT_ASSERT_EQ(capture.revalidate_calls, 1);
+	UT_ASSERT_EQ(capture.wait_calls, 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 0);
+
+	/* An exact OK proof still linearizes the count before the physical wait. */
+	capture.revalidate_ok = true;
+	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(
+					 requester_wait_revalidate_result, requester_wait_block, &capture),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(capture.revalidate_calls, 2);
+	UT_ASSERT_EQ(capture.wait_calls, 1);
+	UT_ASSERT_EQ(capture.count_seen_at_wait, 1);
 }
 
 
@@ -16203,7 +16243,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(271);
+	UT_PLAN(272);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16467,6 +16507,7 @@ main(void)
 	UT_RUN(test_registration_exposes_one_exact_region);
 	UT_RUN(test_stats_initialize_zero_and_narrow_note_apis_are_exact);
 	UT_RUN(test_queue_wait_count_tracks_only_linearized_requester_waits);
+	UT_RUN(test_requester_wait_preserves_late_revoke_barrier_refusal);
 	UT_RUN(test_stats_follow_exact_master_and_local_success_transitions);
 	UT_RUN(test_stats_count_fail_closed_and_exact_activating_reset_once);
 	UT_RUN(test_master_admit_lock_window_error_releases_gate_and_fails_closed);

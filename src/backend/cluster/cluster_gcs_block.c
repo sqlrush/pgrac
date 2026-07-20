@@ -8285,14 +8285,17 @@ typedef struct GcsBlockPcmXRequesterWaitContext {
 	long timeout_ms;
 } GcsBlockPcmXRequesterWaitContext;
 
-static bool
+static PcmXQueueResult
 gcs_block_pcm_x_requester_pre_sleep_revalidate(void *callback_arg)
 {
 	GcsBlockPcmXRequesterWaitContext *context = (GcsBlockPcmXRequesterWaitContext *)callback_arg;
 
-	return gcs_block_pcm_x_requester_authority_exact(context->request_runtime, context->master_node,
-													 context->cluster_epoch,
-													 context->master_session);
+	if (context == NULL
+		|| !gcs_block_pcm_x_requester_authority_exact(
+			context->request_runtime, context->master_node, context->cluster_epoch,
+			context->master_session))
+		return PCM_X_QUEUE_NOT_READY;
+	return cluster_pcm_x_nested_wait_guard_before_block();
 }
 
 static void
@@ -8308,11 +8311,12 @@ gcs_block_pcm_x_requester_wait_latch(void *callback_arg)
  * sides of the sleep are checked: a runtime fence or peer-session change that
  * lands while the latch is asleep must be observed before the next protocol
  * read or mutation. */
-static bool
+static PcmXQueueResult
 gcs_block_pcm_x_requester_wait_exact(uint32 *wait_index, const PcmXRuntimeSnapshot *request_runtime,
 									 int32 master_node, uint64 cluster_epoch, uint64 master_session)
 {
 	GcsBlockPcmXRequesterWaitContext context;
+	PcmXQueueResult result;
 	uint32 current;
 
 	if (wait_index == NULL)
@@ -8320,7 +8324,7 @@ gcs_block_pcm_x_requester_wait_exact(uint32 *wait_index, const PcmXRuntimeSnapsh
 						errmsg("cluster PCM-X requester wait has no backoff state")));
 	if (!gcs_block_pcm_x_requester_authority_exact(request_runtime, master_node, cluster_epoch,
 												   master_session))
-		return false;
+		return PCM_X_QUEUE_NOT_READY;
 	current = *wait_index;
 	memset(&context, 0, sizeof(context));
 	context.request_runtime = request_runtime;
@@ -8329,14 +8333,15 @@ gcs_block_pcm_x_requester_wait_exact(uint32 *wait_index, const PcmXRuntimeSnapsh
 	context.master_session = master_session;
 	context.timeout_ms = cluster_pcm_x_holder_retry_delay_ms(current);
 	CHECK_FOR_INTERRUPTS();
-	if (!cluster_pcm_x_requester_wait_once(gcs_block_pcm_x_requester_pre_sleep_revalidate,
-										   gcs_block_pcm_x_requester_wait_latch, &context))
-		return false;
+	result = cluster_pcm_x_requester_wait_once_result(
+		gcs_block_pcm_x_requester_pre_sleep_revalidate, gcs_block_pcm_x_requester_wait_latch,
+		&context);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
 	ResetLatch(MyLatch);
 	*wait_index = cluster_gcs_pcm_x_requester_wait_index_advance(current);
 	CHECK_FOR_INTERRUPTS();
-	return gcs_block_pcm_x_requester_authority_exact(request_runtime, master_node, cluster_epoch,
-													 master_session);
+	return gcs_block_pcm_x_requester_pre_sleep_revalidate(&context);
 }
 
 static void
@@ -8706,9 +8711,11 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (!cluster_gcs_pcm_x_nested_guard_retryable(result))
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
-		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												  cluster_epoch, master_session)) {
-			result = PCM_X_QUEUE_NOT_READY;
+		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+												cluster_epoch, master_session);
+		if (result != PCM_X_QUEUE_OK) {
+			if (result == PCM_X_QUEUE_CORRUPT)
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}
@@ -8734,9 +8741,11 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (result == PCM_X_QUEUE_CORRUPT)
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (initial_own.pcm_state == (uint8)PCM_STATE_READ_IMAGE || result == PCM_X_QUEUE_BUSY) {
-			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													  cluster_epoch, master_session)) {
-				result = PCM_X_QUEUE_NOT_READY;
+			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+													cluster_epoch, master_session);
+			if (result != PCM_X_QUEUE_OK) {
+				if (result == PCM_X_QUEUE_CORRUPT)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 			continue;
@@ -8772,9 +8781,11 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 			= cluster_gcs_pcm_x_requester_retry_action(GCS_BLOCK_PCM_X_RETRY_SITE_JOIN, result);
 		if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
-		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												  cluster_epoch, master_session)) {
-			result = PCM_X_QUEUE_NOT_READY;
+		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+												cluster_epoch, master_session);
+		if (result != PCM_X_QUEUE_OK) {
+			if (result == PCM_X_QUEUE_CORRUPT)
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}
@@ -8797,9 +8808,11 @@ requester_role_dispatch:
 				GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
-			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													  cluster_epoch, master_session)) {
-				result = PCM_X_QUEUE_NOT_READY;
+			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+													cluster_epoch, master_session);
+			if (result != PCM_X_QUEUE_OK) {
+				if (result == PCM_X_QUEUE_CORRUPT)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
@@ -8816,9 +8829,11 @@ requester_role_dispatch:
 				GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
-			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													  cluster_epoch, master_session)) {
-				result = PCM_X_QUEUE_NOT_READY;
+			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+													cluster_epoch, master_session);
+			if (result != PCM_X_QUEUE_OK) {
+				if (result == PCM_X_QUEUE_CORRUPT)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
@@ -8836,9 +8851,11 @@ requester_role_dispatch:
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			gcs_block_pcm_x_requester_cleanup_context.cutoff_started = false;
-			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													  cluster_epoch, master_session)) {
-				result = PCM_X_QUEUE_NOT_READY;
+			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+													cluster_epoch, master_session);
+			if (result != PCM_X_QUEUE_OK) {
+				if (result == PCM_X_QUEUE_CORRUPT)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
@@ -8889,10 +8906,11 @@ requester_role_dispatch:
 				retry_action = cluster_gcs_pcm_x_requester_retry_action(
 					GCS_BLOCK_PCM_X_RETRY_SITE_ROLE_REFRESH, result);
 				if (retry_action == GCS_BLOCK_PCM_X_RETRY_WAIT) {
-					if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime,
-															  master_node, cluster_epoch,
-															  master_session)) {
-						result = PCM_X_QUEUE_NOT_READY;
+					result = gcs_block_pcm_x_requester_wait_exact(
+						&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
+					if (result != PCM_X_QUEUE_OK) {
+						if (result == PCM_X_QUEUE_CORRUPT)
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 						GCS_BLOCK_PCM_X_REQUESTER_DONE();
 					}
 					continue;
@@ -8967,9 +8985,11 @@ requester_role_dispatch:
 				if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			}
-			if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													  cluster_epoch, master_session)) {
-				result = PCM_X_QUEUE_NOT_READY;
+			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+													cluster_epoch, master_session);
+			if (result != PCM_X_QUEUE_OK) {
+				if (result == PCM_X_QUEUE_CORRUPT)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				GCS_BLOCK_PCM_X_REQUESTER_DONE();
 			}
 		}
@@ -9227,9 +9247,11 @@ requester_role_dispatch:
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 
 	requester_wait:
-		if (!gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												  cluster_epoch, master_session)) {
-			result = PCM_X_QUEUE_NOT_READY;
+		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
+												cluster_epoch, master_session);
+		if (result != PCM_X_QUEUE_OK) {
+			if (result == PCM_X_QUEUE_CORRUPT)
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		}
 	}

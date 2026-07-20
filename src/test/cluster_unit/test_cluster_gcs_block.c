@@ -2725,7 +2725,11 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	const char *wait_exact_end;
 	const char *wait_exact_first_authority;
 	const char *wait_exact_physical;
-	const char *wait_exact_second_authority;
+	const char *wait_exact_second_revalidate;
+	const char *wait_revalidate;
+	const char *wait_revalidate_end;
+	const char *wait_revalidate_authority;
+	const char *wait_revalidate_nested_guard;
 	const char *wait_scan;
 	int raw_wait_count = 0;
 	int exact_wait_count = 0;
@@ -2748,6 +2752,9 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	authority_helper_end = authority_helper != NULL ? strstr(authority_helper, "\n}\n") : NULL;
 	wait_exact = strstr(source, "\ngcs_block_pcm_x_requester_wait_exact(");
 	wait_exact_end = wait_exact != NULL ? strstr(wait_exact, "\n}\n") : NULL;
+	wait_revalidate = strstr(source, "\ngcs_block_pcm_x_requester_pre_sleep_revalidate(");
+	wait_revalidate_end
+		= wait_revalidate != NULL ? strstr(wait_revalidate, "\n}\n") : NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(driver_end);
 	UT_ASSERT_NOT_NULL(rekey_helper);
@@ -2762,6 +2769,8 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	UT_ASSERT_NOT_NULL(authority_helper_end);
 	UT_ASSERT_NOT_NULL(wait_exact);
 	UT_ASSERT_NOT_NULL(wait_exact_end);
+	UT_ASSERT_NOT_NULL(wait_revalidate);
+	UT_ASSERT_NOT_NULL(wait_revalidate_end);
 	if (driver == NULL || driver_end == NULL || wrapper == NULL || wrapper_end == NULL) {
 		free(source);
 		return;
@@ -2859,28 +2868,43 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 							 : NULL;
 	wait_exact_physical
 		= wait_exact_first_authority != NULL
-			  ? strstr(wait_exact_first_authority, "cluster_pcm_x_requester_wait_once(")
+			  ? strstr(wait_exact_first_authority, "cluster_pcm_x_requester_wait_once_result(")
 			  : NULL;
-	wait_exact_second_authority
+	wait_exact_second_revalidate
 		= wait_exact_physical != NULL
-			  ? strstr(wait_exact_physical + 1, "gcs_block_pcm_x_requester_authority_exact(")
+			  ? strstr(wait_exact_physical + 1,
+					   "gcs_block_pcm_x_requester_pre_sleep_revalidate(&context)")
+			  : NULL;
+	wait_revalidate_authority
+		= wait_revalidate != NULL
+			  ? strstr(wait_revalidate, "gcs_block_pcm_x_requester_authority_exact(")
+			  : NULL;
+	wait_revalidate_nested_guard
+		= wait_revalidate_authority != NULL
+			  ? strstr(wait_revalidate_authority, "cluster_pcm_x_nested_wait_guard_before_block()")
 			  : NULL;
 	UT_ASSERT_NOT_NULL(authority_runtime);
 	UT_ASSERT_NOT_NULL(authority_runtime_exact);
 	UT_ASSERT_NOT_NULL(authority_peer);
 	UT_ASSERT_NOT_NULL(wait_exact_first_authority);
 	UT_ASSERT_NOT_NULL(wait_exact_physical);
-	UT_ASSERT_NOT_NULL(wait_exact_second_authority);
+	UT_ASSERT_NOT_NULL(wait_exact_second_revalidate);
+	UT_ASSERT_NOT_NULL(wait_revalidate_authority);
+	UT_ASSERT_NOT_NULL(wait_revalidate_nested_guard);
 	if (authority_runtime != NULL && authority_runtime_exact != NULL && authority_peer != NULL
 		&& authority_helper_end != NULL)
 		UT_ASSERT(authority_runtime < authority_runtime_exact
 				  && authority_runtime_exact < authority_peer
 				  && authority_peer < authority_helper_end);
 	if (wait_exact_first_authority != NULL && wait_exact_physical != NULL
-		&& wait_exact_second_authority != NULL && wait_exact_end != NULL)
+		&& wait_exact_second_revalidate != NULL && wait_exact_end != NULL)
 		UT_ASSERT(wait_exact_first_authority < wait_exact_physical
-				  && wait_exact_physical < wait_exact_second_authority
-				  && wait_exact_second_authority < wait_exact_end);
+				  && wait_exact_physical < wait_exact_second_revalidate
+				  && wait_exact_second_revalidate < wait_exact_end);
+	if (wait_revalidate_authority != NULL && wait_revalidate_nested_guard != NULL
+		&& wait_revalidate_end != NULL)
+		UT_ASSERT(wait_revalidate_authority < wait_revalidate_nested_guard
+				  && wait_revalidate_nested_guard < wait_revalidate_end);
 	formation = strstr(driver, "cluster_gcs_pcm_x_requester_formation_action(");
 	formation_wait = formation != NULL
 						 ? strstr(formation, "gcs_block_pcm_x_requester_wait(&wait_index)")

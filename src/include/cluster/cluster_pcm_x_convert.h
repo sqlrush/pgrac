@@ -1343,9 +1343,13 @@ extern bool cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out);
 extern void cluster_pcm_x_stats_note_enqueue(void);
 extern void cluster_pcm_x_stats_note_wait(void);
 typedef bool (*PcmXPreSleepRevalidateCallback)(void *callback_arg);
+typedef PcmXQueueResult (*PcmXPreSleepResultCallback)(void *callback_arg);
 typedef void (*PcmXWaitCallback)(void *callback_arg);
 extern bool cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback revalidate,
 											  PcmXWaitCallback wait, void *callback_arg);
+extern PcmXQueueResult
+cluster_pcm_x_requester_wait_once_result(PcmXPreSleepResultCallback revalidate,
+										PcmXWaitCallback wait, void *callback_arg);
 extern void cluster_pcm_x_stats_note_queue_result(PcmXQueueResult result);
 extern void cluster_pcm_x_stats_note_own_begin(void);
 extern void cluster_pcm_x_stats_note_own_commit(void);

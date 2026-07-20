@@ -998,6 +998,23 @@ cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback revalidate, Pcm
 }
 
 
+PcmXQueueResult
+cluster_pcm_x_requester_wait_once_result(PcmXPreSleepResultCallback revalidate,
+									PcmXWaitCallback wait, void *callback_arg)
+{
+	PcmXQueueResult result;
+
+	if (revalidate == NULL || wait == NULL)
+		return PCM_X_QUEUE_INVALID;
+	result = revalidate(callback_arg);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	cluster_pcm_x_stats_note_wait();
+	wait(callback_arg);
+	return PCM_X_QUEUE_OK;
+}
+
+
 void
 cluster_pcm_x_stats_note_queue_result(PcmXQueueResult result)
 {
