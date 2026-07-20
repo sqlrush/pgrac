@@ -1116,6 +1116,21 @@ gcs_block_send_direct_reply_sge(int32 dest_node, const GcsBlockReplyHeader *hdr,
 	return rc;
 }
 
+ClusterICSendResult
+cluster_gcs_block_send_direct_zero_reply(int32 dest_node, const GcsBlockReplyHeader *header)
+{
+	ClusterICSendResult rc;
+
+	if (header == NULL || dest_node < 0 || dest_node >= CLUSTER_MAX_NODES
+		|| dest_node == cluster_node_id
+		|| header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	rc = gcs_block_send_direct_reply_sge(dest_node, header, NULL, 0, NULL, NULL);
+	if (rc == CLUSTER_IC_SEND_DONE && ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+	return rc;
+}
+
 static bool
 gcs_block_try_send_direct_reply(int32 dest_node, bool direct_armed, GcsBlockReplyHeader *hdr,
 								const char *block_payload, uint32 block_lkey,
@@ -9798,7 +9813,13 @@ gcs_block_pcm_x_deny_legacy_readers(const PcmXMasterDriveSnapshot *snapshot)
 			&& deny_result != GCS_BLOCK_PENDING_X_DENY_REPLAY)
 			return PCM_X_QUEUE_CORRUPT;
 		if (denied.key.origin_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
-			|| !gcs_block_resend_cached_reply((int32)denied.key.origin_node_id, &denied))
+			|| denied.status != GCS_BLOCK_REPLY_DENIED_PENDING_X
+			|| denied.reply_header.status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
+			return PCM_X_QUEUE_CORRUPT;
+		if (!cluster_lms_outbound_enqueue_zero_block_reply(
+				worker_id, denied.key.origin_node_id, &denied.reply_header,
+				(denied.request_flags & GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND) != 0
+					&& (int32)denied.key.origin_node_id != cluster_node_id))
 			return PCM_X_QUEUE_BUSY;
 		if (deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
 			return PCM_X_QUEUE_OK;

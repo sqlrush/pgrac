@@ -3431,6 +3431,8 @@ typedef enum GcsBlockSendFamily {
 } GcsBlockSendFamily;
 
 extern void cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc);
+extern ClusterICSendResult cluster_gcs_block_send_direct_zero_reply(
+	int32 dest_node, const GcsBlockReplyHeader *header);
 
 extern uint64 cluster_gcs_get_reply_send_queued_count(void);
 extern uint64 cluster_gcs_get_reply_send_not_admitted_count(void);

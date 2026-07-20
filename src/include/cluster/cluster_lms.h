@@ -401,6 +401,9 @@ extern void cluster_lms_outbound_shmem_register(void);
 extern void cluster_lms_outbound_request_lwlocks(void);
 extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 										 const void *payload, uint16 payload_len);
+struct GcsBlockReplyHeader;
+extern bool cluster_lms_outbound_enqueue_zero_block_reply(
+	int worker_id, uint32 dest_node_id, const struct GcsBlockReplyHeader *header, bool direct_land);
 extern int cluster_lms_outbound_drain_send(int worker_id);
 extern uint32 cluster_lms_outbound_depth(int worker_id);
 

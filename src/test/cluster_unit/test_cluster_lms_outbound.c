@@ -193,6 +193,13 @@ cluster_lms_obs_note_outbound_requeue_drop(int worker_id)
 	ut_requeue_drop_count++;
 }
 
+void
+cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc)
+{
+	(void)family;
+	(void)rc;
+}
+
 static int ut_prepare_hook_count = 0;
 
 void
@@ -215,6 +222,8 @@ typedef struct UtSentRec {
 	uint8 msg_type;
 	int32 dest;
 	uint8 marker; /* first payload byte identifies the frame */
+	uint32 payload_len;
+	GcsBlockReplyHeader reply_header;
 } UtSentRec;
 
 static UtSentRec ut_sent_log[64];
@@ -222,6 +231,8 @@ static int ut_sent_n = 0;
 static ClusterICSendResult ut_peer_rc[CLUSTER_MAX_NODES];
 static int ut_local_dispatch_count = 0;
 static uint8 ut_local_dispatch_marker = 0;
+static int ut_direct_zero_reply_count = 0;
+static GcsBlockReplyHeader ut_direct_zero_reply_header;
 
 bool
 cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
@@ -256,10 +267,29 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 		ut_sent_log[ut_sent_n].msg_type = msg_type;
 		ut_sent_log[ut_sent_n].dest = dest_node_id;
 		ut_sent_log[ut_sent_n].marker = payload_len > 0 ? *(const uint8 *)payload : 0;
+		ut_sent_log[ut_sent_n].payload_len = payload_len;
+		if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY
+			&& payload_len >= sizeof(GcsBlockReplyHeader))
+			memcpy(&ut_sent_log[ut_sent_n].reply_header, payload, sizeof(GcsBlockReplyHeader));
 	}
 	ut_sent_n++;
 	UT_ASSERT(dest_node_id >= 0 && dest_node_id < CLUSTER_MAX_NODES);
 	return ut_peer_rc[dest_node_id];
+}
+
+uint32
+cluster_gcs_block_compute_checksum(const char *block_data)
+{
+	(void)block_data;
+	return UINT32_C(0xA55A7E11);
+}
+
+ClusterICSendResult
+cluster_gcs_block_send_direct_zero_reply(int32 dest_node, const GcsBlockReplyHeader *header)
+{
+	ut_direct_zero_reply_count++;
+	ut_direct_zero_reply_header = *header;
+	return ut_peer_rc[dest_node];
 }
 
 static int
@@ -280,6 +310,8 @@ ut_reset_log(void)
 	ut_sent_n = 0;
 	ut_local_dispatch_count = 0;
 	ut_local_dispatch_marker = 0;
+	ut_direct_zero_reply_count = 0;
+	memset(&ut_direct_zero_reply_header, 0, sizeof(ut_direct_zero_reply_header));
 	ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
 	ut_write_fence_enforcing = false;
 	ut_write_fence_allowed = true;
@@ -498,10 +530,68 @@ UT_TEST(test_pcm_x_grant_frame_waits_behind_write_fence)
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 0);
 }
 
+/*
+ * Shape-B denial replay is driven by LMON, which owns only plane 0.  The
+ * reply is an ABI-sized header + zero block, so LMON stages its compact
+ * header on the tag's DATA ring and the owning LMS worker expands and sends
+ * it.  A direct LMON send is a production FATAL under the plane guard.
+ */
+UT_TEST(test_zero_block_reply_is_expanded_by_data_owner)
+{
+	GcsBlockReplyHeader hdr;
+
+	ut_reset_log();
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.request_id = UINT64_C(0x1122334455667788);
+	hdr.epoch = UINT64_C(41);
+	hdr.sender_node = 1;
+	hdr.requester_backend_id = 17;
+	hdr.transition_id = PCM_TRANS_N_TO_X;
+	hdr.status = (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply(2, UT_PEER_X, &hdr, false));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 1);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ((int)ut_sent_log[0].payload_len, (int)GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ((int)ut_sent_log[1].msg_type, (int)PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+	UT_ASSERT_EQ((int)ut_sent_log[1].payload_len, (int)GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+	UT_ASSERT_EQ(ut_sent_log[1].reply_header.request_id, hdr.request_id);
+	UT_ASSERT_EQ((int)ut_sent_log[1].reply_header.status,
+				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ(ut_sent_log[1].reply_header.checksum, UINT32_C(0xA55A7E11));
+}
+
+UT_TEST(test_direct_zero_block_reply_uses_data_owner_direct_lane)
+{
+	GcsBlockReplyHeader hdr;
+
+	ut_reset_log();
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.request_id = UINT64_C(0x8877665544332211);
+	hdr.status = (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply(3, UT_PEER_Y, &hdr, true));
+	ut_peer_rc[UT_PEER_Y] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(3), 1);
+	UT_ASSERT_EQ(ut_direct_zero_reply_count, 1);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_direct_zero_reply_header.request_id, hdr.request_id);
+	UT_ASSERT_EQ(ut_direct_zero_reply_header.checksum, UINT32_C(0xA55A7E11));
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -511,6 +601,8 @@ main(void)
 	UT_RUN(test_self_frame_dispatches_on_owning_worker);
 	UT_RUN(test_pcm_x_grant_frame_waits_for_active_runtime);
 	UT_RUN(test_pcm_x_grant_frame_waits_behind_write_fence);
+	UT_RUN(test_zero_block_reply_is_expanded_by_data_owner);
+	UT_RUN(test_direct_zero_block_reply_uses_data_owner_direct_lane);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
