@@ -358,6 +358,35 @@ UT_TEST(test_s_new_fresh_token_finish_shape_stays_invalid)
 				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
 }
 
+UT_TEST(test_share_cover_reverify_accepts_stable_successor_grant)
+{
+	/* Once content authority is held, a stable current S/X successor is the
+	 * exact node-level grant for a read.  Generation drift alone must not open
+	 * a fresh legacy reservation from S (the forbidden S_NEW shape). */
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_X, 0));
+
+	/* A writer keeps the stricter generation-exact gate and must re-enter the
+	 * convert queue after any ownership round.  A non-covering or live
+	 * lifecycle remains closed for both modes. */
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_X, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_X, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_S,
+		PCM_OWN_FLAG_GRANT_PENDING));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_S,
+		PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_N, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_X, 0));
+}
+
 UT_TEST(test_revoke_commit_is_exact_and_classifies_live_races)
 {
 	uint64 committed = UINT64_MAX;
@@ -1363,12 +1392,12 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 			= strstr(lockbuffer, "cluster_bufmgr_pcm_begin_grant_reservation_wait(");
 		const char *content
 			= strstr(lockbuffer, "LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)");
-		const char *w1_revoke
-			= strstr(lockbuffer, "PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING");
+		const char *w1_reverify
+			= strstr(lockbuffer, "cluster_pcm_x_cached_cover_reverify_accepts(");
 
 		UT_ASSERT_NOT_NULL(reserve);
 		UT_ASSERT_NOT_NULL(content);
-		UT_ASSERT_NOT_NULL(w1_revoke);
+		UT_ASSERT_NOT_NULL(w1_reverify);
 		if (reserve != NULL && content != NULL)
 			UT_ASSERT(reserve < content);
 	}
@@ -2299,7 +2328,7 @@ UT_TEST(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(52);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2307,6 +2336,7 @@ main(void)
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
 	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
+	UT_RUN(test_share_cover_reverify_accepts_stable_successor_grant);
 	UT_RUN(test_retained_release_retag_respects_pin_contract);
 	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
 	UT_RUN(test_legacy_byte_proof_republishes_kept_pi_mirror);

@@ -8489,14 +8489,13 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			 * PGRAC ownership-generation wave (W1) — cached-cover
 			 * re-verify. The cover fast path decided we already held the mode
 			 * on a raw, unlocked pcm_state read.  A BAST X->S downgrade (or
-			 * any ownership round) can have raced this content-lock window
-			 * and revoked the cover.  Re-read the state/generation/flags
-			 * projection of the coherent ownership tuple under the header
-			 * spinlock: if the generation moved, the mode no longer covers,
-			 * or a grant/revoke is in flight, the cover is STALE --
-			 * writing/reading a block we no longer own is the Rule 8.A
-			 * violation.  Release, do a real master re-acquire, re-take the
-			 * content lock.  Bounded: after a real acquire we hold the
+			 * any ownership round) can have raced this content-lock window.
+			 * Re-read the coherent ownership tuple now that content authority
+			 * serializes page-image transitions.  A stable successor S/X still
+			 * covers an S read; an X writer stays generation-exact.  A mode
+			 * loss or live lifecycle is STALE for both.  Release, do a real
+			 * master/queue re-acquire, and re-take the content lock.  Bounded:
+			 * after a real acquire we hold the
 			 * content lock and the downgrade path serializes under it, so no
 			 * further downgrade can intervene -- at most one fallback.
 			 */
@@ -8507,9 +8506,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 				uint32		cur_flags;
 
 				cluster_pcm_own_read(buf, &cur_state, &cur_gen, &cur_flags);
-				if (cur_gen != pcm_covered_gen
-					|| !cluster_pcm_mode_covers((PcmLockMode) cur_state, pcm_mode)
-					|| (cur_flags & (PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING)) != 0)
+				if (!cluster_pcm_x_cached_cover_reverify_accepts(
+						(uint8) pcm_mode, pcm_covered_gen, cur_gen, cur_state, cur_flags))
 				{
 					cluster_pcm_note_writer_cover_stale_detected();
 					pcm_covered = false;

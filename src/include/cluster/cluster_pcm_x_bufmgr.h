@@ -172,6 +172,33 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0;
 }
 
+/* Revalidate a cached cover after the caller has acquired content authority.
+ * A stable current S/X is the node-level authority for an S read even when a
+ * complete ownership round advanced the generation while this backend waited:
+ * the page-image install/transition is serialized by the content lock already
+ * held by the caller.  Treating that successor S as stale would open a fresh
+ * legacy reservation from S (the forbidden S_NEW shape).  X writers retain
+ * the stricter generation-exact rule and re-enter the convert queue after any
+ * ownership round. */
+static inline bool
+cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captured_generation,
+										   uint64 current_generation, uint8 current_state,
+										   uint32 current_flags)
+{
+	bool covers;
+
+	if (requested_state != (uint8)PCM_STATE_S && requested_state != (uint8)PCM_STATE_X)
+		return false;
+	if (current_flags != 0)
+		return false;
+	covers = current_state == (uint8)PCM_STATE_X
+			 || (requested_state == (uint8)PCM_STATE_S
+				 && current_state == (uint8)PCM_STATE_S);
+	return covers
+		   && (requested_state == (uint8)PCM_STATE_S
+			   || current_generation == captured_generation);
+}
+
 /* ConditionalLockBuffer cannot initiate a PCM conversion.  Preserve native
  * PostgreSQL behavior while PCM is inactive and for relations outside the
  * coherence domain; an active tracked page must already hold exact X.  Live
