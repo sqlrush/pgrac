@@ -2859,7 +2859,7 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 							 : NULL;
 	wait_exact_physical
 		= wait_exact_first_authority != NULL
-			  ? strstr(wait_exact_first_authority, "gcs_block_pcm_x_requester_wait(wait_index)")
+			  ? strstr(wait_exact_first_authority, "cluster_pcm_x_requester_wait_once(")
 			  : NULL;
 	wait_exact_second_authority
 		= wait_exact_physical != NULL

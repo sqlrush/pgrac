@@ -15683,6 +15683,74 @@ UT_TEST(test_stats_initialize_zero_and_narrow_note_apis_are_exact)
 }
 
 
+typedef struct RequesterWaitCapture {
+	bool revalidate_ok;
+	int revalidate_calls;
+	int wait_calls;
+	uint64 count_seen_at_wait;
+} RequesterWaitCapture;
+
+static bool
+requester_wait_revalidate(void *callback_arg)
+{
+	RequesterWaitCapture *capture = (RequesterWaitCapture *)callback_arg;
+
+	capture->revalidate_calls++;
+	return capture->revalidate_ok;
+}
+
+static void
+requester_wait_block(void *callback_arg)
+{
+	RequesterWaitCapture *capture = (RequesterWaitCapture *)callback_arg;
+	PcmXStatsSnapshot stats;
+
+	capture->wait_calls++;
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	capture->count_seen_at_wait = stats.wait_count;
+}
+
+UT_TEST(test_queue_wait_count_tracks_only_linearized_requester_waits)
+{
+	RequesterWaitCapture capture = { 0 };
+	PcmXStatsSnapshot stats;
+
+	init_active_pcm_x(UINT64_C(81));
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 0);
+
+	/* Fast-path and polling iterations never enter the wait producer. */
+	UT_ASSERT_EQ(capture.revalidate_calls, 0);
+	UT_ASSERT_EQ(capture.wait_calls, 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 0);
+
+	/* A failed pre-sleep authority check cannot bump or invoke the wait. */
+	UT_ASSERT(!cluster_pcm_x_requester_wait_once(requester_wait_revalidate, requester_wait_block,
+												 &capture));
+	UT_ASSERT_EQ(capture.revalidate_calls, 1);
+	UT_ASSERT_EQ(capture.wait_calls, 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 0);
+
+	/* Each actual wait callback observes its own count already linearized. */
+	capture.revalidate_ok = true;
+	UT_ASSERT(cluster_pcm_x_requester_wait_once(requester_wait_revalidate, requester_wait_block,
+												&capture));
+	UT_ASSERT_EQ(capture.wait_calls, 1);
+	UT_ASSERT_EQ(capture.count_seen_at_wait, 1);
+	UT_ASSERT(cluster_pcm_x_requester_wait_once(requester_wait_revalidate, requester_wait_block,
+												&capture));
+	UT_ASSERT(cluster_pcm_x_requester_wait_once(requester_wait_revalidate, requester_wait_block,
+												&capture));
+	UT_ASSERT_EQ(capture.revalidate_calls, 4);
+	UT_ASSERT_EQ(capture.wait_calls, 3);
+	UT_ASSERT_EQ(capture.count_seen_at_wait, 3);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.wait_count, 3);
+}
+
+
 UT_TEST(test_stats_follow_exact_master_and_local_success_transitions)
 {
 	PcmXMasterAdmission admission[2];
@@ -16135,7 +16203,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(270);
+	UT_PLAN(271);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16398,6 +16466,7 @@ main(void)
 	UT_RUN(test_exec_backend_init_fails_closed_on_layout_mismatch);
 	UT_RUN(test_registration_exposes_one_exact_region);
 	UT_RUN(test_stats_initialize_zero_and_narrow_note_apis_are_exact);
+	UT_RUN(test_queue_wait_count_tracks_only_linearized_requester_waits);
 	UT_RUN(test_stats_follow_exact_master_and_local_success_transitions);
 	UT_RUN(test_stats_count_fail_closed_and_exact_activating_reset_once);
 	UT_RUN(test_master_admit_lock_window_error_releases_gate_and_fails_closed);

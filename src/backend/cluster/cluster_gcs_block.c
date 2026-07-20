@@ -8277,6 +8277,33 @@ gcs_block_pcm_x_requester_wait(uint32 *wait_index)
 	CHECK_FOR_INTERRUPTS();
 }
 
+typedef struct GcsBlockPcmXRequesterWaitContext {
+	const PcmXRuntimeSnapshot *request_runtime;
+	int32 master_node;
+	uint64 cluster_epoch;
+	uint64 master_session;
+	long timeout_ms;
+} GcsBlockPcmXRequesterWaitContext;
+
+static bool
+gcs_block_pcm_x_requester_pre_sleep_revalidate(void *callback_arg)
+{
+	GcsBlockPcmXRequesterWaitContext *context = (GcsBlockPcmXRequesterWaitContext *)callback_arg;
+
+	return gcs_block_pcm_x_requester_authority_exact(context->request_runtime, context->master_node,
+													 context->cluster_epoch,
+													 context->master_session);
+}
+
+static void
+gcs_block_pcm_x_requester_wait_latch(void *callback_arg)
+{
+	GcsBlockPcmXRequesterWaitContext *context = (GcsBlockPcmXRequesterWaitContext *)callback_arg;
+
+	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, context->timeout_ms,
+					WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+}
+
 /* Retry only inside the exact formation that admitted this requester.  Both
  * sides of the sleep are checked: a runtime fence or peer-session change that
  * lands while the latch is asleep must be observed before the next protocol
@@ -8285,10 +8312,29 @@ static bool
 gcs_block_pcm_x_requester_wait_exact(uint32 *wait_index, const PcmXRuntimeSnapshot *request_runtime,
 									 int32 master_node, uint64 cluster_epoch, uint64 master_session)
 {
+	GcsBlockPcmXRequesterWaitContext context;
+	uint32 current;
+
+	if (wait_index == NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster PCM-X requester wait has no backoff state")));
 	if (!gcs_block_pcm_x_requester_authority_exact(request_runtime, master_node, cluster_epoch,
 												   master_session))
 		return false;
-	gcs_block_pcm_x_requester_wait(wait_index);
+	current = *wait_index;
+	memset(&context, 0, sizeof(context));
+	context.request_runtime = request_runtime;
+	context.master_node = master_node;
+	context.cluster_epoch = cluster_epoch;
+	context.master_session = master_session;
+	context.timeout_ms = cluster_pcm_x_holder_retry_delay_ms(current);
+	CHECK_FOR_INTERRUPTS();
+	if (!cluster_pcm_x_requester_wait_once(gcs_block_pcm_x_requester_pre_sleep_revalidate,
+										   gcs_block_pcm_x_requester_wait_latch, &context))
+		return false;
+	ResetLatch(MyLatch);
+	*wait_index = cluster_gcs_pcm_x_requester_wait_index_advance(current);
+	CHECK_FOR_INTERRUPTS();
 	return gcs_block_pcm_x_requester_authority_exact(request_runtime, master_node, cluster_epoch,
 													 master_session);
 }

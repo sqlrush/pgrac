@@ -986,6 +986,18 @@ cluster_pcm_x_stats_note_wait(void)
 }
 
 
+bool
+cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback revalidate, PcmXWaitCallback wait,
+								  void *callback_arg)
+{
+	if (revalidate == NULL || wait == NULL || !revalidate(callback_arg))
+		return false;
+	cluster_pcm_x_stats_note_wait();
+	wait(callback_arg);
+	return true;
+}
+
+
 void
 cluster_pcm_x_stats_note_queue_result(PcmXQueueResult result)
 {
