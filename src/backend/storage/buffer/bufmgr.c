@@ -115,6 +115,9 @@ extern bool ignore_checksum_failure;
 
 #define RELS_BSEARCH_THRESHOLD		20
 
+static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+						IOObject io_object, IOContext io_context);
+
 #ifdef USE_PGRAC_CLUSTER
 static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
@@ -128,8 +131,6 @@ cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 static XLogRecPtr cluster_gcs_clamp_ship_flush_lsn(XLogRecPtr page_lsn);
 static void cluster_bufmgr_pin_for_gcs_locked(BufferDesc *buf, uint32 buf_state);
 static void cluster_bufmgr_unpin_for_gcs(BufferDesc *buf);
-static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
 static ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
 	ClusterPcmOwnSnapshot *out_shared);

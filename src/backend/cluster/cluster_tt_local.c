@@ -560,7 +560,7 @@ static void
 install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 {
 	ClusterTTStatusKey key;
-	ClusterTTLocalBinding *binding;
+	const ClusterTTLocalBinding *binding;
 	int idx;
 
 	if (!cluster_enabled || cluster_node_id < 0)
@@ -709,7 +709,6 @@ cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
 	uint16 slot_offset;
 	uint16 row_offset;
 	int idx;
-	uint16 i;
 
 	if (!cluster_enabled || cluster_node_id < 0 || !TransactionIdIsNormal(xid))
 		return;
@@ -730,6 +729,8 @@ cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
 	(void)row_offset;
 
 	if (record_segment != binding->segment_id) {
+		uint16 i;
+
 		for (i = 0; i < binding->active_alias_count; i++)
 			if (binding->active_alias_segments[i] == (uint16)record_segment)
 				break;

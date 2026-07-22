@@ -240,6 +240,8 @@ cppcheck \
   --xml --xml-version=2 \
   -I src/include \
   -DUSE_PGRAC_CLUSTER=1 \
+  '-DHEAPAM_SOURCE_PATH="src/backend/access/heap/heapam.c"' \
+  '-DTT_LOCAL_SOURCE_PATH="src/backend/cluster/cluster_tt_local.c"' \
   --quiet \
   "${CLUSTER_DIRS[@]}" \
   2> cppcheck.xml
