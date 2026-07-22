@@ -168,22 +168,22 @@ UT_TEST(test_fetch_holder_authenticates_requester_master_and_record_generation)
 	env.dest_node_id = 3;
 	env.payload_length = sizeof(request);
 
-	UT_ASSERT(cluster_pcm_x_image_fetch_request_exact_diagnosed(
-		&env, &request, &holder, 3, 2, 0, &refusal));
+	UT_ASSERT(cluster_pcm_x_image_fetch_request_exact_diagnosed(&env, &request, &holder, 3, 2, 0,
+																&refusal));
 	UT_ASSERT_EQ((int)refusal, (int)PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_NONE);
 	env.source_node_id = 0;
-	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(
-		&env, &request, &holder, 3, 2, 0, &refusal));
+	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(&env, &request, &holder, 3, 2, 0,
+																 &refusal));
 	UT_ASSERT_EQ((int)refusal, (int)PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ENVELOPE);
 	env.source_node_id = 1;
 	holder.image.image_id++;
-	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(
-		&env, &request, &holder, 3, 2, 0, &refusal));
+	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(&env, &request, &holder, 3, 2, 0,
+																 &refusal));
 	UT_ASSERT_EQ((int)refusal, (int)PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_IMAGE);
 	holder.image = requester.image;
 	holder.master_node = 0;
-	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(
-		&env, &request, &holder, 3, 2, 0, &refusal));
+	UT_ASSERT(!cluster_pcm_x_image_fetch_request_exact_diagnosed(&env, &request, &holder, 3, 2, 0,
+																 &refusal));
 	UT_ASSERT_EQ((int)refusal, (int)PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_MASTER);
 }
 

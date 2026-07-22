@@ -86,10 +86,12 @@ cluster_pcm_x_image_fetch_build_request(const PcmXLocalProgress *progress, int32
 
 
 bool
-cluster_pcm_x_image_fetch_request_exact_diagnosed(
-	const ClusterICEnvelope *env, const GcsBlockRequestPayload *request,
-	const PcmXLocalHolderProgress *holder, int32 holder_node, int32 current_master_node,
-	uint64 current_epoch, PcmXImageFetchRequestRefusal *refusal_out)
+cluster_pcm_x_image_fetch_request_exact_diagnosed(const ClusterICEnvelope *env,
+												  const GcsBlockRequestPayload *request,
+												  const PcmXLocalHolderProgress *holder,
+												  int32 holder_node, int32 current_master_node,
+												  uint64 current_epoch,
+												  PcmXImageFetchRequestRefusal *refusal_out)
 {
 	static const uint8 zero_reserved[sizeof(request->reserved_0)] = { 0 };
 	int32 decoded_backend_id;
@@ -148,8 +150,8 @@ cluster_pcm_x_image_fetch_request_exact_diagnosed(
 			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_IMAGE;
 		return false;
 	}
-	if (!cluster_gcs_requester_id_decode(holder->ref.identity.request_id,
-										 &decoded_requester_node, &decoded_backend_id, NULL)
+	if (!cluster_gcs_requester_id_decode(holder->ref.identity.request_id, &decoded_requester_node,
+										 &decoded_backend_id, NULL)
 		|| decoded_requester_node != request->sender_node
 		|| decoded_backend_id != request->requester_backend_id) {
 		if (refusal_out != NULL)

@@ -317,8 +317,8 @@ UT_TEST(test_pcm_x_capability_family_sample_is_record_coherent)
 UT_TEST(test_pcm_x_source_floor_capability_guard_is_generation_exact)
 {
 	ClusterSfPeerCap cap;
-	const uint32 family = PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
-						  | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+	const uint32 family
+		= PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
 
 	memset(&cap, 0, sizeof(cap));
 	cluster_sf_peer_cap_note(&cap, family, 41);

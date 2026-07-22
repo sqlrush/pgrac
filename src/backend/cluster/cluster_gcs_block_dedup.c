@@ -488,8 +488,7 @@ dedup_pcm_x_required_page_scn_get(const GcsBlockDedupEntry *entry)
 }
 
 static void
-dedup_pcm_x_binding_from_entry(const GcsBlockDedupEntry *entry,
-								 GcsBlockPcmXImageBinding *binding)
+dedup_pcm_x_binding_from_entry(const GcsBlockDedupEntry *entry, GcsBlockPcmXImageBinding *binding)
 {
 	binding->identity = entry->payload_meta.pcm_x_identity;
 	binding->master_session = entry->pcm_x_master_session;
@@ -752,15 +751,13 @@ dedup_pending_x_denial_is_exact(const GcsBlockDedupEntry *entry)
 	return entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
 		   && entry->transition_id == (uint8)PCM_TRANS_N_TO_S
 		   && entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
-		   && entry->completed_at_ts != 0
-		   && header->request_id == entry->key.request_id
-		   && header->epoch == entry->key.cluster_epoch
-		   && header->sender_node == cluster_node_id
+		   && entry->completed_at_ts != 0 && header->request_id == entry->key.request_id
+		   && header->epoch == entry->key.cluster_epoch && header->sender_node == cluster_node_id
 		   && header->requester_backend_id == entry->key.requester_backend_id
 		   && header->transition_id == (uint8)PCM_TRANS_N_TO_S
 		   && header->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
 		   && GcsBlockReplyHeaderGetForwardingMasterNode(header)
-			  == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+				  == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 }
 
 static bool
@@ -771,8 +768,7 @@ dedup_pending_x_entry_has_legacy_s_right(const GcsBlockDedupEntry *entry)
 	if (entry->completed_at_ts == 0)
 		return true;
 	status = (GcsBlockReplyStatus)entry->status;
-	return status == GCS_BLOCK_REPLY_GRANTED
-		   || status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK
+	return status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK
 		   || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 		   || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
@@ -864,8 +860,7 @@ cluster_gcs_block_dedup_pending_x_deny_next(int worker_id, const BufferTag *tag,
 	if (have_replay)
 		*denied_out = replay;
 	LWLockRelease(&shard->lock.lock);
-	return have_replay ? GCS_BLOCK_PENDING_X_DENY_REPLAY
-					   : GCS_BLOCK_PENDING_X_DENY_NOT_FOUND;
+	return have_replay ? GCS_BLOCK_PENDING_X_DENY_REPLAY : GCS_BLOCK_PENDING_X_DENY_NOT_FOUND;
 }
 
 GcsBlockPendingXDenyResult
@@ -892,8 +887,7 @@ cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupK
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
 	if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
-		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
-		|| entry->transition_id != transition_id) {
+		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0 || entry->transition_id != transition_id) {
 		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
 			dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
@@ -904,8 +898,7 @@ cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupK
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PENDING_X_DENY_REPLAY;
 	}
-	if (entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X
-		&& entry->completed_at_ts != 0) {
+	if (entry->status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X && entry->completed_at_ts != 0) {
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PENDING_X_DENY_INVALID;
@@ -919,8 +912,8 @@ cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupK
 
 bool
 cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDedupKey *key,
-											const BufferTag *tag, uint8 transition_id,
-											uint8 request_flags)
+												const BufferTag *tag, uint8 transition_id,
+												uint8 request_flags)
 {
 	ClusterGcsBlockDedupShard *shard;
 	HTAB *htab = NULL;
@@ -930,8 +923,7 @@ cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDed
 
 	Assert(key != NULL);
 	Assert(tag != NULL);
-	if (key == NULL || tag == NULL
-		|| (request_flags & ~GCS_BLOCK_DEDUP_REQUEST_F_VALID_MASK) != 0)
+	if (key == NULL || tag == NULL || (request_flags & ~GCS_BLOCK_DEDUP_REQUEST_F_VALID_MASK) != 0)
 		return false;
 	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
 	if (shard == NULL)
@@ -939,8 +931,7 @@ cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDed
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
 	if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
-		&& memcmp(&entry->tag, tag, sizeof(*tag)) == 0
-		&& entry->transition_id == transition_id) {
+		&& memcmp(&entry->tag, tag, sizeof(*tag)) == 0 && entry->transition_id == transition_id) {
 		uint8 pinned_flags = GCS_BLOCK_DEDUP_REQUEST_F_PINNED | request_flags;
 
 		if (entry->request_flags == 0)

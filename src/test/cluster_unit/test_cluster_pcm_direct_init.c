@@ -441,16 +441,21 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 		free(bufmgr);
 	}
 	if (heapam != NULL) {
-		static const char *const pretoast_order[]
-			= { "PGRAC: vm barrier unwind (update pre-toast)",
-				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
-				"ReleaseBuffer(vmbuffer)", "vmbuffer = InvalidBuffer",
-				"cluster_heap_lock_with_vm_repin", "goto l2;" };
+		static const char *const pretoast_order[] = { "PGRAC: vm barrier unwind (update pre-toast)",
+													  "LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
+													  "cluster_heap_vm_barrier_warm",
+													  "ReleaseBuffer(vmbuffer)",
+													  "vmbuffer = InvalidBuffer",
+													  "cluster_heap_lock_with_vm_repin",
+													  "goto l2;" };
 		static const char *const requalify_order[]
 			= { "PGRAC: vm barrier unwind (update requalify)",
-				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
-				"ReleaseBuffer(vmbuffer)", "vmbuffer = InvalidBuffer",
-				"cluster_heap_lock_with_vm_repin", "goto l2;" };
+				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
+				"cluster_heap_vm_barrier_warm",
+				"ReleaseBuffer(vmbuffer)",
+				"vmbuffer = InvalidBuffer",
+				"cluster_heap_lock_with_vm_repin",
+				"goto l2;" };
 		static const char *const reacquire_order[]
 			= { "PGRAC: vm barrier unwind (update reacquire)",
 				"LockBuffer(newbuf, BUFFER_LOCK_UNLOCK)",
@@ -458,11 +463,13 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
 				"cluster_heap_vm_barrier_warm",
 				"goto l_pgrac_reacquire;" };
-		static const char *const delete_order[]
-			= { "PGRAC: vm barrier unwind (delete requalify)",
-				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)", "cluster_heap_vm_barrier_warm",
-				"ReleaseBuffer(vmbuffer)", "vmbuffer = InvalidBuffer",
-				"cluster_heap_lock_with_vm_repin", "goto l1;" };
+		static const char *const delete_order[] = { "PGRAC: vm barrier unwind (delete requalify)",
+													"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
+													"cluster_heap_vm_barrier_warm",
+													"ReleaseBuffer(vmbuffer)",
+													"vmbuffer = InvalidBuffer",
+													"cluster_heap_lock_with_vm_repin",
+													"goto l1;" };
 
 		/* The warm helper itself may only run with no content lock held:
 		 * it must take and drop the map-page lock, nothing else. */
@@ -497,26 +504,27 @@ UT_TEST(test_heap_update_drops_vm_pin_across_heap_pcm_wait)
 		const char *update = strstr(heapam, "\nheap_update(");
 		const char *update_lock
 			= update != NULL ? strstr(update, "cluster_heap_lock_with_vm_repin(") : NULL;
-		const char *repin_branch = update != NULL
-			? strstr(update, "if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))")
-			: NULL;
+		const char *repin_branch
+			= update != NULL
+				  ? strstr(update, "if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))")
+				  : NULL;
 		const char *repin_branch_end
 			= repin_branch != NULL ? strstr(repin_branch, "goto l2;") : NULL;
-		const char *repin_branch_helper = repin_branch != NULL
-			? strstr(repin_branch, "cluster_heap_lock_with_vm_repin(") : NULL;
-		const char *success_tail = update != NULL
-			? strstr(update, "recptr = log_heap_update(")
-			: NULL;
-		const char *vm_unlock = success_tail != NULL
-			? strstr(success_tail,
-					 "if (vm_locked)\n\t\tLockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);")
-			: NULL;
-		const char *vm_release = vm_unlock != NULL
-			? strstr(vm_unlock, "ReleaseBuffer(vmbuffer);")
-			: NULL;
+		const char *repin_branch_helper
+			= repin_branch != NULL ? strstr(repin_branch, "cluster_heap_lock_with_vm_repin(")
+								   : NULL;
+		const char *success_tail
+			= update != NULL ? strstr(update, "recptr = log_heap_update(") : NULL;
+		const char *vm_unlock
+			= success_tail != NULL
+				  ? strstr(success_tail,
+						   "if (vm_locked)\n\t\tLockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);")
+				  : NULL;
+		const char *vm_release
+			= vm_unlock != NULL ? strstr(vm_unlock, "ReleaseBuffer(vmbuffer);") : NULL;
 		const char *heap_unlock = vm_unlock != NULL
-			? strstr(vm_unlock, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);")
-			: NULL;
+									  ? strstr(vm_unlock, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);")
+									  : NULL;
 		static const char *const helper_order[]
 			= { "visibilitymap_pin(relation, heap_block, vmbuffer)",
 				"ReleaseBuffer(*vmbuffer)",
@@ -545,8 +553,8 @@ UT_TEST(test_heap_update_drops_vm_pin_across_heap_pcm_wait)
 		const char *repin = strstr(visibilitymap, "\nvisibilitymap_pin_recent(");
 		const char *repin_end = repin != NULL ? strstr(repin, "\n}\n") : NULL;
 		static const char *const repin_order[]
-			= { "HEAPBLK_TO_MAPBLOCK(heapBlk)", "ReadRecentBuffer(",
-				"VISIBILITYMAP_FORKNUM", "recent_buffer" };
+			= { "HEAPBLK_TO_MAPBLOCK(heapBlk)", "ReadRecentBuffer(", "VISIBILITYMAP_FORKNUM",
+				"recent_buffer" };
 
 		UT_ASSERT(repin != NULL);
 		UT_ASSERT(repin_end != NULL);
@@ -595,9 +603,11 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	relation = strstr(hio, "\nRelationGetBufferForTuple(");
 	relation_end = relation != NULL ? strstr(relation, "\n}\n") : NULL;
 	lower_branch = relation != NULL ? strstr(relation, "else if (otherBlock < targetBlock)") : NULL;
-	lower_call = lower_branch != NULL ? strstr(lower_branch, "cluster_hio_lock_buffer_pair(") : NULL;
+	lower_call
+		= lower_branch != NULL ? strstr(lower_branch, "cluster_hio_lock_buffer_pair(") : NULL;
 	upper_branch = lower_branch != NULL ? strstr(lower_branch, "\n\t\telse\n\t\t{") : NULL;
-	upper_call = upper_branch != NULL ? strstr(upper_branch, "cluster_hio_lock_buffer_pair(") : NULL;
+	upper_call
+		= upper_branch != NULL ? strstr(upper_branch, "cluster_hio_lock_buffer_pair(") : NULL;
 	extension = relation != NULL ? strstr(relation, "Reacquire locks if necessary") : NULL;
 	extension_call = extension != NULL ? strstr(extension, "cluster_hio_lock_buffer_pair(") : NULL;
 
@@ -609,8 +619,7 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	UT_ASSERT(relation_end != NULL);
 	if (helper != NULL && helper_end != NULL)
 		assert_ordered(helper, helper_order, lengthof(helper_order));
-	UT_ASSERT(pins != NULL && pins_end != NULL && pins_call != NULL
-			  && pins_call < pins_end);
+	UT_ASSERT(pins != NULL && pins_end != NULL && pins_call != NULL && pins_call < pins_end);
 	UT_ASSERT(lower_branch != NULL && lower_call != NULL && upper_branch != NULL
 			  && lower_call < upper_branch);
 	UT_ASSERT(upper_branch != NULL && upper_call != NULL && relation_end != NULL

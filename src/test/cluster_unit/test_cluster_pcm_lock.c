@@ -531,17 +531,16 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 void
 cluster_injection_run(const char *name)
 {
-	if (fake_acquire_entry_handoff_armed
-		&& strcmp(name, "cluster-pcm-acquire-entry") == 0) {
+	if (fake_acquire_entry_handoff_armed && strcmp(name, "cluster-pcm-acquire-entry") == 0) {
 		fake_acquire_entry_handoff_armed = false;
 		cluster_injection_armed_count = 0;
-		UT_ASSERT_EQ((int)cluster_pcm_lock_apply_gcs_transition(
-						 fake_acquire_entry_handoff_tag, fake_acquire_entry_handoff_release,
-						 fake_acquire_entry_handoff_source),
+		UT_ASSERT_EQ((int)cluster_pcm_lock_apply_gcs_transition(fake_acquire_entry_handoff_tag,
+																fake_acquire_entry_handoff_release,
+																fake_acquire_entry_handoff_source),
 					 1);
-		UT_ASSERT_EQ((int)cluster_pcm_lock_apply_gcs_transition(
-						 fake_acquire_entry_handoff_tag, PCM_TRANS_N_TO_X,
-						 fake_acquire_entry_handoff_target),
+		UT_ASSERT_EQ((int)cluster_pcm_lock_apply_gcs_transition(fake_acquire_entry_handoff_tag,
+																PCM_TRANS_N_TO_X,
+																fake_acquire_entry_handoff_target),
 					 1);
 	}
 }
@@ -2297,15 +2296,14 @@ UT_TEST(test_pcm_x_slotless_ack_floor_fences_stale_source_before_prepare)
 	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
 	cluster_node_id = 1;
 	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
-	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9011),
-				 PCM_PENDING_X_RESERVE_OK);
+	UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 9011), PCM_PENDING_X_RESERVE_OK);
 
 	/* Source A (node 0) is pre-acked by the transfer driver.  Apply the two
 	 * production-equivalent state effects of non-source B's ACK (node 1), then
 	 * use the bounded source contract below to prove their real handler order. */
 	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE, 1));
-	cluster_pcm_lock_pi_watermark_scn_advance(tag, watermark_scn,
-										  CLUSTER_PCM_WM_SRC_ACK_SLOTLESS, 1, 9011, 17);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, watermark_scn, CLUSTER_PCM_WM_SRC_ACK_SLOTLESS,
+											  1, 9011, 17);
 	UT_ASSERT(cluster_pcm_lock_pi_watermark_prov_query(tag, &provenance));
 	UT_ASSERT_EQ((int)provenance.source, (int)CLUSTER_PCM_WM_SRC_ACK_SLOTLESS);
 	UT_ASSERT_EQ(provenance.sender_node, 1);
@@ -2327,8 +2325,7 @@ UT_TEST(test_pcm_x_slotless_ack_floor_fences_stale_source_before_prepare)
 	UT_ASSERT_EQ((int)after.state, (int)PCM_STATE_S);
 	UT_ASSERT_EQ(after.s_holders_bitmap, UINT32_C(1) << 0);
 	UT_ASSERT_EQ(after.pending_x_requester_node, 3);
-	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
-				 (uint64)watermark_scn);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tag), (uint64)watermark_scn);
 
 	/* Pin the production ordering: B's exact ACK must publish W before the
 	 * bitmap can drive type 49.  IMAGE_READY must then consume that current
@@ -2337,25 +2334,21 @@ UT_TEST(test_pcm_x_slotless_ack_floor_fences_stale_source_before_prepare)
 	if (source == NULL)
 		return;
 	ack_handler = strstr(source, "\ncluster_gcs_handle_block_invalidate_ack_envelope(");
-	ack_end = ack_handler != NULL
-				  ? strstr(ack_handler, "\n/* PGRAC: spec-7.2 flip")
-				  : NULL;
+	ack_end = ack_handler != NULL ? strstr(ack_handler, "\n/* PGRAC: spec-7.2 flip") : NULL;
 	ack_match = ack_handler != NULL
 					? strstr(ack_handler, "gcs_block_pcm_x_queue_invalidate_ack_match(")
 					: NULL;
-	holder_remove = ack_match != NULL
-						? strstr(ack_match, "cluster_pcm_lock_apply_gcs_transition(")
-						: NULL;
+	holder_remove
+		= ack_match != NULL ? strstr(ack_match, "cluster_pcm_lock_apply_gcs_transition(") : NULL;
 	watermark_advance = holder_remove != NULL
 							? strstr(holder_remove, "cluster_pcm_lock_pi_watermark_scn_advance(")
 							: NULL;
-	bitmap_replace = watermark_advance != NULL
-						 ? strstr(watermark_advance,
-								  "cluster_pcm_x_master_drive_bitmap_replace_exact(")
-						 : NULL;
-	drive = bitmap_replace != NULL
-			? strstr(bitmap_replace, "gcs_block_pcm_x_master_drive_tag(")
-			: NULL;
+	bitmap_replace
+		= watermark_advance != NULL
+			  ? strstr(watermark_advance, "cluster_pcm_x_master_drive_bitmap_replace_exact(")
+			  : NULL;
+	drive = bitmap_replace != NULL ? strstr(bitmap_replace, "gcs_block_pcm_x_master_drive_tag(")
+								   : NULL;
 	UT_ASSERT_NOT_NULL(ack_handler);
 	UT_ASSERT_NOT_NULL(ack_end);
 	UT_ASSERT_NOT_NULL(ack_match);
@@ -2371,29 +2364,26 @@ UT_TEST(test_pcm_x_slotless_ack_floor_fences_stale_source_before_prepare)
 
 	ready_handler = strstr(source, "\ncluster_gcs_handle_pcm_x_image_ready_envelope(");
 	ready_end = ready_handler != NULL
-				? strstr(ready_handler, "\ncluster_gcs_handle_pcm_x_prepare_grant_envelope(")
-				: NULL;
-	floor_query = ready_handler != NULL
-				  ? strstr(ready_handler, "cluster_pcm_lock_pi_watermark_scn_query(")
-				  : NULL;
-	floor_verdict = floor_query != NULL
-					? strstr(floor_query, "gcs_block_lost_write_verdict(")
+					? strstr(ready_handler, "\ncluster_gcs_handle_pcm_x_prepare_grant_envelope(")
 					: NULL;
+	floor_query = ready_handler != NULL
+					  ? strstr(ready_handler, "cluster_pcm_lock_pi_watermark_scn_query(")
+					  : NULL;
+	floor_verdict
+		= floor_query != NULL ? strstr(floor_query, "gcs_block_lost_write_verdict(") : NULL;
 	image_ready = ready_handler != NULL
-				  ? strstr(ready_handler, "cluster_pcm_x_master_image_ready_exact(")
-				  : NULL;
-	prepare = image_ready != NULL
-			  ? strstr(image_ready, "PGRAC_IC_MSG_PCM_X_PREPARE_GRANT")
-			  : NULL;
+					  ? strstr(ready_handler, "cluster_pcm_x_master_image_ready_exact(")
+					  : NULL;
+	prepare = image_ready != NULL ? strstr(image_ready, "PGRAC_IC_MSG_PCM_X_PREPARE_GRANT") : NULL;
 	UT_ASSERT_NOT_NULL(ready_handler);
 	UT_ASSERT_NOT_NULL(ready_end);
 	UT_ASSERT_NOT_NULL(image_ready);
 	UT_ASSERT_NOT_NULL(prepare);
-	source_floor_gate
-		= ready_handler != NULL && ready_end != NULL && floor_query != NULL
-		  && floor_verdict != NULL && image_ready != NULL && prepare != NULL
-		  && ready_handler < floor_query && floor_query < floor_verdict
-		  && floor_verdict < image_ready && image_ready < prepare && prepare < ready_end;
+	source_floor_gate = ready_handler != NULL && ready_end != NULL && floor_query != NULL
+						&& floor_verdict != NULL && image_ready != NULL && prepare != NULL
+						&& ready_handler < floor_query && floor_query < floor_verdict
+						&& floor_verdict < image_ready && image_ready < prepare
+						&& prepare < ready_end;
 	UT_ASSERT(source_floor_gate);
 	free(source);
 }

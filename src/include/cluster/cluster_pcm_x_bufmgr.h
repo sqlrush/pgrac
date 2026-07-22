@@ -86,8 +86,7 @@ cluster_pcm_x_holder_register_retry_action(PcmXQueueResult result, bool runtime_
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		return CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE;
 	if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
-		|| (runtime_active
-			&& (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)))
+		|| (runtime_active && (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)))
 		return CLUSTER_PCM_X_HOLDER_RETRY_WAIT;
 	return CLUSTER_PCM_X_HOLDER_RETRY_FAIL;
 }
@@ -233,8 +232,8 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
  * ownership round. */
 static inline bool
 cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captured_generation,
-										   uint64 current_generation, uint8 current_state,
-										   uint32 current_flags)
+											uint64 current_generation, uint8 current_state,
+											uint32 current_flags)
 {
 	bool covers;
 
@@ -243,11 +242,9 @@ cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captur
 	if (current_flags != 0)
 		return false;
 	covers = current_state == (uint8)PCM_STATE_X
-			 || (requested_state == (uint8)PCM_STATE_S
-				 && current_state == (uint8)PCM_STATE_S);
+			 || (requested_state == (uint8)PCM_STATE_S && current_state == (uint8)PCM_STATE_S);
 	return covers
-		   && (requested_state == (uint8)PCM_STATE_S
-			   || current_generation == captured_generation);
+		   && (requested_state == (uint8)PCM_STATE_S || current_generation == captured_generation);
 }
 
 /* ConditionalLockBuffer cannot initiate a PCM conversion.  Preserve native
@@ -484,9 +481,8 @@ cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapsh
  * hard floor; V1's zero floor still prefers the newer observed copy. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
-	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ],
-	XLogRecPtr *out_page_lsn, uint64 *out_page_scn,
-	ClusterPcmOwnSourcePrepareRefusal *out_refusal);
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);

@@ -1000,7 +1000,7 @@ cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback revalidate, Pcm
 
 PcmXQueueResult
 cluster_pcm_x_requester_wait_once_result(PcmXPreSleepResultCallback revalidate,
-									PcmXWaitCallback wait, void *callback_arg)
+										 PcmXWaitCallback wait, void *callback_arg)
 {
 	PcmXQueueResult result;
 
@@ -1328,16 +1328,17 @@ cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, 
 		memcpy(&copy, locked, sizeof(copy));
 		LWLockRelease(&header->local_locks[partition].lock);
 		snprintf(buf, buflen,
-				 "rel=%u fork=%d blk=%u flags=0x%x round=%u master=%d ref_node=%d ref_ticket=" UINT64_FORMAT
-				 " ref_grant=" UINT64_FORMAT " holder_ticket=" UINT64_FORMAT
-				 " blocker_ticket=" UINT64_FORMAT " blocker_gen=" UINT64_FORMAT
+				 "rel=%u fork=%d blk=%u flags=0x%x round=%u master=%d ref_node=%d "
+				 "ref_ticket=" UINT64_FORMAT " ref_grant=" UINT64_FORMAT
+				 " holder_ticket=" UINT64_FORMAT " blocker_ticket=" UINT64_FORMAT
+				 " blocker_gen=" UINT64_FORMAT
 				 " blocker_op=%u blocker_phase=%u blocker_last=%u blocker_last_node=%u"
 				 " blocker_tomb=0x%llx blocker_count=%u blocker_head=%ld blocker_next=%u"
 				 " blocker_crc=%u drain_gen=" UINT64_FORMAT " holder_drain_gen=" UINT64_FORMAT
 				 " members=%zu head=%ld leader=%ld active_writer=%ld",
-				 copy.tag.relNumber, (int)copy.tag.forkNum, copy.tag.blockNum, pcm_x_slot_flags_read(&copy.slot),
-				 copy.local_round, copy.master_node, copy.ref.identity.node_id,
-				 copy.ref.handle.ticket_id, copy.ref.grant_generation,
+				 copy.tag.relNumber, (int)copy.tag.forkNum, copy.tag.blockNum,
+				 pcm_x_slot_flags_read(&copy.slot), copy.local_round, copy.master_node,
+				 copy.ref.identity.node_id, copy.ref.handle.ticket_id, copy.ref.grant_generation,
 				 copy.holder_ref.handle.ticket_id, copy.blocker_snapshot_ref.handle.ticket_id,
 				 copy.blocker_set_generation, copy.blocker_snapshot_reliable.pending_opcode,
 				 copy.blocker_snapshot_reliable.phase,
@@ -4851,10 +4852,11 @@ pcm_x_master_drive_capture_locked(PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot
  * reclaimed in that gap.  Those monotone successors consume the old drive
  * token; they are not evidence that the live queue is corrupt. */
 static PcmXQueueResult
-pcm_x_master_drive_expected_capture_locked(
-	PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot *tag_slot, PcmXSlotRef tag_ref,
-	PcmXMasterTicketSlot *ticket, PcmXSlotRef ticket_ref, const PcmXTicketRef *expected_ref,
-	PcmXMasterDriveSnapshot *snapshot)
+pcm_x_master_drive_expected_capture_locked(PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot *tag_slot,
+										   PcmXSlotRef tag_ref, PcmXMasterTicketSlot *ticket,
+										   PcmXSlotRef ticket_ref,
+										   const PcmXTicketRef *expected_ref,
+										   PcmXMasterDriveSnapshot *snapshot)
 {
 	uint32 state;
 
@@ -4863,11 +4865,10 @@ pcm_x_master_drive_expected_capture_locked(
 	if (ticket == NULL || !pcm_x_ticket_ref_equal(&ticket->ref, expected_ref))
 		return PCM_X_QUEUE_STALE;
 	state = pcm_x_slot_state_read(&ticket->slot);
-	if (state == PCM_XT_COMPLETE || state == PCM_XT_CANCELLED
-		|| state == PCM_XT_RETIRE_CREDIT)
+	if (state == PCM_XT_COMPLETE || state == PCM_XT_CANCELLED || state == PCM_XT_RETIRE_CREDIT)
 		return PCM_X_QUEUE_NOT_READY;
 	return pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
-										 snapshot);
+											 snapshot);
 }
 
 
@@ -5010,8 +5011,8 @@ cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected,
 	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
 													   &expected->ref.identity.tag,
 													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
-	result = pcm_x_master_drive_expected_capture_locked(
-		runtime, tag_slot, tag_ref, ticket, ticket_ref, &expected->ref, &current);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
 	if (result != PCM_X_QUEUE_OK)
 		goto retry_done;
 	if (!pcm_x_master_drive_snapshot_equal(&current, expected)) {
@@ -5107,8 +5108,8 @@ cluster_pcm_x_master_invalidate_busy_backoff_exact(const PcmXMasterDriveSnapshot
 	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
 													   &expected->ref.identity.tag,
 													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
-	result = pcm_x_master_drive_expected_capture_locked(
-		runtime, tag_slot, tag_ref, ticket, ticket_ref, &expected->ref, &current);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
 	if (result != PCM_X_QUEUE_OK)
 		goto busy_done;
 	if (!pcm_x_master_drive_snapshot_equal(&current, expected)) {
@@ -5119,12 +5120,11 @@ cluster_pcm_x_master_invalidate_busy_backoff_exact(const PcmXMasterDriveSnapshot
 								  ticket->reliable.expected_responder_node,
 								  ticket->reliable.expected_responder_session)
 		|| !pcm_x_transfer_peer_exact(ticket, ticket->reliable.expected_responder_node,
-									ticket->reliable.expected_responder_session)) {
+									  ticket->reliable.expected_responder_session)) {
 		result = PCM_X_QUEUE_STALE;
 		goto busy_done;
 	}
-	if (ticket->reliable.retry_deadline_ms != 0
-		&& now_ms < ticket->reliable.retry_deadline_ms) {
+	if (ticket->reliable.retry_deadline_ms != 0 && now_ms < ticket->reliable.retry_deadline_ms) {
 		*snapshot_out = current;
 		result = PCM_X_QUEUE_DUPLICATE;
 		goto busy_done;
@@ -5135,7 +5135,7 @@ cluster_pcm_x_master_invalidate_busy_backoff_exact(const PcmXMasterDriveSnapshot
 	ticket->reliable.retry_deadline_ms = next_retry_deadline_ms;
 	pg_write_barrier();
 	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
-												   snapshot_out);
+											   snapshot_out);
 
 busy_done:
 	LWLockRelease(&header->master_locks[partition].lock);
@@ -5217,8 +5217,8 @@ cluster_pcm_x_master_drive_bitmap_replace_exact(const PcmXMasterDriveSnapshot *e
 	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
 													   &expected->ref.identity.tag,
 													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
-	result = pcm_x_master_drive_expected_capture_locked(
-		runtime, tag_slot, tag_ref, ticket, ticket_ref, &expected->ref, &current);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
 	if (result != PCM_X_QUEUE_OK)
 		goto replace_done;
 	*snapshot_out = current;
@@ -12503,17 +12503,16 @@ pcm_x_local_blocker_ack_tombstone_exact(const PcmXLocalTagSlot *tag_slot,
  * master/session COMMIT, with a fully empty canonical payload, is eligible. */
 static bool
 pcm_x_local_empty_blocker_commit_exact(const PcmXLocalTagSlot *tag_slot,
-									 int32 authenticated_master_node,
-									 uint64 authenticated_master_session)
+									   int32 authenticated_master_node,
+									   uint64 authenticated_master_session)
 {
 	return tag_slot != NULL && tag_slot->blocker_set_generation != 0
 		   && tag_slot->blocker_set_generation != UINT64_MAX
 		   && tag_slot->blocker_snapshot_reliable.state_sequence != 0
 		   && tag_slot->blocker_snapshot_reliable.response_tombstone_mask == 0
 		   && pcm_x_transfer_leg_exact(&tag_slot->blocker_snapshot_reliable,
-									 PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
-									 authenticated_master_node,
-									 authenticated_master_session)
+									   PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
+									   authenticated_master_node, authenticated_master_session)
 		   && tag_slot->blocker_snapshot_head_index == PCM_X_INVALID_SLOT_INDEX
 		   && tag_slot->blocker_snapshot_count == 0 && tag_slot->blocker_snapshot_crc32c == 0
 		   && tag_slot->blocker_snapshot_next_chunk == 0;
@@ -13075,9 +13074,9 @@ ack_done:
 
 PcmXQueueResult
 cluster_pcm_x_local_holder_revoke_apply_floor_exact(const PcmXRevokePayload *revoke,
-												uint64 required_page_scn,
-												int32 authenticated_master_node,
-												uint64 authenticated_master_session)
+													uint64 required_page_scn,
+													int32 authenticated_master_node,
+													uint64 authenticated_master_session)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -13186,20 +13185,20 @@ cluster_pcm_x_local_holder_revoke_apply_floor_exact(const PcmXRevokePayload *rev
 		 * ACK handler can nevertheless observe a transient local admission gate and
 		 * leave the exact COMMIT armed.  Consume only that canonical empty set (for
 		 * the first or a replay generation), since no blocker edge can be omitted. */
-		if (!pcm_x_local_empty_blocker_commit_exact(
-				tag_slot, authenticated_master_node, authenticated_master_session)) {
+		if (!pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+													authenticated_master_session)) {
 			result = PCM_X_QUEUE_NOT_READY;
 			goto revoke_release_gate;
 		}
 	} else if (tag_slot->blocker_set_generation == 0
-		|| tag_slot->blocker_snapshot_reliable.state_sequence == 0
-		|| tag_slot->blocker_snapshot_reliable.last_response_opcode
-			   != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
-		|| tag_slot->blocker_snapshot_reliable.last_responder_node
-			   != (uint32)authenticated_master_node
-		|| tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
-		|| tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
-		|| tag_slot->blocker_snapshot_next_chunk != 0) {
+			   || tag_slot->blocker_snapshot_reliable.state_sequence == 0
+			   || tag_slot->blocker_snapshot_reliable.last_response_opcode
+					  != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
+			   || tag_slot->blocker_snapshot_reliable.last_responder_node
+					  != (uint32)authenticated_master_node
+			   || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
+			   || tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
+			   || tag_slot->blocker_snapshot_next_chunk != 0) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto revoke_release_gate;
@@ -13253,8 +13252,8 @@ cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 											  int32 authenticated_master_node,
 											  uint64 authenticated_master_session)
 {
-	return cluster_pcm_x_local_holder_revoke_apply_floor_exact(
-		revoke, 0, authenticated_master_node, authenticated_master_session);
+	return cluster_pcm_x_local_holder_revoke_apply_floor_exact(revoke, 0, authenticated_master_node,
+															   authenticated_master_session);
 }
 
 
@@ -13404,12 +13403,12 @@ cluster_pcm_x_local_queue_invalidate_authorize_exact(const BufferTag *tag, uint6
 			 * passive pinned S become N+PI instead of waiting forever for an ACK
 			 * the advanced master is no longer required to replay. */
 			if (!pcm_x_transfer_leg_exact(&tag_slot->blocker_snapshot_reliable,
-									  PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
-									  authenticated_master_node, authenticated_master_session)
+										  PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
+										  authenticated_master_node, authenticated_master_session)
 				|| tag_slot->blocker_snapshot_count != 0)
 				result = PCM_X_QUEUE_NOT_READY;
-			else if (!pcm_x_local_empty_blocker_commit_exact(
-						 tag_slot, authenticated_master_node, authenticated_master_session)
+			else if (!pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+															 authenticated_master_session)
 					 || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
 					 || tag_slot->holder_terminal_drain_generation != 0) {
 				result = PCM_X_QUEUE_CORRUPT;
@@ -13417,16 +13416,17 @@ cluster_pcm_x_local_queue_invalidate_authorize_exact(const BufferTag *tag, uint6
 			} else
 				result = PCM_X_QUEUE_OK;
 		} else if (tag_slot->blocker_snapshot_reliable.state_sequence == 0
-				 || tag_slot->blocker_snapshot_reliable.last_response_opcode
-						!= PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
-				 || tag_slot->blocker_snapshot_reliable.last_responder_node
-						!= (uint32)authenticated_master_node
-				 || tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0
-				 || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
-				 || tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
-				 || tag_slot->blocker_snapshot_next_chunk != 0
-				 || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
-				 || tag_slot->holder_terminal_drain_generation != 0) {
+				   || tag_slot->blocker_snapshot_reliable.last_response_opcode
+						  != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
+				   || tag_slot->blocker_snapshot_reliable.last_responder_node
+						  != (uint32)authenticated_master_node
+				   || tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0
+				   || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
+				   || tag_slot->blocker_snapshot_count != 0
+				   || tag_slot->blocker_snapshot_crc32c != 0
+				   || tag_slot->blocker_snapshot_next_chunk != 0
+				   || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
+				   || tag_slot->holder_terminal_drain_generation != 0) {
 			result = PCM_X_QUEUE_CORRUPT;
 			fail_closed = true;
 		} else
@@ -13440,10 +13440,11 @@ cluster_pcm_x_local_queue_invalidate_authorize_exact(const BufferTag *tag, uint6
 
 
 PcmXQueueResult
-cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
-	const PcmXGrantPayload *image_ready, int32 authenticated_master_node,
-	uint64 authenticated_master_session, PcmXGrantPayload *replay_out,
-	PcmXLocalImageReadyRefusal *refusal_out)
+cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(const PcmXGrantPayload *image_ready,
+														   int32 authenticated_master_node,
+														   uint64 authenticated_master_session,
+														   PcmXGrantPayload *replay_out,
+														   PcmXLocalImageReadyRefusal *refusal_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -13518,7 +13519,7 @@ cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
 		goto ready_release_gate;
 	}
 	if (!pcm_x_local_holder_transfer_peer_exact(tag_slot, authenticated_master_node,
-												 authenticated_master_session)
+												authenticated_master_session)
 		|| !pcm_x_ticket_ref_equal(&tag_slot->holder_ref, &image_ready->ref)
 		|| tag_slot->holder_image.image_id != image_ready->image.image_id) {
 		if (refusal_out != NULL)
@@ -18698,8 +18699,8 @@ pcm_x_local_blocker_participant_drain_locked(PcmXLocalTagSlot *tag_slot, PcmXSlo
 		|| tag_slot->blocker_snapshot_ref.identity.cluster_epoch != tag_slot->cluster_epoch)
 		return PCM_X_QUEUE_CORRUPT;
 	if ((!pcm_x_local_blocker_ack_tombstone_exact(tag_slot, authenticated_master_node)
-		 && !pcm_x_local_empty_blocker_commit_exact(
-			 tag_slot, authenticated_master_node, authenticated_master_session))
+		 && !pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+													authenticated_master_session))
 		|| tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0) {
 		blocker_state = pcm_x_local_blocker_lane_retire_state(tag_slot);
 		return blocker_state == PCM_X_QUEUE_CORRUPT ? blocker_state : PCM_X_QUEUE_NOT_READY;
@@ -18781,9 +18782,8 @@ pcm_x_local_holder_drain_poll_exact(const PcmXDrainPollPayload *poll,
 		goto holder_drain_done;
 	}
 	if (pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)) {
-		result = pcm_x_local_blocker_participant_drain_locked(tag_slot, tag_ref, poll,
-														  authenticated_master_node,
-														  authenticated_master_session);
+		result = pcm_x_local_blocker_participant_drain_locked(
+			tag_slot, tag_ref, poll, authenticated_master_node, authenticated_master_session);
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto holder_drain_done;
 	}

@@ -489,9 +489,11 @@ extern GcsBlockPendingXDenyResult
 cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupKey *key,
 											 const BufferTag *tag, uint8 transition_id,
 											 GcsBlockDedupEntry *denied_out);
-extern bool cluster_gcs_block_dedup_set_request_flags_exact(
-	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag, uint8 transition_id,
-	uint8 request_flags);
+extern bool cluster_gcs_block_dedup_set_request_flags_exact(int worker_id,
+															const GcsBlockDedupKey *key,
+															const BufferTag *tag,
+															uint8 transition_id,
+															uint8 request_flags);
 
 /* Dedicated PCM-X image storage over the existing dedup entry pool.  Reserve
  * claims capacity before the revoke lifecycle starts.  Materialize publishes

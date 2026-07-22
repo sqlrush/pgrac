@@ -82,10 +82,11 @@ static int ut_pcm_x_boundary_note_count = 0;
 static uint8 ut_pcm_x_boundary_msg_types[8];
 
 void
-cluster_lms_note_pcm_x_image_ready_boundary(
-	uint8 msg_type, const char *boundary, int result, int runtime_state, bool fence_enforcing,
-	bool fence_allowed, uint32 dest_node_id, uint64 request_id, uint64 ticket_id, uint64 grant_generation,
-	uint64 image_id)
+cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary, int result,
+											int runtime_state, bool fence_enforcing,
+											bool fence_allowed, uint32 dest_node_id,
+											uint64 request_id, uint64 ticket_id,
+											uint64 grant_generation, uint64 image_id)
 {
 	if (ut_pcm_x_boundary_note_count < (int)lengthof(ut_pcm_x_boundary_msg_types))
 		ut_pcm_x_boundary_msg_types[ut_pcm_x_boundary_note_count] = msg_type;
@@ -104,7 +105,7 @@ cluster_lms_note_pcm_x_image_ready_boundary(
 
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
-										  uint32 expected_generation)
+											  uint32 expected_generation)
 {
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || required_capabilities == 0)
 		return false;
@@ -312,8 +313,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 		ut_sent_log[ut_sent_n].dest = dest_node_id;
 		ut_sent_log[ut_sent_n].marker = payload_len > 0 ? *(const uint8 *)payload : 0;
 		ut_sent_log[ut_sent_n].payload_len = payload_len;
-		if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY
-			&& payload_len >= sizeof(GcsBlockReplyHeader))
+		if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY && payload_len >= sizeof(GcsBlockReplyHeader))
 			memcpy(&ut_sent_log[ut_sent_n].reply_header, payload, sizeof(GcsBlockReplyHeader));
 	}
 	ut_sent_n++;
@@ -590,10 +590,10 @@ UT_TEST(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable)
 
 	ut_reset_log();
 	memset(&payload, 0, sizeof(payload));
-	UT_ASSERT(cluster_lms_outbound_enqueue(
-		0, PGRAC_IC_MSG_PCM_X_IMAGE_READY, UT_PEER_X, &payload, sizeof(payload)));
-	UT_ASSERT(cluster_lms_outbound_enqueue(
-		0, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_Y, &payload, sizeof(payload)));
+	UT_ASSERT(cluster_lms_outbound_enqueue(0, PGRAC_IC_MSG_PCM_X_IMAGE_READY, UT_PEER_X, &payload,
+										   sizeof(payload)));
+	UT_ASSERT(cluster_lms_outbound_enqueue(0, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_Y, &payload,
+										   sizeof(payload)));
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 2);
 	UT_ASSERT_EQ(ut_pcm_x_boundary_note_count, 2);
 	UT_ASSERT_EQ((int)ut_pcm_x_boundary_msg_types[0], (int)PGRAC_IC_MSG_PCM_X_IMAGE_READY);
@@ -635,8 +635,7 @@ UT_TEST(test_zero_block_reply_is_expanded_by_data_owner)
 	UT_ASSERT_EQ((int)ut_sent_log[1].msg_type, (int)PGRAC_IC_MSG_GCS_BLOCK_REPLY);
 	UT_ASSERT_EQ((int)ut_sent_log[1].payload_len, (int)GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
 	UT_ASSERT_EQ(ut_sent_log[1].reply_header.request_id, hdr.request_id);
-	UT_ASSERT_EQ((int)ut_sent_log[1].reply_header.status,
-				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ((int)ut_sent_log[1].reply_header.status, (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
 	UT_ASSERT_EQ(ut_sent_log[1].reply_header.checksum, UINT32_C(0xA55A7E11));
 }
 
@@ -695,8 +694,8 @@ UT_TEST(test_cap_bound_frame_drops_on_connection_generation_drift)
 	ut_reset_log();
 	ut_peer_capabilities[UT_PEER_X] = cap;
 	ut_peer_cap_generation[UT_PEER_X] = 18;
-	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
-		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 17));
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
+													 &marker, sizeof(marker), cap, 17));
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
 	UT_ASSERT_EQ(ut_count_marker(marker), 0);
@@ -710,8 +709,8 @@ UT_TEST(test_cap_bound_frame_drops_on_capability_downgrade)
 
 	ut_reset_log();
 	ut_peer_cap_generation[UT_PEER_X] = 21;
-	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
-		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 21));
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
+													 &marker, sizeof(marker), cap, 21));
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
 	UT_ASSERT_EQ(ut_count_marker(marker), 0);
@@ -726,8 +725,8 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 	ut_reset_log();
 	ut_peer_capabilities[UT_PEER_X] = cap;
 	ut_peer_cap_generation[UT_PEER_X] = 34;
-	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
-		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 34));
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
+													 &marker, sizeof(marker), cap, 34));
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
 	UT_ASSERT_EQ(ut_count_marker(marker), 1);

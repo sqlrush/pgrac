@@ -1382,7 +1382,7 @@ extern bool cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback rev
 											  PcmXWaitCallback wait, void *callback_arg);
 extern PcmXQueueResult
 cluster_pcm_x_requester_wait_once_result(PcmXPreSleepResultCallback revalidate,
-										PcmXWaitCallback wait, void *callback_arg);
+										 PcmXWaitCallback wait, void *callback_arg);
 extern void cluster_pcm_x_stats_note_queue_result(PcmXQueueResult result);
 extern void cluster_pcm_x_stats_note_own_begin(void);
 extern void cluster_pcm_x_stats_note_own_commit(void);
@@ -1466,8 +1466,8 @@ cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected,
 										uint64 next_retry_deadline_ms, PcmXPhasePayload *commit_out,
 										PcmXMasterDriveSnapshot *snapshot_out);
 extern PcmXQueueResult cluster_pcm_x_master_invalidate_busy_backoff_exact(
-	const PcmXMasterDriveSnapshot *expected, int32 busy_node, uint64 now_ms,
-	uint64 retry_delay_ms, PcmXMasterDriveSnapshot *snapshot_out);
+	const PcmXMasterDriveSnapshot *expected, int32 busy_node, uint64 now_ms, uint64 retry_delay_ms,
+	PcmXMasterDriveSnapshot *snapshot_out);
 typedef bool (*PcmXStageFrameCallback)(uint8 msg_type, int32 dest_node_id, const void *payload,
 									   Size payload_len, void *callback_arg);
 extern PcmXQueueResult
@@ -1639,11 +1639,9 @@ extern PcmXQueueResult
 cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 											  int32 authenticated_master_node,
 											  uint64 authenticated_master_session);
-extern PcmXQueueResult
-cluster_pcm_x_local_holder_revoke_apply_floor_exact(const PcmXRevokePayload *revoke,
-												uint64 required_page_scn,
-												int32 authenticated_master_node,
-												uint64 authenticated_master_session);
+extern PcmXQueueResult cluster_pcm_x_local_holder_revoke_apply_floor_exact(
+	const PcmXRevokePayload *revoke, uint64 required_page_scn, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
 extern PcmXQueueResult cluster_pcm_x_local_holder_image_ready_arm_exact(
 	const PcmXGrantPayload *image_ready, int32 authenticated_master_node,
 	uint64 authenticated_master_session, PcmXGrantPayload *replay_out);

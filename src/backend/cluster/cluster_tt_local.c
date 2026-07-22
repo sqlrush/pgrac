@@ -57,7 +57,7 @@
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h"		/* spec-3.2 D4 wire emit append */
-#include "cluster/cluster_uba.h"                   /* P0-33 exact data-ref alias */
+#include "cluster/cluster_uba.h"				/* P0-33 exact data-ref alias */
 #include "cluster/storage/cluster_undo_alloc.h" /* cluster_undo_active_segment_for_node_or_create */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -477,12 +477,10 @@ cluster_tt_local_finish_bindings(bool committed, SCN commit_scn)
 
 /* Compose either the canonical key or one page-ref segment alias. */
 static bool
-build_binding_key(const ClusterTTLocalBinding *binding, uint16 segment_id,
-				  ClusterTTStatusKey *out)
+build_binding_key(const ClusterTTLocalBinding *binding, uint16 segment_id, ClusterTTStatusKey *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (binding == NULL || !TransactionIdIsValid(binding->top_xid)
-		|| segment_id == 0)
+	if (binding == NULL || !TransactionIdIsValid(binding->top_xid) || segment_id == 0)
 		return false;
 
 	out->origin_node_id = (uint16)cluster_node_id;
@@ -498,13 +496,12 @@ build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 {
 	int idx = cluster_tt_local_find_binding(xid);
 
-	if (idx < 0)
-	{
+	if (idx < 0) {
 		memset(out, 0, sizeof(*out));
 		return false;
 	}
 	return build_binding_key(&cluster_tt_local_bindings[idx],
-						 (uint16)cluster_tt_local_bindings[idx].segment_id, out);
+							 (uint16)cluster_tt_local_bindings[idx].segment_id, out);
 }
 
 /* Install and emit one already-minted exact key. */
@@ -522,8 +519,7 @@ install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_sc
 		bool hit = false;
 		bool epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
 
-		if (epoch_stable)
-		{
+		if (epoch_stable) {
 			hit = cluster_tt_status_lookup_exact(key, &res);
 			epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
 		}
@@ -538,13 +534,12 @@ install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_sc
 }
 
 static void
-install_binding_aliases(const ClusterTTLocalBinding *binding,
-						ClusterTTStatus status, SCN commit_scn)
+install_binding_aliases(const ClusterTTLocalBinding *binding, ClusterTTStatus status,
+						SCN commit_scn)
 {
 	uint16 i;
 
-	for (i = 0; i < binding->active_alias_count; i++)
-	{
+	for (i = 0; i < binding->active_alias_count; i++) {
 		ClusterTTStatusKey key;
 
 		if (build_binding_key(binding, binding->active_alias_segments[i], &key))
@@ -727,41 +722,34 @@ cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
 	 * If that invariant is ever broken, publish no guessed alias. */
 	if (!uba_decode(uba, &record_segment, &block_no, &slot_offset, &row_offset)
 		|| uba_origin_node_id(uba) != (NodeId)cluster_node_id
-		|| slot_offset != binding->slot_offset)
-	{
+		|| slot_offset != binding->slot_offset) {
 		Assert(false);
 		return;
 	}
 	(void)block_no;
 	(void)row_offset;
 
-	if (record_segment != binding->segment_id)
-	{
+	if (record_segment != binding->segment_id) {
 		for (i = 0; i < binding->active_alias_count; i++)
 			if (binding->active_alias_segments[i] == (uint16)record_segment)
 				break;
 
-		if (i == binding->active_alias_count)
-		{
+		if (i == binding->active_alias_count) {
 			MemoryContext oldcxt;
 
 			oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-			if (binding->active_alias_segments == NULL)
-			{
+			if (binding->active_alias_segments == NULL) {
 				binding->active_alias_capacity = 4;
-				binding->active_alias_segments = (uint16 *)palloc(
-					sizeof(uint16) * binding->active_alias_capacity);
-			}
-			else if (binding->active_alias_count == binding->active_alias_capacity)
-			{
+				binding->active_alias_segments
+					= (uint16 *)palloc(sizeof(uint16) * binding->active_alias_capacity);
+			} else if (binding->active_alias_count == binding->active_alias_capacity) {
 				binding->active_alias_capacity *= 2;
-				binding->active_alias_segments = (uint16 *)repalloc(
-					binding->active_alias_segments,
-					sizeof(uint16) * binding->active_alias_capacity);
+				binding->active_alias_segments
+					= (uint16 *)repalloc(binding->active_alias_segments,
+										 sizeof(uint16) * binding->active_alias_capacity);
 			}
 			MemoryContextSwitchTo(oldcxt);
-			binding->active_alias_segments[binding->active_alias_count++]
-				= (uint16)record_segment;
+			binding->active_alias_segments[binding->active_alias_count++] = (uint16)record_segment;
 		}
 	}
 

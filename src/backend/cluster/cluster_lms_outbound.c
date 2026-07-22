@@ -204,8 +204,8 @@ cluster_lms_outbound_request_lwlocks(void)
  */
 static bool
 lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id,
-							  const void *payload, uint16 payload_len,
-							  uint32 required_capability, uint32 connection_generation)
+							  const void *payload, uint16 payload_len, uint32 required_capability,
+							  uint32 connection_generation)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
@@ -247,8 +247,8 @@ bool
 cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 							 const void *payload, uint16 payload_len)
 {
-	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
-									 0, 0);
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len, 0,
+										 0);
 }
 
 /* Stage a wire-version-sensitive frame for one exact HELLO-authenticated
@@ -258,13 +258,12 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 bool
 cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 dest_node_id,
 									   const void *payload, uint16 payload_len,
-									   uint32 required_capability,
-									   uint32 connection_generation)
+									   uint32 required_capability, uint32 connection_generation)
 {
 	if (required_capability == 0 || dest_node_id >= CLUSTER_MAX_NODES)
 		return false;
 	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
-									 required_capability, connection_generation);
+										 required_capability, connection_generation);
 }
 
 /*
@@ -276,15 +275,14 @@ cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 des
  */
 bool
 cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
-										  const GcsBlockReplyHeader *header, bool direct_land)
+											  const GcsBlockReplyHeader *header, bool direct_land)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	ClusterLmsOutboundSlot *slot;
 
-	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS
-		|| dest_node_id >= CLUSTER_MAX_NODES || header == NULL
-		|| (direct_land && (int32)dest_node_id == cluster_node_id)
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || dest_node_id >= CLUSTER_MAX_NODES
+		|| header == NULL || (direct_land && (int32)dest_node_id == cluster_node_id)
 		|| header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
 		return false;
 	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
@@ -391,8 +389,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		 * no protocol ACK is generated, so the armed reliable leg retries. */
 		if (slot.required_capability != 0
 			&& !cluster_sf_peer_capability_generation_matches(
-				(int32)slot.dest_node_id, slot.required_capability,
-				slot.connection_generation)) {
+				(int32)slot.dest_node_id, slot.required_capability, slot.connection_generation)) {
 			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
 			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
 			continue;
@@ -412,8 +409,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 				goto handle_send_result;
 			}
-			zero_reply.header.checksum
-				= cluster_gcs_block_compute_checksum(zero_reply.block_data);
+			zero_reply.header.checksum = cluster_gcs_block_compute_checksum(zero_reply.block_data);
 			send_payload = &zero_reply;
 			send_payload_len = sizeof(zero_reply);
 		} else if (slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_FRAME) {
@@ -459,23 +455,21 @@ cluster_lms_outbound_drain_send(int worker_id)
 		 */
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
 			rc = cluster_gcs_block_send_direct_zero_reply((int32)slot.dest_node_id,
-														&zero_reply.header);
+														  &zero_reply.header);
 		else if ((int32)slot.dest_node_id == cluster_node_id) {
 			ClusterICEnvelope env;
 
-			if (cluster_ic_envelope_build(
-					&env, slot.msg_type, (uint32)cluster_node_id, slot.dest_node_id,
-					send_payload, send_payload_len)
-				&& cluster_ic_dispatch_envelope(&env, send_payload,
-												cluster_node_id))
+			if (cluster_ic_envelope_build(&env, slot.msg_type, (uint32)cluster_node_id,
+										  slot.dest_node_id, send_payload, send_payload_len)
+				&& cluster_ic_dispatch_envelope(&env, send_payload, cluster_node_id))
 				rc = CLUSTER_IC_SEND_DONE;
 			else
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 		} else
-			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
-										  send_payload, send_payload_len);
+			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id, send_payload,
+										  send_payload_len);
 
-handle_send_result:
+	handle_send_result:
 		lms_outbound_pcm_x_image_ready_note(&slot, "send-result", (int)rc);
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)

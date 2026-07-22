@@ -127,22 +127,21 @@ read_source(const char *path)
 	length = ftell(fp);
 	UT_ASSERT(length > 0);
 	UT_ASSERT_EQ(fseek(fp, 0, SEEK_SET), 0);
-	source = malloc((size_t) length + 1);
+	source = malloc((size_t)length + 1);
 	UT_ASSERT(source != NULL);
-	if (source == NULL)
-	{
+	if (source == NULL) {
 		fclose(fp);
 		return NULL;
 	}
-	UT_ASSERT_EQ((long) fread(source, 1, (size_t) length, fp), length);
+	UT_ASSERT_EQ((long)fread(source, 1, (size_t)length, fp), length);
 	source[length] = '\0';
 	fclose(fp);
 	return source;
 }
 
 static void
-assert_data_active_publish(const char *source, const char *start_marker,
-					   const char *end_marker, const char *uba_name)
+assert_data_active_publish(const char *source, const char *start_marker, const char *end_marker,
+						   const char *uba_name)
 {
 	const char *start = strstr(source, start_marker);
 	const char *end = start != NULL ? strstr(start + strlen(start_marker), end_marker) : NULL;
@@ -150,8 +149,8 @@ assert_data_active_publish(const char *source, const char *start_marker,
 	const char *publish;
 	const char *crit_end = start != NULL ? strstr(start, "END_CRIT_SECTION();") : NULL;
 
-	snprintf(publish_call, sizeof(publish_call),
-			 "cluster_tt_local_record_data_active(xid, %s);", uba_name);
+	snprintf(publish_call, sizeof(publish_call), "cluster_tt_local_record_data_active(xid, %s);",
+			 uba_name);
 	publish = start != NULL ? strstr(start, publish_call) : NULL;
 
 	if (publish != NULL && end != NULL && publish >= end)
@@ -166,8 +165,7 @@ assert_data_active_publish(const char *source, const char *start_marker,
 
 	/* The ACTIVE identity is published only after the tuple + ITL stamp is
 	 * WAL-protected, and before the function can release its heap buffer. */
-	while (true)
-	{
+	while (true) {
 		const char *next = strstr(crit_end + 1, "END_CRIT_SECTION();");
 
 		if (next == NULL || next >= publish)
@@ -327,20 +325,19 @@ UT_TEST(test_p033_data_dml_publishes_active_identity)
 	char *heap_source = read_source(HEAPAM_SOURCE_PATH);
 	char *tt_source = read_source(TT_LOCAL_SOURCE_PATH);
 
-	if (heap_source == NULL || tt_source == NULL)
-	{
+	if (heap_source == NULL || tt_source == NULL) {
 		free(heap_source);
 		free(tt_source);
 		return;
 	}
 	assert_data_active_publish(heap_source, "\nheap_insert(Relation",
-						   "\nheap_prepare_insert(Relation", "cluster_itl_uba");
+							   "\nheap_prepare_insert(Relation", "cluster_itl_uba");
 	assert_data_active_publish(heap_source, "\nheap_multi_insert(Relation",
-						   "\nsimple_heap_insert(Relation", "cluster_mi_uba");
+							   "\nsimple_heap_insert(Relation", "cluster_mi_uba");
 	assert_data_active_publish(heap_source, "\nheap_delete(Relation",
-						   "\nsimple_heap_delete(Relation", "cluster_itl_uba");
+							   "\nsimple_heap_delete(Relation", "cluster_itl_uba");
 	assert_data_active_publish(heap_source, "\nheap_update(Relation",
-						   "\nsimple_heap_update(Relation", "cluster_itl_uba");
+							   "\nsimple_heap_update(Relation", "cluster_itl_uba");
 
 	/* A real undo-record UBA may live in a different record segment from the
 	 * transaction's canonical TT segment after rollover.  The producer must
@@ -361,23 +358,22 @@ UT_TEST(test_p033_data_dml_publishes_active_identity)
  * terminal/FROZEN/stale boundaries are widened by the producer fix. */
 UT_TEST(test_p033_active_and_safety_boundary_matrix)
 {
-	UT_ASSERT_EQ((int) cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_REMOTE, false),
-				 (int) CLUSTER_VIS_ROUTE_REMOTE_VERDICT);
-	UT_ASSERT_EQ((int) cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_IN_PROGRESS),
-				 (int) CVV_INVISIBLE);
-	UT_ASSERT_EQ((int) cluster_vis_update_xmax_verdict(CLUSTER_TT_STATUS_IN_PROGRESS, false),
-				 (int) CVV_BEING_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_REMOTE, false),
+				 (int)CLUSTER_VIS_ROUTE_REMOTE_VERDICT);
+	UT_ASSERT_EQ((int)cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_IN_PROGRESS),
+				 (int)CVV_INVISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_update_xmax_verdict(CLUSTER_TT_STATUS_IN_PROGRESS, false),
+				 (int)CVV_BEING_MODIFIED);
 
-	UT_ASSERT_EQ((int) cluster_vis_xmin_needs_resolution(HEAP_XMIN_FROZEN), 0);
-	UT_ASSERT_EQ((int) cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_COMMITTED),
-				 (int) CVV_VISIBLE);
-	UT_ASSERT_EQ((int) cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_ABORTED),
-				 (int) CVV_INVISIBLE);
-	UT_ASSERT_EQ((int) cluster_vis_evidence_route(
-					 CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS, false),
-				 (int) CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN);
-	UT_ASSERT_EQ((int) cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_UNKNOWN),
-				 (int) CVV_FAILCLOSED_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(HEAP_XMIN_FROZEN), 0);
+	UT_ASSERT_EQ((int)cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_COMMITTED),
+				 (int)CVV_VISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_ABORTED),
+				 (int)CVV_INVISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS, false),
+				 (int)CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_UNKNOWN),
+				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
 

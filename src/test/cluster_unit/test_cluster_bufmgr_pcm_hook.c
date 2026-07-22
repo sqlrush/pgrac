@@ -379,7 +379,8 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 /* spec-5.2 D2 sub-case B stub: local-master read-image forward unreachable. */
 bool
 cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute_unused(),
-											 const PcmAuthoritySnapshot *expected pg_attribute_unused(),
+											 const PcmAuthoritySnapshot *expected
+												 pg_attribute_unused(),
 											 bool *out_retry_denied pg_attribute_unused())
 {
 	abort();

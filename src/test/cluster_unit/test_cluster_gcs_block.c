@@ -2042,9 +2042,9 @@ UT_TEST(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff)
 	received = backoff != NULL ? strstr(backoff, "invalidate_busy_received_count") : NULL;
 	queue_return = received != NULL ? strstr(received, "if (!queue_positive)") : NULL;
 	legacy_busy = queue_return != NULL
-				  ? strstr(queue_return,
-						   "ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY")
-				  : NULL;
+					  ? strstr(queue_return,
+							   "ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY")
+					  : NULL;
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(queue_busy);
 	UT_ASSERT_NOT_NULL(backoff);
@@ -2071,8 +2071,7 @@ UT_TEST(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff)
 	 * retry at 25s and phase-lock the denied reader's GRANT_PENDING window. */
 	delay_helper = strstr(source, "\ngcs_block_pcm_x_invalidate_busy_retry_delay_ms(");
 	delay_end = delay_helper != NULL ? strstr(delay_helper, "\n}") : NULL;
-	leg_retry_delay
-		= delay_helper != NULL ? strstr(delay_helper, "snapshot->retry_count") : NULL;
+	leg_retry_delay = delay_helper != NULL ? strstr(delay_helper, "snapshot->retry_count") : NULL;
 	UT_ASSERT_NOT_NULL(delay_helper);
 	UT_ASSERT_NOT_NULL(delay_end);
 	if (delay_helper != NULL && delay_end != NULL)
@@ -2084,9 +2083,9 @@ UT_TEST(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff)
 	execute_end = execute != NULL ? strstr(execute, "\n}\n") : NULL;
 	self_capable_first
 		= execute != NULL ? strstr(execute, "inv->master_node == cluster_node_id") : NULL;
-	self_capable_second = self_capable_first != NULL
-						  ? strstr(self_capable_first + 1, "inv->master_node == cluster_node_id")
-						  : NULL;
+	self_capable_second = self_capable_first != NULL ? strstr(self_capable_first + 1,
+															  "inv->master_node == cluster_node_id")
+													 : NULL;
 	UT_ASSERT_NOT_NULL(execute);
 	UT_ASSERT_NOT_NULL(execute_end);
 	UT_ASSERT_NOT_NULL(self_capable_first);
@@ -2169,28 +2168,25 @@ UT_TEST(test_pcm_x_grant_pending_invalidate_wakes_local_s_before_busy)
 	if (source == NULL)
 		return;
 	direct_prepare = strstr(source, "\ngcs_block_direct_prepare_attempt(");
-	direct_prepare_end
-		= direct_prepare != NULL ? strstr(direct_prepare, "\n}\n\n\n") : NULL;
+	direct_prepare_end = direct_prepare != NULL ? strstr(direct_prepare, "\n}\n\n\n") : NULL;
 	direct_first_reply_check
 		= direct_prepare != NULL ? strstr(direct_prepare, "slot->reply_received") : NULL;
 	direct_target_prepare = direct_first_reply_check != NULL
-							? strstr(direct_first_reply_check,
-									 "cluster_bufmgr_prepare_direct_land_target_for_gcs(")
-							: NULL;
-	direct_second_reply_check = direct_target_prepare != NULL
-								? strstr(direct_target_prepare, "slot->reply_received")
+								? strstr(direct_first_reply_check,
+										 "cluster_bufmgr_prepare_direct_land_target_for_gcs(")
 								: NULL;
-	direct_target_cleanup = direct_second_reply_check != NULL
-							? strstr(direct_second_reply_check,
-									 "gcs_block_direct_finish_target(buf, true, false")
-							: NULL;
+	direct_second_reply_check = direct_target_prepare != NULL
+									? strstr(direct_target_prepare, "slot->reply_received")
+									: NULL;
+	direct_target_cleanup
+		= direct_second_reply_check != NULL
+			  ? strstr(direct_second_reply_check, "gcs_block_direct_finish_target(buf, true, false")
+			  : NULL;
 	helper = strstr(source, "\ngcs_block_wake_local_pending_s_request(");
 	execute = strstr(source, "\ngcs_block_invalidate_execute(");
-	pending = execute != NULL ? strstr(execute, "cluster_bufmgr_block_grant_pending(inv->tag)")
-						  : NULL;
-	wake = pending != NULL
-			   ? strstr(pending, "gcs_block_wake_local_pending_s_request(inv)")
-			   : NULL;
+	pending
+		= execute != NULL ? strstr(execute, "cluster_bufmgr_block_grant_pending(inv->tag)") : NULL;
+	wake = pending != NULL ? strstr(pending, "gcs_block_wake_local_pending_s_request(inv)") : NULL;
 	busy = wake != NULL ? strstr(wake, "invalidate_busy_sent_count") : NULL;
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(direct_prepare);
@@ -2203,9 +2199,9 @@ UT_TEST(test_pcm_x_grant_pending_invalidate_wakes_local_s_before_busy)
 	UT_ASSERT_NOT_NULL(pending);
 	UT_ASSERT_NOT_NULL(wake);
 	UT_ASSERT_NOT_NULL(busy);
-	if (direct_prepare != NULL && direct_prepare_end != NULL
-		&& direct_first_reply_check != NULL && direct_target_prepare != NULL
-		&& direct_second_reply_check != NULL && direct_target_cleanup != NULL)
+	if (direct_prepare != NULL && direct_prepare_end != NULL && direct_first_reply_check != NULL
+		&& direct_target_prepare != NULL && direct_second_reply_check != NULL
+		&& direct_target_cleanup != NULL)
 		UT_ASSERT(direct_prepare < direct_first_reply_check
 				  && direct_first_reply_check < direct_target_prepare
 				  && direct_target_prepare < direct_second_reply_check
@@ -2246,9 +2242,8 @@ UT_TEST(test_pcm_x_grant_pending_orphan_observation_is_identity_exact)
 	}
 
 	execute = strstr(gcs_source, "\ngcs_block_invalidate_execute(");
-	pending = execute != NULL
-				  ? strstr(execute, "cluster_bufmgr_block_grant_pending(inv->tag)")
-				  : NULL;
+	pending
+		= execute != NULL ? strstr(execute, "cluster_bufmgr_block_grant_pending(inv->tag)") : NULL;
 	wake = pending != NULL
 			   ? strstr(pending, "woke_local = gcs_block_wake_local_pending_s_request(inv)")
 			   : NULL;
@@ -2273,11 +2268,11 @@ UT_TEST(test_pcm_x_grant_pending_orphan_observation_is_identity_exact)
 
 	retry = strstr(bufmgr_source, "\ncluster_bufmgr_pcm_retry_denied_rearm(");
 	abort = retry != NULL
-				? strstr(retry, "cluster_pcm_own_abort_grant_reservation(buf, base, *reservation_token)")
+				? strstr(retry,
+						 "cluster_pcm_own_abort_grant_reservation(buf, base, *reservation_token)")
 				: NULL;
-	abort_observe = abort != NULL
-					? strstr(abort, "cluster PCM pending-X exact abort observation:")
-					: NULL;
+	abort_observe
+		= abort != NULL ? strstr(abort, "cluster PCM pending-X exact abort observation:") : NULL;
 	UT_ASSERT_NOT_NULL(retry);
 	UT_ASSERT_NOT_NULL(abort);
 	UT_ASSERT_NOT_NULL(abort_observe);
@@ -2286,10 +2281,11 @@ UT_TEST(test_pcm_x_grant_pending_orphan_observation_is_identity_exact)
 
 	release = strstr(gcs_source, "\ngcs_block_release_slot(");
 	release_end = release != NULL ? strstr(release, "\n}\n") : NULL;
-	release_live = release != NULL
-					   ? strstr(release,
-								"cluster GCS block slot released with live direct target observation:")
-					   : NULL;
+	release_live
+		= release != NULL
+			  ? strstr(release,
+					   "cluster GCS block slot released with live direct target observation:")
+			  : NULL;
 	UT_ASSERT_NOT_NULL(release);
 	UT_ASSERT_NOT_NULL(release_end);
 	UT_ASSERT_NOT_NULL(release_live);
@@ -2298,14 +2294,14 @@ UT_TEST(test_pcm_x_grant_pending_orphan_observation_is_identity_exact)
 
 	direct_fail = strstr(gcs_source, "\ngcs_block_direct_fail_slot(");
 	direct_fail_end = direct_fail != NULL ? strstr(direct_fail, "\n}\n") : NULL;
-	direct_finish = direct_fail != NULL
-					? strstr(direct_fail,
-							 "gcs_block_direct_finish_target(target_buf, prepared, false")
-					: NULL;
-	direct_abort_observe = direct_finish != NULL
-						   ? strstr(direct_finish,
-									"cluster GCS block direct abort observation:")
-						   : NULL;
+	direct_finish
+		= direct_fail != NULL
+			  ? strstr(direct_fail, "gcs_block_direct_finish_target(target_buf, prepared, false")
+			  : NULL;
+	direct_abort_observe
+		= direct_finish != NULL
+			  ? strstr(direct_finish, "cluster GCS block direct abort observation:")
+			  : NULL;
 	UT_ASSERT_NOT_NULL(direct_fail);
 	UT_ASSERT_NOT_NULL(direct_fail_end);
 	UT_ASSERT_NOT_NULL(direct_finish);
@@ -2371,31 +2367,22 @@ UT_TEST(test_pcm_x_final_ack_fail_closed_names_exact_handoff_stage)
 	const char *handler
 		= source != NULL ? strstr(source, "\ncluster_gcs_handle_pcm_x_final_ack_envelope(") : NULL;
 	const char *handler_end
-		= handler != NULL
-			  ? strstr(handler, "\ncluster_gcs_handle_pcm_x_final_commit_ack_envelope(")
-			  : NULL;
+		= handler != NULL ? strstr(handler, "\ncluster_gcs_handle_pcm_x_final_commit_ack_envelope(")
+						  : NULL;
 	const char *stage_log
 		= handler != NULL ? strstr(handler, "PCM-X FINAL_ACK fail-closed at %s") : NULL;
 	const char *canonical
 		= handler != NULL ? strstr(handler, "cluster_pcm_x_runtime_fail_closed()") : NULL;
 	const char *direct
 		= handler != NULL ? strstr(handler, "cluster_pcm_x_runtime_transition(") : NULL;
-	const char *master_holder
-		= handler != NULL ? strstr(handler, "master_holder=%u") : NULL;
-	const char *image_page_scn
-		= handler != NULL ? strstr(handler, "image_page_scn=%llu") : NULL;
-	const char *watermark_scn
-		= handler != NULL ? strstr(handler, "watermark_scn=%llu") : NULL;
-	const char *watermark_source
-		= handler != NULL ? strstr(handler, "wm_src=%s") : NULL;
-	const char *watermark_sender
-		= handler != NULL ? strstr(handler, "wm_sender=%d") : NULL;
-	const char *watermark_request
-		= handler != NULL ? strstr(handler, "wm_request_id=%llu") : NULL;
-	const char *watermark_old
-		= handler != NULL ? strstr(handler, "wm_old_scn=%llu") : NULL;
-	const char *watermark_new
-		= handler != NULL ? strstr(handler, "wm_new_scn=%llu") : NULL;
+	const char *master_holder = handler != NULL ? strstr(handler, "master_holder=%u") : NULL;
+	const char *image_page_scn = handler != NULL ? strstr(handler, "image_page_scn=%llu") : NULL;
+	const char *watermark_scn = handler != NULL ? strstr(handler, "watermark_scn=%llu") : NULL;
+	const char *watermark_source = handler != NULL ? strstr(handler, "wm_src=%s") : NULL;
+	const char *watermark_sender = handler != NULL ? strstr(handler, "wm_sender=%d") : NULL;
+	const char *watermark_request = handler != NULL ? strstr(handler, "wm_request_id=%llu") : NULL;
+	const char *watermark_old = handler != NULL ? strstr(handler, "wm_old_scn=%llu") : NULL;
+	const char *watermark_new = handler != NULL ? strstr(handler, "wm_new_scn=%llu") : NULL;
 
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(handler_end);
@@ -2584,14 +2571,10 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_bufmgr_pcm_own_prepare_s_source_image("));
 		UT_ASSERT_NOT_NULL(strstr(begin, "binding.required_page_scn"));
 		UT_ASSERT_NOT_NULL(strstr(begin, "&source_prepare_refusal"));
-		UT_ASSERT_NOT_NULL(
-			strstr(source, "materialize-begin-s-content-lock"));
-		UT_ASSERT_NOT_NULL(
-			strstr(source, "materialize-begin-s-dirty-flushed"));
-		UT_ASSERT_NOT_NULL(
-			strstr(source, "materialize-begin-s-dirty-raced"));
-		UT_ASSERT_NOT_NULL(
-			strstr(source, "materialize-begin-s-io-in-progress"));
+		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-content-lock"));
+		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-dirty-flushed"));
+		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-dirty-raced"));
+		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-io-in-progress"));
 		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_bufmgr_pcm_own_begin_x_revoke("));
 		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_pcm_x_revoke_finish_mode("));
 		UT_ASSERT_NOT_NULL(strstr(begin, "CLUSTER_PCM_X_REVOKE_FINISH_DROP"));
@@ -2681,16 +2664,14 @@ UT_TEST(test_pcm_x_s_source_hard_failure_observation_is_reason_exact)
 	const char *observe;
 	const char *prepare;
 	const char *prepare_end;
-	static const char *const reasons[] = {
-		"CLUSTER_PCM_S_SOURCE_HARD_INITIAL_CURRENT_IMAGE",
-		"CLUSTER_PCM_S_SOURCE_HARD_INITIAL_IO_ERROR",
-		"CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT",
-		"CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY",
-		"CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE",
-		"CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_IO_ERROR",
-		"CLUSTER_PCM_S_SOURCE_HARD_NO_COVER",
-		"CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE"
-	};
+	static const char *const reasons[] = { "CLUSTER_PCM_S_SOURCE_HARD_INITIAL_CURRENT_IMAGE",
+										   "CLUSTER_PCM_S_SOURCE_HARD_INITIAL_IO_ERROR",
+										   "CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT",
+										   "CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY",
+										   "CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE",
+										   "CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_IO_ERROR",
+										   "CLUSTER_PCM_S_SOURCE_HARD_NO_COVER",
+										   "CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE" };
 	int i;
 
 	UT_ASSERT_NOT_NULL(source);
@@ -2698,9 +2679,10 @@ UT_TEST(test_pcm_x_s_source_hard_failure_observation_is_reason_exact)
 		return;
 	observe = strstr(source, "\ncluster_bufmgr_pcm_own_observe_s_source_hard_failure(");
 	prepare = strstr(source, "\ncluster_bufmgr_pcm_own_prepare_s_source_image(");
-	prepare_end = prepare != NULL
-		? strstr(prepare, "\n/* Abort only the matching S-source staging reservation. */")
-		: NULL;
+	prepare_end
+		= prepare != NULL
+			  ? strstr(prepare, "\n/* Abort only the matching S-source staging reservation. */")
+			  : NULL;
 	UT_ASSERT_NOT_NULL(observe);
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(prepare_end);
@@ -2722,7 +2704,8 @@ UT_TEST(test_pcm_x_s_source_hard_failure_observation_is_reason_exact)
 		UT_ASSERT(observe < prepare);
 	if (prepare != NULL && prepare_end != NULL) {
 		UT_ASSERT_NOT_NULL(strstr(prepare, "hard_failure_reason ="));
-		UT_ASSERT_NOT_NULL(strstr(prepare, "cluster_bufmgr_pcm_own_observe_s_source_hard_failure("));
+		UT_ASSERT_NOT_NULL(
+			strstr(prepare, "cluster_bufmgr_pcm_own_observe_s_source_hard_failure("));
 		UT_ASSERT(strstr(prepare, "cluster_bufmgr_pcm_own_observe_s_source_hard_failure(")
 				  < prepare_end);
 	}
@@ -2829,8 +2812,7 @@ UT_TEST(test_pcm_x_ready_admission_marks_before_send_and_rolls_back_refusal)
 	UT_ASSERT_NOT_NULL(strstr(begin, "PCM-X IMAGE_READY stage boundary"));
 	UT_ASSERT_NOT_NULL(strstr(begin, "mark_result"));
 	UT_ASSERT_NOT_NULL(strstr(begin, "stage_result"));
-	UT_ASSERT_NOT_NULL(
-		strstr(outbound_source, "cluster_lms_note_pcm_x_image_ready_boundary("));
+	UT_ASSERT_NOT_NULL(strstr(outbound_source, "cluster_lms_note_pcm_x_image_ready_boundary("));
 	handler = strstr(source, "\ncluster_gcs_handle_pcm_x_image_ready_envelope(");
 	UT_ASSERT_NOT_NULL(handler);
 	if (handler != NULL) {
@@ -2985,15 +2967,15 @@ UT_TEST(test_pcm_x_destructive_finish_fault_times_out_in_sql_before_harness)
 	UT_ASSERT_NOT_NULL(leg);
 	UT_ASSERT_NOT_NULL(destructive_leg);
 	statement_timeout = leg != NULL ? strstr(leg, "statement_timeout") : NULL;
-	insert = leg != NULL
-			 ? strstr(leg, "INSERT INTO pcm_xq_flush_error(id, v) VALUES (2, 1)")
-			 : NULL;
+	insert
+		= leg != NULL ? strstr(leg, "INSERT INTO pcm_xq_flush_error(id, v) VALUES (2, 1)") : NULL;
 	harness_timeout = leg != NULL ? strstr(leg, "timeout => 30") : NULL;
 	assertion = leg != NULL ? strstr(leg, "L5F remote writer failed") : NULL;
-	relfilenode = destructive_leg != NULL ? strstr(destructive_leg, "flush_error_relfilenode") : NULL;
-	exact_oracle
-		= destructive_leg != NULL ? strstr(destructive_leg, "PCM-X finish-error evidence exact")
-									 : NULL;
+	relfilenode
+		= destructive_leg != NULL ? strstr(destructive_leg, "flush_error_relfilenode") : NULL;
+	exact_oracle = destructive_leg != NULL
+					   ? strstr(destructive_leg, "PCM-X finish-error evidence exact")
+					   : NULL;
 	global_occupancy
 		= destructive_leg != NULL ? strstr(destructive_leg, "dedup_entry_count") : NULL;
 	UT_ASSERT_NOT_NULL(statement_timeout);
@@ -3465,8 +3447,7 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	wait_exact = strstr(source, "\ngcs_block_pcm_x_requester_wait_exact(");
 	wait_exact_end = wait_exact != NULL ? strstr(wait_exact, "\n}\n") : NULL;
 	wait_revalidate = strstr(source, "\ngcs_block_pcm_x_requester_pre_sleep_revalidate(");
-	wait_revalidate_end
-		= wait_revalidate != NULL ? strstr(wait_revalidate, "\n}\n") : NULL;
+	wait_revalidate_end = wait_revalidate != NULL ? strstr(wait_revalidate, "\n}\n") : NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(driver_end);
 	UT_ASSERT_NOT_NULL(rekey_helper);
@@ -4403,8 +4384,8 @@ UT_TEST(test_revoke_handler_silent_refusal_arms_all_note)
 		UT_ASSERT_NOT_NULL(strstr(materialize, "\"materialize-finish\""));
 	}
 	publish = materialize != NULL
-			  ? strstr(materialize, "cluster_gcs_block_dedup_pcm_x_publish_ready_exact(")
-			  : NULL;
+				  ? strstr(materialize, "cluster_gcs_block_dedup_pcm_x_publish_ready_exact(")
+				  : NULL;
 	reset = publish != NULL ? strstr(publish, "gcs_block_pcm_x_revoke_refusal_note(NULL, 0, NULL)")
 							: NULL;
 	if (reset == NULL && publish != NULL)
@@ -4455,16 +4436,16 @@ UT_TEST(test_local_master_read_image_retries_holder_busy_with_fresh_identity)
 	budget = strstr(read_image, "cluster_gcs_block_retransmit_max_retries");
 	loop = budget != NULL ? strstr(budget, "for (retry_attempt = 0;") : NULL;
 	backoff = loop != NULL ? strstr(loop, "gcs_block_backoff_ms_for_retry(retry_attempt)") : NULL;
-	fresh_id = backoff != NULL ? strstr(backoff, "gcs_block_pcm_x_next_request_id(&request_id)") : NULL;
+	fresh_id
+		= backoff != NULL ? strstr(backoff, "gcs_block_pcm_x_next_request_id(&request_id)") : NULL;
 	slot_id = fresh_id != NULL ? strstr(fresh_id, "slot->request_id = request_id") : NULL;
 	forward_id = slot_id != NULL ? strstr(slot_id, "fwd.request_id = request_id") : NULL;
-	send = forward_id != NULL
-			   ? strstr(forward_id, "cluster_grd_outbound_enqueue_backend_msg(")
-			   : NULL;
-	retryable_deny
-		= send != NULL ? strstr(send, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER") : NULL;
+	send = forward_id != NULL ? strstr(forward_id, "cluster_grd_outbound_enqueue_backend_msg(")
+							  : NULL;
+	retryable_deny = send != NULL ? strstr(send, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER") : NULL;
 	retry = retryable_deny != NULL ? strstr(retryable_deny, "continue;") : NULL;
-	terminal_error = retry != NULL ? strstr(retry, "could not obtain read image from X holder") : NULL;
+	terminal_error
+		= retry != NULL ? strstr(retry, "could not obtain read image from X holder") : NULL;
 	UT_ASSERT_NOT_NULL(budget);
 	UT_ASSERT_NOT_NULL(loop);
 	UT_ASSERT_NOT_NULL(backoff);
@@ -4522,17 +4503,15 @@ UT_TEST(test_local_master_read_image_stops_retrying_displaced_holder_exactly)
 				   ? strstr(retry_arg, "if (!cluster_pcm_lock_authority_matches(tag, expected))")
 				   : NULL;
 	reserve = precheck != NULL ? strstr(precheck, "gcs_block_reserve_slot(") : NULL;
-	backoff = reserve != NULL ? strstr(reserve, "gcs_block_backoff_ms_for_retry(retry_attempt)")
-							  : NULL;
+	backoff
+		= reserve != NULL ? strstr(reserve, "gcs_block_backoff_ms_for_retry(retry_attempt)") : NULL;
 	backoff_check = backoff != NULL
 						? strstr(backoff, "if (!cluster_pcm_lock_authority_matches(tag, expected))")
 						: NULL;
 	fresh_id = backoff_check != NULL
 				   ? strstr(backoff_check, "gcs_block_pcm_x_next_request_id(&request_id)")
 				   : NULL;
-	denial = fresh_id != NULL
-			  ? strstr(fresh_id, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER")
-			  : NULL;
+	denial = fresh_id != NULL ? strstr(fresh_id, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER") : NULL;
 	denial_check = denial != NULL
 					   ? strstr(denial, "if (!cluster_pcm_lock_authority_matches(tag, expected))")
 					   : NULL;
@@ -4540,8 +4519,8 @@ UT_TEST(test_local_master_read_image_stops_retrying_displaced_holder_exactly)
 	release = drift_retry != NULL ? strstr(drift_retry, "gcs_block_release_slot(slot)") : NULL;
 	drift_return = release != NULL ? strstr(release, "if (*out_retry_denied)") : NULL;
 	terminal_error = drift_return != NULL
-					 ? strstr(drift_return, "could not obtain read image from X holder")
-					 : NULL;
+						 ? strstr(drift_return, "could not obtain read image from X holder")
+						 : NULL;
 
 	UT_ASSERT_NOT_NULL(expected_arg);
 	UT_ASSERT_NOT_NULL(retry_arg);
@@ -4558,8 +4537,8 @@ UT_TEST(test_local_master_read_image_stops_retrying_displaced_holder_exactly)
 	UT_ASSERT_NOT_NULL(terminal_error);
 	if (expected_arg != NULL && retry_arg != NULL && precheck != NULL && reserve != NULL
 		&& backoff != NULL && backoff_check != NULL && fresh_id != NULL && denial != NULL
-		&& denial_check != NULL && drift_retry != NULL && release != NULL
-		&& drift_return != NULL && terminal_error != NULL)
+		&& denial_check != NULL && drift_retry != NULL && release != NULL && drift_return != NULL
+		&& terminal_error != NULL)
 		UT_ASSERT(read_image < expected_arg && expected_arg < retry_arg && retry_arg < precheck
 				  && precheck < reserve && reserve < backoff && backoff < backoff_check
 				  && backoff_check < fresh_id && fresh_id < denial && denial < denial_check
@@ -4584,8 +4563,7 @@ UT_TEST(test_local_master_read_image_refusal_evidence_is_attempt_exact)
 		= forward != NULL ? strstr(forward, "cluster_bufmgr_gcs_copy_refusal_name") : NULL;
 	const char *refusal_log
 		= refusal_name != NULL ? strstr(refusal_name, "holder ship image refused") : NULL;
-	const char *request_id
-		= refusal_log != NULL ? strstr(refusal_log, "request_id=") : NULL;
+	const char *request_id = refusal_log != NULL ? strstr(refusal_log, "request_id=") : NULL;
 
 	/* P0-21 observation only: the requester terminal error reports its exact
 	 * bounded-attempt result, while the holder process log binds each copy
@@ -4602,7 +4580,8 @@ UT_TEST(test_local_master_read_image_refusal_evidence_is_attempt_exact)
 	UT_ASSERT_NOT_NULL(refusal_log);
 	UT_ASSERT_NOT_NULL(request_id);
 	if (forward_end != NULL && refusal_name != NULL && refusal_log != NULL && request_id != NULL)
-		UT_ASSERT(refusal_name < refusal_log && refusal_log < request_id && request_id < forward_end);
+		UT_ASSERT(refusal_name < refusal_log && refusal_log < request_id
+				  && request_id < forward_end);
 	UT_ASSERT_NOT_NULL(t400);
 	if (t400 != NULL) {
 		const char *holder_before = strstr(t400, "holder_evicted_before_by_node");
@@ -4610,8 +4589,8 @@ UT_TEST(test_local_master_read_image_refusal_evidence_is_attempt_exact)
 			= holder_before != NULL ? strstr(holder_before, "holder_evicted_after_by_node") : NULL;
 		const char *holder_diag
 			= holder_after != NULL ? strstr(holder_after, "holder copy refusal baseline") : NULL;
-		const char *holder_final
-			= holder_diag != NULL ? strstr(holder_diag, "'block_forward_holder_evicted_count'")
+		const char *holder_final = holder_diag != NULL
+									   ? strstr(holder_diag, "'block_forward_holder_evicted_count'")
 									   : NULL;
 
 		UT_ASSERT_NOT_NULL(holder_before);
@@ -4704,55 +4683,71 @@ UT_TEST(test_remote_downgrade_prepares_exact_image_before_notify_and_reply)
 	char *gcs_source = read_gcs_block_source();
 	char *bufmgr_source = read_source_path("../../backend/storage/buffer/bufmgr.c");
 	const char *forward = gcs_source != NULL
-		? strstr(gcs_source, "\ncluster_gcs_handle_block_forward_envelope(") : NULL;
+							  ? strstr(gcs_source, "\ncluster_gcs_handle_block_forward_envelope(")
+							  : NULL;
 	const char *forward_end = forward != NULL ? strstr(forward, "\n}\n") : NULL;
-	const char *inject = forward != NULL
-		? strstr(forward, "cluster-gcs-block-evict-holder-before-ship") : NULL;
-	const char *downgrade = inject != NULL
-		? strstr(inject, "cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(") : NULL;
-	const char *reuse = downgrade != NULL ? strstr(downgrade, "holder_ship_ok = remote_downgraded")
-										  : NULL;
-	const char *post_notify_guard = downgrade != NULL
-		? strstr(downgrade,
-				 "remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY")
-		: NULL;
+	const char *inject
+		= forward != NULL ? strstr(forward, "cluster-gcs-block-evict-holder-before-ship") : NULL;
+	const char *downgrade
+		= inject != NULL
+			  ? strstr(inject, "cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(")
+			  : NULL;
+	const char *reuse
+		= downgrade != NULL ? strstr(downgrade, "holder_ship_ok = remote_downgraded") : NULL;
+	const char *post_notify_guard
+		= downgrade != NULL
+			  ? strstr(downgrade, "remote_downgrade_outcome == "
+								  "CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY")
+			  : NULL;
 	const char *post_notify_return
 		= post_notify_guard != NULL ? strstr(post_notify_guard, "return;") : NULL;
 	const char *copy = reuse != NULL ? strstr(reuse, "gcs_block_get_ship_image(") : NULL;
-	const char *helper = bufmgr_source != NULL
-		? strstr(bufmgr_source, "\ncluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(")
-		: NULL;
+	const char *helper
+		= bufmgr_source != NULL
+			  ? strstr(bufmgr_source,
+					   "\ncluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(")
+			  : NULL;
 	const char *helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
-	const char *reserve = helper != NULL ? strstr(helper, "cluster_bufmgr_pcm_own_begin_x_revoke(")
-									  : NULL;
+	const char *reserve
+		= helper != NULL ? strstr(helper, "cluster_bufmgr_pcm_own_begin_x_revoke(") : NULL;
 	const char *precopy = reserve != NULL ? strstr(reserve, "memcpy(dst,") : NULL;
-	const char *notify = precopy != NULL
-		? strstr(precopy, "cluster_gcs_send_transition_nowait(") : NULL;
-	const char *commit = notify != NULL
-		? strstr(notify, "cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(") : NULL;
-	const char *abort = helper != NULL
-		? strstr(helper, "cluster_bufmgr_pcm_own_abort_x_revoke(") : NULL;
-	const char *local_helper = bufmgr_source != NULL
-		? strstr(bufmgr_source, "\ncluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(")
-		: NULL;
+	const char *notify
+		= precopy != NULL ? strstr(precopy, "cluster_gcs_send_transition_nowait(") : NULL;
+	const char *commit
+		= notify != NULL ? strstr(notify, "cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(") : NULL;
+	const char *abort
+		= helper != NULL ? strstr(helper, "cluster_bufmgr_pcm_own_abort_x_revoke(") : NULL;
+	const char *local_helper
+		= bufmgr_source != NULL
+			  ? strstr(bufmgr_source, "\ncluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(")
+			  : NULL;
 	const char *local_helper_end = local_helper != NULL ? strstr(local_helper, "\n}\n") : NULL;
 	const char *local_reserve = local_helper != NULL
-		? strstr(local_helper, "cluster_bufmgr_pcm_own_begin_x_revoke(") : NULL;
+									? strstr(local_helper, "cluster_bufmgr_pcm_own_begin_x_revoke(")
+									: NULL;
 	const char *local_copy = local_reserve != NULL ? strstr(local_reserve, "memcpy(dst,") : NULL;
-	const char *local_master = local_copy != NULL
-		? strstr(local_copy, "cluster_pcm_lock_apply_gcs_transition(") : NULL;
-	const char *local_commit = local_master != NULL
-		? strstr(local_master, "cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(") : NULL;
-	const char *local_call = gcs_source != NULL
-		? strstr(gcs_source, "cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(") : NULL;
-	const char *prepared = local_call != NULL ? strstr(local_call, "scache_image_prepared = true")
-										 : NULL;
-	const char *produce = prepared != NULL
-		? strstr(prepared, "gcs_block_produce_reply(req, block_buf, scache_image_prepared") : NULL;
-	const char *produce_def = gcs_source != NULL ? strstr(gcs_source, "\ngcs_block_produce_reply(")
-												 : NULL;
-	const char *skip_second_copy = produce_def != NULL
-		? strstr(produce_def, "if (!preprepared_image\n\t\t&& !gcs_block_get_ship_image(") : NULL;
+	const char *local_master
+		= local_copy != NULL ? strstr(local_copy, "cluster_pcm_lock_apply_gcs_transition(") : NULL;
+	const char *local_commit
+		= local_master != NULL
+			  ? strstr(local_master, "cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(")
+			  : NULL;
+	const char *local_call
+		= gcs_source != NULL
+			  ? strstr(gcs_source, "cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(")
+			  : NULL;
+	const char *prepared
+		= local_call != NULL ? strstr(local_call, "scache_image_prepared = true") : NULL;
+	const char *produce
+		= prepared != NULL
+			  ? strstr(prepared, "gcs_block_produce_reply(req, block_buf, scache_image_prepared")
+			  : NULL;
+	const char *produce_def
+		= gcs_source != NULL ? strstr(gcs_source, "\ngcs_block_produce_reply(") : NULL;
+	const char *skip_second_copy
+		= produce_def != NULL
+			  ? strstr(produce_def, "if (!preprepared_image\n\t\t&& !gcs_block_get_ship_image(")
+			  : NULL;
 
 	/* P0-32: injection is decided before any irreversible downgrade.  The
 	 * successful arm reuses bytes proven under the same content EXCLUSIVE
@@ -4782,11 +4777,13 @@ UT_TEST(test_remote_downgrade_prepares_exact_image_before_notify_and_reply)
 	UT_ASSERT_NOT_NULL(notify);
 	UT_ASSERT_NOT_NULL(commit);
 	UT_ASSERT_NOT_NULL(abort);
-	if (helper_end != NULL && reserve != NULL && precopy != NULL && notify != NULL && commit != NULL)
+	if (helper_end != NULL && reserve != NULL && precopy != NULL && notify != NULL
+		&& commit != NULL)
 		UT_ASSERT(reserve < precopy && precopy < notify && notify < commit && commit < helper_end);
 	if (helper_end != NULL && abort != NULL)
 		UT_ASSERT(abort < notify && abort < helper_end);
-	UT_ASSERT_NOT_NULL(helper != NULL ? strstr(helper, "cluster_pcm_x_runtime_fail_closed()") : NULL);
+	UT_ASSERT_NOT_NULL(helper != NULL ? strstr(helper, "cluster_pcm_x_runtime_fail_closed()")
+									  : NULL);
 	UT_ASSERT_NOT_NULL(local_helper);
 	UT_ASSERT_NOT_NULL(local_helper_end);
 	UT_ASSERT_NOT_NULL(local_reserve);
@@ -4868,18 +4865,15 @@ UT_TEST(test_gcs_apply_state_drift_restarts_with_fresh_request_identity)
 	 * N->S/N->X must abandon this attempt and re-enter bufmgr with a fresh
 	 * request/token identity.  Other transition incompatibilities remain
 	 * structural terminal denials. */
-	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_PENDING_X,
-											  PCM_TRANS_N_TO_S),
+	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_PENDING_X, PCM_TRANS_N_TO_S),
 				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
-	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE,
-											  PCM_TRANS_N_TO_S),
+	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE, PCM_TRANS_N_TO_S),
 				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
-	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE,
-											  PCM_TRANS_N_TO_X),
+	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE, PCM_TRANS_N_TO_X),
 				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
-	UT_ASSERT_EQ((int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE,
-											  PCM_TRANS_S_TO_X_UPGRADE),
-				 (int)GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE);
+	UT_ASSERT_EQ(
+		(int)GcsBlockApplyRefusalStatus(PCM_GCS_TRANSITION_INCOMPATIBLE, PCM_TRANS_S_TO_X_UPGRADE),
+		(int)GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE);
 
 	UT_ASSERT_NOT_NULL(produce);
 	UT_ASSERT_NOT_NULL(produce_end);
@@ -4909,18 +4903,14 @@ UT_TEST(test_master_direct_copy_busy_uses_only_fresh_identity_retry_boundary)
 		GcsBlockReplyStatus expected;
 	};
 	static const struct CopyRefusalCase cases[] = {
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE,
-		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
+		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
 		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT,
 		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT,
-		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
+		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
 		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID,
 		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST,
-		  GCS_BLOCK_REPLY_DENIED_PENDING_X },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND,
-		  GCS_BLOCK_REPLY_DENIED_PENDING_X },
+		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST, GCS_BLOCK_REPLY_DENIED_PENDING_X },
+		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND, GCS_BLOCK_REPLY_DENIED_PENDING_X },
 		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY,
 		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
 		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT,
@@ -4965,12 +4955,12 @@ UT_TEST(test_master_direct_copy_busy_uses_only_fresh_identity_retry_boundary)
 	copy_refusal = strstr(produce, "produce-copy-refused:%s");
 	copy_refusal_end = copy_refusal != NULL ? strstr(copy_refusal, "return true;") : NULL;
 	mapping = copy_refusal != NULL
-			  ? strstr(copy_refusal, "GcsBlockMasterDirectCopyRefusalStatus(copy_refusal)")
+				  ? strstr(copy_refusal, "GcsBlockMasterDirectCopyRefusalStatus(copy_refusal)")
+				  : NULL;
+	terminal_literal
+		= copy_refusal != NULL
+			  ? strstr(copy_refusal, "*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER")
 			  : NULL;
-	terminal_literal = copy_refusal != NULL
-					   ? strstr(copy_refusal,
-								"*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER")
-					   : NULL;
 	UT_ASSERT_NOT_NULL(copy_refusal);
 	UT_ASSERT_NOT_NULL(copy_refusal_end);
 	UT_ASSERT_NOT_NULL(mapping);
@@ -4983,8 +4973,7 @@ UT_TEST(test_master_direct_copy_busy_uses_only_fresh_identity_retry_boundary)
 	 * the same cached request id.  Bufmgr then aborts the exact old reservation,
 	 * waits, and rearms a fresh token/request identity (covered by
 	 * test_pending_x_denied_retry_leaves_master_invalidate_gap). */
-	requester_retry
-		= strstr(source, "if (final_status == GCS_BLOCK_REPLY_DENIED_PENDING_X)");
+	requester_retry = strstr(source, "if (final_status == GCS_BLOCK_REPLY_DENIED_PENDING_X)");
 	retry_flag = requester_retry != NULL ? strstr(requester_retry, "retry_denied = true;") : NULL;
 	retry_break = retry_flag != NULL ? strstr(retry_flag, "break;") : NULL;
 	same_id_continue = retry_flag != NULL ? strstr(retry_flag, "continue;") : NULL;
@@ -5024,20 +5013,13 @@ UT_TEST(test_master_not_holder_producers_log_one_coherent_authority_snapshot)
 		"authority.transition_count",
 	};
 	static const char *const required_reasons[] = {
-		"direct-land-nonsendable",
-		"direct-land-forward-rearm",
-		"pcm-x-image-not-ready",
-		"produce-no-resident-authority",
-		"produce-copy-refused",
-		"clean-third-party-master",
-		"live-x-other-holder",
-		"pending-x-reserve-failed",
-		"x-forward-send-failed",
-		"x-state-holder-unroutable",
-		"holder-immediate-deny",
-		"holder-drop-pinned",
-		"holder-drop-stale",
-		"holder-copy-refused",
+		"direct-land-nonsendable", "direct-land-forward-rearm",
+		"pcm-x-image-not-ready",   "produce-no-resident-authority",
+		"produce-copy-refused",	   "clean-third-party-master",
+		"live-x-other-holder",	   "pending-x-reserve-failed",
+		"x-forward-send-failed",   "x-state-holder-unroutable",
+		"holder-immediate-deny",   "holder-drop-pinned",
+		"holder-drop-stale",	   "holder-copy-refused",
 	};
 	size_t i;
 
@@ -5060,8 +5042,9 @@ UT_TEST(test_master_not_holder_producers_log_one_coherent_authority_snapshot)
 				UT_ASSERT(field < helper_end);
 		}
 		snapshot = strstr(helper, "cluster_pcm_lock_authority_snapshot(");
-		duplicate_snapshot
-			= snapshot != NULL ? strstr(snapshot + 1, "cluster_pcm_lock_authority_snapshot(") : NULL;
+		duplicate_snapshot = snapshot != NULL
+								 ? strstr(snapshot + 1, "cluster_pcm_lock_authority_snapshot(")
+								 : NULL;
 		UT_ASSERT_NOT_NULL(snapshot);
 		UT_ASSERT(snapshot != NULL && snapshot < helper_end);
 		UT_ASSERT(duplicate_snapshot == NULL || duplicate_snapshot >= helper_end);
@@ -5215,21 +5198,20 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 
 	transfer = strstr(source, "\ngcs_block_pcm_x_master_drive_transfer(");
 	transfer_end = transfer != NULL ? strstr(transfer, "\n}\n") : NULL;
-	auth = transfer != NULL
-			 ? strstr(transfer, "gcs_block_pcm_x_authenticated_session_result(")
-			 : NULL;
+	auth = transfer != NULL ? strstr(transfer, "gcs_block_pcm_x_authenticated_session_result(")
+							: NULL;
 	arm = auth != NULL ? strstr(auth, "cluster_pcm_x_master_revoke_arm_exact(") : NULL;
 	sample = arm != NULL ? strstr(arm, "cluster_sf_peer_pcm_x_source_floor_sample(") : NULL;
-	generation
-		= sample != NULL ? strstr(sample, "auth_sample.connection_generation_before") : NULL;
+	generation = sample != NULL ? strstr(sample, "auth_sample.connection_generation_before") : NULL;
 	guarded_stage
 		= generation != NULL ? strstr(generation, "gcs_block_pcm_x_stage_frame_cap_bound(") : NULL;
-	v1_fallback = guarded_stage != NULL
-					  ? strstr(guarded_stage, "cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_REVOKE")
-					  : NULL;
-	stray_simple_query = transfer != NULL
-						 ? strstr(transfer, "cluster_sf_peer_supports_pcm_x_source_floor(source)")
-						 : NULL;
+	v1_fallback
+		= guarded_stage != NULL
+			  ? strstr(guarded_stage, "cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_REVOKE")
+			  : NULL;
+	stray_simple_query
+		= transfer != NULL ? strstr(transfer, "cluster_sf_peer_supports_pcm_x_source_floor(source)")
+						   : NULL;
 	UT_ASSERT_NOT_NULL(transfer);
 	UT_ASSERT_NOT_NULL(transfer_end);
 	UT_ASSERT_NOT_NULL(auth);

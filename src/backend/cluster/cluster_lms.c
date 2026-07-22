@@ -61,8 +61,8 @@
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
-#include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
-#include "cluster/cluster_gcs_block.h"	 /* PGRAC: spec-7.2 D4 plane probe + pi drain */
+#include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current */
+#include "cluster/cluster_gcs_block.h" /* PGRAC: spec-7.2 D4 plane probe + pi drain */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_write_fence.h" /* PGRAC: spec-7.2 D5 fence linkage */
 #include "cluster/cluster_ges.h"
@@ -724,22 +724,23 @@ lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 
 
 void
-cluster_lms_note_pcm_x_image_ready_boundary(
-	uint8 msg_type, const char *boundary, int result, int runtime_state, bool fence_enforcing,
-	bool fence_allowed, uint32 dest_node_id, uint64 request_id, uint64 ticket_id, uint64 grant_generation,
-	uint64 image_id)
+cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary, int result,
+											int runtime_state, bool fence_enforcing,
+											bool fence_allowed, uint32 dest_node_id,
+											uint64 request_id, uint64 ticket_id,
+											uint64 grant_generation, uint64 image_id)
 {
-	if (boundary == NULL
-		|| !cluster_injection_is_armed("cluster-pcm-x-retain-flush-error"))
+	if (boundary == NULL || !cluster_injection_is_armed("cluster-pcm-x-retain-flush-error"))
 		return;
-	ereport(LOG,
-			(errmsg_internal("PCM-X IMAGE_READY transport boundary: %s", boundary),
-			 errdetail("msg_type=%u result=%d runtime=%d fence_enforcing=%s fence_allowed=%s dest=%u "
-					   "request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
-					   (unsigned)msg_type, result, runtime_state, fence_enforcing ? "true" : "false",
-					   fence_allowed ? "true" : "false", dest_node_id,
-					   (unsigned long long)request_id, (unsigned long long)ticket_id,
-					   (unsigned long long)grant_generation, (unsigned long long)image_id)));
+	ereport(
+		LOG,
+		(errmsg_internal("PCM-X IMAGE_READY transport boundary: %s", boundary),
+		 errdetail("msg_type=%u result=%d runtime=%d fence_enforcing=%s fence_allowed=%s dest=%u "
+				   "request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
+				   (unsigned)msg_type, result, runtime_state, fence_enforcing ? "true" : "false",
+				   fence_allowed ? "true" : "false", dest_node_id, (unsigned long long)request_id,
+				   (unsigned long long)ticket_id, (unsigned long long)grant_generation,
+				   (unsigned long long)image_id)));
 }
 
 void

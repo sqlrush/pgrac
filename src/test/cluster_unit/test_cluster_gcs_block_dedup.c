@@ -1428,13 +1428,13 @@ UT_TEST(u25_pcm_x_work_prefers_reserved_and_marks_ready_staged)
 	reserved_binding.identity.image.page_checksum = 0;
 	reserved_binding.required_page_scn = UINT64_C(72057594037950810);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &reserved_key, &reserved_tag,
-														&reserved_binding),
+															&reserved_binding),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
 	wrong_floor = reserved_binding;
 	wrong_floor.required_page_scn++;
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &reserved_key, &reserved_tag,
-														&wrong_floor),
-				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_pcm_x_reserve(0, &reserved_key, &reserved_tag, &wrong_floor),
+		(int)GCS_BLOCK_PCM_X_IMAGE_STALE);
 
 	memset(&work, 0, sizeof(work));
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
@@ -1808,15 +1808,15 @@ UT_TEST(u33_pending_x_arm_terminates_inflight_legacy_s_exactly)
 	forward_hdr.transition_id = (uint8)PCM_TRANS_N_TO_S;
 	forward_hdr.status = (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&forward_hdr, cluster_node_id);
-	cluster_gcs_block_dedup_install_reply(0, &forwarded,
-										 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &forward_hdr, NULL);
+	cluster_gcs_block_dedup_install_reply(0, &forwarded, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
+										  &forward_hdr, NULL);
 
 	/* Different tag and same-tag writer identities are not legacy-S victims. */
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
 					 0, &unrelated, other_tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &writer, tag, PCM_TRANS_N_TO_X, 1000, true, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &writer, tag, PCM_TRANS_N_TO_X,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 
 	for (i = 0; i < 2; i++) {
@@ -1826,12 +1826,10 @@ UT_TEST(u33_pending_x_arm_terminates_inflight_legacy_s_exactly)
 		UT_ASSERT_EQ((int)denied.entry_kind, (int)GCS_BLOCK_DEDUP_ENTRY_GENERIC);
 		UT_ASSERT_EQ((int)denied.transition_id, (int)PCM_TRANS_N_TO_S);
 		UT_ASSERT_EQ((int)denied.status, (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
-		UT_ASSERT_EQ((int)denied.reply_header.status,
-					 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+		UT_ASSERT_EQ((int)denied.reply_header.status, (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
 		UT_ASSERT_EQ(denied.reply_header.request_id, denied.key.request_id);
 		UT_ASSERT_EQ(denied.reply_header.epoch, denied.key.cluster_epoch);
-		UT_ASSERT_EQ(denied.reply_header.requester_backend_id,
-					 denied.key.requester_backend_id);
+		UT_ASSERT_EQ(denied.reply_header.requester_backend_id, denied.key.requester_backend_id);
 		UT_ASSERT_EQ((int)denied.reply_header.transition_id, (int)PCM_TRANS_N_TO_S);
 		UT_ASSERT_EQ(denied.reply_header.sender_node, cluster_node_id);
 		UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(&denied.reply_header),
@@ -1856,8 +1854,8 @@ UT_TEST(u33_pending_x_arm_terminates_inflight_legacy_s_exactly)
 	late_granted.requester_backend_id = denied.key.requester_backend_id;
 	late_granted.transition_id = (uint8)PCM_TRANS_N_TO_S;
 	late_granted.status = (uint8)GCS_BLOCK_REPLY_GRANTED;
-	cluster_gcs_block_dedup_install_reply(0, &denied.key, GCS_BLOCK_REPLY_GRANTED,
-										 &late_granted, page);
+	cluster_gcs_block_dedup_install_reply(0, &denied.key, GCS_BLOCK_REPLY_GRANTED, &late_granted,
+										  page);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
 					 0, &denied.key, tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
@@ -1867,24 +1865,22 @@ UT_TEST(u33_pending_x_arm_terminates_inflight_legacy_s_exactly)
 	/* Duplicate DONE is idempotent and removes both old identities from the
 	 * denial replay set; unrelated entries remain in their original states. */
 	for (i = 0; i < 2; i++) {
-		UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &denied_keys[i], &tag,
-											 PCM_TRANS_N_TO_S));
-		UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &denied_keys[i], &tag,
-											 PCM_TRANS_N_TO_S));
+		UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &denied_keys[i], &tag, PCM_TRANS_N_TO_S));
+		UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &denied_keys[i], &tag, PCM_TRANS_N_TO_S));
 	}
 	UT_ASSERT_EQ(cluster_gcs_block_dedup_pending_x_deny_next(0, &tag, &denied),
 				 GCS_BLOCK_PENDING_X_DENY_NOT_FOUND);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
 					 0, &unrelated, other_tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &writer, tag, PCM_TRANS_N_TO_X, 1000, true, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &writer, tag, PCM_TRANS_N_TO_X,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
 
 	/* Once the queue round is over, a reader with a fresh identity is admitted
 	 * normally; the two denied identities cannot poison the new request. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &fresh, tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &fresh, tag, PCM_TRANS_N_TO_S,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 }
 
@@ -1905,8 +1901,8 @@ UT_TEST(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut)
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 	memset(&granted, 0, sizeof(granted));
 	memset(page, 0x71, sizeof(page));
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &key, tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(
 		0, &key, &tag, PCM_TRANS_N_TO_S, GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
@@ -1917,37 +1913,34 @@ UT_TEST(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut)
 	granted.requester_backend_id = key.requester_backend_id;
 	granted.transition_id = (uint8)PCM_TRANS_N_TO_S;
 	granted.status = (uint8)GCS_BLOCK_REPLY_GRANTED;
-	GcsBlockReplyHeaderSetForwardingMasterNode(&granted,
-										 GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	GcsBlockReplyHeaderSetForwardingMasterNode(&granted, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	cluster_gcs_block_dedup_install_reply(0, &key, GCS_BLOCK_REPLY_GRANTED, &granted, page);
 
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(
-					 0, &key, &tag, PCM_TRANS_N_TO_S, &denied),
-				 (int)GCS_BLOCK_PENDING_X_DENY_NEW);
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_pending_x_deny_exact(0, &key, &tag, PCM_TRANS_N_TO_S, &denied),
+		(int)GCS_BLOCK_PENDING_X_DENY_NEW);
 	UT_ASSERT_EQ((int)denied.status, (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
 	UT_ASSERT_EQ((int)denied.request_flags,
-				 (int)(GCS_BLOCK_DEDUP_REQUEST_F_PINNED
-					   | GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(
-					 0, &key, &tag, PCM_TRANS_N_TO_S, &denied),
-				 (int)GCS_BLOCK_PENDING_X_DENY_REPLAY);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &key, tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
+				 (int)(GCS_BLOCK_DEDUP_REQUEST_F_PINNED | GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_dedup_pending_x_deny_exact(0, &key, &tag, PCM_TRANS_N_TO_S, &denied),
+		(int)GCS_BLOCK_PENDING_X_DENY_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
 	UT_ASSERT_EQ((int)cached.status, (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
 
 	/* Missing and mismatched identities are zero-mutation invalid results. */
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(
-					 0, &absent, &tag, PCM_TRANS_N_TO_S, &denied),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(0, &absent, &tag,
+																   PCM_TRANS_N_TO_S, &denied),
 				 (int)GCS_BLOCK_PENDING_X_DENY_INVALID);
 	UT_ASSERT(!cluster_gcs_block_dedup_set_request_flags_exact(
 		0, &key, &tag, PCM_TRANS_N_TO_X, GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
-					 0, &key, tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S,
+																 1000, true, &cached),
 				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
 	UT_ASSERT_EQ((int)cached.request_flags,
-				 (int)(GCS_BLOCK_DEDUP_REQUEST_F_PINNED
-					   | GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
+				 (int)(GCS_BLOCK_DEDUP_REQUEST_F_PINNED | GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
 }
 
 

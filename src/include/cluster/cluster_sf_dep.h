@@ -273,10 +273,10 @@ extern bool cluster_sf_peer_supports_pcm_x_convert(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id);
 extern bool cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
-													 uint32 *generation_out);
+													  uint32 *generation_out);
 extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
-												  uint32 required_capabilities,
-												  uint32 expected_generation);
+														  uint32 required_capabilities,
+														  uint32 expected_generation);
 /* review P0-2: lock-coherent (CONVERT supported, REBASE bit, record
  * generation) triple for the formation collector's double sample. */
 extern bool cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out,

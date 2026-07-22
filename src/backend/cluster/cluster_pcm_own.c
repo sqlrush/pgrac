@@ -245,8 +245,8 @@ cluster_pcm_own_grant_commit_exact(int buf_id, uint64 expected_generation, uint6
 
 ClusterPcmOwnResult
 cluster_pcm_own_writer_grant_commit_exact(int buf_id, uint64 expected_generation,
-									  uint64 reservation_token,
-									  uint64 *out_committed_generation)
+										  uint64 reservation_token,
+										  uint64 *out_committed_generation)
 {
 	ClusterPcmOwnEntry *entry;
 	ClusterPcmOwnResult live_result;
@@ -290,7 +290,7 @@ cluster_pcm_own_writer_grant_commit_exact(int buf_id, uint64 expected_generation
 
 ClusterPcmOwnResult
 cluster_pcm_own_writer_activation_clear_exact(int buf_id, uint64 expected_generation,
-										  uint64 reservation_token)
+											  uint64 reservation_token)
 {
 	ClusterPcmOwnEntry *entry;
 	uint64 live_activation;

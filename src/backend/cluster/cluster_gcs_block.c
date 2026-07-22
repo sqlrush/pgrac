@@ -260,11 +260,11 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 block_x_granted_from_holder_count; /* sender install X_GRANTED_FROM_HOLDER */
 	pg_atomic_uint64 starvation_denied_pending_x_count; /* N→S short-circuit by pending_x */
 	/* PGRAC: spec-2.37 D12 — 4 NEW counters for PI watermark + lost-write detection. */
-	pg_atomic_uint64 pi_watermark_advance_count; /* X→N/S downgrade caller advance ticks */
-	pg_atomic_uint64 pi_watermark_retire_count;	 /* tag lifecycle + durable-confirm retire */
+	pg_atomic_uint64 pi_watermark_advance_count;  /* X→N/S downgrade caller advance ticks */
+	pg_atomic_uint64 pi_watermark_retire_count;	  /* tag lifecycle + durable-confirm retire */
 	pg_atomic_uint64 pi_durable_note_apply_count; /* target accepted status-3 DATA/CONTROL note */
-	pg_atomic_uint64 lost_write_detected_count;	 /* master direct OR holder forward detect */
-	pg_atomic_uint64 lost_write_avoid_count;	 /* durable-confirm retire avoided false-pos */
+	pg_atomic_uint64 lost_write_detected_count;	  /* master direct OR holder forward detect */
+	pg_atomic_uint64 lost_write_avoid_count;	  /* durable-confirm retire avoided false-pos */
 	/* PGRAC: spec-2.41 D7 — SCN lost-write detector + redo-coverage observability.
 	 * Pure counters (no behavior change): the verdict still maps STALE+ANOMALY to
 	 * DENIED_LOST_WRITE and bumps lost_write_detected_count;  these break that down
@@ -905,10 +905,9 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 			 "cluster GCS block slot released with live direct target observation: "
 			 "backend=%d slot=%d request_id=%llu epoch=%llu rel=%u fork=%d blk=%u "
 			 "reply_received=%d direct_state=%d direct_prepared=1",
-			 (int)MyBackendId - 1, released_slot_index,
-			 (unsigned long long)released_request_id, (unsigned long long)released_epoch,
-			 released_tag.relNumber, (int)released_tag.forkNum, released_tag.blockNum,
-			 released_reply_received ? 1 : 0, released_direct_state);
+			 (int)MyBackendId - 1, released_slot_index, (unsigned long long)released_request_id,
+			 (unsigned long long)released_epoch, released_tag.relNumber, (int)released_tag.forkNum,
+			 released_tag.blockNum, released_reply_received ? 1 : 0, released_direct_state);
 }
 
 static uint32
@@ -1004,8 +1003,7 @@ gcs_block_direct_prepare_attempt(ClusterGcsBlockOutstandingSlot *slot, BufferDes
 
 	slot_idx = gcs_block_slot_index(blk, slot);
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
-	if (!slot->in_use || slot->reply_received
-		|| slot->direct_state != GCS_BLOCK_DIRECT_UNARMED
+	if (!slot->in_use || slot->reply_received || slot->direct_state != GCS_BLOCK_DIRECT_UNARMED
 		|| slot->direct_target_prepared) {
 		LWLockRelease(&blk->lock.lock);
 		gcs_block_direct_finish_target(buf, true, false, InvalidXLogRecPtr);
@@ -1105,21 +1103,22 @@ gcs_block_log_master_not_holder_producer(const char *reason, BufferTag tag, uint
 			 " transition_count=" UINT64_FORMAT,
 			 reason != NULL ? reason : "unknown", cluster_node_id, requester_node, request_id,
 			 request_epoch, (unsigned int)transition_id, tag.spcOid, tag.dbOid,
-			 (unsigned int)BufTagGetRelNumber(&tag), (int)tag.forkNum,
-			 (unsigned int)tag.blockNum, (int)authority_found, (unsigned int)authority.state,
-			 authority.x_holder_node, (unsigned int)authority.s_holders_bitmap,
-			 authority.master_holder.node_id, authority.master_holder.procno,
-			 authority.master_holder.cluster_epoch, authority.master_holder.request_id,
-			 authority.pending_x_requester_node, authority.pending_x_since_lsn,
-			 authority.transition_count)));
+			 (unsigned int)BufTagGetRelNumber(&tag), (int)tag.forkNum, (unsigned int)tag.blockNum,
+			 (int)authority_found, (unsigned int)authority.state, authority.x_holder_node,
+			 (unsigned int)authority.s_holders_bitmap, authority.master_holder.node_id,
+			 authority.master_holder.procno, authority.master_holder.cluster_epoch,
+			 authority.master_holder.request_id, authority.pending_x_requester_node,
+			 authority.pending_x_since_lsn, authority.transition_count)));
 }
 
-#define GCS_BLOCK_LOG_MASTER_NOT_HOLDER_REQUEST(req, reason)                                         \
-	gcs_block_log_master_not_holder_producer((reason), (req)->tag, (req)->request_id, (req)->epoch,   \
-										 (req)->sender_node, (req)->transition_id)
-#define GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(fwd, reason)                                         \
-	gcs_block_log_master_not_holder_producer((reason), (fwd)->tag, (fwd)->request_id, (fwd)->epoch,   \
-										 (fwd)->original_requester_node, (fwd)->transition_id)
+#define GCS_BLOCK_LOG_MASTER_NOT_HOLDER_REQUEST(req, reason)                                       \
+	gcs_block_log_master_not_holder_producer((reason), (req)->tag, (req)->request_id,              \
+											 (req)->epoch, (req)->sender_node,                     \
+											 (req)->transition_id)
+#define GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(fwd, reason)                                       \
+	gcs_block_log_master_not_holder_producer((reason), (fwd)->tag, (fwd)->request_id,              \
+											 (fwd)->epoch, (fwd)->original_requester_node,         \
+											 (fwd)->transition_id)
 
 static void
 gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *release_arg)
@@ -1264,8 +1263,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 						 XLogRecPtr *out_page_lsn, char *copy_buf, const char **out_block_payload,
 						 uint32 *out_block_lkey, ClusterICSgeReleaseCallback *out_release_cb,
 						 void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
-						 bool *out_sf_dep_valid,
-						 ClusterBufmgrGcsCopyRefusal *out_copy_refusal)
+						 bool *out_sf_dep_valid, ClusterBufmgrGcsCopyRefusal *out_copy_refusal)
 {
 	void *scratch = NULL;
 	uint32 scratch_lkey = 0;
@@ -1327,11 +1325,10 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
 			else
 				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch,
-														out_copy_refusal);
+														   out_copy_refusal);
 			if (!copied) {
 				if (smart_fusion_reply && out_copy_refusal != NULL)
-					*out_copy_refusal
-						= CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
+					*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
 				if (release_cb != NULL)
 					release_cb(release_arg);
 				return false;
@@ -1354,17 +1351,15 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 
 	if (smart_fusion_reply) {
 		if (!cluster_bufmgr_copy_block_for_gcs_smart_fusion(tag, out_page_lsn, copy_buf,
-														out_sf_dep_vec)) {
+															out_sf_dep_vec)) {
 			if (out_copy_refusal != NULL)
-				*out_copy_refusal
-					= CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
+				*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
 			return false;
 		}
 		if (out_sf_dep_valid != NULL)
 			*out_sf_dep_valid = true;
 		gcs_block_note_scratch_copy();
-	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf,
-												out_copy_refusal))
+	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal))
 		return false;
 	else
 		gcs_block_note_scratch_copy();
@@ -2050,9 +2045,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 	Assert(out_retry_denied != NULL);
 	if (out_retry_denied == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster_gcs_send_block_request_and_wait: NULL retry result")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs_send_block_request_and_wait: NULL retry result")));
 	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -3349,29 +3343,29 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 		|| !BufferTagsEqual(&leader->identity.tag, &reservation_base->tag)
 		|| reservation_base->generation
 			   != (progress_before.grant_base_own_generation != 0
-						   ? progress_before.grant_base_own_generation
-						   : leader->identity.base_own_generation)) {
+					   ? progress_before.grant_base_own_generation
+					   : leader->identity.base_own_generation)) {
 		if (diagnostic)
-			ereport(LOG,
-					(errmsg_internal("PCM-X image fetch requester boundary: pre-slot reject"),
-					 errdetail("branch=identity-base buf_tag_exact=%s leader_tag_exact=%s "
-							   "base_generation=%llu progress_identity_base=%llu "
-							   "progress_grant_base=%llu effective_grant_base=%llu "
-							   "base_reservation_token=%llu base_writer_activation_token=%llu "
-							   "base_flags=0x%x base_state=%u",
-							   BufferTagsEqual(&buf->tag, &reservation_base->tag) ? "true" : "false",
-							   BufferTagsEqual(&leader->identity.tag, &reservation_base->tag)
-								   ? "true"
-								   : "false",
-							   (unsigned long long)reservation_base->generation,
-							   (unsigned long long)progress_before.identity.base_own_generation,
-							   (unsigned long long)progress_before.grant_base_own_generation,
-							   (unsigned long long)(progress_before.grant_base_own_generation != 0
-														? progress_before.grant_base_own_generation
-														: leader->identity.base_own_generation),
-							   (unsigned long long)reservation_base->reservation_token,
-							   (unsigned long long)reservation_base->writer_activation_token,
-							   reservation_base->flags, (unsigned)reservation_base->pcm_state)));
+			ereport(
+				LOG,
+				(errmsg_internal("PCM-X image fetch requester boundary: pre-slot reject"),
+				 errdetail("branch=identity-base buf_tag_exact=%s leader_tag_exact=%s "
+						   "base_generation=%llu progress_identity_base=%llu "
+						   "progress_grant_base=%llu effective_grant_base=%llu "
+						   "base_reservation_token=%llu base_writer_activation_token=%llu "
+						   "base_flags=0x%x base_state=%u",
+						   BufferTagsEqual(&buf->tag, &reservation_base->tag) ? "true" : "false",
+						   BufferTagsEqual(&leader->identity.tag, &reservation_base->tag) ? "true"
+																						  : "false",
+						   (unsigned long long)reservation_base->generation,
+						   (unsigned long long)progress_before.identity.base_own_generation,
+						   (unsigned long long)progress_before.grant_base_own_generation,
+						   (unsigned long long)(progress_before.grant_base_own_generation != 0
+													? progress_before.grant_base_own_generation
+													: leader->identity.base_own_generation),
+						   (unsigned long long)reservation_base->reservation_token,
+						   (unsigned long long)reservation_base->writer_activation_token,
+						   reservation_base->flags, (unsigned)reservation_base->pcm_state)));
 		return PCM_X_QUEUE_STALE;
 	}
 	if (!cluster_pcm_x_image_fetch_build_request(&progress_before, cluster_node_id,
@@ -3384,29 +3378,29 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 	if (queue_result != PCM_X_QUEUE_OK)
 		return queue_result;
 	if (!cluster_pcm_x_image_fetch_reservation_exact(&live_own, reservation_base,
-														 reservation_token)) {
+													 reservation_token)) {
 		queue_result = gcs_block_pcm_x_fetch_reservation_mismatch(&live_own);
 		if (diagnostic)
 			ereport(LOG,
 					(errmsg_internal("PCM-X image fetch requester boundary: pre-slot reject"),
-					 errdetail("branch=reservation-live result=%d live_tag_exact=%s "
-							   "base_generation=%llu live_generation=%llu "
-							   "base_reservation_token=%llu reservation_token=%llu "
-							   "live_reservation_token=%llu base_writer_activation_token=%llu "
-							   "live_writer_activation_token=%llu base_flags=0x%x live_flags=0x%x "
-							   "base_state=%u live_state=%u",
-							   (int)queue_result,
-							   BufferTagsEqual(&live_own.tag, &reservation_base->tag) ? "true"
-																							: "false",
-							   (unsigned long long)reservation_base->generation,
-							   (unsigned long long)live_own.generation,
-							   (unsigned long long)reservation_base->reservation_token,
-							   (unsigned long long)reservation_token,
-							   (unsigned long long)live_own.reservation_token,
-							   (unsigned long long)reservation_base->writer_activation_token,
-							   (unsigned long long)live_own.writer_activation_token,
-							   reservation_base->flags, live_own.flags,
-							   (unsigned)reservation_base->pcm_state, (unsigned)live_own.pcm_state)));
+					 errdetail(
+						 "branch=reservation-live result=%d live_tag_exact=%s "
+						 "base_generation=%llu live_generation=%llu "
+						 "base_reservation_token=%llu reservation_token=%llu "
+						 "live_reservation_token=%llu base_writer_activation_token=%llu "
+						 "live_writer_activation_token=%llu base_flags=0x%x live_flags=0x%x "
+						 "base_state=%u live_state=%u",
+						 (int)queue_result,
+						 BufferTagsEqual(&live_own.tag, &reservation_base->tag) ? "true" : "false",
+						 (unsigned long long)reservation_base->generation,
+						 (unsigned long long)live_own.generation,
+						 (unsigned long long)reservation_base->reservation_token,
+						 (unsigned long long)reservation_token,
+						 (unsigned long long)live_own.reservation_token,
+						 (unsigned long long)reservation_base->writer_activation_token,
+						 (unsigned long long)live_own.writer_activation_token,
+						 reservation_base->flags, live_own.flags,
+						 (unsigned)reservation_base->pcm_state, (unsigned)live_own.pcm_state)));
 		return queue_result;
 	}
 
@@ -3516,8 +3510,7 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 								   retry_attempt, enqueue_result ? "true" : "false",
 								   progress_now.image.source_node,
 								   (unsigned long long)request.request_id,
-								   request.requester_backend_id,
-								   (unsigned)request.transition_id)));
+								   request.requester_backend_id, (unsigned)request.transition_id)));
 			if (!enqueue_result) {
 				ConditionVariableCancelSleep();
 				if (retry_attempt < max_retries)
@@ -3565,8 +3558,7 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 						 errdetail("attempt=%d got_reply=%s slot_stale=%s fence_lost=%s "
 								   "status=%d request_id=%llu",
 								   retry_attempt, got_reply ? "true" : "false",
-								   slot_stale ? "true" : "false",
-								   fence_lost ? "true" : "false",
+								   slot_stale ? "true" : "false", fence_lost ? "true" : "false",
 								   got_reply ? (int)slot->reply_header.status : -1,
 								   (unsigned long long)request.request_id)));
 			if (fence_lost) {
@@ -3670,12 +3662,11 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 
 	gcs_block_release_slot(slot);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X image fetch requester boundary: complete"),
-				 errdetail("result=%d requester=%d backend=%d source=%u request_id=%llu",
-						   (int)result, cluster_node_id, (int)MyBackendId,
-						   progress_before.image.source_node,
-						   (unsigned long long)request.request_id)));
+		ereport(LOG, (errmsg_internal("PCM-X image fetch requester boundary: complete"),
+					  errdetail("result=%d requester=%d backend=%d source=%u request_id=%llu",
+								(int)result, cluster_node_id, (int)MyBackendId,
+								progress_before.image.source_node,
+								(unsigned long long)request.request_id)));
 	return (PcmXQueueResult)result;
 }
 
@@ -3704,8 +3695,7 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
  *	be obtained — never a silent stale read (Rule 8.A).
  */
 bool
-cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
-											 const PcmAuthoritySnapshot *expected,
+cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
 											 bool *out_retry_denied)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
@@ -5202,7 +5192,7 @@ gcs_block_forward_send_admitted(int32 holder_node, const GcsBlockForwardPayload 
  * the normal registered handler just like a wire reply. */
 static ClusterICSendResult
 gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *payload,
-								   uint32 payload_len)
+									uint32 payload_len)
 {
 	ClusterICEnvelope envelope;
 
@@ -5210,7 +5200,7 @@ gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void 
 		return cluster_ic_send_envelope(msg_type, dest_node, payload, payload_len);
 	if (payload == NULL
 		|| !cluster_ic_envelope_build(&envelope, msg_type, (uint32)cluster_node_id,
-								  (uint32)cluster_node_id, payload, payload_len))
+									  (uint32)cluster_node_id, payload, payload_len))
 		return CLUSTER_IC_SEND_HARD_ERROR;
 	return cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id)
 			   ? CLUSTER_IC_SEND_DONE
@@ -5275,7 +5265,7 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 		*wire_hdr = hdr;
 		wire_hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
 		rc = gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf,
-											  total);
+												 total);
 		pfree(buf);
 	}
 
@@ -5384,7 +5374,7 @@ gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 				"cached-direct-land-nonsendable", entry->tag, entry->key.request_id,
 				entry->key.cluster_epoch, (int32)entry->key.origin_node_id, entry->transition_id);
 		(void)gcs_block_try_send_direct_reply(dest_node, true, hdr,
-										  has_block_payload ? block_data : NULL, 0, NULL, NULL);
+											  has_block_payload ? block_data : NULL, 0, NULL, NULL);
 		pfree(buf);
 		return true;
 	}
@@ -5442,13 +5432,12 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 	current_epoch = cluster_epoch_get_current();
 	tag_master = cluster_gcs_lookup_master(req->tag);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X image fetch source boundary: ingress"),
-				 errdetail("worker=%d source=%u dest=%u requester=%d backend=%d "
-						   "request_id=%llu epoch=%llu encoded_master=%d tag_master=%d",
-						   worker_id, env->source_node_id, env->dest_node_id, req->sender_node,
-						   req->requester_backend_id, (unsigned long long)req->request_id,
-						   (unsigned long long)req->epoch, encoded_master, tag_master)));
+		ereport(LOG, (errmsg_internal("PCM-X image fetch source boundary: ingress"),
+					  errdetail("worker=%d source=%u dest=%u requester=%d backend=%d "
+								"request_id=%llu epoch=%llu encoded_master=%d tag_master=%d",
+								worker_id, env->source_node_id, env->dest_node_id, req->sender_node,
+								req->requester_backend_id, (unsigned long long)req->request_id,
+								(unsigned long long)req->epoch, encoded_master, tag_master)));
 	if (encoded_master != tag_master || req->epoch != current_epoch
 		|| !gcs_block_pcm_x_source_capable(req->sender_node) || !cluster_qvotec_in_quorum()
 		|| !cluster_membership_is_member(cluster_node_id)
@@ -5457,14 +5446,14 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 		|| !gcs_block_pcm_x_authenticated_session(req->sender_node, current_epoch,
 												  &requester_session)
 		|| !gcs_block_pcm_x_revalidate_peer_binding(req->sender_node, current_epoch,
-											requester_session))
+													requester_session))
 		return true;
 	if (diagnostic)
 		ereport(LOG,
 				(errmsg_internal("PCM-X image fetch source boundary: validate"),
 				 errdetail("stage=auth requester_session=%llu current_epoch=%llu tag_master=%d",
-						   (unsigned long long)requester_session,
-						   (unsigned long long)current_epoch, tag_master)));
+						   (unsigned long long)requester_session, (unsigned long long)current_epoch,
+						   tag_master)));
 
 	progress_result = cluster_pcm_x_local_holder_progress_exact(&req->tag, &holder_before);
 	if (progress_result == PCM_X_QUEUE_OK)
@@ -5472,8 +5461,8 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 			env, req, &holder_before, cluster_node_id, tag_master, current_epoch, &request_refusal);
 	else
 		request_refusal = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ARGUMENT;
-	(void)cluster_gcs_requester_id_decode(holder_before.ref.identity.request_id,
-										 &decoded_requester, &decoded_backend, NULL);
+	(void)cluster_gcs_requester_id_decode(holder_before.ref.identity.request_id, &decoded_requester,
+										  &decoded_backend, NULL);
 	if (request_exact)
 		master_authenticated
 			= gcs_block_pcm_x_authenticated_session(tag_master, current_epoch, &master_session);
@@ -5493,16 +5482,15 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 						   "ticket=%llu queue_generation=%llu grant_generation=%llu "
 						   "image_source=%u holder_request_id=%llu holder_image_id=%llu",
 						   (int)progress_result, request_exact ? "true" : "false",
-						   (int)request_refusal,
-						   master_authenticated ? "true" : "false",
+						   (int)request_refusal, master_authenticated ? "true" : "false",
 						   master_binding_valid ? "true" : "false",
 						   (unsigned long long)(master_authenticated ? master_session : 0),
 						   (unsigned long long)holder_before.master_session_incarnation,
 						   holder_before.master_node, holder_before.ref.identity.node_id,
-						   (unsigned)holder_before.pending_opcode,
-						   (unsigned)holder_before.phase, (unsigned)holder_before.flags,
-						   (unsigned)env->payload_length, sizeof(*req), req->requester_backend_id,
-						   decoded_backend, decoded_requester, (unsigned)req->transition_id,
+						   (unsigned)holder_before.pending_opcode, (unsigned)holder_before.phase,
+						   (unsigned)holder_before.flags, (unsigned)env->payload_length,
+						   sizeof(*req), req->requester_backend_id, decoded_backend,
+						   decoded_requester, (unsigned)req->transition_id,
 						   (unsigned long long)holder_before.ref.identity.cluster_epoch,
 						   (unsigned long long)holder_before.ref.identity.wait_seq,
 						   (unsigned long long)holder_before.ref.handle.ticket_id,
@@ -5529,15 +5517,14 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 	image_result
 		= cluster_gcs_block_dedup_pcm_x_lookup(worker_id, &key, &req->tag, &binding, &cached);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X image fetch source boundary: lookup"),
-				 errdetail("result=%d worker=%d requester=%u backend=%d request_id=%llu "
-						   "ticket=%llu grant_generation=%llu image_id=%llu",
-						   (int)image_result, worker_id, key.origin_node_id,
-						   key.requester_backend_id, (unsigned long long)key.request_id,
-						   (unsigned long long)binding.identity.ref.handle.ticket_id,
-						   (unsigned long long)binding.identity.ref.grant_generation,
-						   (unsigned long long)binding.identity.image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X image fetch source boundary: lookup"),
+					  errdetail("result=%d worker=%d requester=%u backend=%d request_id=%llu "
+								"ticket=%llu grant_generation=%llu image_id=%llu",
+								(int)image_result, worker_id, key.origin_node_id,
+								key.requester_backend_id, (unsigned long long)key.request_id,
+								(unsigned long long)binding.identity.ref.handle.ticket_id,
+								(unsigned long long)binding.identity.ref.grant_generation,
+								(unsigned long long)binding.identity.image.image_id)));
 	if (image_result == GCS_BLOCK_PCM_X_IMAGE_NOT_READY) {
 		/* Materialization/publication is still progressing on this same shard. */
 		GCS_BLOCK_LOG_MASTER_NOT_HOLDER_REQUEST(req, "pcm-x-image-not-ready");
@@ -5563,12 +5550,11 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
 
 	reply_result = gcs_block_resend_cached_reply(req->sender_node, &cached);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X image fetch source boundary: reply"),
-				 errdetail("stage_result=%s requester=%d backend=%d request_id=%llu status=%u",
-						   reply_result ? "true" : "false", req->sender_node,
-						   req->requester_backend_id, (unsigned long long)req->request_id,
-						   (unsigned)cached.status)));
+		ereport(LOG, (errmsg_internal("PCM-X image fetch source boundary: reply"),
+					  errdetail("stage_result=%s requester=%d backend=%d request_id=%llu status=%u",
+								reply_result ? "true" : "false", req->sender_node,
+								req->requester_backend_id, (unsigned long long)req->request_id,
+								(unsigned)cached.status)));
 	if (ClusterGcsBlock != NULL) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
@@ -5599,8 +5585,7 @@ gcs_block_pcm_x_serve_image_fetch(const ClusterICEnvelope *env, const GcsBlockRe
  *	dedup install should happen.
  */
 static bool
-gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
-						bool preprepared_image,
+gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf, bool preprepared_image,
 						GcsBlockReplyStatus *out_status, XLogRecPtr *out_page_lsn,
 						const char **out_block_payload, uint32 *out_block_lkey,
 						ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg,
@@ -5686,8 +5671,8 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 		apply_result = cluster_pcm_lock_apply_gcs_transition_result(
 			req->tag, (PcmLockTransition)req->transition_id, req->sender_node);
 		if (apply_result != PCM_GCS_TRANSITION_APPLIED) {
-			*out_status = GcsBlockApplyRefusalStatus(
-				apply_result, (PcmLockTransition)req->transition_id);
+			*out_status
+				= GcsBlockApplyRefusalStatus(apply_result, (PcmLockTransition)req->transition_id);
 			return true;
 		}
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
@@ -5732,7 +5717,8 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 	if (!preprepared_image
 		&& !gcs_block_get_ship_image(req->tag, req->sender_node, true, out_page_lsn, block_buf,
 									 out_block_payload, out_block_lkey, out_release_cb,
-									 out_release_arg, out_sf_dep_vec, out_sf_dep_valid, &copy_refusal)) {
+									 out_release_arg, out_sf_dep_vec, out_sf_dep_valid,
+									 &copy_refusal)) {
 		char producer_reason[96];
 
 		snprintf(producer_reason, sizeof(producer_reason), "produce-copy-refused:%s",
@@ -5755,8 +5741,8 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 			*out_release_cb = NULL;
 		if (out_release_arg != NULL)
 			*out_release_arg = NULL;
-		*out_status = GcsBlockApplyRefusalStatus(
-			apply_result, (PcmLockTransition)req->transition_id);
+		*out_status
+			= GcsBlockApplyRefusalStatus(apply_result, (PcmLockTransition)req->transition_id);
 		return true;
 	}
 
@@ -5925,14 +5911,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	if (dr != GCS_BLOCK_DEDUP_VALIDATION_FAIL && dr != GCS_BLOCK_DEDUP_FULL) {
 		if (GcsBlockRequestPayloadIsDirectLandArmed(req))
 			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND;
-		if (!cluster_gcs_block_dedup_set_request_flags_exact(
-				dedup_worker_id, &key, &req->tag, req->transition_id, request_flags)) {
+		if (!cluster_gcs_block_dedup_set_request_flags_exact(dedup_worker_id, &key, &req->tag,
+															 req->transition_id, request_flags)) {
 			/* The tuple was removed/replaced or its immutable request properties
 			 * changed between lookup and pinning.  Neither case may inherit the
 			 * earlier entry's grant rights. */
-			gcs_block_send_reply(req->sender_node, req,
-								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
-								 NULL);
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+								 InvalidXLogRecPtr, NULL);
 			return;
 		}
 	}
@@ -5946,9 +5931,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		GcsBlockPendingXDenyResult deny_result;
 
 		if (dr == GCS_BLOCK_DEDUP_VALIDATION_FAIL) {
-			gcs_block_send_reply(req->sender_node, req,
-								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
-								 NULL);
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+								 InvalidXLogRecPtr, NULL);
 			return;
 		}
 		if (dr == GCS_BLOCK_DEDUP_FULL) {
@@ -5960,9 +5944,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			dedup_worker_id, &key, &req->tag, req->transition_id, &cached_entry);
 		if (deny_result != GCS_BLOCK_PENDING_X_DENY_NEW
 			&& deny_result != GCS_BLOCK_PENDING_X_DENY_REPLAY) {
-			gcs_block_send_reply(req->sender_node, req,
-								 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr,
-								 NULL);
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+								 InvalidXLogRecPtr, NULL);
 			return;
 		}
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
@@ -6087,8 +6070,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				|| deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
 				(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
 			else
-				gcs_block_send_reply(req->sender_node, req,
-									 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+				gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
 									 InvalidXLogRecPtr, NULL);
 			return;
 		}
@@ -6104,8 +6086,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				|| deny_result == GCS_BLOCK_PENDING_X_DENY_REPLAY)
 				(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
 			else
-				gcs_block_send_reply(req->sender_node, req,
-									 GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+				gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
 									 InvalidXLogRecPtr, NULL);
 			return;
 		}
@@ -6866,11 +6847,10 @@ x_path_skipped:
 				 * state raced / flush unavailable) keeps today's one-shot ship.
 				 */
 				if (cluster_read_scache) {
-					local_downgrade_outcome
-						= cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
-							req->tag, &page_lsn, block_buf, NULL);
-					cluster_lever_a_note_downgrade(
-						local_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED);
+					local_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+						req->tag, &page_lsn, block_buf, NULL);
+					cluster_lever_a_note_downgrade(local_downgrade_outcome
+												   == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED);
 					if (local_downgrade_outcome
 						== CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY)
 						return;
@@ -7041,8 +7021,7 @@ x_path_skipped:
  * serves a durable GRANTED (image + requester N->S quick re-grant). */
 scache_downgraded_fall_through:
 	(void)gcs_block_produce_reply(req, block_buf, scache_image_prepared, &status, &page_lsn,
-								  &block_payload,
-								  &block_payload_lkey, &block_payload_release_cb,
+								  &block_payload, &block_payload_lkey, &block_payload_release_cb,
 								  &block_payload_release_arg, &sf_dep_vec, &sf_dep_valid);
 	if (req->transition_id == PCM_TRANS_N_TO_X || req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
 		(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
@@ -7570,10 +7549,9 @@ gcs_block_direct_fail_slot(ClusterGcsBlockBackendBlock *blk, ClusterGcsBlockOuts
 			 "own_result=%d buffer=%d own_state=%u own_generation=%llu own_token=%llu "
 			 "own_flags=0x%x",
 			 backend_idx, slot_idx, (unsigned long long)request_id,
-			 (unsigned long long)request_epoch, target_tag.relNumber,
-			 (int)target_tag.forkNum, target_tag.blockNum, (int)reason,
-			 authoritative_denial ? 1 : 0, reply_received ? 1 : 0, direct_state,
-			 prepared ? 1 : 0, prepared ? 1 : 0, (int)own_result, buffer_id,
+			 (unsigned long long)request_epoch, target_tag.relNumber, (int)target_tag.forkNum,
+			 target_tag.blockNum, (int)reason, authoritative_denial ? 1 : 0, reply_received ? 1 : 0,
+			 direct_state, prepared ? 1 : 0, prepared ? 1 : 0, (int)own_result, buffer_id,
 			 own.pcm_state, (unsigned long long)own.generation,
 			 (unsigned long long)own.reservation_token, own.flags);
 	}
@@ -8211,11 +8189,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-remote-downgrade");
 		if (!holder_evicted_injected
 			&& !cluster_injection_should_skip("cluster-gcs-block-remote-downgrade"))
-			remote_downgrade_outcome
-				= cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
-					fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
-		remote_downgraded
-			= remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
+			remote_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+				fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
+		remote_downgraded = remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
 		cluster_lever_a_note_remote_downgrade(remote_downgraded);
 	}
 	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY)
@@ -8528,14 +8504,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_holder_evicted_count, 1);
 		GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(fwd, "holder-copy-refused");
-		ereport(LOG,
-				(errmsg("cluster_gcs_block: holder ship image refused"),
-				 errdetail("reason=%s request_id=" UINT64_FORMAT
-						   " requester=%d master=%d tag spc=%u db=%u relNumber=%u block=%u",
-						   copy_refusal_name, fwd->request_id, fwd->original_requester_node,
-						   fwd->master_node, fwd->tag.spcOid, fwd->tag.dbOid,
-						   (unsigned int)BufTagGetRelNumber(&fwd->tag),
-						   (unsigned int)fwd->tag.blockNum)));
+		ereport(LOG, (errmsg("cluster_gcs_block: holder ship image refused"),
+					  errdetail("reason=%s request_id=" UINT64_FORMAT
+								" requester=%d master=%d tag spc=%u db=%u relNumber=%u block=%u",
+								copy_refusal_name, fwd->request_id, fwd->original_requester_node,
+								fwd->master_node, fwd->tag.spcOid, fwd->tag.dbOid,
+								(unsigned int)BufTagGetRelNumber(&fwd->tag),
+								(unsigned int)fwd->tag.blockNum)));
 	}
 
 	send_sf_dep = sf_peer_v2 && sf_dep_valid && block_payload != NULL
@@ -8825,9 +8800,9 @@ gcs_block_pcm_x_requester_pre_sleep_revalidate(void *callback_arg)
 	GcsBlockPcmXRequesterWaitContext *context = (GcsBlockPcmXRequesterWaitContext *)callback_arg;
 
 	if (context == NULL
-		|| !gcs_block_pcm_x_requester_authority_exact(
-			context->request_runtime, context->master_node, context->cluster_epoch,
-			context->master_session))
+		|| !gcs_block_pcm_x_requester_authority_exact(context->request_runtime,
+													  context->master_node, context->cluster_epoch,
+													  context->master_session))
 		return PCM_X_QUEUE_NOT_READY;
 	return cluster_pcm_x_nested_wait_guard_before_block();
 }
@@ -8867,9 +8842,9 @@ gcs_block_pcm_x_requester_wait_exact(uint32 *wait_index, const PcmXRuntimeSnapsh
 	context.master_session = master_session;
 	context.timeout_ms = cluster_pcm_x_holder_retry_delay_ms(current);
 	CHECK_FOR_INTERRUPTS();
-	result = cluster_pcm_x_requester_wait_once_result(
-		gcs_block_pcm_x_requester_pre_sleep_revalidate, gcs_block_pcm_x_requester_wait_latch,
-		&context);
+	result
+		= cluster_pcm_x_requester_wait_once_result(gcs_block_pcm_x_requester_pre_sleep_revalidate,
+												   gcs_block_pcm_x_requester_wait_latch, &context);
 	if (result != PCM_X_QUEUE_OK)
 		return result;
 	ResetLatch(MyLatch);
@@ -9246,7 +9221,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (!cluster_gcs_pcm_x_nested_guard_retryable(result))
 			GCS_BLOCK_PCM_X_REQUESTER_DONE();
 		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												cluster_epoch, master_session);
+													  cluster_epoch, master_session);
 		if (result != PCM_X_QUEUE_OK) {
 			if (result == PCM_X_QUEUE_CORRUPT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9275,8 +9250,8 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (result == PCM_X_QUEUE_CORRUPT)
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		if (initial_own.pcm_state == (uint8)PCM_STATE_READ_IMAGE || result == PCM_X_QUEUE_BUSY) {
-			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													cluster_epoch, master_session);
+			result = gcs_block_pcm_x_requester_wait_exact(
+				&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
 			if (result != PCM_X_QUEUE_OK) {
 				if (result == PCM_X_QUEUE_CORRUPT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9316,7 +9291,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												cluster_epoch, master_session);
+													  cluster_epoch, master_session);
 		if (result != PCM_X_QUEUE_OK) {
 			if (result == PCM_X_QUEUE_CORRUPT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9342,8 +9317,8 @@ requester_role_dispatch:
 				GCS_BLOCK_PCM_X_RETRY_SITE_LEADER_REKEY, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
-			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													cluster_epoch, master_session);
+			result = gcs_block_pcm_x_requester_wait_exact(
+				&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
 			if (result != PCM_X_QUEUE_OK) {
 				if (result == PCM_X_QUEUE_CORRUPT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9363,8 +9338,8 @@ requester_role_dispatch:
 				GCS_BLOCK_PCM_X_RETRY_SITE_CLAIM, result);
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
-			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													cluster_epoch, master_session);
+			result = gcs_block_pcm_x_requester_wait_exact(
+				&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
 			if (result != PCM_X_QUEUE_OK) {
 				if (result == PCM_X_QUEUE_CORRUPT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9385,8 +9360,8 @@ requester_role_dispatch:
 			if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			gcs_block_pcm_x_requester_cleanup_context.cutoff_started = false;
-			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													cluster_epoch, master_session);
+			result = gcs_block_pcm_x_requester_wait_exact(
+				&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
 			if (result != PCM_X_QUEUE_OK) {
 				if (result == PCM_X_QUEUE_CORRUPT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9519,8 +9494,8 @@ requester_role_dispatch:
 				if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			}
-			result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-													cluster_epoch, master_session);
+			result = gcs_block_pcm_x_requester_wait_exact(
+				&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
 			if (result != PCM_X_QUEUE_OK) {
 				if (result == PCM_X_QUEUE_CORRUPT)
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9662,8 +9637,7 @@ requester_role_dispatch:
 							evidence->pcm_state = reservation_base.pcm_state;
 							evidence->own_flags = reservation_base.flags;
 							evidence->live_generation = reservation_base.generation;
-							evidence->base_own_generation
-								= progress.identity.base_own_generation;
+							evidence->base_own_generation = progress.identity.base_own_generation;
 							evidence->reservation_token = reservation_base.reservation_token;
 							evidence->writer_activation_token
 								= reservation_base.writer_activation_token;
@@ -9801,7 +9775,7 @@ requester_role_dispatch:
 
 	requester_wait:
 		result = gcs_block_pcm_x_requester_wait_exact(&wait_index, &request_runtime, master_node,
-												cluster_epoch, master_session);
+													  cluster_epoch, master_session);
 		if (result != PCM_X_QUEUE_OK) {
 			if (result == PCM_X_QUEUE_CORRUPT)
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
@@ -9832,8 +9806,7 @@ requester_fail_closed:
 				 (unsigned long long)gcs_block_pcm_x_requester_preflight_evidence.live_generation,
 				 (unsigned long long)
 					 gcs_block_pcm_x_requester_preflight_evidence.base_own_generation,
-				 (unsigned long long)
-					 gcs_block_pcm_x_requester_preflight_evidence.reservation_token,
+				 (unsigned long long)gcs_block_pcm_x_requester_preflight_evidence.reservation_token,
 				 (unsigned long long)
 					 gcs_block_pcm_x_requester_preflight_evidence.writer_activation_token,
 				 (unsigned int)gcs_block_pcm_x_requester_preflight_evidence.pcm_state,
@@ -10030,9 +10003,9 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 static void gcs_block_pcm_x_master_drive_retry_tick(void);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
 static void gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result,
-											 int32 peer_node, Size cursor_before,
-											 Size cursor_after, const BufferTag *tag,
-											 uint64 cluster_epoch);
+												 int32 peer_node, Size cursor_before,
+												 Size cursor_after, const BufferTag *tag,
+												 uint64 cluster_epoch);
 static PcmXQueueResult
 gcs_block_pcm_x_cancel_claimed_probe_exact(const PcmXMasterPendingXReleaseToken *token);
 
@@ -10066,20 +10039,20 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 		 */
 		if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before,
 											   NULL)) {
-			gcs_block_pcm_x_master_retry_observe("collect-before", PCM_X_QUEUE_NOT_READY, -1, 0,
-											  0, NULL, 0);
+			gcs_block_pcm_x_master_retry_observe("collect-before", PCM_X_QUEUE_NOT_READY, -1, 0, 0,
+												 NULL, 0);
 			return;
 		}
 		if (!gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after, &self_session_after,
 											   NULL)) {
-			gcs_block_pcm_x_master_retry_observe("collect-after", PCM_X_QUEUE_NOT_READY, -1, 0,
-											  0, NULL, 0);
+			gcs_block_pcm_x_master_retry_observe("collect-after", PCM_X_QUEUE_NOT_READY, -1, 0, 0,
+												 NULL, 0);
 			return;
 		}
 		if (!cluster_gcs_pcm_x_formation_samples_stable(true, bindings_before, true, bindings_after)
 			|| epoch_before != epoch_after || self_session_before != self_session_after) {
-			gcs_block_pcm_x_master_retry_observe("stability", PCM_X_QUEUE_NOT_READY, -1, 0, 0,
-											  NULL, epoch_before);
+			gcs_block_pcm_x_master_retry_observe("stability", PCM_X_QUEUE_NOT_READY, -1, 0, 0, NULL,
+												 epoch_before);
 			return;
 		}
 		for (i = 0; i < PCM_X_PROTOCOL_NODE_LIMIT; i++) {
@@ -10091,7 +10064,7 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 				goto fail_closed;
 			if (result != PCM_X_QUEUE_OK) {
 				gcs_block_pcm_x_master_retry_observe("peer-revalidate", result, i, 0, 0, NULL,
-												  epoch_before);
+													 epoch_before);
 				return;
 			}
 		}
@@ -10099,8 +10072,8 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 		if (runtime_after.state != PCM_X_RUNTIME_ACTIVE
 			|| runtime_after.gate_generation != runtime.gate_generation
 			|| runtime_after.master_session_incarnation != runtime.master_session_incarnation) {
-			gcs_block_pcm_x_master_retry_observe("runtime-resample", PCM_X_QUEUE_NOT_READY, -1,
-											  0, 0, NULL, epoch_before);
+			gcs_block_pcm_x_master_retry_observe("runtime-resample", PCM_X_QUEUE_NOT_READY, -1, 0,
+												 0, NULL, epoch_before);
 			return;
 		}
 		gcs_block_pcm_x_master_drive_retry_tick();
@@ -10153,9 +10126,8 @@ cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, const void *pa
  * V1 frame, but retain the capability/generation fence in the LMS ring slot
  * until immediately before transport admission. */
 static bool
-gcs_block_pcm_x_stage_frame_cap_bound(uint8 msg_type, int32 dest_node_id,
-									  const void *payload, uint16 payload_len,
-									  uint32 required_capability,
+gcs_block_pcm_x_stage_frame_cap_bound(uint8 msg_type, int32 dest_node_id, const void *payload,
+									  uint16 payload_len, uint32 required_capability,
 									  uint32 connection_generation)
 {
 	int worker;
@@ -10164,13 +10136,12 @@ gcs_block_pcm_x_stage_frame_cap_bound(uint8 msg_type, int32 dest_node_id,
 		|| dest_node_id < 0 || dest_node_id >= PCM_X_PROTOCOL_NODE_LIMIT || payload == NULL
 		|| payload_len == 0 || required_capability == 0 || cluster_lms_workers <= 0)
 		return false;
-	worker = cluster_gcs_block_payload_shard(msg_type, payload, payload_len,
-										 cluster_lms_workers);
+	worker = cluster_gcs_block_payload_shard(msg_type, payload, payload_len, cluster_lms_workers);
 	if (worker < 0 || worker >= cluster_lms_workers)
 		return false;
-	return cluster_lms_outbound_enqueue_cap_bound(
-		worker, msg_type, (uint32)dest_node_id, payload, payload_len, required_capability,
-		connection_generation);
+	return cluster_lms_outbound_enqueue_cap_bound(worker, msg_type, (uint32)dest_node_id, payload,
+												  payload_len, required_capability,
+												  connection_generation);
 }
 
 
@@ -10382,8 +10353,8 @@ gcs_block_pcm_x_deny_legacy_readers(const PcmXMasterDriveSnapshot *snapshot)
 
 	if (snapshot == NULL
 		|| !cluster_pcm_lock_queue_pending_x_exact(snapshot->ref.identity.tag,
-												snapshot->ref.identity.node_id,
-												snapshot->ref.handle.ticket_id))
+												   snapshot->ref.identity.node_id,
+												   snapshot->ref.handle.ticket_id))
 		return PCM_X_QUEUE_BAD_STATE;
 	worker_id = cluster_lms_shard_for_tag(&snapshot->ref.identity.tag, cluster_lms_workers);
 	if (worker_id < 0 || worker_id >= cluster_lms_workers)
@@ -10474,9 +10445,8 @@ gcs_block_pcm_x_invalidate_busy_retry_delay_ms(const PcmXMasterDriveSnapshot *sn
 	 * scheduling interval; repeated BUSY replies install fresh exact
 	 * deadlines on the same ticket. */
 	(void)snapshot;
-	delay_ms = (uint64)Max(Max(cluster_gcs_block_starvation_backoff_ms,
-									cluster_lmon_main_loop_interval),
-							 1);
+	delay_ms = (uint64)Max(
+		Max(cluster_gcs_block_starvation_backoff_ms, cluster_lmon_main_loop_interval), 1);
 	return delay_ms;
 }
 
@@ -10507,14 +10477,13 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 			snapshot, now_ms, retry_delay_ms, gcs_block_pcm_x_stage_frame_callback, NULL, &retried);
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
 			gcs_block_pcm_x_master_retry_observe("commit-retry", result, -1, 0, 0,
-											  &snapshot->ref.identity.tag,
-											  snapshot->ref.identity.cluster_epoch);
+												 &snapshot->ref.identity.tag,
+												 snapshot->ref.identity.cluster_epoch);
 		return result;
 	}
 	if (!cluster_gcs_pcm_x_transfer_pre_handoff_phase(snapshot->pending_opcode))
 		return PCM_X_QUEUE_NOT_READY;
-	if (snapshot->pending_opcode == PGRAC_IC_MSG_PCM_X_REVOKE
-		&& snapshot->retry_deadline_ms != 0) {
+	if (snapshot->pending_opcode == PGRAC_IC_MSG_PCM_X_REVOKE && snapshot->retry_deadline_ms != 0) {
 		now_ms = (uint64)(GetCurrentTimestamp() / 1000);
 		if (now_ms < snapshot->retry_deadline_ms)
 			return PCM_X_QUEUE_NOT_READY;
@@ -10542,14 +10511,13 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 		return PCM_X_QUEUE_CORRUPT;
 	memset(&auth_sample, 0, sizeof(auth_sample));
 	if ((source == cluster_node_id
-			 ? !gcs_block_pcm_x_authenticated_session(source,
-											  snapshot->ref.identity.cluster_epoch,
-											  &source_session)
+			 ? !gcs_block_pcm_x_authenticated_session(source, snapshot->ref.identity.cluster_epoch,
+													  &source_session)
 			 : gcs_block_pcm_x_authenticated_session_result(
 				   source, snapshot->ref.identity.cluster_epoch, &source_session, &auth_sample)
 				   != PCM_X_SESSION_AUTH_OK)
 		|| !gcs_block_pcm_x_revalidate_peer_binding(source, snapshot->ref.identity.cluster_epoch,
-												source_session))
+													source_session))
 		return PCM_X_QUEUE_NOT_READY;
 	result = cluster_pcm_x_master_revoke_arm_exact(&snapshot->ref, source, source_session, &revoke);
 	cluster_pcm_x_stats_note_queue_result(result);
@@ -10564,15 +10532,15 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 		revoke_v2.required_page_scn
 			= (uint64)cluster_pcm_lock_pi_watermark_scn_query(snapshot->ref.identity.tag);
 		return cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_REVOKE, source, &revoke_v2,
-										 sizeof(revoke_v2))
+											 sizeof(revoke_v2))
 				   ? PCM_X_QUEUE_OK
 				   : PCM_X_QUEUE_BUSY;
 	}
 	/* Resample CONVERT + optional SOURCE_FLOOR under one capability-store
 	 * lock after the authority pass.  Any reconnect since authentication is
 	 * retryable: the already-armed reliable leg remains intact. */
-	if (!cluster_sf_peer_pcm_x_source_floor_sample(
-			source, &source_floor_capable, &source_connection_generation)
+	if (!cluster_sf_peer_pcm_x_source_floor_sample(source, &source_floor_capable,
+												   &source_connection_generation)
 		|| source_connection_generation != auth_sample.connection_generation_before
 		|| source_connection_generation != auth_sample.connection_generation_after)
 		return PCM_X_QUEUE_NOT_READY;
@@ -10582,10 +10550,9 @@ gcs_block_pcm_x_master_drive_transfer(const PcmXMasterDriveSnapshot *snapshot)
 		revoke_v2.required_page_scn
 			= (uint64)cluster_pcm_lock_pi_watermark_scn_query(snapshot->ref.identity.tag);
 		return gcs_block_pcm_x_stage_frame_cap_bound(
-			   PGRAC_IC_MSG_PCM_X_REVOKE, source, &revoke_v2, sizeof(revoke_v2),
-			   PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
-				   | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1,
-			   source_connection_generation)
+				   PGRAC_IC_MSG_PCM_X_REVOKE, source, &revoke_v2, sizeof(revoke_v2),
+				   PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1,
+				   source_connection_generation)
 				   ? PCM_X_QUEUE_OK
 				   : PCM_X_QUEUE_BUSY;
 	}
@@ -10839,8 +10806,8 @@ gcs_block_pcm_x_master_drive_note(const char *stage, PcmXQueueResult result, con
  * repeats stay silent until the exit shape changes. */
 static void
 gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result, int32 peer_node,
-									Size cursor_before, Size cursor_after, const BufferTag *tag,
-									uint64 cluster_epoch)
+									 Size cursor_before, Size cursor_after, const BufferTag *tag,
+									 uint64 cluster_epoch)
 {
 	static const char *last_stage = NULL;
 	static PcmXQueueResult last_result = PCM_X_QUEUE_OK;
@@ -10863,17 +10830,15 @@ gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result, 
 	last_result = result;
 	last_peer_node = peer_node;
 	if (tag != NULL)
-		ereport(LOG,
-				(errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
-						"cursor %zu->%zu, epoch %llu, rel %u, block %u)",
-						stage, (int)result, peer_node, cursor_before, cursor_after,
-						(unsigned long long)cluster_epoch, tag->relNumber, tag->blockNum)));
+		ereport(LOG, (errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
+							 "cursor %zu->%zu, epoch %llu, rel %u, block %u)",
+							 stage, (int)result, peer_node, cursor_before, cursor_after,
+							 (unsigned long long)cluster_epoch, tag->relNumber, tag->blockNum)));
 	else
-		ereport(LOG,
-				(errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
-						"cursor %zu->%zu, epoch %llu)",
-						stage, (int)result, peer_node, cursor_before, cursor_after,
-						(unsigned long long)cluster_epoch)));
+		ereport(LOG, (errmsg("PCM-X periodic retry exit (stage %s, result %d, peer %d, "
+							 "cursor %zu->%zu, epoch %llu)",
+							 stage, (int)result, peer_node, cursor_before, cursor_after,
+							 (unsigned long long)cluster_epoch)));
 }
 
 
@@ -10887,37 +10852,37 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 
 	if (tag == NULL) {
 		gcs_block_pcm_x_master_retry_observe("drive-precheck-tag", PCM_X_QUEUE_INVALID, -1, 0, 0,
-											  NULL, cluster_epoch);
+											 NULL, cluster_epoch);
 		return;
 	}
 	if (cluster_epoch != cluster_epoch_get_current()) {
-		gcs_block_pcm_x_master_retry_observe("drive-precheck-epoch", PCM_X_QUEUE_STALE, -1, 0,
-											  0, tag, cluster_epoch);
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-epoch", PCM_X_QUEUE_STALE, -1, 0, 0,
+											 tag, cluster_epoch);
 		return;
 	}
 	if (cluster_node_id < 0 || cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT) {
 		gcs_block_pcm_x_master_retry_observe("drive-precheck-node", PCM_X_QUEUE_INVALID,
-											  cluster_node_id, 0, 0, tag, cluster_epoch);
+											 cluster_node_id, 0, 0, tag, cluster_epoch);
 		return;
 	}
 	if (cluster_gcs_lookup_master(*tag) != cluster_node_id) {
 		gcs_block_pcm_x_master_retry_observe("drive-precheck-master", PCM_X_QUEUE_STALE,
-											  cluster_node_id, 0, 0, tag, cluster_epoch);
+											 cluster_node_id, 0, 0, tag, cluster_epoch);
 		return;
 	}
 	if (cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING) {
-		gcs_block_pcm_x_master_retry_observe("drive-precheck-recovering", PCM_X_QUEUE_NOT_READY,
-											  -1, 0, 0, tag, cluster_epoch);
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-recovering", PCM_X_QUEUE_NOT_READY, -1,
+											 0, 0, tag, cluster_epoch);
 		return;
 	}
 	if (!cluster_qvotec_in_quorum()) {
-		gcs_block_pcm_x_master_retry_observe("drive-precheck-quorum", PCM_X_QUEUE_NOT_READY, -1,
-											  0, 0, tag, cluster_epoch);
+		gcs_block_pcm_x_master_retry_observe("drive-precheck-quorum", PCM_X_QUEUE_NOT_READY, -1, 0,
+											 0, tag, cluster_epoch);
 		return;
 	}
 	if (!cluster_membership_is_member(cluster_node_id)) {
 		gcs_block_pcm_x_master_retry_observe("drive-precheck-member", PCM_X_QUEUE_NOT_READY,
-											  cluster_node_id, 0, 0, tag, cluster_epoch);
+											 cluster_node_id, 0, 0, tag, cluster_epoch);
 		return;
 	}
 	result = cluster_pcm_x_master_promote_head_exact(tag, cluster_epoch, &active);
@@ -11433,7 +11398,7 @@ cluster_gcs_handle_pcm_x_blocker_set_commit_envelope(const ClusterICEnvelope *en
 	if (result == PCM_X_QUEUE_DUPLICATE && snapshot.graph_generation != 0)
 		goto complete_blocker_probe;
 	result = cluster_pcm_x_master_blocker_snapshot_revalidate_exact(&snapshot, entries,
-													commit->nblockers);
+																	commit->nblockers);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK) {
 		cluster_pcm_x_runtime_fail_closed();
@@ -12188,11 +12153,12 @@ gcs_block_pcm_x_abort_image_before_finish(int worker_id, const GcsBlockPcmXImage
 
 
 static void gcs_block_pcm_x_revoke_refusal_note_exact(const char *site, int own_result,
-												  const ClusterPcmOwnSnapshot *snap,
-												  const PcmXTicketRef *ref, uint64 image_id,
-												  uint64 source_generation);
-static void gcs_block_pcm_x_image_ready_arm_refusal_note_work(
-	int result, const GcsBlockPcmXImageWork *work, PcmXLocalImageReadyRefusal refusal);
+													  const ClusterPcmOwnSnapshot *snap,
+													  const PcmXTicketRef *ref, uint64 image_id,
+													  uint64 source_generation);
+static void gcs_block_pcm_x_image_ready_arm_refusal_note_work(int result,
+															  const GcsBlockPcmXImageWork *work,
+															  PcmXLocalImageReadyRefusal refusal);
 
 
 static void
@@ -12220,15 +12186,14 @@ gcs_block_pcm_x_stage_ready_work(int worker_id, const GcsBlockPcmXImageWork *wor
 		&image_ready, master_node, work->binding.master_session, &replay, &refusal);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY stage boundary: arm"),
-				 errdetail("result=%d refusal=%d master=%d request_id=%llu ticket=%llu "
-						   "grant_generation=%llu image_id=%llu",
-						   (int)result, (int)refusal, master_node,
-						   (unsigned long long)image_ready.ref.identity.request_id,
-						   (unsigned long long)image_ready.ref.handle.ticket_id,
-						   (unsigned long long)image_ready.ref.grant_generation,
-						   (unsigned long long)image_ready.image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY stage boundary: arm"),
+					  errdetail("result=%d refusal=%d master=%d request_id=%llu ticket=%llu "
+								"grant_generation=%llu image_id=%llu",
+								(int)result, (int)refusal, master_node,
+								(unsigned long long)image_ready.ref.identity.request_id,
+								(unsigned long long)image_ready.ref.handle.ticket_id,
+								(unsigned long long)image_ready.ref.grant_generation,
+								(unsigned long long)image_ready.image.image_id)));
 	gcs_block_pcm_x_image_ready_arm_refusal_note_work((int)result, work, refusal);
 	if (result == PCM_X_QUEUE_BUSY || result == PCM_X_QUEUE_NOT_READY)
 		return;
@@ -12253,29 +12218,27 @@ gcs_block_pcm_x_stage_ready_work(int worker_id, const GcsBlockPcmXImageWork *wor
 		return;
 	}
 	stage_result = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_IMAGE_READY, master_node,
-										 &replay, sizeof(replay));
+												 &replay, sizeof(replay));
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY stage boundary: DATA ring"),
-				 errdetail("stage_result=%s worker=%d master=%d request_id=%llu ticket=%llu "
-						   "image_id=%llu",
-						   stage_result ? "true" : "false", worker_id, master_node,
-						   (unsigned long long)image_ready.ref.identity.request_id,
-						   (unsigned long long)image_ready.ref.handle.ticket_id,
-						   (unsigned long long)image_ready.image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY stage boundary: DATA ring"),
+					  errdetail("stage_result=%s worker=%d master=%d request_id=%llu ticket=%llu "
+								"image_id=%llu",
+								stage_result ? "true" : "false", worker_id, master_node,
+								(unsigned long long)image_ready.ref.identity.request_id,
+								(unsigned long long)image_ready.ref.handle.ticket_id,
+								(unsigned long long)image_ready.image.image_id)));
 	if (stage_result)
 		return;
 	rollback_result = cluster_gcs_block_dedup_pcm_x_unmark_staged_exact(worker_id, &work->key,
-															 &work->tag, &work->binding);
+																		&work->tag, &work->binding);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY stage boundary: rollback"),
-				 errdetail("rollback_result=%d worker=%d request_id=%llu ticket=%llu "
-						   "image_id=%llu",
-						   (int)rollback_result, worker_id,
-						   (unsigned long long)image_ready.ref.identity.request_id,
-						   (unsigned long long)image_ready.ref.handle.ticket_id,
-						   (unsigned long long)image_ready.image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY stage boundary: rollback"),
+					  errdetail("rollback_result=%d worker=%d request_id=%llu ticket=%llu "
+								"image_id=%llu",
+								(int)rollback_result, worker_id,
+								(unsigned long long)image_ready.ref.identity.request_id,
+								(unsigned long long)image_ready.ref.handle.ticket_id,
+								(unsigned long long)image_ready.image.image_id)));
 	if (rollback_result != GCS_BLOCK_PCM_X_IMAGE_REARMED
 		&& rollback_result != GCS_BLOCK_PCM_X_IMAGE_DUPLICATE)
 		cluster_pcm_x_runtime_fail_closed();
@@ -12283,9 +12246,8 @@ gcs_block_pcm_x_stage_ready_work(int worker_id, const GcsBlockPcmXImageWork *wor
 
 
 static void gcs_block_pcm_x_revoke_refusal_note_exact_diagnosed(
-	const char *site, int own_result, const ClusterPcmOwnSnapshot *snap,
-	const PcmXTicketRef *ref, uint64 image_id, uint64 source_generation,
-	const ClusterPcmOwnFinishRefusal *finish_refusal);
+	const char *site, int own_result, const ClusterPcmOwnSnapshot *snap, const PcmXTicketRef *ref,
+	uint64 image_id, uint64 source_generation, const ClusterPcmOwnFinishRefusal *finish_refusal);
 static void
 gcs_block_pcm_x_revoke_refusal_note_work(const char *site, int own_result,
 										 const ClusterPcmOwnSnapshot *snap,
@@ -12298,9 +12260,9 @@ gcs_block_pcm_x_revoke_refusal_note_work(const char *site, int own_result,
 }
 
 static void
-gcs_block_pcm_x_revoke_refusal_note_finish_work(
-	int own_result, const ClusterPcmOwnSnapshot *snap, const GcsBlockPcmXImageWork *work,
-	const ClusterPcmOwnFinishRefusal *finish_refusal)
+gcs_block_pcm_x_revoke_refusal_note_finish_work(int own_result, const ClusterPcmOwnSnapshot *snap,
+												const GcsBlockPcmXImageWork *work,
+												const ClusterPcmOwnFinishRefusal *finish_refusal)
 {
 	const char *site = "materialized-finish-other";
 
@@ -12319,9 +12281,10 @@ gcs_block_pcm_x_revoke_refusal_note_finish_work(
 }
 
 static void
-gcs_block_pcm_x_revoke_refusal_note_source_prepare_work(
-	int own_result, const ClusterPcmOwnSnapshot *snap, const GcsBlockPcmXImageWork *work,
-	ClusterPcmOwnSourcePrepareRefusal refusal)
+gcs_block_pcm_x_revoke_refusal_note_source_prepare_work(int own_result,
+														const ClusterPcmOwnSnapshot *snap,
+														const GcsBlockPcmXImageWork *work,
+														ClusterPcmOwnSourcePrepareRefusal refusal)
 {
 	const char *site = "materialize-begin-s-other";
 
@@ -12340,9 +12303,8 @@ gcs_block_pcm_x_revoke_refusal_note_source_prepare_work(
 
 
 static void
-gcs_block_pcm_x_image_ready_arm_refusal_note_work(int result,
-												 const GcsBlockPcmXImageWork *work,
-												 PcmXLocalImageReadyRefusal refusal)
+gcs_block_pcm_x_image_ready_arm_refusal_note_work(int result, const GcsBlockPcmXImageWork *work,
+												  PcmXLocalImageReadyRefusal refusal)
 {
 	const char *site = "image-ready-arm-other";
 
@@ -12396,8 +12358,8 @@ gcs_block_pcm_x_finish_revoke_retain(int worker_id, const GcsBlockPcmXImageWork 
 
 	PG_TRY();
 	{
-		result = cluster_bufmgr_pcm_own_finish_revoke_retain(
-			buf, revoking, page_lsn, retained, finish_refusal);
+		result = cluster_bufmgr_pcm_own_finish_revoke_retain(buf, revoking, page_lsn, retained,
+															 finish_refusal);
 	}
 	PG_CATCH();
 	{
@@ -12412,26 +12374,26 @@ gcs_block_pcm_x_finish_revoke_retain(int worker_id, const GcsBlockPcmXImageWork 
 			revoking->pcm_state);
 		if (preserve_result != GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING)
 			gcs_block_pcm_x_revoke_refusal_note_work("finish-error-evidence", (int)preserve_result,
-											 revoking, work);
-		ereport(LOG,
-				(errmsg_internal("PCM-X finish-error evidence exact"),
-				 errdetail("preserve_result=%d retained=%s worker=%d tag=%u/%u/%u/%d/%u "
-						   "requester=%u backend=%d request_id=%llu ticket=%llu "
-						   "queue_generation=%llu grant_generation=%llu image_id=%llu "
-						   "reservation_token=%llu source_state=%u",
-						   (int)preserve_result,
-						   preserve_result == GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING ? "true"
-																									: "false",
-						   worker_id, work->tag.spcOid, work->tag.dbOid, work->tag.relNumber,
-						   (int)work->tag.forkNum, work->tag.blockNum,
-						   work->key.origin_node_id, work->key.requester_backend_id,
-						   (unsigned long long)work->binding.identity.ref.identity.request_id,
-						   (unsigned long long)work->binding.identity.ref.handle.ticket_id,
-						   (unsigned long long)work->binding.identity.ref.handle.queue_generation,
-						   (unsigned long long)work->binding.identity.ref.grant_generation,
-						   (unsigned long long)work->binding.identity.image.image_id,
-						   (unsigned long long)revoking->reservation_token,
-						   (unsigned)revoking->pcm_state)));
+													 revoking, work);
+		ereport(
+			LOG,
+			(errmsg_internal("PCM-X finish-error evidence exact"),
+			 errdetail("preserve_result=%d retained=%s worker=%d tag=%u/%u/%u/%d/%u "
+					   "requester=%u backend=%d request_id=%llu ticket=%llu "
+					   "queue_generation=%llu grant_generation=%llu image_id=%llu "
+					   "reservation_token=%llu source_state=%u",
+					   (int)preserve_result,
+					   preserve_result == GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING ? "true" : "false",
+					   worker_id, work->tag.spcOid, work->tag.dbOid, work->tag.relNumber,
+					   (int)work->tag.forkNum, work->tag.blockNum, work->key.origin_node_id,
+					   work->key.requester_backend_id,
+					   (unsigned long long)work->binding.identity.ref.identity.request_id,
+					   (unsigned long long)work->binding.identity.ref.handle.ticket_id,
+					   (unsigned long long)work->binding.identity.ref.handle.queue_generation,
+					   (unsigned long long)work->binding.identity.ref.grant_generation,
+					   (unsigned long long)work->binding.identity.image.image_id,
+					   (unsigned long long)revoking->reservation_token,
+					   (unsigned)revoking->pcm_state)));
 		cluster_pcm_x_runtime_fail_closed();
 		ereport(LOG, (errmsg_internal("cluster PCM-X retained-image finish FlushBuffer failed; "
 									  "preserved immutable evidence and blocked recovery: %s",
@@ -12491,7 +12453,7 @@ gcs_block_pcm_x_finish_materialized_work(int worker_id, const GcsBlockPcmXImageW
 	gcs_block_pcm_x_note_own_result(own_result);
 	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY) {
 		gcs_block_pcm_x_revoke_refusal_note_finish_work((int)own_result, &current, work,
-												 &finish_refusal);
+														&finish_refusal);
 		return;
 	}
 	if (own_result != CLUSTER_PCM_OWN_OK) {
@@ -12621,18 +12583,17 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 		}
 		PG_END_TRY();
 		own_result = (ClusterPcmOwnResult)n_prepare_result;
-	}
-	else
+	} else
 		own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
 	gcs_block_pcm_x_note_own_result(own_result);
 	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY
 		|| own_result == CLUSTER_PCM_OWN_STALE) {
 		if (source_is_s)
-			gcs_block_pcm_x_revoke_refusal_note_source_prepare_work(
-				(int)own_result, &current, work, source_prepare_refusal);
+			gcs_block_pcm_x_revoke_refusal_note_source_prepare_work((int)own_result, &current, work,
+																	source_prepare_refusal);
 		else
-			gcs_block_pcm_x_revoke_refusal_note_work("materialize-begin", (int)own_result,
-												 &current, work);
+			gcs_block_pcm_x_revoke_refusal_note_work("materialize-begin", (int)own_result, &current,
+													 work);
 		return;
 	}
 	if (own_result != CLUSTER_PCM_OWN_OK) {
@@ -12663,8 +12624,7 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 	}
 	memcpy(&page_header, block_data, sizeof(page_header));
 	if ((uint64)page_lsn != (uint64)PageXLogRecPtrGet(page_header.pd_lsn)
-		|| ((source_is_n || source_is_s)
-			&& page_scn != (uint64)page_header.pd_block_scn)) {
+		|| ((source_is_n || source_is_s) && page_scn != (uint64)page_header.pd_block_scn)) {
 		gcs_block_pcm_x_abort_image_before_finish(worker_id, work, &work->binding, buf, &revoking,
 												  true);
 		return;
@@ -12713,8 +12673,8 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 			return;
 		}
 	} else {
-		own_result = gcs_block_pcm_x_finish_revoke_retain(worker_id, work, &ready_binding, buf,
-														  &revoking, page_lsn, &retained, &finish_refusal);
+		own_result = gcs_block_pcm_x_finish_revoke_retain(
+			worker_id, work, &ready_binding, buf, &revoking, page_lsn, &retained, &finish_refusal);
 		gcs_block_pcm_x_note_own_result(own_result);
 		if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY) {
 			gcs_block_pcm_x_revoke_refusal_note_work("materialize-finish", (int)own_result,
@@ -12838,14 +12798,13 @@ gcs_block_pcm_x_revoke_refusal_note_exact(const char *site, int own_result,
 										  uint64 source_generation)
 {
 	gcs_block_pcm_x_revoke_refusal_note_exact_diagnosed(site, own_result, snap, ref, image_id,
-																 source_generation, NULL);
+														source_generation, NULL);
 }
 
 static void
 gcs_block_pcm_x_revoke_refusal_note_exact_diagnosed(
-	const char *site, int own_result, const ClusterPcmOwnSnapshot *snap,
-	const PcmXTicketRef *ref, uint64 image_id, uint64 source_generation,
-	const ClusterPcmOwnFinishRefusal *finish_refusal)
+	const char *site, int own_result, const ClusterPcmOwnSnapshot *snap, const PcmXTicketRef *ref,
+	uint64 image_id, uint64 source_generation, const ClusterPcmOwnFinishRefusal *finish_refusal)
 {
 	static const char *last_site = NULL;
 	static uint32 last_flags = 0;
@@ -12916,10 +12875,8 @@ gcs_block_pcm_x_revoke_refusal_note_exact_diagnosed(
 							   (unsigned long long)(snap != NULL ? snap->generation : 0),
 							   (unsigned long long)(snap != NULL ? snap->reservation_token : 0),
 							   (unsigned int)flags, (unsigned int)finish_reason,
-							   (unsigned int)shared_refcount,
-							   bm_io_in_progress ? "true" : "false",
-							   (unsigned int)live_flags,
-							   (unsigned long long)live_token)));
+							   (unsigned int)shared_refcount, bm_io_in_progress ? "true" : "false",
+							   (unsigned int)live_flags, (unsigned long long)live_token)));
 		}
 		return;
 	}
@@ -13088,8 +13045,8 @@ cluster_gcs_handle_pcm_x_revoke_envelope(const ClusterICEnvelope *env, const voi
 			return;
 		}
 	}
-	result = cluster_pcm_x_local_holder_revoke_apply_floor_exact(
-		revoke, required_page_scn, source_node, source_session);
+	result = cluster_pcm_x_local_holder_revoke_apply_floor_exact(revoke, required_page_scn,
+																 source_node, source_session);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		/* Ingress only installs/re-arms holder work.  It does not prove the
@@ -13134,44 +13091,39 @@ cluster_gcs_handle_pcm_x_image_ready_envelope(const ClusterICEnvelope *env, cons
 	diagnostic = cluster_injection_is_armed("cluster-pcm-x-retain-flush-error");
 	wire_valid = cluster_gcs_pcm_x_image_ready_ingress_valid(
 		image_ready, env->payload_length, source_node, current_epoch, tag_master, cluster_node_id);
-	authorized
-		= wire_valid
-		  && gcs_block_pcm_x_transfer_ingress_authorized(
-			  &image_ready->ref.identity.tag, source_node, current_epoch, &source_session);
+	authorized = wire_valid
+				 && gcs_block_pcm_x_transfer_ingress_authorized(
+					 &image_ready->ref.identity.tag, source_node, current_epoch, &source_session);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY master boundary: ingress"),
-				 errdetail("wire_valid=%s authorized=%s source=%d local=%d tag_master=%d "
-						   "epoch=%llu source_session=%llu request_id=%llu ticket=%llu "
-						   "grant_generation=%llu image_source=%d image_id=%llu",
-						   wire_valid ? "true" : "false", authorized ? "true" : "false",
-						   source_node, cluster_node_id, tag_master,
-						   (unsigned long long)current_epoch,
-						   (unsigned long long)(authorized ? source_session : 0),
-						   (unsigned long long)image_ready->ref.identity.request_id,
-						   (unsigned long long)image_ready->ref.handle.ticket_id,
-						   (unsigned long long)image_ready->ref.grant_generation,
-						   image_ready->image.source_node,
-						   (unsigned long long)image_ready->image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY master boundary: ingress"),
+					  errdetail("wire_valid=%s authorized=%s source=%d local=%d tag_master=%d "
+								"epoch=%llu source_session=%llu request_id=%llu ticket=%llu "
+								"grant_generation=%llu image_source=%d image_id=%llu",
+								wire_valid ? "true" : "false", authorized ? "true" : "false",
+								source_node, cluster_node_id, tag_master,
+								(unsigned long long)current_epoch,
+								(unsigned long long)(authorized ? source_session : 0),
+								(unsigned long long)image_ready->ref.identity.request_id,
+								(unsigned long long)image_ready->ref.handle.ticket_id,
+								(unsigned long long)image_ready->ref.grant_generation,
+								image_ready->image.source_node,
+								(unsigned long long)image_ready->image.image_id)));
 	if (!wire_valid || !authorized)
 		return;
-	required_page_scn
-		= cluster_pcm_lock_pi_watermark_scn_query(image_ready->ref.identity.tag);
+	required_page_scn = cluster_pcm_lock_pi_watermark_scn_query(image_ready->ref.identity.tag);
 	floor_verdict
 		= gcs_block_lost_write_verdict(required_page_scn, (SCN)image_ready->image.page_scn);
 	if (floor_verdict == GCS_LOST_WRITE_FAIL_STALE
 		|| floor_verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY source stale before PREPARE: "
-								 "source=%d request=%llu ticket=%llu image=%llu "
-								 "image_scn=%llu required_scn=%llu verdict=%d",
-								 source_node,
-								 (unsigned long long)image_ready->ref.identity.request_id,
-								 (unsigned long long)image_ready->ref.handle.ticket_id,
-								 (unsigned long long)image_ready->image.image_id,
-								 (unsigned long long)image_ready->image.page_scn,
-								 (unsigned long long)required_page_scn,
-								 (int)floor_verdict)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY source stale before PREPARE: "
+									  "source=%d request=%llu ticket=%llu image=%llu "
+									  "image_scn=%llu required_scn=%llu verdict=%d",
+									  source_node,
+									  (unsigned long long)image_ready->ref.identity.request_id,
+									  (unsigned long long)image_ready->ref.handle.ticket_id,
+									  (unsigned long long)image_ready->image.image_id,
+									  (unsigned long long)image_ready->image.page_scn,
+									  (unsigned long long)required_page_scn, (int)floor_verdict)));
 		cluster_pcm_x_runtime_fail_closed();
 		return;
 	}
@@ -13180,24 +13132,23 @@ cluster_gcs_handle_pcm_x_image_ready_envelope(const ClusterICEnvelope *env, cons
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		gcs_block_pcm_x_revoke_refusal_note_exact(NULL, 0, NULL, NULL, 0, 0);
-		prepare_stage_result
-			= cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_PREPARE_GRANT,
-										prepare.ref.identity.node_id, &prepare, sizeof(prepare));
+		prepare_stage_result = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_PREPARE_GRANT,
+															 prepare.ref.identity.node_id, &prepare,
+															 sizeof(prepare));
 	} else
-		gcs_block_pcm_x_revoke_refusal_note_exact(
-			"image-ready-master-consume", (int)result, NULL, &image_ready->ref,
-			image_ready->image.image_id, image_ready->image.source_own_generation);
+		gcs_block_pcm_x_revoke_refusal_note_exact("image-ready-master-consume", (int)result, NULL,
+												  &image_ready->ref, image_ready->image.image_id,
+												  image_ready->image.source_own_generation);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X IMAGE_READY master boundary: consume"),
-				 errdetail("result=%d prepare_stage_result=%s requester=%d source=%d "
-						   "request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
-						   (int)result, prepare_stage_result ? "true" : "false",
-						   image_ready->ref.identity.node_id, source_node,
-						   (unsigned long long)image_ready->ref.identity.request_id,
-						   (unsigned long long)image_ready->ref.handle.ticket_id,
-						   (unsigned long long)image_ready->ref.grant_generation,
-						   (unsigned long long)image_ready->image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X IMAGE_READY master boundary: consume"),
+					  errdetail("result=%d prepare_stage_result=%s requester=%d source=%d "
+								"request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
+								(int)result, prepare_stage_result ? "true" : "false",
+								image_ready->ref.identity.node_id, source_node,
+								(unsigned long long)image_ready->ref.identity.request_id,
+								(unsigned long long)image_ready->ref.handle.ticket_id,
+								(unsigned long long)image_ready->ref.grant_generation,
+								(unsigned long long)image_ready->image.image_id)));
 }
 
 
@@ -13226,52 +13177,48 @@ cluster_gcs_handle_pcm_x_prepare_grant_envelope(const ClusterICEnvelope *env, co
 	diagnostic = cluster_injection_is_armed("cluster-pcm-x-retain-flush-error");
 	wire_valid = cluster_gcs_pcm_x_prepare_grant_ingress_valid(
 		prepare, env->payload_length, source_node, current_epoch, tag_master, cluster_node_id);
-	authorized
-		= wire_valid
-		  && gcs_block_pcm_x_transfer_ingress_authorized(
-			  &prepare->ref.identity.tag, source_node, current_epoch, &source_session);
+	authorized = wire_valid
+				 && gcs_block_pcm_x_transfer_ingress_authorized(
+					 &prepare->ref.identity.tag, source_node, current_epoch, &source_session);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X PREPARE_GRANT requester boundary: ingress"),
-				 errdetail("wire_valid=%s authorized=%s source=%d local=%d tag_master=%d "
-						   "epoch=%llu source_session=%llu request_id=%llu ticket=%llu "
-						   "grant_generation=%llu image_id=%llu",
-						   wire_valid ? "true" : "false", authorized ? "true" : "false",
-						   source_node, cluster_node_id, tag_master,
-						   (unsigned long long)current_epoch,
-						   (unsigned long long)(authorized ? source_session : 0),
-						   (unsigned long long)prepare->ref.identity.request_id,
-						   (unsigned long long)prepare->ref.handle.ticket_id,
-						   (unsigned long long)prepare->ref.grant_generation,
-						   (unsigned long long)prepare->image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X PREPARE_GRANT requester boundary: ingress"),
+					  errdetail("wire_valid=%s authorized=%s source=%d local=%d tag_master=%d "
+								"epoch=%llu source_session=%llu request_id=%llu ticket=%llu "
+								"grant_generation=%llu image_id=%llu",
+								wire_valid ? "true" : "false", authorized ? "true" : "false",
+								source_node, cluster_node_id, tag_master,
+								(unsigned long long)current_epoch,
+								(unsigned long long)(authorized ? source_session : 0),
+								(unsigned long long)prepare->ref.identity.request_id,
+								(unsigned long long)prepare->ref.handle.ticket_id,
+								(unsigned long long)prepare->ref.grant_generation,
+								(unsigned long long)prepare->image.image_id)));
 	if (!wire_valid || !authorized)
 		return;
 	lookup_result = cluster_pcm_x_local_lookup_exact(&prepare->ref.identity, &leader);
 	if (lookup_result != PCM_X_QUEUE_OK) {
 		if (diagnostic)
-			ereport(LOG,
-					(errmsg_internal("PCM-X PREPARE_GRANT requester boundary: apply"),
-					 errdetail("lookup_result=%d apply_result=-1 source=%d request_id=%llu "
-							   "ticket=%llu grant_generation=%llu image_id=%llu",
-							   (int)lookup_result, source_node,
-							   (unsigned long long)prepare->ref.identity.request_id,
-							   (unsigned long long)prepare->ref.handle.ticket_id,
-							   (unsigned long long)prepare->ref.grant_generation,
-							   (unsigned long long)prepare->image.image_id)));
+			ereport(LOG, (errmsg_internal("PCM-X PREPARE_GRANT requester boundary: apply"),
+						  errdetail("lookup_result=%d apply_result=-1 source=%d request_id=%llu "
+									"ticket=%llu grant_generation=%llu image_id=%llu",
+									(int)lookup_result, source_node,
+									(unsigned long long)prepare->ref.identity.request_id,
+									(unsigned long long)prepare->ref.handle.ticket_id,
+									(unsigned long long)prepare->ref.grant_generation,
+									(unsigned long long)prepare->image.image_id)));
 		return;
 	}
 	result = cluster_pcm_x_local_prepare_grant_exact(&leader, prepare, source_node, source_session);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (diagnostic)
-		ereport(LOG,
-				(errmsg_internal("PCM-X PREPARE_GRANT requester boundary: apply"),
-				 errdetail("lookup_result=%d apply_result=%d source=%d request_id=%llu "
-						   "ticket=%llu grant_generation=%llu image_id=%llu",
-						   (int)lookup_result, (int)result, source_node,
-						   (unsigned long long)prepare->ref.identity.request_id,
-						   (unsigned long long)prepare->ref.handle.ticket_id,
-						   (unsigned long long)prepare->ref.grant_generation,
-						   (unsigned long long)prepare->image.image_id)));
+		ereport(LOG, (errmsg_internal("PCM-X PREPARE_GRANT requester boundary: apply"),
+					  errdetail("lookup_result=%d apply_result=%d source=%d request_id=%llu "
+								"ticket=%llu grant_generation=%llu image_id=%llu",
+								(int)lookup_result, (int)result, source_node,
+								(unsigned long long)prepare->ref.identity.request_id,
+								(unsigned long long)prepare->ref.handle.ticket_id,
+								(unsigned long long)prepare->ref.grant_generation,
+								(unsigned long long)prepare->image.image_id)));
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		gcs_block_pcm_x_wake_requester(&prepare->ref.identity);
 }
@@ -13404,8 +13351,7 @@ cluster_gcs_handle_pcm_x_final_ack_envelope(const ClusterICEnvelope *env, const 
 		fail_stage = "prepare";
 		goto final_ack_fail_closed;
 	}
-	authority_valid
-		= cluster_pcm_lock_authority_snapshot(final_ack->ref.identity.tag, &authority);
+	authority_valid = cluster_pcm_lock_authority_snapshot(final_ack->ref.identity.tag, &authority);
 	if (!authority_valid) {
 		fail_stage = "authority-snapshot";
 		goto final_ack_fail_closed;
@@ -13433,10 +13379,8 @@ cluster_gcs_handle_pcm_x_final_ack_envelope(const ClusterICEnvelope *env, const 
 	return;
 
 final_ack_fail_closed:
-	watermark_scn
-		= cluster_pcm_lock_pi_watermark_scn_query(final_ack->ref.identity.tag);
-	wm_have
-		= cluster_pcm_lock_pi_watermark_prov_query(final_ack->ref.identity.tag, &wm_prov);
+	watermark_scn = cluster_pcm_lock_pi_watermark_scn_query(final_ack->ref.identity.tag);
+	wm_have = cluster_pcm_lock_pi_watermark_prov_query(final_ack->ref.identity.tag, &wm_prov);
 	ereport(
 		LOG,
 		(errmsg("PCM-X FINAL_ACK fail-closed at %s", fail_stage),
@@ -13462,9 +13406,8 @@ final_ack_fail_closed:
 			 authority.x_holder_node, authority.s_holders_bitmap, authority.master_holder.node_id,
 			 authority.pending_x_requester_node, (unsigned long long)authority.pending_x_since_lsn,
 			 token.image.source_node, (unsigned long long)handoff.page_scn,
-			 (unsigned long long)watermark_scn,
-			 cluster_pcm_wm_src_text(wm_prov.source), wm_have ? 1 : 0,
-			 wm_prov.table_full ? 1 : 0, wm_prov.sender_node,
+			 (unsigned long long)watermark_scn, cluster_pcm_wm_src_text(wm_prov.source),
+			 wm_have ? 1 : 0, wm_prov.table_full ? 1 : 0, wm_prov.sender_node,
 			 (unsigned long long)wm_prov.request_id, (unsigned long long)wm_prov.epoch,
 			 (unsigned long long)wm_prov.old_scn, (unsigned long long)wm_prov.new_scn,
 			 wm_have && wm_prov.new_scn == watermark_scn ? 1 : 0)));
@@ -14106,12 +14049,12 @@ gcs_block_pcm_x_master_drive_retry_tick(void)
 
 	cursor_before = cursor;
 	result = cluster_pcm_x_master_drive_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &tag,
-											  &cluster_epoch);
+												  &cluster_epoch);
 	if (result == PCM_X_QUEUE_OK)
 		gcs_block_pcm_x_master_drive_tag(&tag, cluster_epoch);
 	else
 		gcs_block_pcm_x_master_retry_observe("work-next", result, -1, cursor_before, cursor, NULL,
-											  cluster_epoch);
+											 cluster_epoch);
 }
 
 
@@ -15264,16 +15207,14 @@ gcs_block_wake_local_pending_s_request(const GcsBlockInvalidatePayload *inv)
 		int slot_idx;
 
 		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
-		for (slot_idx = 0; slot_idx < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
-			 slot_idx++) {
+		for (slot_idx = 0; slot_idx < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot_idx++) {
 			ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_idx];
 			GcsBlockReplyHeader *hdr;
 
 			if (!GcsBlockLocalPendingSDenialMatches(
 					slot->in_use, slot->reply_received, slot->stale, slot->transition_id,
-					&slot->tag, slot->request_epoch, slot->expected_master_node,
-					slot->direct_state, slot->direct_target_prepared, &inv->tag, inv->epoch,
-					inv->master_node))
+					&slot->tag, slot->request_epoch, slot->expected_master_node, slot->direct_state,
+					slot->direct_target_prepared, &inv->tag, inv->epoch, inv->master_node))
 				continue;
 
 			hdr = &slot->reply_header;
@@ -15284,8 +15225,7 @@ gcs_block_wake_local_pending_s_request(const GcsBlockInvalidatePayload *inv)
 			hdr->requester_backend_id = backend_idx + 1;
 			hdr->transition_id = slot->transition_id;
 			hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X;
-			GcsBlockReplyHeaderSetForwardingMasterNode(
-				hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+			GcsBlockReplyHeaderSetForwardingMasterNode(hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 			memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 			hdr->checksum = gcs_block_compute_checksum(slot->reply_block_data);
 			slot->reply_sf_dep_valid = false;
@@ -15318,8 +15258,7 @@ gcs_block_wake_local_pending_s_request(const GcsBlockInvalidatePayload *inv)
 #define GCS_BLOCK_PENDING_OBS_DIRECT_STATE UINT32_C(0x080)
 #define GCS_BLOCK_PENDING_OBS_DIRECT_PREPARED UINT32_C(0x100)
 
-typedef struct GcsBlockGrantPendingObservation
-{
+typedef struct GcsBlockGrantPendingObservation {
 	bool valid;
 	uint64 invalidate_request_id;
 	uint64 invalidate_epoch;
@@ -15349,8 +15288,7 @@ typedef struct GcsBlockGrantPendingObservation
  * BUSY retries while retaining the first sighting and every identity/state
  * change for the exact INVALIDATE. */
 static void
-gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
-										   bool woke_local)
+gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv, bool woke_local)
 {
 	static GcsBlockGrantPendingObservation cache[8];
 	static uint32 next_cache_slot = 0;
@@ -15375,8 +15313,7 @@ gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
 	obs.slot_index = -1;
 	obs.slot_master = -1;
 	obs.woke_local = woke_local;
-	obs.own_result
-		= (int)cluster_bufmgr_pcm_own_snapshot_by_tag(&inv->tag, &obs.buffer_id, &own);
+	obs.own_result = (int)cluster_bufmgr_pcm_own_snapshot_by_tag(&inv->tag, &obs.buffer_id, &own);
 	obs.own_state = own.pcm_state;
 	obs.own_generation = own.generation;
 	obs.own_token = own.reservation_token;
@@ -15388,8 +15325,7 @@ gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
 			int slot_idx;
 
 			LWLockAcquire(&blk->lock.lock, LW_SHARED);
-			for (slot_idx = 0; slot_idx < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
-				 slot_idx++) {
+			for (slot_idx = 0; slot_idx < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot_idx++) {
 				ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_idx];
 				int priority;
 
@@ -15437,8 +15373,7 @@ gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
 		obs.reject_mask = GCS_BLOCK_PENDING_OBS_NO_SLOT;
 
 	for (i = 0; i < lengthof(cache); i++) {
-		if (cache[i].valid
-			&& cache[i].invalidate_request_id == obs.invalidate_request_id
+		if (cache[i].valid && cache[i].invalidate_request_id == obs.invalidate_request_id
 			&& cache[i].invalidate_epoch == obs.invalidate_epoch
 			&& cache[i].invalidate_master == obs.invalidate_master
 			&& BufferTagsEqual(&cache[i].tag, &obs.tag)) {
@@ -15461,16 +15396,15 @@ gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
 		 "woke_local=%d slot_backend=%d slot_index=%d slot_request_id=%llu "
 		 "slot_epoch=%llu slot_master=%d slot_transition=%u reply_received=%d stale=%d "
 		 "direct_state=%d direct_prepared=%d reject_mask=0x%x",
-		 (unsigned long long)obs.invalidate_request_id,
-		 (unsigned long long)obs.invalidate_epoch, obs.invalidate_master,
-		 (unsigned int)inv->invalidating_for_x_node, inv->tag.relNumber,
-		 (int)inv->tag.forkNum, inv->tag.blockNum, obs.own_result, obs.buffer_id,
-		 obs.own_state, (unsigned long long)obs.own_generation,
-		 (unsigned long long)obs.own_token, obs.own_flags, obs.woke_local ? 1 : 0,
-		 obs.slot_backend, obs.slot_index, (unsigned long long)obs.slot_request_id,
-		 (unsigned long long)obs.slot_epoch, obs.slot_master, obs.slot_transition,
-		 obs.slot_reply_received ? 1 : 0, obs.slot_stale ? 1 : 0,
-		 obs.slot_direct_state, obs.slot_direct_prepared ? 1 : 0, obs.reject_mask);
+		 (unsigned long long)obs.invalidate_request_id, (unsigned long long)obs.invalidate_epoch,
+		 obs.invalidate_master, (unsigned int)inv->invalidating_for_x_node, inv->tag.relNumber,
+		 (int)inv->tag.forkNum, inv->tag.blockNum, obs.own_result, obs.buffer_id, obs.own_state,
+		 (unsigned long long)obs.own_generation, (unsigned long long)obs.own_token, obs.own_flags,
+		 obs.woke_local ? 1 : 0, obs.slot_backend, obs.slot_index,
+		 (unsigned long long)obs.slot_request_id, (unsigned long long)obs.slot_epoch,
+		 obs.slot_master, obs.slot_transition, obs.slot_reply_received ? 1 : 0,
+		 obs.slot_stale ? 1 : 0, obs.slot_direct_state, obs.slot_direct_prepared ? 1 : 0,
+		 obs.reject_mask);
 }
 
 /*
@@ -15638,15 +15572,15 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 
 			if (!pcm_x_queue_invalidate_refusal_logged) {
 				pcm_x_queue_invalidate_refusal_logged = true;
-				ereport(LOG,
-						(errmsg_internal("PCM-X queue INVALIDATE passive-S release refused"),
-						 errdetail_internal("epoch=%llu tag=%u/%u/%u/%d/%u requester=%u "
-										"master=%d request_id=%llu queue_result=%d own_result=%d",
-										(unsigned long long)inv->epoch, inv->tag.spcOid,
-										inv->tag.dbOid, inv->tag.relNumber, (int)inv->tag.forkNum,
-										inv->tag.blockNum, (unsigned int)inv->invalidating_for_x_node,
-										inv->master_node, (unsigned long long)inv->request_id,
-										(int)queue_result, (int)own_result)));
+				ereport(LOG, (errmsg_internal("PCM-X queue INVALIDATE passive-S release refused"),
+							  errdetail_internal(
+								  "epoch=%llu tag=%u/%u/%u/%d/%u requester=%u "
+								  "master=%d request_id=%llu queue_result=%d own_result=%d",
+								  (unsigned long long)inv->epoch, inv->tag.spcOid, inv->tag.dbOid,
+								  inv->tag.relNumber, (int)inv->tag.forkNum, inv->tag.blockNum,
+								  (unsigned int)inv->invalidating_for_x_node, inv->master_node,
+								  (unsigned long long)inv->request_id, (int)queue_result,
+								  (int)own_result)));
 			}
 		}
 		/* GCS serve-stall round-5 (A2): nothing changed, no ACK — the
@@ -16066,8 +16000,7 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 			queue_positive = true;
 		else if (queue_result == PCM_X_QUEUE_BUSY) {
 			uint64 now_ms = (uint64)(GetCurrentTimestamp() / 1000);
-			uint64 retry_delay_ms
-				= gcs_block_pcm_x_invalidate_busy_retry_delay_ms(&queue_snapshot);
+			uint64 retry_delay_ms = gcs_block_pcm_x_invalidate_busy_retry_delay_ms(&queue_snapshot);
 
 			queue_result = cluster_pcm_x_master_invalidate_busy_backoff_exact(
 				&queue_snapshot, ack->sender_node, now_ms, retry_delay_ms, &queue_updated);
@@ -16077,10 +16010,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 			else
 				gcs_block_pcm_x_master_drive_fail_closed(queue_result);
 			return;
-		}
-		else if (queue_result == PCM_X_QUEUE_BAD_STATE || queue_result == PCM_X_QUEUE_CORRUPT
-				 || queue_result == PCM_X_QUEUE_COUNTER_EXHAUSTED
-				 || queue_result == PCM_X_QUEUE_INVALID)
+		} else if (queue_result == PCM_X_QUEUE_BAD_STATE || queue_result == PCM_X_QUEUE_CORRUPT
+				   || queue_result == PCM_X_QUEUE_COUNTER_EXHAUSTED
+				   || queue_result == PCM_X_QUEUE_INVALID)
 			gcs_block_pcm_x_master_drive_fail_closed(queue_result);
 		if (!queue_positive)
 			return;

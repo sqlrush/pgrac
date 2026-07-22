@@ -407,7 +407,7 @@ cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id)
  * reconnect. */
 bool
 cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
-										 uint32 *generation_out)
+										  uint32 *generation_out)
 {
 	bool supported;
 
@@ -429,7 +429,7 @@ cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
 /* Drain-side exact fence for a capability-bound LMS slot. */
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
-										  uint32 expected_generation)
+											  uint32 expected_generation)
 {
 	bool matches;
 
@@ -438,8 +438,7 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_cap
 		return false;
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
 	matches = cluster_sf_peer_cap_generation_matches_exact(
-		&ClusterSfDep->peer_capabilities[peer_id], required_capabilities,
-		expected_generation);
+		&ClusterSfDep->peer_capabilities[peer_id], required_capabilities, expected_generation);
 	LWLockRelease(&ClusterSfDep->lock);
 	return matches;
 }

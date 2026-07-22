@@ -953,9 +953,9 @@ cluster_gcs_pcm_x_revoke_ingress_valid(const PcmXRevokePayload *request, Size pa
 {
 	return request != NULL
 		   && (payload_length == sizeof(*request) || payload_length == sizeof(PcmXRevokePayloadV2))
-		   && authenticated_node >= 0
-		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
-		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+		   && authenticated_node >= 0 && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && tag_master == authenticated_node
 		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&request->ref, current_epoch)
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(request->image_id, authenticated_node);
 }
@@ -1314,14 +1314,13 @@ GcsBlockLocalPendingSDenialMatches(bool in_use, bool reply_received, bool stale,
 								   uint8 transition_id, const BufferTag *slot_tag,
 								   uint64 request_epoch, int32 expected_master_node,
 								   ClusterGcsBlockDirectState direct_state,
-								   bool direct_target_prepared,
-								   const BufferTag *invalidate_tag, uint64 invalidate_epoch,
-								   int32 invalidate_master_node)
+								   bool direct_target_prepared, const BufferTag *invalidate_tag,
+								   uint64 invalidate_epoch, int32 invalidate_master_node)
 {
 	return in_use && !reply_received && !stale && slot_tag != NULL && invalidate_tag != NULL
-		   && transition_id == (uint8)PCM_TRANS_N_TO_S
-		   && BufferTagsEqual(slot_tag, invalidate_tag) && request_epoch == invalidate_epoch
-		   && expected_master_node == invalidate_master_node && !direct_target_prepared
+		   && transition_id == (uint8)PCM_TRANS_N_TO_S && BufferTagsEqual(slot_tag, invalidate_tag)
+		   && request_epoch == invalidate_epoch && expected_master_node == invalidate_master_node
+		   && !direct_target_prepared
 		   && (direct_state == GCS_BLOCK_DIRECT_UNARMED
 			   || direct_state == GCS_BLOCK_DIRECT_ABORTED);
 }
@@ -3280,10 +3279,8 @@ typedef enum ClusterBufmgrGcsDowngradeOutcome {
 	CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY
 } ClusterBufmgrGcsDowngradeOutcome;
 extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
-extern ClusterBufmgrGcsDowngradeOutcome
-cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
-	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-	ClusterBufmgrGcsCopyRefusal *out_refusal);
+extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
 extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
 extern ClusterBufmgrGcsDowngradeOutcome
 cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
@@ -3383,9 +3380,9 @@ extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  * Terminal denials ereport(ERROR) and do not return.
  */
 extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
-											PcmLockTransition transition_id,
-											int master_node, bool clean_eligible,
-											bool *out_retry_denied);
+													PcmLockTransition transition_id,
+													int master_node, bool clean_eligible,
+													bool *out_retry_denied);
 
 /*
  * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by
@@ -3398,8 +3395,8 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * bufmgr aborts/rearms GRANT_PENDING and selects a fresh holder identity.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
-													 const PcmAuthoritySnapshot *expected,
-													 bool *out_retry_denied);
+														 const PcmAuthoritySnapshot *expected,
+														 bool *out_retry_denied);
 /* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant.
  * spec-5.2a D2/D3: clean_eligible routes a clean (sequence) page through the
  * flush-data-before-drop holder path + stale-holder storage-fallback recovery.
@@ -3535,8 +3532,8 @@ typedef enum GcsBlockSendFamily {
 } GcsBlockSendFamily;
 
 extern void cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc);
-extern ClusterICSendResult cluster_gcs_block_send_direct_zero_reply(
-	int32 dest_node, const GcsBlockReplyHeader *header);
+extern ClusterICSendResult
+cluster_gcs_block_send_direct_zero_reply(int32 dest_node, const GcsBlockReplyHeader *header);
 
 extern uint64 cluster_gcs_get_reply_send_queued_count(void);
 extern uint64 cluster_gcs_get_reply_send_not_admitted_count(void);

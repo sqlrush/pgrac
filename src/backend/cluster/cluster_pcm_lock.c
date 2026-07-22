@@ -2852,9 +2852,8 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 
 	Assert(out_retry_denied != NULL);
 	if (out_retry_denied == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster_pcm_lock_acquire_buffer: NULL retry result")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_pcm_lock_acquire_buffer: NULL retry result")));
 	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -2983,12 +2982,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		PcmAuthoritySnapshot authority;
 		bool have_authority = cluster_pcm_lock_authority_snapshot(tag, &authority);
 
-		if (have_authority && authority.state == PCM_STATE_X
-			&& authority.x_holder_node >= 0 && authority.x_holder_node != cluster_node_id
-			&& authority.s_holders_bitmap == 0
+		if (have_authority && authority.state == PCM_STATE_X && authority.x_holder_node >= 0
+			&& authority.x_holder_node != cluster_node_id && authority.s_holders_bitmap == 0
 			&& authority.master_holder.node_id == (uint32)authority.x_holder_node)
-			return cluster_gcs_local_master_read_image_and_wait(buf, &authority,
-														 out_retry_denied);
+			return cluster_gcs_local_master_read_image_and_wait(buf, &authority, out_retry_denied);
 	} else /* mode == PCM_LOCK_MODE_X */
 	{
 		/*
@@ -3090,7 +3087,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		if (!pcm_lock_acquire_local(tag, mode, &raced_remote_x)) {
 			if (mode == PCM_LOCK_MODE_S)
 				return cluster_gcs_local_master_read_image_and_wait(buf, &raced_remote_x,
-														 out_retry_denied);
+																	out_retry_denied);
 			return cluster_gcs_local_master_x_transfer_and_wait(buf, &raced_remote_x,
 																clean_eligible, out_retry_denied);
 		}

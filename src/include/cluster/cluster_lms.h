@@ -405,18 +405,21 @@ extern void cluster_lms_outbound_request_lwlocks(void);
 extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 										 const void *payload, uint16 payload_len);
 extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type,
-										   uint32 dest_node_id, const void *payload,
-										   uint16 payload_len, uint32 required_capability,
-										   uint32 connection_generation);
+												   uint32 dest_node_id, const void *payload,
+												   uint16 payload_len, uint32 required_capability,
+												   uint32 connection_generation);
 struct GcsBlockReplyHeader;
-extern bool cluster_lms_outbound_enqueue_zero_block_reply(
-	int worker_id, uint32 dest_node_id, const struct GcsBlockReplyHeader *header, bool direct_land);
+extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
+														  const struct GcsBlockReplyHeader *header,
+														  bool direct_land);
 extern int cluster_lms_outbound_drain_send(int worker_id);
 extern uint32 cluster_lms_outbound_depth(int worker_id);
-extern void cluster_lms_note_pcm_x_image_ready_boundary(
-	uint8 msg_type, const char *boundary, int result, int runtime_state, bool fence_enforcing,
-	bool fence_allowed, uint32 dest_node_id, uint64 request_id, uint64 ticket_id, uint64 grant_generation,
-	uint64 image_id);
+extern void cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary,
+														int result, int runtime_state,
+														bool fence_enforcing, bool fence_allowed,
+														uint32 dest_node_id, uint64 request_id,
+														uint64 ticket_id, uint64 grant_generation,
+														uint64 image_id);
 
 /*
  * Read-only accessors for SQL view + diagnostics.

@@ -61,11 +61,11 @@
 #define PCM_OWN_FLAG_REVOKING ((uint32)0x2)		 /* a revoke (downgrade/invalidate) started */
 
 typedef struct ClusterPcmOwnEntry {
-	pg_atomic_uint64 generation;		/* monotone; bumped on every committed transition */
-	pg_atomic_uint64 reservation_token; /* monotone; active iff a transient flag is set */
+	pg_atomic_uint64 generation;			  /* monotone; bumped on every committed transition */
+	pg_atomic_uint64 reservation_token;		  /* monotone; active iff a transient flag is set */
 	pg_atomic_uint64 writer_activation_token; /* committed X not yet activated under content X */
-	pg_atomic_uint32 flags;				/* PCM_OWN_FLAG_* */
-	uint32 _pad;						/* keep 32B aligned */
+	pg_atomic_uint32 flags;					  /* PCM_OWN_FLAG_* */
+	uint32 _pad;							  /* keep 32B aligned */
 } ClusterPcmOwnEntry;
 
 StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 32, "ClusterPcmOwnEntry must remain 32 bytes");
@@ -136,13 +136,15 @@ extern ClusterPcmOwnResult cluster_pcm_own_revoke_commit_exact(int buf_id,
 /* X-only combined linearization: clear the exact GRANT_PENDING lifecycle,
  * bump its ownership generation, and publish the writer activation fence
  * before the caller releases the BufferDesc header lock. */
-extern ClusterPcmOwnResult cluster_pcm_own_writer_grant_commit_exact(
-	int buf_id, uint64 expected_generation, uint64 reservation_token,
-	uint64 *out_committed_generation);
+extern ClusterPcmOwnResult
+cluster_pcm_own_writer_grant_commit_exact(int buf_id, uint64 expected_generation,
+										  uint64 reservation_token,
+										  uint64 *out_committed_generation);
 /* Clear only the exact committed generation/token after content-EXCLUSIVE
  * activation proof or after exact queue-claim cleanup. */
-extern ClusterPcmOwnResult cluster_pcm_own_writer_activation_clear_exact(
-	int buf_id, uint64 expected_generation, uint64 reservation_token);
+extern ClusterPcmOwnResult cluster_pcm_own_writer_activation_clear_exact(int buf_id,
+																		 uint64 expected_generation,
+																		 uint64 reservation_token);
 /* PCM-X retained-image revoke: commit advances the ownership generation but
  * deliberately leaves the exact REVOKING token live until DRAIN proves the
  * immutable image record is no longer needed.  Release clears only that

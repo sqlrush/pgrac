@@ -407,7 +407,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 			drive_terminal_interlock_tag->active_slot_generation = 0;
 			drive_terminal_interlock_tag->queue_state_sequence++;
 			(void)pg_atomic_fetch_and_u32(&drive_terminal_interlock_tag->queued_node_bitmap,
-										 ~node_bit);
+										  ~node_bit);
 			drive_terminal_interlock_ticket->next_index = PCM_X_INVALID_SLOT_INDEX;
 			drive_terminal_interlock_ticket->prev_index = PCM_X_INVALID_SLOT_INDEX;
 			drive_terminal_interlock_ticket->reliable.retry_deadline_ms = 0;
@@ -3949,10 +3949,10 @@ UT_TEST(test_local_queue_invalidate_authority_is_exact_and_read_only)
 				 PCM_X_QUEUE_STALE);
 	/* An in-flight nonempty set still needs its exact ACK/graph proof. */
 	blocker = make_blocker(holder_key.identity.node_id, holder_key.identity.procno,
-							  holder_key.identity.request_id);
-	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
-					 &probe_ref, 1, master_session, &holder_snapshot, &holder, 1,
-					 &blocker, 1, &blocker_snapshot),
+						   holder_key.identity.request_id);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
+																&holder_snapshot, &holder, 1,
+																&blocker, 1, &blocker_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_queue_invalidate_authorize_exact(
 					 &probe_ref.identity.tag, probe_ref.identity.cluster_epoch,
@@ -6564,34 +6564,33 @@ UT_TEST(test_master_invalidate_busy_backs_off_exact_revoke_ticket)
 	admit_active_probe(814, 0, 24, UINT64_C(8484), requester_session, 1, &admission);
 	arm_blocker_probe(&admission.ref, 2, source_session);
 	blocker_commit = make_blocker_header(&admission.ref, 1, NULL, 0);
-	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_begin_exact(&blocker_commit, 2,
-													 source_session),
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_begin_exact(&blocker_commit, 2, source_session),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(
-					 &blocker_commit, 2, source_session, NULL, 0, &blocker_snapshot),
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_stage_commit_exact(&blocker_commit, 2, source_session,
+																 NULL, 0, &blocker_snapshot),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_graph_commit_exact(
-					 &blocker_snapshot, NULL, 0, graph_generation),
+	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_graph_commit_exact(&blocker_snapshot, NULL, 0,
+																 graph_generation),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_blocker_probe_complete_exact(&admission.ref, 1, 2,
-														 source_session),
-				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_begin_transfer_exact(&admission.ref, graph_generation,
-														  &transfer),
-				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_blocker_probe_complete_exact(&admission.ref, 1, 2, source_session),
+		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_master_begin_transfer_exact(&admission.ref, graph_generation, &transfer),
+		PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_master_revoke_arm_exact(&transfer, 2, source_session, &revoke),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_drive_snapshot_exact(
-					 &transfer.identity.tag, transfer.identity.cluster_epoch, &armed),
+	UT_ASSERT_EQ(cluster_pcm_x_master_drive_snapshot_exact(&transfer.identity.tag,
+														   transfer.identity.cluster_epoch, &armed),
 				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_master_drive_bitmap_replace_exact(
-					 &armed, source_bit | busy_bit, source_bit, &waiting),
+	UT_ASSERT_EQ(cluster_pcm_x_master_drive_bitmap_replace_exact(&armed, source_bit | busy_bit,
+																 source_bit, &waiting),
 				 PCM_X_QUEUE_OK);
 	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
 	before = *ticket;
 
-	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(
-					 &waiting, 3, UINT64_C(1000), UINT64_C(100), &backed_off),
+	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(&waiting, 3, UINT64_C(1000),
+																	UINT64_C(100), &backed_off),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(backed_off.retry_deadline_ms, UINT64_C(1100));
 	UT_ASSERT_EQ(backed_off.pending_s_holders_bitmap, source_bit | busy_bit);
@@ -6604,26 +6603,26 @@ UT_TEST(test_master_invalidate_busy_backs_off_exact_revoke_ticket)
 	/* The pre-BUSY snapshot is consumed exactly.  Replayed BUSY during the
 	 * same live window is an idempotent scheduling no-op. */
 	memset(&replay, 0xA5, sizeof(replay));
-	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(
-					 &waiting, 3, UINT64_C(1001), UINT64_C(100), &replay),
+	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(&waiting, 3, UINT64_C(1001),
+																	UINT64_C(100), &replay),
 				 PCM_X_QUEUE_STALE);
 	UT_ASSERT(memcmp(&replay, &(PcmXMasterDriveSnapshot){ 0 }, sizeof(replay)) == 0);
-	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(
-					 &backed_off, 3, UINT64_C(1099), UINT64_C(100), &replay),
+	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(&backed_off, 3, UINT64_C(1099),
+																	UINT64_C(100), &replay),
 				 PCM_X_QUEUE_DUPLICATE);
 	UT_ASSERT_EQ(replay.retry_deadline_ms, UINT64_C(1100));
 	UT_ASSERT_EQ(ticket->reliable.retry_deadline_ms, UINT64_C(1100));
 
 	/* The source already supplied the retained image and is ACKed; a BUSY
 	 * attributed to it cannot pause invalidation of another holder. */
-	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(
-					 &backed_off, 2, UINT64_C(1100), UINT64_C(100), &replay),
+	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(&backed_off, 2, UINT64_C(1100),
+																	UINT64_C(100), &replay),
 				 PCM_X_QUEUE_INVALID);
 	UT_ASSERT_EQ(ticket->reliable.retry_deadline_ms, UINT64_C(1100));
 
 	/* Expiry permits one new bounded window, still on the same identity. */
-	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(
-					 &backed_off, 3, UINT64_C(1100), UINT64_C(100), &replay),
+	UT_ASSERT_EQ(cluster_pcm_x_master_invalidate_busy_backoff_exact(&backed_off, 3, UINT64_C(1100),
+																	UINT64_C(100), &replay),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(replay.retry_deadline_ms, UINT64_C(1200));
 	UT_ASSERT(ticket_refs_equal(&replay.ref, &waiting.ref));
@@ -6656,8 +6655,8 @@ UT_TEST(test_master_commit_retry_loses_race_to_terminal_progress_without_fail_cl
 	for (mode = 0; mode < 2; mode++) {
 		init_active_pcm_x(UINT64_C(77));
 		header = ClusterPcmXConvertShmem;
-		admit_active_probe_with_base(816 + mode, 0, 22 + mode, UINT64_C(8383),
-									 requester_session, 1, UINT64_C(5), &admission);
+		admit_active_probe_with_base(816 + mode, 0, 22 + mode, UINT64_C(8383), requester_session, 1,
+									 UINT64_C(5), &admission);
 		drive_master_ticket_to_prepared(&admission, source_session, UINT64_C(9383), &transfer,
 										&image_id);
 		tag_slot = &master_tag_slots(header)[admission.tag_slot.slot_index];
@@ -6668,8 +6667,8 @@ UT_TEST(test_master_commit_retry_loses_race_to_terminal_progress_without_fail_cl
 		install_ready.image_id = image_id;
 		install_ready.result = PCM_X_QUEUE_OK;
 		install_ready.phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
-		UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(
-						 &install_ready, 0, 0, requester_session, &first_commit),
+		UT_ASSERT_EQ(cluster_pcm_x_master_install_ready_exact(&install_ready, 0, 0,
+															  requester_session, &first_commit),
 					 PCM_X_QUEUE_OK);
 		UT_ASSERT_EQ(cluster_pcm_x_master_drive_snapshot_exact(
 						 &transfer.identity.tag, transfer.identity.cluster_epoch, &armed),
@@ -6684,8 +6683,8 @@ UT_TEST(test_master_commit_retry_loses_race_to_terminal_progress_without_fail_cl
 		drive_terminal_interlock_armed = true;
 		memset(&retry_commit, 0xA5, sizeof(retry_commit));
 		memset(&retried, 0xA5, sizeof(retried));
-		UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_exact(
-						 &armed, UINT64_C(1000), UINT64_C(1100), &retry_commit, &retried),
+		UT_ASSERT_EQ(cluster_pcm_x_master_commit_retry_exact(&armed, UINT64_C(1000), UINT64_C(1100),
+															 &retry_commit, &retried),
 					 mode == 0 ? PCM_X_QUEUE_NOT_READY : PCM_X_QUEUE_STALE);
 		UT_ASSERT(!drive_terminal_interlock_armed);
 		UT_ASSERT(memcmp(&retry_commit, &(PcmXPhasePayload){ 0 }, sizeof(retry_commit)) == 0);
@@ -8096,8 +8095,8 @@ UT_TEST(test_master_debug_iterators_report_live_slots)
 	init_active_pcm_x(UINT64_C(78));
 	local_identity = make_wait_identity(717, 0, 26, UINT64_C(21002));
 	bind_local_master(1, local_identity.cluster_epoch, UINT64_C(4501));
-	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&local_identity, 1, UINT64_C(4501),
-											   &local_leader), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&local_identity, 1, UINT64_C(4501), &local_leader),
+				 PCM_X_QUEUE_OK);
 	cursor = 0;
 	UT_ASSERT(cluster_pcm_x_local_tag_debug_next(&cursor, &index, line, sizeof(line)));
 	UT_ASSERT(strstr(line, "blocker_gen=") != NULL);
@@ -10260,7 +10259,7 @@ UT_TEST(test_local_tag_only_holder_transfer_persists_until_exact_drain)
 	/* Complete generation 1 normally.  The separate gate-contention test below
 	 * covers an ACK frame that is delivered but cannot apply before REVOKE. */
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref, blocker_snapshot.set_generation,
-												   1, master_session),
+													   1, master_session),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref, blocker_snapshot.set_generation,
 													   1, master_session),
@@ -10272,11 +10271,11 @@ UT_TEST(test_local_tag_only_holder_transfer_persists_until_exact_drain)
 	 * empty replay instead of waiting forever for an ACK the master no longer
 	 * needs to send. */
 	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(&probe_ref, 1, master_session,
-															 NULL, 0, &holder_snapshot),
+																 NULL, 0, &holder_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
-															&holder_snapshot, NULL, 0, NULL, 0,
-															&blocker_snapshot),
+																&holder_snapshot, NULL, 0, NULL, 0,
+																&blocker_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(blocker_snapshot.set_generation, 2);
 	/* The exact blocker ACK tombstone is durable evidence, but it cannot
@@ -10309,8 +10308,7 @@ UT_TEST(test_local_tag_only_holder_transfer_persists_until_exact_drain)
 	tag_slot = &local_tag_slots(header)[holder_snapshot.tag_slot.slot_index];
 	state_flags = pg_atomic_read_u32(&tag_slot->slot.state_flags);
 	pg_atomic_write_u32(&tag_slot->slot.state_flags,
-						state_flags
-							| (PCM_X_LOCAL_TAG_F_ADMISSION_GATE << PCM_X_SLOT_FLAGS_SHIFT));
+						state_flags | (PCM_X_LOCAL_TAG_F_ADMISSION_GATE << PCM_X_SLOT_FLAGS_SHIFT));
 	ready_refusal = PCM_X_LOCAL_IMAGE_READY_REFUSAL_NONE;
 	UT_ASSERT_EQ(cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
 					 &ready, 1, master_session, &replay, &ready_refusal),
@@ -10325,10 +10323,9 @@ UT_TEST(test_local_tag_only_holder_transfer_persists_until_exact_drain)
 	UT_ASSERT_EQ(ready_refusal, PCM_X_LOCAL_IMAGE_READY_REFUSAL_ACTIVE_HOLDER);
 	tag_slot->active_holder_head_index = PCM_X_INVALID_SLOT_INDEX;
 	ready_refusal = PCM_X_LOCAL_IMAGE_READY_REFUSAL_ACTIVE_HOLDER;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
-			&ready, 1, master_session, &replay, &ready_refusal),
-		PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
+					 &ready, 1, master_session, &replay, &ready_refusal),
+				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(ready_refusal, PCM_X_LOCAL_IMAGE_READY_REFUSAL_NONE);
 	UT_ASSERT(memcmp(&ready, &replay, sizeof(ready)) == 0);
 	memset(&replay, 0, sizeof(replay));
@@ -10454,7 +10451,7 @@ UT_TEST(test_local_non_source_blocker_participant_drains_and_retires_exactly)
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(holder_snapshot.holder_count, 2);
 	blocker = make_blocker(holder_keys[0].identity.node_id, holder_keys[0].identity.procno,
-							  holder_keys[0].identity.request_id);
+						   holder_keys[0].identity.request_id);
 	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
 																&holder_snapshot, holder_copies, 2,
 																&blocker, 1, &blocker_snapshot),
@@ -10486,9 +10483,9 @@ UT_TEST(test_local_non_source_blocker_participant_drains_and_retires_exactly)
 					 &probe_ref, 1, master_session, holder_copies, 2, &holder_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(holder_snapshot.holder_count, 0);
-	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
-					 &probe_ref, 1, master_session, &holder_snapshot, NULL, 0, NULL, 0,
-					 &blocker_snapshot),
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
+																&holder_snapshot, NULL, 0, NULL, 0,
+																&blocker_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(blocker_snapshot.set_generation, 2);
 	UT_ASSERT_EQ(tag_slot->blocker_snapshot_count, 0);
@@ -13141,14 +13138,14 @@ UT_TEST(test_local_blocker_snapshot_replays_exact_holder_set_and_gates_revoke)
 		cluster_pcm_x_local_blocker_snapshot_copy_exact(&blocker_snapshot, &header, &edge, 1),
 		PCM_X_QUEUE_NOT_READY);
 	/* A later nonempty generation never qualifies for the replay exception. */
-	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
-					 &probe_ref, 1, master_session, &holder_copy, 1, &holder_snapshot),
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(&probe_ref, 1, master_session,
+																 &holder_copy, 1, &holder_snapshot),
 				 PCM_X_QUEUE_OK);
 	blocker = make_blocker(holder_key.identity.node_id, holder_key.identity.procno,
-							  holder_key.identity.request_id);
-	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
-					 &probe_ref, 1, master_session, &holder_snapshot, &holder_copy, 1, &blocker, 1,
-					 &blocker_snapshot),
+						   holder_key.identity.request_id);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
+																&holder_snapshot, &holder_copy, 1,
+																&blocker, 1, &blocker_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(blocker_snapshot.set_generation, 2);
 	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
@@ -13178,16 +13175,16 @@ UT_TEST(test_local_first_blocker_ack_busy_then_exact_revoke_consumes_empty_commi
 	UT_ASSERT_EQ(register_active_local_holder(&holder_key, &holder), PCM_X_QUEUE_OK);
 	bind_local_master(1, holder_key.identity.cluster_epoch, master_session);
 	UT_ASSERT_EQ(cluster_pcm_x_local_holder_snapshot(&holder_key.identity.tag, &holder_copy, 1,
-												 &holder_snapshot),
+													 &holder_snapshot),
 				 PCM_X_QUEUE_OK);
 
 	memset(&probe_ref, 0, sizeof(probe_ref));
 	probe_ref.identity = make_wait_identity(7091, 2, 2, UINT64_C(70312));
 	probe_ref.handle.ticket_id = UINT64_C(90111);
 	probe_ref.handle.queue_generation = UINT64_C(11);
-	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
-					 &probe_ref, 1, master_session, &holder_snapshot, &holder_copy, 1, NULL, 0,
-					 &blocker_snapshot),
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(&probe_ref, 1, master_session,
+																&holder_snapshot, &holder_copy, 1,
+																NULL, 0, &blocker_snapshot),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(blocker_snapshot.set_generation, 1);
 	UT_ASSERT_EQ(blocker_snapshot.blocker_count, 0);
@@ -13199,9 +13196,8 @@ UT_TEST(test_local_first_blocker_ack_busy_then_exact_revoke_consumes_empty_commi
 	state_flags = pg_atomic_read_u32(&tag_slot->slot.state_flags);
 	pg_atomic_write_u32(&tag_slot->slot.state_flags,
 						state_flags | (PCM_X_LOCAL_TAG_F_ADMISSION_GATE << PCM_X_SLOT_FLAGS_SHIFT));
-	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref,
-													   blocker_snapshot.set_generation, 1,
-													   master_session),
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref, blocker_snapshot.set_generation,
+													   1, master_session),
 				 PCM_X_QUEUE_BUSY);
 	pg_atomic_write_u32(&tag_slot->slot.state_flags, state_flags);
 
@@ -16150,8 +16146,8 @@ UT_TEST(test_requester_wait_preserves_late_revoke_barrier_refusal)
 	/* A type-49 barrier that freezes after initial admission but before the
 	 * next WaitLatch must escape as BARRIER_CLOSED.  Sleeping here would keep
 	 * the source holder registered and deadlock IMAGE_READY forever. */
-	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(
-					 requester_wait_revalidate_result, requester_wait_block, &capture),
+	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(requester_wait_revalidate_result,
+														  requester_wait_block, &capture),
 				 PCM_X_QUEUE_BARRIER_CLOSED);
 	UT_ASSERT_EQ(capture.revalidate_calls, 1);
 	UT_ASSERT_EQ(capture.wait_calls, 0);
@@ -16160,8 +16156,8 @@ UT_TEST(test_requester_wait_preserves_late_revoke_barrier_refusal)
 
 	/* An exact OK proof still linearizes the count before the physical wait. */
 	capture.revalidate_ok = true;
-	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(
-					 requester_wait_revalidate_result, requester_wait_block, &capture),
+	UT_ASSERT_EQ(cluster_pcm_x_requester_wait_once_result(requester_wait_revalidate_result,
+														  requester_wait_block, &capture),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(capture.revalidate_calls, 2);
 	UT_ASSERT_EQ(capture.wait_calls, 1);
