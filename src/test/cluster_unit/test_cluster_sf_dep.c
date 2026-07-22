@@ -260,6 +260,77 @@ UT_TEST(test_pcm_x_capability_generation_snapshot_is_exact)
 	UT_ASSERT_EQ(generation, (uint32)0);
 }
 
+/* review P0-2: the family sample returns required-bit support, the optional
+ * bit and the record generation from one record read; a reconnect renote is
+ * visible as a generation move together with its bits. */
+UT_TEST(test_pcm_x_capability_family_sample_is_record_coherent)
+{
+	ClusterSfPeerCap cap;
+	uint32 generation = UINT32_MAX;
+	bool rebase = true;
+
+	memset(&cap, 0, sizeof(cap));
+	UT_ASSERT(!cluster_sf_peer_cap_family_sample(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+												 PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, &rebase,
+												 &generation));
+	UT_ASSERT(!rebase);
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	/* CONVERT without REBASE: supported, optional bit false. */
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, 7);
+	rebase = true;
+	UT_ASSERT(cluster_sf_peer_cap_family_sample(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+												PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, &rebase,
+												&generation));
+	UT_ASSERT(!rebase);
+	UT_ASSERT_EQ(generation, (uint32)7);
+
+	/* Reconnect renote with both bits: the generation moves with the bits. */
+	cluster_sf_peer_cap_note(
+		&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, 8);
+	UT_ASSERT(cluster_sf_peer_cap_family_sample(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+												PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, &rebase,
+												&generation));
+	UT_ASSERT(rebase);
+	UT_ASSERT_EQ(generation, (uint32)8);
+
+	/* REBASE alone never satisfies the family requirement. */
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, 9);
+	rebase = true;
+	UT_ASSERT(!cluster_sf_peer_cap_family_sample(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+												 PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, &rebase,
+												 &generation));
+	UT_ASSERT(!rebase);
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	/* Disconnect invalidation clears the whole family. */
+	cluster_sf_peer_cap_note(
+		&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, 10);
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, 10));
+	rebase = true;
+	UT_ASSERT(!cluster_sf_peer_cap_family_sample(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+												 PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, &rebase,
+												 &generation));
+	UT_ASSERT(!rebase);
+}
+
+UT_TEST(test_pcm_x_source_floor_capability_guard_is_generation_exact)
+{
+	ClusterSfPeerCap cap;
+	const uint32 family
+		= PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+
+	memset(&cap, 0, sizeof(cap));
+	cluster_sf_peer_cap_note(&cap, family, 41);
+	UT_ASSERT(cluster_sf_peer_cap_generation_matches_exact(
+		&cap, PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, 41));
+	UT_ASSERT(!cluster_sf_peer_cap_generation_matches_exact(
+		&cap, PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, 42));
+	cluster_sf_peer_cap_note(&cap, PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, 42);
+	UT_ASSERT(!cluster_sf_peer_cap_generation_matches_exact(
+		&cap, PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, 42));
+}
+
 int
 main(void)
 {
@@ -274,5 +345,7 @@ main(void)
 	UT_RUN(test_peer_cap_gen_renote_after_reconnect);
 	UT_RUN(test_pcm_x_capability_does_not_alias_idle_horizon);
 	UT_RUN(test_pcm_x_capability_generation_snapshot_is_exact);
+	UT_RUN(test_pcm_x_capability_family_sample_is_record_coherent);
+	UT_RUN(test_pcm_x_source_floor_capability_guard_is_generation_exact);
 	UT_DONE();
 }

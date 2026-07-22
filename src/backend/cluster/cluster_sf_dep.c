@@ -371,6 +371,109 @@ cluster_sf_peer_supports_pcm_x_convert(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0;
 }
 
+/* A' rebase: the V2 INSTALL_READY frame is legal on this connection only when
+ * its verified HELLO advertised the rebase protocol capability. */
+bool
+cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1) != 0;
+}
+
+bool
+cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id)
+{
+	uint32 capabilities;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
+	LWLockRelease(&ClusterSfDep->lock);
+	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1) != 0;
+}
+
+/* One lock-coherent sample for choosing the type-49 wire version.  CONVERT
+ * authenticates the PCM-X family; SOURCE_FLOOR and its connection generation
+ * are sampled from that same record so callers never pair bits across a
+ * reconnect. */
+bool
+cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
+										  uint32 *generation_out)
+{
+	bool supported;
+
+	if (source_floor_out != NULL)
+		*source_floor_out = false;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_family_sample(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+		PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, source_floor_out, generation_out);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
+/* Drain-side exact fence for a capability-bound LMS slot. */
+bool
+cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+											  uint32 expected_generation)
+{
+	bool matches;
+
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| required_capabilities == 0)
+		return false;
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	matches = cluster_sf_peer_cap_generation_matches_exact(
+		&ClusterSfDep->peer_capabilities[peer_id], required_capabilities, expected_generation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return matches;
+}
+
+/*
+ * cluster_sf_peer_pcm_x_capability_sample
+ *
+ * review P0-2: one lock-coherent sample of the PCM-X capability family on
+ * the peer's CURRENT connection.  True iff the verified HELLO advertised
+ * PCM_X_CONVERT; the REBASE bit and the capability-record generation come
+ * from the SAME locked read.  The formation collector samples this on both
+ * sides of its authority pass: a reconnect between the samples changes the
+ * generation and rejects the tick, so a stale connection's REBASE bit can
+ * never be bound to a fresh session/binding.
+ */
+bool
+cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out, uint32 *generation_out)
+{
+	bool supported;
+
+	if (rebase_out != NULL)
+		*rebase_out = false;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_family_sample(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1,
+		PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, rebase_out, generation_out);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
 /* Return one lock-coherent snapshot of the capability-record generation whose
  * verified HELLO advertised PCM-X.  Tier1 owns this record on CONTROL and can
  * sample it around another authority read to reject reconnect ABA; RDMA keeps

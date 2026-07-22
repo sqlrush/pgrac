@@ -184,6 +184,10 @@ extern ClusterVisVerdict cluster_vis_self_verdict(ClusterTTStatus status);
 extern ClusterVisVerdict cluster_vis_toast_verdict(ClusterTTStatus status);
 
 /* OBS-2 Update: xmin gate then xmax outcome. */
+extern bool cluster_vis_xmin_needs_resolution(uint16 infomask);
+
+/* P0-28: local GlobalVis is not a shared-storage pruning horizon. */
+extern bool cluster_vis_prune_must_defer(bool storage_mode, bool cluster_horizon_available);
 extern ClusterVisVerdict cluster_vis_update_xmin_verdict(ClusterTTStatus status);
 extern ClusterVisVerdict cluster_vis_update_xmax_verdict(ClusterTTStatus status, bool is_delete);
 

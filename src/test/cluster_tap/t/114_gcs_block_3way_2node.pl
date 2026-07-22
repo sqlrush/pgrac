@@ -17,9 +17,8 @@
 #	  L5   S barrier injection — DENIED_PENDING_X surfaces under
 #	       cluster-gcs-block-starvation-force-denied inject; reader
 #	       sees starvation_denied_pending_x_count tick
-#	  L6   53R92 ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED triggered
-#	       when reader exhausts cluster.gcs_block_starvation_max_retries
-#	       (set to 0 via runtime GUC so first inject denial → ereport)
+#	  L6   a zero legacy starvation budget cannot surface a client error;
+#	       one forced denial exact-aborts and re-enters with fresh identities
 #	  L7   53R91 ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT triggered
 #	       via cluster-gcs-block-invalidate-stall-ack inject (holder
 #	       never acks);  budget exhaustion → DENIED_INVALIDATE_TIMEOUT
@@ -161,7 +160,7 @@ SKIP:
 		"L5 starvation_denied_pending_x_count tick under inject "
 		. "(before=$r1, after=$r2)");
 
-	# L6: 53R92 budget exhaustion — set retries=0 so first deny errors.
+	# L6: the legacy zero budget cannot turn queue competition into ERROR.
 	$pair->node0->safe_psql('postgres',
 		'SET cluster.gcs_block_starvation_max_retries = 0');
 	$pair->inject_skip_set($pair->node0,
@@ -173,10 +172,8 @@ SKIP:
 		'cluster-gcs-block-starvation-force-denied', 0);
 	$pair->node0->safe_psql('postgres',
 		'RESET cluster.gcs_block_starvation_max_retries');
-	# Result may be PASS if the local backend's transition doesn't
-	# route through GCS (single-node ish) — keep cmp_ok permissive.
-	cmp_ok($rc, '>=', 0,
-		"L6 starvation retry exhaustion exit_code observed (rc=$rc)");
+	is($rc, 0, "L6 pending-X retry stays internal with legacy budget zero")
+		or diag("L6 stdout=[$stdout] stderr=[$stderr]");
 
 	# L7: 53R91 — invalidate ack timeout via stall inject (no X transfer
 	# attempted in 2-node-S baseline, so we just observe the inject is

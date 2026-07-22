@@ -30,8 +30,33 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/htup_details.h"
+
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_visibility_resolve.h"
+
+/*
+ * P0-27: VACUUM freeze is an authoritative xmin-committed proof.  Only the
+ * exact FROZEN bit pair bypasses old xmin identity resolution; a lone native
+ * COMMITTED or INVALID hint still follows cluster evidence and fails closed
+ * when that evidence is stale or ambiguous.
+ */
+bool
+cluster_vis_xmin_needs_resolution(uint16 infomask)
+{
+	return (infomask & HEAP_XMIN_FROZEN) != HEAP_XMIN_FROZEN;
+}
+
+/*
+ * P0-28: local GlobalVis/CLOG state cannot prove that no peer still names a
+ * shared-storage TID.  Reclamation is legal only after a cluster-wide
+ * non-removable horizon is available.
+ */
+bool
+cluster_vis_prune_must_defer(bool storage_mode, bool cluster_horizon_available)
+{
+	return storage_mode && !cluster_horizon_available;
+}
 
 /* ============================================================
  *	spec-3.14 §2.2 OBS truth tables (pure verdict functions).

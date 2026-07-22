@@ -104,6 +104,10 @@ static bool pcm_x_stats_depth_increment(PcmXShmemHeader *header);
 static bool pcm_x_stats_depth_decrement(PcmXShmemHeader *header);
 static bool pcm_x_master_terminal_leg_is_clear(const PcmXReliableLegState *leg);
 static bool pcm_x_master_blocker_stage_metadata_valid(const PcmXMasterTicketSlot *ticket);
+static bool pcm_x_transfer_leg_exact(const PcmXReliableLegState *leg, uint16 opcode,
+									 int32 responder_node, uint64 responder_session);
+static bool pcm_x_transfer_peer_exact(const PcmXMasterTicketSlot *ticket, int32 responder_node,
+									  uint64 responder_session);
 static void pcm_x_master_blocker_snapshot_clear(PcmXMasterBlockerSnapshot *snapshot);
 static bool pcm_x_ticket_ref_is_zero(const PcmXTicketRef *ref);
 static bool pcm_x_local_terminal_ref_valid(const PcmXTicketRef *ref);
@@ -561,7 +565,15 @@ typedef enum PcmXDirectoryMatch {
 } PcmXDirectoryMatch;
 
 
-static void pcm_x_runtime_fail_closed(void);
+static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line);
+static PcmXSlotHeader *pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref,
+										 const BufferTag *expected_tag, uint32 allowed_state_mask);
+static void pcm_x_local_gate_acquire_guarded(LWLock *lock, LWLockMode mode,
+											 PcmXLocalTagSlot *tag_slot);
+
+/* Capture each internal fail-closed arm (file:line) while keeping the many
+ * zero-argument call sites in this file textually unchanged. */
+#define pcm_x_runtime_fail_closed() pcm_x_runtime_fail_closed_impl(__FILE__, __LINE__)
 
 
 /* Required runtime precondition: never nest allocator under a tag domain. */
@@ -830,6 +842,7 @@ pcm_x_init_stats(PcmXStats *stats)
 	pg_atomic_init_u64(&stats->own_abort_count, 0);
 	pg_atomic_init_u64(&stats->own_busy_count, 0);
 	pg_atomic_init_u64(&stats->own_corrupt_count, 0);
+	pg_atomic_init_u64(&stats->barrier_unwind_count, 0);
 }
 
 
@@ -932,6 +945,7 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	snapshot_out->own_abort_count = pg_atomic_read_u64(&header->stats.own_abort_count);
 	snapshot_out->own_busy_count = pg_atomic_read_u64(&header->stats.own_busy_count);
 	snapshot_out->own_corrupt_count = pg_atomic_read_u64(&header->stats.own_corrupt_count);
+	snapshot_out->barrier_unwind_count = pg_atomic_read_u64(&header->stats.barrier_unwind_count);
 	snapshot_out->active_tags = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TAG].used;
 	snapshot_out->live_tickets = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
 	snapshot_out->local_retire_gate = (uint64)pg_atomic_read_u32(&header->local_retire_gate);
@@ -969,6 +983,35 @@ cluster_pcm_x_stats_note_wait(void)
 
 	if (header != NULL)
 		pcm_x_stats_increment(&header->stats.wait_count);
+}
+
+
+bool
+cluster_pcm_x_requester_wait_once(PcmXPreSleepRevalidateCallback revalidate, PcmXWaitCallback wait,
+								  void *callback_arg)
+{
+	if (revalidate == NULL || wait == NULL || !revalidate(callback_arg))
+		return false;
+	cluster_pcm_x_stats_note_wait();
+	wait(callback_arg);
+	return true;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_requester_wait_once_result(PcmXPreSleepResultCallback revalidate,
+										 PcmXWaitCallback wait, void *callback_arg)
+{
+	PcmXQueueResult result;
+
+	if (revalidate == NULL || wait == NULL)
+		return PCM_X_QUEUE_INVALID;
+	result = revalidate(callback_arg);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	cluster_pcm_x_stats_note_wait();
+	wait(callback_arg);
+	return PCM_X_QUEUE_OK;
 }
 
 
@@ -1045,8 +1088,20 @@ cluster_pcm_x_stats_note_own_corrupt(void)
 }
 
 
+/* t/400 L3 item 3: a BARRIER_CLOSED refusal consumed by a barrier-aware
+ * LockBuffer caller (unwound in place of a client ERROR). */
+void
+cluster_pcm_x_stats_note_barrier_unwind(void)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header != NULL)
+		pcm_x_stats_increment(&header->stats.barrier_unwind_count);
+}
+
+
 static void
-pcm_x_runtime_fail_closed(void)
+pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	bool transitioned;
@@ -1056,15 +1111,290 @@ pcm_x_runtime_fail_closed(void)
 	if (!transitioned)
 		transitioned = cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_SHUTTING_DOWN,
 														PCM_X_RUNTIME_RECOVERY_BLOCKED);
-	if (transitioned && header != NULL)
+	if (transitioned && header != NULL) {
+		const char *base;
+
+		/* Record the fusing arm.  Single writer: only the CAS winner above
+		 * reaches this block, and a second fuse requires a full reactivation
+		 * in between, so writes are serialized. */
+		base = strrchr(site_file, '/');
+		base = (base != NULL) ? base + 1 : site_file;
+		snprintf(header->fail_closed_site, sizeof(header->fail_closed_site), "%s:%d", base,
+				 site_line);
 		pcm_x_stats_increment(&header->stats.recovery_blocked_count);
+
+		/* At most one log line per ACTIVE generation (single CAS winner), so
+		 * this cannot flood.  Skip inside critical sections; the shmem site
+		 * above stays observable through pg_cluster_state either way. */
+		if (CritSectionCount == 0)
+			ereport(LOG,
+					(errmsg("cluster PCM-X runtime fail-closed (recovery blocked) at %s:%d", base,
+							site_line),
+					 errhint("Writer conversions on this node stay fail-closed until the PCM-X "
+							 "runtime is reformed.")));
+	}
 }
 
 
 void
-cluster_pcm_x_runtime_fail_closed(void)
+cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line)
 {
-	pcm_x_runtime_fail_closed();
+	pcm_x_runtime_fail_closed_impl(site_file, site_line);
+}
+
+
+bool
+cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (buf == NULL || buflen == 0)
+		return false;
+	buf[0] = '\0';
+	if (header == NULL || header->fail_closed_site[0] == '\0')
+		return false;
+	strlcpy(buf, header->fail_closed_site, Min(buflen, sizeof(header->fail_closed_site)));
+	return true;
+}
+
+
+/* Map an FIFO index to a printable value: PCM_X_INVALID_SLOT_INDEX -> -1. */
+static long
+pcm_x_debug_index(Size index)
+{
+	return index == PCM_X_INVALID_SLOT_INDEX ? -1L : (long)index;
+}
+
+
+/* Diagnostic iterator over live master tag slots.  Coherence contract: the
+ * candidate is identified by a racy pre-read, then revalidated and copied
+ * under the matching master partition shared lock (the same lock every
+ * in-place tag/ticket field mutation holds), so the printed combination is a
+ * state that actually existed.  Diagnostic surface only — never used for
+ * protocol decisions. */
+bool
+cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXMasterTagSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TAG, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXMasterTagSlot *raw = (PcmXMasterTagSlot *)pcm_x_allocator_slot(&view, i);
+		PcmXMasterTagSlot *locked;
+		PcmXSlotRef tag_ref;
+		BufferTag tag;
+		uint32 partition;
+
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
+			continue;
+		tag_ref.slot_index = i;
+		tag = raw->tag;
+		pg_read_barrier();
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+		locked = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref, &tag,
+														PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (locked == NULL) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->master_locks[partition].lock);
+		snprintf(buf, buflen,
+				 "rel=%u blk=%u head=%ld tail=%ld active=%ld queued=0x%x qseq=" UINT64_FORMAT
+				 " outstanding=%zu",
+				 copy.tag.relNumber, copy.tag.blockNum, pcm_x_debug_index(copy.head_index),
+				 pcm_x_debug_index(copy.tail_index), pcm_x_debug_index(copy.active_index),
+				 pg_atomic_read_u32(&copy.queued_node_bitmap), copy.queue_state_sequence,
+				 copy.outstanding_ticket_count);
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
+/* Diagnostic iterator over occupied master ticket slots; same partition-lock
+ * coherence contract as the tag iterator. */
+bool
+cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXMasterTicketSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXMasterTicketSlot *raw = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(&view, i);
+		PcmXMasterTicketSlot *locked;
+		PcmXSlotRef ticket_ref;
+		BufferTag tag;
+		uint32 partition;
+		uint32 state;
+
+		if (raw == NULL)
+			continue;
+		state = pcm_x_slot_state_read(&raw->slot);
+		if (state == PCM_XT_FREE || state == PCM_XT_RESERVED_NONVISIBLE)
+			continue;
+		if (!pcm_x_slot_generation_read(&raw->slot, &ticket_ref.slot_generation))
+			continue;
+		ticket_ref.slot_index = i;
+		tag = raw->ref.identity.tag;
+		pg_read_barrier();
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+		locked = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
+														   &tag, PCM_X_MASTER_TICKET_DOMAIN_STATES);
+		if (locked == NULL) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->master_locks[partition].lock);
+		snprintf(buf, buflen,
+				 "state=%u flags=0x%x node=%d ticket=" UINT64_FORMAT " grant=" UINT64_FORMAT
+				 " tomb=0x%llx involved=0x%x drained=0x%x retire_acked=0x%x pending_s=0x%x"
+				 " acked_s=0x%x leg_op=%u leg_phase=%u leg_flags=0x%x leg_retry=%u leg_node=%d"
+				 " leg_deadline=" UINT64_FORMAT,
+				 pcm_x_slot_state_read(&copy.slot), pcm_x_slot_flags_read(&copy.slot),
+				 copy.ref.identity.node_id, copy.ref.handle.ticket_id, copy.ref.grant_generation,
+				 (unsigned long long)copy.reliable.response_tombstone_mask,
+				 copy.involved_nodes_bitmap, copy.drained_nodes_bitmap,
+				 copy.retire_acked_nodes_bitmap, copy.pending_s_holders_bitmap,
+				 copy.acked_s_holders_bitmap, copy.reliable.pending_opcode, copy.reliable.phase,
+				 copy.reliable.flags, copy.reliable.retry_count,
+				 copy.reliable.expected_responder_node, copy.reliable.retry_deadline_ms);
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
+/* Diagnostic iterator over live local tag slots; partition-lock coherent copy
+ * like the master iterators, but under the local lock partition. */
+bool
+cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView view;
+	PcmXLocalTagSlot copy;
+	Size i;
+
+	if (header == NULL || cursor_io == NULL || index_out == NULL || buf == NULL || buflen == 0)
+		return false;
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view))
+		return false;
+	for (i = *cursor_io; i < view.capacity; i++) {
+		PcmXLocalTagSlot *raw = (PcmXLocalTagSlot *)pcm_x_allocator_slot(&view, i);
+		PcmXLocalTagSlot *locked;
+		PcmXSlotRef tag_ref;
+		BufferTag tag;
+		uint32 partition;
+
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
+			continue;
+		tag_ref.slot_index = i;
+		tag = raw->tag;
+		pg_read_barrier();
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		pcm_x_local_gate_acquire_guarded(&header->local_locks[partition].lock, LW_SHARED, NULL);
+		locked = (PcmXLocalTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_LOCAL_TAG, tag_ref, &tag,
+													   PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (locked == NULL) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		memcpy(&copy, locked, sizeof(copy));
+		LWLockRelease(&header->local_locks[partition].lock);
+		snprintf(buf, buflen,
+				 "rel=%u fork=%d blk=%u flags=0x%x round=%u master=%d ref_node=%d "
+				 "ref_ticket=" UINT64_FORMAT " ref_grant=" UINT64_FORMAT
+				 " holder_ticket=" UINT64_FORMAT " blocker_ticket=" UINT64_FORMAT
+				 " blocker_gen=" UINT64_FORMAT
+				 " blocker_op=%u blocker_phase=%u blocker_last=%u blocker_last_node=%u"
+				 " blocker_tomb=0x%llx blocker_count=%u blocker_head=%ld blocker_next=%u"
+				 " blocker_crc=%u drain_gen=" UINT64_FORMAT " holder_drain_gen=" UINT64_FORMAT
+				 " members=%zu head=%ld leader=%ld active_writer=%ld",
+				 copy.tag.relNumber, (int)copy.tag.forkNum, copy.tag.blockNum,
+				 pcm_x_slot_flags_read(&copy.slot), copy.local_round, copy.master_node,
+				 copy.ref.identity.node_id, copy.ref.handle.ticket_id, copy.ref.grant_generation,
+				 copy.holder_ref.handle.ticket_id, copy.blocker_snapshot_ref.handle.ticket_id,
+				 copy.blocker_set_generation, copy.blocker_snapshot_reliable.pending_opcode,
+				 copy.blocker_snapshot_reliable.phase,
+				 copy.blocker_snapshot_reliable.last_response_opcode,
+				 copy.blocker_snapshot_reliable.last_responder_node,
+				 (unsigned long long)copy.blocker_snapshot_reliable.response_tombstone_mask,
+				 copy.blocker_snapshot_count, pcm_x_debug_index(copy.blocker_snapshot_head_index),
+				 copy.blocker_snapshot_next_chunk, copy.blocker_snapshot_crc32c,
+				 copy.terminal_drain_generation, copy.holder_terminal_drain_generation,
+				 copy.membership_count, pcm_x_debug_index(copy.head_index),
+				 pcm_x_debug_index(copy.leader_index), pcm_x_debug_index(copy.active_writer_index));
+		*index_out = i;
+		*cursor_io = i + 1;
+		return true;
+	}
+	*cursor_io = view.capacity;
+	return false;
+}
+
+
+void
+cluster_pcm_x_terminal_note(uint32 op, uint32 result, uint64 ticket_id)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL)
+		return;
+	if (header->terminal_note_op == op && header->terminal_note_result == result
+		&& header->terminal_note_ticket == ticket_id)
+		header->terminal_note_count++;
+	else {
+		header->terminal_note_op = op;
+		header->terminal_note_result = result;
+		header->terminal_note_ticket = ticket_id;
+		header->terminal_note_count = 1;
+	}
+}
+
+
+bool
+cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
+								 uint32 *count_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL || header->terminal_note_count == 0)
+		return false;
+	if (op_out != NULL)
+		*op_out = header->terminal_note_op;
+	if (result_out != NULL)
+		*result_out = header->terminal_note_result;
+	if (ticket_out != NULL)
+		*ticket_out = header->terminal_note_ticket;
+	if (count_out != NULL)
+		*count_out = header->terminal_note_count;
+	return true;
 }
 
 
@@ -2291,6 +2621,7 @@ cluster_pcm_x_runtime_snapshot(void)
 	PcmXRuntimeSnapshot snapshot = { 0 };
 	uint32 gate1;
 	uint32 gate2;
+	uint32 rebase_wire_active;
 	uint32 state1;
 	uint64 session;
 
@@ -2308,6 +2639,7 @@ cluster_pcm_x_runtime_snapshot(void)
 
 	pg_read_barrier();
 	session = ClusterPcmXConvertShmem->master_session_incarnation;
+	rebase_wire_active = ClusterPcmXConvertShmem->rebase_wire_active;
 	pg_read_barrier();
 	gate2 = pg_atomic_read_u32(&ClusterPcmXConvertShmem->runtime_gate);
 	if (gate1 != gate2 || session == 0)
@@ -2315,7 +2647,17 @@ cluster_pcm_x_runtime_snapshot(void)
 
 	snapshot.state = PCM_X_RUNTIME_ACTIVE;
 	snapshot.master_session_incarnation = session;
+	snapshot.rebase_wire_active = rebase_wire_active != 0;
 	return snapshot;
+}
+
+
+void
+cluster_pcm_x_runtime_set_rebase_wire_active(bool active)
+{
+	if (ClusterPcmXConvertShmem == NULL)
+		return;
+	ClusterPcmXConvertShmem->rebase_wire_active = active ? 1 : 0;
 }
 
 
@@ -2702,6 +3044,17 @@ pcm_x_local_handle_clear(PcmXLocalHandle *handle)
 	memset(handle, 0, sizeof(*handle));
 	handle->tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
 	handle->membership_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
+}
+
+
+/* The exact commit proof runs against the effective grant base: the one-shot
+ * pre-reservation rebase when an interleaved revoke consumed the enqueue-time
+ * base on this node, the immutable identity base otherwise. */
+static inline uint64
+pcm_x_local_effective_grant_base(const PcmXLocalTagSlot *tag_slot)
+{
+	return tag_slot->grant_base_own_generation != 0 ? tag_slot->grant_base_own_generation
+													: tag_slot->ref.identity.base_own_generation;
 }
 
 
@@ -3346,6 +3699,7 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 	ticket->blocker_stage_source_node = -1;
 	ticket->blocker_set_source_node = -1;
 	ticket->involved_nodes_bitmap = node_bit;
+	ticket->grant_base_own_generation = 0;
 
 	if (new_tag) {
 		directory_result = pcm_x_directory_insert_locked(
@@ -4493,6 +4847,31 @@ pcm_x_master_drive_capture_locked(PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot
 }
 
 
+/* Revalidate a snapshot-token locator after crossing allocator -> master
+ * lock domains.  The exact ticket may have completed, retired, or been
+ * reclaimed in that gap.  Those monotone successors consume the old drive
+ * token; they are not evidence that the live queue is corrupt. */
+static PcmXQueueResult
+pcm_x_master_drive_expected_capture_locked(PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot *tag_slot,
+										   PcmXSlotRef tag_ref, PcmXMasterTicketSlot *ticket,
+										   PcmXSlotRef ticket_ref,
+										   const PcmXTicketRef *expected_ref,
+										   PcmXMasterDriveSnapshot *snapshot)
+{
+	uint32 state;
+
+	if (expected_ref == NULL || snapshot == NULL)
+		return PCM_X_QUEUE_CORRUPT;
+	if (ticket == NULL || !pcm_x_ticket_ref_equal(&ticket->ref, expected_ref))
+		return PCM_X_QUEUE_STALE;
+	state = pcm_x_slot_state_read(&ticket->slot);
+	if (state == PCM_XT_COMPLETE || state == PCM_XT_CANCELLED || state == PCM_XT_RETIRE_CREDIT)
+		return PCM_X_QUEUE_NOT_READY;
+	return pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
+											 snapshot);
+}
+
+
 static bool
 pcm_x_master_drive_snapshot_base_equal(const PcmXMasterDriveSnapshot *left,
 									   const PcmXMasterDriveSnapshot *right)
@@ -4585,6 +4964,214 @@ snapshot_done:
 
 
 PcmXQueueResult
+cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 next_retry_deadline_ms, PcmXPhasePayload *commit_out,
+										PcmXMasterDriveSnapshot *snapshot_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXMasterDriveSnapshot current;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+
+	if (commit_out != NULL)
+		memset(commit_out, 0, sizeof(*commit_out));
+	pcm_x_master_drive_snapshot_clear(snapshot_out);
+	if (header == NULL || expected == NULL || commit_out == NULL || snapshot_out == NULL
+		|| next_retry_deadline_ms <= now_ms || expected->ticket_state != PCM_XT_ACTIVE_TRANSFER
+		|| expected->pending_opcode != PGRAC_IC_MSG_PCM_X_COMMIT_X
+		|| expected->phase != PGRAC_IC_MSG_PCM_X_COMMIT_X || expected->reserved != 0
+		|| expected->expected_responder_node != expected->ref.identity.node_id
+		|| expected->expected_responder_session == 0
+		|| !pcm_x_wait_identity_valid(&expected->ref.identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(&expected->ref, &ticket_ref, &ticket);
+	if (result == PCM_X_QUEUE_OK) {
+		tag_ref.slot_index = ticket->tag_slot_index;
+		tag_ref.slot_generation = ticket->tag_slot_generation;
+	}
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&expected->ref.identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref,
+													  &expected->ref.identity.tag,
+													  PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
+													   &expected->ref.identity.tag,
+													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
+	if (result != PCM_X_QUEUE_OK)
+		goto retry_done;
+	if (!pcm_x_master_drive_snapshot_equal(&current, expected)) {
+		result = PCM_X_QUEUE_STALE;
+		goto retry_done;
+	}
+	if (!pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_COMMIT_X,
+								  ticket->ref.identity.node_id,
+								  ticket->reliable.expected_responder_session)
+		|| !pcm_x_transfer_peer_exact(ticket, ticket->ref.identity.node_id,
+									  ticket->reliable.expected_responder_session)) {
+		result = PCM_X_QUEUE_STALE;
+		goto retry_done;
+	}
+	if (ticket->reliable.retry_deadline_ms != 0 && now_ms < ticket->reliable.retry_deadline_ms) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto retry_done;
+	}
+
+	if (ticket->reliable.retry_count != PG_UINT32_MAX)
+		ticket->reliable.retry_count++;
+	ticket->reliable.retry_deadline_ms = next_retry_deadline_ms;
+	pg_write_barrier();
+	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
+											   snapshot_out);
+	if (result == PCM_X_QUEUE_OK) {
+		commit_out->ref = ticket->ref;
+		commit_out->phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	}
+
+retry_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result == PCM_X_QUEUE_CORRUPT)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_invalidate_busy_backoff_exact(const PcmXMasterDriveSnapshot *expected,
+												   int32 busy_node, uint64 now_ms,
+												   uint64 retry_delay_ms,
+												   PcmXMasterDriveSnapshot *snapshot_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXMasterDriveSnapshot current;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint64 next_retry_deadline_ms;
+	uint32 busy_bit;
+	uint32 partition;
+
+	pcm_x_master_drive_snapshot_clear(snapshot_out);
+	if (header == NULL || expected == NULL || snapshot_out == NULL || busy_node < 0
+		|| busy_node >= PCM_X_PROTOCOL_NODE_LIMIT || retry_delay_ms == 0 || now_ms == UINT64_MAX
+		|| expected->ticket_state != PCM_XT_ACTIVE_TRANSFER
+		|| expected->pending_opcode != PGRAC_IC_MSG_PCM_X_REVOKE
+		|| expected->phase != PGRAC_IC_MSG_PCM_X_REVOKE || expected->reserved != 0
+		|| expected->expected_responder_node < 0
+		|| expected->expected_responder_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| expected->expected_responder_session == 0
+		|| !pcm_x_wait_identity_valid(&expected->ref.identity))
+		return PCM_X_QUEUE_INVALID;
+	busy_bit = UINT32_C(1) << (uint32)busy_node;
+	if ((expected->pending_s_holders_bitmap & busy_bit) == 0
+		|| (expected->acked_s_holders_bitmap & busy_bit) != 0)
+		return PCM_X_QUEUE_INVALID;
+	next_retry_deadline_ms
+		= now_ms > UINT64_MAX - retry_delay_ms ? UINT64_MAX : now_ms + retry_delay_ms;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(&expected->ref, &ticket_ref, &ticket);
+	if (result == PCM_X_QUEUE_OK) {
+		tag_ref.slot_index = ticket->tag_slot_index;
+		tag_ref.slot_generation = ticket->tag_slot_generation;
+	}
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&expected->ref.identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref,
+													  &expected->ref.identity.tag,
+													  PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
+													   &expected->ref.identity.tag,
+													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
+	if (result != PCM_X_QUEUE_OK)
+		goto busy_done;
+	if (!pcm_x_master_drive_snapshot_equal(&current, expected)) {
+		result = PCM_X_QUEUE_STALE;
+		goto busy_done;
+	}
+	if (!pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_REVOKE,
+								  ticket->reliable.expected_responder_node,
+								  ticket->reliable.expected_responder_session)
+		|| !pcm_x_transfer_peer_exact(ticket, ticket->reliable.expected_responder_node,
+									  ticket->reliable.expected_responder_session)) {
+		result = PCM_X_QUEUE_STALE;
+		goto busy_done;
+	}
+	if (ticket->reliable.retry_deadline_ms != 0 && now_ms < ticket->reliable.retry_deadline_ms) {
+		*snapshot_out = current;
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto busy_done;
+	}
+
+	/* BUSY is only scheduling evidence.  Do not credit the holder, clear GRD,
+	 * change the reliable identity, or advance the retry-attempt counter. */
+	ticket->reliable.retry_deadline_ms = next_retry_deadline_ms;
+	pg_write_barrier();
+	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
+											   snapshot_out);
+
+busy_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result == PCM_X_QUEUE_CORRUPT)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_commit_retry_drive(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
+										uint64 retry_delay_ms, PcmXStageFrameCallback stage_frame,
+										void *callback_arg, PcmXMasterDriveSnapshot *snapshot_out)
+{
+	PcmXPhasePayload commit;
+	PcmXQueueResult result;
+	uint64 next_retry_deadline_ms;
+
+	pcm_x_master_drive_snapshot_clear(snapshot_out);
+	if (expected == NULL || stage_frame == NULL || snapshot_out == NULL || retry_delay_ms == 0
+		|| now_ms == UINT64_MAX)
+		return PCM_X_QUEUE_INVALID;
+	next_retry_deadline_ms
+		= now_ms > UINT64_MAX - retry_delay_ms ? UINT64_MAX : now_ms + retry_delay_ms;
+	result = cluster_pcm_x_master_commit_retry_exact(expected, now_ms, next_retry_deadline_ms,
+													 &commit, snapshot_out);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	return stage_frame(PGRAC_IC_MSG_PCM_X_COMMIT_X, commit.ref.identity.node_id, &commit,
+					   sizeof(commit), callback_arg)
+			   ? PCM_X_QUEUE_OK
+			   : PCM_X_QUEUE_BUSY;
+}
+
+
+PcmXQueueResult
 cluster_pcm_x_master_drive_bitmap_replace_exact(const PcmXMasterDriveSnapshot *expected,
 												uint32 pending_s_holders_bitmap,
 												uint32 acked_s_holders_bitmap,
@@ -4630,8 +5217,8 @@ cluster_pcm_x_master_drive_bitmap_replace_exact(const PcmXMasterDriveSnapshot *e
 	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TICKET, ticket_ref,
 													   &expected->ref.identity.tag,
 													   PCM_X_MASTER_TICKET_DOMAIN_STATES);
-	result = pcm_x_master_drive_capture_locked(runtime, tag_slot, tag_ref, ticket, ticket_ref,
-											   &current);
+	result = pcm_x_master_drive_expected_capture_locked(runtime, tag_slot, tag_ref, ticket,
+														ticket_ref, &expected->ref, &current);
 	if (result != PCM_X_QUEUE_OK)
 		goto replace_done;
 	*snapshot_out = current;
@@ -7067,9 +7654,13 @@ cluster_pcm_x_master_revoke_arm_exact(const PcmXTicketRef *ref, int32 responder_
 	else if (!pcm_x_transfer_leg_is_clear(&ticket->reliable)) {
 		if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_REVOKE, responder_node,
 									 responder_session)
-			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node)
+			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node) {
+			/* Diagnostic: the transfer driver re-arms this exact REVOKE leg on
+			 * every pass; count it so leg_retry exposes a live retry pump. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
-		else
+		} else
 			result = PCM_X_QUEUE_BUSY;
 	} else if (ticket->image.image_id != 0) {
 		result = ticket->reliable.last_response_opcode == PGRAC_IC_MSG_PCM_X_IMAGE_READY
@@ -7110,9 +7701,13 @@ cluster_pcm_x_master_revoke_arm_exact(const PcmXTicketRef *ref, int32 responder_
 	else if (!pcm_x_transfer_leg_is_clear(&ticket->reliable)) {
 		if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_REVOKE, responder_node,
 									 responder_session)
-			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node)
+			&& ticket->image.image_id != 0 && ticket->image.source_node == (uint32)responder_node) {
+			/* Diagnostic: the transfer driver re-arms this exact REVOKE leg on
+			 * every pass; count it so leg_retry exposes a live retry pump. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
-		else
+		} else
 			result = PCM_X_QUEUE_BUSY;
 	} else if (ticket->image.image_id != 0)
 		result = PCM_X_QUEUE_CORRUPT;
@@ -7221,10 +7816,21 @@ cluster_pcm_x_master_image_ready_exact(const PcmXGrantPayload *image_ready,
 }
 
 
+/* The exact commit proof runs against the effective grant base: the one-shot
+ * INSTALL_READY rebase when an interleaved revoke consumed the enqueue-time
+ * base on the requester node, the immutable identity base otherwise. */
+static inline uint64
+pcm_x_master_ticket_effective_grant_base(const PcmXMasterTicketSlot *ticket)
+{
+	return ticket->grant_base_own_generation != 0 ? ticket->grant_base_own_generation
+												  : ticket->ref.identity.base_own_generation;
+}
+
+
 PcmXQueueResult
 cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_ready,
-										 int32 authenticated_node, uint64 authenticated_session,
-										 PcmXPhasePayload *commit_out)
+										 uint64 rebased_own_generation, int32 authenticated_node,
+										 uint64 authenticated_session, PcmXPhasePayload *commit_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -7241,8 +7847,14 @@ cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_
 		|| install_ready->phase != PGRAC_IC_MSG_PCM_X_INSTALL_READY || install_ready->flags != 0
 		|| authenticated_node < 0 || authenticated_node >= PCM_X_PROTOCOL_NODE_LIMIT
 		|| authenticated_session == 0 || install_ready->ref.identity.node_id != authenticated_node
-		|| !pcm_x_wait_identity_valid(&install_ready->ref.identity))
+		|| !pcm_x_wait_identity_valid(&install_ready->ref.identity)
+		|| rebased_own_generation == UINT64_MAX)
 		return PCM_X_QUEUE_INVALID;
+	/* A nonzero rebase must name a strictly newer effective grant base than
+	 * the enqueue-time identity base it supersedes. */
+	if (rebased_own_generation != 0
+		&& rebased_own_generation <= install_ready->ref.identity.base_own_generation)
+		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
 		return PCM_X_QUEUE_NOT_READY;
@@ -7267,12 +7879,22 @@ cluster_pcm_x_master_install_ready_exact(const PcmXInstallReadyPayload *install_
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_COMMIT_X,
 									  authenticated_node, authenticated_session))
-		result = PCM_X_QUEUE_DUPLICATE;
-	else
+		/* Replay after COMMIT_X armed: the published grant base is frozen; a
+		 * different value is evidence divergence, never contention. */
+		result = ticket->grant_base_own_generation == rebased_own_generation ? PCM_X_QUEUE_DUPLICATE
+																			 : PCM_X_QUEUE_CORRUPT;
+	else {
 		result = pcm_x_transfer_leg_advance_locked(
 			ticket, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, authenticated_node, authenticated_session,
 			PGRAC_IC_MSG_PCM_X_INSTALL_READY, PGRAC_IC_MSG_PCM_X_COMMIT_X, authenticated_node,
 			authenticated_session);
+		if (result == PCM_X_QUEUE_OK && rebased_own_generation != 0) {
+			/* One-shot publish, atomic with arming COMMIT_X under this lock:
+			 * a committed COMMIT_X leg implies the grant base is persisted. */
+			ticket->grant_base_own_generation = rebased_own_generation;
+			pg_write_barrier();
+		}
+	}
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		commit_out->ref = ticket->ref;
 		commit_out->phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
@@ -7307,10 +7929,13 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 		|| final_ack->ref.identity.node_id != authenticated_node
 		|| !pcm_x_wait_identity_valid(&final_ack->ref.identity))
 		return PCM_X_QUEUE_INVALID;
+	/* Monotonic ingress floor only: the exact "+1" proof runs under the ticket
+	 * lock against the effective grant base, which a published INSTALL_READY
+	 * rebase may have moved past the enqueue-time identity base. */
 	if (!cluster_pcm_x_generation_next(final_ack->ref.identity.base_own_generation,
 									   &expected_generation))
 		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-	if (final_ack->committed_own_generation != expected_generation)
+	if (final_ack->committed_own_generation < expected_generation)
 		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
@@ -7335,6 +7960,11 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 		result = claim_result;
 	else if (ticket->image.image_id != final_ack->image_id
 			 || !pcm_x_image_token_valid(&ticket->image))
+		result = PCM_X_QUEUE_STALE;
+	else if (!cluster_pcm_x_generation_next(pcm_x_master_ticket_effective_grant_base(ticket),
+											&expected_generation)
+			 || final_ack->committed_own_generation != expected_generation)
+		/* FINAL_ACK proves exactly one ownership round under this grant. */
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK,
 									  authenticated_node, authenticated_session))
@@ -7389,10 +8019,12 @@ cluster_pcm_x_master_final_ack_finalize_exact(const PcmXMasterFinalAckToken *tok
 		|| !pcm_x_image_token_valid(&token->image)
 		|| token->image.image_id != token->final_ack.image_id)
 		return PCM_X_QUEUE_INVALID;
+	/* Monotonic floor only; the exact "+1" proof re-runs under the ticket lock
+	 * against the effective grant base. */
 	if (!cluster_pcm_x_generation_next(token->final_ack.ref.identity.base_own_generation,
 									   &expected_generation))
 		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-	if (token->final_ack.committed_own_generation != expected_generation)
+	if (token->final_ack.committed_own_generation < expected_generation)
 		return PCM_X_QUEUE_STALE;
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0
@@ -7422,6 +8054,10 @@ cluster_pcm_x_master_final_ack_finalize_exact(const PcmXMasterFinalAckToken *tok
 			 || ticket->image.image_id != token->final_ack.image_id
 			 || !pcm_x_transfer_peer_exact(ticket, token->authenticated_node,
 										   token->authenticated_session))
+		result = PCM_X_QUEUE_STALE;
+	else if (!cluster_pcm_x_generation_next(pcm_x_master_ticket_effective_grant_base(ticket),
+											&expected_generation)
+			 || token->final_ack.committed_own_generation != expected_generation)
 		result = PCM_X_QUEUE_STALE;
 	else if (pcm_x_transfer_leg_exact(&ticket->reliable, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK,
 									  token->authenticated_node, token->authenticated_session)) {
@@ -8548,6 +9184,11 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 				= kind == PCM_X_TERMINAL_LEG_DRAIN ? ticket->drain_generation : 0;
 			token_out->expected_responder_node = responder_node;
 			token_out->kind = (uint16)kind;
+			/* Diagnostic: an exact re-arm is the retry pump re-staging this
+			 * leg.  The count reaches the per-slot dump as leg_retry, so a
+			 * frozen wedge separates a dead pump from a refusing responder. */
+			if (ticket->reliable.retry_count != PG_UINT32_MAX)
+				ticket->reliable.retry_count++;
 			result = PCM_X_QUEUE_DUPLICATE;
 		} else
 			result = PCM_X_QUEUE_BUSY;
@@ -8816,6 +9457,17 @@ cluster_pcm_x_master_retire_ack_resolve_exact(const PcmXRetirePayload *ack,
 PcmXQueueResult
 cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out)
 {
+	return cluster_pcm_x_master_terminal_work_next_after(0, ref_out);
+}
+
+
+/* Floor-scoped scan for the retry driver's fairness loop: the oldest ticket
+ * keeps frontier priority, but its stuck RETIRE preflight may be waiting for
+ * a younger ticket's DRAIN evidence (cross-lane holder interlock), so the
+ * driver walks every terminal ticket in ticket-id order per pass. */
+PcmXQueueResult
+cluster_pcm_x_master_terminal_work_next_after(uint64 after_ticket_id, PcmXTicketRef *ref_out)
+{
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
 	PcmXAllocatorView view;
@@ -8890,7 +9542,8 @@ cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out)
 				break;
 			continue;
 		}
-		if (ticket->ref.handle.ticket_id < best_ticket_id) {
+		if (ticket->ref.handle.ticket_id > after_ticket_id
+			&& ticket->ref.handle.ticket_id < best_ticket_id) {
 			best_ticket_id = ticket->ref.handle.ticket_id;
 			*ref_out = ticket->ref;
 		}
@@ -9722,8 +10375,10 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	tag_slot->closed_round_member_count = 0;
 	tag_slot->terminal_drain_generation = 0;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
+	tag_slot->holder_required_page_scn = 0;
 	memset(&tag_slot->holder_reliable, 0, sizeof(tag_slot->holder_reliable));
 	tag_slot->holder_terminal_drain_generation = 0;
 	memset(&tag_slot->blocker_snapshot_ref, 0, sizeof(tag_slot->blocker_snapshot_ref));
@@ -9880,7 +10535,7 @@ pcm_x_local_writer_holder_authority_check(const PcmXLocalHolderKey *key,
 		|| tag_slot->ref.grant_generation == 0
 		|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity, &leader->identity)
 		|| tag_slot->committed_own_generation == 0
-		|| !cluster_pcm_x_generation_next(leader->identity.base_own_generation,
+		|| !cluster_pcm_x_generation_next(pcm_x_local_effective_grant_base(tag_slot),
 										  &expected_generation)
 		|| tag_slot->committed_own_generation != expected_generation)
 		return PCM_X_QUEUE_CORRUPT;
@@ -10592,6 +11247,7 @@ pcm_x_local_holder_detach_exact(const PcmXLocalHolderHandle *handle, uint32 allo
 			  && pcm_x_ticket_ref_is_zero(&tag_slot->blocker_snapshot_ref)
 			  && pcm_x_transfer_leg_is_clear(&tag_slot->reliable)
 			  && pcm_x_image_token_equal(&tag_slot->holder_image, &zero_image)
+			  && tag_slot->holder_required_page_scn == 0
 			  && pcm_x_transfer_leg_is_pristine(&tag_slot->holder_reliable)
 			  && tag_slot->holder_terminal_drain_generation == 0
 			  && tag_slot->blocker_snapshot_head_index == PCM_X_INVALID_SLOT_INDEX
@@ -11475,6 +12131,23 @@ pcm_x_local_nested_wait_guard_tag(const BufferTag *tag)
 }
 
 
+/* This backend's most recent nested-guard refusal: the held content-lock tag
+ * that closed the guard and the refusing result.  Diagnostic only. */
+static BufferTag pcm_x_nested_guard_block_tag;
+static int pcm_x_nested_guard_block_result = PCM_X_QUEUE_OK;
+
+bool
+cluster_pcm_x_nested_wait_guard_last_block(BufferTag *tag_out, int *result_out)
+{
+	if (pcm_x_nested_guard_block_result == PCM_X_QUEUE_OK)
+		return false;
+	if (tag_out != NULL)
+		*tag_out = pcm_x_nested_guard_block_tag;
+	if (result_out != NULL)
+		*result_out = pcm_x_nested_guard_block_result;
+	return true;
+}
+
 PcmXQueueResult
 cluster_pcm_x_nested_wait_guard_before_block(void)
 {
@@ -11490,8 +12163,11 @@ cluster_pcm_x_nested_wait_guard_before_block(void)
 	}
 	for (i = 0; i < snapshot.count; i++) {
 		result = pcm_x_local_nested_wait_guard_tag(&snapshot.tags[i]);
-		if (result != PCM_X_QUEUE_OK)
+		if (result != PCM_X_QUEUE_OK) {
+			pcm_x_nested_guard_block_tag = snapshot.tags[i];
+			pcm_x_nested_guard_block_result = (int)result;
 			return result;
+		}
 	}
 	return PCM_X_QUEUE_OK;
 }
@@ -11816,6 +12492,27 @@ pcm_x_local_blocker_ack_tombstone_exact(const PcmXLocalTagSlot *tag_slot,
 				  == PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
 		   && tag_slot->blocker_snapshot_reliable.last_responder_node
 				  == (uint32)authenticated_master_node
+		   && tag_slot->blocker_snapshot_head_index == PCM_X_INVALID_SLOT_INDEX
+		   && tag_slot->blocker_snapshot_count == 0 && tag_slot->blocker_snapshot_crc32c == 0
+		   && tag_slot->blocker_snapshot_next_chunk == 0;
+}
+
+
+/* A same-ticket re-PROBE can stage a later empty generation after the master
+ * consumed an earlier ACK.  Keep this exception exact: only the authenticated
+ * master/session COMMIT, with a fully empty canonical payload, is eligible. */
+static bool
+pcm_x_local_empty_blocker_commit_exact(const PcmXLocalTagSlot *tag_slot,
+									   int32 authenticated_master_node,
+									   uint64 authenticated_master_session)
+{
+	return tag_slot != NULL && tag_slot->blocker_set_generation != 0
+		   && tag_slot->blocker_set_generation != UINT64_MAX
+		   && tag_slot->blocker_snapshot_reliable.state_sequence != 0
+		   && tag_slot->blocker_snapshot_reliable.response_tombstone_mask == 0
+		   && pcm_x_transfer_leg_exact(&tag_slot->blocker_snapshot_reliable,
+									   PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
+									   authenticated_master_node, authenticated_master_session)
 		   && tag_slot->blocker_snapshot_head_index == PCM_X_INVALID_SLOT_INDEX
 		   && tag_slot->blocker_snapshot_count == 0 && tag_slot->blocker_snapshot_crc32c == 0
 		   && tag_slot->blocker_snapshot_next_chunk == 0;
@@ -12376,9 +13073,10 @@ ack_done:
 
 
 PcmXQueueResult
-cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
-											  int32 authenticated_master_node,
-											  uint64 authenticated_master_session)
+cluster_pcm_x_local_holder_revoke_apply_floor_exact(const PcmXRevokePayload *revoke,
+													uint64 required_page_scn,
+													int32 authenticated_master_node,
+													uint64 authenticated_master_session)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -12451,7 +13149,8 @@ cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 	}
 	if (!pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)) {
 		if (!pcm_x_ticket_ref_equal(&tag_slot->holder_ref, &revoke->ref)
-			|| tag_slot->holder_image.image_id != revoke->image_id) {
+			|| tag_slot->holder_image.image_id != revoke->image_id
+			|| tag_slot->holder_required_page_scn != required_page_scn) {
 			result = PCM_X_QUEUE_STALE;
 			goto revoke_release_gate;
 		}
@@ -12469,10 +13168,9 @@ cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 		goto revoke_release_gate;
 	}
 	/* Type 49 is the fail-closed boundary that replaces the legacy type-48
-	 * unconditional ACK.  The same ticket locator's immutable blocker set must
-	 * have received an exact type-48 ACK and reclaimed every blocker slot before
-	 * holder revoke state can become visible.  A premature 49 is retryable; an
-	 * inconsistent tombstone is corruption. */
+	 * unconditional ACK.  The same ticket locator must carry either its exact
+	 * type-48 ACK tombstone or the narrowly authenticated empty re-PROBE replay
+	 * below.  A premature 49 is retryable; inconsistent evidence is corruption. */
 	if (pcm_x_ticket_ref_is_zero(&tag_slot->blocker_snapshot_ref)) {
 		result = PCM_X_QUEUE_NOT_READY;
 		goto revoke_release_gate;
@@ -12482,18 +13180,25 @@ cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 		goto revoke_release_gate;
 	}
 	if (!pcm_x_transfer_leg_is_clear(&tag_slot->blocker_snapshot_reliable)) {
-		result = PCM_X_QUEUE_NOT_READY;
-		goto revoke_release_gate;
-	}
-	if (tag_slot->blocker_set_generation == 0
-		|| tag_slot->blocker_snapshot_reliable.state_sequence == 0
-		|| tag_slot->blocker_snapshot_reliable.last_response_opcode
-			   != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
-		|| tag_slot->blocker_snapshot_reliable.last_responder_node
-			   != (uint32)authenticated_master_node
-		|| tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
-		|| tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
-		|| tag_slot->blocker_snapshot_next_chunk != 0) {
+		/* Authenticated exact REVOKE proves the master already crossed into
+		 * transfer after staging this generation's ACK on the same tag FIFO.  The
+		 * ACK handler can nevertheless observe a transient local admission gate and
+		 * leave the exact COMMIT armed.  Consume only that canonical empty set (for
+		 * the first or a replay generation), since no blocker edge can be omitted. */
+		if (!pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+													authenticated_master_session)) {
+			result = PCM_X_QUEUE_NOT_READY;
+			goto revoke_release_gate;
+		}
+	} else if (tag_slot->blocker_set_generation == 0
+			   || tag_slot->blocker_snapshot_reliable.state_sequence == 0
+			   || tag_slot->blocker_snapshot_reliable.last_response_opcode
+					  != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
+			   || tag_slot->blocker_snapshot_reliable.last_responder_node
+					  != (uint32)authenticated_master_node
+			   || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
+			   || tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
+			   || tag_slot->blocker_snapshot_next_chunk != 0) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto revoke_release_gate;
@@ -12507,6 +13212,7 @@ cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 	tag_slot->holder_ref = revoke->ref;
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	tag_slot->holder_image.image_id = revoke->image_id;
+	tag_slot->holder_required_page_scn = required_page_scn;
 	pcm_x_transfer_leg_clear(&tag_slot->holder_reliable, PGRAC_IC_MSG_PCM_X_REVOKE,
 							 authenticated_master_node);
 	memset(&tag_slot->blocker_snapshot_ref, 0, sizeof(tag_slot->blocker_snapshot_ref));
@@ -12538,6 +13244,16 @@ revoke_done:
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
 	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
+											  int32 authenticated_master_node,
+											  uint64 authenticated_master_session)
+{
+	return cluster_pcm_x_local_holder_revoke_apply_floor_exact(revoke, 0, authenticated_master_node,
+															   authenticated_master_session);
 }
 
 
@@ -12587,6 +13303,7 @@ cluster_pcm_x_local_holder_progress_exact(const BufferTag *tag,
 	} else {
 		progress_out->ref = tag_slot->holder_ref;
 		progress_out->image = tag_slot->holder_image;
+		progress_out->required_page_scn = tag_slot->holder_required_page_scn;
 		progress_out->reliable_state_sequence = tag_slot->holder_reliable.state_sequence;
 		progress_out->pending_opcode = tag_slot->holder_reliable.pending_opcode;
 		progress_out->last_response_opcode = tag_slot->holder_reliable.last_response_opcode;
@@ -12673,21 +13390,43 @@ cluster_pcm_x_local_queue_invalidate_authorize_exact(const BufferTag *tag, uint6
 				 || tag_slot->blocker_snapshot_ref.identity.request_id != request_id
 				 || tag_slot->blocker_snapshot_ref.identity.node_id != requester_node)
 			result = PCM_X_QUEUE_STALE;
-		else if (!pcm_x_transfer_leg_is_clear(&tag_slot->blocker_snapshot_reliable)
-				 || tag_slot->blocker_set_generation == 0)
+		else if (tag_slot->blocker_set_generation == 0)
 			result = PCM_X_QUEUE_NOT_READY;
-		else if (tag_slot->blocker_set_generation == UINT64_MAX
-				 || tag_slot->blocker_snapshot_reliable.state_sequence == 0
-				 || tag_slot->blocker_snapshot_reliable.last_response_opcode
-						!= PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
-				 || tag_slot->blocker_snapshot_reliable.last_responder_node
-						!= (uint32)authenticated_master_node
-				 || tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0
-				 || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
-				 || tag_slot->blocker_snapshot_count != 0 || tag_slot->blocker_snapshot_crc32c != 0
-				 || tag_slot->blocker_snapshot_next_chunk != 0
-				 || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
-				 || tag_slot->holder_terminal_drain_generation != 0) {
+		else if (tag_slot->blocker_set_generation == UINT64_MAX) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else if (!pcm_x_transfer_leg_is_clear(&tag_slot->blocker_snapshot_reliable)) {
+			/* An authenticated exact INVALIDATE proves the master already crossed
+			 * into transfer.  A reordered same-ticket re-PROBE may have published
+			 * another empty blocker COMMIT after the ACK that authorized that
+			 * transition.  No graph edge can be omitted in the empty set, so let
+			 * passive pinned S become N+PI instead of waiting forever for an ACK
+			 * the advanced master is no longer required to replay. */
+			if (!pcm_x_transfer_leg_exact(&tag_slot->blocker_snapshot_reliable,
+										  PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT,
+										  authenticated_master_node, authenticated_master_session)
+				|| tag_slot->blocker_snapshot_count != 0)
+				result = PCM_X_QUEUE_NOT_READY;
+			else if (!pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+															 authenticated_master_session)
+					 || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
+					 || tag_slot->holder_terminal_drain_generation != 0) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			} else
+				result = PCM_X_QUEUE_OK;
+		} else if (tag_slot->blocker_snapshot_reliable.state_sequence == 0
+				   || tag_slot->blocker_snapshot_reliable.last_response_opcode
+						  != PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK
+				   || tag_slot->blocker_snapshot_reliable.last_responder_node
+						  != (uint32)authenticated_master_node
+				   || tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0
+				   || tag_slot->blocker_snapshot_head_index != PCM_X_INVALID_SLOT_INDEX
+				   || tag_slot->blocker_snapshot_count != 0
+				   || tag_slot->blocker_snapshot_crc32c != 0
+				   || tag_slot->blocker_snapshot_next_chunk != 0
+				   || (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
+				   || tag_slot->holder_terminal_drain_generation != 0) {
 			result = PCM_X_QUEUE_CORRUPT;
 			fail_closed = true;
 		} else
@@ -12701,10 +13440,11 @@ cluster_pcm_x_local_queue_invalidate_authorize_exact(const BufferTag *tag, uint6
 
 
 PcmXQueueResult
-cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_ready,
-												 int32 authenticated_master_node,
-												 uint64 authenticated_master_session,
-												 PcmXGrantPayload *replay_out)
+cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(const PcmXGrantPayload *image_ready,
+														   int32 authenticated_master_node,
+														   uint64 authenticated_master_session,
+														   PcmXGrantPayload *replay_out,
+														   PcmXLocalImageReadyRefusal *refusal_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -12717,6 +13457,8 @@ cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_r
 	bool gate_claimed = false;
 	bool fail_closed = false;
 
+	if (refusal_out != NULL)
+		*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_NONE;
 	if (replay_out != NULL)
 		memset(replay_out, 0, sizeof(*replay_out));
 	if (header == NULL || image_ready == NULL || replay_out == NULL
@@ -12725,19 +13467,31 @@ cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_r
 		|| !pcm_x_image_token_valid(&image_ready->image)
 		|| !pcm_x_image_id_master_exact(image_ready->image.image_id, authenticated_master_node)
 		|| authenticated_master_node < 0 || authenticated_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
-		|| authenticated_master_session == 0)
+		|| authenticated_master_session == 0) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_INVALID;
 		return PCM_X_QUEUE_INVALID;
+	}
 	runtime = cluster_pcm_x_runtime_snapshot();
-	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_RUNTIME;
 		return PCM_X_QUEUE_NOT_READY;
+	}
 	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
 	directory_result = pcm_x_directory_find_locked(PCM_X_DIR_LOCAL_TAG,
 												   &image_ready->ref.identity.tag, &tag_ref);
 	LWLockRelease(&header->allocator_lock.lock);
-	if (directory_result == PCM_X_DIRECTORY_NOT_FOUND)
+	if (directory_result == PCM_X_DIRECTORY_NOT_FOUND) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_DIRECTORY;
 		return PCM_X_QUEUE_NOT_FOUND;
-	if (directory_result != PCM_X_DIRECTORY_OK)
+	}
+	if (directory_result != PCM_X_DIRECTORY_OK) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_DIRECTORY;
 		return pcm_x_queue_result_from_directory(directory_result);
+	}
 	partition
 		= cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&image_ready->ref.identity.tag));
 	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
@@ -12745,16 +13499,22 @@ cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_r
 													 &image_ready->ref.identity.tag,
 													 PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
 	if (tag_slot == NULL) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_TAG_SLOT;
 		result = PCM_X_QUEUE_STALE;
 		goto ready_done;
 	}
 	result = pcm_x_local_gate_try_acquire(tag_slot);
 	if (result != PCM_X_QUEUE_OK) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_LOCAL_GATE;
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto ready_done;
 	}
 	gate_claimed = true;
 	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_RUNTIME_RECHECK;
 		result = PCM_X_QUEUE_NOT_READY;
 		goto ready_release_gate;
 	}
@@ -12762,29 +13522,41 @@ cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_r
 												authenticated_master_session)
 		|| !pcm_x_ticket_ref_equal(&tag_slot->holder_ref, &image_ready->ref)
 		|| tag_slot->holder_image.image_id != image_ready->image.image_id) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_IDENTITY;
 		result = PCM_X_QUEUE_STALE;
 		goto ready_release_gate;
 	}
 	if (tag_slot->active_holder_head_index != PCM_X_INVALID_SLOT_INDEX) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_ACTIVE_HOLDER;
 		result = PCM_X_QUEUE_NOT_READY;
 		goto ready_release_gate;
 	}
 	if (!pcm_x_transfer_leg_is_clear(&tag_slot->holder_reliable)) {
 		if (!pcm_x_transfer_leg_exact(&tag_slot->holder_reliable, PGRAC_IC_MSG_PCM_X_IMAGE_READY,
 									  authenticated_master_node, authenticated_master_session)) {
+			if (refusal_out != NULL)
+				*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_RELIABLE_LEG;
 			result = PCM_X_QUEUE_BUSY;
 			goto ready_release_gate;
 		}
 		result = pcm_x_image_token_equal(&tag_slot->holder_image, &image_ready->image)
 					 ? PCM_X_QUEUE_DUPLICATE
 					 : PCM_X_QUEUE_STALE;
+		if (result == PCM_X_QUEUE_STALE && refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_IDENTITY;
 		goto ready_output;
 	}
 	if (tag_slot->holder_reliable.last_response_opcode != PGRAC_IC_MSG_PCM_X_REVOKE) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_BAD_PHASE;
 		result = PCM_X_QUEUE_BAD_STATE;
 		goto ready_release_gate;
 	}
 	if (!cluster_pcm_x_generation_next(tag_slot->holder_reliable.state_sequence, &next_sequence)) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_COUNTER;
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		fail_closed = true;
 		goto ready_release_gate;
@@ -12806,6 +13578,8 @@ ready_output:
 	}
 ready_release_gate:
 	if (gate_claimed && !fail_closed && !pcm_x_local_gate_release(tag_slot)) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_LOCAL_IMAGE_READY_REFUSAL_GATE_RELEASE;
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 	}
@@ -12814,6 +13588,17 @@ ready_done:
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
 	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_holder_image_ready_arm_exact(const PcmXGrantPayload *image_ready,
+												 int32 authenticated_master_node,
+												 uint64 authenticated_master_session,
+												 PcmXGrantPayload *replay_out)
+{
+	return cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
+		image_ready, authenticated_master_node, authenticated_master_session, replay_out, NULL);
 }
 
 
@@ -13462,6 +14247,7 @@ cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle, PcmXLocalProgr
 	progress_out->phase = tag_slot->reliable.phase;
 	progress_out->master_session_incarnation = tag_slot->master_session_incarnation;
 	progress_out->master_node = tag_slot->master_node;
+	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
 	result = PCM_X_QUEUE_OK;
 
 progress_done:
@@ -14085,7 +14871,7 @@ rekey_allocator_lookup_done:
 	}
 	memset(&zero_image, 0, sizeof(zero_image));
 	if (!pcm_x_image_token_equal(&tag_slot->image, &zero_image)
-		|| tag_slot->committed_own_generation != 0) {
+		|| tag_slot->committed_own_generation != 0 || tag_slot->grant_base_own_generation != 0) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto rekey_local_done;
@@ -14486,6 +15272,11 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 	claim_out->claim_generation = next_claim_generation;
 	claim_out->local_round = member->admitted_round;
 	claim_out->role = member->role;
+	/* A' rebase: every same-round claim inherits the published effective
+	 * grant base under this partition lock; zero (no rebase) keeps the
+	 * enqueue-time identity math.  Without this a FIFO follower would verify
+	 * the rebased X against its stale base+1 and fail closed. */
+	claim_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
 	result = PCM_X_QUEUE_OK;
 
 claim_release_gate:
@@ -15690,6 +16481,7 @@ cluster_pcm_x_local_prepare_grant_exact(const PcmXLocalHandle *leader,
 	tag_slot->ref = prepare->ref;
 	tag_slot->image = prepare->image;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 	tag_slot->reliable.last_responder_node = (uint32)authenticated_node;
 	tag_slot->reliable.last_response_opcode = PGRAC_IC_MSG_PCM_X_PREPARE_GRANT;
 	pg_write_barrier();
@@ -15743,10 +16535,12 @@ pcm_x_local_transfer_arm_exact(const PcmXLocalHandle *leader, uint16 opcode,
 		|| !pcm_x_wait_identity_valid(&leader->identity))
 		return PCM_X_QUEUE_INVALID;
 	if (opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
+		/* Monotonic floor only; the exact "+1" proof re-runs under the local
+		 * lock against the effective grant base. */
 		if (!cluster_pcm_x_generation_next(leader->identity.base_own_generation,
 										   &expected_generation))
 			return PCM_X_QUEUE_COUNTER_EXHAUSTED;
-		if (committed_own_generation != expected_generation)
+		if (committed_own_generation < expected_generation)
 			return PCM_X_QUEUE_STALE;
 	}
 	runtime = cluster_pcm_x_runtime_snapshot();
@@ -15816,6 +16610,19 @@ pcm_x_local_transfer_arm_exact(const PcmXLocalHandle *leader, uint16 opcode,
 		result = PCM_X_QUEUE_BAD_STATE;
 		goto arm_done;
 	}
+	if (opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
+		if (!cluster_pcm_x_generation_next(pcm_x_local_effective_grant_base(tag_slot),
+										   &expected_generation)) {
+			result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
+			fail_closed = true;
+			goto arm_done;
+		}
+		/* FINAL_ACK proves exactly one ownership round under this grant. */
+		if (committed_own_generation != expected_generation) {
+			result = PCM_X_QUEUE_STALE;
+			goto arm_done;
+		}
+	}
 	if (!cluster_pcm_x_generation_next(tag_slot->reliable.state_sequence, &next_sequence)) {
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		fail_closed = true;
@@ -15844,6 +16651,7 @@ arm_output:
 			install_ready_out->image_id = tag_slot->image.image_id;
 			install_ready_out->result = PCM_X_QUEUE_OK;
 			install_ready_out->phase = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+			install_ready_out->rebased_own_generation = tag_slot->grant_base_own_generation;
 		} else {
 			final_ack_out->ref = tag_slot->ref;
 			final_ack_out->image_id = tag_slot->image.image_id;
@@ -15853,6 +16661,80 @@ arm_output:
 	}
 
 arm_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * One-shot pre-reservation publication of the effective grant base for a
+ * prepared transfer whose enqueue-time base was consumed by an interleaved
+ * revoke.  Runs strictly between PREPARE_GRANT apply and the INSTALL_READY
+ * arm: the reliable leg must be clear with PREPARE_GRANT as its last
+ * response.  A same-value replay is DUPLICATE; a different second value is
+ * evidence divergence and fails the runtime closed.  The immutable identity
+ * (directory key) is never touched.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_grant_rebase_publish_exact(const PcmXLocalHandle *leader,
+											   uint64 rebased_own_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || rebased_own_generation == 0
+		|| rebased_own_generation == UINT64_MAX || !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	if (rebased_own_generation <= leader->identity.base_own_generation)
+		return PCM_X_QUEUE_STALE;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_transfer_slots_exact(leader, tag_ref, member_ref, &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto rebase_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto rebase_done;
+	}
+	/* Only a prepared, not-yet-armed transfer may move its grant base. */
+	if (tag_slot->ref.grant_generation == 0 || !pcm_x_image_token_valid(&tag_slot->image)
+		|| pcm_x_slot_state_read(&member->slot) != PCM_XL_REMOTE_WAIT
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode != PGRAC_IC_MSG_PCM_X_PREPARE_GRANT) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation == rebased_own_generation) {
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto rebase_done;
+	}
+	tag_slot->grant_base_own_generation = rebased_own_generation;
+	pg_write_barrier();
+	result = PCM_X_QUEUE_OK;
+
+rebase_done:
 	LWLockRelease(&header->local_locks[partition].lock);
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
@@ -16280,6 +17162,7 @@ pcm_x_local_holder_lane_retire_state(const PcmXLocalTagSlot *tag_slot, uint32 fl
 			|| tag_slot->blocker_snapshot_next_chunk != 0
 			|| !pcm_x_transfer_leg_is_pristine(&tag_slot->blocker_snapshot_reliable)
 			|| !pcm_x_image_token_equal(&tag_slot->holder_image, &zero_image)
+			|| tag_slot->holder_required_page_scn != 0
 			|| !pcm_x_transfer_leg_is_pristine(&tag_slot->holder_reliable)
 			|| holder_flags != PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
 			|| tag_slot->holder_terminal_drain_generation == 0
@@ -16295,6 +17178,7 @@ pcm_x_local_holder_lane_retire_state(const PcmXLocalTagSlot *tag_slot, uint32 fl
 			return PCM_X_QUEUE_NOT_READY;
 		if (holder_flags != 0 || tag_slot->holder_terminal_drain_generation != 0
 			|| !pcm_x_image_token_equal(&tag_slot->holder_image, &zero_image)
+			|| tag_slot->holder_required_page_scn != 0
 			|| !pcm_x_transfer_leg_is_pristine(&tag_slot->holder_reliable))
 			return PCM_X_QUEUE_CORRUPT;
 		return blocker_state;
@@ -16373,15 +17257,28 @@ pcm_x_local_same_ref_dual_retire_state(const PcmXLocalTagSlot *tag_slot, uint32 
 	source_holder = !pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref);
 	external_ref = source_holder ? &tag_slot->holder_ref : &tag_slot->blocker_snapshot_ref;
 	memset(&zero_image, 0, sizeof(zero_image));
+	/* Per-lane completeness comes first: each terminal lane must carry its
+	 * own full DRAIN evidence before any dual/independent classification. */
 	if (writer_flags != PCM_X_LOCAL_TAG_F_TERMINAL_MASK
 		|| holder_flags != PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK || tag_slot->membership_count == 0
-		|| pcm_x_ticket_ref_is_zero(external_ref)
-		|| !pcm_x_ticket_ref_equal(&tag_slot->ref, external_ref)
-		|| tag_slot->terminal_drain_generation == 0
+		|| pcm_x_ticket_ref_is_zero(external_ref) || tag_slot->terminal_drain_generation == 0
 		|| tag_slot->terminal_drain_generation == UINT64_MAX
-		|| tag_slot->terminal_drain_generation != tag_slot->holder_terminal_drain_generation
 		|| !pcm_x_local_terminal_pending_clear(tag_slot)
 		|| pcm_x_local_holder_lane_retire_state(tag_slot, flags) != PCM_X_QUEUE_OK)
+		return PCM_X_QUEUE_CORRUPT;
+	if (!pcm_x_ticket_ref_equal(&tag_slot->ref, external_ref)) {
+		/* Two complete terminals under DISTINCT master tickets are the legal
+		 * independent form: a granted writer awaiting RETIRE plus a newer
+		 * revoked holder lane on the same tag (the t/400 dump-0x3d shape).
+		 * Not a dual -- each lane retires by its own watermark.  A ticket-id
+		 * collision under a different ref can only be corruption: per-session
+		 * ticket ids are master-unique (see the cross-lane alias-class note
+		 * at pcm_x_local_cross_lane_holder_terminal_retirable). */
+		if (external_ref->handle.ticket_id != tag_slot->ref.handle.ticket_id)
+			return PCM_X_QUEUE_OK;
+		return PCM_X_QUEUE_CORRUPT;
+	}
+	if (tag_slot->terminal_drain_generation != tag_slot->holder_terminal_drain_generation)
 		return PCM_X_QUEUE_CORRUPT;
 	if (external_ref->grant_generation == 0) {
 		if (source_holder || tag_slot->ref.grant_generation != 0
@@ -17616,6 +18513,80 @@ pcm_x_local_empty_frozen_round_apply_locked(PcmXLocalTagSlot *tag_slot,
 }
 
 
+/* Read-only rehearsal of the frozen-round close that must accompany the LAST
+ * terminal authority leaving a barrier-frozen tag.  An independent dual
+ * terminal retires its writer lane first while the barrier stands, so by the
+ * holder ticket's own RETIRE the round may hold next-round followers that
+ * joined in between; consuming the holder lane without closing the round
+ * would strand them behind a barrier with no terminal authority left to drop
+ * it.  Every fallible check runs here BEFORE the holder lane is consumed;
+ * the caller then applies the close infallibly afterwards.  The RETIRE
+ * preflight runs the same rehearsal so both passes agree (the retire gate
+ * excludes ordinary mutators for the whole episode).
+ *
+ * after_writer_retire projects the state a single watermark covering both
+ * lanes will reach: the writer target is still the closed round of one and
+ * still owns tag_slot->ref/membership when the preflight runs, so those two
+ * facts are checked in their pre-retire form instead. */
+static PcmXQueueResult
+pcm_x_local_independent_holder_close_plan_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref,
+												 bool after_writer_retire,
+												 PcmXLocalRoundClosePlan *plan)
+{
+	PcmXQueueResult result;
+	Size projected_membership;
+	Size projected_closed;
+	bool candidate_promote = false;
+
+	if (tag_slot == NULL || plan == NULL)
+		return PCM_X_QUEUE_CORRUPT;
+	memset(plan, 0, sizeof(*plan));
+	plan->candidate_ref.slot_index = PCM_X_INVALID_SLOT_INDEX;
+	if (after_writer_retire) {
+		if (tag_slot->closed_round_member_count != 1 || tag_slot->membership_count == 0
+			|| pcm_x_ticket_ref_is_zero(&tag_slot->ref))
+			return PCM_X_QUEUE_CORRUPT;
+		projected_membership = tag_slot->membership_count - 1;
+		projected_closed = tag_slot->closed_round_member_count - 1;
+	} else {
+		if (tag_slot->closed_round_member_count != 0 || !pcm_x_ticket_ref_is_zero(&tag_slot->ref))
+			return PCM_X_QUEUE_CORRUPT;
+		projected_membership = tag_slot->membership_count;
+		projected_closed = tag_slot->closed_round_member_count;
+	}
+	/* Unlinked CANCELLED next-round members awaiting their own detach leave
+	 * the FIFO empty while the membership count is still nonzero.  That is
+	 * a legal transient, not corruption: wait for their backends to release
+	 * them (retire-gated episodes never race those detaches). */
+	if (tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX && projected_membership > 0)
+		return PCM_X_QUEUE_NOT_READY;
+	if (tag_slot->local_round == 0 || tag_slot->local_round == UINT32_MAX
+		|| tag_slot->next_sequence == 0 || tag_slot->cutoff_sequence >= tag_slot->next_sequence
+		|| projected_closed != 0
+		|| ((projected_membership == 0) != (tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX))
+		|| ((tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX)
+			!= (tag_slot->tail_index == PCM_X_INVALID_SLOT_INDEX))
+		|| tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->leader_slot_generation != 0
+		|| tag_slot->active_writer_index != PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->active_writer_slot_generation != 0
+		|| tag_slot->active_holder_head_index != PCM_X_INVALID_SLOT_INDEX
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable))
+		return PCM_X_QUEUE_CORRUPT;
+	if (tag_slot->head_index != PCM_X_INVALID_SLOT_INDEX) {
+		result = pcm_x_local_follower_chain_ready(tag_slot, tag_ref, tag_slot->head_index,
+												  PCM_X_INVALID_SLOT_INDEX, 0, &plan->candidate,
+												  &plan->candidate_ref, &candidate_promote);
+		if (result != PCM_X_QUEUE_OK)
+			return result == PCM_X_QUEUE_BUSY ? PCM_X_QUEUE_NOT_READY : result;
+		if (plan->candidate == NULL || candidate_promote)
+			return PCM_X_QUEUE_CORRUPT;
+	}
+	plan->close_round = true;
+	return PCM_X_QUEUE_OK;
+}
+
+
 /* Project the state immediately after RETIRE removes the final member of a
  * closed writer cohort.  The terminal member is already unlinked by DRAIN, so
  * the remaining FIFO, if any, must consist entirely of next-round followers.
@@ -17666,14 +18637,16 @@ pcm_x_local_final_member_round_plan_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotR
 
 
 /* Close the terminal leg for an S-holder node that was not selected as the
- * image source.  Type-48 leaves a generation-zero admission locator plus an
- * exact ACK tombstone.  The authenticated DRAIN carries the first final grant
- * generation this node can know, so capture it exactly and make all replays
+ * image source.  Type-48 normally leaves an exact ACK tombstone; a reordered
+ * same-ticket re-PROBE can instead leave a canonical empty COMMIT after the
+ * master advanced.  Authenticated DRAIN consumes either exact form, captures
+ * the first final grant generation this node can know, and makes every replay
  * generation- and drain-exact.  Caller holds the local tag lock. */
 static PcmXQueueResult
 pcm_x_local_blocker_participant_drain_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref,
 											 const PcmXDrainPollPayload *poll,
-											 int32 authenticated_master_node)
+											 int32 authenticated_master_node,
+											 uint64 authenticated_master_session)
 {
 	PcmXImageToken zero_image;
 	PcmXLocalRoundClosePlan round_plan;
@@ -17717,6 +18690,7 @@ pcm_x_local_blocker_participant_drain_locked(PcmXLocalTagSlot *tag_slot, PcmXSlo
 		return PCM_X_QUEUE_NOT_READY;
 	if (holder_flags != 0 || tag_slot->holder_terminal_drain_generation != 0
 		|| !pcm_x_image_token_equal(&tag_slot->holder_image, &zero_image)
+		|| tag_slot->holder_required_page_scn != 0
 		|| !pcm_x_transfer_leg_is_pristine(&tag_slot->holder_reliable))
 		return PCM_X_QUEUE_CORRUPT;
 	if (!pcm_x_local_admission_ref_valid(&tag_slot->blocker_snapshot_ref,
@@ -17724,7 +18698,9 @@ pcm_x_local_blocker_participant_drain_locked(PcmXLocalTagSlot *tag_slot, PcmXSlo
 		|| !BufferTagsEqual(&tag_slot->tag, &tag_slot->blocker_snapshot_ref.identity.tag)
 		|| tag_slot->blocker_snapshot_ref.identity.cluster_epoch != tag_slot->cluster_epoch)
 		return PCM_X_QUEUE_CORRUPT;
-	if (!pcm_x_local_blocker_ack_tombstone_exact(tag_slot, authenticated_master_node)
+	if ((!pcm_x_local_blocker_ack_tombstone_exact(tag_slot, authenticated_master_node)
+		 && !pcm_x_local_empty_blocker_commit_exact(tag_slot, authenticated_master_node,
+													authenticated_master_session))
 		|| tag_slot->blocker_snapshot_reliable.response_tombstone_mask != 0) {
 		blocker_state = pcm_x_local_blocker_lane_retire_state(tag_slot);
 		return blocker_state == PCM_X_QUEUE_CORRUPT ? blocker_state : PCM_X_QUEUE_NOT_READY;
@@ -17806,8 +18782,8 @@ pcm_x_local_holder_drain_poll_exact(const PcmXDrainPollPayload *poll,
 		goto holder_drain_done;
 	}
 	if (pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)) {
-		result = pcm_x_local_blocker_participant_drain_locked(tag_slot, tag_ref, poll,
-															  authenticated_master_node);
+		result = pcm_x_local_blocker_participant_drain_locked(
+			tag_slot, tag_ref, poll, authenticated_master_node, authenticated_master_session);
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto holder_drain_done;
 	}
@@ -17887,6 +18863,20 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 									 int32 authenticated_master_node,
 									 uint64 authenticated_master_session)
 {
+	return cluster_pcm_x_local_drain_poll_certificate_exact(poll, authenticated_master_node,
+															authenticated_master_session, NULL);
+}
+
+
+/* First-consumption variant: capture the completion certificate under the
+ * same tag lock that publishes TERMINAL_DRAINED, so the caller can release
+ * the self-source immutable record against the exact protocol ledger. */
+PcmXQueueResult
+cluster_pcm_x_local_drain_poll_certificate_exact(const PcmXDrainPollPayload *poll,
+												 int32 authenticated_master_node,
+												 uint64 authenticated_master_session,
+												 PcmXLocalDrainCertificate *certificate_out)
+{
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
 	PcmXPeerFrontier *frontier;
@@ -17905,6 +18895,8 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 	bool fail_closed = false;
 	bool promote_candidate;
 
+	if (certificate_out != NULL)
+		memset(certificate_out, 0, sizeof(*certificate_out));
 	if (header == NULL || poll == NULL || !pcm_x_local_terminal_ref_valid(&poll->ref)
 		|| poll->drain_generation == 0 || poll->drain_generation == UINT64_MAX
 		|| authenticated_master_node < 0 || authenticated_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
@@ -18089,8 +19081,8 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 		}
 	} else if (!pcm_x_ticket_ref_is_zero(&tag_slot->blocker_snapshot_ref)
 			   && pcm_x_ticket_locator_equal(&tag_slot->blocker_snapshot_ref, &poll->ref)) {
-		external_result = pcm_x_local_blocker_participant_drain_locked(tag_slot, tag_ref, poll,
-																	   authenticated_master_node);
+		external_result = pcm_x_local_blocker_participant_drain_locked(
+			tag_slot, tag_ref, poll, authenticated_master_node, authenticated_master_session);
 		if (external_result != PCM_X_QUEUE_OK && external_result != PCM_X_QUEUE_DUPLICATE) {
 			result = external_result;
 			fail_closed = result == PCM_X_QUEUE_CORRUPT;
@@ -18100,6 +19092,18 @@ cluster_pcm_x_local_drain_poll_exact(const PcmXDrainPollPayload *poll,
 	tag_slot->terminal_drain_generation = poll->drain_generation;
 	pg_write_barrier();
 	(void)pcm_x_slot_flags_fetch_or(&tag_slot->slot, PCM_X_LOCAL_TAG_F_TERMINAL_DRAINED);
+	/* Completion certificate: the writer-round ledger is captured under this
+	 * same lock, before RETIRE can clear it, so the caller can verify the
+	 * self-source release against the exact protocol evidence instead of the
+	 * live descriptor (which may legitimately have moved on or been evicted). */
+	if (certificate_out != NULL) {
+		certificate_out->ref = tag_slot->ref;
+		certificate_out->image = tag_slot->image;
+		certificate_out->committed_own_generation = tag_slot->committed_own_generation;
+		certificate_out->master_session_incarnation = tag_slot->master_session_incarnation;
+		certificate_out->master_node = tag_slot->master_node;
+		certificate_out->valid = true;
+	}
 	result = PCM_X_QUEUE_OK;
 
 drain_release_gate:
@@ -18331,6 +19335,7 @@ pcm_x_local_reset_holder_only_queue(PcmXLocalTagSlot *tag_slot)
 	tag_slot->active_writer_slot_generation = 0;
 	tag_slot->closed_round_member_count = 0;
 	tag_slot->committed_own_generation = 0;
+	tag_slot->grant_base_own_generation = 0;
 }
 
 
@@ -18339,6 +19344,52 @@ static PcmXQueueResult pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *ta
 															PcmXWaitIdentity *identity_out,
 															PcmXLocalHandle *handle_out,
 															bool *candidate_out);
+
+
+/* Shared eligibility for retiring ONLY the writer lane of an independent
+ * (distinct-ticket) dual terminal while the holder lane stays authoritative.
+ * The RETIRE preflight (candidate scan) and the detach (retain arm) MUST
+ * agree bit-for-bit through this one predicate: a first-pass yes with a
+ * second-pass no escalates to the collect's fail-closed exit.
+ *
+ * The narrow proven shape is one closed writer round of exactly the terminal
+ * target under a standing REVOKE_BARRIER with sane round/cutoff invariants;
+ * the FIFO may hold only next-round followers (they are promoted when the
+ * holder ticket's own later RETIRE closes the still-frozen round -- refusing
+ * them here would deadlock: a pre-joined follower waits for exactly this
+ * RETIRE to drop the barrier).  A zero grant generation on the external lane
+ * (a cancelled blocker-participant DRAIN) is eligible too: its staged
+ * retirement is writer lane first, then the cancelled lane by its own
+ * watermark (see pcm_x_local_cross_lane_holder_terminal_retirable).
+ * Caller guarantees: both terminal masks complete and the same-ref-dual
+ * classifier returned OK with dual=false (distinct tickets). */
+static bool
+pcm_x_local_independent_writer_retire_eligible(const PcmXLocalTagSlot *tag_slot, uint32 flags)
+{
+	const PcmXTicketRef *external_ref;
+
+	if (tag_slot == NULL)
+		return false;
+	external_ref = pcm_x_local_external_terminal_ref(tag_slot);
+	return external_ref != NULL && !pcm_x_ticket_ref_is_zero(external_ref)
+		   && external_ref->handle.ticket_id != tag_slot->ref.handle.ticket_id
+		   && (flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0
+		   && tag_slot->closed_round_member_count == 1 && tag_slot->membership_count >= 1
+		   && tag_slot->local_round != 0 && tag_slot->local_round != UINT32_MAX
+		   && tag_slot->next_sequence != 0 && tag_slot->cutoff_sequence != 0
+		   && tag_slot->cutoff_sequence < tag_slot->next_sequence
+		   && ((tag_slot->membership_count == 1)
+			   == (tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX))
+		   && ((tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX)
+			   == (tag_slot->tail_index == PCM_X_INVALID_SLOT_INDEX))
+		   && tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+		   && tag_slot->leader_slot_generation == 0
+		   && tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX
+		   && tag_slot->active_writer_slot_generation == 0
+		   && tag_slot->active_holder_head_index == PCM_X_INVALID_SLOT_INDEX
+		   && pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		   && pcm_x_local_holder_lane_retire_state(tag_slot, flags) == PCM_X_QUEUE_OK;
+}
 
 
 static PcmXQueueResult
@@ -18365,6 +19416,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 	bool detach_after_close = false;
 	bool detach_tag = false;
 	bool gate_claimed = false;
+	bool retain_independent_holder = false;
 	bool same_ref_dual = false;
 	bool ready_leader_candidate = false;
 	bool target_in_closed_round;
@@ -18449,6 +19501,23 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		goto detach_local_domain_done;
 	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
+	/* An exact unlinked next-round CANCELLED member detaches by releasing
+	 * only its own membership even while terminal evidence occupies the tag:
+	 * it was never part of the frozen round, so the dual terminals, the
+	 * holder lane, the barrier and the master binding all stay byte-exact.
+	 * Without this arm the cancelled membership lingers (the generic path
+	 * refuses under terminal evidence) and wedges both the writer-lane
+	 * eligibility and the holder RETIRE's frozen-round close. */
+	if (!retire_protocol && pcm_x_slot_state_read(&member->slot) == PCM_XL_CANCELLED
+		&& member->admitted_round == tag_slot->local_round + 1
+		&& (flags & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK))
+			   != 0) {
+		tag_slot->membership_count--;
+		pg_write_barrier();
+		pcm_x_slot_state_write(&member->slot, PCM_XL_DETACHING);
+		result = PCM_X_QUEUE_OK;
+		goto detach_local_domain_done;
+	}
 	if ((flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) != 0) {
 		uint32 terminal_flags = flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK;
 
@@ -18489,6 +19558,27 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 				goto detach_local_domain_done;
 			}
 		}
+		/* Independent dual terminal (dump-0x3d): a complete writer terminal
+		 * and a complete holder terminal under DISTINCT master tickets.  Only
+		 * the shared narrow eligibility (one closed writer round of exactly
+		 * this target under the standing barrier; FIFO holds at most
+		 * next-round followers) may retire the writer lane, keeping the
+		 * holder lane, the barrier and the master binding byte-exact on the
+		 * LIVE tag for the holder ticket's own later watermark.  Any other
+		 * distinct-ticket dual stays NOT_READY with zero mutation. */
+		if (!same_ref_dual && !cancel_same_ref_dual
+			&& (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+				   == PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK
+			&& (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == PCM_X_LOCAL_TAG_F_TERMINAL_MASK) {
+			retain_independent_holder
+				= member->admitted_round == tag_slot->local_round
+				  && member->local_sequence <= tag_slot->cutoff_sequence
+				  && pcm_x_local_independent_writer_retire_eligible(tag_slot, flags);
+			if (!retain_independent_holder) {
+				result = PCM_X_QUEUE_NOT_READY;
+				goto detach_local_domain_done;
+			}
+		}
 	}
 	target_in_closed_round = (flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0
 							 && member->admitted_round == tag_slot->local_round
@@ -18503,7 +19593,8 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		result = PCM_X_QUEUE_CORRUPT;
 		goto detach_local_domain_done;
 	}
-	if (retire_protocol && target_in_closed_round && tag_slot->closed_round_member_count == 1) {
+	if (retire_protocol && !retain_independent_holder && target_in_closed_round
+		&& tag_slot->closed_round_member_count == 1) {
 		result = pcm_x_local_final_member_round_plan_locked(tag_slot, tag_ref, &round_plan);
 		if (result != PCM_X_QUEUE_OK)
 			goto detach_local_domain_done;
@@ -18521,10 +19612,14 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		/* Writer membership and holder transfer are independent lifetimes on
 		 * the same tag.  Neither returning to holder-only form nor deleting the
 		 * tag may erase the master binding while an exact holder ticket, send
-		 * leg, or terminal-drain outcome remains authoritative. */
-		if (!pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
-			|| !pcm_x_transfer_leg_is_clear(&tag_slot->holder_reliable)
-			|| ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0 && !cancel_same_ref_dual)) {
+		 * leg, or terminal-drain outcome remains authoritative.  The proven
+		 * independent dual terminal is the one exception: its writer lane may
+		 * retire alone, leaving the holder lane authoritative on the tag. */
+		if (!retain_independent_holder
+			&& (!pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
+				|| !pcm_x_transfer_leg_is_clear(&tag_slot->holder_reliable)
+				|| ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0
+					&& !cancel_same_ref_dual))) {
 			result = PCM_X_QUEUE_NOT_READY;
 			goto detach_local_domain_done;
 		}
@@ -18537,7 +19632,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 				goto detach_local_domain_done;
 			}
 			pcm_x_local_reset_holder_only_queue(tag_slot);
-		} else if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) == 0) {
+		} else if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) == 0 && !retain_independent_holder) {
 			pg_write_barrier();
 			pcm_x_slot_state_write(&tag_slot->slot, PCM_X_TAG_DETACHING);
 			detach_tag = true;
@@ -18576,6 +19671,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		 * and its generation rekey correctly classifies the tag as corrupt. */
 		memset(&tag_slot->image, 0, sizeof(tag_slot->image));
 		tag_slot->committed_own_generation = 0;
+		tag_slot->grant_base_own_generation = 0;
 		/* DRAIN closes the old round by leaving its response opcode as a replay
 		 * tombstone.  RETIRE consumes that tombstone with the membership: a
 		 * promoted successor must see a pristine application leg or the requester
@@ -18787,6 +19883,62 @@ pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag
 }
 
 
+/*
+ * A fully-drained cross-lane holder/blocker terminal (no writer-terminal
+ * companion, so it is not a same-ref dual) belongs to an already-revoked older
+ * cohort: its S lane has finished DRAIN and it carries a completed grant.  The
+ * newer writer's REVOKE_BARRIER guards that writer's own revoke round, not this
+ * older holder lane's terminal cleanup, so the older lane may retire itself
+ * while every writer ref / round / barrier / FIFO field is preserved.  Retiring
+ * it also clears HOLDER_TERMINAL_MASK, which lets the empty-frozen-round path
+ * finally drop the REVOKE_BARRIER.  Cancel-duals (grant_generation == 0) are
+ * routed through the same-ref-dual path and are excluded here.
+ *
+ * The exemption is strictly cross-lane: a writer-lane ref that aliases the
+ * external ref (or merely collides with its master-unique ticket id) cannot
+ * be an older cohort and keeps the pre-exemption NOT_READY verdict.  There is
+ * deliberately no ticket-order requirement beyond that: a cancelled
+ * predecessor leader's duplicate-ACK tombstone legally lingers in
+ * tag_slot->ref with an OLDER ticket until the successor's ENQUEUE arm
+ * retires it, and refusing retirement there could wedge the empty-frozen
+ * path permanently if the successor exits before arming.
+ *
+ * Precondition: the caller MUST have validated
+ * pcm_x_local_holder_lane_retire_state() == OK before consulting this helper.
+ * The test here does not itself re-prove the DRAIN evidence
+ * (holder_terminal_drain_generation, a clear reliable leg, a DRAIN_POLL last
+ * response); both call sites run that check immediately above the guard.
+ */
+static inline bool
+pcm_x_local_cross_lane_holder_terminal_retirable(const PcmXLocalTagSlot *tag_slot, uint32 flags,
+												 const PcmXTicketRef *external_ref)
+{
+	if (tag_slot == NULL || external_ref == NULL)
+		return false;
+	if ((flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) != 0
+		|| (flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+			   != PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+		return false;
+	/* A cancelled lane (zero grant generation) that shared the tag with a
+	 * DISTINCT-ticket writer terminal is the staged second half of an
+	 * independent dual: same-ref cancel forms route through the
+	 * same-ref-dual path and never reach this guard, so once the writer
+	 * lane has fully retired (no terminal bits above, ref consumed) the
+	 * cancelled lane retires by its own watermark exactly like a granted
+	 * one.  While any writer ref remains, keep refusing it. */
+	if (external_ref->grant_generation == 0)
+		return pcm_x_ticket_ref_is_zero(&tag_slot->ref);
+	/* Per-session ticket ids are master-unique (monotonic allocator, exhaustion
+	 * fails closed), so id equality alone is complete for the alias class.  Do
+	 * not "simplify" this to full-ref equality: that would stop refusing an id
+	 * collision under a distinct identity and REDUCE fail-closed coverage. */
+	if (!pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+		&& external_ref->handle.ticket_id == tag_slot->ref.handle.ticket_id)
+		return false;
+	return true;
+}
+
+
 static PcmXQueueResult
 pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *request,
 								int32 authenticated_master_node,
@@ -18873,6 +20025,39 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			result = PCM_X_QUEUE_NOT_READY;
 			goto candidate_done;
 		}
+		/* An independent (distinct-ticket) dual terminal may offer its writer
+		 * lane only through the shared eligibility predicate; see the retain
+		 * arm in pcm_x_local_detach_terminal_common.  Refusing here keeps the
+		 * whole RETIRE preflight retryable instead of tripping the
+		 * second-pass fail-closed exit on an unproven wider shape.  When the
+		 * same watermark also covers the holder lane, rehearse the frozen
+		 * round close it will need in its projected post-writer-retire form
+		 * -- every fallible check must precede the second pass's first
+		 * mutation. */
+		if ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0 && !same_ref_dual
+			&& !cancel_same_ref_dual) {
+			if (!pcm_x_local_independent_writer_retire_eligible(tag_slot, flags)) {
+				result = PCM_X_QUEUE_NOT_READY;
+				goto candidate_done;
+			}
+			external_ref = pcm_x_local_external_terminal_ref(tag_slot);
+			if (external_ref != NULL
+				&& external_ref->handle.ticket_id <= request->retire_through_ticket_id) {
+				PcmXLocalRoundClosePlan close_plan;
+
+				result = pcm_x_local_independent_holder_close_plan_locked(tag_slot, tag_ref, true,
+																		  &close_plan);
+				if (result != PCM_X_QUEUE_OK)
+					goto candidate_done;
+				/* The close this episode will apply promotes that follower;
+				 * project its wake now or the promotion degrades to the
+				 * waiters' poll interval. */
+				if (close_plan.candidate != NULL) {
+					*holder_wake_out = close_plan.candidate->identity;
+					*holder_wake_candidate_out = true;
+				}
+			}
+		}
 		if (tag_slot->ref.handle.ticket_id == request->retire_through_ticket_id)
 			*contains_watermark_out = true;
 		if (tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id) {
@@ -18896,9 +20081,37 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 		if (external_ref->handle.ticket_id == request->retire_through_ticket_id)
 			*contains_watermark_out = true;
 		if (external_ref->handle.ticket_id <= request->retire_through_ticket_id) {
-			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual) {
+			/* A selected writer candidate on the same slot retires first; the
+			 * next scan iteration re-evaluates this holder lane against the
+			 * post-writer-retire flags (its close was already rehearsed in
+			 * the writer arm above when the watermark covers both lanes). */
+			if (!same_ref_dual && *candidate_out)
+				goto candidate_done;
+			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+				&& !pcm_x_local_cross_lane_holder_terminal_retirable(tag_slot, flags,
+																	 external_ref)) {
 				result = PCM_X_QUEUE_NOT_READY;
 				goto candidate_done;
+			}
+			/* When this holder RETIRE will be the last terminal authority on
+			 * a barrier-frozen tag, rehearse the round close its detach must
+			 * apply; the second pass repeats the same read-only rehearsal
+			 * before consuming the lane. */
+			if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+				&& !cancel_same_ref_dual && (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
+				&& tag_slot->closed_round_member_count == 0
+				&& pcm_x_ticket_ref_is_zero(&tag_slot->ref)) {
+				PcmXLocalRoundClosePlan close_plan;
+
+				result = pcm_x_local_independent_holder_close_plan_locked(tag_slot, tag_ref, false,
+																		  &close_plan);
+				if (result != PCM_X_QUEUE_OK)
+					goto candidate_done;
+				/* Project the promotion this close will apply. */
+				if (close_plan.candidate != NULL) {
+					*holder_wake_out = close_plan.candidate->identity;
+					*holder_wake_candidate_out = true;
+				}
 			}
 			/* A generation-zero dual terminal must validate and consume the
 			 * CANCELLED membership before its blocker evidence disappears.  Keep
@@ -18916,7 +20129,7 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			*candidate_out = true;
 		}
 	}
-	if (result == PCM_X_QUEUE_OK && *holder_candidate_out)
+	if (result == PCM_X_QUEUE_OK && *holder_candidate_out && !*holder_wake_candidate_out)
 		result = pcm_x_local_ready_leader_wake_locked(tag_slot, tag_ref, holder_wake_out, NULL,
 													  holder_wake_candidate_out);
 
@@ -18933,6 +20146,7 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 										 bool *ready_leader_candidate_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXLocalRoundClosePlan round_plan;
 	PcmXLocalTagSlot *tag_slot;
 	const PcmXTicketRef *external_ref;
 	PcmXSlotRef tag_ref;
@@ -18955,6 +20169,7 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 	memset(ready_leader_out, 0, sizeof(*ready_leader_out));
 	*ready_leader_candidate_out = false;
 	memset(&ready_leader, 0, sizeof(ready_leader));
+	memset(&round_plan, 0, sizeof(round_plan));
 
 	pcm_x_local_gate_acquire_guarded(&header->allocator_lock.lock, LW_SHARED, NULL);
 	directory_result
@@ -19005,7 +20220,8 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 			goto holder_detach_release_gate;
 		goto holder_detach_domain_done;
 	}
-	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual) {
+	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+		&& !pcm_x_local_cross_lane_holder_terminal_retirable(tag_slot, flags, external_ref)) {
 		result = PCM_X_QUEUE_NOT_READY;
 		goto holder_detach_release_gate;
 	}
@@ -19015,6 +20231,26 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto holder_detach_domain_done;
 	}
+	/* When this holder lane is the LAST terminal authority on a
+	 * barrier-frozen tag (an independent dual whose writer lane already
+	 * retired without closing the round), rehearse the frozen-round close
+	 * BEFORE any evidence is consumed: next-round followers may have joined
+	 * between the two watermarks, and consuming the holder lane without a
+	 * validated close would strand them behind a barrier nothing can drop.
+	 * Every fallible check lives in the rehearsal; the apply below is
+	 * infallible. */
+	if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0 && !same_ref_dual
+		&& (flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
+		&& tag_slot->closed_round_member_count == 0 && pcm_x_ticket_ref_is_zero(&tag_slot->ref)) {
+		result = pcm_x_local_independent_holder_close_plan_locked(tag_slot, tag_ref, false,
+																  &round_plan);
+		if (result != PCM_X_QUEUE_OK) {
+			fail_closed = result == PCM_X_QUEUE_CORRUPT;
+			if (!fail_closed)
+				goto holder_detach_release_gate;
+			goto holder_detach_domain_done;
+		}
+	}
 	if (blocker_terminal) {
 		memset(&tag_slot->blocker_snapshot_ref, 0, sizeof(tag_slot->blocker_snapshot_ref));
 		tag_slot->blocker_set_generation = 0;
@@ -19023,10 +20259,19 @@ pcm_x_local_holder_detach_terminal_exact(const PcmXTicketRef *ref, int32 authent
 	} else {
 		memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 		memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
+		tag_slot->holder_required_page_scn = 0;
 		memset(&tag_slot->holder_reliable, 0, sizeof(tag_slot->holder_reliable));
 	}
 	tag_slot->holder_terminal_drain_generation = 0;
 	(void)pcm_x_slot_flags_fetch_and(&tag_slot->slot, ~PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	pcm_x_local_empty_frozen_round_apply_locked(tag_slot, &round_plan);
+	/* Report the promoted next-round leader through the same wake output the
+	 * preflight projected; without it the promotion is only discovered by
+	 * the waiter's poll interval. */
+	if (round_plan.close_round && round_plan.candidate != NULL) {
+		ready_leader = round_plan.candidate->identity;
+		ready_leader_candidate = true;
+	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
 	detach_tag
 		= tag_slot->membership_count == 0 && tag_slot->closed_round_member_count == 0
@@ -19211,6 +20456,14 @@ pcm_x_local_final_member_round_preflight_exact(const PcmXLocalHandle *handle,
 		result = PCM_X_QUEUE_OK;
 		goto preflight_done;
 	}
+	/* An independent (distinct-ticket) dual terminal retires its writer lane
+	 * WITHOUT closing the round -- the holder lane keeps the fence and its
+	 * own later RETIRE closes and promotes.  Projecting the final-member
+	 * promotion here would demand a wake the detach never produces. */
+	if ((flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK) != 0 && !same_ref_dual) {
+		result = PCM_X_QUEUE_OK;
+		goto preflight_done;
+	}
 	result = pcm_x_local_final_member_round_plan_locked(tag_slot, tag_ref, &plan);
 	if (result == PCM_X_QUEUE_OK && plan.candidate != NULL) {
 		if (*projected_wake_candidate_out) {
@@ -19263,6 +20516,18 @@ pcm_x_local_wake_actual_match(const PcmXLocalWakeBatch *wake_batch,
 		return PCM_X_QUEUE_CORRUPT;
 	(*actual_count)++;
 	return PCM_X_QUEUE_OK;
+}
+
+
+/* One-shot evidence ahead of the retire-collect fuse: every corruption arm
+ * funnels to the same fail-closed line, so name the arm and its uncoerced
+ * detail here.  For scan arms a/b are the slot index and the raw result;
+ * for the wake-count arm they are the projected and actual wake counts. */
+static void
+pcm_x_local_retire_collect_note(const char *site, uint64 a, uint64 b)
+{
+	ereport(LOG, (errmsg("PCM-X local retire collect fails closed at %s (a=%llu, b=%llu)", site,
+						 (unsigned long long)a, (unsigned long long)b)));
 }
 
 
@@ -19357,6 +20622,7 @@ claim_done:
 		return result;
 	}
 	if (!pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view)) {
+		pcm_x_local_retire_collect_note("allocator-view", 0, 0);
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto retire_failed;
@@ -19407,6 +20673,7 @@ claim_done:
 				&writer_candidate_ref, &writer_candidate, &holder_candidate, &candidate,
 				&contains_watermark, &holder_wake, &holder_wake_candidate);
 			if (result != PCM_X_QUEUE_OK) {
+				pcm_x_local_retire_collect_note("second-pass-candidate", (uint64)i, (uint64)result);
 				fail_closed = true;
 				result = PCM_X_QUEUE_CORRUPT;
 				goto retire_failed;
@@ -19430,6 +20697,9 @@ claim_done:
 				}
 			}
 			if (result != PCM_X_QUEUE_OK) {
+				pcm_x_local_retire_collect_note(holder_candidate ? "holder-detach"
+																 : "writer-detach",
+												(uint64)i, (uint64)result);
 				fail_closed = true;
 				result = PCM_X_QUEUE_CORRUPT;
 				goto retire_failed;
@@ -19438,6 +20708,7 @@ claim_done:
 				result = pcm_x_local_wake_actual_match(wake_batch, &writer_wake,
 													   projected_wake_count, &actual_wake_count);
 				if (result != PCM_X_QUEUE_OK) {
+					pcm_x_local_retire_collect_note("wake-match", (uint64)i, (uint64)result);
 					fail_closed = true;
 					result = PCM_X_QUEUE_CORRUPT;
 					goto retire_failed;
@@ -19446,6 +20717,8 @@ claim_done:
 		} while (candidate);
 	}
 	if (wake_batch != NULL && actual_wake_count != projected_wake_count) {
+		pcm_x_local_retire_collect_note("wake-count", (uint64)projected_wake_count,
+										(uint64)actual_wake_count);
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto retire_failed;
@@ -19483,6 +20756,7 @@ retire_preflight_failed:
 	/* No tag was mutated, so a retryable/stale preflight can release the claim.
 	 * Structural corruption retains both exact episode witnesses. */
 	if (result == PCM_X_QUEUE_CORRUPT) {
+		pcm_x_local_retire_collect_note("preflight", 0, (uint64)result);
 		fail_closed = true;
 		goto retire_failed;
 	}

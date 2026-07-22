@@ -24,6 +24,18 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+typedef enum PcmXImageFetchRequestRefusal {
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_NONE = 0,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ARGUMENT,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ENVELOPE,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_REQUEST,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_MASTER,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_REF,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_LEG,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_IMAGE,
+	PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_REQUESTER_ID
+} PcmXImageFetchRequestRefusal;
+
 extern bool cluster_pcm_x_image_fetch_build_request(const PcmXLocalProgress *progress,
 													int32 requester_node,
 													int32 requester_backend_id,
@@ -33,6 +45,10 @@ extern bool cluster_pcm_x_image_fetch_request_exact(const ClusterICEnvelope *env
 													const PcmXLocalHolderProgress *holder,
 													int32 holder_node, int32 current_master_node,
 													uint64 current_epoch);
+extern bool cluster_pcm_x_image_fetch_request_exact_diagnosed(
+	const ClusterICEnvelope *env, const GcsBlockRequestPayload *request,
+	const PcmXLocalHolderProgress *holder, int32 holder_node, int32 current_master_node,
+	uint64 current_epoch, PcmXImageFetchRequestRefusal *refusal_out);
 extern bool cluster_pcm_x_image_fetch_reply_exact(const GcsBlockReplyHeader *reply,
 												  const char *block_data,
 												  const PcmXLocalProgress *progress,

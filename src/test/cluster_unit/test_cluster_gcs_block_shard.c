@@ -405,6 +405,7 @@ UT_TEST(test_pcm_x_route_truth_table)
 		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT, sizeof(PcmXBlockerSetHeaderPayload) },
 		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK, sizeof(PcmXPhasePayload) },
 		{ PGRAC_IC_MSG_PCM_X_REVOKE, sizeof(PcmXRevokePayload) },
+		{ PGRAC_IC_MSG_PCM_X_REVOKE, sizeof(PcmXRevokePayloadV2) },
 		{ PGRAC_IC_MSG_PCM_X_IMAGE_READY, sizeof(PcmXGrantPayload) },
 		{ PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, sizeof(PcmXGrantPayload) },
 		{ PGRAC_IC_MSG_PCM_X_INSTALL_READY, sizeof(PcmXInstallReadyPayload) },
@@ -444,10 +445,39 @@ UT_TEST(test_pcm_x_route_truth_table)
 				 -1);
 }
 
+/* A status-3 PI durable note is an INVALIDATE_ACK frame and must use the
+ * exact tag shard.  Exercise every live worker, including worker 1 (the
+ * t/400 failure arm), against the real payload router. */
+UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
+{
+	bool seen[CLUSTER_LMS_MAX_WORKERS] = { false };
+	int seen_count = 0;
+	int i;
+
+	for (i = 0; i < 4096 && seen_count < CLUSTER_LMS_MAX_WORKERS; i++) {
+		BufferTag tag = make_tag(1663, 5, 16384 + (i % 4), MAIN_FORKNUM, (BlockNumber)i);
+		GcsBlockInvalidateAckPayload note = { 0 };
+		int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+		int routed;
+
+		note.tag = tag;
+		note.ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE;
+		routed = cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, &note,
+												 sizeof(note), CLUSTER_LMS_MAX_WORKERS);
+		UT_ASSERT_EQ(routed, expected);
+		if (!seen[routed]) {
+			seen[routed] = true;
+			seen_count++;
+		}
+	}
+	UT_ASSERT(seen[1]);
+	UT_ASSERT_EQ(seen_count, CLUSTER_LMS_MAX_WORKERS);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -456,6 +486,7 @@ main(void)
 	UT_RUN(test_route_n1_degenerate_zero);
 	UT_RUN(test_route_ignores_non_tag_fields);
 	UT_RUN(test_pcm_x_route_truth_table);
+	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
