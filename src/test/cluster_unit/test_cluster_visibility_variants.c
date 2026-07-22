@@ -25,6 +25,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_visibility_resolve.h"
 
@@ -41,6 +42,43 @@ UT_DEFINE_GLOBALS();
 static const ClusterTTStatus all_states[]
 	= { CLUSTER_TT_STATUS_UNKNOWN, CLUSTER_TT_STATUS_IN_PROGRESS, CLUSTER_TT_STATUS_COMMITTED,
 		CLUSTER_TT_STATUS_ABORTED, CLUSTER_TT_STATUS_CLEANED_OUT, CLUSTER_TT_STATUS_SUBCOMMITTED };
+
+
+/*
+ * P0-27: VACUUM freeze is an authoritative xmin-committed proof.  A frozen
+ * tuple may retain its historical raw xmin and ITL index after that page slot
+ * is legally recycled, so resolving the stale xmin identity is both needless
+ * and wrong.  Ordinary COMMITTED/INVALID hints are deliberately NOT widened:
+ * only the exact FROZEN bit pair bypasses cluster resolution.
+ */
+UT_TEST(test_update_xmin_frozen_precheck)
+{
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(HEAP_XMIN_FROZEN), 0);
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID), 0);
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(HEAP_XMIN_COMMITTED), 1);
+	UT_ASSERT_EQ((int)(cluster_vis_xmin_needs_resolution(HEAP_XMIN_COMMITTED)
+					   && cluster_vis_evidence_route(CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS, false)
+							  == CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN),
+				 1);
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(HEAP_XMIN_INVALID), 1);
+	UT_ASSERT_EQ((int)cluster_vis_xmin_needs_resolution(0), 1);
+}
+
+
+/*
+ * P0-28: a TID selected on one node remains a legal statement target while
+ * PCM-X waits for a newer page image.  Once an ITL slot is recycled, neither
+ * xmin hints nor remote-evidence lookup can prove that no peer still names
+ * that TID.  Until a real cluster-wide horizon exists, shared-storage tuples
+ * must bypass every local prune verdict, including xmin-invalid/unknown forms.
+ */
+UT_TEST(test_prune_requires_cluster_wide_horizon)
+{
+	UT_ASSERT_EQ((int)cluster_vis_prune_must_defer(true, false), 1);
+	UT_ASSERT_EQ((int)cluster_vis_prune_must_defer(true, true), 0);
+	UT_ASSERT_EQ((int)cluster_vis_prune_must_defer(false, false), 0);
+	UT_ASSERT_EQ((int)cluster_vis_prune_must_defer(false, true), 0);
+}
 
 
 /* ---- OBS-4 Self ---- */
@@ -237,6 +275,8 @@ UT_TEST(test_evidence_route_full_table)
 int
 main(void)
 {
+	UT_RUN(test_update_xmin_frozen_precheck);
+	UT_RUN(test_prune_requires_cluster_wide_horizon);
 	UT_RUN(test_obs4_self_full_table);
 	UT_RUN(test_obs5_toast_full_table);
 	UT_RUN(test_obs2_update_xmin_full_table);

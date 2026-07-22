@@ -1555,6 +1555,11 @@ cluster_gcs_get_pi_watermark_retire_count(void)
 	return 0;
 }
 uint64
+cluster_gcs_get_pi_durable_note_apply_count(void)
+{
+	return 0;
+}
+uint64
 cluster_gcs_get_lost_write_detected_count(void)
 {
 	return 0;
@@ -4315,6 +4320,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"invalidate_passive_s_release_count",
 		"pcm_x_self_handoff_count",
 		"pcm_x_self_handoff_drain_count",
+		"pi_durable_note_apply_count",
 	};
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
@@ -4330,7 +4336,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 
 	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 60);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
-	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 119);
+	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 120);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(lmd_keys); i++)
@@ -4534,6 +4540,12 @@ cluster_lms_obs_get_outbound_not_admitted(int worker_id pg_attribute_unused())
 }
 uint64
 cluster_lms_obs_get_outbound_requeue_drop(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+
+uint64
+cluster_lms_obs_get_outbound_cap_guard_drop(int worker_id pg_attribute_unused())
 {
 	return 0;
 }

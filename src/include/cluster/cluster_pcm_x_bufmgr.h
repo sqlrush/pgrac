@@ -21,6 +21,7 @@
 #ifndef CLUSTER_PCM_X_BUFMGR_H
 #define CLUSTER_PCM_X_BUFMGR_H
 
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_convert.h"
@@ -32,6 +33,17 @@
  * instead defers its exact handle after one batch so ordinary UNLOCK never
  * becomes a transaction ERROR merely because RETIRE owns the short gate. */
 #define CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS 5
+
+/* FSM pages are advisory and may be consumed without a content lock, so they
+ * are outside PCM/PCM-X ownership.  Every other fork keeps the relation-level
+ * user/shared-catalog tracking policy. */
+static inline bool
+cluster_pcm_x_buffer_tag_tracked(const BufferTag *tag, bool shared_catalog)
+{
+	if (tag == NULL || tag->forkNum == FSM_FORKNUM)
+		return false;
+	return shared_catalog || tag->relNumber >= (RelFileNumber)FirstNormalObjectId;
+}
 
 typedef enum ClusterPcmXHolderRetryAction {
 	CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE = 0,
@@ -74,7 +86,8 @@ cluster_pcm_x_holder_register_retry_action(PcmXQueueResult result, bool runtime_
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		return CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE;
 	if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
-		|| (result == PCM_X_QUEUE_NOT_READY && runtime_active))
+		|| (runtime_active
+			&& (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)))
 		return CLUSTER_PCM_X_HOLDER_RETRY_WAIT;
 	return CLUSTER_PCM_X_HOLDER_RETRY_FAIL;
 }
@@ -113,12 +126,50 @@ typedef struct ClusterPcmOwnSnapshot {
 	BufferTag tag;
 	uint64 generation;
 	uint64 reservation_token;
+	/* Diagnostic projection of the grant->content activation fence.  It is
+	 * sampled under the same BufferDesc header lock as the authoritative
+	 * ownership tuple, but is not part of snapshot matching or wire state. */
+	uint64 writer_activation_token;
 	uint32 flags;
 	uint8 pcm_state;
 	uint8 _reserved[3];
 } ClusterPcmOwnSnapshot;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 48, "ClusterPcmOwnSnapshot must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 56, "ClusterPcmOwnSnapshot must remain 56 bytes");
+
+/*
+ * Process-local evidence for a reversible finish-revoke refusal.  The DATA
+ * worker fills this from the same header-lock sample that chose BUSY, so GCS
+ * can correlate the exact ticket/image with the actual VM/FSM pin, I/O, or
+ * ownership-lifecycle branch.  This is diagnostics only; it is never sent on
+ * wire or persisted.
+ */
+typedef enum ClusterPcmOwnFinishRefusalReason {
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_NONE = 0,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS
+} ClusterPcmOwnFinishRefusalReason;
+
+typedef struct ClusterPcmOwnFinishRefusal {
+	uint64 live_token;
+	uint32 shared_refcount;
+	uint32 live_flags;
+	ClusterPcmOwnFinishRefusalReason reason;
+	bool bm_io_in_progress;
+} ClusterPcmOwnFinishRefusal;
+
+/* Process-local reason for a retryable S-source image preparation refusal.
+ * DIRTY_FLUSHED records forward progress; the other values identify the
+ * exact nonblocking gate that asked the image pump to retry. */
+typedef enum ClusterPcmOwnSourcePrepareRefusal {
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_NONE = 0,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_BEGIN_REVOKE,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_CONTENT_LOCK,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_DIRTY_FLUSHED,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_DIRTY_RACED,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_IO_IN_PROGRESS
+} ClusterPcmOwnSourcePrepareRefusal;
 
 /* The queue returns execution authority before bufmgr takes content EXCLUSIVE.
  * Bind that claim to the one committed ownership generation and require the
@@ -428,12 +479,20 @@ cluster_bufmgr_pcm_own_abort_n_revoke(BufferDesc *buf,
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s,
 									  ClusterPcmOwnSnapshot *out_revoking);
+/* Freeze one exact S source and choose the newest safe bytes from its clean
+ * current image and verified shared storage.  A valid required_page_scn is a
+ * hard floor; V1's zero floor still prefers the newer observed copy. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ],
+	XLogRecPtr *out_page_lsn, uint64 *out_page_scn,
+	ClusterPcmOwnSourcePrepareRefusal *out_refusal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
-	ClusterPcmOwnSnapshot *out_retained);
+	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 																		 uint64 source_generation);
 /* Process-local descriptor evidence captured by the DRAIN-time probe below

@@ -63,11 +63,14 @@
 typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 generation;		/* monotone; bumped on every committed transition */
 	pg_atomic_uint64 reservation_token; /* monotone; active iff a transient flag is set */
+	pg_atomic_uint64 writer_activation_token; /* committed X not yet activated under content X */
 	pg_atomic_uint32 flags;				/* PCM_OWN_FLAG_* */
-	uint32 _pad;						/* keep 24B aligned */
+	uint32 _pad;						/* keep 32B aligned */
 } ClusterPcmOwnEntry;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 24, "ClusterPcmOwnEntry must remain 24 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 32, "ClusterPcmOwnEntry must remain 32 bytes");
+StaticAssertDecl(offsetof(ClusterPcmOwnEntry, writer_activation_token) == 16,
+				 "writer activation fence offset must remain stable");
 
 typedef enum ClusterPcmOwnResult {
 	CLUSTER_PCM_OWN_OK = 0,
@@ -130,6 +133,16 @@ extern ClusterPcmOwnResult cluster_pcm_own_revoke_commit_exact(int buf_id,
 															   uint64 expected_generation,
 															   uint64 reservation_token,
 															   uint64 *out_committed_generation);
+/* X-only combined linearization: clear the exact GRANT_PENDING lifecycle,
+ * bump its ownership generation, and publish the writer activation fence
+ * before the caller releases the BufferDesc header lock. */
+extern ClusterPcmOwnResult cluster_pcm_own_writer_grant_commit_exact(
+	int buf_id, uint64 expected_generation, uint64 reservation_token,
+	uint64 *out_committed_generation);
+/* Clear only the exact committed generation/token after content-EXCLUSIVE
+ * activation proof or after exact queue-claim cleanup. */
+extern ClusterPcmOwnResult cluster_pcm_own_writer_activation_clear_exact(
+	int buf_id, uint64 expected_generation, uint64 reservation_token);
 /* PCM-X retained-image revoke: commit advances the ownership generation but
  * deliberately leaves the exact REVOKING token live until DRAIN proves the
  * immutable image record is no longer needed.  Release clears only that
@@ -173,6 +186,14 @@ cluster_pcm_own_reservation_token_get(int buf_id)
 	if (ClusterPcmOwnArray == NULL || buf_id < 0)
 		return 0;
 	return pg_atomic_read_u64(&ClusterPcmOwnArray[buf_id].reservation_token);
+}
+
+static inline uint64
+cluster_pcm_own_writer_activation_token_get(int buf_id)
+{
+	if (ClusterPcmOwnArray == NULL || buf_id < 0)
+		return 0;
+	return pg_atomic_read_u64(&ClusterPcmOwnArray[buf_id].writer_activation_token);
 }
 
 static inline void

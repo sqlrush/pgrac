@@ -611,6 +611,29 @@ cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
 	return found && entry != NULL;
 }
 
+bool
+cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
+{
+	struct GrdEntry *entry;
+	PcmAuthoritySnapshot current;
+	bool found;
+	bool matches = false;
+
+	if (expected == NULL || ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		pcm_authority_snapshot_locked(entry, &current);
+		matches = pcm_authority_snapshot_equal(&current, expected);
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return matches;
+}
+
 /*
  * Atomically install the queue winner as the sole X holder, but only if the
  * authority still exactly matches the snapshot captured when the transfer
@@ -852,6 +875,8 @@ cluster_pcm_lock_clear_queue_pending_x_exact(BufferTag tag, int32 requester_node
 			cleared = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
+		if (cleared)
+			ConditionVariableBroadcast(&entry->wait_cv);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return cleared;
@@ -862,6 +887,7 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag)
 {
 	struct GrdEntry *entry;
 	bool found;
+	bool cleared = false;
 
 	if (cluster_pcm_htab == NULL)
 		return;
@@ -870,11 +896,15 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag)
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		if ((entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
+		if (entry->pending_x_requester_node != -1
+			&& (entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
+			cleared = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
+		if (cleared)
+			ConditionVariableBroadcast(&entry->wait_cv);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
@@ -911,6 +941,8 @@ cluster_pcm_lock_clear_pending_x_if(BufferTag tag, int32 expected_requester)
 			cleared = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
+		if (cleared)
+			ConditionVariableBroadcast(&entry->wait_cv);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return cleared;
@@ -1072,6 +1104,8 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&scan, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		bool cleared_entry = false;
+
 		/* Fast SHARED read first — most entries will not match. */
 		if (entry->pending_x_requester_node != dead_node)
 			continue;
@@ -1084,8 +1118,11 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared++;
+			cleared_entry = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
+		if (cleared_entry)
+			ConditionVariableBroadcast(&entry->wait_cv);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 
@@ -1410,67 +1447,77 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 
 
 /*
- * PGRAC: spec-5.2 D11 — local-master record self as the new X holder after a
- * writer-transfer (revoke).
+ * P0-26: exact local-master X-transfer commit.
  *
- *	THIS node is the GCS master for the block.  A remote node held it in X; we
- *	(the master + the writing requester) forwarded an X-transfer request, the
- *	holder shipped its current image AND released its own X (invalidating its
- *	local copy so it can never flush a stale page — Rule 8.A no-stale-flush),
- *	and we just installed the shipped bytes under content_lock EXCLUSIVE.  Now
- *	make the authoritative master GRD entry reflect the new ownership:  X held
- *	by self, no S holders, PI watermark advanced to the shipped page_lsn.
- *
- *	The old holder released BEFORE this point (its forward handler dropped its
- *	copy before replying X_GRANTED_FROM_HOLDER), so there is never a window with
- *	two X holders;  there is at most a brief no-holder window, which is safe.
- *	Mirrors the X branch of cluster_gcs_block_master_rebuild_from_redeclare.
+ * The remote holder drops its X before replying, but the local master keeps
+ * the sampled remote-X authority until this barrier.  Requiring the complete
+ * entry-lock snapshot prevents a late reply from overwriting a newer queue
+ * winner, holder session, or generation.  STALE performs no mutation.
  */
-void
-cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn, SCN page_scn,
-											  int32 holder_node, uint64 request_id, uint64 epoch)
+PcmXTransferCommitResult
+cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthoritySnapshot *expected,
+											  XLogRecPtr page_lsn, SCN page_scn, int32 holder_node,
+											  uint32 requester_procno, uint64 request_id,
+											  uint64 epoch)
 {
 	struct GrdEntry *entry;
+	PcmAuthoritySnapshot current;
+	ClusterGrdHolderId requester;
+	bool found;
 
-	if (cluster_pcm_htab == NULL)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)")));
+	if (expected == NULL || holder_node < 0 || holder_node >= 32 || request_id == 0)
+		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return PCM_X_TRANSFER_COMMIT_NOT_FOUND;
 
-	entry = pcm_get_or_create_entry(tag);
-	if (entry == NULL)
-		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-						errmsg("cluster_pcm_lock_master_take_x_after_transfer: PCM GRD HTAB "
-							   "FULL (cap=%d)",
-							   pcm_grd_effective)));
+	requester.node_id = (uint32)cluster_node_id;
+	requester.procno = requester_procno;
+	requester.cluster_epoch = epoch;
+	requester.request_id = request_id;
 
-	pcm_entry_lock_exclusive(entry);
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (!found || entry == NULL) {
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_X_TRANSFER_COMMIT_NOT_FOUND;
+	}
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pcm_authority_snapshot_locked(entry, &current);
+	if (!pcm_authority_snapshot_equal(&current, expected)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_X_TRANSFER_COMMIT_STALE;
+	}
+	if (current.state != PCM_STATE_X || current.x_holder_node != holder_node
+		|| current.s_holders_bitmap != 0 || current.pending_x_requester_node != -1
+		|| current.master_holder.node_id != (uint32)holder_node) {
+		LWLockRelease(&entry->entry_lock.lock);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
+	}
+
 	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = cluster_node_id;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
-	/* HC110: keep master_holder coherent with the X holder so subsequent
-	 * forward/ship decisions (and spec-5.2 D11 path-B detection of
-	 * master==holder==self) read the right holder identity. */
-	pcm_master_holder_set_node(entry, cluster_node_id);
-	/* spec-2.41 D2 (§2.8.1) — local-page source advances BOTH watermarks
-	 * monotonically: lsn for the redo-coverage serve-gate, scn for the
-	 * lost-write detector.  page_scn comes from the installed page's
-	 * pd_block_scn (InvalidScn-safe). */
+	entry->s_holder_refcount_local = 0;
+	pcm_master_holder_set_exact(entry, &requester);
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64)page_lsn;
-	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
-	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
 	if (SCN_VALID(page_scn)) {
 		SCN wm_old = entry->pi_watermark_scn;
 
-		if (scn_local(page_scn)
-			> scn_local(entry->pi_watermark_scn)) { /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		if (scn_local(page_scn) > scn_local(entry->pi_watermark_scn)) {
 			entry->pi_watermark_scn = page_scn;
-			/* step 1b: record the shipping holder's wire identity on advance. */
 			pcm_wm_prov_record(tag, wm_old, page_scn, CLUSTER_PCM_WM_SRC_TAKE_X, holder_node,
 							   request_id, epoch);
 		}
 	}
+	entry->last_transition_at = GetCurrentTimestamp();
+	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
 	LWLockRelease(&entry->entry_lock.lock);
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return PCM_X_TRANSFER_COMMIT_OK;
 }
 
 /*
@@ -2127,16 +2174,31 @@ cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, in
 	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
 }
 
+/* The pending-X cookie and S-holder bitmap are both protected by entry_lock.
+ * This is the final admission point for every local/remote S publication:
+ * existing S residency may re-enter without changing authority, but a new bit
+ * cannot cross any live writer barrier (including the same-node case). */
+static bool
+pcm_s_admission_allowed_locked(struct GrdEntry *entry, uint32 holder_bit)
+{
+	Assert(entry != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	return (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0
+		   || entry->pending_x_requester_node == -1;
+}
+
 /*
  * Apply a GCS-requested PCM transition on the master side.
  *
- * Unlike the public local APIs, this helper returns false on state
- * incompatibility so the GCS request handler can send a DENIED reply instead
- * of raising ERROR and leaking the caller's reply wait.  Caller is the GCS
- * request handler; sender-side code must not call this after a GRANTED reply.
+ * Unlike the public local APIs, the exact helper distinguishes a raced
+ * pending-X barrier from structural incompatibility so the block handler can
+ * return the retryable denial without raising ERROR or leaking the caller's
+ * reply wait.  The bool wrapper preserves existing callers' applied/not-
+ * applied contract.
  */
-bool
-cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, int holder_node_id)
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
+											 int holder_node_id)
 {
 	struct GrdEntry *entry;
 	PcmState cur;
@@ -2145,25 +2207,29 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 	bool broadcast_needed = false;
 
 	if (cluster_pcm_htab == NULL)
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (holder_node_id < 0 || holder_node_id >= 32)
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (trans < PCM_TRANS_N_TO_S || trans > PCM_TRANS_S_TO_X_CLEANOUT)
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (trans == PCM_TRANS_S_TO_X_CLEANOUT)
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 
 	if (trans == PCM_TRANS_N_TO_S || trans == PCM_TRANS_N_TO_X)
 		entry = pcm_get_or_create_entry(tag);
 	else
 		entry = pcm_find_entry(tag);
 	if (entry == NULL)
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 
 	holder_bit = pcm_holder_bit(holder_node_id);
 	target = pcm_transition_target(trans);
 
 	pcm_entry_lock_exclusive(entry);
+	if (trans == PCM_TRANS_N_TO_S && !pcm_s_admission_allowed_locked(entry, holder_bit)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return PCM_GCS_TRANSITION_PENDING_X;
+	}
 	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
 
 	/*
@@ -2175,7 +2241,7 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 	if (trans == PCM_TRANS_N_TO_S && cur == PCM_STATE_S) {
 		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 		LWLockRelease(&entry->entry_lock.lock);
-		return true;
+		return PCM_GCS_TRANSITION_APPLIED;
 	}
 
 	/*
@@ -2189,12 +2255,12 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 			|| (cur == PCM_STATE_S
 				&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0))) {
 		LWLockRelease(&entry->entry_lock.lock);
-		return true;
+		return PCM_GCS_TRANSITION_APPLIED;
 	}
 
 	if (!cluster_pcm_transition_legal(cur, target, trans)) {
 		LWLockRelease(&entry->entry_lock.lock);
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	}
 
 	switch (trans) {
@@ -2205,7 +2271,7 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0
 			|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit) != 0) {
 			LWLockRelease(&entry->entry_lock.lock);
-			return false;
+			return PCM_GCS_TRANSITION_INCOMPATIBLE;
 		}
 		break;
 	case PCM_TRANS_X_TO_S_DOWNGRADE:
@@ -2213,29 +2279,37 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 	case PCM_TRANS_X_TO_N_RELEASE:
 		if (entry->x_holder_node != holder_node_id) {
 			LWLockRelease(&entry->entry_lock.lock);
-			return false;
+			return PCM_GCS_TRANSITION_INCOMPATIBLE;
 		}
 		break;
 	case PCM_TRANS_S_TO_N_INVALIDATE:
 	case PCM_TRANS_S_TO_N_RELEASE:
 		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0) {
 			LWLockRelease(&entry->entry_lock.lock);
-			return false;
+			return PCM_GCS_TRANSITION_INCOMPATIBLE;
 		}
 		break;
 	case PCM_TRANS_S_TO_X_CLEANOUT:
 		LWLockRelease(&entry->entry_lock.lock);
-		return false;
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	}
 
 	cluster_pcm_transition_apply(entry, trans, holder_node_id);
-	if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N)
+	if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
+		|| trans == PCM_TRANS_X_TO_S_DOWNGRADE)
 		broadcast_needed = true;
 	LWLockRelease(&entry->entry_lock.lock);
 
 	if (broadcast_needed)
 		ConditionVariableBroadcast(&entry->wait_cv);
-	return true;
+	return PCM_GCS_TRANSITION_APPLIED;
+}
+
+bool
+cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, int holder_node_id)
+{
+	return cluster_pcm_lock_apply_gcs_transition_result(tag, trans, holder_node_id)
+		   == PCM_GCS_TRANSITION_APPLIED;
 }
 
 
@@ -2427,8 +2501,8 @@ cluster_pcm_get_trans_s_to_x_cleanout_count(void)
 							"activate the spec-2.30 PCM state machine.")))
 
 
-void
-cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
+static bool
+pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *remote_x_out)
 {
 	struct GrdEntry *entry;
 	int holder_node;
@@ -2504,21 +2578,23 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 	 */
 	for (;;) {
 		PcmState cur;
+		bool pending_x_blocks_new_s = false;
 
 		pcm_entry_lock_exclusive(entry);
 
 		cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
 
 		if (mode == PCM_LOCK_MODE_S) {
-			if (cur == PCM_STATE_N) {
+			pending_x_blocks_new_s = !pcm_s_admission_allowed_locked(entry, holder_bit);
+			if (!pending_x_blocks_new_s && cur == PCM_STATE_N) {
 				cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, holder_node);
 				entry->s_holder_refcount_local = 1;
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();
-				return;
+				return true;
 			}
-			if (cur == PCM_STATE_S) {
+			if (!pending_x_blocks_new_s && cur == PCM_STATE_S) {
 				/* Same-node S re-acquire: bump refcount; or join from other-node-S. */
 				if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0)
 					entry->s_holder_refcount_local++;
@@ -2529,7 +2605,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();
-				return;
+				return true;
 			}
 			/* cur == X → fall through to wait */
 		} else /* mode == PCM_LOCK_MODE_X */
@@ -2541,7 +2617,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();
-				return;
+				return true;
 			}
 			/*
 			 * PGRAC: spec-6.12a — idempotent X re-acquire.  This NODE already
@@ -2557,7 +2633,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();
-				return;
+				return true;
 			}
 
 			holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
@@ -2575,7 +2651,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();
-				return;
+				return true;
 			}
 			/* cur == S or X → fall through to wait */
 		}
@@ -2596,7 +2672,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 		 * conflicting holder under the already-held entry_lock (no extra
 		 * htab_lock → no lock-order inversion).
 		 */
-		if (cluster_gcs_block_local_cache) {
+		if (cluster_gcs_block_local_cache && !pending_x_blocks_new_s) {
 			int32 confl_x = entry->x_holder_node;
 			uint32 confl_s = pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit;
 			bool remote_live = false;
@@ -2611,6 +2687,19 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 					remote_live = true;
 
 			if (remote_live) {
+				/* P0-26: the optimistic buffer-aware precheck may race a queue
+				 * handoff.  Capture the complete remote-X authority under the
+				 * same entry lock instead of escaping through the tag-only
+				 * legacy terminal; the caller owns the BufferDesc transfer. */
+				if (cur == PCM_STATE_X && confl_x >= 0 && confl_x != holder_node
+					&& remote_x_out != NULL) {
+					pcm_authority_snapshot_locked(entry, remote_x_out);
+					LWLockRelease(&entry->entry_lock.lock);
+					if (cv_prepared)
+						ConditionVariableCancelSleep();
+					return false;
+				}
+
 				/*
 				 * PGRAC: spec-6.12a — LOCAL-master S->X upgrade.  When the
 				 * conflict is ONLY remote S copies (the quiescent X->S
@@ -2641,7 +2730,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 						pcm_entry_lock_exclusive(entry);
 						entry->s_holder_refcount_local = 0;
 						LWLockRelease(&entry->entry_lock.lock);
-						return;
+						return true;
 					}
 					/* Invalidate did not complete — fail closed, retryable
 					 * (Rule 8.A: never write past an unconfirmed invalidate). */
@@ -2699,6 +2788,14 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		/* loop and re-check master_state */
 	}
+}
+
+void
+cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
+{
+	/* A tag-only caller has no BufferDesc and therefore retains the
+	 * historical fail-closed behavior for a remote-X conflict. */
+	(void)pcm_lock_acquire_local(tag, mode, NULL);
 }
 
 
@@ -2883,11 +2980,15 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	 * (durable S; caller mirrors pcm_state = S).
 	 */
 	if (mode == PCM_LOCK_MODE_S) {
-		PcmLockMode master_state = cluster_pcm_lock_query(tag);
-		int32 holder = cluster_pcm_master_holder_node_by_tag(tag);
+		PcmAuthoritySnapshot authority;
+		bool have_authority = cluster_pcm_lock_authority_snapshot(tag, &authority);
 
-		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
-			return cluster_gcs_local_master_read_image_and_wait(buf, holder);
+		if (have_authority && authority.state == PCM_STATE_X
+			&& authority.x_holder_node >= 0 && authority.x_holder_node != cluster_node_id
+			&& authority.s_holders_bitmap == 0
+			&& authority.master_holder.node_id == (uint32)authority.x_holder_node)
+			return cluster_gcs_local_master_read_image_and_wait(buf, &authority,
+														 out_retry_denied);
 	} else /* mode == PCM_LOCK_MODE_X */
 	{
 		/*
@@ -2901,11 +3002,15 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		 * The heap AM then sees the remote row lock and enters the cross-node TX
 		 * completion wait (spec-5.2 D4/D5).
 		 */
-		PcmLockMode master_state = cluster_pcm_lock_query(tag);
-		int32 holder = cluster_pcm_master_holder_node_by_tag(tag);
+		PcmAuthoritySnapshot authority;
+		bool have_authority = cluster_pcm_lock_authority_snapshot(tag, &authority);
+		PcmLockMode master_state = have_authority ? (PcmLockMode)authority.state : PCM_LOCK_MODE_N;
 
-		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
-			return cluster_gcs_local_master_x_transfer_and_wait(buf, holder, clean_eligible);
+		if (have_authority && authority.state == PCM_STATE_X && authority.x_holder_node >= 0
+			&& authority.x_holder_node != cluster_node_id && authority.s_holders_bitmap == 0
+			&& authority.master_holder.node_id == (uint32)authority.x_holder_node)
+			return cluster_gcs_local_master_x_transfer_and_wait(buf, &authority, clean_eligible,
+																out_retry_denied);
 
 		/*
 		 * PGRAC: spec-4.6a BUG-C2 follow-through for shared_catalog DDL after
@@ -2922,9 +3027,16 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 
 			if ((cluster_pcm_lock_query_s_holders_bitmap(tag) & self_bit) == 0) {
 				struct GrdEntry *entry;
+				PcmAuthoritySnapshot raced_remote_x;
 				bool upgraded = false;
 
-				cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+				/* The S bootstrap is still BufferDesc-aware: if a queue handoff
+				 * replaces the sampled S authority with remote X before this entry
+				 * lock, preserve that exact authority and use the normal X-transfer
+				 * path instead of the tag-only legacy terminal. */
+				if (!pcm_lock_acquire_local(tag, PCM_LOCK_MODE_S, &raced_remote_x))
+					return cluster_gcs_local_master_x_transfer_and_wait(
+						buf, &raced_remote_x, clean_eligible, out_retry_denied);
 				/* Amendment v1.2 (R5): the upgrade waits on remote ACKs with
 				 * CHECK_FOR_INTERRUPTS in the loop, so a cancel can THROW out
 				 * of it — release the temporary S claim on that path too, not
@@ -2972,7 +3084,17 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		}
 	}
 
-	cluster_pcm_lock_acquire(tag, mode);
+	{
+		PcmAuthoritySnapshot raced_remote_x;
+
+		if (!pcm_lock_acquire_local(tag, mode, &raced_remote_x)) {
+			if (mode == PCM_LOCK_MODE_S)
+				return cluster_gcs_local_master_read_image_and_wait(buf, &raced_remote_x,
+														 out_retry_denied);
+			return cluster_gcs_local_master_x_transfer_and_wait(buf, &raced_remote_x,
+																clean_eligible, out_retry_denied);
+		}
+	}
 	/*
 	 * PGRAC: GCS-race round-4c FUNC-1 (local-master flavour) — the tag-only
 	 * grant ships no image, so the buffer keeps this backend's pre-read

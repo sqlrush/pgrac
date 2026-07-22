@@ -63,6 +63,7 @@
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
 #include "cluster/cluster_gcs_block.h"	 /* PGRAC: spec-7.2 D4 plane probe + pi drain */
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_write_fence.h" /* PGRAC: spec-7.2 D5 fence linkage */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -211,6 +212,7 @@ cluster_lms_shmem_init(void)
 				pg_atomic_init_u64(&cluster_lms_state->worker_inline_serve_count[w], 0);
 				pg_atomic_init_u64(&cluster_lms_state->worker_outbound_not_admitted_count[w], 0);
 				pg_atomic_init_u64(&cluster_lms_state->worker_outbound_requeue_drop_count[w], 0);
+				pg_atomic_init_u64(&cluster_lms_state->worker_outbound_cap_guard_drop_count[w], 0);
 				for (b = 0; b < CLUSTER_LMS_SERVE_HIST_BUCKETS; b++)
 					pg_atomic_init_u64(&cluster_lms_state->worker_serve_hist[w][b], 0);
 			}
@@ -699,6 +701,47 @@ lms_sigusr1_handler(SIGNAL_ARGS)
 	SetLatch(MyLatch);
 }
 
+/* Report when this DATA worker has applied the process-local finish-Flush
+ * injection state.  The transition log is the reload acknowledgement used by
+ * t/400; without it, a fixed sleep can race a worker that has not processed
+ * SIGHUP yet and turn a fault-injection leg into a false negative. */
+static void
+lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
+{
+	static bool was_armed = false;
+	bool armed;
+
+	armed = cluster_injection_is_armed("cluster-pcm-x-retain-flush-error");
+	if (!armed && !was_armed)
+		return;
+	ereport(LOG,
+			(errmsg_internal("cluster_lms: DATA worker=%d applied PCM-X finish Flush "
+							 "injection config: pid=%d armed=%s value=\"%s\"",
+							 worker_id, (int)MyProcPid, armed ? "true" : "false",
+							 cluster_injection_points != NULL ? cluster_injection_points : "")));
+	was_armed = armed;
+}
+
+
+void
+cluster_lms_note_pcm_x_image_ready_boundary(
+	uint8 msg_type, const char *boundary, int result, int runtime_state, bool fence_enforcing,
+	bool fence_allowed, uint32 dest_node_id, uint64 request_id, uint64 ticket_id, uint64 grant_generation,
+	uint64 image_id)
+{
+	if (boundary == NULL
+		|| !cluster_injection_is_armed("cluster-pcm-x-retain-flush-error"))
+		return;
+	ereport(LOG,
+			(errmsg_internal("PCM-X IMAGE_READY transport boundary: %s", boundary),
+			 errdetail("msg_type=%u result=%d runtime=%d fence_enforcing=%s fence_allowed=%s dest=%u "
+					   "request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
+					   (unsigned)msg_type, result, runtime_state, fence_enforcing ? "true" : "false",
+					   fence_allowed ? "true" : "false", dest_node_id,
+					   (unsigned long long)request_id, (unsigned long long)ticket_id,
+					   (unsigned long long)grant_generation, (unsigned long long)image_id)));
+}
+
 void
 LmsMain(void)
 {
@@ -785,6 +828,7 @@ LmsMain(void)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			lms_note_pcm_x_finish_flush_injection_reload(0);
 			/* PGRAC: spec-7.3 D8 — re-apply cluster.lms_nice on reload. */
 			cluster_lms_apply_nice();
 		}
@@ -956,6 +1000,7 @@ LmsWorkerMain(int worker_id)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			lms_note_pcm_x_finish_flush_injection_reload(worker_id);
 			/* PGRAC: spec-7.3 D8 — re-apply cluster.lms_nice on reload. */
 			cluster_lms_apply_nice();
 		}
@@ -1123,6 +1168,14 @@ cluster_lms_obs_note_outbound_requeue_drop(int worker_id)
 	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_outbound_requeue_drop_count[worker_id], 1);
 }
 
+void
+cluster_lms_obs_note_outbound_cap_guard_drop(int worker_id)
+{
+	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_lms_state->worker_outbound_cap_guard_drop_count[worker_id], 1);
+}
+
 uint64
 cluster_lms_obs_get_outbound_not_admitted(int worker_id)
 {
@@ -1137,6 +1190,14 @@ cluster_lms_obs_get_outbound_requeue_drop(int worker_id)
 	return cluster_lms_state == NULL
 			   ? 0
 			   : lms_obs_read(cluster_lms_state->worker_outbound_requeue_drop_count, worker_id);
+}
+
+uint64
+cluster_lms_obs_get_outbound_cap_guard_drop(int worker_id)
+{
+	return cluster_lms_state == NULL
+			   ? 0
+			   : lms_obs_read(cluster_lms_state->worker_outbound_cap_guard_drop_count, worker_id);
 }
 
 uint64

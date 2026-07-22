@@ -33,7 +33,7 @@
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
 /* 13: A' rebase slot growth (ticket 392 / local tag 760 / header stats). */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)13)
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)14)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -194,6 +194,13 @@ typedef struct PcmXRevokePayload {
 	uint64 image_id;
 } PcmXRevokePayload;
 
+/* P0-20 source-floor extension.  V1 remains the byte-exact 96-byte prefix;
+ * V2 is sent only to a connection that advertised SOURCE_FLOOR_V1. */
+typedef struct PcmXRevokePayloadV2 {
+	PcmXRevokePayload v1;
+	uint64 required_page_scn;
+} PcmXRevokePayloadV2;
+
 typedef struct PcmXGrantPayload {
 	PcmXTicketRef ref;
 	PcmXImageToken image;
@@ -259,6 +266,9 @@ StaticAssertDecl(sizeof(PcmXPrehandleCancelPayload) == 80, "PCM-X pre-handle CAN
 StaticAssertDecl(sizeof(PcmXAdmitAckPayload) == 112, "PCM-X ADMIT_ACK ABI");
 StaticAssertDecl(sizeof(PcmXPhasePayload) == 96, "PCM-X phase ABI");
 StaticAssertDecl(sizeof(PcmXRevokePayload) == 96, "PCM-X revoke ABI");
+StaticAssertDecl(sizeof(PcmXRevokePayloadV2) == 104, "PCM-X revoke V2 ABI");
+StaticAssertDecl(offsetof(PcmXRevokePayloadV2, required_page_scn) == sizeof(PcmXRevokePayload),
+				 "PCM-X revoke V2 preserves the complete V1 prefix");
 StaticAssertDecl(sizeof(PcmXGrantPayload) == 128, "PCM-X grant ABI");
 StaticAssertDecl(sizeof(PcmXInstallReadyPayload) == 112, "PCM-X INSTALL_READY ABI");
 StaticAssertDecl(offsetof(PcmXInstallReadyPayload, rebased_own_generation)
@@ -440,6 +450,25 @@ typedef enum PcmXQueueResult {
 	PCM_X_QUEUE_BARRIER_CLOSED
 } PcmXQueueResult;
 
+/* Process-local classification for the holder-side IMAGE_READY arm.  This is
+ * diagnostic evidence only: the queue result remains the protocol verdict and
+ * no value from this enum is persisted in shared memory or sent on the wire. */
+typedef enum PcmXLocalImageReadyRefusal {
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_NONE = 0,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_INVALID,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_RUNTIME,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_DIRECTORY,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_TAG_SLOT,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_LOCAL_GATE,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_RUNTIME_RECHECK,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_IDENTITY,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_ACTIVE_HOLDER,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_RELIABLE_LEG,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_BAD_PHASE,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_COUNTER,
+	PCM_X_LOCAL_IMAGE_READY_REFUSAL_GATE_RELEASE
+} PcmXLocalImageReadyRefusal;
+
 /* A generation-exact type-47 replay can prove the blocker set DUPLICATE
  * after the ticket has already advanced beyond ACTIVE_PROBE.  Its type-48
  * ACK is still safe to replay; only structural corruption warrants closing
@@ -613,6 +642,7 @@ StaticAssertDecl(sizeof(PcmXLocalProgress) == 248, "PCM-X local progress ABI");
 typedef struct PcmXLocalHolderProgress {
 	PcmXTicketRef ref;
 	PcmXImageToken image;
+	uint64 required_page_scn;
 	uint64 reliable_state_sequence;
 	uint16 pending_opcode;
 	uint16 last_response_opcode;
@@ -624,7 +654,7 @@ typedef struct PcmXLocalHolderProgress {
 	uint32 reserved;
 } PcmXLocalHolderProgress;
 
-StaticAssertDecl(sizeof(PcmXLocalHolderProgress) == 160, "PCM-X local holder progress ABI");
+StaticAssertDecl(sizeof(PcmXLocalHolderProgress) == 168, "PCM-X local holder progress ABI");
 
 typedef struct PcmXLocalCutoff {
 	PcmXSlotRef tag_slot;
@@ -992,6 +1022,7 @@ typedef struct PcmXLocalTagSlot {
 	uint64 committed_own_generation;
 	PcmXTicketRef holder_ref;
 	PcmXImageToken holder_image;
+	uint64 holder_required_page_scn;
 	PcmXReliableLegState holder_reliable;
 	uint64 holder_terminal_drain_generation;
 	PcmXTicketRef blocker_snapshot_ref;
@@ -1036,8 +1067,8 @@ StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 392, "PCM-X master ticket slot 
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, grant_base_own_generation) == 384,
 				 "PCM-X master ticket grant-base offset");
 StaticAssertDecl(sizeof(PcmXBlockerSlot) == 128, "PCM-X blocker slot ABI");
-StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 760, "PCM-X local tag slot ABI");
-StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 752,
+StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 768, "PCM-X local tag slot ABI");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 760,
 				 "PCM-X local tag grant-base offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, membership_count) == 384,
 				 "PCM-X local membership count offset");
@@ -1050,13 +1081,15 @@ StaticAssertDecl(offsetof(PcmXLocalTagSlot, committed_own_generation) == 408,
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_ref) == 416, "PCM-X local holder ticket offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_image) == 504,
 				 "PCM-X local holder image offset");
-StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_reliable) == 544,
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_required_page_scn) == 544,
+				 "PCM-X local holder source-floor offset");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_reliable) == 552,
 				 "PCM-X local holder reliable-leg offset");
-StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_terminal_drain_generation) == 600,
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, holder_terminal_drain_generation) == 608,
 				 "PCM-X local holder terminal drain generation offset");
-StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_ref) == 608,
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_ref) == 616,
 				 "PCM-X local blocker snapshot ticket offset");
-StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_reliable) == 696,
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_reliable) == 704,
 				 "PCM-X local blocker snapshot reliable-leg offset");
 StaticAssertDecl(sizeof(PcmXLocalMembershipSlot) == 168, "PCM-X local membership slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalMembershipSlot, admitted_round) == 160,
@@ -1432,6 +1465,9 @@ extern PcmXQueueResult
 cluster_pcm_x_master_commit_retry_exact(const PcmXMasterDriveSnapshot *expected, uint64 now_ms,
 										uint64 next_retry_deadline_ms, PcmXPhasePayload *commit_out,
 										PcmXMasterDriveSnapshot *snapshot_out);
+extern PcmXQueueResult cluster_pcm_x_master_invalidate_busy_backoff_exact(
+	const PcmXMasterDriveSnapshot *expected, int32 busy_node, uint64 now_ms,
+	uint64 retry_delay_ms, PcmXMasterDriveSnapshot *snapshot_out);
 typedef bool (*PcmXStageFrameCallback)(uint8 msg_type, int32 dest_node_id, const void *payload,
 									   Size payload_len, void *callback_arg);
 extern PcmXQueueResult
@@ -1603,9 +1639,18 @@ extern PcmXQueueResult
 cluster_pcm_x_local_holder_revoke_apply_exact(const PcmXRevokePayload *revoke,
 											  int32 authenticated_master_node,
 											  uint64 authenticated_master_session);
+extern PcmXQueueResult
+cluster_pcm_x_local_holder_revoke_apply_floor_exact(const PcmXRevokePayload *revoke,
+												uint64 required_page_scn,
+												int32 authenticated_master_node,
+												uint64 authenticated_master_session);
 extern PcmXQueueResult cluster_pcm_x_local_holder_image_ready_arm_exact(
 	const PcmXGrantPayload *image_ready, int32 authenticated_master_node,
 	uint64 authenticated_master_session, PcmXGrantPayload *replay_out);
+extern PcmXQueueResult cluster_pcm_x_local_holder_image_ready_arm_exact_diagnosed(
+	const PcmXGrantPayload *image_ready, int32 authenticated_master_node,
+	uint64 authenticated_master_session, PcmXGrantPayload *replay_out,
+	PcmXLocalImageReadyRefusal *refusal_out);
 extern PcmXQueueResult cluster_pcm_x_local_enqueue_arm_exact(const PcmXLocalHandle *leader,
 															 PcmXEnqueuePayload *payload_out,
 															 PcmXLocalReliableToken *token_out);

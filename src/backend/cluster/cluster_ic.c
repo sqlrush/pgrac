@@ -666,6 +666,9 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	/* A' rebase: V2 INSTALL_READY understanding, same unconditional protocol
 	 * discipline; activation is formation-wide (see cluster_ic.h). */
 	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1;
+	/* P0-20: V2 REVOKE source-floor carrier.  Senders still gate the extended
+	 * frame on the selected peer's current verified connection. */
+	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

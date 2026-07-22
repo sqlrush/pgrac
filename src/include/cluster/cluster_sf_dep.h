@@ -124,6 +124,19 @@ cluster_sf_peer_cap_family_sample(const ClusterSfPeerCap *cap, uint32 required_b
 	return true;
 }
 
+/* Exact pre-send fence for a capability-bound frame.  Both the required
+ * bits and generation are read from one immutable record snapshot by the
+ * caller holding the capability-store lock. */
+static inline bool
+cluster_sf_peer_cap_generation_matches_exact(const ClusterSfPeerCap *cap, uint32 required_bits,
+											 uint32 expected_generation)
+{
+	uint32 observed_generation;
+
+	return cluster_sf_peer_cap_generation_for_bits(cap, required_bits, &observed_generation)
+		   && observed_generation == expected_generation;
+}
+
 /* Returns true iff the record was live for exactly this generation and got
  * cleared; a mismatch (older/newer generation, already invalid) is a no-op. */
 static inline bool
@@ -258,6 +271,12 @@ extern bool cluster_sf_peer_supports_xid_authority_flock(int32 peer_id);
 extern bool cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_convert(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id);
+extern bool cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id);
+extern bool cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
+													 uint32 *generation_out);
+extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
+												  uint32 required_capabilities,
+												  uint32 expected_generation);
 /* review P0-2: lock-coherent (CONVERT supported, REBASE bit, record
  * generation) triple for the formation collector's double sample. */
 extern bool cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out,

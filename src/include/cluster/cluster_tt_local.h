@@ -39,6 +39,7 @@
 
 #include "c.h"
 #include "access/transam.h"
+#include "cluster/cluster_itl_slot.h"  /* UBA */
 #include "cluster/cluster_scn.h"	   /* SCN */
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
 
@@ -106,6 +107,15 @@ extern void cluster_tt_local_record_abort(TransactionId xid);
  *	  ensuring the binding exists before invoking this).
  */
 extern void cluster_tt_local_record_active(TransactionId xid);
+
+/*
+ * Publish ACTIVE for an ordinary heap data write using the exact UBA carried
+ * by the page's ITL slot.  Record-extent rollover can make the UBA's record
+ * segment differ from the transaction binding's canonical TT segment; this
+ * entry point registers that exact-key alias so commit/abort later publish the
+ * same terminal status to it.  `uba` must carry the binding's slot offset.
+ */
+extern void cluster_tt_local_record_data_active(TransactionId xid, UBA uba);
 
 /*
  * Counters / introspection used by test_cluster_tt_status (D9 T17).

@@ -1353,7 +1353,9 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 # acquire/release/upgrade/downgrade/query paths are exercised standalone.
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
@@ -1379,6 +1381,7 @@ test_cluster_pcm_direct_init: test_cluster_pcm_direct_init.c unit_test.h \
 		-DVM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/visibilitymap.c"' \
 		-DFSM_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/freespace/freespace.c"' \
 		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DHIO_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/hio.c"' \
 		$< \
 		$(CLUSTER_PCM_DIRECT_INIT_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
@@ -1450,7 +1453,10 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
+		-DLMS_OUTBOUND_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c"' \
+		-DT400_SOURCE_PATH='"$(top_srcdir)/src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl"' \
 		$< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -1613,9 +1619,12 @@ test_cluster_tt_status_hint: test_cluster_tt_status_hint.c unit_test.h \
 # HeapTupleSatisfiesMVCC behavioral testing (requires real PG backend;
 # behavioral coverage in cluster_tap t/204).
 test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
-		$(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DTT_LOCAL_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_tt_local.c"' \
+		$< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

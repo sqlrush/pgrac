@@ -82,7 +82,6 @@
 
 UT_DEFINE_GLOBALS();
 
-
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -472,7 +471,8 @@ stage_pcm_x_ready(int worker_id, const GcsBlockDedupKey *key, const BufferTag *t
 	result = cluster_gcs_block_dedup_pcm_x_reserve(worker_id, key, tag, &reserved);
 	if (result != GCS_BLOCK_PCM_X_IMAGE_RESERVED && result != GCS_BLOCK_PCM_X_IMAGE_DUPLICATE)
 		return result;
-	result = cluster_gcs_block_dedup_pcm_x_materialize(worker_id, key, tag, binding, hdr, page);
+	result = cluster_gcs_block_dedup_pcm_x_materialize(worker_id, key, tag, binding, UINT64_C(41),
+													   (uint8)PCM_STATE_X, hdr, page);
 	if (result != GCS_BLOCK_PCM_X_IMAGE_STORED && result != GCS_BLOCK_PCM_X_IMAGE_DUPLICATE)
 		return result;
 	return cluster_gcs_block_dedup_pcm_x_publish_ready_exact(worker_id, key, tag, binding);
@@ -1054,7 +1054,7 @@ UT_TEST(u16_capability_routing_truth_table)
  * field or increasing the entry size. */
 UT_TEST(u17_pcm_x_binding_layout_is_zero_entry_growth)
 {
-	UT_ASSERT_EQ((int)sizeof(GcsBlockPcmXImageBinding), 136);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockPcmXImageBinding), 144);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, entry_kind), 46);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pcm_x_master_session), 48);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header), 56);
@@ -1099,6 +1099,7 @@ UT_TEST(u18_pcm_x_stage_duplicate_and_generic_overwrite_refused)
 	UT_ASSERT_EQ((int)stage_pcm_x_ready(0, &key, &tag, &binding, &hdr, page),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_DUPLICATE);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &conflicting_binding,
+																UINT64_C(41), (uint8)PCM_STATE_X,
 																&conflicting_hdr, overwrite),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
 
@@ -1186,14 +1187,14 @@ UT_TEST(u20_pcm_x_entry_survives_generic_gc_and_retires_exactly)
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &wrong, &cached),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
 	UT_ASSERT_EQ((int)cached.entry_kind, (int)GCS_BLOCK_DEDUP_ENTRY_GENERIC);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &wrong),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &wrong, 2),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &binding),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &binding, 2),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RELEASED);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &binding, &cached),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_release_count(), 1);
-	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_failclosed_count(), 3);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_failclosed_count(), 2);
 }
 
 
@@ -1263,7 +1264,7 @@ UT_TEST(u22_pcm_x_reserved_entry_waits_for_exact_release)
 	cluster_gcs_block_dedup_cleanup_on_node_dead(1);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &reserved, &cached),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_READY);
-	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &reserved),
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &reserved, -1),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RELEASED);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_stage_count(), 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_replay_count(), 0);
@@ -1305,53 +1306,53 @@ UT_TEST(u23_pcm_x_materialize_validation_is_fail_closed_and_byte_stable)
 	bad_binding.identity.image.source_node = 1;
 	bad_hdr = hdr;
 	bad_hdr.sender_node = 1;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &bad_binding, &bad_hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &bad_binding, UINT64_C(41), (uint8)PCM_STATE_X, &bad_hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	bad_hdr = hdr;
 	bad_hdr.sender_node = 1;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &binding, &bad_hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(41), (uint8)PCM_STATE_X, &bad_hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	memcpy(bad_page, page, sizeof(bad_page));
 	bad_page[sizeof(bad_page) - 1] ^= 0x1;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &binding, &hdr, bad_page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, bad_page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	bad_binding = binding;
 	bad_binding.identity.image.page_lsn++;
 	bad_hdr = hdr;
 	bad_hdr.page_lsn++;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &bad_binding, &bad_hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &bad_binding, UINT64_C(41), (uint8)PCM_STATE_X, &bad_hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	bad_binding = binding;
 	bad_binding.identity.image.page_scn++;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &bad_binding, &hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &bad_binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	bad_binding = binding;
 	bad_binding.identity.image.page_checksum++;
 	bad_hdr = hdr;
 	bad_hdr.checksum++;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &bad_binding, &bad_hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &bad_binding, UINT64_C(41), (uint8)PCM_STATE_X, &bad_hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_INVALID);
 
 	bad_binding = binding;
 	bad_binding.master_session++;
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &bad_binding, &hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &bad_binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
 
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &binding, &hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_stage_count(), 1);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_failclosed_count(), 7);
 }
@@ -1400,6 +1401,7 @@ UT_TEST(u25_pcm_x_work_prefers_reserved_and_marks_ready_staged)
 	GcsBlockDedupKey reserved_key;
 	GcsBlockPcmXImageBinding ready_binding;
 	GcsBlockPcmXImageBinding reserved_binding;
+	GcsBlockPcmXImageBinding wrong_floor;
 	GcsBlockPcmXImageWork work;
 	GcsBlockReplyHeader hdr;
 	uint64 ready_image_id;
@@ -1424,9 +1426,15 @@ UT_TEST(u25_pcm_x_work_prefers_reserved_and_marks_ready_staged)
 	reserved_binding.identity.image.page_scn = 0;
 	reserved_binding.identity.image.page_lsn = 0;
 	reserved_binding.identity.image.page_checksum = 0;
+	reserved_binding.required_page_scn = UINT64_C(72057594037950810);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &reserved_key, &reserved_tag,
-															&reserved_binding),
+														&reserved_binding),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
+	wrong_floor = reserved_binding;
+	wrong_floor.required_page_scn++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &reserved_key, &reserved_tag,
+														&wrong_floor),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
 
 	memset(&work, 0, sizeof(work));
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
@@ -1434,7 +1442,7 @@ UT_TEST(u25_pcm_x_work_prefers_reserved_and_marks_ready_staged)
 	UT_ASSERT_EQ(memcmp(&work.key, &reserved_key, sizeof(reserved_key)), 0);
 	UT_ASSERT_EQ(memcmp(&work.binding, &reserved_binding, sizeof(reserved_binding)), 0);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &reserved_key, &reserved_tag,
-																  &reserved_binding),
+																  &reserved_binding, -1),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RELEASED);
 
 	memset(&work, 0, sizeof(work));
@@ -1577,8 +1585,9 @@ UT_TEST(u28_pcm_x_idle_hint_avoids_empty_rescan_and_reserve_rearms)
 
 /* Materialized bytes are retained evidence, not a sendable READY image.  The
  * ownership X->N commit must happen between materialize and the explicit
- * publication call; a restarted LMS scanning the intermediate state must not
- * synthesize type 50 from it. */
+ * publication call.  A live owner must receive a distinct commit-only work
+ * token so conditional BufferContent contention can retry without recopying,
+ * aborting the A-record, or synthesizing type 50. */
 UT_TEST(u29_pcm_x_materialized_bytes_require_explicit_ready_publication)
 {
 	BufferTag tag = make_tag(123);
@@ -1605,13 +1614,17 @@ UT_TEST(u29_pcm_x_materialized_bytes_require_explicit_ready_publication)
 
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key, &tag, &reserved),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &binding, &hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &binding, &cached),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_READY);
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
-				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND);
+				 (int)GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING);
+	UT_ASSERT_EQ((int)work.entry_kind, (int)GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED);
+	UT_ASSERT_EQ(memcmp(&work.binding, &binding, sizeof(binding)), 0);
+	UT_ASSERT_EQ(work.reservation_token, UINT64_C(41));
+	UT_ASSERT_EQ((int)work.source_pcm_state, (int)PCM_STATE_X);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_stage_count(), 1);
 
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_publish_ready_exact(0, &key, &tag, &binding),
@@ -1651,9 +1664,9 @@ UT_TEST(u30_pcm_x_owner_restart_audit_detects_and_retains_evidence)
 
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key, &tag, &reserved),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
-	UT_ASSERT_EQ(
-		(int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key, &tag, &binding, &hdr, page),
-		(int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(41), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
 	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_restart_audit(0));
 	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &binding, &cached),
 				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_READY);
@@ -1937,10 +1950,178 @@ UT_TEST(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut)
 					   | GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
 }
 
+
+/* A contended tag A may remain at the commit-only boundary, but its exact
+ * retry must not prevent the same DATA worker from advancing independent tag
+ * B.  This exercises the production HTAB scan/cursor, not a scheduler model. */
+UT_TEST(u35_pcm_x_commit_pending_rotates_to_independent_reserved_tag)
+{
+	BufferTag tag_a = make_tag(130);
+	BufferTag tag_b = make_tag(131);
+	GcsBlockDedupKey key_a;
+	GcsBlockDedupKey key_b;
+	GcsBlockPcmXImageBinding binding_a;
+	GcsBlockPcmXImageBinding reserved_a;
+	GcsBlockPcmXImageBinding reserved_b;
+	GcsBlockPcmXImageWork work;
+	GcsBlockReplyHeader hdr_a;
+	char page_a[GCS_BLOCK_DATA_SIZE];
+	uint64 image_a;
+	uint64 image_b;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 30, &image_a));
+	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 31, &image_b));
+	key_a = make_key(1, 3, image_a, 13);
+	key_b = make_key(1, 4, image_b, 13);
+	binding_a = make_pcm_x_binding(tag_a, 1, 5, gcs_reqid_requester(1, 2, 100), 13, image_a, 120);
+	hdr_a = make_pcm_x_reply_header(&key_a, &binding_a);
+	memset(page_a, 0x68, sizeof(page_a));
+	prepare_pcm_x_page(page_a, &binding_a, &hdr_a);
+	reserved_a = binding_a;
+	reserved_a.identity.image.page_scn = 0;
+	reserved_a.identity.image.page_lsn = 0;
+	reserved_a.identity.image.page_checksum = 0;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key_a, &tag_a, &reserved_a),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(0, &key_a, &tag_a, &binding_a,
+																UINT64_C(51), (uint8)PCM_STATE_X,
+																&hdr_a, page_a),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+
+	reserved_b = make_pcm_x_binding(tag_b, 1, 6, gcs_reqid_requester(1, 3, 101), 13, image_b, 121);
+	reserved_b.identity.image.page_scn = 0;
+	reserved_b.identity.image.page_lsn = 0;
+	reserved_b.identity.image.page_checksum = 0;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key_b, &tag_b, &reserved_b),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING);
+	UT_ASSERT_EQ(memcmp(&work.key, &key_a, sizeof(key_a)), 0);
+	UT_ASSERT_EQ(work.reservation_token, UINT64_C(51));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
+	UT_ASSERT_EQ(memcmp(&work.key, &key_b, sizeof(key_b)), 0);
+}
+
+
+/* A local terminal DRAIN is not an ACK boundary by itself.  Exact byte and
+ * descriptor cleanup publishes a replayable tombstone; duplicate DRAIN stays
+ * provably complete until the matching RETIRE watermark removes that proof. */
+UT_TEST(u36_pcm_x_drain_cleanup_is_replayable_until_exact_retire)
+{
+	BufferTag tag = make_tag(132);
+	GcsBlockDedupKey key;
+	GcsBlockPcmXImageBinding binding;
+	GcsBlockPcmXImageBinding reserved;
+	GcsBlockReplyHeader hdr;
+	GcsBlockDedupEntry cached;
+	char page[GCS_BLOCK_DATA_SIZE];
+	uint64 image_id;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 32, &image_id));
+	/* The initial live cluster episode is epoch zero; RETIRE must preserve the
+	 * same exact-match semantics there as after the first reconfiguration. */
+	key = make_key(1, 3, image_id, 0);
+	binding = make_pcm_x_binding(tag, 1, 5, gcs_reqid_requester(1, 2, 102), 0, image_id, 122);
+	hdr = make_pcm_x_reply_header(&key, &binding);
+	memset(page, 0x79, sizeof(page));
+	prepare_pcm_x_page(page, &binding, &hdr);
+	UT_ASSERT_EQ((int)stage_pcm_x_ready(0, &key, &tag, &binding, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_drain_status_exact(0, &key, &tag, &binding),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_READY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &binding, 2),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RELEASED);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_drain_status_exact(0, &key, &tag, &binding),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_DUPLICATE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &binding, 2),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_DUPLICATE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_lookup(0, &key, &tag, &binding, &cached),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND);
+	reserved = binding;
+	reserved.identity.image.page_scn = 0;
+	reserved.identity.image.page_lsn = 0;
+	reserved.identity.image.page_checksum = 0;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key, &tag, &reserved),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_DUPLICATE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_rearm_exact(0, &key, &tag, &reserved),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_NOT_READY);
+
+	cluster_gcs_block_dedup_sweep_expired((TimestampTz)INT64_MAX);
+	cluster_gcs_block_dedup_cleanup_on_backend_exit(1, 3);
+	cluster_gcs_block_dedup_cleanup_on_node_dead(1);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(12, 2, 122, 29));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 1, 122, 29));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 121, 29));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 122, 28));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 122, 29));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_release_count(), 1);
+}
+
+
+/* A FlushBuffer ERROR occurs after materialization.  Its catch handler must
+ * validate, but never delete or rewrite, the immutable A-record and revoke
+ * token needed by recovery. */
+UT_TEST(u37_pcm_x_finish_error_preserves_exact_materialized_evidence)
+{
+	BufferTag tag = make_tag(133);
+	GcsBlockDedupKey key;
+	GcsBlockPcmXImageBinding binding;
+	GcsBlockPcmXImageBinding reserved;
+	GcsBlockPcmXImageWork work;
+	GcsBlockReplyHeader hdr;
+	char page[GCS_BLOCK_DATA_SIZE];
+	uint64 image_id;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 33, &image_id));
+	key = make_key(1, 3, image_id, 13);
+	binding = make_pcm_x_binding(tag, 1, 5, gcs_reqid_requester(1, 2, 103), 13, image_id, 123);
+	hdr = make_pcm_x_reply_header(&key, &binding);
+	memset(page, 0x6a, sizeof(page));
+	prepare_pcm_x_page(page, &binding, &hdr);
+	reserved = binding;
+	reserved.identity.image.page_scn = 0;
+	reserved.identity.image.page_lsn = 0;
+	reserved.identity.image.page_checksum = 0;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_reserve(0, &key, &tag, &reserved),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RESERVED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_materialize(
+					 0, &key, &tag, &binding, UINT64_C(61), (uint8)PCM_STATE_X, &hdr, page),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STORED);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_preserve_finish_error_exact(
+					 0, &key, &tag, &binding, UINT64_C(62), (uint8)PCM_STATE_X),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_preserve_finish_error_exact(
+					 0, &key, &tag, &binding, UINT64_C(61), (uint8)PCM_STATE_X),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_next_work(0, &work),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING);
+	UT_ASSERT_EQ(memcmp(&work.binding, &binding, sizeof(binding)), 0);
+	UT_ASSERT_EQ(work.reservation_token, UINT64_C(61));
+	UT_ASSERT_EQ((int)work.source_pcm_state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pcm_x_release_exact(0, &key, &tag, &binding, -1),
+				 (int)GCS_BLOCK_PCM_X_IMAGE_RELEASED);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(37);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);
@@ -1975,6 +2156,9 @@ main(void)
 	UT_RUN(u32_pcm_x_staged_marker_rolls_back_exactly);
 	UT_RUN(u33_pending_x_arm_terminates_inflight_legacy_s_exactly);
 	UT_RUN(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut);
+	UT_RUN(u35_pcm_x_commit_pending_rotates_to_independent_reserved_tag);
+	UT_RUN(u36_pcm_x_drain_cleanup_is_replayable_until_exact_retire);
+	UT_RUN(u37_pcm_x_finish_error_preserves_exact_materialized_evidence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

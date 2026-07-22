@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -65,8 +66,13 @@ typedef struct ClusterLmsOutboundSlot {
 	uint8 msg_type;
 	uint8 kind;
 	uint16 payload_len;
+	uint32 required_capability;
+	uint32 connection_generation;
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
 } ClusterLmsOutboundSlot;
+
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 144,
+				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
 	GcsBlockReplyHeader header;
@@ -150,6 +156,31 @@ lms_outbound_pcm_x_grant_held(uint8 msg_type)
 	return cluster_write_fence_enforcing() && !cluster_write_fence_allowed();
 }
 
+
+static void
+lms_outbound_pcm_x_image_ready_note(const ClusterLmsOutboundSlot *slot, const char *boundary,
+									int result)
+{
+	const PcmXGrantPayload *ready;
+	PcmXRuntimeSnapshot runtime;
+	bool fence_enforcing;
+	bool fence_allowed;
+
+	if (slot == NULL || boundary == NULL
+		|| (slot->msg_type != PGRAC_IC_MSG_PCM_X_IMAGE_READY
+			&& slot->msg_type != PGRAC_IC_MSG_PCM_X_PREPARE_GRANT)
+		|| slot->payload_len != sizeof(PcmXGrantPayload))
+		return;
+	ready = (const PcmXGrantPayload *)slot->payload;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	fence_enforcing = cluster_write_fence_enforcing();
+	fence_allowed = !fence_enforcing || cluster_write_fence_allowed();
+	cluster_lms_note_pcm_x_image_ready_boundary(
+		slot->msg_type, boundary, result, (int)runtime.state, fence_enforcing, fence_allowed,
+		slot->dest_node_id, ready->ref.identity.request_id, ready->ref.handle.ticket_id,
+		ready->ref.grant_generation, ready->image.image_id);
+}
+
 void
 cluster_lms_outbound_shmem_register(void)
 {
@@ -171,9 +202,10 @@ cluster_lms_outbound_request_lwlocks(void)
  *	retry machinery).  Publish-before-signal: the slot is visible
  *	before the LMS wakeup fires.
  */
-bool
-cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
-							 const void *payload, uint16 payload_len)
+static bool
+lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id,
+							  const void *payload, uint16 payload_len,
+							  uint32 required_capability, uint32 connection_generation)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
@@ -199,6 +231,8 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 	slot->msg_type = msg_type;
 	slot->kind = (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
 	slot->payload_len = payload_len;
+	slot->required_capability = required_capability;
+	slot->connection_generation = connection_generation;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
@@ -207,6 +241,30 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 
 	cluster_lms_wakeup(worker_id);
 	return true;
+}
+
+bool
+cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
+							 const void *payload, uint16 payload_len)
+{
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
+									 0, 0);
+}
+
+/* Stage a wire-version-sensitive frame for one exact HELLO-authenticated
+ * connection.  The reliable protocol leg remains outside this ring, so a
+ * drain-side guard failure may consume this stale copy and let the periodic
+ * producer reconstruct the correct wire version. */
+bool
+cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 dest_node_id,
+									   const void *payload, uint16 payload_len,
+									   uint32 required_capability,
+									   uint32 connection_generation)
+{
+	if (required_capability == 0 || dest_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
+									 required_capability, connection_generation);
 }
 
 /*
@@ -245,6 +303,8 @@ cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id
 	slot->kind = (uint8)(direct_land ? CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY
 									 : CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY);
 	slot->payload_len = sizeof(*header);
+	slot->required_capability = 0;
+	slot->connection_generation = 0;
 	memcpy(slot->payload, header, sizeof(*header));
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
@@ -325,6 +385,18 @@ cluster_lms_outbound_drain_send(int worker_id)
 		if (!got)
 			break;
 		scanned++;
+		/* Wire-version-sensitive slots are valid only for the exact
+		 * connection generation whose HELLO advertised the required bit.
+		 * A drift consumes this stale ring copy without transport admission;
+		 * no protocol ACK is generated, so the armed reliable leg retries. */
+		if (slot.required_capability != 0
+			&& !cluster_sf_peer_capability_generation_matches(
+				(int32)slot.dest_node_id, slot.required_capability,
+				slot.connection_generation)) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
+			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
+			continue;
+		}
 		send_payload = slot.payload_len > 0 ? slot.payload : NULL;
 		send_payload_len = slot.payload_len;
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
@@ -352,6 +424,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "peer-blocked", -2);
 			Assert(n_retained < (int)lengthof(retained));
 			retained[n_retained++] = slot;
 			continue;
@@ -361,6 +434,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		 * transport admission.  Retaining also blocks later same-peer frames,
 		 * preserving the DATA FIFO while unrelated peers keep flowing. */
 		if (lms_outbound_pcm_x_grant_held(slot.msg_type)) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "grant-held", -3);
 			if (slot.dest_node_id < CLUSTER_MAX_NODES)
 				peer_blocked[slot.dest_node_id] = true;
 			Assert(n_retained < (int)lengthof(retained));
@@ -402,6 +476,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 										  send_payload, send_payload_len);
 
 handle_send_result:
+		lms_outbound_pcm_x_image_ready_note(&slot, "send-result", (int)rc);
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
 			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);

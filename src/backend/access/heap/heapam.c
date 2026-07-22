@@ -1719,12 +1719,12 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 
 			if (
 #ifdef USE_PGRAC_CLUSTER
-				/* spec-3.14 D5b: HeapTupleIsSurelyDead has no Buffer and
-				 * bypasses VacuumHorizon; guard the HOT all_dead probe here
-				 * so a remote-evidence chain is never declared all-dead. */
-				(cluster_storage_mode_enabled()
-				 && cluster_tuple_has_remote_evidence(buffer, heapTuple->t_data))
-					? true : /* remote evidence -> not surely dead -> *all_dead=false */
+				/* P0-28: no cluster-wide prune horizon; even a recycled ITL
+				 * slot cannot turn a shared-storage HOT member surely dead. */
+				cluster_vis_prune_must_defer(cluster_storage_mode_enabled()
+										&& !RelationUsesLocalBuffers(relation),
+									 false)
+					? true :
 #endif
 				!HeapTupleIsSurelyDead(heapTuple, vistest))
 				*all_dead = false;
@@ -2323,6 +2323,11 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	{
 		ClusterItlTouchHandle handle;
 
+		/* P0-33: publish the exact data-writer binding as IN_PROGRESS only
+		 * after the tuple + ACTIVE ITL stamp is WAL-protected, and before the
+		 * content lock is released. */
+		cluster_tt_local_record_data_active(xid, cluster_itl_uba);
+
 		handle.rloc = relation->rd_locator;
 		handle.block = ItemPointerGetBlockNumber(&heaptup->t_self);
 		handle.forknum = MAIN_FORKNUM;
@@ -2850,6 +2855,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (cluster_mi_active)
 		{
 			ClusterItlTouchHandle handle;
+
+			/* P0-33: pair this page's fresh ACTIVE data ref with its exact
+			 * IN_PROGRESS overlay/hint before releasing the content lock. */
+			cluster_tt_local_record_data_active(xid, cluster_mi_uba);
 
 			handle.rloc = relation->rd_locator;
 			handle.block = BufferGetBlockNumber(buffer);
@@ -3463,6 +3472,50 @@ cluster_heap_vm_barrier_warm(Buffer vmbuf)
 	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 }
 
+/*
+ * Acquire heap content X without carrying a visibility-map pin across the
+ * cluster PCM wait.  VM/FSM pages cannot use the passive-pin retained-PI
+ * shape because their callers may read pinned bytes without a content lock.
+ * Keeping this pin while another node transfers the VM page therefore makes
+ * the source's exact-drop finish return BUSY forever.
+ *
+ * visibilitymap_pin() runs before heap content authority and may do I/O.  We
+ * then release that pin before LockBuffer can wait.  Once heap X is held,
+ * visibilitymap_pin_recent() may only pin the exact still-resident descriptor;
+ * it cannot do I/O.  A retag/drop race releases heap X and repeats the safe
+ * pre-read sequence.
+ */
+static void
+cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block,
+								Buffer heap_buffer, Buffer *vmbuffer)
+{
+	Buffer recent_vm = InvalidBuffer;
+	Page heap_page;
+
+	Assert(relation != NULL);
+	Assert(BufferIsValid(heap_buffer));
+	Assert(vmbuffer != NULL);
+	heap_page = BufferGetPage(heap_buffer);
+
+	for (;;)
+	{
+		if (PageIsAllVisible(heap_page) && !BufferIsValid(*vmbuffer))
+			visibilitymap_pin(relation, heap_block, vmbuffer);
+		if (BufferIsValid(*vmbuffer))
+		{
+			recent_vm = *vmbuffer;
+			ReleaseBuffer(*vmbuffer);
+			*vmbuffer = InvalidBuffer;
+		}
+
+		LockBuffer(heap_buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!PageIsAllVisible(heap_page)
+			|| visibilitymap_pin_recent(relation, heap_block, recent_vm, vmbuffer))
+			return;
+		LockBuffer(heap_buffer, BUFFER_LOCK_UNLOCK);
+	}
+}
+
 
 TM_Result
 heap_delete(Relation relation, ItemPointer tid,
@@ -3907,7 +3960,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			cluster_heap_vm_barrier_warm(vmbuffer);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 			goto l1;
 		}
 		vm_locked = true;
@@ -4065,6 +4120,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	if (cluster_itl_active)
 	{
 		ClusterItlTouchHandle handle;
+
+		/* P0-33: publish the exact ACTIVE data-writer identity while the
+		 * freshly stamped page is still protected by its content lock. */
+		cluster_tt_local_record_data_active(xid, cluster_itl_uba);
 
 		handle.rloc = relation->rd_locator;
 		handle.block = BufferGetBlockNumber(buffer);
@@ -4301,10 +4360,14 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	 * in the middle of changing this, so we'll need to recheck after we have
 	 * the lock.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+#else
 	if (PageIsAllVisible(page))
 		visibilitymap_pin(relation, block, &vmbuffer);
 
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#endif
 
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
 
@@ -4732,8 +4795,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		visibilitymap_pin(relation, block, &vmbuffer);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 		goto l2;
 	}
 
@@ -4890,7 +4952,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				cluster_heap_vm_barrier_warm(vmbuffer);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				goto l2;
 			}
 			vm_locked = true;
@@ -5351,7 +5415,9 @@ l_pgrac_reacquire:
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				cluster_heap_vm_barrier_warm(refused_vm);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				goto l2;
 			}
 
@@ -5506,7 +5572,29 @@ l_pgrac_reacquire:
 	if (vm_locked_new)
 		LockBuffer(vmbuffer_new, BUFFER_LOCK_UNLOCK);
 
+	/* VM pages require a zero-pin exact DROP at remote source handoff.  Do not
+	 * carry these pins into the heap writer's queue release: that release may
+	 * wait for DRAIN after a VM successor has already frozen this node as its
+	 * source, creating a VM-drop -> pin -> heap-DRAIN cycle.  Every VM byte use
+	 * is complete once the VM content locks above are released. */
+	if (BufferIsValid(vmbuffer_new))
+	{
+		ReleaseBuffer(vmbuffer_new);
+		vmbuffer_new = InvalidBuffer;
+	}
+	if (BufferIsValid(vmbuffer))
+	{
+		ReleaseBuffer(vmbuffer);
+		vmbuffer = InvalidBuffer;
+	}
+
 #ifdef USE_PGRAC_CLUSTER
+	/* P0-33: old and new versions share one xact-local TT binding.  Publish
+	 * that exact binding once, after both possible ACTIVE stamps are WAL-
+	 * protected and before either heap content lock is released. */
+	if (cluster_itl_old_active || cluster_itl_new_active)
+		cluster_tt_local_record_data_active(xid, cluster_itl_uba);
+
 	/*
 	 * PGRAC (spec-3.4a D4): register touched ITL handle(s).  Outside
 	 * CRIT so palloc is safe.  Same-page UPDATE registers one handle
@@ -5554,10 +5642,6 @@ l_pgrac_reacquire:
 	if (newbuf != buffer)
 		ReleaseBuffer(newbuf);
 	ReleaseBuffer(buffer);
-	if (BufferIsValid(vmbuffer_new))
-		ReleaseBuffer(vmbuffer_new);
-	if (BufferIsValid(vmbuffer))
-		ReleaseBuffer(vmbuffer);
 
 	/*
 	 * Release the lmgr tuple lock, if we had it.

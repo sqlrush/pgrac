@@ -1451,6 +1451,8 @@ dump_lms(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lms_obs_get_outbound_not_admitted(-1)));
 	emit_row(rsinfo, "lms", "lms_outbound_requeue_drop_count",
 			 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(-1)));
+	emit_row(rsinfo, "lms", "lms_outbound_cap_guard_drop_count",
+			 fmt_int64((int64)cluster_lms_obs_get_outbound_cap_guard_drop(-1)));
 	{
 		int w, hb;
 
@@ -1474,6 +1476,9 @@ dump_lms(ReturnSetInfo *rsinfo)
 			snprintf(wkey, sizeof(wkey), "lms_outbound_requeue_drop_count_w%d", w);
 			emit_row(rsinfo, "lms", wkey,
 					 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(w)));
+			snprintf(wkey, sizeof(wkey), "lms_outbound_cap_guard_drop_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_outbound_cap_guard_drop(w)));
 		}
 
 		/* Inline-serve duration histogram: aggregate 16 rows + per live
@@ -2017,7 +2022,7 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		{
 			Size cursor = 0;
 			Size index = 0;
-			char line[384];
+			char line[768];
 			char key[64];
 
 			while (cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line))) {
@@ -2401,6 +2406,8 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_pi_watermark_advance_count()));
 	emit_row(rsinfo, "gcs", "pi_watermark_retire_count",
 			 fmt_int64((int64)cluster_gcs_get_pi_watermark_retire_count()));
+	emit_row(rsinfo, "gcs", "pi_durable_note_apply_count",
+			 fmt_int64((int64)cluster_gcs_get_pi_durable_note_apply_count()));
 	emit_row(rsinfo, "gcs", "lost_write_detected_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_detected_count()));
 	emit_row(rsinfo, "gcs", "lost_write_avoid_count",

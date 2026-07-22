@@ -54,6 +54,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -75,6 +76,41 @@ int cluster_node_id = 0;
 static PcmXRuntimeState ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
 static bool ut_write_fence_enforcing = false;
 static bool ut_write_fence_allowed = true;
+static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
+static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
+static int ut_pcm_x_boundary_note_count = 0;
+static uint8 ut_pcm_x_boundary_msg_types[8];
+
+void
+cluster_lms_note_pcm_x_image_ready_boundary(
+	uint8 msg_type, const char *boundary, int result, int runtime_state, bool fence_enforcing,
+	bool fence_allowed, uint32 dest_node_id, uint64 request_id, uint64 ticket_id, uint64 grant_generation,
+	uint64 image_id)
+{
+	if (ut_pcm_x_boundary_note_count < (int)lengthof(ut_pcm_x_boundary_msg_types))
+		ut_pcm_x_boundary_msg_types[ut_pcm_x_boundary_note_count] = msg_type;
+	ut_pcm_x_boundary_note_count++;
+	(void)boundary;
+	(void)result;
+	(void)runtime_state;
+	(void)fence_enforcing;
+	(void)fence_allowed;
+	(void)dest_node_id;
+	(void)request_id;
+	(void)ticket_id;
+	(void)grant_generation;
+	(void)image_id;
+}
+
+bool
+cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+										  uint32 expected_generation)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || required_capabilities == 0)
+		return false;
+	return (ut_peer_capabilities[peer_id] & required_capabilities) == required_capabilities
+		   && ut_peer_cap_generation[peer_id] == expected_generation;
+}
 
 PcmXRuntimeSnapshot
 cluster_pcm_x_runtime_snapshot(void)
@@ -178,6 +214,7 @@ cluster_lms_wakeup(int worker_id)
 /* Drain honesty counters (shmem-backed in production): count-only stubs. */
 static int ut_not_admitted_count = 0;
 static int ut_requeue_drop_count = 0;
+static int ut_cap_guard_drop_count = 0;
 
 void
 cluster_lms_obs_note_outbound_not_admitted(int worker_id)
@@ -191,6 +228,13 @@ cluster_lms_obs_note_outbound_requeue_drop(int worker_id)
 {
 	(void)worker_id;
 	ut_requeue_drop_count++;
+}
+
+void
+cluster_lms_obs_note_outbound_cap_guard_drop(int worker_id)
+{
+	(void)worker_id;
+	ut_cap_guard_drop_count++;
 }
 
 void
@@ -315,6 +359,11 @@ ut_reset_log(void)
 	ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
 	ut_write_fence_enforcing = false;
 	ut_write_fence_allowed = true;
+	ut_cap_guard_drop_count = 0;
+	ut_pcm_x_boundary_note_count = 0;
+	memset(ut_pcm_x_boundary_msg_types, 0, sizeof(ut_pcm_x_boundary_msg_types));
+	memset(ut_peer_capabilities, 0, sizeof(ut_peer_capabilities));
+	memset(ut_peer_cap_generation, 0, sizeof(ut_peer_cap_generation));
 	memset(ut_sent_log, 0, sizeof(ut_sent_log));
 }
 
@@ -530,6 +579,27 @@ UT_TEST(test_pcm_x_grant_frame_waits_behind_write_fence)
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 0);
 }
 
+
+/* Both sides of the first reliable transfer hop share PcmXGrantPayload.  The
+ * injected transport trace must identify type 50 and type 51 independently,
+ * otherwise a successful master consume is indistinguishable from a lost
+ * PREPARE_GRANT admission. */
+UT_TEST(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable)
+{
+	PcmXGrantPayload payload;
+
+	ut_reset_log();
+	memset(&payload, 0, sizeof(payload));
+	UT_ASSERT(cluster_lms_outbound_enqueue(
+		0, PGRAC_IC_MSG_PCM_X_IMAGE_READY, UT_PEER_X, &payload, sizeof(payload)));
+	UT_ASSERT(cluster_lms_outbound_enqueue(
+		0, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_Y, &payload, sizeof(payload)));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 2);
+	UT_ASSERT_EQ(ut_pcm_x_boundary_note_count, 2);
+	UT_ASSERT_EQ((int)ut_pcm_x_boundary_msg_types[0], (int)PGRAC_IC_MSG_PCM_X_IMAGE_READY);
+	UT_ASSERT_EQ((int)ut_pcm_x_boundary_msg_types[1], (int)PGRAC_IC_MSG_PCM_X_PREPARE_GRANT);
+}
+
 /*
  * Shape-B denial replay is driven by LMON, which owns only plane 0.  The
  * reply is an ABI-sized header + zero block, so LMON stages its compact
@@ -588,10 +658,86 @@ UT_TEST(test_direct_zero_block_reply_uses_data_owner_direct_lane)
 	UT_ASSERT_EQ(ut_direct_zero_reply_header.checksum, UINT32_C(0xA55A7E11));
 }
 
+/* A producer must receive false when the selected worker ring is full.  The
+ * PI durable-note drain couples this real return contract with its structural
+ * false->break-before-seq-advance unit, so a full shard retains the source
+ * note for the next tick instead of losing it. */
+UT_TEST(test_full_worker_ring_refuses_without_overwrite)
+{
+	int accepted = 0;
+	int sent = 0;
+
+	ut_reset_log();
+	while (accepted < 1024 && ut_enqueue_marker(1, UT_PEER_X, 0xE2))
+		accepted++;
+	UT_ASSERT(accepted > 0);
+	UT_ASSERT(accepted < 1024);
+	UT_ASSERT_EQ((int)cluster_lms_outbound_depth(1), accepted);
+	UT_ASSERT(!ut_enqueue_marker(1, UT_PEER_X, 0xE3));
+	UT_ASSERT_EQ((int)cluster_lms_outbound_depth(1), accepted);
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	while (cluster_lms_outbound_depth(1) > 0)
+		sent += cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(sent, accepted);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+}
+
+/* A V2 wire frame is legal only on the exact HELLO-authenticated connection
+ * generation sampled by its producer.  A reconnect or capability downgrade
+ * consumes the stale ring copy without transport admission; the reliable
+ * protocol leg remains armed and the periodic master drive reconstructs it. */
+UT_TEST(test_cap_bound_frame_drops_on_connection_generation_drift)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+	uint8 marker = 0x91;
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 18;
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 17));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_count_marker(marker), 0);
+	UT_ASSERT_EQ(ut_cap_guard_drop_count, 1);
+}
+
+UT_TEST(test_cap_bound_frame_drops_on_capability_downgrade)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+	uint8 marker = 0x92;
+
+	ut_reset_log();
+	ut_peer_cap_generation[UT_PEER_X] = 21;
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 21));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_count_marker(marker), 0);
+	UT_ASSERT_EQ(ut_cap_guard_drop_count, 1);
+}
+
+UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+	uint8 marker = 0x93;
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 34;
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X, &marker, sizeof(marker), cap, 34));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_count_marker(marker), 1);
+	UT_ASSERT_EQ(ut_cap_guard_drop_count, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(15);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -601,8 +747,13 @@ main(void)
 	UT_RUN(test_self_frame_dispatches_on_owning_worker);
 	UT_RUN(test_pcm_x_grant_frame_waits_for_active_runtime);
 	UT_RUN(test_pcm_x_grant_frame_waits_behind_write_fence);
+	UT_RUN(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable);
 	UT_RUN(test_zero_block_reply_is_expanded_by_data_owner);
 	UT_RUN(test_direct_zero_block_reply_uses_data_owner_direct_lane);
+	UT_RUN(test_full_worker_ring_refuses_without_overwrite);
+	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);
+	UT_RUN(test_cap_bound_frame_drops_on_capability_downgrade);
+	UT_RUN(test_cap_bound_frame_sends_on_exact_connection_capability);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -142,7 +142,12 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		pcm_x_expected_len = sizeof(PcmXBlockerChunkPayload);
 		break;
 	case PGRAC_IC_MSG_PCM_X_REVOKE:
-		pcm_x_expected_len = sizeof(PcmXRevokePayload);
+		/* Source-floor V2 appends one SCN to the byte-identical V1 prefix. */
+		if (payload_len != sizeof(PcmXRevokePayload)
+			&& payload_len != sizeof(PcmXRevokePayloadV2))
+			return -1;
+		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
+		tag = &pcm_x_tag;
 		break;
 	case PGRAC_IC_MSG_PCM_X_IMAGE_READY:
 	case PGRAC_IC_MSG_PCM_X_PREPARE_GRANT:

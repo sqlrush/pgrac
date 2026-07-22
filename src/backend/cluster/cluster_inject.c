@@ -607,6 +607,17 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-pcm-writer-cached-x-stall" },
 	{ .name = "cluster-pcm-restore-aba-window" },
 	/*
+	 * PCM-X retained-image finish FlushBuffer boundary (t/400).
+	 *
+	 * The finish path first proves its exact REVOKING lifecycle while holding
+	 * caller pin + content EXCLUSIVE.  An armed point makes the unchanged page
+	 * dirty so this otherwise race-dependent FlushBuffer leg is deterministic.
+	 * The point itself fires only inside that exact FlushBuffer call, just
+	 * before smgrwrite; SKIP_N raises the fail-closed test ERROR there, while
+	 * SLEEP:0 supplies a success-path observation without changing behavior.
+	 */
+	{ .name = "cluster-pcm-x-retain-flush-error" },
+	/*
 	 * cluster-pcm-grant-finalize-window (W3):
 	 *   Fires in LockBuffer AFTER a real X acquire installed the grant and
 	 *   BEFORE the finalize sets pcm_state=X, i.e. while pcm_state is still N
@@ -1269,6 +1280,18 @@ cluster_injection_should_skip(const char *name)
 		return false;
 
 	return pg_atomic_exchange_u32(&p->skip_pending, 0) != 0;
+}
+
+
+/* Read one point's armed state without dispatching it or consuming SKIP_N. */
+bool
+cluster_injection_is_armed(const char *name)
+{
+	ClusterInjectPoint *p;
+
+	cluster_injection_initialise();
+	p = cluster_injection_lookup(name);
+	return p != NULL && pg_atomic_read_u32(&p->armed_type) != (uint32)CLUSTER_FAULT_NONE;
 }
 
 

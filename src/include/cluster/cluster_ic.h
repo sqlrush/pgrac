@@ -378,6 +378,9 @@ typedef enum ClusterICPlane {
  * verdict) and every INSTALL_READY stays the V1 104-byte exact frame, so an
  * old master never sees a length its byte-exact table would refuse. */
 #define PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 ((uint32)0x00000400U)
+/* P0-20: this binary accepts the 104-byte PCM-X REVOKE V2 frame and binds its
+ * trailing required_page_scn to the immutable source-image lifecycle. */
+#define PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 ((uint32)0x00000800U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).
