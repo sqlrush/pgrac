@@ -368,6 +368,19 @@ typedef enum ClusterICPlane {
  * family.  A sender must not transmit any PCM-X frame to a peer that did not
  * advertise this bit; an old peer would treat the type as unregistered. */
 #define PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 ((uint32)0x00000200U)
+/* PGRAC: A' rebase (t/400 item 2) — this binary understands the V2 (112-byte)
+ * INSTALL_READY frame whose trailing rebased_own_generation publishes the
+ * effective grant base after an interleaved revoke consumed the enqueue-time
+ * base.  A PROTOCOL capability, advertised unconditionally.  Activation is
+ * formation-wide: the PCM-X runtime samples every MEMBER's bit at activation
+ * and only then may a requester publish a rebase; without full coverage the
+ * V2 frame is never sent (a drifted requester keeps the fail-closed STALE
+ * verdict) and every INSTALL_READY stays the V1 104-byte exact frame, so an
+ * old master never sees a length its byte-exact table would refuse. */
+#define PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 ((uint32)0x00000400U)
+/* P0-20: this binary accepts the 104-byte PCM-X REVOKE V2 frame and binds its
+ * trailing required_page_scn to the immutable source-image lifecycle. */
+#define PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 ((uint32)0x00000800U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

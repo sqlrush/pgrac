@@ -57,6 +57,7 @@
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h"		/* spec-3.2 D4 wire emit append */
+#include "cluster/cluster_uba.h"				/* P0-33 exact data-ref alias */
 #include "cluster/storage/cluster_undo_alloc.h" /* cluster_undo_active_segment_for_node_or_create */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -152,6 +153,12 @@ typedef struct ClusterTTLocalBinding {
 	 * segment away (cluster_tt_slot_get_wrap would then ERROR on the stale id). */
 	uint16 wrap;
 	uint32 cluster_epoch; /* snapshot at bind time */
+	/* Real undo records use an independent record cursor.  Its segment may
+	 * differ from segment_id after rollover, while the page ref carries that
+	 * record segment as its exact-key segment. */
+	uint16 *active_alias_segments;
+	uint16 active_alias_count;
+	uint16 active_alias_capacity;
 } ClusterTTLocalBinding;
 
 static ClusterTTLocalBinding *cluster_tt_local_bindings = NULL;
@@ -468,38 +475,76 @@ cluster_tt_local_finish_bindings(bool committed, SCN commit_scn)
 	cluster_tt_local_reset_binding();
 }
 
-/*
- * build_local_key -- compose ClusterTTStatusKey for `xid`.
- *
- *	Returns true with the key populated when an xact-local binding
- *	exists for `xid` (F11 real allocator path); returns false otherwise
- *	and leaves `*out` zeroed.  spec-3.4b F7: production code paths MUST
- *	NOT take a provisional id when the binding is absent -- this would
- *	create a real/provisional key collision risk.  Callers should
- *	silently skip install when build_local_key returns false (the
- *	matching DML never stamped an ITL slot, so no overlay entry is
- *	needed).
- */
+/* Compose either the canonical key or one page-ref segment alias. */
 static bool
-build_local_key(TransactionId xid, ClusterTTStatusKey *out)
+build_binding_key(const ClusterTTLocalBinding *binding, uint16 segment_id, ClusterTTStatusKey *out)
 {
-	uint32 seg;
-	uint16 off;
-	uint32 tt_id;
-	uint32 epoch;
-
 	memset(out, 0, sizeof(*out));
-
-	if (!cluster_tt_local_peek_binding(xid, &seg, &off, &tt_id, &epoch, NULL))
+	if (binding == NULL || !TransactionIdIsValid(binding->top_xid) || segment_id == 0)
 		return false;
 
 	out->origin_node_id = (uint16)cluster_node_id;
-	out->undo_segment_id = (uint16)seg;
-	out->tt_slot_id = tt_id;
-	out->cluster_epoch = epoch;
-	out->local_xid = xid;
-	/* _reserved + _reserved2 already zero from memset. */
+	out->undo_segment_id = segment_id;
+	out->tt_slot_id = cluster_tt_slot_offset_to_id(binding->slot_offset);
+	out->cluster_epoch = binding->cluster_epoch;
+	out->local_xid = binding->top_xid;
 	return true;
+}
+
+static bool
+build_local_key(TransactionId xid, ClusterTTStatusKey *out)
+{
+	int idx = cluster_tt_local_find_binding(xid);
+
+	if (idx < 0) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return build_binding_key(&cluster_tt_local_bindings[idx],
+							 (uint16)cluster_tt_local_bindings[idx].segment_id, out);
+}
+
+/* Install and emit one already-minted exact key. */
+static void
+install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_scn)
+{
+	bool installed = cluster_tt_status_install_local(key, status, commit_scn);
+
+	if (!installed)
+		return;
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		ClusterTTStatusResult res;
+		bool hit = false;
+		bool epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
+
+		if (epoch_stable) {
+			hit = cluster_tt_status_lookup_exact(key, &res);
+			epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
+		}
+		if (epoch_stable)
+			Assert(hit && res.authoritative && res.status == status);
+		if (hit && res.authoritative && res.status == status)
+			cluster_tt_status_bump_self_consumer_hit();
+	}
+#endif
+
+	cluster_tt_status_hint_emit(key, status, commit_scn);
+}
+
+static void
+install_binding_aliases(const ClusterTTLocalBinding *binding, ClusterTTStatus status,
+						SCN commit_scn)
+{
+	uint16 i;
+
+	for (i = 0; i < binding->active_alias_count; i++) {
+		ClusterTTStatusKey key;
+
+		if (build_binding_key(binding, binding->active_alias_segments[i], &key))
+			install_key(&key, status, commit_scn);
+	}
 }
 
 /*
@@ -515,7 +560,8 @@ static void
 install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 {
 	ClusterTTStatusKey key;
-	bool installed;
+	const ClusterTTLocalBinding *binding;
+	int idx;
 
 	if (!cluster_enabled || cluster_node_id < 0)
 		return;
@@ -528,8 +574,10 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	 * (DDL-only or read-only); no overlay entry is needed and the
 	 * provisional fallback path is forbidden in production.
 	 */
-	if (!build_local_key(xid, &key))
+	idx = cluster_tt_local_find_binding(xid);
+	if (idx < 0 || !build_local_key(xid, &key))
 		return;
+	binding = &cluster_tt_local_bindings[idx];
 
 	/*
 	 * spec-3.3 D6 (L181 chain step 2): install in-memory overlay entry
@@ -537,56 +585,8 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	 * carries commit_scn to (a) self-consumer N7 lookup and (b) the wire
 	 * emit path which will ship it to peers in V2 hints (D8).
 	 */
-	installed = cluster_tt_status_install_local(&key, status, commit_scn);
-	if (!installed)
-		return;
-
-		/*
-	 * spec-3.1 v0.4 N7 self-consumer:  re-lookup to prove the just-installed key
-	 * is reachable + bump self_consumer_hit_count (D9 T8 + D10 L2).
-	 *
-	 * P0 perf hardening: this is now a DEBUG-ONLY invariant check.  In every
-	 * commit it cost an extra HTAB lookup + LW_SHARED on the hot path; the
-	 * production install path does not need to re-read its own write.  Assert
-	 * builds still fail fast if the install cannot read its own key, and the
-	 * self_consumer_hit_count counter is now a debug-build signal.
-	 */
-#ifdef USE_ASSERT_CHECKING
-	{
-		ClusterTTStatusResult res;
-		bool hit = false;
-		bool epoch_stable = ((uint32)cluster_epoch_get_current() == key.cluster_epoch);
-
-		/*
-		 * lookup_exact() is the production reader API, so it intentionally fences
-		 * against the current cluster epoch.  A transaction can abort while a
-		 * clean-leave/reconfig advances the epoch; the local old-epoch status
-		 * install is still valid evidence for that transaction, but public lookup
-		 * must reject it.  Keep this debug wiring check only when the epoch stayed
-		 * stable across the install/lookup window.
-		 */
-		if (epoch_stable) {
-			hit = cluster_tt_status_lookup_exact(&key, &res);
-			epoch_stable = ((uint32)cluster_epoch_get_current() == key.cluster_epoch);
-		}
-
-		if (epoch_stable)
-			Assert(hit && res.authoritative && res.status == status);
-		if (hit && res.authoritative && res.status == status)
-			cluster_tt_status_bump_self_consumer_hit();
-	}
-#endif
-
-	/*
-	 * spec-3.2 D4 + spec-3.3 D6/D8 (L181 chain step 4): cross-node TT
-	 * status hint wire emit. Uses the EXACT key just minted + installed
-	 * (HC184 — no raw-xid rebuild); commit_scn flows through so peers
-	 * see the real value via V2 wire. Fire-and-forget; emit_mode =
-	 * disabled is a no-op inside the function. commit/abort 对称
-	 * (install_status is called from both record_commit + record_abort;
-	 * abort path passes InvalidScn).
-	 */
-	cluster_tt_status_hint_emit(&key, status, commit_scn);
+	install_key(&key, status, commit_scn);
+	install_binding_aliases(binding, status, commit_scn);
 }
 
 /* ------------------------------------------------------------ */
@@ -700,6 +700,65 @@ cluster_tt_local_record_active(TransactionId xid)
 	 * running and may stamp additional lock-only or data ITL slots. */
 }
 
+void
+cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
+{
+	ClusterTTLocalBinding *binding;
+	uint32 record_segment;
+	uint32 block_no;
+	uint16 slot_offset;
+	uint16 row_offset;
+	int idx;
+
+	if (!cluster_enabled || cluster_node_id < 0 || !TransactionIdIsNormal(xid))
+		return;
+	idx = cluster_tt_local_find_binding(xid);
+	if (idx < 0)
+		return;
+	binding = &cluster_tt_local_bindings[idx];
+
+	/* The writer made this UBA from the same binding before entering CRIT.
+	 * If that invariant is ever broken, publish no guessed alias. */
+	if (!uba_decode(uba, &record_segment, &block_no, &slot_offset, &row_offset)
+		|| uba_origin_node_id(uba) != (NodeId)cluster_node_id
+		|| slot_offset != binding->slot_offset) {
+		Assert(false);
+		return;
+	}
+	(void)block_no;
+	(void)row_offset;
+
+	if (record_segment != binding->segment_id) {
+		uint16 i;
+
+		for (i = 0; i < binding->active_alias_count; i++)
+			if (binding->active_alias_segments[i] == (uint16)record_segment)
+				break;
+
+		if (i == binding->active_alias_count) {
+			MemoryContext oldcxt;
+
+			oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+			if (binding->active_alias_segments == NULL) {
+				binding->active_alias_capacity = 4;
+				binding->active_alias_segments
+					= (uint16 *)palloc(sizeof(uint16) * binding->active_alias_capacity);
+			} else if (binding->active_alias_count == binding->active_alias_capacity) {
+				binding->active_alias_capacity *= 2;
+				binding->active_alias_segments
+					= (uint16 *)repalloc(binding->active_alias_segments,
+										 sizeof(uint16) * binding->active_alias_capacity);
+			}
+			MemoryContextSwitchTo(oldcxt);
+			binding->active_alias_segments[binding->active_alias_count++] = (uint16)record_segment;
+		}
+	}
+
+	/* install_status publishes canonical + every registered alias.  Commit and
+	 * abort use the same path, closing each alias terminally. */
+	install_status(xid, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn);
+}
+
 uint32
 cluster_tt_local_slot_seq_peek(void)
 {
@@ -741,6 +800,13 @@ void
 cluster_tt_local_record_active(TransactionId xid)
 {
 	(void)xid;
+}
+
+void
+cluster_tt_local_record_data_active(TransactionId xid, UBA uba)
+{
+	(void)xid;
+	(void)uba;
 }
 
 uint32

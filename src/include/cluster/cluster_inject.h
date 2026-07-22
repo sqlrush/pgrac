@@ -115,6 +115,9 @@ extern void cluster_injection_run(const char *name);
 
 extern bool cluster_injection_should_skip(const char *name);
 
+/* Non-consuming armed-state probe for deterministic test setup. */
+extern bool cluster_injection_is_armed(const char *name);
+
 /*
  * cluster_cr_injection_armed -- spec-3.9 D7 CR-specific armed-state peek.
  *	Returns true iff the named CR injection point is armed; sets *out_param

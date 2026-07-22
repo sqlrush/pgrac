@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -54,12 +55,32 @@
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
 #define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 128
 
+typedef enum ClusterLmsOutboundKind {
+	CLUSTER_LMS_OUTBOUND_FRAME = 0,
+	CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY = 1,
+	CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY = 2
+} ClusterLmsOutboundKind;
+
 typedef struct ClusterLmsOutboundSlot {
 	uint32 dest_node_id;
 	uint8 msg_type;
+	uint8 kind;
 	uint16 payload_len;
+	uint32 required_capability;
+	uint32 connection_generation;
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
 } ClusterLmsOutboundSlot;
+
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 144,
+				 "LMS outbound slot capability guard layout changed");
+
+typedef struct ClusterLmsZeroBlockReplyWire {
+	GcsBlockReplyHeader header;
+	char block_data[GCS_BLOCK_DATA_SIZE];
+} ClusterLmsZeroBlockReplyWire;
+
+StaticAssertDecl(sizeof(ClusterLmsZeroBlockReplyWire) == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE,
+				 "staged zero-block reply must preserve the GCS reply wire size");
 
 typedef struct ClusterLmsOutboundState {
 	uint32 head; /* next slot to fill */
@@ -135,6 +156,31 @@ lms_outbound_pcm_x_grant_held(uint8 msg_type)
 	return cluster_write_fence_enforcing() && !cluster_write_fence_allowed();
 }
 
+
+static void
+lms_outbound_pcm_x_image_ready_note(const ClusterLmsOutboundSlot *slot, const char *boundary,
+									int result)
+{
+	const PcmXGrantPayload *ready;
+	PcmXRuntimeSnapshot runtime;
+	bool fence_enforcing;
+	bool fence_allowed;
+
+	if (slot == NULL || boundary == NULL
+		|| (slot->msg_type != PGRAC_IC_MSG_PCM_X_IMAGE_READY
+			&& slot->msg_type != PGRAC_IC_MSG_PCM_X_PREPARE_GRANT)
+		|| slot->payload_len != sizeof(PcmXGrantPayload))
+		return;
+	ready = (const PcmXGrantPayload *)slot->payload;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	fence_enforcing = cluster_write_fence_enforcing();
+	fence_allowed = !fence_enforcing || cluster_write_fence_allowed();
+	cluster_lms_note_pcm_x_image_ready_boundary(
+		slot->msg_type, boundary, result, (int)runtime.state, fence_enforcing, fence_allowed,
+		slot->dest_node_id, ready->ref.identity.request_id, ready->ref.handle.ticket_id,
+		ready->ref.grant_generation, ready->image.image_id);
+}
+
 void
 cluster_lms_outbound_shmem_register(void)
 {
@@ -156,9 +202,10 @@ cluster_lms_outbound_request_lwlocks(void)
  *	retry machinery).  Publish-before-signal: the slot is visible
  *	before the LMS wakeup fires.
  */
-bool
-cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
-							 const void *payload, uint16 payload_len)
+static bool
+lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id,
+							  const void *payload, uint16 payload_len, uint32 required_capability,
+							  uint32 connection_generation)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
@@ -182,9 +229,81 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 	slot = &ring->ring[ring->head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
+	slot->kind = (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
 	slot->payload_len = payload_len;
+	slot->required_capability = required_capability;
+	slot->connection_generation = connection_generation;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
+	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+	ring->count++;
+	LWLockRelease(lock);
+
+	cluster_lms_wakeup(worker_id);
+	return true;
+}
+
+bool
+cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
+							 const void *payload, uint16 payload_len)
+{
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len, 0,
+										 0);
+}
+
+/* Stage a wire-version-sensitive frame for one exact HELLO-authenticated
+ * connection.  The reliable protocol leg remains outside this ring, so a
+ * drain-side guard failure may consume this stale copy and let the periodic
+ * producer reconstruct the correct wire version. */
+bool
+cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 dest_node_id,
+									   const void *payload, uint16 payload_len,
+									   uint32 required_capability, uint32 connection_generation)
+{
+	if (required_capability == 0 || dest_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
+										 required_capability, connection_generation);
+}
+
+/*
+ * Stage a header-only GCS denial from a CONTROL-plane producer.  The DATA
+ * owner expands the ABI-mandated zero block immediately before transport
+ * admission.  Keep this surface narrow: only the Shape-B pending-X denial
+ * may use it, and callers must choose worker[shard(tag)] so it stays on the
+ * same per-tag stream as the request it terminates.
+ */
+bool
+cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
+											  const GcsBlockReplyHeader *header, bool direct_land)
+{
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
+	ClusterLmsOutboundSlot *slot;
+
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || dest_node_id >= CLUSTER_MAX_NODES
+		|| header == NULL || (direct_land && (int32)dest_node_id == cluster_node_id)
+		|| header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
+		return false;
+	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
+		return false;
+
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+		LWLockRelease(lock);
+		return false;
+	}
+	slot = &ring->ring[ring->head];
+	slot->dest_node_id = dest_node_id;
+	slot->msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+	slot->kind = (uint8)(direct_land ? CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY
+									 : CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY);
+	slot->payload_len = sizeof(*header);
+	slot->required_capability = 0;
+	slot->connection_generation = 0;
+	memcpy(slot->payload, header, sizeof(*header));
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
 	LWLockRelease(lock);
@@ -247,6 +366,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 
 	while (scanned < 64) {
 		ClusterLmsOutboundSlot slot;
+		ClusterLmsZeroBlockReplyWire zero_reply;
+		const void *send_payload;
+		uint32 send_payload_len;
 		ClusterICSendResult rc;
 		bool got = false;
 
@@ -261,10 +383,44 @@ cluster_lms_outbound_drain_send(int worker_id)
 		if (!got)
 			break;
 		scanned++;
+		/* Wire-version-sensitive slots are valid only for the exact
+		 * connection generation whose HELLO advertised the required bit.
+		 * A drift consumes this stale ring copy without transport admission;
+		 * no protocol ACK is generated, so the armed reliable leg retries. */
+		if (slot.required_capability != 0
+			&& !cluster_sf_peer_capability_generation_matches(
+				(int32)slot.dest_node_id, slot.required_capability, slot.connection_generation)) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
+			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
+			continue;
+		}
+		send_payload = slot.payload_len > 0 ? slot.payload : NULL;
+		send_payload_len = slot.payload_len;
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
+			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY) {
+			if (slot.msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
+				|| slot.payload_len != sizeof(GcsBlockReplyHeader)) {
+				rc = CLUSTER_IC_SEND_HARD_ERROR;
+				goto handle_send_result;
+			}
+			memset(&zero_reply, 0, sizeof(zero_reply));
+			memcpy(&zero_reply.header, slot.payload, sizeof(zero_reply.header));
+			if (zero_reply.header.status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X) {
+				rc = CLUSTER_IC_SEND_HARD_ERROR;
+				goto handle_send_result;
+			}
+			zero_reply.header.checksum = cluster_gcs_block_compute_checksum(zero_reply.block_data);
+			send_payload = &zero_reply;
+			send_payload_len = sizeof(zero_reply);
+		} else if (slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_FRAME) {
+			rc = CLUSTER_IC_SEND_HARD_ERROR;
+			goto handle_send_result;
+		}
 
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "peer-blocked", -2);
 			Assert(n_retained < (int)lengthof(retained));
 			retained[n_retained++] = slot;
 			continue;
@@ -274,6 +430,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		 * transport admission.  Retaining also blocks later same-peer frames,
 		 * preserving the DATA FIFO while unrelated peers keep flowing. */
 		if (lms_outbound_pcm_x_grant_held(slot.msg_type)) {
+			lms_outbound_pcm_x_image_ready_note(&slot, "grant-held", -3);
 			if (slot.dest_node_id < CLUSTER_MAX_NODES)
 				peer_blocked[slot.dest_node_id] = true;
 			Assert(n_retained < (int)lengthof(retained));
@@ -296,21 +453,27 @@ cluster_lms_outbound_drain_send(int worker_id)
 		 * staged back onto this tag's ring, preserving the one-worker FIFO and
 		 * avoiding recursive handler execution.
 		 */
-		if ((int32)slot.dest_node_id == cluster_node_id) {
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
+			rc = cluster_gcs_block_send_direct_zero_reply((int32)slot.dest_node_id,
+														  &zero_reply.header);
+		else if ((int32)slot.dest_node_id == cluster_node_id) {
 			ClusterICEnvelope env;
 
-			if (cluster_ic_envelope_build(
-					&env, slot.msg_type, (uint32)cluster_node_id, slot.dest_node_id,
-					slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len)
-				&& cluster_ic_dispatch_envelope(&env, slot.payload_len > 0 ? slot.payload : NULL,
-												cluster_node_id))
+			if (cluster_ic_envelope_build(&env, slot.msg_type, (uint32)cluster_node_id,
+										  slot.dest_node_id, send_payload, send_payload_len)
+				&& cluster_ic_dispatch_envelope(&env, send_payload, cluster_node_id))
 				rc = CLUSTER_IC_SEND_DONE;
 			else
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 		} else
-			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
-										  slot.payload_len > 0 ? slot.payload : NULL,
-										  slot.payload_len);
+			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id, send_payload,
+										  send_payload_len);
+
+	handle_send_result:
+		lms_outbound_pcm_x_image_ready_note(&slot, "send-result", (int)rc);
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
+			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
+			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);
 		switch (rc) {
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:

@@ -256,6 +256,32 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 }
 
 /*
+ * Repin the exact visibility-map block in a recently observed descriptor.
+ *
+ * Unlike visibilitymap_pin(), this never performs a mapping lookup, storage
+ * read, or relation extension.  A heap mutation can therefore release its VM
+ * pin before a potentially blocking cluster PCM acquire, take heap content
+ * authority, and use this helper without introducing I/O below that lock.  A
+ * false result means the descriptor was invalidated or retagged; the caller
+ * must release heap content authority and retry through visibilitymap_pin().
+ */
+bool
+visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk, Buffer recent_buffer,
+						 Buffer *vmbuf)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+
+	if (rel == NULL || vmbuf == NULL || BufferIsValid(*vmbuf)
+		|| !BufferIsValid(recent_buffer))
+		return false;
+	if (!ReadRecentBuffer(RelationGetSmgr(rel)->smgr_rlocator.locator,
+						  VISIBILITYMAP_FORKNUM, mapBlock, recent_buffer))
+		return false;
+	*vmbuf = recent_buffer;
+	return true;
+}
+
+/*
  *	visibilitymap_pin_ok - do we already have the correct page pinned?
  *
  * On entry, vmbuf should be InvalidBuffer or a valid buffer returned by

@@ -21,6 +21,7 @@
 #ifndef CLUSTER_PCM_X_BUFMGR_H
 #define CLUSTER_PCM_X_BUFMGR_H
 
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_convert.h"
@@ -32,6 +33,17 @@
  * instead defers its exact handle after one batch so ordinary UNLOCK never
  * becomes a transaction ERROR merely because RETIRE owns the short gate. */
 #define CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS 5
+
+/* FSM pages are advisory and may be consumed without a content lock, so they
+ * are outside PCM/PCM-X ownership.  Every other fork keeps the relation-level
+ * user/shared-catalog tracking policy. */
+static inline bool
+cluster_pcm_x_buffer_tag_tracked(const BufferTag *tag, bool shared_catalog)
+{
+	if (tag == NULL || tag->forkNum == FSM_FORKNUM)
+		return false;
+	return shared_catalog || tag->relNumber >= (RelFileNumber)FirstNormalObjectId;
+}
 
 typedef enum ClusterPcmXHolderRetryAction {
 	CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE = 0,
@@ -74,7 +86,7 @@ cluster_pcm_x_holder_register_retry_action(PcmXQueueResult result, bool runtime_
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
 		return CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE;
 	if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
-		|| (result == PCM_X_QUEUE_NOT_READY && runtime_active))
+		|| (runtime_active && (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)))
 		return CLUSTER_PCM_X_HOLDER_RETRY_WAIT;
 	return CLUSTER_PCM_X_HOLDER_RETRY_FAIL;
 }
@@ -113,12 +125,50 @@ typedef struct ClusterPcmOwnSnapshot {
 	BufferTag tag;
 	uint64 generation;
 	uint64 reservation_token;
+	/* Diagnostic projection of the grant->content activation fence.  It is
+	 * sampled under the same BufferDesc header lock as the authoritative
+	 * ownership tuple, but is not part of snapshot matching or wire state. */
+	uint64 writer_activation_token;
 	uint32 flags;
 	uint8 pcm_state;
 	uint8 _reserved[3];
 } ClusterPcmOwnSnapshot;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 48, "ClusterPcmOwnSnapshot must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 56, "ClusterPcmOwnSnapshot must remain 56 bytes");
+
+/*
+ * Process-local evidence for a reversible finish-revoke refusal.  The DATA
+ * worker fills this from the same header-lock sample that chose BUSY, so GCS
+ * can correlate the exact ticket/image with the actual VM/FSM pin, I/O, or
+ * ownership-lifecycle branch.  This is diagnostics only; it is never sent on
+ * wire or persisted.
+ */
+typedef enum ClusterPcmOwnFinishRefusalReason {
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_NONE = 0,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS
+} ClusterPcmOwnFinishRefusalReason;
+
+typedef struct ClusterPcmOwnFinishRefusal {
+	uint64 live_token;
+	uint32 shared_refcount;
+	uint32 live_flags;
+	ClusterPcmOwnFinishRefusalReason reason;
+	bool bm_io_in_progress;
+} ClusterPcmOwnFinishRefusal;
+
+/* Process-local reason for a retryable S-source image preparation refusal.
+ * DIRTY_FLUSHED records forward progress; the other values identify the
+ * exact nonblocking gate that asked the image pump to retry. */
+typedef enum ClusterPcmOwnSourcePrepareRefusal {
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_NONE = 0,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_BEGIN_REVOKE,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_CONTENT_LOCK,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_DIRTY_FLUSHED,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_DIRTY_RACED,
+	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_IO_IN_PROGRESS
+} ClusterPcmOwnSourcePrepareRefusal;
 
 /* The queue returns execution authority before bufmgr takes content EXCLUSIVE.
  * Bind that claim to the one committed ownership generation and require the
@@ -131,7 +181,14 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 	return claim != NULL && granted != NULL && live != NULL && claim->flags == 0
 		   && claim->writer.flags == 0 && claim->claim_generation != 0
 		   && claim->writer.identity.base_own_generation != UINT64_MAX
-		   && granted->generation == claim->writer.identity.base_own_generation + 1
+		   && claim->grant_base_own_generation != UINT64_MAX
+		   /* A' rebase: the requester copies the published effective grant
+			* base into the claim; zero keeps the enqueue-time identity base. */
+		   && granted->generation
+				  == (claim->grant_base_own_generation != 0
+						  ? claim->grant_base_own_generation
+						  : claim->writer.identity.base_own_generation)
+						 + 1
 		   && granted->reservation_token != 0 && granted->flags == 0
 		   && granted->pcm_state == (uint8)PCM_STATE_X
 		   && BufferTagsEqual(&granted->tag, &claim->writer.identity.tag)
@@ -165,6 +222,31 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0;
 }
 
+/* Revalidate a cached cover after the caller has acquired content authority.
+ * A stable current S/X is the node-level authority for an S read even when a
+ * complete ownership round advanced the generation while this backend waited:
+ * the page-image install/transition is serialized by the content lock already
+ * held by the caller.  Treating that successor S as stale would open a fresh
+ * legacy reservation from S (the forbidden S_NEW shape).  X writers retain
+ * the stricter generation-exact rule and re-enter the convert queue after any
+ * ownership round. */
+static inline bool
+cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captured_generation,
+											uint64 current_generation, uint8 current_state,
+											uint32 current_flags)
+{
+	bool covers;
+
+	if (requested_state != (uint8)PCM_STATE_S && requested_state != (uint8)PCM_STATE_X)
+		return false;
+	if (current_flags != 0)
+		return false;
+	covers = current_state == (uint8)PCM_STATE_X
+			 || (requested_state == (uint8)PCM_STATE_S && current_state == (uint8)PCM_STATE_S);
+	return covers
+		   && (requested_state == (uint8)PCM_STATE_S || current_generation == captured_generation);
+}
+
 /* ConditionalLockBuffer cannot initiate a PCM conversion.  Preserve native
  * PostgreSQL behavior while PCM is inactive and for relations outside the
  * coherence domain; an active tracked page must already hold exact X.  Live
@@ -191,7 +273,17 @@ typedef enum ClusterPcmXGrantReservationKind {
  * acquisition allocates the next monotonic token.  A requester acting as its
  * own N/S/X image source instead reuses the already-live revoke token and
  * changes only its role.  Every shape retains tag/generation/pcm_state until
- * the single grant commit. */
+ * the single grant commit.
+ *
+ * A fresh-token S base (an S holder entering the legacy master acquire, the
+ * loop9/loop10b "S_NEW" tuple) is deliberately NOT a legal finish shape:
+ * writer conversions are ordered by the convert queue's FIFO/WFG, and
+ * legalizing the legacy S-base short cut here would let a stale-cover
+ * fallback bypass that arbitration entirely (the original S3 unordered
+ * multi-writer defect).  The stale-cover path must re-enter the queue
+ * instead; this classifier keeps refusing the bypass.  A fresh-token X base
+ * is equally unenumerated: a live X cover never re-acquires through this
+ * path (cluster_pcm_x_cached_cover_bypasses_queue). */
 static inline ClusterPcmXGrantReservationKind
 cluster_pcm_x_grant_reservation_kind(const ClusterPcmOwnSnapshot *live,
 									 const ClusterPcmOwnSnapshot *base, uint64 reservation_token)
@@ -254,6 +346,42 @@ cluster_pcm_x_current_image_shape(uint8 pcm_state, uint8 buffer_type, bool valid
 			   || (pcm_state == (uint8)PCM_STATE_X && buffer_type == (uint8)BUF_TYPE_XCUR));
 }
 
+/* Post-release retag of a retained PI whose exact write-fence token was just
+ * released, applied under the same header-lock hold.  With no pins the image
+ * is dropped -- !BM_VALID plus a BUF_TYPE_CURRENT retag makes the next
+ * ordinary read reload the current page bytes.  With a pre-existing pin the
+ * frozen bytes must neither vanish nor change under the pin holder
+ * (PostgreSQL pin contract): keep the established PI+BM_VALID
+ * never-write/never-serve N mirror (the passive-pin invalidate release
+ * shape).  The next S acquire begins an exact GRANT_PENDING install that may
+ * overwrite it and republish CURRENT, an X convert rides the convert queue,
+ * and eviction retags once the last pin drains.  Returns true when the image
+ * was dropped. */
+static inline bool
+cluster_pcm_x_retained_release_retag(uint8 *buffer_type, uint32 *buf_state)
+{
+	if (BUF_STATE_GET_REFCOUNT(*buf_state) == 0) {
+		*buf_state &= ~BM_VALID;
+		*buffer_type = (uint8)BUF_TYPE_CURRENT;
+		return true;
+	}
+	return false;
+}
+
+/* A frozen PI mirror kept for pre-existing pins regains CURRENT only while
+ * the exact legacy grant lifecycle that just proved its bytes (a shipped
+ * install, a storage refresh, or an SCN PASS proof) is still open: pcm N +
+ * live GRANT_PENDING + nonzero token + BM_VALID + PI.  Every other shape
+ * stays frozen so the grant-finish valid-image gate keeps failing closed on
+ * an unproven stale cover. */
+static inline bool
+cluster_pcm_x_grant_pending_republish_shape(uint8 pcm_state, uint32 flags, uint64 token, bool valid,
+											uint8 buffer_type)
+{
+	return pcm_state == (uint8)PCM_STATE_N && flags == PCM_OWN_FLAG_GRANT_PENDING && token != 0
+		   && valid && buffer_type == (uint8)BUF_TYPE_PI;
+}
+
 /* Token zero is valid before the first reservation; a completed reservation
  * leaves a nonzero monotonic token idle.  In both cases flags alone say
  * whether a lifecycle is currently active. */
@@ -276,6 +404,7 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
  * LockBuffer/W1.  GRANT_PENDING image installation is permitted; a live
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
 extern bool cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf);
+extern void cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf);
 /* Called only after the requester has proved the exact remote master's S->N
  * RELEASE application ACK.  Atomically normalizes the matching descriptor
  * tuple and returns the fresh N snapshot used by the later PREPARE leg. */
@@ -347,18 +476,40 @@ cluster_bufmgr_pcm_own_abort_n_revoke(BufferDesc *buf,
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s,
 									  ClusterPcmOwnSnapshot *out_revoking);
+/* Freeze one exact S source and choose the newest safe bytes from its clean
+ * current image and verified shared storage.  A valid required_page_scn is a
+ * hard floor; V1's zero floor still prefers the newer observed copy. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
-	ClusterPcmOwnSnapshot *out_retained);
+	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 																		 uint64 source_generation);
-/* Read-only DRAIN proof for a sole-requester source that committed S->X in
- * place.  Exact base+1 X/XCUR authority means DRAIN may release only the
- * immutable dedup record and must not invalidate this descriptor. */
-extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_self_handoff_x_exact(const BufferTag *tag,
-																	   uint64 source_generation);
+/* Process-local descriptor evidence captured by the DRAIN-time probe below
+ * so the caller can log the observed shape as diagnostics.  The fields are
+ * one header-locked snapshot; never persisted or sent on wire. */
+typedef struct ClusterPcmOwnSelfHandoffSample {
+	uint64 live_generation;
+	uint64 live_token;
+	uint32 own_flags;
+	uint8 pcm_state;
+	uint8 buffer_type;
+	bool bm_valid;
+	bool buffer_found;
+} ClusterPcmOwnSelfHandoffSample;
+
+/* Read-only corruption probe for a delayed sole-requester source DRAIN.  The
+ * release authority is the protocol completion certificate; the descriptor
+ * may legitimately have moved on or been evicted, so this only reports a
+ * structurally malformed flags/token shape (and never mutates anything). */
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_self_handoff_probe(const BufferTag *tag,
+										  ClusterPcmOwnSelfHandoffSample *sample_out);
 
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

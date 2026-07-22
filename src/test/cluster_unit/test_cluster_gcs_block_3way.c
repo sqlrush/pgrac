@@ -292,8 +292,8 @@ UT_TEST(test_placeholder_tap_114_2node_x_transfer)
 	 * S→X upgrade with bitmap → broadcast invalidate / X→X holder
 	 * direct ship via HC115 forward / invalidate ack timeout 53R91 /
 	 * dirty buffer XLogFlush-before-ack (HC123) / epoch validation /
-	 * S barrier DENIED_PENDING_X reply / reader backoff retry →
-	 * eventual grant / starvation 53R92 budget exhaustion. */
+	 * S barrier DENIED_PENDING_X reply / exact reservation abort /
+	 * fresh-identity reader backoff retry → eventual grant. */
 	UT_ASSERT(true);
 }
 

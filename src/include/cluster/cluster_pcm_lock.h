@@ -104,6 +104,16 @@ typedef enum PcmLockTransition {
 } PcmLockTransition;
 #define PCM_TRANSITION_COUNT 9
 
+/* Exact master-side apply verdict.  PENDING_X is distinct from a structural
+ * state incompatibility so the block data plane can return its retryable
+ * DENIED_PENDING_X status after the final, entry-lock-serialized admission
+ * check closes a preflight-to-apply race. */
+typedef enum PcmGcsTransitionApplyResult {
+	PCM_GCS_TRANSITION_APPLIED = 0,
+	PCM_GCS_TRANSITION_INCOMPATIBLE = 1,
+	PCM_GCS_TRANSITION_PENDING_X = 2
+} PcmGcsTransitionApplyResult;
+
 
 /*
  * GrdEntry -- opaque per-block global lock state (master node).
@@ -171,6 +181,13 @@ typedef enum PcmXGrdHandoffResult {
 	PCM_X_GRD_HANDOFF_BAD_STATE,
 	PCM_X_GRD_HANDOFF_INVALID
 } PcmXGrdHandoffResult;
+typedef enum PcmXTransferCommitResult {
+	PCM_X_TRANSFER_COMMIT_OK = 0,
+	PCM_X_TRANSFER_COMMIT_NOT_FOUND,
+	PCM_X_TRANSFER_COMMIT_STALE,
+	PCM_X_TRANSFER_COMMIT_BAD_STATE
+} PcmXTransferCommitResult;
+
 
 typedef enum PcmPendingXReserveResult {
 	PCM_PENDING_X_RESERVE_INVALID = -2,
@@ -315,9 +332,12 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  * Returns true if a DURABLE PCM grant was recorded (caller mirrors ownership
  * into buf->pcm_state).  Returns false for a spec-5.2 D2 one-shot READ_IMAGE:
  * bytes were installed for this read only and the caller MUST leave
- * buf->pcm_state == N so the next access re-fetches.
+ * buf->pcm_state == N so the next access re-fetches.  A false return with
+ * *out_retry_denied set is instead a queue-arbitration retry boundary; the
+ * caller must exact-abort and replace its GRANT_PENDING reservation.
  */
-extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
+extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode,
+											bool *out_retry_denied);
 
 /*
  * PGRAC: spec-5.2a D2 — clean-page X-transfer arm (backend-local, one-shot).
@@ -371,13 +391,13 @@ extern bool cluster_pcm_clean_page_xfer_consume(void);
 extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode);
 extern void cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode);
 extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
-/* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
- * writer-transfer (the remote holder shipped + released its X).  S3 forensics
- * step 1b: the shipping holder + wire request_id/epoch ride along so the
- * watermark-advance provenance table records WHO produced the advance. */
-extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn,
-														  SCN page_scn, int32 holder_node,
-														  uint64 request_id, uint64 epoch);
+/* PGRAC: spec-5.2 D11 / P0-26 — commit a local-master X transfer only if the
+ * full remote-X authority sampled before the wire round is unchanged.  The
+ * exact source identity/generation/session closes late-reply and concurrent
+ * queue-handoff races; STALE is a fresh-request retry boundary. */
+extern PcmXTransferCommitResult cluster_pcm_lock_master_take_x_after_transfer(
+	BufferTag tag, const PcmAuthoritySnapshot *expected, XLogRecPtr page_lsn, SCN page_scn,
+	int32 holder_node, uint32 requester_procno, uint64 request_id, uint64 epoch);
 /* PGRAC: spec-5.2 D11 path B — master==holder==self ships its X image to a
  * remote requester and records the requester as the new X holder (single-phase
  * writer-transfer-revoke; caller drops self's copy no-wire before calling).
@@ -419,6 +439,7 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
  */
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
 extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
+extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
 extern PcmXGrdHandoffResult
 cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
 extern int cluster_pcm_grd_count(void);
@@ -448,6 +469,9 @@ extern void cluster_pcm_grd_init(void);
 extern bool cluster_pcm_transition_legal(PcmState from, PcmState to, PcmLockTransition trans);
 extern void cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans,
 										 int holder_node_id);
+extern PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
+											 int holder_node_id);
 extern bool cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans,
 												  int holder_node_id);
 

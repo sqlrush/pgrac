@@ -828,37 +828,42 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	 * striping-off/below-floor collision with a remote inserter's xid; the
 	 * pre-round-6 early return handed that collision to the PG-native cmin
 	 * path -> "attempted to update invisible tuple".  Only the no-remote-
-	 * evidence route treats the raw match as our own insert.
+	 * evidence route treats the raw match as our own insert.  VACUUM freeze is
+	 * stronger: it proves xmin committed even after that historical ITL slot is
+	 * recycled, so only the exact FROZEN bit pair skips xmin resolution.
 	 */
-	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &r);
-	switch (cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xmin))) {
-	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-						errmsg("cluster TT slot recycled for xmin %u", raw_xmin),
-						errhint("ITL slot no longer maps to this xid; retry.")));
-		break;
-	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
-		/* Our own insert: PG-native handles cmin / self-modified correctly. */
-		return false;
-	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
-		switch (cluster_vis_update_xmin_verdict(r.status)) {
-		case CVV_INVISIBLE:
-			*res = TM_Invisible;
-			return true;
-		case CVV_FAILCLOSED_UNKNOWN:
+	if (cluster_vis_xmin_needs_resolution(tuple->t_infomask)) {
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &r);
+		switch (
+			cluster_vis_evidence_route(r.evidence, TransactionIdIsCurrentTransactionId(raw_xmin))) {
+		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xmin %u", raw_xmin),
-							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+							errmsg("cluster TT slot recycled for xmin %u", raw_xmin),
+							errhint("ITL slot no longer maps to this xid; retry.")));
 			break;
-		case CVV_VISIBLE:
-			xmin_remote_visible = true;
+		case CLUSTER_VIS_ROUTE_NATIVE_SELF:
+			/* Our own insert: PG-native handles cmin / self-modified correctly. */
+			return false;
+		case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
+			switch (cluster_vis_update_xmin_verdict(r.status)) {
+			case CVV_INVISIBLE:
+				*res = TM_Invisible;
+				return true;
+			case CVV_FAILCLOSED_UNKNOWN:
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+								errmsg("cluster TT status unknown for xmin %u", raw_xmin),
+								errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				break;
+			case CVV_VISIBLE:
+				xmin_remote_visible = true;
+				break;
+			default:
+				break;
+			}
 			break;
-		default:
+		case CLUSTER_VIS_ROUTE_NATIVE:
 			break;
 		}
-		break;
-	case CLUSTER_VIS_ROUTE_NATIVE:
-		break;
 	}
 	/* xmin NONE/LOCAL: leave xmin to PG unless we must intercept the xmax. */
 
@@ -2465,17 +2470,15 @@ HeapTupleSatisfiesVacuumHorizon(HeapTuple htup, Buffer buffer, TransactionId *de
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * spec-3.14 D5 (hole #2): a tuple with REMOTE writer evidence must never
-	 * be judged DEAD by this node's local horizon -- overlapping xid spaces
-	 * mean local oldest_xmin can pass a still-live remote xid (false-dead).
-	 * Return HEAPTUPLE_LIVE: the RECENTLY_DEAD path re-tests dead_after
-	 * against the LOCAL oldest_xmin / vistest (heap_prune_satisfies_vacuum)
-	 * and would re-introduce the false-dead, so LIVE (unconditional keep) is
-	 * the only safe verdict.  Real reclamation waits for the cross-node
-	 * vacuum-coordination spec (spec-3.14 §10).  spec wrote RECENTLY_DEAD;
-	 * LIVE is the implementation-time correction (dead_after re-test hazard).
+	 * P0-28 / spec-3.14 §10: a peer may retain this exact TID across a
+	 * PCM-X wait.  ITL evidence is not a durable prune-horizon token: its slot
+	 * may be reused before that peer reacquires the page, after which native
+	 * xmin/CLOG checks can misclassify and recycle the target line pointer.
+	 * Keep every shared-storage tuple until a real cluster horizon exists.
 	 */
-	if (cluster_storage_mode_enabled() && cluster_tuple_has_remote_evidence(buffer, tuple)) {
+	if (cluster_vis_prune_must_defer(cluster_storage_mode_enabled()
+									  && BufferIsValid(buffer) && !BufferIsLocal(buffer),
+								  false)) {
 		cluster_vis_bump_prune_remote_keep_count();
 		return HEAPTUPLE_LIVE;
 	}

@@ -86,43 +86,90 @@ cluster_pcm_x_image_fetch_build_request(const PcmXLocalProgress *progress, int32
 
 
 bool
-cluster_pcm_x_image_fetch_request_exact(const ClusterICEnvelope *env,
-										const GcsBlockRequestPayload *request,
-										const PcmXLocalHolderProgress *holder, int32 holder_node,
-										int32 current_master_node, uint64 current_epoch)
+cluster_pcm_x_image_fetch_request_exact_diagnosed(const ClusterICEnvelope *env,
+												  const GcsBlockRequestPayload *request,
+												  const PcmXLocalHolderProgress *holder,
+												  int32 holder_node, int32 current_master_node,
+												  uint64 current_epoch,
+												  PcmXImageFetchRequestRefusal *refusal_out)
 {
 	static const uint8 zero_reserved[sizeof(request->reserved_0)] = { 0 };
 	int32 decoded_backend_id;
 	int32 decoded_master_node;
 	int32 decoded_requester_node;
 
-	return env != NULL && request != NULL && holder != NULL && holder_node >= 0
-		   && holder_node < PCM_X_PROTOCOL_NODE_LIMIT && current_master_node >= 0
-		   && current_master_node < PCM_X_PROTOCOL_NODE_LIMIT
-		   && env->source_node_id == (uint32)request->sender_node
-		   && env->dest_node_id == (uint32)holder_node && env->payload_length == sizeof(*request)
-		   && request->sender_node >= 0 && request->sender_node < PCM_X_PROTOCOL_NODE_LIMIT
-		   && request->requester_backend_id > 0 && request->epoch == current_epoch
-		   && request->transition_id == (uint8)PCM_TRANS_N_TO_S
-		   && memcmp(request->reserved_0, zero_reserved, sizeof(zero_reserved)) == 0
-		   && holder->master_node == current_master_node && holder->master_session_incarnation != 0
-		   && holder->ref.grant_generation != 0 && holder->ref.handle.ticket_id != 0
-		   && holder->ref.handle.queue_generation != 0
-		   && holder->ref.identity.cluster_epoch == current_epoch
-		   && holder->ref.identity.wait_seq != 0
-		   && BufferTagsEqual(&holder->ref.identity.tag, &request->tag)
-		   && holder->ref.identity.node_id == request->sender_node
-		   && holder->pending_opcode == PGRAC_IC_MSG_PCM_X_IMAGE_READY
-		   && holder->phase == PGRAC_IC_MSG_PCM_X_IMAGE_READY && holder->flags == 0
-		   && pcm_x_image_fetch_token_valid(&holder->image, current_master_node)
-		   && holder->image.image_id == request->request_id
-		   && holder->image.source_node == (uint32)holder_node
-		   && cluster_pcm_x_image_id_decode(request->request_id, &decoded_master_node, NULL)
-		   && decoded_master_node == current_master_node
-		   && cluster_gcs_requester_id_decode(holder->ref.identity.request_id,
-											  &decoded_requester_node, &decoded_backend_id, NULL)
-		   && decoded_requester_node == request->sender_node
-		   && decoded_backend_id == request->requester_backend_id;
+	if (refusal_out != NULL)
+		*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_NONE;
+	if (env == NULL || request == NULL || holder == NULL || holder_node < 0
+		|| holder_node >= PCM_X_PROTOCOL_NODE_LIMIT || current_master_node < 0
+		|| current_master_node >= PCM_X_PROTOCOL_NODE_LIMIT) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ARGUMENT;
+		return false;
+	}
+	if (env->source_node_id != (uint32)request->sender_node
+		|| env->dest_node_id != (uint32)holder_node || env->payload_length != sizeof(*request)) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_ENVELOPE;
+		return false;
+	}
+	if (request->sender_node < 0 || request->sender_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| request->requester_backend_id <= 0 || request->epoch != current_epoch
+		|| request->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| memcmp(request->reserved_0, zero_reserved, sizeof(zero_reserved)) != 0) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_REQUEST;
+		return false;
+	}
+	if (holder->master_node != current_master_node || holder->master_session_incarnation == 0) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_MASTER;
+		return false;
+	}
+	if (holder->ref.grant_generation == 0 || holder->ref.handle.ticket_id == 0
+		|| holder->ref.handle.queue_generation == 0
+		|| holder->ref.identity.cluster_epoch != current_epoch || holder->ref.identity.wait_seq == 0
+		|| !BufferTagsEqual(&holder->ref.identity.tag, &request->tag)
+		|| holder->ref.identity.node_id != request->sender_node) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_REF;
+		return false;
+	}
+	if (holder->pending_opcode != PGRAC_IC_MSG_PCM_X_IMAGE_READY
+		|| holder->phase != PGRAC_IC_MSG_PCM_X_IMAGE_READY || holder->flags != 0) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_LEG;
+		return false;
+	}
+	if (!pcm_x_image_fetch_token_valid(&holder->image, current_master_node)
+		|| holder->image.image_id != request->request_id
+		|| holder->image.source_node != (uint32)holder_node
+		|| !cluster_pcm_x_image_id_decode(request->request_id, &decoded_master_node, NULL)
+		|| decoded_master_node != current_master_node) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_HOLDER_IMAGE;
+		return false;
+	}
+	if (!cluster_gcs_requester_id_decode(holder->ref.identity.request_id, &decoded_requester_node,
+										 &decoded_backend_id, NULL)
+		|| decoded_requester_node != request->sender_node
+		|| decoded_backend_id != request->requester_backend_id) {
+		if (refusal_out != NULL)
+			*refusal_out = PCM_X_IMAGE_FETCH_REQUEST_REFUSAL_REQUESTER_ID;
+		return false;
+	}
+	return true;
+}
+
+
+bool
+cluster_pcm_x_image_fetch_request_exact(const ClusterICEnvelope *env,
+										const GcsBlockRequestPayload *request,
+										const PcmXLocalHolderProgress *holder, int32 holder_node,
+										int32 current_master_node, uint64 current_epoch)
+{
+	return cluster_pcm_x_image_fetch_request_exact_diagnosed(
+		env, request, holder, holder_node, current_master_node, current_epoch, NULL);
 }
 
 

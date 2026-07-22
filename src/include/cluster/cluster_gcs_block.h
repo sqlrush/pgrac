@@ -176,7 +176,8 @@ typedef enum GcsBlockPcmXRequesterSite {
 	GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM,
 	GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH,
 	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM,
-	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM
+	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM,
+	GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT
 } GcsBlockPcmXRequesterSite;
 
 typedef enum GcsBlockPcmXRetryAction {
@@ -407,6 +408,15 @@ cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQue
 		if (result == PCM_X_QUEUE_BAD_STATE)
 			return GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS;
 		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT:
+		/* BUSY is a transient own-slot lifecycle flag (a revoke/grant on this
+		 * node mid-flight); wait and re-snapshot.  STALE means an interleaved
+		 * revoke consumed the queued identity's base_own_generation, which the
+		 * grant/final-ack chain cannot absorb without a master-visible rebase;
+		 * keep the fail-closed verdict until that amendment lands. */
+		if (result == PCM_X_QUEUE_BUSY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
 	case GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR:
 	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM:
 		break;
@@ -504,12 +514,13 @@ typedef struct GcsBlockPcmXImageIdentity {
 typedef struct GcsBlockPcmXImageBinding {
 	GcsBlockPcmXImageIdentity identity;
 	uint64 master_session;
+	uint64 required_page_scn;
 } GcsBlockPcmXImageBinding;
 
 StaticAssertDecl(sizeof(GcsBlockPcmXImageIdentity) == 128,
 				 "PCM-X image identity must fit the existing dedup 128-byte metadata cell");
-StaticAssertDecl(sizeof(GcsBlockPcmXImageBinding) == 136,
-				 "PCM-X image binding is identity plus authenticated master session");
+StaticAssertDecl(sizeof(GcsBlockPcmXImageBinding) == 144,
+				 "PCM-X image binding includes session and required source floor");
 
 static inline bool
 GcsBlockPcmXImageIdentityEqual(const GcsBlockPcmXImageIdentity *left,
@@ -523,6 +534,7 @@ GcsBlockPcmXImageBindingEqual(const GcsBlockPcmXImageBinding *left,
 							  const GcsBlockPcmXImageBinding *right)
 {
 	return left != NULL && right != NULL && left->master_session == right->master_session
+		   && left->required_page_scn == right->required_page_scn
 		   && GcsBlockPcmXImageIdentityEqual(&left->identity, &right->identity);
 }
 
@@ -939,9 +951,11 @@ cluster_gcs_pcm_x_revoke_ingress_valid(const PcmXRevokePayload *request, Size pa
 									   int32 authenticated_node, uint64 current_epoch,
 									   int32 tag_master, int32 local_node)
 {
-	return request != NULL && payload_length == sizeof(*request) && authenticated_node >= 0
-		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
-		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == authenticated_node
+	return request != NULL
+		   && (payload_length == sizeof(*request) || payload_length == sizeof(PcmXRevokePayloadV2))
+		   && authenticated_node >= 0 && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && tag_master == authenticated_node
 		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&request->ref, current_epoch)
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(request->image_id, authenticated_node);
 }
@@ -974,16 +988,27 @@ cluster_gcs_pcm_x_prepare_grant_ingress_valid(const PcmXGrantPayload *grant, Siz
 		   && cluster_gcs_pcm_x_image_token_wire_valid(&grant->image, authenticated_node);
 }
 
-/* INSTALL_READY is one canonical requester -> master application ACK. */
+/* INSTALL_READY is one canonical requester -> master application ACK.  Both
+ * the V1 (104-byte, no rebase) and V2 (112-byte) exact frames are legal; the
+ * caller normalizes a V1 frame to rebased_own_generation == 0 before this
+ * check.  A V1 frame carrying a nonzero rebase is impossible by construction
+ * and a V2 rebase must be strictly newer than the immutable identity base. */
 static inline bool
 cluster_gcs_pcm_x_install_ready_ingress_valid(const PcmXInstallReadyPayload *ready,
 											  Size payload_length, int32 authenticated_node,
 											  uint64 current_epoch, int32 tag_master,
-											  int32 local_node)
+											  int32 local_node, bool rebase_wire_active,
+											  bool source_supports_rebase)
 {
-	return ready != NULL && payload_length == sizeof(*ready) && authenticated_node >= 0
-		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
-		   && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
+	return ready != NULL
+		   && (payload_length == sizeof(*ready) || payload_length == PCM_X_INSTALL_READY_V1_LEN)
+		   && (payload_length == sizeof(*ready) || ready->rebased_own_generation == 0)
+		   && (payload_length != sizeof(*ready) || (rebase_wire_active && source_supports_rebase))
+		   && (ready->rebased_own_generation == 0
+			   || (ready->rebased_own_generation != UINT64_MAX
+				   && ready->rebased_own_generation > ready->ref.identity.base_own_generation))
+		   && authenticated_node >= 0 && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && local_node >= 0 && local_node < PCM_X_PROTOCOL_NODE_LIMIT && tag_master == local_node
 		   && cluster_gcs_pcm_x_transfer_ref_wire_valid(&ready->ref, current_epoch)
 		   && ready->ref.identity.node_id == authenticated_node
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ready->image_id, local_node)
@@ -1005,7 +1030,10 @@ cluster_gcs_pcm_x_commit_x_ingress_valid(const PcmXPhasePayload *commit, Size pa
 		   && commit->phase == PGRAC_IC_MSG_PCM_X_COMMIT_X && commit->flags == 0;
 }
 
-/* FINAL_ACK proves the requester committed exactly one ownership generation. */
+/* FINAL_ACK proves the requester committed exactly one ownership generation.
+ * The wire check is only a monotonic floor against the immutable identity
+ * base: a published INSTALL_READY rebase may have moved the effective grant
+ * base, and the exact "+1" proof runs under the master ticket lock. */
 static inline bool
 cluster_gcs_pcm_x_final_ack_ingress_valid(const PcmXFinalAckPayload *ack, Size payload_length,
 										  int32 authenticated_node, uint64 current_epoch,
@@ -1018,7 +1046,7 @@ cluster_gcs_pcm_x_final_ack_ingress_valid(const PcmXFinalAckPayload *ack, Size p
 		   && ack->ref.identity.node_id == authenticated_node
 		   && cluster_gcs_pcm_x_image_id_master_wire_valid(ack->image_id, local_node)
 		   && ack->ref.identity.base_own_generation != UINT64_MAX
-		   && ack->committed_own_generation == ack->ref.identity.base_own_generation + 1;
+		   && ack->committed_own_generation > ack->ref.identity.base_own_generation;
 }
 
 /* FINAL_COMMIT_ACK is the canonical master -> requester application ACK. */
@@ -1272,6 +1300,31 @@ cluster_gcs_block_direct_state_transition_ok(ClusterGcsBlockDirectState from,
 	return false;
 }
 
+/*
+ * A current-master INVALIDATE that meets a node-local mirror-N
+ * GRANT_PENDING is also an authoritative reason for the one exact N->S
+ * attempt to stand down: that reader cannot be granted while this X transfer
+ * is invalidating the node.  Keep the delivery predicate attempt-exact and
+ * refuse any live direct-land target.  The caller only synthesizes a local
+ * DENIED_PENDING_X; the INVALIDATE itself still returns RETRYABLE_BUSY until
+ * the owning backend aborts its reservation, so no holder bit is credited.
+ */
+static inline bool
+GcsBlockLocalPendingSDenialMatches(bool in_use, bool reply_received, bool stale,
+								   uint8 transition_id, const BufferTag *slot_tag,
+								   uint64 request_epoch, int32 expected_master_node,
+								   ClusterGcsBlockDirectState direct_state,
+								   bool direct_target_prepared, const BufferTag *invalidate_tag,
+								   uint64 invalidate_epoch, int32 invalidate_master_node)
+{
+	return in_use && !reply_received && !stale && slot_tag != NULL && invalidate_tag != NULL
+		   && transition_id == (uint8)PCM_TRANS_N_TO_S && BufferTagsEqual(slot_tag, invalidate_tag)
+		   && request_epoch == invalidate_epoch && expected_master_node == invalidate_master_node
+		   && !direct_target_prepared
+		   && (direct_state == GCS_BLOCK_DIRECT_UNARMED
+			   || direct_state == GCS_BLOCK_DIRECT_ABORTED);
+}
+
 
 /* ============================================================
  * GcsBlockReplyStatus -- reply status code carried in
@@ -1454,6 +1507,27 @@ typedef enum GcsBlockReplyStatus {
 													 * multi is a DENIED reply — the
 													 * requester keeps 53R97 (Rule 8.A). */
 } GcsBlockReplyStatus;
+
+/*
+ * The block-request wire validator admits only legal transition ids, but the
+ * master's outer S/X decision and its final entry-lock transition apply are
+ * deliberately separated by buffer probing/copying.  A concurrent handoff can
+ * therefore make an otherwise valid N->S/N->X request incompatible at that
+ * final apply.  That is authority drift, not a client-terminal protocol error:
+ * reuse DENIED_PENDING_X's established fresh-request/token retry boundary.
+ * Keep every other transition's incompatibility terminal so malformed or
+ * structurally illegal control-plane transitions are never papered over.
+ */
+static inline GcsBlockReplyStatus
+GcsBlockApplyRefusalStatus(PcmGcsTransitionApplyResult apply_result,
+						   PcmLockTransition transition_id)
+{
+	if (apply_result == PCM_GCS_TRANSITION_PENDING_X
+		|| (apply_result == PCM_GCS_TRANSITION_INCOMPATIBLE
+			&& (transition_id == PCM_TRANS_N_TO_S || transition_id == PCM_TRANS_N_TO_X)))
+		return GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	return GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
+}
 
 /* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
  * appended as the tail value (no collision with any shipped status; r3 mis-read
@@ -3038,7 +3112,39 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn);
-extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
+/* Process-local diagnostic returned by the nonblocking holder-copy helper.
+ * This is observation only: the caller's bool success/deny contract and wire
+ * reply status remain unchanged. */
+typedef enum ClusterBufmgrGcsCopyRefusal {
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE = 0,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT
+} ClusterBufmgrGcsCopyRefusal;
+
+/* A DATA worker cannot wait for BufferContent: its owner may itself be waiting
+ * for that worker to deliver a reply.  Only the two conditional-lock misses
+ * are therefore retryable through the established fresh reservation/request
+ * boundary.  Residency/current-image failures remain structural, while HC89
+ * keeps its explicit one-retry hot-page bound. */
+static inline GcsBlockReplyStatus
+GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
+{
+	if (refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
+		|| refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
+		return GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	return GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+}
+
+extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
+extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
+											  ClusterBufmgrGcsCopyRefusal *out_refusal);
 extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 														 void **out_page_addr,
 														 BufferDesc **out_buf);
@@ -3167,8 +3273,19 @@ extern bool cluster_gcs_block_local_x_upgrade_ext(BufferTag tag, bool *out_busy)
  * consistent), applies PCM_TRANS_X_TO_S_DOWNGRADE, flips the local
  * pcm_state cache X->S.  False = not quiescent / not X / buffer gone /
  * master refused; caller falls back to the one-shot read-image ship. */
+typedef enum ClusterBufmgrGcsDowngradeOutcome {
+	CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY = 0,
+	CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED,
+	CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY
+} ClusterBufmgrGcsDowngradeOutcome;
 extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
+extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
 extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
+extern ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+	BufferTag tag, int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
+	ClusterBufmgrGcsCopyRefusal *out_refusal);
 
 /* PGRAC: GCS-race round-4c P1 — re-send the (idempotent) X->S downgrade
  * notify when a BAST nudge arrives for a block this node already holds in
@@ -3257,14 +3374,15 @@ extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 /*
  * Returns true if a DURABLE PCM grant was acquired (GRANTED / STORAGE_
  * FALLBACK — the caller mirrors PCM ownership into buf->pcm_state).  Returns
- * false for a spec-5.2 D2 one-shot READ_IMAGE: the bytes were installed for
- * this read only, no S holder was registered, and the caller MUST leave
- * buf->pcm_state == N so the next access re-fetches.  Terminal denials
- * ereport(ERROR) and do not return.
+ * false for a spec-5.2 D2 one-shot READ_IMAGE, or for an authoritative
+ * DENIED_PENDING_X with *out_retry_denied set.  In the latter case the caller
+ * must exact-abort its GRANT_PENDING reservation before waiting/re-entering.
+ * Terminal denials ereport(ERROR) and do not return.
  */
 extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
 													PcmLockTransition transition_id,
-													int master_node, bool clean_eligible);
+													int master_node, bool clean_eligible,
+													bool *out_retry_denied);
 
 /*
  * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by
@@ -3272,14 +3390,22 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * block a REMOTE node holds in X and a local reader needs an N→S image.
  * Forwards a read-image request to the holder and installs the shipped
  * current image for one read.  Returns false (non-durable; caller leaves
- * buf->pcm_state == N); fails closed (ereport) if no image is obtained.
+ * buf->pcm_state == N); fails closed (ereport) if no image is obtained while
+ * expected remains exact.  Authority drift instead sets out_retry_denied so
+ * bufmgr aborts/rearms GRANT_PENDING and selects a fresh holder identity.
  */
-extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node);
+extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
+														 const PcmAuthoritySnapshot *expected,
+														 bool *out_retry_denied);
 /* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant.
  * spec-5.2a D2/D3: clean_eligible routes a clean (sequence) page through the
- * flush-data-before-drop holder path + stale-holder storage-fallback recovery. */
-extern bool cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
-														 bool clean_eligible);
+ * flush-data-before-drop holder path + stale-holder storage-fallback recovery.
+ * P0-26: expected is the entry-lock authority token; authority drift returns
+ * retry_denied so bufmgr aborts/rearms a fresh ownership/request identity. */
+extern bool cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf,
+														 const PcmAuthoritySnapshot *expected,
+														 bool clean_eligible,
+														 bool *out_retry_denied);
 
 /*
  * spec-4.7 D1 — GCS/PCM block resource recovery phase.
@@ -3406,6 +3532,8 @@ typedef enum GcsBlockSendFamily {
 } GcsBlockSendFamily;
 
 extern void cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc);
+extern ClusterICSendResult
+cluster_gcs_block_send_direct_zero_reply(int32 dest_node, const GcsBlockReplyHeader *header);
 
 extern uint64 cluster_gcs_get_reply_send_queued_count(void);
 extern uint64 cluster_gcs_get_reply_send_not_admitted_count(void);
@@ -3550,6 +3678,7 @@ extern uint64 cluster_gcs_get_x_vs_s_no_carrier_denied_count(void);
 /* PGRAC: spec-2.37 D12 — 4 NEW counter accessors for PI watermark + lost-write. */
 extern uint64 cluster_gcs_get_pi_watermark_advance_count(void);
 extern uint64 cluster_gcs_get_pi_watermark_retire_count(void);
+extern uint64 cluster_gcs_get_pi_durable_note_apply_count(void);
 extern uint64 cluster_gcs_get_lost_write_detected_count(void);
 extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
 /* PGRAC: spec-2.41 D7 — SCN detector + redo-coverage observability accessors. */
@@ -3672,6 +3801,9 @@ extern bool cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, co
 extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
 														PcmXLocalWriterClaim *claim_out,
 														bool *claim_handed_off);
+/* Diagnostic: source line of this backend's most recent non-OK
+ * acquire-writer exit (0 when it never failed). */
+extern int cluster_gcs_pcm_x_requester_last_fail_line(void);
 extern PcmXQueueResult
 cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(const PcmXLocalWriterClaim *claim);
 /* Error/owner-exit cleanup adapter: never propagates ERROR.  A caught ERROR

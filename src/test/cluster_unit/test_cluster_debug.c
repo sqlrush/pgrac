@@ -933,6 +933,39 @@ cluster_pcm_x_runtime_snapshot(void)
 	return snapshot;
 }
 
+bool
+cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
+{
+	if (buf != NULL && buflen > 0)
+		buf[0] = '\0';
+	return false;
+}
+
+bool
+cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	return false;
+}
+
+bool
+cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	return false;
+}
+
+bool
+cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
+{
+	return false;
+}
+
+bool
+cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
+								 uint32 *count_out)
+{
+	return false;
+}
+
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)
@@ -1518,6 +1551,11 @@ cluster_gcs_get_pi_watermark_advance_count(void)
 }
 uint64
 cluster_gcs_get_pi_watermark_retire_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_pi_durable_note_apply_count(void)
 {
 	return 0;
 }
@@ -4238,6 +4276,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	static const char *const pcm_keys[] = {
 		"pcm_x_runtime_state",
 		"pcm_x_runtime_generation",
+		"pcm_x_runtime_fail_closed_site",
 		"pcm_x_queue_enqueue_count",
 		"pcm_x_queue_admit_count",
 		"pcm_x_queue_confirm_count",
@@ -4281,6 +4320,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"invalidate_passive_s_release_count",
 		"pcm_x_self_handoff_count",
 		"pcm_x_self_handoff_drain_count",
+		"pi_durable_note_apply_count",
 	};
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
@@ -4294,9 +4334,9 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
 	(void)cluster_dump_state(fcinfo);
 
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 58);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 60);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
-	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 119);
+	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 120);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(lmd_keys); i++)
@@ -4500,6 +4540,12 @@ cluster_lms_obs_get_outbound_not_admitted(int worker_id pg_attribute_unused())
 }
 uint64
 cluster_lms_obs_get_outbound_requeue_drop(int worker_id pg_attribute_unused())
+{
+	return 0;
+}
+
+uint64
+cluster_lms_obs_get_outbound_cap_guard_drop(int worker_id pg_attribute_unused())
 {
 	return 0;
 }

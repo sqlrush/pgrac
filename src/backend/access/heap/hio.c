@@ -66,6 +66,30 @@ cluster_hio_lease_target_block(Relation relation)
 }
 #endif
 
+/* P0-20: acquire an ordered pair without ever sleeping on the second PCM-X
+ * conversion while the first content lock is held.  BARRIER_CLOSED means the
+ * first page was frozen before this nested edge became visible.  Release our
+ * first lock, resolve the second conversion alone, then retry in the original
+ * block order; pins remain owned by the caller throughout. */
+static void
+cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
+{
+	Assert(BufferIsValid(first));
+	Assert(BufferIsValid(second));
+	Assert(first != second);
+
+	for (;;)
+	{
+		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
+		if (ClusterLockBufferExclusiveBarrierAware(second))
+			return;
+
+		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+	}
+}
+
 /*
  * RelationPutHeapTuple - place tuple at specified page
  *
@@ -233,10 +257,12 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 		if (need_to_pin_buffer2)
 			visibilitymap_pin(relation, block2, vmbuffer2);
 
-		/* Relock buffers. */
-		LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE);
+		/* Relock buffers.  A cross-page relock keeps the same block order,
+		 * but must unwind a frozen-barrier refusal from the second page. */
 		if (buffer2 != InvalidBuffer && buffer2 != buffer1)
-			LockBuffer(buffer2, BUFFER_LOCK_EXCLUSIVE);
+			cluster_hio_lock_buffer_pair(buffer1, buffer2);
+		else
+			LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE);
 
 		/*
 		 * If there are two buffers involved and we pinned just one of them,
@@ -716,8 +742,7 @@ loop:
 			buffer = ReadBuffer(relation, targetBlock);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
-			LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
 		}
 		else
 		{
@@ -725,8 +750,7 @@ loop:
 			buffer = ReadBuffer(relation, targetBlock);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_hio_lock_buffer_pair(buffer, otherBuffer);
 		}
 
 		/*
@@ -900,8 +924,9 @@ loop:
 	{
 		/* released lock on target buffer above */
 		if (otherBuffer != InvalidBuffer)
-			LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+		else
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		recheckVmPins = true;
 	}
 	else if (otherBuffer != InvalidBuffer)
@@ -926,8 +951,7 @@ loop:
 		{
 			unlockedTargetBuffer = true;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_hio_lock_buffer_pair(otherBuffer, buffer);
 		}
 		recheckVmPins = true;
 	}

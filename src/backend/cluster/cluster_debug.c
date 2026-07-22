@@ -1451,6 +1451,8 @@ dump_lms(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lms_obs_get_outbound_not_admitted(-1)));
 	emit_row(rsinfo, "lms", "lms_outbound_requeue_drop_count",
 			 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(-1)));
+	emit_row(rsinfo, "lms", "lms_outbound_cap_guard_drop_count",
+			 fmt_int64((int64)cluster_lms_obs_get_outbound_cap_guard_drop(-1)));
 	{
 		int w, hb;
 
@@ -1474,6 +1476,9 @@ dump_lms(ReturnSetInfo *rsinfo)
 			snprintf(wkey, sizeof(wkey), "lms_outbound_requeue_drop_count_w%d", w);
 			emit_row(rsinfo, "lms", wkey,
 					 fmt_int64((int64)cluster_lms_obs_get_outbound_requeue_drop(w)));
+			snprintf(wkey, sizeof(wkey), "lms_outbound_cap_guard_drop_count_w%d", w);
+			emit_row(rsinfo, "lms", wkey,
+					 fmt_int64((int64)cluster_lms_obs_get_outbound_cap_guard_drop(w)));
 		}
 
 		/* Inline-serve duration histogram: aggregate 16 rows + per live
@@ -1995,15 +2000,60 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
 
-	/* PCM-X queue core: 30 stable keys in the existing pcm category. */
+	/* PCM-X queue core: 30 stable integer keys in the existing pcm category,
+	 * plus one text-valued fail-closed provenance key (excluded from the
+	 * integer-only snapshot tooling in the TAP suite). */
 	{
 		PcmXStatsSnapshot stats = { 0 };
 		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
+		char fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
 
 		(void)cluster_pcm_x_stats_snapshot(&stats);
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
 				 fmt_int64((int64)runtime.gate_generation));
+		if (!cluster_pcm_x_runtime_fail_closed_site(fail_closed_site, sizeof(fail_closed_site)))
+			strlcpy(fail_closed_site, "(none)", sizeof(fail_closed_site));
+		emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", fail_closed_site);
+
+		/* Text-valued per-slot diagnostic rows; present only while master tag
+		 * or ticket slots are occupied, so the quiescent key count above is
+		 * unchanged. */
+		{
+			Size cursor = 0;
+			Size index = 0;
+			char line[768];
+			char key[64];
+
+			while (cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_tag_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+			cursor = 0;
+			while (cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_ticket_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+			cursor = 0;
+			while (cluster_pcm_x_local_tag_debug_next(&cursor, &index, line, sizeof(line))) {
+				snprintf(key, sizeof(key), "pcm_x_ltag_%zu", index);
+				emit_row(rsinfo, "pcm", key, line);
+			}
+			{
+				uint32 note_op = 0;
+				uint32 note_result = 0;
+				uint32 note_count = 0;
+				uint64 note_ticket = 0;
+
+				if (cluster_pcm_x_terminal_note_read(&note_op, &note_result, &note_ticket,
+													 &note_count)) {
+					snprintf(line, sizeof(line),
+							 "op=%u result=%u ticket=" UINT64_FORMAT " count=%u", note_op,
+							 note_result, note_ticket, note_count);
+					emit_row(rsinfo, "pcm", "pcm_x_terminal_last_note", line);
+				}
+			}
+		}
 		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", fmt_int64((int64)stats.admit_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", fmt_int64((int64)stats.confirm_count));
@@ -2043,6 +2093,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "pcm", "pcm_x_own_busy_count", fmt_int64((int64)stats.own_busy_count));
 		emit_row(rsinfo, "pcm", "pcm_x_own_corrupt_count",
 				 fmt_int64((int64)stats.own_corrupt_count));
+		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
+				 fmt_int64((int64)stats.barrier_unwind_count));
 	}
 }
 
@@ -2354,6 +2406,8 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_pi_watermark_advance_count()));
 	emit_row(rsinfo, "gcs", "pi_watermark_retire_count",
 			 fmt_int64((int64)cluster_gcs_get_pi_watermark_retire_count()));
+	emit_row(rsinfo, "gcs", "pi_durable_note_apply_count",
+			 fmt_int64((int64)cluster_gcs_get_pi_durable_note_apply_count()));
 	emit_row(rsinfo, "gcs", "lost_write_detected_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_detected_count()));
 	emit_row(rsinfo, "gcs", "lost_write_avoid_count",

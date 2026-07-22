@@ -189,10 +189,9 @@ is($l2_timeout_delta, 0,
 
 # ============================================================
 # L2b (RC-B, injection-deterministic): force ONE DENIED_PENDING_X on a
-# cross-node N->S read.  The reader's backoff retry reuses the same
-# (request_id, epoch) key; the master must re-evaluate it (deny released
-# the dedup entry), not swallow it as IN_FLIGHT_DUPLICATE for a full
-# cluster.gcs_reply_timeout_ms round.
+# cross-node N->S read.  The reader exact-aborts the denied reservation and
+# re-enters with a fresh request_id/token; the old denial remains cached until
+# exact DONE and cannot swallow or authorize the successor identity.
 # ============================================================
 my $base_timeout2 = gcs_sum($triple, 'block_timeout_count');
 my $base_starve   = gcs_sum($triple, 'starvation_denied_pending_x_count');

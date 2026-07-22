@@ -243,6 +243,9 @@ extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
+/* PGRAC: EXCLUSIVE lock that hands a nested-guard BARRIER_CLOSED refusal
+ * back to the caller (false, nothing held) instead of raising an ERROR. */
+extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
 extern void LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern void LockBufferForFreeSpaceMapPageInit(Buffer buffer);
