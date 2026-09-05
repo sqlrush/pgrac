@@ -36,6 +36,8 @@
  */
 #include "postgres.h"
 
+#include "common/relpath.h"
+#include "storage/block.h"
 #include "utils/guc.h"
 #include "libpq/pqcomm.h"
 
@@ -76,6 +78,22 @@ int cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
 char *cluster_config_file = NULL;	   /* boot value filled by DefineCustomStringVariable */
 char *cluster_injection_points = NULL; /* boot value filled by DefineCustomStringVariable */
 char *cluster_wal_threads_dir = NULL;  /* spec-4.1 D5; '' = flat pg_wal layout */
+
+#ifdef ENABLE_INJECTION
+char *cluster_pcm_x_retain_flush_error_target = NULL;
+
+typedef struct ClusterPcmXRetainFlushErrorTarget
+{
+	bool valid;
+	uint32 spc_oid;
+	uint32 db_oid;
+	uint32 rel_number;
+	int fork_number;
+	uint32 block_number;
+} ClusterPcmXRetainFlushErrorTarget;
+
+static ClusterPcmXRetainFlushErrorTarget cluster_pcm_x_retain_flush_error_target_parsed;
+#endif
 
 /* spec-4.3 D2: recovery-plan staleness threshold (observational only). */
 int cluster_recovery_stale_active_ms = 10000;
@@ -1130,6 +1148,125 @@ check_cluster_external_fence_socket_path(char **newval, void **extra,
 	return true;
 }
 
+#ifdef ENABLE_INJECTION
+static bool
+cluster_pcm_x_retain_flush_error_parse_field(const char **cursor, bool last,
+											 uint64 *out)
+{
+	const char *p = *cursor;
+	uint64 value = 0;
+
+	if (*p < '0' || *p > '9')
+		return false;
+	do {
+		uint64 digit = (uint64) (*p - '0');
+
+		if (value > (UINT64_MAX - digit) / 10)
+			return false;
+		value = value * 10 + digit;
+		p++;
+	} while (*p >= '0' && *p <= '9');
+
+	if (last) {
+		if (*p != '\0')
+			return false;
+	}
+	else {
+		if (*p != '/')
+			return false;
+		p++;
+	}
+	*cursor = p;
+	*out = value;
+	return true;
+}
+
+static bool
+cluster_pcm_x_retain_flush_error_parse(
+	const char *value, ClusterPcmXRetainFlushErrorTarget *target)
+{
+	const char *cursor = value;
+	uint64 fields[5];
+	int i;
+
+	memset(target, 0, sizeof(*target));
+	if (value == NULL)
+		return false;
+	if (*value == '\0')
+		return true;
+
+	for (i = 0; i < lengthof(fields); i++) {
+		if (!cluster_pcm_x_retain_flush_error_parse_field(
+				&cursor, i == lengthof(fields) - 1, &fields[i]))
+			return false;
+	}
+	if (fields[0] == 0 || fields[0] > UINT32_MAX ||
+		fields[1] == 0 || fields[1] > UINT32_MAX ||
+		fields[2] == 0 || fields[2] > UINT32_MAX ||
+		fields[3] > MAX_FORKNUM || fields[4] >= InvalidBlockNumber)
+		return false;
+
+	target->valid = true;
+	target->spc_oid = (uint32) fields[0];
+	target->db_oid = (uint32) fields[1];
+	target->rel_number = (uint32) fields[2];
+	target->fork_number = (int) fields[3];
+	target->block_number = (uint32) fields[4];
+	return true;
+}
+
+static bool
+cluster_pcm_x_retain_flush_error_target_check_hook(char **newval, void **extra,
+												 GucSource source)
+{
+	ClusterPcmXRetainFlushErrorTarget parsed;
+	ClusterPcmXRetainFlushErrorTarget *saved;
+
+	(void) source;
+	if (*newval == NULL ||
+		!cluster_pcm_x_retain_flush_error_parse(*newval, &parsed)) {
+		GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
+		GUC_check_errdetail(
+			"cluster.pcm_x_retain_flush_error_target must be empty or exactly "
+			"five unsigned decimal fields spcOid/dbOid/relNumber/forkNum/blockNum "
+			"within BufferTag ranges, with nonzero spcOid, dbOid, and relNumber.");
+		return false;
+	}
+
+	saved = guc_malloc(ERROR, sizeof(*saved));
+	if (saved == NULL)
+		return false;
+	*saved = parsed;
+	*extra = saved;
+	return true;
+}
+
+static void
+cluster_pcm_x_retain_flush_error_target_assign_hook(const char *newval,
+												  void *extra)
+{
+	(void) newval;
+	memset(&cluster_pcm_x_retain_flush_error_target_parsed, 0,
+		   sizeof(cluster_pcm_x_retain_flush_error_target_parsed));
+	if (extra != NULL)
+		cluster_pcm_x_retain_flush_error_target_parsed =
+			*((const ClusterPcmXRetainFlushErrorTarget *) extra);
+}
+
+bool
+cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid, uint32 db_oid,
+											 uint32 rel_number, int fork_number,
+											 uint32 block_number)
+{
+	const ClusterPcmXRetainFlushErrorTarget *target =
+		&cluster_pcm_x_retain_flush_error_target_parsed;
+
+	return target->valid && target->spc_oid == spc_oid &&
+		target->db_oid == db_oid && target->rel_number == rel_number &&
+		target->fork_number == fork_number && target->block_number == block_number;
+}
+#endif
+
 /*
  * spec-6.12d: dynamic space affinity needs the spec-6.3 DRM remaster
  * machinery; reject the value explicitly until that ships (rule 8 --
@@ -1989,6 +2126,17 @@ cluster_init_guc(void)
 		NULL,						   /* check_hook */
 		cluster_injection_assign_hook, /* assign_hook */
 		NULL);						   /* show_hook */
+
+#ifdef ENABLE_INJECTION
+	DefineCustomStringVariable(
+		"cluster.pcm_x_retain_flush_error_target",
+		gettext_noop("Exact BufferTag selected by the retained-image finish fault."),
+		gettext_noop("Injection builds only.  Empty matches no buffer; otherwise use "
+					 "spcOid/dbOid/relNumber/forkNum/blockNum."),
+		&cluster_pcm_x_retain_flush_error_target, "", PGC_SUSET, GUC_NOT_IN_SAMPLE,
+		cluster_pcm_x_retain_flush_error_target_check_hook,
+		cluster_pcm_x_retain_flush_error_target_assign_hook, NULL);
+#endif
 
 	/*
 	 * cluster.shared_storage_backend -- selects the cluster_shared_fs

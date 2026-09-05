@@ -261,6 +261,7 @@ typedef struct GrdWfgWaiterSnap {
 } GrdWfgWaiterSnap;
 
 typedef struct GrdWfgSnapshot {
+	uint64 generation;
 	int n_holders;
 	GrdWfgHolderSnap holders[PGRAC_GRD_MAX_HOLDERS];
 	int n_waiters; /* queued REQUEST waiters + pending converts */
@@ -333,6 +334,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 {
 	int i;
 
+	snap->generation = entry->generation;
 	snap->n_holders = 0;
 	for (i = 0; i < entry->ngranted && snap->n_holders < PGRAC_GRD_MAX_HOLDERS; i++) {
 		GrdWfgHolderSnap *h = &snap->holders[snap->n_holders++];
@@ -376,6 +378,25 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		w->mode = entry->converts[i].requested_mode;
 		w->boosted = entry->converts[i].boosted;			   /* spec-5.10 D5 */
 		w->fair_queue_seq = entry->converts[i].fair_queue_seq; /* spec-5.10 D5 */
+	}
+}
+
+/* Cancel every waiter identity emitted by one snapshot.  A generation retry
+ * needs this in addition to refreshing the successor snapshot: a waiter may
+ * have departed completely and therefore have no successor row whose normal
+ * refresh would cancel the stale edge. */
+static void
+grd_wfg_cancel_snapshot_waiters(const GrdWfgSnapshot *snap)
+{
+	int i;
+
+	for (i = 0; i < snap->n_waiters; i++) {
+		const GrdWfgWaiterSnap *w = &snap->waiters[i];
+		ClusterLmdVertex waiter_v;
+
+		grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id,
+							w->waiter_xid, w->wait_seq, &waiter_v);
+		cluster_lmd_cancel_wait_edge_real(&waiter_v);
 	}
 }
 
@@ -448,11 +469,14 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 	}
 }
 
-/* spec-5.8 D1b — re-sync the WFG edge set for one resource after a master-side
+/* spec-5.8 D1b + A26 — re-sync the WFG edge set for one resource after a master-side
  * holder/waiter mutation.  `departed` lists waiters that LEFT the queue
  * (granted / cancelled) so their edges are removed even if the entry emptied
  * and was reclaimed; every still-queued waiter + pending convert is then
- * refreshed against the current holders.  Best-effort: the submit/cancel calls
+ * refreshed against the current holders.  A26 retains the entry pin across
+ * snapshot, graph publication and generation recheck.  A superseded snapshot
+ * is cancelled and retried, so no older publisher can outlive a newer drain
+ * projection and strand a ghost edge.  Best-effort: the submit/cancel calls
  * self-gate (no-op) when the LMD graph is unavailable. */
 static void
 grd_wfg_resync_entry(const ClusterResId *resid, const ClusterGrdHolderId *departed, int n_departed)
@@ -472,19 +496,47 @@ grd_wfg_resync_entry(const ClusterResId *resid, const ClusterGrdHolderId *depart
 		cluster_lmd_cancel_wait_edge_real(&v);
 	}
 
-	/* (2) Snapshot the current entry state under entry->lock, then refresh
-	 *	   every still-queued waiter / convert after releasing the spinlock. */
+	/* (2) Pin the exact entry across the whole stable-projection loop.  This
+	 * prevents reclaim/recreate ABA while graph work runs without the entry
+	 * spinlock. */
 	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
 		|| entry == NULL)
 		return; /* entry gone (emptied) — nothing left to refresh */
 
-	SpinLockAcquire(&entry->lock);
-	grd_wfg_snapshot_locked(entry, &snap);
-	SpinLockRelease(&entry->lock);
-	cluster_grd_entry_release(entry);
+	PG_TRY();
+	{
+		for (;;) {
+			bool stable;
 
-	for (i = 0; i < snap.n_waiters; i++)
-		grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
+			/* Snapshot authority and its generation under the entry spinlock;
+			 * every LMD graph operation remains outside that lock. */
+			SpinLockAcquire(&entry->lock);
+			grd_wfg_snapshot_locked(entry, &snap);
+			SpinLockRelease(&entry->lock);
+
+			for (i = 0; i < snap.n_waiters; i++)
+				grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
+
+			SpinLockAcquire(&entry->lock);
+			stable = entry->generation == snap.generation;
+			SpinLockRelease(&entry->lock);
+			if (stable)
+				break;
+
+			/* The published snapshot lost to a newer authoritative mutation.
+			 * Remove even identities absent from the successor, then retry on
+			 * the same pinned entry until one generation remains stable. */
+			grd_wfg_cancel_snapshot_waiters(&snap);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cluster_grd_entry_release(entry);
 }
 
 /* Resync after a release/drain that granted `n` identities (now departed from

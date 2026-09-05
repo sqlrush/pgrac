@@ -172,6 +172,20 @@ typedef struct ClusterHeapItlTerminalCensus
 	uint8 terminal_count;
 } ClusterHeapItlTerminalCensus;
 
+typedef enum ClusterHeapItlCensusCaptureResult
+{
+	CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED = 0,
+	CLUSTER_HEAP_ITL_CENSUS_CAPTURED,
+	CLUSTER_HEAP_ITL_CENSUS_CAPTURE_RETRY_REQUALIFY
+} ClusterHeapItlCensusCaptureResult;
+
+typedef enum ClusterHeapItlPairCensusResult
+{
+	CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED = 0,
+	CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED,
+	CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY
+} ClusterHeapItlPairCensusResult;
+
 /* Stack-only proof that an unlock/reacquire performed by terminal census did
  * not change the heap page geometry, its Resource-X/PCM ownership episode,
  * or the target tuple.  ITL terminal stamps are intentionally outside the
@@ -411,6 +425,23 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type,
 	}
 }
 
+/* UPDATE retries keep their original absolute deadline.  The abandoned
+ * pre-APPLY reservation is canceled only after all heap content locks have
+ * been released, then replaced under that same deadline. */
+static bool
+cluster_heap_restart_update_undo_record_exact(
+	const ClusterCanonicalTxnBinding *binding, uint64 absolute_deadline_us,
+	ClusterUndoRecordPrepareReceipt *receipt)
+{
+	if (binding == NULL || receipt == NULL)
+		return false;
+	cluster_undo_record_cancel_prepared(receipt);
+	return cluster_heap_prepare_undo_record_exact(
+		UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+		(uint16)binding->segment_id, binding->slot_offset,
+		(UBA) InvalidUba_init, absolute_deadline_us, receipt);
+}
+
 typedef enum ClusterHeapPreparedUndoResult
 {
 	CLUSTER_HEAP_PREPARED_UNDO_READY = 0,
@@ -566,6 +597,7 @@ cluster_heap_dml_authority_guard_mismatch(
 {
 	ClusterPcmOwnSnapshot live = {0};
 	uint32 mismatch = 0;
+	bool content_holder_lifecycle_equal = false;
 	Page page;
 	ItemId lp;
 
@@ -580,16 +612,25 @@ cluster_heap_dml_authority_guard_mismatch(
 		mismatch |= UINT32_C(1) << 2;
 	else
 	{
+		/* A27: this guard is evaluated inside one continuously-held
+		 * content-X bracket.  A type-17 drain may publish or exact-abort its
+		 * reversible REVOKING token during that bracket; the conditional drain
+		 * cannot consume or replace the page until this writer unlocks. */
+		content_holder_lifecycle_equal
+			= cluster_pcm_x_content_holder_dml_authority_equivalent(
+				&guard->pcm, &live);
 		if (!BufferTagsEqual(&live.tag, &guard->pcm.tag))
 			mismatch |= UINT32_C(1) << 3;
 		if (live.generation != guard->pcm.generation)
 			mismatch |= UINT32_C(1) << 4;
-		if (live.reservation_token != guard->pcm.reservation_token)
+		if (!content_holder_lifecycle_equal
+			&& live.reservation_token != guard->pcm.reservation_token)
 			mismatch |= UINT32_C(1) << 5;
 		if (live.resource_x_activation_generation
 				!= guard->pcm.resource_x_activation_generation)
 			mismatch |= UINT32_C(1) << 6;
-		if (live.flags != guard->pcm.flags)
+		if (!content_holder_lifecycle_equal
+			&& live.flags != guard->pcm.flags)
 			mismatch |= UINT32_C(1) << 7;
 		if (live.pcm_state != guard->pcm.pcm_state)
 			mismatch |= UINT32_C(1) << 8;
@@ -874,21 +915,42 @@ cluster_heap_itl_terminal_census_pcm_authority(
 		&& pcm->pcm_state == (uint8) PCM_STATE_N;
 }
 
+/* The foreground already owns content-X, but a type-17 drain has published
+ * its reversible fence.  It cannot consume the page until this holder
+ * unlocks, so the only legal action is a zero-mutation caller retry. */
 static bool
+cluster_heap_itl_terminal_census_pcm_retry_required(
+	const ClusterPcmOwnSnapshot *pcm)
+{
+	return !cluster_recmerge_window_active
+		&& cluster_peer_mode_enabled()
+		&& pcm != NULL
+		&& pcm->flags == PCM_OWN_FLAG_REVOKING
+		&& cluster_pcm_x_content_holder_dml_authority_equivalent(pcm, pcm);
+}
+
+static ClusterHeapItlCensusCaptureResult
 cluster_heap_itl_capture_terminal_census(Buffer buffer,
 									 ClusterHeapItlTerminalCensus *census)
 {
 	Page page = BufferGetPage(buffer);
+	ClusterPcmOwnResult snapshot_result;
 	uint8 i;
 
 	Assert(census != NULL && census->admission_owned);
 	if (!cluster_semantic_activation_recheck_r4_terminal_census(
 			&census->admission)
-		|| !PageHasItl(page)
-		|| cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
-										&census->pcm) != CLUSTER_PCM_OWN_OK
-		|| !cluster_heap_itl_terminal_census_pcm_authority(&census->pcm))
-		return false;
+		|| !PageHasItl(page))
+		return CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
+	snapshot_result = cluster_bufmgr_pcm_own_snapshot(
+		GetBufferDescriptor(buffer - 1), &census->pcm);
+	if (snapshot_result != CLUSTER_PCM_OWN_OK)
+		return CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
+	if (!cluster_heap_itl_terminal_census_pcm_authority(&census->pcm))
+		return cluster_heap_itl_terminal_census_pcm_retry_required(
+			&census->pcm)
+			? CLUSTER_HEAP_ITL_CENSUS_CAPTURE_RETRY_REQUALIFY
+			: CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
 	census->page_lsn = PageGetLSN(page);
 	memcpy(census->slots, ClusterPageGetItlSlots(page),
 		   sizeof(census->slots));
@@ -903,7 +965,9 @@ cluster_heap_itl_capture_terminal_census(Buffer buffer,
 			memset(&census->locators[i], 0, sizeof(census->locators[i]));
 	}
 	return cluster_semantic_activation_recheck_r4_terminal_census(
-		&census->admission);
+		&census->admission)
+		? CLUSTER_HEAP_ITL_CENSUS_CAPTURED
+		: CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
 }
 
 static bool
@@ -1103,21 +1167,34 @@ cluster_heap_itl_apply_terminal_census(
 	return result;
 }
 
-static bool
+static ClusterHeapItlPairCensusResult
 cluster_heap_itl_unwind_pair_for_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
 	ClusterHeapItlTerminalCensus *census)
 {
+	ClusterHeapItlCensusCaptureResult capture_result;
+
 	Assert(BufferIsValid(old_buffer));
 	Assert(BufferIsValid(new_buffer));
 	Assert(old_buffer != new_buffer);
 	Assert(full_buffer == old_buffer || full_buffer == new_buffer);
 	if (!cluster_heap_itl_begin_terminal_census(census))
-		return false;
-	if (!cluster_heap_itl_capture_terminal_census(full_buffer, census))
+		return CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED;
+	capture_result = cluster_heap_itl_capture_terminal_census(
+		full_buffer, census);
+	if (capture_result != CLUSTER_HEAP_ITL_CENSUS_CAPTURED)
 	{
 		cluster_heap_itl_finish_terminal_census(census);
-		return false;
+		if (capture_result
+			== CLUSTER_HEAP_ITL_CENSUS_CAPTURE_RETRY_REQUALIFY)
+		{
+			/* The pair caller owns the retry.  Release in heap_update's
+			 * established high/new then old order and carry no census debt. */
+			LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
+			LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
+			return CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY;
+		}
+		return CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED;
 	}
 
 	/* Match heap_update's existing full-unwind order.  Resolution starts
@@ -1134,10 +1211,10 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	return true;
+	return CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
 }
 
-static bool
+static ClusterHeapItlCapacityResult
 cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 											TransactionId xid,
 											bool lock_only)
@@ -1148,27 +1225,41 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 	Assert(BufferIsValid(buffer));
 	Assert(TransactionIdIsValid(xid));
 	if (cluster_itl_has_allocatable_slot(buffer, xid, lock_only))
-		return true;
+		return CLUSTER_HEAP_ITL_CAPACITY_READY;
 	for (round = 0; round < 2; round++)
 	{
-		bool result = false;
+		volatile ClusterHeapItlCapacityResult result
+			= CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 		bool run_second_round = false;
 		volatile bool recycle_guard_armed = false;
 		volatile bool recycle_guard_unlocked = false;
+		ClusterHeapItlCensusCaptureResult capture_result;
 
 		if (!cluster_heap_itl_begin_terminal_census(&census))
-			return false;
-		if (!cluster_heap_itl_capture_terminal_census(buffer, &census))
+			return CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+		capture_result = cluster_heap_itl_capture_terminal_census(
+			buffer, &census);
+		if (capture_result != CLUSTER_HEAP_ITL_CENSUS_CAPTURED)
 		{
 			cluster_heap_itl_finish_terminal_census(&census);
-			return false;
+			return capture_result
+				== CLUSTER_HEAP_ITL_CENSUS_CAPTURE_RETRY_REQUALIFY
+				? CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
+				: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 		}
 		if (census.pcm.pcm_state == (uint8) PCM_STATE_X)
 		{
-			if (!cluster_bufmgr_itl_recycle_guard_arm(buffer, &census.pcm))
+			ClusterBufmgrItlRecycleGuardResult arm_result;
+
+			arm_result = cluster_bufmgr_itl_recycle_guard_arm(
+				buffer, &census.pcm);
+			if (arm_result != CLUSTER_BUFMGR_ITL_RECYCLE_ARMED)
 			{
 				cluster_heap_itl_finish_terminal_census(&census);
-				return false;
+				return arm_result
+					== CLUSTER_BUFMGR_ITL_RECYCLE_RETRY_REQUALIFY
+					? CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
+					: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 			}
 			recycle_guard_armed = true;
 		}
@@ -1202,14 +1293,20 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 			if (apply_result.kind
 				== CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
 				result = cluster_itl_has_allocatable_slot(
-					buffer, xid, lock_only);
+					buffer, xid, lock_only)
+					? CLUSTER_HEAP_ITL_CAPACITY_READY
+					: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 			else if (round == 0
 					 && apply_result.kind
 						== CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X)
 			{
-				result = cluster_itl_has_allocatable_slot(
+				bool has_capacity = cluster_itl_has_allocatable_slot(
 					buffer, xid, lock_only);
-				run_second_round = !result;
+
+				result = has_capacity
+					? CLUSTER_HEAP_ITL_CAPACITY_READY
+					: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+				run_second_round = !has_capacity;
 			}
 		}
 		PG_FINALLY();
@@ -1220,12 +1317,12 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 			memset(&census, 0, sizeof(census));
 		}
 		PG_END_TRY();
-		if (result)
-			return true;
+		if (result == CLUSTER_HEAP_ITL_CAPACITY_READY)
+			return CLUSTER_HEAP_ITL_CAPACITY_READY;
 		if (!run_second_round)
-			return false;
+			return CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 	}
-	return false;
+	return CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 }
 
 
@@ -1237,7 +1334,7 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 	Assert(slot_index_out != NULL);
 	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	return cluster_heap_itl_ensure_capacity_with_terminal_census(
-			buffer, xid, lock_only)
+			buffer, xid, lock_only) == CLUSTER_HEAP_ITL_CAPACITY_READY
 		&& cluster_heap_itl_alloc_once(
 			buffer, xid, lock_only, slot_index_out);
 }
@@ -1313,12 +1410,16 @@ cluster_heap_itl_prepare_prepared_undo(
 	bool lock_only, ClusterUndoRecordPrepareReceipt *receipt,
 	uint16 payload_len)
 {
+	ClusterHeapItlCapacityResult capacity_result;
 	ClusterHeapDmlAuthorityGuard dml_guard;
 	ClusterCtrcTargetV1 pending_target;
 
 	Assert(receipt != NULL);
-	if (!cluster_heap_itl_ensure_capacity_with_terminal_census(
-			buffer, xid, lock_only))
+	capacity_result = cluster_heap_itl_ensure_capacity_with_terminal_census(
+		buffer, xid, lock_only);
+	if (capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY)
+		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
+	if (capacity_result != CLUSTER_HEAP_ITL_CAPACITY_READY)
 		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	/* Terminal census may stamp independently-authorized cleanout bytes.
 	 * Capture the DML attempt only after that preparatory work is complete,
@@ -1510,17 +1611,25 @@ cluster_heap_test_itl_alloc_with_terminal_census(Buffer buffer,
 		buffer, xid, lock_only, slot_index_out);
 }
 
+ClusterHeapItlCapacityResult
+cluster_heap_test_itl_capacity_outcome(Buffer buffer, TransactionId xid,
+									   bool lock_only)
+{
+	return cluster_heap_itl_ensure_capacity_with_terminal_census(
+		buffer, xid, lock_only);
+}
+
 bool
 cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer)
 {
 	ClusterHeapItlTerminalCensus census;
-	bool result;
+	ClusterHeapItlPairCensusResult result;
 
 	result = cluster_heap_itl_unwind_pair_for_terminal_census(
 		old_buffer, new_buffer, full_buffer, &census);
 	cluster_heap_itl_finish_terminal_census(&census);
-	return result;
+	return result == CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
 }
 
 bool
@@ -11439,6 +11548,7 @@ l_pgrac_reacquire:
 		uint16 tt_off;
 		bool census_was_pending = cluster_itl_update_census_pending;
 		bool old_capacity;
+		ClusterHeapItlCapacityResult old_capacity_result;
 		ClusterHeapDmlAuthorityGuard old_dml_guard;
 		ClusterHeapDmlAuthorityGuard new_dml_guard;
 		ClusterCtrcTargetV1 ctrc_pending_targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
@@ -11491,36 +11601,96 @@ l_pgrac_reacquire:
 			cluster_itl_update_census_pending = false;
 		}
 
-		old_capacity = newbuf == buffer && !census_was_pending
-			? cluster_heap_itl_ensure_capacity_with_terminal_census(
-				buffer, canonical_xid, false)
-			: census_was_pending && cluster_itl_update_census_old_page
-				? census_apply_result.kind
-					  == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED
+		if (newbuf == buffer && !census_was_pending)
+			old_capacity_result
+				= cluster_heap_itl_ensure_capacity_with_terminal_census(
+					buffer, canonical_xid, false);
+		else if (census_was_pending
+				 && cluster_itl_update_census_old_page)
+			old_capacity_result
+				= census_apply_result.kind
+						== CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED
 					&& cluster_itl_has_allocatable_slot(
 						buffer, canonical_xid, false)
-			: cluster_itl_has_allocatable_slot(
-				buffer, canonical_xid, false);
+					? CLUSTER_HEAP_ITL_CAPACITY_READY
+					: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+		else
+			old_capacity_result = cluster_itl_has_allocatable_slot(
+				buffer, canonical_xid, false)
+				? CLUSTER_HEAP_ITL_CAPACITY_READY
+				: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+		old_capacity
+			= old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_READY;
 		if (census_was_pending
 			&& (cluster_itl_update_census_old_page || newbuf == buffer))
 			cluster_heap_itl_finish_terminal_census(
 				&cluster_itl_update_census);
+		if (old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY)
+		{
+			/* No CTRC target has been applied or slot selected.  Release the
+			 * exact holder so the frozen type-17 successor can finish, then
+			 * reuse UPDATE's established pre-APPLY requalification owner. */
+			if (old_key_tuple != NULL && old_key_copied)
+			{
+				heap_freetuple(old_key_tuple);
+				old_key_tuple = NULL;
+				old_key_copied = false;
+			}
+			cid = pgrac_entry_cid;
+			iscombo = false;
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (!cluster_heap_restart_update_undo_record_exact(
+					&canonical_binding, undo_prepare_deadline_us,
+					&undo_receipt))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo reservation expired before heap update capacity retry")));
+			if (old_tuple_temp_locked)
+				goto l_pgrac_reacquire;
+			cluster_heap_lock_with_vm_repin(
+				relation, block, buffer, &vmbuffer);
+			lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
+			if (!ItemIdIsNormal(lp))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("heap update tuple changed during ITL capacity retry")));
+			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			oldtup.t_len = ItemIdGetLength(lp);
+			goto l2;
+		}
 		if (!old_capacity)
 		{
-			if (newbuf != buffer && !census_was_pending
-				&& cluster_heap_itl_unwind_pair_for_terminal_census(
-					buffer, newbuf, buffer, &cluster_itl_update_census))
+			if (newbuf != buffer && !census_was_pending)
 			{
-				cluster_itl_update_census_pending = true;
-				cluster_itl_update_census_old_page = true;
-				if (old_key_tuple != NULL && old_key_copied)
+				ClusterHeapItlPairCensusResult pair_result;
+
+				pair_result = cluster_heap_itl_unwind_pair_for_terminal_census(
+					buffer, newbuf, buffer, &cluster_itl_update_census);
+				if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 				{
-					heap_freetuple(old_key_tuple);
-					old_key_tuple = NULL;
-					old_key_copied = false;
+					if (pair_result
+						== CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED)
+					{
+						cluster_itl_update_census_pending = true;
+						cluster_itl_update_census_old_page = true;
+					}
+					if (old_key_tuple != NULL && old_key_copied)
+					{
+						heap_freetuple(old_key_tuple);
+						old_key_tuple = NULL;
+						old_key_copied = false;
+					}
+					ReleaseBuffer(newbuf);
+					if (pair_result
+						== CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY
+						&& !cluster_heap_restart_update_undo_record_exact(
+							&canonical_binding, undo_prepare_deadline_us,
+							&undo_receipt))
+						ereport(ERROR,
+								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								 errmsg("cluster undo reservation expired before cross-page heap update capacity retry")));
+					goto l_pgrac_reacquire;
 				}
-				ReleaseBuffer(newbuf);
-				goto l_pgrac_reacquire;
 			}
 			cluster_heap_itl_finish_update_census_after_alloc_failure(
 				&cluster_itl_update_census, census_was_pending);
@@ -11547,21 +11717,39 @@ l_pgrac_reacquire:
 					&cluster_itl_update_census);
 			if (!new_capacity)
 			{
-				if (!census_was_pending
-					&& cluster_heap_itl_unwind_pair_for_terminal_census(
-						buffer, newbuf, newbuf,
-						&cluster_itl_update_census))
+				if (!census_was_pending)
 				{
-					cluster_itl_update_census_pending = true;
-					cluster_itl_update_census_old_page = false;
-					if (old_key_tuple != NULL && old_key_copied)
+					ClusterHeapItlPairCensusResult pair_result;
+
+					pair_result
+						= cluster_heap_itl_unwind_pair_for_terminal_census(
+							buffer, newbuf, newbuf,
+							&cluster_itl_update_census);
+					if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 					{
-						heap_freetuple(old_key_tuple);
-						old_key_tuple = NULL;
-						old_key_copied = false;
+						if (pair_result
+							== CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED)
+						{
+							cluster_itl_update_census_pending = true;
+							cluster_itl_update_census_old_page = false;
+						}
+						if (old_key_tuple != NULL && old_key_copied)
+						{
+							heap_freetuple(old_key_tuple);
+							old_key_tuple = NULL;
+							old_key_copied = false;
+						}
+						ReleaseBuffer(newbuf);
+						if (pair_result
+							== CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY
+							&& !cluster_heap_restart_update_undo_record_exact(
+								&canonical_binding,
+								undo_prepare_deadline_us, &undo_receipt))
+							ereport(ERROR,
+									(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+									 errmsg("cluster undo reservation expired before cross-page heap update capacity retry")));
+						goto l_pgrac_reacquire;
 					}
-					ReleaseBuffer(newbuf);
-					goto l_pgrac_reacquire;
 				}
 				cluster_heap_itl_finish_update_census_after_alloc_failure(
 					&cluster_itl_update_census, census_was_pending);

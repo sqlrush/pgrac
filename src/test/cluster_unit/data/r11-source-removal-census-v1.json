@@ -13,6 +13,11 @@
       "cluster_resource_x_retry.o"
     ]
   },
+  "current_product_snapshot": {
+    "algorithm": "sha256-canonical-path-blob-v1",
+    "path_count": 2224,
+    "sha256": "b257e233d68a37edfbd238891077e28248d64fa8f1743cba1cdaf18a3c2680c2"
+  },
   "gates": {
     "L1": {
       "forbidden_patterns": [
@@ -155,7 +160,7 @@
       ]
     }
   },
-  "schema_version": "R11SourceRemovalCensusV2",
+  "schema_version": "R11SourceRemovalCensusV3",
   "source_removed_subject": {
     "commit": "fe68024a0f79d5a1d187e9f1885cbe9ac441153b",
     "pre_removal_commit": "cc1c5a554276542a05c15f5f1e0e0c7317fba66e",

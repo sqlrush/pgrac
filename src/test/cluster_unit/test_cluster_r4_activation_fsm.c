@@ -8266,10 +8266,53 @@ UT_TEST(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapsh
 	test_gate_reset();
 }
 
+/* A coherent snapshot can be briefly unavailable while QVOTEC publishes its
+ * next observation.  Once the same utility round has installed durable
+ * PREPARE and closed source admission, absence is not evidence of identity
+ * drift: retain the exact in-progress carrier so the next exact observation
+ * can resume SAMPLE -> BARRIER instead of stranding transition_closed. */
+UT_TEST(test_145m_resource_x_prepare_carrier_survives_unavailable_snapshot)
+{
+	const uint64 r4 = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	ClusterSemanticActivationAckTableV1 before;
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	ClusterSemanticAdmissionToken token;
+	int node;
+
+	ut_resource_x_open_carrier_setup(&token);
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				 | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+	table->source_feature_bitmap = r4;
+	table->capability_sample_digest = 0;
+	for (node = 0; node < 4; node++) {
+		table->expected[node].record_generation = table->record_generation;
+		table->observed[node].record_generation = table->record_generation;
+	}
+	test_gate_publish(2, r4, table->record_generation,
+				  table->transition_epoch, true);
+	semantic_activation_ack_local_request_origin.active = true;
+	semantic_activation_lmon_prepare_cas_seq = 41;
+	semantic_activation_lmon_prepare_cas_utility_request_seq
+		= table->round_nonce;
+	memcpy(&before, table, sizeof(before));
+
+	test_membership_snapshot_valid = false;
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(memcmp(&before, table, sizeof(before)), 0);
+	UT_ASSERT(semantic_activation_ack_local_request_origin.active);
+	UT_ASSERT_EQ(semantic_activation_lmon_prepare_cas_seq, UINT64_C(41));
+
+	test_membership_snapshot_valid = true;
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(memcmp(&before, table, sizeof(before)), 0);
+	test_gate_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(229);
+	UT_PLAN(230);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -8499,6 +8542,7 @@ main(void)
 	UT_RUN(test_145j_resource_x_peer_match_reports_first_failed_predicate);
 	UT_RUN(test_145k_restore_open_proof_does_not_overwrite_resource_x_carrier);
 	UT_RUN(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapshot);
+	UT_RUN(test_145m_resource_x_prepare_carrier_survives_unavailable_snapshot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

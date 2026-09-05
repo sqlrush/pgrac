@@ -70,6 +70,7 @@
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -319,6 +320,26 @@ assert_ordered_in_function(const char *source, const char *function_start, const
 			return;
 		cursor += strlen(needles[i]);
 	}
+}
+
+static size_t
+count_source_occurrences(const char *source, const char *needle)
+{
+	size_t count = 0;
+	size_t needle_length;
+	const char *cursor;
+
+	UT_ASSERT_NOT_NULL(source);
+	UT_ASSERT_NOT_NULL(needle);
+	if (source == NULL || needle == NULL || needle[0] == '\0')
+		return 0;
+	needle_length = strlen(needle);
+	cursor = source;
+	while ((cursor = strstr(cursor, needle)) != NULL) {
+		count++;
+		cursor += needle_length;
+	}
+	return count;
 }
 
 void
@@ -1407,6 +1428,232 @@ UT_TEST(test_local_master_read_image_pending_x_denial_rearms_at_outer_boundary)
 	UT_ASSERT(same_identity_retry == NULL || retry_break == NULL
 			  || same_identity_retry > retry_break);
 	free(source);
+}
+
+UT_TEST(test_t400_positive_fixture_scopes_finish_flush_injection_to_exact_l2f_tag)
+{
+	char *t400 = read_source_path(T400_SOURCE_PATH);
+	const char *reload;
+	const char *reload_end;
+	const char *expected_target;
+	const char *target_capture;
+	const char *target_match;
+	const char *catalog_helper;
+	const char *catalog_helper_end;
+	const char *legacy_relation_size;
+	const char *relation_path;
+	const char *shared_physical_path;
+	const char *catalog_tag;
+	const char *target_guc;
+	const char *warning_arm;
+	const char *explicit_disarm;
+	const char *target_clear;
+
+	/* t/400 is the positive Resource-X fixture.  Its retained-finish seam is
+	 * selected by one catalog-derived block-0 tag; destructive L5F ownership
+	 * and whole-cluster zero-debt serialization belong nowhere in this file. */
+	UT_ASSERT_NOT_NULL(t400);
+	if (t400 == NULL)
+		return;
+	UT_ASSERT(strstr(t400, "pcm_xq_flush_error") == NULL);
+	UT_ASSERT(strstr(t400, "wait_for_resource_x_protocol_quiescence") == NULL);
+	UT_ASSERT(strstr(t400, "L5F") == NULL);
+	catalog_helper = strstr(t400,
+		"\nsub pcm_xq_dirty_retain_block0_tag\n");
+	catalog_helper_end = catalog_helper != NULL
+		? strstr(catalog_helper, "\n}\n") : NULL;
+	legacy_relation_size = catalog_helper != NULL
+		? strstr(catalog_helper, "pg_relation_size(") : NULL;
+	relation_path = catalog_helper != NULL
+		? strstr(catalog_helper, "pg_relation_filepath(c.oid)") : NULL;
+	shared_physical_path = relation_path != NULL
+		? strstr(relation_path, "$shared_root/$relation_path") : NULL;
+	UT_ASSERT_NOT_NULL(catalog_helper);
+	UT_ASSERT_NOT_NULL(catalog_helper_end);
+	UT_ASSERT(legacy_relation_size == NULL || catalog_helper_end == NULL
+			  || legacy_relation_size > catalog_helper_end);
+	UT_ASSERT_NOT_NULL(relation_path);
+	UT_ASSERT_NOT_NULL(shared_physical_path);
+	if (catalog_helper_end != NULL && relation_path != NULL
+		&& shared_physical_path != NULL)
+		UT_ASSERT(relation_path < shared_physical_path
+				  && shared_physical_path < catalog_helper_end);
+
+	reload = strstr(t400, "\nsub wait_for_lms_finish_flush_reload\n");
+	reload_end = reload != NULL ? strstr(reload, "\n}\n") : NULL;
+	expected_target = reload != NULL ? strstr(reload, "$expected_target") : NULL;
+	target_capture = expected_target != NULL
+		? strstr(expected_target, "target=\"([^\"]*)\"") : NULL;
+	target_match = target_capture != NULL
+		? strstr(target_capture, "$target eq $expected_target") : NULL;
+	UT_ASSERT_NOT_NULL(reload);
+	UT_ASSERT_NOT_NULL(reload_end);
+	UT_ASSERT_NOT_NULL(expected_target);
+	UT_ASSERT_NOT_NULL(target_capture);
+	UT_ASSERT_NOT_NULL(target_match);
+	if (reload_end != NULL && target_match != NULL)
+		UT_ASSERT(target_match < reload_end);
+
+	catalog_tag = strstr(t400,
+		"COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)");
+	target_guc = catalog_tag != NULL
+		? strstr(catalog_tag, "cluster.pcm_x_retain_flush_error_target") : NULL;
+	warning_arm = target_guc != NULL
+		? strstr(target_guc,
+			"cluster-pcm-x-retain-flush-error';") : NULL;
+	explicit_disarm = warning_arm != NULL
+		? strstr(warning_arm,
+			"cluster-pcm-x-retain-flush-error:none:0") : NULL;
+	target_clear = explicit_disarm != NULL
+		? strstr(explicit_disarm,
+			"cluster.pcm_x_retain_flush_error_target = ''") : NULL;
+	UT_ASSERT_NOT_NULL(catalog_tag);
+	UT_ASSERT_NOT_NULL(target_guc);
+	UT_ASSERT_NOT_NULL(warning_arm);
+	UT_ASSERT_NOT_NULL(explicit_disarm);
+	UT_ASSERT_NOT_NULL(target_clear);
+	if (target_guc != NULL && warning_arm != NULL)
+		UT_ASSERT(target_guc < warning_arm);
+	if (explicit_disarm != NULL && target_clear != NULL)
+		UT_ASSERT(explicit_disarm < target_clear);
+	free(t400);
+}
+
+UT_TEST(test_t406_isolated_fixture_owns_exact_target_finish_flush_failure)
+{
+	char *t406 = read_source_path(T406_SOURCE_PATH);
+	const char *quad_name;
+	const char *quad_name_end;
+	const char *catalog_helper;
+	const char *catalog_helper_end;
+	const char *legacy_relation_size;
+	const char *relation_path;
+	const char *shared_physical_path;
+	const char *target_config;
+	const char *fault_arm;
+	const char *decoy_update;
+	const char *decoy_insert;
+	const char *target_update;
+	const char *target_insert;
+	const char *explicit_disarm;
+	const char *target_clear;
+	const char *stop;
+
+	UT_ASSERT_NOT_NULL(t406);
+	if (t406 == NULL)
+		return;
+
+	quad_name = strstr(t406, "new_quad(\n\t'");
+	quad_name = quad_name != NULL ? quad_name + strlen("new_quad(\n\t'") : NULL;
+	quad_name_end = quad_name != NULL ? strchr(quad_name, '\'') : NULL;
+	UT_ASSERT_NOT_NULL(quad_name);
+	UT_ASSERT_NOT_NULL(quad_name_end);
+	if (quad_name != NULL && quad_name_end != NULL)
+		UT_ASSERT((size_t)(quad_name_end - quad_name)
+				  < PGRAC_IC_CLUSTER_NAME_MAX);
+	UT_ASSERT_NOT_NULL(strstr(t406, "quorum_voting_disks => 3"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "shared_data => 1"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "shared_system_identifier => 1"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "'cluster.lms_workers = 1'"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "my $quad_started = 0;"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "my $quad_stopped = 0;"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "\nEND\n"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"SHOW cluster.pcm_x_retain_flush_error_target"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "RF_DEFERRED"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "'R4 bit0'"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "'Resource-X bit10'"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "resource_x_gate_phase"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "pcm_x_flush_decoy"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "pcm_x_flush_target"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)"));
+	catalog_helper = strstr(t406, "\nsub exact_finish_flush_tags\n");
+	catalog_helper_end = catalog_helper != NULL
+		? strstr(catalog_helper, "\n}\n") : NULL;
+	legacy_relation_size = catalog_helper != NULL
+		? strstr(catalog_helper, "pg_relation_size(") : NULL;
+	relation_path = catalog_helper != NULL
+		? strstr(catalog_helper, "pg_relation_filepath(c.oid)") : NULL;
+	shared_physical_path = relation_path != NULL
+		? strstr(relation_path, "$shared_root/$relation_path") : NULL;
+	UT_ASSERT_NOT_NULL(catalog_helper);
+	UT_ASSERT_NOT_NULL(catalog_helper_end);
+	UT_ASSERT(legacy_relation_size == NULL || catalog_helper_end == NULL
+			  || legacy_relation_size > catalog_helper_end);
+	UT_ASSERT_NOT_NULL(relation_path);
+	UT_ASSERT_NOT_NULL(shared_physical_path);
+	if (catalog_helper_end != NULL && relation_path != NULL
+		&& shared_physical_path != NULL)
+		UT_ASSERT(relation_path < shared_physical_path
+				  && shared_physical_path < catalog_helper_end);
+	UT_ASSERT_NOT_NULL(strstr(t406, "$decoy_tag ne $target_tag"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"wait_for_lms_finish_flush_reload"));
+	UT_ASSERT(strstr(t406, "wait_for_resource_x_protocol_quiescence") == NULL);
+	UT_ASSERT(strstr(t406, "source=0 requester=1") == NULL);
+	UT_ASSERT_NOT_NULL(strstr(t406, "source=[0-3] requester=1"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"while (time() < $decoy_deadline)"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"while (time() < $target_deadline)"));
+	UT_ASSERT(strstr(t406, "\ndo\n{") == NULL);
+
+	target_config = strstr(t406,
+		"ALTER SYSTEM SET cluster.pcm_x_retain_flush_error_target");
+	fault_arm = target_config != NULL
+		? strstr(target_config,
+			"cluster-pcm-x-retain-flush-error:skipn:1") : NULL;
+	decoy_update = fault_arm != NULL
+		? strstr(fault_arm, "UPDATE pcm_x_flush_decoy SET v = 1") : NULL;
+	decoy_insert = decoy_update != NULL
+		? strstr(decoy_update,
+			"INSERT INTO pcm_x_flush_decoy(id, v) VALUES (2, 1)") : NULL;
+	target_update = decoy_insert != NULL
+		? strstr(decoy_insert, "UPDATE pcm_x_flush_target SET v = 1") : NULL;
+	target_insert = target_update != NULL
+		? strstr(target_update,
+			"INSERT INTO pcm_x_flush_target(id, v) VALUES (2, 1)") : NULL;
+	explicit_disarm = target_insert != NULL
+		? strstr(target_insert,
+			"cluster-pcm-x-retain-flush-error:none:0") : NULL;
+	target_clear = explicit_disarm != NULL
+		? strstr(explicit_disarm,
+			"cluster.pcm_x_retain_flush_error_target = ''") : NULL;
+	stop = target_clear != NULL ? strstr(target_clear, "$quad->stop_quad") : NULL;
+	UT_ASSERT_NOT_NULL(target_config);
+	UT_ASSERT_NOT_NULL(fault_arm);
+	UT_ASSERT_NOT_NULL(decoy_update);
+	UT_ASSERT_NOT_NULL(decoy_insert);
+	UT_ASSERT_NOT_NULL(target_update);
+	UT_ASSERT_NOT_NULL(target_insert);
+	UT_ASSERT_NOT_NULL(explicit_disarm);
+	UT_ASSERT_NOT_NULL(target_clear);
+	UT_ASSERT_NOT_NULL(stop);
+	if (target_config != NULL && fault_arm != NULL)
+		UT_ASSERT(target_config < fault_arm);
+	if (decoy_update != NULL && decoy_insert != NULL &&
+		target_update != NULL && target_insert != NULL)
+		UT_ASSERT(decoy_update < decoy_insert && decoy_insert < target_update &&
+				  target_update < target_insert);
+	if (explicit_disarm != NULL && target_clear != NULL && stop != NULL)
+		UT_ASSERT(explicit_disarm < target_clear && target_clear < stop);
+
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"cluster PCM-X retained-image finish fault skipped non-target"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"injected PCM-X retained-image FlushBuffer failure"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"Resource-X source settlement ACK diagnostic"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "$target_assertion_sequence"));
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"attempt=\\Q$target_assertion_sequence\\E"));
+	UT_ASSERT(strstr(t406,
+		"qr/Resource-X source settlement ACK diagnostic/,") == NULL);
+	UT_ASSERT_NOT_NULL(strstr(t406,
+		"cluster PCM-X runtime fail-closed (recovery blocked)"));
+	UT_ASSERT_NOT_NULL(strstr(t406, "lost track of buffer IO"));
+	free(t406);
 }
 
 UT_TEST(test_local_master_read_image_refusal_evidence_is_attempt_exact)
@@ -2850,9 +3097,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	const char *target_end;
 	const char *snapshot;
 	const char *n_branch;
-	const char *target_install_helper;
-	const char *target_install_wait;
-	const char *target_install_cv_wait;
+	const char *continuation_valid;
+	const char *continuation_classify;
+	const char *continuation_wait;
+	const char *continuation_capture;
 	const char *retained_pair_helper;
 	const char *retained_buffer_helper;
 	const char *undrained_current_helper;
@@ -2889,18 +3137,27 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		: NULL;
 	snapshot = target != NULL
 		? strstr(target, "cluster_bufmgr_pcm_own_snapshot(buf, &own)") : NULL;
-	target_install_helper = snapshot != NULL
-		? strstr(snapshot,
-			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(")
+	continuation_valid = snapshot != NULL
+		? strstr(snapshot, "if (target_install_follow.valid)")
 		: NULL;
-	/* Anchor the ordinary TARGET N branch after its mode-independent inflight
-	 * classifier; the direct-init branch has an earlier, separate N shape. */
-	n_branch = target_install_helper != NULL
-		? strstr(target_install_helper,
-			"own.pcm_state == (uint8)PCM_STATE_N") : NULL;
-	target_install_wait = target_install_helper != NULL
-		? strstr(target_install_helper,
-			"action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT") : NULL;
+	continuation_classify = continuation_valid != NULL
+		? strstr(continuation_valid,
+			"gcs_block_resource_x_target_install_classify_coherent(")
+		: NULL;
+	continuation_wait = continuation_classify != NULL
+		? strstr(continuation_classify,
+			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(")
+		: NULL;
+	continuation_capture = continuation_wait != NULL
+		? strstr(continuation_wait,
+			"gcs_block_resource_x_target_install_capture_coherent(")
+		: NULL;
+	/* Anchor the ordinary TARGET N branch after receipt capture; direct-init
+	 * has an earlier, separate N shape. */
+	n_branch = continuation_capture != NULL
+		? strstr(continuation_capture,
+			"} else {\n\t\t\t\t\tif (own.pcm_state == (uint8)PCM_STATE_N")
+		: NULL;
 	retained_pair_helper = n_branch != NULL
 		? strstr(n_branch,
 			"cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(")
@@ -2949,21 +3206,19 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	round_wait = predecessor_continue != NULL
 		? strstr(predecessor_continue,
 			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(") : NULL;
-	target_install_cv_wait = predecessor_continue != NULL
-		? strstr(predecessor_continue,
-			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(")
-		: NULL;
 	generation_zero_reject = snapshot != NULL
 		? strstr(snapshot, "if (own.generation == 0)") : NULL;
 	ownership_loss_skip = step != NULL
-		? strstr(step, "&& !target_install_inflight") : NULL;
+		? strstr(step, "if (!direct_init && !cached_local_x)") : NULL;
 
 	UT_ASSERT_NOT_NULL(target);
 	UT_ASSERT_NOT_NULL(target_end);
 	UT_ASSERT_NOT_NULL(snapshot);
 	UT_ASSERT_NOT_NULL(n_branch);
-	UT_ASSERT_NOT_NULL(target_install_helper);
-	UT_ASSERT_NOT_NULL(target_install_wait);
+	UT_ASSERT_NOT_NULL(continuation_valid);
+	UT_ASSERT_NOT_NULL(continuation_classify);
+	UT_ASSERT_NOT_NULL(continuation_wait);
+	UT_ASSERT_NOT_NULL(continuation_capture);
 	UT_ASSERT_NOT_NULL(retained_pair_helper);
 	UT_ASSERT_NOT_NULL(retained_buffer_helper);
 	UT_ASSERT_NOT_NULL(undrained_current_helper);
@@ -2980,10 +3235,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	UT_ASSERT_NOT_NULL(predecessor_sleep);
 	UT_ASSERT_NOT_NULL(predecessor_continue);
 	UT_ASSERT_NOT_NULL(round_wait);
-	UT_ASSERT_NOT_NULL(target_install_cv_wait);
 	UT_ASSERT_NOT_NULL(ownership_loss_skip);
 	if (target_end != NULL && snapshot != NULL && n_branch != NULL
-		&& target_install_helper != NULL && target_install_wait != NULL
+		&& continuation_valid != NULL && continuation_classify != NULL
+		&& continuation_wait != NULL && continuation_capture != NULL
 		&& retained_pair_helper != NULL && retained_buffer_helper != NULL
 		&& undrained_current_helper != NULL
 		&& retained_wait != NULL && retained_admission_recheck != NULL
@@ -2993,18 +3248,19 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		&& n_candidate != NULL && step != NULL
 		&& predecessor_wait != NULL && predecessor_deadline != NULL
 		&& predecessor_sleep != NULL && predecessor_continue != NULL
-		&& round_wait != NULL && target_install_cv_wait != NULL
-		&& ownership_loss_skip != NULL) {
-		UT_ASSERT(snapshot < n_branch);
-		UT_ASSERT(target_install_helper < n_branch);
+		&& round_wait != NULL && ownership_loss_skip != NULL) {
+		UT_ASSERT(snapshot < continuation_valid);
+		UT_ASSERT(continuation_valid < continuation_classify);
+		UT_ASSERT(continuation_classify < continuation_wait);
+		UT_ASSERT(continuation_wait < continuation_capture);
+		UT_ASSERT(continuation_capture < n_branch);
 		UT_ASSERT(n_branch < retained_pair_helper);
 		UT_ASSERT(retained_pair_helper < retained_buffer_helper);
 		UT_ASSERT(retained_buffer_helper < undrained_current_helper);
 		UT_ASSERT(undrained_current_helper < n_candidate);
 		UT_ASSERT(retained_buffer_helper < n_candidate);
-		UT_ASSERT(target_install_helper < n_candidate);
-		UT_ASSERT(n_candidate < target_install_wait);
-		UT_ASSERT(target_install_wait < step);
+		UT_ASSERT(continuation_capture < n_candidate);
+		UT_ASSERT(n_candidate < step);
 		UT_ASSERT(retained_wait < retained_admission_recheck);
 		UT_ASSERT(retained_admission_recheck < retained_gate_recheck);
 		UT_ASSERT(retained_gate_recheck < retained_deadline);
@@ -3017,9 +3273,7 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		UT_ASSERT(predecessor_deadline < predecessor_sleep);
 		UT_ASSERT(predecessor_sleep < predecessor_continue);
 		UT_ASSERT(predecessor_continue < round_wait);
-		UT_ASSERT(predecessor_continue < target_install_cv_wait);
-		UT_ASSERT(target_install_cv_wait < round_wait);
-		UT_ASSERT(target_install_wait < ownership_loss_skip);
+		UT_ASSERT(continuation_wait < ownership_loss_skip);
 		UT_ASSERT(step < target_end);
 		UT_ASSERT(ownership_loss_skip < target_end);
 	}
@@ -4428,6 +4682,49 @@ UT_TEST(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice)
 	free(source);
 }
 
+UT_TEST(test_pcm_x_finish_flush_reload_ack_is_target_exact_after_sighup)
+{
+	static const char *const reload_contract[] = {
+		"static bool initialized = false",
+		"static char *was_value = NULL",
+		"static char *was_target = NULL",
+		"value = cluster_injection_points != NULL",
+		"target = cluster_pcm_x_retain_flush_error_target != NULL",
+		"strcmp(value, was_value) == 0",
+		"strcmp(target, was_target) == 0",
+		"injection config: pid=%d armed=%s value=",
+		"target=",
+		"MemoryContextStrdup(TopMemoryContext, value)",
+		"MemoryContextStrdup(TopMemoryContext, target)",
+		"was_armed = armed",
+		"initialized = true"
+	};
+	static const char *const apply_contract[] = {
+		"ProcessConfigFile(PGC_SIGHUP)",
+		"lms_note_pcm_x_finish_flush_injection_reload(0)"
+	};
+	static const char *const worker_apply_contract[] = {
+		"ProcessConfigFile(PGC_SIGHUP)",
+		"lms_note_pcm_x_finish_flush_injection_reload(worker_id)"
+	};
+	char *source = read_source_path(LMS_SOURCE_PATH);
+
+	/* The acknowledgement is evidence that this process applied both the
+	 * injection list and exact target.  A repeated armed bit with a different
+	 * target/value must emit again, and both DATA-worker loops can acknowledge
+	 * only after their SIGHUP configuration load returns. */
+	assert_ordered_in_function(
+		source, "\nlms_note_pcm_x_finish_flush_injection_reload(",
+		"\n\nvoid\nLmsMain(", reload_contract, lengthof(reload_contract));
+	assert_ordered_in_function(
+		source, "\nLmsMain(", "\n\n/* ============================================================",
+		apply_contract, lengthof(apply_contract));
+	assert_ordered_in_function(
+		source, "\nLmsWorkerMain(", "\n\npid_t\ncluster_lms_get_worker_pid(",
+		worker_apply_contract, lengthof(worker_apply_contract));
+	free(source);
+}
+
 UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 {
 	static const char *const demux_contract[] = {
@@ -5109,15 +5406,354 @@ UT_TEST(test_resource_x_d6_remote_s_failure_decision_matrix)
 	free(source);
 }
 
+UT_TEST(test_resource_x_target_install_coherent_adjudicator_is_result_complete)
+{
+	static const ResourceXTargetInstallFollowState raw_states[] = {
+		RESOURCE_X_TARGET_INSTALL_INVALID,
+		RESOURCE_X_TARGET_INSTALL_INFLIGHT,
+		RESOURCE_X_TARGET_INSTALL_TERMINAL,
+		RESOURCE_X_TARGET_INSTALL_STALE,
+		RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED,
+		RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY
+	};
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+	ResourceXAcquisitionRef ref;
+	ResourceXAcquisitionRef seeded_ref;
+	ResourceXAcquisitionRef zero_ref;
+	ResourceXTargetInstallContinuation continuation;
+	ResourceXTargetInstallContinuation seeded_continuation;
+	ResourceXTargetInstallContinuation zero_continuation;
+	ResourceXTargetInstallFollowState state;
+	size_t i;
+
+	memset(&before, 0, sizeof(before));
+	before.tag.spcOid = 1663;
+	before.tag.dbOid = 5;
+	before.tag.relNumber = 16384;
+	before.tag.forkNum = MAIN_FORKNUM;
+	before.tag.blockNum = 227;
+	before.pcm_state = (uint8)PCM_STATE_X;
+	before.generation = 41;
+	before.reservation_token = 19;
+	after = before;
+	memset(&seeded_ref, 0x5a, sizeof(seeded_ref));
+	memset(&zero_ref, 0, sizeof(zero_ref));
+	memset(&seeded_continuation, 0xa5, sizeof(seeded_continuation));
+	seeded_continuation.valid = true;
+	memset(&zero_continuation, 0, sizeof(zero_continuation));
+
+	for (i = 0; i < lengthof(raw_states); i++) {
+		ref = seeded_ref;
+		continuation = seeded_continuation;
+		state = cluster_pcm_x_target_install_follow_adjudicate_exact(
+			&before, &after, raw_states[i], &ref, &continuation);
+		UT_ASSERT_EQ(state, raw_states[i]);
+		if (raw_states[i] == RESOURCE_X_TARGET_INSTALL_TERMINAL)
+			UT_ASSERT_EQ(memcmp(&ref, &seeded_ref, sizeof(ref)), 0);
+		else
+			UT_ASSERT_EQ(memcmp(&ref, &zero_ref, sizeof(ref)), 0);
+		if (raw_states[i] == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+			|| raw_states[i] == RESOURCE_X_TARGET_INSTALL_TERMINAL
+			|| raw_states[i] == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+			UT_ASSERT_EQ(memcmp(&continuation, &seeded_continuation,
+				sizeof(continuation)), 0);
+		else
+			UT_ASSERT_EQ(memcmp(&continuation, &zero_continuation,
+				sizeof(continuation)), 0);
+	}
+
+	after.generation++;
+	for (i = 0; i < lengthof(raw_states); i++) {
+		ref = seeded_ref;
+		continuation = seeded_continuation;
+		state = cluster_pcm_x_target_install_follow_adjudicate_exact(
+			&before, &after, raw_states[i], &ref, &continuation);
+		UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_RESAMPLE);
+		UT_ASSERT_EQ(memcmp(&ref, &zero_ref, sizeof(ref)), 0);
+		UT_ASSERT_EQ(memcmp(&continuation, &zero_continuation,
+			sizeof(continuation)), 0);
+	}
+
+	after = before;
+	ref = seeded_ref;
+	continuation = seeded_continuation;
+	state = cluster_pcm_x_target_install_follow_adjudicate_exact(
+		&before, &after, (ResourceXTargetInstallFollowState)UINT8_MAX,
+		&ref, &continuation);
+	UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_INVALID);
+	UT_ASSERT_EQ(memcmp(&ref, &zero_ref, sizeof(ref)), 0);
+	UT_ASSERT_EQ(memcmp(&continuation, &zero_continuation,
+		sizeof(continuation)), 0);
+}
+
+UT_TEST(test_resource_x_target_install_driver_has_no_unbracketed_entry_observer)
+{
+	static const char *const capture_order[] = {
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(",
+		"cluster_bufmgr_pcm_own_snapshot(",
+		"cluster_pcm_x_target_install_follow_adjudicate_exact("
+	};
+	static const char *const classify_order[] = {
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(",
+		"cluster_bufmgr_pcm_own_snapshot(",
+		"cluster_pcm_x_target_install_follow_adjudicate_exact("
+	};
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+
+	assert_ordered_in_function(source,
+		"\ngcs_block_resource_x_target_install_capture_coherent(",
+		"\nstatic ResourceXApplyResult\n"
+		"gcs_block_resource_x_target_install_classify_coherent(",
+		capture_order, lengthof(capture_order));
+	assert_ordered_in_function(source,
+		"\ngcs_block_resource_x_target_install_classify_coherent(",
+		"\nstatic ResourceXApplyResult\n"
+		"gcs_block_resource_x_target_acquire_internal(",
+		classify_order, lengthof(classify_order));
+	UT_ASSERT_EQ(count_source_occurrences(source,
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact("),
+		1);
+	UT_ASSERT_EQ(count_source_occurrences(source,
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact("),
+		1);
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	driver_end = driver != NULL
+		? strstr(driver,
+			"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	if (driver != NULL && driver_end != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(driver,
+			"gcs_block_resource_x_target_install_capture_coherent("));
+		UT_ASSERT_NOT_NULL(strstr(driver,
+			"gcs_block_resource_x_target_install_classify_coherent("));
+		UT_ASSERT_NOT_NULL(strstr(driver,
+			"RESOURCE_X_TARGET_INSTALL_RESAMPLE"));
+		UT_ASSERT_NULL(strstr(driver,
+			"&target_install_follow, &own, timeout_ms"));
+	}
+	free(source);
+}
+
+/* Model the stable E result independently from the B-E-B adjudicator.  The
+ * behavioral pcm-lock tests exercise each real entry/owner transition; this
+ * generated product proves that every cross-axis result is either discarded
+ * on B change or preserves exactly the already classified stable result. */
+static ResourceXTargetInstallFollowState
+resource_x_target_install_generated_stable_state(
+	size_t buffer_phase, size_t entry_phase, size_t owner_state,
+	size_t identity_state, size_t lineage_state)
+{
+	/* entry: T1, T2, terminal, failed, stale, unknown */
+	if (entry_phase == 3 || entry_phase == 5)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (entry_phase == 4 || identity_state != 0 || lineage_state == 2)
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	/* owner 5 and B phases S/READ_IMAGE/malformed are closed. */
+	if (owner_state == 5 || buffer_phase >= 6)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (entry_phase == 0)
+		return owner_state == 0 && buffer_phase <= 3
+			? RESOURCE_X_TARGET_INSTALL_INFLIGHT
+			: RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (entry_phase == 1)
+		return owner_state == 0 && buffer_phase >= 1 && buffer_phase <= 3
+			? RESOURCE_X_TARGET_INSTALL_INFLIGHT
+			: RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	/* Terminal: I3 + empty is the sole authority-bearing cell.  Exact
+	 * terminal pre-use owners and RX/RN successors can only requalify. */
+	if (owner_state == 0 && buffer_phase == 3)
+		return RESOURCE_X_TARGET_INSTALL_TERMINAL;
+	if ((buffer_phase == 3 || buffer_phase == 4 || buffer_phase == 5)
+		&& owner_state < 5)
+		return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+	return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+}
+
+UT_TEST(test_resource_x_target_install_generated_cross_axis_matrix)
+{
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+	ClusterPcmOwnSnapshot before_saved;
+	ClusterPcmOwnSnapshot after_saved;
+	ResourceXAcquisitionRef ref;
+	ResourceXAcquisitionRef seeded_ref;
+	ResourceXAcquisitionRef zero_ref;
+	ResourceXTargetInstallContinuation continuation;
+	ResourceXTargetInstallContinuation seeded_continuation;
+	ResourceXTargetInstallContinuation zero_continuation;
+	ResourceXTargetInstallFollowState raw_state;
+	ResourceXTargetInstallFollowState expected;
+	ResourceXTargetInstallFollowState state;
+	uint64 cases = 0;
+	size_t buffer_phase;
+	size_t entry_phase;
+	size_t owner_state;
+	size_t identity_state;
+	size_t observation;
+	size_t lineage_state;
+	size_t deadline_state;
+
+	memset(&zero_ref, 0, sizeof(zero_ref));
+	memset(&zero_continuation, 0, sizeof(zero_continuation));
+	for (buffer_phase = 0; buffer_phase < 9; buffer_phase++) {
+		memset(&before, 0, sizeof(before));
+		before.tag.spcOid = 1663;
+		before.tag.dbOid = 5;
+		before.tag.relNumber = 16384;
+		before.tag.forkNum = MAIN_FORKNUM;
+		before.tag.blockNum = (BlockNumber)(300 + buffer_phase);
+		before.generation = 10;
+		before.reservation_token = 17;
+		if (buffer_phase == 0) {
+			before.pcm_state = (uint8)PCM_STATE_N;
+			before.flags = PCM_OWN_FLAG_GRANT_PENDING;
+		} else if (buffer_phase == 1 || buffer_phase == 2
+				|| buffer_phase == 3) {
+			before.pcm_state = (uint8)PCM_STATE_X;
+			before.generation = 11;
+			before.writer_activation_token
+				= buffer_phase == 3 ? 0 : UINT64_C(17);
+			before.resource_x_activation_generation
+				= buffer_phase == 2 ? UINT64_C(23) : 0;
+		} else if (buffer_phase == 4) {
+			before.pcm_state = (uint8)PCM_STATE_X;
+			before.flags = PCM_OWN_FLAG_REVOKING;
+			before.generation = 11;
+			before.reservation_token = 18;
+		} else if (buffer_phase == 5) {
+			before.pcm_state = (uint8)PCM_STATE_N;
+			before.flags = PCM_OWN_FLAG_REVOKING;
+			before.generation = 12;
+			before.reservation_token = 18;
+		} else if (buffer_phase == 6)
+			before.pcm_state = (uint8)PCM_STATE_S;
+		else if (buffer_phase == 7)
+			before.pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+		else {
+			before.pcm_state = UINT8_C(0xff);
+			before.flags = UINT32_C(0xffffffff);
+		}
+		for (entry_phase = 0; entry_phase < 6; entry_phase++)
+		for (owner_state = 0; owner_state < 6; owner_state++)
+		for (identity_state = 0; identity_state < 5; identity_state++)
+		for (observation = 0; observation < 2; observation++)
+		for (lineage_state = 0; lineage_state < 3; lineage_state++)
+		for (deadline_state = 0; deadline_state < 3; deadline_state++) {
+			raw_state = resource_x_target_install_generated_stable_state(
+				buffer_phase, entry_phase, owner_state,
+				identity_state, lineage_state);
+			after = before;
+			if (observation != 0)
+				after._reserved[2] ^= UINT8_C(1);
+			before_saved = before;
+			after_saved = after;
+			memset(&seeded_ref, 0x5a, sizeof(seeded_ref));
+			memset(&seeded_continuation, 0xa5,
+				sizeof(seeded_continuation));
+			seeded_continuation.capture_flags = (uint8)owner_state;
+			seeded_continuation.requester_node = (int32)identity_state;
+			seeded_continuation.direct_init_ownership_generation
+				= lineage_state == 0 ? 0 : UINT64_C(10);
+			seeded_continuation.direct_init_reservation_token
+				= lineage_state == 0 ? 0
+				: lineage_state == 1 ? UINT64_C(17) : UINT64_C(18);
+			seeded_continuation.round_absolute_deadline_us = UINT64_C(1000);
+			seeded_continuation.caller_absolute_deadline_us
+				= deadline_state == 0 ? UINT64_C(1001)
+				: deadline_state == 1 ? UINT64_C(1000) : UINT64_C(999);
+			seeded_continuation.valid = true;
+			ref = seeded_ref;
+			continuation = seeded_continuation;
+			state = cluster_pcm_x_target_install_follow_adjudicate_exact(
+				&before, &after, raw_state, &ref, &continuation);
+			expected = observation != 0
+				? RESOURCE_X_TARGET_INSTALL_RESAMPLE : raw_state;
+			UT_ASSERT_EQ(state, expected);
+			UT_ASSERT_EQ(memcmp(&before, &before_saved, sizeof(before)), 0);
+			UT_ASSERT_EQ(memcmp(&after, &after_saved, sizeof(after)), 0);
+			if (expected == RESOURCE_X_TARGET_INSTALL_TERMINAL)
+				UT_ASSERT_EQ(memcmp(&ref, &seeded_ref, sizeof(ref)), 0);
+			else
+				UT_ASSERT_EQ(memcmp(&ref, &zero_ref, sizeof(ref)), 0);
+			if (expected == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+				|| expected == RESOURCE_X_TARGET_INSTALL_TERMINAL
+				|| expected == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
+				UT_ASSERT_EQ(memcmp(&continuation, &seeded_continuation,
+					sizeof(continuation)), 0);
+				UT_ASSERT(continuation.caller_absolute_deadline_us
+					<= seeded_continuation.caller_absolute_deadline_us);
+			} else
+				UT_ASSERT_EQ(memcmp(&continuation, &zero_continuation,
+					sizeof(continuation)), 0);
+			cases++;
+		}
+	}
+	UT_ASSERT_EQ(cases, UINT64_C(29160));
+}
+
+UT_TEST(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first)
+{
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *round_loop;
+	const char *loop;
+	const char *deadline_sample;
+	const char *deadline_guard;
+	const char *deadline_result;
+	const char *first_snapshot;
+
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	round_loop = driver != NULL
+		? strstr(driver, "diagnostic_stage = \"round-loop\"") : NULL;
+	loop = round_loop != NULL ? strstr(round_loop, "for (;;) {") : NULL;
+	first_snapshot = loop != NULL
+		? strstr(loop, "diagnostic_stage = \"own-snapshot\"") : NULL;
+	deadline_sample = loop != NULL
+		? strstr(loop, "now_us = gcs_block_pcm_x_monotonic_us();") : NULL;
+	deadline_guard = deadline_sample != NULL
+		? strstr(deadline_sample, "if (now_us >= absolute_deadline_us)") : NULL;
+	deadline_result = deadline_guard != NULL
+		? strstr(deadline_guard, "result = RESOURCE_X_APPLY_BAD_STATE;") : NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(round_loop);
+	UT_ASSERT_NOT_NULL(loop);
+	UT_ASSERT_NOT_NULL(first_snapshot);
+	UT_ASSERT_NOT_NULL(deadline_sample);
+	UT_ASSERT_NOT_NULL(deadline_guard);
+	UT_ASSERT_NOT_NULL(deadline_result);
+	if (first_snapshot != NULL && deadline_sample != NULL
+		&& deadline_guard != NULL && deadline_result != NULL) {
+		UT_ASSERT(loop < deadline_sample);
+		UT_ASSERT(deadline_sample < deadline_guard);
+		UT_ASSERT(deadline_guard < deadline_result);
+		UT_ASSERT(deadline_result < first_snapshot);
+	}
+	free(source);
+}
+
 UT_TEST(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_drift)
 {
 	static const char *const drift_contract[] = {
 		"n_candidate_result != CLUSTER_PCM_OWN_OK",
 		"n_candidate_result == CLUSTER_PCM_OWN_STALE",
-		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(",
-		"&failure_live)",
-		"if (target_install_inflight)",
-		"own = failure_live",
+		"gcs_block_resource_x_target_install_capture_coherent(",
+		"retry_slice_us, absolute_deadline_us,",
+		"&failure_live,",
+		"&target_install_follow_state,",
+		"&target_install_follow)",
+		"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+		"RESOURCE_X_TARGET_INSTALL_INFLIGHT",
+		"RESOURCE_X_TARGET_INSTALL_TERMINAL",
+		"continue;",
 		"gcs_block_pcm_x_resource_x_remote_s_own_result(",
 		"gcs_block_resource_x_first_failure_record(",
 		"break;"
@@ -5126,10 +5762,10 @@ UT_TEST(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_d
 
 	/* The observed t/400 first cause is a clean N snapshot whose exact
 	 * same-header-lock recheck sees the current R9 executor's N reservation.
-	 * Only the existing exact round/T1 predicate may turn that observation
-	 * drift into the existing WAIT path.  Every non-exact STALE keeps the D1
-	 * failure record and return policy, and the outer absolute deadline is
-	 * neither recomputed nor refreshed here. */
+	 * Only an immutable continuation capture may turn that observation drift
+	 * into the receipt WAIT path. Every non-exact STALE keeps the D1 failure
+	 * record and return policy, and the outer absolute deadline is neither
+	 * recomputed nor refreshed here. */
 	assert_ordered_in_function(
 		source, "\ngcs_block_resource_x_target_acquire_internal(",
 		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
@@ -5142,11 +5778,15 @@ UT_TEST(test_resource_x_target_resamples_only_exact_terminal_install)
 	static const char *const resample_contract[] = {
 		"n_candidate_result != CLUSTER_PCM_OWN_OK",
 		"n_candidate_result == CLUSTER_PCM_OWN_STALE",
+		"gcs_block_resource_x_target_install_capture_coherent(",
+		"&failure_live,",
+		"&target_install_follow_state,",
+		"&target_install_follow)",
+		"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+		"RESOURCE_X_TARGET_INSTALL_TERMINAL",
+		"continue;",
 		"gcs_block_pcm_x_resource_x_remote_s_own_result(",
 		"cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(",
-		"cluster_gcs_resource_x_target_terminal_resample_exact(",
-		"own = failure_live",
-		"continue;",
 		"gcs_block_resource_x_first_failure_record(",
 		"break;"
 	};
@@ -5185,9 +5825,10 @@ UT_TEST(test_resource_x_target_resamples_only_exact_terminal_install)
 
 	/* A clean N preflight may race the exact same-node fan-in executor from
 	 * N to its terminal cached X.  Only the canonical terminal snapshot whose
-	 * cached generation names the freshly sampled X may resample; the next
-	 * driver iteration still revalidates BufferDesc and entry under their own
-	 * locks before returning the terminal ref. */
+	 * cached generation names the freshly sampled X is recognized. The old
+	 * predicate below remains a diagnostic truth-table fixture only; production
+	 * must capture the exact attempt/token receipt and the next iteration must
+	 * revalidate BufferDesc and entry before returning the terminal ref. */
 	UT_ASSERT(cluster_gcs_resource_x_target_terminal_resample_exact(
 		CLUSTER_PCM_OWN_STALE, &before, &live,
 		RESOURCE_X_APPLY_APPLIED, &round));
@@ -5230,7 +5871,7 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_terminal_pu
 	char *source;
 	const char *driver;
 	const char *resample_stage;
-	const char *terminal_exact;
+	const char *receipt_capture;
 	const char *generic_candidate;
 
 	memset(&pending, 0, sizeof(pending));
@@ -5308,22 +5949,22 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_terminal_pu
 	resample_stage = driver != NULL
 		? strstr(driver, "diagnostic_stage = \"pending-install-terminal-resample\"")
 		: NULL;
-	terminal_exact = resample_stage != NULL
+	receipt_capture = resample_stage != NULL
 		? strstr(resample_stage,
-			"cluster_gcs_resource_x_target_pending_terminal_resample_exact(")
+			"gcs_block_resource_x_target_install_capture_coherent(")
 		: NULL;
-	generic_candidate = terminal_exact != NULL
-		? strstr(terminal_exact,
+	generic_candidate = receipt_capture != NULL
+		? strstr(receipt_capture,
 			"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(")
 		: NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(resample_stage);
-	UT_ASSERT_NOT_NULL(terminal_exact);
+	UT_ASSERT_NOT_NULL(receipt_capture);
 	UT_ASSERT_NOT_NULL(generic_candidate);
-	if (resample_stage != NULL && terminal_exact != NULL
+	if (resample_stage != NULL && receipt_capture != NULL
 		&& generic_candidate != NULL)
-		UT_ASSERT(resample_stage < terminal_exact
-			&& terminal_exact < generic_candidate);
+		UT_ASSERT(resample_stage < receipt_capture
+			&& receipt_capture < generic_candidate);
 	free(source);
 }
 
@@ -5409,14 +6050,14 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup
 	const char *resample_stage;
 	const char *live_snapshot;
 	const char *round_snapshot;
-	const char *terminal_exact;
-	const char *retry;
+	const char *mismatch;
+	const char *legacy_retry;
 	const char *return_result;
 
-	/* A same-node executor may publish terminal X after this follower chose
-	 * the target-install WAIT path but before its registered CV predicate is
-	 * rechecked.  STALE is retryable only after fresh BufferDesc and round
-	 * snapshots prove the exact pending(T)->terminal-X(T+1) transition. */
+	/* The old generic round-wait diagnostic may still decompose a pending to
+	 * terminal race, but it can no longer authorize a retry. The receipt wait
+	 * lives earlier in the driver and returns to the same immutable continuation;
+	 * this block records the r115 mismatch mask and propagates its typed result. */
 	driver = source != NULL
 		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
 		: NULL;
@@ -5436,32 +6077,166 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup
 		? strstr(live_snapshot,
 			"cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(")
 		: NULL;
-	terminal_exact = round_snapshot != NULL
+	mismatch = round_snapshot != NULL
 		? strstr(round_snapshot,
+			"cluster_gcs_resource_x_pending_terminal_resample_mismatch(")
+		: NULL;
+	return_result = mismatch != NULL
+		? strstr(mismatch, "result = wait_result;")
+		: NULL;
+	legacy_retry = mismatch != NULL
+		? strstr(mismatch,
 			"cluster_gcs_resource_x_target_pending_terminal_resample_exact(")
-		: NULL;
-	retry = terminal_exact != NULL
-		? strstr(terminal_exact, "continue;")
-		: NULL;
-	return_result = retry != NULL
-		? strstr(retry, "result = wait_result;")
 		: NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(wait_failure);
 	UT_ASSERT_NOT_NULL(resample_stage);
 	UT_ASSERT_NOT_NULL(live_snapshot);
 	UT_ASSERT_NOT_NULL(round_snapshot);
-	UT_ASSERT_NOT_NULL(terminal_exact);
-	UT_ASSERT_NOT_NULL(retry);
+	UT_ASSERT_NOT_NULL(mismatch);
 	UT_ASSERT_NOT_NULL(return_result);
 	if (resample_stage != NULL && live_snapshot != NULL
-		&& round_snapshot != NULL && terminal_exact != NULL
-		&& retry != NULL && return_result != NULL)
+		&& round_snapshot != NULL && mismatch != NULL
+		&& return_result != NULL) {
 		UT_ASSERT(resample_stage < live_snapshot
 			&& live_snapshot < round_snapshot
-			&& round_snapshot < terminal_exact
-			&& terminal_exact < retry
-			&& retry < return_result);
+			&& round_snapshot < mismatch
+			&& mismatch < return_result);
+		UT_ASSERT(legacy_retry == NULL || legacy_retry >= return_result);
+	}
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_retains_one_install_receipt_until_terminal_gate)
+{
+	static const char *const continuation_contract[] = {
+		"ResourceXTargetInstallContinuation target_install_follow",
+		"memset(&target_install_follow, 0, sizeof(target_install_follow))",
+		"if (target_install_follow.valid)",
+		"gcs_block_resource_x_target_install_classify_coherent(",
+		"buf, &target_install_follow, &own,",
+		"&target_install_follow_state, &terminal_ref)",
+		"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+		"RESOURCE_X_TARGET_INSTALL_TERMINAL",
+		"goto target_install_terminal_recheck",
+		"RESOURCE_X_TARGET_INSTALL_INFLIGHT",
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(",
+		"&target_install_follow,",
+		"RESOURCE_X_TARGET_INSTALL_INFLIGHT,",
+		"timeout_ms)",
+		"continue;",
+		"gcs_block_resource_x_target_install_capture_coherent(",
+		"retry_slice_us, absolute_deadline_us, &own,",
+		"&target_install_follow_state,",
+		"&target_install_follow)",
+		"target_install_terminal_recheck:",
+		"terminal_admission_current",
+		"terminal_gate_session_current",
+		"*ref_out = terminal_ref"
+	};
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+	const char *valid_branch;
+	const char *first_capture;
+	const char *old_boolean;
+	const char *forgot_receipt;
+
+	/* One process-local receipt spans I0-I3 and terminal publication.  A wake
+	 * only causes a fresh BufferDesc sample plus classification of that same
+	 * receipt; neither the old boolean predicate nor copying failure_live into
+	 * own may replace its attempt/token identity.  The terminal ref reaches the
+	 * caller only after the unchanged semantic and gate/session checks. */
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_target_acquire_internal(",
+		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
+		continuation_contract, lengthof(continuation_contract));
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	driver_end = driver != NULL
+		? strstr(driver,
+			"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(")
+		: NULL;
+	valid_branch = driver != NULL
+		? strstr(driver, "if (target_install_follow.valid)")
+		: NULL;
+	first_capture = valid_branch != NULL
+		? strstr(valid_branch,
+			"gcs_block_resource_x_target_install_capture_coherent(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	UT_ASSERT_NOT_NULL(valid_branch);
+	UT_ASSERT_NOT_NULL(first_capture);
+	if (driver != NULL && driver_end != NULL) {
+		old_boolean = strstr(driver,
+			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(");
+		UT_ASSERT(old_boolean == NULL || old_boolean >= driver_end);
+	}
+	if (valid_branch != NULL && first_capture != NULL) {
+		forgot_receipt = strstr(valid_branch, "own = failure_live");
+		UT_ASSERT(forgot_receipt == NULL || forgot_receipt >= first_capture);
+	}
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_preuse_successor_discards_only_local_receipt)
+{
+	static const char *const preuse_contract[] = {
+		"bool target_install_preuse_retry_seen = false",
+		"RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY",
+		"target_install_preuse_retry_seen = true",
+		"cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(",
+		"if (wait_result == RESOURCE_X_APPLY_DUPLICATE)",
+		"memset(&target_install_follow, 0,",
+		"sizeof(target_install_follow))",
+		"target_install_preuse_retry_seen = false",
+		"continue;"
+	};
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+	const char *preuse;
+	const char *preuse_end;
+	const char *terminal_jump;
+
+	/* A28 is wholly pre-content-X.  A proven exact local successor may make
+	 * the old process-local receipt retryable, but that branch must only wait
+	 * or clear the receipt.  It cannot jump to terminal publication, adopt the
+	 * successor, clear shared state, or mint a new caller deadline. */
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_target_acquire_internal(",
+		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
+		preuse_contract, lengthof(preuse_contract));
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	driver_end = driver != NULL
+		? strstr(driver,
+			"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(")
+		: NULL;
+	preuse = driver != NULL
+		? strstr(driver, "RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY")
+		: NULL;
+	preuse_end = preuse != NULL
+		? strstr(preuse, "RESOURCE_X_TARGET_INSTALL_INFLIGHT")
+		: NULL;
+	terminal_jump = preuse != NULL
+		? strstr(preuse, "goto target_install_terminal_recheck")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	UT_ASSERT_NOT_NULL(preuse);
+	UT_ASSERT_NOT_NULL(preuse_end);
+	if (preuse != NULL && preuse_end != NULL)
+		UT_ASSERT(terminal_jump == NULL || terminal_jump >= preuse_end);
+	if (driver != NULL && driver_end != NULL) {
+		const char *deadline_reset = strstr(preuse,
+			"absolute_deadline_us = gcs_block_pcm_x_saturating_add_us(");
+
+		UT_ASSERT(deadline_reset == NULL || deadline_reset >= driver_end);
+	}
 	free(source);
 }
 
@@ -5843,49 +6618,43 @@ UT_TEST(test_resource_x_direct_init_reprobes_exact_same_round_after_candidate_dr
 		"== CLUSTER_PCM_OWN_STALE",
 		"cluster_bufmgr_pcm_own_snapshot(",
 		"buf, &failure_live);",
-		"cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(",
-		"direct_init_ownership_generation",
-		"direct_init_reservation_token",
-		"&failure_live);",
-		"if (target_install_inflight)",
-		"own = failure_live",
+		"gcs_block_resource_x_target_install_capture_coherent(",
+		"retry_slice_us, absolute_deadline_us,",
+		"&failure_live, &target_install_follow_state,",
+		"&target_install_follow)",
+		"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+		"RESOURCE_X_TARGET_INSTALL_INFLIGHT",
+		"RESOURCE_X_TARGET_INSTALL_TERMINAL",
 		"continue;",
 		"= direct_candidate_result == CLUSTER_PCM_OWN_BUSY"
 	};
 	char *source = read_gcs_block_source();
 	const char *candidate;
-	const char *direct_inflight;
-	const char *install_inflight;
-	const char *accept_inflight;
+	const char *receipt_capture;
+	const char *accept_receipt;
 
 	/* The exact known-new N check may race the same round's R9 executor in
 	 * either half of T2: after the remote image copy while the sidecar remains
-	 * N+GRANT_PENDING, or after the X writer fence is published.  The narrow
-	 * direct-init predicate covers the latter; the existing full install
-	 * predicate must cover the former before the caller accepts the re-probe.
-	 * Neither observation grants write authority, and the outer deadline is
-	 * reused. */
+	 * N+GRANT_PENDING, or after the X writer fence is published. One immutable
+	 * continuation capture covers both states and retains the direct-init
+	 * identity; neither observation grants write authority, and the outer
+	 * deadline is reused. */
 	assert_ordered_in_function(
 		source, "\ngcs_block_resource_x_target_acquire_internal(",
 		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
 		drift_contract, lengthof(drift_contract));
 	candidate = strstr(source, "if (direct_init_pending_n)");
-	direct_inflight = candidate != NULL
+	receipt_capture = candidate != NULL
 		? strstr(candidate,
-			"cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(")
+			"gcs_block_resource_x_target_install_capture_coherent(")
 		: NULL;
-	install_inflight = direct_inflight != NULL
-		? strstr(direct_inflight,
-			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(")
-		: NULL;
-	accept_inflight = direct_inflight != NULL
-		? strstr(direct_inflight, "if (target_install_inflight)")
+	accept_receipt = receipt_capture != NULL
+		? strstr(receipt_capture, "RESOURCE_X_TARGET_INSTALL_INFLIGHT")
 		: NULL;
 	UT_ASSERT(candidate != NULL);
-	UT_ASSERT(direct_inflight != NULL);
-	UT_ASSERT(install_inflight != NULL);
-	UT_ASSERT(accept_inflight != NULL);
-	UT_ASSERT(install_inflight < accept_inflight);
+	UT_ASSERT(receipt_capture != NULL);
+	UT_ASSERT(accept_receipt != NULL);
+	UT_ASSERT(receipt_capture < accept_receipt);
 	free(source);
 }
 
@@ -6184,6 +6953,39 @@ UT_TEST(test_resource_x_high_rate_diagnostics_are_time_sampled)
 	free(pcm_source);
 }
 
+UT_TEST(test_read_image_shared_marker_has_one_bufmgr_product_publisher)
+{
+	static const char *const marker_assignment
+		= "buf->pcm_state = (uint8) PCM_STATE_READ_IMAGE;";
+	char *gcs_source = read_gcs_block_source();
+	char *bufmgr_source = read_source_path(BUFMGR_SOURCE_PATH);
+	const char *publisher;
+
+	UT_ASSERT_NOT_NULL(gcs_source);
+	UT_ASSERT_NOT_NULL(bufmgr_source);
+	if (gcs_source != NULL)
+	{
+		UT_ASSERT_NULL(strstr(gcs_source,
+			"buf->pcm_state = (uint8)PCM_STATE_READ_IMAGE;"));
+		UT_ASSERT_NULL(strstr(gcs_source,
+			"buf->pcm_state = (uint8) PCM_STATE_READ_IMAGE;"));
+	}
+	if (bufmgr_source != NULL)
+	{
+		publisher = strstr(bufmgr_source, marker_assignment);
+		UT_ASSERT_NOT_NULL(publisher);
+		if (publisher != NULL)
+		{
+			UT_ASSERT_NULL(strstr(publisher + strlen(marker_assignment),
+				marker_assignment));
+			UT_ASSERT_NOT_NULL(strstr(
+				bufmgr_source, "cluster_pcm_own_publish_read_image_exact("));
+		}
+	}
+	free(gcs_source);
+	free(bufmgr_source);
+}
+
 
 /* MXA-T39: the updater challenge must enter the existing cooperative
  * DATA -> TT -> DATA continuation.  The bounded origin context owns one
@@ -6255,7 +7057,7 @@ UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
 int
 main(void)
 {
-	UT_PLAN(113);
+	UT_PLAN(123);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -6293,6 +7095,8 @@ main(void)
 	UT_RUN(test_local_master_read_image_retries_holder_busy_with_fresh_identity);
 	UT_RUN(test_local_master_read_image_stops_retrying_displaced_holder_exactly);
 	UT_RUN(test_local_master_read_image_pending_x_denial_rearms_at_outer_boundary);
+	UT_RUN(test_t400_positive_fixture_scopes_finish_flush_injection_to_exact_l2f_tag);
+	UT_RUN(test_t406_isolated_fixture_owns_exact_target_finish_flush_failure);
 	UT_RUN(test_local_master_read_image_refusal_evidence_is_attempt_exact);
 	UT_RUN(test_remote_downgrade_prepares_exact_image_before_notify_and_reply);
 	UT_RUN(test_preprepared_image_accepts_exact_zero_lsn_and_rejects_mismatch);
@@ -6341,6 +7145,7 @@ main(void)
 	UT_RUN(test_resource_x_s_barrier_closes_remote_registration_race);
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_RUN(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice);
+	UT_RUN(test_pcm_x_finish_flush_reload_ack_is_target_exact_after_sighup);
 	UT_RUN(test_current_mx_member_proof_reuses_nonblocking_target_origin_context);
 	UT_RUN(test_current_mx_updater_provenance_origin_plan_races);
 	UT_RUN(test_ctrc_forward_and_reply_use_closed_internal_gcs_domain);
@@ -6354,11 +7159,17 @@ main(void)
 	UT_RUN(test_resource_x_d1_records_exact_first_failure_before_policy_change);
 	UT_RUN(test_resource_x_terminal_failure_distinguishes_final_authority_observations);
 	UT_RUN(test_resource_x_d6_remote_s_failure_decision_matrix);
+	UT_RUN(test_resource_x_target_install_coherent_adjudicator_is_result_complete);
+	UT_RUN(test_resource_x_target_install_driver_has_no_unbracketed_entry_observer);
+	UT_RUN(test_resource_x_target_install_generated_cross_axis_matrix);
+	UT_RUN(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first);
 	UT_RUN(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_drift);
 	UT_RUN(test_resource_x_target_resamples_only_exact_terminal_install);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_terminal_publish);
 	UT_RUN(test_resource_x_pending_terminal_resample_diagnostic_names_exact_mismatch);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup);
+	UT_RUN(test_resource_x_target_retains_one_install_receipt_until_terminal_gate);
+	UT_RUN(test_resource_x_target_preuse_successor_discards_only_local_receipt);
 	UT_RUN(test_resource_x_target_waits_out_unrelated_local_pending_reservation);
 	UT_RUN(test_resource_x_target_retries_clean_n_reservation_token_churn);
 	UT_RUN(test_resource_x_target_retries_only_exact_empty_round_x_to_n_drift);
@@ -6369,6 +7180,7 @@ main(void)
 	UT_RUN(test_resource_x_target_waits_for_exact_post_release_settlement_window);
 	UT_RUN(test_recovering_denial_records_exact_master_gate_predicates);
 	UT_RUN(test_resource_x_high_rate_diagnostics_are_time_sampled);
+	UT_RUN(test_read_image_shared_marker_has_one_bufmgr_product_publisher);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

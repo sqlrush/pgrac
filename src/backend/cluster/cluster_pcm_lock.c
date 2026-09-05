@@ -8663,8 +8663,6 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 		bool drained_pair_history = false;
 		bool retained = false;
 		bool invalid = false;
-		uint32 retained_block_intents = 0;
-		uint32 retained_receipts = 0;
 		uint32 lifecycle;
 		int node;
 
@@ -8778,14 +8776,10 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 				if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
 					invalid = true;
 				else if (receipt->state
-						!= RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY) {
+						!= RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
 					retained = true;
-					retained_receipts++;
-				}
-				if (block_intent->state != RESOURCE_X_INTENT_SLOT_EMPTY) {
+				if (block_intent->state != RESOURCE_X_INTENT_SLOT_EMPTY)
 					retained = true;
-					retained_block_intents++;
-				}
 				if (block_intent->state > RESOURCE_X_INTENT_SLOT_STAGED)
 					invalid = true;
 
@@ -8814,31 +8808,6 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 
 		if (retained) {
 			out->retained_entry_count++;
-			/* Temporary D1 evidence only: expose which existing retained
-			 * category owns this exact entry without adding a counter, schema,
-			 * protocol state, or success path. */
-			ereport(LOG,
-					(errmsg_internal("Resource-X retained debt category diagnostic"),
-					 errdetail("rel=%u fork=%d block=%u holder_status=%u "
-							   "holder_image=%u holder_status_intent=%u "
-							   "holder_image_intent=%u grant_intent=%u "
-							   "requester_settlement_intent=%u requester_join_grant=%u "
-							   "requester_join_image=%u "
-							   "source_settlement=%u bootstrap_priority=%u "
-							   "receipts=%u block_intents=%u",
-							   entry->tag.relNumber, (int)entry->tag.forkNum,
-							   entry->tag.blockNum,
-							   (unsigned)state->holder_status.valid,
-							   (unsigned)state->holder_image.valid,
-							   (unsigned)state->holder_status_intent.slot.state,
-							   (unsigned)state->holder_image_intent.state,
-							   (unsigned)state->grant_intent.slot.state,
-							   (unsigned)state->requester_settlement_intent.slot.state,
-							   (unsigned)state->requester_join.grant_payload_bytes,
-							   (unsigned)state->requester_join.image_payload_bytes,
-							   (unsigned)state->source_settlement.state,
-							   (unsigned)state->bootstrap_priority.state,
-							   retained_receipts, retained_block_intents)));
 		}
 		if (active)
 			out->active_resource_x_entry_count++;
@@ -11888,65 +11857,961 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
 	return matches;
 }
 
-/* Register before rechecking the exact observed install tuple so a T3
- * broadcast cannot be lost.  This wait creates no attempt and returns to the
- * caller for a fresh BufferDesc probe after one existing retry slice. */
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+static bool
+pcm_resource_x_target_install_continuation_valid(
+	const ResourceXTargetInstallContinuation *continuation,
+	ResourceXAssertion *assertion_out)
+{
+	ResourceXAssertion assertion;
+
+	if (assertion_out != NULL)
+		memset(assertion_out, 0, sizeof(*assertion_out));
+	if (continuation == NULL || !continuation->valid
+		|| continuation->requester_node != cluster_node_id
+		|| continuation->master_node < 0
+		|| continuation->master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| continuation->entry_binding_generation == 0
+		|| continuation->entry_binding_generation == UINT64_MAX
+		|| continuation->resource_formation == 0
+		|| continuation->resource_formation == UINT64_MAX
+		|| continuation->master_session_incarnation == 0
+		|| continuation->master_session_incarnation == UINT64_MAX
+		|| continuation->r4_record_generation == 0
+		|| continuation->r4_record_generation == UINT64_MAX
+		|| continuation->acquisition_generation == 0
+		|| continuation->acquisition_generation == UINT64_MAX
+		|| continuation->accepted_base_authority_generation == 0
+		|| continuation->accepted_base_authority_generation == UINT64_MAX
+		|| continuation->round_absolute_deadline_us == 0
+		|| continuation->round_absolute_deadline_us == UINT64_MAX
+		|| continuation->caller_absolute_deadline_us == 0
+		|| continuation->caller_absolute_deadline_us == UINT64_MAX
+		|| continuation->retry_slice_us == 0
+		|| continuation->retry_slice_us == UINT64_MAX
+		|| continuation->pending_ownership_generation == UINT64_MAX
+		|| continuation->expected_x_ownership_generation == 0
+		|| continuation->expected_x_ownership_generation == UINT64_MAX
+		|| continuation->expected_x_ownership_generation
+			!= continuation->pending_ownership_generation + 1
+		|| continuation->reservation_token == 0
+		|| continuation->reservation_token == UINT64_MAX
+		|| continuation->direct_init_ownership_generation == UINT64_MAX
+		|| continuation->direct_init_reservation_token == UINT64_MAX
+		|| (continuation->direct_init_reservation_token == 0
+			&& continuation->direct_init_ownership_generation != 0)
+		|| (continuation->capture_flags
+			& ~RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK) != 0
+		|| continuation->requester_sender_connection_generation == 0
+		|| continuation->requester_sender_connection_generation == UINT32_MAX
+		|| continuation->master_ingress_connection_generation == 0
+		|| continuation->master_ingress_connection_generation == UINT32_MAX)
+		return false;
+	assertion.resource = continuation->resource;
+	assertion.requester_node = continuation->requester_node;
+	if (!resource_x_assertion_valid(&assertion))
+		return false;
+	if (assertion_out != NULL)
+		*assertion_out = assertion;
+	return true;
+}
+
+static bool
+pcm_resource_x_target_install_round_identity_exact_locked(
+	const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ResourceXAssertion *assertion)
+{
+	return pcm_resource_x_bootstrap_round_identity_matches(
+			round, assertion, continuation->master_node,
+			continuation->resource_formation,
+			continuation->master_session_incarnation,
+			continuation->r4_record_generation,
+			continuation->requester_sender_connection_generation,
+			continuation->master_ingress_connection_generation,
+			continuation->retry_slice_us,
+			continuation->direct_init_ownership_generation,
+			continuation->direct_init_reservation_token)
+		&& round->request.assertion_sequence
+			== continuation->acquisition_generation
+		&& round->highest_attempt_floor
+			== continuation->acquisition_generation
+		&& round->accepted_base
+			== continuation->accepted_base_authority_generation
+		&& round->absolute_deadline_us
+			== continuation->round_absolute_deadline_us;
+}
+
+/* A BufferDesc snapshot is taken before the caller acquires entry_lock.  Once
+ * the immutable continuation has been captured, terminal publication may win
+ * between those two lock-domain samples.  Recognize only the exact legal
+ * I0..I3 predecessor shapes here; this is a request to resample, never
+ * terminal evidence and never writer permission. */
+static bool
+pcm_resource_x_target_install_preterminal_observation_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	bool n_installing;
+	bool x_activation_cleared;
+	bool x_activation_fenced;
+
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	if (!BufferTagsEqual(&observed->tag, &continuation->resource)
+		|| observed->reservation_token != continuation->reservation_token)
+		return false;
+	n_installing
+		= observed->pcm_state == (uint8)PCM_STATE_N
+		  && observed->flags == PCM_OWN_FLAG_GRANT_PENDING
+		  && observed->generation
+			== continuation->pending_ownership_generation
+		  && observed->writer_activation_token == 0
+		  && observed->resource_x_activation_generation == 0;
+	x_activation_fenced
+		= observed->pcm_state == (uint8)PCM_STATE_X
+		  && observed->flags == 0
+		  && observed->generation
+			== continuation->expected_x_ownership_generation
+		  && observed->writer_activation_token
+			== continuation->reservation_token
+		  && (observed->resource_x_activation_generation == 0
+			  || observed->resource_x_activation_generation
+				== continuation->acquisition_generation);
+	x_activation_cleared
+		= observed->pcm_state == (uint8)PCM_STATE_X
+		  && observed->flags == 0
+		  && observed->generation
+			== continuation->expected_x_ownership_generation
+		  && observed->writer_activation_token == 0
+		  && observed->resource_x_activation_generation == 0;
+	return n_installing || x_activation_fenced || x_activation_cleared;
+}
+
+/* A28/A29: one terminal-X receipt may be superseded before its backend
+ * publishes a writer ledger or takes content-X.  A nonblocking successor may
+ * exact-abort and replay more than once; every begin consumes a monotonic
+ * token while the X ownership generation stays fixed.  BufferDesc is sampled
+ * before entry_lock, so accept the exact same-generation revoke/abort envelope
+ * and its single X->N ownership transition for any strictly newer,
+ * non-wrapping token.  This predicate only requests a fresh authority probe;
+ * it never grants authority. */
+static bool
+pcm_resource_x_target_install_postpreuse_observation_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	bool x_revoke_or_abort;
+	bool n_revoke_or_finish;
+
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	if (!BufferTagsEqual(&observed->tag, &continuation->resource)
+		|| observed->reservation_token <= continuation->reservation_token
+		|| observed->reservation_token == UINT64_MAX
+		|| observed->writer_activation_token != 0
+		|| observed->resource_x_activation_generation != 0)
+		return false;
+	x_revoke_or_abort
+		= observed->pcm_state == (uint8)PCM_STATE_X
+		  && observed->generation
+			== continuation->expected_x_ownership_generation
+		  && (observed->flags == 0
+			  || observed->flags == PCM_OWN_FLAG_REVOKING);
+	n_revoke_or_finish
+		= continuation->expected_x_ownership_generation < UINT64_MAX - 1
+		  && observed->pcm_state == (uint8)PCM_STATE_N
+		  && observed->generation
+			== continuation->expected_x_ownership_generation + 1
+		  && (observed->flags == 0
+			  || observed->flags == PCM_OWN_FLAG_REVOKING);
+	return x_revoke_or_abort || n_revoke_or_finish;
+}
+
+static bool
+pcm_resource_x_target_install_terminal_observation_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	return BufferTagsEqual(&observed->tag, &continuation->resource)
+		&& observed->pcm_state == (uint8)PCM_STATE_X
+		&& observed->flags == 0
+		&& observed->generation
+			== continuation->expected_x_ownership_generation
+		&& observed->reservation_token == continuation->reservation_token
+		&& observed->writer_activation_token == 0
+		&& observed->resource_x_activation_generation == 0;
+}
+
+/* A terminal receipt may outlive the old requester binding for only one
+ * reason admitted here: its exact X carrier completed one ownership-generation
+ * transfer after zero or more reversible token cycles and the old acquisition
+ * floor is still retained.  A non-empty successor round must remain in the
+ * same formation/session/transport domain.  Direct-init proof identities are
+ * deliberately excluded. */
+static bool
+pcm_resource_x_target_install_superseded_round_exact_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ResourceXAssertion *assertion)
+{
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(assertion != NULL);
+	if (continuation->direct_init_ownership_generation != 0
+		|| continuation->direct_init_reservation_token != 0
+		|| entry->resource_x_retired_acquisition_generation
+			!= continuation->acquisition_generation
+		|| round->highest_attempt_floor
+			< continuation->acquisition_generation
+		|| !pcm_resource_x_local_owner_valid_locked(
+			&entry->resource_x_local_owner)
+		|| entry->resource_x_local_owner.state
+			!= RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(
+			continuation->resource_formation))
+		return false;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		return true;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		return false;
+	return resource_x_assertion_equal(
+			&round->request.logical_assertion, assertion)
+		&& round->current_master_node == continuation->master_node
+		&& round->resource_formation == continuation->resource_formation
+		&& round->master_session_incarnation
+			== continuation->master_session_incarnation
+		&& round->r4_record_generation
+			== continuation->r4_record_generation
+		&& round->requester_sender_connection_generation
+			== continuation->requester_sender_connection_generation
+		&& round->master_ingress_connection_generation
+			== continuation->master_ingress_connection_generation
+		&& round->retry_slice_us == continuation->retry_slice_us;
+}
+
+static bool
+pcm_resource_x_target_install_captured_live_revoke_exact(
+	const ClusterPcmResourceXLocalOwner *owner,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	Assert(owner != NULL);
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	return owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
+		&& pcm_resource_x_local_owner_handle_valid(&owner->handle)
+		&& owner->handle.reservation_token < UINT64_MAX - 1
+		&& BufferTagsEqual(&observed->tag, &continuation->resource)
+		&& observed->pcm_state == (uint8)PCM_STATE_X
+		&& observed->flags == PCM_OWN_FLAG_REVOKING
+		&& observed->generation
+			== continuation->expected_x_ownership_generation
+		&& observed->reservation_token == continuation->reservation_token
+		&& observed->reservation_token == owner->handle.reservation_token + 1
+		&& observed->writer_activation_token == 0
+		&& observed->resource_x_activation_generation == 0;
+}
+
+static bool
+pcm_resource_x_target_install_owner_observation_exact_locked(
+	const ClusterPcmResourceXLocalOwner *owner,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	Assert(owner != NULL);
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	return pcm_resource_x_target_install_terminal_observation_exact(
+			continuation, observed)
+		|| pcm_resource_x_target_install_preterminal_observation_exact(
+			continuation, observed)
+		|| pcm_resource_x_target_install_postpreuse_observation_exact(
+			continuation, observed)
+		|| pcm_resource_x_target_install_captured_live_revoke_exact(
+			owner, continuation, observed);
+}
+
+/* A30: ordinary T1 names the requester attempt but carries no BufferDesc
+ * generation/token.  An immediate successor N reservation can therefore be
+ * captured as I0 before publication of the exact older terminal cover.  Once
+ * that cover is visible, use it only to disprove the process-local receipt:
+ * the immediate N successor may request canonical requalification, but can
+ * never produce a terminal ref. */
+static bool
+pcm_resource_x_target_install_late_misbound_i0_exact_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed,
+	const ResourceXAcquisitionRef *expected_ref)
+{
+	const ClusterPcmResourceXLocalOwner *owner;
+	uint64 terminal_generation;
+
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	Assert(expected_ref != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	terminal_generation = round->cached_ownership_generation;
+	owner = &entry->resource_x_local_owner;
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		|| continuation->direct_init_ownership_generation != 0
+		|| continuation->direct_init_reservation_token != 0
+		|| terminal_generation == 0
+		|| terminal_generation >= UINT64_MAX - 2
+		|| continuation->pending_ownership_generation
+			!= terminal_generation + 1
+		|| continuation->expected_x_ownership_generation
+			!= terminal_generation + 2
+		|| continuation->reservation_token == 0
+		|| continuation->reservation_token == UINT64_MAX
+		|| !BufferTagsEqual(&observed->tag, &continuation->resource)
+		|| observed->pcm_state != (uint8)PCM_STATE_N
+		|| observed->generation != terminal_generation + 1
+		|| (observed->flags != PCM_OWN_FLAG_GRANT_PENDING
+			&& observed->flags != 0
+			&& observed->flags != PCM_OWN_FLAG_REVOKING)
+		|| observed->reservation_token == 0
+		|| observed->reservation_token == UINT64_MAX
+		|| observed->reservation_token < continuation->reservation_token
+		|| observed->writer_activation_token != 0
+		|| observed->resource_x_activation_generation != 0
+		|| !pcm_resource_x_local_owner_valid_locked(owner)
+		|| (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY
+			&& !pcm_resource_x_local_owner_round_exact_locked(entry, round)))
+		return false;
+	return pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+		entry, round, expected_ref,
+		continuation->master_session_incarnation,
+		continuation->r4_record_generation, terminal_generation);
+}
+
+/* A31: capture may sample the exact terminal X only after a source successor
+ * has armed REVOKING and consumed its new token.  The continuation then stores
+ * that revoke token.  Completing the same X(G)->N(G+1) conversion retains the
+ * token, so equality is receipt invalidation only.  Require the authoritative
+ * terminal cover and exact one-generation N envelope; this predicate returns
+ * no ref and leaves the retained pair for the canonical caller path to prove. */
+static bool
+pcm_resource_x_target_install_same_token_n_successor_exact_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed,
+	const ResourceXAcquisitionRef *expected_ref)
+{
+	const ClusterPcmResourceXLocalOwner *owner;
+	uint64 terminal_generation;
+
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(observed != NULL);
+	Assert(expected_ref != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	terminal_generation = continuation->expected_x_ownership_generation;
+	owner = &entry->resource_x_local_owner;
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		|| (continuation->capture_flags
+			& RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN) == 0
+		|| continuation->direct_init_ownership_generation != 0
+		|| continuation->direct_init_reservation_token != 0
+		|| terminal_generation == 0
+		|| terminal_generation >= UINT64_MAX - 1
+		|| continuation->pending_ownership_generation
+			!= terminal_generation - 1
+		|| round->cached_ownership_generation != terminal_generation
+		|| !BufferTagsEqual(&observed->tag, &continuation->resource)
+		|| observed->pcm_state != (uint8)PCM_STATE_N
+		|| (observed->flags != 0
+			&& observed->flags != PCM_OWN_FLAG_REVOKING)
+		|| observed->generation != terminal_generation + 1
+		|| observed->reservation_token == 0
+		|| observed->reservation_token == UINT64_MAX
+		|| observed->reservation_token != continuation->reservation_token
+		|| observed->writer_activation_token != 0
+		|| observed->resource_x_activation_generation != 0
+		|| !pcm_resource_x_local_owner_valid_locked(owner)
+		|| (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY
+			&& !pcm_resource_x_local_owner_round_exact_locked(entry, round)))
+		return false;
+	return pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+		entry, round, expected_ref,
+		continuation->master_session_incarnation,
+		continuation->r4_record_generation, terminal_generation);
+}
+
+/* A32: two target-install receipts can retain the same generation/token tuple
+ * after owner release.  Preserve the distinguishing capture-time fact only
+ * when the entry-locked terminal cover, local revoke owner, and coherent
+ * X+REVOKING sample all name the same ordinary round.  This is process-local
+ * provenance and never terminal authority. */
+static bool
+pcm_resource_x_target_install_capture_revoke_provenance_exact_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ResourceXAssertion *assertion,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	ResourceXAcquisitionRef expected_ref;
+	const ClusterPcmResourceXLocalOwner *owner;
+	uint64 terminal_generation;
+
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(assertion != NULL);
+	Assert(observed != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	terminal_generation = continuation->expected_x_ownership_generation;
+	owner = &entry->resource_x_local_owner;
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		|| continuation->direct_init_ownership_generation != 0
+		|| continuation->direct_init_reservation_token != 0
+		|| terminal_generation == 0
+		|| terminal_generation >= UINT64_MAX - 1
+		|| continuation->pending_ownership_generation
+			!= terminal_generation - 1
+		|| round->cached_ownership_generation != terminal_generation
+		|| !pcm_resource_x_target_install_round_identity_exact_locked(
+			round, continuation, assertion)
+		|| !pcm_resource_x_local_owner_valid_locked(owner)
+		|| owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+		|| !pcm_resource_x_local_owner_round_exact_locked(entry, round)
+		|| !pcm_resource_x_target_install_captured_live_revoke_exact(
+			owner, continuation, observed))
+		return false;
+	memset(&expected_ref, 0, sizeof(expected_ref));
+	expected_ref.assertion = *assertion;
+	expected_ref.formation = continuation->resource_formation;
+	expected_ref.acquisition_generation
+		= continuation->acquisition_generation;
+	return pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+		entry, round, &expected_ref,
+		continuation->master_session_incarnation,
+		continuation->r4_record_generation, terminal_generation);
+}
+
+static ResourceXTargetInstallFollowState
+pcm_resource_x_target_install_classify_locked(
+	struct GrdEntry *entry, ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ResourceXAssertion *assertion,
+	const ClusterPcmOwnSnapshot *observed,
+	ResourceXAcquisitionRef *terminal_ref_out)
+{
+	ResourceXAcquisitionRef expected_ref;
+	ClusterPcmResourceXLocalOwner *owner;
+	bool postpreuse_observation;
+	bool round_identity_exact;
+	bool terminal_cover_exact = false;
+
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(assertion != NULL);
+	if (terminal_ref_out != NULL)
+		memset(terminal_ref_out, 0, sizeof(*terminal_ref_out));
+	if (observed == NULL)
+		return RESOURCE_X_TARGET_INSTALL_INVALID;
+	if (!BufferTagsEqual(&observed->tag, &continuation->resource))
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	owner = &entry->resource_x_local_owner;
+	if (!pcm_resource_x_local_owner_valid_locked(owner))
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	postpreuse_observation
+		= pcm_resource_x_target_install_postpreuse_observation_exact(
+			continuation, observed);
+	round_identity_exact
+		= pcm_resource_x_target_install_round_identity_exact_locked(
+			round, continuation, assertion);
+	if (!round_identity_exact
+		&& postpreuse_observation
+		&& pcm_resource_x_target_install_superseded_round_exact_locked(
+			entry, round, continuation, assertion))
+		return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (round->request.assertion_sequence != 0
+		&& round->request.assertion_sequence
+			!= continuation->acquisition_generation)
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	if (round->phase < RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (!round_identity_exact)
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+
+	memset(&expected_ref, 0, sizeof(expected_ref));
+	expected_ref.assertion = *assertion;
+	expected_ref.formation = continuation->resource_formation;
+	expected_ref.acquisition_generation
+		= continuation->acquisition_generation;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+	{
+		if (pcm_resource_x_target_install_late_misbound_i0_exact_locked(
+				entry, round, continuation, observed, &expected_ref))
+			return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+		terminal_cover_exact
+			= round->cached_ownership_generation
+				== continuation->expected_x_ownership_generation
+			  && pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+					entry, round, &expected_ref,
+					continuation->master_session_incarnation,
+					continuation->r4_record_generation,
+					continuation->expected_x_ownership_generation);
+		if (!terminal_cover_exact)
+			return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+		if (pcm_resource_x_target_install_same_token_n_successor_exact_locked(
+				entry, round, continuation, observed, &expected_ref))
+			return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+		if (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY)
+		{
+			if (!pcm_resource_x_local_owner_round_exact_locked(entry, round)
+				|| !pcm_resource_x_target_install_owner_observation_exact_locked(
+					owner, continuation, observed))
+				return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+			return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+		}
+		if (pcm_resource_x_target_install_terminal_observation_exact(
+				continuation, observed))
+		{
+			if (terminal_ref_out != NULL)
+				*terminal_ref_out = expected_ref;
+			return RESOURCE_X_TARGET_INSTALL_TERMINAL;
+		}
+		if (postpreuse_observation)
+			return RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+		if (observed->pcm_state == (uint8)PCM_STATE_N
+			&& observed->generation
+				> continuation->expected_x_ownership_generation)
+			return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+		if (observed->reservation_token != continuation->reservation_token
+			|| (observed->generation
+				!= continuation->pending_ownership_generation
+				&& observed->generation
+					!= continuation->expected_x_ownership_generation))
+			return RESOURCE_X_TARGET_INSTALL_STALE;
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	}
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (observed->reservation_token != continuation->reservation_token
+		|| (observed->generation
+			!= continuation->pending_ownership_generation
+			&& observed->generation
+				!= continuation->expected_x_ownership_generation))
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	if (pcm_resource_x_bootstrap_round_target_install_inflight_locked(
+			entry, round, assertion, continuation->master_node,
+			continuation->resource_formation,
+			continuation->master_session_incarnation,
+			continuation->r4_record_generation,
+			continuation->requester_sender_connection_generation,
+			continuation->master_ingress_connection_generation,
+			continuation->retry_slice_us, observed))
+		return RESOURCE_X_TARGET_INSTALL_INFLIGHT;
+	return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+}
+
+ResourceXTargetInstallFollowState
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node,
 	uint64 resource_formation, uint64 master_session_incarnation,
 	uint64 r4_record_generation,
 	uint32 requester_sender_connection_generation,
 	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us,
 	const ClusterPcmOwnSnapshot *observed,
+	ResourceXTargetInstallContinuation *continuation_out)
+{
+	ResourceXTargetInstallContinuation continuation;
+	ResourceXTargetInstallFollowState state;
+	ClusterPcmResourceXBootstrapRound *round;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+
+	if (continuation_out != NULL)
+		memset(continuation_out, 0, sizeof(*continuation_out));
+	if (continuation_out == NULL || !resource_x_assertion_valid(assertion)
+		|| assertion->requester_node != cluster_node_id
+		|| current_master_node < 0
+		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| resource_formation == 0 || resource_formation == UINT64_MAX
+		|| master_session_incarnation == 0
+		|| master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX
+		|| requester_sender_connection_generation == 0
+		|| requester_sender_connection_generation == UINT32_MAX
+		|| master_ingress_connection_generation == 0
+		|| master_ingress_connection_generation == UINT32_MAX
+		|| retry_slice_us == 0 || retry_slice_us == UINT64_MAX
+		|| caller_absolute_deadline_us == 0
+		|| caller_absolute_deadline_us == UINT64_MAX
+		|| observed == NULL)
+		return RESOURCE_X_TARGET_INSTALL_INVALID;
+	if (!pcm_entry_ref_acquire(&assertion->resource, false,
+			&entry_ref, &acquire_result))
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		state = RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	else if (!pcm_resource_x_bootstrap_round_identity_matches(
+			round, assertion, current_master_node, resource_formation,
+			master_session_incarnation, r4_record_generation,
+			requester_sender_connection_generation,
+			master_ingress_connection_generation, retry_slice_us,
+			round->direct_init_ownership_generation,
+			round->direct_init_reservation_token)
+		|| round->request.assertion_sequence == 0
+		|| round->request.assertion_sequence == UINT64_MAX
+		|| round->accepted_base == 0
+		|| round->accepted_base == UINT64_MAX
+		|| round->absolute_deadline_us == 0
+		|| round->absolute_deadline_us == UINT64_MAX)
+		state = RESOURCE_X_TARGET_INSTALL_STALE;
+	else if (!BufferTagsEqual(&observed->tag, &assertion->resource)
+		|| observed->reservation_token == 0
+		|| observed->reservation_token == UINT64_MAX
+		|| observed->generation == UINT64_MAX)
+		state = RESOURCE_X_TARGET_INSTALL_STALE;
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		&& round->cached_ownership_generation != 0
+		&& round->cached_ownership_generation < UINT64_MAX - 1
+		&& observed->pcm_state == (uint8)PCM_STATE_N
+		&& (observed->flags == PCM_OWN_FLAG_GRANT_PENDING
+			|| observed->flags == 0
+			|| observed->flags == PCM_OWN_FLAG_REVOKING)
+		&& observed->generation == round->cached_ownership_generation + 1
+		&& observed->writer_activation_token == 0
+		&& observed->resource_x_activation_generation == 0)
+	{
+		/* This first sample already follows the round's cached terminal X.
+		 * It cannot seed an install continuation: doing so would invent an
+		 * expected X at G+2 and intercept the caller's local-pending or
+		 * retained-release path.  STALE declines only this optional capture;
+		 * the caller must validate the N carrier before fresh authority. */
+		state = RESOURCE_X_TARGET_INSTALL_STALE;
+	}
+	else
+	{
+		memset(&continuation, 0, sizeof(continuation));
+		continuation.resource = assertion->resource;
+		continuation.requester_node = assertion->requester_node;
+		continuation.master_node = current_master_node;
+		continuation.entry_binding_generation
+			= entry_ref.binding_generation;
+		continuation.resource_formation = resource_formation;
+		continuation.master_session_incarnation
+			= master_session_incarnation;
+		continuation.r4_record_generation = r4_record_generation;
+		continuation.acquisition_generation
+			= round->request.assertion_sequence;
+		continuation.accepted_base_authority_generation
+			= round->accepted_base;
+		continuation.round_absolute_deadline_us
+			= round->absolute_deadline_us;
+		continuation.caller_absolute_deadline_us
+			= caller_absolute_deadline_us;
+		continuation.retry_slice_us = retry_slice_us;
+		continuation.pending_ownership_generation
+			= observed->pcm_state == (uint8)PCM_STATE_N
+				? observed->generation : observed->generation - 1;
+		continuation.expected_x_ownership_generation
+			= continuation.pending_ownership_generation + 1;
+		continuation.reservation_token = observed->reservation_token;
+		continuation.direct_init_ownership_generation
+			= round->direct_init_ownership_generation;
+		continuation.direct_init_reservation_token
+			= round->direct_init_reservation_token;
+		continuation.requester_sender_connection_generation
+			= requester_sender_connection_generation;
+		continuation.master_ingress_connection_generation
+			= master_ingress_connection_generation;
+		if (pcm_resource_x_target_install_capture_revoke_provenance_exact_locked(
+				entry, round, &continuation, assertion, observed))
+			continuation.capture_flags
+				|= RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN;
+		continuation.valid = true;
+		state = pcm_resource_x_target_install_classify_locked(
+			entry, round, &continuation, assertion, observed, NULL);
+		if (state == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+			|| state == RESOURCE_X_TARGET_INSTALL_TERMINAL
+			|| state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+			*continuation_out = continuation;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return state;
+}
+
+ResourceXTargetInstallFollowState
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *observed,
+	ResourceXAcquisitionRef *terminal_ref_out)
+{
+	ResourceXAssertion assertion;
+	ClusterPcmResourceXBootstrapRound *round;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ResourceXTargetInstallFollowState state;
+
+	if (terminal_ref_out != NULL)
+		memset(terminal_ref_out, 0, sizeof(*terminal_ref_out));
+	if (!pcm_resource_x_target_install_continuation_valid(
+			continuation, &assertion)
+		|| observed == NULL)
+		return RESOURCE_X_TARGET_INSTALL_INVALID;
+	if (!pcm_entry_ref_acquire(&continuation->resource, false,
+			&entry_ref, &acquire_result))
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	if (entry_ref.binding_generation
+		!= continuation->entry_binding_generation)
+	{
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	}
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	state = pcm_resource_x_target_install_classify_locked(
+		entry, round, continuation, &assertion, observed,
+		terminal_ref_out);
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return state;
+}
+
+/* Recheck only the entry-owned portion of an exact retained continuation.
+ * BufferDesc is deliberately absent: a waiter cannot pair a caller's old
+ * physical snapshot with newer entry progress.  APPLIED means only that the
+ * exact entry predicate remains waitable; it carries no authority. */
+static ResourceXApplyResult
+pcm_resource_x_target_install_wait_recheck_locked(
+	struct GrdEntry *entry,
+	ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ResourceXAssertion *assertion,
+	ResourceXTargetInstallFollowState expected_follow_state)
+{
+	static const ResourceXAcquisitionRef empty_ref;
+	ResourceXAcquisitionRef expected_ref;
+	PcmResourceXRefClass ref_class;
+	uint32 progress_flags;
+
+	Assert(entry != NULL);
+	Assert(round != NULL);
+	Assert(continuation != NULL);
+	Assert(assertion != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+
+	if (!pcm_resource_x_local_owner_valid_locked(
+			&entry->resource_x_local_owner)
+		|| round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| (entry->resource_x_progress_flags
+			& ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| (entry->resource_x_progress_flags
+			& RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+	memset(&expected_ref, 0, sizeof(expected_ref));
+	expected_ref.assertion = *assertion;
+	expected_ref.formation = continuation->resource_formation;
+	expected_ref.acquisition_generation
+		= continuation->acquisition_generation;
+
+	if (expected_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+	{
+		/* Owner clear or a valid successor that won after the caller's
+		 * coherent classification is progress.  Return immediately so the
+		 * caller can obtain a fresh B-E-B observation. */
+		if (entry->resource_x_local_owner.state
+			== RESOURCE_X_LOCAL_OWNER_EMPTY)
+			return RESOURCE_X_APPLY_DUPLICATE;
+		if (!pcm_resource_x_target_install_round_identity_exact_locked(
+				round, continuation, assertion))
+			return RESOURCE_X_APPLY_STALE;
+		if (round->phase
+			!= RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+			|| round->cached_ownership_generation
+				!= continuation->expected_x_ownership_generation
+			|| !pcm_resource_x_local_owner_round_exact_locked(entry, round))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		/* The old terminal cover may coexist with a newer active attempt after
+		 * T1 wins between classification and this registered recheck.  Accept
+		 * only a structurally valid, same-formation, strictly newer attempt;
+		 * this is progress to re-probe, never authority for either attempt. */
+		if (pcm_resource_x_active_valid_locked(entry)
+			&& entry->resource_x_formation
+				== continuation->resource_formation
+			&& entry->resource_x_acquisition_generation
+				> continuation->acquisition_generation
+			&& entry->resource_x_retired_acquisition_generation
+				== continuation->acquisition_generation
+			&& pcm_resource_x_acquisition_ref_equal(
+				&round->terminal_ref, &expected_ref)
+			&& round->terminal_authority_generation
+				> round->accepted_base
+			&& round->terminal_authority_generation != UINT64_MAX)
+			return RESOURCE_X_APPLY_DUPLICATE;
+		if (!pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+				entry, round, &expected_ref,
+				continuation->master_session_incarnation,
+				continuation->r4_record_generation,
+				continuation->expected_x_ownership_generation))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+
+	if (expected_follow_state != RESOURCE_X_TARGET_INSTALL_INFLIGHT)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_resource_x_target_install_round_identity_exact_locked(
+			round, continuation, assertion))
+		return RESOURCE_X_APPLY_STALE;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+	{
+		if (round->cached_ownership_generation
+				!= continuation->expected_x_ownership_generation
+			|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+				entry, round, &expected_ref,
+				continuation->master_session_incarnation,
+				continuation->r4_record_generation,
+				continuation->expected_x_ownership_generation))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return RESOURCE_X_APPLY_DUPLICATE;
+	}
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+		|| entry->resource_x_local_owner.state
+			!= RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| round->terminal_authority_generation != 0
+		|| memcmp(&round->terminal_ref, &empty_ref,
+			sizeof(empty_ref)) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	ref_class = pcm_resource_x_ref_classify_locked(entry, &expected_ref);
+	if (ref_class == PCM_RX_REF_ACTIVE_OTHER
+		|| ref_class == PCM_RX_REF_RETIRED_OLD)
+		return RESOURCE_X_APPLY_STALE;
+	if (ref_class != PCM_RX_REF_ACTIVE_EXACT)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	progress_flags = entry->resource_x_progress_flags;
+	if (progress_flags
+		== (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+	{
+		if (round->cached_ownership_generation != 0)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	else if (progress_flags
+			 == (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
+				 | RESOURCE_X_PROGRESS_T2))
+	{
+		if (round->cached_ownership_generation
+			!= continuation->expected_x_ownership_generation)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	else
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (entry->resource_x_no_progress_generation == 0
+		&& entry->resource_x_no_progress_reason
+			== RESOURCE_X_NO_PROGRESS_NONE)
+		return RESOURCE_X_APPLY_APPLIED;
+	if (entry->resource_x_no_progress_generation
+			== continuation->acquisition_generation
+		&& entry->resource_x_no_progress_reason
+			== RESOURCE_X_NO_PROGRESS_BUFFER_BUSY)
+		return RESOURCE_X_APPLY_APPLIED;
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+/* Register before rechecking the exact retained install receipt so terminal
+ * or owner-clear broadcasts cannot be lost.  An in-flight wait is still part
+ * of the acquisition round and is bounded by both immutable deadlines.  A
+ * PREUSE wait starts only after that round has published a terminal cover, so
+ * its historical round deadline is identity, not the later caller's budget.
+ * Every return remains only a wake/reprobe classification. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	ResourceXTargetInstallFollowState expected_follow_state,
 	long timeout_ms)
 {
+	ResourceXAssertion assertion;
 	ClusterPcmResourceXBootstrapRound *round;
 	PcmEntryWaitContext wait_context;
 	PcmEntryAcquireResult acquire_result;
 	struct GrdEntry *entry;
 	ResourceXApplyResult result;
+	uint64 deadline_ms;
+	uint64 effective_deadline_us;
+	uint64 now_us;
+	uint64 remaining_us;
+	long sleep_ms;
 
-	if (!resource_x_assertion_valid(assertion) || observed == NULL
+	if (!pcm_resource_x_target_install_continuation_valid(
+			continuation, &assertion)
+		|| (expected_follow_state != RESOURCE_X_TARGET_INSTALL_INFLIGHT
+			&& expected_follow_state
+				!= RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 		|| timeout_ms <= 0)
 		return RESOURCE_X_APPLY_INVALID;
 	memset(&wait_context, 0, sizeof(wait_context));
-	if (!pcm_entry_ref_acquire(&assertion->resource, false,
+	if (!pcm_entry_ref_acquire(&continuation->resource, false,
 			&wait_context.ref, &acquire_result))
-		return RESOURCE_X_APPLY_NOT_FOUND;
+		return RESOURCE_X_APPLY_STALE;
+	if (wait_context.ref.binding_generation
+		!= continuation->entry_binding_generation)
+	{
+		pcm_entry_ref_release(&wait_context.ref);
+		return RESOURCE_X_APPLY_STALE;
+	}
 	entry = wait_context.ref.entry;
 	pcm_entry_wait_ref_begin(&wait_context);
 	ConditionVariablePrepareToSleep(&entry->wait_cv);
 	wait_context.cv_prepared = true;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	if (pcm_resource_x_bootstrap_round_target_install_inflight_locked(
-			entry, round, assertion, current_master_node,
-			resource_formation, master_session_incarnation,
-			r4_record_generation, requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us, observed))
-		result = RESOURCE_X_APPLY_APPLIED;
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-			 && pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
-				round, assertion, current_master_node, resource_formation,
-				master_session_incarnation, r4_record_generation,
-				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us, 0, 0))
-		result = RESOURCE_X_APPLY_DUPLICATE;
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
-		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else
-		result = RESOURCE_X_APPLY_STALE;
+	result = pcm_resource_x_target_install_wait_recheck_locked(
+		entry, round, continuation, &assertion, expected_follow_state);
 	LWLockRelease(&entry->entry_lock.lock);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
+	if (expected_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+		effective_deadline_us
+			= continuation->caller_absolute_deadline_us;
+	else
+		effective_deadline_us = Min(
+			continuation->round_absolute_deadline_us,
+			continuation->caller_absolute_deadline_us);
+	now_us = pcm_resource_x_monotonic_us();
+	if (now_us >= effective_deadline_us) {
+		pcm_entry_wait_context_cleanup(&wait_context);
+		return RESOURCE_X_APPLY_BAD_STATE;
+	}
+	remaining_us = effective_deadline_us - now_us;
+	deadline_ms = remaining_us / UINT64_C(1000)
+		+ (remaining_us % UINT64_C(1000) != 0);
+	sleep_ms = timeout_ms;
+	if (deadline_ms < (uint64) sleep_ms)
+		sleep_ms = (long) deadline_ms;
 
 	PG_TRY();
 	{
-		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
 			WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
@@ -16474,15 +17339,14 @@ pcm_resource_x_s_predecessor_superseded_unbound_wait_locked(
  * read-only predicate supplies no authority: it only binds that physical
  * generation to one current, PENDING/PUBLISHED and not-yet-drained retained
  * pair so the caller can wait locally before starting a new bootstrap round. */
-bool
-cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
+static bool
+pcm_resource_x_holder_pair_retained_fence_internal(
 	const BufferTag *tag, int32 current_master_node,
 	uint64 current_master_session, uint64 current_formation,
 	uint64 retained_generation)
 {
 	PcmEntryRef entry_ref;
 	PcmEntryAcquireResult acquire_result;
-	ResourceXApplyResult result;
 	struct GrdEntry *entry;
 	bool matches = false;
 
@@ -16504,14 +17368,24 @@ cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
 	entry = entry_ref.entry;
 
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+	matches = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
 		entry, current_master_node, current_master_session,
-		current_formation, retained_generation);
-	matches = result == RESOURCE_X_APPLY_APPLIED;
+		current_formation, retained_generation) == RESOURCE_X_APPLY_APPLIED;
 
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return matches;
+}
+
+bool
+cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
+	const BufferTag *tag, int32 current_master_node,
+	uint64 current_master_session, uint64 current_formation,
+	uint64 retained_generation)
+{
+	return pcm_resource_x_holder_pair_retained_fence_internal(
+		tag, current_master_node, current_master_session,
+		current_formation, retained_generation);
 }
 
 ResourceXApplyResult

@@ -3693,9 +3693,108 @@ semantic_activation_ack_lmon_revalidate_active(
 		(void)semantic_activation_ack_image_invalidate(&image);
 }
 
+/* Once durable PREPARE has closed source admission, losing one coherent
+ * QVOTEC snapshot is not evidence that the round identity changed.  Keep the
+ * exact carrier inert until authority is visible again; every stage driver
+ * still performs its normal current-authority revalidation before mutation.
+ * Observable epoch, membership, incarnation, capability, tuple, or gate
+ * contradictions reject retention and take the ordinary whole-round
+ * invalidation path. */
+static bool
+semantic_activation_ack_closed_carrier_not_contradicted(
+	const ClusterSemanticActivationAckTableV1 *image,
+	const SemanticActivationAdmissionSnapshot *snapshot)
+{
+	uint64 observed_mask;
+	uint32 local_capability_word;
+	bool all_observed;
+	int node;
+
+	if (image == NULL || snapshot == NULL
+		|| image->stage < CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| image->stage > CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
+		|| image->round_nonce == 0 || image->record_generation == 0
+		|| image->expected_members_lo == 0
+		|| image->expected_members_hi != 0
+		|| image->observed_members_hi != 0
+		|| (image->observed_members_lo & ~image->expected_members_lo) != 0
+		|| !snapshot->transition_closed
+		|| snapshot->active_bits != image->source_feature_bitmap
+		|| snapshot->formation_epoch != image->transition_epoch
+		|| cluster_epoch_get_current() != image->transition_epoch
+		|| !semantic_activation_ack_terminal_identity_not_contradicted(image))
+		return false;
+
+	if (image->stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED) {
+		if (snapshot->record_generation == UINT64_MAX
+			|| snapshot->record_generation + 1 != image->record_generation)
+			return false;
+	} else if (snapshot->record_generation != image->record_generation)
+		return false;
+
+	all_observed
+		= image->observed_members_lo == image->expected_members_lo;
+	if (image->flags
+		!= (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			| (all_observed
+				   ? CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE
+				   : 0))
+		|| (image->stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& image->capability_sample_digest != 0)
+		|| (image->stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& image->capability_sample_digest == 0))
+		return false;
+
+	local_capability_word = cluster_ic_local_capability_word();
+	if (!semantic_activation_ack_expected_image_current(
+			image, image->expected_members_lo, image->expected_members_hi,
+			image->transition_epoch, (int32)image->coordinator_node,
+			cluster_node_id, local_capability_word))
+		return false;
+
+	observed_mask = image->observed_members_lo;
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool expected = semantic_activation_ack_member_present(
+			image->expected_members_lo, image->expected_members_hi, node);
+		bool observed = node < 64
+						? (observed_mask & (UINT64_C(1) << node)) != 0
+						: false;
+
+		if (!expected) {
+			if (!semantic_activation_bytes_are_zero(
+					(const uint8 *)&image->expected[node],
+					sizeof(image->expected[node]))
+				|| !semantic_activation_bytes_are_zero(
+					(const uint8 *)&image->observed[node],
+					sizeof(image->observed[node])))
+				return false;
+		} else if (observed) {
+			if (!semantic_activation_ack_matches(
+					&image->observed[node], &image->expected[node]))
+				return false;
+		} else if (!semantic_activation_bytes_are_zero(
+				   (const uint8 *)&image->observed[node],
+				   sizeof(image->observed[node])))
+			return false;
+	}
+
+	/* The coordinator additionally owns the exact utility/CAS lineage.  A
+	 * member has no process-local CAS sequence; its closed gate plus the same
+	 * durable generation is the corresponding local proof. */
+	if (cluster_node_id == (int32)image->coordinator_node
+		&& (semantic_activation_lmon_prepare_cas_seq == 0
+			|| semantic_activation_lmon_prepare_cas_utility_request_seq
+			   != image->round_nonce))
+		return false;
+
+	return true;
+}
+
 static void
 semantic_activation_ack_lmon_drain(void)
 {
+	ClusterSemanticActivationAckTableV1 closed_image;
+	SemanticActivationAdmissionSnapshot closed_snapshot;
 	ClusterSemanticActivationAckTableV1 terminal_image;
 	SemanticActivationAdmissionSnapshot terminal_snapshot;
 	SemanticActivationAckIngressItem item;
@@ -3720,15 +3819,12 @@ semantic_activation_ack_lmon_drain(void)
 	if (!semantic_activation_ack_current_authority(
 			cluster_node_id, &current_members_lo, &current_members_hi,
 			&current_epoch, &current_coordinator_node)) {
-		/* A complete OPEN_APPLIED image is terminal evidence, not an active
-		 * membership candidate.  The exact admitted snapshot can be
-		 * temporarily unavailable while QVOTEC publishes its next observation;
-		 * that absence is not contradictory evidence and must not erase the
-		 * carrier that opened the already-current target gate.  Consumers still
-		 * call current_authority/complete_image_current and therefore remain
-		 * fail-closed until the snapshot is exact again.  A real epoch or gate
-		 * drift, any live protocol debt, or any non-terminal image keeps the
-		 * existing whole-round invalidation policy. */
+		/* A coherent admitted snapshot can be briefly unavailable while QVOTEC
+		 * publishes its next observation.  Absence alone cannot erase either a
+		 * completed OPEN carrier or an exact source-closed in-progress carrier.
+		 * Consumers and stage drivers remain fail-closed until current authority
+		 * is visible again; observable contradictions still invalidate the whole
+		 * round below. */
 		if (semantic_activation_ack_ingress_pending(
 				&semantic_activation_ack_local_ingress) == 0
 			&& semantic_activation_ack_local_pending_send.pending_members_lo == 0
@@ -3769,6 +3865,11 @@ semantic_activation_ack_lmon_drain(void)
 				== terminal_snapshot.formation_epoch
 			&& semantic_activation_ack_terminal_identity_not_contradicted(
 				&terminal_image))
+			return;
+		if (semantic_activation_ack_table_snapshot(&closed_image)
+			&& semantic_activation_snapshot(&closed_snapshot)
+			&& semantic_activation_ack_closed_carrier_not_contradicted(
+				&closed_image, &closed_snapshot))
 			return;
 		semantic_activation_ack_lmon_invalidate_active();
 		if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0

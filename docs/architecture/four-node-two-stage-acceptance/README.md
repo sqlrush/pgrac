@@ -23,7 +23,7 @@
 2. [启动、停机、消息乱序与故障收束](02-ordering-and-failure-handling.md)
    解释为什么节点必须按特定并发关系启动/停止，以及异常时如何不留进程或设备残骸。
 3. [验证层次、可观测性与 Oracle RAC 边界](03-validation-observability-and-oracle-comparison.md)
-   说明 focused test、`t/430`、`t/400` 和性能预基线分别验证什么。
+   说明 focused test、`t/430`、正向 `t/400`、负向 `t/406` 和性能预基线分别验证什么。
 4. [块设备预检与卡住 I/O 的安全收束](04-block-device-preflight-and-stuck-io-recovery.md)
    说明静态设备认证为何不等于可用 I/O、如何在不改 voting 数据的前提下预检，以及进程陷入不可中断 I/O 时如何留证和延迟回收。
 5. [成员关系先于数据库服务](05-membership-before-service-readiness.md)
@@ -47,7 +47,8 @@ flowchart LR
     Q -- 是 --> G[Phase 2<br/>四节点重新形成]
     G --> H[t/430]
     H --> I[t/400]
-    I --> J[性能预基线]
+    I --> K[t/406<br/>独立失败集群]
+    K --> J[性能预基线<br/>全新集群]
 ```
 
 ## 设计底线
@@ -62,3 +63,4 @@ flowchart LR
 - 测试失败时先停止进程，再解绑设备，最后删除临时文件；
 - 进程陷入不可中断 I/O 时保留设备和清理清单，等精确进程与 FD 消失后再由显式 reaper 回收；
 - `t/400` 的正确性判官不能为适配基板而放宽。
+- `t/406` 的精确目标、pending-pair、同 attempt 无 ACK 和 fail-closed 判官不能放宽，且其失败集群不得复用于 PRE。

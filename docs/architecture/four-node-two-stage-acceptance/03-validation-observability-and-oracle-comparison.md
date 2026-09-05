@@ -6,7 +6,8 @@
 flowchart LR
     U[Focused tests<br/>局部合同] --> T430[t/430<br/>资源容量与复用]
     T430 --> T400[t/400<br/>四节点事务正确性]
-    T400 --> PRE[8.15-PRE<br/>性能基线]
+    T400 --> T406[t/406<br/>精确 finish-error 负向证据]
+    T406 --> PRE[8.15-PRE<br/>性能基线]
     PRE --> PERF[自适应饱和测试<br/>最终 TPS 门]
 ```
 
@@ -15,6 +16,7 @@ flowchart LR
 | Focused tests | 单个状态转换、设备认证、乱序和清理规则是否正确 | 四节点端到端是否闭环 |
 | `t/430` | 更宽资源集合下目录容量是否有界、能否真实 retire/reuse | 完整事务正确性和最终 TPS |
 | `t/400` | 四节点普通 `UPDATE+COMMIT`、R4/Resource-X 和终态守恒是否正确 | 高并发吞吐能力 |
+| `t/406` | 精确 retained source finish-Flush ERROR 是否保留 pending pair、拒绝同 attempt ACK 并 fail closed | 正向事务吞吐或故障后的继续服务 |
 | 8.15-PRE | 与后续对比一致的初始性能和瓶颈证据 | Stage 8 最终性能 verdict |
 | 自适应饱和 | 动态增加连接后最佳稳定总 TPS 是否达标 | 更广泛 Stage 9 HA 场景 |
 
@@ -50,6 +52,8 @@ flowchart LR
 - 四个实例没有 client error。
 
 它的断言数量较多，是因为同时覆盖 workload 结果、跨节点资源流、错误极性和终态守恒。它不以事务数或 TPS 作为主要得分，因此通过 `t/400` 不等于性能已经达到目标。
+
+破坏性的 retained source finish-Flush ERROR 由独立 `t/406` 承担。t/406 先证明非目标 decoy 正常完成且不消费 one-shot，再证明精确目标在 `smgrwrite` 前失败、pending pair 保留、同 requester/attempt 没有 settlement ACK、运行时 fail closed、postmaster 存活且 BufferIO 清理完整。该失败集群不会被复用于 PRE。
 
 ## 4. 8.15-PRE 与最终性能门
 
@@ -119,7 +123,7 @@ Oracle 没有公开或要求以下测试实现：
 - 测试中的固定启动偏移；
 - PGRAC 的停机交付确认细节；
 - R4 早到消息的本地有界保留算法；
-- `t/430`、`t/400` 和 PRE 的断言结构。
+- `t/430`、`t/400`、`t/406` 和 PRE 的断言结构。
 - loop scratch I/O 资格检查、不可中断进程清理清单和显式 reaper。
 
 因此这些只能描述为 PGRAC 的自动化验证实现，不能称为 Oracle 内部协议复刻。

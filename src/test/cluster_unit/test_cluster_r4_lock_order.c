@@ -261,6 +261,8 @@ static uint8 ut_hot_last_pcm_snapshot_state;
 static bool ut_itl_census_force_pcm_n;
 static bool ut_itl_census_change_writer_activation_projection;
 static bool ut_itl_census_replace_current_page;
+static uint64 ut_itl_census_pcm_reservation_token;
+static uint32 ut_itl_census_pcm_flags;
 static bool ut_itl_census_stale_first_round_full;
 static bool ut_itl_census_second_round_drift;
 static bool ut_itl_census_second_round_fresh_locator_seen;
@@ -286,6 +288,7 @@ static int ut_itl_recycle_guard_unlock_calls;
 static int ut_itl_recycle_guard_relock_calls;
 static int ut_itl_recycle_guard_cancel_calls;
 static bool ut_itl_recycle_guard_active;
+static ClusterBufmgrItlRecycleGuardResult ut_itl_recycle_guard_arm_result;
 static uint64 ut_itl_census_tt_generation;
 static uint64 ut_itl_census_origin_tt_generation;
 static bool ut_itl_census_mutate_activation;
@@ -567,6 +570,8 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 		= (ut_itl_census_replace_current_page
 		   || ut_itl_census_stale_first_round_full)
 			&& ut_hot_pcm_snapshot_calls > 1 ? 18 : 17;
+	out->reservation_token = ut_itl_census_pcm_reservation_token;
+	out->flags = ut_itl_census_pcm_flags;
 	if (ut_hot_current_mx_active && ut_hot_current_mx_one_shot)
 	{
 		UT_ASSERT_EQ(ut_hot_current_mx_pcm_state,
@@ -590,7 +595,7 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 	return CLUSTER_PCM_OWN_OK;
 }
 
-bool
+ClusterBufmgrItlRecycleGuardResult
 cluster_bufmgr_itl_recycle_guard_arm(
 	Buffer buffer, const ClusterPcmOwnSnapshot *expected)
 {
@@ -600,8 +605,11 @@ cluster_bufmgr_itl_recycle_guard_arm(
 	UT_ASSERT(!ut_itl_recycle_guard_active);
 	UT_ASSERT_EQ(expected->pcm_state, (uint8) PCM_STATE_X);
 	ut_itl_recycle_guard_arm_calls++;
+	if (ut_itl_recycle_guard_arm_result
+		!= CLUSTER_BUFMGR_ITL_RECYCLE_ARMED)
+		return ut_itl_recycle_guard_arm_result;
 	ut_itl_recycle_guard_active = true;
-	return true;
+	return CLUSTER_BUFMGR_ITL_RECYCLE_ARMED;
 }
 
 void
@@ -2791,6 +2799,7 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture,
 	ut_itl_recycle_guard_relock_calls = 0;
 	ut_itl_recycle_guard_cancel_calls = 0;
 	ut_itl_recycle_guard_active = false;
+	ut_itl_recycle_guard_arm_result = CLUSTER_BUFMGR_ITL_RECYCLE_ARMED;
 	ut_itl_census_tt_generation = UINT64_C(77);
 	ut_itl_census_origin_tt_generation = UINT64_C(77);
 	ut_itl_census_mutate_activation = false;
@@ -2829,6 +2838,8 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture,
 	ut_itl_census_force_pcm_n = false;
 	ut_itl_census_change_writer_activation_projection = false;
 	ut_itl_census_replace_current_page = false;
+	ut_itl_census_pcm_reservation_token = UINT64_C(17);
+	ut_itl_census_pcm_flags = 0;
 	ut_itl_census_stale_first_round_full = false;
 	ut_itl_census_second_round_drift = false;
 	ut_itl_census_second_round_fresh_locator_seen = false;
@@ -3483,6 +3494,21 @@ ut_dml_guard_drift_tuple(Buffer buffer pg_attribute_unused(), HeapTuple tuple,
 }
 
 static void
+ut_dml_guard_begin_revoke(Buffer buffer pg_attribute_unused(),
+	HeapTuple tuple pg_attribute_unused(), void *arg pg_attribute_unused())
+{
+	ut_itl_census_pcm_reservation_token++;
+	ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+}
+
+static void
+ut_dml_guard_abort_revoke(Buffer buffer pg_attribute_unused(),
+	HeapTuple tuple pg_attribute_unused(), void *arg pg_attribute_unused())
+{
+	ut_itl_census_pcm_flags = 0;
+}
+
+static void
 ut_dml_guard_occupy_selected_slot(Buffer buffer,
 	HeapTuple tuple pg_attribute_unused(), void *arg)
 {
@@ -3526,6 +3552,20 @@ UT_TEST(test_64_dml_guard_allows_terminal_hint_lsn_but_rejects_authority_drift)
 		UT_HOT_BUFFER, &tuple, NULL, NULL));
 	ut_itl_census_change_writer_activation_projection = false;
 
+	/* A27: a type-17 drain can publish or exact-abort REVOKING after this
+	 * backend already owns content-X.  Both directions, including the
+	 * monotonic reservation-token advance, retain the same DML authority. */
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_itl_census_pcm_reservation_token = UINT64_C(17);
+	ut_itl_census_pcm_flags = 0;
+	UT_ASSERT(cluster_heap_test_dml_authority_guard_recheck_with_hook(
+		UT_HOT_BUFFER, &tuple, ut_dml_guard_begin_revoke, NULL));
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_itl_census_pcm_reservation_token = UINT64_C(18);
+	ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+	UT_ASSERT(cluster_heap_test_dml_authority_guard_recheck_with_hook(
+		UT_HOT_BUFFER, &tuple, ut_dml_guard_abort_revoke, NULL));
+
 	/* Exact PCM and target-tuple drift remain fail closed. */
 	ut_hot_pcm_snapshot_calls = 0;
 	UT_ASSERT(!cluster_heap_test_dml_authority_guard_recheck_with_hook(
@@ -3534,6 +3574,70 @@ UT_TEST(test_64_dml_guard_allows_terminal_hint_lsn_but_rejects_authority_drift)
 	ut_hot_pcm_snapshot_calls = 0;
 	UT_ASSERT(!cluster_heap_test_dml_authority_guard_recheck_with_hook(
 		UT_HOT_BUFFER, &tuple, ut_dml_guard_drift_tuple, NULL));
+	ut_itl_census_end();
+}
+
+UT_TEST(test_81_terminal_census_transient_lifecycle_is_typed_retry)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	ClusterHeapItlCapacityResult capacity_result;
+
+	/* HANDOFF can become visible between capture and the exact RECYCLING
+	 * claim.  The bufmgr seam reports that collision without arming debt. */
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_recycle_guard_arm_result
+		= CLUSTER_BUFMGR_ITL_RECYCLE_RETRY_REQUALIFY;
+	capacity_result = cluster_heap_test_itl_capacity_outcome(
+		UT_HOT_BUFFER, (TransactionId) 1381, false);
+	UT_ASSERT_EQ(capacity_result,
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_recycle_guard_arm_calls, 1);
+	UT_ASSERT_EQ(ut_itl_recycle_guard_unlock_calls, 0);
+	UT_ASSERT_EQ(ut_itl_recycle_guard_relock_calls, 0);
+	UT_ASSERT_EQ(ut_itl_recycle_guard_cancel_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+	UT_ASSERT(!ut_itl_recycle_guard_active);
+	UT_ASSERT(ut_hot_content_lock_held);
+	ut_itl_census_end();
+
+	/* REVOKING can already be present at the first PCM capture.  It is the
+	 * same typed retry and never reaches the recycle-arm or resolver. */
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_pcm_reservation_token = UINT64_C(18);
+	ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+	capacity_result = cluster_heap_test_itl_capacity_outcome(
+		UT_HOT_BUFFER, (TransactionId) 1382, false);
+	UT_ASSERT_EQ(capacity_result,
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 1);
+	UT_ASSERT_EQ(ut_itl_recycle_guard_arm_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+	UT_ASSERT(ut_hot_content_lock_held);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_82_cross_page_transient_census_releases_both_locks)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_pair_active = true;
+	ut_itl_pair_content_lock_held[0] = true;
+	ut_itl_pair_content_lock_held[1] = true;
+	ut_hot_content_lock_held = false;
+	ut_itl_census_pcm_reservation_token = UINT64_C(18);
+	ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+
+	UT_ASSERT(!cluster_heap_test_itl_resolve_pair_terminal_census(
+		(Buffer) 1, (Buffer) 2, (Buffer) 1));
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_itl_pair_lock_calls, 2);
+	UT_ASSERT_EQ(ut_itl_pair_lock_buffers[0], (Buffer) 2);
+	UT_ASSERT_EQ(ut_itl_pair_lock_buffers[1], (Buffer) 1);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
 	ut_itl_census_end();
 }
 
@@ -3966,7 +4070,7 @@ UT_TEST(test_79_current_mx_epoch_zero_requires_clean_four_node_formation)
 int
 main(void)
 {
-	UT_PLAN(80);
+	UT_PLAN(82);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);
@@ -4032,6 +4136,8 @@ main(void)
 	UT_RUN(test_62_in_progress_cleanout_evidence_is_never_stamped);
 	UT_RUN(test_63_cleanout_evidence_scn_drift_is_never_stamped);
 	UT_RUN(test_64_dml_guard_allows_terminal_hint_lsn_but_rejects_authority_drift);
+	UT_RUN(test_81_terminal_census_transient_lifecycle_is_typed_retry);
+	UT_RUN(test_82_cross_page_transient_census_releases_both_locks);
 	UT_RUN(test_69_dml_guard_rejects_selected_itl_slot_only_aba);
 	UT_RUN(test_70_all_heap_callers_retry_only_from_zero_apply_drift);
 	UT_RUN(test_71_all_heap_callers_refuse_partial_apply_without_retry_edge);

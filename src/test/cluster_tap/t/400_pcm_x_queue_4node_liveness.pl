@@ -4,7 +4,9 @@
 # 400_pcm_x_queue_4node_liveness.pl
 #    spec-2.36a S3-core RED/GREEN: four nodes concurrently update four
 #    different tuples that occupy the same heap BufferTag.  Every writer
-#    must make progress without surfacing a client error.
+#    must make progress without surfacing a client error.  This fixture owns
+#    the retained finish-Flush positive path; exact destructive containment
+#    belongs to t/406_resource_x_finish_flush_failclosed_4node.pl.
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -198,47 +200,6 @@ sub wait_for_resource_x_terminal_drain
 	return (0, \@outstanding, \@wait_edges);
 }
 
-sub wait_for_resource_x_protocol_quiescence
-{
-	my ($quad, $timeout_seconds) = @_;
-	my @pcm_debt_keys = qw(
-		pcm_grd_wait_refcount
-		pcm_grd_transport_refcount
-		resource_x_retained_debt_count
-		resource_x_active_debt_count
-		resource_x_local_owner_debt_count
-		resource_x_evicting_debt_count
-		resource_x_invalid_debt_count
-		convert_queue_active
-	);
-	my $deadline = time() + $timeout_seconds;
-	my @last;
-
-	do
-	{
-		@last = ();
-		my $drained = 1;
-		for my $i (0 .. 3)
-		{
-			my $pcm = state_snapshot($quad->node($i), 'pcm', \@pcm_debt_keys);
-			my %debt = (
-				%{$pcm},
-				outstanding => state_int(
-					$quad->node($i), 'gcs', 'outstanding_count'),
-				wait_edges => state_int(
-					$quad->node($i), 'lmd', 'wait_edge_count'),
-			);
-
-			push @last, \%debt;
-			$drained = 0 if grep { $_ != 0 } values(%debt);
-		}
-		return (1, \@last) if $drained;
-		usleep(100_000);
-	} while (time() < $deadline);
-
-	return (0, \@last);
-}
-
 sub wait_for_node_state_gt
 {
 	my ($node, $category, $key, $before, $timeout_seconds) = @_;
@@ -259,6 +220,52 @@ sub wait_for_node_state_gt
 	} while (time() < $deadline);
 
 	return (0, $last_value);
+}
+
+sub pcm_xq_dirty_retain_block0_tag
+{
+	my ($node, $shared_root) = @_;
+	die "L2F shared data root is unavailable\n"
+		unless defined($shared_root) && $shared_root ne '';
+	my $row = $node->safe_psql('postgres', q{
+		SELECT c.relname || '|' ||
+			COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text || '|' ||
+			d.oid::text || '|' || pg_relation_filenode(c.oid)::text || '|' ||
+			0::text || '|' || 0::text || '|' ||
+			pg_relation_filepath(c.oid)
+		FROM pg_class AS c
+		JOIN pg_database AS d ON d.datname = current_database()
+		WHERE c.oid = 'pcm_xq_dirty_retain'::regclass
+	});
+	my @fields = split(/\|/, $row, -1);
+
+	die "L2F catalog tag projection returned [$row]\n"
+		unless @fields == 7;
+	my ($relname, $spc_oid, $db_oid, $rel_number, $fork_number,
+		$block_number, $relation_path) = @fields;
+	die "L2F catalog tag relation mismatch: [$relname]\n"
+		unless $relname eq 'pcm_xq_dirty_retain';
+	die "L2F catalog tag contains a non-decimal identity: [$row]\n"
+		unless $spc_oid =~ /\A\d+\z/
+			&& $db_oid =~ /\A\d+\z/
+			&& $rel_number =~ /\A\d+\z/
+			&& $fork_number =~ /\A\d+\z/
+			&& $block_number =~ /\A\d+\z/;
+	die "L2F catalog tag contains an out-of-range identity: [$row]\n"
+		unless $spc_oid > 0 && $spc_oid <= 4_294_967_295
+			&& $db_oid > 0 && $db_oid <= 4_294_967_295
+			&& $rel_number > 0 && $rel_number <= 4_294_967_295
+			&& $fork_number == 0 && $block_number == 0;
+	die "L2F catalog path is not a safe main-fork path: [$relation_path]\n"
+		unless defined($relation_path) && $relation_path ne ''
+			&& $relation_path !~ m{(?:\A|/)\.\.(?:/|\z)}
+			&& $relation_path =~ m{(?:\A|/)\Q$rel_number\E\z};
+	my $physical_path = "$shared_root/$relation_path";
+	my $physical_bytes = -s $physical_path;
+	die "L2F shared main fork has no physical block 0: [$physical_path]\n"
+		unless defined($physical_bytes) && $physical_bytes > 0;
+	return join('/', $spc_oid, $db_oid, $rel_number, $fork_number,
+		$block_number);
 }
 
 my $warmup_error_count = 0;
@@ -286,7 +293,7 @@ sub write_retry
 sub wait_for_lms_finish_flush_reload
 {
 	my ($node, $log_offset, $expected_workers, $expected_armed,
-		$expected_value, $timeout_seconds) = @_;
+		$expected_value, $expected_target, $timeout_seconds) = @_;
 	my $deadline = time() + $timeout_seconds;
 	my $last_log = '';
 
@@ -294,10 +301,11 @@ sub wait_for_lms_finish_flush_reload
 	{
 		$last_log = substr(slurp_file($node->logfile), $log_offset);
 		my %ready_workers;
-		while ($last_log =~ /cluster_lms: DATA worker=(\d+) applied PCM-X finish Flush injection config: pid=\d+ armed=(true|false) value="([^"]*)"/g)
+		while ($last_log =~ /cluster_lms: DATA worker=(\d+) applied PCM-X finish Flush injection config: pid=\d+ armed=(true|false) value="([^"]*)" target="([^"]*)"/g)
 		{
-			my ($worker_id, $armed, $value) = ($1, $2, $3);
-			next unless $armed eq $expected_armed && $value eq $expected_value;
+			my ($worker_id, $armed, $value, $target) = ($1, $2, $3, $4);
+			next unless $armed eq $expected_armed && $value eq $expected_value
+				&& $target eq $expected_target;
 			$ready_workers{$worker_id} = 1;
 		}
 		return (1, $last_log) if scalar(keys %ready_workers) == $expected_workers;
@@ -485,10 +493,6 @@ for my $i (0 .. 3)
 		CREATE TABLE pcm_xq_dirty_retain (
 			id integer,
 			v bigint NOT NULL
-		) WITH (fillfactor = 100);
-		CREATE TABLE pcm_xq_flush_error (
-			id integer,
-			v bigint NOT NULL
 		) WITH (fillfactor = 100)
 	});
 }
@@ -619,6 +623,13 @@ ok(write_retry($quad->node0, 'VACUUM pcm_xq_dirty_retain'),
 	'L2F published target-page free space before the direct-X request');
 ok(write_retry($quad->node0, 'CHECKPOINT'),
 	'L2F baseline checkpointed before the dirty retain leg');
+my @dirty_retain_tags = map {
+	pcm_xq_dirty_retain_block0_tag(
+		$quad->node($_), $quad->shared_data_root)
+} (0 .. 3);
+is(scalar(grep { $_ eq $dirty_retain_tags[0] } @dirty_retain_tags), 4,
+	'L2F all nodes resolve the same catalog-authoritative block-0 target');
+my $dirty_retain_target = $dirty_retain_tags[0];
 
 # The source INSERT leaves an uncheckpointed dirty X image on node0.  A
 # different node must install that exact Resource-X image only after the
@@ -635,23 +646,27 @@ my $dirty_lms_workers = $quad->node0->safe_psql('postgres',
 my $dirty_requester_lms_workers = $quad->node1->safe_psql('postgres',
 	'SHOW cluster.lms_workers') + 0;
 $quad->node0->safe_psql('postgres', q{
+	ALTER SYSTEM SET cluster.pcm_x_retain_flush_error_target =
+		'} . $dirty_retain_target . q{';
 	ALTER SYSTEM SET cluster.injection_points = 'cluster-pcm-x-retain-flush-error';
 	SELECT pg_reload_conf()
 });
 $quad->node1->safe_psql('postgres', q{
+	ALTER SYSTEM SET cluster.pcm_x_retain_flush_error_target =
+		'} . $dirty_retain_target . q{';
 	ALTER SYSTEM SET cluster.injection_points = 'cluster-pcm-x-retain-flush-error';
 	SELECT pg_reload_conf()
 });
 my ($dirty_reload_ready, $dirty_reload_log) = wait_for_lms_finish_flush_reload(
 	$quad->node0, $dirty_flush_log_offset, $dirty_lms_workers, 'true',
-	'cluster-pcm-x-retain-flush-error', 15);
+	'cluster-pcm-x-retain-flush-error', $dirty_retain_target, 15);
 ok($dirty_reload_ready,
 	'L2F every node0 DATA worker applied the finish-Flush injection arm')
 	or diag("L2F DATA-worker reload log=[$dirty_reload_log]");
 my ($dirty_requester_reload_ready, $dirty_requester_reload_log)
 	= wait_for_lms_finish_flush_reload(
 		$quad->node1, $dirty_requester_log_offset, $dirty_requester_lms_workers, 'true',
-		'cluster-pcm-x-retain-flush-error', 15);
+		'cluster-pcm-x-retain-flush-error', $dirty_retain_target, 15);
 ok($dirty_requester_reload_ready,
 	'L2F every node1 DATA worker applied the transfer-boundary diagnostic arm')
 	or diag("L2F requester DATA-worker reload log=[$dirty_requester_reload_log]");
@@ -683,21 +698,27 @@ is($quad->node1->safe_psql('postgres',
 		FROM pcm_xq_dirty_retain}), '1:1,2:1',
 	'L2F dirty retain preserved the exact page contents');
 $quad->node0->safe_psql('postgres', q{
-	ALTER SYSTEM RESET cluster.injection_points;
+	ALTER SYSTEM SET cluster.injection_points =
+		'cluster-pcm-x-retain-flush-error:none:0';
+	ALTER SYSTEM SET cluster.pcm_x_retain_flush_error_target = '';
 	SELECT pg_reload_conf()
 });
 $quad->node1->safe_psql('postgres', q{
-	ALTER SYSTEM RESET cluster.injection_points;
+	ALTER SYSTEM SET cluster.injection_points =
+		'cluster-pcm-x-retain-flush-error:none:0';
+	ALTER SYSTEM SET cluster.pcm_x_retain_flush_error_target = '';
 	SELECT pg_reload_conf()
 });
 my ($dirty_reset_ready, $dirty_reset_log) = wait_for_lms_finish_flush_reload(
-	$quad->node0, $dirty_flush_log_offset, $dirty_lms_workers, 'false', '', 15);
+	$quad->node0, $dirty_flush_log_offset, $dirty_lms_workers, 'false',
+	'cluster-pcm-x-retain-flush-error:none:0', '', 15);
 ok($dirty_reset_ready,
 	'L2F every node0 DATA worker applied the finish-Flush injection disarm')
 	or diag("L2F DATA-worker reset log=[$dirty_reset_log]");
 my ($dirty_requester_reset_ready, $dirty_requester_reset_log)
 	= wait_for_lms_finish_flush_reload(
-		$quad->node1, $dirty_requester_log_offset, $dirty_requester_lms_workers, 'false', '', 15);
+		$quad->node1, $dirty_requester_log_offset, $dirty_requester_lms_workers,
+		'false', 'cluster-pcm-x-retain-flush-error:none:0', '', 15);
 ok($dirty_requester_reset_ready,
 	'L2F every node1 DATA worker applied the transfer-boundary diagnostic disarm')
 	or diag("L2F requester DATA-worker reset log=[$dirty_requester_reset_log]");
@@ -1238,99 +1259,5 @@ is($sum_v, "$expected_sum",
 	'L4 aggregate value equals total committed pgbench transactions')
 	or diag("L4 expected_sum=$expected_sum stderr=[$sum_err]");
 
-# The destructive leg is deliberately last: its expected outcome is a
-# fail-closed runtime, so no later assertion may depend on ACTIVE or drained
-# gauges.  GUC+reload is required because injection state is process-local;
-# the DATA worker, not this SQL backend, executes the finish boundary.
-ok(write_retry($quad->node0,
-	q{INSERT INTO pcm_xq_flush_error(id, v) VALUES (1, 0)}),
-	'L5F seeded the direct-X target page');
-ok(write_retry($quad->node0, 'VACUUM pcm_xq_flush_error'),
-	'L5F published target-page free space before the direct-X request');
-ok(write_retry($quad->node0, 'CHECKPOINT'),
-	'L5F checkpointed before the destructive finish-Flush test');
-my $flush_error_relfilenode = $quad->node0->safe_psql('postgres',
-	q{SELECT pg_relation_filenode('pcm_xq_flush_error'::regclass)}) + 0;
-my ($pre_fault_drained, $pre_fault_debt)
-	= wait_for_resource_x_protocol_quiescence($quad, 30);
-unless ($pre_fault_drained)
-{
-	for my $i (0 .. 3)
-	{
-		diag("L5F pre-fault node$i debt="
-			. join(',', map { "$_=$pre_fault_debt->[$i]{$_}" }
-				sort keys %{$pre_fault_debt->[$i]}));
-	}
-	die "L5F cannot arm a destructive injection over prior protocol debt\n";
-}
-my $flush_error_log_offset = (-s $quad->node0->logfile) // 0;
-
-$quad->node0->safe_psql('postgres', q{
-	ALTER SYSTEM SET cluster.injection_points =
-		'cluster-pcm-x-retain-flush-error:skipn:1';
-	SELECT pg_reload_conf()
-});
-my ($flush_error_reload_ready, $flush_error_reload_log)
-	= wait_for_lms_finish_flush_reload(
-		$quad->node0, $flush_error_log_offset, $dirty_lms_workers, 'true',
-		'cluster-pcm-x-retain-flush-error:skipn:1', 15);
-ok($flush_error_reload_ready,
-	'L5F every node0 DATA worker applied the one-shot finish-Flush fault arm')
-	or diag("L5F DATA-worker reload log=[$flush_error_reload_log]");
-
-my ($flush_seed_rc, $flush_seed_out, $flush_seed_err) = $quad->node0->psql(
-	'postgres', q{UPDATE pcm_xq_flush_error SET v = 1 WHERE id = 1}, timeout => 30);
-is($flush_seed_rc, 0, 'L5F node0 created the destructive-leg X source')
-	or diag("L5F seed stdout=[$flush_seed_out] stderr=[$flush_seed_err]");
-my ($flush_error_rc, $flush_error_out, $flush_error_err) = $quad->node1->psql(
-	'postgres', q{
-		SET statement_timeout = '5s';
-		INSERT INTO pcm_xq_flush_error(id, v) VALUES (2, 1)
-	}, timeout => 30);
-isnt($flush_error_rc, 0,
-	'L5F remote writer failed when finish FlushBuffer raised the injected ERROR')
-	or diag("L5F unexpected success stdout=[$flush_error_out] stderr=[$flush_error_err]");
-
-my ($flush_error_log, $flush_error_fail_closed, $flush_error_finish_exact);
-my $flush_error_deadline = time() + 15;
-while (1)
-{
-	$flush_error_log = substr(slurp_file($quad->node0->logfile),
-		$flush_error_log_offset);
-	$flush_error_fail_closed = $flush_error_log =~
-		/cluster PCM-X runtime fail-closed \(recovery blocked\)/;
-	$flush_error_finish_exact = $flush_error_log =~
-		/Resource-X type-17 finish diagnostic\n[^\n]*DETAIL:\s+result=5 [^\n]*tagless=true/;
-	last if $flush_error_fail_closed && $flush_error_finish_exact;
-	last if time() >= $flush_error_deadline;
-	usleep(100_000);
-}
-
-is($quad->node0->safe_psql('postgres', 'SELECT 1'), '1',
-	'L5F node0 postmaster remained alive after the DATA-worker ERROR');
-ok($flush_error_fail_closed,
-	'L5F Resource-X gate moved to fail-closed recovery blocking');
-like($flush_error_log,
-	qr/Resource-X source finish FlushBuffer failed; preserved pending pair and blocked recovery/,
-	'L5F native source-finish boundary recorded the blocked recovery');
-ok($flush_error_finish_exact,
-	'L5F native type-17 finish retained exact fail-closed terminal state');
-like($flush_error_log,
-	qr/PCM-X Resource-X finish-error evidence exact.*?retained=true tag=\d+\/\d+\/\Q$flush_error_relfilenode\E\/0\/0 requester=1 assertion_sequence=\d+ base=\d+ formation=\d+ master_session=\d+ source_generation=\d+ reservation_token=\d+ source_state=\d+/s,
-	'L5F exact Resource-X pair remains pending after ERROR');
-unlike($flush_error_log,
-	qr/Resource-X source settlement ACK diagnostic/,
-	'L5F pending pair emitted no Resource-X source settlement ACK');
-like($flush_error_log,
-	qr/injected PCM-X retained-image FlushBuffer failure/,
-	'L5F exact pre-smgrwrite finish FlushBuffer ERROR reached the DATA worker');
-like($flush_error_log,
-	qr/cluster PCM-X runtime fail-closed \(recovery blocked\)/,
-	'L5F GCS finish catch preserved evidence and fused the runtime');
-
 $quad->stop_quad;
-my $flush_error_shutdown_log = substr(slurp_file($quad->node0->logfile),
-	$flush_error_log_offset);
-unlike($flush_error_shutdown_log, qr/lost track of buffer IO/,
-	'L5F absorbed FlushBuffer ERROR left no ResourceOwner BufferIO at shutdown');
 done_testing();

@@ -399,6 +399,51 @@ typedef struct ResourceXBootstrapRoundFailureSnapshot {
 StaticAssertDecl(sizeof(ResourceXBootstrapRoundFailureSnapshot) == 112,
 				 "ResourceXBootstrapRoundFailureSnapshot layout must remain 112 bytes");
 
+/* A24: process-local identity retained by one ordinary TARGET follower while
+ * the BufferDesc install and requester-round terminal publication cross
+ * separate lock domains.  This object is never shared, serialized, persisted,
+ * or interpreted as Resource-X authority. */
+typedef enum ResourceXTargetInstallFollowState {
+	RESOURCE_X_TARGET_INSTALL_INVALID = 0,
+	RESOURCE_X_TARGET_INSTALL_INFLIGHT,
+	RESOURCE_X_TARGET_INSTALL_TERMINAL,
+	RESOURCE_X_TARGET_INSTALL_STALE,
+	RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED,
+	RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY,
+	/* The BufferDesc projection changed while the entry result was sampled.
+	 * This is a zero-authority instruction to retry under the original
+	 * caller deadline, not an accepted Resource-X state. */
+	RESOURCE_X_TARGET_INSTALL_RESAMPLE
+} ResourceXTargetInstallFollowState;
+
+#define RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN UINT8_C(0x01)
+#define RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK \
+	RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN
+
+typedef struct ResourceXTargetInstallContinuation {
+	BufferTag resource;
+	int32 requester_node;
+	int32 master_node;
+	uint64 entry_binding_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 r4_record_generation;
+	uint64 acquisition_generation;
+	uint64 accepted_base_authority_generation;
+	uint64 round_absolute_deadline_us;
+	uint64 caller_absolute_deadline_us;
+	uint64 retry_slice_us;
+	uint64 pending_ownership_generation;
+	uint64 expected_x_ownership_generation;
+	uint64 reservation_token;
+	uint64 direct_init_ownership_generation;
+	uint64 direct_init_reservation_token;
+	uint32 requester_sender_connection_generation;
+	uint32 master_ingress_connection_generation;
+	uint8 capture_flags;
+	bool valid;
+} ResourceXTargetInstallContinuation;
+
 typedef enum ResourceXExecutorProbeResult {
 	RESOURCE_X_EXECUTOR_READY = 0,
 	RESOURCE_X_EXECUTOR_COMPLETE,
@@ -1197,15 +1242,25 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
 	uint32 master_ingress_connection_generation,
 	uint64 retry_slice_us,
 	const struct ClusterPcmOwnSnapshot *observed);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+extern ResourceXTargetInstallFollowState
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node,
 	uint64 resource_formation, uint64 master_session_incarnation,
 	uint64 r4_record_generation,
 	uint32 requester_sender_connection_generation,
 	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us,
 	const struct ClusterPcmOwnSnapshot *observed,
+	ResourceXTargetInstallContinuation *continuation_out);
+extern ResourceXTargetInstallFollowState
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	const struct ClusterPcmOwnSnapshot *observed,
+	ResourceXAcquisitionRef *terminal_ref_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+	const ResourceXTargetInstallContinuation *continuation,
+	ResourceXTargetInstallFollowState expected_follow_state,
 	long timeout_ms);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(

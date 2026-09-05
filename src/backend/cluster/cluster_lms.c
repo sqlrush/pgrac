@@ -950,24 +950,52 @@ lms_sigusr1_handler(SIGNAL_ARGS)
 }
 
 /* Report when this DATA worker has applied the process-local finish-Flush
- * injection state.  The transition log is the reload acknowledgement used by
- * t/400; without it, a fixed sleep can race a worker that has not processed
- * SIGHUP yet and turn a fault-injection leg into a false negative. */
+ * injection state.  The transition log is the exact reload acknowledgement
+ * used by t/400 L2F and t/406; without it, a fixed sleep can race a worker
+ * that has not processed SIGHUP yet and turn a fault-injection leg into a
+ * false negative. */
 static void
 lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 {
+#ifdef ENABLE_INJECTION
+	static bool initialized = false;
 	static bool was_armed = false;
+	static char *was_value = NULL;
+	static char *was_target = NULL;
+	const char *value;
+	const char *target;
+	char *next_value;
+	char *next_target;
 	bool armed;
 
 	armed = cluster_injection_is_armed("cluster-pcm-x-retain-flush-error");
-	if (!armed && !was_armed)
+	value = cluster_injection_points != NULL ? cluster_injection_points : "";
+	target = cluster_pcm_x_retain_flush_error_target != NULL
+		? cluster_pcm_x_retain_flush_error_target
+		: "";
+	if (initialized && armed == was_armed && strcmp(value, was_value) == 0 &&
+		strcmp(target, was_target) == 0)
 		return;
 	ereport(LOG,
 			(errmsg_internal("cluster_lms: DATA worker=%d applied PCM-X finish Flush "
-							 "injection config: pid=%d armed=%s value=\"%s\"",
+							 "injection config: pid=%d armed=%s value=\"%s\" "
+							 "target=\"%s\"",
 							 worker_id, (int)MyProcPid, armed ? "true" : "false",
-							 cluster_injection_points != NULL ? cluster_injection_points : "")));
+							 value, target)));
+
+	next_value = MemoryContextStrdup(TopMemoryContext, value);
+	next_target = MemoryContextStrdup(TopMemoryContext, target);
+	if (was_value != NULL)
+		pfree(was_value);
+	if (was_target != NULL)
+		pfree(was_target);
+	was_value = next_value;
+	was_target = next_target;
 	was_armed = armed;
+	initialized = true;
+#else
+	(void) worker_id;
+#endif
 }
 
 

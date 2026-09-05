@@ -49,8 +49,10 @@
 #include <stdarg.h>
 #include <sys/un.h>
 
+#include "common/relpath.h"
 #include "cluster/cluster_conf.h" /* ClusterConf type for the D2b latch stub */
 #include "cluster/cluster_guc.h"
+#include "storage/block.h"
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -103,6 +105,35 @@ static const char *external_fence_socket_boot_value = NULL;
 static GucContext external_fence_socket_context = PGC_INTERNAL;
 static int external_fence_socket_flags = 0;
 static GucStringCheckHook external_fence_socket_check_hook = NULL;
+#ifdef ENABLE_INJECTION
+static char **pcm_x_retain_flush_error_target_value_addr = NULL;
+static const char *pcm_x_retain_flush_error_target_boot_value = NULL;
+static GucContext pcm_x_retain_flush_error_target_context = PGC_INTERNAL;
+static int pcm_x_retain_flush_error_target_flags = 0;
+static GucStringCheckHook pcm_x_retain_flush_error_target_check_hook = NULL;
+static GucStringAssignHook pcm_x_retain_flush_error_target_assign_hook = NULL;
+
+/* The weak definitions let the pre-implementation binary report a clean RED
+ * for the missing injection-only symbols instead of failing at link time.
+ * The real cluster_guc object replaces both definitions once D3 lands. */
+char *cluster_pcm_x_retain_flush_error_target __attribute__((weak)) = NULL;
+extern bool cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid,
+														 uint32 db_oid,
+														 uint32 rel_number,
+														 int fork_number,
+														 uint32 block_number)
+	__attribute__((weak));
+
+bool
+cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid pg_attribute_unused(),
+														 uint32 db_oid pg_attribute_unused(),
+														 uint32 rel_number pg_attribute_unused(),
+														 int fork_number pg_attribute_unused(),
+														 uint32 block_number pg_attribute_unused())
+{
+	return false;
+}
+#endif
 
 void
 DefineCustomIntVariable(const char *name,
@@ -179,6 +210,16 @@ DefineCustomStringVariable(
 		external_fence_socket_flags = flags;
 		external_fence_socket_check_hook = check_hook;
 	}
+#ifdef ENABLE_INJECTION
+	else if (strcmp(name, "cluster.pcm_x_retain_flush_error_target") == 0) {
+		pcm_x_retain_flush_error_target_value_addr = valueAddr;
+		pcm_x_retain_flush_error_target_boot_value = bootValue;
+		pcm_x_retain_flush_error_target_context = context;
+		pcm_x_retain_flush_error_target_flags = flags;
+		pcm_x_retain_flush_error_target_check_hook = check_hook;
+		pcm_x_retain_flush_error_target_assign_hook = assign_hook;
+	}
+#endif
 }
 
 static GucBoolCheckHook smart_fusion_check_hook = NULL;
@@ -209,6 +250,7 @@ DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_u
  * GUC_check_errdetail_string global) so cluster_guc.o links standalone
  * even though check_hooks are never invoked in this unit test. */
 char *GUC_check_errdetail_string = NULL;
+static int last_guc_check_errcode = 0;
 
 /*
  * spec-3.18 D2b:  cluster_undo_buffer_writeback_check_hook references
@@ -262,8 +304,16 @@ errdetail(const char *fmt pg_attribute_unused(), ...)
 }
 
 void
-GUC_check_errcode(int sqlerrcode pg_attribute_unused())
-{}
+GUC_check_errcode(int sqlerrcode)
+{
+	last_guc_check_errcode = sqlerrcode;
+}
+
+void *
+guc_malloc(int elevel pg_attribute_unused(), size_t size)
+{
+	return malloc(size);
+}
 
 void
 pre_format_elog_string(int errnum pg_attribute_unused(), const char *domain pg_attribute_unused())
@@ -530,10 +580,129 @@ UT_TEST(test_external_fence_guc_contract)
 }
 
 
+#ifdef ENABLE_INJECTION
+UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
+{
+	static const char *const invalid_targets[]
+		= { "0/5/12345/0/0",
+			"1663/0/12345/0/0",
+			"1663/5/0/0/0",
+			"1663/5/12345/0",
+			"1663//12345/0/0",
+			"1663/5//0/0",
+			"1663/5/12345//0",
+			"1663/5/12345/0/",
+			"1663/5/12345/0/0/1",
+			" 1663/5/12345/0/0",
+			"1663/5/12345/0/0 ",
+			"1663/ 5/12345/0/0",
+			"+1663/5/12345/0/0",
+			"-1663/5/12345/0/0",
+			"0x67f/5/12345/0/0",
+			"1663/5/12x45/0/0",
+			"1663/5/12345/0/0suffix",
+			"1663/5/12345/0/0\n",
+			"4294967296/5/12345/0/0",
+			"1663/4294967296/12345/0/0",
+			"1663/5/4294967296/0/0",
+			"1663/5/12345/4/0",
+			"1663/5/12345/0/4294967295" };
+	char *value;
+	void *extra;
+	int i;
+
+	pcm_x_retain_flush_error_target_value_addr = NULL;
+	pcm_x_retain_flush_error_target_boot_value = NULL;
+	pcm_x_retain_flush_error_target_context = PGC_INTERNAL;
+	pcm_x_retain_flush_error_target_flags = 0;
+	pcm_x_retain_flush_error_target_check_hook = NULL;
+	pcm_x_retain_flush_error_target_assign_hook = NULL;
+	cluster_init_guc();
+
+	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_value_addr);
+	UT_ASSERT_NOT_NULL((void *) &cluster_pcm_x_retain_flush_error_target);
+	if (&cluster_pcm_x_retain_flush_error_target != NULL)
+		UT_ASSERT_EQ(pcm_x_retain_flush_error_target_value_addr ==
+						 &cluster_pcm_x_retain_flush_error_target, true);
+	UT_ASSERT_STR_EQ(pcm_x_retain_flush_error_target_boot_value, "");
+	UT_ASSERT_EQ(pcm_x_retain_flush_error_target_context, PGC_SUSET);
+	UT_ASSERT_EQ(pcm_x_retain_flush_error_target_flags, GUC_NOT_IN_SAMPLE);
+	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_check_hook);
+	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_assign_hook);
+	UT_ASSERT_NOT_NULL((void *) cluster_pcm_x_retain_flush_error_target_matches);
+	if (pcm_x_retain_flush_error_target_check_hook == NULL ||
+		pcm_x_retain_flush_error_target_assign_hook == NULL ||
+		cluster_pcm_x_retain_flush_error_target_matches == NULL)
+		return;
+
+	/* Empty is a valid assignment with a distinct match-none parse result. */
+	value = "";
+	extra = NULL;
+	UT_ASSERT(pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+	UT_ASSERT_NOT_NULL(extra);
+	if (extra != NULL) {
+		pcm_x_retain_flush_error_target_assign_hook(value, extra);
+		free(extra);
+	}
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 0));
+
+	/* Canonical input matches all five fields and rejects each independent
+	 * identity mismatch. */
+	value = "1663/5/12345/0/0";
+	extra = NULL;
+	UT_ASSERT(pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+	UT_ASSERT_NOT_NULL(extra);
+	if (extra != NULL) {
+		pcm_x_retain_flush_error_target_assign_hook(value, extra);
+		free(extra);
+	}
+	UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1664, 5, 12345, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 6, 12345, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12346, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 1, 0));
+	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 1));
+
+	/* The greatest legal components survive parsing without narrowing. */
+	value = "4294967295/4294967295/4294967295/3/4294967294";
+	extra = NULL;
+	UT_ASSERT(pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+	UT_ASSERT_NOT_NULL(extra);
+	if (extra != NULL) {
+		pcm_x_retain_flush_error_target_assign_hook(value, extra);
+		free(extra);
+	}
+	UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(
+		UINT32_MAX, UINT32_MAX, UINT32_MAX, MAX_FORKNUM, InvalidBlockNumber - 1));
+
+	/* Restore the canonical value.  Every rejected check leaves this assigned
+	 * parse untouched because the assign hook is never called. */
+	value = "1663/5/12345/0/0";
+	extra = NULL;
+	UT_ASSERT(pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+	if (extra != NULL) {
+		pcm_x_retain_flush_error_target_assign_hook(value, extra);
+		free(extra);
+	}
+	for (i = 0; i < lengthof(invalid_targets); i++) {
+		value = (char *) invalid_targets[i];
+		extra = NULL;
+		last_guc_check_errcode = 0;
+		UT_ASSERT(!pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+		UT_ASSERT_EQ(last_guc_check_errcode, ERRCODE_INVALID_PARAMETER_VALUE);
+		if (extra != NULL)
+			free(extra);
+		UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(
+			1663, 5, 12345, 0, 0));
+	}
+}
+#endif
+
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
@@ -542,6 +711,9 @@ main(void)
 	UT_RUN(test_undo_buffers_guc_describes_both_r4a_banks_and_inactive_zero);
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
 	UT_RUN(test_external_fence_guc_contract);
+#ifdef ENABLE_INJECTION
+	UT_RUN(test_pcm_x_retain_flush_error_target_guc_contract);
+#endif
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

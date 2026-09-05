@@ -46,6 +46,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h" /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h"
@@ -860,10 +861,58 @@ UT_TEST(test_L9_unlock_without_prior_pcm_ownership_skips_release)
 	UT_ASSERT_EQ((int)cluster_pcm_lock_query(buf.tag), (int)PCM_LOCK_MODE_N);
 }
 
+UT_TEST(test_L10_read_image_is_neither_cached_cover_nor_write_authority)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmGrantBeginWaitReason reason;
+
+	memset(&live, 0, sizeof(live));
+	live.tag = make_tag(110);
+	live.generation = 9;
+	live.reservation_token = 11;
+	live.pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+	before = live;
+
+	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET, 2);
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
+		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
+		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET);
+	UT_ASSERT_EQ(memcmp(&live, &before, sizeof(live)), 0);
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, live.generation, live.generation,
+		live.pcm_state, live.flags, live.writer_activation_token,
+		live.resource_x_activation_generation));
+	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(
+		true, true, false, live.pcm_state, live.flags,
+		live.writer_activation_token,
+		live.resource_x_activation_generation));
+
+	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	reason = CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET;
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
+		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
+		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_NONE);
+	live = before;
+	live.generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
+		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
+		CLUSTER_PCM_OWN_EXHAUSTED);
+	live = before;
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
+		&live, BM_VALID | BM_IO_IN_PROGRESS,
+		(uint8)BUF_TYPE_CURRENT, &reason), CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
+		&live, BM_VALID, (uint8)BUF_TYPE_PI, &reason),
+		CLUSTER_PCM_OWN_CORRUPT);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_L1_is_active_triple_gate_truth_table);
 	UT_RUN(test_L2_pcm_acquired_before_lwlock);
 	UT_RUN(test_L3_lwlock_released_before_pcm);
@@ -873,6 +922,7 @@ main(void)
 	UT_RUN(test_L7_cluster_enabled_false_skips_hook);
 	UT_RUN(test_L8_max_entries_zero_skips_hook);
 	UT_RUN(test_L9_unlock_without_prior_pcm_ownership_skips_release);
+	UT_RUN(test_L10_read_image_is_neither_cached_cover_nor_write_authority);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

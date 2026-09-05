@@ -1,10 +1,11 @@
-# t/429、t/430 与 t/400 四节点验证指南
+# t/429、t/430、t/400 与 t/406 四节点验证指南
 
-本文说明三项 PGRAC TAP 测试分别验证什么、如何运行，以及失败时应查看哪一层证据：
+本文说明四项 PGRAC TAP 测试分别验证什么、如何运行，以及失败时应查看哪一层证据：
 
 - `t/429`：测试如何可靠地启动、停止和清理测试集群；
 - `t/430`：测试资源数量增大后能否回收并复用 PCM/GRD 目录；
-- `t/400`：测试四个节点竞争同一数据块时 Resource-X 与事务结果是否正确。
+- `t/400`：测试四个节点竞争同一数据块时 Resource-X 与事务结果是否正确；
+- `t/406`：隔离验证精确 retained source finish-Flush 错误的 fail-closed 行为。
 
 > 运行命令要求当前源码版本已经包含对应 TAP 文件。若某个文件不存在，请使用包含该测试的源码版本。
 
@@ -14,8 +15,9 @@
 flowchart LR
     U[Focused unit tests] --> T429[t/429<br/>测试基板生命周期]
     T429 --> T430[t/430<br/>宽资源集合回收复用]
-    T430 --> T400[t/400<br/>热块四节点正确性]
-    T400 --> PERF[四节点性能测试]
+    T430 --> T400[t/400<br/>热块四节点正向正确性]
+    T400 --> T406[t/406<br/>精确 finish-error 负向证据]
+    T406 --> PERF[四节点性能测试]
 ```
 
 | 测试 | 是否启动真实四节点 | 工作负载 | 主要结论 |
@@ -23,6 +25,7 @@ flowchart LR
 | `t/429_clusterquad_two_stage_lifecycle.pl` | 否，主要使用 mock | 无 SQL 负载 | harness 的启动、停机、设备与清理规则正确 |
 | `t/430_pcm_grd_resource_reuse_4node.pl` | 是 | 512 个分散页面的点更新 | PCM/GRD entry 能够 terminal、retire、reuse |
 | `t/400_pcm_x_queue_4node_liveness.pl` | 是 | 四节点同时更新同一 heap block | Resource-X 授权、块传输、安装与事务守恒正确 |
+| `t/406_resource_x_finish_flush_failclosed_4node.pl` | 是 | decoy 后对精确 BufferTag 注入 retained finish-Flush ERROR | 非目标不消费 one-shot；目标保留 pending pair、无精确 ACK 并 fail closed |
 
 断言数量不能直接比较测试强弱。`t/429` 即使有大量断言，也主要验证 harness；它不能代替真实四节点测试。
 
@@ -214,26 +217,28 @@ flowchart LR
 
 四个 writer 修改不同逻辑行，但它们共享同一个物理块，因此会触发真实的全局块状态转换和 Cache Fusion 传输。
 
-### 4.2 236 项测试责任
+### 4.2 测试责任
 
 | 阶段 | 验证内容 |
 |---|---|
 | L1 | 四节点 alive、peer mesh、quorum、xid stripe、R4/Resource-X OPEN |
 | L2 | 四节点关系路径一致，四 tuple 位于同一 BufferTag |
 | L2S | requester 已持唯一 S 时完成 Resource-X S→X 转换 |
-| L2F | dirty X source 完成物理 flush，并由远端 requester 安装正确页面 |
+| L2F | dirty X source 正向完成物理 flush，并由远端 requester 安装正确页面 |
 | L3 workload | 四个 pgbench writer 在 hard deadline 内零错误并持续提交 |
 | L3 transfer | kind-9、holder transition、image、grant、remote install 和 settlement 正向发生 |
 | L3 drain | GCS request slot、WFG edge、transport 和 terminal participant 全部闭合 |
 | L3 source removal | 旧 ticket/wire/worker/build/source 路径保持不可达 |
 | L4 | 每行 value 等于对应 writer 的提交数，聚合值等于总提交数 |
-| L5F | 注入 source-finish 错误后保持 fail-closed，postmaster 存活且不错误结算 |
+
+破坏性的 source-finish ERROR 不再属于 t/400；它由独立 t/406 验证，避免把合法的异步终态工作误当作 t/400 的全局清零前置条件。
 
 ### 4.3 运行命令
 
 ```bash
 cd src/test/cluster_tap
-make check PROVE_TESTS=t/400_pcm_x_queue_4node_liveness.pl
+PGRAC_STAGE8_HAPPY_PATH_ONLY=1 \
+  make check PROVE_TESTS=t/400_pcm_x_queue_4node_liveness.pl
 ```
 
 ### 4.4 t/400 不是性能测试
@@ -246,20 +251,35 @@ t/400 GREEN
   ≠ 最终性能达标
 ```
 
-性能测试应在 t/400 通过后，使用固定四节点并逐步增加每节点持久连接数。
+性能测试应在 t/400 正向门和独立 t/406 负向门都通过后，使用全新的固定四节点集群并逐步增加每节点持久连接数。
 
-## 5. 三项测试的故障定位表
+## 5. t/406：精确 retained finish-error 负向验证
+
+t/406 先让非目标 decoy 完成一次原生 type-17 transfer，证明它到达同一 DATA worker 且没有消费 one-shot；随后仅对 catalog 解析出的目标 BufferTag 在 `smgrwrite` 前注入 ERROR。
+
+通过条件包括：decoy 正常完成并产生 PI write；目标 writer 失败；精确 pending pair 保留；失败 assertion 没有 settlement ACK；Resource-X runtime fail closed；postmaster 仍可响应诊断查询；正常停机没有遗留 BufferIO owner。
+
+```bash
+cd src/test/cluster_tap
+PGRAC_STAGE8_HAPPY_PATH_ONLY=1 \
+  make check PROVE_TESTS=t/406_resource_x_finish_flush_failclosed_4node.pl
+```
+
+t/406 GREEN 是故障极性与清理证据，不是性能结果。它使用独立新集群；fail-closed 后不得复用该运行时继续正向测试。
+
+## 6. 四项测试的故障定位表
 
 | 现象 | 首先检查 | 不应首先修改 |
 |---|---|---|
 | 0 subtests、device gate 失败 | t/429 lifecycle、helper、device 与 cleanup evidence | Resource-X workload |
 | 128 entries 后 NO_CAPACITY | t/430 reclaim/reuse 与 terminal debt | t/400 判官 |
 | 四 writer 卡在 grant/install | t/400 Resource-X transfer/settlement | 增大目录容量 |
+| t/406 decoy 触发错误或目标出现同 assertion ACK | 精确 target matcher、attempt identity 与 retained pair | 放宽负向断言或延长超时 |
 | 测试退出仍有 loop/FD | t/429 cleanup/reaper | 延长 SQL timeout |
 | 数据值与提交数不同 | t/400 L4 conservation | counter 白名单 |
 | 数据正确但 debt 非零 | terminal owner、settlement、WFG drain | 忽略 drain |
 
-## 6. 推荐执行顺序
+## 7. 推荐执行顺序
 
 ```text
 focused unit tests
@@ -267,6 +287,7 @@ focused unit tests
   → t/429 lifecycle
   → fresh two-stage t/430
   → unchanged t/400
+  → fresh t/406 exact finish-error
   → four-node performance baseline
 ```
 
@@ -274,11 +295,13 @@ focused unit tests
 
 - t/429 未通过，不运行 t/430；
 - t/430 未完整通过，不运行 t/400；
+- t/400 未完整通过，不运行 t/406 或 PRE；
+- t/406 的 fail-closed 集群只用于收集负向证据，结束后必须新建 PRE 集群；
 - 新的 fresh attempt 必须保留之前的失败证据；
 - 不修改 workload、判官、timeout、skip 或容量来制造绿色；
 - 每次运行后检查零残留 postmaster、FD、loop mapping 和未处理 cleanup manifest。
 
-## 7. 结果记录建议
+## 8. 结果记录建议
 
 每次真实四节点测试至少保留：
 
@@ -295,16 +318,18 @@ focused unit tests
 
 只有 TAP 全绿、数据守恒、协议债务闭合且 cleanup 完成，才能把该次 attempt 记录为有效 GREEN。
 
-## 8. 一句话记忆
+## 9. 一句话记忆
 
 ```text
 t/429：harness lifecycle
 t/430：resource lifecycle
 t/400：contended-block protocol
+t/406：exact finish-error containment
 ```
 
 中文可以记成：
 
 - t/429：测试“怎么可靠地启动和清理测试集群”；
 - t/430：测试“资源多起来以后能不能回收复用”；
-- t/400：测试“四节点抢同一资源时协议是否正确”。
+- t/400：测试“四节点抢同一资源时正向协议是否正确”；
+- t/406：测试“精确 source-finish 失败时是否保留证据并安全关闭”。

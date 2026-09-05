@@ -95,6 +95,14 @@ class R11SourceRemovalCensusTests(unittest.TestCase):
         path = self.mutated_manifest(mutate)
         self.assertNotEqual(self.run_tool(path).returncode, 0)
 
+    def test_current_product_snapshot_identity_is_exact(self) -> None:
+        path = self.mutated_manifest(
+            lambda value: value["current_product_snapshot"].__setitem__(
+                "sha256", "0" * 64
+            )
+        )
+        self.assertNotEqual(self.run_tool(path).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

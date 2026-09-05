@@ -2674,6 +2674,7 @@ test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O
 		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
 		-DLMS_OUTBOUND_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c"' \
 		-DT400_SOURCE_PATH='"$(top_srcdir)/src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl"' \
+		-DT406_SOURCE_PATH='"$(top_srcdir)/src/test/cluster_tap/t/406_resource_x_finish_flush_failclosed_4node.pl"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_RETRY_O) \

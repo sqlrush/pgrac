@@ -107,7 +107,7 @@ PGRAC 的公开三节点竞态测试覆盖冲突更新、拒绝重试、LMS 扰�
 - 请求失败后 pending/reservation 可以精确清理；
 - 数据读回最终一致，且没有隐藏的 checksum rejection。
 
-代表性测试：[`t/390_gcs_block_race_convergence_3node.pl`](../../../src/test/cluster_tap/t/390_gcs_block_race_convergence_3node.pl)、[`t/397_pcm_ownership_convergence_2node.pl`](../../../src/test/cluster_tap/t/397_pcm_ownership_convergence_2node.pl)、[`t/400_pcm_x_queue_4node_liveness.pl`](../../../src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl)。其中 fault injection 是否实际启用要以每条 TAP 的运行条件为准。
+代表性测试：[`t/390_gcs_block_race_convergence_3node.pl`](../../../src/test/cluster_tap/t/390_gcs_block_race_convergence_3node.pl)、[`t/397_pcm_ownership_convergence_2node.pl`](../../../src/test/cluster_tap/t/397_pcm_ownership_convergence_2node.pl)、[`t/400_pcm_x_queue_4node_liveness.pl`](../../../src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl) 和 [`t/406_resource_x_finish_flush_failclosed_4node.pl`](../../../src/test/cluster_tap/t/406_resource_x_finish_flush_failclosed_4node.pl)。t/400 是 retained finish-Flush 的四节点正向证据；t/406 使用精确 BufferTag 和非目标 decoy，隔离验证 pre-`smgrwrite` ERROR 的 pending-pair、无同 attempt ACK、fail-closed 与 BufferIO 清理。其他 fault injection 是否实际启用仍以每条 TAP 的运行条件为准。
 
 ## RDMA 与 TCP fallback
 

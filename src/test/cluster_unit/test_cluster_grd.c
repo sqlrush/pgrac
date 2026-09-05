@@ -856,6 +856,10 @@ static UtWfgEdge ut_wfg[UT_WFG_MAX];
 static int ut_wfg_n = 0;
 static bool ut_wfg_throw_on_submit_once = false;
 static bool ut_wfg_throw_on_cancel_once = false;
+static bool ut_wfg_release_holder_on_submit_once = false;
+static ClusterResId ut_wfg_release_resid;
+static ClusterGrdHolderId ut_wfg_release_holder;
+static int ut_wfg_release_granted = 0;
 
 static void
 ut_wfg_reset(void)
@@ -863,6 +867,10 @@ ut_wfg_reset(void)
 	ut_wfg_n = 0;
 	ut_wfg_throw_on_submit_once = false;
 	ut_wfg_throw_on_cancel_once = false;
+	ut_wfg_release_holder_on_submit_once = false;
+	memset(&ut_wfg_release_resid, 0, sizeof(ut_wfg_release_resid));
+	memset(&ut_wfg_release_holder, 0, sizeof(ut_wfg_release_holder));
+	ut_wfg_release_granted = 0;
 	memset(ut_wfg, 0, sizeof(ut_wfg));
 }
 
@@ -880,6 +888,19 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter, const ClusterL
 								  uint64 request_id pg_attribute_unused())
 {
 	int i;
+
+	/* A26 deterministic race hook: while an outer resync is publishing the
+	 * edge copied from generation G, let the holder release and grant this
+	 * waiter.  The nested resync projects G+1 before the outer stale submit
+	 * resumes. */
+	if (ut_wfg_release_holder_on_submit_once) {
+		ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+
+		ut_wfg_release_holder_on_submit_once = false;
+		ut_wfg_release_granted
+			= cluster_grd_release_and_drain(&ut_wfg_release_resid, &ut_wfg_release_holder,
+										granted, lengthof(granted));
+	}
 
 	if (ut_wfg_throw_on_submit_once) {
 		ut_wfg_throw_on_submit_once = false;
@@ -3850,6 +3871,44 @@ UT_TEST(test_5_8_d1b_u2d_cancel_removes_waiter_edges)
 	convert_teardown();
 }
 
+/* A26 — a resync that copied generation G must not publish a retained edge
+ * after a concurrent release/drain has already granted the waiter and
+ * projected G+1.  This is the deterministic form of the r117/r118 four-node
+ * residue (waiter request 306 -> departed holder request 305). */
+UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5805, &resid);
+
+	h = bast_holder(3, 482, 305);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 305, 0,
+											 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	ut_wfg_release_resid = resid;
+	ut_wfg_release_holder = h;
+	ut_wfg_release_holder_on_submit_once = true;
+	h = bast_holder(3, 543, 306);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 306, 0,
+											 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	UT_ASSERT(!ut_wfg_release_holder_on_submit_once);
+	UT_ASSERT_EQ(ut_wfg_release_granted, 1);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 543, 0, 306), 0);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
 UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 {
 	int saved_node = cluster_node_id;
@@ -5235,7 +5294,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(99);
+	UT_PLAN(100);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5319,6 +5378,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_8_d1b_u2b_refresh_follows_current_holders);
 	UT_RUN(test_5_8_d1b_u2c_convert_enqueue_registers_edge);
 	UT_RUN(test_5_8_d1b_u2d_cancel_removes_waiter_edges);
+	UT_RUN(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race);
 	UT_RUN(test_grd_pin_cleanup_on_lmd_submit_error);
 
 	/* spec-5.8 D1c — waiter xid threaded into the WFG vertex (U3a-b). */

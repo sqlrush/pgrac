@@ -112,7 +112,8 @@ Resource-X 将逐步替代旧 PCM-X 的 ticket 型正常路径。阅读代码时
 - [`cluster_gcs_block.c`](../../../src/backend/cluster/cluster_gcs_block.c)：GCS block 请求、formation tick、master/requester 驱动与 interconnect 接线。
 - [`cluster_pcm_lock.c`](../../../src/backend/cluster/cluster_pcm_lock.c)：块级本地/全局 PCM 状态。
 - [`bufmgr.c`](../../../src/backend/storage/buffer/bufmgr.c)：PostgreSQL buffer content lock、dirty 发布与当前 PCM-X 接入点。
-- [`t/400_pcm_x_queue_4node_liveness.pl`](../../../src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl)：四节点 PCM-X queue/liveness 基线。
+- [`t/400_pcm_x_queue_4node_liveness.pl`](../../../src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl)：四节点普通更新、Resource-X transfer/settlement 与 retained finish-Flush 正向基线。
+- [`t/406_resource_x_finish_flush_failclosed_4node.pl`](../../../src/test/cluster_tap/t/406_resource_x_finish_flush_failclosed_4node.pl)：精确 retained source finish-Flush ERROR 的 pending-pair、同 attempt 无 ACK、fail-closed 与清理负向证据。
 
 ## Oracle 官方入口
 

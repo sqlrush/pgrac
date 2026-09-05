@@ -139,22 +139,19 @@ typedef enum {
 	/*
 	 * PGRAC: spec-5.2 §3.5 D11 and current-read requalification.
 	 * Transient BufferDesc.pcm_state marker (NOT a PCM lock mode, never
-	 * carried on the wire / GRD): this backend installed a remote X holder's
-	 * READ-IMAGE without receiving a durable grant.  This is legal either for
-	 * a one-shot SHARE current read or for an OWN write request whose holder
-	 * deferred writer transfer because it still has an uncommitted ITL slot.
+	 * carried on the wire / GRD): this node installed a remote X holder's
+	 * READ-IMAGE without receiving a durable grant and exactly one local
+	 * one-shot SHARE content bracket may consume it. LockBuffer/bufmgr is the
+	 * sole publisher; GCS byte installation never assigns this state. While
+	 * live it is a node-wide admission barrier, not a backend-private hint.
 	 * The backend holds NO PCM lock — for ownership, covering, the
 	 * re-declare scan, and eviction this state behaves exactly like
 	 * PCM_STATE_N (cluster_pcm_mode_covers + the scan already treat any
 	 * non-{S,X} value as "no lock", and the content-lock unlock hook clears
 	 * it back to N before releasing content).  Read-only HOT/latest-TID may
 	 * use it only as bracket-local evidence and must fetch a fresh bracket
-	 * after an unlocked wait.  For writes, the cluster_itl forward-write path
-	 * fails closed (53R9H, retryable) rather than mutate a non-owned copy
-	 * (Rule 8.A).  The contended-row writer waits in the heap AM and
-	 * re-acquires real X (overwriting this marker) before it ever writes;
-	 * only a writer whose own target row was NOT contended reaches the guard
-	 * with this marker still set.
+	 * after an unlocked wait. It never authorizes a write; writers must reach
+	 * exact terminal Resource-X plus real PCM X before mutation (Rule 8.A).
 	 */
 	PCM_STATE_READ_IMAGE = 3
 } PcmState;

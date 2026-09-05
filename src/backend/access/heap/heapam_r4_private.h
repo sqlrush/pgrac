@@ -117,6 +117,15 @@ typedef enum ClusterHeapMultiInsertRoute
 	CLUSTER_HEAP_MULTI_INSERT_RECEIPT_SAFE_PER_TUPLE
 } ClusterHeapMultiInsertRoute;
 
+/* A27: capacity is not boolean.  An exact Resource-X successor lifecycle is
+ * caller-owned requalification; only unknown/invalid evidence is refusal. */
+typedef enum ClusterHeapItlCapacityResult
+{
+	CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED = 0,
+	CLUSTER_HEAP_ITL_CAPACITY_READY,
+	CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
+} ClusterHeapItlCapacityResult;
+
 /* PK IndexScan companion; public heap_hot_search_buffer() remains unchanged. */
 extern HeapHotSearchResultKind heap_hot_search_buffer_result(
 	ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot,
@@ -150,6 +159,8 @@ extern TableIndexFetchTupleResult cluster_heap_test_r4_index_hot_result(
 	bool *call_again, bool *all_dead);
 extern bool cluster_heap_test_itl_alloc_with_terminal_census(
 	Buffer buffer, TransactionId xid, bool lock_only, uint8 *slot_index_out);
+extern ClusterHeapItlCapacityResult cluster_heap_test_itl_capacity_outcome(
+	Buffer buffer, TransactionId xid, bool lock_only);
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
 extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);

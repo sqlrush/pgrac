@@ -3669,14 +3669,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				/* spec-5.14 D2 class 2: depend on the X holder that shipped this image. */
 				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
 										final_forwarding_master);
-				/* spec-5.2 §3.5 D11: a read-image returned for a WRITE request
-				 * (N->X / S->X) means the master/holder deferred the
-				 * writer-transfer because it still holds an uncommitted ITL
-				 * slot.  Mark the buffer so a write that does not first
-				 * re-acquire X fails closed in cluster_itl (Rule 8.A); a plain
-				 * read (N->S, D2) leaves pcm_state = N. */
-				if (transition_id == PCM_TRANS_N_TO_X || transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-					buf->pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+				/* A non-durable WRITE reply remains N and returns false below.
+				 * GCS installs bytes but publishes no shared ownership marker;
+				 * the target-only Resource-X owner must retry/fail closed before
+				 * any write. LockBuffer is the sole READ_IMAGE publisher, and
+				 * only for its one-shot SHARE bracket. */
 				read_image = true;
 				break;
 			}
@@ -6105,12 +6102,9 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 											  (XLogRecPtr)slot->reply_header.page_lsn, slot);
 				/* spec-5.14 D2 class 2: consumed the remote holder's deferred-writer image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-				/* spec-5.2 §3.5 D11: mark this buffer a deferred-writer
-				 * read-image so a write that does NOT first re-acquire X (the
-				 * non-contended-row case) fails closed in cluster_itl rather
-				 * than mutate a non-owned copy (Rule 8.A).  Cleared to N on
-				 * content-lock unlock / overwritten by X on re-acquire. */
-				buf->pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+				/* This WRITE result is deliberately non-durable: keep PCM N and
+				 * let the target-only writer owner retry/fail closed. GCS may
+				 * install verified bytes but never publishes READ_IMAGE. */
 				read_image = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -12844,6 +12838,109 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 #endif
 }
 
+static ResourceXApplyResult
+gcs_block_resource_x_target_install_snapshot_result(
+	ClusterPcmOwnResult snapshot_result)
+{
+	if (snapshot_result == CLUSTER_PCM_OWN_OK)
+		return RESOURCE_X_APPLY_APPLIED;
+	if (snapshot_result == CLUSTER_PCM_OWN_BUSY)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (snapshot_result == CLUSTER_PCM_OWN_STALE)
+		return RESOURCE_X_APPLY_STALE;
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+/* Bracket the entry-locked continuation capture with two exact BufferDesc
+ * projections.  A changed B invalidates the raw E result and the candidate
+ * continuation before either can reach the caller. */
+static ResourceXApplyResult
+gcs_block_resource_x_target_install_capture_coherent(
+	BufferDesc *buf,
+	const ResourceXAssertion *assertion,
+	int32 current_master_node,
+	uint64 resource_formation,
+	uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us,
+	uint64 caller_absolute_deadline_us,
+	const ClusterPcmOwnSnapshot *before,
+	ResourceXTargetInstallFollowState *follow_state_out,
+	ResourceXTargetInstallContinuation *continuation_out)
+{
+	ClusterPcmOwnSnapshot after;
+	ClusterPcmOwnResult snapshot_result;
+	ResourceXTargetInstallContinuation candidate;
+	ResourceXTargetInstallFollowState raw_state;
+
+	if (follow_state_out != NULL)
+		*follow_state_out = RESOURCE_X_TARGET_INSTALL_INVALID;
+	if (continuation_out != NULL)
+		memset(continuation_out, 0, sizeof(*continuation_out));
+	if (buf == NULL || assertion == NULL || before == NULL
+		|| follow_state_out == NULL || continuation_out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&candidate, 0, sizeof(candidate));
+	raw_state
+		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			assertion, current_master_node, resource_formation,
+			master_session_incarnation, r4_record_generation,
+			requester_sender_connection_generation,
+			master_ingress_connection_generation, retry_slice_us,
+			caller_absolute_deadline_us, before, &candidate);
+	memset(&after, 0, sizeof(after));
+	snapshot_result = cluster_bufmgr_pcm_own_snapshot(buf, &after);
+	if (snapshot_result != CLUSTER_PCM_OWN_OK)
+		return gcs_block_resource_x_target_install_snapshot_result(
+			snapshot_result);
+	*follow_state_out
+		= cluster_pcm_x_target_install_follow_adjudicate_exact(
+			before, &after, raw_state, NULL, &candidate);
+	*continuation_out = candidate;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* The retained continuation already fixes E identity.  This wrapper brackets
+ * its raw entry classification with B and releases a terminal ref only after
+ * exact whole-snapshot equality. */
+static ResourceXApplyResult
+gcs_block_resource_x_target_install_classify_coherent(
+	BufferDesc *buf,
+	const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *before,
+	ResourceXTargetInstallFollowState *follow_state_out,
+	ResourceXAcquisitionRef *terminal_ref_out)
+{
+	ClusterPcmOwnSnapshot after;
+	ClusterPcmOwnResult snapshot_result;
+	ResourceXAcquisitionRef candidate_ref;
+	ResourceXTargetInstallFollowState raw_state;
+
+	if (follow_state_out != NULL)
+		*follow_state_out = RESOURCE_X_TARGET_INSTALL_INVALID;
+	if (terminal_ref_out != NULL)
+		memset(terminal_ref_out, 0, sizeof(*terminal_ref_out));
+	if (buf == NULL || continuation == NULL || before == NULL
+		|| follow_state_out == NULL || terminal_ref_out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&candidate_ref, 0, sizeof(candidate_ref));
+	raw_state
+		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+			continuation, before, &candidate_ref);
+	memset(&after, 0, sizeof(after));
+	snapshot_result = cluster_bufmgr_pcm_own_snapshot(buf, &after);
+	if (snapshot_result != CLUSTER_PCM_OWN_OK)
+		return gcs_block_resource_x_target_install_snapshot_result(
+			snapshot_result);
+	*follow_state_out
+		= cluster_pcm_x_target_install_follow_adjudicate_exact(
+			before, &after, raw_state, &candidate_ref, NULL);
+	*terminal_ref_out = candidate_ref;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 /* PGRAC adaptation: one foreground TARGET caller drives or joins the fixed
  * per-resource bootstrap round.  The round owns fan-in and retransmit state;
  * this backend owns only bounded staging/wait slices and the returned ref. */
@@ -12875,8 +12972,13 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXBootstrapRoundAction action
 		= RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	ResourceXBootstrapRoundFailureSnapshot failure_round;
+	ResourceXTargetInstallContinuation target_install_follow;
+	ResourceXTargetInstallFollowState target_install_follow_state
+		= RESOURCE_X_TARGET_INSTALL_INVALID;
 	ResourceXFirstFailureEvidence first_failure;
 	ResourceXApplyResult wait_result = RESOURCE_X_APPLY_INVALID;
+	ResourceXApplyResult target_install_observation_result
+		= RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult ownership_loss_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult failure_snapshot_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult discard_result = RESOURCE_X_APPLY_INVALID;
@@ -12928,9 +13030,9 @@ gcs_block_resource_x_target_acquire_internal(
 	bool preflight_backpressure = false;
 	bool preflight_current = false;
 	bool stage_ok = false;
-	bool target_install_inflight = false;
 	bool target_retained_release_inflight = false;
 	bool target_retained_release_post_mutation = false;
+	bool target_install_preuse_retry_seen = false;
 	bool terminal_admission_current = false;
 	bool terminal_gate_session_current = false;
 	const char *diagnostic_stage = "entry";
@@ -12938,6 +13040,7 @@ gcs_block_resource_x_target_acquire_internal(
 	if (ref_out != NULL)
 		memset(ref_out, 0, sizeof(*ref_out));
 	memset(&own, 0, sizeof(own));
+	memset(&target_install_follow, 0, sizeof(target_install_follow));
 	memset(&gate, 0, sizeof(gate));
 	memset(&terminal_gate, 0, sizeof(terminal_gate));
 	memset(&assertion, 0, sizeof(assertion));
@@ -13139,8 +13242,12 @@ gcs_block_resource_x_target_acquire_internal(
 
 				for (;;) {
 					CHECK_FOR_INTERRUPTS();
-				target_install_inflight = false;
-				target_retained_release_inflight = false;
+					now_us = gcs_block_pcm_x_monotonic_us();
+					if (now_us >= absolute_deadline_us) {
+						result = RESOURCE_X_APPLY_BAD_STATE;
+						break;
+					}
+					target_retained_release_inflight = false;
 				target_retained_release_post_mutation = false;
 				memset(&own, 0, sizeof(own));
 					diagnostic_stage = "own-snapshot";
@@ -13153,12 +13260,147 @@ gcs_block_resource_x_target_acquire_internal(
 						: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
-				if (!BufferTagsEqual(&own.tag, &assertion.resource)
-					|| own.generation == UINT64_MAX) {
-					result = RESOURCE_X_APPLY_STALE;
-					break;
-				}
-				if (direct_init) {
+					if (!BufferTagsEqual(&own.tag, &assertion.resource)
+						|| own.generation == UINT64_MAX) {
+						result = RESOURCE_X_APPLY_STALE;
+						break;
+					}
+					if (target_install_follow.valid) {
+						target_install_observation_result
+							= gcs_block_resource_x_target_install_classify_coherent(
+								buf, &target_install_follow, &own,
+								&target_install_follow_state, &terminal_ref);
+						if (target_install_observation_result
+								!= RESOURCE_X_APPLY_APPLIED) {
+							result = target_install_observation_result;
+							break;
+						}
+						if (target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+							continue;
+						if (target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_TERMINAL) {
+							action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
+							goto target_install_terminal_recheck;
+						}
+						if (target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
+							target_install_preuse_retry_seen = true;
+							diagnostic_stage = "target-install-preuse-wait";
+							now_us = gcs_block_pcm_x_monotonic_us();
+							if (now_us >= absolute_deadline_us) {
+								result = RESOURCE_X_APPLY_BAD_STATE;
+								break;
+							}
+							remaining_us = absolute_deadline_us - now_us;
+							timeout_ms = (long) Min(
+								(uint64) Max(
+									cluster_gcs_block_retransmit_initial_backoff_ms,
+									1),
+								(remaining_us + UINT64_C(999))
+									/ UINT64_C(1000));
+							if (timeout_ms <= 0)
+								timeout_ms = 1;
+							wait_result
+								= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+									&target_install_follow,
+									RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY,
+									timeout_ms);
+							if (wait_result == RESOURCE_X_APPLY_DUPLICATE) {
+								memset(&target_install_follow, 0,
+									sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
+								continue;
+							}
+							if (wait_result == RESOURCE_X_APPLY_APPLIED)
+								continue;
+							if (wait_result == RESOURCE_X_APPLY_STALE
+								&& target_install_preuse_retry_seen) {
+								memset(&target_install_follow, 0,
+									sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
+								continue;
+							}
+							result = wait_result;
+							break;
+						}
+						if (target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_INFLIGHT) {
+							diagnostic_stage = "target-install-continuation-wait";
+							now_us = gcs_block_pcm_x_monotonic_us();
+							if (now_us >= absolute_deadline_us) {
+								result = RESOURCE_X_APPLY_BAD_STATE;
+								break;
+							}
+							remaining_us = absolute_deadline_us - now_us;
+							timeout_ms = (long) Min(
+								(uint64) Max(
+									cluster_gcs_block_retransmit_initial_backoff_ms,
+									1),
+								(remaining_us + UINT64_C(999))
+									/ UINT64_C(1000));
+							if (timeout_ms <= 0)
+								timeout_ms = 1;
+							wait_result
+								= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+									&target_install_follow,
+									RESOURCE_X_TARGET_INSTALL_INFLIGHT,
+									timeout_ms);
+							if (wait_result == RESOURCE_X_APPLY_APPLIED
+								|| wait_result == RESOURCE_X_APPLY_DUPLICATE)
+								continue;
+							if (wait_result == RESOURCE_X_APPLY_STALE
+								&& target_install_preuse_retry_seen) {
+								memset(&target_install_follow, 0,
+									sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
+								continue;
+							}
+							result = wait_result;
+							break;
+						}
+						if (target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_STALE
+							&& target_install_preuse_retry_seen) {
+							memset(&target_install_follow, 0,
+								sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
+							continue;
+						}
+						result = target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_STALE
+							? RESOURCE_X_APPLY_STALE
+							: target_install_follow_state
+								== RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
+							? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+							: RESOURCE_X_APPLY_INVALID;
+						break;
+					}
+					target_install_observation_result
+						= gcs_block_resource_x_target_install_capture_coherent(
+							buf, &assertion, master_node, gate.formation,
+							master_session, admission.record_generation,
+							requester_sender_connection_generation,
+							master_ingress_connection_generation,
+							retry_slice_us, absolute_deadline_us, &own,
+							&target_install_follow_state,
+							&target_install_follow);
+					if (target_install_observation_result
+							!= RESOURCE_X_APPLY_APPLIED) {
+						result = target_install_observation_result;
+						break;
+					}
+					if (target_install_follow_state
+							== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+						continue;
+					if (target_install_follow_state
+							== RESOURCE_X_TARGET_INSTALL_INFLIGHT
+						|| target_install_follow_state
+							== RESOURCE_X_TARGET_INSTALL_TERMINAL
+						|| target_install_follow_state
+							== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+						continue;
+					if (direct_init) {
 					cached_local_x
 						= own.pcm_state == (uint8)PCM_STATE_X
 						  && own.flags == 0
@@ -13177,18 +13419,10 @@ gcs_block_resource_x_target_acquire_internal(
 								== direct_init_reservation_token
 							  && own.writer_activation_token == 0
 							  && own.resource_x_activation_generation == 0;
-						if (!direct_init_pending_n
-							&& !cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
-								&assertion, master_node, gate.formation,
-								master_session, admission.record_generation,
-								requester_sender_connection_generation,
-								master_ingress_connection_generation,
-								retry_slice_us,
-								direct_init_ownership_generation,
-								direct_init_reservation_token, &own)) {
-							result = RESOURCE_X_APPLY_STALE;
-							break;
-						}
+							if (!direct_init_pending_n) {
+								result = RESOURCE_X_APPLY_STALE;
+								break;
+							}
 						if (direct_init_pending_n) {
 							direct_candidate_result
 								= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
@@ -13201,65 +13435,33 @@ gcs_block_resource_x_target_acquire_internal(
 									own_result
 										= cluster_bufmgr_pcm_own_snapshot(
 											buf, &failure_live);
-								target_install_inflight
-									= own_result == CLUSTER_PCM_OWN_OK
-									  && cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
-										  &assertion, master_node,
-											  gate.formation, master_session,
-											  admission.record_generation,
-											  requester_sender_connection_generation,
-											  master_ingress_connection_generation,
-											  retry_slice_us,
-										  direct_init_ownership_generation,
-										  direct_init_reservation_token,
-										  &failure_live);
-								/* The R9 executor installs remote VM/FSM bytes while the
-								 * exact direct-init sidecar is still N+GRANT_PENDING.  In
-								 * that content/header cross-lock interval PageIsNew is
-								 * already false, so the known-new candidate above returns
-								 * STALE before the post-commit X predicate can match.  Join
-								 * only the same caller token's exact T1 install; this grants
-								 * no authority and merely waits for the existing T2/T3. */
-								if (!target_install_inflight
-									&& own_result == CLUSTER_PCM_OWN_OK
-									&& failure_live.pcm_state == (uint8)PCM_STATE_N
-									&& failure_live.flags
-										== PCM_OWN_FLAG_GRANT_PENDING
-									&& failure_live.generation
-										== direct_init_ownership_generation
-									&& failure_live.reservation_token
-										== direct_init_reservation_token
-									&& failure_live.writer_activation_token == 0
-									&& failure_live.resource_x_activation_generation == 0)
-									target_install_inflight
-										= cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
-											&assertion, master_node,
-											gate.formation, master_session,
-											admission.record_generation,
-											requester_sender_connection_generation,
-											master_ingress_connection_generation,
-											retry_slice_us, &failure_live);
-								if (!target_install_inflight
-									&& own_result == CLUSTER_PCM_OWN_OK)
-									target_install_inflight
-											= BufferTagsEqual(
-												  &failure_live.tag,
-												  &assertion.resource)
-											  && failure_live.pcm_state
-												 == (uint8)PCM_STATE_X
-											  && failure_live.flags == 0
-											  && failure_live.generation
-												 == direct_init_committed_generation
-											  && failure_live.reservation_token
-												 == direct_init_reservation_token
-											  && failure_live.writer_activation_token
-												 == 0
-											  && failure_live.resource_x_activation_generation
-												 == 0;
-								if (target_install_inflight) {
-									own = failure_live;
-									continue;
-								}
+									if (own_result == CLUSTER_PCM_OWN_OK) {
+										target_install_observation_result
+											= gcs_block_resource_x_target_install_capture_coherent(
+												buf, &assertion, master_node,
+												gate.formation, master_session,
+												admission.record_generation,
+												requester_sender_connection_generation,
+												master_ingress_connection_generation,
+												retry_slice_us, absolute_deadline_us,
+												&failure_live, &target_install_follow_state,
+												&target_install_follow);
+										if (target_install_observation_result
+												!= RESOURCE_X_APPLY_APPLIED) {
+											result = target_install_observation_result;
+											break;
+										}
+										if (target_install_follow_state
+												== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+											continue;
+										if (target_install_follow_state
+												== RESOURCE_X_TARGET_INSTALL_INFLIGHT
+											|| target_install_follow_state
+												== RESOURCE_X_TARGET_INSTALL_TERMINAL
+											|| target_install_follow_state
+												== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+										continue;
+									}
 								}
 								result
 									= direct_candidate_result == CLUSTER_PCM_OWN_BUSY
@@ -13273,19 +13475,7 @@ gcs_block_resource_x_target_acquire_internal(
 						}
 					}
 				} else {
-					/* A follower may sample any closed T1->T3 BufferDesc
-					 * shape produced by this exact R9 executor.  This join
-					 * grants no authority; it only suppresses stale-round
-					 * invalidation while that executor owns progress. */
-					target_install_inflight
-						= cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
-							&assertion, master_node, gate.formation,
-							master_session, admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							retry_slice_us, &own);
-					if (!target_install_inflight
-						&& own.pcm_state == (uint8)PCM_STATE_N
+					if (own.pcm_state == (uint8)PCM_STATE_N
 						&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
 						/* The exact T1 install may have crossed both the
 						 * BufferDesc and requester-round terminal transitions
@@ -13296,27 +13486,30 @@ gcs_block_resource_x_target_acquire_internal(
 						memset(&failure_live, 0, sizeof(failure_live));
 						own_result = cluster_bufmgr_pcm_own_snapshot(
 							buf, &failure_live);
-						memset(&failure_round, 0, sizeof(failure_round));
-						failure_snapshot_result
-							= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-								&assertion, master_node, gate.formation,
-								master_session, admission.record_generation,
-								requester_sender_connection_generation,
-								master_ingress_connection_generation,
-								retry_slice_us, &failure_round);
-						target_install_inflight
-							= own_result == CLUSTER_PCM_OWN_OK
-							  && cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
-								  &assertion, master_node, gate.formation,
-								  master_session, admission.record_generation,
-								  requester_sender_connection_generation,
-								  master_ingress_connection_generation,
-								  retry_slice_us, &failure_live);
-						if (target_install_inflight
-							|| cluster_gcs_resource_x_target_pending_terminal_resample_exact(
-								&own, &failure_live,
-								failure_snapshot_result, &failure_round)) {
-							own = failure_live;
+						if (own_result == CLUSTER_PCM_OWN_OK) {
+							target_install_observation_result
+								= gcs_block_resource_x_target_install_capture_coherent(
+									buf, &assertion, master_node, gate.formation,
+									master_session, admission.record_generation,
+									requester_sender_connection_generation,
+									master_ingress_connection_generation,
+									retry_slice_us, absolute_deadline_us,
+									&failure_live, &target_install_follow_state,
+									&target_install_follow);
+							if (target_install_observation_result
+									!= RESOURCE_X_APPLY_APPLIED) {
+								result = target_install_observation_result;
+								break;
+							}
+							if (target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+								continue;
+							if (target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_INFLIGHT
+								|| target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_TERMINAL
+								|| target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 							continue;
 						}
 						now_us = gcs_block_pcm_x_monotonic_us();
@@ -13348,8 +13541,7 @@ gcs_block_resource_x_target_acquire_internal(
 					if (own.pcm_state == (uint8)PCM_STATE_N) {
 						ClusterPcmOwnResult n_candidate_result;
 
-						if (!target_install_inflight
-							&& (own.flags == PCM_OWN_FLAG_REVOKING
+						if ((own.flags == PCM_OWN_FLAG_REVOKING
 								|| own.flags == 0)
 							&& own.reservation_token != 0
 							&& own.reservation_token != UINT64_MAX
@@ -13409,8 +13601,7 @@ gcs_block_resource_x_target_acquire_internal(
 								break;
 							}
 						}
-						if (!target_install_inflight
-							&& !target_retained_release_inflight) {
+						if (!target_retained_release_inflight) {
 							/* A generation-zero descriptor is the ordinary cold-N
 							 * starting point, not an ownership proof.  Admit it only
 							 * through the existing exact BM_VALID/no-IO assertion
@@ -13421,18 +13612,34 @@ gcs_block_resource_x_target_acquire_internal(
 								= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 									buf, &own, &failure_live);
 							if (n_candidate_result != CLUSTER_PCM_OWN_OK) {
-								target_install_inflight
-									= n_candidate_result == CLUSTER_PCM_OWN_STALE
-									  && cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
-										  &assertion, master_node, gate.formation,
-										  master_session,
-										  admission.record_generation,
-										  requester_sender_connection_generation,
-										  master_ingress_connection_generation,
-										  retry_slice_us, &failure_live);
-								if (target_install_inflight)
-									own = failure_live;
-								else {
+								if (n_candidate_result == CLUSTER_PCM_OWN_STALE) {
+									target_install_observation_result
+										= gcs_block_resource_x_target_install_capture_coherent(
+											buf, &assertion, master_node,
+											gate.formation, master_session,
+											admission.record_generation,
+											requester_sender_connection_generation,
+											master_ingress_connection_generation,
+											retry_slice_us, absolute_deadline_us,
+											&failure_live,
+											&target_install_follow_state,
+											&target_install_follow);
+									if (target_install_observation_result
+											!= RESOURCE_X_APPLY_APPLIED) {
+										result = target_install_observation_result;
+										break;
+									}
+									if (target_install_follow_state
+											== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+										continue;
+									if (target_install_follow_state
+											== RESOURCE_X_TARGET_INSTALL_INFLIGHT
+										|| target_install_follow_state
+											== RESOURCE_X_TARGET_INSTALL_TERMINAL
+										|| target_install_follow_state
+											== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+										continue;
+								}
 									result
 										= gcs_block_pcm_x_resource_x_remote_s_own_result(
 											n_candidate_result);
@@ -13446,16 +13653,7 @@ gcs_block_resource_x_target_acquire_internal(
 											requester_sender_connection_generation,
 											master_ingress_connection_generation,
 											retry_slice_us, &failure_round);
-									if (cluster_gcs_resource_x_target_terminal_resample_exact(
-											n_candidate_result, &own, &failure_live,
-											failure_snapshot_result, &failure_round)) {
-										/* The next iteration resamples BufferDesc and lets the
-										 * canonical round step revalidate the terminal cover.
-										 * No old proof/image/status is retained here. */
-											own = failure_live;
-											continue;
-										}
-										now_us = gcs_block_pcm_x_monotonic_us();
+									now_us = gcs_block_pcm_x_monotonic_us();
 									if (cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 												&own, n_candidate_result, &failure_live,
 												now_us, absolute_deadline_us)) {
@@ -13534,7 +13732,6 @@ gcs_block_resource_x_target_acquire_internal(
 										&first_failure);
 									first_failure_recorded = true;
 									break;
-								}
 							}
 						}
 					} else if (own.generation == 0) {
@@ -13584,10 +13781,8 @@ gcs_block_resource_x_target_acquire_internal(
 				now_us = gcs_block_pcm_x_monotonic_us();
 				memset(&dispatch, 0, sizeof(dispatch));
 				memset(&terminal_ref, 0, sizeof(terminal_ref));
-				if (target_install_inflight)
-					action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
-				else if (direct_init)
-					action = join_only
+					if (direct_init)
+						action = join_only
 					? cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
 							&assertion, master_node,
 							gate.formation, master_session,
@@ -13624,9 +13819,60 @@ gcs_block_resource_x_target_acquire_internal(
 						cached_local_x,
 							cached_local_x ? own.generation : 0,
 							&dispatch, &terminal_ref);
-				if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
-					diagnostic_stage = "terminal-recheck";
-					terminal_admission_current
+
+			target_install_terminal_recheck:
+					if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
+						diagnostic_stage = "terminal-recheck";
+						if (target_install_follow.valid) {
+							memset(&failure_live, 0, sizeof(failure_live));
+							own_result = cluster_bufmgr_pcm_own_snapshot(
+								buf, &failure_live);
+							if (own_result != CLUSTER_PCM_OWN_OK) {
+								result = own_result == CLUSTER_PCM_OWN_BUSY
+									? RESOURCE_X_APPLY_BAD_STATE
+									: own_result == CLUSTER_PCM_OWN_STALE
+									? RESOURCE_X_APPLY_STALE
+									: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								break;
+							}
+							target_install_observation_result
+								= gcs_block_resource_x_target_install_classify_coherent(
+									buf, &target_install_follow, &failure_live,
+									&target_install_follow_state, &terminal_ref);
+							if (target_install_observation_result
+									!= RESOURCE_X_APPLY_APPLIED) {
+								result = target_install_observation_result;
+								break;
+							}
+							if (target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+								continue;
+							if (target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
+								target_install_preuse_retry_seen = true;
+								continue;
+							}
+							if (target_install_follow_state
+									== RESOURCE_X_TARGET_INSTALL_STALE
+								&& target_install_preuse_retry_seen) {
+								memset(&target_install_follow, 0,
+									sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
+								continue;
+							}
+							if (target_install_follow_state
+									!= RESOURCE_X_TARGET_INSTALL_TERMINAL) {
+								result = target_install_follow_state
+										== RESOURCE_X_TARGET_INSTALL_STALE
+									? RESOURCE_X_APPLY_STALE
+									: target_install_follow_state
+										== RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
+									? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+									: RESOURCE_X_APPLY_INVALID;
+								break;
+							}
+						}
+						terminal_admission_current
 						= cluster_semantic_activation_recheck(&admission);
 					if (terminal_admission_current) {
 						memset(&terminal_gate, 0, sizeof(terminal_gate));
@@ -13649,6 +13895,9 @@ gcs_block_resource_x_target_acquire_internal(
 						result = RESOURCE_X_APPLY_STALE;
 						break;
 					}
+					memset(&target_install_follow, 0,
+						sizeof(target_install_follow));
+					target_install_preuse_retry_seen = false;
 					*ref_out = terminal_ref;
 					result = RESOURCE_X_APPLY_APPLIED;
 					break;
@@ -13951,8 +14200,7 @@ gcs_block_resource_x_target_acquire_internal(
 					result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
-				if (!direct_init && !cached_local_x
-					&& !target_install_inflight) {
+					if (!direct_init && !cached_local_x) {
 					diagnostic_stage = "ownership-loss-recheck";
 					ownership_loss_result
 						= cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
@@ -13989,7 +14237,7 @@ gcs_block_resource_x_target_acquire_internal(
 				diagnostic_stage = "round-wait";
 					if (direct_init)
 						wait_result
-						= cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
+							= cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 							&assertion, master_node,
 							gate.formation, master_session,
 							admission.record_generation,
@@ -13999,18 +14247,9 @@ gcs_block_resource_x_target_acquire_internal(
 							direct_init_ownership_generation,
 							direct_init_reservation_token,
 							timeout_ms);
-					else if (target_install_inflight)
-						wait_result
-							= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
-								&assertion, master_node,
-								gate.formation, master_session,
-								admission.record_generation,
-								requester_sender_connection_generation,
-								master_ingress_connection_generation,
-								retry_slice_us, &own, timeout_ms);
 					else
 						wait_result
-						= cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+							= cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 						&assertion, master_node,
 						gate.formation, master_session,
 						admission.record_generation,
@@ -14048,14 +14287,7 @@ gcs_block_resource_x_target_acquire_internal(
 								&own, &failure_live,
 								failure_snapshot_result, &failure_round)
 							: RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
-						if (own_result == CLUSTER_PCM_OWN_OK
-							&& cluster_gcs_resource_x_target_pending_terminal_resample_exact(
-								&own, &failure_live,
-								failure_snapshot_result, &failure_round)) {
-							own = failure_live;
-							continue;
-						}
-						ereport(LOG,
+							ereport(LOG,
 							(errmsg_internal("Resource-X pending terminal resample diagnostic"),
 							 errdetail("mismatch=0x%016llx live_result=%d round_result=%d "
 								"before_state=%u before_flags=0x%x before_generation=%llu "
@@ -14101,10 +14333,12 @@ gcs_block_resource_x_target_acquire_internal(
 	}
 	PG_CATCH();
 	{
+		memset(&target_install_follow, 0, sizeof(target_install_follow));
 		cluster_semantic_activation_leave(&admission);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	memset(&target_install_follow, 0, sizeof(target_install_follow));
 	cluster_semantic_activation_leave(&admission);
 	if (result != RESOURCE_X_APPLY_APPLIED && !first_failure_recorded) {
 		memset(&failure_round, 0, sizeof(failure_round));

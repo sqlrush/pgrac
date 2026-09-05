@@ -363,13 +363,14 @@ flowchart LR
     H[t/429<br/>harness lifecycle]
     A[t/430 item 17<br/>PGRD anchor]
     R[t/430 complete<br/>resource reuse]
-    C[t/400 236/236<br/>hot-block correctness]
+    C[t/400 GREEN<br/>hot-block correctness]
+    F[t/406 GREEN<br/>exact finish-error containment]
     P[adaptive performance]
 
-    U --> H --> A --> R --> C --> P
+    U --> H --> A --> R --> C --> F --> P
 ```
 
-第 17 项通过只证明 `A`。完整 `t/400 236/236` 才证明该控制门之后的四节点热块协议也能走完；
+第 17 项通过只证明 `A`。完整 `t/400` GREEN 才证明该控制门之后的四节点热块协议也能走完；
 完整 `t/430` 还要额外证明 buffer replacement、terminal retirement 和目录复用。性能门又是下一层，
 不能从正确性测试的短工作负载推导。
 

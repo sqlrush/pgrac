@@ -13,13 +13,18 @@ import sys
 from typing import Any
 
 
-SCHEMA = "R11SourceRemovalCensusV2"
+SCHEMA = "R11SourceRemovalCensusV3"
 SOURCE_REMOVAL_COMMIT = "cb7c7b585cb63ea4906d49fe01352b005a89b8e8"
 SOURCE_REMOVAL_TREE = "e80f7dc31d269b5927a36cf393d9b2cccf70c02e"
 PRODUCT_COMMIT = "fe68024a0f79d5a1d187e9f1885cbe9ac441153b"
 PRODUCT_TREE = "dd51f830614f1f3ec82658f8806ac3eaf1275a8a"
 L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
+CURRENT_PRODUCT_SNAPSHOT = {
+    "algorithm": "sha256-canonical-path-blob-v1",
+    "path_count": 2224,
+    "sha256": "b257e233d68a37edfbd238891077e28248d64fa8f1743cba1cdaf18a3c2680c2",
+}
 
 LAYERS = {
     "wire_authority": {
@@ -223,9 +228,54 @@ def tree_text(source_root: pathlib.Path, commit: str) -> tuple[list[str], str]:
     return paths, "\n".join(chunks)
 
 
+def current_product_text(
+    source_root: pathlib.Path,
+) -> tuple[list[str], str, dict[str, Any]]:
+    names = git(
+        source_root,
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "src/backend",
+        "src/include",
+    ).splitlines()
+    paths = []
+    entries = []
+    chunks = []
+    for path in sorted(set(names)):
+        if not (
+            path.endswith((".c", ".h"))
+            or pathlib.PurePosixPath(path).name == "Makefile"
+        ):
+            continue
+        absolute = source_root / path
+        if not absolute.exists():
+            continue
+        if not absolute.is_file():
+            raise CensusError(f"current product path is not a regular file: {path}")
+        blob = absolute.read_bytes()
+        paths.append(path)
+        entries.append({"path": path, "sha256": hashlib.sha256(blob).hexdigest()})
+        try:
+            chunks.append(blob.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            raise CensusError(f"current product path is not UTF-8 text: {path}") from error
+    snapshot = {
+        "algorithm": "sha256-canonical-path-blob-v1",
+        "path_count": len(entries),
+        "sha256": hashlib.sha256(
+            canonical_json(entries).encode("utf-8")
+        ).hexdigest(),
+    }
+    return paths, "\n".join(chunks), snapshot
+
+
 def require_exact_manifest(manifest: dict[str, Any]) -> None:
     if set(manifest) != {
         "build_link",
+        "current_product_snapshot",
         "gates",
         "layers",
         "schema_version",
@@ -234,6 +284,8 @@ def require_exact_manifest(manifest: dict[str, Any]) -> None:
         raise CensusError("census top-level fields are stale")
     if manifest["schema_version"] != SCHEMA:
         raise CensusError("census schema is stale")
+    if manifest["current_product_snapshot"] != CURRENT_PRODUCT_SNAPSHOT:
+        raise CensusError("current product snapshot identity is not exact")
     if manifest["source_removed_subject"] != {
         "commit": PRODUCT_COMMIT,
         "pre_removal_commit": L3_COMMIT,
@@ -283,26 +335,21 @@ def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
     except CensusError as error:
         raise CensusError("final source-removed product is not an ancestor of HEAD") from error
 
-    for diff_args in (
-        ("diff", "--name-only", f"{PRODUCT_COMMIT}..HEAD", "--", "src/backend", "src/include"),
-        ("diff", "--name-only", "--", "src/backend", "src/include"),
-        ("diff", "--cached", "--name-only", "--", "src/backend", "src/include"),
-    ):
-        if git(source_root, *diff_args):
-            raise CensusError("production paths drifted after the census subject")
-
-    paths, production = tree_text(source_root, PRODUCT_COMMIT)
+    paths, production, current_snapshot = current_product_text(source_root)
+    if current_snapshot != CURRENT_PRODUCT_SNAPSHOT:
+        raise CensusError("current product bytes do not match the census snapshot")
     for path in REMOVED_PATHS:
-        if path in paths or not path.startswith(("src/backend", "src/include")) and git(
-            source_root, "ls-tree", "-r", "--name-only", PRODUCT_COMMIT, "--", path
-        ):
+        if (source_root / path).exists():
             raise CensusError(f"retired source path remains: {path}")
     for layer, contract in LAYERS.items():
         for pattern in contract["forbidden_patterns"]:
             if re.search(pattern, production):
                 raise CensusError(f"{layer} legacy match remains: {pattern}")
         for anchor in contract["positive_anchors"]:
-            body = git(source_root, "show", f"{PRODUCT_COMMIT}:{anchor['path']}")
+            anchor_path = source_root / anchor["path"]
+            if not anchor_path.is_file():
+                raise CensusError(f"{layer} positive anchor path is missing: {anchor['path']}")
+            body = anchor_path.read_text(encoding="utf-8")
             if anchor["symbol"] not in body:
                 raise CensusError(f"{layer} positive anchor is missing: {anchor['symbol']}")
     for gate_name, patterns in (("L1", L1_PATTERNS), ("L2", L2_PATTERNS)):
@@ -310,10 +357,12 @@ def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
             if re.search(pattern, production):
                 raise CensusError(f"{gate_name} is nonzero: {pattern}")
 
-    stale_body = git(source_root, "show", f"{PRODUCT_COMMIT}:src/backend/cluster/cluster_gcs_block.c")
+    stale_body = (source_root / "src/backend/cluster/cluster_gcs_block.c").read_text(
+        encoding="utf-8"
+    )
     if len(re.findall(r"(?m)^gcs_block_legacy_pcm_x_stale_ingress\($", stale_body)) != 1:
         raise CensusError("bounded stale-family ingress cardinality is not one")
-    build_body = git(source_root, "show", f"{PRODUCT_COMMIT}:{BUILD_LINK['manifest_path']}")
+    build_body = (source_root / BUILD_LINK["manifest_path"]).read_text(encoding="utf-8")
     for name in BUILD_LINK["forbidden_objects"]:
         if name in build_body:
             raise CensusError(f"retired object remains in build manifest: {name}")

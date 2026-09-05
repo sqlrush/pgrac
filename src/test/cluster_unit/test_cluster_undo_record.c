@@ -1418,6 +1418,9 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 	const char *boundary_recheck;
 	const char *boundary_apply;
 	const char *consume;
+	const char *typed_retry;
+	const char *prepare_retry_route;
+	const char *update_retry_route;
 
 	if (source == NULL)
 		return;
@@ -1460,6 +1463,13 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
 	consume = boundary == NULL ? NULL
 		: strstr(boundary, "cluster_heap_boundary_consume_undo(");
+	typed_retry = strstr(source,
+		"CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
+	prepare_retry_route = prepare_helper == NULL ? NULL
+		: strstr(prepare_helper,
+			"CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
+	update_retry_route = strstr(source,
+		"old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
 
 	UT_ASSERT_NOT_NULL(prepare_helper);
 	UT_ASSERT_NOT_NULL(prepare_end);
@@ -1478,6 +1488,9 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 	UT_ASSERT_NOT_NULL(boundary_recheck);
 	UT_ASSERT_NOT_NULL(boundary_apply);
 	UT_ASSERT_NOT_NULL(consume);
+	UT_ASSERT_NOT_NULL(typed_retry);
+	UT_ASSERT_NOT_NULL(prepare_retry_route);
+	UT_ASSERT_NOT_NULL(update_retry_route);
 	if (prepare_helper != NULL && prepare_end != NULL && ensure != NULL
 		&& prepare_guard != NULL && prepare_receipt_recheck != NULL)
 		UT_ASSERT(prepare_helper < ensure && ensure < prepare_guard
@@ -1685,8 +1698,9 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 		 (hit = strstr(hit, "cluster_undo_record_prepare(")) != NULL;
 		 hit++)
 		raw_prepare_calls++;
-	/* Definition + unit seam + all current producer initial/retry sites. */
-	UT_ASSERT_EQ(helper_mentions, 15);
+	/* Definition + A27 UPDATE restart helper + unit seam + all current
+	 * producer initial/retry sites. */
+	UT_ASSERT_EQ(helper_mentions, 16);
 	UT_ASSERT_EQ(wrapper_calls, 2);
 	UT_ASSERT_EQ(raw_prepare_calls, 0);
 	free(source);
