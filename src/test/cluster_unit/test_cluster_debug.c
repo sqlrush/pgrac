@@ -45,6 +45,7 @@
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
@@ -2045,6 +2046,20 @@ cluster_tt_status_hint_get_drop_v1_compat_count(void)
 
 /* spec-3.7 D10 stubs: cluster_debug dump_undo() references 5 counter
  * accessors from cluster_undo_record.o which test_cluster_debug doesn't link. */
+static bool receipt_stats_available = true;
+
+bool
+cluster_undo_record_receipt_stats_snapshot(uint64 values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT])
+{
+	int i;
+
+	if (!receipt_stats_available)
+		return false;
+	for (i = 0; i < CLUSTER_UNDO_RECEIPT_METRIC_COUNT; i++)
+		values[i] = 10 + i;
+	return true;
+}
+
 uint64
 cluster_undo_record_alloc_count(void)
 {
@@ -4930,6 +4945,31 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int available;
+
+	for (available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		receipt_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "receipt_stats_available"), 1);
+		UT_ASSERT_EQ(captured_dump_count("undo", "ready_reprepare_premature_count"), available);
+		if (available && captured_dump_count("undo", "ready_reprepare_premature_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "ready_reprepare_premature_count"), "19");
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "ready_survived_prepare_deadline"), "13");
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "post_apply_reprepare_refused_count"),
+							 "21");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -5534,13 +5574,14 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
 	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
+	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);

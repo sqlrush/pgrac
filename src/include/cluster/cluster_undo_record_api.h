@@ -97,8 +97,9 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained
  * exact proof, while reservation_sequence names the sole backend-local owner.
- * The absolute deadline is frozen by the heap operation and never refreshed
- * by a receipt retry. */
+ * The absolute deadline bounds preparation only.  Once READY, it is a
+ * historical diagnostic stamp, not a lease.  An exact invalidation that
+ * requires a new preparation still uses that original, never-refreshed budget. */
 typedef struct ClusterUndoRecordPrepareReceipt {
 	uint32 magic;
 	uint8 record_type;
@@ -120,6 +121,35 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	uint8 ctrc_reuse_mask;
 	uint8 ctrc_reserved8[4];
 } ClusterUndoRecordPrepareReceipt;
+
+/* Diagnostic counters, not receipt state or authority. */
+typedef enum ClusterUndoReceiptMetric {
+	CLUSTER_UNDO_RECEIPT_PREPARE_START,
+	CLUSTER_UNDO_RECEIPT_PREPARE_TIMEOUT,
+	CLUSTER_UNDO_RECEIPT_READY,
+	CLUSTER_UNDO_RECEIPT_READY_SURVIVED_DEADLINE,
+	CLUSTER_UNDO_RECEIPT_PREFLIGHT_IDENTITY_REFUSAL,
+	CLUSTER_UNDO_RECEIPT_APPLY,
+	CLUSTER_UNDO_RECEIPT_CANCEL,
+	CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL,
+	CLUSTER_UNDO_RECEIPT_RESERVATION_MISMATCH,
+	CLUSTER_UNDO_RECEIPT_REPREPARE_PREMATURE,
+	CLUSTER_UNDO_RECEIPT_INVALIDATED_BUDGET_EXHAUSTED,
+	CLUSTER_UNDO_RECEIPT_POST_APPLY_REPREPARE,
+	CLUSTER_UNDO_RECEIPT_RETRY_PRESERVED,
+	CLUSTER_UNDO_RECEIPT_METRIC_COUNT
+} ClusterUndoReceiptMetric;
+
+extern bool
+cluster_undo_record_receipt_stats_snapshot(uint64 values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT]);
+extern const char *cluster_undo_record_receipt_last_reason(void);
+/* Outside all heap content/recycle ownership: READY means retained unchanged;
+ * RETRY_REQUIRED means exactly canceled and new preparation is permitted;
+ * REFUSED means no reprepare is permitted.  The original budget never changes.
+ * targets_invalidated must come from an exact target comparison, not a wait. */
+extern ClusterUndoRecordPrepareResult
+cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt,
+										uint16 payload_len, bool targets_invalidated);
 
 extern uint64 cluster_undo_record_prepare_deadline_us(void);
 extern ClusterUndoRecordPrepareResult cluster_undo_record_prepare(

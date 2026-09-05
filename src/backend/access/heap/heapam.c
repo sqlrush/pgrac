@@ -425,9 +425,34 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type,
 	}
 }
 
-/* UPDATE retries keep their original absolute deadline.  The abandoned
- * pre-APPLY reservation is canceled only after all heap content locks have
- * been released, then replaced under that same deadline. */
+/* All page/recycle ownership must be released before this retry owner.  Waits
+ * do not cancel an exact READY receipt; proven target/receipt invalidation
+ * may reprepare only under the operation's original preparation budget. */
+static bool
+cluster_heap_retry_undo_record_exact(uint8 record_type, uint16 payload_capacity,
+									 uint16 tt_slot_segment_id, uint16 tt_slot_offset, UBA prev_uba,
+									 uint64 absolute_deadline_us,
+									 ClusterUndoRecordPrepareReceipt *receipt,
+									 bool targets_invalidated)
+{
+	ClusterUndoRecordPrepareResult result;
+
+	if (receipt == NULL)
+		return false;
+	targets_invalidated = targets_invalidated || receipt->record_type != record_type
+						  || receipt->tt_slot_segment_id != tt_slot_segment_id
+						  || receipt->tt_slot_offset != tt_slot_offset;
+	result
+		= cluster_undo_record_requalify_for_retry(receipt, payload_capacity, targets_invalidated);
+	if (result == CLUSTER_UNDO_RECORD_PREPARE_READY)
+		return true;
+	if (result != CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED)
+		return false;
+	return cluster_heap_prepare_undo_record_exact(record_type, payload_capacity, tt_slot_segment_id,
+												  tt_slot_offset, prev_uba, absolute_deadline_us,
+												  receipt);
+}
+
 static bool
 cluster_heap_restart_update_undo_record_exact(
 	const ClusterCanonicalTxnBinding *binding, uint64 absolute_deadline_us,
@@ -435,11 +460,18 @@ cluster_heap_restart_update_undo_record_exact(
 {
 	if (binding == NULL || receipt == NULL)
 		return false;
-	cluster_undo_record_cancel_prepared(receipt);
-	return cluster_heap_prepare_undo_record_exact(
+	return cluster_heap_retry_undo_record_exact(
 		UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
-		(uint16)binding->segment_id, binding->slot_offset,
-		(UBA) InvalidUba_init, absolute_deadline_us, receipt);
+		(uint16)binding->segment_id, binding->slot_offset, (UBA)InvalidUba_init,
+		absolute_deadline_us, receipt, false);
+}
+
+static int
+cluster_heap_undo_receipt_errdetail(bool ctrc)
+{
+	return errdetail("PGRAC_FAMILY=%s PGRAC_REASON=%s PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+					 ctrc ? "CTRC_RECEIPT" : "UNDO_RECEIPT",
+					 cluster_undo_record_receipt_last_reason(), cluster_node_id);
 }
 
 typedef enum ClusterHeapPreparedUndoResult
@@ -1405,10 +1437,10 @@ cluster_heap_test_itl_relation_route(
 
 
 static ClusterHeapPreparedUndoResult
-cluster_heap_itl_prepare_prepared_undo(
-	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
-	bool lock_only, ClusterUndoRecordPrepareReceipt *receipt,
-	uint16 payload_len)
+cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTuple tuple,
+									   TransactionId xid, bool lock_only,
+									   ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
+									   bool *targets_invalidated)
 {
 	ClusterHeapItlCapacityResult capacity_result;
 	ClusterHeapDmlAuthorityGuard dml_guard;
@@ -1417,6 +1449,7 @@ cluster_heap_itl_prepare_prepared_undo(
 	Assert(receipt != NULL);
 	capacity_result = cluster_heap_itl_ensure_capacity_with_terminal_census(
 		buffer, xid, lock_only);
+	*targets_invalidated = false;
 	if (capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY)
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 	if (capacity_result != CLUSTER_HEAP_ITL_CAPACITY_READY)
@@ -1428,9 +1461,8 @@ cluster_heap_itl_prepare_prepared_undo(
 			buffer, tuple, &dml_guard))
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 	if (!cluster_undo_record_prepared_recheck(receipt, payload_len))
-		return receipt->absolute_deadline_us > (uint64)GetCurrentTimestamp()
-			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
-			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+		return receipt->ctrc_applied_mask == 0 ? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
+											   : CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	if (!cluster_heap_ctrc_pending_itl_target(relation, buffer, &dml_guard,
 			receipt->record_type, &pending_target))
 		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
@@ -1439,12 +1471,13 @@ cluster_heap_itl_prepare_prepared_undo(
 		if (!cluster_undo_record_ctrc_stage_pending(
 				receipt, 0, &pending_target))
 			return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
-	}
-	else if (memcmp(&receipt->ctrc_pending_targets[0], &pending_target,
-				  sizeof(pending_target)) != 0)
+	} else if (memcmp(&receipt->ctrc_pending_targets[0], &pending_target, sizeof(pending_target))
+			   != 0) {
+		*targets_invalidated = true;
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
 			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+	}
 	if ((receipt->ctrc_prepared_mask & UINT8_C(1)) == 0)
 	{
 		if (cluster_heap_ctrc_stage_reusable_itl_receipt(
@@ -1453,11 +1486,12 @@ cluster_heap_itl_prepare_prepared_undo(
 			return CLUSTER_HEAP_PREPARED_UNDO_READY;
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 	}
-	if (!cluster_undo_record_ctrc_pending_matches(
-			receipt, 0, &pending_target))
+	if (!cluster_undo_record_ctrc_pending_matches(receipt, 0, &pending_target)) {
+		*targets_invalidated = true;
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
 			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+	}
 	return CLUSTER_HEAP_PREPARED_UNDO_READY;
 }
 
@@ -4904,9 +4938,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			(uint16)canonical_binding.segment_id,
 			canonical_binding.slot_offset, (UBA) InvalidUba_init,
 			undo_prepare_deadline_us, &undo_receipt)))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-				 errmsg("cluster undo reservation failed before heap insert")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						errmsg("cluster undo reservation failed before heap insert"),
+						cluster_heap_undo_receipt_errdetail(false)));
 #endif
 
 	/*
@@ -4994,10 +5028,11 @@ cluster_heap_insert_retry:
 					 errmsg("heap insert ITL reference lacks a CURRENT receipt identity")));
 		{
 			ClusterHeapPreparedUndoResult undo_result;
+			bool targets_invalidated;
 
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
-				relation, buffer, NULL, canonical_xid, false,
-				&undo_receipt, sizeof(UndoInsertPayload));
+				relation, buffer, NULL, canonical_xid, false, &undo_receipt,
+				sizeof(UndoInsertPayload), &targets_invalidated);
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
@@ -5011,25 +5046,25 @@ cluster_heap_insert_retry:
 					ReleaseBuffer(vmbuffer);
 					vmbuffer = InvalidBuffer;
 				}
-				if (ctrc_prepare_only)
-				{
+				if (ctrc_prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&undo_receipt, 0))
 						ereport(ERROR,
 								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("CTRC receipt preparation failed before heap insert")));
+								 errmsg("CTRC receipt preparation failed before heap insert"),
+								 cluster_heap_undo_receipt_errdetail(true)));
 					goto cluster_heap_insert_retry;
 				}
-				cluster_undo_record_cancel_prepared(&undo_receipt);
-				if (!cluster_heap_prepare_undo_record_exact(
+				if (!cluster_heap_retry_undo_record_exact(
 						UNDO_RECORD_INSERT, sizeof(UndoInsertPayload),
-						(uint16)canonical_binding.segment_id,
-						canonical_binding.slot_offset, (UBA) InvalidUba_init,
-						undo_prepare_deadline_us, &undo_receipt))
-						ereport(ERROR,
-								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("cluster undo reservation expired before heap insert retry")));
-					goto cluster_heap_insert_retry;
+						(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+						(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt,
+						targets_invalidated))
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							 errmsg("cluster undo reservation expired before heap insert retry"),
+							 cluster_heap_undo_receipt_errdetail(false)));
+				goto cluster_heap_insert_retry;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
 				ereport(ERROR,
@@ -5153,16 +5188,15 @@ cluster_heap_insert_retry:
 			}
 			if (had_undo_ready)
 			{
-				cluster_undo_record_cancel_prepared(&undo_receipt);
-				if (!cluster_heap_prepare_undo_record_exact(
+				if (!cluster_heap_retry_undo_record_exact(
 						UNDO_RECORD_INSERT, sizeof(UndoInsertPayload),
-						(uint16)canonical_binding.segment_id,
-						canonical_binding.slot_offset,
-						(UBA) InvalidUba_init,
-						undo_prepare_deadline_us, &undo_receipt))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo reservation expired before heap insert final retry")));
+						(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+						(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt, false))
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo reservation expired before heap insert final retry"),
+						 cluster_heap_undo_receipt_errdetail(false)));
 			}
 			goto cluster_heap_insert_retry;
 		}
@@ -9240,9 +9274,9 @@ heap_delete(Relation relation, ItemPointer tid,
 			(uint16)canonical_binding.segment_id,
 			canonical_binding.slot_offset, (UBA) InvalidUba_init,
 			undo_prepare_deadline_us, &undo_receipt)))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-				 errmsg("cluster undo reservation failed before heap delete")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						errmsg("cluster undo reservation failed before heap delete"),
+						cluster_heap_undo_receipt_errdetail(false)));
 #endif
 
 	block = ItemPointerGetBlockNumber(tid);
@@ -9617,6 +9651,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		{
 			ClusterHeapPreparedUndoResult undo_result;
 			uint16 undo_payload_len;
+			bool targets_invalidated;
 
 			if (tp.t_len > UINT16_MAX - sizeof(UndoDeletePayload))
 				ereport(ERROR,
@@ -9625,8 +9660,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 			undo_payload_len = sizeof(UndoDeletePayload) + (uint16) tp.t_len;
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
-				relation, buffer, &tp, canonical_xid, false,
-				&undo_receipt, undo_payload_len);
+				relation, buffer, &tp, canonical_xid, false, &undo_receipt, undo_payload_len,
+				&targets_invalidated);
 
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
@@ -9644,13 +9679,13 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				cid = pgrac_entry_cid;
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-				if (ctrc_prepare_only)
-				{
+				if (ctrc_prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&undo_receipt, 0))
 						ereport(ERROR,
 								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("CTRC receipt preparation failed before heap delete")));
+								 errmsg("CTRC receipt preparation failed before heap delete"),
+								 cluster_heap_undo_receipt_errdetail(true)));
 					cluster_heap_lock_with_vm_repin(
 						relation, block, buffer, &vmbuffer);
 					lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
@@ -9662,16 +9697,15 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					tp.t_len = ItemIdGetLength(lp);
 					goto l1;
 				}
-				cluster_undo_record_cancel_prepared(&undo_receipt);
-				if (!cluster_heap_prepare_undo_record_exact(
-						UNDO_RECORD_DELETE,
-						(uint16)cluster_undo_record_inline_max_bytes,
-						(uint16)canonical_binding.segment_id,
-						canonical_binding.slot_offset, (UBA) InvalidUba_init,
-						undo_prepare_deadline_us, &undo_receipt))
+				if (!cluster_heap_retry_undo_record_exact(
+						UNDO_RECORD_DELETE, (uint16)cluster_undo_record_inline_max_bytes,
+						(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+						(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt,
+						targets_invalidated))
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo reservation expired before heap delete retry")));
+							 errmsg("cluster undo reservation expired before heap delete retry"),
+							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_heap_lock_with_vm_repin(
 					relation, block, buffer, &vmbuffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
@@ -9934,16 +9968,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			cid = pgrac_entry_cid;
 			iscombo = false;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			cluster_undo_record_cancel_prepared(&undo_receipt);
-			if (!cluster_heap_prepare_undo_record_exact(
-					UNDO_RECORD_DELETE,
-					(uint16)cluster_undo_record_inline_max_bytes,
-					(uint16)canonical_binding.segment_id,
-					canonical_binding.slot_offset, (UBA) InvalidUba_init,
-					undo_prepare_deadline_us, &undo_receipt))
+			if (!cluster_heap_retry_undo_record_exact(
+					UNDO_RECORD_DELETE, (uint16)cluster_undo_record_inline_max_bytes,
+					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+					(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt, false))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("cluster undo reservation expired before heap delete final retry")));
+						 errmsg("cluster undo reservation expired before heap delete final retry"),
+						 cluster_heap_undo_receipt_errdetail(false)));
 			cluster_heap_lock_with_vm_repin(
 				relation, block, buffer, &vmbuffer);
 			lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
@@ -10420,9 +10452,9 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 			(uint16)canonical_binding.segment_id,
 			canonical_binding.slot_offset, (UBA) InvalidUba_init,
 			undo_prepare_deadline_us, &undo_receipt)))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-				 errmsg("cluster undo reservation failed before heap update")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						errmsg("cluster undo reservation failed before heap update"),
+						cluster_heap_undo_receipt_errdetail(false)));
 #endif
 
 	block = ItemPointerGetBlockNumber(otid);
@@ -11363,9 +11395,47 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		 */
 		if (need_toast)
 		{
+#ifdef USE_PGRAC_CLUSTER
+			bool resume_update_receipt = undo_receipt.magic != 0;
+
+			/* TEMP_LOCK already protects the tuple, and both page authorities
+			 * are released.  Nested TOAST INSERTs need the sole backend-local
+			 * undo reservation: explicitly relinquish the outer pre-APPLY
+			 * receipt instead of letting a nested producer silently replace it. */
+			if (resume_update_receipt) {
+				if (undo_receipt.ctrc_applied_mask != 0)
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo reservation failed before heap update"),
+						 errdetail(
+							 "PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=POST_APPLY_REPREPARE_REFUSED "
+							 "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+							 cluster_node_id)));
+				cluster_undo_record_cancel_prepared(&undo_receipt);
+				if (undo_receipt.magic != 0)
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo reservation failed before heap update"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=RESERVATION_MISMATCH "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+								   cluster_node_id)));
+			}
+#endif
 			/* Note we always use WAL and FSM during updates */
 			heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup, 0);
 			newtupsize = MAXALIGN(heaptup->t_len);
+#ifdef USE_PGRAC_CLUSTER
+			if (resume_update_receipt
+				&& !cluster_heap_prepare_undo_record_exact(
+					UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+					(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								errmsg("cluster undo reservation failed before heap update"),
+								cluster_heap_undo_receipt_errdetail(false)));
+#endif
 		}
 		else
 			heaptup = newtup;
@@ -11642,9 +11712,11 @@ l_pgrac_reacquire:
 			if (!cluster_heap_restart_update_undo_record_exact(
 					&canonical_binding, undo_prepare_deadline_us,
 					&undo_receipt))
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("cluster undo reservation expired before heap update capacity retry")));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+					 errmsg("cluster undo reservation expired before heap update capacity retry"),
+					 cluster_heap_undo_receipt_errdetail(false)));
 			if (old_tuple_temp_locked)
 				goto l_pgrac_reacquire;
 			cluster_heap_lock_with_vm_repin(
@@ -11686,9 +11758,10 @@ l_pgrac_reacquire:
 						&& !cluster_heap_restart_update_undo_record_exact(
 							&canonical_binding, undo_prepare_deadline_us,
 							&undo_receipt))
-						ereport(ERROR,
-								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("cluster undo reservation expired before cross-page heap update capacity retry")));
+						ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+										errmsg("cluster undo reservation expired before cross-page "
+											   "heap update capacity retry"),
+										cluster_heap_undo_receipt_errdetail(false)));
 					goto l_pgrac_reacquire;
 				}
 			}
@@ -11745,9 +11818,10 @@ l_pgrac_reacquire:
 							&& !cluster_heap_restart_update_undo_record_exact(
 								&canonical_binding,
 								undo_prepare_deadline_us, &undo_receipt))
-							ereport(ERROR,
-									(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-									 errmsg("cluster undo reservation expired before cross-page heap update capacity retry")));
+							ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+											errmsg("cluster undo reservation expired before "
+												   "cross-page heap update capacity retry"),
+											cluster_heap_undo_receipt_errdetail(false)));
 						goto l_pgrac_reacquire;
 					}
 				}
@@ -11888,10 +11962,9 @@ l_pgrac_reacquire:
 				undo_result = CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 			else if (!cluster_undo_record_prepared_recheck(
 					&undo_receipt, undo_payload_len))
-				undo_result = undo_receipt.absolute_deadline_us
-					> (uint64)GetCurrentTimestamp()
-						? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
-						: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+				undo_result = undo_receipt.ctrc_applied_mask == 0
+								  ? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
+								  : CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 			else
 				undo_result = CLUSTER_HEAP_PREPARED_UNDO_READY;
 
@@ -11933,22 +12006,22 @@ l_pgrac_reacquire:
 								&undo_receipt, ctrc_target_ordinal))
 							ereport(ERROR,
 									(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-									 errmsg("CTRC receipt preparation failed before heap update")));
+									 errmsg("CTRC receipt preparation failed before heap update"),
+									 cluster_heap_undo_receipt_errdetail(true)));
 					}
 				}
 				else
 				{
-					cluster_undo_record_cancel_prepared(&undo_receipt);
-					if (!cluster_heap_prepare_undo_record_exact(
-							UNDO_RECORD_UPDATE,
-							(uint16)cluster_undo_record_inline_max_bytes,
-							(uint16)canonical_binding.segment_id,
-							canonical_binding.slot_offset,
-							(UBA) InvalidUba_init,
-							undo_prepare_deadline_us, &undo_receipt))
-						ereport(ERROR,
-								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("cluster undo reservation expired before heap update retry")));
+					if (!cluster_heap_retry_undo_record_exact(
+							UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+							(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+							(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt,
+							ctrc_target_mismatch))
+						ereport(
+							ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							 errmsg("cluster undo reservation expired before heap update retry"),
+							 cluster_heap_undo_receipt_errdetail(false)));
 				}
 				if (old_tuple_temp_locked)
 					goto l_pgrac_reacquire;
@@ -12587,17 +12660,15 @@ l_pgrac_reacquire:
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			if (had_undo_ready)
 			{
-				cluster_undo_record_cancel_prepared(&undo_receipt);
-				if (!cluster_heap_prepare_undo_record_exact(
-						UNDO_RECORD_UPDATE,
-						(uint16)cluster_undo_record_inline_max_bytes,
-						(uint16)canonical_binding.segment_id,
-						canonical_binding.slot_offset,
-						(UBA) InvalidUba_init,
-						undo_prepare_deadline_us, &undo_receipt))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo reservation expired before heap update final retry")));
+				if (!cluster_heap_retry_undo_record_exact(
+						UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+						(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+						(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt, false))
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo reservation expired before heap update final retry"),
+						 cluster_heap_undo_receipt_errdetail(false)));
 			}
 			if (old_tuple_temp_locked)
 				goto l_pgrac_reacquire;
@@ -13372,9 +13443,9 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 			(uint16)canonical_binding.segment_id,
 			canonical_binding.slot_offset, (UBA) InvalidUba_init,
 			undo_prepare_deadline_us, &undo_receipt)))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-				 errmsg("cluster undo reservation failed before heap tuple lock")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						errmsg("cluster undo reservation failed before heap tuple lock"),
+						cluster_heap_undo_receipt_errdetail(false)));
 #endif
 
 	*buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
@@ -14677,10 +14748,11 @@ failed:
 						 errmsg("heap tuple-lock ITL reference lacks a CURRENT receipt identity")));
 			{
 				ClusterHeapPreparedUndoResult undo_result;
+				bool targets_invalidated;
 
 				undo_result = cluster_heap_itl_prepare_prepared_undo(
-					relation, *buffer, tuple, canonical_xid, true,
-					&undo_receipt, sizeof(UndoItlPayload));
+					relation, *buffer, tuple, canonical_xid, true, &undo_receipt,
+					sizeof(UndoItlPayload), &targets_invalidated);
 				if (undo_result
 					== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 				{
@@ -14689,26 +14761,24 @@ failed:
 						  && (undo_receipt.ctrc_prepared_mask & UINT8_C(1)) == 0;
 
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
-					if (ctrc_prepare_only)
-					{
+					if (ctrc_prepare_only && !targets_invalidated) {
 						if (!cluster_undo_record_ctrc_prepare_pending(
 								&undo_receipt, 0))
-							ereport(ERROR,
-									(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-									 errmsg("CTRC receipt preparation failed before heap tuple lock")));
-					}
-					else
-					{
-						cluster_undo_record_cancel_prepared(&undo_receipt);
-						if (!cluster_heap_prepare_undo_record_exact(
+							ereport(
+								ERROR,
+								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								 errmsg("CTRC receipt preparation failed before heap tuple lock"),
+								 cluster_heap_undo_receipt_errdetail(true)));
+					} else {
+						if (!cluster_heap_retry_undo_record_exact(
 								UNDO_RECORD_ITL, sizeof(UndoItlPayload),
-								(uint16)canonical_binding.segment_id,
-								canonical_binding.slot_offset,
-								(UBA) InvalidUba_init,
-								undo_prepare_deadline_us, &undo_receipt))
-							ereport(ERROR,
-									(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-									 errmsg("cluster undo reservation expired before heap tuple lock retry")));
+								(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+								(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt,
+								targets_invalidated))
+							ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+											errmsg("cluster undo reservation expired before heap "
+												   "tuple lock retry"),
+											cluster_heap_undo_receipt_errdetail(false)));
 					}
 					cluster_heap_lock_with_vm_repin(
 						relation, block, *buffer, &vmbuffer);
@@ -14893,16 +14963,16 @@ failed:
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 			if (had_undo_ready)
 			{
-				cluster_undo_record_cancel_prepared(&undo_receipt);
-				if (!cluster_heap_prepare_undo_record_exact(
+				if (!cluster_heap_retry_undo_record_exact(
 						UNDO_RECORD_ITL, sizeof(UndoItlPayload),
-						(uint16)canonical_binding.segment_id,
-						canonical_binding.slot_offset,
-						(UBA) InvalidUba_init,
-						undo_prepare_deadline_us, &undo_receipt))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo reservation expired before heap tuple lock final retry")));
+						(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
+						(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt, false))
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg(
+							 "cluster undo reservation expired before heap tuple lock final retry"),
+						 cluster_heap_undo_receipt_errdetail(false)));
 			}
 			cluster_heap_lock_with_vm_repin(
 				relation, block, *buffer, &vmbuffer);
@@ -15624,6 +15694,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	bool		cluster_chain_lock_stamp = false;
 	bool		cluster_chain_needs_itl = false;
 	bool		cluster_chain_receipt_owned = false;
+	uint64 cluster_chain_prepare_deadline_us = 0;
 	bool		cluster_chain_vm_locked = false;
 	uint8		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	UBA			cluster_chain_uba = InvalidUba_init;
@@ -15979,6 +16050,7 @@ l4:
 		if (cluster_chain_needs_itl)
 		{
 			ClusterHeapPreparedUndoResult undo_result;
+			bool targets_invalidated;
 
 			if (new_infomask & HEAP_XMAX_IS_MULTI)
 			{
@@ -15992,12 +16064,12 @@ l4:
 			if (!cluster_chain_receipt_owned)
 			{
 				ClusterCanonicalTxnBinding binding = {0};
-				uint64 deadline_us;
 
 				/* Receipt reservation can allocate/wait; never do it while the
 				 * heap content lock is held. */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				deadline_us = cluster_undo_record_prepare_deadline_us();
+				if (cluster_chain_prepare_deadline_us == 0)
+					cluster_chain_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 				if (!cluster_tt_local_get_published_binding(
 						canonical_xid, &binding))
 					ereport(ERROR,
@@ -16008,23 +16080,23 @@ l4:
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 							 errmsg("update-chain ITL reference lacks a CURRENT receipt identity")));
-				if (deadline_us == 0
+				if (cluster_chain_prepare_deadline_us == 0
 					|| !cluster_heap_prepare_undo_record_exact(
-						UNDO_RECORD_ITL, sizeof(UndoItlPayload),
-						(uint16) binding.segment_id, binding.slot_offset,
-						(UBA) InvalidUba_init, deadline_us,
-						&cluster_chain_receipt))
+						UNDO_RECORD_ITL, sizeof(UndoItlPayload), (uint16)binding.segment_id,
+						binding.slot_offset, (UBA)InvalidUba_init,
+						cluster_chain_prepare_deadline_us, &cluster_chain_receipt))
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo reservation failed before update-chain lock")));
+							 errmsg("cluster undo reservation failed before update-chain lock"),
+							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_chain_receipt_owned = true;
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 				goto l4;
 			}
 
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
-				rel, buf, &mytup, canonical_xid, true,
-				&cluster_chain_receipt, sizeof(UndoItlPayload));
+				rel, buf, &mytup, canonical_xid, true, &cluster_chain_receipt,
+				sizeof(UndoItlPayload), &targets_invalidated);
 			if (undo_result == CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
 				bool prepare_only
@@ -16032,19 +16104,27 @@ l4:
 					  && (cluster_chain_receipt.ctrc_prepared_mask & UINT8_C(1)) == 0;
 
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				if (prepare_only)
-				{
+				if (prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&cluster_chain_receipt, 0))
 						ereport(ERROR,
 								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("CTRC receipt preparation failed before update-chain lock")));
-				}
-				else
-				{
-					cluster_undo_record_cancel_prepared(
-						&cluster_chain_receipt);
-					cluster_chain_receipt_owned = false;
+								 errmsg("CTRC receipt preparation failed before update-chain lock"),
+								 cluster_heap_undo_receipt_errdetail(true)));
+				} else {
+					ClusterUndoRecordPrepareResult requalified
+						= cluster_undo_record_requalify_for_retry(
+							&cluster_chain_receipt, sizeof(UndoItlPayload), targets_invalidated);
+
+					if (requalified == CLUSTER_UNDO_RECORD_PREPARE_REFUSED)
+						ereport(ERROR,
+								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								 errmsg("cluster undo reservation failed before update-chain lock"),
+								 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=%s "
+										   "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+										   cluster_undo_record_receipt_last_reason(),
+										   cluster_node_id)));
+					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 				}
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 				goto l4;
@@ -16106,15 +16186,24 @@ l4:
 				if (boundary_result
 					== CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY)
 				{
+					ClusterUndoRecordPrepareResult requalified;
+
 					if (cluster_chain_vm_locked)
 					{
 						LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 						cluster_chain_vm_locked = false;
 					}
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-					cluster_undo_record_cancel_prepared(
-						&cluster_chain_receipt);
-					cluster_chain_receipt_owned = false;
+					requalified = cluster_undo_record_requalify_for_retry(
+						&cluster_chain_receipt, sizeof(UndoItlPayload), false);
+					if (requalified == CLUSTER_UNDO_RECORD_PREPARE_REFUSED)
+						ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+										errmsg("update-chain unified receipt boundary was refused"),
+										errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=%s "
+												  "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+												  cluster_undo_record_receipt_last_reason(),
+												  cluster_node_id)));
+					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 					LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 					goto l4;
 				}

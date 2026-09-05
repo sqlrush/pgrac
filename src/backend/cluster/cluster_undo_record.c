@@ -145,6 +145,7 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 block_write_count;
 	pg_atomic_uint64 block_flush_count;
 	pg_atomic_uint64 reader_lookup_count;
+	pg_atomic_uint64 receipt_metrics[CLUSTER_UNDO_RECEIPT_METRIC_COUNT];
 
 	/* spec-3.8 D10: 4 NEW lifecycle counters. */
 	pg_atomic_uint64 autoextend_count;			/* cluster_undo_segment_extend_or_create success */
@@ -358,6 +359,42 @@ static ClusterUndoRecordReservation cluster_undo_record_reservation = {
 };
 static uint64 cluster_undo_record_reservation_floor = 0;
 
+static const char *cluster_undo_receipt_reason = "NONE";
+/* Before-cancel diagnostics only; never consulted to authorize a mutation. */
+static struct {
+	bool armed;
+	bool exact_ready;
+	bool targets_invalidated;
+	uint64 sequence;
+	uint8 applied_mask;
+} cluster_undo_retry_cancel_snapshot;
+
+static void
+cluster_undo_receipt_metric_add(ClusterUndoReceiptMetric metric)
+{
+	Assert(metric >= 0 && metric < CLUSTER_UNDO_RECEIPT_METRIC_COUNT);
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->receipt_metrics[metric], 1);
+}
+
+bool
+cluster_undo_record_receipt_stats_snapshot(uint64 values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT])
+{
+	int i;
+
+	if (values == NULL || UndoRecordShared == NULL)
+		return false;
+	for (i = 0; i < CLUSTER_UNDO_RECEIPT_METRIC_COUNT; i++)
+		values[i] = pg_atomic_read_u64(&UndoRecordShared->receipt_metrics[i]);
+	return true;
+}
+
+const char *
+cluster_undo_record_receipt_last_reason(void)
+{
+	return cluster_undo_receipt_reason;
+}
+
 static bool cluster_undo_pending_flush_internal(bool error_on_fail);
 static void cluster_undo_record_observation_apply_locked(uint8 owner_instance);
 
@@ -551,6 +588,8 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->block_write_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->block_flush_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->reader_lookup_count, 0);
+		for (i = 0; i < CLUSTER_UNDO_RECEIPT_METRIC_COUNT; i++)
+			pg_atomic_init_u64(&UndoRecordShared->receipt_metrics[i], 0);
 
 		/* spec-3.8 D10: 4 NEW lifecycle counters. */
 		pg_atomic_init_u64(&UndoRecordShared->autoextend_count, 0);
@@ -2051,12 +2090,10 @@ cluster_undo_record_receipt_extent_matches(
 	const ClusterUndoExtent *frozen;
 
 	if (receipt == NULL || receipt->magic != CLUSTER_UNDO_RECORD_RECEIPT_MAGIC
-		|| !cluster_undo_record_reservation.active
-		|| receipt->reservation_sequence == 0
-		|| receipt->reservation_sequence
-			!= cluster_undo_record_reservation.sequence
-		|| memcmp(receipt, &cluster_undo_record_reservation.receipt,
-				  sizeof(*receipt)) != 0)
+		|| !cluster_undo_record_reservation.active || receipt->reservation_sequence == 0
+		|| receipt->reservation_sequence == PG_UINT64_MAX
+		|| receipt->reservation_sequence != cluster_undo_record_reservation.sequence
+		|| memcmp(receipt, &cluster_undo_record_reservation.receipt, sizeof(*receipt)) != 0)
 		return false;
 	frozen = &receipt->extent;
 	return live->segment_id == frozen->segment_id
@@ -2106,17 +2143,26 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity,
 	uint32 ensured_segment_id;
 	char *resident;
 
+	cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_PREPARE_START);
+	cluster_undo_receipt_reason = "PREPARE_REFUSED";
 	if (receipt == NULL)
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	memset(receipt, 0, sizeof(*receipt));
 	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL
 		|| payload_capacity > (uint16)cluster_undo_record_inline_max_bytes
-		|| UndoRecordShared == NULL || absolute_deadline_us == 0
-		|| absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+		|| UndoRecordShared == NULL || absolute_deadline_us == 0)
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	if (absolute_deadline_us <= (uint64)GetCurrentTimestamp()) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_PREPARE_TIMEOUT);
+		cluster_undo_receipt_reason = "PREPARE_TIMEOUT_BEFORE_READY";
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
 	record_length = undo_record_total_length(record_type, payload_capacity);
-	if (record_length > UNDO_RECORD_HARD_CAP_BYTES)
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
+		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
 
 	if (reservation->active)
 		cluster_undo_record_cancel_prepared(&reservation->receipt);
@@ -2173,6 +2219,8 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity,
 		if (claim_result == CLAIM_OK)
 			continue;
 		if (claim_result == CLAIM_HARD_CAP) {
+			cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
+			cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
 			cluster_undo_cleaner_wakeup();
 			return CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
 		}
@@ -2229,12 +2277,15 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity,
 	 * cluster/undo producer while the heap content lock is later held. */
 	admission = cluster_semantic_activation_modifier_enter(
 		cluster_undo_record_writable_admission(), &modifier_admission);
-	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !cluster_semantic_activation_modifier_recheck(
-			&modifier_admission, cluster_undo_record_writable_admission())
-		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
-			&publication))
-	{
+	if (absolute_deadline_us <= (uint64)GetCurrentTimestamp()
+		|| admission != CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !cluster_semantic_activation_modifier_recheck(&modifier_admission,
+														 cluster_undo_record_writable_admission())
+		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(&publication)) {
+		if (absolute_deadline_us <= (uint64)GetCurrentTimestamp()) {
+			cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_PREPARE_TIMEOUT);
+			cluster_undo_receipt_reason = "PREPARE_TIMEOUT_BEFORE_READY";
+		}
 		if (modifier_admission.entered)
 			cluster_semantic_activation_leave(&modifier_admission);
 		if (reservation->owns_ref && reservation->ref_slot >= 0)
@@ -2264,6 +2315,8 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity,
 	 * any slot and is consumed only after the exact receipt recheck. */
 	(void)prev_uba;
 	cluster_undo_record_touched_segment(ext->segment_id, owner_instance);
+	cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_READY);
+	cluster_undo_receipt_reason = "NONE";
 	return CLUSTER_UNDO_RECORD_PREPARE_READY;
 }
 
@@ -2431,6 +2484,7 @@ cluster_undo_record_ctrc_prepare_pending(
 	uint32 grant = 0;
 	uint8 target_bit;
 
+	cluster_undo_receipt_reason = "CTRC_PENDING_IDENTITY_MISMATCH";
 	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
 		return false;
 	target_bit = UINT8_C(1) << target_ordinal;
@@ -2438,11 +2492,8 @@ cluster_undo_record_ctrc_prepare_pending(
 		|| (receipt->ctrc_prepared_mask & target_bit) != 0
 		|| (receipt->ctrc_applied_mask & target_bit) != 0
 		|| (receipt->ctrc_reuse_mask & target_bit) != 0
-		|| receipt->ctrc_handles[target_ordinal].valid
-		|| !TransactionIdIsValid(xid)
-		|| MyBackendId <= 0
-		|| !cluster_undo_record_receipt_extent_matches(receipt)
-		|| receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+		|| receipt->ctrc_handles[target_ordinal].valid || !TransactionIdIsValid(xid)
+		|| MyBackendId <= 0 || !cluster_undo_record_receipt_extent_matches(receipt))
 		return false;
 	MemSet(&status_key, 0, sizeof(status_key));
 	MemSet(&status, 0, sizeof(status));
@@ -2477,9 +2528,10 @@ cluster_undo_record_ctrc_prepare_pending(
 	publication.grant_generation = grant;
 	result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant,
 		&publication, &receipt->ctrc_pending_targets[target_ordinal], &handle);
-	if (result != CLUSTER_CTRC_PREPARE_READY
-		&& result != CLUSTER_CTRC_PREPARE_DUPLICATE)
+	if (result != CLUSTER_CTRC_PREPARE_READY && result != CLUSTER_CTRC_PREPARE_DUPLICATE) {
+		cluster_undo_receipt_reason = "CTRC_PREPARE_REFUSED";
 		return false;
+	}
 	receipt->ctrc_handles[target_ordinal] = handle;
 	receipt->ctrc_prepared_mask |= target_bit;
 	if (!cluster_undo_record_receipt_sync(receipt))
@@ -2487,6 +2539,7 @@ cluster_undo_record_ctrc_prepare_pending(
 		(void)cluster_ctrc_receipt_cancel_shared(&handle);
 		return false;
 	}
+	cluster_undo_receipt_reason = "NONE";
 	return true;
 }
 
@@ -2525,6 +2578,7 @@ cluster_undo_record_ctrc_apply_prepared(
 }
 
 
+/* READY identity has no wall-clock lease. */
 bool
 cluster_undo_record_prepared_recheck(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len)
@@ -2533,23 +2587,23 @@ cluster_undo_record_prepared_recheck(
 	const char *reason = NULL;
 
 	if (receipt == NULL)
-		reason = "null";
+		reason = "NULL_RECEIPT";
 	else if (payload_len > receipt->payload_capacity)
-		reason = "payload";
-	else if (receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
-		reason = "deadline";
+		reason = "CAPACITY_REFUSAL";
 	else if (!cluster_undo_record_receipt_extent_matches(receipt))
-		reason = "extent";
+		reason = "RESERVATION_MISMATCH";
 	else if (!cluster_semantic_activation_modifier_recheck(
 				 &receipt->modifier_admission,
 				 cluster_undo_record_writable_admission()))
-		reason = "modifier";
+		reason = "MODIFIER_ADMISSION_CHANGED";
 	else if (!cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 				 &receipt->block0_publication))
-		reason = "block0";
+		reason = "BLOCK0_PUBLICATION_CHANGED";
 	else
 		return true;
 
+	cluster_undo_receipt_reason = reason;
+	cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_RESERVATION_MISMATCH);
 	if (diagnostic_budget > 0)
 	{
 		diagnostic_budget--;
@@ -2563,6 +2617,55 @@ cluster_undo_record_prepared_recheck(
 					(uint64)GetCurrentTimestamp())));
 	}
 	return false;
+}
+
+ClusterUndoRecordPrepareResult
+cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt,
+										uint16 payload_len, bool targets_invalidated)
+{
+	bool exact_ready;
+	uint64 original_deadline;
+
+	cluster_undo_retry_cancel_snapshot.armed = false;
+	if (receipt == NULL || !cluster_undo_record_reservation.active
+		|| receipt->magic != CLUSTER_UNDO_RECORD_RECEIPT_MAGIC
+		|| memcmp(receipt, &cluster_undo_record_reservation.receipt, sizeof(*receipt)) != 0) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_RESERVATION_MISMATCH);
+		cluster_undo_receipt_reason = "RESERVATION_MISMATCH";
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
+	if (receipt->ctrc_applied_mask != 0 || cluster_undo_record_reservation.consume_locked) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_POST_APPLY_REPREPARE);
+		cluster_undo_receipt_reason = "POST_APPLY_REPREPARE_REFUSED";
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
+	/* All heap locks have been dropped.  Use the existing blocking resident
+	 * sampler: a missed conditional content-lock probe is not invalidation. */
+	exact_ready = payload_len <= receipt->payload_capacity
+				  && cluster_undo_record_receipt_extent_matches(receipt)
+				  && cluster_semantic_activation_modifier_recheck(
+					  &receipt->modifier_admission, cluster_undo_record_writable_admission())
+				  && cluster_undo_block0_current_live_owner_publication_recheck(
+					  &receipt->block0_publication);
+	if (exact_ready && !targets_invalidated) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_RETRY_PRESERVED);
+		cluster_undo_receipt_reason = "NONE";
+		return CLUSTER_UNDO_RECORD_PREPARE_READY;
+	}
+	original_deadline = receipt->absolute_deadline_us;
+	cluster_undo_retry_cancel_snapshot.exact_ready = exact_ready;
+	cluster_undo_retry_cancel_snapshot.targets_invalidated = targets_invalidated;
+	cluster_undo_retry_cancel_snapshot.sequence = receipt->reservation_sequence;
+	cluster_undo_retry_cancel_snapshot.applied_mask = receipt->ctrc_applied_mask;
+	cluster_undo_retry_cancel_snapshot.armed = true;
+	cluster_undo_record_cancel_prepared(receipt);
+	if (original_deadline <= (uint64)GetCurrentTimestamp()) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_INVALIDATED_BUDGET_EXHAUSTED);
+		cluster_undo_receipt_reason = "PREPARE_BUDGET_EXHAUSTED_AFTER_EXACT_INVALIDATION";
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
+	cluster_undo_receipt_reason = "EXACT_IDENTITY_INVALIDATED";
+	return CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
 }
 
 bool
@@ -2603,6 +2706,14 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 		|| receipt->reservation_sequence != reservation->sequence
 		|| memcmp(receipt, &reservation->receipt, sizeof(*receipt)) != 0)
 		return;
+	if (cluster_undo_retry_cancel_snapshot.armed) {
+		if (cluster_undo_retry_cancel_snapshot.sequence == receipt->reservation_sequence
+			&& cluster_undo_retry_cancel_snapshot.exact_ready
+			&& !cluster_undo_retry_cancel_snapshot.targets_invalidated)
+			cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_REPREPARE_PREMATURE);
+		cluster_undo_retry_cancel_snapshot.armed = false;
+	}
+	cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CANCEL);
 	{
 		uint8 target_ordinal;
 
@@ -2648,24 +2759,27 @@ cluster_undo_record_consume_preflight(
 	uint16 record_length;
 	int local_head_idx;
 
-	if (receipt == NULL || payload_len > receipt->payload_capacity
-		|| reservation->consume_locked)
+	if (receipt == NULL || payload_len > receipt->payload_capacity || reservation->consume_locked
+		|| receipt->ctrc_applied_mask != 0)
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_REFUSED;
 	if (!cluster_undo_record_receipt_extent_matches(receipt)
 		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 			&receipt->block0_publication)
 		|| !cluster_semantic_activation_modifier_recheck(
-			&receipt->modifier_admission,
-			cluster_undo_record_writable_admission())
-		|| receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+			&receipt->modifier_admission, cluster_undo_record_writable_admission())) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_PREFLIGHT_IDENTITY_REFUSAL);
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED;
+	}
 
 	record_length = undo_record_total_length(receipt->record_type, payload_len);
 	if (!cluster_undo_block_has_space(receipt->extent.cur_free_offset,
-			receipt->extent.cur_slot_count, record_length)
-		|| !cluster_undo_local_head_ensure(receipt->tt_slot_segment_id,
-			receipt->tt_slot_offset, &local_head_idx))
+									  receipt->extent.cur_slot_count, record_length)
+		|| !cluster_undo_local_head_ensure(receipt->tt_slot_segment_id, receipt->tt_slot_offset,
+										   &local_head_idx)) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
+		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED;
+	}
 	if (!cluster_undo_buf_lock_ref_conditional(reservation->ref_slot,
 			receipt->actual_segment_id, receipt->owner_instance,
 			receipt->extent.cur_block))
@@ -2678,10 +2792,8 @@ cluster_undo_record_consume_preflight(
 		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 			&receipt->block0_publication)
 		|| !cluster_semantic_activation_modifier_recheck(
-			&receipt->modifier_admission,
-			cluster_undo_record_writable_admission())
-		|| receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
-	{
+			&receipt->modifier_admission, cluster_undo_record_writable_admission())) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_PREFLIGHT_IDENTITY_REFUSAL);
 		cluster_undo_buf_unlock_ref(reservation->ref_slot);
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED;
 	}
@@ -2829,6 +2941,9 @@ cluster_undo_record_consume_prepared(
 	cluster_undo_current_extent.cur_free_offset = free_offset + record_length;
 	cluster_undo_current_extent.cur_slot_count = (uint16)(slot_count + 1);
 	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, 1);
+	cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_APPLY);
+	if (receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_READY_SURVIVED_DEADLINE);
 	cluster_undo_touched_in_xact = true;
 	result = uba_encode(receipt->actual_segment_id,
 		receipt->extent.cur_block, receipt->tt_slot_offset, new_slot_idx);

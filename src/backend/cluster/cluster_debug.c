@@ -2979,6 +2979,32 @@ dump_visibility(ReturnSetInfo *rsinfo)
 static void
 dump_undo(ReturnSetInfo *rsinfo)
 {
+	static const char *const receipt_keys[]
+		= { "prepare_start",
+			"prepare_timeout_before_ready",
+			"ready_count",
+			"ready_survived_prepare_deadline",
+			"consume_preflight_identity_refusal",
+			"receipt_apply_count",
+			"receipt_cancel_count",
+			"receipt_capacity_refusal",
+			"receipt_reservation_mismatch",
+			"ready_reprepare_premature_count",
+			"prepare_budget_exhausted_after_exact_invalidation_count",
+			"post_apply_reprepare_refused_count",
+			"ready_retry_preserved_count" };
+	uint64 receipt_values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT];
+	bool receipt_available = cluster_undo_record_receipt_stats_snapshot(receipt_values);
+	int receipt_metric;
+
+	StaticAssertStmt(lengthof(receipt_keys) == CLUSTER_UNDO_RECEIPT_METRIC_COUNT,
+					 "receipt diagnostic names must match the counter order");
+	emit_row(rsinfo, "undo", "receipt_stats_available", receipt_available ? "true" : "false");
+	if (receipt_available)
+		for (receipt_metric = 0; receipt_metric < CLUSTER_UNDO_RECEIPT_METRIC_COUNT;
+			 receipt_metric++)
+			emit_row(rsinfo, "undo", receipt_keys[receipt_metric],
+					 fmt_int64((int64)receipt_values[receipt_metric]));
 	emit_row(rsinfo, "undo", "record_alloc_count",
 			 fmt_int64((int64)cluster_undo_record_alloc_count()));
 	emit_row(rsinfo, "undo", "segment_claim_count",
