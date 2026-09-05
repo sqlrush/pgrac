@@ -19,11 +19,13 @@
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
+#include "port/pg_crc32c.h"
 
 #include "unit_test.h"
 
 /* Generated from the production bufmgr function bodies, never a test rewrite. */
 #include "test_cluster_pcm_snapshot_owner.inc"
+#include "test_cluster_pcm_checksum_owner.inc"
 
 #include <errno.h>
 #include <limits.h>
@@ -169,6 +171,7 @@ transition_unexpected_drop(void)
 #define BufMappingPartitionLock(hash) ((void)(hash), &transition_mapping_lock)
 #define BufTableLookup(lookup_tag, hash)                                                           \
 	(BufferTagsEqual((lookup_tag), &transition_buf->tag) ? transition_buf->buf_id : -1)
+#define GetBufferDescriptor(id) ((void)(id), transition_buf)
 #define LWLockAcquire transition_lock_acquire
 #define LWLockConditionalAcquire transition_lock_acquire
 #define LWLockRelease transition_lock_release
@@ -206,6 +209,7 @@ transition_unexpected_drop(void)
 #undef LWLockConditionalAcquire
 #undef LWLockAcquire
 #undef BufTableLookup
+#undef GetBufferDescriptor
 #undef BufMappingPartitionLock
 #undef BufTableHashCode
 #undef BufHdrGetBlock
@@ -476,6 +480,196 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_flush_leaves_dirty = false;
 	cluster_pcm_x_finish_retain_flush_active = false;
 	cluster_pcm_x_finish_retain_flush_io_active = false;
+}
+
+UT_TEST(test_real_known_new_sidecar_rejects_installed_remote_image)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot ignored;
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferInstallProof installed;
+	ResourceXBufferActivationProof activated;
+	int initialized;
+
+	for (initialized = 0; initialized < 2; initialized++) {
+		transition_fixture(&buf, &entry, &ignored, false);
+		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		buf.pcm_state = (uint8)PCM_STATE_X;
+		buf.buffer_type = (uint8)BUF_TYPE_XCUR;
+		pg_atomic_write_u64(&entry.generation, 1);
+		pg_atomic_write_u64(&entry.reservation_token, 1);
+		pg_atomic_write_u64(&entry.writer_activation_token, 1);
+		pg_atomic_write_u32(&entry.flags, 0);
+		memset(transition_page.data, 0, BLCKSZ);
+		if (initialized) {
+			((PageHeader)transition_page.data)->pd_lower = SizeOfPageHeaderData;
+			((PageHeader)transition_page.data)->pd_upper = BLCKSZ;
+			((PageHeader)transition_page.data)->pd_special = BLCKSZ;
+		}
+		memset(&ref, 0, sizeof(ref));
+		ref.assertion.resource = buf.tag;
+		ref.assertion.requester_node = 3;
+		ref.formation = 2;
+		ref.acquisition_generation = 1;
+		UT_ASSERT_EQ(PageIsNew((Page)transition_page.data), !initialized);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(&ref, 1, 1, false,
+																			 &installed, NULL),
+					 initialized ? RESOURCE_X_BUFFER_STALE : RESOURCE_X_BUFFER_T2_INSTALLED);
+		if (initialized) {
+			/* A remote carrier has replaced the known-new image.  This
+			 * narrow helper must not turn that into known-new authority. */
+			UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_generation_get(0), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_writer_activation_token_get(0), 1);
+			UT_ASSERT_EQ(installed.ownership_generation, 0);
+		} else {
+			UT_ASSERT_EQ(installed.ownership_generation, 1);
+			UT_ASSERT_EQ(installed.resource_x_activation_generation, 1);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(&ref, 1, 1, true,
+																				 NULL, &activated),
+						 RESOURCE_X_BUFFER_T2_INSTALLED);
+			UT_ASSERT_EQ(activated.writer_activation_token, 0);
+		}
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot ignored;
+	ResourceXAcquisitionRef ref;
+	ResourceXCurrentImage image;
+	ResourceXBufferInstallProof installed;
+	ResourceXBufferActivationProof activated;
+	PGAlignedBlock carrier;
+	PGAlignedBlock before;
+	int scenario;
+	const ResourceXBufferActivationResult expected[]
+		= { RESOURCE_X_BUFFER_T2_INSTALLED, RESOURCE_X_BUFFER_CORRUPT, RESOURCE_X_BUFFER_CORRUPT,
+			RESOURCE_X_BUFFER_CORRUPT,		RESOURCE_X_BUFFER_ABSENT,  RESOURCE_X_BUFFER_STALE,
+			RESOURCE_X_BUFFER_STALE,		RESOURCE_X_BUFFER_CORRUPT };
+
+	for (scenario = 0; scenario < lengthof(expected); scenario++) {
+		transition_fixture(&buf, &entry, &ignored, false);
+		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		buf.pcm_state = (uint8)PCM_STATE_X;
+		buf.buffer_type = (uint8)BUF_TYPE_XCUR;
+		pg_atomic_write_u64(&entry.generation, 1);
+		pg_atomic_write_u64(&entry.reservation_token, 1);
+		pg_atomic_write_u64(&entry.writer_activation_token, 1);
+		pg_atomic_write_u32(&entry.flags, 0);
+		((PageHeader)transition_page.data)->pd_lower = SizeOfPageHeaderData;
+		((PageHeader)transition_page.data)->pd_upper = BLCKSZ;
+		((PageHeader)transition_page.data)->pd_special = BLCKSZ;
+		memcpy(carrier.data, transition_page.data, BLCKSZ);
+		memcpy(before.data, transition_page.data, BLCKSZ);
+		memset(&ref, 0, sizeof(ref));
+		ref.assertion.resource = buf.tag;
+		ref.assertion.requester_node = 3;
+		ref.formation = 2;
+		ref.acquisition_generation = 1;
+		memset(&image, 0, sizeof(image));
+		image.page_bytes = carrier.data;
+		image.image_length = BLCKSZ;
+		image.page_lsn = PageGetLSN((Page)carrier.data);
+		image.page_scn = ((PageHeader)carrier.data)->pd_block_scn;
+		image.page_checksum = cluster_gcs_block_compute_checksum(carrier.data);
+		if (scenario == 1)
+			image.page_checksum++;
+		else if (scenario == 2)
+			image.page_lsn++;
+		else if (scenario == 3)
+			image.page_scn++;
+		else if (scenario == 4)
+			ref.assertion.resource.relNumber++;
+		else if (scenario == 5)
+			pg_atomic_write_u64(&entry.writer_activation_token, 2);
+		else if (scenario == 6)
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 2);
+		else if (scenario == 7)
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		UT_ASSERT(!PageIsNew((Page)transition_page.data));
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
+					 expected[scenario]);
+		UT_ASSERT_EQ(memcmp(before.data, transition_page.data, BLCKSZ), 0);
+		if (scenario == 0) {
+			UT_ASSERT_EQ(installed.ownership_generation, 1);
+			UT_ASSERT_EQ(installed.writer_activation_token, 1);
+			UT_ASSERT_EQ(installed.resource_x_activation_generation, 1);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
+						 RESOURCE_X_BUFFER_ALREADY_INSTALLED);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+				RESOURCE_X_BUFFER_T2_INSTALLED);
+			UT_ASSERT_EQ(activated.ownership_generation, 1);
+			UT_ASSERT_EQ(activated.writer_activation_token, 0);
+			UT_ASSERT_EQ(activated.resource_x_activation_generation, 0);
+		} else
+			UT_ASSERT_EQ(installed.ownership_generation, 0);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_installed_claim_shape_is_exact_and_not_a_new_base)
+{
+	ClusterPcmOwnSnapshot observed;
+	ClusterPcmOwnSnapshot changed;
+	ResourceXAcquisitionRef ref;
+	ResourceXAcquisitionRef wrong_ref;
+	int scenario;
+
+	memset(&observed, 0, sizeof(observed));
+	observed.tag.spcOid = 1663;
+	observed.tag.dbOid = 5;
+	observed.tag.relNumber = 16386;
+	observed.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	observed.pcm_state = (uint8)PCM_STATE_X;
+	observed.generation = 1;
+	observed.reservation_token = 1;
+	observed.writer_activation_token = 1;
+	memset(&ref, 0, sizeof(ref));
+	ref.assertion.resource = observed.tag;
+	ref.assertion.requester_node = 3;
+	ref.formation = 2;
+	ref.acquisition_generation = 1;
+	UT_ASSERT(cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, 0, 1));
+	observed.resource_x_activation_generation = 1;
+	UT_ASSERT(cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, 0, 1));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, 1, 1));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, UINT64_MAX, 1));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&ref, &observed, 0, UINT64_MAX));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(NULL, &observed, 0, 1));
+	UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&ref, NULL, 0, 1));
+	for (scenario = 0; scenario < 8; scenario++) {
+		changed = observed;
+		wrong_ref = ref;
+		if (scenario == 0)
+			changed.tag.blockNum++;
+		else if (scenario == 1)
+			changed.generation++;
+		else if (scenario == 2)
+			changed.reservation_token++;
+		else if (scenario == 3)
+			changed.writer_activation_token++;
+		else if (scenario == 4)
+			changed.resource_x_activation_generation++;
+		else if (scenario == 5)
+			changed.flags = PCM_OWN_FLAG_GRANT_PENDING;
+		else if (scenario == 6)
+			changed.pcm_state = (uint8)PCM_STATE_N;
+		else
+			wrong_ref.acquisition_generation++;
+		UT_ASSERT(!cluster_pcm_x_resource_x_claim_installed_exact(&wrong_ref, &changed, 0, 1));
+	}
 }
 
 UT_TEST(test_real_source_copy_then_finish_preserves_owned_fence)
@@ -4106,7 +4300,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(85);
+	UT_PLAN(88);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);
 	UT_RUN(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift);
 	UT_RUN(test_bufmgr_snapshot_captures_image_type);
@@ -4115,6 +4309,9 @@ main(void)
 	UT_RUN(test_bufmgr_fence_rejects_every_non_image_byte_drift);
 	UT_RUN(test_bufmgr_snapshot_ignores_refcount_usage_and_pin_waiter);
 	UT_RUN(test_snapshot_post_state_uses_unpublished_locked_state);
+	UT_RUN(test_real_known_new_sidecar_rejects_installed_remote_image);
+	UT_RUN(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new);
+	UT_RUN(test_installed_claim_shape_is_exact_and_not_a_new_base);
 	UT_RUN(test_real_source_copy_then_finish_preserves_owned_fence);
 	UT_RUN(test_real_finish_flush_uses_current_image_and_rejects_failures);
 	UT_RUN(test_real_finish_failed_flush_rethrows_without_losing_fence);

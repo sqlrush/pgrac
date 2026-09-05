@@ -137,7 +137,7 @@ cluster_pcm_x_target_install_follow_adjudicate_exact(
 	else if (!cluster_pcm_own_snapshot_equal_exact(before, after))
 		result = RESOURCE_X_TARGET_INSTALL_RESAMPLE;
 	else if (raw_state < RESOURCE_X_TARGET_INSTALL_INVALID
-			 || raw_state > RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+			 || raw_state > RESOURCE_X_TARGET_INSTALL_RESAMPLE)
 		result = RESOURCE_X_TARGET_INSTALL_INVALID;
 
 	if (result != RESOURCE_X_TARGET_INSTALL_TERMINAL && terminal_ref != NULL)
@@ -274,6 +274,21 @@ cluster_pcm_x_resource_x_t3_snapshot_exact(const ResourceXAcquisitionRef *ref,
 {
 	return cluster_pcm_x_resource_x_t2_snapshot_exact(ref, live)
 		   && live->resource_x_activation_generation == ref->acquisition_generation;
+}
+
+/* The physical claim survives image installation.  This shape is not a
+ * grant: callers must separately hold the exact joined image/ref and claim.
+ * It only prevents a replay from treating installed G+1 as a new base G. */
+static inline bool
+cluster_pcm_x_resource_x_claim_installed_exact(const ResourceXAcquisitionRef *ref,
+											   const ClusterPcmOwnSnapshot *live,
+											   uint64 pending_generation, uint64 reservation_token)
+{
+	return pending_generation < UINT64_MAX - 1 && reservation_token != 0
+		   && reservation_token != UINT64_MAX
+		   && cluster_pcm_x_resource_x_t2_snapshot_exact(ref, live)
+		   && live->generation == pending_generation + 1
+		   && live->reservation_token == reservation_token;
 }
 
 static inline bool

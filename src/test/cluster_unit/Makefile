@@ -2417,7 +2417,7 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 # Compile the two actual bufmgr snapshot owners, verbatim, into this fixture.
 # Column-zero definitions/closing braces delimit these two dependency-light
 # functions.  Counts fail closed if either definition is moved or duplicated.
-test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_pcm_own_snapshot_post_state_locked\(/ { print "static inline void"; emit=1; post++ } \
 	     /^cluster_pcm_own_snapshot_locked\(/ { print "static inline void"; emit=1; capture++ } \
 	     /^cluster_pcm_own_fence_matches_locked\(/ { print "static inline bool"; emit=1; matches++ } \
@@ -2425,16 +2425,28 @@ test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	     END { if (post != 1 || capture != 1 || matches != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^cluster_bufmgr_pcm_direct_init_known_new_locked\(/ { print "static bool"; emit=1; known_new++ } \
+	     /^cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact\(/ { print "static ResourceXBufferActivationResult"; emit=1; sidecar++ } \
+	     /^cluster_bufmgr_pcm_own_activate_x_by_tag\(/ { print "ResourceXBufferActivationResult"; emit=1; activate++ } \
+	     /^cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact\(/ { print "ResourceXBufferActivationResult"; emit=1; clear++ } \
 	     /^cluster_bufmgr_pcm_own_copy_source_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; copy++ } \
 	     /^cluster_bufmgr_pcm_own_finish_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; finish++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (shape != 1 || copy != 1 || finish != 1) exit 1 }' $< > $@.tmp
+	     END { if (shape != 1 || known_new != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; core++ } \
+	     /^cluster_gcs_block_compute_checksum\(/ { print "uint32"; emit=1; wrapper++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (core != 1 || wrapper != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
-		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc $(CLUSTER_PCM_OWN_O)
+		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_checksum_owner.inc $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) \

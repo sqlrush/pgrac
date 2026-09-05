@@ -3468,17 +3468,24 @@ UT_TEST(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x)
 
 UT_TEST(test_resource_x_direct_init_remote_carrier_is_aux_only_exact_r9_install)
 {
-	static const char *const join_contract[] = {
-		"direct_init_bound",
-		"GcsBlockResourceXDirectInitProofAllowedExact(",
-		"cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(",
-		"if (target_base.flags == PCM_OWN_FLAG_GRANT_PENDING)",
-		"if (!direct_init_bound",
-		"GcsBlockResourceXDirectInitProofAllowedExact(",
-		"cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(",
-		"gcs_block_pcm_x_resource_x_prepare_target_x(",
-		"remote_proof ? &joined_image : NULL"
-	};
+	static const char *const join_contract[]
+		= { "direct_init_bound",
+			"GcsBlockResourceXDirectInitProofAllowedExact(",
+			"cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(",
+			"if (target_base.flags == PCM_OWN_FLAG_GRANT_PENDING)",
+			"target_base.generation != claim_generation",
+			"target_base.reservation_token != claim_token",
+			"if (direct_init_bound)",
+			"GcsBlockResourceXDirectInitProofAllowedExact(",
+			"cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(",
+			"gcs_block_pcm_x_resource_x_prepare_target_x(",
+			"remote_proof ? &joined_image : NULL",
+			"if (direct_init_bound && !remote_proof)",
+			"cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(",
+			"cluster_bufmgr_pcm_own_activate_x_by_tag(",
+			"if (direct_init_bound && !remote_proof)",
+			"cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(",
+			"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(" };
 	static const char *const install_contract[] = {
 		"direct_init_remote_install",
 		"GcsBlockResourceXDirectInitProofAllowedExact(",
@@ -5414,14 +5421,11 @@ UT_TEST(test_resource_x_d6_remote_s_failure_decision_matrix)
 
 UT_TEST(test_resource_x_target_install_coherent_adjudicator_is_result_complete)
 {
-	static const ResourceXTargetInstallFollowState raw_states[] = {
-		RESOURCE_X_TARGET_INSTALL_INVALID,
-		RESOURCE_X_TARGET_INSTALL_INFLIGHT,
-		RESOURCE_X_TARGET_INSTALL_TERMINAL,
-		RESOURCE_X_TARGET_INSTALL_STALE,
-		RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED,
-		RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY
-	};
+	static const ResourceXTargetInstallFollowState raw_states[]
+		= { RESOURCE_X_TARGET_INSTALL_INVALID,			RESOURCE_X_TARGET_INSTALL_INFLIGHT,
+			RESOURCE_X_TARGET_INSTALL_TERMINAL,			RESOURCE_X_TARGET_INSTALL_STALE,
+			RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED, RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY,
+			RESOURCE_X_TARGET_INSTALL_RESAMPLE };
 	ClusterPcmOwnSnapshot before;
 	ClusterPcmOwnSnapshot after;
 	ResourceXAcquisitionRef ref;

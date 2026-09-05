@@ -10327,10 +10327,15 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 			|| round_direct_generation != expected_local_generation
 			|| round_direct_token != direct_init_reservation_token)
 			return RESOURCE_X_BUFFER_STALE;
-		own_result
-			= cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
-				&ref->assertion.resource, round_direct_generation,
-				round_direct_token, &buffer_id, &current);
+		/* A remote image consumes the original known-new bytes.  Its
+		 * installed replay is fenced by this claim, not by PageIsNew. */
+		if (direct_init_remote_install)
+			own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref->assertion.resource,
+																&buffer_id, &current);
+		else
+			own_result = cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+				&ref->assertion.resource, round_direct_generation, round_direct_token, &buffer_id,
+				&current);
 	} else
 		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
 			&ref->assertion.resource, &buffer_id, &current);
@@ -10343,7 +10348,7 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 			? RESOURCE_X_BUFFER_ABSENT : RESOURCE_X_BUFFER_CORRUPT;
 	if (direct_init_bound
 		&& !cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
-			ref, current.generation, current.reservation_token))
+			ref, expected_local_generation, direct_init_reservation_token))
 		return RESOURCE_X_BUFFER_STALE;
 	buf = GetBufferDescriptor(buffer_id);
 	content_lock = BufferDescriptorGetContentLock(buf);
@@ -10371,7 +10376,11 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 				break;
 			}
 			if (cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &current)) {
-				if (current.generation != expected_committed_generation) {
+				if (current.generation != expected_committed_generation
+					|| (direct_init_bound
+						&& !cluster_pcm_x_resource_x_claim_installed_exact(
+							ref, &current, expected_local_generation,
+							direct_init_reservation_token))) {
 					result = RESOURCE_X_BUFFER_STALE;
 					break;
 				}
@@ -10641,10 +10650,13 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 	uint64 committed_generation = 0;
 	uint64 direct_init_generation = 0;
 	uint64 direct_init_token = 0;
+	uint64 claim_generation = 0;
+	uint64 claim_token = 0;
 	uint64 storage_scn = 0;
 	XLogRecPtr storage_lsn = InvalidXLogRecPtr;
 	int target_buffer_id = -1;
 	uint8 proof_kind;
+	uint8 claim_source = RESOURCE_X_INSTALL_CLAIM_NONE;
 	bool entered = false;
 	bool durable_proof;
 	bool local_proof;
@@ -10693,17 +10705,28 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 	ref.acquisition_generation = join.requester_target_generation;
 
 	memset(&target_base, 0, sizeof(target_base));
-	direct_init_bound
-			= cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
-				&ref, &direct_init_generation, &direct_init_token);
+	result = cluster_pcm_lock_resource_x_install_claim_snapshot_exact(
+		&ref, &claim_source, &claim_generation, &claim_token);
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_NOT_FOUND)
+		return result;
+	if (claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT) {
+		direct_init_bound = cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
+			&ref, &direct_init_generation, &direct_init_token);
+		if (direct_init_bound
+			&& (direct_init_generation != claim_generation || direct_init_token != claim_token))
+			return RESOURCE_X_APPLY_STALE;
+	}
 	if (direct_init_bound) {
 		if (!GcsBlockResourceXDirectInitProofAllowedExact(
 				&ref.assertion.resource, durable_proof, remote_proof))
 			return RESOURCE_X_APPLY_STALE;
-		own_result
-			= cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
-				&ref.assertion.resource, direct_init_generation,
-				direct_init_token, &target_buffer_id, &target_base);
+		if (remote_proof)
+			own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref.assertion.resource,
+																&target_buffer_id, &target_base);
+		else
+			own_result = cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+				&ref.assertion.resource, direct_init_generation, direct_init_token,
+				&target_buffer_id, &target_base);
 	} else
 		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
 				&ref.assertion.resource, &target_buffer_id, &target_base);
@@ -10716,11 +10739,16 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 				? RESOURCE_X_APPLY_RECOVERY_BLOCKED
 				: RESOURCE_X_APPLY_STALE;
 	if (target_base.flags == PCM_OWN_FLAG_GRANT_PENDING) {
-			if (!direct_init_bound
-				|| !GcsBlockResourceXDirectInitProofAllowedExact(
-					&ref.assertion.resource, durable_proof, remote_proof)
-				|| target_base.pcm_state != (uint8)PCM_STATE_N
-				|| target_base.reservation_token == 0)
+		if (claim_source == RESOURCE_X_INSTALL_CLAIM_NONE
+			|| target_base.pcm_state != (uint8)PCM_STATE_N
+			|| target_base.generation != claim_generation
+			|| target_base.reservation_token != claim_token
+			|| target_base.writer_activation_token != 0
+			|| target_base.resource_x_activation_generation != 0)
+			return RESOURCE_X_APPLY_STALE;
+		if (direct_init_bound) {
+			if (!GcsBlockResourceXDirectInitProofAllowedExact(&ref.assertion.resource,
+															  durable_proof, remote_proof))
 				return RESOURCE_X_APPLY_STALE;
 			own_result
 				= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
@@ -10738,6 +10766,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 					  target_base.reservation_token);
 			if (!direct_init_bound)
 				return RESOURCE_X_APPLY_STALE;
+		}
 	} else if (target_base.pcm_state == (uint8)PCM_STATE_N) {
 			/* Bootstrap admitted a cold generation-zero N descriptor only
 			 * through this exact BM_VALID/no-IO predicate.  Revalidate the
@@ -10754,7 +10783,10 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 					: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	} else if (target_base.generation == 0)
 		return RESOURCE_X_APPLY_STALE;
-	expected_local_generation = target_base.generation;
+	/* A T1 reservation owns the installation base through I1/I2.  The
+	 * current descriptor has already advanced once on an installed replay. */
+	expected_local_generation
+		= claim_source == RESOURCE_X_INSTALL_CLAIM_NONE ? target_base.generation : claim_generation;
 	memset(&executor_snapshot, 0, sizeof(executor_snapshot));
 	probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(
 			&ref, &executor_snapshot);
@@ -10790,23 +10822,30 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 			(void)cluster_pcm_lock_resource_x_executor_wait_exact(&ref, 0);
 			return RESOURCE_X_APPLY_BAD_STATE;
 		}
-	if (probe_result != RESOURCE_X_EXECUTOR_READY
+		/* A terminal round no longer exposes the live direct-init claim; only
+	 * the COMPLETE branch above may consume that historical lineage. */
+		if (claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT && !direct_init_bound)
+			return RESOURCE_X_APPLY_STALE;
+		if (claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+			&& target_base.pcm_state == (uint8)PCM_STATE_X
+			&& !cluster_pcm_x_resource_x_claim_installed_exact(&ref, &target_base, claim_generation,
+															   claim_token))
+			return RESOURCE_X_APPLY_STALE;
+		if (probe_result != RESOURCE_X_EXECUTOR_READY
 			&& !(probe_result == RESOURCE_X_EXECUTOR_CHANGED
-				&& executor_snapshot.ref.assertion.requester_node == -1
-				&& executor_snapshot.ref.formation == 0
-				&& executor_snapshot.ref.acquisition_generation == 0
-				&& executor_snapshot.progress_flags == 0
-				&& executor_snapshot.retired_acquisition_generation
-					< ref.acquisition_generation))
-		return probe_result == RESOURCE_X_EXECUTOR_CHANGED
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	memset(&gate, 0, sizeof(gate));
-	if (!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate))
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	entered = true;
+				 && executor_snapshot.ref.assertion.requester_node == -1
+				 && executor_snapshot.ref.formation == 0
+				 && executor_snapshot.ref.acquisition_generation == 0
+				 && executor_snapshot.progress_flags == 0
+				 && executor_snapshot.retired_acquisition_generation < ref.acquisition_generation))
+			return probe_result == RESOURCE_X_EXECUTOR_CHANGED ? RESOURCE_X_APPLY_STALE
+															   : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		memset(&gate, 0, sizeof(gate));
+		if (!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		entered = true;
 
-	PG_TRY();
+		PG_TRY();
 		{
 			do
 			{
@@ -10911,7 +10950,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 				break;
 			}
 
-			if (direct_init_bound)
+			if (direct_init_bound && !remote_proof)
 				buffer_result
 					= cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
 						&ref, committed_generation, direct_init_token,
@@ -10942,7 +10981,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 			if (result != RESOURCE_X_APPLY_APPLIED
 				&& result != RESOURCE_X_APPLY_DUPLICATE)
 				break;
-			if (direct_init_bound)
+			if (direct_init_bound && !remote_proof)
 				buffer_result
 					= cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
 						&ref, committed_generation, direct_init_token,
