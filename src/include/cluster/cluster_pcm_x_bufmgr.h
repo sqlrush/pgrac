@@ -31,9 +31,9 @@
  * Non-Clang product builds keep identical behavior; certification itself
  * requires a compiler that exposes annotate attributes in its AST. */
 #if __has_attribute(annotate)
-#define PGRAC_PCM_X_FENCE_TERMINAL_OWNER(kind, parameter, proof) \
+#define PGRAC_PCM_X_FENCE_TERMINAL_OWNER(kind, parameter, proof)                                   \
 	__attribute__((annotate("pgrac_pcm_x_terminal_owner:" #kind ":" #parameter ":" #proof)))
-#define PGRAC_PCM_X_FENCE_DOMINATED(proof) \
+#define PGRAC_PCM_X_FENCE_DOMINATED(proof)                                                         \
 	__attribute__((annotate("pgrac_pcm_x_fence_dominated:" #proof)))
 #else
 #define PGRAC_PCM_X_FENCE_TERMINAL_OWNER(kind, parameter, proof)
@@ -44,11 +44,9 @@
  * BufferTag PCM tracking.  With shared_catalog off, catalog/system relations
  * remain node-local and cannot have a real Resource-X ownership episode. */
 static inline bool
-cluster_pcm_x_relation_number_tracked(RelFileNumber rel_number,
-									  bool shared_catalog)
+cluster_pcm_x_relation_number_tracked(RelFileNumber rel_number, bool shared_catalog)
 {
-	return shared_catalog
-		|| rel_number >= (RelFileNumber) FirstNormalObjectId;
+	return shared_catalog || rel_number >= (RelFileNumber)FirstNormalObjectId;
 }
 
 /* FSM pages are advisory and may be consumed without a content lock, so they
@@ -59,12 +57,18 @@ cluster_pcm_x_buffer_tag_tracked(const BufferTag *tag, bool shared_catalog)
 {
 	if (tag == NULL || tag->forkNum == FSM_FORKNUM)
 		return false;
-	return cluster_pcm_x_relation_number_tracked(
-		tag->relNumber, shared_catalog);
+	return cluster_pcm_x_relation_number_tracked(tag->relNumber, shared_catalog);
 }
+
+/* Only authority/image-shape bits belong in coherent observation.  Pin count,
+ * usage count, waiter and header-lock bookkeeping must not force RESAMPLE. */
+#define CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK                                                    \
+	(BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED                   \
+	 | BM_IO_IN_PROGRESS | BM_IO_ERROR)
 
 typedef struct ClusterPcmOwnSnapshot {
 	BufferTag tag;
+	uint32 semantic_buf_state;
 	uint64 generation;
 	uint64 reservation_token;
 	/* Diagnostic projection of the grant->content activation fence.  It is
@@ -75,10 +79,15 @@ typedef struct ClusterPcmOwnSnapshot {
 	uint64 resource_x_activation_generation;
 	uint32 flags;
 	uint8 pcm_state;
-	uint8 _reserved[3];
+	uint8 buffer_type;
+	uint8 _reserved[2];
 } ClusterPcmOwnSnapshot;
 
 StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 64, "ClusterPcmOwnSnapshot must remain 64 bytes");
+StaticAssertDecl(offsetof(ClusterPcmOwnSnapshot, semantic_buf_state) == 20,
+				 "semantic buffer state must use former padding");
+StaticAssertDecl(offsetof(ClusterPcmOwnSnapshot, buffer_type) == 61,
+				 "buffer type must use a former reserved byte");
 
 /* Both operands come from a constructor that clears the complete object
  * before assigning its fields.  Whole-object equality therefore includes
@@ -87,8 +96,28 @@ static inline bool
 cluster_pcm_own_snapshot_equal_exact(const ClusterPcmOwnSnapshot *left,
 									 const ClusterPcmOwnSnapshot *right)
 {
-	return left != NULL && right != NULL
-		&& memcmp(left, right, sizeof(*left)) == 0;
+	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
+}
+
+/* Revalidate an already-owned operation fence across ordinary image/I/O
+ * transitions.  This is not coherent-observation equality or image validity:
+ * the owner must still check the current image under its required locks.
+ * Copy the complete initialized object so every identity/reserved byte is
+ * compared; only these two physical-image fields are outside fence identity. */
+static inline bool
+cluster_pcm_own_fence_equal_exact(const ClusterPcmOwnSnapshot *left,
+								  const ClusterPcmOwnSnapshot *right)
+{
+	ClusterPcmOwnSnapshot left_fence;
+	ClusterPcmOwnSnapshot right_fence;
+
+	if (left == NULL || right == NULL)
+		return false;
+	memcpy(&left_fence, left, sizeof(left_fence));
+	memcpy(&right_fence, right, sizeof(right_fence));
+	left_fence.semantic_buf_state = right_fence.semantic_buf_state = 0;
+	left_fence.buffer_type = right_fence.buffer_type = 0;
+	return cluster_pcm_own_snapshot_equal_exact(&left_fence, &right_fence);
 }
 
 /* Resolve one raw entry result only after the caller has obtained both
@@ -96,10 +125,8 @@ cluster_pcm_own_snapshot_equal_exact(const ClusterPcmOwnSnapshot *left,
  * neither authority-bearing output may escape that observation window. */
 static inline ResourceXTargetInstallFollowState
 cluster_pcm_x_target_install_follow_adjudicate_exact(
-	const ClusterPcmOwnSnapshot *before,
-	const ClusterPcmOwnSnapshot *after,
-	ResourceXTargetInstallFollowState raw_state,
-	ResourceXAcquisitionRef *terminal_ref,
+	const ClusterPcmOwnSnapshot *before, const ClusterPcmOwnSnapshot *after,
+	ResourceXTargetInstallFollowState raw_state, ResourceXAcquisitionRef *terminal_ref,
 	ResourceXTargetInstallContinuation *new_continuation)
 {
 	ResourceXTargetInstallFollowState result = raw_state;
@@ -113,13 +140,11 @@ cluster_pcm_x_target_install_follow_adjudicate_exact(
 			 || raw_state > RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 		result = RESOURCE_X_TARGET_INSTALL_INVALID;
 
-	if (result != RESOURCE_X_TARGET_INSTALL_TERMINAL
-		&& terminal_ref != NULL)
+	if (result != RESOURCE_X_TARGET_INSTALL_TERMINAL && terminal_ref != NULL)
 		memset(terminal_ref, 0, sizeof(*terminal_ref));
-	retain_continuation
-		= result == RESOURCE_X_TARGET_INSTALL_INFLIGHT
-		  || result == RESOURCE_X_TARGET_INSTALL_TERMINAL
-		  || result == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
+	retain_continuation = result == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+						  || result == RESOURCE_X_TARGET_INSTALL_TERMINAL
+						  || result == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY;
 	if (!retain_continuation && new_continuation != NULL)
 		memset(new_continuation, 0, sizeof(*new_continuation));
 	return result;
@@ -128,8 +153,7 @@ cluster_pcm_x_target_install_follow_adjudicate_exact(
 /* A27 terminal-census admission is intentionally tri-state.  A valid
  * Resource-X HANDOFF/REVOKING collision is caller-owned requalification, not
  * physical ITL exhaustion and not a successfully armed recycle owner. */
-typedef enum ClusterBufmgrItlRecycleGuardResult
-{
+typedef enum ClusterBufmgrItlRecycleGuardResult {
 	CLUSTER_BUFMGR_ITL_RECYCLE_REFUSED = 0,
 	CLUSTER_BUFMGR_ITL_RECYCLE_ARMED,
 	CLUSTER_BUFMGR_ITL_RECYCLE_RETRY_REQUALIFY
@@ -141,17 +165,13 @@ typedef enum ClusterBufmgrItlRecycleGuardResult
  * and let the existing Resource-X retry deadline resample it.  Malformed
  * reservation/activation evidence remains a hard failure. */
 static inline ClusterPcmOwnResult
-cluster_pcm_x_remote_s_holder_pending_grant_result(
-	const ClusterPcmOwnSnapshot *snapshot)
+cluster_pcm_x_remote_s_holder_pending_grant_result(const ClusterPcmOwnSnapshot *snapshot)
 {
-	if (snapshot == NULL
-		|| snapshot->pcm_state != (uint8)PCM_STATE_N
+	if (snapshot == NULL || snapshot->pcm_state != (uint8)PCM_STATE_N
 		|| snapshot->flags != PCM_OWN_FLAG_GRANT_PENDING)
 		return CLUSTER_PCM_OWN_INVALID;
-	if (snapshot->generation == UINT64_MAX
-		|| snapshot->reservation_token == 0
-		|| snapshot->reservation_token == UINT64_MAX
-		|| snapshot->writer_activation_token != 0
+	if (snapshot->generation == UINT64_MAX || snapshot->reservation_token == 0
+		|| snapshot->reservation_token == UINT64_MAX || snapshot->writer_activation_token != 0
 		|| snapshot->resource_x_activation_generation != 0)
 		return CLUSTER_PCM_OWN_CORRUPT;
 	return CLUSTER_PCM_OWN_BUSY;
@@ -164,20 +184,17 @@ cluster_pcm_x_remote_s_holder_pending_grant_result(
  * reservation is ordinary backpressure, while residual/illegal tuple axes
  * remain corruption. */
 static inline ClusterPcmOwnResult
-cluster_pcm_x_remote_s_holder_stable_n_result(
-	const ClusterPcmOwnSnapshot *snapshot)
+cluster_pcm_x_remote_s_holder_stable_n_result(const ClusterPcmOwnSnapshot *snapshot)
 {
 	ClusterPcmOwnResult live_result;
 
-	if (snapshot == NULL
-		|| snapshot->pcm_state != (uint8)PCM_STATE_N)
+	if (snapshot == NULL || snapshot->pcm_state != (uint8)PCM_STATE_N)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (snapshot->generation == 0)
 		return CLUSTER_PCM_OWN_STALE;
 	if (snapshot->generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_CORRUPT;
-	live_result = cluster_pcm_own_classify_live_flags(
-		snapshot->flags, snapshot->reservation_token);
+	live_result = cluster_pcm_own_classify_live_flags(snapshot->flags, snapshot->reservation_token);
 	if (live_result != CLUSTER_PCM_OWN_OK)
 		return live_result;
 	/* Every successful S->N revoke keeps its exact reservation token as a
@@ -185,8 +202,7 @@ cluster_pcm_x_remote_s_holder_stable_n_result(
 	 * identify this replay shape, while a finite nonzero idle token does. */
 	if (snapshot->reservation_token == 0)
 		return CLUSTER_PCM_OWN_STALE;
-	if (snapshot->reservation_token == UINT64_MAX
-		|| snapshot->writer_activation_token != 0
+	if (snapshot->reservation_token == UINT64_MAX || snapshot->writer_activation_token != 0
 		|| snapshot->resource_x_activation_generation != 0)
 		return CLUSTER_PCM_OWN_CORRUPT;
 	return CLUSTER_PCM_OWN_OK;
@@ -194,9 +210,8 @@ cluster_pcm_x_remote_s_holder_stable_n_result(
 
 #define CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD UINT32_C(0x00000001)
 #define CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED UINT32_C(0x00000002)
-#define CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK \
-	(CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD \
-	 | CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED)
+#define CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK                                                   \
+	(CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD | CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED)
 
 /* Opaque process-local holder for the post-L3 X-source path.  The raw pin is
  * acquired under mapping authority before REVOKING begins and remains live
@@ -242,10 +257,9 @@ StaticAssertDecl(sizeof(ResourceXCurrentImage) == 32,
 
 static inline bool
 cluster_pcm_x_resource_x_t2_snapshot_exact(const ResourceXAcquisitionRef *ref,
-											 const ClusterPcmOwnSnapshot *live)
+										   const ClusterPcmOwnSnapshot *live)
 {
-	return ref != NULL && live != NULL && ref->formation != 0
-		   && ref->acquisition_generation != 0
+	return ref != NULL && live != NULL && ref->formation != 0 && ref->acquisition_generation != 0
 		   && BufferTagsEqual(&ref->assertion.resource, &live->tag)
 		   && live->pcm_state == (uint8)PCM_STATE_X && live->flags == 0
 		   && live->reservation_token != 0
@@ -256,7 +270,7 @@ cluster_pcm_x_resource_x_t2_snapshot_exact(const ResourceXAcquisitionRef *ref,
 
 static inline bool
 cluster_pcm_x_resource_x_t3_snapshot_exact(const ResourceXAcquisitionRef *ref,
-											 const ClusterPcmOwnSnapshot *live)
+										   const ClusterPcmOwnSnapshot *live)
 {
 	return cluster_pcm_x_resource_x_t2_snapshot_exact(ref, live)
 		   && live->resource_x_activation_generation == ref->acquisition_generation;
@@ -264,8 +278,8 @@ cluster_pcm_x_resource_x_t3_snapshot_exact(const ResourceXAcquisitionRef *ref,
 
 static inline bool
 cluster_pcm_x_resource_x_r8_snapshot_exact(const BufferTag *tag, uint64 old_formation,
-										 uint64 acquisition_generation,
-										 const ClusterPcmOwnSnapshot *live)
+										   uint64 acquisition_generation,
+										   const ClusterPcmOwnSnapshot *live)
 {
 	return tag != NULL && live != NULL && old_formation != 0 && old_formation != UINT64_MAX
 		   && acquisition_generation != 0 && acquisition_generation != UINT64_MAX
@@ -325,25 +339,21 @@ typedef enum ClusterPcmGrantBeginWaitReason {
  * ordinary cover/reservation classifier.  Every other result is terminal for
  * this sample and must occur before reservation_begin_exact. */
 static inline ClusterPcmOwnResult
-cluster_pcm_x_read_image_begin_disposition(
-	const ClusterPcmOwnSnapshot *live, uint32 buf_state, uint8 buffer_type,
-	ClusterPcmGrantBeginWaitReason *wait_reason)
+cluster_pcm_x_read_image_begin_disposition(const ClusterPcmOwnSnapshot *live, uint32 buf_state,
+										   uint8 buffer_type,
+										   ClusterPcmGrantBeginWaitReason *wait_reason)
 {
 	if (wait_reason == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	*wait_reason = CLUSTER_PCM_GRANT_WAIT_NONE;
-	if (live == NULL || live->pcm_state != (uint8) PCM_STATE_READ_IMAGE)
+	if (live == NULL || live->pcm_state != (uint8)PCM_STATE_READ_IMAGE)
 		return CLUSTER_PCM_OWN_INVALID;
-	if (live->generation == UINT64_MAX
-		|| live->reservation_token == UINT64_MAX)
+	if (live->generation == UINT64_MAX || live->reservation_token == UINT64_MAX)
 		return CLUSTER_PCM_OWN_EXHAUSTED;
-	if (live->generation == 0 || live->reservation_token == 0
-		|| live->flags != 0
-		|| live->writer_activation_token != 0
-		|| live->resource_x_activation_generation != 0
-		|| (buf_state & BM_VALID) == 0
-		|| (buf_state & BM_IO_IN_PROGRESS) != 0
-		|| buffer_type != (uint8) BUF_TYPE_CURRENT)
+	if (live->generation == 0 || live->reservation_token == 0 || live->flags != 0
+		|| live->writer_activation_token != 0 || live->resource_x_activation_generation != 0
+		|| (buf_state & BM_VALID) == 0 || (buf_state & BM_IO_IN_PROGRESS) != 0
+		|| buffer_type != (uint8)BUF_TYPE_CURRENT)
 		return CLUSTER_PCM_OWN_CORRUPT;
 	*wait_reason = CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET;
 	return CLUSTER_PCM_OWN_BUSY;
@@ -367,14 +377,12 @@ cluster_pcm_x_activation_fence_open(uint64 writer_activation_token,
  * refcount.  Existing pins predate the fence and are drained separately
  * before retained intent; no new ownership state is introduced here. */
 static inline bool
-cluster_pcm_x_aux_pin_admission_allowed(bool runtime_active, bool tracked,
-										ForkNumber forknum, uint32 flags)
+cluster_pcm_x_aux_pin_admission_allowed(bool runtime_active, bool tracked, ForkNumber forknum,
+										uint32 flags)
 {
-	bool auxiliary = forknum == VISIBILITYMAP_FORKNUM
-		|| forknum == FSM_FORKNUM;
+	bool auxiliary = forknum == VISIBILITYMAP_FORKNUM || forknum == FSM_FORKNUM;
 
-	return !runtime_active || !tracked || !auxiliary
-		|| (flags & PCM_OWN_FLAG_REVOKING) == 0;
+	return !runtime_active || !tracked || !auxiliary || (flags & PCM_OWN_FLAG_REVOKING) == 0;
 }
 
 /* A committed node X is cache residency authority, not a fresh writer
@@ -388,7 +396,7 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 {
 	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0
 		   && cluster_pcm_x_activation_fence_open(writer_activation_token,
-											  resource_x_activation_generation);
+												  resource_x_activation_generation);
 }
 
 /* Revalidate a cached cover after the caller has acquired content authority.
@@ -402,8 +410,7 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 static inline bool
 cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captured_generation,
 											uint64 current_generation, uint8 current_state,
-											uint32 current_flags,
-											uint64 writer_activation_token,
+											uint32 current_flags, uint64 writer_activation_token,
 											uint64 resource_x_activation_generation)
 {
 	bool covers;
@@ -412,7 +419,7 @@ cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captur
 		return false;
 	if (current_flags != 0
 		|| !cluster_pcm_x_activation_fence_open(writer_activation_token,
-											 resource_x_activation_generation))
+												resource_x_activation_generation))
 		return false;
 	covers = current_state == (uint8)PCM_STATE_X
 			 || (requested_state == (uint8)PCM_STATE_S && current_state == (uint8)PCM_STATE_S);
@@ -429,23 +436,20 @@ cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captur
  * deadline.  Corrupt tuples and identity drift retain their fail-closed
  * polarity. */
 static inline bool
-cluster_pcm_x_target_preuse_drift_retryable(
-	const ClusterPcmOwnSnapshot *live, bool target_path_current,
-	bool gate_current, bool tag_current)
+cluster_pcm_x_target_preuse_drift_retryable(const ClusterPcmOwnSnapshot *live,
+											bool target_path_current, bool gate_current,
+											bool tag_current)
 {
 	ClusterPcmOwnResult shape;
 
 	if (live == NULL || !target_path_current || !gate_current || !tag_current
 		|| live->generation == 0 || live->generation == UINT64_MAX
-		|| live->reservation_token == UINT64_MAX
-		|| live->writer_activation_token == UINT64_MAX
+		|| live->reservation_token == UINT64_MAX || live->writer_activation_token == UINT64_MAX
 		|| live->resource_x_activation_generation == UINT64_MAX
-		|| (live->pcm_state != (uint8)PCM_STATE_N
-			&& live->pcm_state != (uint8)PCM_STATE_S
+		|| (live->pcm_state != (uint8)PCM_STATE_N && live->pcm_state != (uint8)PCM_STATE_S
 			&& live->pcm_state != (uint8)PCM_STATE_X))
 		return false;
-	shape = cluster_pcm_own_classify_live_flags(
-		live->flags, live->reservation_token);
+	shape = cluster_pcm_own_classify_live_flags(live->flags, live->reservation_token);
 	return shape == CLUSTER_PCM_OWN_OK || shape == CLUSTER_PCM_OWN_BUSY;
 }
 
@@ -455,15 +459,15 @@ cluster_pcm_x_target_preuse_drift_retryable(
  * transition/retained evidence remains closed regardless of runtime state. */
 static inline bool
 cluster_pcm_x_ordinary_mutation_allowed(bool runtime_active, bool tracked, bool retained_image,
-									uint8 pcm_state, uint32 flags,
-									uint64 writer_activation_token,
-									uint64 resource_x_activation_generation)
+										uint8 pcm_state, uint32 flags,
+										uint64 writer_activation_token,
+										uint64 resource_x_activation_generation)
 {
 	return !retained_image && flags == 0
 		   && (!runtime_active || !tracked
 			   || (pcm_state == (uint8)PCM_STATE_X
-				   && cluster_pcm_x_activation_fence_open(
-						writer_activation_token, resource_x_activation_generation)));
+				   && cluster_pcm_x_activation_fence_open(writer_activation_token,
+														  resource_x_activation_generation)));
 }
 
 /* A type-17 pre-retention drain first marks the exact current X REVOKING and
@@ -475,20 +479,18 @@ cluster_pcm_x_ordinary_mutation_allowed(bool runtime_active, bool tracked, bool 
  * cross the fence.  Retained images and activation-sidecar debt are never
  * covered by this narrow predecessor exception. */
 static inline bool
-cluster_pcm_x_content_holder_mutation_allowed(
-	bool runtime_active, bool tracked, bool retained_image,
-	uint8 pcm_state, uint32 flags, uint64 writer_activation_token,
-	uint64 resource_x_activation_generation)
+cluster_pcm_x_content_holder_mutation_allowed(bool runtime_active, bool tracked,
+											  bool retained_image, uint8 pcm_state, uint32 flags,
+											  uint64 writer_activation_token,
+											  uint64 resource_x_activation_generation)
 {
-	return cluster_pcm_x_ordinary_mutation_allowed(
-			runtime_active, tracked, retained_image, pcm_state, flags,
-			writer_activation_token, resource_x_activation_generation)
-		|| (runtime_active && tracked && !retained_image
-			&& pcm_state == (uint8)PCM_STATE_X
-			&& flags == PCM_OWN_FLAG_REVOKING
-			&& cluster_pcm_x_activation_fence_open(
-				writer_activation_token,
-				resource_x_activation_generation));
+	return cluster_pcm_x_ordinary_mutation_allowed(runtime_active, tracked, retained_image,
+												   pcm_state, flags, writer_activation_token,
+												   resource_x_activation_generation)
+		   || (runtime_active && tracked && !retained_image && pcm_state == (uint8)PCM_STATE_X
+			   && flags == PCM_OWN_FLAG_REVOKING
+			   && cluster_pcm_x_activation_fence_open(writer_activation_token,
+													  resource_x_activation_generation));
 }
 
 /* A27: BufferDesc REVOKING is a reversible drain fence, not a second
@@ -499,36 +501,26 @@ cluster_pcm_x_content_holder_mutation_allowed(
  * activation sidecars remain strict.  This predicate grants no write access:
  * the caller must independently prove that it retained content-X throughout. */
 static inline bool
-cluster_pcm_x_content_holder_dml_authority_equivalent(
-	const ClusterPcmOwnSnapshot *captured,
-	const ClusterPcmOwnSnapshot *live)
+cluster_pcm_x_content_holder_dml_authority_equivalent(const ClusterPcmOwnSnapshot *captured,
+													  const ClusterPcmOwnSnapshot *live)
 {
 	bool captured_lifecycle_valid;
 	bool live_lifecycle_valid;
 
-	if (captured == NULL || live == NULL
-		|| !BufferTagsEqual(&captured->tag, &live->tag)
-		|| captured->generation == 0
-		|| captured->generation == UINT64_MAX
-		|| live->generation != captured->generation
-		|| captured->pcm_state != (uint8)PCM_STATE_X
-		|| live->pcm_state != (uint8)PCM_STATE_X
-		|| captured->writer_activation_token != 0
-		|| live->writer_activation_token != 0
-		|| captured->resource_x_activation_generation != 0
+	if (captured == NULL || live == NULL || !BufferTagsEqual(&captured->tag, &live->tag)
+		|| captured->generation == 0 || captured->generation == UINT64_MAX
+		|| live->generation != captured->generation || captured->pcm_state != (uint8)PCM_STATE_X
+		|| live->pcm_state != (uint8)PCM_STATE_X || captured->writer_activation_token != 0
+		|| live->writer_activation_token != 0 || captured->resource_x_activation_generation != 0
 		|| live->resource_x_activation_generation != 0)
 		return false;
 	captured_lifecycle_valid
-		= (captured->flags == 0
-		   && captured->reservation_token != UINT64_MAX)
-		  || (captured->flags == PCM_OWN_FLAG_REVOKING
-			  && captured->reservation_token != 0
+		= (captured->flags == 0 && captured->reservation_token != UINT64_MAX)
+		  || (captured->flags == PCM_OWN_FLAG_REVOKING && captured->reservation_token != 0
 			  && captured->reservation_token != UINT64_MAX);
-	live_lifecycle_valid
-		= (live->flags == 0 && live->reservation_token != UINT64_MAX)
-		  || (live->flags == PCM_OWN_FLAG_REVOKING
-			  && live->reservation_token != 0
-			  && live->reservation_token != UINT64_MAX);
+	live_lifecycle_valid = (live->flags == 0 && live->reservation_token != UINT64_MAX)
+						   || (live->flags == PCM_OWN_FLAG_REVOKING && live->reservation_token != 0
+							   && live->reservation_token != UINT64_MAX);
 	return captured_lifecycle_valid && live_lifecycle_valid;
 }
 
@@ -538,17 +530,18 @@ cluster_pcm_x_conditional_lock_allowed(bool runtime_active, bool tracked, bool r
 									   uint64 writer_activation_token,
 									   uint64 resource_x_activation_generation)
 {
-	return cluster_pcm_x_ordinary_mutation_allowed(
-		runtime_active, tracked, retained_image, pcm_state, flags,
-		writer_activation_token, resource_x_activation_generation);
+	return cluster_pcm_x_ordinary_mutation_allowed(runtime_active, tracked, retained_image,
+												   pcm_state, flags, writer_activation_token,
+												   resource_x_activation_generation);
 }
 
 static inline bool
 cluster_pcm_x_flush_fence_consistent(bool dirty, uint64 writer_activation_token,
 									 uint64 resource_x_activation_generation)
 {
-	return !dirty || cluster_pcm_x_activation_fence_open(
-		writer_activation_token, resource_x_activation_generation);
+	return !dirty
+		   || cluster_pcm_x_activation_fence_open(writer_activation_token,
+												  resource_x_activation_generation);
 }
 
 typedef ClusterPcmOwnSnapshot ClusterPcmOwnEvictionCapture;
@@ -644,19 +637,15 @@ cluster_pcm_x_current_image_shape(uint8 pcm_state, uint8 buffer_type, bool valid
  * DRAIN.  Both may identify the requester as a non-holder, but neither is
  * read or shipped here.  All other descriptor shapes remain closed. */
 static inline ClusterPcmOwnResult
-cluster_pcm_x_n_assertion_shape(uint8 pcm_state, uint8 buffer_type,
-								uint32 buf_state)
+cluster_pcm_x_n_assertion_shape(uint8 pcm_state, uint8 buffer_type, uint32 buf_state)
 {
 	if (pcm_state != (uint8)PCM_STATE_N)
 		return CLUSTER_PCM_OWN_STALE;
 	if ((buf_state & BM_VALID) == 0 || (buf_state & BM_IO_ERROR) != 0)
 		return CLUSTER_PCM_OWN_CORRUPT;
-	if (buffer_type != (uint8)BUF_TYPE_CURRENT
-		&& buffer_type != (uint8)BUF_TYPE_PI)
+	if (buffer_type != (uint8)BUF_TYPE_CURRENT && buffer_type != (uint8)BUF_TYPE_PI)
 		return CLUSTER_PCM_OWN_CORRUPT;
-	if ((buf_state
-		 & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-			| BM_IO_IN_PROGRESS)) != 0)
+	if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS)) != 0)
 		return CLUSTER_PCM_OWN_BUSY;
 	return CLUSTER_PCM_OWN_OK;
 }
@@ -709,83 +698,83 @@ cluster_pcm_own_eviction_reuse_allowed(const ClusterPcmOwnEvictionCapture *captu
 }
 
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
-													   ClusterPcmOwnSnapshot *out_snapshot);
+														   ClusterPcmOwnSnapshot *out_snapshot);
 /* A non-durable S acquisition publishes a node-exclusive read bracket by
  * consuming its exact N+GRANT_PENDING reservation and changing pcm_state
  * under the same BufferDesc header-lock hold.  Normal release and abandoned
  * recovery both clear only the exact published snapshot and bump generation
  * once; the recovery form additionally requires content EXCLUSIVE. */
-extern ClusterPcmOwnResult cluster_pcm_own_publish_read_image_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
-	uint64 reservation_token, uint64 *published_generation_out);
-extern ClusterPcmOwnResult cluster_pcm_own_release_read_image_exact(
-	BufferDesc *buf, uint64 *cleared_generation_out);
-extern ClusterPcmOwnResult cluster_pcm_own_reclaim_read_image_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *published,
-	uint64 *cleared_generation_out);
+extern ClusterPcmOwnResult
+cluster_pcm_own_publish_read_image_exact(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+										 uint64 reservation_token,
+										 uint64 *published_generation_out);
+extern ClusterPcmOwnResult cluster_pcm_own_release_read_image_exact(BufferDesc *buf,
+																	uint64 *cleared_generation_out);
+extern ClusterPcmOwnResult
+cluster_pcm_own_reclaim_read_image_exact(BufferDesc *buf, const ClusterPcmOwnSnapshot *published,
+										 uint64 *cleared_generation_out);
 /* Exact requester-side N assertion preflight.  A passive retained PI mirror
  * is accepted only as a no-local-current shape; no page bytes or proof are
  * returned, and the master still owns proof selection. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n,
-	ClusterPcmOwnSnapshot *observed_out);
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n, ClusterPcmOwnSnapshot *observed_out);
 /* Exact physical half of the former-source reacquire interlock.  It proves
  * only a clean, valid N+PI descriptor held by one REVOKING token; the caller
  * must independently bind that generation to the retained Resource-X pair. */
-extern bool cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+extern bool
+cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(BufferDesc *buf,
+														 const ClusterPcmOwnSnapshot *expected_n);
 /* A passive N descriptor is eligible for a durable-storage assertion only
  * while the exact ownership tuple still names clean, valid, non-IO CURRENT
  * residency.  The page bytes are deliberately not returned as proof. */
-extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_storage_candidate_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_n_storage_candidate_exact(BufferDesc *buf,
+												 const ClusterPcmOwnSnapshot *expected_n);
 /* The only TARGET durable-proof exception to the ordinary BM_VALID/no-IO N
  * preflight.  An exact direct-init proof has already published this existing
  * N_NEW reservation before any Resource-X frame; T2 revalidates its known-new
  * shared descriptor shape without treating page bytes as proof. */
-extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_pending_n);
 /* Current-slice remote-S holder evidence.  This is a local BufferDesc
  * predicate only: it neither creates nor consults a GRD/Resource-X authority
  * record.  The caller holds content EXCLUSIVE across its final check and the
  * atomic retained-ring publication that commits S->N. */
-extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_s_holder_candidate_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_s_holder_candidate_exact(BufferDesc *buf,
+												const ClusterPcmOwnSnapshot *expected_s);
 /* Read one verified shared-storage page into actor-private aligned staging.
  * This function takes no BufferDesc pin/content lock and publishes no
  * ownership; callers bind the result with Resource-X snapshot/revalidation. */
-extern bool cluster_bufmgr_read_storage_image_for_resource_x(
-	BufferTag tag, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
-	uint64 *out_page_scn);
+extern bool cluster_bufmgr_read_storage_image_for_resource_x(BufferTag tag, char block_data[BLCKSZ],
+															 XLogRecPtr *out_page_lsn,
+															 uint64 *out_page_scn);
 /* Same-page terminal-census slow path.  D11 retains the exact off-lock
  * occupancy in the existing per-resource Resource-X entry, not the deleted
  * ticket holder ledger. */
-extern ClusterBufmgrItlRecycleGuardResult cluster_bufmgr_itl_recycle_guard_arm(
-	Buffer buffer, const ClusterPcmOwnSnapshot *expected);
+extern ClusterBufmgrItlRecycleGuardResult
+cluster_bufmgr_itl_recycle_guard_arm(Buffer buffer, const ClusterPcmOwnSnapshot *expected);
 extern void cluster_bufmgr_itl_recycle_guard_unlock(Buffer buffer);
 extern bool cluster_bufmgr_itl_recycle_guard_relock(Buffer buffer);
 extern void cluster_bufmgr_itl_recycle_guard_cancel(Buffer buffer);
-extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
-	const ResourceXAcquisitionRef *ref, const ResourceXCurrentImage *image,
-	ResourceXBufferInstallProof *out_proof);
 extern ResourceXBufferActivationResult
-cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
+cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
+										 const ResourceXCurrentImage *image,
+										 ResourceXBufferInstallProof *out_proof);
+extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
 /* Exact known-new TARGET adaptation.  These calls bind/clear only the
  * Resource-X sidecar around an already committed local X reservation; they
  * never install durable-storage bytes into the direct-init descriptor. */
-extern ResourceXBufferActivationResult
-cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
+extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
 	uint64 expected_reservation_token, ResourceXBufferInstallProof *out_proof);
-extern ResourceXBufferActivationResult
-cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
+extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
-	uint64 expected_reservation_token,
-	ResourceXBufferActivationProof *out_proof);
-extern ResourceXSidecarNeutralizeResult cluster_bufmgr_resource_x_neutralize_exact(
-	const BufferTag *tag, uint64 old_formation, uint64 acquisition_generation);
+	uint64 expected_reservation_token, ResourceXBufferActivationProof *out_proof);
+extern ResourceXSidecarNeutralizeResult
+cluster_bufmgr_resource_x_neutralize_exact(const BufferTag *tag, uint64 old_formation,
+										   uint64 acquisition_generation);
 /* Resolve one resident descriptor and snapshot its ownership tuple while the
  * mapping partition and buffer header still bind the same BufferTag.  The
  * returned buffer id is only a locator; every later lifecycle call rechecks
@@ -793,11 +782,9 @@ extern ResourceXSidecarNeutralizeResult cluster_bufmgr_resource_x_neutralize_exa
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 									   ClusterPcmOwnSnapshot *out_snapshot);
-extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
-	const BufferTag *tag, uint64 expected_generation,
-	uint64 expected_reservation_token, int *out_buffer_id,
-	ClusterPcmOwnSnapshot *out_snapshot);
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+	const BufferTag *tag, uint64 expected_generation, uint64 expected_reservation_token,
+	int *out_buffer_id, ClusterPcmOwnSnapshot *out_snapshot);
 /* Backstop direct content-lock mutation entrances that do not pass through
  * LockBuffer/W1.  GRANT_PENDING image installation is permitted; a live
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
@@ -815,9 +802,9 @@ cluster_bufmgr_pcm_own_finish_s_release_to_n(BufferDesc *buf,
  * content EXCLUSIVE and present the exact REVOKING S tuple whose immutable
  * type-18 status is already retained in the existing LMS DATA ring. */
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
-	ClusterPcmOwnSnapshot *out_n_snapshot);
+cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(BufferDesc *buf,
+												  const ClusterPcmOwnSnapshot *expected_revoking,
+												  ClusterPcmOwnSnapshot *out_n_snapshot);
 /* A queue INVALIDATE may target a MAIN/INIT S mirror that has passive PG
  * pins, including the waiting writer's own pin.  This by-tag boundary drains
  * content authority, snapshots/flushes its page evidence, and atomically
@@ -864,26 +851,21 @@ extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
-	const BufferTag *tag, const ClusterPcmOwnSnapshot *expected_x,
-	ClusterPcmOwnHeldXRevoke *held_out);
+cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(const BufferTag *tag,
+												  const ClusterPcmOwnSnapshot *expected_x,
+												  ClusterPcmOwnHeldXRevoke *held_out);
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_abort_held_x_revoke(
-	ClusterPcmOwnHeldXRevoke *held);
+cluster_bufmgr_pcm_own_abort_held_x_revoke(ClusterPcmOwnHeldXRevoke *held);
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
-	const ClusterPcmOwnHeldXRevoke *held);
+cluster_bufmgr_pcm_own_try_drain_held_x_revoke(const ClusterPcmOwnHeldXRevoke *held);
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking);
-extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
-	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,
-	ClusterPcmOwnSnapshot *out_retained,
+cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(BufferDesc *buf,
+											   const ClusterPcmOwnSnapshot *expected_revoking);
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
+	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
 	ClusterPcmOwnFinishRefusal *out_refusal);
 extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
-	ClusterPcmOwnHeldXRevoke *held);
+cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(ClusterPcmOwnHeldXRevoke *held);
 
 /* Build an immutable requester-as-source image from a clean N descriptor and
  * shared storage.  Success leaves the exact same-generation REVOKING token
@@ -916,11 +898,10 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
 	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
-extern ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
 	const BufferTag *tag, uint64 source_generation, bool *release_applied_out);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
-															 uint64 source_generation);
+																		 uint64 source_generation);
 /* Process-local descriptor evidence captured by the DRAIN-time probe below
  * so the caller can log the observed shape as diagnostics.  The fields are
  * one header-locked snapshot; never persisted or sent on wire. */

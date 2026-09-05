@@ -2064,6 +2064,8 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
+		test_cluster_pcm_snapshot_owner.inc \
+		test_cluster_pcm_transition_owner.inc \
 		$(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(CLUSTER_QVOTEC_PGSA_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_TEST_O) \
 		$(CLUSTER_XLOG_INSERT_END_TEST_O) \
@@ -2404,8 +2406,27 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 # fake shmem region.  The test also reads the production bufmgr source through
 # an explicit build-time path so the D5a lock-order contract is paired with
 # the shared decision helpers instead of being represented by a fake bufmgr.
+# Compile the two actual bufmgr snapshot owners, verbatim, into this fixture.
+# Column-zero definitions/closing braces delimit these two dependency-light
+# functions.  Counts fail closed if either definition is moved or duplicated.
+test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+	awk '/^cluster_pcm_own_snapshot_post_state_locked\(/ { print "static inline void"; emit=1; post++ } \
+	     /^cluster_pcm_own_snapshot_locked\(/ { print "static inline void"; emit=1; capture++ } \
+	     /^cluster_pcm_own_fence_matches_locked\(/ { print "static inline bool"; emit=1; matches++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (post != 1 || capture != 1 || matches != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
+	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^cluster_bufmgr_pcm_own_copy_source_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; copy++ } \
+	     /^cluster_bufmgr_pcm_own_finish_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; finish++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (shape != 1 || copy != 1 || finish != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
-		$(CLUSTER_PCM_OWN_O)
+		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) \

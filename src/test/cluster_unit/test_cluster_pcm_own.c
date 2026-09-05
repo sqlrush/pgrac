@@ -22,6 +22,9 @@
 
 #include "unit_test.h"
 
+/* Generated from the production bufmgr function bodies, never a test rewrite. */
+#include "test_cluster_pcm_snapshot_owner.inc"
+
 #include <errno.h>
 #include <limits.h>
 #include <sys/mman.h>
@@ -37,6 +40,176 @@ static union {
 	char bytes[4096];
 } fake_shmem;
 static bool fake_found;
+
+/* Compile the real source-copy and retained-finish owners.  Only their
+ * process/physical-I/O dependencies are single-descriptor fixtures; the
+ * ownership sidecar, image predicates, commit, PG_TRY and returned result
+ * remain production code.  Disk I/O is not part of this unit's proof. */
+static BufferDesc *transition_buf;
+static PGIOAlignedBlock transition_page;
+static LWLock transition_mapping_lock;
+static bool transition_mapping_held;
+static bool transition_content_held;
+static int transition_pin_count;
+static int transition_flush_count;
+static bool transition_flush_error;
+static bool transition_flush_leaves_dirty;
+static bool cluster_pcm_x_finish_retain_flush_active;
+static bool cluster_pcm_x_finish_retain_flush_io_active;
+static bool cluster_pcm_x_finish_retain_flush_error_context_pushed;
+static ErrorContextCallback *cluster_pcm_x_finish_retain_flush_error_context_previous;
+
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+static uint32
+transition_lock_header(BufferDesc *buf)
+{
+	uint32 state = pg_atomic_read_u32(&buf->state);
+
+	UT_ASSERT((state & BM_LOCKED) == 0);
+	pg_atomic_write_u32(&buf->state, state | BM_LOCKED);
+	return state | BM_LOCKED;
+}
+
+static bool
+transition_lock_acquire(LWLock *lock, LWLockMode mode)
+{
+	if (lock == &transition_mapping_lock) {
+		UT_ASSERT_EQ(mode, LW_SHARED);
+		UT_ASSERT(!transition_mapping_held);
+		transition_mapping_held = true;
+	} else {
+		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
+		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT(!transition_content_held);
+		transition_content_held = true;
+	}
+	return true;
+}
+
+static void
+transition_lock_release(LWLock *lock)
+{
+	if (lock == &transition_mapping_lock) {
+		UT_ASSERT(transition_mapping_held);
+		transition_mapping_held = false;
+	} else {
+		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
+		UT_ASSERT(transition_content_held);
+		transition_content_held = false;
+	}
+}
+
+static void
+transition_pin_locked(BufferDesc *buf, uint32 state)
+{
+	UT_ASSERT(transition_mapping_held);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	transition_pin_count++;
+	UnlockBufHdr(buf, state + BUF_REFCOUNT_ONE);
+}
+
+static void
+transition_unpin(BufferDesc *buf)
+{
+	UT_ASSERT_EQ(transition_pin_count, 1);
+	UT_ASSERT(!transition_content_held);
+	transition_pin_count--;
+	pg_atomic_fetch_sub_u32(&buf->state, BUF_REFCOUNT_ONE);
+}
+
+static void
+transition_flush(BufferDesc *buf)
+{
+	uint32 state = pg_atomic_read_u32(&buf->state);
+
+	UT_ASSERT(transition_content_held);
+	UT_ASSERT_EQ(transition_pin_count, 1);
+	UT_ASSERT(cluster_pcm_x_finish_retain_flush_active);
+	UT_ASSERT((state & BM_LOCKED) == 0);
+	transition_flush_count++;
+	if (transition_flush_error) {
+		cluster_pcm_x_finish_retain_flush_io_active = true;
+		pg_atomic_write_u32(&buf->state, state | BM_IO_IN_PROGRESS);
+		pg_re_throw();
+	}
+	if (!transition_flush_leaves_dirty)
+		pg_atomic_write_u32(&buf->state,
+							state & ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED));
+}
+
+static void
+transition_abort_io(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, BufferDescriptorGetBuffer(transition_buf));
+	pg_atomic_fetch_and_u32(&transition_buf->state, ~BM_IO_IN_PROGRESS);
+	pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_ERROR);
+}
+
+/* VM/FSM dropping is a different existing owner; never fake its success. */
+static ClusterPcmOwnResult
+transition_unexpected_drop(void)
+{
+	UT_ASSERT(false);
+	return CLUSTER_PCM_OWN_INVALID;
+}
+
+#define LockBufHdr transition_lock_header
+#define BufHdrGetBlock(buf) ((Block)transition_page.data)
+#define BufTableHashCode(tag) (0U)
+#define BufMappingPartitionLock(hash) ((void)(hash), &transition_mapping_lock)
+#define BufTableLookup(lookup_tag, hash)                                                           \
+	(BufferTagsEqual((lookup_tag), &transition_buf->tag) ? transition_buf->buf_id : -1)
+#define LWLockAcquire transition_lock_acquire
+#define LWLockConditionalAcquire transition_lock_acquire
+#define LWLockRelease transition_lock_release
+#define LWLockHeldByMe(lock) (transition_content_held)
+#define LWLockHeldByMeInMode(lock, mode) (transition_content_held && (mode) == LW_EXCLUSIVE)
+#define cluster_bufmgr_pin_for_gcs_locked transition_pin_locked
+#define cluster_bufmgr_unpin_for_gcs transition_unpin
+#define FlushBuffer(buf, rel, object, context) transition_flush(buf)
+#define AbortBufferIO transition_abort_io
+#define cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(...) transition_unexpected_drop()
+/* Injection selector/ERROR logging retain their existing t/406 coverage. */
+#ifdef ENABLE_INJECTION
+#define TRANSITION_RESTORE_INJECTION
+#undef ENABLE_INJECTION
+#endif
+#undef elog
+#define elog(...) ((void)0)
+#undef HOLD_INTERRUPTS
+#define HOLD_INTERRUPTS() ((void)0)
+#include "test_cluster_pcm_transition_owner.inc"
+#undef HOLD_INTERRUPTS
+#undef elog
+#ifdef TRANSITION_RESTORE_INJECTION
+#define ENABLE_INJECTION 1
+#undef TRANSITION_RESTORE_INJECTION
+#endif
+#undef cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned
+#undef AbortBufferIO
+#undef FlushBuffer
+#undef cluster_bufmgr_unpin_for_gcs
+#undef cluster_bufmgr_pin_for_gcs_locked
+#undef LWLockHeldByMeInMode
+#undef LWLockHeldByMe
+#undef LWLockRelease
+#undef LWLockConditionalAcquire
+#undef LWLockAcquire
+#undef BufTableLookup
+#undef BufMappingPartitionLock
+#undef BufTableHashCode
+#undef BufHdrGetBlock
+#undef LockBufHdr
 
 static char *read_bufmgr_source(void);
 static void assert_ordered_in_function(const char *source, const char *function_start,
@@ -78,6 +251,405 @@ UT_TEST(test_pcm_own_snapshot_equality_is_whole_object_exact)
 		((unsigned char *)&changed)[i] ^= UINT8_C(1);
 		UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&base, &changed));
 	}
+}
+
+static void
+snapshot_owner_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
+{
+	memset(buf, 0, sizeof(*buf));
+	memset(entry, 0, sizeof(*entry));
+	buf->tag.spcOid = 1663;
+	buf->tag.dbOid = 5;
+	buf->tag.relNumber = 16386;
+	buf->tag.forkNum = VISIBILITYMAP_FORKNUM;
+	buf->pcm_state = (uint8)PCM_STATE_N;
+	buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
+	pg_atomic_init_u32(&buf->state, BM_LOCKED | BM_TAG_VALID | BM_VALID);
+	pg_atomic_init_u64(&entry->generation, 17);
+	pg_atomic_init_u64(&entry->reservation_token, 21);
+	pg_atomic_init_u64(&entry->writer_activation_token, 23);
+	pg_atomic_init_u64(&entry->resource_x_activation_generation, 29);
+	pg_atomic_init_u32(&entry->flags, PCM_OWN_FLAG_GRANT_PENDING);
+}
+
+UT_TEST(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	UT_ASSERT(cluster_pcm_own_fence_matches_locked(&buf, &before));
+	pg_atomic_write_u64(&entry.writer_activation_token, 24);
+	cluster_pcm_own_snapshot_locked(&buf, &after);
+	UT_ASSERT(!cluster_pcm_own_fence_matches_locked(&buf, &before));
+	UT_ASSERT_EQ(cluster_pcm_x_target_install_follow_adjudicate_exact(
+					 &before, &after, RESOURCE_X_TARGET_INSTALL_TERMINAL, NULL, NULL),
+				 RESOURCE_X_TARGET_INSTALL_RESAMPLE);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_bufmgr_snapshot_captures_image_type)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	buf.buffer_type = (uint8)BUF_TYPE_PI;
+	cluster_pcm_own_snapshot_locked(&buf, &after);
+	UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&before, &after));
+	UT_ASSERT_EQ(cluster_pcm_x_target_install_follow_adjudicate_exact(
+					 &before, &after, RESOURCE_X_TARGET_INSTALL_TERMINAL, NULL, NULL),
+				 RESOURCE_X_TARGET_INSTALL_RESAMPLE);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_bufmgr_snapshot_captures_each_semantic_buffer_bit)
+{
+	const uint32 bits[] = { BM_TAG_VALID,		  BM_VALID,			 BM_DIRTY,	 BM_JUST_DIRTIED,
+							BM_CHECKPOINT_NEEDED, BM_IO_IN_PROGRESS, BM_IO_ERROR };
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+	size_t i;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	for (i = 0; i < lengthof(bits); i++) {
+		pg_atomic_write_u32(&buf.state, (BM_LOCKED | BM_TAG_VALID | BM_VALID) ^ bits[i]);
+		cluster_pcm_own_snapshot_locked(&buf, &after);
+		UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&before, &after));
+		UT_ASSERT_EQ(cluster_pcm_x_target_install_follow_adjudicate_exact(
+						 &before, &after, RESOURCE_X_TARGET_INSTALL_TERMINAL, NULL, NULL),
+					 RESOURCE_X_TARGET_INSTALL_RESAMPLE);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_bufmgr_owned_fence_survives_flush_but_observation_resamples)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot clean;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	buf.pcm_state = (uint8)PCM_STATE_X;
+	pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+	pg_atomic_write_u64(&entry.writer_activation_token, 0);
+	pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+	pg_atomic_write_u32(&buf.state, BM_LOCKED | BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED
+										| BM_CHECKPOINT_NEEDED);
+	cluster_pcm_own_snapshot_locked(&buf, &revoking);
+
+	/* FlushBuffer may clean the source without changing its ownership fence.
+	 * The later finish must still accept that fence, while an observation
+	 * bracket spanning this I/O must never publish its old terminal result. */
+	pg_atomic_write_u32(&buf.state, BM_LOCKED | BM_TAG_VALID | BM_VALID);
+	cluster_pcm_own_snapshot_locked(&buf, &clean);
+	UT_ASSERT(cluster_pcm_own_fence_matches_locked(&buf, &revoking));
+	UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&revoking, &clean));
+	UT_ASSERT_EQ(cluster_pcm_x_target_install_follow_adjudicate_exact(
+					 &revoking, &clean, RESOURCE_X_TARGET_INSTALL_TERMINAL, NULL, NULL),
+				 RESOURCE_X_TARGET_INSTALL_RESAMPLE);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_bufmgr_fence_rejects_every_non_image_byte_drift)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnSnapshot changed;
+	size_t i;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	cluster_pcm_own_snapshot_locked(&buf, &live);
+	for (i = 0; i < sizeof(live); i++) {
+		bool image_byte
+			= (i >= offsetof(ClusterPcmOwnSnapshot, semantic_buf_state)
+			   && i < offsetof(ClusterPcmOwnSnapshot, semantic_buf_state) + sizeof(uint32))
+			  || i == offsetof(ClusterPcmOwnSnapshot, buffer_type);
+
+		memcpy(&changed, &live, sizeof(changed));
+		((unsigned char *)&changed)[i] ^= UINT8_C(1);
+		UT_ASSERT_EQ(cluster_pcm_own_fence_matches_locked(&buf, &changed), image_byte);
+		UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&live, &changed));
+	}
+	UT_ASSERT(!cluster_pcm_own_fence_matches_locked(&buf, NULL));
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_bufmgr_snapshot_ignores_refcount_usage_and_pin_waiter)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	pg_atomic_write_u32(&buf.state, BM_LOCKED | BM_TAG_VALID | BM_VALID | BUF_REFCOUNT_ONE
+										| BUF_USAGECOUNT_ONE | BM_PIN_COUNT_WAITER);
+	memset(&after, 0xff, sizeof(after));
+	cluster_pcm_own_snapshot_locked(&buf, &after);
+	UT_ASSERT(cluster_pcm_own_fence_matches_locked(&buf, &before));
+	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&before, &after));
+	UT_ASSERT_EQ(before.semantic_buf_state, BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(before.buffer_type, BUF_TYPE_CURRENT);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_snapshot_post_state_uses_unpublished_locked_state)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+	const uint32 old_state
+		= BM_LOCKED | BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+	const uint32 post_state = BM_LOCKED | BM_TAG_VALID | BM_VALID | BUF_REFCOUNT_ONE
+							  | BUF_USAGECOUNT_ONE | BM_PIN_COUNT_WAITER;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	pg_atomic_write_u32(&buf.state, old_state);
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	memset(&after, 0xff, sizeof(after));
+	cluster_pcm_own_snapshot_post_state_locked(&buf, post_state, &after);
+	UT_ASSERT_EQ(after.semantic_buf_state, BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(after._reserved[0], 0);
+	UT_ASSERT_EQ(after._reserved[1], 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), old_state);
+	UT_ASSERT(!cluster_pcm_own_snapshot_equal_exact(&before, &after));
+	UT_ASSERT(cluster_pcm_own_fence_equal_exact(&before, &after));
+	UT_ASSERT_EQ(before.semantic_buf_state,
+				 BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	ClusterPcmOwnArray = saved;
+}
+
+static void
+transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnapshot *revoking,
+				   bool dirty)
+{
+	snapshot_owner_fixture(buf, entry);
+	ClusterPcmOwnArray = entry;
+	buf->tag.forkNum = MAIN_FORKNUM;
+	buf->pcm_state = (uint8)PCM_STATE_S;
+	buf->buffer_type = (uint8)BUF_TYPE_SCUR;
+	pg_atomic_write_u32(&entry->flags, PCM_OWN_FLAG_REVOKING);
+	pg_atomic_write_u64(&entry->writer_activation_token, 0);
+	pg_atomic_write_u64(&entry->resource_x_activation_generation, 0);
+	pg_atomic_write_u32(&buf->state,
+						BM_LOCKED | BM_TAG_VALID | BM_VALID
+							| (dirty ? BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED : 0));
+	cluster_pcm_own_snapshot_locked(buf, revoking);
+	UnlockBufHdr(buf, pg_atomic_read_u32(&buf->state));
+	memset(transition_page.data, 0, BLCKSZ);
+	PageSetLSNPreserveOrigin((Page)transition_page.data, UINT64_C(0x12340));
+	((PageHeader)transition_page.data)->pd_block_scn = 123;
+	transition_buf = buf;
+	transition_mapping_held = false;
+	transition_content_held = false;
+	transition_pin_count = 0;
+	transition_flush_count = 0;
+	transition_flush_error = false;
+	transition_flush_leaves_dirty = false;
+	cluster_pcm_x_finish_retain_flush_active = false;
+	cluster_pcm_x_finish_retain_flush_io_active = false;
+}
+
+UT_TEST(test_real_source_copy_then_finish_preserves_owned_fence)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot copied;
+	ClusterPcmOwnSnapshot retained;
+	PGIOAlignedBlock carrier;
+	XLogRecPtr lsn = InvalidXLogRecPtr;
+	uint64 scn = 0;
+
+	transition_fixture(&buf, &entry, &revoking, true);
+	memset(carrier.data, 0, BLCKSZ);
+	/* Copy/materialize has flushed the image since REVOKING was captured. */
+	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_VALID);
+	transition_content_held = true;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_copy_source_image_exact(&buf, &revoking,
+																(Page)transition_page.data, false,
+																&copied, carrier.data, &lsn, &scn),
+				 CLUSTER_PCM_OWN_OK);
+	transition_content_held = false;
+	UT_ASSERT_EQ(lsn, UINT64_C(0x12340));
+	UT_ASSERT_EQ(scn, 123);
+	UT_ASSERT_EQ(memcmp(carrier.data, transition_page.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_finish_revoke_retain(&buf, &revoking, UINT64_C(0x12340),
+															 &retained, NULL),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(retained.generation, 18);
+	UT_ASSERT_EQ(retained.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(retained.buffer_type, BUF_TYPE_PI);
+	UT_ASSERT_EQ(retained.semantic_buf_state, BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_finish_flush_uses_current_image_and_rejects_failures)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot retained;
+	int scenario;
+	const ClusterPcmOwnResult want[]
+		= { CLUSTER_PCM_OWN_OK,		 CLUSTER_PCM_OWN_STALE,	  CLUSTER_PCM_OWN_STALE,
+			CLUSTER_PCM_OWN_CORRUPT, CLUSTER_PCM_OWN_CORRUPT, CLUSTER_PCM_OWN_BUSY,
+			CLUSTER_PCM_OWN_BUSY };
+
+	for (scenario = 0; scenario < lengthof(want); scenario++) {
+		XLogRecPtr lsn = UINT64_C(0x12340);
+
+		transition_fixture(&buf, &entry, &revoking, true);
+		if (scenario == 1)
+			lsn++;
+		else if (scenario == 2)
+			pg_atomic_write_u64(&entry.writer_activation_token, 1);
+		else if (scenario == 3)
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		else if (scenario == 4)
+			buf.buffer_type = (uint8)BUF_TYPE_PI;
+		else if (scenario == 5)
+			transition_flush_leaves_dirty = true;
+		else if (scenario == 6)
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		UT_ASSERT_EQ(
+			cluster_bufmgr_pcm_own_finish_revoke_retain(&buf, &revoking, lsn, &retained, NULL),
+			want[scenario]);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), scenario == 0 ? 18 : 17);
+		UT_ASSERT_EQ(buf.pcm_state, scenario == 0 ? PCM_STATE_N : PCM_STATE_S);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+		UT_ASSERT(!cluster_pcm_x_finish_retain_flush_active);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_finish_failed_flush_rethrows_without_losing_fence)
+{
+	static BufferDesc buf;
+	static ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot retained;
+	volatile bool caught = false;
+
+	transition_fixture(&buf, &entry, &revoking, true);
+	transition_flush_error = true;
+	PG_TRY();
+	{
+		(void)cluster_bufmgr_pcm_own_finish_revoke_retain(&buf, &revoking, UINT64_C(0x12340),
+														  &retained, NULL);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 17);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT(!cluster_pcm_x_finish_retain_flush_io_active);
+	UT_ASSERT(!cluster_pcm_x_finish_retain_flush_active);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_source_copy_returns_post_replacement_image_type)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot copied;
+	PGIOAlignedBlock carrier;
+	PGIOAlignedBlock source;
+	XLogRecPtr lsn;
+	uint64 scn;
+
+	transition_fixture(&buf, &entry, &revoking, false);
+	buf.pcm_state = (uint8)PCM_STATE_N;
+	buf.buffer_type = (uint8)BUF_TYPE_PI;
+	cluster_pcm_own_snapshot_locked(&buf, &revoking);
+	memcpy(source.data, transition_page.data, BLCKSZ);
+	transition_content_held = true;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_copy_source_image_exact(
+					 &buf, &revoking, (Page)source.data, true, &copied, carrier.data, &lsn, &scn),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(copied.buffer_type, BUF_TYPE_CURRENT);
+	UT_ASSERT_EQ(copied.semantic_buf_state, BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(copied.generation, 17);
+	UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_CURRENT);
+	transition_content_held = false;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_snapshot_classifiers_use_the_captured_physical_inputs)
+{
+	const char *owners[] = { "\ncluster_bufmgr_pcm_own_n_assertion_candidate_exact(",
+							 "\ncluster_bufmgr_pcm_own_n_retained_release_inflight_exact(",
+							 "\ncluster_bufmgr_pcm_own_n_storage_candidate_exact(",
+							 "\ncluster_bufmgr_pcm_own_n_direct_init_candidate_exact(",
+							 "\ncluster_bufmgr_pcm_own_s_holder_candidate_exact(" };
+	const char *forbidden[] = { "buf->pcm_state", "buf->buffer_type", "(buf_state & BM_",
+								"cluster_pcm_own_fence_matches_locked(" };
+	char *source = read_bufmgr_source();
+	size_t i;
+	size_t j;
+
+	for (i = 0; i < lengthof(owners); i++) {
+		const char *start = strstr(source, owners[i]);
+		const char *end = start != NULL ? strstr(start, "\n}") : NULL;
+		const char *capture
+			= start != NULL ? strstr(start, "cluster_pcm_own_snapshot_locked(buf, &live)") : NULL;
+		const char *compare
+			= start != NULL ? strstr(start, "cluster_pcm_own_snapshot_equal_exact(&live,") : NULL;
+
+		UT_ASSERT(start != NULL && end != NULL);
+		if (start == NULL || end == NULL)
+			continue;
+		UT_ASSERT(capture != NULL && capture < end);
+		UT_ASSERT(compare != NULL && compare < end);
+		for (j = 0; j < lengthof(forbidden); j++) {
+			const char *found = strstr(start, forbidden[j]);
+
+			UT_ASSERT(found == NULL || found >= end);
+		}
+	}
+	free(source);
 }
 
 static bool
@@ -134,11 +706,11 @@ parallel_stable_cover_child(ParallelStableCoverRace *race, int start_fd, int don
 {
 	if (!pipe_read_byte(start_fd))
 		_exit(10);
-	race->begin_result = cluster_pcm_own_reservation_begin_exact(
-		0, 0, PCM_OWN_FLAG_GRANT_PENDING, &race->token);
+	race->begin_result
+		= cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING, &race->token);
 	if (race->begin_result == CLUSTER_PCM_OWN_OK)
-		race->commit_result = cluster_pcm_own_grant_commit_exact(
-			0, 0, race->token, &race->committed_generation);
+		race->commit_result
+			= cluster_pcm_own_grant_commit_exact(0, 0, race->token, &race->committed_generation);
 	if (race->commit_result == CLUSTER_PCM_OWN_OK)
 		pg_atomic_write_u32(&race->descriptor_state, (uint32)PCM_STATE_S);
 	if (!pipe_write_byte(done_fd))
@@ -261,8 +833,8 @@ assert_writer_activation(uint64 token)
 static void
 assert_resource_x_activation(uint64 generation)
 {
-	UT_ASSERT_EQ(
-		pg_atomic_read_u64(&ClusterPcmOwnArray[0].resource_x_activation_generation), generation);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[0].resource_x_activation_generation),
+				 generation);
 }
 
 UT_TEST(test_shmem_initializes_complete_entry)
@@ -277,8 +849,8 @@ UT_TEST(test_shmem_initializes_complete_entry)
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].generation), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].reservation_token), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].writer_activation_token), 0);
-		UT_ASSERT_EQ(
-			pg_atomic_read_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation),
+					 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmOwnArray[i].flags), 0);
 	}
 }
@@ -299,46 +871,46 @@ UT_TEST(test_resource_x_activation_binding_is_exact_and_legacy_closed)
 	assert_writer_activation(writer_token);
 	assert_resource_x_activation(0);
 
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token, 0),
-				 CLUSTER_PCM_OWN_INVALID);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation + 1, writer_token, 41),
+	UT_ASSERT_EQ(
+		cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation, writer_token, 0),
+		CLUSTER_PCM_OWN_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation + 1,
+																  writer_token, 41),
 				 CLUSTER_PCM_OWN_STALE);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token + 1, 41),
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation,
+																  writer_token + 1, 41),
 				 CLUSTER_PCM_OWN_STALE);
 	assert_resource_x_activation(0);
 
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token, 41),
-				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation, writer_token, 41),
+		CLUSTER_PCM_OWN_OK);
 	assert_writer_activation(writer_token);
 	assert_resource_x_activation(41);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token, 41),
-				 CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token, 42),
-				 CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation, writer_token, 41),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation, writer_token, 42),
+		CLUSTER_PCM_OWN_STALE);
 	assert_resource_x_activation(41);
 
 	/* A generic legacy clear must not open a target Resource-X fence, and
 	 * descriptor reuse cannot erase either live activation field. */
-	UT_ASSERT_EQ(cluster_pcm_own_writer_activation_clear_exact(
-					  0, committed_generation, writer_token),
-				 CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_writer_activation_clear_exact(0, committed_generation, writer_token),
+		CLUSTER_PCM_OWN_STALE);
 	UT_ASSERT(!cluster_pcm_own_gen_bump_checked(0, NULL));
 	assert_writer_activation(writer_token);
 	assert_resource_x_activation(41);
 
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(
-					  0, committed_generation, writer_token, 42),
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(0, committed_generation,
+																   writer_token, 42),
 				 CLUSTER_PCM_OWN_STALE);
 	assert_writer_activation(writer_token);
 	assert_resource_x_activation(41);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(
-					  0, committed_generation, writer_token, 41),
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(0, committed_generation,
+																   writer_token, 41),
 				 CLUSTER_PCM_OWN_OK);
 	assert_resource_x_activation(0);
 	assert_writer_activation(0);
@@ -362,17 +934,17 @@ UT_TEST(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking)
 	UT_ASSERT_EQ(
 		cluster_pcm_own_writer_grant_commit_exact(0, 0, writer_token, &committed_generation),
 		CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(
-					  0, committed_generation, writer_token, 41),
-				 CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_neutralize_exact(
-					  0, committed_generation, writer_token, 42, &neutral_generation),
+	UT_ASSERT_EQ(
+		cluster_pcm_own_resource_x_activation_bind_exact(0, committed_generation, writer_token, 41),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_neutralize_exact(0, committed_generation, writer_token,
+															 42, &neutral_generation),
 				 CLUSTER_PCM_OWN_STALE);
 	UT_ASSERT_EQ(neutral_generation, 0);
 	assert_writer_activation(writer_token);
 	assert_resource_x_activation(41);
-	UT_ASSERT_EQ(cluster_pcm_own_resource_x_neutralize_exact(
-					  0, committed_generation, writer_token, 41, &neutral_generation),
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_neutralize_exact(0, committed_generation, writer_token,
+															 41, &neutral_generation),
 				 CLUSTER_PCM_OWN_OK);
 	UT_ASSERT_EQ(neutral_generation, committed_generation + 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[0].generation), neutral_generation);
@@ -402,13 +974,10 @@ UT_TEST(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking)
 	UT_ASSERT_NOT_NULL(neutralize);
 	UT_ASSERT_NOT_NULL(neutralize_end);
 	if (neutralize != NULL && neutralize_end != NULL) {
-		const char *quarantine
-			= strstr(neutralize, "buf->pcm_state = (uint8)PCM_STATE_N");
-		const char *raw_clear
-			= strstr(neutralize, "cluster_pcm_own_resource_x_neutralize_exact(");
+		const char *quarantine = strstr(neutralize, "buf->pcm_state = (uint8)PCM_STATE_N");
+		const char *raw_clear = strstr(neutralize, "cluster_pcm_own_resource_x_neutralize_exact(");
 
-		UT_ASSERT_NOT_NULL(strstr(source,
-			"PGRAC_PCM_X_FENCE_TERMINAL_OWNER(R8_NEUTRALIZE, tag,"));
+		UT_ASSERT_NOT_NULL(strstr(source, "PGRAC_PCM_X_FENCE_TERMINAL_OWNER(R8_NEUTRALIZE, tag,"));
 		UT_ASSERT_NOT_NULL(strstr(neutralize, "BufTableLookup"));
 		UT_ASSERT_NOT_NULL(strstr(neutralize, "cluster_pcm_x_resource_x_r8_snapshot_exact("));
 		UT_ASSERT_NOT_NULL(strstr(neutralize, "cluster_pcm_own_resource_x_neutralize_exact("));
@@ -575,42 +1144,35 @@ UT_TEST(test_remote_s_holder_pending_grant_is_retryable_busy)
 	snapshot.pcm_state = (uint8)PCM_STATE_N;
 	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	snapshot.reservation_token = 1;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_BUSY);
 
 	/* The narrow retry classification must not hide malformed reservation
 	 * evidence or an already active writer/Resource-X fence. */
 	snapshot.reservation_token = 0;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.reservation_token = UINT64_MAX;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.reservation_token = 1;
 	snapshot.generation = UINT64_MAX;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.generation = 0;
 	snapshot.writer_activation_token = 1;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.writer_activation_token = 0;
 	snapshot.resource_x_activation_generation = 1;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 
 	/* Clean S remains owned by the existing exact candidate path. */
 	memset(&snapshot, 0, sizeof(snapshot));
 	snapshot.pcm_state = (uint8)PCM_STATE_S;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
-		CLUSTER_PCM_OWN_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+				 CLUSTER_PCM_OWN_INVALID);
 }
 
 UT_TEST(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple)
@@ -621,55 +1183,35 @@ UT_TEST(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple)
 	snapshot.pcm_state = (uint8)PCM_STATE_N;
 	snapshot.generation = 2;
 	snapshot.reservation_token = 2;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_OK);
 
 	/* Stable-N idempotence is narrower than the general N assertion shape:
 	 * it requires the finite monotonic token left by a committed revoke and
 	 * rejects every live or residual ownership axis instead of manufacturing
 	 * replay identity. */
 	snapshot.generation = 0;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_STALE);
 	snapshot.generation = UINT64_MAX;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.generation = 2;
 	snapshot.flags = PCM_OWN_FLAG_REVOKING;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_BUSY);
 	snapshot.flags = 0;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_OK);
 	snapshot.reservation_token = 0;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_STALE);
 	snapshot.reservation_token = UINT64_MAX;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.reservation_token = 2;
 	snapshot.writer_activation_token = 1;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_CORRUPT);
 	snapshot.writer_activation_token = 0;
 	snapshot.resource_x_activation_generation = 1;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_CORRUPT);
 	memset(&snapshot, 0, sizeof(snapshot));
 	snapshot.pcm_state = (uint8)PCM_STATE_S;
 	snapshot.generation = 2;
-	UT_ASSERT_EQ(
-		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
-		CLUSTER_PCM_OWN_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot), CLUSTER_PCM_OWN_INVALID);
 }
 
 UT_TEST(test_grant_commit_is_exact_and_bumps_once)
@@ -870,9 +1412,9 @@ UT_TEST(test_parallel_s_cover_is_rechecked_before_new_reservation)
 	base.generation = 1;
 	base.reservation_token = 1;
 	base.pcm_state = (uint8)PCM_STATE_S;
-	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(
-					 0, 1, PCM_OWN_FLAG_GRANT_PENDING, &fresh_token),
-				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_begin_exact(0, 1, PCM_OWN_FLAG_GRANT_PENDING, &fresh_token),
+		CLUSTER_PCM_OWN_OK);
 	UT_ASSERT_EQ(fresh_token, 2);
 	assert_entry(1, 2, PCM_OWN_FLAG_GRANT_PENDING);
 	live = base;
@@ -883,17 +1425,16 @@ UT_TEST(test_parallel_s_cover_is_rechecked_before_new_reservation)
 
 	/* Exercise the production cover predicate directly.  S readers may accept
 	 * a stable successor generation; X writers remain generation-exact. */
-	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, 1, 1,
+														  (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S,
-		PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_X, 1, 1, (uint8)PCM_STATE_S, 0, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_X, 1, 2, (uint8)PCM_STATE_X, 0, 0, 0));
-	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, 1, 2, (uint8)PCM_STATE_S, 0, 0, 0));
+		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S, PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, 1, 1,
+														   (uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, 1, 2,
+														   (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, 1, 2,
+														  (uint8)PCM_STATE_S, 0, 0, 0));
 
 	ClusterPcmOwnArray = NULL;
 	UT_ASSERT_EQ(munmap(race, sizeof(*race)), 0);
@@ -904,35 +1445,34 @@ UT_TEST(test_share_cover_reverify_accepts_stable_successor_grant)
 	/* Once content authority is held, a stable current S/X successor is the
 	 * exact node-level grant for a read.  Generation drift alone must not open
 	 * a fresh legacy reservation from S (the forbidden S_NEW shape). */
-	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(13),
-												  UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
-	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(13),
-												  UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
 
 	/* A writer keeps the stricter generation-exact gate and must re-enter the
 	 * convert queue after any ownership round.  A non-covering or live
 	 * lifecycle remains closed for both modes. */
-	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(13),
-												   UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
-	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-												  UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(13), UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_S,
-												   PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
+														   UINT64_C(14), (uint8)PCM_STATE_S,
+														   PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_S,
-												   PCM_OWN_FLAG_REVOKING, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_N, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
+														   UINT64_C(14), (uint8)PCM_STATE_S,
+														   PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_N, UINT64_C(14), UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_X, 0,
-												   UINT64_C(91), 0));
+														   UINT64_C(14), (uint8)PCM_STATE_X, 0,
+														   UINT64_C(91), 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-												   UINT64_C(14), (uint8)PCM_STATE_X, 0,
-												   UINT64_C(91), UINT64_C(22)));
-
+														   UINT64_C(14), (uint8)PCM_STATE_X, 0,
+														   UINT64_C(91), UINT64_C(22)));
 }
 
 UT_TEST(test_revoke_commit_is_exact_and_classifies_live_races)
@@ -1122,27 +1662,22 @@ UT_TEST(test_eviction_rejects_live_reservation_and_exhaustion)
 
 UT_TEST(test_target_eviction_bufferdesc_lifecycle_is_reversible_before_local_commit)
 {
-	static const char *const begin_contract[] = {
-		"base->pcm_state != (uint8) PCM_STATE_X",
-		"cluster_pcm_own_snapshot_matches_locked(buf, base)",
-		"cluster_pcm_own_reservation_begin_exact",
-		"PCM_OWN_FLAG_REVOKING",
-		"cluster_pcm_own_snapshot_locked(buf, revoking_out)"
-	};
-	static const char *const finish_contract[] = {
-		"expected_revoking->pcm_state != (uint8) PCM_STATE_X",
-		"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
-		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
-		"cluster_pcm_own_revoke_commit_exact",
-		"buf->pcm_state = (uint8) PCM_STATE_N",
-		"cluster_pcm_own_snapshot_locked(buf, committed_n_out)"
-	};
-	static const char *const abort_contract[] = {
-		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
-		"cluster_pcm_own_reservation_abort_exact",
-		"PCM_OWN_FLAG_REVOKING",
-		"cluster_pcm_own_snapshot_locked(buf, restored_x_out)"
-	};
+	static const char *const begin_contract[]
+		= { "base->pcm_state != (uint8) PCM_STATE_X",
+			"cluster_pcm_own_fence_matches_locked(buf, base)",
+			"cluster_pcm_own_reservation_begin_exact", "PCM_OWN_FLAG_REVOKING",
+			"cluster_pcm_own_snapshot_locked(buf, revoking_out)" };
+	static const char *const finish_contract[]
+		= { "expected_revoking->pcm_state != (uint8) PCM_STATE_X",
+			"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
+			"cluster_pcm_own_fence_matches_locked(buf, expected_revoking)",
+			"cluster_pcm_own_revoke_commit_exact",
+			"buf->pcm_state = (uint8) PCM_STATE_N",
+			"cluster_pcm_own_snapshot_locked(buf, committed_n_out)" };
+	static const char *const abort_contract[]
+		= { "cluster_pcm_own_fence_matches_locked(buf, expected_revoking)",
+			"cluster_pcm_own_reservation_abort_exact", "PCM_OWN_FLAG_REVOKING",
+			"cluster_pcm_own_snapshot_locked(buf, restored_x_out)" };
 	char *source = read_bufmgr_source();
 
 	/* The TARGET cached-X release proof must be frozen while the descriptor is
@@ -1152,16 +1687,16 @@ UT_TEST(test_target_eviction_bufferdesc_lifecycle_is_reversible_before_local_com
 	 * Stale identity is rejected before any sidecar mutation. */
 	assert_ordered_in_function(
 		source, "\ncluster_pcm_own_eviction_begin_locked(",
-		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_finish_locked(",
-		begin_contract, lengthof(begin_contract));
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_finish_locked(", begin_contract,
+		lengthof(begin_contract));
 	assert_ordered_in_function(
 		source, "\ncluster_pcm_own_eviction_finish_locked(",
-		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_abort_locked(",
-		finish_contract, lengthof(finish_contract));
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_abort_locked(", finish_contract,
+		lengthof(finish_contract));
 	assert_ordered_in_function(
 		source, "\ncluster_pcm_own_eviction_abort_locked(",
-		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_commit_locked(",
-		abort_contract, lengthof(abort_contract));
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_commit_locked(", abort_contract,
+		lengthof(abort_contract));
 	free(source);
 }
 
@@ -1400,108 +1935,91 @@ UT_TEST(test_bufmgr_generation_bump_failure_is_classified_under_header_lock)
 
 UT_TEST(test_read_image_lifecycle_is_exact_monotonic_and_header_atomic)
 {
-	typedef ClusterPcmOwnResult (*PublishReadImageFn)(
-		BufferDesc *, const ClusterPcmOwnSnapshot *, uint64, uint64 *);
+	typedef ClusterPcmOwnResult (*PublishReadImageFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
+													  uint64, uint64 *);
 	typedef ClusterPcmOwnResult (*ReleaseReadImageFn)(BufferDesc *, uint64 *);
-	typedef ClusterPcmOwnResult (*ReclaimReadImageFn)(
-		BufferDesc *, const ClusterPcmOwnSnapshot *, uint64 *);
-	static const char *const publish_contract[] = {
-		"*published_generation_out = 0",
-		"LWLockHeldByMe(BufferDescriptorGetContentLock(buf))",
-		"LockBufHdr(buf)",
-		"cluster_pcm_own_snapshot_locked(buf, &live)",
-		"BufferTagsEqual(&live.tag, &base->tag)",
-		"live.generation != base->generation",
-		"live.reservation_token != reservation_token",
-		"live.writer_activation_token != 0",
-		"live.resource_x_activation_generation != 0",
-		"live.flags != PCM_OWN_FLAG_GRANT_PENDING",
-		"BM_VALID",
-		"BM_IO_IN_PROGRESS",
-		"BUF_TYPE_CURRENT",
-		"cluster_pcm_own_grant_commit_exact",
-		"buf->pcm_state = (uint8) PCM_STATE_READ_IMAGE",
-		"UnlockBufHdr(buf, buf_state)"
-	};
-	static const char *const clear_contract[] = {
-		"*cleared_generation_out = 0",
-		"LockBufHdr(buf)",
-		"cluster_pcm_own_snapshot_locked(buf, &live)",
-		"BufferTagsEqual(&live.tag, &published->tag)",
-		"live.generation != published->generation",
-		"live.reservation_token != published->reservation_token",
-		"live.pcm_state != (uint8) PCM_STATE_READ_IMAGE",
-		"live.flags != 0",
-		"live.writer_activation_token != 0",
-		"live.resource_x_activation_generation != 0",
-		"cluster_pcm_own_bump_locked",
-		"buf->pcm_state = (uint8) PCM_STATE_N",
-		"UnlockBufHdr(buf, buf_state)"
-	};
-	static const char *const begin_contract[] = {
-		"*wait_reason = CLUSTER_PCM_GRANT_WAIT_NONE",
-		"cluster_pcm_own_snapshot_locked(buf, out_base)",
-		"cluster_pcm_x_read_image_begin_disposition(",
-		"result == CLUSTER_PCM_OWN_INVALID",
-		"cluster_pcm_own_reservation_begin_exact"
-	};
+	typedef ClusterPcmOwnResult (*ReclaimReadImageFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
+													  uint64 *);
+	static const char *const publish_contract[]
+		= { "*published_generation_out = 0",
+			"LWLockHeldByMe(BufferDescriptorGetContentLock(buf))",
+			"LockBufHdr(buf)",
+			"cluster_pcm_own_snapshot_locked(buf, &live)",
+			"BufferTagsEqual(&live.tag, &base->tag)",
+			"live.generation != base->generation",
+			"live.reservation_token != reservation_token",
+			"live.writer_activation_token != 0",
+			"live.resource_x_activation_generation != 0",
+			"live.flags != PCM_OWN_FLAG_GRANT_PENDING",
+			"BM_VALID",
+			"BM_IO_IN_PROGRESS",
+			"BUF_TYPE_CURRENT",
+			"cluster_pcm_own_grant_commit_exact",
+			"buf->pcm_state = (uint8) PCM_STATE_READ_IMAGE",
+			"UnlockBufHdr(buf, buf_state)" };
+	static const char *const clear_contract[]
+		= { "*cleared_generation_out = 0",
+			"LockBufHdr(buf)",
+			"cluster_pcm_own_snapshot_locked(buf, &live)",
+			"BufferTagsEqual(&live.tag, &published->tag)",
+			"live.generation != published->generation",
+			"live.reservation_token != published->reservation_token",
+			"live.pcm_state != (uint8) PCM_STATE_READ_IMAGE",
+			"live.flags != 0",
+			"live.writer_activation_token != 0",
+			"live.resource_x_activation_generation != 0",
+			"cluster_pcm_own_bump_locked",
+			"buf->pcm_state = (uint8) PCM_STATE_N",
+			"UnlockBufHdr(buf, buf_state)" };
+	static const char *const begin_contract[]
+		= { "*wait_reason = CLUSTER_PCM_GRANT_WAIT_NONE",
+			"cluster_pcm_own_snapshot_locked(buf, out_base)",
+			"cluster_pcm_x_read_image_begin_disposition(", "result == CLUSTER_PCM_OWN_INVALID",
+			"cluster_pcm_own_reservation_begin_exact" };
 	char *source = read_bufmgr_source();
 
 	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_NONE, 0);
 	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_LIVE_RESERVATION, 1);
 	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET, 2);
 	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_RESOURCE_X_BARRIER, 3);
-	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_pcm_own_publish_read_image_exact),
-		PublishReadImageFn));
-	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_pcm_own_release_read_image_exact),
-		ReleaseReadImageFn));
-	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_pcm_own_reclaim_read_image_exact),
-		ReclaimReadImageFn));
+	UT_ASSERT(__builtin_types_compatible_p(__typeof__(&cluster_pcm_own_publish_read_image_exact),
+										   PublishReadImageFn));
+	UT_ASSERT(__builtin_types_compatible_p(__typeof__(&cluster_pcm_own_release_read_image_exact),
+										   ReleaseReadImageFn));
+	UT_ASSERT(__builtin_types_compatible_p(__typeof__(&cluster_pcm_own_reclaim_read_image_exact),
+										   ReclaimReadImageFn));
 
 	assert_ordered_in_function(
 		source, "\ncluster_pcm_own_publish_read_image_exact(",
-		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_clear_read_image_exact(",
-		publish_contract, lengthof(publish_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_pcm_own_clear_read_image_exact(",
-		"\nClusterPcmOwnResult\ncluster_pcm_own_release_read_image_exact(",
-		clear_contract, lengthof(clear_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_pcm_own_begin_grant_reservation(",
-		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_x_reservation(",
-		begin_contract, lengthof(begin_contract));
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_clear_read_image_exact(", publish_contract,
+		lengthof(publish_contract));
+	assert_ordered_in_function(source, "\ncluster_pcm_own_clear_read_image_exact(",
+							   "\nClusterPcmOwnResult\ncluster_pcm_own_release_read_image_exact(",
+							   clear_contract, lengthof(clear_contract));
+	assert_ordered_in_function(source, "\ncluster_pcm_own_begin_grant_reservation(",
+							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_x_reservation(",
+							   begin_contract, lengthof(begin_contract));
 	free(source);
 }
 
 UT_TEST(test_share_read_image_publication_has_no_clean_n_observation_gap)
 {
 	char *source = read_bufmgr_source();
-	const char *lockbuffer = strstr(
-		source, "\nLockBufferInternal(Buffer buffer, int mode");
-	const char *lockbuffer_end = lockbuffer != NULL
-		? strstr(lockbuffer, "\nvoid\nLockBuffer(Buffer buffer, int mode)")
-		: NULL;
-	const char *non_durable = lockbuffer != NULL
-		? strstr(lockbuffer, "else if (pcm_pending_set)")
-		: NULL;
-	const char *branch_end = non_durable != NULL
-		? strstr(non_durable, "\n\t\t\t\tbreak;")
-		: NULL;
+	const char *lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
+	const char *lockbuffer_end
+		= lockbuffer != NULL ? strstr(lockbuffer, "\nvoid\nLockBuffer(Buffer buffer, int mode)")
+							 : NULL;
+	const char *non_durable
+		= lockbuffer != NULL ? strstr(lockbuffer, "else if (pcm_pending_set)") : NULL;
+	const char *branch_end = non_durable != NULL ? strstr(non_durable, "\n\t\t\t\tbreak;") : NULL;
 	const char *publish = non_durable != NULL
-		? strstr(non_durable, "cluster_pcm_own_publish_read_image_exact(")
-		: NULL;
-	const char *pending_clear = publish != NULL
-		? strstr(publish, "pcm_pending_set = false")
-		: NULL;
-	const char *old_abort = non_durable != NULL
-		? strstr(non_durable, "cluster_pcm_own_abort_grant_or_error(")
-		: NULL;
-	const char *old_transition = non_durable != NULL
-		? strstr(non_durable, "cluster_pcm_own_transition(")
-		: NULL;
+							  ? strstr(non_durable, "cluster_pcm_own_publish_read_image_exact(")
+							  : NULL;
+	const char *pending_clear = publish != NULL ? strstr(publish, "pcm_pending_set = false") : NULL;
+	const char *old_abort
+		= non_durable != NULL ? strstr(non_durable, "cluster_pcm_own_abort_grant_or_error(") : NULL;
+	const char *old_transition
+		= non_durable != NULL ? strstr(non_durable, "cluster_pcm_own_transition(") : NULL;
 
 	UT_ASSERT_NOT_NULL(lockbuffer);
 	UT_ASSERT_NOT_NULL(lockbuffer_end);
@@ -1525,26 +2043,22 @@ UT_TEST(test_share_read_image_publication_has_no_clean_n_observation_gap)
 UT_TEST(test_read_image_normal_unlock_clears_exactly_before_content_release)
 {
 	char *source = read_bufmgr_source();
-	const char *lockbuffer = strstr(
-		source, "\nLockBufferInternal(Buffer buffer, int mode");
-	const char *unlock = lockbuffer != NULL
-		? strstr(lockbuffer, "if (mode == BUFFER_LOCK_UNLOCK)")
-		: NULL;
-	const char *unlock_end = unlock != NULL
-		? strstr(unlock, "\n\telse if (cluster_pcm_is_active()")
-		: NULL;
-	const char *release_exact = unlock != NULL
-		? strstr(unlock, "cluster_pcm_own_release_read_image_exact(")
-		: NULL;
-	const char *content_release = unlock != NULL
-		? strstr(unlock, "LWLockRelease(BufferDescriptorGetContentLock(buf))")
-		: NULL;
+	const char *lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
+	const char *unlock
+		= lockbuffer != NULL ? strstr(lockbuffer, "if (mode == BUFFER_LOCK_UNLOCK)") : NULL;
+	const char *unlock_end
+		= unlock != NULL ? strstr(unlock, "\n\telse if (cluster_pcm_is_active()") : NULL;
+	const char *release_exact
+		= unlock != NULL ? strstr(unlock, "cluster_pcm_own_release_read_image_exact(") : NULL;
+	const char *content_release
+		= unlock != NULL ? strstr(unlock, "LWLockRelease(BufferDescriptorGetContentLock(buf))")
+						 : NULL;
 	const char *report_failure = release_exact != NULL
-		? strstr(release_exact, "cluster_pcm_own_report_bump_failure(")
-		: NULL;
-	const char *old_generic = unlock != NULL
-		? strstr(unlock, "cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N")
-		: NULL;
+									 ? strstr(release_exact, "cluster_pcm_own_report_bump_failure(")
+									 : NULL;
+	const char *old_generic
+		= unlock != NULL ? strstr(unlock, "cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N")
+						 : NULL;
 
 	UT_ASSERT_NOT_NULL(unlock);
 	UT_ASSERT_NOT_NULL(unlock_end);
@@ -1562,41 +2076,37 @@ UT_TEST(test_read_image_normal_unlock_clears_exactly_before_content_release)
 
 UT_TEST(test_read_image_abandoned_reclaim_wait_is_content_x_and_successor_exact)
 {
-	static const char *const reclaim_wait_contract[] = {
-		"wait_reason == CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET",
-		"abandoned = *base_out",
-		"LWLockAcquireOrWait(",
-		"LW_EXCLUSIVE",
-		"PG_TRY()",
-		"cluster_pcm_own_reclaim_read_image_exact(",
-		"PG_FINALLY()",
-		"LWLockHeldByMe(content_lock)",
-		"LWLockRelease(content_lock)",
-		"reclaim_result == CLUSTER_PCM_OWN_OK",
-		"reclaim_result == CLUSTER_PCM_OWN_STALE",
-		"continue"
-	};
+	static const char *const reclaim_wait_contract[]
+		= { "wait_reason == CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET",
+			"abandoned = *base_out",
+			"LWLockAcquireOrWait(",
+			"LW_EXCLUSIVE",
+			"PG_TRY()",
+			"cluster_pcm_own_reclaim_read_image_exact(",
+			"PG_FINALLY()",
+			"LWLockHeldByMe(content_lock)",
+			"LWLockRelease(content_lock)",
+			"reclaim_result == CLUSTER_PCM_OWN_OK",
+			"reclaim_result == CLUSTER_PCM_OWN_STALE",
+			"continue" };
 	char *source = read_bufmgr_source();
 
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(",
-		"\n\ntypedef enum ClusterBufmgrPcmRetryRearmResult",
-		reclaim_wait_contract, lengthof(reclaim_wait_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(",
+							   "\n\ntypedef enum ClusterBufmgrPcmRetryRearmResult",
+							   reclaim_wait_contract, lengthof(reclaim_wait_contract));
 	free(source);
 }
 
 UT_TEST(test_pending_x_denied_retry_drops_removed_queue_gap)
 {
 	static const char *const retry_contract[]
-		= { "cluster_pcm_own_abort_grant_reservation",
-			"cluster_bufmgr_resource_x_wait_retry",
+		= { "cluster_pcm_own_abort_grant_reservation", "cluster_bufmgr_resource_x_wait_retry",
 			"cluster_bufmgr_pcm_begin_grant_reservation_wait" };
 	char *source = read_bufmgr_source();
 	const char *rearm = strstr(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(");
 	const char *rearm_end = rearm != NULL ? strstr(rearm, "\n}\n\nstatic ") : NULL;
-	const char *old_delay = rearm != NULL
-		? strstr(rearm, "cluster_bufmgr_pcm_pending_x_retry_delay_ms")
-		: NULL;
+	const char *old_delay
+		= rearm != NULL ? strstr(rearm, "cluster_bufmgr_pcm_pending_x_retry_delay_ms") : NULL;
 	const char *old_lmon = rearm != NULL ? strstr(rearm, "cluster_lmon_main_loop_interval") : NULL;
 	const char *old_backoff
 		= rearm != NULL ? strstr(rearm, "cluster_gcs_block_starvation_backoff_ms") : NULL;
@@ -1623,33 +2133,30 @@ UT_TEST(test_pending_x_denied_retry_drops_removed_queue_gap)
 UT_TEST(test_resource_x_s_barrier_aborts_one_racing_reservation_then_parks)
 {
 	char *source = read_bufmgr_source();
-	const char *begin_wait = source != NULL
-		? strstr(source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(")
-		: NULL;
-	const char *begin_wait_end = begin_wait != NULL
-		? strstr(begin_wait, "\n}\n\ntypedef enum ClusterBufmgrPcmRetryRearmResult")
-		: NULL;
-	const char *reservation_begin = begin_wait != NULL
-		? strstr(begin_wait, "cluster_pcm_own_begin_grant_reservation(buf")
-		: NULL;
-	const char *resource_x_barrier = reservation_begin != NULL
-		? strstr(reservation_begin,
-			"cluster_gcs_block_resource_x_local_s_barrier_active(buf->tag)")
-		: NULL;
+	const char *begin_wait
+		= source != NULL ? strstr(source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(")
+						 : NULL;
+	const char *begin_wait_end
+		= begin_wait != NULL
+			  ? strstr(begin_wait, "\n}\n\ntypedef enum ClusterBufmgrPcmRetryRearmResult")
+			  : NULL;
+	const char *reservation_begin
+		= begin_wait != NULL ? strstr(begin_wait, "cluster_pcm_own_begin_grant_reservation(buf")
+							 : NULL;
+	const char *resource_x_barrier
+		= reservation_begin != NULL
+			  ? strstr(reservation_begin,
+					   "cluster_gcs_block_resource_x_local_s_barrier_active(buf->tag)")
+			  : NULL;
 	const char *abort = resource_x_barrier != NULL
-		? strstr(resource_x_barrier,
-			"cluster_pcm_own_abort_grant_reservation(")
-		: NULL;
-	const char *park = abort != NULL
-		? strstr(abort, "\n\t\t\tdo\n")
-		: NULL;
-	const char *yield = park != NULL
-		? strstr(park, "cluster_bufmgr_resource_x_wait_retry(")
-		: NULL;
-	const char *barrier_recheck = yield != NULL
-		? strstr(yield,
-			"while (cluster_gcs_block_resource_x_local_s_barrier_active(")
-		: NULL;
+							? strstr(resource_x_barrier, "cluster_pcm_own_abort_grant_reservation(")
+							: NULL;
+	const char *park = abort != NULL ? strstr(abort, "\n\t\t\tdo\n") : NULL;
+	const char *yield = park != NULL ? strstr(park, "cluster_bufmgr_resource_x_wait_retry(") : NULL;
+	const char *barrier_recheck
+		= yield != NULL
+			  ? strstr(yield, "while (cluster_gcs_block_resource_x_local_s_barrier_active(")
+			  : NULL;
 
 	/* The header-locked begin must run first so a terminal cached X can cover
 	 * the read.  If a requester-local round raced that begin, abort the one
@@ -1663,15 +2170,11 @@ UT_TEST(test_resource_x_s_barrier_aborts_one_racing_reservation_then_parks)
 	UT_ASSERT_NOT_NULL(park);
 	UT_ASSERT_NOT_NULL(yield);
 	UT_ASSERT_NOT_NULL(barrier_recheck);
-	if (begin_wait_end != NULL && reservation_begin != NULL
-		&& resource_x_barrier != NULL && abort != NULL && park != NULL
-		&& yield != NULL && barrier_recheck != NULL)
-		UT_ASSERT(reservation_begin < resource_x_barrier
-			&& resource_x_barrier < abort
-			&& abort < park
-			&& park < yield
-			&& yield < barrier_recheck
-			&& barrier_recheck < begin_wait_end);
+	if (begin_wait_end != NULL && reservation_begin != NULL && resource_x_barrier != NULL
+		&& abort != NULL && park != NULL && yield != NULL && barrier_recheck != NULL)
+		UT_ASSERT(reservation_begin < resource_x_barrier && resource_x_barrier < abort
+				  && abort < park && park < yield && yield < barrier_recheck
+				  && barrier_recheck < begin_wait_end);
 	free(source);
 }
 
@@ -1782,28 +2285,24 @@ UT_TEST(test_passive_retained_pi_is_an_n_assertion_candidate_only)
 	/* A DRAINed retained image kept under a pre-existing pin is a legal
 	 * passive N requester shape.  It may originate ASSERT_X without a local
 	 * image proof, but dirty/IO/malformed variants remain closed. */
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_CURRENT, BM_VALID),
+	UT_ASSERT_EQ(
+		cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_CURRENT, BM_VALID),
 		CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, BM_VALID),
-		CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, BM_VALID | BM_DIRTY),
-		CLUSTER_PCM_OWN_BUSY);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI,
-		BM_VALID | BM_IO_IN_PROGRESS),
-		CLUSTER_PCM_OWN_BUSY);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, 0),
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, BM_VALID),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI,
+												 BM_VALID | BM_DIRTY),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI,
+												 BM_VALID | BM_IO_IN_PROGRESS),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, 0),
+				 CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_N, (uint8)BUF_TYPE_XCUR, BM_VALID),
 		CLUSTER_PCM_OWN_CORRUPT);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_XCUR, BM_VALID),
-		CLUSTER_PCM_OWN_CORRUPT);
-	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
-		(uint8)PCM_STATE_S, (uint8)BUF_TYPE_PI, BM_VALID),
-		CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape((uint8)PCM_STATE_S, (uint8)BUF_TYPE_PI, BM_VALID),
+				 CLUSTER_PCM_OWN_STALE);
 }
 
 UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
@@ -1877,34 +2376,30 @@ UT_TEST(test_d5a_release_error_keeps_descriptor_out_of_freelist)
 
 UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
 {
-	static const char *const lifecycle_contract[] = {
-		"cluster_pcm_own_eviction_begin_locked(",
-		"UnlockBufHdr",
-		"LWLockRelease(partition_lock)",
-		"cluster_gcs_resource_x_target_evict_prepare_exact(",
-		"LWLockAcquire(partition_lock, LW_EXCLUSIVE)",
-		"LockBufHdr(buf)",
-		"cluster_pcm_own_eviction_finish_locked(",
-		"ClearBufferTag(&buf->tag)",
-		"UnlockBufHdr(buf, buf_state)",
-		"BufTableDelete(tag, hash)",
-		"LWLockRelease(partition_lock)",
-		"plan.local_n_committed = true",
-		"cluster_gcs_resource_x_target_evict_publish_exact(&plan)",
-		"StrategyFreeBuffer"
-	};
-	static const char *const abort_contract[] = {
-		"cluster_gcs_resource_x_target_evict_abort_exact(&plan)",
-		"cluster_pcm_own_eviction_abort_locked(",
-		"cluster_bufmgr_resource_x_fail_closed_current()"
-	};
-	static const char *const commit_entry_contract[] = {
-		"cluster_pcm_own_eviction_capture_locked",
-		"cluster_resource_x_writer_path_snapshot(",
-		"current_writer_path == RESOURCE_X_WRITER_TARGET",
-		"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
-		"return cluster_bufmgr_resource_x_target_evict_locked("
-	};
+	static const char *const lifecycle_contract[]
+		= { "cluster_pcm_own_eviction_begin_locked(",
+			"UnlockBufHdr",
+			"LWLockRelease(partition_lock)",
+			"cluster_gcs_resource_x_target_evict_prepare_exact(",
+			"LWLockAcquire(partition_lock, LW_EXCLUSIVE)",
+			"LockBufHdr(buf)",
+			"cluster_pcm_own_eviction_finish_locked(",
+			"ClearBufferTag(&buf->tag)",
+			"UnlockBufHdr(buf, buf_state)",
+			"BufTableDelete(tag, hash)",
+			"LWLockRelease(partition_lock)",
+			"plan.local_n_committed = true",
+			"cluster_gcs_resource_x_target_evict_publish_exact(&plan)",
+			"StrategyFreeBuffer" };
+	static const char *const abort_contract[]
+		= { "cluster_gcs_resource_x_target_evict_abort_exact(&plan)",
+			"cluster_pcm_own_eviction_abort_locked(",
+			"cluster_bufmgr_resource_x_fail_closed_current()" };
+	static const char *const commit_entry_contract[]
+		= { "cluster_pcm_own_eviction_capture_locked", "cluster_resource_x_writer_path_snapshot(",
+			"current_writer_path == RESOURCE_X_WRITER_TARGET",
+			"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
+			"return cluster_bufmgr_resource_x_target_evict_locked(" };
 	char *source = read_bufmgr_source();
 	const char *helper;
 	const char *helper_end;
@@ -1913,56 +2408,48 @@ UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
 	 * fences X first, drops every buffer lock before PREPARE, commits the exact
 	 * token only after reacquiring the same mapping/header, and publishes the
 	 * frozen plan before an explicit invalidation returns it to the freelist. */
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
-		"\n/*\n * InvalidateBufferCommitLocked", lifecycle_contract,
-		lengthof(lifecycle_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
-		"\n/*\n * InvalidateBufferCommitLocked", abort_contract,
-		lengthof(abort_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
+							   "\n/*\n * InvalidateBufferCommitLocked", lifecycle_contract,
+							   lengthof(lifecycle_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
+							   "\n/*\n * InvalidateBufferCommitLocked", abort_contract,
+							   lengthof(abort_contract));
 	assert_ordered_in_function(source, "\nInvalidateBufferCommitLocked(",
-		"\n/*\n * InvalidateBufferCommitTailLocked", commit_entry_contract,
-		lengthof(commit_entry_contract));
-	helper = strstr(source,
-		"\ncluster_bufmgr_resource_x_target_evict_locked(");
-	helper_end = helper == NULL ? NULL : strstr(helper,
-		"\n/*\n * InvalidateBufferCommitLocked");
+							   "\n/*\n * InvalidateBufferCommitTailLocked", commit_entry_contract,
+							   lengthof(commit_entry_contract));
+	helper = strstr(source, "\ncluster_bufmgr_resource_x_target_evict_locked(");
+	helper_end = helper == NULL ? NULL : strstr(helper, "\n/*\n * InvalidateBufferCommitLocked");
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
 	if (helper != NULL && helper_end != NULL) {
-		const char *late_commit = strstr(helper,
-			"cluster_pcm_own_eviction_commit_locked(");
+		const char *late_commit = strstr(helper, "cluster_pcm_own_eviction_commit_locked(");
 
 		UT_ASSERT(late_commit == NULL || late_commit >= helper_end);
 	}
-	UT_ASSERT_NULL(strstr(source,
-		"cluster_gcs_resource_x_target_evict_release_exact("));
+	UT_ASSERT_NULL(strstr(source, "cluster_gcs_resource_x_target_evict_release_exact("));
 	free(source);
 }
 
 UT_TEST(test_resource_x_target_clock_sweep_eviction_uses_native_exact_release)
 {
-	static const char *const victim_contract[] = {
-		"ClusterPcmOwnEvictionCapture eviction_capture",
-		"cluster_pcm_own_eviction_capture_locked",
-		"cluster_resource_x_writer_path_snapshot(",
-		"current_writer_path == RESOURCE_X_WRITER_TARGET",
-		"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
-		"return cluster_bufmgr_resource_x_target_evict_locked("
-	};
+	static const char *const victim_contract[]
+		= { "ClusterPcmOwnEvictionCapture eviction_capture",
+			"cluster_pcm_own_eviction_capture_locked",
+			"cluster_resource_x_writer_path_snapshot(",
+			"current_writer_path == RESOURCE_X_WRITER_TARGET",
+			"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
+			"return cluster_bufmgr_resource_x_target_evict_locked(" };
 	char *source = read_bufmgr_source();
 	const char *victim = strstr(source, "\nInvalidateVictimBuffer(");
-	const char *victim_end = victim != NULL
-		? strstr(victim, "\nstatic Buffer\nGetVictimBuffer(") : NULL;
+	const char *victim_end
+		= victim != NULL ? strstr(victim, "\nstatic Buffer\nGetVictimBuffer(") : NULL;
 
 	/* Clock-sweep reuse joins the same pre-fenced helper while retaining its
 	 * caller pin.  It does not duplicate the protocol or rebuild kind-4 after
 	 * the descriptor has become N. */
-	assert_ordered_in_function(
-		source, "\nInvalidateVictimBuffer(",
-		"\nstatic Buffer\nGetVictimBuffer(", victim_contract,
-		lengthof(victim_contract));
+	assert_ordered_in_function(source, "\nInvalidateVictimBuffer(",
+							   "\nstatic Buffer\nGetVictimBuffer(", victim_contract,
+							   lengthof(victim_contract));
 	UT_ASSERT_NOT_NULL(victim);
 	UT_ASSERT_NOT_NULL(victim_end);
 	if (victim != NULL && victim_end != NULL) {
@@ -2019,21 +2506,17 @@ UT_TEST(test_queue_contract_exposes_prepare_only_begin_api)
 UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 {
 	typedef ClusterPcmOwnResult (*BeginRevokeFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
-											 ClusterPcmOwnSnapshot *);
+												 ClusterPcmOwnSnapshot *);
 	typedef ClusterPcmOwnResult (*BeginHeldXRevokeFn)(
-		const BufferTag *, const ClusterPcmOwnSnapshot *,
-		ClusterPcmOwnHeldXRevoke *);
-	typedef ClusterPcmOwnResult (*AbortHeldXRevokeFn)(
-		ClusterPcmOwnHeldXRevoke *);
-	typedef ClusterPcmOwnResult (*TryDrainHeldXRevokeFn)(
-		const ClusterPcmOwnHeldXRevoke *);
-	typedef ClusterPcmOwnResult (*TryDrainDropXRevokeFn)(
-		BufferDesc *, const ClusterPcmOwnSnapshot *);
-	typedef ClusterPcmOwnResult (*FinishHeldXRevokeFn)(
-		ClusterPcmOwnHeldXRevoke *, XLogRecPtr, ClusterPcmOwnSnapshot *,
-		ClusterPcmOwnFinishRefusal *);
-	typedef ClusterPcmOwnResult (*AbandonHeldXRevokeFn)(
-		ClusterPcmOwnHeldXRevoke *);
+		const BufferTag *, const ClusterPcmOwnSnapshot *, ClusterPcmOwnHeldXRevoke *);
+	typedef ClusterPcmOwnResult (*AbortHeldXRevokeFn)(ClusterPcmOwnHeldXRevoke *);
+	typedef ClusterPcmOwnResult (*TryDrainHeldXRevokeFn)(const ClusterPcmOwnHeldXRevoke *);
+	typedef ClusterPcmOwnResult (*TryDrainDropXRevokeFn)(BufferDesc *,
+														 const ClusterPcmOwnSnapshot *);
+	typedef ClusterPcmOwnResult (*FinishHeldXRevokeFn)(ClusterPcmOwnHeldXRevoke *, XLogRecPtr,
+													   ClusterPcmOwnSnapshot *,
+													   ClusterPcmOwnFinishRefusal *);
+	typedef ClusterPcmOwnResult (*AbandonHeldXRevokeFn)(ClusterPcmOwnHeldXRevoke *);
 	typedef ClusterPcmOwnResult (*PrepareNSourceFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
 													ClusterPcmOwnSnapshot *, char *, XLogRecPtr *,
 													uint64 *);
@@ -2050,20 +2533,15 @@ UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 	UT_ASSERT(__builtin_types_compatible_p(__typeof__(&cluster_bufmgr_pcm_own_begin_x_revoke),
 										   BeginRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag),
-		BeginHeldXRevokeFn));
+		__typeof__(&cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag), BeginHeldXRevokeFn));
+	UT_ASSERT(__builtin_types_compatible_p(__typeof__(&cluster_bufmgr_pcm_own_abort_held_x_revoke),
+										   AbortHeldXRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_abort_held_x_revoke),
-		AbortHeldXRevokeFn));
+		__typeof__(&cluster_bufmgr_pcm_own_try_drain_held_x_revoke), TryDrainHeldXRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_try_drain_held_x_revoke),
-		TryDrainHeldXRevokeFn));
+		__typeof__(&cluster_bufmgr_pcm_own_try_drain_drop_x_revoke), TryDrainDropXRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_try_drain_drop_x_revoke),
-		TryDrainDropXRevokeFn));
-	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_finish_held_x_revoke_retain),
-		FinishHeldXRevokeFn));
+		__typeof__(&cluster_bufmgr_pcm_own_finish_held_x_revoke_retain), FinishHeldXRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
 		__typeof__(&cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed),
 		AbandonHeldXRevokeFn));
@@ -2094,7 +2572,7 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 			"expected_n->pcm_state != (uint8)PCM_STATE_N",
 			"ReservePrivateRefCountEntry",
 			"ResourceOwnerEnlargeBuffers(CurrentResourceOwner)",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"BM_VALID",
 			"BM_IO_ERROR",
 			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
@@ -2110,7 +2588,7 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
 			"cluster_bufmgr_pcm_own_copy_source_image_exact(" };
 	static const char *const copy_contract[]
-		= { "cluster_pcm_own_snapshot_matches_locked",
+		= { "cluster_pcm_own_fence_matches_locked",
 			"PCM_OWN_FLAG_REVOKING",
 			"BM_VALID",
 			"BM_IO_ERROR",
@@ -2120,7 +2598,7 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 			"memcpy(block_data, source_page, BLCKSZ)",
 			"PageGetLSN(source_page)",
 			"pd_block_scn",
-			"*out_revoking = live" };
+			"cluster_pcm_own_snapshot_locked(buf, out_revoking)" };
 	char *source = read_bufmgr_source();
 
 	/* READY may be built only after one verified storage scratch has replaced
@@ -2132,10 +2610,10 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_prepare_n_source_image(",
 							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_s_revoke(",
 							   prepare_contract, lengthof(prepare_contract));
-	assert_ordered_in_function(source,
-							   "\ncluster_bufmgr_pcm_own_copy_source_image_exact(",
-							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_prepare_n_source_image(",
-							   copy_contract, lengthof(copy_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_pcm_own_copy_source_image_exact(",
+		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_prepare_n_source_image(", copy_contract,
+		lengthof(copy_contract));
 	free(source);
 }
 
@@ -2204,40 +2682,36 @@ UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
 	const char *recent_end;
 	const char *extend;
 	const char *extend_end;
-	static const char *const locked_gate_contract[] = {
-		"cluster_bufmgr_pcm_aux_pin_admission_locked(", "PinBuffer_Locked"
-	};
+	static const char *const locked_gate_contract[]
+		= { "cluster_bufmgr_pcm_aux_pin_admission_locked(", "PinBuffer_Locked" };
 
 	/* REVOKING is the already-frozen admission fence.  It blocks only a new
 	 * passive VM/FSM pin in the active tracked domain; inactive, untracked,
 	 * non-auxiliary, and non-REVOKING shapes retain PostgreSQL pin semantics. */
-	UT_ASSERT(!cluster_pcm_x_aux_pin_admission_allowed(
-		true, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
-	UT_ASSERT(!cluster_pcm_x_aux_pin_admission_allowed(
-		true, true, FSM_FORKNUM, PCM_OWN_FLAG_REVOKING));
-	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
-		false, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
-	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
-		true, false, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
-	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
-		true, true, MAIN_FORKNUM, PCM_OWN_FLAG_REVOKING));
-	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
-		true, true, VISIBILITYMAP_FORKNUM, 0));
-	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
-		true, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_GRANT_PENDING));
+	UT_ASSERT(!cluster_pcm_x_aux_pin_admission_allowed(true, true, VISIBILITYMAP_FORKNUM,
+													   PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(
+		!cluster_pcm_x_aux_pin_admission_allowed(true, true, FSM_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(false, true, VISIBILITYMAP_FORKNUM,
+													  PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(true, false, VISIBILITYMAP_FORKNUM,
+													  PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(
+		cluster_pcm_x_aux_pin_admission_allowed(true, true, MAIN_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(true, true, VISIBILITYMAP_FORKNUM, 0));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(true, true, VISIBILITYMAP_FORKNUM,
+													  PCM_OWN_FLAG_GRANT_PENDING));
 
 	source = read_bufmgr_source();
 	lookup_pin = strstr(source, "\nPinBufferForLookup(");
-	lookup_pin_end = lookup_pin != NULL
-		? strstr(lookup_pin, "\nstatic bool\nPinBuffer(") : NULL;
+	lookup_pin_end = lookup_pin != NULL ? strstr(lookup_pin, "\nstatic bool\nPinBuffer(") : NULL;
 	buffer_alloc = strstr(source, "\nBufferAlloc(");
-	buffer_alloc_end = buffer_alloc != NULL
-		? strstr(buffer_alloc, "\n/*\n * InvalidateBuffer") : NULL;
+	buffer_alloc_end
+		= buffer_alloc != NULL ? strstr(buffer_alloc, "\n/*\n * InvalidateBuffer") : NULL;
 	recent = strstr(source, "\nReadRecentBuffer(");
 	recent_end = recent != NULL ? strstr(recent, "\n/*\n * ReadBuffer") : NULL;
 	extend = strstr(source, "\nstatic BlockNumber\nExtendBufferedRelShared(");
-	extend_end = extend != NULL
-		? strstr(extend, "\n/*\n * MarkBufferDirty") : NULL;
+	extend_end = extend != NULL ? strstr(extend, "\n/*\n * MarkBufferDirty") : NULL;
 	UT_ASSERT_NOT_NULL(lookup_pin);
 	UT_ASSERT_NOT_NULL(lookup_pin_end);
 	UT_ASSERT_NOT_NULL(buffer_alloc);
@@ -2247,29 +2721,27 @@ UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
 	UT_ASSERT_NOT_NULL(extend);
 	UT_ASSERT_NOT_NULL(extend_end);
 	if (lookup_pin != NULL && lookup_pin_end != NULL) {
-		static const char *const atomic_contract[] = {
-			"GetPrivateRefCountEntry", "LockBufHdr",
-			"cluster_pcm_x_aux_pin_admission_allowed(",
-			"cluster_pcm_own_flags_get", "PIN_BUFFER_LOOKUP_RETRY",
-			"BUF_REFCOUNT_ONE", "UnlockBufHdr",
-			"NewPrivateRefCountEntry", "ResourceOwnerRememberBuffer"
-		};
+		static const char *const atomic_contract[] = { "GetPrivateRefCountEntry",
+													   "LockBufHdr",
+													   "cluster_pcm_x_aux_pin_admission_allowed(",
+													   "cluster_pcm_own_flags_get",
+													   "PIN_BUFFER_LOOKUP_RETRY",
+													   "BUF_REFCOUNT_ONE",
+													   "UnlockBufHdr",
+													   "NewPrivateRefCountEntry",
+													   "ResourceOwnerRememberBuffer" };
 
-		assert_ordered_in_function(source, "\nPinBufferForLookup(",
-			"\nstatic bool\nPinBuffer(", atomic_contract,
-			lengthof(atomic_contract));
+		assert_ordered_in_function(source, "\nPinBufferForLookup(", "\nstatic bool\nPinBuffer(",
+								   atomic_contract, lengthof(atomic_contract));
 	}
 	if (buffer_alloc != NULL && buffer_alloc_end != NULL) {
 		UT_ASSERT_NOT_NULL(strstr(buffer_alloc, "PinBufferForLookup("));
-		UT_ASSERT_NOT_NULL(strstr(buffer_alloc,
-			"cluster_bufmgr_resource_x_wait_retry("));
+		UT_ASSERT_NOT_NULL(strstr(buffer_alloc, "cluster_bufmgr_resource_x_wait_retry("));
 		UT_ASSERT_NOT_NULL(strstr(buffer_alloc, "goto retry_lookup;"));
 	}
 	if (recent != NULL && recent_end != NULL) {
-		const char *admission = strstr(recent,
-			"cluster_pcm_x_aux_pin_admission_allowed(");
-		const char *pin = admission != NULL
-			? strstr(admission, "PinBuffer_Locked(bufHdr)") : NULL;
+		const char *admission = strstr(recent, "cluster_pcm_x_aux_pin_admission_allowed(");
+		const char *pin = admission != NULL ? strstr(admission, "PinBuffer_Locked(bufHdr)") : NULL;
 
 		UT_ASSERT_NOT_NULL(admission);
 		UT_ASSERT_NOT_NULL(pin);
@@ -2277,16 +2749,12 @@ UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
 			UT_ASSERT(admission < pin && pin < recent_end);
 	}
 	if (extend != NULL && extend_end != NULL) {
-		const char *admission = strstr(extend,
-			"PinBufferForLookup(existing_hdr, strategy)");
-		const char *legacy = strstr(extend,
-			"PinBuffer(existing_hdr, strategy)");
-		const char *retry = strstr(extend,
-			"goto retry_extend_collision;");
-		const char *native_wait = strstr(extend,
-			"cluster_bufmgr_resource_x_wait_retry(");
-		const char *new_client_error = strstr(extend,
-			"cannot reuse revoking auxiliary cluster PCM image");
+		const char *admission = strstr(extend, "PinBufferForLookup(existing_hdr, strategy)");
+		const char *legacy = strstr(extend, "PinBuffer(existing_hdr, strategy)");
+		const char *retry = strstr(extend, "goto retry_extend_collision;");
+		const char *native_wait = strstr(extend, "cluster_bufmgr_resource_x_wait_retry(");
+		const char *new_client_error
+			= strstr(extend, "cannot reuse revoking auxiliary cluster PCM image");
 
 		UT_ASSERT_NOT_NULL(admission);
 		UT_ASSERT(admission == NULL || admission < extend_end);
@@ -2298,32 +2766,32 @@ UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
 		UT_ASSERT(new_client_error == NULL || new_client_error >= extend_end);
 	}
 	assert_ordered_in_function(source, "\nstatic Buffer\nGetVictimBuffer(",
-		"\n/*\n * Limit the number of pins", locked_gate_contract,
-		lengthof(locked_gate_contract));
-	assert_ordered_in_function(source, "\nSyncOneBuffer(",
-		"\n/*\n *\t\tAtEOXact_Buffers", locked_gate_contract,
-		lengthof(locked_gate_contract));
-	assert_ordered_in_function(source, "\nFlushRelationBuffers(",
-		"\n/* ---------------------------------------------------------------------\n *\t\tFlushRelationsAllBuffers",
+							   "\n/*\n * Limit the number of pins", locked_gate_contract,
+							   lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\nSyncOneBuffer(", "\n/*\n *\t\tAtEOXact_Buffers",
+							   locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(
+		source, "\nFlushRelationBuffers(",
+		"\n/* ---------------------------------------------------------------------\n "
+		"*\t\tFlushRelationsAllBuffers",
 		locked_gate_contract, lengthof(locked_gate_contract));
-	assert_ordered_in_function(source, "\nFlushRelationsAllBuffers(",
-		"\n/* ---------------------------------------------------------------------\n *\t\tRelationCopyStorageUsingBuffer",
+	assert_ordered_in_function(
+		source, "\nFlushRelationsAllBuffers(",
+		"\n/* ---------------------------------------------------------------------\n "
+		"*\t\tRelationCopyStorageUsingBuffer",
 		locked_gate_contract, lengthof(locked_gate_contract));
-	assert_ordered_in_function(source, "\nFlushDatabaseBuffers(",
-		"\n/*\n * Flush a previously", locked_gate_contract,
-		lengthof(locked_gate_contract));
-	assert_ordered_in_function(source,
-		"\ncluster_bufmgr_flush_and_release_x_for_leave(", "\n#endif",
-		locked_gate_contract, lengthof(locked_gate_contract));
-	assert_ordered_in_function(source,
-		"\ncluster_bufmgr_lock_resident_for_stamp(",
-		"\nvoid\ncluster_bufmgr_unlock_resident_stamp(",
-		(const char *const[]){"PinBufferForLookup("}, 1);
-	assert_ordered_in_function(source,
-		"\ncluster_bufmgr_lock_resident_for_exact_itl_stamp(",
+	assert_ordered_in_function(source, "\nFlushDatabaseBuffers(", "\n/*\n * Flush a previously",
+							   locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_flush_and_release_x_for_leave(",
+							   "\n#endif", locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_lock_resident_for_stamp(",
+							   "\nvoid\ncluster_bufmgr_unlock_resident_stamp(",
+							   (const char *const[]){ "PinBufferForLookup(" }, 1);
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_lock_resident_for_exact_itl_stamp(",
 		"\n/* ========================================================================\n"
 		" * PGRAC MODIFICATIONS by SqlRush — spec-6.12a",
-		(const char *const[]){"PinBufferForLookup("}, 1);
+		(const char *const[]){ "PinBufferForLookup(" }, 1);
 	free(source);
 }
 
@@ -2448,18 +2916,18 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 			"LWLockAcquire(partition_lock, LW_SHARED)",
 			"BufTableLookup",
 			"LockBufHdr",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"cluster_bufmgr_pcm_current_image_locked",
 			"BM_IO_IN_PROGRESS",
 			"cluster_bufmgr_pin_for_gcs_locked",
 			"LWLockRelease(partition_lock)",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
 			"PG_TRY();",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"PageGetLSN",
 			"FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL)",
 			"LockBufHdr",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"cluster_bufmgr_pcm_current_image_locked",
 			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
 			"result = CLUSTER_PCM_OWN_BUSY",
@@ -2469,7 +2937,7 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 			"buf->buffer_type = (uint8)BUF_TYPE_PI",
 			"BM_DIRTY | BM_JUST_DIRTIED",
 			"BM_CHECKPOINT_NEEDED | BM_IO_ERROR",
-			"cluster_pcm_own_snapshot_locked",
+			"cluster_pcm_own_snapshot_post_state_locked(buf, buf_state, out_retained)",
 			"LWLockRelease(content_lock)",
 			"cluster_bufmgr_unpin_for_gcs" };
 	static const char *const drop_contract[] = { "BufMappingPartitionLock",
@@ -2488,50 +2956,40 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 												 "buf->pcm_state = (uint8)PCM_STATE_N",
 												 "cluster_pcm_own_snapshot_locked",
 												 "InvalidateBufferCommitTailLocked" };
-	static const char *const held_begin_contract[] = {
-		"cluster_pcm_x_revoke_finish_mode(tag, 0)",
-		"LWLockAcquire(partition_lock, LW_SHARED)",
-		"BufTableLookup",
-		"LockBufHdr",
-		"cluster_pcm_own_snapshot_matches_locked",
-		"cluster_bufmgr_pcm_current_image_locked",
-		"cluster_bufmgr_pin_for_gcs_locked",
-		"LWLockRelease(partition_lock)",
-		"cluster_bufmgr_pcm_own_begin_x_revoke(",
-		"cluster_bufmgr_unpin_for_gcs(buf)",
-		"held_out->revoking = revoking",
-		"held_out->flags = CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK"
-	};
-	static const char *const held_abort_contract[] = {
-		"cluster_bufmgr_pcm_own_abort_x_revoke(",
-		"if (result != CLUSTER_PCM_OWN_OK)",
-		"cluster_bufmgr_unpin_for_gcs(buf)",
-		"memset(held, 0, sizeof(*held))"
-	};
-	static const char *const held_drain_contract[] = {
-		"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
-		"LockBufHdr(buf)",
-		"cluster_pcm_own_snapshot_matches_locked",
-		"cluster_bufmgr_pcm_current_image_locked",
-		"BM_IO_IN_PROGRESS",
-		"BM_IO_ERROR",
-		"UnlockBufHdr(buf, buf_state)",
-		"LWLockRelease(content_lock)"
-	};
-	static const char *const held_finish_contract[] = {
-		"cluster_bufmgr_pcm_own_finish_revoke_retain(",
-		"if (result != CLUSTER_PCM_OWN_OK)",
-		"cluster_bufmgr_unpin_for_gcs(buf)",
-		"memset(held, 0, sizeof(*held))"
-	};
-	static const char *const held_abandon_contract[] = {
-		"LockBufHdr",
-		"cluster_pcm_own_snapshot_matches_locked",
-		"cluster_bufmgr_pcm_current_image_locked",
-		"UnlockBufHdr",
-		"cluster_bufmgr_unpin_for_gcs(buf)",
-		"memset(held, 0, sizeof(*held))"
-	};
+	static const char *const held_begin_contract[]
+		= { "cluster_pcm_x_revoke_finish_mode(tag, 0)",
+			"LWLockAcquire(partition_lock, LW_SHARED)",
+			"BufTableLookup",
+			"LockBufHdr",
+			"cluster_pcm_own_fence_matches_locked",
+			"cluster_bufmgr_pcm_current_image_locked",
+			"cluster_bufmgr_pin_for_gcs_locked",
+			"LWLockRelease(partition_lock)",
+			"cluster_bufmgr_pcm_own_begin_x_revoke(",
+			"cluster_bufmgr_unpin_for_gcs(buf)",
+			"held_out->revoking = revoking",
+			"held_out->flags = CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK" };
+	static const char *const held_abort_contract[]
+		= { "cluster_bufmgr_pcm_own_abort_x_revoke(", "if (result != CLUSTER_PCM_OWN_OK)",
+			"cluster_bufmgr_unpin_for_gcs(buf)", "memset(held, 0, sizeof(*held))" };
+	static const char *const held_drain_contract[]
+		= { "LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+			"LockBufHdr(buf)",
+			"cluster_pcm_own_fence_matches_locked",
+			"cluster_bufmgr_pcm_current_image_locked",
+			"BM_IO_IN_PROGRESS",
+			"BM_IO_ERROR",
+			"UnlockBufHdr(buf, buf_state)",
+			"LWLockRelease(content_lock)" };
+	static const char *const held_finish_contract[]
+		= { "cluster_bufmgr_pcm_own_finish_revoke_retain(", "if (result != CLUSTER_PCM_OWN_OK)",
+			"cluster_bufmgr_unpin_for_gcs(buf)", "memset(held, 0, sizeof(*held))" };
+	static const char *const held_abandon_contract[] = { "LockBufHdr",
+														 "cluster_pcm_own_fence_matches_locked",
+														 "cluster_bufmgr_pcm_current_image_locked",
+														 "UnlockBufHdr",
+														 "cluster_bufmgr_unpin_for_gcs(buf)",
+														 "memset(held, 0, sizeof(*held))" };
 	char *source = read_bufmgr_source();
 	const char *begin_s;
 	const char *abort_s;
@@ -2557,10 +3015,9 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 		source, "\ncluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(",
 		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_revoke_retain(", drop_contract,
 		lengthof(drop_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
-		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_abort_held_x_revoke(",
-		held_begin_contract, lengthof(held_begin_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
+							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_abort_held_x_revoke(",
+							   held_begin_contract, lengthof(held_begin_contract));
 	assert_ordered_in_function(
 		source, "\ncluster_bufmgr_pcm_own_abort_held_x_revoke(",
 		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
@@ -2588,12 +3045,12 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 	drop_helper = strstr(source, "\ncluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(");
 	finish = strstr(source, "\ncluster_bufmgr_pcm_own_finish_revoke_retain(");
 	finish_end = strstr(source, "\ncluster_bufmgr_pcm_own_release_retained_image(");
-	held_drain = strstr(source,
-		"\ncluster_bufmgr_pcm_own_try_drain_held_x_revoke(");
-	held_drain_end = held_drain != NULL
-		? strstr(held_drain,
-			"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_held_x_revoke_retain(")
-		: NULL;
+	held_drain = strstr(source, "\ncluster_bufmgr_pcm_own_try_drain_held_x_revoke(");
+	held_drain_end
+		= held_drain != NULL
+			  ? strstr(held_drain,
+					   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_held_x_revoke_retain(")
+			  : NULL;
 	UT_ASSERT_NOT_NULL(begin_s);
 	UT_ASSERT_NOT_NULL(abort_s);
 	UT_ASSERT_NOT_NULL(begin_x);
@@ -2616,8 +3073,7 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 		UT_ASSERT(forbidden == NULL || forbidden >= held_drain_end);
 		forbidden = strstr(held_drain, "FlushBuffer(");
 		UT_ASSERT(forbidden == NULL || forbidden >= held_drain_end);
-		forbidden = strstr(held_drain,
-			"cluster_pcm_own_revoke_retain_commit_exact(");
+		forbidden = strstr(held_drain, "cluster_pcm_own_revoke_retain_commit_exact(");
 		UT_ASSERT(forbidden == NULL || forbidden >= held_drain_end);
 	}
 	/* buffer_type is a monotone hint: every exact source lifecycle must
@@ -2750,8 +3206,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 				  < strstr(dirty, "buf_state |= BM_DIRTY"));
 	if (hint != NULL) {
 		const char *tracked = strstr(hint, "cluster_bufmgr_should_pcm_track(bufHdr)");
-		const char *gate
-			= strstr(hint, "cluster_pcm_x_content_holder_mutation_allowed(");
+		const char *gate = strstr(hint, "cluster_pcm_x_content_holder_mutation_allowed(");
 		const char *refuse = gate != NULL ? strstr(gate, "return;") : NULL;
 		const char *dirty_flags = strstr(hint, "BM_DIRTY | BM_JUST_DIRTIED");
 
@@ -2847,34 +3302,28 @@ UT_TEST(test_retained_drain_retags_invalid_only_after_exact_token_release)
 
 UT_TEST(test_source_settlement_releases_fence_without_discarding_pi)
 {
-	static const char *const preserve_contract[] = {
-		"source_generation == 0",
-		"cluster_pcm_own_revoke_retain_release_exact",
-		"result == CLUSTER_PCM_OWN_OK",
-		"buf->buffer_type != (uint8) BUF_TYPE_PI",
-		"(buf_state & BM_VALID) == 0",
-		"UnlockBufHdr"
-	};
+	static const char *const preserve_contract[]
+		= { "source_generation == 0",		"cluster_pcm_own_revoke_retain_release_exact",
+			"result == CLUSTER_PCM_OWN_OK", "buf->buffer_type != (uint8) BUF_TYPE_PI",
+			"(buf_state & BM_VALID) == 0",	"UnlockBufHdr" };
 	char *source = read_bufmgr_source();
 	const char *preserve;
 	const char *preserve_end;
 
 	assert_ordered_in_function(
-		source,
-		"\ncluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(",
-		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_release_retained_image(",
-		preserve_contract, lengthof(preserve_contract));
-	preserve = strstr(source,
-		"\ncluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(");
-	preserve_end = preserve != NULL
-		? strstr(preserve + 1,
-			"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_release_retained_image(")
-		: NULL;
+		source, "\ncluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(",
+		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_release_retained_image(", preserve_contract,
+		lengthof(preserve_contract));
+	preserve = strstr(source, "\ncluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(");
+	preserve_end
+		= preserve != NULL
+			  ? strstr(preserve + 1,
+					   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_release_retained_image(")
+			  : NULL;
 	UT_ASSERT_NOT_NULL(preserve);
 	UT_ASSERT_NOT_NULL(preserve_end);
 	if (preserve != NULL && preserve_end != NULL) {
-		const char *retag = strstr(preserve,
-			"cluster_pcm_x_retained_release_retag");
+		const char *retag = strstr(preserve, "cluster_pcm_x_retained_release_retag");
 
 		UT_ASSERT(retag == NULL || retag >= preserve_end);
 	}
@@ -2883,23 +3332,21 @@ UT_TEST(test_source_settlement_releases_fence_without_discarding_pi)
 
 UT_TEST(test_source_settlement_post_release_n_pi_remains_exactly_observable)
 {
-	static const char *const observe_contract[] = {
-		"expected_n->flags != PCM_OWN_FLAG_REVOKING",
-		"expected_n->flags != 0",
-		"cluster_pcm_own_snapshot_matches_locked(buf, expected_n)",
-		"live.flags == PCM_OWN_FLAG_REVOKING || live.flags == 0",
-		"buf->pcm_state == (uint8)PCM_STATE_N",
-		"buf->buffer_type == (uint8)BUF_TYPE_PI",
-		"(buf_state & BM_VALID) != 0"
-	};
+	static const char *const observe_contract[]
+		= { "expected_n->flags != PCM_OWN_FLAG_REVOKING",
+			"expected_n->flags != 0",
+			"cluster_pcm_own_snapshot_equal_exact(&live, expected_n)",
+			"live.flags == PCM_OWN_FLAG_REVOKING || live.flags == 0",
+			"live.pcm_state == (uint8)PCM_STATE_N",
+			"live.buffer_type == (uint8)BUF_TYPE_PI",
+			"(live.semantic_buf_state & BM_VALID) != 0" };
 	char *source = read_bufmgr_source();
 
 	/* SourceSettlement clears the retained token before its entry-lock commit.
 	 * The exact undrained pair is checked by the caller; this BufferDesc half
 	 * must recognize both sides of that bounded physical-release window. */
 	assert_ordered_in_function(
-		source,
-		"\ncluster_bufmgr_pcm_own_n_retained_release_inflight_exact(",
+		source, "\ncluster_bufmgr_pcm_own_n_retained_release_inflight_exact(",
 		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_n_storage_candidate_exact(",
 		observe_contract, lengthof(observe_contract));
 	free(source);
@@ -2910,7 +3357,7 @@ UT_TEST(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n)
 	static const char *const release_contract[] = { "expected_s->pcm_state != (uint8) PCM_STATE_S",
 													"expected_s->flags != 0",
 													"LockBufHdr",
-													"cluster_pcm_own_snapshot_matches_locked",
+													"cluster_pcm_own_fence_matches_locked",
 													"cluster_pcm_own_bump_locked",
 													"buf->pcm_state = (uint8) PCM_STATE_N",
 													"cluster_pcm_own_snapshot_locked",
@@ -2928,52 +3375,48 @@ UT_TEST(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n)
 
 UT_TEST(test_resource_x_remote_s_finish_requires_content_and_exact_revoke)
 {
-	typedef ClusterPcmOwnResult (*RemoteSFinishFn)(
-		BufferDesc *, const ClusterPcmOwnSnapshot *, ClusterPcmOwnSnapshot *);
-	static const char *const finish_contract[] = {
-		"LWLockHeldByMe(BufferDescriptorGetContentLock(buf))",
-		"expected_revoking->pcm_state != (uint8)PCM_STATE_S",
-		"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
-		"expected_revoking->reservation_token == 0",
-		"LockBufHdr(buf)",
-		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
-		"cluster_bufmgr_pcm_current_image_locked(buf, buf_state)",
-		"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
-		"cluster_pcm_own_revoke_commit_exact(",
-		"buf->pcm_state = (uint8)PCM_STATE_N",
-		"buf->buffer_type = (uint8)BUF_TYPE_CURRENT",
-		"cluster_pcm_own_snapshot_locked(buf, out_n_snapshot)",
-		"UnlockBufHdr(buf, buf_state)"
-	};
+	typedef ClusterPcmOwnResult (*RemoteSFinishFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
+												   ClusterPcmOwnSnapshot *);
+	static const char *const finish_contract[]
+		= { "LWLockHeldByMe(BufferDescriptorGetContentLock(buf))",
+			"expected_revoking->pcm_state != (uint8)PCM_STATE_S",
+			"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
+			"expected_revoking->reservation_token == 0",
+			"LockBufHdr(buf)",
+			"cluster_pcm_own_fence_matches_locked(buf, expected_revoking)",
+			"cluster_bufmgr_pcm_current_image_locked(buf, buf_state)",
+			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+			"cluster_pcm_own_revoke_commit_exact(",
+			"buf->pcm_state = (uint8)PCM_STATE_N",
+			"buf->buffer_type = (uint8)BUF_TYPE_CURRENT",
+			"cluster_pcm_own_snapshot_locked(buf, out_n_snapshot)",
+			"UnlockBufHdr(buf, buf_state)" };
 	char *source = read_bufmgr_source();
 
 	UT_ASSERT(__builtin_types_compatible_p(
-		__typeof__(&cluster_bufmgr_pcm_own_finish_remote_s_block_to_n),
-		RemoteSFinishFn));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
-		"\n/*\n * Release a passively pinned MAIN/INIT S mirror",
-		finish_contract, lengthof(finish_contract));
+		__typeof__(&cluster_bufmgr_pcm_own_finish_remote_s_block_to_n), RemoteSFinishFn));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
+							   "\n/*\n * Release a passively pinned MAIN/INIT S mirror",
+							   finish_contract, lengthof(finish_contract));
 	free(source);
 }
 
 UT_TEST(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusive)
 {
-	static const char *const selector_contract[] = {
-		"pcm_writer_path = cluster_resource_x_writer_path_snapshot(",
-		"if (pcm_writer_path != RESOURCE_X_WRITER_TARGET)",
-		"cluster_bufmgr_resource_x_writer_report_failure(",
-		"R11 target-only writer selector",
-		"for (;;)",
-		"cluster_bufmgr_pcm_x_writer_prepare_target(",
-		"pcm_writer_r4_generation",
-		"&pcm_x_absolute_deadline_us",
-		"LWLockAcquire(",
-		"cluster_bufmgr_pcm_x_writer_activate(",
-		"pcm_x_writer, true",
-		"LWLockRelease(",
-		"cluster_lockbuffer_barrier_refusal"
-	};
+	static const char *const selector_contract[]
+		= { "pcm_writer_path = cluster_resource_x_writer_path_snapshot(",
+			"if (pcm_writer_path != RESOURCE_X_WRITER_TARGET)",
+			"cluster_bufmgr_resource_x_writer_report_failure(",
+			"R11 target-only writer selector",
+			"for (;;)",
+			"cluster_bufmgr_pcm_x_writer_prepare_target(",
+			"pcm_writer_r4_generation",
+			"&pcm_x_absolute_deadline_us",
+			"LWLockAcquire(",
+			"cluster_bufmgr_pcm_x_writer_activate(",
+			"pcm_x_writer, true",
+			"LWLockRelease(",
+			"cluster_lockbuffer_barrier_refusal" };
 	char *source = read_bufmgr_source();
 
 	UT_ASSERT_NOT_NULL(source);
@@ -2985,19 +3428,16 @@ UT_TEST(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusi
 	 * explicit-invalidation and clock-sweep eviction snapshots under descriptor
 	 * authority.  None may resnapshot into
 	 * the other implementation. */
-	UT_ASSERT_EQ(count_occurrences(
-		source, "cluster_resource_x_writer_path_snapshot("), 8);
-	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL)
-	{
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_resource_x_writer_path_snapshot("), 8);
+	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL) {
 		free(source);
 		return;
 	}
-	assert_ordered_in_function(
-		source, "\nLockBufferInternal(Buffer buffer, int mode", "\nvoid\nLockBuffer(",
-		selector_contract, lengthof(selector_contract));
+	assert_ordered_in_function(source, "\nLockBufferInternal(Buffer buffer, int mode",
+							   "\nvoid\nLockBuffer(", selector_contract,
+							   lengthof(selector_contract));
 	/* The selected target wrapper receives the exact sampled R4 generation. */
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"&pcm_x_absolute_deadline_us"));
+	UT_ASSERT_NOT_NULL(strstr(source, "&pcm_x_absolute_deadline_us"));
 	free(source);
 }
 
@@ -3034,11 +3474,11 @@ UT_TEST(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership)
 			"cluster_bufmgr_pin_for_gcs_locked",
 			"LWLockRelease(partition_lock)",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"PageGetLSN",
 			"FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL)",
 			"LockBufHdr",
-			"cluster_pcm_own_snapshot_matches_locked",
+			"cluster_pcm_own_fence_matches_locked",
 			"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
 			"result = CLUSTER_PCM_OWN_BUSY",
 			"cluster_pcm_own_bump_locked",
@@ -3071,24 +3511,24 @@ UT_TEST(test_current_image_shape_accepts_monotone_xcur_after_x_to_s_yield)
 
 UT_TEST(test_conditional_lock_preserves_native_off_and_enforces_tracked_x)
 {
-	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(false, true, false, (uint8)PCM_STATE_N, 0,
-										 0, 0));
-	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(true, false, false, (uint8)PCM_STATE_N, 0,
-										 0, 0));
-	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_N, 0,
-										  0, 0));
-	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_S, 0,
-										  0, 0));
-	UT_ASSERT(cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0,
-										 0, 0));
-	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0,
-										  7, 0));
-	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0,
-										  0, 41));
-	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(false, false, true, (uint8)PCM_STATE_X, 0,
-										  0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_conditional_lock_allowed(false, true, false, (uint8)PCM_STATE_N, 0, 0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_conditional_lock_allowed(true, false, false, (uint8)PCM_STATE_N, 0, 0, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_N, 0, 0, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 7, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_conditional_lock_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 0, 41));
+	UT_ASSERT(
+		!cluster_pcm_x_conditional_lock_allowed(false, false, true, (uint8)PCM_STATE_X, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_conditional_lock_allowed(false, false, false, (uint8)PCM_STATE_X,
-											  PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
+													  PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
 }
 
 UT_TEST(test_resource_x_ordinary_mutation_gate_dominates_dirty_hint_and_flush)
@@ -3104,44 +3544,43 @@ UT_TEST(test_resource_x_ordinary_mutation_gate_dominates_dirty_hint_and_flush)
 			"StartBufferIO(buf, false)" };
 	char *source;
 
-	UT_ASSERT(cluster_pcm_x_ordinary_mutation_allowed(false, true, false,
-		(uint8)PCM_STATE_N, 0, 0, 0));
-	UT_ASSERT(cluster_pcm_x_ordinary_mutation_allowed(true, false, false,
-		(uint8)PCM_STATE_N, 0, 0, 0));
-	UT_ASSERT(cluster_pcm_x_ordinary_mutation_allowed(true, true, false,
-		(uint8)PCM_STATE_X, 0, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(true, true, false,
-		(uint8)PCM_STATE_X, 0, 12, 0));
-	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(true, true, false,
-		(uint8)PCM_STATE_X, 0, 0, 41));
-	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(true, true, false,
-		(uint8)PCM_STATE_S, 0, 0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_ordinary_mutation_allowed(false, true, false, (uint8)PCM_STATE_N, 0, 0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_ordinary_mutation_allowed(true, false, false, (uint8)PCM_STATE_N, 0, 0, 0));
+	UT_ASSERT(
+		cluster_pcm_x_ordinary_mutation_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_ordinary_mutation_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 12, 0));
+	UT_ASSERT(
+		!cluster_pcm_x_ordinary_mutation_allowed(true, true, false, (uint8)PCM_STATE_X, 0, 0, 41));
+	UT_ASSERT(
+		!cluster_pcm_x_ordinary_mutation_allowed(true, true, false, (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(cluster_pcm_x_flush_fence_consistent(false, 12, 41));
 	UT_ASSERT(!cluster_pcm_x_flush_fence_consistent(true, 12, 0));
 	UT_ASSERT(cluster_pcm_x_flush_fence_consistent(true, 0, 0));
 
 	source = read_bufmgr_source();
 	assert_ordered_in_function(source, "\nMarkBufferDirty(", "\n/*\n * ReleaseAndReadBuffer",
-								   dirty_contract, lengthof(dirty_contract));
+							   dirty_contract, lengthof(dirty_contract));
 	assert_ordered_in_function(source, "\nMarkBufferDirtyHint(",
-								   "\n/*\n * Release buffer content locks",
-								   hint_contract, lengthof(hint_contract));
+							   "\n/*\n * Release buffer content locks", hint_contract,
+							   lengthof(hint_contract));
 	assert_ordered_in_function(source, "\nFlushBuffer(", "\n/*\n * RelationGetNumberOfBlocksInFork",
-								   flush_contract, lengthof(flush_contract));
+							   flush_contract, lengthof(flush_contract));
 	free(source);
 }
 
 UT_TEST(test_preexisting_content_holder_can_finish_before_pre_retention_drain)
 {
 	static const char *const dirty_contract[]
-		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(",
-			"UnlockBufHdr", "pg_atomic_read_u32(&bufHdr->state)" };
+		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",
+			"pg_atomic_read_u32(&bufHdr->state)" };
 	static const char *const hint_contract[]
-		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(",
-			"UnlockBufHdr", "XLogHintBitIsNeeded()" };
+		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",
+			"XLogHintBitIsNeeded()" };
 	static const char *const itl_write_contract[]
-		= { "LWLockHeldByMeInMode(", "LockBufHdr",
-			"cluster_pcm_x_content_holder_mutation_allowed(",
+		= { "LWLockHeldByMeInMode(", "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(",
 			"PCM_OWN_FLAG_REVOKING", "UnlockBufHdr" };
 	char *source;
 	ClusterPcmOwnSnapshot captured;
@@ -3151,24 +3590,18 @@ UT_TEST(test_preexisting_content_holder_can_finish_before_pre_retention_drain)
 	 * already owns BufferContent predates the nonblocking drain, however, and
 	 * must be allowed to finish so that the drain observes BUSY, aborts the
 	 * exact revoke, and returns to the event loop. */
-	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(
-		true, true, false, (uint8)PCM_STATE_X,
-		PCM_OWN_FLAG_REVOKING, 0, 0));
-	UT_ASSERT(cluster_pcm_x_content_holder_mutation_allowed(
-		true, true, false, (uint8)PCM_STATE_X,
-		PCM_OWN_FLAG_REVOKING, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
-		true, true, true, (uint8)PCM_STATE_X,
-		PCM_OWN_FLAG_REVOKING, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
-		true, true, false, (uint8)PCM_STATE_S,
-		PCM_OWN_FLAG_REVOKING, 0, 0));
-	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
-		true, true, false, (uint8)PCM_STATE_X,
-		PCM_OWN_FLAG_REVOKING, 12, 0));
-	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
-		true, true, false, (uint8)PCM_STATE_X,
-		PCM_OWN_FLAG_REVOKING, 0, 41));
+	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(true, true, false, (uint8)PCM_STATE_X,
+													   PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(cluster_pcm_x_content_holder_mutation_allowed(true, true, false, (uint8)PCM_STATE_X,
+															PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(true, true, true, (uint8)PCM_STATE_X,
+															 PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(true, true, false, (uint8)PCM_STATE_S,
+															 PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(true, true, false, (uint8)PCM_STATE_X,
+															 PCM_OWN_FLAG_REVOKING, 12, 0));
+	UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(true, true, false, (uint8)PCM_STATE_X,
+															 PCM_OWN_FLAG_REVOKING, 0, 41));
 
 	/* A27: the same pre-existing content-X bracket can observe the exact
 	 * nonblocking drain before or after its reversible REVOKING publication.
@@ -3186,67 +3619,62 @@ UT_TEST(test_preexisting_content_holder_can_finish_before_pre_retention_drain)
 	live = captured;
 	live.reservation_token++;
 	live.flags = PCM_OWN_FLAG_REVOKING;
-	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
-	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&live, &captured));
+	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
+	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(&live, &captured));
 	live.flags = 0;
-	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.generation++;
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.tag.blockNum++;
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.pcm_state = (uint8)PCM_STATE_S;
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.flags = PCM_OWN_FLAG_REVOKING;
 	live.reservation_token = 0;
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 	live = captured;
 	live.resource_x_activation_generation = UINT64_C(41);
-	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(
-		&captured, &live));
+	UT_ASSERT(!cluster_pcm_x_content_holder_dml_authority_equivalent(&captured, &live));
 
 	source = read_bufmgr_source();
-	assert_ordered_in_function(source, "\nMarkBufferDirty(",
-		"\n/*\n * ReleaseAndReadBuffer", dirty_contract,
-		lengthof(dirty_contract));
+	assert_ordered_in_function(source, "\nMarkBufferDirty(", "\n/*\n * ReleaseAndReadBuffer",
+							   dirty_contract, lengthof(dirty_contract));
 	assert_ordered_in_function(source, "\nMarkBufferDirtyHint(",
-		"\n/*\n * Release buffer content locks", hint_contract,
-		lengthof(hint_contract));
-	assert_ordered_in_function(source, "\ncluster_bufmgr_block_write_permitted(",
-		"\n#endif", itl_write_contract, lengthof(itl_write_contract));
+							   "\n/*\n * Release buffer content locks", hint_contract,
+							   lengthof(hint_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_block_write_permitted(", "\n#endif",
+							   itl_write_contract, lengthof(itl_write_contract));
 	free(source);
 }
 
 UT_TEST(test_resource_x_t2_t3_buffer_owner_is_generation_exact_and_ordered)
 {
 	static const char *const t2_contract[]
-		= { "BufTableLookup", "cluster_bufmgr_pin_for_gcs_locked",
+		= { "BufTableLookup",
+			"cluster_bufmgr_pin_for_gcs_locked",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
 			"cluster_gcs_block_compute_checksum(image->page_bytes)",
-			"memcpy(page, image->page_bytes, BLCKSZ)", "PageSetLSN",
+			"memcpy(page, image->page_bytes, BLCKSZ)",
+			"PageSetLSN",
 			"cluster_pcm_own_resource_x_activation_bind_exact(",
-			"cluster_pcm_own_snapshot_locked", "LWLockRelease(content_lock)",
+			"cluster_pcm_own_snapshot_locked",
+			"LWLockRelease(content_lock)",
 			"cluster_bufmgr_unpin_for_gcs" };
 	static const char *const t3_contract[]
-		= { "BufTableLookup", "cluster_bufmgr_pin_for_gcs_locked",
+		= { "BufTableLookup",
+			"cluster_bufmgr_pin_for_gcs_locked",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
 			"cluster_pcm_x_resource_x_t3_snapshot_exact",
 			"cluster_pcm_own_resource_x_activation_clear_exact(",
-			"cluster_pcm_own_snapshot_locked", "LWLockRelease(content_lock)",
+			"cluster_pcm_own_snapshot_locked",
+			"LWLockRelease(content_lock)",
 			"cluster_bufmgr_unpin_for_gcs" };
 	ResourceXAcquisitionRef ref;
 	ClusterPcmOwnSnapshot live;
@@ -3282,12 +3710,11 @@ UT_TEST(test_resource_x_t2_t3_buffer_owner_is_generation_exact_and_ordered)
 
 	source = read_bufmgr_source();
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_activate_x_by_tag(",
-							   "\n/* T3 removes the Resource-X generation",
-							   t2_contract, lengthof(t2_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
-		"\n/* R8 reconfiguration owner", t3_contract,
-		lengthof(t3_contract));
+							   "\n/* T3 removes the Resource-X generation", t2_contract,
+							   lengthof(t2_contract));
+	assert_ordered_in_function(source,
+							   "\ncluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
+							   "\n/* R8 reconfiguration owner", t3_contract, lengthof(t3_contract));
 	free(source);
 }
 
@@ -3544,114 +3971,92 @@ UT_TEST(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple)
 	live.generation = UINT64_C(83);
 	live.reservation_token = UINT64_C(140);
 	live.pcm_state = (uint8)PCM_STATE_N;
-	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 
 	/* A successor may be settled already or may still own the exact local
 	 * reservation.  Re-probing grants nothing; the ordinary target acquire
 	 * must classify the current round again under the original deadline. */
 	live.pcm_state = (uint8)PCM_STATE_S;
-	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.pcm_state = (uint8)PCM_STATE_X;
 	live.flags = PCM_OWN_FLAG_REVOKING;
 	live.reservation_token = UINT64_C(141);
-	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.pcm_state = (uint8)PCM_STATE_N;
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
-	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 
 	/* Formation/R4/tag drift and malformed ownership tuples never enter the
 	 * local retry.  They retain the existing fail-closed classification. */
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, false, true, true));
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, false, true));
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, false));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, false, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, false, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, false));
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING;
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.flags = PCM_OWN_FLAG_REVOKING;
 	live.reservation_token = 0;
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.flags = 0;
 	live.reservation_token = UINT64_C(140);
 	live.generation = 0;
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.generation = UINT64_MAX;
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.generation = UINT64_C(83);
 	live.reservation_token = UINT64_MAX;
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 	live.reservation_token = UINT64_C(140);
 	live.pcm_state = UINT8_C(255);
-	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(
-		&live, true, true, true));
+	UT_ASSERT(!cluster_pcm_x_target_preuse_drift_retryable(&live, true, true, true));
 }
 
 UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 {
-	static const char *const target_contract[] = {
-		"entry->phase = PCM_X_WRITER_LEDGER_HANDOFF",
-		"cluster_gcs_resource_x_target_acquire_until_exact(",
-		"absolute_deadline_us",
-		"context.ref = terminal_ref",
-		"context.r4_record_generation = r4_generation",
-		"context.buffer_ownership_generation = granted.generation",
-		"context.writer_activation_token = 0",
-		"context.resource_x_activation_generation = 0",
-		"cluster_gcs_resource_x_target_context_recheck_exact(",
-		"&context",
-		"cluster_pcm_x_target_preuse_drift_retryable(",
-		"continue;",
-		"entry->authority = context",
-		"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING"
-	};
-	static const char *const activation_contract[] = {
-		"!LWLockHeldByMe(entry->content_lock)",
-		"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
-		"cluster_gcs_resource_x_target_context_recheck_exact(",
-		"if (allow_reprobe",
-		"cluster_pcm_x_target_preuse_drift_retryable(",
-		"cluster_bufmgr_pcm_x_writer_clear(entry)",
-		"return false;",
-		"entry->phase = PCM_X_WRITER_LEDGER_ACTIVE",
-		"return true;"
-	};
-	static const char *const recycle_contract[] = {
-		"cluster_gcs_resource_x_target_itl_recycle_begin_exact(",
-		"entry->phase = PCM_X_WRITER_LEDGER_RECYCLING"
-	};
-	static const char *const recycle_relock_failure_contract[] = {
-		"result = cluster_gcs_resource_x_target_itl_recycle_finish_exact(",
-		"if (result != RESOURCE_X_APPLY_APPLIED)",
-		"LWLockRelease(content_lock)",
-		"cluster_bufmgr_itl_recycle_guard_cancel(buffer)",
-		"return false;"
-	};
-	static const char *const direct_init_ledger_contract[] = {
-		"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
-		"current_path = cluster_resource_x_writer_path_snapshot(",
-		"current_r4_generation != context->r4_record_generation",
-		"granted.generation != context->buffer_ownership_generation",
-		"granted.writer_activation_token != 0",
-		"granted.resource_x_activation_generation != 0",
-		"cluster_gcs_resource_x_target_context_recheck_exact(context)",
-		"entry->authority = *context",
-		"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING"
-	};
-	static const char *const cleanup_forbidden[] = {
-		"cluster_pcm_lock_release(",
-		"cluster_pcm_lock_resource_x_release_x_exact(",
-		"RESOURCE_X_WIRE_RELEASE_X"
-	};
+	static const char *const target_contract[]
+		= { "entry->phase = PCM_X_WRITER_LEDGER_HANDOFF",
+			"cluster_gcs_resource_x_target_acquire_until_exact(",
+			"absolute_deadline_us",
+			"context.ref = terminal_ref",
+			"context.r4_record_generation = r4_generation",
+			"context.buffer_ownership_generation = granted.generation",
+			"context.writer_activation_token = 0",
+			"context.resource_x_activation_generation = 0",
+			"cluster_gcs_resource_x_target_context_recheck_exact(",
+			"&context",
+			"cluster_pcm_x_target_preuse_drift_retryable(",
+			"continue;",
+			"entry->authority = context",
+			"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING" };
+	static const char *const activation_contract[]
+		= { "!LWLockHeldByMe(entry->content_lock)",
+			"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
+			"cluster_gcs_resource_x_target_context_recheck_exact(",
+			"if (allow_reprobe",
+			"cluster_pcm_x_target_preuse_drift_retryable(",
+			"cluster_bufmgr_pcm_x_writer_clear(entry)",
+			"return false;",
+			"entry->phase = PCM_X_WRITER_LEDGER_ACTIVE",
+			"return true;" };
+	static const char *const recycle_contract[]
+		= { "cluster_gcs_resource_x_target_itl_recycle_begin_exact(",
+			"entry->phase = PCM_X_WRITER_LEDGER_RECYCLING" };
+	static const char *const recycle_relock_failure_contract[]
+		= { "result = cluster_gcs_resource_x_target_itl_recycle_finish_exact(",
+			"if (result != RESOURCE_X_APPLY_APPLIED)", "LWLockRelease(content_lock)",
+			"cluster_bufmgr_itl_recycle_guard_cancel(buffer)", "return false;" };
+	static const char *const direct_init_ledger_contract[]
+		= { "cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
+			"current_path = cluster_resource_x_writer_path_snapshot(",
+			"current_r4_generation != context->r4_record_generation",
+			"granted.generation != context->buffer_ownership_generation",
+			"granted.writer_activation_token != 0",
+			"granted.resource_x_activation_generation != 0",
+			"cluster_gcs_resource_x_target_context_recheck_exact(context)",
+			"entry->authority = *context",
+			"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING" };
+	static const char *const cleanup_forbidden[]
+		= { "cluster_pcm_lock_release(", "cluster_pcm_lock_resource_x_release_x_exact(",
+			"RESOURCE_X_WIRE_RELEASE_X" };
 	char *source = read_bufmgr_source();
 	const char *ledger;
 	const char *ledger_end;
@@ -3662,47 +4067,37 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 		return;
 	UT_ASSERT_EQ(sizeof(ResourceXWriterUseContext), 72);
 	UT_ASSERT_NOT_NULL(strstr(source, "ResourceXWriterUseContext authority"));
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"CLUSTER_BUFMGR_ITL_RECYCLE_RETRY_REQUALIFY"));
+	UT_ASSERT_NOT_NULL(strstr(source, "CLUSTER_BUFMGR_ITL_RECYCLE_RETRY_REQUALIFY"));
 	ledger = strstr(source, "typedef struct ClusterPcmXWriterLedgerEntry {");
-	ledger_end = ledger != NULL ? strstr(ledger,
-		"} ClusterPcmXWriterLedgerEntry;") : NULL;
+	ledger_end = ledger != NULL ? strstr(ledger, "} ClusterPcmXWriterLedgerEntry;") : NULL;
 	UT_ASSERT_NOT_NULL(ledger);
 	UT_ASSERT_NOT_NULL(ledger_end);
 	if (ledger != NULL && ledger_end != NULL) {
-		const char *writer_path = strstr(ledger,
-			"ResourceXWriterPath writer_path");
+		const char *writer_path = strstr(ledger, "ResourceXWriterPath writer_path");
 
 		UT_ASSERT(writer_path == NULL || writer_path >= ledger_end);
 	}
 	UT_ASSERT_NULL(strstr(source, "ResourceXWriterUseContext target"));
 	UT_ASSERT_NULL(strstr(source, "RESOURCE_X_WRITER_SOURCE"));
 	UT_ASSERT_NULL(strstr(source, "PcmXLocalWriterClaim"));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_x_writer_prepare_target(",
-		"\nstatic bool\ncluster_bufmgr_pcm_x_writer_activate(",
-		target_contract, lengthof(target_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_x_writer_activate(",
-		"\n/* Direct-init obtains its exact TARGET grant",
-		activation_contract, lengthof(activation_contract));
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"cluster_pcm_direct_init_target_commit_validate("));
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"cluster_bufmgr_pcm_x_writer_track_target_direct_init("));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_pcm_x_writer_track_target_direct_init(",
-		"\nstatic bool\ncluster_bufmgr_pcm_x_writer_activate(",
-		direct_init_ledger_contract, lengthof(direct_init_ledger_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_itl_recycle_guard_arm(",
-		"\nvoid\ncluster_bufmgr_itl_recycle_guard_unlock(",
-		recycle_contract, lengthof(recycle_contract));
-	assert_ordered_in_function(
-		source, "\ncluster_bufmgr_itl_recycle_guard_relock(",
-		"\nvoid\ncluster_bufmgr_itl_recycle_guard_cancel(",
-		recycle_relock_failure_contract,
-		lengthof(recycle_relock_failure_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_writer_prepare_target(",
+							   "\nstatic bool\ncluster_bufmgr_pcm_x_writer_activate(",
+							   target_contract, lengthof(target_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_writer_activate(",
+							   "\n/* Direct-init obtains its exact TARGET grant",
+							   activation_contract, lengthof(activation_contract));
+	UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_direct_init_target_commit_validate("));
+	UT_ASSERT_NOT_NULL(strstr(source, "cluster_bufmgr_pcm_x_writer_track_target_direct_init("));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_writer_track_target_direct_init(",
+							   "\nstatic bool\ncluster_bufmgr_pcm_x_writer_activate(",
+							   direct_init_ledger_contract, lengthof(direct_init_ledger_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_itl_recycle_guard_arm(",
+							   "\nvoid\ncluster_bufmgr_itl_recycle_guard_unlock(", recycle_contract,
+							   lengthof(recycle_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_itl_recycle_guard_relock(",
+							   "\nvoid\ncluster_bufmgr_itl_recycle_guard_cancel(",
+							   recycle_relock_failure_contract,
+							   lengthof(recycle_relock_failure_contract));
 	for (i = 0; i < lengthof(cleanup_forbidden); i++)
 		UT_ASSERT_NULL(strstr(source, cleanup_forbidden[i]));
 	free(source);
@@ -3711,8 +4106,20 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(85);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);
+	UT_RUN(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift);
+	UT_RUN(test_bufmgr_snapshot_captures_image_type);
+	UT_RUN(test_bufmgr_snapshot_captures_each_semantic_buffer_bit);
+	UT_RUN(test_bufmgr_owned_fence_survives_flush_but_observation_resamples);
+	UT_RUN(test_bufmgr_fence_rejects_every_non_image_byte_drift);
+	UT_RUN(test_bufmgr_snapshot_ignores_refcount_usage_and_pin_waiter);
+	UT_RUN(test_snapshot_post_state_uses_unpublished_locked_state);
+	UT_RUN(test_real_source_copy_then_finish_preserves_owned_fence);
+	UT_RUN(test_real_finish_flush_uses_current_image_and_rejects_failures);
+	UT_RUN(test_real_finish_failed_flush_rethrows_without_losing_fence);
+	UT_RUN(test_real_source_copy_returns_post_replacement_image_type);
+	UT_RUN(test_snapshot_classifiers_use_the_captured_physical_inputs);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
