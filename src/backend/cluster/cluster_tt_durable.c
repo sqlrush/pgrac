@@ -378,8 +378,10 @@ cluster_tt_slot_durable_publish_active(
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 					 errmsg("canonical ACTIVE block-zero current authority is unavailable"),
-					 errdetail("segment=%u result=%d source=%s master=%d attempts=%d",
-							   expected_owner->segment_id, (int)current_failure,
+					 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							   "segment=%u result=%d source=%s master=%d attempts=%d",
+							   cluster_node_id, expected_owner->segment_id, (int)current_failure,
 							   cluster_ges_timeout_src_text(ges_failure->source),
 							   ges_failure->master_node, ges_failure->attempts)));
 		}
@@ -400,12 +402,13 @@ cluster_tt_slot_durable_publish_active(
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 					 errmsg("canonical ACTIVE shared block-zero root is unavailable"),
-					 errdetail("segment=%u side=%s root_available=%s step=%d result=%d "
+					 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							   "segment=%u side=%s root_available=%s step=%d result=%d "
 							   "source=%s master=%d attempts=%d",
-							   expected_owner->segment_id,
-							   target_side ? "target" : "source",
-							   root_available ? "true" : "false",
-							   (int) step, (int) current_failure,
+							   cluster_node_id, expected_owner->segment_id,
+							   target_side ? "target" : "source", root_available ? "true" : "false",
+							   (int)step, (int)current_failure,
 							   cluster_ges_timeout_src_text(ges_failure->source),
 							   ges_failure->master_node, ges_failure->attempts)));
 		}
@@ -416,14 +419,20 @@ cluster_tt_slot_durable_publish_active(
 			|| generation.value == UINT32_MAX)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE block-zero generation is unavailable")));
+					 errmsg("canonical ACTIVE block-zero generation is unavailable"),
+					 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 
 		result = cluster_undo_block0_current_pin_exclusive(
 			&guard, &root, &generation, &pin, (char **)&resident_header);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_header == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE block-zero content authority is unavailable")));
+					 errmsg("canonical ACTIVE block-zero content authority is unavailable"),
+					 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		pin_held = true;
 
 		cluster_tt_durable_io_wait_start();
@@ -447,30 +456,28 @@ cluster_tt_slot_durable_publish_active(
 			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset],
 					  &disk_header->tt_slots[expected_owner->slot_offset],
 					  sizeof(TTSlot)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical ACTIVE block-zero identity or generation mismatch"),
-					 errdetail("segment=%u slot=%u expected_generation=%u "
-							   "disk={segment=%u owner=%u slots=%u generation=%u "
-							   "xid=%u wrap=%u status=%u} "
-							   "resident={segment=%u owner=%u slots=%u generation=%u "
-							   "xid=%u wrap=%u status=%u}",
-							   expected_owner->segment_id,
-							   expected_owner->slot_offset, generation.value,
-							   disk_header->segment_id,
-							   disk_header->owner_instance,
-							   disk_header->tt_slots_count,
-							   disk_header->wrap_count,
-							   disk_header->tt_slots[expected_owner->slot_offset].xid,
-							   disk_header->tt_slots[expected_owner->slot_offset].wrap,
-							   disk_header->tt_slots[expected_owner->slot_offset].status,
-							   resident_header->segment_id,
-							   resident_header->owner_instance,
-							   resident_header->tt_slots_count,
-							   resident_header->wrap_count,
-							   resident_header->tt_slots[expected_owner->slot_offset].xid,
-							   resident_header->tt_slots[expected_owner->slot_offset].wrap,
-							   resident_header->tt_slots[expected_owner->slot_offset].status)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE block-zero identity or generation mismatch"),
+				 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "segment=%u slot=%u expected_generation=%u "
+						   "disk={segment=%u owner=%u slots=%u generation=%u "
+						   "xid=%u wrap=%u status=%u} "
+						   "resident={segment=%u owner=%u slots=%u generation=%u "
+						   "xid=%u wrap=%u status=%u}",
+						   cluster_node_id, expected_owner->segment_id, expected_owner->slot_offset,
+						   generation.value, disk_header->segment_id, disk_header->owner_instance,
+						   disk_header->tt_slots_count, disk_header->wrap_count,
+						   disk_header->tt_slots[expected_owner->slot_offset].xid,
+						   disk_header->tt_slots[expected_owner->slot_offset].wrap,
+						   disk_header->tt_slots[expected_owner->slot_offset].status,
+						   resident_header->segment_id, resident_header->owner_instance,
+						   resident_header->tt_slots_count, resident_header->wrap_count,
+						   resident_header->tt_slots[expected_owner->slot_offset].xid,
+						   resident_header->tt_slots[expected_owner->slot_offset].wrap,
+						   resident_header->tt_slots[expected_owner->slot_offset].status)));
 
 		publication_epoch = cluster_epoch_get_current();
 		publication_boot_incarnation
@@ -1130,13 +1137,17 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 			  &current_failure);
 	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
 		ges_failure = cluster_ges_timeout_detail_get();
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot commit a transaction: undo block-zero current authority is unavailable"),
-				 errdetail("segment=%u result=%d source=%s master=%d attempts=%d",
-						   segment_id, (int)current_failure,
-						   cluster_ges_timeout_src_text(ges_failure->source),
-						   ges_failure->master_node, ges_failure->attempts)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+			 errmsg(
+				 "cannot commit a transaction: undo block-zero current authority is unavailable"),
+			 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+					   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+					   "segment=%u result=%d source=%s master=%d attempts=%d",
+					   cluster_node_id, segment_id, (int)current_failure,
+					   cluster_ges_timeout_src_text(ges_failure->source), ges_failure->master_node,
+					   ges_failure->attempts)));
 	}
 	current_active = true;
 
@@ -1161,10 +1172,14 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("cannot commit a transaction: undo block-zero current acquisition failed"),
-					 errdetail("segment=%u result=%d", segment_id, (int)current_failure)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot commit a transaction: undo block-zero current acquisition failed"),
+				 errdetail("PGRAC_FAMILY=BLOCK0_CURRENT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "segment=%u result=%d",
+						   cluster_node_id, segment_id, (int)current_failure)));
 
 		result = cluster_undo_block0_current_sample_generation_exclusive(
 			&guard, &root, &generation);

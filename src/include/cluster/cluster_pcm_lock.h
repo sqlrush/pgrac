@@ -211,6 +211,110 @@ typedef struct PcmGrdLifecycleStats {
 	uint64 reclaim_refused[PCM_RETIRE_REFUSAL_N];
 } PcmGrdLifecycleStats;
 
+/* Passive paired maxima: index 0 is caller elapsed/budget, index 1 is
+ * head age since semantic progress / no-progress budget. Never authority. */
+typedef struct PcmWaitMarginObservation {
+	BufferTag tag;
+	int32 requester_node;
+	uint64 monotonic_us;
+	uint64 attempt;
+	char phase[48];
+	bool valid;
+} PcmWaitMarginObservation;
+
+typedef struct PcmWaitMarginStats {
+	uint64 elapsed_us[2];
+	uint64 budget_us[2];
+	uint64 sample_count[2];
+	uint64 capture_gap_count[2];
+	uint64 metadata_gap_count[2];
+	PcmWaitMarginObservation observation[2];
+} PcmWaitMarginStats;
+
+extern void cluster_pcm_wait_margin_note(bool head, uint64 elapsed_us, uint64 budget_us);
+extern void cluster_pcm_wait_margin_note_exact(bool head, uint64 elapsed_us, uint64 budget_us,
+											   const BufferTag *tag, int32 requester_node,
+											   const char *phase, uint64 attempt,
+											   uint64 monotonic_us);
+extern bool cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out);
+
+#define PCM_RX_METRICS(X)                                                                          \
+	X(PCM_RX_HEAD_CREATE, "head_create_count")                                                     \
+	X(PCM_RX_HEAD_JOIN, "head_join_count")                                                         \
+	X(PCM_RX_FOLLOWER_DEADLINE, "follower_deadline_leave_count")                                   \
+	X(PCM_RX_FOLLOWER_IDENTITY_REJECT, "follower_identity_reject_count")                           \
+	X(PCM_RX_FOLLOWER_REJECT_MUTATION, "follower_reject_shared_mutation_count")                    \
+	X(PCM_RX_CLAIM_BIND, "install_claim_bind_count")                                               \
+	X(PCM_RX_CLAIM_CONFLICT, "install_claim_conflict_count")                                       \
+	X(PCM_RX_RESERVATION_WAIT, "active_reservation_same_claim_wait_count")                         \
+	X(PCM_RX_RESERVATION_CONFLICT, "active_reservation_conflict_count")                            \
+	X(PCM_RX_RESERVATION_MALFORMED, "active_reservation_malformed_count")                          \
+	X(PCM_RX_DISPATCH, "head_transport_dispatch_count")                                            \
+	X(PCM_RX_FOLLOWER_DUPLICATE_ENQUEUE, "follower_duplicate_transport_enqueue_count")             \
+	X(PCM_RX_SEMANTIC_PROGRESS, "semantic_progress_count")                                         \
+	X(PCM_RX_HEAD_EXPIRE, "head_no_progress_expire_count")                                         \
+	X(PCM_RX_GLOBAL_FUSE_TRIGGER, "global_fuse_trigger_count")                                     \
+	X(PCM_RX_GLOBAL_FUSE_PERSISTED, "global_fuse_persisted_count")
+
+typedef enum PcmRxMetric {
+#define PCM_RX_ENUM(id, key) id,
+	PCM_RX_METRICS(PCM_RX_ENUM)
+#undef PCM_RX_ENUM
+		PCM_RX_METRIC_COUNT
+} PcmRxMetric;
+
+typedef struct PcmRxStats {
+	uint64 count[PCM_RX_METRIC_COUNT];
+} PcmRxStats;
+
+extern void cluster_pcm_rx_metric_note(PcmRxMetric metric);
+extern bool cluster_pcm_rx_stats_snapshot(PcmRxStats *out);
+extern void cluster_pcm_rx_rejected_follower_note(uint64 before_generation,
+												  uint64 after_generation);
+extern void cluster_pcm_rx_dispatch_note(bool head_dispatch);
+extern uint8 cluster_pcm_rx_last_step_head_failure(void);
+
+#define PCM_VM_METRICS(X)                                                                          \
+	X(PCM_VM_X_REQUEST, "vm_x_request_count")                                                      \
+	X(PCM_VM_HEAD_STARTED, "vm_head_started_count")                                                \
+	X(PCM_VM_HEAD_JOIN, "vm_head_join_count")                                                      \
+	X(PCM_VM_CACHED_HIT, "vm_cached_x_hit_count")                                                  \
+	X(PCM_VM_INSTALL_COMPLETE, "vm_x_acquisition_completed_count")                                 \
+	X(PCM_VM_REMOTE_X_TRANSFER, "vm_inter_node_transfer_count")                                    \
+	X(PCM_VM_REMOTE_S_SOURCE, "vm_remote_shared_source_count")                                     \
+	X(PCM_VM_HEAD_FAILED, "vm_head_failed_count")                                                  \
+	X(PCM_VM_ALL_VISIBLE_CLEARED, "vm_all_visible_clear_count")                                    \
+	X(PCM_VM_REPEAT_CLEAR, "vm_repeated_heap_clear_count")                                         \
+	X(PCM_VM_CLEAR_OBSERVATION_GAP, "vm_clear_observation_gap_count")                              \
+	X(PCM_VM_LATENCY_GAP, "vm_latency_capture_gap_count")
+
+typedef enum PcmVmMetric {
+#define PCM_VM_ENUM(id, key) id,
+	PCM_VM_METRICS(PCM_VM_ENUM)
+#undef PCM_VM_ENUM
+		PCM_VM_METRIC_COUNT
+} PcmVmMetric;
+
+#define PCM_VM_HISTOGRAM_BUCKETS 32
+#define PCM_VM_HEAP_BLOCKS ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) * 4)
+#define PCM_VM_BITMAP_WORDS ((PCM_VM_HEAP_BLOCKS + 63) / 64)
+typedef struct PcmVmStats {
+	bool tag_valid;
+	BufferTag tag;
+	uint64 other_tag_observations;
+	uint64 clear_bitmap[PCM_VM_BITMAP_WORDS];
+	uint64 count[PCM_VM_METRIC_COUNT];
+	uint64 latency_count[2];
+	uint64 latency_sum_us[2];
+	uint64 latency_max_us[2];
+	uint64 latency_histogram[2][PCM_VM_HISTOGRAM_BUCKETS];
+} PcmVmStats;
+
+extern void cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric);
+extern void cluster_pcm_vm_clear_note(const BufferTag *tag, BlockNumber heap_block);
+extern void cluster_pcm_vm_latency_note(const BufferTag *tag, bool remote, uint64 elapsed_us);
+extern bool cluster_pcm_vm_stats_snapshot(PcmVmStats *out);
+
 StaticAssertDecl(sizeof(PcmGrdLifecycleStats)
 				 == (9 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
 				 "PcmGrdLifecycleStats must remain a fixed native counter cohort");

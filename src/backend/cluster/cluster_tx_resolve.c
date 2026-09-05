@@ -245,6 +245,7 @@ cluster_tx_resolve_exact_with_admission(
 	bool partial_visibility
 		= mode == CLUSTER_TX_RESOLVE_VISIBILITY
 		  && locator != NULL && locator->tt_wrap == TT_WRAP_INVALID;
+	bool clean_formation_row_wait = false;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -263,14 +264,14 @@ cluster_tx_resolve_exact_with_admission(
 		goto done;
 
 	formation_epoch = admission->formation_epoch;
+	clean_formation_row_wait = mode == CLUSTER_TX_RESOLVE_ROW_WAIT && formation_epoch == 0;
 	if (formation_epoch == 0) {
 		bool zero_epoch_admissible
-			= terminal_census
-				  ? cluster_tx_zero_epoch_terminal_census_is_admissible(
-					  locator, admission, caller_owned_terminal_census)
-				  : partial_visibility
-					&& cluster_tx_zero_epoch_partial_visibility_is_admissible(
-						locator, admission);
+			= terminal_census ? cluster_tx_zero_epoch_terminal_census_is_admissible(
+									locator, admission, caller_owned_terminal_census)
+							  : (partial_visibility || clean_formation_row_wait)
+									&& cluster_tx_zero_epoch_partial_visibility_is_admissible(
+										locator, admission);
 
 		if (!zero_epoch_admissible) {
 			reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
@@ -280,7 +281,17 @@ cluster_tx_resolve_exact_with_admission(
 		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
 	}
-	if (terminal_census || partial_visibility)
+	if (clean_formation_row_wait) {
+		ClusterTxLocator request = *locator;
+
+		/* The existing origin channel accepts a partial request, not a new
+		 * canonical identity. Preserve the complete caller locator and compare
+		 * the returned canonical echo against it below, including TT wrap.
+		 * The input validator above still rejects partial ROW_WAIT callers. */
+		request.tt_wrap = TT_WRAP_INVALID;
+		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&request, CLUSTER_TX_RESOLVE_VISIBILITY, admission, &candidate, &provider_reason);
+	} else if (terminal_census || partial_visibility)
 		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
 			locator, mode, admission, &candidate, &provider_reason);
 	else

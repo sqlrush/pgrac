@@ -56,6 +56,7 @@
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/elog.h"
 #include "utils/hsearch.h"	 /* PGRAC: spec-2.30 D2 — HTAB API */
 #include "pgstat.h"			 /* pgstat_report_wait_start/end */
@@ -201,6 +202,7 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint64 head_change_generation;
 	uint64 head_last_semantic_progress_us;
 	uint64 head_no_progress_budget_us;
+	uint64 diagnostic_started_us;
 	uint64 last_dispatch_us;
 	uint64 retry_slice_us;
 	uint64 accepted_base;
@@ -217,8 +219,8 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint8 reserved[1];
 } ClusterPcmResourceXBootstrapRound;
 
-StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 464,
-				 "Resource-X requester bootstrap round layout must remain 464 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 472,
+				 "Resource-X requester bootstrap round includes passive start observation");
 
 #define RESOURCE_X_LOCAL_OWNER_EMPTY UINT8_C(0)
 #define RESOURCE_X_LOCAL_OWNER_RECYCLING UINT8_C(1)
@@ -410,7 +412,7 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 1056,
+StaticAssertDecl(sizeof(struct GrdEntry) == 1064,
 				 "Stage 8 D2 GrdEntry size must include pinned binding identity");
 
 
@@ -727,6 +729,23 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 resource_x_reconfig_retry_count;
 	pg_atomic_uint64 resource_x_reconfig_blocked_count;
 	/* Node-wide counters shared by foreground and asynchronous reply owners. */
+	pg_atomic_uint64 wait_margin_pair[2];
+	pg_atomic_uint64 wait_margin_samples[2];
+	pg_atomic_uint64 wait_margin_capture_gaps[2];
+	pg_atomic_uint64 wait_margin_metadata_gaps[2];
+	slock_t wait_margin_lock[2];
+	PcmWaitMarginObservation wait_margin_observation[2];
+	pg_atomic_uint64 rx_count[PCM_RX_METRIC_COUNT];
+	pg_atomic_uint64 vm_count[PCM_VM_METRIC_COUNT];
+	slock_t vm_tag_lock;
+	bool vm_tag_valid;
+	BufferTag vm_tag;
+	pg_atomic_uint64 vm_other_tag_observations;
+	pg_atomic_uint64 vm_clear_bitmap[PCM_VM_BITMAP_WORDS];
+	pg_atomic_uint64 vm_latency_count[2];
+	pg_atomic_uint64 vm_latency_sum_us[2];
+	pg_atomic_uint64 vm_latency_max_us[2];
+	pg_atomic_uint64 vm_latency_histogram[2][PCM_VM_HISTOGRAM_BUCKETS];
 	pg_atomic_uint64 block0_reply_wait_count[CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT]
 											[CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT];
 	pg_atomic_uint64 resource_x_reconfig_thaw_count;
@@ -807,6 +826,8 @@ StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
  *	                    never freed until cluster shutdown.
  */
 static ClusterPcmShared *ClusterPcm = NULL;
+/* Process-local, single-step observation; never a shared authority or lease. */
+static uint8 pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
 static HTAB *cluster_pcm_htab = NULL;
 static ClusterPcmResourceXSlot *cluster_pcm_resource_x_slots = NULL;
 static ClusterPcmResourceXMasterState *cluster_pcm_resource_x_master_states = NULL;
@@ -899,7 +920,8 @@ typedef struct PcmResourceXRetirementWitness {
 	uint8 proof_kind;
 	uint8 install_succeeded;
 	uint8 requester_loss_seen;
-	uint8 reserved[3];
+	uint8 diagnostic_source_mode;
+	uint8 reserved[2];
 	uint64 final_authority_generation;
 	uint64 t_image_us;
 	uint64 t_grant_us;
@@ -1442,8 +1464,10 @@ cluster_pcm_lock_resource_x_gate_fail_closed_exact(
 
 	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
 	for (;;) {
-		if (phase == RESOURCE_X_GATE_RECOVERY_BLOCKED)
+		if (phase == RESOURCE_X_GATE_RECOVERY_BLOCKED) {
+			cluster_pcm_rx_metric_note(PCM_RX_GLOBAL_FUSE_PERSISTED);
 			return RESOURCE_X_APPLY_DUPLICATE;
+		}
 		if (phase != RESOURCE_X_GATE_OPEN)
 			return RESOURCE_X_APPLY_STALE;
 		if (pg_atomic_compare_exchange_u32(
@@ -1451,6 +1475,7 @@ cluster_pcm_lock_resource_x_gate_fail_closed_exact(
 				RESOURCE_X_GATE_RECOVERY_BLOCKED)) {
 			pg_atomic_fetch_add_u64(
 				&ClusterPcm->resource_x_reconfig_blocked_count, 1);
+			cluster_pcm_rx_metric_note(PCM_RX_GLOBAL_FUSE_TRIGGER);
 			return RESOURCE_X_APPLY_APPLIED;
 		}
 	}
@@ -1588,9 +1613,11 @@ pcm_resource_x_semantic_mutation_mark(void)
 	for (;;) {
 		if (current == 0 || current == UINT64_MAX) {
 			pcm_resource_x_reconfig_block();
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("Resource-X semantic mutation sequence exhausted")));
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("Resource-X semantic mutation sequence exhausted"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 		}
 		if (pg_atomic_compare_exchange_u64(
 				&ClusterPcm->resource_x_semantic_mutation_sequence,
@@ -5265,10 +5292,12 @@ cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *r
 		if (!pcm_entry_ref_identity_exact(
 				&pcm_resource_x_executor_wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
-			ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("Resource-X executor waiter entry identity changed "
-						"after wakeup")));
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("Resource-X executor waiter entry identity changed "
+								   "after wakeup"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 		}
 	}
 	PG_FINALLY();
@@ -6379,13 +6408,19 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	if (requester_node < 0 || requester_node >= 32)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_pcm_lock_master_grant_x_to: requester_node %d out of range",
-							   requester_node)));
+							   requester_node),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	if (!pcm_entry_ref_acquire(
 			&tag, true, &entry_ref, &acquire_result))
 		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
 						errmsg("cluster_pcm_lock_master_grant_x_to: PCM GRD HTAB FULL (cap=%d)",
-							   pcm_grd_effective)));
+							   pcm_grd_effective),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	entry = entry_ref.entry;
 
 	pcm_entry_lock_exclusive(entry);
@@ -7692,36 +7727,44 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode,
 		PCM_STUB_DISABLED_PATH;
 
 	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
-		ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("cluster_pcm_lock_acquire: invalid mode %d (must be S=1 or X=2)",
-					(int)mode)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_acquire: invalid mode %d (must be S=1 or X=2)",
+							   (int)mode),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	/* A tag-only cross-node caller still has no BufferDesc in which to
 	 * install a shipped image.  D2 changes only entry lifetime, not routing. */
 	if (cluster_gcs_lookup_master(tag) != cluster_node_id)
-		ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cluster_pcm_lock_acquire: remote-master S/X requires "
-					"BufferDesc-aware path"),
-			 errhint("Use cluster_pcm_lock_acquire_buffer() instead; the "
-					 "data plane needs a BufferDesc to install received "
-					 "block bytes under content_lock EXCLUSIVE (HC84).")));
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_pcm_lock_acquire: remote-master S/X requires "
+							   "BufferDesc-aware path"),
+						errhint("Use cluster_pcm_lock_acquire_buffer() instead; the "
+								"data plane needs a BufferDesc to install received "
+								"block bytes under content_lock EXCLUSIVE (HC84)."),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	if (cluster_node_id < 0 || cluster_node_id >= 32)
-		ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("cluster_pcm_lock_acquire: cluster_node_id=%d out of [0, 32) range",
-					cluster_node_id)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_acquire: cluster_node_id=%d out of [0, 32) range",
+							   cluster_node_id),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	memset(&wait_context, 0, sizeof(wait_context));
 	if (!pcm_entry_ref_acquire(&tag, true, &wait_context.ref,
 			&acquire_result))
-		ereport(ERROR,
-			(errcode(ERRCODE_OUT_OF_MEMORY),
-			 errmsg("cluster_pcm_lock_acquire: PCM GRD entry unavailable "
-					"(cap=%d result=%d)",
-					pcm_grd_effective, (int)acquire_result)));
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+						errmsg("cluster_pcm_lock_acquire: PCM GRD entry unavailable "
+							   "(cap=%d result=%d)",
+							   pcm_grd_effective, (int)acquire_result),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	PG_TRY();
 	{
@@ -7799,11 +7842,17 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	Assert(out_retry_denied != NULL);
 	if (out_retry_denied == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_pcm_lock_acquire_buffer: NULL retry result")));
+						errmsg("cluster_pcm_lock_acquire_buffer: NULL retry result"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
+						errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	/*
 	 * PGRAC: spec-5.2a D2 — consume the clean-page X-transfer arm exactly once
@@ -7823,7 +7872,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_pcm_lock_acquire_buffer: invalid mode %d "
 							   "(must be S=1 or X=2)",
-							   (int)mode)));
+							   (int)mode),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	/*
 	 * PGRAC: spec-6.14 D9 amend (INV-D9-R) — designed fail-closed boundary
@@ -8120,13 +8172,19 @@ cluster_pcm_lock_release(BufferTag tag)
 	if (holder_node < 0 || holder_node >= 32)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_pcm_lock_release: cluster_node_id=%d out of [0, 32) range",
-							   holder_node)));
+							   holder_node),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	if (!pcm_entry_ref_acquire(
 			&tag, false, &entry_ref, &acquire_result))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster_pcm_lock_release: no PCM entry for BufferTag (released "
-							   "without prior acquire?)")));
+							   "without prior acquire?)"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	entry = entry_ref.entry;
 
 	holder_bit = pcm_holder_bit(holder_node);
@@ -8153,7 +8211,10 @@ cluster_pcm_lock_release(BufferTag tag)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("cluster_pcm_lock_release: node %d cannot release X held by node %d",
-							holder_node, entry->x_holder_node)));
+							holder_node, entry->x_holder_node),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		}
 		cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_N_RELEASE, holder_node);
 		broadcast_needed = true;
@@ -8163,7 +8224,10 @@ cluster_pcm_lock_release(BufferTag tag)
 			pcm_entry_ref_release(&entry_ref);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("cluster_pcm_lock_release: node %d is not an S holder", holder_node)));
+					 errmsg("cluster_pcm_lock_release: node %d is not an S holder", holder_node),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		}
 		/*
 		 * PGRAC: spec-2.31 D1 v0.4 — refcount semantics under single-uint16
@@ -8186,7 +8250,10 @@ cluster_pcm_lock_release(BufferTag tag)
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("cluster_pcm_lock_release: nothing held (state=%d)", (int)cur)));
+						errmsg("cluster_pcm_lock_release: nothing held (state=%d)", (int)cur),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 	if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
 		&& pcm_entry_mark_quiescing_locked(entry)) {
@@ -8341,7 +8408,10 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 {
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_pcm_lock_release_buffer_for_eviction: NULL BufferDesc")));
+						errmsg("cluster_pcm_lock_release_buffer_for_eviction: NULL BufferDesc"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	cluster_pcm_lock_release_saved_tag_for_eviction(buf->tag, mode);
 }
@@ -8408,13 +8478,19 @@ cluster_pcm_lock_upgrade(BufferTag tag)
 	if (holder_node < 0 || holder_node >= 32)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_pcm_lock_upgrade: cluster_node_id=%d out of [0, 32) range",
-							   holder_node)));
+							   holder_node),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	if (!pcm_entry_ref_acquire(
 			&tag, false, &entry_ref, &acquire_result))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster_pcm_lock_upgrade: no PCM entry for BufferTag (must "
-							   "acquire S first)")));
+							   "acquire S first)"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	entry = entry_ref.entry;
 
 	pcm_entry_lock_exclusive(entry);
@@ -8425,20 +8501,28 @@ cluster_pcm_lock_upgrade(BufferTag tag)
 		pcm_entry_ref_release(&entry_ref);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cluster_pcm_lock_upgrade: state=%d (must be S to upgrade)", (int)cur)));
+				 errmsg("cluster_pcm_lock_upgrade: state=%d (must be S to upgrade)", (int)cur),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 	}
 	if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & pcm_holder_bit(holder_node)) == 0) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cluster_pcm_lock_upgrade: node %d is not an S holder", holder_node)));
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_upgrade: node %d is not an S holder", holder_node),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 	if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & ~pcm_holder_bit(holder_node)) != 0) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-						errmsg("cluster_pcm_lock_upgrade: other S holders still present")));
+						errmsg("cluster_pcm_lock_upgrade: other S holders still present"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 
 	cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_X_UPGRADE, holder_node);
@@ -8467,7 +8551,10 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 		  || (target_mode == PCM_LOCK_MODE_N && !keep_pi)))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_pcm_lock_downgrade: illegal target_mode=%d keep_pi=%d",
-							   (int)target_mode, keep_pi)));
+							   (int)target_mode, keep_pi),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	/* PGRAC: spec-2.32 D5 — HC78 downgrade symmetric wire when master remote. */
 	{
@@ -8493,13 +8580,19 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cluster_pcm_lock_downgrade: cluster_node_id=%d out of [0, 32) range",
-						holder_node)));
+						holder_node),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 	if (!pcm_entry_ref_acquire(
 			&tag, false, &entry_ref, &acquire_result))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster_pcm_lock_downgrade: no PCM entry for BufferTag (must "
-							   "acquire X first)")));
+							   "acquire X first)"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	entry = entry_ref.entry;
 
 	pcm_entry_lock_exclusive(entry);
@@ -8508,9 +8601,12 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 	if (cur != PCM_STATE_X) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster_pcm_lock_downgrade: state=%d (must be X to downgrade)",
-							   (int)cur)));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster_pcm_lock_downgrade: state=%d (must be X to downgrade)", (int)cur),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 	}
 	if (entry->x_holder_node != holder_node) {
 		LWLockRelease(&entry->entry_lock.lock);
@@ -8518,7 +8614,10 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cluster_pcm_lock_downgrade: node %d cannot downgrade X held by node %d",
-						holder_node, entry->x_holder_node)));
+						holder_node, entry->x_holder_node),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 	}
 
 	/*
@@ -8541,7 +8640,10 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster_pcm_lock_downgrade: HC56 validator rejected transition")));
+						errmsg("cluster_pcm_lock_downgrade: HC56 validator rejected transition"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 
 	cluster_pcm_transition_apply(entry, trans, holder_node);
@@ -8953,6 +9055,28 @@ cluster_pcm_grd_init(void)
 		 * by HC60 apply-fail-closed.
 		 */
 		memset(ClusterPcm, 0, header_size);
+		for (int metric = 0; metric < PCM_RX_METRIC_COUNT; metric++)
+			pg_atomic_init_u64(&ClusterPcm->rx_count[metric], 0);
+		for (int metric = 0; metric < PCM_VM_METRIC_COUNT; metric++)
+			pg_atomic_init_u64(&ClusterPcm->vm_count[metric], 0);
+		SpinLockInit(&ClusterPcm->vm_tag_lock);
+		pg_atomic_init_u64(&ClusterPcm->vm_other_tag_observations, 0);
+		for (int word = 0; word < PCM_VM_BITMAP_WORDS; word++)
+			pg_atomic_init_u64(&ClusterPcm->vm_clear_bitmap[word], 0);
+		for (int margin = 0; margin < 2; margin++) {
+			pg_atomic_init_u64(&ClusterPcm->wait_margin_pair[margin], 0);
+			pg_atomic_init_u64(&ClusterPcm->wait_margin_samples[margin], 0);
+			pg_atomic_init_u64(&ClusterPcm->wait_margin_capture_gaps[margin], 0);
+			pg_atomic_init_u64(&ClusterPcm->wait_margin_metadata_gaps[margin], 0);
+			SpinLockInit(&ClusterPcm->wait_margin_lock[margin]);
+			memset(&ClusterPcm->wait_margin_observation[margin], 0,
+				   sizeof(PcmWaitMarginObservation));
+			pg_atomic_init_u64(&ClusterPcm->vm_latency_count[margin], 0);
+			pg_atomic_init_u64(&ClusterPcm->vm_latency_sum_us[margin], 0);
+			pg_atomic_init_u64(&ClusterPcm->vm_latency_max_us[margin], 0);
+			for (int bucket = 0; bucket < PCM_VM_HISTOGRAM_BUCKETS; bucket++)
+				pg_atomic_init_u64(&ClusterPcm->vm_latency_histogram[margin][bucket], 0);
+		}
 		for (int site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++)
 			for (int metric = 0; metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT; metric++)
 				pg_atomic_init_u64(&ClusterPcm->block0_reply_wait_count[site][metric], 0);
@@ -10075,13 +10199,16 @@ cluster_pcm_lock_resource_x_install_claim_bind_t1_exact(const ResourceXAcquisiti
 			result = RESOURCE_X_APPLY_DUPLICATE;
 		else if (reserved->reservation_token < round->install_claim_reservation_token)
 			result = RESOURCE_X_APPLY_STALE;
-		else
+		else {
+			cluster_pcm_rx_metric_note(PCM_RX_CLAIM_CONFLICT);
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
 	} else {
 		pcm_resource_x_semantic_mutation_mark();
 		round->install_claim_pending_generation = reserved->generation;
 		round->install_claim_reservation_token = reserved->reservation_token;
 		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1;
+		cluster_pcm_rx_metric_note(PCM_RX_CLAIM_BIND);
 		broadcast = true;
 		result = pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us())
 					 ? RESOURCE_X_APPLY_APPLIED
@@ -10269,10 +10396,13 @@ cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
 		if (round->install_claim_pending_generation == before->generation
 			&& round->install_claim_reservation_token == before->reservation_token)
 			result = RESOURCE_X_APPLY_DUPLICATE;
-		else
+		else {
 			result = before->reservation_token < round->install_claim_reservation_token
 						 ? RESOURCE_X_APPLY_STALE
 						 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			if (result == RESOURCE_X_APPLY_RECOVERY_BLOCKED)
+				cluster_pcm_rx_metric_note(PCM_RX_CLAIM_CONFLICT);
+		}
 	} else if (before->generation == 0 || !pcm_resource_x_active_empty_locked(entry)
 			   || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY)
 		result = RESOURCE_X_APPLY_BAD_STATE;
@@ -10281,6 +10411,7 @@ cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
 		round->install_claim_pending_generation = before->generation;
 		round->install_claim_reservation_token = before->reservation_token;
 		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
+		cluster_pcm_rx_metric_note(PCM_RX_CLAIM_BIND);
 		broadcast = true;
 		result = pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us())
 					 ? RESOURCE_X_APPLY_APPLIED
@@ -10343,6 +10474,258 @@ cluster_undo_block0_reply_wait_stats_snapshot(ClusterUndoBlock0ReplyWaitStats *o
 	return true;
 }
 
+/* One atomic word preserves the numerator and denominator of the SAME
+ * observation. The frozen microsecond budgets fit 32 bits; a larger value is
+ * an explicit coverage gap, not a truncated ratio. Products of two uint32
+ * values fit uint64, so maxima compare exactly without floating point. */
+void
+cluster_pcm_rx_metric_note(PcmRxMetric metric)
+{
+	if (ClusterPcm != NULL && (unsigned)metric < PCM_RX_METRIC_COUNT)
+		pg_atomic_fetch_add_u64(&ClusterPcm->rx_count[metric], 1);
+}
+
+bool
+cluster_pcm_rx_stats_snapshot(PcmRxStats *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return false;
+	for (int metric = 0; metric < PCM_RX_METRIC_COUNT; metric++)
+		out->count[metric] = pg_atomic_read_u64(&ClusterPcm->rx_count[metric]);
+	return true;
+}
+
+void
+cluster_pcm_rx_rejected_follower_note(uint64 before_generation, uint64 after_generation)
+{
+	cluster_pcm_rx_metric_note(PCM_RX_FOLLOWER_IDENTITY_REJECT);
+	if (before_generation != after_generation)
+		cluster_pcm_rx_metric_note(PCM_RX_FOLLOWER_REJECT_MUTATION);
+}
+
+void
+cluster_pcm_rx_dispatch_note(bool head_dispatch)
+{
+	cluster_pcm_rx_metric_note(PCM_RX_DISPATCH);
+	if (!head_dispatch)
+		cluster_pcm_rx_metric_note(PCM_RX_FOLLOWER_DUPLICATE_ENQUEUE);
+}
+
+uint8
+cluster_pcm_rx_last_step_head_failure(void)
+{
+	uint8 result = pcm_rx_last_step_head_failure;
+
+	pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
+	return result;
+}
+
+static bool
+pcm_vm_diagnostic_tag(const BufferTag *tag)
+{
+	return tag != NULL && tag->forkNum == VISIBILITYMAP_FORKNUM && tag->blockNum == 0;
+}
+
+/* A bounded diagnostic cohort, never a resource owner.  Bind the first exact
+ * VM block-zero tag for this fresh process set and expose every excluded tag
+ * observation.  Consumers must compare it with their manifest's relation. */
+static bool
+pcm_vm_selected_tag(const BufferTag *tag)
+{
+	bool matches;
+
+	if (ClusterPcm == NULL || !pcm_vm_diagnostic_tag(tag))
+		return false;
+	SpinLockAcquire(&ClusterPcm->vm_tag_lock);
+	if (!ClusterPcm->vm_tag_valid) {
+		ClusterPcm->vm_tag = *tag;
+		ClusterPcm->vm_tag_valid = true;
+	}
+	matches = BufferTagsEqual(tag, &ClusterPcm->vm_tag);
+	SpinLockRelease(&ClusterPcm->vm_tag_lock);
+	if (!matches)
+		pg_atomic_fetch_add_u64(&ClusterPcm->vm_other_tag_observations, 1);
+	return matches;
+}
+
+void
+cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric)
+{
+	if ((unsigned)metric < PCM_VM_METRIC_COUNT && pcm_vm_selected_tag(tag))
+		pg_atomic_fetch_add_u64(&ClusterPcm->vm_count[metric], 1);
+}
+
+void
+cluster_pcm_vm_clear_note(const BufferTag *tag, BlockNumber heap_block)
+{
+	uint64 bit;
+	uint64 before;
+
+	if (!pcm_vm_selected_tag(tag))
+		return;
+	if (heap_block >= PCM_VM_HEAP_BLOCKS) {
+		pg_atomic_fetch_add_u64(&ClusterPcm->vm_count[PCM_VM_CLEAR_OBSERVATION_GAP], 1);
+		return;
+	}
+	bit = UINT64_C(1) << (heap_block % 64);
+	before = pg_atomic_fetch_or_u64(&ClusterPcm->vm_clear_bitmap[heap_block / 64], bit);
+	pg_atomic_fetch_add_u64(&ClusterPcm->vm_count[PCM_VM_ALL_VISIBLE_CLEARED], 1);
+	if ((before & bit) != 0)
+		pg_atomic_fetch_add_u64(&ClusterPcm->vm_count[PCM_VM_REPEAT_CLEAR], 1);
+}
+
+void
+cluster_pcm_vm_latency_note(const BufferTag *tag, bool remote, uint64 elapsed_us)
+{
+	int index = remote ? 1 : 0;
+	int bucket = 0;
+	uint64 previous;
+
+	if (!pcm_vm_selected_tag(tag))
+		return;
+	while (bucket < PCM_VM_HISTOGRAM_BUCKETS - 1 && elapsed_us > (UINT64_C(1) << bucket))
+		bucket++;
+	pg_atomic_fetch_add_u64(&ClusterPcm->vm_latency_count[index], 1);
+	pg_atomic_fetch_add_u64(&ClusterPcm->vm_latency_sum_us[index], elapsed_us);
+	pg_atomic_fetch_add_u64(&ClusterPcm->vm_latency_histogram[index][bucket], 1);
+	previous = pg_atomic_read_u64(&ClusterPcm->vm_latency_max_us[index]);
+	while (elapsed_us > previous)
+		if (pg_atomic_compare_exchange_u64(&ClusterPcm->vm_latency_max_us[index], &previous,
+										   elapsed_us))
+			break;
+}
+
+bool
+cluster_pcm_vm_stats_snapshot(PcmVmStats *out)
+{
+	int index;
+	int bucket;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return false;
+	SpinLockAcquire(&ClusterPcm->vm_tag_lock);
+	out->tag_valid = ClusterPcm->vm_tag_valid;
+	out->tag = ClusterPcm->vm_tag;
+	SpinLockRelease(&ClusterPcm->vm_tag_lock);
+	out->other_tag_observations = pg_atomic_read_u64(&ClusterPcm->vm_other_tag_observations);
+	for (index = 0; index < PCM_VM_BITMAP_WORDS; index++)
+		out->clear_bitmap[index] = pg_atomic_read_u64(&ClusterPcm->vm_clear_bitmap[index]);
+	for (index = 0; index < PCM_VM_METRIC_COUNT; index++)
+		out->count[index] = pg_atomic_read_u64(&ClusterPcm->vm_count[index]);
+	for (index = 0; index < 2; index++) {
+		out->latency_count[index] = pg_atomic_read_u64(&ClusterPcm->vm_latency_count[index]);
+		out->latency_sum_us[index] = pg_atomic_read_u64(&ClusterPcm->vm_latency_sum_us[index]);
+		out->latency_max_us[index] = pg_atomic_read_u64(&ClusterPcm->vm_latency_max_us[index]);
+		for (bucket = 0; bucket < PCM_VM_HISTOGRAM_BUCKETS; bucket++)
+			out->latency_histogram[index][bucket]
+				= pg_atomic_read_u64(&ClusterPcm->vm_latency_histogram[index][bucket]);
+	}
+	return true;
+}
+
+void
+cluster_pcm_wait_margin_note(bool head, uint64 elapsed_us, uint64 budget_us)
+{
+	cluster_pcm_wait_margin_note_exact(head, elapsed_us, budget_us, NULL, -1, NULL, 0, 0);
+}
+
+void
+cluster_pcm_wait_margin_note_exact(bool head, uint64 elapsed_us, uint64 budget_us,
+								   const BufferTag *tag, int32 requester_node, const char *phase,
+								   uint64 attempt, uint64 monotonic_us)
+{
+	int index = head ? 1 : 0;
+	uint64 observed;
+	uint64 pair;
+	PcmWaitMarginObservation observation;
+
+	if (ClusterPcm == NULL)
+		return;
+	if (elapsed_us > UINT32_MAX || budget_us == 0 || budget_us > UINT32_MAX) {
+		pg_atomic_fetch_add_u64(&ClusterPcm->wait_margin_capture_gaps[index], 1);
+		return;
+	}
+	pg_atomic_fetch_add_u64(&ClusterPcm->wait_margin_samples[index], 1);
+	memset(&observation, 0, sizeof(observation));
+	if (tag != NULL && requester_node >= 0 && requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& phase != NULL && phase[0] != '\0' && strlen(phase) < sizeof(observation.phase)
+		&& monotonic_us != 0) {
+		observation.tag = *tag;
+		observation.requester_node = requester_node;
+		observation.monotonic_us = monotonic_us;
+		observation.attempt = attempt;
+		strlcpy(observation.phase, phase, sizeof(observation.phase));
+		observation.valid = true;
+	} else
+		pg_atomic_fetch_add_u64(&ClusterPcm->wait_margin_metadata_gaps[index], 1);
+	pair = (elapsed_us << 32) | budget_us;
+	observed = pg_atomic_read_u64(&ClusterPcm->wait_margin_pair[index]);
+	if (observed != 0 && elapsed_us * (uint32)observed <= (observed >> 32) * budget_us)
+		return;
+	/* A tiny, leaf-only diagnostic critical section keeps the winning pair
+	 * and its provenance inseparable. No allocation, clock call, logging,
+	 * authority lookup or other lock acquisition is permitted inside. */
+	SpinLockAcquire(&ClusterPcm->wait_margin_lock[index]);
+	observed = pg_atomic_read_u64(&ClusterPcm->wait_margin_pair[index]);
+	if (observed == 0 || elapsed_us * (uint32)observed > (observed >> 32) * budget_us) {
+		ClusterPcm->wait_margin_observation[index] = observation;
+		pg_atomic_write_u64(&ClusterPcm->wait_margin_pair[index], pair);
+	}
+	SpinLockRelease(&ClusterPcm->wait_margin_lock[index]);
+}
+
+bool
+cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out)
+{
+	int index;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return false;
+	for (index = 0; index < 2; index++) {
+		uint64 pair;
+
+		SpinLockAcquire(&ClusterPcm->wait_margin_lock[index]);
+		pair = pg_atomic_read_u64(&ClusterPcm->wait_margin_pair[index]);
+		out->observation[index] = ClusterPcm->wait_margin_observation[index];
+		SpinLockRelease(&ClusterPcm->wait_margin_lock[index]);
+		out->elapsed_us[index] = pair >> 32;
+		out->budget_us[index] = (uint32)pair;
+		out->sample_count[index] = pg_atomic_read_u64(&ClusterPcm->wait_margin_samples[index]);
+		out->capture_gap_count[index]
+			= pg_atomic_read_u64(&ClusterPcm->wait_margin_capture_gaps[index]);
+		out->metadata_gap_count[index]
+			= pg_atomic_read_u64(&ClusterPcm->wait_margin_metadata_gaps[index]);
+	}
+	return true;
+}
+
+static void
+pcm_resource_x_head_margin_note(const ClusterPcmResourceXBootstrapRound *round, uint64 now_us)
+{
+	if (round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+		&& round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+		&& round->head_last_semantic_progress_us != 0
+		&& now_us >= round->head_last_semantic_progress_us)
+		cluster_pcm_wait_margin_note_exact(
+			true, now_us - round->head_last_semantic_progress_us, round->head_no_progress_budget_us,
+			&round->request.logical_assertion.resource,
+			round->request.logical_assertion.requester_node,
+			round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+				? "HEAD_REQUEST_DISPATCHED"
+			: round->phase == RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND ? "HEAD_BASE_BOUND"
+																	: "HEAD_ASSERT_DISPATCHED",
+			round->request.assertion_sequence, now_us);
+}
+
 const char *
 cluster_pcm_lock_resource_x_head_failure_name(uint8 reason)
 {
@@ -10371,6 +10754,13 @@ pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progres
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
 		return true;
+	if (round->head_change_generation == 0 && semantic_progress) {
+		round->diagnostic_started_us = now_us;
+		cluster_pcm_rx_metric_note(PCM_RX_HEAD_CREATE);
+		cluster_pcm_vm_metric_note(&round->request.logical_assertion.resource, PCM_VM_HEAD_STARTED);
+	}
+	if (semantic_progress)
+		pcm_resource_x_head_margin_note(round, now_us);
 	preterminal = round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 				  && round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED;
 	if (round->head_change_generation >= UINT64_MAX - 1
@@ -10387,6 +10777,7 @@ pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progres
 	}
 	round->head_change_generation++;
 	if (semantic_progress) {
+		cluster_pcm_rx_metric_note(PCM_RX_SEMANTIC_PROGRESS);
 		round->head_last_semantic_progress_us = progress_us;
 		if (preterminal)
 			round->head_no_progress_deadline_us = progress_us + round->head_no_progress_budget_us;
@@ -10401,6 +10792,10 @@ pcm_resource_x_head_fail_locked(struct GrdEntry *entry, uint8 reason)
 	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
 
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
+		if (reason == RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED)
+			cluster_pcm_rx_metric_note(PCM_RX_HEAD_EXPIRE);
+		cluster_pcm_vm_metric_note(&round->request.logical_assertion.resource, PCM_VM_HEAD_FAILED);
+		pcm_resource_x_head_margin_note(round, pcm_resource_x_monotonic_us());
 		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
 		round->head_failure_reason = reason;
 		(void)pcm_resource_x_head_changed_locked(entry, false, 0);
@@ -11110,6 +11505,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	uint64 diagnostic_accepted_base = 0;
 	uint64 diagnostic_attempt = 0;
 	uint64 diagnostic_last_dispatch_us = 0;
+	uint64 diagnostic_reject_generation;
 	uint64 diagnostic_r4_record_generation = 0;
 	uint64 diagnostic_resource_formation = 0;
 	uint64 diagnostic_master_session_incarnation = 0;
@@ -11121,6 +11517,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
 
+	pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
 	if (dispatch_out == NULL || terminal_ref_out == NULL)
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	memset(dispatch_out, 0, sizeof(*dispatch_out));
@@ -11160,6 +11557,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 	pgstat_report_wait_end();
 	round = &entry->resource_x_bootstrap_round;
+	diagnostic_reject_generation = round->head_change_generation;
 	if ((!allow_create
 		 && (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
 			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED))
@@ -11175,6 +11573,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 					&& (round->install_claim_pending_generation != direct_init_ownership_generation
 						|| round->install_claim_reservation_token
 							   != direct_init_reservation_token))))) {
+		cluster_pcm_rx_rejected_follower_note(diagnostic_reject_generation,
+											  round->head_change_generation);
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
@@ -11250,6 +11650,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 			 * It is not authority to invalidate the node's retained cover. */
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else {
+			cluster_pcm_vm_metric_note(&assertion->resource, PCM_VM_CACHED_HIT);
 			*terminal_ref_out = round->terminal_ref;
 			action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
 		}
@@ -11320,6 +11721,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 				round->install_claim_source = direct_init_reservation_token == 0
 												  ? RESOURCE_X_INSTALL_CLAIM_NONE
 												  : RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
+				if (direct_init_reservation_token != 0)
+					cluster_pcm_rx_metric_note(PCM_RX_CLAIM_BIND);
 				round->request.logical_assertion = *assertion;
 				round->request.resource_formation = resource_formation;
 				round->request.master_session_incarnation
@@ -11382,6 +11785,7 @@ round_step_done:
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED) {
 		diagnostic_phase = round->phase;
 		diagnostic_head_failure_reason = round->head_failure_reason;
+		pcm_rx_last_step_head_failure = round->head_failure_reason;
 		diagnostic_attempt = round->request.assertion_sequence;
 		diagnostic_accepted_base = round->accepted_base;
 		diagnostic_r4_record_generation = round->r4_record_generation;
@@ -11845,6 +12249,7 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	else
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	now_us = pcm_resource_x_monotonic_us();
+	pcm_resource_x_head_margin_note(round, now_us);
 	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 		&& now_us >= caller_absolute_deadline_us)
 		result = RESOURCE_X_APPLY_BAD_STATE;
@@ -11877,10 +12282,12 @@ pcm_resource_x_bootstrap_round_wait_internal(
 			WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
-			ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("Resource-X bootstrap waiter entry identity changed "
-						"after wakeup")));
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("Resource-X bootstrap waiter entry identity changed "
+								   "after wakeup"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 		}
 	}
 	PG_FINALLY();
@@ -12011,7 +12418,10 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 			pcm_resource_x_reconfig_block();
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("Resource-X predecessor waiter entry identity changed after wakeup")));
+					 errmsg("Resource-X predecessor waiter entry identity changed after wakeup"),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		}
 	}
 	PG_FINALLY();
@@ -12802,8 +13212,10 @@ pcm_resource_x_target_install_classify_locked(
 			continuation->master_session_incarnation, continuation->r4_record_generation,
 			continuation->requester_sender_connection_generation,
 			continuation->master_ingress_connection_generation,
-			continuation->requested_sleep_slice_us, observed))
+			continuation->requested_sleep_slice_us, observed)) {
+		cluster_pcm_rx_metric_note(PCM_RX_RESERVATION_WAIT);
 		return RESOURCE_X_TARGET_INSTALL_INFLIGHT;
+	}
 	return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
 }
 
@@ -13217,10 +13629,12 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 			WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
-			ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("Resource-X target-install waiter entry identity changed "
-					"after wakeup")));
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("Resource-X target-install waiter entry identity changed "
+								   "after wakeup"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 		}
 	}
 	PG_FINALLY();
@@ -19583,6 +19997,8 @@ pcm_resource_x_requester_retirement_prepare_locked(
 	}
 	witness_out->had_join = true;
 	witness_out->proof_kind = proof_kind;
+	if (proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER && join->image_valid != 0)
+		witness_out->diagnostic_source_mode = image.body.image_envelope.source_fence[28];
 	witness_out->final_authority_generation
 		= snapshot.final_authority_generation;
 	witness_out->t_image_us = join->t_image_us;
@@ -19733,6 +20149,32 @@ pcm_resource_x_requester_retirement_commit_locked(
 	Assert(state != NULL);
 	join = &state->requester_join;
 	if (witness->had_join && !witness->already_settled) {
+		ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+
+		if (witness->install_succeeded && !witness->requester_loss_seen) {
+			bool remote_x = witness->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
+							&& witness->diagnostic_source_mode == (uint8)PCM_STATE_X
+							&& join->image_source_node >= 0
+							&& join->image_source_node != cluster_node_id;
+			uint64 started = round->diagnostic_started_us;
+
+			cluster_pcm_vm_metric_note(&ref->assertion.resource, PCM_VM_INSTALL_COMPLETE);
+			if (remote_x)
+				cluster_pcm_vm_metric_note(&ref->assertion.resource, PCM_VM_REMOTE_X_TRANSFER);
+			else if (witness->diagnostic_source_mode == (uint8)PCM_STATE_S)
+				cluster_pcm_vm_metric_note(&ref->assertion.resource, PCM_VM_REMOTE_S_SOURCE);
+			if (round->request.assertion_sequence == ref->acquisition_generation
+				&& resource_x_assertion_equal(&round->request.logical_assertion, &ref->assertion)
+				&& started != 0 && witness->t_install_us >= started) {
+				cluster_pcm_vm_latency_note(&ref->assertion.resource, false,
+											witness->t_install_us - started);
+				if (remote_x)
+					cluster_pcm_vm_latency_note(&ref->assertion.resource, true,
+												witness->t_install_us - started);
+			} else
+				cluster_pcm_vm_metric_note(&ref->assertion.resource, PCM_VM_LATENCY_GAP);
+			pcm_resource_x_head_margin_note(round, witness->t_install_us);
+		}
 		join->t_install_us = witness->t_install_us;
 		join->proof_kind = witness->proof_kind;
 		join->install_succeeded = witness->install_succeeded;

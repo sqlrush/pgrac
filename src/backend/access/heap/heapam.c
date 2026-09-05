@@ -1312,7 +1312,11 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 				if (!cluster_bufmgr_itl_recycle_guard_relock(buffer))
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_IN_USE),
-							 errmsg("Resource-X ITL recycle guard could not reacquire exact content authority")));
+							 errmsg("Resource-X ITL recycle guard could not reacquire exact "
+									"content authority"),
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									   cluster_node_id)));
 				recycle_guard_unlocked = false;
 				recycle_guard_armed = false;
 			}
@@ -4233,10 +4237,11 @@ heap_hot_current_mx_resolve_updater(
 static pg_attribute_noreturn() void
 heap_hot_r4_unknown(const char *reason)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-			 errmsg("R4 HOT reconstruction cannot prove the logical row: %s",
-					reason)));
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					errmsg("R4 HOT reconstruction cannot prove the logical row: %s", reason),
+					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							  cluster_node_id)));
 	pg_unreachable();
 }
 
@@ -4506,12 +4511,13 @@ heap_hot_r4_full_failure(SCN read_scn, ClusterCrBuildResult build_result,
 {
 	if (build_reason == CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD)
 		heap_hot_r4_snapshot_too_old(read_scn, InvalidScn);
-	ereport(ERROR,
-			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-			 errmsg("R4 HOT full-block fetch did not return a complete page"),
-			 errdetail("Result %d, reason %s.", (int) build_result,
-					   cluster_cr_build_reason_name(
-						   build_reason))));
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					errmsg("R4 HOT full-block fetch did not return a complete page"),
+					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							  "Result %d, reason %s.",
+							  cluster_node_id, (int)build_result,
+							  cluster_cr_build_reason_name(build_reason))));
 	pg_unreachable();
 }
 #endif
@@ -5229,7 +5235,10 @@ cluster_heap_insert_retry:
 				canonical_xid, tt_seg))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap insert ITL reference lacks a CURRENT receipt identity")));
+					 errmsg("heap insert ITL reference lacks a CURRENT receipt identity"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		{
 			ClusterHeapPreparedUndoResult undo_result;
 			bool targets_invalidated;
@@ -5271,21 +5280,26 @@ cluster_heap_insert_retry:
 				goto cluster_heap_insert_retry;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("cluster undo receipt preparation failed for heap_insert"),
-						 errdetail("result=%u receipt_magic=%u record_type=%u owner_instance=%u tt_segment=%u tt_slot=%u actual_segment=%u pending_mask=%u prepared_mask=%u applied_mask=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
-							(unsigned int)undo_result, undo_receipt.magic,
-							(unsigned int)undo_receipt.record_type,
-							(unsigned int)undo_receipt.owner_instance,
-							(unsigned int)undo_receipt.tt_slot_segment_id,
-							(unsigned int)undo_receipt.tt_slot_offset,
-							undo_receipt.actual_segment_id,
-							(unsigned int)undo_receipt.ctrc_pending_mask,
-							(unsigned int)undo_receipt.ctrc_prepared_mask,
-							(unsigned int)undo_receipt.ctrc_applied_mask,
-							undo_receipt.absolute_deadline_us,
-							(uint64)GetCurrentTimestamp())));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+					 errmsg("cluster undo receipt preparation failed for heap_insert"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							   "result=%u receipt_magic=%u record_type=%u owner_instance=%u "
+							   "tt_segment=%u tt_slot=%u actual_segment=%u pending_mask=%u "
+							   "prepared_mask=%u applied_mask=%u deadline=" UINT64_FORMAT
+							   " now=" UINT64_FORMAT,
+							   cluster_node_id, (unsigned int)undo_result, undo_receipt.magic,
+							   (unsigned int)undo_receipt.record_type,
+							   (unsigned int)undo_receipt.owner_instance,
+							   (unsigned int)undo_receipt.tt_slot_segment_id,
+							   (unsigned int)undo_receipt.tt_slot_offset,
+							   undo_receipt.actual_segment_id,
+							   (unsigned int)undo_receipt.ctrc_pending_mask,
+							   (unsigned int)undo_receipt.ctrc_prepared_mask,
+							   (unsigned int)undo_receipt.ctrc_applied_mask,
+							   undo_receipt.absolute_deadline_us, (uint64)GetCurrentTimestamp())));
 			cluster_itl_undo_ready = true;
 		}
 	}
@@ -5360,7 +5374,11 @@ cluster_heap_insert_retry:
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap insert ITL reference reached the final boundary without a PREPARED receipt")));
+						 errmsg("heap insert ITL reference reached the final boundary without a "
+								"PREPARED receipt"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 		}
 
 		boundary_result = zero_apply_retry
@@ -5416,26 +5434,32 @@ cluster_heap_insert_retry:
 					(pg_atomic_uint32 *)&failed_handle->receipt->state);
 			if (failed_handle->valid && failed_handle->participant != NULL)
 				failed_participant_state = failed_handle->participant->state;
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("heap insert receipt boundary was refused"),
-					 errdetail("pending_mask=%u prepared_mask=%u applied_mask=%u reuse_mask=%u handle_valid=%d receipt_state=%u participant_state=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
-						(unsigned int)undo_receipt.ctrc_pending_mask,
-						(unsigned int)undo_receipt.ctrc_prepared_mask,
-						(unsigned int)undo_receipt.ctrc_applied_mask,
-						(unsigned int)undo_receipt.ctrc_reuse_mask,
-						failed_handle->valid,
-						failed_receipt_state,
-						failed_participant_state,
-						undo_receipt.absolute_deadline_us,
-						(uint64)GetCurrentTimestamp())));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+				 errmsg("heap insert receipt boundary was refused"),
+				 errdetail(
+					 "PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN PGRAC_NODE=%d "
+					 "PGRAC_ATTEMPT=0 "
+					 "pending_mask=%u prepared_mask=%u applied_mask=%u reuse_mask=%u "
+					 "handle_valid=%d receipt_state=%u participant_state=%u deadline=" UINT64_FORMAT
+					 " now=" UINT64_FORMAT,
+					 cluster_node_id, (unsigned int)undo_receipt.ctrc_pending_mask,
+					 (unsigned int)undo_receipt.ctrc_prepared_mask,
+					 (unsigned int)undo_receipt.ctrc_applied_mask,
+					 (unsigned int)undo_receipt.ctrc_reuse_mask, failed_handle->valid,
+					 failed_receipt_state, failed_participant_state,
+					 undo_receipt.absolute_deadline_us, (uint64)GetCurrentTimestamp())));
 		}
 		if (undo_plan_count > 0)
 		{
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap insert undo consume failed after receipt APPLY")));
+						 errmsg("heap insert undo consume failed after receipt APPLY"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			cluster_itl_uba = undo_uba;
 			cluster_itl_ctrc_handle = undo_plan.applied_handle;
 		}
@@ -9052,10 +9076,128 @@ cluster_heap_test_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
 }
 #endif
 
+/* One caller-owned budget survives page/tuple requalification. This helper
+ * neither renews a deadline nor counts an ordinary row wait as ITL capacity. */
+static int
+cluster_heap_writer_wait_remaining_ms(uint64 *deadline_us)
+{
+	uint64 now_us = cluster_heap_itl_now_us();
+	uint64 remaining;
+
+	if (*deadline_us == 0) {
+		uint64 budget = (uint64)Max(cluster_ges_request_timeout_ms, 1) * UINT64_C(1000);
+
+		if (now_us > UINT64_MAX - budget)
+			return 0;
+		*deadline_us = now_us + budget;
+	}
+	if (now_us >= *deadline_us)
+		return 0;
+	remaining = *deadline_us - now_us;
+	remaining = remaining / 1000 + (remaining % 1000 != 0);
+	return (int)Min(remaining, (uint64)INT_MAX);
+}
+
+/* The page lock is already released. R4 SOURCE hints are deliberately closed;
+ * the existing TARGET resolver/wait is the sole authority. Upgrade a partial
+ * page locator only through the origin's exact undo-record proof, then retain
+ * that canonical identity across the existing bounded wait. */
+static bool
+cluster_heap_writer_wait_target(const ClusterTxLocator *locator, LockWaitPolicy wait_policy,
+								uint64 *deadline_us, ClusterVisResolve *proof)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterTxOutcome outcome;
+	ClusterTxwResult waited;
+	ClusterTxLocator canonical;
+	int remaining_ms = 0;
+
+	MemSet(proof, 0, sizeof(*proof));
+	if (wait_policy == LockWaitBlock && cluster_tx_enqueue_wait_enabled) {
+		remaining_ms = cluster_heap_writer_wait_remaining_ms(deadline_us);
+		if (remaining_ms == 0)
+			goto expired;
+	}
+	outcome
+		= cluster_tx_resolve_exact(locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason);
+	if (outcome == CLUSTER_TX_UNKNOWN)
+		goto unprovable;
+	if (!cluster_tx_locator_reply_matches(locator, &resolution.locator_echo)
+		|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID
+		|| !cluster_tx_outcome_proof_is_valid(outcome, resolution.proof_kind)) {
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto unprovable;
+	}
+	canonical = resolution.locator_echo;
+	if (outcome == CLUSTER_TX_IN_PROGRESS || outcome == CLUSTER_TX_PREPARED) {
+		if (wait_policy == LockWaitSkip)
+			return false;
+		if (wait_policy == LockWaitError)
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("could not obtain lock on row")));
+		if (!cluster_tx_enqueue_wait_enabled) {
+			reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+			goto unprovable;
+		}
+		remaining_ms = cluster_heap_writer_wait_remaining_ms(deadline_us);
+		if (remaining_ms == 0)
+			goto expired;
+		waited = cluster_tx_enqueue_wait_exact(&canonical, remaining_ms, &reason);
+		if (waited == CLUSTER_TXW_TIMEOUT
+			|| cluster_heap_writer_wait_remaining_ms(deadline_us) == 0)
+			goto expired;
+		if (waited == CLUSTER_TXW_DEADLOCK)
+			ereport(ERROR, (errcode(ERRCODE_T_R_DEADLOCK_DETECTED), errmsg("deadlock detected")));
+		if (waited != CLUSTER_TXW_RESOLVED)
+			goto unprovable;
+		/* A wake/tick is not a terminal status, and the wait API deliberately
+		 * returns no visibility verdict. Re-resolve the same canonical proof. */
+		outcome = cluster_tx_resolve_exact(&canonical, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution,
+										   &reason);
+	}
+	if (*deadline_us != 0 && cluster_heap_writer_wait_remaining_ms(deadline_us) == 0)
+		goto expired;
+	if (!cluster_tx_locator_reply_matches(&canonical, &resolution.locator_echo)
+		|| (outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
+		|| !cluster_tx_outcome_proof_is_valid(outcome, resolution.proof_kind)
+		|| (outcome == CLUSTER_TX_COMMITTED && !SCN_VALID(resolution.commit_scn))) {
+		if (reason == CLUSTER_TX_RESOLVE_NONE)
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto unprovable;
+	}
+	proof->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	proof->status
+		= outcome == CLUSTER_TX_COMMITTED ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+	proof->commit_scn = resolution.commit_scn;
+	return true;
+
+expired:
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+			 errmsg("timed out waiting for remote writer %u on node %u", locator->xid,
+					uba_origin_node_id(locator->uba)),
+			 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=TX_WAIT_CALLER_DEADLINE_EXPIRED "
+					   "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+					   cluster_node_id)));
+unprovable:
+	if (reason == CLUSTER_TX_RESOLVE_NONE)
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+			 errmsg("could not establish an exact cluster TX wait for remote writer %u on node %u",
+					locator->xid, uba_origin_node_id(locator->uba)),
+			 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=TX_WAIT_AUTHORITY_UNPROVABLE "
+					   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 cause=%s",
+					   cluster_node_id, cluster_tx_resolve_reason_name(reason))));
+	return false;
+}
+
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask,
-									LockWaitPolicy wait_policy, TM_Result *res)
+									LockWaitPolicy wait_policy, TM_Result *res,
+									uint64 *wait_deadline_us)
 {
 	Page		page = BufferGetPage(buffer);
 	ClusterUndoTTSlotRef cref;
@@ -9064,6 +9206,8 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	bool		is_lock_only = HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask);
 	ClusterVisResolve recycled;
 	bool recycled_terminal = false;
+	bool target_terminal = false;
+	bool target_would_block = false;
 	XLogRecPtr recycled_page_lsn = InvalidXLogRecPtr;
 	ClusterItlSlotData recycled_slot;
 	char recycled_tuple_header[SizeofHeapTupleHeader];
@@ -9137,8 +9281,58 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 						 "terminal state.")));
 	}
 
-	/* Drop the buffer content lock before the TT lookup (lock order). */
-	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	{
+		ClusterTxLocator locator;
+		ClusterTxResolveReason locator_reason;
+		ClusterSemanticAdmissionToken route;
+		ClusterSemanticAdmissionResult route_result;
+		uint8 slot_index = tup->t_data->t_itl_slot_idx;
+		bool captured;
+
+		captured
+			= (!is_lock_only || cluster_itl_find_lock_slot_index_by_xmax(page, xwait, &slot_index))
+			  && cluster_tx_locator_from_itl_terminal_census(page, slot_index, &locator,
+															 &locator_reason);
+		recycled_page_lsn = PageGetLSN(page);
+		recycled_slot_index = slot_index;
+		if (captured)
+			recycled_slot = ClusterPageGetItlSlots(page)[slot_index];
+		memcpy(recycled_tuple_header, tup->t_data, sizeof(recycled_tuple_header));
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		/* R4 bit 0 owns this selector, not the unrelated bit-22 root latch.
+		 * Probe admission outside content-X and release the routing token;
+		 * each exact resolver invocation takes its own checked admission. */
+		route_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &route);
+		if (route_result == CLUSTER_SEMANTIC_ADMISSION_OK) {
+			cluster_semantic_activation_leave(&route);
+			if (!captured || locator.xid != xwait
+				|| uba_origin_node_id(locator.uba) != cref.origin_node_id)
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("could not capture an exact locator for remote writer %u", xwait),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=TX_WAIT_LOCATOR_UNPROVABLE "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+							   cluster_node_id)));
+			target_would_block = !cluster_heap_writer_wait_target(&locator, wait_policy,
+																  wait_deadline_us, &recycled);
+			target_terminal = !target_would_block;
+			goto cluster_remote_writer_terminal;
+		}
+		if (route_result != CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+				 errmsg(
+					 "could not establish an exact cluster TX wait for remote writer %u on node %u",
+					 xwait, cref.origin_node_id),
+				 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=TX_WAIT_ADMISSION_CLOSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 admission=%d",
+						   cluster_node_id, route_result)));
+	}
+
+	/* SOURCE is selected only by explicit TARGET_DISABLED, never by UNKNOWN. */
 
 	memset(&ckey, 0, sizeof(ckey));
 	ckey.origin_node_id = cref.origin_node_id;
@@ -9237,8 +9431,13 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 						cluster_vis_bump_vis_conflict_failclosed_count();
 						ereport(ERROR,
 								(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								 errmsg("could not establish an exact cluster TX wait for remote writer %u on node %u",
-										xwait, cref.origin_node_id)));
+								 errmsg("could not establish an exact cluster TX wait for remote "
+										"writer %u on node %u",
+										xwait, cref.origin_node_id),
+								 errdetail(
+									 "PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									 cluster_node_id)));
 						break;
 					case CLUSTER_TXW_DEADLOCK:
 						ereport(ERROR,
@@ -9257,9 +9456,14 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 				/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
 				cluster_vis_bump_vis_conflict_failclosed_count();
 				if (!tt_resolved || cres.status == CLUSTER_TT_STATUS_UNKNOWN)
-					ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-									errmsg("cluster TT status unknown for remote writer %u", xwait),
-									errhint("Remote commit_scn not yet propagated; retry or abort.")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for remote writer %u", xwait),
+						 errhint("Remote commit_scn not yet propagated; retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				if (is_lock_only)
 					ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
 									errmsg("cannot wait for remote row lock held by transaction %u on node %u",
@@ -9298,7 +9502,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 */
 cluster_remote_writer_terminal:
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (recycled_terminal) {
+	if (recycled_terminal || target_terminal || target_would_block) {
 		OffsetNumber offset = ItemPointerGetOffsetNumber(&tup->t_self);
 		ClusterUndoTTSlotRef fresh_ref;
 		ItemId item;
@@ -9331,6 +9535,10 @@ cluster_remote_writer_terminal:
 			|| !cluster_itl_get_tt_ref(page, recycled_slot_index, &fresh_ref)
 			|| memcmp(&fresh_ref, &cref, sizeof(cref)) != 0)
 			return true;
+	}
+	if (target_would_block) {
+		*res = TM_WouldBlock;
+		return true;
 	}
 	if (is_lock_only)
 	{
@@ -9371,7 +9579,7 @@ cluster_remote_writer_terminal:
 		wo.kind = CWO_UNRESOLVABLE;
 		old_t_ctid = tup->t_data->t_ctid;
 
-		if (recycled_terminal)
+		if (recycled_terminal || target_terminal)
 			xr = recycled; /* no second remote lookup below content-X */
 		else
 			cluster_visibility_resolve_tuple(buffer, tup->t_data, xwait, CLUSTER_VIS_XMAX_UPDATE,
@@ -9459,8 +9667,10 @@ bool
 cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
 							  uint16 infomask, TM_Result *result)
 {
+	uint64 deadline_us = 0;
+
 	return cluster_heap_writer_wait_failclosed(relation, buffer, tuple, xid, infomask,
-											   LockWaitBlock, result);
+											   LockWaitBlock, result, &deadline_us);
 }
 #endif
 
@@ -9584,6 +9794,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	UBA			cluster_itl_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
 	SCN			cluster_itl_write_scn = InvalidScn;
 	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
+	uint64 cluster_writer_wait_deadline_us = 0;
 	ClusterCurrentMxHeapResult cluster_current_mx;
 	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 	ClusterCurrentMxStampPlan cluster_current_mx_plan = {0};
@@ -9730,12 +9941,12 @@ l1:
 		 * below then yields TM_Ok.  A false return means a local locker; the
 		 * native path is correct.  A remote writer / timeout / wait-off raises.
 		 */
-		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
-												LockWaitBlock, &cluster_writer_res))
-		{
-			if (cluster_writer_res == TM_BeingModified)
-				goto l1;
-			/*
+			if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
+													LockWaitBlock, &cluster_writer_res,
+													&cluster_writer_wait_deadline_us)) {
+				if (cluster_writer_res == TM_BeingModified)
+					goto l1;
+				/*
 			 * Remote holder handled by the cluster path (lock released,
 			 * writer aborted, or terminal writer chained -- spec-7.1a D0).
 			 *
@@ -9746,14 +9957,13 @@ l1:
 			 * re-run HeapTupleSatisfiesUpdate (else: lost update / delete of an
 			 * unvalidated version — Rule 8.A).
 			 */
-			if ((vmbuffer == InvalidBuffer && PageIsAllVisible(page)) ||
-				xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
-				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data), xwait))
-				goto l1;
+				if ((vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+					|| xmax_infomask_changed(tp.t_data->t_infomask, infomask)
+					|| !TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data), xwait))
+					goto l1;
 
-			if (cluster_writer_res != TM_Ok)
-			{
-				/*
+				if (cluster_writer_res != TM_Ok) {
+					/*
 				 * PGRAC: spec-7.1a D0 -- the remote writer's UPDATE/DELETE
 				 * committed.  Its xmax is a COMMITTED foreign deleter: never
 				 * stamp HEAP_XMAX_INVALID over it (a false hint on a shared
@@ -9762,11 +9972,11 @@ l1:
 				 * tmfd from the on-page tuple exactly as for a local
 				 * conflict.
 				 */
-				result = cluster_writer_res;
-				goto cluster_writer_terminal;
-			}
+					result = cluster_writer_res;
+					goto cluster_writer_terminal;
+				}
 
-			/*
+				/*
 			 * TM_Ok: released lock-only holder, or an authoritatively ABORTED
 			 * remote writer.  Mark the released xmax invalid so the TM_Ok
 			 * determination below sees an unlocked tuple and the delete's new
@@ -9774,9 +9984,8 @@ l1:
 			 * read (AD-012).  Then fall through to the LOCKED_ONLY /
 			 * XMAX_INVALID -> TM_Ok path below.
 			 */
-			cluster_heap_stamp_released_xmax_invalid(tp.t_data, buffer);
-		}
-		else
+				cluster_heap_stamp_released_xmax_invalid(tp.t_data, buffer);
+			} else
 #endif
 		/*
 		 * Sleep until concurrent transaction ends -- except when there's a
@@ -10006,7 +10215,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				canonical_xid, tt_seg))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap delete ITL reference lacks a CURRENT receipt identity")));
+					 errmsg("heap delete ITL reference lacks a CURRENT receipt identity"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		{
 			ClusterHeapPreparedUndoResult undo_result;
 			uint16 undo_payload_len;
@@ -10069,9 +10281,13 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					relation, block, buffer, &vmbuffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
 				if (!ItemIdIsNormal(lp))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("heap delete tuple changed during undo reservation retry")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("heap delete tuple changed during undo reservation retry"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				tp.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 				tp.t_len = ItemIdGetLength(lp);
 				goto l1;
@@ -10082,7 +10298,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						 errmsg("cluster undo receipt preparation failed for heap_delete"),
 						 errhint("Increase cluster.undo_segments_per_instance or wait "
-								 "for spec-3.8 lifecycle autoextend.")));
+								 "for spec-3.8 lifecycle autoextend."),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			cluster_itl_undo_ready = true;
 		}
 	}
@@ -10341,7 +10560,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			if (!ItemIdIsNormal(lp))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap delete tuple changed during final receipt retry")));
+						 errmsg("heap delete tuple changed during final receipt retry"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			tp.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			tp.t_len = ItemIdGetLength(lp);
 			goto l1;
@@ -10349,13 +10571,19 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("heap delete unified receipt boundary was refused")));
+					 errmsg("heap delete unified receipt boundary was refused"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		if (undo_plan_count > 0)
 		{
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap delete undo consume failed after receipt APPLY")));
+						 errmsg("heap delete undo consume failed after receipt APPLY"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			cluster_itl_uba = undo_uba;
 			cluster_itl_ctrc_handle = undo_plan.applied_handle;
 		}
@@ -10721,6 +10949,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	/* spec-3.4b D5: single binding shared across old + new stamps (F11). */
 	UBA			cluster_itl_uba = InvalidUba_init;
 	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
+	uint64 cluster_writer_wait_deadline_us = 0;
 	ClusterCurrentMxHeapResult cluster_current_mx;
 	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 	ClusterCurrentMxStampPlan cluster_current_mx_temp_lock_plan = {0};
@@ -11052,8 +11281,8 @@ l2:
 		 * A remote writer / timeout / wait-off raises inside.
 		 */
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask,
-												LockWaitBlock, &cluster_writer_res))
-		{
+												LockWaitBlock, &cluster_writer_res,
+												&cluster_writer_wait_deadline_us)) {
 			if (cluster_writer_res == TM_BeingModified)
 				goto l2;
 			/*
@@ -11104,8 +11333,7 @@ l2:
 			checked_lockers = true;
 			locker_remains = false;
 			can_continue = true;
-		}
-		else
+		} else
 #endif
 		/*
 		 * Now we have to do something about the existing locker.  If it's a
@@ -11671,7 +11899,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				!= CLUSTER_HEAP_BOUNDARY_APPLIED)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-						 errmsg("current MultiXact TEMP_LOCK receipt boundary was refused")));
+						 errmsg("current MultiXact TEMP_LOCK receipt boundary was refused"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 		}
 #endif
 
@@ -12007,7 +12238,10 @@ l_pgrac_reacquire:
 				canonical_xid, tt_seg))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap update ITL references lack a CURRENT receipt identity")));
+					 errmsg("heap update ITL references lack a CURRENT receipt identity"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		if (!cluster_heap_dml_authority_guard_capture(
 				buffer, &oldtup, &old_dml_guard)
 			|| (newbuf != buffer && PageHasItl(BufferGetPage(newbuf))
@@ -12015,7 +12249,10 @@ l_pgrac_reacquire:
 					newbuf, NULL, &new_dml_guard)))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap update authority capture failed before ITL capacity check")));
+					 errmsg("heap update authority capture failed before ITL capacity check"),
+					 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 
 		/* A cross-page full pass resolves with both content locks absent, then
 		 * re-enters through l_pgrac_reacquire.  Apply its result only to the
@@ -12088,7 +12325,10 @@ l_pgrac_reacquire:
 			if (!ItemIdIsNormal(lp))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap update tuple changed during ITL capacity retry")));
+						 errmsg("heap update tuple changed during ITL capacity retry"),
+						 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			oldtup.t_len = ItemIdGetLength(lp);
 			goto l2;
@@ -12209,8 +12449,10 @@ l_pgrac_reacquire:
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						 errmsg("heap update authority changed during ITL capacity check"),
-						 errdetail("old mismatch=0x%08x, new mismatch=0x%08x",
-								   old_mismatch, new_mismatch)));
+						 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								   "old mismatch=0x%08x, new mismatch=0x%08x",
+								   cluster_node_id, old_mismatch, new_mismatch)));
 		}
 
 		if (newbuf != buffer && PageHasItl(BufferGetPage(newbuf)))
@@ -12386,30 +12628,39 @@ l_pgrac_reacquire:
 					relation, block, buffer, &vmbuffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
 				if (!ItemIdIsNormal(lp))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("heap update tuple changed during undo reservation retry")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("heap update tuple changed during undo reservation retry"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 				oldtup.t_len = ItemIdGetLength(lp);
 				goto l2;
 			}
 
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("cluster undo receipt preparation failed for heap_update"),
-						 errdetail("result=%u receipt_magic=%u record_type=%u owner_instance=%u tt_segment=%u tt_slot=%u actual_segment=%u pending_mask=%u prepared_mask=%u applied_mask=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
-							(unsigned int)undo_result, undo_receipt.magic,
-							(unsigned int)undo_receipt.record_type,
-							(unsigned int)undo_receipt.owner_instance,
-							(unsigned int)undo_receipt.tt_slot_segment_id,
-							(unsigned int)undo_receipt.tt_slot_offset,
-							undo_receipt.actual_segment_id,
-							(unsigned int)undo_receipt.ctrc_pending_mask,
-							(unsigned int)undo_receipt.ctrc_prepared_mask,
-							(unsigned int)undo_receipt.ctrc_applied_mask,
-							undo_receipt.absolute_deadline_us,
-							(uint64)GetCurrentTimestamp())));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+					 errmsg("cluster undo receipt preparation failed for heap_update"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							   "result=%u receipt_magic=%u record_type=%u owner_instance=%u "
+							   "tt_segment=%u tt_slot=%u actual_segment=%u pending_mask=%u "
+							   "prepared_mask=%u applied_mask=%u deadline=" UINT64_FORMAT
+							   " now=" UINT64_FORMAT,
+							   cluster_node_id, (unsigned int)undo_result, undo_receipt.magic,
+							   (unsigned int)undo_receipt.record_type,
+							   (unsigned int)undo_receipt.owner_instance,
+							   (unsigned int)undo_receipt.tt_slot_segment_id,
+							   (unsigned int)undo_receipt.tt_slot_offset,
+							   undo_receipt.actual_segment_id,
+							   (unsigned int)undo_receipt.ctrc_pending_mask,
+							   (unsigned int)undo_receipt.ctrc_prepared_mask,
+							   (unsigned int)undo_receipt.ctrc_applied_mask,
+							   undo_receipt.absolute_deadline_us, (uint64)GetCurrentTimestamp())));
 			cluster_itl_undo_ready = true;
 			cluster_itl_undo_target_count
 				= (ctrc_required_mask & UINT8_C(2)) != 0 ? 2 : 1;
@@ -12471,7 +12722,11 @@ l_pgrac_reacquire:
 			if (!ItemIdIsNormal(lp))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-						 errmsg("current MultiXact predecessor disappeared during update receipt preparation")));
+						 errmsg("current MultiXact predecessor disappeared during update receipt "
+								"preparation"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			oldtup.t_len = ItemIdGetLength(lp);
 			goto l2;
@@ -12871,7 +13126,11 @@ l_pgrac_reacquire:
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap update ITL references reached the final boundary without PREPARED receipts")));
+						 errmsg("heap update ITL references reached the final boundary without "
+								"PREPARED receipts"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			if (undo_plan_count > 0 && !zero_apply_retry)
 			{
 				cluster_itl_old_slot = undo_plans[0].slot_index;
@@ -13035,7 +13294,10 @@ l_pgrac_reacquire:
 			if (!ItemIdIsNormal(lp))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap update tuple changed during final receipt retry")));
+						 errmsg("heap update tuple changed during final receipt retry"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			oldtup.t_len = ItemIdGetLength(lp);
 			goto l2;
@@ -13043,13 +13305,19 @@ l_pgrac_reacquire:
 		if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("heap update unified receipt boundary was refused")));
+					 errmsg("heap update unified receipt boundary was refused"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		if (undo_plan_count > 0)
 		{
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap update undo consume failed after receipt APPLY")));
+						 errmsg("heap update undo consume failed after receipt APPLY"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			cluster_itl_uba = undo_uba;
 			cluster_itl_ctrc_handles[0] = undo_plans[0].applied_handle;
 			if (undo_plan_count == 2)
@@ -13184,17 +13452,65 @@ l_pgrac_reacquire:
 	/* clear PD_ALL_VISIBLE flags, reset all visibilitymap bits */
 	if (PageIsAllVisible(BufferGetPage(buffer)))
 	{
+		bool vm_visible_before = false;
+
+#ifdef USE_PGRAC_CLUSTER
+		/* The map is already pinned and content-locked by UPDATE. pin_ok
+		 * prevents the read-only accessor from ever repinning or doing I/O
+		 * in this critical section. A missing observation is not a clear. */
+		if (vm_locked && !BufferIsLocal(vmbuffer)
+			&& visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer)) {
+			Buffer observed_vm = vmbuffer;
+
+			vm_visible_before
+				= (visibilitymap_get_status(relation, BufferGetBlockNumber(buffer), &observed_vm)
+				   & VISIBILITYMAP_ALL_VISIBLE)
+				  != 0;
+		} else if (BufferIsValid(vmbuffer) && !BufferIsLocal(vmbuffer))
+			cluster_pcm_vm_metric_note(&GetBufferDescriptor(vmbuffer - 1)->tag,
+									   PCM_VM_CLEAR_OBSERVATION_GAP);
+#endif
 		all_visible_cleared = true;
 		PageClearAllVisible(BufferGetPage(buffer));
 		visibilitymap_clear_locked(relation, BufferGetBlockNumber(buffer),
 								   vmbuffer, VISIBILITYMAP_VALID_BITS);
+#ifdef USE_PGRAC_CLUSTER
+		if (vm_visible_before)
+			cluster_pcm_vm_clear_note(&GetBufferDescriptor(vmbuffer - 1)->tag,
+									  BufferGetBlockNumber(buffer));
+#else
+		(void)vm_visible_before;
+#endif
 	}
 	if (newbuf != buffer && PageIsAllVisible(BufferGetPage(newbuf)))
 	{
+		bool vm_visible_before = false;
+
+#ifdef USE_PGRAC_CLUSTER
+		if ((vm_locked_new || (vm_locked && vmbuffer_new == vmbuffer))
+			&& !BufferIsLocal(vmbuffer_new)
+			&& visibilitymap_pin_ok(BufferGetBlockNumber(newbuf), vmbuffer_new)) {
+			Buffer observed_vm = vmbuffer_new;
+
+			vm_visible_before
+				= (visibilitymap_get_status(relation, BufferGetBlockNumber(newbuf), &observed_vm)
+				   & VISIBILITYMAP_ALL_VISIBLE)
+				  != 0;
+		} else if (BufferIsValid(vmbuffer_new) && !BufferIsLocal(vmbuffer_new))
+			cluster_pcm_vm_metric_note(&GetBufferDescriptor(vmbuffer_new - 1)->tag,
+									   PCM_VM_CLEAR_OBSERVATION_GAP);
+#endif
 		all_visible_cleared_new = true;
 		PageClearAllVisible(BufferGetPage(newbuf));
 		visibilitymap_clear_locked(relation, BufferGetBlockNumber(newbuf),
 								   vmbuffer_new, VISIBILITYMAP_VALID_BITS);
+#ifdef USE_PGRAC_CLUSTER
+		if (vm_visible_before)
+			cluster_pcm_vm_clear_note(&GetBufferDescriptor(vmbuffer_new - 1)->tag,
+									  BufferGetBlockNumber(newbuf));
+#else
+		(void)vm_visible_before;
+#endif
 	}
 
 	if (newbuf != buffer)
@@ -13388,7 +13704,7 @@ l_pgrac_itl_capacity_wait: {
 				 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 						CLUSTER_ITL_INITRANS_DEFAULT),
 				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
-						   "wait_result=%d deadline_us=" UINT64_FORMAT,
+						   "PGRAC_ATTEMPT=0 wait_result=%d deadline_us=" UINT64_FORMAT,
 						   wait_reason, cluster_node_id, (int)wait_result,
 						   itl_capacity_absolute_deadline_us)));
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_REQUALIFY);
@@ -13415,7 +13731,10 @@ l_pgrac_itl_capacity_wait: {
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
 	if (!ItemIdIsNormal(lp))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						errmsg("heap update tuple changed during ITL capacity retry")));
+						errmsg("heap update tuple changed during ITL capacity retry"),
+						errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
 	oldtup.t_len = ItemIdGetLength(lp);
 	goto l2;
@@ -13809,6 +14128,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	bool		cleared_all_frozen = false;
 #ifdef USE_PGRAC_CLUSTER
 	bool		cluster_did_lock_stamp = false;
+	uint64 cluster_writer_wait_deadline_us = 0;
 	bool		cluster_did_multixact_member_bind = false;
 	TransactionId cluster_multixact_member_xid = InvalidTransactionId;
 	uint8		cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
@@ -14610,8 +14930,13 @@ l3:
 											|| cres.status == CLUSTER_TT_STATUS_UNKNOWN)
 											ereport(ERROR,
 													(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-													 errmsg("cluster TT status unknown for remote lock_xid %u",
-															xwait)));
+													 errmsg("cluster TT status unknown for remote "
+															"lock_xid %u",
+															xwait),
+													 errdetail("PGRAC_FAMILY=TT_AUTHORITY "
+															   "PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+															   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+															   cluster_node_id)));
 										ereport(ERROR,
 												(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
 												 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
@@ -14647,10 +14972,17 @@ l3:
 														 " cluster.ges_request_timeout_ms; retry.")));
 												break;
 											case CLUSTER_TXW_UNPROVABLE:
-												ereport(ERROR,
-														(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-														 errmsg("could not establish an exact cluster TX wait for remote row lock held by transaction %u on node %u",
-																xwait, cref.origin_node_id)));
+												ereport(
+													ERROR,
+													(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+													 errmsg("could not establish an exact cluster "
+															"TX wait for remote row lock held by "
+															"transaction %u on node %u",
+															xwait, cref.origin_node_id),
+													 errdetail("PGRAC_FAMILY=TT_AUTHORITY "
+															   "PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+															   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+															   cluster_node_id)));
 												break;
 											case CLUSTER_TXW_DEADLOCK:
 												ereport(ERROR,
@@ -14740,10 +15072,9 @@ l3:
 											 xwait))
 						goto l3;
 
-					if (cluster_heap_writer_wait_failclosed(relation, *buffer, tuple,
-															xwait, infomask,
-															wait_policy, &cwres))
-					{
+					if (cluster_heap_writer_wait_failclosed(relation, *buffer, tuple, xwait,
+															infomask, wait_policy, &cwres,
+															&cluster_writer_wait_deadline_us)) {
 						if (cwres == TM_BeingModified)
 							goto l3;
 						/*
@@ -15153,7 +15484,10 @@ failed:
 					canonical_xid, seg))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap tuple-lock ITL reference lacks a CURRENT receipt identity")));
+						 errmsg("heap tuple-lock ITL reference lacks a CURRENT receipt identity"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			{
 				ClusterHeapPreparedUndoResult undo_result;
 				bool targets_invalidated;
@@ -15196,15 +15530,23 @@ failed:
 					if (!ItemIdIsNormal(lp))
 						ereport(ERROR,
 								(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								 errmsg("heap lock tuple changed during receipt preparation")));
+								 errmsg("heap lock tuple changed during receipt preparation"),
+								 errdetail(
+									 "PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									 cluster_node_id)));
 					tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 					tuple->t_len = ItemIdGetLength(lp);
 					goto l3;
 				}
 				if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo receipt preparation failed for heap_lock_tuple")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo receipt preparation failed for heap_lock_tuple"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				cluster_lock_undo_ready = true;
 			}
 		}
@@ -15309,7 +15651,11 @@ failed:
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap tuple-lock ITL reference reached the final boundary without a PREPARED receipt")));
+						 errmsg("heap tuple-lock ITL reference reached the final boundary without "
+								"a PREPARED receipt"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 		}
 
 		if (cluster_current_mx_recomposed && !zero_apply_retry)
@@ -15389,7 +15735,10 @@ failed:
 			if (!ItemIdIsNormal(lp))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap lock tuple changed during final receipt retry")));
+						 errmsg("heap lock tuple changed during final receipt retry"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			tuple->t_len = ItemIdGetLength(lp);
 			goto l3;
@@ -15397,13 +15746,19 @@ failed:
 		if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("heap tuple lock unified receipt boundary was refused")));
+					 errmsg("heap tuple lock unified receipt boundary was refused"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		if (undo_plan_count > 0)
 		{
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap tuple lock undo consume failed after receipt APPLY")));
+						 errmsg("heap tuple lock undo consume failed after receipt APPLY"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			cluster_lock_uba = undo_uba;
 			cluster_lock_ctrc_handle = undo_plan.applied_handle;
 		}
@@ -16485,9 +16840,13 @@ l4:
 							 errmsg("canonical ACTIVE binding disappeared before update-chain lock")));
 				if (!cluster_heap_itl_receipt_identity_admitted(
 						canonical_xid, binding.segment_id))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("update-chain ITL reference lacks a CURRENT receipt identity")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("update-chain ITL reference lacks a CURRENT receipt identity"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				if (cluster_chain_prepare_deadline_us == 0
 					|| !cluster_heap_prepare_undo_record_exact(
 						UNDO_RECORD_ITL, sizeof(UndoItlPayload), (uint16)binding.segment_id,
@@ -16542,7 +16901,10 @@ l4:
 				cluster_itl_bump_overflow_lock_count();
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_ITL_SLOT_OVERFLOW),
-						 errmsg("cluster ITL receipt preparation failed on follow_updates")));
+						 errmsg("cluster ITL receipt preparation failed on follow_updates"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			}
 
 			if (PageIsAllVisible(BufferGetPage(buf))
@@ -16616,14 +16978,22 @@ l4:
 					goto l4;
 				}
 				if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-							 errmsg("update-chain unified receipt boundary was refused")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						 errmsg("update-chain unified receipt boundary was refused"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				cluster_chain_receipt_owned = false;
 				if (UBA_is_invalid(undo_uba))
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("update-chain undo consume failed after receipt APPLY")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("update-chain undo consume failed after receipt APPLY"),
+						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				cluster_chain_slot_idx = undo_plan.slot_index;
 				cluster_chain_write_scn = undo_plan.write_scn;
 				cluster_chain_uba = undo_uba;
@@ -16774,7 +17144,10 @@ next:
 		if (cluster_chain_receipt_owned || cluster_chain_vm_locked)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("update-chain lock reached a retry edge with an unfinished receipt")));
+					 errmsg("update-chain lock reached a retry edge with an unfinished receipt"),
+					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 #endif
 		/* if we find the end of update chain, we're done. */
 		if (mytup.t_data->t_infomask & HEAP_XMAX_INVALID ||

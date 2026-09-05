@@ -59,6 +59,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
+#include "port/pg_bitutils.h"
 
 #include "cluster/cluster_debug.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (always-linked SRF) */
@@ -1969,6 +1970,9 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	};
 	PcmGrdLifecycleStats lifecycle;
 	PcmGrdProtocolDebtStats protocol_debt;
+	PcmWaitMarginStats margins;
+	PcmRxStats rx;
+	PcmVmStats vm;
 	ResourceXO1Stats o1;
 	ResourceXGateSnapshot gate_before;
 	ResourceXGateSnapshot gate_after;
@@ -2049,6 +2053,111 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "pcm", reclaim_refusal_keys[refusal],
 			fmt_uint64(lifecycle.reclaim_refused[refusal]));
 	emit_row(rsinfo, "pcm", "pcm_lock_mode_count", "3");
+	if (cluster_pcm_rx_stats_snapshot(&rx)) {
+		emit_row(rsinfo, "pcm", "rx_stats_available", "true");
+#define PCM_RX_EMIT(id, key) emit_row(rsinfo, "pcm", key, fmt_uint64(rx.count[id]));
+		PCM_RX_METRICS(PCM_RX_EMIT)
+#undef PCM_RX_EMIT
+		emit_row(rsinfo, "pcm", "head_no_progress_expire_reason", "HEAD_NO_PROGRESS_EXPIRED");
+	} else
+		emit_row(rsinfo, "pcm", "rx_stats_available", "false");
+	if (cluster_pcm_vm_stats_snapshot(&vm)) {
+		int cohort;
+		int bucket;
+
+		emit_row(rsinfo, "pcm", "vm_stats_available", "true");
+		emit_row(rsinfo, "pcm", "vm_observation_scope", "first_exact_vm_block0_since_restart");
+		emit_row(rsinfo, "pcm", "vm_observed_tag_available", vm.tag_valid ? "true" : "false");
+		emit_row(rsinfo, "pcm", "vm_other_tag_observations", fmt_uint64(vm.other_tag_observations));
+		if (vm.tag_valid) {
+			char tag[96];
+			int base;
+			int unique = 0;
+
+			snprintf(tag, sizeof(tag), "%u/%u/%u/%u/%u", vm.tag.spcOid, vm.tag.dbOid,
+					 vm.tag.relNumber, vm.tag.forkNum, vm.tag.blockNum);
+			emit_row(rsinfo, "pcm", "vm_observed_tag", tag);
+			emit_row(rsinfo, "pcm", "vm_clear_bitmap_word_count", fmt_int64(PCM_VM_BITMAP_WORDS));
+			/* Fixed-width words, increasing heap block order, no host-endian
+			 * byte encoding.  The consumer ORs peer bitmaps, never sums node
+			 * distinct counts.  The snapshot is not a cross-node atomic cut. */
+			for (base = 0; base < PCM_VM_BITMAP_WORDS; base += 16) {
+				char key[64];
+				char words[16 * 16 + 1];
+				int word;
+				int count = Min(16, PCM_VM_BITMAP_WORDS - base);
+
+				for (word = 0; word < count; word++) {
+					snprintf(words + word * 16, sizeof(words) - word * 16, "%016llx",
+							 (unsigned long long)vm.clear_bitmap[base + word]);
+					unique += pg_popcount64(vm.clear_bitmap[base + word]);
+				}
+				snprintf(key, sizeof(key), "vm_clear_bitmap_%02d", base / 16);
+				emit_row(rsinfo, "pcm", key, words);
+			}
+			emit_row(rsinfo, "pcm", "vm_unique_heap_blocks_cleared", fmt_int64(unique));
+		}
+#define PCM_VM_EMIT(id, key) emit_row(rsinfo, "pcm", key, fmt_uint64(vm.count[id]));
+		PCM_VM_METRICS(PCM_VM_EMIT)
+#undef PCM_VM_EMIT
+		for (cohort = 0; cohort < 2; cohort++) {
+			const char *prefix = cohort ? "vm_remote_x" : "vm_acquisition";
+			char key[96];
+
+			snprintf(key, sizeof(key), "%s_latency_count", prefix);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(vm.latency_count[cohort]));
+			snprintf(key, sizeof(key), "%s_latency_sum_us", prefix);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(vm.latency_sum_us[cohort]));
+			snprintf(key, sizeof(key), "%s_latency_max_us", prefix);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(vm.latency_max_us[cohort]));
+			for (bucket = 0; bucket < PCM_VM_HISTOGRAM_BUCKETS; bucket++) {
+				snprintf(key, sizeof(key), "%s_latency_hist_%02d", prefix, bucket);
+				emit_row(rsinfo, "pcm", key, fmt_uint64(vm.latency_histogram[cohort][bucket]));
+			}
+		}
+	} else
+		emit_row(rsinfo, "pcm", "vm_stats_available", "false");
+	if (cluster_pcm_wait_margin_snapshot(&margins)) {
+		const char *prefixes[2] = { "follower_wait", "head_no_progress" };
+		int index;
+
+		emit_row(rsinfo, "pcm", "wait_margin_stats_available", "true");
+		for (index = 0; index < 2; index++) {
+			char key[96];
+
+			snprintf(key, sizeof(key), "%s_max_ratio_elapsed_us", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(margins.elapsed_us[index]));
+			snprintf(key, sizeof(key), "%s_max_ratio_budget_us", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(margins.budget_us[index]));
+			snprintf(key, sizeof(key), "%s_sample_count", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(margins.sample_count[index]));
+			snprintf(key, sizeof(key), "%s_capture_gap_count", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(margins.capture_gap_count[index]));
+			snprintf(key, sizeof(key), "%s_metadata_gap_count", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, fmt_uint64(margins.metadata_gap_count[index]));
+			snprintf(key, sizeof(key), "%s_max_ratio_metadata_available", prefixes[index]);
+			emit_row(rsinfo, "pcm", key, margins.observation[index].valid ? "true" : "false");
+			if (margins.observation[index].valid) {
+				const PcmWaitMarginObservation *observation = &margins.observation[index];
+				char tag[96];
+
+				snprintf(tag, sizeof(tag), "%u/%u/%u/%u/%u", observation->tag.spcOid,
+						 observation->tag.dbOid, observation->tag.relNumber,
+						 (unsigned)observation->tag.forkNum, observation->tag.blockNum);
+				snprintf(key, sizeof(key), "%s_max_ratio_tag", prefixes[index]);
+				emit_row(rsinfo, "pcm", key, tag);
+				snprintf(key, sizeof(key), "%s_max_ratio_requester_node", prefixes[index]);
+				emit_row(rsinfo, "pcm", key, fmt_int32(observation->requester_node));
+				snprintf(key, sizeof(key), "%s_max_ratio_phase", prefixes[index]);
+				emit_row(rsinfo, "pcm", key, observation->phase);
+				snprintf(key, sizeof(key), "%s_max_ratio_attempt", prefixes[index]);
+				emit_row(rsinfo, "pcm", key, fmt_uint64(observation->attempt));
+				snprintf(key, sizeof(key), "%s_max_ratio_monotonic_us", prefixes[index]);
+				emit_row(rsinfo, "pcm", key, fmt_uint64(observation->monotonic_us));
+			}
+		}
+	} else
+		emit_row(rsinfo, "pcm", "wait_margin_stats_available", "false");
 	emit_row(rsinfo, "pcm", "pcm_transition_count", fmt_int32(PCM_TRANSITION_COUNT));
 	/*
 	 * api_state: "active" if PCM 状态机已激活 (cluster.pcm_grd_max_entries

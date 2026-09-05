@@ -58,6 +58,7 @@
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
 #include "storage/lwlock.h"
+#include "storage/spin.h"
 #include "utils/hsearch.h"
 
 extern ResourceXApplyResult
@@ -129,7 +130,7 @@ cluster_lms_wakeup(int worker_id pg_attribute_unused())
 {}
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1056
+#define FAKE_PCM_ENTRY_BYTES 1064
 
 static uint64 fake_pcm_clock_us;
 static void (*fake_pcm_clock_hook)(void);
@@ -333,6 +334,18 @@ read_text_file(const char *path)
 	source[length] = '\0';
 	fclose(file);
 	return source;
+}
+
+/* The production diagnostic snapshot has a leaf spinlock. Keep the slow
+ * path honest if a concurrency probe contends it; never claim acquisition
+ * without taking the lock. */
+int
+s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
+	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
+{
+	while (TAS_SPIN(lock))
+		;
+	return 0;
 }
 
 static void
@@ -1291,7 +1304,7 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 UT_TEST(test_pcm_grd_entry_abi_includes_resource_x_executor_state)
 {
 	reset_fake_pcm_runtime(4);
-	UT_ASSERT_EQ(fake_pcm_entrysize, 1056);
+	UT_ASSERT_EQ(fake_pcm_entrysize, 1064);
 	UT_ASSERT_EQ(cluster_pcm_grd_shmem_size(),
 		add_size(fake_pcm_header_requested_size,
 			hash_estimate_size(4, fake_pcm_entrysize)));
@@ -4322,6 +4335,7 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 	ResourceXDecodedFrame request;
 	ResourceXAcquisitionRef terminal;
 	ResourceXBootstrapRoundFailureSnapshot snapshot;
+	PcmRxStats stats;
 
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 1;
@@ -4342,6 +4356,10 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 	UT_ASSERT_EQ(snapshot.head_failure_reason, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
 	UT_ASSERT_EQ(snapshot.round_phase, UINT8_C(5)); /* FAILED_CLOSED, not global fuse. */
 	UT_ASSERT(cluster_pcm_lock_resource_x_gate_open_exact(17));
+	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_CREATE], 1);
+	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_EXPIRE], 1);
+	UT_ASSERT_EQ(stats.count[PCM_RX_GLOBAL_FUSE_TRIGGER], 0);
 }
 
 UT_TEST(test_resource_x_node_fanin_ignores_caller_deadline_and_retry_slice)
@@ -4417,6 +4435,7 @@ UT_TEST(test_resource_x_post_ack_rejected_follower_preserves_shared_head)
 	ResourceXDecodedFrame dispatch;
 	ResourceXAcquisitionRef terminal_ref;
 	char before[sizeof(fake_pcm_entries.data)];
+	PcmRxStats stats;
 
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 1;
@@ -4457,6 +4476,16 @@ UT_TEST(test_resource_x_post_ack_rejected_follower_preserves_shared_head)
 					 &assertion, 0, 17, 31, 77, 51, 61, 1000, (1000) - (114), 114, 50, 0, 5, false,
 					 0, &dispatch, &terminal_ref),
 				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_RX_FOLLOWER_IDENTITY_REJECT], 2);
+	UT_ASSERT_EQ(stats.count[PCM_RX_FOLLOWER_REJECT_MUTATION], 0);
+	/* A live negative control verifies that the diagnostic is not hardcoded
+	 * zero. The product never authorizes a rejected observer to advance it. */
+	cluster_pcm_rx_rejected_follower_note(7, 8);
+	cluster_pcm_rx_dispatch_note(false);
+	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_RX_FOLLOWER_REJECT_MUTATION], 1);
+	UT_ASSERT_EQ(stats.count[PCM_RX_FOLLOWER_DUPLICATE_ENQUEUE], 1);
 }
 
 UT_TEST(test_resource_x_t1_install_claim_binds_only_exact_physical_reservation)
@@ -11439,6 +11468,48 @@ UT_TEST(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times)
 	UT_ASSERT(stats.last_remote_t_install_us != 0);
 }
 
+UT_TEST(test_vm_terminal_counts_remote_x_only_once_not_shared_carriers)
+{
+	BufferTag tag = make_tag(0);
+	ResourceXDecodedFrame grant;
+	ResourceXDecodedFrame image;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferActivationProof activation;
+	PcmVmStats stats;
+	int source;
+
+	for (source = 0; source < 2; source++) {
+		reset_fake_pcm_runtime(8);
+		cluster_node_id = 2;
+		tag.forkNum = VISIBILITYMAP_FORKNUM;
+		cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+		cluster_pcm_lock_release(tag);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		if (source == 0)
+			make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+		else
+			make_resource_x_s_remote_join_pair(tag, 2, &grant, &image);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&image, 0, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&grant, 2, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		complete_resource_x_remote_requester_terminal(&join, &ref, &activation);
+		UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.count[PCM_VM_INSTALL_COMPLETE], 1);
+		UT_ASSERT_EQ(stats.count[PCM_VM_REMOTE_X_TRANSFER], source == 0 ? 1 : 0);
+		UT_ASSERT_EQ(stats.count[PCM_VM_REMOTE_S_SOURCE], source == 1 ? 1 : 0);
+		/* This direct protocol fixture has no requester round start. */
+		UT_ASSERT_EQ(stats.count[PCM_VM_LATENCY_GAP], 1);
+		UT_ASSERT_EQ(stats.latency_count[0], 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(&ref, &activation),
+					 RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.count[PCM_VM_INSTALL_COMPLETE], 1);
+	}
+}
+
 UT_TEST(test_resource_x_requester_floors_keep_authority_and_target_axes_distinct)
 {
 	BufferTag tag = make_tag(161);
@@ -14703,10 +14774,121 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 0);
 }
 
+UT_TEST(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes)
+{
+	PcmWaitMarginStats stats;
+	BufferTag first = make_tag(1);
+	BufferTag second = make_tag(2);
+	BufferTag third = make_tag(3);
+
+	reset_fake_pcm_runtime(4);
+	cluster_pcm_wait_margin_note_exact(false, 400, 1000, &first, 0, "FIRST", 7, 10);
+	cluster_pcm_wait_margin_note_exact(false, 300, 500, &second, 1, "SECOND", 8, 11);
+	cluster_pcm_wait_margin_note_exact(false, 900, 2000, &third, 2, "THIRD", 9, 12);
+	cluster_pcm_wait_margin_note_exact(true, 700, 1000, &first, 0, "HEAD", 7, 13);
+	UT_ASSERT(cluster_pcm_wait_margin_snapshot(&stats));
+	UT_ASSERT_EQ(stats.elapsed_us[0], 300);
+	UT_ASSERT_EQ(stats.budget_us[0], 500);
+	UT_ASSERT_EQ(stats.elapsed_us[1], 700);
+	UT_ASSERT_EQ(stats.budget_us[1], 1000);
+	UT_ASSERT_EQ(stats.sample_count[0], 3);
+	UT_ASSERT_EQ(stats.sample_count[1], 1);
+	UT_ASSERT(stats.observation[0].valid);
+	UT_ASSERT(BufferTagsEqual(&stats.observation[0].tag, &second));
+	UT_ASSERT_EQ(stats.observation[0].requester_node, 1);
+	UT_ASSERT_EQ(stats.observation[0].attempt, 8);
+	UT_ASSERT_EQ(stats.observation[0].monotonic_us, 11);
+	UT_ASSERT_STR_EQ(stats.observation[0].phase, "SECOND");
+	UT_ASSERT(BufferTagsEqual(&stats.observation[1].tag, &first));
+	UT_ASSERT_STR_EQ(stats.observation[1].phase, "HEAD");
+	cluster_pcm_wait_margin_note(false, UINT64_MAX, 500);
+	cluster_pcm_wait_margin_note(false, 500, 0);
+	UT_ASSERT(cluster_pcm_wait_margin_snapshot(&stats));
+	UT_ASSERT_EQ(stats.capture_gap_count[0], 2);
+	UT_ASSERT_EQ(stats.elapsed_us[0], 300);
+	UT_ASSERT_EQ(stats.budget_us[0], 500);
+	cluster_pcm_wait_margin_note(false, 1500, 1000);
+	UT_ASSERT(cluster_pcm_wait_margin_snapshot(&stats));
+	UT_ASSERT_EQ(stats.elapsed_us[0], 1500);
+	UT_ASSERT(!stats.observation[0].valid);
+	UT_ASSERT_EQ(stats.metadata_gap_count[0], 1);
+}
+
+UT_TEST(test_pcm_vm_metrics_distinguish_requests_completions_and_latency)
+{
+	BufferTag vm = make_tag(0);
+	BufferTag heap = vm;
+	PcmVmStats stats;
+
+	vm.forkNum = VISIBILITYMAP_FORKNUM;
+	reset_fake_pcm_runtime(4);
+	cluster_pcm_vm_metric_note(&heap, PCM_VM_X_REQUEST);
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_X_REQUEST);
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_X_REQUEST);
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_HEAD_JOIN);
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_INSTALL_COMPLETE);
+	cluster_pcm_vm_latency_note(&vm, false, 9);
+	cluster_pcm_vm_latency_note(&vm, true, 17);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_VM_X_REQUEST], 2);
+	UT_ASSERT_EQ(stats.count[PCM_VM_HEAD_JOIN], 1);
+	UT_ASSERT_EQ(stats.count[PCM_VM_INSTALL_COMPLETE], 1);
+	UT_ASSERT_EQ(stats.count[PCM_VM_REMOTE_X_TRANSFER], 0);
+	UT_ASSERT_EQ(stats.latency_count[0], 1);
+	UT_ASSERT_EQ(stats.latency_sum_us[0], 9);
+	UT_ASSERT_EQ(stats.latency_max_us[0], 9);
+	UT_ASSERT_EQ(stats.latency_histogram[0][4], 1);
+	UT_ASSERT_EQ(stats.latency_count[1], 1);
+	UT_ASSERT_EQ(stats.latency_histogram[1][5], 1);
+	UT_ASSERT(stats.tag_valid);
+	UT_ASSERT(BufferTagsEqual(&stats.tag, &vm));
+	vm.relNumber++;
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_X_REQUEST);
+	cluster_pcm_vm_latency_note(&vm, false, 100);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_VM_X_REQUEST], 2);
+	UT_ASSERT_EQ(stats.latency_count[0], 1);
+	UT_ASSERT_EQ(stats.other_tag_observations, 2);
+	vm.relNumber--;
+	vm.blockNum = 1;
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_X_REQUEST);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_VM_X_REQUEST], 2);
+}
+
+UT_TEST(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_range)
+{
+	BufferTag vm = make_tag(0);
+	PcmVmStats stats;
+
+	vm.forkNum = VISIBILITYMAP_FORKNUM;
+	reset_fake_pcm_runtime(4);
+	cluster_pcm_vm_clear_note(&vm, 0);
+	cluster_pcm_vm_clear_note(&vm, 0);
+	cluster_pcm_vm_clear_note(&vm, 63);
+	cluster_pcm_vm_clear_note(&vm, 64);
+	cluster_pcm_vm_clear_note(&vm, PCM_VM_HEAP_BLOCKS - 1);
+	cluster_pcm_vm_clear_note(&vm, PCM_VM_HEAP_BLOCKS);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_VM_ALL_VISIBLE_CLEARED], 5);
+	UT_ASSERT_EQ(stats.count[PCM_VM_REPEAT_CLEAR], 1);
+	UT_ASSERT_EQ(stats.count[PCM_VM_CLEAR_OBSERVATION_GAP], 1);
+	UT_ASSERT_EQ(stats.clear_bitmap[0], UINT64_C(1) | (UINT64_C(1) << 63));
+	UT_ASSERT_EQ(stats.clear_bitmap[1], UINT64_C(1));
+	UT_ASSERT_EQ(stats.clear_bitmap[(PCM_VM_HEAP_BLOCKS - 1) / 64],
+				 UINT64_C(1) << ((PCM_VM_HEAP_BLOCKS - 1) % 64));
+	vm.relNumber++;
+	cluster_pcm_vm_clear_note(&vm, 65);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count[PCM_VM_ALL_VISIBLE_CLEARED], 5);
+	UT_ASSERT_EQ(stats.other_tag_observations, 1);
+	UT_ASSERT_EQ(stats.clear_bitmap[1], UINT64_C(1));
+}
+
 int
 main(void)
 {
-	UT_PLAN(196);
+	UT_PLAN(200);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -14724,6 +14906,9 @@ main(void)
 	UT_RUN(test_pcm_trans_9_cleanout_validator_reachable_but_apply_fail_closed);
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
+	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
+	UT_RUN(test_pcm_vm_metrics_distinguish_requests_completions_and_latency);
+	UT_RUN(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_range);
 	UT_RUN(test_pcm_grd_entry_lifecycle_link_surface);
 	UT_RUN(test_pcm_per_entry_lwlock_independence_link_surface);
 	UT_RUN(test_pcm_pi_bitmap_atomic_accessor_linkable);
@@ -14844,6 +15029,7 @@ main(void)
 	UT_RUN(test_resource_x_requester_join_accepts_multi_blocker_authority_span);
 	UT_RUN(test_resource_x_requester_join_creates_fresh_local_entry_before_t1);
 	UT_RUN(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times);
+	UT_RUN(test_vm_terminal_counts_remote_x_only_once_not_shared_carriers);
 	UT_RUN(test_resource_x_requester_floors_keep_authority_and_target_axes_distinct);
 	UT_RUN(test_resource_x_requester_join_gates_both_floors_before_successor);
 	UT_RUN(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress);

@@ -766,6 +766,41 @@ undo_test_write_header(uint32 segment_id, uint8 state)
 	return written == sizeof(page);
 }
 
+/* The complete-pool probe must never fall through to fresh-file creation. */
+int
+cluster_shared_fs_undo_instance_dir_resolve(uint8 owner pg_attribute_unused(),
+											char *buf pg_attribute_unused(),
+											size_t size pg_attribute_unused())
+{
+	abort();
+}
+
+XLogRecPtr
+cluster_undo_emit_segment_init(uint8 owner pg_attribute_unused(),
+							   uint32 segment pg_attribute_unused(),
+							   const char *page pg_attribute_unused())
+{
+	abort();
+}
+
+int
+errcode_for_file_access(void)
+{
+	abort();
+}
+
+void
+fsync_fname(const char *path pg_attribute_unused(), bool isdir pg_attribute_unused())
+{
+	abort();
+}
+
+int
+pg_fsync(int fd pg_attribute_unused())
+{
+	abort();
+}
+
 static bool
 undo_test_write_invalid_header(uint32 segment_id)
 {
@@ -1204,6 +1239,32 @@ UT_TEST(test_undo_effective_cap_clamps_and_never_falls_below_current)
 	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), CLUSTER_UNDO_SEGS_PER_INSTANCE);
 	cluster_undo_segments_max_per_instance = 4;
 	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), 17);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite)
+{
+	ClusterUndoSegmentExtendPlan plan;
+	uint32 segment_id;
+
+	if (!undo_test_fixture_begin())
+		return;
+	/* Exercise the actual allocator against all 256 present slot files. */
+	for (segment_id = 1; segment_id <= CLUSTER_UNDO_SEGS_PER_INSTANCE; segment_id++)
+		UT_ASSERT(undo_test_write_header(segment_id, SEGMENT_ACTIVE));
+	UT_ASSERT(!cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT(plan.at_hard_cap);
+	UT_ASSERT_EQ(plan.segment_id, 0);
+
+	/* The first/fixed and current slots remain live; only slot 10 is reusable. */
+	UT_ASSERT(undo_test_write_header(10, SEGMENT_RECYCLABLE));
+	UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT(!plan.at_hard_cap);
+	UT_ASSERT(plan.needs_reuse);
+	UT_ASSERT_EQ(plan.segment_id, 10);
+	UT_ASSERT_EQ(plan.generation, 0);
+	/* A plan is not a rewrite or generation publication. */
+	UT_ASSERT_EQ(cluster_undo_segment_generation(10, 1), plan.generation);
 	undo_test_fixture_end();
 }
 
@@ -2685,6 +2746,9 @@ UT_TEST(test_update_toast_releases_outer_receipt_before_nested_producers)
 UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 {
 	char *source = read_heapam_source();
+	char *compact = malloc(strlen(source) + 1);
+	char *write = compact;
+	const char *read;
 	char *update = strstr(source, "\nheap_update(Relation ");
 	char *deadline = update ? strstr(update, "itl_capacity_absolute_deadline_us = 0;") : NULL;
 	char *wait = update ? strstr(update, "\nl_pgrac_itl_capacity_wait:") : NULL;
@@ -2694,15 +2758,16 @@ UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 	char *receipt = call ? strstr(call, "cluster_heap_restart_update_undo_record_exact(") : NULL;
 	char *reacquire = receipt ? strstr(receipt, "goto l_pgrac_reacquire;") : NULL;
 	char *same_page = receipt ? strstr(receipt, "goto l2;") : NULL;
-	char *delete_recheck
-		= strstr(source, "if (cluster_writer_res == TM_BeingModified)\n\t\t\t\tgoto l1;");
-	char *update_recheck
-		= strstr(source, "if (cluster_writer_res == TM_BeingModified)\n\t\t\t\tgoto l2;");
-	char *lock_recheck = strstr(source, "if (cwres == TM_BeingModified)\n\t\t\t\t\t\t\tgoto l3;");
 
-	UT_ASSERT_NOT_NULL(delete_recheck);
-	UT_ASSERT_NOT_NULL(update_recheck);
-	UT_ASSERT_NOT_NULL(lock_recheck);
+	/* This is an adjacency contract, not a clang-format indentation contract. */
+	UT_ASSERT_NOT_NULL(compact);
+	for (read = source; *read; read++)
+		if (!isspace((unsigned char)*read))
+			*write++ = *read;
+	*write = '\0';
+	UT_ASSERT_NOT_NULL(strstr(compact, "if(cluster_writer_res==TM_BeingModified)gotol1;"));
+	UT_ASSERT_NOT_NULL(strstr(compact, "if(cluster_writer_res==TM_BeingModified)gotol2;"));
+	UT_ASSERT_NOT_NULL(strstr(compact, "if(cwres==TM_BeingModified)gotol3;"));
 
 	UT_ASSERT_NOT_NULL(deadline);
 	UT_ASSERT_NOT_NULL(old_full);
@@ -2713,13 +2778,40 @@ UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 	UT_ASSERT_NOT_NULL(same_page);
 	if (deadline && wait)
 		UT_ASSERT(strstr(deadline + 1, "itl_capacity_absolute_deadline_us = 0;") == NULL);
+	free(compact);
+	free(source);
+}
+
+UT_TEST(test_update_vm_observation_never_repins_or_indexes_a_local_buffer)
+{
+	char *source = read_heapam_source();
+	char *update = source != NULL ? strstr(source, "\nheap_update(") : NULL;
+	char *old_probe = update != NULL ? strstr(update, "bool vm_visible_before") : NULL;
+	char *new_probe = old_probe != NULL ? strstr(old_probe + 1, "bool vm_visible_before") : NULL;
+	char *old_local = old_probe != NULL ? strstr(old_probe, "!BufferIsLocal(vmbuffer)") : NULL;
+	char *new_local = new_probe != NULL ? strstr(new_probe, "!BufferIsLocal(vmbuffer_new)") : NULL;
+
+	UT_ASSERT_NOT_NULL(update);
+	UT_ASSERT_NOT_NULL(old_probe);
+	UT_ASSERT_NOT_NULL(new_probe);
+	UT_ASSERT(old_local != NULL && old_local < new_probe);
+	UT_ASSERT_NOT_NULL(new_local);
+	UT_ASSERT(old_probe != NULL
+			  && strstr(old_probe, "visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer)")
+					 != NULL);
+	UT_ASSERT(
+		new_probe != NULL
+		&& strstr(new_probe, "visibilitymap_pin_ok(BufferGetBlockNumber(newbuf), vmbuffer_new)")
+			   != NULL);
 	free(source);
 }
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(52);
+	UT_PLAN(54);
+	UT_RUN(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite);
+	UT_RUN(test_update_vm_observation_never_repins_or_indexes_a_local_buffer);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);

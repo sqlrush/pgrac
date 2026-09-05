@@ -181,24 +181,36 @@ static void
 cluster_pcm_own_report_bump_failure(BufferDesc *buf, ClusterPcmOwnResult result,
 								   uint64 generation, uint32 flags, const char *context)
 {
-	if (result == CLUSTER_PCM_OWN_BUSY)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("cluster PCM ownership transition conflicts with an active reservation"),
-				 errdetail("context=%s buffer=%d generation=%llu flags=0x%x", context,
-						   buf->buf_id, (unsigned long long) generation, flags)));
+	if (result == CLUSTER_PCM_OWN_BUSY) {
+		cluster_pcm_rx_metric_note(PCM_RX_RESERVATION_CONFLICT);
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_OBJECT_IN_USE),
+			 errmsg("cluster PCM ownership transition conflicts with an active reservation"),
+			 errdetail(
+				 "PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=ACTIVE_RESERVATION_CONFLICT "
+				 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 context=%s buffer=%d generation=%llu flags=0x%x",
+				 cluster_node_id, context, buf->buf_id, (unsigned long long)generation, flags)));
+	}
 	if (result == CLUSTER_PCM_OWN_EXHAUSTED)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cluster PCM ownership generation exhausted for buffer %d", buf->buf_id),
-				 errdetail("context=%s generation=%llu flags=0x%x", context,
-						   (unsigned long long) generation, flags)));
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=OWNERSHIP_GENERATION_EXHAUSTED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 context=%s generation=%llu flags=0x%x",
+						   cluster_node_id, context, (unsigned long long)generation, flags)));
 
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("cluster PCM ownership generation bump failed for buffer %d", buf->buf_id),
-			 errdetail("context=%s generation=%llu flags=0x%x result=%d", context,
-					   (unsigned long long) generation, flags, (int) result)));
+	if (result == CLUSTER_PCM_OWN_CORRUPT)
+		cluster_pcm_rx_metric_note(PCM_RX_RESERVATION_MALFORMED);
+	ereport(
+		ERROR,
+		(errcode(ERRCODE_DATA_CORRUPTED),
+		 errmsg("cluster PCM ownership generation bump failed for buffer %d", buf->buf_id),
+		 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+				   "context=%s generation=%llu flags=0x%x result=%d",
+				   result == CLUSTER_PCM_OWN_CORRUPT ? "ACTIVE_RESERVATION_MALFORMED"
+													 : "OWNERSHIP_STATE_UNPROVEN",
+				   cluster_node_id, context, (unsigned long long)generation, flags, (int)result)));
 }
 
 static inline ClusterPcmOwnResult cluster_pcm_own_bump_locked(BufferDesc *buf,
@@ -2248,8 +2260,10 @@ cluster_pcm_own_abort_grant_or_error(BufferDesc *buf, const ClusterPcmOwnSnapsho
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("could not abort exact cluster PCM grant reservation: result=%d",
 							   (int)result),
-						errdetail("context=%s buffer=%d generation=%llu token=%llu", context,
-								  buf != NULL ? buf->buf_id : -1,
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "context=%s buffer=%d generation=%llu token=%llu",
+								  cluster_node_id, context, buf != NULL ? buf->buf_id : -1,
 								  (unsigned long long)(base != NULL ? base->generation : 0),
 								  (unsigned long long)reservation_token)));
 }
@@ -2364,27 +2378,30 @@ cluster_pcm_own_finish_grant_or_rollback(BufferDesc *buf, const ClusterPcmOwnSna
 				 errmsg("could not converge local cluster PCM state after master grant rollback: "
 						"result=%d",
 						(int)rollback_result),
-				 errdetail("buffer=%d base_state=%u generation=%llu token=%llu finish_result=%d",
-						   buf != NULL ? buf->buf_id : -1,
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "buffer=%d base_state=%u generation=%llu token=%llu finish_result=%d",
+						   cluster_node_id, buf != NULL ? buf->buf_id : -1,
 						   base != NULL ? (unsigned int)base->pcm_state : 0,
 						   (unsigned long long)(base != NULL ? base->generation : 0),
 						   (unsigned long long)reservation_token, (int)finish_result)));
 
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("could not finish exact cluster PCM grant reservation: result=%d",
-					(int)finish_result),
-			 errdetail("master grant was rolled back for buffer %d token=%llu target=%u; "
-					   "live state=%u gen=%llu token=%llu flags=%u vs "
-					   "base state=%u gen=%llu token=%llu flags=%u",
-					   buf != NULL ? buf->buf_id : -1, (unsigned long long)reservation_token,
-					   (unsigned int)new_pcm_state,
-					   (unsigned int)live.pcm_state, (unsigned long long)live.generation,
-					   (unsigned long long)live.reservation_token, (unsigned int)live.flags,
-					   base != NULL ? (unsigned int)base->pcm_state : 0,
-					   (unsigned long long)(base != NULL ? base->generation : 0),
-					   (unsigned long long)(base != NULL ? base->reservation_token : 0),
-					   base != NULL ? (unsigned int)base->flags : 0)));
+	ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("could not finish exact cluster PCM grant reservation: result=%d",
+						   (int)finish_result),
+					errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							  "master grant was rolled back for buffer %d token=%llu target=%u; "
+							  "live state=%u gen=%llu token=%llu flags=%u vs "
+							  "base state=%u gen=%llu token=%llu flags=%u",
+							  cluster_node_id, buf != NULL ? buf->buf_id : -1,
+							  (unsigned long long)reservation_token, (unsigned int)new_pcm_state,
+							  (unsigned int)live.pcm_state, (unsigned long long)live.generation,
+							  (unsigned long long)live.reservation_token, (unsigned int)live.flags,
+							  base != NULL ? (unsigned int)base->pcm_state : 0,
+							  (unsigned long long)(base != NULL ? base->generation : 0),
+							  (unsigned long long)(base != NULL ? base->reservation_token : 0),
+							  base != NULL ? (unsigned int)base->flags : 0)));
 }
 
 ClusterPcmOwnResult
@@ -2478,10 +2495,12 @@ cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 	long delay_ms;
 
 	if (content_lock == NULL || LWLockHeldByMe(content_lock))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot wait for Resource-X while holding content authority"),
-				 errdetail("buffer=%d wait_index=%u", buffer_id, wait_index)));
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot wait for Resource-X while holding content authority"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "buffer=%d wait_index=%u",
+								  cluster_node_id, buffer_id, wait_index)));
 	MemSet(&gate, 0, sizeof(gate));
 	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
@@ -2754,18 +2773,29 @@ static void
 cluster_bufmgr_resource_x_writer_report_failure(
 	ResourceXApplyResult result, BufferDesc *buf, const char *operation)
 {
+	const char *reason = "WRITER_FAILURE_CAUSE_UNPROVEN";
+	uint64 attempt = 0;
+
+	/* No unrelated activation/unlock error may consume a stale acquisition
+	 * diagnostic from this backend, even for the same buffer/result pair. */
+	if (strcmp(operation, "Resource-X target acquire") == 0
+		|| strcmp(operation, "Resource-X direct-init target acquire") == 0
+		|| strcmp(operation, "Resource-X auxiliary direct-init join") == 0)
+		reason = cluster_gcs_resource_x_take_acquire_failure_reason(buf != NULL ? buf->buf_id : -1,
+																	result, &attempt);
 	if (result == RESOURCE_X_APPLY_BAD_STATE
 		|| result == RESOURCE_X_APPLY_NOT_FOUND)
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Resource-X writer operation is not ready"),
-				 errdetail("operation=%s buffer=%d result=%d", operation,
-						   buf != NULL ? buf->buf_id : -1, (int) result)));
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("Resource-X writer operation failed"),
-			 errdetail("operation=%s buffer=%d result=%d", operation,
-					   buf != NULL ? buf->buf_id : -1, (int) result)));
+				(errcode(ERRCODE_OBJECT_IN_USE), errmsg("Resource-X writer operation is not ready"),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s PGRAC_NODE=%d "
+						   "PGRAC_ATTEMPT=" UINT64_FORMAT " operation=%s buffer=%d result=%d",
+						   reason, cluster_node_id, attempt, operation,
+						   buf != NULL ? buf->buf_id : -1, (int)result)));
+	ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("Resource-X writer operation failed"),
+					errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s PGRAC_NODE=%d "
+							  "PGRAC_ATTEMPT=" UINT64_FORMAT " operation=%s buffer=%d result=%d",
+							  reason, cluster_node_id, attempt, operation,
+							  buf != NULL ? buf->buf_id : -1, (int)result)));
 }
 
 static void
@@ -2842,11 +2872,12 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 				"reuse target writer ledger");
 		entry = cluster_bufmgr_pcm_x_writer_free_entry();
 		if (entry == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("Resource-X writer ledger is full"),
-					 errdetail("maximum entries=%d",
-						LWLOCK_MAX_HELD_BY_PROC)));
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("Resource-X writer ledger is full"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+									  "maximum entries=%d",
+									  cluster_node_id, LWLOCK_MAX_HELD_BY_PROC)));
 		MemSet(entry, 0, sizeof(*entry));
 		entry->buffer_id = buf->buf_id;
 		entry->content_lock = content_lock;
@@ -2990,10 +3021,12 @@ cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 
 	entry = cluster_bufmgr_pcm_x_writer_free_entry();
 	if (entry == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Resource-X writer ledger is full"),
-				 errdetail("maximum entries=%d", LWLOCK_MAX_HELD_BY_PROC)));
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("Resource-X writer ledger is full"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "maximum entries=%d",
+								  cluster_node_id, LWLOCK_MAX_HELD_BY_PROC)));
 	MemSet(entry, 0, sizeof(*entry));
 	entry->buffer_id = buf->buf_id;
 	entry->content_lock = BufferDescriptorGetContentLock(buf);
@@ -3200,9 +3233,11 @@ cluster_bufmgr_itl_recycle_guard_unlock(Buffer buffer)
 	LWLock *content_lock;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid buffer for Resource-X ITL recycle guard unlock")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid buffer for Resource-X ITL recycle guard unlock"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	buf = GetBufferDescriptor(buffer - 1);
 	content_lock = BufferDescriptorGetContentLock(buf);
 	entry = cluster_bufmgr_pcm_x_writer_find(buf);
@@ -3461,12 +3496,13 @@ cluster_bufmgr_pcm_direct_init_report_failure(BufferDesc *buf, ClusterPcmOwnResu
 		result == CLUSTER_PCM_OWN_EXHAUSTED || result == CLUSTER_PCM_OWN_NOT_READY)
 		cluster_pcm_own_report_bump_failure(buf, result, generation, flags, context);
 
-	ereport(ERROR,
-			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("cluster PCM direct initialization lacks an exact live proof"),
-			 errdetail("context=%s buffer=%d result=%d generation=%llu flags=0x%x",
-					   context, buf != NULL ? buf->buf_id : -1, (int) result,
-					   (unsigned long long) generation, flags)));
+	ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cluster PCM direct initialization lacks an exact live proof"),
+					errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=DIRECT_INIT_PROOF_ABSENT "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 context=%s buffer=%d result=%d "
+							  "generation=%llu flags=0x%x",
+							  cluster_node_id, context, buf != NULL ? buf->buf_id : -1, (int)result,
+							  (unsigned long long)generation, flags)));
 }
 
 /* Join only the exact VM/FSM direct-init reservation already published by
@@ -6728,7 +6764,10 @@ retry_extend_collision:
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_IN_USE),
 							 errmsg("cannot reuse retained cluster PCM image during "
-									"relation extension")));
+									"relation extension"),
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									   cluster_node_id)));
 			}
 #endif
 			do
@@ -6906,10 +6945,12 @@ MarkBufferDirty(Buffer buffer)
 			cluster_pcm_own_resource_x_activation_generation_get(bufHdr->buf_id)))
 	{
 		UnlockBufHdr(bufHdr, buf_state);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot dirty a fenced cluster PCM image"),
-				 errdetail("buffer=%d", bufHdr->buf_id)));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cannot dirty a fenced cluster PCM image"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "buffer=%d",
+								  cluster_node_id, bufHdr->buf_id)));
 	}
 	UnlockBufHdr(bufHdr, buf_state);
 #endif
@@ -8340,14 +8381,15 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			writer_activation_token, resource_x_activation_generation))
 	{
 		UnlockBufHdr(buf, buf_state);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot flush a dirty fenced cluster PCM image"),
-				 errdetail("buffer=%d writer_activation_token=%llu "
-						   "resource_x_activation_generation=%llu",
-						   buf->buf_id,
-						   (unsigned long long)writer_activation_token,
-						   (unsigned long long)resource_x_activation_generation)));
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot flush a dirty fenced cluster PCM image"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "buffer=%d writer_activation_token=%llu "
+								  "resource_x_activation_generation=%llu",
+								  cluster_node_id, buf->buf_id,
+								  (unsigned long long)writer_activation_token,
+								  (unsigned long long)resource_x_activation_generation)));
 	}
 	UnlockBufHdr(buf, buf_state);
 #endif
@@ -9984,12 +10026,15 @@ cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
 	ClusterBufferBarrierUnwindResult result;
 
 	if (pcm_acquired && !pcm_pending_set)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot unwind a cluster PCM barrier refusal without its exact reservation"),
-				 errdetail("buffer=%d token=%llu", buf->buf_id,
-						   (unsigned long long)pending_token),
-				 errhint("Check the server log for the preceding cluster PCM ownership failure.")));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("cannot unwind a cluster PCM barrier refusal without its exact reservation"),
+			 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN PGRAC_NODE=%d "
+					   "PGRAC_ATTEMPT=0 "
+					   "buffer=%d token=%llu",
+					   cluster_node_id, buf->buf_id, (unsigned long long)pending_token),
+			 errhint("Check the server log for the preceding cluster PCM ownership failure.")));
 
 	context.buf = buf;
 	context.pcm_mode = pcm_mode;
@@ -10003,10 +10048,13 @@ cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not synchronously clear cluster PCM barrier-refusal responsibility"),
-				 errdetail("buffer=%d result=%d pending=%d acquired=%d token=%llu",
-						   buf->buf_id, (int) result, pcm_pending_set ? 1 : 0,
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "buffer=%d result=%d pending=%d acquired=%d token=%llu",
+						   cluster_node_id, buf->buf_id, (int)result, pcm_pending_set ? 1 : 0,
 						   pcm_acquired ? 1 : 0, (unsigned long long)pending_token),
-				 errhint("Check the server log for the exact holder, writer, or ownership cleanup failure.")));
+				 errhint("Check the server log for the exact holder, writer, or ownership cleanup "
+						 "failure.")));
 }
 #endif							/* USE_PGRAC_CLUSTER */
 
@@ -10114,6 +10162,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 			? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 		if (pcm_mode == PCM_LOCK_MODE_X)
 		{
+			cluster_pcm_vm_metric_note(&pcm_expected_resource, PCM_VM_X_REQUEST);
 			pcm_aux_pin_required
 				= cluster_pcm_x_revoke_finish_mode(
 					&pcm_expected_resource, 0)

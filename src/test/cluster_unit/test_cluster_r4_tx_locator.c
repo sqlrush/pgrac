@@ -893,6 +893,84 @@ UT_TEST(test_epoch_zero_complete_visibility_remains_fail_closed)
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
 }
 
+UT_TEST(test_epoch_zero_canonical_row_wait_reuses_partial_provider_without_rebinding)
+{
+	int leg;
+
+	for (leg = 0; leg < 3; leg++) {
+		ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
+		ClusterTxLocator before;
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		ClusterTxOutcome expected = leg == 0   ? CLUSTER_TX_IN_PROGRESS
+									: leg == 1 ? CLUSTER_TX_COMMITTED
+											   : CLUSTER_TX_ABORTED;
+
+		locator.tt_wrap = 7;
+		before = locator;
+		test_provider_outcome = expected;
+		test_provider_resolution.outcome = expected;
+		test_provider_resolution.commit_scn = leg == 1 ? (SCN)101 : InvalidScn;
+		UT_ASSERT_EQ(
+			cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution, &reason),
+			expected);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_provider_mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+		UT_ASSERT_EQ(test_provider_locator.tt_wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 7);
+		UT_ASSERT_EQ(memcmp(&locator, &before, sizeof(locator)), 0);
+		UT_ASSERT_EQ(test_enter_calls, 1);
+		UT_ASSERT_EQ(test_leave_calls, 1);
+		UT_ASSERT_EQ(test_terminal_census_enter_calls, 0);
+	}
+}
+
+UT_TEST(test_epoch_zero_row_wait_rejects_identity_and_admission_drift)
+{
+	int leg;
+
+	for (leg = 0; leg < 11; leg++) {
+		ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+		locator.tt_wrap = 7;
+		if (leg == 0)
+			test_provider_resolution.locator_echo.tt_wrap++;
+		if (leg == 1)
+			test_provider_resolution.locator_echo.xid++;
+		if (leg == 2)
+			test_provider_resolution.locator_echo.uba.raw[0]++;
+		if (leg == 3)
+			test_provider_resolution.locator_echo.itl_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		if (leg == 4)
+			test_provider_resolution.locator_echo.itl_slot_index++;
+		if (leg == 5)
+			locator.tt_wrap = TT_WRAP_INVALID;
+		if (leg == 6)
+			test_node_count = 2;
+		if (leg == 7)
+			cluster_recmerge_window_active = true;
+		if (leg == 8)
+			test_recheck_result = false;
+		if (leg == 9)
+			test_provider_mutates_epoch = true;
+		if (leg == 10)
+			test_admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(
+			cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution, &reason),
+			CLUSTER_TX_UNKNOWN);
+		UT_ASSERT(reason != CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_admitted_provider_calls, leg < 5 || leg == 9 ? 1 : 0);
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_leave_calls, leg == 10 ? 0 : 1);
+	}
+}
+
 UT_TEST(test_epoch_zero_partial_visibility_generation_drift_refuses_before_provider)
 {
 	ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
@@ -1376,7 +1454,9 @@ UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(63);
+	UT_RUN(test_epoch_zero_canonical_row_wait_reuses_partial_provider_without_rebinding);
+	UT_RUN(test_epoch_zero_row_wait_rejects_identity_and_admission_drift);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);

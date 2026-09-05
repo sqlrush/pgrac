@@ -4594,6 +4594,25 @@ typedef struct ResourceXTargetEvictionPlan {
 
 /* TARGET-only requester: join/create the per-resource bootstrap round and
  * return only its exact post-T3 retained acquisition ref. */
+/* Diagnostics never infer expiry from BAD_STATE or from a later clock read.
+ * Only the exact failing branch may supply either expiry fact. */
+static inline const char *
+cluster_gcs_resource_x_acquire_failure_reason(bool head_expired, bool caller_expired,
+											  ResourceXApplyResult result)
+{
+	if (head_expired)
+		return "HEAD_NO_PROGRESS_EXPIRED";
+	if (caller_expired)
+		return "FOLLOWER_DEADLINE_EXPIRED";
+	if (result == RESOURCE_X_APPLY_STALE)
+		return "ACQUIRE_IDENTITY_STALE";
+	return "ACQUIRE_FAILURE_CAUSE_UNPROVEN";
+}
+
+extern const char *cluster_gcs_resource_x_take_acquire_failure_reason(int buffer_id,
+																	  ResourceXApplyResult result,
+																	  uint64 *attempt_out);
+
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out);

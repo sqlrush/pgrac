@@ -223,8 +223,18 @@ current_set_failure(ClusterUndoBlock0Result *failure, ClusterUndoBlock0Result re
 
 static ClusterUndoBlock0CurrentStep
 current_unused_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
-					ClusterUndoBlock0Result *failure)
+					ClusterUndoBlock0Result *failure, unsigned int predicate)
 {
+	static uint32 reported_predicates;
+
+	/* One diagnostic per actual rejection predicate per process.  Preserve
+	 * the failing branch before its zeroing cleanup; never log successes. */
+	if (predicate < 32 && (reported_predicates & (UINT32_C(1) << predicate)) == 0) {
+		reported_predicates |= UINT32_C(1) << predicate;
+		ereport(LOG, (errmsg_internal(
+						 "block0 current acquire admission refused: predicate=%u result=%u node=%d",
+						 predicate, (unsigned int)result, cluster_node_id)));
+	}
 	if (data != NULL)
 		memset(data, 0, sizeof(*data));
 	current_set_failure(failure, result);
@@ -766,12 +776,12 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	}
 	if (current_resid_already_active(&data->resid)) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 1);
 	}
 	if (!cluster_enabled || cluster_node_id < 0 || !cluster_lms_is_ready()
 		|| cluster_lmon_status() != CLUSTER_LMON_READY || !cluster_qvotec_in_quorum()
 		|| !cluster_membership_is_member(cluster_node_id)) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 2);
 	}
 	if (caller_admission != NULL) {
 		bool census = caller_admission_class == CURRENT_ADMISSION_CENSUS
@@ -797,11 +807,9 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 
 		if (!census && !ctrc_release
 			&& !live_owner_source && !live_owner_target)
-			return current_unused_fail(
-				data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+			return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 3);
 	} else if (caller_admission_class != CURRENT_ADMISSION_OWNED) {
-		return current_unused_fail(
-			data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 4);
 	}
 
 	effective_timeout_ms
@@ -810,13 +818,13 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 			  ? -1
 			  : (timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms);
 	if (timeout_ms < -1 || effective_timeout_ms == 0 || effective_timeout_ms < -1) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure, 5);
 	}
 	epoch = cluster_epoch_get_current();
 	master = cluster_grd_lookup_master_gen(&data->resid, &routing_generation);
 	if (master < 0 || cluster_grd_shard_phase(cluster_grd_shard_for_resource(&data->resid))
 						 != GRD_SHARD_NORMAL) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 6);
 	}
 
 	memset(&data->holder, 0, sizeof(data->holder));
@@ -825,7 +833,7 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 	data->holder.cluster_epoch = epoch;
 	data->holder.request_id = cluster_ges_reply_wait_next_request_id();
 	if (data->holder.request_id == 0) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure, 7);
 	}
 	data->logical = *key;
 	data->routing_generation = routing_generation;

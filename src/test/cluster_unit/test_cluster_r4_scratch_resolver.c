@@ -897,6 +897,12 @@ MarkBufferDirtyHint(Buffer buffer pg_attribute_unused(), bool standard pg_attrib
 	ut_hint_mutations++;
 }
 bool
+cluster_bufmgr_block_write_permitted(Buffer buffer pg_attribute_unused())
+{
+	UT_ASSERT(false); /* these read/committed-writer fixtures never normalize xmax */
+	return false;
+}
+bool
 cluster_itl_cleanout_lazy(Buffer buffer pg_attribute_unused(), uint8 index pg_attribute_unused(),
 						  TransactionId xid pg_attribute_unused(), SCN scn pg_attribute_unused())
 {

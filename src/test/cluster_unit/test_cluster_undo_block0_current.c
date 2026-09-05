@@ -51,6 +51,25 @@ cluster_undo_block0_current_prove_strict_empty_exclusive(
 
 UT_DEFINE_GLOBALS();
 
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	UT_ASSERT_EQ(elevel, LOG);
+	return true;
+}
+
+int
+errmsg_internal(const char *fmt, ...)
+{
+	UT_ASSERT(strstr(fmt, "block0 current acquire admission refused:") != NULL);
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 static ClusterConf test_cluster_conf = {.node_count = 2};
@@ -841,6 +860,7 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin,
 	last_flush_lsn = required_wal_lsn;
 	memcpy(last_flush_successor, successor_page, BLCKSZ);
 	memcpy(fake_pin_page, successor_page, BLCKSZ);
+	memcpy(fake_disk_page, successor_page, BLCKSZ);
 }
 
 XLogRecPtr
@@ -3017,6 +3037,65 @@ UT_TEST(test_live_owner_recycle_requires_release_on_every_committed_slot)
 	UT_ASSERT_EQ(flush_sync_calls, 1);
 }
 
+UT_TEST(test_terminal_reuse_chain_preserves_refs_and_horizon_before_generation_rebirth)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Generation expected = { true, 7 };
+	PGAlignedBlock successor;
+	UndoSegmentHeaderData *disk;
+
+	reset_fixture();
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_generation = expected;
+	init_recyclable_block0(fake_disk_page, key.segment_id, key.owner_instance, 7);
+	disk = (UndoSegmentHeaderData *)fake_disk_page;
+	disk->segment_state = SEGMENT_COMMITTED;
+	disk->tt_slots[0].status = TT_SLOT_COMMITTED;
+	disk->tt_slots[0].xid = (TransactionId)700;
+	disk->tt_slots[0].wrap = 3;
+	disk->tt_slots[0].commit_scn = (SCN)100;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+
+	/* Terminal alone cannot consume a live receipt/ref. */
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_recycle_exact(&key, (SCN)100, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED);
+	UT_ASSERT_EQ(flush_sync_calls, 0);
+	disk->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+	/* A live reader's folded horizon remains a separate hard gate. */
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_recycle_exact(&key, (SCN)99, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED);
+	UT_ASSERT_EQ(flush_sync_calls, 0);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_recycle_exact(&key, (SCN)100, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);
+	UT_ASSERT_EQ(disk->segment_state, SEGMENT_RECYCLABLE);
+	UT_ASSERT_EQ(disk->wrap_count, 7);
+	UT_ASSERT_EQ(recycle_wal_calls, 1);
+	UT_ASSERT_EQ(memcmp(fake_pin_page, fake_disk_page, BLCKSZ), 0);
+
+	init_fresh_successor_block0(successor.data, key.segment_id, key.owner_instance, 8);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_reuse_exact(&key, &expected, successor.data, 1000),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(disk->segment_state, SEGMENT_ALLOCATED);
+	UT_ASSERT_EQ(disk->wrap_count, 8);
+	UT_ASSERT_EQ(reuse_wal_calls, 1);
+	UT_ASSERT_EQ(flush_sync_calls, 2);
+	UT_ASSERT_EQ(memcmp(fake_pin_page, fake_disk_page, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(fake_pin_page, successor.data, BLCKSZ), 0);
+	/* Replaying the old exact identity cannot produce another generation. */
+	UT_ASSERT_NE(
+		cluster_undo_block0_current_live_owner_reuse_exact(&key, &expected, successor.data, 1000),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(reuse_wal_calls, 1);
+	UT_ASSERT_EQ(flush_sync_calls, 2);
+}
+
 UT_TEST(test_live_owner_recycle_aborted_needs_release_not_scn_age)
 {
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -3103,7 +3182,8 @@ UT_TEST(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(72);
+	UT_RUN(test_terminal_reuse_chain_preserves_refs_and_horizon_before_generation_rebirth);
 	UT_RUN(test_key_guard_and_phase_abi);
 	UT_RUN(test_wait_reply_uses_exact_acquire_and_release_keys);
 	UT_RUN(test_wait_reply_never_rounds_up_remaining_deadline);

@@ -203,6 +203,7 @@ typedef struct GcsBlockR4TxOriginContext {
 	GcsBlockR4TxOriginDomain domain;
 	GcsBlockR4TxOriginPhase phase;
 	GcsBlockR4TxOriginPhase failure_phase;
+	ClusterUndoBlock0Result current_failure;
 	ClusterTxResolveMode resolve_mode;
 	TimestampTz deadline;
 	uint32 requester_capability_generation;
@@ -961,7 +962,10 @@ gcs_block_my_block(void)
 	if (idx < 0 || idx >= MaxBackends)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_block: MyBackendId=%d out of [1, MaxBackends=%d] range",
-							   (int)MyBackendId, MaxBackends)));
+							   (int)MyBackendId, MaxBackends),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	return &gcs_block_backend_blocks[idx];
 }
 
@@ -1047,7 +1051,10 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 				 errmsg("cluster_gcs_block: outstanding-block table full (max %d per backend)",
 						MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND),
 				 errhint("Reduce concurrent block-ship acquisitions; "
-						 "per-backend cap GUC may land in spec-2.34+.")));
+						 "per-backend cap GUC may land in spec-2.34+."),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 	return slot;
 }
 
@@ -1792,7 +1799,10 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 		LWLockRelease(content_lock);
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("refusing to overwrite retained cluster PCM image"),
-						errdetail("buffer=%d", buf->buf_id)));
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+								  "buffer=%d",
+								  cluster_node_id, buf->buf_id)));
 	}
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
@@ -1990,13 +2000,15 @@ cluster_gcs_block_fallback_verify_refresh(BufferDesc *buf, BufferTag tag, SCN ex
 				 errmsg("cluster_gcs_block: stale storage-fallback copy detected on tag "
 						"spc=%u db=%u rel=%u block=%u",
 						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
-				 errdetail("fork=%d expected pi_watermark_scn=" UINT64_FORMAT
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "fork=%d expected pi_watermark_scn=" UINT64_FORMAT
 						   " %s pd_block_scn=" UINT64_FORMAT
 						   " local pi_watermark_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
 						   " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
 						   " wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT
 						   " wm_new=" UINT64_FORMAT " wm_matches_expected=%d.",
-						   (int)tag.forkNum, (uint64)expected_scn,
+						   cluster_node_id, (int)tag.forkNum, (uint64)expected_scn,
 						   refreshed ? "storage" : "local(dirty-refused)", (uint64)page_scn,
 						   (uint64)cluster_pcm_lock_pi_watermark_scn_query(tag),
 						   cluster_pcm_own_gen_get(buf->buf_id),
@@ -3189,11 +3201,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	Assert(out_retry_denied != NULL);
 	if (out_retry_denied == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_gcs_send_block_request_and_wait: NULL retry result")));
+						errmsg("cluster_gcs_send_block_request_and_wait: NULL retry result"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	*out_retry_denied = false;
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc")));
+						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	if (cluster_authority_readiness_managed()
 		&& !cluster_serving_ready_is_current()) {
 		ereport(ERROR,
@@ -3231,7 +3249,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	if (transition_id < PCM_TRANS_N_TO_S || transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster_gcs_send_block_request_and_wait: illegal transition_id=%d",
-							   (int)transition_id)));
+							   (int)transition_id),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	tag = buf->tag;
 	current_master = master_node;
@@ -3378,10 +3399,16 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				}
 				gcs_block_direct_finish_target(direct_target_buf, direct_prepared, false,
 											   InvalidXLogRecPtr);
-				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("cluster_gcs_block: failed to enqueue "
-									   "GCS_BLOCK_REQUEST to node %d",
-									   current_master)));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("cluster_gcs_block: failed to enqueue "
+							"GCS_BLOCK_REQUEST to node %d",
+							current_master),
+					 errdetail(
+						 "PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						 cluster_node_id)));
 			}
 
 			deadline = GetCurrentTimestamp()
@@ -3580,9 +3607,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					 * block install.
 					 */
 					if (final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
-						ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-										errmsg("cluster_gcs_block: holder-granted reply missing "
-											   "forwarding master")));
+						ereport(
+							ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("cluster_gcs_block: holder-granted reply missing "
+									"forwarding master"),
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									   cluster_node_id)));
 					if (final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count,
 												1);
@@ -3636,7 +3668,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 									tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
 									(unsigned int)tag.blockNum),
 							 errhint("The X holder could not relinquish a clean page (pinned or "
-									 "re-dirtied); retry the transaction.")));
+									 "re-dirtied); retry the transaction."),
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									   cluster_node_id)));
 				}
 
 				/*
@@ -3813,10 +3848,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			 * just hammer the same broken broadcast). */
 			if (final_status == GCS_BLOCK_REPLY_DENIED_INVALIDATE_TIMEOUT) {
 				terminal_denied = true;
-				ereport(
-					ERROR,
-					(errcode(ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT),
-					 errmsg("cluster_gcs_block: master broadcast invalidate timed out (HC116)")));
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT),
+						 errmsg("cluster_gcs_block: master broadcast invalidate timed out (HC116)"),
+						 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				break;
 			}
 
@@ -3845,15 +3882,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 							 errmsg("cluster_gcs_block: lost write detected on tag "
 									"spc=%u db=%u rel=%u block=%u",
 									tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
-							 errdetail("request_id=" UINT64_FORMAT " request_epoch=" UINT64_FORMAT
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+									   "request_id=" UINT64_FORMAT " request_epoch=" UINT64_FORMAT
 									   " master=%d fork=%d transition=%d retry_attempt=%d"
 									   " local pd_block_scn=" UINT64_FORMAT
 									   " local pi_watermark_scn=" UINT64_FORMAT
 									   " ownership_gen=" UINT64_FORMAT ".",
-									   request_id, slot->request_epoch, current_master,
-									   (int)tag.forkNum, (int)transition_id, retry_attempt,
-									   (uint64)forens_local_scn, (uint64)forens_local_wm,
-									   forens_own_gen),
+									   cluster_node_id, request_id, slot->request_epoch,
+									   current_master, (int)tag.forkNum, (int)transition_id,
+									   retry_attempt, (uint64)forens_local_scn,
+									   (uint64)forens_local_wm, forens_own_gen),
 							 errhint("Shipped block.pd_block_scn is below the master "
 									 "pi_watermark_scn (or the tracked block shipped an "
 									 "unstamped page).  Inspect dump_gcs."
@@ -3930,7 +3969,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						"leave for tag spc=%u db=%u rel=%u block=%u",
 						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
 				 errhint("a node is leaving the cluster and may not yet have flushed this block; "
-						 "retry after the leave commits — retry is safe")));
+						 "retry after the leave commits — retry is safe"),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 	/*
 	 * PGRAC: GCS-race round-4c FUNC-1 — a storage fallback ships no image:
@@ -4014,12 +4056,18 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		case GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT:
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cluster_gcs_block: master rejected transition_id=%d as illegal",
-								   (int)transition_id)));
+								   (int)transition_id),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL:
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cluster_gcs_block: received block failed CRC32C verify"),
-							errhint("Possible wire-ABI drift or network corruption.")));
+							errhint("Possible wire-ABI drift or network corruption."),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER:
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
@@ -4037,12 +4085,18 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 								tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
 								(unsigned int)tag.blockNum),
 						 errhint("Clean-page X-transfer with a third-party master lands in a "
-								 "later spec; retry, or run the 2-node topology.")));
+								 "later spec; retry, or run the 2-node topology."),
+						 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			}
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cluster_gcs_block: master does not hold tag and state != N"),
 							errhint("Cross-node holder migration / DRM handling lands in Stage 6; "
-									"the cross-instance read-path boundary is Spec: spec-5.57.")));
+									"the cross-instance read-path boundary is Spec: spec-5.57."),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING:
 			/* spec-5.16 D3b — master-side join fence, retry budget exhausted.
@@ -4056,13 +4110,19 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 							(unsigned int)tag.blockNum),
 					 errhint("A rejoining node's home block view is being rebuilt (survivors "
 							 "re-declaring), or the master is not yet a quorum member; retry — "
-							 "retry is safe.")));
+							 "retry is safe."),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
 		default:
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cluster_gcs_block: transition denied (status=%d)",
-								   (int)final_status)));
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster_gcs_block: transition denied (status=%d)", (int)final_status),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		}
 	}
@@ -4077,7 +4137,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					(unsigned int)tag.blockNum, (int)final_status),
 			 errhint("Possible peer GCS unresponsiveness, network partition, or "
 					 "epoch reshuffle storm.  Inspect dump_gcs counters and "
-					 "consider raising cluster.gcs_block_retransmit_max_retries.")));
+					 "consider raising cluster.gcs_block_retransmit_max_retries."),
+			 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN PGRAC_NODE=%d "
+					   "PGRAC_ATTEMPT=0 ",
+					   cluster_node_id)));
 }
 
 
@@ -4102,9 +4165,11 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 
 	Assert(out_retry_denied != NULL);
 	if (buf == NULL || expected == NULL || out_retry_denied == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster_gcs_local_master_read_image_and_wait: invalid exact input")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs_local_master_read_image_and_wait: invalid exact input"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	*out_retry_denied = false;
 	holder_node = expected->x_holder_node;
 	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
@@ -4112,7 +4177,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 		|| expected->master_holder.node_id != (uint32)holder_node)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cluster_gcs_block: invalid remote-X authority for exact read image")));
+				 errmsg("cluster_gcs_block: invalid remote-X authority for exact read image"),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 	tag = buf->tag;
 	/* P0-21 residual: the holder is an exact authority identity, not a route
@@ -4156,8 +4224,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 					break;
 				}
 				if (!gcs_block_pcm_x_next_request_id(&request_id))
-					ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-									errmsg("cluster_gcs_block: read-image request id exhausted")));
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("cluster_gcs_block: read-image request id exhausted"),
+							 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									   cluster_node_id)));
 			}
 			if (!cluster_pcm_lock_authority_matches(tag, expected)) {
 				*out_retry_denied = true;
@@ -4201,10 +4273,16 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 			if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 														  (uint32)holder_node, &fwd, sizeof(fwd)))
-				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("cluster_gcs_block: failed to enqueue read-image FORWARD "
-									   "to X holder %d",
-									   holder_node)));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("cluster_gcs_block: failed to enqueue read-image FORWARD "
+							"to X holder %d",
+							holder_node),
+					 errdetail(
+						 "PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						 cluster_node_id)));
 
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -4335,7 +4413,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						   "for tag spc=%u db=%u relNumber=%u block=%u",
 						   holder_node, tag.spcOid, tag.dbOid,
 						   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
-					errdetail("attempts=%d last_status=%d", attempts, last_status),
+					errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+							  "attempts=%d last_status=%d",
+							  cluster_node_id, attempts, last_status),
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
 	return true; /* unreachable */
@@ -4797,12 +4878,14 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
 							"for tag spc=%u db=%u relNumber=%u block=%u "
 							"(master=%d attempts=%d last_status=%u)",
 							max_retries, tag.spcOid, tag.dbOid,
-							(unsigned int)BufTagGetRelNumber(&tag),
-							(unsigned int)tag.blockNum, real_master_node,
-							retry_attempt + 1, (unsigned int)reply_status),
+							(unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum,
+							real_master_node, retry_attempt + 1, (unsigned int)reply_status),
 					 errhint("Possible peer GCS unresponsiveness, network partition, or "
 							 "epoch reshuffle storm.  Inspect dump_gcs counters and "
-							 "consider raising cluster.gcs_block_retransmit_max_retries.")));
+							 "consider raising cluster.gcs_block_retransmit_max_retries."),
+					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
 			return CLUSTER_CR_BUILD_RETRYABLE;
 		}
@@ -4810,11 +4893,13 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
 			*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
 			return CLUSTER_CR_BUILD_FAIL_CLOSED;
 		}
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("cluster_gcs_block: R4 CR request to master %d received no "
-						"terminal reply after %d attempt(s)",
-						real_master_node, retry_attempt + 1)));
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("cluster_gcs_block: R4 CR request to master %d received no "
+							   "terminal reply after %d attempt(s)",
+							   real_master_node, retry_attempt + 1),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		*reason_out = CLUSTER_CR_BUILD_IO_ERROR;
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 	}
@@ -5099,10 +5184,15 @@ cluster_gcs_block_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 origi
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)origin_node, &fwd, sizeof(fwd)))
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs_block: failed to enqueue CR request to "
-								   "origin node %d",
-								   (int)origin_node)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: failed to enqueue CR request to "
+						"origin node %d",
+						(int)origin_node),
+				 errdetail("PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -5273,10 +5363,15 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)origin_node, &fwd, sizeof(fwd)))
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs_block: failed to enqueue undo-TT fetch to "
-								   "origin node %d",
-								   (int)origin_node)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: failed to enqueue undo-TT fetch to "
+						"origin node %d",
+						(int)origin_node),
+				 errdetail("PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -5422,14 +5517,25 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)dest_node, &fwd, sizeof(fwd))) {
 			if (authority_kind)
-				ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-								errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch "
-									   "to authority node %d",
-									   (int)dest_node)));
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch to "
-								   "origin node %d",
-								   (int)dest_node)));
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch "
+							"to authority node %d",
+							(int)dest_node),
+					 errdetail(
+						 "PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						 cluster_node_id)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: failed to enqueue undo-verdict fetch to "
+						"origin node %d",
+						(int)dest_node),
+				 errdetail("PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 		}
 
 		deadline = GetCurrentTimestamp()
@@ -5800,10 +5906,15 @@ cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXact
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)origin_node, &fwd, sizeof(fwd)))
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs_block: failed to enqueue undo-multi-verdict fetch "
-								   "to origin node %d",
-								   (int)origin_node)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: failed to enqueue undo-multi-verdict fetch "
+						"to origin node %d",
+						(int)origin_node),
+				 errdetail("PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -5937,17 +6048,21 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 
 	Assert(out_retry_denied != NULL);
 	if (buf == NULL || expected == NULL || out_retry_denied == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster_gcs_local_master_x_transfer_and_wait: invalid exact input")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs_local_master_x_transfer_and_wait: invalid exact input"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	*out_retry_denied = false;
 	holder_node = expected->x_holder_node;
 	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
 		|| holder_node == cluster_node_id || expected->s_holders_bitmap != 0
 		|| expected->master_holder.node_id != (uint32)holder_node)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cluster_gcs_block: invalid remote-X authority for exact transfer")));
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_gcs_block: invalid remote-X authority for exact transfer"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	tag = buf->tag;
 	/* P0-26 first barrier: do not emit a request for an authority token
@@ -5995,10 +6110,15 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)holder_node, &fwd, sizeof(fwd)))
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs_block: failed to enqueue X-transfer FORWARD "
-								   "to X holder %d",
-								   holder_node)));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: failed to enqueue X-transfer FORWARD "
+						"to X holder %d",
+						holder_node),
+				 errdetail("PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+						   cluster_node_id)));
 
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -6134,7 +6254,10 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 		}
 		if (commit_result != PCM_X_TRANSFER_COMMIT_OK)
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("cluster_gcs_block: invalid exact X-transfer commit state")));
+							errmsg("cluster_gcs_block: invalid exact X-transfer commit state"),
+							errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									  cluster_node_id)));
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 1);
 		if (clean_eligible)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
@@ -6171,7 +6294,10 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 							   holder_node, tag.spcOid, tag.dbOid,
 							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
 						errhint("The X holder could not relinquish a clean page (pinned or "
-								"re-dirtied); retry the transaction.")));
+								"re-dirtied); retry the transaction."),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 
 	/*
@@ -6216,14 +6342,16 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 						"spc=%u db=%u relNumber=%u block=%u",
 						tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
 						(unsigned int)tag.blockNum),
-				 errdetail("request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " holder=%d fork=%d"
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "request_id=" UINT64_FORMAT " epoch=" UINT64_FORMAT " holder=%d fork=%d"
 						   " expected pi_watermark_scn sent=" UINT64_FORMAT
 						   " master pi_watermark_scn now=" UINT64_FORMAT
 						   " local pd_block_scn=" UINT64_FORMAT " ownership_gen=" UINT64_FORMAT
 						   " wm_src=%s wm_sender=%d wm_request_id=" UINT64_FORMAT
 						   " wm_epoch=" UINT64_FORMAT " wm_old=" UINT64_FORMAT
 						   " wm_new=" UINT64_FORMAT " wm_matches_expected=%d.",
-						   request_id, fwd.epoch, holder_node, (int)tag.forkNum,
+						   cluster_node_id, request_id, fwd.epoch, holder_node, (int)tag.forkNum,
 						   (uint64)forens_expected_sent, (uint64)forens_master_wm_now,
 						   (uint64)forens_local_scn, forens_own_gen,
 						   wm_prov.table_full ? "none(prov-table-full)"
@@ -6308,7 +6436,10 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 							   holder_node, tag.spcOid, tag.dbOid,
 							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
 						errhint("The recorded holder dropped its copy and storage-fallback is not "
-								"cross-instance coherent on this stage; retry the transaction.")));
+								"cross-instance coherent on this stage; retry the transaction."),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 
 	/* No X image obtained (timeout / holder evict / denial) — fail closed,
@@ -6337,14 +6468,20 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 							   holder_node, tag.spcOid, tag.dbOid,
 							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
 						errhint("The holder's copy was pinned, or a local writer committed during "
-								"the transfer; retry the transaction.")));
+								"the transfer; retry the transaction."),
+						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_gcs_block: could not obtain X transfer from X holder %d "
 						   "for tag spc=%u db=%u relNumber=%u block=%u",
 						   holder_node, tag.spcOid, tag.dbOid,
 						   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
-					errhint("The X holder did not ship a current image in time; retry.")));
+					errhint("The X holder did not ship a current image in time; retry."),
+					errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							  cluster_node_id)));
 	return true; /* unreachable */
 }
 
@@ -7163,53 +7300,41 @@ gcs_block_r4_tx_origin_log_first_denied(
 	diagnostic_valid
 		= cluster_runtime_visibility_origin_plan_canonical_diagnostic(
 			&context->origin_plan, &diagnostic);
-	ereport(LOG,
-			(errmsg_internal(
-				 "PGRAC status-22 origin first denied: requester=%d "
-				 "backend=%d request=" UINT64_FORMAT
-				 " xid=%u failure_phase=%d reason=%d outcome=%d "
-				 "canonical_sampled=%d expected_generation=%u "
-				 "formation=" UINT64_FORMAT " record_generation=" UINT64_FORMAT
-				 " canonical_diag=%d first_predicate=%d generation_result=%d "
-				 "generation_known=%d generation=%u resident_result=%d "
-				 "locator_wrap=%u tt_slot=%u slot_status=%u slot_xid=%u "
-				 "slot_wrap=%u slot_scn=" UINT64_FORMAT
-				 " live_owner_sampled=%d live_owner_exact=%d "
-				 "live_owner_segment=%u live_owner_xid=%u "
-				 "live_owner_slot=%u live_owner_wrap=%u live_owner_status=%u"
-				 " native_sampled=%d native_status=%u prepared_sampled=%d "
-				 "prepared=%d procarray_sampled=0 root=" UINT64_FORMAT "/"
-				 UINT64_FORMAT " final_root_sampled=%d final_root="
-				 UINT64_FORMAT "/" UINT64_FORMAT
-				 " admission_initial=%d admission_final=%d",
-				 context->forward.base.original_requester_node,
-				 context->forward.base.requester_backend_id,
-				 context->forward.base.request_id, context->locator.xid,
-				 (int)context->failure_phase, (int)context->reason,
-				 (int)context->outcome, context->canonical_sampled,
-				 context->expected_generation.value,
-				 context->admission.formation_epoch,
-				 context->admission.record_generation, diagnostic_valid,
-				 (int)diagnostic.first_failure, diagnostic.generation_result,
-				 diagnostic.generation_known, diagnostic.generation_value,
-				 diagnostic.resident_copy_result, diagnostic.locator_wrap,
-				 diagnostic.tt_slot_offset, diagnostic.slot_status,
-				 diagnostic.slot_xid, diagnostic.slot_wrap,
-				 (uint64)diagnostic.slot_commit_scn,
-				 diagnostic.live_owner_sampled,
-				 diagnostic.live_owner_exact,
-				 diagnostic.live_owner_segment_id,
-				 diagnostic.live_owner_xid,
-				 diagnostic.live_owner_slot_offset,
-				 diagnostic.live_owner_wrap,
-				 diagnostic.live_owner_status,
-				 diagnostic.native_sampled, diagnostic.native_status,
-				 diagnostic.prepared_sampled, diagnostic.prepared,
-				 diagnostic.root_id, diagnostic.root_generation,
-				 diagnostic.final_root_sampled, diagnostic.final_root_id,
-				 diagnostic.final_root_generation,
-				 diagnostic.initial_admission_current,
-				 diagnostic.final_admission_current)));
+	ereport(
+		LOG,
+		(errmsg_internal(
+			"PGRAC status-22 origin first denied: requester=%d "
+			"backend=%d request=" UINT64_FORMAT
+			" xid=%u failure_phase=%d reason=%d outcome=%d current_failure=%d "
+			"canonical_sampled=%d expected_generation=%u "
+			"formation=" UINT64_FORMAT " record_generation=" UINT64_FORMAT
+			" canonical_diag=%d first_predicate=%d generation_result=%d "
+			"generation_known=%d generation=%u resident_result=%d "
+			"locator_wrap=%u tt_slot=%u slot_status=%u slot_xid=%u "
+			"slot_wrap=%u slot_scn=" UINT64_FORMAT " live_owner_sampled=%d live_owner_exact=%d "
+			"live_owner_segment=%u live_owner_xid=%u "
+			"live_owner_slot=%u live_owner_wrap=%u live_owner_status=%u"
+			" native_sampled=%d native_status=%u prepared_sampled=%d "
+			"prepared=%d procarray_sampled=0 root=" UINT64_FORMAT "/" UINT64_FORMAT
+			" final_root_sampled=%d final_root=" UINT64_FORMAT "/" UINT64_FORMAT
+			" admission_initial=%d admission_final=%d",
+			context->forward.base.original_requester_node,
+			context->forward.base.requester_backend_id, context->forward.base.request_id,
+			context->locator.xid, (int)context->failure_phase, (int)context->reason,
+			(int)context->outcome, (int)context->current_failure, context->canonical_sampled,
+			context->expected_generation.value, context->admission.formation_epoch,
+			context->admission.record_generation, diagnostic_valid, (int)diagnostic.first_failure,
+			diagnostic.generation_result, diagnostic.generation_known, diagnostic.generation_value,
+			diagnostic.resident_copy_result, diagnostic.locator_wrap, diagnostic.tt_slot_offset,
+			diagnostic.slot_status, diagnostic.slot_xid, diagnostic.slot_wrap,
+			(uint64)diagnostic.slot_commit_scn, diagnostic.live_owner_sampled,
+			diagnostic.live_owner_exact, diagnostic.live_owner_segment_id,
+			diagnostic.live_owner_xid, diagnostic.live_owner_slot_offset,
+			diagnostic.live_owner_wrap, diagnostic.live_owner_status, diagnostic.native_sampled,
+			diagnostic.native_status, diagnostic.prepared_sampled, diagnostic.prepared,
+			diagnostic.root_id, diagnostic.root_generation, diagnostic.final_root_sampled,
+			diagnostic.final_root_id, diagnostic.final_root_generation,
+			diagnostic.initial_admission_current, diagnostic.final_admission_current)));
 }
 
 static void
@@ -8170,6 +8295,9 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			gcs_block_r4_tx_origin_context_clear(context, true);
 			break;
 	}
+	if (context->in_use && failure != CLUSTER_UNDO_BLOCK0_OK
+		&& context->current_failure == CLUSTER_UNDO_BLOCK0_OK)
+		context->current_failure = failure;
 }
 
 void
@@ -12984,6 +13112,33 @@ gcs_block_resource_x_target_install_classify_coherent(
 /* PGRAC adaptation: one foreground TARGET caller drives or joins the fixed
  * per-resource bootstrap round.  The round owns fan-in and retransmit state;
  * this backend owns only bounded staging/wait slices and the returned ref. */
+static struct {
+	int buffer_id;
+	ResourceXApplyResult result;
+	uint64 attempt;
+	const char *reason;
+	bool valid;
+} gcs_resource_x_acquire_diagnostic;
+
+/* Only the immediate acquire consumer uses this process-local, one-shot
+ * observation. Other writer operations must not inherit a previous failure. */
+const char *
+cluster_gcs_resource_x_take_acquire_failure_reason(int buffer_id, ResourceXApplyResult result,
+												   uint64 *attempt_out)
+{
+	const char *reason = "ACQUIRE_FAILURE_CAUSE_UNPROVEN";
+
+	*attempt_out = 0;
+	if (gcs_resource_x_acquire_diagnostic.valid
+		&& gcs_resource_x_acquire_diagnostic.buffer_id == buffer_id
+		&& gcs_resource_x_acquire_diagnostic.result == result) {
+		reason = gcs_resource_x_acquire_diagnostic.reason;
+		*attempt_out = gcs_resource_x_acquire_diagnostic.attempt;
+	}
+	gcs_resource_x_acquire_diagnostic.valid = false;
+	return reason;
+}
+
 static ResourceXApplyResult
 gcs_block_resource_x_target_acquire_internal(
 	BufferDesc *buf, const BufferTag *expected_resource,
@@ -13029,7 +13184,11 @@ gcs_block_resource_x_target_acquire_internal(
 	PcmXSessionAuthResult terminal_session_check
 		= PCM_X_SESSION_AUTH_INVALID;
 	ResourceXGateSnapshot rebound_gate;
-	uint64 absolute_deadline_us = 0;
+	volatile uint64 absolute_deadline_us = 0;
+	uint64 diagnostic_caller_budget_us = gcs_block_pcm_x_retry_timeout_us();
+	bool diagnostic_join_recorded = false;
+	bool diagnostic_deadline_expired = false;
+	bool diagnostic_head_expired = false;
 	uint64 observed_head_deadline_us = 0;
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
@@ -13076,8 +13235,9 @@ gcs_block_resource_x_target_acquire_internal(
 	bool target_install_preuse_retry_seen = false;
 	bool terminal_admission_current = false;
 	bool terminal_gate_session_current = false;
-	const char *diagnostic_stage = "entry";
+	const char *volatile diagnostic_stage = "entry";
 
+	gcs_resource_x_acquire_diagnostic.valid = false;
 	if (ref_out != NULL)
 		memset(ref_out, 0, sizeof(*ref_out));
 	memset(&own, 0, sizeof(own));
@@ -13164,6 +13324,8 @@ gcs_block_resource_x_target_acquire_internal(
 			if (now_us == 0 || retry_slice_us == 0
 				|| absolute_deadline_us == UINT64_MAX
 				|| now_us >= absolute_deadline_us) {
+				diagnostic_deadline_expired = now_us != 0 && absolute_deadline_us != UINT64_MAX
+											  && now_us >= absolute_deadline_us;
 				result = RESOURCE_X_APPLY_INVALID;
 				break;
 			}
@@ -13254,6 +13416,7 @@ gcs_block_resource_x_target_acquire_internal(
 				now_us = gcs_block_pcm_x_monotonic_us();
 				if (now_us >= absolute_deadline_us)
 				{
+					diagnostic_deadline_expired = true;
 					preflight_backpressure = true;
 					result = RESOURCE_X_APPLY_BAD_STATE;
 					break;
@@ -13276,8 +13439,10 @@ gcs_block_resource_x_target_acquire_internal(
 
 				for (;;) {
 					CHECK_FOR_INTERRUPTS();
+					diagnostic_head_expired = false;
 					now_us = gcs_block_pcm_x_monotonic_us();
 					if (now_us >= absolute_deadline_us) {
+						diagnostic_deadline_expired = true;
 						result = RESOURCE_X_APPLY_BAD_STATE;
 						break;
 					}
@@ -13325,6 +13490,7 @@ gcs_block_resource_x_target_acquire_internal(
 							diagnostic_stage = "target-install-preuse-wait";
 							now_us = gcs_block_pcm_x_monotonic_us();
 							if (now_us >= absolute_deadline_us) {
+								diagnostic_deadline_expired = true;
 								result = RESOURCE_X_APPLY_BAD_STATE;
 								break;
 							}
@@ -13368,6 +13534,7 @@ gcs_block_resource_x_target_acquire_internal(
 							diagnostic_stage = "target-install-continuation-wait";
 							now_us = gcs_block_pcm_x_monotonic_us();
 							if (now_us >= absolute_deadline_us) {
+								diagnostic_deadline_expired = true;
 								result = RESOURCE_X_APPLY_BAD_STATE;
 								break;
 							}
@@ -13556,6 +13723,7 @@ gcs_block_resource_x_target_acquire_internal(
 						}
 						now_us = gcs_block_pcm_x_monotonic_us();
 						if (now_us >= absolute_deadline_us) {
+							diagnostic_deadline_expired = true;
 							result = RESOURCE_X_APPLY_BAD_STATE;
 							break;
 						}
@@ -13801,6 +13969,7 @@ gcs_block_resource_x_target_acquire_internal(
 					diagnostic_stage = "retained-release-wait";
 					now_us = gcs_block_pcm_x_monotonic_us();
 					if (now_us >= absolute_deadline_us) {
+						diagnostic_deadline_expired = true;
 						if (target_retained_release_post_mutation)
 							gcs_block_resource_x_fail_closed_current();
 						result = target_retained_release_post_mutation
@@ -13893,6 +14062,15 @@ gcs_block_resource_x_target_acquire_internal(
 						cached_local_x ? own.generation : 0, &dispatch, &terminal_ref);
 
 			target_install_terminal_recheck:
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
+					&& cluster_pcm_rx_last_step_head_failure()
+						   == RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED)
+					diagnostic_head_expired = true;
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_WAIT && !diagnostic_join_recorded) {
+					cluster_pcm_rx_metric_note(PCM_RX_HEAD_JOIN);
+					cluster_pcm_vm_metric_note(&resource, PCM_VM_HEAD_JOIN);
+					diagnostic_join_recorded = true;
+				}
 					if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
 						diagnostic_stage = "terminal-recheck";
 						if (target_install_follow.valid) {
@@ -14069,6 +14247,7 @@ gcs_block_resource_x_target_acquire_internal(
 							absolute_deadline_us))
 						continue;
 					diagnostic_stage = "round-fail-closed";
+					diagnostic_deadline_expired = now_us >= absolute_deadline_us;
 					result = now_us >= absolute_deadline_us
 						? RESOURCE_X_APPLY_BAD_STATE
 						: RESOURCE_X_APPLY_STALE;
@@ -14090,6 +14269,7 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 					now_us = gcs_block_pcm_x_monotonic_us();
 					if (now_us >= absolute_deadline_us) {
+						diagnostic_deadline_expired = true;
 						result = RESOURCE_X_APPLY_BAD_STATE;
 						break;
 					}
@@ -14233,6 +14413,7 @@ gcs_block_resource_x_target_acquire_internal(
 					dispatch_recheck_wait:
 							now_us = gcs_block_pcm_x_monotonic_us();
 							if (now_us >= absolute_deadline_us) {
+								diagnostic_deadline_expired = true;
 								result = RESOURCE_X_APPLY_BAD_STATE;
 								break;
 							}
@@ -14252,6 +14433,9 @@ gcs_block_resource_x_target_acquire_internal(
 						result = RESOURCE_X_APPLY_STALE;
 						break;
 					}
+					cluster_pcm_rx_dispatch_note(
+						action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
+						|| action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 					if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST) {
 						diagnostic_stage = "dispatch-bootstrap-request";
 						stage_ok
@@ -14295,6 +14479,7 @@ gcs_block_resource_x_target_acquire_internal(
 				}
 				now_us = gcs_block_pcm_x_monotonic_us();
 				if (now_us >= absolute_deadline_us) {
+					diagnostic_deadline_expired = true;
 					result = RESOURCE_X_APPLY_BAD_STATE;
 					break;
 				}
@@ -14398,11 +14583,30 @@ gcs_block_resource_x_target_acquire_internal(
 	PG_CATCH();
 	{
 		memset(&target_install_follow, 0, sizeof(target_install_follow));
+		if (absolute_deadline_us >= diagnostic_caller_budget_us
+			&& absolute_deadline_us != UINT64_MAX) {
+			uint64 ended_us = gcs_block_pcm_x_monotonic_us();
+			uint64 began_us = absolute_deadline_us - diagnostic_caller_budget_us;
+
+			if (ended_us >= began_us)
+				cluster_pcm_wait_margin_note_exact(false, ended_us - began_us,
+												   diagnostic_caller_budget_us, &resource,
+												   cluster_node_id, diagnostic_stage, 0, ended_us);
+		}
 		cluster_semantic_activation_leave(&admission);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	memset(&target_install_follow, 0, sizeof(target_install_follow));
+	if (absolute_deadline_us >= diagnostic_caller_budget_us && absolute_deadline_us != UINT64_MAX) {
+		uint64 ended_us = gcs_block_pcm_x_monotonic_us();
+		uint64 began_us = absolute_deadline_us - diagnostic_caller_budget_us;
+
+		if (ended_us >= began_us)
+			cluster_pcm_wait_margin_note_exact(
+				false, ended_us - began_us, diagnostic_caller_budget_us, &resource, cluster_node_id,
+				diagnostic_stage, diagnostic_request_sequence, ended_us);
+	}
 	cluster_semantic_activation_leave(&admission);
 	if (result != RESOURCE_X_APPLY_APPLIED && !first_failure_recorded) {
 		memset(&failure_round, 0, sizeof(failure_round));
@@ -14504,6 +14708,18 @@ gcs_block_resource_x_target_acquire_internal(
 						   (unsigned long long)own.resource_x_activation_generation,
 						   (unsigned long long)now_us,
 						   (unsigned long long)absolute_deadline_us)));
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
+		gcs_resource_x_acquire_diagnostic.buffer_id = buf->buf_id;
+		gcs_resource_x_acquire_diagnostic.result = result;
+		/* The diagnostic request sequence is not the protocol attempt. The
+		 * latter can be unavailable on a rejected follower; preserve zero. */
+		gcs_resource_x_acquire_diagnostic.attempt = 0;
+		gcs_resource_x_acquire_diagnostic.reason = cluster_gcs_resource_x_acquire_failure_reason(
+			diagnostic_head_expired, diagnostic_deadline_expired, result);
+		gcs_resource_x_acquire_diagnostic.valid = true;
+		if (diagnostic_deadline_expired && !diagnostic_head_expired)
+			cluster_pcm_rx_metric_note(PCM_RX_FOLLOWER_DEADLINE);
+	}
 	return result;
 }
 
@@ -21764,16 +21980,18 @@ cluster_gcs_block_on_epoch_advance_exact(
 	if (!gcs_block_resource_x_reconfig_epoch(new_epoch, dead_requester_bitmap)) {
 		gcs_block_resource_x_fail_closed_current();
 		cluster_resource_x_reconfig_stats_snapshot(&resource_x_stats);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("Resource-X reconfiguration blocked epoch %llu",
-						(unsigned long long)new_epoch),
-				 errdetail("freeze=%llu examined=%llu orphan=%llu stale=%llu blocked=%llu",
-						   (unsigned long long)resource_x_stats.freeze_count,
-						   (unsigned long long)resource_x_stats.slot_examined_count,
-						   (unsigned long long)resource_x_stats.orphan_count,
-						   (unsigned long long)resource_x_stats.sidecar_stale_count,
-						   (unsigned long long)resource_x_stats.blocked_count)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("Resource-X reconfiguration blocked epoch %llu", (unsigned long long)new_epoch),
+			 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN PGRAC_NODE=%d "
+					   "PGRAC_ATTEMPT=0 "
+					   "freeze=%llu examined=%llu orphan=%llu stale=%llu blocked=%llu",
+					   cluster_node_id, (unsigned long long)resource_x_stats.freeze_count,
+					   (unsigned long long)resource_x_stats.slot_examined_count,
+					   (unsigned long long)resource_x_stats.orphan_count,
+					   (unsigned long long)resource_x_stats.sidecar_stale_count,
+					   (unsigned long long)resource_x_stats.blocked_count)));
 	}
 	(void)cluster_gcs_block_dedup_r4_route_sweep_epoch(new_epoch);
 	if (gcs_block_backend_blocks == NULL || ClusterGcsBlock == NULL)

@@ -80,6 +80,7 @@ static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
 static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
 static char captured_dump_key_storage[CAPTURED_DUMP_ROWS_MAX][128];
 static const char *captured_dump_values[CAPTURED_DUMP_ROWS_MAX];
+static char captured_dump_value_storage[CAPTURED_DUMP_ROWS_MAX][512];
 static int captured_dump_row_count;
 static char captured_formatted_values[CAPTURED_FORMATTED_VALUES_MAX][128];
 static int captured_formatted_value_count;
@@ -1062,6 +1063,66 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 }
 
 static bool reply_wait_stats_available = true;
+static bool wait_margin_stats_available = true;
+static bool vm_stats_available = false;
+
+bool
+cluster_pcm_rx_stats_snapshot(PcmRxStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!wait_margin_stats_available)
+		return false;
+	out->count[PCM_RX_HEAD_CREATE] = 17;
+	out->count[PCM_RX_FOLLOWER_REJECT_MUTATION] = 2;
+	return true;
+}
+
+bool
+cluster_pcm_vm_stats_snapshot(PcmVmStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!vm_stats_available)
+		return false;
+	out->tag_valid = true;
+	out->tag.spcOid = 1663;
+	out->tag.dbOid = 5;
+	out->tag.relNumber = 16386;
+	out->tag.forkNum = VISIBILITYMAP_FORKNUM;
+	out->tag.blockNum = 0;
+	out->other_tag_observations = 7;
+	out->clear_bitmap[0] = UINT64_C(1) | (UINT64_C(1) << 63);
+	out->clear_bitmap[1] = UINT64_C(8);
+	out->count[PCM_VM_X_REQUEST] = 12;
+	out->count[PCM_VM_INSTALL_COMPLETE] = 3;
+	out->count[PCM_VM_REMOTE_X_TRANSFER] = 2;
+	out->latency_count[0] = 3;
+	out->latency_histogram[0][5] = 3;
+	return true;
+}
+
+bool
+cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!wait_margin_stats_available)
+		return false;
+	out->elapsed_us[0] = 300;
+	out->budget_us[0] = 500;
+	out->elapsed_us[1] = 700;
+	out->budget_us[1] = 1000;
+	out->sample_count[0] = 3;
+	out->sample_count[1] = 1;
+	out->observation[0].valid = true;
+	out->observation[0].tag.spcOid = 1663;
+	out->observation[0].tag.dbOid = 5;
+	out->observation[0].tag.relNumber = 16384;
+	out->observation[0].tag.forkNum = 2;
+	out->observation[0].requester_node = 1;
+	out->observation[0].attempt = 9;
+	out->observation[0].monotonic_us = 1234;
+	strlcpy(out->observation[0].phase, "round-wait", sizeof(out->observation[0].phase));
+	return true;
+}
 
 bool
 cluster_undo_block0_reply_wait_stats_snapshot(ClusterUndoBlock0ReplyWaitStats *out)
@@ -3388,7 +3449,15 @@ tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
 			 sizeof(captured_dump_key_storage[0]), "%s", (const char *)DatumGetPointer(values[1]));
 	captured_dump_keys[captured_dump_row_count]
 		= captured_dump_key_storage[captured_dump_row_count];
-	captured_dump_values[captured_dump_row_count] = (const char *)DatumGetPointer(values[2]);
+	/* Values such as exact tags/phases can also be stack-backed. Match the
+	 * production tuplestore's ownership instead of retaining those addresses. */
+	UT_ASSERT(strlen((const char *)DatumGetPointer(values[2]))
+			  < sizeof(captured_dump_value_storage[0]));
+	snprintf(captured_dump_value_storage[captured_dump_row_count],
+			 sizeof(captured_dump_value_storage[0]), "%s",
+			 (const char *)DatumGetPointer(values[2]));
+	captured_dump_values[captured_dump_row_count]
+		= captured_dump_value_storage[captured_dump_row_count];
 	captured_dump_row_count++;
 }
 
@@ -4934,6 +5003,86 @@ UT_TEST(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int available;
+
+	for (available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		wait_margin_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "wait_margin_stats_available"), 1);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "follower_wait_max_ratio_budget_us"), available);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "rx_stats_available"), 1);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "head_create_count"), available);
+		if (available) {
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "head_create_count"), "17");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_reject_shared_mutation_count"),
+							 "2");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_elapsed_us"),
+							 "300");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_budget_us"),
+							 "500");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "head_no_progress_max_ratio_elapsed_us"),
+							 "700");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "head_no_progress_max_ratio_budget_us"),
+							 "1000");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_tag"),
+							 "1663/5/16384/2/0");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_requester_node"),
+							 "1");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_phase"),
+							 "round-wait");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "follower_wait_max_ratio_monotonic_us"),
+							 "1234");
+			UT_ASSERT_STR_EQ(
+				captured_dump_value("pcm", "head_no_progress_max_ratio_metadata_available"),
+				"false");
+			UT_ASSERT_EQ(captured_dump_count("pcm", "head_no_progress_max_ratio_tag"), 0);
+		}
+	}
+}
+
+UT_TEST(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int available;
+
+	for (available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		vm_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "vm_stats_available"), 1);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "vm_x_request_count"), available);
+		if (available) {
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_observed_tag"), "1663/5/16386/2/0");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_other_tag_observations"), "7");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_unique_heap_blocks_cleared"), "3");
+			UT_ASSERT_NOT_NULL(captured_dump_value("pcm", "vm_clear_bitmap_00"));
+			if (captured_dump_value("pcm", "vm_clear_bitmap_00") != NULL)
+				UT_ASSERT(strncmp(captured_dump_value("pcm", "vm_clear_bitmap_00"),
+								  "80000000000000010000000000000008", 32)
+						  == 0);
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_x_request_count"), "12");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_x_acquisition_completed_count"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_inter_node_transfer_count"), "2");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_acquisition_latency_hist_05"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_remote_x_latency_hist_05"), "0");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -5620,13 +5769,15 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
 	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
+	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
+	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);

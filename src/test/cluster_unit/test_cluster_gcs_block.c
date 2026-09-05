@@ -5159,6 +5159,8 @@ UT_TEST(test_r4_tx_origin_first_denial_records_exact_local_phase)
 		reply_contract, lengthof(reply_contract));
 	UT_ASSERT_NOT_NULL(strstr(source, "context->canonical_sampled"));
 	UT_ASSERT_NOT_NULL(strstr(source, "context->expected_generation.value"));
+	UT_ASSERT_NOT_NULL(strstr(source, "current_failure=%d"));
+	UT_ASSERT_NOT_NULL(strstr(source, "context->current_failure = failure"));
 	free(source);
 }
 
@@ -6987,6 +6989,36 @@ UT_TEST(test_resource_x_high_rate_diagnostics_are_time_sampled)
 	free(pcm_source);
 }
 
+UT_TEST(test_resource_x_client_reason_is_exact_and_not_guessed_from_bad_state)
+{
+	char *gcs_source = read_gcs_block_source();
+	char *bufmgr_source = read_source_path(BUFMGR_SOURCE_PATH);
+
+	UT_ASSERT_STR_EQ(cluster_gcs_resource_x_acquire_failure_reason(
+						 true, false, RESOURCE_X_APPLY_RECOVERY_BLOCKED),
+					 "HEAD_NO_PROGRESS_EXPIRED");
+	UT_ASSERT_STR_EQ(
+		cluster_gcs_resource_x_acquire_failure_reason(false, true, RESOURCE_X_APPLY_BAD_STATE),
+		"FOLLOWER_DEADLINE_EXPIRED");
+	UT_ASSERT_STR_EQ(
+		cluster_gcs_resource_x_acquire_failure_reason(false, false, RESOURCE_X_APPLY_BAD_STATE),
+		"ACQUIRE_FAILURE_CAUSE_UNPROVEN");
+	UT_ASSERT_NOT_NULL(gcs_source);
+	UT_ASSERT_NOT_NULL(bufmgr_source);
+	if (gcs_source != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "diagnostic_deadline_expired = true;"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "gcs_resource_x_acquire_diagnostic.valid = false;"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_last_step_head_failure()"));
+	}
+	if (bufmgr_source != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(bufmgr_source, "PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s"));
+		UT_ASSERT_NOT_NULL(
+			strstr(bufmgr_source, "cluster_gcs_resource_x_take_acquire_failure_reason("));
+	}
+	free(gcs_source);
+	free(bufmgr_source);
+}
+
 UT_TEST(test_read_image_shared_marker_has_one_bufmgr_product_publisher)
 {
 	static const char *const marker_assignment
@@ -7091,7 +7123,7 @@ UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
 int
 main(void)
 {
-	UT_PLAN(124);
+	UT_PLAN(125);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7215,6 +7247,7 @@ main(void)
 	UT_RUN(test_resource_x_target_waits_for_exact_post_release_settlement_window);
 	UT_RUN(test_recovering_denial_records_exact_master_gate_predicates);
 	UT_RUN(test_resource_x_high_rate_diagnostics_are_time_sampled);
+	UT_RUN(test_resource_x_client_reason_is_exact_and_not_guessed_from_bad_state);
 	UT_RUN(test_read_image_shared_marker_has_one_bufmgr_product_publisher);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

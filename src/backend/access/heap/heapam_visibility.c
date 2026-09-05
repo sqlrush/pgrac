@@ -110,6 +110,7 @@
 #include "cluster/cluster_catalog_stats.h"		/* vis_unknown counter (spec-6.14 D10b) */
 #include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
+#include "cluster/cluster_gcs_block.h"			/* current block write permission */
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
 #include "cluster/cluster_itl_cleanout.h"		/* cluster_itl_cleanout_lazy (spec-3.4c D4) */
 #include "cluster/cluster_itl_slot.h"			/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -193,7 +194,10 @@ cluster_foreign_xmax_state(Buffer buffer, HeapTupleHeader tuple,
 	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 					errmsg("cluster TT status unknown for xmax %u", raw_xmax),
 					errhint("Remote commit_scn not yet propagated, or TT overlay "
-							"missed/stale; retry or abort.")));
+							"missed/stale; retry or abort."),
+					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							  cluster_node_id)));
 	return CLUSTER_FOREIGN_XMAX_NOT_DELETED; /* unreachable */
 }
 #else /* !USE_PGRAC_CLUSTER */
@@ -289,6 +293,16 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 void
 cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
 {
+	/* A proved terminal transaction is not itself permission to mutate a
+	 * retained/read image.  MarkBufferDirtyHint's refusal comes too late to
+	 * protect tuple bytes; check the existing writer gate before the store. */
+	if (!cluster_bufmgr_block_write_permitted(buffer))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("released xmax cannot be normalized without block write authority"),
+						errdetail("PGRAC_FAMILY=RESOURCE_X "
+								  "PGRAC_REASON=RELEASED_XMAX_WRITE_NOT_PERMITTED "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+								  cluster_node_id)));
 	tuple->t_infomask |= HEAP_XMAX_INVALID;
 	MarkBufferDirtyHint(buffer, true);
 }
@@ -364,7 +378,10 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
 	case CLUSTER_VIS_ROUTE_NATIVE:
@@ -380,7 +397,10 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 	case CVV_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		break;
 	default:
 		break; /* CVV_VISIBLE: xmin committed, check xmax for deletion */
@@ -410,9 +430,13 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 										   TransactionIdIsCurrentTransactionId(raw_xmax))) {
 		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			raw_xid = raw_xmax;
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xid %u", raw_xid),
-							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for xid %u", raw_xid),
+					 errhint("Remote commit_scn not yet propagated; retry or abort."),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 			switch (cluster_vis_self_verdict(xr.status)) {
@@ -421,9 +445,13 @@ cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
 				return true;
 			case CVV_FAILCLOSED_UNKNOWN: {
 				raw_xid = raw_xmax;
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								errmsg("cluster TT status unknown for xid %u", raw_xid),
-								errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for xid %u", raw_xid),
+						 errhint("Remote commit_scn not yet propagated; retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				break;
 			}
 			default:
@@ -672,7 +700,10 @@ cluster_satisfies_toast_fork(HeapTuple htup, Buffer buffer, bool *visible)
 	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
 	case CLUSTER_VIS_ROUTE_NATIVE:
@@ -688,7 +719,10 @@ cluster_satisfies_toast_fork(HeapTuple htup, Buffer buffer, bool *visible)
 	case CVV_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		break;
 	default:
 		*visible = true; /* CVV_VISIBLE */
@@ -865,9 +899,13 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 				*res = TM_Invisible;
 				return true;
 			case CVV_FAILCLOSED_UNKNOWN:
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								errmsg("cluster TT status unknown for xmin %u", raw_xmin),
-								errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for xmin %u", raw_xmin),
+						 errhint("Remote commit_scn not yet propagated; retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				break;
 			case CVV_VISIBLE:
 				xmin_remote_visible = true;
@@ -984,6 +1022,11 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 				? cluster_vis_update_lock_only_xmax_verdict(r.status)
 				: cluster_vis_update_xmax_verdict(r.status, is_delete)) {
 		case CVV_VISIBLE:
+			/* HTSU may encounter ABORT directly or after the wait bridge
+			 * restarts qualification.  Both bypass the bridge caller's
+			 * normalization, but native xmax composition still requires it.
+			 * Only a proved abort or released lock reaches this verdict. */
+			cluster_heap_stamp_released_xmax_invalid(tuple, buffer);
 			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Ok;
 			return true;
@@ -999,9 +1042,13 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 			*res = TM_BeingModified; /* -> D2b bridge (writer 53R9H / lock-only 53R98) */
 			return true;
 		case CVV_FAILCLOSED_UNKNOWN:
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xmax %u", raw_xmax),
-							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for xmax %u", raw_xmax),
+					 errhint("Remote commit_scn not yet propagated; retry or abort."),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		default:
 			break;
@@ -1021,7 +1068,10 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 	if (cluster_xid_provably_foreign(raw_xmax))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xmax %u", raw_xmax),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 
 	/*
 	 * xmax NONE/LOCAL.  If xmin is remote-committed we MUST NOT fall through
@@ -1332,7 +1382,10 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT status unknown for xid %u", raw_xid),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+						errhint("Remote commit_scn not yet propagated; retry or abort."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
 	case CLUSTER_VIS_ROUTE_NATIVE:
@@ -1349,9 +1402,13 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			*visible = false;
 			return true;
 		case CVV_FAILCLOSED_UNKNOWN:
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xid %u", raw_xid),
-							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for xid %u", raw_xid),
+					 errhint("Remote commit_scn not yet propagated; retry or abort."),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		default:
 			break; /* CVV_VISIBLE: xmin committed, check xmax */
@@ -1389,9 +1446,13 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 										   TransactionIdIsCurrentTransactionId(raw_xmax))) {
 		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			raw_xid = raw_xmax;
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xid %u", raw_xid),
-							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for xid %u", raw_xid),
+					 errhint("Remote commit_scn not yet propagated; retry or abort."),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 			break;
 		case CLUSTER_VIS_ROUTE_NATIVE_SELF:
 			*visible = false; /* deleted by self */
@@ -1419,9 +1480,13 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 				return true;
 			case CVV_FAILCLOSED_UNKNOWN:
 				raw_xid = raw_xmax;
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								errmsg("cluster TT status unknown for xid %u", raw_xid),
-								errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for xid %u", raw_xid),
+						 errhint("Remote commit_scn not yet propagated; retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 				break;
 			default:
 				*visible = true;
@@ -1888,10 +1953,11 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 static pg_attribute_noreturn() void
 cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-			 errmsg("cluster TT status unknown for R4 scratch xid %u: %s",
-					xid, reason)));
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					errmsg("cluster TT status unknown for R4 scratch xid %u: %s", xid, reason),
+					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							  cluster_node_id)));
 	pg_unreachable();
 }
 
@@ -2213,13 +2279,18 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						 * invisible.  Same 53R97 surface as the steady-state TT
 						 * path below so callers see one fail-closed contract.
 						 */
-					ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-									errmsg("cluster TT status unknown for a materialized "
-										   "remote-origin tuple"),
-									errhint("The peer's transaction was materialized by merged "
-											"recovery but its commit outcome is in-doubt (stamped "
-											"then crashed before commit/abort); retry after the "
-											"origin completes recovery, or abort.")));
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for a materialized "
+								"remote-origin tuple"),
+						 errhint("The peer's transaction was materialized by merged "
+								 "recovery but its commit outcome is in-doubt (stamped "
+								 "then crashed before commit/abort); retry after the "
+								 "origin completes recovery, or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 					break; /* unreachable */
 				case CLUSTER_CR_NOT_APPLICABLE:
 					break; /* continue to the remote-xid / native paths */
@@ -2234,11 +2305,15 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		 * (uint32) cast (R9 P2).
 		 */
 		if (snapshot->read_epoch != cluster_epoch_get_current())
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster snapshot stale across reconfig"),
-							errhint("snapshot.read_epoch=" UINT64_FORMAT
-									" current epoch=" UINT64_FORMAT "; retry transaction.",
-									snapshot->read_epoch, cluster_epoch_get_current())));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster snapshot stale across reconfig"),
+					 errhint("snapshot.read_epoch=" UINT64_FORMAT " current epoch=" UINT64_FORMAT
+							 "; retry transaction.",
+							 snapshot->read_epoch, cluster_epoch_get_current()),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 
 		/* P0-27: VACUUM's exact FROZEN bit pair is already a durable
 		 * xmin-committed proof.  Do not turn that terminal cleanout back into
@@ -2256,7 +2331,10 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						 errmsg("cluster TT status unknown for deleting xmax of xid %u",
 								HeapTupleHeaderGetRawXmax(tuple)),
 						 errhint("Exact deleter authority is not currently provable; "
-								 "retry or abort.")));
+								 "retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			}
 		}
 
@@ -2356,12 +2434,17 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 						case 0:
 							return false;
 						default:
-							ereport(ERROR,
-									(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-									 errmsg("cluster TT status unknown for deleting xmax of xid %u",
-											HeapTupleHeaderGetRawXmax(tuple)),
-									 errhint("Exact deleter authority is not currently provable; "
-											 "retry or abort.")));
+							ereport(
+								ERROR,
+								(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+								 errmsg("cluster TT status unknown for deleting xmax of xid %u",
+										HeapTupleHeaderGetRawXmax(tuple)),
+								 errhint("Exact deleter authority is not currently provable; "
+										 "retry or abort."),
+								 errdetail(
+									 "PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+									 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+									 cluster_node_id)));
 						}
 						return true; /* unreachable */
 					}
@@ -2451,10 +2534,14 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				 * (xmin_overlay_verdict_ask - hit): every ask that did not
 				 * prove a terminal state fell through to here (D5 / census).
 				 */
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								errmsg("cluster TT status unknown for xid %u", raw_xmin),
-								errhint("Remote commit_scn not yet propagated, or TT "
-										"overlay missed/stale; retry or abort.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for xid %u", raw_xmin),
+						 errhint("Remote commit_scn not yet propagated, or TT "
+								 "overlay missed/stale; retry or abort."),
+						 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								   cluster_node_id)));
 			}
 		}
 		/* else: ref placeholder / local origin / no ITL slot ->
@@ -2600,7 +2687,10 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							   "with cluster.shared_catalog enabled"),
 						errhint("Catalog services on this node are not ready yet (starting up, "
 								"shutting down, or in recovery); retry once the cluster reaches "
-								"the RUNNING phase.")));
+								"the RUNNING phase."),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+								  cluster_node_id)));
 	}
 #endif /* USE_PGRAC_CLUSTER */
 
@@ -2741,11 +2831,15 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		case 0:
 			return false;
 		default:
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for deleting xmax of xid %u",
-								   HeapTupleHeaderGetRawXmax(tuple)),
-							errhint("Exact deleter authority is not currently provable; "
-									"retry or abort.")));
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for deleting xmax of xid %u",
+							HeapTupleHeaderGetRawXmax(tuple)),
+					 errhint("Exact deleter authority is not currently provable; "
+							 "retry or abort."),
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
+							   cluster_node_id)));
 		}
 	}
 #endif
