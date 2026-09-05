@@ -134,6 +134,19 @@ static int outbound_event;
 static int reply_delete_calls;
 static int reply_poll_calls;
 static int reply_sleep_calls;
+static ClusterUndoBlock0ReplyWaitStats reply_wait_stats;
+
+void
+cluster_undo_block0_reply_wait_metric_add(ClusterUndoBlock0ReplyWaitSite site,
+										  ClusterUndoBlock0ReplyWaitMetric metric)
+{
+	UT_ASSERT((unsigned)site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT);
+	UT_ASSERT((unsigned)metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT);
+	if ((unsigned)site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT
+		&& (unsigned)metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT)
+		reply_wait_stats.count[site][metric]++;
+}
+static int fake_reply_wait_held_tranche;
 static int reservation_cancel_calls;
 static int waiter_cancel_calls;
 static int local_release_calls;
@@ -545,6 +558,17 @@ cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms,
 	last_sleep_timeout_ms = timeout_ms;
 	last_sleep_wait_event = wait_event;
 	return true;
+}
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (fake_reply_wait_held_tranche != 0) {
+		LWLock held = { 0 };
+
+		held.tranche = fake_reply_wait_held_tranche;
+		callback(&held, LW_EXCLUSIVE, context);
+	}
 }
 
 bool
@@ -1059,6 +1083,8 @@ reset_fixture(void)
 	event_sequence = reserve_event = insert_event = outbound_event = 0;
 	reserve_calls = 0;
 	reply_delete_calls = reply_poll_calls = reply_sleep_calls = 0;
+	memset(&reply_wait_stats, 0, sizeof(reply_wait_stats));
+	fake_reply_wait_held_tranche = 0;
 	reservation_cancel_calls = waiter_cancel_calls = local_release_calls = 0;
 	mirror_release_calls = cancel_wait_calls = cleanup_release_calls = 0;
 	generic_promote_calls = remote_promote_calls = 0;
@@ -1164,7 +1190,8 @@ UT_TEST(test_wait_reply_uses_exact_acquire_and_release_keys)
 		&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000, &guard, &failure),
 		CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
 	acquire_key = last_insert_key;
-	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
 	UT_ASSERT_EQ(reply_sleep_calls, 1);
 	UT_ASSERT_EQ(memcmp(&last_sleep_key, &acquire_key, sizeof(acquire_key)), 0);
 	UT_ASSERT_EQ(last_sleep_key.request_opcode, GES_REQ_OPCODE_REQUEST);
@@ -1176,7 +1203,8 @@ UT_TEST(test_wait_reply_uses_exact_acquire_and_release_keys)
 				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
 	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&guard, &failure),
 				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
-	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
 	UT_ASSERT_EQ(reply_sleep_calls, 2);
 	UT_ASSERT_EQ(last_sleep_key.request_id, acquire_key.request_id);
 	UT_ASSERT_EQ(last_sleep_key.source_node_id, acquire_key.source_node_id);
@@ -1186,8 +1214,124 @@ UT_TEST(test_wait_reply_uses_exact_acquire_and_release_keys)
 
 	UT_ASSERT_EQ(cluster_undo_block0_current_release_poll(&guard, &failure),
 				 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
-	UT_ASSERT(!cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT(!cluster_undo_block0_current_wait_reply(&guard,
+													  CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
 	UT_ASSERT_EQ(reply_sleep_calls, 2);
+}
+
+UT_TEST(test_wait_reply_never_rounds_up_remaining_deadline)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	TimestampTz deadline;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	deadline = current_guard_data(&guard)->deadline;
+	fake_now = deadline - 999;
+	/* true here suppresses the caller's 1ms fallback; it is never a grant. */
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
+	UT_ASSERT_EQ(reply_sleep_calls, 0);
+	UT_ASSERT_EQ(current_guard_data(&guard)->deadline, deadline);
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	fake_now = deadline;
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
+	UT_ASSERT_EQ(reply_sleep_calls, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
+}
+
+UT_TEST(test_wait_reply_wake_is_only_a_repoll_hint)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	TimestampTz deadline;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	deadline = current_guard_data(&guard)->deadline;
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
+	UT_ASSERT_EQ(reply_poll_calls, 0);
+	UT_ASSERT_EQ(reply_delete_calls, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(current_guard_data(&guard)->deadline, deadline);
+	UT_ASSERT_EQ(current_guard_data(&guard)->phase, CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT);
+	cluster_undo_block0_current_cancel(&guard);
+}
+
+UT_TEST(test_reply_wait_counters_measure_real_repoll_and_violation)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	uint64 *counts = reply_wait_stats.count[CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE];
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_ELIGIBLE], UINT64_C(1));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_CV], UINT64_C(1));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_WAKE_REPOLL], UINT64_C(0));
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_WAKE_REPOLL], UINT64_C(1));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_POLL_VIOLATION], UINT64_C(0));
+	/* Mutation control: skip the required adapter between eligible polls. */
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_POLL_VIOLATION], UINT64_C(1));
+	fake_now = current_guard_data(&guard)->deadline - 999;
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard,
+													 CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_CV], UINT64_C(1));
+	UT_ASSERT_EQ(counts[CLUSTER_UNDO_BLOCK0_WAIT_BUDGET_REPOLL], UINT64_C(1));
+	cluster_undo_block0_current_cancel(&guard);
+}
+
+UT_TEST(test_reply_wait_site_and_lock_boundaries)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	int site;
+
+	reset_fixture();
+	UT_ASSERT_EQ(CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT, 15);
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT(!cluster_undo_block0_current_wait_reply(&guard, (ClusterUndoBlock0ReplyWaitSite)-1));
+	UT_ASSERT(!cluster_undo_block0_current_wait_reply(&guard, CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT));
+	UT_ASSERT_EQ(reply_sleep_calls, 0);
+	for (site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++)
+		UT_ASSERT(
+			cluster_undo_block0_current_wait_reply(&guard, (ClusterUndoBlock0ReplyWaitSite)site));
+	UT_ASSERT_EQ(reply_sleep_calls, 15);
+#ifdef USE_ASSERT_CHECKING
+	UT_ASSERT(current_reply_wait_locks_safe());
+	fake_reply_wait_held_tranche = LWTRANCHE_CLUSTER_UNDO_BUF;
+	UT_ASSERT(!current_reply_wait_locks_safe());
+	fake_reply_wait_held_tranche = LWTRANCHE_CLUSTER_GES_REPLY_WAIT;
+	UT_ASSERT(!current_reply_wait_locks_safe());
+	fake_reply_wait_held_tranche = LWTRANCHE_CLUSTER_TT_SLOT;
+	UT_ASSERT(!current_reply_wait_locks_safe());
+	fake_reply_wait_held_tranche = 0;
+#endif
+	cluster_undo_block0_current_cancel(&guard);
 }
 
 UT_TEST(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type)
@@ -2959,9 +3103,13 @@ UT_TEST(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(71);
 	UT_RUN(test_key_guard_and_phase_abi);
 	UT_RUN(test_wait_reply_uses_exact_acquire_and_release_keys);
+	UT_RUN(test_wait_reply_never_rounds_up_remaining_deadline);
+	UT_RUN(test_wait_reply_wake_is_only_a_repoll_hint);
+	UT_RUN(test_reply_wait_site_and_lock_boundaries);
+	UT_RUN(test_reply_wait_counters_measure_real_repoll_and_violation);
 	UT_RUN(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type);
 	UT_RUN(test_live_owner_resident_preregisters_persistent_exit_hooks);
 	UT_RUN(test_batch_preflight_and_eight_defensive_ensures_register_once);

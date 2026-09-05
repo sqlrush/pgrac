@@ -37,6 +37,45 @@ typedef enum ClusterUndoBlock0CurrentStep {
 	CLUSTER_UNDO_BLOCK0_CURRENT_FAILED = 3
 } ClusterUndoBlock0CurrentStep;
 
+/* Stable, process-local diagnostic labels; never part of a reply key. */
+typedef enum ClusterUndoBlock0ReplyWaitSite {
+	CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE = 0,
+	CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_RELEASE,
+	CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE,
+	CLUSTER_UNDO_BLOCK0_WAIT_TT_COMMIT_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_MUTATE,
+	CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_REUSE,
+	CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_RECYCLE,
+	CLUSTER_UNDO_BLOCK0_WAIT_TT_ACTIVE_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_RELEASE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_RELEASE_SAMPLE_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_RELEASE_SAMPLE_RELEASE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CERTIFICATE_ACQUIRE,
+	CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CERTIFICATE_RELEASE,
+	CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT
+} ClusterUndoBlock0ReplyWaitSite;
+
+/* Diagnostic-only buckets.  They never participate in a key or verdict. */
+typedef enum ClusterUndoBlock0ReplyWaitMetric {
+	CLUSTER_UNDO_BLOCK0_WAIT_ELIGIBLE = 0,
+	CLUSTER_UNDO_BLOCK0_WAIT_CV,
+	CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK,
+	CLUSTER_UNDO_BLOCK0_WAIT_WAKE_REPOLL,
+	CLUSTER_UNDO_BLOCK0_WAIT_POLL_VIOLATION,
+	CLUSTER_UNDO_BLOCK0_WAIT_BUDGET_REPOLL,
+	CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT
+} ClusterUndoBlock0ReplyWaitMetric;
+
+typedef struct ClusterUndoBlock0ReplyWaitStats {
+	uint64 count[CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT][CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT];
+} ClusterUndoBlock0ReplyWaitStats;
+
+extern void cluster_undo_block0_reply_wait_metric_add(ClusterUndoBlock0ReplyWaitSite site,
+													  ClusterUndoBlock0ReplyWaitMetric metric);
+extern bool cluster_undo_block0_reply_wait_stats_snapshot(ClusterUndoBlock0ReplyWaitStats *out);
+
 typedef enum ClusterUndoBlock0RecycleResult {
 	CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED = 0,
 	CLUSTER_UNDO_BLOCK0_RECYCLE_ALREADY = 1,
@@ -95,8 +134,8 @@ cluster_undo_block0_current_acquire_begin_live_owner_target(
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 										ClusterUndoBlock0Result *failure);
-extern bool cluster_undo_block0_current_wait_reply(
-	ClusterUndoBlock0CurrentGuard *guard);
+extern bool cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard,
+												   ClusterUndoBlock0ReplyWaitSite site);
 extern void cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,

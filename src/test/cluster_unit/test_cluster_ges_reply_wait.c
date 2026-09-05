@@ -15,6 +15,7 @@
 
 #include <string.h>
 
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_xnode_profile.h"
@@ -52,6 +53,8 @@ ErrorContextCallback *error_context_stack = NULL;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 
@@ -127,6 +130,9 @@ static int fake_cv_cancel_calls;
 static ConditionVariable *fake_cv_target;
 static long fake_cv_timeout_ms;
 static uint32 fake_cv_wait_event;
+static bool fake_delivery_during_sleep;
+static bool fake_error_during_sleep;
+static int fake_cv_broadcast_calls;
 static union {
 	uint64 force_align;
 	char data[4096];
@@ -259,6 +265,7 @@ void
 ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 {
 	Assert(fake_lock_depth == 0);
+	fake_cv_broadcast_calls++;
 }
 
 void
@@ -278,6 +285,22 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long timeout_ms,
 	fake_cv_timed_sleep_calls++;
 	fake_cv_timeout_ms = timeout_ms;
 	fake_cv_wait_event = wait_event;
+	if (fake_delivery_during_sleep) {
+		GesReplyWaitEntry *entry
+			= (GesReplyWaitEntry *)((char *)cv - offsetof(GesReplyWaitEntry, cv));
+		GesReplyWaitKey key = entry->key;
+
+		/* Even a past-deadline live waiter cannot be removed by the sweeper. */
+		UT_ASSERT_EQ(cluster_ges_reply_wait_sweep_timeout(INT64_MAX), 0);
+		UT_ASSERT_EQ(cluster_ges_reply_wait_lookup(&key), entry);
+		UT_ASSERT_EQ(
+			cluster_ges_reply_wait_deliver(&key, GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE),
+			GES_REPLY_DELIVER_WOKE);
+		UT_ASSERT_EQ(cluster_ges_reply_wait_lookup(&key), entry);
+		UT_ASSERT_EQ(fake_cv_target, cv);
+	}
+	if (fake_error_during_sleep)
+		siglongjmp(*PG_exception_stack, 1);
 	return true;
 }
 
@@ -328,6 +351,9 @@ reset_reply_wait_with_cap(int max_entries)
 	fake_cv_target = NULL;
 	fake_cv_timeout_ms = 0;
 	fake_cv_wait_event = 0;
+	fake_delivery_during_sleep = false;
+	fake_error_during_sleep = false;
+	fake_cv_broadcast_calls = 0;
 	cluster_ges_reply_wait_max_entries = max_entries;
 	cluster_ges_reply_wait_shmem_init();
 }
@@ -513,10 +539,74 @@ UT_TEST(test_sleep_exact_refuses_missing_and_abandoned_keys)
 	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
 }
 
+UT_TEST(test_registered_reply_wait_delivers_without_deleting_live_entry)
+{
+	GesReplyWaitKey key = make_key(90, 0, 1, GES_REQ_OPCODE_REQUEST, 3);
+	GesReplyWaitVerdict verdict;
+
+	reset_reply_wait();
+	UT_ASSERT(cluster_ges_reply_wait_insert(&key, 1) != NULL);
+	fake_delivery_during_sleep = true;
+	UT_ASSERT(cluster_ges_reply_wait_sleep_exact(&key, 1, 0x1234U));
+	UT_ASSERT_EQ(fake_cv_broadcast_calls, 1);
+	UT_ASSERT_EQ(fake_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(fake_cv_cancel_calls, 1);
+	UT_ASSERT(fake_cv_target == NULL);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), UINT64_C(1));
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
+				 GES_REPLY_WAIT_POLL_DELIVERED);
+	UT_ASSERT_EQ(verdict.reply_opcode, GES_REPLY_OPCODE_GRANT);
+}
+
+UT_TEST(test_reply_ready_before_enrollment_skips_sleep_but_requires_poll)
+{
+	GesReplyWaitKey key = make_key(91, 0, 1, GES_REQ_OPCODE_RELEASE, 3);
+	GesReplyWaitVerdict verdict;
+
+	reset_reply_wait();
+	UT_ASSERT(cluster_ges_reply_wait_insert(&key, 10000) != NULL);
+	UT_ASSERT_EQ(
+		cluster_ges_reply_wait_deliver(&key, GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE),
+		GES_REPLY_DELIVER_WOKE);
+	UT_ASSERT(cluster_ges_reply_wait_sleep_exact(&key, 1, 0x1234U));
+	UT_ASSERT_EQ(fake_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(fake_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), UINT64_C(1));
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
+				 GES_REPLY_WAIT_POLL_DELIVERED);
+}
+
+UT_TEST(test_reply_wait_error_cancels_registration_before_owner_cleanup)
+{
+	GesReplyWaitKey key = make_key(92, 0, 1, GES_REQ_OPCODE_REQUEST, 3);
+	volatile bool caught = false;
+
+	reset_reply_wait();
+	UT_ASSERT(cluster_ges_reply_wait_insert(&key, 10000) != NULL);
+	fake_error_during_sleep = true;
+	PG_TRY();
+	{
+		(void)cluster_ges_reply_wait_sleep_exact(&key, 1, 0x1234U);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		UT_ASSERT(fake_cv_target == NULL);
+		UT_ASSERT_EQ(fake_cv_cancel_calls, 1);
+		UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), UINT64_C(1));
+		UT_ASSERT(!cluster_ges_reply_wait_mark_abandoned(&key, 10001));
+		UT_ASSERT_EQ(cluster_ges_reply_wait_sweep_timeout(10001), 1);
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(test_poll_pending_keeps_exact_entry);
 	UT_RUN(test_poll_delivered_copies_complete_verdict_then_consumes);
 	UT_RUN(test_poll_abandoned_is_explicit_and_preserves_tombstone);
@@ -525,6 +615,9 @@ main(void)
 	UT_RUN(test_configured_cap_controls_shmem_and_live_admission);
 	UT_RUN(test_sleep_exact_waits_without_consuming_pending_entry);
 	UT_RUN(test_sleep_exact_refuses_missing_and_abandoned_keys);
+	UT_RUN(test_registered_reply_wait_delivers_without_deleting_live_entry);
+	UT_RUN(test_reply_ready_before_enrollment_skips_sleep_but_requires_poll);
+	UT_RUN(test_reply_wait_error_cancels_registration_before_owner_cleanup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

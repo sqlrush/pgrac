@@ -13030,6 +13030,7 @@ gcs_block_resource_x_target_acquire_internal(
 		= PCM_X_SESSION_AUTH_INVALID;
 	ResourceXGateSnapshot rebound_gate;
 	uint64 absolute_deadline_us = 0;
+	uint64 observed_head_deadline_us = 0;
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
 	uint64 diagnostic_request_sequence = 0;
@@ -13105,11 +13106,9 @@ gcs_block_resource_x_target_acquire_internal(
 			|| !resource_x_assertion_init(
 				&resource, cluster_node_id, &assertion))
 			return RESOURCE_X_APPLY_INVALID;
-		result
-			= cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
-				&assertion, direct_init_ownership_generation,
-				direct_init_reservation_token, now_us,
-				&r4_record_generation, &absolute_deadline_us);
+		result = cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
+			&assertion, direct_init_ownership_generation, direct_init_reservation_token, now_us,
+			&r4_record_generation, &observed_head_deadline_us);
 		if (result != RESOURCE_X_APPLY_APPLIED)
 			return result;
 	}
@@ -13153,14 +13152,9 @@ gcs_block_resource_x_target_acquire_internal(
 				= (uint64)Max(
 					cluster_gcs_block_retransmit_initial_backoff_ms, 1)
 				  * UINT64_C(1000);
-			if (join_only)
-			{
-				/* The read-only join budget above supplied the sole deadline. */
-			}
-			else if (absolute_deadline_us_io != NULL
-				&& *absolute_deadline_us_io != 0)
+			if (absolute_deadline_us_io != NULL && *absolute_deadline_us_io != 0)
 				absolute_deadline_us = *absolute_deadline_us_io;
-			else {
+			else if (absolute_deadline_us == 0) {
 				absolute_deadline_us = gcs_block_pcm_x_saturating_add_us(
 					now_us, gcs_block_pcm_x_retry_timeout_us());
 				if (absolute_deadline_us_io != NULL
@@ -13354,8 +13348,11 @@ gcs_block_resource_x_target_acquire_internal(
 								target_install_preuse_retry_seen = false;
 								continue;
 							}
-							if (wait_result == RESOURCE_X_APPLY_APPLIED)
+							if (wait_result == RESOURCE_X_APPLY_APPLIED) {
+								memset(&target_install_follow, 0, sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
 								continue;
+							}
 							if (wait_result == RESOURCE_X_APPLY_STALE
 								&& target_install_preuse_retry_seen) {
 								memset(&target_install_follow, 0,
@@ -13389,8 +13386,11 @@ gcs_block_resource_x_target_acquire_internal(
 									RESOURCE_X_TARGET_INSTALL_INFLIGHT,
 									timeout_ms);
 							if (wait_result == RESOURCE_X_APPLY_APPLIED
-								|| wait_result == RESOURCE_X_APPLY_DUPLICATE)
+								|| wait_result == RESOURCE_X_APPLY_DUPLICATE) {
+								memset(&target_install_follow, 0, sizeof(target_install_follow));
+								target_install_preuse_retry_seen = false;
 								continue;
+							}
 							if (wait_result == RESOURCE_X_APPLY_STALE
 								&& target_install_preuse_retry_seen) {
 								memset(&target_install_follow, 0,
@@ -13808,15 +13808,15 @@ gcs_block_resource_x_target_acquire_internal(
 							: RESOURCE_X_APPLY_BAD_STATE;
 						break;
 					}
-					remaining_us = absolute_deadline_us - now_us;
-					timeout_ms = (long)Min(
-						(uint64)Max(
-							cluster_gcs_block_retransmit_initial_backoff_ms, 1),
-						(remaining_us + UINT64_C(999)) / UINT64_C(1000));
-					if (timeout_ms <= 0)
-						timeout_ms = 1;
 					CHECK_FOR_INTERRUPTS();
-					pg_usleep(timeout_ms * 1000L);
+					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
+						&resource, master_node, master_session, gate.formation, own.generation,
+						absolute_deadline_us, retry_slice_us);
+					if (wait_result != RESOURCE_X_APPLY_APPLIED
+						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
+						result = wait_result;
+						break;
+					}
 					continue;
 				}
 				diagnostic_stage = "round-step";
@@ -13862,43 +13862,35 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 				}
 					if (direct_init)
-						action = join_only
-					? cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
-							&assertion, master_node,
-							gate.formation, master_session,
-							admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							absolute_deadline_us, now_us, retry_slice_us,
-							direct_init_ownership_generation,
-							direct_init_reservation_token,
-							cached_local_x,
-							cached_local_x ? own.generation : 0,
-							&dispatch, &terminal_ref)
-					: cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
-							&assertion, master_node,
-							gate.formation, master_session,
-							admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							absolute_deadline_us, now_us, retry_slice_us,
-							direct_init_ownership_generation,
-							direct_init_reservation_token,
-							cached_local_x,
-							cached_local_x ? own.generation : 0,
-							&dispatch, &terminal_ref);
+						action
+							= join_only
+								  ? cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
+										&assertion, master_node, gate.formation, master_session,
+										admission.record_generation,
+										requester_sender_connection_generation,
+										master_ingress_connection_generation, absolute_deadline_us,
+										gcs_block_pcm_x_retry_timeout_us(), now_us, retry_slice_us,
+										direct_init_ownership_generation,
+										direct_init_reservation_token, cached_local_x,
+										cached_local_x ? own.generation : 0, &dispatch,
+										&terminal_ref)
+								  : cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
+										&assertion, master_node, gate.formation, master_session,
+										admission.record_generation,
+										requester_sender_connection_generation,
+										master_ingress_connection_generation, absolute_deadline_us,
+										gcs_block_pcm_x_retry_timeout_us(), now_us, retry_slice_us,
+										direct_init_ownership_generation,
+										direct_init_reservation_token, cached_local_x,
+										cached_local_x ? own.generation : 0, &dispatch,
+										&terminal_ref);
 				else
-					action
-						= cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-						&assertion, master_node,
-						gate.formation, master_session,
-						admission.record_generation,
-						requester_sender_connection_generation,
-						master_ingress_connection_generation,
-						absolute_deadline_us, now_us, retry_slice_us,
-						cached_local_x,
-							cached_local_x ? own.generation : 0,
-							&dispatch, &terminal_ref);
+					action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						&assertion, master_node, gate.formation, master_session,
+						admission.record_generation, requester_sender_connection_generation,
+						master_ingress_connection_generation, absolute_deadline_us,
+						gcs_block_pcm_x_retry_timeout_us(), now_us, retry_slice_us, cached_local_x,
+						cached_local_x ? own.generation : 0, &dispatch, &terminal_ref);
 
 			target_install_terminal_recheck:
 					if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
@@ -14085,10 +14077,9 @@ gcs_block_resource_x_target_acquire_internal(
 				if (action
 					== RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT) {
 					/* The exact predecessor pair is older than this local request.
-					 * Keep the requester round empty and retry only inside the
-					 * original R7 absolute deadline; SourceSettlement broadcasts
-					 * the same entry CV, but this pre-round wait intentionally owns
-					 * no round identity to register against. */
+					 * Keep the requester round empty.  Register against the existing
+					 * settlement predicate on the same entry CV under this caller's
+					 * original deadline, without inventing a head or a lease. */
 					diagnostic_stage = "predecessor-settlement-wait";
 					if (!cluster_semantic_activation_recheck(&admission)
 						|| !gcs_block_resource_x_gate_session_recheck(
@@ -14102,15 +14093,15 @@ gcs_block_resource_x_target_acquire_internal(
 						result = RESOURCE_X_APPLY_BAD_STATE;
 						break;
 					}
-					remaining_us = absolute_deadline_us - now_us;
-					timeout_ms = (long)Min(
-						(uint64)Max(
-							cluster_gcs_block_retransmit_initial_backoff_ms, 1),
-						(remaining_us + UINT64_C(999)) / UINT64_C(1000));
-					if (timeout_ms <= 0)
-						timeout_ms = 1;
 					CHECK_FOR_INTERRUPTS();
-					pg_usleep(timeout_ms * 1000L);
+					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
+						&resource, master_node, master_session, gate.formation, 0,
+						absolute_deadline_us, retry_slice_us);
+					if (wait_result != RESOURCE_X_APPLY_APPLIED
+						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
+						result = wait_result;
+						break;
+					}
 					continue;
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
@@ -14318,24 +14309,17 @@ gcs_block_resource_x_target_acquire_internal(
 					if (direct_init)
 						wait_result
 							= cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
-							&assertion, master_node,
-							gate.formation, master_session,
-							admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							retry_slice_us,
-							direct_init_ownership_generation,
-							direct_init_reservation_token,
-							timeout_ms);
+								&assertion, master_node, gate.formation, master_session,
+								admission.record_generation, requester_sender_connection_generation,
+								master_ingress_connection_generation, retry_slice_us,
+								direct_init_ownership_generation, direct_init_reservation_token,
+								absolute_deadline_us, timeout_ms);
 					else
-						wait_result
-							= cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
-						&assertion, master_node,
-						gate.formation, master_session,
-						admission.record_generation,
-						requester_sender_connection_generation,
-						master_ingress_connection_generation,
-						retry_slice_us, timeout_ms);
+						wait_result = cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+							&assertion, master_node, gate.formation, master_session,
+							admission.record_generation, requester_sender_connection_generation,
+							master_ingress_connection_generation, retry_slice_us,
+							absolute_deadline_us, timeout_ms);
 				if (wait_result != RESOURCE_X_APPLY_APPLIED
 					&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
 					/* The registered wait and BufferDesc use independent lock

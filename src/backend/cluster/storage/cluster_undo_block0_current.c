@@ -19,7 +19,6 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_ges.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
@@ -120,7 +119,10 @@ typedef struct ClusterUndoBlock0CurrentGuardData {
 	bool reservation_held;
 	bool request_dispatched;
 	bool grant_observed;
-	uint8 reserved[18];
+	uint8 reserved[15];
+	uint8 reply_wait_site_plus_one;
+	bool reply_wait_adapter_required;
+	bool reply_wait_repoll_pending;
 } ClusterUndoBlock0CurrentGuardData;
 
 typedef struct ClusterUndoBlock0CurrentPinCleanup {
@@ -953,6 +955,24 @@ cluster_undo_block0_current_acquire_begin_live_owner_target(
 		CURRENT_ADMISSION_LIVE_OWNER_TARGET, guard, failure);
 }
 
+static void
+current_reply_poll_note(ClusterUndoBlock0CurrentGuardData *data)
+{
+	ClusterUndoBlock0ReplyWaitSite site;
+
+	/* Nonblocking owners never enter the adapter, so remain unlabelled. */
+	if (data->reply_wait_site_plus_one == 0
+		|| data->reply_wait_site_plus_one > CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT)
+		return;
+	site = (ClusterUndoBlock0ReplyWaitSite)(data->reply_wait_site_plus_one - 1);
+	if (data->reply_wait_adapter_required && data->reply_installed)
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_POLL_VIOLATION);
+	if (data->reply_wait_repoll_pending)
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_WAKE_REPOLL);
+	data->reply_wait_repoll_pending = false;
+	data->reply_wait_adapter_required = true;
+}
+
 ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 										ClusterUndoBlock0Result *failure)
@@ -974,6 +994,7 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 		return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	if (data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	current_reply_poll_note(data);
 	if (!data->reservation_held && !data->reply_installed && !data->request_dispatched) {
 		ClusterUndoBlock0CurrentStep step;
 
@@ -1046,29 +1067,89 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
 }
 
+#ifdef USE_ASSERT_CHECKING
+static void
+current_reply_wait_check_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	bool *safe = (bool *)context;
+
+	(void)mode;
+	switch (lock->tranche) {
+	case LWTRANCHE_LOCK_MANAGER:
+	case LWTRANCHE_CLUSTER_LMON:
+	case LWTRANCHE_CLUSTER_GES_REPLY_WAIT:
+	case LWTRANCHE_CLUSTER_PCM:
+	case LWTRANCHE_CLUSTER_TT_STATUS:
+	case LWTRANCHE_CLUSTER_TT_SLOT:
+	case LWTRANCHE_CLUSTER_UNDO_CLEANER:
+	case LWTRANCHE_CLUSTER_UNDO_BUF:
+		*safe = false;
+		break;
+	default:
+		break;
+	}
+}
+
+static bool
+current_reply_wait_locks_safe(void)
+{
+	bool safe = true;
+
+	ForEachLWLockHeldByMe(current_reply_wait_check_lock, &safe);
+	return safe;
+}
+#endif
+
 bool
-cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard)
+cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard,
+									   ClusterUndoBlock0ReplyWaitSite site)
 {
 	ClusterUndoBlock0CurrentGuardData *data;
 	GesReplyWaitKey key;
 	uint32 opcode;
+	TimestampTz now;
+	bool registered;
 
-	if (guard == NULL)
+	if (guard == NULL || (unsigned)site >= CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT)
 		return false;
 	data = current_guard_data(guard);
-	if (!current_phase_valid(data->phase) || !data->active_linked
-		|| !data->reply_installed)
+	data->reply_wait_site_plus_one = (uint8)site + 1;
+	data->reply_wait_adapter_required = false;
+	if (!current_phase_valid(data->phase) || !data->active_linked) {
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK);
 		return false;
+	}
 	if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
 		opcode = GES_REQ_OPCODE_REQUEST;
 	else if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT)
 		opcode = GES_REQ_OPCODE_RELEASE;
-	else
+	else {
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK);
 		return false;
+	}
+
+	Assert(current_reply_wait_locks_safe());
+
+	/* The CV API takes whole milliseconds.  With less than one quantum left,
+	 * return to poll rather than rounding up or taking the caller's fallback.
+	 * Neither this path nor a CV wake grants authority or consumes a reply. */
+	now = GetCurrentTimestamp();
+	if (data->deadline != 0 && (now >= data->deadline || data->deadline - now < 1000)) {
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_BUDGET_REPOLL);
+		return true;
+	}
+	if (!data->reply_installed) {
+		cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK);
+		return false;
+	}
 
 	current_fill_reply_key(data, opcode, &key);
-	return cluster_ges_reply_wait_sleep_exact(
-		&key, 1, WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+	cluster_undo_block0_reply_wait_metric_add(site, CLUSTER_UNDO_BLOCK0_WAIT_ELIGIBLE);
+	registered = cluster_ges_reply_wait_sleep_exact(&key, 1, WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+	cluster_undo_block0_reply_wait_metric_add(site, registered ? CLUSTER_UNDO_BLOCK0_WAIT_CV
+															   : CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK);
+	data->reply_wait_repoll_pending = registered;
+	return registered;
 }
 
 void
@@ -1113,6 +1194,10 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 	if (!current_live_recheck(data))
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 
+	/* The release leg gets its own site label at its first adapter call. */
+	data->reply_wait_site_plus_one = 0;
+	data->reply_wait_adapter_required = false;
+	data->reply_wait_repoll_pending = false;
 	if (!data->remote_master) {
 		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
@@ -1159,6 +1244,7 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
 	if (!current_phase_valid(data->phase)
 		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT)
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	current_reply_poll_note(data);
 	memset(&verdict, 0, sizeof(verdict));
 	current_fill_reply_key(data, GES_REQ_OPCODE_RELEASE, &key);
 	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
@@ -1529,7 +1615,9 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(
 				&guard, &current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
@@ -1610,7 +1698,9 @@ ensure_done:
 				CHECK_FOR_INTERRUPTS();
 				step = cluster_undo_block0_current_release_poll(
 					&guard, &current_failure);
-				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+					&& !cluster_undo_block0_current_wait_reply(
+						&guard, CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_RELEASE))
 					pg_usleep(1000L);
 			}
 			cleanup.current_active = false;
@@ -1847,7 +1937,9 @@ cluster_undo_block0_current_live_owner_mutate_exact(
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(
 				&guard, &current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_MUTATE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
@@ -2030,7 +2122,9 @@ cluster_undo_block0_current_live_owner_reuse_exact(
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(
 				&guard, &current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_REUSE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
@@ -2217,7 +2311,9 @@ cluster_undo_block0_current_live_owner_recycle_exact(
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(
 				&guard, &current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_LIVE_OWNER_RECYCLE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)

@@ -388,16 +388,25 @@ typedef struct ResourceXBootstrapRoundFailureSnapshot {
 	uint64 r4_record_generation;
 	uint64 master_session_incarnation;
 	uint64 absolute_deadline_us;
+	uint64 head_change_generation;
+	uint64 head_last_semantic_progress_us;
+	uint64 head_no_progress_budget_us;
 	uint64 requester_base_generation;
 	uint64 retired_acquisition_generation;
 	uint32 progress_flags;
 	uint8 round_phase;
 	uint8 terminal;
-	uint8 reserved[2];
+	uint8 head_failure_reason;
+	uint8 reserved;
 } ResourceXBootstrapRoundFailureSnapshot;
 
-StaticAssertDecl(sizeof(ResourceXBootstrapRoundFailureSnapshot) == 112,
-				 "ResourceXBootstrapRoundFailureSnapshot layout must remain 112 bytes");
+#define RESOURCE_X_HEAD_FAILURE_NONE UINT8_C(0)
+#define RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED UINT8_C(1)
+#define RESOURCE_X_HEAD_PROGRESS_OVERFLOW UINT8_C(2)
+extern const char *cluster_pcm_lock_resource_x_head_failure_name(uint8 reason);
+
+StaticAssertDecl(sizeof(ResourceXBootstrapRoundFailureSnapshot) == 136,
+				 "ResourceXBootstrapRoundFailureSnapshot layout must remain 136 bytes");
 
 /* A24: process-local identity retained by one ordinary TARGET follower while
  * the BufferDesc install and requester-round terminal publication cross
@@ -461,7 +470,7 @@ typedef struct ResourceXTargetInstallContinuation {
 	uint64 r4_record_generation;
 	uint64 acquisition_generation;
 	uint64 accepted_base_authority_generation;
-	uint64 round_absolute_deadline_us;
+	uint64 observed_head_change_generation;
 	uint64 caller_absolute_deadline_us;
 	uint64 requested_sleep_slice_us;
 	uint64 pending_ownership_generation;
@@ -1168,30 +1177,22 @@ cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	uint64 r4_record_generation, uint64 current_master_session_incarnation,
 	uint32 current_master_sender_connection_generation,
 	ResourceXMasterSnapshot *out);
-extern ResourceXBootstrapRoundAction
-cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out);
+extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
 extern ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out);
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 	const ResourceXAssertion *assertion,
@@ -1202,17 +1203,13 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 	uint64 *absolute_deadline_us_out);
 extern ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out);
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
 extern ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 	const ResourceXDecodedFrame *ack, int32 authenticated_master_node,
@@ -1227,25 +1224,21 @@ cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_e
 	uint64 expected_retry_slice_us, uint64 expected_absolute_deadline_us,
 	uint64 expected_direct_init_ownership_generation,
 	uint64 expected_direct_init_reservation_token);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us, long timeout_ms);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_predecessor_wait_exact(
+	const BufferTag *tag, int32 current_master_node, uint64 current_master_session,
+	uint64 current_formation, uint64 expected_carrier_generation,
+	uint64 caller_absolute_deadline_us, uint64 requested_sleep_slice_us);
 struct ClusterPcmOwnSnapshot;
 extern bool
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(

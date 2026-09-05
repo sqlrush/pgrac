@@ -532,9 +532,11 @@ cluster_undo_block0_current_acquire_poll(
 }
 
 bool
-cluster_undo_block0_current_wait_reply(
-	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused())
+cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+									   ClusterUndoBlock0ReplyWaitSite site)
 {
+	UT_ASSERT(site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE
+			  || site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE);
 	test_candidate_wait_calls++;
 	UT_ASSERT_EQ(test_candidate_poll_calls, test_candidate_wait_calls);
 	/* Let the next poll close the deterministic pending-loop fixture. */

@@ -143,6 +143,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
 #include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 writer-path snapshot */
 #include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
 #include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
@@ -1921,6 +1922,15 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
+	static const char *const reply_wait_keys[CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT] = {
+		[CLUSTER_UNDO_BLOCK0_WAIT_ELIGIBLE] = "block0_exact_reply_wait_eligible_count",
+		[CLUSTER_UNDO_BLOCK0_WAIT_CV] = "block0_exact_reply_cv_wait_count",
+		[CLUSTER_UNDO_BLOCK0_WAIT_FALLBACK] = "block0_exact_reply_fallback_count",
+		[CLUSTER_UNDO_BLOCK0_WAIT_WAKE_REPOLL] = "block0_exact_reply_wake_repoll_count",
+		[CLUSTER_UNDO_BLOCK0_WAIT_POLL_VIOLATION]
+		= "block0_unconditional_reply_poll_violation_count",
+		[CLUSTER_UNDO_BLOCK0_WAIT_BUDGET_REPOLL] = "block0_exact_reply_budget_repoll_count",
+	};
 	static const char *const reclaim_refusal_keys[PCM_RETIRE_REFUSAL_N] = {
 		[PCM_RETIRE_REFUSAL_GATE_NOT_OPEN]
 			= "pcm_grd_reclaim_refused_gate_not_open_count",
@@ -1970,6 +1980,23 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	const char *gate_phase;
 	const char *writer_path;
 	int refusal;
+	ClusterUndoBlock0ReplyWaitStats reply_wait;
+	bool reply_wait_available;
+	int site;
+	int metric;
+
+	reply_wait_available = cluster_undo_block0_reply_wait_stats_snapshot(&reply_wait);
+	emit_row(rsinfo, "pcm", "block0_reply_wait_stats_available", fmt_bool(reply_wait_available));
+	if (reply_wait_available) {
+		for (site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++) {
+			for (metric = 0; metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT; metric++) {
+				char key[96];
+
+				snprintf(key, sizeof(key), "%s_%02d", reply_wait_keys[metric], site);
+				emit_row(rsinfo, "pcm", key, fmt_int64((int64)reply_wait.count[site][metric]));
+			}
+		}
+	}
 
 	/*
 	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.

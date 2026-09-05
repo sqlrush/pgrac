@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
@@ -76,6 +77,7 @@
 #define CAPTURED_FORMATTED_VALUES_MAX 4096
 static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
 static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
+static char captured_dump_key_storage[CAPTURED_DUMP_ROWS_MAX][128];
 static const char *captured_dump_values[CAPTURED_DUMP_ROWS_MAX];
 static int captured_dump_row_count;
 static char captured_formatted_values[CAPTURED_FORMATTED_VALUES_MAX][128];
@@ -1056,6 +1058,23 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
 	for (i = 0; i < 9; i++)
 		values[i] = UINT64CONST(301) + (uint64)i;
+}
+
+static bool reply_wait_stats_available = true;
+
+bool
+cluster_undo_block0_reply_wait_stats_snapshot(ClusterUndoBlock0ReplyWaitStats *out)
+{
+	int site;
+	int metric;
+
+	memset(out, 0, sizeof(*out));
+	if (!reply_wait_stats_available)
+		return false;
+	for (site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++)
+		for (metric = 0; metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT; metric++)
+			out->count[site][metric] = 100 * site + metric + 1;
+	return true;
 }
 
 void
@@ -3334,7 +3353,13 @@ tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
 	if (captured_dump_row_count >= CAPTURED_DUMP_ROWS_MAX)
 		return;
 	captured_dump_categories[captured_dump_row_count] = (const char *)DatumGetPointer(values[0]);
-	captured_dump_keys[captured_dump_row_count] = (const char *)DatumGetPointer(values[1]);
+	/* Real tuplestore copies text datums; do not retain a stack-built key. */
+	UT_ASSERT(strlen((const char *)DatumGetPointer(values[1]))
+			  < sizeof(captured_dump_key_storage[0]));
+	snprintf(captured_dump_key_storage[captured_dump_row_count],
+			 sizeof(captured_dump_key_storage[0]), "%s", (const char *)DatumGetPointer(values[1]));
+	captured_dump_keys[captured_dump_row_count]
+		= captured_dump_key_storage[captured_dump_row_count];
 	captured_dump_values[captured_dump_row_count] = (const char *)DatumGetPointer(values[2]);
 	captured_dump_row_count++;
 }
@@ -4853,6 +4878,34 @@ UT_TEST(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats)
 	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_runtime_state"), 0);
 }
 
+UT_TEST(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int available;
+
+	for (available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		reply_wait_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "block0_reply_wait_stats_available"), 1);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "block0_exact_reply_cv_wait_count_14"), available);
+		if (available && captured_dump_count("pcm", "block0_exact_reply_cv_wait_count_14") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "block0_exact_reply_cv_wait_count_14"),
+							 "1402");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "block0_exact_reply_wake_repoll_count_01"),
+							 "104");
+			UT_ASSERT_STR_EQ(
+				captured_dump_value("pcm", "block0_unconditional_reply_poll_violation_count_00"),
+				"5");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -5481,12 +5534,13 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
 	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
+	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);

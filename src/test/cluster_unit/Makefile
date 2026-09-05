@@ -2390,14 +2390,22 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 # cluster_node_id / cluster_shmem_register_region / cluster_injection_*).
 # Test stubs all of these and drives a tiny fake shared HTAB so the real
 # acquire/release/upgrade/downgrade/query paths are exercised standalone.
+# Compile the unchanged product source with only its clock dependency redirected.
+# No test clock or test-only branch enters the production object.
+test_cluster_pcm_lock_clock_product.o: \
+		$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
 		$< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

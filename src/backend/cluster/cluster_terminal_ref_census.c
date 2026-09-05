@@ -3599,7 +3599,9 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 		{
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
@@ -3665,7 +3667,9 @@ sample_done:
 				CHECK_FOR_INTERRUPTS();
 				step = cluster_undo_block0_current_release_poll(
 					&guard, &failure);
-				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+					&& !cluster_undo_block0_current_wait_reply(
+						&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_RELEASE))
 					pg_usleep(1000L);
 			}
 			current_active = false;
@@ -3777,7 +3781,9 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
 		{
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_RELEASE_SAMPLE_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
@@ -3841,7 +3847,9 @@ release_sample_done:
 				CHECK_FOR_INTERRUPTS();
 				step = cluster_undo_block0_current_release_poll(
 					&guard, &failure);
-				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+					&& !cluster_undo_block0_current_wait_reply(
+						&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_RELEASE_SAMPLE_RELEASE))
 					pg_usleep(1000L);
 			}
 			current_active = false;
@@ -3981,7 +3989,9 @@ ctrc_cleaner_publish_certificate(
 		{
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CERTIFICATE_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
@@ -4113,7 +4123,9 @@ certificate_done:
 				CHECK_FOR_INTERRUPTS();
 				step = cluster_undo_block0_current_release_poll(
 					&guard, &failure);
-				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+					&& !cluster_undo_block0_current_wait_reply(
+						&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CERTIFICATE_RELEASE))
 					pg_usleep(1000L);
 			}
 			current_active = false;

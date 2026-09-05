@@ -303,7 +303,8 @@ cluster_runtime_visibility_candidate_acquire_until(
 		}
 		step = cluster_undo_block0_current_acquire_poll(guard, failure);
 		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
-			&& !cluster_undo_block0_current_wait_reply(guard))
+			&& !cluster_undo_block0_current_wait_reply(
+				guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE))
 			pg_usleep(1000L);
 	}
 	if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD
@@ -342,7 +343,8 @@ cluster_runtime_visibility_candidate_release_until(
 		}
 		step = cluster_undo_block0_current_release_poll(guard, failure);
 		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
-			&& !cluster_undo_block0_current_wait_reply(guard))
+			&& !cluster_undo_block0_current_wait_reply(
+				guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE))
 			pg_usleep(1000L);
 	}
 	return step;

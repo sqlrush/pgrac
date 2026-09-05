@@ -389,7 +389,9 @@ cluster_tt_slot_durable_publish_active(
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard,
 				&current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_TT_ACTIVE_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)
@@ -1153,7 +1155,9 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard, &current_failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&guard, CLUSTER_UNDO_BLOCK0_WAIT_TT_COMMIT_ACQUIRE))
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)

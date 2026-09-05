@@ -3182,8 +3182,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	retained_deadline = retained_gate_recheck != NULL
 		? strstr(retained_gate_recheck,
 			"now_us >= absolute_deadline_us") : NULL;
-	retained_sleep = retained_wait != NULL
-		? strstr(retained_wait, "pg_usleep(timeout_ms * 1000L)") : NULL;
+	retained_sleep
+		= retained_wait != NULL
+			  ? strstr(retained_wait, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
+			  : NULL;
 	retained_continue = retained_sleep != NULL
 		? strstr(retained_sleep, "continue;") : NULL;
 	n_candidate = n_branch != NULL
@@ -3199,8 +3201,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 			"RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT") : NULL;
 	predecessor_deadline = predecessor_wait != NULL
 		? strstr(predecessor_wait, "now_us >= absolute_deadline_us") : NULL;
-	predecessor_sleep = predecessor_deadline != NULL
-		? strstr(predecessor_deadline, "pg_usleep(timeout_ms * 1000L)") : NULL;
+	predecessor_sleep
+		= predecessor_deadline != NULL
+			  ? strstr(predecessor_deadline, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
+			  : NULL;
 	predecessor_continue = predecessor_sleep != NULL
 		? strstr(predecessor_sleep, "continue;") : NULL;
 	round_wait = predecessor_continue != NULL
@@ -5666,7 +5670,7 @@ UT_TEST(test_resource_x_target_install_generated_cross_axis_matrix)
 																   : lineage_state == 1
 																	   ? UINT64_C(17)
 																	   : UINT64_C(18);
-			seeded_continuation.round_absolute_deadline_us = UINT64_C(1000);
+			seeded_continuation.observed_head_change_generation = UINT64_C(1000);
 			seeded_continuation.caller_absolute_deadline_us
 				= deadline_state == 0 ? UINT64_C(1001)
 				: deadline_state == 1 ? UINT64_C(1000) : UINT64_C(999);
@@ -5698,6 +5702,34 @@ UT_TEST(test_resource_x_target_install_generated_cross_axis_matrix)
 		}
 	}
 	UT_ASSERT_EQ(cases, UINT64_C(29160));
+}
+
+UT_TEST(test_resource_x_predecessor_waits_use_exact_resource_cv)
+{
+	char *source = read_gcs_block_source();
+	const char *starts[] = { "diagnostic_stage = \"retained-release-wait\";",
+							 "diagnostic_stage = \"predecessor-settlement-wait\";" };
+	const char *ends[]
+		= { "diagnostic_stage = \"round-step\";", "diagnostic_stage = \"dispatch-recheck\";" };
+	unsigned i;
+
+	for (i = 0; i < lengthof(starts); i++) {
+		const char *begin = source != NULL ? strstr(source, starts[i]) : NULL;
+		const char *end = begin != NULL ? strstr(begin, ends[i]) : NULL;
+		const char *wait
+			= begin != NULL ? strstr(begin, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
+							: NULL;
+		const char *poll = begin != NULL ? strstr(begin, "pg_usleep(") : NULL;
+
+		UT_ASSERT_NOT_NULL(begin);
+		UT_ASSERT_NOT_NULL(end);
+		UT_ASSERT_NOT_NULL(wait);
+		if (begin != NULL && end != NULL) {
+			UT_ASSERT(wait != NULL && wait < end);
+			UT_ASSERT(poll == NULL || poll >= end);
+		}
+	}
+	free(source);
 }
 
 UT_TEST(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first)
@@ -7059,7 +7091,7 @@ UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(124);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7165,6 +7197,7 @@ main(void)
 	UT_RUN(test_resource_x_target_install_driver_has_no_unbracketed_entry_observer);
 	UT_RUN(test_resource_x_target_install_generated_cross_axis_matrix);
 	UT_RUN(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first);
+	UT_RUN(test_resource_x_predecessor_waits_use_exact_resource_cv);
 	UT_RUN(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_drift);
 	UT_RUN(test_resource_x_target_resamples_only_exact_terminal_install);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_terminal_publish);

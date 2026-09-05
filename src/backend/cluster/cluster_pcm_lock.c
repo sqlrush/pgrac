@@ -44,6 +44,7 @@
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -196,7 +197,10 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint64 resource_formation;
 	uint64 master_session_incarnation;
 	uint64 r4_record_generation;
-	uint64 absolute_deadline_us;
+	uint64 head_no_progress_deadline_us;
+	uint64 head_change_generation;
+	uint64 head_last_semantic_progress_us;
+	uint64 head_no_progress_budget_us;
 	uint64 last_dispatch_us;
 	uint64 retry_slice_us;
 	uint64 accepted_base;
@@ -209,11 +213,12 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint32 master_ingress_connection_generation;
 	uint8 phase;
 	uint8 install_claim_source;
-	uint8 reserved[2];
+	uint8 head_failure_reason;
+	uint8 reserved[1];
 } ClusterPcmResourceXBootstrapRound;
 
-StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 440,
-				 "Resource-X requester bootstrap round layout must remain 440 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 464,
+				 "Resource-X requester bootstrap round layout must remain 464 bytes");
 
 #define RESOURCE_X_LOCAL_OWNER_EMPTY UINT8_C(0)
 #define RESOURCE_X_LOCAL_OWNER_RECYCLING UINT8_C(1)
@@ -405,7 +410,7 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 1032,
+StaticAssertDecl(sizeof(struct GrdEntry) == 1056,
 				 "Stage 8 D2 GrdEntry size must include pinned binding identity");
 
 
@@ -721,6 +726,9 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 resource_x_reconfig_sidecar_stale_count;
 	pg_atomic_uint64 resource_x_reconfig_retry_count;
 	pg_atomic_uint64 resource_x_reconfig_blocked_count;
+	/* Node-wide counters shared by foreground and asynchronous reply owners. */
+	pg_atomic_uint64 block0_reply_wait_count[CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT]
+											[CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT];
 	pg_atomic_uint64 resource_x_reconfig_thaw_count;
 	pg_atomic_uint64 resource_x_reconfig_reclaim_nonhead_count;
 	pg_atomic_uint64 resource_x_reconfig_reclaim_head_count;
@@ -859,11 +867,15 @@ static bool pcm_resource_x_local_owner_valid_locked(
 	const ClusterPcmResourceXLocalOwner *owner);
 static bool pcm_resource_x_local_handoff_valid(
 	const ClusterPcmResourceXLocalHandoff *handoff);
-static bool pcm_resource_x_local_owner_priority_clear_locked(
-	ClusterPcmResourceXLocalOwner *owner);
-static bool pcm_resource_x_local_owner_expire_locked(
-	ClusterPcmResourceXLocalOwner *owner, uint64 now_us);
+static bool pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry);
+static bool pcm_resource_x_local_owner_expire_locked(struct GrdEntry *entry, uint64 now_us);
 static uint64 pcm_resource_x_monotonic_us(void);
+static bool pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress,
+											   uint64 now_us);
+static bool pcm_resource_x_head_progress_ref_locked(struct GrdEntry *entry,
+													const ResourceXAcquisitionRef *ref,
+													uint64 now_us);
+static void pcm_resource_x_head_fail_locked(struct GrdEntry *entry, uint8 reason);
 static uint32 pcm_holder_bit(int holder_node_id);
 static PcmState pcm_transition_target(PcmLockTransition trans);
 static ResourceXReclaimResult pcm_resource_x_reclaim_requester_locked(
@@ -3421,9 +3433,7 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 				&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
 		}
 		local_priority_cleared
-			= pcm_resource_x_local_owner_expire_locked(
-				&entry->resource_x_local_owner,
-				pcm_resource_x_monotonic_us());
+			= pcm_resource_x_local_owner_expire_locked(entry, pcm_resource_x_monotonic_us());
 		if ((entry->resource_x_local_owner.state
 				== RESOURCE_X_LOCAL_OWNER_RECYCLING
 			|| entry->resource_x_local_owner.state
@@ -3433,9 +3443,7 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 			&& entry->resource_x_local_owner.handoff.holder_ref.formation
 				== token->old_formation)
 			local_priority_cleared
-				= pcm_resource_x_local_owner_priority_clear_locked(
-					&entry->resource_x_local_owner)
-				|| local_priority_cleared;
+				= pcm_resource_x_local_owner_priority_clear_locked(entry) || local_priority_cleared;
 		if (local_priority_cleared)
 			ConditionVariableBroadcast(&entry->wait_cv);
 		if (entry->resource_x_local_owner.state
@@ -5140,6 +5148,8 @@ cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref)
 			entry->resource_x_no_progress_generation = 0;
 			entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
 			entry->resource_x_dispatch_phase = 0;
+			if (!pcm_resource_x_head_progress_ref_locked(entry, ref, pcm_resource_x_monotonic_us()))
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			broadcast = true;
 		}
 		break;
@@ -5323,6 +5333,10 @@ cluster_pcm_lock_resource_x_executor_rearm_exact(const ResourceXAcquisitionRef *
 		broadcast = true;
 		result = RESOURCE_X_APPLY_APPLIED;
 	}
+	/* Clearing an executor observation changes the predicate, not progress.
+	 * It must wake followers without buying another head lease. */
+	if (broadcast && !pcm_resource_x_head_changed_locked(entry, false, 0))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	LWLockRelease(&entry->entry_lock.lock);
 	if (broadcast)
 		ConditionVariableBroadcast(&entry->wait_cv);
@@ -5402,7 +5416,11 @@ cluster_pcm_lock_resource_x_requester_apply_exact(const ResourceXAcquisitionRef 
 		entry->resource_x_no_progress_generation = 0;
 		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
 		broadcast = true;
-		result = RESOURCE_X_APPLY_APPLIED;
+		/* This publication records the exact physical-X witness and T2 in
+		 * one shared mutation.  Replayed T2 never renews the head lease. */
+		result = pcm_resource_x_head_progress_ref_locked(entry, ref, pcm_resource_x_monotonic_us())
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	if (broadcast)
@@ -5508,6 +5526,8 @@ cluster_pcm_lock_resource_x_requester_activate_exact(const ResourceXAcquisitionR
 				round->phase
 					= RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED;
 			}
+			if (!pcm_resource_x_head_progress_ref_locked(entry, ref, pcm_resource_x_monotonic_us()))
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			broadcast = true;
 		}
 	}
@@ -5547,6 +5567,7 @@ cluster_pcm_lock_resource_x_publish_no_progress_exact(const ResourceXAcquisition
 			|| entry->resource_x_no_progress_reason != (uint32)reason)) {
 		entry->resource_x_no_progress_generation = ref->acquisition_generation;
 		entry->resource_x_no_progress_reason = (uint32)reason;
+		(void)pcm_resource_x_head_changed_locked(entry, false, 0);
 		broadcast = true;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
@@ -8932,6 +8953,9 @@ cluster_pcm_grd_init(void)
 		 * by HC60 apply-fail-closed.
 		 */
 		memset(ClusterPcm, 0, header_size);
+		for (int site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++)
+			for (int metric = 0; metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT; metric++)
+				pg_atomic_init_u64(&ClusterPcm->block0_reply_wait_count[site][metric], 0);
 		LWLockInitialize(&ClusterPcm->htab_lock.lock, LWTRANCHE_CLUSTER_PCM);
 		pg_atomic_init_u64(&ClusterPcm->next_binding_generation, 1);
 		pg_atomic_init_u64(
@@ -10059,7 +10083,9 @@ cluster_pcm_lock_resource_x_install_claim_bind_t1_exact(const ResourceXAcquisiti
 		round->install_claim_reservation_token = reserved->reservation_token;
 		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1;
 		broadcast = true;
-		result = RESOURCE_X_APPLY_APPLIED;
+		result = pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us())
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	if (broadcast)
@@ -10256,7 +10282,9 @@ cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
 		round->install_claim_reservation_token = before->reservation_token;
 		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
 		broadcast = true;
-		result = RESOURCE_X_APPLY_APPLIED;
+		result = pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us())
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	if (broadcast)
@@ -10284,6 +10312,113 @@ pcm_resource_x_request_observation_matches_locked(
 				   ? direct_init_ownership_generation == 0
 				   : (round->install_claim_pending_generation == direct_init_ownership_generation
 					  && round->install_claim_reservation_token == direct_init_reservation_token));
+}
+
+/* These counters share the existing PCM diagnostic allocation.  Unavailable
+ * shared memory is reported as unavailable, never as a zero-valued snapshot. */
+void
+cluster_undo_block0_reply_wait_metric_add(ClusterUndoBlock0ReplyWaitSite site,
+										  ClusterUndoBlock0ReplyWaitMetric metric)
+{
+	if (ClusterPcm != NULL && (unsigned)site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT
+		&& (unsigned)metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT)
+		pg_atomic_fetch_add_u64(&ClusterPcm->block0_reply_wait_count[site][metric], 1);
+}
+
+bool
+cluster_undo_block0_reply_wait_stats_snapshot(ClusterUndoBlock0ReplyWaitStats *out)
+{
+	int site;
+	int metric;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return false;
+	for (site = 0; site < CLUSTER_UNDO_BLOCK0_WAIT_SITE_COUNT; site++)
+		for (metric = 0; metric < CLUSTER_UNDO_BLOCK0_WAIT_METRIC_COUNT; metric++)
+			out->count[site][metric]
+				= pg_atomic_read_u64(&ClusterPcm->block0_reply_wait_count[site][metric]);
+	return true;
+}
+
+const char *
+cluster_pcm_lock_resource_x_head_failure_name(uint8 reason)
+{
+	switch (reason) {
+	case RESOURCE_X_HEAD_FAILURE_NONE:
+		return "NONE";
+	case RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED:
+		return "HEAD_NO_PROGRESS_EXPIRED";
+	case RESOURCE_X_HEAD_PROGRESS_OVERFLOW:
+		return "HEAD_PROGRESS_OVERFLOW";
+	default:
+		return "HEAD_FAILURE_MALFORMED";
+	}
+}
+
+/* Only an exact owner calls this at a new predicate/progress edge.  Retry
+ * pacing and follower observations never enter here.  Historical lease bytes
+ * may remain in a terminal cover, but are never tested as terminal expiry. */
+static bool
+pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress, uint64 now_us)
+{
+	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	uint64 progress_us = Max(now_us, round->head_last_semantic_progress_us);
+	bool preterminal;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		return true;
+	preterminal = round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+				  && round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED;
+	if (round->head_change_generation >= UINT64_MAX - 1
+		|| (semantic_progress
+			&& (now_us == 0 || now_us == UINT64_MAX
+				|| (preterminal
+					&& (round->head_no_progress_budget_us == 0
+						|| round->head_no_progress_budget_us == UINT64_MAX
+						|| progress_us >= UINT64_MAX - round->head_no_progress_budget_us))))) {
+		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+		round->head_failure_reason = RESOURCE_X_HEAD_PROGRESS_OVERFLOW;
+		ConditionVariableBroadcast(&entry->wait_cv);
+		return false;
+	}
+	round->head_change_generation++;
+	if (semantic_progress) {
+		round->head_last_semantic_progress_us = progress_us;
+		if (preterminal)
+			round->head_no_progress_deadline_us = progress_us + round->head_no_progress_budget_us;
+	}
+	ConditionVariableBroadcast(&entry->wait_cv);
+	return true;
+}
+
+static void
+pcm_resource_x_head_fail_locked(struct GrdEntry *entry, uint8 reason)
+{
+	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
+		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+		round->head_failure_reason = reason;
+		(void)pcm_resource_x_head_changed_locked(entry, false, 0);
+	}
+}
+
+static bool
+pcm_resource_x_head_progress_ref_locked(struct GrdEntry *entry, const ResourceXAcquisitionRef *ref,
+										uint64 now_us)
+{
+	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+		|| !pcm_resource_x_install_claim_ref_exact_locked(round, ref))
+		return true;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		return false;
+	return pcm_resource_x_head_changed_locked(entry, true, now_us);
 }
 
 static void
@@ -10321,7 +10456,7 @@ pcm_resource_x_bootstrap_failed_round_rearmable_locked(
 {
 	static const ResourceXAcquisitionRef empty_ref;
 	static const ResourceXDecodedCommon empty_common;
-	static const uint8 zero_reserved[2];
+	static const uint8 zero_reserved[1];
 	ClusterPcmResourceXMasterState *master_state;
 	ResourceXDecodedCommon expected_assertion;
 	ResourceXDecodedFrame ack_frame;
@@ -10333,15 +10468,17 @@ pcm_resource_x_bootstrap_failed_round_rearmable_locked(
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	master_state = pcm_resource_x_master_state_for_entry(entry);
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| round->head_failure_reason > RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED
 		|| direct_init_ownership_generation != 0 || direct_init_reservation_token != 0
 		|| round->install_claim_pending_generation != 0
 		|| round->install_claim_reservation_token != 0
 		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
-		|| round->absolute_deadline_us == 0 || round->absolute_deadline_us == UINT64_MAX
-		|| now_us < round->absolute_deadline_us
-		|| absolute_deadline_us <= round->absolute_deadline_us || now_us >= absolute_deadline_us
+		|| round->head_no_progress_deadline_us == 0
+		|| round->head_no_progress_deadline_us == UINT64_MAX
+		|| now_us < round->head_no_progress_deadline_us || now_us >= absolute_deadline_us
 		|| round->highest_attempt_floor == 0 || round->highest_attempt_floor == UINT64_MAX
-		|| round->last_dispatch_us == 0 || round->last_dispatch_us >= round->absolute_deadline_us
+		|| round->last_dispatch_us == 0
+		|| round->last_dispatch_us >= round->head_no_progress_deadline_us
 		|| round->terminal_authority_generation != 0 || round->cached_ownership_generation != 0
 		|| memcmp(&round->terminal_ref, &empty_ref, sizeof(empty_ref)) != 0
 		|| memcmp(round->reserved, zero_reserved, sizeof(zero_reserved)) != 0
@@ -10587,15 +10724,18 @@ pcm_resource_x_local_owner_valid_locked(
 }
 
 static void
-pcm_resource_x_local_owner_clear_locked(
-	ClusterPcmResourceXLocalOwner *owner)
+pcm_resource_x_local_owner_clear_locked(struct GrdEntry *entry)
 {
+	ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
 	uint64 highest_owner_generation;
+	bool changed = owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY;
 
 	Assert(owner != NULL);
 	highest_owner_generation = owner->highest_owner_generation;
 	memset(owner, 0, sizeof(*owner));
 	owner->highest_owner_generation = highest_owner_generation;
+	if (changed)
+		(void)pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us());
 }
 
 static bool
@@ -10662,34 +10802,37 @@ pcm_resource_x_local_handoff_deadline(uint64 now_us, uint64 *deadline_out)
 }
 
 static bool
-pcm_resource_x_local_owner_priority_clear_locked(
-	ClusterPcmResourceXLocalOwner *owner)
+pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry)
 {
+	ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+
 	Assert(owner != NULL);
 	if (owner->state == RESOURCE_X_LOCAL_OWNER_RECYCLING
 		&& pcm_resource_x_local_handoff_valid(&owner->handoff)) {
 		memset(&owner->handoff, 0, sizeof(owner->handoff));
+		(void)pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us());
 		return true;
 	}
 	if (owner->state == RESOURCE_X_LOCAL_OWNER_HANDOFF
 		&& pcm_resource_x_local_handoff_valid(&owner->handoff)) {
-		pcm_resource_x_local_owner_clear_locked(owner);
+		pcm_resource_x_local_owner_clear_locked(entry);
 		return true;
 	}
 	return false;
 }
 
 static bool
-pcm_resource_x_local_owner_expire_locked(
-	ClusterPcmResourceXLocalOwner *owner, uint64 now_us)
+pcm_resource_x_local_owner_expire_locked(struct GrdEntry *entry, uint64 now_us)
 {
+	ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+
 	Assert(owner != NULL);
 	Assert(now_us != 0 && now_us != UINT64_MAX);
 	return (owner->state == RESOURCE_X_LOCAL_OWNER_RECYCLING
 			|| owner->state == RESOURCE_X_LOCAL_OWNER_HANDOFF)
-		&& pcm_resource_x_local_handoff_valid(&owner->handoff)
-		&& now_us >= owner->handoff.deadline_us
-		&& pcm_resource_x_local_owner_priority_clear_locked(owner);
+		   && pcm_resource_x_local_handoff_valid(&owner->handoff)
+		   && now_us >= owner->handoff.deadline_us
+		   && pcm_resource_x_local_owner_priority_clear_locked(entry);
 }
 
 static bool
@@ -10762,13 +10905,14 @@ pcm_resource_x_local_handoff_build_locked(
 }
 
 static ResourceXApplyResult
-pcm_resource_x_local_handoff_freeze_locked(
-	ClusterPcmResourceXLocalOwner *owner,
-	const ClusterPcmResourceXBootstrapRound *round,
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation, uint64 now_us)
+pcm_resource_x_local_handoff_freeze_locked(struct GrdEntry *entry,
+										   const ClusterPcmResourceXBootstrapRound *round,
+										   const ResourceXDecodedFrame *successor_block,
+										   int32 authenticated_master_node,
+										   uint64 r4_record_generation,
+										   uint64 cached_ownership_generation, uint64 now_us)
 {
+	ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
 	ResourceXApplyResult result;
 
 	Assert(owner != NULL);
@@ -10789,7 +10933,9 @@ pcm_resource_x_local_handoff_freeze_locked(
 		memset(&owner->handoff, 0, sizeof(owner->handoff));
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	return RESOURCE_X_APPLY_APPLIED;
+	return pcm_resource_x_head_changed_locked(entry, true, now_us)
+			   ? RESOURCE_X_APPLY_APPLIED
+			   : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
 static ResourceXApplyResult
@@ -10807,19 +10953,14 @@ pcm_resource_x_local_owner_claim_locked(
 	if (handle_out != NULL)
 		memset(handle_out, 0, sizeof(*handle_out));
 	if (handle_out == NULL || !pcm_resource_x_ref_valid(ref)
-		|| (state != RESOURCE_X_LOCAL_OWNER_RECYCLING
-			&& state != RESOURCE_X_LOCAL_OWNER_REVOKING
+		|| (state != RESOURCE_X_LOCAL_OWNER_RECYCLING && state != RESOURCE_X_LOCAL_OWNER_REVOKING
 			&& state != RESOURCE_X_LOCAL_OWNER_EVICTING)
-		|| master_session_incarnation == 0
-		|| master_session_incarnation == UINT64_MAX
-		|| r4_record_generation == 0
-		|| r4_record_generation == UINT64_MAX
-		|| cached_ownership_generation == 0
-		|| cached_ownership_generation == UINT64_MAX
+		|| master_session_incarnation == 0 || master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX
+		|| cached_ownership_generation == 0 || cached_ownership_generation == UINT64_MAX
 		|| reservation_token == 0 || reservation_token == UINT64_MAX
-		|| entry->resource_x_bootstrap_round.absolute_deadline_us == 0
-		|| entry->resource_x_bootstrap_round.absolute_deadline_us
-			== UINT64_MAX
+		|| entry->resource_x_bootstrap_round.head_no_progress_deadline_us == 0
+		|| entry->resource_x_bootstrap_round.head_no_progress_deadline_us == UINT64_MAX
 		|| owner_procno < 0)
 		return RESOURCE_X_APPLY_INVALID;
 	owner = &entry->resource_x_local_owner;
@@ -10828,6 +10969,8 @@ pcm_resource_x_local_owner_claim_locked(
 	if (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (owner->highest_owner_generation == UINT64_MAX - 1)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us()))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	owner->highest_owner_generation++;
 	owner->handle.ref = *ref;
@@ -10839,7 +10982,7 @@ pcm_resource_x_local_owner_claim_locked(
 	owner->handle.reservation_token = reservation_token;
 	owner->handle.owner_generation = owner->highest_owner_generation;
 	owner->handle.absolute_deadline_us
-		= entry->resource_x_bootstrap_round.absolute_deadline_us;
+		= entry->resource_x_bootstrap_round.head_no_progress_deadline_us;
 	owner->handle.owner_procno = owner_procno;
 	owner->state = state;
 	*handle_out = owner->handle;
@@ -10869,7 +11012,7 @@ pcm_resource_x_local_owner_release_locked(
 		|| !pcm_resource_x_local_owner_handle_equal(
 			&owner->handle, handle))
 		return RESOURCE_X_APPLY_STALE;
-	pcm_resource_x_local_owner_clear_locked(owner);
+	pcm_resource_x_local_owner_clear_locked(entry);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -10937,6 +11080,8 @@ pcm_resource_x_bootstrap_round_direct_init_handoff_locked(
 	round->terminal_authority_generation = round->accepted_base + 1;
 	round->cached_ownership_generation = cached_ownership_generation;
 	round->phase = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED;
+	if (!pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us()))
+		return false;
 	return pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
 		entry, round, &ref, round->master_session_incarnation,
 		round->r4_record_generation, cached_ownership_generation);
@@ -10944,17 +11089,13 @@ pcm_resource_x_bootstrap_round_direct_init_handoff_locked(
 
 static ResourceXBootstrapRoundAction
 pcm_resource_x_bootstrap_round_step_internal(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool allow_create,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool allow_create, bool cached_local_x,
+	uint64 cached_ownership_generation, ResourceXDecodedFrame *dispatch_out,
 	ResourceXAcquisitionRef *terminal_ref_out)
 {
 	ClusterPcmResourceXBootstrapRound *round;
@@ -10975,6 +11116,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	uint32 diagnostic_master_ingress_generation = 0;
 	uint32 diagnostic_requester_sender_generation = 0;
 	uint8 diagnostic_phase = UINT8_MAX;
+	uint8 diagnostic_head_failure_reason = RESOURCE_X_HEAD_FAILURE_NONE;
 	int32 diagnostic_master_node = -1;
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
@@ -11043,6 +11185,12 @@ pcm_resource_x_bootstrap_round_step_internal(
 		&& round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE) {
 		/* Only the complete B-E-B binder or the T1 installer can publish the
 		 * claim.  A follower's tuple alone cannot make it the physical owner. */
+		if (now_us >= round->head_no_progress_deadline_us) {
+			pcm_resource_x_semantic_mutation_mark();
+			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
+			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+			goto round_step_done;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
@@ -11051,7 +11199,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	if (!pcm_resource_x_local_owner_valid_locked(
 			&entry->resource_x_local_owner)) {
 		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
-			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_FAILURE_NONE);
 		ConditionVariableBroadcast(&entry->wait_cv);
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
@@ -11084,14 +11232,14 @@ pcm_resource_x_bootstrap_round_step_internal(
 			 * this cover.  Re-probe instead of destroying exact terminal evidence. */
 			action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 		} else if (!pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)) {
-			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_FAILURE_NONE);
 			broadcast = true;
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
 			if (pcm_resource_x_local_owner_round_exact_locked(entry, round))
 				action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 			else {
-				round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+				pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_FAILURE_NONE);
 				broadcast = true;
 				action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 			}
@@ -11121,7 +11269,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	} else if (!cluster_pcm_lock_resource_x_gate_open_exact(resource_formation)) {
 		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
 			&& round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
-			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_FAILURE_NONE);
 			broadcast = true;
 		}
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
@@ -11139,7 +11287,9 @@ pcm_resource_x_bootstrap_round_step_internal(
 			   && predecessor_result != RESOURCE_X_APPLY_NOT_FOUND) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
-		if (now_us >= absolute_deadline_us) {
+		if (now_us >= absolute_deadline_us || head_no_progress_budget_us == 0
+			|| head_no_progress_budget_us == UINT64_MAX
+			|| now_us >= UINT64_MAX - head_no_progress_budget_us) {
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else {
 			attempt_floor = round->highest_attempt_floor;
@@ -11157,7 +11307,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 				round->master_session_incarnation
 					= master_session_incarnation;
 				round->r4_record_generation = r4_record_generation;
-				round->absolute_deadline_us = absolute_deadline_us;
+				round->head_no_progress_budget_us = head_no_progress_budget_us;
 				round->last_dispatch_us = now_us;
 				round->retry_slice_us = retry_slice_us;
 				round->current_master_node = current_master_node;
@@ -11184,6 +11334,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 				round->request.outcome = RESOURCE_X_OUTCOME_NONE;
 				round->phase
 					= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED;
+				(void)pcm_resource_x_head_changed_locked(entry, true, now_us);
 				pcm_resource_x_bootstrap_round_dispatch_snapshot(
 					round, dispatch_out);
 				action = RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST;
@@ -11196,9 +11347,9 @@ pcm_resource_x_bootstrap_round_step_internal(
 				   direct_init_ownership_generation, direct_init_reservation_token)) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-			   || now_us >= round->absolute_deadline_us) {
+			   || now_us >= round->head_no_progress_deadline_us) {
 		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
-			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
 			broadcast = true;
 		}
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
@@ -11224,10 +11375,13 @@ pcm_resource_x_bootstrap_round_step_internal(
 	} else {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
+
+round_step_done:
 	if (broadcast)
 		ConditionVariableBroadcast(&entry->wait_cv);
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED) {
 		diagnostic_phase = round->phase;
+		diagnostic_head_failure_reason = round->head_failure_reason;
 		diagnostic_attempt = round->request.assertion_sequence;
 		diagnostic_accepted_base = round->accepted_base;
 		diagnostic_r4_record_generation = round->r4_record_generation;
@@ -11235,7 +11389,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 		diagnostic_master_session_incarnation
 			= round->master_session_incarnation;
 		diagnostic_last_dispatch_us = round->last_dispatch_us;
-		diagnostic_absolute_deadline_us = round->absolute_deadline_us;
+		diagnostic_absolute_deadline_us = round->head_no_progress_deadline_us;
 		diagnostic_master_node = round->current_master_node;
 		diagnostic_requester_sender_generation
 			= round->requester_sender_connection_generation;
@@ -11250,91 +11404,81 @@ pcm_resource_x_bootstrap_round_step_internal(
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED)
-		ereport(LOG,
-				(errmsg_internal("Resource-X bootstrap round diagnostic"),
-				 errdetail("phase=%u identity_match=%s cached_local_x=%s "
-						   "cached_generation=%llu caller_master=%d round_master=%d "
-						   "caller_formation=%llu round_formation=%llu "
-						   "caller_session=%llu round_session=%llu "
-						   "caller_r4_generation=%llu round_r4_generation=%llu "
-						   "attempt=%llu accepted_base=%llu "
-						   "caller_requester_connection=%u round_requester_connection=%u "
-						   "caller_master_connection=%u round_master_connection=%u "
-						   "now=%llu last_dispatch=%llu caller_deadline=%llu round_deadline=%llu",
-						   (unsigned)diagnostic_phase,
-						   diagnostic_identity_match ? "true" : "false",
-						   cached_local_x ? "true" : "false",
-						   (unsigned long long)cached_ownership_generation,
-						   current_master_node, diagnostic_master_node,
-						   (unsigned long long)resource_formation,
-						   (unsigned long long)diagnostic_resource_formation,
-						   (unsigned long long)master_session_incarnation,
-						   (unsigned long long)diagnostic_master_session_incarnation,
-						   (unsigned long long)r4_record_generation,
-						   (unsigned long long)diagnostic_r4_record_generation,
-						   (unsigned long long)diagnostic_attempt,
-						   (unsigned long long)diagnostic_accepted_base,
-						   requester_sender_connection_generation,
-						   diagnostic_requester_sender_generation,
-						   master_ingress_connection_generation,
-						   diagnostic_master_ingress_generation,
-						   (unsigned long long)now_us,
-						   (unsigned long long)diagnostic_last_dispatch_us,
-						   (unsigned long long)absolute_deadline_us,
-						   (unsigned long long)diagnostic_absolute_deadline_us)));
+		ereport(
+			LOG,
+			(errmsg_internal("Resource-X bootstrap round diagnostic"),
+			 errdetail(
+				 "phase=%u identity_match=%s cached_local_x=%s "
+				 "cached_generation=%llu caller_master=%d round_master=%d "
+				 "caller_formation=%llu round_formation=%llu "
+				 "caller_session=%llu round_session=%llu "
+				 "caller_r4_generation=%llu round_r4_generation=%llu "
+				 "attempt=%llu accepted_base=%llu "
+				 "caller_requester_connection=%u round_requester_connection=%u "
+				 "caller_master_connection=%u round_master_connection=%u "
+				 "now=%llu last_dispatch=%llu caller_deadline=%llu round_deadline=%llu "
+				 "head_failure_reason=%s",
+				 (unsigned)diagnostic_phase, diagnostic_identity_match ? "true" : "false",
+				 cached_local_x ? "true" : "false", (unsigned long long)cached_ownership_generation,
+				 current_master_node, diagnostic_master_node,
+				 (unsigned long long)resource_formation,
+				 (unsigned long long)diagnostic_resource_formation,
+				 (unsigned long long)master_session_incarnation,
+				 (unsigned long long)diagnostic_master_session_incarnation,
+				 (unsigned long long)r4_record_generation,
+				 (unsigned long long)diagnostic_r4_record_generation,
+				 (unsigned long long)diagnostic_attempt,
+				 (unsigned long long)diagnostic_accepted_base,
+				 requester_sender_connection_generation, diagnostic_requester_sender_generation,
+				 master_ingress_connection_generation, diagnostic_master_ingress_generation,
+				 (unsigned long long)now_us, (unsigned long long)diagnostic_last_dispatch_us,
+				 (unsigned long long)absolute_deadline_us,
+				 (unsigned long long)diagnostic_absolute_deadline_us,
+				 cluster_pcm_lock_resource_x_head_failure_name(diagnostic_head_failure_reason))));
 	return action;
 }
 
 ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out)
 {
 	return pcm_resource_x_bootstrap_round_step_internal(
-		assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, absolute_deadline_us,
-		now_us, retry_slice_us, 0, 0, true, cached_local_x,
-		cached_ownership_generation, dispatch_out, terminal_ref_out);
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, absolute_deadline_us, head_no_progress_budget_us,
+		now_us, retry_slice_us, 0, 0, true, cached_local_x, cached_ownership_generation,
+		dispatch_out, terminal_ref_out);
 }
 
 ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out)
 {
 	if (direct_init_reservation_token == 0)
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	return pcm_resource_x_bootstrap_round_step_internal(
-		assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, absolute_deadline_us,
-		now_us, retry_slice_us, direct_init_ownership_generation,
-		direct_init_reservation_token, true, cached_local_x,
-		cached_ownership_generation, dispatch_out, terminal_ref_out);
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, absolute_deadline_us, head_no_progress_budget_us,
+		now_us, retry_slice_us, direct_init_ownership_generation, direct_init_reservation_token,
+		true, cached_local_x, cached_ownership_generation, dispatch_out, terminal_ref_out);
 }
 
-/* Snapshot only the already-frozen direct-init follower budget.  This is a
+/* Snapshot only the current node head's admission and progress lease.  This is a
  * read-only admission probe: an EMPTY/failed/expired or inexact round cannot
- * allocate an attempt, clear a binding, advance a phase, or mint a deadline. */
+ * allocate an attempt, clear a binding, advance a phase, or mint a deadline.
+ * The observed head lease is never a caller budget; terminal has no expiry. */
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 	const ResourceXAssertion *assertion,
@@ -11379,11 +11523,11 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 					 || round->install_claim_reservation_token != direct_init_reservation_token)))
 		result = RESOURCE_X_APPLY_STALE;
 	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-			 || round->r4_record_generation == 0
-			 || round->r4_record_generation == UINT64_MAX
-			 || round->absolute_deadline_us == 0
-			 || round->absolute_deadline_us == UINT64_MAX
-			 || now_us >= round->absolute_deadline_us)
+			 || round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
+			 || round->head_no_progress_deadline_us == 0
+			 || round->head_no_progress_deadline_us == UINT64_MAX
+			 || (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+				 && now_us >= round->head_no_progress_deadline_us))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
@@ -11392,7 +11536,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	else {
 		*r4_record_generation_out = round->r4_record_generation;
-		*absolute_deadline_us_out = round->absolute_deadline_us;
+		*absolute_deadline_us_out = round->head_no_progress_deadline_us;
 		result = RESOURCE_X_APPLY_APPLIED;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
@@ -11402,28 +11546,22 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 
 ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool cached_local_x, uint64 cached_ownership_generation,
-	ResourceXDecodedFrame *dispatch_out,
-	ResourceXAcquisitionRef *terminal_ref_out)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out)
 {
 	if (direct_init_reservation_token == 0)
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	return pcm_resource_x_bootstrap_round_step_internal(
-		assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, absolute_deadline_us,
-		now_us, retry_slice_us, direct_init_ownership_generation,
-		direct_init_reservation_token, false, cached_local_x,
-		cached_ownership_generation, dispatch_out, terminal_ref_out);
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, absolute_deadline_us, head_no_progress_budget_us,
+		now_us, retry_slice_us, direct_init_ownership_generation, direct_init_reservation_token,
+		false, cached_local_x, cached_ownership_generation, dispatch_out, terminal_ref_out);
 }
 
 /* A dispatch-side authority recheck can fail while the requester-local kind-9
@@ -11489,7 +11627,6 @@ cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_e
 				 expected_r4_record_generation, request->common.sender_connection_generation,
 				 expected_master_ingress_connection_generation,
 				 expected_direct_init_ownership_generation, expected_direct_init_reservation_token)
-			 || round->absolute_deadline_us != expected_absolute_deadline_us
 			 || round->request.assertion_sequence != round->highest_attempt_floor)
 		result = RESOURCE_X_APPLY_STALE;
 	else if (round->phase
@@ -11562,17 +11699,17 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	else if (authenticated_master_node != round->current_master_node
 			 || authenticated_ingress_connection_generation
-				!= round->master_ingress_connection_generation
+					!= round->master_ingress_connection_generation
 			 || r4_record_generation != round->r4_record_generation
-			 || !cluster_pcm_lock_resource_x_gate_open_exact(
-				round->resource_formation)
-			 || now_us >= round->absolute_deadline_us
-			 || now_us < round->last_dispatch_us) {
-		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			 || !cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation)
+			 || (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+				 && now_us >= round->head_no_progress_deadline_us)) {
+		pcm_resource_x_head_fail_locked(entry, now_us >= round->head_no_progress_deadline_us
+												   ? RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED
+												   : RESOURCE_X_HEAD_FAILURE_NONE);
 		broadcast = true;
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
-	} else if (round->phase
-			   == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
 		pcm_resource_x_common_copy(&round->ack, &ack->common);
 		round->accepted_base = ack->common.base_authority_generation;
 		pcm_resource_x_common_copy(&round->assertion, &round->request);
@@ -11581,13 +11718,17 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 		round->assertion.outcome = RESOURCE_X_OUTCOME_NONE;
 		round->assertion.semantic_crc32c = 0;
 		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED;
-		round->last_dispatch_us = now_us;
+		round->last_dispatch_us = Max(round->last_dispatch_us, now_us);
+		if (!pcm_resource_x_head_changed_locked(entry, true, now_us)) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_entry_ref_release(&entry_ref);
+			return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+		}
 		pcm_resource_x_bootstrap_round_assertion_snapshot(
 			round, assertion_out);
 		broadcast = true;
 		action = RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT;
-	} else if (round->phase
-			   == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
 			   && pcm_resource_x_common_equal(&round->ack, &ack->common))
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 	else
@@ -11604,40 +11745,36 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
  * broadcast cannot be lost between the exact recheck and the sleep. */
 static ResourceXApplyResult
 pcm_resource_x_bootstrap_round_wait_internal(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	long timeout_ms)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms)
 {
 	ClusterPcmResourceXBootstrapRound *round;
 	PcmEntryWaitContext wait_context;
 	PcmEntryAcquireResult acquire_result;
 	struct GrdEntry *entry;
 	ResourceXApplyResult result;
+	uint64 observed_head_change_generation;
+	uint64 observed_attempt;
+	uint64 effective_deadline_us;
+	uint64 remaining_us;
+	uint64 now_us;
 
-	if (!resource_x_assertion_valid(assertion)
-		|| current_master_node < 0
-		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| resource_formation == 0 || resource_formation == UINT64_MAX
-		|| master_session_incarnation == 0
-		|| master_session_incarnation == UINT64_MAX
-		|| r4_record_generation == 0
-		|| r4_record_generation == UINT64_MAX
-		|| requester_sender_connection_generation == 0
+	if (!resource_x_assertion_valid(assertion) || current_master_node < 0
+		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || resource_formation == 0
+		|| resource_formation == UINT64_MAX || master_session_incarnation == 0
+		|| master_session_incarnation == UINT64_MAX || r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX || requester_sender_connection_generation == 0
 		|| requester_sender_connection_generation == UINT32_MAX
 		|| master_ingress_connection_generation == 0
-		|| master_ingress_connection_generation == UINT32_MAX
-		|| retry_slice_us == 0 || retry_slice_us == UINT64_MAX
-		|| (direct_init_reservation_token == 0
-			&& direct_init_ownership_generation != 0)
+		|| master_ingress_connection_generation == UINT32_MAX || retry_slice_us == 0
+		|| retry_slice_us == UINT64_MAX
+		|| (direct_init_reservation_token == 0 && direct_init_ownership_generation != 0)
 		|| direct_init_ownership_generation == UINT64_MAX
-		|| direct_init_reservation_token == UINT64_MAX
-		|| timeout_ms <= 0)
+		|| direct_init_reservation_token == UINT64_MAX || caller_absolute_deadline_us == 0
+		|| caller_absolute_deadline_us == UINT64_MAX || timeout_ms <= 0)
 		return RESOURCE_X_APPLY_INVALID;
 	memset(&wait_context, 0, sizeof(wait_context));
 	if (!pcm_entry_ref_acquire(&assertion->resource, false,
@@ -11645,6 +11782,12 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	entry = wait_context.ref.entry;
 
+	/* This stack-only observation owns no authority.  Pin the binding, sample
+	 * its wait predicate, then enroll and compare before any timed sleep. */
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	observed_head_change_generation = entry->resource_x_bootstrap_round.head_change_generation;
+	observed_attempt = entry->resource_x_bootstrap_round.request.assertion_sequence;
+	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_wait_ref_begin(&wait_context);
 	ConditionVariablePrepareToSleep(&entry->wait_cv);
 	wait_context.cv_prepared = true;
@@ -11701,11 +11844,32 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else
 		result = RESOURCE_X_APPLY_BAD_STATE;
+	now_us = pcm_resource_x_monotonic_us();
+	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		&& now_us >= caller_absolute_deadline_us)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (result == RESOURCE_X_APPLY_APPLIED
+			 && (observed_head_change_generation != round->head_change_generation
+				 || observed_attempt != round->request.assertion_sequence))
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	effective_deadline_us = caller_absolute_deadline_us;
+	if (round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+		&& round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		effective_deadline_us = Min(effective_deadline_us, round->head_no_progress_deadline_us);
+	if (result == RESOURCE_X_APPLY_APPLIED && now_us >= effective_deadline_us)
+		/* Only the exact drive step may expire the shared head. */
+		result = RESOURCE_X_APPLY_DUPLICATE;
 	LWLockRelease(&entry->entry_lock.lock);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
+	remaining_us = Min(effective_deadline_us - now_us, retry_slice_us);
+	if (remaining_us < UINT64_C(1000)) {
+		pcm_entry_wait_context_cleanup(&wait_context);
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+	timeout_ms = (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
 
 	PG_TRY();
 	{
@@ -11729,42 +11893,133 @@ pcm_resource_x_bootstrap_round_wait_internal(
 
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us, long timeout_ms)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, long timeout_ms)
 {
 	return pcm_resource_x_bootstrap_round_wait_internal(
-		assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, retry_slice_us,
-		0, 0, timeout_ms);
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, retry_slice_us, 0, 0, caller_absolute_deadline_us,
+		timeout_ms);
 }
 
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	long timeout_ms)
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms)
 {
 	if (direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	return pcm_resource_x_bootstrap_round_wait_internal(
-		assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, retry_slice_us,
-		direct_init_ownership_generation,
-		direct_init_reservation_token, timeout_ms);
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, retry_slice_us, direct_init_ownership_generation,
+		direct_init_reservation_token, caller_absolute_deadline_us, timeout_ms);
+}
+
+/* A predecessor has its own exact settlement identity, not a requester head.
+ * Pin the entry, capture that identity, enroll, then recheck both the existing
+ * predicate and the captured bytes.  Wake/expiry only requests a fresh probe. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 current_master_node,
+												   uint64 current_master_session,
+												   uint64 current_formation,
+												   uint64 expected_carrier_generation,
+												   uint64 caller_absolute_deadline_us,
+												   uint64 requested_sleep_slice_us)
+{
+	ClusterPcmResourceXHolderStatus observed_status;
+	ClusterPcmResourceXHolderImage observed_image;
+	ClusterPcmResourceXMasterState *master_state;
+	PcmEntryWaitContext wait_context;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	uint64 now_us;
+	uint64 remaining_us;
+	long timeout_ms;
+
+	if (tag == NULL || current_master_node < 0
+		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || current_master_session == 0
+		|| current_master_session == UINT64_MAX || current_formation == 0
+		|| current_formation == UINT64_MAX || expected_carrier_generation == UINT64_MAX
+		|| caller_absolute_deadline_us == 0 || caller_absolute_deadline_us == UINT64_MAX
+		|| requested_sleep_slice_us == 0 || requested_sleep_slice_us == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&wait_context, 0, sizeof(wait_context));
+	if (!pcm_entry_ref_acquire(tag, false, &wait_context.ref, &acquire_result))
+		return RESOURCE_X_APPLY_DUPLICATE;
+	entry = wait_context.ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+		entry, current_master_node, current_master_session, current_formation,
+		expected_carrier_generation);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		master_state = pcm_resource_x_master_state_for_entry(entry);
+		observed_status = master_state->holder_status;
+		observed_image = master_state->holder_image;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		pcm_entry_ref_release(&wait_context.ref);
+		return result == RESOURCE_X_APPLY_NOT_FOUND ? RESOURCE_X_APPLY_DUPLICATE : result;
+	}
+	pcm_entry_wait_ref_begin(&wait_context);
+	ConditionVariablePrepareToSleep(&entry->wait_cv);
+	wait_context.cv_prepared = true;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+		entry, current_master_node, current_master_session, current_formation,
+		expected_carrier_generation);
+	master_state = pcm_resource_x_master_state_for_entry(entry);
+	if (result == RESOURCE_X_APPLY_NOT_FOUND)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if (result == RESOURCE_X_APPLY_APPLIED
+			 && (memcmp(&observed_status, &master_state->holder_status, sizeof(observed_status))
+					 != 0
+				 || memcmp(&observed_image, &master_state->holder_image, sizeof(observed_image))
+						!= 0))
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	if (result == RESOURCE_X_APPLY_APPLIED && expected_carrier_generation == 0
+		&& entry->resource_x_bootstrap_round.phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	LWLockRelease(&entry->entry_lock.lock);
+	now_us = pcm_resource_x_monotonic_us();
+	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		&& now_us >= caller_absolute_deadline_us)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		pcm_entry_wait_context_cleanup(&wait_context);
+		return result;
+	}
+	remaining_us = Min(caller_absolute_deadline_us - now_us, requested_sleep_slice_us);
+	if (remaining_us < UINT64_C(1000)) {
+		pcm_entry_wait_context_cleanup(&wait_context);
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
+	PG_TRY();
+	{
+		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
+			pcm_resource_x_reconfig_block();
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("Resource-X predecessor waiter entry identity changed after wakeup")));
+		}
+	}
+	PG_FINALLY();
+	{
+		pcm_entry_wait_context_cleanup(&wait_context);
+	}
+	PG_END_TRY();
+	return RESOURCE_X_APPLY_APPLIED;
 }
 
 /* The BufferDesc and requester round are separate lock domains.  A direct
@@ -12035,8 +12290,8 @@ pcm_resource_x_target_install_continuation_valid(
 		|| continuation->acquisition_generation == UINT64_MAX
 		|| continuation->accepted_base_authority_generation == 0
 		|| continuation->accepted_base_authority_generation == UINT64_MAX
-		|| continuation->round_absolute_deadline_us == 0
-		|| continuation->round_absolute_deadline_us == UINT64_MAX
+		|| continuation->observed_head_change_generation == 0
+		|| continuation->observed_head_change_generation == UINT64_MAX
 		|| continuation->caller_absolute_deadline_us == 0
 		|| continuation->caller_absolute_deadline_us == UINT64_MAX
 		|| continuation->requested_sleep_slice_us == 0
@@ -12605,8 +12860,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 				 round->install_claim_pending_generation, round->install_claim_reservation_token)
 			 || round->request.assertion_sequence == 0
 			 || round->request.assertion_sequence == UINT64_MAX || round->accepted_base == 0
-			 || round->accepted_base == UINT64_MAX || round->absolute_deadline_us == 0
-			 || round->absolute_deadline_us == UINT64_MAX)
+			 || round->accepted_base == UINT64_MAX || round->head_no_progress_deadline_us == 0
+			 || round->head_no_progress_deadline_us == UINT64_MAX)
 		state = RESOURCE_X_TARGET_INSTALL_STALE;
 	else if (!BufferTagsEqual(&observed->tag, &assertion->resource)
 		|| observed->reservation_token == 0
@@ -12647,8 +12902,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 			= round->request.assertion_sequence;
 		continuation.accepted_base_authority_generation
 			= round->accepted_base;
-		continuation.round_absolute_deadline_us
-			= round->absolute_deadline_us;
+		continuation.observed_head_change_generation = round->head_change_generation;
 		continuation.caller_absolute_deadline_us
 			= caller_absolute_deadline_us;
 		continuation.requested_sleep_slice_us = retry_slice_us;
@@ -12875,12 +13129,10 @@ pcm_resource_x_target_install_wait_recheck_locked(
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
-/* Register before rechecking the exact retained install receipt so terminal
- * or owner-clear broadcasts cannot be lost.  An in-flight wait is still part
- * of the acquisition round and is bounded by both immutable deadlines.  A
- * PREUSE wait starts only after that round has published a terminal cover, so
- * its historical round deadline is identity, not the later caller's budget.
- * Every return remains only a wake/reprobe classification. */
+/* Register before rechecking the exact retained install receipt and its
+ * observed predicate version.  Read the current progress lease under the
+ * entry lock, never from a follower's saved observation.  Terminal PREUSE
+ * has only the caller's fixed deadline.  Every wake requires a fresh probe. */
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	const ResourceXTargetInstallContinuation *continuation,
@@ -12924,26 +13176,37 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	round = &entry->resource_x_bootstrap_round;
 	result = pcm_resource_x_target_install_wait_recheck_locked(
 		entry, round, continuation, &assertion, expected_follow_state);
+	now_us = pcm_resource_x_monotonic_us();
+	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		&& now_us >= continuation->caller_absolute_deadline_us)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (result == RESOURCE_X_APPLY_APPLIED
+			 && continuation->observed_head_change_generation != round->head_change_generation)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	effective_deadline_us = continuation->caller_absolute_deadline_us;
+	if (expected_follow_state == RESOURCE_X_TARGET_INSTALL_INFLIGHT)
+		effective_deadline_us = Min(effective_deadline_us, round->head_no_progress_deadline_us);
 	LWLockRelease(&entry->entry_lock.lock);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
-	if (expected_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
-		effective_deadline_us
-			= continuation->caller_absolute_deadline_us;
-	else
-		effective_deadline_us = Min(
-			continuation->round_absolute_deadline_us,
-			continuation->caller_absolute_deadline_us);
 	now_us = pcm_resource_x_monotonic_us();
 	if (now_us >= effective_deadline_us) {
 		pcm_entry_wait_context_cleanup(&wait_context);
-		return RESOURCE_X_APPLY_BAD_STATE;
+		/* The head may have progressed after unlocking.  A sampled lease
+		 * expiry only asks the exact driver to recheck the current head;
+		 * this follower may fail only on its own fixed deadline. */
+		return now_us >= continuation->caller_absolute_deadline_us ? RESOURCE_X_APPLY_BAD_STATE
+																   : RESOURCE_X_APPLY_DUPLICATE;
 	}
 	remaining_us = effective_deadline_us - now_us;
-	deadline_ms = remaining_us / UINT64_C(1000)
-		+ (remaining_us % UINT64_C(1000) != 0);
+	remaining_us = Min(remaining_us, continuation->requested_sleep_slice_us);
+	deadline_ms = remaining_us / UINT64_C(1000);
+	if (deadline_ms == 0) {
+		pcm_entry_wait_context_cleanup(&wait_context);
+		return RESOURCE_X_APPLY_APPLIED;
+	}
 	sleep_ms = timeout_ms;
 	if (deadline_ms < (uint64) sleep_ms)
 		sleep_ms = (long) deadline_ms;
@@ -13035,7 +13298,11 @@ cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 		out->r4_record_generation = round->r4_record_generation;
 		out->master_session_incarnation
 			= round->master_session_incarnation;
-		out->absolute_deadline_us = round->absolute_deadline_us;
+		out->absolute_deadline_us = round->head_no_progress_deadline_us;
+		out->head_change_generation = round->head_change_generation;
+		out->head_last_semantic_progress_us = round->head_last_semantic_progress_us;
+		out->head_no_progress_budget_us = round->head_no_progress_budget_us;
+		out->head_failure_reason = round->head_failure_reason;
 		out->requester_base_generation
 			= entry->resource_x_requester_base_generation;
 		out->retired_acquisition_generation
@@ -13468,8 +13735,7 @@ cluster_pcm_lock_resource_x_itl_recycle_begin_exact(
 			&entry->resource_x_local_owner))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else {
-		broadcast = pcm_resource_x_local_owner_expire_locked(
-			&entry->resource_x_local_owner, now_us);
+		broadcast = pcm_resource_x_local_owner_expire_locked(entry, now_us);
 		if (!cluster_pcm_lock_resource_x_gate_open_exact(ref->formation)
 		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
 			entry, round, ref, master_session_incarnation,
@@ -13521,8 +13787,7 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(
 			&owner->handle, handle))
 		result = RESOURCE_X_APPLY_STALE;
 	else {
-		broadcast = pcm_resource_x_local_owner_expire_locked(
-			owner, now_us);
+		broadcast = pcm_resource_x_local_owner_expire_locked(entry, now_us);
 		if (!cluster_pcm_lock_resource_x_gate_open_exact(
 			handle->ref.formation)
 		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
@@ -13530,21 +13795,20 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(
 			handle->master_session_incarnation,
 			handle->r4_record_generation,
 			handle->buffer_ownership_generation)) {
-			broadcast = pcm_resource_x_local_owner_priority_clear_locked(
-				owner) || broadcast;
+			broadcast = pcm_resource_x_local_owner_priority_clear_locked(entry) || broadcast;
 			result = RESOURCE_X_APPLY_STALE;
 		} else if (pcm_resource_x_local_handoff_valid(&owner->handoff)) {
 			if (!pcm_resource_x_local_handoff_round_current_locked(
 					&owner->handoff, round)) {
-				broadcast = pcm_resource_x_local_owner_priority_clear_locked(
-					owner) || broadcast;
+				broadcast = pcm_resource_x_local_owner_priority_clear_locked(entry) || broadcast;
 				result = RESOURCE_X_APPLY_STALE;
 			} else {
 				memset(&owner->handle, 0, sizeof(owner->handle));
 				owner->state = RESOURCE_X_LOCAL_OWNER_HANDOFF;
 				result = pcm_resource_x_local_owner_valid_locked(owner)
-					? RESOURCE_X_APPLY_APPLIED
-					: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								 && pcm_resource_x_head_changed_locked(entry, true, now_us)
+							 ? RESOURCE_X_APPLY_APPLIED
+							 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 		} else
 			result = pcm_resource_x_local_owner_release_locked(
@@ -13623,7 +13887,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 	if (!pcm_resource_x_local_owner_valid_locked(
 			owner))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if (pcm_resource_x_local_owner_expire_locked(owner, now_us)) {
+	else if (pcm_resource_x_local_owner_expire_locked(entry, now_us)) {
 		broadcast = true;
 		result = RESOURCE_X_APPLY_STALE;
 	} else {
@@ -13633,14 +13897,12 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 			lineage_out);
 		if (owner->state == RESOURCE_X_LOCAL_OWNER_RECYCLING) {
 			if (!lineage_matches) {
-				broadcast = pcm_resource_x_local_owner_priority_clear_locked(
-					owner);
+				broadcast = pcm_resource_x_local_owner_priority_clear_locked(entry);
 				result = RESOURCE_X_APPLY_STALE;
 			} else if (pcm_resource_x_local_handoff_empty(
 					&owner->handoff)) {
 				result = pcm_resource_x_local_handoff_freeze_locked(
-					owner, round, successor_block,
-					authenticated_master_node, r4_record_generation,
+					entry, round, successor_block, authenticated_master_node, r4_record_generation,
 					cached_ownership_generation, now_us);
 				if (result == RESOURCE_X_APPLY_APPLIED) {
 					broadcast = true;
@@ -13659,8 +13921,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 				|| !lineage_matches
 				|| !pcm_resource_x_local_handoff_round_current_locked(
 					&owner->handoff, round)) {
-				broadcast = pcm_resource_x_local_owner_priority_clear_locked(
-					owner);
+				broadcast = pcm_resource_x_local_owner_priority_clear_locked(entry);
 				result = RESOURCE_X_APPLY_STALE;
 			} else if (!pcm_resource_x_local_handoff_successor_exact(
 					&owner->handoff, successor_block,
@@ -13669,7 +13930,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 				result = RESOURCE_X_APPLY_STALE;
 			else {
 				retained_handoff = owner->handoff;
-				pcm_resource_x_local_owner_clear_locked(owner);
+				pcm_resource_x_local_owner_clear_locked(entry);
 				result = pcm_resource_x_local_owner_claim_locked(
 					entry, RESOURCE_X_LOCAL_OWNER_REVOKING,
 					&retained_handoff.holder_ref,
@@ -13727,7 +13988,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 			if (result == RESOURCE_X_APPLY_APPLIED) {
 				owner->handoff = retained_handoff;
 				if (!pcm_resource_x_local_owner_valid_locked(owner)) {
-					pcm_resource_x_local_owner_clear_locked(owner);
+					pcm_resource_x_local_owner_clear_locked(entry);
 					memset(handle_out, 0, sizeof(*handle_out));
 					result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 				}
@@ -13930,7 +14191,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(
 		result = RESOURCE_X_APPLY_STALE;
 	else {
 		pcm_resource_x_bootstrap_round_clear_binding_locked(round);
-		pcm_resource_x_local_owner_clear_locked(owner);
+		pcm_resource_x_local_owner_clear_locked(entry);
 		broadcast = true;
 		result = RESOURCE_X_APPLY_APPLIED;
 	}
@@ -13984,19 +14245,20 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
 				handle->buffer_ownership_generation)
 			|| !pcm_resource_x_local_handoff_round_current_locked(
 				&owner->handoff, round)) {
-			pcm_resource_x_local_owner_clear_locked(owner);
+			pcm_resource_x_local_owner_clear_locked(entry);
 			broadcast = true;
 			result = RESOURCE_X_APPLY_STALE;
 		} else {
 			memset(&owner->handle, 0, sizeof(owner->handle));
 			owner->state = RESOURCE_X_LOCAL_OWNER_HANDOFF;
 			result = pcm_resource_x_local_owner_valid_locked(owner)
-				? RESOURCE_X_APPLY_APPLIED
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+							 && pcm_resource_x_head_changed_locked(entry, true, now_us)
+						 ? RESOURCE_X_APPLY_APPLIED
+						 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			broadcast = result == RESOURCE_X_APPLY_APPLIED;
 		}
 	} else {
-		pcm_resource_x_local_owner_clear_locked(owner);
+		pcm_resource_x_local_owner_clear_locked(entry);
 		broadcast = true;
 		result = RESOURCE_X_APPLY_APPLIED;
 	}
@@ -14069,27 +14331,19 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 		result = round->terminal_authority_generation
 			== terminal_authority_generation
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
-	else if (round->phase
-			   != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
-			 || !resource_x_assertion_equal(
-				&round->request.logical_assertion, &ref->assertion)
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+			 || !resource_x_assertion_equal(&round->request.logical_assertion, &ref->assertion)
 			 || round->resource_formation != ref->formation
-			 || round->master_session_incarnation
-				!= master_session_incarnation
+			 || round->master_session_incarnation != master_session_incarnation
 			 || round->r4_record_generation != r4_record_generation
-			 || round->request.assertion_sequence
-				!= ref->acquisition_generation
-			 || round->highest_attempt_floor
-				!= ref->acquisition_generation
-			 || round->accepted_base == 0
-			 || round->accepted_base == UINT64_MAX
+			 || round->request.assertion_sequence != ref->acquisition_generation
+			 || round->highest_attempt_floor != ref->acquisition_generation
+			 || round->accepted_base == 0 || round->accepted_base == UINT64_MAX
 			 || terminal_authority_generation <= round->accepted_base
-			 || now_us < round->last_dispatch_us
-			 || now_us >= round->absolute_deadline_us
+			 || now_us >= round->head_no_progress_deadline_us
 			 || !cluster_pcm_lock_resource_x_gate_open_exact(ref->formation)
 			 || !pcm_resource_x_active_empty_locked(entry)
-			 || entry->resource_x_retired_acquisition_generation
-				!= ref->acquisition_generation)
+			 || entry->resource_x_retired_acquisition_generation != ref->acquisition_generation)
 		result = RESOURCE_X_APPLY_STALE;
 	else {
 		round->terminal_ref = *ref;
@@ -14098,7 +14352,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 		round->cached_ownership_generation = cached_ownership_generation;
 		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED;
 		broadcast = true;
-		result = RESOURCE_X_APPLY_APPLIED;
+		result = pcm_resource_x_head_changed_locked(entry, true, now_us)
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	if (broadcast)
 		ConditionVariableBroadcast(&entry->wait_cv);
@@ -14182,17 +14438,14 @@ pcm_resource_x_target_evict_owner_exact_locked(
 	int32 owner_procno)
 {
 	return pcm_resource_x_local_owner_valid_locked(owner)
-		&& owner->state == RESOURCE_X_LOCAL_OWNER_EVICTING
-		&& pcm_resource_x_acquisition_ref_equal(
-			&owner->handle.ref, &round->terminal_ref)
-		&& owner->handle.master_session_incarnation
-			== master_session_incarnation
-		&& owner->handle.r4_record_generation == r4_record_generation
-		&& owner->handle.buffer_ownership_generation
-			== cached_ownership_generation
-		&& owner->handle.reservation_token == reservation_token
-		&& owner->handle.absolute_deadline_us == round->absolute_deadline_us
-		&& owner->handle.owner_procno == owner_procno;
+		   && owner->state == RESOURCE_X_LOCAL_OWNER_EVICTING
+		   && pcm_resource_x_acquisition_ref_equal(&owner->handle.ref, &round->terminal_ref)
+		   && owner->handle.master_session_incarnation == master_session_incarnation
+		   && owner->handle.r4_record_generation == r4_record_generation
+		   && owner->handle.buffer_ownership_generation == cached_ownership_generation
+		   && owner->handle.reservation_token == reservation_token
+		   && owner->handle.absolute_deadline_us == round->head_no_progress_deadline_us
+		   && owner->handle.owner_procno == owner_procno;
 }
 
 ResourceXApplyResult
@@ -14308,11 +14561,9 @@ cluster_pcm_lock_resource_x_target_evict_abort_exact(
 	pcm_entry_lock_exclusive(entry);
 	round = &entry->resource_x_bootstrap_round;
 	if (!pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-			entry, round, &handle->ref,
-			handle->master_session_incarnation,
-			handle->r4_record_generation,
-			handle->buffer_ownership_generation)
-		|| handle->absolute_deadline_us != round->absolute_deadline_us)
+			entry, round, &handle->ref, handle->master_session_incarnation,
+			handle->r4_record_generation, handle->buffer_ownership_generation)
+		|| handle->absolute_deadline_us != round->head_no_progress_deadline_us)
 		result = RESOURCE_X_APPLY_STALE;
 	else
 		result = pcm_resource_x_local_owner_release_locked(
@@ -14351,42 +14602,29 @@ pcm_resource_x_target_evict_release_matches_locked(
 		return false;
 	common = &release->common;
 	return resource_x_assertion_valid(&common->logical_assertion)
-		&& round->current_master_node == current_master_node
-		&& round->r4_record_generation == r4_record_generation
-		&& resource_x_assertion_equal(
-			&common->logical_assertion, &round->terminal_ref.assertion)
-		&& common->base_authority_generation == round->accepted_base
-		&& common->authority_generation
-			== round->terminal_authority_generation
-		&& common->resource_formation == round->resource_formation
-		&& common->master_session_incarnation
-			== round->master_session_incarnation
-		&& common->assertion_sequence
-			== round->terminal_ref.acquisition_generation
-		&& common->ordered_lane == round->request.ordered_lane
-		&& common->action_node
-			== round->terminal_ref.assertion.requester_node
-		&& common->observed_mode == (uint8)PCM_STATE_X
-		&& common->target_mode == (uint8)PCM_STATE_N
-		&& common->source_candidate == 0
-		&& common->retain_pi_if_dirty == 0
-		&& common->sender_connection_generation != 0
-		&& common->sender_connection_generation != UINT32_MAX
-		&& common->outcome == RESOURCE_X_OUTCOME_OK
-		&& common->flags == 0
-		&& cluster_pcm_lock_resource_x_gate_open_exact(
-			common->resource_formation)
-		&& pcm_resource_x_local_owner_valid_locked(
-			&entry->resource_x_local_owner)
-		&& entry->resource_x_local_owner.state
-			== RESOURCE_X_LOCAL_OWNER_EVICTING
-		&& pcm_resource_x_local_owner_handle_equal(
-			&entry->resource_x_local_owner.handle, handle)
-		&& handle->absolute_deadline_us == round->absolute_deadline_us
-		&& pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-			entry, round, &round->terminal_ref,
-			common->master_session_incarnation, r4_record_generation,
-			cached_ownership_generation);
+		   && round->current_master_node == current_master_node
+		   && round->r4_record_generation == r4_record_generation
+		   && resource_x_assertion_equal(&common->logical_assertion, &round->terminal_ref.assertion)
+		   && common->base_authority_generation == round->accepted_base
+		   && common->authority_generation == round->terminal_authority_generation
+		   && common->resource_formation == round->resource_formation
+		   && common->master_session_incarnation == round->master_session_incarnation
+		   && common->assertion_sequence == round->terminal_ref.acquisition_generation
+		   && common->ordered_lane == round->request.ordered_lane
+		   && common->action_node == round->terminal_ref.assertion.requester_node
+		   && common->observed_mode == (uint8)PCM_STATE_X
+		   && common->target_mode == (uint8)PCM_STATE_N && common->source_candidate == 0
+		   && common->retain_pi_if_dirty == 0 && common->sender_connection_generation != 0
+		   && common->sender_connection_generation != UINT32_MAX
+		   && common->outcome == RESOURCE_X_OUTCOME_OK && common->flags == 0
+		   && cluster_pcm_lock_resource_x_gate_open_exact(common->resource_formation)
+		   && pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+		   && entry->resource_x_local_owner.state == RESOURCE_X_LOCAL_OWNER_EVICTING
+		   && pcm_resource_x_local_owner_handle_equal(&entry->resource_x_local_owner.handle, handle)
+		   && handle->absolute_deadline_us == round->head_no_progress_deadline_us
+		   && pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+			   entry, round, &round->terminal_ref, common->master_session_incarnation,
+			   r4_record_generation, cached_ownership_generation);
 }
 
 ResourceXApplyResult
@@ -14420,8 +14658,7 @@ cluster_pcm_lock_resource_x_target_evict_commit_exact(
 		return RESOURCE_X_APPLY_STALE;
 	}
 	pcm_resource_x_bootstrap_round_clear_binding_locked(round);
-	pcm_resource_x_local_owner_clear_locked(
-		&entry->resource_x_local_owner);
+	pcm_resource_x_local_owner_clear_locked(entry);
 	retire_tag = entry_ref.tag;
 	retire_generation = entry_ref.binding_generation;
 	ConditionVariableBroadcast(&entry->wait_cv);
@@ -16462,7 +16699,7 @@ pcm_resource_x_s_predecessor_cancel_unbound_round_locked(
 {
 	static const ResourceXAcquisitionRef empty_ref;
 	static const ResourceXDecodedCommon empty_common;
-	static const uint8 zero_reserved[3];
+	static const uint8 zero_reserved[1];
 	ClusterPcmResourceXBootstrapRound *round;
 	const ResourceXDecodedCommon *request;
 
@@ -16491,8 +16728,9 @@ pcm_resource_x_s_predecessor_cancel_unbound_round_locked(
 		|| round->resource_formation != block->common.resource_formation
 		|| round->master_session_incarnation != block->common.master_session_incarnation
 		|| round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
-		|| round->absolute_deadline_us == 0 || round->absolute_deadline_us == UINT64_MAX
-		|| round->last_dispatch_us == 0 || round->last_dispatch_us >= round->absolute_deadline_us
+		|| round->head_no_progress_deadline_us == 0
+		|| round->head_no_progress_deadline_us == UINT64_MAX || round->last_dispatch_us == 0
+		|| round->last_dispatch_us >= round->head_no_progress_deadline_us
 		|| round->retry_slice_us == 0 || round->retry_slice_us == UINT64_MAX
 		|| round->requester_sender_connection_generation == 0
 		|| round->requester_sender_connection_generation == UINT32_MAX
@@ -19566,57 +19804,42 @@ pcm_resource_x_requester_join_live_round_base_exact_locked(
 		&entry->entry_lock.lock, LW_EXCLUSIVE));
 	round = &entry->resource_x_bootstrap_round;
 	common = &frame->common;
-	return round->phase
-			== RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
-		&& now_us != 0 && now_us != UINT64_MAX
-		&& now_us >= round->last_dispatch_us
-		&& now_us < round->absolute_deadline_us
-		&& round->current_master_node >= 0
-		&& round->current_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
-			|| round->current_master_node == authenticated_source_node)
-		&& resource_x_assertion_equal(
-			&round->request.logical_assertion,
-			&common->logical_assertion)
-		&& round->resource_formation == common->resource_formation
-		&& round->master_session_incarnation
-			== common->master_session_incarnation
-		&& round->r4_record_generation != 0
-		&& round->r4_record_generation != UINT64_MAX
-		&& round->request.assertion_sequence
-			== requester_target_generation
-		&& round->highest_attempt_floor == requester_target_generation
-		&& round->request.ordered_lane == common->ordered_lane
-		&& round->accepted_base != 0
-		&& round->accepted_base != UINT64_MAX
-		&& round->accepted_base == common->base_authority_generation
-		&& common->authority_generation > round->accepted_base
-		&& common->authority_generation != UINT64_MAX
-		&& resource_x_assertion_equal(
-			&round->ack.logical_assertion,
-			&round->request.logical_assertion)
-		&& round->ack.base_authority_generation == round->accepted_base
-		&& round->ack.authority_generation == 0
-		&& round->ack.resource_formation == round->resource_formation
-		&& round->ack.master_session_incarnation
-			== round->master_session_incarnation
-		&& round->ack.assertion_sequence == requester_target_generation
-		&& round->ack.outcome == RESOURCE_X_OUTCOME_OK
-		&& resource_x_assertion_equal(
-			&round->assertion.logical_assertion,
-			&round->request.logical_assertion)
-		&& round->assertion.base_authority_generation
-			== round->accepted_base
-		&& round->assertion.authority_generation == round->accepted_base
-		&& round->assertion.resource_formation == round->resource_formation
-		&& round->assertion.master_session_incarnation
-			== round->master_session_incarnation
-		&& round->assertion.assertion_sequence
-			== requester_target_generation
-		&& round->assertion.ordered_lane == common->ordered_lane
-		&& round->assertion.outcome == RESOURCE_X_OUTCOME_NONE
-		&& cluster_pcm_lock_resource_x_gate_open_exact(
-			round->resource_formation);
+	return round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED && now_us != 0
+		   && now_us != UINT64_MAX && now_us >= round->last_dispatch_us
+		   && now_us < round->head_no_progress_deadline_us && round->current_master_node >= 0
+		   && round->current_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
+			   || round->current_master_node == authenticated_source_node)
+		   && resource_x_assertion_equal(&round->request.logical_assertion,
+										 &common->logical_assertion)
+		   && round->resource_formation == common->resource_formation
+		   && round->master_session_incarnation == common->master_session_incarnation
+		   && round->r4_record_generation != 0 && round->r4_record_generation != UINT64_MAX
+		   && round->request.assertion_sequence == requester_target_generation
+		   && round->highest_attempt_floor == requester_target_generation
+		   && round->request.ordered_lane == common->ordered_lane && round->accepted_base != 0
+		   && round->accepted_base != UINT64_MAX
+		   && round->accepted_base == common->base_authority_generation
+		   && common->authority_generation > round->accepted_base
+		   && common->authority_generation != UINT64_MAX
+		   && resource_x_assertion_equal(&round->ack.logical_assertion,
+										 &round->request.logical_assertion)
+		   && round->ack.base_authority_generation == round->accepted_base
+		   && round->ack.authority_generation == 0
+		   && round->ack.resource_formation == round->resource_formation
+		   && round->ack.master_session_incarnation == round->master_session_incarnation
+		   && round->ack.assertion_sequence == requester_target_generation
+		   && round->ack.outcome == RESOURCE_X_OUTCOME_OK
+		   && resource_x_assertion_equal(&round->assertion.logical_assertion,
+										 &round->request.logical_assertion)
+		   && round->assertion.base_authority_generation == round->accepted_base
+		   && round->assertion.authority_generation == round->accepted_base
+		   && round->assertion.resource_formation == round->resource_formation
+		   && round->assertion.master_session_incarnation == round->master_session_incarnation
+		   && round->assertion.assertion_sequence == requester_target_generation
+		   && round->assertion.ordered_lane == common->ordered_lane
+		   && round->assertion.outcome == RESOURCE_X_OUTCOME_NONE
+		   && cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation);
 }
 
 ResourceXApplyResult
@@ -22451,31 +22674,28 @@ cluster_pcm_lock_resource_x_release_x_exact(
 	 * outbound intents, so detecting cover loss afterwards is too late. */
 	if (requester_node == cluster_node_id) {
 		preserve_local_terminal_cover
-			= entry->resource_x_bootstrap_round.current_master_node
-				== cluster_node_id
-			&& entry->resource_x_bootstrap_round.accepted_base
-				== release->common.base_authority_generation
-			&& entry->resource_x_bootstrap_round.terminal_authority_generation
-				== release->common.authority_generation
-			&& entry->resource_x_bootstrap_round.request.ordered_lane
-				== release->common.ordered_lane
-			&& resource_x_assertion_equal(
-				&entry->resource_x_bootstrap_round.terminal_ref.assertion,
-				&release->common.logical_assertion)
-			&& pcm_resource_x_local_owner_valid_locked(
-				&entry->resource_x_local_owner)
-			&& entry->resource_x_local_owner.state
-				== RESOURCE_X_LOCAL_OWNER_EVICTING
-			&& pcm_resource_x_local_owner_round_exact_locked(
-				entry, &entry->resource_x_bootstrap_round)
-			&& entry->resource_x_local_owner.handle.absolute_deadline_us
-				== entry->resource_x_bootstrap_round.absolute_deadline_us
-			&& pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-				entry, &entry->resource_x_bootstrap_round,
-				&entry->resource_x_bootstrap_round.terminal_ref,
-				release->common.master_session_incarnation,
-				entry->resource_x_bootstrap_round.r4_record_generation,
-				entry->resource_x_bootstrap_round.cached_ownership_generation);
+			= entry->resource_x_bootstrap_round.current_master_node == cluster_node_id
+			  && entry->resource_x_bootstrap_round.accepted_base
+					 == release->common.base_authority_generation
+			  && entry->resource_x_bootstrap_round.terminal_authority_generation
+					 == release->common.authority_generation
+			  && entry->resource_x_bootstrap_round.request.ordered_lane
+					 == release->common.ordered_lane
+			  && resource_x_assertion_equal(
+				  &entry->resource_x_bootstrap_round.terminal_ref.assertion,
+				  &release->common.logical_assertion)
+			  && pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+			  && entry->resource_x_local_owner.state == RESOURCE_X_LOCAL_OWNER_EVICTING
+			  && pcm_resource_x_local_owner_round_exact_locked(entry,
+															   &entry->resource_x_bootstrap_round)
+			  && entry->resource_x_local_owner.handle.absolute_deadline_us
+					 == entry->resource_x_bootstrap_round.head_no_progress_deadline_us
+			  && pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+				  entry, &entry->resource_x_bootstrap_round,
+				  &entry->resource_x_bootstrap_round.terminal_ref,
+				  release->common.master_session_incarnation,
+				  entry->resource_x_bootstrap_round.r4_record_generation,
+				  entry->resource_x_bootstrap_round.cached_ownership_generation);
 		if (!preserve_local_terminal_cover) {
 			pcm_resource_x_release_snapshot(&entry->tag, state, request,
 				tombstone, tombstone_request, requester_node, out);
