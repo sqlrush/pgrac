@@ -1023,14 +1023,17 @@ void *ProcGlobal = &stub_proc_global;
 void *
 palloc0(Size sz)
 {
-	static char buf[256];
-	(void)sz;
-	memset(buf, 0, sizeof(buf));
+	void *buf = calloc(1, sz);
+
+	if (buf == NULL)
+		abort();
 	return buf;
 }
 void
-pfree(void *p pg_attribute_unused())
-{}
+pfree(void *p)
+{
+	free(p);
+}
 
 /* spec-2.15 D11: shmem add_size stub.  cluster_grd_shmem_size() wraps
  * add_size() for the entry HTAB component; standalone harness never
@@ -1596,6 +1599,7 @@ UT_TEST(test_grd_reclaim_sweep_reclaims_legacy_cold_entries)
 UT_TEST(test_grd_reclaim_sweep_honors_large_batch_guc)
 {
 	ClusterGrdEntry *entry = NULL;
+	int test_ordinal = ut_test_count;
 	int i;
 
 	grd_lifecycle_reset(320);
@@ -1615,6 +1619,9 @@ UT_TEST(test_grd_reclaim_sweep_honors_large_batch_guc)
 	cluster_grd_entry_reclaim_max_per_sweep = 300;
 	UT_ASSERT_EQ(cluster_grd_reclaim_sweep(), 300);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	/* The allocator fixture must honor the 4800-byte batch, not corrupt
+	 * neighboring test bookkeeping through an undersized static buffer. */
+	UT_ASSERT_EQ(ut_test_count, test_ordinal);
 
 	cluster_grd_max_entries = 0;
 	reset_fake_grd_htab();
