@@ -2869,6 +2869,9 @@ UT_TEST(test_join_bitmap_declared_peer_filter)
 	int n;
 
 	ut_join_setup();
+	/* Never-seen runtime admission is past INITIAL; initial founders use
+	 * the exact bootstrap path tested separately below. */
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(7)));
 	/* node 3 declared, ALIVE, fresh slot, membership ABSENT -> join edge */
 	ut_declared_set[3] = true;
 	ut_peer_state[3] = CLUSTER_CSSD_PEER_ALIVE;
@@ -2881,6 +2884,51 @@ UT_TEST(test_join_bitmap_declared_peer_filter)
 	UT_ASSERT_EQ(n, 1);
 	UT_ASSERT(jb_test(jb, 3));
 	UT_ASSERT(!jb_test(jb, 5));
+}
+
+/* A new founding peer can be published by QVOTEC after the membership loop
+ * has sampled it, but before the same tick computes runtime join edges.
+ * INITIAL ABSENT remains owned by bootstrap on both sides of that window;
+ * a transient missing bootstrap proof must not create JOIN_PENDING. */
+UT_TEST(test_initial_absent_peer_is_not_a_runtime_join_edge)
+{
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 inc = 0;
+	int i;
+
+	ut_join_setup();
+	ut_in_quorum_value = true;
+	for (i = 0; i < 4; i++) {
+		ut_declared_set[i] = true;
+		ut_peer_state[i] = CLUSTER_CSSD_PEER_ALIVE;
+		if (i == 3)
+			continue;
+		cluster_reconfig_record_observed_slot(i, 100 + i, 1, 0);
+		cluster_reconfig_record_observed_fresh_alive(i, true);
+		cluster_membership_record_admitted(i, 100 + i);
+		cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
+	}
+	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 0);
+	cluster_reconfig_bootstrap_publish_begin();
+	cluster_reconfig_record_observed_slot(3, 103, 1, 0);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(3, &inc));
+	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 0);
+	UT_ASSERT(!jb_test(jb, 3));
+	cluster_reconfig_record_observed_fresh_alive(3, true);
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
+	cluster_reconfig_bootstrap_publish_end();
+	UT_ASSERT(cluster_reconfig_bootstrap_proof_node(3, &inc));
+	UT_ASSERT_EQ(inc, UINT64_C(103));
+	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 0);
+	UT_ASSERT(!jb_test(jb, 3));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(3),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 0);
+
+	/* A real past-INITIAL cluster still owns ordinary never-seen admission. */
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(7)));
+	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 1);
+	UT_ASSERT(jb_test(jb, 3));
 }
 
 /* U7 — DEAD->ALIVE edge is a join; a steady-state MEMBER is not. */
@@ -7007,7 +7055,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(117);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
@@ -7079,6 +7127,7 @@ main(void)
 
 	/* spec-5.15 D1 — join-edge detection (U6-U9). */
 	UT_RUN(test_join_bitmap_declared_peer_filter);
+	UT_RUN(test_initial_absent_peer_is_not_a_runtime_join_edge);
 	UT_RUN(test_join_bitmap_dead_edge_not_member);
 	UT_RUN(test_join_bitmap_multi_joiner);
 	UT_RUN(test_join_bitmap_stale_and_notready_excluded);

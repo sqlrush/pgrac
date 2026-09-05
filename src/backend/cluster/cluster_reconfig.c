@@ -1621,6 +1621,7 @@ cluster_reconfig_compute_removal_event_id(
  *	set iff ALL hold:
  *	  - cluster_conf_lookup_node(i) != NULL          (declared-peer filter)
  *	  - cluster_membership_get_state(i) is DEAD/ABSENT (not currently a member)
+ *	  - ABSENT at INITIAL is excluded: the founding-quorum path owns it
  *	  - cluster_cssd_get_peer_state(i) == ALIVE      (now heart-beating)
  *	  - the peer's observed voting-slot incarnation is strictly greater than
  *	    last_admitted_incarnation[i]                 (freshness, anti-stale: a
@@ -1655,6 +1656,14 @@ cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BIT
 		ms = cluster_membership_get_state(i);
 		if (ms != CLUSTER_MEMBER_DEAD && ms != CLUSTER_MEMBER_ABSENT)
 			continue; /* already a member / mid-join (JOINING) — not a new edge */
+		/* QVOTEC may publish a founding peer after this tick's membership
+		 * loop.  It is still bootstrap work, not a runtime join edge: creating
+		 * JOIN_PENDING here would advance the epoch and destroy the proof the
+		 * next bootstrap tick needs.  Keep the existing exact founding proof
+		 * as the only ABSENT admission owner at INITIAL. */
+		if (ms == CLUSTER_MEMBER_ABSENT
+			&& cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL)
+			continue;
 
 		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_ALIVE)
 			continue; /* not heart-beating yet */
