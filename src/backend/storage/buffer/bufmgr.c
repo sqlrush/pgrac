@@ -3532,9 +3532,20 @@ cluster_bufmgr_pcm_join_aux_direct_init_exact(
 			buf, CLUSTER_PCM_OWN_STALE, observed,
 			"aux direct-init pin handoff");
 	MemSet(&terminal_ref, 0, sizeof(terminal_ref));
+	elog(DEBUG1, "aux consumer join begin: pid=%d tag=%u/%u/%u/%u/%u generation=%llu token=%llu",
+		 MyProcPid, observed->tag.spcOid, observed->tag.dbOid, observed->tag.relNumber,
+		 observed->tag.forkNum, observed->tag.blockNum, (unsigned long long)observed->generation,
+		 (unsigned long long)observed->reservation_token);
 	result = cluster_gcs_resource_x_target_direct_init_join_exact(
 		buf, &observed->tag, observed->generation,
 		observed->reservation_token, &terminal_ref);
+	elog(DEBUG1,
+		 "aux consumer join result: pid=%d result=%d tag=%u/%u/%u/%u/%u requester=%d "
+		 "formation=%llu acquisition=%llu",
+		 MyProcPid, (int)result, observed->tag.spcOid, observed->tag.dbOid, observed->tag.relNumber,
+		 observed->tag.forkNum, observed->tag.blockNum, terminal_ref.assertion.requester_node,
+		 (unsigned long long)terminal_ref.formation,
+		 (unsigned long long)terminal_ref.acquisition_generation);
 	/* The reservation sidecar can become visible just before its proof owner
 	 * creates the canonical round.  That EMPTY/STale observation is a
 	 * zero-mutation re-probe, never permission to create a second attempt. */
@@ -3632,6 +3643,31 @@ cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kin
 	return arm_result;
 }
 
+/* PGRAC: recognize only the completed current image of this consumed aux
+ * reservation.  This predicate grants no writer permission: the caller must
+ * revalidate the terminal cover, then return through ordinary pre-use. */
+static bool
+cluster_bufmgr_pcm_aux_installed_image_matches(ClusterPcmDirectInitKind kind,
+											   const ClusterPcmDirectInitSnapshot *before,
+											   const ClusterPcmDirectInitSnapshot *after,
+											   const ResourceXAcquisitionRef *terminal_ref)
+{
+	return (kind == CLUSTER_PCM_DIRECT_INIT_VM || kind == CLUSTER_PCM_DIRECT_INIT_FSM)
+		   && !after->page_is_new && after->buf_id == before->buf_id
+		   && BufferTagsEqual(&after->tag, &before->tag)
+		   && BufferTagsEqual(&after->tag, &terminal_ref->assertion.resource)
+		   && before->generation != UINT64_MAX && after->generation == before->generation + 1
+		   && before->reservation_token != UINT64_MAX
+		   && after->reservation_token == before->reservation_token + 1
+		   && after->private_refcount == before->private_refcount && after->private_refcount > 0
+		   && BUF_STATE_GET_REFCOUNT(after->buf_state) > 0
+		   && (after->buf_state & (BM_VALID | BM_TAG_VALID)) == (BM_VALID | BM_TAG_VALID)
+		   && (after->buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) == 0
+		   && after->buffer_type == (uint8)BUF_TYPE_XCUR && after->pcm_state == (uint8)PCM_STATE_X
+		   && after->flags == 0 && after->writer_activation_token == 0
+		   && after->resource_x_activation_generation == 0;
+}
+
 /*
  * PCM write gate for the few operations which initialize known-new bytes and
  * therefore cannot use the ordinary N/S -> X convert queue.  The proof is
@@ -3661,6 +3697,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	uint64		pending_token = 0;
 	uint64		writer_r4_generation = 0;
 	bool		aux_pin_required;
+	bool installed_aux_image;
 
 	if (pin_replaced != NULL)
 		*pin_replaced = false;
@@ -3817,8 +3854,11 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 				= committed_observed.generation;
 			context.writer_activation_token = 0;
 			context.resource_x_activation_generation = 0;
-			pending_result = cluster_pcm_direct_init_target_commit_validate(
-				kind, &committed_observed, proof);
+			installed_aux_image = cluster_bufmgr_pcm_aux_installed_image_matches(
+				kind, &observed, &committed_observed, &terminal_ref);
+			pending_result = installed_aux_image ? CLUSTER_PCM_OWN_OK
+												 : cluster_pcm_direct_init_target_commit_validate(
+													   kind, &committed_observed, proof);
 			if (pending_result != CLUSTER_PCM_OWN_OK
 				|| current_writer_path != RESOURCE_X_WRITER_TARGET
 				|| current_writer_r4_generation != writer_r4_generation
@@ -3831,6 +3871,23 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 				cluster_bufmgr_resource_x_writer_report_failure(
 					RESOURCE_X_APPLY_STALE, buf,
 					"Resource-X direct-init target post-T3 proof");
+			}
+			/* PGRAC: installed aux bytes are not known-new bytes.  Do not
+			 * register an initialization writer.  Re-enter CACHED_X and the
+			 * ordinary pre-use/content-lock path; the map reader rechecks
+			 * PageIsNew under that lock before deciding to initialize. */
+			if (installed_aux_image) {
+				elog(DEBUG1,
+					 "aux consumer installed ordinary: pid=%d tag=%u/%u/%u/%u/%u requester=%d "
+					 "formation=%llu acquisition=%llu generation=%llu token=%llu",
+					 MyProcPid, committed_observed.tag.spcOid, committed_observed.tag.dbOid,
+					 committed_observed.tag.relNumber, committed_observed.tag.forkNum,
+					 committed_observed.tag.blockNum, terminal_ref.assertion.requester_node,
+					 (unsigned long long)terminal_ref.formation,
+					 (unsigned long long)terminal_ref.acquisition_generation,
+					 (unsigned long long)committed_observed.generation,
+					 (unsigned long long)committed_observed.reservation_token);
+				return false;
 			}
 			cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 				buf, &context);
@@ -10601,6 +10658,16 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 			{
 				LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE,
 					NULL, NULL, &pin_replaced, NULL);
+				if (!pin_replaced)
+					elog(DEBUG1,
+						 "aux consumer ordinary locked: pid=%d tag=%u/%u/%u/%u/%u page_new=%d "
+						 "content_x=%d",
+						 MyProcPid, buf->tag.spcOid, buf->tag.dbOid, buf->tag.relNumber,
+						 buf->tag.forkNum, buf->tag.blockNum,
+						 PageIsNew((Page)BufHdrGetBlock(buf)) ? 1 : 0,
+						 LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)
+							 ? 1
+							 : 0);
 				return pin_replaced ? InvalidBuffer : buffer;
 			}
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING)
