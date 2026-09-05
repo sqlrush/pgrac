@@ -13455,10 +13455,15 @@ l_pgrac_reacquire:
 		bool vm_visible_before = false;
 
 #ifdef USE_PGRAC_CLUSTER
+		bool vm_diagnostic_tracked = cluster_pcm_x_relation_number_tracked(
+			relation->rd_locator.relNumber, cluster_shared_catalog);
+
 		/* The map is already pinned and content-locked by UPDATE. pin_ok
 		 * prevents the read-only accessor from ever repinning or doing I/O
-		 * in this critical section. A missing observation is not a clear. */
-		if (vm_locked && !BufferIsLocal(vmbuffer)
+		 * in this critical section. Node-local catalogs are outside PCM and
+		 * must not bind its first observed VM tag. The actual clear below is
+		 * independent of this diagnostic scope. */
+		if (vm_diagnostic_tracked && vm_locked && !BufferIsLocal(vmbuffer)
 			&& visibilitymap_pin_ok(BufferGetBlockNumber(buffer), vmbuffer)) {
 			Buffer observed_vm = vmbuffer;
 
@@ -13466,7 +13471,7 @@ l_pgrac_reacquire:
 				= (visibilitymap_get_status(relation, BufferGetBlockNumber(buffer), &observed_vm)
 				   & VISIBILITYMAP_ALL_VISIBLE)
 				  != 0;
-		} else if (BufferIsValid(vmbuffer) && !BufferIsLocal(vmbuffer))
+		} else if (vm_diagnostic_tracked && BufferIsValid(vmbuffer) && !BufferIsLocal(vmbuffer))
 			cluster_pcm_vm_metric_note(&GetBufferDescriptor(vmbuffer - 1)->tag,
 									   PCM_VM_CLEAR_OBSERVATION_GAP);
 #endif
@@ -13487,7 +13492,10 @@ l_pgrac_reacquire:
 		bool vm_visible_before = false;
 
 #ifdef USE_PGRAC_CLUSTER
-		if ((vm_locked_new || (vm_locked && vmbuffer_new == vmbuffer))
+		bool vm_diagnostic_tracked = cluster_pcm_x_relation_number_tracked(
+			relation->rd_locator.relNumber, cluster_shared_catalog);
+
+		if (vm_diagnostic_tracked && (vm_locked_new || (vm_locked && vmbuffer_new == vmbuffer))
 			&& !BufferIsLocal(vmbuffer_new)
 			&& visibilitymap_pin_ok(BufferGetBlockNumber(newbuf), vmbuffer_new)) {
 			Buffer observed_vm = vmbuffer_new;
@@ -13496,7 +13504,8 @@ l_pgrac_reacquire:
 				= (visibilitymap_get_status(relation, BufferGetBlockNumber(newbuf), &observed_vm)
 				   & VISIBILITYMAP_ALL_VISIBLE)
 				  != 0;
-		} else if (BufferIsValid(vmbuffer_new) && !BufferIsLocal(vmbuffer_new))
+		} else if (vm_diagnostic_tracked && BufferIsValid(vmbuffer_new)
+				   && !BufferIsLocal(vmbuffer_new))
 			cluster_pcm_vm_metric_note(&GetBufferDescriptor(vmbuffer_new - 1)->tag,
 									   PCM_VM_CLEAR_OBSERVATION_GAP);
 #endif

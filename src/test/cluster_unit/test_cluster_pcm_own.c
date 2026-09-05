@@ -974,6 +974,33 @@ fail:
 	return NULL;
 }
 
+/* Linux ARM's real CRC dispatcher logs its CPU choice. Keep DEBUG quiet,
+ * but never turn its hardware/software disagreement ERROR into success. */
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return elevel >= ERROR;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),

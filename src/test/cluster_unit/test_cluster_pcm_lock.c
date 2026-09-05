@@ -4115,6 +4115,17 @@ UT_TEST(test_resource_x_round_wait_rechecks_progress_and_clips_head_lease)
 				 RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	fake_pcm_clock_us = 104500;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, 2000, 104500, 50),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 }
 
 UT_TEST(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact)
@@ -4355,6 +4366,25 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.head_failure_reason, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
 	UT_ASSERT_EQ(snapshot.round_phase, UINT8_C(5)); /* FAILED_CLOSED, not global fuse. */
+	fake_pcm_clock_us = 5101;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, 50, 3, 77, 9000, 1),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	/* A different formation cannot inherit the expired head's reason. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
+					 &assertion, 0, 18, 31, 77, 51, 61, 50, 3, 77, 9000, 1),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	/* Even an unconsumed observation must be reset by the next invocation. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(&assertion, 0, 17, 31, 77,
+																		51, 61, 50, 9000, 1),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(&assertion, 0, 17, 31, 77,
+																		51, 61, 50, 0, 1),
+				 RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT(cluster_pcm_lock_resource_x_gate_open_exact(17));
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
 	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_CREATE], 1);
@@ -10502,14 +10532,18 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 60, 102500, 10000),
 		RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 61, 100000, 10000),
 		RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	fake_cv_prepare_hook = settle_predecessor_during_wait_registration;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 0, 102500, 10000),
 		RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(

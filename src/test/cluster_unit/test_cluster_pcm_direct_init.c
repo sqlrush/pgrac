@@ -10,6 +10,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_pcm_direct_init.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -1331,10 +1332,47 @@ UT_TEST(test_ordinary_aux_repin_replacement_reaches_heap_retry)
 	}
 }
 
+UT_TEST(test_vm_clear_observation_uses_existing_pcm_relation_scope)
+{
+	char *heapam = read_source(HEAPAM_SOURCE_PATH);
+	const char *cursor;
+	int leg;
+
+	UT_ASSERT(!cluster_pcm_x_relation_number_tracked(1255, false));
+	UT_ASSERT(cluster_pcm_x_relation_number_tracked(16386, false));
+	UT_ASSERT(cluster_pcm_x_relation_number_tracked(1255, true));
+	UT_ASSERT_NOT_NULL(heapam);
+	if (heapam == NULL)
+		return;
+	cursor = strstr(heapam, "/* clear PD_ALL_VISIBLE flags, reset all visibilitymap bits */");
+	UT_ASSERT_NOT_NULL(cursor);
+	for (leg = 0; cursor != NULL && leg < 2; leg++) {
+		const char *scope = strstr(cursor, "bool vm_diagnostic_tracked");
+		const char *clear = strstr(cursor, "visibilitymap_clear_locked(relation,");
+		const char *publish = strstr(cursor, "cluster_pcm_vm_clear_note(");
+		const char *predicate
+			= scope == NULL ? NULL : strstr(scope, "cluster_pcm_x_relation_number_tracked(");
+		const char *gap = scope == NULL ? NULL : strstr(scope, "else if (vm_diagnostic_tracked");
+		const char *read = scope == NULL ? NULL : strstr(scope, "if (vm_diagnostic_tracked");
+		const char *close = gap == NULL ? NULL : strstr(gap, "#endif");
+
+		UT_ASSERT(scope != NULL && clear != NULL && publish != NULL);
+		UT_ASSERT(predicate != NULL && clear != NULL && predicate < clear);
+		UT_ASSERT(read != NULL && clear != NULL && read < clear);
+		UT_ASSERT(gap != NULL && clear != NULL && gap < clear);
+		/* The cluster observation conditional ends before the real clear. */
+		UT_ASSERT(close != NULL && clear != NULL && close < clear);
+		UT_ASSERT(clear != NULL && publish != NULL && clear < publish);
+		cursor = publish == NULL ? NULL : publish + strlen("cluster_pcm_vm_clear_note(");
+	}
+	UT_ASSERT(leg == 2);
+	free(heapam);
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(32);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -1366,6 +1404,7 @@ main(void)
 	UT_RUN(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain);
 	UT_RUN(test_aux_repin_replacement_restarts_from_fresh_relation_ref);
 	UT_RUN(test_ordinary_aux_repin_replacement_reaches_heap_retry);
+	UT_RUN(test_vm_clear_observation_uses_existing_pcm_relation_scope);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

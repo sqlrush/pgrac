@@ -13228,6 +13228,7 @@ gcs_block_resource_x_target_acquire_internal(
 	bool diagnostic_join_recorded = false;
 	bool diagnostic_deadline_expired = false;
 	bool diagnostic_head_expired = false;
+	PcmRxWaitFailure diagnostic_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	uint64 observed_head_deadline_us = 0;
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
@@ -14316,6 +14317,9 @@ gcs_block_resource_x_target_acquire_internal(
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
 						&resource, master_node, master_session, gate.formation, 0,
 						absolute_deadline_us, retry_slice_us);
+					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
+					diagnostic_deadline_expired
+						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
 					if (wait_result != RESOURCE_X_APPLY_APPLIED
 						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
 						result = wait_result;
@@ -14544,37 +14548,40 @@ gcs_block_resource_x_target_acquire_internal(
 							admission.record_generation, requester_sender_connection_generation,
 							master_ingress_connection_generation, retry_slice_us,
 							absolute_deadline_us, timeout_ms);
-				if (wait_result != RESOURCE_X_APPLY_APPLIED
-					&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
-					/* The registered wait and BufferDesc use independent lock
+					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
+					diagnostic_deadline_expired
+						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
+					diagnostic_head_expired
+						= diagnostic_wait_failure == PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED;
+					if (wait_result != RESOURCE_X_APPLY_APPLIED
+						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
+						/* The registered wait and BufferDesc use independent lock
 					 * domains.  A same-node T1 executor can publish terminal X
 					 * between the wait predicate and this return, making the old
 					 * wait identity STALE even though the exact requested install
 					 * completed.  Admit no generic STALE retry: independently
 					 * resample both domains and require the frozen pending(T) ->
 					 * terminal-X(T+1) proof before restarting the full driver. */
-					if (!direct_init && !join_only
-						&& wait_result == RESOURCE_X_APPLY_STALE
-						&& own.pcm_state == (uint8)PCM_STATE_N
-						&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
-						diagnostic_stage = "wait-terminal-resample";
-						memset(&failure_live, 0, sizeof(failure_live));
-						own_result = cluster_bufmgr_pcm_own_snapshot(
-							buf, &failure_live);
-						memset(&failure_round, 0, sizeof(failure_round));
-						failure_snapshot_result
-							= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-								&assertion, master_node, gate.formation,
-								master_session, admission.record_generation,
-								requester_sender_connection_generation,
-								master_ingress_connection_generation,
-								retry_slice_us, &failure_round);
-						pending_terminal_resample_mismatch
-							= own_result == CLUSTER_PCM_OWN_OK
-							? cluster_gcs_resource_x_pending_terminal_resample_mismatch(
-								&own, &failure_live,
-								failure_snapshot_result, &failure_round)
-							: RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
+						if (!direct_init && !join_only && wait_result == RESOURCE_X_APPLY_STALE
+							&& own.pcm_state == (uint8)PCM_STATE_N
+							&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
+							diagnostic_stage = "wait-terminal-resample";
+							memset(&failure_live, 0, sizeof(failure_live));
+							own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
+							memset(&failure_round, 0, sizeof(failure_round));
+							failure_snapshot_result
+								= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+									&assertion, master_node, gate.formation, master_session,
+									admission.record_generation,
+									requester_sender_connection_generation,
+									master_ingress_connection_generation, retry_slice_us,
+									&failure_round);
+							pending_terminal_resample_mismatch
+								= own_result == CLUSTER_PCM_OWN_OK
+									  ? cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+											&own, &failure_live, failure_snapshot_result,
+											&failure_round)
+									  : RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
 							ereport(LOG,
 							(errmsg_internal("Resource-X pending terminal resample diagnostic"),
 							 errdetail("mismatch=0x%016llx live_result=%d round_result=%d "

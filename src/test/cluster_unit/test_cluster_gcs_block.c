@@ -6087,6 +6087,8 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup
 	char *source = read_gcs_block_source();
 	const char *driver;
 	const char *wait_failure;
+	const char *wait_stage;
+	const char *duplicate_guard;
 	const char *resample_stage;
 	const char *live_snapshot;
 	const char *round_snapshot;
@@ -6101,11 +6103,12 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup
 	driver = source != NULL
 		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
 		: NULL;
-	wait_failure = driver != NULL
-		? strstr(driver,
-			"if (wait_result != RESOURCE_X_APPLY_APPLIED\n"
-			"\t\t\t\t\t&& wait_result != RESOURCE_X_APPLY_DUPLICATE)")
+	wait_stage = driver != NULL ? strstr(driver, "diagnostic_stage = \"round-wait\"") : NULL;
+	wait_failure = wait_stage != NULL
+		? strstr(wait_stage, "if (wait_result != RESOURCE_X_APPLY_APPLIED")
 		: NULL;
+	duplicate_guard = wait_failure == NULL ? NULL
+		: strstr(wait_failure, "&& wait_result != RESOURCE_X_APPLY_DUPLICATE)");
 	resample_stage = wait_failure != NULL
 		? strstr(wait_failure,
 			"diagnostic_stage = \"wait-terminal-resample\"")
@@ -6129,7 +6132,11 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup
 			"cluster_gcs_resource_x_target_pending_terminal_resample_exact(")
 		: NULL;
 	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(wait_stage);
 	UT_ASSERT_NOT_NULL(wait_failure);
+	UT_ASSERT_NOT_NULL(duplicate_guard);
+	if (wait_failure != NULL && duplicate_guard != NULL)
+		UT_ASSERT(duplicate_guard < strchr(wait_failure, '{'));
 	UT_ASSERT_NOT_NULL(resample_stage);
 	UT_ASSERT_NOT_NULL(live_snapshot);
 	UT_ASSERT_NOT_NULL(round_snapshot);
@@ -7013,6 +7020,11 @@ UT_TEST(test_resource_x_client_reason_is_exact_and_not_guessed_from_bad_state)
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "diagnostic_deadline_expired = true;"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "gcs_resource_x_acquire_diagnostic.valid = false;"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_last_step_head_failure()"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_take_wait_failure()"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"diagnostic_wait_failure == PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED"));
 	}
 	if (bufmgr_source != NULL) {
 		UT_ASSERT_NOT_NULL(strstr(bufmgr_source, "PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s"));

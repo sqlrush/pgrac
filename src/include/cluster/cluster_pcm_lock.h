@@ -274,6 +274,14 @@ extern void cluster_pcm_rx_rejected_follower_note(uint64 before_generation,
 extern void cluster_pcm_rx_dispatch_note(bool head_dispatch);
 extern uint8 cluster_pcm_rx_last_step_head_failure(void);
 
+/* One immediate wait result, process-local diagnostics only. */
+typedef enum PcmRxWaitFailure {
+	PCM_RX_WAIT_FAILURE_NONE,
+	PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED,
+	PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED
+} PcmRxWaitFailure;
+extern PcmRxWaitFailure cluster_pcm_rx_take_wait_failure(void);
+
 #define PCM_VM_METRICS(X)                                                                          \
 	X(PCM_VM_X_REQUEST, "vm_x_request_count")                                                      \
 	X(PCM_VM_HEAD_STARTED, "vm_head_started_count")                                                \

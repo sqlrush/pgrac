@@ -828,6 +828,7 @@ StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
 static ClusterPcmShared *ClusterPcm = NULL;
 /* Process-local, single-step observation; never a shared authority or lease. */
 static uint8 pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
+static PcmRxWaitFailure pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 static HTAB *cluster_pcm_htab = NULL;
 static ClusterPcmResourceXSlot *cluster_pcm_resource_x_slots = NULL;
 static ClusterPcmResourceXMasterState *cluster_pcm_resource_x_master_states = NULL;
@@ -10523,6 +10524,15 @@ cluster_pcm_rx_last_step_head_failure(void)
 	return result;
 }
 
+PcmRxWaitFailure
+cluster_pcm_rx_take_wait_failure(void)
+{
+	PcmRxWaitFailure result = pcm_rx_last_wait_failure;
+
+	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
+	return result;
+}
+
 static bool
 pcm_vm_diagnostic_tag(const BufferTag *tag)
 {
@@ -12166,6 +12176,7 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	uint64 remaining_us;
 	uint64 now_us;
 
+	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	if (!resource_x_assertion_valid(assertion) || current_master_node < 0
 		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || resource_formation == 0
 		|| resource_formation == UINT64_MAX || master_session_incarnation == 0
@@ -12244,18 +12255,21 @@ pcm_resource_x_bootstrap_round_wait_internal(
 			   || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
 			   || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
 		result = RESOURCE_X_APPLY_APPLIED;
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else
+		if (round->head_failure_reason == RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED)
+			pcm_rx_last_wait_failure = PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED;
+	} else
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	now_us = pcm_resource_x_monotonic_us();
 	pcm_resource_x_head_margin_note(round, now_us);
 	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		&& now_us >= caller_absolute_deadline_us)
+		&& now_us >= caller_absolute_deadline_us) {
 		result = RESOURCE_X_APPLY_BAD_STATE;
-	else if (result == RESOURCE_X_APPLY_APPLIED
-			 && (observed_head_change_generation != round->head_change_generation
-				 || observed_attempt != round->request.assertion_sequence))
+		pcm_rx_last_wait_failure = PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
+	} else if (result == RESOURCE_X_APPLY_APPLIED
+			   && (observed_head_change_generation != round->head_change_generation
+				   || observed_attempt != round->request.assertion_sequence))
 		result = RESOURCE_X_APPLY_DUPLICATE;
 	effective_deadline_us = caller_absolute_deadline_us;
 	if (round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
@@ -12320,6 +12334,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms)
 {
+	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	if (direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	return pcm_resource_x_bootstrap_round_wait_internal(
@@ -12351,6 +12366,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	uint64 remaining_us;
 	long timeout_ms;
 
+	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	if (tag == NULL || current_master_node < 0
 		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || current_master_session == 0
 		|| current_master_session == UINT64_MAX || current_formation == 0
@@ -12398,8 +12414,10 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	LWLockRelease(&entry->entry_lock.lock);
 	now_us = pcm_resource_x_monotonic_us();
 	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		&& now_us >= caller_absolute_deadline_us)
+		&& now_us >= caller_absolute_deadline_us) {
 		result = RESOURCE_X_APPLY_BAD_STATE;
+		pcm_rx_last_wait_failure = PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
+	}
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
