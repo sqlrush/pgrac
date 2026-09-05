@@ -15,7 +15,7 @@
  * NOTES
  *    Test-only, superuser-only module. No direct buffer/PCM state mutation,
  *    synthetic grant, page initialization, timeout change or injected return.
- *    A holder can keep the real pin while waiting on a test advisory lock.
+ *    A holder can keep the real pin until the test creates its release marker.
  *    Normal resource-owner cleanup still owns errors and cancellation.
  *
  *-------------------------------------------------------------------------
@@ -23,15 +23,18 @@
 
 #include "postgres.h"
 
+#include <unistd.h>
+
 #include "access/table.h"
 #include "access/visibilitymap.h"
 #include "catalog/pg_class.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/latch.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_pgrac_aux_vm_pin);
@@ -44,12 +47,18 @@ test_pgrac_aux_vm_pin(PG_FUNCTION_ARGS)
 	Page page;
 	PageHeader header;
 	uint64 digest = UINT64CONST(14695981039346656037);
-	int64 wait_key = PG_GETARG_INT64(1);
+	bool hold = PG_GETARG_BOOL(1);
+	char *release_path = NULL;
 	char *result;
 	int i;
 
 	if (!superuser())
 		ereport(ERROR, (errmsg("auxiliary consumer probe requires superuser")));
+	if (hold) {
+		release_path = psprintf("%s/aux-probe-release", DataDir);
+		if (access(release_path, F_OK) == 0 || errno != ENOENT)
+			ereport(ERROR, (errmsg("auxiliary consumer requires a fresh release marker path")));
+	}
 	relation = table_open(PG_GETARG_OID(0), AccessShareLock);
 	if (relation->rd_rel->relkind != RELKIND_RELATION
 		|| relation->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT)
@@ -71,12 +80,16 @@ test_pgrac_aux_vm_pin(PG_FUNCTION_ARGS)
 	result = psprintf("pid=%d rel=%u page_new=0 lower=%u upper=%u special=%u bitmap=%llu",
 					  MyProcPid, RelationGetRelid(relation), header->pd_lower, header->pd_upper,
 					  header->pd_special, (unsigned long long)digest);
-	ereport(NOTICE,
-			(errmsg("aux probe pinned: %s hold=%s", result, wait_key != 0 ? "true" : "false")));
+	ereport(NOTICE, (errmsg("aux probe pinned: %s hold=%s", result, hold ? "true" : "false")));
 
-	if (wait_key != 0) {
-		DirectFunctionCall1(pg_advisory_lock_int8, Int64GetDatum(wait_key));
-		DirectFunctionCall1(pg_advisory_unlock_int8, Int64GetDatum(wait_key));
+	while (hold && access(release_path, F_OK) != 0) {
+		if (errno != ENOENT)
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("could not read auxiliary probe release marker: %m")));
+		CHECK_FOR_INTERRUPTS();
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 1L,
+						PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
 	}
 	ReleaseBuffer(buffer);
 	table_close(relation, AccessShareLock);
