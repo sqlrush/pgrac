@@ -35,6 +35,7 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_tt_local.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -108,6 +109,8 @@ static int test_candidate_release_calls;
 static int test_candidate_cancel_calls;
 static int test_candidate_poll_calls;
 static int test_candidate_wait_calls;
+static int test_candidate_wakes_before_terminal;
+static uint64 test_vis_evidence[CLUSTER_VIS_METRIC_COUNT];
 static int test_candidate_exit_hooks_ensure_calls;
 static uint32 test_candidate_acquire_segments[8];
 static int test_candidate_held_count;
@@ -148,6 +151,15 @@ static ClusterUndoBlock0CurrentStep test_candidate_acquire_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+static ClusterUndoBlock0CurrentStep test_candidate_after_wait_step
+	= CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+
+void
+cluster_vis_evidence_note(ClusterVisEvidenceMetric metric)
+{
+	UT_ASSERT(metric >= 0 && metric < CLUSTER_VIS_METRIC_COUNT);
+	test_vis_evidence[metric]++;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -528,6 +540,11 @@ cluster_undo_block0_current_acquire_poll(
 	ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
 	test_candidate_poll_calls++;
+	if (test_candidate_poll_step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+		test_candidate_held_count++;
+		test_candidate_max_held_count
+			= Max(test_candidate_max_held_count, test_candidate_held_count);
+	}
 	return test_candidate_poll_step;
 }
 
@@ -539,8 +556,9 @@ cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard pg_a
 			  || site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE);
 	test_candidate_wait_calls++;
 	UT_ASSERT_EQ(test_candidate_poll_calls, test_candidate_wait_calls);
-	/* Let the next poll close the deterministic pending-loop fixture. */
-	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	/* A wake alone is not a grant: the product must repoll each time. */
+	if (test_candidate_wait_calls >= test_candidate_wakes_before_terminal)
+		test_candidate_poll_step = test_candidate_after_wait_step;
 	return true;
 }
 
@@ -857,6 +875,8 @@ reset_exact_origin_fixture(void)
 	test_candidate_cancel_calls = 0;
 	test_candidate_poll_calls = 0;
 	test_candidate_wait_calls = 0;
+	test_candidate_wakes_before_terminal = 1;
+	memset(test_vis_evidence, 0, sizeof(test_vis_evidence));
 	test_candidate_exit_hooks_ensure_calls = 0;
 	memset(test_candidate_acquire_segments, 0,
 		   sizeof(test_candidate_acquire_segments));
@@ -911,6 +931,7 @@ reset_exact_origin_fixture(void)
 	test_local_freshref_pair_calls = 0;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	test_candidate_after_wait_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
 
 static const bool expected[5][8] = {
@@ -2271,6 +2292,47 @@ UT_TEST(test_terminal_census_pending_acquire_failure_cancels_candidate_guard)
 	UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
 	UT_ASSERT_EQ(test_candidate_sample_calls, 0);
 	UT_ASSERT_EQ(test_candidate_release_calls, 0);
+	UT_ASSERT_EQ(test_vis_evidence[CLUSTER_VIS_METRIC_TRANSIENT_PENDING], 2);
+	UT_ASSERT_EQ(test_vis_evidence[CLUSTER_VIS_METRIC_PREMATURE_EXIT], 0);
+}
+
+UT_TEST(test_terminal_census_pending_wakes_repoll_until_exact_terminal)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission = { 0 };
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_origin_record.tt_slot_segment_id = TEST_RECORD_SEGMENT;
+	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+	test_candidate_wakes_before_terminal = 3;
+	test_candidate_after_wait_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission,
+					 &resolution, &reason),
+				 CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.commit_scn, test_commit_scn);
+	UT_ASSERT_EQ(resolution.locator_echo.xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_candidate_poll_calls, 4);
+	UT_ASSERT_EQ(test_candidate_wait_calls, 3);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_candidate_release_calls, 1);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+	UT_ASSERT_EQ(test_vis_evidence[CLUSTER_VIS_METRIC_TRANSIENT_PENDING], 4);
+	UT_ASSERT_EQ(test_vis_evidence[CLUSTER_VIS_METRIC_PREMATURE_EXIT], 0);
+	UT_ASSERT_EQ(test_vis_evidence[CLUSTER_VIS_METRIC_AUTHORITY_TIMEOUT], 0);
 }
 
 UT_TEST(test_exact_origin_bad_record_wrap_fails_before_tt_or_clog)
@@ -2952,7 +3014,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(93);
+	UT_PLAN(94);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -3022,6 +3084,7 @@ main(void)
 	UT_RUN(test_terminal_census_cross_segment_data_drift_fails_closed);
 	UT_RUN(test_terminal_census_cross_owner_tt_alias_fails_closed);
 	UT_RUN(test_terminal_census_pending_acquire_failure_cancels_candidate_guard);
+	UT_RUN(test_terminal_census_pending_wakes_repoll_until_exact_terminal);
 	UT_RUN(test_exact_origin_bad_record_wrap_fails_before_tt_or_clog);
 	UT_RUN(test_exact_origin_aborted_uses_exact_tt_and_direct_clog);
 	UT_RUN(test_exact_origin_conflicting_terminal_evidence_fails_closed);

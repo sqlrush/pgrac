@@ -2047,6 +2047,19 @@ cluster_tt_status_hint_get_drop_v1_compat_count(void)
 /* spec-3.7 D10 stubs: cluster_debug dump_undo() references 5 counter
  * accessors from cluster_undo_record.o which test_cluster_debug doesn't link. */
 static bool receipt_stats_available = true;
+static bool evidence_stats_available = true;
+
+bool
+cluster_vis_evidence_snapshot(uint64 values[CLUSTER_VIS_METRIC_COUNT])
+{
+	int i;
+
+	if (!evidence_stats_available)
+		return false;
+	for (i = 0; i < CLUSTER_VIS_METRIC_COUNT; i++)
+		values[i] = 100 + i;
+	return true;
+}
 
 bool
 cluster_undo_record_receipt_stats_snapshot(uint64 values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT])
@@ -4970,6 +4983,39 @@ UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int available;
+	static const char *const keys[] = {
+#define TEST_VIS_KEY(id, key) #key,
+		CLUSTER_VIS_EVIDENCE_METRICS(TEST_VIS_KEY)
+#undef TEST_VIS_KEY
+	};
+	int i;
+
+	for (available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = 0;
+		captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		evidence_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("visibility", "evidence_stats_available"), 1);
+		for (i = 0; i < lengthof(keys); i++) {
+			char expected[32];
+
+			UT_ASSERT_EQ(captured_dump_count("visibility", keys[i]), available);
+			if (available && captured_dump_count("visibility", keys[i]) == 1) {
+				snprintf(expected, sizeof(expected), "%d", 100 + i);
+				UT_ASSERT_STR_EQ(captured_dump_value("visibility", keys[i]), expected);
+			}
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -5574,7 +5620,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
@@ -5582,6 +5628,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
+	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);

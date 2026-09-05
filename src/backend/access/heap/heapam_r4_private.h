@@ -25,7 +25,9 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_visibility_resolve.h"
 #endif
 #include "executor/tuptable.h"
 #include "storage/buf_internals.h"
@@ -142,6 +144,9 @@ extern bool cluster_heap_tuple_satisfies_visibility_waitable(
 #endif
 
 #ifdef USE_CLUSTER_UNIT
+extern bool cluster_heap_test_satisfies_mvcc(HeapTuple tuple, Snapshot snapshot, Buffer buffer);
+extern bool cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple,
+										  TransactionId xid, uint16 infomask, TM_Result *result);
 extern bool cluster_heap_test_r4_target_reachable(void);
 extern HeapHotSearchResultKind cluster_heap_test_r4_hot_full_cycle(
 	BufferTag tag, ItemPointerData logical_root, SCN read_scn,
@@ -161,6 +166,15 @@ extern bool cluster_heap_test_itl_alloc_with_terminal_census(
 	Buffer buffer, TransactionId xid, bool lock_only, uint8 *slot_index_out);
 extern ClusterHeapItlCapacityResult cluster_heap_test_itl_capacity_outcome(
 	Buffer buffer, TransactionId xid, bool lock_only);
+extern ClusterVisEvidence
+cluster_heap_test_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
+											  const ClusterUndoTTSlotRef *ref, bool lock_only,
+											  ClusterVisResolve *out);
+extern int cluster_heap_test_itl_remaining_wait_ms(uint64 *deadline_us, uint64 now_us,
+												   int budget_ms);
+extern ClusterTxwResult cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer,
+															Buffer full_buffer, uint64 *deadline_us,
+															const char **diagnostic_reason);
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
 extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);

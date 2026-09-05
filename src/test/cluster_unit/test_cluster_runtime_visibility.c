@@ -1129,8 +1129,10 @@ UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
 	UT_ASSERT_NOT_NULL(exact);
 	UT_ASSERT_NOT_NULL(visibility);
 	UT_ASSERT_NOT_NULL(exact_map);
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"cluster_tx_locator_from_itl_terminal_census("));
+	UT_ASSERT_NOT_NULL(strstr(source, "cluster_tx_locator_from_itl("));
+	UT_ASSERT_NOT_NULL(strstr(source, "*row_wait_locator_out = candidate;"));
+	UT_ASSERT_NOT_NULL(strstr(source, "candidate.tt_wrap = TT_WRAP_INVALID;"));
+	UT_ASSERT_NOT_NULL(strstr(source, "*visibility_locator_out = candidate;"));
 	if (classifier_end != NULL && pair != NULL && exact != NULL
 		&& visibility != NULL && exact_map != NULL)
 		UT_ASSERT(pair < exact && exact < visibility
@@ -1192,9 +1194,7 @@ UT_TEST(test_page_exact_locator_filters_full_ref_before_uniqueness)
 {
 	char *source = read_visibility_resolve_source();
 	const char *helper
-		= source != NULL
-			  ? strstr(source, "\ncluster_vis_exact_locator_for_ref(")
-			  : NULL;
+		= source != NULL ? strstr(source, "\ncluster_vis_exact_locators_for_ref(") : NULL;
 	const char *helper_end
 		= helper != NULL ? strstr(helper, "\n}\n\n/*\n * classify_ref") : NULL;
 	const char *xid
@@ -1218,10 +1218,7 @@ UT_TEST(test_page_exact_locator_filters_full_ref_before_uniqueness)
 	const char *duplicate_guard
 		= epoch != NULL ? strstr(epoch, "if (found") : NULL;
 	const char *locator
-		= duplicate_guard != NULL
-			  ? strstr(duplicate_guard,
-					   "cluster_tx_locator_from_itl_terminal_census(")
-			  : NULL;
+		= duplicate_guard != NULL ? strstr(duplicate_guard, "cluster_tx_locator_from_itl(") : NULL;
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);

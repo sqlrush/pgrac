@@ -2682,10 +2682,44 @@ UT_TEST(test_update_toast_releases_outer_receipt_before_nested_producers)
 	free(source);
 }
 
+UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
+{
+	char *source = read_heapam_source();
+	char *update = strstr(source, "\nheap_update(Relation ");
+	char *deadline = update ? strstr(update, "itl_capacity_absolute_deadline_us = 0;") : NULL;
+	char *wait = update ? strstr(update, "\nl_pgrac_itl_capacity_wait:") : NULL;
+	char *old_full = update ? strstr(update, "itl_capacity_wait_buffer = buffer;") : NULL;
+	char *new_full = update ? strstr(update, "itl_capacity_wait_buffer = newbuf;") : NULL;
+	char *call = wait ? strstr(wait, "cluster_heap_itl_wait_capacity_after_census(") : NULL;
+	char *receipt = call ? strstr(call, "cluster_heap_restart_update_undo_record_exact(") : NULL;
+	char *reacquire = receipt ? strstr(receipt, "goto l_pgrac_reacquire;") : NULL;
+	char *same_page = receipt ? strstr(receipt, "goto l2;") : NULL;
+	char *delete_recheck
+		= strstr(source, "if (cluster_writer_res == TM_BeingModified)\n\t\t\t\tgoto l1;");
+	char *update_recheck
+		= strstr(source, "if (cluster_writer_res == TM_BeingModified)\n\t\t\t\tgoto l2;");
+	char *lock_recheck = strstr(source, "if (cwres == TM_BeingModified)\n\t\t\t\t\t\t\tgoto l3;");
+
+	UT_ASSERT_NOT_NULL(delete_recheck);
+	UT_ASSERT_NOT_NULL(update_recheck);
+	UT_ASSERT_NOT_NULL(lock_recheck);
+
+	UT_ASSERT_NOT_NULL(deadline);
+	UT_ASSERT_NOT_NULL(old_full);
+	UT_ASSERT_NOT_NULL(new_full);
+	UT_ASSERT_NOT_NULL(call);
+	UT_ASSERT_NOT_NULL(receipt);
+	UT_ASSERT_NOT_NULL(reacquire);
+	UT_ASSERT_NOT_NULL(same_page);
+	if (deadline && wait)
+		UT_ASSERT(strstr(deadline + 1, "itl_capacity_absolute_deadline_us = 0;") == NULL);
+	free(source);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(51);
+	UT_PLAN(52);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -2738,6 +2772,7 @@ main(int argc, char **argv)
 	UT_RUN(test_retry_after_apply_refuses_without_canceling_shared_owner);
 	UT_RUN(test_cancel_before_snapshot_violation_counter_is_live);
 	UT_RUN(test_update_toast_releases_outer_receipt_before_nested_producers);
+	UT_RUN(test_update_itl_wait_returns_through_receipt_and_page_requalification);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

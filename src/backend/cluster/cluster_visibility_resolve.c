@@ -205,6 +205,7 @@ resolve_live_overlay_miss_via_origin(TransactionId raw_xid, const ClusterUndoTTS
 	if ((int32)ref->origin_node_id == cluster_node_id)
 		return;
 
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
 	if (!cluster_runtime_visibility_try_resolve_remote(
 			(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid, read_scn,
 			false /* keep the serve-side stripe self-check (pre-D6-7 behavior) */, &committed, &scn,
@@ -212,6 +213,7 @@ resolve_live_overlay_miss_via_origin(TransactionId raw_xid, const ClusterUndoTTS
 		return; /* stay UNKNOWN -> caller 53R97 fail-closed */
 
 	cluster_vis_bump_overlay_refresh_count(); /* spec-7.1a D6 */
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_TERMINAL);
 	if (committed) {
 		out->status = CLUSTER_TT_STATUS_COMMITTED;
 		out->commit_scn = scn;
@@ -315,6 +317,7 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 			!= CLUSTER_SEMANTIC_ADMISSION_OK
 		|| !source_result.bool_value || !source_result.lookup.authoritative) {
 		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_OVERLAY_MISS);
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		/* PGRAC: spec-7.1a D4 -- overlay miss on a LIVE remote ref: pull the
 		 * origin verdict instead of staying UNKNOWN forever (HC181). */
@@ -326,12 +329,19 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 	result = source_result.lookup;
 
 	/*
-	 * spec-3.5: follow a SUBCOMMITTED subxact to its parent so the caller
-	 * sees a terminal-or-in-progress status, never SUBCOMMITTED itself.
-	 * Depth exceeded / parent miss -> non-authoritative -> UNKNOWN.
+	 * A nonterminal peer overlay is a propagation hint, not a current TT
+	 * observation.  Even a cached SUBCOMMITTED parent chain can be stale.
+	 * Leave UNKNOWN so classify_ref_guts uses the existing exact origin
+	 * verdict (including authoritative live status) and DATA-to-TT fallback.
+	 * Do not memoize this provisional hit or turn it into MVCC polarity.
 	 */
-	if (result.status == CLUSTER_TT_STATUS_SUBCOMMITTED && result.has_parent_key)
-		result = cluster_subtrans_lookup_parent(&result, cluster_subtrans_max_chain_depth);
+	if (result.status == CLUSTER_TT_STATUS_IN_PROGRESS
+		|| result.status == CLUSTER_TT_STATUS_SUBCOMMITTED) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_OVERLAY_LIVE);
+		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
+		cluster_xp_end(&xp_scope);
+		return;
+	}
 
 	if (!result.authoritative) {
 		out->status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -346,6 +356,11 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 
 	out->status = result.status;
 	out->commit_scn = result.commit_scn;
+	if (result.status == CLUSTER_TT_STATUS_ABORTED
+		|| ((result.status == CLUSTER_TT_STATUS_COMMITTED
+			 || result.status == CLUSTER_TT_STATUS_CLEANED_OUT)
+			&& SCN_VALID(result.commit_scn)))
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_OVERLAY_TERMINAL);
 
 	/*
 	 * PGRAC: spec-6.12c -- D0 stamp-evidence classification + memo install.
@@ -712,6 +727,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				SCN scn = InvalidScn;
 				bool is_bound = false;
 
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
 				if (cluster_runtime_visibility_try_resolve_remote(
 						derived_origin, (uint32)ref->undo_segment_id, raw_xid, read_scn,
 						false /* derived origin: keep the stripe self-check (6.12i P0) */,
@@ -721,6 +737,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 						= committed ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
 					out->commit_scn = committed ? scn : InvalidScn;
 					out->commit_scn_is_bound = committed ? is_bound : false;
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_TERMINAL);
 					return;
 				}
 			} else {
@@ -769,6 +786,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * -- mirroring the recycled underivable leg (:458), which likewise
 			 * does not touch the shared rtvis_resolve totals. */
 			out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+			out->diagnostic_reason = "IDENTITY_STALE";
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_IDENTITY_STALE);
 			cluster_vis_freshref_verdict_note_failclosed();
 			break;
 
@@ -790,20 +809,22 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				cluster_epoch_get_current(), (int32)ref->origin_node_id,
 				cluster_node_id, (uint32)ref->undo_segment_id,
 				(uint32)ref->tt_slot_id);
-			ClusterUndoVerdictResult v
-				= freshref_pair
-					  ? cluster_undo_verdict_resolve_freshref_c1b_pair(
-							(int)ref->origin_node_id,
-							(uint32)ref->undo_segment_id, raw_xid,
-							ref->local_xid, (uint32)ref->tt_slot_id,
-							ref->cluster_epoch, ref->cached_commit_scn, read_scn)
-					  : cluster_undo_verdict_resolve(
-							(int)ref->origin_node_id,
-							(uint32)ref->undo_segment_id, raw_xid,
-							(uint32)ref->tt_slot_id, read_scn,
-							true /* fresh ref: physical-binding authority */);
+			ClusterUndoVerdictResult v;
+
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
+			v = freshref_pair ? cluster_undo_verdict_resolve_freshref_c1b_pair(
+									(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid,
+									ref->local_xid, (uint32)ref->tt_slot_id, ref->cluster_epoch,
+									ref->cached_commit_scn, read_scn)
+							  : cluster_undo_verdict_resolve(
+									(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid,
+									(uint32)ref->tt_slot_id, read_scn,
+									true /* fresh ref: physical-binding authority */);
 
 			if (cluster_vis_from_undo_verdict(v, out)) {
+				cluster_vis_evidence_note(v.kind == CLUSTER_UNDO_VERDICT_IN_PROGRESS
+											  ? CLUSTER_VIS_METRIC_ORIGIN_LIVE
+											  : CLUSTER_VIS_METRIC_ORIGIN_TERMINAL);
 				/* O2: an origin-proven exact terminal is immutable and may use
 				 * the existing backend-local, lxid-bound memo.  A bound or live
 				 * result remains request/snapshot relative and is never installed. */
@@ -838,6 +859,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * revalidates DATA while holding at most one 0xFB SCUR. */
 			memset(&exact_resolution, 0, sizeof(exact_resolution));
 			exact_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			if (exact_locator != NULL)
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
 			exact_outcome = exact_locator == NULL
 				? CLUSTER_TX_UNKNOWN
 				: cluster_tx_resolve_exact(
@@ -845,6 +868,11 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 					&exact_resolution, &exact_reason);
 			if (cluster_vis_from_exact_tx_resolution(
 					exact_outcome, &exact_resolution, out)) {
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ROUTE_BYPASS);
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_DURABLE_ROUTE_GAP);
+				cluster_vis_evidence_note(exact_outcome == CLUSTER_TX_IN_PROGRESS
+											  ? CLUSTER_VIS_METRIC_ORIGIN_LIVE
+											  : CLUSTER_VIS_METRIC_ORIGIN_TERMINAL);
 				cluster_vis_freshref_verdict_note_resolved();
 				return;
 			}
@@ -853,6 +881,26 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			cluster_vis_log_freshref_unproven(
 				raw_xid, ref, freshref_pair, v, exact_locator,
 				exact_outcome, exact_reason);
+			if (exact_locator != NULL) {
+				if (exact_reason == CLUSTER_TX_RESOLVE_TIMEOUT) {
+					out->diagnostic_reason = "AUTHORITY_DEADLINE_EXPIRED";
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_AUTHORITY_TIMEOUT);
+				} else if (exact_reason == CLUSTER_TX_RESOLVE_RF_DEFERRED
+						   || exact_reason == CLUSTER_TX_RESOLVE_AUTHORITY_STALE) {
+					out->diagnostic_reason = "FORMATION_STALE";
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_FORMATION_STALE);
+				} else if (exact_reason == CLUSTER_TX_RESOLVE_XID_MISMATCH
+						   || exact_reason == CLUSTER_TX_RESOLVE_WRAP_MISMATCH
+						   || exact_reason == CLUSTER_TX_RESOLVE_SLOT_MISMATCH) {
+					out->diagnostic_reason = "IDENTITY_STALE";
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_IDENTITY_STALE);
+				} else if (exact_reason == CLUSTER_TX_RESOLVE_BAD_LOCATOR
+						   || exact_reason == CLUSTER_TX_RESOLVE_BAD_UBA
+						   || exact_reason == CLUSTER_TX_RESOLVE_PROTOCOL) {
+					out->diagnostic_reason = "MALFORMED";
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_MALFORMED);
+				}
+			}
 			cluster_vis_freshref_verdict_note_failclosed();
 			break;
 		}
@@ -920,6 +968,25 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 	cluster_vis_resolve_depth++;
 	classify_ref_guts(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);
 	cluster_vis_resolve_depth--;
+	if (out != NULL && ref != NULL && ref->local_xid != raw_xid
+		&& out->evidence != CLUSTER_VIS_EVIDENCE_LOCAL
+		&& out->evidence != CLUSTER_VIS_EVIDENCE_NONE) {
+		bool terminal = out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE
+						&& (out->status == CLUSTER_TT_STATUS_ABORTED
+							|| ((out->status == CLUSTER_TT_STATUS_COMMITTED
+								 || out->status == CLUSTER_TT_STATUS_CLEANED_OUT)
+								&& SCN_VALID(out->commit_scn)));
+
+		out->diagnostic_reason
+			= terminal ? "RECYCLED_TERMINAL_PROVEN" : "RECYCLED_AUTHORITY_UNPROVABLE";
+		cluster_vis_evidence_note(terminal ? CLUSTER_VIS_METRIC_RECYCLED_TERMINAL
+										   : CLUSTER_VIS_METRIC_RECYCLED_UNPROVABLE);
+	} else if (out != NULL && out->status == CLUSTER_TT_STATUS_UNKNOWN
+			   && out->evidence != CLUSTER_VIS_EVIDENCE_LOCAL
+			   && out->evidence != CLUSTER_VIS_EVIDENCE_NONE && out->diagnostic_reason == NULL) {
+		out->diagnostic_reason = "AUTHORITY_UNAVAILABLE";
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_AUTHORITY_UNAVAILABLE);
+	}
 }
 
 static void

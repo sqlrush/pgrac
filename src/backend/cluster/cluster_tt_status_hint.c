@@ -294,6 +294,7 @@ cluster_tt_status_hint_emit_raw(const ClusterTTStatusKey *key, ClusterTTStatus s
 		/* Full — fire-and-forget MVP loss mode (R10). */
 		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_FULL);
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						  errmsg("cluster TT status hint outbound full; hint dropped"),
 						  errhint("Raise cluster.tt_status_hint_outbound_capacity.")));
@@ -352,6 +353,7 @@ cluster_tt_status_hint_emit_subcommitted_raw(const ClusterTTStatusKey *child_key
 	if (next_tail == pg_atomic_read_u32(&ClusterTTHintOutbound->head)) {
 		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_FULL);
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						  errmsg("cluster TT status hint outbound full; SUBCOMMITTED hint dropped"),
 						  errhint("Raise cluster.tt_status_hint_outbound_capacity.")));
@@ -412,6 +414,7 @@ cluster_tt_status_hint_emit_multixact_overlay_raw(const ClusterMultiXactKey *key
 	if (next_tail == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head)) {
 		LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_FULL);
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						  errmsg("cluster V4 sidecar outbound full; multixact hint dropped"),
 						  errhint("Raise cluster.multixact_hint_outbound_slots.")));
@@ -442,6 +445,22 @@ cluster_tt_status_hint_emit_multixact_overlay_raw(const ClusterMultiXactKey *key
 /* ------------------------------------------------------------ */
 /* LMON drain (L172 family — LMON-only HC185)                   */
 /* ------------------------------------------------------------ */
+
+static void
+cluster_tt_status_hint_note_send_results(const ClusterICFanoutResult per_peer[])
+{
+	int node;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (node == cluster_node_id || cluster_conf_lookup_node(node) == NULL)
+			continue;
+		/* WOULD_BLOCK already transferred an exact frame to the transport;
+		 * it is not an enqueue refusal and must never be resubmitted here. */
+		if (per_peer[node] != CLUSTER_IC_FANOUT_DONE
+			&& per_peer[node] != CLUSTER_IC_FANOUT_WOULD_BLOCK)
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_SEND_FAILED);
+	}
+}
 
 static void
 cluster_tt_status_hint_drain_outbound_raw(void)
@@ -512,6 +531,7 @@ cluster_tt_status_hint_drain_outbound_raw(void)
 			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg2, sizeof(msg2),
 											per_peer);
 		}
+		cluster_tt_status_hint_note_send_results(per_peer);
 	}
 
 	/*
@@ -548,6 +568,7 @@ cluster_tt_status_hint_drain_outbound_raw(void)
 
 			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &local, wire_len,
 											per_peer);
+			cluster_tt_status_hint_note_send_results(per_peer);
 		}
 	}
 }
@@ -591,6 +612,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	 */
 	if (env->payload_length < (uint32)offsetof(ClusterTTStatusHintMsgV1, key)) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 
@@ -601,6 +623,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 
 		if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsgV1)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -618,6 +641,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 
 		if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsgV2)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -633,6 +657,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 
 		if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsgV3)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -666,6 +691,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 
 		if (env->payload_length < (uint32)sizeof(ClusterTTStatusHintMsgV4Header)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -676,18 +702,21 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 
 		if ((Size)env->payload_length != expected_len) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
 		if (v4_member_count == 0
 			|| (int)v4_member_count > cluster_multixact_member_overlay_max_members) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
 		/* anti-spoof HC186 family:  key.origin_node_id == env source */
 		if ((int32)v4hdr->key.origin_node_id != (int32)env->source_node_id) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -695,6 +724,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 		if (v4hdr->flags != 0 || v4hdr->payload_kind != 1 || v4hdr->key._pad16 != 0
 			|| v4hdr->key._reserved != 0) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 
@@ -706,6 +736,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 			if (m->status > (uint8)MultiXactStatusUpdate || m->_pad8 != 0 || m->_pad16 != 0
 				|| m->_reserved2 != 0 || (int32)m->origin_node_id != (int32)env->source_node_id) {
 				pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 				return;
 			}
 		}
@@ -733,6 +764,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	 * check). */
 	if ((int32)env->source_node_id == cluster_node_id) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 
@@ -740,6 +772,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	 * set envelope source. */
 	if ((int32)key->origin_node_id != (int32)env->source_node_id) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 
@@ -747,6 +780,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	current_epoch = (uint32)cluster_epoch_get_current();
 	if (key->cluster_epoch != current_epoch) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_stale_epoch_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_STALE);
 		return;
 	}
 
@@ -758,11 +792,13 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	if (is_v3_subcommitted) {
 		if (status_raw != CLUSTER_TT_STATUS_SUBCOMMITTED) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED && status_raw != CLUSTER_TT_STATUS_ABORTED
 			   && status_raw != CLUSTER_TT_STATUS_IN_PROGRESS) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 
@@ -779,25 +815,30 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	if (!v1_compat && !is_v3_subcommitted) {
 		if (status_raw == CLUSTER_TT_STATUS_COMMITTED && !SCN_VALID(commit_scn)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 		if (status_raw == CLUSTER_TT_STATUS_ABORTED && SCN_VALID(commit_scn)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 		if (status_raw == CLUSTER_TT_STATUS_IN_PROGRESS && SCN_VALID(commit_scn)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 	}
 	if (is_v3_subcommitted && SCN_VALID(commit_scn)) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 
 	/* Reserved fields MUST be zero (M3 anti-tamper). */
 	if (flags_raw != 0 || reserved16_raw != 0 || key->_reserved != 0 || key->_reserved2 != 0) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 		return;
 	}
 	if (is_v3_subcommitted) {
@@ -806,6 +847,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 			|| parent_key_local.cluster_epoch != key->cluster_epoch
 			|| !TransactionIdIsNormal(parent_key_local.local_xid)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_HINT_INVALID);
 			return;
 		}
 	}
@@ -843,7 +885,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &tt_request,
 													&tt_result);
 	}
-	if (tt_admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (tt_admission != CLUSTER_SEMANTIC_ADMISSION_OK || !tt_result.bool_value)
 		return;
 
 	if (!is_v3_subcommitted) {

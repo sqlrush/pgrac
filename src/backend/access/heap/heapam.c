@@ -1118,15 +1118,14 @@ cluster_heap_itl_resolve_terminal_census(
 			census->outcomes[i] = cluster_tx_resolve_exact_admitted(
 				&census->locators[i], CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 				&census->admission, &census->resolutions[i], &reason);
-		if (reason != CLUSTER_TX_RESOLVE_NONE
-			|| (census->outcomes[i] != CLUSTER_TX_COMMITTED
-				&& census->outcomes[i] != CLUSTER_TX_ABORTED))
+		if (reason != CLUSTER_TX_RESOLVE_NONE)
 			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
-		else
-		{
+		else if (census->outcomes[i] == CLUSTER_TX_COMMITTED
+				 || census->outcomes[i] == CLUSTER_TX_ABORTED) {
 			census->terminal_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
 			census->terminal_count++;
-		}
+		} else if (census->outcomes[i] != CLUSTER_TX_IN_PROGRESS)
+			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
 	}
 #ifdef USE_CLUSTER_UNIT
 	cluster_heap_test_itl_last_locator_mask = census->locator_mask;
@@ -1356,6 +1355,211 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer,
 	}
 	return CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 }
+
+static int
+cluster_heap_itl_remaining_wait_ms(uint64 *deadline_us, uint64 now_us, int budget_ms)
+{
+	uint64 remaining;
+
+	if (deadline_us == NULL || now_us == 0)
+		return 0;
+	if (*deadline_us == 0) {
+		uint64 budget_us;
+
+		if (budget_ms <= 0)
+			return 0;
+		budget_us = (uint64)budget_ms * UINT64_C(1000);
+		if (now_us > UINT64_MAX - budget_us)
+			return 0;
+		*deadline_us = now_us + budget_us;
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_DEADLINE_INIT);
+	}
+	if (now_us >= *deadline_us)
+		return 0;
+	remaining = *deadline_us - now_us;
+	remaining = remaining / 1000 + (remaining % 1000 != 0);
+	return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static uint64
+cluster_heap_itl_now_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+/* Called only after UPDATE's ordinary allocation and terminal census failed.
+ * Recapture under the current page bracket: the preceding census may have
+ * unlocked/relocked it.  This capture is never stamped or recycled.  All
+ * page ownership and the borrowed new-page pin are released before resolving
+ * or waiting, and the caller must restart page/tuple qualification afterwards.
+ * There is deliberately no new wait protocol, retry loop or receipt cancel. */
+static ClusterTxwResult
+cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
+											Buffer full_buffer, uint64 *deadline_us,
+											const char **diagnostic_reason)
+{
+	ClusterHeapItlTerminalCensus census;
+	ClusterHeapItlCensusCaptureResult capture_result;
+	ClusterTxLocator blocker;
+	ClusterTxResolveReason wait_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
+	volatile bool terminal = false;
+	volatile bool active = false;
+	volatile bool unprovable = false;
+	uint8 i;
+	int remaining_ms;
+	uint64 wait_deadline;
+
+	Assert(full_buffer == old_buffer || full_buffer == new_buffer);
+	*diagnostic_reason = "ITL_BLOCKER_UNPROVABLE";
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_FULL);
+	MemSet(&blocker, 0, sizeof(blocker));
+	if (!cluster_heap_itl_begin_terminal_census(&census))
+		capture_result = CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
+	else
+		capture_result = cluster_heap_itl_capture_terminal_census(full_buffer, &census);
+	/* No recycle guard is armed by this path; its capture requires flags=0.
+	 * The earlier terminal-census owner has already finished/cancelled. */
+	if (new_buffer != old_buffer)
+		LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
+	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(GetBufferDescriptor(old_buffer - 1)))
+		|| (new_buffer != old_buffer
+			&& LWLockHeldByMe(
+				BufferDescriptorGetContentLock(GetBufferDescriptor(new_buffer - 1))))) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_HELD_OWNER);
+		if (new_buffer != old_buffer
+			&& LWLockHeldByMe(BufferDescriptorGetContentLock(GetBufferDescriptor(new_buffer - 1))))
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_PEER_HELD);
+		cluster_heap_itl_finish_terminal_census(&census);
+		return CLUSTER_TXW_UNPROVABLE;
+	}
+	if (new_buffer != old_buffer)
+		ReleaseBuffer(new_buffer);
+	/* An existing operation budget also bounds REVOKING/requalification;
+	 * do not resolve eight TT candidates or return RETRY after it is spent.
+	 * The first budget is still created only for an exact active blocker. */
+	if (*deadline_us != 0
+		&& cluster_heap_itl_remaining_wait_ms(deadline_us, cluster_heap_itl_now_us(), 0) == 0) {
+		cluster_heap_itl_finish_terminal_census(&census);
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_TIMEOUT);
+		*diagnostic_reason = "ITL_CAPACITY_WAIT_EXPIRED";
+		return CLUSTER_TXW_TIMEOUT;
+	}
+	if (capture_result != CLUSTER_HEAP_ITL_CENSUS_CAPTURED) {
+		cluster_heap_itl_finish_terminal_census(&census);
+		if (capture_result == CLUSTER_HEAP_ITL_CENSUS_CAPTURE_RETRY_REQUALIFY) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_STALE);
+			*diagnostic_reason = "ITL_FRESH_REQUALIFY";
+			return CLUSTER_TXW_RETRY;
+		}
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+		return CLUSTER_TXW_UNPROVABLE;
+	}
+	PG_TRY();
+	{
+		cluster_heap_itl_resolve_terminal_census(&census);
+		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+			uint8 flags = census.slots[i].flags;
+			const ClusterTxResolution *resolution = &census.resolutions[i];
+
+			if (flags == ITL_FLAG_FREE) {
+				terminal = true; /* fresh allocation must be retried */
+				continue;
+			}
+			if (flags == ITL_FLAG_COMMITTED || flags == ITL_FLAG_ABORTED
+				|| flags == ITL_FLAG_LOCK_ONLY_COMMITTED || flags == ITL_FLAG_LOCK_ONLY_ABORTED)
+				continue; /* any still-full terminal history remains protected */
+			if ((flags != ITL_FLAG_ACTIVE && flags != ITL_FLAG_NEEDS_CLEANOUT
+				 && flags != ITL_FLAG_LOCK_ONLY_ACTIVE)
+				|| (census.locator_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) == 0
+				|| !cluster_tx_locator_reply_matches(&census.locators[i], &resolution->locator_echo)
+				|| resolution->locator_echo.tt_wrap == TT_WRAP_INVALID
+				|| census.outcomes[i] != resolution->outcome
+				|| !cluster_tx_outcome_proof_is_valid(resolution->outcome,
+													  resolution->proof_kind)) {
+				unprovable = true;
+				continue;
+			}
+			if ((census.terminal_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) != 0)
+				terminal = true;
+			else if (census.outcomes[i] == CLUSTER_TX_IN_PROGRESS) {
+				if (!active)
+					blocker = resolution->locator_echo;
+				active = true; /* lowest slot index wins, never a raw-xid key */
+			} else
+				unprovable = true;
+		}
+		if (!cluster_semantic_activation_recheck_r4_terminal_census(&census.admission))
+			unprovable = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_heap_itl_finish_terminal_census(&census);
+	}
+	PG_END_TRY();
+	if (unprovable) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+		return CLUSTER_TXW_UNPROVABLE;
+	}
+	if (terminal) {
+		*diagnostic_reason = "ITL_FRESH_REQUALIFY";
+		return CLUSTER_TXW_RETRY;
+	}
+	if (!active) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_PROTECTED);
+		*diagnostic_reason = "ITL_PROTECTED_HISTORY_CAPACITY";
+		return CLUSTER_TXW_UNPROVABLE;
+	}
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_SELECTED);
+	remaining_ms = cluster_heap_itl_remaining_wait_ms(deadline_us, cluster_heap_itl_now_us(),
+													  cluster_ges_request_timeout_ms);
+	if (remaining_ms <= 0) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_TIMEOUT);
+		*diagnostic_reason = "ITL_CAPACITY_WAIT_EXPIRED";
+		return CLUSTER_TXW_TIMEOUT;
+	}
+	wait_deadline = *deadline_us;
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_WAIT_STARTED);
+	result = cluster_tx_enqueue_wait_exact(&blocker, remaining_ms, &wait_reason);
+	if (*deadline_us != wait_deadline) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_DEADLINE_REFRESH);
+		return CLUSTER_TXW_UNPROVABLE;
+	}
+	/* Even a terminal reply cannot renew an already spent caller budget. */
+	if (result == CLUSTER_TXW_TIMEOUT
+		|| cluster_heap_itl_remaining_wait_ms(deadline_us, cluster_heap_itl_now_us(), 0) == 0) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_TIMEOUT);
+		*diagnostic_reason = "ITL_CAPACITY_WAIT_EXPIRED";
+		return CLUSTER_TXW_TIMEOUT;
+	}
+	if (result == CLUSTER_TXW_RESOLVED || result == CLUSTER_TXW_RETRY)
+		*diagnostic_reason = "ITL_FRESH_REQUALIFY";
+	if (result == CLUSTER_TXW_RESOLVED)
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_WAIT_TERMINAL);
+	else if (result == CLUSTER_TXW_UNPROVABLE)
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+	return result;
+}
+
+#ifdef USE_CLUSTER_UNIT
+int
+cluster_heap_test_itl_remaining_wait_ms(uint64 *deadline_us, uint64 now_us, int budget_ms)
+{
+	return cluster_heap_itl_remaining_wait_ms(deadline_us, now_us, budget_ms);
+}
+
+ClusterTxwResult
+cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
+									uint64 *deadline_us, const char **diagnostic_reason)
+{
+	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer,
+													   deadline_us, diagnostic_reason);
+}
+#endif
 
 
 #ifdef USE_CLUSTER_UNIT
@@ -8771,6 +8975,10 @@ cluster_current_mx_stamp_lock_buffer(
  *	                       tuple exactly as for a local conflict
  *	                       (spec-7.1a D0; only with
  *	                       cluster.crossnode_write_write=on).
+ *	            TM_BeingModified means the recycled terminal proof's captured
+ *	                       page/tuple/ref changed; all three callers restart
+ *	                       their existing l1/l2/l3 qualification under the
+ *	                       restored content lock, without consuming the proof.
  *
  *	A remote MultiXact, a wait timeout, cluster.tx_enqueue_wait=off, a
  *	terminal remote WRITER under cluster.crossnode_write_write=off (the
@@ -8783,6 +8991,67 @@ cluster_current_mx_stamp_lock_buffer(
  *	lock is dropped across the lookup (lock order) and the native code's
  *	xmax_infomask_changed recheck covers the window.
  */
+/* Recycled data-slot references may need the existing by-xid authority.
+ * A lock-only selector, in contrast, must already have returned the same xid.
+ * This policy helper never reads TT authority below a content lock. */
+static ClusterVisEvidence
+cluster_heap_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
+										 const ClusterUndoTTSlotRef *ref, bool lock_only,
+										 ClusterVisResolve *out)
+{
+	MemSet(out, 0, sizeof(*out));
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	if (lock_only) {
+		Page page = BufferGetPage(buffer);
+		const BufferTag *tag = &GetBufferDescriptor(buffer - 1)->tag;
+		uint8 i;
+
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_LOCK_XID_BREACH);
+		out->diagnostic_reason = "LOCK_ONLY_REF_XID_INVARIANT_BREACH";
+		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+			const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[i];
+
+			elog(LOG,
+				 "PGRAC lock-only identity breach: tag=%u/%u/%u/%u/%u "
+				 "page_lsn=" UINT64_FORMAT " slot=%u flags=%u xid=%u wrap=%u "
+				 "uba=" UINT64_FORMAT "/" UINT64_FORMAT " expected_xid=%u ref_xid=%u content_x=1",
+				 tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
+				 (uint64)PageGetLSN(page), (unsigned)i, (unsigned)slot->flags, slot->xid,
+				 (unsigned)slot->wrap, slot->undo_segment_head.raw[0],
+				 slot->undo_segment_head.raw[1], xid, ref->local_xid);
+		}
+		return out->evidence;
+	}
+	{
+		XLogRecPtr page_lsn = PageGetLSN(BufferGetPage(buffer));
+
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		cluster_visibility_resolve_from_ref_scn(xid, ref, page_lsn, InvalidScn, out);
+	}
+	if (out->evidence == CLUSTER_VIS_EVIDENCE_LOCAL)
+		return out->evidence;
+	if (out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE
+		&& (out->status == CLUSTER_TT_STATUS_ABORTED
+			|| ((out->status == CLUSTER_TT_STATUS_COMMITTED
+				 || out->status == CLUSTER_TT_STATUS_CLEANED_OUT)
+				&& SCN_VALID(out->commit_scn)))) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ROUTE_BYPASS);
+		return out->evidence;
+	}
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	return out->evidence;
+}
+
+#ifdef USE_CLUSTER_UNIT
+ClusterVisEvidence
+cluster_heap_test_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
+											  const ClusterUndoTTSlotRef *ref, bool lock_only,
+											  ClusterVisResolve *out)
+{
+	return cluster_heap_resolve_recycled_writer_ref(buffer, xid, ref, lock_only, out);
+}
+#endif
+
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask,
@@ -8793,6 +9062,12 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	ClusterTTStatusKey ckey;
 	ClusterTTStatusResult cres;
 	bool		is_lock_only = HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask);
+	ClusterVisResolve recycled;
+	bool recycled_terminal = false;
+	XLogRecPtr recycled_page_lsn = InvalidXLogRecPtr;
+	ClusterItlSlotData recycled_slot;
+	char recycled_tuple_header[SizeofHeapTupleHeader];
+	uint8 recycled_slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
 
 	if (!cluster_peer_mode_enabled() || !PageHasItl(page))
 		return false;
@@ -8815,18 +9090,52 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		if (!cluster_itl_find_lock_tt_ref_by_xmax(page, xwait, &cref)
 			|| cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
 			return false; /* local / placeholder / no lock-only ITL: native wait is correct */
-		if (cref.local_xid != xwait)
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT slot recycled for remote lock_xid %u", xwait),
-							errhint("ITL slot no longer maps to this xid; retry.")));
+		if (cref.local_xid != xwait
+			&& cluster_heap_resolve_recycled_writer_ref(buffer, xwait, &cref, true, &recycled)
+				   == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+				 errmsg("cluster TT slot recycled for remote lock_xid %u", xwait),
+				 errdetail(
+					 "PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=LOCK_ONLY_REF_XID_INVARIANT_BREACH "
+					 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 xid=%u ref_xid=%u origin=%u segment=%u slot=%u "
+					 "epoch=%u page_lsn=" UINT64_FORMAT " content_x=1",
+					 cluster_node_id, xwait, cref.local_xid, cref.origin_node_id,
+					 cref.undo_segment_id, cref.tt_slot_id, cref.cluster_epoch,
+					 (uint64)PageGetLSN(page)),
+				 errhint("The lock-only selector returned an inconsistent identity.")));
 	} else if (tup->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 			   || !cluster_itl_get_tt_ref(page, tup->t_data->t_itl_slot_idx, &cref)
 			   || cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
 		return false; /* local / placeholder / not-this-xid: native wait is correct */
-	else if (cref.local_xid != xwait)
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-						errmsg("cluster TT slot recycled for remote writer %u", xwait),
-						errhint("ITL slot no longer maps to this xid; retry.")));
+	else if (cref.local_xid != xwait) {
+		ClusterVisEvidence evidence;
+
+		recycled_page_lsn = PageGetLSN(page);
+		recycled_slot_index = tup->t_data->t_itl_slot_idx;
+		recycled_slot = ClusterPageGetItlSlots(page)[recycled_slot_index];
+		memcpy(recycled_tuple_header, tup->t_data, sizeof(recycled_tuple_header));
+		evidence = cluster_heap_resolve_recycled_writer_ref(buffer, xwait, &cref, false, &recycled);
+
+		if (evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			return false; /* existing resolver proved a genuinely own xid */
+		}
+		if (evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			recycled_terminal = true;
+			goto cluster_remote_writer_terminal;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+				 errmsg("cluster TT slot recycled for remote writer %u", xwait),
+				 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=RECYCLED_AUTHORITY_UNPROVABLE "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+						   "PGRAC_EXIT=WRITER_REMOTE_DATA_XID_MISMATCH xid=%u ref_xid=%u",
+						   cluster_node_id, xwait, cref.local_xid),
+				 errhint("The existing origin authority could not prove the old transaction's "
+						 "terminal state.")));
+	}
 
 	/* Drop the buffer content lock before the TT lookup (lock order). */
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -8987,7 +9296,42 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 *   outcome / new version is unprovable -- fail closed retryably (53R9H)
 	 *   instead of running the unsafe native path.
 	 */
+cluster_remote_writer_terminal:
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (recycled_terminal) {
+		OffsetNumber offset = ItemPointerGetOffsetNumber(&tup->t_self);
+		ClusterUndoTTSlotRef fresh_ref;
+		ItemId item;
+
+		/* The proof is operation-local and immutable, but its tuple/ITL
+		 * observation was made before unlocking.  Reload by TID, then compare
+		 * all captured header, slot and ref bytes before consuming it. */
+		page = BufferGetPage(buffer);
+		*res = TM_BeingModified; /* all three callers restart qualification */
+		item = PageHasItl(page) && OffsetNumberIsValid(offset)
+					   && offset <= PageGetMaxOffsetNumber(page)
+				   ? PageGetItemId(page, offset)
+				   : NULL;
+		if (item == NULL || !ItemIdIsNormal(item)
+			|| ItemIdGetLength(item) < sizeof(recycled_tuple_header))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT slot recycled for remote writer %u", xwait),
+					 errdetail(
+						 "PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=IDENTITY_STALE "
+						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 PGRAC_EXIT=WRITER_REMOTE_DATA_XID_MISMATCH",
+						 cluster_node_id)));
+		tup->t_data = (HeapTupleHeader)PageGetItem(page, item);
+		tup->t_len = ItemIdGetLength(item);
+		if (PageGetLSN(page) != recycled_page_lsn
+			|| memcmp(tup->t_data, recycled_tuple_header, sizeof(recycled_tuple_header)) != 0
+			|| memcmp(&ClusterPageGetItlSlots(page)[recycled_slot_index], &recycled_slot,
+					  sizeof(recycled_slot))
+				   != 0
+			|| !cluster_itl_get_tt_ref(page, recycled_slot_index, &fresh_ref)
+			|| memcmp(&fresh_ref, &cref, sizeof(cref)) != 0)
+			return true;
+	}
 	if (is_lock_only)
 	{
 		*res = TM_Ok;
@@ -9027,8 +9371,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		wo.kind = CWO_UNRESOLVABLE;
 		old_t_ctid = tup->t_data->t_ctid;
 
-		cluster_visibility_resolve_tuple(buffer, tup->t_data, xwait,
-										 CLUSTER_VIS_XMAX_UPDATE, &xr);
+		if (recycled_terminal)
+			xr = recycled; /* no second remote lookup below content-X */
+		else
+			cluster_visibility_resolve_tuple(buffer, tup->t_data, xwait, CLUSTER_VIS_XMAX_UPDATE,
+											 &xr);
 
 		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE)
 		{
@@ -9107,6 +9454,16 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
  *	fork / bridge fail-closed legs own that shape.  Caller must hold the
  *	buffer content lock (ITL slot read).
  */
+#ifdef USE_CLUSTER_UNIT
+bool
+cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
+							  uint16 infomask, TM_Result *result)
+{
+	return cluster_heap_writer_wait_failclosed(relation, buffer, tuple, xid, infomask,
+											   LockWaitBlock, result);
+}
+#endif
+
 static bool
 cluster_xwait_has_remote_evidence(Page page, HeapTupleHeader tuple, TransactionId xwait,
 								  uint16 infomask)
@@ -9376,6 +9733,8 @@ l1:
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
 												LockWaitBlock, &cluster_writer_res))
 		{
+			if (cluster_writer_res == TM_BeingModified)
+				goto l1;
 			/*
 			 * Remote holder handled by the cluster path (lock released,
 			 * writer aborted, or terminal writer chained -- spec-7.1a D0).
@@ -10351,6 +10710,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	SCN			cluster_itl_old_write_scn = InvalidScn;
 	SCN			cluster_itl_new_write_scn = InvalidScn;
 	ClusterHeapItlTerminalCensus cluster_itl_update_census = {0};
+	uint64 itl_capacity_absolute_deadline_us = 0;
+	Buffer itl_capacity_wait_buffer = InvalidBuffer;
 	bool		cluster_itl_update_census_pending = false;
 	bool		cluster_itl_update_census_old_page = false;
 	bool		cluster_itl_update_needs_slots = false;
@@ -10693,6 +11054,8 @@ l2:
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask,
 												LockWaitBlock, &cluster_writer_res))
 		{
+			if (cluster_writer_res == TM_BeingModified)
+				goto l2;
 			/*
 			 * Remote holder handled by the cluster path (lock released,
 			 * writer aborted, or terminal writer chained -- spec-7.1a D0).
@@ -11767,11 +12130,8 @@ l_pgrac_reacquire:
 			}
 			cluster_heap_itl_finish_update_census_after_alloc_failure(
 				&cluster_itl_update_census, census_was_pending);
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
-							CLUSTER_ITL_INITRANS_DEFAULT),
-					 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+			itl_capacity_wait_buffer = buffer;
+			goto l_pgrac_itl_capacity_wait;
 		}
 		if (newbuf != buffer && PageHasItl(BufferGetPage(newbuf)))
 		{
@@ -11827,11 +12187,8 @@ l_pgrac_reacquire:
 				}
 				cluster_heap_itl_finish_update_census_after_alloc_failure(
 					&cluster_itl_update_census, census_was_pending);
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
-								CLUSTER_ITL_INITRANS_DEFAULT),
-						 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+				itl_capacity_wait_buffer = newbuf;
+				goto l_pgrac_itl_capacity_wait;
 			}
 		}
 		else if (census_was_pending
@@ -13015,6 +13372,55 @@ l_pgrac_reacquire:
 	bms_free(interesting_attrs);
 
 	return TM_Ok;
+
+#ifdef USE_PGRAC_CLUSTER
+l_pgrac_itl_capacity_wait: {
+	const char *wait_reason;
+	ClusterTxwResult wait_result;
+
+	wait_result = cluster_heap_itl_wait_capacity_after_census(
+		buffer, newbuf, itl_capacity_wait_buffer, &itl_capacity_absolute_deadline_us, &wait_reason);
+	if (wait_result != CLUSTER_TXW_RESOLVED && wait_result != CLUSTER_TXW_RETRY)
+		ereport(ERROR,
+				(errcode(wait_result == CLUSTER_TXW_TIMEOUT	   ? ERRCODE_CLUSTER_GES_TIMEOUT
+						 : wait_result == CLUSTER_TXW_DEADLOCK ? ERRCODE_T_R_DEADLOCK_DETECTED
+															   : ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+						CLUSTER_ITL_INITRANS_DEFAULT),
+				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
+						   "wait_result=%d deadline_us=" UINT64_FORMAT,
+						   wait_reason, cluster_node_id, (int)wait_result,
+						   itl_capacity_absolute_deadline_us)));
+	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_REQUALIFY);
+	/* No page lock or foreign newbuf pin remains.  READY is requalified,
+		 * not expired by the old prepare budget.  Both page choices and all
+		 * slot/tuple/CTRC identities are rebuilt by their existing owner. */
+	if (old_key_tuple != NULL && old_key_copied) {
+		heap_freetuple(old_key_tuple);
+		old_key_tuple = NULL;
+		old_key_copied = false;
+	}
+	cid = pgrac_entry_cid;
+	iscombo = false;
+	if (!cluster_heap_restart_update_undo_record_exact(&canonical_binding, undo_prepare_deadline_us,
+													   &undo_receipt))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+				 errmsg("cluster undo reservation expired before heap update capacity retry"),
+				 cluster_heap_undo_receipt_errdetail(false)));
+	if (old_tuple_temp_locked)
+		goto l_pgrac_reacquire;
+	cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+	page = BufferGetPage(buffer);
+	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
+	if (!ItemIdIsNormal(lp))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						errmsg("heap update tuple changed during ITL capacity retry")));
+	oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+	oldtup.t_len = ItemIdGetLength(lp);
+	goto l2;
+}
+#endif
 }
 
 #ifdef USE_ASSERT_CHECKING
@@ -14338,6 +14744,8 @@ l3:
 															xwait, infomask,
 															wait_policy, &cwres))
 					{
+						if (cwres == TM_BeingModified)
+							goto l3;
 						/*
 						 * The bridge dropped the content lock across its
 						 * wait/lookup; re-validate against the pre-wait

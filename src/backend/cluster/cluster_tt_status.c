@@ -151,6 +151,7 @@ typedef struct ClusterTTStatusShmem {
 	pg_atomic_uint64 merged_skipped_local;	 /* foreign L-class records skipped  */
 	pg_atomic_uint64 merged_own_bound_skips; /* §3.3c own-LSN-bound redo skips   */
 	pg_atomic_uint64 remote_uba_resolved;	 /* materialized remote undo reads   */
+	pg_atomic_uint64 evidence_metrics[CLUSTER_VIS_METRIC_COUNT];
 } ClusterTTStatusShmem;
 
 static bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
@@ -226,6 +227,12 @@ cluster_tt_status_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_conflict_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->prune_remote_keep_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_variant_unknown_failclosed_count, 0);
+		{
+			int metric;
+
+			for (metric = 0; metric < CLUSTER_VIS_METRIC_COUNT; metric++)
+				pg_atomic_init_u64(&ClusterTTStatusState->evidence_metrics[metric], 0);
+		}
 		/* PGRAC (spec-7.1a D6) */
 		pg_atomic_init_u64(&ClusterTTStatusState->writer_chain_resolved_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->writer_chain_failclosed_count, 0);
@@ -1398,6 +1405,31 @@ cluster_tt_status_bump_parent_chain_follow(void)
 
 
 #endif /* USE_PGRAC_CLUSTER */
+
+void
+cluster_vis_evidence_note(ClusterVisEvidenceMetric metric)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (ClusterTTStatusState != NULL && (unsigned)metric < CLUSTER_VIS_METRIC_COUNT)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evidence_metrics[metric], 1);
+#endif
+}
+
+bool
+cluster_vis_evidence_snapshot(uint64 values[CLUSTER_VIS_METRIC_COUNT])
+{
+#ifdef USE_PGRAC_CLUSTER
+	int metric;
+
+	if (values == NULL || ClusterTTStatusState == NULL)
+		return false;
+	for (metric = 0; metric < CLUSTER_VIS_METRIC_COUNT; metric++)
+		values[metric] = pg_atomic_read_u64(&ClusterTTStatusState->evidence_metrics[metric]);
+	return true;
+#else
+	return false;
+#endif
+}
 
 /*
  * cluster_tt_status_source_dispatch -- Admit one legacy TT source operation.

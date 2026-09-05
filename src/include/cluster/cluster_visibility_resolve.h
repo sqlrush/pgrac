@@ -113,6 +113,7 @@ typedef struct ClusterVisResolve {
 	ClusterTxLocator row_wait_locator;
 	uint16 multi_marker_origin;	 /* XMAX_MULTI: origin node of marker, else 0 */
 	bool multi_marker_is_remote; /* XMAX_MULTI: marker hit + origin != self */
+	const char *diagnostic_reason; /* static diagnostic text, not proof or wire */
 } ClusterVisResolve;
 
 

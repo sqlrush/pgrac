@@ -849,6 +849,11 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 		case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 							errmsg("cluster TT slot recycled for xmin %u", raw_xmin),
+							errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=%s PGRAC_NODE=%d "
+									  "PGRAC_ATTEMPT=0 PGRAC_EXIT=VIS_RECYCLED_XMIN",
+									  r.diagnostic_reason ? r.diagnostic_reason
+														  : "RECYCLED_AUTHORITY_UNPROVABLE",
+									  cluster_node_id),
 							errhint("ITL slot no longer maps to this xid; retry.")));
 			break;
 		case CLUSTER_VIS_ROUTE_NATIVE_SELF:
@@ -939,6 +944,11 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 	case CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT slot recycled for xmax %u", raw_xmax),
+						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=%s PGRAC_NODE=%d "
+								  "PGRAC_ATTEMPT=0 PGRAC_EXIT=VIS_RECYCLED_XMAX",
+								  r.diagnostic_reason ? r.diagnostic_reason
+													  : "RECYCLED_AUTHORITY_UNPROVABLE",
+								  cluster_node_id),
 						errhint("ITL slot no longer maps to this xid; retry.")));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
@@ -2283,6 +2293,11 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			if (res.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 								errmsg("cluster TT slot recycled for xid %u", raw_xmin),
+								errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=%s PGRAC_NODE=%d "
+										  "PGRAC_ATTEMPT=0 PGRAC_EXIT=VIS_RECYCLED_XID",
+										  res.diagnostic_reason ? res.diagnostic_reason
+																: "RECYCLED_AUTHORITY_UNPROVABLE",
+										  cluster_node_id),
 								errhint("ITL slot no longer maps to this xid (slot reused); "
 										"retry the transaction with a fresh snapshot.")));
 
@@ -2765,6 +2780,14 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	return false;
 }
 
+
+#ifdef USE_CLUSTER_UNIT
+bool
+cluster_heap_test_satisfies_mvcc(HeapTuple tuple, Snapshot snapshot, Buffer buffer)
+{
+	return HeapTupleSatisfiesMVCC(tuple, snapshot, buffer);
+}
+#endif
 
 /*
  * HeapTupleSatisfiesVacuum

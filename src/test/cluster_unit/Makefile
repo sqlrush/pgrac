@@ -3294,12 +3294,12 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
-		$(CLUSTER_R4_HEAPTUPLE_TEST_O)
+		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
-		$(CLUSTER_R4_HEAPTUPLE_TEST_O) \
+		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
@@ -3315,9 +3315,12 @@ $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 		-DCLUSTER_CTRC_UNIT_TEST=1 -c $< -o $@
 
 test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h \
-		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_status_hint.c \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
+		$(CLUSTER_R4_HOT_VIS_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
+		$(CLUSTER_R4_HOT_VIS_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

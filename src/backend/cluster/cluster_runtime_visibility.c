@@ -70,6 +70,7 @@
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
@@ -279,8 +280,10 @@ cluster_runtime_visibility_candidate_acquire_until(
 		TimestampTz now = GetCurrentTimestamp();
 		TimestampTz remaining_us;
 
-		if (now >= deadline)
+		if (now >= deadline) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_AUTHORITY_TIMEOUT);
 			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		}
 		remaining_us = deadline - now;
 		timeout_ms = remaining_us / 1000 >= INT_MAX
 			? INT_MAX : (int)Max((remaining_us + 999) / 1000, 1);
@@ -294,8 +297,10 @@ cluster_runtime_visibility_candidate_acquire_until(
 			|| step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD))
 		cleanup->active = true;
 	while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_TRANSIENT_PENDING);
 		CHECK_FOR_INTERRUPTS();
 		if (deadline != 0 && GetCurrentTimestamp() >= deadline) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_AUTHORITY_TIMEOUT);
 			cluster_undo_block0_current_cancel(guard);
 			if (cleanup != NULL)
 				cleanup->active = false;
@@ -311,6 +316,11 @@ cluster_runtime_visibility_candidate_acquire_until(
 		&& cleanup != NULL && cleanup->active) {
 		cluster_undo_block0_current_cancel(guard);
 		cleanup->active = false;
+	}
+	/* A synchronous candidate must never leak an unfinished observation. */
+	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_PREMATURE_EXIT);
+		Assert(false);
 	}
 	return step;
 }
@@ -336,8 +346,10 @@ cluster_runtime_visibility_candidate_release_until(
 
 	step = cluster_undo_block0_current_release_begin(guard, failure);
 	while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_TRANSIENT_PENDING);
 		CHECK_FOR_INTERRUPTS();
 		if (deadline != 0 && GetCurrentTimestamp() >= deadline) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_AUTHORITY_TIMEOUT);
 			cluster_undo_block0_current_cancel(guard);
 			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 		}
@@ -346,6 +358,10 @@ cluster_runtime_visibility_candidate_release_until(
 			&& !cluster_undo_block0_current_wait_reply(
 				guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE))
 			pg_usleep(1000L);
+	}
+	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_PREMATURE_EXIT);
+		Assert(false);
 	}
 	return step;
 }

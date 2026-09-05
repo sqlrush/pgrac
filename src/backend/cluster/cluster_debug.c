@@ -2973,6 +2973,23 @@ dump_visibility(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis_get_overlay_refresh_count()));
 	emit_row(rsinfo, "visibility", "covers_scn_refuse_count",
 			 fmt_int64((int64)cluster_vis_get_covers_scn_refuse_count()));
+	{
+		static const char *const keys[] = {
+#define CLUSTER_VIS_DEBUG_KEY(id, key) #key,
+			CLUSTER_VIS_EVIDENCE_METRICS(CLUSTER_VIS_DEBUG_KEY)
+#undef CLUSTER_VIS_DEBUG_KEY
+		};
+		uint64 values[CLUSTER_VIS_METRIC_COUNT];
+		bool available = cluster_vis_evidence_snapshot(values);
+		int metric;
+
+		StaticAssertStmt(lengthof(keys) == CLUSTER_VIS_METRIC_COUNT,
+						 "visibility diagnostic key census drift");
+		emit_row(rsinfo, "visibility", "evidence_stats_available", available ? "true" : "false");
+		if (available)
+			for (metric = 0; metric < CLUSTER_VIS_METRIC_COUNT; metric++)
+				emit_row(rsinfo, "visibility", keys[metric], fmt_int64((int64)values[metric]));
+	}
 }
 
 

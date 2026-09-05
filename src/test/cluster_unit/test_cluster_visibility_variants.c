@@ -315,6 +315,7 @@ UT_TEST(test_evidence_route_full_table)
 int
 main(void)
 {
+	UT_PLAN(12);
 	UT_RUN(test_update_xmin_frozen_precheck);
 	UT_RUN(test_prune_requires_cluster_wide_horizon);
 	UT_RUN(test_obs4_self_full_table);

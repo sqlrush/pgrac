@@ -225,6 +225,9 @@ static Page ut_scratch_forbidden_live_page;
 static ClusterUndoTTSlotRef ut_scratch_expected_ref;
 static ClusterVisEvidence ut_scratch_resolve_evidence;
 static ClusterTTStatus ut_scratch_resolve_status;
+static bool ut_writer_bridge_fixture;
+static int ut_writer_bridge_mutation;
+static int ut_writer_bridge_tuple_pulls;
 static SCN ut_scratch_resolve_scn;
 static SCN ut_scratch_expected_read_scn;
 static XLogRecPtr ut_scratch_expected_lsn;
@@ -296,11 +299,51 @@ static const ClusterSemanticAdmissionToken *ut_itl_census_admission;
 static ClusterSemanticActivationShmem ut_itl_census_semantic;
 static ClusterTxOutcome ut_itl_census_outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
 static BufferTag ut_itl_census_tag;
+static int ut_itl_wait_calls;
+static ClusterTxLocator ut_itl_wait_locator;
+static int ut_itl_wait_budget_ms;
+static uint64 ut_evidence_metrics[CLUSTER_VIS_METRIC_COUNT];
+
+void
+cluster_vis_evidence_note(ClusterVisEvidenceMetric metric)
+{
+	UT_ASSERT((unsigned)metric < CLUSTER_VIS_METRIC_COUNT);
+	ut_evidence_metrics[metric]++;
+}
+static ClusterTxwResult ut_itl_wait_result = CLUSTER_TXW_RESOLVED;
 static bool ut_itl_pair_active;
 static bool ut_itl_pair_content_lock_held[2];
 static Buffer ut_itl_pair_lock_buffers[4];
 static int ut_itl_pair_lock_calls;
 
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	if (lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)))
+		return ut_itl_pair_active ? ut_itl_pair_content_lock_held[0] : ut_hot_content_lock_held;
+	if (lock == BufferDescriptorGetContentLock(GetBufferDescriptor(1)))
+		return ut_itl_pair_content_lock_held[1];
+	UT_ASSERT(false);
+	return false;
+}
+
+ClusterTxwResult
+cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_timeout_ms,
+							  ClusterTxResolveReason *reason_out)
+{
+	ut_itl_wait_calls++;
+	ut_itl_wait_locator = *locator;
+	ut_itl_wait_budget_ms = effective_timeout_ms;
+	UT_ASSERT(!ut_hot_content_lock_held);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+	UT_ASSERT(!ut_itl_recycle_guard_active);
+	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
+	UT_ASSERT(effective_timeout_ms > 0);
+	*reason_out = ut_itl_wait_result == CLUSTER_TXW_TIMEOUT ? CLUSTER_TX_RESOLVE_TIMEOUT
+															: CLUSTER_TX_RESOLVE_NONE;
+	return ut_itl_wait_result;
+}
 void
 cluster_multixact_current_stats_bump(
 	ClusterCurrentMxStatId stat pg_attribute_unused())
@@ -369,9 +412,13 @@ cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
 }
 
 bool
-cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx,
-						   ClusterUndoTTSlotRef *ref)
+cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 {
+	if (ut_writer_bridge_fixture) {
+		UT_ASSERT(ut_hot_content_lock_held);
+		*ref = ut_scratch_expected_ref;
+		return true;
+	}
 	if (page == ut_hot_live_ref_page)
 	{
 		ut_hot_live_ref_calls++;
@@ -424,6 +471,79 @@ cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid,
 	out->evidence = ut_scratch_resolve_evidence;
 	out->status = ut_scratch_resolve_status;
 	out->commit_scn = ut_scratch_resolve_scn;
+	if (ut_writer_bridge_fixture && ut_writer_bridge_mutation == 1)
+		PageSetLSN(ut_hot_live_ref_page, ut_scratch_expected_lsn + 1);
+	if (ut_writer_bridge_fixture && ut_writer_bridge_mutation == 2)
+		ClusterPageGetItlSlots(ut_hot_live_ref_page)[2].wrap++;
+	if (ut_writer_bridge_fixture && ut_writer_bridge_mutation == 3)
+		ut_scratch_expected_ref.cluster_epoch++;
+}
+
+void
+cluster_visibility_resolve_tuple(Buffer buffer pg_attribute_unused(),
+								 HeapTupleHeader tuple pg_attribute_unused(),
+								 TransactionId xid pg_attribute_unused(),
+								 ClusterVisXidKind kind pg_attribute_unused(),
+								 ClusterVisResolve *out)
+{
+	ut_writer_bridge_tuple_pulls++;
+	UT_ASSERT(!ut_hot_content_lock_held);
+	memset(out, 0, sizeof(*out));
+	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	out->status = CLUSTER_TT_STATUS_COMMITTED;
+	out->commit_scn = ut_scratch_resolve_scn;
+}
+
+bool cluster_crossnode_write_write = true;
+bool cluster_tx_enqueue_wait_enabled = true;
+ClusterTxwResult
+cluster_tx_enqueue_wait(const ClusterTTStatusKey *key pg_attribute_unused(),
+						int timeout_ms pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return CLUSTER_TXW_UNPROVABLE;
+}
+void
+cluster_vis_bump_vis_conflict_failclosed_count(void)
+{}
+void
+cluster_vis_bump_writer_chain_resolved_count(void)
+{}
+void
+cluster_vis_bump_writer_chain_failclosed_count(void)
+{}
+Buffer
+ReadBuffer(Relation relation pg_attribute_unused(), BlockNumber block pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return InvalidBuffer;
+}
+BlockNumber
+RelationGetNumberOfBlocksInFork(Relation relation pg_attribute_unused(),
+								ForkNumber fork pg_attribute_unused())
+{
+	return 100;
+}
+void
+UnlockReleaseBuffer(Buffer buffer pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+bool
+cluster_itl_find_lock_tt_ref_by_xmax(Page page pg_attribute_unused(),
+									 TransactionId xid pg_attribute_unused(),
+									 ClusterUndoTTSlotRef *ref pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+								  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+								  ClusterTTStatusSourceResult *result pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
 void
@@ -1331,7 +1451,11 @@ IncrBufferRefCount(Buffer buffer)
 void
 ReleaseBuffer(Buffer buffer)
 {
-	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(buffer, ut_itl_pair_active ? 2 : 1);
+	if (ut_itl_pair_active) {
+		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+		UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+	}
 	ut_buffer_release_calls++;
 }
 
@@ -2846,6 +2970,11 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture,
 	ut_itl_census_mutate_second_terminal_after_full_resolve = false;
 	ut_itl_census_second_terminal_mutated = false;
 	ut_itl_census_consume_allocated_slot = false;
+	ut_itl_wait_calls = 0;
+	ut_itl_wait_budget_ms = 0;
+	memset(ut_evidence_metrics, 0, sizeof(ut_evidence_metrics));
+	memset(&ut_itl_wait_locator, 0, sizeof(ut_itl_wait_locator));
+	ut_itl_wait_result = CLUSTER_TXW_RESOLVED;
 }
 
 static void
@@ -4067,10 +4196,249 @@ UT_TEST(test_79_current_mx_epoch_zero_requires_clean_four_node_formation)
 	UT_ASSERT(cluster_heap_test_current_mx_epoch_supported(1));
 }
 
+UT_TEST(test_recycled_writer_uses_existing_authority_outside_content_lock)
+{
+	int leg;
+
+	for (leg = 0; leg < 4; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		ClusterVisResolve resolved;
+		ClusterVisEvidence evidence;
+		PGAlignedBlock before;
+
+		ut_itl_census_begin(&fixture, &result, false);
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+		ut_scratch_expected_ref.origin_node_id = 1;
+		ut_scratch_expected_ref.tt_slot_id = 2;
+		ut_scratch_expected_ref.local_xid = 1500;
+		ut_scratch_expected_xid = 1200;
+		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
+		ut_scratch_expected_read_scn = InvalidScn;
+		ut_scratch_resolve_evidence
+			= leg == 3 ? CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS : CLUSTER_VIS_EVIDENCE_REMOTE;
+		ut_scratch_resolve_status = leg < 2	   ? CLUSTER_TT_STATUS_COMMITTED
+									: leg == 2 ? CLUSTER_TT_STATUS_ABORTED
+											   : CLUSTER_TT_STATUS_UNKNOWN;
+		ut_scratch_resolve_scn = leg < 2 ? (SCN)9001 : InvalidScn;
+		ut_scratch_exact_resolve_calls = 0;
+		evidence = cluster_heap_test_resolve_recycled_writer_ref(
+			UT_HOT_BUFFER, 1200, &ut_scratch_expected_ref, false, &resolved);
+		UT_ASSERT_EQ(evidence, ut_scratch_resolve_evidence);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		if (!ut_hot_content_lock_held)
+			LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_lock_only_xid_breach_never_asks_fallback_or_changes_page)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	ClusterVisResolve resolved;
+	ClusterUndoTTSlotRef ref;
+	PGAlignedBlock before;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	memcpy(before.data, fixture.live_page, BLCKSZ);
+	memset(&ref, 0, sizeof(ref));
+	ref.origin_node_id = 1;
+	ref.tt_slot_id = 2;
+	ref.local_xid = 1500;
+	ut_scratch_exact_resolve_calls = 0;
+	UT_ASSERT_EQ(
+		cluster_heap_test_resolve_recycled_writer_ref(UT_HOT_BUFFER, 1200, &ref, true, &resolved),
+		CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
+	UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 0);
+	UT_ASSERT(ut_hot_content_lock_held);
+	UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
+{
+	int leg;
+
+	for (leg = 0; leg < 5; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot_result;
+		HeapTupleData tuple = { 0 };
+		TM_Result result = TM_Invisible;
+		PGAlignedBlock before;
+
+		ut_itl_census_begin(&fixture, &hot_result, false);
+		tuple.t_data = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+		tuple.t_len = UT_HOT_TUPLE_LEN;
+		tuple.t_tableOid = UT_HOT_TABLE_OID;
+		ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		tuple.t_data->t_ctid = tuple.t_self;
+		tuple.t_data->t_infomask = HEAP_XMIN_COMMITTED;
+		tuple.t_data->t_itl_slot_idx = 2;
+		HeapTupleHeaderSetXmax(tuple.t_data, 1200);
+		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+		ut_scratch_expected_ref.origin_node_id = 1;
+		ut_scratch_expected_ref.tt_slot_id = 2;
+		ut_scratch_expected_ref.local_xid = 1500;
+		ut_scratch_expected_xid = 1200;
+		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
+		ut_scratch_expected_read_scn = InvalidScn;
+		ut_scratch_resolve_evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		ut_scratch_resolve_status
+			= leg == 1 ? CLUSTER_TT_STATUS_ABORTED : CLUSTER_TT_STATUS_COMMITTED;
+		ut_scratch_resolve_scn = leg == 1 ? InvalidScn : (SCN)9001;
+		ut_scratch_exact_resolve_calls = 0;
+		ut_writer_bridge_fixture = true;
+		ut_writer_bridge_mutation = leg >= 2 ? leg - 1 : 0;
+		ut_writer_bridge_tuple_pulls = 0;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT(cluster_heap_test_writer_wait(NULL, 1, &tuple, 1200, tuple.t_data->t_infomask,
+												&result));
+		UT_ASSERT_EQ(result, leg >= 2 ? TM_BeingModified : leg == 1 ? TM_Ok : TM_Deleted);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
+		UT_ASSERT_EQ(ut_writer_bridge_tuple_pulls, 0);
+		UT_ASSERT(ut_hot_content_lock_held);
+		if (leg < 2)
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		ut_writer_bridge_fixture = false;
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_itl_capacity_deadline_is_once_only_checked_and_ceil_rounded)
+{
+	uint64 deadline = 0;
+	uint64 saved;
+
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, 1000, 5000), 5000);
+	UT_ASSERT_EQ(deadline, UINT64_C(5001000));
+	saved = deadline;
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, 5000001, 30000), 1);
+	UT_ASSERT_EQ(deadline, saved);
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, saved, 30000), 0);
+	UT_ASSERT_EQ(deadline, saved);
+	deadline = 0;
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, 1000, 0), 0);
+	UT_ASSERT_EQ(deadline, 0);
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, 1000, -1), 0);
+	UT_ASSERT_EQ(deadline, 0);
+	UT_ASSERT_EQ(cluster_heap_test_itl_remaining_wait_ms(&deadline, UINT64_MAX - 10, 1), 0);
+	UT_ASSERT_EQ(deadline, 0);
+}
+
+UT_TEST(test_itl_full_wait_uses_lowest_exact_blocker_after_pair_unwind)
+{
+	int pair;
+
+	for (pair = 0; pair < 2; pair++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		uint64 deadline = 0;
+		const char *reason;
+		uint8 i;
+		int releases;
+
+		ut_itl_census_begin(&fixture, &result, false);
+		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+			ut_itl_census_outcomes[i] = CLUSTER_TX_IN_PROGRESS;
+		if (pair) {
+			ut_itl_pair_active = true;
+			ut_itl_pair_content_lock_held[0] = true;
+			ut_itl_pair_content_lock_held[1] = true;
+			ut_hot_content_lock_held = false;
+		}
+		releases = ut_buffer_release_calls;
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, pair ? 2 : 1, 1, &deadline, &reason),
+					 CLUSTER_TXW_RESOLVED);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 1);
+		UT_ASSERT_EQ(ut_itl_wait_locator.itl_slot_index, 0);
+		UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1200);
+		UT_ASSERT(ut_itl_wait_locator.tt_wrap != TT_WRAP_INVALID);
+		UT_ASSERT(deadline > 0);
+		UT_ASSERT(ut_itl_wait_budget_ms <= cluster_ges_request_timeout_ms);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		UT_ASSERT_EQ(ut_buffer_release_calls - releases, pair);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_ITL_SELECTED], 1);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_ITL_WAIT_STARTED], 1);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_ITL_WAIT_TERMINAL], 1);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_ITL_DEADLINE_INIT], 1);
+		if (pair) {
+			/* Restore fixture only after recording a RED; production must
+			 * have performed both unlocks already. */
+			UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+			UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+			ut_itl_pair_content_lock_held[0] = false;
+			ut_itl_pair_content_lock_held[1] = false;
+		} else if (!ut_hot_content_lock_held)
+			LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_itl_wait_negative_boundaries_preserve_page_and_close_owners)
+{
+	int leg;
+
+	for (leg = 0; leg < 7; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		PGAlignedBlock before;
+		uint64 deadline = leg == 1 || leg == 6 ? 1 : 0;
+		const char *reason;
+		ClusterTxwResult expected = CLUSTER_TXW_UNPROVABLE;
+		uint8 i;
+
+		ut_itl_census_begin(&fixture, &result, false);
+		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+			ut_itl_census_outcomes[i] = CLUSTER_TX_IN_PROGRESS;
+		if (leg == 0)
+			ut_itl_census_outcomes[0] = CLUSTER_TX_UNKNOWN;
+		if (leg == 1 || leg == 2) {
+			expected = CLUSTER_TXW_TIMEOUT;
+			ut_itl_wait_result = CLUSTER_TXW_TIMEOUT;
+		}
+		if (leg == 3)
+			ut_itl_census_mutate_activation = true;
+		if (leg == 4) {
+			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				ClusterPageGetItlSlots((Page)fixture.live_page)[i].flags = ITL_FLAG_COMMITTED;
+		}
+		if (leg == 5 || leg == 6) {
+			ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+			expected = leg == 6 ? CLUSTER_TXW_TIMEOUT : CLUSTER_TXW_RETRY;
+		}
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, &deadline, &reason), expected);
+		UT_ASSERT_EQ(ut_itl_wait_calls, leg == 2 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		UT_ASSERT(!ut_itl_recycle_guard_active);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		if (leg == 1 || leg == 6) {
+			UT_ASSERT_EQ(deadline, 1);
+			UT_ASSERT(strcmp(reason, "ITL_CAPACITY_WAIT_EXPIRED") == 0);
+			UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+		}
+		if (leg == 4)
+			UT_ASSERT(strcmp(reason, "ITL_PROTECTED_HISTORY_CAPACITY") == 0);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(88);
+	UT_RUN(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck);
+	UT_RUN(test_itl_wait_negative_boundaries_preserve_page_and_close_owners);
+	UT_RUN(test_itl_capacity_deadline_is_once_only_checked_and_ceil_rounded);
+	UT_RUN(test_itl_full_wait_uses_lowest_exact_blocker_after_pair_unwind);
+	UT_RUN(test_recycled_writer_uses_existing_authority_outside_content_lock);
+	UT_RUN(test_lock_only_xid_breach_never_asks_fallback_or_changes_page);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);

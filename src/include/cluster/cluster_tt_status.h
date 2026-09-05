@@ -342,6 +342,54 @@ extern void cluster_vis_bump_xmax_resolved_count(void);
 extern uint64 cluster_vis_get_xmax_resolved_count(void);
 extern void cluster_vis_bump_overlay_refresh_count(void);
 extern uint64 cluster_vis_get_overlay_refresh_count(void);
+
+/* Process-local diagnostic identifiers, never wire status or authority. */
+#define CLUSTER_VIS_EVIDENCE_METRICS(X)                                                            \
+	X(OVERLAY_TERMINAL, overlay_exact_terminal_hit)                                                \
+	X(OVERLAY_LIVE, overlay_exact_in_progress_hit)                                                 \
+	X(OVERLAY_MISS, overlay_miss)                                                                  \
+	X(ORIGIN_ASK, origin_ask)                                                                      \
+	X(ORIGIN_TERMINAL, origin_terminal)                                                            \
+	X(ORIGIN_LIVE, origin_in_progress)                                                             \
+	X(TRANSIENT_PENDING, transient_pending)                                                        \
+	X(PREMATURE_EXIT, transient_pending_premature_exit)                                            \
+	X(AUTHORITY_TIMEOUT, authority_deadline_expired)                                               \
+	X(ROUTE_BYPASS, false_recycled_route_bypass)                                                   \
+	X(DURABLE_ROUTE_GAP, durable_record_route_gap)                                                 \
+	X(RECYCLED_TERMINAL, recycled_terminal_proven)                                                 \
+	X(RECYCLED_UNPROVABLE, recycled_authority_unprovable)                                          \
+	X(LOCK_XID_BREACH, lock_only_ref_xid_invariant_breach)                                         \
+	X(IDENTITY_STALE, identity_stale)                                                              \
+	X(FORMATION_STALE, formation_stale)                                                            \
+	X(AUTHORITY_UNAVAILABLE, authority_unavailable)                                                \
+	X(MALFORMED, malformed)                                                                        \
+	X(HINT_FULL, hint_outbound_full_drop)                                                          \
+	X(HINT_SEND_FAILED, hint_peer_send_failure)                                                    \
+	X(HINT_INVALID, hint_receiver_invalid)                                                         \
+	X(HINT_STALE, hint_receiver_stale_epoch)                                                       \
+	X(ITL_FULL, itl_capacity_exhausted_after_terminal_census)                                      \
+	X(ITL_DEADLINE_INIT, itl_capacity_deadline_init_count)                                         \
+	X(ITL_DEADLINE_REFRESH, itl_capacity_deadline_refresh_violation)                               \
+	X(ITL_SELECTED, itl_exact_blocker_selected)                                                    \
+	X(ITL_WAIT_STARTED, itl_exact_tx_wait_started)                                                 \
+	X(ITL_WAIT_TERMINAL, itl_exact_tx_wait_terminal)                                               \
+	X(ITL_TIMEOUT, itl_capacity_wait_expired)                                                      \
+	X(ITL_UNPROVABLE, itl_blocker_unprovable)                                                      \
+	X(ITL_PROTECTED, itl_protected_history_capacity)                                               \
+	X(ITL_HELD_OWNER, itl_wait_while_content_or_recycle_owner_held)                                \
+	X(ITL_PEER_HELD, itl_cross_page_peer_content_held_during_wait)                                 \
+	X(ITL_REQUALIFY, itl_fresh_requalify_count)                                                    \
+	X(ITL_STALE, itl_fresh_requalify_stale_count)
+
+typedef enum ClusterVisEvidenceMetric {
+#define CLUSTER_VIS_EVIDENCE_ENUM(id, key) CLUSTER_VIS_METRIC_##id,
+	CLUSTER_VIS_EVIDENCE_METRICS(CLUSTER_VIS_EVIDENCE_ENUM)
+#undef CLUSTER_VIS_EVIDENCE_ENUM
+		CLUSTER_VIS_METRIC_COUNT
+} ClusterVisEvidenceMetric;
+
+extern void cluster_vis_evidence_note(ClusterVisEvidenceMetric metric);
+extern bool cluster_vis_evidence_snapshot(uint64 values[CLUSTER_VIS_METRIC_COUNT]);
 extern void cluster_vis_bump_covers_scn_refuse_count(void);
 extern uint64 cluster_vis_get_covers_scn_refuse_count(void);
 
