@@ -17618,9 +17618,9 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		 * carrier may supersede it only after post-settlement DRAIN retired the
 		 * old pair and both old outbound intents are empty.  Attempt ordering is
 		 * comparable only within one {resource, requester} namespace; a different
-		 * requester is ordered here by the exact drain and carrier-generation
-		 * fences instead.  The monotone per-requester tombstone remains so a
-		 * delayed old DRAIN still replays exactly. */
+		 * requester is ordered here by exact drain and carrier or terminal
+		 * authority fences instead.  The monotone per-requester tombstone remains
+		 * so a delayed old DRAIN still replays exactly. */
 		result = pcm_resource_x_holder_pair_decode_locked(
 			state, &old_status, &old_image);
 		local_grd_source = state->authority_generation
@@ -17643,13 +17643,21 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		if (result == RESOURCE_X_APPLY_APPLIED
 			&& prepared_terminal_x_source_exact
 			&& required_x_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP
-			&& decoded_image.body.image_envelope.source_carrier_generation
-				== old_image.body.image_envelope.source_carrier_generation
-			&& resource_x_assertion_equal(
-				&block->common.logical_assertion,
-				&old_status.common.logical_assertion)
-			&& status_record.logical_generation
-				> state->holder_status.logical_generation)
+			&& ((decoded_image.body.image_envelope.source_carrier_generation
+					 == old_image.body.image_envelope.source_carrier_generation
+				 && resource_x_assertion_equal(
+					 &block->common.logical_assertion,
+					 &old_status.common.logical_assertion)
+				 && status_record.logical_generation
+					 > state->holder_status.logical_generation)
+				/* DROP can recreate the descriptor with an equal or smaller
+				 * local generation.  The exact terminal predicate above binds
+				 * this base to the current cover, not to the local GRD mirror.
+				 * A strictly later canonical authority orders that new episode
+				 * even across requesters.  All old DRAIN/intent/domain and
+				 * same-requester attempt fences below still apply. */
+				|| block->common.base_authority_generation
+					> old_image.common.authority_generation))
 			exact_drop_episode_restart = true;
 		if (result != RESOURCE_X_APPLY_APPLIED
 				|| (!local_grd_source && !installed_remote_source

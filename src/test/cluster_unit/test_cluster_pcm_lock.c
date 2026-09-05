@@ -5108,7 +5108,10 @@ UT_TEST(test_resource_x_direct_init_observer_is_join_only_and_keeps_round_deadli
 	UT_ASSERT_EQ(dispatch.common.assertion_sequence, UINT64_C(0));
 }
 
-UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
+static void
+check_resource_x_terminal_local_owner_recycle_and_revoke(
+	int32 next_requester, uint64 next_generation, uint64 next_attempt,
+	bool stale_authority_probe)
 {
 	BufferTag tag = make_tag(155);
 	ResourceXAssertion assertion;
@@ -5478,6 +5481,11 @@ UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
 		old_block.common.master_session_incarnation,
 		old_source_generation), RESOURCE_X_APPLY_APPLIED);
 
+	/* DRAIN alone cannot establish a new authority episode.  Keep the exact
+	 * old terminal cover, but ask it to replace the pair for another requester. */
+	if (stale_authority_probe)
+		UT_ASSERT(resource_x_assertion_init(&tag, 3,
+			&successor_block.common.logical_assertion));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 		&successor_block, 0, 77, 91, 19, 9, UINT64_C(3500),
 		&lineage, &revoke), RESOURCE_X_APPLY_APPLIED);
@@ -5487,7 +5495,8 @@ UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
 	 * not invalidate the already-held terminal cover/REVOKING identity which
 	 * the post-drop close consumes. */
 	fake_gcs_master_node = 0;
-	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+	make_resource_x_remote_join_pair(tag,
+		successor_block.common.logical_assertion.requester_node, &grant, &image);
 	retarget_resource_x_remote_join_pair(&grant, &image, UINT64_C(12),
 		UINT64_C(42));
 	image.common.ordered_lane = 0;
@@ -5546,6 +5555,14 @@ UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 		&successor_block, 0, &status, &image, &revoking, &stale),
 		RESOURCE_X_APPLY_STALE);
+	if (stale_authority_probe) {
+		UT_ASSERT_EQ(lineage.final_authority_generation, UINT64_C(10));
+		UT_ASSERT_EQ(old_image.common.authority_generation, UINT64_C(11));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+			&successor_block, 0, &status, &image, &revoking, &revoke),
+			RESOURCE_X_APPLY_STALE);
+		return;
+	}
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 		&successor_block, 0, &status, &image, &revoking, &revoke),
 		RESOURCE_X_APPLY_APPLIED);
@@ -5604,6 +5621,183 @@ UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
 		&expected_ref, 31, 77, 91));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
 		&revoke), RESOURCE_X_APPLY_NOT_FOUND);
+	if (next_requester == 0 || ut_current_failed != 0)
+		return;
+
+	/* The original test has now consumed the exact old cover after DROP.
+	 * Publish and drain its actual pending pair before a distinct acquisition;
+	 * DRAIN alone is not evidence of a new descriptor/authority episode. */
+	old_block = successor_block;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+		&old_block.common.logical_assertion, UINT64_C(42), 0, 31),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+		&old_block.common.logical_assertion, &old_status_intent,
+		old_status_payload, sizeof(old_status_payload)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+		&old_block.common.logical_assertion, &old_image_intent,
+		old_image_payload, sizeof(old_image_payload)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+		&old_status_intent, old_status_intent.first_armed_us + 1), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&old_status_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+		&old_image_intent, old_image_intent.first_armed_us + 1), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&old_image_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
+		&old_block.common.logical_assertion, UINT64_C(42), 0, 31,
+		&old_source_generation), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(old_source_generation, UINT64_C(91));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(
+		&old_block.common.logical_assertion, UINT64_C(42), 0, 31,
+		old_source_generation), RESOURCE_X_APPLY_APPLIED);
+	if (ut_current_failed != 0)
+		return;
+
+	/* The master has completed old base10 -> authority12.  This holder next
+	 * receives an ordinary image/grant and T1/T2/T3 for acquisition2/final14.
+	 * The clock/BufferDesc proof inputs are fixture observations, not a replay
+	 * of C7's missing old-pair snapshot or a physical bufmgr DROP. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(10000), UINT64_C(6000),
+		UINT64_C(4000), UINT64_C(50), false, 0, &request, &terminal_ref),
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(request.common.assertion_sequence, UINT64_C(2));
+	ack = make_resource_x_bootstrap_ack_values(&request, UINT64_C(12), UINT32_C(71));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+		&ack, 0, 61, 77, UINT64_C(4010), &assert_frame),
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	make_resource_x_remote_join_pair(tag, 1, &grant, &image);
+	retarget_resource_x_remote_join_pair(&grant, &image, UINT64_C(14), UINT64_C(2));
+	{
+		ResourceXRequesterJoinSnapshot join;
+
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+			&image, 0, &join), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+			&grant, 0, &join), RESOURCE_X_APPLY_APPLIED);
+	}
+	expected_ref = make_resource_x_acquisition_ref(tag, 1, 17, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&expected_ref), RESOURCE_X_APPLY_APPLIED);
+	memset(&install, 0, sizeof(install));
+	install.ownership_generation = next_generation;
+	install.writer_activation_token = 1;
+	install.resource_x_activation_generation = 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(
+		&expected_ref, &install), RESOURCE_X_APPLY_APPLIED);
+	memset(&activation, 0, sizeof(activation));
+	activation.ownership_generation = next_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
+		&expected_ref, &activation), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
+		&expected_ref, 31, 77, next_generation));
+	if (ut_current_failed != 0)
+		return;
+
+	successor_block.common.base_authority_generation = UINT64_C(14);
+	successor_block.common.authority_generation = UINT64_C(14);
+	successor_block.common.assertion_sequence = next_attempt;
+	UT_ASSERT(resource_x_assertion_init(&tag, next_requester,
+		&successor_block.common.logical_assertion));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+		&successor_block, 0, 77, next_generation, 1, 9, UINT64_C(4100),
+		&lineage, &revoke), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(lineage.final_authority_generation, UINT64_C(14));
+	make_resource_x_remote_join_pair(tag, next_requester, &grant, &image);
+	retarget_resource_x_remote_join_pair(&grant, &image, UINT64_C(16), next_attempt);
+	image.common.ordered_lane = 0;
+	set_resource_x_test_source_fence(image.body.image_envelope.source_fence,
+		next_generation, PCM_STATE_X);
+	image.body.image_envelope.source_carrier_generation = next_generation + 1;
+	canonicalize_resource_x_test_image(&image);
+	status.common = successor_block.common;
+	status.common.source_candidate = 0;
+	status.common.retain_pi_if_dirty = 0;
+	status.common.outcome = RESOURCE_X_OUTCOME_OK;
+	status.common.flags = RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
+	memcpy(status.body.blocked_to_n.source_fence, image.body.image_envelope.source_fence,
+		sizeof(status.body.blocked_to_n.source_fence));
+	status.body.blocked_to_n.source_carrier_generation = next_generation + 1;
+	status.body.blocked_to_n.requester_target_generation = next_attempt;
+	status.body.blocked_to_n.page_scn_lsn = image.body.image_envelope.page_scn_lsn;
+	status.body.blocked_to_n.dependency_count = image.body.image_envelope.dependency_count;
+	memcpy(status.body.blocked_to_n.dependencies, image.body.image_envelope.dependencies,
+		sizeof(status.body.blocked_to_n.dependencies));
+	status.body.blocked_to_n.source_proof_crc32c = image.common.semantic_crc32c;
+	status.body.blocked_to_n.page_checksum = image.body.image_envelope.page_checksum;
+	revoking.generation = next_generation;
+	revoking.reservation_token = revoke.reservation_token + 1;
+	if (ut_current_failed != 0)
+		return;
+	if (next_generation <= UINT64_C(91))
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_source_exact(
+			&successor_block, 0, &status, &image), RESOURCE_X_APPLY_STALE);
+	stale = revoke;
+	stale.owner_procno++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+		&successor_block, 0, &status, &image, &revoking, &stale), RESOURCE_X_APPLY_STALE);
+	if (next_requester == 2 && next_attempt <= UINT64_C(42)) {
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+			&successor_block, 0, &status, &image, &revoking, &revoke), RESOURCE_X_APPLY_STALE);
+		return;
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+		&successor_block, 0, &status, &image, &revoking, &revoke), RESOURCE_X_APPLY_APPLIED);
+	if (ut_current_failed != 0)
+		return;
+	/* A delayed old DRAIN is idempotent, not permission to remove the new
+	 * pending pair or to recreate the old outbound intents. */
+	old_source_generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
+		&old_block.common.logical_assertion, UINT64_C(42), 0, 31,
+		&old_source_generation), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(old_source_generation, UINT64_C(0));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+		&successor_block.common.logical_assertion, &old_image), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(old_image.common.assertion_sequence, next_attempt);
+	UT_ASSERT_EQ(old_image.common.authority_generation, UINT64_C(15));
+	UT_ASSERT_EQ(old_image.body.image_envelope.source_carrier_generation, next_generation + 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+		&successor_block.common.logical_assertion, &old_image_intent,
+		old_image_payload, sizeof(old_image_payload)), RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+UT_TEST(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke)
+{
+	check_resource_x_terminal_local_owner_recycle_and_revoke(0, 0, 43, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_distinct_authority_control)
+{
+	check_resource_x_terminal_local_owner_recycle_and_revoke(3, 93, 43, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_allows_different_successor_requester)
+{
+	/* Requester-local attempt numbers cannot order different requesters.  The
+	 * old pair is fully drained before the existing exact successor owner acts. */
+	check_resource_x_terminal_local_owner_recycle_and_revoke(3, 91, 43, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_allows_lower_descriptor_generation)
+{
+	/* A newly allocated BufferDesc starts a distinct local generation domain.
+	 * Its smaller numeric generation must not stand in for old protocol debt. */
+	check_resource_x_terminal_local_owner_recycle_and_revoke(2, 1, 43, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_allows_other_requester_lower_attempt)
+{
+	check_resource_x_terminal_local_owner_recycle_and_revoke(3, 1, 1, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_rejects_old_requester_attempt)
+{
+	check_resource_x_terminal_local_owner_recycle_and_revoke(2, 1, 42, false);
+}
+
+UT_TEST(test_resource_x_drained_drop_pair_requires_new_terminal_authority)
+{
+	check_resource_x_terminal_local_owner_recycle_and_revoke(0, 0, 43, true);
 }
 
 UT_TEST(test_resource_x_bootstrap_round_waits_only_for_exact_target_install)
@@ -14922,7 +15116,7 @@ UT_TEST(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_r
 int
 main(void)
 {
-	UT_PLAN(200);
+	UT_PLAN(206);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -15014,6 +15208,12 @@ main(void)
 	UT_RUN(test_resource_x_pre_assert_authority_drift_discards_exact_round_only);
 	UT_RUN(test_resource_x_direct_init_observer_is_join_only_and_keeps_round_deadline);
 	UT_RUN(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke);
+	UT_RUN(test_resource_x_drained_drop_pair_distinct_authority_control);
+	UT_RUN(test_resource_x_drained_drop_pair_allows_different_successor_requester);
+	UT_RUN(test_resource_x_drained_drop_pair_allows_lower_descriptor_generation);
+	UT_RUN(test_resource_x_drained_drop_pair_allows_other_requester_lower_attempt);
+	UT_RUN(test_resource_x_drained_drop_pair_rejects_old_requester_attempt);
+	UT_RUN(test_resource_x_drained_drop_pair_requires_new_terminal_authority);
 		UT_RUN(test_resource_x_bootstrap_round_waits_only_for_exact_target_install);
 		UT_RUN(test_resource_x_bootstrap_round_waits_across_exact_post_t3_cover_window);
 		UT_RUN(test_resource_x_target_install_continuation_classifies_exact_attempt);
