@@ -909,51 +909,44 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 }
 
 static bool
-cluster_vis_exact_locators_for_ref(
-	Page page, TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
-	ClusterTxLocator *visibility_locator_out,
-	ClusterTxLocator *row_wait_locator_out)
+cluster_vis_exact_locators_for_ref(Page page, uint8 slot_index, ClusterVisXidKind which,
+								   TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+								   ClusterTxLocator *visibility_locator_out,
+								   ClusterTxLocator *row_wait_locator_out)
 {
 	ClusterTxLocator candidate;
+	ClusterUndoTTSlotRef candidate_ref;
 	ClusterTxResolveReason reason;
-	uint8 i;
-	bool found = false;
 
 	if (visibility_locator_out != NULL)
 		memset(visibility_locator_out, 0, sizeof(*visibility_locator_out));
 	if (row_wait_locator_out != NULL)
 		memset(row_wait_locator_out, 0, sizeof(*row_wait_locator_out));
 	if (page == NULL || ref == NULL || visibility_locator_out == NULL
-		|| row_wait_locator_out == NULL
-		|| !TransactionIdIsNormal(raw_xid))
+		|| row_wait_locator_out == NULL || !TransactionIdIsNormal(raw_xid))
 		return false;
 
-	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
-		ClusterUndoTTSlotRef candidate_ref;
+	/* The tuple or the canonical DATA/LOCK selector already chose this slot.
+	 * A reduced TT ref loses the UBA record address and ITL kind: rescanning
+	 * it can conflate a transaction's DATA and LOCK_ONLY records, or replace
+	 * a recycled tuple slot with an unrelated surviving carrier. */
+	if (!cluster_itl_get_tt_ref(page, slot_index, &candidate_ref)
+		|| candidate_ref.local_xid != raw_xid || candidate_ref.local_xid != ref->local_xid
+		|| candidate_ref.origin_node_id != ref->origin_node_id
+		|| candidate_ref.undo_segment_id != ref->undo_segment_id
+		|| candidate_ref.tt_slot_id != ref->tt_slot_id
+		|| candidate_ref.cluster_epoch != ref->cluster_epoch
+		|| !cluster_tx_locator_from_itl(page, slot_index, &candidate, &reason))
+		return false;
+	if ((which == CLUSTER_VIS_XMAX_LOCK_ONLY) != ITL_FLAG_IS_LOCK_ONLY(candidate.itl_kind))
+		return false;
 
-		if (!cluster_itl_get_tt_ref(page, i, &candidate_ref)
-			|| candidate_ref.local_xid != raw_xid
-			|| candidate_ref.origin_node_id != ref->origin_node_id
-			|| candidate_ref.undo_segment_id != ref->undo_segment_id
-			|| candidate_ref.tt_slot_id != ref->tt_slot_id
-			|| candidate_ref.cluster_epoch != ref->cluster_epoch)
-			continue;
-		if (found
-			|| !cluster_tx_locator_from_itl(page, i, &candidate, &reason)) {
-			memset(visibility_locator_out, 0,
-				   sizeof(*visibility_locator_out));
-			memset(row_wait_locator_out, 0,
-				   sizeof(*row_wait_locator_out));
-			return false;
-		}
-		*row_wait_locator_out = candidate;
-		/* Visibility Candidate-2 derives the canonical wrap at the origin;
-		 * ROW_WAIT instead retains the exact page witness. */
-		candidate.tt_wrap = TT_WRAP_INVALID;
-		*visibility_locator_out = candidate;
-		found = true;
-	}
-	return found;
+	*row_wait_locator_out = candidate;
+	/* Visibility Candidate-2 derives the canonical wrap at the origin;
+	 * ROW_WAIT instead retains the exact page witness. */
+	candidate.tt_wrap = TT_WRAP_INVALID;
+	*visibility_locator_out = candidate;
+	return true;
 }
 
 /*
@@ -990,20 +983,19 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 }
 
 static void
-classify_page_ref(
-	Page page, TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
-	XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
+classify_page_ref(Page page, uint8 slot_index, ClusterVisXidKind which, TransactionId raw_xid,
+				  const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn, SCN read_scn,
+				  ClusterVisResolve *out)
 {
 	ClusterTxLocator locator;
 	ClusterTxLocator row_wait_locator;
 	const ClusterTxLocator *exact_locator = NULL;
 
-	if (cluster_vis_exact_locators_for_ref(
-			page, raw_xid, ref, &locator, &row_wait_locator))
+	if (cluster_vis_exact_locators_for_ref(page, slot_index, which, raw_xid, ref, &locator,
+										   &row_wait_locator))
 		exact_locator = &locator;
 	classify_ref(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);
-	if (exact_locator != NULL
-		&& out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+	if (exact_locator != NULL && out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 		out->row_wait_locator = row_wait_locator;
 		out->row_wait_locator_valid = true;
 	}
@@ -1049,6 +1041,7 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 	Page page;
 	ClusterUndoTTSlotRef ref;
 	XLogRecPtr anchor_lsn;
+	uint8 slot_index;
 	bool is_catalog_page = false;
 
 	if (out == NULL)
@@ -1097,8 +1090,8 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref)) {
 			if (ref.local_xid == raw_xid)
-				classify_page_ref(page, raw_xid, &ref, anchor_lsn,
-							  read_scn, out);
+				classify_page_ref(page, htup->t_itl_slot_idx, which, raw_xid, &ref, anchor_lsn,
+								  read_scn, out);
 			else {
 				/*
 				 * An updated old tuple points at its xmax writer, not its
@@ -1109,29 +1102,37 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 				 */
 				ClusterUndoTTSlotRef xmin_ref;
 
-				if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &xmin_ref))
-					classify_page_ref(page, raw_xid, &xmin_ref, anchor_lsn,
-								  read_scn, out);
+				if (cluster_itl_find_data_slot_index_by_xid(page, raw_xid, &slot_index)
+					&& cluster_itl_get_tt_ref(page, slot_index, &xmin_ref))
+					classify_page_ref(page, slot_index, which, raw_xid, &xmin_ref, anchor_lsn,
+									  read_scn, out);
 				else
-					classify_page_ref(page, raw_xid, &ref, anchor_lsn,
-								  read_scn, out);
+					classify_page_ref(page, htup->t_itl_slot_idx, which, raw_xid, &ref, anchor_lsn,
+									  read_scn, out);
 			}
-		} else if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &ref))
-			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
+		} else if (cluster_itl_find_data_slot_index_by_xid(page, raw_xid, &slot_index)
+				   && cluster_itl_get_tt_ref(page, slot_index, &ref))
+			classify_page_ref(page, slot_index, which, raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_UPDATE:
 		/* The tuple's own ITL slot is the authority for its last updater. */
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref))
-			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
+			classify_page_ref(page, htup->t_itl_slot_idx, which, raw_xid, &ref, anchor_lsn,
+							  read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_LOCK_ONLY:
 		/* Lock-only xmax: the writer slot is found by xmax, not by the
 		 * tuple's own slot index (spec-3.4d D1). */
-		if (cluster_itl_find_lock_tt_ref_by_xmax(page, raw_xid, &ref))
-			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
+		if (cluster_itl_find_lock_slot_index_by_xmax(page, raw_xid, &slot_index)
+			&& cluster_itl_get_tt_ref(page, slot_index, &ref)) {
+			/* Preserve the lock-only reader's no-cached-verdict contract. */
+			ref.cached_commit_scn = InvalidScn;
+			ref.has_cached_status = false;
+			classify_page_ref(page, slot_index, which, raw_xid, &ref, anchor_lsn, read_scn, out);
+		}
 		break;
 
 	case CLUSTER_VIS_XMAX_MULTI: {

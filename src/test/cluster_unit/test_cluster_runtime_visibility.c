@@ -1185,56 +1185,77 @@ UT_TEST(test_freshref_failclosed_records_exact_first_local_predicate)
 }
 
 /*
- * The page can contain several live ITL slots from the same cluster epoch.
- * Only the slot carrying the full ref identity may become the status-22 DATA
- * locator; an unrelated same-epoch slot must not set the uniqueness latch.
- * A second exact duplicate remains ambiguous and therefore fail-closed.
+ * Wiring census, not a behavioural substitute: the selected ITL index must
+ * survive the reduced TT ref. DATA and LOCK_ONLY can share that ref while
+ * naming different undo records. Preserve the canonical selectors' ambiguity
+ * rules, all exact-ref guards, the kind guard, and the two wrap contracts.
  */
-UT_TEST(test_page_exact_locator_filters_full_ref_before_uniqueness)
+UT_TEST(test_page_exact_locator_preserves_selected_slot)
 {
 	char *source = read_visibility_resolve_source();
 	const char *helper
 		= source != NULL ? strstr(source, "\ncluster_vis_exact_locators_for_ref(") : NULL;
-	const char *helper_end
-		= helper != NULL ? strstr(helper, "\n}\n\n/*\n * classify_ref") : NULL;
+	const char *helper_end = helper != NULL ? strstr(helper, "\n}\n\n/*\n * classify_ref") : NULL;
+	const char *selected
+		= helper != NULL
+			  ? strstr(helper, "cluster_itl_get_tt_ref(page, slot_index, &candidate_ref)")
+			  : NULL;
 	const char *xid
-		= helper != NULL ? strstr(helper, "candidate_ref.local_xid != raw_xid") : NULL;
+		= selected != NULL ? strstr(selected, "candidate_ref.local_xid != raw_xid") : NULL;
+	const char *ref_xid
+		= xid != NULL ? strstr(xid, "candidate_ref.local_xid != ref->local_xid") : NULL;
 	const char *origin
-		= xid != NULL
-			  ? strstr(xid, "candidate_ref.origin_node_id != ref->origin_node_id")
-			  : NULL;
+		= xid != NULL ? strstr(xid, "candidate_ref.origin_node_id != ref->origin_node_id") : NULL;
 	const char *segment
-		= origin != NULL
-			  ? strstr(origin, "candidate_ref.undo_segment_id != ref->undo_segment_id")
-			  : NULL;
+		= origin != NULL ? strstr(origin, "candidate_ref.undo_segment_id != ref->undo_segment_id")
+						 : NULL;
 	const char *slot
-		= segment != NULL
-			  ? strstr(segment, "candidate_ref.tt_slot_id != ref->tt_slot_id")
-			  : NULL;
+		= segment != NULL ? strstr(segment, "candidate_ref.tt_slot_id != ref->tt_slot_id") : NULL;
 	const char *epoch
-		= slot != NULL
-			  ? strstr(slot, "candidate_ref.cluster_epoch != ref->cluster_epoch")
-			  : NULL;
-	const char *duplicate_guard
-		= epoch != NULL ? strstr(epoch, "if (found") : NULL;
+		= slot != NULL ? strstr(slot, "candidate_ref.cluster_epoch != ref->cluster_epoch") : NULL;
 	const char *locator
-		= duplicate_guard != NULL ? strstr(duplicate_guard, "cluster_tx_locator_from_itl(") : NULL;
+		= epoch != NULL ? strstr(epoch, "cluster_tx_locator_from_itl(page, slot_index,") : NULL;
+	const char *kind
+		= locator != NULL ? strstr(locator, "ITL_FLAG_IS_LOCK_ONLY(candidate.itl_kind)") : NULL;
+	const char *row_wait = kind != NULL ? strstr(kind, "*row_wait_locator_out = candidate;") : NULL;
+	const char *partial_wrap
+		= row_wait != NULL ? strstr(row_wait, "candidate.tt_wrap = TT_WRAP_INVALID;") : NULL;
+	const char *visibility = partial_wrap != NULL
+								 ? strstr(partial_wrap, "*visibility_locator_out = candidate;")
+								 : NULL;
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
+	UT_ASSERT_NOT_NULL(selected);
 	UT_ASSERT_NOT_NULL(xid);
+	UT_ASSERT_NOT_NULL(ref_xid);
 	UT_ASSERT_NOT_NULL(origin);
 	UT_ASSERT_NOT_NULL(segment);
 	UT_ASSERT_NOT_NULL(slot);
 	UT_ASSERT_NOT_NULL(epoch);
-	UT_ASSERT_NOT_NULL(duplicate_guard);
 	UT_ASSERT_NOT_NULL(locator);
-	if (helper_end != NULL && xid != NULL && origin != NULL
-		&& segment != NULL && slot != NULL && epoch != NULL
-		&& duplicate_guard != NULL && locator != NULL)
-		UT_ASSERT(xid < origin && origin < segment && segment < slot
-				  && slot < epoch && epoch < duplicate_guard
-				  && duplicate_guard < locator && locator < helper_end);
+	UT_ASSERT_NOT_NULL(kind);
+	UT_ASSERT_NOT_NULL(row_wait);
+	UT_ASSERT_NOT_NULL(partial_wrap);
+	UT_ASSERT_NOT_NULL(visibility);
+	if (helper_end != NULL && selected != NULL && xid != NULL && ref_xid != NULL && origin != NULL
+		&& segment != NULL && slot != NULL && epoch != NULL && locator != NULL && kind != NULL
+		&& row_wait != NULL && partial_wrap != NULL && visibility != NULL) {
+		const char *rescan = strstr(helper, "for (");
+
+		UT_ASSERT(selected < xid && xid < ref_xid && ref_xid < origin && origin < segment
+				  && segment < slot && slot < epoch && epoch < locator && locator < kind
+				  && kind < row_wait && row_wait < partial_wrap && partial_wrap < visibility
+				  && visibility < helper_end);
+		UT_ASSERT(rescan == NULL || rescan > helper_end);
+	}
+	UT_ASSERT_NOT_NULL(
+		strstr(source, "cluster_itl_find_data_slot_index_by_xid(page, raw_xid, &slot_index)"));
+	UT_ASSERT_NOT_NULL(
+		strstr(source, "cluster_itl_find_lock_slot_index_by_xmax(page, raw_xid, &slot_index)"));
+	UT_ASSERT_NOT_NULL(strstr(source, "classify_page_ref(page, htup->t_itl_slot_idx, which,"));
+	UT_ASSERT_NOT_NULL(strstr(source, "ref.cached_commit_scn = InvalidScn;"));
+	UT_ASSERT_NOT_NULL(strstr(source, "ref.has_cached_status = false;"));
 	free(source);
 }
 
@@ -1271,7 +1292,7 @@ main(void)
 	UT_RUN(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair);
 	UT_RUN(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo);
 	UT_RUN(test_freshref_failclosed_records_exact_first_local_predicate);
-	UT_RUN(test_page_exact_locator_filters_full_ref_before_uniqueness);
+	UT_RUN(test_page_exact_locator_preserves_selected_slot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

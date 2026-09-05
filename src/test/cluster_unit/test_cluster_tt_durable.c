@@ -348,6 +348,15 @@ cluster_undo_block0_current_acquire_poll(
 						: CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
 
+bool
+cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+									   ClusterUndoBlock0ReplyWaitSite site pg_attribute_unused())
+{
+	/* These current-guard fixtures complete synchronously.  A new pending
+	 * path must add an explicit fixture, not receive a fabricated wake. */
+	abort();
+}
+
 ClusterUndoBlock0Result
 cluster_undo_block0_current_sample_generation_exclusive(
 	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
