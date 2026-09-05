@@ -10153,7 +10153,9 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 	ClusterPcmOwnSnapshot base;
 	ClusterPcmOwnSnapshot current;
 	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnSnapshot pending;
 	ClusterPcmOwnResult own_result;
+	ResourceXApplyResult claim_result;
 	LWLock *content_lock;
 	Page page;
 	uint64 committed_generation = 0;
@@ -10161,6 +10163,9 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 	uint64 round_direct_token = 0;
 	uint64 expected_committed_generation;
 	uint64 reservation_token = 0;
+	uint64 claim_generation = 0;
+	uint64 claim_token = 0;
+	uint8 claim_source = RESOURCE_X_INSTALL_CLAIM_NONE;
 	int buffer_id = -1;
 	ResourceXBufferActivationResult result = RESOURCE_X_BUFFER_STALE;
 	bool content_locked = false;
@@ -10267,7 +10272,22 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 					 * one aux-only exception consumes an already-joined remote
 					 * carrier through this ordinary image-before-X installer; the
 					 * local direct-init proof never authorizes those bytes. */
-					if (target_native) {
+					if (target_native && !direct_init_bound) {
+						/* A retry may consume only the reservation published by
+						 * this exact T1 installer, never whichever token it sees. */
+						claim_result = cluster_pcm_lock_resource_x_install_claim_snapshot_exact(
+							ref, &claim_source, &claim_generation, &claim_token);
+						if (claim_result != RESOURCE_X_APPLY_APPLIED
+							|| claim_source != RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1
+							|| current.pcm_state != (uint8)PCM_STATE_N
+							|| claim_generation != current.generation
+							|| claim_token != current.reservation_token) {
+							result = claim_result == RESOURCE_X_APPLY_RECOVERY_BLOCKED
+										 ? RESOURCE_X_BUFFER_CORRUPT
+										 : RESOURCE_X_BUFFER_STALE;
+							break;
+						}
+					} else if (target_native) {
 						if (!direct_init_bound
 							|| (!require_clean_n
 								&& !direct_init_remote_install)
@@ -10329,6 +10349,26 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 							? RESOURCE_X_BUFFER_STALE
 							: RESOURCE_X_BUFFER_CORRUPT;
 						break;
+					}
+					if (target_native) {
+						/* Still under the same content-X that created PENDING.
+						 * Publish its exact physical tuple before image install/X. */
+						own_result = cluster_bufmgr_pcm_own_snapshot(buf, &pending);
+						if (own_result != CLUSTER_PCM_OWN_OK
+							|| pending.generation != current.generation
+							|| pending.reservation_token != reservation_token) {
+							result = RESOURCE_X_BUFFER_CORRUPT;
+							break;
+						}
+						claim_result = cluster_pcm_lock_resource_x_install_claim_bind_t1_exact(
+							ref, &pending);
+						if (claim_result != RESOURCE_X_APPLY_APPLIED
+							&& claim_result != RESOURCE_X_APPLY_DUPLICATE) {
+							result = claim_result == RESOURCE_X_APPLY_STALE
+										 ? RESOURCE_X_BUFFER_STALE
+										 : RESOURCE_X_BUFFER_CORRUPT;
+							break;
+						}
 					}
 				} else if (current.pcm_state == (uint8)PCM_STATE_S) {
 					own_result = cluster_bufmgr_pcm_own_begin_s_revoke(
@@ -13275,9 +13315,11 @@ gcs_block_resource_x_target_acquire_internal(
 							result = target_install_observation_result;
 							break;
 						}
-						if (target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
 							continue;
+						}
 						if (target_install_follow_state
 								== RESOURCE_X_TARGET_INSTALL_TERMINAL) {
 							action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
@@ -13781,6 +13823,44 @@ gcs_block_resource_x_target_acquire_internal(
 				now_us = gcs_block_pcm_x_monotonic_us();
 				memset(&dispatch, 0, sizeof(dispatch));
 				memset(&terminal_ref, 0, sizeof(terminal_ref));
+				if (direct_init && own.pcm_state == (uint8)PCM_STATE_N
+					&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
+					ResourceXInstallClaimJoinObservation claim_join;
+					ClusterPcmOwnSnapshot after;
+					ResourceXApplyResult claim_result;
+
+					/* own is B-before; this read-only capture is E.  No claim
+					 * mutation is allowed until the complete B-after matches. */
+					claim_result = cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
+						&assertion, master_node, gate.formation, master_session,
+						admission.record_generation, requester_sender_connection_generation,
+						master_ingress_connection_generation, &claim_join);
+					if (claim_result == RESOURCE_X_APPLY_APPLIED) {
+						own_result = cluster_bufmgr_pcm_own_snapshot(buf, &after);
+						if (own_result != CLUSTER_PCM_OWN_OK) {
+							result
+								= gcs_block_resource_x_target_install_snapshot_result(own_result);
+							break;
+						}
+						if (!cluster_pcm_own_snapshot_equal_exact(&own, &after))
+							continue;
+						claim_result
+							= cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
+								&claim_join, &own, &after);
+						if (claim_result != RESOURCE_X_APPLY_APPLIED
+							&& claim_result != RESOURCE_X_APPLY_DUPLICATE
+							&& claim_result != RESOURCE_X_APPLY_BAD_STATE) {
+							result = claim_result;
+							break;
+						}
+						/* BAD_STATE here includes T1 winning before the bind.
+						 * The ordinary step may wait but cannot adopt our token. */
+					} else if (claim_result != RESOURCE_X_APPLY_NOT_FOUND
+							   && claim_result != RESOURCE_X_APPLY_BAD_STATE) {
+						result = claim_result;
+						break;
+					}
+				}
 					if (direct_init)
 						action = join_only
 					? cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(

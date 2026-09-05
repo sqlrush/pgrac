@@ -2684,7 +2684,9 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # field offsets, deterministic hash math, wait events + tranches
 # distinct, BLCKSZ cross-check).  The GCS substrate checks do not link
 # cluster_gcs_block.o.  Other behavioral coverage lives in t/111.
-test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O) \
+test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_RETRY_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) \

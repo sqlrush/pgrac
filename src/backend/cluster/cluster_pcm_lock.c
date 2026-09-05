@@ -202,13 +202,14 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint64 accepted_base;
 	uint64 terminal_authority_generation;
 	uint64 cached_ownership_generation;
-	uint64 direct_init_ownership_generation;
-	uint64 direct_init_reservation_token;
+	uint64 install_claim_pending_generation;
+	uint64 install_claim_reservation_token;
 	int32 current_master_node;
 	uint32 requester_sender_connection_generation;
 	uint32 master_ingress_connection_generation;
 	uint8 phase;
-	uint8 reserved[3];
+	uint8 install_claim_source;
+	uint8 reserved[2];
 } ClusterPcmResourceXBootstrapRound;
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 440,
@@ -9985,70 +9986,304 @@ pcm_resource_x_bootstrap_round_ack_matches_request(
 }
 
 static bool
-pcm_resource_x_bootstrap_round_identity_matches(
-	const ClusterPcmResourceXBootstrapRound *round,
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token)
+pcm_resource_x_install_claim_valid_locked(const ClusterPcmResourceXBootstrapRound *round)
 {
-	return round != NULL && assertion != NULL
-		&& resource_x_assertion_equal(&round->request.logical_assertion,
-			assertion)
-		&& round->current_master_node == current_master_node
-		&& round->resource_formation == resource_formation
-		&& round->master_session_incarnation
-			== master_session_incarnation
-		&& round->r4_record_generation == r4_record_generation
-		&& round->requester_sender_connection_generation
-			== requester_sender_connection_generation
-		&& round->master_ingress_connection_generation
-			== master_ingress_connection_generation
-		&& round->retry_slice_us == retry_slice_us
-		&& round->direct_init_ownership_generation
-			== direct_init_ownership_generation
-		&& round->direct_init_reservation_token
-			== direct_init_reservation_token;
+	if (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE)
+		return round->install_claim_pending_generation == 0
+			   && round->install_claim_reservation_token == 0;
+	return (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1
+			|| round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT)
+		   && round->install_claim_pending_generation < UINT64_MAX - 1
+		   && round->install_claim_reservation_token != 0
+		   && round->install_claim_reservation_token != UINT64_MAX;
 }
 
-/* A terminal cover is node-level retained authority, so an ordinary cached-X
- * writer does not have (and must not invent) the creation-only direct-init
- * generation/token.  A direct-init replay remains bound to both exact values;
- * every other round identity component is unchanged. */
 static bool
-pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
-	const ClusterPcmResourceXBootstrapRound *round,
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
+pcm_resource_x_install_claim_ref_exact_locked(const ClusterPcmResourceXBootstrapRound *round,
+											  const ResourceXAcquisitionRef *ref)
+{
+	return resource_x_assertion_equal(&round->request.logical_assertion, &ref->assertion)
+		   && round->resource_formation == ref->formation
+		   && round->request.assertion_sequence == ref->acquisition_generation
+		   && round->highest_attempt_floor == ref->acquisition_generation;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_install_claim_bind_t1_exact(const ResourceXAcquisitionRef *ref,
+														const ClusterPcmOwnSnapshot *reserved)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXBootstrapRound *round;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref) || reserved == NULL
+		|| !BufferTagsEqual(&ref->assertion.resource, &reserved->tag)
+		|| reserved->pcm_state != (uint8)PCM_STATE_N
+		|| reserved->flags != PCM_OWN_FLAG_GRANT_PENDING || reserved->generation >= UINT64_MAX - 1
+		|| reserved->reservation_token == 0 || reserved->reservation_token == UINT64_MAX
+		|| reserved->writer_activation_token != 0
+		|| reserved->resource_x_activation_generation != 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&ref->assertion.resource, false, &entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	round = &entry->resource_x_bootstrap_round;
+	if (!pcm_resource_x_install_claim_ref_exact_locked(round, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!cluster_pcm_lock_resource_x_gate_open_exact(ref->formation)
+			 || !pcm_resource_x_install_claim_valid_locked(round)
+			 || !pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+			 || round->accepted_base == 0 || round->accepted_base == UINT64_MAX
+			 || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+			 || pcm_resource_x_ref_classify_locked(entry, ref) != PCM_RX_REF_ACTIVE_EXACT
+			 || entry->resource_x_progress_flags
+					!= (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE) {
+		if (round->install_claim_reservation_token == reserved->reservation_token
+			&& round->install_claim_pending_generation == reserved->generation)
+			result = RESOURCE_X_APPLY_DUPLICATE;
+		else if (reserved->reservation_token < round->install_claim_reservation_token)
+			result = RESOURCE_X_APPLY_STALE;
+		else
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	} else {
+		pcm_resource_x_semantic_mutation_mark();
+		round->install_claim_pending_generation = reserved->generation;
+		round->install_claim_reservation_token = reserved->reservation_token;
+		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_install_claim_snapshot_exact(const ResourceXAcquisitionRef *ref,
+														 uint8 *source_out,
+														 uint64 *pending_generation_out,
+														 uint64 *reservation_token_out)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	const ClusterPcmResourceXBootstrapRound *round;
+	ResourceXApplyResult result;
+
+	if (source_out != NULL)
+		*source_out = RESOURCE_X_INSTALL_CLAIM_NONE;
+	if (pending_generation_out != NULL)
+		*pending_generation_out = 0;
+	if (reservation_token_out != NULL)
+		*reservation_token_out = 0;
+	if (!pcm_resource_x_ref_valid(ref) || source_out == NULL || pending_generation_out == NULL
+		|| reservation_token_out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&ref->assertion.resource, false, &entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	if (!pcm_resource_x_install_claim_ref_exact_locked(round, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!pcm_resource_x_install_claim_valid_locked(round))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE)
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+	else {
+		*source_out = round->install_claim_source;
+		*pending_generation_out = round->install_claim_pending_generation;
+		*reservation_token_out = round->install_claim_reservation_token;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
+/* The held PcmEntryRef fences entry binding/reuse.  Continuations additionally
+ * compare their saved binding_generation before reaching this comparator.
+ * Scheduling budgets and physical installation observations are not part of
+ * the node request key. */
+static bool
+pcm_resource_x_node_request_key_matches_locked(const ClusterPcmResourceXBootstrapRound *round,
+											   const ResourceXAssertion *assertion,
+											   int32 current_master_node, uint64 resource_formation,
+											   uint64 master_session_incarnation,
+											   uint64 r4_record_generation,
+											   uint32 requester_sender_connection_generation,
+											   uint32 master_ingress_connection_generation)
+{
+	return round != NULL && assertion != NULL
+		   && resource_x_assertion_equal(&round->request.logical_assertion, assertion)
+		   && round->current_master_node == current_master_node
+		   && round->resource_formation == resource_formation
+		   && round->master_session_incarnation == master_session_incarnation
+		   && round->r4_record_generation == r4_record_generation
+		   && round->requester_sender_connection_generation
+				  == requester_sender_connection_generation
+		   && round->master_ingress_connection_generation == master_ingress_connection_generation;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	ResourceXInstallClaimJoinObservation *out)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	const ClusterPcmResourceXBootstrapRound *round;
+	ResourceXApplyResult result;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !resource_x_assertion_valid(assertion)
+		|| assertion->requester_node != cluster_node_id)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+	else if (!pcm_resource_x_node_request_key_matches_locked(
+				 round, assertion, current_master_node, resource_formation,
+				 master_session_incarnation, r4_record_generation,
+				 requester_sender_connection_generation, master_ingress_connection_generation))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (round->phase > RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (!pcm_resource_x_install_claim_valid_locked(round)
+			 || round->request.assertion_sequence == 0
+			 || round->request.assertion_sequence == UINT64_MAX
+			 || round->request.assertion_sequence != round->highest_attempt_floor)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else {
+		out->request = round->request;
+		out->entry_binding_generation = entry_ref.binding_generation;
+		out->r4_record_generation = round->r4_record_generation;
+		out->master_node = round->current_master_node;
+		out->master_ingress_connection_generation = round->master_ingress_connection_generation;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
+	const ResourceXInstallClaimJoinObservation *observation, const ClusterPcmOwnSnapshot *before,
+	const ClusterPcmOwnSnapshot *after)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXBootstrapRound *round;
+	const ResourceXDecodedCommon *request;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (observation == NULL || before == NULL || after == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	request = &observation->request;
+	if (!resource_x_assertion_valid(&request->logical_assertion)
+		|| request->logical_assertion.requester_node != cluster_node_id
+		|| observation->entry_binding_generation == 0
+		|| observation->entry_binding_generation == UINT64_MAX || request->assertion_sequence == 0
+		|| request->assertion_sequence == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!cluster_pcm_own_snapshot_equal_exact(before, after))
+		return RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&before->tag, &request->logical_assertion.resource)
+		|| before->pcm_state != (uint8)PCM_STATE_N || before->flags != PCM_OWN_FLAG_GRANT_PENDING
+		|| before->generation >= UINT64_MAX - 1 || before->reservation_token == 0
+		|| before->reservation_token == UINT64_MAX || before->writer_activation_token != 0
+		|| before->resource_x_activation_generation != 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&before->tag, false, &entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	round = &entry->resource_x_bootstrap_round;
+	if (entry_ref.binding_generation != observation->entry_binding_generation
+		|| !pcm_resource_x_common_equal(&round->request, request)
+		|| round->highest_attempt_floor != request->assertion_sequence
+		|| !pcm_resource_x_node_request_key_matches_locked(
+			round, &request->logical_assertion, observation->master_node,
+			request->resource_formation, request->master_session_incarnation,
+			observation->r4_record_generation, request->sender_connection_generation,
+			observation->master_ingress_connection_generation))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!cluster_pcm_lock_resource_x_gate_open_exact(request->resource_formation)
+			 || !pcm_resource_x_install_claim_valid_locked(round)
+			 || !pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->phase < RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+			 || round->phase > RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE) {
+		if (round->install_claim_pending_generation == before->generation
+			&& round->install_claim_reservation_token == before->reservation_token)
+			result = RESOURCE_X_APPLY_DUPLICATE;
+		else
+			result = before->reservation_token < round->install_claim_reservation_token
+						 ? RESOURCE_X_APPLY_STALE
+						 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	} else if (before->generation == 0 || !pcm_resource_x_active_empty_locked(entry)
+			   || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else {
+		pcm_resource_x_semantic_mutation_mark();
+		round->install_claim_pending_generation = before->generation;
+		round->install_claim_reservation_token = before->reservation_token;
+		round->install_claim_source = RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
+/* A tokenless caller joins the node request without claiming any physical
+ * installation.  A caller presenting a token must match the bound claim; it
+ * cannot replace that claim, including when it is otherwise creator-capable. */
+static bool
+pcm_resource_x_request_observation_matches_locked(
+	const ClusterPcmResourceXBootstrapRound *round, const ResourceXAssertion *assertion,
+	int32 current_master_node, uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation, uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token)
 {
-	if (round == NULL || assertion == NULL
-		|| !resource_x_assertion_equal(
-			&round->request.logical_assertion, assertion)
-		|| round->current_master_node != current_master_node
-		|| round->resource_formation != resource_formation
-		|| round->master_session_incarnation
-			!= master_session_incarnation
-		|| round->r4_record_generation != r4_record_generation
-		|| round->requester_sender_connection_generation
-			!= requester_sender_connection_generation
-		|| round->master_ingress_connection_generation
-			!= master_ingress_connection_generation
-		|| round->retry_slice_us != retry_slice_us)
-		return false;
-	if (direct_init_reservation_token == 0)
-		return direct_init_ownership_generation == 0;
-	return round->direct_init_ownership_generation
-			== direct_init_ownership_generation
-		&& round->direct_init_reservation_token
-			== direct_init_reservation_token;
+	return pcm_resource_x_node_request_key_matches_locked(
+			   round, assertion, current_master_node, resource_formation,
+			   master_session_incarnation, r4_record_generation,
+			   requester_sender_connection_generation, master_ingress_connection_generation)
+		   && (direct_init_reservation_token == 0
+				   ? direct_init_ownership_generation == 0
+				   : (round->install_claim_pending_generation == direct_init_ownership_generation
+					  && round->install_claim_reservation_token == direct_init_reservation_token));
 }
 
 static void
@@ -10086,7 +10321,7 @@ pcm_resource_x_bootstrap_failed_round_rearmable_locked(
 {
 	static const ResourceXAcquisitionRef empty_ref;
 	static const ResourceXDecodedCommon empty_common;
-	static const uint8 zero_reserved[3];
+	static const uint8 zero_reserved[2];
 	ClusterPcmResourceXMasterState *master_state;
 	ResourceXDecodedCommon expected_assertion;
 	ResourceXDecodedFrame ack_frame;
@@ -10098,38 +10333,26 @@ pcm_resource_x_bootstrap_failed_round_rearmable_locked(
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	master_state = pcm_resource_x_master_state_for_entry(entry);
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-		|| direct_init_ownership_generation != 0
-		|| direct_init_reservation_token != 0
-		|| round->direct_init_ownership_generation != 0
-		|| round->direct_init_reservation_token != 0
-		|| round->absolute_deadline_us == 0
-		|| round->absolute_deadline_us == UINT64_MAX
+		|| direct_init_ownership_generation != 0 || direct_init_reservation_token != 0
+		|| round->install_claim_pending_generation != 0
+		|| round->install_claim_reservation_token != 0
+		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+		|| round->absolute_deadline_us == 0 || round->absolute_deadline_us == UINT64_MAX
 		|| now_us < round->absolute_deadline_us
-		|| absolute_deadline_us <= round->absolute_deadline_us
-		|| now_us >= absolute_deadline_us
-		|| round->highest_attempt_floor == 0
-		|| round->highest_attempt_floor == UINT64_MAX
-		|| round->last_dispatch_us == 0
-		|| round->last_dispatch_us >= round->absolute_deadline_us
-		|| round->terminal_authority_generation != 0
-		|| round->cached_ownership_generation != 0
-		|| memcmp(&round->terminal_ref, &empty_ref,
-			sizeof(empty_ref)) != 0
-		|| memcmp(round->reserved, zero_reserved,
-			sizeof(zero_reserved)) != 0
-		|| !pcm_resource_x_local_owner_valid_locked(
-			&entry->resource_x_local_owner)
-		|| entry->resource_x_local_owner.state
-			!= RESOURCE_X_LOCAL_OWNER_EMPTY
-		|| !pcm_resource_x_active_empty_locked(entry)
-		|| master_state == NULL
-		|| !pcm_resource_x_requester_join_empty_locked(
-			&master_state->requester_join)
-		|| !pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us, 0, 0))
+		|| absolute_deadline_us <= round->absolute_deadline_us || now_us >= absolute_deadline_us
+		|| round->highest_attempt_floor == 0 || round->highest_attempt_floor == UINT64_MAX
+		|| round->last_dispatch_us == 0 || round->last_dispatch_us >= round->absolute_deadline_us
+		|| round->terminal_authority_generation != 0 || round->cached_ownership_generation != 0
+		|| memcmp(&round->terminal_ref, &empty_ref, sizeof(empty_ref)) != 0
+		|| memcmp(round->reserved, zero_reserved, sizeof(zero_reserved)) != 0
+		|| !pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+		|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| !pcm_resource_x_active_empty_locked(entry) || master_state == NULL
+		|| !pcm_resource_x_requester_join_empty_locked(&master_state->requester_join)
+		|| !pcm_resource_x_request_observation_matches_locked(
+			round, assertion, current_master_node, resource_formation, master_session_incarnation,
+			r4_record_generation, requester_sender_connection_generation,
+			master_ingress_connection_generation, 0, 0))
 		return false;
 
 	request = &round->request;
@@ -10668,19 +10891,15 @@ pcm_resource_x_bootstrap_round_direct_init_handoff_locked(
 	Assert(round != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
-		|| round->direct_init_reservation_token == 0
-		|| round->direct_init_reservation_token == UINT64_MAX
-		|| round->direct_init_ownership_generation == UINT64_MAX
-		|| cached_ownership_generation == 0
+		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT
+		|| round->install_claim_reservation_token == 0
+		|| round->install_claim_reservation_token == UINT64_MAX
+		|| round->install_claim_pending_generation == UINT64_MAX || cached_ownership_generation == 0
 		|| cached_ownership_generation == UINT64_MAX
-		|| round->direct_init_ownership_generation + 1
-			!= cached_ownership_generation
-		|| round->request.assertion_sequence == 0
-		|| round->request.assertion_sequence == UINT64_MAX
-		|| round->request.assertion_sequence
-			!= round->highest_attempt_floor
-		|| round->accepted_base == 0
-		|| round->accepted_base >= UINT64_MAX - 1)
+		|| round->install_claim_pending_generation + 1 != cached_ownership_generation
+		|| round->request.assertion_sequence == 0 || round->request.assertion_sequence == UINT64_MAX
+		|| round->request.assertion_sequence != round->highest_attempt_floor
+		|| round->accepted_base == 0 || round->accepted_base >= UINT64_MAX - 1)
 		return false;
 
 	memset(&ref, 0, sizeof(ref));
@@ -10764,30 +10983,23 @@ pcm_resource_x_bootstrap_round_step_internal(
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	memset(dispatch_out, 0, sizeof(*dispatch_out));
 	memset(terminal_ref_out, 0, sizeof(*terminal_ref_out));
-	if (!resource_x_assertion_valid(assertion)
-		|| assertion->requester_node != cluster_node_id
-		|| current_master_node < 0
-		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+	if (!resource_x_assertion_valid(assertion) || assertion->requester_node != cluster_node_id
+		|| current_master_node < 0 || current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| resource_formation == 0 || resource_formation == UINT64_MAX
-		|| master_session_incarnation == 0
-		|| master_session_incarnation == UINT64_MAX
-		|| r4_record_generation == 0
-		|| r4_record_generation == UINT64_MAX
+		|| master_session_incarnation == 0 || master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX
 		|| requester_sender_connection_generation == 0
 		|| requester_sender_connection_generation == UINT32_MAX
 		|| master_ingress_connection_generation == 0
-		|| master_ingress_connection_generation == UINT32_MAX
-		|| absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX
-		|| now_us == 0 || now_us == UINT64_MAX
-		|| retry_slice_us == 0 || retry_slice_us == UINT64_MAX
-		|| (direct_init_reservation_token == 0
-			&& direct_init_ownership_generation != 0)
-		|| direct_init_ownership_generation == UINT64_MAX
+		|| master_ingress_connection_generation == UINT32_MAX || absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX || now_us == 0 || now_us == UINT64_MAX
+		|| now_us >= absolute_deadline_us || retry_slice_us == 0 || retry_slice_us == UINT64_MAX
+		|| (direct_init_reservation_token == 0 && direct_init_ownership_generation != 0)
+		|| direct_init_ownership_generation >= UINT64_MAX - 1
 		|| direct_init_reservation_token == UINT64_MAX
 		|| (!cached_local_x && cached_ownership_generation != 0)
 		|| (cached_local_x
-			&& (cached_ownership_generation == 0
-				|| cached_ownership_generation == UINT64_MAX))
+			&& (cached_ownership_generation == 0 || cached_ownership_generation == UINT64_MAX))
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(resource_formation))
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 
@@ -10800,42 +11012,42 @@ pcm_resource_x_bootstrap_round_step_internal(
 	}
 	entry = entry_ref.entry;
 
-	if (allow_create)
-		pcm_entry_lock_exclusive(entry);
-	else {
-		/* A rejected observer must be byte-for-byte side-effect free.  Delay
-		 * the conservative semantic-mutation sequence mark until the exact
-		 * already-frozen round has been proven joinable. */
-		pgstat_report_wait_start(WAIT_EVENT_PCM_TRANSITION_APPLY);
-		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		pgstat_report_wait_end();
-	}
+	/* Creator-capable callers are still followers of an existing head.  Check
+	 * their key and optional claim before any shared semantic mutation. */
+	pgstat_report_wait_start(WAIT_EVENT_PCM_TRANSITION_APPLY);
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pgstat_report_wait_end();
 	round = &entry->resource_x_bootstrap_round;
-	/* A pending-sidecar observer is a follower, never a requester-round
-	 * creator.  Reject every unjoinable shape before owner expiry, binding
-	 * cleanup, terminal mutation, or deadline transition.  Its caller must
-	 * present the round's already-frozen deadline byte-exactly. */
-	if (!allow_create
-		&& (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-			|| round->absolute_deadline_us == 0
-			|| round->absolute_deadline_us == UINT64_MAX
-			|| absolute_deadline_us != round->absolute_deadline_us
-			|| now_us >= round->absolute_deadline_us
-			|| !pcm_resource_x_bootstrap_round_identity_matches(
-				round, assertion, current_master_node,
-				resource_formation, master_session_incarnation,
-				r4_record_generation,
-				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us,
-				direct_init_ownership_generation,
-				direct_init_reservation_token))) {
+	if ((!allow_create
+		 && (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED))
+		|| (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			&& (!pcm_resource_x_install_claim_valid_locked(round)
+				|| !pcm_resource_x_node_request_key_matches_locked(
+					round, assertion, current_master_node, resource_formation,
+					master_session_incarnation, r4_record_generation,
+					requester_sender_connection_generation, master_ingress_connection_generation)
+				|| (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+					&& direct_init_reservation_token != 0
+					&& round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+					&& (round->install_claim_pending_generation != direct_init_ownership_generation
+						|| round->install_claim_reservation_token
+							   != direct_init_reservation_token))))) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
-	if (!allow_create)
-		pcm_resource_x_semantic_mutation_mark();
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+		&& round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+		&& direct_init_reservation_token != 0
+		&& round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE) {
+		/* Only the complete B-E-B binder or the T1 installer can publish the
+		 * claim.  A follower's tuple alone cannot make it the physical owner. */
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
+	}
+	pcm_resource_x_semantic_mutation_mark();
 	if (!pcm_resource_x_local_owner_valid_locked(
 			&entry->resource_x_local_owner)) {
 		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
@@ -10845,18 +11057,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
-	broadcast = pcm_resource_x_local_owner_expire_locked(
-		&entry->resource_x_local_owner, now_us);
-	if ((entry->resource_x_local_owner.state
-			== RESOURCE_X_LOCAL_OWNER_RECYCLING
-		|| entry->resource_x_local_owner.state
-			== RESOURCE_X_LOCAL_OWNER_HANDOFF)
-		&& pcm_resource_x_local_handoff_valid(
-			&entry->resource_x_local_owner.handoff)
-		&& !pcm_resource_x_local_handoff_round_current_locked(
-			&entry->resource_x_local_owner.handoff, round))
-		broadcast = pcm_resource_x_local_owner_priority_clear_locked(
-			&entry->resource_x_local_owner) || broadcast;
+	/* Expiry/cleanup belongs to the existing local owner and transport paths.
+	 * A caller joining this head cannot clear another owner's handoff. */
 	if (allow_create && !cached_local_x
 		&& pcm_resource_x_bootstrap_failed_round_rearmable_locked(
 			entry, round, assertion, current_master_node,
@@ -10871,31 +11073,21 @@ pcm_resource_x_bootstrap_round_step_internal(
 		broadcast = true;
 	}
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED) {
-		if (!pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
+		if (!pcm_resource_x_node_request_key_matches_locked(
 				round, assertion, current_master_node, resource_formation,
 				master_session_incarnation, r4_record_generation,
-				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us,
-				direct_init_ownership_generation,
-				direct_init_reservation_token)) {
-			if (cached_local_x)
-				round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
-			else
-				pcm_resource_x_bootstrap_round_clear_binding_locked(round);
-			broadcast = true;
+				requester_sender_connection_generation, master_ingress_connection_generation)) {
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else if (!cached_local_x) {
 			/* BufferDesc and the round are separate lock domains.  A caller may
 			 * have sampled the pre-T3 descriptor immediately before T3 published
 			 * this cover.  Re-probe instead of destroying exact terminal evidence. */
 			action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
-		} else if (!pcm_resource_x_local_owner_valid_locked(
-				&entry->resource_x_local_owner)) {
+		} else if (!pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)) {
 			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
 			broadcast = true;
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
-		} else if (entry->resource_x_local_owner.state
-				   != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		} else if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
 			if (pcm_resource_x_local_owner_round_exact_locked(entry, round))
 				action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 			else {
@@ -10904,25 +11096,21 @@ pcm_resource_x_bootstrap_round_step_internal(
 				action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 			}
 		} else if (!pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-				entry, round, &round->terminal_ref,
-				master_session_incarnation, r4_record_generation,
-				cached_ownership_generation)) {
-			round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
-			broadcast = true;
+					   entry, round, &round->terminal_ref, master_session_incarnation,
+					   r4_record_generation, cached_ownership_generation)) {
+			/* This caller's physical observation cannot consume the cover.
+			 * It is not authority to invalidate the node's retained cover. */
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else {
 			*terminal_ref_out = round->terminal_ref;
 			action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
 		}
 	} else if (cached_local_x
-			   && pcm_resource_x_bootstrap_round_identity_matches(
-				   round, assertion, current_master_node,
-				   resource_formation, master_session_incarnation,
-				   r4_record_generation,
-				   requester_sender_connection_generation,
-				   master_ingress_connection_generation, retry_slice_us,
-				   direct_init_ownership_generation,
-				   direct_init_reservation_token)
+			   && pcm_resource_x_request_observation_matches_locked(
+				   round, assertion, current_master_node, resource_formation,
+				   master_session_incarnation, r4_record_generation,
+				   requester_sender_connection_generation, master_ingress_connection_generation,
+				   direct_init_ownership_generation, direct_init_reservation_token)
 			   && pcm_resource_x_bootstrap_round_direct_init_handoff_locked(
 				   entry, round, cached_ownership_generation)) {
 		*terminal_ref_out = round->terminal_ref;
@@ -10938,11 +11126,10 @@ pcm_resource_x_bootstrap_round_step_internal(
 		}
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-			   && (predecessor_result
-				   = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
-					   entry, current_master_node,
-					   master_session_incarnation, resource_formation, 0))
-				  == RESOURCE_X_APPLY_APPLIED) {
+			   && (predecessor_result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+					   entry, current_master_node, master_session_incarnation, resource_formation,
+					   0))
+					  == RESOURCE_X_APPLY_APPLIED) {
 		/* The already-published holder pair belongs to an earlier canonical
 		 * conversion.  Keep this requester round byte-empty until its exact
 		 * SourceSettlement closes; no attempt, base, or master priority is
@@ -10978,10 +11165,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 					= requester_sender_connection_generation;
 				round->master_ingress_connection_generation
 					= master_ingress_connection_generation;
-				round->direct_init_ownership_generation
-					= direct_init_ownership_generation;
-				round->direct_init_reservation_token
-					= direct_init_reservation_token;
+				round->install_claim_pending_generation = direct_init_ownership_generation;
+				round->install_claim_reservation_token = direct_init_reservation_token;
+				round->install_claim_source = direct_init_reservation_token == 0
+												  ? RESOURCE_X_INSTALL_CLAIM_NONE
+												  : RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
 				round->request.logical_assertion = *assertion;
 				round->request.resource_formation = resource_formation;
 				round->request.master_session_incarnation
@@ -11001,15 +11189,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 				action = RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST;
 			}
 		}
-	} else if (!pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			direct_init_ownership_generation,
-			direct_init_reservation_token)) {
-		pcm_resource_x_bootstrap_round_clear_binding_locked(round);
-		broadcast = true;
+	} else if (!pcm_resource_x_request_observation_matches_locked(
+				   round, assertion, current_master_node, resource_formation,
+				   master_session_incarnation, r4_record_generation,
+				   requester_sender_connection_generation, master_ingress_connection_generation,
+				   direct_init_ownership_generation, direct_init_reservation_token)) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 			   || now_us >= round->absolute_deadline_us) {
@@ -11028,13 +11212,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 	} else if (now_us - round->last_dispatch_us < round->retry_slice_us) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
-	} else if (round->phase
-			   == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
 		round->last_dispatch_us = now_us;
 		pcm_resource_x_bootstrap_round_dispatch_snapshot(round, dispatch_out);
 		action = RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST;
-	} else if (round->phase
-			   == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED) {
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED) {
 		round->last_dispatch_us = now_us;
 		pcm_resource_x_bootstrap_round_assertion_snapshot(
 			round, dispatch_out);
@@ -11059,14 +11241,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 			= round->requester_sender_connection_generation;
 		diagnostic_master_ingress_generation
 			= round->master_ingress_connection_generation;
-		diagnostic_identity_match
-			= pcm_resource_x_bootstrap_round_identity_matches(
-				round, assertion, current_master_node, resource_formation,
-				master_session_incarnation, r4_record_generation,
-				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us,
-				direct_init_ownership_generation,
-				direct_init_reservation_token);
+		diagnostic_identity_match = pcm_resource_x_request_observation_matches_locked(
+			round, assertion, current_master_node, resource_formation, master_session_incarnation,
+			r4_record_generation, requester_sender_connection_generation,
+			master_ingress_connection_generation, direct_init_ownership_generation,
+			direct_init_reservation_token);
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
@@ -11193,12 +11372,11 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 	round = &entry->resource_x_bootstrap_round;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
 		result = RESOURCE_X_APPLY_NOT_FOUND;
-	else if (!resource_x_assertion_equal(
-			&round->request.logical_assertion, assertion)
-			|| round->direct_init_ownership_generation
-				!= direct_init_ownership_generation
-			|| round->direct_init_reservation_token
-				!= direct_init_reservation_token)
+	else if (!resource_x_assertion_equal(&round->request.logical_assertion, assertion)
+			 || (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+				 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+				 && (round->install_claim_pending_generation != direct_init_ownership_generation
+					 || round->install_claim_reservation_token != direct_init_reservation_token)))
 		result = RESOURCE_X_APPLY_STALE;
 	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 			 || round->r4_record_generation == 0
@@ -11304,23 +11482,15 @@ cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_e
 	round = &entry->resource_x_bootstrap_round;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
 		result = RESOURCE_X_APPLY_NOT_FOUND;
-	else if (!pcm_resource_x_common_equal(
-			&round->request, &request->common)
-			 || !pcm_resource_x_bootstrap_round_identity_matches(
-				round, &request->common.logical_assertion,
-				expected_master_node,
-				request->common.resource_formation,
-				request->common.master_session_incarnation,
-				expected_r4_record_generation,
-				request->common.sender_connection_generation,
-				expected_master_ingress_connection_generation,
-				expected_retry_slice_us,
-				expected_direct_init_ownership_generation,
-				expected_direct_init_reservation_token)
-			 || round->absolute_deadline_us
-				!= expected_absolute_deadline_us
-			 || round->request.assertion_sequence
-				!= round->highest_attempt_floor)
+	else if (!pcm_resource_x_common_equal(&round->request, &request->common)
+			 || !pcm_resource_x_request_observation_matches_locked(
+				 round, &request->common.logical_assertion, expected_master_node,
+				 request->common.resource_formation, request->common.master_session_incarnation,
+				 expected_r4_record_generation, request->common.sender_connection_generation,
+				 expected_master_ingress_connection_generation,
+				 expected_direct_init_ownership_generation, expected_direct_init_reservation_token)
+			 || round->absolute_deadline_us != expected_absolute_deadline_us
+			 || round->request.assertion_sequence != round->highest_attempt_floor)
 		result = RESOURCE_X_APPLY_STALE;
 	else if (round->phase
 			 != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED)
@@ -11328,8 +11498,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_e
 	else if (!pcm_resource_x_local_owner_valid_locked(
 			&entry->resource_x_local_owner))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if (entry->resource_x_local_owner.state
-			 != RESOURCE_X_LOCAL_OWNER_EMPTY)
+	else if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+			 || round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+			 || !pcm_resource_x_active_empty_locked(entry))
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	else if (round->accepted_base != 0
 			 || round->terminal_authority_generation != 0
@@ -11483,14 +11654,10 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		/* The retained cover is node-level authority.  An ordinary caller has
 		 * no creation-only direct-init token, so use the same relaxed terminal
 		 * identity as step_exact while it re-probes the BufferDesc domain. */
-		bool terminal_identity_matches
-			= pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			direct_init_ownership_generation,
-			direct_init_reservation_token);
+		bool terminal_identity_matches = pcm_resource_x_node_request_key_matches_locked(
+			round, assertion, current_master_node, resource_formation, master_session_incarnation,
+			r4_record_generation, requester_sender_connection_generation,
+			master_ingress_connection_generation);
 
 		if (!terminal_identity_matches
 			|| !pcm_resource_x_local_owner_valid_locked(
@@ -11516,19 +11683,19 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		 * PREDECESSOR_WAIT.  No pair, direct-init round, bound base or owner is
 		 * admitted through this exception. */
 		result = RESOURCE_X_APPLY_DUPLICATE;
-	}
-	else if (!pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			direct_init_ownership_generation,
-			direct_init_reservation_token)) {
+	} else if (!pcm_resource_x_node_request_key_matches_locked(
+				   round, assertion, current_master_node, resource_formation,
+				   master_session_incarnation, r4_record_generation,
+				   requester_sender_connection_generation, master_ingress_connection_generation)
+			   || (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+				   && direct_init_reservation_token != 0
+				   && (round->install_claim_pending_generation != direct_init_ownership_generation
+					   || round->install_claim_reservation_token
+							  != direct_init_reservation_token))) {
 		result = RESOURCE_X_APPLY_STALE;
-	}
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
-			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
-			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+			   || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
+			   || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
 		result = RESOURCE_X_APPLY_APPLIED;
 	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -11641,12 +11808,10 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
 
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	if (pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			direct_init_ownership_generation,
+	if (pcm_resource_x_request_observation_matches_locked(
+			round, assertion, current_master_node, resource_formation, master_session_incarnation,
+			r4_record_generation, requester_sender_connection_generation,
+			master_ingress_connection_generation, direct_init_ownership_generation,
 			direct_init_reservation_token)) {
 		phase_matches = round->phase
 			== RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED;
@@ -11719,32 +11884,22 @@ pcm_resource_x_bootstrap_round_target_install_inflight_locked(
 	ref.acquisition_generation = round->request.assertion_sequence;
 	attempt = round->request.assertion_sequence;
 	progress_flags = entry->resource_x_progress_flags;
-	direct_init_round = round->direct_init_reservation_token != 0
-		&& round->direct_init_reservation_token != UINT64_MAX
-		&& round->direct_init_ownership_generation != UINT64_MAX;
-	direct_init_generation_exact = direct_init_round
-		&& observed->reservation_token
-			== round->direct_init_reservation_token
-		&& ((observed->pcm_state == (uint8)PCM_STATE_N
-				&& observed->generation
-					== round->direct_init_ownership_generation)
-			|| (observed->pcm_state == (uint8)PCM_STATE_X
-				&& round->direct_init_ownership_generation != UINT64_MAX
-				&& observed->generation
-					== round->direct_init_ownership_generation + 1));
-	identity_exact = pcm_resource_x_bootstrap_round_identity_matches(
-		round, assertion, current_master_node, resource_formation,
-		master_session_incarnation, r4_record_generation,
-		requester_sender_connection_generation,
-		master_ingress_connection_generation, retry_slice_us, 0, 0);
-	if (!identity_exact && direct_init_generation_exact)
-		identity_exact = pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			round->direct_init_ownership_generation,
-			round->direct_init_reservation_token);
+	direct_init_round = round->install_claim_reservation_token != 0
+						&& round->install_claim_reservation_token != UINT64_MAX
+						&& round->install_claim_pending_generation != UINT64_MAX;
+	direct_init_generation_exact
+		= direct_init_round && observed->reservation_token == round->install_claim_reservation_token
+		  && ((observed->pcm_state == (uint8)PCM_STATE_N
+			   && observed->generation == round->install_claim_pending_generation)
+			  || (observed->pcm_state == (uint8)PCM_STATE_X
+				  && round->install_claim_pending_generation != UINT64_MAX
+				  && observed->generation == round->install_claim_pending_generation + 1));
+	identity_exact
+		= pcm_resource_x_node_request_key_matches_locked(
+			  round, assertion, current_master_node, resource_formation, master_session_incarnation,
+			  r4_record_generation, requester_sender_connection_generation,
+			  master_ingress_connection_generation)
+		  && (!direct_init_round || direct_init_generation_exact);
 	n_installing = observed->pcm_state == (uint8)PCM_STATE_N
 		&& observed->flags == PCM_OWN_FLAG_GRANT_PENDING
 		&& observed->writer_activation_token == 0
@@ -11867,13 +12022,11 @@ pcm_resource_x_target_install_continuation_valid(
 	if (assertion_out != NULL)
 		memset(assertion_out, 0, sizeof(*assertion_out));
 	if (continuation == NULL || !continuation->valid
-		|| continuation->requester_node != cluster_node_id
-		|| continuation->master_node < 0
+		|| continuation->requester_node != cluster_node_id || continuation->master_node < 0
 		|| continuation->master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| continuation->entry_binding_generation == 0
 		|| continuation->entry_binding_generation == UINT64_MAX
-		|| continuation->resource_formation == 0
-		|| continuation->resource_formation == UINT64_MAX
+		|| continuation->resource_formation == 0 || continuation->resource_formation == UINT64_MAX
 		|| continuation->master_session_incarnation == 0
 		|| continuation->master_session_incarnation == UINT64_MAX
 		|| continuation->r4_record_generation == 0
@@ -11886,21 +12039,19 @@ pcm_resource_x_target_install_continuation_valid(
 		|| continuation->round_absolute_deadline_us == UINT64_MAX
 		|| continuation->caller_absolute_deadline_us == 0
 		|| continuation->caller_absolute_deadline_us == UINT64_MAX
-		|| continuation->retry_slice_us == 0
-		|| continuation->retry_slice_us == UINT64_MAX
+		|| continuation->requested_sleep_slice_us == 0
+		|| continuation->requested_sleep_slice_us == UINT64_MAX
 		|| continuation->pending_ownership_generation == UINT64_MAX
 		|| continuation->expected_x_ownership_generation == 0
 		|| continuation->expected_x_ownership_generation == UINT64_MAX
 		|| continuation->expected_x_ownership_generation
-			!= continuation->pending_ownership_generation + 1
-		|| continuation->reservation_token == 0
-		|| continuation->reservation_token == UINT64_MAX
-		|| continuation->direct_init_ownership_generation == UINT64_MAX
-		|| continuation->direct_init_reservation_token == UINT64_MAX
-		|| (continuation->direct_init_reservation_token == 0
-			&& continuation->direct_init_ownership_generation != 0)
-		|| (continuation->capture_flags
-			& ~RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK) != 0
+			   != continuation->pending_ownership_generation + 1
+		|| continuation->reservation_token == 0 || continuation->reservation_token == UINT64_MAX
+		|| continuation->observed_claim_pending_generation == UINT64_MAX
+		|| continuation->observed_claim_reservation_token == UINT64_MAX
+		|| (continuation->observed_claim_reservation_token == 0
+			&& continuation->observed_claim_pending_generation != 0)
+		|| (continuation->capture_flags & ~RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK) != 0
 		|| continuation->requester_sender_connection_generation == 0
 		|| continuation->requester_sender_connection_generation == UINT32_MAX
 		|| continuation->master_ingress_connection_generation == 0
@@ -11921,24 +12072,28 @@ pcm_resource_x_target_install_round_identity_exact_locked(
 	const ResourceXTargetInstallContinuation *continuation,
 	const ResourceXAssertion *assertion)
 {
-	return pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, continuation->master_node,
-			continuation->resource_formation,
-			continuation->master_session_incarnation,
-			continuation->r4_record_generation,
-			continuation->requester_sender_connection_generation,
-			continuation->master_ingress_connection_generation,
-			continuation->retry_slice_us,
-			continuation->direct_init_ownership_generation,
-			continuation->direct_init_reservation_token)
-		&& round->request.assertion_sequence
-			== continuation->acquisition_generation
-		&& round->highest_attempt_floor
-			== continuation->acquisition_generation
-		&& round->accepted_base
-			== continuation->accepted_base_authority_generation
-		&& round->absolute_deadline_us
-			== continuation->round_absolute_deadline_us;
+	return pcm_resource_x_node_request_key_matches_locked(
+			   round, assertion, continuation->master_node, continuation->resource_formation,
+			   continuation->master_session_incarnation, continuation->r4_record_generation,
+			   continuation->requester_sender_connection_generation,
+			   continuation->master_ingress_connection_generation)
+		   && round->request.assertion_sequence == continuation->acquisition_generation
+		   && round->highest_attempt_floor == continuation->acquisition_generation
+		   && round->accepted_base == continuation->accepted_base_authority_generation;
+}
+
+static bool
+pcm_resource_x_target_install_claim_observation_exact_locked(
+	const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation)
+{
+	return pcm_resource_x_install_claim_valid_locked(round)
+		   && continuation->observed_claim_pending_generation
+				  == round->install_claim_pending_generation
+		   && continuation->observed_claim_reservation_token
+				  == round->install_claim_reservation_token
+		   && ((continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0)
+				  == (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT);
 }
 
 /* A BufferDesc snapshot is taken before the caller acquires entry_lock.  Once
@@ -12060,36 +12215,22 @@ pcm_resource_x_target_install_superseded_round_exact_locked(
 	Assert(round != NULL);
 	Assert(continuation != NULL);
 	Assert(assertion != NULL);
-	if (continuation->direct_init_ownership_generation != 0
-		|| continuation->direct_init_reservation_token != 0
-		|| entry->resource_x_retired_acquisition_generation
-			!= continuation->acquisition_generation
-		|| round->highest_attempt_floor
-			< continuation->acquisition_generation
-		|| !pcm_resource_x_local_owner_valid_locked(
-			&entry->resource_x_local_owner)
-		|| entry->resource_x_local_owner.state
-			!= RESOURCE_X_LOCAL_OWNER_EMPTY
-		|| !cluster_pcm_lock_resource_x_gate_open_exact(
-			continuation->resource_formation))
+	if ((continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0
+		|| entry->resource_x_retired_acquisition_generation != continuation->acquisition_generation
+		|| round->highest_attempt_floor < continuation->acquisition_generation
+		|| !pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+		|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(continuation->resource_formation))
 		return false;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
 		return true;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
 		return false;
-	return resource_x_assertion_equal(
-			&round->request.logical_assertion, assertion)
-		&& round->current_master_node == continuation->master_node
-		&& round->resource_formation == continuation->resource_formation
-		&& round->master_session_incarnation
-			== continuation->master_session_incarnation
-		&& round->r4_record_generation
-			== continuation->r4_record_generation
-		&& round->requester_sender_connection_generation
-			== continuation->requester_sender_connection_generation
-		&& round->master_ingress_connection_generation
-			== continuation->master_ingress_connection_generation
-		&& round->retry_slice_us == continuation->retry_slice_us;
+	return pcm_resource_x_node_request_key_matches_locked(
+		round, assertion, continuation->master_node, continuation->resource_formation,
+		continuation->master_session_incarnation, continuation->r4_record_generation,
+		continuation->requester_sender_connection_generation,
+		continuation->master_ingress_connection_generation);
 }
 
 static bool
@@ -12160,27 +12301,20 @@ pcm_resource_x_target_install_late_misbound_i0_exact_locked(
 	terminal_generation = round->cached_ownership_generation;
 	owner = &entry->resource_x_local_owner;
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-		|| continuation->direct_init_ownership_generation != 0
-		|| continuation->direct_init_reservation_token != 0
-		|| terminal_generation == 0
+		|| continuation->observed_claim_pending_generation != 0
+		|| continuation->observed_claim_reservation_token != 0 || terminal_generation == 0
 		|| terminal_generation >= UINT64_MAX - 2
-		|| continuation->pending_ownership_generation
-			!= terminal_generation + 1
-		|| continuation->expected_x_ownership_generation
-			!= terminal_generation + 2
-		|| continuation->reservation_token == 0
-		|| continuation->reservation_token == UINT64_MAX
+		|| continuation->pending_ownership_generation != terminal_generation + 1
+		|| continuation->expected_x_ownership_generation != terminal_generation + 2
+		|| continuation->reservation_token == 0 || continuation->reservation_token == UINT64_MAX
 		|| !BufferTagsEqual(&observed->tag, &continuation->resource)
 		|| observed->pcm_state != (uint8)PCM_STATE_N
 		|| observed->generation != terminal_generation + 1
-		|| (observed->flags != PCM_OWN_FLAG_GRANT_PENDING
-			&& observed->flags != 0
+		|| (observed->flags != PCM_OWN_FLAG_GRANT_PENDING && observed->flags != 0
 			&& observed->flags != PCM_OWN_FLAG_REVOKING)
-		|| observed->reservation_token == 0
-		|| observed->reservation_token == UINT64_MAX
+		|| observed->reservation_token == 0 || observed->reservation_token == UINT64_MAX
 		|| observed->reservation_token < continuation->reservation_token
-		|| observed->writer_activation_token != 0
-		|| observed->resource_x_activation_generation != 0
+		|| observed->writer_activation_token != 0 || observed->resource_x_activation_generation != 0
 		|| !pcm_resource_x_local_owner_valid_locked(owner)
 		|| (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY
 			&& !pcm_resource_x_local_owner_round_exact_locked(entry, round)))
@@ -12217,25 +12351,18 @@ pcm_resource_x_target_install_same_token_n_successor_exact_locked(
 	terminal_generation = continuation->expected_x_ownership_generation;
 	owner = &entry->resource_x_local_owner;
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-		|| (continuation->capture_flags
-			& RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN) == 0
-		|| continuation->direct_init_ownership_generation != 0
-		|| continuation->direct_init_reservation_token != 0
-		|| terminal_generation == 0
-		|| terminal_generation >= UINT64_MAX - 1
-		|| continuation->pending_ownership_generation
-			!= terminal_generation - 1
+		|| (continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN) == 0
+		|| (continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0
+		|| terminal_generation == 0 || terminal_generation >= UINT64_MAX - 1
+		|| continuation->pending_ownership_generation != terminal_generation - 1
 		|| round->cached_ownership_generation != terminal_generation
 		|| !BufferTagsEqual(&observed->tag, &continuation->resource)
 		|| observed->pcm_state != (uint8)PCM_STATE_N
-		|| (observed->flags != 0
-			&& observed->flags != PCM_OWN_FLAG_REVOKING)
-		|| observed->generation != terminal_generation + 1
-		|| observed->reservation_token == 0
+		|| (observed->flags != 0 && observed->flags != PCM_OWN_FLAG_REVOKING)
+		|| observed->generation != terminal_generation + 1 || observed->reservation_token == 0
 		|| observed->reservation_token == UINT64_MAX
 		|| observed->reservation_token != continuation->reservation_token
-		|| observed->writer_activation_token != 0
-		|| observed->resource_x_activation_generation != 0
+		|| observed->writer_activation_token != 0 || observed->resource_x_activation_generation != 0
 		|| !pcm_resource_x_local_owner_valid_locked(owner)
 		|| (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY
 			&& !pcm_resource_x_local_owner_round_exact_locked(entry, round)))
@@ -12272,20 +12399,16 @@ pcm_resource_x_target_install_capture_revoke_provenance_exact_locked(
 	terminal_generation = continuation->expected_x_ownership_generation;
 	owner = &entry->resource_x_local_owner;
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-		|| continuation->direct_init_ownership_generation != 0
-		|| continuation->direct_init_reservation_token != 0
-		|| terminal_generation == 0
-		|| terminal_generation >= UINT64_MAX - 1
-		|| continuation->pending_ownership_generation
-			!= terminal_generation - 1
+		|| (continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0
+		|| terminal_generation == 0 || terminal_generation >= UINT64_MAX - 1
+		|| continuation->pending_ownership_generation != terminal_generation - 1
 		|| round->cached_ownership_generation != terminal_generation
-		|| !pcm_resource_x_target_install_round_identity_exact_locked(
-			round, continuation, assertion)
+		|| !pcm_resource_x_target_install_round_identity_exact_locked(round, continuation,
+																	  assertion)
 		|| !pcm_resource_x_local_owner_valid_locked(owner)
 		|| owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
 		|| !pcm_resource_x_local_owner_round_exact_locked(entry, round)
-		|| !pcm_resource_x_target_install_captured_live_revoke_exact(
-			owner, continuation, observed))
+		|| !pcm_resource_x_target_install_captured_live_revoke_exact(owner, continuation, observed))
 		return false;
 	memset(&expected_ref, 0, sizeof(expected_ref));
 	expected_ref.assertion = *assertion;
@@ -12346,6 +12469,18 @@ pcm_resource_x_target_install_classify_locked(
 		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
 	if (!round_identity_exact)
 		return RESOURCE_X_TARGET_INSTALL_STALE;
+	if (!pcm_resource_x_target_install_claim_observation_exact_locked(round, continuation)) {
+		/* A follower captured while T1 had not published its physical claim
+		 * must start a fresh B-E-B after the bind.  Its old sample cannot be
+		 * promoted into the new claim or into terminal authority. */
+		if (continuation->observed_claim_reservation_token == 0
+			&& continuation->observed_claim_pending_generation == 0
+			&& (continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) == 0
+			&& pcm_resource_x_install_claim_valid_locked(round)
+			&& round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE)
+			return RESOURCE_X_TARGET_INSTALL_RESAMPLE;
+		return RESOURCE_X_TARGET_INSTALL_STALE;
+	}
 
 	memset(&expected_ref, 0, sizeof(expected_ref));
 	expected_ref.assertion = *assertion;
@@ -12408,13 +12543,11 @@ pcm_resource_x_target_install_classify_locked(
 				!= continuation->expected_x_ownership_generation))
 		return RESOURCE_X_TARGET_INSTALL_STALE;
 	if (pcm_resource_x_bootstrap_round_target_install_inflight_locked(
-			entry, round, assertion, continuation->master_node,
-			continuation->resource_formation,
-			continuation->master_session_incarnation,
-			continuation->r4_record_generation,
+			entry, round, assertion, continuation->master_node, continuation->resource_formation,
+			continuation->master_session_incarnation, continuation->r4_record_generation,
 			continuation->requester_sender_connection_generation,
 			continuation->master_ingress_connection_generation,
-			continuation->retry_slice_us, observed))
+			continuation->requested_sleep_slice_us, observed))
 		return RESOURCE_X_TARGET_INSTALL_INFLIGHT;
 	return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
 }
@@ -12465,19 +12598,15 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 	round = &entry->resource_x_bootstrap_round;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
 		state = RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
-	else if (!pcm_resource_x_bootstrap_round_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			round->direct_init_ownership_generation,
-			round->direct_init_reservation_token)
-		|| round->request.assertion_sequence == 0
-		|| round->request.assertion_sequence == UINT64_MAX
-		|| round->accepted_base == 0
-		|| round->accepted_base == UINT64_MAX
-		|| round->absolute_deadline_us == 0
-		|| round->absolute_deadline_us == UINT64_MAX)
+	else if (!pcm_resource_x_request_observation_matches_locked(
+				 round, assertion, current_master_node, resource_formation,
+				 master_session_incarnation, r4_record_generation,
+				 requester_sender_connection_generation, master_ingress_connection_generation,
+				 round->install_claim_pending_generation, round->install_claim_reservation_token)
+			 || round->request.assertion_sequence == 0
+			 || round->request.assertion_sequence == UINT64_MAX || round->accepted_base == 0
+			 || round->accepted_base == UINT64_MAX || round->absolute_deadline_us == 0
+			 || round->absolute_deadline_us == UINT64_MAX)
 		state = RESOURCE_X_TARGET_INSTALL_STALE;
 	else if (!BufferTagsEqual(&observed->tag, &assertion->resource)
 		|| observed->reservation_token == 0
@@ -12522,17 +12651,17 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 			= round->absolute_deadline_us;
 		continuation.caller_absolute_deadline_us
 			= caller_absolute_deadline_us;
-		continuation.retry_slice_us = retry_slice_us;
+		continuation.requested_sleep_slice_us = retry_slice_us;
 		continuation.pending_ownership_generation
 			= observed->pcm_state == (uint8)PCM_STATE_N
 				? observed->generation : observed->generation - 1;
 		continuation.expected_x_ownership_generation
 			= continuation.pending_ownership_generation + 1;
 		continuation.reservation_token = observed->reservation_token;
-		continuation.direct_init_ownership_generation
-			= round->direct_init_ownership_generation;
-		continuation.direct_init_reservation_token
-			= round->direct_init_reservation_token;
+		continuation.observed_claim_pending_generation = round->install_claim_pending_generation;
+		continuation.observed_claim_reservation_token = round->install_claim_reservation_token;
+		if (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT)
+			continuation.capture_flags |= RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT;
 		continuation.requester_sender_connection_generation
 			= requester_sender_connection_generation;
 		continuation.master_ingress_connection_generation
@@ -12682,6 +12811,16 @@ pcm_resource_x_target_install_wait_recheck_locked(
 	if (!pcm_resource_x_target_install_round_identity_exact_locked(
 			round, continuation, assertion))
 		return RESOURCE_X_APPLY_STALE;
+	if (!pcm_resource_x_target_install_claim_observation_exact_locked(round, continuation))
+		return continuation->observed_claim_reservation_token == 0
+					   && continuation->observed_claim_pending_generation == 0
+					   && (continuation->capture_flags
+						   & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT)
+							  == 0
+					   && pcm_resource_x_install_claim_valid_locked(round)
+					   && round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+				   ? RESOURCE_X_APPLY_DUPLICATE
+				   : RESOURCE_X_APPLY_STALE;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
 	{
 		if (round->cached_ownership_generation
@@ -12876,11 +13015,10 @@ cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 		|| (entry->resource_x_progress_flags
 			& ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0)
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if (!pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us, 0, 0))
+	else if (!pcm_resource_x_node_request_key_matches_locked(
+				 round, assertion, current_master_node, resource_formation,
+				 master_session_incarnation, r4_record_generation,
+				 requester_sender_connection_generation, master_ingress_connection_generation))
 		result = RESOURCE_X_APPLY_STALE;
 	else {
 		memset(&ref, 0, sizeof(ref));
@@ -12945,24 +13083,18 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
 	matches = round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
-		&& resource_x_assertion_equal(
-			&round->request.logical_assertion, &ref->assertion)
-		&& round->resource_formation == ref->formation
-		&& round->request.assertion_sequence
-			== ref->acquisition_generation
-		&& round->highest_attempt_floor == ref->acquisition_generation
-		&& round->accepted_base != 0
-		&& round->accepted_base != UINT64_MAX
-		&& round->direct_init_reservation_token
-			!= 0
-		&& round->direct_init_reservation_token
-			!= UINT64_MAX
-		&& round->direct_init_ownership_generation != UINT64_MAX;
+			  && resource_x_assertion_equal(&round->request.logical_assertion, &ref->assertion)
+			  && round->resource_formation == ref->formation
+			  && round->request.assertion_sequence == ref->acquisition_generation
+			  && round->highest_attempt_floor == ref->acquisition_generation
+			  && round->accepted_base != 0 && round->accepted_base != UINT64_MAX
+			  && round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT
+			  && round->install_claim_reservation_token != 0
+			  && round->install_claim_reservation_token != UINT64_MAX
+			  && round->install_claim_pending_generation != UINT64_MAX;
 	if (matches) {
-		*direct_init_ownership_generation_out
-			= round->direct_init_ownership_generation;
-		*direct_init_reservation_token_out
-			= round->direct_init_reservation_token;
+		*direct_init_ownership_generation_out = round->install_claim_pending_generation;
+		*direct_init_reservation_token_out = round->install_claim_reservation_token;
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
@@ -13047,54 +13179,37 @@ pcm_resource_x_terminal_x_lineage_locked(
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	final_authority_generation = round->terminal_authority_generation;
-	direct_init_lineage = round->direct_init_reservation_token != 0;
-	matches = round->phase
-			  == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-		&& resource_x_assertion_valid(
-			&round->request.logical_assertion)
-		&& round->request.logical_assertion.requester_node
-			== cluster_node_id
-		&& BufferTagsEqual(
-			&round->request.logical_assertion.resource,
-			&successor_block->common.logical_assertion.resource)
-		&& !resource_x_assertion_equal(
-			&round->request.logical_assertion,
-			&successor_block->common.logical_assertion)
-		&& pcm_resource_x_ref_valid(&round->terminal_ref)
-		&& resource_x_assertion_equal(
-			&round->terminal_ref.assertion,
-			&round->request.logical_assertion)
-		&& round->terminal_ref.formation
-			== successor_block->common.resource_formation
-		&& round->terminal_ref.acquisition_generation
-			== round->request.assertion_sequence
-		&& round->request.assertion_sequence != 0
-		&& round->request.assertion_sequence != UINT64_MAX
-		&& round->highest_attempt_floor
-			== round->request.assertion_sequence
-		&& round->resource_formation
-			== successor_block->common.resource_formation
-		&& round->master_session_incarnation
-			== successor_block->common.master_session_incarnation
-		&& round->r4_record_generation == r4_record_generation
-		&& round->current_master_node == authenticated_master_node
-		&& round->accepted_base != 0
-		&& round->accepted_base != UINT64_MAX
-		&& final_authority_generation > round->accepted_base
-		&& final_authority_generation != UINT64_MAX
-		&& successor_block->common.base_authority_generation
-			== final_authority_generation
-		&& (!require_direct_init || direct_init_lineage)
-		&& (direct_init_lineage
-			? round->direct_init_reservation_token != UINT64_MAX
-			  && round->direct_init_ownership_generation != UINT64_MAX
-			  && round->direct_init_ownership_generation + 1
-				 == cached_ownership_generation
-			: round->direct_init_ownership_generation == 0)
-		&& round->cached_ownership_generation
-			== cached_ownership_generation
-		&& entry->resource_x_retired_acquisition_generation
-			== round->terminal_ref.acquisition_generation;
+	direct_init_lineage = round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT;
+	matches
+		= round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		  && resource_x_assertion_valid(&round->request.logical_assertion)
+		  && round->request.logical_assertion.requester_node == cluster_node_id
+		  && BufferTagsEqual(&round->request.logical_assertion.resource,
+							 &successor_block->common.logical_assertion.resource)
+		  && !resource_x_assertion_equal(&round->request.logical_assertion,
+										 &successor_block->common.logical_assertion)
+		  && pcm_resource_x_ref_valid(&round->terminal_ref)
+		  && resource_x_assertion_equal(&round->terminal_ref.assertion,
+										&round->request.logical_assertion)
+		  && round->terminal_ref.formation == successor_block->common.resource_formation
+		  && round->terminal_ref.acquisition_generation == round->request.assertion_sequence
+		  && round->request.assertion_sequence != 0
+		  && round->request.assertion_sequence != UINT64_MAX
+		  && round->highest_attempt_floor == round->request.assertion_sequence
+		  && round->resource_formation == successor_block->common.resource_formation
+		  && round->master_session_incarnation == successor_block->common.master_session_incarnation
+		  && round->r4_record_generation == r4_record_generation
+		  && round->current_master_node == authenticated_master_node && round->accepted_base != 0
+		  && round->accepted_base != UINT64_MAX && final_authority_generation > round->accepted_base
+		  && final_authority_generation != UINT64_MAX
+		  && successor_block->common.base_authority_generation == final_authority_generation
+		  && (!require_direct_init || direct_init_lineage)
+		  && pcm_resource_x_install_claim_valid_locked(round)
+		  && (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE
+			  || round->install_claim_pending_generation + 1 == cached_ownership_generation)
+		  && round->cached_ownership_generation == cached_ownership_generation
+		  && entry->resource_x_retired_acquisition_generation
+				 == round->terminal_ref.acquisition_generation;
 	if (!matches)
 		return false;
 	lineage_out->holder_assertion = round->terminal_ref.assertion;
@@ -13108,7 +13223,7 @@ pcm_resource_x_terminal_x_lineage_locked(
 	lineage_out->final_authority_generation
 		= final_authority_generation;
 	lineage_out->direct_init_ownership_generation
-		= round->direct_init_ownership_generation;
+		= direct_init_lineage ? round->install_claim_pending_generation : 0;
 	lineage_out->cached_ownership_generation
 		= round->cached_ownership_generation;
 	lineage_out->r4_record_generation = round->r4_record_generation;
@@ -13254,8 +13369,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(
 		round_r4_generation = round->r4_record_generation;
 		retired_generation
 			= entry->resource_x_retired_acquisition_generation;
-		direct_init_generation = round->direct_init_ownership_generation;
-		direct_init_token = round->direct_init_reservation_token;
+		direct_init_generation = round->install_claim_pending_generation;
+		direct_init_token = round->install_claim_reservation_token;
 		local_owner_state = entry->resource_x_local_owner.state;
 		current_master = round->current_master_node;
 		round_phase = round->phase;
@@ -14363,24 +14478,20 @@ cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
 	round = &entry->resource_x_bootstrap_round;
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
 		result = RESOURCE_X_APPLY_NOT_FOUND;
-	else if (!pcm_resource_x_bootstrap_round_terminal_join_identity_matches(
-			round, assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us, 0, 0)
-		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-			entry, round, &round->terminal_ref,
-			master_session_incarnation, r4_record_generation,
-			round->cached_ownership_generation)
-		|| !BufferTagsEqual(&observed->tag, &assertion->resource)
-		|| (observed->pcm_state != (uint8)PCM_STATE_N
-			&& observed->pcm_state != (uint8)PCM_STATE_S)
-		|| observed->flags != 0
-		|| observed->writer_activation_token != 0
-		|| observed->resource_x_activation_generation != 0
-		|| observed->generation == 0
-		|| observed->generation == UINT64_MAX
-		|| observed->generation <= round->cached_ownership_generation)
+	else if (!pcm_resource_x_node_request_key_matches_locked(
+				 round, assertion, current_master_node, resource_formation,
+				 master_session_incarnation, r4_record_generation,
+				 requester_sender_connection_generation, master_ingress_connection_generation)
+			 || !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+				 entry, round, &round->terminal_ref, master_session_incarnation,
+				 r4_record_generation, round->cached_ownership_generation)
+			 || !BufferTagsEqual(&observed->tag, &assertion->resource)
+			 || (observed->pcm_state != (uint8)PCM_STATE_N
+				 && observed->pcm_state != (uint8)PCM_STATE_S)
+			 || observed->flags != 0 || observed->writer_activation_token != 0
+			 || observed->resource_x_activation_generation != 0 || observed->generation == 0
+			 || observed->generation == UINT64_MAX
+			 || observed->generation <= round->cached_ownership_generation)
 		result = RESOURCE_X_APPLY_STALE;
 	else if (!pcm_resource_x_local_owner_valid_locked(
 			&entry->resource_x_local_owner))
@@ -16373,61 +16484,40 @@ pcm_resource_x_s_predecessor_cancel_unbound_round_locked(
 		return RESOURCE_X_APPLY_APPLIED;
 
 	request = &round->request;
-	if (!cluster_pcm_lock_resource_x_gate_open_exact(
-			block->common.resource_formation)
-		|| cluster_gcs_lookup_master(
-			request->logical_assertion.resource)
-			!= authenticated_master_node
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(block->common.resource_formation)
+		|| cluster_gcs_lookup_master(request->logical_assertion.resource)
+			   != authenticated_master_node
 		|| round->current_master_node != authenticated_master_node
-		|| round->resource_formation
-			!= block->common.resource_formation
-		|| round->master_session_incarnation
-			!= block->common.master_session_incarnation
-		|| round->r4_record_generation == 0
-		|| round->r4_record_generation == UINT64_MAX
-		|| round->absolute_deadline_us == 0
-		|| round->absolute_deadline_us == UINT64_MAX
-		|| round->last_dispatch_us == 0
-		|| round->last_dispatch_us >= round->absolute_deadline_us
-		|| round->retry_slice_us == 0
-		|| round->retry_slice_us == UINT64_MAX
+		|| round->resource_formation != block->common.resource_formation
+		|| round->master_session_incarnation != block->common.master_session_incarnation
+		|| round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
+		|| round->absolute_deadline_us == 0 || round->absolute_deadline_us == UINT64_MAX
+		|| round->last_dispatch_us == 0 || round->last_dispatch_us >= round->absolute_deadline_us
+		|| round->retry_slice_us == 0 || round->retry_slice_us == UINT64_MAX
 		|| round->requester_sender_connection_generation == 0
 		|| round->requester_sender_connection_generation == UINT32_MAX
 		|| round->master_ingress_connection_generation == 0
-		|| round->master_ingress_connection_generation == UINT32_MAX
-		|| round->accepted_base != 0
-		|| round->terminal_authority_generation != 0
-		|| round->cached_ownership_generation != 0
-		|| round->direct_init_ownership_generation != 0
-		|| round->direct_init_reservation_token != 0
+		|| round->master_ingress_connection_generation == UINT32_MAX || round->accepted_base != 0
+		|| round->terminal_authority_generation != 0 || round->cached_ownership_generation != 0
+		|| round->install_claim_pending_generation != 0
+		|| round->install_claim_reservation_token != 0
 		|| memcmp(&round->ack, &empty_common, sizeof(empty_common)) != 0
-		|| memcmp(&round->assertion, &empty_common,
-			sizeof(empty_common)) != 0
+		|| memcmp(&round->assertion, &empty_common, sizeof(empty_common)) != 0
 		|| memcmp(&round->terminal_ref, &empty_ref, sizeof(empty_ref)) != 0
-		|| memcmp(round->reserved, zero_reserved,
-			sizeof(zero_reserved)) != 0
+		|| memcmp(round->reserved, zero_reserved, sizeof(zero_reserved)) != 0
 		|| !resource_x_assertion_valid(&request->logical_assertion)
-		|| !BufferTagsEqual(
-			&request->logical_assertion.resource, &entry->tag)
+		|| !BufferTagsEqual(&request->logical_assertion.resource, &entry->tag)
 		|| request->logical_assertion.requester_node != cluster_node_id
-		|| request->base_authority_generation != 0
-		|| request->authority_generation != 0
+		|| request->base_authority_generation != 0 || request->authority_generation != 0
 		|| request->resource_formation != round->resource_formation
-		|| request->master_session_incarnation
-			!= round->master_session_incarnation
-		|| request->assertion_sequence == 0
-		|| request->assertion_sequence == UINT64_MAX
-		|| request->assertion_sequence != round->highest_attempt_floor
-		|| request->ordered_lane != 0
-		|| request->action_node != cluster_node_id
-		|| request->observed_mode != (uint8)PCM_STATE_N
-		|| request->target_mode != (uint8)PCM_STATE_X
-		|| request->source_candidate != 0
+		|| request->master_session_incarnation != round->master_session_incarnation
+		|| request->assertion_sequence == 0 || request->assertion_sequence == UINT64_MAX
+		|| request->assertion_sequence != round->highest_attempt_floor || request->ordered_lane != 0
+		|| request->action_node != cluster_node_id || request->observed_mode != (uint8)PCM_STATE_N
+		|| request->target_mode != (uint8)PCM_STATE_X || request->source_candidate != 0
 		|| request->retain_pi_if_dirty != 0
-		|| request->sender_connection_generation
-			!= round->requester_sender_connection_generation
-		|| request->outcome != RESOURCE_X_OUTCOME_NONE
-		|| request->flags != 0
+		|| request->sender_connection_generation != round->requester_sender_connection_generation
+		|| request->outcome != RESOURCE_X_OUTCOME_NONE || request->flags != 0
 		|| request->semantic_crc32c != 0)
 		return RESOURCE_X_APPLY_APPLIED;
 

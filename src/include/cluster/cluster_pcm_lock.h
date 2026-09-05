@@ -417,8 +417,39 @@ typedef enum ResourceXTargetInstallFollowState {
 } ResourceXTargetInstallFollowState;
 
 #define RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN UINT8_C(0x01)
-#define RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK \
-	RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN
+#define RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT UINT8_C(0x02)
+#define RESOURCE_X_INSTALL_CLAIM_NONE UINT8_C(0)
+#define RESOURCE_X_INSTALL_CLAIM_ORDINARY_T1 UINT8_C(1)
+#define RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT UINT8_C(2)
+struct ClusterPcmOwnSnapshot;
+
+/* Called by the exact T1 installer while it still holds content-X on the
+ * newly reserved descriptor.  This publishes physical evidence only. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_claim_bind_t1_exact(
+	const ResourceXAcquisitionRef *ref, const struct ClusterPcmOwnSnapshot *reserved);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_claim_snapshot_exact(
+	const ResourceXAcquisitionRef *ref, uint8 *source_out, uint64 *pending_generation_out,
+	uint64 *reservation_token_out);
+
+/* Stack-only E observation for B-E-B claim binding.  It is never a grant,
+ * persisted state, wire payload, or a wait/authority receipt. */
+typedef struct ResourceXInstallClaimJoinObservation {
+	ResourceXDecodedCommon request;
+	uint64 entry_binding_generation;
+	uint64 r4_record_generation;
+	int32 master_node;
+	uint32 master_ingress_connection_generation;
+} ResourceXInstallClaimJoinObservation;
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	ResourceXInstallClaimJoinObservation *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_claim_bind_direct_init_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const struct ClusterPcmOwnSnapshot *before, const struct ClusterPcmOwnSnapshot *after);
+#define RESOURCE_X_TARGET_INSTALL_CAPTURE_KNOWN_MASK                                               \
+	(RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN | RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT)
 
 typedef struct ResourceXTargetInstallContinuation {
 	BufferTag resource;
@@ -432,12 +463,12 @@ typedef struct ResourceXTargetInstallContinuation {
 	uint64 accepted_base_authority_generation;
 	uint64 round_absolute_deadline_us;
 	uint64 caller_absolute_deadline_us;
-	uint64 retry_slice_us;
+	uint64 requested_sleep_slice_us;
 	uint64 pending_ownership_generation;
 	uint64 expected_x_ownership_generation;
 	uint64 reservation_token;
-	uint64 direct_init_ownership_generation;
-	uint64 direct_init_reservation_token;
+	uint64 observed_claim_pending_generation;
+	uint64 observed_claim_reservation_token;
 	uint32 requester_sender_connection_generation;
 	uint32 master_ingress_connection_generation;
 	uint8 capture_flags;

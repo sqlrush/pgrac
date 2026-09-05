@@ -5651,7 +5651,8 @@ UT_TEST(test_resource_x_target_install_generated_cross_axis_matrix)
 				identity_state, lineage_state);
 			after = before;
 			if (observation != 0)
-				after._reserved[2] ^= UINT8_C(1);
+				/* The complete snapshot now reserves two bytes, not three. */
+				after._reserved[1] ^= UINT8_C(1);
 			before_saved = before;
 			after_saved = after;
 			memset(&seeded_ref, 0x5a, sizeof(seeded_ref));
@@ -5659,11 +5660,12 @@ UT_TEST(test_resource_x_target_install_generated_cross_axis_matrix)
 				sizeof(seeded_continuation));
 			seeded_continuation.capture_flags = (uint8)owner_state;
 			seeded_continuation.requester_node = (int32)identity_state;
-			seeded_continuation.direct_init_ownership_generation
+			seeded_continuation.observed_claim_pending_generation
 				= lineage_state == 0 ? 0 : UINT64_C(10);
-			seeded_continuation.direct_init_reservation_token
-				= lineage_state == 0 ? 0
-				: lineage_state == 1 ? UINT64_C(17) : UINT64_C(18);
+			seeded_continuation.observed_claim_reservation_token = lineage_state == 0 ? 0
+																   : lineage_state == 1
+																	   ? UINT64_C(17)
+																	   : UINT64_C(18);
 			seeded_continuation.round_absolute_deadline_us = UINT64_C(1000);
 			seeded_continuation.caller_absolute_deadline_us
 				= deadline_state == 0 ? UINT64_C(1001)
