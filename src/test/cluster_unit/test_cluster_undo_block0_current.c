@@ -46,10 +46,15 @@ cluster_undo_block0_current_prove_strict_empty_exclusive(
 #undef printf
 #undef fprintf
 #undef snprintf
+#undef vsnprintf
 
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static char admission_log[512];
+static unsigned int admission_log_count;
+static unsigned int readiness_reads;
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
@@ -61,7 +66,13 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 int
 errmsg_internal(const char *fmt, ...)
 {
+	va_list args;
+
 	UT_ASSERT(strstr(fmt, "block0 current acquire admission refused:") != NULL);
+	va_start(args, fmt);
+	vsnprintf(admission_log, sizeof(admission_log), fmt, args);
+	va_end(args);
+	admission_log_count++;
 	return 0;
 }
 
@@ -315,24 +326,28 @@ cluster_undo_smgr_ensure_exit_hook(void)
 bool
 cluster_lms_is_ready(void)
 {
+	readiness_reads |= 1;
 	return fake_lms_ready;
 }
 
 ClusterLmonStatus
 cluster_lmon_status(void)
 {
+	readiness_reads |= 2;
 	return fake_lmon_status;
 }
 
 bool
 cluster_qvotec_in_quorum(void)
 {
+	readiness_reads |= 4;
 	return fake_quorum;
 }
 
 bool
 cluster_membership_is_member(int32 node_id)
 {
+	readiness_reads |= 8;
 	return fake_member && node_id == cluster_node_id;
 }
 
@@ -1051,6 +1066,10 @@ test_root(void)
 static void
 reset_fixture(void)
 {
+	cluster_enabled = true;
+	cluster_node_id = 0;
+	readiness_reads = admission_log_count = 0;
+	admission_log[0] = '\0';
 	fake_now = UINT64_C(1000000);
 	fake_epoch = 9;
 	fake_master = 2;
@@ -3179,10 +3198,53 @@ UT_TEST(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal
 	UT_ASSERT_EQ(flush_sync_calls, 0);
 }
 
+UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
+{
+	const char *expected[]
+		= { "gate=CLUSTER_DISABLED", "gate=NODE_INVALID",  "gate=LMS_NOT_READY",
+			"gate=LMON_NOT_READY",	 "gate=QUORUM_DENIED", "gate=LOCAL_NOT_MEMBER" };
+	const unsigned int reads[] = { 0, 0, 1, 3, 7, 15 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	unsigned int i;
+
+	for (i = 0; i < lengthof(expected); i++) {
+		ClusterUndoBlock0CurrentGuard guard = { 0 };
+		ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_OK;
+
+		reset_fixture();
+		/* All later prerequisites also fail: prove original short-circuiting. */
+		cluster_enabled = i != 0;
+		cluster_node_id = i <= 1 ? -1 : 0;
+		fake_lms_ready = i > 2;
+		fake_lmon_status = i > 3 ? CLUSTER_LMON_READY : CLUSTER_LMON_NOT_STARTED;
+		fake_quorum = i > 4;
+		fake_member = false;
+		UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+															   &guard, &failure),
+					 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
+		UT_ASSERT_EQ(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		UT_ASSERT_EQ(memcmp(guard.opaque, (const uint8[168]){ 0 }, 168), 0);
+		UT_ASSERT_EQ(readiness_reads, reads[i]);
+		UT_ASSERT_EQ(semantic_enter_calls, 0);
+		UT_ASSERT_EQ(reserve_calls, 0);
+		UT_ASSERT_EQ(insert_event, 0);
+		UT_ASSERT_EQ(outbound_event, 0);
+		UT_ASSERT(strstr(admission_log, "predicate=2 result=5") != NULL);
+		UT_ASSERT(strstr(admission_log, expected[i]) != NULL);
+		UT_ASSERT_EQ(admission_log_count, 1);
+		UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+															   &guard, &failure),
+					 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
+		UT_ASSERT_EQ(admission_log_count, 1);
+	}
+	reset_fixture();
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(73);
+	UT_RUN(test_readiness_denial_names_first_false_gate_without_side_effects);
 	UT_RUN(test_terminal_reuse_chain_preserves_refs_and_horizon_before_generation_rebirth);
 	UT_RUN(test_key_guard_and_phase_abi);
 	UT_RUN(test_wait_reply_uses_exact_acquire_and_release_keys);

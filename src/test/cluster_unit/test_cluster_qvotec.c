@@ -257,10 +257,13 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+static char quorum_admission_log[512];
+static unsigned int quorum_admission_log_count;
+
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	return e == LOG;
 }
 bool
 errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
@@ -287,8 +290,14 @@ errmsg(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errmsg_internal(const char *f pg_attribute_unused(), ...)
+errmsg_internal(const char *f, ...)
 {
+	va_list args;
+
+	va_start(args, f);
+	vsnprintf(quorum_admission_log, sizeof(quorum_admission_log), f, args);
+	va_end(args);
+	quorum_admission_log_count++;
 	return 0;
 }
 int
@@ -1470,6 +1479,78 @@ UT_TEST(test_qvotec_accessors_post_init)
  *
  *	Pre-init / quorum_state != OK / lease expired → all return false.
  * ============================================================ */
+
+UT_TEST(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false)
+{
+	quorum_admission_log_count = 0;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT(strstr(quorum_admission_log, "PGRAC_REASON=SHMEM_UNAVAILABLE") != NULL);
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+}
+
+UT_TEST(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions)
+{
+	const uint32 states[] = { CLUSTER_QVOTEC_QUORUM_INITIALIZING, CLUSTER_QVOTEC_QUORUM_UNCERTAIN,
+							  CLUSTER_QVOTEC_QUORUM_LOST, UINT32_MAX };
+	const char *reasons[] = { "PGRAC_REASON=STATE_INITIALIZING", "PGRAC_REASON=STATE_UNCERTAIN",
+							  "PGRAC_REASON=STATE_LOST", "PGRAC_REASON=STATE_INVALID" };
+	TimestampTz saved_now = mock_now;
+	char before[sizeof(shmem_storage)];
+	unsigned int i;
+
+	/* Set only the frozen quorum@4 and lease@32 fields of the actual region. */
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 32), 5000000);
+	memcpy(before, shmem_storage, sizeof(before));
+	mock_now = 4999999;
+	quorum_admission_log_count = 0;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(quorum_admission_log_count, 0);
+	cluster_freeze_writes_set();
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT(strstr(quorum_admission_log, "PGRAC_REASON=WRITES_FROZEN") != NULL);
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	cluster_thaw_writes_set();
+	UT_ASSERT(cluster_qvotec_in_quorum());
+
+	for (i = 0; i < lengthof(states); i++) {
+		pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), states[i]);
+		memcpy(before, shmem_storage, sizeof(before));
+		quorum_admission_log_count = 0;
+		quorum_admission_log[0] = '\0';
+		UT_ASSERT(!cluster_qvotec_in_quorum());
+		UT_ASSERT(strstr(quorum_admission_log, reasons[i]) != NULL);
+		UT_ASSERT_EQ(quorum_admission_log_count, 1);
+		UT_ASSERT(!cluster_qvotec_in_quorum());
+		UT_ASSERT_EQ(quorum_admission_log_count, 1);
+		UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	}
+
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	memcpy(before, shmem_storage, sizeof(before));
+	quorum_admission_log_count = 0;
+	mock_now = 5000000;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT(strstr(quorum_admission_log, "PGRAC_REASON=LEASE_EXPIRED") != NULL);
+	UT_ASSERT(strstr(quorum_admission_log, "sampled_expiry_us=5000000 sampled_now_us=5000000")
+			  != NULL);
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	mock_now++;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 32), 6000000);
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4),
+						CLUSTER_QVOTEC_QUORUM_INITIALIZING);
+	mock_now = saved_now;
+}
 
 UT_TEST(test_in_quorum_pre_shmem_init_false)
 {
@@ -2979,7 +3060,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(55);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -2990,7 +3071,9 @@ main(void)
 	UT_RUN(test_qvotec_mailbox_rejects_invalid_and_holds_on_sequence_overflow);
 	UT_RUN(test_qvotec_mailbox_terminal_hold_completion);
 	UT_RUN(test_qvotec_accessors_null_safe_pre_init);
+	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
+	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
 	UT_RUN(test_in_quorum_initializing_state_false);
 	UT_RUN(test_in_quorum_frozen_flag_overrides_to_false);

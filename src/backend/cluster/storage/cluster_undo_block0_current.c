@@ -222,23 +222,54 @@ current_set_failure(ClusterUndoBlock0Result *failure, ClusterUndoBlock0Result re
 }
 
 static ClusterUndoBlock0CurrentStep
-current_unused_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
-					ClusterUndoBlock0Result *failure, unsigned int predicate)
+current_unused_fail_detail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
+						   ClusterUndoBlock0Result *failure, unsigned int predicate,
+						   unsigned int diagnostic_bit, const char *gate)
 {
 	static uint32 reported_predicates;
 
 	/* One diagnostic per actual rejection predicate per process.  Preserve
 	 * the failing branch before its zeroing cleanup; never log successes. */
-	if (predicate < 32 && (reported_predicates & (UINT32_C(1) << predicate)) == 0) {
-		reported_predicates |= UINT32_C(1) << predicate;
-		ereport(LOG, (errmsg_internal(
-						 "block0 current acquire admission refused: predicate=%u result=%u node=%d",
-						 predicate, (unsigned int)result, cluster_node_id)));
+	if (diagnostic_bit < 32 && (reported_predicates & (UINT32_C(1) << diagnostic_bit)) == 0) {
+		reported_predicates |= UINT32_C(1) << diagnostic_bit;
+		ereport(
+			LOG,
+			(errmsg_internal(
+				"block0 current acquire admission refused: predicate=%u result=%u node=%d gate=%s",
+				predicate, (unsigned int)result, cluster_node_id, gate)));
 	}
 	if (data != NULL)
 		memset(data, 0, sizeof(*data));
 	current_set_failure(failure, result);
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+
+static ClusterUndoBlock0CurrentStep
+current_unused_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
+					ClusterUndoBlock0Result *failure, unsigned int predicate)
+{
+	return current_unused_fail_detail(data, result, failure, predicate, predicate,
+									  "NOT_APPLICABLE");
+}
+
+/* Preserve the original short-circuit order. These are diagnostic labels,
+ * never a second authority sample after the rejecting condition. */
+static unsigned int
+current_readiness_rejection(void)
+{
+	if (!cluster_enabled)
+		return 1;
+	if (cluster_node_id < 0)
+		return 2;
+	if (!cluster_lms_is_ready())
+		return 3;
+	if (cluster_lmon_status() != CLUSTER_LMON_READY)
+		return 4;
+	if (!cluster_qvotec_in_quorum())
+		return 5;
+	if (!cluster_membership_is_member(cluster_node_id))
+		return 6;
+	return 0;
 }
 
 static bool
@@ -778,10 +809,15 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 	if (current_resid_already_active(&data->resid)) {
 		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 1);
 	}
-	if (!cluster_enabled || cluster_node_id < 0 || !cluster_lms_is_ready()
-		|| cluster_lmon_status() != CLUSTER_LMON_READY || !cluster_qvotec_in_quorum()
-		|| !cluster_membership_is_member(cluster_node_id)) {
-		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure, 2);
+	{
+		static const char *const gates[]
+			= { "READY",		  "CLUSTER_DISABLED", "NODE_INVALID",	 "LMS_NOT_READY",
+				"LMON_NOT_READY", "QUORUM_DENIED",	  "LOCAL_NOT_MEMBER" };
+		unsigned int rejection = current_readiness_rejection();
+
+		if (rejection != 0)
+			return current_unused_fail_detail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure,
+											  2, 8 + rejection, gates[rejection]);
 	}
 	if (caller_admission != NULL) {
 		bool census = caller_admission_class == CURRENT_ADMISSION_CENSUS

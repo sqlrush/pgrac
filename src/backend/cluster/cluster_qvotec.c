@@ -748,6 +748,25 @@ cluster_qvotec_get_collision_state_name(void)
  *	through the gate, so a lost-quorum decision is enforced before
  *	durability).
  * ============================================================ */
+/* False-path evidence only. Do not resample shared state, renew a lease, or
+ * log a success. Unsampled values are zero; the reason defines their meaning. */
+static bool
+qvotec_admission_denied(unsigned int diagnostic_bit, const char *reason, uint32 sampled_state,
+						uint64 sampled_expiry, uint64 sampled_now)
+{
+	static uint32 reported_reasons;
+
+	if ((reported_reasons & (UINT32_C(1) << diagnostic_bit)) == 0) {
+		reported_reasons |= UINT32_C(1) << diagnostic_bit;
+		ereport(LOG, (errmsg_internal("PGRAC_FAMILY=QUORUM_ADMISSION PGRAC_REASON=%s node=%d "
+									  "sampled_state=%u sampled_expiry_us=%llu sampled_now_us=%llu",
+									  reason, cluster_node_id, sampled_state,
+									  (unsigned long long)sampled_expiry,
+									  (unsigned long long)sampled_now)));
+	}
+	return false;
+}
+
 bool
 cluster_qvotec_in_quorum(void)
 {
@@ -757,21 +776,31 @@ cluster_qvotec_in_quorum(void)
 
 	/* Disable-cluster / pre-shmem path: fail-closed. */
 	if (QvotecShmem == NULL)
-		return false;
+		return qvotec_admission_denied(0, "SHMEM_UNAVAILABLE", 0, 0, 0);
 
 	/* Process-local frozen flag set by ProcSignal handler — wins
 	 * regardless of lease state (defensive double-gate). */
 	if (cluster_writes_frozen)
-		return false;
+		return qvotec_admission_denied(1, "WRITES_FROZEN", 0, 0, 0);
 
 	q = pg_atomic_read_u32(&QvotecShmem->quorum_state);
-	if (q != CLUSTER_QVOTEC_QUORUM_OK)
-		return false;
+	if (q != CLUSTER_QVOTEC_QUORUM_OK) {
+		switch (q) {
+		case CLUSTER_QVOTEC_QUORUM_INITIALIZING:
+			return qvotec_admission_denied(2, "STATE_INITIALIZING", q, 0, 0);
+		case CLUSTER_QVOTEC_QUORUM_UNCERTAIN:
+			return qvotec_admission_denied(3, "STATE_UNCERTAIN", q, 0, 0);
+		case CLUSTER_QVOTEC_QUORUM_LOST:
+			return qvotec_admission_denied(4, "STATE_LOST", q, 0, 0);
+		default:
+			return qvotec_admission_denied(5, "STATE_INVALID", q, 0, 0);
+		}
+	}
 
 	lease_expire = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	now_us = (uint64)GetCurrentTimestamp();
 	if (now_us >= lease_expire)
-		return false;
+		return qvotec_admission_denied(6, "LEASE_EXPIRED", q, lease_expire, now_us);
 
 	return true;
 }
