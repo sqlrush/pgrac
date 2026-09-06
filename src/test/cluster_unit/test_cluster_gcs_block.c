@@ -2751,7 +2751,8 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 			"cluster_bufmgr_pcm_own_snapshot(",
 			"writer_activation_token == 0",
 			"resource_x_activation_generation == 0",
-			"cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(",
+			"cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(",
+			"&caller_witness, &own, &dispatch",
 			"cluster_pcm_lock_resource_x_caller_observe_exact(",
 			"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST",
 			"gcs_block_resource_x_bootstrap_request_stage_exact(",
@@ -2760,16 +2761,16 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 			"RESOURCE_X_BOOTSTRAP_ROUND_WAIT",
 			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(",
 			"RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL" };
-	static const char *const forbidden[] = {
-		"cluster_gcs_pcm_x_acquire_writer(",
-		"cluster_pcm_x_local_join_begin_semantic(",
-		"cluster_pcm_x_local_resource_x_attempt_exact(",
-		"cluster_pcm_x_local_resource_x_grant_publish_exact(",
-		"cluster_pcm_x_local_writer_claim_exact(",
-		"cluster_pcm_x_master_",
-		"cluster_pcm_x_runtime_snapshot(",
-		"cluster_pcm_x_holder_retry_delay_ms("
-	};
+	static const char *const forbidden[]
+		= { "cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(",
+			"cluster_gcs_pcm_x_acquire_writer(",
+			"cluster_pcm_x_local_join_begin_semantic(",
+			"cluster_pcm_x_local_resource_x_attempt_exact(",
+			"cluster_pcm_x_local_resource_x_grant_publish_exact(",
+			"cluster_pcm_x_local_writer_claim_exact(",
+			"cluster_pcm_x_master_",
+			"cluster_pcm_x_runtime_snapshot(",
+			"cluster_pcm_x_holder_retry_delay_ms(" };
 	size_t i;
 
 	UT_ASSERT_NOT_NULL(source);
@@ -2781,11 +2782,6 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(driver_end);
 	if (driver != NULL && driver_end != NULL) {
-		const char *ownership_loss_guard = strstr(driver,
-			"if (!direct_init && !cached_local_x");
-		const char *ownership_loss_invalidate = strstr(driver,
-			"cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(");
-
 		for (i = 0; i < lengthof(required); i++) {
 			const char *site = strstr(driver, required[i]);
 
@@ -2793,12 +2789,6 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 			if (site != NULL)
 				UT_ASSERT(site < driver_end);
 		}
-		UT_ASSERT_NOT_NULL(ownership_loss_guard);
-		UT_ASSERT_NOT_NULL(ownership_loss_invalidate);
-		if (ownership_loss_guard != NULL
-			&& ownership_loss_invalidate != NULL)
-			UT_ASSERT(ownership_loss_guard < ownership_loss_invalidate
-				&& ownership_loss_invalidate < driver_end);
 		for (i = 0; i < lengthof(forbidden); i++) {
 			const char *site = strstr(driver, forbidden[i]);
 
@@ -3109,7 +3099,7 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	const char *predecessor_sleep;
 	const char *predecessor_continue;
 	const char *round_wait;
-	const char *ownership_loss_skip;
+	const char *readonly_wait;
 	const char *generation_zero_reject;
 	const char *terminal;
 	const char *terminal_end;
@@ -3186,7 +3176,7 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		: NULL;
 	step = n_candidate != NULL
 			   ? strstr(n_candidate,
-						"cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(")
+						"cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(")
 			   : NULL;
 	predecessor_wait = step != NULL
 		? strstr(step,
@@ -3204,8 +3194,8 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(") : NULL;
 	generation_zero_reject = snapshot != NULL
 		? strstr(snapshot, "if (own.generation == 0)") : NULL;
-	ownership_loss_skip = step != NULL
-		? strstr(step, "if (!direct_init && !cached_local_x)") : NULL;
+	readonly_wait
+		= step != NULL ? strstr(step, "if (action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT)") : NULL;
 
 	UT_ASSERT_NOT_NULL(target);
 	UT_ASSERT_NOT_NULL(target_end);
@@ -3231,20 +3221,16 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	UT_ASSERT_NOT_NULL(predecessor_sleep);
 	UT_ASSERT_NOT_NULL(predecessor_continue);
 	UT_ASSERT_NOT_NULL(round_wait);
-	UT_ASSERT_NOT_NULL(ownership_loss_skip);
-	if (target_end != NULL && snapshot != NULL && n_branch != NULL
-		&& continuation_valid != NULL && continuation_classify != NULL
-		&& continuation_wait != NULL && continuation_capture != NULL
-		&& retained_pair_helper != NULL && retained_buffer_helper != NULL
-		&& undrained_current_helper != NULL
+	UT_ASSERT_NOT_NULL(readonly_wait);
+	if (target_end != NULL && snapshot != NULL && n_branch != NULL && continuation_valid != NULL
+		&& continuation_classify != NULL && continuation_wait != NULL
+		&& continuation_capture != NULL && retained_pair_helper != NULL
+		&& retained_buffer_helper != NULL && undrained_current_helper != NULL
 		&& retained_wait != NULL && retained_admission_recheck != NULL
-		&& retained_gate_recheck != NULL && retained_deadline != NULL
-		&& retained_sleep != NULL
-		&& retained_continue != NULL
-		&& n_candidate != NULL && step != NULL
-		&& predecessor_wait != NULL && predecessor_deadline != NULL
-		&& predecessor_sleep != NULL && predecessor_continue != NULL
-		&& round_wait != NULL && ownership_loss_skip != NULL) {
+		&& retained_gate_recheck != NULL && retained_deadline != NULL && retained_sleep != NULL
+		&& retained_continue != NULL && n_candidate != NULL && step != NULL
+		&& predecessor_wait != NULL && predecessor_deadline != NULL && predecessor_sleep != NULL
+		&& predecessor_continue != NULL && round_wait != NULL && readonly_wait != NULL) {
 		UT_ASSERT(snapshot < continuation_valid);
 		UT_ASSERT(continuation_valid < continuation_classify);
 		UT_ASSERT(continuation_classify < continuation_wait);
@@ -3269,9 +3255,9 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		UT_ASSERT(predecessor_deadline < predecessor_sleep);
 		UT_ASSERT(predecessor_sleep < predecessor_continue);
 		UT_ASSERT(predecessor_continue < round_wait);
-		UT_ASSERT(continuation_wait < ownership_loss_skip);
+		UT_ASSERT(continuation_wait < readonly_wait);
 		UT_ASSERT(step < target_end);
-		UT_ASSERT(ownership_loss_skip < target_end);
+		UT_ASSERT(readonly_wait < round_wait && round_wait < target_end);
 	}
 	/* S/X generation zero remains impossible; its rejection must be the
 	 * alternate branch after the exact N predicate, never a pre-N gate. */
@@ -3384,10 +3370,10 @@ UT_TEST(test_resource_x_target_preflight_waits_under_one_r7_deadline)
 	retry = sleep != NULL ? strstr(sleep, "continue;") : NULL;
 	round_loop = retry != NULL
 		? strstr(retry, "diagnostic_stage = \"round-loop\"") : NULL;
-	round_step
-		= round_loop != NULL
-			  ? strstr(round_loop, "cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(")
-			  : NULL;
+	round_step = round_loop != NULL
+					 ? strstr(round_loop,
+							  "cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(")
+					 : NULL;
 
 	UT_ASSERT_NOT_NULL(target);
 	UT_ASSERT_NOT_NULL(target_end);

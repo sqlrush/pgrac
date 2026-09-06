@@ -2402,7 +2402,13 @@ test_cluster_pcm_lock_clock_product.o: \
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@
 
-test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
+test_cluster_pcm_wait_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT\)/ { emit=1; begin++ } \
+	     emit && /diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@
+
+test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \

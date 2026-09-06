@@ -12155,6 +12155,329 @@ UT_TEST(test_resource_x_admitted_late_image_exact_deadline_is_stale)
 	}
 }
 
+/* Execute the actual GCS WAIT consumer against the real PCM object.  Only
+ * the surrounding caller environment/clock is supplied by this fixture;
+ * the ownership-loss decision is compiled verbatim from production. */
+static uint64
+gcs_block_pcm_x_monotonic_us(void)
+{
+	return fake_pcm_clock_us;
+}
+
+static ResourceXApplyResult
+run_actual_gcs_wait_consumer(ResourceXAssertion assertion, ClusterPcmOwnSnapshot own)
+{
+	ResourceXBootstrapRoundAction action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_APPLIED;
+	ResourceXApplyResult ownership_loss_result = RESOURCE_X_APPLY_INVALID;
+	ResourceXApplyResult wait_result = RESOURCE_X_APPLY_INVALID;
+	struct {
+		uint64 formation;
+	} gate = { 17 };
+	struct {
+		uint64 record_generation;
+	} admission = { 77 };
+	int32 master_node = 0;
+	uint64 master_session = 31;
+	uint64 requester_sender_connection_generation = 51;
+	uint64 master_ingress_connection_generation = 61;
+	uint64 retry_slice_us = 50, absolute_deadline_us = 4000;
+	uint64 direct_init_ownership_generation = 0, direct_init_reservation_token = 0;
+	uint64 now_us, remaining_us;
+	long timeout_ms;
+	int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
+	bool direct_init = false, cached_local_x = false;
+	bool diagnostic_deadline_expired = false;
+	const char *diagnostic_stage = NULL;
+
+	/* Exactly one caller observation; a production continue requests a fresh
+ * outer sample, not success.  No synthetic retry masks the first result. */
+	do {
+#include "test_cluster_pcm_wait_consumer.inc"
+		result = wait_result;
+	} while (false);
+	(void)ownership_loss_result;
+	(void)diagnostic_stage;
+	(void)diagnostic_deadline_expired;
+	(void)own;
+	(void)cached_local_x;
+	return result;
+}
+
+typedef struct DeliveryObserverFixture {
+	ResourceXAssertion assertion;
+	ResourceXAcquisitionRef ref;
+	ResourceXCallerWitness caller;
+	ResourceXDeliveryClaim delivery;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot installed;
+} DeliveryObserverFixture;
+
+static void
+setup_delivery_observer(DeliveryObserverFixture *fixture, bool publish_terminal)
+{
+	BufferTag tag = make_tag(289);
+	ResourceXDecodedFrame request, grant, image;
+	ResourceXAcquisitionRef terminal;
+	ResourceXInstallClaimJoinObservation observation;
+	ResourceXDeliveryTarget target;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXBufferInstallProof install = { 0 };
+	ResourceXBufferActivationProof activation = { 0 };
+	ClusterPcmOwnSnapshot reserved;
+
+	memset(fixture, 0, sizeof(*fixture));
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 2;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 2, &fixture->assertion));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+					 &fixture->assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 100, 50, 0, 0, true,
+					 true, false, 0, &fixture->caller, &request, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	fixture->ref = make_resource_x_acquisition_ref(tag, 2, 17, request.common.assertion_sequence);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
+					 &fixture->assertion, 0, 17, 31, 77, 51, 61, &observation),
+				 RESOURCE_X_APPLY_APPLIED);
+	fixture->before.tag = tag;
+	fixture->before.generation = 7;
+	fixture->before.pcm_state = PCM_STATE_N;
+	fixture->before.buffer_type = BUF_TYPE_CURRENT;
+	fixture->before.semantic_buf_state = BM_TAG_VALID | BM_VALID;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_bind_target_exact(
+					 &observation, 1, &fixture->before, &fixture->before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(&fixture->ref,
+																			&observation, &target),
+				 RESOURCE_X_APPLY_APPLIED);
+	fake_pcm_clock_us = 110;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 &fixture->ref, &target, RESOURCE_X_DELIVERY_NORMAL, 110, &fixture->delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	if (!publish_terminal)
+		return;
+	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+	resource_x_test_image_authority(&image, 1, 4, fixture->ref.acquisition_generation);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_delivery_exact(
+					 &image, 1, 91, 0, 61, 77, &fixture->delivery, &join),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_t1_grant_delivery_exact(&fixture->ref, &fixture->delivery),
+		RESOURCE_X_APPLY_APPLIED);
+	reserved = fixture->before;
+	reserved.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	reserved.reservation_token = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_claim_bind_t1_delivery_exact(
+					 &fixture->ref, &reserved, &fixture->delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	install.ownership_generation = 8;
+	install.writer_activation_token = 1;
+	install.resource_x_activation_generation = fixture->ref.acquisition_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_delivery_exact(&fixture->ref, &install,
+																			&fixture->delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	activation.ownership_generation = 8;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_delivery_exact(
+					 &fixture->ref, &activation, &fixture->delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	fixture->installed = fixture->before;
+	fixture->installed.generation = 8;
+	fixture->installed.reservation_token = 1;
+	fixture->installed.pcm_state = PCM_STATE_X;
+	fixture->installed.buffer_type = BUF_TYPE_XCUR;
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(&fixture->ref, 31, 77, 8));
+}
+
+static void
+setup_terminal_delivery_observer(DeliveryObserverFixture *fixture)
+{
+	setup_delivery_observer(fixture, true);
+}
+
+UT_TEST(test_resource_x_delivery_executor_excludes_caller_retransmit)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXDecodedFrame dispatch, empty = { 0 };
+	ResourceXAcquisitionRef terminal;
+
+	setup_delivery_observer(&fixture, false);
+	fake_pcm_clock_us = 160; /* Original retransmit slice elapsed. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 160, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(memcmp(&dispatch, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&fixture.delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 160, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(dispatch.common.assertion_sequence, fixture.ref.acquisition_generation);
+}
+
+UT_TEST(test_resource_x_actual_wait_does_not_reject_own_terminal_delivery)
+{
+	DeliveryObserverFixture fixture;
+
+	setup_terminal_delivery_observer(&fixture);
+	/* B was sampled before IMAGE; real T1/T2/T3 above ran before WAIT.
+ * The destructive API must still reject this state; WAIT must not call it. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, &fixture.before),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(run_actual_gcs_wait_consumer(fixture.assertion, fixture.before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&fixture.assertion, 17, 31, 77,
+																  &fixture.caller),
+				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_terminal_delivery_holds_reference_until_release)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXDecodedFrame dispatch;
+	ResourceXAcquisitionRef terminal, empty = { 0 };
+	int sleeps;
+
+	setup_terminal_delivery_observer(&fixture);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 true, true, 8, &fixture.caller, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(memcmp(&terminal, &empty, sizeof(empty)), 0);
+	sleeps = fake_cv_sleep_count;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 true, true, 8, &fixture.caller, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL);
+	UT_ASSERT_EQ(terminal.acquisition_generation, fixture.ref.acquisition_generation);
+}
+
+UT_TEST(test_resource_x_install_follow_waits_for_delivery_release)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXTargetInstallContinuation follow, wrong;
+	ResourceXAcquisitionRef terminal, empty = { 0 };
+	int sleeps;
+
+	setup_terminal_delivery_observer(&fixture);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			&fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, &fixture.installed, &follow),
+		RESOURCE_X_TARGET_INSTALL_INFLIGHT);
+	UT_ASSERT(follow.valid);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+					 &follow, &fixture.installed, &terminal),
+				 RESOURCE_X_TARGET_INSTALL_INFLIGHT);
+	UT_ASSERT_EQ(memcmp(&terminal, &empty, sizeof(empty)), 0);
+	wrong = follow;
+	wrong.acquisition_generation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+					 &wrong, &fixture.installed, &terminal),
+				 RESOURCE_X_TARGET_INSTALL_STALE);
+	sleeps = fake_cv_sleep_count;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 1),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+					 &follow, &fixture.installed, &terminal),
+				 RESOURCE_X_TARGET_INSTALL_TERMINAL);
+	UT_ASSERT_EQ(terminal.acquisition_generation, fixture.ref.acquisition_generation);
+}
+
+static DeliveryObserverFixture *delivery_release_on_enroll;
+
+static void
+release_delivery_after_wait_enrollment(void)
+{
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_complete_exact(
+					 &delivery_release_on_enroll->delivery, &delivery_release_on_enroll->installed),
+				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_delivery_release_before_sleep_and_original_deadline)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXAcquisitionRef terminal;
+	ResourceXDecodedFrame dispatch;
+
+	setup_terminal_delivery_observer(&fixture);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	delivery_release_on_enroll = &fixture;
+	fake_cv_prepare_hook = release_delivery_after_wait_enrollment;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	fake_cv_prepare_hook = NULL;
+	delivery_release_on_enroll = NULL;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 true, true, 8, &fixture.caller, &fixture.installed, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL);
+	fake_pcm_clock_us = 4000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+}
+
+UT_TEST(test_resource_x_observed_step_preserves_strict_successor_proof)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXAcquisitionRef terminal, empty = { 0 };
+	ResourceXDecodedFrame dispatch;
+	ClusterPcmOwnSnapshot successor;
+	unsigned char entries_before[sizeof(fake_pcm_entries)];
+
+	setup_terminal_delivery_observer(&fixture);
+	memcpy(entries_before, &fake_pcm_entries, sizeof(entries_before));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 62, 4000, 900, 110, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(memcmp(entries_before, &fake_pcm_entries, sizeof(entries_before)), 0);
+	UT_ASSERT_EQ(memcmp(&terminal, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
+		RESOURCE_X_APPLY_APPLIED);
+	successor = fixture.before;
+	successor.generation = 9;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &successor, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(&fixture.ref, 31, 77, 8));
+	/* Only the strictly newer clean S proves that the old cover is obsolete. */
+	successor.pcm_state = PCM_STATE_S;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 110, 50, 0, 0, true,
+					 false, false, 0, &fixture.caller, &successor, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(dispatch.common.assertion_sequence, fixture.ref.acquisition_generation + 1);
+}
+
 UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 {
 	static unsigned char header_before[sizeof(fake_pcm_header)];
@@ -17019,7 +17342,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(229);
+	UT_PLAN(235);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -17178,6 +17501,12 @@ main(void)
 	UT_RUN(test_resource_x_remote_admission_binds_only_actual_image);
 	UT_RUN(test_resource_x_admitted_late_image_exact_deadline_is_stale);
 	UT_RUN(test_resource_x_late_delivery_requires_exact_cleanup_executor);
+	UT_RUN(test_resource_x_actual_wait_does_not_reject_own_terminal_delivery);
+	UT_RUN(test_resource_x_terminal_delivery_holds_reference_until_release);
+	UT_RUN(test_resource_x_install_follow_waits_for_delivery_release);
+	UT_RUN(test_resource_x_delivery_release_before_sleep_and_original_deadline);
+	UT_RUN(test_resource_x_observed_step_preserves_strict_successor_proof);
+	UT_RUN(test_resource_x_delivery_executor_excludes_caller_retransmit);
 	UT_RUN(test_resource_x_quiet_delivery_is_bounded_and_revisited_without_packets);
 	UT_RUN(test_resource_x_target_bind_after_exact_head_expiry_keeps_physical_owner);
 	UT_RUN(test_resource_x_requester_join_accepts_s_carrier_either_order_and_rejects_mode_drift);

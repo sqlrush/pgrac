@@ -1462,6 +1462,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_caller_observe_exact(
 	const ResourceXAssertion *assertion, uint64 resource_formation,
 	uint64 master_session_incarnation, uint64 r4_record_generation, ResourceXCallerWitness *caller);
 
+/* Serialized observed driver; WAIT itself never disposes of terminal cover. */
+extern ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool allow_create, bool allow_remote_admission,
+	bool cached_local_x, uint64 cached_ownership_generation, ResourceXCallerWitness *caller,
+	const struct ClusterPcmOwnSnapshot *observed, ResourceXDecodedFrame *dispatch_out,
+	ResourceXAcquisitionRef *terminal_ref_out);
+
 extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
 	uint64 master_session_incarnation, uint64 r4_record_generation,

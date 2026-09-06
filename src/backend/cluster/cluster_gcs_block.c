@@ -14562,14 +14562,15 @@ gcs_block_resource_x_target_acquire_internal(
 						break;
 					}
 				}
-				action = cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+				action = cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
 					&assertion, master_node, gate.formation, master_session,
 					admission.record_generation, requester_sender_connection_generation,
 					master_ingress_connection_generation, absolute_deadline_us,
 					gcs_block_pcm_x_retry_timeout_us(), now_us, retry_slice_us,
 					direct_init_ownership_generation, direct_init_reservation_token, !join_only,
 					own.pcm_state == PCM_STATE_N, cached_local_x,
-					cached_local_x ? own.generation : 0, &caller_witness, &dispatch, &terminal_ref);
+					cached_local_x ? own.generation : 0, &caller_witness, &own, &dispatch,
+					&terminal_ref);
 
 			target_install_terminal_recheck:
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
@@ -14989,28 +14990,8 @@ gcs_block_resource_x_target_acquire_internal(
 					result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
-					if (!direct_init && !cached_local_x) {
-					diagnostic_stage = "ownership-loss-recheck";
-					ownership_loss_result
-						= cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
-							&assertion, master_node, gate.formation,
-							master_session, admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							retry_slice_us, &own);
-					if (ownership_loss_result == RESOURCE_X_APPLY_APPLIED
-						|| ownership_loss_result
-							== RESOURCE_X_APPLY_DUPLICATE) {
-						continue;
-					}
-					if (ownership_loss_result
-						!= RESOURCE_X_APPLY_NOT_FOUND
-						&& ownership_loss_result
-							!= RESOURCE_X_APPLY_STALE) {
-						result = ownership_loss_result;
-						break;
-					}
-				}
+				/* The serialized step already adjudicated the physical sample.
+				 * WAIT only enrolls/rechecks; it cannot revoke its own install. */
 				now_us = gcs_block_pcm_x_monotonic_us();
 				if (now_us >= absolute_deadline_us) {
 					diagnostic_deadline_expired = true;
