@@ -17541,6 +17541,7 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	bool created_retention_container = false;
 	bool installed_remote_source;
 	bool local_grd_source;
+	bool physical_current_x = false;
 	bool prepared_remote_s_source = false;
 	bool prepared_terminal_x_source_exact = false;
 	bool prepared_x_source_exact = false;
@@ -17800,19 +17801,17 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	prepared_terminal_x_source_exact = prepared_x_source_exact
-		&& authenticated_master_node != cluster_node_id
-		&& entry->resource_x_requester_base_generation >= 1
-		&& entry->resource_x_requester_base_generation
-			<= block->common.base_authority_generation
-		&& entry->resource_x_retired_acquisition_generation != 0
-		&& pcm_resource_x_active_empty_locked(entry)
-		&& (PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
-		&& entry->x_holder_node == -1
-		&& pg_atomic_read_u32(&entry->s_holders_bitmap) == 0
-		&& pcm_resource_x_prepared_terminal_x_source_exact_locked(
-			entry, block, authenticated_master_node, prepared_x_source,
-			x_owner);
+	physical_current_x = prepared_x_source_exact
+						 && pcm_resource_x_prepared_terminal_x_source_exact_locked(
+							 entry, block, authenticated_master_node, prepared_x_source, x_owner);
+	prepared_terminal_x_source_exact
+		= physical_current_x && authenticated_master_node != cluster_node_id
+		  && entry->resource_x_requester_base_generation >= 1
+		  && entry->resource_x_requester_base_generation <= block->common.base_authority_generation
+		  && entry->resource_x_retired_acquisition_generation != 0
+		  && pcm_resource_x_active_empty_locked(entry)
+		  && (PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
+		  && entry->x_holder_node == -1 && pg_atomic_read_u32(&entry->s_holders_bitmap) == 0;
 	/* The prepared terminal-X predicate is the remote-master provenance
 	 * class added for a holder whose local GRD is only an N mirror.  A
 	 * self-master DROP is instead admitted by local_grd_source below; its
@@ -17838,6 +17837,7 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		bool exact_existing;
 		bool exact_existing_drained;
 		bool exact_drop_episode_restart = false;
+		bool canonical_successor;
 
 		exact_existing = state->holder_status.valid
 				== state->holder_image.valid
@@ -17912,35 +17912,30 @@ pcm_resource_x_block_to_n_source_exact_internal(
 				   == PCM_STATE_N
 			&& entry->x_holder_node == -1
 			&& pg_atomic_read_u32(&entry->s_holders_bitmap) == 0;
-		if (result == RESOURCE_X_APPLY_APPLIED
-			&& prepared_terminal_x_source_exact
+		/* Descriptor generations order one physical carrier episode only.
+		 * A later proven current-X acquisition has the same canonical order
+		 * for local/remote masters and RETAIN/DROP.  Neither a bare mirror nor
+		 * a larger base without the exact current owner/cover supplies it. */
+		canonical_successor
+			= result == RESOURCE_X_APPLY_APPLIED && physical_current_x
+			  && ((authenticated_master_node == cluster_node_id && local_grd_source)
+				  || prepared_terminal_x_source_exact)
+			  && block->common.base_authority_generation > old_image.common.authority_generation;
+		if (result == RESOURCE_X_APPLY_APPLIED && prepared_terminal_x_source_exact
 			&& required_x_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP
-			&& ((decoded_image.body.image_envelope.source_carrier_generation
-					 == old_image.body.image_envelope.source_carrier_generation
-				 && resource_x_assertion_equal(
-					 &block->common.logical_assertion,
-					 &old_status.common.logical_assertion)
-				 && status_record.logical_generation
-					 > state->holder_status.logical_generation)
-				/* DROP can recreate the descriptor with an equal or smaller
-				 * local generation.  The exact terminal predicate above binds
-				 * this base to the current cover, not to the local GRD mirror.
-				 * A strictly later canonical authority orders that new episode
-				 * even across requesters.  All old DRAIN/intent/domain and
-				 * same-requester attempt fences below still apply. */
-				|| block->common.base_authority_generation
-					> old_image.common.authority_generation))
+			&& (decoded_image.body.image_envelope.source_carrier_generation
+					== old_image.body.image_envelope.source_carrier_generation
+				&& resource_x_assertion_equal(&block->common.logical_assertion,
+											  &old_status.common.logical_assertion)
+				&& status_record.logical_generation > state->holder_status.logical_generation))
 			exact_drop_episode_restart = true;
 		if (result != RESOURCE_X_APPLY_APPLIED
-				|| (!local_grd_source && !installed_remote_source
-					&& !prepared_remote_s_source
-					&& !prepared_terminal_x_source_exact)
-			|| state->holder_status_intent.slot.state
-				   != RESOURCE_X_INTENT_SLOT_EMPTY
-			|| state->holder_image_intent.state
-				   != RESOURCE_X_INTENT_SLOT_EMPTY
-			|| state->holder_pair_drained_sequences
-					  [state->holder_status.body.assertion.requester_node]
+			|| (!local_grd_source && !installed_remote_source && !prepared_remote_s_source
+				&& !prepared_terminal_x_source_exact)
+			|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_pair_drained_sequences[state->holder_status.body.assertion
+														.requester_node]
 				   < state->holder_status.logical_generation
 			|| state->holder_pair_drained_resource_formation
 				   != state->holder_status.resource_formation
@@ -17948,20 +17943,15 @@ pcm_resource_x_block_to_n_source_exact_internal(
 				   != old_status.common.master_session_incarnation
 			|| state->holder_pair_drained_master_node
 				   != (int32)state->holder_status.destination_node
-			|| block->common.resource_formation
-				   != state->holder_pair_drained_resource_formation
-			|| block->common.master_session_incarnation
-				   != state->holder_pair_drained_master_session
-			|| authenticated_master_node
-				   != state->holder_pair_drained_master_node
-			|| (resource_x_assertion_equal(
-					&block->common.logical_assertion,
-					&old_status.common.logical_assertion)
-				&& status_record.logical_generation
-				   <= state->holder_status.logical_generation)
+			|| block->common.resource_formation != state->holder_pair_drained_resource_formation
+			|| block->common.master_session_incarnation != state->holder_pair_drained_master_session
+			|| authenticated_master_node != state->holder_pair_drained_master_node
+			|| (resource_x_assertion_equal(&block->common.logical_assertion,
+										   &old_status.common.logical_assertion)
+				&& status_record.logical_generation <= state->holder_status.logical_generation)
 			|| (decoded_image.body.image_envelope.source_carrier_generation
-				   <= old_image.body.image_envelope.source_carrier_generation
-				&& !exact_drop_episode_restart)) {
+					<= old_image.body.image_envelope.source_carrier_generation
+				&& !exact_drop_episode_restart && !canonical_successor)) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_entry_ref_release(&entry_ref);
 			return result == RESOURCE_X_APPLY_RECOVERY_BLOCKED

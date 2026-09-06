@@ -9963,8 +9963,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 			= cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 				block, authenticated_master_node, &status, &image, &revoking,
 				&target_revoke_owner);
-	else if (tagless_target_x && target_x_retain
-		&& authenticated_master_node != cluster_node_id)
+	else if (tagless_target_x && target_x_retain)
 		result
 			= cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 				block, authenticated_master_node, &status, &image, &revoking,
