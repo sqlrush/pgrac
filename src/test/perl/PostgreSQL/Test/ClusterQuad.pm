@@ -124,6 +124,7 @@ sub _two_stage_register_cleanup_owner
 		  // ($monotonic + $PostgreSQL::Test::Utils::timeout_default),
 		cleanup_deadline_wallclock => time()
 		  + $PostgreSQL::Test::Utils::timeout_default,
+		cleanup_timeout => $PostgreSQL::Test::Utils::timeout_default,
 	};
 	$self->{two_stage_cleanup_registered} = 1;
 	push @TWO_STAGE_LOOP_QUADS, $self;
@@ -1099,7 +1100,7 @@ sub _two_stage_request_failure_stops_once
 
 sub _two_stage_cleanup_registered
 {
-	my ($self) = @_;
+	my ($self, %opts) = @_;
 	return $self->{two_stage_cleanup_terminal}
 	  if defined($self->{two_stage_cleanup_terminal});
 	if ($self->{two_stage_cleanup_started})
@@ -1107,9 +1108,22 @@ sub _two_stage_cleanup_registered
 		$self->{two_stage_cleanup_terminal} = 'CLEANUP_FAILED';
 		return $self->{two_stage_cleanup_terminal};
 	}
+	my $attempt = $self->{two_stage_attempt};
+	# Startup/failure deadlines remain absolute.  An explicit normal stop of
+	# a completely started quad owns a separate, one-shot budget of the same
+	# duration; ordinary uptime must not preconsume its process-exit wait.
+	# END, failed starts and explicitly failed teardown never enter this path.
+	if ($opts{normal_stop} && $self->{two_stage_start_completed}
+		&& ref($attempt) eq 'HASH' && !defined($attempt->{first_failure})
+		&& !defined($attempt->{normal_cleanup_deadline}))
+	{
+		$attempt->{normal_cleanup_deadline} = $self->_two_stage_monotonic_now()
+		  + $attempt->{cleanup_timeout};
+		$attempt->{normal_cleanup_deadline_wallclock} = time()
+		  + $attempt->{cleanup_timeout};
+	}
 	my @errors;
 	my @processes = @{ $self->_two_stage_capture_cleanup_processes() };
-	my $attempt = $self->{two_stage_attempt};
 	my $original_failure = ref($attempt) eq 'HASH'
 	  && ref($attempt->{first_failure}) eq 'HASH'
 	  ? $attempt->{first_failure}{class} : 'HARNESS_TEARDOWN';
@@ -1128,7 +1142,8 @@ sub _two_stage_cleanup_registered
 
 	push @errors, @{ $self->_two_stage_request_failure_stops_once(\@processes) };
 	my $process_terminal = $self->_two_stage_wait_cleanup_processes(
-		\@processes, $attempt->{cleanup_deadline});
+		\@processes, $attempt->{normal_cleanup_deadline}
+		  // $attempt->{cleanup_deadline});
 	if ($process_terminal ne 'EXITED')
 	{
 		$self->_two_stage_write_cleanup_terminal(
@@ -2642,6 +2657,12 @@ sub _two_stage_write_cleanup_manifest
 		original_failure => $original_failure // 'UNCLASSIFIED_INTERNAL_RESULT',
 		created_at => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime(time())),
 		absolute_cleanup_deadline => ''
+		  . ($attempt->{normal_cleanup_deadline_wallclock}
+			  // $attempt->{cleanup_deadline_wallclock}
+			  // $attempt->{cleanup_deadline}),
+		cleanup_deadline_owner => defined($attempt->{normal_cleanup_deadline})
+		  ? 'NORMAL_STOP' : 'STARTUP_FAILURE',
+		startup_cleanup_deadline => ''
 		  . ($attempt->{cleanup_deadline_wallclock}
 			  // $attempt->{cleanup_deadline}),
 		processes => [ map { +{ %$_ } }
@@ -3619,16 +3640,18 @@ sub start_quad
 		$msg .= " node$i=pg:$pg/ic:$ic";
 	}
 	Test::More::note($msg);
+	$self->{two_stage_start_completed} = 1;
 	return;
 }
 
 
 sub stop_quad
 {
-	my ($self) = @_;
+	my ($self, %opts) = @_;
 	if ($self->{two_stage_cleanup_registered})
 	{
-		my $result = $self->_two_stage_cleanup_registered();
+		my $result = $self->_two_stage_cleanup_registered(
+			normal_stop => !$opts{failure_cleanup});
 		die "two-stage ClusterQuad cleanup result=$result"
 		  unless defined($result) && $result eq 'CLEAN';
 		return;

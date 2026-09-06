@@ -1291,6 +1291,105 @@ PROBE
 	}
 }
 
+for my $case (qw(normal_exit normal_d_state normal_identity_drift
+	normal_fd_holder incomplete_start explicit_failure recorded_failure end_cleanup))
+{
+	local @PostgreSQL::Test::ClusterQuad::TWO_STAGE_LOOP_QUADS;
+	my $root = tempdir(CLEANUP => 1);
+	my $node = ClusterQuadLifecycleTestNode->new(8160);
+	my $quad = bless {
+		nodes => [ $node ], two_stage_artifact_root => $root,
+		two_stage_loop_devices => [], two_stage_loop_records => [],
+		two_stage_cleanup_deadline => 1,
+		two_stage_start_completed => $case ne 'incomplete_start',
+	}, 'PostgreSQL::Test::ClusterQuad';
+	my ($now, $waits, $stops, $detaches) = (1000, 0, 0, 0);
+	my $normal = $case =~ /^normal_/;
+	my $expected = $case eq 'normal_exit' ? 'CLEAN'
+	  : $case eq 'normal_identity_drift' ? 'CLEANUP_IDENTITY_CONFLICT'
+	  : 'OPERATOR_CLEANUP_REQUIRED';
+	my $budget = $PostgreSQL::Test::Utils::timeout_default;
+
+	no warnings 'redefine';
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_monotonic_now
+		= sub { return $now; };
+	local *PostgreSQL::Test::ClusterQuad::time
+		= sub { return 1_800_000_000; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_process_parent_map
+		= sub { return {}; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_proc_identity = sub {
+		return { pid => 8160, exists => 0 }
+		  if $stops && ($case eq 'normal_fd_holder'
+			  || ($case eq 'normal_exit' && $waits));
+		return { pid => 8160, exists => 1,
+			starttime => $stops && $case eq 'normal_identity_drift' ? 9999 : 9913,
+			state => $case eq 'normal_d_state' ? 'D' : 'S', ppid => 1 };
+	};
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_wait_gate_observation_change
+		= sub { $waits++; $now += $budget / 2; return; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_signal_exact_process
+		= sub { $stops++; return 1; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_device_holders
+		= sub { return $case eq 'normal_fd_holder' ? [ 'exact holder' ] : []; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_detach_voting_loops
+		= sub { $detaches++; return; };
+	local *PostgreSQL::Test::ClusterQuad::_two_stage_capture_failure_evidence
+		= sub { return; };
+
+	$quad->_two_stage_register_cleanup_owner();
+	$quad->{two_stage_attempt}{cleanup_deadline_wallclock} = 1_799_999_001;
+	$quad->_two_stage_record_first_failure('WAL_ACTIVE_BLOCKED', 'original', 0,
+		'WAL_ACTIVE_PUBLISHED') if $case eq 'recorded_failure';
+	my $ok = eval {
+		if ($case eq 'end_cleanup')
+		{
+			$quad->_two_stage_cleanup_registered();
+		}
+		else
+		{
+			$quad->stop_quad(failure_cleanup => $case eq 'explicit_failure');
+		}
+		1;
+	};
+	is($quad->{two_stage_cleanup_terminal}, $expected,
+		"$case: exact cleanup terminal is preserved");
+	is(!!$ok, $case eq 'normal_exit' || $case eq 'end_cleanup' ? 1 : '',
+		"$case: stop still surfaces any failed cleanup");
+	is($quad->{two_stage_attempt}{cleanup_deadline}, 1,
+		"$case: original startup/failure deadline is never changed");
+	is($quad->{two_stage_attempt}{normal_cleanup_deadline},
+		$normal ? 1000 + $budget : undef,
+		"$case: only admitted normal stop receives its original-duration budget");
+	is($stops, 1, "$case: exactly one stop signal request");
+	is($detaches, $case eq 'normal_exit' ? 1 : 0,
+		"$case: nonterminal processes or holders never permit detach");
+	is($waits, $case eq 'normal_exit' ? 1 : $case eq 'normal_d_state' ? 2 : 0,
+		"$case: only normal cleanup waits within its frozen deadline");
+	$now += 500;
+	is($quad->_two_stage_cleanup_registered(), $expected,
+		"$case: END returns the exact previous terminal");
+	eval { $quad->stop_quad(); };
+	is($quad->{two_stage_attempt}{normal_cleanup_deadline},
+		$normal ? 1000 + $budget : undef,
+		"$case: repeated stop and END cannot renew or create a budget");
+	is($stops, 1, "$case: duplicate cleanup never signals again");
+	if ($expected ne 'CLEAN')
+	{
+		open(my $fh, '<:raw', $quad->{two_stage_cleanup_manifest_path})
+		  or die "open $case manifest: $!";
+		local $/;
+		my $manifest = JSON::PP->new->decode(<$fh>);
+		close($fh) or die "close $case manifest: $!";
+		is($manifest->{absolute_cleanup_deadline},
+			$normal ? 1_800_000_000 + $budget : 1_799_999_001,
+			"$case: manifest records the deadline actually used");
+		is($manifest->{cleanup_deadline_owner}, $normal ? 'NORMAL_STOP' : 'STARTUP_FAILURE',
+			"$case: manifest records budget ownership");
+		is($manifest->{startup_cleanup_deadline}, 1_799_999_001,
+			"$case: manifest retains the original deadline evidence");
+	}
+}
+
 {
 	local @PostgreSQL::Test::ClusterQuad::TWO_STAGE_LOOP_QUADS;
 	my $root = tempdir(CLEANUP => 1);
