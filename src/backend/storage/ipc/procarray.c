@@ -2225,8 +2225,9 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * read_scn over all backends' live snapshots (each backend publishes its min
  * into PGPROC->cluster_read_scn_atomic via snapmgr).  TT slots / undo segments
  * whose commit_scn is strictly below this are needed by no live reader and may
- * be recycled (spec-3.12 C1/C3/C5).  No live cluster reader -> cluster_scn_current()
- * (everything recyclable).
+ * be recycled (spec-3.12 C1/C3/C5). The fallback clock is sampled before the
+ * scan. An xmin-bearing backend without a published read_scn makes the sample
+ * unproven (InvalidScn), covering snapshot creation before snapmgr publication.
  *
  * spec-3.15 V-3: prepared transactions' dummy PGPROCs never publish a
  * cluster_read_scn_atomic (only snapmgr does, for live snapshots; proc.c
@@ -2237,32 +2238,39 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * (spec-3.15 D6), NOT from this horizon.
  *
  * Mirrors GetOldestXmin's ProcArray scan under a
- * SHARED ProcArrayLock; callers must NOT hold seg->lock / undo lifecycle_lock
+ * EXCLUSIVE ProcArrayLock, serializing against GetSnapshotData's xmin
+ * publication; callers must NOT hold seg->lock / undo lifecycle_lock
  * when calling (C17 lock ordering: compute horizon first).
  */
 SCN
 cluster_undo_retention_horizon(void)
 {
 	ProcArrayStruct *arrayP = procArray;
-	SCN			min = InvalidScn;
+	SCN min;
 	int			index;
 
 	if (cluster_node_id < 0)
 		return InvalidScn;		/* cluster disabled */
 
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	/* Snapshot xmin is published under this lock before read_scn is chosen.
+	 * Sample the clock first: a later snapshot cannot precede this value.
+	 * Existing unpublished snapshots refuse below; there is no post-scan
+	 * clock sample that could run ahead of a concurrently created reader. */
+	min = cluster_scn_current();
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
 		int			pgprocno = arrayP->pgprocnos[index];
 		PGPROC	   *proc = &allProcs[pgprocno];
 		SCN			r = (SCN) pg_atomic_read_u64(&proc->cluster_read_scn_atomic);
 
-		if (SCN_VALID(r) && (!SCN_VALID(min) || scn_time_cmp(r, min) < 0))
-			min = r;
+		min = cluster_undo_retention_sample_min(min, UINT32_ACCESS_ONCE(proc->xmin), r);
+		if (!SCN_VALID(min))
+			break;
 	}
 	LWLockRelease(ProcArrayLock);
 
-	return SCN_VALID(min) ? min : cluster_scn_current();
+	return min;
 }
 
 /*
@@ -2279,7 +2287,7 @@ cluster_undo_retention_horizon(void)
  * conservative direction (its undo must stay reachable).  Walsenders /
  * background workers with an xmin likewise read as constraints.
  *
- * Same locking contract as cluster_undo_retention_horizon() above: SHARED
+ * This diagnostic predicate needs only SHARED
  * ProcArrayLock, never called under seg->lock / undo lifecycle_lock (C17).
  * The xid reads follow the ComputeXidHorizons dense-array access pattern.
  */

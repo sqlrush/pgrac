@@ -102,7 +102,7 @@ cluster_undo_horizon_cluster_floor(SCN local_horizon, const ClusterUndoHorizonRe
 	 * which is valid whenever the storage gate is on.  Defensive stall,
 	 * blamed on self (U7b) -- never "recycle a little anyway".
 	 */
-	if (local_horizon == InvalidScn) {
+	if (local_horizon == InvalidScn || local_horizon == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED) {
 		*out_reason = CLUSTER_UNDO_HORIZON_STALL_MALFORMED;
 		*out_blame_node = self_node;
 		return CLUSTER_UNDO_HORIZON_FOLD_STALLED;
@@ -152,6 +152,7 @@ cluster_undo_horizon_cluster_floor(SCN local_horizon, const ClusterUndoHorizonRe
 		 * corrupted by any future path still fails closed.
 		 */
 		if (v->horizon_scn == InvalidScn
+			|| v->horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
 			|| v->sender_interval_ms < CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS
 			|| v->sender_interval_ms > CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS) {
 			*out_reason = CLUSTER_UNDO_HORIZON_STALL_MALFORMED;

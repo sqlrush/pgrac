@@ -41,12 +41,15 @@
 
 /*
  * cluster_undo_retention_horizon -- own-instance retention lower bound:
- *	min(live CLUSTER read_scn over backends); cluster_scn_current() when no
- *	live cluster reader (everything recyclable); InvalidScn when cluster is
- *	disabled.  Scans the ProcArray under a SHARED ProcArrayLock.  spec-3.12
+ *	min(pre-scan local clock, live read_scn over backends). InvalidScn when
+ *	disabled or an xmin-bearing backend has not published its read_scn.
+ *	Scans under EXCLUSIVE ProcArrayLock, serializing against snapshot xmin
+ *	publication; no I/O, remote wait or clock resample inside. spec-3.12
  *	C17: do NOT hold seg->lock / undo lifecycle_lock when calling.
  */
 extern SCN cluster_undo_retention_horizon(void);
+extern SCN cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin,
+											 SCN published_read_scn);
 
 /*
  * cluster_undo_retention_all_quiescent -- TT lane (S3 idle-peer floor pin):
@@ -55,8 +58,8 @@ extern SCN cluster_undo_retention_horizon(void);
  *	CLUSTER read_scn (zero active transactions AND zero held snapshots —
  *	both legs required).  Anything uncertain (cluster disabled, any live
  *	xid/xmin/read_scn, prepared-xact dummy PGPROCs with an xid) returns
- *	false so the caller falls back to the conservative clock sample.  Same
- *	locking contract as cluster_undo_retention_horizon().
+ *	false. This diagnostic-only predicate uses SHARED ProcArrayLock; it no
+ *	longer authorizes an unconstrained peer report.
  */
 extern bool cluster_undo_retention_all_quiescent(void);
 
@@ -71,8 +74,8 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	  commit_scn, and the current horizon, decide whether the slot may be
  *	  recycled.  ABORTED -> single-node C7 true; COMMITTED -> only when
  *	  commit_scn is strictly older than the horizon (a reader at the same SCN
- *	  as commit_scn still needs the pre-image).  InvalidScn horizon (cluster
- *	  disabled) -> the gate carries no constraint, so COMMITTED is recyclable.
+ *	  as commit_scn still needs the pre-image). InvalidScn horizon is unproven
+ *	  and retains COMMITTED; GUC-off permission belongs to the caller.
  *	  A COMMITTED slot with an unresolved (InvalidScn) commit_scn is retained
  *	  (rule 8.A fail-closed).
  *

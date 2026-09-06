@@ -51,11 +51,26 @@
 
 
 /*
- * cluster_tt_slot_recyclable
+ * cluster_undo_retention_sample_min
  *
- *	Decide whether a TT-slot allocator entry may be recycled under the current
- *	retention horizon.  See header / file-banner contract.
+ *	Fold a ProcArray sample without raising its pre-scan clock bound. An
+ *	xmin whose read_scn is not published conservatively refuses the sample.
  */
+SCN
+cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin, SCN published_read_scn)
+{
+	if (!SCN_VALID(sampled_clock))
+		return InvalidScn;
+	if (SCN_VALID(published_read_scn))
+		return scn_time_cmp(published_read_scn, sampled_clock) < 0 ? published_read_scn
+																   : sampled_clock;
+	/* GetSnapshotData publishes xmin before snapmgr publishes read_scn.
+	 * This interval is an unproven reader, not permission to recycle. */
+	return TransactionIdIsValid(xmin) ? InvalidScn : sampled_clock;
+}
+
+
+/* Retention-gated TT allocator policy; see the header contract. */
 bool
 cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 {
@@ -68,11 +83,11 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 		return false;
 
 	/*
-	 * InvalidScn horizon == cluster disabled (no live cluster reader can
-	 * exist) -> no retention constraint, recycle freely.
+	 * An enabled sampler may be unproven during snapshot publication.
+	 * GUC-off permission is the allocator's separate explicit branch.
 	 */
 	if (!SCN_VALID(horizon))
-		return true;
+		return false;
 
 	/*
 	 * rule 8.A: a COMMITTED slot whose commit_scn is unresolved cannot be
@@ -154,10 +169,6 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 		return true;
 	}
 
-	/* InvalidScn horizon == cluster disabled -> no retention constraint. */
-	if (!SCN_VALID(horizon))
-		return true;
-
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		const TTSlot *s = &hdr->tt_slots[i];
 
@@ -178,6 +189,8 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	/* SEGMENT_COMMITTED with no live committed slot -> nothing to retain. */
 	if (!SCN_VALID(watermark))
 		return true;
+	if (!SCN_VALID(horizon))
+		return false;
 
 	return scn_time_cmp(watermark, horizon) < 0;
 }

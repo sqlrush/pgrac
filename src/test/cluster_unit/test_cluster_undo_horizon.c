@@ -451,7 +451,7 @@ UT_TEST(test_u16b_blame_order)
 	UT_ASSERT_EQ(r.blame, 1);
 }
 
-/* ---- U17: idle-unconstrained sentinel never wins the min fold -------- */
+/* Temporary idleness cannot waive a future snapshot's finite bound. */
 UT_TEST(test_u17_idle_sentinel_skipped)
 {
 	uint8 req[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
@@ -464,17 +464,25 @@ UT_TEST(test_u17_idle_sentinel_skipped)
 	bm_set(req, 1);
 	bm_set(req, 2);
 
-	/* the sentinel peer contributes nothing; min(local 800, peer2 900) */
+	/* A peer can start a snapshot before its next report; infinity is not
+	 * a proof that that snapshot is at/after the owner's local800. */
 	r = run_fold((SCN)800, views, 3, req);
-	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_OK);
-	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)800);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_STALLED);
+	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)InvalidScn);
 	UT_ASSERT_EQ(r.floor.epoch, TEST_EPOCH);
 
-	/* every required peer idle => floor is exactly the local horizon */
+	/* All peers idle at an earlier instant still proves no future bound. */
 	views[2] = mk_view((uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED);
 	r = run_fold((SCN)800, views, 3, req);
+	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_STALLED);
+	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)InvalidScn);
+
+	/* The original finite sample100 remains safe for a new snapshot110. */
+	views[1] = mk_view(100);
+	views[2] = mk_view(900);
+	r = run_fold((SCN)800, views, 3, req);
 	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_OK);
-	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)800);
+	UT_ASSERT_EQ((uint64)r.floor.scn, (uint64)100);
 }
 
 /* ---- U17b: sentinel reports still owe every proof obligation --------- */
@@ -494,7 +502,7 @@ UT_TEST(test_u17b_idle_sentinel_still_proven)
 
 	r = run_fold((SCN)800, views, 2, req);
 	UT_ASSERT_EQ(r.st, CLUSTER_UNDO_HORIZON_FOLD_STALLED);
-	UT_ASSERT_EQ(r.reason, CLUSTER_UNDO_HORIZON_STALL_STALE);
+	UT_ASSERT_EQ(r.reason, CLUSTER_UNDO_HORIZON_STALL_MALFORMED);
 	UT_ASSERT_EQ(r.blame, 1);
 
 	/* an epoch-mismatched sentinel stalls too */

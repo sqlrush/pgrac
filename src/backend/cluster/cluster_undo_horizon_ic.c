@@ -221,7 +221,8 @@ cluster_undo_horizon_report_handler(const ClusterICEnvelope *env, const void *pa
 		return;
 	}
 	memcpy(&wire, payload, sizeof(wire));
-	if ((SCN)wire.horizon_scn == InvalidScn) {
+	if ((SCN)wire.horizon_scn == InvalidScn
+		|| (SCN)wire.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED) {
 		undo_horizon_reject("invalid scn", sender);
 		return;
 	}
@@ -322,7 +323,6 @@ cluster_undo_horizon_lmon_tick(void)
 	ClusterUndoHorizonWire wire;
 	uint64 now_us;
 	SCN report;
-	bool unconstrained;
 	int pi;
 
 	if (!cluster_enabled || cluster_node_id < 0 || UndoHorizonShmem == NULL)
@@ -338,25 +338,15 @@ cluster_undo_horizon_lmon_tick(void)
 		return;
 	last_sent_us = now_us;
 
-	/*
-	 * TT lane (S3 idle-peer floor pin): a PROVABLY idle node (zero active
-	 * xacts AND zero held snapshots) reports the unconstrained sentinel so
-	 * its clock-sample lag stops pinning a lone writer's recycle floor.
-	 * MRP-active standbys are never "idle" in this sense (their future
-	 * snapshots read at consistent_scn, S3.0 row 4), and any uncertainty
-	 * in the probe answers false -- the conservative sample then flows
-	 * exactly as before.  The probe runs AFTER the sample: a snapshot
-	 * appearing in between flips it to false (conservative); one
-	 * disappearing in between just means the constraint is gone.
-	 */
-	unconstrained = !cluster_mrp_should_start() && cluster_undo_retention_all_quiescent();
+	/* Idleness at this instant does not bound a future snapshot by infinity.
+	 * Publish only the finite pre-scan clock / retained-snapshot minimum.
+	 * A new reader can then start before the next tick without a revoke
+	 * protocol; its read point cannot precede the previously published floor. */
 
 	wire.epoch = cluster_epoch_get_current();
 	wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
 
 	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-		bool sentinel;
-
 		if (pi == cluster_node_id)
 			continue;
 		if (cluster_conf_lookup_node(pi) == NULL)
@@ -372,17 +362,7 @@ cluster_undo_horizon_lmon_tick(void)
 		if (!cluster_sf_peer_supports_undo_horizon(pi))
 			continue;
 
-		/*
-		 * Sentinel send-side hard gate: an old receiver would fold the
-		 * raw sentinel value harmlessly but latch a spurious same-epoch
-		 * regression when this node wakes, so it keeps getting the
-		 * conservative clock sample instead (see cluster_ic.h).
-		 */
-		sentinel = unconstrained && cluster_sf_peer_supports_undo_horizon_idle(pi);
-		wire.horizon_scn
-			= sentinel ? (uint64)CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED : (uint64)report;
-		if (sentinel)
-			pg_atomic_fetch_add_u64(&UndoHorizonShmem->idle_sentinel_sent_count, 1);
+		wire.horizon_scn = (uint64)report;
 
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
 		/* fire-and-forget (L456): transport retention / errors surface

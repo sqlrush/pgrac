@@ -354,7 +354,7 @@ reset_allocator(void)
 	mock_ctrc_sample_calls = 0;
 	mock_ctrc_sample_lock_depth = -1;
 
-	/* Default: no retention constraint (cluster-disabled sentinel), gate on. */
+	/* Default: unproven retention sample, gate on. */
 	mock_retention_horizon = InvalidScn;
 	cluster_undo_retention_horizon_enabled = true;
 	mock_cluster_conf.node_count = 1;
@@ -547,8 +547,8 @@ UT_TEST(test_t19_recycle_committed_bumps_wrap)
 	/*
 	 * L189 recycle policy: when no FREE slot is available, the allocator
 	 * must recycle a COMMITTED slot, bumping its wrap counter on the way.
-	 * We use the test-only force_status helper to drive a slot into
-	 * COMMITTED, fill the rest of the 48 slots with distinct ACTIVE xids,
+	 * We publish a finite COMMITTED proof below a valid horizon,
+	 * fill the rest of the 48 slots with distinct ACTIVE xids,
 	 * then watch a fresh alloc choose the recyclable slot + bump wrap.
 	 */
 	uint16 first_off;
@@ -561,8 +561,9 @@ UT_TEST(test_t19_recycle_committed_bumps_wrap)
 	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
 
-	/* Mark slot 0 as COMMITTED. */
-	cluster_tt_slot_test_force_status(NODE0_SEG, first_off, 2 /* CTS_COMMITTED */);
+	/* Mark slot 0 as COMMITTED with an actual finite retention proof. */
+	cluster_tt_slot_mark_committed(NODE0_SEG, first_off, (TransactionId)100, (SCN)5);
+	mock_retention_horizon = (SCN)10;
 
 	/* Fill the remaining 47 slots with distinct ACTIVE xids so no FREE
 	 * slot remains; the next alloc must recycle the COMMITTED one. */
@@ -1366,6 +1367,34 @@ UT_TEST(test_t53_current_exact_alloc_captures_recycle_wrap_atomically)
 }
 
 
+UT_TEST(test_t55_unproven_horizon_retains_until_finite_sample)
+{
+	uint16 first;
+	uint16 result;
+	bool retained = false;
+	ClusterUndoCleanerPassStats stats = { 0 };
+	int i;
+
+	reset_allocator();
+	first = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	cluster_tt_slot_mark_committed(NODE0_SEG, first, (TransactionId)100, (SCN)5);
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
+
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	cluster_tt_slot_gc_current_pass(InvalidScn, (uint64)0, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, first), 0);
+
+	mock_retention_horizon = (SCN)10;
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)first);
+	UT_ASSERT_EQ((int)retained, 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, first), 1);
+}
+
 int
 main(void)
 {
@@ -1427,6 +1456,7 @@ main(void)
 	UT_RUN(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation);
 	UT_RUN(test_t53_current_exact_alloc_captures_recycle_wrap_atomically);
 	UT_RUN(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample);
+	UT_RUN(test_t55_unproven_horizon_retains_until_finite_sample);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

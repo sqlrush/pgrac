@@ -19,7 +19,7 @@
  *	    U3  ABORTED (any commit_scn)                    -> recyclable (C7)
  *	    U4  ACTIVE / FREE                               -> not recyclable
  *	    U7  COMMITTED + commit_scn == horizon (strict <) -> retained
- *	    U8  InvalidScn horizon (cluster disabled)       -> recyclable
+ *	    U8  InvalidScn horizon (unproven sample)        -> retained
  *	    U8b COMMITTED + InvalidScn commit_scn (rule 8.A) -> retained
  *	    U5  SEGMENT_COMMITTED watermark < / == / > horizon + empty
  *	    U10 SEGMENT_ALLOCATED/ACTIVE/FULL-but-ACTIVE precondition
@@ -59,6 +59,8 @@ UT_DEFINE_GLOBALS();
 /* Stage 8 peer-mode whole-segment retention contract. */
 extern bool cluster_undo_segment_recyclable_for_mode(
 	const struct UndoSegmentHeaderData *hdr, SCN horizon, bool peer_mode);
+extern SCN cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin,
+											 SCN published_read_scn);
 
 
 /*
@@ -139,10 +141,32 @@ UT_TEST(test_u7_committed_equal_horizon_retained)
 	UT_ASSERT_EQ((int)cluster_tt_slot_recyclable(CTS_COMMITTED, mk_scn(10), mk_scn(10)), 0);
 }
 
-UT_TEST(test_u8_invalid_horizon_recyclable)
+UT_TEST(test_u8_invalid_horizon_retained)
 {
-	/* InvalidScn horizon == cluster disabled / no retention constraint. */
-	UT_ASSERT_EQ((int)cluster_tt_slot_recyclable(CTS_COMMITTED, mk_scn(5), InvalidScn), 1);
+	UndoSegmentHeaderData hdr;
+
+	/* An enabled retention sampler can be unproven during snapshot
+	 * publication. Absence is not permission to recycle committed history. */
+	UT_ASSERT_EQ((int)cluster_tt_slot_recyclable(CTS_COMMITTED, mk_scn(5), InvalidScn), 0);
+	init_header(&hdr, SEGMENT_COMMITTED);
+	set_committed_slot(&hdr, 0, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, InvalidScn), 0);
+}
+
+UT_TEST(test_local_snapshot_publication_bounds)
+{
+	SCN c = mk_scn(100);
+
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(c, InvalidTransactionId, InvalidScn), c);
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(c, (TransactionId)42, InvalidScn), InvalidScn);
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(c, (TransactionId)42, mk_scn(80)), mk_scn(80));
+	/* A snapshot starting after C does not raise the already sampled floor. */
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(c, (TransactionId)42, mk_scn(110)), c);
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(InvalidScn, InvalidTransactionId, mk_scn(80)),
+				 InvalidScn);
+	/* A concurrent release can leave a harmless old published SCN. */
+	UT_ASSERT_EQ(cluster_undo_retention_sample_min(c, InvalidTransactionId, mk_scn(80)),
+				 mk_scn(80));
 }
 
 UT_TEST(test_u8b_committed_invalid_commit_scn_retained)
@@ -256,12 +280,15 @@ UT_TEST(test_u5_segment_committed_invalid_commit_scn_retained)
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, mk_scn(10)), 0);
 }
 
-UT_TEST(test_u8_segment_invalid_horizon_recyclable)
+UT_TEST(test_u8_segment_invalid_horizon_retained)
 {
 	UndoSegmentHeaderData hdr;
 
 	init_header(&hdr, SEGMENT_COMMITTED);
 	set_committed_slot(&hdr, 0, mk_scn(100)); /* even high watermark */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, InvalidScn), 0);
+	/* No committed history requires no time proof. */
+	init_header(&hdr, SEGMENT_COMMITTED);
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, InvalidScn), 1);
 }
 
@@ -535,7 +562,8 @@ main(void)
 	UT_RUN(test_u3_aborted_always_recyclable);
 	UT_RUN(test_u4_active_free_not_recyclable);
 	UT_RUN(test_u7_committed_equal_horizon_retained);
-	UT_RUN(test_u8_invalid_horizon_recyclable);
+	UT_RUN(test_u8_invalid_horizon_retained);
+	UT_RUN(test_local_snapshot_publication_bounds);
 	UT_RUN(test_u8b_committed_invalid_commit_scn_retained);
 	UT_RUN(test_u5_segment_committed_watermark_below_horizon);
 	UT_RUN(test_u5_segment_committed_watermark_at_or_above_horizon);
@@ -543,7 +571,7 @@ main(void)
 	UT_RUN(test_u5_peer_mode_segment_with_aborted_slot_retained);
 	UT_RUN(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot);
 	UT_RUN(test_u5_segment_committed_invalid_commit_scn_retained);
-	UT_RUN(test_u8_segment_invalid_horizon_recyclable);
+	UT_RUN(test_u8_segment_invalid_horizon_retained);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);
 	UT_RUN(test_u10_segment_null_header_not_recyclable);
 
