@@ -242,7 +242,8 @@ resource_x_bootstrap_common_valid(uint8 msg_type,
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 		return false;
 	}
-	if (common->flags != 0) {
+	if (common->flags != 0
+		&& (!request || common->flags != RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_FLAGS);
 		return false;
 	}

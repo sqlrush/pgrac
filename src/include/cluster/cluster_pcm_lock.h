@@ -1687,6 +1687,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_authority_grant_exact(
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_exact(
 	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
 	ResourceXRequesterJoinSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_current_exact(
+	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
+	uint32 authenticated_source_ingress_generation, int32 current_master_node,
+	uint32 current_master_ingress_generation, uint64 r4_record_generation,
+	ResourceXRequesterJoinSnapshot *out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_requester_join_frames_exact(
 	const ResourceXAssertion *assertion, ResourceXDecodedFrame *grant_out,

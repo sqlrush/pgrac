@@ -2622,6 +2622,7 @@ make_resource_x_bootstrap_ack_values(
 	ack.common.base_authority_generation = base_authority_generation;
 	ack.common.sender_connection_generation = sender_connection_generation;
 	ack.common.outcome = RESOURCE_X_OUTCOME_OK;
+	ack.common.flags = 0;
 	UT_ASSERT(cluster_resource_x_wire_encode(
 		RESOURCE_X_MSG_IMAGE_OR_GRANT, &ack, wire, sizeof(wire),
 		&wire_len, &reject));
@@ -3453,6 +3454,92 @@ UT_TEST(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly)
 		RESOURCE_X_APPLY_INVALID);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		&request, 1, 61, 77, 31, 71, &replay_ack), RESOURCE_X_APPLY_STALE);
+}
+
+UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
+{
+	BufferTag tag = make_tag(281);
+	ResourceXDecodedFrame request;
+	ResourceXDecodedFrame reply;
+	ResourceXDecodedFrame replay;
+	ResourceXDecodedFrame wrong;
+	ResourceXMasterSnapshot snapshot;
+	ResourceXMasterSnapshot before;
+	int shape;
+
+	for (shape = 0; shape < 4; shape++) {
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		if (shape == 1)
+			UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 2),
+						 PCM_GCS_TRANSITION_APPLIED);
+		else if (shape >= 2) {
+			UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 2),
+						 PCM_GCS_TRANSITION_APPLIED);
+			if (shape == 3)
+				UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 1),
+							 PCM_GCS_TRANSITION_APPLIED);
+		}
+		request = make_resource_x_bootstrap_request(tag, 1);
+		request.common.flags = UINT8_C(0x08);
+		request.common.semantic_crc32c = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
+																		 71, &reply),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(reply.common.flags, 0);
+		UT_ASSERT(reply.common.base_authority_generation > 0);
+		if (shape == 0 || shape == 3) {
+			/* Local/durable admission still needs its original proof path. */
+			UT_ASSERT_EQ(reply.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+			UT_ASSERT_EQ(reply.common.authority_generation, 0);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+							 &request.common.logical_assertion, &snapshot),
+						 RESOURCE_X_APPLY_NOT_FOUND);
+			continue;
+		}
+		UT_ASSERT_EQ(reply.kind, RESOURCE_X_WIRE_ASSERT_X);
+		UT_ASSERT_EQ(reply.common.authority_generation, reply.common.base_authority_generation);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+						 &request.common.logical_assertion, &snapshot),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+		UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 2);
+		UT_ASSERT(cluster_pcm_lock_resource_x_s_barrier_active_exact(&tag));
+		before = snapshot;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
+																		 71, &replay),
+					 RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&reply, &replay, sizeof(reply)) == 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+						 &request.common.logical_assertion, &snapshot),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
+		wrong = request;
+		wrong.common.sender_connection_generation++;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_bootstrap_request_exact(&wrong, 1, 61, 77, 31, 71, &replay),
+			RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 62, 77, 31,
+																		 71, &replay),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 78, 31,
+																		 71, &replay),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
+																		 72, &replay),
+					 RESOURCE_X_APPLY_STALE);
+		wrong = request;
+		wrong.common.assertion_sequence++;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_bootstrap_request_exact(&wrong, 1, 61, 77, 31, 71, &replay),
+			RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+						 &request.common.logical_assertion, &snapshot),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
+	}
 }
 
 UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)
@@ -4981,14 +5068,13 @@ UT_TEST(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation)
 		&expected_ref, 0, 6));
 }
 
-UT_TEST(test_resource_x_pre_assert_authority_drift_discards_exact_round_only)
+UT_TEST(test_resource_x_pre_assert_authority_drift_cannot_discard_admitted_capable_round)
 {
 	BufferTag tag = make_tag(216);
 	ResourceXAssertion assertion;
 	ResourceXDecodedFrame first_request;
 	ResourceXDecodedFrame second_request;
 	ResourceXDecodedFrame first_ack;
-	ResourceXDecodedFrame second_ack;
 	ResourceXDecodedFrame assert_frame;
 	ResourceXAcquisitionRef terminal_ref;
 	ResourceXBootstrapRoundAction action;
@@ -5005,42 +5091,33 @@ UT_TEST(test_resource_x_pre_assert_authority_drift_discards_exact_round_only)
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 	UT_ASSERT_EQ(first_request.common.assertion_sequence, UINT64_C(1));
 
-	/* A successful request enqueue may already have installed the master's
-	 * non-authority RECEIVED receipt.  Before any ACK is accepted or ASSERT is
-	 * dispatched, exact authority drift still discards the whole requester
-	 * round; A1.1 requires a higher attempt to replace that old receipt. */
+	/* Missing ACK cannot distinguish a harmless receipt from a canonical
+	 * remote admission. A caller cannot discard either by assumption. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		&first_request, 1, 61, 77, 31, 71, &first_ack),
 		RESOURCE_X_APPLY_APPLIED);
 	result = cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
 		&first_request, 0, 77, 61, UINT64_C(50), UINT64_C(10000), 0, 0);
-	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
 	result = cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
 		&first_request, 0, 77, 61, UINT64_C(50), UINT64_C(10000), 0, 0);
-	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
 
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 32, 77, 52, 62, UINT64_C(10000), (UINT64_C(10000)) - (UINT64_C(101)),
 		UINT64_C(101), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
-	UT_ASSERT_EQ(second_request.common.assertion_sequence, UINT64_C(2));
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&second_request, 1, 62, 77, 32, 72, &second_ack),
-		RESOURCE_X_APPLY_APPLIED);
-
-	/* Old bytes and the old non-authority ACK cannot bind or clear the rebound
-	 * round.  Only the replacement receipt's exact ACK may advance ASSERT. */
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(second_request.common.assertion_sequence, UINT64_C(0));
+	/* The original exact round remains intact and can consume its actual
+	 * local/durable ACK. No changed identity was published by the caller. */
 	result = cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
 		&first_request, 0, 77, 61, UINT64_C(50), UINT64_C(10000), 0, 0);
-	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
 	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
-		&first_ack, 0, 62, 77, UINT64_C(110), &assert_frame);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
-	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
-		&second_ack, 0, 62, 77, UINT64_C(111), &assert_frame);
+		&first_ack, 0, 61, 77, UINT64_C(111), &assert_frame);
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 	result = cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
-		&second_request, 0, 77, 62, UINT64_C(50), UINT64_C(10000), 0, 0);
+		&first_request, 0, 77, 61, UINT64_C(50), UINT64_C(10000), 0, 0);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
 }
 
@@ -7969,9 +8046,9 @@ UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
 	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 		&ack, 0, 61, 77, UINT64_C(110), &assert_frame);
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assert_frame, 0, 61, 77, 31, 71, &snapshot),
-		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(&assert_frame, 0, 61, 77, 31,
+																	   71, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
 
 	memset(&durable, 0, sizeof(durable));
 	durable.assertion = assertion;
@@ -11655,6 +11732,97 @@ resource_x_test_image_authority(ResourceXDecodedFrame *image, int32 source, uint
 	canonicalize_resource_x_test_image(image);
 }
 
+UT_TEST(test_resource_x_remote_admission_binds_only_actual_image)
+{
+	BufferTag tag = make_tag(282);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame request, retry, grant, image, changed;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXBootstrapRoundFailureSnapshot before, after;
+	ResourceXBufferInstallProof install = { 0 };
+	ResourceXBufferActivationProof activation = { 0 };
+	int fault;
+
+	for (fault = 0; fault < 10; fault++) {
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 2;
+		fake_gcs_master_node = 0;
+		fake_pcm_clock_us = 110;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 1000, 900, 100, 50, false, 0, &request,
+						 &terminal_ref),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		/* Deliberately no ACK and no requester ASSERT. */
+		make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+		resource_x_test_image_authority(&image, 1, 4, request.common.assertion_sequence);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 50, &before),
+					 RESOURCE_X_APPLY_APPLIED);
+		changed = image;
+		if (fault == 1)
+			changed.common.master_session_incarnation++;
+		if (fault == 2)
+			fake_pcm_clock_us = UINT64_C(6000000000);
+		if (fault == 3) {
+			changed.common.assertion_sequence++;
+			changed.body.image_envelope.requester_target_generation++;
+		}
+		if (fault == 4)
+			changed.common.flags = 0;
+		if (fault != 0) {
+			UT_ASSERT(cluster_pcm_lock_resource_x_requester_join_current_exact(
+						  &changed, fault == 5 ? 3 : 1, fault == 6 ? 0 : 91, fault == 7 ? 3 : 0,
+						  fault == 8 ? 62 : 61, fault == 9 ? 78 : 77, &join)
+					  != RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+							 &assertion, 0, 17, 31, 77, 51, 61, 50, &after),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+			fake_pcm_clock_us = 110;
+		}
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61,
+																			  77, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
+		UT_ASSERT_EQ(join.base_authority_generation, UINT64_C(1));
+		UT_ASSERT_EQ(join.final_authority_generation, UINT64_C(4));
+		UT_ASSERT_EQ(join.t_grant_us, 0);
+		UT_ASSERT_EQ(join.t_image_us, UINT64_C(110));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61,
+																			  77, &join),
+					 RESOURCE_X_APPLY_DUPLICATE);
+		changed = image;
+		resource_x_test_image_authority(&changed, 1, 5, request.common.assertion_sequence);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&changed, 1, 91, 0,
+																			  61, 77, &join),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 1000, 900, 200, 50, false, 0, &retry,
+						 &terminal_ref),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		UT_ASSERT(memcmp(&request, &retry, sizeof(request)) == 0);
+		terminal_ref
+			= make_resource_x_acquisition_ref(tag, 2, 17, request.common.assertion_sequence);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&terminal_ref),
+					 RESOURCE_X_APPLY_APPLIED);
+		install.ownership_generation = 9;
+		install.writer_activation_token = 12;
+		install.resource_x_activation_generation = terminal_ref.acquisition_generation;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&terminal_ref, &install),
+					 RESOURCE_X_APPLY_APPLIED);
+		activation.ownership_generation = 9;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_requester_activate_exact(&terminal_ref, &activation),
+			RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(&terminal_ref, 31,
+																				  77, 9));
+	}
+}
+
 UT_TEST(test_resource_x_image_authority_requires_live_head_and_exact_source)
 {
 	BufferTag tag = make_tag(207);
@@ -11737,7 +11905,8 @@ UT_TEST(test_resource_x_image_authority_requires_live_head_and_exact_source)
 	}
 }
 
-UT_TEST(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floor)
+static void
+resource_x_test_live_base_not_binding_floor(bool image_bound)
 {
 	BufferTag retired_tag = make_tag(205);
 	BufferTag tag = make_tag(206);
@@ -11792,25 +11961,28 @@ UT_TEST(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floo
 	UT_ASSERT(pcm_entry_try_retire_exact(&retired_tag,
 		retired_binding_generation, PCM_RETIRE_REASON_HOLDER_RELEASE));
 
-	/* The current master ACK freezes base=2 for this exact attempt.  A grant
-	 * at final=3 must be judged against that live round, not the unrelated
-	 * local binding floor inherited during physical slot reuse. */
+	/* Actual ACK or actual delegated IMAGE must bind the master's base,
+	 * not the unrelated local physical slot floor. Exercise both origins. */
 	UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_MAX - 1, UINT64_C(1000000), UINT64_C(100),
 		UINT64_C(50), false, 0, &request, &terminal_ref);
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
-	ack = make_resource_x_bootstrap_ack_values(
-		&request, UINT64_C(2), UINT32_C(71));
-	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
-		&ack, 0, 61, 77, UINT64_C(110), &assert_frame);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	if (image_bound) {
+		assert_frame = request;
+		assert_frame.common.base_authority_generation = 2;
+	} else {
+		ack = make_resource_x_bootstrap_ack_values(&request, UINT64_C(2), UINT32_C(71));
+		action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+			&ack, 0, 61, 77, UINT64_C(110), &assert_frame);
+		UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	}
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), &failure),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(failure.requester_base_generation > UINT64_C(3));
-	UT_ASSERT_EQ(failure.base_authority_generation, UINT64_C(2));
+	UT_ASSERT_EQ(failure.base_authority_generation, image_bound ? UINT64_C(0) : UINT64_C(2));
 
 	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
 	retarget_resource_x_remote_join_pair(&grant, &image, UINT64_C(3),
@@ -11825,11 +11997,20 @@ UT_TEST(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floo
 	grant.body.authority_grant.source_disposition
 		= RESOURCE_X_DISPOSITION_DURABLE_STORAGE;
 	UT_ASSERT_EQ(grant.common.base_authority_generation, UINT64_C(2));
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
-		&grant, 0, &join), RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(join.flags,
-		RESOURCE_X_REQUESTER_JOIN_HAS_GRANT
-		| RESOURCE_X_REQUESTER_JOIN_READY);
+	if (image_bound) {
+		image.common.base_authority_generation = 2;
+		image.body.image_envelope.conversion_base_generation = 2;
+		resource_x_test_image_authority(&image, 1, 4, request.common.assertion_sequence);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61,
+																			  77, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(join.final_authority_generation, UINT64_C(4));
+	} else {
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&grant, 0, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(join.flags,
+					 RESOURCE_X_REQUESTER_JOIN_HAS_GRANT | RESOURCE_X_REQUESTER_JOIN_READY);
+	}
 
 	ref = make_resource_x_acquisition_ref(tag, 2, 17,
 		assert_frame.common.assertion_sequence);
@@ -11847,6 +12028,12 @@ UT_TEST(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floo
 		&ref, &activation), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 		&ref, 31, 77, install.ownership_generation));
+}
+
+UT_TEST(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floor)
+{
+	resource_x_test_live_base_not_binding_floor(false);
+	resource_x_test_live_base_not_binding_floor(true);
 }
 
 UT_TEST(test_resource_x_requester_join_accepts_s_carrier_either_order_and_rejects_mode_drift)
@@ -13653,12 +13840,20 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		&request, 0, 61, 77, 31, 71, &ack),
 		RESOURCE_X_APPLY_APPLIED);
-	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
-		&ack, 0, 61, 77, UINT64_C(110), &assert_frame);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assert_frame, 0, 61, 77, 31, 71, &snapshot),
-		RESOURCE_X_APPLY_APPLIED);
+	if (with_history) {
+		UT_ASSERT_EQ(ack.kind, RESOURCE_X_WIRE_ASSERT_X);
+		assert_frame = ack; /* Already admitted locally; no ACK on wire. */
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_master_snapshot_exact(&holder_assertion, &snapshot),
+			RESOURCE_X_APPLY_APPLIED);
+	} else {
+		action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+			&ack, 0, 61, 77, UINT64_C(110), &assert_frame);
+		UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(&assert_frame, 0, 61, 77,
+																		   31, 71, &snapshot),
+					 RESOURCE_X_APPLY_APPLIED);
+	}
 	if (ut_current_failed)
 		return;
 
@@ -13709,7 +13904,8 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
 						 &holder_assertion, &intent, payload, sizeof(payload)),
 					 RESOURCE_X_APPLY_NOT_FOUND);
-		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&image, 3, &join),
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 3, 91, 0, 61,
+																			  77, &join),
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_AUTHORITY_WITH_IMAGE) != 0);
 	} else
@@ -16178,6 +16374,7 @@ main(void)
 	UT_RUN(test_resource_x_reconfig_t2_newer_sidecar_survives_and_blocks_orphan);
 	UT_RUN(test_resource_x_native_head_is_exact_s_admission_barrier);
 	UT_RUN(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly);
+	UT_RUN(test_resource_x_remote_admission_is_one_canonical_transaction);
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
@@ -16197,7 +16394,7 @@ main(void)
 	UT_RUN(test_resource_x_requester_round_blocks_local_s_only_until_x_cached);
 	UT_RUN(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition);
 	UT_RUN(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation);
-	UT_RUN(test_resource_x_pre_assert_authority_drift_discards_exact_round_only);
+	UT_RUN(test_resource_x_pre_assert_authority_drift_cannot_discard_admitted_capable_round);
 	UT_RUN(test_resource_x_direct_init_observer_is_join_only_and_keeps_round_deadline);
 	UT_RUN(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke);
 	UT_RUN(test_resource_x_drained_drop_pair_distinct_authority_control);
@@ -16256,6 +16453,7 @@ main(void)
 	UT_RUN(test_resource_x_requester_join_accepts_exact_base_carrier_final_lineage);
 	UT_RUN(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floor);
 	UT_RUN(test_resource_x_image_authority_requires_live_head_and_exact_source);
+	UT_RUN(test_resource_x_remote_admission_binds_only_actual_image);
 	UT_RUN(test_resource_x_requester_join_accepts_s_carrier_either_order_and_rejects_mode_drift);
 	UT_RUN(test_resource_x_requester_join_accepts_multi_blocker_authority_span);
 	UT_RUN(test_resource_x_requester_join_creates_fresh_local_entry_before_t1);

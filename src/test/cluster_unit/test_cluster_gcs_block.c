@@ -2850,11 +2850,9 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 
 UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 {
-	static const char *const ingress_contract[] = {
-		"cluster_pcm_lock_resource_x_requester_join_exact(",
-		"RESOURCE_X_REQUESTER_JOIN_READY",
-		"gcs_block_resource_x_requester_terminal_try("
-	};
+	static const char *const ingress_contract[]
+		= { "gcs_block_resource_x_requester_join_ingress(", "RESOURCE_X_REQUESTER_JOIN_READY",
+			"gcs_block_resource_x_requester_terminal_try(" };
 	static const char *const executor_contract[] = {
 		"cluster_pcm_lock_resource_x_requester_join_frames_exact(",
 		"join.requester_target_generation != join.assertion_sequence",

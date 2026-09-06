@@ -67,6 +67,8 @@ typedef enum ResourceXSourceProofKind
 /* An exact master-directed source transfers X permission with the image.
  * Valid only on a selected-source BLOCK_TO_N and its IMAGE_ENVELOPE. */
 #define RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE UINT8_C(0x04)
+/* Only a zero-base type14/kind9 request may permit remote-source admission. */
+#define RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION UINT8_C(0x08)
 
 typedef enum ResourceXWireOutcome
 {

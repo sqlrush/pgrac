@@ -2722,8 +2722,10 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # fixture doubles; the master/source decision and call sequence are product C.
 test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
+	     /^gcs_block_resource_x_kind9_ingress\(/ { print "static void"; emit=1; admission++ } \
+	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; join++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (owner != 1) exit 1 }' $< > $@.tmp
+	     END { if (owner != 1 || admission != 1 || join != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingress.c \

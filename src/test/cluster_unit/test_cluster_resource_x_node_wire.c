@@ -342,6 +342,40 @@ UT_TEST(test_preassert_bootstrap_request_and_ack_are_direction_exact)
 	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &ack);
 }
 
+UT_TEST(test_remote_admission_is_only_a_zero_base_request_flag)
+{
+	ResourceXDecodedFrame request = make_bootstrap_frame(false);
+	ResourceXDecodedFrame decoded;
+	ResourceXDecodedFrame wrong;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 len = 0;
+
+	request.common.flags = UINT8_C(0x08);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &request, bytes,
+											 sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT(
+		cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.flags, UINT8_C(0x08));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation, 0);
+	UT_ASSERT_EQ(decoded.common.authority_generation, 0);
+	wrong = make_bootstrap_frame(true);
+	wrong.common.flags = UINT8_C(0x08);
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, &wrong);
+	wrong = request;
+	wrong.common.flags |= RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &wrong);
+	wrong = request;
+	wrong.common.base_authority_generation = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &wrong);
+	wrong = request;
+	wrong.kind = RESOURCE_X_WIRE_ASSERT_X;
+	wrong.common.base_authority_generation = 1;
+	wrong.common.authority_generation = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &wrong);
+}
+
 UT_TEST(test_preassert_bootstrap_truth_tables_fail_closed)
 {
 	ResourceXDecodedFrame frame;
@@ -1177,6 +1211,7 @@ main(void)
 	UT_RUN(test_image_envelope_layout_is_exact);
 	UT_RUN(test_install_settlement_layout_is_exact);
 	UT_RUN(test_preassert_bootstrap_request_and_ack_are_direction_exact);
+	UT_RUN(test_remote_admission_is_only_a_zero_base_request_flag);
 	UT_RUN(test_preassert_bootstrap_truth_tables_fail_closed);
 	UT_RUN(test_preassert_bootstrap_decode_rejects_reserved_length_and_pair_drift);
 	UT_RUN(test_control_codec_is_network_order_and_crc_exact);

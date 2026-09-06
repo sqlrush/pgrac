@@ -12486,6 +12486,14 @@ gcs_block_resource_x_kind9_ingress(
 		if (apply_result != RESOURCE_X_APPLY_APPLIED
 			&& apply_result != RESOURCE_X_APPLY_DUPLICATE)
 			goto done;
+		if (outbound.kind == RESOURCE_X_WIRE_ASSERT_X
+			&& frame->common.flags == RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION) {
+			/* Master already linearized the canonical request under entry_lock.
+			 * This stack snapshot is not an ACK or a requester wire ASSERT. */
+			cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_APPLY, frame, source_node,
+													(int32)apply_result);
+			goto done;
+		}
 		if (!cluster_semantic_activation_recheck(&admission)
 			|| !gcs_block_resource_x_gate_session_recheck(
 				&frame->common.logical_assertion.resource, &gate,
@@ -12588,6 +12596,57 @@ done:
  * never falls back to the local ticket projection and publishes the exact
  * post-T3 ref/BufferDesc generation into the requester round before waking
  * its same-node followers. */
+static ResourceXApplyResult
+gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
+											const ResourceXDecodedFrame *frame,
+											uint32 authenticated_connection_generation,
+											ResourceXRequesterJoinSnapshot *out)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint64 master_session = 0;
+	uint32 master_ingress = 0;
+	int32 master_node = -1;
+	int32 source;
+
+	if (env == NULL || frame == NULL || out == NULL || authenticated_connection_generation == 0
+		|| (frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+			&& frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT))
+		return RESOURCE_X_APPLY_INVALID;
+	source = (int32)env->source_node_id;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		if (gcs_block_resource_x_target_peer_matches_exact(&admission, source,
+														   authenticated_connection_generation)
+			&& gcs_block_resource_x_gate_session_snapshot(&frame->common.logical_assertion.resource,
+														  &gate, &master_node, &master_session)
+			&& gate.formation == frame->common.resource_formation
+			&& master_session == frame->common.master_session_incarnation
+			&& gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &master_ingress)
+			&& gcs_block_resource_x_target_peer_matches_exact(&admission, master_node,
+															  master_ingress)
+			&& cluster_semantic_activation_recheck(&admission)
+			&& gcs_block_resource_x_gate_session_recheck(&frame->common.logical_assertion.resource,
+														 &gate, master_node, master_session))
+			result = cluster_pcm_lock_resource_x_requester_join_current_exact(
+				frame, source, authenticated_connection_generation, master_node, master_ingress,
+				admission.record_generation, out);
+	}
+	PG_CATCH();
+	{
+		cluster_semantic_activation_leave(&admission);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_semantic_activation_leave(&admission);
+	return result;
+}
+
 static ResourceXApplyResult
 gcs_block_resource_x_requester_terminal_try(
 	const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
@@ -12993,8 +13052,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 		break;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
-		result = cluster_pcm_lock_resource_x_requester_join_exact(
-			&frame, (int32)env->source_node_id, &join_snapshot);
+		result = gcs_block_resource_x_requester_join_ingress(
+			env, &frame, authenticated_capability_generation, &join_snapshot);
 		if ((result == RESOURCE_X_APPLY_APPLIED
 				|| result == RESOURCE_X_APPLY_DUPLICATE)
 			&& (join_snapshot.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0) {
