@@ -2435,6 +2435,8 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; evict++ } \
 	     /^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
 	     /^cluster_bufmgr_pcm_direct_init_known_new_locked\(/ { print "static bool"; emit=1; known_new++ } \
+	     /^cluster_bufmgr_pcm_own_snapshot_by_tag\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_lookup++ } \
+	     /^cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact\(/ { print "ClusterPcmOwnResult"; emit=1; direct_lookup++ } \
 	     /^cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact\(/ { print "static ResourceXBufferActivationResult"; emit=1; sidecar++ } \
 	     /^cluster_bufmgr_pcm_own_activate_x_by_tag\(/ { print "ResourceXBufferActivationResult"; emit=1; activate++ } \
 	     /^cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact\(/ { print "ResourceXBufferActivationResult"; emit=1; clear++ } \
@@ -2446,7 +2448,13 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_delivery_snapshot_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_snapshot++ } \
 	     /^cluster_bufmgr_pcm_own_delivery_hold_release_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_release++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1) exit 1 }' $< > $@.tmp
+	     END { if (bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_delivery_route_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_delivery_arm_exact\(/ { print "static ResourceXApplyResult"; emit=1; arm++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (arm != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2458,7 +2466,7 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
-		test_cluster_pcm_checksum_owner.inc $(CLUSTER_PCM_OWN_O)
+		test_cluster_pcm_checksum_owner.inc test_cluster_pcm_delivery_route_owner.inc $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) \

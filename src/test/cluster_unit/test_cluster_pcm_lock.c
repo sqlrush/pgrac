@@ -5231,6 +5231,67 @@ UT_TEST(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation)
 		&expected_ref, 0, 6));
 }
 
+UT_TEST(test_resource_x_dispatch_observation_projects_existing_claim_without_mutation)
+{
+	static unsigned char header_before[sizeof(fake_pcm_header)];
+	unsigned char entries_before[sizeof(fake_pcm_entries)];
+	BufferTag tag = make_tag(292);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame request, ack, dispatch, wrong;
+	ResourceXAcquisitionRef terminal;
+	ResourceXCallerWitness caller;
+	ResourceXInstallClaimJoinObservation observation;
+	ResourceXDeliveryTarget target;
+	uint64 generation, token;
+
+	for (int direct = 0; direct < 2; direct++) {
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 1;
+		fake_pcm_clock_us = 100;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+		memset(&caller, 0, sizeof(caller));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 100, 50, 0, direct ? 5 : 0,
+						 true, true, false, 0, &caller, &request, &terminal),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		dispatch = request;
+		for (int phase = 0; phase < 2; phase++) {
+			if (phase) {
+				ack = make_resource_x_bootstrap_ack_values(&request, 9, 71);
+				UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+								 &ack, 0, 61, 77, 110, &dispatch),
+							 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+			}
+			memcpy(header_before, &fake_pcm_header, sizeof(header_before));
+			memcpy(entries_before, &fake_pcm_entries, sizeof(entries_before));
+			generation = token = UINT64_MAX;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
+							 &dispatch, 0, &observation, &target, &generation, &token),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(generation, UINT64_C(0));
+			UT_ASSERT_EQ(token, direct ? UINT64_C(5) : UINT64_C(0));
+			UT_ASSERT_EQ(target.buffer_id_plus_one, 0);
+			UT_ASSERT_EQ(observation.request.assertion_sequence, request.common.assertion_sequence);
+			UT_ASSERT(observation.entry_binding_generation != 0);
+			UT_ASSERT_EQ(observation.r4_record_generation, UINT64_C(77));
+			UT_ASSERT_EQ(memcmp(header_before, &fake_pcm_header, sizeof(header_before)), 0);
+			UT_ASSERT_EQ(memcmp(entries_before, &fake_pcm_entries, sizeof(entries_before)), 0);
+			wrong = dispatch;
+			wrong.common.sender_connection_generation++;
+			generation = token = UINT64_MAX;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
+							 &wrong, 0, &observation, &target, &generation, &token),
+						 RESOURCE_X_APPLY_STALE);
+			UT_ASSERT_EQ(generation, UINT64_C(0));
+			UT_ASSERT_EQ(token, UINT64_C(0));
+			UT_ASSERT_EQ(memcmp(header_before, &fake_pcm_header, sizeof(header_before)), 0);
+			UT_ASSERT_EQ(memcmp(entries_before, &fake_pcm_entries, sizeof(entries_before)), 0);
+		}
+	}
+}
+
 UT_TEST(test_resource_x_pre_assert_authority_drift_cannot_discard_admitted_capable_round)
 {
 	BufferTag tag = make_tag(216);
@@ -16958,7 +17019,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(226);
+	UT_PLAN(229);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -17054,6 +17115,7 @@ main(void)
 	UT_RUN(test_resource_x_delivery_target_survives_head_failure);
 	UT_RUN(test_resource_x_s_caller_retains_ack_local_proof_admission);
 	UT_RUN(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation);
+	UT_RUN(test_resource_x_dispatch_observation_projects_existing_claim_without_mutation);
 	UT_RUN(test_resource_x_pre_assert_authority_drift_cannot_discard_admitted_capable_round);
 	UT_RUN(test_resource_x_direct_init_observer_is_join_only_and_keeps_round_deadline);
 	UT_RUN(test_resource_x_terminal_local_owner_serializes_recycle_and_revoke);

@@ -11426,7 +11426,8 @@ cluster_pcm_lock_resource_x_delivery_bind_target_exact(
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
 	const ResourceXDecodedFrame *dispatch, int32 master_node,
-	ResourceXInstallClaimJoinObservation *observation_out, ResourceXDeliveryTarget *target_out)
+	ResourceXInstallClaimJoinObservation *observation_out, ResourceXDeliveryTarget *target_out,
+	uint64 *direct_generation_out, uint64 *direct_token_out)
 {
 	PcmEntryRef entry_ref;
 	PcmEntryAcquireResult acquire_result;
@@ -11438,7 +11439,12 @@ cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
 		memset(observation_out, 0, sizeof(*observation_out));
 	if (target_out != NULL)
 		memset(target_out, 0, sizeof(*target_out));
+	if (direct_generation_out != NULL)
+		*direct_generation_out = 0;
+	if (direct_token_out != NULL)
+		*direct_token_out = 0;
 	if (dispatch == NULL || observation_out == NULL || target_out == NULL
+		|| direct_generation_out == NULL || direct_token_out == NULL
 		|| !resource_x_assertion_valid(&dispatch->common.logical_assertion)
 		|| dispatch->common.logical_assertion.requester_node != cluster_node_id
 		|| (dispatch->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
@@ -11455,6 +11461,8 @@ cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
 		|| round->current_master_node != master_node
 		|| !pcm_resource_x_common_equal(expected, &dispatch->common))
 		result = RESOURCE_X_APPLY_STALE;
+	else if (!pcm_resource_x_install_claim_valid_locked(round))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else {
 		observation_out->request = round->request;
 		observation_out->entry_binding_generation = entry_ref.binding_generation;
@@ -11463,6 +11471,12 @@ cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
 		observation_out->master_ingress_connection_generation
 			= round->master_ingress_connection_generation;
 		*target_out = round->delivery_target;
+		/* Read-only projection of the already-bound initializer, including
+		 * its pre-ACK phase. This does not allocate or refresh a claim. */
+		if (round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT) {
+			*direct_generation_out = round->install_claim_pending_generation;
+			*direct_token_out = round->install_claim_reservation_token;
+		}
 		result = RESOURCE_X_APPLY_APPLIED;
 	}
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);

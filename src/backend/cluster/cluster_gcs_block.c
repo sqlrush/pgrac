@@ -9153,9 +9153,10 @@ gcs_block_resource_x_delivery_arm_exact(int32 master_node, const ResourceXDecode
 	ResourceXApplyResult result;
 	int buffer_id = -1;
 	uint64 attempt;
+	uint64 direct_generation = 0, direct_token = 0;
 
-	result = cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(dispatch, master_node,
-																		 &observation, &target);
+	result = cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
+		dispatch, master_node, &observation, &target, &direct_generation, &direct_token);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
 	attempt = observation.request.assertion_sequence;
@@ -9172,10 +9173,41 @@ gcs_block_resource_x_delivery_arm_exact(int32 master_node, const ResourceXDecode
 				   ? RESOURCE_X_APPLY_APPLIED
 				   : RESOURCE_X_APPLY_STALE;
 	}
-	if (dispatch->kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP && dispatch->common.flags == 0)
+	if (direct_token != 0) {
+		/* A real read-miss/extension initializer owns !VALID+IO until its
+		 * foreground completes. Ordinary resident lookup deliberately cannot
+		 * see it. Reuse its exact known-new proof, never a raw IO-bit bypass. */
+		own_result = cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+			&observation.request.logical_assertion.resource, direct_generation, direct_token,
+			&buffer_id, &before);
+		if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
+			return own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+														 : RESOURCE_X_APPLY_STALE;
+		if ((before.semantic_buf_state & (BM_VALID | BM_IO_IN_PROGRESS)) == BM_IO_IN_PROGRESS) {
+			ResourceXInstallClaimJoinObservation current;
+			ResourceXDeliveryTarget current_target;
+			uint64 current_generation = 0, current_token = 0;
+
+			result = cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
+				dispatch, master_node, &current, &current_target, &current_generation,
+				&current_token);
+			if (result != RESOURCE_X_APPLY_APPLIED)
+				return result;
+			/* Keep its existing pin/IO/error owner, with no delivery hold.
+			 * This permits publication only; master proof and actual T1/T2/T3
+			 * still follow. No BM_VALID, X or INSTALL is manufactured here. */
+			return memcmp(&observation, &current, sizeof(current)) == 0
+						   && current_target.buffer_id_plus_one == 0
+						   && current_generation == direct_generation
+						   && current_token == direct_token
+					   ? RESOURCE_X_APPLY_APPLIED
+					   : RESOURCE_X_APPLY_STALE;
+		}
+	} else if (dispatch->kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP && dispatch->common.flags == 0)
 		return RESOURCE_X_APPLY_APPLIED;
-	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-		&observation.request.logical_assertion.resource, &buffer_id, &before);
+	else
+		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
+			&observation.request.logical_assertion.resource, &buffer_id, &before);
 	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
 		return own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
 													 : RESOURCE_X_APPLY_BAD_STATE;

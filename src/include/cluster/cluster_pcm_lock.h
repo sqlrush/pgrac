@@ -1452,7 +1452,8 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_bind_target_exa
 	const struct ClusterPcmOwnSnapshot *before, const struct ClusterPcmOwnSnapshot *after);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
 	const ResourceXDecodedFrame *dispatch, int32 master_node,
-	ResourceXInstallClaimJoinObservation *observation_out, ResourceXDeliveryTarget *target_out);
+	ResourceXInstallClaimJoinObservation *observation_out, ResourceXDeliveryTarget *target_out,
+	uint64 *direct_generation_out, uint64 *direct_token_out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXInstallClaimJoinObservation *observation_out,
 	ResourceXDeliveryTarget *target_out);
