@@ -16,6 +16,32 @@
 
 UT_DEFINE_GLOBALS();
 
+/* The Linux ARM CRC chooser uses backend logging. Never hide a CRC error. */
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return elevel >= ERROR;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
 void
 ExceptionalCondition(const char *condition_name, const char *file_name,
 				 int line_number)
