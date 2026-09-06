@@ -25,9 +25,11 @@
 
 #include <unistd.h>
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -48,6 +50,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_aux_vm_pin);
 PG_FUNCTION_INFO_V1(test_pgrac_aux_cycle);
 PG_FUNCTION_INFO_V1(test_pgrac_aux_step);
 PG_FUNCTION_INFO_V1(test_pgrac_micro_heap_step);
+PG_FUNCTION_INFO_V1(test_pgrac_micro_heap_lock_step);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_begin);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_seal);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_stats);
@@ -312,6 +315,137 @@ test_pgrac_micro_heap_step(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("heap timed step could not finish SPI")));
 	probe_operation(relation, MAIN_FORKNUM, 0, RESOURCE_X_TRACE_OPERATION_DONE, sequence, 1);
 	table_close(relation, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/* Inspect only while the caller owns a real shared/exclusive content lock.
+ * The probe never repairs malformed fixtures or follows a moved tuple. */
+static HeapTupleData
+heap_lock_probe_tuple(Relation relation, Buffer buffer, int32 worker)
+{
+	HeapTupleData tuple = { 0 };
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	Page page = BufferGetPage(buffer);
+	PageHeader header = (PageHeader)page;
+	OffsetNumber offset;
+	ItemId item;
+	bool isnull;
+	Datum id;
+
+	BufferGetTag(buffer, &locator, &fork, &block);
+	if (BufferIsLocal(buffer) || !RelFileLocatorEquals(locator, relation->rd_locator)
+		|| fork != MAIN_FORKNUM || block != 0 || PageIsNew(page)
+		|| header->pd_lower != SizeOfPageHeaderData + 16 * sizeof(ItemIdData)
+		|| header->pd_lower > header->pd_upper || header->pd_upper > header->pd_special
+		|| header->pd_special > BLCKSZ)
+		ereport(ERROR, (errmsg("heap lock probe requires its exact sixteen-slot block")));
+	for (offset = 1; offset <= 16; offset++) {
+		item = PageGetItemId(page, offset);
+		if (!ItemIdIsNormal(item) || ItemIdGetLength(item) < SizeofHeapTupleHeader
+			|| ItemIdGetOffset(item) < header->pd_upper
+			|| (Size)ItemIdGetOffset(item) + ItemIdGetLength(item) > header->pd_special)
+			ereport(ERROR, (errmsg("heap lock probe found a non-normal tuple slot")));
+	}
+	item = PageGetItemId(page, (OffsetNumber)worker);
+	tuple.t_tableOid = RelationGetRelid(relation);
+	ItemPointerSet(&tuple.t_self, 0, (OffsetNumber)worker);
+	tuple.t_len = ItemIdGetLength(item);
+	tuple.t_data = (HeapTupleHeader)PageGetItem(page, item);
+	if (HeapTupleHeaderGetNatts(tuple.t_data) != 2 || HeapTupleHasNulls(&tuple)
+		|| tuple.t_data->t_hoff != MAXALIGN(SizeofHeapTupleHeader)
+		|| tuple.t_len != tuple.t_data->t_hoff + 16
+		|| !ItemPointerEquals(&tuple.t_self, &tuple.t_data->t_ctid))
+		ereport(ERROR, (errmsg("heap lock probe found a changed tuple shape or TID")));
+	id = heap_getattr(&tuple, 1, RelationGetDescr(relation), &isnull);
+	if (isnull || DatumGetInt32(id) != worker)
+		ereport(ERROR, (errmsg("heap lock probe worker does not match its fixed tuple slot")));
+	return tuple;
+}
+
+/* A real exclusive row lock changes xmax/ITL under the ordinary heap API.
+ * Unlike UPDATE it needs no new tuple version. The SQL client must commit
+ * each call; repeated same-transaction locks are rejected as no-ops.
+ * This measures header mutation, not the throughput of business UPDATEs. */
+Datum
+test_pgrac_micro_heap_lock_step(PG_FUNCTION_ARGS)
+{
+	int32 worker = PG_GETARG_INT32(1);
+	Relation relation;
+	TupleDesc descriptor;
+	Buffer buffer;
+	HeapTupleData before;
+	HeapTupleData after;
+	HeapTupleData locked = { 0 };
+	HeapTuple saved;
+	PageHeader header;
+	LocationIndex lower, upper, special;
+	TM_FailureData failure = { 0 };
+	TM_Result result;
+	TransactionId xid;
+	uint64 sequence;
+
+	probe_superuser();
+	if (worker < 1 || worker > 16)
+		ereport(ERROR, (errmsg("heap lock probe requires a fixed worker id from 1 to 16")));
+	relation = table_open(PG_GETARG_OID(0), RowShareLock);
+	descriptor = RelationGetDescr(relation);
+	if (relation->rd_rel->relkind != RELKIND_RELATION
+		|| relation->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| strcmp(RelationGetRelationName(relation), "micro_heap") != 0 || descriptor->natts != 2
+		|| TupleDescAttr(descriptor, 0)->attisdropped || TupleDescAttr(descriptor, 1)->attisdropped
+		|| TupleDescAttr(descriptor, 0)->atttypid != INT4OID
+		|| TupleDescAttr(descriptor, 1)->atttypid != INT8OID
+		|| RelationGetNumberOfBlocks(relation) != 1)
+		ereport(ERROR,
+				(errmsg("heap lock probe requires the existing single-block typed fixture")));
+	sequence = probe_next_operation();
+	probe_operation(relation, MAIN_FORKNUM, 0, RESOURCE_X_TRACE_OPERATION_BEGIN, sequence, worker);
+	buffer = ReadBuffer(relation, 0);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	before = heap_lock_probe_tuple(relation, buffer, worker);
+	saved = heap_copytuple(&before);
+	header = (PageHeader)BufferGetPage(buffer);
+	lower = header->pd_lower;
+	upper = header->pd_upper;
+	special = header->pd_special;
+	UnlockReleaseBuffer(buffer);
+
+	xid = GetCurrentTransactionId();
+	if (TransactionIdEquals(HeapTupleHeaderGetRawXmax(saved->t_data), xid))
+		ereport(ERROR, (errmsg("heap lock probe requires a fresh transaction for a new mutation")));
+	locked.t_self = saved->t_self;
+	result = heap_lock_tuple(relation, &locked, GetCurrentCommandId(false), LockTupleExclusive,
+							 LockWaitBlock, false, &buffer, &failure
+#ifdef USE_PGRAC_CLUSTER
+							 ,
+							 NULL, NULL
+#endif
+	);
+	if (result != TM_Ok)
+		ereport(ERROR, (errmsg("heap lock probe ordinary tuple lock failed: %d", (int)result)));
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	after = heap_lock_probe_tuple(relation, buffer, worker);
+	header = (PageHeader)BufferGetPage(buffer);
+	if (header->pd_lower != lower || header->pd_upper != upper || header->pd_special != special
+		|| after.t_len != saved->t_len || after.t_data->t_hoff != saved->t_data->t_hoff
+		|| !TransactionIdEquals(HeapTupleHeaderGetRawXmin(after.t_data),
+								HeapTupleHeaderGetRawXmin(saved->t_data))
+		|| memcmp((char *)after.t_data + after.t_data->t_hoff,
+				  (char *)saved->t_data + saved->t_data->t_hoff,
+				  saved->t_len - saved->t_data->t_hoff)
+			   != 0
+		|| !TransactionIdEquals(HeapTupleHeaderGetRawXmax(after.t_data), xid)
+		|| (after.t_data->t_infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) != 0
+		|| !HEAP_XMAX_IS_LOCKED_ONLY(after.t_data->t_infomask)
+		|| !HEAP_XMAX_IS_EXCL_LOCKED(after.t_data->t_infomask))
+		ereport(ERROR,
+				(errmsg("heap lock probe did not prove an exact fresh header-only mutation")));
+	UnlockReleaseBuffer(buffer);
+	heap_freetuple(saved);
+	probe_operation(relation, MAIN_FORKNUM, 0, RESOURCE_X_TRACE_OPERATION_DONE, sequence, 1);
+	table_close(relation, RowShareLock);
 	PG_RETURN_VOID();
 }
 
