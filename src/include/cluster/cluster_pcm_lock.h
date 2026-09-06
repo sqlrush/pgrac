@@ -1725,7 +1725,8 @@ typedef struct ResourceXSourceSettlementPlan {
 	int32 authenticated_master_node;
 	uint8 source_mode;
 	uint8 cover_action;
-	uint16 reserved;
+	uint8 authority_with_image;
+	uint8 reserved;
 	bool valid;
 } ResourceXSourceSettlementPlan;
 

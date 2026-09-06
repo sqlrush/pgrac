@@ -238,6 +238,7 @@ typedef struct ClusterPcmResourceXLocalHandoff {
 	ResourceXAssertion successor_assertion;
 	ResourceXAcquisitionRef holder_ref;
 	uint64 base_authority_generation;
+	uint64 delegated_authority_generation;
 	uint64 master_session_incarnation;
 	uint64 assertion_sequence;
 	uint64 r4_record_generation;
@@ -249,8 +250,8 @@ typedef struct ClusterPcmResourceXLocalHandoff {
 	uint8 reserved[7];
 } ClusterPcmResourceXLocalHandoff;
 
-StaticAssertDecl(sizeof(ClusterPcmResourceXLocalHandoff) == 128,
-				 "Resource-X local handoff layout must remain 128 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXLocalHandoff) == 136,
+				 "Resource-X local handoff must bind delegated authority");
 
 /* Entry-local serialization only.  This record is not canonical authority,
  * is never serialized, and cannot make a terminal cover true.  It closes the
@@ -264,8 +265,8 @@ typedef struct ClusterPcmResourceXLocalOwner {
 	uint8 reserved[7];
 } ClusterPcmResourceXLocalOwner;
 
-StaticAssertDecl(sizeof(ClusterPcmResourceXLocalOwner) == 240,
-				 "Resource-X local owner layout must remain 240 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXLocalOwner) == 248,
+				 "Resource-X local owner must bind delegated authority");
 
 
 /*
@@ -414,7 +415,7 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 1064,
+StaticAssertDecl(sizeof(struct GrdEntry) == 1072,
 				 "Stage 8 D2 GrdEntry size must include pinned binding identity");
 
 
@@ -11328,28 +11329,26 @@ pcm_resource_x_local_handoff_valid(
 	static const uint8 zero_reserved[7];
 
 	return handoff != NULL && handoff->valid == 1
-		&& resource_x_assertion_valid(&handoff->successor_assertion)
-		&& pcm_resource_x_ref_valid(&handoff->holder_ref)
-		&& BufferTagsEqual(&handoff->successor_assertion.resource,
-			&handoff->holder_ref.assertion.resource)
-		&& !resource_x_assertion_equal(&handoff->successor_assertion,
-			&handoff->holder_ref.assertion)
-		&& handoff->base_authority_generation != 0
-		&& handoff->base_authority_generation != UINT64_MAX
-		&& handoff->master_session_incarnation != 0
-		&& handoff->master_session_incarnation != UINT64_MAX
-		&& handoff->assertion_sequence != 0
-		&& handoff->assertion_sequence != UINT64_MAX
-		&& handoff->r4_record_generation != 0
-		&& handoff->r4_record_generation != UINT64_MAX
-		&& handoff->buffer_ownership_generation != 0
-		&& handoff->buffer_ownership_generation != UINT64_MAX
-		&& handoff->deadline_us != 0
-		&& handoff->deadline_us != UINT64_MAX
-		&& handoff->master_node >= 0
-		&& handoff->master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& memcmp(handoff->reserved, zero_reserved,
-			sizeof(zero_reserved)) == 0;
+		   && resource_x_assertion_valid(&handoff->successor_assertion)
+		   && pcm_resource_x_ref_valid(&handoff->holder_ref)
+		   && BufferTagsEqual(&handoff->successor_assertion.resource,
+							  &handoff->holder_ref.assertion.resource)
+		   && !resource_x_assertion_equal(&handoff->successor_assertion,
+										  &handoff->holder_ref.assertion)
+		   && handoff->base_authority_generation != 0
+		   && handoff->base_authority_generation != UINT64_MAX
+		   && (handoff->delegated_authority_generation == 0
+			   || (handoff->delegated_authority_generation > handoff->base_authority_generation
+				   && handoff->delegated_authority_generation != UINT64_MAX))
+		   && handoff->master_session_incarnation != 0
+		   && handoff->master_session_incarnation != UINT64_MAX && handoff->assertion_sequence != 0
+		   && handoff->assertion_sequence != UINT64_MAX && handoff->r4_record_generation != 0
+		   && handoff->r4_record_generation != UINT64_MAX
+		   && handoff->buffer_ownership_generation != 0
+		   && handoff->buffer_ownership_generation != UINT64_MAX && handoff->deadline_us != 0
+		   && handoff->deadline_us != UINT64_MAX && handoff->master_node >= 0
+		   && handoff->master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && memcmp(handoff->reserved, zero_reserved, sizeof(zero_reserved)) == 0;
 }
 
 static bool
@@ -11527,23 +11526,26 @@ pcm_resource_x_local_handoff_successor_exact(
 	int32 authenticated_master_node, uint64 r4_record_generation,
 	uint64 cached_ownership_generation)
 {
-	return pcm_resource_x_local_handoff_valid(handoff)
-		&& successor_block != NULL
-		&& resource_x_assertion_equal(&handoff->successor_assertion,
-			&successor_block->common.logical_assertion)
-		&& handoff->base_authority_generation
-			== successor_block->common.base_authority_generation
-		&& handoff->holder_ref.formation
-			== successor_block->common.resource_formation
-		&& handoff->master_session_incarnation
-			== successor_block->common.master_session_incarnation
-		&& handoff->assertion_sequence
-			== successor_block->common.assertion_sequence
-		&& handoff->r4_record_generation == r4_record_generation
-		&& handoff->buffer_ownership_generation
-			== cached_ownership_generation
-		&& handoff->master_node == authenticated_master_node
-		&& handoff->ordered_lane == successor_block->common.ordered_lane;
+	return pcm_resource_x_local_handoff_valid(handoff) && successor_block != NULL
+		   && resource_x_assertion_equal(&handoff->successor_assertion,
+										 &successor_block->common.logical_assertion)
+		   && handoff->base_authority_generation
+				  == successor_block->common.base_authority_generation
+		   && (handoff->delegated_authority_generation != 0
+				   ? (successor_block->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+					  && successor_block->common.authority_generation
+							 == handoff->delegated_authority_generation)
+				   : (successor_block->common.flags == 0
+					  && successor_block->common.authority_generation
+							 == handoff->base_authority_generation))
+		   && handoff->holder_ref.formation == successor_block->common.resource_formation
+		   && handoff->master_session_incarnation
+				  == successor_block->common.master_session_incarnation
+		   && handoff->assertion_sequence == successor_block->common.assertion_sequence
+		   && handoff->r4_record_generation == r4_record_generation
+		   && handoff->buffer_ownership_generation == cached_ownership_generation
+		   && handoff->master_node == authenticated_master_node
+		   && handoff->ordered_lane == successor_block->common.ordered_lane;
 }
 
 static ResourceXApplyResult
@@ -11570,6 +11572,10 @@ pcm_resource_x_local_handoff_build_locked(
 	handoff->holder_ref = round->terminal_ref;
 	handoff->base_authority_generation
 		= successor_block->common.base_authority_generation;
+	handoff->delegated_authority_generation
+		= successor_block->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+			  ? successor_block->common.authority_generation
+			  : 0;
 	handoff->master_session_incarnation
 		= successor_block->common.master_session_incarnation;
 	handoff->assertion_sequence
@@ -14108,38 +14114,37 @@ pcm_resource_x_terminal_x_lineage_args_valid(
 	int32 authenticated_master_node, uint64 r4_record_generation,
 	uint64 cached_ownership_generation)
 {
-	return successor_block != NULL
-		&& successor_block->kind == RESOURCE_X_WIRE_BLOCK_TO_N
-		&& successor_block->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
-		&& !successor_block->blocked_has_remote_proof
-		&& resource_x_assertion_valid(
-			&successor_block->common.logical_assertion)
-		&& authenticated_master_node >= 0
-		&& authenticated_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& cluster_node_id >= 0
-		&& cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& successor_block->common.action_node == cluster_node_id
-		&& successor_block->common.base_authority_generation != 0
-		&& successor_block->common.base_authority_generation != UINT64_MAX
-		&& successor_block->common.authority_generation
-			== successor_block->common.base_authority_generation
-		&& successor_block->common.resource_formation != 0
-		&& successor_block->common.resource_formation != UINT64_MAX
-		&& successor_block->common.master_session_incarnation != 0
-		&& successor_block->common.master_session_incarnation != UINT64_MAX
-		&& successor_block->common.assertion_sequence != 0
-		&& successor_block->common.assertion_sequence != UINT64_MAX
-		&& successor_block->common.sender_connection_generation != 0
-		&& successor_block->common.observed_mode == (uint8)PCM_STATE_X
-		&& successor_block->common.target_mode == (uint8)PCM_STATE_N
-		&& successor_block->common.source_candidate == 1
-		&& successor_block->common.retain_pi_if_dirty == 1
-		&& successor_block->common.outcome == RESOURCE_X_OUTCOME_NONE
-		&& successor_block->common.flags == 0
-		&& r4_record_generation != 0
-		&& r4_record_generation != UINT64_MAX
-		&& cached_ownership_generation != 0
-		&& cached_ownership_generation != UINT64_MAX;
+	return successor_block != NULL && successor_block->kind == RESOURCE_X_WIRE_BLOCK_TO_N
+		   && successor_block->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+		   && !successor_block->blocked_has_remote_proof
+		   && resource_x_assertion_valid(&successor_block->common.logical_assertion)
+		   && authenticated_master_node >= 0
+		   && authenticated_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT && cluster_node_id >= 0
+		   && cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && successor_block->common.action_node == cluster_node_id
+		   && successor_block->common.base_authority_generation != 0
+		   && successor_block->common.base_authority_generation != UINT64_MAX
+		   && (successor_block->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+				   ? (successor_block->common.authority_generation
+						  > successor_block->common.base_authority_generation
+					  && successor_block->common.authority_generation != UINT64_MAX)
+				   : (successor_block->common.flags == 0
+					  && successor_block->common.authority_generation
+							 == successor_block->common.base_authority_generation))
+		   && successor_block->common.resource_formation != 0
+		   && successor_block->common.resource_formation != UINT64_MAX
+		   && successor_block->common.master_session_incarnation != 0
+		   && successor_block->common.master_session_incarnation != UINT64_MAX
+		   && successor_block->common.assertion_sequence != 0
+		   && successor_block->common.assertion_sequence != UINT64_MAX
+		   && successor_block->common.sender_connection_generation != 0
+		   && successor_block->common.observed_mode == (uint8)PCM_STATE_X
+		   && successor_block->common.target_mode == (uint8)PCM_STATE_N
+		   && successor_block->common.source_candidate == 1
+		   && successor_block->common.retain_pi_if_dirty == 1
+		   && successor_block->common.outcome == RESOURCE_X_OUTCOME_NONE
+		   && r4_record_generation != 0 && r4_record_generation != UINT64_MAX
+		   && cached_ownership_generation != 0 && cached_ownership_generation != UINT64_MAX;
 }
 
 static bool
@@ -14804,16 +14809,16 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
 	entry = entry_ref.entry;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	matches = pcm_resource_x_local_owner_valid_locked(
-			&entry->resource_x_local_owner)
-		&& entry->resource_x_local_owner.state
-			== RESOURCE_X_LOCAL_OWNER_REVOKING
-		&& pcm_resource_x_local_owner_handle_equal(
-			&entry->resource_x_local_owner.handle, handle)
-		&& pcm_resource_x_terminal_x_lineage_locked(
-			entry, round, successor_block, authenticated_master_node,
-			r4_record_generation, cached_ownership_generation, false,
-			lineage_out);
+	matches
+		= pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+		  && entry->resource_x_local_owner.state == RESOURCE_X_LOCAL_OWNER_REVOKING
+		  && pcm_resource_x_local_owner_handle_equal(&entry->resource_x_local_owner.handle, handle)
+		  && pcm_resource_x_local_handoff_successor_exact(
+			  &entry->resource_x_local_owner.handoff, successor_block, authenticated_master_node,
+			  r4_record_generation, cached_ownership_generation)
+		  && pcm_resource_x_terminal_x_lineage_locked(
+			  entry, round, successor_block, authenticated_master_node, r4_record_generation,
+			  cached_ownership_generation, false, lineage_out);
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return matches;
@@ -19173,39 +19178,33 @@ pcm_resource_x_source_settlement_matches_pair(
 
 	if (settlement == NULL || status == NULL || image == NULL
 		|| settlement->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
-		|| !settlement->blocked_has_remote_proof
-		|| status->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
-		|| !status->blocked_has_remote_proof
-		|| image->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
-		|| !resource_x_assertion_equal(
-			&settlement->common.logical_assertion,
-			&status->common.logical_assertion)
-		|| !resource_x_assertion_equal(
-			&settlement->common.logical_assertion,
-			&image->common.logical_assertion)
-		|| settlement->common.base_authority_generation
-			!= status->common.base_authority_generation
-		|| settlement->common.resource_formation
-			!= status->common.resource_formation
+		|| !settlement->blocked_has_remote_proof || status->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+		|| !status->blocked_has_remote_proof || image->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| !resource_x_assertion_equal(&settlement->common.logical_assertion,
+									   &status->common.logical_assertion)
+		|| !resource_x_assertion_equal(&settlement->common.logical_assertion,
+									   &image->common.logical_assertion)
+		|| settlement->common.base_authority_generation != status->common.base_authority_generation
+		|| settlement->common.resource_formation != status->common.resource_formation
 		|| settlement->common.master_session_incarnation
-			!= status->common.master_session_incarnation
-		|| settlement->common.assertion_sequence
-			!= status->common.assertion_sequence
-		|| settlement->common.ordered_lane != 0
-		|| status->common.ordered_lane != 0
+			   != status->common.master_session_incarnation
+		|| settlement->common.assertion_sequence != status->common.assertion_sequence
+		|| settlement->common.ordered_lane != 0 || status->common.ordered_lane != 0
 		|| image->common.ordered_lane != 0
 		|| settlement->common.action_node != status->common.action_node
 		|| settlement->common.observed_mode != (uint8)PCM_STATE_N
 		|| settlement->common.target_mode != (uint8)PCM_STATE_N
-		|| settlement->common.source_candidate != 1
-		|| settlement->common.retain_pi_if_dirty != 1
+		|| settlement->common.source_candidate != 1 || settlement->common.retain_pi_if_dirty != 1
 		|| settlement->common.sender_connection_generation == 0
-		|| settlement->common.outcome != RESOURCE_X_OUTCOME_NONE
-		|| settlement->common.flags != 0
+		|| settlement->common.outcome != RESOURCE_X_OUTCOME_NONE || settlement->common.flags != 0
 		|| image->common.authority_generation == UINT64_MAX
 		|| settlement->common.authority_generation == UINT64_MAX
-		|| settlement->common.authority_generation
-			<= image->common.authority_generation)
+		|| (image->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+				? (image->common.authority_generation <= image->common.base_authority_generation
+				   || settlement->common.authority_generation != image->common.authority_generation)
+				: (image->common.flags != 0
+				   || settlement->common.authority_generation
+						  <= image->common.authority_generation)))
 		return false;
 	left = &settlement->body.blocked_to_n;
 	right = &status->body.blocked_to_n;
@@ -19247,38 +19246,29 @@ pcm_resource_x_source_settlement_plan_valid(
 {
 	ResourceXAcquisitionRef empty_ref;
 
-	if (plan == NULL || !plan->valid || plan->reserved != 0
-		|| !resource_x_assertion_valid(&plan->assertion)
-		|| plan->resource_formation == 0
-		|| plan->resource_formation == UINT64_MAX
-		|| plan->master_session_incarnation == 0
-		|| plan->master_session_incarnation == UINT64_MAX
-		|| plan->assertion_sequence == 0
-		|| plan->assertion_sequence == UINT64_MAX
-		|| plan->pair_base_authority_generation == 0
+	if (plan == NULL || !plan->valid || plan->reserved != 0 || plan->authority_with_image > 1
+		|| !resource_x_assertion_valid(&plan->assertion) || plan->resource_formation == 0
+		|| plan->resource_formation == UINT64_MAX || plan->master_session_incarnation == 0
+		|| plan->master_session_incarnation == UINT64_MAX || plan->assertion_sequence == 0
+		|| plan->assertion_sequence == UINT64_MAX || plan->pair_base_authority_generation == 0
 		|| plan->pair_base_authority_generation == UINT64_MAX
 		|| plan->pair_image_authority_generation == 0
 		|| plan->pair_image_authority_generation == UINT64_MAX
 		|| plan->settlement_authority_generation == 0
 		|| plan->settlement_authority_generation == UINT64_MAX
-		|| plan->settlement_authority_generation
-			<= plan->pair_image_authority_generation
-		|| plan->source_generation == 0
-		|| plan->source_generation == UINT64_MAX
-		|| plan->carrier_generation == 0
-		|| plan->carrier_generation == UINT64_MAX
+		|| plan->pair_image_authority_generation <= plan->pair_base_authority_generation
+		|| (plan->authority_with_image
+				? plan->settlement_authority_generation != plan->pair_image_authority_generation
+				: plan->settlement_authority_generation <= plan->pair_image_authority_generation)
+		|| plan->source_generation == 0 || plan->source_generation == UINT64_MAX
+		|| plan->carrier_generation == 0 || plan->carrier_generation == UINT64_MAX
 		|| plan->carrier_generation != plan->source_generation + 1
-		|| plan->status_semantic_crc32c == 0
-		|| plan->image_semantic_crc32c == 0
+		|| plan->status_semantic_crc32c == 0 || plan->image_semantic_crc32c == 0
 		|| plan->authenticated_master_node < 0
-		|| plan->authenticated_master_node
-			>= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| (plan->source_mode != (uint8)PCM_STATE_X
-			&& plan->source_mode != (uint8)PCM_STATE_S)
-		|| (plan->cover_action
-			!= RESOURCE_X_SETTLEMENT_COVER_NO_COVER
-			&& plan->cover_action
-				!= RESOURCE_X_SETTLEMENT_COVER_CLOSE_EXACT_X))
+		|| plan->authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| (plan->source_mode != (uint8)PCM_STATE_X && plan->source_mode != (uint8)PCM_STATE_S)
+		|| (plan->cover_action != RESOURCE_X_SETTLEMENT_COVER_NO_COVER
+			&& plan->cover_action != RESOURCE_X_SETTLEMENT_COVER_CLOSE_EXACT_X))
 		return false;
 	memset(&empty_ref, 0, sizeof(empty_ref));
 	if (plan->cover_action == RESOURCE_X_SETTLEMENT_COVER_NO_COVER)
@@ -19305,23 +19295,18 @@ pcm_resource_x_source_settlement_plan_equal(
 		|| !pcm_resource_x_source_settlement_plan_valid(right)
 		|| !resource_x_assertion_equal(&left->assertion, &right->assertion)
 		|| left->resource_formation != right->resource_formation
-		|| left->master_session_incarnation
-			!= right->master_session_incarnation
+		|| left->master_session_incarnation != right->master_session_incarnation
 		|| left->assertion_sequence != right->assertion_sequence
-		|| left->pair_base_authority_generation
-			!= right->pair_base_authority_generation
-		|| left->pair_image_authority_generation
-			!= right->pair_image_authority_generation
-		|| left->settlement_authority_generation
-			!= right->settlement_authority_generation
+		|| left->pair_base_authority_generation != right->pair_base_authority_generation
+		|| left->pair_image_authority_generation != right->pair_image_authority_generation
+		|| left->settlement_authority_generation != right->settlement_authority_generation
+		|| left->authority_with_image != right->authority_with_image
 		|| left->source_generation != right->source_generation
 		|| left->carrier_generation != right->carrier_generation
 		|| left->status_semantic_crc32c != right->status_semantic_crc32c
 		|| left->image_semantic_crc32c != right->image_semantic_crc32c
-		|| left->authenticated_master_node
-			!= right->authenticated_master_node
-		|| left->source_mode != right->source_mode
-		|| left->cover_action != right->cover_action)
+		|| left->authenticated_master_node != right->authenticated_master_node
+		|| left->source_mode != right->source_mode || left->cover_action != right->cover_action)
 		return false;
 	if (left->cover_action == RESOURCE_X_SETTLEMENT_COVER_NO_COVER)
 		return true;
@@ -19442,6 +19427,8 @@ pcm_resource_x_source_settlement_plan_build_locked(
 		= image->common.authority_generation;
 	candidate.settlement_authority_generation
 		= settlement->common.authority_generation;
+	candidate.authority_with_image
+		= image->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
 	candidate.source_generation = source_generation;
 	candidate.carrier_generation = carrier_generation;
 	candidate.status_semantic_crc32c = status->common.semantic_crc32c;
