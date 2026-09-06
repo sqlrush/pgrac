@@ -763,7 +763,8 @@ StaticAssertDecl(sizeof(ResourceXMasterSnapshot) == 96,
 #define RESOURCE_X_REQUESTER_JOIN_HAS_GRANT UINT32_C(0x00000002)
 #define RESOURCE_X_REQUESTER_JOIN_READY UINT32_C(0x00000004)
 #define RESOURCE_X_REQUESTER_JOIN_TERMINAL UINT32_C(0x00000008)
-#define RESOURCE_X_REQUESTER_JOIN_KNOWN_MASK UINT32_C(0x0000000f)
+#define RESOURCE_X_REQUESTER_JOIN_AUTHORITY_WITH_IMAGE UINT32_C(0x00000010)
+#define RESOURCE_X_REQUESTER_JOIN_KNOWN_MASK UINT32_C(0x0000001f)
 
 /* Requester-local retained view of the two independent type-15 halves.
  * Connection-generation freshness is validated by ingress but is not part
@@ -780,14 +781,17 @@ typedef struct ResourceXRequesterJoinSnapshot {
 	uint64 t_image_us;
 	uint64 t_grant_us;
 	uint64 t_install_us;
+	/* Actual accepted authority event; t_grant_us stays zero for a delegated
+	 * image. grant_source_node names its authority master, not packet source. */
+	uint64 t_authority_us;
 	int32 grant_source_node;
 	int32 image_source_node;
 	uint32 flags;
 	uint32 reserved;
 } ResourceXRequesterJoinSnapshot;
 
-StaticAssertDecl(sizeof(ResourceXRequesterJoinSnapshot) == 120,
-				 "ResourceXRequesterJoinSnapshot layout must remain 120 bytes");
+StaticAssertDecl(sizeof(ResourceXRequesterJoinSnapshot) == 128,
+				 "ResourceXRequesterJoinSnapshot layout must remain 128 bytes");
 
 /* Requester-local ordinary Resource-X observation cohort.  These are
  * postmaster-incarnation readings, not Recovery Foundation proof. */

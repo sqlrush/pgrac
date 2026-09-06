@@ -354,6 +354,8 @@ resource_x_common_valid(ResourceXWireKind kind,
 			&& common->source_candidate
 				== common->retain_pi_if_dirty;
 
+		allowed_flags = RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
+
 		if (common->target_mode != (uint8)PCM_STATE_N
 			|| (!direct_x_source && !shared_s_holder)) {
 			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
@@ -402,6 +404,7 @@ resource_x_common_valid(ResourceXWireKind kind,
 			return false;
 		}
 	} else if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
+		allowed_flags = RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
 		if (common->source_candidate != 0
 			|| common->retain_pi_if_dirty != 0
 			|| common->target_mode != (uint8)PCM_STATE_X
@@ -413,6 +416,26 @@ resource_x_common_valid(ResourceXWireKind kind,
 	if ((common->flags & ~allowed_flags) != 0) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_FLAGS);
 		return false;
+	}
+	if ((common->flags & RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE) != 0) {
+		bool selected_block = kind == RESOURCE_X_WIRE_BLOCK_TO_N && common->source_candidate == 1
+							  && common->retain_pi_if_dirty == 1
+							  && common->action_node != common->logical_assertion.requester_node;
+		bool target_image = kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+							&& common->action_node == common->logical_assertion.requester_node
+							&& common->outcome == RESOURCE_X_OUTCOME_OK;
+
+		if ((!selected_block && !target_image)
+			|| (common->observed_mode != (uint8)PCM_STATE_X
+				&& common->observed_mode != (uint8)PCM_STATE_S)) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
+			return false;
+		}
+		if (common->authority_generation <= common->base_authority_generation
+			|| common->authority_generation == UINT64_MAX) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_GENERATION);
+			return false;
+		}
 	}
 	return true;
 }

@@ -9364,9 +9364,11 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	image->common.sender_connection_generation
 		= requester_connection_generation;
 	image->common.outcome = RESOURCE_X_OUTCOME_OK;
-	image->common.flags = 0;
+	image->common.flags = block->common.flags;
 	image->common.authority_generation
-		= block->common.base_authority_generation + 1;
+		= (block->common.flags & RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE) != 0
+			  ? block->common.authority_generation
+			  : block->common.base_authority_generation + 1;
 	image_body = &image->body.image_envelope;
 	gcs_block_resource_x_put_u64(image_body->request_tail,
 		(uint64)requester_connection_generation);
@@ -12617,17 +12619,20 @@ gcs_block_resource_x_requester_terminal_try(
 	memset(&terminal_ref, 0, sizeof(terminal_ref));
 	PG_TRY();
 	{
-		if (gcs_block_resource_x_target_peer_matches_exact(
-				&admission, source_node,
-				authenticated_connection_generation)
-			&& gcs_block_resource_x_gate_session_snapshot(
-				&frame->common.logical_assertion.resource, &gate,
-				&master_node, &master_session)
-			&& master_node == source_node
-			&& gate.formation
-				== frame->common.resource_formation
-			&& master_session
-				== frame->common.master_session_incarnation
+		if (gcs_block_resource_x_target_peer_matches_exact(&admission, source_node,
+														   authenticated_connection_generation)
+			&& gcs_block_resource_x_gate_session_snapshot(&frame->common.logical_assertion.resource,
+														  &gate, &master_node, &master_session)
+			/* Ingress has already admitted the exact READY join.  A delegated
+			 * image arrives from its authenticated physical source, not
+			 * necessarily the authority master.  join_terminal_try rereads the
+			 * retained proof/ref before T1/T2/T3; both peer and master/session
+			 * fences below and after installation remain mandatory. */
+			&& (master_node == source_node
+				|| (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+					&& frame->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE))
+			&& gate.formation == frame->common.resource_formation
+			&& master_session == frame->common.master_session_incarnation
 			&& cluster_semantic_activation_recheck(&admission)) {
 			result = gcs_block_pcm_x_resource_x_join_terminal_try(
 				&frame->common.logical_assertion, scheduled_retry,
@@ -12973,30 +12978,13 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INSTALL_SETTLEMENT,
 				(int)result))
 			ereport(LOG,
-				(errmsg_internal("Resource-X install settlement diagnostic"),
-				 errdetail("source=%u requester=%d attempt=%llu result=%d "
-						   "phase=%u lane=%u final=%llu",
-						   env->source_node_id,
-						   frame.common.logical_assertion.requester_node,
-						   (unsigned long long)
-							frame.common.assertion_sequence,
-						   (int)result, (unsigned)snapshot.phase,
-						   (unsigned)frame.common.ordered_lane,
-						   (unsigned long long)
-							frame.common.authority_generation)));
-		if ((result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE)
-			&& snapshot.phase == RESOURCE_X_MASTER_SETTLED) {
-			ResourceXApplyResult retire_result;
-
-			retire_result
-				= cluster_pcm_lock_resource_x_settled_retire_exact(
-					&frame.common.logical_assertion,
-					snapshot.assertion_sequence, &snapshot);
-			if (retire_result != RESOURCE_X_APPLY_APPLIED
-				&& retire_result != RESOURCE_X_APPLY_DUPLICATE)
-				gcs_block_resource_x_fail_closed_current();
-		}
+					(errmsg_internal("Resource-X install settlement diagnostic"),
+					 errdetail("source=%u requester=%d attempt=%llu result=%d "
+							   "phase=%u lane=%u final=%llu",
+							   env->source_node_id, frame.common.logical_assertion.requester_node,
+							   (unsigned long long)frame.common.assertion_sequence, (int)result,
+							   (unsigned)snapshot.phase, (unsigned)frame.common.ordered_lane,
+							   (unsigned long long)frame.common.authority_generation)));
 		break;
 	}
 	case RESOURCE_X_WIRE_RELEASE_X:
@@ -13015,6 +13003,21 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 				result == RESOURCE_X_APPLY_DUPLICATE);
 		}
 		break;
+	}
+	/* The second leg may be the source proof or the install notification.
+	 * Both close the identical retained master request exactly once. */
+	if ((frame.kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+		 || frame.kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
+		&& (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		&& snapshot.phase == RESOURCE_X_MASTER_SETTLED) {
+		ResourceXApplyResult retire_result = cluster_pcm_lock_resource_x_settled_retire_exact(
+			&frame.common.logical_assertion, snapshot.assertion_sequence, &snapshot);
+
+		if (retire_result != RESOURCE_X_APPLY_APPLIED
+			&& retire_result != RESOURCE_X_APPLY_DUPLICATE) {
+			gcs_block_resource_x_fail_closed_current();
+			result = retire_result;
+		}
 	}
 	/* Bootstrap owns its own typed action; the local sentinel is not its result. */
 	if (frame.kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)

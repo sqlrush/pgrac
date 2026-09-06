@@ -898,6 +898,90 @@ UT_TEST(test_image_envelope_round_trip_preserves_exact_page)
 		frame.body.image_envelope.page_bytes, RESOURCE_X_PAGE_BYTES) == 0);
 }
 
+UT_TEST(test_delegated_block_and_image_keep_exact_wire_layout)
+{
+	ResourceXWireKind kinds[] = { RESOURCE_X_WIRE_BLOCK_TO_N, RESOURCE_X_WIRE_IMAGE_ENVELOPE };
+	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	Size i;
+
+	for (i = 0; i < lengthof(kinds); i++) {
+		ResourceXDecodedFrame frame = kinds[i] == RESOURCE_X_WIRE_BLOCK_TO_N
+										  ? make_control_frame(kinds[i])
+										  : make_typed_frame(kinds[i]);
+		ResourceXDecodedFrame decoded = { 0 };
+		ResourceXWireReject reject;
+		uint16 len = 0;
+		uint8 msg = kinds[i] == RESOURCE_X_WIRE_BLOCK_TO_N ? RESOURCE_X_MSG_BLOCK_TO_N
+														   : RESOURCE_X_MSG_IMAGE_OR_GRANT;
+
+		frame.common.flags = UINT8_C(0x04);
+		frame.common.observed_mode = PCM_STATE_X;
+		if (i != 0)
+			frame.common.action_node = frame.common.logical_assertion.requester_node;
+		frame.common.authority_generation = frame.common.base_authority_generation + 2;
+		UT_ASSERT(cluster_resource_x_wire_encode(msg, &frame, bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT_EQ(len, i == 0 ? RESOURCE_X_CONTROL_V1_BYTES : RESOURCE_X_IMAGE_V1_BYTES);
+		UT_ASSERT(cluster_resource_x_wire_decode(msg, bytes, len, &decoded, &reject));
+		UT_ASSERT_EQ(decoded.common.flags, UINT8_C(0x04));
+		UT_ASSERT_EQ(decoded.common.authority_generation, frame.common.authority_generation);
+		/* A selected SCUR source is also legal, after the master barrier. */
+		frame.common.observed_mode = PCM_STATE_S;
+		UT_ASSERT(cluster_resource_x_wire_encode(msg, &frame, bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(msg, bytes, len, &decoded, &reject));
+		UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
+	}
+}
+
+UT_TEST(test_delegation_flag_never_grants_other_kind_or_nonsource)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint16 len;
+
+	frame = make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	frame.common.flags = UINT8_C(0x04);
+	frame.common.observed_mode = PCM_STATE_S;
+	frame.common.source_candidate = frame.common.retain_pi_if_dirty = 0;
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
+	frame = make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	frame.common.flags |= UINT8_C(0x04);
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
+	frame = make_typed_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT);
+	frame.common.flags = UINT8_C(0x04);
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
+}
+
+UT_TEST(test_delegation_generations_rejected_even_with_valid_crc)
+{
+	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint16 len;
+	uint64 finals[] = { 0, frame.common.base_authority_generation, UINT64_MAX };
+	Size i;
+
+	frame.common.flags = UINT8_C(0x04);
+	frame.common.observed_mode = PCM_STATE_X;
+	frame.common.action_node = frame.common.logical_assertion.requester_node;
+	for (i = 0; i < lengthof(finals); i++) {
+		frame.common.authority_generation = finals[i];
+		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+												  sizeof(bytes), &len, &reject));
+	}
+	frame.common.authority_generation = frame.common.base_authority_generation + 2;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											 sizeof(bytes), &len, &reject));
+	memcpy(bytes + 88, bytes + 32, 8); /* valid CRC, F == B is still no delegation */
+	test_reseal(bytes, len);
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
+}
+
 UT_TEST(test_typed_body_validation_is_fail_closed)
 {
 	ResourceXDecodedFrame frame;
@@ -1079,6 +1163,9 @@ main(void)
 	UT_RUN(test_short_typed_frames_round_trip);
 	UT_RUN(test_proof_typed_frames_round_trip);
 	UT_RUN(test_image_envelope_round_trip_preserves_exact_page);
+	UT_RUN(test_delegated_block_and_image_keep_exact_wire_layout);
+	UT_RUN(test_delegation_flag_never_grants_other_kind_or_nonsource);
+	UT_RUN(test_delegation_generations_rejected_even_with_valid_crc);
 	UT_RUN(test_typed_body_validation_is_fail_closed);
 	UT_RUN(test_ingress_semantic_mutations_with_valid_crc_are_rejected);
 	UT_RUN(test_resource_x_capability_has_complete_collision_census);

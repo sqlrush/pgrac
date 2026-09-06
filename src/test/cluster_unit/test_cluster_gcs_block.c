@@ -3571,8 +3571,8 @@ UT_TEST(test_resource_x_native_settlement_has_no_legacy_locator_cleanup)
 	if (source == NULL)
 		return;
 	ingress = strstr(source, "case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:");
-	ingress_end = ingress != NULL
-		? strstr(ingress, "case RESOURCE_X_WIRE_RELEASE_X:") : NULL;
+	ingress_end
+		= ingress != NULL ? strstr(ingress, "/* Bootstrap owns its own typed action;") : NULL;
 	UT_ASSERT_NOT_NULL(ingress);
 	UT_ASSERT_NOT_NULL(ingress_end);
 	if (ingress != NULL && ingress_end != NULL) {
@@ -3582,6 +3582,9 @@ UT_TEST(test_resource_x_native_settlement_has_no_legacy_locator_cleanup)
 			"cluster_pcm_lock_resource_x_settled_retire_exact(");
 		UT_ASSERT_NULL(legacy_cleanup);
 		UT_ASSERT_NOT_NULL(resource_x_retire);
+		/* The common tail also retires when proof is the second leg. */
+		UT_ASSERT(strstr(ingress, "frame.kind == RESOURCE_X_WIRE_BLOCKED_TO_N")
+				  < resource_x_retire);
 		if (resource_x_retire != NULL)
 			UT_ASSERT(resource_x_retire < ingress_end);
 	}

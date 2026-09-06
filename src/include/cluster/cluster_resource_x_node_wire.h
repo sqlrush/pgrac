@@ -64,6 +64,9 @@ typedef enum ResourceXSourceProofKind
 
 #define RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED UINT8_C(0x01)
 #define RESOURCE_X_COMMON_FLAG_REMOTE_IMAGE_REQUIRED UINT8_C(0x02)
+/* An exact master-directed source transfers X permission with the image.
+ * Valid only on a selected-source BLOCK_TO_N and its IMAGE_ENVELOPE. */
+#define RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE UINT8_C(0x04)
 
 typedef enum ResourceXWireOutcome
 {
