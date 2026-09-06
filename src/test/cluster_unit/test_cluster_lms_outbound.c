@@ -129,11 +129,23 @@ static int ut_resource_x_complete_count = 0;
 static ResourceXIntentProbeResult ut_resource_x_probe_mode
 	= RESOURCE_X_INTENT_PROBE_IDLE;
 static int ut_resource_x_probe_call_count = 0;
+static int ut_resource_x_delivery_tick_count = 0;
 static uint32 ut_resource_x_probe_max_budget = 0;
 static int ut_resource_x_rebind_count = 0;
 static uint32 ut_resource_x_rebind_generation = 0;
 static int ut_resource_x_decode_count = 0;
 static uint32 ut_resource_x_decode_sender_generation = 0;
+
+void
+cluster_pcm_lock_resource_x_trace_wire(uint8 type, int32 peer, const void *payload, uint32 length,
+									   int32 result)
+{
+	(void)type;
+	(void)peer;
+	(void)payload;
+	(void)length;
+	(void)result;
+}
 
 bool
 cluster_resource_x_wire_decode(
@@ -282,6 +294,35 @@ cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 		return RESOURCE_X_INTENT_PROBE_FOUND;
 	}
 	return ut_resource_x_probe_mode;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref)
+{
+	UT_ASSERT_EQ(ref->formation, UINT64_C(17));
+	UT_ASSERT_EQ(ref->acquisition_generation, UINT64_C(41));
+	ut_resource_x_delivery_tick_count++;
+	return RESOURCE_X_APPLY_BAD_STATE; /* BUSY does not self-wake or fake send. */
+}
+
+ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
+													  ResourceXIntentSlot *slot_out,
+													  void *payload_out, uint16 payload_capacity,
+													  uint32 *examined_out,
+													  ResourceXAcquisitionRef *delivery_out)
+{
+	ResourceXIntentProbeResult result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+		probe_budget, slot_out, payload_out, payload_capacity, examined_out);
+
+	memset(delivery_out, 0, sizeof(*delivery_out));
+	if (result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
+		delivery_out->formation = 17;
+		delivery_out->acquisition_generation = 41;
+		*examined_out = 1;
+		ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
+	}
+	return result;
 }
 
 ResourceXApplyResult
@@ -1408,6 +1449,21 @@ UT_TEST(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes)
 	UT_ASSERT_EQ(ut_wakeup_count, 1);
 }
 
+UT_TEST(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_spin)
+{
+	ut_reset_log();
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_DELIVERY;
+	ut_resource_x_delivery_tick_count = 0;
+	ut_wakeup_count = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_delivery_tick_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 2);
+	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_resource_x_stage_count, 0);
+	UT_ASSERT_EQ(ut_wakeup_count, 0);
+}
+
 UT_TEST(test_resource_x_type14_assert_and_local_proof_share_one_data_fifo)
 {
 	uint8 assertion[RESOURCE_X_CONTROL_V1_BYTES] = { 0xA1 };
@@ -1637,6 +1693,7 @@ main(void)
 	UT_RUN(test_resource_x_intent_pump_stages_found_owner_on_tag_shard);
 	UT_RUN(test_resource_x_intent_pump_not_admitted_preserves_owner);
 	UT_RUN(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes);
+	UT_RUN(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_spin);
 	UT_RUN(test_resource_x_type14_assert_and_local_proof_share_one_data_fifo);
 	UT_RUN(test_resource_x_remote_s_status_is_pending_then_exact_ready);
 	UT_RUN(test_resource_x_remote_s_pending_can_cancel_without_send);

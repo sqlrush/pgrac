@@ -2430,15 +2430,23 @@ test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	mv $@.tmp $@
 
 test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	awk '/^cluster_pcm_own_bump_failure\(/ { print "static ClusterPcmOwnResult"; emit=1; bump_failure++ } \
+	     /^cluster_pcm_own_bump_locked\(/ { print "static inline ClusterPcmOwnResult"; emit=1; bump++ } \
+	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; evict++ } \
+	     /^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
 	     /^cluster_bufmgr_pcm_direct_init_known_new_locked\(/ { print "static bool"; emit=1; known_new++ } \
 	     /^cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact\(/ { print "static ResourceXBufferActivationResult"; emit=1; sidecar++ } \
 	     /^cluster_bufmgr_pcm_own_activate_x_by_tag\(/ { print "ResourceXBufferActivationResult"; emit=1; activate++ } \
 	     /^cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact\(/ { print "ResourceXBufferActivationResult"; emit=1; clear++ } \
 	     /^cluster_bufmgr_pcm_own_copy_source_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; copy++ } \
 	     /^cluster_bufmgr_pcm_own_finish_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; finish++ } \
+	     /^cluster_bufmgr_pcm_own_delivery_hold_begin_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_begin++ } \
+	     /^cluster_bufmgr_pcm_own_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; normal_reserve++ } \
+	     /^cluster_bufmgr_pcm_own_delivery_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_reserve++ } \
+	     /^cluster_bufmgr_pcm_own_delivery_snapshot_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_snapshot++ } \
+	     /^cluster_bufmgr_pcm_own_delivery_hold_release_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_release++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (shape != 1 || known_new != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1) exit 1 }' $< > $@.tmp
+	     END { if (bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2722,19 +2730,24 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # fixture doubles; the master/source decision and call sequence are product C.
 test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
+	     /^gcs_block_resource_x_delivery_finish_exact\(/ { print "static ResourceXApplyResult"; emit=1; finish++ } \
+	     /^gcs_block_resource_x_delivery_run_exact\(/ { print "static ResourceXApplyResult"; emit=1; run++ } \
+	     /^cluster_gcs_block_resource_x_delivery_tick\(/ { print "ResourceXApplyResult"; emit=1; tick++ } \
+	     /^gcs_block_resource_x_cleanup_frame_exact\(/ { print "static ResourceXApplyResult"; emit=1; cleanup++ } \
 	     /^gcs_block_resource_x_kind9_ingress\(/ { print "static void"; emit=1; admission++ } \
 	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; join++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (owner != 1 || admission != 1 || join != 1) exit 1 }' $< > $@.tmp
+	     END { if (owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingress.c \
 		unit_test.h test_cluster_resource_x_terminal_owner.inc \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.33 D13: test_cluster_gcs_block verifies GCS block-shipping

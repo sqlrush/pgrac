@@ -81,6 +81,11 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* One bounded, local requester-delivery callback on the existing LMS loop.
+ * No wire ownership or foreground success is implied by this result. */
+extern ResourceXApplyResult
+cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref);
+
 /* Stage 8 8.15-PRE-CAP D1: diagnostic-only failure axes.  These values are
  * process-internal observability, not wire outcomes or a second authority.
  * NONE is retained so successful/unknown observations are never fabricated

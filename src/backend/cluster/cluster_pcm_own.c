@@ -59,6 +59,7 @@ cluster_pcm_own_shmem_init(void)
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation, 0);
 			pg_atomic_init_u32(&ClusterPcmOwnArray[i].flags, 0);
 			ClusterPcmOwnArray[i]._pad = 0;
+			pg_atomic_init_u64(&ClusterPcmOwnArray[i].delivery_attempt, 0);
 		}
 	}
 }
@@ -82,9 +83,10 @@ cluster_pcm_own_reservation_flag_valid(uint32 reservation_flag)
 		   || reservation_flag == PCM_OWN_FLAG_REVOKING;
 }
 
-ClusterPcmOwnResult
-cluster_pcm_own_reservation_begin_exact(int buf_id, uint64 expected_generation,
-										uint32 reservation_flag, uint64 *out_token)
+static ClusterPcmOwnResult
+cluster_pcm_own_reservation_begin_internal(int buf_id, uint64 expected_generation,
+										   uint32 reservation_flag, uint64 delivery_attempt,
+										   uint64 *out_token)
 {
 	ClusterPcmOwnEntry *entry;
 	ClusterPcmOwnResult live_result;
@@ -120,6 +122,8 @@ cluster_pcm_own_reservation_begin_exact(int buf_id, uint64 expected_generation,
 			return CLUSTER_PCM_OWN_BUSY;
 		return CLUSTER_PCM_OWN_CORRUPT;
 	}
+	if (pg_atomic_read_u64(&entry->delivery_attempt) != delivery_attempt)
+		return CLUSTER_PCM_OWN_BUSY;
 	if (generation == UINT64_MAX || old_token == UINT64_MAX)
 		return CLUSTER_PCM_OWN_EXHAUSTED;
 
@@ -131,6 +135,26 @@ cluster_pcm_own_reservation_begin_exact(int buf_id, uint64 expected_generation,
 	pg_atomic_write_u32(&entry->flags, reservation_flag);
 	*out_token = old_token;
 	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_reservation_begin_exact(int buf_id, uint64 expected_generation,
+										uint32 reservation_flag, uint64 *out_token)
+{
+	return cluster_pcm_own_reservation_begin_internal(buf_id, expected_generation, reservation_flag,
+													  0, out_token);
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_grant_begin_exact(int buf_id, uint64 expected_generation,
+										   uint64 delivery_attempt, uint64 *out_token)
+{
+	if (out_token != NULL)
+		*out_token = 0;
+	if (delivery_attempt == 0 || delivery_attempt == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	return cluster_pcm_own_reservation_begin_internal(
+		buf_id, expected_generation, PCM_OWN_FLAG_GRANT_PENDING, delivery_attempt, out_token);
 }
 
 ClusterPcmOwnResult
@@ -149,6 +173,8 @@ cluster_pcm_own_reservation_abort_exact(int buf_id, uint64 expected_generation,
 		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
 		|| pg_atomic_read_u32(&entry->flags) != reservation_flag)
 		return CLUSTER_PCM_OWN_STALE;
+	if (pg_atomic_read_u64(&entry->delivery_attempt) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
 
 	pg_atomic_write_u32(&entry->flags, 0);
 	return CLUSTER_PCM_OWN_OK;
@@ -234,6 +260,10 @@ cluster_pcm_own_grant_commit_exact(int buf_id, uint64 expected_generation, uint6
 		return CLUSTER_PCM_OWN_BUSY;
 	if (live_token != reservation_token)
 		return CLUSTER_PCM_OWN_STALE;
+	/* An adopted delivery grant is consumed only by the exact writer T2,
+	 * never by the generic read/shared grant path. */
+	if (pg_atomic_read_u64(&entry->delivery_attempt) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
 	if (generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_EXHAUSTED;
 
@@ -439,6 +469,8 @@ cluster_pcm_own_revoke_commit_exact(int buf_id, uint64 expected_generation,
 		return CLUSTER_PCM_OWN_BUSY;
 	if (live_token != reservation_token)
 		return CLUSTER_PCM_OWN_STALE;
+	if (pg_atomic_read_u64(&entry->delivery_attempt) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
 	if (generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_EXHAUSTED;
 
@@ -543,7 +575,8 @@ cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation)
 		*out_generation = generation;
 	if (generation == UINT64_MAX || flags != 0
 		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
-		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0
+		|| pg_atomic_read_u64(&entry->delivery_attempt) != 0)
 		return false;
 	generation++;
 	pg_atomic_write_u64(&entry->generation, generation);
@@ -554,6 +587,89 @@ cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation)
 	if (out_generation != NULL)
 		*out_generation = generation;
 	return true;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_hold_begin_exact(int buf_id, uint64 expected_generation,
+										  uint64 delivery_attempt)
+{
+	ClusterPcmOwnEntry *entry;
+	ClusterPcmOwnResult live_result;
+	uint64 live_attempt;
+	if (delivery_attempt == 0 || delivery_attempt == UINT64_MAX
+		|| expected_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation)
+		return CLUSTER_PCM_OWN_STALE;
+	live_attempt = pg_atomic_read_u64(&entry->delivery_attempt);
+	if (live_attempt != 0 && live_attempt != delivery_attempt)
+		return CLUSTER_PCM_OWN_BUSY;
+	live_result = cluster_pcm_own_classify_live_flags(
+		pg_atomic_read_u32(&entry->flags), pg_atomic_read_u64(&entry->reservation_token));
+	if (live_result != CLUSTER_PCM_OWN_OK)
+		return live_result;
+	if (pg_atomic_read_u32(&entry->flags) != 0
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	pg_atomic_write_u64(&entry->delivery_attempt, delivery_attempt);
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_hold_adopt_grant_exact(int buf_id, uint64 expected_generation,
+												uint64 reservation_token, uint64 delivery_attempt)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 live_attempt;
+
+	if (delivery_attempt == 0 || delivery_attempt == UINT64_MAX || reservation_token == 0
+		|| reservation_token == UINT64_MAX || expected_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
+		|| pg_atomic_read_u32(&entry->flags) != PCM_OWN_FLAG_GRANT_PENDING
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		return CLUSTER_PCM_OWN_STALE;
+	live_attempt = pg_atomic_read_u64(&entry->delivery_attempt);
+	if (live_attempt != 0 && live_attempt != delivery_attempt)
+		return CLUSTER_PCM_OWN_BUSY;
+	pg_atomic_write_u64(&entry->delivery_attempt, delivery_attempt);
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_hold_release_exact(int buf_id, uint64 expected_generation,
+											uint64 delivery_attempt)
+{
+	ClusterPcmOwnEntry *entry;
+	ClusterPcmOwnResult live_result;
+
+	if (delivery_attempt == 0 || delivery_attempt == UINT64_MAX
+		|| expected_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->delivery_attempt) != delivery_attempt)
+		return CLUSTER_PCM_OWN_STALE;
+	live_result = cluster_pcm_own_classify_live_flags(
+		pg_atomic_read_u32(&entry->flags), pg_atomic_read_u64(&entry->reservation_token));
+	if (live_result != CLUSTER_PCM_OWN_OK)
+		return live_result;
+	/* Release follows actual T3 (or proved unpublished unwind).  It cannot
+	 * erase an install/revoke/activation owner midway through publication. */
+	if (pg_atomic_read_u32(&entry->flags) != 0
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	pg_atomic_write_u64(&entry->delivery_attempt, 0);
+	return CLUSTER_PCM_OWN_OK;
 }
 
 static const ClusterShmemRegion cluster_pcm_own_region = {

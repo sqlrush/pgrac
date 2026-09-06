@@ -174,6 +174,8 @@ cluster_pcm_own_bump_failure(BufferDesc *buf, uint64 generation, uint32 *out_fla
 		return CLUSTER_PCM_OWN_EXHAUSTED;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
+	if (cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
 	return CLUSTER_PCM_OWN_CORRUPT;
 }
 
@@ -543,6 +545,106 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out_snap
 	cluster_pcm_own_snapshot_locked(buf, out_snapshot);
 	UnlockBufHdr(buf, buf_state);
 	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_hold_begin_exact(BufferDesc *buf,
+												 const ClusterPcmOwnSnapshot *expected_n,
+												 uint64 delivery_attempt)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result;
+	uint32 state;
+
+	if (buf == NULL || expected_n == NULL || expected_n->pcm_state != PCM_STATE_N
+		|| delivery_attempt == 0 || delivery_attempt == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+	if (!cluster_pcm_own_snapshot_equal_exact(&live, expected_n) || (state & BM_TAG_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if ((result = cluster_pcm_x_n_assertion_shape(live.pcm_state, live.buffer_type, state))
+			 != CLUSTER_PCM_OWN_OK)
+		; /* Do not turn dirty/IO/malformed N into a delivery target. */
+	else if (live.flags == 0)
+		result = cluster_pcm_own_delivery_hold_begin_exact(buf->buf_id, live.generation,
+														   delivery_attempt);
+	else if (live.flags == PCM_OWN_FLAG_GRANT_PENDING)
+		result = cluster_pcm_own_delivery_hold_adopt_grant_exact(
+			buf->buf_id, live.generation, live.reservation_token, delivery_attempt);
+	else
+		result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token);
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_snapshot_exact(BufferDesc *buf, const BufferTag *tag,
+											   uint64 delivery_attempt,
+											   ClusterPcmOwnSnapshot *snapshot_out)
+{
+	ClusterPcmOwnResult result;
+	uint32 state;
+
+	if (snapshot_out != NULL)
+		memset(snapshot_out, 0, sizeof(*snapshot_out));
+	if (buf == NULL || tag == NULL || snapshot_out == NULL || delivery_attempt == 0
+		|| delivery_attempt == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	state = LockBufHdr(buf);
+	if ((state & BM_TAG_VALID) == 0 || !BufferTagsEqual(tag, &buf->tag)
+		|| cluster_pcm_own_delivery_attempt_get(buf->buf_id) != delivery_attempt)
+		result = CLUSTER_PCM_OWN_STALE;
+	else {
+		cluster_pcm_own_snapshot_post_state_locked(buf, state, snapshot_out);
+		result = CLUSTER_PCM_OWN_OK;
+	}
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_hold_release_exact(BufferDesc *buf,
+												   const ClusterPcmOwnSnapshot *terminal_x,
+												   uint64 delivery_attempt,
+												   uint64 original_install_token)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result;
+	uint32 state;
+
+	if (buf == NULL || terminal_x == NULL || terminal_x->pcm_state != PCM_STATE_X
+		|| terminal_x->flags != 0 || terminal_x->writer_activation_token != 0
+		|| terminal_x->resource_x_activation_generation != 0 || delivery_attempt == 0
+		|| delivery_attempt == UINT64_MAX || original_install_token == 0
+		|| original_install_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+	if (!cluster_pcm_own_snapshot_equal_exact(&live, terminal_x)
+		|| (state & (BM_TAG_VALID | BM_VALID)) != (BM_TAG_VALID | BM_VALID)
+		|| live.buffer_type != BUF_TYPE_XCUR || live.reservation_token < original_install_token
+		|| live.reservation_token == UINT64_MAX)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0)
+		/* A bound delivery can have zero hold only after its exact terminal
+		 * release. A later reversible begin/abort advances the token, not the
+		 * page incarnation. The caller still proves original T3 and G+1. */
+		result = CLUSTER_PCM_OWN_OK;
+	else if (live.reservation_token != original_install_token)
+		/* This is a FIRST release: no monotone-token replay exception. */
+		result = CLUSTER_PCM_OWN_STALE;
+	else
+		result = cluster_pcm_own_delivery_hold_release_exact(buf->buf_id, live.generation,
+															 delivery_attempt);
+	UnlockBufHdr(buf, state);
+	return result;
 }
 
 ClusterPcmOwnResult
@@ -2042,6 +2144,33 @@ cluster_bufmgr_pcm_own_begin_x_reservation(BufferDesc *buf, const ClusterPcmOwnS
 	else
 		result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, expected->generation,
 														 PCM_OWN_FLAG_GRANT_PENDING, out_token);
+	UnlockBufHdr(buf, buf_state);
+	return result;
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
+													const ClusterPcmOwnSnapshot *expected,
+													uint64 delivery_attempt, uint64 *out_token)
+{
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+
+	if (out_token != NULL)
+		*out_token = 0;
+	if (buf == NULL || expected == NULL || out_token == NULL || delivery_attempt == 0
+		|| delivery_attempt == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (expected->pcm_state != PCM_STATE_N || expected->flags != 0)
+		return CLUSTER_PCM_OWN_STALE;
+	buf_state = LockBufHdr(buf);
+	if (!cluster_pcm_own_fence_matches_locked(buf, expected))
+		result = CLUSTER_PCM_OWN_STALE;
+	else
+		result = cluster_pcm_own_delivery_grant_begin_exact(buf->buf_id, expected->generation,
+															delivery_attempt, out_token);
 	UnlockBufHdr(buf, buf_state);
 	return result;
 }

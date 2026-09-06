@@ -652,10 +652,11 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		uint64 timeout_us;
 		int worker_id;
 		bool enqueued;
+		ResourceXAcquisitionRef delivery;
 
-		probe_result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
-			PGRAC_LMS_RESOURCE_X_PROBE_BUDGET, &intent, payload,
-			sizeof(payload), &examined);
+		probe_result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+			PGRAC_LMS_RESOURCE_X_PROBE_BUDGET, &intent, payload, sizeof(payload), &examined,
+			&delivery);
 		if (probe_result == RESOURCE_X_INTENT_PROBE_IDLE
 			|| probe_result == RESOURCE_X_INTENT_PROBE_COMPLETE)
 			break;
@@ -666,6 +667,12 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			continue;
 		}
 		scan_more = false;
+		if (probe_result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
+			/* A local callback is not a packet and consumes the same bounded
+			 * call budget. BUSY waits for the existing event-loop tick. */
+			(void)cluster_gcs_block_resource_x_delivery_tick(&delivery);
+			continue;
+		}
 		if (probe_result != RESOURCE_X_INTENT_PROBE_FOUND)
 			break;
 		now_us = lms_outbound_monotonic_us();

@@ -254,7 +254,21 @@ extern bool cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out);
 	X(PCM_RX_SEMANTIC_PROGRESS, "semantic_progress_count")                                         \
 	X(PCM_RX_HEAD_EXPIRE, "head_no_progress_expire_count")                                         \
 	X(PCM_RX_GLOBAL_FUSE_TRIGGER, "global_fuse_trigger_count")                                     \
-	X(PCM_RX_GLOBAL_FUSE_PERSISTED, "global_fuse_persisted_count")
+	X(PCM_RX_GLOBAL_FUSE_PERSISTED, "global_fuse_persisted_count")                                 \
+	X(PCM_RX_DELIVERY_BIND, "delivery_target_bind_count")                                          \
+	X(PCM_RX_DELIVERY_NORMAL, "delivery_normal_claim_count")                                       \
+	X(PCM_RX_DELIVERY_CLEANUP, "delivery_cleanup_claim_count")                                     \
+	X(PCM_RX_DELIVERY_OWNER_BUSY, "delivery_owner_busy_count")                                     \
+	X(PCM_RX_DELIVERY_COMPLETE, "delivery_complete_count")                                         \
+	X(PCM_RX_DELIVERY_CLEANUP_COMPLETE, "delivery_cleanup_complete_count")                         \
+	X(PCM_RX_DELIVERY_REQUEST_RETRY, "delivery_request_retry_count")                               \
+	X(PCM_RX_DELIVERY_SOURCE_REDRIVE, "delivery_source_block_redrive_count")                       \
+	X(PCM_RX_DELIVERY_LATE_FRAME, "delivery_late_frame_accepted_count")                            \
+	X(PCM_RX_DELIVERY_NAMESPACE_BLOCKED, "delivery_namespace_blocked_count")                       \
+	X(PCM_RX_DELIVERY_CALLBACK, "delivery_callback_count")                                         \
+	X(PCM_RX_DELIVERY_CALLBACK_MAX_US, "delivery_callback_max_us")                                 \
+	X(PCM_RX_DELIVERY_PENDING_MAX_US, "delivery_pending_age_max_us")                               \
+	X(PCM_RX_DELIVERY_FAILED_CALLER, "delivery_failed_caller_count")
 
 typedef enum PcmRxMetric {
 #define PCM_RX_ENUM(id, key) id,
@@ -268,6 +282,7 @@ typedef struct PcmRxStats {
 } PcmRxStats;
 
 extern void cluster_pcm_rx_metric_note(PcmRxMetric metric);
+extern void cluster_pcm_rx_delivery_max_note(PcmRxMetric metric, uint64 elapsed_us);
 extern bool cluster_pcm_rx_stats_snapshot(PcmRxStats *out);
 extern void cluster_pcm_rx_rejected_follower_note(uint64 before_generation,
 												  uint64 after_generation);
@@ -672,7 +687,9 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_FOUND = 1,
 	RESOURCE_X_INTENT_PROBE_MORE = 2,
 	RESOURCE_X_INTENT_PROBE_COMPLETE = 3,
-	RESOURCE_X_INTENT_PROBE_CORRUPT = 4
+	RESOURCE_X_INTENT_PROBE_CORRUPT = 4,
+	/* Local work only: never encoded as a wire intent. */
+	RESOURCE_X_INTENT_PROBE_DELIVERY = 5
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -827,6 +844,13 @@ typedef enum ResourceXTraceKind {
 	RESOURCE_X_TRACE_OPERATION_DONE,
 	RESOURCE_X_TRACE_FOLLOWER_JOIN
 } ResourceXTraceKind;
+
+/* Local APPLY observations, not new wire/trace kinds. */
+typedef enum ResourceXDeliveryTraceDetail {
+	RESOURCE_X_DELIVERY_TRACE_CLAIM = 128,
+	RESOURCE_X_DELIVERY_TRACE_COMPLETE,
+	RESOURCE_X_DELIVERY_TRACE_CALLBACK
+} ResourceXDeliveryTraceDetail;
 
 typedef struct ResourceXTraceEvent {
 	ResourceXAssertion assertion;
@@ -1358,6 +1382,95 @@ cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	uint64 r4_record_generation, uint64 current_master_session_incarnation,
 	uint32 current_master_sender_connection_generation,
 	ResourceXMasterSnapshot *out);
+/* Process-local membership in one node head.  This is not authority and is
+ * never copied to another caller.  A failed witness cannot be reset by a
+ * background installation, shared binding clear, or a later caller's head. */
+typedef struct ResourceXCallerWitness {
+	ResourceXDecodedCommon joined_request;
+	uint64 entry_binding_generation;
+	uint64 r4_record_generation;
+	uint64 failed_attempt;
+} ResourceXCallerWitness;
+
+/* Local residency, not a wire identity or permission to modify page bytes. */
+typedef struct ResourceXDeliveryTarget {
+	uint64 generation;
+	uint64 reservation_token;
+	uint32 buffer_id_plus_one;
+	uint32 flags;
+} ResourceXDeliveryTarget;
+
+#define RESOURCE_X_DELIVERY_NORMAL UINT8_C(1)
+#define RESOURCE_X_DELIVERY_CLEANUP UINT8_C(2)
+typedef struct ResourceXDeliveryClaim {
+	ResourceXInstallClaimJoinObservation observation;
+	ResourceXDeliveryTarget target;
+	uint64 executor_sequence;
+	uint8 purpose;
+	uint8 reserved[7];
+} ResourceXDeliveryClaim;
+
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_t1_grant_delivery_exact(const ResourceXAcquisitionRef *ref,
+													const ResourceXDeliveryClaim *claim);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_apply_delivery_exact(const ResourceXAcquisitionRef *ref,
+														   const ResourceXBufferInstallProof *proof,
+														   const ResourceXDeliveryClaim *claim);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_delivery_exact(
+	const ResourceXAcquisitionRef *ref, const ResourceXBufferActivationProof *proof,
+	const ResourceXDeliveryClaim *claim);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_claim_bind_t1_delivery_exact(
+	const ResourceXAcquisitionRef *ref, const struct ClusterPcmOwnSnapshot *reserved,
+	const ResourceXDeliveryClaim *claim);
+
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+	const ResourceXAcquisitionRef *ref, const ResourceXDeliveryTarget *target, uint8 purpose,
+	uint64 now_us, ResourceXDeliveryClaim *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_delivery_claim_end_exact(const ResourceXDeliveryClaim *claim);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_delivery_dispatch_exact(const ResourceXDeliveryClaim *claim,
+													ResourceXDecodedFrame *dispatch_out);
+extern ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_delivery_exact(
+	const ResourceXDecodedFrame *ack, int32 authenticated_master_node,
+	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation, uint64 now_us,
+	const ResourceXDeliveryClaim *claim, ResourceXDecodedFrame *assertion_out);
+/* Call only after exact post-T3 BufferDesc hold release, before ending claim. */
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_delivery_complete_exact(const ResourceXDeliveryClaim *claim,
+													const struct ClusterPcmOwnSnapshot *terminal_x);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_delivery_exact(
+	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
+	uint32 authenticated_source_ingress_generation, int32 current_master_node,
+	uint32 current_master_ingress_generation, uint64 r4_record_generation,
+	const ResourceXDeliveryClaim *claim, ResourceXRequesterJoinSnapshot *out);
+
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_bind_target_exact(
+	const ResourceXInstallClaimJoinObservation *observation, int buffer_id,
+	const struct ClusterPcmOwnSnapshot *before, const struct ClusterPcmOwnSnapshot *after);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_dispatch_observe_exact(
+	const ResourceXDecodedFrame *dispatch, int32 master_node,
+	ResourceXInstallClaimJoinObservation *observation_out, ResourceXDeliveryTarget *target_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXInstallClaimJoinObservation *observation_out,
+	ResourceXDeliveryTarget *target_out);
+
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_caller_observe_exact(
+	const ResourceXAssertion *assertion, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation, ResourceXCallerWitness *caller);
+
+extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 head_no_progress_budget_us, uint64 now_us,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, bool allow_create, bool allow_remote_admission,
+	bool cached_local_x, uint64 cached_ownership_generation, ResourceXCallerWitness *caller,
+	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
+
 extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
 	uint64 master_session_incarnation, uint64 r4_record_generation,
@@ -1885,6 +1998,9 @@ extern ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
 	uint16 payload_capacity, uint32 *examined_out);
+extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
+	uint32 *examined_out, ResourceXAcquisitionRef *delivery_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
 extern bool cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(

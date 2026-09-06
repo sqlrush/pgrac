@@ -67,9 +67,10 @@ typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 resource_x_activation_generation; /* target T2 bound, T3 not yet open */
 	pg_atomic_uint32 flags;					  /* PCM_OWN_FLAG_* */
 	uint32 _pad;							  /* keep naturally aligned */
+	pg_atomic_uint64 delivery_attempt;		  /* non-authoritative target residency hold */
 } ClusterPcmOwnEntry;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 40, "ClusterPcmOwnEntry must remain 40 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 48, "ClusterPcmOwnEntry must remain 48 bytes");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, writer_activation_token) == 16,
 				 "writer activation fence offset must remain stable");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation) == 24,
@@ -176,6 +177,33 @@ extern ClusterPcmOwnResult cluster_pcm_own_revoke_retain_release_exact(int buf_i
 																	   uint64 committed_generation,
 																	   uint64 reservation_token);
 extern bool cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation);
+
+/* Non-authoritative descriptor residency.  The bufmgr owner must prove an
+ * idle N target under the same header lock before begin; delivery identity
+ * is node-unique and never permission to install.  Exact T2 may advance the
+ * generation while retaining this hold.  Release requires the new exact
+ * generation and the original attempt, never a caller's expired deadline. */
+extern ClusterPcmOwnResult cluster_pcm_own_delivery_hold_begin_exact(int buf_id,
+																	 uint64 expected_generation,
+																	 uint64 delivery_attempt);
+extern ClusterPcmOwnResult
+cluster_pcm_own_delivery_hold_adopt_grant_exact(int buf_id, uint64 expected_generation,
+												uint64 reservation_token, uint64 delivery_attempt);
+extern ClusterPcmOwnResult cluster_pcm_own_delivery_grant_begin_exact(int buf_id,
+																	  uint64 expected_generation,
+																	  uint64 delivery_attempt,
+																	  uint64 *out_token);
+extern ClusterPcmOwnResult cluster_pcm_own_delivery_hold_release_exact(int buf_id,
+																	   uint64 expected_generation,
+																	   uint64 delivery_attempt);
+
+static inline uint64
+cluster_pcm_own_delivery_attempt_get(int buf_id)
+{
+	if (ClusterPcmOwnArray == NULL || buf_id < 0)
+		return 0;
+	return pg_atomic_read_u64(&ClusterPcmOwnArray[buf_id].delivery_attempt);
+}
 
 /*
  * Raw by-buf_id atomic accessors.  Callers that need the

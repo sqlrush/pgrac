@@ -83,6 +83,18 @@ typedef struct ClusterPcmOwnSnapshot {
 	uint8 _reserved[2];
 } ClusterPcmOwnSnapshot;
 
+/* Local descriptor residency only.  The Resource-X entry owns the attempt
+ * binding; these wrappers prove tag/generation under the header lock. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_delivery_hold_begin_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n, uint64 delivery_attempt);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_snapshot_exact(BufferDesc *buf, const BufferTag *tag,
+											   uint64 delivery_attempt,
+											   ClusterPcmOwnSnapshot *snapshot_out);
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_delivery_hold_release_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *terminal_x, uint64 delivery_attempt,
+	uint64 original_install_token);
+
 StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 64, "ClusterPcmOwnSnapshot must remain 64 bytes");
 StaticAssertDecl(offsetof(ClusterPcmOwnSnapshot, semantic_buf_state) == 20,
 				 "semantic buffer state must use former padding");
@@ -835,6 +847,10 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_publish_installed_x_image(
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_begin_x_reservation(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected,
 										   uint64 *out_token);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
+													const ClusterPcmOwnSnapshot *expected,
+													uint64 delivery_attempt, uint64 *out_token);
 /* Reclassify an exact requester-as-source N/S/X revoke without allocating a
  * second token or advancing generation.  The S-named entry remains as a
  * compatibility wrapper for callers that have not yet generalized. */

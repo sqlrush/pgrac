@@ -1064,7 +1064,7 @@ UT_TEST(test_shmem_initializes_complete_entry)
 
 	reset_fixture();
 	UT_ASSERT_EQ(cluster_pcm_own_shmem_size(), (Size)NBuffers * sizeof(ClusterPcmOwnEntry));
-	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 40);
+	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 48);
 	UT_ASSERT_EQ(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation), 24);
 	for (i = 0; i < NBuffers; i++) {
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].generation), 0);
@@ -1073,6 +1073,220 @@ UT_TEST(test_shmem_initializes_complete_entry)
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation),
 					 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmOwnArray[i].flags), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].delivery_attempt), 0);
+	}
+}
+
+UT_TEST(test_delivery_hold_blocks_idle_target_retag_after_caller_exit)
+{
+	ClusterPcmOwnEntry before;
+	uint64 generation = 99;
+
+	reset_fixture();
+	/* No PG caller pin or grant reservation remains.  The instance still
+	 * owes delivery into this descriptor.  Test the actual ordinary reuse
+	 * primitive, not an emulation of the new delivery API. */
+	pg_atomic_write_u64(&ClusterPcmOwnArray[0].delivery_attempt, 41);
+	memcpy(&before, &ClusterPcmOwnArray[0], sizeof(before));
+	UT_ASSERT(!cluster_pcm_own_gen_bump_checked(0, &generation));
+	UT_ASSERT_EQ(generation, 0);
+	UT_ASSERT_EQ(memcmp(&before, &ClusterPcmOwnArray[0], sizeof(before)), 0);
+}
+
+UT_TEST(test_delivery_hold_exact_t2_preserves_residency_until_real_t3)
+{
+	uint64 token = 0;
+	uint64 committed = 0;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_begin_exact(0, 0, 41), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_begin_exact(0, 0, 41), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_begin_exact(0, 0, 42), CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_begin_exact(0, 1, 41), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 0, 42), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 1, 41), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 41);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_grant_begin_exact(0, 0, 42, &token),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_grant_begin_exact(0, 0, 41, &token), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 0, 41), CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_own_writer_grant_commit_exact(0, 0, token, &committed),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(committed, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 41);
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(0, 1, token, 51),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 1, 41), CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(0, 1, token, 51),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_writer_activation_token_get(0), 0);
+	UT_ASSERT(!cluster_pcm_own_gen_bump_checked(0, NULL));
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 0, 41), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 1, 41), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_release_exact(0, 1, 41), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+	UT_ASSERT(cluster_pcm_own_gen_bump_checked(0, &committed));
+	UT_ASSERT_EQ(committed, 2);
+}
+
+UT_TEST(test_delivery_hold_prevents_failed_direct_init_owner_from_aborting_delivery)
+{
+	uint64 token = 0;
+	uint64 committed = 0;
+	ClusterPcmOwnEntry before;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING, &token),
+				 CLUSTER_PCM_OWN_OK);
+	/* Seed only the new residency field.  The production abort owner must
+	 * not discard a token handed to instance-owned delivery after ERROR. */
+	pg_atomic_write_u64(&ClusterPcmOwnArray[0].delivery_attempt, 41);
+	memcpy(&before, &ClusterPcmOwnArray[0], sizeof(before));
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, 0, token, PCM_OWN_FLAG_GRANT_PENDING),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(memcmp(&before, &ClusterPcmOwnArray[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_pcm_own_grant_commit_exact(0, 0, token, &committed), CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(committed, 0);
+	UT_ASSERT_EQ(memcmp(&before, &ClusterPcmOwnArray[0], sizeof(before)), 0);
+}
+
+UT_TEST(test_delivery_hold_rejects_unrelated_s_or_x_reservation)
+{
+	uint64 token = 99;
+	ClusterPcmOwnEntry before;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_hold_begin_exact(0, 0, 41), CLUSTER_PCM_OWN_OK);
+	memcpy(&before, &ClusterPcmOwnArray[0], sizeof(before));
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 0, PCM_OWN_FLAG_GRANT_PENDING, &token),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(token, 0);
+	UT_ASSERT_EQ(memcmp(&before, &ClusterPcmOwnArray[0], sizeof(before)), 0);
+}
+
+UT_TEST(test_real_delivery_residency_owns_exact_heap_vm_fsm_descriptor)
+{
+	int fork;
+	int pending;
+
+	for (fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
+		for (pending = 0; pending <= 1; pending++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry;
+			ClusterPcmOwnSnapshot before;
+			ClusterPcmOwnSnapshot after;
+			ClusterPcmOwnSnapshot wrong;
+			uint64 token = 21;
+			uint64 generation = 0;
+			uint32 flags = 0;
+			ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+
+			transition_fixture(&buf, &entry, &before, false);
+			buf.tag.forkNum = fork;
+			buf.pcm_state = PCM_STATE_N;
+			buf.buffer_type = BUF_TYPE_CURRENT;
+			pg_atomic_write_u32(&entry.flags, pending ? PCM_OWN_FLAG_GRANT_PENDING : 0);
+			cluster_pcm_own_snapshot_locked(&buf, &before);
+			wrong = before;
+			wrong.tag.blockNum++;
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_delivery_hold_begin_exact(&buf, &wrong, 41),
+						 CLUSTER_PCM_OWN_STALE);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_delivery_hold_begin_exact(&buf, &before, 41),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_delivery_hold_begin_exact(&buf, &before, 41),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_snapshot_exact(&buf, &before.tag, 42, &after),
+				CLUSTER_PCM_OWN_STALE);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_snapshot_exact(&buf, &before.tag, 41, &after),
+				CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+			/* Actual BufferDesc eviction owner, with zero foreground pins. */
+			UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_eviction_commit_locked(&buf, &before, &generation, &flags),
+						 CLUSTER_PCM_OWN_BUSY);
+			UT_ASSERT(BufferTagsEqual(&buf.tag, &before.tag));
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+			if (pending)
+				UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, 17, token,
+																	 PCM_OWN_FLAG_GRANT_PENDING),
+							 CLUSTER_PCM_OWN_BUSY);
+			else
+				UT_ASSERT_EQ(
+					cluster_bufmgr_pcm_own_delivery_begin_x_reservation(&buf, &before, 41, &token),
+					CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(cluster_pcm_own_writer_grant_commit_exact(0, 17, token, &generation),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(generation, 18);
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_bind_exact(0, 18, token, 41),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_clear_exact(0, 18, token, 41),
+						 CLUSTER_PCM_OWN_OK);
+			cluster_pcm_own_snapshot_locked(&buf, &after);
+			wrong = after;
+			wrong.generation--;
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &wrong, 41, token),
+				CLUSTER_PCM_OWN_STALE);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &after, 42, token),
+				CLUSTER_PCM_OWN_STALE);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &after, 41, token - 1),
+				CLUSTER_PCM_OWN_STALE); /* No first-release monotone exception. */
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &after, 41, token),
+				CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+			/* A completed T3 may be replayed after physical release but before
+			 * the entry owner cleared its delivery debt. Only the same exact
+			 * terminal incarnation is a release no-op. */
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &after, 41, token),
+				CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(
+				cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &wrong, 41, token),
+				CLUSTER_PCM_OWN_STALE);
+			/* Actual post-release reservation + refused-plan abort. No
+			 * generation/bytes change, but the token is intentionally monotone. */
+			{
+				uint64 cancelled_token = 0;
+				ClusterPcmOwnSnapshot cancelled;
+
+				UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(
+								 0, after.generation, PCM_OWN_FLAG_REVOKING, &cancelled_token),
+							 CLUSTER_PCM_OWN_OK);
+				UT_ASSERT_EQ(cancelled_token, after.reservation_token + 1);
+				cluster_pcm_own_snapshot_locked(&buf, &cancelled);
+				UT_ASSERT_EQ(
+					cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &cancelled, 41, token),
+					CLUSTER_PCM_OWN_INVALID);
+				UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(
+								 0, after.generation, cancelled_token, PCM_OWN_FLAG_REVOKING),
+							 CLUSTER_PCM_OWN_OK);
+				cluster_pcm_own_snapshot_locked(&buf, &cancelled);
+				UT_ASSERT_EQ(cancelled.generation, after.generation);
+				UT_ASSERT_EQ(cancelled.pcm_state, PCM_STATE_X);
+				UT_ASSERT_EQ(cancelled.flags, 0);
+				UT_ASSERT_EQ(cancelled.reservation_token, cancelled_token);
+				UT_ASSERT_EQ(
+					cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &cancelled, 41, token),
+					CLUSTER_PCM_OWN_OK);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_delivery_hold_release_exact(
+								 &buf, &cancelled, 41, cancelled_token + 1),
+							 CLUSTER_PCM_OWN_STALE);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_delivery_hold_release_exact(&buf, &cancelled,
+																				41, UINT64_MAX),
+							 CLUSTER_PCM_OWN_INVALID);
+			}
+			UT_ASSERT_EQ(transition_pin_count, 0);
+			UT_ASSERT(!transition_mapping_held && !transition_content_held);
+			ClusterPcmOwnArray = saved;
+		}
 	}
 }
 
@@ -4327,7 +4541,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(93);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);
 	UT_RUN(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift);
 	UT_RUN(test_bufmgr_snapshot_captures_image_type);
@@ -4345,6 +4559,11 @@ main(void)
 	UT_RUN(test_real_source_copy_returns_post_replacement_image_type);
 	UT_RUN(test_snapshot_classifiers_use_the_captured_physical_inputs);
 	UT_RUN(test_shmem_initializes_complete_entry);
+	UT_RUN(test_delivery_hold_blocks_idle_target_retag_after_caller_exit);
+	UT_RUN(test_delivery_hold_exact_t2_preserves_residency_until_real_t3);
+	UT_RUN(test_delivery_hold_prevents_failed_direct_init_owner_from_aborting_delivery);
+	UT_RUN(test_delivery_hold_rejects_unrelated_s_or_x_reservation);
+	UT_RUN(test_real_delivery_residency_owns_exact_heap_vm_fsm_descriptor);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);

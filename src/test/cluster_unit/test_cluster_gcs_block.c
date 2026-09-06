@@ -2387,12 +2387,12 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
 			"cluster_pcm_lock_resource_x_executor_probe_exact(",
 			"cluster_pcm_lock_resource_x_executor_enter(",
-			"cluster_pcm_lock_resource_x_t1_grant_exact(",
+			"cluster_pcm_lock_resource_x_t1_grant_delivery_exact(",
 			"gcs_block_pcm_x_resource_x_prepare_target_x(",
 			"cluster_bufmgr_pcm_own_activate_x_by_tag(",
-			"cluster_pcm_lock_resource_x_requester_apply_exact(",
+			"cluster_pcm_lock_resource_x_requester_apply_delivery_exact(",
 			"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
-			"cluster_pcm_lock_resource_x_requester_activate_exact(",
+			"cluster_pcm_lock_resource_x_requester_activate_delivery_exact(",
 			"cluster_pcm_lock_resource_x_executor_leave(" };
 	char *source = read_gcs_block_source();
 
@@ -2743,23 +2743,23 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 	const char *gate_helper_end;
 	const char *terminal;
 	const char *terminal_end;
-	static const char *const required[] = {
-		"cluster_semantic_activation_enter(",
-		"CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1",
-		"gcs_block_resource_x_gate_session_snapshot_result(",
-		"gcs_block_resource_x_gate_session_recheck(",
-		"cluster_bufmgr_pcm_own_snapshot(",
-		"writer_activation_token == 0",
-		"resource_x_activation_generation == 0",
-		"cluster_pcm_lock_resource_x_bootstrap_round_step_exact(",
-		"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST",
-		"gcs_block_resource_x_bootstrap_request_stage_exact(",
-		"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT",
-		"gcs_block_resource_x_native_assert_stage_exact(",
-		"RESOURCE_X_BOOTSTRAP_ROUND_WAIT",
-		"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(",
-		"RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL"
-	};
+	static const char *const required[]
+		= { "cluster_semantic_activation_enter(",
+			"CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1",
+			"gcs_block_resource_x_gate_session_snapshot_result(",
+			"gcs_block_resource_x_gate_session_recheck(",
+			"cluster_bufmgr_pcm_own_snapshot(",
+			"writer_activation_token == 0",
+			"resource_x_activation_generation == 0",
+			"cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(",
+			"cluster_pcm_lock_resource_x_caller_observe_exact(",
+			"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST",
+			"gcs_block_resource_x_bootstrap_request_stage_exact(",
+			"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT",
+			"gcs_block_resource_x_native_assert_stage_exact(",
+			"RESOURCE_X_BOOTSTRAP_ROUND_WAIT",
+			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(",
+			"RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL" };
 	static const char *const forbidden[] = {
 		"cluster_gcs_pcm_x_acquire_writer(",
 		"cluster_pcm_x_local_join_begin_semantic(",
@@ -2853,20 +2853,19 @@ UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 	static const char *const ingress_contract[]
 		= { "gcs_block_resource_x_requester_join_ingress(", "RESOURCE_X_REQUESTER_JOIN_READY",
 			"gcs_block_resource_x_requester_terminal_try(" };
-	static const char *const executor_contract[] = {
-		"cluster_pcm_lock_resource_x_requester_join_frames_exact(",
-		"join.requester_target_generation != join.assertion_sequence",
-		"ref.acquisition_generation = join.requester_target_generation",
-		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"cluster_pcm_lock_resource_x_executor_probe_exact(",
-		"cluster_pcm_lock_resource_x_executor_enter(",
-		"cluster_pcm_lock_resource_x_t1_grant_exact(",
-		"cluster_bufmgr_pcm_own_activate_x_by_tag(",
-		"cluster_pcm_lock_resource_x_requester_apply_exact(",
-		"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
-		"cluster_pcm_lock_resource_x_requester_activate_exact(",
-		"cluster_pcm_lock_resource_x_executor_leave("
-	};
+	static const char *const executor_contract[]
+		= { "cluster_pcm_lock_resource_x_requester_join_frames_exact(",
+			"join.requester_target_generation != join.assertion_sequence",
+			"ref.acquisition_generation = join.requester_target_generation",
+			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+			"cluster_pcm_lock_resource_x_executor_probe_exact(",
+			"cluster_pcm_lock_resource_x_executor_enter(",
+			"cluster_pcm_lock_resource_x_t1_grant_delivery_exact(",
+			"cluster_bufmgr_pcm_own_activate_x_by_tag(",
+			"cluster_pcm_lock_resource_x_requester_apply_delivery_exact(",
+			"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
+			"cluster_pcm_lock_resource_x_requester_activate_delivery_exact(",
+			"cluster_pcm_lock_resource_x_executor_leave(" };
 	char *source = read_gcs_block_source();
 	const char *executor;
 
@@ -2971,13 +2970,12 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 		"gcs_block_pcm_x_resource_x_durable_proof_crc(",
 		"cluster_pcm_lock_resource_x_durable_proof_exact("
 	};
-	static const char *const requester_join_contract[] = {
-		"cluster_pcm_lock_resource_x_t1_grant_exact(",
-		"cluster_bufmgr_read_storage_image_for_resource_x(",
-		"gcs_block_pcm_x_resource_x_durable_proof_crc(",
-		"gcs_block_pcm_x_resource_x_prepare_target_x(",
-		"cluster_bufmgr_pcm_own_activate_x_by_tag("
-	};
+	static const char *const requester_join_contract[]
+		= { "cluster_pcm_lock_resource_x_t1_grant_delivery_exact(",
+			"cluster_bufmgr_read_storage_image_for_resource_x(",
+			"gcs_block_pcm_x_resource_x_durable_proof_crc(",
+			"gcs_block_pcm_x_resource_x_prepare_target_x(",
+			"cluster_bufmgr_pcm_own_activate_x_by_tag(" };
 	static const char *const target_direct_init_contract[] = {
 		"cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(",
 		"cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(",
@@ -2991,12 +2989,11 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 		"cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(",
 		"cluster_bufmgr_pcm_own_finish_x_commit("
 	};
-	static const char *const target_direct_init_terminal_contract[] = {
-		"gcs_block_pcm_x_resource_x_prepare_target_x(",
-		"cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(",
-		"cluster_pcm_lock_resource_x_requester_apply_exact(",
-		"cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact("
-	};
+	static const char *const target_direct_init_terminal_contract[]
+		= { "gcs_block_pcm_x_resource_x_prepare_target_x(",
+			"cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(",
+			"cluster_pcm_lock_resource_x_requester_apply_delivery_exact(",
+			"cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(" };
 	char *source = read_gcs_block_source();
 
 	assert_ordered_in_function(
@@ -3009,11 +3006,9 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 		"\nstatic ResourceXApplyResult\n"
 		"gcs_block_pcm_x_resource_x_master_durable_try(", requester_join_contract,
 		lengthof(requester_join_contract));
-	assert_ordered_in_function(
-		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
-		"\n/* Consume one complete retained type-15 join",
-		target_direct_init_contract,
-		lengthof(target_direct_init_contract));
+	assert_ordered_in_function(source, "gcs_block_pcm_x_resource_x_prepare_target_x(",
+							   "\n/* Consume one complete retained type-15 join",
+							   target_direct_init_contract, lengthof(target_direct_init_contract));
 	assert_ordered_in_function(
 		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
 		"\nstatic bool\ngcs_block_try_resource_x_frame(",
@@ -3033,10 +3028,9 @@ UT_TEST(test_resource_x_target_x_freezes_exact_committed_generation_before_repla
 	};
 	char *source = read_gcs_block_source();
 
-	assert_ordered_in_function(
-		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
-		"\n/* Consume one complete retained type-15 join",
-		generation_contract, lengthof(generation_contract));
+	assert_ordered_in_function(source, "gcs_block_pcm_x_resource_x_prepare_target_x(",
+							   "\n/* Consume one complete retained type-15 join",
+							   generation_contract, lengthof(generation_contract));
 	free(source);
 }
 
@@ -3191,9 +3185,9 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 			"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(")
 		: NULL;
 	step = n_candidate != NULL
-		? strstr(n_candidate,
-			"cluster_pcm_lock_resource_x_bootstrap_round_step_exact(")
-		: NULL;
+			   ? strstr(n_candidate,
+						"cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(")
+			   : NULL;
 	predecessor_wait = step != NULL
 		? strstr(step,
 			"RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT") : NULL;
@@ -3390,10 +3384,10 @@ UT_TEST(test_resource_x_target_preflight_waits_under_one_r7_deadline)
 	retry = sleep != NULL ? strstr(sleep, "continue;") : NULL;
 	round_loop = retry != NULL
 		? strstr(retry, "diagnostic_stage = \"round-loop\"") : NULL;
-	round_step = round_loop != NULL
-		? strstr(round_loop,
-			"cluster_pcm_lock_resource_x_bootstrap_round_step_exact(")
-		: NULL;
+	round_step
+		= round_loop != NULL
+			  ? strstr(round_loop, "cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(")
+			  : NULL;
 
 	UT_ASSERT_NOT_NULL(target);
 	UT_ASSERT_NOT_NULL(target_end);
@@ -3449,10 +3443,9 @@ UT_TEST(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x)
 	 * assertion to reach the master.  Once an exact retained remote image is
 	 * joined, install those bytes under GRANT_PENDING before X commit; never
 	 * relabel or read the PI as current authority. */
-	assert_ordered_in_function(
-		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
-		"\n/* Consume one complete retained type-15 join", target_contract,
-		lengthof(target_contract));
+	assert_ordered_in_function(source, "gcs_block_pcm_x_resource_x_prepare_target_x(",
+							   "\n/* Consume one complete retained type-15 join", target_contract,
+							   lengthof(target_contract));
 	join = strstr(source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(");
 	remote_image = join != NULL
 		? strstr(join, "image_frame.body.image_envelope.page_bytes") : NULL;
@@ -3528,10 +3521,9 @@ UT_TEST(test_resource_x_direct_init_remote_carrier_is_aux_only_exact_r9_install)
 		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
 		"\nstatic ResourceXApplyResult\ngcs_block_pcm_x_resource_x_master_durable_try(",
 		join_contract, lengthof(join_contract));
-	assert_ordered_in_function(
-		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
-		"\n/* Consume one complete retained type-15 join", install_contract,
-		lengthof(install_contract));
+	assert_ordered_in_function(source, "gcs_block_pcm_x_resource_x_prepare_target_x(",
+							   "\n/* Consume one complete retained type-15 join", install_contract,
+							   lengthof(install_contract));
 	free(source);
 }
 
