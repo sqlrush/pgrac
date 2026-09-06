@@ -11593,6 +11593,7 @@ UT_TEST(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times)
 	ResourceXIntentSlot settlement_intent;
 	ResourceXO1Stats stats;
 	ResourceXO1Stats duplicate_stats;
+	ResourceXTraceEvent trace_rows[8];
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 settlement_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint32 examined = 0;
@@ -11607,6 +11608,7 @@ UT_TEST(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times)
 				 RESOURCE_X_APPLY_APPLIED);
 	cluster_pcm_lock_resource_x_o1_stats_snapshot(&stats);
 	UT_ASSERT_EQ(stats.remote_install_observed_count, 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&image_first_tag, 1));
 
 	make_resource_x_remote_join_pair(image_first_tag, 2, &grant, &image);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
@@ -11616,6 +11618,16 @@ UT_TEST(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times)
 		&grant, 2, &join), RESOURCE_X_APPLY_APPLIED);
 	ready_join = join;
 	complete_resource_x_remote_requester_terminal(&join, &ref, &activation);
+	/* This valid retirement has no bootstrap round. Observation must retain
+	 * the validated join identity, never zero/stale round fields. */
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(1));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_trace_read(1, 0, trace_rows, 8), 1);
+	UT_ASSERT_EQ(trace_rows[0].kind, RESOURCE_X_TRACE_RETIRE);
+	UT_ASSERT_EQ(trace_rows[0].master_session, ready_join.master_session_incarnation);
+	UT_ASSERT_EQ(trace_rows[0].base_generation, ready_join.base_authority_generation);
+	UT_ASSERT_EQ(trace_rows[0].attempt, ready_join.requester_target_generation);
+	UT_ASSERT_EQ(trace_rows[0].value[3], 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(1));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 		4, &settlement_intent, settlement_payload,
 		sizeof(settlement_payload), &examined),
@@ -15113,10 +15125,112 @@ UT_TEST(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_r
 	UT_ASSERT_EQ(stats.clear_bitmap[1], UINT64_C(1));
 }
 
+UT_TEST(test_resource_x_trace_observes_actual_head_and_same_ref_waiters)
+{
+	BufferTag tag = make_tag(491);
+	ResourceXAssertion assertion;
+	ResourceXAcquisitionRef terminal;
+	ResourceXDecodedFrame dispatch;
+	ResourceXTraceEvent rows[16];
+	uint32 count;
+	int head_count = 0;
+	int wait_count = 0;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_pcm_clock_us = 100;
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&tag, 1));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+	for (int caller = 0; caller < 4; caller++)
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, 1000, 900, 100, 50, false, 0,
+			&dispatch, &terminal), caller == 0 ? RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
+				: RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(1));
+	count = cluster_pcm_lock_resource_x_trace_read(1, 0, rows, lengthof(rows));
+	for (uint32 i = 0; i < count; i++) {
+		UT_ASSERT_EQ(rows[i].formation, 17);
+		UT_ASSERT_EQ(rows[i].attempt, 1);
+		UT_ASSERT(resource_x_assertion_equal(&rows[i].assertion, &assertion));
+		if (rows[i].kind == RESOURCE_X_TRACE_HEAD) {
+			head_count++;
+			UT_ASSERT_EQ(rows[i].value[1], 900);
+			UT_ASSERT_EQ(rows[i].value[2], 1000);
+		} else if (rows[i].kind == RESOURCE_X_TRACE_FOLLOWER_JOIN)
+			wait_count++;
+	}
+	UT_ASSERT_EQ(head_count, 1);
+	UT_ASSERT_EQ(wait_count, 3);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(1));
+}
+
+UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence)
+{
+	BufferTag tag = make_tag(40);
+	ResourceXTraceStats stats;
+	ResourceXTraceEvent event = {0};
+	ResourceXTraceEvent rows[64];
+	uint64 cursor;
+	uint32 copied;
+
+	reset_fake_pcm_runtime(4);
+	event.assertion.resource = tag;
+	event.assertion.requester_node = 0;
+	event.kind = RESOURCE_X_TRACE_PREUSE;
+	event.attempt = 17;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_snapshot(&stats));
+	UT_ASSERT_EQ(stats.state, RESOURCE_X_TRACE_IDLE);
+	UT_ASSERT_EQ(stats.count, 0);
+	UT_ASSERT_EQ(stats.capacity, 4 * 64);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_begin(NULL, 1));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_begin(&tag, 0));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&tag, 1));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_begin(&tag, 2));
+	event.assertion.resource.blockNum++;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	event.assertion.resource = tag;
+	fake_pcm_clock_us = 222;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_trace_read(1, 0, rows, 64), 0);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_release(1));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_seal(2));
+	for (cursor = 1; cursor <= stats.capacity; cursor++)
+		cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(1));
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count, stats.capacity);
+	UT_ASSERT_EQ(stats.overflow, 1);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_release(1));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_trace_read(1, 1, rows, 64), 0);
+	copied = cluster_pcm_lock_resource_x_trace_read(1, 0, rows, 64);
+	UT_ASSERT_EQ(copied, 64);
+	UT_ASSERT_EQ(rows[0].attempt, 17);
+	UT_ASSERT_EQ(rows[0].time_us, 222);
+	UT_ASSERT(BufferTagsEqual(&rows[0].assertion.resource, &tag));
+	for (cursor = copied; cursor < stats.count; cursor += copied) {
+		copied = cluster_pcm_lock_resource_x_trace_read(1, cursor, rows, 64);
+		UT_ASSERT(copied > 0);
+	}
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_release(2));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(1));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_begin(&tag, 1));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&tag, 2));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_trace_seal(1));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(2));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(2));
+	UT_ASSERT_EQ(cluster_pcm_grd_count(), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(206);
+	UT_PLAN(208);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -15135,6 +15249,8 @@ main(void)
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
+	UT_RUN(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence);
+	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);
 	UT_RUN(test_pcm_vm_metrics_distinguish_requests_completions_and_latency);
 	UT_RUN(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_range);
 	UT_RUN(test_pcm_grd_entry_lifecycle_link_surface);

@@ -12884,6 +12884,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 			(uint16)env->payload_length, &frame, &reject)) {
 		return true;
 	}
+	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
+		(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {
 		return true;
 	}
@@ -13015,6 +13017,10 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 		}
 		break;
 	}
+	/* Bootstrap owns its own typed action; the local sentinel is not its result. */
+	if (frame.kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
+		cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_APPLY, &frame,
+			(int32)env->source_node_id, (int32)result);
 	if (gcs_block_resource_x_frame_diagnostic(frame.kind)
 			!= GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT
 		&& ((result != RESOURCE_X_APPLY_APPLIED

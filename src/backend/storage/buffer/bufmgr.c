@@ -3104,6 +3104,8 @@ cluster_bufmgr_pcm_x_writer_activate(
 			RESOURCE_X_APPLY_STALE, buf, "Resource-X target activate");
 	}
 	entry->phase = PCM_X_WRITER_LEDGER_ACTIVE;
+	cluster_pcm_lock_resource_x_trace_ref(RESOURCE_X_TRACE_PREUSE, &entry->authority.ref,
+		entry->authority.buffer_ownership_generation);
 	return true;
 }
 
@@ -3156,6 +3158,8 @@ cluster_bufmgr_pcm_x_writer_release(ClusterPcmXWriterLedgerEntry *entry)
 		|| LWLockHeldByMe(entry->content_lock))
 		cluster_bufmgr_resource_x_writer_report_failure(
 			RESOURCE_X_APPLY_BAD_STATE, buf, "release phase");
+	cluster_pcm_lock_resource_x_trace_ref(RESOURCE_X_TRACE_UNLOCK, &entry->authority.ref,
+		entry->authority.buffer_ownership_generation);
 	cluster_bufmgr_pcm_x_writer_clear(entry);
 }
 

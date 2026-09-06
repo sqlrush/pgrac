@@ -806,6 +806,71 @@ typedef struct ResourceXO1Stats {
 StaticAssertDecl(sizeof(ResourceXO1Stats) == 72,
 				 "ResourceXO1Stats must remain the exact nine-reading cohort");
 
+/* Bounded, opt-in observation only. No field is an authority input. */
+#define RESOURCE_X_TRACE_MAX_EVENTS UINT32_C(1048576)
+#define RESOURCE_X_TRACE_IDLE 0
+#define RESOURCE_X_TRACE_RECORDING 1
+#define RESOURCE_X_TRACE_SEALED 2
+typedef enum ResourceXTraceKind {
+	RESOURCE_X_TRACE_SEND = 1,
+	RESOURCE_X_TRACE_RECEIVE,
+	RESOURCE_X_TRACE_APPLY,
+	RESOURCE_X_TRACE_HEAD,
+	RESOURCE_X_TRACE_RETIRE,
+	RESOURCE_X_TRACE_PREUSE,
+	RESOURCE_X_TRACE_UNLOCK,
+	RESOURCE_X_TRACE_OPERATION_BEGIN,
+	RESOURCE_X_TRACE_OPERATION_DONE,
+	RESOURCE_X_TRACE_FOLLOWER_JOIN
+} ResourceXTraceKind;
+
+typedef struct ResourceXTraceEvent {
+	ResourceXAssertion assertion;
+	uint64 time_us;
+	uint64 formation;
+	uint64 master_session;
+	uint64 attempt;
+	uint64 base_generation;
+	uint64 final_generation;
+	uint64 value[4];
+	int32 pid;
+	int32 node;
+	int32 peer;
+	uint16 kind;
+	uint16 detail;
+	uint32 flags;
+	uint32 reserved;
+} ResourceXTraceEvent;
+StaticAssertDecl(sizeof(ResourceXTraceEvent) == 128, "observation record must remain 128 bytes");
+
+typedef struct ResourceXTraceStats {
+	BufferTag tag;
+	uint32 state;
+	uint64 epoch;
+	uint64 count;
+	uint64 overflow;
+	uint64 late_events;
+	uint64 exported;
+	uint64 started_us;
+	uint64 sealed_us;
+	uint32 capacity;
+	int32 owner_pid;
+} ResourceXTraceStats;
+
+extern bool cluster_pcm_lock_resource_x_trace_begin(const BufferTag *tag, uint64 epoch);
+extern bool cluster_pcm_lock_resource_x_trace_seal(uint64 epoch);
+extern bool cluster_pcm_lock_resource_x_trace_snapshot(ResourceXTraceStats *out);
+extern uint32 cluster_pcm_lock_resource_x_trace_read(uint64 epoch, uint64 first,
+													  ResourceXTraceEvent *out, uint32 limit);
+extern bool cluster_pcm_lock_resource_x_trace_release(uint64 epoch);
+extern void cluster_pcm_lock_resource_x_trace_note(const ResourceXTraceEvent *event);
+extern void cluster_pcm_lock_resource_x_trace_ref(uint16 kind,
+	const ResourceXAcquisitionRef *ref, uint64 value);
+extern void cluster_pcm_lock_resource_x_trace_frame(uint16 kind,
+	const ResourceXDecodedFrame *frame, int32 peer, int32 result);
+extern void cluster_pcm_lock_resource_x_trace_wire(uint8 msg_type, int32 peer,
+	const void *payload, uint32 length, int32 result);
+
 /* Exact, process-local D2 result retained for the R8 sweep owner.  This is
  * deliberately not a wire structure and carries both the removed queue
  * identity and the successor selected under the same resource-entry lock. */

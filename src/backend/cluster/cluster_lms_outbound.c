@@ -1081,6 +1081,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 										  send_payload_len);
 
 handle_send_result:
+		/* Actual transport result, not admission or enqueue success. */
+		cluster_pcm_lock_resource_x_trace_wire(slot.msg_type, (int32)slot.dest_node_id,
+			send_payload, send_payload_len, (int32)rc);
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
 			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);

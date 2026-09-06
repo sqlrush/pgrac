@@ -33,6 +33,8 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogdefs.h"
@@ -680,6 +682,9 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 43840,
 
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
+	slock_t trace_lock;
+	pg_atomic_uint64 trace_active_epoch;
+	ResourceXTraceStats trace;
 	pg_atomic_uint64 next_binding_generation;
 	pg_atomic_uint64 resource_x_retired_authority_floor;
 	pg_atomic_uint64 resource_x_bootstrap_next_attempt;
@@ -832,6 +837,7 @@ static PcmRxWaitFailure pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 static HTAB *cluster_pcm_htab = NULL;
 static ClusterPcmResourceXSlot *cluster_pcm_resource_x_slots = NULL;
 static ClusterPcmResourceXMasterState *cluster_pcm_resource_x_master_states = NULL;
+static ResourceXTraceEvent *pcm_rx_trace_events = NULL;
 /*
  * Resolved (post-HC62) entry count used by HTAB cap + accessor + errmsg.
  *	Set in cluster_pcm_grd_init from pcm_grd_effective_entries(true) ;
@@ -923,6 +929,8 @@ typedef struct PcmResourceXRetirementWitness {
 	uint8 requester_loss_seen;
 	uint8 diagnostic_source_mode;
 	uint8 reserved[2];
+	uint64 diagnostic_master_session;
+	uint64 diagnostic_base_generation;
 	uint64 final_authority_generation;
 	uint64 t_image_us;
 	uint64 t_grant_us;
@@ -4697,6 +4705,209 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out)
 		&ClusterPcm->resource_x_o1_last_remote_t_grant_us);
 	out->last_remote_t_install_us = pg_atomic_read_u64(
 		&ClusterPcm->resource_x_o1_last_remote_t_install_us);
+}
+
+static uint32
+pcm_rx_trace_capacity(int entries)
+{
+	return (uint32)Min((uint64)entries * 64, (uint64)RESOURCE_X_TRACE_MAX_EVENTS);
+}
+
+bool
+cluster_pcm_lock_resource_x_trace_begin(const BufferTag *tag, uint64 epoch)
+{
+	ResourceXTraceStats *trace;
+	uint64 now_us;
+	bool accepted = false;
+
+	if (ClusterPcm == NULL || tag == NULL || epoch == 0 || epoch == UINT64_MAX
+		|| !OidIsValid(tag->relNumber) || tag->forkNum > VISIBILITYMAP_FORKNUM
+		|| tag->blockNum == InvalidBlockNumber)
+		return false;
+	now_us = pcm_resource_x_monotonic_us();
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	trace = &ClusterPcm->trace;
+	if (trace->state == RESOURCE_X_TRACE_IDLE && epoch > trace->epoch) {
+		uint32 capacity = trace->capacity;
+
+		memset(trace, 0, sizeof(*trace));
+		trace->tag = *tag;
+		trace->state = RESOURCE_X_TRACE_RECORDING;
+		trace->epoch = epoch;
+		trace->capacity = capacity;
+		trace->owner_pid = (int32)getpid();
+		trace->started_us = now_us;
+		pg_atomic_write_u64(&ClusterPcm->trace_active_epoch, epoch);
+		accepted = true;
+	}
+	SpinLockRelease(&ClusterPcm->trace_lock);
+	return accepted;
+}
+
+bool
+cluster_pcm_lock_resource_x_trace_seal(uint64 epoch)
+{
+	ResourceXTraceStats *trace;
+	uint64 now_us;
+	bool accepted = false;
+
+	if (ClusterPcm == NULL)
+		return false;
+	now_us = pcm_resource_x_monotonic_us();
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	trace = &ClusterPcm->trace;
+	if (trace->owner_pid == (int32)getpid() && trace->epoch == epoch
+		&& trace->state == RESOURCE_X_TRACE_RECORDING) {
+		pg_atomic_write_u64(&ClusterPcm->trace_active_epoch, 0);
+		trace->state = RESOURCE_X_TRACE_SEALED;
+		trace->sealed_us = trace->count == 0 ? now_us
+			: Max(now_us, pcm_rx_trace_events[trace->count - 1].time_us);
+		accepted = true;
+	}
+	SpinLockRelease(&ClusterPcm->trace_lock);
+	return accepted;
+}
+
+bool
+cluster_pcm_lock_resource_x_trace_snapshot(ResourceXTraceStats *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return false;
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	*out = ClusterPcm->trace;
+	SpinLockRelease(&ClusterPcm->trace_lock);
+	return true;
+}
+
+uint32
+cluster_pcm_lock_resource_x_trace_read(uint64 epoch, uint64 first,
+	ResourceXTraceEvent *out, uint32 limit)
+{
+	ResourceXTraceStats *trace;
+	uint32 copied = 0;
+
+	if (ClusterPcm == NULL || out == NULL || limit == 0 || limit > 64)
+		return 0;
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	trace = &ClusterPcm->trace;
+	if (trace->state == RESOURCE_X_TRACE_SEALED && trace->epoch == epoch
+		&& trace->owner_pid == (int32)getpid() && first <= trace->exported
+		&& first < trace->count) {
+		copied = (uint32)Min((uint64)limit, trace->count - first);
+		memcpy(out, &pcm_rx_trace_events[first], copied * sizeof(*out));
+		trace->exported = Max(trace->exported, first + copied);
+	}
+	SpinLockRelease(&ClusterPcm->trace_lock);
+	return copied;
+}
+
+bool
+cluster_pcm_lock_resource_x_trace_release(uint64 epoch)
+{
+	ResourceXTraceStats *trace;
+	bool accepted = false;
+
+	if (ClusterPcm == NULL)
+		return false;
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	trace = &ClusterPcm->trace;
+	if (trace->state == RESOURCE_X_TRACE_SEALED && trace->epoch == epoch
+		&& trace->owner_pid == (int32)getpid() && trace->exported == trace->count) {
+		/* Preserve the last counters and epoch until an explicit newer begin.
+		 * The controller must persist its full export before calling release. */
+		trace->state = RESOURCE_X_TRACE_IDLE;
+		accepted = true;
+	}
+	SpinLockRelease(&ClusterPcm->trace_lock);
+	return accepted;
+}
+
+void
+cluster_pcm_lock_resource_x_trace_note(const ResourceXTraceEvent *event)
+{
+	ResourceXTraceStats *trace;
+	ResourceXTraceEvent value;
+	uint64 epoch;
+
+	if (ClusterPcm == NULL || event == NULL
+		|| (epoch = pg_atomic_read_u64(&ClusterPcm->trace_active_epoch)) == 0)
+		return;
+	value = *event;
+	if (value.time_us == 0)
+		value.time_us = pcm_resource_x_monotonic_us();
+	value.node = cluster_node_id;
+	value.pid = (int32)getpid();
+	value.reserved = 0;
+	SpinLockAcquire(&ClusterPcm->trace_lock);
+	trace = &ClusterPcm->trace;
+	if (trace->state != RESOURCE_X_TRACE_RECORDING || trace->epoch != epoch)
+		trace->late_events++;
+	else if (BufferTagsEqual(&trace->tag, &value.assertion.resource)) {
+		if (trace->count == trace->capacity)
+			trace->overflow++;
+		else
+			pcm_rx_trace_events[trace->count++] = value;
+	}
+	SpinLockRelease(&ClusterPcm->trace_lock);
+}
+
+void
+cluster_pcm_lock_resource_x_trace_ref(uint16 kind,
+	const ResourceXAcquisitionRef *ref, uint64 value)
+{
+	ResourceXTraceEvent event = {0};
+
+	if (ref == NULL || ClusterPcm == NULL
+		|| pg_atomic_read_u64(&ClusterPcm->trace_active_epoch) == 0)
+		return;
+	event.kind = kind;
+	event.assertion = ref->assertion;
+	event.formation = ref->formation;
+	event.attempt = ref->acquisition_generation;
+	event.value[0] = value;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+}
+
+void
+cluster_pcm_lock_resource_x_trace_frame(uint16 kind,
+	const ResourceXDecodedFrame *frame, int32 peer, int32 result)
+{
+	ResourceXTraceEvent event = {0};
+
+	if (frame == NULL || ClusterPcm == NULL
+		|| pg_atomic_read_u64(&ClusterPcm->trace_active_epoch) == 0)
+		return;
+	event.kind = kind;
+	event.detail = frame->kind;
+	event.assertion = frame->common.logical_assertion;
+	event.formation = frame->common.resource_formation;
+	event.master_session = frame->common.master_session_incarnation;
+	event.attempt = frame->common.assertion_sequence;
+	event.base_generation = frame->common.base_authority_generation;
+	event.final_generation = frame->common.authority_generation;
+	event.peer = peer;
+	event.value[0] = (uint32)result;
+	event.value[1] = frame->common.observed_mode;
+	event.value[2] = frame->common.target_mode;
+	event.value[3] = frame->common.ordered_lane;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+}
+
+void
+cluster_pcm_lock_resource_x_trace_wire(uint8 msg_type, int32 peer,
+	const void *payload, uint32 length, int32 result)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXWireReject reject;
+
+	if (ClusterPcm == NULL || payload == NULL || length > PG_UINT16_MAX
+		|| pg_atomic_read_u64(&ClusterPcm->trace_active_epoch) == 0)
+		return;
+	if (cluster_resource_x_wire_decode(msg_type, payload, (uint16)length, &frame, &reject))
+		cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_SEND, &frame, peer, result);
 }
 
 static bool
@@ -9009,6 +9220,7 @@ cluster_pcm_grd_shmem_size(void)
 	sz = add_size(sz, mul_size((Size)eff, sizeof(ClusterPcmResourceXSlot)));
 	sz = add_size(sz, mul_size((Size)eff,
 							 sizeof(ClusterPcmResourceXMasterState)));
+	sz = add_size(sz, mul_size(pcm_rx_trace_capacity(eff), sizeof(ResourceXTraceEvent)));
 	sz = add_size(sz, hash_estimate_size((Size)eff, sizeof(struct GrdEntry)));
 	return sz;
 }
@@ -9038,6 +9250,8 @@ cluster_pcm_grd_init(void)
 	header_size = add_size(header_size,
 						   mul_size((Size)pcm_grd_effective,
 									sizeof(ClusterPcmResourceXMasterState)));
+	header_size = add_size(header_size,
+		mul_size(pcm_rx_trace_capacity(pcm_grd_effective), sizeof(ResourceXTraceEvent)));
 
 	pgstat_report_wait_start(WAIT_EVENT_PCM_GRD_INIT);
 	ClusterPcm = (ClusterPcmShared *)ShmemInitStruct("pgrac cluster pcm grd hdr",
@@ -9048,6 +9262,8 @@ cluster_pcm_grd_init(void)
 		((char *)cluster_pcm_resource_x_slots
 		 + mul_size((Size)pcm_grd_effective,
 					 sizeof(ClusterPcmResourceXSlot)));
+	pcm_rx_trace_events = (ResourceXTraceEvent *)
+		(cluster_pcm_resource_x_master_states + pcm_grd_effective);
 
 	if (!found) {
 		/*
@@ -9056,6 +9272,9 @@ cluster_pcm_grd_init(void)
 		 * by HC60 apply-fail-closed.
 		 */
 		memset(ClusterPcm, 0, header_size);
+		SpinLockInit(&ClusterPcm->trace_lock);
+		pg_atomic_init_u64(&ClusterPcm->trace_active_epoch, 0);
+		ClusterPcm->trace.capacity = pcm_rx_trace_capacity(pcm_grd_effective);
 		for (int metric = 0; metric < PCM_RX_METRIC_COUNT; metric++)
 			pg_atomic_init_u64(&ClusterPcm->rx_count[metric], 0);
 		for (int metric = 0; metric < PCM_VM_METRIC_COUNT; metric++)
@@ -10736,6 +10955,53 @@ pcm_resource_x_head_margin_note(const ClusterPcmResourceXBootstrapRound *round, 
 			round->request.assertion_sequence, now_us);
 }
 
+static void
+pcm_rx_trace_head(const ClusterPcmResourceXBootstrapRound *round, uint32 flags,
+	uint64 now_us)
+{
+	ResourceXTraceEvent event = {0};
+
+	if (ClusterPcm == NULL || pg_atomic_read_u64(&ClusterPcm->trace_active_epoch) == 0)
+		return;
+	event.kind = RESOURCE_X_TRACE_HEAD;
+	event.detail = round->phase;
+	event.flags = flags;
+	event.time_us = now_us;
+	event.assertion = round->request.logical_assertion;
+	event.formation = round->resource_formation;
+	event.master_session = round->master_session_incarnation;
+	event.attempt = round->request.assertion_sequence;
+	event.base_generation = round->accepted_base;
+	event.final_generation = round->terminal_authority_generation;
+	event.peer = round->current_master_node;
+	event.value[0] = round->head_last_semantic_progress_us;
+	event.value[1] = round->head_no_progress_budget_us;
+	event.value[2] = round->head_no_progress_deadline_us;
+	event.value[3] = round->head_change_generation;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+}
+
+static void
+pcm_rx_trace_join(const ClusterPcmResourceXBootstrapRound *round, uint64 now_us)
+{
+	ResourceXTraceEvent event = {0};
+
+	if (ClusterPcm == NULL || pg_atomic_read_u64(&ClusterPcm->trace_active_epoch) == 0)
+		return;
+	event.kind = RESOURCE_X_TRACE_FOLLOWER_JOIN;
+	event.detail = round->phase;
+	event.time_us = now_us;
+	event.assertion = round->request.logical_assertion;
+	event.formation = round->resource_formation;
+	event.master_session = round->master_session_incarnation;
+	event.attempt = round->request.assertion_sequence;
+	event.base_generation = round->accepted_base;
+	event.peer = round->current_master_node;
+	event.value[0] = round->head_change_generation;
+	event.value[1] = round->head_no_progress_deadline_us;
+	cluster_pcm_lock_resource_x_trace_note(&event);
+}
+
 const char *
 cluster_pcm_lock_resource_x_head_failure_name(uint8 reason)
 {
@@ -10782,6 +11048,7 @@ pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progres
 						|| progress_us >= UINT64_MAX - round->head_no_progress_budget_us))))) {
 		round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
 		round->head_failure_reason = RESOURCE_X_HEAD_PROGRESS_OVERFLOW;
+		pcm_rx_trace_head(round, 0, now_us);
 		ConditionVariableBroadcast(&entry->wait_cv);
 		return false;
 	}
@@ -10792,6 +11059,7 @@ pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progres
 		if (preterminal)
 			round->head_no_progress_deadline_us = progress_us + round->head_no_progress_budget_us;
 	}
+	pcm_rx_trace_head(round, semantic_progress ? 1 : 0, now_us);
 	ConditionVariableBroadcast(&entry->wait_cv);
 	return true;
 }
@@ -10833,6 +11101,7 @@ pcm_resource_x_bootstrap_round_clear_binding_locked(
 	uint64 highest_attempt_floor;
 
 	Assert(round != NULL);
+	pcm_rx_trace_head(round, 2, 0); /* exact old round before its binding is erased */
 	highest_attempt_floor = round->highest_attempt_floor;
 	memset(round, 0, sizeof(*round));
 	round->highest_attempt_floor = highest_attempt_floor;
@@ -11601,6 +11870,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 			goto round_step_done;
 		}
+		pcm_rx_trace_join(round, now_us);
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
@@ -11790,6 +12060,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 	}
 
 round_step_done:
+	if (action == RESOURCE_X_BOOTSTRAP_ROUND_WAIT)
+		pcm_rx_trace_join(round, now_us);
 	if (broadcast)
 		ConditionVariableBroadcast(&entry->wait_cv);
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED) {
@@ -20023,6 +20295,8 @@ pcm_resource_x_requester_retirement_prepare_locked(
 	}
 	witness_out->had_join = true;
 	witness_out->proof_kind = proof_kind;
+	witness_out->diagnostic_master_session = snapshot.master_session_incarnation;
+	witness_out->diagnostic_base_generation = snapshot.base_authority_generation;
 	if (proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER && join->image_valid != 0)
 		witness_out->diagnostic_source_mode = image.body.image_envelope.source_fence[28];
 	witness_out->final_authority_generation
@@ -20176,6 +20450,27 @@ pcm_resource_x_requester_retirement_commit_locked(
 	join = &state->requester_join;
 	if (witness->had_join && !witness->already_settled) {
 		ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+		ResourceXTraceEvent event = {0};
+
+		event.kind = RESOURCE_X_TRACE_RETIRE;
+		event.detail = witness->proof_kind;
+		event.flags = (witness->install_succeeded ? 1 : 0)
+			| (witness->requester_loss_seen ? 2 : 0)
+			| ((uint32)witness->diagnostic_source_mode << 8);
+		event.assertion = ref->assertion;
+		event.formation = ref->formation;
+		event.attempt = ref->acquisition_generation;
+		event.master_session = witness->diagnostic_master_session;
+		event.base_generation = witness->diagnostic_base_generation;
+		event.final_generation = witness->final_authority_generation;
+		event.peer = join->image_source_node;
+		event.value[0] = witness->t_image_us;
+		event.value[1] = witness->t_grant_us;
+		event.value[2] = witness->t_install_us;
+		if (round->request.assertion_sequence == ref->acquisition_generation
+			&& resource_x_assertion_equal(&round->request.logical_assertion, &ref->assertion))
+			event.value[3] = round->diagnostic_started_us;
+		cluster_pcm_lock_resource_x_trace_note(&event);
 
 		if (witness->install_succeeded && !witness->requester_loss_seen) {
 			bool remote_x = witness->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
