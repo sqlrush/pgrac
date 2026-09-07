@@ -276,6 +276,10 @@ static const char *const BuiltinTrancheNames[] = {
 		"ClusterPcmXMaster",
 		/* PGRAC LWTRANCHE_CLUSTER_PCM_X_LOCAL: spec-2.36a local coordinator */
 		"ClusterPcmXLocal",
+		/* PGRAC: local terminal-reference census table exclusion. */
+		"ClusterCtrcOrigin",
+		"ClusterCtrcParticipant",
+		"ClusterCtrcReceipt",
 	#endif
 	};
 

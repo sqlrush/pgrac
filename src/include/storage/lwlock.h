@@ -382,6 +382,10 @@ typedef enum BuiltinTrancheIds {
 		LWTRANCHE_CLUSTER_PCM_X_MASTER,
 		/* PGRAC (spec-2.36a): PCM-X node-local coordinator partitions. */
 		LWTRANCHE_CLUSTER_PCM_X_LOCAL,
+		/* PGRAC: local terminal-reference census table exclusion. */
+		LWTRANCHE_CLUSTER_CTRC_ORIGIN,
+		LWTRANCHE_CLUSTER_CTRC_PARTICIPANT,
+		LWTRANCHE_CLUSTER_CTRC_RECEIPT,
 	#endif
 		LWTRANCHE_FIRST_USER_DEFINED
 	} BuiltinTrancheIds;

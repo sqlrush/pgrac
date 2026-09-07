@@ -28,7 +28,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
-#include "storage/spin.h"
+#include "storage/lwlock.h"
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
 #include "access/generic_xlog.h"
@@ -69,7 +69,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(7)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(8)
 const uint8 cluster_ctrc_empty_sha256[32] = {
 	0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
 	0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
@@ -1537,12 +1537,15 @@ ctrc_target_encode(const ClusterCtrcTargetV1 *target,
 	return true;
 }
 
-/* Header bytes are part of sizing, not a wire or shared ABI promise. */
+/* Header bytes are part of sizing, not a wire or shared ABI promise.
+ * Table-wide snapshots need sleepable exclusion, not spinlock backoff.
+ * Lock order is origin -> receipt or participant -> receipt. Protected
+ * helpers must not perform I/O or acquire external physical locks. */
 typedef struct ClusterCtrcSharedHeader
 {
-	slock_t origin_lock;
-	slock_t participant_lock;
-	slock_t receipt_lock;
+	LWLock origin_lock;
+	LWLock participant_lock;
+	LWLock receipt_lock;
 	uint32 magic;
 	uint32 version;
 	uint32 global_grant_generation;
@@ -1987,8 +1990,8 @@ ctrc_origin_next_certificate_snapshot_shared(
 		|| !cluster_ctrc_shmem_ready())
 		return false;
 	limit = ctrc_scan_limit(CTRC_SCAN_CERTIFICATE, CtrcShared->origin_key_entries);
-	SpinLockAcquire(&CtrcShared->origin_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (visited = 0; visited < limit; visited++) {
 		uint64 index = (scan_cursor + visited)
 			% CtrcShared->origin_key_entries;
@@ -2006,8 +2009,8 @@ ctrc_origin_next_certificate_snapshot_shared(
 		found = true;
 		break;
 	}
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	ctrc_scan_charge(CTRC_SCAN_CERTIFICATE, visited + (found ? 1 : 0));
 	return found;
 }
@@ -2021,13 +2024,13 @@ ctrc_origin_certificate_snapshot_matches_shared(
 
 	if (expected == NULL || !cluster_ctrc_shmem_ready())
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	exact = ctrc_origin_certificate_snapshot_index_locked(
 		expected->origin_index, &current)
 		&& memcmp(&current, expected, sizeof(current)) == 0;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return exact;
 }
 
@@ -2041,16 +2044,16 @@ ctrc_origin_certificate_commit_shared(
 	if (snapshot == NULL || !cluster_ctrc_shmem_ready()
 		|| snapshot->origin_index >= CtrcShared->origin_key_entries)
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[snapshot->origin_index];
 	committed = cluster_ctrc_origin_certificate_commit_entry(
 		origin, snapshot);
 	if (committed && origin->touched_bitmap == 0)
 		committed = ctrc_origin_release_reclaim_locked(
 			snapshot->origin_index);
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return committed;
 }
 
@@ -2161,9 +2164,9 @@ cluster_ctrc_shmem_init(void)
 			= capacity.participant_ack_summary_entries;
 		CtrcShared->origin_ack_inbox_entries
 			= capacity.origin_ack_inbox_entries;
-		SpinLockInit(&CtrcShared->origin_lock);
-		SpinLockInit(&CtrcShared->participant_lock);
-		SpinLockInit(&CtrcShared->receipt_lock);
+		LWLockInitialize(&CtrcShared->origin_lock, LWTRANCHE_CLUSTER_CTRC_ORIGIN);
+		LWLockInitialize(&CtrcShared->participant_lock, LWTRANCHE_CLUSTER_CTRC_PARTICIPANT);
+		LWLockInitialize(&CtrcShared->receipt_lock, LWTRANCHE_CLUSTER_CTRC_RECEIPT);
 		CtrcShared->global_grant_generation = 1;
 		CtrcShared->global_reservation_generation = 1;
 		CtrcShared->global_journal_generation = 1;
@@ -2244,7 +2247,7 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	if (snapshot == NULL || !cluster_ctrc_shmem_ready())
 		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++)
 	{
 		switch ((ClusterCtrcOriginState)ctrc_origin_entries()[i].state)
@@ -2269,9 +2272,9 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 		}
 	}
 	snapshot->full_refusal_count = CtrcShared->full_refusal_count;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 
-	SpinLockAcquire(&CtrcShared->participant_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->participant_key_entries; i++)
 	{
 		switch ((ClusterCtrcParticipantState)
@@ -2296,9 +2299,9 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 				break;
 		}
 	}
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->receipt_entries; i++)
 	{
 		uint32 state = pg_atomic_read_u32((pg_atomic_uint32 *)
@@ -2329,7 +2332,7 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 				break;
 		}
 	}
-	SpinLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
 	snapshot->test_barrier_hit_count = pg_atomic_read_u64(
 		&CtrcShared->test_barrier_hit_count);
 	snapshot->test_barrier_phase = pg_atomic_read_u32(
@@ -2507,7 +2510,7 @@ ctrc_allocate_journal_sequence(uint64 *sequence_out)
 	if (sequence_out == NULL || !cluster_ctrc_shmem_ready())
 		return false;
 	*sequence_out = 0;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	if (CtrcShared->global_journal_generation != 0
 		&& CtrcShared->global_journal_generation != UINT64_MAX)
 	{
@@ -2516,7 +2519,7 @@ ctrc_allocate_journal_sequence(uint64 *sequence_out)
 	}
 	else
 		CtrcShared->full_refusal_count++;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return allocated;
 #else
 	static uint64 unit_journal_sequence = 1;
@@ -2662,12 +2665,12 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	if (!cluster_ctrc_shmem_ready() || !ctrc_origin_index(key, &index))
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN
 		&& memcmp(&origin->key, key, sizeof(*key)) != 0)
 	{
-		SpinLockRelease(&CtrcShared->origin_lock);
+		LWLockRelease(&CtrcShared->origin_lock);
 		return CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED;
 	}
 	if (origin->state == CTRC_ORIGIN_OPEN)
@@ -2679,14 +2682,14 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	else
 	{
 		CtrcShared->full_refusal_count++;
-		SpinLockRelease(&CtrcShared->origin_lock);
+		LWLockRelease(&CtrcShared->origin_lock);
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 	}
 	result = cluster_ctrc_origin_reserve_entry(origin, key, index,
 		reservation_generation, reservation);
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
 		CtrcShared->full_refusal_count++;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return result;
 #else
 	(void)key;
@@ -2712,11 +2715,11 @@ cluster_ctrc_origin_release_overlap_pending(const ClusterCtrcTxnKeyV1 *key)
 
 	if (!cluster_ctrc_shmem_ready() || !ctrc_origin_index(key, &index))
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	pending = origin->state == CTRC_ORIGIN_RELEASE_PROVEN
 		&& memcmp(&origin->key, key, sizeof(*key)) != 0;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return pending;
 #else
 	(void)key;
@@ -2736,10 +2739,10 @@ cluster_ctrc_origin_cancel_pre_bind(
 		|| !ctrc_origin_index(&reservation->key, &index)
 		|| index != reservation->origin_index)
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	cancelled = cluster_ctrc_origin_cancel_pre_bind_entry(
 		&ctrc_origin_entries()[index], index, reservation);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return cancelled;
 #else
 	(void)reservation;
@@ -2759,10 +2762,10 @@ cluster_ctrc_origin_block_post_bind(
 		|| !ctrc_origin_index(&reservation->key, &index)
 		|| index != reservation->origin_index)
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	blocked = cluster_ctrc_origin_block_post_bind_entry(
 		&ctrc_origin_entries()[index], index, reservation);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return blocked;
 #else
 	(void)reservation;
@@ -2797,7 +2800,7 @@ cluster_ctrc_origin_open_reserved(
 		|| index != reservation->origin_index)
 		return false;
 
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_OPEN
 		&& origin->reservation_generation
@@ -2830,7 +2833,7 @@ cluster_ctrc_origin_open_reserved(
 		CtrcShared->full_refusal_count++;
 	if (opened)
 		*grant_generation = origin->grant_generation;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (issued)
 		cluster_ctrc_stat_bump(CTRC_STAT_GRANT_ISSUED);
 	else if (!opened)
@@ -2865,7 +2868,7 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 		|| !ctrc_origin_index(key, &index))
 		return CLUSTER_CTRC_TOUCH_REFUSED;
 
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (memcmp(&origin->key, key, sizeof(*key)) != 0)
 	{
@@ -2876,7 +2879,7 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 	else
 		result = cluster_ctrc_origin_record_touched(
 			origin, participant, proof_class, grant_out);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (result == CLUSTER_CTRC_TOUCH_REFUSED)
 		cluster_ctrc_stat_bump(CTRC_STAT_GRANT_REFUSED);
 	return result;
@@ -3015,11 +3018,11 @@ cluster_ctrc_origin_grant_publishable(
 	if (key == NULL || participant == NULL || grant_generation == 0
 		|| !cluster_ctrc_shmem_ready() || !ctrc_origin_index(key, &index))
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	publishable = cluster_ctrc_origin_grant_publishable_entry(
 		origin, key, participant, grant_generation);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return publishable;
 #else
 	(void)key;
@@ -3266,7 +3269,7 @@ cluster_ctrc_origin_request_snapshot_shared(
 		return false;
 	bit = UINT32_C(1) << participant_node_id;
 
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++)
 	{
 		ClusterCtrcOriginEntry *candidate = &ctrc_origin_entries()[i];
@@ -3301,7 +3304,7 @@ cluster_ctrc_origin_request_snapshot_shared(
 			*suboperation_out = suboperation;
 		}
 	}
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return matched != NULL && *grant_generation_out != 0
 		&& *seal_generation_out != 0 && *suboperation_out != 0;
 #else
@@ -3364,7 +3367,7 @@ cluster_ctrc_origin_note_close_reply_shared(
 		|| !cluster_ctrc_shmem_ready())
 		return false;
 	bit = UINT32_C(1) << participant_node_id;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++)
 	{
 		ClusterCtrcOriginEntry *candidate = &ctrc_origin_entries()[i];
@@ -3392,7 +3395,7 @@ cluster_ctrc_origin_note_close_reply_shared(
 					 && (confirmed_before != matched->close_confirmed_bitmap
 						 || state_before != matched->state);
 	}
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
 	else if (noted && result == CTRC_SEAL_REPLY_PENDING_DRAIN)
@@ -3424,8 +3427,8 @@ cluster_ctrc_origin_note_certificate_reply_shared(
 		|| !cluster_ctrc_shmem_ready())
 		return false;
 	bit = UINT32_C(1) << participant_node_id;
-	SpinLockAcquire(&CtrcShared->origin_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++)
 	{
 		ClusterCtrcOriginEntry *candidate = &ctrc_origin_entries()[i];
@@ -3460,8 +3463,8 @@ cluster_ctrc_origin_note_certificate_reply_shared(
 				matched->state = CTRC_ORIGIN_BLOCKED;
 		}
 	}
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (noted && progressed)
 		ctrc_semantic_progress(true);
 	return noted;
@@ -3488,7 +3491,7 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 		|| !cluster_ctrc_shmem_ready())
 		return false;
 	limit = ctrc_scan_limit(CTRC_SCAN_OPEN, CtrcShared->origin_key_entries);
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < limit; i++) {
 		uint64 index = (scan_cursor + i) % CtrcShared->origin_key_entries;
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
@@ -3508,7 +3511,7 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 		found = true;
 		break;
 	}
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	ctrc_scan_charge(CTRC_SCAN_OPEN, i + (found ? 1 : 0));
 	return found;
 #else
@@ -3531,12 +3534,12 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 	if (key == NULL || !cluster_ctrc_shmem_ready()
 		|| !ctrc_origin_index(key, &index))
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (memcmp(&origin->key, key, sizeof(*key)) != 0)
 	{
 		origin->state = CTRC_ORIGIN_BLOCKED;
-		SpinLockRelease(&CtrcShared->origin_lock);
+		LWLockRelease(&CtrcShared->origin_lock);
 		return false;
 	}
 	if (origin->state != CTRC_ORIGIN_OPEN)
@@ -3544,7 +3547,7 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 		sealed = origin->state >= CTRC_ORIGIN_SEALING
 			&& origin->state <= CTRC_ORIGIN_RELEASE_PROVEN
 			&& origin->seal_generation != 0;
-		SpinLockRelease(&CtrcShared->origin_lock);
+		LWLockRelease(&CtrcShared->origin_lock);
 		return sealed;
 	}
 	if (CtrcShared->global_seal_generation == 0
@@ -3552,13 +3555,13 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 	{
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		CtrcShared->full_refusal_count++;
-		SpinLockRelease(&CtrcShared->origin_lock);
+		LWLockRelease(&CtrcShared->origin_lock);
 		return false;
 	}
 	seal_generation = CtrcShared->global_seal_generation++;
 	sealed = cluster_ctrc_origin_begin_seal_entry(origin, seal_generation);
 	started = sealed;
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (started)
 		cluster_ctrc_stat_bump(CTRC_STAT_SEAL_STARTED);
 	else
@@ -3625,7 +3628,7 @@ ctrc_dispatch_batch_collect(void)
 	if (!cluster_ctrc_shmem_ready())
 		return;
 	Assert(CtrcShared->origin_key_entries == lengthof(CtrcOriginHint));
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[i];
 		CtrcCleanerOriginHint *hint = &CtrcOriginHint[i];
@@ -3677,7 +3680,7 @@ ctrc_dispatch_batch_collect(void)
 		CtrcBatch.dispatch_index[CtrcBatch.dispatch_count++] = index;
 		CtrcDispatchCursor = (index + 1) % CtrcShared->origin_key_entries;
 	}
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 
 	/* Non-atomic observation across tables/stages. Age is a lower bound
 	 * since this process first saw the seal, never an expiry decision. */
@@ -3702,7 +3705,7 @@ cluster_ctrc_origin_next_close_dispatch_shared(
 		return false;
 	if (!CtrcBatch.active && CtrcBatch.dispatch_next >= CtrcBatch.dispatch_count)
 		ctrc_dispatch_batch_collect();
-	SpinLockAcquire(&CtrcShared->origin_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	while (CtrcBatch.dispatch_next < CtrcBatch.dispatch_count) {
 		uint64 index = CtrcBatch.dispatch_index[CtrcBatch.dispatch_next++];
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
@@ -3753,7 +3756,7 @@ cluster_ctrc_origin_next_close_dispatch_shared(
 		if (found)
 			break;
 	}
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	return found;
 #else
 	if (dispatch_out != NULL)
@@ -4853,8 +4856,8 @@ cluster_ctrc_receipt_prepare_shared(
 
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	result = cluster_ctrc_receipt_prepare_table_locked(participant, key,
 		identity, grant_generation, publication, target, receipts,
 		ctrc_receipt_probe_states(), CtrcShared->receipt_entries,
@@ -4869,8 +4872,8 @@ cluster_ctrc_receipt_prepare_shared(
 		ctrc_receipt_handle_fill(handle, participant, participant_index,
 			&receipts[receipt_index], receipt_index);
 
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	if (result == CLUSTER_CTRC_PREPARE_READY)
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_PREPARED);
 	else if (result == CLUSTER_CTRC_PREPARE_CAPACITY)
@@ -5363,8 +5366,8 @@ cluster_ctrc_receipt_discharge_itl_shared(
 		cluster_ctrc_stat_bump(CTRC_STAT_TARGET_RETAINED);
 		return CLUSTER_CTRC_DISCHARGE_RETAIN;
 	}
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	state_before = pg_atomic_read_u32(
 		(pg_atomic_uint32 *)&handle->receipt->state);
 	result = ctrc_receipt_handle_exact(handle)
@@ -5373,8 +5376,8 @@ cluster_ctrc_receipt_discharge_itl_shared(
 		? cluster_ctrc_receipt_discharge_itl(
 			handle->participant, handle->receipt, projection, durability)
 		: CLUSTER_CTRC_DISCHARGE_RETAIN;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	if (result == CLUSTER_CTRC_DISCHARGE_CLEANED)
 	{
 		if (state_before == CTRC_RECEIPT_APPLIED)
@@ -5484,8 +5487,8 @@ cluster_ctrc_receipt_discharge_current_mx_shared(
 		cluster_ctrc_stat_bump(CTRC_STAT_TARGET_RETAINED);
 		return CLUSTER_CTRC_DISCHARGE_RETAIN;
 	}
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	state_before = pg_atomic_read_u32(
 		(pg_atomic_uint32 *)&handle->receipt->state);
 	result = ctrc_receipt_handle_exact(handle)
@@ -5493,8 +5496,8 @@ cluster_ctrc_receipt_discharge_current_mx_shared(
 			handle->participant, handle->receipt, expected_target,
 			clean_result, durability)
 		: CLUSTER_CTRC_DISCHARGE_RETAIN;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	if (result == CLUSTER_CTRC_DISCHARGE_CLEANED)
 	{
 		if (state_before == CTRC_RECEIPT_APPLIED)
@@ -5665,15 +5668,15 @@ cluster_ctrc_origin_ack_land_shared(
 		|| !ctrc_origin_ack_index(&ack->transaction_key,
 			ack->participant_node_id, &ack_index))
 		return false;
-	SpinLockAcquire(&CtrcShared->origin_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[origin_index];
 	ack_before = origin->ack_bitmap;
 	landed = cluster_ctrc_origin_ack_land_entry(origin, request_id, ack,
 		&ctrc_origin_ack_entries()[ack_index]);
 	progressed = landed && ack_before != origin->ack_bitmap;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->origin_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->origin_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
 	return landed;
@@ -5800,8 +5803,8 @@ cluster_ctrc_participant_request_shared(
 			&participant_index))
 		return CTRC_SEAL_REPLY_DENIED;
 
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	participant = &ctrc_participant_entries()[participant_index];
 	ack_summary = &ctrc_participant_ack_entries()[participant_index];
 	participant_before = *participant;
@@ -5833,8 +5836,8 @@ cluster_ctrc_participant_request_shared(
 	}
 	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
 				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
 	if (result == CTRC_SEAL_REPLY_PENDING_DRAIN)
@@ -6296,11 +6299,11 @@ cluster_ctrc_relation_removal_ready_shared(
 
 	if (!cluster_ctrc_shmem_ready())
 		return false;
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	ready = cluster_ctrc_relation_removal_ready_from_snapshot(
 		ctrc_receipt_entries(), CtrcShared->receipt_entries,
 		spc_oid, db_oid, rel_number);
-	SpinLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
 	return ready;
 #else
 	(void)spc_oid;
@@ -6716,8 +6719,8 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	*participant_index_out = UINT64_MAX;
 	*receipt_index_out = UINT64_MAX;
 	limit = ctrc_scan_limit(CTRC_SCAN_RECEIPT, CtrcShared->receipt_entries);
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (visited = 0; visited < limit; visited++) {
 		uint64 receipt_index = (scan_cursor + visited)
 			% CtrcShared->receipt_entries;
@@ -6748,8 +6751,8 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 		found = true;
 		break;
 	}
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	ctrc_scan_charge(CTRC_SCAN_RECEIPT, visited + (found ? 1 : 0));
 	return found;
 }
@@ -7944,8 +7947,8 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 	MemSet(snapshot, 0, sizeof(*snapshot));
 	*participant_index_out = UINT64_MAX;
 	limit = ctrc_scan_limit(CTRC_SCAN_ACK, CtrcShared->participant_key_entries);
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (visited = 0; visited < limit; visited++) {
 		uint64 index = (scan_cursor + visited)
 			% CtrcShared->participant_key_entries;
@@ -7973,8 +7976,8 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 		found = true;
 		break;
 	}
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	ctrc_scan_charge(CTRC_SCAN_ACK, visited + (found ? 1 : 0));
 	return found;
 }
@@ -7992,8 +7995,8 @@ ctrc_participant_copy_receipts(uint64 participant_index,
 	if (expected == NULL || (receipt_count != 0 && receipts == NULL)
 		|| participant_index >= CtrcShared->participant_key_entries)
 		return false;
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	participant = &ctrc_participant_entries()[participant_index];
 	if (memcmp(participant, expected, sizeof(*expected)) != 0
 		|| participant->state != CTRC_PARTICIPANT_ACK_READY
@@ -8021,8 +8024,8 @@ ctrc_participant_copy_receipts(uint64 participant_index,
 		&& participant->seal_generation == expected->seal_generation
 		&& participant->state == CTRC_PARTICIPANT_ACK_READY)
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	return exact;
 }
 
@@ -8055,8 +8058,8 @@ ctrc_participant_freeze_ack_exact(uint64 participant_index,
 		|| (receipt_count != 0 && sorted_receipts == NULL)
 		|| participant_index >= CtrcShared->participant_key_entries)
 		return false;
-	SpinLockAcquire(&CtrcShared->participant_lock);
-	SpinLockAcquire(&CtrcShared->receipt_lock);
+	LWLockAcquire(&CtrcShared->participant_lock, LW_EXCLUSIVE);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	participant = &ctrc_participant_entries()[participant_index];
 	summary = &ctrc_participant_ack_entries()[participant_index];
 	if (memcmp(participant, expected, sizeof(*expected)) != 0
@@ -8106,8 +8109,8 @@ ctrc_participant_freeze_ack_exact(uint64 participant_index,
 			 && participant->seal_generation == expected->seal_generation
 			 && participant->state == CTRC_PARTICIPANT_ACK_READY)
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
-	SpinLockRelease(&CtrcShared->receipt_lock);
-	SpinLockRelease(&CtrcShared->participant_lock);
+	LWLockRelease(&CtrcShared->receipt_lock);
+	LWLockRelease(&CtrcShared->participant_lock);
 	return exact;
 }
 

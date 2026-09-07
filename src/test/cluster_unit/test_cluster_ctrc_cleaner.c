@@ -23,6 +23,36 @@
 
 #include <stdlib.h>
 #include <time.h>
+#include "storage/lwlock.h"
+#include "storage/spin.h"
+
+static unsigned spin_acquisitions;
+static unsigned sleepable_acquisitions;
+static unsigned held_count;
+static const void *held_locks[2];
+static void test_lock_enter(const void *lock, bool sleepable);
+static void test_lock_leave(const void *lock);
+
+static void
+pg_attribute_unused() test_spin_acquire(volatile slock_t *lock)
+{
+	S_LOCK(lock);
+	test_lock_enter((const void *)lock, false);
+}
+
+static void
+pg_attribute_unused() test_spin_release(volatile slock_t *lock)
+{
+	test_lock_leave((const void *)lock);
+	S_UNLOCK(lock);
+}
+
+/* Observe the real shared bodies, including the old spinlock baseline.
+ * LWLock scheduling itself is PostgreSQL, not implemented by this fixture. */
+#undef SpinLockAcquire
+#undef SpinLockRelease
+#define SpinLockAcquire(lock) test_spin_acquire(lock)
+#define SpinLockRelease(lock) test_spin_release(lock)
 
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
 #define clock_gettime test_clock_gettime
@@ -40,6 +70,54 @@ int MaxBackends = 8;
 int cluster_node_id = 0;
 static unsigned wake_count;
 static uint64 test_now_us = UINT64_C(1000000);
+
+static void
+test_lock_enter(const void *lock, bool sleepable)
+{
+	if (CtrcShared == NULL || held_count >= lengthof(held_locks)
+		|| (lock != &CtrcShared->origin_lock && lock != &CtrcShared->participant_lock
+			&& lock != &CtrcShared->receipt_lock)
+		|| (held_count != 0
+			&& (lock != &CtrcShared->receipt_lock
+				|| (held_locks[0] != &CtrcShared->origin_lock
+					&& held_locks[0] != &CtrcShared->participant_lock))))
+		abort();
+	held_locks[held_count++] = lock;
+	if (sleepable)
+		sleepable_acquisitions++;
+	else
+		spin_acquisitions++;
+}
+
+static void
+test_lock_leave(const void *lock)
+{
+	if (held_count == 0 || held_locks[held_count - 1] != lock)
+		abort();
+	held_locks[--held_count] = NULL;
+}
+
+void
+LWLockInitialize(LWLock *lock, int tranche_id)
+{
+	MemSet(lock, 0, sizeof(*lock));
+	lock->tranche = tranche_id;
+}
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	if (mode != LW_EXCLUSIVE)
+		abort();
+	test_lock_enter(lock, true);
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	test_lock_leave(lock);
+}
 
 static int
 test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts)
@@ -122,11 +200,15 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static void
 reset_fixture(void)
 {
+	if (held_count != 0)
+		abort();
 	free(CtrcShared);
 	CtrcShared = NULL;
 	cluster_ctrc_shmem_init();
 	wake_count = 0;
 	test_now_us = UINT64_C(1000000);
+	spin_acquisitions = 0;
+	sleepable_acquisitions = 0;
 }
 
 static ClusterCtrcOriginEntry *
@@ -565,10 +647,175 @@ UT_TEST(test_certificate_scan_bounds_unpublished_candidates)
 	CtrcBatch.active = false;
 }
 
+/* Build one real pending receipt, cancel it without publishing a page
+ * reference, then close and encode its actual nonempty ACK. The fixture
+ * owns no disk or page I/O and must not claim durability of an applied row. */
+static bool
+seed_cancelled_ack(ClusterCtrcParticipantEntry *snapshot, ClusterCtrcReceipt *receipt,
+				   ClusterCtrcLocalReleaseAckV1 *ack, uint64 *participant_index,
+				   uint64 *receipt_index)
+{
+	ClusterCtrcOriginEntry *origin = seed_origin(0, 1);
+	ClusterCtrcPublicationIdV1 publication = { 0 };
+	ClusterCtrcTargetV1 target = { 0 };
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcDurability durability = { 0 };
+
+	publication.requester_node_id = 0;
+	publication.requester_boot_incarnation = origin->touched[0].boot_incarnation;
+	publication.capability_record_generation = origin->touched[0].capability_record_generation;
+	publication.requester_backend_id = 11;
+	publication.wire_request_id = 101;
+	publication.operation_id = 81;
+	publication.attempt_generation = 1;
+	publication.member_ordinal = UINT16_MAX;
+	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
+	publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	publication.grant_generation = origin->grant_generation;
+	target.kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	target.spc_oid = 1663;
+	target.db_oid = 5;
+	target.rel_number = 9001;
+	target.block_number = 44;
+	target.predecessor_page_lsn_origin_node_id = CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID;
+	target.publication_own_generation = 17;
+	target.publication_acquisition_epoch = 19;
+	target.relation_persistence = 'p';
+	target.needs_wal = true;
+	target.page_operation_kind = 1;
+	if (cluster_ctrc_receipt_prepare_shared(&origin->key, &origin->touched[0],
+											origin->grant_generation, &publication, &target,
+											&handle)
+			!= CLUSTER_CTRC_PREPARE_READY
+		|| !handle.valid || !cluster_ctrc_receipt_cancel_shared(&handle)
+		|| !ctrc_participant_index(&origin->key, 0, participant_index))
+		return false;
+	*receipt_index = handle.receipt_index;
+	participant = &ctrc_participant_entries()[*participant_index];
+	if (cluster_ctrc_participant_close(participant, &origin->touched[0], origin->grant_generation,
+									   origin->seal_generation)
+		!= CLUSTER_CTRC_CLOSE_ACK_READY)
+		return false;
+	*snapshot = *participant;
+	*receipt = ctrc_receipt_entries()[*receipt_index];
+	return cluster_ctrc_participant_ack_from_snapshot(snapshot, receipt, 1, &durability, ack)
+		   == CLUSTER_CTRC_ACK_RELEASED;
+}
+
+UT_TEST(test_shared_prepare_journal_uses_sleepable_exclusion)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index;
+	uint64 receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(receipt.state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(snapshot.receipt_count, 1);
+	UT_ASSERT_EQ(spin_acquisitions, 0);
+	UT_ASSERT_EQ(sleepable_acquisitions, 3);
+}
+
+UT_TEST(test_nonempty_ack_copy_and_freeze_use_sleepable_exclusion)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcReceipt copied;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index;
+	uint64 receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	spin_acquisitions = sleepable_acquisitions = 0;
+	UT_ASSERT(ctrc_participant_copy_receipts(participant_index, &snapshot, &copied, 1));
+	UT_ASSERT_EQ(memcmp(&copied, &receipt, sizeof(receipt)), 0);
+	UT_ASSERT(ctrc_participant_freeze_ack_exact(participant_index, &snapshot, &copied, 1, &ack));
+	UT_ASSERT_EQ(ctrc_receipt_entries()[receipt_index].state, CTRC_RECEIPT_ACK_FROZEN);
+	UT_ASSERT_EQ(ctrc_participant_entries()[participant_index].state, CTRC_PARTICIPANT_ACK_FROZEN);
+	UT_ASSERT_EQ(memcmp(&ctrc_participant_ack_entries()[participant_index], &ack, sizeof(ack)), 0);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(spin_acquisitions, 0);
+	UT_ASSERT_EQ(sleepable_acquisitions, 4);
+}
+
+UT_TEST(test_stale_ack_snapshot_releases_without_publication)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index;
+	uint64 receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	before = snapshot;
+	snapshot.grant_generation++;
+	UT_ASSERT(!ctrc_participant_copy_receipts(participant_index, &snapshot, &receipt, 1));
+	UT_ASSERT(!ctrc_participant_freeze_ack_exact(participant_index, &snapshot, &receipt, 1, &ack));
+	UT_ASSERT_EQ(memcmp(&ctrc_participant_entries()[participant_index], &before, sizeof(before)),
+				 0);
+	UT_ASSERT_EQ(ctrc_receipt_entries()[receipt_index].state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[participant_index], sizeof(ack)));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_receipt_drift_retains_bytes_and_blocks_ack)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcReceipt changed;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index;
+	uint64 receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	ctrc_receipt_entries()[receipt_index].target.predecessor_page_scn++;
+	changed = ctrc_receipt_entries()[receipt_index];
+	UT_ASSERT(!ctrc_participant_freeze_ack_exact(participant_index, &snapshot, &receipt, 1, &ack));
+	UT_ASSERT_EQ(ctrc_participant_entries()[participant_index].state, CTRC_PARTICIPANT_BLOCKED);
+	UT_ASSERT_EQ(memcmp(&ctrc_receipt_entries()[receipt_index], &changed, sizeof(changed)), 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[participant_index], sizeof(ack)));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_sleepable_header_requires_exact_layout_and_tranches)
+{
+	ClusterCtrcCapacity capacity;
+
+	reset_fixture();
+	UT_ASSERT(cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity));
+	UT_ASSERT(cluster_ctrc_shmem_ready());
+	UT_ASSERT_EQ(CtrcShared->total_bytes, capacity.total_bytes);
+	UT_ASSERT_EQ(CtrcShared->origin_offset, MAXALIGN(sizeof(*CtrcShared)));
+	UT_ASSERT_EQ(CtrcShared->origin_lock.tranche, LWTRANCHE_CLUSTER_CTRC_ORIGIN);
+	UT_ASSERT_EQ(CtrcShared->participant_lock.tranche, LWTRANCHE_CLUSTER_CTRC_PARTICIPANT);
+	UT_ASSERT_EQ(CtrcShared->receipt_lock.tranche, LWTRANCHE_CLUSTER_CTRC_RECEIPT);
+	CtrcShared->version--;
+	UT_ASSERT(!cluster_ctrc_shmem_ready());
+	CtrcShared->version++;
+	CtrcShared->total_bytes--;
+	UT_ASSERT(!cluster_ctrc_shmem_ready());
+	CtrcShared->total_bytes++;
+	UT_ASSERT(cluster_ctrc_shmem_ready());
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	ClusterCtrcCapacity capacity;
+
+	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
+		abort();
+	UT_PLAN(17);
+	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
+		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
 	UT_RUN(test_pending_participant_does_not_starve_peer);
 	UT_RUN(test_duplicate_pending_is_accepted_without_wakeup);
@@ -581,6 +828,11 @@ main(void)
 	UT_RUN(test_real_ack_and_certificate_consumers_are_idempotent);
 	UT_RUN(test_receipt_and_ack_scans_do_not_retry_retained_entries);
 	UT_RUN(test_certificate_scan_bounds_unpublished_candidates);
+	UT_RUN(test_shared_prepare_journal_uses_sleepable_exclusion);
+	UT_RUN(test_nonempty_ack_copy_and_freeze_use_sleepable_exclusion);
+	UT_RUN(test_stale_ack_snapshot_releases_without_publication);
+	UT_RUN(test_receipt_drift_retains_bytes_and_blocks_ack);
+	UT_RUN(test_sleepable_header_requires_exact_layout_and_tranches);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
