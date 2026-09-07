@@ -474,6 +474,58 @@ cluster_heap_undo_receipt_errdetail(bool ctrc)
 					 cluster_undo_record_receipt_last_reason(), cluster_node_id);
 }
 
+/* Called only at the final ERROR, after the locks have been released. Keep
+ * this evidence with the client error rather than a rate-limited early LOG. */
+static int
+cluster_heap_undo_retry_errdetail(const ClusterUndoRecordPrepareReceipt *before,
+	const ClusterCtrcTargetV1 observed[CLUSTER_UNDO_RECORD_CTRC_TARGETS],
+	uint8 required_mask, uint8 failure_bits, uint8 changed_mask)
+{
+	StringInfoData detail;
+	bool exact_ready = false;
+	bool targets_invalidated = false;
+	bool evidence;
+	uint8 i;
+	int result;
+
+	evidence = cluster_undo_record_retry_evidence(before->reservation_sequence,
+		&exact_ready, &targets_invalidated);
+	initStringInfo(&detail);
+	appendStringInfo(&detail,
+		"PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=%s PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
+		"reservation=" UINT64_FORMAT " retry_evidence=%d exact_ready=%d targets_invalidated=%d "
+		"required=%u pending=%u prepared=%u applied=%u capture_or_stage_or_mask=%u changed=%u",
+		cluster_undo_record_receipt_last_reason(), cluster_node_id,
+		before->reservation_sequence, evidence, exact_ready, targets_invalidated,
+		(unsigned)required_mask, (unsigned)before->ctrc_pending_mask,
+		(unsigned)before->ctrc_prepared_mask, (unsigned)before->ctrc_applied_mask,
+		(unsigned)failure_bits, (unsigned)changed_mask);
+	for (i = 0; i < CLUSTER_UNDO_RECORD_CTRC_TARGETS; i++)
+	{
+		const ClusterCtrcTargetV1 *old = &before->ctrc_pending_targets[i];
+		const ClusterCtrcTargetV1 *now = &observed[i];
+
+		appendStringInfo(&detail,
+			" target%u_old=%u/%u/%u/%u/%u,origin%u,lsn" UINT64_FORMAT
+			",scn" UINT64_FORMAT ",generation" UINT64_FORMAT ",epoch" UINT64_FORMAT
+			" target%u_new=%u/%u/%u/%u/%u,origin%u,lsn" UINT64_FORMAT
+			",scn" UINT64_FORMAT ",generation" UINT64_FORMAT ",epoch" UINT64_FORMAT,
+			(unsigned)i, old->spc_oid, old->db_oid, old->rel_number,
+			(unsigned)old->fork_number, old->block_number,
+			(unsigned)old->predecessor_page_lsn_origin_node_id,
+			(uint64)old->predecessor_page_lsn, old->predecessor_page_scn,
+			old->publication_own_generation, old->publication_acquisition_epoch,
+			(unsigned)i, now->spc_oid, now->db_oid, now->rel_number,
+			(unsigned)now->fork_number, now->block_number,
+			(unsigned)now->predecessor_page_lsn_origin_node_id,
+			(uint64)now->predecessor_page_lsn, now->predecessor_page_scn,
+			now->publication_own_generation, now->publication_acquisition_epoch);
+	}
+	result = errdetail_internal("%s", detail.data);
+	pfree(detail.data);
+	return result;
+}
+
 typedef enum ClusterHeapPreparedUndoResult
 {
 	CLUSTER_HEAP_PREPARED_UNDO_READY = 0,
@@ -922,6 +974,10 @@ cluster_heap_ctrc_final_itl_target(
 		successor.first_change_lsn = InvalidXLogRecPtr;
 
 	*final_target = receipt->ctrc_pending_targets[target_ordinal];
+	/* PREPARE kept an immutable observation floor. The exact publication
+	 * predecessor belongs to this locked page, not the earlier snapshot. */
+	if (!cluster_heap_ctrc_capture_predecessor_page_version(page, final_target))
+		return false;
 	final_target->kind = CTRC_TARGET_EXACT_ITL_SLOT;
 	final_target->itl_slot_index = slot_index;
 	final_target->itl_slot_wrap = successor.wrap;
@@ -1691,8 +1747,7 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 		if (!cluster_undo_record_ctrc_stage_pending(
 				receipt, 0, &pending_target))
 			return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
-	} else if (memcmp(&receipt->ctrc_pending_targets[0], &pending_target, sizeof(pending_target))
-			   != 0) {
+	} else if (!cluster_undo_record_ctrc_pending_recheck(receipt, 0, &pending_target)) {
 		*targets_invalidated = true;
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
@@ -12232,6 +12287,9 @@ l_pgrac_reacquire:
 		uint8 ctrc_target_ordinal;
 		bool ctrc_prepare_only = false;
 		bool ctrc_target_mismatch = false;
+		/* Diagnostic bits: capture=1, stage=2, required-mask=4. */
+		uint8 ctrc_failure_bits = 0;
+		uint8 ctrc_changed_mask = 0;
 		ClusterHeapItlTerminalBatchApplyResult census_apply_result = {
 			CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0};
 
@@ -12475,7 +12533,10 @@ l_pgrac_reacquire:
 				&& !cluster_heap_ctrc_pending_itl_target(relation, newbuf,
 					&new_dml_guard, UNDO_RECORD_UPDATE,
 					&ctrc_pending_targets[1])))
+		{
 			ctrc_target_mismatch = true;
+			ctrc_failure_bits |= UINT8_C(1);
+		}
 		for (ctrc_target_ordinal = 0;
 			 ctrc_target_ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
 			 ctrc_target_ordinal++)
@@ -12493,15 +12554,15 @@ l_pgrac_reacquire:
 						&ctrc_pending_targets[ctrc_target_ordinal]))
 				{
 					ctrc_target_mismatch = true;
+					ctrc_failure_bits |= UINT8_C(2);
 					continue;
 				}
 			}
-			else if (memcmp(
-						 &undo_receipt.ctrc_pending_targets[ctrc_target_ordinal],
-						 &ctrc_pending_targets[ctrc_target_ordinal],
-						 sizeof(ClusterCtrcTargetV1)) != 0)
+			else if (!cluster_undo_record_ctrc_pending_recheck(&undo_receipt,
+						 ctrc_target_ordinal, &ctrc_pending_targets[ctrc_target_ordinal]))
 			{
 				ctrc_target_mismatch = true;
+				ctrc_changed_mask |= target_bit;
 				continue;
 			}
 			if ((undo_receipt.ctrc_prepared_mask & target_bit) == 0
@@ -12514,7 +12575,10 @@ l_pgrac_reacquire:
 			if ((undo_receipt.ctrc_pending_mask
 				 & ((UINT8_C(1) << CLUSTER_UNDO_RECORD_CTRC_TARGETS) - 1))
 				!= ctrc_required_mask)
+			{
 				ctrc_target_mismatch = true;
+				ctrc_failure_bits |= UINT8_C(4);
+			}
 			if (cluster_current_mx_recomposed
 				&& cluster_current_mx_undo_diagnostic_budget > 0)
 			{
@@ -12623,6 +12687,8 @@ l_pgrac_reacquire:
 				}
 				else
 				{
+					ClusterUndoRecordPrepareReceipt retry_before = undo_receipt;
+
 					if (!cluster_heap_retry_undo_record_exact(
 							UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
 							(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
@@ -12632,7 +12698,9 @@ l_pgrac_reacquire:
 							ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 							 errmsg("cluster undo reservation expired before heap update retry"),
-							 cluster_heap_undo_receipt_errdetail(false)));
+							 cluster_heap_undo_retry_errdetail(&retry_before,
+								ctrc_pending_targets, ctrc_required_mask,
+								ctrc_failure_bits, ctrc_changed_mask)));
 				}
 				if (old_tuple_temp_locked)
 					goto l_pgrac_reacquire;

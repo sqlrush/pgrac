@@ -143,6 +143,8 @@ typedef enum ClusterUndoReceiptMetric {
 extern bool
 cluster_undo_record_receipt_stats_snapshot(uint64 values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT]);
 extern const char *cluster_undo_record_receipt_last_reason(void);
+extern bool cluster_undo_record_retry_evidence(uint64 reservation_sequence, bool *exact_ready,
+											   bool *targets_invalidated);
 /* Outside all heap content/recycle ownership: READY means retained unchanged;
  * RETRY_REQUIRED means exactly canceled and new preparation is permitted;
  * REFUSED means no reprepare is permitted.  The original budget never changes.
@@ -172,6 +174,9 @@ extern bool cluster_undo_record_ctrc_stage_reuse(
 extern bool cluster_undo_record_ctrc_pending_matches(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
 	const ClusterCtrcTargetV1 *pending_target);
+extern bool cluster_undo_record_ctrc_pending_recheck(const ClusterUndoRecordPrepareReceipt *receipt,
+													 uint8 target_ordinal,
+													 const ClusterCtrcTargetV1 *pending_target);
 extern bool cluster_undo_record_ctrc_required_prepared(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask);
 extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(

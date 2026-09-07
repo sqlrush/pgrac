@@ -985,6 +985,29 @@ ctrc_target_pending_itl_valid(const ClusterCtrcTargetV1 *target)
 		&& target->intended_descriptor_hash == 0;
 }
 
+bool
+cluster_ctrc_pending_itl_target_recheck(const ClusterCtrcTargetV1 *stored,
+										const ClusterCtrcTargetV1 *observed)
+{
+	ClusterCtrcTargetV1 normalized;
+
+	if (!ctrc_target_pending_itl_valid(stored) || !ctrc_target_pending_itl_valid(observed))
+		return false;
+	normalized = *observed;
+	normalized.predecessor_page_lsn = stored->predecessor_page_lsn;
+	normalized.predecessor_page_scn = stored->predecessor_page_scn;
+	normalized.predecessor_page_lsn_origin_node_id = stored->predecessor_page_lsn_origin_node_id;
+	if (memcmp(stored, &normalized, sizeof(normalized)) != 0)
+		return false;
+	if (memcmp(stored, observed, sizeof(*stored)) == 0)
+		return true;
+	return cluster_ctrc_page_version_order(
+			   stored->predecessor_page_lsn_origin_node_id, stored->predecessor_page_lsn,
+			   stored->predecessor_page_scn, observed->predecessor_page_lsn_origin_node_id,
+			   observed->predecessor_page_lsn, observed->predecessor_page_scn)
+		   == CTRC_PAGE_VERSION_CURRENT;
+}
+
 static bool
 ctrc_target_exact_itl_valid(const ClusterCtrcTxnKeyV1 *key,
 							const ClusterCtrcTargetV1 *target)
@@ -1049,6 +1072,25 @@ ctrc_target_itl_finalizes_exact(const ClusterCtrcTargetV1 *pending,
 		&& pending->relation_persistence == final_target->relation_persistence
 		&& pending->needs_wal == final_target->needs_wal
 		&& pending->page_operation_kind == final_target->page_operation_kind;
+}
+
+/* Only a new PREPARED ITL receipt has an observation floor. The APPLIED
+ * retarget path retains the exact predecessor contract above. */
+static bool
+ctrc_target_itl_finalizes_prepared(const ClusterCtrcTargetV1 *pending,
+								   const ClusterCtrcTargetV1 *final_target)
+{
+	ClusterCtrcTargetV1 observed;
+
+	if (pending == NULL || final_target == NULL)
+		return false;
+	observed = *pending;
+	observed.predecessor_page_lsn = final_target->predecessor_page_lsn;
+	observed.predecessor_page_scn = final_target->predecessor_page_scn;
+	observed.predecessor_page_lsn_origin_node_id
+		= final_target->predecessor_page_lsn_origin_node_id;
+	return cluster_ctrc_pending_itl_target_recheck(pending, &observed)
+		   && ctrc_target_itl_finalizes_exact(&observed, final_target);
 }
 
 ClusterCtrcItlCleanoutApplyResult
@@ -4888,11 +4930,10 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 	}
 	if (expected != CTRC_RECEIPT_PREPARED)
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
-	target_finalizes
-		= receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
-		? ctrc_target_itl_finalizes_exact(&receipt->target, final_target)
-		: ctrc_target_offnum_finalizes_exact(
-			&receipt->publication, &receipt->target, final_target);
+	target_finalizes = receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+						   ? ctrc_target_itl_finalizes_prepared(&receipt->target, final_target)
+						   : ctrc_target_offnum_finalizes_exact(&receipt->publication,
+																&receipt->target, final_target);
 	if (participant->state != CTRC_PARTICIPANT_OPEN || !target_finalizes)
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 

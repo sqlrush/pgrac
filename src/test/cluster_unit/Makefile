@@ -32,7 +32,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
-        test_cluster_gcs_reqid test_cluster_ctrc_cleaner \
+        test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_heap_receipt \
         test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -338,7 +338,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_cr_native_origin test_cluster_tt_abort
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
-		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner,$(SIMPLE_TESTS))
+		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_heap_receipt,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -3443,7 +3443,18 @@ test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h
 
 # spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
 # tests for UndoRecordHeader + 4 payloads + slot dir addressing.
+test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DCLUSTER_CTRC_UNIT_TEST=1 \
+		-Dcluster_ctrc_receipt_prepare_shared=undo_ctrc_unavailable_prepare_shared \
+		-Dcluster_ctrc_receipt_apply_shared=undo_ctrc_unavailable_apply_shared \
+		-Dcluster_ctrc_receipt_retarget_itl_shared=undo_ctrc_unavailable_retarget_shared \
+		-Dcluster_ctrc_receipt_cancel_shared=undo_ctrc_unavailable_cancel_shared \
+		-c $< -o $@
+
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
+		test_cluster_undo_ctrc_product.o \
 		../../../src/include/cluster/cluster_undo_record_api.h \
 		../../../src/include/cluster/storage/cluster_undo_alloc.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
@@ -3454,8 +3465,32 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
 		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
 		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
-		$< \
+		$< test_cluster_undo_ctrc_product.o \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Link the actual heap final planner, not the USE_CLUSTER_UNIT boundary mocks.
+test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
+		$(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
+		test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
+		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \
+		-DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' \
+		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
+		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
+		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
+		$< test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 

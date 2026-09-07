@@ -650,6 +650,151 @@ UT_TEST(test_ctrc_receipt_prepare_apply_full_identity_cross_product)
 	UT_ASSERT_EQ(receipt.target.kind, CTRC_TARGET_EXACT_ITL_SLOT);
 }
 
+UT_TEST(test_ctrc_unpublished_itl_apply_accepts_forward_page_version)
+{
+	unsigned variant;
+
+	for (variant = 0; variant < 3; variant++) {
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcPublicationIdV1 publication
+			= test_publication(201, CTRC_REF_HEAP_ITL_UBA, CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+		ClusterCtrcTargetV1 pending = test_pending_itl_target();
+		ClusterCtrcTargetV1 exact = test_exact_itl_target();
+		ClusterCtrcReceipt receipt = { 0 };
+		ClusterCtrcReceipt saved;
+		ClusterCtrcApplyToken token;
+
+		pending.predecessor_page_lsn = 1000;
+		pending.predecessor_page_lsn_origin_node_id = 0;
+		pending.predecessor_page_scn = scn_encode(0, 100);
+		exact.predecessor_page_lsn = variant == 1 ? 500 : 1100;
+		exact.predecessor_page_lsn_origin_node_id = variant == 1 ? 1 : 0;
+		exact.predecessor_page_scn = scn_encode(variant == 1 ? 1 : 0, 101);
+		if (variant == 2) {
+			pending.predecessor_page_lsn_origin_node_id = CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID;
+			pending.predecessor_page_scn = InvalidScn;
+		}
+		test_open_participant(&participant);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare(&participant, &publication, &pending, &receipt),
+					 CLUSTER_CTRC_PREPARE_READY);
+		saved = receipt;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+					 CLUSTER_CTRC_APPLY_APPLIED);
+		UT_ASSERT(token.valid);
+		UT_ASSERT_EQ(memcmp(&receipt.target, &exact, sizeof(exact)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt.publication, &saved.publication, sizeof(saved.publication)),
+					 0);
+		UT_ASSERT_EQ(participant.prepared_count, 0);
+		UT_ASSERT_EQ(participant.applied_count, 1);
+		UT_ASSERT_EQ(participant.cancelled_count, 0);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+					 CLUSTER_CTRC_APPLY_APPLIED);
+		exact.predecessor_page_lsn++;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+					 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+		UT_ASSERT(!token.valid);
+	}
+}
+
+UT_TEST(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fences)
+{
+	unsigned variant;
+
+	for (variant = 0; variant < 13; variant++) {
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcPublicationIdV1 publication
+			= test_publication(202, CTRC_REF_HEAP_ITL_UBA, CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+		ClusterCtrcTargetV1 pending = test_pending_itl_target();
+		ClusterCtrcTargetV1 exact = test_exact_itl_target();
+		ClusterCtrcReceipt receipt = { 0 };
+		ClusterCtrcReceipt saved;
+		ClusterCtrcApplyToken token;
+
+		pending.predecessor_page_lsn = 1000;
+		pending.predecessor_page_lsn_origin_node_id = 0;
+		pending.predecessor_page_scn = scn_encode(0, 100);
+		exact.predecessor_page_lsn = 1100;
+		exact.predecessor_page_lsn_origin_node_id = 0;
+		exact.predecessor_page_scn = scn_encode(0, 101);
+		test_open_participant(&participant);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare(&participant, &publication, &pending, &receipt),
+					 CLUSTER_CTRC_PREPARE_READY);
+		switch (variant) {
+		case 0:
+			exact.predecessor_page_lsn = 999;
+			break;
+		case 1:
+			exact.predecessor_page_scn = scn_encode(0, 99);
+			break;
+		case 2:
+			exact.predecessor_page_lsn_origin_node_id = UINT16_MAX;
+			break;
+		case 3:
+			exact.block_number++;
+			break;
+		case 4:
+			exact.publication_own_generation++;
+			break;
+		case 5:
+			exact.publication_acquisition_epoch++;
+			break;
+		case 6:
+			exact.page_operation_kind++;
+			break;
+		case 7:
+			exact.needs_wal = false;
+			break;
+		case 8:
+			exact.reserved8[0] = 1;
+			break;
+		case 9:
+			exact.itl_xid++;
+			break;
+		case 10:
+			participant.grant_generation++;
+			break;
+		case 11:
+			participant.state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+			break;
+		case 12:
+			receipt.state = CTRC_RECEIPT_CANCELLED;
+			break;
+		}
+		saved = receipt;
+		UT_ASSERT(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token)
+				  != CLUSTER_CTRC_APPLY_APPLIED);
+		UT_ASSERT(!token.valid);
+		UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+	}
+}
+
+UT_TEST(test_ctrc_offnum_still_requires_exact_predecessor_version)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcPublicationIdV1 publication
+		= test_publication(203, CTRC_REF_CURRENT_MX_LOCKER, CTRC_TARGET_PAGE_PENDING_OFFNUM);
+	ClusterCtrcTargetV1 pending = test_pending_offnum_target(publication.descriptor_hash);
+	ClusterCtrcTargetV1 exact = test_exact_tid_target(publication.descriptor_hash);
+	ClusterCtrcReceipt receipt = { 0 };
+	ClusterCtrcReceipt saved;
+	ClusterCtrcApplyToken token;
+
+	pending.predecessor_page_lsn = 1000;
+	pending.predecessor_page_lsn_origin_node_id = 0;
+	pending.predecessor_page_scn = scn_encode(0, 100);
+	exact.predecessor_page_lsn = 1100;
+	exact.predecessor_page_lsn_origin_node_id = 0;
+	exact.predecessor_page_scn = scn_encode(0, 101);
+	test_open_participant(&participant);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare(&participant, &publication, &pending, &receipt),
+				 CLUSTER_CTRC_PREPARE_READY);
+	saved = receipt;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+				 CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT(!token.valid);
+	UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+}
+
 UT_TEST(test_ctrc_shared_table_exact_duplicate_is_idempotent)
 {
 	ClusterCtrcTxnKeyV1 key = test_key();
@@ -3100,6 +3245,9 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_epoch_zero_identity_is_present_and_exact),
 		CTRC_TEST_ENTRY(test_ctrc_delayed_positive_proof_revalidates_open_grant),
 		CTRC_TEST_ENTRY(test_ctrc_receipt_prepare_apply_full_identity_cross_product),
+		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_apply_accepts_forward_page_version),
+		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fences),
+		CTRC_TEST_ENTRY(test_ctrc_offnum_still_requires_exact_predecessor_version),
 		CTRC_TEST_ENTRY(test_ctrc_shared_table_exact_duplicate_is_idempotent),
 		CTRC_TEST_ENTRY(test_ctrc_shared_table_same_publication_different_target_blocks),
 		CTRC_TEST_ENTRY(test_ctrc_shared_table_different_publication_allocates_new_receipt),
@@ -3109,7 +3257,8 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_same_itl_retarget_is_exact_nonblocking_and_count_neutral),
 		CTRC_TEST_ENTRY(test_ctrc_retargeting_owner_loss_blocks_without_release),
 		CTRC_TEST_ENTRY(test_ctrc_current_mx_receipt_applies_only_exact_active_target),
-		CTRC_TEST_ENTRY(test_ctrc_itl_uba_registers_before_mutation_and_only_exact_projection_discharges),
+		CTRC_TEST_ENTRY(
+			test_ctrc_itl_uba_registers_before_mutation_and_only_exact_projection_discharges),
 		CTRC_TEST_ENTRY(test_ctrc_itl_cleanout_rewrites_only_exact_terminal_slot),
 		CTRC_TEST_ENTRY(test_ctrc_close_race_drains_prepared_without_timeout_cancellation),
 		CTRC_TEST_ENTRY(test_ctrc_exact_target_absence_and_ambiguity_cleanout_table),
@@ -3138,7 +3287,8 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_release_certificate_enables_exact_l11_l12_and_ack_reclaim),
 		CTRC_TEST_ENTRY(test_ctrc_crash_cut_matrix_releases_only_after_durable_certificate),
 		CTRC_TEST_ENTRY(test_ctrc_release_wal_codec_and_exact_redo_matrix),
-		CTRC_TEST_ENTRY(test_ctrc_capacity_is_activation_sized_and_runtime_full_refuses_before_mutation),
+		CTRC_TEST_ENTRY(
+			test_ctrc_capacity_is_activation_sized_and_runtime_full_refuses_before_mutation),
 		CTRC_TEST_ENTRY(test_ctrc_participant_index_uses_participant_not_origin_node),
 		CTRC_TEST_ENTRY(test_ctrc_source_census_has_no_unclassified_reference_or_release_writer),
 		CTRC_TEST_ENTRY(test_ctrc_heap_reference_producer_census_is_closed),

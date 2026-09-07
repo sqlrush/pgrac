@@ -2370,9 +2370,7 @@ cluster_undo_record_ctrc_stage_pending(
 									  sizeof(receipt->ctrc_reserved8)))
 		return false;
 	if ((receipt->ctrc_pending_mask & target_bit) != 0)
-		return memcmp(&receipt->ctrc_pending_targets[target_ordinal],
-			pending_target,
-					  sizeof(*pending_target)) == 0;
+		return cluster_undo_record_ctrc_pending_recheck(receipt, target_ordinal, pending_target);
 	receipt->ctrc_pending_targets[target_ordinal] = *pending_target;
 	receipt->ctrc_pending_mask |= target_bit;
 	return cluster_undo_record_receipt_sync(receipt);
@@ -2421,6 +2419,27 @@ cluster_undo_record_ctrc_stage_reuse(
 }
 
 bool
+cluster_undo_record_ctrc_pending_recheck(const ClusterUndoRecordPrepareReceipt *receipt,
+										 uint8 target_ordinal,
+										 const ClusterCtrcTargetV1 *pending_target)
+{
+	const ClusterCtrcTargetV1 *stored;
+	uint8 target_bit;
+
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS || receipt == NULL
+		|| pending_target == NULL)
+		return false;
+	target_bit = UINT8_C(1) << target_ordinal;
+	if ((receipt->ctrc_pending_mask & target_bit) == 0)
+		return false;
+	stored = &receipt->ctrc_pending_targets[target_ordinal];
+	/* Published/reused references keep their exact retarget contract. */
+	if (receipt->ctrc_applied_mask != 0 || (receipt->ctrc_reuse_mask & target_bit) != 0)
+		return memcmp(stored, pending_target, sizeof(*pending_target)) == 0;
+	return cluster_ctrc_pending_itl_target_recheck(stored, pending_target);
+}
+
+bool
 cluster_undo_record_ctrc_pending_matches(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
 	const ClusterCtrcTargetV1 *pending_target)
@@ -2431,12 +2450,10 @@ cluster_undo_record_ctrc_pending_matches(
 		return false;
 	target_bit = UINT8_C(1) << target_ordinal;
 	return receipt != NULL && pending_target != NULL
-		&& (receipt->ctrc_pending_mask & target_bit) != 0
-		&& (receipt->ctrc_prepared_mask & target_bit) != 0
-		&& receipt->ctrc_handles[target_ordinal].valid
-		&& memcmp(&receipt->ctrc_pending_targets[target_ordinal],
-			pending_target,
-				  sizeof(*pending_target)) == 0;
+		   && (receipt->ctrc_pending_mask & target_bit) != 0
+		   && (receipt->ctrc_prepared_mask & target_bit) != 0
+		   && receipt->ctrc_handles[target_ordinal].valid
+		   && cluster_undo_record_ctrc_pending_recheck(receipt, target_ordinal, pending_target);
 }
 
 bool
@@ -2619,6 +2636,22 @@ cluster_undo_record_prepared_recheck(
 	return false;
 }
 
+bool
+cluster_undo_record_retry_evidence(uint64 reservation_sequence, bool *exact_ready,
+								   bool *targets_invalidated)
+{
+	if (exact_ready != NULL)
+		*exact_ready = false;
+	if (targets_invalidated != NULL)
+		*targets_invalidated = false;
+	if (exact_ready == NULL || targets_invalidated == NULL || reservation_sequence == 0
+		|| cluster_undo_retry_cancel_snapshot.sequence != reservation_sequence)
+		return false;
+	*exact_ready = cluster_undo_retry_cancel_snapshot.exact_ready;
+	*targets_invalidated = cluster_undo_retry_cancel_snapshot.targets_invalidated;
+	return true;
+}
+
 ClusterUndoRecordPrepareResult
 cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt,
 										uint16 payload_len, bool targets_invalidated)
@@ -2626,7 +2659,7 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt
 	bool exact_ready;
 	uint64 original_deadline;
 
-	cluster_undo_retry_cancel_snapshot.armed = false;
+	MemSet(&cluster_undo_retry_cancel_snapshot, 0, sizeof(cluster_undo_retry_cancel_snapshot));
 	if (receipt == NULL || !cluster_undo_record_reservation.active
 		|| receipt->magic != CLUSTER_UNDO_RECORD_RECEIPT_MAGIC
 		|| memcmp(receipt, &cluster_undo_record_reservation.receipt, sizeof(*receipt)) != 0) {

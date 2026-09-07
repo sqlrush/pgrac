@@ -307,6 +307,11 @@ typedef enum ClusterCtrcPageVersionOrder
 	CTRC_PAGE_VERSION_UNKNOWN
 } ClusterCtrcPageVersionOrder;
 
+/* Immutable unpublished ITL intent: identity is exact, its page version is
+ * an observation floor. This predicate supplies no page authority. */
+extern bool cluster_ctrc_pending_itl_target_recheck(const ClusterCtrcTargetV1 *stored,
+													const ClusterCtrcTargetV1 *observed);
+
 extern ClusterCtrcPageVersionOrder cluster_ctrc_page_version_order(
 	uint16 predecessor_origin, XLogRecPtr predecessor_lsn,
 	SCN predecessor_scn, uint16 current_origin, XLogRecPtr current_lsn,
