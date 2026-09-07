@@ -838,6 +838,11 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * initialization transaction, as is entirely possible, we need the
 	 * AbortTransaction call to clean up.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* Register below ShutdownPostgres in the LIFO stack: a FATAL during its
+	 * abort must still encounter the terminal guard before low-level cleanup. */
+	ClusterAbortTransactionRegisterExitGuard();
+#endif
 	before_shmem_exit(ShutdownPostgres, 0);
 
 #ifdef USE_PGRAC_CLUSTER

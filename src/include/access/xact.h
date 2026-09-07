@@ -556,6 +556,9 @@ extern void SaveTransactionCharacteristics(SavedTransactionCharacteristics *s);
 extern void RestoreTransactionCharacteristics(const SavedTransactionCharacteristics *s);
 extern void CommitTransactionCommand(void);
 extern void AbortCurrentTransaction(void);
+#if defined(USE_PGRAC_CLUSTER) && !defined(FRONTEND)
+extern void ClusterAbortTransactionRegisterExitGuard(void);
+#endif
 extern void BeginTransactionBlock(void);
 extern bool EndTransactionBlock(bool chain);
 extern bool PrepareTransactionBlock(const char *gid);

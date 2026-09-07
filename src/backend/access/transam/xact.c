@@ -93,6 +93,10 @@
 
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "storage/ipc.h"
+#endif
+
 #include <time.h>
 #include <unistd.h>
 
@@ -428,6 +432,7 @@ static SubXactCallbackItem *SubXact_callbacks = NULL;
 /* local function prototypes */
 static void AssignTransactionId(TransactionState s);
 static void AbortTransaction(void);
+static void AbortTransactionBody(void);
 static void AtAbort_Memory(void);
 static void AtCleanup_Memory(void);
 static void AtAbort_ResourceOwner(void);
@@ -3314,11 +3319,92 @@ PrepareTransaction(void)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Process-local control only: neither a TT terminal nor authority to reuse. */
+static bool cluster_abort_in_progress;
+static bool cluster_abort_exit_guard_registered;
+static TransactionId cluster_abort_xid;
+
+static void cluster_abort_completion_failed(const char *stage) pg_attribute_noreturn();
+
+static void
+cluster_abort_completion_failed(const char *stage)
+{
+	/* A failed abort may have invalidated transaction-owned error callbacks.
+	 * Use only the reserved error context and values saved before entry. */
+	error_context_stack = NULL;
+	MemoryContextSwitchTo(ErrorContext);
+	ereport(PANIC,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("cluster transaction abort could not complete"),
+			 errdetail_internal("PGRAC_FAMILY=TX_TERMINAL "
+								"PGRAC_REASON=ABORT_COMPLETION_FAILED stage=%s pid=%d xid=%u",
+								stage, MyProcPid, cluster_abort_xid),
+			 errhidecontext(true), errhidestmt(true)));
+	pg_unreachable();
+}
+
+static void
+cluster_abort_exit_guard(int code, Datum arg)
+{
+	if (cluster_abort_in_progress)
+		cluster_abort_completion_failed("EXIT");
+}
+
+void
+ClusterAbortTransactionRegisterExitGuard(void)
+{
+	if (!cluster_abort_exit_guard_registered)
+	{
+		/* Must precede ShutdownPostgres, including its nested FATAL exit. */
+		before_shmem_exit(cluster_abort_exit_guard, 0);
+		cluster_abort_exit_guard_registered = true;
+	}
+}
+#endif
+
 /*
- *	AbortTransaction
+ * AbortTransaction
+ *
+ * A storage-mode transaction cannot hand an incomplete terminal operation to
+ * the outer error loop or to normal process teardown.  Keep all actual abort
+ * work and its ordering in the unchanged body; never retry that body here.
  */
 static void
 AbortTransaction(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_abort_in_progress)
+		cluster_abort_completion_failed("REENTRY");
+	if (cluster_storage_mode_enabled())
+	{
+		cluster_abort_xid = XidFromFullTransactionId(TopTransactionStateData.fullTransactionId);
+		if (!cluster_abort_exit_guard_registered)
+			cluster_abort_completion_failed("UNREGISTERED");
+		cluster_abort_in_progress = true;
+		PG_TRY();
+		{
+			AbortTransactionBody();
+		}
+		PG_CATCH();
+		{
+			/* The original failure has not yet reached PostgresMain. */
+			error_context_stack = NULL;
+			MemoryContextSwitchTo(ErrorContext);
+			EmitErrorReport();
+			cluster_abort_completion_failed("ERROR");
+		}
+		PG_END_TRY();
+		cluster_abort_in_progress = false;
+		cluster_abort_xid = InvalidTransactionId;
+		return;
+	}
+#endif
+	AbortTransactionBody();
+}
+
+static void
+AbortTransactionBody(void)
 {
 	TransactionState s = CurrentTransactionState;
 	TransactionId latestXid;

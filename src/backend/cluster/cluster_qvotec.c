@@ -285,6 +285,61 @@ qvotec_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms)
 	return (long)((remaining_us + 999ULL) / 1000ULL);
 }
 
+/* A test stimulus on the actual poll owner, once per observed arm interval.
+ * Registry state remains process-local.  The harness must await this owner's
+ * disarm log before rearming; SQL-side hits are not execution evidence. */
+static void
+qvotec_poll_pre_injection(void)
+{
+	static bool consumed;
+	const char *point = "cluster-qvotec-poll-pre";
+	ClusterInjectFaultType type = CLUSTER_FAULT_NONE;
+	uint64 delay_us = 0;
+	uint64 lease_us;
+	instr_time started;
+	instr_time ended;
+	int i;
+
+	if (MyBackendType != B_QVOTEC)
+		return;
+	if (!consumed && cluster_injection_armed_count == 0)
+		return;
+	if (!cluster_injection_is_armed(point)) {
+		if (consumed)
+			elog(LOG, "qvotec poll-pre injection disarmed node=%d pid=%d poll_cycle=" UINT64_FORMAT,
+				 cluster_node_id, MyProcPid, cluster_pgstat_read(qvotec_counter_poll_cycle));
+		consumed = false;
+		return;
+	}
+	if (consumed)
+		return;
+	for (i = 0; i < cluster_injection_get_count(); i++) {
+		const char *name;
+		uint64 hits;
+
+		if (cluster_injection_get_state_at(i, &name, &type, &hits) && strcmp(name, point) == 0)
+			break;
+	}
+	consumed = true;
+	if (type != CLUSTER_FAULT_SLEEP || !cluster_cr_injection_armed(point, &delay_us)
+		|| delay_us == 0 || delay_us > 10000000ULL) {
+		elog(WARNING, "qvotec poll-pre injection requires one bounded sleep");
+		return;
+	}
+	lease_us = QvotecShmem == NULL ? 0 : pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
+	elog(LOG,
+		 "qvotec poll-pre injection begin node=%d pid=%d delay_us=" UINT64_FORMAT
+		 " prior_lease_us=" UINT64_FORMAT " now_us=" INT64_FORMAT " poll_cycle=" UINT64_FORMAT,
+		 cluster_node_id, MyProcPid, delay_us, lease_us, GetCurrentTimestamp(),
+		 cluster_pgstat_read(qvotec_counter_poll_cycle));
+	INSTR_TIME_SET_CURRENT(started);
+	pg_usleep((long)delay_us);
+	INSTR_TIME_SET_CURRENT(ended);
+	INSTR_TIME_SUBTRACT(ended, started);
+	elog(LOG, "qvotec poll-pre injection end node=%d pid=%d elapsed_us=" UINT64_FORMAT,
+		 cluster_node_id, MyProcPid, (uint64)INSTR_TIME_GET_MICROSEC(ended));
+}
+
 
 /* ============================================================
  * Shmem region — size / init / register.
@@ -2161,6 +2216,14 @@ qvotec_replacement_request_preserve(ClusterVotingSlot *next,
 }
 
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
+void cluster_qvotec_test_poll_pre_injection(void);
+
+void
+cluster_qvotec_test_poll_pre_injection(void)
+{
+	qvotec_poll_pre_injection();
+}
+
 ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior)
@@ -3876,6 +3939,7 @@ ClusterQvotecMain(void)
 		 * matrix, decide quorum, publish shmem.  Counter bumps live
 		 * inside qvotec_poll_once. */
 		INSTR_TIME_SET_CURRENT(cycle_started);
+		qvotec_poll_pre_injection();
 		qvotec_poll_once();
 		INSTR_TIME_SET_CURRENT(cycle_finished);
 		INSTR_TIME_SUBTRACT(cycle_finished, cycle_started);

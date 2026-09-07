@@ -153,6 +153,11 @@ cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
 extern long cluster_qvotec_test_poll_wait_timeout_ms(
 	uint64 elapsed_us, int poll_interval_ms);
+#ifdef __APPLE__
+extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak_import));
+#else
+extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak));
+#endif
 
 
 /* ============================================================
@@ -372,9 +377,14 @@ WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute
 {
 	return 0;
 }
+static int injected_sleeps;
+static long injected_sleep_us;
 void
-pg_usleep(long microsec pg_attribute_unused())
-{}
+pg_usleep(long microsec)
+{
+	injected_sleeps++;
+	injected_sleep_us = microsec;
+}
 
 #include "cluster/cluster_shmem.h"
 void
@@ -424,11 +434,44 @@ cluster_elog_init(void)
 {}
 
 #include "cluster/cluster_inject.h"
+static bool poll_injection_armed;
+int cluster_injection_armed_count;
+static uint64 poll_injection_hits;
+static uint64 poll_injection_param = 75000;
+
 bool
-cluster_cr_injection_armed(const char *name pg_attribute_unused(),
-						   uint64 *out_param pg_attribute_unused())
+cluster_injection_is_armed(const char *name)
 {
-	return false;
+	return poll_injection_armed && strcmp(name, "cluster-qvotec-poll-pre") == 0;
+}
+
+int
+cluster_injection_get_count(void)
+{
+	return 1;
+}
+
+bool
+cluster_injection_get_state_at(int idx, const char **name, ClusterInjectFaultType *type,
+							   uint64 *hits)
+{
+	if (idx != 0)
+		return false;
+	*name = "cluster-qvotec-poll-pre";
+	*type = poll_injection_armed ? CLUSTER_FAULT_SLEEP : CLUSTER_FAULT_NONE;
+	*hits = poll_injection_hits;
+	return true;
+}
+
+bool
+cluster_cr_injection_armed(const char *name, uint64 *out_param)
+{
+	if (!cluster_injection_is_armed(name))
+		return false;
+	if (out_param != NULL)
+		*out_param = poll_injection_param;
+	poll_injection_hits++;
+	return true;
 }
 
 /* Step 3 D7 stubs: signal/ps_display/procsignal symbols not linked
@@ -622,6 +665,11 @@ cluster_pgstat_lookup(const char *name pg_attribute_unused())
 void
 cluster_pgstat_inc(ClusterPgstatCounter *c pg_attribute_unused())
 {}
+uint64
+cluster_pgstat_read(const ClusterPgstatCounter *c pg_attribute_unused())
+{
+	return 0;
+}
 void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}
@@ -1621,6 +1669,45 @@ UT_TEST(test_qvotec_poll_cadence_subtracts_cycle_work)
 	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(500000, 500), 0);
 	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(900000, 500), 0);
 	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(0, 0), 0);
+}
+
+UT_TEST(test_qvotec_poll_pre_injection_only_target_and_once)
+{
+	void (*poll_pre)(void) = cluster_qvotec_test_poll_pre_injection;
+
+	UT_ASSERT_NOT_NULL((void *)poll_pre);
+	if (poll_pre == NULL)
+		return;
+	MyBackendType = B_QVOTEC;
+	poll_injection_armed = false;
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 0);
+	UT_ASSERT_EQ(poll_injection_hits, 0);
+	poll_injection_armed = true;
+	cluster_injection_armed_count = 1;
+	MyBackendType = B_BACKEND;
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 0);
+	UT_ASSERT_EQ(poll_injection_hits, 0);
+	MyBackendType = B_QVOTEC;
+	poll_pre();
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 1);
+	UT_ASSERT_EQ(injected_sleep_us, 75000);
+	UT_ASSERT_EQ(poll_injection_hits, 1);
+	poll_injection_armed = false;
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 1);
+	poll_injection_param = 6000000;
+	poll_injection_armed = true;
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 2);
+	UT_ASSERT_EQ(injected_sleep_us, 6000000);
+	UT_ASSERT_EQ(poll_injection_hits, 2);
+	poll_injection_armed = false;
+	poll_pre();
+	MyBackendType = B_INVALID;
+	cluster_injection_armed_count = 0;
 }
 
 
@@ -3060,7 +3147,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(56);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3080,6 +3167,7 @@ main(void)
 	UT_RUN(test_freeze_thaw_round_trip);
 	UT_RUN(test_qvotec_main_symbol_link_resolves);
 	UT_RUN(test_qvotec_poll_cadence_subtracts_cycle_work);
+	UT_RUN(test_qvotec_poll_pre_injection_only_target_and_once);
 	UT_RUN(test_qvotec_status_enum_values);
 	UT_RUN(test_quorum_state_enum_values);
 	UT_RUN(test_voting_disk_io_state_enum_values);

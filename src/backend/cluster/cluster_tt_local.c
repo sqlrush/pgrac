@@ -968,11 +968,17 @@ cluster_tt_local_preabort_durable_finish(TransactionId xid)
 		&& binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
 		return false;
 	if (binding->publish_state != CLUSTER_CANONICAL_TXN_PUBLISHED)
-		return false;
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("canonical transaction publication is unproved during abort"),
+						errdetail("xid=%u publication=%u terminal=%u", xid, binding->publish_state,
+								  binding->terminal_state)));
 	if (binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)
 		return true;
 	if (binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE)
-		return false;
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("canonical transaction terminal state cannot be aborted"),
+						errdetail("xid=%u publication=%u terminal=%u", xid, binding->publish_state,
+								  binding->terminal_state)));
 
 	admission = cluster_semantic_activation_modifier_enter(
 		cluster_tt_local_writable_admission(), &modifier_token);
@@ -1033,6 +1039,26 @@ void
 cluster_tt_local_record_abort(TransactionId xid)
 {
 	int idx = cluster_tt_local_find_binding(xid);
+	uint32 i;
+
+	/* Validate the entire batch before emitting even its first terminal hint
+	 * or changing an allocator slot.  A failed publisher may have written WAL;
+	 * dropping its binding is not proof that abort completed. */
+	for (i = 0; i < cluster_tt_local_binding_count; i++) {
+		const ClusterTTLocalBinding *binding = &cluster_tt_local_bindings[i];
+
+		if (!TransactionIdIsValid(binding->top_xid))
+			continue;
+		if ((binding->publish_state == CLUSTER_CANONICAL_TXN_RESERVED
+			 && binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
+			|| (binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+				&& binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE))
+			continue;
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot release a canonical transaction without abort proof"),
+						errdetail("xid=%u publication=%u terminal=%u", binding->top_xid,
+								  binding->publish_state, binding->terminal_state)));
+	}
 
 	if (idx >= 0
 		&& cluster_tt_local_bindings[idx].terminal_state
