@@ -224,8 +224,9 @@ transition_unexpected_drop(void)
 #define LWLockAcquire transition_lock_acquire
 #define LWLockConditionalAcquire transition_lock_acquire
 #define LWLockRelease transition_lock_release
-#define LWLockHeldByMe(lock) (transition_content_held)
-#define LWLockHeldByMeInMode(lock, mode) (transition_content_held && (mode) == LW_EXCLUSIVE)
+#define LWLockHeldByMe(lock) ((void)(lock), transition_content_held)
+#define LWLockHeldByMeInMode(lock, mode)                                                           \
+	((void)(lock), transition_content_held && (mode) == LW_EXCLUSIVE)
 #define cluster_bufmgr_pin_for_gcs_locked transition_pin_locked
 #define cluster_bufmgr_unpin_for_gcs transition_unpin
 #define FlushBuffer(buf, rel, object, context) transition_flush(buf)
@@ -683,6 +684,118 @@ UT_TEST(test_actual_delivery_arm_rejects_unproved_initializer_without_mutation)
 		UT_ASSERT_EQ(memcmp(&entry, &entry_before, sizeof(entry)), 0);
 		UT_ASSERT_EQ(memcmp(transition_page.data, bytes_before.data, BLCKSZ), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state_before);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+/* A reader and a direct initializer share GRANT_PENDING's physical shape,
+ * but only the latter can delegate its token to its own delivery round. */
+static uint64
+delivery_reader_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ResourceXDecodedFrame *dispatch,
+						ClusterPcmOwnSnapshot *base, ForkNumber fork, bool assertion)
+{
+	uint64 token = 0;
+	uint32 state;
+
+	delivery_route_fixture(buf, entry, dispatch, fork, false, false);
+	if (assertion) {
+		dispatch->kind = RESOURCE_X_WIRE_ASSERT_X;
+		dispatch->common.flags = 0;
+	}
+	pg_atomic_write_u64(&entry->generation, 6);
+	pg_atomic_write_u64(&entry->reservation_token, 2);
+	((PageHeader)transition_page.data)->pd_upper = BLCKSZ;
+	state = transition_lock_header(buf);
+	cluster_pcm_own_snapshot_locked(buf, base);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(buf->buf_id, base->generation,
+														 PCM_OWN_FLAG_GRANT_PENDING, &token),
+				 CLUSTER_PCM_OWN_OK);
+	UnlockBufHdr(buf, state);
+	UT_ASSERT_EQ(token, UINT64_C(3));
+	return token;
+}
+
+UT_TEST(test_delivery_dispatch_waits_for_ordinary_read_image_owner)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+
+	for (int fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
+		for (int assertion = 0; assertion < 2; assertion++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry, before;
+			ResourceXDecodedFrame dispatch;
+			ClusterPcmOwnSnapshot base;
+			PGAlignedBlock bytes;
+			uint64 token, generation = 0;
+			uint32 state;
+
+			token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, (ForkNumber)fork,
+											assertion != 0);
+			memcpy(&before, &entry, sizeof(before));
+			memcpy(bytes.data, transition_page.data, BLCKSZ);
+			state = pg_atomic_read_u32(&buf.state);
+			/* The real dispatch must defer before transport/target binding.
+			 * It must not make the subsequent real reader commit return BUSY. */
+			UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+						 RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT_EQ(route_binds, 0);
+			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+			transition_content_held = true;
+			UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_READ_IMAGE);
+			UT_ASSERT_EQ(generation, UINT64_C(7));
+			UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+						 RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT_EQ(route_binds, 0);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(buf.buf_id), UINT64_C(0));
+			UT_ASSERT_EQ(cluster_pcm_own_release_read_image_exact(&buf, &generation),
+						 CLUSTER_PCM_OWN_OK);
+			transition_content_held = false;
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+			UT_ASSERT_EQ(generation, UINT64_C(8));
+			/* Re-enter the same staging function after the real read bracket
+			 * releases. No new grant or artificial successful abort is seeded. */
+			UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(route_binds, 1);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(buf.buf_id), UINT64_C(41));
+			UT_ASSERT_EQ(memcmp(transition_page.data, bytes.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+		}
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_delivery_dispatch_preserves_ordinary_read_abort_then_arms)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+
+	for (int fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
+		for (int assertion = 0; assertion < 2; assertion++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry, before;
+			ResourceXDecodedFrame dispatch;
+			ClusterPcmOwnSnapshot base;
+			uint64 token;
+
+			token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, (ForkNumber)fork,
+											assertion != 0);
+			memcpy(&before, &entry, sizeof(before));
+			UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+						 RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT_EQ(route_binds, 0);
+			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_abort_grant_reservation(&buf, &base, token),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(buf.buf_id), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), base.generation);
+			UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(route_binds, 1);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(buf.buf_id), UINT64_C(41));
+		}
 	}
 	ClusterPcmOwnArray = saved;
 }
@@ -4746,7 +4859,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(98);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);
 	UT_RUN(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift);
 	UT_RUN(test_bufmgr_snapshot_captures_image_type);
@@ -4758,6 +4871,8 @@ main(void)
 	UT_RUN(test_actual_delivery_arm_preserves_foreground_io_initializer);
 	UT_RUN(test_actual_delivery_arm_keeps_valid_target_and_existing_hold_guards);
 	UT_RUN(test_actual_delivery_arm_rejects_unproved_initializer_without_mutation);
+	UT_RUN(test_delivery_dispatch_waits_for_ordinary_read_image_owner);
+	UT_RUN(test_delivery_dispatch_preserves_ordinary_read_abort_then_arms);
 	UT_RUN(test_real_known_new_sidecar_rejects_installed_remote_image);
 	UT_RUN(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new);
 	UT_RUN(test_installed_claim_shape_is_exact_and_not_a_new_base);

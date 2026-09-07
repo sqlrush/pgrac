@@ -9216,6 +9216,14 @@ gcs_block_resource_x_delivery_arm_exact(int32 master_node, const ResourceXDecode
 					   && (before.pcm_state == PCM_STATE_S || before.pcm_state == PCM_STATE_X)
 				   ? RESOURCE_X_APPLY_APPLIED
 				   : RESOURCE_X_APPLY_BAD_STATE;
+	/* An ordinary S reader owns its pending grant through image publication
+	 * or abort. Only this round's verified direct initializer can delegate
+	 * that token. Keep staging pending until the reader releases clean N;
+	 * adopting its token would make both reader commit and abort return BUSY.
+	 * The hold helper rechecks the complete snapshot under header authority,
+	 * so a new reader racing this check also cannot be adopted. */
+	if (before.flags == PCM_OWN_FLAG_GRANT_PENDING && direct_token == 0)
+		return RESOURCE_X_APPLY_BAD_STATE;
 	own_result = cluster_bufmgr_pcm_own_delivery_hold_begin_exact(GetBufferDescriptor(buffer_id),
 																  &before, attempt);
 	if (own_result != CLUSTER_PCM_OWN_OK)
