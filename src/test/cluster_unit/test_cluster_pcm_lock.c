@@ -55,6 +55,7 @@
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
+#include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
 #include "storage/lwlock.h"
@@ -12359,6 +12360,62 @@ gcs_block_pcm_x_monotonic_us(void)
 	return fake_pcm_clock_us;
 }
 
+/* Actual GCS scheduler + actual PCM owners. Only capability/shard/physical
+ * ring admission are doubles; the ring itself has a separate real-object
+ * suite. Synthetic endless-probe mode tests just the scheduler's16 bound. */
+BackendType MyBackendType = B_LMS;
+int cluster_lms_workers = 2;
+static bool ready_peer_ok = true;
+static bool ready_ring_full;
+static int ready_enqueue_calls;
+static bool ready_endless_probe;
+static ResourceXIntentSlot ready_synthetic_slot;
+
+static bool
+gcs_block_pcm_x_resource_x_peer_ready_exact(int32 node, uint32 *connection)
+{
+	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	*connection = 61;
+	return ready_peer_ok;
+}
+
+int
+cluster_lms_shard_for_tag(const BufferTag *tag, int workers)
+{
+	UT_ASSERT(tag != NULL);
+	UT_ASSERT_EQ(workers, 2);
+	return 1;
+}
+
+bool
+cluster_lms_outbound_enqueue_resource_x_intent(int worker, const ResourceXIntentSlot *intent,
+											   uint32 connection, uint64 deadline)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT_EQ(worker, 1);
+	UT_ASSERT_EQ(connection, 61);
+	UT_ASSERT_EQ(deadline, fake_pcm_clock_us + (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * 1000);
+	ready_enqueue_calls++;
+	if (ready_ring_full)
+		return false;
+	return cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us)
+		   == RESOURCE_X_INTENT_STAGED;
+}
+
+static ResourceXIntentProbeResult
+test_ready_probe(const BufferTag *tag, uint32 *cursor, ResourceXIntentSlot *out)
+{
+	if (ready_endless_probe) {
+		*out = ready_synthetic_slot;
+		return RESOURCE_X_INTENT_PROBE_FOUND;
+	}
+	return cluster_pcm_lock_resource_x_ready_intent_probe_exact(tag, cursor, out);
+}
+
+#define cluster_pcm_lock_resource_x_ready_intent_probe_exact test_ready_probe
+#include "test_cluster_pcm_ready_scheduler.inc"
+#undef cluster_pcm_lock_resource_x_ready_intent_probe_exact
+
 static ResourceXApplyResult
 run_actual_gcs_wait_consumer(ResourceXAssertion assertion, ClusterPcmOwnSnapshot own)
 {
@@ -16184,6 +16241,172 @@ UT_TEST(test_resource_x_intent_sparse_probe_rediscovers_exact_rearm)
 	UT_ASSERT_EQ(intent.logical_generation, 41);
 }
 
+UT_TEST(test_resource_x_outbound_stage_has_one_physical_queue_owner)
+{
+	BufferTag tag = make_tag(154);
+	ResourceXDecodedFrame assertion;
+	ResourceXDurableProof durable = { 0 };
+	ResourceXIntentSlot intent, observed;
+	ResourceXMasterSnapshot snapshot;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+					 &durable.assertion, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	/* Two schedulers captured the same ARMED handle. Only the first may
+	 * claim a physical ring slot; idempotent semantic staging is not enough. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 201),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 202),
+				 RESOURCE_X_INTENT_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.last_attempt_us, UINT64_C(201));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 203),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 204),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 205),
+				 RESOURCE_X_INTENT_STALE);
+}
+
+UT_TEST(test_resource_x_ready_tag_avoids_sparse_scan_and_preserves_admission)
+{
+	BufferTag tag;
+	ResourceXDecodedFrame assertion;
+	ResourceXDurableProof durable = { 0 };
+	ResourceXMasterSnapshot snapshot;
+	ResourceXIntentSlot intent, selected, observed;
+	ResourceXIntentProbeResult result;
+	PcmEntryRef entry;
+	PcmEntryAcquireResult acquire;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES], saved[RESOURCE_X_PROOF_V1_BYTES];
+	uint32 cursor, examined, slot_index = 0;
+	long entry_count;
+	int choice;
+
+	/* Choose a real hashed slot after the first two four-slot probes. The
+	 * fixture has17 slots, not G2's131072; no live timing claim is made. */
+	for (choice = 0; choice < 32; choice++) {
+		reset_fake_pcm_runtime(17);
+		tag = make_tag(760 + choice);
+		UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &entry, &acquire));
+		slot_index = entry.registry_slot;
+		pcm_entry_ref_release(&entry);
+		if (slot_index >= 8)
+			break;
+	}
+	UT_ASSERT(slot_index >= 8);
+	fake_pcm_clock_us = 200;
+	MyBackendType = B_LMS;
+	ready_peer_ok = true;
+	ready_ring_full = ready_endless_probe = false;
+	ready_enqueue_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+					 &durable.assertion, &intent, saved, sizeof(saved)),
+				 RESOURCE_X_APPLY_APPLIED);
+	result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(4, &selected, payload,
+																	 sizeof(payload), &examined);
+	UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_MORE);
+	UT_ASSERT_EQ(examined, 4);
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_ready_intent_probe_exact(&tag, &cursor, &selected),
+				 RESOURCE_X_INTENT_PROBE_FOUND);
+	UT_ASSERT_EQ(memcmp(&intent, &selected, sizeof(intent)), 0);
+	/* Direct lookup did not rewind/advance the global cursor. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+					 4, &selected, payload, sizeof(payload), &examined),
+				 RESOURCE_X_INTENT_PROBE_MORE);
+	UT_ASSERT_EQ(examined, 4);
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.state, RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT_EQ(memcmp(saved, payload, sizeof(saved)), 0);
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 1); /* No second queue owner. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 201),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	ready_peer_ok = false;
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 1);
+	ready_peer_ok = true;
+	ready_ring_full = true;
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	ready_endless_probe = true;
+	ready_synthetic_slot = intent;
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 18); /* Fixed16 even if probe never ends. */
+	ready_endless_probe = ready_ring_full = false;
+	MyBackendType = B_BACKEND;
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 18);
+	MyBackendType = B_LMS;
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 19);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 202),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	MyBackendType = B_LMS_WORKER; /* Actual nonzero DATA-shard ingress owner. */
+	gcs_block_resource_x_stage_ready_tag(&tag);
+	UT_ASSERT_EQ(ready_enqueue_calls, 20);
+	MyBackendType = B_LMS;
+	entry_count = fake_pcm_entry_count;
+	tag.blockNum += 10000;
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_ready_intent_probe_exact(&tag, &cursor, &selected),
+				 RESOURCE_X_INTENT_PROBE_COMPLETE);
+	UT_ASSERT_EQ(fake_pcm_entry_count, entry_count);
+	cursor = UINT32_MAX;
+	memset(&selected, 0xff, sizeof(selected));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_ready_intent_probe_exact(&tag, &cursor, &selected),
+				 RESOURCE_X_INTENT_PROBE_CORRUPT);
+	UT_ASSERT_EQ(selected.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(cursor, UINT32_MAX);
+}
+
 UT_TEST(test_resource_x_duplicate_assert_redrives_completed_grant_delivery)
 {
 	BufferTag tag = make_tag(172);
@@ -17537,7 +17760,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(237);
+	UT_PLAN(239);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -17745,6 +17968,8 @@ main(void)
 	UT_RUN(test_resource_x_reconfig_sweep_drives_exact_dead_requester_reclaim);
 	UT_RUN(test_resource_x_intent_retains_logical_owner_across_physical_scarcity);
 	UT_RUN(test_resource_x_intent_sparse_probe_rediscovers_exact_rearm);
+	UT_RUN(test_resource_x_outbound_stage_has_one_physical_queue_owner);
+	UT_RUN(test_resource_x_ready_tag_avoids_sparse_scan_and_preserves_admission);
 	UT_RUN(test_resource_x_duplicate_assert_redrives_completed_grant_delivery);
 	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);

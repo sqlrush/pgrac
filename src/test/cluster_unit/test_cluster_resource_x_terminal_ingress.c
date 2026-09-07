@@ -25,6 +25,8 @@ static int ack_sends;
 static int assert_sends;
 static int joins;
 static bool fused_reply;
+static int ready_tag_notifications;
+static BufferTag ready_tag;
 BackendType MyBackendType = B_LMS;
 int NBuffers = 2;
 static BufferDescPadded delivery_buffers[2];
@@ -105,6 +107,17 @@ gcs_block_pcm_x_resource_x_peer_ready_exact(int node, uint32 *connection)
 	(void)node;
 	*connection = 61;
 	return scenario != 14;
+}
+
+/* Scheduler boundary double only. The real ingress must notify this after
+ * releasing its semantic admission; it must not wait for a registry sweep.
+ * Separate PCM/ring tests prove the owner and transport mutations. */
+static void
+gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
+{
+	ready_tag_notifications++;
+	ready_tag = *tag;
+	UT_ASSERT(leaves > 0);
 }
 
 ResourceXApplyResult
@@ -575,6 +588,30 @@ UT_TEST(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission)
 	}
 }
 
+UT_TEST(test_actual_fused_admission_notifies_ready_resource_without_registry_tick)
+{
+	ClusterICEnvelope env = { 0 };
+	ResourceXDecodedFrame frame = { 0 };
+
+	scenario = 0;
+	master = cluster_node_id = 0;
+	peer_checks = rechecks = leaves = kind9_requests = ack_sends = assert_sends = 0;
+	ready_tag_notifications = 0;
+	fused_reply = true;
+	env.source_node_id = 1;
+	env.msg_type = RESOURCE_X_MSG_ASSERT_X;
+	frame.kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
+	frame.common.flags = RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION;
+	frame.common.resource_formation = 17;
+	frame.common.master_session_incarnation = 31;
+	frame.common.logical_assertion.resource.blockNum = 761;
+	gcs_block_resource_x_kind9_ingress(&env, &frame, 61);
+	UT_ASSERT_EQ(kind9_requests, 1);
+	UT_ASSERT_EQ(ack_sends, 0);
+	UT_ASSERT_EQ(ready_tag_notifications, 1);
+	UT_ASSERT(BufferTagsEqual(&ready_tag, &frame.common.logical_assertion.resource));
+}
+
 UT_TEST(test_actual_join_ingress_carries_current_authority_coordinates)
 {
 	int test_case;
@@ -620,6 +657,7 @@ reset_delivery_fixture(void)
 	delivery_claims = delivery_ends = delivery_completes = delivery_retries = cleanup_joins = 0;
 	delivery_drift = 0;
 	delivery_sequence = 0;
+	ready_tag_notifications = 0;
 	installs = publishes = leaves = joins = peer_checks = rechecks = assert_sends = 0;
 }
 
@@ -648,6 +686,7 @@ UT_TEST(test_actual_quiet_tick_installs_or_redrives_without_foreground)
 		UT_ASSERT_EQ(delivery_metrics[PCM_RX_DELIVERY_CALLBACK], UINT64_C(1));
 		UT_ASSERT_EQ(delivery_metrics[PCM_RX_DELIVERY_REQUEST_RETRY], leg == 0 ? 1 : 0);
 		UT_ASSERT_EQ(delivery_trace_callbacks, 1);
+		UT_ASSERT_EQ(ready_tag_notifications, leg == 0 ? 0 : 1);
 	}
 }
 
@@ -705,6 +744,7 @@ UT_TEST(test_actual_delivery_tick_fences_drift_active_owner_and_unwind)
 		UT_ASSERT_EQ(delivery_retries, 0);
 		UT_ASSERT(delivery_hold);
 		UT_ASSERT_EQ(delivery_claims, leg >= 3 ? 1 : 0);
+		UT_ASSERT_EQ(ready_tag_notifications, 0);
 	}
 	reset_delivery_fixture();
 	delivery_active = true;
@@ -731,14 +771,16 @@ UT_TEST(test_actual_delivery_tick_fences_drift_active_owner_and_unwind)
 	UT_ASSERT_EQ(delivery_ends, 1);
 	UT_ASSERT_EQ(leaves, 1);
 	UT_ASSERT(!delivery_active && delivery_hold);
+	UT_ASSERT_EQ(ready_tag_notifications, 0); /* Never stage from ERROR FINALLY. */
 }
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
+	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
 	UT_RUN(test_actual_join_ingress_carries_current_authority_coordinates);
 	UT_RUN(test_actual_quiet_tick_installs_or_redrives_without_foreground);
 	UT_RUN(test_actual_cleanup_ingress_retains_exact_late_frame_then_quiet_tick_finishes);

@@ -2411,7 +2411,13 @@ test_cluster_pcm_wait_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     emit { print } \
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@
 
+test_cluster_pcm_ready_scheduler.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_stage_ready_tag\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_ready_scheduler.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \

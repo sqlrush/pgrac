@@ -8895,6 +8895,47 @@ gcs_block_pcm_x_resource_x_peer_ready_exact(int32 peer_node,
 	return true;
 }
 
+/* Notify only already-ARMED work after the consumer releases its locks.
+ * The existing ring takes the physical claim and its ordinary drain performs
+ * all current identity, capability, fence and payload checks before sending.
+ * No direct send or recursive dispatch occurs here. Refused/remaining work
+ * is still discoverable by the unchanged global scanner. */
+static void
+gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
+{
+	uint32 owner_cursor = 0;
+	int call;
+
+	if ((MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER) || tag == NULL)
+		return;
+	for (call = 0; call < 16; call++) {
+		ResourceXIntentSlot intent;
+		uint32 connection_generation = 0;
+		uint64 now_us;
+		uint64 timeout_us;
+		uint64 deadline_us;
+		int worker_id;
+
+		if (cluster_pcm_lock_resource_x_ready_intent_probe_exact(tag, &owner_cursor, &intent)
+			!= RESOURCE_X_INTENT_PROBE_FOUND)
+			break;
+		now_us = gcs_block_pcm_x_monotonic_us();
+		if (now_us == 0 || now_us == UINT64_MAX)
+			break;
+		if (!gcs_block_pcm_x_resource_x_peer_ready_exact((int32)intent.destination_node,
+														 &connection_generation)) {
+			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
+			continue;
+		}
+		worker_id = cluster_lms_shard_for_tag(tag, cluster_lms_workers);
+		timeout_us = (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * UINT64_C(1000);
+		deadline_us = now_us > UINT64_MAX - timeout_us ? UINT64_MAX : now_us + timeout_us;
+		if (!cluster_lms_outbound_enqueue_resource_x_intent(worker_id, &intent,
+															connection_generation, deadline_us))
+			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
+	}
+}
+
 static PcmXSessionAuthResult
 gcs_block_resource_x_gate_session_snapshot_result(
 	const BufferTag *tag, ResourceXGateSnapshot *gate_out,
@@ -12567,6 +12608,8 @@ cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref)
 		cluster_pcm_lock_resource_x_trace_note(&event);
 	}
 	PG_END_TRY();
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		gcs_block_resource_x_stage_ready_tag(&ref->assertion.resource);
 	return result;
 }
 
@@ -12837,6 +12880,7 @@ gcs_block_resource_x_kind9_ingress(
 	uint64 master_session = 0;
 	int32 source_node;
 	int32 master_node;
+	bool ready = false;
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&outbound, 0, sizeof(outbound));
@@ -12894,6 +12938,7 @@ gcs_block_resource_x_kind9_ingress(
 		if (apply_result != RESOURCE_X_APPLY_APPLIED
 			&& apply_result != RESOURCE_X_APPLY_DUPLICATE)
 			goto done;
+		ready = true;
 		if (outbound.kind == RESOURCE_X_WIRE_ASSERT_X
 			&& frame->common.flags == RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION) {
 			/* Master already linearized the canonical request under entry_lock.
@@ -12957,6 +13002,8 @@ gcs_block_resource_x_kind9_ingress(
 
 done:
 	cluster_semantic_activation_leave(&admission);
+	if (ready)
+		gcs_block_resource_x_stage_ready_tag(&frame->common.logical_assertion.resource);
 }
 
 static ResourceXApplyResult
@@ -13532,6 +13579,9 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 						   join_snapshot.flags,
 						   join_snapshot.grant_source_node,
 						   join_snapshot.image_source_node)));
+	if (frame.kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+		&& (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE))
+		gcs_block_resource_x_stage_ready_tag(&frame.common.logical_assertion.resource);
 	return true;
 #endif
 }

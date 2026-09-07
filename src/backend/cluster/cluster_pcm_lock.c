@@ -23830,8 +23830,12 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 		expected, &entry_ref, &payload);
 	if (slot == NULL)
 		return RESOURCE_X_INTENT_STALE;
-	result = cluster_pcm_lock_resource_x_intent_stage_exact(
-		slot, expected, now_us);
+	/* Physical queue ownership is not the idempotent semantic stage API.
+	 * An ingress worker and the scan worker can observe the same ARMED
+	 * handle: only one may acquire a ring copy under this entry lock. */
+	result = slot->state == RESOURCE_X_INTENT_SLOT_ARMED
+				 ? cluster_pcm_lock_resource_x_intent_stage_exact(slot, expected, now_us)
+				 : RESOURCE_X_INTENT_STALE;
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
@@ -23963,6 +23967,66 @@ pcm_resource_x_outbound_owner_valid(const ResourceXIntentSlot *slot,
 			&& slot->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 			&& slot->payload_bytes == RESOURCE_X_PROOF_V1_BYTES;
 	return false;
+}
+
+/* A completed consumer knows its resource. This read-only, noncreating
+ * lookup never moves the global scan cursor or becomes a transport claim. */
+ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint32 *owner_cursor,
+													 ResourceXIntentSlot *slot_out)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	ClusterPcmResourceXMasterState *state;
+	ResourceXIntentProbeResult result = RESOURCE_X_INTENT_PROBE_COMPLETE;
+	uint32 index;
+
+	if (slot_out != NULL)
+		memset(slot_out, 0, sizeof(*slot_out));
+	if (tag == NULL || owner_cursor == NULL || slot_out == NULL
+		|| *owner_cursor > PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS)
+		return RESOURCE_X_INTENT_PROBE_CORRUPT;
+	if (*owner_cursor == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS)
+		return RESOURCE_X_INTENT_PROBE_COMPLETE;
+	if (!pcm_entry_ref_acquire(tag, false, &entry_ref, &acquire_result))
+		return acquire_result == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_INTENT_PROBE_COMPLETE
+															 : RESOURCE_X_INTENT_PROBE_CORRUPT;
+	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(entry_ref.entry);
+	if (state == NULL) {
+		result = RESOURCE_X_INTENT_PROBE_CORRUPT;
+		goto ready_probe_done;
+	}
+	for (index = *owner_cursor; index < PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS; index++) {
+		ResourceXIntentSlot *slot;
+		uint8 *payload;
+
+		pcm_resource_x_outbound_owner_at(state, index, &slot, &payload);
+		if (slot == NULL || payload == NULL) {
+			result = RESOURCE_X_INTENT_PROBE_CORRUPT;
+			break;
+		}
+		if (slot->state == RESOURCE_X_INTENT_SLOT_EMPTY
+			|| slot->state == RESOURCE_X_INTENT_SLOT_STAGED)
+			continue;
+		if (slot->state != RESOURCE_X_INTENT_SLOT_ARMED
+			|| !pcm_resource_x_outbound_owner_valid(slot, index)
+			|| !BufferTagsEqual(tag, &slot->body.assertion.resource)) {
+			result = RESOURCE_X_INTENT_PROBE_CORRUPT;
+			break;
+		}
+		*slot_out = *slot;
+		*owner_cursor = index + 1;
+		result = RESOURCE_X_INTENT_PROBE_FOUND;
+		break;
+	}
+	if (result == RESOURCE_X_INTENT_PROBE_COMPLETE)
+		*owner_cursor = PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS;
+
+ready_probe_done:
+	LWLockRelease(&entry_ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
 }
 
 ResourceXIntentProbeResult

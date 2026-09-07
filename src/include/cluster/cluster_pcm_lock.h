@@ -2009,9 +2009,11 @@ cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 extern bool cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
 	const ResourceXIntentSlot *expected);
 extern ResourceXIntentProbeResult
-cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
-	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
-	uint16 payload_capacity, uint32 *examined_out);
+cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint32 *owner_cursor,
+													 ResourceXIntentSlot *slot_out);
+extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
+	uint32 *examined_out);
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_work_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out, ResourceXAcquisitionRef *delivery_out);
