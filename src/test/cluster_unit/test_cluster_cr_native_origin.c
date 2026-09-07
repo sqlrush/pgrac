@@ -68,6 +68,38 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* Linux/ARM's real CRC chooser needs the backend logging surface.  Keep
+ * DEBUG diagnostics inert, but never suppress its hardware self-test ERROR. */
+#undef errstart
+#undef errstart_cold
+#undef errfinish
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	if (elevel >= ERROR)
+		abort();
+	return false;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
 static void
 native_reset(void)
 {
