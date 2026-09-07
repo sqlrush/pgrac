@@ -22249,7 +22249,12 @@ pcm_resource_x_redrive_grant_intent_locked(
 		body.owner_node = (uint32)cluster_node_id;
 		body.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_BLOCK;
 		body.owner_index = (uint8)source;
-		now_us = pcm_resource_x_monotonic_us();
+		/* An in-flight send keeps its physical identity across logical
+		 * replays. Only an EMPTY slot starts a new send lifetime; sampling
+		 * another first_armed_us would falsely trip the exact ABA comparison. */
+		now_us = block_intent->slot.state == RESOURCE_X_INTENT_SLOT_EMPTY
+					 ? pcm_resource_x_monotonic_us()
+					 : block_intent->slot.first_armed_us;
 		if (now_us == 0 || now_us == UINT64_MAX
 			|| !cluster_pcm_lock_resource_x_intent_arm_exact(
 				&candidate, &body, request->assertion_sequence, request->base_authority_generation,

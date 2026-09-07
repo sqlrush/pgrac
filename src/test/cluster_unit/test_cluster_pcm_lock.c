@@ -9323,6 +9323,201 @@ UT_TEST(test_resource_x_delegates_final_x_without_standalone_grant)
 	UT_ASSERT_EQ(memcmp(payload, original_payload, sizeof(original_payload)), 0);
 }
 
+static void
+check_resource_x_delegated_replay_preserves_live_send(bool staged, bool fused, bool shared)
+{
+	BufferTag tag = make_tag(294);
+	ResourceXDecodedFrame bootstrap, assertion, replay, proof, notice, source_ack, wrong;
+	ResourceXMasterSnapshot snapshot, committed;
+	ResourceXIntentSlot intent, before, after;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint8 original_payload[RESOURCE_X_CONTROL_V1_BYTES];
+	ResourceXApplyResult replay_result;
+
+	reset_fake_pcm_runtime(4);
+	fake_pcm_clock_us = 1000;
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, shared ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	bootstrap = make_resource_x_bootstrap_request(tag, 2);
+	if (fused) {
+		bootstrap.common.flags = RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION;
+		bootstrap.common.semantic_crc32c = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&bootstrap, 2, 61, 77, 31,
+																		 71, &assertion),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(assertion.kind, RESOURCE_X_WIRE_ASSERT_X);
+	} else
+		assertion = resource_x_admitted_test_assert(tag, 2, &snapshot);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	memcpy(original_payload, payload, sizeof(original_payload));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 1100),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+
+	/* Authenticated remote proof is a fixture input. Admission, grant commit,
+	 * physical-send ownership, replay and settlement are real production FSMs. */
+	proof = make_resource_x_remote_blocked_frame(tag, 2, 0);
+	proof.common.base_authority_generation = assertion.common.base_authority_generation;
+	proof.common.authority_generation = assertion.common.base_authority_generation;
+	proof.common.assertion_sequence = assertion.common.assertion_sequence;
+	proof.common.ordered_lane = 0;
+	if (shared) {
+		proof.common.observed_mode = PCM_STATE_S;
+		set_resource_x_test_source_fence(proof.body.blocked_to_n.source_fence, 3, PCM_STATE_S);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&proof, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	committed = snapshot;
+
+	/* The first post-proof replay rearms an EMPTY physical slot. */
+	fake_pcm_clock_us = 2000;
+	if (fused)
+		replay_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(&bootstrap, 2, 61, 77,
+																			31, 71, &replay);
+	else
+		replay_result = cluster_pcm_lock_resource_x_assert_bootstrapped_exact(&assertion, 2, 61, 77,
+																			  31, 71, &snapshot);
+	UT_ASSERT_EQ(replay_result, RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(intent.first_armed_us, UINT64_C(2000));
+	UT_ASSERT_EQ(memcmp(payload, original_payload, sizeof(original_payload)), 0);
+	if (staged)
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 2100),
+					 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, 0, &before, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(before.state,
+				 staged ? RESOURCE_X_INTENT_SLOT_STAGED : RESOURCE_X_INTENT_SLOT_ARMED);
+	if (ut_current_failed)
+		return;
+
+	/* A later clock tick is not a different request or physical-send owner. */
+	fake_pcm_clock_us = 3000;
+	if (fused)
+		replay_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(&bootstrap, 2, 61, 77,
+																			31, 71, &replay);
+	else
+		replay_result = cluster_pcm_lock_resource_x_assert_bootstrapped_exact(&assertion, 2, 61, 77,
+																			  31, 71, &snapshot);
+	UT_ASSERT_EQ(replay_result, RESOURCE_X_APPLY_DUPLICATE);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+					 &assertion.common.logical_assertion, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&snapshot, &committed, sizeof(snapshot)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, 0, &after, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&after, &before, sizeof(after)), 0);
+	UT_ASSERT_EQ(memcmp(payload, original_payload, sizeof(original_payload)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+	wrong = fused ? bootstrap : assertion;
+	wrong.common.assertion_sequence++;
+	if (fused)
+		replay_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(&wrong, 2, 61, 77, 31,
+																			71, &replay);
+	else
+		replay_result = cluster_pcm_lock_resource_x_assert_bootstrapped_exact(&wrong, 2, 61, 77, 31,
+																			  71, &snapshot);
+	UT_ASSERT_EQ(replay_result, RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+					 &assertion.common.logical_assertion, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&snapshot, &committed, sizeof(snapshot)), 0);
+	if (!staged)
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&before, 3100),
+					 RESOURCE_X_INTENT_STAGED);
+	/* Keeping logical replay idempotent must not weaken physical-send ABA. */
+	after = before;
+	after.first_armed_us++;
+	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&after));
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&before));
+
+	/* Do not stop at a DUPLICATE result: the actual INSTALL consumer must
+	 * still create the exact source-release debt, never fabricate completion. */
+	notice = assertion;
+	notice.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+	notice.common.authority_generation = committed.final_authority_generation;
+	notice.common.outcome = RESOURCE_X_OUTCOME_OK;
+	memset(&notice.body, 0, sizeof(notice.body));
+	notice.body.install_settlement.conversion_base_generation
+		= assertion.common.base_authority_generation;
+	notice.body.install_settlement.final_authority_generation
+		= committed.final_authority_generation;
+	notice.body.install_settlement.requester_connection_generation = 91;
+	notice.body.install_settlement.requester_target_generation
+		= proof.body.blocked_to_n.requester_target_generation;
+	notice.body.install_settlement.page_scn_lsn = proof.body.blocked_to_n.page_scn_lsn;
+	notice.body.install_settlement.page_checksum = proof.body.blocked_to_n.page_checksum;
+	notice.body.install_settlement.source_proof_crc32c
+		= proof.body.blocked_to_n.source_proof_crc32c;
+	notice.body.install_settlement.installed_mode = PCM_STATE_X;
+	notice.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	notice.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	notice.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&notice, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, payload,
+											 intent.payload_bytes, &source_ack, &reject));
+	UT_ASSERT_EQ(source_ack.common.authority_generation, committed.final_authority_generation);
+	source_ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
+	source_ack.common.outcome = RESOURCE_X_OUTCOME_OK;
+	source_ack.common.sender_connection_generation = 61;
+	wrong = source_ack;
+	wrong.body.blocked_to_n.source_carrier_generation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&wrong, 0, &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, &after, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&after, &intent, sizeof(after)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&source_ack, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, &after, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+UT_TEST(test_resource_x_delegated_replay_preserves_armed_send)
+{
+	int fused, shared;
+
+	for (fused = 0; fused <= 1; fused++)
+		for (shared = 0; shared <= 1; shared++) {
+			check_resource_x_delegated_replay_preserves_live_send(false, fused, shared);
+			if (ut_current_failed)
+				return;
+		}
+}
+
+UT_TEST(test_resource_x_delegated_replay_preserves_staged_send)
+{
+	int fused, shared;
+
+	for (fused = 0; fused <= 1; fused++)
+		for (shared = 0; shared <= 1; shared++) {
+			check_resource_x_delegated_replay_preserves_live_send(true, fused, shared);
+			if (ut_current_failed)
+				return;
+		}
+}
+
 UT_TEST(test_resource_x_delegates_selected_s_only_after_other_holders_revoke)
 {
 	BufferTag tag = make_tag(195);
@@ -17342,7 +17537,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(235);
+	UT_PLAN(237);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -17469,6 +17664,8 @@ main(void)
 	UT_RUN(test_resource_x_tombstone_lineage_drift_remains_terminal);
 	UT_RUN(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi);
 	UT_RUN(test_resource_x_delegates_final_x_without_standalone_grant);
+	UT_RUN(test_resource_x_delegated_replay_preserves_armed_send);
+	UT_RUN(test_resource_x_delegated_replay_preserves_staged_send);
 	UT_RUN(test_resource_x_delegates_selected_s_only_after_other_holders_revoke);
 	UT_RUN(test_resource_x_delegated_unproven_head_cannot_be_reclaimed);
 	UT_RUN(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_ack);
