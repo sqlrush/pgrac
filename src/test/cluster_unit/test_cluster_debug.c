@@ -456,6 +456,15 @@ cluster_ctrc_stat_name(ClusterCtrcStatId stat)
 		[CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY] = "ordinary_publication_after_apply_count",
 		[CTRC_STAT_CURRENT_MX_PUBLICATION_AFTER_APPLY] = "current_mx_publication_after_apply_count",
 		[CTRC_STAT_PUBLICATION_ORDER_VIOLATION] = "publication_order_violation_count",
+		[CTRC_STAT_CLEANER_PASS] = "cleaner_pass_count",
+		[CTRC_STAT_CLEANER_ATTEMPT] = "cleaner_attempt_count",
+		[CTRC_STAT_SEMANTIC_PROGRESS] = "semantic_progress_count",
+		[CTRC_STAT_PENDING_DUPLICATE] = "pending_duplicate_count",
+		[CTRC_STAT_DISPATCH_BACKLOG] = "dispatch_backlog",
+		[CTRC_STAT_CERTIFICATE_BACKLOG] = "certificate_backlog",
+		[CTRC_STAT_PENDING_OBSERVED_AGE_MS] = "pending_observed_age_ms",
+		[CTRC_STAT_OBSERVED_AT_US] = "observed_at_monotonic_us",
+		[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
 	};
 
 	return stat >= 0 && stat < CTRC_STAT_COUNT ? names[stat] : NULL;

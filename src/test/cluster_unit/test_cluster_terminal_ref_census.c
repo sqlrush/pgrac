@@ -2202,12 +2202,10 @@ UT_TEST(test_ctrc_release_overlap_progress_is_event_driven_without_xcur_churn)
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_tt_durable.c",
 		"cluster_undo_cleaner_wakeup();"));
-	UT_ASSERT(source_file_contains(
-		"src/backend/cluster/cluster_terminal_ref_census.c",
-		"if (landed)\n\t\tcluster_undo_cleaner_wakeup();"));
-	UT_ASSERT(source_file_contains(
-		"src/backend/cluster/cluster_terminal_ref_census.c",
-		"if (noted)\n\t\tcluster_undo_cleaner_wakeup();"));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "progressed = landed && ack_before != origin->ack_bitmap;"));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "confirmed_before != matched->close_confirmed_bitmap"));
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);\n"
@@ -2215,9 +2213,9 @@ UT_TEST(test_ctrc_release_overlap_progress_is_event_driven_without_xcur_churn)
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"RELEASE_PROVEN still needs the participant-summary notification"));
-	UT_ASSERT(source_file_occurrences(
-		"src/backend/cluster/cluster_terminal_ref_census.c",
-		"cluster_undo_cleaner_wakeup();") >= 8);
+	UT_ASSERT(source_file_occurrences("src/backend/cluster/cluster_terminal_ref_census.c",
+									  "ctrc_semantic_progress(true);")
+			  >= 4);
 	/* Latches coalesce notifications, so one wake cannot stand in for an
 	 * unbounded number of queued local state edges.  A completed local edge
 	 * keeps the sole cleaner running immediately; a remote transport enqueue
@@ -2230,7 +2228,7 @@ UT_TEST(test_ctrc_release_overlap_progress_is_event_driven_without_xcur_churn)
 		"*out_work_remaining = ctrc_local_progress;"));
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
-		"dispatched && dispatch.participant.node_id == (uint16)cluster_node_id"));
+		"cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) != progress_before"));
 	UT_ASSERT(!source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"progressed = cluster_gcs_ctrc_dispatch_close(&dispatch) || progressed;"));
@@ -3045,6 +3043,15 @@ UT_TEST(test_ctrc_observability_names_are_closed_and_total)
 		"ordinary_publication_after_apply_count",
 		"current_mx_publication_after_apply_count",
 		"publication_order_violation_count",
+		"cleaner_pass_count",
+		"cleaner_attempt_count",
+		"semantic_progress_count",
+		"pending_duplicate_count",
+		"dispatch_backlog",
+		"certificate_backlog",
+		"pending_observed_age_ms",
+		"observed_at_monotonic_us",
+		"observation_age_ms",
 	};
 	static const char *const reason_names[] = {
 		"NONE",

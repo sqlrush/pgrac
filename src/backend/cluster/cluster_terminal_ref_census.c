@@ -63,12 +63,13 @@
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
+#include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(6)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(7)
 const uint8 cluster_ctrc_empty_sha256[32] = {
 	0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
 	0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
@@ -109,8 +110,7 @@ static const char *const ctrc_stat_names[CTRC_STAT_COUNT] = {
 	[CTRC_STAT_RECEIPT_PREPARED] = "receipt_prepared_count",
 	[CTRC_STAT_RECEIPT_APPLIED] = "receipt_applied_count",
 	[CTRC_STAT_RECEIPT_CANCELLED] = "receipt_cancelled_count",
-	[CTRC_STAT_RECEIPT_CAPACITY_REFUSED] =
-		"receipt_capacity_refused_count",
+	[CTRC_STAT_RECEIPT_CAPACITY_REFUSED] = "receipt_capacity_refused_count",
 	[CTRC_STAT_SEAL_STARTED] = "seal_started_count",
 	[CTRC_STAT_SEAL_BLOCKED] = "seal_blocked_count",
 	[CTRC_STAT_TARGET_ABSENT] = "target_absent_count",
@@ -122,12 +122,18 @@ static const char *const ctrc_stat_names[CTRC_STAT_COUNT] = {
 	[CTRC_STAT_CERTIFICATE_REPLAYED] = "certificate_replayed_count",
 	[CTRC_STAT_L11_RELEASE_SAMPLE] = "l11_release_sample_count",
 	[CTRC_STAT_L12_RECYCLE] = "l12_recycle_count",
-	[CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY] =
-		"ordinary_publication_after_apply_count",
-	[CTRC_STAT_CURRENT_MX_PUBLICATION_AFTER_APPLY] =
-		"current_mx_publication_after_apply_count",
-	[CTRC_STAT_PUBLICATION_ORDER_VIOLATION] =
-		"publication_order_violation_count",
+	[CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY] = "ordinary_publication_after_apply_count",
+	[CTRC_STAT_CURRENT_MX_PUBLICATION_AFTER_APPLY] = "current_mx_publication_after_apply_count",
+	[CTRC_STAT_PUBLICATION_ORDER_VIOLATION] = "publication_order_violation_count",
+	[CTRC_STAT_CLEANER_PASS] = "cleaner_pass_count",
+	[CTRC_STAT_CLEANER_ATTEMPT] = "cleaner_attempt_count",
+	[CTRC_STAT_SEMANTIC_PROGRESS] = "semantic_progress_count",
+	[CTRC_STAT_PENDING_DUPLICATE] = "pending_duplicate_count",
+	[CTRC_STAT_DISPATCH_BACKLOG] = "dispatch_backlog",
+	[CTRC_STAT_CERTIFICATE_BACKLOG] = "certificate_backlog",
+	[CTRC_STAT_PENDING_OBSERVED_AGE_MS] = "pending_observed_age_ms",
+	[CTRC_STAT_OBSERVED_AT_US] = "observed_at_monotonic_us",
+	[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
 };
 
 static const char *const ctrc_cleaner_reason_names[
@@ -1633,6 +1639,75 @@ cluster_ctrc_participant_index_compute(
 #ifndef CLUSTER_CTRC_UNIT_TEST
 
 static ClusterCtrcSharedHeader *CtrcShared = NULL;
+
+/* Process-local scheduling hints, never part of an authority snapshot. Only
+ * the existing UndoCleaner runs batches. A reused slot may inherit a cursor,
+ * but every operation still samples and checks the current shared identity. */
+#define CTRC_CLEANER_SEAL_BATCH 8
+#define CTRC_CLEANER_RECEIPT_BATCH 32
+#define CTRC_CLEANER_ACK_BATCH 16
+#define CTRC_CLEANER_DISPATCH_BATCH 64
+#define CTRC_CLEANER_OLD_BATCH (CTRC_CLEANER_DISPATCH_BATCH / 2)
+#define CTRC_CLEANER_CERTIFICATE_BATCH 16
+#define CTRC_CLEANER_ORIGINS (CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT)
+
+typedef enum CtrcCleanerScanKind {
+	CTRC_SCAN_OPEN,
+	CTRC_SCAN_RECEIPT,
+	CTRC_SCAN_ACK,
+	CTRC_SCAN_CERTIFICATE,
+	CTRC_SCAN_COUNT
+} CtrcCleanerScanKind;
+
+typedef struct CtrcCleanerOriginHint {
+	uint64 seal_generation;
+	uint64 first_observed_us;
+	uint16 participant_cursor;
+} CtrcCleanerOriginHint;
+
+typedef struct CtrcCleanerBatch {
+	bool active;
+	uint64 remaining[CTRC_SCAN_COUNT];
+	uint64 dispatch_index[CTRC_CLEANER_DISPATCH_BATCH];
+	unsigned dispatch_count;
+	unsigned dispatch_next;
+} CtrcCleanerBatch;
+
+static CtrcCleanerBatch CtrcBatch;
+static CtrcCleanerOriginHint CtrcOriginHint[CTRC_CLEANER_ORIGINS];
+static uint64 CtrcDispatchCursor;
+
+static uint64
+ctrc_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+static uint64
+ctrc_scan_limit(CtrcCleanerScanKind kind, uint64 capacity)
+{
+	return CtrcBatch.active ? Min(capacity, CtrcBatch.remaining[kind]) : capacity;
+}
+
+static void
+ctrc_scan_charge(CtrcCleanerScanKind kind, uint64 visited)
+{
+	if (CtrcBatch.active) {
+		Assert(visited <= CtrcBatch.remaining[kind]);
+		CtrcBatch.remaining[kind] -= visited;
+	}
+}
+
+static void
+ctrc_semantic_progress(bool wake)
+{
+	cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
+	if (wake)
+		cluster_undo_cleaner_wakeup();
+}
 static bool ctrc_cleaner_clean_next_receipt(void);
 static bool ctrc_cleaner_clean_current_mx_receipt(
 	const ClusterCtrcParticipantEntry *participant,
@@ -1861,6 +1936,7 @@ ctrc_origin_next_certificate_snapshot_shared(
 {
 	static uint64 scan_cursor = 0;
 	uint64 visited;
+	uint64 limit;
 	bool found = false;
 
 	if (snapshot != NULL)
@@ -1868,10 +1944,10 @@ ctrc_origin_next_certificate_snapshot_shared(
 	if (snapshot == NULL || cluster_node_id < 0
 		|| !cluster_ctrc_shmem_ready())
 		return false;
+	limit = ctrc_scan_limit(CTRC_SCAN_CERTIFICATE, CtrcShared->origin_key_entries);
 	SpinLockAcquire(&CtrcShared->origin_lock);
 	SpinLockAcquire(&CtrcShared->receipt_lock);
-	for (visited = 0; visited < CtrcShared->origin_key_entries; visited++)
-	{
+	for (visited = 0; visited < limit; visited++) {
 		uint64 index = (scan_cursor + visited)
 			% CtrcShared->origin_key_entries;
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
@@ -1890,6 +1966,7 @@ ctrc_origin_next_certificate_snapshot_shared(
 	}
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->origin_lock);
+	ctrc_scan_charge(CTRC_SCAN_CERTIFICATE, visited + (found ? 1 : 0));
 	return found;
 }
 
@@ -2027,6 +2104,9 @@ cluster_ctrc_shmem_init(void)
 		&found);
 	if (!found)
 	{
+		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
+		MemSet(CtrcOriginHint, 0, sizeof(CtrcOriginHint));
+		CtrcDispatchCursor = 0;
 		MemSet(CtrcShared, 0, capacity.total_bytes);
 		CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
 		CtrcShared->version = CLUSTER_CTRC_SHMEM_VERSION;
@@ -2077,6 +2157,12 @@ cluster_ctrc_stat_get(ClusterCtrcStatId stat)
 	if (stat < 0 || stat >= CTRC_STAT_COUNT
 		|| !ctrc_runtime_attached())
 		return 0;
+	if (stat == CTRC_STAT_OBSERVATION_AGE_MS) {
+		uint64 sampled = pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_OBSERVED_AT_US]);
+		uint64 now = ctrc_monotonic_us();
+
+		return sampled != 0 && now >= sampled ? (now - sampled) / 1000 : 0;
+	}
 	return pg_atomic_read_u64(&CtrcShared->stats[stat]);
 }
 
@@ -3227,6 +3313,7 @@ cluster_ctrc_origin_note_close_reply_shared(
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *matched = NULL;
 	bool noted = false;
+	bool progressed = false;
 	uint64 i;
 	uint32 bit;
 
@@ -3253,12 +3340,21 @@ cluster_ctrc_origin_note_close_reply_shared(
 		}
 		matched = candidate;
 	}
-	if (matched != NULL)
+	if (matched != NULL) {
+		uint32 confirmed_before = matched->close_confirmed_bitmap;
+		uint8 state_before = matched->state;
+
 		noted = cluster_ctrc_origin_note_close_reply_entry(
 			matched, participant_node_id, request_id, result);
+		progressed = noted
+					 && (confirmed_before != matched->close_confirmed_bitmap
+						 || state_before != matched->state);
+	}
 	SpinLockRelease(&CtrcShared->origin_lock);
-	if (noted)
-		cluster_undo_cleaner_wakeup();
+	if (progressed)
+		ctrc_semantic_progress(true);
+	else if (noted && result == CTRC_SEAL_REPLY_PENDING_DRAIN)
+		cluster_ctrc_stat_bump(CTRC_STAT_PENDING_DUPLICATE);
 	return noted;
 #else
 	(void)request_id;
@@ -3277,6 +3373,7 @@ cluster_ctrc_origin_note_certificate_reply_shared(
 	ClusterCtrcOriginEntry *matched = NULL;
 	uint64 matched_index = UINT64_MAX;
 	bool noted = false;
+	bool progressed = false;
 	uint64 i;
 	uint32 bit;
 
@@ -3308,8 +3405,11 @@ cluster_ctrc_origin_note_certificate_reply_shared(
 	}
 	if (matched != NULL)
 	{
+		uint32 confirmed_before = matched->close_confirmed_bitmap;
+
 		noted = cluster_ctrc_origin_note_certificate_reply_entry(
 			matched, participant_node_id, request_id, result);
+		progressed = noted && confirmed_before != matched->close_confirmed_bitmap;
 		if (noted
 			&& matched->close_confirmed_bitmap == matched->touched_bitmap)
 		{
@@ -3320,6 +3420,8 @@ cluster_ctrc_origin_note_certificate_reply_shared(
 	}
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->origin_lock);
+	if (noted && progressed)
+		ctrc_semantic_progress(true);
 	return noted;
 #else
 	(void)request_id;
@@ -3335,6 +3437,7 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	static uint64 scan_cursor = 0;
 	uint64 i;
+	uint64 limit;
 	bool found = false;
 
 	if (key_out != NULL)
@@ -3342,9 +3445,9 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 	if (key_out == NULL || cluster_node_id < 0
 		|| !cluster_ctrc_shmem_ready())
 		return false;
+	limit = ctrc_scan_limit(CTRC_SCAN_OPEN, CtrcShared->origin_key_entries);
 	SpinLockAcquire(&CtrcShared->origin_lock);
-	for (i = 0; i < CtrcShared->origin_key_entries; i++)
-	{
+	for (i = 0; i < limit; i++) {
 		uint64 index = (scan_cursor + i) % CtrcShared->origin_key_entries;
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
 
@@ -3364,6 +3467,7 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 		break;
 	}
 	SpinLockRelease(&CtrcShared->origin_lock);
+	ctrc_scan_charge(CTRC_SCAN_OPEN, i + (found ? 1 : 0));
 	return found;
 #else
 	if (key_out != NULL)
@@ -3424,47 +3528,151 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 #endif
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Advance only the existing local FSM edges. Selection is not permission to
+ * clean a page, publish a certificate, or recycle a slot. */
+static bool
+ctrc_origin_dispatchable_locked(ClusterCtrcOriginEntry *origin)
+{
+	uint8 before = origin->state;
+
+	if (cluster_node_id < 0 || origin->key.origin_node_id != (uint16)cluster_node_id)
+		return false;
+	if (origin->state == CTRC_ORIGIN_SEALED
+		|| (origin->state == CTRC_ORIGIN_SEALING && origin->touched_bitmap == 0))
+		(void)cluster_ctrc_origin_begin_cleaning_entry(origin);
+	if (origin->state == CTRC_ORIGIN_CLEANING && origin->ack_bitmap == origin->touched_bitmap)
+		origin->state = CTRC_ORIGIN_CERTIFYING;
+	if (before != origin->state)
+		ctrc_semantic_progress(false);
+	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN)
+		return (origin->touched_bitmap & ~origin->close_confirmed_bitmap) != 0;
+	return (origin->state == CTRC_ORIGIN_SEALING || origin->state == CTRC_ORIGIN_CLEANING)
+		   && (origin->touched_bitmap & ~origin->ack_bitmap) != 0;
+}
+
+static bool
+ctrc_dispatch_batch_contains(uint64 index)
+{
+	unsigned i;
+
+	for (i = 0; i < CtrcBatch.dispatch_count; i++)
+		if (CtrcBatch.dispatch_index[i] == index)
+			return true;
+	return false;
+}
+
+/* One census, at most 32 oldest origins plus the remaining round-robin
+ * share. Only indices are retained; arm re-reads the real identity under its
+ * original lock. No shared state, receipt or request is pre-reserved here. */
+static void
+ctrc_dispatch_batch_collect(void)
+{
+	uint64 old_index[CTRC_CLEANER_OLD_BATCH];
+	uint64 old_seal[CTRC_CLEANER_OLD_BATCH];
+	unsigned old_count = 0;
+	uint64 pending = 0;
+	uint64 certifying = 0;
+	uint64 oldest_age_us = 0;
+	uint64 now = ctrc_monotonic_us();
+	uint64 i;
+	uint64 start;
+
+	CtrcBatch.dispatch_count = 0;
+	CtrcBatch.dispatch_next = 0;
+	if (!cluster_ctrc_shmem_ready())
+		return;
+	Assert(CtrcShared->origin_key_entries == lengthof(CtrcOriginHint));
+	SpinLockAcquire(&CtrcShared->origin_lock);
+	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
+		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[i];
+		CtrcCleanerOriginHint *hint = &CtrcOriginHint[i];
+		bool eligible = ctrc_origin_dispatchable_locked(origin);
+		bool certificate = origin->state == CTRC_ORIGIN_CERTIFYING;
+		unsigned pos;
+
+		if (certificate)
+			certifying++;
+		if (eligible || certificate) {
+			if (hint->seal_generation != origin->seal_generation || hint->first_observed_us == 0
+				|| now < hint->first_observed_us) {
+				hint->seal_generation = origin->seal_generation;
+				hint->first_observed_us = now;
+			}
+			oldest_age_us = Max(oldest_age_us, now - hint->first_observed_us);
+		} else {
+			hint->seal_generation = 0;
+			hint->first_observed_us = 0;
+		}
+		if (!eligible)
+			continue;
+		pending++;
+		for (pos = 0; pos < old_count; pos++)
+			if (origin->seal_generation < old_seal[pos])
+				break;
+		if (pos >= CTRC_CLEANER_OLD_BATCH)
+			continue;
+		if (old_count < CTRC_CLEANER_OLD_BATCH)
+			old_count++;
+		for (unsigned move = old_count - 1; move > pos; move--) {
+			old_index[move] = old_index[move - 1];
+			old_seal[move] = old_seal[move - 1];
+		}
+		old_index[pos] = i;
+		old_seal[pos] = origin->seal_generation;
+	}
+	for (unsigned pos = 0; pos < old_count; pos++)
+		CtrcBatch.dispatch_index[CtrcBatch.dispatch_count++] = old_index[pos];
+	start = CtrcDispatchCursor % CtrcShared->origin_key_entries;
+	for (i = 0; i < CtrcShared->origin_key_entries
+				&& CtrcBatch.dispatch_count < CTRC_CLEANER_DISPATCH_BATCH;
+		 i++) {
+		uint64 index = (start + i) % CtrcShared->origin_key_entries;
+
+		if (ctrc_dispatch_batch_contains(index)
+			|| !ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[index]))
+			continue;
+		CtrcBatch.dispatch_index[CtrcBatch.dispatch_count++] = index;
+		CtrcDispatchCursor = (index + 1) % CtrcShared->origin_key_entries;
+	}
+	SpinLockRelease(&CtrcShared->origin_lock);
+
+	/* Non-atomic observation across tables/stages. Age is a lower bound
+	 * since this process first saw the seal, never an expiry decision. */
+	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_DISPATCH_BACKLOG], pending);
+	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_CERTIFICATE_BACKLOG], certifying);
+	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_PENDING_OBSERVED_AGE_MS],
+						oldest_age_us / 1000);
+	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_OBSERVED_AT_US], now);
+}
+#endif
+
 bool
 cluster_ctrc_origin_next_close_dispatch_shared(
 	ClusterCtrcCloseDispatch *dispatch_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
-	static uint64 scan_cursor = 0;
-	uint64 visited;
 	bool found = false;
 
 	if (dispatch_out != NULL)
 		MemSet(dispatch_out, 0, sizeof(*dispatch_out));
 	if (dispatch_out == NULL || !cluster_ctrc_shmem_ready())
 		return false;
+	if (!CtrcBatch.active && CtrcBatch.dispatch_next >= CtrcBatch.dispatch_count)
+		ctrc_dispatch_batch_collect();
 	SpinLockAcquire(&CtrcShared->origin_lock);
-	for (visited = 0; visited < CtrcShared->origin_key_entries; visited++)
-	{
-		uint64 index = (scan_cursor + visited)
-			% CtrcShared->origin_key_entries;
+	while (CtrcBatch.dispatch_next < CtrcBatch.dispatch_count) {
+		uint64 index = CtrcBatch.dispatch_index[CtrcBatch.dispatch_next++];
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
+		CtrcCleanerOriginHint *hint = &CtrcOriginHint[index];
 		bool certificate_notification;
-		uint16 node_id;
+		unsigned visited;
 
-		if (origin->state == CTRC_ORIGIN_SEALED
-			|| (origin->state == CTRC_ORIGIN_SEALING
-				&& origin->touched_bitmap == 0))
-			(void)cluster_ctrc_origin_begin_cleaning_entry(origin);
-		if (origin->state == CTRC_ORIGIN_CLEANING
-			&& origin->ack_bitmap == origin->touched_bitmap)
-		{
-			origin->state = CTRC_ORIGIN_CERTIFYING;
+		if (!ctrc_origin_dispatchable_locked(origin))
 			continue;
-		}
-		certificate_notification
-			= origin->state == CTRC_ORIGIN_RELEASE_PROVEN;
-		if (origin->state != CTRC_ORIGIN_SEALING
-			&& origin->state != CTRC_ORIGIN_CLEANING
-			&& !certificate_notification)
-			continue;
-		for (node_id = 0; node_id < CLUSTER_CTRC_MAX_PARTICIPANTS;
-			 node_id++)
-		{
+		certificate_notification = origin->state == CTRC_ORIGIN_RELEASE_PROVEN;
+		for (visited = 0; visited < CLUSTER_CTRC_MAX_PARTICIPANTS; visited++) {
+			uint16 node_id = (hint->participant_cursor + visited) % CLUSTER_CTRC_MAX_PARTICIPANTS;
 			uint32 bit = UINT32_C(1) << node_id;
 			uint64 request_id;
 
@@ -3484,29 +3692,19 @@ cluster_ctrc_origin_next_close_dispatch_shared(
 					break;
 				}
 				request_id = CtrcShared->global_request_generation++;
-				if (!(certificate_notification
-						? cluster_ctrc_origin_arm_certificate_entry(
-							origin, node_id, request_id)
-						: cluster_ctrc_origin_arm_close_entry(
-							origin, node_id, request_id)))
-					break;
 			}
-			else if (!(certificate_notification
-					   ? cluster_ctrc_origin_arm_certificate_entry(
-						   origin, node_id, request_id)
-					   : cluster_ctrc_origin_arm_close_entry(
-						   origin, node_id, request_id)))
+			if (!(certificate_notification
+					  ? cluster_ctrc_origin_arm_certificate_entry(origin, node_id, request_id)
+					  : cluster_ctrc_origin_arm_close_entry(origin, node_id, request_id)))
 				break;
-
 			dispatch_out->key = origin->key;
 			dispatch_out->participant = origin->touched[node_id];
 			dispatch_out->request_id = request_id;
 			dispatch_out->seal_generation = origin->seal_generation;
 			dispatch_out->grant_generation = origin->grant_generation;
-			dispatch_out->suboperation = certificate_notification
-				? CTRC_SEAL_CERTIFICATE_COMMITTED
-				: CTRC_SEAL_CLOSE_AND_CLEAN;
-			scan_cursor = (index + 1) % CtrcShared->origin_key_entries;
+			dispatch_out->suboperation = certificate_notification ? CTRC_SEAL_CERTIFICATE_COMMITTED
+																  : CTRC_SEAL_CLOSE_AND_CLEAN;
+			hint->participant_cursor = (node_id + 1) % CLUSTER_CTRC_MAX_PARTICIPANTS;
 			found = true;
 			break;
 		}
@@ -4168,39 +4366,82 @@ bool
 cluster_ctrc_cleaner_run_pass(void)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
-	ClusterCtrcTxnKeyV1 key;
-	ClusterCtrcCloseDispatch dispatch;
-	ClusterCtrcOriginCertificateSnapshot certificate;
-	bool local_progressed = false;
+	uint64 progress_before;
 
-	MemSet(&key, 0, sizeof(key));
-	MemSet(&dispatch, 0, sizeof(dispatch));
-	MemSet(&certificate, 0, sizeof(certificate));
 	if (!cluster_ctrc_shmem_ready())
 		return false;
+	Assert(!CtrcBatch.active);
+	if (CtrcBatch.active)
+		return false;
+	cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_PASS);
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
-	if (cluster_ctrc_origin_next_open_shared(&key)
-		&& ctrc_cleaner_terminal_sample_exact(&key, NULL, NULL))
-		local_progressed = cluster_ctrc_origin_begin_seal_shared(&key);
-	if (ctrc_cleaner_clean_next_receipt())
-		local_progressed = true;
-	if (ctrc_participant_freeze_next_ack_shared())
-		local_progressed = true;
-	if (cluster_ctrc_origin_next_close_dispatch_shared(&dispatch))
+	progress_before = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	CtrcBatch.active = true;
+	CtrcBatch.remaining[CTRC_SCAN_OPEN] = CtrcShared->origin_key_entries;
+	CtrcBatch.remaining[CTRC_SCAN_RECEIPT] = CtrcShared->receipt_entries;
+	CtrcBatch.remaining[CTRC_SCAN_ACK] = CtrcShared->participant_key_entries;
+	CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] = CtrcShared->origin_key_entries;
+	PG_TRY();
 	{
-		bool dispatched = cluster_gcs_ctrc_dispatch_close(&dispatch);
+		/* Service the terminal pipeline before admitting new seals. Each
+		 * selector walks at most one table circumference per pass; a
+		 * retained item consumes its attempt and cannot block its peers. */
+		for (unsigned i = 0;
+			 i < CTRC_CLEANER_RECEIPT_BATCH && CtrcBatch.remaining[CTRC_SCAN_RECEIPT] != 0; i++) {
+			CHECK_FOR_INTERRUPTS();
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			if (ctrc_cleaner_clean_next_receipt())
+				ctrc_semantic_progress(false);
+		}
+		for (unsigned i = 0; i < CTRC_CLEANER_ACK_BATCH && CtrcBatch.remaining[CTRC_SCAN_ACK] != 0;
+			 i++) {
+			CHECK_FOR_INTERRUPTS();
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			if (ctrc_participant_freeze_next_ack_shared())
+				ctrc_semantic_progress(false);
+		}
+		ctrc_dispatch_batch_collect();
+		for (unsigned i = 0; i < CTRC_CLEANER_DISPATCH_BATCH; i++) {
+			ClusterCtrcCloseDispatch dispatch;
 
-		/* A local request lands its reply synchronously and therefore changes
-		 * shared CTRC state before returning.  A remote enqueue is only an
-		 * in-flight attempt: its eventual exact reply wakes the next pass and
-		 * enqueue alone must not be counted as semantic progress. */
-		if (dispatched && dispatch.participant.node_id == (uint16)cluster_node_id)
-			local_progressed = true;
+			CHECK_FOR_INTERRUPTS();
+			if (!cluster_ctrc_origin_next_close_dispatch_shared(&dispatch))
+				break;
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			/* An accepted duplicate and a remote enqueue are not progress.
+			 * Only the actual shared reply/participant edges record it. */
+			(void)cluster_gcs_ctrc_dispatch_close(&dispatch);
+		}
+		for (unsigned i = 0;
+			 i < CTRC_CLEANER_CERTIFICATE_BATCH && CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] != 0;
+			 i++) {
+			ClusterCtrcOriginCertificateSnapshot certificate;
+
+			CHECK_FOR_INTERRUPTS();
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			if (ctrc_origin_next_certificate_snapshot_shared(&certificate)
+				&& ctrc_cleaner_publish_certificate(&certificate))
+				ctrc_semantic_progress(false);
+		}
+		for (unsigned i = 0;
+			 i < CTRC_CLEANER_SEAL_BATCH && CtrcBatch.remaining[CTRC_SCAN_OPEN] != 0; i++) {
+			ClusterCtrcTxnKeyV1 key;
+
+			CHECK_FOR_INTERRUPTS();
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			if (cluster_ctrc_origin_next_open_shared(&key)
+				&& ctrc_cleaner_terminal_sample_exact(&key, NULL, NULL)
+				&& cluster_ctrc_origin_begin_seal_shared(&key))
+				ctrc_semantic_progress(false);
+		}
 	}
-	if (ctrc_origin_next_certificate_snapshot_shared(&certificate))
-		local_progressed = ctrc_cleaner_publish_certificate(&certificate)
-			|| local_progressed;
-	return local_progressed;
+	PG_FINALLY();
+	{
+		/* No batch hint or scan limit survives an ERROR into a later pass. */
+		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
+	}
+	PG_END_TRY();
+	return cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) != progress_before;
 #else
 	return false;
 #endif
@@ -5375,6 +5616,8 @@ cluster_ctrc_origin_ack_land_shared(
 	uint64 origin_index;
 	uint64 ack_index;
 	bool landed;
+	bool progressed;
+	uint32 ack_before;
 
 	if (ack == NULL || !cluster_ctrc_shmem_ready()
 		|| !ctrc_origin_index(&ack->transaction_key, &origin_index)
@@ -5384,12 +5627,14 @@ cluster_ctrc_origin_ack_land_shared(
 	SpinLockAcquire(&CtrcShared->origin_lock);
 	SpinLockAcquire(&CtrcShared->receipt_lock);
 	origin = &ctrc_origin_entries()[origin_index];
+	ack_before = origin->ack_bitmap;
 	landed = cluster_ctrc_origin_ack_land_entry(origin, request_id, ack,
 		&ctrc_origin_ack_entries()[ack_index]);
+	progressed = landed && ack_before != origin->ack_bitmap;
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->origin_lock);
-	if (landed)
-		cluster_undo_cleaner_wakeup();
+	if (progressed)
+		ctrc_semantic_progress(true);
 	return landed;
 #else
 	(void)request_id;
@@ -5500,6 +5745,7 @@ cluster_ctrc_participant_request_shared(
 	ClusterCtrcSealReplyResult result;
 	ClusterCtrcParticipantState state_before;
 	uint64 participant_index;
+	bool progressed;
 
 	if (first_reason != NULL)
 		*first_reason = CTRC_SEAL_REASON_MALFORMED;
@@ -5544,15 +5790,20 @@ cluster_ctrc_participant_request_shared(
 		*first_reason = CTRC_SEAL_REASON_ACK_UNAVAILABLE;
 		result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 	}
+	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
+				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->participant_lock);
+	if (progressed)
+		ctrc_semantic_progress(true);
 	if (result == CTRC_SEAL_REPLY_PENDING_DRAIN)
 	{
 		cluster_ctrc_cleaner_reason_set(
 			*first_reason == CTRC_SEAL_REASON_PREPARED
 				? CTRC_CLEANER_REASON_PREPARED_DRAIN
 				: CTRC_CLEANER_REASON_PAGE_REVALIDATE);
-		cluster_undo_cleaner_wakeup();
+		if (!progressed)
+			cluster_ctrc_stat_bump(CTRC_STAT_PENDING_DUPLICATE);
 	}
 	else if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
 	{
@@ -6412,6 +6663,7 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 {
 	static uint64 scan_cursor = 0;
 	uint64 visited;
+	uint64 limit;
 	bool found = false;
 
 	if (participant_out == NULL || receipt_out == NULL
@@ -6422,10 +6674,10 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	MemSet(receipt_out, 0, sizeof(*receipt_out));
 	*participant_index_out = UINT64_MAX;
 	*receipt_index_out = UINT64_MAX;
+	limit = ctrc_scan_limit(CTRC_SCAN_RECEIPT, CtrcShared->receipt_entries);
 	SpinLockAcquire(&CtrcShared->participant_lock);
 	SpinLockAcquire(&CtrcShared->receipt_lock);
-	for (visited = 0; visited < CtrcShared->receipt_entries; visited++)
-	{
+	for (visited = 0; visited < limit; visited++) {
 		uint64 receipt_index = (scan_cursor + visited)
 			% CtrcShared->receipt_entries;
 		ClusterCtrcReceipt *receipt
@@ -6457,6 +6709,7 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	}
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->participant_lock);
+	ctrc_scan_charge(CTRC_SCAN_RECEIPT, visited + (found ? 1 : 0));
 	return found;
 }
 
@@ -7641,6 +7894,7 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 {
 	static uint64 scan_cursor = 0;
 	uint64 visited;
+	uint64 limit;
 	bool found = false;
 
 	if (snapshot == NULL || participant_index_out == NULL
@@ -7648,11 +7902,10 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
 	*participant_index_out = UINT64_MAX;
+	limit = ctrc_scan_limit(CTRC_SCAN_ACK, CtrcShared->participant_key_entries);
 	SpinLockAcquire(&CtrcShared->participant_lock);
 	SpinLockAcquire(&CtrcShared->receipt_lock);
-	for (visited = 0; visited < CtrcShared->participant_key_entries;
-		 visited++)
-	{
+	for (visited = 0; visited < limit; visited++) {
 		uint64 index = (scan_cursor + visited)
 			% CtrcShared->participant_key_entries;
 		ClusterCtrcParticipantEntry *participant
@@ -7681,6 +7934,7 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 	}
 	SpinLockRelease(&CtrcShared->receipt_lock);
 	SpinLockRelease(&CtrcShared->participant_lock);
+	ctrc_scan_charge(CTRC_SCAN_ACK, visited + (found ? 1 : 0));
 	return found;
 }
 

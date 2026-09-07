@@ -871,7 +871,7 @@ _classify_owners(
 _classify_owners(
     "HOT_PRUNE_FREEZE_REWRITE",
     "src/backend/access/heap/pruneheap.c",
-    ("heap_page_prune", "heap_page_prune_execute", "heap_page_prune_opt"),
+    ("heap_page_prune", "heap_page_prune_internal", "heap_page_prune_execute", "heap_page_prune_opt"),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_RECOMPOSED_SURVIVOR|CTRC_REF_HOT_FOLLOW_EDGE",
     "CTRC_TARGET_EXACT_TID",
