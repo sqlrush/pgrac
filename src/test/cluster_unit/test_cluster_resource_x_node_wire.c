@@ -1201,7 +1201,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(30);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);

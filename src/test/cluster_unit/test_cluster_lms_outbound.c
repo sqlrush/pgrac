@@ -1664,7 +1664,7 @@ UT_TEST(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(32);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
