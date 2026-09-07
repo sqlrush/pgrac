@@ -135,6 +135,8 @@ static int test_current_segment_calls;
 static bool test_no_raw_reuse_window;
 static bool test_no_raw_reuse_drift_on_recheck;
 static bool test_xid_is_mine;
+static bool test_native_origin_provable;
+static bool test_native_throw;
 static bool test_procarray_live;
 static int test_native_fence_depth;
 static int test_native_fence_lock_calls;
@@ -367,6 +369,8 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 	XidStatus status;
 
 	test_native_status_calls++;
+	if (test_native_throw)
+		pg_re_throw();
 	if (lsn != NULL)
 		*lsn = test_flush_lsn;
 	if (test_native_script_pos < test_native_script_count) {
@@ -715,6 +719,14 @@ cluster_cr_native_prehistory_disabled(void)
 }
 
 bool
+cluster_cr_native_origin_epoch0_provable(TransactionId xid)
+{
+	UT_ASSERT_EQ(test_native_fence_depth, 1);
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	return test_native_origin_provable && test_no_raw_reuse_window;
+}
+
+bool
 TransactionIdIsInProgress(TransactionId xid)
 {
 	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
@@ -915,6 +927,8 @@ reset_exact_origin_fixture(void)
 	test_no_raw_reuse_window = true;
 	test_no_raw_reuse_drift_on_recheck = false;
 	test_xid_is_mine = true;
+	test_native_origin_provable = false;
+	test_native_throw = false;
 	test_procarray_live = true;
 	test_native_fence_depth = 0;
 	test_native_fence_lock_calls = 0;
@@ -1753,6 +1767,210 @@ UT_TEST(test_visibility_precommit_committed_slot_with_live_origin_stays_in_progr
 	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
 	UT_ASSERT_EQ(test_candidate_extract_calls, 2);
 	UT_ASSERT_EQ(test_native_status_calls, 2);
+}
+
+static void
+reset_recycled_abort_fixture(ClusterSemanticAdmissionToken *admission)
+{
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_tt_slot.xid += 384;
+	test_tt_slot.wrap++;
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	test_native_origin_provable = true;
+	memset(admission, 0, sizeof(*admission));
+	admission->feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission->record_generation = 5;
+	admission->formation_epoch = test_formation_epoch;
+	admission->side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission->entered = true;
+}
+
+UT_TEST(test_recycled_canonical_abort_rechecks_exact_data_and_origin)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason;
+
+	reset_recycled_abort_fixture(&admission);
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &resolution, &reason),
+		CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.locator_echo.xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(resolution.top_xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+	UT_ASSERT_EQ(test_candidate_extract_calls, 2);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_native_fence_lock_calls, 2);
+	UT_ASSERT_EQ(test_native_fence_unlock_calls, 2);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+}
+
+UT_TEST(test_recycled_canonical_abort_same_segment)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason;
+
+	reset_recycled_abort_fixture(&admission);
+	test_origin_record.tt_slot_segment_id = TEST_RECORD_SEGMENT;
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &resolution, &reason),
+		CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_native_status_calls, 1);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+}
+
+UT_TEST(test_recycled_canonical_nonabort_never_borrows_successor_status)
+{
+	const XidStatus states[] = { TRANSACTION_STATUS_IN_PROGRESS, TRANSACTION_STATUS_COMMITTED,
+								 TRANSACTION_STATUS_SUB_COMMITTED };
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		reset_recycled_abort_fixture(&admission);
+		test_native_status = states[i];
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+						 &resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(test_twophase_calls, 0);
+		UT_ASSERT_EQ(test_subtrans_parent_calls, 0);
+		UT_ASSERT_EQ(test_procarray_calls, 0);
+		UT_ASSERT_EQ(test_native_fence_depth, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_recycled_canonical_invalid_successor_never_reads_native)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason;
+
+	for (int bad = 0; bad < 9; bad++) {
+		reset_recycled_abort_fixture(&admission);
+		switch (bad) {
+		case 0:
+			test_tt_slot.xid = TEST_ORIGIN_XID;
+			break;
+		case 1:
+			test_tt_slot.xid = TEST_ORIGIN_XID - 16;
+			break;
+		case 2:
+			test_tt_slot.xid++;
+			break;
+		case 3:
+			test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+			break;
+		case 4:
+			test_tt_slot.wrap = TT_WRAP_INVALID;
+			break;
+		case 5:
+			test_tt_slot.status = TT_SLOT_UNUSED;
+			break;
+		case 6:
+			test_tt_slot.status = TT_SLOT_RECYCLABLE + 1;
+			break;
+		case 7:
+			test_tt_slot.commit_scn = InvalidScn;
+			break;
+		case 8:
+			test_tt_slot.status = TT_SLOT_ABORTED;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+						 &resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(test_native_status_calls, 0);
+		UT_ASSERT_EQ(test_native_fence_lock_calls, 0);
+	}
+}
+
+UT_TEST(test_recycled_canonical_missing_or_revoked_window_refuses)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+
+	for (int revoked = 0; revoked < 2; revoked++) {
+		reset_recycled_abort_fixture(&admission);
+		test_native_origin_provable = revoked != 0;
+		test_no_raw_reuse_drift_on_recheck = revoked != 0;
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+						 &resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(test_native_status_calls, revoked);
+		UT_ASSERT_EQ(test_native_fence_depth, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_recycled_canonical_truncation_and_data_drift_refuse)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+
+	for (int drift = 0; drift < 2; drift++) {
+		reset_recycled_abort_fixture(&admission);
+		if (drift)
+			test_candidate_mutate_record_on_recheck = true;
+		else
+			test_variable_cache.oldestClogXid = TEST_ORIGIN_XID + 1;
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+						 &resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(test_native_status_calls, drift);
+		UT_ASSERT_EQ(test_native_fence_depth, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_recycled_canonical_clog_error_rethrows_and_releases_own_locks)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason;
+	volatile bool caught = false;
+
+	reset_recycled_abort_fixture(&admission);
+	test_native_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &resolution, &reason);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_native_fence_unlock_calls, 1);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
 }
 
 UT_TEST(test_canonical_sample_reports_first_failed_predicate)
@@ -3014,7 +3232,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(94);
+	UT_PLAN(101);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -3073,6 +3291,13 @@ main(void)
 	UT_RUN(test_visibility_same_owner_cross_segment_is_sequential_and_exact);
 	UT_RUN(test_visibility_precommit_committed_slot_with_live_origin_stays_in_progress);
 	UT_RUN(test_canonical_sample_reports_first_failed_predicate);
+	UT_RUN(test_recycled_canonical_abort_rechecks_exact_data_and_origin);
+	UT_RUN(test_recycled_canonical_abort_same_segment);
+	UT_RUN(test_recycled_canonical_nonabort_never_borrows_successor_status);
+	UT_RUN(test_recycled_canonical_invalid_successor_never_reads_native);
+	UT_RUN(test_recycled_canonical_missing_or_revoked_window_refuses);
+	UT_RUN(test_recycled_canonical_truncation_and_data_drift_refuse);
+	UT_RUN(test_recycled_canonical_clog_error_rethrows_and_releases_own_locks);
 	UT_RUN(test_empty_physical_slot_remains_unknown_despite_current_allocator_owner);
 	UT_RUN(test_allocator_identity_never_overrides_empty_physical_slot);
 	UT_RUN(test_empty_physical_slot_remains_unknown_despite_rolled_live_xid);

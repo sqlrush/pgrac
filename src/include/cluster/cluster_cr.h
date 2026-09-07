@@ -338,6 +338,11 @@ extern bool cluster_cr_native_prehistory_disabled(void);
 extern void cluster_cr_native_prehistory_reader_lock(void);
 extern void cluster_cr_native_prehistory_reader_unlock(void);
 
+/* Caller holds the consume/disable drain SHARED. Positive origin-local
+ * epoch-zero identity proof; unlike !disabled, absent shmem is NOT proof.
+ * This does not establish native-prehistory coverage or a transaction status. */
+extern bool cluster_cr_native_origin_epoch0_provable(TransactionId xid);
+
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 extern uint64 cluster_vis_freshref_verdict_resolved_count(void);
 extern uint64 cluster_vis_freshref_verdict_failclosed_count(void);

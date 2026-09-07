@@ -72,6 +72,7 @@
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
+#include "cluster/cluster_xid_stripe.h"
 
 
 /*
@@ -1245,6 +1246,20 @@ cluster_cr_native_prehistory_disabled(void)
 	if (CRShared == NULL)
 		return false;
 	return pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0;
+}
+
+bool
+cluster_cr_native_origin_epoch0_provable(TransactionId xid)
+{
+	FullTransactionId next;
+
+	if (CRShared == NULL || !TransactionIdIsNormal(xid)
+		|| pg_atomic_read_u64(&CRShared->native_prehistory_disabled) != 0)
+		return false;
+	Assert(LWLockHeldByMeInMode(&CRShared->native_prehistory_lock, LW_SHARED));
+	next = ReadNextFullTransactionId();
+	return FullTransactionIdIsValid(next) && EpochFromFullTransactionId(next) == 0
+		   && (uint64)xid < U64FromFullTransactionId(next) && cluster_xid_is_mine(xid);
 }
 
 void
