@@ -173,7 +173,8 @@ cluster_heap_test_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
 extern int cluster_heap_test_itl_remaining_wait_ms(uint64 *deadline_us, uint64 now_us,
 												   int budget_ms);
 extern ClusterTxwResult cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer,
-															Buffer full_buffer, uint64 *deadline_us,
+															Buffer full_buffer, TransactionId xid,
+															uint64 *deadline_us,
 															const char **diagnostic_reason);
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);

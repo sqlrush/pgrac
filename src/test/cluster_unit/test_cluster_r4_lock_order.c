@@ -318,6 +318,7 @@ static int ut_hot_requester_requalify_barrier_lock_calls;
 static bool ut_itl_census_active;
 static bool ut_itl_census_mutate_wrap;
 static bool ut_itl_census_lock_only;
+static bool ut_itl_census_protected_history;
 static int ut_itl_census_alloc_calls;
 static int ut_itl_census_capacity_calls;
 static int ut_itl_census_resolve_calls;
@@ -928,6 +929,9 @@ ut_itl_census_alloc(Buffer buf, TransactionId xid,
 	slots = ClusterPageGetItlSlots(BufferGetPage(buf));
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
+		if (ut_itl_census_protected_history
+			&& (slots[i].flags == ITL_FLAG_COMMITTED || slots[i].flags == ITL_FLAG_ABORTED))
+			continue;
 		if (slots[i].flags == ITL_FLAG_FREE
 			|| slots[i].flags == ITL_FLAG_COMMITTED
 			|| slots[i].flags == ITL_FLAG_ABORTED
@@ -970,12 +974,15 @@ cluster_itl_has_allocatable_slot(Buffer buf, TransactionId xid,
 	uint8 i;
 
 	UT_ASSERT(ut_itl_census_active);
-	UT_ASSERT(ut_hot_content_lock_held);
+	UT_ASSERT(ut_itl_pair_active ? ut_itl_pair_content_lock_held[0] : ut_hot_content_lock_held);
 	UT_ASSERT_EQ(buf, (Buffer) 1);
 	ut_itl_census_capacity_calls++;
 	slots = ClusterPageGetItlSlots(BufferGetPage(buf));
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
+		if (ut_itl_census_protected_history
+			&& (slots[i].flags == ITL_FLAG_COMMITTED || slots[i].flags == ITL_FLAG_ABORTED))
+			continue;
 		if ((!lock_only && slots[i].flags == ITL_FLAG_ACTIVE
 			 && slots[i].xid == xid)
 			|| (lock_only && slots[i].flags == ITL_FLAG_LOCK_ONLY_ACTIVE
@@ -3086,6 +3093,7 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture,
 	ut_itl_census_active = true;
 	ut_itl_census_mutate_wrap = false;
 	ut_itl_census_lock_only = lock_only;
+	ut_itl_census_protected_history = false;
 	ut_itl_census_alloc_calls = 0;
 	ut_itl_census_capacity_calls = 0;
 	ut_itl_census_resolve_calls = 0;
@@ -4725,8 +4733,9 @@ UT_TEST(test_itl_full_wait_uses_lowest_exact_blocker_after_pair_unwind)
 			ut_hot_content_lock_held = false;
 		}
 		releases = ut_buffer_release_calls;
-		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, pair ? 2 : 1, 1, &deadline, &reason),
-					 CLUSTER_TXW_RESOLVED);
+		UT_ASSERT_EQ(
+			cluster_heap_test_itl_wait_capacity(1, pair ? 2 : 1, 1, 9900, &deadline, &reason),
+			CLUSTER_TXW_RESOLVED);
 		UT_ASSERT_EQ(ut_itl_wait_calls, 1);
 		UT_ASSERT_EQ(ut_itl_wait_locator.itl_slot_index, 0);
 		UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1200);
@@ -4756,11 +4765,11 @@ UT_TEST(test_itl_wait_negative_boundaries_preserve_page_and_close_owners)
 {
 	int leg;
 
-	for (leg = 0; leg < 7; leg++) {
+	for (leg = 0; leg < 9; leg++) {
 		UtR4HotProductFixture fixture;
 		HeapHotSearchResult result;
 		PGAlignedBlock before;
-		uint64 deadline = leg == 1 || leg == 6 ? 1 : 0;
+		uint64 deadline = leg == 1 || leg == 6 || leg == 7 ? 1 : 0;
 		const char *reason;
 		ClusterTxwResult expected = CLUSTER_TXW_UNPROVABLE;
 		uint8 i;
@@ -4777,36 +4786,108 @@ UT_TEST(test_itl_wait_negative_boundaries_preserve_page_and_close_owners)
 		if (leg == 3)
 			ut_itl_census_mutate_activation = true;
 		if (leg == 4) {
-			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
-				ClusterPageGetItlSlots((Page)fixture.live_page)[i].flags = ITL_FLAG_COMMITTED;
+			/* Model the unchanged allocator's actual foreign-history refusal,
+			 * not merely the existence of completed slots. */
+			ut_itl_census_protected_history = true;
+			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+				ClusterItlSlotData *slot = &ClusterPageGetItlSlots((Page)fixture.live_page)[i];
+				slot->flags = ITL_FLAG_COMMITTED;
+				slot->undo_segment_head = uba_encode(257, i + 1, i, 0);
+			}
 		}
 		if (leg == 5 || leg == 6) {
 			ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
 			expected = leg == 6 ? CLUSTER_TXW_TIMEOUT : CLUSTER_TXW_RETRY;
 		}
+		if (leg == 7 || leg == 8) {
+			/* Fresh capacity cannot erase a spent operation budget or an
+			 * unproved current-page authority. */
+			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				ClusterPageGetItlSlots((Page)fixture.live_page)[i].flags = ITL_FLAG_COMMITTED;
+			expected = leg == 7 ? CLUSTER_TXW_TIMEOUT : CLUSTER_TXW_UNPROVABLE;
+			ut_itl_census_force_pcm_n = leg == 8;
+		}
 		memcpy(before.data, fixture.live_page, BLCKSZ);
-		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, &deadline, &reason), expected);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 expected);
 		UT_ASSERT_EQ(ut_itl_wait_calls, leg == 2 ? 1 : 0);
 		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
 		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
 		UT_ASSERT(!ut_itl_recycle_guard_active);
 		UT_ASSERT(!ut_hot_content_lock_held);
-		if (leg == 1 || leg == 6) {
+		if (leg == 1 || leg == 6 || leg == 7) {
 			UT_ASSERT_EQ(deadline, 1);
 			UT_ASSERT(strcmp(reason, "ITL_CAPACITY_WAIT_EXPIRED") == 0);
 			UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
 		}
 		if (leg == 4)
 			UT_ASSERT(strcmp(reason, "ITL_PROTECTED_HISTORY_CAPACITY") == 0);
+		if (leg == 8) {
+			UT_ASSERT_STR_EQ(reason, "ITL_BLOCKER_UNPROVABLE");
+			UT_ASSERT_EQ(ut_itl_census_capacity_calls, 0);
+			UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+		}
 		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
 		ut_itl_census_end();
 	}
 }
 
+UT_TEST(test_itl_fresh_capacity_requalifies_without_wait_or_page_mutation)
+{
+	const uint8 terminal_flags[] = { ITL_FLAG_COMMITTED, ITL_FLAG_ABORTED,
+									 ITL_FLAG_LOCK_ONLY_COMMITTED, ITL_FLAG_LOCK_ONLY_ABORTED };
+	int pair;
+	int leg;
+
+	for (pair = 0; pair < 2; pair++)
+		for (leg = 0; leg < lengthof(terminal_flags); leg++) {
+			UtR4HotProductFixture fixture;
+			HeapHotSearchResult hot;
+			PGAlignedBlock before;
+			uint64 deadline = 0;
+			const char *reason;
+			uint8 i;
+			int releases;
+
+			ut_itl_census_begin(&fixture, &hot, false);
+			for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				ClusterPageGetItlSlots((Page)fixture.live_page)[i].flags = terminal_flags[leg];
+			if (pair) {
+				ut_itl_pair_active = true;
+				ut_itl_pair_content_lock_held[0] = true;
+				ut_itl_pair_content_lock_held[1] = true;
+				ut_hot_content_lock_held = false;
+			}
+			UT_ASSERT(cluster_itl_has_allocatable_slot(1, 9900, false));
+			memcpy(before.data, fixture.live_page, BLCKSZ);
+			releases = ut_buffer_release_calls;
+			UT_ASSERT_EQ(
+				cluster_heap_test_itl_wait_capacity(1, pair ? 2 : 1, 1, 9900, &deadline, &reason),
+				CLUSTER_TXW_RETRY);
+			UT_ASSERT_STR_EQ(reason, "ITL_FRESH_REQUALIFY");
+			UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+			UT_ASSERT_EQ(deadline, 0);
+			UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+			UT_ASSERT_EQ(ut_buffer_release_calls - releases, pair);
+			UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_ITL_PROTECTED], 0);
+			UT_ASSERT(!ut_itl_recycle_guard_active);
+			if (pair) {
+				UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+				UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+			} else {
+				UT_ASSERT(!ut_hot_content_lock_held);
+				LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+			}
+			ut_itl_census_end();
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(93);
+	UT_RUN(test_itl_fresh_capacity_requalifies_without_wait_or_page_mutation);
 	UT_RUN(test_update_terminal_proof_normalizes_plain_xmax_before_native_consumers);
 	UT_RUN(test_released_xmax_without_write_authority_preserves_every_byte);
 	UT_RUN(test_update_live_and_committed_writers_never_normalize_xmax);

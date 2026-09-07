@@ -1402,14 +1402,15 @@ cluster_heap_itl_now_us(void)
  * There is deliberately no new wait protocol, retry loop or receipt cancel. */
 static ClusterTxwResult
 cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
-											Buffer full_buffer, uint64 *deadline_us,
-											const char **diagnostic_reason)
+											Buffer full_buffer, TransactionId xid,
+											uint64 *deadline_us, const char **diagnostic_reason)
 {
 	ClusterHeapItlTerminalCensus census;
 	ClusterHeapItlCensusCaptureResult capture_result;
 	ClusterTxLocator blocker;
 	ClusterTxResolveReason wait_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 	ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
+	bool fresh_capacity = false;
 	volatile bool terminal = false;
 	volatile bool active = false;
 	volatile bool unprovable = false;
@@ -1425,6 +1426,11 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 		capture_result = CLUSTER_HEAP_ITL_CENSUS_CAPTURE_REFUSED;
 	else
 		capture_result = cluster_heap_itl_capture_terminal_census(full_buffer, &census);
+	/* A preceding census failure describes its old page image, not this
+	 * fresh one.  Reuse the allocator's exact protection predicate while
+	 * content authority is still held; this check never allocates or stamps. */
+	if (capture_result == CLUSTER_HEAP_ITL_CENSUS_CAPTURED)
+		fresh_capacity = cluster_itl_has_allocatable_slot(full_buffer, xid, false);
 	/* No recycle guard is armed by this path; its capture requires flags=0.
 	 * The earlier terminal-census owner has already finished/cancelled. */
 	if (new_buffer != old_buffer)
@@ -1462,6 +1468,11 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 		}
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
 		return CLUSTER_TXW_UNPROVABLE;
+	}
+	if (fresh_capacity) {
+		cluster_heap_itl_finish_terminal_census(&census);
+		*diagnostic_reason = "ITL_FRESH_REQUALIFY";
+		return CLUSTER_TXW_RETRY;
 	}
 	PG_TRY();
 	{
@@ -1558,9 +1569,10 @@ cluster_heap_test_itl_remaining_wait_ms(uint64 *deadline_us, uint64 now_us, int 
 
 ClusterTxwResult
 cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
-									uint64 *deadline_us, const char **diagnostic_reason)
+									TransactionId xid, uint64 *deadline_us,
+									const char **diagnostic_reason)
 {
-	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer,
+	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer, xid,
 													   deadline_us, diagnostic_reason);
 }
 #endif
@@ -13704,7 +13716,8 @@ l_pgrac_itl_capacity_wait: {
 	ClusterTxwResult wait_result;
 
 	wait_result = cluster_heap_itl_wait_capacity_after_census(
-		buffer, newbuf, itl_capacity_wait_buffer, &itl_capacity_absolute_deadline_us, &wait_reason);
+		buffer, newbuf, itl_capacity_wait_buffer, canonical_xid, &itl_capacity_absolute_deadline_us,
+		&wait_reason);
 	if (wait_result != CLUSTER_TXW_RESOLVED && wait_result != CLUSTER_TXW_RETRY)
 		ereport(ERROR,
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT	   ? ERRCODE_CLUSTER_GES_TIMEOUT
