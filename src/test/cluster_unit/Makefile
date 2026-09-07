@@ -3359,6 +3359,15 @@ CLUSTER_R4_HOT_HANDLER_TEST_O = test_cluster_r4_hot_handler_product.o
 CLUSTER_R4_HOT_VIS_TEST_O = test_cluster_r4_hot_visibility_product.o
 CLUSTER_R4_EXEC_TUPLES_TEST_O = test_cluster_r4_exec_tuples_product.o
 CLUSTER_R4_HEAPTUPLE_TEST_O = test_cluster_r4_heaptuple_product.o
+CLUSTER_HOT_PRUNE_TEST_O = test_cluster_hot_prune_product.o
+CLUSTER_HOT_BUFPAGE_TEST_O = test_cluster_hot_bufpage_product.o
+CLUSTER_HOT_HORIZON_O = $(top_builddir)/src/backend/cluster/cluster_undo_horizon.o
+
+$(CLUSTER_HOT_PRUNE_TEST_O): $(top_srcdir)/src/backend/access/heap/pruneheap.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+$(CLUSTER_HOT_BUFPAGE_TEST_O): $(top_srcdir)/src/backend/storage/page/bufpage.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 $(CLUSTER_R4_HOT_HEAPAM_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
@@ -3386,12 +3395,14 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
-		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) $(CLUSTER_VIS_VERDICT_O)
+		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) $(CLUSTER_VIS_VERDICT_O) \
+		$(CLUSTER_HOT_PRUNE_TEST_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_HOT_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
 		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) $(CLUSTER_VIS_VERDICT_O) \
+		$(CLUSTER_HOT_PRUNE_TEST_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_HOT_HORIZON_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

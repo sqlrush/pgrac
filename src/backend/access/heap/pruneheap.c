@@ -26,12 +26,20 @@
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
-#include "utils/snapmgr.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_undo_verdict.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "storage/buf_internals.h"
 #endif
 
 /* Working data for heap_page_prune and subroutines */
@@ -57,6 +65,7 @@ typedef struct
 
 	TransactionId new_prune_xid;	/* new prune hint value for page */
 	TransactionId snapshotConflictHorizon;	/* latest xid removed */
+	const bool *proved_dead;		/* stack-local shared HOT proof, or NULL */
 	int			nredirected;	/* numbers of entries in arrays below */
 	int			ndead;
 	int			nunused;
@@ -97,6 +106,11 @@ static void heap_prune_record_redirect(PruneState *prstate,
 static void heap_prune_record_dead(PruneState *prstate, OffsetNumber offnum);
 static void heap_prune_record_unused(PruneState *prstate, OffsetNumber offnum);
 static void page_verify_redirects(Page page);
+static int heap_page_prune_internal(Relation relation, Buffer buffer,
+								   TransactionId oldest_xmin, GlobalVisState *vistest,
+								   TransactionId old_snap_xmin, TimestampTz old_snap_ts,
+								   int *nnewlpdead, OffsetNumber *off_loc,
+								   const bool *proved_dead);
 
 #ifdef USE_PGRAC_CLUSTER
 static bool
@@ -126,6 +140,295 @@ heap_page_has_current_mx_predecessor(Page page)
 			return true;
 	}
 	return false;
+}
+
+/* Shared HOT reclamation uses the same required-member retention fold as
+ * undo recycling. A local xmin, elapsed time or an absent peer is not proof. */
+static bool
+cluster_heap_prune_floor(uint64 epoch, ClusterUndoHorizonFloor *floor)
+{
+	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+	uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	ClusterUndoHorizonStallReason reason;
+	int32 blame;
+	uint64 sampled_epoch;
+	SCN local_floor = cluster_undo_retention_horizon();
+	int nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+
+	return cluster_undo_horizon_required_members(required, &sampled_epoch)
+		&& sampled_epoch == epoch
+		&& cluster_undo_horizon_cluster_floor(
+			local_floor, views, nviews, required, cluster_node_id, sampled_epoch,
+			(uint64) GetCurrentTimestamp(), (uint32) cluster_lmon_main_loop_interval,
+			floor, &reason, &blame) == CLUSTER_UNDO_HORIZON_FOLD_OK
+		&& !cluster_undo_horizon_epoch_fence_tripped(epoch);
+}
+
+/* Validate every item the native chain walker may inspect, before resolving
+ * anything or passing a page to that walker. This is not an Assert-only gate. */
+static bool
+cluster_heap_prune_page_valid(Page page, BlockNumber block)
+{
+	PageHeader header = (PageHeader) page;
+	OffsetNumber off;
+	OffsetNumber maxoff;
+
+	if (!PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
+		|| header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (maxoff > MaxHeapTuplesPerPage)
+		return false;
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId item = PageGetItemId(page, off);
+
+		if (ItemIdIsNormal(item))
+		{
+			HeapTupleHeader tuple;
+			unsigned int start = ItemIdGetOffset(item);
+			unsigned int length = ItemIdGetLength(item);
+
+			if (start != MAXALIGN(start) || start < header->pd_upper
+				|| length < SizeofHeapTupleHeader
+				|| start + length > header->pd_special)
+				return false;
+			tuple = (HeapTupleHeader) PageGetItem(page, item);
+			if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > length)
+				return false;
+		}
+		else if (ItemIdIsRedirected(item))
+		{
+			OffsetNumber target = ItemIdGetRedirect(item);
+
+			if (target < FirstOffsetNumber || target > maxoff
+				|| !ItemIdIsNormal(PageGetItemId(page, target)))
+				return false;
+		}
+	}
+	/* The native planner assumes a well-formed HOT graph. Prove that every
+	 * followed edge stays on this page and terminates, even for an unproved
+	 * tuple. A malformed cycle must never overrun its fixed chain array. */
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		OffsetNumber next = off;
+		unsigned int steps = 0;
+
+		while (ItemIdIsNormal(PageGetItemId(page, next)))
+		{
+			HeapTupleHeader tuple = (HeapTupleHeader)
+				PageGetItem(page, PageGetItemId(page, next));
+
+			if (!HeapTupleHeaderIsHotUpdated(tuple))
+				break;
+			if (++steps > maxoff || !ItemPointerIsValid(&tuple->t_ctid)
+				|| ItemPointerGetBlockNumber(&tuple->t_ctid) != block)
+				return false;
+			next = ItemPointerGetOffsetNumber(&tuple->t_ctid);
+			if (next < FirstOffsetNumber || next > maxoff
+				|| !ItemIdIsNormal(PageGetItemId(page, next)))
+				return false;
+		}
+	}
+	return true;
+}
+
+/* Only a committed updater with a real same-page HOT successor can make an
+ * old version dead. Never make an orphan, DELETE or lock-only tuple DEAD. */
+static bool
+cluster_heap_prune_candidate(Page page, BlockNumber block, OffsetNumber off)
+{
+	ItemId item = PageGetItemId(page, off);
+	HeapTupleHeader tuple;
+	HeapTupleHeader successor;
+	OffsetNumber next;
+
+	if (!ItemIdIsNormal(item))
+		return false;
+	tuple = (HeapTupleHeader) PageGetItem(page, item);
+	if (!HeapTupleHeaderIsHotUpdated(tuple)
+		|| (tuple->t_infomask & (HEAP_MOVED | HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI))
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
+		|| !TransactionIdIsNormal(HeapTupleHeaderGetRawXmax(tuple))
+		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| !ItemPointerIsValid(&tuple->t_ctid)
+		|| ItemPointerGetBlockNumber(&tuple->t_ctid) != block)
+		return false;
+	next = ItemPointerGetOffsetNumber(&tuple->t_ctid);
+	if (next < FirstOffsetNumber || next > PageGetMaxOffsetNumber(page)
+		|| next == off || !ItemIdIsNormal(PageGetItemId(page, next)))
+		return false;
+	successor = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, next));
+	return HeapTupleHeaderIsHeapOnly(successor)
+		&& HeapTupleHeaderGetRawXmin(successor) == HeapTupleHeaderGetRawXmax(tuple);
+}
+
+static bool
+cluster_heap_prune_pcm(Buffer buffer, ClusterPcmOwnSnapshot *pcm)
+{
+	return cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW
+		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1), pcm)
+			== CLUSTER_PCM_OWN_OK
+		&& pcm->pcm_state == PCM_STATE_X && pcm->flags == 0;
+}
+
+/* One opportunistic owner: capture under current-X/cleanup, resolve with no
+ * content lock, then revalidate the entire image and authority. No background
+ * owner, cross-call proof cache or conversion/wait loop is introduced. */
+static void
+cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoHorizonFloor floor;
+	ClusterPcmOwnSnapshot captured_pcm;
+	ClusterPcmOwnSnapshot live_pcm;
+	PGAlignedBlock image;
+	ClusterUndoVerdictResult verdicts[MaxHeapTuplesPerPage + 1];
+	bool proved_dead[MaxHeapTuplesPerPage + 1];
+	Snapshot snapshot;
+	Page live = BufferGetPage(buffer);
+	Page page = (Page) image.data;
+	BlockNumber block = BufferGetBlockNumber(buffer);
+	OffsetNumber off;
+	OffsetNumber maxoff;
+	SCN read_scn;
+	uint64 epoch;
+	Size minfree;
+	volatile bool locked = false;
+
+	if (!cluster_peer_mode_enabled() || cluster_enable_adg
+		|| cluster_recmerge_window_active || !cluster_undo_retention_horizon_enabled
+		|| cluster_reconfig_self_join_gate_verdict() != CLUSTER_JOIN_GATE_ALLOW
+		|| relation->rd_rel->relkind != RELKIND_RELATION
+		|| relation->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| IsCatalogRelation(relation) || !ActiveSnapshotSet()
+		|| !TransactionIdIsValid(((PageHeader) live)->pd_prune_xid))
+		return;
+	snapshot = GetActiveSnapshot();
+	if (snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER
+		|| !SCN_VALID(snapshot->read_scn)
+		|| (snapshot->read_epoch == 0 && cluster_conf_node_count() != 4))
+		return;
+	read_scn = snapshot->read_scn;
+	epoch = snapshot->read_epoch;
+	minfree = Max(RelationGetTargetPageFreeSpace(relation, HEAP_DEFAULT_FILLFACTOR),
+				  BLCKSZ / 10);
+	if (!PageIsFull(live) && PageGetHeapFreeSpace(live) >= minfree)
+		return;
+	memset(&admission, 0, sizeof(admission));
+	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+	PG_TRY();
+	{
+		do
+		{
+			int ndeleted;
+			int nnewlpdead;
+
+			if (admission.formation_epoch != epoch
+				|| !cluster_heap_prune_floor(epoch, &floor)
+				|| !ConditionalLockBufferForCleanup(buffer))
+				break;
+			locked = true;
+			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+				|| !cluster_heap_prune_pcm(buffer, &captured_pcm)
+				|| !cluster_heap_prune_page_valid(live, block)
+				|| heap_page_has_current_mx_predecessor(live))
+				break;
+			memcpy(image.data, live, BLCKSZ);
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			locked = false;
+			maxoff = PageGetMaxOffsetNumber(page);
+			memset(verdicts, 0, sizeof(verdicts));
+			memset(proved_dead, 0, sizeof(proved_dead));
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				HeapTupleHeader tuple;
+				const ClusterItlSlotData *itl;
+				TransactionId xid;
+				uint32 segment;
+				uint32 undo_block;
+				uint16 slot;
+				uint16 row;
+				int origin;
+				bool fresh;
+				OffsetNumber prior;
+
+				if (!cluster_heap_prune_candidate(page, block, off))
+					continue;
+				tuple = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, off));
+				xid = HeapTupleHeaderGetRawXmax(tuple);
+				itl = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+				if (!uba_decode(itl->undo_segment_head, &segment, &undo_block, &slot, &row))
+					continue;
+				fresh = itl->xid == xid;
+				origin = fresh ? uba_origin_node_id(itl->undo_segment_head)
+					: cluster_xid_origin_slot(xid);
+				if (origin < 0 || origin >= CLUSTER_MAX_NODES
+					|| (fresh && itl->flags != ITL_FLAG_ACTIVE
+						&& itl->flags != ITL_FLAG_COMMITTED
+						&& itl->flags != ITL_FLAG_NEEDS_CLEANOUT))
+					continue;
+				/* Exact same page locator inputs share one verdict, not just
+				 * an xid whose physical incarnation might be different. */
+				for (prior = FirstOffsetNumber; prior < off; prior++)
+				{
+					HeapTupleHeader old;
+
+					if (!cluster_heap_prune_candidate(page, block, prior))
+						continue;
+					old = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, prior));
+					if (HeapTupleHeaderGetRawXmax(old) == xid
+						&& old->t_itl_slot_idx == tuple->t_itl_slot_idx)
+						break;
+				}
+				if (prior < off)
+					verdicts[off] = verdicts[prior];
+				else if (fresh && SCN_VALID(itl->commit_scn))
+					verdicts[off] = cluster_undo_verdict_resolve_freshref_c1b_pair(
+						origin, segment, xid, itl->xid, (uint32) slot + 1,
+						(uint32) epoch, itl->commit_scn, read_scn);
+				else
+					verdicts[off] = cluster_undo_verdict_resolve(
+						origin, segment, xid, fresh ? (uint32) slot + 1 : 0,
+						read_scn, fresh);
+			}
+			if (!cluster_heap_prune_floor(epoch, &floor))
+				break;
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+				proved_dead[off] = (verdicts[off].kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+					|| verdicts[off].kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
+					&& SCN_VALID(verdicts[off].commit_scn)
+					&& scn_time_cmp(verdicts[off].commit_scn, floor.scn) < 0;
+			if (!ConditionalLockBufferForCleanup(buffer))
+				break;
+			locked = true;
+			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+				|| !cluster_heap_prune_pcm(buffer, &live_pcm)
+				|| !cluster_pcm_own_snapshot_equal_exact(&captured_pcm, &live_pcm)
+				|| memcmp(image.data, live, BLCKSZ) != 0
+				|| cluster_recmerge_window_active
+				|| cluster_undo_horizon_epoch_fence_tripped(epoch))
+				break;
+			ndeleted = heap_page_prune_internal(relation, buffer, InvalidTransactionId,
+				NULL, InvalidTransactionId, 0, &nnewlpdead, NULL, proved_dead);
+			if (ndeleted > nnewlpdead)
+				pgstat_update_heap_dead_tuples(relation, ndeleted - nnewlpdead);
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (locked)
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 }
 #endif
 
@@ -159,6 +462,14 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	 */
 	if (RecoveryInProgress())
 		return;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_storage_mode_enabled() && !BufferIsLocal(buffer))
+	{
+		cluster_heap_page_prune_opt(relation, buffer);
+		return;
+	}
+#endif
 
 	/*
 	 * XXX: Magic to keep old_snapshot_threshold tests appear "working". They
@@ -312,6 +623,16 @@ heap_page_prune(Relation relation, Buffer buffer,
 				int *nnewlpdead,
 				OffsetNumber *off_loc)
 {
+	return heap_page_prune_internal(relation, buffer, oldest_xmin, vistest,
+		old_snap_xmin, old_snap_ts, nnewlpdead, off_loc, NULL);
+}
+
+static int
+heap_page_prune_internal(Relation relation, Buffer buffer,
+						 TransactionId oldest_xmin, GlobalVisState *vistest,
+						 TransactionId old_snap_xmin, TimestampTz old_snap_ts,
+						 int *nnewlpdead, OffsetNumber *off_loc, const bool *proved_dead)
+{
 	int			ndeleted = 0;
 	Page		page = BufferGetPage(buffer);
 	BlockNumber blockno = BufferGetBlockNumber(buffer);
@@ -332,6 +653,10 @@ heap_page_prune(Relation relation, Buffer buffer,
 	 * initialize the rest of our working state.
 	 */
 	prstate.new_prune_xid = InvalidTransactionId;
+	/* An unproved shared tuple remains a candidate for a later invocation.
+	 * Do not clear the scheduling hint using native/local GlobalVis. */
+	if (proved_dead != NULL)
+		prstate.new_prune_xid = ((PageHeader) page)->pd_prune_xid;
 	prstate.rel = relation;
 	prstate.oldest_xmin = oldest_xmin;
 	prstate.vistest = vistest;
@@ -339,6 +664,7 @@ heap_page_prune(Relation relation, Buffer buffer,
 	prstate.old_snap_ts = old_snap_ts;
 	prstate.old_snap_used = false;
 	prstate.snapshotConflictHorizon = InvalidTransactionId;
+	prstate.proved_dead = proved_dead;
 	prstate.nredirected = prstate.ndead = prstate.nunused = 0;
 	memset(prstate.marked, 0, sizeof(prstate.marked));
 
@@ -404,8 +730,9 @@ heap_page_prune(Relation relation, Buffer buffer,
 		if (off_loc)
 			*off_loc = offnum;
 
-		prstate.htsv[offnum] = heap_prune_satisfies_vacuum(&prstate, &tup,
-														   buffer);
+		prstate.htsv[offnum] = proved_dead != NULL
+			? (proved_dead[offnum] ? HEAPTUPLE_DEAD : HEAPTUPLE_LIVE)
+			: heap_prune_satisfies_vacuum(&prstate, &tup, buffer);
 	}
 
 	/* Scan the page */
@@ -435,6 +762,14 @@ heap_page_prune(Relation relation, Buffer buffer,
 	/* Clear the offset information once we have processed the given page. */
 	if (off_loc)
 		*off_loc = InvalidOffsetNumber;
+
+	/* The proved HOT-only entry never removes an index root or updates a
+	 * shared hint on a zero-reclamation pass. Other entrypoints are unchanged. */
+	if (proved_dead != NULL && (prstate.ndead != 0 || ndeleted == 0))
+	{
+		*nnewlpdead = 0;
+		return 0;
+	}
 
 	/* Any error while applying the changes is critical */
 	START_CRIT_SECTION();
@@ -633,6 +968,26 @@ heap_prune_satisfies_vacuum(PruneState *prstate, HeapTuple tup, Buffer buffer)
 }
 
 
+static void
+heap_prune_advance_conflict_horizon(HeapTupleHeader tuple, PruneState *prstate)
+{
+	if (prstate->proved_dead != NULL)
+	{
+		TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple);
+
+		/* The shared entry has already proved this normal updater committed.
+		 * Carry its xid conservatively into the unchanged WAL field; do not
+		 * ask the requester's CLOG about a possibly foreign, unhinted xmin.
+		 * This is not another deletion authority or an exact SCN stamp. */
+		Assert(TransactionIdIsNormal(xmax));
+		Assert((tuple->t_infomask & (HEAP_MOVED | HEAP_XMAX_IS_MULTI)) == 0);
+		if (TransactionIdFollows(xmax, prstate->snapshotConflictHorizon))
+			prstate->snapshotConflictHorizon = xmax;
+	}
+	else
+		HeapTupleHeaderAdvanceConflictHorizon(tuple, &prstate->snapshotConflictHorizon);
+}
+
 /*
  * Prune specified line pointer or a HOT chain originating at line pointer.
  *
@@ -711,8 +1066,7 @@ heap_prune_chain(Buffer buffer, OffsetNumber rootoffnum, PruneState *prstate)
 				!HeapTupleHeaderIsHotUpdated(htup))
 			{
 				heap_prune_record_unused(prstate, rootoffnum);
-				HeapTupleHeaderAdvanceConflictHorizon(htup,
-													  &prstate->snapshotConflictHorizon);
+				heap_prune_advance_conflict_horizon(htup, prstate);
 				ndeleted++;
 			}
 
@@ -848,8 +1202,7 @@ heap_prune_chain(Buffer buffer, OffsetNumber rootoffnum, PruneState *prstate)
 		if (tupdead)
 		{
 			latestdead = offnum;
-			HeapTupleHeaderAdvanceConflictHorizon(htup,
-												  &prstate->snapshotConflictHorizon);
+			heap_prune_advance_conflict_horizon(htup, prstate);
 		}
 		else if (!recent_dead)
 			break;
