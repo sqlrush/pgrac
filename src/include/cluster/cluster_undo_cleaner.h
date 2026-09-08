@@ -62,9 +62,12 @@
 #define CLUSTER_UNDO_CLEANER_H
 
 #include "datatype/timestamp.h"
+#include "miscadmin.h"
+#include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_scn.h" /* SCN (pass-stats horizon plumbing) */
+#include "cluster/cluster_terminal_ref_census.h"
 
 
 /*
@@ -95,15 +98,15 @@ typedef enum UndoCleanerStatus {
  *	retention-pressure rollover / hard-cap paths SetLatch the cleaner
  *	so RECYCLABLE supply is produced when it is needed most).
  */
-typedef struct UndoCleanerSharedState {
-	LWLock lwlock;					   /* LWTRANCHE_CLUSTER_UNDO_CLEANER */
+typedef struct UndoCleanerWorkerState {
 	UndoCleanerStatus status;		   /* HC2 SSOT */
 	pid_t pid;						   /* set in SPAWNING */
 	TimestampTz spawned_at;			   /* set in SPAWNING */
 	TimestampTz ready_at;			   /* set in READY */
 	TimestampTz last_liveness_tick_at; /* local liveness tick (not heartbeat) */
 	int64 main_loop_iters;			   /* monotone; observable liveness proof */
-	bool shutdown_requested;		   /* postmaster sets; main loop polls */
+	uint64 local_completed_passes;
+	uint64 local_progress_events;
 
 	/*
 	 * Pressure-wakeup channel (Q8).  Points at the cleaner's own
@@ -112,6 +115,17 @@ typedef struct UndoCleanerSharedState {
 	 * copy the pointer under LW_SHARED and tolerate NULL.
 	 */
 	Latch *latch;
+} UndoCleanerWorkerState;
+
+typedef struct UndoCleanerSharedState {
+	LWLock lwlock;
+	bool shutdown_requested;
+	UndoCleanerWorkerState workers[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
+	ConditionVariable capacity_cv;
+	uint64 capacity_wait_entered;
+	uint64 capacity_wait_repolled;
+	uint64 capacity_wait_refused_context;
+	uint64 capacity_wait_refused_proof;
 
 	/*
 	 * D6 pass counters (spec-3.13 step 8 fills; zero-init).  Updated by
@@ -138,6 +152,27 @@ typedef struct UndoCleanerSharedState {
 	 */
 	uint32 scan_resume_seg;
 } UndoCleanerSharedState;
+
+/* Postmaster-owned PID inventory. Zero is an unoccupied slot, never a
+ * reaped process identity. A normal reap frees exactly one respawn slot. */
+static inline int
+cluster_undo_cleaner_find_pid(const pid_t *pids, pid_t pid)
+{
+	if (pid > 0)
+		for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+			if (pids[i] == pid)
+				return (int)i;
+	return -1;
+}
+
+static inline bool
+cluster_undo_cleaner_all_reaped(const pid_t *pids)
+{
+	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+		if (pids[i] != 0)
+			return false;
+	return true;
+}
 
 
 /*
@@ -186,6 +221,9 @@ extern TimestampTz cluster_undo_cleaner_spawned_at(void);
 extern TimestampTz cluster_undo_cleaner_ready_at(void);
 extern TimestampTz cluster_undo_cleaner_last_liveness_tick_at(void);
 extern int64 cluster_undo_cleaner_main_loop_iters(void);
+extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out);
+extern bool cluster_undo_cleaner_wait_for_capacity(uint32 segment_id,
+												   ClusterCtrcTxnKeyV1 *continuation);
 
 /* D6 counter accessors (dump_undo + tests). */
 extern uint64 cluster_undo_cleaner_pass_count(void);
@@ -193,6 +231,10 @@ extern uint64 cluster_undo_cleaner_header_tt_slots_below_horizon(void); /* spec-
 extern uint64 cluster_undo_cleaner_shmem_tt_slots_gcd(void);
 extern uint64 cluster_undo_cleaner_segments_marked_recyclable(void);
 extern uint64 cluster_undo_cleaner_stale_active_skipped(void);
+extern uint64 cluster_undo_cleaner_capacity_wait_entered(void);
+extern uint64 cluster_undo_cleaner_capacity_wait_repolled(void);
+extern uint64 cluster_undo_cleaner_capacity_wait_refused_context(void);
+extern uint64 cluster_undo_cleaner_capacity_wait_refused_proof(void);
 
 /* D6 segment-scan wait wrappers (stubbed by cluster_unit binaries). */
 extern void cluster_undo_cleaner_scan_wait_start(void);

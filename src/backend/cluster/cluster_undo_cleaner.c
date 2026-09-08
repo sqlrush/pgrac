@@ -44,11 +44,14 @@
 
 #include <unistd.h>
 
+#include "access/xact.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
+#include "storage/bufmgr.h"
+#include "storage/lock.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -56,6 +59,7 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
+#include "utils/hsearch.h"
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP */
@@ -72,6 +76,8 @@
 #include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_cleaner.h"
+#include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 
 
 /*
@@ -80,6 +86,10 @@
  * cluster_unit test harness when init was not invoked.
  */
 static UndoCleanerSharedState *undo_cleaner_state = NULL;
+static int undo_cleaner_worker = -1;
+
+StaticAssertDecl(CLUSTER_UNDO_CLEANER_WORKER_TYPES == CLUSTER_CTRC_CLEANER_WORKERS,
+				 "each terminal-supply shard needs one distinct auxiliary process");
 
 
 /* ============================================================
@@ -126,7 +136,7 @@ cluster_undo_cleaner_shmem_init(void)
 	if (!found) {
 		memset(undo_cleaner_state, 0, sizeof(*undo_cleaner_state));
 		LWLockInitialize(&undo_cleaner_state->lwlock, LWTRANCHE_CLUSTER_UNDO_CLEANER);
-		undo_cleaner_state->status = UNDO_CLEANER_NOT_STARTED;
+		ConditionVariableInit(&undo_cleaner_state->capacity_cv);
 	}
 }
 
@@ -169,7 +179,7 @@ cluster_undo_cleaner_request_shutdown(void)
 void
 cluster_undo_cleaner_wakeup(void)
 {
-	Latch *latch;
+	Latch *latches[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
 
 	/*
 	 * Q8 pressure wakeup.  Callers sit on allocator hot-pressure paths
@@ -183,11 +193,181 @@ cluster_undo_cleaner_wakeup(void)
 		return;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	latch = undo_cleaner_state->latch;
+	for (unsigned i = 0; i < lengthof(latches); i++)
+		latches[i] = undo_cleaner_state->workers[i].latch;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 
-	if (latch != NULL)
-		SetLatch(latch);
+	for (unsigned i = 0; i < lengthof(latches); i++)
+		if (latches[i] != NULL)
+			SetLatch(latches[i]);
+}
+
+bool
+cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out)
+{
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+	if (worker_id >= CLUSTER_UNDO_CLEANER_WORKER_TYPES || undo_cleaner_state == NULL)
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	*out = undo_cleaner_state->workers[worker_id];
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	return true;
+}
+
+static void
+undo_cleaner_note_held_lwlock(LWLock *lock pg_attribute_unused(),
+							  LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+/* No blocking resource may survive into capacity sleep. Inspect only the
+ * backend's LOCALLOCK tag/count; shared lock/proclock pointers can be stale
+ * in zero-count entries and are deliberately never dereferenced here. */
+static bool
+undo_cleaner_capacity_context_safe(void)
+{
+	HTAB *locks;
+	HASH_SEQ_STATUS scan;
+	LOCALLOCK *lock;
+	LOCKTAG own_xid, own_vxid;
+	VirtualTransactionId vxid;
+	TransactionId xid;
+	bool held_lwlock = false;
+
+	if (MyBackendType != B_BACKEND || MyProc == NULL || CritSectionCount != 0
+		|| InterruptHoldoffCount != 0 || cluster_buffer_backend_has_pins()
+		|| cluster_undo_block0_current_backend_has_guards()
+		|| cluster_undo_block0_backend_has_resources()
+		|| cluster_semantic_activation_backend_has_admission())
+		return false;
+	ForEachLWLockHeldByMe(undo_cleaner_note_held_lwlock, &held_lwlock);
+	if (held_lwlock)
+		return false;
+	locks = GetLockMethodLocalHash();
+	if (locks == NULL)
+		return true;
+	xid = GetTopTransactionIdIfAny();
+	SET_LOCKTAG_TRANSACTION(own_xid, xid);
+	GET_VXID_FROM_PGPROC(vxid, *MyProc);
+	SET_LOCKTAG_VIRTUALTRANSACTION(own_vxid, vxid);
+	hash_seq_init(&scan, locks);
+	while ((lock = hash_seq_search(&scan)) != NULL) {
+		const LOCKTAG *tag = &lock->tag.lock;
+		bool allowed = false;
+
+		if (lock->nLocks == 0)
+			continue;
+		if (lock->nLocks > 0 && tag->locktag_lockmethodid == DEFAULT_LOCKMETHOD
+			&& !lock->holdsStrongLockCount) {
+			if (tag->locktag_type == LOCKTAG_RELATION)
+				allowed = lock->tag.mode == AccessShareLock || lock->tag.mode == RowShareLock
+						  || lock->tag.mode == RowExclusiveLock;
+			else if (lock->tag.mode == ExclusiveLock)
+				allowed = (TransactionIdIsNormal(xid) && memcmp(tag, &own_xid, sizeof(*tag)) == 0)
+						  || (VirtualTransactionIdIsValid(vxid)
+							  && memcmp(tag, &own_vxid, sizeof(*tag)) == 0);
+		}
+		if (!allowed) {
+			hash_seq_term(&scan);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+undo_cleaner_capacity_floor(ClusterUndoHorizonFloor *floor)
+{
+	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+	uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	ClusterUndoHorizonStallReason reason;
+	uint64 epoch;
+	int32 blame;
+	int nviews;
+	SCN horizon;
+
+	if (!cluster_undo_retention_horizon_enabled)
+		return false;
+	horizon = cluster_undo_retention_horizon();
+	nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+	return cluster_undo_horizon_required_members(required, &epoch)
+		   && cluster_undo_horizon_cluster_floor(horizon, views, nviews, required, cluster_node_id,
+												 epoch, (uint64)GetCurrentTimestamp(),
+												 (uint32)cluster_lmon_main_loop_interval, floor,
+												 &reason, &blame)
+				  == CLUSTER_UNDO_HORIZON_FOLD_OK
+		   && !cluster_undo_horizon_epoch_fence_tripped(floor->epoch);
+}
+
+bool
+cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
+{
+	bool retry = false;
+
+	if (undo_cleaner_state == NULL || continuation == NULL)
+		return false;
+	if (!undo_cleaner_capacity_context_safe()) {
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+		undo_cleaner_state->capacity_wait_refused_context++;
+		LWLockRelease(&undo_cleaner_state->lwlock);
+		return false;
+	}
+	ConditionVariablePrepareToSleep(&undo_cleaner_state->capacity_cv);
+	PG_TRY();
+	{
+		ClusterUndoHorizonFloor floor;
+		ClusterCtrcCapacityProbeResult proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()
+			&& undo_cleaner_capacity_floor(&floor))
+			proof = cluster_ctrc_capacity_probe_current(segment_id, floor.scn, floor.epoch,
+														continuation);
+		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
+			retry = true;
+		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
+			unsigned worker = (continuation->segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
+			bool supplied;
+
+			LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+			supplied = !undo_cleaner_state->shutdown_requested
+					   && undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
+					   && undo_cleaner_state->workers[worker].status == UNDO_CLEANER_READY;
+			if (supplied)
+				undo_cleaner_state->capacity_wait_entered++;
+			else
+				undo_cleaner_state->capacity_wait_refused_proof++;
+			LWLockRelease(&undo_cleaner_state->lwlock);
+			if (supplied) {
+				cluster_undo_cleaner_wakeup();
+				/* Timeout is only the existing floor-report recheck cadence,
+				 * not a new failure deadline or a reason to assume FREE. */
+				(void)ConditionVariableTimedSleep(&undo_cleaner_state->capacity_cv,
+												  Max(cluster_lmon_main_loop_interval, 200),
+												  WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
+				LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+				undo_cleaner_state->capacity_wait_repolled++;
+				LWLockRelease(&undo_cleaner_state->lwlock);
+				retry = true;
+			}
+		} else {
+			LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+			if (proof == CLUSTER_CTRC_CAPACITY_WAIT)
+				undo_cleaner_state->capacity_wait_refused_context++;
+			else
+				undo_cleaner_state->capacity_wait_refused_proof++;
+			LWLockRelease(&undo_cleaner_state->lwlock);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
+	return retry;
 }
 
 
@@ -200,7 +380,7 @@ cluster_undo_cleaner_status(void)
 		return UNDO_CLEANER_NOT_STARTED;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->status;
+	result = undo_cleaner_state->workers[0].status;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -214,7 +394,7 @@ cluster_undo_cleaner_pid(void)
 		return 0;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->pid;
+	result = undo_cleaner_state->workers[0].pid;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -228,7 +408,7 @@ cluster_undo_cleaner_spawned_at(void)
 		return 0;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->spawned_at;
+	result = undo_cleaner_state->workers[0].spawned_at;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -242,7 +422,7 @@ cluster_undo_cleaner_ready_at(void)
 		return 0;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->ready_at;
+	result = undo_cleaner_state->workers[0].ready_at;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -256,7 +436,7 @@ cluster_undo_cleaner_last_liveness_tick_at(void)
 		return 0;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->last_liveness_tick_at;
+	result = undo_cleaner_state->workers[0].last_liveness_tick_at;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -270,7 +450,7 @@ cluster_undo_cleaner_main_loop_iters(void)
 		return 0;
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-	result = undo_cleaner_state->main_loop_iters;
+	result = undo_cleaner_state->workers[0].main_loop_iters;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	return result;
 }
@@ -284,11 +464,13 @@ static void
 undo_cleaner_publish_status(UndoCleanerStatus status)
 {
 	TimestampTz now = GetCurrentTimestamp();
+	UndoCleanerWorkerState *worker;
 
 	Assert(undo_cleaner_state != NULL);
+	Assert(undo_cleaner_worker >= 0 && undo_cleaner_worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES);
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-	undo_cleaner_state->status = status;
+	worker = &undo_cleaner_state->workers[undo_cleaner_worker];
 	/*
 	 * F16 (spec-1.14 lineage): SPAWNING marks a new incarnation —
 	 * refresh every incarnation-scoped field unconditionally so SQL
@@ -296,19 +478,19 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	 * respawn.
 	 */
 	if (status == UNDO_CLEANER_SPAWNING) {
-		undo_cleaner_state->pid = MyProcPid;
-		undo_cleaner_state->spawned_at = now;
-		undo_cleaner_state->ready_at = 0;
-		undo_cleaner_state->last_liveness_tick_at = 0;
-		undo_cleaner_state->main_loop_iters = 0;
-		undo_cleaner_state->latch = (MyProc != NULL) ? &MyProc->procLatch : NULL;
+		MemSet(worker, 0, sizeof(*worker));
+		worker->pid = MyProcPid;
+		worker->spawned_at = now;
+		worker->latch = (MyProc != NULL) ? &MyProc->procLatch : NULL;
 	} else if (status == UNDO_CLEANER_READY) {
-		undo_cleaner_state->ready_at = now;
+		worker->ready_at = now;
 	} else if (status == UNDO_CLEANER_SHUTTING_DOWN) {
 		/* stop accepting pressure wakeups against a dying latch */
-		undo_cleaner_state->latch = NULL;
+		worker->latch = NULL;
 	}
+	worker->status = status;
 	LWLockRelease(&undo_cleaner_state->lwlock);
+	ConditionVariableBroadcast(&undo_cleaner_state->capacity_cv);
 }
 
 
@@ -334,8 +516,8 @@ undo_cleaner_advance_liveness_tick(void)
 	Assert(undo_cleaner_state != NULL);
 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-	undo_cleaner_state->last_liveness_tick_at = now;
-	undo_cleaner_state->main_loop_iters++;
+	undo_cleaner_state->workers[undo_cleaner_worker].last_liveness_tick_at = now;
+	undo_cleaner_state->workers[undo_cleaner_worker].main_loop_iters++;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 }
 
@@ -393,15 +575,18 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	if (!cluster_storage_mode_enabled())
 		return false;
 
-	/* Spec 8.4D K13: this existing process is the sole CTRC progress owner.
-	 * The helper holds no cleaner/lifecycle/page lock while it samples one
-	 * terminal and stages at most one idempotent close continuation. */
+	/* Each bound worker advances only its canonical TT segment shard.
+	 * The helper holds no cleaner lock while sampling or doing physical work. */
 	ctrc_local_progress = cluster_ctrc_cleaner_run_pass();
 	/* SetLatch notifications coalesce.  A completed local CTRC edge proves
 	 * useful work remains in the bounded pipeline, so keep this sole owner
 	 * running until a pass makes no local progress.  Remote enqueue is not a
 	 * completed edge and is excluded by cluster_ctrc_cleaner_run_pass(). */
 	*out_work_remaining = ctrc_local_progress;
+	/* Only coordinator zero owns GC, floor capture, the scan cursor and
+	 * segment advancement. Per-worker progress never duplicates those roles. */
+	if (undo_cleaner_worker != 0)
+		return false;
 	writable_admission
 		= cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
 	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)
@@ -612,6 +797,9 @@ pass_account:
 	undo_cleaner_state->stale_active_skipped += stats.stale_active_skipped;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 
+	if (stats.shmem_tt_slots_gcd > 0 || stats.segments_marked_recyclable > 0)
+		ConditionVariableBroadcast(&undo_cleaner_state->capacity_cv);
+
 	/*
 	 * L213 pinned-horizon observability: a pass that found retained
 	 * inventory but made zero recycle progress means a long reader is
@@ -645,6 +833,10 @@ UndoCleanerMain(void)
 {
 	/* HC1 reverse defense: we must be a postmaster child. */
 	Assert(IsUnderPostmaster);
+	undo_cleaner_worker = ClusterUndoCleanerWorkerIdForType(MyAuxProcType);
+	if (undo_cleaner_worker < 0 || !cluster_ctrc_cleaner_bind_worker((unsigned)undo_cleaner_worker))
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("invalid undo cleaner worker identity")));
 
 	MyBackendType = B_UNDO_CLEANER;
 	init_ps_display(NULL);
@@ -710,6 +902,12 @@ UndoCleanerMain(void)
 		CLUSTER_INJECTION_POINT("undo-cleaner-main-loop-iter");
 
 		floor_retry = undo_cleaner_run_pass(&work_remaining);
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+		undo_cleaner_state->workers[undo_cleaner_worker].local_completed_passes
+			= cluster_ctrc_cleaner_local_passes();
+		undo_cleaner_state->workers[undo_cleaner_worker].local_progress_events
+			= cluster_ctrc_cleaner_local_progress();
+		LWLockRelease(&undo_cleaner_state->lwlock);
 
 		/*
 		 * TT lane H2 (pressure-driven continuous mode): a pass that
@@ -791,6 +989,10 @@ UNDO_CLEANER_COUNTER_ACCESSOR(pass_count)
 UNDO_CLEANER_COUNTER_ACCESSOR(shmem_tt_slots_gcd)
 UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
 UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
+UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_entered)
+UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_repolled)
+UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_context)
+UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_proof)
 UNDO_CLEANER_COUNTER_ACCESSOR(header_tt_slots_below_horizon) /* spec-5.22e D5-5 */
 
 

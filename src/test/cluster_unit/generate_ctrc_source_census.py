@@ -1223,6 +1223,19 @@ _classify_owners(
     "cluster_ctrc_terminal_release_sample_exact",
     "MXA-T30",
 )
+# This lexical category includes reads of the flag as well as writes. The
+# capacity sampler is an observation only; no release producer is delegated.
+_classify_owners(
+    "TT_RELEASE_FLAG_WRITER",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_cleaner_terminal_sample_mode",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "READ_ONLY_CAPACITY_OBSERVATION",
+    "NO_RELEASE_MUTATION",
+    "MXA-T30-capacity-native-bracket",
+)
 _classify_owners(
     "TT_RELEASE_FLAG_WRITER",
     "src/backend/cluster/cluster_tt_durable.c",

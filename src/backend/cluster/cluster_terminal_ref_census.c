@@ -69,7 +69,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(8)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(9)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -1542,6 +1542,14 @@ ctrc_target_encode(const ClusterCtrcTargetV1 *target,
  * Table-wide snapshots need sleepable exclusion, not spinlock backoff.
  * Lock order is origin -> receipt or participant -> receipt. Protected
  * helpers must not perform I/O or acquire external physical locks. */
+typedef struct CtrcCleanerWorkerObservationShared {
+	pg_atomic_uint64 dispatch_backlog;
+	pg_atomic_uint64 certificate_backlog;
+	pg_atomic_uint64 pending_observed_age_ms;
+	pg_atomic_uint64 observed_at_us;
+	pg_atomic_uint32 reason;
+} CtrcCleanerWorkerObservationShared;
+
 typedef struct ClusterCtrcSharedHeader
 {
 	LWLock origin_lock;
@@ -1571,7 +1579,7 @@ typedef struct ClusterCtrcSharedHeader
 	pg_atomic_uint64 stats[CTRC_STAT_COUNT];
 	pg_atomic_uint64 test_barrier_hit_count;
 	pg_atomic_uint32 test_barrier_phase;
-	pg_atomic_uint32 cleaner_reason;
+	CtrcCleanerWorkerObservationShared workers[CLUSTER_CTRC_CLEANER_WORKERS];
 	uint8 reserved[24];
 } ClusterCtrcSharedHeader;
 
@@ -1722,6 +1730,48 @@ typedef struct CtrcCleanerBatch {
 static CtrcCleanerBatch CtrcBatch;
 static CtrcCleanerOriginHint CtrcOriginHint[CTRC_CLEANER_ORIGINS];
 static uint64 CtrcDispatchCursor;
+static int CtrcWorkerId = -1;
+static uint64 CtrcLocalProgress;
+static uint64 CtrcLocalPasses;
+
+bool
+cluster_ctrc_cleaner_bind_worker(unsigned worker_id)
+{
+	if (worker_id >= CLUSTER_CTRC_CLEANER_WORKERS
+		|| (CtrcWorkerId >= 0 && CtrcWorkerId != (int)worker_id))
+		return false;
+	CtrcWorkerId = (int)worker_id;
+	return true;
+}
+
+uint64
+cluster_ctrc_cleaner_local_progress(void)
+{
+	return CtrcLocalProgress;
+}
+
+uint64
+cluster_ctrc_cleaner_local_passes(void)
+{
+	return CtrcLocalPasses;
+}
+
+/* Canonical TT segment ownership, not the undo-record extent or table index.
+ * Unbound single-step consumers retain their existing contract. Only bound
+ * auxiliary processes may run the autonomous batch driver. */
+static bool
+ctrc_cleaner_owns_key(const ClusterCtrcTxnKeyV1 *key)
+{
+	uint32 first;
+
+	if (CtrcWorkerId < 0)
+		return true;
+	if (!ctrc_txn_key_valid(key))
+		return false;
+	first = ((uint32)key->owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	return key->segment_id >= first && key->segment_id - first < CLUSTER_UNDO_SEGS_PER_INSTANCE
+		   && (key->segment_id - first) % CLUSTER_CTRC_CLEANER_WORKERS == (unsigned)CtrcWorkerId;
+}
 
 static uint64
 ctrc_monotonic_us(void)
@@ -1751,6 +1801,8 @@ static void
 ctrc_semantic_progress(bool wake)
 {
 	cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
+	if (CtrcWorkerId >= 0)
+		CtrcLocalProgress++;
 	if (wake)
 		cluster_undo_cleaner_wakeup();
 }
@@ -2000,7 +2052,8 @@ ctrc_origin_next_certificate_snapshot_shared(
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
 
 		if (origin->state != CTRC_ORIGIN_CERTIFYING
-			|| origin->key.origin_node_id != (uint16)cluster_node_id)
+			|| origin->key.origin_node_id != (uint16)cluster_node_id
+			|| !ctrc_cleaner_owns_key(&origin->key))
 			continue;
 		if (!ctrc_origin_certificate_snapshot_index_locked(index, snapshot))
 		{
@@ -2154,6 +2207,8 @@ cluster_ctrc_shmem_init(void)
 		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
 		MemSet(CtrcOriginHint, 0, sizeof(CtrcOriginHint));
 		CtrcDispatchCursor = 0;
+		CtrcWorkerId = -1;
+		CtrcLocalProgress = CtrcLocalPasses = 0;
 		MemSet(CtrcShared, 0, capacity.total_bytes);
 		CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
 		CtrcShared->version = CLUSTER_CTRC_SHMEM_VERSION;
@@ -2179,8 +2234,13 @@ cluster_ctrc_shmem_init(void)
 		pg_atomic_init_u64(&CtrcShared->test_barrier_hit_count, 0);
 		pg_atomic_init_u32(&CtrcShared->test_barrier_phase,
 			CTRC_TEST_BARRIER_NONE);
-		pg_atomic_init_u32(&CtrcShared->cleaner_reason,
-			CTRC_CLEANER_REASON_NONE);
+		for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
+			pg_atomic_init_u64(&CtrcShared->workers[i].dispatch_backlog, 0);
+			pg_atomic_init_u64(&CtrcShared->workers[i].certificate_backlog, 0);
+			pg_atomic_init_u64(&CtrcShared->workers[i].pending_observed_age_ms, 0);
+			pg_atomic_init_u64(&CtrcShared->workers[i].observed_at_us, 0);
+			pg_atomic_init_u32(&CtrcShared->workers[i].reason, CTRC_CLEANER_REASON_NONE);
+		}
 		ctrc_shared_fill_layout(CtrcShared, &capacity);
 	}
 	if (!ctrc_shared_header_exact(CtrcShared, &capacity))
@@ -2224,11 +2284,17 @@ cluster_ctrc_stat_bump(ClusterCtrcStatId stat)
 ClusterCtrcCleanerReason
 cluster_ctrc_cleaner_reason_get(void)
 {
+	return cluster_ctrc_cleaner_worker_reason(0);
+}
+
+ClusterCtrcCleanerReason
+cluster_ctrc_cleaner_worker_reason(unsigned worker_id)
+{
 	uint32 reason;
 
-	if (!ctrc_runtime_attached())
+	if (worker_id >= CLUSTER_CTRC_CLEANER_WORKERS || !ctrc_runtime_attached())
 		return CTRC_CLEANER_REASON_NONE;
-	reason = pg_atomic_read_u32(&CtrcShared->cleaner_reason);
+	reason = pg_atomic_read_u32(&CtrcShared->workers[worker_id].reason);
 	return reason < CTRC_CLEANER_REASON_COUNT
 		? (ClusterCtrcCleanerReason)reason : CTRC_CLEANER_REASON_BLOCKED;
 }
@@ -2238,7 +2304,28 @@ cluster_ctrc_cleaner_reason_set(ClusterCtrcCleanerReason reason)
 {
 	if (reason >= 0 && reason < CTRC_CLEANER_REASON_COUNT
 		&& ctrc_runtime_attached())
-		pg_atomic_write_u32(&CtrcShared->cleaner_reason, (uint32)reason);
+		pg_atomic_write_u32(&CtrcShared->workers[CtrcWorkerId < 0 ? 0 : CtrcWorkerId].reason,
+							(uint32)reason);
+}
+
+bool
+cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
+										ClusterCtrcCleanerWorkerObservation *out)
+{
+	CtrcCleanerWorkerObservationShared *row;
+
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+	if (worker_id >= CLUSTER_CTRC_CLEANER_WORKERS || !ctrc_runtime_attached())
+		return false;
+	row = &CtrcShared->workers[worker_id];
+	out->dispatch_backlog = pg_atomic_read_u64(&row->dispatch_backlog);
+	out->certificate_backlog = pg_atomic_read_u64(&row->certificate_backlog);
+	out->pending_observed_age_ms = pg_atomic_read_u64(&row->pending_observed_age_ms);
+	out->observed_at_us = pg_atomic_read_u64(&row->observed_at_us);
+	out->reason = (uint32)cluster_ctrc_cleaner_worker_reason(worker_id);
+	return true;
 }
 
 bool
@@ -2339,8 +2426,7 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 		&CtrcShared->test_barrier_hit_count);
 	snapshot->test_barrier_phase = pg_atomic_read_u32(
 		&CtrcShared->test_barrier_phase);
-	snapshot->cleaner_reason = pg_atomic_read_u32(
-		&CtrcShared->cleaner_reason);
+	snapshot->cleaner_reason = (uint32)cluster_ctrc_cleaner_reason_get();
 	return snapshot->test_barrier_phase < CTRC_TEST_BARRIER_COUNT
 		&& snapshot->cleaner_reason < CTRC_CLEANER_REASON_COUNT;
 }
@@ -3499,7 +3585,8 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
 
 		if (origin->state != CTRC_ORIGIN_OPEN
-			|| origin->key.origin_node_id != (uint16)cluster_node_id)
+			|| origin->key.origin_node_id != (uint16)cluster_node_id
+			|| !ctrc_cleaner_owns_key(&origin->key))
 			continue;
 		if (!ctrc_txn_key_valid(&origin->key)
 			|| origin->grant_generation == 0
@@ -3583,7 +3670,8 @@ ctrc_origin_dispatchable_locked(ClusterCtrcOriginEntry *origin)
 {
 	uint8 before = origin->state;
 
-	if (cluster_node_id < 0 || origin->key.origin_node_id != (uint16)cluster_node_id)
+	if (cluster_node_id < 0 || origin->key.origin_node_id != (uint16)cluster_node_id
+		|| !ctrc_cleaner_owns_key(&origin->key))
 		return false;
 	if (origin->state == CTRC_ORIGIN_SEALED
 		|| (origin->state == CTRC_ORIGIN_SEALING && origin->touched_bitmap == 0))
@@ -3621,6 +3709,9 @@ ctrc_dispatch_batch_collect(void)
 	uint64 pending = 0;
 	uint64 certifying = 0;
 	uint64 oldest_age_us = 0;
+	uint64 own_pending = 0;
+	uint64 own_certifying = 0;
+	uint64 own_oldest_age_us = 0;
 	uint64 now = ctrc_monotonic_us();
 	uint64 i;
 	uint64 start;
@@ -3634,26 +3725,44 @@ ctrc_dispatch_batch_collect(void)
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[i];
 		CtrcCleanerOriginHint *hint = &CtrcOriginHint[i];
+		bool owned = ctrc_cleaner_owns_key(&origin->key);
 		bool eligible = ctrc_origin_dispatchable_locked(origin);
 		bool certificate = origin->state == CTRC_ORIGIN_CERTIFYING;
+		bool observed_pending;
 		unsigned pos;
 
+		/* Coordinator observations cover the whole table, without executing
+		 * another shard's FSM edge just to count it. */
+		observed_pending
+			= origin->key.origin_node_id == (uint16)cluster_node_id
+			  && (origin->state == CTRC_ORIGIN_RELEASE_PROVEN
+					  ? (origin->touched_bitmap & ~origin->close_confirmed_bitmap) != 0
+					  : (origin->state == CTRC_ORIGIN_SEALING || origin->state == CTRC_ORIGIN_SEALED
+						 || origin->state == CTRC_ORIGIN_CLEANING)
+							&& (origin->touched_bitmap & ~origin->ack_bitmap) != 0);
 		if (certificate)
 			certifying++;
-		if (eligible || certificate) {
+		if (owned && certificate)
+			own_certifying++;
+		if (observed_pending)
+			pending++;
+		if (eligible)
+			own_pending++;
+		if (observed_pending || certificate) {
 			if (hint->seal_generation != origin->seal_generation || hint->first_observed_us == 0
 				|| now < hint->first_observed_us) {
 				hint->seal_generation = origin->seal_generation;
 				hint->first_observed_us = now;
 			}
 			oldest_age_us = Max(oldest_age_us, now - hint->first_observed_us);
+			if (owned)
+				own_oldest_age_us = Max(own_oldest_age_us, now - hint->first_observed_us);
 		} else {
 			hint->seal_generation = 0;
 			hint->first_observed_us = 0;
 		}
 		if (!eligible)
 			continue;
-		pending++;
 		for (pos = 0; pos < old_count; pos++)
 			if (origin->seal_generation < old_seal[pos])
 				break;
@@ -3686,11 +3795,21 @@ ctrc_dispatch_batch_collect(void)
 
 	/* Non-atomic observation across tables/stages. Age is a lower bound
 	 * since this process first saw the seal, never an expiry decision. */
-	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_DISPATCH_BACKLOG], pending);
-	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_CERTIFICATE_BACKLOG], certifying);
-	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_PENDING_OBSERVED_AGE_MS],
-						oldest_age_us / 1000);
-	pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_OBSERVED_AT_US], now);
+	if (CtrcWorkerId <= 0) {
+		pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_DISPATCH_BACKLOG], pending);
+		pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_CERTIFICATE_BACKLOG], certifying);
+		pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_PENDING_OBSERVED_AGE_MS],
+							oldest_age_us / 1000);
+		pg_atomic_write_u64(&CtrcShared->stats[CTRC_STAT_OBSERVED_AT_US], now);
+	}
+	if (CtrcWorkerId >= 0) {
+		CtrcCleanerWorkerObservationShared *row = &CtrcShared->workers[CtrcWorkerId];
+
+		pg_atomic_write_u64(&row->dispatch_backlog, own_pending);
+		pg_atomic_write_u64(&row->certificate_backlog, own_certifying);
+		pg_atomic_write_u64(&row->pending_observed_age_ms, own_oldest_age_us / 1000);
+		pg_atomic_write_u64(&row->observed_at_us, now);
+	}
 }
 #endif
 
@@ -3769,8 +3888,9 @@ cluster_ctrc_origin_next_close_dispatch_shared(
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
-ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
-	ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out)
+ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
+								  ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out,
+								  bool *released_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -3791,13 +3911,15 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 	bool native_abort_after;
 	bool native_progress_after;
 	bool admission_entered = false;
-	bool current_active = false;
+	volatile bool current_active = false;
 	bool terminal = false;
 
 	if (status_out != NULL)
 		*status_out = CTRC_TERMINAL_UNKNOWN;
 	if (commit_scn_out != NULL)
 		*commit_scn_out = InvalidScn;
+	if (released_out != NULL)
+		*released_out = false;
 
 	MemSet(&admission, 0, sizeof(admission));
 	MemSet(&logical, 0, sizeof(logical));
@@ -3873,12 +3995,12 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 		native_commit_after = TransactionIdDidCommit(key->xid);
 		native_abort_after = TransactionIdDidAbort(key->xid);
 		native_progress_after = TransactionIdIsInProgress(key->xid);
-		if (native_commit_before != native_commit_after
-			|| native_abort_before != native_abort_after
-			|| native_progress_before != native_progress_after
-			|| native_progress_after
+		if (native_commit_before != native_commit_after || native_abort_before != native_abort_after
+			|| native_progress_before != native_progress_after || native_progress_after
 			|| slot.xid != key->xid || slot.wrap != key->slot_wrap
-			|| slot.flags != TT_FLAGS_RESERVED)
+			|| (slot.flags != TT_FLAGS_RESERVED
+				&& !(capacity_probe && slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN))
+			|| (capacity_probe && !UBA_is_invalid(slot.first_undo_block)))
 			goto sample_done;
 
 		MemSet(&final_root, 0, sizeof(final_root));
@@ -3938,9 +4060,186 @@ sample_done:
 	if (terminal && commit_scn_out != NULL)
 		*commit_scn_out = slot.status == TT_SLOT_COMMITTED
 			? slot.commit_scn : InvalidScn;
+	if (terminal && released_out != NULL)
+		*released_out = slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
 	return terminal;
 }
+
+static bool
+ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
+								   ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out)
+{
+	/* The seal consumer retains its flags-zero contract. Capacity sampling
+	 * cannot broaden any release/certificate producer's acceptance set. */
+	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL);
+}
 #endif
+
+ClusterCtrcCapacityProbeResult
+cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch,
+									ClusterCtrcTxnKeyV1 *continuation)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	uint32 first;
+	uint32 current;
+	bool armed;
+	uint64 start;
+
+	if (continuation == NULL)
+		return CLUSTER_CTRC_CAPACITY_REFUSE;
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| !SCN_VALID(horizon) || epoch == 0 || epoch != cluster_epoch_get_current()
+		|| !cluster_ctrc_shmem_ready())
+		goto refuse;
+	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (segment_id < first || segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		goto refuse;
+	current = cluster_tt_slot_current_segment(cluster_node_id);
+	if (current < first || current - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		goto refuse;
+	if (current != segment_id) {
+		MemSet(continuation, 0, sizeof(*continuation));
+		return CLUSTER_CTRC_CAPACITY_RETRY;
+	}
+	armed = !ctrc_bytes_zero(continuation, sizeof(*continuation));
+	if (armed
+		&& (!ctrc_txn_key_valid(continuation) || continuation->segment_id != segment_id
+			|| continuation->origin_node_id != (uint16)cluster_node_id
+			|| continuation->cluster_epoch != epoch))
+		goto refuse;
+	start = (uint64)(segment_id - first) * TT_SLOTS_PER_SEGMENT;
+	for (unsigned slot = 0; slot < (armed ? 1 : TT_SLOTS_PER_SEGMENT); slot++) {
+		ClusterCtrcOriginCertificateSnapshot snapshot;
+		ClusterCtrcTxnKeyV1 key;
+		ClusterCtrcTerminalStatus status;
+		SCN commit_scn;
+		bool released;
+		bool exact = false;
+
+		CHECK_FOR_INTERRUPTS();
+		if (armed)
+			key = *continuation;
+		else {
+			LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+			LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+			exact = ctrc_origin_certificate_snapshot_index_locked(start + slot, &snapshot)
+					&& snapshot.origin.key.segment_id == segment_id
+					&& snapshot.origin.key.origin_node_id == (uint16)cluster_node_id;
+			LWLockRelease(&CtrcShared->receipt_lock);
+			LWLockRelease(&CtrcShared->origin_lock);
+			if (!exact)
+				continue;
+			key = snapshot.origin.key;
+		}
+		if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released)
+			|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
+			continue;
+	capacity_sampled:
+		if (epoch != cluster_epoch_get_current())
+			goto refuse;
+		current = cluster_tt_slot_current_segment(cluster_node_id);
+		if (current != segment_id) {
+			if (current < first || current - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+				goto refuse;
+			MemSet(continuation, 0, sizeof(*continuation));
+			return CLUSTER_CTRC_CAPACITY_RETRY;
+		}
+		if (!armed) {
+			if (!ctrc_origin_certificate_snapshot_matches_shared(&snapshot)) {
+				/* A concurrent completion warrants original allocation again,
+				 * not permission to sleep on an unarmed historical identity. */
+				return CLUSTER_CTRC_CAPACITY_RETRY;
+			}
+		} else if (!released) {
+			/* Before the flag exists, the original certificate work must
+			 * still exist. Afterward its exact durable flag bridges origin
+			 * reclamation to coordinator GC, without caching terminality. */
+			LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+			LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+			exact
+				= ctrc_origin_certificate_snapshot_index_locked(start + key.slot_offset, &snapshot)
+				  && memcmp(&snapshot.origin.key, &key, sizeof(key)) == 0;
+			LWLockRelease(&CtrcShared->receipt_lock);
+			LWLockRelease(&CtrcShared->origin_lock);
+			if (!exact) {
+				/* Completion after SCUR release can remove CERTIFYING. Reprove
+				 * once against the exact durable flag; absence alone cannot
+				 * authorize waiting, and a failed second proof is not retried. */
+				if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released)
+					|| !released
+					|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
+					goto refuse;
+				goto capacity_sampled;
+			}
+		}
+		*continuation = key;
+		return CLUSTER_CTRC_CAPACITY_WAIT;
+	}
+refuse:
+	MemSet(continuation, 0, sizeof(*continuation));
+#else
+	(void)segment_id;
+	(void)horizon;
+	(void)epoch;
+	if (continuation != NULL)
+		MemSet(continuation, 0, sizeof(*continuation));
+#endif
+	return CLUSTER_CTRC_CAPACITY_REFUSE;
+}
+
+/* The durable flag remains the sole release authority. This additional
+ * local barrier prevents reuse while its publisher still owns CERTIFYING,
+ * including ERROR after flush but before the shared handoff. Callers have
+ * already sampled canonical bytes; no I/O or current acquisition occurs
+ * under this lock. A completed notification may have removed the row. */
+bool
+cluster_ctrc_reuse_handoff_complete(const UndoSegmentHeaderData *header, uint16 slot_offset)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	uint32 first;
+	uint64 start;
+	bool complete = true;
+	unsigned begin = slot_offset == INVALID_TT_SLOT_OFFSET ? 0 : slot_offset;
+	unsigned end = slot_offset == INVALID_TT_SLOT_OFFSET ? TT_SLOTS_PER_SEGMENT : begin + 1;
+
+	if (header == NULL || cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| header->owner_instance != (uint8)(cluster_node_id + 1)
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT || header->wrap_count == UINT32_MAX
+		|| begin >= TT_SLOTS_PER_SEGMENT || end > TT_SLOTS_PER_SEGMENT
+		|| !cluster_ctrc_shmem_ready())
+		return false;
+	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (header->segment_id < first || header->segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		return false;
+	start = (uint64)(header->segment_id - first) * TT_SLOTS_PER_SEGMENT;
+	if (start + end > CtrcShared->origin_key_entries)
+		return false;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	for (unsigned i = begin; i < end; i++) {
+		const ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[start + i];
+		const ClusterCtrcTxnKeyV1 *key = &origin->key;
+		const TTSlot *slot = &header->tt_slots[i];
+
+		if (ctrc_bytes_zero(origin, sizeof(*origin)))
+			continue;
+		if (origin->state != CTRC_ORIGIN_RELEASE_PROVEN || !ctrc_txn_key_valid(key)
+			|| key->owner_instance != header->owner_instance
+			|| key->origin_node_id != (uint16)cluster_node_id
+			|| key->segment_id != header->segment_id
+			|| key->segment_generation != header->wrap_count || key->slot_offset != i
+			|| key->slot_wrap != slot->wrap || key->xid != slot->xid) {
+			complete = false;
+			break;
+		}
+	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	return complete;
+#else
+	(void)header;
+	(void)slot_offset;
+	return false;
+#endif
+}
 
 /*
  * cluster_ctrc_terminal_release_sample_exact -- 8D-12 L11/L12.
@@ -3978,7 +4277,7 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
 	bool native_abort_after;
 	bool native_progress_after;
 	bool admission_entered = false;
-	bool current_active = false;
+	volatile bool current_active = false;
 	bool released = false;
 
 	MemSet(&admission, 0, sizeof(admission));
@@ -4081,7 +4380,7 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
 			|| !final_generation.known
 			|| final_generation.value != generation.value)
 			goto release_sample_done;
-		released = true;
+		released = cluster_ctrc_reuse_handoff_complete(header, slot_offset);
 
 release_sample_done:
 		if (current_active)
@@ -4158,8 +4457,10 @@ ctrc_cleaner_publish_certificate(
 	uint8 digest[32];
 	char *resident_page = NULL;
 	bool admission_entered = false;
-	bool current_active = false;
-	bool pin_held = false;
+	/* PG_CATCH reads these after siglongjmp; optimized builds must retain
+	 * the actual holdings acquired inside PG_TRY. */
+	volatile bool current_active = false;
+	volatile bool pin_held = false;
 	bool durable = false;
 	bool committed = false;
 
@@ -4415,14 +4716,14 @@ cluster_ctrc_cleaner_run_pass(void)
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	uint64 progress_before;
 
-	if (!cluster_ctrc_shmem_ready())
+	if (CtrcWorkerId < 0 || !cluster_ctrc_shmem_ready())
 		return false;
 	Assert(!CtrcBatch.active);
 	if (CtrcBatch.active)
 		return false;
 	cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_PASS);
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
-	progress_before = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	progress_before = CtrcLocalProgress;
 	CtrcBatch.active = true;
 	CtrcBatch.remaining[CTRC_SCAN_OPEN] = CtrcShared->origin_key_entries;
 	CtrcBatch.remaining[CTRC_SCAN_RECEIPT] = CtrcShared->receipt_entries;
@@ -4493,7 +4794,8 @@ cluster_ctrc_cleaner_run_pass(void)
 		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
 	}
 	PG_END_TRY();
-	return cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) != progress_before;
+	CtrcLocalPasses++;
+	return CtrcLocalProgress != progress_before;
 #else
 	return false;
 #endif
@@ -6885,10 +7187,9 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 		ClusterCtrcParticipantEntry *participant;
 		uint64 participant_index;
 
-		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state)
-			!= CTRC_RECEIPT_APPLIED
-			|| !ctrc_participant_index(&receipt->key,
-				(uint16)cluster_node_id, &participant_index))
+		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != CTRC_RECEIPT_APPLIED
+			|| !ctrc_cleaner_owns_key(&receipt->key)
+			|| !ctrc_participant_index(&receipt->key, (uint16)cluster_node_id, &participant_index))
 			continue;
 		participant = &ctrc_participant_entries()[participant_index];
 		if (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
@@ -8111,6 +8412,8 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 		ClusterCtrcParticipantEntry *participant
 			= &ctrc_participant_entries()[index];
 
+		if (!ctrc_cleaner_owns_key(&participant->key))
+			continue;
 		if (participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
 			&& participant->prepared_count == 0
 			&& participant->applied_count == 0)

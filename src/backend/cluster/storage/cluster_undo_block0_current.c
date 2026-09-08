@@ -25,6 +25,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_resid.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_undo_segment.h"
@@ -167,6 +168,12 @@ StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED == 0
 				 "block0 current phase values are frozen");
 
 static dlist_head current_active_guards = DLIST_STATIC_INIT(current_active_guards);
+
+bool
+cluster_undo_block0_current_backend_has_guards(void)
+{
+	return !dlist_is_empty(&current_active_guards);
+}
 static bool current_exit_hook_registered = false;
 
 #define CURRENT_ADMISSION_BORROWED_INDEX 0
@@ -2384,6 +2391,14 @@ cluster_undo_block0_current_live_owner_recycle_exact(
 				   sizeof(disk->tt_slots)) != 0)
 			goto recycle_done;
 
+		/* Parallel certificate workers can have durable flags while their
+		 * exact shared-origin handoff is still pending. Never expose the
+		 * segment for generation reuse across that publication window. */
+		if (cluster_peer_mode_enabled()
+			&& !cluster_ctrc_reuse_handoff_complete(disk, INVALID_TT_SLOT_OFFSET)) {
+			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED;
+			goto recycle_done;
+		}
 		if (current_reuse_page_identity(disk_block.data, key,
 				observed.value, SEGMENT_RECYCLABLE)) {
 			if (memcmp(disk_block.data, resident_page, BLCKSZ) != 0)

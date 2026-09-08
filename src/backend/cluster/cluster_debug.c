@@ -967,6 +967,42 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 
 	iters = cluster_undo_cleaner_main_loop_iters();
 	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_main_loop_iters", fmt_int64(iters));
+	emit_row(rsinfo, "undo_cleaner", "capacity_wait_entered",
+			 fmt_int64(cluster_undo_cleaner_capacity_wait_entered()));
+	emit_row(rsinfo, "undo_cleaner", "capacity_wait_repolled",
+			 fmt_int64(cluster_undo_cleaner_capacity_wait_repolled()));
+	emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_context",
+			 fmt_int64(cluster_undo_cleaner_capacity_wait_refused_context()));
+	emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_proof",
+			 fmt_int64(cluster_undo_cleaner_capacity_wait_refused_proof()));
+	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
+		UndoCleanerWorkerState row;
+		ClusterCtrcCleanerWorkerObservation observation;
+		char prefix[64];
+
+		if (!cluster_undo_cleaner_worker_snapshot(i, &row))
+			continue;
+		snprintf(prefix, sizeof(prefix), "undo.cleaner.worker.%u", i);
+		emit_row(rsinfo, prefix, "status", cluster_undo_cleaner_status_to_string(row.status));
+		emit_row(rsinfo, prefix, "status_enum_value", fmt_int32(row.status));
+		emit_row(rsinfo, prefix, "pid", fmt_int64(row.pid));
+		emit_row(rsinfo, prefix, "spawned_at", fmt_int64(row.spawned_at));
+		emit_row(rsinfo, prefix, "ready_at", fmt_int64(row.ready_at));
+		emit_row(rsinfo, prefix, "last_liveness_tick_at", fmt_int64(row.last_liveness_tick_at));
+		emit_row(rsinfo, prefix, "main_loop_iters", fmt_int64(row.main_loop_iters));
+		emit_row(rsinfo, prefix, "local_completed_passes", fmt_int64(row.local_completed_passes));
+		emit_row(rsinfo, prefix, "local_progress_events", fmt_int64(row.local_progress_events));
+		if (cluster_ctrc_cleaner_worker_observation(i, &observation)) {
+			emit_row(rsinfo, prefix, "dispatch_backlog", fmt_int64(observation.dispatch_backlog));
+			emit_row(rsinfo, prefix, "certificate_backlog",
+					 fmt_int64(observation.certificate_backlog));
+			emit_row(rsinfo, prefix, "pending_observed_age_ms",
+					 fmt_int64(observation.pending_observed_age_ms));
+			emit_row(rsinfo, prefix, "observed_at_us", fmt_int64(observation.observed_at_us));
+			emit_row(rsinfo, prefix, "reason",
+					 cluster_ctrc_cleaner_reason_name(observation.reason));
+		}
+	}
 }
 
 

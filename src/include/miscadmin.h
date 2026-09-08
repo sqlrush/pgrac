@@ -637,6 +637,16 @@ typedef enum {
 	LmsWorker6Process,
 	LmsWorker7Process,
 
+	/* One aux slot and BackendStatus row per terminal-supply worker.
+	 * Append only: existing process type identities must not move. */
+	UndoCleanerWorker1Process,
+	UndoCleanerWorker2Process,
+	UndoCleanerWorker3Process,
+	UndoCleanerWorker4Process,
+	UndoCleanerWorker5Process,
+	UndoCleanerWorker6Process,
+	UndoCleanerWorker7Process,
+
 #endif
 	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
@@ -659,7 +669,29 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmLmsProcess() (MyAuxProcType == LmsProcess)
 #define AmLmdProcess() (MyAuxProcType == LmdProcess)
 #define AmSinvalBcastProcess() (MyAuxProcType == SinvalBcastProcess)
-#define AmUndoCleanerProcess() (MyAuxProcType == UndoCleanerProcess)
+#define CLUSTER_UNDO_CLEANER_WORKER_TYPES 8
+
+static inline int
+ClusterUndoCleanerWorkerIdForType(AuxProcType type)
+{
+	if (type == UndoCleanerProcess)
+		return 0;
+	if (type >= UndoCleanerWorker1Process && type <= UndoCleanerWorker7Process)
+		return (int)(type - UndoCleanerWorker1Process) + 1;
+	return -1;
+}
+
+static inline AuxProcType
+ClusterUndoCleanerTypeForWorker(int worker)
+{
+	if (worker == 0)
+		return UndoCleanerProcess;
+	if (worker > 0 && worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES)
+		return (AuxProcType)(UndoCleanerWorker1Process + worker - 1);
+	return NotAnAuxProcess;
+}
+
+#define AmUndoCleanerProcess() (ClusterUndoCleanerWorkerIdForType(MyAuxProcType) >= 0)
 #define AmMrpProcess() (MyAuxProcType == MrpProcess)
 #define AmRfsProcess() (MyAuxProcType == RfsProcess)
 /*

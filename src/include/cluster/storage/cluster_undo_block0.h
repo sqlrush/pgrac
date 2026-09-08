@@ -153,6 +153,7 @@ StaticAssertDecl(offsetof(ClusterR4PrerequisiteSnapshot, grammar_fingerprint) ==
 extern ClusterUndoBlock0Result
 cluster_undo_block0_logical_slot(const ClusterUndoBlock0LogicalKey *logical, uint32 *slot);
 extern bool cluster_undo_block0_root_valid(const ClusterUndoBlock0ResolvedRoot *root);
+extern bool cluster_undo_block0_backend_has_resources(void);
 extern bool cluster_undo_block0_root_matches(const ClusterUndoBlock0ResolvedRoot *observed,
 											 const ClusterUndoBlock0ResolvedRoot *expected);
 extern bool cluster_undo_block0_generation_matches(const ClusterUndoBlock0Generation *observed,

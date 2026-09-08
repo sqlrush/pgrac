@@ -131,6 +131,13 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		break;
 	/* PGRAC (stage 3.13): Undo Cleaner aux process. */
 	case UndoCleanerProcess:
+	case UndoCleanerWorker1Process:
+	case UndoCleanerWorker2Process:
+	case UndoCleanerWorker3Process:
+	case UndoCleanerWorker4Process:
+	case UndoCleanerWorker5Process:
+	case UndoCleanerWorker6Process:
+	case UndoCleanerWorker7Process:
 		MyBackendType = B_UNDO_CLEANER;
 		break;
 	/* PGRAC (stage 2.6 Sprint A Step 3 D7): QVOTEC aux process. */
@@ -236,7 +243,7 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess
-		&& MyAuxProcType != SinvalBcastProcess && MyAuxProcType != UndoCleanerProcess
+		&& MyAuxProcType != SinvalBcastProcess && !AmUndoCleanerProcess()
 		&& MyAuxProcType != MrpProcess && MyAuxProcType != RfsProcess
 		&& !AmLmsWorkerProcess()) /* PGRAC: spec-7.3 D2 — workers skip like LMS */
 #endif
@@ -264,7 +271,7 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * pgstat-visible publication / any LMS/LMD shmem-LWLock-CV operation.
 	 */
 	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess
-		|| MyAuxProcType == SinvalBcastProcess || MyAuxProcType == UndoCleanerProcess
+		|| MyAuxProcType == SinvalBcastProcess || AmUndoCleanerProcess()
 		|| MyAuxProcType == MrpProcess || MyAuxProcType == RfsProcess
 		|| AmLmsWorkerProcess()) { /* PGRAC: spec-7.3 D2 — workers mirror LMS */
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -347,6 +354,13 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		proc_exit(1);
 	/* PGRAC (stage 3.13): Undo Cleaner aux process dispatch. */
 	case UndoCleanerProcess:
+	case UndoCleanerWorker1Process:
+	case UndoCleanerWorker2Process:
+	case UndoCleanerWorker3Process:
+	case UndoCleanerWorker4Process:
+	case UndoCleanerWorker5Process:
+	case UndoCleanerWorker6Process:
+	case UndoCleanerWorker7Process:
 		UndoCleanerMain();
 		proc_exit(1);
 	/* PGRAC (stage 2.6 Sprint A Step 3 D7): QVOTEC aux process dispatch.

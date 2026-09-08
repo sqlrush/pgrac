@@ -211,10 +211,33 @@ UT_TEST(test_lms_worker_aux_slots_reserved)
 }
 
 
+UT_TEST(test_cleaner_aux_pool_preserves_old_slots)
+{
+#ifdef USE_PGRAC_CLUSTER
+	/* The old enum ended after LMS worker7. A fixed cleaner pool requires
+	 * seven additional distinct auxiliary PGPROC slots, not one shared slot. */
+	UT_ASSERT_EQ(NUM_AUXPROCTYPES - LmsWorker7Process - 1, 7);
+	UT_ASSERT_EQ(NUM_AUXILIARY_PROCS, 32);
+	for (int i = 0; i < 8; i++) {
+		AuxProcType type = ClusterUndoCleanerTypeForWorker(i);
+
+		UT_ASSERT_EQ(ClusterUndoCleanerWorkerIdForType(type), i);
+		UT_ASSERT(type != NotAnAuxProcess);
+		if (i == 0)
+			UT_ASSERT_EQ(type, UndoCleanerProcess);
+		else
+			UT_ASSERT_EQ(type, LmsWorker7Process + i);
+	}
+	UT_ASSERT_EQ(ClusterUndoCleanerWorkerIdForType(LmsWorker7Process), -1);
+	UT_ASSERT_EQ(ClusterUndoCleanerTypeForWorker(8), NotAnAuxProcess);
+	UT_ASSERT_EQ(ClusterUndoCleanerTypeForWorker(-1), NotAnAuxProcess);
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_backend_num_types_is_32);
 	UT_RUN(test_pgrac_values_appended_after_wal_writer);
 	UT_RUN(test_pg_native_values_unchanged);
@@ -222,6 +245,7 @@ main(void)
 	UT_RUN(test_rfs_is_last);
 	UT_RUN(test_mrp_aux_proc_slot_is_reserved);
 	UT_RUN(test_lms_worker_aux_slots_reserved);
+	UT_RUN(test_cleaner_aux_pool_preserves_old_slots);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

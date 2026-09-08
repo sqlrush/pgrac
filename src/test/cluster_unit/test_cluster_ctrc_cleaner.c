@@ -1451,6 +1451,323 @@ UT_TEST(test_ack_batch_final_count_summary_and_identity_faults_are_isolated)
 	}
 }
 
+/* Compile the exact top-level batch body, keeping its real shared selection
+ * and finally cleanup. Only physical I/O/network leaves are fixture inputs. */
+static bool driver_other_progress;
+static bool driver_interrupt;
+
+static bool
+driver_no_receipt(void)
+{
+	return false;
+}
+
+static bool
+driver_no_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+static bool
+driver_no_terminal(const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	ClusterCtrcTerminalStatus *status pg_attribute_unused(), SCN *scn pg_attribute_unused())
+{
+	return false;
+}
+
+static void
+driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute_unused(),
+	Size count pg_attribute_unused())
+{
+	if (driver_other_progress)
+		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
+	if (driver_interrupt)
+		pg_re_throw();
+}
+
+bool ctrc_fixture_run_pass(void);
+#define cluster_ctrc_cleaner_run_pass ctrc_fixture_run_pass
+#define ctrc_cleaner_clean_next_receipt driver_no_receipt
+#define ctrc_cleaner_publish_certificate driver_no_certificate
+#define ctrc_cleaner_terminal_sample_exact driver_no_terminal
+#define cluster_gcs_ctrc_dispatch_batch driver_dispatch_boundary
+#ifndef CLUSTER_CTRC_DRIVER_BODY
+#define CLUSTER_CTRC_DRIVER_BODY "test_cluster_ctrc_run_pass.inc"
+#endif
+#include CLUSTER_CTRC_DRIVER_BODY
+#undef cluster_ctrc_cleaner_run_pass
+#undef ctrc_cleaner_clean_next_receipt
+#undef ctrc_cleaner_publish_certificate
+#undef ctrc_cleaner_terminal_sample_exact
+#undef cluster_gcs_ctrc_dispatch_batch
+
+static bool
+bind_test_worker(unsigned worker)
+{
+	return cluster_ctrc_cleaner_bind_worker(worker);
+}
+
+UT_TEST(test_cleaner_dispatch_has_one_canonical_segment_owner)
+{
+	static const unsigned segments[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 256 };
+	static const unsigned owners[] = { 0, 1, 2, 3, 4, 5, 6, 7, 0, 7 };
+
+	for (unsigned worker = 0; worker < 8; worker++) {
+		unsigned selected = 0;
+		unsigned expected = 0;
+		ClusterCtrcCloseDispatch dispatch;
+
+		reset_fixture();
+		for (unsigned i = 0; i < lengthof(segments); i++) {
+			seed_origin((segments[i] - 1) * TT_SLOTS_PER_SEGMENT, 1);
+			if (owners[i] == worker)
+				expected++;
+		}
+		UT_ASSERT(bind_test_worker(worker));
+		ctrc_dispatch_batch_collect();
+		CtrcBatch.active = true;
+		while (cluster_ctrc_origin_next_close_dispatch_shared(&dispatch)) {
+			unsigned i;
+
+			for (i = 0; i < lengthof(segments); i++)
+				if (segments[i] == dispatch.key.segment_id)
+					break;
+			UT_ASSERT(i < lengthof(segments));
+			UT_ASSERT_EQ(owners[i], worker);
+			selected++;
+		}
+		CtrcBatch.active = false;
+		UT_ASSERT_EQ(selected, expected);
+		for (unsigned i = 0; i < lengthof(segments); i++) {
+			ClusterCtrcOriginEntry *origin
+				= &ctrc_origin_entries()[(segments[i] - 1) * TT_SLOTS_PER_SEGMENT];
+
+			if (owners[i] != worker)
+				UT_ASSERT_EQ(origin->close_dispatched_bitmap, 0);
+		}
+	}
+}
+
+UT_TEST(test_ack_scan_does_not_advance_foreign_shard)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index, receipt_index, selected_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack_at(TT_SLOTS_PER_SEGMENT, &snapshot, &receipt, &ack,
+									&participant_index, &receipt_index));
+	ctrc_participant_entries()[participant_index].state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+	before = ctrc_participant_entries()[participant_index];
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(!ctrc_participant_find_ack_ready(&snapshot, &selected_index));
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_participant_entries()[participant_index], sizeof(before)),
+				 0);
+}
+
+UT_TEST(test_worker_binding_and_bad_keys_never_change_ownership)
+{
+	ClusterCtrcTxnKeyV1 key;
+
+	reset_fixture();
+	key = seed_origin(0, 0)->key;
+	UT_ASSERT(!bind_test_worker(8));
+	UT_ASSERT_EQ(CtrcWorkerId, -1);
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(!bind_test_worker(1));
+	UT_ASSERT(!bind_test_worker(UINT_MAX));
+	UT_ASSERT(ctrc_cleaner_owns_key(&key));
+	key.owner_instance = 0;
+	UT_ASSERT(!ctrc_cleaner_owns_key(&key));
+	key.owner_instance = 1;
+	key.segment_id = 0;
+	UT_ASSERT(!ctrc_cleaner_owns_key(&key));
+	key.segment_id = 257;
+	UT_ASSERT(!ctrc_cleaner_owns_key(&key));
+	key.segment_id = 1;
+	key.reserved[0] = 1;
+	UT_ASSERT(!ctrc_cleaner_owns_key(&key));
+	key.reserved[0] = 0;
+	/* A foreign origin's participant uses its canonical segment ordinal,
+	 * not this node's segment range or its slot number. */
+	key.owner_instance = 2;
+	key.origin_node_id = 1;
+	key.segment_id = 257;
+	UT_ASSERT(ctrc_cleaner_owns_key(&key));
+	key.segment_id = 258;
+	UT_ASSERT(!ctrc_cleaner_owns_key(&key));
+	UT_ASSERT_EQ(CtrcWorkerId, 0);
+}
+
+UT_TEST(test_open_and_certificate_scans_preserve_foreign_bytes)
+{
+	for (unsigned worker = 0; worker < 8; worker++) {
+		ClusterCtrcTxnKeyV1 selected;
+		ClusterCtrcOriginCertificateSnapshot certificate;
+		ClusterCtrcOriginEntry foreign[8];
+
+		reset_fixture();
+		for (unsigned i = 0; i < 8; i++) {
+			ClusterCtrcOriginEntry *origin = seed_origin(i * TT_SLOTS_PER_SEGMENT, 0);
+
+			origin->state = CTRC_ORIGIN_OPEN;
+			origin->seal_generation = 0;
+			foreign[i] = *origin;
+		}
+		UT_ASSERT(bind_test_worker(worker));
+		UT_ASSERT(cluster_ctrc_origin_next_open_shared(&selected));
+		UT_ASSERT_EQ(selected.segment_id, worker + 1);
+		for (unsigned i = 0; i < 8; i++)
+			UT_ASSERT_EQ(memcmp(&foreign[i], &ctrc_origin_entries()[i * TT_SLOTS_PER_SEGMENT],
+								sizeof(foreign[i])),
+						 0);
+		for (unsigned i = 0; i < 8; i++) {
+			ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[i * TT_SLOTS_PER_SEGMENT];
+
+			UT_ASSERT(cluster_ctrc_origin_begin_seal_entry(origin, 800 + i));
+			origin->state = CTRC_ORIGIN_CERTIFYING;
+			foreign[i] = *origin;
+		}
+		UT_ASSERT(ctrc_origin_next_certificate_snapshot_shared(&certificate));
+		UT_ASSERT_EQ(certificate.origin_index, worker * TT_SLOTS_PER_SEGMENT);
+		for (unsigned i = 0; i < 8; i++)
+			UT_ASSERT_EQ(memcmp(&foreign[i], &ctrc_origin_entries()[i * TT_SLOTS_PER_SEGMENT],
+								sizeof(foreign[i])),
+						 0);
+		/* An old-generation selected snapshot cannot certify its replacement. */
+		ctrc_origin_entries()[certificate.origin_index].key.segment_generation++;
+		UT_ASSERT(!ctrc_origin_certificate_snapshot_matches_shared(&certificate));
+	}
+}
+
+UT_TEST(test_receipt_and_ack_select_only_canonical_worker)
+{
+	for (unsigned worker = 0; worker < 8; worker++) {
+		ClusterCtrcParticipantEntry selected;
+		ClusterCtrcReceipt receipt;
+		uint64 participant_index, receipt_index;
+
+		reset_fixture();
+		for (unsigned i = 0; i < 8; i++) {
+			ClusterCtrcOriginEntry *origin = seed_origin(i * TT_SLOTS_PER_SEGMENT, 1);
+			ClusterCtrcParticipantEntry *participant;
+
+			UT_ASSERT(ctrc_participant_index(&origin->key, 0, &participant_index));
+			participant = &ctrc_participant_entries()[participant_index];
+			UT_ASSERT_EQ(cluster_ctrc_participant_open(participant, &origin->key,
+													   origin->grant_generation,
+													   &origin->touched[0]),
+						 CLUSTER_CTRC_PARTICIPANT_OPENED);
+			participant->state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+			participant->applied_count = participant->receipt_count = 1;
+			participant->seal_generation = origin->seal_generation;
+			ctrc_receipt_entries()[i].key = origin->key;
+			ctrc_receipt_entries()[i].publication.grant_generation = origin->grant_generation;
+			ctrc_receipt_entries()[i].state = CTRC_RECEIPT_APPLIED;
+		}
+		UT_ASSERT(bind_test_worker(worker));
+		UT_ASSERT(ctrc_cleaner_next_applied_receipt(&selected, &receipt, &participant_index,
+													&receipt_index));
+		UT_ASSERT_EQ(receipt.key.segment_id, worker + 1);
+		for (unsigned i = 0; i < 8; i++) {
+			ClusterCtrcParticipantEntry *participant;
+
+			UT_ASSERT(
+				ctrc_participant_index(&ctrc_receipt_entries()[i].key, 0, &participant_index));
+			participant = &ctrc_participant_entries()[participant_index];
+			participant->state = CTRC_PARTICIPANT_ACK_READY;
+			participant->applied_count = 0;
+			participant->cleaned_count = 1;
+		}
+		UT_ASSERT(ctrc_participant_find_ack_ready(&selected, &participant_index));
+		UT_ASSERT_EQ(selected.key.segment_id, worker + 1);
+	}
+}
+
+UT_TEST(test_foreign_progress_and_observations_cannot_drive_local_work)
+{
+	ClusterCtrcCleanerWorkerObservation row;
+	ClusterCtrcOriginEntry before;
+	uint64 global;
+
+	reset_fixture();
+	seed_origin(0, 1);
+	seed_origin(TT_SLOTS_PER_SEGMENT, 1);
+	UT_ASSERT(bind_test_worker(0));
+	ctrc_dispatch_batch_collect();
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_DISPATCH_BACKLOG), 2);
+	UT_ASSERT(cluster_ctrc_cleaner_worker_observation(0, &row));
+	UT_ASSERT_EQ(row.dispatch_backlog, 1);
+	/* Model the private address space of the second process, preserving all
+	 * shared rows. This is not a product rebind or a shared-owner handoff. */
+	CtrcWorkerId = -1;
+	CtrcLocalProgress = CtrcLocalPasses = 0;
+	UT_ASSERT(bind_test_worker(1));
+	ctrc_dispatch_batch_collect();
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_DISPATCH_BACKLOG), 2);
+	UT_ASSERT(cluster_ctrc_cleaner_worker_observation(1, &row));
+	UT_ASSERT_EQ(row.dispatch_backlog, 1);
+	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_reason_get(), CTRC_CLEANER_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_worker_reason(1), CTRC_CLEANER_REASON_RESOURCE_X);
+	global = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), global + 1);
+	ctrc_origin_entries()[0].state = CTRC_ORIGIN_SEALED;
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT(!ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[0]));
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 0);
+	ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT].state = CTRC_ORIGIN_SEALED;
+	ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT].close_confirmed_bitmap = 1;
+	ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT].close_dispatched_bitmap = 1;
+	UT_ASSERT(ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT]));
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), global + 2);
+	UT_ASSERT(!cluster_ctrc_cleaner_worker_observation(8, &row));
+}
+
+UT_TEST(test_actual_driver_ignores_other_progress_and_clears_error_batch)
+{
+	volatile bool caught = false;
+
+	reset_fixture();
+	driver_other_progress = true;
+	driver_interrupt = false;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 0);
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 1);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), 1);
+	seed_origin(0, 0);
+	UT_ASSERT(ctrc_fixture_run_pass());
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 1);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 2);
+	seed_origin(1, 0);
+	driver_interrupt = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_progress(), 2);
+	UT_ASSERT_EQ(cluster_ctrc_cleaner_local_passes(), 2);
+	UT_ASSERT(ctrc_bytes_zero(&CtrcBatch, sizeof(CtrcBatch)));
+	UT_ASSERT_EQ(held_count, 0);
+	driver_interrupt = driver_other_progress = false;
+}
+
 int
 main(void)
 {
@@ -1458,7 +1775,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(31);
+	UT_PLAN(38);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -1492,6 +1809,13 @@ main(void)
 	UT_RUN(test_real_ack_driver_independent_capture_and_final_drift_retain_one_key);
 	UT_RUN(test_real_ack_driver_exception_and_allocation_failure_never_publish);
 	UT_RUN(test_ack_batch_final_count_summary_and_identity_faults_are_isolated);
+	UT_RUN(test_cleaner_dispatch_has_one_canonical_segment_owner);
+	UT_RUN(test_ack_scan_does_not_advance_foreign_shard);
+	UT_RUN(test_worker_binding_and_bad_keys_never_change_ownership);
+	UT_RUN(test_open_and_certificate_scans_preserve_foreign_bytes);
+	UT_RUN(test_receipt_and_ack_select_only_canonical_worker);
+	UT_RUN(test_foreign_progress_and_observations_cannot_drive_local_work);
+	UT_RUN(test_actual_driver_ignores_other_progress_and_clears_error_batch);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

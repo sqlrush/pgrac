@@ -126,6 +126,19 @@ typedef enum ClusterCtrcCleanerReason
 	CTRC_CLEANER_REASON_COUNT
 } ClusterCtrcCleanerReason;
 
+#define CLUSTER_CTRC_CLEANER_WORKERS 8
+
+/* Scheduling observations only; neither a coherent authority snapshot nor
+ * permission to release a reference. Each row has one cleaner writer. */
+typedef struct ClusterCtrcCleanerWorkerObservation {
+	uint64 dispatch_backlog;
+	uint64 certificate_backlog;
+	uint64 pending_observed_age_ms;
+	uint64 observed_at_us;
+	uint32 reason;
+	uint32 reserved;
+} ClusterCtrcCleanerWorkerObservation;
+
 /* A single shared scheduling seam.  The phase value selects a safe point;
  * the seam never changes proof, receipt, ACK, certificate or verdict bytes. */
 typedef enum ClusterCtrcTestBarrierPhase
@@ -854,6 +867,12 @@ extern const char *cluster_ctrc_cleaner_reason_name(
 	ClusterCtrcCleanerReason reason);
 extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_reason_get(void);
 extern void cluster_ctrc_cleaner_reason_set(ClusterCtrcCleanerReason reason);
+extern bool cluster_ctrc_cleaner_bind_worker(unsigned worker_id);
+extern uint64 cluster_ctrc_cleaner_local_progress(void);
+extern uint64 cluster_ctrc_cleaner_local_passes(void);
+extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_worker_reason(unsigned worker_id);
+extern bool cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
+													ClusterCtrcCleanerWorkerObservation *out);
 extern bool cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot);
 extern bool cluster_ctrc_test_barrier_control(
 	ClusterCtrcTestBarrierPhase phase, bool armed);
@@ -946,6 +965,15 @@ extern bool cluster_ctrc_origin_next_close_dispatch_shared(
 	ClusterCtrcCloseDispatch *dispatch_out);
 extern bool cluster_ctrc_cleaner_run_pass(void);
 
+typedef enum ClusterCtrcCapacityProbeResult {
+	CLUSTER_CTRC_CAPACITY_REFUSE = 0,
+	CLUSTER_CTRC_CAPACITY_WAIT = 1,
+	CLUSTER_CTRC_CAPACITY_RETRY = 2
+} ClusterCtrcCapacityProbeResult;
+extern ClusterCtrcCapacityProbeResult
+cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch,
+									ClusterCtrcTxnKeyV1 *continuation);
+
 /*
  * L11/L12 canonical release sampler for the current allocator GC.  The
  * caller holds no allocator/page/CTRC lock.  Success means one exact local
@@ -953,6 +981,10 @@ extern bool cluster_ctrc_cleaner_run_pass(void);
  * the durable CTRC release bit set, a stable native terminal bracket and the
  * supplied horizon-fold epoch still current.  It never mutates block 0.
  */
+/* Read-only publication barrier, never terminal/release authority. The
+ * invalid slot sentinel checks all physical origins in the header. */
+extern bool cluster_ctrc_reuse_handoff_complete(const struct UndoSegmentHeaderData *header,
+												uint16 slot_offset);
 extern bool cluster_ctrc_terminal_release_sample_exact(
 	uint32 segment_id, uint16 slot_offset, TransactionId xid,
 	uint16 slot_wrap, uint8 terminal_status, SCN terminal_scn,

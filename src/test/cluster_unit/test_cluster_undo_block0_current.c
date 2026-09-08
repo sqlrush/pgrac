@@ -53,6 +53,17 @@ cluster_undo_block0_current_prove_strict_empty_exclusive(
 UT_DEFINE_GLOBALS();
 
 static char admission_log[512];
+static bool fake_handoff_pending;
+
+/* The real shared CTRC predicate is covered in test_cluster_ctrc_capacity;
+ * this boundary controls whether its publication handoff has completed. */
+bool
+cluster_ctrc_reuse_handoff_complete(const UndoSegmentHeaderData *header, uint16 slot_offset)
+{
+	UT_ASSERT_NOT_NULL(header);
+	UT_ASSERT_EQ(slot_offset, INVALID_TT_SLOT_OFFSET);
+	return !fake_handoff_pending;
+}
 static unsigned int admission_log_count;
 static unsigned int readiness_reads;
 
@@ -3049,6 +3060,13 @@ UT_TEST(test_live_owner_recycle_requires_release_on_every_committed_slot)
 	disk->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
 	resident = (UndoSegmentHeaderData *)fake_pin_page;
 	resident->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	fake_handoff_pending = true;
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_recycle_exact(&key, (SCN)100, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED);
+	UT_ASSERT_EQ(recycle_wal_calls, 0);
+	UT_ASSERT_EQ(flush_sync_calls, 0);
+	fake_handoff_pending = false;
 	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
 		&key, (SCN)100, fake_epoch, 1000),
 		CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);

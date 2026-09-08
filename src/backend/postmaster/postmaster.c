@@ -195,6 +195,7 @@
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_undo_cleaner.h"
 #endif
 
 #ifdef EXEC_BACKEND
@@ -335,7 +336,7 @@ static pid_t DiagPID = 0;
 
 /* PGRAC (stage 1.14 Sprint A): Cluster Stats aux process pid; same pattern. */
 static pid_t ClusterStatsPID = 0;
-static pid_t UndoCleanerPID = 0; /* PGRAC: spec-3.13 Undo Cleaner (ServerLoop-managed) */
+static pid_t UndoCleanerPIDs[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
 
 /* PGRAC (stage 2.5 Sprint A): CSSD aux process pid; same pattern. */
 static pid_t CssdPID = 0;
@@ -695,7 +696,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartLck() StartChildProcess(LckProcess)
 #define StartDiag() StartChildProcess(DiagProcess)
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
-#define StartUndoCleaner() StartChildProcess(UndoCleanerProcess) /* PGRAC: spec-3.13 */
+#define StartUndoCleaner(i) StartChildProcess(ClusterUndoCleanerTypeForWorker(i))
 #define StartCssd() StartChildProcess(CssdProcess)
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
@@ -2010,8 +2011,10 @@ ServerLoop(void)
 		 * recycling), so it has no startup gate, no wait-for-ready, and
 		 * no spawn-failure SQLSTATE.
 		 */
-		if (cluster_enabled && UndoCleanerPID == 0 && pmState == PM_RUN)
-			UndoCleanerPID = StartUndoCleaner();
+		if (cluster_enabled && pmState == PM_RUN)
+			for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+				if (UndoCleanerPIDs[i] == 0)
+					UndoCleanerPIDs[i] = StartUndoCleaner(i);
 
 		/*
 		 * PGRAC: spec-2.5 Sprint A — same ServerLoop respawn for CSSD
@@ -3006,8 +3009,9 @@ process_pm_reload_request(void)
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, SIGHUP);
 		/* PGRAC: spec-3.13 — same SIGHUP fan-out for Undo Cleaner. */
-		if (UndoCleanerPID != 0)
-			signal_child(UndoCleanerPID, SIGHUP);
+		for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+			if (UndoCleanerPIDs[i] != 0)
+				signal_child(UndoCleanerPIDs[i], SIGHUP);
 		if (CssdPID != 0)
 			signal_child(CssdPID, SIGHUP);
 		if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
@@ -3552,11 +3556,15 @@ process_pm_child_exit(void)
 			continue;
 		}
 		/* PGRAC: spec-3.13 — Undo Cleaner normal-exit harvest; ServerLoop respawns. */
-		if (pid == UndoCleanerPID) {
-			UndoCleanerPID = 0;
-			if (!EXIT_STATUS_0(exitstatus))
-				HandleChildCrash(pid, exitstatus, _("undo cleaner process"));
-			continue;
+		{
+			int worker = cluster_undo_cleaner_find_pid(UndoCleanerPIDs, pid);
+
+			if (worker >= 0) {
+				UndoCleanerPIDs[worker] = 0;
+				if (!EXIT_STATUS_0(exitstatus))
+					HandleChildCrash(pid, exitstatus, _("undo cleaner process"));
+				continue;
+			}
 		}
 		/*
 		 * PGRAC: stage 2.5 Sprint A — CSSD aux process exit handling
@@ -4058,10 +4066,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	else if (ClusterStatsPID != 0 && take_action)
 		sigquit_child(ClusterStatsPID);
 	/* PGRAC: spec-3.13 — same crash cross-kill for Undo Cleaner. */
-	if (pid == UndoCleanerPID)
-		UndoCleanerPID = 0;
-	else if (UndoCleanerPID != 0 && take_action)
-		sigquit_child(UndoCleanerPID);
+	for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
+		if (pid == UndoCleanerPIDs[i])
+			UndoCleanerPIDs[i] = 0;
+		else if (UndoCleanerPIDs[i] != 0 && take_action)
+			sigquit_child(UndoCleanerPIDs[i]);
+	}
 
 	/* PGRAC (stage 2.5 Sprint A): same pattern for CSSD. */
 	if (pid == CssdPID)
@@ -4312,8 +4322,9 @@ PostmasterStateMachine(void)
 			}
 
 			/* PGRAC: spec-3.13 — same shutdown SIGTERM for Undo Cleaner. */
-			if (UndoCleanerPID != 0)
-				signal_child(UndoCleanerPID, SIGTERM);
+			for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+				if (UndoCleanerPIDs[i] != 0)
+					signal_child(UndoCleanerPIDs[i], SIGTERM);
 			/* spec-1.13 Q10 LIFO: DIAG next. */
 			if (DiagPID != 0)
 				signal_child(DiagPID, SIGTERM);
@@ -4388,7 +4399,8 @@ PostmasterStateMachine(void)
 			((cluster_lmon_reconfig_suppressed() && !FatalError && Shutdown > NoShutdown
 			  && Shutdown < ImmediateShutdown)
 			 || (LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
-				 && LmsWorkersAllReaped())) &&
+				 && LmsWorkersAllReaped()))
+			&&
 			/* PGRAC: spec-1.12 Sprint A — same wait for LCK (codex
 			 * round 3 P2.3 preempted in 1.12). */
 			LckPID == 0 &&
@@ -4397,7 +4409,7 @@ PostmasterStateMachine(void)
 			/* PGRAC: spec-1.14 Sprint A — same wait for Cluster Stats. */
 			ClusterStatsPID == 0 &&
 			/* PGRAC: spec-3.13 — same wait for Undo Cleaner. */
-			UndoCleanerPID == 0 &&
+			cluster_undo_cleaner_all_reaped(UndoCleanerPIDs) &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
 			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
@@ -4766,8 +4778,9 @@ TerminateChildren(int signal)
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, signal);
 		/* PGRAC: spec-3.13 — same TerminateChildren for Undo Cleaner. */
-		if (UndoCleanerPID != 0)
-			signal_child(UndoCleanerPID, signal);
+		for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+			if (UndoCleanerPIDs[i] != 0)
+				signal_child(UndoCleanerPIDs[i], signal);
 		if (CssdPID != 0)
 			signal_child(CssdPID, signal);
 		if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */

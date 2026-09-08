@@ -232,6 +232,16 @@ typedef struct ClusterR4Bit22CutoverSeamShmem {
 
 static ClusterR4Bit22CutoverSeamShmem *SemanticActivationBit22Seam = NULL;
 static uint32 semantic_activation_local_inflight[2][64];
+
+bool
+cluster_semantic_activation_backend_has_admission(void)
+{
+	for (unsigned side = 0; side < lengthof(semantic_activation_local_inflight); side++)
+		for (unsigned bit = 0; bit < lengthof(semantic_activation_local_inflight[side]); bit++)
+			if (semantic_activation_local_inflight[side][bit] != 0)
+				return true;
+	return false;
+}
 static int semantic_activation_exit_hook_pid;
 static uint64 semantic_activation_lmon_record_read_seq;
 static uint64 semantic_activation_lmon_pgrd_request_seq;

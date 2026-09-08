@@ -2372,6 +2372,9 @@ UT_TEST(test_ctrc_release_overlap_progress_is_event_driven_without_xcur_churn)
 		"*out_work_remaining = ctrc_local_progress;"));
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
+		"CtrcLocalProgress != progress_before"));
+	UT_ASSERT(!source_file_contains(
+		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) != progress_before"));
 	UT_ASSERT(!source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",

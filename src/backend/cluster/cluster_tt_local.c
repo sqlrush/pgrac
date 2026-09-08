@@ -266,6 +266,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		uint32 seg;
 		uint16 off;
 		uint16 wrap;
+		ClusterCtrcTxnKeyV1 capacity_continuation = { 0 };
 
 		for (;;) {
 			bool retained_pressure = false;
@@ -332,6 +333,10 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 					long cleaner_tick_age_ms
 						= cleaner_tick > 0 ? (long)((GetCurrentTimestamp() - cleaner_tick) / 1000)
 										   : -1;
+
+					if (at_hard_cap
+						&& cluster_undo_cleaner_wait_for_capacity(seg, &capacity_continuation))
+						continue;
 
 					ereport(
 						ERROR,

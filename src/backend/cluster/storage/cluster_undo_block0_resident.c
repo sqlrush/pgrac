@@ -89,6 +89,12 @@ typedef struct ClusterUndoBlock0OwnedResource {
 } ClusterUndoBlock0OwnedResource;
 
 static dlist_head Block0OwnedResources = DLIST_STATIC_INIT(Block0OwnedResources);
+
+bool
+cluster_undo_block0_backend_has_resources(void)
+{
+	return !dlist_is_empty(&Block0OwnedResources);
+}
 static bool Block0ResourceCallbackRegistered = false;
 
 #define BLOCK0_FRAME_DATA(i) (Block0Frames + ((Size)(i)) * BLCKSZ)

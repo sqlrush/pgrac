@@ -336,6 +336,7 @@ cluster_semantic_activation_resource_x_peer_open_check(
 	uint32 sampled_capability_generation);
 extern bool cluster_semantic_activation_restore_open_proof_if_active(void);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
+extern bool cluster_semantic_activation_backend_has_admission(void);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_modifier_enter(bool writable_admission,
 									   ClusterSemanticAdmissionToken *token);

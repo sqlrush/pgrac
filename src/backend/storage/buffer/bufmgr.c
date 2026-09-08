@@ -4156,6 +4156,24 @@ static int32 PrivateRefCountOverflowed = 0;
 static uint32 PrivateRefCountClock = 0;
 static PrivateRefCountEntry *ReservedRefCountEntry = NULL;
 
+#ifdef USE_PGRAC_CLUSTER
+/* A capacity waiter must not retain even an unrelated buffer pin: the
+ * coordinator may need it before reaching the selected slot's GC work. */
+bool
+cluster_buffer_backend_has_pins(void)
+{
+	if (PrivateRefCountOverflowed != 0)
+		return true;
+	for (unsigned i = 0; i < lengthof(PrivateRefCountArray); i++)
+		if (PrivateRefCountArray[i].refcount != 0)
+			return true;
+	for (int i = 0; i < NLocBuffer; i++)
+		if (LocalRefCount == NULL || LocalRefCount[i] != 0)
+			return true;
+	return false;
+}
+#endif
+
 static void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);

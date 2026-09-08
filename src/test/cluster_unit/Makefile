@@ -33,6 +33,7 @@ endif
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity \
         test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -339,7 +340,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_cr_native_origin test_cluster_tt_abort
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
-		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt,$(SIMPLE_TESTS))
+		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -2076,6 +2078,8 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_ctrc_dispatch.inc \
+		test_cluster_ctrc_run_pass.inc \
+		test_cluster_undo_cleaner_holds.inc \
 		$(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(CLUSTER_QVOTEC_PGSA_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_TEST_O) \
 		$(CLUSTER_XLOG_INSERT_END_TEST_O) \
@@ -3527,7 +3531,43 @@ CLUSTER_CTRC_TEST_O = test_cluster_terminal_ref_census_product.o
 
 # Shared selectors/reply consumers must not use the dependency-light
 # CLUSTER_CTRC_UNIT_TEST variant, which removes the real driver paths.
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c unit_test.h \
+test_cluster_backend_types: $(top_srcdir)/src/include/miscadmin.h \
+	$(top_srcdir)/src/include/storage/proc.h
+
+test_cluster_undo_cleaner_holds.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_current.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_resident.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_(buffer_backend_has_pins|undo_block0_current_backend_has_guards|undo_block0_backend_has_resources|semantic_activation_backend_has_admission)\(/ \
+	     { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } \
+	     END { if (count != 4) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cluster_undo_cleaner_holds.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/miscadmin.h unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+test_cluster_ctrc_run_pass.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^cluster_ctrc_cleaner_run_pass\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+	$(top_srcdir)/src/include/miscadmin.h
+
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -3547,7 +3587,7 @@ test_cluster_ctrc_dispatch.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_bl
 	     END { if (prepare != 1 || local != 1 || single != 1 || batch != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ctrc_dispatch: test_cluster_ctrc_dispatch.c test_cluster_ctrc_cleaner.c \
+test_cluster_ctrc_dispatch: test_cluster_ctrc_dispatch.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_dispatch.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \

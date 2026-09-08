@@ -107,6 +107,7 @@ StaticAssertDecl(sizeof(ClusterUndoBlock0LiveOwnerPublication) == 192,
 				 "live-owner publication receipt ABI must remain 192 bytes");
 
 extern void cluster_undo_block0_current_init(void);
+extern bool cluster_undo_block0_current_backend_has_guards(void);
 extern void cluster_undo_block0_current_ensure_exit_hooks(void);
 extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin(
 	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode, int timeout_ms,

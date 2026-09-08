@@ -148,6 +148,9 @@ extern PGDLLIMPORT char *BufferBlocks;
 
 /* in localbuf.c */
 extern PGDLLIMPORT int NLocBuffer;
+#ifdef USE_PGRAC_CLUSTER
+extern bool cluster_buffer_backend_has_pins(void);
+#endif
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
 
