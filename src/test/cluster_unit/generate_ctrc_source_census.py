@@ -271,6 +271,7 @@ _classify_owners(
     "src/backend/cluster/cluster_gcs_block.c",
     (
         "cluster_gcs_ctrc_dispatch_close",
+        "gcs_ctrc_dispatch_prepare",
         "gcs_block_try_ctrc_forward136",
         "gcs_block_try_land_ctrc_reply",
     ),

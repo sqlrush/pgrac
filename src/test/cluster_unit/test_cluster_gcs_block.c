@@ -4810,13 +4810,27 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 
 UT_TEST(test_ctrc_forward_and_reply_use_closed_internal_gcs_domain)
 {
-	static const char *const dispatch_contract[] = {
-		"cluster_sf_peer_capability_generation_matches(",
-		"cluster_ctrc_seal_request_encode(",
-		"dispatch->suboperation",
-		"cluster_ctrc_origin_note_certificate_reply_shared(",
-		"cluster_lms_outbound_enqueue_cap_bound("
-	};
+	static const char *const prepare_contract[]
+		= { "cluster_membership_is_member(",
+			"cluster_semantic_activation_enter_r4_terminal_census(",
+			"cluster_sf_peer_capability_generation_matches(",
+			"cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(",
+			"cluster_semantic_activation_recheck_r4_terminal_census(",
+			"cluster_ctrc_seal_request_encode(" };
+	static const char *const dispatch_contract[]
+		= { "gcs_ctrc_dispatch_prepare(", "dispatch->suboperation",
+			"cluster_ctrc_origin_note_certificate_reply_shared(",
+			"cluster_lms_outbound_enqueue_cap_bound(" };
+	static const char *const batch_contract[]
+		= { "PG_TRY()",
+			"gcs_ctrc_dispatch_prepare(",
+			"cluster_semantic_activation_recheck_r4_terminal_census(",
+			"cluster_ctrc_participant_certificate_batch_shared(",
+			"cluster_semantic_activation_recheck_r4_terminal_census(",
+			"cluster_ctrc_origin_note_certificate_reply_shared(",
+			"PG_FINALLY()",
+			"cluster_semantic_activation_leave(",
+			"pfree(" };
 	static const char *const forward_contract[] = {
 		"cluster_ctrc_seal_request_decode(",
 		"cluster_semantic_activation_enter_r4_terminal_census(",
@@ -4844,10 +4858,16 @@ UT_TEST(test_ctrc_forward_and_reply_use_closed_internal_gcs_domain)
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
+	assert_ordered_in_function(source, "\ngcs_ctrc_dispatch_prepare(",
+							   "\nbool\ncluster_gcs_ctrc_dispatch_close(", prepare_contract,
+							   lengthof(prepare_contract));
 	assert_ordered_in_function(
 		source, "\ncluster_gcs_ctrc_dispatch_close(",
 		"\nstatic bool\ngcs_block_try_land_ctrc_reply(",
 		dispatch_contract, lengthof(dispatch_contract));
+	assert_ordered_in_function(source, "\ngcs_ctrc_dispatch_local_certificates(",
+							   "\nvoid\ncluster_gcs_ctrc_dispatch_batch(", batch_contract,
+							   lengthof(batch_contract));
 	assert_ordered_in_function(
 		source, "\ngcs_block_try_ctrc_forward136(",
 		"\nstatic bool\ngcs_block_try_current_mx_forward128(",

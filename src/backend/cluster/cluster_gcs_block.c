@@ -17978,25 +17978,22 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
  * queues.  The correlation is armed in CTRC shared state before this call;
  * an enqueue refusal leaves the same request id available for idempotent
  * retry on the next cleaner pass. */
-bool
-cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
+/* The caller owns every entered token, including a refused prepare. */
+static bool
+gcs_ctrc_dispatch_prepare(const ClusterCtrcCloseDispatch *dispatch,
+						  ClusterSemanticAdmissionToken *admission, uint8 *request)
 {
-	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
-	BufferTag route_tag;
-	uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
 	uint64 participant_incarnation = 0;
 	uint64 participant_observed_generation = 0;
 	uint64 self_incarnation;
 	uint32 required_capabilities
 		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
 		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
-	int worker_id;
-	bool dispatched = false;
 	bool participant_current;
 
-	MemSet(&admission, 0, sizeof(admission));
+	MemSet(admission, 0, sizeof(*admission));
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
 	if (dispatch == NULL || dispatch->reserved32 != 0
@@ -18027,12 +18024,10 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 		return false;
 
 	self_incarnation = cluster_qvotec_get_self_incarnation();
-	if (self_incarnation == 0
-		|| self_incarnation != dispatch->key.origin_boot_incarnation
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-		   != self_incarnation
-		|| cluster_semantic_activation_enter_r4_terminal_census(&admission)
-		   != CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (self_incarnation == 0 || self_incarnation != dispatch->key.origin_boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_incarnation
+		|| cluster_semantic_activation_enter_r4_terminal_census(admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return false;
 
 	/* A local participant has no peer HELLO record.  Its receipt identity is
@@ -18041,14 +18036,13 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 	 * running binary.  Remote participants retain the exact observed-slot and
 	 * HELLO-generation fence. */
 	if (dispatch->participant.node_id == (uint16)cluster_node_id)
-		participant_current
-			= admission.record_generation != 0
-			  && admission.record_generation <= (uint64)PG_UINT32_MAX
-			  && dispatch->participant.capability_record_generation
-				 == (uint32)admission.record_generation
-			  && dispatch->participant.boot_incarnation == self_incarnation
-			  && (cluster_ic_local_capability_word()
-				  & required_capabilities) == required_capabilities;
+		participant_current = admission->record_generation != 0
+							  && admission->record_generation <= (uint64)PG_UINT32_MAX
+							  && dispatch->participant.capability_record_generation
+									 == (uint32)admission->record_generation
+							  && dispatch->participant.boot_incarnation == self_incarnation
+							  && (cluster_ic_local_capability_word() & required_capabilities)
+									 == required_capabilities;
 	else
 		participant_current
 			= cluster_reconfig_get_observed_slot(
@@ -18067,32 +18061,35 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 				dispatch->participant.node_id, required_capabilities,
 				dispatch->participant.capability_record_generation);
 	if (!participant_current)
-	{
-		cluster_semantic_activation_leave(&admission);
 		return false;
-	}
 
 	logical.owner_instance = dispatch->key.owner_instance;
 	logical.segment_id = dispatch->key.segment_id;
-	if (admission.formation_epoch == dispatch->key.formation_epoch
-		&& admission.record_generation
-		   == dispatch->key.admission_record_generation
-		&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-			&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			logical.owner_instance, logical.segment_id, &root)
-		&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		&& root.root_id == dispatch->key.root_id
-		&& root.root_generation == dispatch->key.root_generation
-		&& dispatch->key.root_descriptor_incarnation
-		   == root.root_generation
-		&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-		&& cluster_ctrc_seal_request_encode(
-			&dispatch->key, dispatch->request_id,
-			dispatch->grant_generation, dispatch->seal_generation,
-			dispatch->participant.capability_record_generation,
-			(ClusterCtrcSealSuboperation)dispatch->suboperation,
-			request, sizeof(request)))
-	{
+	return admission->formation_epoch == dispatch->key.formation_epoch
+		   && admission->record_generation == dispatch->key.admission_record_generation
+		   && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+			   admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+			   logical.segment_id, &root)
+		   && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		   && root.root_id == dispatch->key.root_id
+		   && root.root_generation == dispatch->key.root_generation
+		   && dispatch->key.root_descriptor_incarnation == root.root_generation
+		   && cluster_semantic_activation_recheck_r4_terminal_census(admission)
+		   && cluster_ctrc_seal_request_encode(
+			   &dispatch->key, dispatch->request_id, dispatch->grant_generation,
+			   dispatch->seal_generation, dispatch->participant.capability_record_generation,
+			   (ClusterCtrcSealSuboperation)dispatch->suboperation, request,
+			   CLUSTER_CTRC_SEAL_REQUEST_BYTES);
+}
+
+bool
+cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
+{
+	ClusterSemanticAdmissionToken admission;
+	uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+	bool dispatched = false;
+
+	if (gcs_ctrc_dispatch_prepare(dispatch, &admission, request)) {
 		if (dispatch->participant.node_id == (uint16)cluster_node_id)
 		{
 			ClusterCtrcLocalReleaseAckV1 ack;
@@ -18125,11 +18122,12 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 		}
 		else
 		{
-			route_tag = GcsBlockCurrentMxRouteTagMake(
-				dispatch->request_id, dispatch->key.cluster_epoch,
-				cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
-			worker_id = cluster_lms_shard_for_tag(
-				&route_tag, cluster_lms_workers);
+			BufferTag route_tag
+				= GcsBlockCurrentMxRouteTagMake(dispatch->request_id, dispatch->key.cluster_epoch,
+												cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
+			int worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+			uint32 required_capabilities
+				= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 			dispatched = worker_id >= 0
 				&& worker_id < cluster_lms_workers
 				&& cluster_lms_outbound_enqueue_cap_bound(
@@ -18139,8 +18137,103 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 					dispatch->participant.capability_record_generation);
 		}
 	}
-	cluster_semantic_activation_leave(&admission);
+	if (admission.entered)
+		cluster_semantic_activation_leave(&admission);
 	return dispatched;
+}
+
+static void
+gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches, Size count)
+{
+	ClusterSemanticAdmissionToken *admissions;
+	ClusterCtrcCloseDispatch accepted[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	ClusterCtrcSealReplyResult results[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	Size accepted_to_input[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	Size accepted_count = 0;
+
+	/* Same physical slot twice must retain the original serial ordering. */
+	for (Size i = 0; i < count; i++)
+		for (Size j = 0; j < i; j++)
+			if (dispatches[i].key.segment_id == dispatches[j].key.segment_id
+				&& dispatches[i].key.slot_offset == dispatches[j].key.slot_offset) {
+				for (Size k = 0; k < count; k++)
+					(void)cluster_gcs_ctrc_dispatch_close(&dispatches[k]);
+				return;
+			}
+	admissions = palloc_extended(count * sizeof(*admissions), MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (admissions == NULL) {
+		for (Size i = 0; i < count; i++)
+			(void)cluster_gcs_ctrc_dispatch_close(&dispatches[i]);
+		return;
+	}
+	/* Token state is in owned heap storage, not an indeterminate automatic
+	 * object after longjmp. Even an ERROR in prepare is paired with leave. */
+	PG_TRY();
+	{
+		for (Size i = 0; i < count; i++) {
+			uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+
+			if (!gcs_ctrc_dispatch_prepare(&dispatches[i], &admissions[i], request)) {
+				if (admissions[i].entered)
+					cluster_semantic_activation_leave(&admissions[i]);
+				continue;
+			}
+			accepted[accepted_count] = dispatches[i];
+			accepted_to_input[accepted_count++] = i;
+		}
+		/* Each token was rechecked in the original prepare. Recheck again at
+		 * this batch's use boundary; do not borrow the first member's token. */
+		for (Size i = 0; i < accepted_count;) {
+			if (cluster_semantic_activation_recheck_r4_terminal_census(
+					&admissions[accepted_to_input[i]])) {
+				i++;
+				continue;
+			}
+			cluster_semantic_activation_leave(&admissions[accepted_to_input[i]]);
+			accepted_count--;
+			memmove(&accepted[i], &accepted[i + 1], (accepted_count - i) * sizeof(accepted[0]));
+			memmove(&accepted_to_input[i], &accepted_to_input[i + 1],
+					(accepted_count - i) * sizeof(accepted_to_input[0]));
+		}
+		if (accepted_count != 0
+			&& cluster_ctrc_participant_certificate_batch_shared(accepted, accepted_count, results))
+			for (Size i = 0; i < accepted_count; i++)
+				if (cluster_semantic_activation_recheck_r4_terminal_census(
+						&admissions[accepted_to_input[i]]))
+					(void)cluster_ctrc_origin_note_certificate_reply_shared(
+						accepted[i].request_id, accepted[i].participant.node_id, results[i]);
+	}
+	PG_FINALLY();
+	{
+		for (Size i = 0; i < count; i++)
+			if (admissions[i].entered)
+				cluster_semantic_activation_leave(&admissions[i]);
+		pfree(admissions);
+	}
+	PG_END_TRY();
+}
+
+void
+cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count)
+{
+	if (dispatches == NULL || count > CLUSTER_CTRC_RECLAIM_BATCH_MAX)
+		return;
+	for (Size i = 0; i < count;) {
+		Size end = i;
+
+		/* Do not move a certificate across another operation. A run is the
+		 * maximal contiguous local-certificate subsequence in the old order. */
+		while (end < count && dispatches[end].suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+			   && cluster_node_id >= 0
+			   && dispatches[end].participant.node_id == (uint16)cluster_node_id)
+			end++;
+		if (end == i) {
+			(void)cluster_gcs_ctrc_dispatch_close(&dispatches[i++]);
+			continue;
+		}
+		gcs_ctrc_dispatch_local_certificates(&dispatches[i], end - i);
+		i = end;
+	}
 }
 
 /* CTRC status 30 uses the legacy-sized outer carriage but has no backend

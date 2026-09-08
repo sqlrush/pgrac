@@ -980,6 +980,22 @@ extern bool cluster_ctrc_receipt_reclaim_frozen_table_locked(
 	const ClusterCtrcTxnKeyV1 *key, uint64 expected_receipt_count,
 	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count,
 	Size *reclaimed_count_out);
+#define CLUSTER_CTRC_RECLAIM_BATCH_MAX 64
+/* Call-local work only; not a shared, durable, or wire authority record. */
+typedef struct ClusterCtrcReclaimWork {
+	ClusterCtrcTxnKeyV1 key;
+	uint64 expected_count;
+	Size found;
+	bool reclaimed;
+} ClusterCtrcReclaimWork;
+extern bool cluster_ctrc_receipts_reclaim_batch_locked(ClusterCtrcReclaimWork *work,
+													   Size work_count,
+													   ClusterCtrcReceipt *receipts,
+													   uint8 *probe_states, Size receipt_count);
+/* Caller has authenticated each local certificate request separately. */
+extern bool
+cluster_ctrc_participant_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
+												  Size count, ClusterCtrcSealReplyResult *results);
 extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared(
 	const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *identity,

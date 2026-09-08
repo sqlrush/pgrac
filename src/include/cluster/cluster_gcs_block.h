@@ -4687,6 +4687,7 @@ extern void cluster_gcs_block_on_epoch_advance_exact(
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
 extern bool cluster_gcs_ctrc_dispatch_close(
 	const ClusterCtrcCloseDispatch *dispatch);
+extern void cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count);
 
 
 /* ============================================================

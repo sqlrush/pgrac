@@ -2299,9 +2299,8 @@ UT_TEST(test_ctrc_existing_undo_cleaner_owns_terminal_seal_progress)
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"cluster_ctrc_origin_begin_seal_shared(&key)"));
-	UT_ASSERT(source_file_contains(
-		"src/backend/cluster/cluster_terminal_ref_census.c",
-		"cluster_gcs_ctrc_dispatch_close(&dispatch)"));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "cluster_gcs_ctrc_dispatch_batch(dispatches, dispatch_count)"));
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"cluster_undo_block0_current_acquire_begin_ctrc_release("));
@@ -2354,7 +2353,7 @@ UT_TEST(test_ctrc_release_overlap_progress_is_event_driven_without_xcur_churn)
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);\n"
-		"\t\tcluster_undo_cleaner_wakeup();"));
+		"\t\t\t\tcluster_undo_cleaner_wakeup();"));
 	UT_ASSERT(source_file_contains(
 		"src/backend/cluster/cluster_terminal_ref_census.c",
 		"RELEASE_PROVEN still needs the participant-summary notification"));
