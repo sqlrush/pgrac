@@ -31,7 +31,11 @@
 static unsigned spin_acquisitions;
 static unsigned sleepable_acquisitions;
 static unsigned held_count;
-static const void *held_locks[2];
+static const void *held_locks[10];
+static const void *last_participant_lock;
+static LWLockMode last_pool_mode;
+static const void *paused_actor_locks[10];
+static unsigned paused_actor_count;
 static void test_lock_enter(const void *lock, bool sleepable);
 static void test_lock_leave(const void *lock);
 
@@ -58,7 +62,11 @@ pg_attribute_unused() test_spin_release(volatile slock_t *lock)
 
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
 static Size table_visits[4];
-#define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) (table_visits[(kind)]++)
+static Size shared_validation_writer_visits;
+static void test_table_visit(unsigned kind);
+static void test_pool_upgrade(void);
+#define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) test_table_visit(kind)
+#define CLUSTER_CTRC_TEST_POOL_UPGRADE() test_pool_upgrade()
 #define clock_gettime test_clock_gettime
 #include "../../backend/cluster/cluster_terminal_ref_census.c"
 #undef clock_gettime
@@ -86,6 +94,7 @@ static unsigned flush_calls, durability_calls, barrier_calls;
 static XLogRecPtr test_flush_lsn;
 static void (*durability_hook)(unsigned call);
 static void (*barrier_hook)(void);
+static void (*pool_upgrade_hook)(void);
 
 void *
 palloc_extended(Size size, int flags)
@@ -169,13 +178,25 @@ pg_usleep(long microsec)
 static void
 test_lock_enter(const void *lock, bool sleepable)
 {
-	if (CtrcShared == NULL || held_count >= lengthof(held_locks)
-		|| (lock != &CtrcShared->origin_lock && lock != &CtrcShared->participant_lock
-			&& lock != &CtrcShared->receipt_lock)
+	int shard = -1;
+	int previous_shard = -1;
+
+	if (CtrcShared == NULL || held_count >= lengthof(held_locks))
+		abort();
+	for (unsigned i = 0; i < paused_actor_count; i++)
+		if (lock == paused_actor_locks[i])
+			abort();
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
+		if (lock == &CtrcShared->participant_locks[i].lock)
+			shard = i;
+		if (held_count != 0 && held_locks[held_count - 1] == &CtrcShared->participant_locks[i].lock)
+			previous_shard = i;
+	}
+	if ((shard < 0 && lock != &CtrcShared->origin_lock && lock != &CtrcShared->receipt_lock)
 		|| (held_count != 0
-			&& (lock != &CtrcShared->receipt_lock
-				|| (held_locks[0] != &CtrcShared->origin_lock
-					&& held_locks[0] != &CtrcShared->participant_lock))))
+			&& (held_locks[held_count - 1] == &CtrcShared->receipt_lock
+				|| (lock != &CtrcShared->receipt_lock
+					&& (previous_shard < 0 || shard <= previous_shard)))))
 		abort();
 	held_locks[held_count++] = lock;
 	if (sleepable)
@@ -192,6 +213,22 @@ test_lock_leave(const void *lock)
 	held_locks[--held_count] = NULL;
 }
 
+static void
+test_table_visit(unsigned kind)
+{
+	table_visits[kind]++;
+	if (kind == 0 && held_count != 0 && held_locks[held_count - 1] == &CtrcShared->receipt_lock
+		&& last_pool_mode == LW_EXCLUSIVE)
+		shared_validation_writer_visits++;
+}
+
+static void
+test_pool_upgrade(void)
+{
+	if (pool_upgrade_hook != NULL)
+		pool_upgrade_hook();
+}
+
 void
 LWLockInitialize(LWLock *lock, int tranche_id)
 {
@@ -202,8 +239,12 @@ LWLockInitialize(LWLock *lock, int tranche_id)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	if (mode != LW_EXCLUSIVE)
+	if (mode != LW_EXCLUSIVE && mode != LW_SHARED)
 		abort();
+	if (lock->tranche == LWTRANCHE_CLUSTER_CTRC_PARTICIPANT)
+		last_participant_lock = lock;
+	if (lock == &CtrcShared->receipt_lock)
+		last_pool_mode = mode;
 	test_lock_enter(lock, true);
 	return true;
 }
@@ -309,6 +350,8 @@ reset_fixture(void)
 	test_flush_lsn = 0;
 	durability_hook = NULL;
 	barrier_hook = NULL;
+	pool_upgrade_hook = NULL;
+	paused_actor_count = 0;
 	InterruptPending = 0;
 }
 
@@ -751,24 +794,19 @@ UT_TEST(test_certificate_scan_bounds_unpublished_candidates)
 /* Build one real pending receipt, cancel it without publishing a page
  * reference, then close and encode its actual nonempty ACK. The fixture
  * owns no disk or page I/O and must not claim durability of an applied row. */
-static bool
-seed_cancelled_ack_at(unsigned origin_index, ClusterCtrcParticipantEntry *snapshot,
-					  ClusterCtrcReceipt *receipt, ClusterCtrcLocalReleaseAckV1 *ack,
-					  uint64 *participant_index, uint64 *receipt_index)
+static ClusterCtrcPrepareResult
+prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
+						ClusterCtrcReceiptHandle *handle)
 {
-	ClusterCtrcOriginEntry *origin = seed_origin(origin_index, 1);
 	ClusterCtrcPublicationIdV1 publication = { 0 };
 	ClusterCtrcTargetV1 target = { 0 };
-	ClusterCtrcReceiptHandle handle;
-	ClusterCtrcParticipantEntry *participant;
-	ClusterCtrcDurability durability = { 0 };
 
 	publication.requester_node_id = 0;
 	publication.requester_boot_incarnation = origin->touched[0].boot_incarnation;
 	publication.capability_record_generation = origin->touched[0].capability_record_generation;
 	publication.requester_backend_id = 11;
 	publication.wire_request_id = 101;
-	publication.operation_id = 81;
+	publication.operation_id = operation_id;
 	publication.attempt_generation = 1;
 	publication.member_ordinal = UINT16_MAX;
 	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
@@ -785,11 +823,22 @@ seed_cancelled_ack_at(unsigned origin_index, ClusterCtrcParticipantEntry *snapsh
 	target.relation_persistence = 'p';
 	target.needs_wal = true;
 	target.page_operation_kind = 1;
-	if (cluster_ctrc_receipt_prepare_shared(&origin->key, &origin->touched[0],
-											origin->grant_generation, &publication, &target,
-											&handle)
-			!= CLUSTER_CTRC_PREPARE_READY
-		|| !handle.valid || !cluster_ctrc_receipt_cancel_shared(&handle)
+	return cluster_ctrc_receipt_prepare_shared(
+		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
+}
+
+static bool
+seed_cancelled_ack_at(unsigned origin_index, ClusterCtrcParticipantEntry *snapshot,
+					  ClusterCtrcReceipt *receipt, ClusterCtrcLocalReleaseAckV1 *ack,
+					  uint64 *participant_index, uint64 *receipt_index)
+{
+	ClusterCtrcOriginEntry *origin = seed_origin(origin_index, 1);
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcDurability durability = { 0 };
+
+	if (prepare_fixture_receipt(origin, 81, &handle) != CLUSTER_CTRC_PREPARE_READY || !handle.valid
+		|| !cluster_ctrc_receipt_cancel_shared(&handle)
 		|| !ctrc_participant_index(&origin->key, 0, participant_index))
 		return false;
 	*receipt_index = handle.receipt_index;
@@ -827,6 +876,94 @@ UT_TEST(test_shared_prepare_journal_uses_sleepable_exclusion)
 	UT_ASSERT_EQ(snapshot.receipt_count, 1);
 	UT_ASSERT_EQ(spin_acquisitions, 0);
 	UT_ASSERT_EQ(sleepable_acquisitions, 3);
+}
+
+/* The real shared PREPARE must not serialize different canonical segments
+ * on one participant mutex, while a segment in the same shard still must. */
+UT_TEST(test_shared_prepare_isolates_participant_shards)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index, receipt_index;
+	const void *first;
+	const void *second;
+
+	reset_fixture();
+	UT_ASSERT(
+		seed_cancelled_ack_at(0, &snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	first = last_participant_lock;
+	UT_ASSERT(seed_cancelled_ack_at(TT_SLOTS_PER_SEGMENT, &snapshot, &receipt, &ack,
+									&participant_index, &receipt_index));
+	second = last_participant_lock;
+	UT_ASSERT(first != NULL && second != NULL && first != second);
+	UT_ASSERT(seed_cancelled_ack_at(8 * TT_SLOTS_PER_SEGMENT, &snapshot, &receipt, &ack,
+									&participant_index, &receipt_index));
+	UT_ASSERT(last_participant_lock == first);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+/* An ACK copy must visit its actual receipt, not every unrelated empty slot,
+ * and it must leave the pool readable by another shard's independent copy. */
+UT_TEST(test_ack_copy_is_indexed_and_pool_read_only)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt, copy;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint64 participant_index, receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &ack, &participant_index, &receipt_index));
+	MemSet(table_visits, 0, sizeof(table_visits));
+	UT_ASSERT(ctrc_participant_copy_receipts(participant_index, &snapshot, &copy, 1));
+	UT_ASSERT_EQ(memcmp(&copy, &receipt, sizeof(copy)), 0);
+	UT_ASSERT_EQ(table_visits[1], 1);
+	UT_ASSERT_EQ(last_pool_mode, LW_SHARED);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_shared_pool_capacity_is_not_a_per_shard_quota)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle, duplicate;
+	uint64 participant_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &participant_index));
+	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++) {
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &duplicate),
+					 CLUSTER_CTRC_PREPARE_DUPLICATE);
+		UT_ASSERT_EQ(duplicate.receipt_index, handle.receipt_index);
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	}
+	UT_ASSERT_EQ(ctrc_participant_entries()[participant_index].receipt_count,
+				 CtrcShared->receipt_entries);
+	UT_ASSERT(ctrc_receipt_chain_exact_locked(participant_index, false));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, CtrcShared->receipt_entries + 1, &handle),
+				 CLUSTER_CTRC_PREPARE_CAPACITY);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_prepare_does_not_overwrite_a_corrupt_empty_locator)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	CtrcReceiptLink *links;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	links = ctrc_receipt_links();
+	/* Corrupt all empty locator rows so this does not depend on the product
+	 * hash function choosing a particular slot. No receipt exists yet. */
+	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+		links[i].next_plus_one = 1;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 1, &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT(ctrc_bytes_zero(ctrc_receipt_entries(),
+							  CtrcShared->receipt_entries * sizeof(ClusterCtrcReceipt)));
 }
 
 UT_TEST(test_nonempty_ack_copy_and_freeze_use_sleepable_exclusion)
@@ -904,7 +1041,9 @@ UT_TEST(test_sleepable_header_requires_exact_layout_and_tranches)
 	UT_ASSERT_EQ(CtrcShared->total_bytes, capacity.total_bytes);
 	UT_ASSERT_EQ(CtrcShared->origin_offset, MAXALIGN(sizeof(*CtrcShared)));
 	UT_ASSERT_EQ(CtrcShared->origin_lock.tranche, LWTRANCHE_CLUSTER_CTRC_ORIGIN);
-	UT_ASSERT_EQ(CtrcShared->participant_lock.tranche, LWTRANCHE_CLUSTER_CTRC_PARTICIPANT);
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++)
+		UT_ASSERT_EQ(CtrcShared->participant_locks[i].lock.tranche,
+					 LWTRANCHE_CLUSTER_CTRC_PARTICIPANT);
 	UT_ASSERT_EQ(CtrcShared->receipt_lock.tranche, LWTRANCHE_CLUSTER_CTRC_RECEIPT);
 	CtrcShared->version--;
 	UT_ASSERT(!cluster_ctrc_shmem_ready());
@@ -1116,7 +1255,8 @@ UT_TEST(test_shared_certificate_batch_uses_one_real_validation)
 	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) - progress, 8);
 	UT_ASSERT_EQ(held_count, 0);
 	UT_ASSERT_EQ(table_visits[0], CtrcShared->receipt_entries);
-	UT_ASSERT_EQ(sleepable_acquisitions, 2);
+	/* One key-shard hold plus pool S validation and pool X publication. */
+	UT_ASSERT_EQ(sleepable_acquisitions, 3);
 }
 
 UT_TEST(test_shared_certificate_batch_identity_and_receipt_faults_are_isolated)
@@ -1202,7 +1342,240 @@ UT_TEST(test_shared_certificate_global_corruption_and_alias_never_partially_clea
 	UT_ASSERT_EQ(held_count, 0);
 }
 
-UT_TEST(test_ack_batch_keeps_four_independent_scans_not_four_per_key)
+UT_TEST(test_shared_reclaim_validates_read_only_and_clears_locators)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	uint64 participant_index, receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+	MemSet(table_visits, 0, sizeof(table_visits));
+	shared_validation_writer_visits = 0;
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT_EQ(table_visits[0], CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(shared_validation_writer_visits, 0);
+	UT_ASSERT_EQ(ctrc_participant_receipt_heads()[participant_index], 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_links()[receipt_index], sizeof(CtrcReceiptLink)));
+}
+
+/* Fill the original pool, so deleting the last occupied row leaves no EMPTY
+ * probe as a shortcut. Reuse every physical address with another transaction
+ * and replay an old handle against an actually occupied replacement row. */
+UT_TEST(test_shared_whole_pool_reclaim_and_old_handle_replay)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceiptHandle handle, old_handle;
+	ClusterCtrcReceipt *copies;
+	ClusterCtrcReceipt replacement;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcDurability durability = { 0 };
+	ClusterCtrcCloseDispatch dispatch = { 0 };
+	ClusterCtrcSealReplyResult result;
+	uint64 participant_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &participant_index));
+	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++) {
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &handle), CLUSTER_CTRC_PREPARE_READY);
+		if (i == 0)
+			old_handle = handle;
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	}
+	UT_ASSERT_EQ(cluster_ctrc_participant_close(&ctrc_participant_entries()[participant_index],
+												&origin->touched[0], origin->grant_generation,
+												origin->seal_generation),
+				 CLUSTER_CTRC_CLOSE_ACK_READY);
+	snapshot = ctrc_participant_entries()[participant_index];
+	copies = palloc_extended(CtrcShared->receipt_entries * sizeof(*copies), 0);
+	UT_ASSERT(copies != NULL);
+	UT_ASSERT(ctrc_participant_copy_receipts(participant_index, &snapshot, copies,
+											 CtrcShared->receipt_entries));
+	UT_ASSERT_EQ(cluster_ctrc_participant_ack_from_snapshot(
+					 &snapshot, copies, CtrcShared->receipt_entries, &durability, &ack),
+				 CLUSTER_CTRC_ACK_RELEASED);
+	UT_ASSERT(ctrc_participant_freeze_ack_exact(participant_index, &snapshot, copies,
+												CtrcShared->receipt_entries, &ack));
+	pfree(copies);
+	dispatch.key = snapshot.key;
+	dispatch.participant = snapshot.identity;
+	dispatch.grant_generation = snapshot.grant_generation;
+	dispatch.seal_generation = snapshot.seal_generation;
+	dispatch.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	dispatch.request_id = 8123;
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(
+		ctrc_bytes_zero(ctrc_receipt_entries(), CtrcShared->receipt_entries * sizeof(*copies)));
+	UT_ASSERT(ctrc_bytes_zero(ctrc_receipt_links(),
+							  CtrcShared->receipt_entries * sizeof(CtrcReceiptLink)));
+	UT_ASSERT(ctrc_bytes_zero(ctrc_receipt_probe_states(), CtrcShared->receipt_entries));
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&old_handle));
+
+	origin = seed_origin(TT_SLOTS_PER_SEGMENT, 1);
+	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, i + 1, &handle), CLUSTER_CTRC_PREPARE_READY);
+	replacement = *old_handle.receipt;
+	UT_ASSERT_EQ(replacement.state, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT(replacement.publication.journal_slot_generation
+			  != old_handle.journal_slot_generation);
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&old_handle));
+	UT_ASSERT_EQ(memcmp(&replacement, old_handle.receipt, sizeof(replacement)), 0);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+}
+
+UT_TEST(test_shared_reclaim_rejects_incomplete_cyclic_and_stale_locators)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcCloseDispatch dispatches[2];
+		ClusterCtrcSealReplyResult results[2];
+		uint64 participant_indices[2], receipt_indices[2];
+		ClusterCtrcReceipt before;
+
+		reset_fixture();
+		for (unsigned i = 0; i < 2; i++)
+			UT_ASSERT(seed_frozen_certificate(i, &dispatches[i], &participant_indices[i],
+											  &receipt_indices[i]));
+		if (fault == 0)
+			ctrc_participant_receipt_heads()[participant_indices[0]] = 0;
+		else if (fault == 1)
+			ctrc_receipt_links()[receipt_indices[0]].next_plus_one = receipt_indices[0] + 1;
+		else if (fault == 2)
+			ctrc_receipt_links()[receipt_indices[0]].journal_generation++;
+		else
+			ctrc_receipt_links()[receipt_indices[0]].participant_plus_one++;
+		before = ctrc_receipt_entries()[receipt_indices[0]];
+		UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(dispatches, 2, results));
+		UT_ASSERT_EQ(results[0], CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+		UT_ASSERT_EQ(results[1], CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+		UT_ASSERT_EQ(memcmp(&before, &ctrc_receipt_entries()[receipt_indices[0]], sizeof(before)),
+					 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+static ClusterCtrcOriginEntry *interleave_origin;
+static ClusterCtrcCloseDispatch interleave_dispatch;
+static ClusterCtrcReceiptHandle interleave_handle;
+static unsigned interleave_mode;
+static unsigned interleave_completed;
+
+/* Deterministic scheduling boundary, not a substitute for PostgreSQL's lock
+ * implementation: the suspended actor's actual held locks remain forbidden
+ * to the second actor while it executes the real shared producer/consumer. */
+static void
+run_other_key_during_pool_upgrade(void)
+{
+	ClusterCtrcSealReplyResult result;
+
+	if (held_count != 1 || held_locks[0] != &CtrcShared->participant_locks[0].lock)
+		abort();
+	pool_upgrade_hook = NULL;
+	paused_actor_count = held_count;
+	memcpy(paused_actor_locks, held_locks, sizeof(held_locks));
+	MemSet(held_locks, 0, sizeof(held_locks));
+	held_count = 0;
+	if (interleave_mode == 0) {
+		if (prepare_fixture_receipt(interleave_origin, 99, &interleave_handle)
+				!= CLUSTER_CTRC_PREPARE_READY
+			|| !cluster_ctrc_receipt_cancel_shared(&interleave_handle))
+			abort();
+	} else if (!cluster_ctrc_participant_certificate_batch_shared(&interleave_dispatch, 1, &result)
+			   || result != CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
+		abort();
+	if (held_count != 0)
+		abort();
+	memcpy(held_locks, paused_actor_locks, sizeof(held_locks));
+	held_count = paused_actor_count;
+	paused_actor_count = 0;
+	interleave_completed++;
+}
+
+UT_TEST(test_reclaim_upgrade_preserves_other_key_prepare_and_reclaim)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterCtrcCloseDispatch dispatch;
+		ClusterCtrcSealReplyResult result;
+		uint64 participant_index, receipt_index, other_participant, other_receipt;
+
+		reset_fixture();
+		UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+		if (mode == 0)
+			interleave_origin = seed_origin(TT_SLOTS_PER_SEGMENT, 1);
+		else
+			UT_ASSERT(seed_frozen_certificate(TT_SLOTS_PER_SEGMENT, &interleave_dispatch,
+											  &other_participant, &other_receipt));
+		interleave_mode = mode;
+		interleave_completed = 0;
+		pool_upgrade_hook = run_other_key_during_pool_upgrade;
+		UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+		UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+		UT_ASSERT_EQ(interleave_completed, 1);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT(
+			ctrc_bytes_zero(&ctrc_receipt_entries()[receipt_index], sizeof(ClusterCtrcReceipt)));
+		if (mode == 0) {
+			UT_ASSERT_EQ(interleave_handle.receipt->state, CTRC_RECEIPT_CANCELLED);
+			UT_ASSERT(ctrc_receipt_chain_exact_locked(interleave_handle.participant_index, false));
+		} else
+			UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_entries()[other_receipt],
+									  sizeof(ClusterCtrcReceipt)));
+	}
+}
+
+static void
+throw_before_pool_write(void)
+{
+	if (held_count != 1 || held_locks[0] != &CtrcShared->participant_locks[0].lock)
+		abort();
+	pg_re_throw();
+}
+
+UT_TEST(test_reclaim_error_before_write_keeps_exact_set)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	uint64 participant_index, receipt_index;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	volatile bool caught = false;
+
+	reset_fixture();
+	UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+	participant = ctrc_participant_entries()[participant_index];
+	receipt = ctrc_receipt_entries()[receipt_index];
+	ack = ctrc_participant_ack_entries()[participant_index];
+	pool_upgrade_hook = throw_before_pool_write;
+	PG_TRY();
+	{
+		(void)cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		/* Model PostgreSQL's error cleanup of the still-held LWLocks. */
+		while (held_count != 0)
+			LWLockRelease((LWLock *)held_locks[held_count - 1]);
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(
+		memcmp(&participant, &ctrc_participant_entries()[participant_index], sizeof(participant)),
+		0);
+	UT_ASSERT_EQ(memcmp(&receipt, &ctrc_receipt_entries()[receipt_index], sizeof(receipt)), 0);
+	UT_ASSERT_EQ(memcmp(&ack, &ctrc_participant_ack_entries()[participant_index], sizeof(ack)), 0);
+	UT_ASSERT(ctrc_receipt_chain_exact_locked(participant_index, true));
+	pool_upgrade_hook = NULL;
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+}
+
+UT_TEST(test_ack_batch_keeps_independent_copies_and_complete_final_census)
 {
 	CtrcAckWork work[8] = { { 0 } };
 	ClusterCtrcReceipt copies[8];
@@ -1248,9 +1621,9 @@ UT_TEST(test_ack_batch_keeps_four_independent_scans_not_four_per_key)
 					 0);
 	}
 	UT_ASSERT_EQ(held_count, 0);
-	UT_ASSERT_EQ(table_visits[1], 2 * CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(table_visits[1], 16);
 	UT_ASSERT_EQ(table_visits[2], CtrcShared->receipt_entries);
-	UT_ASSERT_EQ(table_visits[3], CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(table_visits[3], 8);
 }
 
 UT_TEST(test_real_ack_driver_shares_scans_and_keeps_durability_and_barrier)
@@ -1282,9 +1655,9 @@ UT_TEST(test_real_ack_driver_shares_scans_and_keeps_durability_and_barrier)
 	UT_ASSERT_EQ(wake_count, 8);
 	UT_ASSERT_EQ(barrier_calls, 1);
 	UT_ASSERT_EQ(allocated, 0);
-	UT_ASSERT_EQ(table_visits[1], 2 * CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(table_visits[1], 16);
 	UT_ASSERT_EQ(table_visits[2], CtrcShared->receipt_entries);
-	UT_ASSERT_EQ(table_visits[3], CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(table_visits[3], 8);
 }
 
 static uint64 drift_receipt_index;
@@ -1470,14 +1843,15 @@ driver_no_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot pg_at
 
 static bool
 driver_no_terminal(const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
-	ClusterCtrcTerminalStatus *status pg_attribute_unused(), SCN *scn pg_attribute_unused())
+				   ClusterCtrcTerminalStatus *status pg_attribute_unused(),
+				   SCN *scn pg_attribute_unused())
 {
 	return false;
 }
 
 static void
 driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute_unused(),
-	Size count pg_attribute_unused())
+						 Size count pg_attribute_unused())
 {
 	if (driver_other_progress)
 		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
@@ -1775,7 +2149,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(38);
+	UT_PLAN(47);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -1791,6 +2165,10 @@ main(void)
 	UT_RUN(test_receipt_and_ack_scans_do_not_retry_retained_entries);
 	UT_RUN(test_certificate_scan_bounds_unpublished_candidates);
 	UT_RUN(test_shared_prepare_journal_uses_sleepable_exclusion);
+	UT_RUN(test_shared_prepare_isolates_participant_shards);
+	UT_RUN(test_ack_copy_is_indexed_and_pool_read_only);
+	UT_RUN(test_shared_pool_capacity_is_not_a_per_shard_quota);
+	UT_RUN(test_prepare_does_not_overwrite_a_corrupt_empty_locator);
 	UT_RUN(test_nonempty_ack_copy_and_freeze_use_sleepable_exclusion);
 	UT_RUN(test_stale_ack_snapshot_releases_without_publication);
 	UT_RUN(test_receipt_drift_retains_bytes_and_blocks_ack);
@@ -1804,7 +2182,12 @@ main(void)
 	UT_RUN(test_shared_certificate_batch_uses_one_real_validation);
 	UT_RUN(test_shared_certificate_batch_identity_and_receipt_faults_are_isolated);
 	UT_RUN(test_shared_certificate_global_corruption_and_alias_never_partially_clear);
-	UT_RUN(test_ack_batch_keeps_four_independent_scans_not_four_per_key);
+	UT_RUN(test_shared_reclaim_validates_read_only_and_clears_locators);
+	UT_RUN(test_shared_whole_pool_reclaim_and_old_handle_replay);
+	UT_RUN(test_shared_reclaim_rejects_incomplete_cyclic_and_stale_locators);
+	UT_RUN(test_reclaim_upgrade_preserves_other_key_prepare_and_reclaim);
+	UT_RUN(test_reclaim_error_before_write_keeps_exact_set);
+	UT_RUN(test_ack_batch_keeps_independent_copies_and_complete_final_census);
 	UT_RUN(test_real_ack_driver_shares_scans_and_keeps_durability_and_barrier);
 	UT_RUN(test_real_ack_driver_independent_capture_and_final_drift_retain_one_key);
 	UT_RUN(test_real_ack_driver_exception_and_allocation_failure_never_publish);
