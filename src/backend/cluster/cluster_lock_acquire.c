@@ -65,13 +65,13 @@
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
 #include "cluster/cluster_startup_phase.h"
-#include "storage/latch.h"				  /* spec-4.6 D4 — freeze-gate WaitLatch */
-#include "storage/lock.h"				  /* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
-#include "utils/hsearch.h"				  /* spec-4.6 D3 — hash_seq over LocalLockHash */
-#include "utils/wait_event.h"			  /* spec-4.6 D4 — ClusterGrdShardRemaster */
-#include "access/htup_details.h"		  /* GETSTRUCT */
-#include "access/xact.h"				  /* GetTopTransactionIdIfAny */
-#include "catalog/pg_class.h"			  /* Form_pg_class for HC25 relpersistence */
+#include "storage/latch.h"		 /* spec-4.6 D4 — freeze-gate WaitLatch */
+#include "storage/lock.h"		 /* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
+#include "utils/hsearch.h"		 /* spec-4.6 D3 — hash_seq over LocalLockHash */
+#include "utils/wait_event.h"	 /* spec-4.6 D4 — ClusterGrdShardRemaster */
+#include "access/htup_details.h" /* GETSTRUCT */
+#include "access/xact.h"		 /* GetTopTransactionIdIfAny */
+#include "catalog/pg_class.h"	 /* Form_pg_class for HC25 relpersistence */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -189,14 +189,12 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 		 * CF(S)/WALR(X) allowlist inside
 		 * cluster_recovery_authority_request_allowed.
 		 */
-		if (cluster_recovery_authority_request_allowed(
-				&req->resid, req->lockmode,
-				AmStartupProcess()))
+		if (cluster_recovery_authority_request_allowed(&req->resid, req->lockmode,
+													   AmStartupProcess()))
 			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 		if (cluster_serving_ready_is_current())
-			return cluster_lms_is_ready()
-				? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
-				: CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+			return cluster_lms_is_ready() ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+										  : CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 		/*
 		 * RF-ROOT P6 (reverted 2026-08-17): the recovery lock admission is
 		 * StartupProcess-only per frozen AD-023 §4 and STOP-01 I1 (the
@@ -331,6 +329,13 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
  *	+ wait GES_REPLY;timeout 53R70 / deadlock 53R72(LMD spec-2.22 wire)/
  *	cancel 53R73。
  */
+static bool
+cluster_lock_acquire_is_hw_request(const ClusterLockAcquireRequest *req)
+{
+	return req->resid.type == CLUSTER_HW_RESID_TYPE && req->lockmode == ExclusiveLock
+		   && req->op == CLUSTER_LOCK_OP_REQUEST && req->current_mode == NoLock && !req->dontwait;
+}
+
 ClusterLockAcquireResult
 cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
 {
@@ -377,7 +382,12 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 												 GetTopTransactionIdIfAny());
 		PG_TRY();
 		{
-			reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
+			if (cluster_lock_acquire_is_hw_request(req))
+				reject = cluster_ges_send_hw_request_and_wait(
+					&req->resid, &req->holder, req->request_id, req->timeout_ms, req->wait_event,
+					&((ClusterLockAcquireRequest *)req)->hw_grant);
+			else
+				reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
 														   &req->holder, req->request_id,
 														   req->timeout_ms, req->wait_event);
 		}
@@ -385,6 +395,10 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		{
 			if (ws != NULL)
 				cluster_lmd_wait_state_clear(ws);
+			if (cluster_lock_acquire_is_hw_request(req)) {
+				ConditionVariableCancelSleep();
+				(void)cluster_lock_acquire_s7_cleanup(req);
+			}
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -411,8 +425,7 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * same end-state as the lock.c gate-time SOLE->native short-circuit.
 	 */
 	/* RF A1: a formed control-file authority can never fall back native. */
-	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE
-		&& req->resid.type == CLUSTER_CF_RESID_TYPE)
+	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE && req->resid.type == CLUSTER_CF_RESID_TYPE)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE)
 		return CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
@@ -498,9 +511,9 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 {
 	uint32 reject;
 	bool convert_nowait = req->dontwait
-		&& ges_mode_convert_class((ClusterGesMode)req->current_mode,
-								  (ClusterGesMode)req->lockmode)
-			== GES_CONVERT_UPGRADE;
+						  && ges_mode_convert_class((ClusterGesMode)req->current_mode,
+													(ClusterGesMode)req->lockmode)
+								 == GES_CONVERT_UPGRADE;
 	/* spec-5.8 D1d — a cross-node CONVERT (S->X upgrade) blocks and can
 	 * deadlock; publish/clear the wait-state around it like the S4 request
 	 * wait so the resolver can revalidate the victim. */
@@ -513,16 +526,14 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 	PG_TRY();
 	{
 		if (convert_nowait)
-				reject = cluster_ges_send_convert_nowait_and_wait(
-					&req->resid, (uint32)req->lockmode,
-					(uint32)req->current_mode, &req->holder, req->request_id,
-					req->convert_old_request_id, req->timeout_ms,
-					req->wait_event);
+			reject = cluster_ges_send_convert_nowait_and_wait(
+				&req->resid, (uint32)req->lockmode, (uint32)req->current_mode, &req->holder,
+				req->request_id, req->convert_old_request_id, req->timeout_ms, req->wait_event);
 		else
-				reject = cluster_ges_send_convert_and_wait(
-					&req->resid, (uint32)req->lockmode,
-					(uint32)req->current_mode, &req->holder, req->request_id,
-					/* timeout = GUC default */ 0);
+			reject = cluster_ges_send_convert_and_wait(&req->resid, (uint32)req->lockmode,
+													   (uint32)req->current_mode, &req->holder,
+													   req->request_id,
+													   /* timeout = GUC default */ 0);
 	}
 	PG_CATCH();
 	{
@@ -570,6 +581,44 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+
+	/* Remote HW GRANT owns an exact reservation, not the S3 local snapshot.
+	 * Keep the ordinary optimistic fence below for all other acquisitions. */
+	if (req->hw_grant.key.request_id != 0) {
+		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
+		volatile bool promoted = false;
+
+		if (grant->consumed)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		PG_TRY();
+		{
+			if (cluster_lock_acquire_is_hw_request(req)
+				&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
+												   req->request_id)) {
+				er = cluster_grd_promote_remote_grant_exact(&req->resid, &req->holder);
+				grant->local_promoted = (er == CLUSTER_GRD_ENTRY_OK);
+				if (grant->local_promoted
+					&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
+													   req->request_id)) {
+					grant->consumed = true;
+					grant->cleanup_pending = false;
+					promoted = true;
+				}
+			}
+			if (!promoted)
+				(void)cluster_lock_acquire_s7_cleanup(req);
+		}
+		PG_CATCH();
+		{
+			(void)cluster_lock_acquire_s7_cleanup(req);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!promoted)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
+		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	}
 
 	/* spec-5.3 §3.1a — convert path mutates an existing holder (no
 	 * reservation to promote);  send the CONVERT wire at S5 (T2). */
@@ -645,8 +694,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 */
 		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
 		release_result = cluster_ges_send_release_and_wait(
-			&req->resid, &req->holder, req->request_id, req->timeout_ms,
-			req->wait_event);
+			&req->resid, &req->holder, req->request_id, req->timeout_ms, req->wait_event);
 		if (release_result != GES_REJECT_REASON_NONE)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
@@ -707,11 +755,30 @@ cluster_lock_release(const ClusterLockReleaseRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
 {
+	ClusterLockAcquireRequest original;
+
 	ensure_counter_initialized();
 	pg_atomic_fetch_add_u64(&stub_s7_cleanup_count, 1);
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (req->hw_grant.key.request_id != 0) {
+		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
+
+		if (grant->consumed)
+			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* Normal S6 owns this holder. */
+		cluster_ges_hw_grant_abandon(grant);
+		/* S7 must clean the original caller even if identity revalidation failed. */
+		original = *req;
+		memcpy(&original.resid, grant->request.resid, sizeof(original.resid));
+		original.holder.node_id = (int32)grant->request.holder_node_id;
+		original.holder.procno = grant->request.holder_procno;
+		original.holder.cluster_epoch = (uint64)grant->request.holder_cluster_epoch_lo
+										| ((uint64)grant->request.holder_cluster_epoch_hi << 32);
+		original.holder.request_id = grant->key.request_id;
+		original.request_id = grant->key.request_id;
+		req = &original;
+	}
 
 	/*
 	 * spec-2.21 D4 — S7 cleanup:cancel any outstanding reservation +

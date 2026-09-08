@@ -252,10 +252,10 @@ static uint64 stub_replacement_capability_sample_count = 0;
 static uint32 stub_replacement_required_capabilities = 0;
 
 bool
-cluster_sf_peer_capability_family_sample(
-	int32 peer_id pg_attribute_unused(), uint32 required_capabilities,
-	uint32 optional_capabilities pg_attribute_unused(),
-	bool *optional_supported_out, uint32 *generation_out)
+cluster_sf_peer_capability_family_sample(int32 peer_id pg_attribute_unused(),
+										 uint32 required_capabilities,
+										 uint32 optional_capabilities pg_attribute_unused(),
+										 bool *optional_supported_out, uint32 *generation_out)
 {
 	stub_replacement_capability_sample_count++;
 	stub_replacement_required_capabilities = required_capabilities;
@@ -330,26 +330,23 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 										   bool startup_process)
 {
 	return startup_process && stub_recovery_ready && resid != NULL
-		&& ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
-			|| (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
-				&& mode == ExclusiveLock));
+		   && ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
+			   || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ExclusiveLock));
 }
 
 bool
-cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid,
-										  LOCKMODE mode)
+cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMODE mode)
 {
 	if (resid == NULL)
 		return false;
 	if (resid->type == CLUSTER_CF_RESID_TYPE)
-		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0
-			&& resid->field3 == 0 && resid->field4 == 0
-			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
+			   && resid->field4 == 0 && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
 		return mode == ExclusiveLock && resid->field1 > 0
-			&& resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
-			&& resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
-			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+			   && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
+			   && resid->field3 == 0 && resid->field4 == 0
+			   && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	return false;
 }
 
@@ -454,8 +451,9 @@ int32
 cluster_grd_lookup_master_gen(const struct ClusterResId *resid, uint64 *out_routing_generation)
 {
 	if (out_routing_generation != NULL)
-		*out_routing_generation = stub_master_generation
-			+ (stub_remaster_on_second_lookup && stub_master_gen_lookup_calls > 0 ? 1 : 0);
+		*out_routing_generation
+			= stub_master_generation
+			  + (stub_remaster_on_second_lookup && stub_master_gen_lookup_calls > 0 ? 1 : 0);
 	stub_master_gen_lookup_calls++;
 	return cluster_grd_lookup_master(resid);
 }
@@ -782,8 +780,8 @@ cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key pg_attribute_
 
 void
 cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key pg_attribute_unused(),
-								   const uint8 *reply pg_attribute_unused(),
-								   uint16 reply_len pg_attribute_unused())
+							   const uint8 *reply pg_attribute_unused(),
+							   uint16 reply_len pg_attribute_unused())
 {
 	stub_dedup_record_count++;
 }
@@ -791,8 +789,7 @@ cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key pg_attribute_unused
 bool
 cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
 {
-	if (stub_dedup_remove_completed_count
-		< lengthof(stub_dedup_remove_completed_keys))
+	if (stub_dedup_remove_completed_count < lengthof(stub_dedup_remove_completed_keys))
 		stub_dedup_remove_completed_keys[stub_dedup_remove_completed_count] = *key;
 	stub_dedup_remove_completed_count++;
 	return true;
@@ -857,13 +854,15 @@ cluster_grd_convert_or_enqueue_meta(
 }
 
 ClusterGrdConvertResult
-cluster_grd_convert_nowait(
-	const struct ClusterResId *resid pg_attribute_unused(), int32 node_id pg_attribute_unused(),
-	uint32 procno pg_attribute_unused(), uint64 cluster_epoch pg_attribute_unused(),
-	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
-	uint64 convert_request_id pg_attribute_unused(), uint64 old_request_id pg_attribute_unused(),
-	int32 source_node_id pg_attribute_unused(),
-	uint64 shard_master_generation pg_attribute_unused())
+cluster_grd_convert_nowait(const struct ClusterResId *resid pg_attribute_unused(),
+						   int32 node_id pg_attribute_unused(), uint32 procno pg_attribute_unused(),
+						   uint64 cluster_epoch pg_attribute_unused(),
+						   int current_mode pg_attribute_unused(),
+						   int requested_mode pg_attribute_unused(),
+						   uint64 convert_request_id pg_attribute_unused(),
+						   uint64 old_request_id pg_attribute_unused(),
+						   int32 source_node_id pg_attribute_unused(),
+						   uint64 shard_master_generation pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
 }
@@ -1033,17 +1032,14 @@ cluster_grd_release_holder_by_id(const struct ClusterResId *r pg_attribute_unuse
 
 bool
 cluster_grd_holder_mode_by_id(const struct ClusterResId *r,
-								 const struct ClusterGrdHolderId *h pg_attribute_unused(),
-								 LOCKMODE *out_mode)
+							  const struct ClusterGrdHolderId *h pg_attribute_unused(),
+							  LOCKMODE *out_mode)
 {
 	if (r == NULL)
 		return false;
 	if (out_mode != NULL)
-		*out_mode = r->type == CLUSTER_CF_RESID_TYPE
-			? ShareLock
-			: ExclusiveLock;
-	return r->type == CLUSTER_CF_RESID_TYPE
-		|| r->type == CLUSTER_WAL_RETENTION_RESID_TYPE;
+		*out_mode = r->type == CLUSTER_CF_RESID_TYPE ? ShareLock : ExclusiveLock;
+	return r->type == CLUSTER_CF_RESID_TYPE || r->type == CLUSTER_WAL_RETENTION_RESID_TYPE;
 }
 
 ClusterGrdEntryResult
@@ -1133,6 +1129,14 @@ void *MyProc;
 void
 ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 {}
+/* HW consumes the real reply table in test_cluster_hw_handoff. */
+GesReplyWaitPollResult
+cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key pg_attribute_unused(),
+									GesReplyWaitVerdict *verdict pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 ConditionVariableCancelSleep(void)
 {
@@ -1140,8 +1144,8 @@ ConditionVariableCancelSleep(void)
 }
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
-								long timeout pg_attribute_unused(),
-								uint32 wait_event pg_attribute_unused())
+							long timeout pg_attribute_unused(),
+							uint32 wait_event pg_attribute_unused())
 {
 	if (stub_cv_now_after_sleep > 0)
 		stub_now = stub_cv_now_after_sleep;
@@ -1269,9 +1273,8 @@ UT_TEST(test_ges_request_valid_payload_enqueues_work)
 }
 
 static void
-init_valid_ges_request(ClusterICEnvelope *env, GesRequestPayload *req,
-					   GesRequestOpcode opcode, const ClusterResId *resid,
-					   LOCKMODE mode)
+init_valid_ges_request(ClusterICEnvelope *env, GesRequestPayload *req, GesRequestOpcode opcode,
+					   const ClusterResId *resid, LOCKMODE mode)
 {
 	memset(env, 0, sizeof(*env));
 	env->source_node_id = 1;
@@ -1314,8 +1317,7 @@ UT_TEST(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts)
 	resid.field1 = 77;
 	resid.type = CLUSTER_IR_RESID_TYPE;
 	resid.lockmethodid = DEFAULT_LOCKMETHOD;
-	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_RELEASE, &resid,
-						   ExclusiveLock);
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_RELEASE, &resid, ExclusiveLock);
 	req.holder_procno = 23;
 	req.holder_request_id_lo = UINT32_C(0x55667788);
 	req.holder_request_id_hi = UINT32_C(0x11223344);
@@ -1325,8 +1327,7 @@ UT_TEST(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts)
 	UT_ASSERT_EQ(stub_dedup_lookup_count, lookup_before);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueue_before + 1);
 
-	memset(&stub_work_queue_dequeue_item, 0,
-		   sizeof(stub_work_queue_dequeue_item));
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
 	stub_work_queue_dequeue_item.source_node_id = env.source_node_id;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
@@ -1336,11 +1337,9 @@ UT_TEST(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts)
 	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 	UT_ASSERT_EQ(stub_dedup_record_count, record_before);
 	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, reply_before + 1);
-	UT_ASSERT_EQ(stub_dedup_remove_completed_count,
-				 remove_before + lengthof(expected_opcodes));
+	UT_ASSERT_EQ(stub_dedup_remove_completed_count, remove_before + lengthof(expected_opcodes));
 	for (int i = 0; i < lengthof(expected_opcodes); i++) {
-		const ClusterGesDedupKey *key
-			= &stub_dedup_remove_completed_keys[remove_before + i];
+		const ClusterGesDedupKey *key = &stub_dedup_remove_completed_keys[remove_before + i];
 
 		UT_ASSERT_EQ(key->origin_node_id, env.source_node_id);
 		UT_ASSERT_EQ(key->opcode, expected_opcodes[i]);
@@ -1368,8 +1367,7 @@ UT_TEST(test_ges_recovery_ingress_exact_allowlist)
 	memset(&resid, 0, sizeof(resid));
 	resid.type = CLUSTER_CF_RESID_TYPE;
 	resid.lockmethodid = DEFAULT_LOCKMETHOD;
-	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
-						   ShareLock);
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid, ShareLock);
 	cluster_ges_request_handler(&env, &req);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, ++enqueued);
 
@@ -1381,8 +1379,7 @@ UT_TEST(test_ges_recovery_ingress_exact_allowlist)
 	resid.field1 = 1;
 	resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
 	resid.lockmethodid = DEFAULT_LOCKMETHOD;
-	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
-						   ExclusiveLock);
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid, ExclusiveLock);
 	cluster_ges_request_handler(&env, &req);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, ++enqueued);
 
@@ -1394,8 +1391,7 @@ UT_TEST(test_ges_recovery_ingress_exact_allowlist)
 	memset(&resid, 0, sizeof(resid));
 	resid.type = CLUSTER_IR_RESID_TYPE;
 	resid.lockmethodid = DEFAULT_LOCKMETHOD;
-	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
-						   ExclusiveLock);
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid, ExclusiveLock);
 	cluster_ges_request_handler(&env, &req);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
 
@@ -1437,8 +1433,7 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 	req.lockmode = AccessExclusiveLock;
 	req.holder_node_id = 1;
 	memcpy(req.resid, &resid, sizeof(resid));
-	memset(&stub_work_queue_dequeue_item, 0,
-		   sizeof(stub_work_queue_dequeue_item));
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
 	stub_work_queue_dequeue_item.source_node_id = 1;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
@@ -1449,8 +1444,7 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations);
 	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
-	UT_ASSERT_EQ(stub_lmon_reply_last.opcode,
-				 (uint32)GES_REPLY_OPCODE_REJECT);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, (uint32)GES_REPLY_OPCODE_REJECT);
 
 	memset(&resid, 0, sizeof(resid));
 	resid.type = CLUSTER_CF_RESID_TYPE;
@@ -1461,8 +1455,7 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 	stub_work_queue_dequeue_pending = true;
 	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations + 1);
-	UT_ASSERT_EQ(stub_lmon_reply_last.opcode,
-				 (uint32)GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, (uint32)GES_REPLY_OPCODE_GRANT);
 
 	stub_authority_managed = false;
 	stub_recovery_ready = false;
@@ -1492,15 +1485,13 @@ UT_TEST(test_ges_starting_redeclare_uses_preseal_transport_only)
 	stub_backend_request_ready_after = 1;
 	MyAuxProcType = NotAnAuxProcess;
 
-	result = cluster_ges_send_redeclare_and_wait(
-		&resid, ShareLock, &holder, holder.request_id);
+	result = cluster_ges_send_redeclare_and_wait(&resid, ShareLock, &holder, holder.request_id);
 	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
 	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)1);
 
 	stub_backend_request_enqueue_count = 0;
 	MyAuxProcType = StartupProcess;
-	result = cluster_ges_send_request_and_wait(
-		&resid, ShareLock, &holder, holder.request_id, 1, 0);
+	result = cluster_ges_send_request_and_wait(&resid, ShareLock, &holder, holder.request_id, 1, 0);
 	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_SHARD_FROZEN);
 	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)0);
 
@@ -1525,10 +1516,8 @@ make_ges_phase3_message(uint32 phase)
 	message.request_nonce = UINT64_C(101);
 	message.identity0 = UINT64_C(202);
 	message.identity1 = UINT64_C(303);
-	message.grammar_fingerprint
-		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
-	if (phase
-		== CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY) {
+	message.grammar_fingerprint = CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	if (phase == CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY) {
 		message.body.phase3.jcmk_generation = UINT64_C(404);
 		message.body.phase3.episode_state_generation = UINT32_C(505);
 	}
@@ -1561,8 +1550,7 @@ UT_TEST(test_ges_phase3_early_dispatch_enqueues_formation_handoff)
 	cluster_ges_shmem_init();
 	cluster_node_id = 1;
 	drain_ges_phase3_handoff();
-	message = make_ges_phase3_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_ges_phase3_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 	memset(&env, 0, sizeof(env));
 	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
@@ -1579,10 +1567,8 @@ UT_TEST(test_ges_phase3_early_dispatch_enqueues_formation_handoff)
 
 	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
-	UT_ASSERT_EQ(stub_replacement_capability_sample_count,
-				 pre_capability + 1);
-	UT_ASSERT_EQ(stub_replacement_required_capabilities,
-				 (uint32)0x00100000U);
+	UT_ASSERT_EQ(stub_replacement_capability_sample_count, pre_capability + 1);
+	UT_ASSERT_EQ(stub_replacement_required_capabilities, (uint32)0x00100000U);
 	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 1);
 	UT_ASSERT(cluster_replacement_phase3_handoff_poll_local(&item));
 	UT_ASSERT_EQ(memcmp(&item.message, &message, sizeof(message)), 0);
@@ -1606,8 +1592,7 @@ UT_TEST(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier)
 	cluster_ges_shmem_init();
 	cluster_node_id = 1;
 	drain_ges_phase3_handoff();
-	message = make_ges_phase3_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK);
+	message = make_ges_phase3_message(CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 	memset(&env, 0, sizeof(env));
 	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
@@ -1945,8 +1930,7 @@ UT_TEST(test_ges_release_cv_timeout_retransmits)
 	stub_backend_request_enqueue_count = 0;
 	stub_backend_request_ready_after = 2;
 
-	result = cluster_ges_send_release_and_wait(&resid, &holder,
-										 holder.request_id, 0, 0);
+	result = cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 0, 0);
 
 	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
 	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
@@ -1971,8 +1955,7 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 	stub_master_gen_lookup_calls = 0;
 	stub_remaster_on_second_lookup = false;
 	stub_release_and_drain_result = -1;
-	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
-				 GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_TIMEOUT);
 
 	stub_master_gen_lookup_calls = 0;
 	stub_release_and_drain_result = 0;
@@ -1982,8 +1965,7 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 
 	stub_master_gen_lookup_calls = 0;
 	stub_remaster_on_second_lookup = false;
-	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
-				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
 	cluster_node_id = saved_node;
 }
 

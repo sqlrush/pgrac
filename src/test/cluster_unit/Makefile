@@ -52,6 +52,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_replacement_episode test_cluster_replacement_request test_cluster_replacement_wire test_cluster_undo_root_descriptor test_cluster_marker_async \
         test_cluster_ges test_cluster_ges_reply_wait test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
+        test_cluster_hw_handoff \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
@@ -351,6 +352,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
@@ -2375,6 +2377,22 @@ test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# HW handoff uses production objects in two independent address spaces.
+# Section splitting removes unrelated backend entry points, not tested code.
+HW_HANDOFF_OBJECTS = $(addprefix hw_handoff_,cluster_grd.o cluster_ges.o \
+    cluster_ges_reply_wait.o cluster_lock_acquire.o cluster_ges_mode.o cluster_lmd_wait_state.o)
+$(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
+        $(top_srcdir)/src/include/cluster/cluster_ges.h \
+        $(top_srcdir)/src/include/cluster/cluster_lock_acquire.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
+        $(HW_HANDOFF_OBJECTS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

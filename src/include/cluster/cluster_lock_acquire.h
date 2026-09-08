@@ -71,6 +71,7 @@
 #include "access/transam.h"		  /* FirstNormalObjectId for HC24/HC27 */
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES for HC47 */
 #include "cluster/cluster_grd.h"  /* ClusterResId + ClusterGrdHolderId */
+#include "cluster/cluster_ges.h"  /* Backend-local HW grant handoff */
 #include "cluster/cluster_guc.h"  /* cluster_node_id extern for HC47 */
 #include "storage/lock.h"		  /* LOCKMODE / LOCKTAG / ShareUpdateExclusiveLock */
 
@@ -200,6 +201,8 @@ typedef struct ClusterLockAcquireRequest {
 	 */
 	int timeout_ms;
 	uint32 wait_event;
+	/* Zero-initialized, inline ownership from the HW sender through S5/S7. */
+	ClusterGesHwGrant hw_grant;
 } ClusterLockAcquireRequest;
 
 /*

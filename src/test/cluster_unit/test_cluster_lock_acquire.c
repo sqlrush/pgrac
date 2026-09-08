@@ -132,9 +132,8 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 										   bool startup_process)
 {
 	return stub_recovery_ready_for_test && startup_process && resid != NULL
-		&& ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
-			|| (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
-				&& mode == ExclusiveLock));
+		   && ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
+			   || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ExclusiveLock));
 }
 
 bool
@@ -550,6 +549,47 @@ static uint32 stub_convert_nowait_requested_mode;
 static uint32 stub_convert_nowait_current_mode;
 static uint64 stub_convert_nowait_old_request_id;
 
+/* Remote HW evidence is exercised with real GES/GRD in test_cluster_hw_handoff.
+ * This generic-lock fixture must never manufacture that authority. */
+uint32
+cluster_ges_send_hw_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 request_id pg_attribute_unused(),
+									 int timeout_ms pg_attribute_unused(),
+									 uint32 wait_event pg_attribute_unused(),
+									 ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unused(),
+								const ClusterResId *resid pg_attribute_unused(),
+								const ClusterGrdHolderId *holder pg_attribute_unused(),
+								uint64 request_id pg_attribute_unused())
+{
+	abort();
+}
+
+void
+cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_exact(const ClusterResId *resid pg_attribute_unused(),
+									   const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	abort();
+}
+
 uint32
 cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
 								  uint32 lockmode pg_attribute_unused(),
@@ -578,8 +618,7 @@ cluster_ges_send_request_nowait_and_wait(
 uint32
 cluster_ges_send_convert_nowait_and_wait(
 	const struct ClusterResId *resid pg_attribute_unused(), uint32 requested_mode,
-	uint32 current_mode,
-	const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+	uint32 current_mode, const struct ClusterGrdHolderId *holder pg_attribute_unused(),
 	uint64 convert_request_id pg_attribute_unused(), uint64 old_request_id,
 	int timeout_ms pg_attribute_unused(), uint32 wait_event pg_attribute_unused())
 {
@@ -592,9 +631,9 @@ cluster_ges_send_convert_nowait_and_wait(
 
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-									  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-									  uint64 request_id pg_attribute_unused(),
-									  int timeout_ms, uint32 wait_event)
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused(), int timeout_ms,
+								  uint32 wait_event)
 {
 	stub_ges_release_timeout_ms = timeout_ms;
 	stub_ges_release_wait_event = wait_event;
@@ -700,16 +739,14 @@ UT_TEST(test_7step_s1_recovery_allowlist_and_no_native_fallback)
 
 	req.resid.type = CLUSTER_CF_RESID_TYPE;
 	req.lockmode = ShareLock;
-	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
-				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	req.lockmode = ExclusiveLock;
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
 
 	req.resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
 	req.lockmode = ExclusiveLock;
-	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
-				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	req.lockmode = ShareLock;
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
@@ -734,8 +771,7 @@ UT_TEST(test_7step_s1_recovery_allowlist_and_no_native_fallback)
 	stub_lms_ready_for_test = true;
 	req.resid.type = CLUSTER_IR_RESID_TYPE;
 	req.lockmode = ExclusiveLock;
-	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
-				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 
 	stub_authority_managed_for_test = false;
 	stub_serving_ready_for_test = false;
@@ -783,8 +819,7 @@ UT_TEST(test_s6_local_master_unconfirmed_release_fails_closed)
 	req.wait_event = UINT32_C(9876);
 	stub_ges_release_timeout_ms = 0;
 	stub_ges_release_wait_event = 0;
-	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
-				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	UT_ASSERT_EQ(stub_ges_release_timeout_ms, 4321);
 	UT_ASSERT_EQ(stub_ges_release_wait_event, UINT32_C(9876));
 	stub_local_release_result = saved_release_result;

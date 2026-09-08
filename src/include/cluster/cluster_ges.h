@@ -63,6 +63,7 @@
 
 #include "port/atomics.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ges_reply_wait.h"
 
 /*
  * ClusterGesSharedState -- spec-2.13 D2 skeleton shmem.
@@ -517,6 +518,18 @@ StaticAssertDecl(sizeof(GesRequestPayload) == 72,
 				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
 				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
 
+/* Backend-local HW handoff; never a shared entry pointer or wire payload. */
+typedef struct ClusterGesHwGrant {
+	GesReplyWaitKey key;
+	GesRequestPayload request;
+	int32 master;
+	uint64 master_generation;
+	bool cleanup_pending;
+	bool grant_observed;
+	bool local_promoted;
+	bool consumed;
+} ClusterGesHwGrant;
+
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
  *
@@ -585,6 +598,17 @@ extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid
 												uint64 request_id, int timeout_ms,
 												uint32 wait_event);
 
+/* Only blocking HW-X REQUEST may hand an authenticated remote grant to S5. */
+extern uint32 cluster_ges_send_hw_request_and_wait(const struct ClusterResId *resid,
+												   const struct ClusterGrdHolderId *holder,
+												   uint64 request_id, int timeout_ms,
+												   uint32 wait_event, ClusterGesHwGrant *grant);
+extern bool cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant,
+											const struct ClusterResId *resid,
+											const struct ClusterGrdHolderId *holder,
+											uint64 request_id);
+extern void cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant);
+
 /*
  * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns
  * GES_REJECT_REASON_NONE (granted) / GES_REJECT_REASON_LOCK_CONFLICT (held
@@ -599,10 +623,12 @@ extern uint32 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId
 /* RF-ROOT P6 S05-3H -- opcode-15 conditional same-holder conversion.  The
  * master either converts in place or returns LOCK_CONFLICT; it never queues a
  * convert. */
-extern uint32 cluster_ges_send_convert_nowait_and_wait(
-	const struct ClusterResId *resid, uint32 requested_mode, uint32 current_mode,
-	const struct ClusterGrdHolderId *holder, uint64 convert_request_id,
-	uint64 old_request_id, int timeout_ms, uint32 wait_event);
+extern uint32 cluster_ges_send_convert_nowait_and_wait(const struct ClusterResId *resid,
+													   uint32 requested_mode, uint32 current_mode,
+													   const struct ClusterGrdHolderId *holder,
+													   uint64 convert_request_id,
+													   uint64 old_request_id, int timeout_ms,
+													   uint32 wait_event);
 
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,
