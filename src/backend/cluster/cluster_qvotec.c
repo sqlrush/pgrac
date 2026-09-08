@@ -263,11 +263,24 @@ qvotec_pgstat_lookup_all(void)
 #define CLUSTER_QVOTEC_DEFAULT_POLL_INTERVAL_MS 2000
 
 /*
+ * The real poll owner publishes a six-period local lease. Observers never
+ * renew it. This is PGRAC policy, not a verified Oracle internal lease value.
+ */
+static void
+qvotec_publish_poll_lease(uint64 now_us)
+{
+	uint64 next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 6 * 1000ULL;
+
+	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
+	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+}
+
+/*
  * Keep poll starts on the configured cadence.  Waiting a full interval after
  * the disk cycle makes the effective period `cycle work + interval`, which can
- * expire the fixed 2x lease even though the dedicated qvotec is progressing.
+ * needlessly consume lease margin even though the dedicated qvotec is progressing.
  * A cycle that itself consumes the interval runs the successor immediately;
- * an actual cycle lasting 2x the interval still expires the lease and remains
+ * an actual cycle lasting six intervals still expires the lease and remains
  * fail-closed.
  */
 static long
@@ -322,7 +335,7 @@ qvotec_poll_pre_injection(void)
 	}
 	consumed = true;
 	if (type != CLUSTER_FAULT_SLEEP || !cluster_cr_injection_armed(point, &delay_us)
-		|| delay_us == 0 || delay_us > 10000000ULL) {
+		|| delay_us == 0 || delay_us > 14000000ULL) {
 		elog(WARNING, "qvotec poll-pre injection requires one bounded sleep");
 		return;
 	}
@@ -790,7 +803,7 @@ cluster_qvotec_get_collision_state_name(void)
  *	  (a) shmem live
  *	  (b) quorum_state == OK
  *	  (c) now < lease_expire_at_us  (qvotec polled within
- *	      2 × poll_interval — defends against qvotec hung)
+ *	      6 × poll_interval — defends against qvotec hung)
  *
  *	Any other state — INITIALIZING / UNCERTAIN / LOST / lease
  *	expired / shmem absent — returns false → backend fail-closed.
@@ -2217,6 +2230,13 @@ qvotec_replacement_request_preserve(ClusterVotingSlot *next,
 
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void cluster_qvotec_test_poll_pre_injection(void);
+void cluster_qvotec_test_publish_poll_lease(uint64 now_us);
+
+void
+cluster_qvotec_test_publish_poll_lease(uint64 now_us)
+{
+	qvotec_publish_poll_lease(now_us);
+}
 
 void
 cluster_qvotec_test_poll_pre_injection(void)
@@ -2589,7 +2609,6 @@ qvotec_poll_once(void)
 	bool own_prior_read_ok[CLUSTER_MAX_VOTING_DISKS] = { false };
 	ClusterQuorumDecision decision;
 	uint64 now_us;
-	uint64 next_lease_expire;
 	uint64 heartbeat_timeout_us;
 	int i;
 	ClusterFenceMarker submit_marker;
@@ -2684,13 +2703,11 @@ qvotec_poll_once(void)
 	}
 
 	now_us = (uint64)GetCurrentTimestamp();
-	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
 	heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
 
 	/* Always update the lease + last_poll_ts so the backend helper
 	 * sees recent liveness even on the single-node short-circuit. */
-	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
-	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+	qvotec_publish_poll_lease(now_us);
 
 	/*
 	 * spec-4.12 D4: pick up a pending fence-marker submit from LMON (latch-woke

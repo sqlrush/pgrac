@@ -464,7 +464,7 @@ extern const char *cluster_qvotec_get_collision_state_name(void);
  * cluster_qvotec_in_quorum — backend hot-path helper (Q4 v0.2 lease-aware).
  *
  *	Returns true ONLY when (a) shmem live, (b) quorum_state == OK,
- *	(c) now < lease_expire_at_us (qvotec polled within 2 × poll_interval).
+ *	(c) now < lease_expire_at_us (qvotec polled within 6 × poll_interval).
  *	Any other state — INITIALIZING / UNCERTAIN / LOST / lease expired
  *	/ shmem absent — returns false → backend fail-closed.
  *

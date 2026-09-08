@@ -155,8 +155,10 @@ extern long cluster_qvotec_test_poll_wait_timeout_ms(
 	uint64 elapsed_us, int poll_interval_ms);
 #ifdef __APPLE__
 extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak_import));
+extern void cluster_qvotec_test_publish_poll_lease(uint64 now_us) __attribute__((weak_import));
 #else
 extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak));
+extern void cluster_qvotec_test_publish_poll_lease(uint64 now_us) __attribute__((weak));
 #endif
 
 
@@ -1608,6 +1610,64 @@ UT_TEST(test_in_quorum_pre_shmem_init_false)
 	UT_ASSERT(!(cluster_qvotec_in_quorum()));
 }
 
+UT_TEST(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed)
+{
+	void (*publish)(uint64) = cluster_qvotec_test_publish_poll_lease;
+	TimestampTz saved_now = mock_now;
+	int saved_poll = cluster_quorum_poll_interval_ms;
+	char saved[sizeof(shmem_storage)];
+	char published[sizeof(shmem_storage)];
+	const uint32 denied_states[]
+		= { CLUSTER_QVOTEC_QUORUM_INITIALIZING, CLUSTER_QVOTEC_QUORUM_UNCERTAIN,
+			CLUSTER_QVOTEC_QUORUM_LOST, UINT32_MAX };
+	unsigned int i;
+
+	UT_ASSERT_NOT_NULL((void *)publish);
+	if (publish == NULL)
+		return;
+	memcpy(saved, shmem_storage, sizeof(saved));
+	cluster_quorum_poll_interval_ms = 2000;
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	publish(1000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 24)), 1000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 13000000);
+	memcpy(published, shmem_storage, sizeof(published));
+
+	/* The old four-second boundary is inside the approved live window. */
+	mock_now = 5000000;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	mock_now = 12999999;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	mock_now = 13000000;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	mock_now = 13000001;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(memcmp(published, shmem_storage, sizeof(published)), 0);
+
+	mock_now = 1000001;
+	cluster_freeze_writes_set();
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	UT_ASSERT_EQ(memcmp(published, shmem_storage, sizeof(published)), 0);
+	cluster_thaw_writes_set();
+	for (i = 0; i < lengthof(denied_states); i++) {
+		pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), denied_states[i]);
+		UT_ASSERT(!cluster_qvotec_in_quorum());
+	}
+
+	/* Only the existing publisher renews; it does not turn a LOST state OK. */
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_LOST);
+	publish(14000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 26000000);
+	UT_ASSERT_EQ(cluster_qvotec_get_quorum_state(), CLUSTER_QVOTEC_QUORUM_LOST);
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	mock_now = 14000000;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	cluster_quorum_poll_interval_ms = saved_poll;
+	mock_now = saved_now;
+	memcpy(shmem_storage, saved, sizeof(saved));
+}
+
 UT_TEST(test_in_quorum_initializing_state_false)
 {
 	cluster_qvotec_shmem_init();
@@ -1704,6 +1764,22 @@ UT_TEST(test_qvotec_poll_pre_injection_only_target_and_once)
 	UT_ASSERT_EQ(injected_sleeps, 2);
 	UT_ASSERT_EQ(injected_sleep_us, 6000000);
 	UT_ASSERT_EQ(poll_injection_hits, 2);
+	poll_injection_armed = false;
+	poll_pre();
+	poll_injection_param = 14000000;
+	poll_injection_armed = true;
+	poll_pre();
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 3);
+	UT_ASSERT_EQ(injected_sleep_us, 14000000);
+	UT_ASSERT_EQ(poll_injection_hits, 3);
+	poll_injection_armed = false;
+	poll_pre();
+	poll_injection_param = 14000001;
+	poll_injection_armed = true;
+	poll_pre();
+	poll_pre();
+	UT_ASSERT_EQ(injected_sleeps, 3);
 	poll_injection_armed = false;
 	poll_pre();
 	MyBackendType = B_INVALID;
@@ -3147,7 +3223,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(57);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3161,6 +3237,7 @@ main(void)
 	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
 	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
+	UT_RUN(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
 	UT_RUN(test_in_quorum_initializing_state_false);
 	UT_RUN(test_in_quorum_frozen_flag_overrides_to_false);
