@@ -2077,6 +2077,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
+		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
@@ -2514,6 +2515,14 @@ test_cluster_pcm_preassert_consumer.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_pending_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(own.pcm_state == \(uint8\)PCM_STATE_N$$/ { candidate=$$0; pending=1; next } \
+	     pending { if ($$0 ~ /&& own.flags == PCM_OWN_FLAG_GRANT_PENDING\) \{/) { print candidate; emit=1; begin++ } pending=0 } \
+	     emit && /if \(own.pcm_state == \(uint8\)PCM_STATE_N\) \{/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_delivery_route_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_delivery_arm_exact\(/ { print "static ResourceXApplyResult"; emit=1; arm++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -2530,6 +2539,7 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
+		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_pcm_checksum_owner.inc test_cluster_pcm_delivery_route_owner.inc $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \

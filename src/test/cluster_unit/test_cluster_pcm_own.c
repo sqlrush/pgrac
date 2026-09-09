@@ -274,6 +274,20 @@ static int preassert_fuses;
 static int preassert_failure_records;
 static int preassert_iterations;
 static uint64 preassert_now_us;
+static ClusterPcmOwnEntry *preassert_wait_entry;
+static int preassert_sleeps;
+
+static void
+preassert_wait_schedule(long usec)
+{
+	UT_ASSERT(usec > 0);
+	preassert_sleeps++;
+	if (preassert_wait_entry != NULL) {
+		pg_atomic_fetch_add_u64(&preassert_wait_entry->generation, 2);
+		pg_atomic_write_u32(&preassert_wait_entry->flags, 0);
+		preassert_wait_entry = NULL;
+	}
+}
 
 static void
 gcs_block_resource_x_fail_closed_current(void)
@@ -352,10 +366,14 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 	uint64 retry_slice_us = 10000;
 	uint64 diagnostic_request_sequence = 11994;
 	uint64 now_us;
+	uint64 remaining_us;
+	long timeout_ms;
+	int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
 	uint32 requester_sender_connection_generation = 8;
 	uint32 master_ingress_connection_generation = 8;
 	int32 master_node = 3;
 	bool first_failure_recorded = false;
+	bool diagnostic_deadline_expired = false;
 	bool target_retained_release_inflight = false;
 	const char *diagnostic_stage = "own-snapshot";
 
@@ -379,10 +397,13 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 		}
 		result = RESOURCE_X_APPLY_APPLIED;
 #define gcs_block_pcm_x_monotonic_us() preassert_now_us
-#define pg_usleep(us) ((void)(us))
+#define pg_usleep(us) preassert_wait_schedule(us)
 #undef CHECK_FOR_INTERRUPTS
 #define CHECK_FOR_INTERRUPTS() ((void)0)
+#include "test_cluster_pcm_pending_consumer.inc"
+		if (own.pcm_state == (uint8)PCM_STATE_N) {
 #include "test_cluster_pcm_preassert_consumer.inc"
+		}
 #undef CHECK_FOR_INTERRUPTS
 #undef pg_usleep
 #undef gcs_block_pcm_x_monotonic_us
@@ -390,6 +411,7 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 	}
 	(void)diagnostic_stage;
 	(void)first_failure_recorded;
+	(void)diagnostic_deadline_expired;
 	return result;
 }
 
@@ -492,6 +514,143 @@ UT_TEST(test_real_preassert_discards_completed_conversion_observation)
 	UT_ASSERT_EQ(preassert_fuses, 0);
 	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
 	UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_pending_recapture_keeps_original_observation)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry stable;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	PGIOAlignedBlock unchanged;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	buf.tag.relNumber = 16429;
+	buf.tag.forkNum = MAIN_FORKNUM;
+	buf.tag.blockNum = 6645;
+	buf.buffer_type = BUF_TYPE_PI;
+	pg_atomic_write_u64(&entry.generation, 8);
+	pg_atomic_write_u64(&entry.reservation_token, 5);
+	pg_atomic_write_u64(&entry.writer_activation_token, 0);
+	pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+	pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+	/* The real pending consumer must not replace B0 with a newer B1,
+	 * validate B1-E-B2, then still feed pending B0 to the clean-N check.
+	 * This is a deterministic consumer counterexample, not a live replay. */
+	pg_atomic_write_u64(&entry.generation, 10);
+	pg_atomic_write_u32(&entry.flags, 0);
+	memcpy(&stable, &entry, sizeof(entry));
+	memcpy(unchanged.data, transition_page.data, BLCKSZ);
+	preassert_entry_state = RESOURCE_X_TARGET_INSTALL_STALE;
+	preassert_now_us = UINT64_C(234638955873);
+	preassert_fuses = preassert_failure_records = 0;
+	UT_ASSERT_EQ(preassert_consume(&buf, &before), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(preassert_iterations, 2);
+	UT_ASSERT_EQ(preassert_failure_records, 0);
+	UT_ASSERT_EQ(preassert_fuses, 0);
+	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_pending_observation_rechecks_successor_and_preserves_refusals)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int variant;
+
+	for (variant = 0; variant < 13; variant++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot before;
+		PGIOAlignedBlock unchanged;
+		ResourceXApplyResult expected = RESOURCE_X_APPLY_APPLIED;
+		int iterations = 2;
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		buf.buffer_type = BUF_TYPE_PI;
+		pg_atomic_write_u64(&entry.generation, 8);
+		pg_atomic_write_u64(&entry.reservation_token, variant == 3 ? 0 : 5);
+		pg_atomic_write_u64(&entry.writer_activation_token, variant == 4 ? 1 : 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		preassert_entry_state = RESOURCE_X_TARGET_INSTALL_STALE;
+		preassert_now_us = UINT64_C(234638955873);
+		preassert_wait_entry = NULL;
+		preassert_sleeps = preassert_fuses = preassert_failure_records = 0;
+		if (variant < 2 || variant >= 8) {
+			pg_atomic_write_u64(&entry.generation, 10);
+			pg_atomic_write_u32(&entry.flags, 0);
+		}
+		switch (variant) {
+		case 0: /* Token changes without a generation change. */
+			pg_atomic_write_u64(&entry.generation, 8);
+			pg_atomic_write_u64(&entry.reservation_token, 6);
+			break;
+		case 1: /* More than one complete intervening conversion. */
+			pg_atomic_write_u64(&entry.generation, 24);
+			pg_atomic_write_u64(&entry.reservation_token, 17);
+			break;
+		case 2: /* Same pending observation is wait-only; owner later clears it. */
+			preassert_wait_entry = &entry;
+			break;
+		case 3:
+		case 4:
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			iterations = 1;
+			break;
+		case 5:
+			preassert_entry_state = RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			iterations = 1;
+			break;
+		case 6:
+			preassert_entry_state = RESOURCE_X_TARGET_INSTALL_INVALID;
+			expected = RESOURCE_X_APPLY_INVALID;
+			iterations = 1;
+			break;
+		case 7:
+			preassert_now_us = UINT64_C(234641943560);
+			expected = RESOURCE_X_APPLY_BAD_STATE;
+			iterations = 1;
+			break;
+		case 8:
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			break;
+		case 9:
+			pg_atomic_fetch_and_u32(&buf.state, ~BM_VALID);
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			break;
+		case 10:
+			pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
+			expected = RESOURCE_X_APPLY_BAD_STATE;
+			break;
+		case 11:
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			pg_atomic_write_u64(&entry.generation, 9);
+			break;
+		case 12:
+			buf.pcm_state = PCM_STATE_S;
+			buf.buffer_type = BUF_TYPE_CURRENT;
+			pg_atomic_write_u64(&entry.generation, 9);
+			break;
+		}
+		memcpy(unchanged.data, transition_page.data, BLCKSZ);
+		UT_ASSERT_EQ(preassert_consume(&buf, &before), expected);
+		UT_ASSERT_EQ(preassert_iterations, iterations);
+		UT_ASSERT_EQ(preassert_sleeps, variant == 2 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+		preassert_wait_entry = NULL;
+	}
 	ClusterPcmOwnArray = saved;
 }
 
@@ -5203,8 +5362,10 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(101);
+	UT_PLAN(103);
 	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
+	UT_RUN(test_real_pending_recapture_keeps_original_observation);
+	UT_RUN(test_real_pending_observation_rechecks_successor_and_preserves_refusals);
 	UT_RUN(test_preassert_resample_is_not_an_identity_or_deadline_exception);
 	UT_RUN(test_real_preassert_rechecks_changed_image_and_preserves_failures);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);

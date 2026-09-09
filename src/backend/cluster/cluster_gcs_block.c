@@ -14276,40 +14276,33 @@ gcs_block_resource_x_target_acquire_internal(
 				} else {
 					if (own.pcm_state == (uint8)PCM_STATE_N
 						&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
-						/* The exact T1 install may have crossed both the
-						 * BufferDesc and requester-round terminal transitions
-						 * after the snapshot above.  Re-sample both lock domains;
-						 * only the same token's one-generation terminal X may
-						 * restart this driver under its original deadline. */
+						/* Preserve this branch's original B through E and the
+						 * physical after-image. A newer B-E-B cannot validate
+						 * the old pending snapshot or turn it into clean N. */
 						diagnostic_stage = "pending-install-terminal-resample";
-						memset(&failure_live, 0, sizeof(failure_live));
-						own_result = cluster_bufmgr_pcm_own_snapshot(
-							buf, &failure_live);
-						if (own_result == CLUSTER_PCM_OWN_OK) {
-							target_install_observation_result
-								= gcs_block_resource_x_target_install_capture_coherent(
-									buf, &assertion, master_node, gate.formation,
-									master_session, admission.record_generation,
-									requester_sender_connection_generation,
-									master_ingress_connection_generation,
-									retry_slice_us, absolute_deadline_us,
-									&failure_live, &target_install_follow_state,
-									&target_install_follow);
-							if (target_install_observation_result
-									!= RESOURCE_X_APPLY_APPLIED) {
-								result = target_install_observation_result;
-								break;
-							}
-							if (target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
-								continue;
-							if (target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_INFLIGHT
-								|| target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_TERMINAL
-								|| target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+						target_install_observation_result
+							= gcs_block_resource_x_target_install_capture_coherent(
+								buf, &assertion, master_node, gate.formation, master_session,
+								admission.record_generation, requester_sender_connection_generation,
+								master_ingress_connection_generation, retry_slice_us,
+								absolute_deadline_us, &own, &target_install_follow_state,
+								&target_install_follow);
+						if (target_install_observation_result != RESOURCE_X_APPLY_APPLIED) {
+							result = target_install_observation_result;
+							break;
+						}
+						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE
+							|| target_install_follow_state == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+							|| target_install_follow_state == RESOURCE_X_TARGET_INSTALL_TERMINAL
+							|| target_install_follow_state
+								   == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 							continue;
+						if (target_install_follow_state != RESOURCE_X_TARGET_INSTALL_STALE) {
+							result = target_install_follow_state
+											 == RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
+										 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+										 : RESOURCE_X_APPLY_INVALID;
+							break;
 						}
 						now_us = gcs_block_pcm_x_monotonic_us();
 						if (now_us >= absolute_deadline_us) {
@@ -14318,11 +14311,12 @@ gcs_block_resource_x_target_acquire_internal(
 							break;
 						}
 						if (cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
-								&own, own_result, &failure_live,
-								now_us, absolute_deadline_us)) {
+								&own, CLUSTER_PCM_OWN_OK, &own, now_us, absolute_deadline_us)) {
 							/* Another local caller owns only the reversible
 							 * pre-mutation reservation word.  It cannot satisfy
-							 * this round and must not fence the global gate. */
+							 * this round and must not fence the global gate.
+							 * Coherent equality covers own only at observation;
+							 * the fresh loop must recheck before any admission. */
 							diagnostic_stage = "local-pending-reservation-wait";
 							remaining_us = absolute_deadline_us - now_us;
 							timeout_ms = (long) Min(
