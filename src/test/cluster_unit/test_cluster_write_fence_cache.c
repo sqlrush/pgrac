@@ -57,12 +57,14 @@ static union {
 static bool fence_shmem_found;
 static bool epoch_shmem_found;
 
+#ifdef USE_ASSERT_CHECKING
 static pthread_mutex_t race_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t race_cv = PTHREAD_COND_INITIALIZER;
 static bool publisher_acquired;
 static bool release_publisher;
 static bool invalidator_started;
 static bool invalidator_done;
+#endif
 static jmp_buf error_jump;
 static bool capture_error;
 static bool renew_at_error;
@@ -245,6 +247,7 @@ attach_epoch(void)
 	epoch_region->init_fn();
 }
 
+#ifdef USE_ASSERT_CHECKING
 static void
 publisher_pause_hook(void)
 {
@@ -287,6 +290,8 @@ invalidator_main(void *arg)
 	(void)pthread_mutex_unlock(&race_lock);
 	return NULL;
 }
+
+#endif
 
 UT_TEST(test_cache_publish_revalidate_and_invalidate)
 {
@@ -337,6 +342,8 @@ UT_TEST(test_mutation_guard_keeps_cache_unavailable_until_change_finishes)
 				 CLUSTER_FENCE_CACHE_INVALID);
 }
 
+/* These production interleaving hooks exist only in cassert builds. */
+#ifdef USE_ASSERT_CHECKING
 UT_TEST(test_invalidate_waits_out_preexisting_publisher)
 {
 	ClusterFenceMarker old_marker = cache_marker(UINT64_C(0xAA));
@@ -371,6 +378,7 @@ UT_TEST(test_invalidate_waits_out_preexisting_publisher)
 	UT_ASSERT_NE(cluster_write_fence_revalidate_cached_nowait(&old_marker, UINT64_C(1000000)),
 				 CLUSTER_FENCE_CACHE_MATCH);
 }
+#endif
 
 UT_TEST(test_membership_mutation_invalidates_cache_before_change)
 {
@@ -526,9 +534,15 @@ UT_TEST(test_critical_zero_lease_remains_panic_with_exact_reason)
 int
 main(void)
 {
+#ifdef USE_ASSERT_CHECKING
 	UT_PLAN(10);
+#else
+	UT_PLAN(9);
+#endif
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
+#ifdef USE_ASSERT_CHECKING
 	UT_RUN(test_invalidate_waits_out_preexisting_publisher);
+#endif
 	UT_RUN(test_invalidation_rejects_late_prechange_proof);
 	UT_RUN(test_mutation_guard_keeps_cache_unavailable_until_change_finishes);
 	UT_RUN(test_membership_mutation_invalidates_cache_before_change);
