@@ -365,8 +365,8 @@ cluster_write_fence_enforcing(void)
  *	action by context: ERROR / PANIC / BLOCKED).  L110: a detached region (token
  *	not attached) yields enforcement_on with region_attached=false -> fail-closed.
  */
-bool
-cluster_write_fence_allowed(void)
+static bool
+write_fence_allowed_observed(ClusterWriteFenceObservation *out)
 {
 	bool enforcement_on = cluster_write_fence_enforcing(); /* D4: ON + voting disks */
 	bool region_attached = (cluster_write_fence_shmem != NULL);
@@ -375,7 +375,8 @@ cluster_write_fence_allowed(void)
 	uint64 lease_expire_us = 0;
 	bool self_fenced = false;
 	bool fence_engaged = false;
-	uint64 now_us;
+	uint64 now_us = 0;
+	bool allowed;
 
 	if (region_attached) {
 		/*
@@ -406,13 +407,80 @@ cluster_write_fence_allowed(void)
 	 */
 	if (cluster_write_fence_grace_before_engage(enforcement_on, region_attached, fence_engaged,
 												self_fenced))
-		return true;
+		allowed = true;
+	else {
+		/* Same wall-clock domain as the lease; retain this very evaluation. */
+		now_us = (uint64)GetCurrentTimestamp();
+		allowed
+			= cluster_write_fence_decide(enforcement_on, region_attached, epoch_current,
+										 authorized_epoch, now_us, lease_expire_us, self_fenced);
+	}
 
-	/* TimestampTz is microseconds since 2000-01-01; the lease is in the same unit. */
-	now_us = (uint64)GetCurrentTimestamp();
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+		out->enforcing = enforcement_on;
+		out->attached = region_attached;
+		out->engaged = fence_engaged;
+		out->self_fenced = self_fenced;
+		out->allowed = allowed;
+		out->epoch_current = epoch_current;
+		out->authorized_epoch = authorized_epoch;
+		out->now_us = now_us;
+		out->expiry_us = lease_expire_us;
+	}
+	return allowed;
+}
 
-	return cluster_write_fence_decide(enforcement_on, region_attached, epoch_current,
-									  authorized_epoch, now_us, lease_expire_us, self_fenced);
+bool
+cluster_write_fence_allowed(void)
+{
+	return write_fence_allowed_observed(NULL);
+}
+
+const char *
+cluster_write_fence_observation_reason(const ClusterWriteFenceObservation *s)
+{
+	if (!s->enforcing)
+		return "ENFORCEMENT_DISABLED";
+	if (!s->attached)
+		return "SHMEM_UNAVAILABLE";
+	if (s->self_fenced)
+		return "SELF_FENCED";
+	if (!s->engaged)
+		return "BRINGUP_GRACE";
+	if (s->epoch_current != s->authorized_epoch)
+		return "EPOCH_MISMATCH";
+	if (s->expiry_us == 0)
+		return "LEASE_ZERO";
+	if (s->now_us >= s->expiry_us)
+		return "LEASE_EXPIRED";
+	return "ALLOWED";
+}
+
+void
+cluster_write_fence_observe(ClusterWriteFenceObservation *out)
+{
+	if (out == NULL)
+		return;
+	(void)write_fence_allowed_observed(out);
+	/* Metadata, not part of the retained gate evaluation. Non-atomic snapshot. */
+	if (cluster_write_fence_shmem != NULL) {
+		out->last_refresh_us
+			= pg_atomic_read_u64(&cluster_write_fence_shmem->last_authority_refresh_us);
+		out->event_id = pg_atomic_read_u64(&cluster_write_fence_shmem->fence_event_id);
+	}
+}
+
+static int
+write_fence_error_detail(const ClusterWriteFenceObservation *s)
+{
+	return errdetail("PGRAC_FAMILY=WRITE_FENCE PGRAC_REASON=%s node=%d enforcing=%d "
+					 "attached=%d engaged=%d self_fenced=%d current_epoch=%llu "
+					 "authorized_epoch=%llu sampled_now_us=%llu sampled_expiry_us=%llu",
+					 cluster_write_fence_observation_reason(s), cluster_node_id, s->enforcing,
+					 s->attached, s->engaged, s->self_fenced, (unsigned long long)s->epoch_current,
+					 (unsigned long long)s->authorized_epoch, (unsigned long long)s->now_us,
+					 (unsigned long long)s->expiry_us);
 }
 
 /*
@@ -554,25 +622,25 @@ cluster_write_fence_supersede_by_admit(uint64 admitted_epoch)
 void
 cluster_write_fence_reject_if_fenced(const char *op)
 {
-	if (cluster_write_fence_allowed())
+	ClusterWriteFenceObservation observed;
+
+	if (write_fence_allowed_observed(&observed))
 		return; /* enforcement off, or the token proves this node's authority */
 
 	if (cluster_write_fence_shmem != NULL)
 		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->hot_gate_blocked, 1);
 
 	if (CritSectionCount > 0)
-		ereport(PANIC,
-				(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
-				 errmsg("cluster shared-storage %s rejected by the write fence inside a "
-						"critical section",
-						op),
-				 errdetail("This node is stale / superseded / lease-expired / self-fenced; a "
-						   "critical-section write cannot be rolled back, so the node PANICs "
-						   "to fail closed.")));
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+						errmsg("cluster shared-storage %s rejected by the write fence inside a "
+							   "critical section",
+							   op),
+						write_fence_error_detail(&observed)));
 
 	ereport(ERROR,
 			(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
 			 errmsg("cluster shared-storage %s rejected: this node is write-fenced", op),
+			 write_fence_error_detail(&observed),
 			 errhint("The node's cluster epoch is stale, its write-fence lease expired, or a "
 					 "membership reconfiguration declared this node dead (self-fenced).")));
 }

@@ -399,6 +399,29 @@ extern Size cluster_qvotec_shmem_size(void);
 extern void cluster_qvotec_shmem_init(void);
 extern void cluster_qvotec_shmem_register(void);
 
+/* Passive, non-atomic diagnostic copy. No quorum decision, disk read, logging
+ * or lease renewal. observer_frozen is this process's flag, not every backend. */
+typedef struct ClusterQvotecObservation {
+	bool attached;
+	bool observer_frozen;
+	uint32 status;
+	uint32 quorum_state;
+	uint32 collision;
+	uint32 disks_ok;
+	uint32 disks_total;
+	uint32 completed_cycles;
+	uint64 now_us;
+	uint64 epoch_at_boot;
+	uint64 last_poll_us;
+	uint64 expiry_us;
+	uint64 last_loss_us;
+	uint64 cycle_started_us;
+	uint64 cycle_finished_us;
+	uint64 cycle_duration_us;
+} ClusterQvotecObservation;
+
+extern void cluster_qvotec_observe(ClusterQvotecObservation *out);
+
 /*
  * spec-5.15A §2.1A.4 local SPSC handoff.  LMON is the sole submit/poll-
  * completion caller; QVOTEC is the sole poll-request/complete caller.  These

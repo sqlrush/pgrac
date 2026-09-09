@@ -5,6 +5,8 @@
 #include "postgres.h"
 
 #include <pthread.h>
+#include <setjmp.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -61,6 +63,13 @@ static bool publisher_acquired;
 static bool release_publisher;
 static bool invalidator_started;
 static bool invalidator_done;
+static jmp_buf error_jump;
+static bool capture_error;
+static bool renew_at_error;
+static int captured_level;
+static int captured_code;
+static char captured_detail[2048];
+static ClusterFenceMarker renewal_marker;
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -145,9 +154,15 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 bool
 errstart(int elevel, const char *domain)
 {
-	(void)elevel;
 	(void)domain;
-	return false;
+	if (!capture_error)
+		return false;
+	captured_level = elevel;
+	if (renew_at_error) {
+		renew_at_error = false;
+		cluster_write_fence_refresh_from_marker(&renewal_marker, 9000);
+	}
+	return true;
 }
 
 bool
@@ -162,11 +177,26 @@ errfinish(const char *filename, int lineno, const char *funcname)
 	(void)filename;
 	(void)lineno;
 	(void)funcname;
+	if (capture_error)
+		longjmp(error_jump, 1);
 }
 
-int errcode(int sqlerrcode) { (void)sqlerrcode; return 0; }
+int
+errcode(int sqlerrcode)
+{
+	captured_code = sqlerrcode;
+	return 0;
+}
 int errmsg(const char *fmt, ...) { (void)fmt; return 0; }
-int errdetail(const char *fmt, ...) { (void)fmt; return 0; }
+int
+errdetail(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(captured_detail, sizeof(captured_detail), fmt, args);
+	va_end(args);
+	return 0;
+}
 int errhint(const char *fmt, ...) { (void)fmt; return 0; }
 
 static ClusterFenceMarker
@@ -414,10 +444,83 @@ UT_TEST(test_external_fence_counters_are_exact_and_restart_empty)
 	UT_ASSERT(cluster_write_fence_get_external_last_proof_age_ms(&age_ms));
 }
 
+UT_TEST(test_passive_fence_snapshot_retains_expiry_without_mutation)
+{
+	ClusterWriteFenceObservation observed;
+	ClusterFenceMarker marker;
+	uint8 before[sizeof(fence_shmem.bytes)];
+	void (*observe)(ClusterWriteFenceObservation *) = cluster_write_fence_observe;
+
+	UT_ASSERT_NOT_NULL((void *)observe);
+	if (observe == NULL)
+		return;
+	attach_cache();
+	attach_epoch();
+	marker = cache_marker(12);
+	marker.fence_epoch = cluster_epoch_get_current();
+	cluster_write_fence_refresh_from_marker(&marker, 99);
+	memcpy(before, fence_shmem.bytes, sizeof(before));
+	observe(&observed);
+	UT_ASSERT(observed.attached && observed.enforcing && observed.engaged);
+	UT_ASSERT(!observed.allowed && !observed.self_fenced);
+	UT_ASSERT_EQ(observed.now_us, 100);
+	UT_ASSERT_EQ(observed.expiry_us, 99);
+	UT_ASSERT_EQ(observed.event_id, 12);
+	UT_ASSERT_EQ(observed.last_refresh_us, 100);
+	UT_ASSERT_EQ(memcmp(before, fence_shmem.bytes, sizeof(before)), 0);
+	UT_ASSERT(!cluster_write_fence_allowed());
+}
+
+/* Real reject wrapper must retain the failed read, even if publication completes
+ * at the subsequent error boundary. No copied authority or failure model. */
+UT_TEST(test_denial_detail_keeps_original_expiry_after_renewal)
+{
+	attach_cache();
+	attach_epoch();
+	renewal_marker = cache_marker(10);
+	renewal_marker.fence_epoch = cluster_epoch_get_current();
+	cluster_write_fence_refresh_from_marker(&renewal_marker, 100);
+	UT_ASSERT(!cluster_write_fence_allowed());
+	captured_detail[0] = '\0';
+	capture_error = renew_at_error = true;
+	if (setjmp(error_jump) == 0)
+		cluster_write_fence_reject_if_fenced("write");
+	capture_error = false;
+	UT_ASSERT_EQ(captured_level, ERROR);
+	UT_ASSERT_EQ(captured_code, ERRCODE_CLUSTER_WRITE_FENCED);
+	UT_ASSERT(cluster_write_fence_allowed());
+	UT_ASSERT(strstr(captured_detail, "PGRAC_FAMILY=WRITE_FENCE") != NULL);
+	UT_ASSERT(strstr(captured_detail, "PGRAC_REASON=LEASE_EXPIRED") != NULL);
+	UT_ASSERT(strstr(captured_detail, "sampled_now_us=100 sampled_expiry_us=100") != NULL);
+	UT_ASSERT(strstr(captured_detail, "sampled_expiry_us=9000") == NULL);
+}
+
+UT_TEST(test_critical_zero_lease_remains_panic_with_exact_reason)
+{
+	attach_cache();
+	attach_epoch();
+	renewal_marker = cache_marker(11);
+	renewal_marker.fence_epoch = cluster_epoch_get_current();
+	cluster_write_fence_refresh_from_marker(&renewal_marker, 0);
+	captured_detail[0] = '\0';
+	capture_error = true;
+	renew_at_error = false;
+	CritSectionCount = 1;
+	if (setjmp(error_jump) == 0)
+		cluster_write_fence_reject_if_fenced("write");
+	capture_error = false;
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(captured_level, PANIC);
+	UT_ASSERT_EQ(captured_code, ERRCODE_CLUSTER_WRITE_FENCED);
+	UT_ASSERT(strstr(captured_detail, "PGRAC_REASON=LEASE_ZERO") != NULL);
+	UT_ASSERT(strstr(captured_detail, "sampled_expiry_us=0") != NULL);
+	UT_ASSERT(!cluster_write_fence_allowed());
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
 	UT_RUN(test_invalidate_waits_out_preexisting_publisher);
 	UT_RUN(test_invalidation_rejects_late_prechange_proof);
@@ -425,6 +528,9 @@ main(void)
 	UT_RUN(test_membership_mutation_invalidates_cache_before_change);
 	UT_RUN(test_epoch_mutation_invalidates_cache_before_change);
 	UT_RUN(test_external_fence_counters_are_exact_and_restart_empty);
+	UT_RUN(test_passive_fence_snapshot_retains_expiry_without_mutation);
+	UT_RUN(test_denial_detail_keeps_original_expiry_after_renewal);
+	UT_RUN(test_critical_zero_lease_remains_panic_with_exact_reason);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -886,6 +886,26 @@ extern void (*cluster_write_fence_cache_test_before_invalidate_acquire_hook)(voi
  */
 extern bool cluster_write_fence_allowed(void);
 
+/* Diagnostic values, not an authority or an atomic multi-field snapshot.
+ * Core gate inputs are retained from one evaluation; refresh/event metadata
+ * are sampled afterward by the passive observer only. */
+typedef struct ClusterWriteFenceObservation {
+	bool enforcing;
+	bool attached;
+	bool self_fenced;
+	bool engaged;
+	bool allowed;
+	uint64 epoch_current;
+	uint64 authorized_epoch;
+	uint64 now_us;
+	uint64 expiry_us;
+	uint64 last_refresh_us;
+	uint64 event_id;
+} ClusterWriteFenceObservation;
+
+extern void cluster_write_fence_observe(ClusterWriteFenceObservation *out);
+extern const char *cluster_write_fence_observation_reason(const ClusterWriteFenceObservation *s);
+
 /*
  * cluster_write_fence_reject_if_fenced -- spec-4.12 D5 hot-path gate.  Allowed ->
  *	return; fenced -> bump hot_gate_blocked and fail closed (CritSectionCount>0 ->

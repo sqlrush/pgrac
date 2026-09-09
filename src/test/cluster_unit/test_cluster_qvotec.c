@@ -1602,6 +1602,40 @@ UT_TEST(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions)
 	mock_now = saved_now;
 }
 
+UT_TEST(test_passive_quorum_observation_neither_renews_nor_logs)
+{
+	ClusterQvotecObservation observed;
+	void (*observe)(ClusterQvotecObservation *) = cluster_qvotec_observe;
+	char before[sizeof(shmem_storage)];
+	char saved[sizeof(shmem_storage)];
+	TimestampTz saved_now = mock_now;
+
+	UT_ASSERT_NOT_NULL((void *)observe);
+	if (observe == NULL)
+		return;
+	memcpy(saved, shmem_storage, sizeof(saved));
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_LOST);
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 8), 1);
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 12), 3);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 24), 1000);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 32), 5000);
+	mock_now = 7000;
+	memcpy(before, shmem_storage, sizeof(before));
+	quorum_admission_log_count = 0;
+	observe(&observed);
+	UT_ASSERT(observed.attached);
+	UT_ASSERT_EQ(observed.quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
+	UT_ASSERT_EQ(observed.disks_ok, 1);
+	UT_ASSERT_EQ(observed.disks_total, 3);
+	UT_ASSERT_EQ(observed.last_poll_us, 1000);
+	UT_ASSERT_EQ(observed.expiry_us, 5000);
+	UT_ASSERT_EQ(observed.now_us, 7000);
+	UT_ASSERT_EQ(quorum_admission_log_count, 0);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	memcpy(shmem_storage, saved, sizeof(saved));
+	mock_now = saved_now;
+}
+
 UT_TEST(test_in_quorum_pre_shmem_init_false)
 {
 	/* Reset shmem stub */
@@ -3223,7 +3257,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(58);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3237,6 +3271,7 @@ main(void)
 	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
 	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
+	UT_RUN(test_passive_quorum_observation_neither_renews_nor_logs);
 	UT_RUN(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
 	UT_RUN(test_in_quorum_initializing_state_false);

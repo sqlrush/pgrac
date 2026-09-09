@@ -33,9 +33,12 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_write_fence.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "lib/stringinfo.h"
 #include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
@@ -56,6 +59,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_seal);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_stats);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_export);
 PG_FUNCTION_INFO_V1(test_pgrac_rx_trace_release);
+PG_FUNCTION_INFO_V1(test_pgrac_lease_snapshot);
 
 static uint64 operation_sequence;
 
@@ -64,6 +68,53 @@ probe_superuser(void)
 {
 	if (!superuser())
 		ereport(ERROR, (errmsg("consumer observation requires superuser")));
+}
+
+/* Read-only diagnostics. In particular this does not call in_quorum(), which
+ * can emit admission logs, or any voting-disk/authority-refresh operation. */
+Datum
+test_pgrac_lease_snapshot(PG_FUNCTION_ARGS)
+{
+	ClusterQvotecObservation q;
+	ClusterWriteFenceObservation f;
+	StringInfoData result;
+	instr_time began;
+	instr_time ended;
+
+	probe_superuser();
+	INSTR_TIME_SET_CURRENT(began);
+	cluster_qvotec_observe(&q);
+	cluster_write_fence_observe(&f);
+	INSTR_TIME_SET_CURRENT(ended);
+	initStringInfo(&result);
+	appendStringInfo(&result,
+					 "{\"atomic\":false,\"node\":%d,\"pid\":%d,\"server_mono_begin_us\":%llu,"
+					 "\"server_mono_end_us\":%llu,\"quorum\":{\"attached\":%s,"
+					 "\"observer_frozen\":%s,\"status\":%u,\"state\":%u,\"collision\":%u,"
+					 "\"disks_ok\":%u,\"disks_total\":%u,\"completed_cycles\":%u,"
+					 "\"now_us\":%llu,\"epoch_at_boot\":%llu,\"last_poll_us\":%llu,"
+					 "\"expiry_us\":%llu,\"last_loss_us\":%llu,\"cycle_started_us\":%llu,"
+					 "\"cycle_finished_us\":%llu,\"cycle_duration_us\":%llu},"
+					 "\"fence\":{\"attached\":%s,\"enforcing\":%s,\"engaged\":%s,"
+					 "\"self_fenced\":%s,\"allowed\":%s,\"reason\":\"%s\","
+					 "\"current_epoch\":%llu,\"authorized_epoch\":%llu,\"now_us\":%llu,"
+					 "\"expiry_us\":%llu,\"last_refresh_us\":%llu,\"event_id\":%llu}}",
+					 cluster_node_id, MyProcPid, (unsigned long long)INSTR_TIME_GET_MICROSEC(began),
+					 (unsigned long long)INSTR_TIME_GET_MICROSEC(ended),
+					 q.attached ? "true" : "false", q.observer_frozen ? "true" : "false", q.status,
+					 q.quorum_state, q.collision, q.disks_ok, q.disks_total, q.completed_cycles,
+					 (unsigned long long)q.now_us, (unsigned long long)q.epoch_at_boot,
+					 (unsigned long long)q.last_poll_us, (unsigned long long)q.expiry_us,
+					 (unsigned long long)q.last_loss_us, (unsigned long long)q.cycle_started_us,
+					 (unsigned long long)q.cycle_finished_us,
+					 (unsigned long long)q.cycle_duration_us, f.attached ? "true" : "false",
+					 f.enforcing ? "true" : "false", f.engaged ? "true" : "false",
+					 f.self_fenced ? "true" : "false", f.allowed ? "true" : "false",
+					 cluster_write_fence_observation_reason(&f),
+					 (unsigned long long)f.epoch_current, (unsigned long long)f.authorized_epoch,
+					 (unsigned long long)f.now_us, (unsigned long long)f.expiry_us,
+					 (unsigned long long)f.last_refresh_us, (unsigned long long)f.event_id);
+	PG_RETURN_TEXT_P(cstring_to_text(result.data));
 }
 
 static void

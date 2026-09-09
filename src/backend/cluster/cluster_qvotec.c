@@ -164,7 +164,11 @@ typedef struct ClusterQvotecShmem {
 	 * dead-deadband (the epoch signal is INITIAL on both sides in that race).
 	 */
 	pg_atomic_uint32 prior_unclean_death; /* offset 72..75 */
-	uint8 _reserved[52];
+	uint32 diagnostic_pad;
+	pg_atomic_uint64 diagnostic_cycle_started_us;
+	pg_atomic_uint64 diagnostic_cycle_finished_us;
+	pg_atomic_uint64 diagnostic_cycle_duration_us;
+	uint8 _reserved[24];
 	ClusterQvotecMailbox mailbox;
 } ClusterQvotecShmem;
 
@@ -176,6 +180,8 @@ StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_unclean_death) == 72,
 					 "prior_unclean_death must sit at offset 72 (queue lane owns 64..71)");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, mailbox) == CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES,
 					 "ClusterQvotecShmem mailbox must start at absolute offset 128");
+StaticAssertDecl(offsetof(ClusterQvotecShmem, diagnostic_cycle_started_us) == 80,
+				 "diagnostic timestamps must occupy only the former reserved prefix");
 
 
 static ClusterQvotecShmem *QvotecShmem = NULL;
@@ -620,6 +626,10 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->_pad, 0);
 		pg_atomic_init_u64(&QvotecShmem->self_incarnation, 0);
 		pg_atomic_init_u32(&QvotecShmem->prior_unclean_death, 0);
+		QvotecShmem->diagnostic_pad = 0;
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_started_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_finished_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_duration_us, 0);
 		memset(QvotecShmem->_reserved, 0, sizeof(QvotecShmem->_reserved));
 		cluster_qvotec_mailbox_restart_reset(&QvotecShmem->mailbox);
 	}
@@ -638,6 +648,32 @@ void
 cluster_qvotec_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_qvotec_region);
+}
+
+void
+cluster_qvotec_observe(ClusterQvotecObservation *out)
+{
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	out->now_us = (uint64)GetCurrentTimestamp();
+	out->observer_frozen = cluster_writes_frozen != 0;
+	if (QvotecShmem == NULL)
+		return;
+	out->attached = true;
+	out->status = pg_atomic_read_u32(&QvotecShmem->state);
+	out->quorum_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
+	out->collision = pg_atomic_read_u32(&QvotecShmem->collision_state);
+	out->disks_ok = pg_atomic_read_u32(&QvotecShmem->disks_ok_count);
+	out->disks_total = pg_atomic_read_u32(&QvotecShmem->disks_total_count);
+	out->completed_cycles = pg_atomic_read_u32(&QvotecShmem->poll_cycle_count);
+	out->epoch_at_boot = pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
+	out->last_poll_us = pg_atomic_read_u64(&QvotecShmem->last_poll_ts_us);
+	out->expiry_us = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
+	out->last_loss_us = pg_atomic_read_u64(&QvotecShmem->last_quorum_loss_ts_us);
+	out->cycle_started_us = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_started_us);
+	out->cycle_finished_us = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_finished_us);
+	out->cycle_duration_us = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_duration_us);
 }
 
 
@@ -3956,10 +3992,17 @@ ClusterQvotecMain(void)
 		 * matrix, decide quorum, publish shmem.  Counter bumps live
 		 * inside qvotec_poll_once. */
 		INSTR_TIME_SET_CURRENT(cycle_started);
+		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_started_us,
+							(uint64)GetCurrentTimestamp());
 		qvotec_poll_pre_injection();
 		qvotec_poll_once();
 		INSTR_TIME_SET_CURRENT(cycle_finished);
 		INSTR_TIME_SUBTRACT(cycle_finished, cycle_started);
+		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_duration_us,
+							INSTR_TIME_GET_MICROSEC(cycle_finished));
+		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_finished_us,
+							(uint64)GetCurrentTimestamp());
+		pg_atomic_fetch_add_u32(&QvotecShmem->poll_cycle_count, 1);
 		cluster_pgstat_inc(qvotec_counter_poll_cycle);
 
 		timeout_ms = qvotec_poll_wait_timeout_ms(
@@ -4193,6 +4236,13 @@ cluster_get_voting_disks(PG_FUNCTION_ARGS)
 
 
 #else /* !USE_PGRAC_CLUSTER */
+
+void
+cluster_qvotec_observe(ClusterQvotecObservation *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+}
 
 /*
  * Disable-cluster stubs.  Same symbol surface, all return defaults.
