@@ -296,6 +296,9 @@ extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
  * generation) triple for the formation collector's double sample. */
 extern bool cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_out,
 													uint32 *generation_out);
+/* One locked record, including its invalid/not-yet-learned state. False is
+ * absent storage/invalid arguments, not a coherent capability mismatch. */
+extern bool cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out);
 extern bool cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);

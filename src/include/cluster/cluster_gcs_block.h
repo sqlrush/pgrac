@@ -395,23 +395,21 @@ GcsBlockResourceXDirectInitProofAllowedExact(
  * predicate grants no authority and preserves no evidence: it permits only
  * one fresh driver iteration when the current descriptor is the exact
  * one-generation/one-token clean N successor, the round is still absent,
- * the sampled authority tuple is still current, and the original deadline
- * remains live. */
+ * the authority recheck permits resampling, and the original diagnostic
+ * threshold is still bound. A recognized missing observation permits only
+ * interruptible reobservation, never publication from the old tuple. */
 static inline bool
 cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
-	ResourceXBootstrapRoundAction action,
-	bool direct_init, bool join_only,
-	const ClusterPcmOwnSnapshot *before_x,
-	ClusterPcmOwnResult live_result,
-	const ClusterPcmOwnSnapshot *live_n,
-	ResourceXApplyResult round_snapshot_result,
-	bool authority_current,
-	uint64 now_us, uint64 absolute_deadline_us)
+	ResourceXBootstrapRoundAction action, bool direct_init, bool join_only,
+	const ClusterPcmOwnSnapshot *before_x, ClusterPcmOwnResult live_result,
+	const ClusterPcmOwnSnapshot *live_n, ResourceXApplyResult round_snapshot_result,
+	bool authority_recheck_allows_resample, uint64 now_us, uint64 absolute_deadline_us)
 {
 	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED || direct_init || join_only
 		|| before_x == NULL || live_n == NULL || live_result != CLUSTER_PCM_OWN_OK
-		|| round_snapshot_result != RESOURCE_X_APPLY_NOT_FOUND || !authority_current || now_us == 0
-		|| now_us == UINT64_MAX || absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX)
+		|| round_snapshot_result != RESOURCE_X_APPLY_NOT_FOUND || !authority_recheck_allows_resample
+		|| now_us == 0 || now_us == UINT64_MAX || absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX)
 		return false;
 	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
 		|| before_x->pcm_state != (uint8) PCM_STATE_X
@@ -439,19 +437,16 @@ cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
  * iteration under the original deadline. */
 static inline bool
 cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
-	ResourceXBootstrapRoundAction action,
-	bool direct_init, bool join_only,
-	const ClusterPcmOwnSnapshot *before_x,
-	ClusterPcmOwnResult live_result,
-	const ClusterPcmOwnSnapshot *live_n,
-	bool retained_pair_exact, bool retained_buffer_exact,
-	bool authority_current,
-	uint64 now_us, uint64 absolute_deadline_us)
+	ResourceXBootstrapRoundAction action, bool direct_init, bool join_only,
+	const ClusterPcmOwnSnapshot *before_x, ClusterPcmOwnResult live_result,
+	const ClusterPcmOwnSnapshot *live_n, bool retained_pair_exact, bool retained_buffer_exact,
+	bool authority_recheck_allows_resample, uint64 now_us, uint64 absolute_deadline_us)
 {
 	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED || direct_init || join_only
 		|| before_x == NULL || live_n == NULL || live_result != CLUSTER_PCM_OWN_OK
-		|| !retained_pair_exact || !retained_buffer_exact || !authority_current || now_us == 0
-		|| now_us == UINT64_MAX || absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX)
+		|| !retained_pair_exact || !retained_buffer_exact || !authority_recheck_allows_resample
+		|| now_us == 0 || now_us == UINT64_MAX || absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX)
 		return false;
 	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
 		|| before_x->pcm_state != (uint8) PCM_STATE_X
@@ -684,10 +679,11 @@ cluster_gcs_pcm_x_auth_sample_classify(const ClusterGcsPcmXAuthSample *sample,
 	return PCM_X_SESSION_AUTH_OK;
 }
 
-/* A complete non-OK sample is retryable only before a Resource-X round has
- * been created or any holder mutation has started.  The caller retains the
- * first absolute deadline and must still recheck admission, gate, master,
- * session and transport identity on every iteration. */
+/* These results mean an observation is unavailable, not that identity is
+ * current.  Before a round, the caller can reobserve without authority.
+ * After binding or mutation, only an explicit phase-aware consumer may yield
+ * to the same registered owner; it must preserve cleanup and recheck the full
+ * admission/gate/master/session/transport identity before proceeding. */
 static inline bool
 cluster_gcs_pcm_x_auth_result_retryable(PcmXSessionAuthResult result)
 {
@@ -4653,8 +4649,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(
 	uint64 r4_record_generation, uint64 reservation_token,
 	ResourceXTargetEvictionPlan *plan_out);
 extern ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_publish_exact(
-	ResourceXTargetEvictionPlan *plan);
+cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *plan,
+												  bool *retry_pending_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_abort_exact(
 	ResourceXTargetEvictionPlan *plan);
@@ -4672,6 +4668,10 @@ cluster_gcs_resource_x_target_direct_init_join_exact(
 	uint64 direct_init_reservation_token,
 	ResourceXAcquisitionRef *ref_out);
 extern bool cluster_gcs_resource_x_target_context_recheck_exact(
+	const ResourceXWriterUseContext *context);
+/* Local proof check only: BAD_STATE means recognized unavailable observation,
+ * never permission. Callers must revalidate their physical proof after wait. */
+extern ResourceXApplyResult cluster_gcs_resource_x_target_context_recheck_result_exact(
 	const ResourceXWriterUseContext *context);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_itl_recycle_begin_exact(

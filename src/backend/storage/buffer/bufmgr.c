@@ -3107,6 +3107,7 @@ cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmOwnSnapshot granted;
 	ClusterPcmOwnResult own_result;
+	ResourceXApplyResult context_result;
 	ResourceXGateSnapshot gate;
 	ResourceXWriterPath current_path;
 	uint64 current_r4_generation = 0;
@@ -3124,28 +3125,36 @@ cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 			RESOURCE_X_APPLY_BAD_STATE, buf,
 			"Resource-X direct-init ledger reuse");
 
-	MemSet(&gate, 0, sizeof(gate));
-	MemSet(&granted, 0, sizeof(granted));
-	(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
-	current_path = cluster_resource_x_writer_path_snapshot(
-		&current_r4_generation);
-	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &granted);
-	if (own_result != CLUSTER_PCM_OWN_OK
-		|| current_path != RESOURCE_X_WRITER_TARGET
-		|| current_r4_generation != context->r4_record_generation
-		|| gate.phase != RESOURCE_X_GATE_OPEN
-		|| gate.formation != context->ref.formation
-		|| !BufferTagsEqual(&granted.tag, &buf->tag)
-		|| granted.generation != context->buffer_ownership_generation
-		|| granted.pcm_state != (uint8)PCM_STATE_X
-		|| granted.flags != 0
-		|| granted.writer_activation_token != 0
-		|| granted.resource_x_activation_generation != 0
-		|| !cluster_gcs_resource_x_target_context_recheck_exact(context)) {
-		cluster_bufmgr_resource_x_fail_closed_exact(&gate);
-		cluster_bufmgr_resource_x_writer_report_failure(
-			RESOURCE_X_APPLY_STALE, buf,
-			"Resource-X direct-init ledger recheck");
+	for (;;) {
+		MemSet(&gate, 0, sizeof(gate));
+		MemSet(&granted, 0, sizeof(granted));
+		(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+		current_path = cluster_resource_x_writer_path_snapshot(&current_r4_generation);
+		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &granted);
+		if (own_result != CLUSTER_PCM_OWN_OK || current_path != RESOURCE_X_WRITER_TARGET
+			|| current_r4_generation != context->r4_record_generation
+			|| gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != context->ref.formation
+			|| !BufferTagsEqual(&granted.tag, &buf->tag)
+			|| granted.generation != context->buffer_ownership_generation
+			|| granted.pcm_state != (uint8)PCM_STATE_X || granted.flags != 0
+			|| granted.writer_activation_token != 0
+			|| granted.resource_x_activation_generation != 0)
+			context_result = RESOURCE_X_APPLY_STALE;
+		else
+			context_result = cluster_gcs_resource_x_target_context_recheck_result_exact(context);
+		if (context_result == RESOURCE_X_APPLY_BAD_STATE) {
+			/* No ledger or permission is exported during an observation gap.
+			 * Revalidate the original post-T3 ownership after every wait. */
+			(void)cluster_bufmgr_resource_x_wait_retry(BufferDescriptorGetContentLock(buf),
+													   buf->buf_id, 0, NULL);
+			continue;
+		}
+		if (context_result != RESOURCE_X_APPLY_APPLIED) {
+			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+			cluster_bufmgr_resource_x_writer_report_failure(
+				context_result, buf, "Resource-X direct-init ledger recheck");
+		}
+		break;
 	}
 
 	entry = cluster_bufmgr_pcm_x_writer_free_entry();
@@ -3177,6 +3186,7 @@ cluster_bufmgr_pcm_x_writer_activate(
 {
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
+	ResourceXApplyResult context_result;
 	ResourceXGateSnapshot gate;
 	ResourceXWriterPath current_path;
 	uint64 current_r4_generation = 0;
@@ -3189,48 +3199,53 @@ cluster_bufmgr_pcm_x_writer_activate(
 	if (entry == NULL)
 		return false;
 	buf = GetBufferDescriptor(entry->buffer_id);
-	if (entry->phase != PCM_X_WRITER_LEDGER_ACQUIRING
-		|| !cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)
-		|| entry->content_lock == NULL
-		|| !LWLockHeldByMe(entry->content_lock))
-		cluster_bufmgr_resource_x_writer_report_failure(
-			RESOURCE_X_APPLY_BAD_STATE, buf, "activate phase");
-	MemSet(&gate, 0, sizeof(gate));
-	current_path = cluster_resource_x_writer_path_snapshot(
-		&current_r4_generation);
-	(void) cluster_pcm_lock_resource_x_gate_snapshot(&gate);
-	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
-	path_current = current_path == RESOURCE_X_WRITER_TARGET
-		&& current_r4_generation
-			== entry->authority.r4_record_generation;
-	gate_current = gate.phase == RESOURCE_X_GATE_OPEN
-		&& gate.formation == entry->authority.ref.formation;
-	tag_current = own_result == CLUSTER_PCM_OWN_OK
-		&& BufferTagsEqual(&live.tag, &buf->tag)
-		&& BufferTagsEqual(
-			&entry->authority.ref.assertion.resource, &buf->tag);
-	context_exact = own_result == CLUSTER_PCM_OWN_OK
-		&& path_current && gate_current && tag_current
-		&& live.generation
-			== entry->authority.buffer_ownership_generation
-		&& live.pcm_state == (uint8) PCM_STATE_X
-		&& live.flags == 0
-		&& live.writer_activation_token == 0
-		&& live.resource_x_activation_generation == 0
-		&& cluster_gcs_resource_x_target_context_recheck_exact(
-			&entry->authority);
-	if (!context_exact)
-	{
-		if (allow_reprobe
-			&& cluster_pcm_x_target_preuse_drift_retryable(
-				&live, path_current, gate_current, tag_current))
-		{
-			cluster_bufmgr_pcm_x_writer_clear(entry);
-			return false;
+	for (;;) {
+		if (entry->phase != PCM_X_WRITER_LEDGER_ACQUIRING
+			|| !cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf) || entry->content_lock == NULL
+			|| !LWLockHeldByMe(entry->content_lock))
+			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_BAD_STATE, buf,
+															"activate phase");
+		MemSet(&gate, 0, sizeof(gate));
+		current_path = cluster_resource_x_writer_path_snapshot(&current_r4_generation);
+		(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
+		path_current = current_path == RESOURCE_X_WRITER_TARGET
+					   && current_r4_generation == entry->authority.r4_record_generation;
+		gate_current = gate.phase == RESOURCE_X_GATE_OPEN
+					   && gate.formation == entry->authority.ref.formation;
+		tag_current = own_result == CLUSTER_PCM_OWN_OK && BufferTagsEqual(&live.tag, &buf->tag)
+					  && BufferTagsEqual(&entry->authority.ref.assertion.resource, &buf->tag);
+		context_exact
+			= own_result == CLUSTER_PCM_OWN_OK && path_current && gate_current && tag_current
+			  && live.generation == entry->authority.buffer_ownership_generation
+			  && live.pcm_state == (uint8)PCM_STATE_X && live.flags == 0
+			  && live.writer_activation_token == 0 && live.resource_x_activation_generation == 0;
+		context_result
+			= context_exact
+				  ? cluster_gcs_resource_x_target_context_recheck_result_exact(&entry->authority)
+				  : RESOURCE_X_APPLY_STALE;
+		context_exact = context_result == RESOURCE_X_APPLY_APPLIED;
+		if (!allow_reprobe && context_result == RESOURCE_X_APPLY_BAD_STATE) {
+			/* Direct-init still owns its original ledger, pin and I/O obligation.
+		 * Nothing has initialized the page yet. Never wait under content-X or
+		 * reuse a physical snapshot taken before releasing that lock. */
+			LWLockRelease(entry->content_lock);
+			(void)cluster_bufmgr_resource_x_wait_retry(entry->content_lock, buf->buf_id, 0, NULL);
+			LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
+			continue;
 		}
-		cluster_bufmgr_resource_x_fail_closed_exact(&gate);
-		cluster_bufmgr_resource_x_writer_report_failure(
-			RESOURCE_X_APPLY_STALE, buf, "Resource-X target activate");
+		if (!context_exact) {
+			if (allow_reprobe
+				&& cluster_pcm_x_target_preuse_drift_retryable(&live, path_current, gate_current,
+															   tag_current)) {
+				cluster_bufmgr_pcm_x_writer_clear(entry);
+				return false;
+			}
+			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+			cluster_bufmgr_resource_x_writer_report_failure(context_result, buf,
+															"Resource-X target activate");
+		}
+		break;
 	}
 	entry->phase = PCM_X_WRITER_LEDGER_ACTIVE;
 	cluster_pcm_lock_resource_x_trace_ref(RESOURCE_X_TRACE_PREUSE, &entry->authority.ref,
@@ -3971,39 +3986,50 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 			/* The terminal round has already completed T2/T3.  Rebind that
 			 * exact retained cover to the consumed stack proof before the
 			 * caller is allowed to take content EXCLUSIVE and initialize. */
-			buf_state = LockBufHdr(buf);
-			cluster_bufmgr_pcm_direct_init_snapshot_locked(
-				buf, buf_state, PageIsNew((Page)BufHdrGetBlock(buf)),
-				&committed_observed);
-			UnlockBufHdr(buf, buf_state);
-			MemSet(&gate, 0, sizeof(gate));
-			MemSet(&context, 0, sizeof(context));
-			(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
-			current_writer_path = cluster_resource_x_writer_path_snapshot(
-				&current_writer_r4_generation);
-			context.ref = terminal_ref;
-			context.r4_record_generation = writer_r4_generation;
-			context.buffer_ownership_generation
-				= committed_observed.generation;
-			context.writer_activation_token = 0;
-			context.resource_x_activation_generation = 0;
-			installed_aux_image = cluster_bufmgr_pcm_aux_installed_image_matches(
-				kind, &observed, &committed_observed, &terminal_ref);
-			pending_result = installed_aux_image ? CLUSTER_PCM_OWN_OK
-												 : cluster_pcm_direct_init_target_commit_validate(
-													   kind, &committed_observed, proof);
-			if (pending_result != CLUSTER_PCM_OWN_OK
-				|| current_writer_path != RESOURCE_X_WRITER_TARGET
-				|| current_writer_r4_generation != writer_r4_generation
-				|| gate.phase != RESOURCE_X_GATE_OPEN
-				|| gate.formation != terminal_ref.formation
-				|| !cluster_gcs_resource_x_target_context_recheck_exact(
-					&context))
-			{
-				cluster_bufmgr_resource_x_fail_closed_exact(&gate);
-				cluster_bufmgr_resource_x_writer_report_failure(
-					RESOURCE_X_APPLY_STALE, buf,
-					"Resource-X direct-init target post-T3 proof");
+			for (;;) {
+				buf_state = LockBufHdr(buf);
+				cluster_bufmgr_pcm_direct_init_snapshot_locked(
+					buf, buf_state, PageIsNew((Page)BufHdrGetBlock(buf)), &committed_observed);
+				UnlockBufHdr(buf, buf_state);
+				MemSet(&gate, 0, sizeof(gate));
+				MemSet(&context, 0, sizeof(context));
+				(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+				current_writer_path
+					= cluster_resource_x_writer_path_snapshot(&current_writer_r4_generation);
+				context.ref = terminal_ref;
+				context.r4_record_generation = writer_r4_generation;
+				context.buffer_ownership_generation = committed_observed.generation;
+				context.writer_activation_token = 0;
+				context.resource_x_activation_generation = 0;
+				installed_aux_image = cluster_bufmgr_pcm_aux_installed_image_matches(
+					kind, &observed, &committed_observed, &terminal_ref);
+				pending_result = installed_aux_image
+									 ? CLUSTER_PCM_OWN_OK
+									 : cluster_pcm_direct_init_target_commit_validate(
+										   kind, &committed_observed, proof);
+				if (pending_result != CLUSTER_PCM_OWN_OK
+					|| current_writer_path != RESOURCE_X_WRITER_TARGET
+					|| current_writer_r4_generation != writer_r4_generation
+					|| gate.phase != RESOURCE_X_GATE_OPEN
+					|| gate.formation != terminal_ref.formation)
+					resource_x_result = RESOURCE_X_APPLY_STALE;
+				else
+					resource_x_result
+						= cluster_gcs_resource_x_target_context_recheck_result_exact(&context);
+				if (resource_x_result == RESOURCE_X_APPLY_BAD_STATE) {
+					/* Keep the consumed proof and current pin/IO obligation, but
+				 * no header/content lock. Resample the whole descriptor and
+				 * validate that same proof after the observation recovers. */
+					(void)cluster_bufmgr_resource_x_wait_retry(BufferDescriptorGetContentLock(buf),
+															   buf->buf_id, 0, NULL);
+					continue;
+				}
+				if (resource_x_result != RESOURCE_X_APPLY_APPLIED) {
+					cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+					cluster_bufmgr_resource_x_writer_report_failure(
+						resource_x_result, buf, "Resource-X direct-init target post-T3 proof");
+				}
+				break;
 			}
 			/* PGRAC: installed aux bytes are not known-new bytes.  Do not
 			 * register an initialization writer.  Re-enter CACHED_X and the
@@ -5677,6 +5703,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	uint64 reservation_token = 0;
 	uint32 old_flags;
 	bool precommit_exact;
+	bool retry_pending = false;
+	volatile bool temporary_pin = false;
 
 	MemSet(&revoking, 0, sizeof(revoking));
 	MemSet(&committed_n, 0, sizeof(committed_n));
@@ -5721,6 +5749,13 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	/* Phase B: freeze kind-4 and claim EVICTING without any buffer lock. */
 	PG_TRY();
 	{
+		/* PREPARE uses no private buffer pins. Reserve off-lock, before its
+		 * reversible claim, so taking the invalidator's pin after N cannot
+		 * allocate or throw while holding mapping/header authority. */
+		if (expected_refcount == 0) {
+			ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+			ReservePrivateRefCountEntry();
+		}
 		prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
 			tag, &revoking, r4_record_generation, reservation_token,
 			&plan);
@@ -5829,6 +5864,14 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			"TARGET cached-X local commit cleanup");
 	}
 
+	/* A descriptor with zero pins is a clock-sweep candidate even without
+	 * freelist insertion. Keep an ordinary foreground pin throughout the
+	 * exact publication; the victim path already owns its caller pin. */
+	if (expected_refcount == 0) {
+		PinBuffer_Locked(buf);
+		temporary_pin = true;
+		buf_state = LockBufHdr(buf);
+	}
 	old_flags = buf_state & BUF_FLAG_MASK;
 	ClearBufferTag(&buf->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
@@ -5839,20 +5882,29 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	LWLockRelease(partition_lock);
 	plan.local_n_committed = true;
 
-	/* Phase D: publish the already-frozen bytes.  Any failure from here is
-	 * post-mutation ambiguity: retain EVICTING/cover, close the gate, and keep
-	 * the descriptor out of the freelist/victim return path. */
+	/* Phase D: keep the same plan and pin for recognized pending publication.
+	 * A hard failure or cancellation closes the gate before local pin cleanup;
+	 * neither error handling nor elapsed time certifies the EVICTING close. */
 	PG_TRY();
 	{
-		publish_result
-			= cluster_gcs_resource_x_target_evict_publish_exact(&plan);
+		for (;;) {
+			retry_pending = false;
+			publish_result
+				= cluster_gcs_resource_x_target_evict_publish_exact(&plan, &retry_pending);
+			if (publish_result != RESOURCE_X_APPLY_BAD_STATE || !retry_pending)
+				break;
+			(void)cluster_bufmgr_resource_x_wait_retry(BufferDescriptorGetContentLock(buf),
+													   buf->buf_id, 0, NULL);
+		}
 	}
 	PG_CATCH();
 	{
 		cluster_bufmgr_resource_x_fail_closed_current();
+		if (temporary_pin)
+			UnpinBuffer(buf);
 		elog(LOG,
 			 "Resource-X TARGET cached-X eviction publish threw after local commit; "
-			 "buffer %d remains non-reusable",
+			 "buffer %d is N/unmapped; unresolved EVICTING remains fail-closed",
 			 buf->buf_id);
 		PG_RE_THROW();
 	}
@@ -5861,6 +5913,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		&& publish_result != RESOURCE_X_APPLY_DUPLICATE)
 	{
 		cluster_bufmgr_resource_x_fail_closed_current();
+		if (temporary_pin)
+			UnpinBuffer(buf);
 		elog(LOG,
 			 "Resource-X TARGET cached-X eviction publish ambiguity: "
 			 "buffer=%d result=%d",
@@ -5869,6 +5923,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			RESOURCE_X_APPLY_RECOVERY_BLOCKED, buf,
 			"TARGET cached-X eviction publish after local commit");
 	}
+	if (temporary_pin)
+		UnpinBuffer(buf);
 	if (return_to_freelist)
 		StrategyFreeBuffer(buf);
 	return true;

@@ -15595,7 +15595,14 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else if (pcm_resource_x_local_owner_expire_locked(entry, now_us)) {
 		broadcast = true;
-		result = RESOURCE_X_APPLY_STALE;
+		/* Expiry removed only reversible local priority, not the master's
+		 * request.  A current successor retries without receiving a grant;
+		 * an independently contradicted lineage still rejects the old frame. */
+		result = pcm_resource_x_terminal_x_lineage_locked(
+					 entry, round, successor_block, authenticated_master_node, r4_record_generation,
+					 cached_ownership_generation, false, lineage_out)
+					 ? RESOURCE_X_APPLY_BAD_STATE
+					 : RESOURCE_X_APPLY_STALE;
 	} else {
 		lineage_matches = pcm_resource_x_terminal_x_lineage_locked(
 			entry, round, successor_block, authenticated_master_node,
@@ -15623,7 +15630,6 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 					: RESOURCE_X_APPLY_STALE;
 		} else if (owner->state == RESOURCE_X_LOCAL_OWNER_HANDOFF) {
 			if (!pcm_resource_x_local_handoff_valid(&owner->handoff)
-				|| now_us >= owner->handoff.deadline_us
 				|| !lineage_matches
 				|| !pcm_resource_x_local_handoff_round_current_locked(
 					&owner->handoff, round)) {
@@ -15658,8 +15664,6 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 			 * allowed to hide behind the same generic BUSY disposition: reject it
 			 * as STALE without changing owner, HANDOFF, or the local deadline. */
 			if (!pcm_resource_x_local_handoff_valid(&owner->handoff)
-				|| (now_us >= owner->handoff.deadline_us
-					&& !pcm_resource_x_source_finish_pending_locked(entry))
 				|| !lineage_matches
 				|| !pcm_resource_x_local_handoff_round_current_locked(&owner->handoff, round))
 				result = RESOURCE_X_APPLY_STALE;
@@ -15748,9 +15752,9 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
 			&& owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
 		|| !pcm_resource_x_local_handoff_valid(&owner->handoff))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if ((now_us >= owner->handoff.deadline_us
-			  && !pcm_resource_x_source_finish_pending_locked(entry))
-			 || !pcm_resource_x_local_handoff_round_current_locked(&owner->handoff, round)
+	/* The priority deadline bounds reversible HANDOFF, not the lifetime of
+	 * an executor that already owns REVOKING and its cleanup obligation. */
+	else if (!pcm_resource_x_local_handoff_round_current_locked(&owner->handoff, round)
 			 || !pcm_resource_x_terminal_x_lineage_locked(
 				 entry, round, successor_block, authenticated_master_node, r4_record_generation,
 				 cached_ownership_generation, false, lineage_out))

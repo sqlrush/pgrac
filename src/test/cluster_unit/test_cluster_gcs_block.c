@@ -2748,7 +2748,7 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 		= { "cluster_semantic_activation_enter(",
 			"CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1",
 			"gcs_block_resource_x_gate_session_snapshot_result(",
-			"gcs_block_resource_x_gate_session_recheck(",
+			"gcs_block_resource_x_gate_session_recheck_result(",
 			"cluster_bufmgr_pcm_own_snapshot(",
 			"writer_activation_token == 0",
 			"resource_x_activation_generation == 0",
@@ -3159,9 +3159,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	retained_admission_recheck = retained_wait != NULL
 		? strstr(retained_wait,
 			"cluster_semantic_activation_recheck(&admission)") : NULL;
-	retained_gate_recheck = retained_admission_recheck != NULL
-		? strstr(retained_admission_recheck,
-			"gcs_block_resource_x_gate_session_recheck(") : NULL;
+	retained_gate_recheck
+		= retained_wait != NULL
+			  ? strstr(retained_wait, "gcs_block_resource_x_gate_session_recheck_result(")
+			  : NULL;
 	retained_deadline = retained_gate_recheck != NULL
 							? strstr(retained_gate_recheck, "CHECK_FOR_INTERRUPTS()")
 							: NULL;
@@ -3245,7 +3246,8 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		UT_ASSERT(continuation_capture < n_candidate);
 		UT_ASSERT(n_candidate < step);
 		UT_ASSERT(retained_wait < retained_admission_recheck);
-		UT_ASSERT(retained_admission_recheck < retained_gate_recheck);
+		UT_ASSERT(retained_gate_recheck < retained_admission_recheck);
+		UT_ASSERT(retained_admission_recheck < retained_deadline);
 		UT_ASSERT(retained_gate_recheck < retained_deadline);
 		UT_ASSERT(retained_deadline < retained_sleep);
 		UT_ASSERT(retained_wait < retained_sleep);
@@ -3937,18 +3939,17 @@ UT_TEST(test_resource_x_type17_early_stale_records_exact_failure_stage)
 
 UT_TEST(test_resource_x_type17_x_source_separates_wire_and_local_fence_formations)
 {
-	static const char *const dual_domain_contract[] = {
-		"gcs_block_resource_x_gate_session_snapshot(",
-		"resource_gate.formation != block->common.resource_formation",
-		"resource_master_node != authenticated_master_node",
-		"resource_master_session\n\t\t\t!= block->common.master_session_incarnation",
-		"cluster_resource_x_writer_path_snapshot(",
-		"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
-		"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
-		"gcs_block_resource_x_gate_session_recheck("
-	};
+	static const char *const dual_domain_contract[]
+		= { "gcs_block_resource_x_gate_session_snapshot_result(",
+			"resource_gate.formation != block->common.resource_formation",
+			"resource_master_node != authenticated_master_node",
+			"resource_master_session != block->common.master_session_incarnation",
+			"cluster_resource_x_writer_path_snapshot(",
+			"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
+			"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
+			"gcs_block_resource_x_gate_session_recheck_result(" };
 	char *source = read_gcs_block_source();
 	const char *helper;
 	const char *helper_end;
@@ -4289,9 +4290,9 @@ UT_TEST(test_resource_x_type17_selected_s_source_reuses_fenced_pair_core)
 		= { "source_mode = block->common.observed_mode",
 			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
 			"cluster_sf_peer_capability_word_sample(",
-			"gcs_block_resource_x_gate_session_recheck(",
+			"gcs_block_resource_x_gate_session_recheck_result(",
 			"cluster_bufmgr_pcm_own_prepare_s_source_image(",
-			"gcs_block_resource_x_gate_session_recheck(",
+			"gcs_block_resource_x_gate_session_recheck_result(",
 			"gcs_block_pcm_x_resource_x_build_source_frames(",
 			"cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(",
 			"return gcs_block_resource_x_source_finish_owned(" };
@@ -4363,20 +4364,19 @@ UT_TEST(test_resource_x_type17_selected_s_source_reuses_fenced_pair_core)
 
 UT_TEST(test_resource_x_type17_remote_s_holder_uses_exact_buffer_evidence)
 {
-	static const char *const holder_contract[] = {
-		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"cluster_pcm_x_remote_s_holder_pending_grant_result(",
-		"cluster_bufmgr_pcm_own_s_holder_candidate_exact(",
-		"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
-		"cluster_bufmgr_pcm_own_begin_s_revoke(",
-		"LWLockRelease(content_lock)",
-		"cluster_lms_outbound_stage_resource_x_remote_s_status_exact(",
-		"cluster_sf_peer_capability_generation_matches(",
-		"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
-		"cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
-		"LWLockRelease(content_lock)",
-		"cluster_lms_outbound_publish_resource_x_remote_s_status_exact("
-	};
+	static const char *const holder_contract[]
+		= { "cluster_bufmgr_pcm_own_snapshot_by_tag(",
+			"cluster_pcm_x_remote_s_holder_pending_grant_result(",
+			"cluster_bufmgr_pcm_own_s_holder_candidate_exact(",
+			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+			"cluster_bufmgr_pcm_own_begin_s_revoke(",
+			"LWLockRelease(content_lock)",
+			"cluster_lms_outbound_stage_resource_x_remote_s_status_exact(",
+			"gcs_block_resource_x_remote_s_authority_result_exact(",
+			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+			"cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
+			"LWLockRelease(content_lock)",
+			"cluster_lms_outbound_publish_resource_x_remote_s_status_exact(" };
 	char *source = read_gcs_block_source();
 	const char *helper;
 	const char *helper_end;
@@ -4450,6 +4450,16 @@ UT_TEST(test_resource_x_type17_remote_s_holder_uses_exact_buffer_evidence)
 
 UT_TEST(test_resource_x_type17_stable_n_replay_is_zero_mutation_and_revalidated)
 {
+	static const char *const authority_contract[]
+		= { "gcs_block_resource_x_gate_session_snapshot_result(",
+			"cluster_semantic_activation_recheck(admission)",
+			"cluster_pcm_lock_resource_x_gate_open_exact(",
+			"gate.formation != block->common.resource_formation",
+			"master_node != expected_master",
+			"cluster_gcs_pcm_x_auth_result_retryable(sample_result)",
+			"session != block->common.master_session_incarnation",
+			"cluster_sf_peer_capability_record_snapshot(",
+			"capability.generation != expected_connection" };
 	char *source = read_gcs_block_source();
 	const char *holder = strstr(source,
 		"\ngcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(");
@@ -4466,21 +4476,14 @@ UT_TEST(test_resource_x_type17_stable_n_replay_is_zero_mutation_and_revalidated)
 	const char *snapshot_failure = n_candidate != NULL
 		? strstr(n_candidate,
 			"first_failure.buffer_own_result = (int32)own_result;") : NULL;
-	const char *r4_recheck = n_candidate != NULL
-		? strstr(n_candidate,
-			"cluster_semantic_activation_recheck(admission)") : NULL;
-	const char *connection_recheck = r4_recheck != NULL
-		? strstr(r4_recheck,
-			"cluster_sf_peer_capability_generation_matches(") : NULL;
-	const char *gate_recheck = connection_recheck != NULL
-		? strstr(connection_recheck,
-			"cluster_pcm_lock_resource_x_gate_open_exact(") : NULL;
-	const char *session_recheck = gate_recheck != NULL
-		? strstr(gate_recheck,
-			"gcs_block_resource_x_peer_session_matches_exact(") : NULL;
-	const char *outbound_sample = session_recheck != NULL
-		? strstr(session_recheck,
-			"gcs_block_pcm_x_resource_x_peer_ready_exact(") : NULL;
+	const char *authority_recheck
+		= n_candidate != NULL
+			  ? strstr(n_candidate, "gcs_block_resource_x_remote_s_authority_result_exact(")
+			  : NULL;
+	const char *outbound_sample
+		= authority_recheck != NULL
+			  ? strstr(authority_recheck, "gcs_block_pcm_x_resource_x_peer_ready_exact(")
+			  : NULL;
 	const char *sender_rebind = outbound_sample != NULL
 		? strstr(outbound_sample,
 			"status.common.sender_connection_generation") : NULL;
@@ -4504,10 +4507,7 @@ UT_TEST(test_resource_x_type17_stable_n_replay_is_zero_mutation_and_revalidated)
 	UT_ASSERT_NOT_NULL(stable_n);
 	UT_ASSERT_NOT_NULL(n_candidate);
 	UT_ASSERT_NOT_NULL(snapshot_failure);
-	UT_ASSERT_NOT_NULL(r4_recheck);
-	UT_ASSERT_NOT_NULL(connection_recheck);
-	UT_ASSERT_NOT_NULL(gate_recheck);
-	UT_ASSERT_NOT_NULL(session_recheck);
+	UT_ASSERT_NOT_NULL(authority_recheck);
 	UT_ASSERT_NOT_NULL(outbound_sample);
 	UT_ASSERT_NOT_NULL(sender_rebind);
 	UT_ASSERT_NOT_NULL(status_encode);
@@ -4517,22 +4517,14 @@ UT_TEST(test_resource_x_type17_stable_n_replay_is_zero_mutation_and_revalidated)
 	UT_ASSERT_NOT_NULL(s_candidate);
 	UT_ASSERT_NOT_NULL(begin_revoke);
 	if (stable_n != NULL && n_candidate != NULL && snapshot_failure != NULL
-		&& r4_recheck != NULL
-		&& connection_recheck != NULL && gate_recheck != NULL
-		&& session_recheck != NULL && outbound_sample != NULL
-		&& sender_rebind != NULL && status_encode != NULL
-		&& status_enqueue != NULL && backpressure != NULL
-		&& applied != NULL
-		&& s_candidate != NULL && begin_revoke != NULL
-		&& holder_end != NULL) {
+		&& authority_recheck != NULL && outbound_sample != NULL && sender_rebind != NULL
+		&& status_encode != NULL && status_enqueue != NULL && backpressure != NULL
+		&& applied != NULL && s_candidate != NULL && begin_revoke != NULL && holder_end != NULL) {
 		UT_ASSERT(stable_n < n_candidate);
 		UT_ASSERT(n_candidate < snapshot_failure);
-		UT_ASSERT(snapshot_failure < r4_recheck);
-		UT_ASSERT(n_candidate < r4_recheck);
-		UT_ASSERT(r4_recheck < connection_recheck);
-		UT_ASSERT(connection_recheck < gate_recheck);
-		UT_ASSERT(gate_recheck < session_recheck);
-		UT_ASSERT(session_recheck < outbound_sample);
+		UT_ASSERT(snapshot_failure < authority_recheck);
+		UT_ASSERT(n_candidate < authority_recheck);
+		UT_ASSERT(authority_recheck < outbound_sample);
 		UT_ASSERT(outbound_sample < sender_rebind);
 		UT_ASSERT(sender_rebind < status_encode);
 		UT_ASSERT(status_encode < status_enqueue);
@@ -4542,6 +4534,11 @@ UT_TEST(test_resource_x_type17_stable_n_replay_is_zero_mutation_and_revalidated)
 		UT_ASSERT(applied < begin_revoke);
 		UT_ASSERT(begin_revoke < holder_end);
 	}
+	/* The admission, formation, session and connection guards moved into
+	 * one typed producer; prove its contents as well as the call-before-send. */
+	assert_ordered_in_function(source, "\ngcs_block_resource_x_remote_s_authority_result_exact(",
+							   "\n/* PGRAC adaptation approved", authority_contract,
+							   lengthof(authority_contract));
 	UT_ASSERT_NOT_NULL(strstr(source, "buffer_own_result=%d"));
 	UT_ASSERT_NOT_NULL(strstr(source, "buffer_flags_before=0x%08x"));
 	UT_ASSERT_NOT_NULL(strstr(source, "buffer_flags_after=0x%08x"));
@@ -6742,44 +6739,42 @@ UT_TEST(test_resource_x_pre_dispatch_drift_recaptures_current_authority_under_sa
 
 UT_TEST(test_resource_x_target_eviction_freezes_before_local_n_and_publishes_same_bytes)
 {
-	static const char *const prepare_contract[] = {
-		"volatile ResourceXLocalOwnerHandle cleanup_owner",
-		"volatile bool owner_claimed",
-		"memset(plan_out, 0, sizeof(*plan_out))",
-		"cluster_semantic_activation_enter(",
-		"admission.record_generation != r4_record_generation",
-		"gcs_block_resource_x_gate_session_snapshot(",
-		"gcs_block_pcm_x_resource_x_peer_ready_exact(",
-		"cluster_pcm_lock_resource_x_target_evict_prepare_exact(",
-		"memcpy((void *)&cleanup_owner, &owner, sizeof(owner))",
-		"owner_claimed = true",
-		"cluster_resource_x_wire_encode(",
-		"RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE",
-		"RESOURCE_X_WIRE_RELEASE_X",
-		"gcs_block_resource_x_gate_session_recheck(",
-		"memcpy(plan_out->release_payload, payload, payload_bytes)",
-		"plan_out->prepared = true",
-		"PG_CATCH()",
-		"ResourceXLocalOwnerHandle catch_owner",
-		"memcpy(&catch_owner, (const void *)&cleanup_owner",
-		"abort_result",
-		"cluster_pcm_lock_resource_x_target_evict_abort_exact(",
-		"abort_result != RESOURCE_X_APPLY_APPLIED",
-		"gcs_block_resource_x_fail_closed_current()",
-		"cluster_semantic_activation_leave(&admission)",
-		"PG_RE_THROW()"
-	};
-	static const char *const publish_contract[] = {
-		"!plan->prepared || !plan->local_n_committed",
-		"cluster_semantic_activation_enter(",
-		"gcs_block_resource_x_gate_session_recheck(",
-		"cluster_pcm_lock_resource_x_release_x_exact(",
-		"cluster_grd_outbound_enqueue_backend_msg(",
-		"plan->release_payload",
-		"plan->release_admitted = true",
-		"cluster_pcm_lock_resource_x_target_evict_commit_exact(",
-		"cluster_semantic_activation_leave(&admission)"
-	};
+	static const char *const prepare_contract[]
+		= { "volatile ResourceXLocalOwnerHandle cleanup_owner",
+			"volatile bool owner_claimed",
+			"memset(plan_out, 0, sizeof(*plan_out))",
+			"cluster_semantic_activation_enter(",
+			"admission.record_generation != r4_record_generation",
+			"gcs_block_resource_x_gate_session_snapshot_result(",
+			"gcs_block_pcm_x_resource_x_peer_ready_exact(",
+			"cluster_pcm_lock_resource_x_target_evict_prepare_exact(",
+			"memcpy((void *)&cleanup_owner, &owner, sizeof(owner))",
+			"owner_claimed = true",
+			"cluster_resource_x_wire_encode(",
+			"RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE",
+			"RESOURCE_X_WIRE_RELEASE_X",
+			"gcs_block_resource_x_target_eviction_recheck_result(",
+			"memcpy(plan_out->release_payload, payload, payload_bytes)",
+			"plan_out->prepared = true",
+			"PG_CATCH()",
+			"ResourceXLocalOwnerHandle catch_owner",
+			"memcpy(&catch_owner, (const void *)&cleanup_owner",
+			"abort_result",
+			"cluster_pcm_lock_resource_x_target_evict_abort_exact(",
+			"abort_result != RESOURCE_X_APPLY_APPLIED",
+			"gcs_block_resource_x_fail_closed_current()",
+			"cluster_semantic_activation_leave(&admission)",
+			"PG_RE_THROW()" };
+	static const char *const publish_contract[]
+		= { "!plan->prepared || !plan->local_n_committed",
+			"cluster_semantic_activation_enter(",
+			"gcs_block_resource_x_target_eviction_recheck_result(",
+			"cluster_pcm_lock_resource_x_release_x_exact(",
+			"cluster_grd_outbound_enqueue_backend_msg(",
+			"plan->release_payload",
+			"plan->release_admitted = true",
+			"cluster_pcm_lock_resource_x_target_evict_commit_exact(",
+			"cluster_semantic_activation_leave(&admission)" };
 	static const char *const abort_contract[] = {
 		"!plan->prepared",
 		"plan->local_n_committed || plan->release_admitted",

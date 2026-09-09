@@ -2082,6 +2082,21 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_pcm_source_replay.inc \
 		test_cluster_resource_x_terminal_owner.inc \
+		test_cluster_resource_x_terminal_gate_consumer.inc \
+		test_cluster_resource_x_session_observation.inc \
+		test_cluster_resource_x_remote_s_types.inc \
+		test_cluster_resource_x_remote_s_staged_gate.inc \
+		test_cluster_resource_x_source_final_gate.inc \
+		test_cluster_resource_x_source_entry_gate.inc \
+		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_retained_wait_gate.inc \
+		test_cluster_resource_x_predecessor_wait_gate.inc \
+		test_cluster_resource_x_dispatch_observation.inc \
+		test_cluster_pcm_source_finish_tick.inc \
+		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
+		test_cluster_resource_x_eviction_owner.inc \
+		test_cluster_resource_x_failed_round_observation.inc \
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_undo_cleaner_holds.inc \
@@ -2535,6 +2550,28 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_source_finish_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^cluster_gcs_block_resource_x_source_finish_tick\(/ { print "ResourceXApplyResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_eviction_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_eviction_begin_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_eviction_finish_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; finish++ } \
+	     /^cluster_pcm_own_eviction_abort_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; cancel++ } \
+	     /^cluster_bufmgr_resource_x_target_evict_locked\(/ { print "static bool"; emit=1; driver++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (begin != 1 || finish != 1 || cancel != 1 || driver != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The real clock-sweep loop, excluding the freelist and unrelated strategy setup.
+test_cluster_pcm_clock_sweep.inc: $(top_srcdir)/src/backend/storage/buffer/freelist.c Makefile
+	awk '/Nothing on the freelist, so run the "clock sweep" algorithm/ { emit=1; begin++ } \
+	     emit && /^}/ { emit=0; end++ } emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_preassert_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^typedef enum ResourceXSourceSettlementStage/ { emit=1; stage++ } \
 	     /^typedef struct ResourceXFirstFailureEvidence/ { emit=1; evidence++ } \
@@ -2576,7 +2613,9 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
+		test_cluster_pcm_source_finish_tick.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_pcm_checksum_owner.inc test_cluster_pcm_delivery_route_owner.inc $(CLUSTER_PCM_OWN_O)
@@ -2610,9 +2649,21 @@ test_cluster_pcm_aux_consumer.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 	     END { if (arm_enum != 1 || arm != 1 || gate != 1 || consumer != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_aux_ledger.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef (enum ClusterPcmXWriterLedgerPhase|struct ClusterPcmXWriterLedgerEntry)/ { emit=1; types++ } \
+	     /^static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger\[/ { print; array++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(find|free_entry)\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(entry_exact|activate)\(/ { print "static bool"; emit=1; boolean++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(clear|track_target_direct_init|activate_target_direct_init)\(/ { print "static void"; emit=1; action++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 2 || array != 1 || find != 2 || boolean != 2 || action != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_aux_consumer: test_cluster_pcm_aux_consumer.c unit_test.h \
-		test_cluster_pcm_aux_consumer.inc $(CLUSTER_PCM_DIRECT_INIT_O)
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc \
+		$(CLUSTER_PCM_DIRECT_INIT_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_DIRECT_INIT_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-8.4 W0: source-path-only static/model RED.  Prospective R4 files are
@@ -2863,18 +2914,122 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # fixture doubles; the master/source decision and call sequence are product C.
 test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
+	     /^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1 } \
+	     /^gcs_block_resource_x_target_peer_matches_exact\(/ { print "static bool"; emit=1; peer++ } \
 	     /^gcs_block_resource_x_delivery_finish_exact\(/ { print "static ResourceXApplyResult"; emit=1; finish++ } \
 	     /^gcs_block_resource_x_delivery_run_exact\(/ { print "static ResourceXApplyResult"; emit=1; run++ } \
 	     /^cluster_gcs_block_resource_x_delivery_tick\(/ { print "ResourceXApplyResult"; emit=1; tick++ } \
 	     /^gcs_block_resource_x_cleanup_frame_exact\(/ { print "static ResourceXApplyResult"; emit=1; cleanup++ } \
 	     /^gcs_block_resource_x_kind9_ingress\(/ { print "static void"; emit=1; admission++ } \
+	     /^gcs_block_resource_x_type17_ingress\(/ { print "static ResourceXApplyResult"; emit=1; type17++ } \
+	     /^gcs_block_resource_x_bootstrapped_assert_ingress\(/ { print "static ResourceXApplyResult"; emit=1; assertion++ } \
 	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; join++ } \
+	     /^cluster_gcs_resource_x_target_context_recheck_result_exact\(/ { print "ResourceXApplyResult"; emit=1; context++ } \
+	     /^cluster_gcs_resource_x_target_context_recheck_exact\(/ { print "bool"; emit=1; context_bool++ } \
+	     /^gcs_block_resource_x_target_recycle_inputs_exact\(/ { print "static bool"; emit=1; recycle_input++ } \
+	     /^gcs_block_resource_x_target_recycle_inputs_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; recycle_input++ } \
+	     /^cluster_gcs_resource_x_target_itl_recycle_(begin|finish)_exact\(/ { print "ResourceXApplyResult"; emit=1; recycle++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1) exit 1 }' $< > $@.tmp
+	     END { if (owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1 || context != 1 || context_bool != 1 || peer != 1 || type17 != 1 || assertion != 1 || recycle_input != 1 || recycle != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_terminal_gate_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^[[:space:]]*terminal_admission_current$$/ { emit=1; begin++ } \
+	     emit && /memset\(&target_install_follow, 0,/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_eviction_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_target_eviction_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1 } \
+	     /^cluster_gcs_resource_x_target_evict_(prepare|publish|abort)_exact\(/ { print "ResourceXApplyResult"; emit=1; owner++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (owner != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_failed_round_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/\/\* The cached-X sample can be invalidated by an exact type-17/ { emit=1; begin++ } \
+	     emit { print } emit && /break;/ { emit=0; end++ } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_session_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_gate_session_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_remote_s_types.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef (enum ResourceXSourceSettlementStage|struct ResourceXFirstFailureEvidence)/ { emit=1; types++ } \
+	     /^gcs_block_resource_x_remote_s_authority_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; authority++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 2 || authority != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_remote_s_staged_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/\/\* The type-17.s authority is sampled again after cross-domain staging\./ { emit=1; begin++ } \
+	     emit && /if \(!LWLockConditionalAcquire\(content_lock, LW_EXCLUSIVE\)\)/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_source_final_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/failure_stage = "source-final-gate";/ { emit=1; begin++ } \
+	     emit && /if \(tagless_target_x && target_x_retain && !semantic_retained\)/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_source_entry_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/\/\* Resource-X formation and the local BufferDesc owner/ { emit=1; begin++ } \
+	     emit && /status_result = cluster_pcm_lock_resource_x_holder_status_exact\(/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_source_prepare_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/failure_stage = "source-gate-recheck";/ { emit=1; begin++ } \
+	     emit && /memset\(&source_prepare_refusal, 0,/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_retained_wait_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(target_retained_release_inflight\)/ { emit=1; begin++; next } \
+	     emit && /diagnostic_stage = "retained-release-wait";/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_predecessor_wait_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/diagnostic_stage = "predecessor-settlement-wait";/ { emit=1; begin++ } \
+	     emit && /now_us = gcs_block_pcm_x_monotonic_us\(\);/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_dispatch_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/diagnostic_stage = "dispatch-recheck";/ { print prev2; print prev1; emit=1; begin++ } \
+	     emit && /if \(action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT\)/ { emit=0; end++ } \
+	     emit { print } \
+	     { prev2=prev1; prev1=$$0 } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingress.c \
 		unit_test.h test_cluster_resource_x_terminal_owner.inc \
+		test_cluster_resource_x_eviction_owner.inc \
+		test_cluster_resource_x_failed_round_observation.inc \
+		test_cluster_resource_x_remote_s_types.inc \
+		test_cluster_resource_x_remote_s_staged_gate.inc \
+		test_cluster_resource_x_terminal_gate_consumer.inc \
+		test_cluster_resource_x_session_observation.inc \
+		test_cluster_resource_x_source_final_gate.inc \
+		test_cluster_resource_x_source_entry_gate.inc \
+		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_retained_wait_gate.inc \
+		test_cluster_resource_x_predecessor_wait_gate.inc \
+		test_cluster_resource_x_dispatch_observation.inc \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic.h \

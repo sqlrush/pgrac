@@ -588,9 +588,44 @@ UT_TEST(test_current_mx_capability_generation_sample_is_connection_exact)
 	UT_ASSERT_EQ(generation, (uint32)0);
 }
 
+UT_TEST(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift)
+{
+	ClusterSfPeerCap sample;
+
+	memset(&sample, 0xff, sizeof(sample));
+	UT_ASSERT(!cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, &sample));
+	UT_ASSERT(!sample.valid);
+	UT_ASSERT_EQ(sample.generation, 0);
+	test_sf_cap_store_reset();
+	UT_ASSERT(cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, &sample));
+	UT_ASSERT(!sample.valid);
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER,
+												PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, 73);
+	UT_ASSERT(cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, &sample));
+	UT_ASSERT(sample.valid);
+	UT_ASSERT_EQ(sample.generation, 73);
+	UT_ASSERT_EQ(sample.bits, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1);
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 73);
+	UT_ASSERT(cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, &sample));
+	UT_ASSERT(!sample.valid);
+	UT_ASSERT_EQ(sample.generation, 73); /* Invalidated is not a fresh incarnation. */
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER,
+												PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, 74);
+	UT_ASSERT(cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, &sample));
+	UT_ASSERT(sample.valid);
+	UT_ASSERT_EQ(sample.generation, 74);
+	UT_ASSERT_EQ(sample.bits, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1);
+	UT_ASSERT(!cluster_sf_peer_capability_record_snapshot(-1, &sample));
+	UT_ASSERT(!sample.valid);
+	UT_ASSERT_EQ(sample.generation, 0);
+	UT_ASSERT(!cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, NULL));
+}
+
 int
 main(void)
 {
+	UT_PLAN(19);
+	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_vec_set_union_and_clear);
 	UT_RUN(test_vec_rejects_invalid_origin_and_lsn);
 	UT_RUN(test_smart_fusion_lwlock_tranche);

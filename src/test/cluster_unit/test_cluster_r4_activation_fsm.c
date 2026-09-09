@@ -120,6 +120,8 @@ static bool test_peer_capability_word_sample_ok;
 static uint32 test_peer_capability_word;
 static uint32 test_peer_capability_generation;
 static int test_peer_capability_sample_calls[CLUSTER_MAX_NODES];
+static int test_capability_missing_peer = -1;
+static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
 static bool test_ctrc_shmem_is_ready = true;
 static ClusterICSendResult test_send_results[CLUSTER_MAX_NODES];
@@ -541,7 +543,21 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_cap
 	test_peer_capability_match_peer = peer_id;
 	test_peer_capability_match_caps = required_capabilities;
 	test_peer_capability_match_generation = expected_generation;
-	return test_peer_capability_matches;
+	return test_peer_capability_matches && peer_id != test_capability_missing_peer;
+}
+
+bool
+cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || test_capability_store_missing || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+	test_peer_capability_sample_calls[peer_id]++;
+	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer;
+	out->bits = test_peer_capability_word;
+	out->generation = test_peer_capability_generation;
+	return true;
 }
 
 bool
@@ -556,11 +572,9 @@ cluster_sf_peer_capability_word_sample(int32 peer_id,
 		*generation_out = 0;
 	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES)
 		test_peer_capability_sample_calls[peer_id]++;
-	if (!test_peer_capability_word_sample_ok
-		|| peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
-		|| required_capabilities == 0
-		|| (test_peer_capability_word & required_capabilities)
-			   != required_capabilities)
+	if (!test_peer_capability_word_sample_ok || peer_id == test_capability_missing_peer
+		|| peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || required_capabilities == 0
+		|| (test_peer_capability_word & required_capabilities) != required_capabilities)
 		return false;
 	if (capability_word_out != NULL)
 		*capability_word_out = test_peer_capability_word;
@@ -8045,6 +8059,8 @@ ut_resource_x_open_carrier_setup_at_epoch(
 	int node;
 
 	UT_ASSERT(token != NULL);
+	test_capability_missing_peer = -1;
+	test_capability_store_missing = false;
 	test_gate_reset();
 	cluster_node_id = 0;
 	test_membership_snapshot_valid = true;
@@ -8193,10 +8209,97 @@ UT_TEST(test_145j_resource_x_peer_match_reports_first_failed_predicate)
 	test_membership_snapshot_valid = true;
 
 	test_peer_capability_matches = false;
+	test_peer_capability_generation++;
 	UT_ASSERT_EQ(
 		cluster_semantic_activation_resource_x_peer_open_check(
 			&token, 2, 19),
 		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT);
+	test_gate_reset();
+}
+
+UT_TEST(test_a89_peer_open_missing_and_torn_observations_are_not_identity_drift)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticActivationAckTableV1 *table;
+
+	ut_resource_x_open_carrier_setup(&token);
+	table = SemanticActivationAckTable;
+	test_capability_missing_peer = 2;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY);
+	UT_ASSERT(!cluster_semantic_activation_resource_x_peer_open_matches(&token, 2, 19));
+	test_capability_missing_peer = -1;
+	pg_atomic_write_u64(&table->publication_seq, 1);
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN);
+	pg_atomic_write_u64(&table->publication_seq, 2);
+	SemanticActivationAckTable = NULL;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_UNAVAILABLE);
+	SemanticActivationAckTable = table;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	/* A valid different connection remains a contradiction, not pending. */
+	test_peer_capability_matches = false;
+	test_peer_capability_generation++;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT);
+	test_gate_reset();
+}
+
+UT_TEST(test_a89_peer_open_full_image_pending_and_independent_contradiction)
+{
+	ClusterSemanticAdmissionToken token;
+	uint64 self_incarnation;
+	int leg;
+
+	ut_resource_x_open_carrier_setup(&token);
+	test_capability_missing_peer = 1;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING);
+	UT_ASSERT(!cluster_semantic_activation_resource_x_peer_open_matches(&token, 2, 19));
+	/* A different later row must win over the earlier unobservable row. */
+	test_remote_admitted_incarnations[3]++;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT);
+	test_remote_admitted_incarnations[3]--;
+	test_capability_missing_peer = -1;
+	self_incarnation = test_qvotec_self_incarnation;
+	test_qvotec_self_incarnation = 0;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING);
+	test_qvotec_self_incarnation = self_incarnation;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	/* Pending fields cannot hide other known fields in that same member row. */
+	for (leg = 0; leg < 6; leg++) {
+		ClusterSemanticActivationAckTableV1 *table;
+		int node = leg < 2 ? 0 : 1;
+
+		ut_resource_x_open_carrier_setup(&token);
+		table = SemanticActivationAckTable;
+		if (leg == 0) {
+			test_qvotec_self_incarnation = 0;
+			table->expected[0].capability_word ^= UINT32_C(1) << 31;
+		} else if (leg == 1) {
+			test_last_admitted_incarnation = 0;
+			table->expected[0].control_connection_generation++;
+		} else if (leg == 2) {
+			test_remote_admitted_incarnations[1] = 0;
+			table->expected[1].control_connection_generation++;
+		} else {
+			test_capability_missing_peer = 1;
+			if (leg == 3)
+				table->expected[1].boot_id++;
+			if (leg == 4)
+				table->expected[1].transition_epoch++;
+			if (leg == 5)
+				table->expected[1].record_generation++;
+		}
+		table->observed[node] = table->expected[node];
+		UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 2, 19),
+					 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT);
+	}
 	test_gate_reset();
 }
 
@@ -8312,7 +8415,7 @@ UT_TEST(test_145m_resource_x_prepare_carrier_survives_unavailable_snapshot)
 int
 main(void)
 {
-	UT_PLAN(230);
+	UT_PLAN(232);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -8540,6 +8643,8 @@ main(void)
 	UT_RUN(test_145h_resource_x_open_carrier_survives_unavailable_snapshot);
 	UT_RUN(test_145i_resource_x_open_carrier_invalidates_formation_drift);
 	UT_RUN(test_145j_resource_x_peer_match_reports_first_failed_predicate);
+	UT_RUN(test_a89_peer_open_missing_and_torn_observations_are_not_identity_drift);
+	UT_RUN(test_a89_peer_open_full_image_pending_and_independent_contradiction);
 	UT_RUN(test_145k_restore_open_proof_does_not_overwrite_resource_x_carrier);
 	UT_RUN(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapshot);
 	UT_RUN(test_145m_resource_x_prepare_carrier_survives_unavailable_snapshot);

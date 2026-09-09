@@ -4539,18 +4539,17 @@ semantic_activation_full_ack_table_matches(
 	return true;
 }
 
-static bool
-semantic_activation_ack_complete_image_current(
-	const ClusterSemanticActivationAckTableV1 *image,
-	uint64 current_members_lo, uint64 current_members_hi,
-	uint64 current_epoch, int32 current_coordinator_node,
-	int32 local_node_id, uint32 local_capability_word)
+static ClusterSemanticResourceXPeerOpenResult
+semantic_activation_ack_complete_image_check(const ClusterSemanticActivationAckTableV1 *image,
+											 uint64 current_members_lo, uint64 current_members_hi,
+											 uint64 current_epoch, int32 current_coordinator_node,
+											 int32 local_node_id, uint32 local_capability_word)
 {
 	SemanticActivationAckTuple current;
-	uint32 capability_word;
-	uint32 capability_generation;
+	ClusterSfPeerCap capability;
 	uint32 required_caps;
 	uint64 admitted_incarnation;
+	bool observation_pending = false;
 	int node;
 
 	if (image == NULL || local_node_id < 0
@@ -4579,37 +4578,74 @@ semantic_activation_ack_complete_image_current(
 			image->observed, image->observed_members_lo,
 			image->observed_members_hi, image->expected,
 			image->expected_members_lo, image->expected_members_hi))
-		return false;
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		if (!semantic_activation_ack_member_present(
 				current_members_lo, current_members_hi, node))
 			continue;
+		admitted_incarnation = cluster_membership_get_last_admitted_incarnation(node);
+		if (image->expected[node].transition_epoch != current_epoch
+			|| image->expected[node].record_generation != image->record_generation
+			|| cluster_membership_get_state(node) != CLUSTER_MEMBER_MEMBER
+			|| (admitted_incarnation != 0
+				&& (admitted_incarnation != image->expected[node].admitted_incarnation
+					|| admitted_incarnation != image->observed[node].admitted_incarnation
+					|| (node != local_node_id
+						&& admitted_incarnation != image->expected[node].boot_id))))
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 		if (node == local_node_id) {
-			if (!semantic_activation_ack_self_tuple(
-					local_node_id, local_capability_word, current_epoch,
-					image->record_generation, &current))
-				return false;
+			uint64 self_incarnation = cluster_qvotec_get_self_incarnation();
+
+			if ((local_capability_word & CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+					!= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+				|| local_capability_word != image->expected[node].capability_word
+				|| (self_incarnation != 0
+					&& (self_incarnation != image->expected[node].boot_id
+						|| self_incarnation != image->observed[node].boot_id
+						|| self_incarnation != image->expected[node].control_connection_generation
+						|| self_incarnation != image->expected[node].capability_generation
+						|| (admitted_incarnation != 0
+							&& self_incarnation != admitted_incarnation))))
+				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
+			if (self_incarnation == 0 || admitted_incarnation == 0) {
+				observation_pending = true;
+				continue;
+			}
+			memset(&current, 0, sizeof(current));
+			current.node_id = (uint32)node;
+			current.boot_id = self_incarnation;
+			current.admitted_incarnation = admitted_incarnation;
+			current.control_connection_generation = self_incarnation;
+			current.capability_word = local_capability_word;
+			current.capability_generation = self_incarnation;
+			current.transition_epoch = current_epoch;
+			current.record_generation = image->record_generation;
 		} else {
-			admitted_incarnation
-				= cluster_membership_get_last_admitted_incarnation(node);
-			if (admitted_incarnation == 0
-				|| cluster_membership_get_state(node)
-				   != CLUSTER_MEMBER_MEMBER
-				|| !cluster_sf_peer_capability_word_sample(
-					node, required_caps,
-					&capability_word, &capability_generation)
-				|| capability_generation == 0)
-				return false;
+			if (!cluster_sf_peer_capability_record_snapshot(node, &capability))
+				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
+			if (!capability.valid) {
+				observation_pending = true;
+				continue;
+			}
+			if (capability.generation == 0 || (capability.bits & required_caps) != required_caps
+				|| capability.generation != image->expected[node].capability_generation
+				|| capability.generation != image->observed[node].capability_generation
+				|| capability.generation != image->expected[node].control_connection_generation
+				|| capability.bits != image->expected[node].capability_word
+				|| capability.bits != image->observed[node].capability_word)
+				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
+			if (admitted_incarnation == 0) {
+				observation_pending = true;
+				continue;
+			}
 			memset(&current, 0, sizeof(current));
 			current.node_id = (uint32)node;
 			current.boot_id = admitted_incarnation;
 			current.admitted_incarnation = admitted_incarnation;
-			current.control_connection_generation
-				= (uint64)capability_generation;
-			current.capability_word = capability_word;
-			current.capability_generation
-				= (uint64)capability_generation;
+			current.control_connection_generation = (uint64)capability.generation;
+			current.capability_word = capability.bits;
+			current.capability_generation = (uint64)capability.generation;
 			current.transition_epoch = current_epoch;
 			current.record_generation = image->record_generation;
 		}
@@ -4617,9 +4653,22 @@ semantic_activation_ack_complete_image_current(
 				&image->expected[node], &current)
 			|| !semantic_activation_ack_matches(
 				&image->observed[node], &current))
-			return false;
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 	}
-	return true;
+	return observation_pending ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING
+							   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
+}
+
+static bool
+semantic_activation_ack_complete_image_current(const ClusterSemanticActivationAckTableV1 *image,
+											   uint64 current_members_lo, uint64 current_members_hi,
+											   uint64 current_epoch, int32 current_coordinator_node,
+											   int32 local_node_id, uint32 local_capability_word)
+{
+	return semantic_activation_ack_complete_image_check(
+			   image, current_members_lo, current_members_hi, current_epoch,
+			   current_coordinator_node, local_node_id, local_capability_word)
+		   == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 }
 
 static bool
@@ -10589,6 +10638,9 @@ cluster_semantic_activation_resource_x_peer_open_check(
 	uint64 current_epoch;
 	uint32 local_capability_word;
 	int32 current_coordinator_node;
+	ClusterSfPeerCap capability;
+	ClusterSemanticResourceXPeerOpenResult image_result;
+	bool capability_pending;
 
 	if (token == NULL || !token->entered
 		|| token->feature_bit
@@ -10600,18 +10652,21 @@ cluster_semantic_activation_resource_x_peer_open_check(
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
 	if (!cluster_semantic_activation_recheck(token))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT;
-	if (!cluster_sf_peer_capability_generation_matches(
-			authenticated_peer_node_id,
-			PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-			sampled_capability_generation))
+	if (!cluster_sf_peer_capability_record_snapshot(authenticated_peer_node_id, &capability))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
+	capability_pending = !capability.valid;
+	if (!capability_pending
+		&& ((capability.bits & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0
+			|| capability.generation != sampled_capability_generation))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
 	if (!semantic_activation_ack_current_authority(
 			cluster_node_id, &current_members_lo, &current_members_hi,
 			&current_epoch, &current_coordinator_node))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE;
-	if (SemanticActivationAckTable == NULL
-		|| !semantic_activation_ack_table_snapshot(&table))
+	if (SemanticActivationAckTable == NULL)
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_UNAVAILABLE;
+	if (!semantic_activation_ack_table_snapshot(&table))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN;
 	if (table.stage
 		!= CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_STAGE_MISMATCH;
@@ -10637,11 +10692,14 @@ cluster_semantic_activation_resource_x_peer_open_check(
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ROW_MISMATCH;
 
 	local_capability_word = cluster_ic_local_capability_word();
-	if (!semantic_activation_ack_complete_image_current(
-			&table, current_members_lo, current_members_hi, current_epoch,
-			current_coordinator_node, cluster_node_id, local_capability_word))
-		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
-	return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
+	image_result = semantic_activation_ack_complete_image_check(
+		&table, current_members_lo, current_members_hi, current_epoch, current_coordinator_node,
+		cluster_node_id, local_capability_word);
+	if (image_result != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+		&& image_result != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING)
+		return image_result;
+	return capability_pending ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY
+							  : image_result;
 }
 
 bool

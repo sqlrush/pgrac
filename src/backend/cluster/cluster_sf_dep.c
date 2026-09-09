@@ -451,9 +451,22 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabili
 
 /* Exact full-word and generation sample from one locked capability record. */
 bool
+cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
+{
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+	if (out == NULL || ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	*out = ClusterSfDep->peer_capabilities[peer_id];
+	LWLockRelease(&ClusterSfDep->lock);
+	return true;
+}
+
+/* Required-capability positive sample; unavailable still exports no proof. */
+bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
-									  uint32 *capability_word_out,
-									  uint32 *generation_out)
+									   uint32 *capability_word_out, uint32 *generation_out)
 {
 	const ClusterSfPeerCap *cap;
 	bool supported = false;

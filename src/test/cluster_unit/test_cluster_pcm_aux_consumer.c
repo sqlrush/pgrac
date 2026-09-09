@@ -23,6 +23,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_direct_init.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "storage/bufmgr.h"
 #include "unit_test.h"
@@ -43,6 +44,9 @@ static int fixture_fuse;
 static int fixture_acquires;
 static int fixture_reservations;
 static uint64 fixture_payload;
+static int fixture_context_pending, fixture_waits, fixture_post_t3_snapshots;
+static bool fixture_change_on_wait, fixture_cancel_on_wait;
+static void (*fixture_wait_check)(void);
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -71,6 +75,8 @@ static void
 fixture_snapshot(BufferDesc *buf, uint32 state, bool is_new, ClusterPcmDirectInitSnapshot *out)
 {
 	UT_ASSERT(buf == &fixture_buf);
+	if (fixture_acquires > 0)
+		fixture_post_t3_snapshots++;
 	*out = fixture_state;
 	out->buf_state = state;
 	out->page_is_new = is_new;
@@ -186,7 +192,42 @@ fixture_context(const ResourceXWriterUseContext *context)
 	UT_ASSERT_EQ(context->r4_record_generation, 6);
 	UT_ASSERT_EQ(context->writer_activation_token, 0);
 	UT_ASSERT_EQ(context->resource_x_activation_generation, 0);
+	if (fixture_context_pending > 0) {
+		fixture_context_pending--;
+		return false;
+	}
 	return fixture_context_valid;
+}
+
+static ResourceXApplyResult
+pg_attribute_unused() fixture_context_result(const ResourceXWriterUseContext *context)
+{
+	bool pending = fixture_context_pending > 0;
+
+	if (fixture_context(context))
+		return RESOURCE_X_APPLY_APPLIED;
+	return pending ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+}
+
+static bool
+pg_attribute_unused()
+	fixture_observation_wait(LWLock *content, int32 buffer, uint32 wait_index, bool *barrier)
+{
+	UT_ASSERT(content == BufferDescriptorGetContentLock(&fixture_buf));
+	UT_ASSERT_EQ(buffer, 0);
+	UT_ASSERT_EQ(wait_index, 0);
+	UT_ASSERT(barrier == NULL);
+	UT_ASSERT(!fixture_content_held);
+	UT_ASSERT_EQ(fixture_state.private_refcount, 1);
+	UT_ASSERT_EQ(fixture_track, 0);
+	if (fixture_wait_check != NULL)
+		fixture_wait_check();
+	fixture_waits++;
+	if (fixture_change_on_wait)
+		fixture_state.generation++;
+	if (fixture_cancel_on_wait)
+		siglongjmp(fixture_error, 1);
+	return true;
 }
 
 static void
@@ -234,6 +275,8 @@ fixture_failure(void)
 #define cluster_gcs_resource_x_target_direct_init_acquire_exact fixture_acquire
 #define cluster_pcm_lock_resource_x_gate_snapshot fixture_gate
 #define cluster_gcs_resource_x_target_context_recheck_exact fixture_context
+#define cluster_gcs_resource_x_target_context_recheck_result_exact fixture_context_result
+#define cluster_bufmgr_resource_x_wait_retry fixture_observation_wait
 #define cluster_bufmgr_pcm_direct_init_report_failure(...) fixture_failure()
 #define cluster_bufmgr_resource_x_writer_report_failure(...) fixture_failure()
 #define cluster_pcm_own_abort_grant_after_error(...) fixture_failure()
@@ -253,6 +296,41 @@ fixture_failure(void)
 #define elog(level, ...) UT_ASSERT_EQ(level, DEBUG1)
 
 #include "test_cluster_pcm_aux_consumer.inc"
+
+/* The upper-consumer cases above keep their ledger dependencies controlled.
+ * These additional cases execute the real ledger find/bind/activate bodies. */
+static ClusterPcmOwnResult
+fixture_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
+{
+	UT_ASSERT(buf == &fixture_buf);
+	memset(out, 0, sizeof(*out));
+	out->tag = fixture_state.tag;
+	out->generation = fixture_state.generation;
+	out->pcm_state = fixture_state.pcm_state;
+	out->flags = fixture_state.flags;
+	out->writer_activation_token = fixture_state.writer_activation_token;
+	out->resource_x_activation_generation = fixture_state.resource_x_activation_generation;
+	return CLUSTER_PCM_OWN_OK;
+}
+
+static void
+pg_attribute_unused() fixture_unlock(LWLock *lock)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(&fixture_buf));
+	UT_ASSERT(fixture_content_held);
+	fixture_content_held = false;
+}
+
+#undef cluster_bufmgr_pcm_x_writer_track_target_direct_init
+#undef cluster_bufmgr_pcm_x_writer_activate_target_direct_init
+#define cluster_bufmgr_pcm_own_snapshot fixture_own_snapshot
+#define cluster_node_id 0
+#define LWLockHeldByMe(lock) ((void)(lock), fixture_content_held)
+#define LWLockRelease fixture_unlock
+#define cluster_pcm_lock_resource_x_trace_ref(...) (fixture_activate++)
+#undef ereport
+#define ereport(...) fixture_failure()
+#include "test_cluster_pcm_aux_ledger.inc"
 
 static void
 fixture_reset(ClusterPcmDirectInitKind kind, bool remote)
@@ -278,6 +356,9 @@ fixture_reset(ClusterPcmDirectInitKind kind, bool remote)
 	fixture_mutation = fixture_ordinary = fixture_track = fixture_activate = 0;
 	fixture_fuse = fixture_acquires = fixture_reservations = 0;
 	fixture_payload = 0;
+	fixture_context_pending = fixture_waits = fixture_post_t3_snapshots = 0;
+	fixture_change_on_wait = fixture_cancel_on_wait = false;
+	fixture_wait_check = NULL;
 }
 
 UT_TEST(test_initialized_remote_aux_uses_ordinary_upper_consumer)
@@ -347,14 +428,184 @@ UT_TEST(test_initialized_remote_aux_rejects_each_changed_identity)
 	}
 }
 
+UT_TEST(test_actual_aux_post_t3_wait_resamples_proof_without_reinitializing_image)
+{
+	for (int remote = 0; remote <= 1; remote++) {
+		fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, remote != 0);
+		fixture_context_pending = 3;
+		if (sigsetjmp(fixture_error, 0) != 0) {
+			UT_ASSERT(!"temporary post-T3 observation was made a hard failure");
+			continue;
+		}
+		UT_ASSERT_EQ(LockBufferForAuxiliaryPageInit(1, CLUSTER_PCM_DIRECT_INIT_VM), 1);
+		UT_ASSERT_EQ(fixture_waits, 3);
+		/* Installed remote bytes re-enter the original CACHED_X arm once. */
+		UT_ASSERT_EQ(fixture_post_t3_snapshots, remote ? 5 : 4);
+		UT_ASSERT_EQ(fixture_fuse, 0);
+		UT_ASSERT_EQ(fixture_acquires, 1);
+		UT_ASSERT_EQ(fixture_reservations, 1);
+		UT_ASSERT_EQ(fixture_ordinary, remote ? 1 : 0);
+		UT_ASSERT_EQ(fixture_track, remote ? 0 : 1);
+		UT_ASSERT_EQ(fixture_activate, remote ? 0 : 1);
+		UT_ASSERT_EQ(fixture_payload, remote ? UINT64CONST(0x123456789abcdef0) : 0);
+	}
+}
+
+UT_TEST(test_actual_aux_post_t3_wait_rejects_later_drift_and_cancellation)
+{
+	for (int cancel = 0; cancel <= 1; cancel++) {
+		fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, false);
+		fixture_context_pending = 1;
+		fixture_change_on_wait = cancel == 0;
+		fixture_cancel_on_wait = cancel == 1;
+		if (sigsetjmp(fixture_error, 0) == 0) {
+			(void)LockBufferForAuxiliaryPageInit(1, CLUSTER_PCM_DIRECT_INIT_VM);
+			UT_ASSERT(!"post-wait stale proof or caller cancellation admitted");
+		}
+		UT_ASSERT_EQ(fixture_waits, 1);
+		UT_ASSERT_EQ(fixture_post_t3_snapshots, cancel ? 1 : 2);
+		UT_ASSERT_EQ(fixture_fuse, cancel ? 0 : 1);
+		UT_ASSERT_EQ(fixture_track, 0);
+		UT_ASSERT_EQ(fixture_activate, 0);
+		UT_ASSERT_EQ(fixture_ordinary, 0);
+		UT_ASSERT(!fixture_content_held);
+	}
+}
+
+static ResourceXWriterUseContext fixture_ledger_context;
+static bool fixture_expect_bound;
+
+static void
+fixture_check_pending_ledger(void)
+{
+	ClusterPcmXWriterLedgerEntry *entry = cluster_bufmgr_pcm_x_writer_find(&fixture_buf);
+
+	if (!fixture_expect_bound) {
+		UT_ASSERT(entry == NULL);
+		return;
+	}
+	UT_ASSERT_NOT_NULL(entry);
+	if (entry != NULL) {
+		UT_ASSERT_EQ(entry->phase, PCM_X_WRITER_LEDGER_ACQUIRING);
+		UT_ASSERT_EQ(
+			memcmp(&entry->authority, &fixture_ledger_context, sizeof(fixture_ledger_context)), 0);
+		UT_ASSERT_EQ(entry->granted.generation, 12);
+	}
+	UT_ASSERT_EQ(fixture_activate, 0);
+}
+
+static void
+fixture_ledger_reset(void)
+{
+	fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, false);
+	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+	memset(&fixture_ledger_context, 0, sizeof(fixture_ledger_context));
+	fixture_state.generation = 12;
+	fixture_state.pcm_state = (uint8)PCM_STATE_X;
+	fixture_ledger_context.ref.assertion.resource = fixture_buf.tag;
+	fixture_ledger_context.ref.assertion.requester_node = 0;
+	fixture_ledger_context.ref.formation = 2;
+	fixture_ledger_context.ref.acquisition_generation = 41;
+	fixture_ledger_context.r4_record_generation = 6;
+	fixture_ledger_context.buffer_ownership_generation = 12;
+	fixture_wait_check = fixture_check_pending_ledger;
+	fixture_expect_bound = false;
+}
+
+UT_TEST(test_actual_direct_init_ledger_waits_before_binding_and_activation)
+{
+	fixture_ledger_reset();
+	fixture_context_pending = 3;
+	if (sigsetjmp(fixture_error, 0) != 0) {
+		UT_ASSERT(!"direct-init observation gap became a ledger/activation failure");
+		return;
+	}
+	cluster_bufmgr_pcm_x_writer_track_target_direct_init(&fixture_buf, &fixture_ledger_context);
+	UT_ASSERT_EQ(fixture_waits, 3);
+	UT_ASSERT_EQ(fixture_fuse, 0);
+	fixture_expect_bound = true;
+	fixture_context_pending = 3;
+	fixture_content_held = true;
+	cluster_bufmgr_pcm_x_writer_activate_target_direct_init(&fixture_buf);
+	UT_ASSERT_EQ(fixture_waits, 6);
+	UT_ASSERT_EQ(fixture_fuse, 0);
+	UT_ASSERT_EQ(fixture_activate, 1);
+	UT_ASSERT(fixture_content_held);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(&fixture_buf)->phase, PCM_X_WRITER_LEDGER_ACTIVE);
+	UT_ASSERT_EQ(fixture_state.private_refcount, 1);
+	UT_ASSERT_EQ(fixture_payload, 0);
+}
+
+UT_TEST(test_actual_direct_init_ledger_wait_rechecks_physical_drift_and_cancel)
+{
+	for (int activate = 0; activate <= 1; activate++) {
+		for (int cancel = 0; cancel <= 1; cancel++) {
+			fixture_ledger_reset();
+			if (activate) {
+				cluster_bufmgr_pcm_x_writer_track_target_direct_init(&fixture_buf,
+																	 &fixture_ledger_context);
+				fixture_expect_bound = true;
+				fixture_content_held = true;
+			}
+			fixture_context_pending = 1;
+			fixture_change_on_wait = cancel == 0;
+			fixture_cancel_on_wait = cancel == 1;
+			if (sigsetjmp(fixture_error, 0) == 0) {
+				if (activate)
+					cluster_bufmgr_pcm_x_writer_activate_target_direct_init(&fixture_buf);
+				else
+					cluster_bufmgr_pcm_x_writer_track_target_direct_init(&fixture_buf,
+																		 &fixture_ledger_context);
+				UT_ASSERT(!"ledger admitted drift/cancel after pending observation");
+			}
+			UT_ASSERT_EQ(fixture_waits, 1);
+			UT_ASSERT_EQ(fixture_fuse, cancel ? 0 : 1);
+			UT_ASSERT_EQ(fixture_activate, 0);
+			UT_ASSERT_EQ(fixture_state.private_refcount, 1);
+			UT_ASSERT_EQ(fixture_payload, 0);
+			UT_ASSERT(fixture_content_held == (activate && !cancel));
+			if (activate)
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(&fixture_buf)->phase,
+							 PCM_X_WRITER_LEDGER_ACQUIRING);
+			else
+				UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buf) == NULL);
+		}
+	}
+}
+
+UT_TEST(test_actual_ordinary_preuse_still_requalifies_without_waiting_under_lock)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+
+	fixture_ledger_reset();
+	cluster_bufmgr_pcm_x_writer_track_target_direct_init(&fixture_buf, &fixture_ledger_context);
+	entry = cluster_bufmgr_pcm_x_writer_find(&fixture_buf);
+	fixture_context_pending = 1;
+	fixture_content_held = true;
+	if (sigsetjmp(fixture_error, 0) != 0) {
+		UT_ASSERT(!"ordinary pre-use failed instead of requalifying");
+		return;
+	}
+	UT_ASSERT(!cluster_bufmgr_pcm_x_writer_activate(entry, true));
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buf) == NULL);
+	UT_ASSERT_EQ(fixture_waits, 0);
+	UT_ASSERT_EQ(fixture_fuse, 0);
+	UT_ASSERT(fixture_content_held); /* The existing caller releases this lock. */
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(9);
 	UT_RUN(test_initialized_remote_aux_uses_ordinary_upper_consumer);
 	UT_RUN(test_known_new_aux_keeps_initialization_proof);
 	UT_RUN(test_initialized_remote_aux_still_rejects_stale_context);
 	UT_RUN(test_initialized_remote_aux_rejects_each_changed_identity);
+	UT_RUN(test_actual_aux_post_t3_wait_resamples_proof_without_reinitializing_image);
+	UT_RUN(test_actual_aux_post_t3_wait_rejects_later_drift_and_cancellation);
+	UT_RUN(test_actual_direct_init_ledger_waits_before_binding_and_activation);
+	UT_RUN(test_actual_direct_init_ledger_wait_rechecks_physical_drift_and_cancel);
+	UT_RUN(test_actual_ordinary_preuse_still_requalifies_without_waiting_under_lock);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

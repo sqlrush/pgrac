@@ -5672,7 +5672,9 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(
 	owner_result = cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 		&successor_block, 0, 77, 91, 19, 9, UINT64_C(2300),
 		&lineage, &revoke);
-	UT_ASSERT_EQ(owner_result, RESOURCE_X_APPLY_STALE);
+	/* Expiring reversible priority supplies no new grant and does not
+	 * contradict the successor.  The same master must retry its request. */
+	UT_ASSERT_EQ(owner_result, RESOURCE_X_APPLY_BAD_STATE);
 	if (owner_result == RESOURCE_X_APPLY_APPLIED)
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
 			&revoke), RESOURCE_X_APPLY_APPLIED);
@@ -5681,9 +5683,9 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(
 		UINT64_C(2301), UINT64_C(50), true, 91, &unused_dispatch, &terminal_ref);
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL);
 
-	/* REVOKING retains the same local deadline.  An exact duplicate at that
-	 * boundary is stale and must not refresh priority or mutate the active
-	 * owner; the original handle remains the only legal cleanup identity. */
+	/* The priority deadline is not the active executor's lifetime.  Its exact
+	 * duplicate keeps waiting without refreshing priority or taking the owner;
+	 * the original handle remains the only legal cleanup identity. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 		&successor_block, 0, 77, 91, 19, 9, UINT64_C(2400),
 		&lineage, &revoke), RESOURCE_X_APPLY_APPLIED);
@@ -5692,11 +5694,16 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(
 		&successor_block, 0, 77, 91, UINT64_C(3399), &replay_lineage),
 		RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
-		&successor_block, 0, 77, 91, UINT64_C(3400), &replay_lineage),
-		RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+					 &successor_block, 0, 77, 91, UINT64_C(3400), &replay_lineage),
+				 RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
-		&successor_block, 0, 77, 91, 19, 9, UINT64_C(3400),
-		&lineage, &stale), RESOURCE_X_APPLY_STALE);
+					 &successor_block, 0, 77, 91, 19, 9, UINT64_C(3400), &lineage, &stale),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+					 &conflict_block, 0, 77, 91, 19, 10, UINT64_C(3400), &lineage, &stale),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
+		&successor_block, 0, 77, 91, &revoke, &lineage));
 
 	/* A prior VM conversion may be fully DRAINed before replacement removes
 	 * and later recreates the BufferDesc.  Its carrier generation therefore
@@ -7404,8 +7411,8 @@ UT_TEST(test_resource_x_target_install_preuse_successor_never_grants_old_receipt
 		UT_ASSERT(memcmp(owner_before, &fake_pcm_entries, sizeof(owner_before)) == 0);
 	}
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
-		&successor_block, 0, 77, 1, 15, 8, UINT64_C(1000200),
-		&lineage, &revoke), RESOURCE_X_APPLY_STALE);
+					 &successor_block, 0, 77, 1, 15, 8, UINT64_C(1000200), &lineage, &revoke),
+				 RESOURCE_X_APPLY_BAD_STATE);
 	assert_resource_x_target_install_follow_state(
 		&follow, &observed, RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY);
 	memset(&fresh, 0, sizeof(fresh));
