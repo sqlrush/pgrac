@@ -25,6 +25,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/ipc.h"
@@ -297,6 +298,22 @@ static uint8 cluster_r4_activation_test_send_payloads[CLUSTER_MAX_NODES]
 static uint32 cluster_r4_activation_test_send_payload_lengths[CLUSTER_MAX_NODES];
 static uint8 cluster_r4_activation_test_send_msg_types[CLUSTER_MAX_NODES];
 static uint32 cluster_r4_activation_test_close_calls[CLUSTER_MAX_NODES];
+
+/* Same fixture record as word_sample, including an unavailable observation.
+ * It never supplies a positive proof when the fixture record is invalid. */
+bool
+cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+	cluster_r4_activation_test_capability_sample_calls[peer_id]++;
+	out->valid = cluster_r4_activation_test_capability_word_sample_ok;
+	out->bits = cluster_r4_activation_test_capability_word;
+	out->generation = cluster_r4_activation_test_capability_generation;
+	return true;
+}
 
 bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
