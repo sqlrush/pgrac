@@ -14081,6 +14081,61 @@ cluster_gcs_resource_x_take_acquire_failure_reason(int buffer_id, ResourceXApply
 	return reason;
 }
 
+typedef struct GcsResourceXWaitDiagnostic {
+	PcmRxRequesterWaitState state;
+	const BufferTag *tag;
+	const ResourceXCallerWitness *caller;
+	uint64 request_sequence;
+	uint64 threshold_us;
+	uint64 budget_us;
+} GcsResourceXWaitDiagnostic;
+
+static void
+gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
+										 PcmRxRequesterWaitReason reason)
+{
+	PcmRxRequesterWaitSnapshot snapshot;
+	uint64 now_us = gcs_block_pcm_x_monotonic_us();
+	uint64 started_us = diagnostic->threshold_us > diagnostic->budget_us
+							? diagnostic->threshold_us - diagnostic->budget_us
+							: 0;
+	uint32 events = cluster_pcm_rx_requester_wait_note(&diagnostic->state, reason, started_us,
+													   diagnostic->budget_us, now_us);
+	bool found;
+
+	/* Normal short waits are counted, not logged per acquisition. Retirement
+	 * and threshold crossings log once per logical request/reason, outside all
+	 * entry/buffer locks. The later snapshot is explicitly not authority. */
+	if (events == 0
+		|| (events == PCM_RX_WAIT_FIRST_REASON && reason != PCM_RX_WAIT_RETIRED_EMPTY
+			&& reason != PCM_RX_WAIT_RETIRED_SUCCESSOR))
+		return;
+	found = cluster_pcm_rx_requester_wait_snapshot(diagnostic->tag, &snapshot);
+	ereport(
+		LOG,
+		(errmsg_internal("Resource-X requester owned-wait observation"),
+		 errdetail(
+			 "PGRAC_FAMILY=RESOURCE_X_DIAGNOSTIC PGRAC_REASON=%s "
+			 "request=" UINT64_FORMAT " tag=%u/%u/%u/%u/%u "
+			 "age_us=" UINT64_FORMAT " phase_age_us=" UINT64_FORMAT " budget_us=" UINT64_FORMAT
+			 " events=%u now_us=" UINT64_FORMAT " caller_attempt=" UINT64_FORMAT
+			 " retired_attempt=" UINT64_FORMAT " snapshot_found=%u head_attempt=" UINT64_FORMAT
+			 " head_phase=%u local_owner=%u delivery_bound=%u executor_active=%u "
+			 "head_started_us=" UINT64_FORMAT " last_semantic_progress_us=" UINT64_FORMAT
+			 " formation=" UINT64_FORMAT " master=%d session=" UINT64_FORMAT " r4=" UINT64_FORMAT
+			 " action=continue_observation",
+			 cluster_pcm_rx_requester_wait_reason_name(reason), diagnostic->request_sequence,
+			 diagnostic->tag->spcOid, diagnostic->tag->dbOid, diagnostic->tag->relNumber,
+			 (unsigned)diagnostic->tag->forkNum, diagnostic->tag->blockNum,
+			 diagnostic->state.total_age_us, diagnostic->state.phase_age_us, diagnostic->budget_us,
+			 events, now_us, diagnostic->caller->joined_request.assertion_sequence,
+			 diagnostic->caller->reobserve_attempt, (unsigned)found, snapshot.attempt,
+			 (unsigned)snapshot.round_phase, (unsigned)snapshot.local_owner_state,
+			 (unsigned)snapshot.delivery_bound, (unsigned)snapshot.delivery_executor_active,
+			 snapshot.diagnostic_started_us, snapshot.last_semantic_progress_us, snapshot.formation,
+			 snapshot.master_node, snapshot.master_session, snapshot.r4_generation)));
+}
+
 static ResourceXApplyResult
 gcs_block_resource_x_target_acquire_internal(
 	BufferDesc *buf, const BufferTag *expected_resource,
@@ -14111,6 +14166,7 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXBootstrapRoundFailureSnapshot failure_round;
 	ResourceXTargetInstallContinuation target_install_follow;
 	ResourceXCallerWitness caller_witness;
+	GcsResourceXWaitDiagnostic wait_diagnostic = { 0 };
 	ResourceXTargetInstallFollowState target_install_follow_state
 		= RESOURCE_X_TARGET_INSTALL_INVALID;
 	ResourceXFirstFailureEvidence first_failure;
@@ -14132,7 +14188,6 @@ gcs_block_resource_x_target_acquire_internal(
 	uint64 diagnostic_caller_budget_us = gcs_block_pcm_x_retry_timeout_us();
 	bool diagnostic_join_recorded = false;
 	bool diagnostic_deadline_expired = false;
-	bool diagnostic_wait_threshold_noted = false;
 	bool diagnostic_head_expired = false;
 	PcmRxWaitFailure diagnostic_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	uint64 observed_head_deadline_us = 0;
@@ -14224,6 +14279,10 @@ gcs_block_resource_x_target_acquire_internal(
 	}
 	diagnostic_request_sequence
 		= gcs_block_resource_x_next_diagnostic_request_sequence();
+	wait_diagnostic.tag = &resource;
+	wait_diagnostic.caller = &caller_witness;
+	wait_diagnostic.request_sequence = diagnostic_request_sequence;
+	wait_diagnostic.budget_us = diagnostic_caller_budget_us;
 	if (direct_init)
 		direct_init_committed_generation
 			= direct_init_ownership_generation + 1;
@@ -14276,6 +14335,7 @@ gcs_block_resource_x_target_acquire_internal(
 				result = RESOURCE_X_APPLY_INVALID;
 				break;
 			}
+			wait_diagnostic.threshold_us = absolute_deadline_us;
 
 			/* The full-member OPEN carrier is terminal R4 evidence, while its
 			 * stack-only QVOTEC/current-membership revalidation can be briefly
@@ -14360,6 +14420,7 @@ gcs_block_resource_x_target_acquire_internal(
 
 			preflight_membership_wait:
 				diagnostic_stage = "preflight-membership-wait";
+				gcs_block_resource_x_requester_wait_note(&wait_diagnostic, PCM_RX_WAIT_PREFLIGHT);
 				now_us = gcs_block_pcm_x_monotonic_us();
 				if (now_us == 0 || now_us == UINT64_MAX) {
 					preflight_backpressure = true;
@@ -14390,19 +14451,20 @@ gcs_block_resource_x_target_acquire_internal(
 						result = RESOURCE_X_APPLY_INVALID;
 						break;
 					}
-					if (now_us >= absolute_deadline_us && !diagnostic_wait_threshold_noted) {
-						diagnostic_wait_threshold_noted = true;
-						ereport(
-							LOG,
-							(errmsg_internal("Resource-X wait diagnostic threshold reached"),
-							 errdetail("buffer=%d now=" UINT64_FORMAT " threshold=" UINT64_FORMAT
-									   " action=continue_owned_wait",
-									   buf->buf_id, now_us, absolute_deadline_us)));
-					}
+					if (wait_diagnostic.state.started_us != 0)
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 wait_diagnostic.state.reason);
 					target_retained_release_inflight = false;
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
 						&assertion, gate.formation, master_session, admission.record_generation,
 						&caller_witness);
+					if (result == RESOURCE_X_APPLY_DUPLICATE) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 caller_witness.reobserve_reason);
+						memset(&target_install_follow, 0, sizeof(target_install_follow));
+						target_install_preuse_retry_seen = false;
+						continue;
+					}
 					if (result != RESOURCE_X_APPLY_APPLIED) {
 						diagnostic_stage = "caller-history-reject";
 						break;
@@ -14440,6 +14502,8 @@ gcs_block_resource_x_target_acquire_internal(
 							break;
 						}
 						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE) {
+							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																	 PCM_RX_WAIT_OBSERVATION);
 							memset(&target_install_follow, 0, sizeof(target_install_follow));
 							target_install_preuse_retry_seen = false;
 							continue;
@@ -14453,6 +14517,8 @@ gcs_block_resource_x_target_acquire_internal(
 								== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
 							target_install_preuse_retry_seen = true;
 							diagnostic_stage = "target-install-preuse-wait";
+							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																	 PCM_RX_WAIT_PREUSE);
 							now_us = gcs_block_pcm_x_monotonic_us();
 							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
@@ -14492,6 +14558,8 @@ gcs_block_resource_x_target_acquire_internal(
 						if (target_install_follow_state
 								== RESOURCE_X_TARGET_INSTALL_INFLIGHT) {
 							diagnostic_stage = "target-install-continuation-wait";
+							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																	 PCM_RX_WAIT_INSTALL);
 							now_us = gcs_block_pcm_x_monotonic_us();
 							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
@@ -14678,6 +14746,8 @@ gcs_block_resource_x_target_acquire_internal(
 							 * Coherent equality covers own only at observation;
 							 * the fresh loop must recheck before any admission. */
 							diagnostic_stage = "local-pending-reservation-wait";
+							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																	 PCM_RX_WAIT_RESERVATION);
 							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
 								(uint64) Max(
@@ -14800,6 +14870,8 @@ gcs_block_resource_x_target_acquire_internal(
 											target_install_follow_state, now_us,
 											absolute_deadline_us)) {
 										diagnostic_stage = "preassert-observation-resample";
+										gcs_block_resource_x_requester_wait_note(
+											&wait_diagnostic, PCM_RX_WAIT_OBSERVATION);
 										continue;
 									}
 								}
@@ -14890,6 +14962,8 @@ gcs_block_resource_x_target_acquire_internal(
 					if (!cluster_semantic_activation_recheck(&admission))
 						wait_result = RESOURCE_X_APPLY_STALE;
 					if (wait_result == RESOURCE_X_APPLY_BAD_STATE) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
@@ -14902,6 +14976,8 @@ gcs_block_resource_x_target_acquire_internal(
 						break;
 					}
 					diagnostic_stage = "retained-release-wait";
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 PCM_RX_WAIT_PREDECESSOR);
 					now_us = gcs_block_pcm_x_monotonic_us();
 					CHECK_FOR_INTERRUPTS();
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
@@ -15052,6 +15128,8 @@ gcs_block_resource_x_target_acquire_internal(
 						/* No writer context is exported while the sample is missing.
 						 * Revisit all physical/entry proofs under the same caller and
 						 * attempt; the LMS still owns any outstanding delivery. */
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_TERMINAL);
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
@@ -15070,6 +15148,12 @@ gcs_block_resource_x_target_acquire_internal(
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
 						&assertion, gate.formation, master_session, admission.record_generation,
 						&caller_witness);
+					if (result == RESOURCE_X_APPLY_DUPLICATE) {
+						memset(ref_out, 0, sizeof(*ref_out));
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 caller_witness.reobserve_reason);
+						continue;
+					}
 					now_us = gcs_block_pcm_x_monotonic_us();
 					if (result != RESOURCE_X_APPLY_APPLIED || now_us == 0 || now_us == UINT64_MAX) {
 						memset(ref_out, 0, sizeof(*ref_out));
@@ -15080,6 +15164,13 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 					result = RESOURCE_X_APPLY_APPLIED;
 					break;
+				}
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE) {
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 caller_witness.reobserve_reason);
+					memset(&target_install_follow, 0, sizeof(target_install_follow));
+					target_install_preuse_retry_seen = false;
+					continue;
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE) {
 					diagnostic_stage = "round-capacity-backpressure";
@@ -15175,6 +15266,8 @@ gcs_block_resource_x_target_acquire_internal(
 							action, direct_init, join_only, &own, own_result, &failure_live,
 							failure_snapshot_result, round_drift_can_resample, now_us,
 							absolute_deadline_us)) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
 						if (round_drift_observation_pending)
 							gcs_block_resource_x_observation_pause();
 						continue;
@@ -15190,11 +15283,15 @@ gcs_block_resource_x_target_acquire_internal(
 					 * settlement predicate on the same entry CV under this caller's
 					 * original deadline, without inventing a head or a lease. */
 					diagnostic_stage = "predecessor-settlement-wait";
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 PCM_RX_WAIT_PREDECESSOR);
 					wait_result = gcs_block_resource_x_gate_session_recheck_result(
 						&resource, &gate, master_node, master_session);
 					if (!cluster_semantic_activation_recheck(&admission))
 						wait_result = RESOURCE_X_APPLY_STALE;
 					if (wait_result == RESOURCE_X_APPLY_BAD_STATE) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
@@ -15257,6 +15354,8 @@ gcs_block_resource_x_target_acquire_internal(
 							|| master_ingress_recheck == master_ingress_connection_generation)
 						&& (dispatch_gate_session_result == RESOURCE_X_APPLY_BAD_STATE
 							|| !dispatch_requester_sampled || !dispatch_master_sampled)) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_DISPATCH);
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
@@ -15365,19 +15464,18 @@ gcs_block_resource_x_target_acquire_internal(
 							break;
 
 					dispatch_recheck_wait:
-							now_us = gcs_block_pcm_x_monotonic_us();
-							remaining_us = retry_slice_us;
-							timeout_ms = (long)Min(
-								(uint64)Max(
-									cluster_gcs_block_retransmit_initial_backoff_ms,
-									1),
-								(remaining_us + UINT64_C(999))
-									/ UINT64_C(1000));
-							if (timeout_ms <= 0)
-								timeout_ms = 1;
-							CHECK_FOR_INTERRUPTS();
-							pg_usleep(timeout_ms * 1000L);
-							continue;
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_DISPATCH);
+						now_us = gcs_block_pcm_x_monotonic_us();
+						remaining_us = retry_slice_us;
+						timeout_ms = (long)Min(
+							(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+							(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+						if (timeout_ms <= 0)
+							timeout_ms = 1;
+						CHECK_FOR_INTERRUPTS();
+						pg_usleep(timeout_ms * 1000L);
+						continue;
 						}
 						result = RESOURCE_X_APPLY_STALE;
 						break;
@@ -15400,6 +15498,8 @@ gcs_block_resource_x_target_acquire_internal(
 					(void)stage_ok;
 					continue;
 				}
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_WAIT)
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic, PCM_RX_WAIT_ROUND);
 				if (action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT) {
 					result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
@@ -15424,12 +15524,16 @@ gcs_block_resource_x_target_acquire_internal(
 								direct_init_ownership_generation, direct_init_reservation_token,
 								absolute_deadline_us, timeout_ms);
 					else
-						wait_result = cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+						wait_result = cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(
 							&assertion, master_node, gate.formation, master_session,
 							admission.record_generation, requester_sender_connection_generation,
 							master_ingress_connection_generation, retry_slice_us,
-							absolute_deadline_us, timeout_ms);
+							absolute_deadline_us, timeout_ms, &caller_witness);
 					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
+					if (wait_result == RESOURCE_X_APPLY_DUPLICATE
+						&& caller_witness.reobserve_attempt != 0)
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 caller_witness.reobserve_reason);
 					diagnostic_deadline_expired
 						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
 					diagnostic_head_expired

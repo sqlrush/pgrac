@@ -890,6 +890,9 @@ static ClusterPcmResourceXMasterState *pcm_resource_x_master_state_for_entry(
 static ClusterPcmResourceXMasterRequest *pcm_resource_x_master_head(
 	ClusterPcmResourceXMasterState *state, int32 *requester_node_out);
 static bool pcm_resource_x_s_barrier_active_locked(struct GrdEntry *entry);
+static bool
+pcm_resource_x_local_owner_round_exact_locked(struct GrdEntry *entry,
+											  const ClusterPcmResourceXBootstrapRound *round);
 static bool pcm_resource_x_bootstrap_receipt_valid(
 	const ClusterPcmResourceXBootstrapReceipt *receipt);
 static bool pcm_resource_x_local_owner_handle_valid(
@@ -10895,6 +10898,109 @@ cluster_pcm_rx_rejected_follower_note(uint64 before_generation, uint64 after_gen
 		cluster_pcm_rx_metric_note(PCM_RX_FOLLOWER_REJECT_MUTATION);
 }
 
+const char *
+cluster_pcm_rx_requester_wait_reason_name(PcmRxRequesterWaitReason reason)
+{
+	static const char *const names[] = {
+#define PCM_RX_REASON_NAME(id, name) name,
+		PCM_RX_REQUESTER_WAIT_REASONS(PCM_RX_REASON_NAME)
+#undef PCM_RX_REASON_NAME
+	};
+	return (unsigned)reason < lengthof(names) ? names[reason] : "invalid";
+}
+
+uint32
+cluster_pcm_rx_requester_wait_note(PcmRxRequesterWaitState *state, PcmRxRequesterWaitReason reason,
+								   uint64 started_us, uint64 budget_us, uint64 now_us)
+{
+	static const PcmRxMetric metrics[] = {
+#define PCM_RX_REASON_METRIC(id, name) PCM_RX_REQUESTER_WAIT_##id,
+		PCM_RX_REQUESTER_WAIT_REASONS(PCM_RX_REASON_METRIC)
+#undef PCM_RX_REASON_METRIC
+	};
+	uint32 events = 0;
+	uint32 bit;
+	uint8 thresholds = 0;
+	uint64 ratio;
+
+	/* Bad diagnostic input is never an admission decision. It also cannot
+	 * reset the original clock and hide the age of a repeatedly replaced head. */
+	if (state == NULL || (unsigned)reason >= PCM_RX_REQUESTER_WAIT_REASON_COUNT || started_us == 0
+		|| budget_us == 0 || budget_us == UINT64_MAX || now_us == UINT64_MAX || now_us < started_us
+		|| (state->started_us != 0
+			&& (state->started_us != started_us || state->budget_us != budget_us
+				|| now_us < state->last_us))) {
+		cluster_pcm_rx_metric_note(PCM_RX_REQUESTER_WAIT_DIAGNOSTIC_GAP);
+		return 0;
+	}
+	if (state->started_us == 0) {
+		state->started_us = started_us;
+		state->budget_us = budget_us;
+		state->phase_started_us = now_us;
+		state->reason = reason;
+	} else if (state->reason != reason) {
+		state->phase_started_us = now_us;
+		state->reason = reason;
+	}
+	state->last_us = now_us;
+	state->total_age_us = now_us - state->started_us;
+	state->phase_age_us = now_us - state->phase_started_us;
+	bit = UINT32_C(1) << reason;
+	if ((state->seen_reasons & bit) == 0) {
+		state->seen_reasons |= bit;
+		events |= PCM_RX_WAIT_FIRST_REASON;
+		cluster_pcm_rx_metric_note(metrics[reason]);
+	}
+	ratio = state->total_age_us / budget_us;
+	if (ratio >= 1)
+		thresholds |= PCM_RX_WAIT_THRESHOLD_1;
+	if (ratio >= 2)
+		thresholds |= PCM_RX_WAIT_THRESHOLD_2;
+	if (ratio >= 4)
+		thresholds |= PCM_RX_WAIT_THRESHOLD_4;
+	events |= thresholds & ~state->threshold_seen[reason];
+	state->threshold_seen[reason] |= thresholds;
+	if ((events & ~PCM_RX_WAIT_FIRST_REASON) != 0)
+		cluster_pcm_rx_metric_note(PCM_RX_REQUESTER_WAIT_THRESHOLD);
+	if (ClusterPcm != NULL) {
+		pcm_atomic_max_u64(&ClusterPcm->rx_count[PCM_RX_REQUESTER_WAIT_AGE_MAX_US],
+						   state->total_age_us);
+		pcm_atomic_max_u64(&ClusterPcm->rx_count[PCM_RX_REQUESTER_PHASE_AGE_MAX_US],
+						   state->phase_age_us);
+	}
+	return events;
+}
+
+bool
+cluster_pcm_rx_requester_wait_snapshot(const BufferTag *tag, PcmRxRequesterWaitSnapshot *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquire;
+	const ClusterPcmResourceXBootstrapRound *round;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (tag == NULL || !pcm_entry_ref_acquire(tag, false, &ref, &acquire))
+		return false;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	round = &ref.entry->resource_x_bootstrap_round;
+	out->attempt = round->request.assertion_sequence;
+	out->diagnostic_started_us = round->diagnostic_started_us;
+	out->last_semantic_progress_us = round->head_last_semantic_progress_us;
+	out->formation = round->resource_formation;
+	out->master_session = round->master_session_incarnation;
+	out->r4_generation = round->r4_record_generation;
+	out->master_node = round->current_master_node;
+	out->round_phase = round->phase;
+	out->local_owner_state = ref.entry->resource_x_local_owner.state;
+	out->delivery_bound = round->delivery_target.buffer_id_plus_one != 0;
+	out->delivery_executor_active = round->delivery_executor_purpose != 0;
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return true;
+}
+
 void
 cluster_pcm_rx_dispatch_note(bool head_dispatch)
 {
@@ -11822,13 +11928,51 @@ pcm_resource_x_caller_namespace_matches(const ResourceXCallerWitness *caller,
 			   && caller->r4_record_generation == r4_record_generation);
 }
 
+/* One lifetime classification for ordinary caller and install observations.
+ * Identity/binding checks belong to the entry points; this never turns an
+ * observation into authority. DUPLICATE means discard only the old observer. */
+static ResourceXApplyResult
+pcm_resource_x_observation_history_locked(struct GrdEntry *entry, uint64 attempt)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+
+	if (attempt == 0 || attempt == UINT64_MAX || round->highest_attempt_floor == UINT64_MAX
+		|| round->cancelled_attempt_floor > round->highest_attempt_floor
+		|| round->failed_attempt_floor > round->highest_attempt_floor
+		|| attempt > round->highest_attempt_floor
+		|| round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| (entry->resource_x_progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0)
+		return RESOURCE_X_APPLY_STALE;
+	if (attempt <= round->failed_attempt_floor
+		|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (attempt <= round->cancelled_attempt_floor
+		&& (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			|| (round->request.assertion_sequence > attempt
+				&& round->request.assertion_sequence == round->highest_attempt_floor))) {
+		if (!pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+			|| (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+					? entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+					: (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+					   && !pcm_resource_x_local_owner_round_exact_locked(entry, round))))
+			return RESOURCE_X_APPLY_STALE;
+		return RESOURCE_X_APPLY_DUPLICATE;
+	}
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+		|| round->request.assertion_sequence != attempt)
+		return RESOURCE_X_APPLY_STALE;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 /* Caller history is independent of the physical delivery/terminal state.
  * Only this caller's stack object changes; rejection never edits the node
  * head.  A caller joining an already terminal cover has no old wait to undo. */
 static ResourceXApplyResult
-pcm_resource_x_caller_observe_locked(const struct GrdEntry *entry, ResourceXCallerWitness *caller)
+pcm_resource_x_caller_observe_locked(struct GrdEntry *entry, ResourceXCallerWitness *caller)
 {
 	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	ResourceXApplyResult history;
 	uint64 attempt;
 
 	if (caller == NULL)
@@ -11843,11 +11987,14 @@ pcm_resource_x_caller_observe_locked(const struct GrdEntry *entry, ResourceXCall
 		caller->joined_request = round->request;
 		caller->entry_binding_generation = entry->binding_generation;
 		caller->r4_record_generation = round->r4_record_generation;
+		caller->master_node = round->current_master_node;
+		caller->master_ingress_connection_generation = round->master_ingress_connection_generation;
 		attempt = caller->joined_request.assertion_sequence;
 	}
 	if (attempt == 0)
 		return RESOURCE_X_APPLY_APPLIED;
-	if (attempt <= round->failed_attempt_floor) {
+	history = pcm_resource_x_observation_history_locked(entry, attempt);
+	if (history == RESOURCE_X_APPLY_RECOVERY_BLOCKED) {
 		caller->failed_attempt = attempt;
 		cluster_pcm_rx_metric_note(PCM_RX_DELIVERY_FAILED_CALLER);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -11856,14 +12003,15 @@ pcm_resource_x_caller_observe_locked(const struct GrdEntry *entry, ResourceXCall
 	 * EMPTY binding or a newer head alone is not permission to forget history.
 	 * Failure wins even if a later legitimate cancellation advances its floor.
 	 * The caller's independent absolute deadline is not stored or changed here. */
-	if (attempt <= round->cancelled_attempt_floor
-		&& round->cancelled_attempt_floor <= round->highest_attempt_floor
-		&& (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-			|| round->request.assertion_sequence > attempt)) {
+	if (history == RESOURCE_X_APPLY_DUPLICATE) {
 		memset(caller, 0, sizeof(*caller));
-		return RESOURCE_X_APPLY_APPLIED;
+		caller->reobserve_attempt = attempt;
+		caller->reobserve_reason = round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+									   ? PCM_RX_WAIT_RETIRED_EMPTY
+									   : PCM_RX_WAIT_RETIRED_SUCCESSOR;
+		return RESOURCE_X_APPLY_DUPLICATE;
 	}
-	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+	if (history != RESOURCE_X_APPLY_APPLIED
 		|| !pcm_resource_x_common_equal(&caller->joined_request, &round->request)
 		|| caller->r4_record_generation != round->r4_record_generation)
 		return RESOURCE_X_APPLY_STALE;
@@ -12659,6 +12807,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	int32 diagnostic_master_node = -1;
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
+	ResourceXApplyResult caller_history;
 
 	pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
 	if (dispatch_out == NULL || terminal_ref_out == NULL)
@@ -12688,8 +12837,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 	if (!pcm_resource_x_caller_namespace_matches(caller, assertion, resource_formation,
 												 master_session_incarnation, r4_record_generation)
 		|| (caller != NULL && caller->joined_request.assertion_sequence != 0
-			&& caller->joined_request.sender_connection_generation
-				   != requester_sender_connection_generation))
+			&& (caller->joined_request.sender_connection_generation
+					!= requester_sender_connection_generation
+				|| caller->master_node != current_master_node
+				|| caller->master_ingress_connection_generation
+					   != master_ingress_connection_generation)))
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 
 	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create,
@@ -12708,11 +12860,15 @@ pcm_resource_x_bootstrap_round_step_internal(
 	pgstat_report_wait_end();
 	round = &entry->resource_x_bootstrap_round;
 	diagnostic_reject_generation = round->head_change_generation;
-	if (caller != NULL && caller->joined_request.assertion_sequence != 0
-		&& pcm_resource_x_caller_observe_locked(entry, caller) != RESOURCE_X_APPLY_APPLIED) {
+	caller_history = caller != NULL && caller->joined_request.assertion_sequence != 0
+						 ? pcm_resource_x_caller_observe_locked(entry, caller)
+						 : RESOURCE_X_APPLY_APPLIED;
+	if (caller_history != RESOURCE_X_APPLY_APPLIED) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
-		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+		return caller_history == RESOURCE_X_APPLY_DUPLICATE
+				   ? RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE
+				   : RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
 	if ((!allow_create
 		 && (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
@@ -12967,7 +13123,12 @@ pcm_resource_x_bootstrap_round_step_internal(
 	}
 
 round_step_done:
-	if (pcm_resource_x_caller_observe_locked(entry, caller) != RESOURCE_X_APPLY_APPLIED)
+	caller_history = pcm_resource_x_caller_observe_locked(entry, caller);
+	/* This serialized step can itself prove an old cover retired before
+	 * creating its successor. Join that successor, never restore old history. */
+	if (caller_history == RESOURCE_X_APPLY_DUPLICATE)
+		caller_history = pcm_resource_x_caller_observe_locked(entry, caller);
+	if (caller_history != RESOURCE_X_APPLY_APPLIED)
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_WAIT)
 		pcm_rx_trace_join(round, now_us);
@@ -13411,7 +13572,8 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	uint64 master_session_incarnation, uint64 r4_record_generation,
 	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
 	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms)
+	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms,
+	ResourceXCallerWitness *caller)
 {
 	ClusterPcmResourceXBootstrapRound *round;
 	PcmEntryWaitContext wait_context;
@@ -13422,6 +13584,7 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	uint64 observed_attempt;
 	uint64 remaining_us;
 	uint64 now_us;
+	ResourceXApplyResult history;
 
 	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	if (!resource_x_assertion_valid(assertion) || current_master_node < 0
@@ -13438,6 +13601,15 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		|| direct_init_reservation_token == UINT64_MAX || caller_absolute_deadline_us == 0
 		|| caller_absolute_deadline_us == UINT64_MAX || timeout_ms <= 0)
 		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_resource_x_caller_namespace_matches(caller, assertion, resource_formation,
+												 master_session_incarnation, r4_record_generation)
+		|| (caller != NULL && caller->joined_request.assertion_sequence != 0
+			&& (caller->joined_request.sender_connection_generation
+					!= requester_sender_connection_generation
+				|| caller->master_node != current_master_node
+				|| caller->master_ingress_connection_generation
+					   != master_ingress_connection_generation)))
+		return RESOURCE_X_APPLY_STALE;
 	memset(&wait_context, 0, sizeof(wait_context));
 	if (!pcm_entry_ref_acquire(&assertion->resource, false,
 			&wait_context.ref, &acquire_result))
@@ -13455,6 +13627,23 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	wait_context.cv_prepared = true;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
+	/* Enrollment and lifetime classification share the predicate lock. A
+	 * detached old caller may only re-observe; no follower clears this head. */
+	if (caller != NULL) {
+		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			&& !pcm_resource_x_node_request_key_matches_locked(
+				round, assertion, current_master_node, resource_formation,
+				master_session_incarnation, r4_record_generation,
+				requester_sender_connection_generation, master_ingress_connection_generation)) {
+			result = RESOURCE_X_APPLY_STALE;
+			goto round_wait_predicate_done;
+		}
+		history = pcm_resource_x_caller_observe_locked(entry, caller);
+		if (history != RESOURCE_X_APPLY_APPLIED) {
+			result = history;
+			goto round_wait_predicate_done;
+		}
+	}
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED) {
 		/* The retained cover is node-level authority.  An ordinary caller has
 		 * no creation-only direct-init token, so use the same relaxed terminal
@@ -13510,6 +13699,7 @@ pcm_resource_x_bootstrap_round_wait_internal(
 			pcm_rx_last_wait_failure = PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED;
 	} else
 		result = RESOURCE_X_APPLY_BAD_STATE;
+round_wait_predicate_done:
 	now_us = pcm_resource_x_monotonic_us();
 	pcm_resource_x_head_margin_note(round, now_us);
 	if (now_us == 0 || now_us == UINT64_MAX)
@@ -13561,7 +13751,24 @@ cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 		assertion, current_master_node, resource_formation, master_session_incarnation,
 		r4_record_generation, requester_sender_connection_generation,
 		master_ingress_connection_generation, retry_slice_us, 0, 0, caller_absolute_deadline_us,
-		timeout_ms);
+		timeout_ms, NULL);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, long timeout_ms,
+	ResourceXCallerWitness *caller)
+{
+	if (caller == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	return pcm_resource_x_bootstrap_round_wait_internal(
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, retry_slice_us, 0, 0, caller_absolute_deadline_us,
+		timeout_ms, caller);
 }
 
 ResourceXApplyResult
@@ -13579,7 +13786,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 		assertion, current_master_node, resource_formation, master_session_incarnation,
 		r4_record_generation, requester_sender_connection_generation,
 		master_ingress_connection_generation, retry_slice_us, direct_init_ownership_generation,
-		direct_init_reservation_token, caller_absolute_deadline_us, timeout_ms);
+		direct_init_reservation_token, caller_absolute_deadline_us, timeout_ms, NULL);
 }
 
 /* A predecessor has its own exact settlement identity, not a requester head.
@@ -14129,13 +14336,7 @@ pcm_resource_x_target_install_observation_retired_locked(
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	if ((continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0
-		|| round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-		|| round->highest_attempt_floor == UINT64_MAX
-		|| round->cancelled_attempt_floor > round->highest_attempt_floor
-		|| attempt > round->cancelled_attempt_floor || attempt <= round->failed_attempt_floor
-		|| (entry->resource_x_progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0
-		|| (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0
-		|| !pcm_resource_x_local_owner_valid_locked(owner)
+		|| pcm_resource_x_observation_history_locked(entry, attempt) != RESOURCE_X_APPLY_DUPLICATE
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(continuation->resource_formation))
 		return false;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)

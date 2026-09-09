@@ -2760,7 +2760,7 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 			"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT",
 			"gcs_block_resource_x_native_assert_stage_exact(",
 			"RESOURCE_X_BOOTSTRAP_ROUND_WAIT",
-			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(",
+			"cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(",
 			"RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL" };
 	static const char *const forbidden[]
 		= { "cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(",
@@ -3192,8 +3192,9 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	predecessor_continue = predecessor_sleep != NULL
 		? strstr(predecessor_sleep, "continue;") : NULL;
 	round_wait = predecessor_continue != NULL
-		? strstr(predecessor_continue,
-			"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(") : NULL;
+					 ? strstr(predecessor_continue,
+							  "cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(")
+					 : NULL;
 	generation_zero_reject = snapshot != NULL
 		? strstr(snapshot, "if (own.generation == 0)") : NULL;
 	readonly_wait
@@ -5762,13 +5763,11 @@ UT_TEST(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first
 		? strstr(loop, "diagnostic_stage = \"own-snapshot\"") : NULL;
 	deadline_sample = loop != NULL
 		? strstr(loop, "now_us = gcs_block_pcm_x_monotonic_us();") : NULL;
-	deadline_guard
-		= deadline_sample != NULL
-			  ? strstr(deadline_sample,
-					   "if (now_us >= absolute_deadline_us && !diagnostic_wait_threshold_noted)")
-			  : NULL;
+	deadline_guard = deadline_sample != NULL
+						 ? strstr(deadline_sample, "if (wait_diagnostic.state.started_us != 0)")
+						 : NULL;
 	deadline_result = deadline_guard != NULL
-						  ? strstr(deadline_guard, "diagnostic_wait_threshold_noted = true;")
+						  ? strstr(deadline_guard, "gcs_block_resource_x_requester_wait_note(")
 						  : NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(round_loop);
@@ -7018,7 +7017,7 @@ UT_TEST(test_resource_x_client_reason_is_exact_and_not_guessed_from_bad_state)
 	UT_ASSERT_NOT_NULL(bufmgr_source);
 	if (gcs_source != NULL) {
 		UT_ASSERT_NULL(strstr(gcs_source, "diagnostic_deadline_expired = true;"));
-		UT_ASSERT_NOT_NULL(strstr(gcs_source, "action=continue_owned_wait"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "action=continue_observation"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "gcs_resource_x_acquire_diagnostic.valid = false;"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_last_step_head_failure()"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_take_wait_failure()"));

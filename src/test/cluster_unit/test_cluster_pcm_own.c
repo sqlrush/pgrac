@@ -626,6 +626,9 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 		result = RESOURCE_X_APPLY_APPLIED;
 #define gcs_block_pcm_x_monotonic_us() preassert_now_us
 #define pg_usleep(us) preassert_wait_schedule(us)
+/* This verbatim consumer fixture sinks only the non-authoritative logger;
+ * the real age/reason state machine is exercised in test_cluster_pcm_lock. */
+#define gcs_block_resource_x_requester_wait_note(context, reason) ((void)(reason))
 #undef CHECK_FOR_INTERRUPTS
 #define CHECK_FOR_INTERRUPTS() ((void)0)
 #include "test_cluster_pcm_pending_consumer.inc"
@@ -633,6 +636,7 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 #include "test_cluster_pcm_preassert_consumer.inc"
 		}
 #undef CHECK_FOR_INTERRUPTS
+#undef gcs_block_resource_x_requester_wait_note
 #undef pg_usleep
 #undef gcs_block_pcm_x_monotonic_us
 		break;

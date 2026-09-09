@@ -238,6 +238,65 @@ extern void cluster_pcm_wait_margin_note_exact(bool head, uint64 elapsed_us, uin
 											   uint64 monotonic_us);
 extern bool cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out);
 
+#define PCM_RX_REQUESTER_WAIT_REASONS(X)                                                           \
+	X(PREFLIGHT, "preflight")                                                                      \
+	X(OBSERVATION, "observation")                                                                  \
+	X(RESERVATION, "reservation")                                                                  \
+	X(PREUSE, "preuse")                                                                            \
+	X(INSTALL, "install")                                                                          \
+	X(PREDECESSOR, "predecessor")                                                                  \
+	X(DISPATCH, "dispatch")                                                                        \
+	X(ROUND, "round")                                                                              \
+	X(RETIRED_EMPTY, "retired_empty")                                                              \
+	X(RETIRED_SUCCESSOR, "retired_successor")                                                      \
+	X(TERMINAL, "terminal")
+
+typedef enum PcmRxRequesterWaitReason {
+#define PCM_RX_WAIT_REASON(id, name) PCM_RX_WAIT_##id,
+	PCM_RX_REQUESTER_WAIT_REASONS(PCM_RX_WAIT_REASON)
+#undef PCM_RX_WAIT_REASON
+		PCM_RX_REQUESTER_WAIT_REASON_COUNT
+} PcmRxRequesterWaitReason;
+
+#define PCM_RX_WAIT_FIRST_REASON UINT32_C(1)
+#define PCM_RX_WAIT_THRESHOLD_1 UINT32_C(2)
+#define PCM_RX_WAIT_THRESHOLD_2 UINT32_C(4)
+#define PCM_RX_WAIT_THRESHOLD_4 UINT32_C(8)
+
+/* Process-local diagnostics, never copied into a head or used as authority. */
+typedef struct PcmRxRequesterWaitState {
+	uint64 started_us;
+	uint64 budget_us;
+	uint64 phase_started_us;
+	uint64 last_us;
+	uint64 total_age_us;
+	uint64 phase_age_us;
+	uint32 seen_reasons;
+	uint8 threshold_seen[PCM_RX_REQUESTER_WAIT_REASON_COUNT];
+	PcmRxRequesterWaitReason reason;
+} PcmRxRequesterWaitState;
+
+typedef struct PcmRxRequesterWaitSnapshot {
+	uint64 attempt;
+	uint64 diagnostic_started_us;
+	uint64 last_semantic_progress_us;
+	uint64 formation;
+	uint64 master_session;
+	uint64 r4_generation;
+	int32 master_node;
+	uint8 round_phase;
+	uint8 local_owner_state;
+	bool delivery_bound;
+	bool delivery_executor_active;
+} PcmRxRequesterWaitSnapshot;
+
+extern uint32 cluster_pcm_rx_requester_wait_note(PcmRxRequesterWaitState *state,
+												 PcmRxRequesterWaitReason reason, uint64 started_us,
+												 uint64 budget_us, uint64 now_us);
+extern const char *cluster_pcm_rx_requester_wait_reason_name(PcmRxRequesterWaitReason reason);
+extern bool cluster_pcm_rx_requester_wait_snapshot(const BufferTag *tag,
+												   PcmRxRequesterWaitSnapshot *out);
+
 #define PCM_RX_METRICS(X)                                                                          \
 	X(PCM_RX_HEAD_CREATE, "head_create_count")                                                     \
 	X(PCM_RX_HEAD_JOIN, "head_join_count")                                                         \
@@ -268,7 +327,22 @@ extern bool cluster_pcm_wait_margin_snapshot(PcmWaitMarginStats *out);
 	X(PCM_RX_DELIVERY_CALLBACK, "delivery_callback_count")                                         \
 	X(PCM_RX_DELIVERY_CALLBACK_MAX_US, "delivery_callback_max_us")                                 \
 	X(PCM_RX_DELIVERY_PENDING_MAX_US, "delivery_pending_age_max_us")                               \
-	X(PCM_RX_DELIVERY_FAILED_CALLER, "delivery_failed_caller_count")
+	X(PCM_RX_DELIVERY_FAILED_CALLER, "delivery_failed_caller_count")                               \
+	X(PCM_RX_REQUESTER_WAIT_AGE_MAX_US, "requester_wait_age_max_us")                               \
+	X(PCM_RX_REQUESTER_PHASE_AGE_MAX_US, "requester_wait_phase_age_max_us")                        \
+	X(PCM_RX_REQUESTER_WAIT_DIAGNOSTIC_GAP, "requester_wait_diagnostic_gap_count")                 \
+	X(PCM_RX_REQUESTER_WAIT_THRESHOLD, "requester_wait_threshold_count")                           \
+	X(PCM_RX_REQUESTER_WAIT_PREFLIGHT, "requester_wait_preflight_count")                           \
+	X(PCM_RX_REQUESTER_WAIT_OBSERVATION, "requester_wait_observation_count")                       \
+	X(PCM_RX_REQUESTER_WAIT_RESERVATION, "requester_wait_reservation_count")                       \
+	X(PCM_RX_REQUESTER_WAIT_PREUSE, "requester_wait_preuse_count")                                 \
+	X(PCM_RX_REQUESTER_WAIT_INSTALL, "requester_wait_install_count")                               \
+	X(PCM_RX_REQUESTER_WAIT_PREDECESSOR, "requester_wait_predecessor_count")                       \
+	X(PCM_RX_REQUESTER_WAIT_DISPATCH, "requester_wait_dispatch_count")                             \
+	X(PCM_RX_REQUESTER_WAIT_ROUND, "requester_wait_round_count")                                   \
+	X(PCM_RX_REQUESTER_WAIT_RETIRED_EMPTY, "requester_reobserve_retired_empty_count")              \
+	X(PCM_RX_REQUESTER_WAIT_RETIRED_SUCCESSOR, "requester_reobserve_retired_successor_count")      \
+	X(PCM_RX_REQUESTER_WAIT_TERMINAL, "requester_wait_terminal_count")
 
 typedef enum PcmRxMetric {
 #define PCM_RX_ENUM(id, key) id,
@@ -510,7 +584,8 @@ typedef enum ResourceXBootstrapRoundAction {
 	RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL,
 	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED,
 	RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE,
-	RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT
+	RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT,
+	RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE
 } ResourceXBootstrapRoundAction;
 
 /* D1 read-only projection of the existing requester round.  It deliberately
@@ -1402,6 +1477,10 @@ typedef struct ResourceXCallerWitness {
 	uint64 entry_binding_generation;
 	uint64 r4_record_generation;
 	uint64 failed_attempt;
+	int32 master_node;
+	uint32 master_ingress_connection_generation;
+	uint64 reobserve_attempt;
+	PcmRxRequesterWaitReason reobserve_reason;
 } ResourceXCallerWitness;
 
 /* Local residency, not a wire identity or permission to modify page bytes. */
@@ -1470,6 +1549,7 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_delivery_target_snapshot
 	const ResourceXAcquisitionRef *ref, ResourceXInstallClaimJoinObservation *observation_out,
 	ResourceXDeliveryTarget *target_out);
 
+/* DUPLICATE discards a proved retired observer; it is not current authority. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_caller_observe_exact(
 	const ResourceXAssertion *assertion, uint64 resource_formation,
 	uint64 master_session_incarnation, uint64 r4_record_generation, ResourceXCallerWitness *caller);
@@ -1555,6 +1635,12 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_wait_dir
 	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
 	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token, uint64 caller_absolute_deadline_us, long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, long timeout_ms,
+	ResourceXCallerWitness *caller);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_predecessor_wait_exact(
 	const BufferTag *tag, int32 current_master_node, uint64 current_master_session,
 	uint64 current_formation, uint64 expected_carrier_generation,
