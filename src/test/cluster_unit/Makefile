@@ -2076,6 +2076,7 @@ clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
@@ -2469,6 +2470,8 @@ test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 
 test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_pcm_own_bump_failure\(/ { print "static ClusterPcmOwnResult"; emit=1; bump_failure++ } \
+	     /^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_snapshot++ } \
+	     /^cluster_bufmgr_pcm_own_n_assertion_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; n_candidate++ } \
 	     /^cluster_pcm_own_bump_locked\(/ { print "static inline ClusterPcmOwnResult"; emit=1; bump++ } \
 	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; evict++ } \
 	     /^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
@@ -2490,7 +2493,25 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_release_read_image_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_release++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_preassert_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef enum ResourceXSourceSettlementStage/ { emit=1; stage++ } \
+	     /^typedef struct ResourceXFirstFailureEvidence/ { emit=1; evidence++ } \
+	     /^gcs_block_pcm_x_resource_x_remote_s_own_result\(/ { print "static ResourceXApplyResult"; emit=1; mapping++ } \
+	     /^gcs_block_resource_x_pre_mutation_domain\(/ { print "static ResourceXFailureDomain"; emit=1; domain++ } \
+	     /^gcs_block_resource_x_target_install_snapshot_result\(/ { print "static ResourceXApplyResult"; emit=1; snapshot++ } \
+	     /^gcs_block_resource_x_target_install_capture_coherent\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (stage != 1 || evidence != 1 || mapping != 1 || domain != 1 || snapshot != 1 || capture != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_preassert_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(!target_retained_release_inflight\)/ { emit=1; begin++ } \
+	     emit && /} else if \(own.generation == 0\)/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_delivery_route_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2508,6 +2529,7 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_checksum_owner.inc test_cluster_pcm_delivery_route_owner.inc $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \

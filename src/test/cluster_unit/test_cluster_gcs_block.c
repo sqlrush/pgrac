@@ -6453,8 +6453,9 @@ UT_TEST(test_resource_x_target_retries_clean_n_reservation_token_churn)
 		&before, CLUSTER_PCM_OWN_STALE, &live,
 		UINT64_C(200), UINT64_C(200)));
 
-	/* Production consumes this exact transient after the canonical candidate
-	 * reports STALE and before first-failure classification. */
+	/* The ordinary pre-assert consumer now covers this token-only case with
+	 * its read-only resampling boundary, after STALE and before first failure.
+	 * The narrower helper above still serves the pending-N reservation path. */
 	source = read_gcs_block_source();
 	driver = source != NULL
 		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
@@ -6464,9 +6465,8 @@ UT_TEST(test_resource_x_target_retries_clean_n_reservation_token_churn)
 			"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(")
 		: NULL;
 	retry_exact = candidate != NULL
-		? strstr(candidate,
-			"cluster_gcs_resource_x_target_local_n_reservation_retry_exact(")
-		: NULL;
+					  ? strstr(candidate, "cluster_gcs_resource_x_target_preassert_resample_exact(")
+					  : NULL;
 	failure_record = retry_exact != NULL
 		? strstr(retry_exact,
 			"gcs_block_resource_x_first_failure_record(")

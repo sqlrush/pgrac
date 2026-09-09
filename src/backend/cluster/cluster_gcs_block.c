@@ -14439,6 +14439,14 @@ gcs_block_resource_x_target_acquire_internal(
 										|| target_install_follow_state
 											== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 										continue;
+									now_us = gcs_block_pcm_x_monotonic_us();
+									if (cluster_gcs_resource_x_target_preassert_resample_exact(
+											&own, n_candidate_result, &failure_live,
+											target_install_follow_state, now_us,
+											absolute_deadline_us)) {
+										diagnostic_stage = "preassert-observation-resample";
+										continue;
+									}
 								}
 									result
 										= gcs_block_pcm_x_resource_x_remote_s_own_result(
@@ -14453,29 +14461,6 @@ gcs_block_resource_x_target_acquire_internal(
 											requester_sender_connection_generation,
 											master_ingress_connection_generation,
 											retry_slice_us, &failure_round);
-									now_us = gcs_block_pcm_x_monotonic_us();
-									if (cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
-												&own, n_candidate_result, &failure_live,
-												now_us, absolute_deadline_us)) {
-											/* A concurrent local caller completed only its
-											 * reversible reservation word.  Re-enter with no
-											 * retained proof or authority under the same deadline. */
-											diagnostic_stage
-												= "clean-n-reservation-churn-wait";
-											remaining_us = absolute_deadline_us - now_us;
-											timeout_ms = (long) Min(
-												(uint64) Max(
-													cluster_gcs_block_retransmit_initial_backoff_ms,
-													1),
-												(remaining_us + UINT64_C(999))
-													/ UINT64_C(1000));
-											if (timeout_ms <= 0)
-												timeout_ms = 1;
-											CHECK_FOR_INTERRUPTS();
-											pg_usleep(timeout_ms * 1000L);
-											own = failure_live;
-											continue;
-										}
 										memset(&first_failure, 0,
 										sizeof(first_failure));
 									first_failure.tag = assertion.resource;

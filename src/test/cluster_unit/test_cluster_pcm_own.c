@@ -266,6 +266,133 @@ transition_unexpected_drop(void)
 #undef BufHdrGetBlock
 #undef LockBufHdr
 
+/* Entry/clock/logging dependencies for the actual ordinary pre-assert
+ * consumer. Physical snapshots, candidate validation, coherent B-E-B and
+ * the rejection/retry block are compiled verbatim from production. */
+static ResourceXTargetInstallFollowState preassert_entry_state;
+static int preassert_fuses;
+static int preassert_failure_records;
+static int preassert_iterations;
+static uint64 preassert_now_us;
+
+static void
+gcs_block_resource_x_fail_closed_current(void)
+{
+	preassert_fuses++;
+}
+
+ResourceXTargetInstallFollowState
+cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+	const ResourceXAssertion *assertion, int32 master_node, uint64 formation, uint64 session,
+	uint64 r4_generation, uint32 requester_connection, uint32 master_connection, uint64 retry_slice,
+	uint64 deadline, const ClusterPcmOwnSnapshot *observed, ResourceXTargetInstallContinuation *out)
+{
+	UT_ASSERT(BufferTagsEqual(&assertion->resource, &observed->tag));
+	UT_ASSERT_EQ(master_node, 3);
+	UT_ASSERT_EQ(formation, 2);
+	UT_ASSERT_EQ(session, UINT64_C(842236411871794));
+	UT_ASSERT_EQ(r4_generation, 6);
+	UT_ASSERT_EQ(requester_connection, 8);
+	UT_ASSERT_EQ(master_connection, 8);
+	UT_ASSERT_EQ(retry_slice, 10000);
+	UT_ASSERT_EQ(deadline, UINT64_C(234641943560));
+	memset(out, 0, sizeof(*out));
+	return preassert_entry_state;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+	const ResourceXAssertion *assertion, int32 master_node, uint64 formation, uint64 session,
+	uint64 r4_generation, uint32 requester_connection, uint32 master_connection, uint64 retry_slice,
+	ResourceXBootstrapRoundFailureSnapshot *out)
+{
+	(void)assertion;
+	(void)master_node;
+	(void)formation;
+	(void)session;
+	(void)r4_generation;
+	(void)requester_connection;
+	(void)master_connection;
+	(void)retry_slice;
+	memset(out, 0, sizeof(*out));
+	return RESOURCE_X_APPLY_NOT_FOUND;
+}
+
+#include "test_cluster_pcm_preassert_owner.inc"
+
+static void
+gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *failure)
+{
+	UT_ASSERT(failure->result != RESOURCE_X_APPLY_APPLIED);
+	preassert_failure_records++;
+}
+
+static ResourceXApplyResult
+preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
+{
+	ClusterPcmOwnSnapshot own = *initial;
+	ClusterPcmOwnSnapshot failure_live;
+	ClusterPcmOwnResult n_candidate_result;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_APPLIED;
+	ResourceXApplyResult target_install_observation_result;
+	ResourceXApplyResult failure_snapshot_result;
+	ResourceXTargetInstallContinuation target_install_follow;
+	ResourceXTargetInstallFollowState target_install_follow_state;
+	ResourceXBootstrapRoundFailureSnapshot failure_round;
+	ResourceXFirstFailureEvidence first_failure;
+	ResourceXAssertion assertion;
+	struct {
+		uint64 record_generation;
+	} admission = { 6 };
+	struct {
+		uint64 formation;
+	} gate = { 2 };
+	uint64 master_session = UINT64_C(842236411871794);
+	uint64 absolute_deadline_us = UINT64_C(234641943560);
+	uint64 retry_slice_us = 10000;
+	uint64 diagnostic_request_sequence = 11994;
+	uint64 now_us;
+	uint32 requester_sender_connection_generation = 8;
+	uint32 master_ingress_connection_generation = 8;
+	int32 master_node = 3;
+	bool first_failure_recorded = false;
+	bool target_retained_release_inflight = false;
+	const char *diagnostic_stage = "own-snapshot";
+
+	memset(&assertion, 0, sizeof(assertion));
+	assertion.resource = initial->tag;
+	assertion.requester_node = 0;
+	preassert_iterations = 0;
+	for (;;) {
+		preassert_iterations++;
+		if (preassert_iterations > 3) {
+			UT_ASSERT(false);
+			return RESOURCE_X_APPLY_BAD_STATE;
+		}
+		/* The real enclosing loop rechecks caller history and deadline before
+		 * a new B. This fixture proves only the selected consumer's decision;
+		 * real history/terminal authority remain in test_cluster_pcm_lock. */
+		if (preassert_iterations > 1) {
+			if (preassert_now_us >= absolute_deadline_us)
+				return RESOURCE_X_APPLY_BAD_STATE;
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(buf, &own), CLUSTER_PCM_OWN_OK);
+		}
+		result = RESOURCE_X_APPLY_APPLIED;
+#define gcs_block_pcm_x_monotonic_us() preassert_now_us
+#define pg_usleep(us) ((void)(us))
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS() ((void)0)
+#include "test_cluster_pcm_preassert_consumer.inc"
+#undef CHECK_FOR_INTERRUPTS
+#undef pg_usleep
+#undef gcs_block_pcm_x_monotonic_us
+		break;
+	}
+	(void)diagnostic_stage;
+	(void)first_failure_recorded;
+	return result;
+}
+
 static char *read_bufmgr_source(void);
 static void assert_ordered_in_function(const char *source, const char *function_start,
 									   const char *function_end, const char *const *needles,
@@ -325,6 +452,223 @@ snapshot_owner_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	pg_atomic_init_u64(&entry->writer_activation_token, 23);
 	pg_atomic_init_u64(&entry->resource_x_activation_generation, 29);
 	pg_atomic_init_u32(&entry->flags, PCM_OWN_FLAG_GRANT_PENDING);
+}
+
+UT_TEST(test_real_preassert_discards_completed_conversion_observation)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry stable;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	PGIOAlignedBlock unchanged;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	buf.tag.relNumber = 16429;
+	buf.tag.forkNum = MAIN_FORKNUM;
+	buf.tag.blockNum = 6717;
+	buf.buffer_type = BUF_TYPE_PI;
+	pg_atomic_write_u64(&entry.generation, 12);
+	pg_atomic_write_u64(&entry.reservation_token, 8);
+	pg_atomic_write_u64(&entry.writer_activation_token, 0);
+	pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+	pg_atomic_write_u32(&entry.flags, 0);
+	cluster_pcm_own_snapshot_locked(&buf, &before);
+	UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+	/* Deterministic schedule: the descriptor has completed another current
+	 * conversion after the caller's saved observation, before its real
+	 * header-locked N assertion check. No replacement success predicate. */
+	pg_atomic_write_u64(&entry.generation, 14);
+	pg_atomic_write_u64(&entry.reservation_token, 10);
+	memcpy(&stable, &entry, sizeof(entry));
+	memcpy(unchanged.data, transition_page.data, BLCKSZ);
+	preassert_entry_state = RESOURCE_X_TARGET_INSTALL_STALE;
+	preassert_now_us = UINT64_C(234638955873);
+	preassert_fuses = preassert_failure_records = 0;
+	UT_ASSERT_EQ(preassert_consume(&buf, &before), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(preassert_iterations, 2);
+	UT_ASSERT_EQ(preassert_failure_records, 0);
+	UT_ASSERT_EQ(preassert_fuses, 0);
+	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_preassert_resample_is_not_an_identity_or_deadline_exception)
+{
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnSnapshot changed;
+
+	memset(&before, 0, sizeof(before));
+	before.tag.spcOid = 1663;
+	before.tag.dbOid = 5;
+	before.tag.relNumber = 16429;
+	before.tag.blockNum = 6717;
+	before.pcm_state = (uint8)PCM_STATE_N;
+	before.generation = 12;
+	before.reservation_token = 8;
+	live = before;
+	live.generation = 14;
+	live.reservation_token = 10;
+#define RESAMPLE(b, l, r, f, n, d)                                                                 \
+	cluster_gcs_resource_x_target_preassert_resample_exact(b, r, l, f, n, d)
+#define ELIGIBLE(b, l)                                                                             \
+	RESAMPLE(b, l, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 100, 200)
+	UT_ASSERT(ELIGIBLE(&before, &live));
+	UT_ASSERT(!ELIGIBLE(NULL, &live));
+	UT_ASSERT(!ELIGIBLE(&before, NULL));
+	UT_ASSERT(!ELIGIBLE(&before, &before));
+#define REJECT_LIVE(field, value)                                                                  \
+	do {                                                                                           \
+		changed = live;                                                                            \
+		changed.field = (value);                                                                   \
+		UT_ASSERT(!ELIGIBLE(&before, &changed));                                                   \
+	} while (0)
+	REJECT_LIVE(tag.blockNum, 6718);
+	REJECT_LIVE(generation, 11);
+	REJECT_LIVE(generation, UINT64_MAX);
+	REJECT_LIVE(reservation_token, 7);
+	REJECT_LIVE(reservation_token, UINT64_MAX);
+	REJECT_LIVE(pcm_state, UINT8_MAX);
+#undef REJECT_LIVE
+#define REJECT_BEFORE(field, value)                                                                \
+	do {                                                                                           \
+		changed = before;                                                                          \
+		changed.field = (value);                                                                   \
+		UT_ASSERT(!ELIGIBLE(&changed, &live));                                                     \
+	} while (0)
+	REJECT_BEFORE(pcm_state, (uint8)PCM_STATE_X);
+	REJECT_BEFORE(flags, PCM_OWN_FLAG_GRANT_PENDING);
+	REJECT_BEFORE(writer_activation_token, 1);
+	REJECT_BEFORE(resource_x_activation_generation, 1);
+	REJECT_BEFORE(generation, UINT64_MAX);
+	REJECT_BEFORE(reservation_token, UINT64_MAX);
+#undef REJECT_BEFORE
+	UT_ASSERT(
+		!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_OK, RESOURCE_X_TARGET_INSTALL_STALE, 100, 200));
+	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE,
+						RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED, 100, 200));
+	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_INVALID,
+						100, 200));
+	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 200,
+						200));
+	UT_ASSERT(
+		!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 0, 200));
+	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE,
+						UINT64_MAX, 200));
+	UT_ASSERT(
+		!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 100, 0));
+	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 100,
+						UINT64_MAX));
+	/* Recognizing that a B changed to S/X grants no authority. The original
+	 * enclosing loop, not this helper, must check its newly observed mode. */
+	live.pcm_state = (uint8)PCM_STATE_S;
+	UT_ASSERT(ELIGIBLE(&before, &live));
+	live.pcm_state = (uint8)PCM_STATE_X;
+	UT_ASSERT(ELIGIBLE(&before, &live));
+#undef ELIGIBLE
+#undef RESAMPLE
+}
+
+UT_TEST(test_real_preassert_rechecks_changed_image_and_preserves_failures)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int variant;
+
+	for (variant = 0; variant < 13; variant++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnEntry stable;
+		ClusterPcmOwnSnapshot before;
+		PGIOAlignedBlock unchanged;
+		ResourceXApplyResult expected = RESOURCE_X_APPLY_STALE;
+		int iterations = 1;
+		int fuses = 0;
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		buf.buffer_type = BUF_TYPE_PI;
+		pg_atomic_write_u64(&entry.generation, 12);
+		pg_atomic_write_u64(&entry.reservation_token, 8);
+		pg_atomic_write_u64(&entry.writer_activation_token, 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, 0);
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		pg_atomic_write_u64(&entry.generation, 14);
+		pg_atomic_write_u64(&entry.reservation_token, 10);
+		preassert_entry_state = RESOURCE_X_TARGET_INSTALL_STALE;
+		preassert_now_us = UINT64_C(234638955873);
+		preassert_fuses = preassert_failure_records = 0;
+		switch (variant) {
+		case 0:
+			preassert_entry_state = RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+			break;
+		case 1:
+			preassert_entry_state = RESOURCE_X_TARGET_INSTALL_INVALID;
+			break;
+		case 2:
+			preassert_now_us = UINT64_C(234641943560);
+			break;
+		case 3:
+			pg_atomic_write_u64(&entry.generation, 11);
+			break;
+		case 4:
+			pg_atomic_write_u64(&entry.reservation_token, 7);
+			break;
+		case 5:
+			pg_atomic_write_u64(&entry.generation, UINT64_MAX);
+			break;
+		case 6:
+			pg_atomic_write_u64(&entry.reservation_token, UINT64_MAX);
+			break;
+		case 7:
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			iterations = 2;
+			fuses = 1;
+			break;
+		case 8:
+			pg_atomic_fetch_and_u32(&buf.state, ~BM_VALID);
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			iterations = 2;
+			fuses = 1;
+			break;
+		case 9:
+			pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
+			expected = RESOURCE_X_APPLY_BAD_STATE;
+			iterations = 2;
+			break;
+		case 10:
+			buf.buffer_type = BUF_TYPE_XCUR;
+			expected = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			iterations = 2;
+			fuses = 1;
+			break;
+		case 11:
+			pg_atomic_write_u64(&entry.generation, 12);
+			expected = RESOURCE_X_APPLY_APPLIED;
+			iterations = 2;
+			break;
+		case 12:
+			pg_atomic_write_u64(&entry.generation, 38);
+			pg_atomic_write_u64(&entry.reservation_token, 30);
+			expected = RESOURCE_X_APPLY_APPLIED;
+			iterations = 2;
+			break;
+		}
+		memcpy(&stable, &entry, sizeof(entry));
+		memcpy(unchanged.data, transition_page.data, BLCKSZ);
+		UT_ASSERT_EQ(preassert_consume(&buf, &before), expected);
+		UT_ASSERT_EQ(preassert_iterations, iterations);
+		UT_ASSERT_EQ(preassert_failure_records, expected == RESOURCE_X_APPLY_APPLIED ? 0 : 1);
+		UT_ASSERT_EQ(preassert_fuses, fuses);
+		UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	}
+	ClusterPcmOwnArray = saved;
 }
 
 UT_TEST(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift)
@@ -4859,7 +5203,10 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(98);
+	UT_PLAN(101);
+	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
+	UT_RUN(test_preassert_resample_is_not_an_identity_or_deadline_exception);
+	UT_RUN(test_real_preassert_rechecks_changed_image_and_preserves_failures);
 	UT_RUN(test_pcm_own_snapshot_equality_is_whole_object_exact);
 	UT_RUN(test_bufmgr_snapshot_matches_rejects_writer_token_only_drift);
 	UT_RUN(test_bufmgr_snapshot_captures_image_type);
