@@ -1181,6 +1181,16 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id pg_attribute_unused(
 {
 	return false;
 }
+/* This fixture has no allocated capability store.  Preserve the existing
+ * negative admission boundary when linking the read-only record interface. */
+bool
+cluster_sf_peer_capability_record_snapshot(int32 peer_id pg_attribute_unused(),
+										   ClusterSfPeerCap *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
 #ifndef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void
 cluster_voting_disk_io_install_timeout_handler(void)
