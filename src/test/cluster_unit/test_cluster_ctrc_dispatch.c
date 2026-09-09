@@ -206,6 +206,302 @@ seed_certificate_notification(unsigned index, ClusterCtrcCloseDispatch *dispatch
 		   && cluster_ctrc_origin_arm_certificate_entry(origin, 0, dispatch->request_id);
 }
 
+static bool
+seed_close_notification(unsigned index, ClusterCtrcCloseDispatch *dispatch,
+						ClusterCtrcLocalReleaseAckV1 *ack, bool frozen)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	uint64 participant_index, receipt_index;
+
+	if (!seed_cancelled_ack_at(index, &participant, &receipt, ack, &participant_index,
+							   &receipt_index)
+		|| (frozen
+			&& !ctrc_participant_freeze_ack_exact(participant_index, &participant, &receipt, 1,
+												  ack)))
+		return false;
+	MemSet(dispatch, 0, sizeof(*dispatch));
+	dispatch->key = participant.key;
+	dispatch->participant = participant.identity;
+	dispatch->grant_generation = participant.grant_generation;
+	dispatch->seal_generation = participant.seal_generation;
+	dispatch->suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	dispatch->request_id = 1234 + index;
+	return cluster_ctrc_origin_arm_close_entry(&ctrc_origin_entries()[index], 0,
+											   dispatch->request_id);
+}
+
+UT_TEST(test_actual_gcs_close_replies_share_full_census)
+{
+	ClusterCtrcCloseDispatch dispatches[8];
+	ClusterCtrcLocalReleaseAckV1 acks[8];
+
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 8; i++)
+		UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], false));
+	for (unsigned replay = 0; replay < 2; replay++) {
+		MemSet(table_visits, 0, sizeof(table_visits));
+		cluster_gcs_ctrc_dispatch_batch(dispatches, 8);
+		for (Size i = 0; i < 8; i++) {
+			UT_ASSERT_EQ(ctrc_origin_entries()[i].close_confirmed_bitmap, 1);
+			UT_ASSERT_EQ(ctrc_origin_entries()[i].ack_bitmap, 0);
+		}
+		UT_ASSERT_EQ(table_visits[5], CtrcShared->origin_key_entries);
+		/* The already ACK_READY participant accepts a duplicate on both
+		 * calls; only the second origin confirmation is also duplicate. */
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_PENDING_DUPLICATE), (2 * replay + 1) * 8);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_local_close_batch_matches_all_scalar_results)
+{
+	for (unsigned scenario = 0; scenario < 19; scenario++) {
+		unsigned char *expected = NULL;
+		uint64 expected_progress = 0, expected_duplicates = 0;
+		unsigned expected_wakes = 0;
+
+		for (unsigned batch = 0; batch < 2; batch++) {
+			ClusterCtrcCloseDispatch dispatches[64];
+			ClusterCtrcSealReplyResult results[64];
+			ClusterCtrcLocalReleaseAckV1 acks[64];
+			Size count = scenario == 0 ? 1 : (scenario == 2 || scenario == 13 ? 64 : 8);
+			Size origin_bytes, ack_bytes;
+			uint64 collision = 1;
+
+			reset_dispatch_fixture();
+			for (Size i = 0; i < count; i++) {
+				bool ack = scenario == 3 || scenario == 9 || scenario == 10 || scenario == 11
+						   || scenario == 12 || scenario == 16 || scenario == 18
+						   || ((scenario == 4 || scenario == 17) && i % 2 != 0);
+
+				UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], ack));
+				results[i]
+					= ack ? CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK : CTRC_SEAL_REPLY_PENDING_DRAIN;
+				if (scenario == 13) {
+					while (collision < UINT64_C(65536)
+						   && ctrc_receipt_hash_bytes(UINT64_C(1469598103934665603), &collision,
+													  sizeof(collision))
+									  % 128
+								  != 0)
+						collision++;
+					UT_ASSERT(collision < UINT64_C(65536));
+					dispatches[i].request_id = collision++;
+					ctrc_origin_entries()[i].close_request_id[0] = dispatches[i].request_id;
+				}
+			}
+			if (scenario == 5)
+				results[count - 1] = CTRC_SEAL_REPLY_DENIED;
+			if (scenario == 6)
+				dispatches[0].request_id += UINT64_C(1) << 50;
+			if (scenario == 7 || scenario == 8 || scenario == 16) {
+				ctrc_origin_entries()[count] = ctrc_origin_entries()[0];
+				if (scenario == 8)
+					ctrc_origin_entries()[count + 1] = ctrc_origin_entries()[0];
+			}
+			if (scenario == 9)
+				acks[count - 1].crc32c++;
+			if (scenario == 10)
+				acks[0].transaction_key.xid++;
+			if (scenario == 11 || scenario == 12) {
+				uint64 ack_index;
+				UT_ASSERT(ctrc_origin_ack_index(&dispatches[0].key, 0, &ack_index));
+				if (scenario == 12) {
+					UT_ASSERT(
+						cluster_ctrc_origin_ack_land_shared(dispatches[0].request_id, &acks[0]));
+					ctrc_origin_ack_entries()[ack_index].grant_generation++;
+				} else
+					ctrc_origin_ack_entries()[ack_index].reserved[0] = 1;
+			}
+			if (scenario == 14)
+				ctrc_origin_entries()[count - 1].state = CTRC_ORIGIN_BLOCKED;
+			if (scenario == 15)
+				ctrc_origin_entries()[count - 1].close_dispatched_bitmap = 0;
+			if (scenario == 17)
+				ctrc_origin_entries()[1].close_request_id[0] = dispatches[0].request_id;
+			if (scenario == 18)
+				acks[0].transaction_key.owner_instance = 0;
+			origin_bytes = CtrcShared->origin_key_entries * sizeof(ClusterCtrcOriginEntry);
+			ack_bytes = CtrcShared->origin_ack_inbox_entries * sizeof(ClusterCtrcLocalReleaseAckV1);
+			MemSet(table_visits, 0, sizeof(table_visits));
+			for (unsigned replay = 0; replay < 2; replay++)
+				if (batch)
+					UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(dispatches, results,
+																				acks, count));
+				else
+					for (Size i = 0; i < count; i++)
+						if (results[i] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
+							(void)cluster_ctrc_origin_ack_land_shared(dispatches[i].request_id,
+																	  &acks[i]);
+						else
+							(void)cluster_ctrc_origin_note_close_reply_shared(
+								dispatches[i].request_id, 0, results[i]);
+			if (!batch) {
+				expected = malloc(origin_bytes + ack_bytes);
+				if (expected == NULL)
+					abort();
+				memcpy(expected, ctrc_origin_entries(), origin_bytes);
+				memcpy(expected + origin_bytes, ctrc_origin_ack_entries(), ack_bytes);
+				expected_progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+				expected_duplicates = cluster_ctrc_stat_get(CTRC_STAT_PENDING_DUPLICATE);
+				expected_wakes = wake_count;
+			} else {
+				UT_ASSERT_EQ(memcmp(expected, ctrc_origin_entries(), origin_bytes), 0);
+				UT_ASSERT_EQ(memcmp(expected + origin_bytes, ctrc_origin_ack_entries(), ack_bytes),
+							 0);
+				UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), expected_progress);
+				UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_PENDING_DUPLICATE),
+							 expected_duplicates);
+				UT_ASSERT_EQ(wake_count, expected_wakes);
+				UT_ASSERT_EQ(table_visits[5], results[0] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+												  ? 0
+												  : 2 * CtrcShared->origin_key_entries);
+			}
+			UT_ASSERT_EQ(held_count, 0);
+		}
+		free(expected);
+	}
+}
+
+UT_TEST(test_local_close_invalid_shape_has_no_mutation)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterCtrcCloseDispatch dispatches[2];
+		ClusterCtrcSealReplyResult results[2]
+			= { CTRC_SEAL_REPLY_PENDING_DRAIN, CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK };
+		ClusterCtrcLocalReleaseAckV1 acks[2];
+		unsigned char *before;
+		unsigned locks;
+		Size bytes;
+		Size count = fault == 0 ? 0 : (fault == 1 ? 65 : 2);
+
+		reset_dispatch_fixture();
+		for (Size i = 0; i < 2; i++)
+			UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], i != 0));
+		if (fault == 5)
+			dispatches[1].participant.node_id = 1;
+		if (fault == 6)
+			dispatches[1].suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+		if (fault == 7)
+			dispatches[1].request_id = 0;
+		if (fault == 8)
+			dispatches[1].request_id = dispatches[0].request_id;
+		bytes = CtrcShared->total_bytes;
+		before = malloc(bytes);
+		if (before == NULL)
+			abort();
+		memcpy(before, CtrcShared, bytes);
+		locks = sleepable_acquisitions;
+		UT_ASSERT(!cluster_ctrc_origin_note_local_close_batch_shared(
+			fault == 2 ? NULL : dispatches, fault == 3 ? NULL : results, fault == 4 ? NULL : acks,
+			count));
+		UT_ASSERT_EQ(sleepable_acquisitions, locks);
+		UT_ASSERT_EQ(memcmp(before, CtrcShared, bytes), 0);
+		free(before);
+	}
+}
+
+UT_TEST(test_actual_gcs_close_each_token_stage_refuses_only_its_reply)
+{
+	for (unsigned stage = 0; stage < 4; stage++)
+		for (unsigned failed = 0; failed < 3; failed++) {
+			ClusterCtrcCloseDispatch dispatches[3];
+			ClusterCtrcLocalReleaseAckV1 acks[3];
+
+			reset_dispatch_fixture();
+			for (Size i = 0; i < 3; i++)
+				UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], false));
+			fail_recheck = stage == 3 ? 10 + failed : failed * 3 + stage + 1;
+			cluster_gcs_ctrc_dispatch_batch(dispatches, 3);
+			for (Size i = 0; i < 3; i++)
+				UT_ASSERT_EQ(ctrc_origin_entries()[i].close_confirmed_bitmap, i == failed ? 0 : 1);
+			UT_ASSERT_EQ(enters, leaves);
+			UT_ASSERT_EQ(allocated, 0);
+		}
+}
+
+static void
+throw_from_participant_wakeup(void)
+{
+	if (held_count != 0)
+		abort();
+	wakeup_hook = NULL;
+	pg_re_throw();
+}
+
+UT_TEST(test_actual_gcs_close_error_and_allocation_fallbacks)
+{
+	for (unsigned failure = 0; failure < 6; failure++) {
+		ClusterCtrcCloseDispatch dispatches[2];
+		ClusterCtrcLocalReleaseAckV1 acks[2];
+		volatile bool caught = false;
+
+		reset_dispatch_fixture();
+		for (Size i = 0; i < 2; i++)
+			UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], false));
+		if (failure < 2)
+			fail_allocation_attempt = allocation_attempts + 1 + failure;
+		if (failure == 2)
+			dispatches[1] = dispatches[0];
+		if (failure == 3)
+			dispatches[1].request_id = dispatches[0].request_id;
+		if (failure == 4)
+			throw_resolve = 2;
+		if (failure == 5) {
+			uint64 participant;
+			UT_ASSERT(ctrc_participant_index(&dispatches[0].key, 0, &participant));
+			ctrc_participant_entries()[participant].state = CTRC_PARTICIPANT_OPEN;
+			ctrc_participant_entries()[participant].seal_generation = 0;
+			wakeup_hook = throw_from_participant_wakeup;
+		}
+		PG_TRY();
+		{
+			cluster_gcs_ctrc_dispatch_batch(dispatches, 2);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, failure >= 4);
+		if (failure >= 4)
+			UT_ASSERT_EQ(ctrc_origin_entries()[0].close_confirmed_bitmap, 0);
+		else
+			UT_ASSERT_EQ(ctrc_origin_entries()[0].close_confirmed_bitmap, 1);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_actual_gcs_close_ack_and_mixed_results)
+{
+	for (unsigned mixed = 0; mixed < 2; mixed++) {
+		ClusterCtrcCloseDispatch dispatches[8];
+		ClusterCtrcLocalReleaseAckV1 acks[8];
+
+		reset_dispatch_fixture();
+		for (Size i = 0; i < 8; i++)
+			UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], !mixed || i % 2 != 0));
+		MemSet(table_visits, 0, sizeof(table_visits));
+		cluster_gcs_ctrc_dispatch_batch(dispatches, 8);
+		for (Size i = 0; i < 8; i++) {
+			uint64 ack_index;
+			UT_ASSERT_EQ(ctrc_origin_entries()[i].close_confirmed_bitmap, 1);
+			UT_ASSERT_EQ(ctrc_origin_entries()[i].ack_bitmap, !mixed || i % 2 != 0 ? 1 : 0);
+			if (!mixed || i % 2 != 0) {
+				UT_ASSERT(ctrc_origin_ack_index(&dispatches[i].key, 0, &ack_index));
+				UT_ASSERT_EQ(
+					memcmp(&ctrc_origin_ack_entries()[ack_index], &acks[i], sizeof(acks[i])), 0);
+			}
+		}
+		UT_ASSERT_EQ(table_visits[5], mixed ? CtrcShared->origin_key_entries : 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
 UT_TEST(test_actual_gcs_batch_reclaims_eight_independent_sets_once)
 {
 	ClusterCtrcCloseDispatch dispatches[8];
@@ -495,7 +791,13 @@ UT_TEST(test_actual_gcs_mixed_operations_preserve_order_and_remote_enqueue)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(15);
+	UT_RUN(test_actual_gcs_close_replies_share_full_census);
+	UT_RUN(test_local_close_batch_matches_all_scalar_results);
+	UT_RUN(test_local_close_invalid_shape_has_no_mutation);
+	UT_RUN(test_actual_gcs_close_each_token_stage_refuses_only_its_reply);
+	UT_RUN(test_actual_gcs_close_error_and_allocation_fallbacks);
+	UT_RUN(test_actual_gcs_close_ack_and_mixed_results);
 	UT_RUN(test_actual_gcs_batch_reclaims_eight_independent_sets_once);
 	UT_RUN(test_actual_gcs_authentication_faults_never_reclaim);
 	UT_RUN(test_actual_gcs_exception_releases_all_entered_tokens);

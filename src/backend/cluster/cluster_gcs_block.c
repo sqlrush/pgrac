@@ -18228,6 +18228,101 @@ gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches,
 	PG_END_TRY();
 }
 
+/* Different physical slots have independent participant state. Defer only
+ * their origin replies to one census, never their per-item admission or ACK
+ * checks. No reply crosses a remote request or a certificate notification. */
+static void
+gcs_ctrc_dispatch_local_closes(const ClusterCtrcCloseDispatch *dispatches, Size count)
+{
+	ClusterSemanticAdmissionToken *admissions;
+	ClusterCtrcLocalReleaseAckV1 *acks;
+	ClusterCtrcCloseDispatch accepted[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	ClusterCtrcSealReplyResult results[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	Size accepted_to_input[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	Size accepted_count = 0;
+
+	for (Size i = 0; i < count; i++)
+		for (Size j = 0; j < i; j++)
+			if ((dispatches[i].key.segment_id == dispatches[j].key.segment_id
+				 && dispatches[i].key.slot_offset == dispatches[j].key.slot_offset)
+				|| dispatches[i].request_id == dispatches[j].request_id) {
+				for (Size k = 0; k < count; k++)
+					(void)cluster_gcs_ctrc_dispatch_close(&dispatches[k]);
+				return;
+			}
+	admissions = palloc_extended(count * sizeof(*admissions), MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (admissions == NULL) {
+		for (Size i = 0; i < count; i++)
+			(void)cluster_gcs_ctrc_dispatch_close(&dispatches[i]);
+		return;
+	}
+	acks = palloc_extended(count * sizeof(*acks), MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (acks == NULL) {
+		pfree(admissions);
+		for (Size i = 0; i < count; i++)
+			(void)cluster_gcs_ctrc_dispatch_close(&dispatches[i]);
+		return;
+	}
+	PG_TRY();
+	{
+		for (Size i = 0; i < count; i++) {
+			uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+			uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
+
+			if (!gcs_ctrc_dispatch_prepare(&dispatches[i], &admissions[i], request)
+				|| !cluster_semantic_activation_recheck_r4_terminal_census(&admissions[i])) {
+				if (admissions[i].entered)
+					cluster_semantic_activation_leave(&admissions[i]);
+				continue;
+			}
+			results[accepted_count] = cluster_ctrc_participant_request_shared(
+				&dispatches[i].key, &dispatches[i].participant, dispatches[i].grant_generation,
+				dispatches[i].seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &first_reason,
+				&acks[accepted_count]);
+			if (cluster_semantic_activation_recheck_r4_terminal_census(&admissions[i])) {
+				accepted[accepted_count] = dispatches[i];
+				accepted_to_input[accepted_count++] = i;
+			}
+		}
+		{
+			Size reply_count = 0;
+
+			for (Size i = 0; i < accepted_count; i++)
+				if (cluster_semantic_activation_recheck_r4_terminal_census(
+						&admissions[accepted_to_input[i]])) {
+					accepted[reply_count] = accepted[i];
+					accepted_to_input[reply_count] = accepted_to_input[i];
+					results[reply_count] = results[i];
+					acks[reply_count++] = acks[i];
+				}
+			if (reply_count != 0
+				&& !cluster_ctrc_origin_note_local_close_batch_shared(accepted, results, acks,
+																	  reply_count))
+				for (Size i = 0; i < reply_count; i++)
+					if (cluster_semantic_activation_recheck_r4_terminal_census(
+							&admissions[accepted_to_input[i]])) {
+						/* Consume this existing reply; do not repeat participant work. */
+						if (results[i] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
+							(void)cluster_ctrc_origin_ack_land_shared(accepted[i].request_id,
+																	  &acks[i]);
+						else
+							(void)cluster_ctrc_origin_note_close_reply_shared(
+								accepted[i].request_id, accepted[i].participant.node_id,
+								results[i]);
+					}
+		}
+	}
+	PG_FINALLY();
+	{
+		for (Size i = 0; i < count; i++)
+			if (admissions[i].entered)
+				cluster_semantic_activation_leave(&admissions[i]);
+		pfree(acks);
+		pfree(admissions);
+	}
+	PG_END_TRY();
+}
+
 void
 cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count)
 {
@@ -18235,18 +18330,23 @@ cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size
 		return;
 	for (Size i = 0; i < count;) {
 		Size end = i;
+		uint8 suboperation = dispatches[i].suboperation;
 
-		/* Do not move a certificate across another operation. A run is the
-		 * maximal contiguous local-certificate subsequence in the old order. */
-		while (end < count && dispatches[end].suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
-			   && cluster_node_id >= 0
+		/* Maximal contiguous same-operation local subsequences, in old order. */
+		while (end < count
+			   && (suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+				   || suboperation == CTRC_SEAL_CLOSE_AND_CLEAN)
+			   && dispatches[end].suboperation == suboperation && cluster_node_id >= 0
 			   && dispatches[end].participant.node_id == (uint16)cluster_node_id)
 			end++;
 		if (end == i) {
 			(void)cluster_gcs_ctrc_dispatch_close(&dispatches[i++]);
 			continue;
 		}
-		gcs_ctrc_dispatch_local_certificates(&dispatches[i], end - i);
+		if (suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
+			gcs_ctrc_dispatch_local_certificates(&dispatches[i], end - i);
+		else
+			gcs_ctrc_dispatch_local_closes(&dispatches[i], end - i);
 		i = end;
 	}
 }

@@ -3581,10 +3581,11 @@ test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pas
 test_cluster_ctrc_dispatch.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_ctrc_dispatch_prepare\(/ { print "static bool"; emit=1; prepare++ } \
 	     /^gcs_ctrc_dispatch_local_certificates\(/ { print "static void"; emit=1; local++ } \
+	     /^gcs_ctrc_dispatch_local_closes\(/ { print "static void"; emit=1; closes++ } \
 	     /^cluster_gcs_ctrc_dispatch_close\(/ { print "bool"; emit=1; single++ } \
 	     /^cluster_gcs_ctrc_dispatch_batch\(/ { print "void"; emit=1; batch++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (prepare != 1 || local != 1 || single != 1 || batch != 1) exit 1 }' $< > $@.tmp
+	     END { if (prepare != 1 || local != 1 || closes != 1 || single != 1 || batch != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ctrc_dispatch: test_cluster_ctrc_dispatch.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \

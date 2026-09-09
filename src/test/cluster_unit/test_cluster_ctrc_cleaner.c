@@ -61,7 +61,7 @@ pg_attribute_unused() test_spin_release(volatile slock_t *lock)
 #define SpinLockRelease(lock) test_spin_release(lock)
 
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
-static Size table_visits[5];
+static Size table_visits[6];
 static Size shared_validation_writer_visits;
 static void test_table_visit(unsigned kind);
 static void test_pool_upgrade(void);
@@ -90,11 +90,13 @@ volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 static unsigned allocated;
 static bool allocation_failure;
+static unsigned allocation_attempts, fail_allocation_attempt;
 static unsigned flush_calls, durability_calls, barrier_calls;
 static XLogRecPtr test_flush_lsn;
 static void (*durability_hook)(unsigned call);
 static void (*barrier_hook)(void);
 static void (*pool_upgrade_hook)(void);
+static void (*wakeup_hook)(void);
 
 void *
 palloc_extended(Size size, int flags)
@@ -102,7 +104,8 @@ palloc_extended(Size size, int flags)
 	void *memory;
 	if (held_count != 0)
 		abort();
-	if (allocation_failure)
+	allocation_attempts++;
+	if (allocation_failure || allocation_attempts == fail_allocation_attempt)
 		return NULL;
 	memory = (flags & MCXT_ALLOC_ZERO) != 0 ? calloc(1, size) : malloc(size);
 	if (memory != NULL)
@@ -287,6 +290,8 @@ void
 cluster_undo_cleaner_wakeup(void)
 {
 	wake_count++;
+	if (wakeup_hook != NULL)
+		wakeup_hook();
 }
 
 bool
@@ -346,11 +351,13 @@ reset_fixture(void)
 	spin_acquisitions = 0;
 	sleepable_acquisitions = 0;
 	allocation_failure = false;
+	allocation_attempts = fail_allocation_attempt = 0;
 	flush_calls = durability_calls = barrier_calls = 0;
 	test_flush_lsn = 0;
 	durability_hook = NULL;
 	barrier_hook = NULL;
 	pool_upgrade_hook = NULL;
+	wakeup_hook = NULL;
 	paused_actor_count = 0;
 	InterruptPending = 0;
 }

@@ -272,6 +272,7 @@ _classify_owners(
     (
         "cluster_gcs_ctrc_dispatch_close",
         "gcs_ctrc_dispatch_prepare",
+        "gcs_ctrc_dispatch_local_closes",
         "gcs_block_try_ctrc_forward136",
         "gcs_block_try_land_ctrc_reply",
     ),
