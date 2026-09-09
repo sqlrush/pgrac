@@ -84,6 +84,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h" /* init_ps_display */
@@ -135,7 +136,7 @@
  *	  60..63  uint32 _pad
  *	  64..71  uint64 self_incarnation      (canonical boot session)
  *	  72..75  uint32 prior_unclean_death   (crash-rejoin barrier)
- *	  76..127 uint8[52] _reserved          (future expansion)
+ *	  76..127 diagnostics only (phase sequence, cycle times, owner and phase)
  *	 128..447 ClusterQvotecMailbox          (spec-5.15A §2.1A.4)
  * ============================================================ */
 typedef struct ClusterQvotecShmem {
@@ -164,11 +165,14 @@ typedef struct ClusterQvotecShmem {
 	 * dead-deadband (the epoch signal is INITIAL on both sides in that race).
 	 */
 	pg_atomic_uint32 prior_unclean_death; /* offset 72..75 */
-	uint32 diagnostic_pad;
+	pg_atomic_uint32 diagnostic_phase_seq;
 	pg_atomic_uint64 diagnostic_cycle_started_us;
 	pg_atomic_uint64 diagnostic_cycle_finished_us;
 	pg_atomic_uint64 diagnostic_cycle_duration_us;
-	uint8 _reserved[24];
+	pg_atomic_uint64 diagnostic_phase_started_us;
+	pg_atomic_uint64 diagnostic_owner_identity;
+	pg_atomic_uint32 diagnostic_phase;
+	uint8 _reserved[4];
 	ClusterQvotecMailbox mailbox;
 } ClusterQvotecShmem;
 
@@ -185,6 +189,137 @@ StaticAssertDecl(offsetof(ClusterQvotecShmem, diagnostic_cycle_started_us) == 80
 
 
 static ClusterQvotecShmem *QvotecShmem = NULL;
+
+/* Read-only evidence, not a quorum state machine or permission to renew. */
+typedef enum QvotecDiagnosticPhase {
+	QVOTEC_DIAG_UNKNOWN,
+	QVOTEC_DIAG_PRE_INJECTION,
+	QVOTEC_DIAG_SEMANTIC_MAILBOX,
+	QVOTEC_DIAG_LEASE_PENDING,
+	QVOTEC_DIAG_BALLOT,
+	QVOTEC_DIAG_VOTE_MATRIX,
+	QVOTEC_DIAG_JOIN,
+	QVOTEC_DIAG_FENCE_DECISION,
+	QVOTEC_DIAG_APPLY_LEASE,
+	QVOTEC_DIAG_SELF_WRITE,
+	QVOTEC_DIAG_ACK_READBACK,
+	QVOTEC_DIAG_STRIPE_SCAN,
+	QVOTEC_DIAG_STRIPE_SEED,
+	QVOTEC_DIAG_STRIPE_HERD,
+	QVOTEC_DIAG_STATE_PUBLISH,
+	QVOTEC_DIAG_FORMATION,
+	QVOTEC_DIAG_BOOTSTRAP,
+	QVOTEC_DIAG_IDLE,
+	QVOTEC_DIAG_SHUTDOWN
+} QvotecDiagnosticPhase;
+
+static const char *const qvotec_diagnostic_phase_names[]
+	= { "UNKNOWN",		 "PRE_INJECTION",  "SEMANTIC_MAILBOX",
+		"LEASE_PENDING", "BALLOT",		   "VOTE_MATRIX",
+		"JOIN",			 "FENCE_DECISION", "APPLY_LEASE",
+		"SELF_WRITE",	 "ACK_READBACK",   "STRIPE_SCAN",
+		"STRIPE_SEED",	 "STRIPE_HERD",	   "STATE_PUBLISH",
+		"FORMATION",	 "BOOTSTRAP",	   "IDLE",
+		"SHUTDOWN" };
+
+static void
+qvotec_diagnostic_phase_enter(QvotecDiagnosticPhase phase)
+{
+	uint32 seq;
+	uint64 identity;
+
+	/* Only the existing poll owner writes; observation cannot drive it. */
+	if (QvotecShmem == NULL || MyBackendType != B_QVOTEC)
+		return;
+	identity = ((uint64)(uint32)MyProcPid << 32)
+			   | (MyProc != NULL ? (uint32)MyProc->pgprocno : UINT32_MAX);
+	seq = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq);
+	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase_seq, seq | 1u);
+	pg_write_barrier();
+	pg_atomic_write_u64(&QvotecShmem->diagnostic_phase_started_us, (uint64)GetCurrentTimestamp());
+	pg_atomic_write_u64(&QvotecShmem->diagnostic_owner_identity, identity);
+	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase, (uint32)phase);
+	pg_write_barrier();
+	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase_seq, (seq | 1u) + 1u);
+}
+
+static void
+qvotec_diagnostic_format(char *out, size_t size)
+{
+	uint64 phase_started = 0;
+	uint64 identity = 0;
+	uint64 sampled_now = (uint64)GetCurrentTimestamp();
+	uint64 cycle_started = 0;
+	uint64 cycle_finished = 0;
+	uint64 cycle_duration = 0;
+	uint32 phase = QVOTEC_DIAG_UNKNOWN;
+	uint32 cycle_count = 0;
+	uint32 wait_event = 0;
+	uint32 seq = 0;
+	bool stable = false;
+	bool owner_matches = false;
+	unsigned int attempt;
+
+	if (QvotecShmem != NULL) {
+		for (attempt = 0; attempt < 3; attempt++) {
+			uint32 observed_phase;
+			uint64 observed_started;
+			uint64 observed_identity;
+
+			seq = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq);
+			if ((seq & 1u) != 0)
+				continue;
+			pg_read_barrier();
+			observed_phase = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase);
+			observed_started = pg_atomic_read_u64(&QvotecShmem->diagnostic_phase_started_us);
+			observed_identity = pg_atomic_read_u64(&QvotecShmem->diagnostic_owner_identity);
+			pg_read_barrier();
+			if (seq != pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq))
+				continue;
+			if (observed_phase > QVOTEC_DIAG_UNKNOWN
+				&& observed_phase < lengthof(qvotec_diagnostic_phase_names)) {
+				phase = observed_phase;
+				phase_started = observed_started;
+				identity = observed_identity;
+				stable = true;
+			}
+			break;
+		}
+		/* Independent diagnostics, not an atomic cycle/phase snapshot. */
+		cycle_started = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_started_us);
+		cycle_finished = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_finished_us);
+		cycle_duration = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_duration_us);
+		cycle_count = pg_atomic_read_u32(&QvotecShmem->poll_cycle_count);
+	}
+
+	if (stable && (uint32)(identity >> 32) > 0 && (uint32)(identity >> 32) <= INT_MAX
+		&& ProcGlobal != NULL && ProcGlobal->allProcs != NULL
+		&& (uint32)identity < ProcGlobal->allProcCount) {
+		volatile PGPROC *owner = &ProcGlobal->allProcs[(uint32)identity];
+		int pid = (int)(identity >> 32);
+
+		/* allProcs storage is fixed. Never follow a PID as an address or index.
+		 * A recycled slot, or a phase changing during this read, is a gap. */
+		if (owner->pid == pid) {
+			pg_read_barrier();
+			wait_event = owner->wait_event_info;
+			pg_read_barrier();
+			owner_matches = owner->pid == pid
+							&& seq == pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq);
+			if (!owner_matches)
+				wait_event = 0;
+		}
+	}
+	snprintf(out, size,
+			 "owner_snapshot_stable=%d owner_phase=%s owner_phase_started_us=%llu "
+			 "owner_pid=%u owner_procno=%u owner_pid_matches=%d owner_wait_event=%u "
+			 "owner_sampled_us=%llu diag_cycle_started_us=%llu diag_cycle_finished_us=%llu "
+			 "diag_cycle_duration_us=%llu diag_cycle_count=%u",
+			 stable, qvotec_diagnostic_phase_names[phase], (unsigned long long)phase_started,
+			 (uint32)(identity >> 32), stable ? (uint32)identity : UINT32_MAX, owner_matches,
+			 wait_event, (unsigned long long)sampled_now, (unsigned long long)cycle_started,
+			 (unsigned long long)cycle_finished, (unsigned long long)cycle_duration, cycle_count);
+}
 
 /*
  * QvotecPid — process-local mirror of the postmaster-side QvotecPID.
@@ -626,10 +761,13 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->_pad, 0);
 		pg_atomic_init_u64(&QvotecShmem->self_incarnation, 0);
 		pg_atomic_init_u32(&QvotecShmem->prior_unclean_death, 0);
-		QvotecShmem->diagnostic_pad = 0;
+		pg_atomic_init_u32(&QvotecShmem->diagnostic_phase_seq, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_started_us, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_finished_us, 0);
 		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_duration_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_phase_started_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_owner_identity, 0);
+		pg_atomic_init_u32(&QvotecShmem->diagnostic_phase, QVOTEC_DIAG_UNKNOWN);
 		memset(QvotecShmem->_reserved, 0, sizeof(QvotecShmem->_reserved));
 		cluster_qvotec_mailbox_restart_reset(&QvotecShmem->mailbox);
 	}
@@ -861,12 +999,15 @@ qvotec_admission_denied(unsigned int diagnostic_bit, const char *reason, uint32 
 	static uint32 reported_reasons;
 
 	if ((reported_reasons & (UINT32_C(1) << diagnostic_bit)) == 0) {
+		char owner_evidence[640];
+
 		reported_reasons |= UINT32_C(1) << diagnostic_bit;
-		ereport(LOG, (errmsg_internal("PGRAC_FAMILY=QUORUM_ADMISSION PGRAC_REASON=%s node=%d "
-									  "sampled_state=%u sampled_expiry_us=%llu sampled_now_us=%llu",
-									  reason, cluster_node_id, sampled_state,
-									  (unsigned long long)sampled_expiry,
-									  (unsigned long long)sampled_now)));
+		qvotec_diagnostic_format(owner_evidence, sizeof(owner_evidence));
+		ereport(LOG, (errmsg_internal(
+						 "PGRAC_FAMILY=QUORUM_ADMISSION PGRAC_REASON=%s node=%d "
+						 "sampled_state=%u sampled_expiry_us=%llu sampled_now_us=%llu %s",
+						 reason, cluster_node_id, sampled_state, (unsigned long long)sampled_expiry,
+						 (unsigned long long)sampled_now, owner_evidence)));
 	}
 	return false;
 }
@@ -2267,6 +2408,20 @@ qvotec_replacement_request_preserve(ClusterVotingSlot *next,
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void cluster_qvotec_test_poll_pre_injection(void);
 void cluster_qvotec_test_publish_poll_lease(uint64 now_us);
+void cluster_qvotec_test_diagnostic_phase_enter(uint32 phase);
+void cluster_qvotec_test_diagnostic_format(char *out, size_t size);
+
+void
+cluster_qvotec_test_diagnostic_phase_enter(uint32 phase)
+{
+	qvotec_diagnostic_phase_enter((QvotecDiagnosticPhase)phase);
+}
+
+void
+cluster_qvotec_test_diagnostic_format(char *out, size_t size)
+{
+	qvotec_diagnostic_format(out, size);
+}
 
 void
 cluster_qvotec_test_publish_poll_lease(uint64 now_us)
@@ -2675,6 +2830,7 @@ qvotec_poll_once(void)
 	bool fence_majority_written = false; /* RF-ROOT P6: this poll's marker tuple
 										 * reached quorum-majority durability */
 
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SEMANTIC_MAILBOX);
 	if (cluster_semantic_activation_qvotec_poll_record_read(
 			&semantic_record_read_request)) {
 		uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
@@ -2738,6 +2894,7 @@ qvotec_poll_once(void)
 			undo_root_descriptor_request.request_seq, result);
 	}
 
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_LEASE_PENDING);
 	now_us = (uint64)GetCurrentTimestamp();
 	heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
 
@@ -2848,6 +3005,7 @@ qvotec_poll_once(void)
 	/* Common-epoch authority is serviced only by QVOTEC after its disk set and
 	 * local node identity are valid.  RECOVER_HEAD is read-only; PROPOSE remains
 	 * HOLD until the cooperative P1/P2/SETTLE phases are installed. */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_BALLOT);
 	qvotec_epoch_ballot_mailbox_tick();
 
 	/*
@@ -2868,6 +3026,7 @@ qvotec_poll_once(void)
 	 */
 
 	/* ---- 1. read full slot matrix BEFORE writing ---- */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_VOTE_MATRIX);
 	memset(qvotec_slot_matrix, 0,
 		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
 	for (i = 0; i < qvotec_n_disks; i++) {
@@ -2934,6 +3093,7 @@ qvotec_poll_once(void)
 		uint32 node;
 		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_JOIN);
 		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 			ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
 			int n_committed = 0;
@@ -3041,6 +3201,7 @@ qvotec_poll_once(void)
 		bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
 		ClusterFenceAuthority authority;
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FENCE_DECISION);
 		for (i = 0; i < qvotec_n_disks; i++)
 			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
 
@@ -3112,6 +3273,7 @@ qvotec_poll_once(void)
 	if (have_apply_lease_request) {
 		ClusterMrpApplyLeaseSubmitResult apply_lease_result;
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_APPLY_LEASE);
 		apply_lease_result
 			= qvotec_apply_lease_cas(&apply_lease_request, decision.alive_bitmap,
 									 (int)sizeof(decision.alive_bitmap), &apply_lease_winner);
@@ -3119,6 +3281,7 @@ qvotec_poll_once(void)
 	}
 
 	/* ---- 3. build + write self slot to every disk ---- */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SELF_WRITE);
 	memset(&self_slot, 0, sizeof(self_slot));
 	self_slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
 	self_slot.version = CLUSTER_VOTING_SLOT_VERSION;
@@ -3372,6 +3535,7 @@ qvotec_poll_once(void)
 		 * >= quorum-majority -- otherwise the coordinator fails closed and does
 		 * NOT publish the reconfig event (core 8.A order).
 		 */
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_ACK_READBACK);
 		fence_majority_written = (disks_ok_post_write >= quorum_size_post_write);
 		if (have_submit)
 			cluster_write_fence_qvotec_complete(fence_majority_written);
@@ -3477,16 +3641,20 @@ qvotec_poll_once(void)
 	 * disk, majority-durable, adopt-not-overwrite — see
 	 * cluster_xid_stripe_boot.c).
 	 */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STRIPE_SCAN);
 	if (cluster_xid_stripe_disk_state() != CLUSTER_XID_STRIPE_DISK_PUBLISHED)
 		cluster_xid_stripe_scan_disks(qvotec_fds, qvotec_n_disks);
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STRIPE_SEED);
 	cluster_xid_stripe_service_seed(qvotec_fds, qvotec_n_disks);
 
 	/* spec-6.15 D3: counter herding — sweep peer hwm, publish min/max,
 	 * durably advance this node's hwm promise (no-op until the stripe
 	 * face is PUBLISHED + MINE). */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STRIPE_HERD);
 	cluster_xid_stripe_herding_tick(qvotec_fds, qvotec_n_disks);
 
 	/* ---- 4. publish shmem ---- */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STATE_PUBLISH);
 	{
 		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
 
@@ -3519,6 +3687,7 @@ qvotec_poll_once(void)
 		uint32		majority = (uint32) qvotec_n_disks / 2u + 1u;
 		int			d;
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FORMATION);
 		memset(valid, 0, sizeof(valid));
 		for (d = 0; d < qvotec_n_disks; d++)
 		{
@@ -3578,6 +3747,7 @@ qvotec_poll_once(void)
 	{
 		uint32 node;
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_BOOTSTRAP);
 		cluster_reconfig_bootstrap_publish_begin();
 		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 			uint64 best_gen = 0;
@@ -3994,6 +4164,7 @@ ClusterQvotecMain(void)
 		INSTR_TIME_SET_CURRENT(cycle_started);
 		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_started_us,
 							(uint64)GetCurrentTimestamp());
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_PRE_INJECTION);
 		qvotec_poll_pre_injection();
 		qvotec_poll_once();
 		INSTR_TIME_SET_CURRENT(cycle_finished);
@@ -4009,6 +4180,7 @@ ClusterQvotecMain(void)
 			INSTR_TIME_GET_MICROSEC(cycle_finished),
 			cluster_quorum_poll_interval_ms);
 
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_IDLE);
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
 					   WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP);
 
@@ -4023,6 +4195,7 @@ ClusterQvotecMain(void)
 	 * is non-fatal — startup ghost-detect path covers the residual
 	 * crash / immediate-shutdown gap.
 	 */
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SHUTDOWN);
 	qvotec_clear_self_alive_on_clean_shutdown();
 	qvotec_close_disks();
 	if (!cluster_reconfig_qvotec_lifecycle_transition(

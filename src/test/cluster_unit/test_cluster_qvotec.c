@@ -76,6 +76,7 @@
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -171,6 +172,10 @@ volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 int MyProcPid = 0;
+PGPROC *MyProc = NULL;
+PROC_HDR *ProcGlobal = NULL;
+extern void cluster_qvotec_test_diagnostic_phase_enter(uint32 phase);
+extern void cluster_qvotec_test_diagnostic_format(char *out, size_t size);
 int cluster_node_id = 0;
 char *cluster_shared_data_dir = NULL;
 
@@ -264,7 +269,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
-static char quorum_admission_log[512];
+static char quorum_admission_log[1536];
 static unsigned int quorum_admission_log_count;
 
 bool
@@ -1599,6 +1604,10 @@ UT_TEST(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions)
 	UT_ASSERT(strstr(quorum_admission_log, "PGRAC_REASON=LEASE_EXPIRED") != NULL);
 	UT_ASSERT(strstr(quorum_admission_log, "sampled_expiry_us=5000000 sampled_now_us=5000000")
 			  != NULL);
+	/* A real denial must say whether the refresh owner was observable; missing
+	 * evidence is not an idle owner and must never renew the expired lease. */
+	UT_ASSERT(strstr(quorum_admission_log, "owner_snapshot_stable=0") != NULL);
+	UT_ASSERT(strstr(quorum_admission_log, "owner_phase=UNKNOWN") != NULL);
 	UT_ASSERT_EQ(quorum_admission_log_count, 1);
 	mock_now++;
 	UT_ASSERT(!cluster_qvotec_in_quorum());
@@ -1609,6 +1618,83 @@ UT_TEST(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions)
 	UT_ASSERT_EQ(quorum_admission_log_count, 1);
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4),
 						CLUSTER_QVOTEC_QUORUM_INITIALIZING);
+	mock_now = saved_now;
+}
+
+UT_TEST(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_owner)
+{
+	PGPROC owner[2];
+	PROC_HDR header;
+	char evidence[1024];
+	char saved[sizeof(shmem_storage)];
+	char before[sizeof(shmem_storage)];
+	BackendType saved_type = MyBackendType;
+	TimestampTz saved_now = mock_now;
+	int saved_pid = MyProcPid;
+
+	memcpy(saved, shmem_storage, sizeof(saved));
+	memset(owner, 0, sizeof(owner));
+	memset(&header, 0, sizeof(header));
+	header.allProcs = owner;
+	header.allProcCount = 2;
+	owner[1].pgprocno = 1;
+	owner[1].pid = 4321;
+	owner[1].wait_event_info = UINT32_C(0x01000001);
+	ProcGlobal = &header;
+	MyProc = &owner[1];
+	MyProcPid = 4321;
+	mock_now = 2000000;
+	MyBackendType = B_BACKEND;
+	cluster_qvotec_test_diagnostic_phase_enter(13);
+	UT_ASSERT_EQ(memcmp(saved, shmem_storage, sizeof(saved)), 0);
+	MyBackendType = B_QVOTEC;
+	cluster_qvotec_test_diagnostic_phase_enter(13); /* actual STRIPE_HERD producer */
+	mock_now = 5000000;
+	memcpy(before, shmem_storage, sizeof(before));
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_snapshot_stable=1 owner_phase=STRIPE_HERD") != NULL);
+	UT_ASSERT(strstr(evidence, "owner_phase_started_us=2000000") != NULL);
+	UT_ASSERT(strstr(evidence, "owner_pid=4321 owner_procno=1 owner_pid_matches=1") != NULL);
+	UT_ASSERT(strstr(evidence, "owner_wait_event=16777217") != NULL);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+
+	owner[1].pid = 8765;
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_pid_matches=0 owner_wait_event=0") != NULL);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	/* An out-of-range identity cannot read even the adjacent decoy slot. */
+	MyProc->pgprocno = 2;
+	cluster_qvotec_test_diagnostic_phase_enter(13);
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_procno=2 owner_pid_matches=0") != NULL);
+	MyProc = NULL;
+	cluster_qvotec_test_diagnostic_phase_enter(13);
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_procno=4294967295 owner_pid_matches=0") != NULL);
+
+	/* Interrupted publication is missing evidence, not IDLE or a real waiter. */
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 76), 5);
+	memcpy(before, shmem_storage, sizeof(before));
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_snapshot_stable=0 owner_phase=UNKNOWN") != NULL);
+	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
+	/* Owner restart overwrites a half-written diagnostic; sequence wrap is safe. */
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 76), UINT32_MAX);
+	MyProc = &owner[1];
+	owner[1].pid = 4321;
+	owner[1].pgprocno = 1;
+	cluster_qvotec_test_diagnostic_phase_enter(17);
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_snapshot_stable=1 owner_phase=IDLE") != NULL);
+	cluster_qvotec_test_diagnostic_phase_enter(UINT32_MAX);
+	cluster_qvotec_test_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "owner_snapshot_stable=0 owner_phase=UNKNOWN") != NULL);
+
+	memcpy(shmem_storage, saved, sizeof(saved));
+	MyProc = NULL;
+	ProcGlobal = NULL;
+	MyProcPid = saved_pid;
+	MyBackendType = saved_type;
 	mock_now = saved_now;
 }
 
@@ -3267,7 +3353,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3281,6 +3367,7 @@ main(void)
 	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
 	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
+	UT_RUN(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_owner);
 	UT_RUN(test_passive_quorum_observation_neither_renews_nor_logs);
 	UT_RUN(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
