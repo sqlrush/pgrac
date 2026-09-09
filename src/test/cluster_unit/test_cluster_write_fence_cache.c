@@ -189,6 +189,12 @@ errcode(int sqlerrcode)
 }
 int errmsg(const char *fmt, ...) { (void)fmt; return 0; }
 int
+errmsg_internal(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
+int
 errdetail(const char *fmt, ...)
 {
 	va_list args;
