@@ -28,6 +28,7 @@
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_xid_authority.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
@@ -110,7 +111,8 @@ typedef enum C0TestEvent {
 	C0_EV_XACT_UNLOCK,
 	C0_EV_NATIVE_UNLOCK,
 	C0_EV_RELEASE_ALL,
-	C0_EV_RETENTION
+	C0_EV_RETENTION,
+	C0_EV_BOUND
 } C0TestEvent;
 
 static C0TestEvent c0_events[32];
@@ -124,6 +126,10 @@ static bool c0_xid_is_mine;
 static uint64 c0_covered_hw;
 static bool c0_disabled;
 static bool c0_retention_ok;
+static bool c0_reader_pending;
+static uint64 c0_ungated_recycles;
+int cluster_node_id = 0;
+bool cluster_undo_retention_horizon_enabled = true;
 static bool c0_did_commit;
 static bool c0_commit_after_procarray;
 static bool c0_durable_drift_after_procarray;
@@ -143,6 +149,7 @@ static int c0_procarray_calls;
 static int c0_did_commit_calls;
 static int c0_did_abort_calls;
 static int c0_retention_calls;
+static int c0_bound_calls;
 static int c0_native_provable_calls;
 
 static void
@@ -187,6 +194,10 @@ c0_reset(void)
 	c0_covered_hw = UINT64_C(816); /* armed-drain witness, NOT an xid bound */
 	c0_disabled = false;
 	c0_retention_ok = false; /* exact RED: old zero-match abort cannot pass */
+	c0_reader_pending = false;
+	c0_ungated_recycles = 0;
+	cluster_node_id = 0;
+	cluster_undo_retention_horizon_enabled = true;
 	c0_did_commit = false;
 	c0_commit_after_procarray = false;
 	c0_durable_drift_after_procarray = false;
@@ -206,6 +217,7 @@ c0_reset(void)
 	c0_did_commit_calls = 0;
 	c0_did_abort_calls = 0;
 	c0_retention_calls = 0;
+	c0_bound_calls = 0;
 	c0_native_provable_calls = 0;
 	InterruptHoldoffCount = 0;
 	memset(&c0_variable_cache, 0, sizeof(c0_variable_cache));
@@ -331,16 +343,31 @@ cluster_cr_native_prehistory_reader_unlock(void)
 bool
 cluster_cr_retention_proof_origin_legs(SCN *out_horizon)
 {
+	SCN current = c0_retention_ok ? c0_horizon_scn : InvalidScn;
+	bool valid;
+
 	c0_retention_calls++;
 	c0_note(C0_EV_RETENTION);
+	if (c0_reader_pending)
+		current = cluster_undo_retention_sample_min(current, 4199120, InvalidScn);
+	valid = cluster_node_id >= 0 && cluster_undo_retention_horizon_enabled
+			&& c0_ungated_recycles == 0 && SCN_VALID(current);
 	if (out_horizon != NULL)
-		*out_horizon = c0_retention_ok ? c0_horizon_scn : InvalidScn;
-	return c0_retention_ok;
+		*out_horizon = valid ? current : InvalidScn;
+	return valid;
+}
+
+uint64
+cluster_tt_slot_retention_off_recycle_count(void)
+{
+	return c0_ungated_recycles;
 }
 
 SCN
 cluster_tt_slot_max_recycle_horizon(void)
 {
+	c0_bound_calls++;
+	c0_note(C0_EV_BOUND);
 	return c0_retention_ok ? c0_horizon_scn : InvalidScn;
 }
 
@@ -811,12 +838,13 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
 	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
 	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
-	UT_ASSERT_EQ(c0_retention_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
 	UT_ASSERT_EQ(c0_did_commit_calls, 0);
 	UT_ASSERT_EQ(c0_native_lock_depth, 0);
 	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
-	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_RETENTION));
-	UT_ASSERT(c0_event_pos(C0_EV_RETENTION) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_BOUND));
+	UT_ASSERT(c0_event_pos(C0_EV_BOUND) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
 
 	/* Still-bound terminal: exact segment/slot/scn plus the same raw CLOG fence. */
 	c0_reset();
@@ -846,10 +874,11 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
 	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
 	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
-	UT_ASSERT_EQ(c0_retention_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
 	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
-	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_RETENTION));
-	UT_ASSERT(c0_event_pos(C0_EV_RETENTION) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_BOUND));
+	UT_ASSERT(c0_event_pos(C0_EV_BOUND) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
 
 	/* A one-way reuse-disable race invalidates the whole pair before CLOG. */
 	c0_reset();
@@ -1046,7 +1075,8 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	c0_did_commit = true;
 	kind = cluster_cr_server_test_own_xid_verdict(4195136, 1, 1, true);
 	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
-	UT_ASSERT_EQ(c0_retention_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
 	UT_ASSERT_EQ(c0_did_commit_calls, 1);
 	UT_ASSERT_EQ(c0_did_abort_calls, 0);
 
@@ -1069,6 +1099,122 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
 	UT_ASSERT_EQ((int)InterruptHoldoffCount, 0);
 	UT_ASSERT(c0_event_pos(C0_EV_SLRU_LOCK) < c0_event_pos(C0_EV_RELEASE_ALL));
+}
+
+UT_TEST(test_pending_reader_does_not_revoke_recycled_terminal_bound)
+{
+	ClusterUndoVerdictKind kind;
+	SCN current = 1;
+
+	c0_reset();
+	c0_retention_ok = true;
+	c0_reader_pending = true;
+	c0_did_commit = true;
+	/* Real A55 sampler preserves the no-new-recycle safety rule. */
+	UT_ASSERT(!cluster_cr_retention_proof_origin_legs(&current));
+	UT_ASSERT_EQ(current, InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_max_recycle_horizon(), c0_horizon_scn);
+	c0_event_count = 0;
+	c0_retention_calls = 0;
+	c0_bound_calls = 0;
+	kind = cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT(c0_event_pos(C0_EV_SCAN) < c0_event_pos(C0_EV_BOUND));
+}
+
+UT_TEST(test_pending_reader_does_not_revoke_wrap_suspect_bound)
+{
+	ClusterUndoVerdictKind kind;
+
+	c0_reset();
+	c0_retention_ok = true;
+	c0_reader_pending = true;
+	c0_did_commit = true;
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = 90;
+	c0_matched_segment = 1;
+	kind = cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT(c0_event_pos(C0_EV_SCAN) < c0_event_pos(C0_EV_BOUND));
+}
+
+UT_TEST(test_pending_reader_preserves_exact_freshref_c1b_pair)
+{
+	ClusterUndoVerdictResult result;
+
+	c0_reset();
+	c0_retention_ok = true;
+	c0_reader_pending = true;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	result = cluster_cr_server_test_own_xid_pair_verdict(4195120, 7, 1, 90);
+	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, 90);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT(c0_event_pos(C0_EV_SCAN) < c0_event_pos(C0_EV_BOUND));
+	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_BOUND));
+	UT_ASSERT(c0_event_pos(C0_EV_BOUND) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+}
+
+UT_TEST(test_historical_bound_keeps_all_terminal_refusal_gates)
+{
+	/* The three real consumer branches share no success shortcut. */
+	for (int branch = 0; branch < 3; branch++) {
+		for (int bad = 0; bad < 7; bad++) {
+			ClusterUndoVerdictKind kind;
+
+			c0_reset();
+			c0_retention_ok = true;
+			c0_reader_pending = true;
+			c0_did_commit = true;
+			c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+			if (branch == 1) {
+				c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+				c0_resolved_scn = 90;
+				c0_matched_segment = 7;
+			}
+			switch (bad) {
+			case 0:
+				cluster_node_id = -1;
+				break;
+			case 1:
+				cluster_undo_retention_horizon_enabled = false;
+				break;
+			case 2:
+				c0_ungated_recycles = 1;
+				break;
+			case 3:
+				c0_retention_ok = false;
+				break;
+			case 4:
+				c0_resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+				break;
+			case 5:
+				c0_resolve = CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP;
+				break;
+			case 6:
+				c0_did_commit = false;
+				c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+				break;
+			}
+			if (branch == 2) {
+				ClusterUndoVerdictResult result
+					= cluster_cr_server_test_own_xid_pair_verdict(4195120, 7, 1, 90);
+				kind = result.kind;
+				UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+			} else
+				kind = cluster_cr_server_test_own_xid_verdict(4195120, 7, 0, false);
+			UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+			UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		}
+	}
+	c0_reset();
 }
 
 /*
@@ -1220,7 +1366,7 @@ UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(26);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1240,6 +1386,10 @@ main(void)
 	UT_RUN(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b);
 	UT_RUN(test_freshref_c1b_pair_request_canonical_decode);
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
+	UT_RUN(test_pending_reader_does_not_revoke_recycled_terminal_bound);
+	UT_RUN(test_pending_reader_does_not_revoke_wrap_suspect_bound);
+	UT_RUN(test_pending_reader_preserves_exact_freshref_c1b_pair);
+	UT_RUN(test_historical_bound_keeps_all_terminal_refusal_gates);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_RUN(test_r4_cr_build_inline_entry_is_denied_without_serve);
 	UT_RUN(test_lms_exact_status22_preempts_legacy_tt_scan_convoy);

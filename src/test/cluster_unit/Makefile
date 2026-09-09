@@ -542,9 +542,11 @@ $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_ser
 		-c $< -o $@
 
 test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O)
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
+		$(top_builddir)/src/backend/cluster/cluster_undo_retention.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
+		$(top_builddir)/src/backend/cluster/cluster_undo_retention.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

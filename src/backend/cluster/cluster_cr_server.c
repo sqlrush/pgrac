@@ -2211,6 +2211,27 @@ typedef enum LmsOwnXidReason {
 	LMS_OWN_XID_REFUSE_INVALID_SCN	/* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
 
+/* A new reader's not-yet-published SCN prevents NEW reclamation; it does
+ * not revoke an already gated recycle.  The origin's complete scan must
+ * precede this sample of the historical upper bound.  Its caller still
+ * proves the terminal outcome and retains exact/bound consumer checks.
+ * Never substitute the current clock or current reader horizon here. */
+static bool
+lms_own_xid_recycle_bound(SCN *out_horizon)
+{
+	SCN horizon;
+
+	*out_horizon = InvalidScn;
+	if (cluster_node_id < 0 || !cluster_undo_retention_horizon_enabled
+		|| cluster_tt_slot_retention_off_recycle_count() != 0)
+		return false;
+	horizon = cluster_tt_slot_max_recycle_horizon();
+	if (!SCN_VALID(horizon))
+		return false;
+	*out_horizon = horizon;
+	return true;
+}
+
 /* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
  * prehistory reader fence continuously covers the complete durable scan,
  * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
@@ -2277,12 +2298,7 @@ lms_resolve_own_xid_freshref_c1b_pair(
 				if (clog_sampled
 					&& resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 					&& raw_clog_status == TRANSACTION_STATUS_COMMITTED) {
-					retention_ok
-						= cluster_cr_retention_proof_origin_legs(&horizon_scn);
-					if (retention_ok) {
-						horizon_scn = cluster_tt_slot_max_recycle_horizon();
-						retention_ok = SCN_VALID(horizon_scn);
-					}
+					retention_ok = lms_own_xid_recycle_bound(&horizon_scn);
 				}
 
 				if (clog_sampled)
@@ -2481,10 +2497,7 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		 * the single-xid serve and each multi member-verdict resolve through
 		 * exactly this bound -- no serve forks on the wrap-suspect leg.
 		 */
-		if (!cluster_cr_retention_proof_origin_legs(&horizon))
-			return LMS_OWN_XID_REFUSE_OTHER;
-		horizon = cluster_tt_slot_max_recycle_horizon();
-		if (!SCN_VALID(horizon))
+		if (!lms_own_xid_recycle_bound(&horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		if (scn_time_cmp(scn, horizon) > 0)
 			horizon = scn;
@@ -2593,10 +2606,7 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 			if (c0_hard_refuse)
 				return LMS_OWN_XID_REFUSE_ZERO_MATCH;
 		}
-		if (!cluster_cr_retention_proof_origin_legs(&horizon))
-			return LMS_OWN_XID_REFUSE_OTHER;
-		horizon = cluster_tt_slot_max_recycle_horizon();
-		if (!SCN_VALID(horizon))
+		if (!lms_own_xid_recycle_bound(&horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		if (TransactionIdDidCommit(xid)) {
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
@@ -2707,8 +2717,8 @@ cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid,
  *	                           wrap-suspect acceptance gate must pass ->
  *	                           COMMITTED_EXACT{commit_scn, wrap}.
  *	       RECYCLED_ZERO_MATCH the slot is provably gone: evaluate the
- *	                           spec-3.22 retention origin legs (a)-(d) and
- *	                           sample the horizon AFTER the scan (the
+ *	                           historical gated-recycle proof and
+ *	                           sample its bound AFTER the scan (the
  *	                           monotonicity ordering contract), then let
  *	                           CLOG decide the terminal state:
  *	                             COMMITTED -> COMMITTED_BELOW_HORIZON{H}
