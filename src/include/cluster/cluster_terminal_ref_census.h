@@ -958,6 +958,11 @@ extern bool cluster_ctrc_origin_note_close_reply_shared(
 extern bool cluster_ctrc_origin_note_certificate_reply_shared(
 	uint64 request_id, uint16 participant_node_id,
 	ClusterCtrcSealReplyResult result);
+/* False means unsupported batch shape, without mutation; true is consumption,
+ * not collective release proof. Caller retains each rechecked admission. */
+extern bool cluster_ctrc_origin_note_local_certificate_batch_shared(
+	const ClusterCtrcCloseDispatch *dispatches,
+	const ClusterCtrcSealReplyResult *results, Size count);
 extern bool cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out);
 extern bool cluster_ctrc_origin_begin_seal_shared(
 	const ClusterCtrcTxnKeyV1 *key);

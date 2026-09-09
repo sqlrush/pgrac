@@ -3173,6 +3173,30 @@ cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participan
 #endif
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* The scalar and bounded batch consumers share the exact terminal edge. The
+ * origin lock is held from unique lookup until inbox/origin reclamation. */
+static bool
+ctrc_origin_note_certificate_match_locked(uint64 index, uint64 request_id,
+										  uint16 participant_node_id,
+										  ClusterCtrcSealReplyResult result, bool *progressed)
+{
+	ClusterCtrcOriginEntry *matched = &ctrc_origin_entries()[index];
+	uint32 confirmed_before = matched->close_confirmed_bitmap;
+	bool noted;
+
+	noted = cluster_ctrc_origin_note_certificate_reply_entry(matched, participant_node_id,
+															 request_id, result);
+	*progressed = noted && confirmed_before != matched->close_confirmed_bitmap;
+	if (noted && matched->close_confirmed_bitmap == matched->touched_bitmap) {
+		noted = ctrc_origin_release_reclaim_locked(index);
+		if (!noted && matched->state == CTRC_ORIGIN_RELEASE_PROVEN)
+			matched->state = CTRC_ORIGIN_BLOCKED;
+	}
+	return noted;
+}
+#endif
+
 bool
 cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 participant_node_id,
 												  ClusterCtrcSealReplyResult result)
@@ -3193,6 +3217,7 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		ClusterCtrcOriginEntry *candidate = &ctrc_origin_entries()[i];
 
+		CLUSTER_CTRC_TEST_TABLE_VISIT(4);
 		if ((candidate->close_dispatched_bitmap & bit) == 0
 			|| candidate->close_request_id[participant_node_id] != request_id)
 			continue;
@@ -3206,18 +3231,9 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 		matched = candidate;
 		matched_index = i;
 	}
-	if (matched != NULL) {
-		uint32 confirmed_before = matched->close_confirmed_bitmap;
-
-		noted = cluster_ctrc_origin_note_certificate_reply_entry(matched, participant_node_id,
-																 request_id, result);
-		progressed = noted && confirmed_before != matched->close_confirmed_bitmap;
-		if (noted && matched->close_confirmed_bitmap == matched->touched_bitmap) {
-			noted = ctrc_origin_release_reclaim_locked(matched_index);
-			if (!noted && matched->state == CTRC_ORIGIN_RELEASE_PROVEN)
-				matched->state = CTRC_ORIGIN_BLOCKED;
-		}
-	}
+	if (matched != NULL)
+		noted = ctrc_origin_note_certificate_match_locked(matched_index, request_id,
+														  participant_node_id, result, &progressed);
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (noted && progressed)
 		ctrc_semantic_progress(true);
@@ -3226,6 +3242,118 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 	(void)request_id;
 	(void)participant_node_id;
 	(void)result;
+	return false;
+#endif
+}
+
+/*
+ * cluster_ctrc_origin_note_local_certificate_batch_shared -- Share one census.
+ *
+ * Inputs: distinct nonzero request IDs for one local certificate subsequence;
+ * each caller admission remains entered after its own final recheck.
+ * Returns: false before mutation for an unsupported batch shape, true after
+ * consuming it (not proof that every reply succeeded).
+ * Side Effects: the original per-request FSM, inbox cleanup and progress wake.
+ * A complete physical census still rejects duplicate request IDs in origins.
+ * The bounded stack lookup is neither shared state nor a substitute authority.
+ */
+bool
+cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
+														const ClusterCtrcSealReplyResult *results,
+														Size count)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	uint16 lookup[2 * CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { 0 };
+	uint64 first[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	uint64 second[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
+	bool progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
+	uint32 bit;
+
+	if (dispatches == NULL || results == NULL || count == 0
+		|| count > CLUSTER_CTRC_RECLAIM_BATCH_MAX || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS || !cluster_ctrc_shmem_ready())
+		return false;
+	for (Size i = 0; i < count; i++) {
+		uint64 request_id = dispatches[i].request_id;
+		uint64 slot;
+		Size probe;
+
+		if (request_id == 0 || dispatches[i].participant.node_id != (uint16)cluster_node_id
+			|| dispatches[i].suboperation != CTRC_SEAL_CERTIFICATE_COMMITTED)
+			return false;
+		slot = ctrc_receipt_hash_bytes(UINT64_C(1469598103934665603), &request_id,
+									   sizeof(request_id))
+			   % lengthof(lookup);
+		for (probe = 0; probe < lengthof(lookup); probe++) {
+			if (lookup[slot] == 0) {
+				lookup[slot] = (uint16)(i + 1);
+				break;
+			}
+			if (dispatches[lookup[slot] - 1].request_id == request_id)
+				return false;
+			slot = (slot + 1) % lengthof(lookup);
+		}
+		if (probe == lengthof(lookup))
+			return false;
+		first[i] = second[i] = UINT64_MAX;
+	}
+
+	bit = UINT32_C(1) << cluster_node_id;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	for (uint64 i = 0; i < CtrcShared->origin_key_entries; i++) {
+		const ClusterCtrcOriginEntry *candidate = &ctrc_origin_entries()[i];
+		uint64 request_id;
+		uint64 slot;
+
+		CLUSTER_CTRC_TEST_TABLE_VISIT(4);
+		if ((candidate->close_dispatched_bitmap & bit) == 0)
+			continue;
+		request_id = candidate->close_request_id[cluster_node_id];
+		if (request_id == 0)
+			continue;
+		slot = ctrc_receipt_hash_bytes(UINT64_C(1469598103934665603), &request_id,
+									   sizeof(request_id))
+			   % lengthof(lookup);
+		for (Size probe = 0; probe < lengthof(lookup); probe++) {
+			Size item;
+
+			if (lookup[slot] == 0)
+				break;
+			item = lookup[slot] - 1;
+			if (dispatches[item].request_id == request_id) {
+				if (first[item] == UINT64_MAX)
+					first[item] = i;
+				else if (second[item] == UINT64_MAX)
+					second[item] = i;
+				break;
+			}
+			slot = (slot + 1) % lengthof(lookup);
+		}
+	}
+	/* A row has only one local request ID, so distinct inputs' match sets
+	 * cannot overlap. Apply in input order and preserve the scalar's first
+	 * two duplicate rows, including its refusal to clear any such origin. */
+	for (Size i = 0; i < count; i++) {
+		bool progressed = false;
+
+		if (second[i] != UINT64_MAX) {
+			ctrc_origin_entries()[first[i]].state = CTRC_ORIGIN_BLOCKED;
+			ctrc_origin_entries()[second[i]].state = CTRC_ORIGIN_BLOCKED;
+		} else if (first[i] != UINT64_MAX)
+			progress[i] = ctrc_origin_note_certificate_match_locked(
+							  first[i], dispatches[i].request_id, (uint16)cluster_node_id,
+							  results[i], &progressed)
+						  && progressed;
+	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	for (Size i = 0; i < count; i++)
+		if (progress[i])
+			ctrc_semantic_progress(true);
+	return true;
+#else
+	(void)dispatches;
+	(void)results;
+	(void)count;
 	return false;
 #endif
 }

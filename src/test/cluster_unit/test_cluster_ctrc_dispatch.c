@@ -225,6 +225,7 @@ UT_TEST(test_actual_gcs_batch_reclaims_eight_independent_sets_once)
 	UT_ASSERT_EQ(leaves, 8);
 	UT_ASSERT_EQ(enqueues, 0);
 	UT_ASSERT_EQ(table_visits[0], CtrcShared->receipt_entries);
+	UT_ASSERT_EQ(table_visits[4], CtrcShared->origin_key_entries);
 	UT_ASSERT_EQ(allocated, 0);
 }
 
@@ -304,6 +305,148 @@ UT_TEST(test_actual_gcs_final_recheck_cannot_forge_origin_confirmation)
 	UT_ASSERT_EQ(allocated, 0);
 }
 
+UT_TEST(test_actual_gcs_each_final_token_guards_its_origin)
+{
+	for (unsigned failed = 0; failed < 3; failed++) {
+		ClusterCtrcCloseDispatch dispatches[3];
+		uint64 participants[3], receipts[3];
+
+		reset_dispatch_fixture();
+		for (Size i = 0; i < 3; i++)
+			UT_ASSERT(
+				seed_certificate_notification(i, &dispatches[i], &participants[i], &receipts[i]));
+		fail_recheck = 7 + failed; /* Three prepare, three use, then individual final checks. */
+		cluster_gcs_ctrc_dispatch_batch(dispatches, 3);
+		for (Size i = 0; i < 3; i++) {
+			UT_ASSERT(
+				ctrc_bytes_zero(&ctrc_receipt_entries()[receipts[i]], sizeof(ClusterCtrcReceipt)));
+			if (i == failed) {
+				UT_ASSERT_EQ(ctrc_origin_entries()[i].state, CTRC_ORIGIN_RELEASE_PROVEN);
+				UT_ASSERT_EQ(ctrc_origin_entries()[i].close_confirmed_bitmap, 0);
+			} else
+				UT_ASSERT(
+					ctrc_bytes_zero(&ctrc_origin_entries()[i], sizeof(ClusterCtrcOriginEntry)));
+		}
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_origin_batch_preserves_scalar_bytes_and_refusals)
+{
+	for (unsigned scenario = 0; scenario < 11; scenario++) {
+		unsigned char *expected = NULL;
+		uint64 expected_progress = 0;
+		unsigned expected_wakes = 0;
+
+		for (unsigned batch = 0; batch < 2; batch++) {
+			ClusterCtrcCloseDispatch dispatches[64];
+			ClusterCtrcSealReplyResult results[64];
+			Size count = scenario == 0 ? 1 : (scenario == 2 || scenario == 8 ? 64 : 8);
+			Size origin_bytes, ack_bytes;
+			uint64 next_collision = 1;
+
+			reset_dispatch_fixture();
+			for (Size i = 0; i < count; i++) {
+				uint64 participant, receipt;
+
+				UT_ASSERT(seed_certificate_notification(i, &dispatches[i], &participant, &receipt));
+				results[i] = CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED;
+				if (scenario == 8) {
+					/* Distinct full IDs collide in the bounded scratch, never alias. */
+					while (next_collision < UINT64_C(65536)
+						   && ctrc_receipt_hash_bytes(UINT64_C(1469598103934665603),
+													  &next_collision, sizeof(next_collision))
+									  % 128
+								  != 0)
+						next_collision++;
+					UT_ASSERT(next_collision < UINT64_C(65536));
+					dispatches[i].request_id = next_collision++;
+					ctrc_origin_entries()[i].close_request_id[0] = dispatches[i].request_id;
+				}
+			}
+			if (scenario == 3)
+				dispatches[0].request_id += UINT64_C(1) << 50;
+			if (scenario == 4 || scenario == 10) {
+				ctrc_origin_entries()[count] = ctrc_origin_entries()[0];
+				if (scenario == 10)
+					ctrc_origin_entries()[count + 1] = ctrc_origin_entries()[0];
+			}
+			if (scenario == 5) {
+				uint64 ack_index;
+				UT_ASSERT(ctrc_origin_ack_index(&dispatches[0].key, 0, &ack_index));
+				ctrc_origin_ack_entries()[ack_index].reserved[0] = 1;
+			}
+			if (scenario == 6)
+				results[0] = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+			if (scenario == 7)
+				ctrc_origin_entries()[0].state = CTRC_ORIGIN_CLEANING;
+			if (scenario == 9)
+				ctrc_origin_entries()[0].close_dispatched_bitmap = 0;
+			origin_bytes = CtrcShared->origin_key_entries * sizeof(ClusterCtrcOriginEntry);
+			ack_bytes = CtrcShared->origin_ack_inbox_entries * sizeof(ClusterCtrcLocalReleaseAckV1);
+			/* Replay twice too: clearing or an ambiguous refusal must not revive. */
+			for (unsigned replay = 0; replay < 2; replay++)
+				if (batch)
+					UT_ASSERT(cluster_ctrc_origin_note_local_certificate_batch_shared(
+						dispatches, results, count));
+				else
+					for (Size i = 0; i < count; i++)
+						(void)cluster_ctrc_origin_note_certificate_reply_shared(
+							dispatches[i].request_id, 0, results[i]);
+			if (!batch) {
+				expected = malloc(origin_bytes + ack_bytes);
+				if (expected == NULL)
+					abort();
+				memcpy(expected, ctrc_origin_entries(), origin_bytes);
+				memcpy(expected + origin_bytes, ctrc_origin_ack_entries(), ack_bytes);
+				expected_progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+				expected_wakes = wake_count;
+			} else {
+				UT_ASSERT_EQ(memcmp(expected, ctrc_origin_entries(), origin_bytes), 0);
+				UT_ASSERT_EQ(memcmp(expected + origin_bytes, ctrc_origin_ack_entries(), ack_bytes),
+							 0);
+				UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), expected_progress);
+				UT_ASSERT_EQ(wake_count, expected_wakes);
+			}
+			UT_ASSERT_EQ(held_count, 0);
+		}
+		free(expected);
+	}
+}
+
+UT_TEST(test_origin_batch_invalid_input_refuses_before_lock_or_mutation)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterCtrcCloseDispatch dispatches[2];
+		ClusterCtrcSealReplyResult results[2]
+			= { CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED };
+		ClusterCtrcOriginEntry before[2];
+		unsigned locks;
+		Size count = fault == 0 ? 0 : (fault == 1 ? 65 : 2);
+
+		reset_dispatch_fixture();
+		for (Size i = 0; i < 2; i++) {
+			uint64 participant, receipt;
+			UT_ASSERT(seed_certificate_notification(i, &dispatches[i], &participant, &receipt));
+			before[i] = ctrc_origin_entries()[i];
+		}
+		if (fault == 4)
+			dispatches[1].participant.node_id = 1;
+		if (fault == 5)
+			dispatches[1].suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+		if (fault == 6)
+			dispatches[1].request_id = 0;
+		if (fault == 7)
+			dispatches[1].request_id = dispatches[0].request_id;
+		locks = sleepable_acquisitions;
+		UT_ASSERT(!cluster_ctrc_origin_note_local_certificate_batch_shared(
+			fault == 2 ? NULL : dispatches, fault == 3 ? NULL : results, count));
+		UT_ASSERT_EQ(sleepable_acquisitions, locks);
+		UT_ASSERT_EQ(memcmp(before, ctrc_origin_entries(), sizeof(before)), 0);
+	}
+}
+
 UT_TEST(test_actual_gcs_allocation_and_alias_preserve_single_dispatch)
 {
 	for (int fallback = 0; fallback < 2; fallback++) {
@@ -352,11 +495,14 @@ UT_TEST(test_actual_gcs_mixed_operations_preserve_order_and_remote_enqueue)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(9);
 	UT_RUN(test_actual_gcs_batch_reclaims_eight_independent_sets_once);
 	UT_RUN(test_actual_gcs_authentication_faults_never_reclaim);
 	UT_RUN(test_actual_gcs_exception_releases_all_entered_tokens);
 	UT_RUN(test_actual_gcs_final_recheck_cannot_forge_origin_confirmation);
+	UT_RUN(test_actual_gcs_each_final_token_guards_its_origin);
+	UT_RUN(test_origin_batch_preserves_scalar_bytes_and_refusals);
+	UT_RUN(test_origin_batch_invalid_input_refuses_before_lock_or_mutation);
 	UT_RUN(test_actual_gcs_allocation_and_alias_preserve_single_dispatch);
 	UT_RUN(test_actual_gcs_mixed_operations_preserve_order_and_remote_enqueue);
 	free(CtrcShared);

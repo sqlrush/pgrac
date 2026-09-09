@@ -18196,12 +18196,27 @@ gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches,
 					(accepted_count - i) * sizeof(accepted_to_input[0]));
 		}
 		if (accepted_count != 0
-			&& cluster_ctrc_participant_certificate_batch_shared(accepted, accepted_count, results))
+			&& cluster_ctrc_participant_certificate_batch_shared(accepted, accepted_count, results)) {
+			Size reply_count = 0;
+
 			for (Size i = 0; i < accepted_count; i++)
 				if (cluster_semantic_activation_recheck_r4_terminal_census(
-						&admissions[accepted_to_input[i]]))
-					(void)cluster_ctrc_origin_note_certificate_reply_shared(
-						accepted[i].request_id, accepted[i].participant.node_id, results[i]);
+						&admissions[accepted_to_input[i]])) {
+					accepted[reply_count] = accepted[i];
+					accepted_to_input[reply_count] = accepted_to_input[i];
+					results[reply_count++] = results[i];
+				}
+			/* Every surviving token stays entered through the shared census.
+			 * Unsupported input shape retains the original per-item consumer. */
+			if (reply_count != 0
+				&& !cluster_ctrc_origin_note_local_certificate_batch_shared(
+					accepted, results, reply_count))
+				for (Size i = 0; i < reply_count; i++)
+					if (cluster_semantic_activation_recheck_r4_terminal_census(
+							&admissions[accepted_to_input[i]]))
+						(void)cluster_ctrc_origin_note_certificate_reply_shared(
+							accepted[i].request_id, accepted[i].participant.node_id, results[i]);
+		}
 	}
 	PG_FINALLY();
 	{

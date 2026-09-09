@@ -61,7 +61,7 @@ pg_attribute_unused() test_spin_release(volatile slock_t *lock)
 #define SpinLockRelease(lock) test_spin_release(lock)
 
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
-static Size table_visits[4];
+static Size table_visits[5];
 static Size shared_validation_writer_visits;
 static void test_table_visit(unsigned kind);
 static void test_pool_upgrade(void);
