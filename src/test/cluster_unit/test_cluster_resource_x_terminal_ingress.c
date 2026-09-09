@@ -13,6 +13,10 @@
 #include "storage/proc.h"
 #include "unit_test.h"
 
+/* These verbatim consumer slices sink only non-authoritative age logging.
+ * The real age/reason state machine is exercised in test_cluster_pcm_lock. */
+#define gcs_block_resource_x_requester_wait_note(context, reason) ((void)(reason))
+
 UT_DEFINE_GLOBALS();
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
