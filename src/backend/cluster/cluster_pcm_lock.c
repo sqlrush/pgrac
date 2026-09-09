@@ -206,6 +206,7 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	uint64 resource_formation;
 	uint64 master_session_incarnation;
 	uint64 r4_record_generation;
+	/* Diagnostic age threshold; never elapsed-only authority to fail a head. */
 	uint64 head_no_progress_deadline_us;
 	uint64 head_change_generation;
 	uint64 head_last_semantic_progress_us;
@@ -11545,9 +11546,8 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_EXCLUSIVE);
 	round = &entry_ref.entry->resource_x_bootstrap_round;
-	expired = round->failed_attempt_floor >= ref->acquisition_generation
-			  || (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-				  && now_us >= round->head_no_progress_deadline_us);
+	/* Age is diagnostic, not authenticated abandonment of LMS-owned work. */
+	expired = round->failed_attempt_floor >= ref->acquisition_generation;
 	if (!pcm_resource_x_install_claim_ref_exact_locked(round, ref)
 		|| memcmp(target, &round->delivery_target, sizeof(*target)) != 0)
 		result = RESOURCE_X_APPLY_STALE;
@@ -11568,6 +11568,7 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 	else {
 		if (purpose == RESOURCE_X_DELIVERY_CLEANUP)
 			pcm_resource_x_head_fail_locked(entry_ref.entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
+		pcm_resource_x_head_margin_note(round, now_us);
 		round->delivery_executor_sequence++;
 		round->delivery_executor_purpose = purpose;
 		round->last_dispatch_us = Max(round->last_dispatch_us, now_us);
@@ -11728,9 +11729,7 @@ pcm_resource_x_delivery_mutation_allowed_locked(const struct GrdEntry *entry,
 			   && round->head_failure_reason == RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED;
 	now_us = pcm_resource_x_monotonic_us();
 	return round->failed_attempt_floor < ref->acquisition_generation && now_us != 0
-		   && now_us != UINT64_MAX
-		   && (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-			   || now_us < round->head_no_progress_deadline_us);
+		   && now_us != UINT64_MAX;
 }
 
 ResourceXApplyResult
@@ -11906,13 +11905,13 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	return result;
 }
 
-/* An expired requester-local round is terminal for every caller that joined
- * its frozen R7 deadline, but it is not persistent authority and therefore
- * cannot poison this resource forever.  A later ordinary acquisition may
- * retire only a structurally complete expired binding, after all local
+/* A genuinely failed requester-local round remains failed for every caller
+ * that joined it. Age alone no longer produces that state. Preserve the
+ * existing conservative rearm predicate: a later ordinary acquisition may
+ * retire only a structurally complete failed binding, after all local
  * authority/debt carriers are empty, and then allocate a strictly higher
  * attempt from the retained floor.  The later caller contributes a new
- * deadline only to the new round; no field from the failed attempt is reused.
+ * diagnostic timestamp; no field from the failed attempt is reused.
  * Direct-init has a separate creation reservation and is deliberately not
  * eligible for this ordinary-acquisition handoff. */
 static bool
@@ -12666,7 +12665,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 		|| master_ingress_connection_generation == 0
 		|| master_ingress_connection_generation == UINT32_MAX || absolute_deadline_us == 0
 		|| absolute_deadline_us == UINT64_MAX || now_us == 0 || now_us == UINT64_MAX
-		|| now_us >= absolute_deadline_us || retry_slice_us == 0 || retry_slice_us == UINT64_MAX
+		|| retry_slice_us == 0 || retry_slice_us == UINT64_MAX
 		|| (direct_init_reservation_token == 0 && direct_init_ownership_generation != 0)
 		|| direct_init_ownership_generation >= UINT64_MAX - 1
 		|| direct_init_reservation_token == UINT64_MAX
@@ -12737,12 +12736,6 @@ pcm_resource_x_bootstrap_round_step_internal(
 		&& round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE) {
 		/* Only the complete B-E-B binder or the T1 installer can publish the
 		 * claim.  A follower's tuple alone cannot make it the physical owner. */
-		if (now_us >= round->head_no_progress_deadline_us) {
-			pcm_resource_x_semantic_mutation_mark();
-			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
-			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
-			goto round_step_done;
-		}
 		pcm_rx_trace_join(round, now_us);
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
@@ -12829,11 +12822,10 @@ pcm_resource_x_bootstrap_round_step_internal(
 			*terminal_ref_out = round->terminal_ref;
 			action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
 		}
-	} else if (round->delivery_executor_purpose != 0
-			   && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-			   && now_us < round->head_no_progress_deadline_us) {
-		/* An exact NORMAL/CLEANUP executor already owns dispatch/install.
-		 * The caller is an observer, not a second retransmit driver. */
+	} else if (round->delivery_target.buffer_id_plus_one != 0
+			   && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
+		/* Binding transfers dispatch/install ownership to LMS, including
+		 * intervals between its exclusive executor claims. */
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 	} else if (cached_local_x
 			   && pcm_resource_x_request_observation_matches_locked(
@@ -12869,8 +12861,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 			   && predecessor_result != RESOURCE_X_APPLY_NOT_FOUND) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
-		if (now_us >= absolute_deadline_us || head_no_progress_budget_us == 0
-			|| head_no_progress_budget_us == UINT64_MAX
+		if (head_no_progress_budget_us == 0 || head_no_progress_budget_us == UINT64_MAX
 			|| now_us >= UINT64_MAX - head_no_progress_budget_us) {
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else {
@@ -12936,12 +12927,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 				   requester_sender_connection_generation, master_ingress_connection_generation,
 				   direct_init_ownership_generation, direct_init_reservation_token)) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
-	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-			   || now_us >= round->head_no_progress_deadline_us) {
-		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
-			pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
-			broadcast = true;
-		}
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (now_us < round->last_dispatch_us) {
 		/* now_us is sampled before entry_lock.  An exact ACK can advance this
@@ -13170,9 +13156,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 			 || round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
 			 || round->head_no_progress_deadline_us == 0
-			 || round->head_no_progress_deadline_us == UINT64_MAX
-			 || (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-				 && now_us >= round->head_no_progress_deadline_us))
+			 || round->head_no_progress_deadline_us == UINT64_MAX)
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
@@ -13372,12 +13356,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_delivery_exact(
 			 || authenticated_ingress_connection_generation
 					!= round->master_ingress_connection_generation
 			 || r4_record_generation != round->r4_record_generation
-			 || !cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation)
-			 || (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED && !cleanup
-				 && now_us >= round->head_no_progress_deadline_us)) {
-		pcm_resource_x_head_fail_locked(entry, now_us >= round->head_no_progress_deadline_us
-												   ? RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED
-												   : RESOURCE_X_HEAD_FAILURE_NONE);
+			 || !cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation)) {
+		pcm_resource_x_head_fail_locked(entry, RESOURCE_X_HEAD_FAILURE_NONE);
 		broadcast = true;
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
@@ -13430,10 +13410,8 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	ResourceXApplyResult result;
 	uint64 observed_head_change_generation;
 	uint64 observed_attempt;
-	uint64 effective_deadline_us;
 	uint64 remaining_us;
 	uint64 now_us;
-	bool delivery_owned;
 
 	pcm_rx_last_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	if (!resource_x_assertion_valid(assertion) || current_master_node < 0
@@ -13467,8 +13445,6 @@ pcm_resource_x_bootstrap_round_wait_internal(
 	wait_context.cv_prepared = true;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	delivery_owned
-		= round->delivery_target.buffer_id_plus_one != 0 && round->delivery_executor_purpose != 0;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED) {
 		/* The retained cover is node-level authority.  An ordinary caller has
 		 * no creation-only direct-init token, so use the same relaxed terminal
@@ -13526,38 +13502,21 @@ pcm_resource_x_bootstrap_round_wait_internal(
 		result = RESOURCE_X_APPLY_BAD_STATE;
 	now_us = pcm_resource_x_monotonic_us();
 	pcm_resource_x_head_margin_note(round, now_us);
-	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		&& now_us >= caller_absolute_deadline_us) {
-		result = RESOURCE_X_APPLY_BAD_STATE;
-		pcm_rx_last_wait_failure = PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
-	} else if (result == RESOURCE_X_APPLY_APPLIED
-			   && (observed_head_change_generation != round->head_change_generation
-				   || observed_attempt != round->request.assertion_sequence))
-		result = RESOURCE_X_APPLY_DUPLICATE;
-	effective_deadline_us = caller_absolute_deadline_us;
-	if (round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
-		&& round->phase <= RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
-		effective_deadline_us = Min(effective_deadline_us, round->head_no_progress_deadline_us);
-	if (result == RESOURCE_X_APPLY_APPLIED && now_us >= effective_deadline_us)
-		/* Only the exact drive step may expire the shared head. */
+	if (now_us == 0 || now_us == UINT64_MAX)
+		result = RESOURCE_X_APPLY_INVALID;
+	else if (result == RESOURCE_X_APPLY_APPLIED
+			 && (observed_head_change_generation != round->head_change_generation
+				 || observed_attempt != round->request.assertion_sequence))
 		result = RESOURCE_X_APPLY_DUPLICATE;
 	LWLockRelease(&entry->entry_lock.lock);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
-	/* The delivery executor owns retransmission until it relinquishes its
-	 * claim, and broadcasts on release. Sleep to that event or the unchanged
-	 * earliest deadline instead of scheduling another foreground driver. */
-	remaining_us = effective_deadline_us - now_us;
-	if (!delivery_owned)
-		remaining_us = Min(remaining_us, retry_slice_us);
-	if (remaining_us < UINT64_C(1000)) {
-		pcm_entry_wait_context_cleanup(&wait_context);
-		return RESOURCE_X_APPLY_APPLIED;
-	}
-	timeout_ms = delivery_owned ? (long)Min(remaining_us / UINT64_C(1000), (uint64)LONG_MAX)
-								: (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
+	/* A finite CV slice permits interrupts and fresh proof checks; expiration
+	 * of the diagnostic threshold neither fails nor retires the head. */
+	remaining_us = Max(retry_slice_us, UINT64_C(1000));
+	timeout_ms = (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
 
 	PG_TRY();
 	{
@@ -13682,20 +13641,13 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 		result = RESOURCE_X_APPLY_DUPLICATE;
 	LWLockRelease(&entry->entry_lock.lock);
 	now_us = pcm_resource_x_monotonic_us();
-	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		&& now_us >= caller_absolute_deadline_us) {
-		result = RESOURCE_X_APPLY_BAD_STATE;
-		pcm_rx_last_wait_failure = PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
-	}
+	if (now_us == 0 || now_us == UINT64_MAX)
+		result = RESOURCE_X_APPLY_INVALID;
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
-	remaining_us = Min(caller_absolute_deadline_us - now_us, requested_sleep_slice_us);
-	if (remaining_us < UINT64_C(1000)) {
-		pcm_entry_wait_context_cleanup(&wait_context);
-		return RESOURCE_X_APPLY_APPLIED;
-	}
+	remaining_us = Max(requested_sleep_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
 	PG_TRY();
 	{
@@ -14904,11 +14856,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	struct GrdEntry *entry;
 	ResourceXApplyResult result;
 	uint64 deadline_ms;
-	uint64 effective_deadline_us;
 	uint64 now_us;
 	uint64 remaining_us;
 	long sleep_ms;
-	bool delivery_owned;
 
 	if (!pcm_resource_x_target_install_continuation_valid(
 			continuation, &assertion)
@@ -14933,44 +14883,26 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	wait_context.cv_prepared = true;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	delivery_owned
-		= round->delivery_target.buffer_id_plus_one != 0 && round->delivery_executor_purpose != 0;
 	result = pcm_resource_x_target_install_wait_recheck_locked(
 		entry, round, continuation, &assertion, expected_follow_state);
 	now_us = pcm_resource_x_monotonic_us();
-	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		&& now_us >= continuation->caller_absolute_deadline_us)
-		result = RESOURCE_X_APPLY_BAD_STATE;
+	if (now_us == 0 || now_us == UINT64_MAX)
+		result = RESOURCE_X_APPLY_INVALID;
 	else if (result == RESOURCE_X_APPLY_APPLIED
 			 && continuation->observed_head_change_generation != round->head_change_generation)
 		result = RESOURCE_X_APPLY_DUPLICATE;
-	effective_deadline_us = continuation->caller_absolute_deadline_us;
-	if (expected_follow_state == RESOURCE_X_TARGET_INSTALL_INFLIGHT
-		&& round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
-		effective_deadline_us = Min(effective_deadline_us, round->head_no_progress_deadline_us);
 	LWLockRelease(&entry->entry_lock.lock);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return result;
 	}
-	now_us = pcm_resource_x_monotonic_us();
-	if (now_us >= effective_deadline_us) {
-		pcm_entry_wait_context_cleanup(&wait_context);
-		/* The head may have progressed after unlocking.  A sampled lease
-		 * expiry only asks the exact driver to recheck the current head;
-		 * this follower may fail only on its own fixed deadline. */
-		return now_us >= continuation->caller_absolute_deadline_us ? RESOURCE_X_APPLY_BAD_STATE
-																   : RESOURCE_X_APPLY_DUPLICATE;
-	}
-	remaining_us = effective_deadline_us - now_us;
-	if (!delivery_owned)
-		remaining_us = Min(remaining_us, continuation->requested_sleep_slice_us);
+	remaining_us = Max(continuation->requested_sleep_slice_us, UINT64_C(1000));
 	deadline_ms = remaining_us / UINT64_C(1000);
 	if (deadline_ms == 0) {
 		pcm_entry_wait_context_cleanup(&wait_context);
 		return RESOURCE_X_APPLY_APPLIED;
 	}
-	sleep_ms = delivery_owned ? (long)Min(deadline_ms, (uint64)LONG_MAX) : timeout_ms;
+	sleep_ms = timeout_ms;
 	if (deadline_ms < (uint64) sleep_ms)
 		sleep_ms = (long) deadline_ms;
 
@@ -16104,7 +16036,6 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 			 || round->highest_attempt_floor != ref->acquisition_generation
 			 || round->accepted_base == 0 || round->accepted_base == UINT64_MAX
 			 || terminal_authority_generation <= round->accepted_base
-			 || now_us >= round->head_no_progress_deadline_us
 			 || !cluster_pcm_lock_resource_x_gate_open_exact(ref->formation)
 			 || !pcm_resource_x_active_empty_locked(entry)
 			 || entry->resource_x_retired_acquisition_generation != ref->acquisition_generation)
@@ -18247,33 +18178,31 @@ pcm_resource_x_rearm_holder_status_locked(
 }
 
 static bool
-pcm_resource_x_rearm_holder_source_locked(
-	ClusterPcmResourceXMasterState *state,
-	const ClusterPcmResourceXHolderStatus *status_record,
-	const ClusterPcmResourceXHolderImage *image_record)
+pcm_resource_x_holder_source_slots_exact(ClusterPcmResourceXMasterState *state,
+										 const ClusterPcmResourceXHolderStatus *status_record,
+										 const ClusterPcmResourceXHolderImage *image_record)
 {
 	ResourceXIntentSlot *status_slot;
 	ResourceXIntentSlot *image_slot;
-	uint64 now_us;
-	bool armed_image = false;
-	bool armed_status = false;
 
 	Assert(state != NULL);
 	Assert(status_record != NULL);
 	Assert(image_record != NULL);
 	status_slot = &state->holder_status_intent.slot;
 	image_slot = &state->holder_image_intent;
+	if (status_slot->state > RESOURCE_X_INTENT_SLOT_STAGED
+		|| image_slot->state > RESOURCE_X_INTENT_SLOT_STAGED)
+		return false;
 	if (status_slot->state != RESOURCE_X_INTENT_SLOT_EMPTY
-		&& (status_slot->logical_generation
-				!= status_record->logical_generation
-			|| status_slot->authority_generation
-					!= status_record->authority_generation
-			|| status_slot->destination_node
-					!= status_record->destination_node
+		&& (status_slot->logical_generation != status_record->logical_generation
+			|| status_slot->authority_generation != status_record->authority_generation
+			|| status_slot->destination_node != status_record->destination_node
 			|| status_slot->payload_bytes != status_record->payload_bytes
 			|| status_slot->kind != status_record->kind
-			|| memcmp(&status_slot->body, &status_record->body,
-					  sizeof(status_record->body)) != 0))
+			|| memcmp(&status_slot->body, &status_record->body, sizeof(status_record->body)) != 0
+			|| memcmp(state->holder_status_intent.payload, status_record->payload,
+					  status_record->payload_bytes)
+				   != 0))
 		return false;
 	if (image_slot->state != RESOURCE_X_INTENT_SLOT_EMPTY
 		&& (image_slot->logical_generation
@@ -18287,12 +18216,33 @@ pcm_resource_x_rearm_holder_source_locked(
 			|| memcmp(&image_slot->body, &image_record->body,
 					  sizeof(image_record->body)) != 0))
 		return false;
+	return true;
+}
+
+static bool
+pcm_resource_x_rearm_holder_source_locked(ClusterPcmResourceXMasterState *state,
+										  const ClusterPcmResourceXHolderStatus *status_record,
+										  const ClusterPcmResourceXHolderImage *image_record)
+{
+	ResourceXIntentSlot *status_slot = &state->holder_status_intent.slot;
+	ResourceXIntentSlot *image_slot = &state->holder_image_intent;
+	uint64 now_us;
+	uint64 status_floor = status_slot->first_armed_us;
+	uint64 image_floor = image_slot->first_armed_us;
+	bool armed_image = false;
+	bool armed_status = false;
+
+	if (!pcm_resource_x_holder_source_slots_exact(state, status_record, image_record))
+		return false;
 	if (status_slot->state != RESOURCE_X_INTENT_SLOT_EMPTY
 		&& image_slot->state != RESOURCE_X_INTENT_SLOT_EMPTY)
 		return true;
 	now_us = pcm_resource_x_monotonic_us();
-	if (now_us == 0 || now_us == UINT64_MAX)
+	if (now_us == 0 || now_us == UINT64_MAX || status_floor >= UINT64_MAX - 1
+		|| image_floor >= UINT64_MAX - 1)
 		return false;
+	/* The empty slot retains only its previous physical episode floor. */
+	now_us = Max(now_us, Max(status_floor, image_floor) + 1);
 	if (status_slot->state == RESOURCE_X_INTENT_SLOT_EMPTY) {
 		memcpy(state->holder_status_intent.payload,
 			status_record->payload, status_record->payload_bytes);
@@ -18316,6 +18266,7 @@ pcm_resource_x_rearm_holder_source_locked(
 				(ResourceXWireKind)image_record->kind)) {
 			if (armed_status) {
 				memset(status_slot, 0, sizeof(*status_slot));
+				status_slot->first_armed_us = status_floor;
 				memset(state->holder_status_intent.payload, 0,
 					   sizeof(state->holder_status_intent.payload));
 			}
@@ -18327,11 +18278,14 @@ pcm_resource_x_rearm_holder_source_locked(
 		&& !pcm_resource_x_intent_mark_dirty()) {
 		if (armed_status) {
 			memset(status_slot, 0, sizeof(*status_slot));
+			status_slot->first_armed_us = status_floor;
 			memset(state->holder_status_intent.payload, 0,
 				   sizeof(state->holder_status_intent.payload));
 		}
-		if (armed_image)
+		if (armed_image) {
 			memset(image_slot, 0, sizeof(*image_slot));
+			image_slot->first_armed_us = image_floor;
+		}
 		return false;
 	}
 	return true;
@@ -18530,9 +18484,8 @@ pcm_resource_x_s_predecessor_cancel_unbound_round_locked(
 		|| round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
 		|| round->head_no_progress_deadline_us == 0
 		|| round->head_no_progress_deadline_us == UINT64_MAX || round->last_dispatch_us == 0
-		|| round->last_dispatch_us >= round->head_no_progress_deadline_us
-		|| round->retry_slice_us == 0 || round->retry_slice_us == UINT64_MAX
-		|| round->requester_sender_connection_generation == 0
+		|| round->last_dispatch_us == UINT64_MAX || round->retry_slice_us == 0
+		|| round->retry_slice_us == UINT64_MAX || round->requester_sender_connection_generation == 0
 		|| round->requester_sender_connection_generation == UINT32_MAX
 		|| round->master_ingress_connection_generation == 0
 		|| round->master_ingress_connection_generation == UINT32_MAX || round->accepted_base != 0
@@ -19246,10 +19199,11 @@ pair_needed_done:
  * the holder caller has completed the exact BufferDesc revoke.  The retained
  * records are the PENDING owner; the two existing intent slots are the READY
  * projection.  No wire, authority, or holder registry is created here. */
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_publish_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session)
+static ResourceXApplyResult
+pcm_resource_x_holder_pair_publish_internal(const ResourceXAssertion *assertion,
+											uint64 assertion_sequence,
+											int32 authenticated_master_node,
+											uint64 authenticated_master_session, bool replay)
 {
 	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef entry_ref;
@@ -19305,6 +19259,21 @@ cluster_pcm_lock_resource_x_holder_pair_publish_exact(
 		!= RESOURCE_X_INTENT_SLOT_EMPTY;
 	image_ready = state->holder_image_intent.state
 		!= RESOURCE_X_INTENT_SLOT_EMPTY;
+	if (replay) {
+		if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+			|| !pcm_resource_x_holder_source_slots_exact(state, &state->holder_status,
+														 &state->holder_image))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else if (status_ready || image_ready)
+			/* Do not overwrite a physical owner or refill half an episode. */
+			result = RESOURCE_X_APPLY_DUPLICATE;
+		else
+			result = pcm_resource_x_rearm_holder_source_locked(state, &state->holder_status,
+															   &state->holder_image)
+						 ? RESOURCE_X_APPLY_APPLIED
+						 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto pair_publish_done;
+	}
 	/* A pair is one transport unit.  Once either exact half has completed,
 	 * reconstructing only that missing half would create a new observable pair
 	 * episode and could release the source fence on partial evidence. */
@@ -19339,6 +19308,28 @@ pair_publish_done:
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_pair_publish_exact(const ResourceXAssertion *assertion,
+													  uint64 assertion_sequence,
+													  int32 authenticated_master_node,
+													  uint64 authenticated_master_session)
+{
+	return pcm_resource_x_holder_pair_publish_internal(assertion, assertion_sequence,
+													   authenticated_master_node,
+													   authenticated_master_session, false);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_pair_replay_exact(const ResourceXAssertion *assertion,
+													 uint64 assertion_sequence,
+													 int32 authenticated_master_node,
+													 uint64 authenticated_master_session)
+{
+	return pcm_resource_x_holder_pair_publish_internal(assertion, assertion_sequence,
+													   authenticated_master_node,
+													   authenticated_master_session, true);
 }
 
 /* Classify one retained former-holder pair under the resource entry lock.
@@ -21612,7 +21603,7 @@ pcm_resource_x_requester_retirement_commit_locked(
  * binding ABA; it is not a second Resource-X authority.  Before T1 (and for
  * an exact replay while T1 is active), the accepted kind-9 ACK is the only
  * base allowed to disambiguate the two axes.  Keep the exception bounded to
- * one live ASSERT-dispatched round and its original absolute deadline. */
+ * one live ASSERT-dispatched round and its exact authority identity. */
 static bool
 pcm_resource_x_requester_join_live_round_base_exact_locked(
 	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
@@ -21632,9 +21623,7 @@ pcm_resource_x_requester_join_live_round_base_exact_locked(
 			  && round->head_failure_reason == RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED;
 	return round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED && now_us != 0
 		   && now_us != UINT64_MAX && now_us >= round->last_dispatch_us
-		   && (cleanup
-			   || (now_us < round->head_no_progress_deadline_us
-				   && round->failed_attempt_floor < requester_target_generation))
+		   && (cleanup || round->failed_attempt_floor < requester_target_generation)
 		   && round->current_master_node >= 0
 		   && round->current_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		   && (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
@@ -21884,7 +21873,6 @@ pcm_resource_x_requester_join_internal(
 			|| !pcm_resource_x_active_empty_locked(entry) || state == NULL
 			|| !pcm_resource_x_requester_join_empty_locked(&state->requester_join) || now_us == 0
 			|| now_us == UINT64_MAX || now_us < effective_round->last_dispatch_us
-			|| (!cleanup && now_us >= effective_round->head_no_progress_deadline_us)
 			|| frame->common.base_authority_generation == 0
 			|| frame->common.base_authority_generation >= final_authority_generation) {
 			result = RESOURCE_X_APPLY_STALE;
@@ -23925,6 +23913,16 @@ cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
 		return false;
 	completed = cluster_pcm_lock_resource_x_intent_complete_exact(
 		slot, expected);
+	if (completed) {
+		ClusterPcmResourceXMasterState *state
+			= pcm_resource_x_master_state_for_entry(entry_ref.entry);
+
+		/* No live transport owner remains, but callbacks from this episode
+		 * must not match a later replay even within the same clock tick. */
+		if (state != NULL && state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED
+			&& (slot == &state->holder_status_intent.slot || slot == &state->holder_image_intent))
+			slot->first_armed_us = expected->first_armed_us;
+	}
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return completed;

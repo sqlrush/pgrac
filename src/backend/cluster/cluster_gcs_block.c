@@ -9629,6 +9629,28 @@ gcs_block_resource_x_terminal_owner_release(
 	return true;
 }
 
+/* A published replay has already completed the physical source revoke.
+ * Keep that disposition separate from APPLIED: rearming transport must never
+ * send the caller back through physical finish/copy a second time. */
+static ResourceXApplyResult
+gcs_block_resource_x_retained_pair_replay(const ResourceXAssertion *assertion, uint64 sequence,
+										  int32 master_node, uint64 master_session, bool *published)
+{
+	ResourceXApplyResult result;
+
+	if (published == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	*published = false;
+	result = cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
+		assertion, sequence, master_node, master_session);
+	if (result == RESOURCE_X_APPLY_DUPLICATE) {
+		*published = true;
+		return cluster_pcm_lock_resource_x_holder_pair_replay_exact(assertion, sequence,
+																	master_node, master_session);
+	}
+	return result;
+}
+
 /* The source fence is established before copying.  Before L3 it is the local
  * tag gate; after L3 an exact terminal-X lineage plus a caller-held raw pin
  * and REVOKING token cover the same window.  The retained status and image
@@ -9659,6 +9681,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	ResourceXApplyResult failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	ResourceXApplyResult image_result = RESOURCE_X_APPLY_NOT_FOUND;
 	ResourceXApplyResult pair_result = RESOURCE_X_APPLY_NOT_FOUND;
+	bool pair_published = false;
 	ResourceXApplyResult result;
 	ResourceXApplyResult status_result = RESOURCE_X_APPLY_NOT_FOUND;
 	ResourceXApplyResult replay_result = RESOURCE_X_APPLY_NOT_FOUND;
@@ -9735,18 +9758,16 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		/* The retained pair's monotonic publication witness separates an exact
 		 * PENDING finish retry from a type-17 replay after both intents were
 		 * atomically published.  Independent DATA drain may make the two current
-		 * slots asymmetric; never re-enter publish or recreate a completed half.
+		 * slots asymmetric. Replay validates the occupied episode without
+		 * recreating a completed half; both-empty replays the immutable pair.
 		 * A strictly older same-domain pair is not evidence for this attempt: build
 		 * fresh frames and let block_to_n_source_exact enforce its DRAIN tombstone
 		 * and newer-carrier replacement contract. */
-		pair_result
-			= cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
-				&block->common.logical_assertion,
-				block->common.assertion_sequence,
-				authenticated_master_node,
-				block->common.master_session_incarnation);
-		if (pair_result == RESOURCE_X_APPLY_DUPLICATE)
-			return RESOURCE_X_APPLY_DUPLICATE;
+		pair_result = gcs_block_resource_x_retained_pair_replay(
+			&block->common.logical_assertion, block->common.assertion_sequence,
+			authenticated_master_node, block->common.master_session_incarnation, &pair_published);
+		if (pair_published)
+			return pair_result;
 		if (pair_result == RESOURCE_X_APPLY_APPLIED)
 			semantic_retained = true;
 		else if (pair_result != RESOURCE_X_APPLY_NOT_FOUND) {
@@ -13444,6 +13465,12 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 		return true;
 	memset(&snapshot, 0, sizeof(snapshot));
 	memset(&join_snapshot, 0, sizeof(join_snapshot));
+	/* These consumers do not sample a master request.  Do not print an
+	 * unobserved zero as evidence that the canonical master is EMPTY. */
+	if (frame.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| frame.kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame.kind == RESOURCE_X_WIRE_BLOCK_TO_N
+		|| frame.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
+		snapshot.phase = UINT8_MAX;
 
 	switch (frame.kind) {
 	case RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP:
@@ -13769,6 +13796,7 @@ gcs_block_resource_x_target_acquire_internal(
 	uint64 diagnostic_caller_budget_us = gcs_block_pcm_x_retry_timeout_us();
 	bool diagnostic_join_recorded = false;
 	bool diagnostic_deadline_expired = false;
+	bool diagnostic_wait_threshold_noted = false;
 	bool diagnostic_head_expired = false;
 	PcmRxWaitFailure diagnostic_wait_failure = PCM_RX_WAIT_FAILURE_NONE;
 	uint64 observed_head_deadline_us = 0;
@@ -13907,11 +13935,8 @@ gcs_block_resource_x_target_acquire_internal(
 					&& absolute_deadline_us != UINT64_MAX)
 					*absolute_deadline_us_io = absolute_deadline_us;
 			}
-			if (now_us == 0 || retry_slice_us == 0
-				|| absolute_deadline_us == UINT64_MAX
-				|| now_us >= absolute_deadline_us) {
-				diagnostic_deadline_expired = now_us != 0 && absolute_deadline_us != UINT64_MAX
-											  && now_us >= absolute_deadline_us;
+			if (now_us == 0 || now_us == UINT64_MAX || retry_slice_us == 0
+				|| absolute_deadline_us == UINT64_MAX) {
 				result = RESOURCE_X_APPLY_INVALID;
 				break;
 			}
@@ -14000,14 +14025,12 @@ gcs_block_resource_x_target_acquire_internal(
 			preflight_membership_wait:
 				diagnostic_stage = "preflight-membership-wait";
 				now_us = gcs_block_pcm_x_monotonic_us();
-				if (now_us >= absolute_deadline_us)
-				{
-					diagnostic_deadline_expired = true;
+				if (now_us == 0 || now_us == UINT64_MAX) {
 					preflight_backpressure = true;
-					result = RESOURCE_X_APPLY_BAD_STATE;
+					result = RESOURCE_X_APPLY_INVALID;
 					break;
 				}
-				remaining_us = absolute_deadline_us - now_us;
+				remaining_us = retry_slice_us;
 				timeout_ms = (long) Min(
 					(uint64) Max(
 						cluster_gcs_block_retransmit_initial_backoff_ms, 1),
@@ -14027,10 +14050,18 @@ gcs_block_resource_x_target_acquire_internal(
 					CHECK_FOR_INTERRUPTS();
 					diagnostic_head_expired = false;
 					now_us = gcs_block_pcm_x_monotonic_us();
-					if (now_us >= absolute_deadline_us) {
-						diagnostic_deadline_expired = true;
-						result = RESOURCE_X_APPLY_BAD_STATE;
+					if (now_us == 0 || now_us == UINT64_MAX) {
+						result = RESOURCE_X_APPLY_INVALID;
 						break;
+					}
+					if (now_us >= absolute_deadline_us && !diagnostic_wait_threshold_noted) {
+						diagnostic_wait_threshold_noted = true;
+						ereport(
+							LOG,
+							(errmsg_internal("Resource-X wait diagnostic threshold reached"),
+							 errdetail("buffer=%d now=" UINT64_FORMAT " threshold=" UINT64_FORMAT
+									   " action=continue_owned_wait",
+									   buf->buf_id, now_us, absolute_deadline_us)));
 					}
 					target_retained_release_inflight = false;
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
@@ -14087,12 +14118,7 @@ gcs_block_resource_x_target_acquire_internal(
 							target_install_preuse_retry_seen = true;
 							diagnostic_stage = "target-install-preuse-wait";
 							now_us = gcs_block_pcm_x_monotonic_us();
-							if (now_us >= absolute_deadline_us) {
-								diagnostic_deadline_expired = true;
-								result = RESOURCE_X_APPLY_BAD_STATE;
-								break;
-							}
-							remaining_us = absolute_deadline_us - now_us;
+							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
 								(uint64) Max(
 									cluster_gcs_block_retransmit_initial_backoff_ms,
@@ -14131,12 +14157,7 @@ gcs_block_resource_x_target_acquire_internal(
 								== RESOURCE_X_TARGET_INSTALL_INFLIGHT) {
 							diagnostic_stage = "target-install-continuation-wait";
 							now_us = gcs_block_pcm_x_monotonic_us();
-							if (now_us >= absolute_deadline_us) {
-								diagnostic_deadline_expired = true;
-								result = RESOURCE_X_APPLY_BAD_STATE;
-								break;
-							}
-							remaining_us = absolute_deadline_us - now_us;
+							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
 								(uint64) Max(
 									cluster_gcs_block_retransmit_initial_backoff_ms,
@@ -14313,11 +14334,6 @@ gcs_block_resource_x_target_acquire_internal(
 							break;
 						}
 						now_us = gcs_block_pcm_x_monotonic_us();
-						if (now_us >= absolute_deadline_us) {
-							diagnostic_deadline_expired = true;
-							result = RESOURCE_X_APPLY_BAD_STATE;
-							break;
-						}
 						if (cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 								&own, CLUSTER_PCM_OWN_OK, &own, now_us, absolute_deadline_us)) {
 							/* Another local caller owns only the reversible
@@ -14326,7 +14342,7 @@ gcs_block_resource_x_target_acquire_internal(
 							 * Coherent equality covers own only at observation;
 							 * the fresh loop must recheck before any admission. */
 							diagnostic_stage = "local-pending-reservation-wait";
-							remaining_us = absolute_deadline_us - now_us;
+							remaining_us = retry_slice_us;
 							timeout_ms = (long) Min(
 								(uint64) Max(
 									cluster_gcs_block_retransmit_initial_backoff_ms,
@@ -14546,15 +14562,6 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 					diagnostic_stage = "retained-release-wait";
 					now_us = gcs_block_pcm_x_monotonic_us();
-					if (now_us >= absolute_deadline_us) {
-						diagnostic_deadline_expired = true;
-						if (target_retained_release_post_mutation)
-							gcs_block_resource_x_fail_closed_current();
-						result = target_retained_release_post_mutation
-							? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-							: RESOURCE_X_APPLY_BAD_STATE;
-						break;
-					}
 					CHECK_FOR_INTERRUPTS();
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
 						&resource, master_node, master_session, gate.formation, own.generation,
@@ -14713,11 +14720,9 @@ gcs_block_resource_x_target_acquire_internal(
 						&assertion, gate.formation, master_session, admission.record_generation,
 						&caller_witness);
 					now_us = gcs_block_pcm_x_monotonic_us();
-					if (result != RESOURCE_X_APPLY_APPLIED || now_us == 0
-						|| now_us >= absolute_deadline_us) {
+					if (result != RESOURCE_X_APPLY_APPLIED || now_us == 0 || now_us == UINT64_MAX) {
 						memset(ref_out, 0, sizeof(*ref_out));
 						diagnostic_stage = "terminal-caller-history-reject";
-						diagnostic_deadline_expired = now_us >= absolute_deadline_us;
 						if (result == RESOURCE_X_APPLY_APPLIED)
 							result = RESOURCE_X_APPLY_BAD_STATE;
 						break;
@@ -14820,10 +14825,7 @@ gcs_block_resource_x_target_acquire_internal(
 							absolute_deadline_us))
 						continue;
 					diagnostic_stage = "round-fail-closed";
-					diagnostic_deadline_expired = now_us >= absolute_deadline_us;
-					result = now_us >= absolute_deadline_us
-						? RESOURCE_X_APPLY_BAD_STATE
-						: RESOURCE_X_APPLY_STALE;
+					result = RESOURCE_X_APPLY_STALE;
 					break;
 				}
 				if (action
@@ -14841,11 +14843,6 @@ gcs_block_resource_x_target_acquire_internal(
 						break;
 					}
 					now_us = gcs_block_pcm_x_monotonic_us();
-					if (now_us >= absolute_deadline_us) {
-						diagnostic_deadline_expired = true;
-						result = RESOURCE_X_APPLY_BAD_STATE;
-						break;
-					}
 					CHECK_FOR_INTERRUPTS();
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
 						&resource, master_node, master_session, gate.formation, 0,
@@ -14993,12 +14990,7 @@ gcs_block_resource_x_target_acquire_internal(
 
 					dispatch_recheck_wait:
 							now_us = gcs_block_pcm_x_monotonic_us();
-							if (now_us >= absolute_deadline_us) {
-								diagnostic_deadline_expired = true;
-								result = RESOURCE_X_APPLY_BAD_STATE;
-								break;
-							}
-							remaining_us = absolute_deadline_us - now_us;
+							remaining_us = retry_slice_us;
 							timeout_ms = (long)Min(
 								(uint64)Max(
 									cluster_gcs_block_retransmit_initial_backoff_ms,
@@ -15039,12 +15031,7 @@ gcs_block_resource_x_target_acquire_internal(
 				/* The serialized step already adjudicated the physical sample.
 				 * WAIT only enrolls/rechecks; it cannot revoke its own install. */
 				now_us = gcs_block_pcm_x_monotonic_us();
-				if (now_us >= absolute_deadline_us) {
-					diagnostic_deadline_expired = true;
-					result = RESOURCE_X_APPLY_BAD_STATE;
-					break;
-				}
-				remaining_us = absolute_deadline_us - now_us;
+				remaining_us = retry_slice_us;
 				timeout_ms = (long)Min(
 					(uint64)Max(
 						cluster_gcs_block_retransmit_initial_backoff_ms, 1),

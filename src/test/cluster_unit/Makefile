@@ -2080,6 +2080,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_pending_consumer.inc \
+		test_cluster_pcm_source_replay.inc \
 		test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
@@ -2443,7 +2444,13 @@ test_cluster_pcm_ready_scheduler.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (found != 1 || emit) exit 1 }' $< > $@
 
+test_cluster_pcm_source_replay.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_retained_pair_replay\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_source_replay.inc \
 		test_cluster_pcm_ready_scheduler.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)

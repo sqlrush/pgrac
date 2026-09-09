@@ -303,7 +303,7 @@ cluster_gcs_resource_x_target_pending_terminal_resample_exact(
  * GRANT_PENDING->clean, or a complete clean->clean token advance.  None
  * grants authority or carries page proof.  Accept only an unchanged N
  * generation, monotone token and zero activation fields, then permit one
- * bounded sleep/reprobe under the caller's original R7 deadline.  The next
+ * bounded sleep/reprobe with the original diagnostic timestamp. The next
  * iteration validates the successor through its canonical predicate. */
 static inline bool
 cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
@@ -314,11 +314,8 @@ cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 {
 	bool before_pending;
 
-	if (before == NULL || live == NULL
-		|| now_us == 0 || now_us == UINT64_MAX
-		|| absolute_deadline_us == 0
-		|| absolute_deadline_us == UINT64_MAX
-		|| now_us >= absolute_deadline_us)
+	if (before == NULL || live == NULL || now_us == 0 || now_us == UINT64_MAX
+		|| absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX)
 		return false;
 	before_pending = before->flags == PCM_OWN_FLAG_GRANT_PENDING;
 	if ((!before_pending && before->flags != 0)
@@ -349,7 +346,7 @@ cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 /* An ordinary pre-assert observation is not a reservation or authority.
  * A completed conversion can supersede it before its header-locked check.
  * Discard only the stale observation: the caller must re-enter its original
- * deadline/history, retained-pair and ordinary pre-use checks.  No generation
+ * history, retained-pair and ordinary pre-use checks. No generation
  * offset is a release proof, and no continuation/error state is accepted here. */
 static inline bool
 cluster_gcs_resource_x_target_preassert_resample_exact(
@@ -360,12 +357,11 @@ cluster_gcs_resource_x_target_preassert_resample_exact(
 	if (before == NULL || live == NULL || live_result != CLUSTER_PCM_OWN_STALE
 		|| follow_state != RESOURCE_X_TARGET_INSTALL_STALE || now_us == 0 || now_us == UINT64_MAX
 		|| absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX
-		|| now_us >= absolute_deadline_us || !BufferTagsEqual(&before->tag, &live->tag)
-		|| before->pcm_state != (uint8)PCM_STATE_N || before->flags != 0
-		|| before->writer_activation_token != 0 || before->resource_x_activation_generation != 0
-		|| before->generation == UINT64_MAX || live->generation == UINT64_MAX
-		|| before->reservation_token == UINT64_MAX || live->reservation_token == UINT64_MAX
-		|| live->generation < before->generation
+		|| !BufferTagsEqual(&before->tag, &live->tag) || before->pcm_state != (uint8)PCM_STATE_N
+		|| before->flags != 0 || before->writer_activation_token != 0
+		|| before->resource_x_activation_generation != 0 || before->generation == UINT64_MAX
+		|| live->generation == UINT64_MAX || before->reservation_token == UINT64_MAX
+		|| live->reservation_token == UINT64_MAX || live->generation < before->generation
 		|| live->reservation_token < before->reservation_token
 		|| (live->pcm_state != (uint8)PCM_STATE_N && live->pcm_state != (uint8)PCM_STATE_S
 			&& live->pcm_state != (uint8)PCM_STATE_X))
@@ -408,16 +404,10 @@ cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
 	bool authority_current,
 	uint64 now_us, uint64 absolute_deadline_us)
 {
-	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
-		|| direct_init || join_only
-		|| before_x == NULL || live_n == NULL
-		|| live_result != CLUSTER_PCM_OWN_OK
-		|| round_snapshot_result != RESOURCE_X_APPLY_NOT_FOUND
-		|| !authority_current
-		|| now_us == 0 || now_us == UINT64_MAX
-		|| absolute_deadline_us == 0
-		|| absolute_deadline_us == UINT64_MAX
-		|| now_us >= absolute_deadline_us)
+	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED || direct_init || join_only
+		|| before_x == NULL || live_n == NULL || live_result != CLUSTER_PCM_OWN_OK
+		|| round_snapshot_result != RESOURCE_X_APPLY_NOT_FOUND || !authority_current || now_us == 0
+		|| now_us == UINT64_MAX || absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX)
 		return false;
 	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
 		|| before_x->pcm_state != (uint8) PCM_STATE_X
@@ -454,16 +444,10 @@ cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
 	bool authority_current,
 	uint64 now_us, uint64 absolute_deadline_us)
 {
-	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
-		|| direct_init || join_only
-		|| before_x == NULL || live_n == NULL
-		|| live_result != CLUSTER_PCM_OWN_OK
-		|| !retained_pair_exact || !retained_buffer_exact
-		|| !authority_current
-		|| now_us == 0 || now_us == UINT64_MAX
-		|| absolute_deadline_us == 0
-		|| absolute_deadline_us == UINT64_MAX
-		|| now_us >= absolute_deadline_us)
+	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED || direct_init || join_only
+		|| before_x == NULL || live_n == NULL || live_result != CLUSTER_PCM_OWN_OK
+		|| !retained_pair_exact || !retained_buffer_exact || !authority_current || now_us == 0
+		|| now_us == UINT64_MAX || absolute_deadline_us == 0 || absolute_deadline_us == UINT64_MAX)
 		return false;
 	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
 		|| before_x->pcm_state != (uint8) PCM_STATE_X

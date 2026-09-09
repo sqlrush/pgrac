@@ -3162,8 +3162,8 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		? strstr(retained_admission_recheck,
 			"gcs_block_resource_x_gate_session_recheck(") : NULL;
 	retained_deadline = retained_gate_recheck != NULL
-		? strstr(retained_gate_recheck,
-			"now_us >= absolute_deadline_us") : NULL;
+							? strstr(retained_gate_recheck, "CHECK_FOR_INTERRUPTS()")
+							: NULL;
 	retained_sleep
 		= retained_wait != NULL
 			  ? strstr(retained_wait, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
@@ -3181,8 +3181,8 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 	predecessor_wait = step != NULL
 		? strstr(step,
 			"RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT") : NULL;
-	predecessor_deadline = predecessor_wait != NULL
-		? strstr(predecessor_wait, "now_us >= absolute_deadline_us") : NULL;
+	predecessor_deadline
+		= predecessor_wait != NULL ? strstr(predecessor_wait, "CHECK_FOR_INTERRUPTS()") : NULL;
 	predecessor_sleep
 		= predecessor_deadline != NULL
 			  ? strstr(predecessor_deadline, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
@@ -3363,8 +3363,8 @@ UT_TEST(test_resource_x_target_preflight_waits_under_one_r7_deadline)
 		? strstr(peer_open,
 			"diagnostic_stage = \"preflight-membership-wait\"")
 		: NULL;
-	deadline_check = wait_stage != NULL
-		? strstr(wait_stage, "now_us >= absolute_deadline_us") : NULL;
+	deadline_check
+		= wait_stage != NULL ? strstr(wait_stage, "now_us == 0 || now_us == UINT64_MAX") : NULL;
 	sleep = deadline_check != NULL
 		? strstr(deadline_check, "pg_usleep(timeout_ms * 1000L)") : NULL;
 	retry = sleep != NULL ? strstr(sleep, "continue;") : NULL;
@@ -3771,32 +3771,33 @@ UT_TEST(test_resource_x_source_settlement_distinguishes_retained_and_dropped_car
 
 UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 {
-	static const char *const source_contract[] = {
-		"cluster_pcm_lock_resource_x_holder_image_exact(",
-		"cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(",
-		"cluster_resource_x_writer_path_snapshot(",
-		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
-		"current.generation > image.body.image_envelope.source_carrier_generation",
-		"carrier_superseded = true;",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(",
-		"replay_result == RESOURCE_X_APPLY_BAD_STATE",
-		"return RESOURCE_X_APPLY_BAD_STATE;",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
-		"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
-		"cluster_bufmgr_pcm_own_try_drain_held_x_revoke(",
-		"cluster_bufmgr_copy_block_for_gcs(",
-		"gcs_block_pcm_x_resource_x_build_source_frames(",
-		"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
-		"semantic_retained && carrier_superseded",
-		"result == RESOURCE_X_APPLY_STALE",
-		"cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(",
-		"pair_result == RESOURCE_X_APPLY_APPLIED",
-		"cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
-		"cluster_pcm_lock_resource_x_holder_pair_publish_exact(",
-		"gcs_block_resource_x_terminal_owner_release("
-	};
+	static const char *const source_contract[]
+		= { "cluster_pcm_lock_resource_x_holder_image_exact(",
+			"gcs_block_resource_x_retained_pair_replay(",
+			"if (pair_published)",
+			"return pair_result;",
+			"cluster_resource_x_writer_path_snapshot(",
+			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+			"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
+			"current.generation > image.body.image_envelope.source_carrier_generation",
+			"carrier_superseded = true;",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(",
+			"replay_result == RESOURCE_X_APPLY_BAD_STATE",
+			"return RESOURCE_X_APPLY_BAD_STATE;",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
+			"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
+			"cluster_bufmgr_pcm_own_try_drain_held_x_revoke(",
+			"cluster_bufmgr_copy_block_for_gcs(",
+			"gcs_block_pcm_x_resource_x_build_source_frames(",
+			"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
+			"semantic_retained && carrier_superseded",
+			"result == RESOURCE_X_APPLY_STALE",
+			"cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(",
+			"pair_result == RESOURCE_X_APPLY_APPLIED",
+			"cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
+			"cluster_pcm_lock_resource_x_holder_pair_publish_exact(",
+			"gcs_block_resource_x_terminal_owner_release(" };
 	char *source = read_gcs_block_source();
 	const char *ingress;
 	const char *source_call;
@@ -5758,10 +5759,14 @@ UT_TEST(test_resource_x_target_install_resample_loop_checks_fixed_deadline_first
 		? strstr(loop, "diagnostic_stage = \"own-snapshot\"") : NULL;
 	deadline_sample = loop != NULL
 		? strstr(loop, "now_us = gcs_block_pcm_x_monotonic_us();") : NULL;
-	deadline_guard = deadline_sample != NULL
-		? strstr(deadline_sample, "if (now_us >= absolute_deadline_us)") : NULL;
+	deadline_guard
+		= deadline_sample != NULL
+			  ? strstr(deadline_sample,
+					   "if (now_us >= absolute_deadline_us && !diagnostic_wait_threshold_noted)")
+			  : NULL;
 	deadline_result = deadline_guard != NULL
-		? strstr(deadline_guard, "result = RESOURCE_X_APPLY_BAD_STATE;") : NULL;
+						  ? strstr(deadline_guard, "diagnostic_wait_threshold_noted = true;")
+						  : NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(round_loop);
 	UT_ASSERT_NOT_NULL(loop);
@@ -6344,9 +6349,8 @@ UT_TEST(test_resource_x_target_waits_out_unrelated_local_pending_reservation)
 	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 		&pending, CLUSTER_PCM_OWN_STALE, &live,
 		UINT64_C(100), UINT64_C(200)));
-	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
-		&pending, CLUSTER_PCM_OWN_OK, &live,
-		UINT64_C(200), UINT64_C(200)));
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live, UINT64_C(200), UINT64_C(200)));
 
 	/* Production must consume this transient before the clean-N assertion
 	 * predicate sees GRANT_PENDING and maps its INVALID result to recovery. */
@@ -6449,9 +6453,8 @@ UT_TEST(test_resource_x_target_retries_clean_n_reservation_token_churn)
 	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 		&before, CLUSTER_PCM_OWN_OK, &live,
 		UINT64_C(100), UINT64_C(200)));
-	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
-		&before, CLUSTER_PCM_OWN_STALE, &live,
-		UINT64_C(200), UINT64_C(200)));
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live, UINT64_C(200), UINT64_C(200)));
 
 	/* The ordinary pre-assert consumer now covers this token-only case with
 	 * its read-only resampling boundary, after STALE and before first failure.
@@ -6540,11 +6543,9 @@ UT_TEST(test_resource_x_target_retries_only_exact_empty_round_x_to_n_drift)
 		&before, CLUSTER_PCM_OWN_OK, &live,
 		RESOURCE_X_APPLY_APPLIED, true,
 		UINT64_C(900), UINT64_C(1000)));
-	UT_ASSERT(!cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, false, false,
-		&before, CLUSTER_PCM_OWN_OK, &live,
-		RESOURCE_X_APPLY_NOT_FOUND, true,
-		UINT64_C(1000), UINT64_C(1000)));
+	UT_ASSERT(cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
+		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, false, false, &before, CLUSTER_PCM_OWN_OK, &live,
+		RESOURCE_X_APPLY_NOT_FOUND, true, UINT64_C(1000), UINT64_C(1000)));
 	UT_ASSERT(!cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
 		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, true, false,
 		&before, CLUSTER_PCM_OWN_OK, &live,
@@ -6644,10 +6645,9 @@ UT_TEST(test_resource_x_target_waits_only_exact_retained_predecessor_after_cache
 		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, true, false,
 		&before, CLUSTER_PCM_OWN_OK, &live, true, true, true,
 		UINT64_C(900), UINT64_C(1000)));
-	UT_ASSERT(!cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, false, false,
-		&before, CLUSTER_PCM_OWN_OK, &live, true, true, true,
-		UINT64_C(1000), UINT64_C(1000)));
+	UT_ASSERT(cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
+		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED, false, false, &before, CLUSTER_PCM_OWN_OK, &live,
+		true, true, true, UINT64_C(1000), UINT64_C(1000)));
 
 	source = read_gcs_block_source();
 	assert_ordered_in_function(
@@ -6865,12 +6865,12 @@ UT_TEST(test_resource_x_target_waits_for_exact_post_release_settlement_window)
 	drift_fail_closed = drift_guard != NULL
 		? strstr(drift_guard, "gcs_block_resource_x_fail_closed_current()")
 		: NULL;
-	deadline_guard = drift_fail_closed != NULL
-		? strstr(drift_fail_closed, "if (now_us >= absolute_deadline_us)")
-		: NULL;
-	deadline_fail_closed = deadline_guard != NULL
-		? strstr(deadline_guard, "gcs_block_resource_x_fail_closed_current()")
-		: NULL;
+	deadline_guard
+		= drift_fail_closed != NULL ? strstr(drift_fail_closed, "CHECK_FOR_INTERRUPTS()") : NULL;
+	deadline_fail_closed
+		= deadline_guard != NULL
+			  ? strstr(deadline_guard, "cluster_pcm_lock_resource_x_predecessor_wait_exact(")
+			  : NULL;
 	new_round = deadline_fail_closed != NULL
 		? strstr(deadline_fail_closed, "diagnostic_stage = \"round-step\"")
 		: NULL;
@@ -7016,7 +7016,8 @@ UT_TEST(test_resource_x_client_reason_is_exact_and_not_guessed_from_bad_state)
 	UT_ASSERT_NOT_NULL(gcs_source);
 	UT_ASSERT_NOT_NULL(bufmgr_source);
 	if (gcs_source != NULL) {
-		UT_ASSERT_NOT_NULL(strstr(gcs_source, "diagnostic_deadline_expired = true;"));
+		UT_ASSERT_NULL(strstr(gcs_source, "diagnostic_deadline_expired = true;"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source, "action=continue_owned_wait"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "gcs_resource_x_acquire_diagnostic.valid = false;"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_last_step_head_failure()"));
 		UT_ASSERT_NOT_NULL(strstr(gcs_source, "cluster_pcm_rx_take_wait_failure()"));

@@ -4134,7 +4134,7 @@ UT_TEST(test_resource_x_ack_advances_lease_but_replays_do_not)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, (2000) - (1800), 1800, 50, false, 0,
 					 &dispatch, &terminal_ref),
-				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
 	UT_ASSERT_EQ(gate.phase, RESOURCE_X_GATE_OPEN);
 }
@@ -4177,7 +4177,7 @@ accept_ack_during_wait_registration(void)
 				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 }
 
-UT_TEST(test_resource_x_round_wait_rechecks_progress_and_clips_head_lease)
+UT_TEST(test_resource_x_round_wait_rechecks_progress_in_finite_slices)
 {
 	BufferTag tag = make_tag(483);
 	ResourceXAssertion assertion;
@@ -4198,7 +4198,7 @@ UT_TEST(test_resource_x_round_wait_rechecks_progress_and_clips_head_lease)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 1);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 2);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	wait_race_ack = make_resource_x_bootstrap_ack_values(&request, 9, 71);
 	fake_cv_prepare_hook = accept_ack_during_wait_registration;
@@ -4209,10 +4209,10 @@ UT_TEST(test_resource_x_round_wait_rechecks_progress_and_clips_head_lease)
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	fake_pcm_clock_us = 104500;
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
-					 &assertion, 0, 17, 31, 77, 51, 61, 2000, 104500, 50),
-				 RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(&assertion, 0, 17, 31, 77,
+																		51, 61, 2000, 104500, 50),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50),
@@ -4287,7 +4287,7 @@ UT_TEST(test_resource_x_head_budget_and_owned_progress_are_independent)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 			&assertion, 0, 17, 31, 77, 51, 61, 200, 1, 200, 75, false, 0, &dispatch, &terminal),
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, &after),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -4431,7 +4431,7 @@ UT_TEST(test_resource_x_head_budget_and_owned_progress_are_independent)
 	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
 }
 
-UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
+UT_TEST(test_resource_x_unbound_wait_threshold_cannot_publish_claim)
 {
 	BufferTag tag = make_tag(485);
 	ResourceXAssertion assertion;
@@ -4452,19 +4452,19 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 9000, 5000, 5100, 50, 3, 77, false, 0,
 					 &request, &terminal),
-				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(snapshot.head_failure_reason, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
-	UT_ASSERT_EQ(snapshot.round_phase, UINT8_C(5)); /* FAILED_CLOSED, not global fuse. */
+	UT_ASSERT_EQ(snapshot.head_failure_reason, RESOURCE_X_HEAD_FAILURE_NONE);
+	UT_ASSERT_EQ(snapshot.round_phase, UINT8_C(1)); /* Same pending request, no failure. */
 	fake_pcm_clock_us = 5101;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, 3, 77, 9000, 1),
-				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
-	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED);
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
-	/* A different formation cannot inherit the expired head's reason. */
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	/* A different formation is still a real identity rejection. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 					 &assertion, 0, 18, 31, 77, 51, 61, 50, 3, 77, 9000, 1),
 				 RESOURCE_X_APPLY_STALE);
@@ -4472,7 +4472,7 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 	/* Even an unconsumed observation must be reset by the next invocation. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(&assertion, 0, 17, 31, 77,
 																		51, 61, 50, 9000, 1),
-				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(&assertion, 0, 17, 31, 77,
 																		51, 61, 50, 0, 1),
 				 RESOURCE_X_APPLY_INVALID);
@@ -4480,7 +4480,7 @@ UT_TEST(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry)
 	UT_ASSERT(cluster_pcm_lock_resource_x_gate_open_exact(17));
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
 	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_CREATE], 1);
-	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_EXPIRE], 1);
+	UT_ASSERT_EQ(stats.count[PCM_RX_HEAD_EXPIRE], 0);
 	UT_ASSERT_EQ(stats.count[PCM_RX_GLOBAL_FUSE_TRIGGER], 0);
 }
 
@@ -4537,9 +4537,9 @@ UT_TEST(test_resource_x_expired_follower_cannot_cancel_live_head)
 				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 	memcpy(before, fake_pcm_entries.data, sizeof(before));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-					 &assertion, 0, 17, 31, 77, 51, 61, 120, (120) - (130), 130, 50, false, 0,
-					 &dispatch, &terminal_ref),
-				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+					 &assertion, 0, 17, 31, 77, 51, 61, 120, 900, 130, 50, false, 0, &dispatch,
+					 &terminal_ref),
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(memcmp(before, fake_pcm_entries.data, sizeof(before)), 0);
 	UT_ASSERT_EQ(terminal_ref.acquisition_generation, 0);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
@@ -4904,7 +4904,7 @@ UT_TEST(test_resource_x_requester_round_blocks_local_s_only_until_x_cached)
 		&tag));
 }
 
-UT_TEST(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition)
+UT_TEST(test_resource_x_bootstrap_threshold_keeps_same_acquisition)
 {
 	BufferTag tag = make_tag(268);
 	ResourceXAssertion assertion;
@@ -4934,37 +4934,34 @@ UT_TEST(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition)
 		&first_ack, 0, 61, 77, UINT64_C(150), &first_assertion);
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 
-	/* The first caller expires at 1000; ACK advances the head lease to 1050.
-	 * Head expiry is terminal for
-	 * that acquisition, and an equal or already-expired caller deadline can
-	 * neither refresh it nor allocate a second attempt. */
+	/* Both original diagnostic thresholds pass. The unbound initiating
+	 * owner retries the original ASSERT; age creates neither failure nor
+	 * another acquisition identity. */
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), (UINT64_C(1000)) - (UINT64_C(1000)),
 		UINT64_C(1000), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), (UINT64_C(1000)) - (UINT64_C(1051)),
 		UINT64_C(1051), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 
-	/* Caller expiry above is zero-mutation.  A live driver observes the head's
-	 * own expiry before any later independent acquisition can rearm it. */
+	/* A follower in the same pacing slice has no dispatch authority. */
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(2000), (UINT64_C(2000)) - (UINT64_C(1051)),
 		UINT64_C(1051), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 
-	/* A later independent acquisition may retire only the expired local
-	 * binding and allocate a strictly higher attempt.  It starts with a clean
-	 * request: no old base, ACK, assertion, proof, or deadline is reused. */
+	/* The next paced retry retains exactly the first accepted base and
+	 * attempt. A larger caller threshold does not create another request. */
 	memset(&second_request, 0xa5, sizeof(second_request));
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(2000), (UINT64_C(2000)) - (UINT64_C(1051)),
-		UINT64_C(1051), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
-	UT_ASSERT_EQ(second_request.common.assertion_sequence, UINT64_C(2));
-	UT_ASSERT_EQ(second_request.common.base_authority_generation, UINT64_C(0));
-	UT_ASSERT_EQ(second_request.common.authority_generation, UINT64_C(0));
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(2000), 900, UINT64_C(1101), UINT64_C(50), false,
+		0, &second_request, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	UT_ASSERT_EQ(second_request.common.assertion_sequence, first_request.common.assertion_sequence);
+	UT_ASSERT_EQ(second_request.common.base_authority_generation, UINT64_C(9));
+	UT_ASSERT_EQ(second_request.common.authority_generation, UINT64_C(9));
 	UT_ASSERT_EQ(second_request.common.outcome, RESOURCE_X_OUTCOME_NONE);
 
 	/* Creation-only direct-init identity is never reinterpreted as a fresh
@@ -4980,15 +4977,14 @@ UT_TEST(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition)
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), (UINT64_C(1000)) - (UINT64_C(1000)),
 		UINT64_C(1000), UINT64_C(50), 0, 5, false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(2000), (UINT64_C(2000)) - (UINT64_C(1051)),
 		UINT64_C(1051), UINT64_C(50), 0, 5, false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 
-	/* A failed ordinary round is not locally empty while any grant/image half
-	 * remains retained for the same requester.  Expiry cannot discard that
-	 * no-half-open debt or let a higher attempt reuse the entry. */
+	/* A retained grant/image half stays with the same requester attempt.
+	 * Age cannot discard that debt or let a higher attempt reuse the entry. */
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 1;
 	fake_gcs_master_node = 0;
@@ -5019,11 +5015,11 @@ UT_TEST(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition)
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), (UINT64_C(1000)) - (UINT64_C(1000)),
 		UINT64_C(1000), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(2000), (UINT64_C(2000)) - (UINT64_C(1051)),
 		UINT64_C(1051), UINT64_C(50), false, 0, &second_request, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 }
 
 UT_TEST(test_resource_x_s_caller_retains_ack_local_proof_admission)
@@ -5053,7 +5049,7 @@ UT_TEST(test_resource_x_s_caller_retains_ack_local_proof_admission)
 	UT_ASSERT_EQ(caller.joined_request.flags, 0);
 }
 
-UT_TEST(test_resource_x_delivery_target_survives_head_failure)
+UT_TEST(test_resource_x_delivery_target_survives_wait_threshold)
 {
 	BufferTag tag = make_tag(270);
 	ResourceXAssertion assertion;
@@ -5107,18 +5103,18 @@ UT_TEST(test_resource_x_delivery_target_survives_head_failure)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 			&assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 1000, 50, false, 0, &dispatch, &terminal),
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+		RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(&ref, &observed, &target),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(target.buffer_id_plus_one, 2);
 	UT_ASSERT_EQ(target.generation, 7);
 	UT_ASSERT(memcmp(&observation, &observed, sizeof(observation)) == 0);
-	/* Even ACK-only rearm must not clear a target owned by live delivery. */
+	/* An elapsed threshold must not clear a target owned by live delivery. */
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 			&assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 1001, 50, false, 0, &dispatch, &terminal),
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+		RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(&ref, &observed, &target),
 		RESOURCE_X_APPLY_APPLIED);
@@ -5157,12 +5153,13 @@ UT_TEST(test_resource_x_failed_caller_cannot_join_later_head)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(&ack, 0, 61, 77, 150,
 																			  &dispatch),
 				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
-	UT_ASSERT_EQ(
-		cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-			&assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 1051, 50, false, 0, &dispatch, &terminal),
-		RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
-	/* A separate new caller legally creates attempt2 after the old empty
-	 * binding fails.  This does not grant the old caller another lifetime. */
+	/* Actual authenticated ingress-generation drift, not elapsed age, fails
+	 * this round. The original caller must retain that failed history. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(&ack, 0, 62, 77, 1051,
+																			  &dispatch),
+				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	/* The existing exact empty-binding recovery permits a different caller
+	 * to create attempt2. The failed caller must not inherit that request. */
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 			&assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 1052, 50, false, 0, &dispatch, &terminal),
@@ -6947,15 +6944,14 @@ UT_TEST(test_resource_x_target_wait_old_lease_is_only_a_reprobe_hint)
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, &before),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(before.absolute_deadline_us, UINT64_C(105000));
-	/* The first clock sample is under entry lock.  On the second sample,
-	 * the owner installs T2 and renews the lease after the waiter unlocked. */
+	/* The owner installs T2 after enrollment, before the registered recheck.
+	 * A progressed head is a re-probe hint, never an elapsed failure. */
 	fake_pcm_clock_us = UINT64_C(104999);
-	fake_pcm_clock_hook_countdown = 2;
-	fake_pcm_clock_hook = renew_target_head_after_wait_unlock;
+	fake_cv_prepare_hook = renew_target_head_after_wait_unlock;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 					 &follower, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 50),
 				 RESOURCE_X_APPLY_DUPLICATE);
-	UT_ASSERT(fake_pcm_clock_hook == NULL);
+	UT_ASSERT(fake_cv_prepare_hook == NULL);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
@@ -7099,7 +7095,7 @@ UT_TEST(test_resource_x_target_install_wait_uses_receipt_and_fixed_deadline)
 	wait_result
 		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 			&expired, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 50);
-	UT_ASSERT_EQ(wait_result, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(wait_result, RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(fake_cv_prepare_count, 5);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 3);
 	UT_ASSERT_EQ(fake_cv_cancel_count, 5);
@@ -7828,7 +7824,7 @@ UT_TEST(test_resource_x_completed_install_wait_reregisters_after_multiple_cycles
 	fake_pcm_clock_us = follow.caller_absolute_deadline_us;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 50),
-				 RESOURCE_X_APPLY_BAD_STATE);
+				 RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
 }
@@ -7839,7 +7835,7 @@ UT_TEST(test_resource_x_completed_install_floor_never_erases_failure)
 	ResourceXTargetInstallContinuation follow;
 	ResourceXCallerWitness caller = { 0 };
 	ClusterPcmOwnSnapshot observed;
-	ResourceXDecodedFrame request;
+	ResourceXDecodedFrame request, bad_ack, dispatch;
 	ResourceXAcquisitionRef terminal;
 	BufferTag tag = make_tag(298);
 	unsigned char before[sizeof(fake_pcm_entries)];
@@ -7858,9 +7854,9 @@ UT_TEST(test_resource_x_completed_install_floor_never_erases_failure)
 					 &assertion, 0, 17, 31, 77, 51, 61, 10000000, 900, 300, 50, false, 0, &request,
 					 &terminal),
 				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
-					 &assertion, 0, 17, 31, 77, 51, 61, 10000000, 900, 1201, 50, false, 0, &request,
-					 &terminal),
+	bad_ack = make_resource_x_bootstrap_ack_values(&request, 9, 71);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(&bad_ack, 0, 62, 77,
+																			  1201, &dispatch),
 				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
 	/* The existing closed floor covers the observation, but the later failed
 	 * floor also covers it. Failure must win for caller and install observer;
@@ -11841,7 +11837,7 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 0, 102500, 10000),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
-	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 2);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 10);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, &snapshot),
 				 RESOURCE_X_APPLY_NOT_FOUND);
@@ -11851,16 +11847,16 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 61, 100000, 10000),
-		RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
-	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 2);
 	fake_cv_prepare_hook = settle_predecessor_during_wait_registration;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 0, 102500, 10000),
 		RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
-	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 2);
 	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 105000, 5000, 100000, 1000, false, 0,
@@ -12509,7 +12505,7 @@ UT_TEST(test_resource_x_remote_admission_binds_only_actual_image)
 		if (fault == 1)
 			changed.common.master_session_incarnation++;
 		if (fault == 2)
-			fake_pcm_clock_us = UINT64_C(6000000000);
+			fake_pcm_clock_us = UINT64_MAX; /* Invalid clock, not elapsed age. */
 		if (fault == 3) {
 			changed.common.assertion_sequence++;
 			changed.body.image_envelope.requester_target_generation++;
@@ -12566,10 +12562,8 @@ UT_TEST(test_resource_x_remote_admission_binds_only_actual_image)
 	}
 }
 
-UT_TEST(test_resource_x_admitted_late_image_exact_deadline_is_stale)
+UT_TEST(test_resource_x_admitted_image_threshold_preserves_authority)
 {
-	static unsigned char header_before[sizeof(fake_pcm_header)];
-	unsigned char entries_before[sizeof(fake_pcm_entries)];
 	int fork;
 	int offset;
 
@@ -12602,22 +12596,12 @@ UT_TEST(test_resource_x_admitted_late_image_exact_deadline_is_stale)
 			UT_ASSERT_EQ(failure.absolute_deadline_us, UINT64_C(1000));
 			make_resource_x_remote_join_pair(tag, 2, &grant, &image);
 			resource_x_test_image_authority(&image, 1, 4, request.common.assertion_sequence);
-			memcpy(header_before, &fake_pcm_header, sizeof(header_before));
-			memcpy(entries_before, &fake_pcm_entries, sizeof(entries_before));
 			fake_pcm_clock_us = failure.absolute_deadline_us + offset;
 			result = cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61,
 																			  77, &join);
-			if (offset < 0) {
-				UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
-				UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
-			} else {
-				UT_ASSERT_EQ(result, RESOURCE_X_APPLY_STALE);
-				UT_ASSERT_EQ(join.flags & RESOURCE_X_REQUESTER_JOIN_READY, 0);
-				/* Includes the whole actual master/join/intent shmem, not just
-				 * the public diagnostic projection. No installer was admitted. */
-				UT_ASSERT_EQ(memcmp(header_before, &fake_pcm_header, sizeof(header_before)), 0);
-				UT_ASSERT_EQ(memcmp(entries_before, &fake_pcm_entries, sizeof(entries_before)), 0);
-			}
+			UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
+			UT_ASSERT_EQ(join.assertion_sequence, request.common.assertion_sequence);
 		}
 	}
 }
@@ -12722,10 +12706,15 @@ run_actual_gcs_wait_consumer(ResourceXAssertion assertion, ClusterPcmOwnSnapshot
 	(void)ownership_loss_result;
 	(void)diagnostic_stage;
 	(void)diagnostic_deadline_expired;
+	(void)now_us;
 	(void)own;
 	(void)cached_local_x;
 	return result;
 }
+
+/* Compile the actual GCS PUBLISHED/PENDING consumer, not a copy of its
+ * decision. It runs against the real PCM retained-pair/intent owners. */
+#include "test_cluster_pcm_source_replay.inc"
 
 typedef struct DeliveryObserverFixture {
 	ResourceXAssertion assertion;
@@ -12822,13 +12811,195 @@ setup_terminal_delivery_observer(DeliveryObserverFixture *fixture)
 	setup_delivery_observer(fixture, true);
 }
 
+UT_TEST(test_resource_x_wait_threshold_does_not_fail_owned_delivery)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXDecodedFrame dispatch, empty = { 0 };
+	ResourceXAcquisitionRef terminal;
+	ResourceXInstallClaimJoinObservation observation;
+	ResourceXDeliveryTarget target;
+	ResourceXDeliveryClaim later;
+	ResourceXBootstrapRoundFailureSnapshot failure;
+
+	setup_delivery_observer(&fixture, false);
+	/* The same delivery is still owned; both the 900us head observation
+	 * interval and the caller's original 4000us threshold have elapsed. */
+	fake_pcm_clock_us = 5000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 5000, 50, 0, 0, true,
+					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(memcmp(&dispatch, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, &failure),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(failure.head_failure_reason, RESOURCE_X_HEAD_FAILURE_NONE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&fixture.assertion, 17, 31, 77,
+																  &fixture.caller),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&fixture.delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(&fixture.ref,
+																			&observation, &target),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 &fixture.ref, &target, RESOURCE_X_DELIVERY_NORMAL, 5000, &later),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&later, &dispatch),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(dispatch.common.assertion_sequence, fixture.ref.acquisition_generation);
+	UT_ASSERT_EQ(dispatch.common.base_authority_generation, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&later),
+				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_delayed_image_uses_same_live_authority_after_threshold)
+{
+	int fork;
+
+	for (fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
+		BufferTag tag = make_tag(303);
+		ResourceXAssertion assertion;
+		ResourceXDecodedFrame request, grant, image, wrong;
+		ResourceXAcquisitionRef ref;
+		ResourceXRequesterJoinSnapshot join;
+
+		tag.forkNum = (ForkNumber)fork;
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 2;
+		fake_gcs_master_node = 0;
+		fake_pcm_clock_us = 100;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+				&assertion, 0, 17, 31, 77, 51, 61, 1000, 900, 100, 50, false, 0, &request, &ref),
+			RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+		resource_x_test_image_authority(&image, 1, 4, request.common.assertion_sequence);
+		fake_pcm_clock_us = 1001;
+		wrong = image;
+		wrong.common.master_session_incarnation++;
+		canonicalize_resource_x_test_image(&wrong);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&wrong, 1, 91, 0, 61,
+																			  77, &join),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(join.flags, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61,
+																			  77, &join),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
+		UT_ASSERT_EQ(join.assertion_sequence, request.common.assertion_sequence);
+		UT_ASSERT_EQ(join.final_authority_generation, 4);
+	}
+}
+
+UT_TEST(test_resource_x_lost_image_replays_pair_after_physical_completion)
+{
+	BufferTag tag = make_tag(304);
+	ResourceXDecodedFrame settlement, image_before, image_after;
+	ResourceXIntentSlot status_slot, image_slot, replay_status, replay_image;
+	ResourceXSourceSettlementPlan plan;
+	ResourceXSourceSettlementCommitObservation observation;
+	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	ResourceXAssertion assertion;
+	bool published = false;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	(void)setup_resource_x_test_terminal_cover(tag, 60);
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_X, 60, 61, 5, 41, &settlement);
+	assertion = settlement.common.logical_assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(&assertion, &image_before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &assertion, &status_slot, status_payload, sizeof(status_payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+					 &assertion, &image_slot, image_payload, sizeof(image_payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+	/* Both sends completed, but no INSTALL/SourceSettlement has arrived.
+	 * A repeated exact BLOCK must be able to send the retained bytes again. */
+	fake_pcm_clock_us = 500;
+	UT_ASSERT_EQ(gcs_block_resource_x_retained_pair_replay(&assertion, 41, 0, 31, &published),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(published); /* Never re-enter physical source revoke/copy. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &assertion, &status_slot, status_payload, sizeof(status_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+					 &assertion, &image_slot, image_payload, sizeof(image_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(&assertion, &image_after),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&image_before, &image_after, sizeof(image_before)), 0);
+	/* A partially completed physical episode is never refilled. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(&assertion, 41, 0, 32),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&status_slot, 501),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&status_slot));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(&assertion, 41, 0, 31),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &assertion, &replay_status, status_payload, sizeof(status_payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+					 &assertion, &replay_image, image_payload, sizeof(image_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&image_slot, &replay_image, sizeof(image_slot)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&image_slot, 502),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&image_slot));
+	/* Same clock tick as the prior arm: a fresh episode must still have a
+	 * distinct callback identity, without changing retained image bytes. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(&assertion, 41, 0, 31),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &assertion, &replay_status, status_payload, sizeof(status_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+					 &assertion, &replay_image, image_payload, sizeof(image_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(replay_status.first_armed_us > status_slot.first_armed_us);
+	UT_ASSERT(replay_image.first_armed_us > image_slot.first_armed_us);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&replay_status, 503),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&replay_image, 503),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&status_slot));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&image_slot));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(&assertion, 41, 0, 31),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&replay_status));
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&replay_image));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_prepare_exact(&settlement, 0, &plan),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_commit_exact(&settlement, 0, &plan,
+																			&observation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(&assertion, 41, 0, 31),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+					 &assertion, &image_slot, image_payload, sizeof(image_payload)),
+				 RESOURCE_X_APPLY_NOT_FOUND);
+}
+
 UT_TEST(test_resource_x_delivery_executor_excludes_caller_retransmit)
 {
 	DeliveryObserverFixture fixture;
 	ResourceXDecodedFrame dispatch, empty = { 0 };
 	ResourceXAcquisitionRef terminal;
+	ResourceXDeliveryTarget target;
 
 	setup_delivery_observer(&fixture, false);
+	target = fixture.delivery.target;
 	fake_pcm_clock_us = 160; /* Original retransmit slice elapsed. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
 					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 160, 50, 0, 0, true,
@@ -12840,7 +13011,13 @@ UT_TEST(test_resource_x_delivery_executor_excludes_caller_retransmit)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(
 					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 160, 50, 0, 0, true,
 					 true, false, 0, &fixture.caller, &fixture.before, &dispatch, &terminal),
-				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(memcmp(&dispatch, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 &fixture.ref, &target, RESOURCE_X_DELIVERY_NORMAL, 160, &fixture.delivery),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &dispatch),
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(dispatch.common.assertion_sequence, fixture.ref.acquisition_generation);
 }
 
@@ -12961,8 +13138,8 @@ UT_TEST(test_resource_x_delivery_release_before_sleep_and_original_deadline)
 	fake_pcm_clock_us = 4000;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
-				 RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED);
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 }
 
 UT_TEST(test_resource_x_observed_step_preserves_strict_successor_proof)
@@ -13001,7 +13178,7 @@ UT_TEST(test_resource_x_observed_step_preserves_strict_successor_proof)
 	UT_ASSERT_EQ(dispatch.common.assertion_sequence, fixture.ref.acquisition_generation + 1);
 }
 
-UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
+UT_TEST(test_resource_x_late_delivery_requires_exact_normal_executor)
 {
 	static unsigned char header_before[sizeof(fake_pcm_header)];
 	unsigned char entries_before[sizeof(fake_pcm_entries)];
@@ -13063,13 +13240,13 @@ UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
 	resource_x_test_image_authority(&image, 1, 4, ref.acquisition_generation);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
-					 &ref, &target, RESOURCE_X_DELIVERY_CLEANUP, 1000, &cleanup),
+					 &ref, &target, RESOURCE_X_DELIVERY_NORMAL, 1000, &cleanup),
 				 RESOURCE_X_APPLY_APPLIED);
 	memcpy(header_before, &fake_pcm_header, sizeof(header_before));
 	memcpy(entries_before, &fake_pcm_entries, sizeof(entries_before));
 	UT_ASSERT_EQ(
-		cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 1, 91, 0, 61, 77, &join),
-		RESOURCE_X_APPLY_STALE);
+		cluster_pcm_lock_resource_x_requester_join_current_exact(&image, 3, 91, 0, 61, 77, &join),
+		RESOURCE_X_APPLY_INVALID);
 	stale = cleanup;
 	stale.executor_sequence++;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_delivery_exact(&image, 1, 91, 0, 61, 77,
@@ -13085,22 +13262,22 @@ UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&cleanup, &grant),
 				 RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(grant.kind, 0); /* A retained READY image needs no request retry. */
-	/* Shared failed state is not a cleanup capability.  The ordinary entry
+	/* A bound delivery is not a caller capability.  The ordinary entry
 	 * point must reject before BOUND/T1, not after publishing those bits. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref), RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(memcmp(entries_before, &fake_pcm_entries, sizeof(entries_before)), 0);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, &failure),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(failure.absolute_deadline_us, 1000);
+	UT_ASSERT_EQ(failure.absolute_deadline_us, 1900);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&assertion, 17, 31, 77, &caller),
-				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&cleanup),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&cleanup),
 				 RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
-					 &ref, &target, RESOURCE_X_DELIVERY_CLEANUP, 1001, &other),
+					 &ref, &target, RESOURCE_X_DELIVERY_NORMAL, 1001, &other),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(other.executor_sequence > cleanup.executor_sequence);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_delivery_exact(&image, 1, 91, 0, 61, 77,
@@ -13167,13 +13344,13 @@ UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 		pcm_entry_ref_release(&entry_ref);
 	}
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&assertion, 17, 31, 77, &caller),
-				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&other),
 				 RESOURCE_X_APPLY_APPLIED);
 	/* Unwind between real T3 and delivery release must not strand the hold.
 	 * Reclaim the same terminal only; this is not a fresh acquisition. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
-					 &ref, &target, RESOURCE_X_DELIVERY_CLEANUP, 1002, &cleanup),
+					 &ref, &target, RESOURCE_X_DELIVERY_NORMAL, 1002, &cleanup),
 				 RESOURCE_X_APPLY_APPLIED);
 	own.generation = 8;
 	own.reservation_token = 1;
@@ -13195,11 +13372,11 @@ UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 		RESOURCE_X_APPLY_NOT_FOUND);
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&metrics));
 	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_BIND], UINT64_C(1));
-	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_NORMAL], UINT64_C(1));
-	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_CLEANUP], UINT64_C(3));
+	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_NORMAL], UINT64_C(4));
+	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_CLEANUP], UINT64_C(0));
 	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_COMPLETE], UINT64_C(1));
-	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_CLEANUP_COMPLETE], UINT64_C(1));
-	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_FAILED_CALLER], UINT64_C(1));
+	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_CLEANUP_COMPLETE], UINT64_C(0));
+	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_FAILED_CALLER], UINT64_C(0));
 	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_PENDING_MAX_US], UINT64_C(902));
 	cluster_pcm_rx_delivery_max_note(PCM_RX_DELIVERY_PENDING_MAX_US, 1);
 	cluster_pcm_rx_delivery_max_note(PCM_RX_DELIVERY_BIND, 99);
@@ -13209,7 +13386,7 @@ UT_TEST(test_resource_x_late_delivery_requires_exact_cleanup_executor)
 	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_CALLBACK_MAX_US], UINT64_C(17));
 	UT_ASSERT_EQ(metrics.count[PCM_RX_DELIVERY_BIND], UINT64_C(1));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_caller_observe_exact(&assertion, 17, 31, 77, &caller),
-				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+				 RESOURCE_X_APPLY_APPLIED);
 }
 
 UT_TEST(test_resource_x_quiet_delivery_is_bounded_and_revisited_without_packets)
@@ -13291,12 +13468,12 @@ UT_TEST(test_resource_x_quiet_delivery_is_bounded_and_revisited_without_packets)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&claim),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
-					 &ref, &target, RESOURCE_X_DELIVERY_CLEANUP, 1001, &claim),
+					 &ref, &target, RESOURCE_X_DELIVERY_NORMAL, 1001, &claim),
 				 RESOURCE_X_APPLY_APPLIED);
 	ack = make_resource_x_bootstrap_ack_values(&request, 1, 71);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(&ack, 0, 61, 77, 1001,
 																			  &assertion_frame),
-				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 	wrong = claim;
 	wrong.executor_sequence++;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_delivery_exact(
@@ -13304,7 +13481,9 @@ UT_TEST(test_resource_x_quiet_delivery_is_bounded_and_revisited_without_packets)
 				 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_delivery_exact(
 					 &ack, 0, 61, 77, 1001, &claim, &assertion_frame),
-				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&claim, &assertion_frame),
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(assertion_frame.common.assertion_sequence, ref.acquisition_generation);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&claim),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -13346,13 +13525,14 @@ UT_TEST(test_resource_x_target_bind_after_exact_head_expiry_keeps_physical_owner
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
 						 &assertion, 0, 17, 31, 77, 51, 61, &observation),
 					 RESOURCE_X_APPLY_APPLIED);
-		/* Header hold is acquired at this point; a different caller expires
-		 * the exact head before the B-E-B entry binder can publish its owner. */
+		/* Header hold is acquired at this point; the diagnostic threshold passes
+		 * before the B-E-B entry binder can publish its owner. */
 		fake_pcm_clock_us = 1000;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_caller_exact(
 						 &assertion, 0, 17, 31, 77, 51, 61, 4000, 900, 1000, 50, 0, 0, true, true,
 						 false, 0, &caller, &dispatch, &terminal),
-					 RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+					 ack_first ? RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT
+							   : RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 		own.tag = tag;
 		own.generation = 7;
 		own.pcm_state = PCM_STATE_N;
@@ -13366,7 +13546,7 @@ UT_TEST(test_resource_x_target_bind_after_exact_head_expiry_keeps_physical_owner
 			cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(&ref, &observation, &target),
 			RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
-						 &ref, &target, RESOURCE_X_DELIVERY_CLEANUP, 1001, &claim),
+						 &ref, &target, RESOURCE_X_DELIVERY_NORMAL, 1001, &claim),
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&claim, &dispatch),
 					 RESOURCE_X_APPLY_APPLIED);
@@ -13374,7 +13554,7 @@ UT_TEST(test_resource_x_target_bind_after_exact_head_expiry_keeps_physical_owner
 					 ack_first ? RESOURCE_X_WIRE_ASSERT_X : RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
 		UT_ASSERT_EQ(
 			cluster_pcm_lock_resource_x_caller_observe_exact(&assertion, 17, 31, 77, &caller),
-			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+			RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&claim),
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT(cluster_resource_x_reconfig_freeze_exact(17, 18, 0, &token));
@@ -13425,7 +13605,7 @@ UT_TEST(test_resource_x_image_authority_requires_live_head_and_exact_source)
 		if (scenario == 3)
 			image.common.master_session_incarnation++;
 		if (scenario == 4)
-			fake_pcm_clock_us = UINT64_C(6000000000);
+			fake_pcm_clock_us = UINT64_MAX; /* Invalid clock, not elapsed age. */
 		if (scenario == 5)
 			put_resource_x_test_u64(image.body.image_envelope.request_tail + 8,
 									assertion_frame.common.assertion_sequence + 1);
@@ -18111,20 +18291,20 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);
 	UT_RUN(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt);
 	UT_RUN(test_resource_x_node_fanin_ignores_caller_deadline_and_retry_slice);
-	UT_RUN(test_resource_x_unbound_claim_wait_cannot_bypass_head_expiry);
+	UT_RUN(test_resource_x_unbound_wait_threshold_cannot_publish_claim);
 	UT_RUN(test_resource_x_ack_advances_lease_but_replays_do_not);
 	UT_RUN(test_resource_x_exact_ack_sample_before_retry_is_not_failure);
 	UT_RUN(test_resource_x_head_budget_and_owned_progress_are_independent);
-	UT_RUN(test_resource_x_round_wait_rechecks_progress_and_clips_head_lease);
+	UT_RUN(test_resource_x_round_wait_rechecks_progress_in_finite_slices);
 	UT_RUN(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact);
 	UT_RUN(test_resource_x_expired_follower_cannot_cancel_live_head);
 	UT_RUN(test_resource_x_post_ack_rejected_follower_preserves_shared_head);
 	UT_RUN(test_resource_x_t1_install_claim_binds_only_exact_physical_reservation);
 	UT_RUN(test_resource_x_direct_claim_joins_unbound_head_only_after_complete_beb);
 	UT_RUN(test_resource_x_requester_round_blocks_local_s_only_until_x_cached);
-	UT_RUN(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition);
+	UT_RUN(test_resource_x_bootstrap_threshold_keeps_same_acquisition);
 	UT_RUN(test_resource_x_failed_caller_cannot_join_later_head);
-	UT_RUN(test_resource_x_delivery_target_survives_head_failure);
+	UT_RUN(test_resource_x_delivery_target_survives_wait_threshold);
 	UT_RUN(test_resource_x_s_caller_retains_ack_local_proof_admission);
 	UT_RUN(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation);
 	UT_RUN(test_resource_x_dispatch_observation_projects_existing_claim_without_mutation);
@@ -18193,13 +18373,16 @@ main(void)
 	UT_RUN(test_resource_x_requester_join_uses_live_bootstrap_base_not_binding_floor);
 	UT_RUN(test_resource_x_image_authority_requires_live_head_and_exact_source);
 	UT_RUN(test_resource_x_remote_admission_binds_only_actual_image);
-	UT_RUN(test_resource_x_admitted_late_image_exact_deadline_is_stale);
-	UT_RUN(test_resource_x_late_delivery_requires_exact_cleanup_executor);
+	UT_RUN(test_resource_x_admitted_image_threshold_preserves_authority);
+	UT_RUN(test_resource_x_late_delivery_requires_exact_normal_executor);
 	UT_RUN(test_resource_x_actual_wait_does_not_reject_own_terminal_delivery);
 	UT_RUN(test_resource_x_terminal_delivery_holds_reference_until_release);
 	UT_RUN(test_resource_x_install_follow_waits_for_delivery_release);
 	UT_RUN(test_resource_x_delivery_release_before_sleep_and_original_deadline);
 	UT_RUN(test_resource_x_observed_step_preserves_strict_successor_proof);
+	UT_RUN(test_resource_x_wait_threshold_does_not_fail_owned_delivery);
+	UT_RUN(test_resource_x_delayed_image_uses_same_live_authority_after_threshold);
+	UT_RUN(test_resource_x_lost_image_replays_pair_after_physical_completion);
 	UT_RUN(test_resource_x_delivery_executor_excludes_caller_retransmit);
 	UT_RUN(test_resource_x_quiet_delivery_is_bounded_and_revisited_without_packets);
 	UT_RUN(test_resource_x_target_bind_after_exact_head_expiry_keeps_physical_owner);

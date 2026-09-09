@@ -598,6 +598,7 @@ typedef struct ResourceXTargetInstallContinuation {
 	uint64 acquisition_generation;
 	uint64 accepted_base_authority_generation;
 	uint64 observed_head_change_generation;
+	/* Original finite diagnostic threshold; not elapsed-only invalidation. */
 	uint64 caller_absolute_deadline_us;
 	uint64 requested_sleep_slice_us;
 	uint64 pending_ownership_generation;
@@ -1756,6 +1757,11 @@ extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_holder_pair_publish_exact(
 	const ResourceXAssertion *assertion, uint64 assertion_sequence,
 	int32 authenticated_master_node, uint64 authenticated_master_session);
+/* Replay only a published, undrained immutable pair. Occupied physical slots
+ * are validated and left untouched; an empty pair is rearmed atomically. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
 /* Non-authoritative former-source retry classifier.  It binds one retained
  * physical generation to the exact still-undrained PENDING/PUBLISHED pair
  * under the resource entry lock; callers must separately revalidate

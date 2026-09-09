@@ -387,12 +387,12 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 			UT_ASSERT(false);
 			return RESOURCE_X_APPLY_BAD_STATE;
 		}
-		/* The real enclosing loop rechecks caller history and deadline before
+		/* The real enclosing loop rechecks caller history and clock before
 		 * a new B. This fixture proves only the selected consumer's decision;
 		 * real history/terminal authority remain in test_cluster_pcm_lock. */
 		if (preassert_iterations > 1) {
-			if (preassert_now_us >= absolute_deadline_us)
-				return RESOURCE_X_APPLY_BAD_STATE;
+			if (preassert_now_us == 0 || preassert_now_us == UINT64_MAX)
+				return RESOURCE_X_APPLY_INVALID;
 			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(buf, &own), CLUSTER_PCM_OWN_OK);
 		}
 		result = RESOURCE_X_APPLY_APPLIED;
@@ -618,8 +618,7 @@ UT_TEST(test_real_pending_observation_rechecks_successor_and_preserves_refusals)
 			break;
 		case 7:
 			preassert_now_us = UINT64_C(234641943560);
-			expected = RESOURCE_X_APPLY_BAD_STATE;
-			iterations = 1;
+			preassert_wait_entry = &entry; /* The real owner releases after a wait. */
 			break;
 		case 8:
 			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
@@ -647,7 +646,7 @@ UT_TEST(test_real_pending_observation_rechecks_successor_and_preserves_refusals)
 		memcpy(unchanged.data, transition_page.data, BLCKSZ);
 		UT_ASSERT_EQ(preassert_consume(&buf, &before), expected);
 		UT_ASSERT_EQ(preassert_iterations, iterations);
-		UT_ASSERT_EQ(preassert_sleeps, variant == 2 ? 1 : 0);
+		UT_ASSERT_EQ(preassert_sleeps, variant == 2 || variant == 7 ? 1 : 0);
 		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
 		preassert_wait_entry = NULL;
 	}
@@ -711,8 +710,8 @@ UT_TEST(test_preassert_resample_is_not_an_identity_or_deadline_exception)
 						RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED, 100, 200));
 	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_INVALID,
 						100, 200));
-	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 200,
-						200));
+	UT_ASSERT(
+		RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 200, 200));
 	UT_ASSERT(
 		!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE, 0, 200));
 	UT_ASSERT(!RESAMPLE(&before, &live, CLUSTER_PCM_OWN_STALE, RESOURCE_X_TARGET_INSTALL_STALE,
@@ -770,6 +769,8 @@ UT_TEST(test_real_preassert_rechecks_changed_image_and_preserves_failures)
 			break;
 		case 2:
 			preassert_now_us = UINT64_C(234641943560);
+			expected = RESOURCE_X_APPLY_APPLIED;
+			iterations = 2;
 			break;
 		case 3:
 			pg_atomic_write_u64(&entry.generation, 11);
