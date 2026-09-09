@@ -20,6 +20,58 @@
 
 int cluster_node_id = 0;
 
+/* Link-only dependencies of unrelated bootstrap/migration entry points.
+ * This record/codec fixture must fail if one is reached, never synthesize
+ * a prepared root or a quorum-selected activation record. */
+ClusterControlRootResult
+cluster_control_root_activate_prepared(
+	const ClusterControlRootFileToken *expected_token pg_attribute_unused(),
+	const uint8 expected_round_sha256[32] pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootFileToken *out_token pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_control_root_build_migration_image(
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootMigrationImage *out pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_control_root_create_prepared(
+	const ClusterControlRootMigrationImage *image pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootFileToken *out_token pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_control_root_round_sha256(const ClusterControlRootMigrationRoundV1 *round
+									  pg_attribute_unused(),
+								  uint8 out_sha[PG_SHA256_DIGEST_LENGTH] pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterSemanticActivationResult
+cluster_qvotec_bootstrap_read_semantic_activation(
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES] pg_attribute_unused(),
+	bool *implicit_open pg_attribute_unused())
+{
+	abort();
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 /* The SQL entry pgrac_r4_bit22_cutover_begin (contract step ④e) references
  * superuser(); this binary does not link the backend superuser machinery. */
 bool
