@@ -1740,7 +1740,7 @@ UT_TEST(test_in_quorum_pre_shmem_init_false)
 	UT_ASSERT(!(cluster_qvotec_in_quorum()));
 }
 
-UT_TEST(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed)
+UT_TEST(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed)
 {
 	void (*publish)(uint64) = cluster_qvotec_test_publish_poll_lease;
 	TimestampTz saved_now = mock_now;
@@ -1760,17 +1760,19 @@ UT_TEST(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed)
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
 	publish(1000000);
 	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 24)), 1000000);
-	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 13000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 61000000);
 	memcpy(published, shmem_storage, sizeof(published));
 
-	/* The old four-second boundary is inside the approved live window. */
+	/* The old age boundaries are inside the approved laboratory window. */
 	mock_now = 5000000;
 	UT_ASSERT(cluster_qvotec_in_quorum());
-	mock_now = 12999999;
-	UT_ASSERT(cluster_qvotec_in_quorum());
 	mock_now = 13000000;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	mock_now = 60999999;
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	mock_now = 61000000;
 	UT_ASSERT(!cluster_qvotec_in_quorum());
-	mock_now = 13000001;
+	mock_now = 61000001;
 	UT_ASSERT(!cluster_qvotec_in_quorum());
 	UT_ASSERT_EQ(memcmp(published, shmem_storage, sizeof(published)), 0);
 
@@ -1787,7 +1789,7 @@ UT_TEST(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed)
 	/* Only the existing publisher renews; it does not turn a LOST state OK. */
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_LOST);
 	publish(14000000);
-	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 26000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 74000000);
 	UT_ASSERT_EQ(cluster_qvotec_get_quorum_state(), CLUSTER_QVOTEC_QUORUM_LOST);
 	UT_ASSERT(!cluster_qvotec_in_quorum());
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
@@ -1896,16 +1898,16 @@ UT_TEST(test_qvotec_poll_pre_injection_only_target_and_once)
 	UT_ASSERT_EQ(poll_injection_hits, 2);
 	poll_injection_armed = false;
 	poll_pre();
-	poll_injection_param = 14000000;
+	poll_injection_param = 64000000;
 	poll_injection_armed = true;
 	poll_pre();
 	poll_pre();
 	UT_ASSERT_EQ(injected_sleeps, 3);
-	UT_ASSERT_EQ(injected_sleep_us, 14000000);
+	UT_ASSERT_EQ(injected_sleep_us, 64000000);
 	UT_ASSERT_EQ(poll_injection_hits, 3);
 	poll_injection_armed = false;
 	poll_pre();
-	poll_injection_param = 14000001;
+	poll_injection_param = 64000001;
 	poll_injection_armed = true;
 	poll_pre();
 	poll_pre();
@@ -3369,7 +3371,7 @@ main(void)
 	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
 	UT_RUN(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_owner);
 	UT_RUN(test_passive_quorum_observation_neither_renews_nor_logs);
-	UT_RUN(test_quorum_lease_six_polls_preserves_exact_expiry_and_fail_closed);
+	UT_RUN(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
 	UT_RUN(test_in_quorum_initializing_state_false);
 	UT_RUN(test_in_quorum_frozen_flag_overrides_to_false);

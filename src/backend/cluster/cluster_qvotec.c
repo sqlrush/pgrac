@@ -404,13 +404,13 @@ qvotec_pgstat_lookup_all(void)
 #define CLUSTER_QVOTEC_DEFAULT_POLL_INTERVAL_MS 2000
 
 /*
- * The real poll owner publishes a six-period local lease. Observers never
+ * The real poll owner publishes a thirty-period laboratory lease. Observers never
  * renew it. This is PGRAC policy, not a verified Oracle internal lease value.
  */
 static void
 qvotec_publish_poll_lease(uint64 now_us)
 {
-	uint64 next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 6 * 1000ULL;
+	uint64 next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL;
 
 	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
 	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
@@ -421,7 +421,7 @@ qvotec_publish_poll_lease(uint64 now_us)
  * the disk cycle makes the effective period `cycle work + interval`, which can
  * needlessly consume lease margin even though the dedicated qvotec is progressing.
  * A cycle that itself consumes the interval runs the successor immediately;
- * an actual cycle lasting six intervals still expires the lease and remains
+ * an actual cycle lasting thirty intervals still expires the lease and remains
  * fail-closed.
  */
 static long
@@ -476,7 +476,7 @@ qvotec_poll_pre_injection(void)
 	}
 	consumed = true;
 	if (type != CLUSTER_FAULT_SLEEP || !cluster_cr_injection_armed(point, &delay_us)
-		|| delay_us == 0 || delay_us > 14000000ULL) {
+		|| delay_us == 0 || delay_us > 64000000ULL) {
 		elog(WARNING, "qvotec poll-pre injection requires one bounded sleep");
 		return;
 	}
@@ -977,7 +977,7 @@ cluster_qvotec_get_collision_state_name(void)
  *	  (a) shmem live
  *	  (b) quorum_state == OK
  *	  (c) now < lease_expire_at_us  (qvotec polled within
- *	      6 × poll_interval — defends against qvotec hung)
+ *	      30 × poll_interval — laboratory window, still expires if qvotec hangs)
  *
  *	Any other state — INITIALIZING / UNCERTAIN / LOST / lease
  *	expired / shmem absent — returns false → backend fail-closed.
