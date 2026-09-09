@@ -59,6 +59,14 @@ static int transition_base_pins;
 static int transition_flush_count;
 static bool transition_flush_error;
 static bool transition_flush_leaves_dirty;
+static bool transition_copy_active;
+static bool transition_wal_error;
+static int transition_wal_calls;
+static int transition_wal_changes;
+#ifdef USE_CLUSTER_UNIT
+void (*cluster_gcs_block_test_xlog_flush_hook)(uint64 page_lsn) = NULL;
+int (*cluster_gcs_block_test_lsn_drift_hook)(void) = NULL;
+#endif
 static bool cluster_pcm_x_finish_retain_flush_active;
 static bool cluster_pcm_x_finish_retain_flush_io_active;
 static bool cluster_pcm_x_finish_retain_flush_error_context_pushed;
@@ -146,7 +154,7 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 		transition_mapping_held = true;
 	} else {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
-		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT_EQ(mode, transition_copy_active ? LW_SHARED : LW_EXCLUSIVE);
 		if (transition_content_busy)
 			return false;
 		UT_ASSERT(!transition_content_held);
@@ -195,7 +203,7 @@ transition_flush(BufferDesc *buf)
 
 	UT_ASSERT(transition_content_held);
 	UT_ASSERT_EQ(transition_pin_count, transition_base_pins + 1);
-	UT_ASSERT(cluster_pcm_x_finish_retain_flush_active);
+	UT_ASSERT(transition_copy_active || cluster_pcm_x_finish_retain_flush_active);
 	UT_ASSERT((state & BM_LOCKED) == 0);
 	transition_flush_count++;
 	if (transition_flush_error) {
@@ -214,6 +222,27 @@ transition_abort_io(Buffer buffer)
 	UT_ASSERT_EQ(buffer, BufferDescriptorGetBuffer(transition_buf));
 	pg_atomic_fetch_and_u32(&transition_buf->state, ~BM_IO_IN_PROGRESS);
 	pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_ERROR);
+}
+
+/* Simulate only a concurrent page writer during the real owner's unlocked
+ * WAL interval. Sampling, current-image validation and cleanup stay real. */
+static void
+transition_wal_flush(XLogRecPtr lsn)
+{
+	Page page = (Page)transition_page.data;
+
+	UT_ASSERT(transition_copy_active);
+	UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	UT_ASSERT_EQ(transition_pin_count, 1);
+	UT_ASSERT_EQ(lsn, PageGetLSN(page));
+	transition_wal_calls++;
+	if (transition_wal_error)
+		pg_re_throw();
+	if (transition_wal_changes > 0) {
+		transition_wal_changes--;
+		PageSetLSNPreserveOrigin(page, lsn + UINT64_C(8));
+		pg_atomic_fetch_or_u32(&transition_buf->state, BM_DIRTY);
+	}
 }
 
 /* The real DROP owner has already checked and committed N. Only the mapping
@@ -245,6 +274,8 @@ transition_drop_tail(BufferDesc *buf, uint32 state)
 #define cluster_bufmgr_pin_for_gcs_locked transition_pin_locked
 #define cluster_bufmgr_unpin_for_gcs transition_unpin
 #define FlushBuffer(buf, rel, object, context) transition_flush(buf)
+#define XLogFlush(lsn) transition_wal_flush(lsn)
+#define cluster_gcs_clamp_ship_flush_lsn(lsn) (lsn)
 #define AbortBufferIO transition_abort_io
 #define InvalidateBufferCommitTailLocked(buf, tag, hash, lock, state, pcm, io)                     \
 	transition_drop_tail(buf, state)
@@ -268,6 +299,8 @@ transition_drop_tail(BufferDesc *buf, uint32 state)
 #undef InvalidateBufferCommitTailLocked
 #undef AbortBufferIO
 #undef FlushBuffer
+#undef cluster_gcs_clamp_ship_flush_lsn
+#undef XLogFlush
 #undef cluster_bufmgr_unpin_for_gcs
 #undef cluster_bufmgr_pin_for_gcs_locked
 #undef LWLockHeldByMeInMode
@@ -1155,8 +1188,122 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_flush_count = 0;
 	transition_flush_error = false;
 	transition_flush_leaves_dirty = false;
+	transition_copy_active = false;
+	transition_wal_error = false;
+	transition_wal_calls = 0;
+	transition_wal_changes = 0;
 	cluster_pcm_x_finish_retain_flush_active = false;
 	cluster_pcm_x_finish_retain_flush_io_active = false;
+}
+
+UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnSnapshot ignored;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	PGIOAlignedBlock output;
+	PGIOAlignedBlock sentinel;
+	GcsBlockReplyStatus statuses[3];
+	ClusterBufmgrGcsCopyRefusal refusal;
+	XLogRecPtr copied_lsn;
+	uint64 generation;
+	int attempt;
+
+	transition_fixture(&buf, &entry, &ignored, false);
+	transition_copy_active = true;
+	buf.pcm_state = PCM_STATE_X;
+	buf.buffer_type = BUF_TYPE_XCUR;
+	pg_atomic_write_u32(&entry.flags, 0);
+	generation = pg_atomic_read_u64(&entry.generation);
+	memset(sentinel.data, 0xa5, BLCKSZ);
+	for (attempt = 0; attempt < 3; attempt++) {
+		memcpy(output.data, sentinel.data, BLCKSZ);
+		copied_lsn = UINT64_C(0xdead);
+		transition_wal_changes = 2;
+		UT_ASSERT(!cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal));
+		statuses[attempt] = GcsBlockMasterDirectCopyRefusalStatus(refusal);
+		UT_ASSERT_EQ(copied_lsn, UINT64_C(0xdead));
+		UT_ASSERT_EQ(memcmp(output.data, sentinel.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(transition_wal_calls, 2 * (attempt + 1));
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	}
+
+	/* The next actual attempt must earn an image, not merely report success
+	 * after the prior retry. The pending dirty image is physically flushed. */
+	UT_ASSERT(cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal));
+	UT_ASSERT_EQ(memcmp(output.data, transition_page.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(copied_lsn, UINT64_C(0x12370));
+	UT_ASSERT_EQ(refusal, CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE);
+	UT_ASSERT_EQ(transition_wal_calls, 7);
+	UT_ASSERT_EQ(transition_flush_count, 1);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entry.generation), generation);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry.flags), 0);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	ClusterPcmOwnArray = saved;
+	for (attempt = 0; attempt < 3; attempt++)
+		UT_ASSERT_EQ(statuses[attempt], GCS_BLOCK_REPLY_DENIED_PENDING_X);
+}
+
+UT_TEST(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals)
+{
+	int scenario;
+
+	for (scenario = 0; scenario < 4; scenario++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot ignored;
+		ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		ClusterBufmgrGcsCopyRefusal refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+		PGIOAlignedBlock output;
+		BufferTag tag;
+		XLogRecPtr copied_lsn = UINT64_C(0xdead);
+		volatile bool threw = false;
+		volatile bool copied = false;
+
+		transition_fixture(&buf, &entry, &ignored, false);
+		transition_copy_active = true;
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_write_u32(&entry.flags, 0);
+		tag = buf.tag;
+		if (scenario == 0)
+			tag.blockNum++;
+		else if (scenario == 1)
+			buf.pcm_state = PCM_STATE_N;
+		else if (scenario == 2)
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		else
+			transition_wal_error = true;
+		memset(output.data, 0xa5, BLCKSZ);
+		PG_TRY();
+		{
+			copied = cluster_bufmgr_copy_block_for_gcs(tag, &copied_lsn, output.data, &refusal);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		ClusterPcmOwnArray = saved;
+		UT_ASSERT(!copied);
+		UT_ASSERT_EQ(threw, scenario == 3);
+		UT_ASSERT_EQ(copied_lsn, UINT64_C(0xdead));
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		if (scenario != 3)
+			UT_ASSERT_EQ(GcsBlockMasterDirectCopyRefusalStatus(refusal),
+						 GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER);
+	}
+	/* The separate exclusive-copy drift retains its hard classification. */
+	UT_ASSERT_EQ(
+		GcsBlockMasterDirectCopyRefusalStatus(CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT),
+		GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER);
 }
 
 static void
@@ -5419,7 +5566,7 @@ UT_TEST(test_gcs_ship_copy_reports_exact_nonblocking_refusal_stage)
 			"CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID",
 			"CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST",
 			"CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND",
-			"CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT" };
+			"CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED" };
 	char *source = read_bufmgr_source();
 	const char *copy
 		= source != NULL ? strstr(source, "\ncluster_bufmgr_copy_block_for_gcs(") : NULL;
@@ -5429,7 +5576,7 @@ UT_TEST(test_gcs_ship_copy_reports_exact_nonblocking_refusal_stage)
 
 	/* P0-21 observation contract: every nonblocking false return that can
 	 * become holder-side DENIED_MASTER_NOT_HOLDER identifies the precise
-	 * residency/current-image/content-lock/HC89 refusal stage. */
+	 * residency/current-image/content-lock/WAL-recheck refusal stage. */
 	UT_ASSERT_NOT_NULL(copy);
 	UT_ASSERT_NOT_NULL(copy_end);
 	if (copy != NULL && copy_end != NULL) {
@@ -5756,7 +5903,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(110);
 	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
 	UT_RUN(test_real_pending_recapture_keeps_original_observation);
 	UT_RUN(test_real_pending_observation_rechecks_successor_and_preserves_refusals);
@@ -5865,6 +6012,8 @@ main(void)
 	UT_RUN(test_pcm_x_retain_flush_error_injection_is_exact_and_pre_write);
 	UT_RUN(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple);
 	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
+	UT_RUN(test_real_gcs_wal_recheck_yields_without_exporting_an_image);
+	UT_RUN(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

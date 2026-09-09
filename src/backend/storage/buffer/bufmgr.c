@@ -12066,7 +12066,9 @@ cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal)
 			return "smart_fusion_unclassified";
 		case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT:
 			return "injected_evict";
-	}
+		case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED:
+			return "wal_recheck_changed";
+		}
 	return "unknown";
 }
 
@@ -12448,8 +12450,10 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
 				break;
 			}
+			/* The content lock was released for WAL flush.  A changed LSN
+			 * invalidates this attempt, not the holder's authority. */
 			if (out_refusal != NULL)
-				*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT;
+				*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED;
 			LWLockRelease(content_lock);
 			content_locked = false;
 			/* fall through: retry once if budget remains */

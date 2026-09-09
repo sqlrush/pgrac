@@ -3858,20 +3858,23 @@ typedef enum ClusterBufmgrGcsCopyRefusal {
 	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY,
 	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT,
 	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED,
-	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT,
+	CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED
 } ClusterBufmgrGcsCopyRefusal;
 
 /* A DATA worker cannot wait for BufferContent: its owner may itself be waiting
  * for that worker to deliver a reply.  This mapping is shared by master-direct
- * and holder-forward DATA replies.  Only the two conditional-lock misses are
- * retryable through the established fresh reservation/request boundary.
- * Residency/current-image failures remain structural, while HC89 keeps its
- * explicit one-retry hot-page bound. */
+ * and holder-forward DATA replies.  Conditional-lock misses and a changed LSN
+ * across the unlocked WAL-flush interval yield through the established fresh
+ * reservation/request boundary.  The local copy attempt remains bounded.
+ * Residency/current-image failures and HC89 drift under content EXCLUSIVE
+ * remain hard refusals. */
 static inline GcsBlockReplyStatus
 GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 {
 	if (refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
-		|| refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
+		|| refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND
+		|| refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED)
 		return GCS_BLOCK_REPLY_DENIED_PENDING_X;
 	return GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 }

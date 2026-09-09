@@ -2501,6 +2501,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_bump_locked\(/ { print "static inline ClusterPcmOwnResult"; emit=1; bump++ } \
 	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; evict++ } \
 	     /^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^cluster_bufmgr_copy_block_for_gcs\(/ { print "bool"; emit=1; wal_copy++ } \
 	     /^cluster_bufmgr_pcm_direct_init_known_new_locked\(/ { print "static bool"; emit=1; known_new++ } \
 	     /^cluster_bufmgr_pcm_own_snapshot_by_tag\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_lookup++ } \
 	     /^cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact\(/ { print "ClusterPcmOwnResult"; emit=1; direct_lookup++ } \
@@ -2525,7 +2526,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_release_read_image_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_release++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile

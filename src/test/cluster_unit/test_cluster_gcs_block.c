@@ -2099,6 +2099,7 @@ UT_TEST(test_master_direct_copy_busy_uses_only_fresh_identity_retry_boundary)
 		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
 		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT,
 		  GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER },
+		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED, GCS_BLOCK_REPLY_DENIED_PENDING_X },
 	};
 	char *source = read_gcs_block_source();
 	const char *produce = source != NULL ? strstr(source, "\ngcs_block_produce_reply(") : NULL;

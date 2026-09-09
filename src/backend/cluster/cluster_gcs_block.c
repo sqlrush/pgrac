@@ -8696,9 +8696,10 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf, bool
 
 	/*
 	 * D4 bufmgr helper performs HC82 XLogFlush(page_lsn) + content_lock dance
-	 * + HC89 single-retry revalidation.  Conditional BufferContent refusal is
-	 * retried by the owning backend with a fresh reservation/request identity;
-	 * structural and HC89 exhaustion remain DENIED_MASTER_NOT_HOLDER.
+	 * + single-retry revalidation.  Conditional BufferContent refusal and an
+	 * LSN change across the unlocked WAL interval are retried by the owning
+	 * backend with a fresh reservation/request identity.  Structural failures
+	 * and HC89 drift under content EXCLUSIVE remain DENIED_MASTER_NOT_HOLDER.
 	 */
 	if (!preprepared_image
 		&& !gcs_block_get_ship_image(req->tag, req->sender_node, true, out_page_lsn, block_buf,
