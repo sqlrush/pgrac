@@ -13775,6 +13775,9 @@ gcs_block_resource_x_target_acquire_internal(
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
 	uint64 diagnostic_request_sequence = 0;
+	uint64 diagnostic_follow_attempt = 0;
+	uint64 diagnostic_follow_generation = 0;
+	uint64 diagnostic_follow_token = 0;
 	uint64 master_session = 0;
 	uint64 rebound_master_session = 0;
 	uint64 terminal_master_session = 0;
@@ -14055,6 +14058,11 @@ gcs_block_resource_x_target_acquire_internal(
 						break;
 					}
 					if (target_install_follow.valid) {
+						diagnostic_stage = "target-install-follow-classify";
+						diagnostic_follow_attempt = target_install_follow.acquisition_generation;
+						diagnostic_follow_generation
+							= target_install_follow.expected_x_ownership_generation;
+						diagnostic_follow_token = target_install_follow.reservation_token;
 						target_install_observation_result
 							= gcs_block_resource_x_target_install_classify_coherent(
 								buf, &target_install_follow, &own,
@@ -14402,6 +14410,7 @@ gcs_block_resource_x_target_acquire_internal(
 							 * predicate; the master still selects DURABLE_STORAGE and
 							 * the requester installs only after the exact grant. */
 							memset(&failure_live, 0, sizeof(failure_live));
+							diagnostic_stage = "n-assertion-candidate";
 							n_candidate_result
 								= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 									buf, &own, &failure_live);
@@ -15225,39 +15234,45 @@ gcs_block_resource_x_target_acquire_internal(
 		ereport(
 			LOG,
 			(errmsg_internal("Resource-X target acquire diagnostic"),
-			 errdetail("stage=%s result=%d action=%d wait=%d ownership_loss=%d "
-					   "stage_ok=%s requester=%d master=%d buffer=%d tag=%u/%u/%u/%d/%u "
-					   "formation=%llu session=%llu r4_generation=%llu "
-					   "requester_connection=%u master_connection=%u peer_open_reason=%d "
-					   "preflight_session_check=%d "
-					   "dispatch_recheck_mask=0x%08x requester_recheck=%u "
-					   "master_recheck=%u "
-					   "terminal_admission_current=%s terminal_session_check=%d "
-					   "terminal_gate_current=%s terminal_master=%d "
-					   "terminal_session=%llu "
-					   "own_state=%u "
-					   "own_flags=%u own_generation=%llu own_writer_token=%llu "
-					   "own_resource_x_generation=%llu now=%llu deadline=%llu "
-					   "caller_joined_attempt=%llu caller_failed_attempt=%llu",
-					   diagnostic_stage, (int)result, (int)action, (int)wait_result,
-					   (int)ownership_loss_result, stage_ok ? "true" : "false",
-					   assertion.requester_node, master_node, buf->buf_id, resource.spcOid,
-					   resource.dbOid, resource.relNumber, (int)resource.forkNum, resource.blockNum,
-					   (unsigned long long)gate.formation, (unsigned long long)master_session,
-					   (unsigned long long)admission_record_generation,
-					   requester_sender_connection_generation, master_ingress_connection_generation,
-					   (int)peer_open_result, (int)preflight_session_check,
-					   dispatch_recheck_failure_mask, requester_sender_recheck,
-					   master_ingress_recheck, terminal_admission_current ? "true" : "false",
-					   (int)terminal_session_check,
-					   terminal_gate_session_current ? "true" : "false", terminal_master_node,
-					   (unsigned long long)terminal_master_session, (unsigned)own.pcm_state,
-					   (unsigned)own.flags, (unsigned long long)own.generation,
-					   (unsigned long long)own.writer_activation_token,
-					   (unsigned long long)own.resource_x_activation_generation,
-					   (unsigned long long)now_us, (unsigned long long)absolute_deadline_us,
-					   (unsigned long long)caller_witness.joined_request.assertion_sequence,
-					   (unsigned long long)caller_witness.failed_attempt)));
+			 errdetail(
+				 "stage=%s result=%d action=%d wait=%d ownership_loss=%d "
+				 "stage_ok=%s requester=%d master=%d buffer=%d tag=%u/%u/%u/%d/%u "
+				 "formation=%llu session=%llu r4_generation=%llu "
+				 "requester_connection=%u master_connection=%u peer_open_reason=%d "
+				 "preflight_session_check=%d "
+				 "dispatch_recheck_mask=0x%08x requester_recheck=%u "
+				 "master_recheck=%u "
+				 "terminal_admission_current=%s terminal_session_check=%d "
+				 "terminal_gate_current=%s terminal_master=%d "
+				 "terminal_session=%llu "
+				 "own_state=%u "
+				 "own_flags=%u own_generation=%llu own_writer_token=%llu "
+				 "own_resource_x_generation=%llu now=%llu deadline=%llu "
+				 "caller_joined_attempt=%llu caller_failed_attempt=%llu "
+				 "follow_attempt=%llu follow_expected_x_generation=%llu follow_token=%llu "
+				 "follow_state=%d own_buffer_type=%u own_semantic_state=%u",
+				 diagnostic_stage, (int)result, (int)action, (int)wait_result,
+				 (int)ownership_loss_result, stage_ok ? "true" : "false", assertion.requester_node,
+				 master_node, buf->buf_id, resource.spcOid, resource.dbOid, resource.relNumber,
+				 (int)resource.forkNum, resource.blockNum, (unsigned long long)gate.formation,
+				 (unsigned long long)master_session,
+				 (unsigned long long)admission_record_generation,
+				 requester_sender_connection_generation, master_ingress_connection_generation,
+				 (int)peer_open_result, (int)preflight_session_check, dispatch_recheck_failure_mask,
+				 requester_sender_recheck, master_ingress_recheck,
+				 terminal_admission_current ? "true" : "false", (int)terminal_session_check,
+				 terminal_gate_session_current ? "true" : "false", terminal_master_node,
+				 (unsigned long long)terminal_master_session, (unsigned)own.pcm_state,
+				 (unsigned)own.flags, (unsigned long long)own.generation,
+				 (unsigned long long)own.writer_activation_token,
+				 (unsigned long long)own.resource_x_activation_generation,
+				 (unsigned long long)now_us, (unsigned long long)absolute_deadline_us,
+				 (unsigned long long)caller_witness.joined_request.assertion_sequence,
+				 (unsigned long long)caller_witness.failed_attempt,
+				 (unsigned long long)diagnostic_follow_attempt,
+				 (unsigned long long)diagnostic_follow_generation,
+				 (unsigned long long)diagnostic_follow_token, (int)target_install_follow_state,
+				 (unsigned)own.buffer_type, (unsigned)own.semantic_buf_state)));
 	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
 		gcs_resource_x_acquire_diagnostic.buffer_id = buf->buf_id;
 		gcs_resource_x_acquire_diagnostic.result = result;

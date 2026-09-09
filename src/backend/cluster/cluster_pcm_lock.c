@@ -14151,6 +14151,44 @@ pcm_resource_x_target_install_terminal_observation_exact(
 		&& observed->resource_x_activation_generation == 0;
 }
 
+/* A process-local observer may miss any number of completed acquisitions.
+ * Use the same exact-owner closed floor as caller history, not a predicted
+ * physical generation or the retired acquisition floor (which also includes
+ * failed cleanup). This authorizes only discarding the observation; every
+ * later caller iteration must acquire and validate current authority anew. */
+static bool
+pcm_resource_x_target_install_observation_retired_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
+	const ResourceXTargetInstallContinuation *continuation, const ResourceXAssertion *assertion)
+{
+	uint64 attempt = continuation->acquisition_generation;
+	const ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if ((continuation->capture_flags & RESOURCE_X_TARGET_INSTALL_CAPTURE_DIRECT_INIT) != 0
+		|| round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+		|| round->highest_attempt_floor == UINT64_MAX
+		|| round->cancelled_attempt_floor > round->highest_attempt_floor
+		|| attempt > round->cancelled_attempt_floor || attempt <= round->failed_attempt_floor
+		|| (entry->resource_x_progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0
+		|| (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0
+		|| !pcm_resource_x_local_owner_valid_locked(owner)
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(continuation->resource_formation))
+		return false;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		return owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY;
+	return round->request.assertion_sequence > attempt
+		   && round->request.assertion_sequence == round->highest_attempt_floor
+		   && pcm_resource_x_node_request_key_matches_locked(
+			   round, assertion, continuation->master_node, continuation->resource_formation,
+			   continuation->master_session_incarnation, continuation->r4_record_generation,
+			   continuation->requester_sender_connection_generation,
+			   continuation->master_ingress_connection_generation)
+		   && (owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY
+			   || pcm_resource_x_local_owner_round_exact_locked(entry, round));
+}
+
 /* A terminal receipt may outlive the old requester binding for only one
  * reason admitted here: its exact X carrier completed one ownership-generation
  * transfer after zero or more reversible token cycles and the old acquisition
@@ -14400,6 +14438,11 @@ pcm_resource_x_target_install_classify_locked(
 	owner = &entry->resource_x_local_owner;
 	if (!pcm_resource_x_local_owner_valid_locked(owner))
 		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (continuation->acquisition_generation <= round->failed_attempt_floor)
+		return RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+	if (pcm_resource_x_target_install_observation_retired_locked(entry, round, continuation,
+																 assertion))
+		return RESOURCE_X_TARGET_INSTALL_RESAMPLE;
 	postpreuse_observation
 		= pcm_resource_x_target_install_postpreuse_observation_exact(
 			continuation, observed);
@@ -14718,9 +14761,12 @@ pcm_resource_x_target_install_wait_recheck_locked(
 			& ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
-		|| (entry->resource_x_progress_flags
-			& RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		|| continuation->acquisition_generation <= round->failed_attempt_floor
+		|| (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (pcm_resource_x_target_install_observation_retired_locked(entry, round, continuation,
+																 assertion))
+		return RESOURCE_X_APPLY_DUPLICATE;
 
 	memset(&expected_ref, 0, sizeof(expected_ref));
 	expected_ref.assertion = *assertion;
