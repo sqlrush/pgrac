@@ -15514,6 +15514,60 @@ cluster_bufmgr_pcm_own_held_x_revoke_valid(
 		&& held->revoking.reservation_token != 0;
 }
 
+/* The active executor or the exact shared DEFERRED owner owns one service
+ * pin. Validate it without either releasing it or taking a substitute pin. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_validate_held_x_revoke(const ClusterPcmOwnHeldXRevoke *held)
+{
+	BufferDesc *buf;
+	uint32 state;
+	ClusterPcmOwnResult result;
+
+	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
+		return CLUSTER_PCM_OWN_INVALID;
+	buf = GetBufferDescriptor(held->buffer_id);
+	state = LockBufHdr(buf);
+	if (!cluster_pcm_own_fence_matches_locked(buf, &held->revoking)
+		|| (state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (BUF_STATE_GET_REFCOUNT(state) == 0 || (state & BM_IO_ERROR) != 0
+		|| !cluster_bufmgr_pcm_current_image_locked(buf, state)
+		|| held->revoking.writer_activation_token != 0
+		|| held->revoking.resource_x_activation_generation != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else
+		result = CLUSTER_PCM_OWN_OK;
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
+/* Only the winning logical claim may call this. It already owns the recorded
+ * pin, including the obligation to release it after fail-closed on mismatch.
+ * No mapping lookup, refcount increment, revoke token or page copy occurs. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_adopt_held_x_revoke(int buffer_id,
+	const ResourceXLocalOwnerHandle *owner, ClusterPcmOwnHeldXRevoke *held_out)
+{
+	if (held_out != NULL)
+		memset(held_out, 0, sizeof(*held_out));
+	if (owner == NULL || held_out == NULL || buffer_id < 0 || buffer_id >= NBuffers
+		|| owner->buffer_ownership_generation == 0 || owner->buffer_ownership_generation == UINT64_MAX
+		|| owner->reservation_token == 0 || owner->reservation_token >= UINT64_MAX - 1
+		|| cluster_pcm_x_revoke_finish_mode(&owner->ref.assertion.resource, 0)
+			!= CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
+		return CLUSTER_PCM_OWN_INVALID;
+	held_out->buffer_id = buffer_id;
+	held_out->flags = CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK;
+	held_out->revoking.tag = owner->ref.assertion.resource;
+	held_out->revoking.generation = owner->buffer_ownership_generation;
+	held_out->revoking.reservation_token = owner->reservation_token + 1;
+	held_out->revoking.flags = PCM_OWN_FLAG_REVOKING;
+	held_out->revoking.pcm_state = (uint8)PCM_STATE_X;
+	VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(GetBufferDescriptor(buffer_id)), BLCKSZ);
+	return cluster_bufmgr_pcm_own_validate_held_x_revoke(held_out);
+}
+
+
 /* Bind tag -> descriptor and take the caller's raw pin before beginning the
  * exact X revoke.  This narrow handle is for retained MAIN/INIT images only;
  * VM/FSM keep their zero-refcount drop contract. */
@@ -15684,8 +15738,9 @@ cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(
 }
 
 /* Post-arm finish.  Success proves the exact N+PI successor before releasing
- * the long-lived pin.  Failure deliberately leaves the handle live so the
- * caller must first fail-close and then use the abandon boundary. */
+ * the long-lived pin. Failure leaves the handle live: proved transient BUSY
+ * can transfer it to the shared deferred owner; every hard failure requires
+ * fail-closed before the abandon boundary. */
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,
@@ -15924,10 +15979,15 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
-		result = CLUSTER_PCM_OWN_BUSY;
 	else if ((buf_state & BM_IO_ERROR) != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
+		if (out_refusal != NULL) {
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS;
+			out_refusal->bm_io_in_progress = true;
+		}
+		result = CLUSTER_PCM_OWN_BUSY;
+	}
 	else {
 		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
 		caller_pinned = true;
@@ -15941,6 +16001,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		if (out_refusal != NULL)
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK;
 		cluster_bufmgr_unpin_for_gcs(buf);
 		return CLUSTER_PCM_OWN_BUSY;
 	}
@@ -15954,10 +16016,15 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			result = CLUSTER_PCM_OWN_STALE;
 		else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 			result = CLUSTER_PCM_OWN_CORRUPT;
-		else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
-			result = CLUSTER_PCM_OWN_BUSY;
 		else if ((buf_state & BM_IO_ERROR) != 0)
 			result = CLUSTER_PCM_OWN_CORRUPT;
+		else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
+			if (out_refusal != NULL) {
+				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS;
+				out_refusal->bm_io_in_progress = true;
+			}
+			result = CLUSTER_PCM_OWN_BUSY;
+		}
 		else if (PageGetLSN((Page)BufHdrGetBlock(buf)) != expected_lsn)
 			result = CLUSTER_PCM_OWN_STALE;
 		else {
@@ -16018,10 +16085,15 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 					result = CLUSTER_PCM_OWN_STALE;
 				else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 					result = CLUSTER_PCM_OWN_CORRUPT;
-				else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
-					result = CLUSTER_PCM_OWN_BUSY;
 				else if ((buf_state & BM_IO_ERROR) != 0)
 					result = CLUSTER_PCM_OWN_CORRUPT;
+				else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
+					if (out_refusal != NULL) {
+						out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS;
+						out_refusal->bm_io_in_progress = true;
+					}
+					result = CLUSTER_PCM_OWN_BUSY;
+				}
 				else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
 					result = CLUSTER_PCM_OWN_BUSY;
 				else if (PageGetLSN((Page)BufHdrGetBlock(buf)) != expected_lsn)

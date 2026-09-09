@@ -673,6 +673,12 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			(void)cluster_gcs_block_resource_x_delivery_tick(&delivery);
 			continue;
 		}
+		if (probe_result == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
+			/* Pin ownership is claimed after all scan locks have been dropped.
+			 * A repeated BUSY consumes one call, not a wire slot or self-wake. */
+			(void)cluster_gcs_block_resource_x_source_finish_tick(&delivery);
+			continue;
+		}
 		if (probe_result != RESOURCE_X_INTENT_PROBE_FOUND)
 			break;
 		now_us = lms_outbound_monotonic_us();

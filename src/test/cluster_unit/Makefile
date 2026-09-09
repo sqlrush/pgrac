@@ -2449,8 +2449,24 @@ test_cluster_pcm_source_replay.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (found != 1 || emit) exit 1 }' $< > $@
 
+test_cluster_pcm_source_replay_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^\t\t\t\treplay_result$$/ { emit=1; begin++ } \
+	     emit && /^\t\t\t}/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_source_owner_layout.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
+	awk '/^typedef struct ClusterPcmResourceXLocalHandoff / { emit=1; handoff++ } \
+	     /^typedef struct ClusterPcmResourceXLocalOwner / { emit=1; owner++ } \
+	     emit { print } /^} ClusterPcmResourceXLocal/ { emit=0 } \
+	     END { if (handoff != 1 || owner != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_source_owner_layout.inc \
 		test_cluster_pcm_source_replay.inc \
+		test_cluster_pcm_source_replay_consumer.inc \
 		test_cluster_pcm_ready_scheduler.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
@@ -2492,6 +2508,12 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_activate_x_by_tag\(/ { print "ResourceXBufferActivationResult"; emit=1; activate++ } \
 	     /^cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact\(/ { print "ResourceXBufferActivationResult"; emit=1; clear++ } \
 	     /^cluster_bufmgr_pcm_own_copy_source_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; copy++ } \
+	     /^cluster_bufmgr_pcm_own_held_x_revoke_valid\(/ { print "static bool"; emit=1; held_valid++ } \
+	     /^cluster_bufmgr_pcm_own_validate_held_x_revoke\(/ { print "ClusterPcmOwnResult"; emit=1; held_validate++ } \
+	     /^cluster_bufmgr_pcm_own_adopt_held_x_revoke\(/ { print "ClusterPcmOwnResult"; emit=1; held_adopt++ } \
+	     /^cluster_bufmgr_pcm_own_finish_held_x_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; held_finish++ } \
+	     /^cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed\(/ { print "ClusterPcmOwnResult"; emit=1; held_abandon++ } \
+	     /^cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned\(/ { print "static ClusterPcmOwnResult"; emit=1; drop++ } \
 	     /^cluster_bufmgr_pcm_own_finish_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; finish++ } \
 	     /^cluster_bufmgr_pcm_own_delivery_hold_begin_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_begin++ } \
 	     /^cluster_bufmgr_pcm_own_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; normal_reserve++ } \
@@ -2503,7 +2525,13 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_release_read_image_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_release++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_preassert_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2547,6 +2575,7 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_source_finish_consumer.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_pcm_checksum_owner.inc test_cluster_pcm_delivery_route_owner.inc $(CLUSTER_PCM_OWN_O)

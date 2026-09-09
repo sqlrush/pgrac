@@ -9651,26 +9651,206 @@ gcs_block_resource_x_retained_pair_replay(const ResourceXAssertion *assertion, u
 	return result;
 }
 
-/* The source fence is established before copying.  Before L3 it is the local
- * tag gate; after L3 an exact terminal-X lineage plus a caller-held raw pin
- * and REVOKING token cover the same window.  The retained status and image
- * are committed atomically before source->N.  A post-arm failure never aborts
- * or reopens X; the target-only tagless branch cannot adopt a prior call's
- * untracked pin and therefore fails closed instead of retrying that finish. */
+/* The initial callback and the winning LMS retry use one finish/publish
+ * boundary. Ownership of the supplied pin and local handle moves into this
+ * call; the caller must return immediately and must not unwind them again.
+ * Retained status/image precede physical N; only exact completion publishes
+ * them. Classified BUSY defers without aborting REVOKING or reopening X. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_finish_owned(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 writer_r4_generation, BufferDesc *buf, ClusterPcmOwnSnapshot revoking,
+	const ResourceXDecodedFrame *image, ClusterPcmOwnHeldXRevoke held_x_revoke,
+	ResourceXLocalOwnerHandle target_revoke_owner, volatile bool held_x_revoke_active,
+	bool target_revoke_owner_held, bool tagless_target_x, bool target_x_drop,
+	ResourceXApplyResult result)
+{
+	MemoryContext error_context = CurrentMemoryContext;
+	ClusterPcmOwnFinishRefusal finish_refusal;
+	ClusterPcmOwnSnapshot retained;
+	ResourceXDecodedFrame status;
+	ResourceXDecodedFrame fault_image;
+	ResourceXApplyResult status_result;
+	ResourceXApplyResult image_result;
+	ResourceXApplyResult pair_result;
+	volatile ClusterPcmOwnResult finish_result = CLUSTER_PCM_OWN_INVALID;
+	XLogRecPtr page_lsn = PageGetLSN((Page)image->body.image_envelope.page_bytes);
+
+	memset(&finish_refusal, 0, sizeof(finish_refusal));
+	memset(&retained, 0, sizeof(retained));
+	PG_TRY();
+	{
+		if (held_x_revoke_active) {
+			finish_result = cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
+				&held_x_revoke, page_lsn, &retained, &finish_refusal);
+			if (finish_result == CLUSTER_PCM_OWN_OK)
+				held_x_revoke_active = false;
+		} else
+			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &revoking, page_lsn,
+																		&retained, &finish_refusal);
+	}
+	PG_CATCH();
+	{
+		ErrorData *original_error;
+		bool pair_retained;
+
+		MemoryContextSwitchTo(error_context);
+		original_error = CopyErrorData();
+		FlushErrorState();
+		status_result = cluster_pcm_lock_resource_x_holder_status_exact(
+			&block->common.logical_assertion, &status);
+		image_result = cluster_pcm_lock_resource_x_holder_image_exact(
+			&block->common.logical_assertion, &fault_image);
+		pair_retained
+			= status_result == RESOURCE_X_APPLY_APPLIED && image_result == RESOURCE_X_APPLY_APPLIED
+			  && status.common.assertion_sequence == block->common.assertion_sequence
+			  && fault_image.common.assertion_sequence == block->common.assertion_sequence
+			  && status.body.blocked_to_n.source_proof_crc32c == fault_image.common.semantic_crc32c;
+		ereport(LOG, (errmsg_internal("PCM-X Resource-X finish-error evidence exact"),
+					  errdetail("retained=%s tag=%u/%u/%u/%d/%u requester=%d "
+								"assertion_sequence=%llu base=%llu formation=%llu "
+								"master_session=%llu source_generation=%llu "
+								"reservation_token=%llu source_state=%u",
+								pair_retained ? "true" : "false",
+								block->common.logical_assertion.resource.spcOid,
+								block->common.logical_assertion.resource.dbOid,
+								block->common.logical_assertion.resource.relNumber,
+								(int)block->common.logical_assertion.resource.forkNum,
+								block->common.logical_assertion.resource.blockNum,
+								block->common.logical_assertion.requester_node,
+								(unsigned long long)block->common.assertion_sequence,
+								(unsigned long long)block->common.base_authority_generation,
+								(unsigned long long)block->common.resource_formation,
+								(unsigned long long)block->common.master_session_incarnation,
+								(unsigned long long)revoking.generation,
+								(unsigned long long)revoking.reservation_token,
+								(unsigned int)revoking.pcm_state)));
+		gcs_block_resource_x_fail_closed_current();
+		if (held_x_revoke_active) {
+			(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(&held_x_revoke);
+			held_x_revoke_active = false;
+		}
+		ereport(LOG, (errmsg_internal("cluster PCM-X Resource-X source finish "
+									  "FlushBuffer failed; preserved pending pair and "
+									  "blocked recovery: %s",
+									  original_error->message != NULL ? original_error->message
+																	  : "(no message)")));
+		FreeErrorData(original_error);
+		finish_result = CLUSTER_PCM_OWN_CORRUPT;
+	}
+	PG_END_TRY();
+	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
+		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
+		/* Only a proved, pre-mutation busy cause may hand the continuous
+		 * service pin to the exact shared owner. No callback cleanup may run
+		 * after APPLIED: a winning LMS claim can already own its release. */
+		if (finish_result == CLUSTER_PCM_OWN_BUSY
+			&& (finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
+				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS
+				|| (!tagless_target_x
+					&& finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED))) {
+			if (held_x_revoke_active && target_revoke_owner_held
+				&& cluster_bufmgr_pcm_own_validate_held_x_revoke(&held_x_revoke)
+					   == CLUSTER_PCM_OWN_OK
+				&& cluster_pcm_lock_resource_x_source_finish_defer_exact(
+					   block, authenticated_master_node, &held_x_revoke.revoking,
+					   &target_revoke_owner, held_x_revoke.buffer_id)
+					   == RESOURCE_X_APPLY_APPLIED) {
+				memset(&held_x_revoke, 0, sizeof(held_x_revoke));
+				memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
+				held_x_revoke_active = false;
+				target_revoke_owner_held = false;
+				return RESOURCE_X_APPLY_BAD_STATE;
+			}
+			if (!tagless_target_x && !held_x_revoke_active && !target_revoke_owner_held) {
+				ClusterPcmOwnSnapshot live;
+				int live_buffer_id = -1;
+
+				/* Selected-S already has an immutable pending pair and the
+				 * existing master type-17 retry owner. Do not invent an X pin
+				 * owner or publish the pair before physical N+PI exists. */
+				if (cluster_bufmgr_pcm_own_snapshot_by_tag(
+						&block->common.logical_assertion.resource, &live_buffer_id, &live)
+						== CLUSTER_PCM_OWN_OK
+					&& live_buffer_id == buf->buf_id
+					&& cluster_pcm_own_fence_equal_exact(&live, &revoking)
+					&& (live.semantic_buf_state & (BM_VALID | BM_IO_ERROR)) == BM_VALID
+					&& cluster_pcm_x_current_image_shape(live.pcm_state, live.buffer_type, true)
+					&& cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
+						   &block->common.logical_assertion, block->common.assertion_sequence,
+						   authenticated_master_node, block->common.master_session_incarnation)
+						   == RESOURCE_X_APPLY_APPLIED)
+					return RESOURCE_X_APPLY_BAD_STATE;
+			}
+		}
+		ereport(
+			LOG,
+			(errmsg_internal("Resource-X type-17 finish diagnostic"),
+			 errdetail(
+				 "result=%d retained_state=%u retained_generation=%llu "
+				 "expected_generation=%llu refusal_reason=%u refcount=%u "
+				 "io=%s live_flags=%u live_token=%llu held=%s tagless=%s",
+				 (int)finish_result, (unsigned)retained.pcm_state,
+				 (unsigned long long)retained.generation,
+				 (unsigned long long)image->body.image_envelope.source_carrier_generation,
+				 (unsigned)finish_refusal.reason, (unsigned)finish_refusal.shared_refcount,
+				 finish_refusal.bm_io_in_progress ? "true" : "false",
+				 (unsigned)finish_refusal.live_flags, (unsigned long long)finish_refusal.live_token,
+				 held_x_revoke_active ? "true" : "false", tagless_target_x ? "true" : "false")));
+		gcs_block_resource_x_fail_closed_current();
+		if (held_x_revoke_active) {
+			(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(&held_x_revoke);
+			held_x_revoke_active = false;
+		}
+		(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+														  &target_revoke_owner_held);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (target_x_drop) {
+		/* VM/FSM DROP has already removed the exact descriptor mapping, so it
+		 * cannot preserve the cached-X cover for the N+PI SourceSettlement
+		 * path.  Close that cover and the exact REVOKING owner together after
+		 * the physical generation commit, while the retained pair still blocks
+		 * any successor bootstrap. */
+		pair_result = cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(
+			block, authenticated_master_node, writer_r4_generation, &revoking, &retained,
+			&target_revoke_owner);
+		if (pair_result != RESOURCE_X_APPLY_APPLIED) {
+			/* The physical drop is irreversible.  Preserve the entry-local owner
+			 * and cover as ambiguity evidence after closing the current gate. */
+			gcs_block_resource_x_fail_closed_current();
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
+		target_revoke_owner_held = false;
+	}
+	pair_result = cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+		&block->common.logical_assertion, block->common.assertion_sequence,
+		authenticated_master_node, block->common.master_session_incarnation);
+	if (pair_result != RESOURCE_X_APPLY_APPLIED && pair_result != RESOURCE_X_APPLY_DUPLICATE) {
+		gcs_block_resource_x_fail_closed_current();
+		(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+														  &target_revoke_owner_held);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (!gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+													 &target_revoke_owner_held)) {
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	return result;
+}
+
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	uint64 r4_record_generation)
 {
-	MemoryContext error_context = CurrentMemoryContext;
 	PGAlignedBlock aligned_page;
 	BufferDesc *buf;
-	ClusterPcmOwnFinishRefusal finish_refusal;
 	ClusterPcmOwnHeldXRevoke held_x_revoke;
 	ClusterPcmOwnResult own_result;
 	ClusterPcmOwnSourcePrepareRefusal source_prepare_refusal;
 	ClusterPcmOwnSnapshot current;
-	ClusterPcmOwnSnapshot retained;
 	ClusterPcmOwnSnapshot revoking;
 	ResourceXGateSnapshot resource_gate;
 	ResourceXLocalOwnerHandle target_revoke_owner;
@@ -9699,7 +9879,6 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	int32 event_owner_identity = -1;
 	int32 resource_master_node = -1;
 	uint8 source_mode;
-	volatile ClusterPcmOwnResult finish_result = CLUSTER_PCM_OWN_INVALID;
 	ResourceXWriterPath writer_path;
 	bool carrier_superseded = false;
 	bool finish_required = true;
@@ -9853,10 +10032,9 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		} else {
-			/* A retained tagless callback cannot adopt the raw pin owned by the
-			 * callback that first claimed REVOKING.  An exact same-successor
-			 * replay is bounded pre-mutation backpressure; the original owner
-			 * remains solely responsible for finishing. */
+			/* A packet replay never adopts a service pin. The active callback
+			 * or exact DEFERRED owner keeps it; only the LMS claim can transfer
+			 * its release obligation. Same-successor replay is owned wait. */
 			if (tagless_target_x) {
 				memset(&revalidated_lineage, 0,
 					   sizeof(revalidated_lineage));
@@ -9870,6 +10048,37 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 					return RESOURCE_X_APPLY_BAD_STATE;
 				if (replay_result == RESOURCE_X_APPLY_STALE)
 					return RESOURCE_X_APPLY_STALE;
+				/* LMS may have completed this exact retained pair after our
+				 * X/G snapshot but before the owner observation. EMPTY alone is
+				 * never proof: require the captured full episode plus the real
+				 * monotonic publication witness before replaying transport. */
+				if (resource_x_assertion_equal(&image.common.logical_assertion,
+											   &block->common.logical_assertion)
+					&& image.common.base_authority_generation
+						   == block->common.base_authority_generation
+					&& image.common.resource_formation == block->common.resource_formation
+					&& image.common.master_session_incarnation
+						   == block->common.master_session_incarnation
+					&& image.common.assertion_sequence == block->common.assertion_sequence
+					&& image.common.ordered_lane == block->common.ordered_lane
+					&& image.common.observed_mode == block->common.observed_mode
+					&& image.common.flags == block->common.flags
+					&& image.common.authority_generation
+						   == (block->common.flags == RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+								   ? block->common.authority_generation
+								   : block->common.base_authority_generation + 1)
+					&& image.body.image_envelope.source_carrier_generation
+						   == terminal_holder_generation + 1) {
+					bool completed = false;
+
+					replay_result = gcs_block_resource_x_retained_pair_replay(
+						&block->common.logical_assertion, block->common.assertion_sequence,
+						resource_master_node, block->common.master_session_incarnation, &completed);
+					if (completed
+						&& (replay_result == RESOURCE_X_APPLY_APPLIED
+							|| replay_result == RESOURCE_X_APPLY_DUPLICATE))
+						return replay_result;
+				}
 				gcs_block_resource_x_fail_closed_current();
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
@@ -10179,146 +10388,10 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		return result;
 	}
 
-	memset(&finish_refusal, 0, sizeof(finish_refusal));
-	memset(&retained, 0, sizeof(retained));
-	PG_TRY();
-	{
-		if (held_x_revoke_active) {
-			finish_result
-				= cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
-					&held_x_revoke, page_lsn, &retained,
-					&finish_refusal);
-			if (finish_result == CLUSTER_PCM_OWN_OK)
-				held_x_revoke_active = false;
-		} else
-			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(
-				buf, &revoking, page_lsn, &retained, &finish_refusal);
-	}
-	PG_CATCH();
-	{
-		ErrorData *original_error;
-		bool pair_retained;
-
-		MemoryContextSwitchTo(error_context);
-		original_error = CopyErrorData();
-		FlushErrorState();
-		status_result = cluster_pcm_lock_resource_x_holder_status_exact(
-			&block->common.logical_assertion, &status);
-		image_result = cluster_pcm_lock_resource_x_holder_image_exact(
-			&block->common.logical_assertion, &image);
-		pair_retained = status_result == RESOURCE_X_APPLY_APPLIED
-			&& image_result == RESOURCE_X_APPLY_APPLIED
-			&& status.common.assertion_sequence
-				   == block->common.assertion_sequence
-			&& image.common.assertion_sequence
-				   == block->common.assertion_sequence
-			&& status.body.blocked_to_n.source_proof_crc32c
-				   == image.common.semantic_crc32c;
-		ereport(
-			LOG,
-			(errmsg_internal("PCM-X Resource-X finish-error evidence exact"),
-			 errdetail("retained=%s tag=%u/%u/%u/%d/%u requester=%d "
-					   "assertion_sequence=%llu base=%llu formation=%llu "
-					   "master_session=%llu source_generation=%llu "
-					   "reservation_token=%llu source_state=%u",
-					   pair_retained ? "true" : "false",
-					   block->common.logical_assertion.resource.spcOid,
-					   block->common.logical_assertion.resource.dbOid,
-					   block->common.logical_assertion.resource.relNumber,
-					   (int)block->common.logical_assertion.resource.forkNum,
-					   block->common.logical_assertion.resource.blockNum,
-					   block->common.logical_assertion.requester_node,
-					   (unsigned long long)block->common.assertion_sequence,
-					   (unsigned long long)block->common.base_authority_generation,
-					   (unsigned long long)block->common.resource_formation,
-					   (unsigned long long)block->common.master_session_incarnation,
-					   (unsigned long long)revoking.generation,
-					   (unsigned long long)revoking.reservation_token,
-					   (unsigned int)revoking.pcm_state)));
-		gcs_block_resource_x_fail_closed_current();
-		if (held_x_revoke_active) {
-			(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
-				&held_x_revoke);
-			held_x_revoke_active = false;
-		}
-		ereport(LOG,
-				(errmsg_internal("cluster PCM-X Resource-X source finish "
-								 "FlushBuffer failed; preserved pending pair and "
-								 "blocked recovery: %s",
-								 original_error->message != NULL
-									 ? original_error->message : "(no message)")));
-		FreeErrorData(original_error);
-		finish_result = CLUSTER_PCM_OWN_CORRUPT;
-	}
-	PG_END_TRY();
-	if (finish_result != CLUSTER_PCM_OWN_OK
-		|| retained.pcm_state != (uint8)PCM_STATE_N
-		|| retained.generation
-			!= image.body.image_envelope.source_carrier_generation) {
-		ereport(
-			LOG,
-			(errmsg_internal("Resource-X type-17 finish diagnostic"),
-			 errdetail("result=%d retained_state=%u retained_generation=%llu "
-					   "expected_generation=%llu refusal_reason=%u refcount=%u "
-					   "io=%s live_flags=%u live_token=%llu held=%s tagless=%s",
-					   (int)finish_result,
-					   (unsigned)retained.pcm_state,
-					   (unsigned long long)retained.generation,
-					   (unsigned long long)image.body.image_envelope
-						   .source_carrier_generation,
-					   (unsigned)finish_refusal.reason,
-					   (unsigned)finish_refusal.shared_refcount,
-					   finish_refusal.bm_io_in_progress ? "true" : "false",
-					   (unsigned)finish_refusal.live_flags,
-					   (unsigned long long)finish_refusal.live_token,
-					   held_x_revoke_active ? "true" : "false",
-					   tagless_target_x ? "true" : "false")));
-		gcs_block_resource_x_fail_closed_current();
-		if (held_x_revoke_active) {
-			(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
-				&held_x_revoke);
-			held_x_revoke_active = false;
-		}
-		(void)gcs_block_resource_x_terminal_owner_release(
-			&target_revoke_owner, &target_revoke_owner_held);
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	}
-	if (target_x_drop) {
-		/* VM/FSM DROP has already removed the exact descriptor mapping, so it
-		 * cannot preserve the cached-X cover for the N+PI SourceSettlement
-		 * path.  Close that cover and the exact REVOKING owner together after
-		 * the physical generation commit, while the retained pair still blocks
-		 * any successor bootstrap. */
-		pair_result
-			= cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(
-				block, resource_master_node, writer_r4_generation,
-				&revoking, &retained, &target_revoke_owner);
-		if (pair_result != RESOURCE_X_APPLY_APPLIED) {
-			/* The physical drop is irreversible.  Preserve the entry-local owner
-			 * and cover as ambiguity evidence after closing the current gate. */
-			gcs_block_resource_x_fail_closed_current();
-			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		}
-		memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
-		target_revoke_owner_held = false;
-	}
-	pair_result = cluster_pcm_lock_resource_x_holder_pair_publish_exact(
-		&block->common.logical_assertion,
-		block->common.assertion_sequence,
-		authenticated_master_node,
-		block->common.master_session_incarnation);
-	if (pair_result != RESOURCE_X_APPLY_APPLIED
-		&& pair_result != RESOURCE_X_APPLY_DUPLICATE) {
-		gcs_block_resource_x_fail_closed_current();
-		(void)gcs_block_resource_x_terminal_owner_release(
-			&target_revoke_owner, &target_revoke_owner_held);
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	}
-	if (!gcs_block_resource_x_terminal_owner_release(
-			&target_revoke_owner, &target_revoke_owner_held)) {
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	}
-	return result;
+	return gcs_block_resource_x_source_finish_owned(
+		block, authenticated_master_node, writer_r4_generation, buf, revoking, &image,
+		held_x_revoke, target_revoke_owner, held_x_revoke_active, target_revoke_owner_held,
+		tagless_target_x, target_x_drop, result);
 
 pre_retained_failure:
 	ereport(LOG,
@@ -12492,6 +12565,83 @@ gcs_block_resource_x_target_peer_matches_exact(
 				& PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) != 0;
 	return cluster_semantic_activation_resource_x_peer_open_matches(
 		admission, peer_node, authenticated_connection_generation);
+}
+
+/* A successful claim transfers release responsibility before any physical
+ * work. All ordinary exits thereafter consume it via the common finish owner
+ * or fail-close before releasing it. No requester deadline owns this work. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_finish_run_exact(const ResourceXAcquisitionRef *ref,
+											 const ClusterSemanticAdmissionToken *admission,
+											 int32 master_node, uint64 master_session)
+{
+	ResourceXSourceFinishClaim claim;
+	ClusterPcmOwnHeldXRevoke held;
+	ResourceXApplyResult result;
+	ClusterPcmOwnResult physical;
+	bool owner_held = true;
+	int32 executor = cluster_gcs_resource_x_event_owner_identity(
+		MyProc != NULL ? (int32)MyProc->pgprocno : -1, (int32)getpid());
+
+	if (executor < 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	result = cluster_pcm_lock_resource_x_source_finish_claim_exact(ref, executor, &claim);
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		if (result == RESOURCE_X_APPLY_RECOVERY_BLOCKED)
+			gcs_block_resource_x_fail_closed_current();
+		return result;
+	}
+	physical = cluster_bufmgr_pcm_own_adopt_held_x_revoke(claim.buffer_id, &claim.owner, &held);
+	if (physical != CLUSTER_PCM_OWN_OK || claim.master_node != master_node
+		|| claim.block.common.master_session_incarnation != master_session
+		|| claim.owner.r4_record_generation != admission->record_generation) {
+		gcs_block_resource_x_fail_closed_current();
+		(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(&held);
+		(void)gcs_block_resource_x_terminal_owner_release(&claim.owner, &owner_held);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	return gcs_block_resource_x_source_finish_owned(
+		&claim.block, master_node, admission->record_generation,
+		GetBufferDescriptor(claim.buffer_id), held.revoking, &claim.image, held, claim.owner, true,
+		true, true, false, RESOURCE_X_APPLY_APPLIED);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
+{
+	ClusterSemanticAdmissionToken admission;
+	ResourceXGateSnapshot gate;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint64 session = 0;
+	int32 master_node = -1;
+	uint32 master_ingress = 0;
+
+	if (MyBackendType != B_LMS || ref == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&admission, 0, sizeof(admission));
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		if (gcs_block_resource_x_gate_session_snapshot(&ref->assertion.resource, &gate,
+													   &master_node, &session)
+			&& gate.formation == ref->formation
+			&& gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &master_ingress)
+			&& gcs_block_resource_x_target_peer_matches_exact(&admission, master_node,
+															  master_ingress))
+			result = gcs_block_resource_x_source_finish_run_exact(ref, &admission, master_node,
+																  session);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		gcs_block_resource_x_stage_ready_tag(&ref->assertion.resource);
+	return result;
 }
 
 /* Called only under a current target admission in the existing LMS process.

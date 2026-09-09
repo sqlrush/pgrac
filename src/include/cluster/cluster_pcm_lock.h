@@ -458,6 +458,16 @@ typedef struct ResourceXLocalOwnerHandle {
 StaticAssertDecl(sizeof(ResourceXLocalOwnerHandle) == 96,
 				 "ResourceXLocalOwnerHandle layout must remain 96 bytes");
 
+/* Local LMS work, never a wire frame or shared-memory layout. The successful
+ * claim transfers one existing raw pin; it does not acquire another pin. */
+typedef struct ResourceXSourceFinishClaim {
+	ResourceXDecodedFrame block;
+	ResourceXDecodedFrame image;
+	ResourceXLocalOwnerHandle owner;
+	int32 master_node;
+	int32 buffer_id;
+} ResourceXSourceFinishClaim;
+
 #define RESOURCE_X_PROGRESS_BOUND UINT32_C(0x00000001)
 #define RESOURCE_X_PROGRESS_T1 UINT32_C(0x00000002)
 #define RESOURCE_X_PROGRESS_T2 UINT32_C(0x00000004)
@@ -690,7 +700,8 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_COMPLETE = 3,
 	RESOURCE_X_INTENT_PROBE_CORRUPT = 4,
 	/* Local work only: never encoded as a wire intent. */
-	RESOURCE_X_INTENT_PROBE_DELIVERY = 5
+	RESOURCE_X_INTENT_PROBE_DELIVERY = 5,
+	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -1677,13 +1688,16 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
 	const ResourceXLocalOwnerHandle *handle);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	const struct ClusterPcmOwnSnapshot *revoking,
-	const struct ClusterPcmOwnSnapshot *dropped,
-	const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_finish_defer_exact(
+	const ResourceXDecodedFrame *block, int32 master_node,
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
+	int buffer_id);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_finish_claim_exact(
+	const ResourceXAcquisitionRef *successor, int32 owner_procno, ResourceXSourceFinishClaim *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, const struct ClusterPcmOwnSnapshot *revoking,
+	const struct ClusterPcmOwnSnapshot *dropped, const ResourceXLocalOwnerHandle *handle);
 extern bool
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
 	const ResourceXAcquisitionRef *ref,

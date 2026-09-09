@@ -47,6 +47,7 @@
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6) */
 #include "cluster/cluster_cssd.h"		 /* spec-4.7a D4 — ClusterCssdPeerState for stub */
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -93,6 +94,7 @@ cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 #undef printf
 
 #include "unit_test.h"
+#include "test_cluster_pcm_source_owner_layout.inc"
 
 
 UT_DEFINE_GLOBALS();
@@ -12716,6 +12718,24 @@ run_actual_gcs_wait_consumer(ResourceXAssertion assertion, ClusterPcmOwnSnapshot
  * decision. It runs against the real PCM retained-pair/intent owners. */
 #include "test_cluster_pcm_source_replay.inc"
 
+static int source_replay_fuses;
+
+/* Actual consumer after it saved X/G. Another executor's publication is
+ * performed with the real pair owner before entering this consumer. */
+static ResourceXApplyResult
+source_replay_consume_saved_x(const ResourceXDecodedFrame *block, ResourceXDecodedFrame image)
+{
+	ResourceXApplyResult replay_result;
+	ResourceXTerminalXLineage revalidated_lineage;
+	int32 resource_master_node = 0;
+	uint64 writer_r4_generation = 77;
+	uint64 terminal_holder_generation = 91;
+
+#define gcs_block_resource_x_fail_closed_current() (source_replay_fuses++)
+#include "test_cluster_pcm_source_replay_consumer.inc"
+#undef gcs_block_resource_x_fail_closed_current
+}
+
 typedef struct DeliveryObserverFixture {
 	ResourceXAssertion assertion;
 	ResourceXAcquisitionRef ref;
@@ -15152,6 +15172,11 @@ UT_TEST(test_resource_x_remote_master_retains_exact_current_x_without_local_auth
 		sizeof(image_payload)), RESOURCE_X_APPLY_APPLIED);
 }
 
+static ResourceXDecodedFrame prepared_finish_block;
+static ResourceXDecodedFrame prepared_finish_image;
+static ResourceXLocalOwnerHandle prepared_finish_owner;
+static ClusterPcmOwnSnapshot prepared_finish_revoking;
+
 static void
 check_resource_x_prepared_retain_episode_mode(uint64 old_generation, int old_requester,
 											  bool drain_old, bool delegated)
@@ -15380,6 +15405,261 @@ check_resource_x_prepared_retain_episode_mode(uint64 old_generation, int old_req
 		UT_ASSERT_EQ(retained.common.authority_generation, source_base + 1);
 		UT_ASSERT_EQ(retained.common.assertion_sequence, UINT64_C(42));
 	}
+	prepared_finish_block = block;
+	prepared_finish_image = image;
+	prepared_finish_owner = owner;
+	prepared_finish_revoking = revoking;
+}
+
+UT_TEST(test_resource_x_retained_source_replay_outlives_handoff_age)
+{
+	ResourceXTerminalXLineage lineage;
+
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
+					 &prepared_finish_block, 0, 77, 91, UINT64_C(1000000000), &lineage),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
+					 &prepared_finish_block.common.logical_assertion, 42, 0, 31),
+				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
+{
+	ResourceXSourceFinishClaim claim;
+	ResourceXSourceFinishClaim duplicate;
+	ResourceXAcquisitionRef successor;
+	ResourceXLocalOwnerHandle owner;
+	ResourceXLocalOwnerHandle stale;
+	ClusterPcmOwnSnapshot wrong;
+	ResourceXDecodedFrame retained;
+	ResourceXTerminalXLineage lineage;
+	int cycle;
+
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	owner = prepared_finish_owner;
+	successor.assertion = prepared_finish_block.common.logical_assertion;
+	successor.formation = 17;
+	successor.acquisition_generation = 42;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(&successor.assertion, &retained),
+				 RESOURCE_X_APPLY_APPLIED);
+	for (cycle = 0; cycle < 3; cycle++) {
+		stale = owner;
+		stale.owner_procno++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+						 &prepared_finish_block, 0, &prepared_finish_revoking, &stale, 1),
+					 RESOURCE_X_APPLY_STALE);
+		wrong = prepared_finish_revoking;
+		wrong.reservation_token++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(&prepared_finish_block,
+																		   0, &wrong, &owner, 1),
+					 RESOURCE_X_APPLY_STALE);
+		{
+			ResourceXDecodedFrame wrong_block = prepared_finish_block;
+
+			wrong_block.common.master_session_incarnation++;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+							 &wrong_block, 0, &prepared_finish_revoking, &owner, 1),
+						 RESOURCE_X_APPLY_STALE);
+			wrong = prepared_finish_revoking;
+			wrong.tag.blockNum++;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+							 &prepared_finish_block, 0, &wrong, &owner, 1),
+						 RESOURCE_X_APPLY_STALE);
+		}
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+						 &prepared_finish_block, 0, &prepared_finish_revoking, &owner, NBuffers),
+					 RESOURCE_X_APPLY_INVALID);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+						 &prepared_finish_block, 0, &prepared_finish_revoking, &owner, 1),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(
+						 &prepared_finish_block, 0, &prepared_finish_revoking, &owner, 1),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
+						 &prepared_finish_block, 0, 77, 91, UINT64_C(1000000000), &lineage),
+					 RESOURCE_X_APPLY_BAD_STATE);
+		{
+			ResourceXTargetInstallContinuation follow;
+
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+							 &owner.ref.assertion, 0, 17, 31, 77, 51, 61, 50, 1000,
+							 &prepared_finish_revoking, &follow),
+						 RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY);
+			UT_ASSERT_EQ(follow.capture_flags, RESOURCE_X_TARGET_INSTALL_CAPTURE_REVOKE_TOKEN);
+		}
+		/* Quiet scans must rediscover the same owner without any new frame,
+		 * foreground request, or synthetic notification. They never claim it. */
+		for (int pass = 0; pass < 3; pass++) {
+			bool found = false;
+
+			for (int calls = 0; calls < 20; calls++) {
+				ResourceXAcquisitionRef work;
+				ResourceXIntentSlot slot;
+				uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+				uint32 examined;
+				ResourceXIntentProbeResult probe;
+
+				probe = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+					1, &slot, payload, sizeof(payload), &examined, &work);
+				UT_ASSERT(examined <= 1);
+				UT_ASSERT(probe != RESOURCE_X_INTENT_PROBE_CORRUPT);
+				if (probe == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
+					UT_ASSERT(!found);
+					UT_ASSERT_EQ(memcmp(&work, &successor, sizeof(work)), 0);
+					UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+					found = true;
+				}
+				if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE
+					|| probe == RESOURCE_X_INTENT_PROBE_IDLE)
+					break;
+			}
+			UT_ASSERT(found);
+		}
+		successor.acquisition_generation++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 20, &claim),
+					 RESOURCE_X_APPLY_STALE);
+		successor.acquisition_generation--;
+		successor.formation++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 20, &claim),
+					 RESOURCE_X_APPLY_STALE);
+		successor.formation--;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 20, &claim),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(claim.buffer_id, 1);
+		UT_ASSERT_EQ(claim.master_node, 0);
+		UT_ASSERT_EQ(claim.owner.owner_generation, owner.owner_generation + 1);
+		UT_ASSERT_EQ(claim.owner.reservation_token, UINT64_C(12));
+		UT_ASSERT_EQ(claim.owner.buffer_ownership_generation, UINT64_C(91));
+		UT_ASSERT_EQ(memcmp(&claim.image, &retained, sizeof(retained)), 0);
+		UT_ASSERT_EQ(claim.block.common.assertion_sequence, UINT64_C(42));
+		UT_ASSERT_EQ(claim.block.common.base_authority_generation, UINT64_C(3));
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 21, &duplicate),
+			RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(duplicate.buffer_id, -1);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
+					 RESOURCE_X_APPLY_STALE);
+		owner = claim.owner;
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
+				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_source_replay_observes_concurrent_finish_publication)
+{
+	ResourceXDecodedFrame wrong;
+	ResourceXTerminalXLineage lineage;
+	bool published = true;
+
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	UT_ASSERT_EQ(gcs_block_resource_x_retained_pair_replay(
+					 &prepared_finish_block.common.logical_assertion, 42, 0, 31, &published),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!published); /* Replay saved PENDING and X/G here. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &prepared_finish_block.common.logical_assertion, 42, 0, 31),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&prepared_finish_owner),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(
+		&prepared_finish_block, 0, 77, 91, &lineage));
+	source_replay_fuses = 0;
+	UT_ASSERT_EQ(source_replay_consume_saved_x(&prepared_finish_block, prepared_finish_image),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(source_replay_fuses, 0);
+	wrong = prepared_finish_block;
+	wrong.common.master_session_incarnation++;
+	UT_ASSERT(source_replay_consume_saved_x(&wrong, prepared_finish_image)
+			  != RESOURCE_X_APPLY_DUPLICATE);
+	wrong = prepared_finish_block;
+	wrong.common.base_authority_generation++;
+	UT_ASSERT(source_replay_consume_saved_x(&wrong, prepared_finish_image)
+			  != RESOURCE_X_APPLY_DUPLICATE);
+}
+
+/* Mutate only the exact fake-shmem record. Layout comes verbatim from the
+ * product, not duplicated numeric offsets or a production test hook. */
+UT_TEST(test_resource_x_deferred_source_rejects_corruption_exhaustion_and_reconfig)
+{
+	ResourceXSourceFinishClaim claim;
+	ResourceXAcquisitionRef ref;
+	ClusterPcmResourceXLocalOwner saved_owner;
+	ClusterPcmResourceXLocalOwner changed;
+	ResourceXDecodedFrame retained;
+	ResourceXReconfigToken token;
+	uint8 encoded[RESOURCE_X_IMAGE_V1_BYTES];
+	ResourceXWireReject reject;
+	uint16 bytes;
+	char *owner_bytes = NULL;
+	char *image_bytes = NULL;
+	int owner_matches = 0;
+	int image_matches = 0;
+
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	ref = make_resource_x_acquisition_ref(prepared_finish_block.common.logical_assertion.resource,
+										  2, 17, 42);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_defer_exact(&prepared_finish_block, 0,
+																	   &prepared_finish_revoking,
+																	   &prepared_finish_owner, 1),
+				 RESOURCE_X_APPLY_APPLIED);
+	for (int entry = 0; entry < fake_pcm_entry_count; entry++) {
+		for (Size off = 0; off + sizeof(saved_owner) <= fake_pcm_entrysize; off++) {
+			char *at = fake_pcm_entries.data[entry] + off;
+
+			if (memcmp(at, &prepared_finish_owner, sizeof(prepared_finish_owner)) == 0) {
+				owner_bytes = at;
+				owner_matches++;
+			}
+		}
+	}
+	UT_ASSERT_EQ(owner_matches, 1);
+	if (owner_matches != 1)
+		return;
+	memcpy(&saved_owner, owner_bytes, sizeof(saved_owner));
+	UT_ASSERT_EQ(saved_owner.held_buffer_id_plus_one, 2);
+	changed = saved_owner;
+	changed.highest_owner_generation = changed.handle.owner_generation = UINT64_MAX - 1;
+	memcpy(owner_bytes, &changed, sizeof(changed));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&ref, 21, &claim),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(claim.buffer_id, -1);
+	UT_ASSERT_EQ(memcmp(owner_bytes, &changed, sizeof(changed)), 0);
+	changed = saved_owner;
+	changed.reserved[0] = 1;
+	memcpy(owner_bytes, &changed, sizeof(changed));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&ref, 21, &claim),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(memcmp(owner_bytes, &changed, sizeof(changed)), 0);
+	memcpy(owner_bytes, &saved_owner, sizeof(saved_owner));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(&ref.assertion, &retained),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &retained, encoded,
+											 sizeof(encoded), &bytes, &reject));
+	UT_ASSERT_EQ(bytes, sizeof(encoded));
+	for (Size off = 0; off + bytes <= fake_pcm_header_requested_size; off++) {
+		if (memcmp(fake_pcm_header.data + off, encoded, bytes) == 0) {
+			image_bytes = fake_pcm_header.data + off;
+			image_matches++;
+		}
+	}
+	UT_ASSERT_EQ(image_matches, 1);
+	if (image_matches != 1)
+		return;
+	image_bytes[offsetof(ResourceXImageEnvelopeV1, page_bytes) + 17] ^= 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&ref, 21, &claim),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(claim.buffer_id, -1);
+	UT_ASSERT_EQ(memcmp(owner_bytes, &saved_owner, sizeof(saved_owner)), 0);
+	memcpy(image_bytes, encoded, bytes);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze_exact(17, 18, UINT32_C(1) << 2, &token));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&ref, 21, &claim),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(claim.buffer_id, -1);
+	UT_ASSERT_EQ(memcmp(owner_bytes, &saved_owner, sizeof(saved_owner)), 0);
 }
 
 static void
@@ -18211,7 +18491,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(245);
+	UT_PLAN(249);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -18409,6 +18689,10 @@ main(void)
 	UT_RUN(test_resource_x_prepared_retain_uses_terminal_x_not_local_reuse_order);
 	UT_RUN(test_resource_x_remote_retain_reuse_orders_by_proven_current_authority);
 	UT_RUN(test_resource_x_delegated_reentry_requires_physical_cover_and_drain);
+	UT_RUN(test_resource_x_retained_source_replay_outlives_handoff_age);
+	UT_RUN(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner);
+	UT_RUN(test_resource_x_deferred_source_rejects_corruption_exhaustion_and_reconfig);
+	UT_RUN(test_resource_x_source_replay_observes_concurrent_finish_publication);
 	UT_RUN(test_resource_x_remote_retain_reuse_requires_old_drain);
 	UT_RUN(test_resource_x_self_master_drop_keeps_local_grd_authority_domain);
 	UT_RUN(test_resource_x_self_master_reuse_orders_by_proven_current_authority);

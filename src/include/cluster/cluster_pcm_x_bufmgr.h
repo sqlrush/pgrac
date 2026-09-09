@@ -327,7 +327,8 @@ typedef enum ClusterPcmOwnFinishRefusalReason {
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_NONE = 0,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS,
-	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
 } ClusterPcmOwnFinishRefusalReason;
 
 typedef struct ClusterPcmOwnFinishRefusal {
@@ -887,6 +888,11 @@ cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(const BufferTag *tag,
 												  ClusterPcmOwnHeldXRevoke *held_out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_held_x_revoke(ClusterPcmOwnHeldXRevoke *held);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_validate_held_x_revoke(const ClusterPcmOwnHeldXRevoke *held);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_adopt_held_x_revoke(int buffer_id, const ResourceXLocalOwnerHandle *owner,
+										   ClusterPcmOwnHeldXRevoke *held_out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_try_drain_held_x_revoke(const ClusterPcmOwnHeldXRevoke *held);
 extern ClusterPcmOwnResult

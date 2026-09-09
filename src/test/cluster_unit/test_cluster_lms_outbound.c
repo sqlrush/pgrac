@@ -130,6 +130,7 @@ static ResourceXIntentProbeResult ut_resource_x_probe_mode
 	= RESOURCE_X_INTENT_PROBE_IDLE;
 static int ut_resource_x_probe_call_count = 0;
 static int ut_resource_x_delivery_tick_count = 0;
+static int ut_resource_x_source_finish_tick_count = 0;
 static uint32 ut_resource_x_probe_max_budget = 0;
 static int ut_resource_x_rebind_count = 0;
 static uint32 ut_resource_x_rebind_generation = 0;
@@ -316,13 +317,23 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 		probe_budget, slot_out, payload_out, payload_capacity, examined_out);
 
 	memset(delivery_out, 0, sizeof(*delivery_out));
-	if (result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
+	if (result == RESOURCE_X_INTENT_PROBE_DELIVERY
+		|| result == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
 		delivery_out->formation = 17;
 		delivery_out->acquisition_generation = 41;
 		*examined_out = 1;
 		ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
 	}
 	return result;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
+{
+	UT_ASSERT_EQ(ref->formation, UINT64_C(17));
+	UT_ASSERT_EQ(ref->acquisition_generation, UINT64_C(41));
+	ut_resource_x_source_finish_tick_count++;
+	return RESOURCE_X_APPLY_BAD_STATE;
 }
 
 ResourceXApplyResult
@@ -1457,6 +1468,17 @@ UT_TEST(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_s
 	ut_wakeup_count = 0;
 	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
 	UT_ASSERT_EQ(ut_resource_x_delivery_tick_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 2);
+	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_resource_x_stage_count, 0);
+	UT_ASSERT_EQ(ut_wakeup_count, 0);
+	ut_reset_log();
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_SOURCE_FINISH;
+	ut_resource_x_source_finish_tick_count = 0;
+	ut_wakeup_count = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_source_finish_tick_count, 1);
 	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 2);
 	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
 	UT_ASSERT_EQ(ut_sent_n, 0);

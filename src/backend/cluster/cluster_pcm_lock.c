@@ -80,7 +80,7 @@
 #define PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION UINT32_C(1)
 #define PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS \
 	(RESOURCE_X_PROTOCOL_NODE_LIMIT + 5)
-#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 1)
+#define PGRAC_RESOURCE_X_WORK_OWNER_SLOTS (PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 2)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET UINT64_C(1469598103934665603)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_PRIME UINT64_C(1099511628211)
 #define PGRAC_RESOURCE_X_NATIVE_INITIAL_FORMATION UINT64_C(1)
@@ -236,6 +236,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapRound) == 528,
 #define RESOURCE_X_LOCAL_OWNER_REVOKING UINT8_C(2)
 #define RESOURCE_X_LOCAL_OWNER_HANDOFF UINT8_C(3)
 #define RESOURCE_X_LOCAL_OWNER_EVICTING UINT8_C(4)
+#define RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED UINT8_C(5)
 
 /* One bounded, entry-local successor priority.  The holder reference is the
  * retained terminal cover, while the successor fields identify the only
@@ -268,8 +269,9 @@ typedef struct ClusterPcmResourceXLocalOwner {
 	ResourceXLocalOwnerHandle handle;
 	ClusterPcmResourceXLocalHandoff handoff;
 	uint64 highest_owner_generation;
+	uint32 held_buffer_id_plus_one;
 	uint8 state;
-	uint8 reserved[7];
+	uint8 reserved[3];
 } ClusterPcmResourceXLocalOwner;
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXLocalOwner) == 248,
@@ -915,6 +917,10 @@ static void pcm_resource_x_bootstrap_round_clear_binding_locked(
 	ClusterPcmResourceXBootstrapRound *round);
 static bool pcm_resource_x_local_owner_valid_locked(
 	const ClusterPcmResourceXLocalOwner *owner);
+static ResourceXApplyResult
+pcm_resource_x_source_finish_snapshot_locked(struct GrdEntry *entry,
+											 ResourceXSourceFinishClaim *out);
+static bool pcm_resource_x_source_finish_pending_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_local_handoff_valid(
 	const ClusterPcmResourceXLocalHandoff *handoff);
 static bool pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry);
@@ -12157,15 +12163,18 @@ pcm_resource_x_local_owner_valid_locked(
 	const ClusterPcmResourceXLocalOwner *owner)
 {
 	static const ResourceXLocalOwnerHandle empty_handle;
-	static const uint8 zero_reserved[7];
+	static const uint8 zero_reserved[3];
 	bool handle_valid;
 	bool handoff_empty;
 	bool handoff_valid;
 
 	Assert(owner != NULL);
 	if (owner->highest_owner_generation == UINT64_MAX
-		|| memcmp(owner->reserved, zero_reserved,
-			sizeof(zero_reserved)) != 0)
+		|| memcmp(owner->reserved, zero_reserved, sizeof(zero_reserved)) != 0
+		|| (owner->state == RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED
+				? (owner->held_buffer_id_plus_one == 0
+				   || owner->held_buffer_id_plus_one > (uint32)NBuffers)
+				: owner->held_buffer_id_plus_one != 0))
 		return false;
 	handle_valid = pcm_resource_x_local_owner_handle_valid(&owner->handle);
 	handoff_empty = pcm_resource_x_local_handoff_empty(&owner->handoff);
@@ -12178,14 +12187,15 @@ pcm_resource_x_local_owner_valid_locked(
 					  sizeof(empty_handle)) == 0
 			&& handoff_valid && owner->highest_owner_generation != 0;
 	if ((owner->state != RESOURCE_X_LOCAL_OWNER_RECYCLING
-			&& owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
-			&& owner->state != RESOURCE_X_LOCAL_OWNER_EVICTING)
-		|| !handle_valid
-		|| owner->handle.owner_generation
-			!= owner->highest_owner_generation)
+		 && owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+		 && owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED
+		 && owner->state != RESOURCE_X_LOCAL_OWNER_EVICTING)
+		|| !handle_valid || owner->handle.owner_generation != owner->highest_owner_generation)
 		return false;
 	if (owner->state == RESOURCE_X_LOCAL_OWNER_EVICTING)
 		return handoff_empty;
+	if (owner->state == RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
+		return pcm_resource_x_local_handoff_matches_handle(&owner->handoff, &owner->handle);
 	return handoff_empty
 		|| pcm_resource_x_local_handoff_matches_handle(
 			&owner->handoff, &owner->handle);
@@ -14184,18 +14194,17 @@ pcm_resource_x_target_install_captured_live_revoke_exact(
 	Assert(owner != NULL);
 	Assert(continuation != NULL);
 	Assert(observed != NULL);
-	return owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
-		&& pcm_resource_x_local_owner_handle_valid(&owner->handle)
-		&& owner->handle.reservation_token < UINT64_MAX - 1
-		&& BufferTagsEqual(&observed->tag, &continuation->resource)
-		&& observed->pcm_state == (uint8)PCM_STATE_X
-		&& observed->flags == PCM_OWN_FLAG_REVOKING
-		&& observed->generation
-			== continuation->expected_x_ownership_generation
-		&& observed->reservation_token == continuation->reservation_token
-		&& observed->reservation_token == owner->handle.reservation_token + 1
-		&& observed->writer_activation_token == 0
-		&& observed->resource_x_activation_generation == 0;
+	return (owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
+			|| owner->state == RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
+		   && pcm_resource_x_local_owner_handle_valid(&owner->handle)
+		   && owner->handle.reservation_token < UINT64_MAX - 1
+		   && BufferTagsEqual(&observed->tag, &continuation->resource)
+		   && observed->pcm_state == (uint8)PCM_STATE_X && observed->flags == PCM_OWN_FLAG_REVOKING
+		   && observed->generation == continuation->expected_x_ownership_generation
+		   && observed->reservation_token == continuation->reservation_token
+		   && observed->reservation_token == owner->handle.reservation_token + 1
+		   && observed->writer_activation_token == 0
+		   && observed->resource_x_activation_generation == 0;
 }
 
 static bool
@@ -14348,7 +14357,8 @@ pcm_resource_x_target_install_capture_revoke_provenance_exact_locked(
 		|| !pcm_resource_x_target_install_round_identity_exact_locked(round, continuation,
 																	  assertion)
 		|| !pcm_resource_x_local_owner_valid_locked(owner)
-		|| owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+		|| (owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+			&& owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
 		|| !pcm_resource_x_local_owner_round_exact_locked(entry, round)
 		|| !pcm_resource_x_target_install_captured_live_revoke_exact(owner, continuation, observed))
 		return false;
@@ -15641,16 +15651,17 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 				}
 				broadcast = result == RESOURCE_X_APPLY_APPLIED;
 			}
-		} else if (owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING) {
+		} else if (owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
+				   || owner->state == RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED) {
 			/* Only an exact replay of the successor already retained by this
 			 * active owner is retryable.  A conflicting successor must not be
 			 * allowed to hide behind the same generic BUSY disposition: reject it
 			 * as STALE without changing owner, HANDOFF, or the local deadline. */
 			if (!pcm_resource_x_local_handoff_valid(&owner->handoff)
-				|| now_us >= owner->handoff.deadline_us
+				|| (now_us >= owner->handoff.deadline_us
+					&& !pcm_resource_x_source_finish_pending_locked(entry))
 				|| !lineage_matches
-				|| !pcm_resource_x_local_handoff_round_current_locked(
-					&owner->handoff, round))
+				|| !pcm_resource_x_local_handoff_round_current_locked(&owner->handoff, round))
 				result = RESOURCE_X_APPLY_STALE;
 			else
 				result = pcm_resource_x_local_handoff_successor_exact(
@@ -15659,8 +15670,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
 					cached_ownership_generation)
 					? RESOURCE_X_APPLY_BAD_STATE
 					: RESOURCE_X_APPLY_STALE;
-		}
-		else if (!lineage_matches)
+		} else if (!lineage_matches)
 			result = RESOURCE_X_APPLY_STALE;
 		else {
 			/* The first authenticated exact type-17 owns the same bounded
@@ -15734,16 +15744,16 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
 	round = &entry->resource_x_bootstrap_round;
 	owner = &entry->resource_x_local_owner;
 	if (!pcm_resource_x_local_owner_valid_locked(owner)
-		|| owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+		|| (owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+			&& owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
 		|| !pcm_resource_x_local_handoff_valid(&owner->handoff))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if (now_us >= owner->handoff.deadline_us
-		|| !pcm_resource_x_local_handoff_round_current_locked(
-			&owner->handoff, round)
-		|| !pcm_resource_x_terminal_x_lineage_locked(
-			entry, round, successor_block, authenticated_master_node,
-			r4_record_generation, cached_ownership_generation, false,
-			lineage_out))
+	else if ((now_us >= owner->handoff.deadline_us
+			  && !pcm_resource_x_source_finish_pending_locked(entry))
+			 || !pcm_resource_x_local_handoff_round_current_locked(&owner->handoff, round)
+			 || !pcm_resource_x_terminal_x_lineage_locked(
+				 entry, round, successor_block, authenticated_master_node, r4_record_generation,
+				 cached_ownership_generation, false, lineage_out))
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else if (!pcm_resource_x_local_handoff_successor_exact(
 			&owner->handoff, successor_block, authenticated_master_node,
@@ -18560,6 +18570,188 @@ pcm_resource_x_prepared_terminal_x_source_exact_locked(
 			x_owner->master_session_incarnation,
 			x_owner->r4_record_generation,
 			x_owner->buffer_ownership_generation);
+}
+
+/* Reconstruct local work only from the checked immutable pair and its exact
+ * terminal source owner. An old handoff age is not authority for discarding
+ * an already retained obligation. Caller holds the entry lock. */
+static ResourceXApplyResult
+pcm_resource_x_source_finish_snapshot_locked(struct GrdEntry *entry,
+											 ResourceXSourceFinishClaim *out)
+{
+	ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+	ClusterPcmResourceXLocalHandoff *handoff = &owner->handoff;
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	ResourceXDecodedFrame status;
+	ResourceXTerminalXLineage lineage;
+	ResourceXApplyResult result;
+
+	memset(out, 0, sizeof(*out));
+	out->buffer_id = -1;
+	if (!pcm_resource_x_local_owner_valid_locked(owner)
+		|| (owner->state != RESOURCE_X_LOCAL_OWNER_REVOKING
+			&& owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
+		|| !pcm_resource_x_local_handoff_matches_handle(handoff, &owner->handle) || state == NULL
+		|| owner->handle.reservation_token >= UINT64_MAX - 1)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(owner->handle.ref.formation)
+		|| cluster_gcs_lookup_master(entry->tag) != handoff->master_node)
+		return RESOURCE_X_APPLY_STALE;
+	if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PENDING
+		|| state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PENDING
+		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = pcm_resource_x_holder_pair_decode_locked(state, &status, &out->image);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	out->block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+	out->block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	out->block.common = status.common;
+	out->block.common.flags = handoff->delegated_authority_generation != 0
+								  ? RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+								  : 0;
+	out->block.common.authority_generation = handoff->delegated_authority_generation != 0
+												 ? handoff->delegated_authority_generation
+												 : handoff->base_authority_generation;
+	out->block.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	out->block.common.source_candidate = 1;
+	out->block.common.retain_pi_if_dirty = 1;
+	out->block.common.semantic_crc32c = 0;
+	if (state->holder_status.destination_node != (uint32)handoff->master_node
+		|| status.common.action_node != cluster_node_id
+		|| status.common.observed_mode != (uint8)PCM_STATE_X
+		|| pcm_resource_x_source_fence_get_u64(out->image.body.image_envelope.source_fence + 20)
+			   != owner->handle.buffer_ownership_generation
+		|| out->image.body.image_envelope.source_carrier_generation
+			   != owner->handle.buffer_ownership_generation + 1
+		|| cluster_pcm_x_revoke_finish_mode(&entry->tag, 0) != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN
+		|| !pcm_resource_x_local_handoff_successor_exact(handoff, &out->block, handoff->master_node,
+														 owner->handle.r4_record_generation,
+														 owner->handle.buffer_ownership_generation)
+		|| (handoff->delegated_authority_generation != 0
+			&& (out->image.common.flags != RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE
+				|| out->image.common.authority_generation
+					   != handoff->delegated_authority_generation))
+		|| !pcm_resource_x_local_handoff_round_current_locked(handoff,
+															  &entry->resource_x_bootstrap_round)
+		|| !pcm_resource_x_terminal_x_lineage_locked(
+			entry, &entry->resource_x_bootstrap_round, &out->block, handoff->master_node,
+			owner->handle.r4_record_generation, owner->handle.buffer_ownership_generation, false,
+			&lineage)
+		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+			entry, &entry->resource_x_bootstrap_round, &owner->handle.ref,
+			owner->handle.master_session_incarnation, owner->handle.r4_record_generation,
+			owner->handle.buffer_ownership_generation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	out->owner = owner->handle;
+	out->master_node = handoff->master_node;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static bool
+pcm_resource_x_source_finish_pending_locked(struct GrdEntry *entry)
+{
+	ResourceXSourceFinishClaim snapshot;
+
+	return pcm_resource_x_source_finish_snapshot_locked(entry, &snapshot)
+		   == RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_finish_defer_exact(const ResourceXDecodedFrame *block,
+													  int32 master_node,
+													  const ClusterPcmOwnSnapshot *revoking,
+													  const ResourceXLocalOwnerHandle *handle,
+													  int buffer_id)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXLocalOwner *owner;
+	ResourceXApplyResult result;
+	struct GrdEntry *entry;
+
+	if (block == NULL || revoking == NULL || !pcm_resource_x_local_owner_handle_valid(handle)
+		|| buffer_id < 0 || buffer_id >= NBuffers)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&block->common.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	owner = &entry->resource_x_local_owner;
+	if (!pcm_resource_x_prepared_terminal_x_source_exact_locked(entry, block, master_node, revoking,
+																handle)
+		|| !BufferTagsEqual(&revoking->tag, &entry->tag)
+		|| revoking->pcm_state != (uint8)PCM_STATE_X || revoking->flags != PCM_OWN_FLAG_REVOKING
+		|| revoking->generation != handle->buffer_ownership_generation
+		|| handle->reservation_token >= UINT64_MAX - 1
+		|| revoking->reservation_token != handle->reservation_token + 1
+		|| revoking->writer_activation_token != 0
+		|| revoking->resource_x_activation_generation != 0)
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!pcm_resource_x_source_finish_pending_locked(entry))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (!pcm_resource_x_intent_mark_pending(false))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else {
+		owner->held_buffer_id_plus_one = (uint32)buffer_id + 1;
+		owner->state = RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_finish_claim_exact(const ResourceXAcquisitionRef *successor,
+													  int32 owner_procno,
+													  ResourceXSourceFinishClaim *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXLocalOwner *owner;
+	ResourceXApplyResult result;
+	struct GrdEntry *entry;
+
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+		out->buffer_id = -1;
+	}
+	if (out == NULL || !pcm_resource_x_ref_valid(successor) || owner_procno < 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&successor->assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	owner = &entry->resource_x_local_owner;
+	if (!pcm_resource_x_local_owner_valid_locked(owner))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (!resource_x_assertion_equal(&successor->assertion, &owner->handoff.successor_assertion)
+			 || successor->formation != owner->handle.ref.formation
+			 || successor->acquisition_generation != owner->handoff.assertion_sequence)
+		result = RESOURCE_X_APPLY_STALE;
+	else if (owner->highest_owner_generation >= UINT64_MAX - 1)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if ((result = pcm_resource_x_source_finish_snapshot_locked(entry, out))
+			 == RESOURCE_X_APPLY_APPLIED) {
+		owner->highest_owner_generation++;
+		owner->handle.owner_generation = owner->highest_owner_generation;
+		owner->handle.owner_procno = owner_procno;
+		out->owner = owner->handle;
+		out->buffer_id = (int32)owner->held_buffer_id_plus_one - 1;
+		owner->held_buffer_id_plus_one = 0;
+		owner->state = RESOURCE_X_LOCAL_OWNER_REVOKING;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		memset(out, 0, sizeof(*out));
+		out->buffer_id = -1;
+	}
+	return result;
 }
 
 static ResourceXApplyResult
@@ -24175,6 +24367,29 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 			ResourceXIntentSlot *slot;
 			uint8 *payload;
 
+			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS + 1) {
+				const ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+
+				if (owner->state != RESOURCE_X_LOCAL_OWNER_REVOKE_DEFERRED
+					|| !cluster_pcm_lock_resource_x_gate_open_exact(owner->handle.ref.formation))
+					continue;
+				if (!pcm_resource_x_source_finish_pending_locked(entry)
+					|| !pcm_resource_x_intent_mark_pending(false)) {
+					LWLockRelease(&entry->entry_lock.lock);
+					pcm_entry_ref_release(&entry_ref);
+					*examined_out = examined;
+					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+				}
+				delivery_out->assertion = owner->handoff.successor_assertion;
+				delivery_out->formation = owner->handle.ref.formation;
+				delivery_out->acquisition_generation = owner->handoff.assertion_sequence;
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_entry_ref_release(&entry_ref);
+				pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor + 1);
+				pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index, 0);
+				*examined_out = examined;
+				return RESOURCE_X_INTENT_PROBE_SOURCE_FINISH;
+			}
 			if (owner_index == PGRAC_RESOURCE_X_OUTBOUND_OWNER_SLOTS) {
 				const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
 				uint64 now_us = pcm_resource_x_monotonic_us();
@@ -24207,8 +24422,9 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 				delivery_out->acquisition_generation = round->request.assertion_sequence;
 				LWLockRelease(&entry->entry_lock.lock);
 				pcm_entry_ref_release(&entry_ref);
-				pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor + 1);
-				pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index, 0);
+				pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor);
+				pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index,
+									owner_index + 1);
 				*examined_out = examined;
 				return RESOURCE_X_INTENT_PROBE_DELIVERY;
 			}

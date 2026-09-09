@@ -3795,7 +3795,16 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 			"result == RESOURCE_X_APPLY_STALE",
 			"cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(",
 			"pair_result == RESOURCE_X_APPLY_APPLIED",
-			"cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
+			"return gcs_block_resource_x_source_finish_owned(" };
+	static const char *const finish_contract[]
+		= { "cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
+			"cluster_bufmgr_pcm_own_finish_revoke_retain(",
+			"CopyErrorData();",
+			"PCM-X Resource-X finish-error evidence exact",
+			"finish_result != CLUSTER_PCM_OWN_OK",
+			"cluster_pcm_lock_resource_x_source_finish_defer_exact(",
+			"if (target_x_drop)",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(",
 			"cluster_pcm_lock_resource_x_holder_pair_publish_exact(",
 			"gcs_block_resource_x_terminal_owner_release(" };
 	char *source = read_gcs_block_source();
@@ -3810,6 +3819,10 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_source_finish_owned(",
+		"\nstatic ResourceXApplyResult\ngcs_block_pcm_x_resource_x_source_block_to_n(",
+		finish_contract, lengthof(finish_contract));
 	helper = strstr(source,
 		"\ngcs_block_pcm_x_resource_x_source_block_to_n(");
 	UT_ASSERT_NOT_NULL(helper);
@@ -3830,10 +3843,9 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 
 		UT_ASSERT_NOT_NULL(helper_end);
 		UT_ASSERT(legacy_fence == NULL || legacy_fence >= helper_end);
-		UT_ASSERT_NOT_NULL(strstr(helper,
-			"PCM-X Resource-X finish-error evidence exact"));
-		UT_ASSERT_NOT_NULL(strstr(helper, "CopyErrorData();"));
-		UT_ASSERT_NOT_NULL(strstr(helper, "pair_retained"));
+		UT_ASSERT_NOT_NULL(strstr(source, "PCM-X Resource-X finish-error evidence exact"));
+		UT_ASSERT_NOT_NULL(strstr(source, "CopyErrorData();"));
+		UT_ASSERT_NOT_NULL(strstr(source, "pair_retained"));
 	}
 	ingress = strstr(source, "\ngcs_block_resource_x_type17_ingress(");
 	source_call = ingress != NULL
@@ -3965,20 +3977,19 @@ UT_TEST(test_resource_x_type17_x_source_separates_wire_and_local_fence_formation
 
 UT_TEST(test_resource_x_type17_target_x_after_l3_uses_no_legacy_shell)
 {
-	static const char *const tagless_contract[] = {
-		"cluster_resource_x_writer_path_snapshot(",
-		"writer_path != RESOURCE_X_WRITER_TARGET",
-		"tagless_target_x = source_mode == (uint8)PCM_STATE_X;",
-		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
-		"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
-		"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
-		"cluster_bufmgr_copy_block_for_gcs(",
-		"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
-		"cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(",
-		"gcs_block_resource_x_terminal_owner_release("
-	};
+	static const char *const tagless_contract[]
+		= { "cluster_resource_x_writer_path_snapshot(",
+			"writer_path != RESOURCE_X_WRITER_TARGET",
+			"tagless_target_x = source_mode == (uint8)PCM_STATE_X;",
+			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+			"cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(",
+			"cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(",
+			"cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(",
+			"cluster_bufmgr_copy_block_for_gcs(",
+			"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
+			"gcs_block_resource_x_source_finish_owned(",
+			"gcs_block_resource_x_terminal_owner_release(" };
 	char *source = read_gcs_block_source();
 	const char *helper;
 	const char *helper_end;
@@ -4069,8 +4080,8 @@ UT_TEST(test_resource_x_type17_target_x_uses_fork_exact_revoke_finish)
 			"if (tagless_target_x && target_x_retain && !semantic_retained)")
 		: NULL;
 	generic_finish = content_drain != NULL
-		? strstr(content_drain,
-			"cluster_bufmgr_pcm_own_finish_revoke_retain(") : NULL;
+						 ? strstr(content_drain, "return gcs_block_resource_x_source_finish_owned(")
+						 : NULL;
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
@@ -4136,10 +4147,8 @@ UT_TEST(test_resource_x_type17_target_drains_before_semantic_retention)
 		? strstr(copy,
 			"cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(")
 		: NULL;
-	finish = retain != NULL
-		? strstr(retain,
-			"cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(")
-		: NULL;
+	finish = retain != NULL ? strstr(retain, "return gcs_block_resource_x_source_finish_owned(")
+							: NULL;
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
@@ -4230,11 +4239,11 @@ UT_TEST(test_resource_x_type17_aux_drop_drains_passive_pins_before_pair)
 		? strstr(retry_return,
 			"cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(")
 		: NULL;
-	finish = pair != NULL
-		? strstr(pair, "cluster_bufmgr_pcm_own_finish_revoke_retain(")
-		: NULL;
+	finish = pair != NULL ? strstr(pair, "return gcs_block_resource_x_source_finish_owned(") : NULL;
 	drop_close_branch = finish != NULL
-		? strstr(finish, "if (target_x_drop) {") : NULL;
+							? strstr(strstr(source, "\ngcs_block_resource_x_source_finish_owned("),
+									 "if (target_x_drop) {")
+							: NULL;
 	close_cover = drop_close_branch != NULL
 		? strstr(drop_close_branch,
 			"cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(")
@@ -4261,12 +4270,10 @@ UT_TEST(test_resource_x_type17_aux_drop_drains_passive_pins_before_pair)
 		&& retry_return != NULL && pair != NULL && finish != NULL
 		&& drop_close_branch != NULL && close_cover != NULL
 		&& publish != NULL) {
-		UT_ASSERT(drop_begin < drop_drain && drop_drain < busy
-			&& busy < abort && abort < yield && yield < retry_return
-			&& retry_return < pair && pair < finish
-			&& finish < drop_close_branch
-			&& drop_close_branch < close_cover && close_cover < publish
-			&& publish < helper_end);
+		UT_ASSERT(drop_begin < drop_drain && drop_drain < busy && busy < abort && abort < yield
+				  && yield < retry_return && retry_return < pair && pair < finish
+				  && finish < helper_end && drop_close_branch < close_cover && close_cover < publish
+				  && publish < helper);
 		UT_ASSERT(strstr(drop_drain, "LWLockAcquire(") == NULL
 			|| strstr(drop_drain, "LWLockAcquire(") >= retry_return);
 		UT_ASSERT(strstr(drop_drain, "pg_usleep(") == NULL
@@ -4277,18 +4284,16 @@ UT_TEST(test_resource_x_type17_aux_drop_drains_passive_pins_before_pair)
 
 UT_TEST(test_resource_x_type17_selected_s_source_reuses_fenced_pair_core)
 {
-	static const char *const source_contract[] = {
-		"source_mode = block->common.observed_mode",
-		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"cluster_sf_peer_capability_word_sample(",
-		"gcs_block_resource_x_gate_session_recheck(",
-		"cluster_bufmgr_pcm_own_prepare_s_source_image(",
-		"gcs_block_resource_x_gate_session_recheck(",
-		"gcs_block_pcm_x_resource_x_build_source_frames(",
-		"cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(",
-		"cluster_bufmgr_pcm_own_finish_revoke_retain(",
-		"cluster_pcm_lock_resource_x_holder_pair_publish_exact("
-	};
+	static const char *const source_contract[]
+		= { "source_mode = block->common.observed_mode",
+			"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+			"cluster_sf_peer_capability_word_sample(",
+			"gcs_block_resource_x_gate_session_recheck(",
+			"cluster_bufmgr_pcm_own_prepare_s_source_image(",
+			"gcs_block_resource_x_gate_session_recheck(",
+			"gcs_block_pcm_x_resource_x_build_source_frames(",
+			"cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(",
+			"return gcs_block_resource_x_source_finish_owned(" };
 	char *source = read_gcs_block_source();
 	const char *abort;
 	const char *builder;
