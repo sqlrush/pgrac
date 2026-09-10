@@ -28,6 +28,8 @@ bool heap_receipt_test_plan_capture(ClusterUndoRecordPrepareReceipt *receipt);
 bool heap_receipt_test_plan_recheck(ClusterUndoRecordPrepareReceipt *receipt);
 int heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt *receipt,
 								   const ClusterCtrcTargetV1 *observed);
+void heap_receipt_test_current_handoff(void);
+void heap_receipt_test_current_mode(uint8 state);
 
 int NBuffers = 1;
 int NLocBuffer = 0;
@@ -42,6 +44,20 @@ uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 static ClusterPcmOwnSnapshot probe_pcm;
 static ClusterHeapDmlAuthorityGuard probe_guard;
+
+void
+heap_receipt_test_current_handoff(void)
+{
+	/* Runtime-boundary fixture: the same pinned descriptor has acquired a
+	 * later current ownership, without a membership or logical tag change. */
+	probe_pcm.generation++;
+}
+
+void
+heap_receipt_test_current_mode(uint8 state)
+{
+	probe_pcm.pcm_state = state;
+}
 
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
@@ -77,7 +93,8 @@ heap_receipt_test_capture(Page page, bool first, uint8 operation, ClusterCtrcTar
 		probe_pcm.tag.forkNum = MAIN_FORKNUM;
 		probe_pcm.tag.blockNum = 44;
 		probe_pcm.generation = 17;
-		probe_pcm.resource_x_activation_generation = 1;
+		/* Installed ordinary current authority has no direct-init sidecar. */
+		probe_pcm.resource_x_activation_generation = 0;
 		probe_pcm.pcm_state = PCM_STATE_X;
 		probe_descriptors[0].bufferdesc.tag = probe_pcm.tag;
 	}

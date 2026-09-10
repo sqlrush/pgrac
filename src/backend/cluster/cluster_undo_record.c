@@ -2658,6 +2658,9 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt
 {
 	bool exact_ready;
 	uint64 original_deadline;
+	uint64 refused_at;
+	uint8 reuse_mask;
+	const char *invalidated_reason = NULL;
 
 	MemSet(&cluster_undo_retry_cancel_snapshot, 0, sizeof(cluster_undo_retry_cancel_snapshot));
 	if (receipt == NULL || !cluster_undo_record_reservation.active
@@ -2674,27 +2677,46 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt
 	}
 	/* All heap locks have been dropped.  Use the existing blocking resident
 	 * sampler: a missed conditional content-lock probe is not invalidation. */
-	exact_ready = payload_len <= receipt->payload_capacity
-				  && cluster_undo_record_receipt_extent_matches(receipt)
-				  && cluster_semantic_activation_modifier_recheck(
-					  &receipt->modifier_admission, cluster_undo_record_writable_admission())
-				  && cluster_undo_block0_current_live_owner_publication_recheck(
-					  &receipt->block0_publication);
+	if (payload_len > receipt->payload_capacity)
+		invalidated_reason = "CAPACITY_REFUSAL";
+	else if (!cluster_undo_record_receipt_extent_matches(receipt))
+		invalidated_reason = "RESERVATION_MISMATCH";
+	else if (!cluster_semantic_activation_modifier_recheck(
+				 &receipt->modifier_admission, cluster_undo_record_writable_admission()))
+		invalidated_reason = "MODIFIER_ADMISSION_CHANGED";
+	else if (!cluster_undo_block0_current_live_owner_publication_recheck(
+				 &receipt->block0_publication))
+		invalidated_reason = "BLOCK0_PUBLICATION_CHANGED";
+	exact_ready = invalidated_reason == NULL;
 	if (exact_ready && !targets_invalidated) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_RETRY_PRESERVED);
 		cluster_undo_receipt_reason = "NONE";
 		return CLUSTER_UNDO_RECORD_PREPARE_READY;
 	}
 	original_deadline = receipt->absolute_deadline_us;
+	reuse_mask = receipt->ctrc_reuse_mask;
 	cluster_undo_retry_cancel_snapshot.exact_ready = exact_ready;
 	cluster_undo_retry_cancel_snapshot.targets_invalidated = targets_invalidated;
 	cluster_undo_retry_cancel_snapshot.sequence = receipt->reservation_sequence;
 	cluster_undo_retry_cancel_snapshot.applied_mask = receipt->ctrc_applied_mask;
 	cluster_undo_retry_cancel_snapshot.armed = true;
 	cluster_undo_record_cancel_prepared(receipt);
-	if (original_deadline <= (uint64)GetCurrentTimestamp()) {
+	refused_at = (uint64)GetCurrentTimestamp();
+	if (original_deadline <= refused_at) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_INVALIDATED_BUDGET_EXHAUSTED);
 		cluster_undo_receipt_reason = "PREPARE_BUDGET_EXHAUSTED_AFTER_EXACT_INVALIDATION";
+		/* Keep the actual pre-cancel predicate with every final refusal,
+		 * including a budget crossed while releasing the exact reservation. */
+		ereport(
+			LOG,
+			(errmsg_internal(
+				"undo retry refusal evidence: reservation=" UINT64_FORMAT
+				" exact_ready=%d targets_invalidated=%d cause=%s deadline=" UINT64_FORMAT
+				" now=" UINT64_FORMAT " applied=%u reuse=%u",
+				cluster_undo_retry_cancel_snapshot.sequence, exact_ready, targets_invalidated,
+				invalidated_reason == NULL ? "TARGET_INVALIDATED" : invalidated_reason,
+				original_deadline, refused_at,
+				(unsigned)cluster_undo_retry_cancel_snapshot.applied_mask, (unsigned)reuse_mask)));
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
 	cluster_undo_receipt_reason = "EXACT_IDENTITY_INVALIDATED";

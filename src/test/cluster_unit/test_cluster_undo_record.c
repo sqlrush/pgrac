@@ -110,6 +110,9 @@ static uint32 undo_test_wait_event_info;
 static PGAlignedBlock undo_test_lifecycle_disk;
 static bool undo_test_publish_tt_after_block0_read;
 static TimestampTz receipt_clock_us;
+static TimestampTz receipt_clock_after_unref;
+static bool receipt_log_enabled;
+static char receipt_last_log[1024];
 static TimestampTz receipt_clock_after_lock;
 static bool receipt_modifier_valid;
 static bool receipt_block0_valid;
@@ -206,7 +209,7 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel >= ERROR)
 		abort();
-	return false;
+	return receipt_log_enabled && elevel == LOG;
 }
 
 bool
@@ -221,8 +224,13 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {}
 
 int
-errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+errmsg_internal(const char *fmt, ...)
 {
+	va_list arguments;
+
+	va_start(arguments, fmt);
+	vsnprintf(receipt_last_log, sizeof(receipt_last_log), fmt, arguments);
+	va_end(arguments);
 	return 0;
 }
 
@@ -308,6 +316,8 @@ cluster_undo_buf_unref_slot(int slot)
 {
 	UT_ASSERT_EQ(slot, 7);
 	receipt_unref_calls++;
+	if (receipt_clock_after_unref != 0)
+		receipt_clock_us = receipt_clock_after_unref;
 }
 
 void
@@ -2431,6 +2441,9 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	cluster_node_id = 0;
 	MyBackendId = 1;
 	receipt_clock_us = 99;
+	receipt_clock_after_unref = 0;
+	receipt_log_enabled = false;
+	receipt_last_log[0] = '\0';
 	receipt_clock_after_lock = 0;
 	receipt_modifier_valid = true;
 	receipt_block0_valid = true;
@@ -2684,6 +2697,40 @@ UT_TEST(test_retry_requalification_keeps_ready_and_proves_actual_invalidation)
 	UT_ASSERT_EQ(receipt_unref_calls, 1);
 }
 
+UT_TEST(test_retry_refusal_records_exact_cause_including_expiry_during_cancel)
+{
+	static const char *causes[]
+		= { "TARGET_INVALIDATED",		  "CAPACITY_REFUSAL",			"RESERVATION_MISMATCH",
+			"MODIFIER_ADMISSION_CHANGED", "BLOCK0_PUBLICATION_CHANGED", "TARGET_INVALIDATED" };
+	size_t variant;
+
+	for (variant = 0; variant < lengthof(causes); variant++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		bool targets_invalidated = variant == 0 || variant == 5;
+
+		receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+		receipt_log_enabled = true;
+		receipt_clock_us = variant == 5 ? 99 : 101;
+		if (variant == 2)
+			cluster_undo_current_extent.cur_block++;
+		if (variant == 3)
+			receipt_modifier_valid = false;
+		if (variant == 4)
+			receipt_block0_valid = false;
+		if (variant == 5)
+			receipt_clock_after_unref = 101;
+		UT_ASSERT_EQ(cluster_undo_record_requalify_for_retry(&receipt, variant == 1 ? 129 : 64,
+															 targets_invalidated),
+					 CLUSTER_UNDO_RECORD_PREPARE_REFUSED);
+		UT_ASSERT(strstr(receipt_last_log, "undo retry refusal evidence: reservation=17") != NULL);
+		UT_ASSERT(strstr(receipt_last_log, causes[variant]) != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "deadline=100 now=101 applied=0 reuse=0") != NULL);
+		UT_ASSERT_EQ(receipt_unref_calls, 1);
+		UT_ASSERT_EQ(receipt_apply_calls, 0);
+	}
+	receipt_log_enabled = false;
+}
+
 UT_TEST(test_retry_after_apply_refuses_without_canceling_shared_owner)
 {
 	ClusterUndoRecordPrepareReceipt receipt, before;
@@ -2809,7 +2856,7 @@ UT_TEST(test_update_vm_observation_never_repins_or_indexes_a_local_buffer)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(54);
+	UT_PLAN(55);
 	UT_RUN(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite);
 	UT_RUN(test_update_vm_observation_never_repins_or_indexes_a_local_buffer);
 
@@ -2862,6 +2909,7 @@ main(int argc, char **argv)
 	UT_RUN(test_heap_retry_preserves_exact_ready_before_considering_cancel);
 	UT_RUN(test_retry_requalification_keeps_ready_and_proves_actual_invalidation);
 	UT_RUN(test_retry_after_apply_refuses_without_canceling_shared_owner);
+	UT_RUN(test_retry_refusal_records_exact_cause_including_expiry_during_cancel);
 	UT_RUN(test_cancel_before_snapshot_violation_counter_is_live);
 	UT_RUN(test_update_toast_releases_outer_receipt_before_nested_producers);
 	UT_RUN(test_update_itl_wait_returns_through_receipt_and_page_requalification);

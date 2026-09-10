@@ -43,6 +43,8 @@ extern bool heap_receipt_test_plan_capture(ClusterUndoRecordPrepareReceipt *rece
 extern bool heap_receipt_test_plan_recheck(ClusterUndoRecordPrepareReceipt *receipt);
 extern int heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt *receipt,
 										  const ClusterCtrcTargetV1 *observed);
+extern void heap_receipt_test_current_handoff(void);
+extern void heap_receipt_test_current_mode(uint8 state);
 
 static char heap_receipt_error_detail[4096];
 
@@ -213,9 +215,9 @@ UT_TEST(reuse_applied_and_identity_drift_are_not_page_version_refreshes)
 	heap_receipt_fixture(image.data, &receipt, &before);
 	heap_receipt_cleanout(image.data, &before);
 	UT_ASSERT(heap_receipt_test_capture(image.data, false, receipt.record_type, &after));
-	after.publication_own_generation++;
-	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
 	after.publication_own_generation--;
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	after.publication_own_generation++;
 	receipt.ctrc_reuse_mask = 1;
 	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
 	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
@@ -284,10 +286,73 @@ UT_TEST(final_error_keeps_the_exact_cancel_snapshot_and_both_page_observations)
 	UT_ASSERT_EQ(receipt_apply_calls, 0);
 }
 
+UT_TEST(reacquired_current_keeps_unpublished_receipt_not_old_dml_plan)
+{
+	PGAlignedBlock image;
+	ClusterUndoRecordPrepareReceipt receipt, saved;
+	ClusterCtrcTargetV1 before, after, final_target;
+
+	heap_receipt_fixture(image.data, &receipt, &before);
+	saved = receipt;
+	UT_ASSERT(heap_receipt_test_plan_capture(&receipt));
+	heap_receipt_cleanout(image.data, &before);
+	heap_receipt_test_current_handoff();
+	UT_ASSERT(heap_receipt_test_authority_mismatch() != 0);
+	UT_ASSERT(!heap_receipt_test_plan_recheck(&receipt));
+	UT_ASSERT(heap_receipt_test_capture(image.data, false, receipt.record_type, &after));
+	UT_ASSERT_EQ(after.publication_own_generation, before.publication_own_generation + 1);
+	UT_ASSERT_EQ(after.publication_acquisition_epoch, before.publication_acquisition_epoch);
+	receipt_clock_us = 101;
+	UT_ASSERT(cluster_undo_record_prepared_recheck(&receipt, 64));
+	UT_ASSERT(cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	UT_ASSERT_EQ(cluster_undo_record_requalify_for_retry(&receipt, 64, false),
+				 CLUSTER_UNDO_RECORD_PREPARE_READY);
+	UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+	UT_ASSERT(heap_receipt_test_final(&receipt, &final_target));
+	UT_ASSERT_EQ(final_target.publication_own_generation, after.publication_own_generation);
+	heap_receipt_test_current_mode(PCM_STATE_S);
+	UT_ASSERT(!heap_receipt_test_final(&receipt, &final_target));
+	heap_receipt_test_current_mode(PCM_STATE_X);
+	UT_ASSERT(heap_receipt_test_plan_capture(&receipt));
+	UT_ASSERT(heap_receipt_test_plan_recheck(&receipt));
+	UT_ASSERT_EQ(receipt_cancel_calls, 0);
+	UT_ASSERT_EQ(receipt_apply_calls, 0);
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(reacquisition_cannot_cross_membership_or_retained_identity)
+{
+	PGAlignedBlock image;
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcTargetV1 before, after;
+
+	heap_receipt_fixture(image.data, &receipt, &before);
+	heap_receipt_test_current_handoff();
+	UT_ASSERT(heap_receipt_test_capture(image.data, false, receipt.record_type, &after));
+	UT_ASSERT(cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	after.publication_acquisition_epoch++;
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	after.publication_acquisition_epoch--;
+	after.block_number++;
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	after.block_number--;
+	after.publication_own_generation = 0;
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	after.publication_own_generation = before.publication_own_generation + 1;
+	receipt.ctrc_reuse_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	receipt.ctrc_reuse_mask = 0;
+	receipt.ctrc_applied_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	UT_ASSERT(!cluster_undo_record_ctrc_pending_matches(&receipt, 0, &after));
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(11);
 	UT_RUN(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline);
 	UT_RUN(final_itl_predecessor_is_captured_from_current_page);
 	UT_RUN(final_plan_drift_is_rejected_even_when_intent_is_compatible);
@@ -297,6 +362,8 @@ main(void)
 	UT_RUN(test_retry_requalification_keeps_ready_and_proves_actual_invalidation);
 	UT_RUN(cancel_evidence_belongs_only_to_the_exact_retry);
 	UT_RUN(final_error_keeps_the_exact_cancel_snapshot_and_both_page_observations);
+	UT_RUN(reacquired_current_keeps_unpublished_receipt_not_old_dml_plan);
+	UT_RUN(reacquisition_cannot_cross_membership_or_retained_identity);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

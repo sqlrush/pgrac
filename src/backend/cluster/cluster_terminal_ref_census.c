@@ -900,15 +900,23 @@ cluster_ctrc_pending_itl_target_recheck(const ClusterCtrcTargetV1 *stored,
 {
 	ClusterCtrcTargetV1 normalized;
 
-	if (!ctrc_target_pending_itl_valid(stored) || !ctrc_target_pending_itl_valid(observed))
+	if (!ctrc_target_pending_itl_valid(stored) || !ctrc_target_pending_itl_valid(observed)
+		|| observed->publication_own_generation < stored->publication_own_generation)
 		return false;
 	normalized = *observed;
 	normalized.predecessor_page_lsn = stored->predecessor_page_lsn;
 	normalized.predecessor_page_scn = stored->predecessor_page_scn;
 	normalized.predecessor_page_lsn_origin_node_id = stored->predecessor_page_lsn_origin_node_id;
+	/* An unpublished page intent is not retained current authority. A fresh
+	 * final content-X plan may bind a later local ownership generation, but
+	 * membership epoch and every logical/publication identity remain exact. */
+	normalized.publication_own_generation = stored->publication_own_generation;
 	if (memcmp(stored, &normalized, sizeof(normalized)) != 0)
 		return false;
-	if (memcmp(stored, observed, sizeof(*stored)) == 0)
+	if (stored->predecessor_page_lsn == observed->predecessor_page_lsn
+		&& stored->predecessor_page_scn == observed->predecessor_page_scn
+		&& stored->predecessor_page_lsn_origin_node_id
+			   == observed->predecessor_page_lsn_origin_node_id)
 		return true;
 	return cluster_ctrc_page_version_order(
 			   stored->predecessor_page_lsn_origin_node_id, stored->predecessor_page_lsn,
@@ -980,6 +988,7 @@ ctrc_target_itl_finalizes_prepared(const ClusterCtrcTargetV1 *pending,
 	observed.predecessor_page_scn = final_target->predecessor_page_scn;
 	observed.predecessor_page_lsn_origin_node_id
 		= final_target->predecessor_page_lsn_origin_node_id;
+	observed.publication_own_generation = final_target->publication_own_generation;
 	return cluster_ctrc_pending_itl_target_recheck(pending, &observed)
 		   && ctrc_target_itl_finalizes_exact(&observed, final_target);
 }

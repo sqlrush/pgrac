@@ -656,6 +656,34 @@ UT_TEST(test_ctrc_unpublished_itl_apply_accepts_forward_page_version)
 	}
 }
 
+UT_TEST(test_ctrc_unpublished_itl_reacquired_current_binds_only_at_apply)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcPublicationIdV1 publication
+		= test_publication(204, CTRC_REF_HEAP_ITL_UBA, CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+	ClusterCtrcTargetV1 pending = test_pending_itl_target();
+	ClusterCtrcTargetV1 exact = test_exact_itl_target();
+	ClusterCtrcReceipt receipt = { 0 };
+	ClusterCtrcApplyToken token;
+
+	exact.publication_own_generation++;
+	test_open_participant(&participant);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare(&participant, &publication, &pending, &receipt),
+				 CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(token.valid);
+	UT_ASSERT_EQ(memcmp(&receipt.target, &exact, sizeof(exact)), 0);
+	UT_ASSERT_EQ(participant.prepared_count, 0);
+	UT_ASSERT_EQ(participant.applied_count, 1);
+	UT_ASSERT_EQ(participant.cancelled_count, 0);
+	/* Once applied, another generation is not the same publication. */
+	exact.publication_own_generation++;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+				 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT(!token.valid);
+}
+
 UT_TEST(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fences)
 {
 	unsigned variant;
@@ -693,7 +721,7 @@ UT_TEST(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fenc
 			exact.block_number++;
 			break;
 		case 4:
-			exact.publication_own_generation++;
+			exact.publication_own_generation--;
 			break;
 		case 5:
 			exact.publication_acquisition_epoch++;
@@ -2219,10 +2247,10 @@ UT_TEST(test_ctrc_cleaner_resource_x_not_ready_is_a_clean_retry)
 	UT_ASSERT(
 		source_file_contains("src/include/storage/bufmgr.h",
 							 "extern bool ClusterLockBufferExclusiveRetryAware(Buffer buffer);"));
-	UT_ASSERT(source_file_contains("src/backend/storage/buffer/bufmgr.c",
-								   "result == RESOURCE_X_APPLY_BAD_STATE\n"
-								   "\t\t\t\t|| result == RESOURCE_X_APPLY_NOT_FOUND\n"
-								   "\t\t\t\t|| result == RESOURCE_X_APPLY_STALE"));
+	UT_ASSERT(source_file_contains(
+		"src/backend/storage/buffer/bufmgr.c",
+		"result == RESOURCE_X_APPLY_BAD_STATE || result == RESOURCE_X_APPLY_NOT_FOUND\n"
+		"\t\t\t\t || (result == RESOURCE_X_APPLY_STALE && aux_context == NULL)"));
 	UT_ASSERT(source_file_contains("src/backend/storage/buffer/bufmgr.c",
 								   "*pcm_x_transient_refused = true;"));
 	UT_ASSERT(source_file_contains("src/backend/storage/buffer/bufmgr.c",
@@ -2998,6 +3026,7 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_delayed_positive_proof_revalidates_open_grant),
 		CTRC_TEST_ENTRY(test_ctrc_receipt_prepare_apply_full_identity_cross_product),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_apply_accepts_forward_page_version),
+		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_reacquired_current_binds_only_at_apply),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fences),
 		CTRC_TEST_ENTRY(test_ctrc_offnum_still_requires_exact_predecessor_version),
 		CTRC_TEST_ENTRY(test_ctrc_shared_table_exact_duplicate_is_idempotent),

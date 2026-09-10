@@ -937,6 +937,7 @@ cluster_heap_ctrc_final_itl_target(
 {
 	ClusterItlSlotData predecessor;
 	ClusterItlSlotData successor;
+	ClusterPcmOwnSnapshot current;
 	Page page;
 
 	if (!BufferIsValid(buffer) || !TransactionIdIsValid(xid)
@@ -976,7 +977,20 @@ cluster_heap_ctrc_final_itl_target(
 	*final_target = receipt->ctrc_pending_targets[target_ordinal];
 	/* PREPARE kept an immutable observation floor. The exact publication
 	 * predecessor belongs to this locked page, not the earlier snapshot. */
-	if (!cluster_heap_ctrc_capture_predecessor_page_version(page, final_target))
+	if (cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1), &current)
+			!= CLUSTER_PCM_OWN_OK
+		|| !BufferTagsEqual(&current.tag, &GetBufferDescriptor(buffer - 1)->tag)
+		|| current.tag.spcOid != final_target->spc_oid || current.tag.dbOid != final_target->db_oid
+		|| current.tag.relNumber != final_target->rel_number
+		|| current.tag.forkNum != final_target->fork_number
+		|| current.tag.blockNum != final_target->block_number
+		|| cluster_epoch_get_current() != final_target->publication_acquisition_epoch
+		|| (current.generation != final_target->publication_own_generation
+			&& !cluster_pcm_x_content_holder_dml_authority_equivalent(&current, &current))
+		|| !cluster_heap_ctrc_capture_predecessor_page_version(page, final_target))
+		return false;
+	final_target->publication_own_generation = current.generation;
+	if (!cluster_undo_record_ctrc_pending_matches(receipt, target_ordinal, final_target))
 		return false;
 	final_target->kind = CTRC_TARGET_EXACT_ITL_SLOT;
 	final_target->itl_slot_index = slot_index;
