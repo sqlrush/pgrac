@@ -848,8 +848,8 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  *	lock-only remote path reuses the spec-3.4d bridge unchanged.
  */
 static bool
-cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
-							  TM_Result *res)
+cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, TM_Result *res,
+							  bool writer_bridge)
 {
 	HeapTupleHeader tuple = htup->t_data;
 	TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
@@ -972,6 +972,28 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 	is_delete = !lock_only && !HeapTupleHeaderIndicatesMovedPartitions(tuple)
 				&& ItemPointerEquals(&htup->t_self, &tuple->t_ctid);
 	kind = lock_only ? CLUSTER_VIS_XMAX_LOCK_ONLY : CLUSTER_VIS_XMAX_UPDATE;
+
+	/* Only consumers with the exact unlocked writer bridge may defer this
+	 * proof. TM_BeingModified is dispatch, not an IN_PROGRESS verdict. In
+	 * particular, do not perform the origin SCUR RPC below content-X merely
+	 * to discover that the bridge must release content-X and ask again. */
+	if (writer_bridge && cluster_peer_mode_enabled() && !lock_only
+		&& tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT
+		&& TransactionIdIsNormal(raw_xmax)) {
+		Page page = BufferGetPage(buffer);
+		const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+		ClusterUndoTTSlotRef ref;
+		NodeId origin = uba_origin_node_id(slot->undo_segment_head);
+
+		if (slot->flags == ITL_FLAG_ACTIVE && slot->xid == raw_xmax
+			&& !UBA_is_invalid(slot->undo_segment_head) && origin != InvalidNodeId
+			&& (int32)origin != cluster_node_id
+			&& cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) && ref.tt_slot_id != 0
+			&& ref.local_xid == raw_xmax && ref.origin_node_id == origin) {
+			*res = TM_BeingModified;
+			return true;
+		}
+	}
 
 	/* PGRAC serve-stall round-6: resolve ITL evidence BEFORE the raw
 	 * current-xid test (see the xmin leg above).  A raw match can be a
@@ -1096,8 +1118,8 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
 }
 #endif /* USE_PGRAC_CLUSTER */
 
-TM_Result
-HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
+static TM_Result
+heap_tuple_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer, bool writer_bridge)
 {
 	HeapTupleHeader tuple = htup->t_data;
 
@@ -1108,7 +1130,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 	{
 		TM_Result cluster_res;
 
-		if (cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res)) {
+		if (cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res, writer_bridge)) {
 			cluster_vis_bump_vis_update_fork_count();
 			return cluster_res;
 		}
@@ -1327,6 +1349,20 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 		return TM_Updated; /* updated by other */
 	else
 		return TM_Deleted; /* deleted by other */
+}
+
+TM_Result
+HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
+{
+	return heap_tuple_satisfies_update(htup, curcid, buffer, false);
+}
+
+/* UPDATE/DELETE/tuple-lock have an exact remote writer proof owner. Inplace
+ * and other native-only callers must keep the original entry above. */
+TM_Result
+HeapTupleSatisfiesUpdateForWriter(HeapTuple htup, CommandId curcid, Buffer buffer)
+{
+	return heap_tuple_satisfies_update(htup, curcid, buffer, true);
 }
 
 /*

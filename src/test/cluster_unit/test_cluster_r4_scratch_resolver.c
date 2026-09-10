@@ -59,6 +59,33 @@
 
 UT_DEFINE_GLOBALS();
 
+/* This fixture keeps its original non-writer HTSU entry. The new page-only
+ * writer route is exercised with real UBA decoding in r4_lock_order. */
+NodeId
+uba_origin_node_id(UBA uba pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return InvalidNodeId;
+}
+
+/* These scratch pages describe only the selected ref; there is no alternate
+ * on-page DATA/lock selector. Keep that absence explicit at the fixture edge. */
+bool
+cluster_itl_find_data_slot_index_by_xid(Page page pg_attribute_unused(),
+										TransactionId xid pg_attribute_unused(), uint8 *slot_index)
+{
+	*slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	return false;
+}
+
+bool
+cluster_itl_find_lock_slot_index_by_xmax(Page page pg_attribute_unused(),
+										 TransactionId xid pg_attribute_unused(), uint8 *slot_index)
+{
+	*slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	return false;
+}
+
 #define UT_SELF_NODE 3
 #define UT_PEER_NODE 11
 #define UT_UNDO_SEGMENT UINT16_C(0x1234)

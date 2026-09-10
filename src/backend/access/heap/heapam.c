@@ -9956,7 +9956,10 @@ l1:
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	}
 
-	result = HeapTupleSatisfiesUpdate(&tp, cid, buffer);
+	if (wait)
+		result = HeapTupleSatisfiesUpdateForWriter(&tp, cid, buffer);
+	else
+		result = HeapTupleSatisfiesUpdate(&tp, cid, buffer);
 #ifdef USE_PGRAC_CLUSTER
 	if (result != TM_BeingModified || !wait)
 		cluster_current_mx_operation_finish(
@@ -11253,7 +11256,10 @@ l2:
 #endif
 	checked_lockers = false;
 	locker_remains = false;
-	result = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);
+	if (wait)
+		result = HeapTupleSatisfiesUpdateForWriter(&oldtup, cid, buffer);
+	else
+		result = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);
 #ifdef USE_PGRAC_CLUSTER
 	if (result != TM_BeingModified || !wait)
 		cluster_current_mx_operation_finish(
@@ -14302,7 +14308,13 @@ l3:
 	cluster_current_mx_handled = false;
 	cluster_current_mx_recomposed = false;
 #endif
-	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
+	/* KeyShare can bypass the sleep/bridge on a non-key-changing DATA
+	 * update. It needs the original proved HTSU verdict, not dispatch-only
+	 * TM_BeingModified. The other modes always bridge a plain DATA writer. */
+	if (mode == LockTupleKeyShare)
+		result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
+	else
+		result = HeapTupleSatisfiesUpdateForWriter(tuple, cid, *buffer);
 #ifdef USE_PGRAC_CLUSTER
 	if (result != TM_BeingModified && result != TM_Updated
 		&& result != TM_Deleted)

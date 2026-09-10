@@ -433,8 +433,8 @@ UT_TEST(test_update_fork_preserves_native_self_three_state)
 	helper = start == NULL
 		? NULL
 		: strstr(start, "cluster_vis_update_native_self_verdict(");
-	entry = strstr(source,
-		"cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res)");
+	entry = strstr(
+		source, "cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res, writer_bridge)");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -818,6 +818,39 @@ UT_TEST(test_canonical_active_is_prepared_before_heap_content_lock)
 }
 
 
+UT_TEST(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *cursor = source;
+	int count = 0;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	while ((cursor = strstr(cursor, "= HeapTupleSatisfiesUpdateForWriter(")) != NULL) {
+		count++;
+		cursor++;
+	}
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT(
+		strstr(source, "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&tp, cid, "
+					   "buffer);\n\telse\n\t\tresult = HeapTupleSatisfiesUpdate(&tp, cid, buffer);")
+		!= NULL);
+	UT_ASSERT(
+		strstr(source,
+			   "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&oldtup, cid, "
+			   "buffer);\n\telse\n\t\tresult = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);")
+		!= NULL);
+	UT_ASSERT(strstr(source, "if (mode == LockTupleKeyShare)\n\t\tresult = "
+							 "HeapTupleSatisfiesUpdate(tuple, cid, *buffer);\n\telse\n\t\tresult = "
+							 "HeapTupleSatisfiesUpdateForWriter(tuple, cid, *buffer);")
+			  != NULL);
+	UT_ASSERT(
+		strstr(source, "result = HeapTupleSatisfiesUpdate(&oldtup, GetCurrentCommandId(false),")
+		!= NULL);
+	free(source);
+}
+
 int
 main(void)
 {
@@ -844,5 +877,6 @@ main(void)
 	UT_RUN(test_deleting_xmax_error_names_actual_xmax);
 	UT_RUN(test_tt_retention_rollover_follower_reclassifies_current_segment);
 	UT_RUN(test_canonical_active_is_prepared_before_heap_content_lock);
+	UT_RUN(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts);
 	UT_DONE();
 }
