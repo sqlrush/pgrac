@@ -3230,6 +3230,45 @@ cluster_undo_cleaner_main_loop_iters(void)
 {
 	return 0;
 }
+
+/* Cross-module monitoring accessors; no cleaner is started by this fixture. */
+uint64
+cluster_undo_cleaner_capacity_wait_entered(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_cleaner_capacity_wait_repolled(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_cleaner_capacity_wait_refused_context(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_cleaner_capacity_wait_refused_proof(void)
+{
+	return 0;
+}
+bool
+cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out)
+{
+	(void)worker_id;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
+										ClusterCtrcCleanerWorkerObservation *out)
+{
+	(void)worker_id;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
 /* spec-3.12 D5 retention counter stubs (dump_undo references these). */
 uint64
 cluster_tt_slot_retention_horizon_scn(void)
