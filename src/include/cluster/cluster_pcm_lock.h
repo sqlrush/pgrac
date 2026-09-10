@@ -1483,6 +1483,22 @@ typedef struct ResourceXCallerWitness {
 	PcmRxRequesterWaitReason reobserve_reason;
 } ResourceXCallerWitness;
 
+/* Caller-owned auxiliary handle requalification. This is a local observation
+ * cursor, not a retained grant, a pin or a wire identity. Keep it across a
+ * failed repin so descriptor replacement cannot erase caller failure history
+ * or restart the logical acquisition's diagnostic age. */
+typedef struct ResourceXAuxiliaryAcquireContext {
+	BufferTag resource;
+	ResourceXCallerWitness caller;
+	PcmRxRequesterWaitState wait_state;
+	uint64 r4_record_generation;
+	uint64 absolute_deadline_us;
+	uint64 diagnostic_request_sequence;
+	uint64 reobserve_count;
+	bool active;
+	bool reobserve;
+} ResourceXAuxiliaryAcquireContext;
+
 /* Local residency, not a wire identity or permission to modify page bytes. */
 typedef struct ResourceXDeliveryTarget {
 	uint64 generation;

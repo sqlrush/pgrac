@@ -150,6 +150,9 @@
 /* prototypes for internal routines */
 static Buffer vm_readbuf(Relation rel, BlockNumber blkno, bool extend);
 static Buffer vm_extend(Relation rel, BlockNumber vm_nblocks);
+static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
+									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
+									 uint8 flags);
 
 
 /*
@@ -181,6 +184,21 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
+}
+
+bool
+visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 flags,
+								struct ResourceXAuxiliaryAcquireContext *context, bool *cleared)
+{
+	Assert(vmbuf != NULL && cleared != NULL && context != NULL);
+	*cleared = false;
+	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+		elog(ERROR, "wrong buffer passed to visibilitymap_clear_retry_aware");
+	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
+		return false;
+	*cleared = visibilitymap_clear_locked(rel, heapBlk, *vmbuf, flags);
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+	return true;
 }
 
 /*
@@ -319,6 +337,32 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
 				  uint8 flags)
 {
+	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
+		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
+	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags);
+	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
+}
+
+bool
+visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
+							  Buffer *vmbuf, TransactionId cutoff_xid, uint8 flags,
+							  struct ResourceXAuxiliaryAcquireContext *context)
+{
+	Assert(vmbuf != NULL && context != NULL);
+	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
+	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
+		return false;
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, *vmbuf, cutoff_xid, flags);
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+	return true;
+}
+
+static void
+visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
+						 Buffer vmBuf, TransactionId cutoff_xid, uint8 flags)
+{
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
@@ -345,8 +389,7 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 
 	page = BufferGetPage(vmBuf);
-	map = (uint8 *) PageGetContents(page);
-	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
+	map = (uint8 *)PageGetContents(page);
 
 	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS))
 	{
@@ -383,8 +426,6 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 
 		END_CRIT_SECTION();
 	}
-
-	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
 }
 
 /*

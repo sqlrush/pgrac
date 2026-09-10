@@ -232,11 +232,12 @@ pg_attribute_unused()
 
 static void
 fixture_ordinary_lock(Buffer buffer, int mode, bool *barrier, void *deadline, bool *replaced,
-					  bool *transient)
+					  bool *transient, ResourceXAuxiliaryAcquireContext *context)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
 	UT_ASSERT(barrier == NULL && deadline == NULL && transient == NULL);
+	UT_ASSERT(context == NULL);
 	UT_ASSERT(!fixture_content_held);
 	UT_ASSERT_EQ(fixture_track, 0);
 	*replaced = false;

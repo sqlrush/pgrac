@@ -310,6 +310,15 @@ extern void ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_i
 extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
 											 ClusterBufferBarrierSiteId site_id,
 											 bool *pin_replaced);
+
+struct ResourceXAuxiliaryAcquireContext;
+/* False owns no target content lock/writer entry. A replaced handle is
+ * invalidated, not released again. The caller owns every affected alias and
+ * must requalify its outer page proof before the next attempt. */
+extern bool
+ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer,
+										 struct ResourceXAuxiliaryAcquireContext *context);
+extern bool ClusterBufferAuxiliaryObservationUnowned(Buffer buffer);
 /* PGRAC: EXCLUSIVE lock for pass-based auxiliary work.  False is a clean
  * pre-content-X Resource-X retry; the caller retains only its original pin. */
 extern bool ClusterLockBufferExclusiveRetryAware(Buffer buffer);

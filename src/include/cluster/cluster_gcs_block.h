@@ -4643,6 +4643,13 @@ cluster_gcs_resource_x_target_acquire_until_exact(
 	BufferDesc *buf, const BufferTag *expected_resource,
 	uint64 r4_record_generation,
 	uint64 *absolute_deadline_us_io, ResourceXAcquisitionRef *ref_out);
+
+/* Only a deliberate, unpinned VM/FSM handoff owner may opt into this entry.
+ * NOT_FOUND plus context->reobserve exports no authority and requires the
+ * upper handle owner to repin by the original tag before trying again. */
+extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_reobserve_exact(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	ResourceXAuxiliaryAcquireContext *context, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_prepare_exact(
 	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,

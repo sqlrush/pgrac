@@ -229,6 +229,12 @@ typedef struct HeapPageFreeze
  */
 #define HeapScanIsValid(scan) PointerIsValid(scan)
 
+/* Caller holds the heap pin, but no heap content lock. On return heap X is
+ * held and, when all-visible, VM has been repinned without I/O under heap X.
+ * Page/tuple proofs must be recomputed after this requalification boundary. */
+extern void cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block,
+											Buffer heap_buffer, Buffer *vmbuffer);
+
 extern TableScanDesc heap_beginscan(Relation relation, Snapshot snapshot,
 									int nkeys, ScanKey key,
 									ParallelTableScanDesc parallel_scan,

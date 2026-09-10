@@ -2960,12 +2960,11 @@ cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
 }
 
 static ClusterPcmXWriterLedgerEntry *
-cluster_bufmgr_pcm_x_writer_prepare_target(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	PcmLockMode mode, uint64 r4_generation,
-	uint64 *absolute_deadline_us,
-	bool *pcm_barrier_refused,
-	bool *pcm_x_transient_refused)
+cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *expected_resource,
+										   PcmLockMode mode, uint64 r4_generation,
+										   uint64 *absolute_deadline_us, bool *pcm_barrier_refused,
+										   bool *pcm_x_transient_refused,
+										   ResourceXAuxiliaryAcquireContext *aux_context)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmOwnSnapshot granted;
@@ -2978,10 +2977,14 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 	uint64 current_r4_generation = 0;
 	LWLock *content_lock;
 
-	if (mode != PCM_LOCK_MODE_X || buf == NULL || expected_resource == NULL
-		|| !cluster_bufmgr_should_pcm_track(buf)
-		|| r4_generation == 0 || r4_generation == UINT64_MAX
-		|| absolute_deadline_us == NULL
+	if (mode != PCM_LOCK_MODE_X || buf == NULL
+		|| expected_resource == NULL
+		/* An auxiliary handoff has already released the pin. Classify the
+		 * original resource, not a slot that DROP may have just cleared. */
+		|| !(aux_context != NULL
+				 ? cluster_pcm_x_buffer_tag_tracked(expected_resource, cluster_shared_catalog)
+				 : cluster_bufmgr_should_pcm_track(buf))
+		|| r4_generation == 0 || r4_generation == UINT64_MAX || absolute_deadline_us == NULL
 		|| *absolute_deadline_us == UINT64_MAX)
 		return NULL;
 	content_lock = BufferDescriptorGetContentLock(buf);
@@ -3015,13 +3018,21 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 		MemSet(&gate, 0, sizeof(gate));
 		MemSet(&context, 0, sizeof(context));
 
-		result = cluster_gcs_resource_x_target_acquire_until_exact(
-			buf, expected_resource, r4_generation,
-			absolute_deadline_us, &terminal_ref);
+		if (aux_context != NULL) {
+			result = cluster_gcs_resource_x_target_acquire_reobserve_exact(
+				buf, expected_resource, r4_generation, aux_context, &terminal_ref);
+			*absolute_deadline_us = aux_context->absolute_deadline_us;
+		} else
+			result = cluster_gcs_resource_x_target_acquire_until_exact(
+				buf, expected_resource, r4_generation, absolute_deadline_us, &terminal_ref);
 		if (result != RESOURCE_X_APPLY_APPLIED
 			&& result != RESOURCE_X_APPLY_DUPLICATE)
 		{
 			cluster_bufmgr_pcm_x_writer_clear(entry);
+			if (aux_context != NULL && aux_context->reobserve) {
+				Assert(result == RESOURCE_X_APPLY_NOT_FOUND);
+				return NULL;
+			}
 			(void) cluster_pcm_lock_resource_x_gate_snapshot(&gate);
 			if (gate.phase != RESOURCE_X_GATE_OPEN
 				&& pcm_barrier_refused != NULL)
@@ -3033,11 +3044,9 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 			 * routine's pre-content-X retry surface.  Only an explicitly
 			 * retry-aware caller may consume them without ERROR, and only after
 			 * this call's process-local writer ledger has been cleared. */
-			if ((result == RESOURCE_X_APPLY_BAD_STATE
-				|| result == RESOURCE_X_APPLY_NOT_FOUND
-				|| result == RESOURCE_X_APPLY_STALE)
-				&& pcm_x_transient_refused != NULL)
-			{
+			if ((result == RESOURCE_X_APPLY_BAD_STATE || result == RESOURCE_X_APPLY_NOT_FOUND
+				 || (result == RESOURCE_X_APPLY_STALE && aux_context == NULL))
+				&& pcm_x_transient_refused != NULL) {
 				*pcm_x_transient_refused = true;
 				return NULL;
 			}
@@ -3514,6 +3523,20 @@ cluster_bufmgr_pcm_x_writer_reset(void)
  * while holding the matching buffer header spinlock so pin + mapping identity
  * are captured in one critical section. */
 static inline int32 GetPrivateRefCount(Buffer buffer);
+
+bool
+ClusterBufferAuxiliaryObservationUnowned(Buffer buffer)
+{
+	BufferDesc *buf;
+	ClusterPcmXWriterLedgerEntry *entry;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) || GetPrivateRefCount(buffer) != 0)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	entry = cluster_bufmgr_pcm_x_writer_find(buf);
+	return entry != NULL && entry->phase == PCM_X_WRITER_LEDGER_HANDOFF
+		   && !LWLockHeldByMe(BufferDescriptorGetContentLock(buf));
+}
 
 /* VM/FSM readers may consume bytes under a pin without taking the content
  * lock, so no such pin may cross a distributed Resource-X conversion.  This
@@ -10349,9 +10372,9 @@ ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
 
 static void
 LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
-				   const ClusterBufferBarrierSiteId *barrier_site_id,
-				   bool *pcm_pin_replaced,
-				   bool *pcm_x_transient_refused)
+				   const ClusterBufferBarrierSiteId *barrier_site_id, bool *pcm_pin_replaced,
+				   bool *pcm_x_transient_refused,
+				   struct ResourceXAuxiliaryAcquireContext *aux_context)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
@@ -10457,11 +10480,17 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 						RESOURCE_X_APPLY_STALE, buf,
 						"Resource-X target pin handoff");
 				pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_target(
-					buf, &pcm_expected_resource, pcm_mode,
-					pcm_writer_r4_generation,
-					&pcm_x_absolute_deadline_us,
-					pcm_barrier_refused,
-					pcm_x_transient_refused);
+					buf, &pcm_expected_resource, pcm_mode, pcm_writer_r4_generation,
+					&pcm_x_absolute_deadline_us, pcm_barrier_refused, pcm_x_transient_refused,
+					aux_context);
+				if (aux_context != NULL && aux_context->reobserve) {
+					Assert(pcm_aux_pin_required && pcm_aux_pin_handoff.active);
+					Assert(pcm_x_writer == NULL && pcm_pin_replaced != NULL);
+					Assert(GetPrivateRefCount(buffer) == 0);
+					pcm_aux_pin_handoff.active = false;
+					*pcm_pin_replaced = true;
+					return;
+				}
 				if ((pcm_barrier_refused != NULL && *pcm_barrier_refused)
 					|| (pcm_x_transient_refused != NULL
 						&& *pcm_x_transient_refused))
@@ -10750,7 +10779,7 @@ cluster_lockbuffer_barrier_refusal:
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	LockBufferInternal(buffer, mode, NULL, NULL, NULL, NULL);
+	LockBufferInternal(buffer, mode, NULL, NULL, NULL, NULL, NULL);
 }
 
 /*
@@ -10779,11 +10808,45 @@ ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
 
 	if (pin_replaced != NULL)
 		*pin_replaced = false;
-	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused,
-		&site_id, &replaced, &transient_refused);
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, &site_id, &replaced,
+					   &transient_refused, NULL);
 	if (pin_replaced != NULL)
 		*pin_replaced = replaced;
 	return !barrier_refused && !transient_refused && !replaced;
+}
+
+bool
+ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer,
+										 struct ResourceXAuxiliaryAcquireContext *context)
+{
+	bool barrier_refused = false;
+	bool replaced = false;
+	bool transient_refused = false;
+
+	Assert(buffer != NULL && BufferIsValid(*buffer) && context != NULL);
+#ifdef USE_PGRAC_CLUSTER
+	if (!BufferIsLocal(*buffer) && cluster_pcm_is_active()) {
+		BufferDesc *buf = GetBufferDescriptor(*buffer - 1);
+
+		/* One explicit handle cannot repair unknown aliases after all private
+		 * pins have been handed off. Reject misuse before releasing any pin. */
+		if (GetPrivateRefCount(*buffer) != 1
+			|| cluster_pcm_x_revoke_finish_mode(&buf->tag, 0) != CLUSTER_PCM_X_REVOKE_FINISH_DROP
+			|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_INVALID, buf,
+															"auxiliary reobserve handle contract");
+	}
+#endif
+	LockBufferInternal(*buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, NULL, &replaced,
+					   &transient_refused, context);
+	if (replaced)
+		*buffer = InvalidBuffer;
+	if (barrier_refused || replaced || transient_refused)
+		return false;
+#ifdef USE_PGRAC_CLUSTER
+	memset(context, 0, sizeof(*context));
+#endif
+	return true;
 }
 
 /*
@@ -10803,8 +10866,8 @@ ClusterLockBufferExclusiveRetryAware(Buffer buffer)
 	bool		barrier_refused = false;
 	bool		transient_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused,
-		NULL, NULL, &transient_refused);
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, NULL, NULL,
+					   &transient_refused, NULL);
 	return !barrier_refused && !transient_refused;
 }
 
@@ -10823,8 +10886,7 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL, NULL,
-		NULL);
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL, NULL, NULL, NULL);
 	return !barrier_refused;
 }
 
@@ -10863,8 +10925,8 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 				buf, kind, &direct_init_proof, &pending_observed);
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X)
 			{
-				LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE,
-					NULL, NULL, &pin_replaced, NULL);
+				LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, NULL, NULL, &pin_replaced, NULL,
+								   NULL);
 				if (!pin_replaced)
 					elog(DEBUG1,
 						 "aux consumer ordinary locked: pid=%d tag=%u/%u/%u/%u/%u page_new=%d "

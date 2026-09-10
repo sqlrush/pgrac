@@ -215,6 +215,32 @@ test_pgrac_aux_vm_pin(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
+/* A retry invalidates the old observation, not these proof obligations.
+ * Recompute all of them after every caller-owned heap-lock reentry. */
+static Page
+aux_mutation_heap_proof(Buffer heap_buffer)
+{
+	Page heap_page = BufferGetPage(heap_buffer);
+	OffsetNumber offset;
+
+	if (PageIsNew(heap_page) || !PageIsAllVisible(heap_page))
+		ereport(ERROR,
+				(errmsg("auxiliary mutation requires an initialized all-visible heap page")));
+	for (offset = FirstOffsetNumber; offset <= PageGetMaxOffsetNumber(heap_page); offset++) {
+		ItemId item = PageGetItemId(heap_page, offset);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsUsed(item))
+			continue;
+		if (!ItemIdIsNormal(item))
+			ereport(ERROR, (errmsg("auxiliary mutation refuses non-normal heap items")));
+		tuple = (HeapTupleHeader)PageGetItem(heap_page, item);
+		if (!HeapTupleHeaderXminFrozen(tuple) || !(tuple->t_infomask & HEAP_XMAX_INVALID))
+			ereport(ERROR, (errmsg("auxiliary mutation requires every tuple frozen without xmax")));
+	}
+	return heap_page;
+}
+
 /* Finite legal mutation, not a claim that a remote handoff took place.  The
  * caller assigns different frozen heap pages to concurrent workers; all may
  * share one auxiliary map page.  Table ShareLock excludes ordinary DML, and
@@ -230,7 +256,7 @@ aux_cycle_internal(FunctionCallInfo fcinfo, bool describe)
 	Buffer heap_buffer;
 	Buffer vm_buffer = InvalidBuffer;
 	Page heap_page;
-	OffsetNumber offset;
+	ResourceXAuxiliaryAcquireContext aux_context = { 0 };
 	Size before;
 	Size after;
 	Size available;
@@ -261,36 +287,41 @@ aux_cycle_internal(FunctionCallInfo fcinfo, bool describe)
 	if (fork_arg == VISIBILITYMAP_FORKNUM)
 		visibilitymap_pin(relation, block, &vm_buffer);
 	heap_buffer = ReadBuffer(relation, block);
-	LockBuffer(heap_buffer, BUFFER_LOCK_EXCLUSIVE);
-	heap_page = BufferGetPage(heap_buffer);
-	if (PageIsNew(heap_page) || !PageIsAllVisible(heap_page))
-		ereport(ERROR,
-				(errmsg("auxiliary mutation requires an initialized all-visible heap page")));
-	for (offset = FirstOffsetNumber; offset <= PageGetMaxOffsetNumber(heap_page); offset++) {
-		ItemId item = PageGetItemId(heap_page, offset);
-		HeapTupleHeader tuple;
-
-		if (!ItemIdIsUsed(item))
-			continue;
-		if (!ItemIdIsNormal(item))
-			ereport(ERROR, (errmsg("auxiliary mutation refuses non-normal heap items")));
-		tuple = (HeapTupleHeader)PageGetItem(heap_page, item);
-		if (!HeapTupleHeaderXminFrozen(tuple) || !(tuple->t_infomask & HEAP_XMAX_INVALID))
-			ereport(ERROR, (errmsg("auxiliary mutation requires every tuple frozen without xmax")));
-	}
+	if (fork_arg == VISIBILITYMAP_FORKNUM)
+		cluster_heap_lock_with_vm_repin(relation, block, heap_buffer, &vm_buffer);
+	else
+		LockBuffer(heap_buffer, BUFFER_LOCK_EXCLUSIVE);
+	heap_page = aux_mutation_heap_proof(heap_buffer);
 
 	if (fork_arg == VISIBILITYMAP_FORKNUM) {
+		bool cleared = false;
+
 		before = visibilitymap_get_status(relation, block, &vm_buffer);
 		if (before != VISIBILITYMAP_VALID_BITS)
 			ereport(ERROR, (errmsg("auxiliary mutation requires a pre-frozen visibility map")));
-		if (!visibilitymap_clear(relation, block, vm_buffer, VISIBILITYMAP_VALID_BITS)
-			|| visibilitymap_get_status(relation, block, &vm_buffer) != 0)
+		while (!visibilitymap_clear_retry_aware(relation, block, &vm_buffer,
+												VISIBILITYMAP_VALID_BITS, &aux_context, &cleared)) {
+			LockBuffer(heap_buffer, BUFFER_LOCK_UNLOCK);
+			CHECK_FOR_INTERRUPTS();
+			cluster_heap_lock_with_vm_repin(relation, block, heap_buffer, &vm_buffer);
+			heap_page = aux_mutation_heap_proof(heap_buffer);
+		}
+		if (!cleared || visibilitymap_get_status(relation, block, &vm_buffer) != 0)
 			ereport(ERROR, (errmsg("auxiliary mutation did not clear the exact visibility bits")));
 		/* The page is independently proven frozen under content-X.  Clearing
 		 * is conservative; only the existing WAL-producing set API restores it. */
 		MarkBufferDirty(heap_buffer);
-		visibilitymap_set(relation, block, heap_buffer, InvalidXLogRecPtr, vm_buffer,
-						  InvalidTransactionId, VISIBILITYMAP_VALID_BITS);
+		while (!visibilitymap_set_retry_aware(relation, block, heap_buffer, InvalidXLogRecPtr,
+											  &vm_buffer, InvalidTransactionId,
+											  VISIBILITYMAP_VALID_BITS, &aux_context)) {
+			/* Clear already completed. Do not replay it or demand initial VM
+			 * bits again; only a freshly re-proven heap may restore the bits. */
+			LockBuffer(heap_buffer, BUFFER_LOCK_UNLOCK);
+			CHECK_FOR_INTERRUPTS();
+			cluster_heap_lock_with_vm_repin(relation, block, heap_buffer, &vm_buffer);
+			heap_page = aux_mutation_heap_proof(heap_buffer);
+			MarkBufferDirty(heap_buffer);
+		}
 		after = visibilitymap_get_status(relation, block, &vm_buffer);
 		ReleaseBuffer(vm_buffer);
 	} else {

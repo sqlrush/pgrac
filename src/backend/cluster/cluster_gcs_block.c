@@ -14136,15 +14136,28 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 			 snapshot.master_node, snapshot.master_session, snapshot.r4_generation)));
 }
 
+/* A descriptor observed after deliberate unpin is not a retained identity.
+ * The caller computes unowned from its handoff context, never from the new
+ * occupant's writer flags. A torn generation remains a hard contradiction. */
 static ResourceXApplyResult
-gcs_block_resource_x_target_acquire_internal(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 r4_record_generation,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	bool join_only,
-	uint64 *absolute_deadline_us_io,
-	ResourceXAcquisitionRef *ref_out)
+gcs_block_resource_x_target_own_observation_result(const ClusterPcmOwnSnapshot *own,
+												   const BufferTag *resource, bool unowned)
+{
+	if (own->generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&own->tag, resource))
+		return unowned ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_STALE;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *expected_resource,
+											 uint64 r4_record_generation,
+											 uint64 direct_init_ownership_generation,
+											 uint64 direct_init_reservation_token, bool join_only,
+											 uint64 *absolute_deadline_us_io,
+											 ResourceXAuxiliaryAcquireContext *aux_context,
+											 ResourceXAcquisitionRef *ref_out)
 {
 	BufferTag resource;
 	ClusterPcmOwnSnapshot own;
@@ -14165,7 +14178,9 @@ gcs_block_resource_x_target_acquire_internal(
 		= RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	ResourceXBootstrapRoundFailureSnapshot failure_round;
 	ResourceXTargetInstallContinuation target_install_follow;
-	ResourceXCallerWitness caller_witness;
+	ResourceXCallerWitness local_caller_witness;
+	ResourceXCallerWitness *caller_witness
+		= aux_context != NULL ? &aux_context->caller : &local_caller_witness;
 	GcsResourceXWaitDiagnostic wait_diagnostic = { 0 };
 	ResourceXTargetInstallFollowState target_install_follow_state
 		= RESOURCE_X_TARGET_INSTALL_INVALID;
@@ -14246,7 +14261,7 @@ gcs_block_resource_x_target_acquire_internal(
 		memset(ref_out, 0, sizeof(*ref_out));
 	memset(&own, 0, sizeof(own));
 	memset(&target_install_follow, 0, sizeof(target_install_follow));
-	memset(&caller_witness, 0, sizeof(caller_witness));
+	memset(&local_caller_witness, 0, sizeof(local_caller_witness));
 	memset(&gate, 0, sizeof(gate));
 	memset(&terminal_gate, 0, sizeof(terminal_gate));
 	memset(&assertion, 0, sizeof(assertion));
@@ -14279,8 +14294,14 @@ gcs_block_resource_x_target_acquire_internal(
 	}
 	diagnostic_request_sequence
 		= gcs_block_resource_x_next_diagnostic_request_sequence();
+	if (aux_context != NULL) {
+		if (aux_context->diagnostic_request_sequence == 0)
+			aux_context->diagnostic_request_sequence = diagnostic_request_sequence;
+		diagnostic_request_sequence = aux_context->diagnostic_request_sequence;
+		wait_diagnostic.state = aux_context->wait_state;
+	}
 	wait_diagnostic.tag = &resource;
-	wait_diagnostic.caller = &caller_witness;
+	wait_diagnostic.caller = caller_witness;
 	wait_diagnostic.request_sequence = diagnostic_request_sequence;
 	wait_diagnostic.budget_us = diagnostic_caller_budget_us;
 	if (direct_init)
@@ -14457,10 +14478,10 @@ gcs_block_resource_x_target_acquire_internal(
 					target_retained_release_inflight = false;
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
 						&assertion, gate.formation, master_session, admission.record_generation,
-						&caller_witness);
+						caller_witness);
 					if (result == RESOURCE_X_APPLY_DUPLICATE) {
 						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 caller_witness.reobserve_reason);
+																 caller_witness->reobserve_reason);
 						memset(&target_install_follow, 0, sizeof(target_install_follow));
 						target_install_preuse_retry_seen = false;
 						continue;
@@ -14481,11 +14502,36 @@ gcs_block_resource_x_target_acquire_internal(
 						: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
-					if (!BufferTagsEqual(&own.tag, &assertion.resource)
-						|| own.generation == UINT64_MAX) {
-						result = RESOURCE_X_APPLY_STALE;
-						break;
+				result = gcs_block_resource_x_target_own_observation_result(
+					&own, &assertion.resource,
+					aux_context != NULL && !direct_init && !join_only
+						&& ClusterBufferAuxiliaryObservationUnowned(
+							BufferDescriptorGetBuffer(buf)));
+				if (result != RESOURCE_X_APPLY_APPLIED) {
+					if (result == RESOURCE_X_APPLY_NOT_FOUND && aux_context != NULL) {
+						aux_context->reobserve = true;
+						if (aux_context->reobserve_count < UINT64_MAX)
+							aux_context->reobserve_count++;
+						diagnostic_stage = "auxiliary-handle-reobserve";
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
+						if (aux_context->reobserve_count == 1)
+							ereport(
+								LOG,
+								(errmsg_internal("Resource-X auxiliary observation replaced"),
+								 errdetail(
+									 "PGRAC_FAMILY=RESOURCE_X_DIAGNOSTIC "
+									 "PGRAC_REASON=AUX_HANDLE_REOBSERVE request=" UINT64_FORMAT
+									 " buffer=%d tag=%u/%u/%u/%u/%u observed=%u/%u/%u/%u/%u "
+									 "age_us=" UINT64_FORMAT " action=caller_owned_repin",
+									 diagnostic_request_sequence, buf->buf_id, resource.spcOid,
+									 resource.dbOid, resource.relNumber, (unsigned)resource.forkNum,
+									 resource.blockNum, own.tag.spcOid, own.tag.dbOid,
+									 own.tag.relNumber, (unsigned)own.tag.forkNum, own.tag.blockNum,
+									 wait_diagnostic.state.total_age_us)));
 					}
+					break;
+				}
 					if (target_install_follow.valid) {
 						diagnostic_stage = "target-install-follow-classify";
 						diagnostic_follow_attempt = target_install_follow.acquisition_generation;
@@ -15039,7 +15085,7 @@ gcs_block_resource_x_target_acquire_internal(
 					gcs_block_pcm_x_retry_timeout_us(), now_us, retry_slice_us,
 					direct_init_ownership_generation, direct_init_reservation_token, !join_only,
 					own.pcm_state == PCM_STATE_N, cached_local_x,
-					cached_local_x ? own.generation : 0, &caller_witness, &own, &dispatch,
+					cached_local_x ? own.generation : 0, caller_witness, &own, &dispatch,
 					&terminal_ref);
 
 			target_install_terminal_recheck:
@@ -15147,11 +15193,11 @@ gcs_block_resource_x_target_acquire_internal(
 					 * T3 cannot resurrect a caller attached to a failed attempt. */
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
 						&assertion, gate.formation, master_session, admission.record_generation,
-						&caller_witness);
+						caller_witness);
 					if (result == RESOURCE_X_APPLY_DUPLICATE) {
 						memset(ref_out, 0, sizeof(*ref_out));
 						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 caller_witness.reobserve_reason);
+																 caller_witness->reobserve_reason);
 						continue;
 					}
 					now_us = gcs_block_pcm_x_monotonic_us();
@@ -15167,7 +15213,7 @@ gcs_block_resource_x_target_acquire_internal(
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE) {
 					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-															 caller_witness.reobserve_reason);
+															 caller_witness->reobserve_reason);
 					memset(&target_install_follow, 0, sizeof(target_install_follow));
 					target_install_preuse_retry_seen = false;
 					continue;
@@ -15451,7 +15497,7 @@ gcs_block_resource_x_target_acquire_internal(
 								 * pre-admission discard, not a failed delivery.
 								 * Keep the caller deadline while leaving that
 								 * retired, non-authoritative attempt. */
-								memset(&caller_witness, 0, sizeof(caller_witness));
+								memset(caller_witness, 0, sizeof(*caller_witness));
 								master_node = rebound_master_node;
 								master_session = rebound_master_session;
 								requester_sender_connection_generation
@@ -15528,12 +15574,12 @@ gcs_block_resource_x_target_acquire_internal(
 							&assertion, master_node, gate.formation, master_session,
 							admission.record_generation, requester_sender_connection_generation,
 							master_ingress_connection_generation, retry_slice_us,
-							absolute_deadline_us, timeout_ms, &caller_witness);
+							absolute_deadline_us, timeout_ms, caller_witness);
 					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
 					if (wait_result == RESOURCE_X_APPLY_DUPLICATE
-						&& caller_witness.reobserve_attempt != 0)
+						&& caller_witness->reobserve_attempt != 0)
 						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 caller_witness.reobserve_reason);
+																 caller_witness->reobserve_reason);
 					diagnostic_deadline_expired
 						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
 					diagnostic_head_expired
@@ -15639,6 +15685,14 @@ gcs_block_resource_x_target_acquire_internal(
 				diagnostic_stage, diagnostic_request_sequence, ended_us);
 	}
 	cluster_semantic_activation_leave(&admission);
+	if (aux_context != NULL) {
+		aux_context->wait_state = wait_diagnostic.state;
+		if (aux_context->reobserve) {
+			Assert(result == RESOURCE_X_APPLY_NOT_FOUND);
+			memset(ref_out, 0, sizeof(*ref_out));
+			return result;
+		}
+	}
 	if (result != RESOURCE_X_APPLY_APPLIED && !first_failure_recorded) {
 		memset(&failure_round, 0, sizeof(failure_round));
 		failure_snapshot_result
@@ -15734,8 +15788,8 @@ gcs_block_resource_x_target_acquire_internal(
 				 (unsigned long long)own.writer_activation_token,
 				 (unsigned long long)own.resource_x_activation_generation,
 				 (unsigned long long)now_us, (unsigned long long)absolute_deadline_us,
-				 (unsigned long long)caller_witness.joined_request.assertion_sequence,
-				 (unsigned long long)caller_witness.failed_attempt,
+				 (unsigned long long)caller_witness->joined_request.assertion_sequence,
+				 (unsigned long long)caller_witness->failed_attempt,
 				 (unsigned long long)diagnostic_follow_attempt,
 				 (unsigned long long)diagnostic_follow_generation,
 				 (unsigned long long)diagnostic_follow_token, (int)target_install_follow_state,
@@ -15748,8 +15802,8 @@ gcs_block_resource_x_target_acquire_internal(
 		gcs_resource_x_acquire_diagnostic.attempt = 0;
 		gcs_resource_x_acquire_diagnostic.reason = cluster_gcs_resource_x_acquire_failure_reason(
 			diagnostic_head_expired, diagnostic_deadline_expired, result);
-		if (caller_witness.failed_attempt != 0) {
-			gcs_resource_x_acquire_diagnostic.attempt = caller_witness.failed_attempt;
+		if (caller_witness->failed_attempt != 0) {
+			gcs_resource_x_acquire_diagnostic.attempt = caller_witness->failed_attempt;
 			gcs_resource_x_acquire_diagnostic.reason = "FAILED_CALLER_ATTEMPT";
 		}
 		gcs_resource_x_acquire_diagnostic.valid = true;
@@ -16054,8 +16108,8 @@ cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out)
 {
-	return gcs_block_resource_x_target_acquire_internal(
-		buf, NULL, r4_record_generation, 0, 0, false, NULL, ref_out);
+	return gcs_block_resource_x_target_acquire_internal(buf, NULL, r4_record_generation, 0, 0,
+														false, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult
@@ -16066,9 +16120,40 @@ cluster_gcs_resource_x_target_acquire_until_exact(
 {
 	if (expected_resource == NULL || absolute_deadline_us_io == NULL)
 		return RESOURCE_X_APPLY_INVALID;
+	return gcs_block_resource_x_target_acquire_internal(buf, expected_resource,
+														r4_record_generation, 0, 0, false,
+														absolute_deadline_us_io, NULL, ref_out);
+}
+
+ResourceXApplyResult
+cluster_gcs_resource_x_target_acquire_reobserve_exact(BufferDesc *buf,
+													  const BufferTag *expected_resource,
+													  uint64 r4_record_generation,
+													  ResourceXAuxiliaryAcquireContext *context,
+													  ResourceXAcquisitionRef *ref_out)
+{
+	/* A previous non-authoritative result must never survive a later genuine
+	 * namespace/input rejection and turn it into a clean retry upstream. */
+	if (context != NULL)
+		context->reobserve = false;
+	if (ref_out != NULL)
+		memset(ref_out, 0, sizeof(*ref_out));
+	if (context == NULL || expected_resource == NULL || buf == NULL || ref_out == NULL
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX
+		|| (BufTagGetForkNum(expected_resource) != VISIBILITYMAP_FORKNUM
+			&& BufTagGetForkNum(expected_resource) != FSM_FORKNUM))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!context->active) {
+		memset(context, 0, sizeof(*context));
+		context->resource = *expected_resource;
+		context->r4_record_generation = r4_record_generation;
+		context->active = true;
+	} else if (!BufferTagsEqual(&context->resource, expected_resource)
+			   || context->r4_record_generation != r4_record_generation)
+		return RESOURCE_X_APPLY_STALE;
 	return gcs_block_resource_x_target_acquire_internal(
-		buf, expected_resource, r4_record_generation, 0, 0, false,
-		absolute_deadline_us_io, ref_out);
+		buf, expected_resource, r4_record_generation, 0, 0, false, &context->absolute_deadline_us,
+		context, ref_out);
 }
 
 ResourceXApplyResult
@@ -16082,9 +16167,8 @@ cluster_gcs_resource_x_target_direct_init_acquire_exact(
 	if (expected_resource == NULL || direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	return gcs_block_resource_x_target_acquire_internal(
-		buf, expected_resource, r4_record_generation,
-		direct_init_ownership_generation,
-		direct_init_reservation_token, false, NULL, ref_out);
+		buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
+		direct_init_reservation_token, false, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult
@@ -16097,8 +16181,8 @@ cluster_gcs_resource_x_target_direct_init_join_exact(
 	if (expected_resource == NULL || direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	return gcs_block_resource_x_target_acquire_internal(
-		buf, expected_resource, 0, direct_init_ownership_generation,
-		direct_init_reservation_token, true, NULL, ref_out);
+		buf, expected_resource, 0, direct_init_ownership_generation, direct_init_reservation_token,
+		true, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult

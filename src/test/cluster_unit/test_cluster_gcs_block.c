@@ -2753,7 +2753,7 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 			"writer_activation_token == 0",
 			"resource_x_activation_generation == 0",
 			"cluster_pcm_lock_resource_x_bootstrap_round_step_observed_exact(",
-			"&caller_witness, &own, &dispatch",
+			"caller_witness, &own, &dispatch",
 			"cluster_pcm_lock_resource_x_caller_observe_exact(",
 			"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST",
 			"gcs_block_resource_x_bootstrap_request_stage_exact(",

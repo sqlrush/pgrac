@@ -9798,9 +9798,9 @@ cluster_heap_vm_barrier_warm(Buffer vmbuf)
  * it cannot do I/O.  A retag/drop race releases heap X and repeats the safe
  * pre-read sequence.
  */
-static void
-cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block,
-								Buffer heap_buffer, Buffer *vmbuffer)
+void
+cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block, Buffer heap_buffer,
+								Buffer *vmbuffer)
 {
 	Buffer recent_vm = InvalidBuffer;
 	Page heap_page;

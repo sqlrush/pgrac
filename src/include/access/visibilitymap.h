@@ -39,6 +39,17 @@ extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
 extern void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 							  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
 							  uint8 flags);
+struct ResourceXAuxiliaryAcquireContext;
+/* False means not executed; caller releases/requalifies its outer heap proof.
+ * InvalidBuffer means the lower handoff already released the old pin. */
+extern bool visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
+											uint8 flags,
+											struct ResourceXAuxiliaryAcquireContext *context,
+											bool *cleared);
+extern bool visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
+										  XLogRecPtr recptr, Buffer *vmbuf,
+										  TransactionId cutoff_xid, uint8 flags,
+										  struct ResourceXAuxiliaryAcquireContext *context);
 extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf);
 extern void visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
 extern BlockNumber visibilitymap_prepare_truncate(Relation rel,
