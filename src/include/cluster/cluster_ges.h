@@ -522,7 +522,8 @@ StaticAssertDecl(sizeof(GesRequestPayload) == 72,
 				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
 				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
 
-/* Backend-local HW handoff; never a shared entry pointer or wire payload. */
+/* Backend-local HW/relation REQUEST handoff.  Historical type name retained;
+ * never a shared entry pointer, a new authority, or a wire payload. */
 typedef struct ClusterGesHwGrant {
 	GesReplyWaitKey key;
 	GesRequestPayload request;
@@ -612,6 +613,13 @@ extern bool cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant,
 											const struct ClusterGrdHolderId *holder,
 											uint64 request_id);
 extern void cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant);
+extern uint32 cluster_ges_send_relation_request_and_wait(
+	const struct ClusterResId *resid, uint32 mode, const struct ClusterGrdHolderId *holder,
+	uint64 request_id, int timeout_ms, uint32 wait_event, bool dontwait, ClusterGesHwGrant *grant);
+extern bool cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant,
+												  const struct ClusterResId *resid,
+												  const struct ClusterGrdHolderId *holder,
+												  uint64 request_id, uint32 mode, bool dontwait);
 
 /*
  * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns

@@ -201,9 +201,17 @@ typedef struct ClusterLockAcquireRequest {
 	 */
 	int timeout_ms;
 	uint32 wait_event;
-	/* Zero-initialized, inline ownership from the HW sender through S5/S7. */
+	/* Zero-initialized inline HW/relation ownership through S5/S7. */
 	ClusterGesHwGrant hw_grant;
+	/* Backend-local static typed reason, captured at the failed S5 predicate. */
+	const char *registration_failure_reason;
 } ClusterLockAcquireRequest;
+
+/* Error owner around the complete PG-native acquisition body.  The callback
+ * shares this one retained context through S4/S5; no per-ERROR-site guard. */
+extern int cluster_lock_acquire_guarded_native(int (*acquire)(void *argument,
+															  ClusterLockAcquireRequest *pending),
+											   void *argument);
 
 /*
  * ClusterLockReleaseRequest — spec-2.21 D1:cluster_lock_release() input.

@@ -8192,9 +8192,9 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHo
 	return er;
 }
 
-ClusterGrdEntryResult
-cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
-									   const ClusterGrdHolderId *holder)
+static ClusterGrdEntryResult
+grd_promote_remote_grant_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+							   LOCKMODE expected_mode)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
@@ -8212,7 +8212,8 @@ cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
 		if ((uint32)entry->reservations[i].id.node_id == holder->node_id
 			&& entry->reservations[i].id.procno == holder->procno
 			&& entry->reservations[i].id.cluster_epoch == holder->cluster_epoch
-			&& entry->reservations[i].id.request_id == holder->request_id) {
+			&& entry->reservations[i].id.request_id == holder->request_id
+			&& (expected_mode == NoLock || entry->reservations[i].mode == expected_mode)) {
 			LOCKMODE mode = entry->reservations[i].mode;
 
 			if (i < entry->nreservations - 1)
@@ -8228,6 +8229,64 @@ cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder)
+{
+	return grd_promote_remote_grant_exact(resid, holder, NoLock);
+}
+
+ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_mode_exact(const ClusterResId *resid,
+											const ClusterGrdHolderId *holder, LOCKMODE mode)
+{
+	if (mode < AccessShareLock || mode > AccessExclusiveLock)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	return grd_promote_remote_grant_exact(resid, holder, mode);
+}
+
+/* A local master's grant already exists.  Confirm, never create authority
+ * from an optimistic reservation or an unrelated entry mutation number. */
+ClusterGrdEntryResult
+cluster_grd_confirm_local_grant_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+									  LOCKMODE mode)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	bool granted = false;
+	int i;
+
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return result;
+	SpinLockAcquire(&entry->lock);
+	for (i = 0; i < entry->ngranted; i++) {
+		if ((uint32)entry->holders[i].node_id == holder->node_id
+			&& entry->holders[i].procno == holder->procno
+			&& entry->holders[i].cluster_epoch == holder->cluster_epoch
+			&& entry->holders[i].request_id == holder->request_id
+			&& entry->holders[i].mode == mode) {
+			granted = true;
+			break;
+		}
+	}
+	if (granted) {
+		for (i = 0; i < entry->nreservations; i++) {
+			ClusterGrdHolderId *reserved = &entry->reservations[i].id;
+
+			if (reserved->node_id == holder->node_id && reserved->procno == holder->procno
+				&& reserved->cluster_epoch == holder->cluster_epoch
+				&& reserved->request_id == holder->request_id
+				&& entry->reservations[i].mode == mode) {
+				result = cluster_grd_reservation_cancel(entry, holder);
+				break;
+			}
+		}
+	}
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return result;
 }
 
 ClusterGrdEntryResult

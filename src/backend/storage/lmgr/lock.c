@@ -762,7 +762,7 @@ LockAcquire(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock, bool do
  * exit paths (fast-path + main).  Never returns.
  */
 static void
-pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr)
+pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr, const ClusterLockAcquireRequest *req)
 {
 	switch (sr) {
 	case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
@@ -787,8 +787,19 @@ pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr)
 				 errhint("Consider increasing cluster.ges_convert_timeout_ms.")));
 		break;
 	default:
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster S5 promote failed (result=%d)", (int)sr)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("cluster S5 promote failed (result=%d)", (int)sr),
+			 errdetail("family=%s reason=%s resource=%u/%u/%u/%u/%u mode=%d "
+					   "request_id=" UINT64_FORMAT " master=%d grant_observed=%d consumed=%d",
+					   req->resid.type == LOCKTAG_RELATION ? "RELATION_GRANT_REGISTRATION"
+														   : "GES_REGISTRATION",
+					   req->registration_failure_reason != NULL ? req->registration_failure_reason
+																: "UNATTRIBUTED_LEGACY",
+					   req->resid.type, req->resid.field1, req->resid.field2, req->resid.field3,
+					   req->resid.field4, req->lockmode, req->request_id, req->hw_grant.master,
+					   req->hw_grant.grant_observed, req->hw_grant.consumed)));
 		break;
 	}
 	pg_unreachable();
@@ -833,7 +844,7 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 			(void)cluster_lock_acquire_s7_cleanup(cluster_req); /* cancel reservation */
 		}
 		(void)LockRelease(locktag, lockmode, sessionLock);
-		pgrac_cluster_post_native_fail(sr); /* noreturn */
+		pgrac_cluster_post_native_fail(sr, cluster_req); /* noreturn */
 	}
 
 	locallock->cluster_registered = true;
@@ -855,9 +866,52 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 }
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+typedef struct PgracNativeAcquireCall {
+	const LOCKTAG *locktag;
+	LOCKMODE lockmode;
+	bool session_lock;
+	bool dont_wait;
+	bool report_memory_error;
+	LOCALLOCK **locallock;
+} PgracNativeAcquireCall;
+
+static LockAcquireResult LockAcquireExtendedInternal(const LOCKTAG *locktag, LOCKMODE lockmode,
+													 bool sessionLock, bool dontWait,
+													 bool reportMemoryError, LOCALLOCK **locallockp,
+													 ClusterLockAcquireRequest *cluster_req);
+
+static int
+pgrac_native_acquire_call(void *argument, ClusterLockAcquireRequest *pending)
+{
+	PgracNativeAcquireCall *call = argument;
+
+	return LockAcquireExtendedInternal(call->locktag, call->lockmode, call->session_lock,
+									   call->dont_wait, call->report_memory_error, call->locallock,
+									   pending);
+}
+
 LockAcquireResult
 LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock, bool dontWait,
 					bool reportMemoryError, LOCALLOCK **locallockp)
+{
+	PgracNativeAcquireCall call
+		= { locktag, lockmode, sessionLock, dontWait, reportMemoryError, locallockp };
+
+	/* Own every error exit after S4, including WAL/XID preparation before
+	 * native lock acquisition.  Only a consumed S5 belongs to LOCALLOCK/S6. */
+	return (LockAcquireResult)cluster_lock_acquire_guarded_native(pgrac_native_acquire_call, &call);
+}
+
+static LockAcquireResult
+LockAcquireExtendedInternal(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
+							bool dontWait, bool reportMemoryError, LOCALLOCK **locallockp,
+							ClusterLockAcquireRequest *cluster_req)
+#else
+LockAcquireResult
+LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock, bool dontWait,
+					bool reportMemoryError, LOCALLOCK **locallockp)
+#endif
 {
 	LOCKMETHODID lockmethodid = locktag->locktag_lockmethodid;
 	LockMethod lockMethodTable;
@@ -878,17 +932,16 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	 * exit paths.  Spec-2.21 D2 / D4 P2.3.
 	 */
 	volatile bool cluster_need_s5 = false;
-	ClusterLockAcquireRequest cluster_req;
 	/* PGRAC: spec-5.3 §3.1a — the weaker LOCALLOCK being converted (L_old) so
 	 * the post-native registration can de-register it and rebind ownership. */
 	LOCALLOCK *cluster_lold = NULL;
 
-	memset(&cluster_req, 0, sizeof(cluster_req));
+	memset(cluster_req, 0, sizeof(*cluster_req));
 
 #define PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE()                                                    \
 	do {                                                                                           \
 		if (cluster_need_s5) {                                                                     \
-			(void)cluster_lock_acquire_s7_cleanup(&cluster_req);                                   \
+			(void)cluster_lock_acquire_s7_cleanup(cluster_req);                                    \
 			cluster_need_s5 = false;                                                               \
 		}                                                                                          \
 	} while (0)
@@ -1054,12 +1107,12 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		if (locktag->locktag_type == LOCKTAG_ADVISORY)
 			cluster_advisory_counter_inc(CLUSTER_ADVISORY_GLOBALIZE);
 
-		cluster_req.locktag = *locktag;
-		cluster_req.lockmode = lockmode;
-		cluster_req.lockmethod_id = lockmethodid;
-		cluster_req.dontwait = dontWait;
-		cluster_req.sessionLock = sessionLock;
-		cluster_grd_resid_encode(locktag, &cluster_req.resid);
+		cluster_req->locktag = *locktag;
+		cluster_req->lockmode = lockmode;
+		cluster_req->lockmethod_id = lockmethodid;
+		cluster_req->dontwait = dontWait;
+		cluster_req->sessionLock = sessionLock;
+		cluster_grd_resid_encode(locktag, &cluster_req->resid);
 
 		/*
 		 * PGRAC: spec-5.3 D1/§3.1a — decide REQUEST vs CONVERT.  A same-backend
@@ -1070,12 +1123,12 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		{
 			LOCKMODE cluster_current_mode = NoLock;
 
-			cluster_req.op
-				= cluster_lock_decide_op(&cluster_req, &cluster_current_mode, &cluster_lold);
-			cluster_req.current_mode = cluster_current_mode;
+			cluster_req->op
+				= cluster_lock_decide_op(cluster_req, &cluster_current_mode, &cluster_lold);
+			cluster_req->current_mode = cluster_current_mode;
 		}
 
-		cluster_r = cluster_lock_acquire_seven_step(&cluster_req);
+		cluster_r = cluster_lock_acquire_seven_step(cluster_req);
 
 		switch (cluster_r) {
 		case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
@@ -1268,7 +1321,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
 			if (cluster_need_s5)
-				pgrac_cluster_post_native_register(locallock, &cluster_req, cluster_lold, locktag,
+				pgrac_cluster_post_native_register(locallock, cluster_req, cluster_lold, locktag,
 												   lockmode, sessionLock);
 #endif
 			return LOCKACQUIRE_OK;
@@ -1466,7 +1519,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	/* PGRAC: post-native S5 promote / convert ownership transfer (spec-2.21
 	 * D2 / D4 P2.3 + spec-5.3 §3.1a). */
 	if (cluster_need_s5)
-		pgrac_cluster_post_native_register(locallock, &cluster_req, cluster_lold, locktag, lockmode,
+		pgrac_cluster_post_native_register(locallock, cluster_req, cluster_lold, locktag, lockmode,
 										   sessionLock);
 #endif
 	return LOCKACQUIRE_OK;

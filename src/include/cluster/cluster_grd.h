@@ -1128,6 +1128,12 @@ extern ClusterGrdEntryResult cluster_grd_revalidate_and_promote(const ClusterRes
 extern ClusterGrdEntryResult
 cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
 									   const ClusterGrdHolderId *holder);
+extern ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_mode_exact(const ClusterResId *resid,
+											const ClusterGrdHolderId *holder, LOCKMODE mode);
+extern ClusterGrdEntryResult cluster_grd_confirm_local_grant_exact(const ClusterResId *resid,
+																   const ClusterGrdHolderId *holder,
+																   LOCKMODE mode);
 
 extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId *resid,
 														 const ClusterGrdHolderId *holder);

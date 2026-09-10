@@ -41,6 +41,21 @@ ProcessingMode Mode = NormalProcessing;
 int cluster_lms_workers = 1;
 int cluster_lmon_main_loop_interval = 1000;
 int MaxBackends = 200;
+int cluster_node_id = 0;
+static bool ut_local_queue_accept = true;
+static int ut_local_queue_attempts;
+static GesRequestPayload ut_local_release;
+
+bool
+cluster_grd_work_queue_enqueue(uint32 source, const void *payload, uint16 length)
+{
+	UT_ASSERT_EQ(source, (uint32)cluster_node_id);
+	UT_ASSERT_EQ(length, sizeof(ut_local_release));
+	ut_local_queue_attempts++;
+	if (ut_local_queue_accept)
+		memcpy(&ut_local_release, payload, sizeof(ut_local_release));
+	return ut_local_queue_accept;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -214,6 +229,9 @@ ut_reset_state(void)
 	ut_send_count = 0;
 	ut_release_seen_count = 0;
 	ut_log_count = 0;
+	ut_local_queue_accept = true;
+	ut_local_queue_attempts = 0;
+	memset(&ut_local_release, 0, sizeof(ut_local_release));
 	memset(ut_release_seen, 0, sizeof(ut_release_seen));
 }
 
@@ -338,15 +356,36 @@ UT_TEST(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime)
 	UT_ASSERT_EQ(ut_log_count, UINT64CONST(2));
 }
 
+UT_TEST(test_local_cleanup_reaches_work_owner_and_retains_on_full)
+{
+	GesRequestPayload rel;
+
+	ut_reset_state();
+	rel = ut_release(201);
+	cluster_grd_outbound_enqueue_cleanup_release(0, &rel, sizeof(rel));
+	ut_local_queue_accept = false;
+	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 0);
+	UT_ASSERT_EQ(ut_send_count, 0); /* IC self-send is a no-op, not ownership. */
+	UT_ASSERT_EQ(ut_local_queue_attempts, 1);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth() + cluster_grd_outbound_cleanup_dirty_depth(), 1);
+	ut_local_queue_accept = true;
+	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 1);
+	UT_ASSERT_EQ(ut_send_count, 0);
+	UT_ASSERT_EQ(ut_local_queue_attempts, 2);
+	UT_ASSERT(memcmp(&rel, &ut_local_release, sizeof(rel)) == 0);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth() + cluster_grd_outbound_cleanup_dirty_depth(), 0);
+}
+
 int
 main(void)
 {
 	cluster_grd_outbound_shmem_register();
-	UT_PLAN(3);
+	UT_PLAN(4);
 
 	UT_RUN(test_cleanup_retry_queue_never_overwrites_oldest);
 	UT_RUN(test_cleanup_hard_error_is_deferred_for_retry);
 	UT_RUN(test_cleanup_retry_pressure_logs_once_per_postmaster_lifetime);
+	UT_RUN(test_local_cleanup_reaches_work_owner_and_retains_on_full);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

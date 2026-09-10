@@ -1776,6 +1776,101 @@ UT_TEST(test_grd_remote_grant_promotes_exact_reservation_amid_siblings)
 	reset_fake_grd_htab();
 }
 
+UT_TEST(test_grd_s5_compatible_reservations_do_not_invalidate_each_other)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId first;
+	ClusterGrdHolderId sibling;
+	uint64 first_generation;
+	uint64 sibling_generation;
+	bool fast_path = false;
+	LOCKMODE mode = NoLock;
+	const int32 nodes[] = { 0 };
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflicts = 0;
+
+	set_mock_declared(1, nodes);
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6332, &resid);
+	first = grd_lifecycle_holder(0, 21, 201);
+	sibling = grd_lifecycle_holder(0, 22, 202);
+
+	/* A93 retires the old optimistic S3->PG->S5 shortcut for relations.
+	 * Each compatible reservation must first obtain its real master grant. */
+	UT_ASSERT_EQ(
+		(int)cluster_grd_try_reserve(&resid, &first, ShareLock, 0, &fast_path, &first_generation),
+		(int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(fast_path);
+	UT_ASSERT_EQ((int)cluster_grd_try_reserve(&resid, &sibling, ShareLock, 0, &fast_path,
+											  &sibling_generation),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(fast_path);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &first, 0, 201, 1, 1, ShareLock,
+													conflicts, &nconflicts),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &sibling, 0, 202, 1, 1, ShareLock,
+													conflicts, &nconflicts),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ((int)cluster_grd_confirm_local_grant_exact(&resid, &first, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &first, &mode));
+	UT_ASSERT_EQ((int)mode, (int)ShareLock);
+	UT_ASSERT_EQ((int)cluster_grd_confirm_local_grant_exact(&resid, &sibling, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &first), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &sibling),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+UT_TEST(test_grd_exact_registration_needs_grant_identity_and_mode)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder, wrong;
+	uint64 snapshot;
+	const int32 nodes[] = { 0 };
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflicts = 0;
+	LOCKMODE mode = NoLock;
+
+	set_mock_declared(1, nodes);
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6333, &resid);
+	holder = grd_lifecycle_holder(0, 21, 201);
+	UT_ASSERT_EQ(cluster_grd_try_reserve(&resid, &holder, ShareLock, 0, NULL, &snapshot),
+				 CLUSTER_GRD_ENTRY_OK);
+	/* A reservation by itself is not a local grant. */
+	UT_ASSERT_EQ(cluster_grd_confirm_local_grant_exact(&resid, &holder, ShareLock),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &holder, &mode));
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &holder, 0, 201, 1, 1, ShareLock,
+													conflicts, &nconflicts),
+				 CLUSTER_GRD_GRANT_NOW);
+	wrong = holder;
+	wrong.procno++;
+	UT_ASSERT_EQ(cluster_grd_confirm_local_grant_exact(&resid, &wrong, ShareLock),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_confirm_local_grant_exact(&resid, &holder, ExclusiveLock),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_confirm_local_grant_exact(&resid, &holder, ShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holder), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_try_reserve(&resid, &holder, ShareLock, 0, NULL, &snapshot),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_promote_remote_grant_mode_exact(&resid, &wrong, ShareLock),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_promote_remote_grant_mode_exact(&resid, &holder, ExclusiveLock),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_promote_remote_grant_mode_exact(&resid, &holder, ShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &holder), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
 /* ============================================================
  * spec-2.26 T-grd-N..N+2 — LOCKTAG_TRANSACTION ClusterResId wrapper +
  * cleanup tests.
@@ -5301,7 +5396,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(100);
+	UT_PLAN(102);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5323,6 +5418,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_reclaim_excludes_live_state);
 	UT_RUN(test_grd_entry_release_overrelease_fail_safe);
 	UT_RUN(test_grd_remote_grant_promotes_exact_reservation_amid_siblings);
+	UT_RUN(test_grd_s5_compatible_reservations_do_not_invalidate_each_other);
+	UT_RUN(test_grd_exact_registration_needs_grant_identity_and_mode);
 
 	/* spec-2.26 T-grd-N..N+2 */
 	UT_RUN(test_grd_resid_encode_transaction_roundtrip);

@@ -257,6 +257,13 @@ cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req)
 }
 
 
+static bool
+cluster_lock_acquire_is_relation_request(const ClusterLockAcquireRequest *req)
+{
+	return req->resid.type == LOCKTAG_RELATION && req->op == CLUSTER_LOCK_OP_REQUEST
+		   && req->current_mode == NoLock;
+}
+
 /*
  * S3 partition + reservation — spec-2.17 §1.4 Q6 F3 race window 防御。
  *
@@ -300,6 +307,11 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	mut->master_gen_snapshot = gen_snapshot;
 	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
+	/* A relation's compatible siblings may mutate the entry while PG-native
+	 * acquisition runs.  Use the existing local/remote master in S4, not an
+	 * optimistic entry revision as a second grant authority. */
+	if (cluster_lock_acquire_is_relation_request(req))
+		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 
 	if (cluster_local_fast_path_enabled && fast_path) {
 		if (cluster_lms_native_probe_required(&req->resid, req->lockmode)
@@ -363,9 +375,25 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	if (dontwait) {
 		/* NOWAIT never enqueues a waiter (immediate grant-or-reject) — it
 		 * cannot participate in a deadlock, so no wait-state is published. */
-		reject = cluster_ges_send_request_nowait_and_wait(&req->resid, (uint32)req->lockmode,
-														  &req->holder, req->request_id,
-														  req->timeout_ms, req->wait_event);
+		if (cluster_lock_acquire_is_relation_request(req)) {
+			PG_TRY();
+			{
+				reject = cluster_ges_send_relation_request_and_wait(
+					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
+					req->timeout_ms, req->wait_event, true,
+					&((ClusterLockAcquireRequest *)req)->hw_grant);
+			}
+			PG_CATCH();
+			{
+				ConditionVariableCancelSleep();
+				(void)cluster_lock_acquire_s7_cleanup(req);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		} else
+			reject = cluster_ges_send_request_nowait_and_wait(&req->resid, (uint32)req->lockmode,
+															  &req->holder, req->request_id,
+															  req->timeout_ms, req->wait_event);
 	} else {
 		/*
 		 * spec-5.8 D1d — publish the cluster wait-state around the blocking
@@ -386,6 +414,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 				reject = cluster_ges_send_hw_request_and_wait(
 					&req->resid, &req->holder, req->request_id, req->timeout_ms, req->wait_event,
 					&((ClusterLockAcquireRequest *)req)->hw_grant);
+			else if (cluster_lock_acquire_is_relation_request(req))
+				reject = cluster_ges_send_relation_request_and_wait(
+					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
+					req->timeout_ms, req->wait_event, false,
+					&((ClusterLockAcquireRequest *)req)->hw_grant);
 			else
 				reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
 														   &req->holder, req->request_id,
@@ -395,7 +428,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		{
 			if (ws != NULL)
 				cluster_lmd_wait_state_clear(ws);
-			if (cluster_lock_acquire_is_hw_request(req)) {
+			if (cluster_lock_acquire_is_hw_request(req)
+				|| cluster_lock_acquire_is_relation_request(req)) {
 				ConditionVariableCancelSleep();
 				(void)cluster_lock_acquire_s7_cleanup(req);
 			}
@@ -576,33 +610,57 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
 	ClusterGrdEntryResult er;
 	int32 self_node = cluster_node_id;
+	ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
 
 	ensure_counter_initialized();
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	mut->registration_failure_reason = NULL;
 
-	/* Remote HW GRANT owns an exact reservation, not the S3 local snapshot.
-	 * Keep the ordinary optimistic fence below for all other acquisitions. */
+	/* Retained HW/relation GRANT owns its exact registration, not the S3
+	 * mutation snapshot.  Unmodified legacy classes keep their old path. */
 	if (req->hw_grant.key.request_id != 0) {
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
+		bool relation = cluster_lock_acquire_is_relation_request(req);
 
-		if (grant->consumed)
+		if (grant->consumed) {
+			mut->registration_failure_reason = "GRANT_ALREADY_CONSUMED";
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		}
 		PG_TRY();
 		{
-			if (cluster_lock_acquire_is_hw_request(req)
-				&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
-												   req->request_id)) {
-				er = cluster_grd_promote_remote_grant_exact(&req->resid, &req->holder);
-				grant->local_promoted = (er == CLUSTER_GRD_ENTRY_OK);
-				if (grant->local_promoted
-					&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
-													   req->request_id)) {
+			mut->registration_failure_reason = "GRANT_IDENTITY_NOT_CURRENT";
+			if (relation ? cluster_ges_relation_grant_is_current(grant, &req->resid, &req->holder,
+																 req->request_id, req->lockmode,
+																 req->dontwait)
+						 : (cluster_lock_acquire_is_hw_request(req)
+							&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
+															   req->request_id))) {
+				mut->registration_failure_reason = "EXACT_RESERVATION_OR_HOLDER_MISSING";
+				if (relation && grant->master == cluster_node_id)
+					er = cluster_grd_confirm_local_grant_exact(&req->resid, &req->holder,
+															   req->lockmode);
+				else if (relation)
+					er = cluster_grd_promote_remote_grant_mode_exact(&req->resid, &req->holder,
+																	 req->lockmode);
+				else
+					er = cluster_grd_promote_remote_grant_exact(&req->resid, &req->holder);
+				grant->local_promoted
+					= er == CLUSTER_GRD_ENTRY_OK && grant->master != cluster_node_id;
+				if (er == CLUSTER_GRD_ENTRY_OK) {
+					mut->registration_failure_reason = "GRANT_CHANGED_DURING_REGISTRATION";
+					promoted = relation ? cluster_ges_relation_grant_is_current(
+											  grant, &req->resid, &req->holder, req->request_id,
+											  req->lockmode, req->dontwait)
+										: cluster_ges_hw_grant_is_current(
+											  grant, &req->resid, &req->holder, req->request_id);
+				}
+				if (promoted) {
 					grant->consumed = true;
 					grant->cleanup_pending = false;
-					promoted = true;
+					mut->registration_failure_reason = NULL;
 				}
 			}
 			if (!promoted)
@@ -618,6 +676,11 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	}
+	if (cluster_lock_acquire_is_relation_request(req)) {
+		mut->registration_failure_reason = "NO_RETAINED_MASTER_GRANT";
+		(void)cluster_lock_acquire_s7_cleanup(req);
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 
 	/* spec-5.3 §3.1a — convert path mutates an existing holder (no
@@ -797,6 +860,34 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 
+
+int
+cluster_lock_acquire_guarded_native(int (*acquire)(void *argument,
+												   ClusterLockAcquireRequest *pending),
+									void *argument)
+{
+	volatile ClusterLockAcquireRequest pending;
+	int result;
+
+	memset((void *)&pending, 0, sizeof(pending));
+	PG_TRY();
+	{
+		result = acquire(argument, (ClusterLockAcquireRequest *)&pending);
+	}
+	PG_CATCH();
+	{
+		/* Volatile storage survives the PG longjmp; the inner call and S7
+		 * mutate the same object, so prior cleanup cannot be replayed. */
+		if (pending.hw_grant.key.request_id != 0 && !pending.hw_grant.consumed)
+			(void)cluster_lock_acquire_s7_cleanup((ClusterLockAcquireRequest *)&pending);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* A native NOT_AVAIL/soft refusal must also abandon a retained grant. */
+	if (pending.hw_grant.cleanup_pending && !pending.hw_grant.consumed)
+		(void)cluster_lock_acquire_s7_cleanup((ClusterLockAcquireRequest *)&pending);
+	return result;
+}
 
 /*
  * Top-level entry — sequential dispatch S1-S7.

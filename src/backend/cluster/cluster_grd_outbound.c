@@ -39,6 +39,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lms.h" /* PGRAC: spec-7.2 D4 DATA-ring routing */
@@ -658,8 +659,22 @@ cluster_grd_outbound_lmon_drain_send(void)
 			cluster_gcs_block_lmon_prepare_outbound_request((GcsBlockRequestPayload *)slot.payload,
 															(int32)slot.dest_node_id);
 
-		rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
-									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);
+		if (slot.dest_node_id == (uint32)cluster_node_id
+			&& slot.origin == CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE
+			&& slot.msg_type == PGRAC_IC_MSG_GES_REQUEST
+			&& slot.payload_len == sizeof(GesRequestPayload)
+			&& ((const GesRequestPayload *)slot.payload)->opcode == GES_REQ_OPCODE_RELEASE) {
+			/* IC self-send deliberately does not dispatch.  Transfer an exact
+			 * local cleanup to the actual mutation owner, or retain it below
+			 * on queue refusal.  No new queue or wire loopback protocol. */
+			rc = cluster_grd_work_queue_enqueue((uint32)cluster_node_id, slot.payload,
+												slot.payload_len)
+					 ? CLUSTER_IC_SEND_DONE
+					 : CLUSTER_IC_SEND_NOT_ADMITTED;
+		} else
+			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id,
+										  slot.payload_len > 0 ? slot.payload : NULL,
+										  slot.payload_len);
 		switch (rc) {
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:

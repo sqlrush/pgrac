@@ -584,6 +584,50 @@ cluster_grd_promote_remote_grant_exact(const ClusterResId *resid pg_attribute_un
 	abort();
 }
 
+uint32
+cluster_ges_send_relation_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
+										   uint32 mode pg_attribute_unused(),
+										   const ClusterGrdHolderId *holder pg_attribute_unused(),
+										   uint64 request_id pg_attribute_unused(),
+										   int timeout_ms pg_attribute_unused(),
+										   uint32 wait_event pg_attribute_unused(), bool dontwait,
+										   ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	/* Mapping-only fixture; no retained authority is manufactured here. */
+	if (dontwait)
+		stub_ges_request_nowait_wait_calls++;
+	else
+		stub_ges_request_wait_calls++;
+	return stub_ges_reject_reason;
+}
+
+bool
+cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unused(),
+									  const ClusterResId *resid pg_attribute_unused(),
+									  const ClusterGrdHolderId *holder pg_attribute_unused(),
+									  uint64 request_id pg_attribute_unused(),
+									  uint32 mode pg_attribute_unused(),
+									  bool dontwait pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterGrdEntryResult
+cluster_grd_confirm_local_grant_exact(const ClusterResId *resid pg_attribute_unused(),
+									  const ClusterGrdHolderId *holder pg_attribute_unused(),
+									  LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_mode_exact(const ClusterResId *resid pg_attribute_unused(),
+											const ClusterGrdHolderId *holder pg_attribute_unused(),
+											LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 ConditionVariableCancelSleep(void)
 {
