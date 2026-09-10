@@ -3145,10 +3145,10 @@ UT_TEST(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstra
 		? strstr(n_branch,
 			"cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(")
 		: NULL;
-	retained_buffer_helper = retained_pair_helper != NULL
-		? strstr(retained_pair_helper,
-			"cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(")
-		: NULL;
+	retained_buffer_helper
+		= retained_pair_helper != NULL
+			  ? strstr(retained_pair_helper, "cluster_bufmgr_pcm_own_n_predecessor_observe_exact(")
+			  : NULL;
 	undrained_current_helper = retained_buffer_helper != NULL
 		? strstr(retained_buffer_helper,
 			"cluster_gcs_resource_x_target_undrained_current_predecessor_exact(")
@@ -6847,9 +6847,8 @@ UT_TEST(test_resource_x_target_waits_for_exact_post_release_settlement_window)
 			"cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(")
 		: NULL;
 	buffer_check = pair_check != NULL
-		? strstr(pair_check,
-			"cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(")
-		: NULL;
+					   ? strstr(pair_check, "cluster_bufmgr_pcm_own_n_predecessor_observe_exact(")
+					   : NULL;
 	post_mutation_classify = buffer_check != NULL
 		? strstr(buffer_check,
 			"target_retained_release_post_mutation")

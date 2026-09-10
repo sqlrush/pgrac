@@ -724,6 +724,53 @@ cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
 }
 
 ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_n_predecessor_observe_exact(BufferDesc *buf,
+												   const ClusterPcmOwnSnapshot *expected_n,
+												   bool *retained_out)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+	uint32 dirty = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+
+	if (retained_out != NULL)
+		*retained_out = false;
+	if (buf == NULL || expected_n == NULL || retained_out == NULL || expected_n->generation == 0
+		|| expected_n->generation == UINT64_MAX || expected_n->reservation_token == 0
+		|| expected_n->reservation_token == UINT64_MAX
+		|| expected_n->pcm_state != (uint8)PCM_STATE_N
+		|| (expected_n->flags != 0 && expected_n->flags != PCM_OWN_FLAG_REVOKING)
+		|| expected_n->writer_activation_token != 0
+		|| expected_n->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+
+	/* This observer owns no source proof. Preserve a changed projection as
+	 * STALE instead of mixing a failed PI check with a later CURRENT check.
+	 * A later equal B cannot make that intermediate observation coherent. */
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!cluster_pcm_own_snapshot_equal_exact(&live, expected_n))
+		result = CLUSTER_PCM_OWN_STALE;
+	else if ((live.semantic_buf_state & (BM_TAG_VALID | BM_VALID)) != (BM_TAG_VALID | BM_VALID)
+			 || (live.semantic_buf_state & BM_IO_ERROR) != 0
+			 || (live.buffer_type != (uint8)BUF_TYPE_CURRENT
+				 && live.buffer_type != (uint8)BUF_TYPE_PI)
+			 || (live.buffer_type == (uint8)BUF_TYPE_CURRENT && live.flags != 0)
+			 || (live.buffer_type == (uint8)BUF_TYPE_PI && (live.semantic_buf_state & dirty) != 0))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((live.semantic_buf_state & (dirty | BM_IO_IN_PROGRESS)) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else {
+		*retained_out = live.buffer_type == (uint8)BUF_TYPE_PI;
+		result = CLUSTER_PCM_OWN_OK;
+	}
+	UnlockBufHdr(buf, buf_state);
+	return result;
+}
+
+ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_n_storage_candidate_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n)
 {

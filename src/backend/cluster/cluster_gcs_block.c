@@ -14251,6 +14251,8 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 	bool stage_ok = false;
 	bool target_retained_release_inflight = false;
 	bool target_retained_release_post_mutation = false;
+	ClusterPcmOwnResult diagnostic_n_predecessor_result = CLUSTER_PCM_OWN_INVALID;
+	bool diagnostic_n_predecessor_pair = false;
 	bool target_install_preuse_retry_seen = false;
 	bool terminal_admission_current = false;
 	bool terminal_gate_session_current = false;
@@ -14821,17 +14823,31 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 							ClusterPcmOwnResult current_candidate_result
 								= CLUSTER_PCM_OWN_INVALID;
 							bool pair_exact;
-							bool buffer_exact;
+							bool buffer_exact = false;
 							bool undrained_current_predecessor = false;
 
+							diagnostic_stage = "n-predecessor-observe";
 							pair_exact
 								= cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
 									&assertion.resource, master_node,
 									master_session, gate.formation,
 									own.generation);
-							buffer_exact = pair_exact
-								&& cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
-									buf, &own);
+							diagnostic_n_predecessor_pair = pair_exact;
+							diagnostic_n_predecessor_result = CLUSTER_PCM_OWN_INVALID;
+							if (pair_exact) {
+								current_candidate_result
+									= cluster_bufmgr_pcm_own_n_predecessor_observe_exact(
+										buf, &own, &buffer_exact);
+								diagnostic_n_predecessor_result = current_candidate_result;
+								if (current_candidate_result == CLUSTER_PCM_OWN_STALE
+									|| current_candidate_result == CLUSTER_PCM_OWN_BUSY) {
+									gcs_block_resource_x_requester_wait_note(
+										&wait_diagnostic, PCM_RX_WAIT_OBSERVATION);
+									if (current_candidate_result == CLUSTER_PCM_OWN_BUSY)
+										gcs_block_resource_x_observation_pause();
+									continue;
+								}
+							}
 							target_retained_release_inflight
 								= pair_exact && buffer_exact;
 							target_retained_release_post_mutation
@@ -14839,13 +14855,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 								  && own.flags == 0;
 							if (pair_exact && !buffer_exact
 								&& own.flags == 0) {
-								/* VM/FSM DROP has no N+PI carrier.  Revalidate the
-								 * exact clean N+CURRENT shape without reading page
-								 * bytes, then let the existing round step observe the
-								 * retained predecessor under the original deadline. */
-								current_candidate_result
-									= cluster_bufmgr_pcm_own_n_storage_candidate_exact(
-										buf, &own);
+								/* DROP's clean CURRENT and retained PI classification
+								 * came from one physical observation above. Neither
+								 * grants authority or consumes the predecessor. */
 								undrained_current_predecessor
 									= cluster_gcs_resource_x_target_undrained_current_predecessor_exact(
 										pair_exact, buffer_exact,
@@ -15777,7 +15789,8 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 				 "own_resource_x_generation=%llu now=%llu deadline=%llu "
 				 "caller_joined_attempt=%llu caller_failed_attempt=%llu "
 				 "follow_attempt=%llu follow_expected_x_generation=%llu follow_token=%llu "
-				 "follow_state=%d own_buffer_type=%u own_semantic_state=%u",
+				 "follow_state=%d own_buffer_type=%u own_semantic_state=%u "
+				 "n_predecessor_pair=%u n_predecessor_result=%d",
 				 diagnostic_stage, (int)result, (int)action, (int)wait_result,
 				 (int)ownership_loss_result, stage_ok ? "true" : "false", assertion.requester_node,
 				 master_node, buf->buf_id, resource.spcOid, resource.dbOid, resource.relNumber,
@@ -15799,7 +15812,8 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 				 (unsigned long long)diagnostic_follow_attempt,
 				 (unsigned long long)diagnostic_follow_generation,
 				 (unsigned long long)diagnostic_follow_token, (int)target_install_follow_state,
-				 (unsigned)own.buffer_type, (unsigned)own.semantic_buf_state)));
+				 (unsigned)own.buffer_type, (unsigned)own.semantic_buf_state,
+				 (unsigned)diagnostic_n_predecessor_pair, (int)diagnostic_n_predecessor_result)));
 	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
 		gcs_resource_x_acquire_diagnostic.buffer_id = buf->buf_id;
 		gcs_resource_x_acquire_diagnostic.result = result;
@@ -15808,6 +15822,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 		gcs_resource_x_acquire_diagnostic.attempt = 0;
 		gcs_resource_x_acquire_diagnostic.reason = cluster_gcs_resource_x_acquire_failure_reason(
 			diagnostic_head_expired, diagnostic_deadline_expired, result);
+		if (strcmp(diagnostic_stage, "n-predecessor-observe") == 0
+			&& result == RESOURCE_X_APPLY_RECOVERY_BLOCKED)
+			gcs_resource_x_acquire_diagnostic.reason = "N_PREDECESSOR_IMAGE_UNPROVEN";
 		if (caller_witness->failed_attempt != 0) {
 			gcs_resource_x_acquire_diagnostic.attempt = caller_witness->failed_attempt;
 			gcs_resource_x_acquire_diagnostic.reason = "FAILED_CALLER_ATTEMPT";

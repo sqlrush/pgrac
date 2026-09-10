@@ -752,6 +752,11 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 extern bool
 cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(BufferDesc *buf,
 														 const ClusterPcmOwnSnapshot *expected_n);
+/* Wait-only physical observation. STALE discards a sample, BUSY waits;
+ * OK distinguishes clean PI from clean CURRENT but exports no authority.
+ * Authority consumers keep the strict retained-release predicate above. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_predecessor_observe_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n, bool *retained_out);
 /* A passive N descriptor is eligible for a durable-storage assertion only
  * while the exact ownership tuple still names clean, valid, non-IO CURRENT
  * residency.  The page bytes are deliberately not returned as proof. */

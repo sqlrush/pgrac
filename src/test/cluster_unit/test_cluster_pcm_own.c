@@ -77,6 +77,7 @@ static ResourceXDeliveryTarget route_target;
 static uint64 route_direct_generation, route_direct_token;
 static int route_observations, route_binds;
 static int route_drift;
+static int n_predecessor_header_step;
 
 /* Explicit entry observations; the dispatch, both physical lookup functions,
  * header predicates and actual ownership hold below remain production C. */
@@ -139,6 +140,15 @@ transition_lock_header(BufferDesc *buf)
 {
 	uint32 state = pg_atomic_read_u32(&buf->state);
 
+	/* A concurrent physical I/O interval changes no ownership identity.
+	 * The third sample returns to the exact original physical projection. */
+	if (n_predecessor_header_step != 0) {
+		if (n_predecessor_header_step <= 2)
+			state |= BM_IO_IN_PROGRESS;
+		else
+			state &= ~BM_IO_IN_PROGRESS;
+		n_predecessor_header_step++;
+	}
 	UT_ASSERT((state & BM_LOCKED) == 0);
 	pg_atomic_write_u32(&buf->state, state | BM_LOCKED);
 	return state | BM_LOCKED;
@@ -652,6 +662,202 @@ static void assert_ordered_in_function(const char *source, const char *function_
 									   const char *function_end, const char *const *needles,
 									   int needle_count);
 static void assert_source_range_contains(const char *start, const char *end, const char *needle);
+
+bool
+cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(const BufferTag *tag, int32 master,
+															 uint64 session, uint64 formation,
+															 uint64 generation)
+{
+	UT_ASSERT_EQ(tag->forkNum, VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(master, 1);
+	UT_ASSERT_EQ(session, UINT64_C(842379567870890));
+	UT_ASSERT_EQ(formation, 2);
+	UT_ASSERT_EQ(generation, 48);
+	return true;
+}
+
+/* The entire production N/predecessor interlock, with only the entry answer
+ * and scheduled physical I/O as dependencies. No hand-written decision model. */
+static ResourceXApplyResult
+n_predecessor_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
+{
+	ClusterPcmOwnSnapshot own = *initial;
+	ClusterPcmOwnResult own_result;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_APPLIED;
+	ResourceXAssertion assertion = { 0 };
+	struct {
+		uint64 formation;
+	} gate = { 2 };
+	int32 master_node = 1;
+	uint64 master_session = UINT64_C(842379567870890);
+	bool target_retained_release_inflight = false;
+	bool target_retained_release_post_mutation = false;
+	ClusterPcmOwnResult diagnostic_n_predecessor_result = CLUSTER_PCM_OWN_INVALID;
+	bool diagnostic_n_predecessor_pair = false;
+	const char *diagnostic_stage = "own-snapshot";
+	int iteration;
+
+	assertion.resource = initial->tag;
+	for (iteration = 0; iteration < 4; iteration++) {
+		if (iteration != 0)
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(buf, &own), CLUSTER_PCM_OWN_OK);
+#define gcs_block_resource_x_requester_wait_note(context, reason) ((void)(reason))
+#define gcs_block_resource_x_observation_pause() ((void)0)
+#include "test_cluster_pcm_n_predecessor_consumer.inc"
+#undef gcs_block_resource_x_observation_pause
+#undef gcs_block_resource_x_requester_wait_note
+		break;
+	}
+	UT_ASSERT(iteration < 4);
+	(void)target_retained_release_post_mutation;
+	(void)diagnostic_n_predecessor_result;
+	(void)diagnostic_n_predecessor_pair;
+	(void)diagnostic_stage;
+	return result;
+}
+
+static void
+n_predecessor_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, uint8 image)
+{
+	memset(buf, 0, sizeof(*buf));
+	memset(entry, 0, sizeof(*entry));
+	buf->tag.spcOid = 1663;
+	buf->tag.dbOid = 5;
+	buf->tag.relNumber = 16393;
+	buf->tag.forkNum = VISIBILITYMAP_FORKNUM;
+	buf->buffer_type = image;
+	buf->pcm_state = PCM_STATE_N;
+	pg_atomic_init_u32(&buf->state, BM_TAG_VALID | BM_VALID);
+	pg_atomic_init_u64(&entry->generation, 48);
+	pg_atomic_init_u64(&entry->reservation_token, 48);
+	ClusterPcmOwnArray = entry;
+	n_predecessor_header_step = 0;
+}
+
+UT_TEST(test_real_n_predecessor_does_not_fence_a_lost_physical_observation)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	int image;
+
+	for (image = 0; image < 2; image++) {
+		n_predecessor_fixture(&buf, &entry, image == 0 ? BUF_TYPE_CURRENT : BUF_TYPE_PI);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		preassert_fuses = 0;
+		n_predecessor_header_step = 1;
+		UT_ASSERT_EQ(n_predecessor_consume(&buf, &before), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(preassert_fuses, 0);
+		n_predecessor_header_step = 0;
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 48);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), 48);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_n_predecessor_classifies_one_physical_image_without_mutation)
+{
+	static const struct {
+		uint8 type;
+		uint32 flags;
+		uint32 bits;
+		ClusterPcmOwnResult want;
+		bool retained;
+	} cases[] = { { BUF_TYPE_CURRENT, 0, 0, CLUSTER_PCM_OWN_OK, false },
+				  { BUF_TYPE_PI, 0, 0, CLUSTER_PCM_OWN_OK, true },
+				  { BUF_TYPE_PI, PCM_OWN_FLAG_REVOKING, 0, CLUSTER_PCM_OWN_OK, true },
+				  { BUF_TYPE_CURRENT, PCM_OWN_FLAG_REVOKING, 0, CLUSTER_PCM_OWN_CORRUPT, false },
+				  { BUF_TYPE_CURRENT, 0, BM_IO_IN_PROGRESS, CLUSTER_PCM_OWN_BUSY, false },
+				  { BUF_TYPE_PI, 0, BM_IO_IN_PROGRESS, CLUSTER_PCM_OWN_BUSY, false },
+				  { BUF_TYPE_CURRENT, 0, BM_DIRTY, CLUSTER_PCM_OWN_BUSY, false },
+				  { BUF_TYPE_CURRENT, 0, BM_CHECKPOINT_NEEDED, CLUSTER_PCM_OWN_BUSY, false },
+				  { BUF_TYPE_PI, 0, BM_DIRTY, CLUSTER_PCM_OWN_CORRUPT, false },
+				  { BUF_TYPE_PI, 0, BM_JUST_DIRTIED, CLUSTER_PCM_OWN_CORRUPT, false },
+				  { BUF_TYPE_PI, 0, BM_CHECKPOINT_NEEDED, CLUSTER_PCM_OWN_CORRUPT, false },
+				  { BUF_TYPE_CURRENT, 0, BM_IO_ERROR | BM_IO_IN_PROGRESS, CLUSTER_PCM_OWN_CORRUPT,
+					false },
+				  { BUF_TYPE_PI, 0, BM_IO_ERROR, CLUSTER_PCM_OWN_CORRUPT, false },
+				  { 255, 0, 0, CLUSTER_PCM_OWN_CORRUPT, false } };
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before, after;
+	bool retained;
+	size_t i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		n_predecessor_fixture(&buf, &entry, cases[i].type);
+		pg_atomic_write_u32(&entry.flags, cases[i].flags);
+		pg_atomic_fetch_or_u32(&buf.state, cases[i].bits);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		retained = !cases[i].retained;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_n_predecessor_observe_exact(&buf, &before, &retained),
+					 cases[i].want);
+		UT_ASSERT_EQ(retained, cases[i].retained);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &after), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&before, &after));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), BM_TAG_VALID | BM_VALID | cases[i].bits);
+		/* The old authority predicate does not inherit BUSY/STALE retry. */
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(&buf, &before),
+					 cases[i].want == CLUSTER_PCM_OWN_OK && cases[i].retained);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_n_predecessor_clears_output_for_every_changed_snapshot_byte)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before, changed;
+	ClusterPcmOwnResult result;
+	bool retained;
+	size_t i;
+
+	n_predecessor_fixture(&buf, &entry, BUF_TYPE_PI);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+	for (i = 0; i < sizeof(before); i++) {
+		changed = before;
+		((unsigned char *)&changed)[i] ^= 1;
+		retained = true;
+		result = cluster_bufmgr_pcm_own_n_predecessor_observe_exact(&buf, &changed, &retained);
+		UT_ASSERT(result == CLUSTER_PCM_OWN_STALE || result == CLUSTER_PCM_OWN_INVALID);
+		UT_ASSERT(!retained);
+	}
+	retained = true;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_n_predecessor_observe_exact(NULL, &before, &retained),
+				 CLUSTER_PCM_OWN_INVALID);
+	UT_ASSERT(!retained);
+	retained = true;
+	ClusterPcmOwnArray = NULL;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_n_predecessor_observe_exact(&buf, &before, &retained),
+				 CLUSTER_PCM_OWN_NOT_READY);
+	UT_ASSERT(!retained);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_n_predecessor_consumer_keeps_stable_image_contradictions_closed)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	int image;
+
+	for (image = 0; image < 2; image++) {
+		n_predecessor_fixture(&buf, &entry, image == 0 ? BUF_TYPE_CURRENT : BUF_TYPE_PI);
+		pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		preassert_fuses = 0;
+		UT_ASSERT_EQ(n_predecessor_consume(&buf, &before), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(preassert_fuses, 1);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 48);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), 48);
+	}
+	ClusterPcmOwnArray = saved;
+}
 
 UT_TEST(test_pcm_own_snapshot_equality_is_whole_object_exact)
 {
@@ -6398,6 +6604,10 @@ main(void)
 	UT_RUN(test_real_gcs_wal_recheck_yields_without_exporting_an_image);
 	UT_RUN(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals);
 	UT_RUN(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner);
+	UT_RUN(test_real_n_predecessor_does_not_fence_a_lost_physical_observation);
+	UT_RUN(test_real_n_predecessor_classifies_one_physical_image_without_mutation);
+	UT_RUN(test_real_n_predecessor_clears_output_for_every_changed_snapshot_byte);
+	UT_RUN(test_real_n_predecessor_consumer_keeps_stable_image_contradictions_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
