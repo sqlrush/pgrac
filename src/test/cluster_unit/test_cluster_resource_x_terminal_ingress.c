@@ -1691,7 +1691,8 @@ run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_
 	BufferTag resource = { 0 };
 	ResourceXGateSnapshot gate = { 0 }, rebound_gate;
 	ResourceXDecodedFrame dispatch = { 0 };
-	ResourceXCallerWitness caller_witness, saved_witness;
+	ResourceXCallerWitness local_caller_witness, saved_witness;
+	ResourceXCallerWitness *caller_witness = &local_caller_witness;
 	ResourceXApplyResult dispatch_gate_session_result pg_attribute_unused();
 	ResourceXApplyResult discard_result, result = RESOURCE_X_APPLY_INVALID;
 	ClusterSemanticResourceXPeerOpenResult peer_open_result;
@@ -1718,13 +1719,13 @@ run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_
 	 * Its pending branch must not be restricted to REQUEST/non-follower. */
 	UT_ASSERT(action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
 			  || action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
-	memset(&caller_witness, 0x2a, sizeof(caller_witness));
-	saved_witness = caller_witness;
+	memset(caller_witness, 0x2a, sizeof(*caller_witness));
+	saved_witness = *caller_witness;
 	dispatch.common.assertion_sequence = 41;
 	gate.formation = 17;
 	for (iteration = 0; iteration < 4; iteration++) {
 		if (delivery_retries != 0 || assert_sends != 0) {
-			UT_ASSERT_EQ(memcmp(&caller_witness, &saved_witness, sizeof(caller_witness)), 0);
+			UT_ASSERT_EQ(memcmp(caller_witness, &saved_witness, sizeof(*caller_witness)), 0);
 			UT_ASSERT_EQ(dispatch.common.assertion_sequence, UINT64_C(41));
 			UT_ASSERT_EQ(absolute_deadline_us, UINT64_C(3000000));
 			return RESOURCE_X_APPLY_APPLIED;

@@ -12902,8 +12902,9 @@ test_ready_probe(const BufferTag *tag, uint32 *cursor, ResourceXIntentSlot *out)
 
 static ResourceXApplyResult
 run_actual_gcs_wait_consumer(ResourceXAssertion assertion, ClusterPcmOwnSnapshot own,
-							 ResourceXCallerWitness caller_witness)
+							 ResourceXCallerWitness local_caller_witness)
 {
+	ResourceXCallerWitness *caller_witness = &local_caller_witness;
 	ResourceXBootstrapRoundAction action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 	ResourceXApplyResult result = RESOURCE_X_APPLY_APPLIED;
 	ResourceXApplyResult ownership_loss_result = RESOURCE_X_APPLY_INVALID;
