@@ -6491,7 +6491,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(116);
 	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
 	UT_RUN(test_real_pending_recapture_keeps_original_observation);
 	UT_RUN(test_real_pending_observation_rechecks_successor_and_preserves_refusals);
