@@ -2863,9 +2863,11 @@ test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
 CLUSTER_R4_LMS_CONTROLS_TEST_O = test_cluster_r4_lms_controls_product.o
 
 test_cluster_lms_native_probe: test_cluster_lms_native_probe.c unit_test.h \
-        $(top_srcdir)/src/backend/cluster/cluster_lms.c
+        $(top_srcdir)/src/backend/cluster/cluster_lms.c \
+        $(top_srcdir)/src/backend/cluster/cluster_ges_dedup.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DLMS_NATIVE_PROBE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_lms.c"' \
+		-DGES_DEDUP_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_ges_dedup.c"' \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

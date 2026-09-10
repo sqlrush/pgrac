@@ -2,6 +2,7 @@
  * are controlled. Deferred wire replies keep exactly eight real probes live. */
 #include "postgres.h"
 #include LMS_NATIVE_PROBE_SOURCE_PATH
+#include GES_DEDUP_SOURCE_PATH
 #undef printf
 #include "unit_test.h"
 
@@ -12,6 +13,7 @@ int cluster_lms_native_lock_probe_max_inflight = 8;
 int cluster_lms_native_lock_probe_retry_interval_ms = 500;
 int cluster_lms_native_lock_probe_retry_budget = 60;
 int cluster_ges_request_timeout_ms = 60000;
+int cluster_ges_dedup_max_entries = 256;
 int MyProcPid = 100;
 Latch *MyLatch;
 sigjmp_buf *PG_exception_stack;
@@ -41,6 +43,42 @@ static uint64 epoch;
 static uint64 wire_ids[256];
 static ClusterGrdHolderId holders[128];
 static int n_holders;
+static ClusterGesDedupShared dedup_state;
+static ClusterGesDedupEntry dedup_rows[256];
+static bool dedup_used[256];
+static LWLock dedup_lock;
+
+/* Only the shmem hash storage is controlled. Registration, exact reply
+ * publication and completed-only removal execute the production module. */
+void *
+hash_search(HTAB *table, const void *key, HASHACTION action, bool *found)
+{
+	int free_row = -1;
+
+	UT_ASSERT(table == cluster_ges_dedup_htab);
+	for (int i = 0; i < lengthof(dedup_rows); i++) {
+		if (!dedup_used[i]) {
+			if (free_row < 0)
+				free_row = i;
+			continue;
+		}
+		if (memcmp(&dedup_rows[i].key, key, sizeof(ClusterGesDedupKey)) == 0) {
+			if (found)
+				*found = true;
+			if (action == HASH_REMOVE)
+				dedup_used[i] = false;
+			return &dedup_rows[i];
+		}
+	}
+	if (found)
+		*found = false;
+	if (action != HASH_ENTER_NULL || free_row < 0)
+		return NULL;
+	dedup_used[free_row] = true;
+	memset(&dedup_rows[free_row], 0, sizeof(dedup_rows[free_row]));
+	memcpy(&dedup_rows[free_row].key, key, sizeof(ClusterGesDedupKey));
+	return &dedup_rows[free_row];
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -138,13 +176,6 @@ cluster_grd_resid_decode(const ClusterResId *id, LOCKTAG *tag)
 	SET_LOCKTAG_RELATION(*tag, 5, 16384);
 }
 void
-cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply, uint16 len)
-{
-	(void)key;
-	(void)reply;
-	(void)len;
-}
-void
 cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *data, uint16 len)
 {
 	const GesNativeLockProbePayload *p = data;
@@ -240,9 +271,15 @@ reset(void)
 	epoch = 9;
 	InterruptPending = 0;
 	memset(wire_ids, 0, sizeof(wire_ids));
+	memset(&dedup_state, 0, sizeof(dedup_state));
+	memset(dedup_rows, 0, sizeof(dedup_rows));
+	memset(dedup_used, 0, sizeof(dedup_used));
+	cluster_ges_dedup_shared = &dedup_state;
+	cluster_ges_dedup_htab = (HTAB *)dedup_rows;
+	cluster_ges_dedup_lock = &dedup_lock;
 }
 static bool
-submit_op(int procno, uint32 opcode)
+submit_exact(int procno, uint64 request_id, uint32 opcode)
 {
 	ClusterResId id;
 	ClusterGrdHolderId holder;
@@ -252,11 +289,16 @@ submit_op(int procno, uint32 opcode)
 	holder.node_id = 1;
 	holder.procno = procno;
 	holder.cluster_epoch = 9;
-	holder.request_id = procno + 1000;
+	holder.request_id = request_id;
 	holders[n_holders++] = holder;
 	return cluster_lms_native_probe_schedule_grant(
 		&id, ShareLock, &holder, 1, opcode, (UINT64_C(9) << 32) | 7,
 		opcode == GES_REQ_OPCODE_CONVERT ? AccessShareLock : NoLock);
+}
+static bool
+submit_op(int procno, uint32 opcode)
+{
+	return submit_exact(procno, procno + 1000, opcode);
 }
 static bool
 submit(int procno)
@@ -518,10 +560,113 @@ UT_TEST(unexpected_peer_and_duplicate_reply_are_not_extra_evidence)
 	UT_ASSERT_EQ(grants, 1);
 	UT_ASSERT_EQ(occupied(), 0);
 }
+
+static ClusterGesDedupKey
+receipt_key(uint32 procno, uint64 request_id)
+{
+	/* Hand-derived ingress identity: origin1, REQUEST, epoch9/master7. */
+	ClusterGesDedupKey key
+		= { 1, GES_REQ_OPCODE_REQUEST, request_id, 9, (UINT64_C(9) << 32) | 7, procno, 0 };
+	return key;
+}
+
+static ClusterGesDedupLookupStatus
+lookup_receipt(const ClusterGesDedupKey *key, GesReplyPayload *reply)
+{
+	uint16 size = 0;
+	return cluster_ges_dedup_lookup_or_register(key, (uint8 *)reply, sizeof(*reply), &size);
+}
+
+UT_TEST(native_clear_completes_the_registered_nonzero_procno_receipt)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	GesReplyPayload reply = { 0 };
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+	UT_ASSERT_EQ(grants, 1);
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(reply.holder_procno, 37);
+	UT_ASSERT_EQ(reply.opcode, GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT_EQ(occupied(), 0);
+}
+
+UT_TEST(native_timeout_completes_the_exact_reject_receipt)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	GesReplyPayload reply = { 0 };
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(submit(37));
+	for (int i = 0; i < 61; i++) {
+		now_us += 500000;
+		cluster_lms_native_probe_retry_tick();
+	}
+	UT_ASSERT_EQ(rejects, 1);
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(reply.holder_procno, 37);
+	UT_ASSERT_EQ(reply.reject_reason, GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(grants, 0);
+}
+
+UT_TEST(native_completion_cannot_overwrite_another_backend_receipt)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	ClusterGesDedupKey decoy = receipt_key(0, 1037);
+	GesReplyPayload reply = { 0 };
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(lookup_receipt(&decoy, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+	UT_ASSERT_EQ(lookup_receipt(&decoy, &reply), CLUSTER_GES_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(reply.holder_procno, 37);
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 2);
+}
+
+UT_TEST(only_completed_exact_receipts_can_be_retired)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	ClusterGesDedupKey other = receipt_key(38, 1037);
+	GesReplyPayload reply = { 0 };
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(!cluster_ges_dedup_remove_completed(&key));
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+	UT_ASSERT(!cluster_ges_dedup_remove_completed(&other));
+	UT_ASSERT(cluster_ges_dedup_remove_completed(&key));
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 0);
+	UT_ASSERT(!cluster_ges_dedup_remove_completed(&key));
+}
+
+UT_TEST(native_grant_release_cycles_do_not_fill_the_receipt_table)
+{
+	GesReplyPayload reply = { 0 };
+	reset();
+	for (int i = 0; i < 257; i++) {
+		ClusterGesDedupKey key = receipt_key(37, 1037 + i);
+		UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+		/* Only the external holder/wire fixtures roll over, not the actual
+		 * collector or dedup state. Each old request has really completed. */
+		n_holders = 0;
+		sends = 0;
+		UT_ASSERT(submit_exact(37, 1037 + i, GES_REQ_OPCODE_REQUEST));
+		cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+		(void)cluster_ges_dedup_remove_completed(&key);
+	}
+	UT_ASSERT_EQ(grants, 257);
+	UT_ASSERT_EQ(occupied(), 0);
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 0);
+	UT_ASSERT_EQ(cluster_ges_dedup_full_reject_count(), 0);
+}
 int
 main(void)
 {
-	printf("1..17\n");
+	printf("1..22\n");
 	UT_RUN(eight_active_ninth_must_wait_then_use_real_peer_clear);
 	UT_RUN(sixteen_requests_never_exceed_eight_active_and_all_finish);
 	UT_RUN(oldest_pending_is_promoted_first);
@@ -539,6 +684,11 @@ main(void)
 	UT_RUN(real_conflict_stays_ungranted_until_a_fresh_probe_clear);
 	UT_RUN(convert_retry_expiry_preserves_old_mode_holder);
 	UT_RUN(unexpected_peer_and_duplicate_reply_are_not_extra_evidence);
+	UT_RUN(native_clear_completes_the_registered_nonzero_procno_receipt);
+	UT_RUN(native_timeout_completes_the_exact_reject_receipt);
+	UT_RUN(native_completion_cannot_overwrite_another_backend_receipt);
+	UT_RUN(only_completed_exact_receipts_can_be_retired);
+	UT_RUN(native_grant_release_cycles_do_not_fill_the_receipt_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1705,6 +1705,7 @@ native_probe_record_dedup_reply(const ClusterLmsNativeLockProbeSlot *slot,
 	key.request_id = slot->requester.request_id;
 	key.cluster_epoch = slot->requester.cluster_epoch;
 	key.shard_master_generation = shard_master_generation;
+	key.holder_procno = slot->requester.procno;
 	cluster_ges_dedup_record_reply(&key, (const uint8 *)reply, sizeof(*reply));
 }
 
