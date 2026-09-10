@@ -1969,10 +1969,35 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 	cluster_node_id = saved_node;
 }
 
+UT_TEST(test_block0_protected_failure_detail_is_not_elapsed_timeout)
+{
+	const ClusterGesTimeoutSrc sources[]
+		= { CLUSTER_GES_TSRC_BLOCK0_REPLY_MISSING, CLUSTER_GES_TSRC_BLOCK0_REPLY_ABANDONED,
+			CLUSTER_GES_TSRC_BLOCK0_GUARD_INCONSISTENT, CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT };
+	const char *names[] = { "block0-reply-missing", "block0-reply-abandoned",
+							"block0-guard-inconsistent", "block0-master-reject" };
+	unsigned int i;
+
+	for (i = 0; i < lengthof(sources); i++) {
+		const ClusterGesTimeoutDetail *detail;
+
+		cluster_ges_timeout_detail_set(sources[i], 2, 4700, 5, -1, 60000);
+		detail = cluster_ges_timeout_detail_get();
+		UT_ASSERT_EQ(detail->source, sources[i]);
+		UT_ASSERT_EQ(detail->master_node, 2);
+		UT_ASSERT_EQ(detail->attempts, 5);
+		UT_ASSERT_EQ(detail->elapsed_ms, 4700);
+		UT_ASSERT_EQ(strcmp(cluster_ges_timeout_src_text(detail->source), names[i]), 0);
+	}
+	cluster_ges_timeout_detail_reset();
+	UT_ASSERT_EQ(cluster_ges_timeout_detail_get()->source, CLUSTER_GES_TSRC_NONE);
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
+	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);

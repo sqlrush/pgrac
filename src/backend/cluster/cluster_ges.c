@@ -1840,6 +1840,11 @@ cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src, int32 master_node, long
 		break;
 	case CLUSTER_GES_TSRC_NONE:
 	case CLUSTER_GES_TSRC_NULL_ARG:
+	case CLUSTER_GES_TSRC_BLOCK0_REPLY_MISSING:
+	case CLUSTER_GES_TSRC_BLOCK0_REPLY_ABANDONED:
+	case CLUSTER_GES_TSRC_BLOCK0_GUARD_INCONSISTENT:
+	case CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT:
+		/* Exact protected failure, not a fabricated elapsed/capacity count. */
 		break;
 	}
 }
@@ -1891,6 +1896,14 @@ cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src)
 		return "master-reject-queue-full";
 	case CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT:
 		return "master-reject-timeout";
+	case CLUSTER_GES_TSRC_BLOCK0_REPLY_MISSING:
+		return "block0-reply-missing";
+	case CLUSTER_GES_TSRC_BLOCK0_REPLY_ABANDONED:
+		return "block0-reply-abandoned";
+	case CLUSTER_GES_TSRC_BLOCK0_GUARD_INCONSISTENT:
+		return "block0-guard-inconsistent";
+	case CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT:
+		return "block0-master-reject";
 	}
 	return "unknown";
 }

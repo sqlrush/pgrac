@@ -182,6 +182,7 @@ static bool current_exit_hook_registered = false;
 #define CURRENT_ADMISSION_LIVE_OWNER_SOURCE UINT8_C(2)
 #define CURRENT_ADMISSION_LIVE_OWNER_TARGET UINT8_C(3)
 #define CURRENT_ADMISSION_CTRC_RELEASE UINT8_C(4)
+#define CURRENT_RETRY_REPORTED_INDEX 1
 
 static void current_backend_exit(int code, Datum arg);
 static void current_error_cleanup(int code, Datum arg);
@@ -689,6 +690,98 @@ current_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result re
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
 
+/* A retry count is not an elapsed caller deadline or a proof of lost authority.
+ * Diagnostics use the original deadline, never renew it, and do not resample
+ * authority after a failed predicate.  -1 means no finite elapsed anchor. */
+static long
+current_wait_elapsed_ms(const ClusterUndoBlock0CurrentGuardData *data, TimestampTz now)
+{
+	TimestampTz began;
+
+	if (data->deadline == 0 || data->timeout_ms < 0)
+		return -1;
+	began = data->deadline - (int64)data->timeout_ms * 1000;
+	return now >= began ? (long)((now - began) / 1000) : -1;
+}
+
+static void
+current_wait_log(const ClusterUndoBlock0CurrentGuardData *data, uint8 phase, const char *reason,
+				 ClusterUndoBlock0Result result, int poll_result, uint32 reply_opcode,
+				 uint32 reject_reason)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	int64 remaining_ms = data->deadline == 0 ? -1 : (data->deadline - now) / 1000;
+
+	ereport(LOG,
+			(errmsg_internal("block0 current wait: PGRAC_FAMILY=BLOCK0_CURRENT "
+							 "PGRAC_REASON=%s node=%d segment=%u owner=%u phase=%u "
+							 "request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+							 " routing=" UINT64_FORMAT " master=%d attempts=%u "
+							 "elapsed_ms=%ld remaining_ms=" INT64_FORMAT " timeout_ms=%d "
+							 "result=%u poll=%d reply=%u reject=%u",
+							 reason, cluster_node_id, data->logical.segment_id,
+							 data->logical.owner_instance, phase, data->holder.request_id,
+							 data->holder.cluster_epoch, data->routing_generation,
+							 data->master_node, data->retry_attempt,
+							 current_wait_elapsed_ms(data, now), remaining_ms, data->timeout_ms,
+							 (unsigned)result, poll_result, reply_opcode, reject_reason)));
+}
+
+static ClusterUndoBlock0CurrentStep
+current_wait_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
+				  ClusterUndoBlock0Result *failure, ClusterGesTimeoutSrc source, const char *reason,
+				  int poll_result, uint32 reply_opcode, uint32 reject_reason)
+{
+	uint8 phase = data->phase;
+	ClusterUndoBlock0CurrentStep step;
+
+	cluster_ges_timeout_detail_set(source, data->master_node,
+								   current_wait_elapsed_ms(data, GetCurrentTimestamp()),
+								   data->retry_attempt, -1, data->timeout_ms);
+	/* Cleanup precedes even LOG, so an error during formatting cannot orphan
+	 * a pending request. Cleanup preserves diagnostic identity/scalars. */
+	step = current_fail(data, result, failure);
+	current_wait_log(data, phase, reason, result, poll_result, reply_opcode, reject_reason);
+	return step;
+}
+
+static ClusterUndoBlock0CurrentStep
+current_reply_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result *failure,
+				   GesReplyWaitPollResult poll, const GesReplyWaitVerdict *verdict)
+{
+	ClusterGesTimeoutSrc source = CLUSTER_GES_TSRC_BLOCK0_REPLY_MISSING;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
+	const char *reason = "REPLY_MISSING";
+
+	if (poll == GES_REPLY_WAIT_POLL_ABANDONED) {
+		source = CLUSTER_GES_TSRC_BLOCK0_REPLY_ABANDONED;
+		reason = "REPLY_ABANDONED";
+	} else if (poll == GES_REPLY_WAIT_POLL_DELIVERED) {
+		source = verdict->reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL
+					 ? CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL
+				 : verdict->reject_reason == GES_REJECT_REASON_TIMEOUT
+					 ? CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT
+					 : CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT;
+		result = current_failure_from_reject(verdict->reject_reason);
+		reason = "REMOTE_REJECT";
+	}
+	return current_wait_fail(data, result, failure, source, reason, (int)poll,
+							 verdict == NULL ? 0 : verdict->reply_opcode,
+							 verdict == NULL ? 0 : verdict->reject_reason);
+}
+
+static void
+current_retry_threshold_note(ClusterUndoBlock0CurrentGuardData *data)
+{
+	if (cluster_ges_retransmit_max_attempts > 0
+		&& data->retry_attempt >= (uint16)cluster_ges_retransmit_max_attempts
+		&& data->reserved[CURRENT_RETRY_REPORTED_INDEX] == 0) {
+		data->reserved[CURRENT_RETRY_REPORTED_INDEX] = 1;
+		current_wait_log(data, data->phase, "RETRANSMIT_THRESHOLD_WAIT", CLUSTER_UNDO_BLOCK0_OK,
+						 GES_REPLY_WAIT_POLL_PENDING, 0, 0);
+	}
+}
+
 static ClusterUndoBlock0CurrentStep
 current_promote_grant(ClusterUndoBlock0CurrentGuardData *data,
 				  ClusterUndoBlock0Result *failure)
@@ -1053,7 +1146,9 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 			return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 		now = GetCurrentTimestamp();
 		if (data->deadline != 0 && now >= data->deadline)
-			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+			return current_wait_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure,
+									 CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT,
+									 "RESERVATION_DEADLINE_EXPIRED", -1, 0, 0);
 		if (now < data->next_retry_at)
 			return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
 		PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
@@ -1064,7 +1159,9 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 		return step;
 	}
 	if (!data->reservation_held || !data->reply_installed || !data->request_dispatched)
-		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		return current_wait_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure,
+								 CLUSTER_GES_TSRC_BLOCK0_GUARD_INCONSISTENT,
+								 "GUARD_FLAGS_INCONSISTENT", -1, 0, 0);
 
 	memset(&verdict, 0, sizeof(verdict));
 	current_fill_reply_key(data, GES_REQ_OPCODE_REQUEST, &key);
@@ -1080,27 +1177,23 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 			data->grant_observed = true;
 			return current_promote_grant(data, failure);
 		}
-		if (verdict.reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
-			cluster_ges_timeout_detail_set(
-				CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, data->master_node, 0,
-				data->retry_attempt, -1, data->timeout_ms);
-		return current_fail(data, current_failure_from_reject(verdict.reject_reason), failure);
+		return current_reply_fail(data, failure, poll_result, &verdict);
 	}
 	if (poll_result != GES_REPLY_WAIT_POLL_PENDING)
-		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		return current_reply_fail(data, failure, poll_result, NULL);
 	if (!current_live_recheck(data))
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 
 	now = GetCurrentTimestamp();
 	if (data->deadline != 0 && now >= data->deadline)
-		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		return current_wait_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure,
+								 CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, "ACQUIRE_DEADLINE_EXPIRED",
+								 (int)poll_result, 0, 0);
 	if (data->remote_master && now >= data->next_retry_at) {
 		GesRequestPayload request;
 		int backoff_ms;
 
-		if (data->timeout_ms >= 0 && cluster_ges_retransmit_max_attempts > 0
-			&& data->retry_attempt >= (uint16)cluster_ges_retransmit_max_attempts)
-			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		current_retry_threshold_note(data);
 		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
 														 sizeof(request))) {
@@ -1109,7 +1202,8 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 				data->retry_attempt, -1, data->timeout_ms);
 			return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
 		}
-		data->retry_attempt++;
+		if (data->retry_attempt < UINT16_MAX)
+			data->retry_attempt++;
 		backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS << Min(data->retry_attempt, 4);
 		if (backoff_ms > CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS)
 			backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS;
@@ -1249,6 +1343,7 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 	data->reply_wait_site_plus_one = 0;
 	data->reply_wait_adapter_required = false;
 	data->reply_wait_repoll_pending = false;
+	data->reserved[CURRENT_RETRY_REPORTED_INDEX] = 0;
 	if (!data->remote_master) {
 		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
@@ -1307,7 +1402,7 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
 		data->reply_installed = false;
 		if (verdict.reply_opcode != GES_REPLY_OPCODE_GRANT
 			|| verdict.reject_reason != GES_REJECT_REASON_NONE) {
-			return current_fail(data, current_failure_from_reject(verdict.reject_reason), failure);
+			return current_reply_fail(data, failure, poll_result, &verdict);
 		}
 		(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
@@ -1317,24 +1412,24 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
 		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	}
 	if (poll_result != GES_REPLY_WAIT_POLL_PENDING)
-		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		return current_reply_fail(data, failure, poll_result, NULL);
 	now = GetCurrentTimestamp();
 	if (data->deadline != 0 && now >= data->deadline) {
-		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		return current_wait_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure,
+								 CLUSTER_GES_TSRC_CV_WAIT_TIMEOUT, "RELEASE_DEADLINE_EXPIRED",
+								 (int)poll_result, 0, 0);
 	}
 	if (now >= data->next_retry_at) {
 		GesRequestPayload release;
 		int backoff_ms;
 
-		if (data->timeout_ms >= 0 && cluster_ges_retransmit_max_attempts > 0
-			&& data->retry_attempt >= (uint16)cluster_ges_retransmit_max_attempts) {
-			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
-		}
+		current_retry_threshold_note(data);
 		current_fill_request(data, GES_REQ_OPCODE_RELEASE, &release);
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &release,
 														 sizeof(release)))
 			current_stage_remote_release(data);
-		data->retry_attempt++;
+		if (data->retry_attempt < UINT16_MAX)
+			data->retry_attempt++;
 		backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS << Min(data->retry_attempt, 4);
 		if (backoff_ms > CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS)
 			backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS;

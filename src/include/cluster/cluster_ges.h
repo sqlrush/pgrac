@@ -128,6 +128,10 @@ typedef enum ClusterGesTimeoutSrc {
 											    * (dedup table / work queue / wait queue full
 											    * on the master — the reply-tail fold) */
 	CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT,	   /* master replied TIMEOUT (reply-tail fold) */
+	CLUSTER_GES_TSRC_BLOCK0_REPLY_MISSING,
+	CLUSTER_GES_TSRC_BLOCK0_REPLY_ABANDONED,
+	CLUSTER_GES_TSRC_BLOCK0_GUARD_INCONSISTENT,
+	CLUSTER_GES_TSRC_BLOCK0_MASTER_REJECT,
 } ClusterGesTimeoutSrc;
 
 typedef struct ClusterGesTimeoutDetail {
