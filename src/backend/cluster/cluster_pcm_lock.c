@@ -909,6 +909,9 @@ pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
 	struct GrdEntry *entry, int32 current_master_node,
 	uint64 current_master_session, uint64 current_formation,
 	uint64 expected_carrier_generation);
+static ResourceXApplyResult pcm_resource_x_predecessor_wait_observation_locked(
+	struct GrdEntry *entry, int32 current_master_node, uint64 current_master_session,
+	uint64 current_formation, uint64 expected_carrier_generation);
 static bool pcm_resource_x_s_predecessor_superseded_unbound_wait_locked(
 	struct GrdEntry *entry, const ResourceXAssertion *assertion,
 	int32 current_master_node, uint64 current_master_session,
@@ -13824,7 +13827,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 		return RESOURCE_X_APPLY_DUPLICATE;
 	entry = wait_context.ref.entry;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+	result = pcm_resource_x_predecessor_wait_observation_locked(
 		entry, current_master_node, current_master_session, current_formation,
 		expected_carrier_generation);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
@@ -13841,7 +13844,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	ConditionVariablePrepareToSleep(&entry->wait_cv);
 	wait_context.cv_prepared = true;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+	result = pcm_resource_x_predecessor_wait_observation_locked(
 		entry, current_master_node, current_master_session, current_formation,
 		expected_carrier_generation);
 	master_state = pcm_resource_x_master_state_for_entry(entry);
@@ -19805,6 +19808,38 @@ pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
 			&& carrier_generation != expected_carrier_generation))
 		return RESOURCE_X_APPLY_STALE;
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* This is a local wait observation, never a retained-source authority check.
+ * A valid newer pair still blocks bootstrap; only the sampled wait location
+ * has become obsolete. Keep the exact authority predicate unchanged and
+ * validate the whole current pair before comparing physical generations. */
+static ResourceXApplyResult
+pcm_resource_x_predecessor_wait_observation_locked(struct GrdEntry *entry,
+												   int32 current_master_node,
+												   uint64 current_master_session,
+												   uint64 current_formation,
+												   uint64 expected_carrier_generation)
+{
+	ClusterPcmResourceXMasterState *state;
+	ResourceXDecodedFrame status;
+	ResourceXDecodedFrame image;
+	ResourceXApplyResult result;
+	uint64 current_carrier_generation;
+
+	result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
+		entry, current_master_node, current_master_session, current_formation, 0);
+	if (result != RESOURCE_X_APPLY_APPLIED || expected_carrier_generation == 0)
+		return result;
+	state = pcm_resource_x_master_state_for_entry(entry);
+	result = pcm_resource_x_holder_pair_decode_locked(state, &status, &image);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	current_carrier_generation = image.body.image_envelope.source_carrier_generation;
+	if (current_carrier_generation == expected_carrier_generation)
+		return RESOURCE_X_APPLY_APPLIED;
+	return current_carrier_generation > expected_carrier_generation ? RESOURCE_X_APPLY_DUPLICATE
+																	: RESOURCE_X_APPLY_STALE;
 }
 
 /* The S-predecessor retention linearization point is the only path allowed to

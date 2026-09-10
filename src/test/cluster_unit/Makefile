@@ -2456,6 +2456,12 @@ test_cluster_pcm_wait_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     emit { print } \
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@
 
+test_cluster_pcm_predecessor_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/diagnostic_stage = "retained-release-wait";/ { emit=1; begin++ } \
+	     emit && /^\t\t\t\t}$$/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@
+
 test_cluster_pcm_ready_scheduler.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_stage_ready_tag\(/ { print "static void"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -2481,6 +2487,7 @@ test_cluster_pcm_source_owner_layout.inc: $(top_srcdir)/src/backend/cluster/clus
 	mv $@.tmp $@
 
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_predecessor_consumer.inc \
 		test_cluster_pcm_source_owner_layout.inc \
 		test_cluster_pcm_source_replay.inc \
 		test_cluster_pcm_source_replay_consumer.inc \

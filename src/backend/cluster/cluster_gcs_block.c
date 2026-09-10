@@ -15029,6 +15029,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
 						&resource, master_node, master_session, gate.formation, own.generation,
 						absolute_deadline_us, retry_slice_us);
+					if (wait_result == RESOURCE_X_APPLY_DUPLICATE)
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
 					if (wait_result != RESOURCE_X_APPLY_APPLIED
 						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
 						result = wait_result;
@@ -15350,6 +15353,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 					wait_result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
 						&resource, master_node, master_session, gate.formation, 0,
 						absolute_deadline_us, retry_slice_us);
+					if (wait_result == RESOURCE_X_APPLY_DUPLICATE)
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
 					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
 					diagnostic_deadline_expired
 						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;

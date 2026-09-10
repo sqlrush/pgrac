@@ -1657,6 +1657,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_wait_cal
 	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
 	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, long timeout_ms,
 	ResourceXCallerWitness *caller);
+/* APPLIED or DUPLICATE requests a fresh caller observation, not current-X
+ * authority. A newer valid source pair never authorizes consuming an older
+ * physical carrier; source/settlement predicates remain exact. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_predecessor_wait_exact(
 	const BufferTag *tag, int32 current_master_node, uint64 current_master_session,
 	uint64 current_formation, uint64 expected_carrier_generation,

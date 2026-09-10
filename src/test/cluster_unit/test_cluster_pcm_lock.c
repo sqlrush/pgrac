@@ -12065,7 +12065,7 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 					 &assertion, 0, 17, 31, 77, 51, 61, 50, &snapshot),
 				 RESOURCE_X_APPLY_NOT_FOUND);
 	UT_ASSERT_EQ(
-		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 60, 102500, 10000),
+		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 62, 102500, 10000),
 		RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
 	UT_ASSERT_EQ(
@@ -12086,6 +12086,151 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 					 &bootstrap, &terminal),
 				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
 	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(1));
+}
+
+static void
+replace_settled_predecessor_during_wait_registration(void)
+{
+	BufferTag tag = predecessor_wait_settlement.common.logical_assertion.resource;
+
+	settle_predecessor_during_wait_registration();
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_S, 62, 63, 7, 42,
+													  &predecessor_wait_settlement);
+}
+
+/* A sampled carrier is a wait observation, not owned source authority.
+ * Replacing a genuinely settled pair must send the observer back through
+ * fresh acquisition, without retiring or publishing the newer pair. */
+UT_TEST(test_resource_x_predecessor_replaced_before_wait_is_reobserved)
+{
+	BufferTag tag = make_tag(486);
+	ResourceXDecodedFrame before, after;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_S, 60, 61, 5, 41,
+													  &predecessor_wait_settlement);
+	UT_ASSERT(cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 61));
+	replace_settled_predecessor_during_wait_registration();
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+					 &predecessor_wait_settlement.common.logical_assertion, &before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 61, 102500, 10000),
+		RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+					 &predecessor_wait_settlement.common.logical_assertion, &after),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 61));
+	UT_ASSERT(cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 63));
+}
+
+UT_TEST(test_resource_x_predecessor_replaced_during_enrollment_is_reobserved)
+{
+	BufferTag tag = make_tag(487);
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_S, 60, 61, 5, 41,
+													  &predecessor_wait_settlement);
+	fake_cv_prepare_hook = replace_settled_predecessor_during_wait_registration;
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 61, 102500, 10000),
+		RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+	UT_ASSERT(fake_cv_prepare_hook == NULL);
+	UT_ASSERT(cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 63));
+}
+
+UT_TEST(test_resource_x_predecessor_newer_pair_does_not_hide_contradictions)
+{
+	int fault;
+
+	for (fault = 0; fault < 5; fault++) {
+		BufferTag tag = make_tag(488);
+		ResourceXDecodedFrame before, after;
+		ResourceXAssertion assertion;
+		ResourceXBootstrapRoundFailureSnapshot snapshot;
+		ResourceXApplyResult result;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 1;
+		fake_gcs_master_node = 0;
+		fake_pcm_clock_us = 100000;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_S, 60, 61, 5, 41,
+														  &predecessor_wait_settlement);
+		replace_settled_predecessor_during_wait_registration();
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+						 &predecessor_wait_settlement.common.logical_assertion, &before),
+					 RESOURCE_X_APPLY_APPLIED);
+		result = cluster_pcm_lock_resource_x_predecessor_wait_exact(
+			&tag, fault == 0 ? 3 : 0, fault == 1 ? 32 : 31, fault == 2 ? 18 : 17,
+			fault == 3	 ? 64
+			: fault == 4 ? UINT64_MAX
+						 : 61,
+			102500, 10000);
+		UT_ASSERT_EQ(result, fault == 0	  ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+							 : fault == 4 ? RESOURCE_X_APPLY_INVALID
+										  : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+		UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+						 &predecessor_wait_settlement.common.logical_assertion, &after),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 50, &snapshot),
+					 RESOURCE_X_APPLY_NOT_FOUND);
+		UT_ASSERT(
+			!cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 61));
+		UT_ASSERT(
+			cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 63));
+	}
+}
+
+UT_TEST(test_resource_x_predecessor_malformed_pair_is_not_progress)
+{
+	BufferTag tag = make_tag(489);
+	ResourceXDecodedFrame before, after;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	/* The retained wire pair can be decoded, but its physical carrier does
+	 * not equal source+1. A larger number alone is never progress proof. */
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_X, 59, 61, 3, 41,
+													  &predecessor_wait_settlement);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+					 &predecessor_wait_settlement.common.logical_assertion, &before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 59, 102500, 10000),
+		RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(
+					 &predecessor_wait_settlement.common.logical_assertion, &after),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 61));
 }
 
 UT_TEST(test_resource_x_s_predecessor_retained_pair_blocks_local_bootstrap)
@@ -12842,6 +12987,76 @@ static uint64
 gcs_block_pcm_x_monotonic_us(void)
 {
 	return fake_pcm_clock_us;
+}
+
+/* Compile the actual retained-release consumer, including its continue and
+ * error exits, against the real PCM wait. Only diagnostic output is doubled.
+ * Re-entering the loop is distinct from exporting an acquisition result. */
+static ResourceXApplyResult
+run_actual_gcs_predecessor_consumer(BufferTag resource, uint64 observed_generation,
+									bool *reobserved, uint64 *notes)
+{
+	ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+	ResourceXApplyResult wait_result;
+	ClusterPcmOwnSnapshot own = { 0 };
+	struct {
+		uint64 formation;
+	} gate = { 17 };
+	int32 master_node = 0;
+	uint64 master_session = 31;
+	uint64 absolute_deadline_us = 102500, retry_slice_us = 10000;
+	uint64 now_us = 0, wait_diagnostic = 0;
+	const char *diagnostic_stage = NULL;
+	int iteration;
+
+	own.generation = observed_generation;
+	*reobserved = false;
+	for (iteration = 0; iteration < 2; iteration++) {
+		if (iteration == 1) {
+			*reobserved = true;
+			break;
+		}
+#define gcs_block_resource_x_requester_wait_note(state, reason)                                    \
+	(*(state) |= UINT64_C(1) << (reason))
+#include "test_cluster_pcm_predecessor_consumer.inc"
+#undef gcs_block_resource_x_requester_wait_note
+		result = RESOURCE_X_APPLY_BAD_STATE; /* No production exit may fall through. */
+		break;
+	}
+	*notes = wait_diagnostic;
+	(void)now_us;
+	(void)diagnostic_stage;
+	return result;
+}
+
+UT_TEST(test_resource_x_gcs_predecessor_reobserve_is_not_authority)
+{
+	BufferTag tag = make_tag(490);
+	bool reobserved;
+	uint64 notes;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 100000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	retain_resource_x_test_settlement_pair_at_attempt(tag, PCM_STATE_S, 60, 61, 5, 41,
+													  &predecessor_wait_settlement);
+	replace_settled_predecessor_during_wait_registration();
+	UT_ASSERT_EQ(run_actual_gcs_predecessor_consumer(tag, 61, &reobserved, &notes),
+				 RESOURCE_X_APPLY_INVALID); /* No usable result exported. */
+	UT_ASSERT(reobserved);
+	UT_ASSERT(notes & (UINT64_C(1) << PCM_RX_WAIT_PREDECESSOR));
+	UT_ASSERT(notes & (UINT64_C(1) << PCM_RX_WAIT_OBSERVATION));
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	UT_ASSERT_EQ(run_actual_gcs_predecessor_consumer(tag, 64, &reobserved, &notes),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(!reobserved);
+	UT_ASSERT(!(notes & (UINT64_C(1) << PCM_RX_WAIT_OBSERVATION)));
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
+	UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+	UT_ASSERT(cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(&tag, 0, 31, 17, 63));
 }
 
 /* Actual GCS scheduler + actual PCM owners. Only capability/shard/physical
@@ -18765,7 +18980,7 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 int
 main(void)
 {
-	UT_PLAN(255);
+	UT_PLAN(260);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -18957,6 +19172,11 @@ main(void)
 	UT_RUN(test_resource_x_source_settlement_prepare_closes_total_cover_table);
 	UT_RUN(test_resource_x_s_predecessor_retained_pair_blocks_local_bootstrap);
 	UT_RUN(test_resource_x_predecessor_cv_observes_settlement_without_a_head);
+	UT_RUN(test_resource_x_predecessor_replaced_before_wait_is_reobserved);
+	UT_RUN(test_resource_x_predecessor_replaced_during_enrollment_is_reobserved);
+	UT_RUN(test_resource_x_predecessor_newer_pair_does_not_hide_contradictions);
+	UT_RUN(test_resource_x_predecessor_malformed_pair_is_not_progress);
+	UT_RUN(test_resource_x_gcs_predecessor_reobserve_is_not_authority);
 	UT_RUN(test_resource_x_s_predecessor_cancels_only_unbound_preassert_round);
 	UT_RUN(test_resource_x_s_predecessor_cancellation_supersedes_old_wait);
 	UT_RUN(test_resource_x_source_settlement_accepts_multi_blocker_authority_span);
