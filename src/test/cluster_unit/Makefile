@@ -53,7 +53,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_replacement_episode test_cluster_replacement_request test_cluster_replacement_wire test_cluster_undo_root_descriptor test_cluster_marker_async \
         test_cluster_ges test_cluster_ges_reply_wait test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
-        test_cluster_hw_handoff \
+        test_cluster_hw_handoff test_cluster_lms_native_probe \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
@@ -1693,7 +1693,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-$(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_lms_native_probe,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # M7: execute the production insert-end accessor against the exact WAL page
@@ -2776,6 +2776,15 @@ test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
 # focused test seam executes the incarnation publication used by both DATA
 # worker main entries without linking unrelated LMS duties.
 CLUSTER_R4_LMS_CONTROLS_TEST_O = test_cluster_r4_lms_controls_product.o
+
+test_cluster_lms_native_probe: test_cluster_lms_native_probe.c unit_test.h \
+        $(top_srcdir)/src/backend/cluster/cluster_lms.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DLMS_NATIVE_PROBE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_lms.c"' \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 $(CLUSTER_R4_LMS_CONTROLS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_lms.c \
 		$(top_srcdir)/src/include/cluster/cluster_lms.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \

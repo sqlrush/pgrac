@@ -1750,87 +1750,129 @@ native_probe_send_reject_reply(const ClusterLmsNativeLockProbeSlot *slot, uint32
 											sizeof(reply));
 }
 
-bool
-cluster_lms_native_probe_slot_acquire(int32 origin_node_id, const LOCKTAG *locktag,
-									  LOCKMODE lockmode, const ClusterGrdHolderId *requester,
-									  uint32 *slot_idx_out)
+/* The allocated descriptor count is independent of the active fanout GUC. */
+enum {
+	PROBE_FREE = 0,
+	PROBE_ACTIVE = 1,
+	PROBE_DISPATCHING = 2,
+	PROBE_QUEUED = 3,
+	PROBE_COMPLETING = 4
+};
+
+static void native_probe_dispatch(uint32 slot_idx, uint64 probe_id);
+static void native_probe_aggregate(uint32 slot_idx, uint64 probe_id);
+static void native_probe_start_pending(void);
+
+static void
+native_probe_copy_work(ClusterLmsNativeLockProbeSlot *dest,
+					   const ClusterLmsNativeLockProbeSlot *source)
 {
-	int cap, i;
-
-	Assert(cluster_lms_state != NULL);
-	Assert(locktag != NULL);
-	Assert(requester != NULL);
-	Assert(slot_idx_out != NULL);
-	if (cluster_lms_state == NULL || locktag == NULL || requester == NULL || slot_idx_out == NULL)
-		return false;
-
-	cap = probe_active_capacity();
-
-	for (i = 0; i < cap; i++) {
-		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
-		uint64 expected = 0;
-
-		if (pg_atomic_compare_exchange_u64(&slot->in_use, &expected, 2)) {
-			/* Slot acquired — initialize while readers still skip the slot.
-			 * Publish active state only after all fields are set. */
-			slot->probe_id = pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_next_id, 1);
-			slot->locktag = *locktag;
-			slot->lockmode = lockmode;
-			slot->origin_node_id = origin_node_id;
-			slot->requester_procno = (int32)requester->procno;
-			slot->shard_master_generation_lo = 0;
-			slot->requester = *requester;
-			memset(&slot->resid, 0, sizeof(slot->resid));
-			slot->start_ts = GetCurrentTimestamp();
-			slot->grant_source_node_id = -1;
-			slot->request_opcode = GES_REQ_OPCODE_REQUEST;
-			slot->retry_count = 0;
-			slot->expected_replies_bitmap = 0;
-			slot->received_replies_bitmap = 0;
-			slot->aggregated_status_packed = 0;
-			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
-			slot->grant_on_clear = false;
-			slot->final_ready = false;
-			pg_atomic_write_u64(&slot->in_use, 1);
-
-			*slot_idx_out = (uint32)i;
-			return true;
-		}
-	}
-
-	/* HC29:  capacity exhausted.  Caller enqueues into LMS pending queue
-	 * (Step 5 surface; pending queue wire 推 spec-2.27 + future shard
-	 * partition).  Bump counter for observability. */
-	pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_collector_slot_full_count, 1);
-	return false;
+	/* Never copy a live LWLock or atomic ownership word into a new slot. */
+	memcpy(&dest->probe_id, &source->probe_id,
+		   offsetof(ClusterLmsNativeLockProbeSlot, lock)
+			   - offsetof(ClusterLmsNativeLockProbeSlot, probe_id));
 }
 
-void
-cluster_lms_native_probe_slot_release(uint32 slot_idx)
+static void
+native_probe_wake(void)
 {
+	ConditionVariableBroadcast(&cluster_lms_state->cv);
+	cluster_lms_wakeup(0);
+}
+
+static bool
+native_probe_authority_current(const ClusterLmsNativeLockProbeSlot *work)
+{
+	LOCKMODE mode;
+
+	if (work->requester.cluster_epoch != cluster_epoch_get_current())
+		return false;
+	if (!work->grant_on_clear)
+		return true; /* The synchronous caller can still own an S3 reservation. */
+	if (work->shard_master_generation_lo != (uint32)cluster_lms_get_shard_master_generation())
+		return false;
+	if (work->request_opcode == GES_REQ_OPCODE_CONVERT)
+		return true; /* Original precise old-mode locator is checked at commit. */
+	return cluster_grd_holder_mode_by_id(&work->resid, &work->requester, &mode)
+		   && mode == work->lockmode;
+}
+
+static void
+native_probe_release(uint32 slot_idx, uint64 probe_id, bool owner)
+{
+	ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	uint64 phase;
+
+	LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+	phase = pg_atomic_read_u64(&slot->in_use);
+	if (slot->probe_id == probe_id && phase != PROBE_FREE
+		&& (owner || (phase != PROBE_DISPATCHING && phase != PROBE_COMPLETING))) {
+		slot->grant_on_clear = false;
+		slot->final_ready = false;
+		pg_atomic_write_u64(&slot->in_use, PROBE_FREE);
+	}
+	LWLockRelease(&slot->lock.lock);
+	native_probe_wake();
+}
+
+static bool
+native_probe_submit(const ClusterLmsNativeLockProbeSlot *work, bool allow_queue,
+					volatile uint32 *slot_idx_out, volatile uint64 *probe_id_out)
+{
+	int free_slot = -1;
+	int active = 0;
+	bool queued = false;
+	bool start = false;
+	uint64 next_id;
 	ClusterLmsNativeLockProbeSlot *slot;
 
-	Assert(cluster_lms_state != NULL);
-	Assert(slot_idx < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS);
-	if (cluster_lms_state == NULL || slot_idx >= CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS)
-		return;
+	/* Allocation and capacity reservation use one pool lock, never a GRD lock. */
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
+		uint64 phase = pg_atomic_read_u64(&cluster_lms_state->native_probe_slots[i].in_use);
 
-	slot = &cluster_lms_state->native_probe_slots[slot_idx];
-	if (pg_atomic_read_u64(&slot->in_use) != 1)
-		return;
+		if (phase == PROBE_FREE && free_slot < 0)
+			free_slot = i;
+		if (phase == PROBE_ACTIVE || phase == PROBE_DISPATCHING || phase == PROBE_COMPLETING)
+			active++;
+		if (phase == PROBE_QUEUED)
+			queued = true;
+	}
+	if (active >= probe_active_capacity() || queued)
+		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_collector_slot_full_count, 1);
+	next_id = pg_atomic_read_u64(&cluster_lms_state->native_probe_next_id);
+	if (free_slot < 0 || next_id == 0 || next_id == UINT64_MAX
+		|| (!allow_queue && (active >= probe_active_capacity() || queued))) {
+		LWLockRelease(&cluster_lms_state->lwlock);
+		return false;
+	}
+	slot = &cluster_lms_state->native_probe_slots[free_slot];
 	LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-	slot->grant_on_clear = false;
-	slot->final_ready = false;
-	pg_atomic_write_u64(&slot->in_use, 0);
+	native_probe_copy_work(slot, work);
+	slot->probe_id = pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_next_id, 1);
+	slot->start_ts = GetCurrentTimestamp();
+	start = active < probe_active_capacity() && !queued;
+	pg_atomic_write_u64(&slot->in_use, start ? PROBE_DISPATCHING : PROBE_QUEUED);
+	*slot_idx_out = free_slot;
+	*probe_id_out = slot->probe_id;
 	LWLockRelease(&slot->lock.lock);
+	LWLockRelease(&cluster_lms_state->lwlock);
+	if (start) {
+		native_probe_dispatch(*slot_idx_out, *probe_id_out);
+		native_probe_aggregate(*slot_idx_out, *probe_id_out);
+	}
+	native_probe_wake();
+	return true;
 }
 
-void
-cluster_lms_native_probe_dispatch(uint32 slot_idx)
+static void
+native_probe_dispatch(uint32 slot_idx, uint64 probe_id)
 {
 	ClusterLmsNativeLockProbeSlot *slot;
 	GesNativeLockProbePayload payload;
 	int peer_count = 0;
+	ClusterLmsNativeLockProbeSlot work;
+	bool authority_valid;
 	int self_node = cluster_node_id;
 	/* Local fan-out walk:  for every live peer in cluster_conf, send a
 	 * probe message + mark expected_replies_bitmap.  Origin self short-
@@ -1844,6 +1886,26 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 
 	slot = &cluster_lms_state->native_probe_slots[slot_idx];
 	LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u64(&slot->in_use) != PROBE_DISPATCHING || slot->probe_id != probe_id) {
+		LWLockRelease(&slot->lock.lock);
+		return;
+	}
+	native_probe_copy_work(&work, slot);
+	LWLockRelease(&slot->lock.lock);
+	/* The dispatch owner pins the descriptor, not any GRD lock. */
+	authority_valid = native_probe_authority_current(&work);
+	LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u64(&slot->in_use) != PROBE_DISPATCHING || slot->probe_id != probe_id) {
+		LWLockRelease(&slot->lock.lock);
+		return;
+	}
+	if (!authority_valid) {
+		slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+		slot->final_ready = true;
+		pg_atomic_write_u64(&slot->in_use, PROBE_ACTIVE);
+		LWLockRelease(&slot->lock.lock);
+		return;
+	}
 	slot->expected_replies_bitmap = 0;
 	slot->received_replies_bitmap = 0;
 	slot->aggregated_status_packed = 0;
@@ -1869,6 +1931,7 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
 			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
 			slot->final_ready = true;
+			pg_atomic_write_u64(&slot->in_use, PROBE_ACTIVE);
 			LWLockRelease(&slot->lock.lock);
 			ConditionVariableBroadcast(&cluster_lms_state->cv);
 			return;
@@ -1903,6 +1966,7 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 				pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
 				slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
 				slot->final_ready = true;
+				pg_atomic_write_u64(&slot->in_use, PROBE_ACTIVE);
 				LWLockRelease(&slot->lock.lock);
 				ConditionVariableBroadcast(&cluster_lms_state->cv);
 				return;
@@ -1917,6 +1981,7 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 
 	/* Capture dispatch ts for retry-tick (HC32 retry-poll). */
 	slot->start_ts = GetCurrentTimestamp();
+	pg_atomic_write_u64(&slot->in_use, PROBE_ACTIVE);
 	LWLockRelease(&slot->lock.lock);
 
 	/* Wake any LMS waiter watching for collector advance. */
@@ -1929,314 +1994,279 @@ void
 cluster_lms_native_probe_recv_reply(uint64 probe_id, int32 sender_node_id,
 									ClusterNativeLockProbeReply status)
 {
-	int cap, i;
+	uint32 sender_bit;
 
-	Assert(cluster_lms_state != NULL);
-	if (cluster_lms_state == NULL)
+	if (cluster_lms_state == NULL || !native_probe_node_bit(sender_node_id, &sender_bit))
 		return;
-
 	pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_reply_recv_count, 1);
-
-	cap = probe_active_capacity();
-	for (i = 0; i < cap; i++) {
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
 		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
-		uint32 sender_bit;
+		uint64 phase = pg_atomic_read_u64(&slot->in_use);
 
-		if (pg_atomic_read_u64(&slot->in_use) != 1)
+		/* DISPATCHING can have an immediate reply waiting for its slot lock. */
+		if (phase != PROBE_ACTIVE && phase != PROBE_DISPATCHING)
 			continue;
-
-		if (!native_probe_node_bit(sender_node_id, &sender_bit))
-			return;
-
-		/* spec-2.27 D5 / HC55 — per-slot LWLock serializes the read-modify-
-		 * write of received_replies_bitmap + aggregated_status_packed
-		 * against retry_tick / aggregate / cleanup paths. */
 		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		if (slot->probe_id != probe_id) {
+		if (pg_atomic_read_u64(&slot->in_use) != PROBE_ACTIVE || slot->probe_id != probe_id) {
 			LWLockRelease(&slot->lock.lock);
 			continue;
 		}
-		if ((slot->expected_replies_bitmap & sender_bit) == 0) {
+		if ((slot->expected_replies_bitmap & sender_bit) == 0
+			|| (slot->received_replies_bitmap & sender_bit) != 0) {
 			LWLockRelease(&slot->lock.lock);
-			return; /* HC36 stale reply (not expected from this node) */
+			return;
 		}
-		if ((slot->received_replies_bitmap & sender_bit) != 0) {
-			LWLockRelease(&slot->lock.lock);
-			return; /* duplicate reply — silent drop */
-		}
-
 		slot->received_replies_bitmap |= sender_bit;
 		slot->aggregated_status_packed |= ((uint32)status & 0x3) << ((uint32)sender_node_id * 2);
 		LWLockRelease(&slot->lock.lock);
-
-		/* Wake LMS to attempt aggregate resolution. */
-		cluster_lms_native_probe_aggregate_and_resolve((uint32)i);
-		ConditionVariableBroadcast(&cluster_lms_state->cv);
+		native_probe_aggregate(i, probe_id);
+		native_probe_wake();
 		return;
 	}
-
-	/* No matching slot — HC36 stale-reply drop. */
 }
 
-void
-cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
+static void
+native_probe_aggregate(uint32 slot_idx, uint64 probe_id)
 {
-	ClusterLmsNativeLockProbeSlot *slot;
+	ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	ClusterLmsNativeLockProbeSlot work;
 	bool complete = false;
+	bool timeout;
 	uint32 status;
-	bool need_release_after_grant = false;
-	bool need_release_after_timeout = false;
-	bool need_send_grant = false;
-	bool need_send_reject = false;
-	bool need_release_holder = false;
-	bool need_convert_commit = false; /* spec-5.3 §3.5 — commit a CONVERT on clear */
-	uint32 reject_reason = 0;
 
-	Assert(cluster_lms_state != NULL);
-	Assert(slot_idx < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS);
-
-	slot = &cluster_lms_state->native_probe_slots[slot_idx];
-	if (pg_atomic_read_u64(&slot->in_use) != 1)
-		return;
-
-	/* spec-2.27 D5 / HC55 — hold per-slot LWLock across status read +
-	 * aggregate computation + final_status/final_ready update.  Defer
-	 * GRD release / reply send and slot release calls to after the lock
-	 * is dropped, since those touch other shmem regions and may sleep
-	 * (avoid lock inversion). */
 	LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-
-	if (slot->final_ready && slot->final_status == CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT) {
-		if (slot->grant_on_clear) {
-			/*
-			 * spec-5.3 §3.2 — a CONVERT is NOT pre-mutated, so on timeout the
-			 * existing (weaker-mode) holder must stay (do NOT release it): the
-			 * requester keeps L_old and sends a best-effort CONVERT_ROLLBACK.
-			 * A plain REQUEST grant-on-clear had added a holder, which must be
-			 * released here.
-			 */
-			need_release_holder = (slot->request_opcode != GES_REQ_OPCODE_CONVERT);
-			need_send_reject = true;
-			need_release_after_timeout = true;
-			reject_reason = GES_REJECT_REASON_TIMEOUT;
+	if (pg_atomic_read_u64(&slot->in_use) != PROBE_ACTIVE || slot->probe_id != probe_id) {
+		LWLockRelease(&slot->lock.lock);
+		return;
+	}
+	timeout = slot->final_ready && slot->final_status == CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+	if (!timeout) {
+		if (slot->final_ready) {
+			LWLockRelease(&slot->lock.lock);
+			return; /* Synchronous result belongs to its one waiting caller. */
 		}
-		LWLockRelease(&slot->lock.lock);
-		goto post_lock;
+		status = native_probe_aggregate_status(slot, &complete);
+		if (!complete || slot->expected_replies_bitmap == 0) {
+			LWLockRelease(&slot->lock.lock);
+			return;
+		}
+		if (status == CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT
+			|| status == CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT) {
+			pg_atomic_fetch_add_u64(
+				status == CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT
+					? &cluster_lms_state->native_probe_aggregate_holder_conflict_count
+					: &cluster_lms_state->native_probe_aggregate_waiter_conflict_count,
+				1);
+			LWLockRelease(&slot->lock.lock);
+			return;
+		}
 	}
-
-	status = native_probe_aggregate_status(slot, &complete);
-	if (!complete) {
-		LWLockRelease(&slot->lock.lock);
-		return;
-	}
-
-	if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT) {
-		LWLockRelease(&slot->lock.lock);
-		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_aggregate_holder_conflict_count,
-								1);
-		return;
-	}
-	if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT) {
-		LWLockRelease(&slot->lock.lock);
-		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_aggregate_waiter_conflict_count,
-								1);
-		return;
-	}
-
-	if (slot->grant_on_clear) {
-		/* spec-5.3 §3.5 — a CONVERT commits its upgrade HERE (the holder was
-		 * not pre-mutated during the probe window);  a plain REQUEST just
-		 * sends the deferred grant. */
-		if (slot->request_opcode == GES_REQ_OPCODE_CONVERT)
-			need_convert_commit = true;
-		else
-			need_send_grant = true;
-		need_release_after_grant = true;
-	} else {
-		slot->final_status = (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+	if (!slot->grant_on_clear) {
+		slot->final_status
+			= timeout ? CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT : CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
 		slot->final_ready = true;
+		LWLockRelease(&slot->lock.lock);
+		native_probe_wake();
+		return;
 	}
+	/* Claim completion before dropping the lock. No second aggregator, retry,
+	 * or cleanup may send, release, or reuse this descriptor in this window. */
+	native_probe_copy_work(&work, slot);
+	pg_atomic_write_u64(&slot->in_use, PROBE_COMPLETING);
 	LWLockRelease(&slot->lock.lock);
 
-post_lock:
-	if (need_release_holder)
-		(void)cluster_grd_release_holder_by_id(&slot->resid, &slot->requester);
-	if (need_convert_commit) {
-		/*
-		 * spec-5.3 §3.5 — the native probe cleared;  commit the convert now
-		 * (locate the OLD slot by node/procno, upgrade + rebind).  GRANTED ->
-		 * send the grant;  ILLEGAL (the holder vanished mid-probe) -> reject;
-		 * ENQUEUED (a cluster holder conflict appeared during the probe) ->
-		 * no reply now, the requester keeps waiting and the release drain
-		 * grants it.
-		 */
-		/* P2-1: reconstruct the FULL shard_master_generation (epoch high half
-		 * + lo) so an ENQUEUED-then-drained convert records its dedup reply
-		 * under the same generation the requester retransmits with. */
-		uint64 gen = ((slot->requester.cluster_epoch & 0xffffffffu) << 32)
-					 | (uint64)slot->shard_master_generation_lo;
-		ClusterGrdConvertResult cr = cluster_grd_convert_grant_by_backend(
-			&slot->resid, (int32)slot->requester.node_id, slot->requester.procno,
-			slot->requester.cluster_epoch, (LOCKMODE)slot->convert_old_mode, slot->lockmode,
-			slot->requester.request_id, slot->grant_source_node_id, gen);
+	PG_TRY();
+	{
+		if (!native_probe_authority_current(&work)) {
+			/* Exact REQUEST holder removed by S7/release: never resurrect it.
+			 * A real epoch/generation change still gets a correlated refusal. */
+			if (work.requester.cluster_epoch != cluster_epoch_get_current()
+				|| work.shard_master_generation_lo
+					   != (uint32)cluster_lms_get_shard_master_generation()) {
+				if (work.request_opcode != GES_REQ_OPCODE_CONVERT)
+					(void)cluster_grd_release_holder_by_id(&work.resid, &work.requester);
+				native_probe_send_reject_reply(&work, GES_REJECT_REASON_SHARD_FROZEN);
+			}
+		} else if (timeout) {
+			if (work.request_opcode != GES_REQ_OPCODE_CONVERT)
+				(void)cluster_grd_release_holder_by_id(&work.resid, &work.requester);
+			native_probe_send_reject_reply(&work, GES_REJECT_REASON_TIMEOUT);
+		} else if (work.request_opcode == GES_REQ_OPCODE_CONVERT) {
+			uint64 gen = ((work.requester.cluster_epoch & 0xffffffffu) << 32)
+						 | (uint64)work.shard_master_generation_lo;
+			ClusterGrdConvertResult cr = cluster_grd_convert_grant_by_backend(
+				&work.resid, work.requester.node_id, work.requester.procno,
+				work.requester.cluster_epoch, work.convert_old_mode, work.lockmode,
+				work.requester.request_id, work.grant_source_node_id, gen);
 
-		if (cr == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
-			native_probe_send_grant_reply(slot);
-		else if (cr == CLUSTER_GRD_CONVERT_ILLEGAL)
-			native_probe_send_reject_reply(slot, GES_REJECT_REASON_ILLEGAL_CONVERT);
+			if (cr == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
+				native_probe_send_grant_reply(&work);
+			else if (cr == CLUSTER_GRD_CONVERT_ILLEGAL)
+				native_probe_send_reject_reply(&work, GES_REJECT_REASON_ILLEGAL_CONVERT);
+		} else
+			native_probe_send_grant_reply(&work);
 	}
-	if (need_send_reject)
-		native_probe_send_reject_reply(slot, reject_reason);
-	if (need_send_grant)
-		native_probe_send_grant_reply(slot);
-	if (need_release_after_grant || need_release_after_timeout)
-		cluster_lms_native_probe_slot_release(slot_idx);
-	if (!need_release_after_grant && !need_release_after_timeout)
-		ConditionVariableBroadcast(&cluster_lms_state->cv);
+	PG_FINALLY();
+	{
+		native_probe_release(slot_idx, probe_id, true);
+	}
+	PG_END_TRY();
+}
+
+static void
+native_probe_start_pending(void)
+{
+	/* A bounded existing LMS duty; never park the GES RELEASE/CANCEL queue. */
+	for (int pass = 0; pass < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; pass++) {
+		int active = 0;
+		int oldest = -1;
+		uint64 oldest_id = UINT64_MAX;
+		ClusterLmsNativeLockProbeSlot *slot;
+
+		LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+		for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
+			ClusterLmsNativeLockProbeSlot *candidate = &cluster_lms_state->native_probe_slots[i];
+			uint64 phase = pg_atomic_read_u64(&candidate->in_use);
+
+			if (phase == PROBE_ACTIVE || phase == PROBE_DISPATCHING || phase == PROBE_COMPLETING)
+				active++;
+			if (phase == PROBE_QUEUED) {
+				LWLockAcquire(&candidate->lock.lock, LW_EXCLUSIVE);
+				if (pg_atomic_read_u64(&candidate->in_use) == PROBE_QUEUED
+					&& candidate->probe_id < oldest_id) {
+					oldest = i;
+					oldest_id = candidate->probe_id;
+				}
+				LWLockRelease(&candidate->lock.lock);
+			}
+		}
+		if (active >= probe_active_capacity() || oldest < 0) {
+			LWLockRelease(&cluster_lms_state->lwlock);
+			return;
+		}
+		slot = &cluster_lms_state->native_probe_slots[oldest];
+		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u64(&slot->in_use) != PROBE_QUEUED || slot->probe_id != oldest_id) {
+			LWLockRelease(&slot->lock.lock);
+			LWLockRelease(&cluster_lms_state->lwlock);
+			continue;
+		}
+		pg_atomic_write_u64(&slot->in_use, PROBE_DISPATCHING);
+		LWLockRelease(&slot->lock.lock);
+		LWLockRelease(&cluster_lms_state->lwlock);
+		native_probe_dispatch(oldest, oldest_id);
+		native_probe_aggregate(oldest, oldest_id);
+	}
 }
 
 void
 cluster_lms_native_probe_retry_tick(void)
 {
-	int cap, i;
 	TimestampTz now;
-	int interval_ms;
-	int budget;
 
 	if (cluster_lms_state == NULL)
 		return;
-
-	cap = probe_active_capacity();
 	now = GetCurrentTimestamp();
-	interval_ms = cluster_lms_native_lock_probe_retry_interval_ms;
-	budget = cluster_lms_native_lock_probe_retry_budget;
-
-	for (i = 0; i < cap; i++) {
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
 		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
-		long diff_ms;
-		bool grant_on_clear;
+		ClusterLmsNativeLockProbeSlot work;
+		uint64 phase, probe_id;
 		bool dispatch_again = false;
-		bool timeout_grant = false;
-		bool timeout_waiter = false;
-
-		if (pg_atomic_read_u64(&slot->in_use) != 1)
-			continue;
-
-		cluster_lms_native_probe_aggregate_and_resolve((uint32)i);
-		if (pg_atomic_read_u64(&slot->in_use) != 1)
-			continue;
 
 		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		if (slot->final_ready) {
+		phase = pg_atomic_read_u64(&slot->in_use);
+		if (phase != PROBE_ACTIVE && phase != PROBE_QUEUED) {
 			LWLockRelease(&slot->lock.lock);
 			continue;
 		}
-
-		diff_ms = (long)((now - slot->start_ts) / 1000); /* µs → ms */
-		if (diff_ms < interval_ms) {
-			LWLockRelease(&slot->lock.lock);
-			continue;
-		}
-
-		/* HC32 retry — clear received bitmap (forces fresh fan-out) and
-		 * re-dispatch.  retry_count bumped + budget check. */
-		slot->retry_count++;
-		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_retry_count, 1);
-
-		if (slot->retry_count > (uint32)budget) {
-			/* HC32 fail-closed: async grant path sends REJECT and removes
-			 * the provisional GRD holder; sync waiter observes TIMEOUT. */
-			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
-			grant_on_clear = slot->grant_on_clear;
-			if (grant_on_clear) {
-				timeout_grant = true;
-			} else {
+		native_probe_copy_work(&work, slot);
+		probe_id = slot->probe_id;
+		LWLockRelease(&slot->lock.lock);
+		if (!native_probe_authority_current(&work)) {
+			/* This exact work is abandoned, not an elapsed-capacity guess. */
+			LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+			phase = pg_atomic_read_u64(&slot->in_use);
+			if (slot->probe_id == probe_id && (phase == PROBE_ACTIVE || phase == PROBE_QUEUED)) {
 				slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
 				slot->final_ready = true;
-				timeout_waiter = true;
+				pg_atomic_write_u64(&slot->in_use, PROBE_ACTIVE);
 			}
 			LWLockRelease(&slot->lock.lock);
-			if (timeout_grant) {
-				(void)cluster_grd_release_holder_by_id(&slot->resid, &slot->requester);
-				native_probe_send_reject_reply(slot, GES_REJECT_REASON_TIMEOUT);
-				cluster_lms_native_probe_slot_release((uint32)i);
-			}
-			if (timeout_waiter)
-				ConditionVariableBroadcast(&cluster_lms_state->cv);
+			native_probe_aggregate(i, probe_id);
 			continue;
 		}
-
-		dispatch_again = true;
+		if (phase == PROBE_QUEUED)
+			continue; /* No fanout and no active retry budget spent in this state. */
+		native_probe_aggregate(i, probe_id);
+		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u64(&slot->in_use) != PROBE_ACTIVE || slot->probe_id != probe_id
+			|| slot->final_ready) {
+			LWLockRelease(&slot->lock.lock);
+			continue;
+		}
+		if ((now - slot->start_ts) / 1000 < cluster_lms_native_lock_probe_retry_interval_ms) {
+			LWLockRelease(&slot->lock.lock);
+			continue;
+		}
+		slot->retry_count++;
+		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_retry_count, 1);
+		if (slot->retry_count > (uint32)cluster_lms_native_lock_probe_retry_budget) {
+			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
+			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+			slot->final_ready = true;
+		} else {
+			pg_atomic_write_u64(&slot->in_use, PROBE_DISPATCHING);
+			dispatch_again = true;
+		}
 		LWLockRelease(&slot->lock.lock);
-
-		/* Re-dispatch with fresh expected/received bitmaps (origin self short-
-		 * circuit + peer fan-out).  dispatch resets bitmaps + ts. */
 		if (dispatch_again)
-			cluster_lms_native_probe_dispatch((uint32)i);
+			native_probe_dispatch(i, probe_id);
+		native_probe_aggregate(i, probe_id);
 	}
+	native_probe_start_pending();
 }
 
 void
 cluster_lms_native_probe_cleanup_on_node_dead(int32 dead_node_id)
 {
-	int cap, i;
 	uint32 dead_bit;
 
-	if (cluster_lms_state == NULL)
+	if (cluster_lms_state == NULL || !native_probe_node_bit(dead_node_id, &dead_bit))
 		return;
-
-	/* HC35 fence-gated:  caller MUST verify CSSD/fence + GRD
-	 * cleanup_on_node_dead generation completed before invoking this.
-	 * Premature CLEAR-on-dead risks split-brain false grant. */
-
-	cap = probe_active_capacity();
-	if (!native_probe_node_bit(dead_node_id, &dead_bit))
-		return;
-
-	for (i = 0; i < cap; i++) {
+	/* HC35: caller must already have proved fencing AND GRD cleanup. */
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
 		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
 
-		if (pg_atomic_read_u64(&slot->in_use) != 1)
-			continue;
 		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		if ((slot->expected_replies_bitmap & dead_bit) == 0) {
-			LWLockRelease(&slot->lock.lock);
-			continue;
+		if (pg_atomic_read_u64(&slot->in_use) == PROBE_ACTIVE
+			&& (slot->expected_replies_bitmap & dead_bit) != 0) {
+			slot->received_replies_bitmap |= dead_bit;
+			slot->aggregated_status_packed &= ~(3U << ((uint32)dead_node_id * 2));
 		}
-
-		/* Treat dead node as CLEAR (post-fence safe).  Set received bit +
-		 * leave packed status at default 0 (CLEAR encoding). */
-		slot->received_replies_bitmap |= dead_bit;
 		LWLockRelease(&slot->lock.lock);
 	}
-
-	ConditionVariableBroadcast(&cluster_lms_state->cv);
+	native_probe_wake();
 }
 
 void
 cluster_lms_native_probe_cleanup_on_backend_exit(int procno)
 {
-	int cap, i;
-
 	if (cluster_lms_state == NULL)
 		return;
-
-	cap = probe_active_capacity();
-	for (i = 0; i < cap; i++) {
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
 		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
+		uint64 probe_id = 0;
+		uint64 phase;
 
-		if (pg_atomic_read_u64(&slot->in_use) != 1)
-			continue;
 		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		if (slot->requester_procno != procno) {
-			LWLockRelease(&slot->lock.lock);
-			continue;
-		}
+		phase = pg_atomic_read_u64(&slot->in_use);
+		if ((phase == PROBE_ACTIVE || phase == PROBE_QUEUED) && !slot->grant_on_clear
+			&& slot->requester.node_id == (uint32)cluster_node_id
+			&& slot->requester_procno == procno)
+			probe_id = slot->probe_id;
 		LWLockRelease(&slot->lock.lock);
-
-		/* HC34 — release slot;  any in-flight reply will be dropped via
-		 * HC36 stale-reply path (probe_id no longer matches active slot). */
-		cluster_lms_native_probe_slot_release((uint32)i);
+		if (probe_id != 0)
+			native_probe_release(i, probe_id, false);
 	}
 }
 
@@ -2246,108 +2276,100 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lock
 										uint32 request_opcode, uint64 shard_master_generation,
 										LOCKMODE convert_current_mode)
 {
-	LOCKTAG locktag;
+	ClusterLmsNativeLockProbeSlot work;
 	uint32 slot_idx;
-	ClusterLmsNativeLockProbeSlot *slot;
+	uint64 probe_id;
 
-	if (!cluster_lms_native_probe_required(resid, lockmode))
+	if (cluster_lms_state == NULL || resid == NULL || requester == NULL
+		|| !cluster_lms_native_probe_required(resid, lockmode))
 		return false;
-	if (cluster_lms_state == NULL || resid == NULL || requester == NULL)
-		return false;
-
-	cluster_grd_resid_decode(resid, &locktag);
-	if (!cluster_lms_native_probe_slot_acquire(cluster_node_id, &locktag, lockmode, requester,
-											   &slot_idx))
-		return false;
-
-	slot = &cluster_lms_state->native_probe_slots[slot_idx];
-	slot->resid = *resid;
-	slot->grant_source_node_id = source_node_id;
-	slot->request_opcode = request_opcode;
-	slot->shard_master_generation_lo = (uint32)(shard_master_generation & 0xffffffffu);
-	/* spec-5.3 — precise REDECLARE locator for an async CONVERT commit. */
-	slot->convert_old_mode = (uint8)convert_current_mode;
-	slot->grant_on_clear = true;
-	cluster_lms_native_probe_dispatch(slot_idx);
-	cluster_lms_native_probe_aggregate_and_resolve(slot_idx);
-	return true;
+	memset(&work, 0, sizeof(work));
+	cluster_grd_resid_decode(resid, &work.locktag);
+	work.lockmode = lockmode;
+	work.origin_node_id = cluster_node_id;
+	work.requester_procno = requester->procno;
+	work.requester = *requester;
+	work.resid = *resid;
+	work.grant_source_node_id = source_node_id;
+	work.request_opcode = request_opcode;
+	work.shard_master_generation_lo = (uint32)shard_master_generation;
+	work.convert_old_mode = convert_current_mode;
+	work.grant_on_clear = true;
+	work.final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+	/* NOWAIT/CONVERT admission policies are not broadened by capacity waiting. */
+	return native_probe_submit(&work, request_opcode == GES_REQ_OPCODE_REQUEST, &slot_idx,
+							   &probe_id);
 }
 
 bool
 cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode,
 									const ClusterGrdHolderId *requester, int timeout_ms)
 {
-	LOCKTAG locktag;
-	uint32 slot_idx;
-	ClusterLmsNativeLockProbeSlot *slot;
+	ClusterLmsNativeLockProbeSlot work;
+	volatile uint32 slot_idx = UINT32_MAX;
+	volatile uint64 probe_id = 0;
+	volatile bool clear = false;
 	TimestampTz deadline;
-	bool clear = false;
 	int effective_timeout_ms;
 
 	if (!cluster_lms_native_probe_required(resid, lockmode))
 		return true;
 	if (cluster_lms_state == NULL || resid == NULL || requester == NULL)
 		return false;
-
-	cluster_grd_resid_decode(resid, &locktag);
-	if (!cluster_lms_native_probe_slot_acquire(cluster_node_id, &locktag, lockmode, requester,
-											   &slot_idx))
-		return false;
-
-	slot = &cluster_lms_state->native_probe_slots[slot_idx];
-	slot->resid = *resid;
-	slot->grant_source_node_id = cluster_node_id;
-	slot->request_opcode = GES_REQ_OPCODE_REQUEST;
-	slot->grant_on_clear = false;
-	cluster_lms_native_probe_dispatch(slot_idx);
-	cluster_lms_native_probe_aggregate_and_resolve(slot_idx);
-
+	memset(&work, 0, sizeof(work));
+	cluster_grd_resid_decode(resid, &work.locktag);
+	work.lockmode = lockmode;
+	work.origin_node_id = cluster_node_id;
+	work.requester_procno = requester->procno;
+	work.requester = *requester;
+	work.resid = *resid;
+	work.grant_source_node_id = cluster_node_id;
+	work.request_opcode = GES_REQ_OPCODE_REQUEST;
+	work.final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
 	effective_timeout_ms = timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms;
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
-
 	ConditionVariablePrepareToSleep(&cluster_lms_state->cv);
-	for (;;) {
-		long remaining_ms;
-		TimestampTz now = GetCurrentTimestamp();
-		bool final_ready;
-		uint32 final_status;
+	PG_TRY();
+	{
+		for (;;) {
+			TimestampTz now;
+			long remaining_ms;
 
-		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		final_ready = slot->final_ready;
-		final_status = slot->final_status;
-		LWLockRelease(&slot->lock.lock);
-		if (final_ready) {
-			clear = final_status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
-			break;
-		}
+			CHECK_FOR_INTERRUPTS();
+			if (slot_idx == UINT32_MAX) {
+				/* Even real descriptor exhaustion is a caller-owned wait here. */
+				(void)native_probe_submit(&work, true, &slot_idx, &probe_id);
+			}
+			cluster_lms_native_probe_retry_tick();
+			if (slot_idx != UINT32_MAX) {
+				ClusterLmsNativeLockProbeSlot *slot
+					= &cluster_lms_state->native_probe_slots[slot_idx];
+				bool ready;
 
-		cluster_lms_native_probe_retry_tick();
-		LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-		final_ready = slot->final_ready;
-		final_status = slot->final_status;
-		LWLockRelease(&slot->lock.lock);
-		if (final_ready) {
-			clear = final_status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
-			break;
+				LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
+				ready = slot->probe_id != probe_id || slot->final_ready;
+				clear = slot->probe_id == probe_id && slot->final_ready
+						&& slot->final_status == CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+				LWLockRelease(&slot->lock.lock);
+				if (ready)
+					break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline) {
+				pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
+				break;
+			}
+			remaining_ms = Min((long)((deadline - now) / 1000), 100L);
+			(void)ConditionVariableTimedSleep(&cluster_lms_state->cv, Max(remaining_ms, 1L),
+											  WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT);
 		}
-		if (now >= deadline) {
-			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
-			LWLockAcquire(&slot->lock.lock, LW_EXCLUSIVE);
-			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
-			slot->final_ready = true;
-			LWLockRelease(&slot->lock.lock);
-			break;
-		}
-		remaining_ms = (long)((deadline - now) / 1000);
-		if (remaining_ms <= 0)
-			remaining_ms = 1;
-		if (remaining_ms > 100)
-			remaining_ms = 100;
-		(void)ConditionVariableTimedSleep(&cluster_lms_state->cv, (long)remaining_ms,
-										  WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT);
 	}
-	ConditionVariableCancelSleep();
-
-	cluster_lms_native_probe_slot_release(slot_idx);
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+		if (slot_idx != UINT32_MAX)
+			native_probe_release(slot_idx, probe_id, true);
+	}
+	PG_END_TRY();
 	return clear;
 }

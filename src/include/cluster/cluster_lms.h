@@ -152,7 +152,8 @@ typedef enum ClusterLmsState {
  *	in ClusterLmsSharedState sized to CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS
  *	(= 64, matches GUC max range);  GUC
  *	cluster.lms_native_lock_probe_max_inflight (default 8) bounds the
- *	"active capacity" — slots beyond it are reserved but unused.
+ *	active fanout capacity. Remaining allocated descriptors can wait for
+ *	capacity; the LMS driver promotes them oldest first.
  */
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS 64
 
@@ -165,7 +166,7 @@ typedef enum ClusterLmsState {
 #define CLUSTER_LMS_SERVE_HIST_BUCKETS 16
 
 typedef struct ClusterLmsNativeLockProbeSlot {
-	pg_atomic_uint64 in_use;		   /* 0 = free, 2 = initializing, 1 = active */
+	pg_atomic_uint64 in_use;		   /* 0 free, 1 active, 2 dispatch, 3 queued, 4 completing */
 	uint64 probe_id;				   /* monotonic per-shard id (HC36 epoch) */
 	LOCKTAG locktag;				   /* 16B PG LOCKTAG (RELATION / OBJECT) */
 	LOCKMODE lockmode;				   /* 4B PG LOCKMODE */

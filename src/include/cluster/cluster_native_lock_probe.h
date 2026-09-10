@@ -182,15 +182,10 @@ extern bool cluster_lms_native_probe_required(const ClusterResId *resid, LOCKMOD
 /* StaticAssertDecl on the slot struct lives next to the definition in
  * cluster_lms.h to keep the size invariant near its implementation. */
 
-extern bool cluster_lms_native_probe_slot_acquire(int32 origin_node_id, const LOCKTAG *locktag,
-												  LOCKMODE lockmode,
-												  const ClusterGrdHolderId *requester,
-												  uint32 *slot_idx_out);
-extern void cluster_lms_native_probe_slot_release(uint32 slot_idx);
-extern void cluster_lms_native_probe_dispatch(uint32 slot_idx);
+/* Slot publication, dispatch and completion are private exact-id operations;
+ * callers may not manipulate a reusable descriptor through its index alone. */
 extern void cluster_lms_native_probe_recv_reply(uint64 probe_id, int32 sender_node_id,
 												ClusterNativeLockProbeReply status);
-extern void cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx);
 extern void cluster_lms_native_probe_retry_tick(void);
 extern void cluster_lms_native_probe_cleanup_on_node_dead(int32 dead_node_id);
 extern void cluster_lms_native_probe_cleanup_on_backend_exit(int procno);
