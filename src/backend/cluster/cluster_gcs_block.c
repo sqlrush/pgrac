@@ -13961,29 +13961,52 @@ gcs_block_resource_x_target_install_snapshot_result(
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
+/* A descriptor observed after deliberate unpin is not a retained identity.
+ * The caller computes unowned from its handoff context, never from the new
+ * occupant's writer flags. A torn generation remains a hard contradiction. */
+static ResourceXApplyResult
+gcs_block_resource_x_target_own_observation_result(const ClusterPcmOwnSnapshot *own,
+												   const BufferTag *resource, bool unowned)
+{
+	if (own->generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&own->tag, resource))
+		return unowned ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_STALE;
+	/* Tag equality does not make an unpinned auxiliary handle read-ready.
+	 * BufferAlloc publishes the tag before input I/O, and SourceSettlement
+	 * may leave an invalid CURRENT image for the next ordinary reader.
+	 * Return both pre-read and in-read windows to the original pin owner:
+	 * it can start/wait for ReadBuffer I/O and redo every pre-use check.
+	 * Do not relax the shared N assertion or retained/delivery predicates. */
+	if (unowned && cluster_pcm_x_revoke_finish_mode(resource, 0) == CLUSTER_PCM_X_REVOKE_FINISH_DROP
+		&& own->pcm_state == (uint8)PCM_STATE_N && own->buffer_type == (uint8)BUF_TYPE_CURRENT
+		&& own->flags == 0 && own->writer_activation_token == 0
+		&& own->resource_x_activation_generation == 0 && own->reservation_token != UINT64_MAX
+		&& (own->semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == BM_TAG_VALID
+		&& (own->semantic_buf_state
+			& (BM_IO_ERROR | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED))
+			   == 0)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 /* Bracket the entry-locked continuation capture with two exact BufferDesc
  * projections.  A changed B invalidates the raw E result and the candidate
  * continuation before either can reach the caller. */
 static ResourceXApplyResult
 gcs_block_resource_x_target_install_capture_coherent(
-	BufferDesc *buf,
-	const ResourceXAssertion *assertion,
-	int32 current_master_node,
-	uint64 resource_formation,
-	uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	uint64 caller_absolute_deadline_us,
-	const ClusterPcmOwnSnapshot *before,
-	ResourceXTargetInstallFollowState *follow_state_out,
+	BufferDesc *buf, const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 caller_absolute_deadline_us, const ClusterPcmOwnSnapshot *before,
+	bool observation_unowned, ResourceXTargetInstallFollowState *follow_state_out,
 	ResourceXTargetInstallContinuation *continuation_out)
 {
 	ClusterPcmOwnSnapshot after;
 	ClusterPcmOwnResult snapshot_result;
 	ResourceXTargetInstallContinuation candidate;
 	ResourceXTargetInstallFollowState raw_state;
+	ResourceXApplyResult observation_result;
 
 	if (follow_state_out != NULL)
 		*follow_state_out = RESOURCE_X_TARGET_INSTALL_INVALID;
@@ -13992,6 +14015,18 @@ gcs_block_resource_x_target_install_capture_coherent(
 	if (buf == NULL || assertion == NULL || before == NULL
 		|| follow_state_out == NULL || continuation_out == NULL)
 		return RESOURCE_X_APPLY_INVALID;
+	/* A fresh B returned by a failed header check need not still describe
+	 * this resource.  Coherent B-E-B equality cannot repair that lost
+	 * domain.  Discard only an explicitly unowned observation before E;
+	 * the original caller owns relookup/read and every new pre-use check. */
+	observation_result = gcs_block_resource_x_target_own_observation_result(
+		before, &assertion->resource, observation_unowned);
+	if (observation_result == RESOURCE_X_APPLY_NOT_FOUND) {
+		*follow_state_out = RESOURCE_X_TARGET_INSTALL_RESAMPLE;
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+	if (observation_result != RESOURCE_X_APPLY_APPLIED)
+		return observation_result;
 	memset(&candidate, 0, sizeof(candidate));
 	raw_state
 		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
@@ -14136,34 +14171,6 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 			 snapshot.master_node, snapshot.master_session, snapshot.r4_generation)));
 }
 
-/* A descriptor observed after deliberate unpin is not a retained identity.
- * The caller computes unowned from its handoff context, never from the new
- * occupant's writer flags. A torn generation remains a hard contradiction. */
-static ResourceXApplyResult
-gcs_block_resource_x_target_own_observation_result(const ClusterPcmOwnSnapshot *own,
-												   const BufferTag *resource, bool unowned)
-{
-	if (own->generation == UINT64_MAX)
-		return RESOURCE_X_APPLY_STALE;
-	if (!BufferTagsEqual(&own->tag, resource))
-		return unowned ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_STALE;
-	/* Tag equality does not make an unpinned auxiliary handle read-ready.
-	 * BufferAlloc publishes the tag before input I/O, and SourceSettlement
-	 * may leave an invalid CURRENT image for the next ordinary reader.
-	 * Return both pre-read and in-read windows to the original pin owner:
-	 * it can start/wait for ReadBuffer I/O and redo every pre-use check.
-	 * Do not relax the shared N assertion or retained/delivery predicates. */
-	if (unowned && cluster_pcm_x_revoke_finish_mode(resource, 0) == CLUSTER_PCM_X_REVOKE_FINISH_DROP
-		&& own->pcm_state == (uint8)PCM_STATE_N && own->buffer_type == (uint8)BUF_TYPE_CURRENT
-		&& own->flags == 0 && own->writer_activation_token == 0
-		&& own->resource_x_activation_generation == 0 && own->reservation_token != UINT64_MAX
-		&& (own->semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == BM_TAG_VALID
-		&& (own->semantic_buf_state
-			& (BM_IO_ERROR | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED))
-			   == 0)
-		return RESOURCE_X_APPLY_NOT_FOUND;
-	return RESOURCE_X_APPLY_APPLIED;
-}
 
 static ResourceXApplyResult
 gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *expected_resource,
@@ -14677,13 +14684,14 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 					}
 					target_install_observation_result
 						= gcs_block_resource_x_target_install_capture_coherent(
-							buf, &assertion, master_node, gate.formation,
-							master_session, admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							retry_slice_us, absolute_deadline_us, &own,
-							&target_install_follow_state,
-							&target_install_follow);
+							buf, &assertion, master_node, gate.formation, master_session,
+							admission.record_generation, requester_sender_connection_generation,
+							master_ingress_connection_generation, retry_slice_us,
+							absolute_deadline_us, &own,
+							aux_context != NULL && !direct_init && !join_only
+								&& ClusterBufferAuxiliaryObservationUnowned(
+									BufferDescriptorGetBuffer(buf)),
+							&target_install_follow_state, &target_install_follow);
 					if (target_install_observation_result
 							!= RESOURCE_X_APPLY_APPLIED) {
 						result = target_install_observation_result;
@@ -14737,13 +14745,15 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 									if (own_result == CLUSTER_PCM_OWN_OK) {
 										target_install_observation_result
 											= gcs_block_resource_x_target_install_capture_coherent(
-												buf, &assertion, master_node,
-												gate.formation, master_session,
-												admission.record_generation,
+												buf, &assertion, master_node, gate.formation,
+												master_session, admission.record_generation,
 												requester_sender_connection_generation,
 												master_ingress_connection_generation,
-												retry_slice_us, absolute_deadline_us,
-												&failure_live, &target_install_follow_state,
+												retry_slice_us, absolute_deadline_us, &failure_live,
+												aux_context != NULL && !direct_init && !join_only
+													&& ClusterBufferAuxiliaryObservationUnowned(
+														BufferDescriptorGetBuffer(buf)),
+												&target_install_follow_state,
 												&target_install_follow);
 										if (target_install_observation_result
 												!= RESOURCE_X_APPLY_APPLIED) {
@@ -14785,8 +14795,11 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 								buf, &assertion, master_node, gate.formation, master_session,
 								admission.record_generation, requester_sender_connection_generation,
 								master_ingress_connection_generation, retry_slice_us,
-								absolute_deadline_us, &own, &target_install_follow_state,
-								&target_install_follow);
+								absolute_deadline_us, &own,
+								aux_context != NULL && !direct_init && !join_only
+									&& ClusterBufferAuxiliaryObservationUnowned(
+										BufferDescriptorGetBuffer(buf)),
+								&target_install_follow_state, &target_install_follow);
 						if (target_install_observation_result != RESOURCE_X_APPLY_APPLIED) {
 							result = target_install_observation_result;
 							break;
@@ -14917,15 +14930,15 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 								if (n_candidate_result == CLUSTER_PCM_OWN_STALE) {
 									target_install_observation_result
 										= gcs_block_resource_x_target_install_capture_coherent(
-											buf, &assertion, master_node,
-											gate.formation, master_session,
-											admission.record_generation,
+											buf, &assertion, master_node, gate.formation,
+											master_session, admission.record_generation,
 											requester_sender_connection_generation,
-											master_ingress_connection_generation,
-											retry_slice_us, absolute_deadline_us,
-											&failure_live,
-											&target_install_follow_state,
-											&target_install_follow);
+											master_ingress_connection_generation, retry_slice_us,
+											absolute_deadline_us, &failure_live,
+											aux_context != NULL && !direct_init && !join_only
+												&& ClusterBufferAuxiliaryObservationUnowned(
+													BufferDescriptorGetBuffer(buf)),
+											&target_install_follow_state, &target_install_follow);
 									if (target_install_observation_result
 											!= RESOURCE_X_APPLY_APPLIED) {
 										result = target_install_observation_result;

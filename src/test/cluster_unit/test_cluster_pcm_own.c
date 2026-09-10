@@ -514,6 +514,13 @@ static int preassert_iterations;
 static uint64 preassert_now_us;
 static ClusterPcmOwnEntry *preassert_wait_entry;
 static int preassert_sleeps;
+static bool preassert_observation_unowned;
+static int preassert_entry_captures;
+static int preassert_entry_foreign_tag;
+
+static ResourceXApplyResult
+gcs_block_resource_x_target_own_observation_result(const ClusterPcmOwnSnapshot *own,
+												   const BufferTag *resource, bool unowned);
 
 static void
 preassert_wait_schedule(long usec)
@@ -539,7 +546,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 	uint64 r4_generation, uint32 requester_connection, uint32 master_connection, uint64 retry_slice,
 	uint64 deadline, const ClusterPcmOwnSnapshot *observed, ResourceXTargetInstallContinuation *out)
 {
-	UT_ASSERT(BufferTagsEqual(&assertion->resource, &observed->tag));
+	preassert_entry_captures++;
+	if (!BufferTagsEqual(&assertion->resource, &observed->tag))
+		preassert_entry_foreign_tag++;
 	UT_ASSERT_EQ(master_node, 3);
 	UT_ASSERT_EQ(formation, 2);
 	UT_ASSERT_EQ(session, UINT64_C(842236411871794));
@@ -613,6 +622,11 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 	bool first_failure_recorded = false;
 	bool diagnostic_deadline_expired = false;
 	bool target_retained_release_inflight = false;
+	bool direct_init = false;
+	bool join_only = false;
+	ResourceXAuxiliaryAcquireContext auxiliary_context;
+	ResourceXAuxiliaryAcquireContext *aux_context
+		= preassert_observation_unowned ? &auxiliary_context : NULL;
 	const char *diagnostic_stage = "own-snapshot";
 
 	memset(&assertion, 0, sizeof(assertion));
@@ -633,9 +647,20 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 				return RESOURCE_X_APPLY_INVALID;
 			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(buf, &own), CLUSTER_PCM_OWN_OK);
 		}
+		/* The existing outer observer is real production code too.  A later
+		 * tag/readiness loss must return to this owner without reaching an
+		 * entry lookup for the wrong physical observation. */
+		if (preassert_observation_unowned) {
+			result = gcs_block_resource_x_target_own_observation_result(&own, &assertion.resource,
+																		true);
+			if (result != RESOURCE_X_APPLY_APPLIED)
+				return result;
+		}
 		result = RESOURCE_X_APPLY_APPLIED;
 #define gcs_block_pcm_x_monotonic_us() preassert_now_us
 #define pg_usleep(us) preassert_wait_schedule(us)
+#define ClusterBufferAuxiliaryObservationUnowned(buffer)                                           \
+	((void)(buffer), preassert_observation_unowned)
 /* This verbatim consumer fixture sinks only the non-authoritative logger;
  * the real age/reason state machine is exercised in test_cluster_pcm_lock. */
 #define gcs_block_resource_x_requester_wait_note(context, reason) ((void)(reason))
@@ -648,6 +673,7 @@ preassert_consume(BufferDesc *buf, const ClusterPcmOwnSnapshot *initial)
 #undef CHECK_FOR_INTERRUPTS
 #undef gcs_block_resource_x_requester_wait_note
 #undef pg_usleep
+#undef ClusterBufferAuxiliaryObservationUnowned
 #undef gcs_block_pcm_x_monotonic_us
 		break;
 	}
@@ -952,6 +978,205 @@ UT_TEST(test_real_preassert_discards_completed_conversion_observation)
 	UT_ASSERT_EQ(preassert_fuses, 0);
 	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
 	UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_preassert_requalifies_late_unowned_auxiliary_retag)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int axis;
+
+	for (axis = 0; axis < 5; axis++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnEntry stable;
+		ClusterPcmOwnSnapshot before;
+		PGIOAlignedBlock unchanged;
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		buf.tag.relNumber = 16393;
+		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		buf.tag.blockNum = 0;
+		buf.buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_write_u64(&entry.generation, 11072);
+		pg_atomic_write_u64(&entry.reservation_token, 11085);
+		pg_atomic_write_u64(&entry.writer_activation_token, 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, 0);
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		/* B0 passed the real entry observer.  The deliberately unpinned
+		 * descriptor is reused before the header-locked candidate check. */
+		pg_atomic_write_u64(&entry.generation, 11074);
+		pg_atomic_write_u64(&entry.reservation_token, 11087);
+		switch (axis) {
+		case 0:
+			buf.tag.spcOid++;
+			break;
+		case 1:
+			buf.tag.dbOid++;
+			break;
+		case 2:
+			buf.tag.relNumber++;
+			break;
+		case 3:
+			buf.tag.forkNum = MAIN_FORKNUM;
+			break;
+		case 4:
+			buf.tag.blockNum++;
+			break;
+		}
+		memcpy(&stable, &entry, sizeof(entry));
+		memcpy(unchanged.data, transition_page.data, BLCKSZ);
+		preassert_entry_state = RESOURCE_X_TARGET_INSTALL_STALE;
+		preassert_now_us = UINT64_C(234638955873);
+		preassert_observation_unowned = true;
+		preassert_entry_captures = preassert_entry_foreign_tag = 0;
+		preassert_fuses = preassert_failure_records = 0;
+		UT_ASSERT_EQ(preassert_consume(&buf, &before), RESOURCE_X_APPLY_NOT_FOUND);
+		UT_ASSERT_EQ(preassert_iterations, 2);
+		UT_ASSERT_EQ(preassert_entry_captures, 0);
+		UT_ASSERT_EQ(preassert_entry_foreign_tag, 0);
+		UT_ASSERT_EQ(preassert_failure_records, 0);
+		UT_ASSERT_EQ(preassert_fuses, 0);
+		UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	}
+	preassert_observation_unowned = false;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_preassert_requalifies_late_unowned_auxiliary_readiness)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int reading;
+
+	for (reading = 0; reading < 2; reading++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot before;
+		PGIOAlignedBlock unchanged;
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		buf.buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_write_u64(&entry.generation, 18);
+		pg_atomic_write_u64(&entry.reservation_token, 21);
+		pg_atomic_write_u64(&entry.writer_activation_token, 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, 0);
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_VALID);
+		if (reading)
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		memcpy(unchanged.data, transition_page.data, BLCKSZ);
+		preassert_entry_state = RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+		preassert_now_us = UINT64_C(234638955873);
+		preassert_observation_unowned = true;
+		preassert_entry_captures = preassert_entry_foreign_tag = 0;
+		preassert_fuses = preassert_failure_records = 0;
+		UT_ASSERT_EQ(preassert_consume(&buf, &before), RESOURCE_X_APPLY_NOT_FOUND);
+		UT_ASSERT_EQ(preassert_iterations, 2);
+		UT_ASSERT_EQ(preassert_entry_captures, 0);
+		UT_ASSERT_EQ(preassert_failure_records, 0);
+		UT_ASSERT_EQ(preassert_fuses, 0);
+		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	}
+	preassert_observation_unowned = false;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_capture_domain_preserves_owned_and_stable_refusals)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int variant;
+
+	for (variant = 0; variant < 14; variant++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot before;
+		ResourceXAssertion assertion;
+		ResourceXTargetInstallContinuation continuation;
+		ResourceXTargetInstallContinuation empty;
+		ResourceXTargetInstallFollowState state;
+		ResourceXApplyResult result;
+		PGIOAlignedBlock unchanged;
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		buf.buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_write_u64(&entry.generation, 18);
+		pg_atomic_write_u64(&entry.reservation_token, 21);
+		pg_atomic_write_u64(&entry.writer_activation_token, 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, 0);
+		memset(&assertion, 0, sizeof(assertion));
+		assertion.resource = buf.tag;
+		if (variant >= 3 && variant <= 11)
+			pg_atomic_fetch_and_u32(&buf.state, ~BM_VALID);
+		switch (variant) {
+		case 0:
+			buf.tag.blockNum++;
+			break; /* Owned descriptor. */
+		case 1:
+			buf.tag.blockNum++; /* TORN never becomes retag retry. */
+								/* FALLTHROUGH */
+		case 2:
+			pg_atomic_write_u64(&entry.generation, UINT64_MAX);
+			break;
+		case 3:
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+			break;
+		case 4:
+			pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
+			break;
+		case 5:
+			buf.buffer_type = BUF_TYPE_PI;
+			break;
+		case 6:
+			pg_atomic_write_u64(&entry.writer_activation_token, 1);
+			break;
+		case 7:
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+			break;
+		case 8:
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+			break;
+		case 9:
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 1);
+			break;
+		case 10:
+			buf.tag.forkNum = MAIN_FORKNUM;
+			assertion.resource = buf.tag;
+			break;
+		case 11:
+			buf.tag.forkNum = INIT_FORKNUM;
+			assertion.resource = buf.tag;
+			break;
+		}
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		preassert_entry_state = variant == 12 ? RESOURCE_X_TARGET_INSTALL_INVALID
+											  : RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED;
+		preassert_entry_captures = preassert_entry_foreign_tag = 0;
+		memset(&continuation, 0xa5, sizeof(continuation));
+		memset(&empty, 0, sizeof(empty));
+		memcpy(unchanged.data, transition_page.data, BLCKSZ);
+		result = gcs_block_resource_x_target_install_capture_coherent(
+			&buf, &assertion, 3, 2, UINT64_C(842236411871794), 6, 8, 8, 10000,
+			UINT64_C(234641943560), &before, variant != 0, &state, &continuation);
+		UT_ASSERT_EQ(result, variant < 3 ? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(state,
+					 variant < 3 ? RESOURCE_X_TARGET_INSTALL_INVALID : preassert_entry_state);
+		UT_ASSERT_EQ(preassert_entry_captures, variant < 3 ? 0 : 1);
+		UT_ASSERT_EQ(preassert_entry_foreign_tag, 0);
+		UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
+		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
+	}
 	ClusterPcmOwnArray = saved;
 }
 
@@ -1261,7 +1486,10 @@ UT_TEST(test_real_preassert_rechecks_changed_image_and_preserves_failures)
 		memcpy(unchanged.data, transition_page.data, BLCKSZ);
 		UT_ASSERT_EQ(preassert_consume(&buf, &before), expected);
 		UT_ASSERT_EQ(preassert_iterations, iterations);
-		UT_ASSERT_EQ(preassert_failure_records, expected == RESOURCE_X_APPLY_APPLIED ? 0 : 1);
+		/* TORN is now refused at the shared domain guard before the late
+		 * failure recorder.  Its STALE result and zero mutation remain required. */
+		UT_ASSERT_EQ(preassert_failure_records,
+					 expected == RESOURCE_X_APPLY_APPLIED || variant == 5 ? 0 : 1);
 		UT_ASSERT_EQ(preassert_fuses, fuses);
 		UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
 		UT_ASSERT_EQ(memcmp(unchanged.data, transition_page.data, BLCKSZ), 0);
@@ -6491,8 +6719,11 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(119);
 	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
+	UT_RUN(test_real_preassert_requalifies_late_unowned_auxiliary_retag);
+	UT_RUN(test_real_preassert_requalifies_late_unowned_auxiliary_readiness);
+	UT_RUN(test_real_capture_domain_preserves_owned_and_stable_refusals);
 	UT_RUN(test_real_pending_recapture_keeps_original_observation);
 	UT_RUN(test_real_pending_observation_rechecks_successor_and_preserves_refusals);
 	UT_RUN(test_preassert_resample_is_not_an_identity_or_deadline_exception);

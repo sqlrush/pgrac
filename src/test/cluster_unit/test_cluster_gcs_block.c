@@ -5792,7 +5792,8 @@ UT_TEST(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_d
 		"n_candidate_result != CLUSTER_PCM_OWN_OK",
 		"n_candidate_result == CLUSTER_PCM_OWN_STALE",
 		"gcs_block_resource_x_target_install_capture_coherent(",
-		"retry_slice_us, absolute_deadline_us,",
+		"retry_slice_us,",
+		"absolute_deadline_us,",
 		"&failure_live,",
 		"&target_install_follow_state,",
 		"&target_install_follow)",
@@ -6179,7 +6180,8 @@ UT_TEST(test_resource_x_target_retains_one_install_receipt_until_terminal_gate)
 		"timeout_ms)",
 		"continue;",
 		"gcs_block_resource_x_target_install_capture_coherent(",
-		"retry_slice_us, absolute_deadline_us, &own,",
+		"retry_slice_us,",
+		"absolute_deadline_us, &own,",
 		"&target_install_follow_state,",
 		"&target_install_follow)",
 		"target_install_terminal_recheck:",
@@ -6659,23 +6661,74 @@ UT_TEST(test_resource_x_target_waits_only_exact_retained_predecessor_after_cache
 	free(source);
 }
 
+UT_TEST(test_resource_x_capture_domain_is_bound_at_every_real_call)
+{
+	static const char *const domain_contract[]
+		= { "memset(continuation_out, 0, sizeof(*continuation_out))",
+			"gcs_block_resource_x_target_own_observation_result(",
+			"before, &assertion->resource, observation_unowned)",
+			"observation_result == RESOURCE_X_APPLY_NOT_FOUND",
+			"*follow_state_out = RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+			"return RESOURCE_X_APPLY_APPLIED",
+			"observation_result != RESOURCE_X_APPLY_APPLIED",
+			"return observation_result",
+			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(",
+			"cluster_bufmgr_pcm_own_snapshot(buf, &after)",
+			"cluster_pcm_x_target_install_follow_adjudicate_exact(" };
+	char *source = read_gcs_block_source();
+	const char *driver
+		= source ? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(") : NULL;
+	const char *end
+		= driver ? strstr(driver,
+						  "\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(")
+				 : NULL;
+	const char *cursor = driver;
+	int count = 0;
+
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(end);
+	assert_ordered_in_function(source, "\ngcs_block_resource_x_target_install_capture_coherent(",
+							   "\ngcs_block_resource_x_target_install_classify_coherent(",
+							   domain_contract, lengthof(domain_contract));
+	while (cursor && end
+		   && (cursor = strstr(cursor, "gcs_block_resource_x_target_install_capture_coherent("))
+				  != NULL
+		   && cursor < end) {
+		const char *close = strstr(cursor, ");");
+		const char *mode = strstr(cursor, "aux_context != NULL && !direct_init && !join_only");
+		const char *owner = strstr(cursor, "ClusterBufferAuxiliaryObservationUnowned(");
+		const char *handle = strstr(cursor, "BufferDescriptorGetBuffer(buf)");
+
+		UT_ASSERT(close && close < end);
+		UT_ASSERT(mode && owner && handle && close && mode < owner && owner < handle
+				  && handle < close);
+		count++;
+		cursor++;
+	}
+	UT_ASSERT_EQ(count, 4);
+	free(source);
+}
+
 UT_TEST(test_resource_x_direct_init_reprobes_exact_same_round_after_candidate_drift)
 {
-	static const char *const drift_contract[] = {
-		"direct_candidate_result != CLUSTER_PCM_OWN_OK",
-		"== CLUSTER_PCM_OWN_STALE",
-		"cluster_bufmgr_pcm_own_snapshot(",
-		"buf, &failure_live);",
-		"gcs_block_resource_x_target_install_capture_coherent(",
-		"retry_slice_us, absolute_deadline_us,",
-		"&failure_live, &target_install_follow_state,",
-		"&target_install_follow)",
-		"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
-		"RESOURCE_X_TARGET_INSTALL_INFLIGHT",
-		"RESOURCE_X_TARGET_INSTALL_TERMINAL",
-		"continue;",
-		"= direct_candidate_result == CLUSTER_PCM_OWN_BUSY"
-	};
+	static const char *const drift_contract[]
+		= { "direct_candidate_result != CLUSTER_PCM_OWN_OK",
+			"== CLUSTER_PCM_OWN_STALE",
+			"cluster_bufmgr_pcm_own_snapshot(",
+			"buf, &failure_live);",
+			"gcs_block_resource_x_target_install_capture_coherent(",
+			"retry_slice_us, absolute_deadline_us,",
+			"&failure_live,",
+			"aux_context != NULL && !direct_init && !join_only",
+			"ClusterBufferAuxiliaryObservationUnowned(",
+			"BufferDescriptorGetBuffer(buf)",
+			"&target_install_follow_state,",
+			"&target_install_follow)",
+			"RESOURCE_X_TARGET_INSTALL_RESAMPLE",
+			"RESOURCE_X_TARGET_INSTALL_INFLIGHT",
+			"RESOURCE_X_TARGET_INSTALL_TERMINAL",
+			"continue;",
+			"= direct_candidate_result == CLUSTER_PCM_OWN_BUSY" };
 	char *source = read_gcs_block_source();
 	const char *candidate;
 	const char *receipt_capture;
@@ -7138,7 +7191,7 @@ UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
 int
 main(void)
 {
-	UT_PLAN(125);
+	UT_PLAN(126);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7257,6 +7310,7 @@ main(void)
 	UT_RUN(test_resource_x_target_retries_only_exact_empty_round_x_to_n_drift);
 	UT_RUN(test_resource_x_target_waits_only_exact_retained_predecessor_after_cached_x_drift);
 	UT_RUN(test_resource_x_direct_init_reprobes_exact_same_round_after_candidate_drift);
+	UT_RUN(test_resource_x_capture_domain_is_bound_at_every_real_call);
 	UT_RUN(test_resource_x_pre_dispatch_drift_recaptures_current_authority_under_same_deadline);
 	UT_RUN(test_resource_x_target_eviction_freezes_before_local_n_and_publishes_same_bytes);
 	UT_RUN(test_resource_x_target_waits_for_exact_post_release_settlement_window);
