@@ -14147,6 +14147,21 @@ gcs_block_resource_x_target_own_observation_result(const ClusterPcmOwnSnapshot *
 		return RESOURCE_X_APPLY_STALE;
 	if (!BufferTagsEqual(&own->tag, resource))
 		return unowned ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_STALE;
+	/* Tag equality does not make an unpinned auxiliary handle read-ready.
+	 * BufferAlloc publishes the tag before input I/O, and SourceSettlement
+	 * may leave an invalid CURRENT image for the next ordinary reader.
+	 * Return both pre-read and in-read windows to the original pin owner:
+	 * it can start/wait for ReadBuffer I/O and redo every pre-use check.
+	 * Do not relax the shared N assertion or retained/delivery predicates. */
+	if (unowned && cluster_pcm_x_revoke_finish_mode(resource, 0) == CLUSTER_PCM_X_REVOKE_FINISH_DROP
+		&& own->pcm_state == (uint8)PCM_STATE_N && own->buffer_type == (uint8)BUF_TYPE_CURRENT
+		&& own->flags == 0 && own->writer_activation_token == 0
+		&& own->resource_x_activation_generation == 0 && own->reservation_token != UINT64_MAX
+		&& (own->semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == BM_TAG_VALID
+		&& (own->semantic_buf_state
+			& (BM_IO_ERROR | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED))
+			   == 0)
+		return RESOURCE_X_APPLY_NOT_FOUND;
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -14520,17 +14535,21 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 						if (aux_context->reobserve_count == 1)
 							ereport(
 								LOG,
-								(errmsg_internal("Resource-X auxiliary observation replaced"),
+								(errmsg_internal(
+									 "Resource-X auxiliary observation needs requalification"),
 								 errdetail(
 									 "PGRAC_FAMILY=RESOURCE_X_DIAGNOSTIC "
 									 "PGRAC_REASON=AUX_HANDLE_REOBSERVE request=" UINT64_FORMAT
 									 " buffer=%d tag=%u/%u/%u/%u/%u observed=%u/%u/%u/%u/%u "
-									 "age_us=" UINT64_FORMAT " action=caller_owned_repin",
+									 "age_us=" UINT64_FORMAT " action=caller_owned_repin "
+									 "own_pcm=%u own_type=%u own_flags=%u own_semantic_state=%u",
 									 diagnostic_request_sequence, buf->buf_id, resource.spcOid,
 									 resource.dbOid, resource.relNumber, (unsigned)resource.forkNum,
 									 resource.blockNum, own.tag.spcOid, own.tag.dbOid,
 									 own.tag.relNumber, (unsigned)own.tag.forkNum, own.tag.blockNum,
-									 wait_diagnostic.state.total_age_us)));
+									 wait_diagnostic.state.total_age_us, (unsigned)own.pcm_state,
+									 (unsigned)own.buffer_type, own.flags,
+									 own.semantic_buf_state)));
 					}
 					break;
 				}

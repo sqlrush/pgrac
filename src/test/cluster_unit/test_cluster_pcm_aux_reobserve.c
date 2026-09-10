@@ -35,6 +35,9 @@ static sigjmp_buf fixture_error;
 static int fixture_lock_outcome;
 static int fixture_errors;
 static int fixture_core_calls;
+static bool fixture_readiness_observation;
+static ResourceXApplyResult fixture_production_own_guard(const ClusterPcmOwnSnapshot *own,
+														 const BufferTag *resource, bool unowned);
 
 static void
 fixture_failure(void)
@@ -86,6 +89,22 @@ fixture_acquire_internal(BufferDesc *buf, const BufferTag *tag, uint64 r4, uint6
 	} else {
 		UT_ASSERT_EQ(*deadline, 9000);
 		UT_ASSERT_EQ(context->caller.joined_request.assertion_sequence, 77);
+	}
+	if (fixture_readiness_observation) {
+		ClusterPcmOwnSnapshot own = { 0 };
+		ResourceXApplyResult observed;
+
+		own.tag = buf->tag;
+		own.generation = own.reservation_token = 8908;
+		own.pcm_state = buf->pcm_state;
+		own.buffer_type = buf->buffer_type;
+		own.semantic_buf_state = pg_atomic_read_u32(&buf->state);
+		observed = fixture_production_own_guard(
+			&own, tag, ClusterBufferAuxiliaryObservationUnowned(BufferDescriptorGetBuffer(buf)));
+		if (observed != RESOURCE_X_APPLY_NOT_FOUND)
+			fixture_failure(); /* Must not enter the acquired-authority branch. */
+		context->reobserve = true;
+		return observed;
 	}
 	context->reobserve = true;
 	return RESOURCE_X_APPLY_NOT_FOUND;
@@ -194,6 +213,7 @@ fixture_reset(ForkNumber fork)
 	fixture_refs[0] = 1;
 	fixture_releases = fixture_old_access = 0;
 	fixture_lock_outcome = fixture_errors = fixture_core_calls = 0;
+	fixture_readiness_observation = false;
 	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
 	return tag;
 }
@@ -237,6 +257,164 @@ UT_TEST(unowned_vm_observation_replacement_is_reobserve_not_stale)
 	own.tag.relNumber = 999;
 	own.generation = 8622;
 	UT_ASSERT_EQ(fixture_production_own_guard(&own, &tag, true), RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+/* This is the actual read-readiness projection from the failed contention
+ * leg, not a valid page with an extra I/O bit. The unchanged strict grant
+ * predicate must still refuse it; only the pinless observer may give its
+ * handle back to the original caller for ordinary lookup/read/revalidation. */
+UT_TEST(unpinned_n_read_in_progress_returns_to_original_pin_owner)
+{
+	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	ClusterBufmgrPcmAuxPinHandoff handoff;
+	ClusterPcmOwnSnapshot own = { 0 };
+	ClusterPcmOwnSnapshot saved;
+
+	UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
+	own.tag = tag;
+	own.generation = own.reservation_token = 8908;
+	own.pcm_state = (uint8)PCM_STATE_N;
+	own.buffer_type = (uint8)BUF_TYPE_CURRENT;
+	own.semantic_buf_state = UINT32_C(0x06000000);
+	saved = own;
+	UT_ASSERT_EQ(fixture_refs[0], 0);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_n_assertion_shape(own.pcm_state, own.buffer_type, own.semantic_buf_state),
+		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(fixture_production_own_guard(&own, &tag, true), RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(memcmp(&own, &saved, sizeof(own)), 0);
+	UT_ASSERT_EQ(fixture_refs[0], 0);
+}
+
+UT_TEST(unpinned_n_before_read_start_returns_to_caller_instead_of_waiting_ownerless)
+{
+	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	ClusterPcmOwnSnapshot own = { 0 };
+
+	own.tag = tag;
+	own.generation = own.reservation_token = 8908;
+	own.pcm_state = (uint8)PCM_STATE_N;
+	own.buffer_type = (uint8)BUF_TYPE_CURRENT;
+	own.semantic_buf_state = BM_TAG_VALID;
+	UT_ASSERT_EQ(fixture_production_own_guard(&own, &tag, true), RESOURCE_X_APPLY_NOT_FOUND);
+	/* A still-pinned/retained caller cannot use this observer escape. */
+	UT_ASSERT_EQ(fixture_production_own_guard(&own, &tag, false), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_n_assertion_shape(own.pcm_state, own.buffer_type, own.semantic_buf_state),
+		CLUSTER_PCM_OWN_CORRUPT);
+}
+
+UT_TEST(read_readiness_escape_never_covers_owned_or_contradictory_images)
+{
+	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	ClusterPcmOwnSnapshot base = { 0 };
+
+	base.tag = tag;
+	base.generation = base.reservation_token = 8908;
+	base.pcm_state = (uint8)PCM_STATE_N;
+	base.buffer_type = (uint8)BUF_TYPE_CURRENT;
+	base.semantic_buf_state = BM_TAG_VALID | BM_IO_IN_PROGRESS;
+	for (int axis = 0; axis < 17; axis++) {
+		ClusterPcmOwnSnapshot own = base;
+		BufferTag resource = tag;
+		bool unowned = true;
+
+		switch (axis) {
+		case 0:
+			unowned = false;
+			break;
+		case 1:
+			own.buffer_type = (uint8)BUF_TYPE_PI;
+			break;
+		case 2:
+			own.buffer_type = (uint8)BUF_TYPE_XCUR;
+			break;
+		case 3:
+			own.flags = PCM_OWN_FLAG_GRANT_PENDING;
+			break;
+		case 4:
+			own.flags = PCM_OWN_FLAG_REVOKING;
+			break;
+		case 5:
+			own.writer_activation_token = 3;
+			break;
+		case 6:
+			own.resource_x_activation_generation = 3;
+			break;
+		case 7:
+			own.reservation_token = UINT64_MAX;
+			break;
+		case 8:
+			own.semantic_buf_state |= BM_IO_ERROR;
+			break;
+		case 9:
+			own.semantic_buf_state |= BM_DIRTY;
+			break;
+		case 10:
+			own.semantic_buf_state |= BM_JUST_DIRTIED;
+			break;
+		case 11:
+			own.semantic_buf_state |= BM_CHECKPOINT_NEEDED;
+			break;
+		case 12:
+			own.semantic_buf_state |= BM_VALID;
+			break;
+		case 13:
+			own.semantic_buf_state &= ~BM_TAG_VALID;
+			break;
+		case 14:
+			own.pcm_state = (uint8)PCM_STATE_S;
+			break;
+		case 15:
+			own.pcm_state = (uint8)PCM_STATE_X;
+			break;
+		case 16:
+			own.tag.forkNum = resource.forkNum = MAIN_FORKNUM;
+			break;
+		}
+		/* APPLIED here only reaches the unchanged strict predicates; it is
+		 * not a reference, pin or installed current authority. */
+		UT_ASSERT_EQ(fixture_production_own_guard(&own, &resource, unowned),
+					 RESOURCE_X_APPLY_APPLIED);
+	}
+	base.generation = UINT64_MAX;
+	UT_ASSERT_EQ(fixture_production_own_guard(&base, &tag, true), RESOURCE_X_APPLY_STALE);
+	base.generation = base.reservation_token = 0;
+	UT_ASSERT_EQ(fixture_production_own_guard(&base, &tag, true), RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+UT_TEST(real_prepare_routes_unready_observation_without_grant_or_pin)
+{
+	for (int io = 0; io < 2; io++) {
+		BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+		ClusterBufmgrPcmAuxPinHandoff handoff;
+		ResourceXAuxiliaryAcquireContext context = { 0 };
+		uint64 deadline = 0;
+		bool barrier = false, transient = false;
+		BufferDesc unchanged;
+
+		UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
+		fixture_buffers[0].pcm_state = (uint8)PCM_STATE_N;
+		fixture_buffers[0].buffer_type = (uint8)BUF_TYPE_CURRENT;
+		pg_atomic_write_u32(&fixture_buffers[0].state, BM_TAG_VALID | (io ? BM_IO_IN_PROGRESS : 0));
+		memcpy(&unchanged, &fixture_buffers[0], sizeof(unchanged));
+		fixture_readiness_observation = true;
+		if (sigsetjmp(fixture_error, 1) == 0) {
+			UT_ASSERT(cluster_bufmgr_pcm_x_writer_prepare_target(&fixture_buffers[0], &tag,
+																 PCM_LOCK_MODE_X, 6, &deadline,
+																 &barrier, &transient, &context)
+					  == NULL);
+		} else
+			UT_ASSERT(false);
+		UT_ASSERT_EQ(fixture_errors, 0);
+		UT_ASSERT(context.active && context.reobserve);
+		UT_ASSERT_EQ(context.caller.joined_request.assertion_sequence, 77);
+		UT_ASSERT_EQ(deadline, 9000);
+		UT_ASSERT(!barrier && !transient);
+		UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buffers[0]) == NULL);
+		UT_ASSERT_EQ(fixture_refs[0], 0);
+		UT_ASSERT_EQ(memcmp(&unchanged, &fixture_buffers[0], sizeof(unchanged)), 0);
+	}
 }
 
 UT_TEST(pinned_or_retained_identity_contradiction_is_still_stale)
@@ -416,10 +594,14 @@ UT_TEST(actual_prepare_does_not_turn_failed_history_or_namespace_into_retry)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(14);
 	UT_RUN(handoff_releases_every_private_pin_before_the_wait);
 	UT_RUN(retagged_old_slot_is_never_repinned_or_read);
 	UT_RUN(unowned_vm_observation_replacement_is_reobserve_not_stale);
+	UT_RUN(unpinned_n_read_in_progress_returns_to_original_pin_owner);
+	UT_RUN(unpinned_n_before_read_start_returns_to_caller_instead_of_waiting_ownerless);
+	UT_RUN(read_readiness_escape_never_covers_owned_or_contradictory_images);
+	UT_RUN(real_prepare_routes_unready_observation_without_grant_or_pin);
 	UT_RUN(pinned_or_retained_identity_contradiction_is_still_stale);
 	UT_RUN(real_unowned_gate_requires_empty_pin_and_handoff_not_retained_writer);
 	UT_RUN(actual_handle_owner_invalidates_replaced_pin_and_keeps_other_pin_on_retry);
