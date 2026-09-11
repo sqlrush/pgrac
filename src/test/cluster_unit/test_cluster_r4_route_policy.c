@@ -1036,6 +1036,12 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 {
 	abort();
 }
+Size
+mul_size(Size s1 pg_attribute_unused(), Size s2 pg_attribute_unused())
+{
+	/* The real PCM sidecar is fixture-owned; backend shmem setup is not run. */
+	abort();
+}
 void
 perform_spin_delay(SpinDelayStatus *status pg_attribute_unused())
 {
