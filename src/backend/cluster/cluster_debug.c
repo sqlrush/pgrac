@@ -3394,6 +3394,29 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_MULTI_UNKNOWN)));
 	emit_row(rsinfo, "r4", "slot_capacity_retry_count",
 			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_SLOT_CAPACITY_RETRY)));
+	emit_row(rsinfo, "r4", "cr_requester_terminal_retry_count",
+			 fmt_uint64(cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_REQUESTER_TERMINAL_RETRY)));
+	emit_row(rsinfo, "r4", "cr_requester_reply_period_count",
+			 fmt_uint64(cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_REQUESTER_REPLY_PERIOD)));
+	emit_row(rsinfo, "r4", "cr_requester_backpressure_count",
+			 fmt_uint64(cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_REQUESTER_BACKPRESSURE)));
+	{
+		int stage;
+		int reason;
+
+		for (stage = 0; stage < CLUSTER_R4_REFUSAL_STAGE_COUNT; stage++)
+			for (reason = CLUSTER_CR_BUILD_TARGET_DISABLED; reason <= CLUSTER_CR_BUILD_PROTOCOL;
+				 reason++) {
+				char key[96];
+
+				snprintf(key, sizeof(key), "cr_%s_refusal_%s_count",
+						 cluster_r4_refusal_stage_name((ClusterR4RefusalStage)stage),
+						 cluster_cr_build_reason_name((ClusterCrBuildReason)reason));
+				emit_row(
+					rsinfo, "r4", key,
+					fmt_uint64(cluster_cr_r4_event_count(CLUSTER_R4_REFUSAL_EVENT(stage, reason))));
+			}
+	}
 
 	emit_row(rsinfo, "cr", "cr_construct_count", fmt_int64((int64)cluster_cr_construct_count()));
 	emit_row(rsinfo, "cr", "cr_snapshot_too_old_count",

@@ -1780,6 +1780,11 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 			&& cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
 		return cr_server_r4_release_terminal(slot_index, slot_generation);
 
+	if (terminal_reason != CLUSTER_CR_BUILD_NONE)
+		cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_HOLDER_SHIP, terminal_reason, &slot->tag,
+								   slot->request_id, slot->epoch, slot->requester_node,
+								   slot->reply_master_node, slot->read_scn);
+
 	if (slot->requester_node == cluster_node_id) {
 		if (!cluster_ic_envelope_build(
 				&envelope, PGRAC_IC_MSG_GCS_BLOCK_REPLY,

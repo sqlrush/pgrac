@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
@@ -106,6 +107,24 @@ static char ut_initial_memory_context_storage;
 static char ut_error_memory_context_storage;
 MemoryContext CurrentMemoryContext = (MemoryContext)&ut_initial_memory_context_storage;
 static MemoryContext ut_context_at_flush;
+static int ut_refusal_observe_calls;
+static ClusterCrBuildReason ut_refusal_observed_reason;
+
+void
+cluster_r4_observe_refusal(ClusterR4RefusalStage stage, ClusterCrBuildReason reason,
+						   const BufferTag *tag, uint64 request, uint64 epoch, int32 requester,
+						   int32 master, SCN read_scn)
+{
+	UT_ASSERT_EQ(stage, CLUSTER_R4_REFUSAL_HOLDER_SHIP);
+	UT_ASSERT_NOT_NULL(tag);
+	UT_ASSERT_EQ(request, UT_REQUEST_ID);
+	UT_ASSERT_EQ(epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(requester, UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(master, UT_MASTER_NODE);
+	UT_ASSERT_EQ(read_scn, UT_READ_SCN);
+	ut_refusal_observe_calls++;
+	ut_refusal_observed_reason = reason;
+}
 
 void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
@@ -920,6 +939,7 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	ut_current_sample_generation = UT_FOREIGN_PHYSICAL_GENERATION;
 	ut_send_result = CLUSTER_IC_SEND_DONE;
 	ut_send_calls = 0;
+	ut_refusal_observe_calls = 0;
 	ut_send_msg_type = 0;
 	ut_send_dest = -1;
 	ut_send_length = 0;
@@ -2543,6 +2563,8 @@ UT_TEST(test_r4_worker0_retry_and_fail_ship_zero_body_without_image_fence)
 		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), cases[i].terminal_state);
 		UT_ASSERT_EQ(slot->r4.terminal_reason, cases[i].reason);
 		UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+		UT_ASSERT_EQ(ut_refusal_observe_calls, 1);
+		UT_ASSERT_EQ(ut_refusal_observed_reason, cases[i].reason);
 
 		UT_ASSERT_EQ(ut_send_calls, 1);
 		UT_ASSERT_EQ(ut_send_msg_type, PGRAC_IC_MSG_GCS_BLOCK_REPLY);

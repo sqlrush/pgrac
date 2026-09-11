@@ -3794,7 +3794,15 @@ test_cluster_r4_activation_record: test_cluster_r4_activation_record.c unit_test
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -lssl -lcrypto -o $@
 
+CLUSTER_R4_OPEN_ROUTE_TEST_O = test_cluster_r4_open_route_product.o
+$(CLUSTER_R4_OPEN_ROUTE_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c \
+		$(top_srcdir)/src/include/cluster/cluster_r4_observe.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -DCLUSTER_R4_ROUTE_POLICY_UNIT \
+		-Dcluster_gcs_block_r4_requester_count=cluster_gcs_block_r4_requester_count_unused_test \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h \
+		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
@@ -3802,7 +3810,8 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -lssl -lcrypto -o $@
 

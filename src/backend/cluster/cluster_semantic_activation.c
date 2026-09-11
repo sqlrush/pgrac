@@ -10610,6 +10610,10 @@ cluster_semantic_activation_peer_open_matches(
 	uint32 required_hello_caps, uint32 sampled_capability_generation)
 {
 	ClusterSemanticActivationAckTableV1 table;
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 epoch;
+	int32 coordinator;
 
 	if (token == NULL || !token->entered
 		|| token->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
@@ -10622,26 +10626,31 @@ cluster_semantic_activation_peer_open_matches(
 			authenticated_peer_node_id, required_hello_caps, sampled_capability_generation))
 		return false;
 
-	/* R4 cutover contract §9: only a stable local table with OPEN_PROOF for the
-	 * entered TARGET token's exact record generation and formation epoch
-	 * authorizes a peer-positive path; the authenticated peer must be in
-	 * the exact member bitmap with its observed tuple byte-equal to its
-	 * expected row.  Missing storage, local self, non-OPEN stage or any
-	 * drift returns false without mutation. */
-	if (SemanticActivationAckTable == NULL
-		|| !semantic_activation_ack_table_snapshot(&table)
-		|| (table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF) == 0
+	/* Both a recovered OPEN and an ordinary completed cutover retain R4
+	 * authority.  Their carriers are different: never add the recovery flag
+	 * to the live round just to make this read-only consumer accept it. */
+	if (SemanticActivationAckTable == NULL || !semantic_activation_ack_table_snapshot(&table)
 		|| table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
 		|| table.record_generation != token->record_generation
 		|| table.transition_epoch != token->formation_epoch
 		|| !semantic_activation_ack_member_present(
-			table.expected_members_lo, table.expected_members_hi,
-			authenticated_peer_node_id)
-		|| !semantic_activation_ack_matches(
-			&table.observed[authenticated_peer_node_id],
-			&table.expected[authenticated_peer_node_id]))
+			table.expected_members_lo, table.expected_members_hi, authenticated_peer_node_id)
+		|| !semantic_activation_ack_matches(&table.observed[authenticated_peer_node_id],
+											&table.expected[authenticated_peer_node_id]))
 		return false;
-	return true;
+	if ((table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF) != 0)
+		return true; /* Existing recovery reconstruction contract. */
+	if (table.flags
+			!= (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| (table.target_feature_bitmap & token->feature_bit) == 0
+		|| table.rollback_feature_bitmap != 0
+		|| !semantic_activation_ack_current_authority(cluster_node_id, &members_lo, &members_hi,
+													  &epoch, &coordinator))
+		return false;
+	return semantic_activation_ack_complete_image_current(&table, members_lo, members_hi, epoch,
+														  coordinator, cluster_node_id,
+														  cluster_ic_local_capability_word());
 }
 
 /* Resource-X owns a distinct target-only admission bit.  Its peer proof is

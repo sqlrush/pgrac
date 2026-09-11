@@ -306,6 +306,9 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 r4_event_counts[CLUSTER_R4_OBSERVATION_EVENT_COUNT];
 } ClusterCRShared;
 
+StaticAssertDecl(CLUSTER_R4_OBSERVATION_EVENT_COUNT == 71,
+				 "R4 counter layout changes require a fresh-restart/dump binding");
+
 static ClusterCRShared *CRShared = NULL;
 
 /*

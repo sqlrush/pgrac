@@ -8138,6 +8138,140 @@ ut_resource_x_open_carrier_setup(ClusterSemanticAdmissionToken *token)
 	ut_resource_x_open_carrier_setup_at_epoch(token, 7);
 }
 
+/* The ordinary cutover retains R4 in its current target bitmap.  Its exact
+ * complete OPEN_APPLIED image is not a recovery OPEN_PROOF image: a read-only
+ * R4 consumer must accept the same current formation without rewriting it. */
+UT_TEST(test_r4_peer_accepts_completed_ordinary_cutover_without_recovery_flag)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticActivationAckTableV1 before;
+	int epoch;
+
+	for (epoch = 0; epoch <= 7; epoch += 7) {
+		ut_resource_x_open_carrier_setup_at_epoch(&token, (uint64)epoch);
+		token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		memcpy(&before, SemanticActivationAckTable, sizeof(before));
+		UT_ASSERT(cluster_semantic_activation_recheck(&token));
+		UT_ASSERT(semantic_activation_ack_complete_image_current(
+			SemanticActivationAckTable, UINT64_C(0x0f), 0, (uint64)epoch, 0, cluster_node_id,
+			test_local_capability_word));
+		UT_ASSERT(cluster_semantic_activation_peer_open_matches(
+			&token, 2, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 19));
+		UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+	}
+	test_gate_reset();
+}
+
+#include "cluster_r4_open_route_test_stubs.h"
+
+UT_TEST(test_ordinary_open_reaches_real_master_route_and_stale_peer_does_not)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterR4CrRequestPayload request = { 0 };
+	ClusterICEnvelope env = { 0 };
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterSemanticActivationAckTableV1 before;
+
+	ut_resource_x_open_carrier_setup_at_epoch(&token, 7);
+	before = *SemanticActivationAckTable;
+	test_open_route_forwards = 0;
+	test_open_route_refusals = 0;
+	request.base.request_id = 42;
+	request.base.epoch = 7;
+	request.base.tag.spcOid = 1663;
+	request.base.tag.dbOid = 5;
+	request.base.tag.relNumber = 16429;
+	request.base.sender_node = 2;
+	request.base.requester_backend_id = 7;
+	request.base.transition_id = PCM_TRANS_N_TO_S;
+	UT_ASSERT(ClusterR4RequestExtensionSetCr(&request.extension, (SCN)44));
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REQUEST;
+	env.payload_length = sizeof(request);
+	env.source_node_id = 2;
+	env.dest_node_id = 0;
+	env.epoch = 7;
+	UT_ASSERT_EQ(cluster_gcs_block_r4_route_cr(&env, &request, &reason), CLUSTER_CR_BUILD_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(test_open_route_forwards, 1);
+	UT_ASSERT_EQ(test_open_route_refusals, 0);
+	UT_ASSERT_EQ(test_open_route_forward.base.original_requester_node, 2);
+	UT_ASSERT_EQ(test_open_route_forward.base.master_node, 0);
+	UT_ASSERT_EQ(test_open_route_forward.base.request_id, 42);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&test_open_route_forward.base),
+				 (SCN)44);
+	UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+	test_remote_admitted_incarnations[3]++;
+	request.base.request_id++;
+	UT_ASSERT_EQ(cluster_gcs_block_r4_route_cr(&env, &request, &reason),
+				 CLUSTER_CR_BUILD_RETRYABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_RF_DEFERRED);
+	UT_ASSERT_EQ(test_open_route_forwards, 1);
+	UT_ASSERT_EQ(test_open_route_refusals, 1);
+	UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+}
+
+UT_TEST(test_r4_peer_ordinary_open_rechecks_every_member_and_feature)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	int leg;
+
+	for (leg = 0; leg < 12; leg++) {
+		ut_resource_x_open_carrier_setup(&token);
+		token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		UT_ASSERT(cluster_semantic_activation_peer_open_matches(
+			&token, 2, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 19));
+		switch (leg) {
+		case 0:
+			table->target_feature_bitmap &= ~token.feature_bit;
+			break;
+		case 1:
+			table->observed_members_lo &= ~UINT64_C(8);
+			break;
+		case 2:
+			table->observed[3].boot_id++;
+			break;
+		case 3:
+			test_remote_admitted_incarnations[3]++;
+			break;
+		case 4:
+			table->record_generation++;
+			break;
+		case 5:
+			table->transition_epoch++;
+			break;
+		case 6:
+			table->flags &= ~CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+			break;
+		case 7:
+			table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED;
+			break;
+		case 8:
+			table->rollback_feature_bitmap = token.feature_bit;
+			break;
+		case 9:
+			test_peer_capability_matches = false;
+			break;
+		case 10:
+			test_membership_snapshot_valid = false;
+			break;
+		case 11:
+			table->publication_seq.value |= 1;
+			break;
+		}
+		UT_ASSERT(!cluster_semantic_activation_peer_open_matches(
+			&token, 2, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 19));
+	}
+	ut_resource_x_open_carrier_setup(&token);
+	token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	table->source_feature_bitmap = 0;
+	table->target_feature_bitmap = token.feature_bit;
+	test_gate_publish(2, token.feature_bit, 6, 7, false);
+	UT_ASSERT(cluster_semantic_activation_peer_open_matches(
+		&token, 2, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 19));
+	test_gate_reset();
+}
+
 /* A completed ordinary R11 OPEN_APPLIED image is the positive Resource-X
  * carrier after cutover.  A single LMON tick that cannot capture the current
  * admission snapshot must not rewrite that terminal image into an empty
@@ -8733,7 +8867,7 @@ UT_TEST(test_145t_owned_commit_and_open_resume_without_a_new_utility)
 int
 main(void)
 {
-	UT_PLAN(240);
+	UT_PLAN(243);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -8958,6 +9092,9 @@ main(void)
 	UT_RUN(test_145e_restore_open_proof_is_idempotent);
 	UT_RUN(test_145f_restore_open_proof_requires_active_latch);
 	UT_RUN(test_145g_peer_open_matches_consumes_open_proof);
+	UT_RUN(test_r4_peer_accepts_completed_ordinary_cutover_without_recovery_flag);
+	UT_RUN(test_ordinary_open_reaches_real_master_route_and_stale_peer_does_not);
+	UT_RUN(test_r4_peer_ordinary_open_rechecks_every_member_and_feature);
 	UT_RUN(test_145h_resource_x_open_carrier_survives_unavailable_snapshot);
 	UT_RUN(test_145i_resource_x_open_carrier_invalidates_formation_drift);
 	UT_RUN(test_145j_resource_x_peer_match_reports_first_failed_predicate);

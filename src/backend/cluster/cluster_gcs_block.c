@@ -674,8 +674,8 @@ static ClusterGcsBlockOutstandingSlot *gcs_block_try_reserve_r4_slot(
 	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
 	uint64 *out_request_id);
 static ClusterCrBuildResult gcs_block_r4_cr_fetch_and_wait_raw(
-	BufferTag tag, SCN read_scn, int32 real_master_node,
-	char dst_page[GCS_BLOCK_DATA_SIZE], ClusterCrBuildReason *reason_out);
+	BufferTag tag, SCN read_scn, int32 real_master_node, char dst_page[GCS_BLOCK_DATA_SIZE],
+	ClusterCrBuildReason *reason_out, const ClusterSemanticAdmissionToken *admission);
 static void gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot);
 static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req,
 								 GcsBlockReplyStatus status, XLogRecPtr page_lsn,
@@ -2485,9 +2485,14 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 {
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
+	SCN read_scn = InvalidScn;
 
 	if (!gcs_block_r4_refusal_status_for_build(result, reason, admitted_forward, &status))
 		return true;
+	(void)ClusterR4RequestExtensionGetCr(&request->extension, &read_scn);
+	cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_MASTER, reason, &request->base.tag,
+							   request->base.request_id, request->base.epoch,
+							   (int32)env->source_node_id, current_master_node, read_scn);
 	memset(&header, 0, sizeof(header));
 	header.request_id = request->base.request_id;
 	header.epoch = request->base.epoch;
@@ -2524,6 +2529,10 @@ gcs_block_r4_publish_holder_refusal(int worker_id,
 	if (forward == NULL
 		|| !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
 		return true;
+	cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_HOLDER_ADMISSION, reason, &forward->base.tag,
+							   forward->base.request_id, forward->base.epoch,
+							   forward->base.original_requester_node, forward->base.master_node,
+							   GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base));
 	memset(&header, 0, sizeof(header));
 	header.request_id = forward->base.request_id;
 	header.epoch = forward->base.epoch;
@@ -3091,8 +3100,8 @@ cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
 	ClusterCrBuildReason reason;
 
 	gcs_block_test_reset_r4_reply_table(UINT64_C(1));
-	return gcs_block_r4_cr_fetch_and_wait_raw(
-			   tag, read_scn, real_master_node, dst_page, &reason)
+	return gcs_block_r4_cr_fetch_and_wait_raw(tag, read_scn, real_master_node, dst_page, &reason,
+											  NULL)
 		   == CLUSTER_CR_BUILD_FULL;
 }
 
@@ -4740,14 +4749,68 @@ proof_done:
 	return result;
 }
 
-static ClusterCrBuildResult
-gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
-									  int32 real_master_node,
-									  char dst_page[GCS_BLOCK_DATA_SIZE],
-									  ClusterCrBuildReason *reason_out)
+typedef struct GcsR4CrWaitDiagnostic {
+	instr_time started;
+	uint64 attempts;
+	uint64 sends;
+	uint32 seen;
+	double next_age_ms;
+} GcsR4CrWaitDiagnostic;
+
+/* Observation only: neither a retry count nor an elapsed service period is
+ * evidence that a read-only request lost its authority.  Log first causes
+ * and geometrically spaced age thresholds, never every spin/notification. */
+static void
+gcs_block_r4_wait_note(GcsR4CrWaitDiagnostic *diagnostic, const BufferTag *tag, uint64 request_id,
+					   uint64 epoch, int32 master, uint32 cause)
 {
-	int max_retries;
-	int retry_attempt;
+	static const char *const reasons[]
+		= { "TERMINAL_RETRY", "REPLY_PERIOD_ELAPSED", "OUTBOUND_BACKPRESSURE" };
+	instr_time elapsed;
+	double age_ms;
+	uint32 bit;
+
+	Assert(cause < lengthof(reasons));
+	bit = UINT32_C(1) << cause;
+	cluster_r4_observe((ClusterR4Event)(CLUSTER_R4_EVENT_CR_REQUESTER_TERMINAL_RETRY + cause),
+					   CLUSTER_TX_RESOLVE_NONE, CLUSTER_CR_BUILD_NONE);
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, diagnostic->started);
+	age_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+	if ((diagnostic->seen & bit) != 0 && age_ms < diagnostic->next_age_ms)
+		return;
+	diagnostic->seen |= bit;
+	if (age_ms >= diagnostic->next_age_ms)
+		diagnostic->next_age_ms = Max(diagnostic->next_age_ms * 10.0, age_ms * 10.0);
+	ereport(LOG, (errmsg_internal("R4 CR logical read wait"),
+				  errdetail("PGRAC_FAMILY=R4_CR_DIAGNOSTIC PGRAC_REASON=%s "
+							"node=%d master=%d tag=%u/%u/%u/%u/%u request=" UINT64_FORMAT
+							" epoch=" UINT64_FORMAT " attempts=" UINT64_FORMAT
+							" sends=" UINT64_FORMAT " age_ms=%.3f action=wait",
+							reasons[cause], cluster_node_id, master, tag->spcOid, tag->dbOid,
+							tag->relNumber, (unsigned)tag->forkNum, tag->blockNum, request_id,
+							epoch, diagnostic->attempts, diagnostic->sends, age_ms)));
+}
+
+static void
+gcs_block_r4_retry_backoff(void)
+{
+	ResetLatch(MyLatch);
+	CHECK_FOR_INTERRUPTS();
+	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+					WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+	CHECK_FOR_INTERRUPTS();
+}
+
+static ClusterCrBuildResult
+gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_master_node,
+								   char dst_page[GCS_BLOCK_DATA_SIZE],
+								   ClusterCrBuildReason *reason_out,
+								   const ClusterSemanticAdmissionToken *admission)
+{
+	GcsR4CrWaitDiagnostic diagnostic = { 0 };
+	uint64 request_epoch = cluster_epoch_get_current();
 
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
@@ -4755,21 +4818,29 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
 		|| real_master_node < 0
 		|| real_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
-	max_retries = cluster_gcs_block_retransmit_max_retries;
-	if (max_retries < 0)
-		max_retries = 4;
-	if (max_retries > 30)
-		max_retries = 30;
+	INSTR_TIME_SET_CURRENT(diagnostic.started);
+	diagnostic.next_age_ms = Max(cluster_gcs_reply_timeout_ms, 1);
 	cluster_gcs_block_dedup_register_backend_exit_hook();
-	for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
+	for (;;) {
 		ClusterGcsBlockOutstandingSlot *slot;
 		ClusterR4CrRequestPayload request;
 		uint64 request_id = 0;
-		uint64 request_epoch = cluster_epoch_get_current();
 		volatile bool got_reply = false;
 		volatile bool fetched = false;
+		volatile bool invalidated = false;
 		volatile uint8 reply_status = 0;
 
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_epoch_get_current() != request_epoch) {
+			*reason_out = CLUSTER_CR_BUILD_EPOCH_MISMATCH;
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		}
+		if (admission != NULL && !cluster_semantic_activation_recheck(admission)) {
+			*reason_out = CLUSTER_CR_BUILD_RF_DEFERRED;
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		}
+		if (diagnostic.attempts < UINT64_MAX)
+			diagnostic.attempts++;
 		slot = gcs_block_try_reserve_r4_slot(tag, request_epoch, real_master_node,
 											  &request_id);
 		if (slot == NULL) {
@@ -4794,117 +4865,131 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
 					cluster_gcs_block_retransmit_initial_backoff_ms,
 					cluster_gcs_block_retransmit_max_retries,
 					cluster_gcs_reply_timeout_ms));
-			if (ClusterR4RequestExtensionSetCr(&request.extension, read_scn))
-				request_admitted
-					= cluster_grd_outbound_enqueue_backend_msg(
-						PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-						(uint32)real_master_node, &request,
-						sizeof(request));
-			if (request_admitted) {
-				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
-				instr_time started;
-
-				INSTR_TIME_SET_CURRENT(started);
-				ConditionVariablePrepareToSleep(&slot->reply_cv);
-				for (;;) {
-					instr_time now;
-					instr_time elapsed;
-					double remaining_ms;
-					long timeout_ms;
-					bool have_reply;
-					bool stale;
-
-					LWLockAcquire(&blk->lock.lock, LW_SHARED);
-					have_reply = slot->in_use && slot->reply_received;
-					stale = slot->in_use && slot->stale;
-					LWLockRelease(&blk->lock.lock);
-					if (have_reply) {
-						got_reply = true;
-						break;
-					}
-					if (stale)
-						break;
-					INSTR_TIME_SET_CURRENT(now);
-					elapsed = now;
-					INSTR_TIME_SUBTRACT(elapsed, started);
-					remaining_ms = (double)cluster_gcs_reply_timeout_ms
-									   - INSTR_TIME_GET_MILLISEC(elapsed);
-					if (remaining_ms <= 0)
-						break;
-					timeout_ms = remaining_ms < 1.0 ? 1L : (long)remaining_ms;
-					(void)ConditionVariableTimedSleep(
-						&slot->reply_cv, timeout_ms, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			if (!ClusterR4RequestExtensionSetCr(&request.extension, read_scn)) {
+				invalidated = true;
+				*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+			}
+			/* A missing response does not close this physical request.  Redrive
+			 * its immutable identity rather than allocate parallel holder work. */
+			while (!invalidated && !got_reply) {
+				CHECK_FOR_INTERRUPTS();
+				if (cluster_epoch_get_current() != request_epoch
+					|| (admission != NULL && !cluster_semantic_activation_recheck(admission))) {
+					invalidated = true;
+					*reason_out = cluster_epoch_get_current() != request_epoch
+									  ? CLUSTER_CR_BUILD_EPOCH_MISMATCH
+									  : CLUSTER_CR_BUILD_RF_DEFERRED;
+					break;
 				}
-				ConditionVariableCancelSleep();
+				if (diagnostic.sends < UINT64_MAX)
+					diagnostic.sends++;
+				request_admitted = cluster_grd_outbound_enqueue_backend_msg(
+					PGRAC_IC_MSG_GCS_BLOCK_REQUEST, (uint32)real_master_node, &request,
+					sizeof(request));
+				if (!request_admitted) {
+					gcs_block_r4_wait_note(&diagnostic, &tag, request_id, request_epoch,
+										   real_master_node, 2);
+					gcs_block_r4_retry_backoff();
+					continue;
+				}
+				{
+					ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+					instr_time started;
 
-				if (got_reply
-					&& slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
-					&& slot->reply_header.request_id == request_id
-					&& slot->reply_header.epoch == request_epoch
-					&& slot->reply_header.requester_backend_id == (int32)MyBackendId
-					&& slot->reply_header.transition_id == (uint8)PCM_TRANS_N_TO_S) {
-					reply_status = slot->reply_header.status;
-					if (reply_status == (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
-						&& slot->reply_header.checksum
-							   == gcs_block_compute_checksum(slot->reply_block_data)) {
-						memcpy(dst_page, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
-						fetched = true;
+					INSTR_TIME_SET_CURRENT(started);
+					ConditionVariablePrepareToSleep(&slot->reply_cv);
+					for (;;) {
+						instr_time now;
+						instr_time elapsed;
+						double remaining_ms;
+						long timeout_ms;
+						bool have_reply;
+						bool stale;
+
+						CHECK_FOR_INTERRUPTS();
+						if (cluster_epoch_get_current() != request_epoch
+							|| (admission != NULL
+								&& !cluster_semantic_activation_recheck(admission))) {
+							invalidated = true;
+							*reason_out = cluster_epoch_get_current() != request_epoch
+											  ? CLUSTER_CR_BUILD_EPOCH_MISMATCH
+											  : CLUSTER_CR_BUILD_RF_DEFERRED;
+							break;
+						}
+						LWLockAcquire(&blk->lock.lock, LW_SHARED);
+						have_reply = slot->in_use && slot->reply_received;
+						stale = slot->in_use && slot->stale;
+						LWLockRelease(&blk->lock.lock);
+						if (have_reply) {
+							got_reply = true;
+							break;
+						}
+						if (stale) {
+							invalidated = true;
+							*reason_out = CLUSTER_CR_BUILD_EPOCH_MISMATCH;
+							break;
+						}
+						INSTR_TIME_SET_CURRENT(now);
+						elapsed = now;
+						INSTR_TIME_SUBTRACT(elapsed, started);
+						remaining_ms = (double)cluster_gcs_reply_timeout_ms
+									   - INSTR_TIME_GET_MILLISEC(elapsed);
+						if (remaining_ms <= 0)
+							break;
+						timeout_ms = remaining_ms < 1.0 ? 1L : (long)remaining_ms;
+						(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+														  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 					}
+					ConditionVariableCancelSleep();
+
+					if (got_reply && slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+						&& slot->reply_header.request_id == request_id
+						&& slot->reply_header.epoch == request_epoch
+						&& slot->reply_header.requester_backend_id == (int32)MyBackendId
+						&& slot->reply_header.transition_id == (uint8)PCM_TRANS_N_TO_S) {
+						reply_status = slot->reply_header.status;
+						if (reply_status == (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+							&& slot->reply_header.checksum
+								   == gcs_block_compute_checksum(slot->reply_block_data)) {
+							memcpy(dst_page, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+							fetched = true;
+						}
+					}
+					if (!got_reply && !invalidated)
+						gcs_block_r4_wait_note(&diagnostic, &tag, request_id, request_epoch,
+											   real_master_node, 1);
 				}
 			}
 		}
 		PG_CATCH();
 		{
+			ConditionVariableCancelSleep();
 			gcs_block_release_slot(slot);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
 		gcs_block_release_slot(slot);
+		if (invalidated)
+			return cluster_cr_build_result_for_reason(*reason_out);
 		if (fetched) {
 			*reason_out = CLUSTER_CR_BUILD_NONE;
 			return CLUSTER_CR_BUILD_FULL;
 		}
 		if (got_reply
-			&& reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
-			&& retry_attempt < max_retries)
-			continue;
-		if (got_reply
 			&& reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED) {
-			pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_exhausted_count, 1);
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED),
-					 errmsg("cluster_gcs_block: R4 CR retry budget exhausted after %d retries "
-							"for tag spc=%u db=%u relNumber=%u block=%u "
-							"(master=%d attempts=%d last_status=%u)",
-							max_retries, tag.spcOid, tag.dbOid,
-							(unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum,
-							real_master_node, retry_attempt + 1, (unsigned int)reply_status),
-					 errhint("Possible peer GCS unresponsiveness, network partition, or "
-							 "epoch reshuffle storm.  Inspect dump_gcs counters and "
-							 "consider raising cluster.gcs_block_retransmit_max_retries."),
-					 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-							   cluster_node_id)));
-			*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
-			return CLUSTER_CR_BUILD_RETRYABLE;
+			gcs_block_r4_wait_note(&diagnostic, &tag, request_id, request_epoch, real_master_node,
+								   0);
+			gcs_block_r4_retry_backoff();
+			continue;
 		}
 		if (got_reply) {
 			*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
 			return CLUSTER_CR_BUILD_FAIL_CLOSED;
 		}
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("cluster_gcs_block: R4 CR request to master %d received no "
-							   "terminal reply after %d attempt(s)",
-							   real_master_node, retry_attempt + 1),
-						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-								  cluster_node_id)));
-		*reason_out = CLUSTER_CR_BUILD_IO_ERROR;
+		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 	}
-	*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
-	return CLUSTER_CR_BUILD_RETRYABLE;
 }
 
 ClusterTxOutcome
@@ -5090,8 +5175,8 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 			goto done;
 		}
 
-		result = gcs_block_r4_cr_fetch_and_wait_raw(
-			tag, read_scn, real_master_node, scratch.data, &raw_reason);
+		result = gcs_block_r4_cr_fetch_and_wait_raw(tag, read_scn, real_master_node, scratch.data,
+													&raw_reason, &admission);
 		reason = raw_reason;
 		if (result != CLUSTER_CR_BUILD_FULL)
 			goto done;

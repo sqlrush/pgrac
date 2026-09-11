@@ -14,6 +14,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_cssd.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
@@ -43,6 +44,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 
 #undef printf
 
@@ -103,6 +105,16 @@ extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(
 /* Backend globals reached by the narrow production route section. */
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+volatile sig_atomic_t InterruptPending = false;
+static Latch route_test_latch;
+Latch *MyLatch = &route_test_latch;
+static int retry_latch_wait_calls;
+static bool retry_latch_cancel;
+static bool retry_latch_epoch_drift;
+static bool reply_wait_epoch_drift;
+static bool reply_wait_admission_drift;
+static int process_interrupt_calls;
+static uint64 route_test_epoch = UINT64_C(9);
 static bool route_ereport_armed;
 static bool route_ereport_caught;
 static int route_ereport_sqlstate;
@@ -405,7 +417,7 @@ static int reply_lock_acquire_calls;
 static int reply_lock_release_calls;
 static int reply_cv_signal_calls;
 
-#define REQUESTER_REPLY_SCRIPT_CAPACITY 3
+#define REQUESTER_REPLY_SCRIPT_CAPACITY 12
 
 static ConditionVariable *reply_cv_signaled[REQUESTER_REPLY_SCRIPT_CAPACITY];
 
@@ -439,6 +451,37 @@ static TimestampTz route_test_now;
 static bool reply_cv_timed_sleep_raise;
 
 void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+}
+
+int
+WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
+{
+	UT_ASSERT(latch == MyLatch);
+	UT_ASSERT((wake_events & (WL_TIMEOUT | WL_EXIT_ON_PM_DEATH))
+			  == (WL_TIMEOUT | WL_EXIT_ON_PM_DEATH));
+	UT_ASSERT_EQ(timeout, cluster_gcs_block_retransmit_initial_backoff_ms);
+	UT_ASSERT(wait_event != 0);
+	retry_latch_wait_calls++;
+	if (retry_latch_cancel)
+		InterruptPending = true;
+	if (retry_latch_epoch_drift)
+		route_test_epoch++;
+	return WL_TIMEOUT;
+}
+
+void
+ProcessInterrupts(void)
+{
+	process_interrupt_calls++;
+	InterruptPending = false;
+	UT_ASSERT_NOT_NULL(PG_exception_stack);
+	siglongjmp(*PG_exception_stack, 1);
+}
+
+void
 ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 {
 	if (reply_cv_prepare_calls < REQUESTER_REPLY_SCRIPT_CAPACITY)
@@ -454,6 +497,8 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 	reply_cv_timed_sleep_calls++;
 	if (reply_cv_timed_sleep_raise)
 		siglongjmp(*PG_exception_stack, 1);
+	if (reply_wait_epoch_drift)
+		route_test_epoch++;
 	return false;
 }
 
@@ -500,6 +545,7 @@ typedef struct RouteSeamCapture {
 	bool capability_ok;
 	bool peer_open_ok;
 	bool recheck_ok;
+	int recheck_fail_at;
 	bool snapshot_ok;
 	bool local_dispatch_ok;
 	bool current_mx_capability_ok;
@@ -540,6 +586,13 @@ typedef struct RouteSeamCapture {
 	ClusterTxOutcome candidate_outcome;
 	ClusterTxProofKind candidate_proof;
 	int observe_calls;
+	int refusal_observe_calls;
+	ClusterR4RefusalStage refusal_stage;
+	ClusterCrBuildReason refusal_reason;
+	BufferTag refusal_tag;
+	uint64 refusal_request_id;
+	uint64 refusal_epoch;
+	SCN refusal_read_scn;
 	int envelope_build_calls;
 	int local_dispatch_calls;
 	int raw_send_calls;
@@ -699,6 +752,9 @@ typedef struct RequesterSendCapture {
 	ClusterR4CrForwardPayload tx_forward;
 	bool tx_kind2;
 	bool suppress_reply;
+	int suppress_reply_calls;
+	int refuse_enqueue_calls;
+	bool corrupt_reply_checksum;
 	bool slot_armed;
 	uint8 slot_domain;
 	ClusterGcsBlockDirectState direct_state;
@@ -752,6 +808,15 @@ route_seam_reset(void)
 	route_seam.candidate_outcome = CLUSTER_TX_COMMITTED;
 	route_seam.candidate_proof = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
 	route_test_now = 0;
+	route_test_epoch = UT_FORMATION_EPOCH;
+	reply_cv_timed_sleep_raise = false;
+	retry_latch_wait_calls = 0;
+	retry_latch_cancel = false;
+	retry_latch_epoch_drift = false;
+	reply_wait_epoch_drift = false;
+	reply_wait_admission_drift = false;
+	process_interrupt_calls = 0;
+	InterruptPending = false;
 }
 
 static BufferTag
@@ -1033,6 +1098,10 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
 		if (call_index < requester_send.reply_step_count)
 			reply_step = requester_send.reply_steps[call_index];
 	}
+	if (call_index < requester_send.refuse_enqueue_calls)
+		return false;
+	if (requester_send.suppress_reply || call_index < requester_send.suppress_reply_calls)
+		return true;
 
 	memset(&reply, 0, sizeof(reply));
 	reply.header.request_id = requester_send.request.base.request_id;
@@ -1047,6 +1116,8 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
 	memset(reply.block_data, reply_step.block_fill, sizeof(reply.block_data));
 	memcpy(requester_send.reply_page, reply.block_data, sizeof(reply.block_data));
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+	if (requester_send.corrupt_reply_checksum)
+		reply.header.checksum ^= UINT32_C(1);
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 						  reply_step.envelope_source_node,
 						  (uint32)cluster_node_id, sizeof(reply));
@@ -1179,7 +1250,7 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 uint64
 cluster_epoch_get_current(void)
 {
-	return UT_FORMATION_EPOCH;
+	return route_test_epoch;
 }
 
 void
@@ -1340,7 +1411,10 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	route_seam.rechecked_admission_address = token;
 	if (token != NULL)
 		route_seam.rechecked_admission = *token;
-	return route_seam.recheck_ok && token != NULL && token->entered;
+	return route_seam.recheck_ok && token != NULL && token->entered
+		   && (route_seam.recheck_fail_at == 0
+			   || route_seam.recheck_calls < route_seam.recheck_fail_at)
+		   && !(reply_wait_admission_drift && reply_cv_timed_sleep_calls > 0);
 }
 
 void
@@ -1628,6 +1702,22 @@ cluster_r4_observe(ClusterR4Event event, ClusterTxResolveReason tx_reason,
 	route_seam.observed_event = event;
 	route_seam.observed_tx_reason = tx_reason;
 	route_seam.observed_cr_reason = cr_reason;
+}
+
+void
+cluster_r4_observe_refusal(ClusterR4RefusalStage stage, ClusterCrBuildReason reason,
+						   const BufferTag *tag, uint64 request_id, uint64 epoch, int32 requester,
+						   int32 master, SCN read_scn)
+{
+	route_seam.refusal_observe_calls++;
+	route_seam.refusal_stage = stage;
+	route_seam.refusal_reason = reason;
+	route_seam.refusal_tag = *tag;
+	route_seam.refusal_request_id = request_id;
+	route_seam.refusal_epoch = epoch;
+	route_seam.refusal_read_scn = read_scn;
+	UT_ASSERT_EQ(requester, UT_REQUESTER_NODE);
+	UT_ASSERT(master >= -1 && master < CLUSTER_MAX_NODES);
 }
 
 bool
@@ -3490,11 +3580,10 @@ route_test_assert_public_target_slot_is_canonical(void)
 	UT_ASSERT(!direct_target_prepared);
 }
 
-/* Two valid D3-master status25 replies consume the complete retry budget.
- * Each reply closes its old id before a fresh arm, then the public TARGET
- * wrapper must surface the existing 53R90 ERROR and still leave its one
- * admission token through PG_FINALLY. */
-UT_TEST(test_target_wrapper_status25_retry_exhaustion_raises_53r90)
+/* A valid retry is a terminal physical reply, not a failed logical read.
+ * Nine replies exceed the old eight-retry limit; only the later exact FULL
+ * may publish scratch, under the same admitted logical read. */
+UT_TEST(test_target_wrapper_status25_beyond_old_limit_waits_for_full)
 {
 	BufferTag tag = route_test_tag();
 	char dst_page[BLCKSZ];
@@ -3505,12 +3594,14 @@ UT_TEST(test_target_wrapper_status25_retry_exhaustion_raises_53r90)
 	int saved_node_id = cluster_node_id;
 	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
 	int saved_max_retries = cluster_gcs_block_retransmit_max_retries;
+	volatile ClusterCrBuildResult result = CLUSTER_CR_BUILD_FAIL_CLOSED;
+	int i;
 
 	cluster_node_id = UT_REQUESTER_NODE;
 	cluster_gcs_reply_timeout_ms = 1;
-	cluster_gcs_block_retransmit_max_retries = 1;
+	cluster_gcs_block_retransmit_max_retries = 8;
 	route_test_reset_public_target_requester();
-	requester_send.reply_step_count = 2;
+	requester_send.reply_step_count = 10;
 	requester_send.reply_steps[0].status
 		= GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
 	requester_send.reply_steps[0].envelope_source_node = UT_MASTER_NODE;
@@ -3519,7 +3610,14 @@ UT_TEST(test_target_wrapper_status25_retry_exhaustion_raises_53r90)
 		= GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 	requester_send.reply_steps[0].page_lsn = 0;
 	requester_send.reply_steps[0].block_fill = 0;
-	requester_send.reply_steps[1] = requester_send.reply_steps[0];
+	for (i = 1; i < 9; i++)
+		requester_send.reply_steps[i] = requester_send.reply_steps[0];
+	requester_send.reply_steps[9].status = GCS_BLOCK_REPLY_R4_CR_FULL;
+	requester_send.reply_steps[9].envelope_source_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[9].header_sender_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[9].forwarding_master_node = UT_MASTER_NODE;
+	requester_send.reply_steps[9].page_lsn = UINT64_C(0xabcdef);
+	requester_send.reply_steps[9].block_fill = 0x6d;
 	memset(dst_page, 0xa7, sizeof(dst_page));
 	memcpy(original_page, dst_page, sizeof(original_page));
 	route_ereport_armed = true;
@@ -3528,39 +3626,232 @@ UT_TEST(test_target_wrapper_status25_retry_exhaustion_raises_53r90)
 
 	if (sigsetjmp(error_jump, 1) == 0) {
 		PG_exception_stack = &error_jump;
-		(void)cluster_gcs_block_cr_fetch_and_wait(
-			tag, UT_READ_SCN, dst_page, &reason);
+		result = cluster_gcs_block_cr_fetch_and_wait(tag, UT_READ_SCN, dst_page, &reason);
 	} else
 		PG_exception_stack = saved_exception_stack;
 	PG_exception_stack = saved_exception_stack;
 	route_ereport_armed = false;
 
-	UT_ASSERT(route_ereport_caught);
-	UT_ASSERT_EQ(route_ereport_sqlstate,
-				 ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED);
-	UT_ASSERT_EQ(requester_send.calls, 2);
-	/* The public-wrapper reset primes and releases sequence 1, so the two
-	 * transported attempts must consume the next exact fresh ids. */
-	UT_ASSERT_EQ(requester_send.request_ids[0], UINT64_C(0x0200000000000002));
-	UT_ASSERT_EQ(requester_send.request_ids[1], UINT64_C(0x0200000000000003));
-	UT_ASSERT_NE(requester_send.request_ids[0], requester_send.request_ids[1]);
-	UT_ASSERT(requester_send.slot_armed_by_call[0]);
-	UT_ASSERT(requester_send.slot_armed_by_call[1]);
-	UT_ASSERT_EQ(requester_send.slot_domain_by_call[0], UT_REPLY_DOMAIN_R4_CR);
-	UT_ASSERT_EQ(requester_send.slot_domain_by_call[1], UT_REPLY_DOMAIN_R4_CR);
-	UT_ASSERT_EQ(reply_cv_prepare_calls, 2);
+	UT_ASSERT(!route_ereport_caught);
+	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(requester_send.calls, 10);
+	for (i = 0; i < 10; i++) {
+		UT_ASSERT_EQ(requester_send.request_ids[i], UINT64_C(0x0200000000000002) + i);
+		UT_ASSERT(requester_send.slot_armed_by_call[i]);
+		UT_ASSERT_EQ(requester_send.slot_domain_by_call[i], UT_REPLY_DOMAIN_R4_CR);
+	}
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 10);
 	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
-	UT_ASSERT_EQ(reply_cv_cancel_calls, 2);
-	UT_ASSERT_EQ(reply_cv_signal_calls, 2);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 10);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 10);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
-	UT_ASSERT_EQ(route_seam.recheck_calls, 0);
+	UT_ASSERT(route_seam.recheck_calls >= 1);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	memset(original_page, 0x6d, sizeof(original_page));
 	UT_ASSERT_EQ(memcmp(dst_page, original_page, sizeof(dst_page)), 0);
 	route_test_assert_public_target_slot_is_canonical();
 
 	cluster_gcs_block_retransmit_max_retries = saved_max_retries;
 	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
 	cluster_node_id = saved_node_id;
+}
+
+static void
+route_test_first_reply_retry(void)
+{
+	RequesterReplyStep *step = &requester_send.reply_steps[0];
+
+	requester_send.reply_step_count = 1;
+	step->status = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+	step->envelope_source_node = UT_MASTER_NODE;
+	step->header_sender_node = UT_MASTER_NODE;
+	step->forwarding_master_node = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+}
+
+/* Neither lost responses nor outbound backpressure authorize parallel
+ * physical requests.  All three sends must carry exactly the same ID. */
+UT_TEST(test_target_wrapper_lost_reply_and_backpressure_redrive_same_id)
+{
+	BufferTag tag = route_test_tag();
+	int saved_node = cluster_node_id;
+	int saved_timeout = cluster_gcs_reply_timeout_ms;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	for (mode = 0; mode < 2; mode++) {
+		char page[BLCKSZ];
+		char expected[BLCKSZ];
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+		int i;
+
+		route_test_reset_public_target_requester();
+		if (mode == 0)
+			requester_send.suppress_reply_calls = 2;
+		else
+			requester_send.refuse_enqueue_calls = 2;
+		memset(page, 0xa7, sizeof(page));
+		memset(expected, 0x6d, sizeof(expected));
+		UT_ASSERT_EQ(cluster_gcs_block_cr_fetch_and_wait(tag, UT_READ_SCN, page, &reason),
+					 CLUSTER_CR_BUILD_FULL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+		UT_ASSERT_EQ(requester_send.calls, 3);
+		for (i = 0; i < 3; i++) {
+			UT_ASSERT_EQ(requester_send.request_ids[i], UINT64_C(0x0200000000000002));
+			UT_ASSERT(requester_send.slot_armed_by_call[i]);
+			UT_ASSERT_EQ(requester_send.slot_domain_by_call[i], UT_REPLY_DOMAIN_R4_CR);
+		}
+		UT_ASSERT_EQ(reply_cv_prepare_calls, mode == 0 ? 3 : 1);
+		UT_ASSERT_EQ(reply_cv_cancel_calls, reply_cv_prepare_calls);
+		UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+		UT_ASSERT_EQ(retry_latch_wait_calls, mode == 0 ? 0 : 2);
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(memcmp(page, expected, sizeof(page)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	cluster_gcs_reply_timeout_ms = saved_timeout;
+	cluster_node_id = saved_node;
+}
+
+/* Exercise cancellation in the CV, after a terminal reply released its
+ * slot, and while an unqueued request still owns its slot. */
+UT_TEST(test_target_wrapper_wait_cancellation_leaves_admission_and_slot)
+{
+	BufferTag tag = route_test_tag();
+	int saved_node = cluster_node_id;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (mode = 0; mode < 3; mode++) {
+		char page[BLCKSZ];
+		char before[BLCKSZ];
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+		sigjmp_buf jump;
+		sigjmp_buf *saved_stack = PG_exception_stack;
+		volatile bool caught = false;
+
+		route_test_reset_public_target_requester();
+		if (mode == 0) {
+			requester_send.suppress_reply = true;
+			reply_cv_timed_sleep_raise = true;
+		} else {
+			retry_latch_cancel = true;
+			if (mode == 1)
+				route_test_first_reply_retry();
+			else
+				requester_send.refuse_enqueue_calls = 1;
+		}
+		memset(page, 0xa7, sizeof(page));
+		memcpy(before, page, sizeof(before));
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			(void)cluster_gcs_block_cr_fetch_and_wait(tag, UT_READ_SCN, page, &reason);
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(requester_send.calls, 1);
+		UT_ASSERT_EQ(process_interrupt_calls, mode == 0 ? 0 : 1);
+		UT_ASSERT_EQ(reply_cv_cancel_calls, 1);
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(memcmp(page, before, sizeof(page)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
+}
+
+/* Original epoch/admission cannot be replaced during this logical read,
+ * including a wake which has not received any response yet. */
+UT_TEST(test_target_wrapper_wait_drift_never_adopts_new_identity)
+{
+	BufferTag tag = route_test_tag();
+	int saved_node = cluster_node_id;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (mode = 0; mode < 4; mode++) {
+		char page[BLCKSZ];
+		char before[BLCKSZ];
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+
+		route_test_reset_public_target_requester();
+		if (mode == 0) {
+			route_test_first_reply_retry();
+			retry_latch_epoch_drift = true;
+		} else if (mode == 3)
+			route_seam.recheck_ok = false;
+		else {
+			requester_send.suppress_reply = true;
+			reply_wait_epoch_drift = mode == 1;
+			reply_wait_admission_drift = mode == 2;
+		}
+		memset(page, 0xa7, sizeof(page));
+		memcpy(before, page, sizeof(before));
+		UT_ASSERT_EQ(cluster_gcs_block_cr_fetch_and_wait(tag, UT_READ_SCN, page, &reason),
+					 CLUSTER_CR_BUILD_RETRYABLE);
+		UT_ASSERT_EQ(reason,
+					 mode < 2 ? CLUSTER_CR_BUILD_EPOCH_MISMATCH : CLUSTER_CR_BUILD_RF_DEFERRED);
+		UT_ASSERT_EQ(requester_send.calls, mode == 3 ? 0 : 1);
+		UT_ASSERT_EQ(reply_cv_cancel_calls, mode == 3 ? 0 : 1);
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(route_seam.left_admission.formation_epoch, UT_FORMATION_EPOCH);
+		UT_ASSERT_EQ(memcmp(page, before, sizeof(page)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_target_wrapper_denied_and_corrupt_full_never_publish)
+{
+	BufferTag tag = route_test_tag();
+	int saved_node = cluster_node_id;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (mode = 0; mode < 2; mode++) {
+		char page[BLCKSZ];
+		char before[BLCKSZ];
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+		sigjmp_buf jump;
+		sigjmp_buf *saved_stack = PG_exception_stack;
+		volatile bool caught = false;
+		volatile ClusterCrBuildResult result = CLUSTER_CR_BUILD_FULL;
+
+		route_test_reset_public_target_requester();
+		if (mode == 0) {
+			route_test_first_reply_retry();
+			requester_send.reply_steps[0].status = GCS_BLOCK_REPLY_R4_DENIED;
+		} else {
+			requester_send.corrupt_reply_checksum = true;
+			reply_cv_timed_sleep_raise = true;
+		}
+		memset(page, 0xa7, sizeof(page));
+		memcpy(before, page, sizeof(before));
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			result = cluster_gcs_block_cr_fetch_and_wait(tag, UT_READ_SCN, page, &reason);
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		UT_ASSERT_EQ(caught, mode == 1);
+		if (mode == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FAIL_CLOSED);
+			UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
+		}
+		UT_ASSERT_EQ(requester_send.calls, 1);
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(memcmp(page, before, sizeof(page)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
 }
 
 /* TARGET admission is the outermost gate.  Even an invalid read SCN cannot
@@ -3623,7 +3914,7 @@ UT_TEST(test_target_wrapper_status21_rechecks_private_scratch_then_copies_full)
 	UT_ASSERT(requester_send.slot_armed);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
-	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 4);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
 	UT_ASSERT(route_seam.enter_sequence < route_seam.lookup_sequence);
 	UT_ASSERT(route_seam.lookup_sequence < requester_send.send_sequence);
@@ -3687,7 +3978,7 @@ UT_TEST(test_target_wrapper_local_master_stages_request80_to_data_owner_and_retu
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 0);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
-	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 4);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
 	UT_ASSERT(route_seam.enter_sequence < route_seam.lookup_sequence);
 	UT_ASSERT(route_seam.lookup_sequence < requester_send.send_sequence);
@@ -3716,7 +4007,7 @@ UT_TEST(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot)
 
 	cluster_node_id = UT_REQUESTER_NODE;
 	route_test_reset_public_target_requester();
-	route_seam.recheck_ok = false;
+	route_seam.recheck_fail_at = 4; /* After the verified FULL, at final publication. */
 	memset(dst_page, 0xa7, sizeof(dst_page));
 	memcpy(original_page, dst_page, sizeof(original_page));
 
@@ -3729,7 +4020,7 @@ UT_TEST(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot)
 	UT_ASSERT(requester_send.slot_armed);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
-	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 4);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
 	UT_ASSERT(requester_send.send_sequence < route_seam.recheck_sequence);
 	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
@@ -4224,6 +4515,13 @@ UT_TEST(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation)
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
 	route_assert_refusal(GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED, 0);
+	UT_ASSERT_EQ(route_seam.refusal_observe_calls, 1);
+	UT_ASSERT_EQ(route_seam.refusal_stage, CLUSTER_R4_REFUSAL_MASTER);
+	UT_ASSERT_EQ(route_seam.refusal_reason, CLUSTER_CR_BUILD_RF_DEFERRED);
+	UT_ASSERT_EQ(route_seam.refusal_request_id, UT_REQUEST_ID);
+	UT_ASSERT_EQ(route_seam.refusal_epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(route_seam.refusal_read_scn, UT_READ_SCN);
+	UT_ASSERT_EQ(memcmp(&route_seam.refusal_tag, &request.base.tag, sizeof(BufferTag)), 0);
 
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE, UT_HOLDER_NODE,
 						  sizeof(forward));
@@ -4877,7 +5175,7 @@ UT_TEST(test_kind2_origin_capacity_covers_three_remote_c32_bursts)
 int
 main(void)
 {
-	UT_PLAN(97);
+	UT_PLAN(101);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -4947,7 +5245,11 @@ main(void)
 	UT_RUN(test_r4_remote_requester_arms_request80_waits_full_and_releases);
 	UT_RUN(test_r4_requester_status25_releases_then_retries_with_fresh_id);
 	UT_RUN(test_r4_requester_status26_fails_closed_without_retry_and_cleans_slot);
-	UT_RUN(test_target_wrapper_status25_retry_exhaustion_raises_53r90);
+	UT_RUN(test_target_wrapper_status25_beyond_old_limit_waits_for_full);
+	UT_RUN(test_target_wrapper_lost_reply_and_backpressure_redrive_same_id);
+	UT_RUN(test_target_wrapper_wait_cancellation_leaves_admission_and_slot);
+	UT_RUN(test_target_wrapper_wait_drift_never_adopts_new_identity);
+	UT_RUN(test_target_wrapper_denied_and_corrupt_full_never_publish);
 	UT_RUN(test_target_wrapper_disabled_returns_typed_before_lookup_or_wire);
 	UT_RUN(test_target_wrapper_status21_rechecks_private_scratch_then_copies_full);
 	UT_RUN(test_target_wrapper_local_master_stages_request80_to_data_owner_and_returns_full);

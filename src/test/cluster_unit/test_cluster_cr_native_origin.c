@@ -167,15 +167,37 @@ UT_TEST(native_inactive_stripe_is_not_origin_authority)
 	cluster_cr_native_prehistory_reader_unlock();
 }
 
+UT_TEST(r4_observation_layout_and_counter_bounds_are_exact)
+{
+	uint32 event;
+
+	CRShared = &native_shared;
+	UT_ASSERT_EQ(sizeof(native_shared.r4_event_counts), 71 * 8);
+	UT_ASSERT_EQ(cluster_cr_shmem_size(), MAXALIGN(sizeof(ClusterCRShared)));
+	for (event = 0; event < CLUSTER_R4_OBSERVATION_EVENT_COUNT; event++) {
+		pg_atomic_init_u64(&native_shared.r4_event_counts[event], 0);
+		cluster_cr_r4_event_bump(event);
+		UT_ASSERT_EQ(cluster_cr_r4_event_count(event), 1);
+	}
+	cluster_cr_r4_event_bump(CLUSTER_R4_OBSERVATION_EVENT_COUNT);
+	UT_ASSERT_EQ(cluster_cr_r4_event_count(CLUSTER_R4_OBSERVATION_EVENT_COUNT), 0);
+	printf("# R4 counter layout: shmem_bytes=%zu counter_bytes=%zu counter_growth_bytes=456\n",
+		   cluster_cr_shmem_size(), sizeof(native_shared.r4_event_counts));
+	CRShared = NULL;
+	cluster_cr_r4_event_bump(0);
+	UT_ASSERT_EQ(cluster_cr_r4_event_count(0), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(native_absent_shared_state_is_not_a_positive_proof);
 	UT_RUN(native_zero_prehistory_does_not_disable_own_epoch_zero_identity);
 	UT_RUN(native_disabled_or_later_epoch_has_no_alias_free_proof);
 	UT_RUN(native_wrong_origin_prehistory_and_unallocated_xids_refuse);
 	UT_RUN(native_inactive_stripe_is_not_origin_authority);
+	UT_RUN(r4_observation_layout_and_counter_bounds_are_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

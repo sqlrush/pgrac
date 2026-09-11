@@ -20,6 +20,39 @@ UT_DEFINE_GLOBALS();
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+int cluster_node_id = 1;
+static int refusal_log_calls;
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	UT_ASSERT_EQ(elevel, LOG);
+	refusal_log_calls++;
+	return true;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *func pg_attribute_unused())
+{}
 
 static uint64 observed[CLUSTER_R4_OBSERVATION_EVENT_COUNT];
 static ClusterSemanticAdmissionResult admission_result;
@@ -153,7 +186,7 @@ UT_TEST(test_event_domain_is_exact_and_adapter_is_one_to_one)
 	UT_ASSERT_EQ(CLUSTER_R4_EVENT_TX_ABORTED, 10);
 	UT_ASSERT_EQ(CLUSTER_R4_EVENT_SLOT_CAPACITY_RETRY, 13);
 	UT_ASSERT_EQ(CLUSTER_R4_EVENT_COUNT, 9);
-	UT_ASSERT_EQ(CLUSTER_R4_OBSERVATION_EVENT_COUNT, 14);
+	UT_ASSERT_EQ(CLUSTER_R4_OBSERVATION_EVENT_COUNT, 71);
 	for (i = 0; i < CLUSTER_R4_OBSERVATION_EVENT_COUNT; i++)
 		cluster_r4_observe((ClusterR4Event)i, CLUSTER_TX_RESOLVE_NONE,
 						   CLUSTER_CR_BUILD_NONE);
@@ -229,15 +262,46 @@ UT_TEST(test_holder_admission_refusal_is_not_an_event)
 	UT_ASSERT_EQ(leave_calls, 0);
 }
 
+UT_TEST(test_refusal_reasons_are_stage_separated_and_logs_are_bounded)
+{
+	BufferTag tag = { 0 };
+	int stage;
+	int reason;
+	int repetition;
+
+	reset_fixture();
+	refusal_log_calls = 0;
+	for (stage = 0; stage < CLUSTER_R4_REFUSAL_STAGE_COUNT; stage++)
+		for (reason = CLUSTER_CR_BUILD_TARGET_DISABLED; reason <= CLUSTER_CR_BUILD_PROTOCOL;
+			 reason++) {
+			for (repetition = 0; repetition < 4; repetition++)
+				cluster_r4_observe_refusal((ClusterR4RefusalStage)stage,
+										   (ClusterCrBuildReason)reason, &tag, 42, 9, 2, 1,
+										   (SCN)88);
+			UT_ASSERT_EQ(observed[CLUSTER_R4_REFUSAL_EVENT(stage, reason)], 4);
+		}
+	UT_ASSERT_EQ(observation_total(), 3 * 17 * 4);
+	UT_ASSERT_EQ(refusal_log_calls, 3 * 17 * 3); /* Calls 1, 2 and 4, not 3. */
+	cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_MASTER, CLUSTER_CR_BUILD_NONE, &tag, 42, 9, 2, 1,
+							   (SCN)88);
+	cluster_r4_observe_refusal((ClusterR4RefusalStage)-1, CLUSTER_CR_BUILD_PROTOCOL, &tag, 42, 9, 2,
+							   1, (SCN)88);
+	cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_HOLDER_SHIP, CLUSTER_CR_BUILD_PROTOCOL, NULL, 42,
+							   9, 2, 1, (SCN)88);
+	UT_ASSERT_EQ(observation_total(), 3 * 17 * 4);
+	UT_ASSERT_EQ(refusal_log_calls, 3 * 17 * 3);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_event_domain_is_exact_and_adapter_is_one_to_one);
 	UT_RUN(test_holder_full_is_observed_after_accepted_build);
 	UT_RUN(test_holder_retry_is_observed_with_typed_reason);
 	UT_RUN(test_holder_nonretryable_failure_is_observed);
 	UT_RUN(test_holder_admission_refusal_is_not_an_event);
+	UT_RUN(test_refusal_reasons_are_stage_separated_and_logs_are_bounded);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
