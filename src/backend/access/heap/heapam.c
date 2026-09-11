@@ -5199,6 +5199,36 @@ ReleaseBulkInsertStatePin(BulkInsertState bistate)
  * stored.  But note that any toasting of fields within the tuple data is NOT
  * reflected into *tup.
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Only INSERT/new-target owners call this after abandoning their old target.
+ * A different VM block in the same relation is a new logical request, not a
+ * new observation of the old one. Never erase a failure or namespace change. */
+static void
+cluster_heap_vm_retarget_after_repick(Buffer buffer, ResourceXAuxiliaryAcquireContext *context)
+{
+	BufferTag target;
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	uint64 r4_generation = 0;
+
+	if (!context->active || !context->reobserve || context->caller.failed_attempt != 0)
+		return;
+	BufferGetTag(buffer, &locator, &fork, &block);
+	InitBufferTag(&target, &locator, fork, block);
+	if (BufferTagsEqual(&context->resource, &target))
+		return;
+	if (target.spcOid != context->resource.spcOid || target.dbOid != context->resource.dbOid
+		|| target.relNumber != context->resource.relNumber
+		|| target.forkNum != VISIBILITYMAP_FORKNUM
+		|| context->resource.forkNum != VISIBILITYMAP_FORKNUM
+		|| cluster_resource_x_writer_path_snapshot(&r4_generation) != RESOURCE_X_WRITER_TARGET
+		|| r4_generation != context->r4_record_generation)
+		return;
+	memset(context, 0, sizeof(*context));
+}
+#endif
+
 void
 heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			int options, BulkInsertState bistate)
@@ -5210,6 +5240,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	/* PGRAC (spec-3.4a D3 / spec-3.4b D5): hoisted to function scope per PG style. */
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
@@ -5436,7 +5467,21 @@ cluster_heap_insert_retry:
 	vm_locked = false;
 	if (PageIsAllVisible(BufferGetPage(buffer)) && BufferIsValid(vmbuffer))
 	{
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
+		if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(&vmbuffer, NULL, NULL,
+														   &cluster_vm_context)) {
+			/* No receipt APPLY or tuple publication has occurred. The target
+			 * and its ITL/receipt plan must be selected again after this wait. */
+			UnlockReleaseBuffer(buffer);
+			if (BufferIsValid(vmbuffer))
+				ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+			goto cluster_heap_insert_retry;
+		}
+#else
 		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+#endif
 		vm_locked = true;
 	}
 
@@ -9055,10 +9100,11 @@ cluster_current_mx_stamp_published(ClusterCurrentMxStampPlan *plan)
 
 
 static bool
-cluster_current_mx_stamp_lock_buffer(
-	Buffer buffer, bool barrier_aware, ClusterBufferBarrierSiteId site,
-	bool *pin_replaced,
-	ClusterCurrentMxStampPlan *first, ClusterCurrentMxStampPlan *second)
+cluster_current_mx_stamp_lock_buffer(Buffer buffer, bool barrier_aware,
+									 ClusterBufferBarrierSiteId site, bool *pin_replaced,
+									 ClusterCurrentMxStampPlan *first,
+									 ClusterCurrentMxStampPlan *second,
+									 ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
 {
 	bool acquired = false;
 
@@ -9066,7 +9112,15 @@ cluster_current_mx_stamp_lock_buffer(
 		*pin_replaced = false;
 	PG_TRY();
 	{
-		if (barrier_aware)
+		if (context != NULL) {
+			Assert(pin_replaced != NULL);
+			if (site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW
+				|| site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST)
+				cluster_heap_vm_retarget_after_repick(buffer, context);
+			acquired = ClusterLockBufferExclusiveAuxiliaryAliasAware(
+				&buffer, alias, site != 0 ? &site : NULL, context);
+			*pin_replaced = !BufferIsValid(buffer);
+		} else if (barrier_aware)
 			acquired = ClusterLockBufferExclusiveBarrierAware(
 				buffer, site, pin_replaced);
 		else
@@ -9826,16 +9880,6 @@ cluster_xwait_has_remote_evidence(Page page, HeapTupleHeader tuple, TransactionI
 #endif /* USE_PGRAC_CLUSTER */
 
 /*
- * PGRAC (t/400 L3 item 3): bound for the BARRIER_CLOSED caller-owned unwind
- * at the pre-crit VM lock sites.  The all-visible clear race is one-shot per
- * page (whoever clears first removes the need for every later contender), so
- * the retry converges; the bound only guards the no-node-cache configuration
- * where the warmed conversion can be revoked before the re-attempt.  Once
- * exhausted, the plain LockBuffer restores the historical fail-closed ERROR.
- */
-#define CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES 16
-
-/*
  * PGRAC (t/400 L3 item 3): resolve a refused map-page conversion while the
  * caller holds NO content lock.  Blocking is legal here (the nested guard
  * only refuses a wait entered while a frozen-tag content lock is held);
@@ -9844,10 +9888,12 @@ cluster_xwait_has_remote_evidence(Page page, HeapTupleHeader tuple, TransactionI
  * without consulting the guard again.
  */
 static void
-cluster_heap_vm_barrier_warm(Buffer vmbuf)
+cluster_heap_vm_barrier_warm(Buffer *vmbuf, Buffer *alias,
+							 ResourceXAuxiliaryAcquireContext *context)
 {
-	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
-	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+	if (BufferIsValid(*vmbuf)
+		&& ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, alias, NULL, context))
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 }
 
 /*
@@ -9909,7 +9955,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		vm_locked;	/* PGRAC: pre-crit VM content lock held */
-	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	CommandId	pgrac_entry_cid = cid;	/* PGRAC: restored on barrier requalify */
 	TransactionId new_xmax;
 	uint16		new_infomask,
@@ -10467,24 +10513,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 	/* PGRAC: pre-crit VM content lock — see heap_insert. */
 	vm_locked = false;
-	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
-	{
-		if (vm_barrier_retries >= CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES)
-		{
-			PG_TRY();
-			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-			}
-			PG_CATCH();
-			{
-#ifdef USE_PGRAC_CLUSTER
-				cluster_current_mx_stamp_cancel(&cluster_current_mx_plan);
-#endif
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-		}
-		else
+	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer)) {
 		{
 			bool vm_acquired;
 			bool vm_pin_replaced = false;
@@ -10497,9 +10526,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 			PG_TRY();
 			{
-				vm_acquired = ClusterLockBufferExclusiveBarrierAware(
-					vmbuffer, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM,
-					&vm_pin_replaced);
+				vm_acquired = cluster_current_mx_stamp_lock_buffer(
+					vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM, &vm_pin_replaced,
+					&cluster_current_mx_plan, NULL, &cluster_vm_context, NULL);
 			}
 			PG_CATCH();
 			{
@@ -10522,7 +10551,6 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			 * combo-of-combo) and the abandoned replica-identity copy freed.
 			 */
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_plan);
-			vm_barrier_retries++;
 			cid = pgrac_entry_cid;
 			iscombo = false;
 			if (old_key_tuple != NULL && old_key_copied)
@@ -10540,11 +10568,19 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			if (!vm_pin_replaced)
 			{
-				cluster_heap_vm_barrier_warm(vmbuffer);
-				ReleaseBuffer(vmbuffer);
+				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
 			}
 			vmbuffer = InvalidBuffer;
 			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			page = BufferGetPage(buffer);
+			lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+			if (!ItemIdIsNormal(lp))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("heap delete tuple disappeared during VM requalification")));
+			tp.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+			tp.t_len = ItemIdGetLength(lp);
 			ClusterObserveBufferBarrierReceipt(
 				CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM,
 				CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
@@ -11037,7 +11073,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		vm_locked;		/* PGRAC: pre-crit VM content lock held */
 	bool		vm_locked_new;
 	bool		old_tuple_temp_locked = false;	/* PGRAC: t/400 L3 item 3 */
-	int			vm_barrier_retries = 0; /* PGRAC: t/400 L3 item 3 */
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ResourceXAuxiliaryAcquireContext cluster_vm_new_context = { 0 };
 	CommandId	pgrac_entry_cid = cid;	/* PGRAC: restored on barrier requalify */
 	bool		need_toast;
 	Size		newtupsize,
@@ -11912,16 +11949,12 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					 &refused_blocknum);
 
 		vm_acquired = cluster_current_mx_stamp_lock_buffer(
-			vmbuffer,
-			vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES,
-			CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
-			&vm_pin_replaced,
-			cluster_current_mx_recomposed
-				? &cluster_current_mx_temp_lock_plan : NULL,
-			NULL);
+			vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM, &vm_pin_replaced,
+			cluster_current_mx_recomposed ? &cluster_current_mx_temp_lock_plan : NULL, NULL,
+			&cluster_vm_context, &vmbuffer_new);
 		if (!vm_acquired)
 		{
-				/*
+			/*
 				 * PGRAC: vm barrier unwind (update pre-toast) — the old
 				 * tuple carries no temporary lock yet and nothing
 				 * irreversible has happened in this pass, so a full
@@ -11929,9 +11962,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				 * cid: a pass-1 combo cmax must not feed requalification or
 				 * be recombined into a combo-of-combo.
 				 */
-			vm_barrier_retries++;
-				cid = pgrac_entry_cid;
-				iscombo = false;
+			cid = pgrac_entry_cid;
+			iscombo = false;
 #ifdef USE_PGRAC_CLUSTER
 				cluster_current_mx_stamp_cancel(
 					&cluster_current_mx_temp_lock_plan);
@@ -11948,11 +11980,21 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			if (!vm_pin_replaced)
 			{
-				cluster_heap_vm_barrier_warm(vmbuffer);
-				ReleaseBuffer(vmbuffer);
+				cluster_heap_vm_barrier_warm(&vmbuffer, &vmbuffer_new, &cluster_vm_context);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
 			}
 			vmbuffer = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				page = BufferGetPage(buffer);
+				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
+				if (!ItemIdIsNormal(lp))
+					ereport(
+						ERROR,
+						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						 errmsg("heap update predecessor disappeared before TEMP_LOCK VM retry")));
+				oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+				oldtup.t_len = ItemIdGetLength(lp);
 				ClusterObserveBufferBarrierReceipt(
 					CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
 					CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
@@ -12899,13 +12941,12 @@ l_pgrac_reacquire:
 	{
 		bool		need_old = PageIsAllVisible(BufferGetPage(buffer))
 			&& BufferIsValid(vmbuffer);
-		bool		need_new = newbuf != buffer
-			&& PageIsAllVisible(BufferGetPage(newbuf))
-			&& BufferIsValid(vmbuffer_new);
-		bool		barrier_aware = vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES;
+		bool need_new = newbuf != buffer && PageIsAllVisible(BufferGetPage(newbuf))
+						&& BufferIsValid(vmbuffer_new);
 		Buffer		refused_vm = InvalidBuffer;
 		ClusterBufferBarrierSiteId refused_site = (ClusterBufferBarrierSiteId) 0;
 		bool		refused_pin_replaced = false;
+		bool refused_vm_is_new = false;
 		RelFileLocator refused_rlocator = {0};
 		ForkNumber refused_forknum = InvalidForkNumber;
 		BlockNumber refused_blocknum = InvalidBlockNumber;
@@ -12926,131 +12967,43 @@ l_pgrac_reacquire:
 		if (need_old && need_new && vmbuffer_new == vmbuffer)
 			need_new = false;	/* same map page: one lock covers both */
 
-		if (need_old && need_new
-			&& vmbuffer_new < vmbuffer)
-		{
-			if (!barrier_aware)
-			{
-				(void)cluster_current_mx_stamp_lock_buffer(
-					vmbuffer_new, false, (ClusterBufferBarrierSiteId)0,
-					NULL,
-					&cluster_current_mx_old_plan,
-					&cluster_current_mx_new_plan);
+		/* One adapter owns all declared aliases. Every failed acquisition
+		 * reaches the original caller-owned unwind, including after repeated
+		 * contention; a retry count is not an authority contradiction. */
+		for (int vm_leg = 0; vm_leg < 2; vm_leg++) {
+			bool new_first = need_old && need_new && vmbuffer_new < vmbuffer;
+			bool is_new = new_first ? vm_leg == 0 : vm_leg == 1;
+			Buffer *target = is_new ? &vmbuffer_new : &vmbuffer;
+			Buffer *alias = is_new ? &vmbuffer : &vmbuffer_new;
+			ResourceXAuxiliaryAcquireContext *context
+				= is_new ? &cluster_vm_new_context : &cluster_vm_context;
+			ClusterBufferBarrierSiteId site
+				= is_new ? (new_first ? CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST
+									  : CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW)
+						 : (new_first ? CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND
+									  : CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD);
+			Buffer requested;
+
+			if (is_new ? !need_new : !need_old)
+				continue;
+			requested = *target;
+			if (!cluster_current_mx_stamp_lock_buffer(
+					requested, true, site, &refused_pin_replaced, &cluster_current_mx_old_plan,
+					&cluster_current_mx_new_plan, context, alias)) {
+				refused_vm = requested;
+				refused_vm_is_new = is_new;
+				refused_site = site;
+				refused_rlocator = is_new ? new_vm_rlocator : old_vm_rlocator;
+				refused_forknum = is_new ? new_vm_forknum : old_vm_forknum;
+				refused_blocknum = is_new ? new_vm_blocknum : old_vm_blocknum;
+				if (refused_pin_replaced)
+					*target = InvalidBuffer;
+				break;
+			}
+			if (is_new)
 				vm_locked_new = true;
-				(void)cluster_current_mx_stamp_lock_buffer(
-					vmbuffer, false, (ClusterBufferBarrierSiteId)0,
-					NULL,
-					&cluster_current_mx_old_plan,
-					&cluster_current_mx_new_plan);
-				vm_locked = true;
-			}
 			else
-			{
-				if (cluster_current_mx_stamp_lock_buffer(
-						vmbuffer_new,
-						true,
-						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST,
-						&refused_pin_replaced,
-						&cluster_current_mx_old_plan,
-						&cluster_current_mx_new_plan))
-					vm_locked_new = true;
-				else
-				{
-					refused_vm = vmbuffer_new;
-					refused_site =
-						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST;
-					refused_rlocator = new_vm_rlocator;
-					refused_forknum = new_vm_forknum;
-					refused_blocknum = new_vm_blocknum;
-					if (refused_pin_replaced)
-						vmbuffer_new = InvalidBuffer;
-				}
-				if (refused_vm == InvalidBuffer)
-				{
-					if (cluster_current_mx_stamp_lock_buffer(
-							vmbuffer,
-							true,
-							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND,
-							&refused_pin_replaced,
-							&cluster_current_mx_old_plan,
-							&cluster_current_mx_new_plan))
-						vm_locked = true;
-					else
-					{
-						refused_vm = vmbuffer;
-						refused_site =
-							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND;
-						refused_rlocator = old_vm_rlocator;
-						refused_forknum = old_vm_forknum;
-						refused_blocknum = old_vm_blocknum;
-						if (refused_pin_replaced)
-							vmbuffer = InvalidBuffer;
-					}
-				}
-			}
-		}
-		else
-		{
-			if (need_old)
-			{
-				if (!barrier_aware)
-				{
-					(void)cluster_current_mx_stamp_lock_buffer(
-						vmbuffer, false, (ClusterBufferBarrierSiteId)0,
-						NULL,
-						&cluster_current_mx_old_plan,
-						&cluster_current_mx_new_plan);
-					vm_locked = true;
-				}
-				else if (cluster_current_mx_stamp_lock_buffer(
-							 vmbuffer,
-							 true,
-							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD,
-							 &refused_pin_replaced,
-							 &cluster_current_mx_old_plan,
-							 &cluster_current_mx_new_plan))
-					vm_locked = true;
-				else
-				{
-					refused_vm = vmbuffer;
-					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD;
-					refused_rlocator = old_vm_rlocator;
-					refused_forknum = old_vm_forknum;
-					refused_blocknum = old_vm_blocknum;
-					if (refused_pin_replaced)
-						vmbuffer = InvalidBuffer;
-				}
-			}
-			if (need_new && refused_vm == InvalidBuffer)
-			{
-				if (!barrier_aware)
-				{
-					(void)cluster_current_mx_stamp_lock_buffer(
-						vmbuffer_new, false, (ClusterBufferBarrierSiteId)0,
-						NULL,
-						&cluster_current_mx_old_plan,
-						&cluster_current_mx_new_plan);
-					vm_locked_new = true;
-				}
-				else if (cluster_current_mx_stamp_lock_buffer(
-							 vmbuffer_new,
-							 true,
-							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW,
-							 &refused_pin_replaced,
-							 &cluster_current_mx_old_plan,
-							 &cluster_current_mx_new_plan))
-					vm_locked_new = true;
-				else
-				{
-					refused_vm = vmbuffer_new;
-					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW;
-					refused_rlocator = new_vm_rlocator;
-					refused_forknum = new_vm_forknum;
-					refused_blocknum = new_vm_blocknum;
-					if (refused_pin_replaced)
-						vmbuffer_new = InvalidBuffer;
-				}
-			}
+				vm_locked = true;
 		}
 
 		if (refused_vm != InvalidBuffer)
@@ -13066,8 +13019,7 @@ l_pgrac_reacquire:
 			 */
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_old_plan);
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_new_plan);
-			Assert(refused_site != (ClusterBufferBarrierSiteId) 0);
-			vm_barrier_retries++;
+			Assert(refused_site != (ClusterBufferBarrierSiteId)0);
 			if (vm_locked_new)
 			{
 				LockBuffer(vmbuffer_new, BUFFER_LOCK_UNLOCK);
@@ -13095,11 +13047,6 @@ l_pgrac_reacquire:
 				{
 					LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
 					ReleaseBuffer(newbuf);
-					if (BufferIsValid(vmbuffer_new))
-					{
-						ReleaseBuffer(vmbuffer_new);
-						vmbuffer_new = InvalidBuffer;
-					}
 				}
 				if (heaptup != newtup)
 					heap_freetuple(heaptup);
@@ -13112,10 +13059,16 @@ l_pgrac_reacquire:
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 				if (!refused_pin_replaced)
-					cluster_heap_vm_barrier_warm(refused_vm);
+					cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+												 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+												 refused_vm_is_new ? &cluster_vm_new_context
+																   : &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
 					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
+				if (BufferIsValid(vmbuffer_new))
+					ReleaseBuffer(vmbuffer_new);
+				vmbuffer_new = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				page = BufferGetPage(buffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
@@ -13152,7 +13105,16 @@ l_pgrac_reacquire:
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			if (!refused_pin_replaced)
-				cluster_heap_vm_barrier_warm(refused_vm);
+				cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+											 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+											 refused_vm_is_new ? &cluster_vm_new_context
+															   : &cluster_vm_context);
+			if (BufferIsValid(vmbuffer))
+				ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+			if (BufferIsValid(vmbuffer_new))
+				ReleaseBuffer(vmbuffer_new);
+			vmbuffer_new = InvalidBuffer;
 			ClusterObserveBufferBarrierReceipt(
 				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
 				refused_rlocator, refused_forknum, refused_blocknum,
@@ -14288,6 +14250,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	bool		have_tuple_lock = false;
 	bool		cleared_all_frozen = false;
 #ifdef USE_PGRAC_CLUSTER
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	bool		cluster_did_lock_stamp = false;
 	uint64 cluster_writer_wait_deadline_us = 0;
 	bool		cluster_did_multixact_member_bind = false;
@@ -15469,10 +15432,32 @@ failed:
 	vm_locked = false;
 	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
 	{
-		(void)cluster_current_mx_stamp_lock_buffer(
-			vmbuffer, false, (ClusterBufferBarrierSiteId)0,
-			NULL,
-			&cluster_current_mx_lock_plan, NULL);
+		bool vm_pin_replaced = false;
+
+		if (!cluster_current_mx_stamp_lock_buffer(vmbuffer, false, (ClusterBufferBarrierSiteId)0,
+												  &vm_pin_replaced, &cluster_current_mx_lock_plan,
+												  NULL, &cluster_vm_context, NULL)) {
+			cluster_current_mx_stamp_cancel(&cluster_current_mx_lock_plan);
+			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
+			cluster_did_lock_stamp = false;
+			cluster_lock_needs_itl_slot = false;
+			cluster_lock_undo_ready = false;
+			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+			if (vm_pin_replaced)
+				vmbuffer = InvalidBuffer;
+			else
+				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
+			cluster_heap_lock_with_vm_repin(relation, block, *buffer, &vmbuffer);
+			page = BufferGetPage(*buffer);
+			lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+			if (!ItemIdIsNormal(lp))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("heap lock tuple disappeared during VM requalification")));
+			tuple->t_data = (HeapTupleHeader)PageGetItem(page, lp);
+			tuple->t_len = ItemIdGetLength(lp);
+			goto l3;
+		}
 		vm_locked = true;
 	}
 

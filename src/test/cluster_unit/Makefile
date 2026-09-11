@@ -2080,7 +2080,10 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
-		test_cluster_heap_lock_dispatch.inc \
+		test_cluster_heap_lock_dispatch.inc test_cluster_heap_vm_lock_entry.inc \
+		test_cluster_heap_vm_insert.inc test_cluster_heap_vm_tuple_lock.inc \
+		test_cluster_heap_vm_update.inc test_cluster_heap_vm_unwind_helpers.inc \
+		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
@@ -2683,7 +2686,7 @@ test_cluster_pcm_aux_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_
 test_cluster_pcm_aux_reobserve: test_cluster_pcm_aux_reobserve.c unit_test.h \
 		test_cluster_pcm_aux_handoff.inc test_cluster_pcm_aux_observation.inc \
 		test_cluster_pcm_aux_reobserve_owner.inc test_cluster_pcm_aux_reobserve_context.inc \
-		test_cluster_pcm_aux_prepare.inc
+		test_cluster_pcm_aux_prepare.inc test_cluster_heap_vm_lock_entry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
@@ -2694,8 +2697,16 @@ test_cluster_pcm_aux_reobserve_owner.inc: $(top_srcdir)/src/backend/storage/buff
 	     /^cluster_bufmgr_pcm_x_writer_clear\(/ { print "static void"; emit=1; clear++ } \
 	     /^ClusterBufferAuxiliaryObservationUnowned\(/ { print "bool"; emit=1; unowned++ } \
 	     /^ClusterLockBufferExclusiveAuxiliaryAware\(/ { print "bool"; emit=1; consumer++ } \
+	     /^ClusterLockBufferExclusiveAuxiliaryAliasAware\(/ { print "bool"; emit=1; aliases++ } \
+	     /^ClusterLockBufferExclusiveBarrierAware\(/ { print "bool"; emit=1; barrier++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 2 || array != 1 || find != 2 || clear != 1 || unowned != 1 || consumer != 1) exit 1 }' $< > $@.tmp
+	     END { if (types != 2 || array != 1 || find != 2 || clear != 1 || unowned != 1 || consumer != 1 || aliases != 1 || barrier != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_lock_entry.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_vm_retarget_after_repick\(/ { print "static void"; emit=1; retarget++ } \
+	     /^cluster_current_mx_stamp_lock_buffer\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || retarget != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_reobserve_context.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2736,7 +2747,53 @@ test_cluster_pcm_aux_mutation_consumer.inc: $(top_srcdir)/src/test/cluster_tap/a
 	     emit { print } /^}/ { emit=0 } END { if (proof != 1 || consumer != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_vm_insert.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_insert\(/ { in_insert=1 } \
+	     in_insert && !found && /^\tvm_locked = false;/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; complete++ } \
+	     /^}/ { in_insert=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_tuple_lock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple\(/ { in_lock=1 } \
+	     in_lock && !found && /^\tvm_locked = false;/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; complete++ } \
+	     /^}/ { in_lock=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_update.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/pre-crit VM content locks \(both heap pages\)/ { armed=1 } \
+	     armed && !found && /^\tvm_locked = false;/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; complete++ } \
+	     END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_unwind_helpers.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_vm_barrier_warm\(/ { print "static void"; emit=1; warm++ } \
+	     /^cluster_heap_lock_with_vm_repin\(/ { print "void"; emit=1; repin++ } \
+	     emit { print } /^}/ { emit=0 } END { if (warm != 1 || repin != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_delete.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { in_delete=1 } \
+	     in_delete && !found && /^\tvm_locked = false;/ { emit=1; found++ } \
+	     emit { print } emit && /^\t}/ { emit=0; complete++ } \
+	     /^}/ { in_delete=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vm_pretoast.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && !found && /^[[:space:]]*vm_locked = false;/ { emit=1; found++ } \
+	     emit { print; s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	            depth+=opens-closes; if(opens) opened=1; \
+	            if(opened && depth==0) { emit=0; complete++ } } \
+	     /^}/ { in_update=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c unit_test.h \
+		test_cluster_heap_vm_insert.inc test_cluster_heap_vm_tuple_lock.inc \
+		test_cluster_heap_vm_update.inc test_cluster_heap_vm_unwind_helpers.inc \
+		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_aux_vm_mutation.inc test_cluster_pcm_aux_heap_repin.inc \
 		test_cluster_pcm_aux_fsm_mutation.inc test_cluster_pcm_aux_mutation_consumer.inc \
 		test_cluster_pcm_aux_page_space.inc

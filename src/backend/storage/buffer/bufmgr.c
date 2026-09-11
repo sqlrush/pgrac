@@ -10866,28 +10866,41 @@ bool
 ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer,
 										 struct ResourceXAuxiliaryAcquireContext *context)
 {
+	return ClusterLockBufferExclusiveAuxiliaryAliasAware(buffer, NULL, NULL, context);
+}
+
+bool
+ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
+											  const ClusterBufferBarrierSiteId *site,
+											  struct ResourceXAuxiliaryAcquireContext *context)
+{
 	bool barrier_refused = false;
 	bool replaced = false;
 	bool transient_refused = false;
+	bool equal_alias;
 
 	Assert(buffer != NULL && BufferIsValid(*buffer) && context != NULL);
+	equal_alias = alias != NULL && alias != buffer && *alias == *buffer;
 #ifdef USE_PGRAC_CLUSTER
 	if (!BufferIsLocal(*buffer) && cluster_pcm_is_active()) {
 		BufferDesc *buf = GetBufferDescriptor(*buffer - 1);
 
-		/* One explicit handle cannot repair unknown aliases after all private
-		 * pins have been handed off. Reject misuse before releasing any pin. */
-		if (GetPrivateRefCount(*buffer) != 1
+		/* Name every private pin relinquished by handoff. An undeclared
+		 * alias cannot be repaired after retag; reject it before any unpin. */
+		if (GetPrivateRefCount(*buffer) != 1 + (equal_alias ? 1 : 0)
 			|| cluster_pcm_x_revoke_finish_mode(&buf->tag, 0) != CLUSTER_PCM_X_REVOKE_FINISH_DROP
 			|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_INVALID, buf,
 															"auxiliary reobserve handle contract");
 	}
 #endif
-	LockBufferInternal(*buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, NULL, &replaced,
+	LockBufferInternal(*buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, site, &replaced,
 					   &transient_refused, context);
-	if (replaced)
+	if (replaced) {
 		*buffer = InvalidBuffer;
+		if (equal_alias)
+			*alias = InvalidBuffer;
+	}
 	if (barrier_refused || replaced || transient_refused)
 		return false;
 #ifdef USE_PGRAC_CLUSTER
