@@ -8733,7 +8733,7 @@ UT_TEST(test_145t_owned_commit_and_open_resume_without_a_new_utility)
 int
 main(void)
 {
-	UT_PLAN(239);
+	UT_PLAN(240);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
