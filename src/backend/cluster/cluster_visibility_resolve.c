@@ -1066,13 +1066,47 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 			ClusterTxResolution resolution;
 			ClusterTxResolveReason reason;
 			ClusterTxOutcome outcome;
+			ClusterUndoVerdictResult retained = {
+				.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED,
+				.commit_scn = InvalidScn,
+			};
+			bool pair = ref.has_cached_status && SCN_VALID(ref.cached_commit_scn);
+			bool completed = false;
 
-			memset(&resolution, 0, sizeof(resolution));
-			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-			outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution,
-											   &reason);
-			if (!cluster_vis_from_exact_tx_resolution(outcome, &resolution, out))
-				out->diagnostic_reason = cluster_tx_resolve_reason_name(reason);
+			/* The DATA record may outlive its canonical TT occupant. Use
+			 * the same origin C1b conjunction as the remote retained-ref
+			 * path, not the page stamp alone or native tuple visibility. */
+			if (pair) {
+				retained = cluster_undo_verdict_resolve_freshref_c1b_pair(
+					(int)ref.origin_node_id, ref.undo_segment_id, raw_xid, ref.local_xid,
+					ref.tt_slot_id, ref.cluster_epoch, ref.cached_commit_scn, read_scn);
+				if (retained.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+					&& retained.commit_scn == ref.cached_commit_scn
+					&& cluster_epoch_get_current() == (uint64)ref.cluster_epoch)
+					completed = cluster_vis_from_undo_verdict(retained, out);
+				else if (retained.kind != CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED) {
+					out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+					out->status = CLUSTER_TT_STATUS_UNKNOWN;
+					out->commit_scn = InvalidScn;
+					out->diagnostic_reason = "RETAINED_PROOF_UNPROVEN";
+					cluster_vis_log_freshref_unproven(raw_xid, &ref, pair, retained, &locator,
+													  CLUSTER_TX_UNKNOWN,
+													  CLUSTER_TX_RESOLVE_PROTOCOL);
+					completed = true;
+				}
+			}
+
+			if (!completed) {
+				memset(&resolution, 0, sizeof(resolution));
+				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
+												   &resolution, &reason);
+				if (!cluster_vis_from_exact_tx_resolution(outcome, &resolution, out)) {
+					out->diagnostic_reason = cluster_tx_resolve_reason_name(reason);
+					cluster_vis_log_freshref_unproven(raw_xid, &ref, pair, retained, &locator,
+													  outcome, reason);
+				}
+			}
 		}
 		PG_FINALLY();
 		{

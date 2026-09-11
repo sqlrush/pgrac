@@ -202,6 +202,7 @@ static ClusterUndoTTSlotRef ut_exit_ref;
 static bool ut_exit_exact_proof;
 static bool ut_full_scratch_fixture;
 static int ut_full_scratch_scenario;
+static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
 static sigjmp_buf ut_error_jump;
@@ -360,6 +361,7 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_exit_exact_proof = false;
 	ut_full_scratch_fixture = false;
 	ut_full_scratch_scenario = 0;
+	ut_current_epoch = UT_CLUSTER_EPOCH;
 	ut_native_calls = 0;
 	ut_hint_mutations = 0;
 	ut_error_armed = false;
@@ -531,6 +533,22 @@ cluster_undo_verdict_resolve_freshref_c1b_pair(
 {
 	ut_calls.wire++;
 	ut_calls.pair_resolve++;
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12) {
+		UT_ASSERT_EQ(origin_node, ut_exit_ref.origin_node_id);
+		UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
+		UT_ASSERT_EQ(ref_xid, UT_RAW_XID);
+		UT_ASSERT_EQ(undo_segment_id, UT_UNDO_SEGMENT);
+		UT_ASSERT_EQ(expected_tt_slot_id, UT_TT_SLOT);
+		UT_ASSERT_EQ(ref_epoch, ut_current_epoch);
+		UT_ASSERT_EQ(cached_commit_scn, ut_exit_ref.cached_commit_scn);
+		UT_ASSERT_EQ(read_scn, UT_READ_SCN);
+		UT_ASSERT(cluster_vis_resolve_in_flight());
+		if (ut_full_scratch_scenario == 19)
+			ut_current_epoch++;
+		if (ut_full_scratch_scenario == 20)
+			pg_re_throw();
+		return ut_pair_verdict;
+	}
 	UT_ASSERT_EQ(origin_node, UT_PEER_NODE);
 	UT_ASSERT_EQ(undo_segment_id, UT_UNDO_SEGMENT);
 	UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
@@ -549,6 +567,12 @@ cluster_vis_freshref_c1b_pair_request_eligible(
 	int32 origin_node, int32 local_node, uint32 segment_id,
 	uint32 expected_tt_slot_id)
 {
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12)
+		return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID && has_cached_status
+			   && SCN_VALID(cached_commit_scn) && ref_epoch == ut_current_epoch
+			   && current_epoch == ut_current_epoch && origin_node == UT_PEER_NODE
+			   && local_node == UT_SELF_NODE && segment_id == UT_UNDO_SEGMENT
+			   && expected_tt_slot_id == UT_TT_SLOT;
 	return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID
 		   && has_cached_status && cached_commit_scn == UT_COMMIT_SCN
 		   && ref_epoch == UT_CLUSTER_EPOCH
@@ -719,7 +743,7 @@ uint64
 cluster_epoch_get_current(void)
 {
 	ut_calls.durable++;
-	return UT_CLUSTER_EPOCH;
+	return ut_current_epoch;
 }
 
 ClusterRemoteXactOutcome
@@ -756,6 +780,19 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	ut_calls.exact_resolve++;
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12) {
+		memset(out, 0, sizeof(*out));
+		UT_ASSERT(cluster_vis_resolve_in_flight());
+		UT_ASSERT_EQ(locator->xid, UT_RAW_XID);
+		if (ut_full_scratch_scenario == 21 || ut_full_scratch_scenario == 24) {
+			out->outcome = CLUSTER_TX_IN_PROGRESS;
+			out->locator_echo = *locator;
+			*reason_out = CLUSTER_TX_RESOLVE_NONE;
+			return CLUSTER_TX_IN_PROGRESS;
+		}
+		*reason_out = CLUSTER_TX_RESOLVE_XID_MISMATCH;
+		return CLUSTER_TX_UNKNOWN; /* canonical TT already reused */
+	}
 	if (ut_exit_exact_proof) {
 		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 		UT_ASSERT_EQ(locator->xid, UT_RAW_XID);
@@ -1606,6 +1643,36 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 	slot->wrap = 7;
 	slot->undo_segment_head.raw[0] = UINT64_C(0x1234010203040506);
 	slot->undo_segment_head.raw[1] = UINT64_C(0x0708090a0b0c0d0e);
+	if (scenario >= 12) {
+		slot->flags = ITL_FLAG_COMMITTED;
+		slot->commit_scn = UT_COMMIT_SCN;
+		ut_exit_ref.has_cached_status = true;
+		ut_exit_ref.cached_commit_scn = UT_COMMIT_SCN;
+		ut_exit_ref.cluster_epoch = UT_CLUSTER_EPOCH;
+		ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		ut_pair_verdict.commit_scn = UT_COMMIT_SCN;
+		if (scenario == 13 || scenario == 21 || scenario == 24)
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		if (scenario == 14)
+			ut_pair_verdict.commit_scn++;
+		if (scenario == 15)
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		if (scenario == 16)
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+		if (scenario == 17)
+			ut_exit_ref.has_cached_status = false;
+		if (scenario == 18)
+			ut_exit_ref.cached_commit_scn = InvalidScn;
+		if (scenario == 22) {
+			slot->commit_scn = UT_READ_SCN + 1;
+			ut_exit_ref.cached_commit_scn = UT_READ_SCN + 1;
+			ut_pair_verdict.commit_scn = UT_READ_SCN + 1;
+		}
+		if (scenario == 23)
+			ut_exit_ref.cluster_epoch = ut_current_epoch = 0;
+		if (scenario == 24)
+			slot->flags = ITL_FLAG_ACTIVE; /* precommit stamp is not terminal */
+	}
 	if (scenario == 9)
 		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
 	if (scenario == 10)
@@ -1644,10 +1711,22 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 	}
 	PG_END_TRY();
 	ut_error_armed = false;
-	UT_ASSERT_EQ(caught, scenario >= 4);
-	if (!caught)
-		UT_ASSERT_EQ(visible, scenario == 0 ? !deleting : deleting);
-	UT_ASSERT_EQ(ut_calls.exact_resolve, scenario < 8 ? 1 : 0);
+	if (scenario >= 12) {
+		bool expected_error = scenario >= 13 && scenario <= 20;
+		bool expected_exact = scenario == 13 || scenario == 17 || scenario == 18 || scenario == 21
+							  || scenario == 24;
+
+		UT_ASSERT_EQ(caught, expected_error);
+		if (!caught)
+			UT_ASSERT_EQ(visible, scenario == 12 || scenario == 23 ? !deleting : deleting);
+		UT_ASSERT_EQ(ut_calls.exact_resolve, expected_exact ? 1 : 0);
+		UT_ASSERT_EQ(ut_calls.pair_resolve, scenario == 17 || scenario == 18 ? 0 : 1);
+	} else {
+		UT_ASSERT_EQ(caught, scenario >= 4);
+		if (!caught)
+			UT_ASSERT_EQ(visible, scenario == 0 ? !deleting : deleting);
+		UT_ASSERT_EQ(ut_calls.exact_resolve, scenario < 8 ? 1 : 0);
+	}
 	UT_ASSERT(!cluster_vis_resolve_in_flight());
 	UT_ASSERT(PG_exception_stack == NULL);
 	UT_ASSERT_EQ(ut_calls.clog, 0);
@@ -1706,10 +1785,46 @@ UT_TEST(test_full_scratch_local_exact_error_releases_resolution_scope)
 	ut_full_scratch_exact_case(true, true, 0);
 }
 
+UT_TEST(test_full_scratch_local_reused_tt_retained_xmin)
+{
+	ut_full_scratch_exact_case(false, true, 12);
+}
+
+UT_TEST(test_full_scratch_local_reused_tt_retained_xmax)
+{
+	ut_full_scratch_exact_case(true, true, 12);
+}
+
+UT_TEST(test_full_scratch_retained_scn_both_origins_and_tuple_sides)
+{
+	for (int origin = 0; origin < 2; origin++)
+		for (int deleting = 0; deleting < 2; deleting++) {
+			ut_full_scratch_exact_case(deleting, origin, 12);
+			ut_full_scratch_exact_case(deleting, origin, 22);
+			ut_full_scratch_exact_case(deleting, origin, 23);
+		}
+}
+
+UT_TEST(test_full_scratch_retained_unknown_malformed_missing_and_epoch_change)
+{
+	for (int scenario = 13; scenario <= 19; scenario++)
+		for (int deleting = 0; deleting < 2; deleting++)
+			ut_full_scratch_exact_case(deleting, true, scenario);
+}
+
+UT_TEST(test_full_scratch_retained_pair_error_unwinds_then_exact_live_works)
+{
+	ut_full_scratch_exact_case(false, true, 20);
+	for (int deleting = 0; deleting < 2; deleting++) {
+		ut_full_scratch_exact_case(deleting, true, 21);
+		ut_full_scratch_exact_case(deleting, true, 24);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(27);
 	UT_RUN(test_peer_exact_memo_hit_propagates_committed);
 	UT_RUN(test_peer_exact_memo_hit_propagates_aborted);
 	UT_RUN(test_peer_exact_synthetic_unknown_hit_stays_failclosed_without_wire);
@@ -1732,6 +1847,11 @@ main(void)
 	UT_RUN(test_full_scratch_exact_status_and_scn_polarity_both_origins);
 	UT_RUN(test_full_scratch_unknown_prepared_bad_scn_and_locator_stay_protective);
 	UT_RUN(test_full_scratch_local_exact_error_releases_resolution_scope);
+	UT_RUN(test_full_scratch_local_reused_tt_retained_xmin);
+	UT_RUN(test_full_scratch_local_reused_tt_retained_xmax);
+	UT_RUN(test_full_scratch_retained_scn_both_origins_and_tuple_sides);
+	UT_RUN(test_full_scratch_retained_unknown_malformed_missing_and_epoch_change);
+	UT_RUN(test_full_scratch_retained_pair_error_unwinds_then_exact_live_works);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
