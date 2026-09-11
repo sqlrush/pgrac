@@ -729,9 +729,10 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 
 		/* The warm helper itself may only run with no content lock held:
 		 * it must take and drop the map-page lock, nothing else. */
-		static const char *const warm_order[] = { "cluster_heap_vm_barrier_warm(Buffer vmbuf)",
-												  "LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE)",
-												  "LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK)" };
+		static const char *const warm_order[]
+			= { "cluster_heap_vm_barrier_warm(Buffer *vmbuf, Buffer *alias,",
+				"ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, alias, NULL, context)",
+				"LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK)" };
 
 		assert_ordered(heapam, warm_order, lengthof(warm_order));
 		assert_ordered(heapam, pretoast_order, lengthof(pretoast_order));
@@ -1113,6 +1114,8 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 			"cluster_current_mx_stamp_lock_buffer(");
 		static const char *const stamp_helper_chain[]
 			= { "cluster_current_mx_stamp_lock_buffer(",
+				"if (context != NULL)",
+				"ClusterLockBufferExclusiveAuxiliaryAliasAware(",
 				"if (barrier_aware)",
 				"ClusterLockBufferExclusiveBarrierAware(",
 				"buffer, site, pin_replaced)",
@@ -1125,10 +1128,9 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 		if (stamp_helper != NULL)
 			assert_ordered(stamp_helper, stamp_helper_chain,
 						   lengthof(stamp_helper_chain));
-		/* One call is centralized in the current-MX cleanup helper; the
-		 * delete VM site remains the sole direct caller. */
-		UT_ASSERT_EQ(count_occurrences(heapam,
-									   "ClusterLockBufferExclusiveBarrierAware("), 2);
+		/* Legacy compatibility stays centralized in the MX helper. Primary
+		 * VM consumers use the explicit-context branch, including DELETE. */
+		UT_ASSERT_EQ(count_occurrences(heapam, "ClusterLockBufferExclusiveBarrierAware("), 1);
 
 		update = strstr(heapam, "PGRAC: BARRIER_CLOSED caller-owned unwind");
 		UT_ASSERT(update != NULL);
