@@ -718,6 +718,7 @@ _classify_owners(
     "HEAP_PRODUCER_ENTRYPOINT",
     "src/backend/access/heap/heapam.c",
     (
+        "cluster_heap_lock_update_predecessor",
         "heap_delete",
         "heap_insert",
         "heap_lock_tuple",

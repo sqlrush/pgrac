@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_itl.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "port/pg_crc32c.h"
@@ -1310,6 +1311,77 @@ UT_TEST(test_ctrc_itl_cleanout_rewrites_only_exact_terminal_slot)
 
 /* MXA-T24: CLOSE racing an old PREPARED receipt either observes exact APPLY
  * or keeps the range blocked; time and backend loss never cancel it. */
+/* Real cleaner image transition; page admission, WAL and lock services are
+ * boundary seams. The slot proof and tuple rewrite are the product C. */
+static int image_finishes, image_aborts, image_unlocks, image_leaves;
+
+static bool
+test_cleaner_terminal_image(Page image, const ClusterCtrcReceipt *receipt,
+							ClusterCtrcTerminalStatus terminal_status, SCN commit_scn)
+{
+	ClusterCtrcItlCleanoutApplyResult apply_result;
+	XLogRecPtr cleanout_lsn;
+
+#define GenericXLogAbort(state) ((void)image_aborts++)
+#define UnlockReleaseBuffer(buffer) ((void)image_unlocks++)
+#define cluster_semantic_activation_leave(admission) ((void)image_leaves++)
+#define GenericXLogFinish(state) (image_finishes++, (XLogRecPtr)100)
+#include "test_cluster_ctrc_terminal_image.inc"
+#undef GenericXLogAbort
+#undef UnlockReleaseBuffer
+#undef cluster_semantic_activation_leave
+#undef GenericXLogFinish
+	UT_ASSERT_EQ(cleanout_lsn, 100);
+	return true;
+}
+
+UT_TEST(test_real_cleaner_terminal_image_closes_plain_lock_reference)
+{
+	int leg;
+
+	for (leg = 0; leg < 4; leg++) {
+		PGAlignedBlock storage = { 0 };
+		Page image = (Page)storage.data;
+		PageHeader header = (PageHeader)image;
+		ClusterCtrcReceipt receipt = { 0 };
+		ClusterItlSlotData *slot;
+		HeapTupleHeader tuple;
+		bool applied;
+
+		receipt.key = test_key();
+		receipt.target = test_exact_itl_target();
+		receipt.target.itl_class = 2;
+		header->pd_flags = PD_HAS_ITL;
+		header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+		header->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
+		header->pd_upper = header->pd_special - MAXALIGN(SizeofHeapTupleHeader);
+		PageSetPageSizeAndVersion(image, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+		ItemIdSetNormal(PageGetItemId(image, FirstOffsetNumber), header->pd_upper,
+						SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader)PageGetItem(image, PageGetItemId(image, FirstOffsetNumber));
+		tuple->t_hoff = SizeofHeapTupleHeader;
+		tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+		HeapTupleHeaderSetXmin(tuple, 800);
+		HeapTupleHeaderSetXmax(tuple, receipt.target.itl_xid);
+		slot = &ClusterPageGetItlSlots(image)[receipt.target.itl_slot_index];
+		slot->xid = receipt.target.itl_xid;
+		slot->wrap = receipt.target.itl_slot_wrap + (leg == 3 ? 1 : 0);
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		memcpy(&slot->undo_segment_head, receipt.target.uba, sizeof(slot->undo_segment_head));
+		image_finishes = image_aborts = image_unlocks = image_leaves = 0;
+		applied = test_cleaner_terminal_image(
+			image, &receipt, leg == 2 ? CTRC_TERMINAL_ABORTED : CTRC_TERMINAL_COMMITTED,
+			leg == 0 || leg == 2 ? InvalidScn : 900);
+		UT_ASSERT_EQ(applied, leg == 1 || leg == 2);
+		UT_ASSERT_EQ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0, applied);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 800);
+		UT_ASSERT_EQ(image_finishes, applied ? 1 : 0);
+		UT_ASSERT_EQ(image_aborts, applied ? 0 : 1);
+		UT_ASSERT_EQ(image_unlocks, applied ? 0 : 1);
+		UT_ASSERT_EQ(image_leaves, applied ? 0 : 1);
+	}
+}
+
 UT_TEST(test_ctrc_close_race_drains_prepared_without_timeout_cancellation)
 {
 	ClusterCtrcParticipantEntry participant;
@@ -3041,6 +3113,7 @@ main(void)
 		CTRC_TEST_ENTRY(
 			test_ctrc_itl_uba_registers_before_mutation_and_only_exact_projection_discharges),
 		CTRC_TEST_ENTRY(test_ctrc_itl_cleanout_rewrites_only_exact_terminal_slot),
+		CTRC_TEST_ENTRY(test_real_cleaner_terminal_image_closes_plain_lock_reference),
 		CTRC_TEST_ENTRY(test_ctrc_close_race_drains_prepared_without_timeout_cancellation),
 		CTRC_TEST_ENTRY(test_ctrc_exact_target_absence_and_ambiguity_cleanout_table),
 		CTRC_TEST_ENTRY(test_ctrc_terminal_member_cleanout_semantics_cross_product),

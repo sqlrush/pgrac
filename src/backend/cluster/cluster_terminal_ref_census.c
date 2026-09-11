@@ -42,6 +42,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_itl.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -7831,6 +7832,9 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
+	if (receipt->target.itl_class == 2)
+		(void)cluster_itl_clear_terminal_lock_refs(
+			image, &ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);
 	cleanout_lsn = GenericXLogFinish(xlog_state);
 	UnlockReleaseBuffer(buffer);
 	cluster_semantic_activation_leave(&admission);

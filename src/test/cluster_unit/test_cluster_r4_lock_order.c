@@ -316,6 +316,7 @@ static uint8 ut_hot_last_pcm_snapshot_state;
 static bool ut_itl_census_force_pcm_n;
 static bool ut_itl_census_change_writer_activation_projection;
 static bool ut_itl_census_replace_current_page;
+static bool ut_itl_census_change_page_geometry;
 static uint64 ut_itl_census_pcm_reservation_token;
 static uint32 ut_itl_census_pcm_flags;
 static bool ut_itl_census_stale_first_round_full;
@@ -1185,6 +1186,14 @@ cluster_tx_resolve_exact_admitted(
 		current_slots[4].commit_scn = (SCN) 8001;
 		PageSetLSN(BufferGetPage((Buffer) 1),
 				   (XLogRecPtr) UINT64_C(0x334456));
+		if (ut_itl_census_change_page_geometry) {
+			Page page = BufferGetPage((Buffer)1);
+			PageHeader header = (PageHeader)page;
+
+			header->pd_lower += sizeof(ItemIdData);
+			header->pd_upper -= MAXALIGN(64);
+			ItemIdSetUnused(PageGetItemId(page, PageGetMaxOffsetNumber(page)));
+		}
 	}
 	if (ut_itl_census_stale_first_round_full
 		&& ut_itl_census_resolve_calls == 0)
@@ -2914,6 +2923,98 @@ UT_TEST(test_35_scratch_mvcc_uses_exact_ref_without_hints_or_live_page)
 	UT_ASSERT(memcmp(scratch_storage, scratch_before, BLCKSZ) == 0);
 }
 
+UT_TEST(test_post_snapshot_matching_xmin_uses_holder_full)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class relation_form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	HeapHotSearchResultKind kind;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	ut_hot_live_ref.local_xid = UT_HOT_LIVE_XMIN;
+	ClusterPageGetItlSlots((Page)fixture.live_page)[2].write_scn = UT_HOT_READ_SCN + 1;
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, UINT64_C(0x123450));
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &relation_form;
+	relation_form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+
+	kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result, NULL,
+										 true);
+	UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
+	UT_ASSERT(fixture.fetch_calls > 0);
+	UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_live_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_cr_calls, 0);
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_post_snapshot_own_xmin_keeps_command_visibility)
+{
+	int leg;
+
+	for (leg = 0; leg < 3; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		RelationData relation = { 0 };
+		FormData_pg_class relation_form = { 0 };
+		SnapshotData snapshot = { 0 };
+		ItemPointerData tid;
+		HeapHotSearchResultKind kind;
+		TransactionId xmin = leg == 2 ? UT_HOT_LIVE_XMIN : GetTopTransactionId();
+		Page page;
+
+		ut_r4_hot_init_product_fixture(&fixture, &result);
+		page = (Page)fixture.live_page;
+		HeapTupleHeaderSetXmin(ut_r4_hot_tuple_at(page, UT_HOT_ROOT_OFF), xmin);
+		ClusterPageGetItlSlots(page)[2].xid = xmin;
+		ClusterPageGetItlSlots(page)[2].write_scn = UT_HOT_READ_SCN + 1;
+		ut_hot_live_ref.local_xid = xmin;
+		ut_hot_live_ref.origin_node_id = leg == 1 ? 1 : cluster_node_id;
+		ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, page, UT_HOT_READ_SCN,
+										  UINT64_C(0x123450));
+		relation.rd_id = UT_HOT_TABLE_OID;
+		relation.rd_rel = &relation_form;
+		relation_form.relpersistence = RELPERSISTENCE_PERMANENT;
+		snapshot.snapshot_type = SNAPSHOT_MVCC;
+		snapshot.read_scn = UT_HOT_READ_SCN;
+		snapshot.read_epoch = 9;
+		snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
+											 NULL, true);
+		if (leg == 0) {
+			UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_BUFFER_BACKED);
+			UT_ASSERT_EQ(fixture.fetch_calls, 0);
+			UT_ASSERT_EQ(ut_live_visibility_calls, 1);
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(result.tuple.t_data), xmin);
+		} else {
+			/* Neither a foreign numeric collision nor another local xid is ours. */
+			UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
+			UT_ASSERT(fixture.fetch_calls > 0);
+			UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+		}
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+		ut_hot_production_core_active = false;
+		ut_hot_product_fixture = NULL;
+		ut_hot_live_ref_page = NULL;
+		BufferBlocks = NULL;
+	}
+}
+
 UT_TEST(test_36_production_hot_core_full_result_is_owned)
 {
 	UtR4HotProductFixture fixture;
@@ -3444,6 +3545,7 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture,
 	ut_itl_census_force_pcm_n = false;
 	ut_itl_census_change_writer_activation_projection = false;
 	ut_itl_census_replace_current_page = false;
+	ut_itl_census_change_page_geometry = false;
 	ut_itl_census_pcm_reservation_token = UINT64_C(17);
 	ut_itl_census_pcm_flags = 0;
 	ut_itl_census_stale_first_round_full = false;
@@ -3567,6 +3669,12 @@ UT_TEST(test_44_wrap_aba_recycles_only_after_fresh_second_census)
 	ut_itl_census_mutate_wrap = true;
 	slot = &ClusterPageGetItlSlots((Page) fixture.live_page)[0];
 	before = *slot;
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1303, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	/* A fresh call represents the DML owner's requalified plan. */
+	ut_itl_census_admission = NULL;
 	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
 		UT_HOT_BUFFER, (TransactionId) 1303, false, &slot_index));
 	UT_ASSERT_EQ(slot->wrap, (uint16) (before.wrap + 1));
@@ -3784,6 +3892,9 @@ UT_TEST(test_53_stale_census_retries_only_the_relocked_current_page_once)
 	ut_itl_census_begin(&fixture, &result, false);
 	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
 	ut_itl_census_replace_current_page = true;
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1310, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
 	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
 		UT_HOT_BUFFER, (TransactionId) 1310, false, &slot_index));
 	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
@@ -3839,6 +3950,11 @@ UT_TEST(test_55_second_census_recaptures_fresh_identity_after_current_page_full)
 	ut_itl_census_begin(&fixture, &result, false);
 	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
 	ut_itl_census_stale_first_round_full = true;
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1312, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_admission = NULL;
 	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
 		UT_HOT_BUFFER, (TransactionId) 1312, false, &slot_index));
 	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
@@ -3868,8 +3984,10 @@ UT_TEST(test_56_second_census_drift_overflows_without_third_retry)
 	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
 	ut_itl_census_stale_first_round_full = true;
 	ut_itl_census_second_round_drift = true;
-	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
-		UT_HOT_BUFFER, (TransactionId) 1313, false, &slot_index));
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1313, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1313, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
 	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
 	UT_ASSERT(ut_itl_census_second_round_fresh_locator_seen);
 	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
@@ -3897,6 +4015,10 @@ UT_TEST(test_57_terminal_census_validates_all_before_mutating_any)
 	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
 	ut_itl_census_outcomes[1] = CLUSTER_TX_COMMITTED;
 	ut_itl_census_mutate_second_terminal_after_full_resolve = true;
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1314, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
 	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
 		UT_HOT_BUFFER, (TransactionId) 1314, false, &slot_index));
 	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
@@ -5887,10 +6009,56 @@ UT_TEST(test_hot_prune_without_xmin_hint_never_reads_requester_clog)
 	ut_prune_end();
 }
 
+UT_TEST(test_census_changed_page_returns_to_dml_requalification)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	ClusterHeapItlCapacityResult outcome;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_replace_current_page = true;
+	ut_itl_census_change_page_geometry = true;
+	outcome = cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1391, false);
+	ut_itl_census_end();
+	UT_ASSERT_EQ(outcome, CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+}
+
+UT_TEST(test_census_clearing_target_lock_returns_to_dml_owner)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	Page page;
+	ClusterItlSlotData *slot;
+	HeapTupleHeader tuple;
+	int outcome;
+
+	ut_itl_census_begin(&fixture, &hot, false);
+	page = (Page)fixture.live_page;
+	slot = &ClusterPageGetItlSlots(page)[0];
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	tuple = ut_r4_hot_tuple_at(page, UT_HOT_ROOT_OFF);
+	HeapTupleHeaderSetXmax(tuple, slot->xid);
+	tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	outcome = cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, (TransactionId)1390, false);
+	UT_ASSERT_EQ(outcome, CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_COMMITTED);
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	ut_itl_census_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(106);
+	UT_PLAN(110);
+	UT_RUN(test_post_snapshot_own_xmin_keeps_command_visibility);
+	UT_RUN(test_census_clearing_target_lock_returns_to_dml_owner);
+	UT_RUN(test_post_snapshot_matching_xmin_uses_holder_full);
+	UT_RUN(test_census_changed_page_returns_to_dml_requalification);
 	UT_RUN(test_hot_prune_without_xmin_hint_never_reads_requester_clog);
 	UT_RUN(test_hot_prune_preserves_excluded_tuple_snapshot_and_locator_shapes);
 	UT_RUN(test_hot_prune_rejects_cyclic_input_before_origin_resolution);

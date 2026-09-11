@@ -1740,9 +1740,7 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 		return;
 	prepare_helper = strstr(source,
 		"\ncluster_heap_itl_prepare_prepared_undo(");
-	prepare_end = prepare_helper == NULL ? NULL
-		: strstr(prepare_helper,
-			"\n}\n\n\nstatic ClusterHeapPreparedUndoResult\ncluster_heap_itl_plan_prepared_undo_target(");
+	prepare_end = prepare_helper == NULL ? NULL : strstr(prepare_helper, "\n}\n");
 	ensure = prepare_helper == NULL ? NULL
 		: strstr(prepare_helper,
 			"cluster_heap_itl_ensure_capacity_with_terminal_census(");
@@ -2014,7 +2012,7 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 		raw_prepare_calls++;
 	/* Definition + retry wrapper + unit seam + five initial producer sites.
 	 * Existing retry sites now preserve READY through their dedicated owner. */
-	UT_ASSERT_EQ(helper_mentions, 9); /* Includes explicit post-TOAST resume. */
+	UT_ASSERT_EQ(helper_mentions, 10); /* Explicit TOAST and ordinary row-lock resume. */
 	UT_ASSERT_EQ(wrapper_calls, 2);
 	UT_ASSERT_EQ(raw_prepare_calls, 0);
 	free(source);
@@ -2149,7 +2147,9 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 	 * content lock.  Do not count enum/result spellings: UPDATE legitimately
 	 * has more than one pre-mutation retry classification. */
 	UT_ASSERT_EQ(ctrc_prepare_sites, 5);
-	UT_ASSERT_EQ(cancel_sites, 3); /* Two chain exits and the explicit TOAST handoff. */
+	/* Two chain exits, TOAST, the nested row-lock adapter and the row-lock
+	 * unpublished normal-return cleanup. Actual-C tests cover both new owners. */
+	UT_ASSERT_EQ(cancel_sites, 5);
 	UT_ASSERT_NOT_NULL(strstr(source, "cluster_undo_record_requalify_for_retry("));
 	/* Four declarations plus initial/reprepare uses on all callers. */
 	UT_ASSERT(deadline_locals >= 12);
@@ -2643,14 +2643,33 @@ UT_TEST(test_heap_retry_preserves_exact_ready_before_considering_cancel)
 	deadline_reclass
 		= strstr(source, "return receipt->absolute_deadline_us > (uint64)GetCurrentTimestamp()");
 	UT_ASSERT(deadline_reclass == NULL);
-	/* The one direct outer-receipt cancel is the explicit nested TOAST
-	 * handoff, independently checked below; retries must use requalification. */
+	/* UPDATE's one direct cancel is the explicit nested TOAST handoff.
+	 * The other direct site is heap_lock_tuple's unpublished return cleanup;
+	 * neither allows UPDATE retries to bypass READY requalification. */
 	{
 		const char *cancel = strstr(source, "cluster_undo_record_cancel_prepared(&undo_receipt)");
+		const char *update = strstr(source, "\nheap_update(");
+		const char *lock = strstr(source, "\nheap_lock_tuple(");
+		const char *next
+			= cancel == NULL
+				  ? NULL
+				  : strstr(cancel + 1, "cluster_undo_record_cancel_prepared(&undo_receipt)");
+		const char *unpublished
+			= lock == NULL
+				  ? NULL
+				  : strstr(lock,
+						   "if (undo_receipt.magic != 0 && undo_receipt.ctrc_applied_mask == 0)");
 		UT_ASSERT_NOT_NULL(cancel);
-		if (cancel != NULL)
-			UT_ASSERT(strstr(cancel + 1, "cluster_undo_record_cancel_prepared(&undo_receipt)")
+		UT_ASSERT_NOT_NULL(update);
+		UT_ASSERT_NOT_NULL(lock);
+		UT_ASSERT_NOT_NULL(next);
+		UT_ASSERT_NOT_NULL(unpublished);
+		if (cancel != NULL && update != NULL && lock != NULL && next != NULL
+			&& unpublished != NULL) {
+			UT_ASSERT(update < cancel && cancel < lock && lock < unpublished && unpublished < next);
+			UT_ASSERT(strstr(next + 1, "cluster_undo_record_cancel_prepared(&undo_receipt)")
 					  == NULL);
+		}
 	}
 	free(source);
 }

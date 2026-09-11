@@ -47,11 +47,57 @@
 
 #include "c.h"
 #include "access/htup.h"			 /* HeapTupleHeader forward typedef */
+#include "access/htup_details.h"
 #include "access/transam.h"			 /* TransactionId */
 #include "storage/buf.h"			 /* Buffer */
 #include "storage/bufpage.h"		 /* Page typedef */
 #include "cluster/cluster_scn.h"	 /* SCN */
 #include "cluster/cluster_tt_slot.h" /* ClusterUndoTTSlotRef */
+
+#ifdef USE_PGRAC_CLUSTER
+/* Caller owns the exact page and a proven terminal plain locker (or its
+ * authoritative replacement WAL). Never use missing status as that proof.
+ * This page-local change travels with the caller's existing WAL/hint write. */
+static inline uint16
+cluster_itl_clear_terminal_lock_refs(Page page, const ClusterItlSlotData *proven_slot)
+{
+	OffsetNumber offset;
+	OffsetNumber maxoff;
+	uint16 changed = 0;
+	const ClusterItlSlotData *slots;
+	TransactionId xid = proven_slot->xid;
+	uint8 i;
+
+	Assert(page != NULL && PageHasItl(page));
+	Assert(TransactionIdIsNormal(xid));
+	slots = ClusterPageGetItlSlots(page);
+	Assert(proven_slot >= slots && proven_slot < slots + CLUSTER_ITL_INITRANS_DEFAULT);
+	/* Tuple xmax has no incarnation. An older or ambiguous slot must not
+	 * release a newer locker sharing that raw xid. */
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		if (&slots[i] != proven_slot && slots[i].xid == xid && ITL_FLAG_IS_LOCK_ONLY(slots[i].flags)
+			&& slots[i].flags != ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+			&& slots[i].wrap >= proven_slot->wrap)
+			return 0;
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsNormal(item))
+			continue;
+		Assert(ItemIdGetLength(item) >= SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		if ((tuple->t_infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) != 0
+			|| !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
+			|| !TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple), xid))
+			continue;
+		tuple->t_infomask |= HEAP_XMAX_INVALID;
+		changed++;
+	}
+	return changed;
+}
+#endif
 
 /*
  * cluster_itl_get_tt_ref -- read ITL slot at `itl_slot_idx` and fill a
@@ -150,6 +196,23 @@ extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xm
  */
 extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
 												  uint8 *slot_index_out);
+
+#ifdef USE_PGRAC_CLUSTER
+/* Normalize an undo copy, not the live tuple. A missing or ambiguous locator
+ * is deliberately not a terminal proof. */
+static inline uint16
+cluster_itl_terminal_lock_infomask(Page page, TransactionId xmax, uint16 infomask)
+{
+	uint8 slot_index;
+
+	if (TransactionIdIsNormal(xmax) && (infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) == 0
+		&& HEAP_XMAX_IS_LOCKED_ONLY(infomask)
+		&& cluster_itl_find_lock_slot_index_by_xmax(page, xmax, &slot_index)
+		&& ITL_FLAG_IS_LOCK_ONLY_COMPLETED(ClusterPageGetItlSlots(page)[slot_index].flags))
+		return infomask | HEAP_XMAX_INVALID;
+	return infomask;
+}
+#endif
 
 /*
  * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW;OBS-2

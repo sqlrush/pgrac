@@ -586,17 +586,17 @@ itl_finish_stamp_page(Page page, uint8 slot_idx, const ItlFinishCtx *ctx)
 	Assert(slot->flags == ITL_FLAG_ACTIVE || slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE);
 
 	if (ctx->is_commit) {
-		slot->flags = is_lock_only
-			? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_NEEDS_CLEANOUT;
-		/*
-		 * spec-3.4d:  lock-only commit_scn carries no visibility ordering
-		 * (lock release ≠ MVCC commit).  Still store for observability;
-		 * reader silent-falls-through these slots.
-		 */
+		/* Precommit is not terminal proof. Keep the exact lock locator and
+		 * its shared receipt for the admitted terminal census/cleaner. */
+		if (is_lock_only)
+			return;
+		slot->flags = ITL_FLAG_NEEDS_CLEANOUT;
 		slot->commit_scn = ctx->commit_scn;
 	} else {
 		slot->flags = is_lock_only ? ITL_FLAG_LOCK_ONLY_ABORTED : ITL_FLAG_ABORTED;
 		slot->commit_scn = InvalidScn;
+		if (is_lock_only)
+			(void)cluster_itl_clear_terminal_lock_refs(page, slot);
 	}
 }
 
@@ -765,14 +765,10 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 
 			if (stampable[r]) {
 				itl_finish_stamp_page(image, (uint8)record->key.slot_idx, &bctx->finish);
-				/* A data COMMIT intentionally remains NEEDS_CLEANOUT/APPLIED.
-				 * Abort and lock-only commit are terminal independently of the
-				 * later transaction-status publication and may discharge once
-				 * this page WAL and its dependency vector are durable. */
-				if (record->ctrc_handle.valid
-					&& (!bctx->finish.is_commit
-						|| record->proof.slot_class
-							== ITL_FLAG_LOCK_ONLY_ACTIVE)
+				/* Every precommit receipt remains APPLIED. Only an abort is
+				 * terminal independently of later status publication, and may
+				 * discharge once this page WAL and its dependencies are durable. */
+				if (record->ctrc_handle.valid && !bctx->finish.is_commit
 					&& ndischarges < lengthof(discharges)) {
 					discharges[ndischarges].record_index = run->first + r;
 					discharges[ndischarges].dependency_index = p;

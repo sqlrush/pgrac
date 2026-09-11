@@ -71,8 +71,10 @@
 #include <string.h>
 
 #include "access/heapam_xlog.h" /* xl_heap_itl_delta_v2 / _block (spec-3.9 L213 redo parity) */
+#include "access/htup_details.h"
 #include "access/transam.h"
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h" /* ClusterShmemRegion (spec-3.4e D6 stub) */
@@ -90,6 +92,15 @@
 
 
 UT_DEFINE_GLOBALS();
+
+/* The inverse witness overwrites a present tuple; re-adding a missing item
+ * is outside this fixture and must not silently succeed. */
+OffsetNumber
+PageAddItemExtended(Page page, Item item, Size size, OffsetNumber offset, int flags)
+{
+	UT_ASSERT(false);
+	return InvalidOffsetNumber;
+}
 
 
 /* ============================================================
@@ -1372,9 +1383,235 @@ UT_TEST(test_precommit_cleanout_evidence_is_not_directly_reusable)
 	UT_ASSERT_EQ((int)slot_index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
 
+static HeapTupleHeader
+append_plain_lock_tuple(Page page, TransactionId xid)
+{
+	PageHeader header = (PageHeader)page;
+	OffsetNumber offset = PageGetMaxOffsetNumber(page) + 1;
+	HeapTupleHeader tuple;
+
+	header->pd_lower += sizeof(ItemIdData);
+	header->pd_upper -= MAXALIGN(SizeofHeapTupleHeader);
+	ItemIdSetNormal(PageGetItemId(page, offset), header->pd_upper, SizeofHeapTupleHeader);
+	tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, offset));
+	HeapTupleHeaderSetXmin(tuple, FrozenTransactionId);
+	HeapTupleHeaderSetXmax(tuple, xid);
+	tuple->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ItemPointerSet(&tuple->t_ctid, 17, offset);
+	return tuple;
+}
+
+UT_TEST(completed_lock_reuse_normalizes_only_matching_plain_locks)
+{
+	int leg;
+
+	for (leg = 0; leg < 2; leg++) {
+		Page page = build_itl_page();
+		Buffer buffer = marker_buffer_for(page);
+		HeapTupleHeader matching = append_plain_lock_tuple(page, 700);
+		HeapTupleHeader other = append_plain_lock_tuple(page, 701);
+		HeapTupleHeader multi = append_plain_lock_tuple(page, 700);
+		HeapTupleHeader data = append_plain_lock_tuple(page, 700);
+		HeapTupleHeaderData before = *matching;
+		ClusterItlSlotData *slot = slot_at(page, 0);
+
+		multi->t_infomask |= HEAP_XMAX_IS_MULTI;
+		data->t_infomask &= ~(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK);
+		slot->flags = leg == 0 ? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_LOCK_ONLY_ABORTED;
+		slot->xid = 700;
+		slot->wrap = 7;
+		cluster_itl_stamp_active(buffer, 0, 702, 900, uba_encode(1, 2, 8, 1));
+		before.t_infomask |= HEAP_XMAX_INVALID;
+		UT_ASSERT_EQ(memcmp(matching, &before, SizeofHeapTupleHeader), 0);
+		UT_ASSERT((other->t_infomask & HEAP_XMAX_INVALID) == 0);
+		UT_ASSERT((multi->t_infomask & HEAP_XMAX_INVALID) == 0);
+		UT_ASSERT((data->t_infomask & HEAP_XMAX_INVALID) == 0);
+	}
+}
+
+UT_TEST(active_own_lock_to_data_keeps_unreleased_locks)
+{
+	Page page = build_itl_page();
+	Buffer buffer = marker_buffer_for(page);
+	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+	ClusterItlSlotData *slot = slot_at(page, 0);
+
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->xid = 700;
+	cluster_itl_stamp_active(buffer, 0, 700, 900, uba_encode(1, 2, 8, 1));
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) == 0);
+}
+
+UT_TEST(replacement_redo_normalizes_old_active_lock_and_is_idempotent)
+{
+	Page page = build_itl_page();
+	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+	ClusterItlSlotData *slot = slot_at(page, 0);
+	char after[BLCKSZ];
+	const char *delta;
+
+	/* Terminal cleanout may have been an unlogged hint. Replacement WAL,
+	 * not a requester-local status guess, proves the old owner was retired. */
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->xid = 700;
+	delta = make_v2_active_delta(0, ITL_FLAG_ACTIVE, 702, 900);
+	(void)cluster_itl_redo_apply_block_local_delta(page, NULL, delta);
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	memcpy(after, page, BLCKSZ);
+	(void)cluster_itl_redo_apply_block_local_delta(page, NULL, delta);
+	UT_ASSERT_EQ(memcmp(after, page, BLCKSZ), 0);
+}
+
+UT_TEST(marker_reuse_normalizes_retired_plain_lock)
+{
+	Page page = build_itl_page();
+	Buffer buffer = marker_buffer_for(page);
+	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+	int i;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
+		slot_at(page, i)->xid = 800 + i;
+	}
+	slot_at(page, 0)->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slot_at(page, 0)->xid = 700;
+	UT_ASSERT_EQ(cluster_itl_stamp_multixact_marker(buffer, 900), 0);
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+}
+
+#include "test_cluster_itl_undo_capture.inc"
+
+UT_TEST(undo_capture_and_real_inverse_do_not_resurrect_retired_plain_lock)
+{
+	Page page = build_itl_page();
+	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+	ClusterItlSlotData *slot = slot_at(page, 0);
+	UndoRecordHeader header = { 0 };
+	UndoItlPayload payload = { 0 };
+	ClusterUndoTTSlotRef ref;
+
+	slot->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slot->xid = 700;
+	slot->wrap = 7;
+	slot->undo_segment_head = uba_encode(257, 1, 7, 1);
+	payload.prev_xmax = 700;
+	payload.prev_infomask = tuple->t_infomask;
+	payload.prev_infomask2 = tuple->t_infomask2;
+	UT_ASSERT(cluster_heap_capture_undo_prior_lock(page, UNDO_RECORD_ITL, 0, 0, slot, &payload,
+												   sizeof(payload)));
+	HeapTupleHeaderSetXmax(tuple, 701);
+	slot->xid = 701;
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	header.target_offset = FirstOffsetNumber;
+	UT_ASSERT(cluster_cr_apply_itl_inverse((char *)page, &header, &payload));
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0
+			  || cluster_itl_find_lock_tt_ref_by_xmax(page, 700, &ref));
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_FREE);
+}
+
+UT_TEST(retired_older_or_ambiguous_slot_cannot_release_newer_locker)
+{
+	int leg;
+
+	for (leg = 0; leg < 2; leg++) {
+		Page page = build_itl_page();
+		Buffer buffer = marker_buffer_for(page);
+		HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+		ClusterItlSlotData *old = slot_at(page, 0);
+		ClusterItlSlotData *newer = slot_at(page, 1);
+
+		old->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+		old->xid = 700;
+		old->wrap = 7;
+		newer->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		newer->xid = 700;
+		newer->wrap = leg == 0 ? 8 : 7;
+		cluster_itl_stamp_active(buffer, 0, 701, 900, uba_encode(1, 1, 2, 0));
+		UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) == 0);
+	}
+}
+
+UT_TEST(undo_active_and_unproved_lock_headers_are_not_normalized)
+{
+	int leg;
+
+	for (leg = 0; leg < 5; leg++) {
+		Page page = build_itl_page();
+		HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+		ClusterItlSlotData *slot = slot_at(page, 0);
+		UndoRecordHeader header = { 0 };
+		UndoItlPayload payload = { 0 };
+		ClusterUndoTTSlotRef ref;
+		uint16 before;
+
+		slot->flags = leg == 0 ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_LOCK_ONLY_COMMITTED;
+		slot->xid = 700;
+		slot->wrap = 7;
+		slot->undo_segment_head = uba_encode(257, 1, 7, 1);
+		if (leg == 1)
+			tuple->t_infomask |= HEAP_XMAX_IS_MULTI;
+		if (leg == 2)
+			tuple->t_infomask &= ~(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK);
+		if (leg == 3)
+			HeapTupleHeaderSetXmax(tuple, 701);
+		if (leg == 4)
+			*slot_at(page, 1) = *slot;
+		before = tuple->t_infomask;
+		payload.prev_xmax = HeapTupleHeaderGetRawXmax(tuple);
+		payload.prev_infomask = before;
+		UT_ASSERT(cluster_heap_capture_undo_prior_lock(page, UNDO_RECORD_ITL, 0, 0, slot, &payload,
+													   sizeof(payload)));
+		UT_ASSERT_EQ(payload.prev_infomask, before);
+		if (leg == 0) {
+			header.target_offset = FirstOffsetNumber;
+			UT_ASSERT(cluster_cr_apply_itl_inverse((char *)page, &header, &payload));
+			UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
+			UT_ASSERT(cluster_itl_find_lock_tt_ref_by_xmax(page, 700, &ref));
+			UT_ASSERT_EQ(ref.local_xid, 700);
+		}
+	}
+}
+
+UT_TEST(full_tuple_undo_copy_does_not_resurrect_terminal_lock)
+{
+	Page page = build_itl_page();
+	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
+	ClusterItlSlotData *slot = slot_at(page, 0);
+	UndoRecordHeader header = { 0 };
+	char payload[128] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	int leg;
+
+	slot->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slot->xid = 700;
+	slot->wrap = 7;
+	slot->undo_segment_head = uba_encode(257, 1, 7, 1);
+	for (leg = 0; leg < 2; leg++) {
+		uint8 type = leg == 0 ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE;
+		Size offset = leg == 0 ? sizeof(UndoUpdatePayload) : sizeof(UndoDeletePayload);
+		HeapTupleHeader copy = (HeapTupleHeader)(payload + offset);
+
+		memset(payload, 0, sizeof(payload));
+		memcpy(copy, tuple, SizeofHeapTupleHeader);
+		UT_ASSERT(cluster_heap_capture_undo_prior_lock(page, type, 0, 0, slot, payload,
+													   offset + SizeofHeapTupleHeader));
+		UT_ASSERT((copy->t_infomask & HEAP_XMAX_INVALID) != 0);
+		UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) == 0);
+		if (leg == 1) {
+			header.target_offset = FirstOffsetNumber;
+			UT_ASSERT(cluster_cr_apply_delete_inverse((char *)page, &header,
+													  (UndoDeletePayload *)payload, (char *)copy,
+													  SizeofHeapTupleHeader));
+			UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+		}
+	}
+}
+
 int
 main(void)
 {
+	UT_PLAN(65);
 	UT_RUN(test_t1_ref_sizeof_32);
 	UT_RUN(test_t2_null_page_returns_false);
 	UT_RUN(test_t3_null_ref_returns_false);
@@ -1434,6 +1671,15 @@ main(void)
 	UT_RUN(test_d11_page_has_active_slot_detects_active);
 	UT_RUN(test_d11_page_has_active_slot_no_itl_is_false);
 	UT_RUN(test_precommit_cleanout_evidence_is_not_directly_reusable);
+	UT_RUN(completed_lock_reuse_normalizes_only_matching_plain_locks);
+	UT_RUN(active_own_lock_to_data_keeps_unreleased_locks);
+	UT_RUN(replacement_redo_normalizes_old_active_lock_and_is_idempotent);
+	UT_RUN(marker_reuse_normalizes_retired_plain_lock);
+	UT_RUN(undo_capture_and_real_inverse_do_not_resurrect_retired_plain_lock);
+	UT_RUN(retired_older_or_ambiguous_slot_cannot_release_newer_locker);
+	UT_RUN(undo_active_and_unproved_lock_headers_are_not_normalized);
+	UT_RUN(full_tuple_undo_copy_does_not_resurrect_terminal_lock);
 
+	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

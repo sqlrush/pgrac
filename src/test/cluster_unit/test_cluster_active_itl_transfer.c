@@ -264,6 +264,8 @@ reset_registration_fixture(TransactionId xid)
 	MemSet(&test_buffer_block, 0, sizeof(test_buffer_block));
 	page_header->pd_flags = PD_HAS_ITL;
 	page_header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	page_header->pd_lower = SizeOfPageHeaderData;
+	page_header->pd_upper = page_header->pd_special;
 	PageSetPageSizeAndVersion(page, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
 	slot = &ClusterPageGetItlSlots(page)[0];
 	slot->xid = xid;
@@ -534,7 +536,7 @@ UT_TEST(u37_data_commit_retains_applied_receipt_for_lazy_cleanout)
 	UT_ASSERT_EQ(test_xlog_flush_sequence, 0);
 }
 
-UT_TEST(u38_lock_only_commit_discharges_terminal_independent_receipt)
+UT_TEST(u38_lock_precommit_retains_authority_until_real_terminal_proof)
 {
 	ClusterItlTouchHandle touch = registration_handle();
 	TransactionId xid = 700;
@@ -550,10 +552,57 @@ UT_TEST(u38_lock_only_commit_discharges_terminal_independent_receipt)
 	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
 	cluster_itl_xact_precommit_finish(xid, 99);
 
-	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_COMMITTED);
-	UT_ASSERT_EQ(test_discharge_calls, 1);
-	UT_ASSERT_EQ(test_discharge_projection, CTRC_ITL_TERMINAL_INDEPENDENT);
-	UT_ASSERT_EQ(test_discharge_target.itl_class, 2);
+	/* This hook precedes both the commit record and terminal TT publication. */
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
+	UT_ASSERT_EQ(slot->commit_scn, InvalidScn);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+}
+
+UT_TEST(lock_terminal_finish_preserves_precommit_and_clears_only_exact_abort)
+{
+	int leg;
+
+	for (leg = 0; leg < 3; leg++) {
+		ClusterItlTouchHandle touch = registration_handle();
+		TransactionId xid = 700;
+		ClusterItlSlotData *slot = reset_registration_fixture(xid);
+		Page page = (Page)test_buffer_block.data;
+		PageHeader header = (PageHeader)page;
+		HeapTupleHeader tuple;
+		ClusterCtrcReceiptHandle ctrc;
+
+		header->pd_lower += sizeof(ItemIdData);
+		header->pd_upper -= MAXALIGN(SizeofHeapTupleHeader);
+		ItemIdSetNormal(PageGetItemId(page, FirstOffsetNumber), header->pd_upper,
+						SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+		tuple->t_hoff = SizeofHeapTupleHeader;
+		tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+		HeapTupleHeaderSetXmin(tuple, 600);
+		HeapTupleHeaderSetXmax(tuple, xid);
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		slot->undo_segment_head.raw[0] = 23;
+		touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+		ctrc = registration_ctrc_handle(0, &touch, slot);
+		test_capture_authority = true;
+		test_generic_finish_lsn = 500;
+		cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+		if (leg == 2)
+			slot->undo_segment_head.raw[0]++;
+		if (leg == 0)
+			cluster_itl_xact_precommit_finish(xid, 99);
+		else
+			cluster_itl_xact_abort_finish(xid);
+		UT_ASSERT_EQ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0, leg == 1);
+		UT_ASSERT_EQ(slot->flags,
+					 leg == 1 ? ITL_FLAG_LOCK_ONLY_ABORTED : ITL_FLAG_LOCK_ONLY_ACTIVE);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 600);
+		UT_ASSERT_EQ(test_discharge_calls, leg == 1 ? 1 : 0);
+		if (leg == 1) {
+			UT_ASSERT(test_generic_finish_sequence > 0);
+			UT_ASSERT(test_discharge_sequence > test_xlog_flush_sequence);
+		}
+	}
 }
 
 UT_TEST(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle)
@@ -860,7 +909,8 @@ UT_TEST(u34_epoch_drift_preserves_active_slot)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
+	UT_RUN(lock_terminal_finish_preserves_precommit_and_clears_only_exact_abort);
 	UT_RUN(u13_exact_owner_proof_matches);
 	UT_RUN(u14_missing_owner_proof_is_rejected);
 	UT_RUN(u15_later_x_generation_is_rejected);
@@ -886,8 +936,9 @@ main(void)
 	UT_RUN(u35_uba_drift_preserves_active_slot);
 	UT_RUN(u36_abort_discharge_waits_for_terminal_wal_and_dependency_frontier);
 	UT_RUN(u37_data_commit_retains_applied_receipt_for_lazy_cleanout);
-	UT_RUN(u38_lock_only_commit_discharges_terminal_independent_receipt);
+	UT_RUN(u38_lock_precommit_retains_authority_until_real_terminal_proof);
 	UT_RUN(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle);
 	UT_RUN(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt);
 	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
 }

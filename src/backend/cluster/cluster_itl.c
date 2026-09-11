@@ -869,6 +869,8 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 			return CLUSTER_ITL_SLOT_UNALLOCATED; /* OVERFLOW */
 
 		slot = &slots[idx];
+		if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(slot->flags))
+			(void)cluster_itl_clear_terminal_lock_refs(page, slot);
 		/*
 		 * spec-3.6b current-MX closure: idx can only name a stale marker,
 		 * FREE slot, or completed lock-only slot.  Those states contribute
@@ -1002,6 +1004,8 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 	 * watermark case.
 	 */
 	Assert(!(slot->flags == ITL_FLAG_ACTIVE && slot->xid != xid));
+	if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(slot->flags))
+		(void)cluster_itl_clear_terminal_lock_refs(page, slot);
 	/*
 	 * spec-3.10 §v0.5: fold the evicted (recycled) data slot's write_scn into
 	 * the per-page recycle watermark BEFORE overwriting the slot, so own-
@@ -1193,6 +1197,11 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 			elog(PANIC, "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap redo");
 
 		slot = &ClusterPageGetItlSlots(page)[slot_idx];
+		/* Replacement WAL proves retirement even if the terminal hint was
+		 * not flushed. Same-xid ACTIVE transitions do not release row locks. */
+		if (ITL_FLAG_IS_LOCK_ONLY(slot->flags) && slot->flags != ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+			&& (slot->xid != d_xid || ITL_FLAG_IS_LOCK_ONLY_COMPLETED(flags_after)))
+			(void)cluster_itl_clear_terminal_lock_refs(page, slot);
 		/*
 		 * spec-3.10 §v0.5: redo parity for itl_recycle_watermark_scn.
 		 * Recompute the recycle contribution from the PRE-overwrite slot
