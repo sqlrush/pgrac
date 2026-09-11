@@ -2012,8 +2012,9 @@ cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
  * HeapTupleSatisfiesMVCCScratch
  *
  * Narrow D6 evaluator for a caller-owned, already reconstructed FULL page.
- * It consumes only tuple/page bytes from that private page and one exact ITL
- * ref verdict.  In particular it never enters native CLOG/ProcArray,
+ * It consumes only tuple/page bytes from that private page, the existing
+ * frozen-creation proof, and exact ITL ref verdicts where required.  It never
+ * enters native CLOG/ProcArray,
  * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI.
  */
 bool
@@ -2071,30 +2072,30 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
 										  "malformed or cross-block scratch tuple");
 
-	raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
-	if (!TransactionIdIsNormal(raw_xmin)
-		|| tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
-		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
-		cluster_r4_scratch_visibility_unknown(raw_xmin,
-										  "scratch xmin has no DATA ITL slot");
+	/* A frozen creator is already proved by the immutable tuple flags.
+	 * Its raw xmin is historical data; its former DATA slot may be reused.
+	 * This says nothing about xmax, which still has to be checked below. */
+	if (!HeapTupleHeaderXminFrozen(tuple)) {
+		raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+		if (!TransactionIdIsNormal(raw_xmin)
+			|| tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+			|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
-	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
-	if (itl_slot->flags < ITL_FLAG_ACTIVE
-		|| itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
-		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
-		|| ref.local_xid != raw_xmin
-		|| ref.tt_slot_id == 0)
-		cluster_r4_scratch_visibility_unknown(raw_xmin,
-										  "scratch xmin lacks an exact DATA ITL reference");
+		itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+			|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
+			|| ref.local_xid != raw_xmin || ref.tt_slot_id == 0)
+			cluster_r4_scratch_visibility_unknown(raw_xmin,
+												  "scratch xmin lacks an exact DATA ITL reference");
 
-	cluster_visibility_resolve_from_ref_scn(raw_xmin, &ref, PageGetLSN(page),
-										 snapshot->read_scn, &resolved);
-	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
-		cluster_r4_scratch_visibility_unknown(raw_xmin,
-										  "scratch xmin is not backed by remote authority");
+		cluster_visibility_resolve_from_ref_scn(raw_xmin, &ref, PageGetLSN(page),
+												snapshot->read_scn, &resolved);
+		if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+			cluster_r4_scratch_visibility_unknown(raw_xmin,
+												  "scratch xmin is not backed by remote authority");
 
-	switch (resolved.status)
-	{
+		switch (resolved.status) {
 		case CLUSTER_TT_STATUS_ABORTED:
 		case CLUSTER_TT_STATUS_IN_PROGRESS:
 		case CLUSTER_TT_STATUS_SUBCOMMITTED:
@@ -2112,8 +2113,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 			break;
 
 		default:
-			cluster_r4_scratch_visibility_unknown(raw_xmin,
-										  "scratch xmin outcome is not terminal");
+			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin outcome is not terminal");
+		}
 	}
 
 	/* A reconstructed pre-update image normally has no deleting xmax. */
@@ -2134,8 +2135,13 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 	 * A non-locking xmax is supported only when the same scratch-owned slot
 	 * exactly binds it.  Never derive members or fall back to native CLOG.
 	 */
-	if (!cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
-		|| ref.local_xid != raw_xmax || ref.tt_slot_id == 0)
+	if (tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax has no DATA ITL slot");
+	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) || ref.local_xid != raw_xmax
+		|| ref.tt_slot_id == 0)
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
 										  "scratch xmax lacks an exact DATA ITL reference");
 

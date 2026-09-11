@@ -2961,6 +2961,188 @@ UT_TEST(test_post_snapshot_matching_xmin_uses_holder_full)
 	BufferBlocks = NULL;
 }
 
+/* Frozen creation is a tuple proof, not a claim that its old page slot still
+ * names xmin.  Keep the real scratch evaluator and trap all live-page paths. */
+static void
+ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool expect_error,
+					   bool expect_visible)
+{
+	PGAlignedBlock scratch;
+	PGAlignedBlock before;
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	ClusterR4HotScratchTestContext context = { 0 };
+	Page page = ut_r4_hot_build_page(scratch.data, (TransactionId)4195504, 1,
+									 (TransactionId)4207696, 4, UT_HOT_PAYLOAD);
+	HeapTupleHeader header = ut_r4_hot_tuple_at(page, UT_HOT_ROOT_OFF);
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	header->t_infomask = xmin_bits | HEAP_XMAX_INVALID;
+	header->t_itl_slot_idx = itl_index;
+	PageSetLSN(page, UINT64_C(57237168));
+	tuple.t_data = header;
+	tuple.t_len = UT_HOT_TUPLE_LEN;
+	ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	context.scratch_page = page;
+	context.tag.blockNum = UT_HOT_BLOCK;
+	context.logical_root = tuple.t_self;
+	context.read_scn = snapshot.read_scn;
+	context.already_full = true;
+	ut_r4_hot_reset_scratch_authority(page, NULL, snapshot.read_scn, PageGetLSN(page));
+	ut_scratch_expected_ref.local_xid = 4207696;
+	ut_scratch_expected_xid = 4207696;
+	if (xmax_leg != 0) {
+		header->t_infomask &= ~HEAP_XMAX_INVALID;
+		HeapTupleHeaderSetXmax(header, ut_scratch_expected_xid);
+		if (xmax_leg == 2)
+			ut_scratch_resolve_scn = snapshot.read_scn + 1;
+		if (xmax_leg == 3)
+			ut_scratch_resolve_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		if (xmax_leg == 4)
+			ut_scratch_resolve_status = CLUSTER_TT_STATUS_ABORTED;
+		if (xmax_leg == 5)
+			header->t_infomask |= HEAP_XMAX_LOCK_ONLY;
+		if (xmax_leg == 6)
+			ClusterPageGetItlSlots(page)[1].flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+		if (xmax_leg == 7)
+			ut_scratch_ref_available = false;
+		if (xmax_leg == 8)
+			ut_scratch_expected_ref.local_xid++;
+		if (xmax_leg == 9)
+			ut_scratch_resolve_status = CLUSTER_TT_STATUS_UNKNOWN;
+		if (xmax_leg == 10)
+			ut_scratch_resolve_scn = InvalidScn;
+		if (xmax_leg == 11)
+			header->t_infomask |= HEAP_XMAX_IS_MULTI;
+		if (xmax_leg == 12)
+			context.already_full = false;
+		if (xmax_leg == 13)
+			context.tag.blockNum++;
+	}
+	memcpy(before.data, page, BLCKSZ);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		visible = HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT_EQ(caught, expect_error);
+	if (!expect_error) {
+		UT_ASSERT_EQ(visible, expect_visible);
+		UT_ASSERT_EQ(ut_scratch_ref_calls, xmax_leg > 0 && xmax_leg < 5 ? 1 : 0);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, xmax_leg > 0 && xmax_leg < 5 ? 1 : 0);
+	}
+	UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+	UT_ASSERT_EQ(ut_scratch_live_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_cr_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_hint_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_dirty_calls, 0);
+}
+
+UT_TEST(test_scratch_frozen_xmin_survives_recycled_data_slot)
+{
+	ut_scratch_frozen_case(HEAP_XMIN_FROZEN, 1, 0, false, true);
+}
+
+UT_TEST(test_scratch_frozen_xmin_needs_no_creator_slot)
+{
+	ut_scratch_frozen_case(HEAP_XMIN_FROZEN, CLUSTER_ITL_SLOT_UNALLOCATED, 0, false, true);
+	ut_scratch_frozen_case(HEAP_XMIN_FROZEN, CLUSTER_ITL_SLOT_UNALLOCATED, 5, false, true);
+}
+
+UT_TEST(test_scratch_frozen_creation_does_not_hide_deleting_xmax)
+{
+	int leg;
+
+	for (leg = 1; leg <= 4; leg++)
+		ut_scratch_frozen_case(HEAP_XMIN_FROZEN, 1, leg, false, leg != 1);
+	ut_scratch_frozen_case(HEAP_XMIN_FROZEN, CLUSTER_ITL_SLOT_UNALLOCATED, 1, true, false);
+}
+
+UT_TEST(test_scratch_committed_hint_is_not_frozen_creation_proof)
+{
+	ut_scratch_frozen_case(HEAP_XMIN_COMMITTED, 1, 0, true, false);
+	ut_scratch_frozen_case(0, 1, 0, true, false);
+}
+
+UT_TEST(test_scratch_frozen_creation_keeps_data_and_context_negatives)
+{
+	int leg;
+
+	for (leg = 6; leg <= 13; leg++)
+		ut_scratch_frozen_case(HEAP_XMIN_FROZEN, 1, leg, true, false);
+}
+
+UT_TEST(test_real_hot_full_consumer_preserves_frozen_creator_without_slot)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	PGAlignedBlock live_before;
+	HeapTupleHeader tuple;
+	HeapHotSearchResultKind kind = HEAP_HOT_SEARCH_NOT_FOUND;
+	volatile bool caught = false;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	tuple = ut_r4_hot_tuple_at((Page)fixture.full_source, UT_HOT_ROOT_OFF);
+	tuple->t_infomask |= HEAP_XMIN_FROZEN;
+	tuple->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, PageGetLSN((Page)fixture.full_source));
+	memcpy(live_before.data, fixture.live_page, BLCKSZ);
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
+											 NULL, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
+	UT_ASSERT(fixture.fetch_calls > 0);
+	UT_ASSERT_EQ(ut_scratch_ref_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+	UT_ASSERT(ut_hot_content_lock_held);
+	/* The fetch fixture deliberately flips this live bit on its first
+	 * delivery.  Requalification must retry, with no other live mutation. */
+	UT_ASSERT_EQ(fixture.fetch_calls, 2);
+	UT_ASSERT(fixture.live_poisoned);
+	ut_r4_hot_tuple_at((Page)live_before.data, UT_HOT_ROOT_OFF)->t_infomask2 ^= HEAP_KEYS_UPDATED;
+	UT_ASSERT_EQ(memcmp(live_before.data, fixture.live_page, BLCKSZ), 0);
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
 UT_TEST(test_post_snapshot_own_xmin_keeps_command_visibility)
 {
 	int leg;
@@ -6054,7 +6236,13 @@ UT_TEST(test_census_clearing_target_lock_returns_to_dml_owner)
 int
 main(void)
 {
-	UT_PLAN(110);
+	UT_PLAN(116);
+	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
+	UT_RUN(test_scratch_frozen_creation_keeps_data_and_context_negatives);
+	UT_RUN(test_scratch_frozen_xmin_survives_recycled_data_slot);
+	UT_RUN(test_scratch_frozen_xmin_needs_no_creator_slot);
+	UT_RUN(test_scratch_frozen_creation_does_not_hide_deleting_xmax);
+	UT_RUN(test_scratch_committed_hint_is_not_frozen_creation_proof);
 	UT_RUN(test_post_snapshot_own_xmin_keeps_command_visibility);
 	UT_RUN(test_census_clearing_target_lock_returns_to_dml_owner);
 	UT_RUN(test_post_snapshot_matching_xmin_uses_holder_full);
