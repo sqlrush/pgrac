@@ -3812,7 +3812,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -lssl -lcrypto -o $@
 
 # Stage 8 R4 D6 lifecycle/store RED tranche: link the real heap HOT lifecycle,
