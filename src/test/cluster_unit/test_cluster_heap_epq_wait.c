@@ -28,6 +28,76 @@ int old_snapshot_threshold = -1;
 char *BufferBlocks = (char *)fetch_pages;
 Block *LocalBufferBlockPointers;
 static bool content_locked;
+static int proved_entry_calls, dispatch_entry_calls;
+
+TM_Result
+HeapTupleSatisfiesUpdate(HeapTuple tuple, CommandId cid, Buffer buffer)
+{
+	UT_ASSERT(content_locked);
+	proved_entry_calls++;
+	return TM_Invisible; /* only distinguish entry selection, not model TT proof */
+}
+
+TM_Result
+HeapTupleSatisfiesUpdateForWriter(HeapTuple tuple, CommandId cid, Buffer buffer)
+{
+	UT_ASSERT(content_locked);
+	dispatch_entry_calls++;
+	return TM_BeingModified;
+}
+
+static void
+check_lock_dispatch(LockTupleMode mode, uint16 infomask, bool needs_proved_entry)
+{
+	HeapTupleHeaderData header = { 0 }, before;
+	HeapTupleData tuple_data = { .t_data = &header };
+	HeapTuple tuple = &tuple_data;
+	Buffer selected_buffer = 7, *buffer = &selected_buffer;
+	CommandId cid = 1;
+	TM_Result result = TM_Ok;
+
+	header.t_infomask = infomask;
+	HeapTupleHeaderSetXmax(&header, 900);
+	before = header;
+	proved_entry_calls = dispatch_entry_calls = 0;
+	content_locked = true;
+#include "test_cluster_heap_lock_dispatch.inc"
+	content_locked = false;
+	UT_ASSERT_EQ(proved_entry_calls, needs_proved_entry ? 1 : 0);
+	UT_ASSERT_EQ(dispatch_entry_calls, needs_proved_entry ? 0 : 1);
+	UT_ASSERT_EQ(result, needs_proved_entry ? TM_Invisible : TM_BeingModified);
+	UT_ASSERT_EQ(memcmp(&before, &header, sizeof(header)), 0);
+}
+
+UT_TEST(test_keyshare_keeps_proved_entry_for_every_plain_holder)
+{
+	check_lock_dispatch(LockTupleKeyShare, 0, true);
+	check_lock_dispatch(LockTupleKeyShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK, true);
+	check_lock_dispatch(LockTupleKeyShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK, true);
+	check_lock_dispatch(LockTupleKeyShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, true);
+}
+UT_TEST(test_share_compatible_locks_cannot_use_dispatch_only)
+{
+	check_lock_dispatch(LockTupleShare, 0, false);
+	check_lock_dispatch(LockTupleShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK, true);
+	check_lock_dispatch(LockTupleShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK, true);
+	check_lock_dispatch(LockTupleShare, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, false);
+}
+UT_TEST(test_nokeyexclusive_compatible_lock_cannot_use_dispatch_only)
+{
+	check_lock_dispatch(LockTupleNoKeyExclusive, 0, false);
+	check_lock_dispatch(LockTupleNoKeyExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK, true);
+	check_lock_dispatch(LockTupleNoKeyExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK, false);
+	check_lock_dispatch(LockTupleNoKeyExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, false);
+}
+UT_TEST(test_exclusive_conflicting_locks_retain_exact_wait_dispatch)
+{
+	check_lock_dispatch(LockTupleExclusive, 0, false);
+	check_lock_dispatch(LockTupleExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK, false);
+	check_lock_dispatch(LockTupleExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_SHR_LOCK, false);
+	check_lock_dispatch(LockTupleExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, false);
+}
+
 bool
 ItemPointerEquals(ItemPointer a, ItemPointer b)
 {
@@ -361,7 +431,7 @@ UT_TEST(test_fetch_miss_clears_wait_output_and_releases_pin)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_remote_wait_refetches_without_pin);
 	UT_RUN(test_skip_drops_pin_and_returns_would_block);
 	UT_RUN(test_nowait_preserves_error_and_drops_pin);
@@ -370,6 +440,10 @@ main(void)
 	UT_RUN(test_multixact_successor_proof_bypasses_dirty);
 	UT_RUN(test_after_wait_refetch_rechecks_xmin);
 	UT_RUN(test_fetch_miss_clears_wait_output_and_releases_pin);
+	UT_RUN(test_keyshare_keeps_proved_entry_for_every_plain_holder);
+	UT_RUN(test_share_compatible_locks_cannot_use_dispatch_only);
+	UT_RUN(test_nokeyexclusive_compatible_lock_cannot_use_dispatch_only);
+	UT_RUN(test_exclusive_conflicting_locks_retain_exact_wait_dispatch);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

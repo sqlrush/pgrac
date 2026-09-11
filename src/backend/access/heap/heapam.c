@@ -14373,10 +14373,18 @@ l3:
 	cluster_current_mx_handled = false;
 	cluster_current_mx_recomposed = false;
 #endif
-	/* KeyShare can bypass the sleep/bridge on a non-key-changing DATA
-	 * update. It needs the original proved HTSU verdict, not dispatch-only
-	 * TM_BeingModified. The other modes always bridge a plain DATA writer. */
-	if (mode == LockTupleKeyShare)
+	/*
+	 * KeyShare and compatible plain LOCK_ONLY holders can bypass the exact
+	 * sleep/bridge below. They need the original proved HTSU verdict, not a
+	 * dispatch-only TM_BeingModified, even when a foreign raw xmax happens
+	 * to equal our raw xid and current-MX composition declines the tuple.
+	 */
+	if (mode == LockTupleKeyShare
+		|| (!(tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+			&& HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)
+			&& ((mode == LockTupleShare && !HEAP_XMAX_IS_EXCL_LOCKED(tuple->t_data->t_infomask))
+				|| (mode == LockTupleNoKeyExclusive
+					&& HEAP_XMAX_IS_KEYSHR_LOCKED(tuple->t_data->t_infomask)))))
 		result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
 	else
 		result = HeapTupleSatisfiesUpdateForWriter(tuple, cid, *buffer);

@@ -841,9 +841,17 @@ UT_TEST(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts)
 			   "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&oldtup, cid, "
 			   "buffer);\n\telse\n\t\tresult = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);")
 		!= NULL);
-	UT_ASSERT(strstr(source, "if (mode == LockTupleKeyShare)\n\t\tresult = "
-							 "HeapTupleSatisfiesUpdate(tuple, cid, *buffer);\n\telse\n\t\tresult = "
-							 "HeapTupleSatisfiesUpdateForWriter(tuple, cid, *buffer);")
+	UT_ASSERT(strstr(source,
+					 "if (mode == LockTupleKeyShare\n"
+					 "\t\t|| (!(tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)\n"
+					 "\t\t\t&& HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)\n"
+					 "\t\t\t&& ((mode == LockTupleShare && "
+					 "!HEAP_XMAX_IS_EXCL_LOCKED(tuple->t_data->t_infomask))\n"
+					 "\t\t\t\t|| (mode == LockTupleNoKeyExclusive\n"
+					 "\t\t\t\t\t&& HEAP_XMAX_IS_KEYSHR_LOCKED(tuple->t_data->t_infomask)))))\n"
+					 "\t\tresult = "
+					 "HeapTupleSatisfiesUpdate(tuple, cid, *buffer);\n\telse\n\t\tresult = "
+					 "HeapTupleSatisfiesUpdateForWriter(tuple, cid, *buffer);")
 			  != NULL);
 	UT_ASSERT(
 		strstr(source, "result = HeapTupleSatisfiesUpdate(&oldtup, GetCurrentCommandId(false),")
@@ -879,4 +887,5 @@ main(void)
 	UT_RUN(test_canonical_active_is_prepared_before_heap_content_lock);
 	UT_RUN(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts);
 	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
 }

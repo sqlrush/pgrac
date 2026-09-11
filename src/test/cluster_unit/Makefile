@@ -2080,6 +2080,7 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
+		test_cluster_heap_lock_dispatch.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
@@ -3787,7 +3788,14 @@ test_cluster_heap_fetch_consumer.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc
+test_cluster_heap_lock_dispatch.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple\(/ { in_lock=1 } \
+	     in_lock && !found && /if \(mode == LockTupleKeyShare/ { emit=1; found++ } \
+	     emit { print } emit && /result = HeapTupleSatisfiesUpdateForWriter/ { emit=0; complete++ } \
+	     /^}/ { in_lock=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
