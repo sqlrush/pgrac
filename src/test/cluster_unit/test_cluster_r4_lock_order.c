@@ -84,6 +84,9 @@ UT_DEFINE_GLOBALS();
 static bool ut_capture_error;
 static bool ut_pending_writer_route;
 static bool ut_writer_xid_collision;
+static bool ut_lock_selector_fixture;
+static bool ut_successor_proof_fixture;
+static int ut_successor_proof_fault;
 
 bool
 errstart(int elevel, const char *domain)
@@ -493,18 +496,20 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 }
 
 bool
-cluster_itl_find_lock_slot_index_by_xmax(Page page pg_attribute_unused(),
-										 TransactionId xid pg_attribute_unused(),
-										 uint8 *slot_index_out pg_attribute_unused())
+cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId xid, uint8 *slot_index_out)
 {
-	UT_ASSERT(false); /* this fixture exercises DATA writers, not lock-only selectors */
-	return false;
+	if (!ut_lock_selector_fixture)
+		return false;
+	UT_ASSERT(ut_hot_content_lock_held);
+	UT_ASSERT_EQ(ClusterPageGetItlSlots(page)[2].xid, xid);
+	*slot_index_out = 2;
+	return true;
 }
 
 const char *
 cluster_tx_resolve_reason_name(ClusterTxResolveReason reason pg_attribute_unused())
 {
-	UT_ASSERT(false); /* positive bridge fixtures must not reach an ERROR boundary */
+	UT_ASSERT(ut_successor_proof_fixture); /* only explicit negative proof cases may error */
 	return "UNEXPECTED_TEST_ERROR";
 }
 
@@ -706,12 +711,13 @@ UnlockReleaseBuffer(Buffer buffer pg_attribute_unused())
 	UT_ASSERT(false);
 }
 bool
-cluster_itl_find_lock_tt_ref_by_xmax(Page page pg_attribute_unused(),
-									 TransactionId xid pg_attribute_unused(),
-									 ClusterUndoTTSlotRef *ref pg_attribute_unused())
+cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId xid, ClusterUndoTTSlotRef *ref)
 {
-	UT_ASSERT(false);
-	return false;
+	uint8 index;
+	if (!cluster_itl_find_lock_slot_index_by_xmax(page, xid, &index))
+		return false;
+	*ref = ut_scratch_expected_ref;
+	return true;
 }
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
@@ -1106,6 +1112,16 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 			ClusterPageGetItlSlots(ut_hot_live_ref_page)[2].wrap++;
 		if (ut_writer_bridge_mutation == 3)
 			ut_scratch_expected_ref.cluster_epoch++;
+	}
+	if (ut_successor_proof_fixture) {
+		if (ut_successor_proof_fault == 1)
+			out->locator_echo.xid++;
+		if (ut_successor_proof_fault == 2)
+			return CLUSTER_TX_UNKNOWN;
+		if (ut_successor_proof_fault == 3 && ut_writer_target_resolve_calls == 2)
+			return CLUSTER_TX_IN_PROGRESS;
+		if (ut_successor_proof_fault == 4 && ut_writer_target_resolve_calls == 2)
+			out->locator_echo.tt_wrap++;
 	}
 	return outcome;
 }
@@ -4953,6 +4969,146 @@ UT_TEST(test_pending_writer_enters_unlocked_bridge_without_a_locked_rpc)
 	}
 }
 
+static void
+ut_lock_only_writer_route_case(int negative)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	HeapTupleData tuple = { 0 };
+	ClusterItlSlotData *slot;
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile TM_Result result = TM_Invisible;
+	int pulls;
+
+	ut_itl_census_begin(&fixture, &hot, false);
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	tuple.t_data = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+	tuple.t_len = UT_HOT_TUPLE_LEN;
+	tuple.t_tableOid = UT_HOT_TABLE_OID;
+	ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	tuple.t_data->t_ctid = tuple.t_self;
+	tuple.t_data->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	tuple.t_data->t_itl_slot_idx = 1; /* DATA identity is deliberately not the lock slot. */
+	HeapTupleHeaderSetXmax(tuple.t_data, 1200);
+	slot = &ClusterPageGetItlSlots((Page)fixture.live_page)[2];
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->xid = 1200;
+	slot->wrap = 22;
+	slot->undo_segment_head = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 2, 0);
+	memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+	ut_scratch_expected_ref.origin_node_id = 1;
+	ut_scratch_expected_ref.tt_slot_id = 3;
+	ut_scratch_expected_ref.local_xid = 1200;
+	ut_lock_selector_fixture = negative != 1;
+	ut_writer_bridge_fixture = ut_pending_writer_route = true;
+	if (negative == 2)
+		slot->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	if (negative == 3)
+		memset(&slot->undo_segment_head, 0, sizeof(slot->undo_segment_head));
+	if (negative == 4)
+		ut_scratch_expected_ref.local_xid++;
+	if (negative == 5)
+		slot->undo_segment_head = uba_encode(1, 3, 2, 0);
+	if (negative == 6)
+		ut_scratch_expected_ref.tt_slot_id = 0;
+	ut_writer_bridge_tuple_pulls = 0;
+	memcpy(before.data, fixture.live_page, BLCKSZ);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		result = HeapTupleSatisfiesUpdateForWriter(&tuple, 7, UT_HOT_BUFFER);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = ut_pending_writer_route = false;
+	pulls = ut_writer_bridge_tuple_pulls;
+	UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+	if (!caught) {
+		TM_Result bridge = TM_Invisible;
+		ut_writer_target_fixture = true;
+		ut_writer_target_resolve_calls = 0;
+		ut_writer_target_already_terminal = false;
+		ut_writer_target_outcome = CLUSTER_TX_COMMITTED;
+		ut_writer_bridge_mutation = negative == 7 ? 2 : negative == 8 ? 3 : 0;
+		UT_ASSERT(cluster_heap_test_writer_wait(NULL, UT_HOT_BUFFER, &tuple, 1200,
+												tuple.t_data->t_infomask, &bridge));
+		UT_ASSERT_EQ(bridge, negative >= 7 ? TM_BeingModified : TM_Ok);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 1);
+		UT_ASSERT_EQ(ut_writer_target_resolve_calls, 2);
+		UT_ASSERT(ut_hot_content_lock_held);
+		ut_writer_target_fixture = false;
+	}
+	ut_lock_selector_fixture = ut_writer_bridge_fixture = false;
+	ut_itl_census_end();
+	UT_ASSERT_EQ(caught, negative >= 1 && negative <= 6);
+	UT_ASSERT_EQ(result, negative >= 1 && negative <= 6 ? TM_Invisible : TM_BeingModified);
+	UT_ASSERT_EQ(pulls, negative >= 1 && negative <= 6 ? 1 : 0);
+}
+
+UT_TEST(test_lock_only_writer_routes_to_unlocked_exact_owner)
+{
+	int negative;
+	for (negative = 0; negative <= 8; negative++)
+		ut_lock_only_writer_route_case(negative);
+}
+
+UT_TEST(test_successor_wait_canonicalizes_and_rejects_unproved_wakes)
+{
+	volatile int leg;
+	for (leg = 0; leg < 10; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		ClusterTxLocator locator = { 0 };
+		volatile bool caught = false;
+		volatile bool completed = false;
+		uint64 deadline = 0;
+		LockWaitPolicy policy = leg == 3 ? LockWaitSkip : leg == 4 ? LockWaitError : LockWaitBlock;
+
+		ut_itl_census_begin(&fixture, &hot, false);
+		locator.xid = 1200;
+		locator.itl_slot_index = 2;
+		locator.itl_kind = ITL_FLAG_ACTIVE;
+		locator.tt_wrap = 22;
+		locator.uba = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 2, 0);
+		ut_successor_proof_fixture = ut_writer_target_fixture = true;
+		ut_successor_proof_fault = leg == 5 ? 1 : leg == 6 ? 2 : leg == 8 ? 3 : leg == 9 ? 4 : 0;
+		ut_writer_target_resolve_calls = 0;
+		ut_writer_target_already_terminal = leg == 2;
+		ut_writer_target_outcome = leg == 1 ? CLUSTER_TX_ABORTED : CLUSTER_TX_COMMITTED;
+		ut_writer_bridge_mutation = 0;
+		if (leg == 7)
+			ut_itl_wait_result = CLUSTER_TXW_UNPROVABLE;
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+		ut_capture_error = true;
+		PG_TRY();
+		{
+			completed = cluster_heap_wait_successor(&locator, policy, &deadline);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_capture_error = false;
+		UT_ASSERT_EQ(caught, leg >= 4);
+		UT_ASSERT_EQ(completed, leg < 3);
+		UT_ASSERT_EQ(locator.tt_wrap, 22); /* copied input is never rewritten */
+		if (ut_itl_wait_calls > 0)
+			UT_ASSERT_EQ(ut_itl_wait_locator.tt_wrap, 42);
+		UT_ASSERT_EQ(ut_itl_wait_calls, leg == 0 || leg == 1 || leg >= 7 ? 1 : 0);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		ut_successor_proof_fixture = ut_writer_target_fixture = false;
+		ut_successor_proof_fault = 0;
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE); /* fixture teardown owns its unlock */
+		ut_itl_census_end();
+	}
+}
+
 UT_TEST(test_update_terminal_proof_normalizes_plain_xmax_before_native_consumers)
 {
 	int leg;
@@ -5734,7 +5890,7 @@ UT_TEST(test_hot_prune_without_xmin_hint_never_reads_requester_clog)
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(106);
 	UT_RUN(test_hot_prune_without_xmin_hint_never_reads_requester_clog);
 	UT_RUN(test_hot_prune_preserves_excluded_tuple_snapshot_and_locator_shapes);
 	UT_RUN(test_hot_prune_rejects_cyclic_input_before_origin_resolution);
@@ -5839,6 +5995,8 @@ main(void)
 	UT_RUN(test_67_one_member_current_mx_reaches_standard_hot_consumer);
 	UT_RUN(test_79_current_mx_epoch_zero_requires_clean_four_node_formation);
 	UT_RUN(test_pending_writer_enters_unlocked_bridge_without_a_locked_rpc);
+	UT_RUN(test_lock_only_writer_routes_to_unlocked_exact_owner);
+	UT_RUN(test_successor_wait_canonicalizes_and_rejects_unproved_wakes);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

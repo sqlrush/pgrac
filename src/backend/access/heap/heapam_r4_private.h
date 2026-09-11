@@ -34,6 +34,15 @@
 #include "storage/bufpage.h"
 #include "utils/snapshot.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* Exact remote Dirty wait channel for the built-in successor consumer only. */
+extern bool cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple,
+										Buffer *userbuf, bool keep_buf, bool *remote_xmax_wait,
+										ClusterTxLocator *remote_wait_locator);
+extern bool cluster_heap_wait_successor(const ClusterTxLocator *locator, LockWaitPolicy wait_policy,
+										uint64 *deadline_us);
+#endif
+
 typedef enum HeapHotSearchResultKind
 {
 	HEAP_HOT_SEARCH_NOT_FOUND = 0,

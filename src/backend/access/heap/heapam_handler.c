@@ -541,6 +541,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 #ifdef USE_PGRAC_CLUSTER
 	ClusterHeapSuccessorProof expected_successor;
 	ClusterHeapSuccessorProof next_successor;
+	uint64 successor_wait_deadline_us = 0;
 #endif
 
 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
@@ -608,14 +609,24 @@ tuple_lock_retry:
 			InitDirtySnapshot(SnapshotDirty);
 			for (;;)
 			{
+#ifdef USE_PGRAC_CLUSTER
+				bool remote_xmax_wait = false;
+				ClusterTxLocator remote_wait_locator;
+#endif
 				if (ItemPointerIndicatesMovedPartitions(tid))
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
 
 				tuple->t_self = *tid;
-				if (heap_fetch(relation, &SnapshotDirty, tuple, &buffer, true))
-				{
+				if (
+#ifdef USE_PGRAC_CLUSTER
+					cluster_heap_fetch_waitable(relation, &SnapshotDirty, tuple, &buffer, true,
+												&remote_xmax_wait, &remote_wait_locator)
+#else
+					heap_fetch(relation, &SnapshotDirty, tuple, &buffer, true)
+#endif
+				) {
 					/*
 					 * If xmin isn't what we're expecting, the slot must have
 					 * been recycled and reused for an unrelated tuple.  This
@@ -643,6 +654,17 @@ tuple_lock_retry:
 												 ItemPointerGetOffsetNumber(&tuple->t_self),
 												 RelationGetRelationName(relation))));
 
+#ifdef USE_PGRAC_CLUSTER
+					if (remote_xmax_wait) {
+						/* No fetched pointer or pin may survive the exact TX wait.
+						 * Wake is not visibility: refetch the same TID and recheck. */
+						ReleaseBuffer(buffer);
+						if (!cluster_heap_wait_successor(&remote_wait_locator, wait_policy,
+														 &successor_wait_deadline_us))
+							return TM_WouldBlock;
+						continue;
+					}
+#endif
 					/*
 					 * If tuple is being updated by other transaction then we
 					 * have to wait for its commit/abort, or die trying.

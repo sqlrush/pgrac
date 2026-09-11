@@ -977,21 +977,27 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, T
 	 * proof. TM_BeingModified is dispatch, not an IN_PROGRESS verdict. In
 	 * particular, do not perform the origin SCUR RPC below content-X merely
 	 * to discover that the bridge must release content-X and ask again. */
-	if (writer_bridge && cluster_peer_mode_enabled() && !lock_only
-		&& tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT
-		&& TransactionIdIsNormal(raw_xmax)) {
+	if (writer_bridge && cluster_peer_mode_enabled() && TransactionIdIsNormal(raw_xmax)) {
 		Page page = BufferGetPage(buffer);
-		const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
-		ClusterUndoTTSlotRef ref;
-		NodeId origin = uba_origin_node_id(slot->undo_segment_head);
+		uint8 slot_index = tuple->t_itl_slot_idx;
 
-		if (slot->flags == ITL_FLAG_ACTIVE && slot->xid == raw_xmax
-			&& !UBA_is_invalid(slot->undo_segment_head) && origin != InvalidNodeId
-			&& (int32)origin != cluster_node_id
-			&& cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) && ref.tt_slot_id != 0
-			&& ref.local_xid == raw_xmax && ref.origin_node_id == origin) {
-			*res = TM_BeingModified;
-			return true;
+		/* A lock-only holder has its own ITL, not the tuple's DATA slot. */
+		if ((!lock_only || cluster_itl_find_lock_slot_index_by_xmax(page, raw_xmax, &slot_index))
+			&& slot_index < CLUSTER_ITL_INITRANS_DEFAULT) {
+			const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[slot_index];
+			ClusterUndoTTSlotRef ref;
+			NodeId origin = uba_origin_node_id(slot->undo_segment_head);
+
+			if (slot->flags == (lock_only ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE)
+				&& slot->xid == raw_xmax && !UBA_is_invalid(slot->undo_segment_head)
+				&& origin != InvalidNodeId && (int32)origin != cluster_node_id
+				&& (lock_only ? cluster_itl_find_lock_tt_ref_by_xmax(page, raw_xmax, &ref)
+							  : cluster_itl_get_tt_ref(page, slot_index, &ref))
+				&& ref.tt_slot_id != 0 && ref.local_xid == raw_xmax
+				&& ref.origin_node_id == origin) {
+				*res = TM_BeingModified;
+				return true;
+			}
 		}
 	}
 
@@ -1068,9 +1074,11 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, T
 					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 					 errmsg("cluster TT status unknown for xmax %u", raw_xmax),
 					 errhint("Remote commit_scn not yet propagated; retry or abort."),
-					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-							   cluster_node_id)));
+					 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=%s "
+							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 PGRAC_EXIT=HTSU_XMAX_STATUS_UNKNOWN "
+							   "kind=%d writer_entry=%d infomask=%u",
+							   r.diagnostic_reason ? r.diagnostic_reason : "CALLER_CAUSE_UNPROVEN",
+							   cluster_node_id, kind, writer_bridge, (unsigned)tuple->t_infomask)));
 			break;
 		default:
 			break;
@@ -1088,12 +1096,15 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, T
 	 * shared page.  Fail closed instead.
 	 */
 	if (cluster_xid_provably_foreign(raw_xmax))
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-						errmsg("cluster TT status unknown for xmax %u", raw_xmax),
-						errhint("Remote commit_scn not yet propagated; retry or abort."),
-						errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-								  cluster_node_id)));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+				 errmsg("cluster TT status unknown for xmax %u", raw_xmax),
+				 errhint("Remote commit_scn not yet propagated; retry or abort."),
+				 errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=%s "
+						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 PGRAC_EXIT=HTSU_XMAX_FOREIGN_NO_EVIDENCE "
+						   "kind=%d writer_entry=%d infomask=%u",
+						   r.diagnostic_reason ? r.diagnostic_reason : "CALLER_CAUSE_UNPROVEN",
+						   cluster_node_id, kind, writer_bridge, (unsigned)tuple->t_infomask)));
 
 	/*
 	 * xmax NONE/LOCAL.  If xmin is remote-committed we MUST NOT fall through

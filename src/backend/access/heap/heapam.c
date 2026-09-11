@@ -3430,12 +3430,14 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
  * truncate off the destination page without having killed the referencing
  * tuple first), but the item number might well not be good.
  */
-bool
-heap_fetch(Relation relation,
-		   Snapshot snapshot,
-		   HeapTuple tuple,
-		   Buffer *userbuf,
-		   bool keep_buf)
+static bool
+heap_fetch_internal(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer *userbuf,
+					bool keep_buf
+#ifdef USE_PGRAC_CLUSTER
+					,
+					bool *remote_xmax_wait, ClusterTxLocator *remote_wait_locator
+#endif
+)
 {
 	ItemPointer tid = &(tuple->t_self);
 	ItemId		lp;
@@ -3443,6 +3445,13 @@ heap_fetch(Relation relation,
 	Page		page;
 	OffsetNumber offnum;
 	bool		valid;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (remote_xmax_wait != NULL)
+		*remote_xmax_wait = false;
+	if (remote_wait_locator != NULL)
+		memset(remote_wait_locator, 0, sizeof(*remote_wait_locator));
+#endif
 
 	/*
 	 * Fetch and pin the appropriate page of the relation.
@@ -3497,7 +3506,13 @@ heap_fetch(Relation relation,
 	/*
 	 * check tuple visibility, then release lock
 	 */
-	valid = HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
+#ifdef USE_PGRAC_CLUSTER
+	if (remote_xmax_wait != NULL && remote_wait_locator != NULL)
+		valid = cluster_heap_tuple_satisfies_visibility_waitable(
+			tuple, snapshot, buffer, remote_xmax_wait, remote_wait_locator);
+	else
+#endif
+		valid = HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
 
 	if (valid)
 		PredicateLockTID(relation, &(tuple->t_self), snapshot,
@@ -3530,6 +3545,28 @@ heap_fetch(Relation relation,
 
 	return false;
 }
+
+bool
+heap_fetch(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer *userbuf, bool keep_buf)
+{
+	return heap_fetch_internal(relation, snapshot, tuple, userbuf, keep_buf
+#ifdef USE_PGRAC_CLUSTER
+							   ,
+							   NULL, NULL
+#endif
+	);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer *userbuf,
+							bool keep_buf, bool *remote_xmax_wait,
+							ClusterTxLocator *remote_wait_locator)
+{
+	return heap_fetch_internal(relation, snapshot, tuple, userbuf, keep_buf, remote_xmax_wait,
+							   remote_wait_locator);
+}
+#endif
 
 #ifdef USE_CLUSTER_UNIT
 /*
@@ -9274,6 +9311,20 @@ unprovable:
 	return false;
 }
 
+/* The successor fetch has released its pin/content lock. Page ITL wrap is
+ * not a canonical TT incarnation; the existing origin proof must supply it.
+ * Discard the terminal verdict here: only a fresh fetch may decide the row. */
+bool
+cluster_heap_wait_successor(const ClusterTxLocator *locator, LockWaitPolicy wait_policy,
+							uint64 *deadline_us)
+{
+	ClusterTxLocator partial = *locator;
+	ClusterVisResolve proof;
+
+	partial.tt_wrap = TT_WRAP_INVALID;
+	return cluster_heap_writer_wait_target(&partial, wait_policy, deadline_us, &proof);
+}
+
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask,
@@ -14783,22 +14834,7 @@ l3:
 		{
 			LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
 			goto failed;
-		}
-		else if (require_sleep)
-		{
-#ifdef USE_PGRAC_CLUSTER
-			/*
-			 * PGRAC: spec-5.2 — set true when the C4 cross-node block below
-			 * resolves a REMOTE lock-only holder as terminal.  In that case the
-			 * native XactLockTableWait / UpdateXmaxHintBits must be SKIPPED:
-			 * they operate on the remote raw xid, which is meaningless in this
-			 * node's ProcArray/CLOG (raw xids alias across instances, AD-012)
-			 * and XactLockTableWait on it hangs (Blocker C — the same hole
-			 * fixed in heap_update/heap_delete).
-			 */
-			bool		cluster_remote_lockonly_terminal = false;
-#endif
-
+		} else if (require_sleep) {
 			/*
 			 * Acquire tuple lock to establish our priority for the tuple, or
 			 * die trying.  LockTuple will release us when we are next-in-line
@@ -14906,254 +14942,7 @@ l3:
 				 * isn't absolutely necessary in the latter case, but doing so
 				 * is simpler.
 				 */
-			}
-			else
-			{
-#ifdef USE_PGRAC_CLUSTER
-				/*
-				 * PGRAC (spec-3.4d D8 / Q1 / F1 / L199 P0):  remote ACTIVE
-				 * row lock detection BEFORE the PG-native wait_policy switch.
-				 *
-				 * Native XactLockTableWait / ConditionalXactLockTableWait
-				 * only see local ProcArray — for cross-node lock_xid this
-				 * is a correctness hole (would silently treat remote as
-				 * not-locked / not-in-progress and grant the lock to us,
-				 * causing concurrent writes on the same row from two nodes).
-				 *
-				 * Algorithm (matches spec-3.4d §7.3):
-				 *   1. tuple has HEAP_XMAX_LOCK_ONLY infomask, raw xmax
-				 *      not MultiXact (else branch already rules out MULTI);
-				 *   2. re-lock buffer and recheck xmax/infomask before
-				 *      reading page ITL bytes (F10:  PG has released the
-				 *      buffer lock before this wait window);
-				 *   3. raw_xmax + ITL slot scan via
-				 *      cluster_itl_find_lock_tt_ref_by_xmax, then copy ref
-				 *      and unlock before TT lookup;
-				 *   4. ref origin != self_node + tt_slot_id != 0 →
-				 *      authoritative remote exact-key candidate;
-				 *   5. cluster_tt_status_lookup_exact → switch on result:
-				 *        ACTIVE (IN_PROGRESS):  fail-closed per wait_policy
-				 *           LockWaitBlock → 53R98 ereport;
-				 *           LockWaitSkip  → TM_WouldBlock + goto failed;
-				 *           LockWaitError → ERRCODE_LOCK_NOT_AVAILABLE;
-				 *        COMMITTED/ABORTED: lock released, fall through
-				 *           native path (xwait commit/abort recorded);
-				 *        UNKNOWN: 53R97 fail-closed (spec-3.2 既有);
-				 *
-				 * Falls through to native wait_policy switch when:
-				 *   - cluster_enabled / cluster_node_id / has_peers gate
-				 *     fails (no-peer fast path);
-				 *   - cluster_itl_find_lock_tt_ref_by_xmax returns false
-				 *     (no remote lock metadata on page — local xwait or
-				 *     pre-spec-3.4d page);
-				 *   - ref origin == self_node (local lock — native path).
-				 */
-				if (HEAP_XMAX_IS_LOCKED_ONLY(infomask)
-					&& cluster_peer_mode_enabled())
-				{
-					ClusterUndoTTSlotRef cref;
-					bool		have_remote_ref = false;
-
-					/*
-					 * F10:  this branch runs after PG intentionally released
-					 * the buffer lock.  Reacquire it before scanning the ITL
-					 * array, and revalidate the tuple state against the
-					 * copied xmax/infomask snapshot just like the native
-					 * no-sleep fast paths above.  Keep only the copied TT ref;
-					 * TT status lookup happens after unlock to avoid taking
-					 * cluster locks under a buffer content lock.
-					 */
-					LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
-					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
-						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
-											 xwait))
-						goto l3;
-
-					if (PageHasItl(page)
-						&& cluster_itl_find_lock_tt_ref_by_xmax(page, xwait, &cref)
-						&& cref.tt_slot_id != 0
-						&& (int32) cref.origin_node_id != cluster_node_id)
-						have_remote_ref = true;
-
-					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
-
-					if (have_remote_ref)
-					{
-						ClusterTTStatusKey ckey;
-						ClusterTTStatusResult cres;
-						ClusterTTStatusSourceRequest source_request;
-						ClusterTTStatusSourceResult source_result;
-						bool		tt_found;
-						bool		tt_resolved;
-						bool		tt_terminal;
-
-						memset(&ckey, 0, sizeof(ckey));
-						ckey.origin_node_id = cref.origin_node_id;
-						ckey.undo_segment_id = cref.undo_segment_id;
-						ckey.tt_slot_id = cref.tt_slot_id;
-						ckey.cluster_epoch = cref.cluster_epoch;
-						ckey.local_xid = xwait;
-
-						/*
-						 * PGRAC: spec-5.2 §3.2 C4 refine (user-approved
-						 * 2026-06-19, Rule 8.A-safe).  have_remote_ref is a
-						 * VALID remote lock-only ITL ref keyed on xwait
-						 * (cluster_itl_find_lock_tt_ref_by_xmax matches
-						 * slot->xid == xwait and rejects recycled/ambiguous
-						 * slots), i.e. durable on-page proof the remote holder
-						 * still holds this row lock.  So any NON-terminal TT
-						 * status — IN_PROGRESS / SUBCOMMITTED, or an unresolved
-						 * UNKNOWN / not-found / not-yet-authoritative result
-						 * (the holder's in-progress hint has not reached this
-						 * node yet) — means we must WAIT for the holder to
-						 * complete, never fail closed on UNKNOWN (the frozen C4
-						 * fail-closed-on-UNKNOWN was pre-wait-world and would
-						 * make the wait unreachable for a live remote lock).
-						 * Only a confirmed authoritative-terminal status
-						 * releases us to the native path.  We never decide
-						 * visibility here; dead-holder is bounded by the finite
-						 * wait timeout (53R70).  When cluster.tx_enqueue_wait is
-						 * off we keep the pre-5.2 honest codes (53R97 unresolved
-						 * / 53R98 known-in-progress).
-						 *
-						 * ckey is the holder's full 24B TT key (origin_node_id =
-						 * the HOLDER node); never the generic resid encoder
-						 * which would key on the local node (G1).
-						 */
-						memset(&source_request, 0, sizeof(source_request));
-						source_request.key = &ckey;
-						tt_found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP,
-															   &source_request, &source_result)
-							== CLUSTER_SEMANTIC_ADMISSION_OK
-							&& source_result.bool_value;
-						cres = source_result.lookup;
-						tt_resolved = tt_found && cres.authoritative;
-						tt_terminal = tt_resolved
-							&& (cres.status == CLUSTER_TT_STATUS_COMMITTED
-								|| cres.status == CLUSTER_TT_STATUS_ABORTED
-								|| cres.status == CLUSTER_TT_STATUS_CLEANED_OUT);
-
-						if (!tt_terminal)
-						{
-							cluster_itl_bump_remote_row_lock_fail_closed_count();
-							switch (wait_policy)
-							{
-								case LockWaitBlock:
-									if (!cluster_tx_enqueue_wait_enabled)
-									{
-										/* off: honest fail-closed, pre-5.2 code by status. */
-										if (!tt_resolved
-											|| cres.status == CLUSTER_TT_STATUS_UNKNOWN)
-											ereport(ERROR,
-													(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-													 errmsg("cluster TT status unknown for remote "
-															"lock_xid %u",
-															xwait),
-													 errdetail("PGRAC_FAMILY=TT_AUTHORITY "
-															   "PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-															   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-															   cluster_node_id)));
-										ereport(ERROR,
-												(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
-												 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
-														xwait, cref.origin_node_id),
-												 errhint("cluster.tx_enqueue_wait is off; retry, use SKIP"
-														 " LOCKED, or enable it for cross-node TX waits.")));
-									}
-									{
-										ClusterTxwResult txw;
-
-										txw = cluster_tx_enqueue_wait(
-											&ckey, cluster_ges_request_timeout_ms);
-										switch (txw)
-										{
-											case CLUSTER_TXW_RESOLVED:
-											case CLUSTER_TXW_DEAD_HOLDER:
-												break;
-											case CLUSTER_TXW_RETRY:
-												ereport(ERROR,
-														(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-														 errmsg("remote row-lock wait blocked by a "
-																"PCM-X holder probe"),
-														 errhint("Retry the transaction after the "
-																 "current Cache Fusion "
-																 "conversion round completes.")));
-												break;
-											case CLUSTER_TXW_TIMEOUT:
-												ereport(ERROR,
-														(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
-														 errmsg("timed out waiting for remote row lock held by transaction %u on node %u",
-																xwait, cref.origin_node_id),
-														 errhint("Holder did not complete within"
-														 " cluster.ges_request_timeout_ms; retry.")));
-												break;
-											case CLUSTER_TXW_UNPROVABLE:
-												ereport(
-													ERROR,
-													(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-													 errmsg("could not establish an exact cluster "
-															"TX wait for remote row lock held by "
-															"transaction %u on node %u",
-															xwait, cref.origin_node_id),
-													 errdetail("PGRAC_FAMILY=TT_AUTHORITY "
-															   "PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
-															   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
-															   cluster_node_id)));
-												break;
-											case CLUSTER_TXW_DEADLOCK:
-												ereport(ERROR,
-														(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
-														 errmsg("deadlock detected"),
-														 errdetail("Cluster TX wait on transaction %u at "
-																   "node %u was selected as the victim.",
-																   xwait, cref.origin_node_id)));
-												break;
-										}
-									}
-									/*
-									 * RESOLVED: the remote lock-only holder is now
-									 * terminal.  Do NOT goto l3 — re-running
-									 * HeapTupleSatisfiesUpdate on the now-committed
-									 * REMOTE lock-only xmax misjudges it (the remote
-									 * raw xid's local CLOG/ProcArray view is
-									 * meaningless, AD-012) and can return TM_Updated
-									 * for a row that was only locked, tripping the
-									 * Assert at the result-determination below.
-									 * Instead break out to the terminal handler
-									 * (cluster_remote_lockonly_terminal = true →
-									 * skip native wait → reacquire content lock at
-									 * the shared LockBuffer below → post-wait recheck
-									 * → HEAP_XMAX_INVALID), exactly mirroring the
-									 * tt_terminal-on-first-check path and the
-									 * heap_update/heap_delete cross-node handling.
-									 */
-									break;
-								case LockWaitSkip:
-									result = TM_WouldBlock;
-									LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
-									goto failed;
-								case LockWaitError:
-									ereport(ERROR,
-											(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-											 errmsg("could not obtain lock on row in relation \"%s\"",
-													RelationGetRelationName(relation))));
-									break;
-							}
-						}
-						/*
-						 * Holder terminal (committed/aborted/cleaned): the remote
-						 * lock-only holder is done and its row lock is released.
-						 * Do NOT fall through to native XactLockTableWait /
-						 * UpdateXmaxHintBits below — they operate on the remote raw
-						 * xid, which hangs/aliases on this node's ProcArray/CLOG
-						 * (Blocker C, same as heap_update/heap_delete).  Skip the
-						 * native wait; the post-wait recheck + HEAP_XMAX_INVALID
-						 * handling below treat the lock as released and proceed.
-						 */
-						cluster_remote_lockonly_terminal = true;
-					}
-				}
-#endif
+			} else {
 #ifdef USE_PGRAC_CLUSTER
 				/*
 				 * PGRAC: spec-7.1a D0 -- remote WRITER holder in
@@ -15170,17 +14959,14 @@ l3:
 				 * via goto/ereport; only a LOCAL holder falls through to the
 				 * native wait.
 				 */
-				if (!HEAP_XMAX_IS_LOCKED_ONLY(infomask)
-					&& !(infomask & HEAP_XMAX_IS_MULTI)
-					&& cluster_peer_mode_enabled())
-				{
+				if (!(infomask & HEAP_XMAX_IS_MULTI) && cluster_peer_mode_enabled()) {
 					TM_Result	cwres = TM_Ok;
 
 					/*
 					 * F10: PG released the buffer lock before sleeping;
 					 * reacquire + revalidate before the bridge scans the ITL
-					 * (it expects the content lock held), exactly like the
-					 * lock-only block above.
+					 * (it expects the content lock held), like all other
+					 * writer consumers. DATA and LOCK_ONLY share this owner.
 					 */
 					LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
@@ -15206,8 +14992,8 @@ l3:
 						if (cwres == TM_Ok)
 						{
 							/*
-							 * Authoritatively ABORTED remote writer: mark the
-							 * dead xmax invalid (mirrors native
+							 * Authoritatively released lock-only holder or
+							 * ABORTED DATA writer: mark xmax invalid (mirrors native
 							 * UpdateXmaxHintBits for an aborted writer; the
 							 * verdict came from cluster authority, never the
 							 * local CLOG view of the foreign xid) and re-run
@@ -15234,15 +15020,6 @@ l3:
 				}
 #endif
 				/* wait for regular transaction to end, or die trying */
-#ifdef USE_PGRAC_CLUSTER
-				/*
-				 * spec-5.2: a terminal REMOTE lock-only holder is already done;
-				 * skip the native wait (XactLockTableWait on the remote raw xid
-				 * hangs/aliases — Blocker C).  The reacquire + recheck + hint-bit
-				 * handling below still run.
-				 */
-				if (!cluster_remote_lockonly_terminal)
-#endif
 				switch (wait_policy)
 				{
 					case LockWaitBlock:
@@ -15299,21 +15076,6 @@ l3:
 									 xwait))
 				goto l3;
 
-#ifdef USE_PGRAC_CLUSTER
-			if (cluster_remote_lockonly_terminal)
-			{
-				/*
-				 * spec-5.2: terminal REMOTE lock-only holder — its row lock is
-				 * released.  Mark the released xmax invalid (mirrors
-				 * UpdateXmaxHintBits for a gone lock-only locker) WITHOUT
-				 * consulting the remote raw xid's local CLOG/ProcArray, which is
-				 * meaningless for a foreign xid (AD-012).  The result-determination
-				 * below then sees HEAP_XMAX_INVALID / LOCKED_ONLY and yields TM_Ok.
-				 */
-				cluster_heap_stamp_released_xmax_invalid(tuple->t_data, *buffer);
-			}
-			else
-#endif
 			if (!(infomask & HEAP_XMAX_IS_MULTI))
 			{
 				/*

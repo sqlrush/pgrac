@@ -55,7 +55,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_hw_handoff test_cluster_lms_native_probe \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
-        test_cluster_heap_lock_tuple test_cluster_perf_gates \
+        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
@@ -358,6 +358,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
@@ -2078,6 +2079,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
+		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
@@ -3773,6 +3775,20 @@ $(CLUSTER_R4_EXEC_TUPLES_TEST_O): $(top_srcdir)/src/backend/executor/execTuples.
 
 $(CLUSTER_R4_HEAPTUPLE_TEST_O): $(top_srcdir)/src/backend/access/common/heaptuple.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_heap_epq_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_tuple_lock\(/ { print "static TM_Result"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_fetch_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_fetch_internal\(/ { print "static bool"; emit=1; found++ } \
+	     /^(heap_fetch|cluster_heap_fetch_waitable)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		cluster_r4_activation_test_stubs.h \
