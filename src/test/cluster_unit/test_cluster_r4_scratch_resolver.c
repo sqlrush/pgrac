@@ -206,6 +206,7 @@ static int ut_history_origin;
 static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
+static int ut_live_cr_gate_calls;
 static sigjmp_buf ut_error_jump;
 static bool ut_error_armed;
 static int ut_error_level;
@@ -366,6 +367,7 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_current_epoch = UT_CLUSTER_EPOCH;
 	ut_native_calls = 0;
 	ut_hint_mutations = 0;
+	ut_live_cr_gate_calls = 0;
 	ut_error_armed = false;
 	ut_error_level = 0;
 	ut_error_code = 0;
@@ -1069,6 +1071,7 @@ cluster_cr_satisfies_mvcc(HeapTuple tuple pg_attribute_unused(),
 						  Snapshot snapshot pg_attribute_unused(),
 						  Buffer buffer pg_attribute_unused(), bool *visible pg_attribute_unused())
 {
+	ut_live_cr_gate_calls++;
 	return CLUSTER_CR_NOT_APPLICABLE;
 }
 bool
@@ -1123,6 +1126,83 @@ int
 scn_time_cmp(SCN a, SCN b)
 {
 	return scn_local(a) < scn_local(b) ? -1 : scn_local(a) > scn_local(b) ? 1 : 0;
+}
+
+/* Execute the actual MVCC body, not the HOT test's counted visibility seam.
+ * A complete tuple proof must not ask CR to inspect a recycled DATA slot. */
+static void
+ut_complete_frozen_live_case(uint16 mask, uint64 epoch_delta, bool complete)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	HeapTupleHeader header;
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	ut_exit_fixture = true;
+	ut_exit_ref = ut_exact_peer_ref();
+	ut_exit_ref.local_xid++;
+	ut_memo_hit = false;
+	cluster_crossnode_runtime_visibility = true;
+	memset(ut_visibility_page.data, 0, BLCKSZ);
+	((PageHeader)ut_visibility_page.data)->pd_flags = PD_HAS_ITL;
+	((PageHeader)ut_visibility_page.data)->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_upper = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)ut_visibility_page.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageSetLSN(ut_visibility_page.data, UT_ANCHOR_LSN);
+	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	header->t_hoff = SizeofHeapTupleHeader;
+	header->t_itl_slot_idx = 0;
+	header->t_infomask = mask;
+	HeapTupleHeaderSetXmin(header, UT_RAW_XID);
+	HeapTupleHeaderSetXmax(header, (mask & HEAP_XMAX_INVALID) ? InvalidTransactionId : UT_RAW_XID);
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	header->t_ctid = tuple.t_self;
+	tuple.t_data = header;
+	tuple.t_len = SizeofHeapTupleHeader;
+	tuple.t_tableOid = FirstNormalObjectId;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_epoch = UT_CLUSTER_EPOCH + epoch_delta;
+	snapshot.read_scn = UT_READ_SCN;
+	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
+	ut_error_armed = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		visible = cluster_heap_test_satisfies_mvcc(&tuple, &snapshot, 1);
+	else
+		caught = true;
+	ut_error_armed = false;
+	UT_ASSERT_EQ(caught, epoch_delta != 0 || !complete);
+	UT_ASSERT_EQ(visible, epoch_delta == 0 && complete);
+	UT_ASSERT_EQ(ut_live_cr_gate_calls, complete ? 0 : 1);
+	if (epoch_delta != 0) {
+		UT_ASSERT_EQ(ut_error_code, ERRCODE_CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT(strstr(ut_error_message, "snapshot stale across reconfig") != NULL);
+	}
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT_EQ(ut_hint_mutations, 0);
+	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+	ut_exit_fixture = false;
+}
+
+UT_TEST(test_complete_frozen_live_proof_precedes_legacy_cr)
+{
+	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, 0, true);
+}
+
+UT_TEST(test_complete_frozen_live_proof_keeps_full_epoch_check)
+{
+	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, 1, true);
+	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, UINT64_C(1) << 32, true);
+}
+
+UT_TEST(test_incomplete_live_proof_keeps_cr_and_authority_refusal)
+{
+	ut_complete_frozen_live_case(HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID, 0, false);
+	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN, 0, false);
 }
 
 UT_TEST(test_three_real_visibility_exits_route_recycle_and_unproven)
@@ -1945,7 +2025,7 @@ UT_TEST(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(36);
 	UT_RUN(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_commit);
 	UT_RUN(test_full_scratch_history_terminal_polarity_and_bound_both_origins);
 	UT_RUN(test_full_scratch_history_cannot_rescue_unknown_malformed_or_epoch_drift);
@@ -1967,6 +2047,9 @@ main(void)
 	UT_RUN(test_real_hint_full_and_fanout_keep_loss_observable_without_retry);
 	UT_RUN(test_real_hint_receiver_wakes_only_after_successful_exact_apply);
 	UT_RUN(test_three_real_visibility_exits_route_recycle_and_unproven);
+	UT_RUN(test_complete_frozen_live_proof_precedes_legacy_cr);
+	UT_RUN(test_complete_frozen_live_proof_keeps_full_epoch_check);
+	UT_RUN(test_incomplete_live_proof_keeps_cr_and_authority_refusal);
 	UT_RUN(test_full_scratch_remote_xmax_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_remote_xmin_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_local_xmax_uses_exact_origin_not_native_clog);

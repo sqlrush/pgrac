@@ -3330,6 +3330,85 @@ UT_TEST(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zer
 	ut_full_three_versions_case(5);
 }
 
+/* Run the real HOT selector and ownership switch.  FULL delivery and the
+ * downstream live visibility service are counted adjacent boundaries. */
+static void
+ut_complete_frozen_hot_case(uint16 mask, bool newer_slot, bool unallocated, bool full)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	PGAlignedBlock before;
+	HeapTupleHeader tuple;
+	HeapHotSearchResultKind kind;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	tuple = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+	tuple->t_infomask = mask;
+	if ((mask & HEAP_XMAX_INVALID) == 0)
+		HeapTupleHeaderSetXmax(tuple, UT_HOT_LIVE_XMIN + 1);
+	if (unallocated)
+		tuple->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterPageGetItlSlots((Page)fixture.live_page)[2].write_scn
+		= UT_HOT_READ_SCN + (newer_slot ? 1 : -1);
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, PageGetLSN((Page)fixture.full_source));
+	memcpy(before.data, fixture.live_page, BLCKSZ);
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result, NULL,
+										 true);
+	UT_ASSERT_EQ(kind, full ? HEAP_HOT_SEARCH_OWNED_SCRATCH : HEAP_HOT_SEARCH_BUFFER_BACKED);
+	UT_ASSERT_EQ(ut_live_visibility_calls, full ? 0 : 1);
+	UT_ASSERT(ut_hot_content_lock_held);
+	if (full)
+		UT_ASSERT(fixture.fetch_calls > 0);
+	else {
+		UT_ASSERT_EQ(fixture.fetch_calls, 0);
+		UT_ASSERT_EQ(ut_hot_live_ref_calls, 0);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT(result.tuple.t_data == tuple);
+	}
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_complete_frozen_hot_proof_avoids_reused_creator_reconstruction)
+{
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, false, false, false);
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, true, false, false);
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID, true, true, false);
+}
+
+UT_TEST(test_incomplete_creation_flags_keep_real_hot_full_route)
+{
+	ut_complete_frozen_hot_case(HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID, true, false, true);
+	ut_complete_frozen_hot_case(HEAP_XMIN_INVALID | HEAP_XMAX_INVALID, true, false, true);
+	ut_complete_frozen_hot_case(HEAP_XMAX_INVALID, true, false, true);
+}
+
+UT_TEST(test_frozen_creator_does_not_bypass_data_lock_or_multi_xmax_full)
+{
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN, true, false, true);
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, true,
+								false, true);
+	ut_complete_frozen_hot_case(HEAP_XMIN_FROZEN | HEAP_XMAX_IS_MULTI | HEAP_XMAX_EXCL_LOCK, true,
+								false, true);
+}
+
 UT_TEST(test_post_snapshot_own_xmin_keeps_command_visibility)
 {
 	int leg;
@@ -6423,12 +6502,15 @@ UT_TEST(test_census_clearing_target_lock_returns_to_dml_owner)
 int
 main(void)
 {
-	UT_PLAN(120);
+	UT_PLAN(123);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
 	UT_RUN(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data);
 	UT_RUN(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zero_rows);
 	UT_RUN(test_real_hot_full_three_versions_select_creator_and_deleter_separately);
 	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
+	UT_RUN(test_complete_frozen_hot_proof_avoids_reused_creator_reconstruction);
+	UT_RUN(test_incomplete_creation_flags_keep_real_hot_full_route);
+	UT_RUN(test_frozen_creator_does_not_bypass_data_lock_or_multi_xmax_full);
 	UT_RUN(test_scratch_frozen_creation_keeps_data_and_context_negatives);
 	UT_RUN(test_scratch_frozen_xmin_survives_recycled_data_slot);
 	UT_RUN(test_scratch_frozen_xmin_needs_no_creator_slot);

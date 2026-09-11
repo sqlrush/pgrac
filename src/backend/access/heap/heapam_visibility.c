@@ -2323,6 +2323,15 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		ClusterUndoTTSlotRef ref = { 0 };
 		bool ref_filled = false;
 
+		/* Both tuple sides are already proved. A recycled DATA slot can be
+		 * newer than this snapshot without changing this frozen, undeleted
+		 * tuple. Skip only reconstruction, not the epoch/visibility checks
+		 * below. Effective xmax and incomplete creation proofs still take
+		 * the original CR gate. */
+		if (SCN_VALID(snapshot->read_scn) && HeapTupleHeaderXminFrozen(tuple)
+			&& (tuple->t_infomask & HEAP_XMAX_INVALID) != 0)
+			goto cluster_mvcc_epoch_and_tuple_visibility;
+
 		/*
 		 * PGRAC spec-3.9 D5: own-instance CR 3-tier short-circuit gate.
 		 *
@@ -2390,6 +2399,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			}
 		}
 
+	cluster_mvcc_epoch_and_tuple_visibility:
 		/*
 		 * spec-3.3 D10 (Q8 / R6): reconfig epoch fence. A snapshot
 		 * captured under epoch N becomes invalid the moment a peer

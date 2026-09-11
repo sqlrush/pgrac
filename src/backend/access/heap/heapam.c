@@ -4495,6 +4495,15 @@ heap_hot_r4_updated_xmin_needs_full(Page page, HeapTuple tuple,
 		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
 		return false;
 
+	/* A frozen creator with no effective xmax already has both tuple-side
+	 * proofs. Its retained raw xmin may name a recycled DATA carrier; that
+	 * mismatch is not a need to reconstruct this unchanged tuple. The caller
+	 * still runs ordinary visibility, including the snapshot epoch check.
+	 * Frozen creation alone does not exempt an effective xmax from FULL. */
+	if (HeapTupleHeaderXminFrozen(tuple->t_data)
+		&& (tuple->t_data->t_infomask & HEAP_XMAX_INVALID) != 0)
+		return false;
+
 	raw_xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
 	itl_index = tuple->t_data->t_itl_slot_idx;
 	if (!TransactionIdIsNormal(raw_xmin)
