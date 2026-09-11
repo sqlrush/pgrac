@@ -656,8 +656,8 @@ make_one_update_candidate_page(char page[BLCKSZ],
 	record->target_block = extension->route_proof.tag.blockNum;
 	record->target_offset = FirstOffsetNumber;
 	record->tt_wrap_plus1 = TEST_WRAP + 1;
-	payload->new_block = InvalidBlockNumber;
-	payload->new_offset = InvalidOffsetNumber;
+	payload->new_block = extension->route_proof.tag.blockNum;
+	payload->new_offset = 2;
 	payload->old_tuple_length = TEST_TUPLE_LENGTH;
 	payload->old_tuple_offset = sizeof(*payload);
 	memcpy(record_old, expected_old, TEST_TUPLE_LENGTH);
@@ -938,8 +938,8 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	head->target_block = extension->route_proof.tag.blockNum;
 	head->target_offset = middle_offnum;
 	head->tt_wrap_plus1 = TEST_WRAP + 1;
-	head_payload->new_block = InvalidBlockNumber;
-	head_payload->new_offset = InvalidOffsetNumber;
+	head_payload->new_block = extension->route_proof.tag.blockNum;
+	head_payload->new_offset = newest_offnum;
 	head_payload->old_tuple_length = TEST_TUPLE_LENGTH;
 	head_payload->old_tuple_offset = sizeof(*head_payload);
 	memcpy(head_old, middle_image_bytes, TEST_TUPLE_LENGTH);
@@ -960,8 +960,8 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	tail->target_block = extension->route_proof.tag.blockNum;
 	tail->target_offset = FirstOffsetNumber;
 	tail->tt_wrap_plus1 = TEST_WRAP + 1;
-	tail_payload->new_block = InvalidBlockNumber;
-	tail_payload->new_offset = InvalidOffsetNumber;
+	tail_payload->new_block = extension->route_proof.tag.blockNum;
+	tail_payload->new_offset = middle_offnum;
 	tail_payload->old_tuple_length = TEST_TUPLE_LENGTH;
 	tail_payload->old_tuple_offset = sizeof(*tail_payload);
 	memcpy(tail_old, expected_oldest, TEST_TUPLE_LENGTH);
@@ -2267,10 +2267,292 @@ UT_TEST(test_r4_builder_cross_segment_cycle_fails_before_repeat_fetch)
 	cluster_cr_build_on_holder_forget(2, 83);
 }
 
+/* The ordinary heap producer records the replacement TID; it is not a
+ * legacy in-place record with both successor fields unset. */
+UT_TEST(test_r4_builder_ordinary_update_successor_pair_reaches_full)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ];
+	ClusterR4CrSlotExtension extension = make_builder_extension(84, 114);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoUpdatePayload *payload = (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	payload->new_block = 37;
+	payload->new_offset = 2;
+	memset(foreign_page, 0, sizeof(foreign_page));
+
+	result = cluster_cr_build_on_holder_step(0, 84, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 84);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, PageGetItemId((Page)page, 1)), expected_old,
+					 TEST_TUPLE_LENGTH)
+			  == 0);
+	UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page, 2)));
+}
+
+UT_TEST(test_r4_builder_cross_page_update_does_not_fetch_successor)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ];
+	char foreign_before[BLCKSZ];
+	ClusterR4CrSlotExtension extension = make_builder_extension(85, 115);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoUpdatePayload *payload = (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	HeapTupleHeader old_current;
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	payload->new_block = 38;
+	payload->new_offset = 2;
+	old_current = (HeapTupleHeader)PageGetItem((Page)page, PageGetItemId((Page)page, 1));
+	ItemPointerSet(&old_current->t_ctid, 38, 2);
+	ItemIdSetUnused(PageGetItemId((Page)page, 2));
+	memset(foreign_page, 0xad, sizeof(foreign_page));
+	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
+	result = cluster_cr_build_on_holder_step(0, 85, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 85);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, PageGetItemId((Page)page, 1)), expected_old,
+					 TEST_TUPLE_LENGTH)
+			  == 0);
+	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
+}
+
+UT_TEST(test_r4_builder_successor_page_skips_old_target_inverse)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(86, 116);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoUpdatePayload *payload = (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	payload->new_block = 38;
+	payload->new_offset = 1;
+	/* The query page is the replacement page; the record still names old37/1. */
+	extension.route_proof.tag.blockNum = 38;
+	*PageGetItemId((Page)page, 1) = *PageGetItemId((Page)page, 2);
+	((PageHeader)page)->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
+	result = cluster_cr_build_on_holder_step(0, 86, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 86);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+	UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page, 1)));
+}
+
+UT_TEST(test_r4_builder_update_pair_horizon_does_not_restore_old_image)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char target_before[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(87, 117);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	record->write_scn = extension.route_proof.read_scn;
+	memcpy(target_before, PageGetItem((Page)page, PageGetItemId((Page)page, 1)), TEST_TUPLE_LENGTH);
+	result = cluster_cr_build_on_holder_step(0, 87, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 87);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, PageGetItemId((Page)page, 1)), target_before,
+					 TEST_TUPLE_LENGTH)
+			  == 0);
+}
+
+UT_TEST(test_r4_builder_update_payload_rejects_incomplete_or_corrupt_shapes)
+{
+	int case_index;
+
+	for (case_index = 0; case_index < 10; case_index++) {
+		char page[BLCKSZ];
+		char before[BLCKSZ];
+		char expected_old[TEST_TUPLE_LENGTH];
+		char foreign_page[BLCKSZ] = { 0 };
+		ClusterR4CrSlotExtension extension = make_builder_extension(88, 118);
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+		UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
+		UndoUpdatePayload *payload
+			= (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+		HeapTupleHeader old_image = (HeapTupleHeader)((char *)payload + sizeof(*payload));
+		ClusterR4CrBuildStepResult result;
+
+		extension.route_proof.tag.spcOid = 1663;
+		extension.route_proof.tag.dbOid = 5;
+		extension.route_proof.tag.relNumber = 20000;
+		extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+		extension.route_proof.tag.blockNum = 37;
+		make_one_update_candidate_page(page, &extension, expected_old);
+		switch (case_index) {
+		case 0:
+			payload->new_offset = InvalidOffsetNumber;
+			break;
+		case 1:
+			payload->new_block = InvalidBlockNumber;
+			break;
+		case 2:
+			payload->new_offset = MaxHeapTuplesPerPage + 1;
+			break;
+		case 3:
+			payload->new_offset = record->target_offset;
+			break;
+		case 4:
+			payload->flags = 1;
+			break;
+		case 5:
+			payload->old_tuple_offset++;
+			break;
+		case 6:
+			payload->old_tuple_length = SizeofHeapTupleHeader - 1;
+			record->payload_length = sizeof(*payload) + payload->old_tuple_length;
+			ut_undo_record_length = sizeof(*record) + record->payload_length;
+			break;
+		case 7:
+			old_image->t_hoff = SizeofHeapTupleHeader - 1;
+			break;
+		case 8:
+			old_image->t_hoff = TEST_TUPLE_LENGTH + 1;
+			break;
+		case 9:
+			payload->new_block = InvalidBlockNumber;
+			payload->new_offset = InvalidOffsetNumber;
+			payload->flags = 1;
+			break;
+		}
+		memcpy(before, page, sizeof(page));
+		result = cluster_cr_build_on_holder_step(0, 88, false, &extension, page, foreign_page,
+												 &reason);
+		cluster_cr_build_on_holder_forget(0, 88);
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT(memcmp(page, before, sizeof(page)) == 0);
+	}
+}
+
+UT_TEST(test_r4_builder_update_pair_keeps_foreign_occupant_identity_guard)
+{
+	char page[BLCKSZ];
+	char before[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(89, 119);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	HeapTupleHeader occupant;
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	occupant = (HeapTupleHeader)PageGetItem((Page)page, PageGetItemId((Page)page, 1));
+	HeapTupleHeaderSetXmin(occupant, TEST_XID + 999);
+	memcpy(before, page, sizeof(page));
+	result = cluster_cr_build_on_holder_step(0, 89, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 89);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
+	UT_ASSERT(memcmp(page, before, sizeof(page)) == 0);
+}
+
+UT_TEST(test_r4_builder_legacy_update_still_restores_exact_old_image)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(90, 120);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoUpdatePayload *payload = (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	payload->new_block = InvalidBlockNumber;
+	payload->new_offset = InvalidOffsetNumber;
+	result = cluster_cr_build_on_holder_step(0, 90, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 90);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, PageGetItemId((Page)page, 1)), expected_old,
+					 TEST_TUPLE_LENGTH)
+			  == 0);
+}
+
+UT_TEST(test_r4_builder_successor_tid_is_not_unrelated_tuple_delete_authority)
+{
+	char page[BLCKSZ];
+	char expected_old[TEST_TUPLE_LENGTH];
+	char occupant_before[TEST_TUPLE_LENGTH];
+	char foreign_page[BLCKSZ] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(91, 121);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	HeapTupleHeader occupant;
+	ClusterR4CrBuildStepResult result;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page, &extension, expected_old);
+	occupant = (HeapTupleHeader)PageGetItem((Page)page, PageGetItemId((Page)page, 2));
+	HeapTupleHeaderSetXmin(occupant, TEST_XID + 999);
+	memcpy(occupant_before, occupant, TEST_TUPLE_LENGTH);
+	result = cluster_cr_build_on_holder_step(0, 91, false, &extension, page, foreign_page, &reason);
+	cluster_cr_build_on_holder_forget(0, 91);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, PageGetItemId((Page)page, 1)), expected_old,
+					 TEST_TUPLE_LENGTH)
+			  == 0);
+	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)page, 2)));
+	UT_ASSERT(memcmp(occupant, occupant_before, TEST_TUPLE_LENGTH) == 0);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(49);
+	UT_PLAN(57);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
@@ -2321,6 +2603,14 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_builder_rejects_malformed_off_target_relation_before_filter);
 	UT_RUN(test_r4_builder_rejects_off_target_itl_invalid_slot_before_filter);
 	UT_RUN(test_r4_builder_cross_segment_cycle_fails_before_repeat_fetch);
+	UT_RUN(test_r4_builder_ordinary_update_successor_pair_reaches_full);
+	UT_RUN(test_r4_builder_cross_page_update_does_not_fetch_successor);
+	UT_RUN(test_r4_builder_successor_page_skips_old_target_inverse);
+	UT_RUN(test_r4_builder_update_pair_horizon_does_not_restore_old_image);
+	UT_RUN(test_r4_builder_update_payload_rejects_incomplete_or_corrupt_shapes);
+	UT_RUN(test_r4_builder_update_pair_keeps_foreign_occupant_identity_guard);
+	UT_RUN(test_r4_builder_legacy_update_still_restores_exact_old_image);
+	UT_RUN(test_r4_builder_successor_tid_is_not_unrelated_tuple_delete_authority);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

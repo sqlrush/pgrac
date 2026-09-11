@@ -774,18 +774,38 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 				const UndoUpdatePayload *payload = (const UndoUpdatePayload *)(
 					record_buffer.data + sizeof(UndoRecordHeader));
 				const char *old_tuple;
+				const HeapTupleHeaderData *old_header;
+				bool successor_absent;
+				bool successor_present;
 
-				if (record->payload_length < sizeof(*payload)
-					|| payload->new_block != InvalidBlockNumber
-					|| payload->new_offset != InvalidOffsetNumber
+				if (record->payload_length < sizeof(*payload) || payload->flags != 0
 					|| payload->old_tuple_offset != sizeof(*payload)
-					|| payload->old_tuple_length == 0
+					|| payload->old_tuple_length < SizeofHeapTupleHeader
 					|| (size_t)payload->old_tuple_offset + payload->old_tuple_length
-						!= record->payload_length) {
+						   != record->payload_length) {
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
+				/* Ordinary UPDATE records its replacement TID.  Validate that
+				 * pair without treating it as authority to visit another page or
+				 * delete an arbitrary occupant.  The existing target inverse and
+				 * candidate-xmin prune own those effects.  Both-invalid remains
+				 * the historical in-place representation. */
+				successor_absent = payload->new_block == InvalidBlockNumber
+								   && payload->new_offset == InvalidOffsetNumber;
+				successor_present = payload->new_block != InvalidBlockNumber
+									&& payload->new_offset >= FirstOffsetNumber
+									&& payload->new_offset <= MaxHeapTuplesPerPage
+									&& (payload->new_block != record->target_block
+										|| payload->new_offset != record->target_offset);
 				old_tuple = (const char *)payload + payload->old_tuple_offset;
+				old_header = (const HeapTupleHeaderData *)old_tuple;
+				if ((!successor_absent && !successor_present)
+					|| old_header->t_hoff < SizeofHeapTupleHeader
+					|| old_header->t_hoff > payload->old_tuple_length) {
+					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+					return CLUSTER_R4_CR_STEP_FAIL;
+				}
 				if (apply_record && !cluster_cr_apply_update_inverse(
 						result_page, record, payload, old_tuple,
 						payload->old_tuple_length)) {
