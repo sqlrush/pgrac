@@ -2268,6 +2268,72 @@ lms_own_xid_recycle_bound(SCN *out_horizon)
 	return true;
 }
 
+/* Request-local observation only; none of these fields grants authority. */
+typedef struct LmsFreshrefPairDiagnostic {
+	const char *predicate;
+	bool native_sampled;
+	bool no_raw_reuse;
+	bool own_xid;
+	bool scan_sampled;
+	ClusterTTDurableResolve resolve;
+	uint16 matched_segment;
+	uint16 matched_slot;
+	uint16 matched_wrap;
+	SCN resolved_scn;
+	bool clog_sampled;
+	TransactionId clog_floor;
+	int raw_status;
+	bool retention_sampled;
+	bool retention_ok;
+	SCN horizon_scn;
+} LmsFreshrefPairDiagnostic;
+
+static bool
+lms_freshref_pair_detail_admit(uint32 *emitted)
+{
+	if (*emitted >= 64)
+		return false;
+	(*emitted)++;
+	return true;
+}
+
+static const char *
+lms_freshref_pair_refusal_predicate(const volatile LmsFreshrefPairDiagnostic *d,
+									uint32 expected_segment, uint32 expected_slot, SCN proposed_scn)
+{
+	if (!d->no_raw_reuse)
+		return "NATIVE_REUSE_GUARD_DISABLED";
+	if (!d->own_xid)
+		return "ORIGIN_NOT_OWNED";
+	switch (d->resolve) {
+	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
+		return "TT_SCAN_UNAVAILABLE";
+	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
+		return "TT_AMBIGUOUS";
+	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
+		return "TT_UNSTAMPED";
+	default:
+		break;
+	}
+	if (!d->clog_sampled)
+		return "CLOG_TRUNCATED";
+	if (d->raw_status != TRANSACTION_STATUS_COMMITTED)
+		return "CLOG_NOT_COMMITTED";
+	if (d->resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
+		if (d->matched_segment != expected_segment)
+			return "TT_SEGMENT_MISMATCH";
+		if ((uint32)d->matched_slot + 1 != expected_slot)
+			return "TT_SLOT_MISMATCH";
+		if (!SCN_VALID(d->resolved_scn) || d->resolved_scn != proposed_scn)
+			return "TT_SCN_MISMATCH";
+	} else if (d->resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH) {
+		if (!d->retention_ok || !SCN_VALID(d->horizon_scn))
+			return "RETENTION_UNAVAILABLE";
+		return "RETENTION_NOT_COVERED";
+	}
+	return "POLICY_REFUSED";
+}
+
 /* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
  * prehistory reader fence continuously covers the complete durable scan,
  * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
@@ -2275,11 +2341,13 @@ lms_own_xid_recycle_bound(SCN *out_horizon)
  * echo only the request's exact cached SCN, never reinterpret a horizon as
  * an exact value. */
 static LmsOwnXidReason
-lms_resolve_own_xid_freshref_c1b_pair(
-	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
-	SCN proposed_scn, uint8 *out_verdict, SCN *out_commit_scn,
-	SCN *out_horizon_scn, uint16 *out_wrap)
+lms_resolve_own_xid_freshref_c1b_pair(TransactionId xid, uint32 expected_segment_id,
+									  uint32 expected_tt_slot_id, SCN proposed_scn,
+									  uint8 *out_verdict, SCN *out_commit_scn, SCN *out_horizon_scn,
+									  uint16 *out_wrap,
+									  volatile LmsFreshrefPairDiagnostic *diagnostic)
 {
+	volatile LmsFreshrefPairDiagnostic ignored;
 	ClusterUndoVerdictKind pair_verdict
 		= CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
 	ClusterTTDurableResolve resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
@@ -2291,6 +2359,11 @@ lms_resolve_own_xid_freshref_c1b_pair(
 	int raw_clog_status = TRANSACTION_STATUS_IN_PROGRESS;
 	bool retention_ok = false;
 
+	if (diagnostic == NULL)
+		diagnostic = &ignored;
+	memset((void *)diagnostic, 0, sizeof(*diagnostic));
+	diagnostic->predicate = "BAD_INPUT";
+	diagnostic->raw_status = -1;
 	*out_verdict = 0;
 	*out_commit_scn = InvalidScn;
 	*out_horizon_scn = InvalidScn;
@@ -2314,20 +2387,34 @@ lms_resolve_own_xid_freshref_c1b_pair(
 		 * fence plus its one-way disable is the exact no-raw-reuse window. */
 		no_raw_reuse_window = !cluster_cr_native_prehistory_disabled();
 		xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
+		diagnostic->native_sampled = true;
+		diagnostic->no_raw_reuse = no_raw_reuse_window;
+		diagnostic->own_xid = xid_is_mine;
 
 		if (xid_is_mine) {
 			resolve = cluster_tt_slot_durable_resolve_by_xid(
 				xid, CLUSTER_TT_WRAP_ANY, &resolved_scn, &matched_segment,
 				&matched_slot, &matched_wrap);
+			diagnostic->scan_sampled = true;
+			diagnostic->resolve = resolve;
+			diagnostic->matched_segment = matched_segment;
+			diagnostic->matched_slot = matched_slot;
+			diagnostic->matched_wrap = matched_wrap;
+			diagnostic->resolved_scn = resolved_scn;
 			if (resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN
 				|| resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH) {
 				XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+				TransactionId clog_floor;
 				bool clog_sampled = false;
 
 				LWLockAcquire(XactTruncationLock, LW_SHARED);
-				if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+				clog_floor = ShmemVariableCache->oldestClogXid;
+				diagnostic->clog_floor = clog_floor;
+				if (!TransactionIdPrecedes(xid, clog_floor)) {
 					raw_clog_status = TransactionIdGetStatus(xid, &clog_lsn);
 					clog_sampled = true;
+					diagnostic->clog_sampled = true;
+					diagnostic->raw_status = raw_clog_status;
 				}
 				LWLockRelease(XactTruncationLock);
 
@@ -2335,6 +2422,9 @@ lms_resolve_own_xid_freshref_c1b_pair(
 					&& resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 					&& raw_clog_status == TRANSACTION_STATUS_COMMITTED) {
 					retention_ok = lms_own_xid_recycle_bound(&horizon_scn);
+					diagnostic->retention_sampled = true;
+					diagnostic->retention_ok = retention_ok;
+					diagnostic->horizon_scn = horizon_scn;
 				}
 
 				if (clog_sampled)
@@ -2349,6 +2439,7 @@ lms_resolve_own_xid_freshref_c1b_pair(
 	}
 	PG_CATCH(freshref_pair);
 	{
+		diagnostic->predicate = "CORE_EXCEPTION";
 		/* The pair owns no persistent state.  Release both the native fence
 		 * and any CLOG/retention LWLocks before the LMS converts the error to
 		 * a fail-closed DENIED reply. */
@@ -2359,8 +2450,12 @@ lms_resolve_own_xid_freshref_c1b_pair(
 	}
 	PG_END_TRY(freshref_pair);
 
-	if (pair_verdict != CLUSTER_UNDO_VERDICT_COMMITTED_EXACT)
+	if (pair_verdict != CLUSTER_UNDO_VERDICT_COMMITTED_EXACT) {
+		diagnostic->predicate = lms_freshref_pair_refusal_predicate(
+			diagnostic, expected_segment_id, expected_tt_slot_id, proposed_scn);
 		return LMS_OWN_XID_REFUSE_OTHER;
+	}
+	diagnostic->predicate = "PROVEN";
 
 	*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 	*out_commit_scn = proposed_scn;
@@ -2385,9 +2480,9 @@ cluster_cr_server_local_freshref_c1b_pair_exact(
 
 	if (out_wrap != NULL)
 		*out_wrap = 0;
-	reason = lms_resolve_own_xid_freshref_c1b_pair(
-		xid, expected_segment_id, expected_tt_slot_id, proposed_scn,
-		&verdict, &commit_scn, &horizon_scn, &wrap);
+	reason = lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
+												   proposed_scn, &verdict, &commit_scn,
+												   &horizon_scn, &wrap, NULL);
 	if (reason != LMS_OWN_XID_PROVEN
 		|| verdict != (uint8) CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
 		|| commit_scn != proposed_scn || SCN_VALID(horizon_scn))
@@ -2713,10 +2808,10 @@ cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid,
 	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
 
-	if (lms_resolve_own_xid_freshref_c1b_pair(
-			xid, expected_segment_id, expected_tt_slot_id, proposed_scn,
-			&verdict, &commit_scn, &horizon_scn, &wrap)
-		== LMS_OWN_XID_PROVEN
+	if (lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
+											  proposed_scn, &verdict, &commit_scn, &horizon_scn,
+											  &wrap, NULL)
+			== LMS_OWN_XID_PROVEN
 		&& verdict == (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT) {
 		result.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
 		result.commit_scn = commit_scn;
@@ -2724,7 +2819,70 @@ cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid,
 	}
 	return result;
 }
+
+const char *
+cluster_cr_server_test_own_xid_pair_reason(TransactionId xid, uint32 expected_segment_id,
+										   uint32 expected_tt_slot_id, SCN proposed_scn,
+										   ClusterUndoVerdictResult *out)
+{
+	volatile LmsFreshrefPairDiagnostic diagnostic;
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+
+	memset(out, 0, sizeof(*out));
+	(void)lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
+												proposed_scn, &verdict, &commit_scn, &horizon_scn,
+												&wrap, &diagnostic);
+	if (verdict == (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT) {
+		out->kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		out->commit_scn = commit_scn;
+		out->wrap = wrap;
+	}
+	return diagnostic.predicate;
+}
+
+bool
+cluster_cr_server_test_pair_detail_admit(uint32 *emitted)
+{
+	return lms_freshref_pair_detail_admit(emitted);
+}
 #endif
+
+/* Bounded refusal evidence. Never read authority again or log under its locks. */
+static void
+lms_freshref_pair_log_refusal(const ClusterLmsCrSlot *slot, const char *phase,
+							  const char *predicate,
+							  const volatile LmsFreshrefPairDiagnostic *diagnostic)
+{
+	static uint32 emitted;
+	LmsFreshrefPairDiagnostic empty;
+
+	if (!SCN_VALID(slot->read_scn) || !lms_freshref_pair_detail_admit(&emitted))
+		return;
+	memset(&empty, 0, sizeof(empty));
+	empty.raw_status = -1;
+	if (diagnostic == NULL)
+		diagnostic = &empty;
+	elog(LOG,
+		 "PGRAC freshref C1b refused: node=%d requester=%d backend=%d "
+		 "request=" UINT64_FORMAT " xid=%u segment=%u slot=%u proposed=" UINT64_FORMAT
+		 " epoch=" UINT64_FORMAT " phase=%s predicate=%s "
+		 "native_sampled=%d no_raw_reuse=%d own_xid=%d scan_sampled=%d scan=%d "
+		 "matched_segment=%u matched_slot=%u matched_wrap=%u resolved=" UINT64_FORMAT
+		 " clog_sampled=%d clog_floor=%u raw_status=%d retention_sampled=%d "
+		 "retention_ok=%d horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT
+		 " detail_budget_exhausted=%d",
+		 cluster_node_id, slot->requester_node, slot->requester_backend, slot->request_id,
+		 slot->undo_xid, slot->undo_segment_id, slot->undo_block_no, (uint64)slot->read_scn,
+		 slot->epoch, phase, predicate, diagnostic->native_sampled, diagnostic->no_raw_reuse,
+		 diagnostic->own_xid, diagnostic->scan_sampled, (int)diagnostic->resolve,
+		 diagnostic->matched_segment, diagnostic->matched_slot, diagnostic->matched_wrap,
+		 (uint64)diagnostic->resolved_scn, diagnostic->clog_sampled, diagnostic->clog_floor,
+		 diagnostic->raw_status, diagnostic->retention_sampled, diagnostic->retention_ok,
+		 (uint64)diagnostic->horizon_scn, (uint64)slot->undo_auth.authority_scn, emitted == 64);
+}
 
 /*
  * lms_undo_verdict_serve — LMS side of one KIND_UNDO_VERDICT slot
@@ -2789,14 +2947,17 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	bool zero_epoch_pair = freshref_pair && slot->epoch == 0;
 	bool zero_epoch_current = false;
 	ClusterSemanticAdmissionToken zero_epoch_admission;
+	volatile LmsFreshrefPairDiagnostic pair_diagnostic;
 	LmsOwnXidReason reason;
 
 	memset(&zero_epoch_admission, 0, sizeof(zero_epoch_admission));
+	memset((void *)&pair_diagnostic, 0, sizeof(pair_diagnostic));
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
 	if (!TransactionIdIsNormal(xid)) {
 		cluster_vis53r97_note_srv_other();
+		lms_freshref_pair_log_refusal(slot, "ENTRY", "BAD_XID", NULL);
 		return false;
 	}
 	if (freshref_pair
@@ -2807,6 +2968,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 			|| pair_segment != slot->undo_segment_id || pair_xid != xid
 			|| pair_slot != slot->undo_block_no)) {
 		cluster_vis53r97_note_srv_other();
+		lms_freshref_pair_log_refusal(slot, "ENTRY", "PAIR_FIELDS", NULL);
 		return false;
 	}
 
@@ -2829,6 +2991,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		if (!cluster_runtime_visibility_zero_epoch_pair_admission_enter(
 				&zero_epoch_admission)) {
 			cluster_vis53r97_note_srv_other();
+			lms_freshref_pair_log_refusal(slot, "ENTRY", "ZERO_EPOCH_ADMISSION", NULL);
 			return false;
 		}
 		PG_TRY();
@@ -2839,9 +3002,8 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 				= cluster_undo_tt_retention_rollover_count();
 			slot->undo_auth.authority_scn = cluster_scn_current();
 			reason = lms_resolve_own_xid_freshref_c1b_pair(
-				xid, slot->undo_segment_id, slot->undo_block_no,
-				slot->read_scn, &verdict, &commit_scn, &horizon_scn,
-				&wrap);
+				xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn, &verdict,
+				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic);
 			zero_epoch_current
 				= cluster_semantic_activation_recheck(
 					&zero_epoch_admission);
@@ -2853,6 +3015,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		PG_END_TRY();
 		if (!zero_epoch_current) {
 			cluster_vis53r97_note_srv_other();
+			lms_freshref_pair_log_refusal(slot, "EXIT", "ADMISSION_DRIFT", &pair_diagnostic);
 			return false;
 		}
 	} else {
@@ -2870,21 +3033,28 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		 * census leg. */
 		if (freshref_pair)
 			reason = lms_resolve_own_xid_freshref_c1b_pair(
-				xid, slot->undo_segment_id, slot->undo_block_no,
-				slot->read_scn, &verdict, &commit_scn, &horizon_scn,
-				&wrap);
+				xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn, &verdict,
+				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic);
 		else
 		reason = lms_resolve_own_xid_verdict(
 			xid, slot->undo_segment_id, slot->undo_block_no,
 			slot->undo_authoritative, &verdict, &commit_scn, &horizon_scn, &wrap);
 	}
-	if (freshref_pair
-		&& (slot->epoch != cluster_epoch_get_current()
-			|| slot->undo_auth.origin_epoch != slot->epoch
+	if (freshref_pair) {
+		uint64 exit_epoch = cluster_epoch_get_current();
+
+		if (slot->epoch != exit_epoch || slot->undo_auth.origin_epoch != slot->epoch
 			|| !SCN_VALID(slot->undo_auth.authority_scn)
-			|| scn_time_cmp(slot->undo_auth.authority_scn, slot->read_scn) < 0)) {
-		cluster_vis53r97_note_srv_other();
-		return false;
+			|| scn_time_cmp(slot->undo_auth.authority_scn, slot->read_scn) < 0) {
+			cluster_vis53r97_note_srv_other();
+			lms_freshref_pair_log_refusal(
+				slot, "EXIT",
+				(slot->epoch != exit_epoch || slot->undo_auth.origin_epoch != slot->epoch)
+					? "EPOCH_DRIFT"
+					: "AUTHORITY_SCN_NOT_COVERED",
+				&pair_diagnostic);
+			return false;
+		}
 	}
 	switch (reason) {
 	case LMS_OWN_XID_PROVEN:
@@ -2903,6 +3073,9 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	case LMS_OWN_XID_REFUSE_OTHER:
 	default:
 		cluster_vis53r97_note_srv_other();
+		if (freshref_pair)
+			lms_freshref_pair_log_refusal(slot, "CORE", pair_diagnostic.predicate,
+										  &pair_diagnostic);
 		return false;
 	}
 
@@ -3239,6 +3412,8 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 				served = false;
 				MemoryContextSwitchTo(TopMemoryContext);
 				FlushErrorState();
+				if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT)
+					lms_freshref_pair_log_refusal(slot, "EXCEPTION", "CORE_EXCEPTION", NULL);
 			}
 			PG_END_TRY();
 		}

@@ -87,6 +87,12 @@ extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
 extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	SCN proposed_scn);
+extern const char *cluster_cr_server_test_own_xid_pair_reason(TransactionId xid,
+															  uint32 expected_segment_id,
+															  uint32 expected_tt_slot_id,
+															  SCN proposed_scn,
+															  ClusterUndoVerdictResult *out);
+extern bool cluster_cr_server_test_pair_detail_admit(uint32 *emitted);
 extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
 	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
 	int32 local_node, uint64 current_epoch, int max_backends,
@@ -956,6 +962,167 @@ UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
 		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
 }
 
+/* Observe the actual resolver, without promoting an old refusal to success. */
+UT_TEST(test_freshref_pair_diagnostic_preserves_exact_and_alias_refusal)
+{
+	ClusterUndoVerdictResult result;
+	const char *reason;
+
+	c0_reset();
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_retention_ok = true;
+	c0_horizon_scn = 10499;
+	reason = cluster_cr_server_test_own_xid_pair_reason(4195136, 7, 1, 10498, &result);
+	UT_ASSERT(strcmp(reason, "PROVEN") == 0);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, 10498);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+
+	c0_reset();
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_matched_segment = 8;
+	c0_matched_slot = 0;
+	c0_resolved_scn = 10498;
+	reason = cluster_cr_server_test_own_xid_pair_reason(4195136, 7, 1, 10498, &result);
+	UT_ASSERT(strcmp(reason, "TT_SEGMENT_MISMATCH") == 0);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_bound_calls, 0);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+}
+
+UT_TEST(test_freshref_pair_diagnostic_negative_matrix)
+{
+	static const char *expected[] = { "BAD_INPUT",
+									  "NATIVE_REUSE_GUARD_DISABLED",
+									  "ORIGIN_NOT_OWNED",
+									  "TT_SCAN_UNAVAILABLE",
+									  "TT_AMBIGUOUS",
+									  "TT_UNSTAMPED",
+									  "CLOG_TRUNCATED",
+									  "CLOG_NOT_COMMITTED",
+									  "CLOG_NOT_COMMITTED",
+									  "CLOG_NOT_COMMITTED",
+									  "TT_SEGMENT_MISMATCH",
+									  "TT_SLOT_MISMATCH",
+									  "TT_SCN_MISMATCH",
+									  "RETENTION_UNAVAILABLE",
+									  "RETENTION_NOT_COVERED" };
+	int i;
+
+	for (i = 0; i < lengthof(expected); i++) {
+		ClusterUndoVerdictResult result;
+		uint32 segment = 7;
+		const char *reason;
+		int scans = 0;
+		int event;
+
+		c0_reset();
+		c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+		c0_retention_ok = true;
+		c0_horizon_scn = 10499;
+		switch (i) {
+		case 0:
+			segment = 0;
+			break;
+		case 1:
+			c0_disabled = true;
+			break;
+		case 2:
+			c0_xid_is_mine = false;
+			break;
+		case 3:
+			c0_resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+			break;
+		case 4:
+			c0_resolve = CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP;
+			break;
+		case 5:
+			c0_resolve = CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN;
+			break;
+		case 6:
+			c0_variable_cache.oldestClogXid = 4195137;
+			break;
+		case 7:
+			c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+			break;
+		case 8:
+			c0_raw_status = TRANSACTION_STATUS_ABORTED;
+			break;
+		case 9:
+			c0_raw_status = TRANSACTION_STATUS_SUB_COMMITTED;
+			break;
+		case 10:
+		case 11:
+		case 12:
+			c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+			c0_matched_segment = i == 10 ? 8 : 7;
+			c0_matched_slot = i == 11 ? 1 : 0;
+			c0_resolved_scn = i == 12 ? 10499 : 10498;
+			break;
+		case 13:
+			c0_horizon_scn = InvalidScn;
+			break;
+		case 14:
+			c0_horizon_scn = 10497;
+			break;
+		}
+		reason = cluster_cr_server_test_own_xid_pair_reason(4195136, segment, 1, 10498, &result);
+		UT_ASSERT(strcmp(reason, expected[i]) == 0);
+		UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(c0_raw_clog_calls, i >= 7 ? 1 : 0);
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+		for (event = 0; event < c0_event_count; event++)
+			if (c0_events[event] == C0_EV_SCAN)
+				scans++;
+		UT_ASSERT_EQ(scans, i >= 3 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_freshref_pair_diagnostic_preserves_clog_exception_cleanup)
+{
+	volatile bool caught = false;
+
+	c0_reset();
+	c0_throw_on_clog = true;
+	PG_TRY();
+	{
+		ClusterUndoVerdictResult result;
+
+		(void)cluster_cr_server_test_own_xid_pair_reason(4195136, 7, 1, 10498, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_release_all_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+}
+
+UT_TEST(test_freshref_pair_diagnostic_output_budget_is_finite)
+{
+	uint32 count = 0;
+	int i;
+
+	for (i = 0; i < 66; i++)
+		UT_ASSERT_EQ(cluster_cr_server_test_pair_detail_admit(&count), i < 64);
+	UT_ASSERT_EQ(count, 64);
+	count = UINT32_MAX;
+	UT_ASSERT(!cluster_cr_server_test_pair_detail_admit(&count));
+	UT_ASSERT_EQ(count, UINT32_MAX);
+}
+
 /*
  * Execute the real own-xid resolver at the exact formal zero-match shape.
  * retention=false makes both positive rows RED on 34b: the old branch never
@@ -1366,7 +1533,7 @@ UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(30);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1385,6 +1552,10 @@ main(void)
 	UT_RUN(test_freshref_c1b_pair_exact_truth_table);
 	UT_RUN(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b);
 	UT_RUN(test_freshref_c1b_pair_request_canonical_decode);
+	UT_RUN(test_freshref_pair_diagnostic_preserves_exact_and_alias_refusal);
+	UT_RUN(test_freshref_pair_diagnostic_negative_matrix);
+	UT_RUN(test_freshref_pair_diagnostic_preserves_clog_exception_cleanup);
+	UT_RUN(test_freshref_pair_diagnostic_output_budget_is_finite);
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
 	UT_RUN(test_pending_reader_does_not_revoke_recycled_terminal_bound);
 	UT_RUN(test_pending_reader_does_not_revoke_wrap_suspect_bound);

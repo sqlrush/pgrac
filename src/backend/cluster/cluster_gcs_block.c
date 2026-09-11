@@ -5599,6 +5599,35 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
  *	false -> timeout / DENIED / wrong status / missing trailer / checksum
  *	mismatch (the caller keeps its 53R97 refusal, Rule 8.A).
  */
+typedef struct GcsFreshrefPairExchangeDiagnostic {
+	bool received;
+	int status;
+	bool trailer;
+	int checksum_ok;
+} GcsFreshrefPairExchangeDiagnostic;
+
+static void
+gcs_freshref_pair_log_refusal(const char *phase, int32 origin, BufferTag tag, TransactionId xid,
+							  SCN proposed_scn, uint64 epoch, uint64 request_id,
+							  const volatile GcsFreshrefPairExchangeDiagnostic *diagnostic)
+{
+	static uint32 emitted;
+
+	if (emitted >= 64)
+		return;
+	emitted++;
+	elog(LOG,
+		 "PGRAC freshref exchange refused: node=%d origin=%d request=" UINT64_FORMAT
+		 " xid=%u proposed=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u phase=%s received=%d status=%d trailer=%d "
+		 "checksum_ok=%d detail_budget_exhausted=%d",
+		 cluster_node_id, origin, request_id, xid, (uint64)proposed_scn, epoch, tag.spcOid,
+		 tag.dbOid, tag.relNumber, tag.forkNum, tag.blockNum, phase,
+		 diagnostic != NULL && diagnostic->received, diagnostic == NULL ? -1 : diagnostic->status,
+		 diagnostic != NULL && diagnostic->trailer,
+		 diagnostic == NULL ? -1 : diagnostic->checksum_ok, emitted == 64);
+}
+
 static bool
 gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
 									 TransactionId xid, SCN freshref_pair_scn,
@@ -5613,6 +5642,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 	bool got_reply = false;
 	bool fetched = false;
 	bool freshref_pair = SCN_VALID(freshref_pair_scn);
+	volatile GcsFreshrefPairExchangeDiagnostic diagnostic = { false, -1, false, -1 };
 
 	if (freshref_pair && (!authoritative || authority_kind))
 		return false;
@@ -5694,6 +5724,11 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 
 			LWLockAcquire(&blk->lock.lock, LW_SHARED);
 			have_reply = slot->in_use && slot->reply_received;
+			if (freshref_pair && have_reply) {
+				diagnostic.received = true;
+				diagnostic.status = slot->reply_header.status;
+				diagnostic.trailer = slot->reply_undo_trailer_valid;
+			}
 			LWLockRelease(&blk->lock.lock);
 			if (have_reply) {
 				got_reply = true;
@@ -5715,6 +5750,8 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 			uint32 expected = slot->reply_header.checksum;
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
+			if (freshref_pair)
+				diagnostic.checksum_ok = expected == got;
 			if (expected == got) {
 				if (hdr_out != NULL)
 					*hdr_out = slot->reply_header;
@@ -5736,11 +5773,18 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 	PG_CATCH();
 	{
 		gcs_block_release_slot(slot);
+		if (freshref_pair)
+			gcs_freshref_pair_log_refusal("EXCHANGE_EXCEPTION", dest_node, tag, xid,
+										  freshref_pair_scn, stamped_epoch, request_id,
+										  &diagnostic);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	gcs_block_release_slot(slot);
+	if (freshref_pair && !fetched)
+		gcs_freshref_pair_log_refusal("WIRE_RESULT", dest_node, tag, xid, freshref_pair_scn,
+									  stamped_epoch, request_id, &diagnostic);
 
 	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
 }
@@ -5834,8 +5878,11 @@ gcs_block_undo_freshref_c1b_pair_exchange_current(
 		|| cluster_epoch_get_current() != stamped_epoch
 		|| !cluster_vis_undo_verdict_page_usable(&page, xid)
 		|| page.verdict != (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
-		|| page.commit_scn != proposed_scn || SCN_VALID(page.horizon_scn))
+		|| page.commit_scn != proposed_scn || SCN_VALID(page.horizon_scn)) {
+		gcs_freshref_pair_log_refusal("REPLY_BINDING", origin_node, tag, xid, proposed_scn,
+									  stamped_epoch, hdr.request_id, NULL);
 		return false;
+	}
 
 	*verdict_out = page;
 	auth_out->origin_epoch = hdr.epoch;
@@ -5872,16 +5919,24 @@ cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
 	memset(&zero_epoch_admission, 0, sizeof(zero_epoch_admission));
 
 	stamped_epoch = cluster_epoch_get_current();
-	if (stamped_epoch > UINT32_MAX
-		|| ref_epoch != (uint32)stamped_epoch)
+	if (stamped_epoch > UINT32_MAX || ref_epoch != (uint32)stamped_epoch) {
+		gcs_freshref_pair_log_refusal(
+			"REF_EPOCH", origin_node,
+			GcsBlockUndoFreshRefC1bTagMake(segment_id, xid, expected_tt_slot_id), xid, proposed_scn,
+			stamped_epoch, 0, NULL);
 		return false;
+	}
 	if (stamped_epoch != 0)
 		return gcs_block_undo_freshref_c1b_pair_exchange_current(
 			origin_node, segment_id, expected_tt_slot_id, xid, stamped_epoch,
 			proposed_scn, verdict_out, auth_out);
-	if (!cluster_runtime_visibility_zero_epoch_pair_admission_enter(
-			&zero_epoch_admission))
+	if (!cluster_runtime_visibility_zero_epoch_pair_admission_enter(&zero_epoch_admission)) {
+		gcs_freshref_pair_log_refusal(
+			"ZERO_EPOCH_ADMISSION", origin_node,
+			GcsBlockUndoFreshRefC1bTagMake(segment_id, xid, expected_tt_slot_id), xid, proposed_scn,
+			stamped_epoch, 0, NULL);
 		return false;
+	}
 	PG_TRY();
 	{
 		result = gcs_block_undo_freshref_c1b_pair_exchange_current(
@@ -5889,6 +5944,10 @@ cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
 			proposed_scn, verdict_out, auth_out);
 		if (result
 			&& !cluster_semantic_activation_recheck(&zero_epoch_admission)) {
+			gcs_freshref_pair_log_refusal(
+				"RETURN_ADMISSION_DRIFT", origin_node,
+				GcsBlockUndoFreshRefC1bTagMake(segment_id, xid, expected_tt_slot_id), xid,
+				proposed_scn, stamped_epoch, 0, NULL);
 			memset(verdict_out, 0, sizeof(*verdict_out));
 			memset(auth_out, 0, sizeof(*auth_out));
 			result = false;
