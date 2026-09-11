@@ -1630,22 +1630,36 @@ cluster_runtime_visibility_origin_recycled_abort_sample(
 }
 
 /* This is a terminal-only extension of the origin DATA/physical-TT proof,
- * not a replacement for candidate_decide's exact identity guard. A valid
- * newer physical occupant proves reuse, NEVER the old transaction's status.
- * The old ABORT must be proved independently at its origin. */
+ * not a replacement for candidate_decide's exact identity guard. Whole-
+ * segment rebirth clears slots and restarts their wraps. Neither an empty
+ * slot nor a newer occupant proves the old transaction's status: the old
+ * ABORT must be proved independently at its origin. */
 static bool
 cluster_runtime_visibility_origin_recycled_abort_candidate(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, const TTSlot *slot,
+	uint32 sampled_generation,
 	ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic)
 {
 	if (mode != CLUSTER_TX_RESOLVE_VISIBILITY || !TransactionIdIsNormal(locator->xid)
-		|| !TransactionIdIsNormal(slot->xid) || slot->xid <= locator->xid
+		|| locator->tt_wrap > TT_WRAP_MAX)
+		return false;
+	if (slot->status == TT_SLOT_UNUSED) {
+		const TTSlot empty = {0};
+
+		if (sampled_generation == 0 || sampled_generation == UINT32_MAX
+			|| memcmp(slot, &empty, sizeof(empty)) != 0)
+			return false;
+		return cluster_runtime_visibility_origin_recycled_abort_sample(locator, diagnostic);
+	}
+	if (!TransactionIdIsNormal(slot->xid) || slot->xid <= locator->xid
 		|| slot->xid % CLUSTER_XID_STRIDE != locator->xid % CLUSTER_XID_STRIDE
-		|| locator->tt_wrap > TT_WRAP_MAX || slot->wrap <= locator->tt_wrap
 		|| slot->wrap > TT_WRAP_MAX || slot->status < TT_SLOT_ACTIVE
 		|| slot->status > TT_SLOT_RECYCLABLE
 		|| (slot->status == TT_SLOT_COMMITTED ? !SCN_VALID(slot->commit_scn)
 											  : slot->commit_scn != InvalidScn))
+		return false;
+	if (slot->wrap <= locator->tt_wrap
+		&& (sampled_generation == 0 || sampled_generation == UINT32_MAX))
 		return false;
 	return cluster_runtime_visibility_origin_recycled_abort_sample(locator, diagnostic);
 }
@@ -1781,7 +1795,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 		&commit_scn, &reason, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(&canonical_locator, mode,
-																	  &exact_slot, NULL)) {
+																	  &exact_slot, generation.value, NULL)) {
 		outcome = CLUSTER_TX_ABORTED;
 		top_xid = canonical_locator.xid;
 		proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
@@ -1975,7 +1989,8 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 		&commit_scn, &reason, &plan_data->canonical_diagnostic);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(
-			&plan_data->canonical_locator, mode, &exact_slot, &plan_data->canonical_diagnostic)) {
+			&plan_data->canonical_locator, mode, &exact_slot, generation.value,
+			&plan_data->canonical_diagnostic)) {
 		outcome = CLUSTER_TX_ABORTED;
 		top_xid = plan_data->canonical_locator.xid;
 		proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
