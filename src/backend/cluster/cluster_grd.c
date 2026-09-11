@@ -6962,6 +6962,8 @@ cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 pr
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
 	ClusterGrdEntryResult result;
+	ClusterGrdHolderId departed;
+	int n_departed = 0;
 
 	Assert(resid != NULL);
 
@@ -6970,13 +6972,28 @@ cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 pr
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 
 	SpinLockAcquire(&entry->lock);
+	/* Save the actual queued identity before rollback removes its slot. */
+	for (int c = 0; c < entry->nconverts; c++) {
+		const ClusterGrdConvert *convert = &entry->converts[c];
+
+		if (convert->node_id == node_id && convert->procno == procno
+			&& (convert_request_id == 0 || convert->convert_request_id == convert_request_id)) {
+			memset(&departed, 0, sizeof(departed));
+			departed.node_id = (uint32)convert->node_id;
+			departed.procno = convert->procno;
+			departed.cluster_epoch = convert->cluster_epoch;
+			departed.request_id = convert->convert_request_id;
+			n_departed = 1;
+			break;
+		}
+	}
 	result = cluster_grd_entry_rollback_convert(entry, node_id, procno, upgraded_mode, old_mode,
 												old_request_id, convert_request_id);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	/* spec-5.8 D1b — convert rolled back (holder mode restored / queued convert
 	 * cancelled); refresh queued waiters against the current holders. */
-	grd_wfg_resync_entry(resid, NULL, 0);
+	grd_wfg_resync_entry(resid, &departed, result == CLUSTER_GRD_ENTRY_OK ? n_departed : 0);
 	return result;
 }
 
@@ -7124,7 +7141,17 @@ cluster_grd_entry_cleanup_guarded_by_resid(const ClusterResId *resid, int dead_p
 		|| entry == NULL)
 		return 0;
 
-	removed = cluster_grd_entry_cleanup_guarded(entry, dead_procno, dead_node_id);
+	/* Graph projection may ERROR; the lookup pin still belongs to this caller. */
+	PG_TRY();
+	{
+		removed = cluster_grd_entry_cleanup_guarded(entry, dead_procno, dead_node_id);
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	cluster_grd_entry_release(entry);
 	return removed;
 }
@@ -7835,6 +7862,8 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	GesRequestPayload release_payloads[PGRAC_GRD_MAX_HOLDERS];
 	int n_release = 0;
 	ClusterResId entry_resid;
+	ClusterGrdHolderId departed[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
+	int n_departed = 0;
 
 	Assert(entry != NULL);
 
@@ -7889,6 +7918,14 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		if (!match)
 			continue;
 
+		/* The removed slot, not the caller's procno, supplies the graph key. */
+		Assert(n_departed < lengthof(departed));
+		memset(&departed[n_departed], 0, sizeof(departed[n_departed]));
+		departed[n_departed].node_id = (uint32)entry->waiters[i].node_id;
+		departed[n_departed].procno = entry->waiters[i].procno;
+		departed[n_departed].cluster_epoch = entry->waiters[i].cluster_epoch;
+		departed[n_departed].request_id = entry->waiters[i].request_id;
+		n_departed++;
 		if (i < entry->nwaiters - 1)
 			entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
 		memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
@@ -7912,6 +7949,13 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		if (!match)
 			continue;
 
+		Assert(n_departed < lengthof(departed));
+		memset(&departed[n_departed], 0, sizeof(departed[n_departed]));
+		departed[n_departed].node_id = (uint32)entry->converts[i].node_id;
+		departed[n_departed].procno = entry->converts[i].procno;
+		departed[n_departed].cluster_epoch = entry->converts[i].cluster_epoch;
+		departed[n_departed].request_id = entry->converts[i].convert_request_id;
+		n_departed++;
 		if (i < entry->nconverts - 1)
 			entry->converts[i] = entry->converts[entry->nconverts - 1];
 		memset(&entry->converts[entry->nconverts - 1], 0, sizeof(ClusterGrdConvert));
@@ -7957,6 +8001,10 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 															 sizeof(GesRequestPayload));
 		}
 	}
+
+	/* Do not let projection ERROR suppress an already-owed remote release. */
+	if (removed > 0)
+		grd_wfg_resync_entry(&entry_resid, departed, n_departed);
 
 	return removed;
 }
@@ -8066,8 +8114,17 @@ cluster_grd_sweep_local_stale_procnos(void)
 		}
 		SpinLockRelease(&entry->lock);
 
-		if (stale_procno != (uint32)-1)
-			total += cluster_grd_entry_cleanup_guarded(entry, (int)stale_procno, -1);
+		PG_TRY();
+		{
+			if (stale_procno != (uint32)-1)
+				total += cluster_grd_entry_cleanup_guarded(entry, (int)stale_procno, -1);
+		}
+		PG_CATCH();
+		{
+			cluster_grd_entry_release(entry);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 		cluster_grd_entry_release(entry);
 	}
 

@@ -815,11 +815,15 @@ s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribu
 }
 
 /* spec-2.24 D14/D16 stub audit. */
+static int ut_cleanup_release_count;
+
 void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
 											 const void *p pg_attribute_unused(),
 											 uint16 l pg_attribute_unused())
-{}
+{
+	ut_cleanup_release_count++;
+}
 void
 cluster_lmd_cleanup_on_backend_exit_count_inc(uint64 d pg_attribute_unused())
 {}
@@ -4011,6 +4015,245 @@ UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race
 	convert_teardown();
 }
 
+/* Real queue mutations drive the existing WFG dependency spy. */
+static void
+ut_wfg_departure_holders(ClusterResId *resid, int key)
+{
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(key, resid);
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													ShareLock, conflicts, &nc),
+				 CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+													ShareLock, conflicts, &nc),
+				 CLUSTER_GRD_GRANT_NOW);
+}
+
+static void
+ut_wfg_departure_waiter(const ClusterResId *resid)
+{
+	ClusterGrdHolderId h = bast_holder(3, 300, 3);
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, conflicts, &nc),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 2);
+}
+
+UT_TEST(test_wfg_rollback_cancels_exact_convert)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+
+	ut_wfg_departure_holders(&resid, 5820);
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1,
+												0, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	/* A late rollback may not retract the successor's wait. */
+	UT_ASSERT_EQ(cluster_grd_rollback_convert(&resid, 1, 100, ExclusiveLock, ShareLock, 1, 9),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT_EQ(cluster_grd_rollback_convert(&resid, 1, 100, ExclusiveLock, ShareLock, 1, 10),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(entry), 0);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+	convert_teardown();
+}
+
+UT_TEST(test_wfg_rollback_legacy_id_cancels_actual_convert)
+{
+	ClusterResId resid;
+
+	ut_wfg_departure_holders(&resid, 5821);
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1,
+												0, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT_EQ(cluster_grd_rollback_convert(&resid, 1, 100, ExclusiveLock, ShareLock, 1, 0),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+	convert_teardown();
+}
+
+UT_TEST(test_wfg_exit_cancels_local_waiter_not_foreign_alias)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	LOCKMODE mode = NoLock;
+	int nc = -1;
+
+	cluster_node_id = 1;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5822, &resid);
+	h = bast_holder(2, 100, 2);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, conflicts, &nc),
+				 CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(1, 100, 10);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 10, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, conflicts, &nc),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	cluster_grd_cleanup_on_backend_exit(100);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(!cluster_grd_entry_has_pending_waiter(entry));
+	UT_ASSERT(cluster_grd_entry_holder_mode(entry, 2, 100, &mode));
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+	convert_teardown();
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_wfg_exit_cancels_local_convert)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	LOCKMODE mode = NoLock;
+
+	ut_wfg_departure_holders(&resid, 5823);
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1,
+												0, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	cluster_node_id = 1;
+	cluster_grd_cleanup_on_backend_exit(100);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(entry), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(entry, 2, 200, &mode));
+	UT_ASSERT_EQ(mode, ShareLock);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+	convert_teardown();
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_wfg_cleanup_reprojects_surviving_waiter)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	LOCKMODE mode = NoLock;
+
+	ut_wfg_departure_holders(&resid, 5824);
+	ut_wfg_departure_waiter(&resid);
+	cluster_node_id = 1;
+	cluster_grd_cleanup_on_backend_exit(200); /* Foreign same-procno holder survives. */
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 2);
+	cluster_grd_cleanup_on_backend_exit(100);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 1);
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_entry_has_pending_waiter(entry));
+	UT_ASSERT(!cluster_grd_entry_holder_mode(entry, 3, 300, &mode));
+	cluster_grd_entry_release(entry);
+	convert_teardown();
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_wfg_cleanup_retracts_before_empty_reclaim)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5825, &resid);
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, conflicts, &nc),
+				 CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(1, 200, 2);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 2, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, conflicts, &nc),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 200, 0, 2), 1);
+	cluster_grd_cleanup_on_node_dead(1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 200, 0, 2), 0);
+	cluster_grd_cleanup_on_node_dead(1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	convert_teardown();
+}
+
+UT_TEST(test_wfg_cleanup_retries_newer_publication)
+{
+	ClusterResId resid;
+
+	ut_wfg_departure_holders(&resid, 5826);
+	ut_wfg_departure_waiter(&resid);
+	ut_wfg_release_resid = resid;
+	ut_wfg_release_holder = bast_holder(2, 200, 2);
+	ut_wfg_release_holder_on_submit_once = true;
+	cluster_node_id = 1;
+	cluster_grd_cleanup_on_backend_exit(100);
+	UT_ASSERT(!ut_wfg_release_holder_on_submit_once);
+	UT_ASSERT_EQ(ut_wfg_release_granted, 1);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 0);
+	convert_teardown();
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_wfg_cleanup_projection_error_releases_caller_pin)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	volatile bool caught = false;
+	int32 master;
+	const int32 nodes[] = { 0, 1, 2 };
+	int32 saved_declared[CLUSTER_MAX_NODES];
+	int saved_count = mock_declared_count;
+
+	ut_wfg_departure_holders(&resid, 5827);
+	ut_wfg_departure_waiter(&resid);
+	memcpy(saved_declared, mock_declared, sizeof(saved_declared));
+	set_mock_declared(lengthof(nodes), nodes);
+	cluster_grd_master_map_init();
+	ut_wfg_throw_on_submit_once = true;
+	master = cluster_grd_lookup_master(&resid);
+	UT_ASSERT(master >= 0);
+	cluster_node_id = master == 1 ? 2 : 1;
+	ut_cleanup_release_count = 0;
+	PG_TRY();
+	{
+		cluster_grd_cleanup_on_backend_exit(cluster_node_id == 1 ? 100 : 200);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(!ut_wfg_throw_on_submit_once);
+	/* Projection failure cannot suppress the already-owed remote release. */
+	UT_ASSERT_EQ(ut_cleanup_release_count, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	cluster_grd_entry_release(entry);
+	convert_teardown();
+	cluster_node_id = 0;
+	set_mock_declared(saved_count, saved_declared);
+	cluster_grd_master_map_init();
+}
+
 UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 {
 	int saved_node = cluster_node_id;
@@ -5396,7 +5639,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(102);
+	UT_PLAN(110);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5483,6 +5726,14 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_8_d1b_u2c_convert_enqueue_registers_edge);
 	UT_RUN(test_5_8_d1b_u2d_cancel_removes_waiter_edges);
 	UT_RUN(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race);
+	UT_RUN(test_wfg_rollback_cancels_exact_convert);
+	UT_RUN(test_wfg_rollback_legacy_id_cancels_actual_convert);
+	UT_RUN(test_wfg_exit_cancels_local_waiter_not_foreign_alias);
+	UT_RUN(test_wfg_exit_cancels_local_convert);
+	UT_RUN(test_wfg_cleanup_reprojects_surviving_waiter);
+	UT_RUN(test_wfg_cleanup_retracts_before_empty_reclaim);
+	UT_RUN(test_wfg_cleanup_retries_newer_publication);
+	UT_RUN(test_wfg_cleanup_projection_error_releases_caller_pin);
 	UT_RUN(test_grd_pin_cleanup_on_lmd_submit_error);
 
 	/* spec-5.8 D1c — waiter xid threaded into the WFG vertex (U3a-b). */
