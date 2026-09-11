@@ -290,6 +290,10 @@ static int ut_scratch_cr_calls;
 static int ut_scratch_ssi_calls;
 static int ut_scratch_hint_calls;
 static int ut_scratch_dirty_calls;
+static bool ut_scratch_history_fixture;
+static uint8 ut_scratch_history_slots[16];
+static int ut_scratch_history_resolves;
+static SCN ut_scratch_history_base_scn;
 static int ut_live_visibility_calls;
 static OffsetNumber ut_live_visible_offnum;
 static int ut_native_multixact_decode_calls;
@@ -489,6 +493,14 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	ut_scratch_ref_calls++;
 	UT_ASSERT(page == ut_scratch_expected_page);
 	UT_ASSERT(page != ut_scratch_forbidden_live_page);
+	if (ut_scratch_history_fixture) {
+		const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[itl_slot_idx];
+
+		*ref = ut_scratch_expected_ref;
+		ref->local_xid = slot->xid;
+		ref->tt_slot_id = itl_slot_idx + 1;
+		return true;
+	}
 	UT_ASSERT_EQ(itl_slot_idx, 1);
 	if (!ut_scratch_ref_available)
 		return false;
@@ -591,6 +603,27 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 	UT_ASSERT(page != ut_scratch_forbidden_live_page);
 	UT_ASSERT(slot_index < CLUSTER_ITL_INITRANS_DEFAULT);
 	UT_ASSERT(!ut_hot_content_lock_held);
+	if (ut_scratch_history_fixture) {
+		const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[slot_index];
+
+		UT_ASSERT_EQ(raw_xid, slot->xid);
+		UT_ASSERT(slot_index == 1 || slot_index == 3);
+		UT_ASSERT(ut_scratch_history_resolves < lengthof(ut_scratch_history_slots));
+		ut_scratch_history_slots[ut_scratch_history_resolves++] = slot_index;
+		memset(out, 0, sizeof(*out));
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ut_scratch_history_base_scn - (slot_index == 1 ? 2 : 1);
+		return;
+	}
+	/* Historical origin proof is deliberately absent from the original
+	 * frozen/hint negatives. Do not let this exact-only stub invent it. */
+	if (raw_xid != ut_scratch_expected_ref.local_xid
+		|| ClusterPageGetItlSlots(page)[slot_index].xid != ut_scratch_expected_ref.local_xid) {
+		memset(out, 0, sizeof(*out));
+		out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+		return;
+	}
 	cluster_visibility_resolve_from_ref_scn(raw_xid, &ut_scratch_expected_ref, PageGetLSN(page),
 											read_scn, out);
 }
@@ -3153,6 +3186,148 @@ UT_TEST(test_real_hot_full_consumer_preserves_frozen_creator_without_slot)
 	ut_hot_product_fixture = NULL;
 	ut_hot_live_ref_page = NULL;
 	BufferBlocks = NULL;
+}
+
+/* Three retained versions reproduce the stopped page's identity shape,
+ * not its uncaptured exception-time bytes. Only origin outcomes are fixtures;
+ * real HOT traversal and scratch MVCC must choose each transaction side. */
+static void
+ut_full_three_versions_case(int scenario)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	PGAlignedBlock scratch_before;
+	Page page;
+	HeapTupleHeader root, middle, tail;
+	HeapHotSearchResultKind kind = HEAP_HOT_SEARCH_NOT_FOUND;
+	volatile bool caught = false;
+	bool expect_error = scenario == 4 || scenario == 5;
+	int expected_member = scenario == 2 ? 1 : (scenario == 1 || scenario == 6 ? 2 : 3);
+	int proofs_per_full
+		= scenario == 2 ? 1 : (scenario == 1 || scenario == 3 ? 3 : (scenario == 6 ? 2 : 4));
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	page = (Page)fixture.full_source;
+	((PageHeader)page)->pd_lower = SizeOfPageHeaderData + 3 * sizeof(ItemIdData);
+	((PageHeader)page)->pd_upper = UT_HOT_DATA_OFF - 2 * UT_HOT_TUPLE_LEN;
+	ItemIdSetNormal(PageGetItemId(page, 2), UT_HOT_DATA_OFF - UT_HOT_TUPLE_LEN, UT_HOT_TUPLE_LEN);
+	ItemIdSetNormal(PageGetItemId(page, 3), UT_HOT_DATA_OFF - 2 * UT_HOT_TUPLE_LEN,
+					UT_HOT_TUPLE_LEN);
+	root = ut_r4_hot_tuple_at(page, 1);
+	middle = ut_r4_hot_tuple_at(page, 2);
+	tail = ut_r4_hot_tuple_at(page, 3);
+	root->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_COMMITTED;
+	root->t_infomask2 = HEAP_HOT_UPDATED;
+	HeapTupleHeaderSetXmax(root, 4428497);
+	ItemPointerSet(&root->t_ctid, UT_HOT_BLOCK, 2);
+	ut_r4_hot_set_tuple(middle, 4428497, 3, 0x42);
+	HeapTupleHeaderSetXmax(middle, 4390592);
+	middle->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED;
+	middle->t_infomask2 = HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE;
+	ItemPointerSet(&middle->t_ctid, UT_HOT_BLOCK, 3);
+	ut_r4_hot_set_tuple(tail, 4390592, 3, 0x43);
+	HeapTupleHeaderSetXmax(tail, 4390592);
+	tail->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	tail->t_infomask2 = HEAP_ONLY_TUPLE;
+	ItemPointerSet(&tail->t_ctid, UT_HOT_BLOCK, 3);
+	ClusterPageGetItlSlots(page)[1].xid = 4428497;
+	ClusterPageGetItlSlots(page)[1].flags = ITL_FLAG_COMMITTED;
+	ClusterPageGetItlSlots(page)[1].undo_segment_head = uba_encode(257, 265, 16, 0);
+	ClusterPageGetItlSlots(page)[3].xid = 4390592;
+	ClusterPageGetItlSlots(page)[3].flags = ITL_FLAG_COMMITTED;
+	ClusterPageGetItlSlots(page)[3].undo_segment_head = uba_encode(3, 5926, 4, 12);
+	if (scenario == 3)
+		ItemIdSetRedirect(PageGetItemId(page, 1), 2);
+	if (scenario == 4)
+		HeapTupleHeaderSetXmin(middle, 4428498); /* breaks predecessor linkage */
+	if (scenario == 5)
+		ClusterPageGetItlSlots(page)[5] = ClusterPageGetItlSlots(page)[1];
+	if (scenario == 6) {
+		middle->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+		middle->t_infomask |= HEAP_XMAX_INVALID;
+		middle->t_infomask2 = HEAP_ONLY_TUPLE;
+	}
+	memcpy(scratch_before.data, page, BLCKSZ);
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, PageGetLSN(page));
+	ut_scratch_history_fixture = true;
+	ut_scratch_history_resolves = 0;
+	ut_scratch_history_base_scn = UT_HOT_READ_SCN;
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	if (scenario == 1 || scenario == 2)
+		snapshot.read_scn -= scenario + 1;
+	fixture.expected_read_scn = ut_scratch_expected_read_scn = snapshot.read_scn;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
+											 NULL, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT_EQ(caught, expect_error);
+	UT_ASSERT_EQ(kind, expect_error ? HEAP_HOT_SEARCH_NOT_FOUND : HEAP_HOT_SEARCH_OWNED_SCRATCH);
+	if (!caught) {
+		UT_ASSERT_EQ(ut_scratch_history_resolves, 2 * proofs_per_full);
+		if (scenario == 0)
+			for (int i = 0; i < 8; i++)
+				UT_ASSERT_EQ(ut_scratch_history_slots[i], i % 4 < 2 ? 1 : 3);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(result.tuple.t_data),
+					 expected_member == 1 ? UT_HOT_FULL_XMIN
+										  : (expected_member == 2 ? 4428497 : 4390592));
+		UT_ASSERT_EQ(*((unsigned char *)result.tuple.t_data + result.tuple.t_data->t_hoff),
+					 expected_member == 1 ? UT_HOT_PAYLOAD : (expected_member == 2 ? 0x42 : 0x43));
+	}
+	UT_ASSERT_EQ(memcmp(result.scratch_page, scratch_before.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_live_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_cr_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_hint_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_dirty_calls, 0);
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_scratch_history_fixture = false;
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_real_hot_full_three_versions_select_creator_and_deleter_separately)
+{
+	ut_full_three_versions_case(0);
+}
+
+UT_TEST(test_real_hot_full_three_versions_preserve_statement_scn_polarity)
+{
+	ut_full_three_versions_case(1);
+	ut_full_three_versions_case(2);
+}
+
+UT_TEST(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data)
+{
+	ut_full_three_versions_case(3);
+	ut_full_three_versions_case(6);
+}
+
+UT_TEST(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zero_rows)
+{
+	ut_full_three_versions_case(4);
+	ut_full_three_versions_case(5);
 }
 
 UT_TEST(test_post_snapshot_own_xmin_keeps_command_visibility)
@@ -6248,7 +6423,11 @@ UT_TEST(test_census_clearing_target_lock_returns_to_dml_owner)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(120);
+	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
+	UT_RUN(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data);
+	UT_RUN(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zero_rows);
+	UT_RUN(test_real_hot_full_three_versions_select_creator_and_deleter_separately);
 	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
 	UT_RUN(test_scratch_frozen_creation_keeps_data_and_context_negatives);
 	UT_RUN(test_scratch_frozen_xmin_survives_recycled_data_slot);

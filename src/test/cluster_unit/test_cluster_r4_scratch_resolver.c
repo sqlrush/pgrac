@@ -202,6 +202,7 @@ static ClusterUndoTTSlotRef ut_exit_ref;
 static bool ut_exit_exact_proof;
 static bool ut_full_scratch_fixture;
 static int ut_full_scratch_scenario;
+static int ut_history_origin;
 static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
@@ -361,6 +362,7 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_exit_exact_proof = false;
 	ut_full_scratch_fixture = false;
 	ut_full_scratch_scenario = 0;
+	ut_history_origin = UT_PEER_NODE;
 	ut_current_epoch = UT_CLUSTER_EPOCH;
 	ut_native_calls = 0;
 	ut_hint_mutations = 0;
@@ -518,6 +520,21 @@ cluster_undo_verdict_resolve(int origin_node pg_attribute_unused(),
 {
 	ut_calls.wire++;
 	ut_origin_asks++;
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 30) {
+		UT_ASSERT(cluster_vis_resolve_in_flight());
+		UT_ASSERT_EQ(origin_node, ut_history_origin);
+		UT_ASSERT(origin_node != ut_exit_ref.origin_node_id);
+		UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
+		UT_ASSERT_EQ(undo_segment_id, UT_UNDO_SEGMENT);
+		UT_ASSERT_EQ(expected_tt_slot_id, 0);
+		UT_ASSERT_EQ(read_scn, UT_READ_SCN);
+		UT_ASSERT(!authoritative);
+		if (ut_full_scratch_scenario == 38)
+			ut_current_epoch++;
+		if (ut_full_scratch_scenario == 40)
+			pg_re_throw();
+		return ut_origin_verdict;
+	}
 	UT_ASSERT_EQ(origin_node, UT_PEER_NODE);
 	UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
 	UT_ASSERT_EQ(expected_tt_slot_id, UT_TT_SLOT);
@@ -586,6 +603,10 @@ int
 cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
 {
 	ut_calls.wire++;
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 30) {
+		UT_ASSERT_EQ(xid, UT_RAW_XID);
+		return ut_full_scratch_scenario == 39 ? -1 : ut_history_origin;
+	}
 	return UT_PEER_NODE;
 }
 
@@ -912,7 +933,8 @@ cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
 {
 	UT_ASSERT(page == ut_visibility_page.data);
 	UT_ASSERT_EQ(index, 0);
-	if (ut_full_scratch_fixture && ut_full_scratch_scenario == 8) {
+	if (ut_full_scratch_fixture
+		&& (ut_full_scratch_scenario == 8 || ut_full_scratch_scenario == 42)) {
 		*reason = CLUSTER_TX_RESOLVE_BAD_UBA;
 		return false;
 	}
@@ -925,6 +947,8 @@ cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
 		out->uba = slot->undo_segment_head;
 		out->itl_kind = slot->flags;
 		out->itl_slot_index = index;
+		if (ut_full_scratch_scenario >= 30)
+			out->xid = slot->xid;
 	}
 	*reason = CLUSTER_TX_RESOLVE_NONE;
 	return true;
@@ -1672,6 +1696,10 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 			ut_exit_ref.cluster_epoch = ut_current_epoch = 0;
 		if (scenario == 24)
 			slot->flags = ITL_FLAG_ACTIVE; /* precommit stamp is not terminal */
+		if (scenario == 25 || scenario == 26) {
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+			ut_pair_verdict.commit_scn = scenario == 25 ? UT_READ_SCN + 1 : UT_COMMIT_SCN;
+		}
 	}
 	if (scenario == 9)
 		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
@@ -1679,6 +1707,40 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 		ut_exit_ref.local_xid++;
 	if (scenario == 11)
 		ut_exit_ref.tt_slot_id = 0;
+	if (scenario >= 30) {
+		ut_history_origin = local_origin ? UT_SELF_NODE : UT_PEER_NODE;
+		ut_exit_ref.origin_node_id = local_origin ? UT_PEER_NODE : UT_SELF_NODE;
+		ut_exit_ref.local_xid = UT_RAW_XID + 4;
+		slot->xid = ut_exit_ref.local_xid;
+		ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		ut_origin_verdict.commit_scn = UT_COMMIT_SCN;
+		if (scenario == 31)
+			ut_origin_verdict.commit_scn = UT_READ_SCN + 1;
+		if (scenario == 32)
+			ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		if (scenario == 33 || scenario == 34 || scenario == 47)
+			ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+		if (scenario == 34)
+			ut_origin_verdict.commit_scn = UT_READ_SCN + 1;
+		if (scenario == 35)
+			ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		if (scenario == 36)
+			ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+		if (scenario == 37 || scenario == 47)
+			ut_origin_verdict.commit_scn = InvalidScn;
+		if (scenario == 41)
+			ut_exit_ref.cluster_epoch--;
+		if (scenario == 43)
+			ut_exit_ref.tt_slot_id = 0;
+		if (scenario == 44)
+			slot->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+		if (scenario == 45)
+			slot->xid++;
+		if (scenario == 46)
+			ut_exit_ref.cluster_epoch = ut_current_epoch = 0;
+		if (scenario == 48)
+			ut_current_epoch = UINT64_C(1) << 32;
+	}
 	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
 	header->t_hoff = SizeofHeapTupleHeader;
 	header->t_itl_slot_idx = 0;
@@ -1711,14 +1773,25 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 	}
 	PG_END_TRY();
 	ut_error_armed = false;
-	if (scenario >= 12) {
-		bool expected_error = scenario >= 13 && scenario <= 20;
+	if (scenario >= 30) {
+		bool expected_error = scenario >= 34 && scenario != 46;
+		bool expected_call = scenario < 39 || scenario == 40 || scenario == 46 || scenario == 47;
+
+		UT_ASSERT_EQ(caught, expected_error);
+		if (!caught)
+			UT_ASSERT_EQ(visible, scenario == 31 || scenario == 32 ? deleting : !deleting);
+		UT_ASSERT_EQ(ut_origin_asks, expected_call ? 1 : 0);
+		UT_ASSERT_EQ(ut_calls.exact_resolve, 0);
+		UT_ASSERT_EQ(ut_calls.pair_resolve, 0);
+	} else if (scenario >= 12) {
+		bool expected_error = (scenario >= 13 && scenario <= 20) || scenario == 25;
 		bool expected_exact = scenario == 13 || scenario == 17 || scenario == 18 || scenario == 21
 							  || scenario == 24;
 
 		UT_ASSERT_EQ(caught, expected_error);
 		if (!caught)
-			UT_ASSERT_EQ(visible, scenario == 12 || scenario == 23 ? !deleting : deleting);
+			UT_ASSERT_EQ(visible,
+						 scenario == 12 || scenario == 23 || scenario == 26 ? !deleting : deleting);
 		UT_ASSERT_EQ(ut_calls.exact_resolve, expected_exact ? 1 : 0);
 		UT_ASSERT_EQ(ut_calls.pair_resolve, scenario == 17 || scenario == 18 ? 0 : 1);
 	} else {
@@ -1821,10 +1894,64 @@ UT_TEST(test_full_scratch_retained_pair_error_unwinds_then_exact_live_works)
 	}
 }
 
+UT_TEST(test_full_scratch_recycled_creator_uses_original_origin_terminal_proof)
+{
+	ut_full_scratch_exact_case(false, false, 30);
+	ut_full_scratch_exact_case(false, true, 30);
+}
+
+UT_TEST(test_full_scratch_recycled_deleter_uses_original_origin_terminal_proof)
+{
+	ut_full_scratch_exact_case(true, false, 30);
+	ut_full_scratch_exact_case(true, true, 30);
+}
+
+UT_TEST(test_full_scratch_history_terminal_polarity_and_bound_both_origins)
+{
+	const int scenarios[] = { 31, 32, 33, 46 };
+
+	for (int deleting = 0; deleting <= 1; deleting++)
+		for (int origin = 0; origin <= 1; origin++)
+			for (int i = 0; i < lengthof(scenarios); i++)
+				ut_full_scratch_exact_case(deleting, origin, scenarios[i]);
+}
+
+UT_TEST(test_full_scratch_history_cannot_rescue_unknown_malformed_or_epoch_drift)
+{
+	const int scenarios[] = { 34, 35, 36, 37, 38, 39, 41, 42, 43, 44, 45, 47, 48 };
+
+	for (int deleting = 0; deleting <= 1; deleting++)
+		for (int origin = 0; origin <= 1; origin++)
+			for (int i = 0; i < lengthof(scenarios); i++)
+				ut_full_scratch_exact_case(deleting, origin, scenarios[i]);
+}
+
+UT_TEST(test_full_scratch_history_error_releases_scope_before_next_exact_proof)
+{
+	for (int origin = 0; origin <= 1; origin++) {
+		ut_full_scratch_exact_case(false, origin, 40);
+		ut_full_scratch_exact_case(true, origin, 0);
+	}
+}
+
+UT_TEST(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_commit)
+{
+	for (int deleting = 0; deleting <= 1; deleting++) {
+		ut_full_scratch_exact_case(deleting, false, 25);
+		ut_full_scratch_exact_case(deleting, false, 26);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(33);
+	UT_RUN(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_commit);
+	UT_RUN(test_full_scratch_history_terminal_polarity_and_bound_both_origins);
+	UT_RUN(test_full_scratch_history_cannot_rescue_unknown_malformed_or_epoch_drift);
+	UT_RUN(test_full_scratch_history_error_releases_scope_before_next_exact_proof);
+	UT_RUN(test_full_scratch_recycled_creator_uses_original_origin_terminal_proof);
+	UT_RUN(test_full_scratch_recycled_deleter_uses_original_origin_terminal_proof);
 	UT_RUN(test_peer_exact_memo_hit_propagates_committed);
 	UT_RUN(test_peer_exact_memo_hit_propagates_aborted);
 	UT_RUN(test_peer_exact_synthetic_unknown_hit_stays_failclosed_without_wire);

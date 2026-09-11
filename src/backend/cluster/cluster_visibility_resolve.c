@@ -72,6 +72,7 @@
  */
 static int8 vis_origin_materialized_cache[CLUSTER_WAL_STATE_SLOT_COUNT]; /* 0 ? / 1 / -1 */
 static bool vis_freshref_first_unproven_logged = false;
+static bool vis_scratch_history_first_unproven_logged = false;
 
 /* Round-3b RISK-1: the pure prehistory status mapper mirrors the CLOG
  * alphabet without dragging clog.h into the standalone unit layer; pin the
@@ -1046,11 +1047,68 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 		return;
 	slot = &ClusterPageGetItlSlots(page)[slot_index];
 	if (slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_NEEDS_CLEANOUT
-		|| !cluster_itl_get_tt_ref(page, slot_index, &ref) || ref.local_xid != raw_xid
+		|| !cluster_itl_get_tt_ref(page, slot_index, &ref) || ref.local_xid != slot->xid
 		|| ref.tt_slot_id == 0
-		|| !cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, raw_xid, &ref,
-											   &locator, &unused_row_wait))
+		|| !cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref.local_xid,
+											   &ref, &locator, &unused_row_wait)
+		|| locator.xid != ref.local_xid)
 		return;
+
+	if (ref.local_xid != raw_xid) {
+		uint64 epoch = cluster_epoch_get_current();
+		int origin = cluster_xid_origin_slot(raw_xid);
+		ClusterUndoVerdictResult historical = {
+			.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED,
+			.commit_scn = InvalidScn,
+		};
+
+		/* A recycled last-writer ref is not this transaction's identity.
+		 * Derive the original origin, keep its stripe self-check, and ask
+		 * only for a terminal outcome. Never create a live physical binding
+		 * or route our own scratch xid into native tuple visibility. */
+		out->ref = ref;
+		out->diagnostic_reason = "RECYCLED_AUTHORITY_UNPROVABLE";
+		if (origin >= 0 && origin < CLUSTER_MAX_NODES && epoch <= UINT32_MAX
+			&& ref.cluster_epoch == (uint32)epoch) {
+			cluster_vis_resolve_depth++;
+			PG_TRY();
+			{
+				if (origin != cluster_node_id)
+					cluster_touched_peers_stamp(origin, CLUSTER_TOUCH_VISIBILITY);
+				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
+				historical = cluster_undo_verdict_resolve(origin, ref.undo_segment_id, raw_xid, 0,
+														  read_scn, false);
+				if (cluster_epoch_get_current() == epoch
+					&& (historical.kind == CLUSTER_UNDO_VERDICT_ABORTED
+						|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+							&& SCN_VALID(historical.commit_scn))
+						|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
+							&& SCN_VALID(historical.commit_scn)
+							&& scn_time_cmp(historical.commit_scn, read_scn) <= 0)))
+					(void)cluster_vis_from_undo_verdict(historical, out);
+			}
+			PG_FINALLY();
+			{
+				cluster_vis_resolve_depth--;
+			}
+			PG_END_TRY();
+		}
+		if (out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			out->diagnostic_reason = "RECYCLED_TERMINAL_PROVEN";
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_RECYCLED_TERMINAL);
+		} else {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_RECYCLED_UNPROVABLE);
+			if (!vis_scratch_history_first_unproven_logged) {
+				vis_scratch_history_first_unproven_logged = true;
+				elog(LOG,
+					 "PGRAC scratch history first unproven: xid=%u writer_xid=%u "
+					 "derived_origin=%d segment=%u ref_epoch=%u epoch=" UINT64_FORMAT " verdict=%d",
+					 raw_xid, ref.local_xid, origin, (unsigned)ref.undo_segment_id,
+					 ref.cluster_epoch, epoch, (int)historical.kind);
+			}
+		}
+		return;
+	}
 
 	/* Keep the physical DATA address, not just the reduced TT ref. The
 	 * existing classifier can then reach its DATA-to-canonical-TT fallback. */

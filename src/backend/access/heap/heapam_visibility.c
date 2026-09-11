@@ -2008,14 +2008,40 @@ cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
 	pg_unreachable();
 }
 
+/* The tuple index names its last DATA writer, not necessarily its creator.
+ * Select a surviving creator carrier using the ordinary DATA selector. If
+ * none remains, the original index is only a hint for historical resolution.
+ * An ambiguous/malformed matching carrier is not an absent carrier. */
+static uint8
+cluster_r4_scratch_creator_slot(Page page, uint8 writer_index, TransactionId xmin)
+{
+	const ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
+	uint8 creator_index;
+	uint8 i;
+
+	if (writer_index < CLUSTER_ITL_INITRANS_DEFAULT && slots[writer_index].flags >= ITL_FLAG_ACTIVE
+		&& slots[writer_index].flags <= ITL_FLAG_NEEDS_CLEANOUT && slots[writer_index].xid == xmin)
+		return writer_index;
+	if (cluster_itl_find_data_slot_index_by_xid(page, xmin, &creator_index))
+		return creator_index;
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags >= ITL_FLAG_ACTIVE && slots[i].flags <= ITL_FLAG_NEEDS_CLEANOUT
+			&& slots[i].xid == xmin)
+			cluster_r4_scratch_visibility_unknown(xmin,
+												  "scratch creator DATA is ambiguous or malformed");
+	}
+	return writer_index;
+}
+
 /*
  * HeapTupleSatisfiesMVCCScratch
  *
  * Narrow D6 evaluator for a caller-owned, already reconstructed FULL page.
  * It consumes only tuple/page bytes from that private page, the existing
- * frozen-creation proof, and exact page-derived DATA verdicts where required. It never
- * enters native CLOG/ProcArray,
- * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI.
+ * frozen-creation proof, and origin verdicts from exact DATA or guarded
+ * historical resolution. It never enters requester-native visibility/CLOG,
+ * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI; the existing origin
+ * service still owns its transaction-table/CLOG cross-checks.
  */
 bool
 HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
@@ -2026,6 +2052,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 	PageHeader	header;
 	HeapTupleHeader tuple;
 	ClusterUndoTTSlotRef ref;
+	uint8 creator_index;
 	const ClusterItlSlotData *itl_slot;
 	ClusterVisResolve resolved;
 	ClusterVisibilityDecision decision;
@@ -2077,23 +2104,29 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 	 * This says nothing about xmax, which still has to be checked below. */
 	if (!HeapTupleHeaderXminFrozen(tuple)) {
 		raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
-		if (!TransactionIdIsNormal(raw_xmin)
-			|| tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
-			|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		if (!TransactionIdIsNormal(raw_xmin))
+			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin is not a normal xid");
+		creator_index = cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);
+		if (creator_index >= CLUSTER_ITL_INITRANS_DEFAULT)
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
-		itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+		itl_slot = &ClusterPageGetItlSlots(page)[creator_index];
 		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
-			|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
-			|| ref.local_xid != raw_xmin || ref.tt_slot_id == 0)
+			|| !cluster_itl_get_tt_ref(page, creator_index, &ref) || ref.tt_slot_id == 0)
 			cluster_r4_scratch_visibility_unknown(raw_xmin,
-												  "scratch xmin lacks an exact DATA ITL reference");
+												  "scratch xmin lacks a valid DATA ITL reference");
 
-		cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmin,
-											   snapshot->read_scn, &resolved);
+		cluster_visibility_resolve_scratch_scn(page, creator_index, raw_xmin, snapshot->read_scn,
+											   &resolved);
 		if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
-			cluster_r4_scratch_visibility_unknown(raw_xmin,
-												  "scratch xmin is not backed by exact authority");
+			cluster_r4_scratch_visibility_unknown(
+				raw_xmin, resolved.diagnostic_reason != NULL
+							  ? resolved.diagnostic_reason
+							  : "scratch xmin is not backed by exact authority");
+		if (resolved.commit_scn_is_bound
+			&& (!SCN_VALID(resolved.commit_scn)
+				|| scn_time_cmp(resolved.commit_scn, snapshot->read_scn) > 0))
+			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin bound is not admissible");
 
 		switch (resolved.status) {
 		case CLUSTER_TT_STATUS_ABORTED:
@@ -2132,24 +2165,30 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 										  "scratch xmax has no single exact transaction reference");
 
 	/*
-	 * A non-locking xmax is supported only when the same scratch-owned slot
-	 * exactly binds it.  Never derive members or fall back to native CLOG.
+	 * The deleting side keeps its own last-writer index. If that DATA carrier
+	 * has been recycled, only the original origin's terminal service may
+	 * prove its history. Never derive MultiXact members or use native CLOG.
 	 */
 	if (tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax has no DATA ITL slot");
 	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
 	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
-		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) || ref.local_xid != raw_xmax
-		|| ref.tt_slot_id == 0)
+		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) || ref.tt_slot_id == 0)
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
-										  "scratch xmax lacks an exact DATA ITL reference");
+											  "scratch xmax lacks a valid DATA ITL reference");
 
 	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
 										   snapshot->read_scn, &resolved);
 	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
-		cluster_r4_scratch_visibility_unknown(raw_xmax,
-											  "scratch xmax is not backed by exact authority");
+		cluster_r4_scratch_visibility_unknown(
+			raw_xmax, resolved.diagnostic_reason != NULL
+						  ? resolved.diagnostic_reason
+						  : "scratch xmax is not backed by exact authority");
+	if (resolved.commit_scn_is_bound
+		&& (!SCN_VALID(resolved.commit_scn)
+			|| scn_time_cmp(resolved.commit_scn, snapshot->read_scn) > 0))
+		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax bound is not admissible");
 
 	switch (resolved.status)
 	{
