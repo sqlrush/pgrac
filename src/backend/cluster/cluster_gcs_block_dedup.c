@@ -470,6 +470,14 @@ dedup_r4_route_reclaim_safe(const GcsBlockDedupEntry *entry, const instr_time *n
 
 	deadline_us = entry->pinned_lifetime_us > 0 ? entry->pinned_lifetime_us
 											 : fallback_out_of_window_us;
+	/* R4 timestamps are monotonic anchors, including terminal DONE.  A
+	 * completed requester no longer retransmits this physical request, but
+	 * retain its route through the same pinned quarantine as ordinary DONE. */
+	if (record->state != GCS_BLOCK_R4_ROUTE_ROUTING && entry->done_at_ts != 0) {
+		if (!dedup_r4_route_anchor_load(&entry->done_at_ts, &anchor))
+			return false;
+		deadline_us = entry->pinned_done_linger_us;
+	}
 	elapsed = *now;
 	INSTR_TIME_SUBTRACT(elapsed, anchor);
 	if (INSTR_TIME_GET_NANOSEC(elapsed) < 0)
@@ -735,6 +743,9 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 	pinned_lifetime_ms = lifetime_hint_trusted ? (int64)requester_lifetime_hint_ms
 										 : GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS;
 	entry->pinned_lifetime_us = pinned_lifetime_ms * 1000 * 2;
+	entry->pinned_done_linger_us
+		= (int64)(cluster_gcs_reply_timeout_ms > 0 ? cluster_gcs_reply_timeout_ms : 5000) * 1000
+		  * 2;
 	pg_atomic_fetch_add_u32(&shard->entry_count, 1);
 	*record_out = entry->payload_meta.r4_route;
 	result = GCS_BLOCK_R4_ROUTE_ARM_NEW;
@@ -1109,6 +1120,28 @@ cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key, co
 			entry->done_at_ts = GetCurrentTimestamp();
 		stamped = true; /* duplicate DONE re-stamps nothing: idempotent */
 		pg_atomic_fetch_add_u64(&shard->done_marked_count, 1);
+	} else if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE) {
+		const GcsBlockR4RouteRecord *record = &entry->payload_meta.r4_route;
+		GcsBlockR4RouteIdentity identity;
+		instr_time completed;
+
+		memset(&identity, 0, sizeof(identity));
+		identity.legacy_key = *key;
+		identity.tag = *tag;
+		identity.read_scn = record->proof.read_scn;
+		identity.activation_generation = record->proof.activation_generation;
+		if (transition_id == (uint8)PCM_TRANS_N_TO_S
+			&& dedup_r4_route_identity_equal(entry, &identity, transition_id)
+			&& dedup_r4_route_input_valid(&identity, transition_id, &record->proof)
+			&& (record->state == GCS_BLOCK_R4_ROUTE_FORWARDED
+				|| record->state == GCS_BLOCK_R4_ROUTE_RETRYABLE)
+			&& dedup_r4_route_anchor_load(&entry->completed_at_ts, &completed)
+			&& entry->pinned_done_linger_us > 0) {
+			if (entry->done_at_ts == 0)
+				dedup_r4_route_anchor_now(&entry->done_at_ts);
+			stamped = true;
+			pg_atomic_fetch_add_u64(&shard->done_marked_count, 1);
+		}
 	} else if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE) {
 		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
 			dedup_note_validation_failure(shard);

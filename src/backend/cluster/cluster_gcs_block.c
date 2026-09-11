@@ -3129,7 +3129,6 @@ cluster_gcs_block_test_snapshot_r4_reply_slot(GcsBlockReplyHeader *header_out,
 }
 #endif
 
-#undef R4_CR_REQUIRED_HELLO_CAPS
 
 /*
  * cluster_gcs_block_redo_lsn_covered -- spec-4.7 D5 redo-before-unfreeze gate
@@ -3188,6 +3187,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool read_image = false; /* spec-5.2 D2: one-shot read image, non-durable */
 	bool terminal_denied = false;
 	bool retry_denied = false;
+	bool read_capacity_refused = false;
 	bool retransmit_warning_emitted = false;
 	bool suppress_direct_land = false;
 	bool awaiting_holder_refusal_master_cleanup = false;
@@ -3744,6 +3744,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 								   final_forwarding_master,
 								   direct_authoritative_denial ? 1U : 0U,
 								   (unsigned)transition_id)));
+			/* A direct master FULL precedes registration and any grant.  Only
+			 * this ordinary read can return to bufmgr's exact-abort/yield/rearm
+			 * owner.  It has no dedup entry to complete and publishes no bytes. */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
+				&& transition_id == PCM_TRANS_N_TO_S && !clean_eligible
+				&& final_forwarding_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+				&& slot->reply_header.sender_node == current_master) {
+				read_capacity_refused = true;
+				retry_denied = true;
+				break;
+			}
 			if (final_status == GCS_BLOCK_REPLY_DENIED_EPOCH_STALE
 				|| final_status == GCS_BLOCK_REPLY_DENIED_DEDUP_FULL) {
 				/* HC94 + HC96 — retry within budget; re-lookup master so
@@ -4010,7 +4021,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	if (granted || granted_storage_fallback || read_image)
 		gcs_block_ship_hist_record(ship_started_at);
 
-	if (granted || granted_storage_fallback || read_image || retry_denied) {
+	if (granted || granted_storage_fallback || read_image
+		|| (retry_denied && !read_capacity_refused)) {
 		/*
 		 * PGRAC: GCS-race round-2 RC-F — completion proof.  The terminal
 		 * reply was verified and consumed, so no retransmit of this
@@ -4806,6 +4818,38 @@ gcs_block_r4_retry_backoff(void)
 	CHECK_FOR_INTERRUPTS();
 }
 
+/* A terminal R4 physical request owns no remaining retransmit.  Reuse the
+ * existing advisory completion channel after releasing its slot; loss keeps
+ * the master's pinned fallback lifetime in charge.  Local masters have no
+ * remote HELLO entry, so bind their compiled capability to this R4 admission. */
+static void
+gcs_block_r4_send_done(const GcsBlockDonePayload *done, int32 master_node,
+					   const ClusterSemanticAdmissionToken *admission)
+{
+	bool done_capable = false;
+
+	CLUSTER_INJECTION_POINT("cluster-gcs-block-done-drop");
+	if (cluster_ic_suppress_gcs_done_cap
+		|| cluster_injection_should_skip("cluster-gcs-block-done-drop"))
+		return;
+	if (master_node == cluster_node_id) {
+		if (!gcs_block_r4_local_compiled_capability_matches(admission, R4_CR_REQUIRED_HELLO_CAPS,
+															PGRAC_IC_HELLO_CAP_GCS_DONE_V1,
+															&done_capable))
+			return;
+	} else
+		done_capable = cluster_sf_peer_supports_gcs_done(master_node);
+	if (!done_capable)
+		return;
+	if (cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_DONE, (uint32)master_node,
+												 done, sizeof(*done)))
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_sent_count, 1);
+	else
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_enqueue_drop_count, 1);
+}
+
+#undef R4_CR_REQUIRED_HELLO_CAPS
+
 static ClusterCrBuildResult
 gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_master_node,
 								   char dst_page[GCS_BLOCK_DATA_SIZE],
@@ -4827,6 +4871,7 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 	for (;;) {
 		ClusterGcsBlockOutstandingSlot *slot;
 		ClusterR4CrRequestPayload request;
+		GcsBlockDonePayload done;
 		uint64 request_id = 0;
 		volatile bool got_reply = false;
 		volatile bool fetched = false;
@@ -4972,9 +5017,21 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 		}
 		PG_END_TRY();
 
+		/* Copy the terminal physical identity before release canonicalizes
+		 * the slot.  Malformed FULL and unvalidated headers never qualify. */
+		memset(&done, 0, sizeof(done));
+		done.request_id = request_id;
+		done.epoch = request_epoch;
+		done.tag = tag;
+		done.sender_node = request.base.sender_node;
+		done.requester_backend_id = request.base.requester_backend_id;
+		done.transition_id = request.base.transition_id;
 		gcs_block_release_slot(slot);
 		if (invalidated)
 			return cluster_cr_build_result_for_reason(*reason_out);
+		if (fetched || reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
+			|| reply_status == (uint8)GCS_BLOCK_REPLY_R4_DENIED)
+			gcs_block_r4_send_done(&done, real_master_node, admission);
 		if (fetched) {
 			*reason_out = CLUSTER_CR_BUILD_NONE;
 			return CLUSTER_CR_BUILD_FULL;

@@ -221,7 +221,7 @@ typedef struct GcsBlockDedupEntry {
 	char block_data[GCS_BLOCK_DATA_SIZE];  /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		   /*  8B — generic wall / R4 monotonic replied */
 	TimestampTz registered_at_ts;		   /*  8B — generic wall / R4 monotonic in-flight */
-	TimestampTz done_at_ts;				   /*  8B — round-2: DONE proof consumed */
+	TimestampTz done_at_ts;				   /*  8B — generic wall / R4 monotonic DONE */
 	int64 pinned_lifetime_us;			   /*  8B — round-2: TTL pinned at register */
 	int64 pinned_done_linger_us;		   /*  8B — round-2: quarantine pinned */
 } GcsBlockDedupEntry;
@@ -515,8 +515,11 @@ extern bool cluster_gcs_block_dedup_set_request_flags_exact(int worker_id,
  * stamps done_at_ts.  Returns true when stamped; false on any mismatch or
  * miss (caller counts and drops -- DONE is advisory, TTL remains the
  * backstop).  Never removes the entry outright: the pinned done-linger
- * quarantine absorbs retransmit reorder slop, and eager reclaim may take
- * the entry immediately under cap pressure (IsReclaimSafe).
+ * quarantine absorbs retransmit reorder slop; only after that quarantine
+ * can eager reclaim take the entry under cap pressure (IsReclaimSafe).
+ * R4 routes require FORWARDED/RETRYABLE and an exact valid route proof;
+ * their first DONE stamp and pinned quarantine use monotonic time.  ROUTING
+ * is not a completed physical request and remains on its original lifetime.
  */
 extern bool cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key,
 											  const BufferTag *tag, uint8 transition_id);

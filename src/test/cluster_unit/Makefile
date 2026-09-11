@@ -2932,10 +2932,27 @@ $(CLUSTER_R4_GCS_BLOCK_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_gcs_bl
 		-DCLUSTER_R4_ROUTE_POLICY_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 
+# Execute the existing read-rearm owners verbatim, not a mirrored test loop.
+# Runtime gates/locks are bounded fixture seams; reservation transitions use
+# the real cluster_pcm_own object. Fail generation on missing/duplicate owners.
+test_cluster_gcs_read_rearm_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; cancel++ } \
+	     /^cluster_pcm_own_read\(/ { print "static inline void"; emit=1; observe++ } \
+	     /^cluster_bufmgr_resource_x_wait_retry\(/ { print "static bool"; emit=1; wait_owner++ } \
+	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; begin_wait++ } \
+	     /^typedef enum ClusterBufmgrPcmRetryRearmResult/ { emit=1; result_type++ } \
+	     /^cluster_bufmgr_pcm_retry_denied_rearm\(/ { print "static ClusterBufmgrPcmRetryRearmResult"; emit=1; rearm++ } \
+	     /^LockBufHdr\(/ { print "uint32"; emit=1; header_lock++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (begin != 1 || cancel != 1 || observe != 1 || wait_owner != 1 || begin_wait != 1 || result_type != 1 || rearm != 1 || header_lock != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O)
+		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
+		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
