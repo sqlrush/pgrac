@@ -911,10 +911,55 @@ UT_TEST(test_generic_done_and_remove_ignore_route)
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &proof, &record));
 }
 
+UT_TEST(test_forwarded_route_consumes_exact_requester_done)
+{
+	GcsBlockR4RouteIdentity identity = make_identity(17, 3, 57, (SCN)117, 26);
+	ClusterR4CrRouteProof proof = make_proof(&identity, 2);
+	GcsBlockR4RouteRecord record;
+
+	fixture_reset(8);
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &identity.legacy_key, &identity.tag,
+												TEST_ROUTE_TRANSITION));
+	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
+	UT_ASSERT_EQ(1, fake_live_count());
+	UT_ASSERT_EQ(0, fake_lock_depth);
+}
+
+UT_TEST(test_completed_route_reclaims_after_existing_done_linger)
+{
+	GcsBlockR4RouteIdentity identity = make_identity(18, 3, 58, (SCN)118, 27);
+	ClusterR4CrRouteProof proof = make_proof(&identity, 2);
+	GcsBlockR4RouteRecord record;
+	GcsBlockDedupKey next = identity.legacy_key;
+
+	fixture_reset(1);
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
+	(void)cluster_gcs_block_dedup_mark_done(0, &identity.legacy_key, &identity.tag,
+											TEST_ROUTE_TRANSITION);
+	/* Same established 2 x reply-timeout quarantine, not the 53-second
+	 * no-completion lifetime. Wall time is deliberately unchanged. */
+	fixture_advance_monotonic_us((int64)cluster_gcs_reply_timeout_ms * 2000 + 1);
+	cluster_gcs_block_dedup_sweep_expired(fake_now);
+	UT_ASSERT_EQ(0, cluster_gcs_block_dedup_r4_route_count());
+	UT_ASSERT_EQ(0, fake_live_count());
+	next.request_id = gcs_reqid_requester(1, 7, 19);
+	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_MISS_REGISTERED, cluster_gcs_block_dedup_lookup_or_register(
+													  0, &next, make_tag(59), TEST_ROUTE_TRANSITION,
+													  TEST_LIFETIME_HINT_MS, true, NULL));
+	UT_ASSERT_EQ(0, cluster_gcs_block_dedup_get_full_count());
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(test_route_abi_and_empty_count);
 	UT_RUN(test_new_then_exact_duplicate_replays_stored_record);
 	UT_RUN(test_unarmed_expected_page_scn_new_then_exact_replay);
@@ -938,6 +983,8 @@ main(void)
 	UT_RUN(test_node_death_removes_requester_route);
 	UT_RUN(test_closed_purge_removes_routes_but_preserves_generic_entry);
 	UT_RUN(test_generic_done_and_remove_ignore_route);
+	UT_RUN(test_forwarded_route_consumes_exact_requester_done);
+	UT_RUN(test_completed_route_reclaims_after_existing_done_linger);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
