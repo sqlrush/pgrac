@@ -255,6 +255,14 @@ cluster_runtime_visibility_origin_plan_recheck_data_held(
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
+/* Export the exact revalidated resident DATA image under the final guard.
+ * A failed proof does not modify data_out; no page is reconstructed from a
+ * record or from a canonical TT sample. */
+extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
 #endif
 
 /*

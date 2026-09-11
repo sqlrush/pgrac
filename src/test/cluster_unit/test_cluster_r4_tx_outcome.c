@@ -3229,10 +3229,83 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 	UT_ASSERT_EQ(test_subtrans_parent_calls, 2 * CLUSTER_R4_SUBTRANS_MAX_DEPTH);
 }
 
+UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
+{
+	int variant;
+	for (variant = 0; variant < 7; variant++) {
+		ClusterRuntimeVisibilityOriginPlan plan;
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterSemanticAdmissionToken admission;
+		ClusterUndoBlock0CurrentGuard data_guard = { 0 }, tt_guard = { 0 };
+		ClusterUndoBlock0ResolvedRoot data_root = { 0 }, tt_root = { 0 };
+		PGAlignedBlock page, expected;
+		bool negative = variant >= 2;
+
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		memset(&admission, 0, sizeof(admission));
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		data_root.intent = tt_root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+		data_root.root_id = 91;
+		tt_root.root_id = 92;
+		data_root.root_generation = tt_root.root_generation = 7;
+		if (variant == 0)
+			test_origin_record.tt_slot_segment_id = TEST_RECORD_SEGMENT;
+		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_data_held(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, NULL,
+						 &data_guard, &data_root, &plan, &resolution, &reason),
+					 variant == 0 ? CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE
+								  : CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+		if (variant != 0 && variant != 6)
+			UT_ASSERT(cluster_runtime_visibility_origin_plan_sample_canonical_held(
+				&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &tt_guard, &tt_root, &reason));
+		switch (variant) {
+		case 2:
+			test_candidate_mutate_record_on_recheck = true;
+			break;
+		case 3:
+			test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+			break;
+		case 4:
+			admission.formation_epoch++;
+			break;
+		case 5:
+			data_root.root_generation++;
+			break;
+		default:
+			break;
+		}
+		memset(page.data, 0xa5, BLCKSZ);
+		memset(expected.data, negative ? 0xa5 : 0x5a, BLCKSZ);
+		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_copy_data_held(
+						 &plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard, &data_root,
+						 &resolution, page.data, &reason),
+					 negative ? CLUSTER_TX_UNKNOWN : CLUSTER_TX_COMMITTED);
+		UT_ASSERT_EQ(memcmp(page.data, expected.data, BLCKSZ), 0);
+		if (!negative) {
+			UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+			UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+			/* Export consumes the frozen plan; it cannot be replayed. */
+			memset(page.data, 0xa5, BLCKSZ);
+			memset(expected.data, 0xa5, BLCKSZ);
+			UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_copy_data_held(
+							 &plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard,
+							 &data_root, &resolution, page.data, &reason),
+						 CLUSTER_TX_UNKNOWN);
+			UT_ASSERT_EQ(memcmp(page.data, expected.data, BLCKSZ), 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(101);
+	UT_PLAN(102);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -3334,6 +3407,7 @@ main(void)
 	UT_RUN(test_exact_origin_subcommitted_before_transaction_xmin_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_depth_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge);
+	UT_RUN(test_origin_export_copies_only_the_final_revalidated_resident_data_page);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

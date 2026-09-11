@@ -65,6 +65,7 @@
 #include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_startup_phase.h"
@@ -200,6 +201,8 @@ typedef enum GcsBlockCurrentMxOriginFailure {
 typedef struct GcsBlockR4TxOriginContext {
 	bool in_use;
 	bool guard_active;
+	bool undo_data_fetch;
+	bool undo_data_ready;
 	GcsBlockR4TxOriginDomain domain;
 	GcsBlockR4TxOriginPhase phase;
 	GcsBlockR4TxOriginPhase failure_phase;
@@ -242,7 +245,7 @@ typedef struct GcsBlockR4TxOriginContext {
 	ClusterTxResolution resolution;
 	ClusterTxOutcome outcome;
 	ClusterTxResolveReason reason;
-	uint8 reply_frame[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint8 reply_frame[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + sizeof(ClusterGcsUndoAuthTrailer)];
 } GcsBlockR4TxOriginContext;
 
 static GcsBlockR4TxOriginContext
@@ -2462,8 +2465,7 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 			|| header->page_lsn == 0)
 			return false;
 		undo_auth = (const ClusterGcsUndoAuthTrailer *)(block_data + GCS_BLOCK_DATA_SIZE);
-		return ClusterGcsUndoAuthTrailerGetTtGeneration(undo_auth) != 0
-			   && ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth) != 0;
+		return ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth) != 0;
 	}
 
 	for (i = 0; i < GCS_BLOCK_DATA_SIZE; i++)
@@ -2835,7 +2837,8 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 	 * it before ordinary TARGET admission so malformed kind-2 frames are
 	 * consumed fail-closed and can never fall through as holder CR work. */
 	if (forward->extension.r4_version == CLUSTER_R4_WIRE_VERSION
-		&& forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_TX_RESOLVE)
+		&& (forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_TX_RESOLVE
+			|| forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
 		return gcs_block_r4_tx_origin_try_accept(env, forward);
 	memset(&admission, 0, sizeof(admission));
 	admission_result = cluster_semantic_activation_enter(
@@ -6676,13 +6679,14 @@ gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void 
 }
 
 static bool
-gcs_block_r4_tx_origin_locator_kind_valid(const ClusterTxLocator *locator)
+gcs_block_r4_tx_origin_locator_kind_valid(const ClusterTxLocator *locator, bool undo_data_fetch)
 {
 	bool data_kind;
 
 	if (locator == NULL || locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
 		|| !TransactionIdIsNormal(locator->xid)
-		|| locator->tt_wrap != TT_WRAP_INVALID)
+		|| (locator->tt_wrap != TT_WRAP_INVALID
+			&& (!undo_data_fetch || locator->tt_wrap > TT_WRAP_MAX)))
 		return false;
 	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
 				|| locator->itl_kind == ITL_FLAG_COMMITTED
@@ -6806,45 +6810,46 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	uint16 row_offset;
 	uint32 capability_generation = 0;
 	bool optional_supported = false;
+	bool undo_data_fetch
+		= forward != NULL && forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
 	int i;
 
 	memset(&locator, 0, sizeof(locator));
 	memset(&logical, 0, sizeof(logical));
 	memset(&root, 0, sizeof(root));
 	memset(&admission, 0, sizeof(admission));
-	if (env == NULL || forward == NULL
-		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+	if (env == NULL || forward == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
 		|| env->payload_length != sizeof(*forward)
 		|| env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| forward->base.original_requester_node != (int32)env->source_node_id
 		|| forward->base.original_requester_node == cluster_node_id
-		|| forward->base.requester_backend_id <= 0
-		|| forward->base.requester_backend_id > MaxBackends
-		|| forward->base.master_node != cluster_node_id
-		|| forward->base.request_id == 0
-		|| forward->base.transition_id != (uint8)PCM_TRANS_N_TO_S
-		|| forward->base.epoch != env->epoch
-		|| forward->base.epoch != cluster_epoch_get_current()
+		|| (undo_data_fetch
+				? (forward->base.requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+				   || forward->base.master_node != forward->base.original_requester_node)
+				: (forward->base.requester_backend_id <= 0
+				   || forward->base.requester_backend_id > MaxBackends
+				   || forward->base.master_node != cluster_node_id))
+		|| forward->base.request_id == 0 || forward->base.transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| forward->base.epoch != env->epoch || forward->base.epoch != cluster_epoch_get_current()
 		|| (forward->base.epoch == 0 && cluster_conf_node_count() != 4)
 		|| cluster_ic_tier1_my_data_channel() != 0
-		|| memcmp(forward->base.expected_pi_watermark_scn_bytes,
-				  zero_watermark, sizeof(zero_watermark)) != 0
-		|| forward->base.reserved_0[0] != 0
-		|| forward->base.reserved_0[1] != 0
-		|| forward->base.reserved_0[2] != 0
-		|| forward->base.reserved_0[3] != 0
-		|| forward->base.reserved_0[4] != 0
-		|| forward->base.reserved_0[5] != 0
-		|| forward->base.reserved_0[6] != 0
+		|| (undo_data_fetch
+				? !SCN_VALID(GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base))
+				: memcmp(forward->base.expected_pi_watermark_scn_bytes, zero_watermark,
+						 sizeof(zero_watermark))
+					  != 0)
+		|| forward->base.reserved_0[0] != 0 || forward->base.reserved_0[1] != 0
+		|| forward->base.reserved_0[2] != 0 || forward->base.reserved_0[3] != 0
+		|| forward->base.reserved_0[4] != 0 || forward->base.reserved_0[5] != 0
+		|| forward->base.reserved_0[6] != (undo_data_fetch ? CLUSTER_R4_FORWARD_EXTENDED : 0)
 		|| !ClusterR4ForwardExtensionGetLocatorGeneration(
-			&forward->extension, CLUSTER_R4_WIRE_TX_RESOLVE,
+			&forward->extension,
+			undo_data_fetch ? CLUSTER_R4_WIRE_UNDO_DATA_FETCH : CLUSTER_R4_WIRE_TX_RESOLVE,
 			&locator, &expected_generation)
-		|| !gcs_block_r4_tx_origin_locator_kind_valid(&locator)
-		|| !uba_decode(locator.uba, &segment_id, &block_no,
-					   &tt_slot_offset, &row_offset)
-		|| block_no == 0
-		|| uba_origin_node_id(locator.uba) != (NodeId)cluster_node_id)
+		|| !gcs_block_r4_tx_origin_locator_kind_valid(&locator, undo_data_fetch)
+		|| !uba_decode(locator.uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
+		|| block_no == 0 || uba_origin_node_id(locator.uba) != (NodeId)cluster_node_id)
 		return true;
 	expected_tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 	if (memcmp(&forward->base.tag, &expected_tag, sizeof(expected_tag)) != 0)
@@ -6885,15 +6890,19 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result == CLUSTER_SEMANTIC_ADMISSION_OK) {
 		resolve_mode = CLUSTER_TX_RESOLVE_VISIBILITY;
-		if (!cluster_semantic_activation_resolve_shared_undo_root(
-				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &root)
+		if ((undo_data_fetch
+			 && !cluster_semantic_activation_peer_open_matches(
+				 &admission, forward->base.original_requester_node,
+				 GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, capability_generation))
+			|| !cluster_semantic_activation_resolve_shared_undo_root(
+				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+				logical.segment_id, &root)
 			|| !cluster_semantic_activation_recheck(&admission)) {
 			cluster_semantic_activation_leave(&admission);
 			return true;
 		}
 	} else {
-		if (admission_result != CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
+		if (undo_data_fetch || admission_result != CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
 			return true;
 		if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
 				!= CLUSTER_SEMANTIC_ADMISSION_OK)
@@ -6910,6 +6919,7 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 
 	memset(free_context, 0, sizeof(*free_context));
 	free_context->in_use = true;
+	free_context->undo_data_fetch = undo_data_fetch;
 	free_context->domain = GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE;
 	free_context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN;
 	free_context->resolve_mode = resolve_mode;
@@ -6927,6 +6937,8 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	free_context->admission = admission;
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
 	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	if (undo_data_fetch)
+		cluster_scn_observe(GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base));
 	return true;
 }
 
@@ -7452,6 +7464,64 @@ gcs_block_r4_tx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 		header->status = (uint8)GCS_BLOCK_REPLY_R4_DENIED;
 	}
 	header->checksum = gcs_block_compute_checksum((const char *)page);
+}
+
+static void
+gcs_block_r4_undo_origin_copy_held(GcsBlockR4TxOriginContext *context,
+								   const ClusterUndoBlock0ResolvedRoot *root)
+{
+	Assert(context->undo_data_fetch && context->guard_active);
+	context->outcome = cluster_runtime_visibility_origin_plan_copy_data_held(
+		&context->origin_plan, context->resolve_mode, &context->admission, &context->guard, root,
+		&context->resolution, (char *)context->reply_frame + sizeof(GcsBlockReplyHeader),
+		&context->reason);
+	context->undo_data_ready = context->outcome != CLUSTER_TX_UNKNOWN;
+}
+
+static uint32
+gcs_block_r4_undo_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
+{
+	GcsBlockReplyHeader *header = (GcsBlockReplyHeader *)context->reply_frame;
+	char *page = (char *)context->reply_frame + sizeof(*header);
+	ClusterGcsUndoAuthTrailer *trailer
+		= (ClusterGcsUndoAuthTrailer *)(context->reply_frame + GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+	bool positive
+		= context->undo_data_ready && gcs_block_r4_tx_origin_resolution_valid(context)
+		  && scn_time_cmp(context->resolution.authority.authority_scn,
+						  GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&context->forward.base))
+				 >= 0;
+	uint32 size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+
+	/* A backpressured send keeps the same already-proven page. */
+	memset(header, 0, sizeof(*header));
+	memset(trailer, 0, sizeof(*trailer));
+	header->request_id = context->forward.base.request_id;
+	header->epoch = context->forward.base.epoch;
+	header->sender_node = cluster_node_id;
+	header->requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
+	header->transition_id = (uint8)PCM_TRANS_N_TO_S;
+	GcsBlockReplyHeaderSetForwardingMasterNode(header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	if (positive
+		&& GcsBlockReplyHeaderSetR4UndoGeneration(header, context->expected_generation.value)) {
+		header->status = GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
+		header->page_lsn = context->resolution.authority.live_hwm_lsn;
+		ClusterGcsUndoAuthTrailerSetTtGeneration(trailer,
+												 context->resolution.authority.tt_generation);
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(trailer,
+												 context->resolution.authority.authority_scn);
+		size += sizeof(*trailer);
+	} else {
+		memset(page, 0, GCS_BLOCK_DATA_SIZE);
+		header->status = context->reason == CLUSTER_TX_RESOLVE_TIMEOUT
+								 || context->reason == CLUSTER_TX_RESOLVE_CAPACITY
+								 || context->reason == CLUSTER_TX_RESOLVE_HOLDER_MOVED
+								 || context->reason == CLUSTER_TX_RESOLVE_RF_DEFERRED
+							 ? GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
+							 : GCS_BLOCK_REPLY_R4_DENIED;
+		gcs_block_r4_tx_origin_log_first_denied(context);
+	}
+	header->checksum = gcs_block_compute_checksum(page);
+	return size;
 }
 
 static void
@@ -7991,6 +8061,8 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 					&context->reason);
 			if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
 				context->outcome = context->resolution.outcome;
+				if (context->undo_data_fetch)
+					gcs_block_r4_undo_origin_copy_held(context, &context->root);
 				context->phase
 					= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 			} else if (origin_step
@@ -8260,6 +8332,8 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
 				(void)gcs_block_current_mx_origin_updater_provenance_advance(
 					context);
+			else if (context->undo_data_fetch)
+				gcs_block_r4_undo_origin_copy_held(context, &context->recheck_root);
 			else
 				context->outcome
 					= cluster_runtime_visibility_origin_plan_recheck_data_held(
@@ -8319,6 +8393,7 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			int32 requester_node;
 			uint64 request_epoch;
 			bool capability_current;
+			uint32 reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
 
 			if (context->domain
 					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
@@ -8359,14 +8434,16 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			if (context->domain
 					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
 				gcs_block_current_mx_origin_prepare_reply(context);
+			else if (context->undo_data_fetch)
+				reply_size = gcs_block_r4_undo_origin_prepare_reply(context);
 			else
 				gcs_block_r4_tx_origin_prepare_reply(context);
 			send_result = gcs_block_send_envelope_or_loopback(
-				PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-				requester_node,
-				context->reply_frame, sizeof(context->reply_frame));
+				PGRAC_IC_MSG_GCS_BLOCK_REPLY, requester_node, context->reply_frame, reply_size);
 			cluster_gcs_block_note_send_outcome(
 				GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
+			if (context->undo_data_fetch && send_result == CLUSTER_IC_SEND_NOT_ADMITTED)
+				break;
 			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
 				cluster_lms_data_plane_close_peer_now(
 					context->forward.base.original_requester_node);
@@ -8401,6 +8478,7 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 			 step_budget < GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET;
 			 step_budget++) {
 			GcsBlockR4TxOriginPhase phase_before = context->phase;
+			MemoryContext saved_context = CurrentMemoryContext;
 
 			PG_TRY();
 			{
@@ -8408,8 +8486,20 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 			}
 			PG_CATCH();
 			{
+				MemoryContextSwitchTo(saved_context);
 				FlushErrorState();
-				gcs_block_r4_tx_origin_context_clear(context, true);
+				if (context->undo_data_fetch) {
+					if (context->guard_active)
+						cluster_undo_block0_current_cancel(&context->guard);
+					context->guard_active = false;
+					memset(&context->guard, 0, sizeof(context->guard));
+					context->outcome = CLUSTER_TX_UNKNOWN;
+					context->reason = CLUSTER_TX_RESOLVE_IO_ERROR;
+					context->undo_data_ready = false;
+					memset(&context->resolution, 0, sizeof(context->resolution));
+					context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+				} else
+					gcs_block_r4_tx_origin_context_clear(context, true);
 			}
 			PG_END_TRY();
 			if (context->in_use && context->failure_phase == 0
@@ -19365,6 +19455,13 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 		return false;
 	if (env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
 		return true;
+
+	if (hdr->requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+		&& GcsBlockReplyStatusIsR4Refusal(hdr->status)) {
+		(void)cluster_cr_server_r4_land_foreign_undo(env, hdr, (const char *)payload + sizeof(*hdr),
+													 NULL);
+		return true;
+	}
 
 	backend_idx = hdr->requester_backend_id - 1;
 	if (backend_idx < 0 || backend_idx >= MaxBackends

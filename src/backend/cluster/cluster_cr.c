@@ -409,29 +409,52 @@ cr_r4_foreign_request_matches(uint32 slot_index, uint64 slot_generation,
 	uint16 row_offset;
 	NodeId origin;
 
-	if (!context->pending_locator_valid || slot_generation > (UINT64_MAX >> 2)
-		|| extension->foreign_request_id != ((slot_generation << 2) | slot_index)
-		|| extension->foreign_request_id == 0
-		|| pending->xid != locator->xid || pending->tt_wrap != locator->tt_wrap
-		|| pending->itl_kind != locator->itl_kind
+	if (!context->pending_locator_valid || extension->build_steps != context->visited_count
+		|| extension->foreign_request_id
+			   != cluster_cr_r4_dependency_request_id(slot_index, slot_generation,
+													  extension->build_steps)
+		|| extension->foreign_request_id == 0 || pending->xid != locator->xid
+		|| pending->tt_wrap != locator->tt_wrap || pending->itl_kind != locator->itl_kind
 		|| pending->itl_slot_index != locator->itl_slot_index
-		|| !uba_decode(pending->uba, &segment_id, &block_no, &tt_slot_offset,
-					   &row_offset)
+		|| !uba_decode(pending->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
 		|| block_no == 0)
 		return false;
 	origin = uba_origin_node_id(pending->uba);
 	return origin != InvalidNodeId && origin != (NodeId)cluster_node_id
 		   && extension->foreign_uba.raw[0] == pending->uba.raw[0]
 		   && extension->foreign_uba.raw[1] == pending->uba.raw[1]
-		   && extension->origin_formation_epoch
-				  == extension->route_proof.formation_epoch
+		   && extension->origin_formation_epoch == extension->route_proof.formation_epoch
 		   && extension->foreign_origin_node == (int32)origin
-		   && extension->foreign_segment_id == segment_id
-		   && extension->foreign_block_no == block_no
+		   && extension->foreign_segment_id == segment_id && extension->foreign_block_no == block_no
 		   && extension->foreign_xid == pending->xid
-		   && extension->foreign_wrap == pending->tt_wrap
+		   && (pending->tt_wrap == TT_WRAP_INVALID ? (extension->foreign_wrap == TT_WRAP_INVALID
+													  || extension->foreign_wrap <= TT_WRAP_MAX)
+												   : extension->foreign_wrap == pending->tt_wrap)
 		   && extension->foreign_tt_slot_offset == tt_slot_offset
 		   && extension->foreign_row_offset == row_offset;
+}
+
+/* Page-slot reuse is not TT-slot reuse.  Only the addressed record may
+ * establish an initially unknown canonical TT generation; exact callers and
+ * every later predecessor keep their original generation check. */
+static bool
+cr_r4_canonical_record_locator(const ClusterTxLocator *request, UBA record_uba,
+							   const UndoRecordHeader *record, ClusterTxLocator *out)
+{
+	ClusterTxLocator canonical = *request;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	if (canonical.tt_wrap == TT_WRAP_INVALID) {
+		if (record->tt_wrap_plus1 == 0)
+			return false;
+		canonical.tt_wrap = (uint16)(record->tt_wrap_plus1 - 1);
+		if (canonical.tt_wrap > TT_WRAP_MAX)
+			return false;
+	}
+	if (!cluster_undo_record_validate_identity(&canonical, record_uba, record, &reason))
+		return false;
+	*out = canonical;
+	return true;
 }
 
 bool
@@ -445,7 +468,6 @@ cluster_cr_r4_extract_resident_record(
 	const UndoRecordHeader *record;
 	PGAlignedBlock candidate_record;
 	ClusterTxLocator canonical_locator;
-	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 	uint32 segment_id;
 	uint32 block_no;
 	uint32 slot_dir_low;
@@ -487,16 +509,8 @@ cluster_cr_r4_extract_resident_record(
 			   != sizeof(UndoRecordHeader) + (size_t)record->payload_length)
 		return false;
 
-	canonical_locator = *request_locator;
-	if (canonical_locator.tt_wrap == TT_WRAP_INVALID) {
-		if (record->tt_wrap_plus1 == 0)
-			return false;
-		canonical_locator.tt_wrap = (uint16)(record->tt_wrap_plus1 - 1);
-		if (canonical_locator.tt_wrap > TT_WRAP_MAX)
-			return false;
-	}
-	if (!cluster_undo_record_validate_identity(
-			&canonical_locator, request_locator->uba, record, &reason))
+	if (!cr_r4_canonical_record_locator(request_locator, request_locator->uba, record,
+										&canonical_locator))
 		return false;
 
 	memcpy(record_out, candidate_record.data, record_length);
@@ -603,6 +617,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 				*reason_out = CLUSTER_CR_BUILD_BAD_LOCATOR;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
+			/* The immutable page retains its own ABA incarnation.  That
+			 * number cannot predict the independently recycled TT slot. */
+			context->locators[i].tt_wrap = TT_WRAP_INVALID;
 		}
 		if (cluster_cr_chain_walk_max_steps <= 0) {
 			*reason_out = CLUSTER_CR_BUILD_CHAIN_LIMIT;
@@ -665,29 +682,28 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 				context->visited_ubas[context->visited_count++] = current_uba;
 			}
 			if (origin != (NodeId)cluster_node_id && !record_from_foreign_page) {
-				if (!uba_decode(current_uba, &foreign_segment, &foreign_block,
-								&foreign_tt_offset, &foreign_row)
+				if (!uba_decode(current_uba, &foreign_segment, &foreign_block, &foreign_tt_offset,
+								&foreign_row)
 					|| foreign_block == 0
-					|| slot_generation > (UINT64_MAX >> 2)
-					|| context->pending_locator_valid
-					|| extension->foreign_request_id != 0
+					|| cluster_cr_r4_dependency_request_id(slot_index, slot_generation,
+														   extension->build_steps)
+						   == 0
+					|| context->pending_locator_valid || extension->foreign_request_id != 0
 					|| !UBA_is_invalid(extension->foreign_uba)
-					|| extension->origin_formation_epoch != 0
-					|| extension->origin_live_hwm_lsn != 0
+					|| extension->origin_formation_epoch != 0 || extension->origin_live_hwm_lsn != 0
 					|| extension->origin_tt_generation != 0
 					|| SCN_VALID(extension->origin_authority_scn)
-					|| extension->foreign_origin_node != 0
-					|| extension->foreign_segment_id != 0
+					|| extension->foreign_origin_node != 0 || extension->foreign_segment_id != 0
 					|| extension->foreign_block_no != 0
-					|| TransactionIdIsValid(extension->foreign_xid)
-					|| extension->foreign_wrap != 0
+					|| TransactionIdIsValid(extension->foreign_xid) || extension->foreign_wrap != 0
 					|| extension->foreign_tt_slot_offset != 0
 					|| extension->foreign_row_offset != 0) {
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
 
-				extension->foreign_request_id = (slot_generation << 2) | slot_index;
+				extension->foreign_request_id = cluster_cr_r4_dependency_request_id(
+					slot_index, slot_generation, extension->build_steps);
 				extension->foreign_uba = current_uba;
 				extension->origin_formation_epoch
 					= extension->route_proof.formation_epoch;
@@ -712,11 +728,14 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 			if (record_from_foreign_page) {
 				record_length = 0;
 				if (cluster_cr_r4_extract_resident_record(
-						foreign_undo_page, &context->pending_locator,
-						record_buffer.data, &record_length, &canonical_locator)) {
+						foreign_undo_page, &context->pending_locator, record_buffer.data,
+						&record_length, &canonical_locator)
+					&& (extension->foreign_wrap == TT_WRAP_INVALID
+						|| extension->foreign_wrap == canonical_locator.tt_wrap)) {
 					context->pending_locator = canonical_locator;
 					*locator = canonical_locator;
-				}
+				} else
+					record_length = 0;
 			} else
 				record_length = cluster_undo_get_record(
 					current_uba, record_buffer.data, sizeof(record_buffer.data));
@@ -732,6 +751,14 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 			}
 			record = (UndoRecordHeader *)record_buffer.data;
 			terminal = UBA_is_invalid(record->prev_uba);
+			if (!context->have_previous && locator->tt_wrap == TT_WRAP_INVALID) {
+				if (!cr_r4_canonical_record_locator(locator, current_uba, record,
+													&canonical_locator)) {
+					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+					return CLUSTER_R4_CR_STEP_FAIL;
+				}
+				*locator = canonical_locator;
+			}
 			if (record_length != sizeof(UndoRecordHeader) + record->payload_length
 				|| (terminal ? record->flags != UNDO_REC_FLAG_FIRST_IN_TX
 							 : record->flags != 0)

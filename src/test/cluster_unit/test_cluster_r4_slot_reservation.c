@@ -8,15 +8,18 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include "access/htup_details.h"
 
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -280,6 +283,78 @@ static uint32 ut_state_at_extract;
 static ClusterTxLocator ut_extract_locator;
 static bool ut_reclaim_race_on_proof;
 static bool ut_reclaim_race_injected;
+static bool ut_real_builder;
+int cluster_cr_chain_walk_max_steps = 4096;
+MemoryContext TopMemoryContext = (MemoryContext)0x1;
+extern ClusterR4CrBuildStepResult continuation_real_step(uint32, uint64, bool,
+														 ClusterR4CrSlotExtension *, char *,
+														 const char *, ClusterCrBuildReason *);
+extern void continuation_real_forget(uint32, uint64);
+extern bool continuation_real_pending(uint32, uint64, ClusterTxLocator *);
+extern bool continuation_real_extract(const char *, const ClusterTxLocator *, char *, size_t *,
+									  ClusterTxLocator *);
+
+void *
+MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return calloc(1, size);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+size_t
+cluster_undo_get_record(UBA uba pg_attribute_unused(), void *out pg_attribute_unused(),
+						size_t size pg_attribute_unused())
+{
+	/* The integrated fixture is entirely foreign. A local read is a bug. */
+	UT_ASSERT(false);
+	return 0;
+}
+
+bool
+errstart(int level, const char *domain pg_attribute_unused())
+{
+	return level >= ERROR;
+}
+
+int
+errcode(int sqlerrcode)
+{
+	ut_builder_error_code = sqlerrcode;
+	return 0;
+}
+
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+
+int
+errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errmsg_internal(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *func pg_attribute_unused())
+{
+	UT_ASSERT(false); /* A real page operation must not throw in this fixture. */
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 
 bool
 cluster_cr_r4_extract_resident_record(
@@ -288,6 +363,9 @@ cluster_cr_r4_extract_resident_record(
 	size_t *record_length_out, ClusterTxLocator *canonical_locator_out)
 {
 	ut_extract_calls++;
+	if (ut_real_builder)
+		return continuation_real_extract(resident_undo_page, request_locator, record_out,
+										 record_length_out, canonical_locator_out);
 	ut_state_at_extract = pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
 	memset(&ut_extract_locator, 0, sizeof(ut_extract_locator));
 	if (request_locator != NULL)
@@ -322,6 +400,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 	ut_builder_foreign_page = foreign_undo_page;
 	ut_state_at_builder_step
 		= pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
+	if (ut_real_builder)
+		return continuation_real_step(slot_index, slot_generation, foreign_undo_ready, extension,
+									  result_page, foreign_undo_page, reason_out);
 	if (ut_builder_throw_query_cancel) {
 		ut_builder_error_code = ERRCODE_QUERY_CANCELED;
 		CurrentMemoryContext = (MemoryContext)&ut_error_memory_context_storage;
@@ -333,9 +414,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 	if (ut_builder_publish_foreign_pause && extension != NULL) {
 		foreign_uba.raw[0] = UINT64CONST(0x0000000900000101);
 		foreign_uba.raw[1] = UINT64CONST(0x0000000000060003);
-		extension->foreign_request_id = UINT64CONST(4);
+		extension->foreign_request_id = UINT64CONST(262144);
 		extension->foreign_uba = foreign_uba;
-		extension->origin_formation_epoch = UT_FORMATION_EPOCH;
+		extension->origin_formation_epoch = extension->route_proof.formation_epoch;
 		extension->foreign_origin_node = 1;
 		extension->foreign_segment_id = 257;
 		extension->foreign_block_no = 9;
@@ -356,6 +437,8 @@ cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation)
 	ut_forget_calls++;
 	ut_forget_slot_index = slot_index;
 	ut_forget_slot_generation = slot_generation;
+	if (ut_real_builder)
+		continuation_real_forget(slot_index, slot_generation);
 }
 
 bool
@@ -363,6 +446,8 @@ cluster_cr_build_on_holder_pending_locator(uint32 slot_index,
 									   uint64 slot_generation,
 									   ClusterTxLocator *locator_out)
 {
+	if (ut_real_builder)
+		return continuation_real_pending(slot_index, slot_generation, locator_out);
 	ut_pending_locator_calls++;
 	ut_pending_locator_slot_index = slot_index;
 	ut_pending_locator_slot_generation = slot_generation;
@@ -982,6 +1067,7 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	memset(&ut_extract_locator, 0, sizeof(ut_extract_locator));
 	ut_reclaim_race_on_proof = false;
 	ut_reclaim_race_injected = false;
+	ut_real_builder = false;
 	cluster_cr_server_test_r4_reset_contexts();
 
 	cluster_cr_server_shmem_register();
@@ -1007,6 +1093,20 @@ bytes_are(const void *ptr, Size size, uint8 expected)
 			return false;
 	}
 	return true;
+}
+
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	uint64 left = scn_local(a);
+	uint64 right = scn_local(b);
+	return (left > right) - (left < right);
+}
+
+int
+cluster_conf_node_count(void)
+{
+	return 4;
 }
 
 static bool
@@ -1157,7 +1257,7 @@ make_foreign_undo_reply(GcsBlockReplyHeader *header,
 						ClusterICEnvelope *env, char page[BLCKSZ])
 {
 	memset(header, 0, sizeof(*header));
-	header->request_id = UINT64CONST(4);
+	header->request_id = UINT64CONST(262144);
 	header->page_lsn = UT_FOREIGN_LIVE_HWM;
 	header->epoch = UT_FORMATION_EPOCH;
 	header->checksum = ut_checksum_value;
@@ -1180,6 +1280,7 @@ make_foreign_undo_reply(GcsBlockReplyHeader *header,
 	env->msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
 	env->source_node_id = 1;
 	env->dest_node_id = UT_HOLDER_NODE;
+	env->epoch = UT_FORMATION_EPOCH;
 	env->payload_length = sizeof(*header) + BLCKSZ + sizeof(*auth);
 }
 
@@ -1198,7 +1299,7 @@ assert_exact_foreign_undo_forward96(void)
 	UT_ASSERT_EQ(ut_send_msg_type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
 	UT_ASSERT_EQ(ut_send_dest, 1);
 	UT_ASSERT_EQ(ut_send_length, sizeof(ClusterR4CrForwardPayload));
-	UT_ASSERT_EQ(forward->base.request_id, UINT64CONST(4));
+	UT_ASSERT_EQ(forward->base.request_id, UINT64CONST(262144));
 	UT_ASSERT_EQ(forward->base.epoch, UT_FORMATION_EPOCH);
 	UT_ASSERT_EQ(forward->base.tag.spcOid, GCS_BLOCK_UNDO_FETCH_TAG_MAGIC);
 	UT_ASSERT_EQ(forward->base.tag.dbOid, 257);
@@ -1853,7 +1954,7 @@ UT_TEST(test_r4_worker0_build_step_publishes_one_need_undo)
 
 	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
 	expected = slot->r4;
-	expected.foreign_request_id = UINT64CONST(4);
+	expected.foreign_request_id = UINT64CONST(262144);
 	expected.foreign_uba.raw[0] = UINT64CONST(0x0000000900000101);
 	expected.foreign_uba.raw[1] = UINT64CONST(0x0000000000060003);
 	expected.origin_formation_epoch = UT_FORMATION_EPOCH;
@@ -2310,7 +2411,7 @@ UT_TEST(test_r4_worker0_status24_mismatches_leave_shared_slot_unchanged)
 		REJECT_ORIGIN,
 		REJECT_PHYSICAL_GENERATION,
 		REJECT_LIVE_HWM,
-		REJECT_TT_GENERATION,
+		REJECT_ENV_EPOCH,
 		REJECT_AUTHORITY_ZERO,
 		REJECT_AUTHORITY_BELOW_DEMAND,
 		REJECT_CHECKSUM,
@@ -2375,8 +2476,8 @@ UT_TEST(test_r4_worker0_status24_mismatches_leave_shared_slot_unchanged)
 			case REJECT_LIVE_HWM:
 				header.page_lsn = InvalidXLogRecPtr;
 				break;
-			case REJECT_TT_GENERATION:
-				ClusterGcsUndoAuthTrailerSetTtGeneration(&auth, 0);
+			case REJECT_ENV_EPOCH:
+				env.epoch++;
 				break;
 			case REJECT_AUTHORITY_ZERO:
 				ClusterGcsUndoAuthTrailerSetAuthorityScn(&auth, InvalidScn);
@@ -2727,10 +2828,311 @@ UT_TEST(test_all_four_legacy_submitters_use_common_reserver)
 	free(source);
 }
 
+UT_TEST(test_r4_worker0_ready_undo_resumes_and_releases_original_owner)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_undo_inflight(&state);
+	GcsBlockReplyHeader header;
+	ClusterGcsUndoAuthTrailer auth;
+	ClusterICEnvelope env;
+	char page[BLCKSZ];
+	int enters;
+
+	make_foreign_undo_reply(&header, &auth, &env, page);
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+	enters = ut_enter_calls;
+	ut_builder_publish_foreign_pause = false;
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT(ut_builder_foreign_ready);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+	UT_ASSERT_EQ(ut_state_at_builder_step, CLUSTER_LMS_CR_R4_BUILDING);
+	UT_ASSERT_EQ(ut_enter_calls, enters);
+	UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+	UT_ASSERT_EQ(ut_forget_calls, 1);
+	UT_ASSERT_EQ(ut_leave_calls, 2); /* short receive + original builder */
+	UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+}
+
+UT_TEST(test_r4_worker0_ready_undo_error_uses_original_terminal_cleanup)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_undo_inflight(&state);
+	GcsBlockReplyHeader header;
+	ClusterGcsUndoAuthTrailer auth;
+	ClusterICEnvelope env;
+	char page[BLCKSZ];
+
+	make_foreign_undo_reply(&header, &auth, &env, page);
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+	ut_builder_throw_query_cancel = true;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT(ut_builder_foreign_ready);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_CANCELLED);
+	UT_ASSERT_EQ(ut_forget_calls, 1);
+	UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+	UT_ASSERT_EQ(ut_forget_calls, 1);
+	UT_ASSERT_EQ(ut_leave_calls, 2);
+}
+
+UT_TEST(test_r4_worker0_origin_refusal_uses_exact_original_terminal_owner)
+{
+	int variant;
+	for (variant = 0; variant < 2; variant++) {
+		ClusterLmsSharedState state;
+		ClusterLmsCrSlot *slot = prepare_worker0_undo_inflight(&state);
+		GcsBlockReplyHeader header;
+		ClusterGcsUndoAuthTrailer auth;
+		ClusterICEnvelope env;
+		char page[BLCKSZ];
+
+		make_foreign_undo_reply(&header, &auth, &env, page);
+		header.status
+			= variant ? GCS_BLOCK_REPLY_R4_DENIED : GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+		header.page_lsn = 0;
+		memset(header.reserved_0, 0, sizeof(header.reserved_0));
+		memset(page, 0, sizeof(page));
+		env.payload_length = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+		UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, NULL));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
+					 variant ? CLUSTER_LMS_CR_R4_READY_FAIL : CLUSTER_LMS_CR_R4_READY_RETRY);
+		UT_ASSERT_EQ(ut_extract_calls, 0);
+		UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+		UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+		UT_ASSERT_EQ(ut_forget_calls, 1);
+		UT_ASSERT_EQ(ut_leave_calls, 2);
+		UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page, NULL));
+	}
+}
+
+UT_TEST(test_r4_worker0_initial_tt_rollover_counter_is_proven_zero)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_undo_inflight(&state);
+	GcsBlockReplyHeader header;
+	ClusterGcsUndoAuthTrailer auth;
+	ClusterICEnvelope env;
+	char page[BLCKSZ];
+
+	make_foreign_undo_reply(&header, &auth, &env, page);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&auth, 0);
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+	UT_ASSERT_EQ(slot->r4.origin_tt_generation, 0);
+	ut_builder_publish_foreign_pause = false;
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+}
+
+UT_TEST(test_r4_worker0_authority_cover_uses_logical_cross_origin_scn)
+{
+	int variant;
+	for (variant = 0; variant < 2; variant++) {
+		ClusterLmsSharedState state;
+		ClusterLmsCrSlot *slot = prepare_worker0_undo_inflight(&state);
+		ClusterLmsCrSlot before;
+		GcsBlockReplyHeader header;
+		ClusterGcsUndoAuthTrailer auth;
+		ClusterICEnvelope env;
+		char page[BLCKSZ];
+
+		make_foreign_undo_reply(&header, &auth, &env, page);
+		slot->read_scn = slot->r4.route_proof.read_scn = ((SCN)1 << 56) | (SCN)100;
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(&auth,
+												 variant ? (((SCN)3 << 56) | (SCN)99) : (SCN)101);
+		before = *slot;
+		if (variant) {
+			UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+			UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
+		} else {
+			UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+			ut_builder_publish_foreign_pause = false;
+			ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+			UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+			UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+			UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+		}
+	}
+}
+
+UT_TEST(test_r4_worker0_foreign_dependency_preserves_current_zero_epoch_open)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+	GcsBlockReplyHeader header;
+	ClusterGcsUndoAuthTrailer auth;
+	ClusterICEnvelope env;
+	char page[BLCKSZ];
+
+	/* Establish the original worker0 token in the ordinary current OPEN
+	 * formation; changing the token after claim would be a stale test. */
+	ut_expected_admission.formation_epoch = 0;
+	slot->epoch = slot->r4.route_proof.formation_epoch = 0;
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_NEED_UNDO;
+	ut_builder_step_reason = CLUSTER_CR_BUILD_NONE;
+	ut_builder_publish_foreign_pause = true;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT(
+		cluster_cr_server_test_r4_freeze_foreign_generation(0, UT_FOREIGN_PHYSICAL_GENERATION));
+	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	make_foreign_undo_reply(&header, &auth, &env, page);
+	header.epoch = env.epoch = 0;
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+	ut_builder_publish_foreign_pause = false;
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+}
+
+UT_TEST(test_worker0_real_builder_two_foreign_updates_complete_same_owned_continuation)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+	Page page = slot->result_page;
+	PageHeader phdr = (PageHeader)page;
+	char old_images[2][32];
+	GcsBlockReplyHeader previous_header;
+	ClusterGcsUndoAuthTrailer previous_auth;
+	ClusterICEnvelope previous_env;
+	PGAlignedBlock previous_page;
+	int i;
+
+	ut_real_builder = true;
+	memset(page, 0, BLCKSZ);
+	PageSetPageSizeAndVersion(page, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	phdr->pd_flags = PD_HAS_ITL;
+	phdr->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	phdr->pd_lower = SizeOfPageHeaderData + 4 * sizeof(ItemIdData);
+	phdr->pd_upper = phdr->pd_special - 4 * 32;
+	for (i = 0; i < 2; i++) {
+		OffsetNumber old_off = (OffsetNumber)(1 + i * 2), new_off = old_off + 1;
+		TransactionId xid = 797 + i;
+		HeapTupleHeader old_image = (HeapTupleHeader)old_images[i];
+		HeapTupleHeader current, replacement;
+		ClusterItlSlotData *itl = &ClusterPageGetItlSlots(page)[i];
+		uint16 old_pos = phdr->pd_upper + i * 64, new_pos = old_pos + 32;
+		ItemIdSetNormal(PageGetItemId(page, old_off), old_pos, 32);
+		ItemIdSetNormal(PageGetItemId(page, new_off), new_pos, 32);
+		memset(old_image, 0, 32);
+		HeapTupleHeaderSetXmin(old_image, 796);
+		HeapTupleHeaderSetXmax(old_image, InvalidTransactionId);
+		old_image->t_infomask = HEAP_XMAX_INVALID;
+		old_image->t_hoff = SizeofHeapTupleHeader;
+		old_image->t_itl_slot_idx = (uint8)i;
+		ItemPointerSet(&old_image->t_ctid, slot->tag.blockNum, old_off);
+		current = (HeapTupleHeader)(page + old_pos);
+		memcpy(current, old_image, 32);
+		HeapTupleHeaderSetXmax(current, xid);
+		current->t_infomask &= ~HEAP_XMAX_INVALID;
+		ItemPointerSet(&current->t_ctid, slot->tag.blockNum, new_off);
+		replacement = (HeapTupleHeader)(page + new_pos);
+		memcpy(replacement, old_image, 32);
+		HeapTupleHeaderSetXmin(replacement, xid);
+		ItemPointerSet(&replacement->t_ctid, slot->tag.blockNum, new_off);
+		itl->xid = xid;
+		itl->wrap = 1; /* Page ABA is deliberately not canonical TT wrap7. */
+		itl->flags = ITL_FLAG_ACTIVE;
+		itl->write_scn = UT_READ_SCN + 10 + i;
+		itl->undo_segment_head = uba_encode(257, 9 - i, 3, 6);
+	}
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	for (i = 0; i < 2; i++) {
+		PGAlignedBlock undo_page;
+		UndoBlockHeader *undo_header = (UndoBlockHeader *)undo_page.data;
+		UndoRecordHeader *record = (UndoRecordHeader *)(undo_page.data + sizeof(*undo_header));
+		UndoUpdatePayload *payload = (UndoUpdatePayload *)(record + 1);
+		UndoSlotDirEntry *directory;
+		GcsBlockReplyHeader header;
+		ClusterGcsUndoAuthTrailer auth;
+		ClusterICEnvelope env;
+		ClusterLmsCrSlot before;
+		int tuple_index = 1 - i;
+		int phase;
+
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_NEED_UNDO);
+		UT_ASSERT_EQ(slot->r4.foreign_request_id, UINT64_C(262144) + i * 4);
+		ut_current_sample_generation = UT_FOREIGN_PHYSICAL_GENERATION + i;
+		for (phase = 0;
+			 phase < 4 && pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_R4_NEED_UNDO; phase++)
+			(void)cluster_cr_server_test_r4_send_foreign_undo(0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+		if (i != 0) {
+			before = *slot;
+			UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&previous_env, &previous_header,
+															  previous_page.data, &previous_auth));
+			UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
+		}
+		make_foreign_undo_reply(&header, &auth, &env, undo_page.data);
+		memset(undo_page.data, 0, BLCKSZ);
+		undo_header->magic = PGRAC_UNDO_BLOCK_MAGIC;
+		undo_header->block_version = UNDO_BLOCK_VERSION_1;
+		undo_header->slot_count = 7;
+		undo_header->free_offset = sizeof(*undo_header) + sizeof(*record) + sizeof(*payload) + 32;
+		record->record_type = UNDO_RECORD_UPDATE;
+		record->flags = UNDO_REC_FLAG_FIRST_IN_TX;
+		record->payload_length = sizeof(*payload) + 32;
+		record->xid = 797 + tuple_index;
+		record->origin_node_id = 1;
+		record->tt_slot_segment_id = 257;
+		record->tt_slot_id = 4;
+		record->tt_wrap_plus1 = 8;
+		record->write_scn = UT_READ_SCN + 10 + tuple_index;
+		record->target_locator.spcOid = slot->tag.spcOid;
+		record->target_locator.dbOid = slot->tag.dbOid;
+		record->target_locator.relNumber = slot->tag.relNumber;
+		record->target_fork = slot->tag.forkNum;
+		record->target_block = slot->tag.blockNum;
+		record->target_offset = 1 + tuple_index * 2;
+		payload->new_block = slot->tag.blockNum;
+		payload->new_offset = record->target_offset + 1;
+		payload->old_tuple_length = 32;
+		payload->old_tuple_offset = sizeof(*payload);
+		memcpy(payload + 1, old_images[tuple_index], 32);
+		directory = UNDO_SLOT_DIR_PTR(undo_page.data, 6);
+		directory->record_offset = sizeof(*undo_header);
+		directory->record_length = sizeof(*record) + record->payload_length;
+		directory->record_type = record->record_type;
+		directory->flags = record->flags;
+		header.request_id = slot->r4.foreign_request_id;
+		UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(&header, ut_current_sample_generation));
+		UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, undo_page.data, &auth));
+		previous_header = header;
+		previous_auth = auth;
+		previous_env = env;
+		previous_page = undo_page;
+		UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+		UT_ASSERT(ut_builder_foreign_ready);
+		UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+	}
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+	UT_ASSERT_EQ(ut_current_sample_calls, 2);
+	for (i = 0; i < 2; i++) {
+		ItemId old_item = PageGetItemId(page, 1 + i * 2);
+		UT_ASSERT(ItemIdIsNormal(old_item));
+		UT_ASSERT_EQ(memcmp(PageGetItem(page, old_item), old_images[i], 32), 0);
+		UT_ASSERT(!ItemIdIsNormal(PageGetItemId(page, 2 + i * 2)));
+		UT_ASSERT_EQ(ClusterPageGetItlSlots(page)[i].wrap, 1);
+	}
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+	UT_ASSERT_EQ(ut_forget_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+	UT_ASSERT(!continuation_real_pending(0, 1, &ut_pending_locator));
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(43);
 	UT_RUN(test_free_to_pending_canonicalizes_owner_under_lms_lock);
 	UT_RUN(test_free_to_filling_uses_same_proof_window);
 	UT_RUN(test_busy_slot_preserves_winner_owner_stamp);
@@ -2759,6 +3161,13 @@ main(void)
 	UT_RUN(test_r4_worker0_foreign_undo_refusal_mapping_is_close_first);
 	UT_RUN(test_r4_worker0_foreign_undo_locator_mismatch_fails_before_send);
 	UT_RUN(test_r4_worker0_status24_lands_exact_foreign_undo_and_short_admission);
+	UT_RUN(test_r4_worker0_ready_undo_resumes_and_releases_original_owner);
+	UT_RUN(test_r4_worker0_ready_undo_error_uses_original_terminal_cleanup);
+	UT_RUN(test_r4_worker0_origin_refusal_uses_exact_original_terminal_owner);
+	UT_RUN(test_r4_worker0_initial_tt_rollover_counter_is_proven_zero);
+	UT_RUN(test_r4_worker0_authority_cover_uses_logical_cross_origin_scn);
+	UT_RUN(test_r4_worker0_foreign_dependency_preserves_current_zero_epoch_open);
+	UT_RUN(test_worker0_real_builder_two_foreign_updates_complete_same_owned_continuation);
 	UT_RUN(test_r4_worker0_status24_canonicalizes_invalid_wrap_before_ready);
 	UT_RUN(test_r4_worker0_status24_mismatches_leave_shared_slot_unchanged);
 	UT_RUN(test_r4_worker0_remote_full_ship_transfers_frame_and_cleans_context);

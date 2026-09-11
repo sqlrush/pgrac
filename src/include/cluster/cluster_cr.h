@@ -75,6 +75,17 @@ StaticAssertDecl(CLUSTER_R4_CR_STEP_NEED_UNDO == 1, "R4 build-step NEED_UNDO ord
 StaticAssertDecl(CLUSTER_R4_CR_STEP_RETRY == 2, "R4 build-step RETRY ordinal");
 StaticAssertDecl(CLUSTER_R4_CR_STEP_FAIL == 3, "R4 build-step FAIL ordinal");
 
+/* Existing wire id, distinct for each bounded record dependency.  The low
+ * two bits keep the four-slot routing; zero is never a publishable id. */
+static inline uint64
+cluster_cr_r4_dependency_request_id(uint32 slot_index, uint64 slot_generation, uint32 build_steps)
+{
+	if (slot_index >= 4 || slot_generation == 0 || slot_generation > (UINT64_MAX >> 18)
+		|| build_steps == 0 || build_steps > 65536)
+		return 0;
+	return (slot_generation << 18) | ((uint64)(build_steps - 1) << 2) | slot_index;
+}
+
 extern ClusterR4CrBuildStepResult cluster_cr_build_on_holder_step(
 	uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
 	ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],

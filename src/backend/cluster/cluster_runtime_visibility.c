@@ -2070,12 +2070,11 @@ cluster_runtime_visibility_origin_plan_canonical_diagnostic(
 	return true;
 }
 
-ClusterTxOutcome
-cluster_runtime_visibility_origin_plan_recheck_data_held(
+static ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_recheck_data_internal(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out, char *data_out,
 	ClusterTxResolveReason *reason_out)
 {
 	ClusterRuntimeVisibilityOriginPlanData *plan_data
@@ -2142,6 +2141,8 @@ cluster_runtime_visibility_origin_plan_recheck_data_held(
 			&plan_data->canonical_locator, &plan_data->canonical_diagnostic))
 		goto failed;
 	*out = plan_data->candidate;
+	if (data_out != NULL)
+		memcpy(data_out, data_page.data, BLCKSZ);
 	plan_data->valid = false;
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
@@ -2151,6 +2152,35 @@ failed:
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return CLUSTER_TX_UNKNOWN;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_recheck_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_origin_plan_recheck_data_internal(
+		plan, mode, admission, guard, root, out, NULL, reason_out);
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_copy_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out)
+{
+	if (data_out == NULL) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	return cluster_runtime_visibility_origin_plan_recheck_data_internal(
+		plan, mode, admission, guard, root, out, data_out, reason_out);
 }
 
 bool

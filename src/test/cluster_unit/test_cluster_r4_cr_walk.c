@@ -1890,14 +1890,14 @@ UT_TEST(test_r4_builder_foreign_head_freezes_one_need_undo)
 	UT_ASSERT_EQ(foreign_uba.raw[1], UINT64CONST(0x0000000000060003));
 
 	expected_extension = extension;
-	expected_extension.foreign_request_id = UINT64CONST(305);
+	expected_extension.foreign_request_id = (UINT64CONST(76) << 18) | 1;
 	expected_extension.foreign_uba = foreign_uba;
 	expected_extension.origin_formation_epoch = UINT64CONST(19);
 	expected_extension.foreign_origin_node = 1;
 	expected_extension.foreign_segment_id = 257;
 	expected_extension.foreign_block_no = 9;
 	expected_extension.foreign_xid = TEST_XID;
-	expected_extension.foreign_wrap = TEST_WRAP;
+	expected_extension.foreign_wrap = TT_WRAP_INVALID;
 	expected_extension.build_steps = 1;
 	expected_extension.foreign_tt_slot_offset = TEST_TT_OFFSET;
 	expected_extension.foreign_row_offset = 6;
@@ -1917,7 +1917,7 @@ UT_TEST(test_r4_builder_foreign_head_freezes_one_need_undo)
 	memset(&expected_locator, 0, sizeof(expected_locator));
 	expected_locator.uba = foreign_uba;
 	expected_locator.xid = TEST_XID;
-	expected_locator.tt_wrap = TEST_WRAP;
+	expected_locator.tt_wrap = TT_WRAP_INVALID;
 	expected_locator.itl_kind = ITL_FLAG_ACTIVE;
 	expected_locator.itl_slot_index = 0;
 	memset(&pending_locator, 0, sizeof(pending_locator));
@@ -1986,7 +1986,7 @@ UT_TEST(test_r4_builder_foreign_resume_preserves_predecessor_and_step_count)
 				 CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(extension.build_steps, 1);
-	UT_ASSERT_EQ(extension.foreign_request_id, UINT64CONST(315));
+	UT_ASSERT_EQ(extension.foreign_request_id, (UINT64CONST(78) << 18) | 3);
 	UT_ASSERT(extension.foreign_uba.raw[0] == head_uba.raw[0]
 			  && extension.foreign_uba.raw[1] == head_uba.raw[1]);
 	memset(&pending_locator, 0, sizeof(pending_locator));
@@ -2001,7 +2001,7 @@ UT_TEST(test_r4_builder_foreign_resume_preserves_predecessor_and_step_count)
 				 CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(extension.build_steps, 2);
-	UT_ASSERT_EQ(extension.foreign_request_id, UINT64CONST(315));
+	UT_ASSERT_EQ(extension.foreign_request_id, (UINT64CONST(78) << 18) | 7);
 	UT_ASSERT(extension.foreign_uba.raw[0] == tail_uba.raw[0]
 			  && extension.foreign_uba.raw[1] == tail_uba.raw[1]);
 	memset(&pending_locator, 0, sizeof(pending_locator));
@@ -2011,6 +2011,19 @@ UT_TEST(test_r4_builder_foreign_resume_preserves_predecessor_and_step_count)
 			  && pending_locator.uba.raw[1] == tail_uba.raw[1]);
 
 	memcpy(foreign_page, tail_block, sizeof(foreign_page));
+	{
+		char before_late[BLCKSZ];
+		uint64 exact_id = extension.foreign_request_id;
+
+		memcpy(before_late, page, BLCKSZ);
+		extension.foreign_request_id = (UINT64CONST(78) << 18) | 3;
+		UT_ASSERT_EQ(
+			cluster_cr_build_on_holder_step(3, 78, true, &extension, page, foreign_page, &reason),
+			CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
+		UT_ASSERT(memcmp(before_late, page, BLCKSZ) == 0);
+		extension.foreign_request_id = exact_id;
+	}
 	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
 		3, 78, true, &extension, page, foreign_page, &reason),
 				 CLUSTER_R4_CR_STEP_FULL);
@@ -2549,10 +2562,154 @@ UT_TEST(test_r4_builder_successor_tid_is_not_unrelated_tuple_delete_authority)
 	UT_ASSERT(memcmp(occupant, occupant_before, TEST_TUPLE_LENGTH) == 0);
 }
 
+static void
+check_independent_record_generation(bool foreign, uint16 page_wrap, uint16 tt_wrap, bool landed,
+									int corrupt)
+{
+	PGAlignedBlock page, before, foreign_page;
+	char expected_old[TEST_TUPLE_LENGTH];
+	ClusterR4CrSlotExtension extension = make_builder_extension(192, 115);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterR4CrBuildStepResult result;
+	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
+	ClusterItlSlotData *slot;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page.data, &extension, expected_old);
+	slot = &ClusterPageGetItlSlots((Page)page.data)[0];
+	slot->wrap = page_wrap;
+	record->tt_wrap_plus1 = tt_wrap + 1;
+	if (foreign) {
+		slot->undo_segment_head = uba_encode(257, 9, TEST_TT_OFFSET, 0);
+		record->origin_node_id = 1;
+		record->tt_slot_segment_id = 257;
+	}
+	if (corrupt == 1)
+		record->tt_wrap_plus1 = 0;
+	else if (corrupt == 2)
+		record->xid++;
+	else if (corrupt == 3)
+		record->tt_slot_id++;
+	else if (corrupt == 4)
+		record->origin_node_id ^= 1;
+	make_single_record_undo_block(foreign_page.data, ut_undo_record, ut_undo_record_length);
+	memcpy(before.data, page.data, BLCKSZ);
+	result = cluster_cr_build_on_holder_step(0, 192, false, &extension, page.data,
+											 foreign_page.data, &reason);
+	if (foreign) {
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_NEED_UNDO);
+		UT_ASSERT_EQ(extension.foreign_wrap, TT_WRAP_INVALID);
+		if (landed)
+			extension.foreign_wrap = tt_wrap + (corrupt == 5 ? 1 : 0);
+		result = cluster_cr_build_on_holder_step(0, 192, true, &extension, page.data,
+												 foreign_page.data, &reason);
+	}
+	cluster_cr_build_on_holder_forget(0, 192);
+	if (corrupt) {
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT(memcmp(page.data, before.data, BLCKSZ) == 0);
+	} else {
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+		UT_ASSERT(memcmp(PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1)),
+						 expected_old, TEST_TUPLE_LENGTH)
+				  == 0);
+		UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page.data, 2)));
+		UT_ASSERT_EQ(ClusterPageGetItlSlots((Page)page.data)[0].wrap, page_wrap);
+	}
+}
+
+UT_TEST(test_r4_builder_local_page_wrap_is_not_tt_generation)
+{
+	check_independent_record_generation(false, 1, 0, false, 0);
+	check_independent_record_generation(false, 0, TEST_WRAP, false, 0);
+	check_independent_record_generation(false, TT_WRAP_MAX, 0, false, 0);
+}
+
+UT_TEST(test_r4_builder_foreign_wrap_canonicalizes_once_after_landing)
+{
+	check_independent_record_generation(true, 1, 0, false, 0);
+	check_independent_record_generation(true, 0, TEST_WRAP, true, 0);
+	check_independent_record_generation(true, TT_WRAP_MAX, 0, true, 0);
+}
+
+UT_TEST(test_r4_builder_partial_locator_keeps_record_identity_refusals)
+{
+	int corrupt;
+	for (corrupt = 1; corrupt <= 4; corrupt++) {
+		check_independent_record_generation(false, 1, 0, false, corrupt);
+		check_independent_record_generation(true, 1, 0, true, corrupt);
+	}
+}
+
+UT_TEST(test_r4_builder_known_landed_wrap_must_match_exact_record)
+{
+	check_independent_record_generation(true, 1, 0, true, 5);
+}
+
+UT_TEST(test_r4_dependency_id_is_bounded_and_does_not_alias_next_record)
+{
+	uint32 step;
+	uint64 previous = 0;
+
+	for (step = 1; step <= 65536; step++) {
+		uint64 id = cluster_cr_r4_dependency_request_id(3, 7, step);
+		UT_ASSERT(id > previous);
+		UT_ASSERT_EQ(id & 3, 3);
+		UT_ASSERT(id < cluster_cr_r4_dependency_request_id(0, 8, 1));
+		previous = id;
+	}
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(4, 1, 1), 0);
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(0, 0, 1), 0);
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(0, (UINT64_MAX >> 18) + 1, 1), 0);
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(0, 1, 0), 0);
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(0, 1, 65537), 0);
+	UT_ASSERT_EQ(cluster_cr_r4_dependency_request_id(3, UINT64_MAX >> 18, 65536), UINT64_MAX);
+}
+
+UT_TEST(test_r4_canonical_generation_does_not_change_on_foreign_predecessor)
+{
+	PGAlignedBlock page, head, tail;
+	char expected_old[TEST_TUPLE_LENGTH];
+	UBA head_uba, tail_uba;
+	ClusterR4CrSlotExtension extension = make_builder_extension(193, 115);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	UndoSlotDirEntry *tail_slot;
+	UndoRecordHeader *tail_record;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_two_foreign_update_candidate_page(page.data, &extension, expected_old, head.data,
+										   tail.data, &head_uba, &tail_uba);
+	ClusterPageGetItlSlots((Page)page.data)[0].wrap = TEST_WRAP + 20;
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 193, false, &extension, page.data, head.data, &reason),
+		CLUSTER_R4_CR_STEP_NEED_UNDO);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 193, true, &extension, page.data, head.data, &reason),
+		CLUSTER_R4_CR_STEP_NEED_UNDO);
+	UT_ASSERT_EQ(extension.foreign_wrap, TEST_WRAP);
+	tail_slot = UNDO_SLOT_DIR_PTR(tail.data, 0);
+	tail_record = (UndoRecordHeader *)(tail.data + tail_slot->record_offset);
+	tail_record->tt_wrap_plus1++;
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 193, true, &extension, page.data, tail.data, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
+	cluster_cr_build_on_holder_forget(0, 193);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(57);
+	UT_PLAN(63);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
@@ -2611,6 +2768,12 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_builder_update_pair_keeps_foreign_occupant_identity_guard);
 	UT_RUN(test_r4_builder_legacy_update_still_restores_exact_old_image);
 	UT_RUN(test_r4_builder_successor_tid_is_not_unrelated_tuple_delete_authority);
+	UT_RUN(test_r4_builder_local_page_wrap_is_not_tt_generation);
+	UT_RUN(test_r4_builder_foreign_wrap_canonicalizes_once_after_landing);
+	UT_RUN(test_r4_builder_partial_locator_keeps_record_identity_refusals);
+	UT_RUN(test_r4_builder_known_landed_wrap_must_match_exact_record);
+	UT_RUN(test_r4_dependency_id_is_bounded_and_does_not_alias_next_record);
+	UT_RUN(test_r4_canonical_generation_does_not_change_on_foreign_predecessor);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

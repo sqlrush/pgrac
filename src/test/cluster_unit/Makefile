@@ -2980,15 +2980,31 @@ $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_l
 		-c $< -o $@
 
 CLUSTER_R4_SLOT_RESERVATION_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
+CLUSTER_R4_CONTINUATION_CR_O = test_cluster_r4_continuation_cr_product.o
+CLUSTER_R4_CONTINUATION_PAGE_O = test_cluster_r4_continuation_page_product.o
+$(CLUSTER_R4_CONTINUATION_PAGE_O): $(top_srcdir)/src/backend/storage/page/bufpage.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+$(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c \
+		$(top_srcdir)/src/include/cluster/cluster_cr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_cr_build_on_holder_step=continuation_real_step \
+		-Dcluster_cr_build_on_holder_forget=continuation_real_forget \
+		-Dcluster_cr_build_on_holder_pending_locator=continuation_real_pending \
+		-Dcluster_cr_r4_extract_resident_record=continuation_real_extract \
+		-c $< -o $@
 
 test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h \
 		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
-		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O)
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DCR_SERVER_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_cr_server.c"' \
 		$< $(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
-		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # Stage 8 R4 D11: exercise the thin observation adapter and the real holder
 # result seam.  The fixture supplies only the existing CR-copy/constructor,

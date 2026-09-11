@@ -1116,29 +1116,75 @@ cr_server_r4_build_step(uint32 slot_index)
 	volatile ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
 	volatile bool error_terminalized = false;
 	uint32 terminal_state;
+	uint32 entry_state;
 	uint32 expected;
+	bool foreign_undo_ready;
 
 	if (CrServerShared == NULL || slot_index >= CLUSTER_LMS_CR_SLOTS
 		|| cluster_ic_tier1_my_data_channel() != 0 || MyBackendType != B_LMS)
 		return false;
 	slot = &CrServerShared->slots[slot_index];
 	context = &CrServerR4Contexts[slot_index];
-	if (pg_atomic_read_u32(&slot->state) != CLUSTER_LMS_CR_R4_BUILDING
-		|| !context->in_use || context->slot_generation != slot->r4.slot_generation
+	entry_state = pg_atomic_read_u32(&slot->state);
+	foreign_undo_ready = entry_state == CLUSTER_LMS_CR_R4_UNDO_READY;
+	if ((entry_state != CLUSTER_LMS_CR_R4_BUILDING && !foreign_undo_ready) || !context->in_use
+		|| context->slot_generation != slot->r4.slot_generation
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
 		|| context->request_id != slot->request_id)
 		return false;
+	if (foreign_undo_ready) {
+		ClusterLmsSharedState *lms_state = cluster_lms_shared_state();
+		const ClusterR4CrOwnerStamp *owner = &slot->r4.owner;
+
+		pg_read_barrier(); /* status-24 publishes the bytes before READY */
+		if (lms_state == NULL || context->builder_forgotten || !context->admission.entered
+			|| context->admission.record_generation != slot->r4.route_proof.activation_generation
+			|| context->admission.formation_epoch != slot->epoch
+			|| owner->builder_incarnation != lms_state->r4_controls.data_worker_incarnation[0]
+			|| owner->builder_incarnation == 0
+			|| owner->edge_owner_incarnation != owner->builder_incarnation
+			|| owner->builder_pid != MyProcPid || owner->edge_owner_pid != MyProcPid
+			|| owner->builder_worker_id != 0 || owner->edge_owner_worker_id != 0
+			|| owner->edge_owner_role != (uint8)B_LMS
+			|| !cr_server_bytes_zero(owner->reserved, sizeof(owner->reserved))
+			|| slot->req_kind != (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD
+			|| slot->epoch != slot->r4.route_proof.formation_epoch
+			|| !BufferTagsEqual(&slot->tag, &slot->r4.route_proof.tag)
+			|| slot->read_scn != slot->r4.route_proof.read_scn
+			|| !context->foreign_physical_generation_frozen
+			|| context->expected_foreign_physical_generation == UINT32_MAX
+			|| context->foreign_scur_phase != CLUSTER_R4_FOREIGN_SCUR_UNUSED
+			|| slot->r4.foreign_request_id == 0 || slot->r4.foreign_wrap > TT_WRAP_MAX
+			|| slot->r4.origin_formation_epoch != slot->epoch
+			|| slot->r4.origin_live_hwm_lsn == InvalidXLogRecPtr
+			|| !SCN_VALID(slot->r4.origin_authority_scn)
+			|| scn_time_cmp(slot->r4.origin_authority_scn, slot->read_scn) < 0
+			|| !cluster_semantic_activation_recheck(&context->admission)
+			|| !cr_server_r4_identity_open_matches(&context->admission, slot->reply_master_node,
+												   slot->r4.master_capability_generation)
+			|| !cr_server_r4_identity_open_matches(&context->admission, slot->requester_node,
+												   slot->r4.requester_capability_generation))
+			return false;
+		expected = CLUSTER_LMS_CR_R4_UNDO_READY;
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_BUILDING))
+			return false;
+	}
 	key = *context;
 	saved_context = CurrentMemoryContext;
 
 	PG_TRY();
 	{
 		step_result = cluster_cr_build_on_holder_step(
-			slot_index, key.slot_generation, false, &slot->r4,
-			slot->result_page, slot->foreign_undo_page, &step_reason);
+			slot_index, key.slot_generation, foreign_undo_ready, &slot->r4, slot->result_page,
+			slot->foreign_undo_page, &step_reason);
 		reason = step_reason;
+		if (foreign_undo_ready) {
+			memset(slot->foreign_undo_page, 0, BLCKSZ);
+			context->foreign_physical_generation_frozen = false;
+			context->expected_foreign_physical_generation = 0;
+		}
 	}
 	PG_CATCH();
 	{
@@ -1219,48 +1265,41 @@ cr_server_r4_foreign_request_valid(uint32 slot_index, const ClusterLmsCrSlot *sl
 
 	if (slot == NULL || context == NULL || locator_out == NULL || segment_out == NULL
 		|| block_out == NULL || slot->req_kind != (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD
-		|| !context->in_use || !context->admission.entered
-		|| context->slot_generation == 0
-		|| context->slot_generation > (UINT64_MAX >> 2)
+		|| !context->in_use || !context->admission.entered || context->slot_generation == 0
+		|| context->slot_generation > (UINT64_MAX >> 18)
 		|| context->slot_generation != slot->r4.slot_generation
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
 		|| context->request_id != slot->request_id
-		|| slot->epoch == 0 || slot->epoch != slot->r4.route_proof.formation_epoch
+		|| (slot->epoch == 0 && cluster_conf_node_count() != 4)
+		|| slot->epoch != context->admission.formation_epoch
+		|| slot->epoch != slot->r4.route_proof.formation_epoch
 		|| !BufferTagsEqual(&slot->tag, &slot->r4.route_proof.tag)
-		|| slot->read_scn != slot->r4.route_proof.read_scn
-		|| !SCN_VALID(slot->read_scn)
+		|| slot->read_scn != slot->r4.route_proof.read_scn || !SCN_VALID(slot->read_scn)
 		|| slot->r4.route_proof.selected_holder_node != cluster_node_id
 		|| slot->r4.foreign_request_id
-			   != ((context->slot_generation << 2) | slot_index)
-		|| slot->r4.foreign_request_id == 0
-		|| slot->r4.origin_formation_epoch != slot->epoch
+			   != cluster_cr_r4_dependency_request_id(slot_index, context->slot_generation,
+													  slot->r4.build_steps)
+		|| slot->r4.foreign_request_id == 0 || slot->r4.origin_formation_epoch != slot->epoch
 		|| slot->r4.origin_live_hwm_lsn != 0 || slot->r4.origin_tt_generation != 0
-		|| SCN_VALID(slot->r4.origin_authority_scn)
-		|| slot->r4.foreign_origin_node < 0
+		|| SCN_VALID(slot->r4.origin_authority_scn) || slot->r4.foreign_origin_node < 0
 		|| slot->r4.foreign_origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| slot->r4.foreign_origin_node == cluster_node_id
 		|| !TransactionIdIsNormal(slot->r4.foreign_xid)
 		|| (slot->r4.foreign_wrap > TT_WRAP_MAX
-			&& !(allow_unresolved_wrap
-				 && slot->r4.foreign_wrap == TT_WRAP_INVALID))
-		|| slot->r4.terminal_reason != (uint8)CLUSTER_CR_BUILD_NONE
-		|| slot->r4.flags != 0
+			&& !(allow_unresolved_wrap && slot->r4.foreign_wrap == TT_WRAP_INVALID))
+		|| slot->r4.terminal_reason != (uint8)CLUSTER_CR_BUILD_NONE || slot->r4.flags != 0
 		|| !cr_server_bytes_zero(slot->r4.reserved, sizeof(slot->r4.reserved))
-		|| !cluster_cr_build_on_holder_pending_locator(
-			slot_index, context->slot_generation, locator_out)
+		|| !cluster_cr_build_on_holder_pending_locator(slot_index, context->slot_generation,
+													   locator_out)
 		|| locator_out->uba.raw[0] != slot->r4.foreign_uba.raw[0]
 		|| locator_out->uba.raw[1] != slot->r4.foreign_uba.raw[1]
-		|| !uba_decode(locator_out->uba, segment_out, block_out, &tt_slot_offset,
-					   &row_offset)
-		|| *block_out == 0
-		|| uba_origin_node_id(locator_out->uba) != slot->r4.foreign_origin_node
-		|| *segment_out != slot->r4.foreign_segment_id
-		|| *block_out != slot->r4.foreign_block_no
+		|| !uba_decode(locator_out->uba, segment_out, block_out, &tt_slot_offset, &row_offset)
+		|| *block_out == 0 || uba_origin_node_id(locator_out->uba) != slot->r4.foreign_origin_node
+		|| *segment_out != slot->r4.foreign_segment_id || *block_out != slot->r4.foreign_block_no
 		|| tt_slot_offset != slot->r4.foreign_tt_slot_offset
-		|| row_offset != slot->r4.foreign_row_offset
-		|| locator_out->xid != slot->r4.foreign_xid
+		|| row_offset != slot->r4.foreign_row_offset || locator_out->xid != slot->r4.foreign_xid
 		|| locator_out->tt_wrap != (uint16)slot->r4.foreign_wrap)
 		return false;
 
@@ -1496,54 +1535,41 @@ cr_server_r4_foreign_landing_key_valid(
 {
 	ClusterLmsSharedState *lms_state = cluster_lms_shared_state();
 
-	return slot != NULL && context != NULL && frozen_context != NULL
-		   && lms_state != NULL
+	return slot != NULL && context != NULL && frozen_context != NULL && lms_state != NULL
 		   && slot_index < CLUSTER_LMS_CR_SLOTS
-		   && pg_atomic_read_u32(&slot->state)
-			  == CLUSTER_LMS_CR_R4_UNDO_INFLIGHT
-		   && memcmp(context, frozen_context, sizeof(*context)) == 0
-		   && context->in_use && !context->builder_forgotten
-		   && context->foreign_physical_generation_frozen
+		   && pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_R4_UNDO_INFLIGHT
+		   && memcmp(context, frozen_context, sizeof(*context)) == 0 && context->in_use
+		   && !context->builder_forgotten && context->foreign_physical_generation_frozen
 		   && cr_server_bytes_zero(context->reserved, sizeof(context->reserved))
-		   && context->slot_generation != 0
-		   && context->slot_generation <= (UINT64_MAX >> 2)
+		   && context->slot_generation != 0 && context->slot_generation <= (UINT64_MAX >> 18)
 		   && context->slot_generation == slot->r4.slot_generation
 		   && context->builder_incarnation != 0
-		   && context->builder_incarnation
-			  == slot->r4.owner.builder_incarnation
-		   && context->builder_incarnation
-			  == slot->r4.owner.edge_owner_incarnation
-		   && context->builder_incarnation
-			  == lms_state->r4_controls.data_worker_incarnation[0]
-		   && slot->r4.owner.edge_owner_pid == MyProcPid
-		   && slot->r4.owner.builder_pid == MyProcPid
-		   && slot->r4.owner.edge_owner_worker_id == 0
-		   && slot->r4.owner.builder_worker_id == 0
+		   && context->builder_incarnation == slot->r4.owner.builder_incarnation
+		   && context->builder_incarnation == slot->r4.owner.edge_owner_incarnation
+		   && context->builder_incarnation == lms_state->r4_controls.data_worker_incarnation[0]
+		   && slot->r4.owner.edge_owner_pid == MyProcPid && slot->r4.owner.builder_pid == MyProcPid
+		   && slot->r4.owner.edge_owner_worker_id == 0 && slot->r4.owner.builder_worker_id == 0
 		   && slot->r4.owner.edge_owner_role == (uint8)B_LMS
-		   && cr_server_bytes_zero(slot->r4.owner.reserved,
-								  sizeof(slot->r4.owner.reserved))
+		   && cr_server_bytes_zero(slot->r4.owner.reserved, sizeof(slot->r4.owner.reserved))
 		   && context->requester_node == slot->requester_node
 		   && context->requester_backend_id == slot->requester_backend
 		   && context->request_id == slot->request_id
 		   && slot->r4.foreign_request_id
-			  == ((context->slot_generation << 2) | slot_index)
+				  == cluster_cr_r4_dependency_request_id(slot_index, context->slot_generation,
+														 slot->r4.build_steps)
 		   && slot->r4.foreign_request_id != 0
 		   && slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD
 		   && slot->transition_id == (uint8)PCM_TRANS_N_TO_S
-		   && slot->epoch != 0
+		   && (slot->epoch != 0 || cluster_conf_node_count() == 4)
+		   && slot->epoch == context->admission.formation_epoch
 		   && slot->epoch == slot->r4.route_proof.formation_epoch
-		   && slot->r4.origin_formation_epoch == slot->epoch
-		   && slot->r4.foreign_origin_node >= 0
+		   && slot->r4.origin_formation_epoch == slot->epoch && slot->r4.foreign_origin_node >= 0
 		   && slot->r4.foreign_origin_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		   && slot->r4.foreign_origin_node != cluster_node_id
-		   && slot->r4.origin_live_hwm_lsn == 0
-		   && slot->r4.origin_tt_generation == 0
-		   && !SCN_VALID(slot->r4.origin_authority_scn)
+		   && slot->r4.foreign_origin_node != cluster_node_id && slot->r4.origin_live_hwm_lsn == 0
+		   && slot->r4.origin_tt_generation == 0 && !SCN_VALID(slot->r4.origin_authority_scn)
 		   && cr_server_bytes_zero(slot->foreign_undo_page, BLCKSZ)
-		   && slot->r4.terminal_reason == (uint8)CLUSTER_CR_BUILD_NONE
-		   && slot->r4.flags == 0
-		   && cr_server_bytes_zero(slot->r4.reserved,
-								  sizeof(slot->r4.reserved));
+		   && slot->r4.terminal_reason == (uint8)CLUSTER_CR_BUILD_NONE && slot->r4.flags == 0
+		   && cr_server_bytes_zero(slot->r4.reserved, sizeof(slot->r4.reserved));
 }
 
 bool
@@ -1569,29 +1595,29 @@ cluster_cr_server_r4_land_foreign_undo(
 	uint32 expected;
 	bool admitted = false;
 	bool landed = false;
+	bool refusal = header != NULL && GcsBlockReplyStatusIsR4Refusal(header->status);
 
-	if (CrServerShared == NULL || env == NULL || header == NULL
-		|| undo_page == NULL || undo_auth == NULL
-		|| cluster_ic_tier1_my_data_channel() != 0 || MyBackendType != B_LMS
-		|| !cluster_gcs_block_family_on_data_plane()
+	if (CrServerShared == NULL || env == NULL || header == NULL || undo_page == NULL
+		|| (!refusal && undo_auth == NULL) || cluster_ic_tier1_my_data_channel() != 0
+		|| MyBackendType != B_LMS || !cluster_gcs_block_family_on_data_plane()
 		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
 		|| env->payload_length
 			   != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
-				  + (uint32)sizeof(ClusterGcsUndoAuthTrailer)
-		|| env->dest_node_id != (uint32)cluster_node_id
-		|| header->status != (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT
-		|| header->requester_backend_id
-			   != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
-		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S
-		|| header->sender_node < 0
+					  + (refusal ? 0 : (uint32)sizeof(ClusterGcsUndoAuthTrailer))
+		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != header->epoch
+		|| (!refusal && header->status != (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT)
+		|| header->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S || header->sender_node < 0
 		|| header->sender_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| env->source_node_id != (uint32)header->sender_node
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
 			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
-		|| header->page_lsn == InvalidXLogRecPtr
+		|| (refusal ? (header->page_lsn != InvalidXLogRecPtr || undo_auth != NULL
+					   || !cr_server_bytes_zero(header->reserved_0, sizeof(header->reserved_0))
+					   || !cr_server_bytes_zero(undo_page, BLCKSZ))
+					: header->page_lsn == InvalidXLogRecPtr)
 		|| header->request_id == 0
-		|| !GcsBlockReplyHeaderGetR4UndoGeneration(
-			header, &physical_generation)
+		|| (!refusal && !GcsBlockReplyHeaderGetR4UndoGeneration(header, &physical_generation))
 		|| header->checksum != cluster_gcs_block_compute_checksum(undo_page))
 		return false;
 
@@ -1603,33 +1629,29 @@ cluster_cr_server_r4_land_foreign_undo(
 		return false;
 	pg_read_barrier();
 	frozen_context = *context;
-	if (!cr_server_r4_foreign_landing_key_valid(
-			slot_index, slot, context, &frozen_context)
+	if (!cr_server_r4_foreign_landing_key_valid(slot_index, slot, context, &frozen_context)
 		|| header->request_id != slot->r4.foreign_request_id
 		|| header->epoch != slot->r4.origin_formation_epoch
 		|| header->sender_node != slot->r4.foreign_origin_node
-		|| physical_generation
-			   != context->expected_foreign_physical_generation
-		|| !cr_server_r4_foreign_request_valid(
-			slot_index, slot, context, true, &locator, &segment_id, &block_no))
+		|| (!refusal && physical_generation != context->expected_foreign_physical_generation)
+		|| !cr_server_r4_foreign_request_valid(slot_index, slot, context, true, &locator,
+											   &segment_id, &block_no))
 		return false;
 
-	tt_generation = ClusterGcsUndoAuthTrailerGetTtGeneration(undo_auth);
-	authority_scn = (SCN)ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth);
-	if (tt_generation == 0 || !SCN_VALID(authority_scn)
-		|| authority_scn < slot->read_scn
-		|| !cluster_cr_r4_extract_resident_record(
-			undo_page, &locator, record.data, &record_length,
-			&canonical_locator)
-		|| record_length == 0
-		|| canonical_locator.uba.raw[0] != locator.uba.raw[0]
-		|| canonical_locator.uba.raw[1] != locator.uba.raw[1]
-		|| canonical_locator.xid != locator.xid
-		|| canonical_locator.itl_kind != locator.itl_kind
-		|| canonical_locator.itl_slot_index != locator.itl_slot_index
-		|| canonical_locator.tt_wrap > TT_WRAP_MAX
-		|| (locator.tt_wrap != TT_WRAP_INVALID
-			&& canonical_locator.tt_wrap != locator.tt_wrap))
+	tt_generation = refusal ? 0 : ClusterGcsUndoAuthTrailerGetTtGeneration(undo_auth);
+	authority_scn = refusal ? InvalidScn : (SCN)ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth);
+	if (!refusal
+		&& (!SCN_VALID(authority_scn) || scn_time_cmp(authority_scn, slot->read_scn) < 0
+			|| !cluster_cr_r4_extract_resident_record(undo_page, &locator, record.data,
+													  &record_length, &canonical_locator)
+			|| record_length == 0 || canonical_locator.uba.raw[0] != locator.uba.raw[0]
+			|| canonical_locator.uba.raw[1] != locator.uba.raw[1]
+			|| canonical_locator.xid != locator.xid
+			|| canonical_locator.itl_kind != locator.itl_kind
+			|| canonical_locator.itl_slot_index != locator.itl_slot_index
+			|| canonical_locator.tt_wrap > TT_WRAP_MAX
+			|| (locator.tt_wrap != TT_WRAP_INVALID
+				&& canonical_locator.tt_wrap != locator.tt_wrap)))
 		return false;
 
 	memset(&receive_admission, 0, sizeof(receive_admission));
@@ -1647,6 +1669,15 @@ cluster_cr_server_r4_land_foreign_undo(
 			slot_index, slot, context, &frozen_context))
 		goto out;
 
+	if (refusal) {
+		bool retry = header->status == GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+
+		landed = cr_server_r4_publish_foreign_terminal(
+			slot, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT,
+			retry ? CLUSTER_LMS_CR_R4_READY_RETRY : CLUSTER_LMS_CR_R4_READY_FAIL,
+			retry ? CLUSTER_CR_BUILD_CAPACITY : CLUSTER_CR_BUILD_PROTOCOL);
+		goto out;
+	}
 	memcpy(slot->foreign_undo_page, undo_page, BLCKSZ);
 	slot->r4.foreign_wrap = canonical_locator.tt_wrap;
 	slot->r4.origin_live_hwm_lsn = header->page_lsn;
@@ -3358,7 +3389,7 @@ cluster_lms_cr_drain(void)
 				(void)cr_server_r4_ship_terminal((uint32)i);
 			continue;
 		}
-		if (state == CLUSTER_LMS_CR_R4_BUILDING) {
+		if (state == CLUSTER_LMS_CR_R4_BUILDING || state == CLUSTER_LMS_CR_R4_UNDO_READY) {
 			if (cr_server_r4_build_step((uint32)i))
 				(void)cr_server_r4_ship_terminal((uint32)i);
 			continue;
@@ -3367,8 +3398,7 @@ cluster_lms_cr_drain(void)
 			(void)cr_server_r4_send_foreign_undo((uint32)i);
 			continue;
 		}
-		if (state == CLUSTER_LMS_CR_R4_UNDO_INFLIGHT
-			|| state == CLUSTER_LMS_CR_R4_UNDO_READY)
+		if (state == CLUSTER_LMS_CR_R4_UNDO_INFLIGHT)
 			continue;
 		if (state == CLUSTER_LMS_CR_R4_READY_FULL
 			|| state == CLUSTER_LMS_CR_R4_READY_RETRY
