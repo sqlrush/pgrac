@@ -8576,7 +8576,12 @@ UT_TEST(test_145u_cas_binding_copy_contradiction_cannot_retain_utility)
 			semantic_activation_utility_mailbox_poll_completion(request.request_seq, &refusal));
 		UT_ASSERT(refusal.result != CLUSTER_SEMANTIC_ACTIVATION_OK);
 		UT_ASSERT(semantic_activation_snapshot(&after));
-		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		/* Snapshot padding is not part of the published gate contract. */
+		UT_ASSERT_EQ(before.seq, after.seq);
+		UT_ASSERT_EQ(before.active_bits, after.active_bits);
+		UT_ASSERT_EQ(before.record_generation, after.record_generation);
+		UT_ASSERT_EQ(before.formation_epoch, after.formation_epoch);
+		UT_ASSERT_EQ(before.transition_closed, after.transition_closed);
 	}
 	test_gate_reset();
 }
