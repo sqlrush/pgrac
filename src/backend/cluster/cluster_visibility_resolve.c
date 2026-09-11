@@ -1025,6 +1025,63 @@ cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndo
 	classify_ref(raw_xid, ref, anchor_lsn, read_scn, NULL, out);
 }
 
+void
+cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionId raw_xid,
+									   SCN read_scn, ClusterVisResolve *out)
+{
+	ClusterUndoTTSlotRef ref;
+	ClusterTxLocator locator;
+	ClusterTxLocator unused_row_wait;
+	const ClusterItlSlotData *slot;
+
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	out->status = CLUSTER_TT_STATUS_UNKNOWN;
+	out->diagnostic_reason = "MALFORMED";
+	if (page == NULL || !SCN_VALID(read_scn) || !TransactionIdIsNormal(raw_xid) || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE
+		|| slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return;
+	slot = &ClusterPageGetItlSlots(page)[slot_index];
+	if (slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| !cluster_itl_get_tt_ref(page, slot_index, &ref) || ref.local_xid != raw_xid
+		|| ref.tt_slot_id == 0
+		|| !cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, raw_xid, &ref,
+											   &locator, &unused_row_wait))
+		return;
+
+	/* Keep the physical DATA address, not just the reduced TT ref. The
+	 * existing classifier can then reach its DATA-to-canonical-TT fallback. */
+	out->diagnostic_reason = NULL;
+	classify_ref(raw_xid, &ref, PageGetLSN(page), read_scn, &locator, out);
+	if (out->evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
+		/* LOCAL normally delegates to native tuple visibility. That is not
+		 * a valid fallback for a foreign-produced immutable scratch image.
+		 * The same exact origin service also handles our own DATA records. */
+		cluster_vis_resolve_depth++;
+		PG_TRY();
+		{
+			ClusterTxResolution resolution;
+			ClusterTxResolveReason reason;
+			ClusterTxOutcome outcome;
+
+			memset(&resolution, 0, sizeof(resolution));
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution,
+											   &reason);
+			if (!cluster_vis_from_exact_tx_resolution(outcome, &resolution, out))
+				out->diagnostic_reason = cluster_tx_resolve_reason_name(reason);
+		}
+		PG_FINALLY();
+		{
+			cluster_vis_resolve_depth--;
+		}
+		PG_END_TRY();
+	}
+}
+
 
 void
 cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup, TransactionId raw_xid,

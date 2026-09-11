@@ -161,6 +161,14 @@ extern void cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid,
 													XLogRecPtr anchor_lsn, SCN read_scn,
 													ClusterVisResolve *out);
 
+/* Caller-owned immutable FULL scratch: retain the selected DATA record's
+ * complete locator for exact origin resolution. No Buffer, live-page access,
+ * native visibility fallback or row-wait proof is returned. REMOTE evidence
+ * denotes a status-bearing verdict here, including an exact own-origin one. */
+extern void cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index,
+												   TransactionId raw_xid, SCN read_scn,
+												   ClusterVisResolve *out);
+
 
 /*
  * ============================================================

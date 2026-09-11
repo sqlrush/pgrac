@@ -2013,7 +2013,7 @@ cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
  *
  * Narrow D6 evaluator for a caller-owned, already reconstructed FULL page.
  * It consumes only tuple/page bytes from that private page, the existing
- * frozen-creation proof, and exact ITL ref verdicts where required.  It never
+ * frozen-creation proof, and exact page-derived DATA verdicts where required. It never
  * enters native CLOG/ProcArray,
  * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI.
  */
@@ -2089,11 +2089,11 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmin,
 												  "scratch xmin lacks an exact DATA ITL reference");
 
-		cluster_visibility_resolve_from_ref_scn(raw_xmin, &ref, PageGetLSN(page),
-												snapshot->read_scn, &resolved);
+		cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmin,
+											   snapshot->read_scn, &resolved);
 		if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
 			cluster_r4_scratch_visibility_unknown(raw_xmin,
-												  "scratch xmin is not backed by remote authority");
+												  "scratch xmin is not backed by exact authority");
 
 		switch (resolved.status) {
 		case CLUSTER_TT_STATUS_ABORTED:
@@ -2145,11 +2145,11 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
 										  "scratch xmax lacks an exact DATA ITL reference");
 
-	cluster_visibility_resolve_from_ref_scn(raw_xmax, &ref, PageGetLSN(page),
-										 snapshot->read_scn, &resolved);
+	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
+										   snapshot->read_scn, &resolved);
 	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
-										  "scratch xmax is not backed by remote authority");
+											  "scratch xmax is not backed by exact authority");
 
 	switch (resolved.status)
 	{

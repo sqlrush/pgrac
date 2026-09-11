@@ -583,6 +583,18 @@ cluster_visibility_resolve_tuple(Buffer buffer pg_attribute_unused(),
 	out->commit_scn = ut_scratch_resolve_scn;
 }
 
+void
+cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionId raw_xid,
+									   SCN read_scn, ClusterVisResolve *out)
+{
+	UT_ASSERT(page == ut_scratch_expected_page);
+	UT_ASSERT(page != ut_scratch_forbidden_live_page);
+	UT_ASSERT(slot_index < CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT(!ut_hot_content_lock_held);
+	cluster_visibility_resolve_from_ref_scn(raw_xid, &ut_scratch_expected_ref, PageGetLSN(page),
+											read_scn, out);
+}
+
 bool cluster_crossnode_write_write = true;
 bool cluster_tx_enqueue_wait_enabled = true;
 ClusterTxwResult

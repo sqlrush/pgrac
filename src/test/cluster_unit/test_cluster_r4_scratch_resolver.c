@@ -59,6 +59,17 @@
 
 UT_DEFINE_GLOBALS();
 
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
 /* This fixture keeps its original non-writer HTSU entry. The new page-only
  * writer route is exercised with real UBA decoding in r4_lock_order. */
 NodeId
@@ -189,6 +200,8 @@ uint32 *my_wait_event_info = &ut_wait_event;
 static bool ut_exit_fixture;
 static ClusterUndoTTSlotRef ut_exit_ref;
 static bool ut_exit_exact_proof;
+static bool ut_full_scratch_fixture;
+static int ut_full_scratch_scenario;
 static int ut_native_calls;
 static int ut_hint_mutations;
 static sigjmp_buf ut_error_jump;
@@ -345,6 +358,8 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_recycled_bound = false;
 	ut_exit_fixture = false;
 	ut_exit_exact_proof = false;
+	ut_full_scratch_fixture = false;
+	ut_full_scratch_scenario = 0;
 	ut_native_calls = 0;
 	ut_hint_mutations = 0;
 	ut_error_armed = false;
@@ -745,6 +760,17 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 		UT_ASSERT_EQ(locator->xid, UT_RAW_XID);
 		UT_ASSERT_EQ(locator->tt_wrap, TT_WRAP_INVALID);
+		if (ut_full_scratch_fixture) {
+			const ClusterItlSlotData *slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+
+			UT_ASSERT_EQ(locator->uba.raw[0], slot->undo_segment_head.raw[0]);
+			UT_ASSERT_EQ(locator->uba.raw[1], slot->undo_segment_head.raw[1]);
+			UT_ASSERT_EQ(locator->itl_kind, ITL_FLAG_ACTIVE);
+			UT_ASSERT_EQ(locator->itl_slot_index, 0);
+			UT_ASSERT(cluster_vis_resolve_in_flight());
+			if (ut_full_scratch_scenario == 7)
+				pg_re_throw();
+		}
 		memset(out, 0, sizeof(*out));
 		out->outcome = CLUSTER_TX_COMMITTED;
 		out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
@@ -752,6 +778,23 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 		out->locator_echo = *locator;
 		out->locator_echo.tt_wrap = 7;
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		if (ut_full_scratch_fixture) {
+			if (ut_full_scratch_scenario == 1 || ut_full_scratch_scenario == 2) {
+				out->outcome
+					= ut_full_scratch_scenario == 1 ? CLUSTER_TX_ABORTED : CLUSTER_TX_IN_PROGRESS;
+				out->commit_scn = InvalidScn;
+			}
+			if (ut_full_scratch_scenario == 3)
+				out->commit_scn = UT_READ_SCN + 1;
+			if (ut_full_scratch_scenario == 5)
+				out->commit_scn = InvalidScn;
+			if (ut_full_scratch_scenario == 6) {
+				out->outcome = CLUSTER_TX_PREPARED;
+				out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+				out->commit_scn = InvalidScn;
+			}
+			return out->outcome;
+		}
 		return CLUSTER_TX_COMMITTED;
 	}
 	if (out != NULL)
@@ -786,6 +829,8 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {
 	if (ut_error_level >= ERROR) {
 		UT_ASSERT(ut_error_armed);
+		if (PG_exception_stack != NULL)
+			pg_re_throw();
 		if (ut_error_armed)
 			siglongjmp(ut_error_jump, 1);
 		abort();
@@ -830,9 +875,20 @@ cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
 {
 	UT_ASSERT(page == ut_visibility_page.data);
 	UT_ASSERT_EQ(index, 0);
+	if (ut_full_scratch_fixture && ut_full_scratch_scenario == 8) {
+		*reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		return false;
+	}
 	memset(out, 0, sizeof(*out));
 	out->xid = UT_RAW_XID;
 	out->tt_wrap = 7;
+	if (ut_full_scratch_fixture) {
+		const ClusterItlSlotData *slot = ClusterPageGetItlSlots(page);
+
+		out->uba = slot->undo_segment_head;
+		out->itl_kind = slot->flags;
+		out->itl_slot_index = index;
+	}
 	*reason = CLUSTER_TX_RESOLVE_NONE;
 	return true;
 }
@@ -1510,10 +1566,150 @@ UT_TEST(test_real_hint_receiver_wakes_only_after_successful_exact_apply)
 	ClusterTTHintOutbound = NULL;
 }
 
+/* Real FULL consumer and real legacy resolver, with only the exact origin
+ * service substituted. A complete DATA locator must reach that service;
+ * a reduced-key miss must not prevent it, for either origin or tuple side. */
+static void
+ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	ClusterR4HotScratchTestContext context = { 0 };
+	HeapTupleHeader header;
+	ClusterItlSlotData *slot;
+	PageHeader page_header;
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	ut_exit_fixture = true;
+	ut_full_scratch_fixture = true;
+	ut_full_scratch_scenario = scenario;
+	ut_exit_exact_proof = scenario != 4;
+	ut_exit_ref = ut_exact_peer_ref();
+	ut_exit_ref.origin_node_id = local_origin ? UT_SELF_NODE : UT_PEER_NODE;
+	ut_exit_ref.cluster_epoch = 0;
+	ut_memo_hit = false;
+	cluster_crossnode_runtime_visibility = true;
+	memset(ut_visibility_page.data, 0, BLCKSZ);
+	page_header = (PageHeader)ut_visibility_page.data;
+	page_header->pd_flags = PD_HAS_ITL;
+	page_header->pd_lower = SizeOfPageHeaderData;
+	page_header->pd_upper = 1024;
+	page_header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	page_header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageSetLSN(ut_visibility_page.data, UT_ANCHOR_LSN);
+	slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->xid = UT_RAW_XID;
+	slot->wrap = 7;
+	slot->undo_segment_head.raw[0] = UINT64_C(0x1234010203040506);
+	slot->undo_segment_head.raw[1] = UINT64_C(0x0708090a0b0c0d0e);
+	if (scenario == 9)
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	if (scenario == 10)
+		ut_exit_ref.local_xid++;
+	if (scenario == 11)
+		ut_exit_ref.tt_slot_id = 0;
+	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	header->t_hoff = SizeofHeapTupleHeader;
+	header->t_itl_slot_idx = 0;
+	header->t_infomask = deleting ? HEAP_XMIN_FROZEN : HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXmin(header, UT_RAW_XID);
+	HeapTupleHeaderSetXmax(header, deleting ? UT_RAW_XID : InvalidTransactionId);
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	header->t_ctid = tuple.t_self;
+	tuple.t_data = header;
+	tuple.t_len = SizeofHeapTupleHeader;
+	tuple.t_tableOid = FirstNormalObjectId;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_epoch = UT_CLUSTER_EPOCH;
+	snapshot.read_scn = UT_READ_SCN;
+	context.scratch_page = ut_visibility_page.data;
+	context.already_full = true;
+	context.read_scn = snapshot.read_scn;
+	context.logical_root = tuple.t_self;
+	context.tag.blockNum = 0;
+	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
+	ut_error_armed = true;
+	PG_TRY();
+	{
+		visible = HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_error_armed = false;
+	UT_ASSERT_EQ(caught, scenario >= 4);
+	if (!caught)
+		UT_ASSERT_EQ(visible, scenario == 0 ? !deleting : deleting);
+	UT_ASSERT_EQ(ut_calls.exact_resolve, scenario < 8 ? 1 : 0);
+	UT_ASSERT(!cluster_vis_resolve_in_flight());
+	UT_ASSERT(PG_exception_stack == NULL);
+	UT_ASSERT_EQ(ut_calls.clog, 0);
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT_EQ(ut_hint_mutations, 0);
+	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+}
+
+UT_TEST(test_full_scratch_remote_xmax_retains_exact_data_locator)
+{
+	ut_full_scratch_exact_case(true, false, 0);
+}
+UT_TEST(test_full_scratch_remote_xmin_retains_exact_data_locator)
+{
+	ut_full_scratch_exact_case(false, false, 0);
+}
+UT_TEST(test_full_scratch_local_xmax_uses_exact_origin_not_native_clog)
+{
+	ut_full_scratch_exact_case(true, true, 0);
+}
+UT_TEST(test_full_scratch_local_xmin_uses_exact_origin_not_native_clog)
+{
+	ut_full_scratch_exact_case(false, true, 0);
+}
+
+UT_TEST(test_full_scratch_exact_status_and_scn_polarity_both_origins)
+{
+	int scenario;
+	int origin;
+	int deleting;
+
+	for (scenario = 1; scenario <= 3; scenario++)
+		for (origin = 0; origin < 2; origin++)
+			for (deleting = 0; deleting < 2; deleting++)
+				ut_full_scratch_exact_case(deleting, origin, scenario);
+}
+
+UT_TEST(test_full_scratch_unknown_prepared_bad_scn_and_locator_stay_protective)
+{
+	int scenario;
+	int origin;
+	int deleting;
+
+	for (scenario = 4; scenario <= 11; scenario++) {
+		if (scenario == 7)
+			continue; /* the owned-error cleanup leg is tested separately */
+		for (origin = 0; origin < 2; origin++)
+			for (deleting = 0; deleting < 2; deleting++)
+				ut_full_scratch_exact_case(deleting, origin, scenario);
+	}
+}
+
+UT_TEST(test_full_scratch_local_exact_error_releases_resolution_scope)
+{
+	ut_full_scratch_exact_case(false, true, 7);
+	ut_full_scratch_exact_case(true, true, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(22);
 	UT_RUN(test_peer_exact_memo_hit_propagates_committed);
 	UT_RUN(test_peer_exact_memo_hit_propagates_aborted);
 	UT_RUN(test_peer_exact_synthetic_unknown_hit_stays_failclosed_without_wire);
@@ -1529,6 +1725,13 @@ main(void)
 	UT_RUN(test_real_hint_full_and_fanout_keep_loss_observable_without_retry);
 	UT_RUN(test_real_hint_receiver_wakes_only_after_successful_exact_apply);
 	UT_RUN(test_three_real_visibility_exits_route_recycle_and_unproven);
+	UT_RUN(test_full_scratch_remote_xmax_retains_exact_data_locator);
+	UT_RUN(test_full_scratch_remote_xmin_retains_exact_data_locator);
+	UT_RUN(test_full_scratch_local_xmax_uses_exact_origin_not_native_clog);
+	UT_RUN(test_full_scratch_local_xmin_uses_exact_origin_not_native_clog);
+	UT_RUN(test_full_scratch_exact_status_and_scn_polarity_both_origins);
+	UT_RUN(test_full_scratch_unknown_prepared_bad_scn_and_locator_stay_protective);
+	UT_RUN(test_full_scratch_local_exact_error_releases_resolution_scope);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
