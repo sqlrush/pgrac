@@ -4610,6 +4610,13 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 		lp = PageGetItemId(page, offnum);
 		if (!ItemIdIsNormal(lp))
 		{
+			/* The completed CR producer removes versions born after the
+			 * statement SCN.  An absent first index root is invisible, not a
+			 * broken traversed edge.  The outer caller still revalidates its
+			 * current input and never marks this index entry all-dead. */
+			if (at_chain_start && !ItemIdIsUsed(lp)
+				&& ItemIdGetOffset(lp) == 0 && ItemIdGetLength(lp) == 0)
+				return false;
 			if (ItemIdIsRedirected(lp) && at_chain_start)
 			{
 				offnum = ItemIdGetRedirect(lp);

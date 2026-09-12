@@ -20,6 +20,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/catalog.h"
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_itl.h"
@@ -3186,6 +3187,117 @@ UT_TEST(test_real_hot_full_consumer_preserves_frozen_creator_without_slot)
 	ut_hot_product_fixture = NULL;
 	ut_hot_live_ref_page = NULL;
 	BufferBlocks = NULL;
+}
+
+/* The real FULL producer removes post-snapshot physical versions.  That
+ * proves root absence, not a dead current index item or a broken HOT edge. */
+static void
+ut_full_root_absence_case(int scenario)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	ClusterCRCandidateChain chain = { 0 };
+	PGAlignedBlock live_before;
+	HeapHotSearchResultKind kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
+	volatile bool caught = false;
+	bool all_dead = true;
+	Page page;
+	ItemId root;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	page = (Page)fixture.full_source;
+	chain.xid = UT_HOT_FULL_XMIN;
+	chain.write_scn = UT_HOT_READ_SCN + 1;
+	UT_ASSERT_EQ(cluster_cr_prune_post_snapshot_versions(fixture.full_source, &chain, 1), 1);
+	root = PageGetItemId(page, UT_HOT_ROOT_OFF);
+	UT_ASSERT(!ItemIdIsUsed(root));
+	if (scenario == 1)
+		root->lp_off = UT_HOT_DATA_OFF;
+	else if (scenario == 2)
+		ItemIdSetDead(root);
+	else if (scenario == 3) {
+		((PageHeader)page)->pd_lower += sizeof(ItemIdData);
+		ItemIdSetUnused(PageGetItemId(page, UT_HOT_ROOT_OFF + 1));
+		ItemIdSetRedirect(root, UT_HOT_ROOT_OFF + 1);
+	} else if (scenario == 4)
+		ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = UT_HOT_READ_SCN + 1;
+	else if (scenario == 5)
+		((PageHeader)page)->pd_pagesize_version = 0;
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, PageGetLSN(page));
+	memcpy(live_before.data, fixture.live_page, BLCKSZ);
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
+											 &all_dead, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT(ut_hot_content_lock_held);
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+	UT_ASSERT_EQ(caught, scenario != 0);
+	if (scenario == 0) {
+		UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_NOT_FOUND);
+		UT_ASSERT(!all_dead);
+		UT_ASSERT_EQ(fixture.fetch_calls, 2);
+		UT_ASSERT_EQ(ItemPointerGetBlockNumber(&tid), UT_HOT_BLOCK);
+		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_ROOT_OFF);
+	}
+	UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+	UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 0);
+	ut_r4_hot_tuple_at((Page)live_before.data, UT_HOT_ROOT_OFF)->t_infomask2 ^= HEAP_KEYS_UPDATED;
+	UT_ASSERT_EQ(memcmp(live_before.data, fixture.live_page, BLCKSZ), 0);
+}
+
+UT_TEST(test_full_post_snapshot_root_absence_is_not_found)
+{
+	ut_full_root_absence_case(0);
+}
+
+UT_TEST(test_full_unused_root_with_nonzero_storage_is_rejected)
+{
+	ut_full_root_absence_case(1);
+}
+
+UT_TEST(test_full_dead_root_is_not_an_absence_proof)
+{
+	ut_full_root_absence_case(2);
+}
+
+UT_TEST(test_full_unused_member_after_redirect_is_still_broken)
+{
+	ut_full_root_absence_case(3);
+}
+
+UT_TEST(test_full_absence_does_not_bypass_retention)
+{
+	ut_full_root_absence_case(4);
+}
+
+UT_TEST(test_full_absence_does_not_bypass_page_validation)
+{
+	ut_full_root_absence_case(5);
 }
 
 /* Three retained versions reproduce the stopped page's identity shape,
@@ -6502,12 +6614,18 @@ UT_TEST(test_census_clearing_target_lock_returns_to_dml_owner)
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(129);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
 	UT_RUN(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data);
 	UT_RUN(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zero_rows);
 	UT_RUN(test_real_hot_full_three_versions_select_creator_and_deleter_separately);
 	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
+	UT_RUN(test_full_post_snapshot_root_absence_is_not_found);
+	UT_RUN(test_full_unused_root_with_nonzero_storage_is_rejected);
+	UT_RUN(test_full_dead_root_is_not_an_absence_proof);
+	UT_RUN(test_full_unused_member_after_redirect_is_still_broken);
+	UT_RUN(test_full_absence_does_not_bypass_retention);
+	UT_RUN(test_full_absence_does_not_bypass_page_validation);
 	UT_RUN(test_complete_frozen_hot_proof_avoids_reused_creator_reconstruction);
 	UT_RUN(test_incomplete_creation_flags_keep_real_hot_full_route);
 	UT_RUN(test_frozen_creator_does_not_bypass_data_lock_or_multi_xmax_full);
