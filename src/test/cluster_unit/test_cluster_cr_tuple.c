@@ -523,10 +523,28 @@ UT_TEST(test_apply_nontarget_insert_is_noop)
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple_at(page, TEST_TUPLE_OFFSET)), OLD_XMIN);
 }
 
+UT_TEST(test_retained_history_requires_full_page_without_tuple_mutation)
+{
+	Page page = build_page(InvalidScn);
+	PGAlignedBlock before;
+	char record[256];
+	size_t length = build_insert_record(record, TEST_TUPLE_OFFSET);
+	ClusterCRTupleOutcome reason = CR_TUPLE_OUTCOME__COUNT;
+
+	set_occupant(page, TEST_TUPLE_OFFSET, CAND_XID, InvalidTransactionId, HEAP_XMAX_INVALID);
+	((UndoRecordHeader *)record)->flags |= UNDO_REC_FLAG_HAS_ITL_HISTORY;
+	memcpy(before.data, page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_cr_tuple_apply_record(page, TEST_TUPLE_OFFSET, record, length, &reason),
+				 CR_TUPLE_APPLY_FALLBACK);
+	UT_ASSERT_EQ(reason, CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN);
+	UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
+	UT_RUN(test_retained_history_requires_full_page_without_tuple_mutation);
 	UT_RUN(test_elig_ok_own_instance_nchains1);
 	UT_RUN(test_elig_ok_watermark_at_or_before_read_scn);
 	UT_RUN(test_elig_fallback_remote);

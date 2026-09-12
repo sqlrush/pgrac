@@ -603,6 +603,7 @@ typedef struct ClusterHeapPreparedUndoTargetPlan
 	UBA planned_uba;
 	ClusterHeapDmlAuthorityGuard guard;
 	ClusterCtrcTargetV1 final_target;
+	UndoItlHistoryEntry history;
 	/* APPLY ownership survives reservation consume, which intentionally
 	 * clears ClusterUndoRecordPrepareReceipt before page publication. */
 	ClusterCtrcReceiptHandle applied_handle;
@@ -658,6 +659,22 @@ cluster_heap_no_retry_boundary_apply(
 	uint16 undo_payload_len, UBA *undo_uba_out,
 	ClusterHeapCurrentMxExactPublication *mx_publications,
 	uint8 mx_publication_count);
+
+static bool cluster_current_mx_stamp_predict_heap_insert(
+	Buffer buffer, HeapTuple tuple, ItemPointerData *self_tid, ItemIdData *line_pointer);
+
+static OffsetNumber
+cluster_heap_insert_undo_offset(Buffer buffer, HeapTuple tuple)
+{
+	ItemPointerData self_tid;
+	ItemIdData line_pointer;
+
+	/* Reuse the real PageAddItem prediction already used by UPDATE. An
+	 * unused line pointer can precede maxoff; never guess append-only. */
+	if (!cluster_current_mx_stamp_predict_heap_insert(buffer, tuple, &self_tid, &line_pointer))
+		return InvalidOffsetNumber;
+	return ItemPointerGetOffsetNumber(&self_tid);
+}
 
 static bool
 cluster_heap_itl_alloc_once(Buffer buffer, TransactionId xid,
@@ -1900,6 +1917,13 @@ cluster_heap_itl_plan_prepared_undo_target(
 		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	if (!cluster_heap_dml_authority_guard_recheck(buffer, &plan->guard))
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
+	plan->history.block = BufferGetBlockNumber(buffer);
+	plan->history.slot_index = plan->slot_index;
+	plan->history.after_kind = lock_only ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+	plan->history.after_write_scn = plan->write_scn;
+	plan->history.prior = plan->guard.itl_slot;
+	if (!cluster_undo_record_stage_history(receipt, target_ordinal, &plan->history))
+		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	plan->valid = true;
 	plan->lock_only = lock_only;
 	plan->target_ordinal = target_ordinal;
@@ -1924,6 +1948,7 @@ cluster_heap_itl_prepared_undo_target_recheck(
 		|| !cluster_heap_dml_authority_guard_recheck(
 			plan->buffer, &plan->guard)
 		|| !cluster_undo_record_prepared_recheck(receipt, plan->payload_len)
+		|| !cluster_undo_record_history_matches(receipt, plan->target_ordinal, &plan->history)
 		|| !cluster_heap_ctrc_pending_itl_target(relation, plan->buffer,
 			&plan->guard, receipt->record_type, &pending_target)
 		|| !cluster_undo_record_ctrc_pending_matches(
@@ -5331,6 +5356,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
 	ClusterCtrcReceiptHandle cluster_itl_ctrc_handle = {0};
+	OffsetNumber cluster_itl_insert_offnum = InvalidOffsetNumber;
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
 #endif
@@ -5388,6 +5414,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 */
 #ifdef USE_PGRAC_CLUSTER
 cluster_heap_insert_retry:
+	cluster_itl_insert_offnum = InvalidOffsetNumber;
 	cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	cluster_itl_active = false;
 	cluster_itl_needs_slot = false;
@@ -5456,9 +5483,8 @@ cluster_heap_insert_retry:
 		 * back a 16B UBA that replaces cluster_itl_uba.  Failure → ereport
 		 * 53R9D outside critical section (I1 + I3 invariants per §3.3).
 		 *
-		 * For heap_insert pre-CRIT,target_offset is the next OffsetNumber
-		 * that PageAddItem will use(PageGetMaxOffsetNumber + 1)— matches
-		 * the tuple position after RelationPutHeapTuple inside CRIT.
+		 * The final locked-page boundary predicts the exact PageAddItem
+		 * position, including reusable line pointers, before receipt APPLY.
 		 */
 		if (!cluster_heap_itl_receipt_identity_admitted(
 				canonical_xid, tt_seg))
@@ -5590,14 +5616,17 @@ cluster_heap_insert_retry:
 				undo_target.forknum = MAIN_FORKNUM;
 				undo_target.blockno = BufferGetBlockNumber(buffer);
 				undo_target.offnum
-					= PageGetMaxOffsetNumber(BufferGetPage(buffer)) + 1;
+					= cluster_heap_insert_undo_offset(buffer, heaptup);
+				cluster_itl_insert_offnum = undo_target.offnum;
 				undo_payload.inserted_tuple_len
 					= (uint16) (heaptup->t_len > UINT16_MAX
 						? 0 : heaptup->t_len);
-				undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-					relation, buffer, NULL, canonical_xid, false,
-					&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
-					&undo_plan);
+				undo_plan_result = CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
+				if (OffsetNumberIsValid(undo_target.offnum))
+					undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
+						relation, buffer, NULL, canonical_xid, false,
+						&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
+						&undo_plan);
 				if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
 				{
 					undo_plan_count = 1;
@@ -5719,7 +5748,9 @@ cluster_heap_insert_retry:
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_itl_active)
 	{
-		cluster_itl_stamp_active(buffer, cluster_itl_slot, canonical_xid,
+		if (ItemPointerGetOffsetNumber(&heaptup->t_self) != cluster_itl_insert_offnum)
+			elog(PANIC, "heap insert placement differs from retained undo target");
+		cluster_itl_stamp_active_with_history(buffer, cluster_itl_slot, canonical_xid,
 								 cluster_itl_write_scn, cluster_itl_uba);
 	}
 #endif
@@ -5813,7 +5844,7 @@ cluster_heap_insert_retry:
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = canonical_xid;
@@ -10846,7 +10877,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_itl_active)
 	{
-		cluster_itl_stamp_active(buffer, cluster_itl_slot, canonical_xid,
+		cluster_itl_stamp_active_with_history(buffer, cluster_itl_slot, canonical_xid,
 								 cluster_itl_write_scn, cluster_itl_uba);
 		tp.t_data->t_itl_slot_idx = cluster_itl_slot;
 	}
@@ -10946,7 +10977,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = canonical_xid;
@@ -13572,13 +13603,13 @@ l_pgrac_reacquire:
 	 * spec-3.4b D5: both stamps carry the same cluster_itl_uba (F11). */
 	if (cluster_itl_old_active)
 	{
-		cluster_itl_stamp_active(buffer, cluster_itl_old_slot, canonical_xid,
+		cluster_itl_stamp_active_with_history(buffer, cluster_itl_old_slot, canonical_xid,
 								 cluster_itl_old_write_scn, cluster_itl_uba);
 		oldtup.t_data->t_itl_slot_idx = cluster_itl_old_slot;
 	}
 	if (cluster_itl_new_active)
 	{
-		cluster_itl_stamp_active(newbuf, cluster_itl_new_slot, canonical_xid,
+		cluster_itl_stamp_active_with_history(newbuf, cluster_itl_new_slot, canonical_xid,
 								 cluster_itl_new_write_scn, cluster_itl_uba);
 		heaptup->t_data->t_itl_slot_idx = cluster_itl_new_slot;
 	}
@@ -15821,27 +15852,8 @@ failed:
 	 */
 	if (cluster_did_lock_stamp)
 	{
-		ClusterItlSlotData *cslot;
-
-		cslot = &ClusterPageGetItlSlots(page)[cluster_lock_slot_idx];
-		if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(cslot->flags))
-			(void)cluster_itl_clear_terminal_lock_refs(page, cslot);
-		/*
-		 * L189:  recycled slot needs wrap++ bump unless we are re-stamping
-		 * our own existing LOCK_ONLY_ACTIVE slot (multi-lock within same
-		 * xact on same tuple).
-		 */
-		if (cslot->flags != ITL_FLAG_FREE
-			&& !(cslot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE
-				&& cslot->xid == canonical_xid))
-			cslot->wrap++;
-		cslot->xid = canonical_xid;
-		cslot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
-		cslot->lock_count = 0;	/* lock_count tracking deferred to spec-3.5+ */
-		cslot->undo_segment_head = cluster_lock_uba;
-		cslot->commit_scn = InvalidScn;
-		cslot->write_scn = cluster_lock_write_scn;
-		cslot->first_change_lsn = InvalidXLogRecPtr;
+		cluster_itl_stamp_lock_active_with_history(*buffer, cluster_lock_slot_idx,
+			canonical_xid, cluster_lock_write_scn, cluster_lock_uba);
 	}
 #endif
 
@@ -15894,7 +15906,7 @@ failed:
 		if (cluster_did_lock_stamp)
 		{
 			memset(&hdr, 0, sizeof(hdr));
-			hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			hdr.ndeltas = 1;
 			hdr.reserved = 0;
 			XLogRegisterData((char *) &hdr, offsetof(xl_heap_itl_delta_block, deltas));
@@ -17033,23 +17045,8 @@ l4:
 		 */
 		if (cluster_chain_lock_stamp)
 		{
-			Page		cpage = BufferGetPage(buf);
-			ClusterItlSlotData *cslot;
-
-			cslot = &ClusterPageGetItlSlots(cpage)[cluster_chain_slot_idx];
-			if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(cslot->flags))
-				(void)cluster_itl_clear_terminal_lock_refs(cpage, cslot);
-			if (cslot->flags != ITL_FLAG_FREE
-				&& !(cslot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE
-					&& cslot->xid == canonical_xid))
-				cslot->wrap++;
-			cslot->xid = canonical_xid;
-			cslot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
-			cslot->lock_count = 0;
-			cslot->undo_segment_head = cluster_chain_uba;
-			cslot->commit_scn = InvalidScn;
-			cslot->write_scn = cluster_chain_write_scn;
-			cslot->first_change_lsn = InvalidXLogRecPtr;
+			cluster_itl_stamp_lock_active_with_history(buf, cluster_chain_slot_idx,
+				canonical_xid, cluster_chain_write_scn, cluster_chain_uba);
 		}
 		if (cluster_chain_vm_locked
 			&& PageIsAllVisible(BufferGetPage(buf))
@@ -17090,7 +17087,7 @@ l4:
 			if (cluster_chain_lock_stamp)
 			{
 				memset(&chain_hdr, 0, sizeof(chain_hdr));
-				chain_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+				chain_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 				chain_hdr.ndeltas = 1;
 				chain_hdr.reserved = 0;
 				XLogRegisterData((char *) &chain_hdr,
@@ -20603,7 +20600,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		{
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			cluster_itl_new_delta.slot_idx = cluster_itl_new_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;
@@ -20614,7 +20611,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		{
 			cluster_itl_old_hdr.ndeltas = 1;
 			cluster_itl_old_hdr.reserved = 0;
-			cluster_itl_old_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			cluster_itl_old_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			cluster_itl_old_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_old_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_old_delta.xid = cluster_itl_xid;
@@ -20630,7 +20627,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 			 */
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
 			cluster_itl_new_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;

@@ -45,6 +45,7 @@ extern int heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt 
 										  const ClusterCtrcTargetV1 *observed);
 extern void heap_receipt_test_current_handoff(void);
 extern void heap_receipt_test_current_mode(uint8 state);
+extern OffsetNumber heap_receipt_test_insert_offset(Page page, HeapTuple tuple);
 
 static char heap_receipt_error_detail[4096];
 
@@ -293,8 +294,8 @@ UT_TEST(reacquired_current_keeps_unpublished_receipt_not_old_dml_plan)
 	ClusterCtrcTargetV1 before, after, final_target;
 
 	heap_receipt_fixture(image.data, &receipt, &before);
-	saved = receipt;
 	UT_ASSERT(heap_receipt_test_plan_capture(&receipt));
+	saved = receipt; /* the staged history is part of this exact reservation */
 	heap_receipt_cleanout(image.data, &before);
 	heap_receipt_test_current_handoff();
 	UT_ASSERT(heap_receipt_test_authority_mismatch() != 0);
@@ -349,10 +350,48 @@ UT_TEST(reacquisition_cannot_cross_membership_or_retained_identity)
 	cluster_undo_record_cancel_prepared(&receipt);
 }
 
+UT_TEST(insert_undo_target_matches_real_empty_or_reused_line_pointer)
+{
+	int variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		PGAlignedBlock image, before;
+		HeapTupleHeaderData header = { 0 };
+		HeapTupleData tuple = { 0 };
+		OffsetNumber predicted, actual;
+
+		header.t_hoff = SizeofHeapTupleHeader;
+		HeapTupleHeaderSetXmin(&header, 700);
+		tuple.t_len = sizeof(header);
+		tuple.t_data = &header;
+		PageInitHeapPage(image.data, BLCKSZ, 0);
+		if (variant != 0) {
+			UT_ASSERT_EQ(PageAddItem(image.data, (Item)&header, sizeof(header), InvalidOffsetNumber,
+									 false, true),
+						 1);
+			UT_ASSERT_EQ(PageAddItem(image.data, (Item)&header, sizeof(header), InvalidOffsetNumber,
+									 false, true),
+						 2);
+			if (variant >= 2)
+				ItemIdSetUnused(PageGetItemId(image.data, 1));
+			if (variant == 2)
+				PageSetHasFreeLinePointers(image.data);
+		}
+		memcpy(before.data, image.data, BLCKSZ);
+		predicted = heap_receipt_test_insert_offset(image.data, &tuple);
+		UT_ASSERT_EQ(memcmp(before.data, image.data, BLCKSZ), 0);
+		actual = PageAddItem(image.data, (Item)&header, sizeof(header), InvalidOffsetNumber, false,
+							 true);
+		UT_ASSERT_EQ(predicted, actual);
+		UT_ASSERT_EQ(actual, variant == 0 || variant == 2 ? 1 : 3);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
+	UT_RUN(insert_undo_target_matches_real_empty_or_reused_line_pointer);
 	UT_RUN(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline);
 	UT_RUN(final_itl_predecessor_is_captured_from_current_page);
 	UT_RUN(final_plan_drift_is_rejected_even_when_intent_is_compatible);

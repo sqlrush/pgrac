@@ -708,7 +708,9 @@
  * cluster_pi_apply_redo_test SRF (oid 8975).  Bump 202606390 -> 202607060. */
 /* RF-ROOT P3 / STOP03: remove ten authority-bearing recovery mutator/probe
  * builtins before recovery-serial activation.  Bump 202607060 -> 202608150. */
-#define CATALOG_VERSION_NO 202608150
+/* Retained page-slot undo history and final record-drain retention semantics.
+ * Fresh homogeneous databases only; not an in-place/rolling format upgrade. */
+#define CATALOG_VERSION_NO 202609120
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

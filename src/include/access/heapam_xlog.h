@@ -594,6 +594,8 @@ StaticAssertDecl(offsetof(xl_heap_itl_delta_block, deltas) == 8,
 #define CLUSTER_ITL_DELTA_FORMAT_V1 ((uint32) 0)
 #define CLUSTER_ITL_DELTA_FORMAT_V2 ((uint32) 1)
 #define CLUSTER_ITL_DELTA_FORMAT_V3 ((uint32) 2)
+/* Same 32-byte delta, but the exact prior ITL is retained by this undo record. */
+#define CLUSTER_ITL_DELTA_FORMAT_V4 ((uint32) 3)
 
 typedef struct xl_heap_itl_delta_v2
 {

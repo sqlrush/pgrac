@@ -311,8 +311,7 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	 * if that is unproved, bind this SCN to origin CLOG plus no-raw-reuse.
 	 * ACTIVE and every invalid-SCN shape remain ineligible. */
 	ref->has_cached_status
-		= ((slot->flags == ITL_FLAG_COMMITTED
-			|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT)
+		= ((slot->flags == ITL_FLAG_COMMITTED || slot->flags == ITL_FLAG_NEEDS_CLEANOUT)
 		   && SCN_VALID(slot->commit_scn));
 	/* _padding cleared by memset above. */
 
@@ -330,8 +329,7 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
  * their xid field has a different consumer (and the marker stores an MXID).
  */
 static bool
-cluster_itl_select_data_slot_index(Page page, TransactionId raw_xid,
-								   uint8 *slot_index_out)
+cluster_itl_select_data_slot_index(Page page, TransactionId raw_xid, uint8 *slot_index_out)
 {
 	const ClusterItlSlotData *slots;
 	int match_idx = -1;
@@ -352,12 +350,10 @@ cluster_itl_select_data_slot_index(Page page, TransactionId raw_xid,
 		const ClusterItlSlotData *slot = &slots[i];
 		bool is_data_state;
 
-		is_data_state = slot->flags == ITL_FLAG_ACTIVE
-						|| slot->flags == ITL_FLAG_COMMITTED
+		is_data_state = slot->flags == ITL_FLAG_ACTIVE || slot->flags == ITL_FLAG_COMMITTED
 						|| slot->flags == ITL_FLAG_ABORTED
 						|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT;
-		if (!is_data_state || slot->xid != raw_xid
-			|| UBA_is_invalid(slot->undo_segment_head))
+		if (!is_data_state || slot->xid != raw_xid || UBA_is_invalid(slot->undo_segment_head))
 			continue;
 
 		if (match_idx < 0 || slot->wrap > match_wrap) {
@@ -375,15 +371,13 @@ cluster_itl_select_data_slot_index(Page page, TransactionId raw_xid,
 }
 
 bool
-cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
-									uint8 *slot_index_out)
+cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid, uint8 *slot_index_out)
 {
 	return cluster_itl_select_data_slot_index(page, raw_xid, slot_index_out);
 }
 
 bool
-cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
-									ClusterUndoTTSlotRef *ref)
+cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid, ClusterUndoTTSlotRef *ref)
 {
 	uint8 match_idx;
 
@@ -404,8 +398,7 @@ cluster_itl_select_lock_slot_index(Page page, TransactionId raw_xmax, uint8 *slo
 	uint8 i;
 	bool ambiguous = false;
 
-	if (page == NULL || !PageHasItl(page)
-		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
+	if (page == NULL || !PageHasItl(page) || PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
 		return false;
 	if (!TransactionIdIsValid(raw_xmax))
 		return false;
@@ -443,8 +436,7 @@ cluster_itl_select_lock_slot_index(Page page, TransactionId raw_xmax, uint8 *slo
 }
 
 bool
-cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
-										 uint8 *slot_index_out)
+cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax, uint8 *slot_index_out)
 {
 	if (slot_index_out == NULL)
 		return false;
@@ -568,8 +560,7 @@ itl_require_block_x_for_write(Buffer buf)
 
 
 bool
-cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid,
-								 bool lock_only)
+cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid, bool lock_only)
 {
 	Page page;
 	const ClusterItlSlotData *slots;
@@ -583,11 +574,8 @@ cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid,
 	itl_require_block_x_for_write(buf);
 	slots = ClusterPageGetItlSlots(page);
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
-		if ((!lock_only && slots[i].flags == ITL_FLAG_ACTIVE
-			 && slots[i].xid == top_xid)
-			|| (lock_only
-				&& slots[i].flags == ITL_FLAG_LOCK_ONLY_ACTIVE
-				&& slots[i].xid == top_xid)
+		if ((!lock_only && slots[i].flags == ITL_FLAG_ACTIVE && slots[i].xid == top_xid)
+			|| (lock_only && slots[i].flags == ITL_FLAG_LOCK_ONLY_ACTIVE && slots[i].xid == top_xid)
 			|| slots[i].flags == ITL_FLAG_FREE
 			|| (cluster_itl_slot_is_completed_reusable(slots[i].flags)
 				&& !cluster_itl_slot_is_protected_foreign(&slots[i])))
@@ -860,9 +848,8 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 		 * before consuming FREE space; otherwise one marker per successive
 		 * MXID would permanently shrink the page's fixed ITL budget.
 		 */
-		int idx = (stale_marker_idx >= 0)
-					  ? stale_marker_idx
-					  : ((free_idx >= 0) ? free_idx : reusable_idx);
+		int idx = (stale_marker_idx >= 0) ? stale_marker_idx
+										  : ((free_idx >= 0) ? free_idx : reusable_idx);
 		ClusterItlSlotData *slot;
 
 		if (idx < 0)
@@ -948,7 +935,9 @@ cluster_itl_recycle_watermark_contribution(uint8 old_flags, TransactionId old_xi
 	case ITL_FLAG_COMMITTED:
 	case ITL_FLAG_ABORTED:
 	case ITL_FLAG_NEEDS_CLEANOUT:
-		break; /* completed data slot -- eligible */
+	case ITL_FLAG_LOCK_ONLY_COMMITTED:
+	case ITL_FLAG_LOCK_ONLY_ABORTED:
+		break; /* ordinary terminal carrier; its predecessor may be DATA */
 	default:
 		return InvalidScn; /* FREE / ACTIVE / lock-only-* -- never */
 	}
@@ -978,9 +967,9 @@ cluster_itl_block_watermark_advance(Page page, SCN contrib)
 		h->itl_recycle_watermark_scn = contrib;
 }
 
-void
-cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
-						 UBA undo_segment_head)
+static void
+cluster_itl_stamp_active_internal(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
+								  UBA undo_segment_head, bool history_preserved)
 {
 	Page page;
 	ClusterItlSlotData *slot;
@@ -1014,8 +1003,10 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 	 * surrounding heap record; redo parity in
 	 * cluster_itl_redo_apply_block_local_delta via the same shared helper.
 	 */
-	cluster_itl_block_watermark_advance(page, cluster_itl_recycle_watermark_contribution(
-												  slot->flags, slot->xid, slot->write_scn, xid));
+	if (!history_preserved)
+		cluster_itl_block_watermark_advance(
+			page, cluster_itl_recycle_watermark_contribution(slot->flags, slot->xid,
+															 slot->write_scn, xid));
 	if (slot->flags != ITL_FLAG_FREE && !(slot->flags == ITL_FLAG_ACTIVE && slot->xid == xid))
 		slot->wrap++;
 	slot->xid = xid;
@@ -1055,6 +1046,13 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 }
 
 void
+cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
+						 UBA undo_segment_head)
+{
+	cluster_itl_stamp_active_internal(buf, slot_idx, xid, write_scn, undo_segment_head, false);
+}
+
+void
 cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx, SCN commit_scn)
 {
 	Page page;
@@ -1074,6 +1072,43 @@ cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx, SCN commit_scn)
 	slot->commit_scn = commit_scn;
 
 	MarkBufferDirty(buf);
+}
+
+void
+cluster_itl_stamp_active_with_history(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
+									  UBA undo_segment_head)
+{
+	Assert(!UBA_is_invalid(undo_segment_head));
+	cluster_itl_stamp_active_internal(buf, slot_idx, xid, write_scn, undo_segment_head, true);
+}
+
+void
+cluster_itl_stamp_lock_active_with_history(Buffer buf, uint8 slot_idx, TransactionId xid,
+										   SCN write_scn, UBA undo_segment_head)
+{
+	Page page = BufferGetPage(buf);
+	ClusterItlSlotData *slot;
+
+	Assert(PageHasItl(page));
+	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+	Assert(!UBA_is_invalid(undo_segment_head));
+	slot = &ClusterPageGetItlSlots(page)[slot_idx];
+	if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(slot->flags))
+		(void)cluster_itl_clear_terminal_lock_refs(page, slot);
+	if (slot->flags != ITL_FLAG_FREE
+		&& !(slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE && slot->xid == xid))
+		slot->wrap++;
+	slot->xid = xid;
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->lock_count = 0;
+	slot->undo_segment_head = undo_segment_head;
+	slot->commit_scn = InvalidScn;
+	slot->write_scn = write_scn;
+	slot->first_change_lsn = InvalidXLogRecPtr;
+	/* LOCK can carry an older DATA history head too. Match non-FPI redo's
+	 * page gate so the synchronous reader cannot skip this new history. */
+	if (SCN_VALID(write_scn) && scn_time_cmp(write_scn, ((PageHeader)page)->pd_block_scn) > 0)
+		((PageHeader)page)->pd_block_scn = write_scn;
 }
 
 void
@@ -1133,11 +1168,43 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		delta_size = sizeof(xl_heap_itl_delta);
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
-	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3)
+	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3
+			 || hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V4)
 		delta_size = sizeof(xl_heap_itl_delta_v3);
 	else
 		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
 			 (unsigned)hdr.format_version);
+
+	/* Validate the complete new-format array before any page mutation. */
+	if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V4) {
+		uint8 seen = 0;
+
+		if (!PageHasItl(page) || hdr.reserved != 0 || hdr.ndeltas > CLUSTER_ITL_INITRANS_DEFAULT)
+			elog(PANIC, "invalid retained-history ITL delta array");
+		for (i = 0; i < hdr.ndeltas; i++) {
+			xl_heap_itl_delta_v3 delta;
+			uint32 segment;
+			uint32 block;
+			uint16 tt;
+			uint16 row;
+
+			memcpy(&delta,
+				   itl_block_start + offsetof(xl_heap_itl_delta_block, deltas)
+					   + (Size)i * delta_size,
+				   sizeof(delta));
+			if (delta.slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
+				|| (seen & (UINT8_C(1) << delta.slot_idx)) != 0
+				|| (delta.flags_after != ITL_FLAG_ACTIVE
+					&& delta.flags_after != ITL_FLAG_LOCK_ONLY_ACTIVE)
+				|| !TransactionIdIsNormal(delta.xid) || !SCN_VALID(delta.write_scn)
+				|| !uba_decode(delta.undo_segment_head, &segment, &block, &tt, &row) || block == 0
+				|| block >= UNDO_BLOCKS_PER_SEGMENT
+				|| row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+				|| uba_origin_node_id(delta.undo_segment_head) == InvalidNodeId)
+				elog(PANIC, "invalid retained-history ITL delta");
+			seen |= UINT8_C(1) << delta.slot_idx;
+		}
+	}
 
 	for (i = 0; i < hdr.ndeltas; i++) {
 		const char *p
@@ -1196,6 +1263,8 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		if (flags_after == ITL_FLAG_COMMITTED && !SCN_VALID(d_commit_scn))
 			elog(PANIC, "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap redo");
 
+		if (slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+			elog(PANIC, "ITL delta slot index out of range");
 		slot = &ClusterPageGetItlSlots(page)[slot_idx];
 		/* Replacement WAL proves retirement even if the terminal hint was
 		 * not flushed. Same-xid ACTIVE transitions do not release row locks. */
@@ -1212,10 +1281,19 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		 * restores the watermark verbatim (it is a page field); this covers
 		 * the incremental-delta path -- NOT FPI-dependent (§v0.5 B5).
 		 */
-		if (flags_after == ITL_FLAG_ACTIVE)
+		if (hdr.format_version != CLUSTER_ITL_DELTA_FORMAT_V4
+			&& (flags_after == ITL_FLAG_ACTIVE || flags_after == ITL_FLAG_LOCK_ONLY_ACTIVE))
 			cluster_itl_block_watermark_advance(
 				page, cluster_itl_recycle_watermark_contribution(slot->flags, slot->xid,
 																 slot->write_scn, d_xid));
+		if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V4) {
+			if (slot->flags != ITL_FLAG_FREE && !(slot->flags == flags_after && slot->xid == d_xid))
+				slot->wrap++;
+			if (flags_after == ITL_FLAG_LOCK_ONLY_ACTIVE) {
+				slot->lock_count = 0;
+				slot->first_change_lsn = InvalidXLogRecPtr;
+			}
+		}
 		slot->xid = d_xid;
 		slot->flags = (ClusterItlFlags)flags_after;
 		slot->write_scn = d_write_scn;
@@ -1275,7 +1353,8 @@ cluster_itl_wal_block_consumed_bytes(const char *itl_block_start)
 		delta_size = sizeof(xl_heap_itl_delta);
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
-	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3)
+	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3
+			 || hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V4)
 		delta_size = sizeof(xl_heap_itl_delta_v3);
 	else
 		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",

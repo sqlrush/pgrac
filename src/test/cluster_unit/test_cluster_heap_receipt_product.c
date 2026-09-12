@@ -30,6 +30,7 @@ int heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt *receip
 								   const ClusterCtrcTargetV1 *observed);
 void heap_receipt_test_current_handoff(void);
 void heap_receipt_test_current_mode(uint8 state);
+OffsetNumber heap_receipt_test_insert_offset(Page page, HeapTuple tuple);
 
 int NBuffers = 1;
 int NLocBuffer = 0;
@@ -44,6 +45,20 @@ uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 static ClusterPcmOwnSnapshot probe_pcm;
 static ClusterHeapDmlAuthorityGuard probe_guard;
+
+BlockNumber
+BufferGetBlockNumber(Buffer buffer)
+{
+	Assert(buffer == 1);
+	return probe_descriptors[0].bufferdesc.tag.blockNum;
+}
+
+OffsetNumber
+heap_receipt_test_insert_offset(Page page, HeapTuple tuple)
+{
+	BufferBlocks = page;
+	return cluster_heap_insert_undo_offset(1, tuple);
+}
 
 void
 heap_receipt_test_current_handoff(void)
@@ -141,7 +156,11 @@ heap_receipt_test_plan_capture(ClusterUndoRecordPrepareReceipt *receipt)
 	probe_plan.xid = 700;
 	probe_plan.payload_len = 64;
 	probe_plan.write_scn = 1000;
-	return true;
+	probe_plan.history.block = 44;
+	probe_plan.history.after_kind = ITL_FLAG_ACTIVE;
+	probe_plan.history.after_write_scn = 1000;
+	probe_plan.history.prior = probe_plan.guard.itl_slot;
+	return cluster_undo_record_stage_history(receipt, 0, &probe_plan.history);
 }
 
 bool

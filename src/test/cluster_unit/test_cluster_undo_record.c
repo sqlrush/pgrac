@@ -195,8 +195,9 @@ read_heapam_source(void)
 	return read_source_file(HEAPAM_SOURCE_PATH);
 }
 
-extern bool cluster_undo_record_ctrc_required_prepared(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask);
+extern bool
+cluster_undo_record_ctrc_required_prepared(const ClusterUndoRecordPrepareReceipt *receipt,
+										   uint8 required_mask);
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -440,7 +441,8 @@ cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
  */
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
 {
 	abort();
 }
@@ -504,14 +506,13 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 {}
 
 bool
-cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
-							 uint32 segment_id, uint8 owner_instance,
-							 uint32 block_no, char *buf)
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
+							 uint8 owner_instance, uint32 block_no, char *buf)
 {
-	UndoSegmentHeaderData *disk
-		= (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 
-	if (segment_id != 1 || owner_instance != 1 || block_no != 0 || buf == NULL)
+	if (segment_id != disk->segment_id || owner_instance != disk->owner_instance || block_no != 0
+		|| buf == NULL)
 		return false;
 	memcpy(buf, undo_test_lifecycle_disk.data, BLCKSZ);
 	if (undo_test_publish_tt_after_block0_read) {
@@ -528,9 +529,8 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 }
 
 bool
-cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused(),
-							  uint32 segment_id, uint8 owner_instance,
-							  uint32 block_no, const char *buf,
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
+							  uint8 owner_instance, uint32 block_no, const char *buf,
 							  bool do_fsync pg_attribute_unused())
 {
 	if (segment_id != 1 || owner_instance != 1 || block_no != 0 || buf == NULL)
@@ -541,8 +541,8 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused()
 
 bool
 cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_unused(),
-								 uint32 segment_id, uint8 owner_instance,
-								 uint32 offset, const char *buf, uint32 len)
+									 uint32 segment_id, uint8 owner_instance, uint32 offset,
+									 const char *buf, uint32 len)
 {
 	if (segment_id != 1 || owner_instance != 1 || buf == NULL || len == 0
 		|| (uint64)offset + (uint64)len > BLCKSZ)
@@ -558,41 +558,35 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 }
 
 ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_ensure_resident(
-	const ClusterUndoBlock0LogicalKey *key, int timeout_ms)
+cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key,
+													   int timeout_ms)
 {
-	return key != NULL && key->segment_id == 1 && key->owner_instance == 1
-		&& timeout_ms > 0
-		? CLUSTER_UNDO_BLOCK0_OK
-		: CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	return key != NULL && key->segment_id == 1 && key->owner_instance == 1 && timeout_ms > 0
+			   ? CLUSTER_UNDO_BLOCK0_OK
+			   : CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 }
 
 ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_mutate_exact(
-	const ClusterUndoBlock0LogicalKey *key,
-	const ClusterUndoBlock0Generation *expected,
-	const char predecessor_page[BLCKSZ],
-	const char successor_page[BLCKSZ], int timeout_ms)
+cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0LogicalKey *key,
+													const ClusterUndoBlock0Generation *expected,
+													const char predecessor_page[BLCKSZ],
+													const char successor_page[BLCKSZ],
+													int timeout_ms)
 {
 	PGAlignedBlock rebased;
-	UndoSegmentHeaderData *current
-		= (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	UndoSegmentHeaderData *current = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 	UndoSegmentHeaderData *next = (UndoSegmentHeaderData *)rebased.data;
-	const UndoSegmentHeaderData *requested
-		= (const UndoSegmentHeaderData *)successor_page;
+	const UndoSegmentHeaderData *requested = (const UndoSegmentHeaderData *)successor_page;
 
-	if (key == NULL || expected == NULL || !expected->known
-		|| predecessor_page == NULL || successor_page == NULL
-		|| timeout_ms <= 0 || key->segment_id != current->segment_id
-		|| key->owner_instance != current->owner_instance
-		|| expected->value != current->wrap_count)
+	if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
+		|| successor_page == NULL || timeout_ms <= 0 || key->segment_id != current->segment_id
+		|| key->owner_instance != current->owner_instance || expected->value != current->wrap_count)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	memcpy(rebased.data, successor_page, BLCKSZ);
 	memcpy(next->tt_slots, current->tt_slots, sizeof(next->tt_slots));
 	memcpy(undo_test_lifecycle_disk.data, rebased.data, BLCKSZ);
-	return requested->wrap_count == expected->value
-		? CLUSTER_UNDO_BLOCK0_OK
-		: CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+	return requested->wrap_count == expected->value ? CLUSTER_UNDO_BLOCK0_OK
+													: CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
 }
 
 int
@@ -613,17 +607,18 @@ cluster_tt_slot_current_segment(int node_id pg_attribute_unused())
 	return 0;
 }
 
+static bool undo_test_drain_allowed;
+
 bool
-cluster_undo_record_segment_drainable(
-	const UndoSegmentHeaderData *hdr pg_attribute_unused(),
-	ClusterUndoActiveBoundary boundary pg_attribute_unused(),
-	bool any_unresolved_prepared pg_attribute_unused(),
-	uint32 fixed_first_segment_id pg_attribute_unused(),
-	uint32 active_record_segment_id pg_attribute_unused(),
-	uint32 active_tt_segment_id pg_attribute_unused(),
-	bool recovery_in_progress pg_attribute_unused())
+cluster_undo_record_segment_drainable(const UndoSegmentHeaderData *hdr pg_attribute_unused(),
+									  ClusterUndoActiveBoundary boundary pg_attribute_unused(),
+									  bool any_unresolved_prepared pg_attribute_unused(),
+									  uint32 fixed_first_segment_id pg_attribute_unused(),
+									  uint32 active_record_segment_id pg_attribute_unused(),
+									  uint32 active_tt_segment_id pg_attribute_unused(),
+									  bool recovery_in_progress pg_attribute_unused())
 {
-	return false;
+	return undo_test_drain_allowed;
 }
 
 int
@@ -637,8 +632,7 @@ BasicOpenFile(const char *fileName, int fileFlags)
 {
 	if (undo_test_track_observer_opens)
 		undo_test_observer_open_calls++;
-	if (undo_test_open_fail_path[0] != '\0'
-		&& strcmp(fileName, undo_test_open_fail_path) == 0) {
+	if (undo_test_open_fail_path[0] != '\0' && strcmp(fileName, undo_test_open_fail_path) == 0) {
 		errno = EIO;
 		return -1;
 	}
@@ -1102,8 +1096,7 @@ UT_TEST(test_undo_pool_observer_rejects_invalid_owner_and_null_output)
 	UT_ASSERT_EQ(observation.allocated_count, 0);
 	UT_ASSERT_EQ(observation.configured_cap, 0);
 	UT_ASSERT_EQ(observation.effective_cap, 0);
-	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, NULL),
-				 CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, NULL), CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
 }
 
 UT_TEST(test_undo_pool_observer_distinguishes_io_failure_and_invalid_header)
@@ -1300,14 +1293,11 @@ UT_TEST(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks)
 	end = start == NULL ? NULL : strstr(start, "\n}\n\n\n/*\n * cluster_undo_get_record");
 	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
 	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
-	recheck = start == NULL
-				  ? NULL
-				  : strstr(start, "cluster_semantic_activation_modifier_recheck(");
+	recheck = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_recheck(");
 	call_body = start == NULL ? NULL : strstr(start, "cluster_undo_record_alloc_body(");
 	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
-	leave = finally_block == NULL
-				? NULL
-				: strstr(finally_block, "cluster_semantic_activation_leave(");
+	leave = finally_block == NULL ? NULL
+								  : strstr(finally_block, "cluster_semantic_activation_leave(");
 
 	UT_ASSERT_NOT_NULL(body);
 	UT_ASSERT_NOT_NULL(start);
@@ -1348,27 +1338,32 @@ UT_TEST(test_tt_rollover_publishes_current_before_binding_exposure)
 		return;
 	start = strstr(source, "\ncluster_undo_tt_rollover_locked(");
 	end = start == NULL ? NULL
-		: strstr(start, "\nuint64\ncluster_undo_tt_retention_rollover_count(");
-	mark_active = start == NULL ? NULL
-		: strstr(start, "cluster_undo_segment_mark_active(");
-	freeze_logical = mark_active == NULL ? NULL
-		: strstr(mark_active, "logical.segment_id = new_segment_id;");
-	unlock_for_current = freeze_logical == NULL ? NULL
-		: strstr(freeze_logical,
-			"LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);");
-	ensure_current = unlock_for_current == NULL ? NULL
-		: strstr(unlock_for_current,
-			"cluster_undo_block0_current_live_owner_ensure_resident_exact(");
-	relock = ensure_current == NULL ? NULL
-		: strstr(ensure_current,
-			"LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);");
-	recheck_current = relock == NULL ? NULL
-		: strstr(relock, "cluster_tt_slot_current_segment(node_id)");
-	recheck_publication = recheck_current == NULL ? NULL
-		: strstr(recheck_current,
-			"cluster_undo_block0_current_live_owner_publication_recheck(");
-	publish_binding = recheck_publication == NULL ? NULL
-		: strstr(recheck_publication, "cluster_tt_slot_rollover(");
+						: strstr(start, "\nuint64\ncluster_undo_tt_retention_rollover_count(");
+	mark_active = start == NULL ? NULL : strstr(start, "cluster_undo_segment_mark_active(");
+	freeze_logical
+		= mark_active == NULL ? NULL : strstr(mark_active, "logical.segment_id = new_segment_id;");
+	unlock_for_current
+		= freeze_logical == NULL
+			  ? NULL
+			  : strstr(freeze_logical, "LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);");
+	ensure_current = unlock_for_current == NULL
+						 ? NULL
+						 : strstr(unlock_for_current,
+								  "cluster_undo_block0_current_live_owner_ensure_resident_exact(");
+	relock = ensure_current == NULL
+				 ? NULL
+				 : strstr(ensure_current,
+						  "LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);");
+	recheck_current
+		= relock == NULL ? NULL : strstr(relock, "cluster_tt_slot_current_segment(node_id)");
+	recheck_publication
+		= recheck_current == NULL
+			  ? NULL
+			  : strstr(recheck_current,
+					   "cluster_undo_block0_current_live_owner_publication_recheck(");
+	publish_binding = recheck_publication == NULL
+						  ? NULL
+						  : strstr(recheck_publication, "cluster_tt_slot_rollover(");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -1380,18 +1375,13 @@ UT_TEST(test_tt_rollover_publishes_current_before_binding_exposure)
 	UT_ASSERT_NOT_NULL(recheck_current);
 	UT_ASSERT_NOT_NULL(recheck_publication);
 	UT_ASSERT_NOT_NULL(publish_binding);
-	if (start != NULL && end != NULL && mark_active != NULL
-		&& freeze_logical != NULL
-		&& unlock_for_current != NULL && ensure_current != NULL
-		&& relock != NULL && recheck_current != NULL
-		&& recheck_publication != NULL
-		&& publish_binding != NULL)
+	if (start != NULL && end != NULL && mark_active != NULL && freeze_logical != NULL
+		&& unlock_for_current != NULL && ensure_current != NULL && relock != NULL
+		&& recheck_current != NULL && recheck_publication != NULL && publish_binding != NULL)
 		UT_ASSERT(start < mark_active && mark_active < freeze_logical
-				  && freeze_logical < unlock_for_current
-				  && unlock_for_current < ensure_current
+				  && freeze_logical < unlock_for_current && unlock_for_current < ensure_current
 				  && ensure_current < relock && relock < recheck_current
-				  && recheck_current < recheck_publication
-				  && recheck_publication < publish_binding
+				  && recheck_current < recheck_publication && recheck_publication < publish_binding
 				  && publish_binding < end);
 	free(source);
 }
@@ -1411,19 +1401,20 @@ UT_TEST(test_recycle_releases_lifecycle_before_exact_current_transition)
 		return;
 	start = strstr(source, "\ncluster_undo_segment_advance_recyclable(");
 	end = start == NULL ? NULL
-		: strstr(start, "\n\n/* spec-3.13 D4: allocator-side reuse counter hook");
-	acquire = start == NULL ? NULL
-		: strstr(start,
-			"LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);");
-	epoch_fence = acquire == NULL ? NULL
-		: strstr(acquire, "cluster_undo_horizon_epoch_fence_tripped(expected_epoch)");
-	release = epoch_fence == NULL ? NULL
-		: strstr(epoch_fence,
-			"LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);");
-	transition = release == NULL ? NULL
-		: strstr(release, "cluster_undo_segment_try_mark_recyclable(");
-	expected_arg = transition == NULL ? NULL
-		: strstr(transition, "expected_epoch");
+						: strstr(start, "\n\n/* spec-3.13 D4: allocator-side reuse counter hook");
+	acquire = start == NULL
+				  ? NULL
+				  : strstr(start,
+						   "LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);");
+	epoch_fence = acquire == NULL
+					  ? NULL
+					  : strstr(acquire, "cluster_undo_horizon_epoch_fence_tripped(expected_epoch)");
+	release = epoch_fence == NULL
+				  ? NULL
+				  : strstr(epoch_fence, "LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);");
+	transition
+		= release == NULL ? NULL : strstr(release, "cluster_undo_segment_try_mark_recyclable(");
+	expected_arg = transition == NULL ? NULL : strstr(transition, "expected_epoch");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -1432,12 +1423,10 @@ UT_TEST(test_recycle_releases_lifecycle_before_exact_current_transition)
 	UT_ASSERT_NOT_NULL(release);
 	UT_ASSERT_NOT_NULL(transition);
 	UT_ASSERT_NOT_NULL(expected_arg);
-	if (start != NULL && end != NULL && acquire != NULL
-		&& epoch_fence != NULL && release != NULL && transition != NULL
-		&& expected_arg != NULL)
-		UT_ASSERT(start < acquire && acquire < epoch_fence
-			&& epoch_fence < release && release < transition
-			&& transition < expected_arg && expected_arg < end);
+	if (start != NULL && end != NULL && acquire != NULL && epoch_fence != NULL && release != NULL
+		&& transition != NULL && expected_arg != NULL)
+		UT_ASSERT(start < acquire && acquire < epoch_fence && epoch_fence < release
+				  && release < transition && transition < expected_arg && expected_arg < end);
 	free(source);
 }
 
@@ -1453,12 +1442,10 @@ UT_TEST(test_extend_selects_reuse_without_mutating_block0)
 	if (source == NULL)
 		return;
 	start = strstr(source, "\ncluster_undo_segment_extend_or_create(");
-	end = start == NULL ? NULL
-		: strstr(start, "\n\n/*\n * cluster_undo_segment_scan_max_existing");
+	end = start == NULL ? NULL : strstr(start, "\n\n/*\n * cluster_undo_segment_scan_max_existing");
 	plan = start == NULL ? NULL : strstr(start, "ClusterUndoSegmentExtendPlan *plan");
 	candidate = plan == NULL ? NULL : strstr(plan, "plan->needs_reuse = true;");
-	forbidden_reuse = start == NULL ? NULL
-		: strstr(start, "cluster_undo_segment_reuse_in_place(");
+	forbidden_reuse = start == NULL ? NULL : strstr(start, "cluster_undo_segment_reuse_in_place(");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -1486,21 +1473,19 @@ UT_TEST(test_reuse_wrapper_routes_only_through_exact_current_owner)
 	if (source == NULL)
 		return;
 	start = strstr(source, "\ncluster_undo_segment_reuse_in_place(");
-	end = start == NULL ? NULL
-		: strstr(start, "\n\n/*\n * cluster_undo_segment_generation");
-	fresh = start == NULL ? NULL
-		: strstr(start, "cluster_undo_segment_make_header_bytes(");
-	current_exact = fresh == NULL ? NULL
-		: strstr(fresh, "cluster_undo_block0_current_live_owner_reuse_exact(");
-	invalidate = current_exact == NULL ? NULL
-		: strstr(current_exact, "cluster_undo_buf_invalidate_segment(");
+	end = start == NULL ? NULL : strstr(start, "\n\n/*\n * cluster_undo_segment_generation");
+	fresh = start == NULL ? NULL : strstr(start, "cluster_undo_segment_make_header_bytes(");
+	current_exact = fresh == NULL
+						? NULL
+						: strstr(fresh, "cluster_undo_block0_current_live_owner_reuse_exact(");
+	invalidate = current_exact == NULL
+					 ? NULL
+					 : strstr(current_exact, "cluster_undo_buf_invalidate_segment(");
 	note = invalidate == NULL ? NULL
-		: strstr(invalidate, "cluster_undo_record_note_segment_reuse();");
-	raw_emit = start == NULL ? NULL
-		: strstr(start, "cluster_undo_emit_segment_reuse(");
+							  : strstr(invalidate, "cluster_undo_record_note_segment_reuse();");
+	raw_emit = start == NULL ? NULL : strstr(start, "cluster_undo_emit_segment_reuse(");
 	raw_flush = start == NULL ? NULL : strstr(start, "XLogFlush(");
-	raw_write = start == NULL ? NULL
-		: strstr(start, "write_segment_header_via_smgr(");
+	raw_write = start == NULL ? NULL : strstr(start, "write_segment_header_via_smgr(");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -1508,10 +1493,10 @@ UT_TEST(test_reuse_wrapper_routes_only_through_exact_current_owner)
 	UT_ASSERT_NOT_NULL(current_exact);
 	UT_ASSERT_NOT_NULL(invalidate);
 	UT_ASSERT_NOT_NULL(note);
-	if (start != NULL && end != NULL && fresh != NULL && current_exact != NULL
-		&& invalidate != NULL && note != NULL)
-		UT_ASSERT(start < fresh && fresh < current_exact
-			&& current_exact < invalidate && invalidate < note && note < end);
+	if (start != NULL && end != NULL && fresh != NULL && current_exact != NULL && invalidate != NULL
+		&& note != NULL)
+		UT_ASSERT(start < fresh && fresh < current_exact && current_exact < invalidate
+				  && invalidate < note && note < end);
 	UT_ASSERT(raw_emit == NULL || raw_emit >= end);
 	UT_ASSERT(raw_flush == NULL || raw_flush >= end);
 	UT_ASSERT(raw_write == NULL || raw_write >= end);
@@ -1541,25 +1526,24 @@ UT_TEST(test_record_prepare_owns_extent_and_block0_slow_paths)
 	if (source == NULL)
 		return;
 	prepare = strstr(source, "\ncluster_undo_record_prepare(");
-	prepare_end = prepare == NULL ? NULL
-		: strstr(prepare, "\n}\n\n\nClusterUndoRecordConsumeResult\n");
+	prepare_end
+		= prepare == NULL ? NULL : strstr(prepare, "\n}\n\n\nClusterUndoRecordConsumeResult\n");
 	consume = prepare_end == NULL ? NULL
-		: strstr(prepare_end, "\ncluster_undo_record_consume_prepared(");
-	consume_end = consume == NULL ? NULL
-		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+								  : strstr(prepare_end, "\ncluster_undo_record_consume_prepared(");
+	consume_end
+		= consume == NULL ? NULL : strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
 	claim = prepare == NULL ? NULL : strstr(prepare, "claim_undo_extent(");
-	ensure = prepare == NULL ? NULL
-		: strstr(prepare, "cluster_undo_record_ensure_block0_current(");
-	retention_guard = prepare == NULL ? NULL
-		: strstr(prepare, "cluster_undo_active_write_register(");
+	ensure = prepare == NULL ? NULL : strstr(prepare, "cluster_undo_record_ensure_block0_current(");
+	retention_guard
+		= prepare == NULL ? NULL : strstr(prepare, "cluster_undo_active_write_register(");
 	consume_claim = consume == NULL ? NULL : strstr(consume, "claim_undo_extent(");
-	consume_ensure = consume == NULL ? NULL
-		: strstr(consume,
-			"cluster_undo_block0_current_live_owner_ensure_resident_exact(");
-	consume_extend = consume == NULL ? NULL
-		: strstr(consume, "cluster_undo_segment_extend_or_create(");
-	consume_read = consume == NULL ? NULL
-		: strstr(consume, "read_undo_block(");
+	consume_ensure
+		= consume == NULL
+			  ? NULL
+			  : strstr(consume, "cluster_undo_block0_current_live_owner_ensure_resident_exact(");
+	consume_extend
+		= consume == NULL ? NULL : strstr(consume, "cluster_undo_segment_extend_or_create(");
+	consume_read = consume == NULL ? NULL : strstr(consume, "read_undo_block(");
 
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(prepare_end);
@@ -1570,8 +1554,8 @@ UT_TEST(test_record_prepare_owns_extent_and_block0_slow_paths)
 	UT_ASSERT_NOT_NULL(retention_guard);
 	if (prepare != NULL && prepare_end != NULL && claim != NULL && ensure != NULL
 		&& retention_guard != NULL)
-		UT_ASSERT(prepare < retention_guard && retention_guard < claim
-				  && claim < ensure && ensure < prepare_end);
+		UT_ASSERT(prepare < retention_guard && retention_guard < claim && claim < ensure
+				  && ensure < prepare_end);
 	UT_ASSERT(consume_claim == NULL || consume_claim >= consume_end);
 	UT_ASSERT(consume_ensure == NULL || consume_ensure >= consume_end);
 	UT_ASSERT(consume_extend == NULL || consume_extend >= consume_end);
@@ -1596,19 +1580,22 @@ UT_TEST(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation)
 	if (source == NULL)
 		return;
 	preflight = strstr(source, "\ncluster_undo_record_consume_preflight(");
-	preflight_end = preflight == NULL ? NULL
-		: strstr(preflight,
-			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
+	preflight_end = preflight == NULL
+						? NULL
+						: strstr(preflight, "\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_"
+											"record_consume_prepared(");
 	consume = preflight_end;
-	consume_end = consume == NULL ? NULL
-		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
-	recheck = preflight == NULL ? NULL
-		: strstr(preflight,
-			"cluster_undo_block0_current_live_owner_publication_recheck_conditional(");
-	extent_match = preflight == NULL ? NULL
-		: strstr(preflight, "cluster_undo_record_receipt_extent_matches(");
-	first_mutation = consume == NULL ? NULL
-		: strstr(consume, "cluster_scn_advance(");
+	consume_end
+		= consume == NULL ? NULL : strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	recheck
+		= preflight == NULL
+			  ? NULL
+			  : strstr(preflight,
+					   "cluster_undo_block0_current_live_owner_publication_recheck_conditional(");
+	extent_match = preflight == NULL
+					   ? NULL
+					   : strstr(preflight, "cluster_undo_record_receipt_extent_matches(");
+	first_mutation = consume == NULL ? NULL : strstr(consume, "cluster_scn_advance(");
 
 	UT_ASSERT_NOT_NULL(preflight);
 	UT_ASSERT_NOT_NULL(preflight_end);
@@ -1617,12 +1604,11 @@ UT_TEST(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation)
 	UT_ASSERT_NOT_NULL(recheck);
 	UT_ASSERT_NOT_NULL(extent_match);
 	UT_ASSERT_NOT_NULL(first_mutation);
-	if (preflight != NULL && preflight_end != NULL && consume != NULL
-		&& consume_end != NULL && recheck != NULL && extent_match != NULL
-		&& first_mutation != NULL)
-		UT_ASSERT(preflight < extent_match && extent_match < recheck
-				  && recheck < preflight_end && preflight_end == consume
-				  && consume < first_mutation && first_mutation < consume_end);
+	if (preflight != NULL && preflight_end != NULL && consume != NULL && consume_end != NULL
+		&& recheck != NULL && extent_match != NULL && first_mutation != NULL)
+		UT_ASSERT(preflight < extent_match && extent_match < recheck && recheck < preflight_end
+				  && preflight_end == consume && consume < first_mutation
+				  && first_mutation < consume_end);
 	free(source);
 }
 
@@ -1649,37 +1635,35 @@ UT_TEST(test_prepared_consume_lock_precedes_first_receipt_apply)
 	const char *boundary_preflight;
 	const char *first_apply;
 
-	if (record_source == NULL || heap_source == NULL)
-	{
+	if (record_source == NULL || heap_source == NULL) {
 		free(record_source);
 		free(heap_source);
 		return;
 	}
-	preflight = strstr(record_source,
-		"\ncluster_undo_record_consume_preflight(");
-	preflight_end = preflight == NULL ? NULL
-		: strstr(preflight,
-			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
-	conditional_lock = preflight == NULL ? NULL
-		: strstr(preflight, "cluster_undo_buf_lock_ref_conditional(");
+	preflight = strstr(record_source, "\ncluster_undo_record_consume_preflight(");
+	preflight_end = preflight == NULL
+						? NULL
+						: strstr(preflight, "\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_"
+											"record_consume_prepared(");
+	conditional_lock
+		= preflight == NULL ? NULL : strstr(preflight, "cluster_undo_buf_lock_ref_conditional(");
 	consume = preflight_end;
-	consume_end = consume == NULL ? NULL
-		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
-	locked_install = consume == NULL ? NULL
-		: strstr(consume,
-			"cluster_undo_record_install_prepared_resident_locked(");
-	late_conditional = consume == NULL ? NULL
-		: strstr(consume, "cluster_undo_buf_lock_ref_conditional(");
+	consume_end
+		= consume == NULL ? NULL : strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	locked_install = consume == NULL
+						 ? NULL
+						 : strstr(consume, "cluster_undo_record_install_prepared_resident_locked(");
+	late_conditional
+		= consume == NULL ? NULL : strstr(consume, "cluster_undo_buf_lock_ref_conditional(");
 
 	boundary = strstr(heap_source, "/* One caller-owned final boundary.");
-	boundary = boundary == NULL ? NULL
-		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
-	boundary_end = boundary == NULL ? NULL
-		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
-	boundary_preflight = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_undo_record_consume_preflight(");
-	first_apply = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+	boundary
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	boundary_preflight
+		= boundary == NULL ? NULL : strstr(boundary, "cluster_undo_record_consume_preflight(");
+	first_apply
+		= boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
 
 	UT_ASSERT_NOT_NULL(preflight);
 	UT_ASSERT_NOT_NULL(preflight_end);
@@ -1692,16 +1676,13 @@ UT_TEST(test_prepared_consume_lock_precedes_first_receipt_apply)
 	UT_ASSERT_NOT_NULL(boundary_end);
 	UT_ASSERT_NOT_NULL(boundary_preflight);
 	UT_ASSERT_NOT_NULL(first_apply);
-	if (preflight != NULL && preflight_end != NULL
-		&& conditional_lock != NULL)
-		UT_ASSERT(preflight < conditional_lock
-				  && conditional_lock < preflight_end);
+	if (preflight != NULL && preflight_end != NULL && conditional_lock != NULL)
+		UT_ASSERT(preflight < conditional_lock && conditional_lock < preflight_end);
 	if (consume != NULL && consume_end != NULL && locked_install != NULL)
 		UT_ASSERT(consume < locked_install && locked_install < consume_end);
-	if (boundary != NULL && boundary_end != NULL
-		&& boundary_preflight != NULL && first_apply != NULL)
-		UT_ASSERT(boundary < boundary_preflight
-				  && boundary_preflight < first_apply
+	if (boundary != NULL && boundary_end != NULL && boundary_preflight != NULL
+		&& first_apply != NULL)
+		UT_ASSERT(boundary < boundary_preflight && boundary_preflight < first_apply
 				  && first_apply < boundary_end);
 
 	free(record_source);
@@ -1738,50 +1719,48 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 
 	if (source == NULL)
 		return;
-	prepare_helper = strstr(source,
-		"\ncluster_heap_itl_prepare_prepared_undo(");
+	prepare_helper = strstr(source, "\ncluster_heap_itl_prepare_prepared_undo(");
 	prepare_end = prepare_helper == NULL ? NULL : strstr(prepare_helper, "\n}\n");
-	ensure = prepare_helper == NULL ? NULL
-		: strstr(prepare_helper,
-			"cluster_heap_itl_ensure_capacity_with_terminal_census(");
-	prepare_guard = prepare_helper == NULL ? NULL
-		: strstr(prepare_helper, "cluster_heap_dml_authority_guard_capture(");
-	prepare_receipt_recheck = prepare_helper == NULL ? NULL
-		: strstr(prepare_helper, "cluster_undo_record_prepared_recheck(");
+	ensure = prepare_helper == NULL
+				 ? NULL
+				 : strstr(prepare_helper, "cluster_heap_itl_ensure_capacity_with_terminal_census(");
+	prepare_guard = prepare_helper == NULL
+						? NULL
+						: strstr(prepare_helper, "cluster_heap_dml_authority_guard_capture(");
+	prepare_receipt_recheck = prepare_helper == NULL
+								  ? NULL
+								  : strstr(prepare_helper, "cluster_undo_record_prepared_recheck(");
 
-	plan_helper = strstr(source,
-		"\ncluster_heap_itl_plan_prepared_undo_target(");
-	plan_end = plan_helper == NULL ? NULL
-		: strstr(plan_helper, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
-	plan_guard = plan_helper == NULL ? NULL
-		: strstr(plan_helper, "cluster_heap_dml_authority_guard_capture(");
-	plan_receipt_recheck = plan_helper == NULL ? NULL
-		: strstr(plan_helper, "cluster_undo_record_prepared_recheck(");
-	alloc_once = plan_helper == NULL ? NULL
-		: strstr(plan_helper, "cluster_heap_itl_alloc_once(");
-	bind_slot = plan_helper == NULL ? NULL
-		: strstr(plan_helper, "cluster_heap_dml_authority_guard_bind_itl_slot(");
-	plan_guard_recheck = bind_slot == NULL ? NULL
-		: strstr(bind_slot, "cluster_heap_dml_authority_guard_recheck(");
+	plan_helper = strstr(source, "\ncluster_heap_itl_plan_prepared_undo_target(");
+	plan_end
+		= plan_helper == NULL ? NULL : strstr(plan_helper, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
+	plan_guard = plan_helper == NULL
+					 ? NULL
+					 : strstr(plan_helper, "cluster_heap_dml_authority_guard_capture(");
+	plan_receipt_recheck
+		= plan_helper == NULL ? NULL : strstr(plan_helper, "cluster_undo_record_prepared_recheck(");
+	alloc_once = plan_helper == NULL ? NULL : strstr(plan_helper, "cluster_heap_itl_alloc_once(");
+	bind_slot = plan_helper == NULL
+					? NULL
+					: strstr(plan_helper, "cluster_heap_dml_authority_guard_bind_itl_slot(");
+	plan_guard_recheck
+		= bind_slot == NULL ? NULL : strstr(bind_slot, "cluster_heap_dml_authority_guard_recheck(");
 
 	boundary = strstr(source, "/* One caller-owned final boundary.");
-	boundary = boundary == NULL ? NULL
-		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
-	boundary_end = boundary == NULL ? NULL
-		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
-	boundary_recheck = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_undo_target_recheck(");
-	boundary_apply = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
-	consume = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_consume_undo(");
-	typed_retry = strstr(source,
-		"CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
-	prepare_retry_route = prepare_helper == NULL ? NULL
-		: strstr(prepare_helper,
-			"CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
-	update_retry_route = strstr(source,
-		"old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
+	boundary
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	boundary_recheck
+		= boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_undo_target_recheck(");
+	boundary_apply
+		= boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+	consume = boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_consume_undo(");
+	typed_retry = strstr(source, "CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
+	prepare_retry_route = prepare_helper == NULL
+							  ? NULL
+							  : strstr(prepare_helper, "CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
+	update_retry_route
+		= strstr(source, "old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY");
 
 	UT_ASSERT_NOT_NULL(prepare_helper);
 	UT_ASSERT_NOT_NULL(prepare_end);
@@ -1803,25 +1782,20 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 	UT_ASSERT_NOT_NULL(typed_retry);
 	UT_ASSERT_NOT_NULL(prepare_retry_route);
 	UT_ASSERT_NOT_NULL(update_retry_route);
-	if (prepare_helper != NULL && prepare_end != NULL && ensure != NULL
-		&& prepare_guard != NULL && prepare_receipt_recheck != NULL)
+	if (prepare_helper != NULL && prepare_end != NULL && ensure != NULL && prepare_guard != NULL
+		&& prepare_receipt_recheck != NULL)
 		UT_ASSERT(prepare_helper < ensure && ensure < prepare_guard
 				  && prepare_guard < prepare_receipt_recheck
 				  && prepare_receipt_recheck < prepare_end);
 	if (plan_helper != NULL && plan_end != NULL && plan_guard != NULL
-		&& plan_receipt_recheck != NULL && alloc_once != NULL
-		&& bind_slot != NULL && plan_guard_recheck != NULL)
-		UT_ASSERT(plan_helper < plan_guard
-				  && plan_guard < plan_receipt_recheck
-				  && plan_receipt_recheck < alloc_once
-				  && alloc_once < bind_slot
-				  && bind_slot < plan_guard_recheck
-				  && plan_guard_recheck < plan_end);
-	if (boundary != NULL && boundary_end != NULL
-		&& boundary_recheck != NULL && boundary_apply != NULL
-		&& consume != NULL)
-		UT_ASSERT(boundary < boundary_recheck
-				  && boundary_recheck < boundary_apply
+		&& plan_receipt_recheck != NULL && alloc_once != NULL && bind_slot != NULL
+		&& plan_guard_recheck != NULL)
+		UT_ASSERT(plan_helper < plan_guard && plan_guard < plan_receipt_recheck
+				  && plan_receipt_recheck < alloc_once && alloc_once < bind_slot
+				  && bind_slot < plan_guard_recheck && plan_guard_recheck < plan_end);
+	if (boundary != NULL && boundary_end != NULL && boundary_recheck != NULL
+		&& boundary_apply != NULL && consume != NULL)
+		UT_ASSERT(boundary < boundary_recheck && boundary_recheck < boundary_apply
 				  && boundary_apply < consume && consume < boundary_end);
 	free(source);
 }
@@ -1831,37 +1805,29 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
  * receipt that has already crossed APPLY. */
 UT_TEST(test_ctrc_cross_page_update_requires_both_prepared_receipts)
 {
-	ClusterUndoRecordPrepareReceipt receipt = {0};
+	ClusterUndoRecordPrepareReceipt receipt = { 0 };
 
 	receipt.ctrc_pending_mask = UINT8_C(3);
 	receipt.ctrc_prepared_mask = UINT8_C(3);
 	receipt.ctrc_handles[0].valid = true;
 	receipt.ctrc_handles[1].valid = true;
-	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
+	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
 	receipt.ctrc_reuse_mask = UINT8_C(1);
-	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
+	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
 	receipt.ctrc_reuse_mask = UINT8_C(4);
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
 	receipt.ctrc_reuse_mask = 0;
 
 	receipt.ctrc_prepared_mask = UINT8_C(1);
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
 	receipt.ctrc_prepared_mask = UINT8_C(3);
 	receipt.ctrc_handles[1].valid = false;
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
 	receipt.ctrc_handles[1].valid = true;
 	receipt.ctrc_applied_mask = UINT8_C(1);
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(3)));
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, 0));
-	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
-		&receipt, UINT8_C(4)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(3)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, 0));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(&receipt, UINT8_C(4)));
 }
 
 /* The UPDATE caller must route both same-page and cross-page passes through
@@ -1883,16 +1849,12 @@ UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation
 		return;
 	update = strstr(source, "\nheap_update(");
 	update_end = update == NULL ? NULL : strstr(update, "\nheap_lock_tuple(");
-	stage = update == NULL ? NULL
-		: strstr(update, "cluster_undo_record_ctrc_stage_pending(");
-	reuse = update == NULL ? NULL
-		: strstr(update, "cluster_heap_ctrc_stage_reusable_itl_receipt(");
-	prepare = update == NULL ? NULL
-		: strstr(update, "cluster_undo_record_ctrc_prepare_pending(");
-	required = update == NULL ? NULL
-		: strstr(update, "cluster_undo_record_ctrc_required_prepared(");
-	unlock = reuse == NULL ? NULL
-		: strstr(reuse, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);");
+	stage = update == NULL ? NULL : strstr(update, "cluster_undo_record_ctrc_stage_pending(");
+	reuse = update == NULL ? NULL : strstr(update, "cluster_heap_ctrc_stage_reusable_itl_receipt(");
+	prepare = update == NULL ? NULL : strstr(update, "cluster_undo_record_ctrc_prepare_pending(");
+	required
+		= update == NULL ? NULL : strstr(update, "cluster_undo_record_ctrc_required_prepared(");
+	unlock = reuse == NULL ? NULL : strstr(reuse, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);");
 
 	UT_ASSERT_NOT_NULL(update);
 	UT_ASSERT_NOT_NULL(update_end);
@@ -1901,10 +1863,10 @@ UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(required);
 	UT_ASSERT_NOT_NULL(unlock);
-	if (update != NULL && update_end != NULL && stage != NULL && reuse != NULL
-		&& prepare != NULL && required != NULL && unlock != NULL)
-		UT_ASSERT(update < stage && stage < reuse && reuse < required
-			&& required < unlock && unlock < prepare && prepare < update_end);
+	if (update != NULL && update_end != NULL && stage != NULL && reuse != NULL && prepare != NULL
+		&& required != NULL && unlock != NULL)
+		UT_ASSERT(update < stage && stage < reuse && reuse < required && required < unlock
+				  && unlock < prepare && prepare < update_end);
 	free(source);
 }
 
@@ -1918,23 +1880,17 @@ UT_TEST(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix)
 	char *xlog_source = read_source_file(UNDO_XLOG_SOURCE_PATH);
 	char *format_header = read_source_file(TT_SLOT_HEADER_PATH);
 
-	if (xlog_header == NULL || xlog_source == NULL || format_header == NULL)
-	{
+	if (xlog_header == NULL || xlog_source == NULL || format_header == NULL) {
 		free(xlog_header);
 		free(xlog_source);
 		free(format_header);
 		return;
 	}
-	UT_ASSERT_NOT_NULL(strstr(xlog_header,
-		"XLOG_UNDO_TT_SLOT_CTRC_RELEASE"));
-	UT_ASSERT_NOT_NULL(strstr(xlog_header,
-		"xl_undo_tt_slot_ctrc_release_v1"));
-	UT_ASSERT_NOT_NULL(strstr(xlog_source,
-		"cluster_undo_xlog_insert_tt_ctrc_release"));
-	UT_ASSERT_NOT_NULL(strstr(xlog_source,
-		"cluster_tt_durable_redo_ctrc_release_slot_exact"));
-	UT_ASSERT_NOT_NULL(strstr(format_header,
-		"TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_header, "XLOG_UNDO_TT_SLOT_CTRC_RELEASE"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_header, "xl_undo_tt_slot_ctrc_release_v1"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_source, "cluster_undo_xlog_insert_tt_ctrc_release"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_source, "cluster_tt_durable_redo_ctrc_release_slot_exact"));
+	UT_ASSERT_NOT_NULL(strstr(format_header, "TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
 	free(xlog_header);
 	free(xlog_source);
 	free(format_header);
@@ -1966,20 +1922,16 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 	if (source == NULL)
 		return;
 	helper = strstr(source, "\ncluster_heap_prepare_undo_record_exact(");
-	helper_end = helper == NULL ? NULL
-		: strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
-	deadline = helper == NULL ? NULL
-		: strstr(helper, "uint64 absolute_deadline_us");
-	prepare_call = helper == NULL ? NULL
-		: strstr(helper, "cluster_heap_prepare_undo_record_call(");
-	production_alias = strstr(source,
-		"#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare");
-	ready = helper == NULL ? NULL
-		: strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_READY");
-	retry = helper == NULL ? NULL
-		: strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED");
-	refused = helper == NULL ? NULL
-		: strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_REFUSED");
+	helper_end = helper == NULL
+					 ? NULL
+					 : strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
+	deadline = helper == NULL ? NULL : strstr(helper, "uint64 absolute_deadline_us");
+	prepare_call = helper == NULL ? NULL : strstr(helper, "cluster_heap_prepare_undo_record_call(");
+	production_alias = strstr(
+		source, "#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare");
+	ready = helper == NULL ? NULL : strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_READY");
+	retry = helper == NULL ? NULL : strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED");
+	refused = helper == NULL ? NULL : strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_REFUSED");
 	interrupts = helper == NULL ? NULL : strstr(helper, "CHECK_FOR_INTERRUPTS()");
 
 	UT_ASSERT_NOT_NULL(helper);
@@ -1991,24 +1943,18 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 	UT_ASSERT_NOT_NULL(retry);
 	UT_ASSERT_NOT_NULL(refused);
 	UT_ASSERT_NOT_NULL(interrupts);
-	if (helper != NULL && helper_end != NULL && deadline != NULL
-		&& prepare_call != NULL && ready != NULL && retry != NULL
-		&& refused != NULL && interrupts != NULL)
-		UT_ASSERT(helper < deadline && deadline < prepare_call
-				  && prepare_call < ready && ready < retry && retry < refused
-				  && refused < interrupts && interrupts < helper_end);
+	if (helper != NULL && helper_end != NULL && deadline != NULL && prepare_call != NULL
+		&& ready != NULL && retry != NULL && refused != NULL && interrupts != NULL)
+		UT_ASSERT(helper < deadline && deadline < prepare_call && prepare_call < ready
+				  && ready < retry && retry < refused && refused < interrupts
+				  && interrupts < helper_end);
 
-	for (hit = source;
-		 (hit = strstr(hit, "cluster_heap_prepare_undo_record_exact(")) != NULL;
+	for (hit = source; (hit = strstr(hit, "cluster_heap_prepare_undo_record_exact(")) != NULL;
 		 hit++)
 		helper_mentions++;
-	for (hit = source;
-		 (hit = strstr(hit, "cluster_heap_prepare_undo_record_call(")) != NULL;
-		 hit++)
+	for (hit = source; (hit = strstr(hit, "cluster_heap_prepare_undo_record_call(")) != NULL; hit++)
 		wrapper_calls++;
-	for (hit = source;
-		 (hit = strstr(hit, "cluster_undo_record_prepare(")) != NULL;
-		 hit++)
+	for (hit = source; (hit = strstr(hit, "cluster_undo_record_prepare(")) != NULL; hit++)
 		raw_prepare_calls++;
 	/* Definition + retry wrapper + unit seam + five initial producer sites.
 	 * Existing retry sites now preserve READY through their dedicated owner. */
@@ -2043,30 +1989,22 @@ UT_TEST(test_inlock_consume_preserves_retry_required_for_heap_unwind)
 		return;
 	result_enum = strstr(source, "typedef enum ClusterHeapPreparedUndoResult");
 	plan = strstr(source, "\ncluster_heap_itl_plan_prepared_undo_target(");
-	plan_end = plan == NULL ? NULL
-		: strstr(plan, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
-	recheck = plan == NULL ? NULL
-		: strstr(plan, "cluster_undo_record_prepared_recheck(");
-	alloc_once = plan == NULL ? NULL
-		: strstr(plan, "cluster_heap_itl_alloc_once(");
-	retry_result = plan == NULL ? NULL
-		: strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED");
-	refused_result = plan == NULL ? NULL
-		: strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_REFUSED");
+	plan_end = plan == NULL ? NULL : strstr(plan, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
+	recheck = plan == NULL ? NULL : strstr(plan, "cluster_undo_record_prepared_recheck(");
+	alloc_once = plan == NULL ? NULL : strstr(plan, "cluster_heap_itl_alloc_once(");
+	retry_result = plan == NULL ? NULL : strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED");
+	refused_result = plan == NULL ? NULL : strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_REFUSED");
 
 	boundary = strstr(source, "/* One caller-owned final boundary.");
-	boundary = boundary == NULL ? NULL
-		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
-	boundary_end = boundary == NULL ? NULL
-		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
-	preflight = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_undo_record_consume_preflight(");
-	apply = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
-	consume = boundary == NULL ? NULL
-		: strstr(boundary, "cluster_heap_boundary_consume_undo(");
-	zero_apply_result = boundary == NULL ? NULL
-		: strstr(boundary, "CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY");
+	boundary
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	preflight
+		= boundary == NULL ? NULL : strstr(boundary, "cluster_undo_record_consume_preflight(");
+	apply = boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+	consume = boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_consume_undo(");
+	zero_apply_result
+		= boundary == NULL ? NULL : strstr(boundary, "CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY");
 
 	UT_ASSERT_NOT_NULL(result_enum);
 	UT_ASSERT_NOT_NULL(plan);
@@ -2081,14 +2019,13 @@ UT_TEST(test_inlock_consume_preserves_retry_required_for_heap_unwind)
 	UT_ASSERT_NOT_NULL(apply);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(zero_apply_result);
-	if (plan != NULL && plan_end != NULL && recheck != NULL
-		&& alloc_once != NULL && retry_result != NULL && refused_result != NULL)
-		UT_ASSERT(plan < recheck && recheck < alloc_once
-				  && retry_result < plan_end && refused_result < plan_end);
-	if (boundary != NULL && boundary_end != NULL && preflight != NULL
-		&& apply != NULL && consume != NULL && zero_apply_result != NULL)
-		UT_ASSERT(boundary < zero_apply_result
-				  && zero_apply_result < preflight && preflight < apply
+	if (plan != NULL && plan_end != NULL && recheck != NULL && alloc_once != NULL
+		&& retry_result != NULL && refused_result != NULL)
+		UT_ASSERT(plan < recheck && recheck < alloc_once && retry_result < plan_end
+				  && refused_result < plan_end);
+	if (boundary != NULL && boundary_end != NULL && preflight != NULL && apply != NULL
+		&& consume != NULL && zero_apply_result != NULL)
+		UT_ASSERT(boundary < zero_apply_result && zero_apply_result < preflight && preflight < apply
 				  && apply < consume && consume < boundary_end);
 	free(source);
 }
@@ -2112,35 +2049,26 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 	if (source == NULL)
 		return;
 	helper = strstr(source, "\ncluster_heap_prepare_undo_record_exact(");
-	helper_end = helper == NULL ? NULL
-		: strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
-	deadline_parameter = helper == NULL ? NULL
-		: strstr(helper, "uint64 absolute_deadline_us");
+	helper_end = helper == NULL
+					 ? NULL
+					 : strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
+	deadline_parameter = helper == NULL ? NULL : strstr(helper, "uint64 absolute_deadline_us");
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
 	UT_ASSERT_NOT_NULL(deadline_parameter);
-	if (helper != NULL && helper_end != NULL && deadline_parameter != NULL)
-	{
+	if (helper != NULL && helper_end != NULL && deadline_parameter != NULL) {
 		UT_ASSERT(deadline_parameter < helper_end);
-		UT_ASSERT(strstr(helper,
-			"cluster_undo_record_prepare_deadline_us()") == NULL
-			|| strstr(helper, "cluster_undo_record_prepare_deadline_us()")
-				>= helper_end);
+		UT_ASSERT(strstr(helper, "cluster_undo_record_prepare_deadline_us()") == NULL
+				  || strstr(helper, "cluster_undo_record_prepare_deadline_us()") >= helper_end);
 	}
 
-	for (hit = source;
-		 (hit = strstr(hit,
-			"cluster_undo_record_ctrc_prepare_pending(")) != NULL;
+	for (hit = source; (hit = strstr(hit, "cluster_undo_record_ctrc_prepare_pending(")) != NULL;
 		 hit++)
 		ctrc_prepare_sites++;
-	for (hit = source;
-		 (hit = strstr(hit, "cluster_undo_record_cancel_prepared(")) != NULL;
-		 hit++)
+	for (hit = source; (hit = strstr(hit, "cluster_undo_record_cancel_prepared(")) != NULL; hit++)
 		cancel_sites++;
-	for (hit = source;
-		 (hit = strstr(hit, "undo_prepare_deadline_us")) != NULL;
-		 hit++)
+	for (hit = source; (hit = strstr(hit, "undo_prepare_deadline_us")) != NULL; hit++)
 		deadline_locals++;
 
 	/* Each heap DML family prepares its CTRC receipt only after dropping the
@@ -2183,25 +2111,22 @@ UT_TEST(test_prepared_consumer_excludes_only_cluster_undo_slow_paths)
 	if (source == NULL)
 		return;
 	preflight = strstr(source, "\ncluster_undo_record_consume_preflight(");
-	consume = preflight == NULL ? NULL
-		: strstr(preflight, "\ncluster_undo_record_consume_prepared(");
-	consume_end = consume == NULL ? NULL
-		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	consume
+		= preflight == NULL ? NULL : strstr(preflight, "\ncluster_undo_record_consume_prepared(");
+	consume_end
+		= consume == NULL ? NULL : strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
 	UT_ASSERT_NOT_NULL(preflight);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(consume_end);
-	if (preflight != NULL && consume != NULL && consume_end != NULL)
-	{
-		for (i = 0; i < lengthof(forbidden); i++)
-		{
+	if (preflight != NULL && consume != NULL && consume_end != NULL) {
+		for (i = 0; i < lengthof(forbidden); i++) {
 			const char *hit = strstr(preflight, forbidden[i]);
 
 			UT_ASSERT(hit == NULL || hit >= consume_end);
 		}
-		UT_ASSERT_NOT_NULL(strstr(preflight,
-			"cluster_undo_buf_lock_ref_conditional("));
-		UT_ASSERT_NOT_NULL(strstr(consume,
-			"cluster_undo_record_install_prepared_resident_locked("));
+		UT_ASSERT_NOT_NULL(strstr(preflight, "cluster_undo_buf_lock_ref_conditional("));
+		UT_ASSERT_NOT_NULL(
+			strstr(consume, "cluster_undo_record_install_prepared_resident_locked("));
 	}
 	free(source);
 }
@@ -2224,12 +2149,11 @@ UT_TEST(test_prepared_receipt_is_single_use_and_exactly_cancelable)
 	prepare = strstr(source, "\ncluster_undo_record_prepare(");
 	cancel = strstr(source, "\ncluster_undo_record_cancel_prepared(");
 	consume = strstr(source, "\ncluster_undo_record_consume_prepared(");
-	sequence_publish = prepare == NULL ? NULL
-		: strstr(prepare, "receipt->reservation_sequence =");
-	cancel_match = cancel == NULL ? NULL
-		: strstr(cancel, "reservation_sequence");
-	consume_invalidate = consume == NULL ? NULL
-		: strstr(consume, "cluster_undo_record_reservation.active = false;");
+	sequence_publish = prepare == NULL ? NULL : strstr(prepare, "receipt->reservation_sequence =");
+	cancel_match = cancel == NULL ? NULL : strstr(cancel, "reservation_sequence");
+	consume_invalidate = consume == NULL
+							 ? NULL
+							 : strstr(consume, "cluster_undo_record_reservation.active = false;");
 
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(cancel);
@@ -2266,16 +2190,18 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	recheck = prepare_end;
 	recheck_end = recheck == NULL ? NULL : strstr(recheck, "\n}\n");
 	cancel = strstr(source, "\ncluster_undo_record_cancel_prepared(");
-	cancel_end = cancel == NULL ? NULL
-		: strstr(cancel,
-			"\n}\n\n\nClusterUndoRecordConsumePreflightResult\ncluster_undo_record_consume_preflight(");
+	cancel_end = cancel == NULL
+					 ? NULL
+					 : strstr(cancel, "\n}\n\n\nClusterUndoRecordConsumePreflightResult\ncluster_"
+									  "undo_record_consume_preflight(");
 	preflight = cancel_end;
-	preflight_end = preflight == NULL ? NULL
-		: strstr(preflight,
-			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
+	preflight_end = preflight == NULL
+						? NULL
+						: strstr(preflight, "\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_"
+											"record_consume_prepared(");
 	consume = preflight_end;
-	consume_end = consume == NULL ? NULL
-		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	consume_end
+		= consume == NULL ? NULL : strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
 
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(prepare_end);
@@ -2287,51 +2213,37 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	UT_ASSERT_NOT_NULL(preflight_end);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(consume_end);
-	if (prepare != NULL && prepare_end != NULL)
-	{
-		const char *enter = strstr(prepare,
-			"cluster_semantic_activation_modifier_enter(");
+	if (prepare != NULL && prepare_end != NULL) {
+		const char *enter = strstr(prepare, "cluster_semantic_activation_modifier_enter(");
 		const char *freeze = strstr(prepare, "modifier_admission");
 
 		UT_ASSERT(enter != NULL && enter < prepare_end);
 		UT_ASSERT(freeze != NULL && freeze < prepare_end);
 	}
-	if (recheck != NULL && recheck_end != NULL)
-	{
-		const char *exact = strstr(recheck,
-			"cluster_semantic_activation_modifier_recheck(");
+	if (recheck != NULL && recheck_end != NULL) {
+		const char *exact = strstr(recheck, "cluster_semantic_activation_modifier_recheck(");
 
 		UT_ASSERT(exact != NULL && exact < recheck_end);
-		UT_ASSERT(strstr(recheck, "cluster_undo_record_prepare_deadline_us(")
-			== NULL);
+		UT_ASSERT(strstr(recheck, "cluster_undo_record_prepare_deadline_us(") == NULL);
 	}
-	if (cancel != NULL && cancel_end != NULL)
-	{
-		const char *leave = strstr(cancel,
-			"cluster_semantic_activation_leave(");
+	if (cancel != NULL && cancel_end != NULL) {
+		const char *leave = strstr(cancel, "cluster_semantic_activation_leave(");
 
 		UT_ASSERT(leave != NULL && leave < cancel_end);
 	}
-	if (preflight != NULL && preflight_end != NULL)
-	{
-		const char *exact = strstr(preflight,
-			"cluster_semantic_activation_modifier_recheck(");
+	if (preflight != NULL && preflight_end != NULL) {
+		const char *exact = strstr(preflight, "cluster_semantic_activation_modifier_recheck(");
 
 		UT_ASSERT(exact != NULL && exact < preflight_end);
-		UT_ASSERT(strstr(preflight,
-			"cluster_undo_record_prepare_deadline_us(") == NULL);
+		UT_ASSERT(strstr(preflight, "cluster_undo_record_prepare_deadline_us(") == NULL);
 	}
-	if (consume != NULL && consume_end != NULL)
-	{
-		const char *leave = strstr(consume,
-			"cluster_semantic_activation_leave(");
-		const char *enter = strstr(consume,
-			"cluster_semantic_activation_modifier_enter(");
+	if (consume != NULL && consume_end != NULL) {
+		const char *leave = strstr(consume, "cluster_semantic_activation_leave(");
+		const char *enter = strstr(consume, "cluster_semantic_activation_modifier_enter(");
 
 		UT_ASSERT(leave != NULL && leave < consume_end);
 		UT_ASSERT(enter == NULL || enter >= consume_end);
-		UT_ASSERT(strstr(consume, "cluster_undo_record_prepare_deadline_us(")
-			== NULL);
+		UT_ASSERT(strstr(consume, "cluster_undo_record_prepare_deadline_us(") == NULL);
 	}
 	free(source);
 }
@@ -2341,12 +2253,10 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
  * bytes; applying it must preserve that concurrent canonical slot. */
 UT_TEST(test_lifecycle_bitmap_update_preserves_concurrent_canonical_tt_slot)
 {
-	UndoSegmentHeaderData *disk
-		= (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 	TTSlot expected;
 
-	undo_test_make_header(1, 1, SEGMENT_ACTIVE,
-		undo_test_lifecycle_disk.data);
+	undo_test_make_header(1, 1, SEGMENT_ACTIVE, undo_test_lifecycle_disk.data);
 	memset(&expected, 0, sizeof(expected));
 	expected.status = TT_SLOT_ACTIVE;
 	expected.xid = (TransactionId)700;
@@ -2365,13 +2275,11 @@ UT_TEST(test_lifecycle_bitmap_update_preserves_concurrent_canonical_tt_slot)
  * image back over the canonical authority. */
 UT_TEST(test_record_segment_seal_preserves_concurrent_canonical_tt_slot)
 {
-	UndoSegmentHeaderData *disk
-		= (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 	TTSlot expected;
 
 	undo_test_reset_record_shmem();
-	undo_test_make_header(1, 1, SEGMENT_COMMITTED,
-		undo_test_lifecycle_disk.data);
+	undo_test_make_header(1, 1, SEGMENT_COMMITTED, undo_test_lifecycle_disk.data);
 	memset(&expected, 0, sizeof(expected));
 	expected.status = TT_SLOT_ACTIVE;
 	expected.xid = (TransactionId)700;
@@ -2382,6 +2290,39 @@ UT_TEST(test_record_segment_seal_preserves_concurrent_canonical_tt_slot)
 	cluster_undo_try_mark_record_segment_committed(1, 1, (SCN)42);
 	UT_ASSERT_EQ(memcmp(&disk->tt_slots[7], &expected, sizeof(expected)), 0);
 	UT_ASSERT_EQ((long long)UndoSegmentHeader_record_seal_upper_scn(disk), 42LL);
+}
+
+/* The six-gate predicate is covered by the real retention suite. Here its
+ * result is the runtime seam: exercise the real record-owner publication. */
+UT_TEST(test_record_drain_owner_stamps_only_after_gate)
+{
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	PGAlignedBlock retained;
+
+	undo_test_reset_record_shmem();
+	undo_test_make_header(2, 1, SEGMENT_ACTIVE, undo_test_lifecycle_disk.data);
+	UndoSegmentHeader_set_record_seal_upper_scn(disk, 42);
+	undo_test_drain_allowed = false;
+	memcpy(retained.data, disk, BLCKSZ);
+	cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
+	UT_ASSERT_EQ(memcmp(retained.data, disk, BLCKSZ), 0);
+	undo_test_drain_allowed = true;
+	cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
+	undo_test_drain_allowed = false;
+	UT_ASSERT_EQ(disk->segment_state, SEGMENT_COMMITTED);
+	UT_ASSERT_EQ(UndoSegmentHeader_record_seal_upper_scn(disk), 42);
+	UT_ASSERT_EQ(UndoSegmentHeader_record_drain_upper_scn(disk), 1000);
+	memcpy(retained.data, disk, BLCKSZ);
+	cluster_undo_try_mark_record_segment_committed(2, 1, 2000);
+	UT_ASSERT_EQ(memcmp(retained.data, disk, BLCKSZ), 0);
+
+	undo_test_make_header(2, 1, SEGMENT_ACTIVE, undo_test_lifecycle_disk.data);
+	UndoSegmentHeader_set_record_seal_upper_scn(disk, 1001);
+	memcpy(retained.data, disk, BLCKSZ);
+	undo_test_drain_allowed = true;
+	cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
+	undo_test_drain_allowed = false;
+	UT_ASSERT_EQ(memcmp(retained.data, disk, BLCKSZ), 0);
 }
 
 /* Live block-zero lifecycle bytes and canonical TT slots share one
@@ -2401,20 +2342,20 @@ UT_TEST(test_live_lifecycle_writers_use_only_exact_block0_current)
 		return;
 	}
 
-	UT_ASSERT(strstr(alloc_source,
-		"write_segment_lifecycle_header_via_smgr") == NULL);
-	UT_ASSERT(strstr(record_source,
-		"cluster_undo_write_record_lifecycle_header") == NULL);
-	UT_ASSERT_NOT_NULL(strstr(alloc_source,
-		"cluster_undo_block0_current_live_owner_lifecycle_exact("));
-	UT_ASSERT_NOT_NULL(strstr(record_source,
-		"cluster_undo_block0_current_live_owner_mutate_exact("));
-	helper = strstr(alloc_source,
-		"cluster_undo_block0_current_live_owner_lifecycle_exact(");
-	ensure_resident = helper == NULL ? NULL : strstr(helper,
-		"cluster_undo_block0_current_live_owner_ensure_resident(");
-	mutate_exact = helper == NULL ? NULL : strstr(helper,
-		"cluster_undo_block0_current_live_owner_mutate_exact(");
+	UT_ASSERT(strstr(alloc_source, "write_segment_lifecycle_header_via_smgr") == NULL);
+	UT_ASSERT(strstr(record_source, "cluster_undo_write_record_lifecycle_header") == NULL);
+	UT_ASSERT_NOT_NULL(
+		strstr(alloc_source, "cluster_undo_block0_current_live_owner_lifecycle_exact("));
+	UT_ASSERT_NOT_NULL(
+		strstr(record_source, "cluster_undo_block0_current_live_owner_mutate_exact("));
+	helper = strstr(alloc_source, "cluster_undo_block0_current_live_owner_lifecycle_exact(");
+	ensure_resident
+		= helper == NULL
+			  ? NULL
+			  : strstr(helper, "cluster_undo_block0_current_live_owner_ensure_resident(");
+	mutate_exact = helper == NULL
+					   ? NULL
+					   : strstr(helper, "cluster_undo_block0_current_live_owner_mutate_exact(");
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(ensure_resident);
 	UT_ASSERT_NOT_NULL(mutate_exact);
@@ -2495,17 +2436,52 @@ UT_TEST(test_ready_receipt_survives_prepare_deadline_through_real_consume)
 		ClusterCtrcTargetV1 final_target = { 0 };
 		ClusterCtrcApplyToken token;
 		char payload[64] = { 0 };
+		uint16 payload_length;
+		UndoItlHistoryEntry history = { 0 };
 		UBA uba;
 		ClusterUndoRecordConsumePreflightResult preflight;
 
 		receipt_fixture_ready(types[i], &receipt);
 		receipt.ctrc_pending_mask = 1;
+		receipt.ctrc_pending_targets[0].block_number = 37;
+		target.locator.spcOid = 1663;
+		target.locator.dbOid = 5;
+		target.locator.relNumber = 20000;
+		target.forknum = MAIN_FORKNUM;
+		target.blockno = 37;
+		target.offnum = 1;
+		final_target.block_number = 37;
+		history.block = 37;
+		history.after_write_scn = 999;
+		history.after_kind
+			= types[i] == UNDO_RECORD_ITL ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+		if (types[i] == UNDO_RECORD_INSERT)
+			payload_length = sizeof(UndoInsertPayload);
+		else if (types[i] == UNDO_RECORD_ITL) {
+			UndoItlPayload itl = { 0 };
+
+			itl.new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+			itl.lock_xid = 700;
+			memcpy(payload, &itl, sizeof(itl));
+			payload_length = sizeof(itl);
+		} else if (types[i] == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update = { 37, 2, 32, sizeof(UndoUpdatePayload), 0 };
+
+			memcpy(payload, &update, sizeof(update));
+			payload_length = sizeof(update) + 32;
+		} else {
+			UndoDeletePayload deleted = { 32, sizeof(UndoDeletePayload), 0 };
+
+			memcpy(payload, &deleted, sizeof(deleted));
+			payload_length = sizeof(deleted) + 32;
+		}
 		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
 		receipt_clock_us = 101;
 		UT_ASSERT(cluster_undo_record_prepared_recheck(&receipt, sizeof(payload)));
 		UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
 		UT_ASSERT_EQ(receipt_prepare_calls, 1);
-		preflight = cluster_undo_record_consume_preflight(&receipt, sizeof(payload));
+		UT_ASSERT(cluster_undo_record_stage_history(&receipt, 0, &history));
+		preflight = cluster_undo_record_consume_preflight(&receipt, payload_length);
 		UT_ASSERT_EQ(preflight, CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY);
 		if (preflight != CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY) {
 			cluster_undo_record_cancel_prepared(&receipt);
@@ -2514,12 +2490,28 @@ UT_TEST(test_ready_receipt_survives_prepare_deadline_through_real_consume)
 		UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &final_target, &token),
 					 CLUSTER_CTRC_APPLY_APPLIED);
 		UT_ASSERT_EQ(
-			cluster_undo_record_consume_prepared(&receipt, &target, payload, sizeof(payload), &uba),
+			cluster_undo_record_consume_prepared(&receipt, &target, payload, payload_length, &uba),
 			CLUSTER_UNDO_RECORD_CONSUME_APPLIED);
 		UT_ASSERT(!UBA_is_invalid(uba));
 		UT_ASSERT_EQ(receipt_install_calls, 1);
 		UT_ASSERT_EQ(receipt_leave_calls, 1);
 		UT_ASSERT_EQ(receipt_unref_calls, 0); /* Reference transferred to pending WAL. */
+		{
+			const UndoSlotDirEntry *directory = UNDO_SLOT_DIR_PTR(cluster_undo_pending.buf, 0);
+			const UndoRecordHeader *stored
+				= (const UndoRecordHeader *)(cluster_undo_pending.buf + directory->record_offset);
+			UndoItlHistoryTrailer stored_history;
+			uint16 stored_body_length;
+
+			UT_ASSERT_EQ(directory->record_length,
+						 sizeof(*stored) + payload_length + sizeof(stored_history));
+			UT_ASSERT_EQ(directory->flags, stored->flags);
+			UT_ASSERT(cluster_undo_record_decode_payload(
+				stored, (const char *)stored + sizeof(*stored), stored->payload_length,
+				&stored_body_length, &stored_history));
+			UT_ASSERT_EQ(stored_body_length, payload_length);
+			UT_ASSERT_EQ(memcmp(&stored_history.entries[0], &history, sizeof(history)), 0);
+		}
 		UT_ASSERT_EQ(memcmp(&receipt, &zero, sizeof(receipt)), 0);
 		UT_ASSERT_EQ(memcmp(&cluster_undo_record_reservation.receipt, &zero, sizeof(zero)), 0);
 		UT_ASSERT(!cluster_undo_record_reservation.active);
@@ -2600,11 +2592,17 @@ UT_TEST(test_partial_apply_cancel_releases_only_unapplied_nonreuse_handle)
 	int reuse;
 
 	for (reuse = 0; reuse <= 1; reuse++) {
+		UndoItlHistoryEntry history = { 0 };
+
 		receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
 		receipt.ctrc_pending_mask = receipt.ctrc_prepared_mask = 3;
 		receipt.ctrc_reuse_mask = reuse ? 2 : 0;
 		receipt.ctrc_handles[0].valid = receipt.ctrc_handles[1].valid = true;
 		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		history.after_kind = ITL_FLAG_ACTIVE;
+		history.after_write_scn = 999;
+		UT_ASSERT(cluster_undo_record_stage_history(&receipt, 0, &history));
+		UT_ASSERT(cluster_undo_record_stage_history(&receipt, 1, &history));
 		UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token),
 					 CLUSTER_CTRC_APPLY_APPLIED);
 		cluster_undo_record_cancel_prepared(&receipt);
@@ -2872,10 +2870,312 @@ UT_TEST(test_update_vm_observation_never_repins_or_indexes_a_local_buffer)
 	free(source);
 }
 
+static void
+make_history_codec_record(UndoRecordHeader *record, char *body, UndoItlHistoryTrailer *history)
+{
+	UndoInsertPayload insert = { 32, 0 };
+
+	memset(record, 0, sizeof(*record));
+	record->record_type = UNDO_RECORD_INSERT;
+	record->flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY;
+	record->payload_length = sizeof(insert) + sizeof(*history);
+	record->xid = 100;
+	record->origin_node_id = 0;
+	record->tt_slot_segment_id = 1;
+	record->tt_slot_id = 1;
+	record->tt_wrap_plus1 = 1;
+	record->write_scn = 201;
+	record->target_locator.spcOid = 1663;
+	record->target_locator.dbOid = 5;
+	record->target_locator.relNumber = 20000;
+	record->target_fork = MAIN_FORKNUM;
+	record->target_block = 37;
+	record->target_offset = 1;
+	memset(history, 0, sizeof(*history));
+	history->magic = UNDO_ITL_HISTORY_MAGIC;
+	history->version = UNDO_ITL_HISTORY_VERSION;
+	history->count = 1;
+	history->entries[0].block = 37;
+	history->entries[0].after_kind = ITL_FLAG_ACTIVE;
+	history->entries[0].after_write_scn = 200;
+	history->entries[0].prior.wrap = 7;
+	memcpy(body, &insert, sizeof(insert));
+	memcpy(body + sizeof(insert), history, sizeof(*history));
+}
+
+UT_TEST(test_history_stage_syncs_both_receipts_and_freezes_after_apply)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UndoItlHistoryEntry entry = { 0 };
+	ClusterUndoRecordPrepareReceipt before;
+
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	entry.block = 37;
+	entry.after_kind = ITL_FLAG_ACTIVE;
+	entry.after_write_scn = 1000;
+	entry.prior.wrap = 7;
+	UT_ASSERT(cluster_undo_record_stage_history(&receipt, 0, &entry));
+	UT_ASSERT_EQ(receipt.itl_history_mask, 1);
+	UT_ASSERT_EQ(memcmp(&receipt, &cluster_undo_record_reservation.receipt, sizeof(receipt)), 0);
+	UT_ASSERT(cluster_undo_record_history_matches(&receipt, 0, &entry));
+	entry.after_write_scn++;
+	UT_ASSERT(cluster_undo_record_stage_history(&receipt, 0, &entry));
+	UT_ASSERT(cluster_undo_record_history_matches(&receipt, 0, &entry));
+	receipt.ctrc_applied_mask = 1;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	before = receipt;
+	entry.after_write_scn++;
+	UT_ASSERT(!cluster_undo_record_stage_history(&receipt, 0, &entry));
+	UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+	UT_ASSERT(!cluster_undo_record_history_matches(&receipt, 0, &entry));
+	cluster_undo_record_cancel_prepared(&receipt);
+	UT_ASSERT_EQ(receipt.itl_history_mask, 0);
+}
+
+UT_TEST(test_history_stage_rejects_unowned_target_and_tampered_receipt)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UndoItlHistoryEntry entry = { 0 };
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, &receipt);
+	entry.block = 37;
+	entry.after_kind = ITL_FLAG_ACTIVE;
+	entry.after_write_scn = 1000;
+	UT_ASSERT(!cluster_undo_record_stage_history(&receipt, 0, &entry));
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	entry.block++;
+	UT_ASSERT(!cluster_undo_record_stage_history(&receipt, 0, &entry));
+	entry.block--;
+	entry.prior.xid = 700;
+	UT_ASSERT(!cluster_undo_record_stage_history(&receipt, 0, &entry));
+	entry.prior.xid = InvalidTransactionId;
+	receipt.absolute_deadline_us++;
+	UT_ASSERT(!cluster_undo_record_stage_history(&receipt, 0, &entry));
+	receipt.absolute_deadline_us--;
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(test_history_consume_refuses_missing_metadata_before_install)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterUndoRecordTarget target = { 0 };
+	UndoInsertPayload payload = { 0 };
+	UBA uba;
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, &receipt);
+	UT_ASSERT_EQ(cluster_undo_record_consume_preflight(&receipt, sizeof(payload)),
+				 CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY);
+	UT_ASSERT_EQ(
+		cluster_undo_record_consume_prepared(&receipt, &target, &payload, sizeof(payload), &uba),
+		CLUSTER_UNDO_RECORD_CONSUME_REFUSED);
+	UT_ASSERT_EQ(receipt_install_calls, 0);
+	UT_ASSERT(UBA_is_invalid(uba));
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(test_history_planned_uba_accounts_for_footer_capacity)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, &receipt);
+	receipt.extent.cur_slot_count = 0;
+	receipt.extent.cur_free_offset
+		= BLCKSZ - sizeof(UndoSlotDirEntry) - sizeof(UndoRecordHeader) - sizeof(UndoInsertPayload);
+	cluster_undo_current_extent = receipt.extent;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	UT_ASSERT(!cluster_undo_record_prepared_uba_exact(&receipt, sizeof(UndoInsertPayload), &uba));
+	UT_ASSERT(UBA_is_invalid(uba));
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(test_history_codec_unaligned_complete_prior_and_logical_body)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoItlHistoryTrailer decoded;
+	char storage[512];
+	char *body = storage + 1;
+	uint16 length = 0;
+
+	make_history_codec_record(&record, body, &history);
+	history.entries[0].prior.xid = 90;
+	history.entries[0].prior.flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	history.entries[0].prior.commit_scn = 180;
+	history.entries[0].prior.write_scn = 150;
+	history.entries[0].prior.undo_segment_head = uba_encode(1, 7, 0, 0);
+	history.entries[0].prior.first_change_lsn = 321;
+	memcpy(body + sizeof(UndoInsertPayload), &history, sizeof(history));
+	UT_ASSERT(cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												 &decoded));
+	UT_ASSERT_EQ(length, sizeof(UndoInsertPayload));
+	UT_ASSERT_EQ(memcmp(&decoded, &history, sizeof(history)), 0);
+}
+
+UT_TEST(test_history_codec_rejects_flag_length_magic_and_reserved_drift)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoItlHistoryTrailer decoded;
+	char body[512];
+	uint16 length;
+	unsigned i;
+
+	for (i = 0; i < 10; i++) {
+		make_history_codec_record(&record, body, &history);
+		switch (i) {
+		case 0:
+			record.flags |= UNDO_REC_FLAG_CONTINUED;
+			break;
+		case 1:
+			record.flags |= UNDO_REC_FLAG_TOAST;
+			break;
+		case 2:
+			record.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+			break;
+		case 3:
+			history.magic++;
+			break;
+		case 4:
+			history.version++;
+			break;
+		case 5:
+			history.reserved = 1;
+			break;
+		case 6:
+			history.entries[0].reserved = 1;
+			break;
+		case 7:
+			history.entries[1].block = 1;
+			break;
+		case 8:
+			history.count = 0;
+			break;
+		case 9:
+			history.count = 3;
+			break;
+		}
+		memcpy(body + sizeof(UndoInsertPayload), &history, sizeof(history));
+		UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+													  &decoded));
+	}
+	make_history_codec_record(&record, body, &history);
+	UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length - 1, &length,
+												  &decoded));
+	record.payload_length = sizeof(history) - 1;
+	UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												  &decoded));
+}
+
+UT_TEST(test_history_codec_rejects_forged_slot_identity_role_and_time)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoItlHistoryTrailer decoded;
+	char body[512];
+	uint16 length;
+	unsigned i;
+
+	for (i = 0; i < 11; i++) {
+		make_history_codec_record(&record, body, &history);
+		switch (i) {
+		case 0:
+			history.entries[0].block++;
+			break;
+		case 1:
+			history.entries[0].slot_index = 8;
+			break;
+		case 2:
+			history.entries[0].after_kind = ITL_FLAG_COMMITTED;
+			break;
+		case 3:
+			history.entries[0].after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+			break;
+		case 4:
+			history.entries[0].after_write_scn = InvalidScn;
+			break;
+		case 5:
+			history.entries[0].after_write_scn = 202;
+			break;
+		case 6:
+			history.entries[0].prior.xid = 99;
+			break;
+		case 7:
+			history.entries[0].prior.flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+			break;
+		case 8:
+			history.entries[0].prior.flags = ITL_FLAG_ACTIVE;
+			break;
+		case 9:
+			history.entries[0].prior.first_change_lsn = 1;
+			break;
+		case 10:
+			history.entries[0].prior.undo_segment_head = uba_encode(1, 7, 0, 0);
+			break;
+		}
+		memcpy(body + sizeof(UndoInsertPayload), &history, sizeof(history));
+		UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+													  &decoded));
+	}
+}
+
+UT_TEST(test_history_codec_cross_page_update_requires_exactly_two_targets)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoItlHistoryTrailer decoded;
+	UndoUpdatePayload update = { 38, 2, 32, sizeof(UndoUpdatePayload), 0 };
+	char body[512];
+	uint16 length = 0;
+	Size body_length = sizeof(update) + update.old_tuple_length;
+
+	make_history_codec_record(&record, body, &history);
+	record.record_type = UNDO_RECORD_UPDATE;
+	record.payload_length = body_length + sizeof(history);
+	memset(body, 0, sizeof(body));
+	memcpy(body, &update, sizeof(update));
+	memcpy(body + body_length, &history, sizeof(history));
+	UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												  &decoded));
+	history.count = 2;
+	history.entries[1] = history.entries[0];
+	history.entries[1].block = 38;
+	memcpy(body + body_length, &history, sizeof(history));
+	UT_ASSERT(cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												 &decoded));
+	UT_ASSERT_EQ(length, body_length);
+	history.entries[1].block = 37;
+	memcpy(body + body_length, &history, sizeof(history));
+	UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												  &decoded));
+	update.new_block = 37;
+	memcpy(body, &update, sizeof(update));
+	UT_ASSERT(!cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												  &decoded));
+	history.count = 1;
+	memset(&history.entries[1], 0, sizeof(history.entries[1]));
+	memcpy(body + body_length, &history, sizeof(history));
+	UT_ASSERT(cluster_undo_record_decode_payload(&record, body, record.payload_length, &length,
+												 &decoded));
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(55);
+	UT_PLAN(64);
+	UT_RUN(test_history_consume_refuses_missing_metadata_before_install);
+	UT_RUN(test_history_planned_uba_accounts_for_footer_capacity);
+	UT_RUN(test_history_stage_syncs_both_receipts_and_freezes_after_apply);
+	UT_RUN(test_history_stage_rejects_unowned_target_and_tampered_receipt);
+	UT_RUN(test_history_codec_unaligned_complete_prior_and_logical_body);
+	UT_RUN(test_history_codec_rejects_flag_length_magic_and_reserved_drift);
+	UT_RUN(test_history_codec_rejects_forged_slot_identity_role_and_time);
+	UT_RUN(test_history_codec_cross_page_update_requires_exactly_two_targets);
 	UT_RUN(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite);
 	UT_RUN(test_update_vm_observation_never_repins_or_indexes_a_local_buffer);
 
@@ -2918,6 +3218,7 @@ main(int argc, char **argv)
 	UT_RUN(test_prepared_receipt_retains_exact_admission_until_close);
 	UT_RUN(test_lifecycle_bitmap_update_preserves_concurrent_canonical_tt_slot);
 	UT_RUN(test_record_segment_seal_preserves_concurrent_canonical_tt_slot);
+	UT_RUN(test_record_drain_owner_stamps_only_after_gate);
 	UT_RUN(test_live_lifecycle_writers_use_only_exact_block0_current);
 	UT_RUN(test_ready_receipt_survives_prepare_deadline_through_real_consume);
 	UT_RUN(test_ready_preflight_crosses_old_deadline_while_taking_lock);

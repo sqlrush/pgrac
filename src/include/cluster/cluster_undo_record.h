@@ -89,9 +89,10 @@ typedef enum UndoRecordType {
 /*
  * UndoRecordFlags -- record header flags field.
  */
-#define UNDO_REC_FLAG_FIRST_IN_TX 0x01 /* first record in this xid's undo chain */
-#define UNDO_REC_FLAG_CONTINUED 0x02   /* continued from previous block (future) */
-#define UNDO_REC_FLAG_TOAST 0x04	   /* payload references TOAST (future) */
+#define UNDO_REC_FLAG_FIRST_IN_TX 0x01	   /* first record in this xid's undo chain */
+#define UNDO_REC_FLAG_CONTINUED 0x02	   /* continued from previous block (future) */
+#define UNDO_REC_FLAG_TOAST 0x04		   /* payload references TOAST (future) */
+#define UNDO_REC_FLAG_HAS_ITL_HISTORY 0x08 /* complete prior page-slot images */
 
 
 /*
@@ -363,6 +364,207 @@ typedef struct UndoItlPayload {
 } UndoItlPayload;
 
 StaticAssertDecl(sizeof(UndoItlPayload) == 40, "UndoItlPayload must be 40B — HC217");
+
+/* Optional, explicitly flagged trailer. Copy from the unaligned payload tail
+ * before examining it. The operation body retains its original offsets. */
+#define UNDO_ITL_HISTORY_MAGIC UINT32_C(0x49544c48)
+#define UNDO_ITL_HISTORY_VERSION 1
+#define UNDO_ITL_HISTORY_TARGETS 2
+
+typedef struct UndoItlHistoryEntry {
+	BlockNumber block;
+	uint8 slot_index;
+	uint8 after_kind;
+	uint16 reserved;
+	SCN after_write_scn;
+	ClusterItlSlotData prior;
+} UndoItlHistoryEntry;
+
+typedef struct UndoItlHistoryTrailer {
+	uint32 magic;
+	uint16 version;
+	uint8 count;
+	uint8 reserved;
+	UndoItlHistoryEntry entries[UNDO_ITL_HISTORY_TARGETS];
+} UndoItlHistoryTrailer;
+
+StaticAssertDecl(sizeof(UndoItlHistoryEntry) == 64, "undo history entry is 64B");
+StaticAssertDecl(sizeof(UndoItlHistoryTrailer) == 136, "undo history trailer is 136B");
+
+#ifdef USE_PGRAC_CLUSTER
+static inline bool
+cluster_undo_history_prior_valid(const ClusterItlSlotData *prior)
+{
+	uint32 segment;
+	uint32 block;
+	uint16 tt_offset;
+	uint16 row;
+
+	if (prior->flags == ITL_FLAG_FREE) {
+		ClusterItlSlotData empty = { 0 };
+
+		empty.wrap = prior->wrap;
+		return memcmp(prior, &empty, sizeof(empty)) == 0;
+	}
+	if (prior->flags > ITL_FLAG_LOCK_ONLY_ABORTED || !TransactionIdIsNormal(prior->xid)
+		|| !SCN_VALID(prior->write_scn)
+		|| !uba_decode(prior->undo_segment_head, &segment, &block, &tt_offset, &row) || block == 0
+		|| block >= UNDO_BLOCKS_PER_SEGMENT
+		|| row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+		|| uba_origin_node_id(prior->undo_segment_head) == InvalidNodeId)
+		return false;
+	if (prior->flags == ITL_FLAG_COMMITTED || prior->flags == ITL_FLAG_NEEDS_CLEANOUT
+		|| prior->flags == ITL_FLAG_LOCK_ONLY_COMMITTED)
+		return SCN_VALID(prior->commit_scn);
+	return prior->commit_scn == InvalidScn;
+}
+
+static inline bool
+cluster_undo_record_decode_payload(const UndoRecordHeader *record, const void *payload,
+								   size_t payload_bytes, uint16 *body_length_out,
+								   UndoItlHistoryTrailer *history_out)
+{
+	UndoItlHistoryTrailer history = { 0 };
+	BlockNumber second_block = InvalidBlockNumber;
+	uint8 expected_kind = ITL_FLAG_ACTIVE;
+	size_t body_length;
+	bool has_history;
+	unsigned i;
+
+	if (body_length_out != NULL)
+		*body_length_out = 0;
+	if (history_out != NULL)
+		memset(history_out, 0, sizeof(*history_out));
+	if (record == NULL || payload == NULL || body_length_out == NULL || history_out == NULL
+		|| payload_bytes != record->payload_length
+		|| (record->flags & ~(UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY)) != 0
+		|| ((record->flags & UNDO_REC_FLAG_FIRST_IN_TX) != 0) != UBA_is_invalid(record->prev_uba))
+		return false;
+	has_history = (record->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0;
+	body_length = payload_bytes;
+	if (has_history) {
+		if (body_length < sizeof(history))
+			return false;
+		body_length -= sizeof(history);
+		memcpy(&history, (const char *)payload + body_length, sizeof(history));
+		if (history.magic != UNDO_ITL_HISTORY_MAGIC || history.version != UNDO_ITL_HISTORY_VERSION
+			|| history.reserved != 0 || history.count == 0
+			|| history.count > UNDO_ITL_HISTORY_TARGETS)
+			return false;
+	}
+	switch (record->record_type) {
+	case UNDO_RECORD_INSERT: {
+		UndoInsertPayload insert;
+
+		if (body_length != sizeof(insert))
+			return false;
+		memcpy(&insert, payload, sizeof(insert));
+		if (insert.flags != 0)
+			return false;
+		break;
+	}
+	case UNDO_RECORD_UPDATE: {
+		UndoUpdatePayload update;
+		bool absent;
+
+		if (body_length < sizeof(update))
+			return false;
+		memcpy(&update, payload, sizeof(update));
+		if (update.flags != 0 || update.old_tuple_offset != sizeof(update)
+			|| update.old_tuple_length == 0
+			|| (size_t)update.old_tuple_offset + update.old_tuple_length != body_length)
+			return false;
+		absent = update.new_block == InvalidBlockNumber && update.new_offset == InvalidOffsetNumber;
+		if (!absent) {
+			if (update.new_block == InvalidBlockNumber || !OffsetNumberIsValid(update.new_offset)
+				|| (update.new_block == record->target_block
+					&& update.new_offset == record->target_offset))
+				return false;
+			if (update.new_block != record->target_block)
+				second_block = update.new_block;
+		}
+		break;
+	}
+	case UNDO_RECORD_DELETE: {
+		UndoDeletePayload deleted;
+
+		if (body_length < sizeof(deleted))
+			return false;
+		memcpy(&deleted, payload, sizeof(deleted));
+		if (deleted.flags != 0 || deleted.full_tuple_offset != sizeof(deleted)
+			|| deleted.full_tuple_length == 0
+			|| (size_t)deleted.full_tuple_offset + deleted.full_tuple_length != body_length)
+			return false;
+		break;
+	}
+	case UNDO_RECORD_ITL: {
+		UndoItlPayload itl;
+
+		if (body_length != sizeof(itl))
+			return false;
+		memcpy(&itl, payload, sizeof(itl));
+		if (itl.itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| itl.new_flags != ITL_FLAG_LOCK_ONLY_ACTIVE || itl.lock_xid != record->xid)
+			return false;
+		expected_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		if (has_history && history.entries[0].slot_index != itl.itl_slot_idx)
+			return false;
+		break;
+	}
+	default:
+		return false;
+	}
+	if (has_history) {
+		uint32 segment;
+		uint32 block;
+		uint16 tt;
+		uint16 row;
+
+		if (record->target_block == InvalidBlockNumber
+			|| !OffsetNumberIsValid(record->target_offset)
+			|| !RelFileNumberIsValid(record->target_locator.relNumber)
+			|| record->target_fork != MAIN_FORKNUM || !SCN_VALID(record->write_scn)
+			|| !TransactionIdIsNormal(record->xid) || record->origin_node_id > SCN_MAX_VALID_NODE_ID
+			|| record->tt_slot_segment_id == 0
+			|| (record->tt_slot_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+				   != record->origin_node_id
+			|| record->tt_slot_id == 0 || record->tt_slot_id > TT_SLOTS_PER_SEGMENT
+			|| record->tt_wrap_plus1 == 0
+			|| history.count != (second_block == InvalidBlockNumber ? 1 : 2))
+			return false;
+		/* Even though page history has its own next edge, the transaction
+		 * predecessor field remains a well-formed, same-origin TT locator. */
+		if (!UBA_is_invalid(record->prev_uba)
+			&& (!uba_decode(record->prev_uba, &segment, &block, &tt, &row) || block == 0
+				|| block >= UNDO_BLOCKS_PER_SEGMENT
+				|| row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+				|| (uint32)tt + 1 != record->tt_slot_id
+				|| uba_origin_node_id(record->prev_uba) != record->origin_node_id))
+			return false;
+		for (i = 0; i < history.count; i++) {
+			const UndoItlHistoryEntry *entry = &history.entries[i];
+
+			if (entry->block != (i == 0 ? record->target_block : second_block)
+				|| entry->reserved != 0 || entry->slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+				|| entry->after_kind != expected_kind || !SCN_VALID(entry->after_write_scn)
+				|| scn_time_cmp(entry->after_write_scn, record->write_scn) > 0
+				|| !cluster_undo_history_prior_valid(&entry->prior)
+				|| (SCN_VALID(entry->prior.write_scn)
+					&& scn_time_cmp(entry->prior.write_scn, entry->after_write_scn) >= 0))
+				return false;
+		}
+		if (history.count == 1) {
+			UndoItlHistoryEntry empty = { 0 };
+
+			if (memcmp(&history.entries[1], &empty, sizeof(empty)) != 0)
+				return false;
+		}
+	}
+	*body_length_out = (uint16)body_length;
+	*history_out = history;
+	return true;
+}
+#endif
 
 
 /*

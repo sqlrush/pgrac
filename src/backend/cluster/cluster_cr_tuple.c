@@ -148,6 +148,13 @@ cluster_cr_tuple_apply_record(char *scratch_page, OffsetNumber queried_offnum,
 			*reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
 		return CR_TUPLE_APPLY_FALLBACK;
 	}
+	/* A single tuple cannot reconstruct predecessor page-slot identities.
+	 * The full-page entry uses the same history walker as the holder. */
+	if ((hdr->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0) {
+		if (reason != NULL)
+			*reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
+		return CR_TUPLE_APPLY_FALLBACK;
+	}
 
 	switch (hdr->record_type) {
 	case UNDO_RECORD_INSERT: {

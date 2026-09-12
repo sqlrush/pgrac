@@ -59,7 +59,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/access/heap/heapam.c",
             "src/backend/cluster/cluster_itl.c",
         ),
-        r"\bcluster_itl_stamp_active\s*\(",
+        r"\bcluster_itl_stamp_(?:active(?:_internal|_with_history)?|lock_active_with_history)\s*\(",
     ),
     ScanRule(
         "HEAP_ITL_REGISTER",
@@ -797,7 +797,7 @@ _classify_owners(
 _classify_owners(
     "HEAP_ITL_PUBLISH",
     "src/backend/access/heap/heapam.c",
-    ("heap_delete", "heap_insert", "heap_update"),
+    ("heap_delete", "heap_insert", "heap_update", "heap_lock_tuple", "heap_lock_updated_tuple_rec"),
     "REGISTERED_REFERENCE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",
@@ -808,7 +808,8 @@ _classify_owners(
 _classify_owners(
     "HEAP_ITL_PUBLISH",
     "src/backend/cluster/cluster_itl.c",
-    ("cluster_itl_stamp_active",),
+    ("cluster_itl_stamp_active", "cluster_itl_stamp_active_internal",
+     "cluster_itl_stamp_active_with_history", "cluster_itl_stamp_lock_active_with_history"),
     "REGISTERED_REFERENCE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",
@@ -908,17 +909,6 @@ _classify_owners(
 _classify_owners(
     "ITL_STATUS_WRITER",
     "src/backend/access/heap/heapam.c",
-    ("heap_lock_tuple", "heap_lock_updated_tuple_rec"),
-    "REGISTERED_REFERENCE",
-    "CTRC_REF_HEAP_ITL_UBA",
-    "CTRC_TARGET_EXACT_ITL_SLOT",
-    "cluster_heap_no_retry_boundary_apply",
-    "cluster_ctrc_receipt_discharge_itl_shared",
-    "MXA-T23",
-)
-_classify_owners(
-    "ITL_STATUS_WRITER",
-    "src/backend/access/heap/heapam.c",
     ("cluster_heap_itl_apply_terminal_census",),
     "TERMINAL_PROJECTION_DISCHARGE",
     "CTRC_REF_HEAP_ITL_UBA",
@@ -930,7 +920,8 @@ _classify_owners(
 _classify_owners(
     "ITL_STATUS_WRITER",
     "src/backend/cluster/cluster_itl.c",
-    ("cluster_itl_stamp_active", "cluster_itl_stamp_multixact_marker"),
+    ("cluster_itl_stamp_active_internal", "cluster_itl_stamp_lock_active_with_history",
+     "cluster_itl_stamp_multixact_marker"),
     "REGISTERED_REFERENCE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",

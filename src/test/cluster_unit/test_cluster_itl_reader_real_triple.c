@@ -700,8 +700,7 @@ UT_TEST(test_t21a_data_scan_ignores_lock_and_marker_same_xid)
 	marker->wrap = 9;
 	marker->undo_segment_head = uba_encode(1, 0, 3, 0);
 
-	UT_ASSERT_EQ(
-		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1001, &ref), 1);
+	UT_ASSERT_EQ((int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1001, &ref), 1);
 	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 12);
 	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
@@ -723,8 +722,7 @@ UT_TEST(test_t21b_data_scan_rejects_ambiguous_highest_wrap)
 	b->wrap = 4;
 	b->undo_segment_head = uba_encode(257, 0, 2, 0);
 
-	UT_ASSERT_EQ(
-		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1002, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1002, &ref), 0);
 }
 
 UT_TEST(test_t21c_data_scan_chooses_unique_highest_wrap)
@@ -743,8 +741,7 @@ UT_TEST(test_t21c_data_scan_chooses_unique_highest_wrap)
 	newer->wrap = 5;
 	newer->undo_segment_head = uba_encode(257, 0, 13, 0);
 
-	UT_ASSERT_EQ(
-		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1003, &ref), 1);
+	UT_ASSERT_EQ((int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1003, &ref), 1);
 	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 14);
 }
@@ -769,8 +766,8 @@ UT_TEST(test_t21d_data_slot_index_returns_historical_creator)
 	later_updater->wrap = 8;
 	later_updater->undo_segment_head = uba_encode(1, 0, 18, 0);
 
-	UT_ASSERT_EQ((int)cluster_itl_find_data_slot_index_by_xid(
-						page, (TransactionId)1004, &index), 1);
+	UT_ASSERT_EQ((int)cluster_itl_find_data_slot_index_by_xid(page, (TransactionId)1004, &index),
+				 1);
 	UT_ASSERT_EQ((int)index, 2);
 }
 
@@ -778,8 +775,7 @@ UT_TEST(test_t37_lock_slot_index_null_page_sets_sentinel)
 {
 	uint8 index = 3;
 
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						NULL, (TransactionId)1001, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(NULL, (TransactionId)1001, &index),
 				 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
@@ -789,8 +785,7 @@ UT_TEST(test_t38_lock_slot_index_miss_sets_sentinel)
 	Page page = build_itl_page();
 	uint8 index = 3;
 
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1002, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1002, &index),
 				 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
@@ -805,8 +800,7 @@ UT_TEST(test_t39_lock_slot_index_unique_winner)
 	slot->xid = (TransactionId)1003;
 	slot->wrap = 2;
 	slot->undo_segment_head = uba_encode(257, 3, 7, 5);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1003, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1003, &index),
 				 1);
 	UT_ASSERT_EQ((int)index, 4);
 }
@@ -826,8 +820,7 @@ UT_TEST(test_t40_lock_slot_index_chooses_highest_wrap)
 	newer->xid = (TransactionId)1004;
 	newer->wrap = 9;
 	newer->undo_segment_head = uba_encode(257, 5, 9, 7);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1004, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1004, &index),
 				 1);
 	UT_ASSERT_EQ((int)index, 6);
 }
@@ -847,8 +840,7 @@ UT_TEST(test_t41_lock_slot_index_equal_winning_wrap_is_ambiguous)
 	b->xid = (TransactionId)1005;
 	b->wrap = 10;
 	b->undo_segment_head = uba_encode(257, 7, 11, 9);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1005, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1005, &index),
 				 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
@@ -871,8 +863,7 @@ UT_TEST(test_t42_lock_slot_index_lower_wrap_duplicate_does_not_hide_winner)
 	slot_at(page, 5)->xid = (TransactionId)1006;
 	slot_at(page, 5)->wrap = 12;
 	slot_at(page, 5)->undo_segment_head = uba_encode(513, 10, 14, 12);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1006, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1006, &index),
 				 1);
 	UT_ASSERT_EQ((int)index, 5);
 }
@@ -887,10 +878,8 @@ UT_TEST(test_t43_lock_slot_index_ignores_data_and_invalid_uba)
 	slot_at(page, 0)->undo_segment_head = uba_encode(1, 11, 15, 13);
 	slot_at(page, 1)->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
 	slot_at(page, 1)->xid = (TransactionId)1007;
-	memset(&slot_at(page, 1)->undo_segment_head, 0,
-		   sizeof(slot_at(page, 1)->undo_segment_head));
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1007, &index),
+	memset(&slot_at(page, 1)->undo_segment_head, 0, sizeof(slot_at(page, 1)->undo_segment_head));
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1007, &index),
 				 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
@@ -906,13 +895,10 @@ UT_TEST(test_t44_lock_slot_index_and_old_reader_select_same_slot)
 	winner->xid = (TransactionId)1008;
 	winner->wrap = 13;
 	winner->undo_segment_head = uba_encode(257, 12, 23, 14);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, (TransactionId)1008, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, (TransactionId)1008, &index),
 				 1);
 	UT_ASSERT_EQ((int)index, 3);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_tt_ref_by_xmax(
-						page, (TransactionId)1008, &ref),
-				 1);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_tt_ref_by_xmax(page, (TransactionId)1008, &ref), 1);
 	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 24);
 	UT_ASSERT_EQ((int)winner->wrap, 13);
@@ -925,8 +911,7 @@ UT_TEST(test_t45_lock_slot_index_invalid_xid_sets_sentinel)
 	Page page = build_itl_page();
 	uint8 index = 0;
 
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						page, InvalidTransactionId, &index),
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(page, InvalidTransactionId, &index),
 				 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
@@ -937,13 +922,11 @@ UT_TEST(test_t46_lock_slot_index_page_without_itl_sets_sentinel)
 	uint8 index = 0;
 
 	memset(&page, 0, sizeof(page));
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						(Page)&page, (TransactionId)1009, &index),
-				 0);
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_lock_slot_index_by_xmax((Page)&page, (TransactionId)1009, &index), 0);
 	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
-	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
-						(Page)&page, (TransactionId)1009, NULL),
-				 0);
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_lock_slot_index_by_xmax((Page)&page, (TransactionId)1009, NULL), 0);
 }
 
 
@@ -1052,15 +1035,16 @@ UT_TEST(test_t27_watermark_same_xid_no_contribution)
 
 UT_TEST(test_t28_watermark_lock_only_no_contribution)
 {
-	/* E6: completed lock-only slots never anchor a visibility-affecting undo. */
+	/* A completed locker can carry a predecessor DATA head in retained undo.
+	 * Discard without a history proof is now a loss, just like DATA. */
 	UT_ASSERT_EQ(
 		(int)SCN_VALID(cluster_itl_recycle_watermark_contribution(
 			ITL_FLAG_LOCK_ONLY_COMMITTED, (TransactionId)100, (SCN)5000, (TransactionId)200)),
-		0);
+		1);
 	UT_ASSERT_EQ(
 		(int)SCN_VALID(cluster_itl_recycle_watermark_contribution(
 			ITL_FLAG_LOCK_ONLY_ABORTED, (TransactionId)100, (SCN)5000, (TransactionId)200)),
-		0);
+		1);
 }
 
 UT_TEST(test_t29_watermark_active_diff_xid_no_contribution)
@@ -1189,7 +1173,7 @@ UT_TEST(test_t33_marker_full_page_preserves_completed_data_anchor)
 	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
 }
 
-UT_TEST(test_t34_marker_reuse_lock_only_no_fold)
+UT_TEST(test_t34_marker_reuse_lock_only_preserves_loss_bound)
 {
 	Page page = build_itl_page();
 	Buffer buf = marker_buffer_for(page);
@@ -1200,9 +1184,8 @@ UT_TEST(test_t34_marker_reuse_lock_only_no_fold)
 		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
 		slot_at(page, i)->xid = (TransactionId)(1000 + i);
 	}
-	/* Completed lock-only slot: reusable, but it anchors no tuple versions
-	 * (§v0.5 B2/Q1) -- must NOT contribute.  Poison write_scn proves the
-	 * flag predicate, not the SCN_VALID guard, rejects it. */
+	/* Marker publication has no inverse history trailer. A completed lock
+	 * can carry an older DATA anchor, so losing it must retain a loss bound. */
 	slot_at(page, 3)->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
 	slot_at(page, 3)->xid = (TransactionId)100;
 	slot_at(page, 3)->write_scn = (SCN)5000;
@@ -1210,7 +1193,7 @@ UT_TEST(test_t34_marker_reuse_lock_only_no_fold)
 
 	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
 	UT_ASSERT_EQ((int)idx, 3);
-	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
+	UT_ASSERT_EQ(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn, (SCN)5000);
 }
 
 UT_TEST(test_t35_marker_free_slot_no_fold)
@@ -1271,9 +1254,7 @@ UT_TEST(test_marker_recasts_stale_marker_before_free_slot)
 	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
 	UT_ASSERT_EQ((int)idx, 4);
 	UT_ASSERT_EQ((int)slot_at(page, 4)->xid, 4242);
-	UT_ASSERT_EQ((int)(slot_at(page, 4)->flags
-					   == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI),
-				 1);
+	UT_ASSERT_EQ((int)(slot_at(page, 4)->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI), 1);
 	UT_ASSERT_EQ((int)slot_at(page, 4)->wrap, 10);
 	UT_ASSERT_EQ((int)(slot_at(page, 0)->flags == ITL_FLAG_FREE), 1);
 }
@@ -1370,16 +1351,14 @@ UT_TEST(test_precommit_cleanout_evidence_is_not_directly_reusable)
 	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
 	uint8 i;
 
-	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
-	{
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
 		slot_at(page, i)->xid = (TransactionId)(5000 + i);
 	}
 	slot_at(page, 3)->flags = ITL_FLAG_NEEDS_CLEANOUT;
 	slot_at(page, 3)->commit_scn = (SCN)7001;
 
-	UT_ASSERT_EQ((int)cluster_itl_alloc_or_reuse_slot(
-		buf, (TransactionId)6000, &slot_index), 0);
+	UT_ASSERT_EQ((int)cluster_itl_alloc_or_reuse_slot(buf, (TransactionId)6000, &slot_index), 0);
 	UT_ASSERT_EQ((int)slot_index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
 }
 
@@ -1608,10 +1587,169 @@ UT_TEST(full_tuple_undo_copy_does_not_resurrect_terminal_lock)
 	}
 }
 
+UT_TEST(test_retained_history_stamp_does_not_erase_or_advance_loss_watermark)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot = slot_at(page, 0);
+
+	slot->xid = 100;
+	slot->flags = ITL_FLAG_COMMITTED;
+	slot->wrap = 7;
+	slot->write_scn = 500;
+	slot->commit_scn = 600;
+	slot->undo_segment_head = uba_encode(1, 7, 0, 0);
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = 300;
+	cluster_itl_stamp_active_with_history(marker_buffer_for(page), 0, 101, 700,
+										  uba_encode(1, 7, 1, 0));
+	UT_ASSERT_EQ(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn, 300);
+	UT_ASSERT_EQ(slot->wrap, 8);
+	UT_ASSERT_EQ(slot->xid, 101);
+}
+
+UT_TEST(test_retained_history_v4_redo_matches_primary_without_fpi)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot = slot_at(page, 0);
+	PGAlignedBlock before;
+	PGAlignedBlock primary;
+	xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
+	xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
+
+	slot->xid = 100;
+	slot->flags = ITL_FLAG_COMMITTED;
+	slot->wrap = 7;
+	slot->write_scn = 500;
+	slot->commit_scn = 600;
+	slot->undo_segment_head = uba_encode(1, 7, 0, 0);
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = 300;
+	memcpy(before.data, page, BLCKSZ);
+	cluster_itl_stamp_active_with_history(marker_buffer_for(page), 0, 101, 700,
+										  uba_encode(1, 7, 1, 0));
+	memcpy(primary.data, page, BLCKSZ);
+	memcpy(page, before.data, BLCKSZ);
+	memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
+	header->ndeltas = 1;
+	header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
+	delta->slot_idx = 0;
+	delta->flags_after = ITL_FLAG_ACTIVE;
+	delta->xid = 101;
+	delta->write_scn = 700;
+	delta->undo_segment_head = uba_encode(1, 7, 1, 0);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+		UT_ASSERT_EQ(cluster_itl_wal_block_consumed_bytes(redo_delta_buf), 40);
+		UT_ASSERT_EQ(memcmp(page, primary.data, BLCKSZ), 0);
+	} else
+		UT_ASSERT(false);
+}
+
+UT_TEST(test_retained_history_v4_rejects_complete_array_before_mutation)
+{
+	int variant;
+
+	for (variant = 0; variant < 9; variant++) {
+		Page page = build_itl_page();
+		PGAlignedBlock before;
+		xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
+		xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
+		volatile bool rejected = false;
+
+		memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
+		header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
+		header->ndeltas = 2;
+		delta[0].slot_idx = 0;
+		delta[0].flags_after = ITL_FLAG_ACTIVE;
+		delta[0].xid = 101;
+		delta[0].write_scn = 700;
+		delta[0].undo_segment_head = uba_encode(1, 7, 1, 0);
+		delta[1] = delta[0];
+		delta[1].slot_idx = 1;
+		switch (variant) {
+		case 0:
+			delta[1].slot_idx = 0;
+			break;
+		case 1:
+			delta[1].slot_idx = 8;
+			break;
+		case 2:
+			delta[1].xid = InvalidTransactionId;
+			break;
+		case 3:
+			delta[1].write_scn = InvalidScn;
+			break;
+		case 4:
+			delta[1].flags_after = ITL_FLAG_COMMITTED;
+			break;
+		case 5:
+			delta[1].undo_segment_head = uba_encode(1, 0, 1, 0);
+			break;
+		case 6:
+			header->reserved = 1;
+			break;
+		case 7:
+			header->ndeltas = 9;
+			break;
+		case 8:
+			((PageHeader)page)->pd_flags &= ~PD_HAS_ITL;
+			break;
+		}
+		memcpy(before.data, page, BLCKSZ);
+		if (sigsetjmp(ereport_recover_jmp, 1) == 0)
+			(void)cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf);
+		else
+			rejected = true;
+		UT_ASSERT(rejected);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_retained_lock_history_v4_redo_matches_primary)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot = slot_at(page, 0);
+	PGAlignedBlock before, primary;
+	xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
+	xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
+
+	slot->xid = 100;
+	slot->flags = ITL_FLAG_COMMITTED;
+	slot->wrap = 7;
+	slot->write_scn = 500;
+	slot->commit_scn = 600;
+	slot->lock_count = 3;
+	slot->first_change_lsn = 123;
+	slot->undo_segment_head = uba_encode(1, 7, 0, 0);
+	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = 300;
+	memcpy(before.data, page, BLCKSZ);
+	cluster_itl_stamp_lock_active_with_history(marker_buffer_for(page), 0, 101, 700,
+											   uba_encode(1, 7, 1, 0));
+	memcpy(primary.data, page, BLCKSZ);
+	memcpy(page, before.data, BLCKSZ);
+	memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
+	header->ndeltas = 1;
+	header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
+	delta->slot_idx = 0;
+	delta->flags_after = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	delta->xid = 101;
+	delta->write_scn = 700;
+	delta->undo_segment_head = uba_encode(1, 7, 1, 0);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+		UT_ASSERT_EQ(memcmp(primary.data, page, BLCKSZ), 0);
+		UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+		UT_ASSERT_EQ(memcmp(primary.data, page, BLCKSZ), 0);
+	} else
+		UT_ASSERT(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(69);
+	UT_RUN(test_retained_lock_history_v4_redo_matches_primary);
+	UT_RUN(test_retained_history_v4_rejects_complete_array_before_mutation);
+	UT_RUN(test_retained_history_stamp_does_not_erase_or_advance_loss_watermark);
+	UT_RUN(test_retained_history_v4_redo_matches_primary_without_fpi);
 	UT_RUN(test_t1_ref_sizeof_32);
 	UT_RUN(test_t2_null_page_returns_false);
 	UT_RUN(test_t3_null_ref_returns_false);
@@ -1662,7 +1800,7 @@ main(void)
 	UT_RUN(test_t32_redo_recomputes_recycle_watermark);
 	/* spec-3.6b: lossy markers preserve completed DATA anchors. */
 	UT_RUN(test_t33_marker_full_page_preserves_completed_data_anchor);
-	UT_RUN(test_t34_marker_reuse_lock_only_no_fold);
+	UT_RUN(test_t34_marker_reuse_lock_only_preserves_loss_bound);
 	UT_RUN(test_t35_marker_free_slot_no_fold);
 	UT_RUN(test_t36_marker_xid_mxid_collision_preserves_data_anchor);
 	UT_RUN(test_marker_recasts_stale_marker_before_free_slot);

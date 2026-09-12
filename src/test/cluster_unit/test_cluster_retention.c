@@ -57,8 +57,8 @@
 UT_DEFINE_GLOBALS();
 
 /* Stage 8 peer-mode whole-segment retention contract. */
-extern bool cluster_undo_segment_recyclable_for_mode(
-	const struct UndoSegmentHeaderData *hdr, SCN horizon, bool peer_mode);
+extern bool cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
+													 SCN horizon, bool peer_mode);
 extern SCN cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin,
 											 SCN published_read_scn);
 
@@ -222,18 +222,15 @@ UT_TEST(test_u5_peer_mode_segment_with_aborted_slot_retained)
 	/* Preserve the single-node C7 policy while peer mode retains the exact
 	 * canonical bytes for current-MX A16/A17. */
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, mk_scn(10)), 1);
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), false), 1);
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 0);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), false), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 0);
 
 	/* L12 opens only after the canonical release bit is durable. */
 	hdr.tt_slots[0].xid = (TransactionId)100;
 	hdr.tt_slots[0].wrap = 1;
 	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
 	hdr.tt_slots[0].commit_scn = InvalidScn;
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, InvalidScn, true), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, InvalidScn, true), 1);
 }
 
 UT_TEST(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot)
@@ -246,26 +243,21 @@ UT_TEST(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot)
 	hdr.tt_slots[0].wrap = 1;
 
 	/* Horizon without release proof retains. */
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 0);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 0);
 	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 1);
 
 	/* 8.4D L11 defines the folded floor as inclusive. */
 	hdr.tt_slots[0].commit_scn = mk_scn(10);
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 1);
 
 	/* Unknown flag bits and a release bit on a nonterminal slot both retain. */
 	hdr.tt_slots[0].flags |= UINT8_C(0x80);
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 0);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 0);
 	hdr.tt_slots[0].status = TT_SLOT_UNUSED;
 	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
 	hdr.tt_slots[0].commit_scn = InvalidScn;
-	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
-					 &hdr, mk_scn(10), true), 0);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(10), true), 0);
 }
 
 UT_TEST(test_u5_segment_committed_invalid_commit_scn_retained)
@@ -317,6 +309,67 @@ UT_TEST(test_u10_segment_non_committed_state_never_recyclable)
 UT_TEST(test_u10_segment_null_header_not_recyclable)
 {
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(NULL, mk_scn(10)), 0);
+}
+
+UT_TEST(test_record_history_empty_tt_needs_final_drain_bound)
+{
+	UndoSegmentHeaderData hdr;
+	int peer;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	hdr.tail_block = 1;
+	UndoSegmentHeader_set_record_seal_upper_scn(&hdr, mk_scn(20));
+	for (peer = 0; peer < 2; peer++) {
+		/* Empty TT does not mean the DATA record bytes are dispensable. */
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(100), peer != 0),
+					 0);
+	}
+}
+
+UT_TEST(test_record_history_final_bound_must_precede_reader)
+{
+	UndoSegmentHeaderData hdr;
+	int peer;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	hdr.tail_block = 1;
+	UndoSegmentHeader_set_record_seal_upper_scn(&hdr, mk_scn(20));
+	hdr.commit_horizon_scn = mk_scn(80);
+	for (peer = 0; peer < 2; peer++) {
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(40), peer != 0), 0);
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(80), peer != 0), 0);
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, InvalidScn, peer != 0), 0);
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(81), peer != 0), 1);
+	}
+}
+
+UT_TEST(test_record_history_aborted_tt_does_not_drop_page_predecessor)
+{
+	UndoSegmentHeaderData hdr;
+	int peer;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	hdr.tail_block = 1;
+	UndoSegmentHeader_set_record_seal_upper_scn(&hdr, mk_scn(20));
+	hdr.commit_horizon_scn = mk_scn(80);
+	hdr.tt_slots[0].xid = 100;
+	hdr.tt_slots[0].wrap = 1;
+	hdr.tt_slots[0].status = TT_SLOT_ABORTED;
+	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	for (peer = 0; peer < 2; peer++) {
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(80), peer != 0), 0);
+		UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(81), peer != 0), 1);
+	}
+}
+
+UT_TEST(test_record_history_invalid_drain_order_retains)
+{
+	UndoSegmentHeaderData hdr;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	UndoSegmentHeader_set_record_seal_upper_scn(&hdr, mk_scn(20));
+	hdr.commit_horizon_scn = mk_scn(19);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(&hdr, mk_scn(100), true), 0);
 }
 
 
@@ -574,6 +627,10 @@ main(void)
 	UT_RUN(test_u8_segment_invalid_horizon_retained);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);
 	UT_RUN(test_u10_segment_null_header_not_recyclable);
+	UT_RUN(test_record_history_empty_tt_needs_final_drain_bound);
+	UT_RUN(test_record_history_final_bound_must_precede_reader);
+	UT_RUN(test_record_history_aborted_tt_does_not_drop_page_predecessor);
+	UT_RUN(test_record_history_invalid_drain_order_retains);
 
 	/* spec-4.12a D1: record-segment drain gate. */
 	UT_RUN(test_d1_drainable_seal_below_boundary);

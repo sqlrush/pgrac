@@ -114,8 +114,8 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
  *	retain the whole segment.
  */
 bool
-cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
-									 SCN horizon, bool peer_mode)
+cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr, SCN horizon,
+										 bool peer_mode)
 {
 	SCN watermark = InvalidScn;
 	bool saw_unresolved_committed = false;
@@ -133,27 +133,34 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	if (hdr->segment_state != SEGMENT_COMMITTED)
 		return false;
 
+	/* A record-only segment may have an empty or wholly ABORTED TT array.
+	 * TT terminal/release proofs never prove its historical record bytes are
+	 * no longer needed. The seal alone also precedes the last reserved write. */
+	if (hdr->tail_block != 0 || SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(hdr))) {
+		SCN seal = UndoSegmentHeader_record_seal_upper_scn(hdr);
+		SCN drain = UndoSegmentHeader_record_drain_upper_scn(hdr);
+
+		if (!SCN_VALID(seal) || !SCN_VALID(drain) || !SCN_VALID(horizon)
+			|| scn_time_cmp(drain, seal) < 0 || scn_time_cmp(drain, horizon) >= 0)
+			return false;
+	}
+
 	if (peer_mode) {
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 			const TTSlot *s = &hdr->tt_slots[i];
 
 			switch (s->status) {
 			case TT_SLOT_COMMITTED:
-				if (!TransactionIdIsNormal(s->xid)
-					|| s->wrap == TT_WRAP_INVALID
+				if (!TransactionIdIsNormal(s->xid) || s->wrap == TT_WRAP_INVALID
 					|| s->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
-					|| !UBA_is_invalid(s->first_undo_block)
-					|| !SCN_VALID(s->commit_scn)
-					|| !SCN_VALID(horizon)
-					|| scn_time_cmp(s->commit_scn, horizon) > 0)
+					|| !UBA_is_invalid(s->first_undo_block) || !SCN_VALID(s->commit_scn)
+					|| !SCN_VALID(horizon) || scn_time_cmp(s->commit_scn, horizon) > 0)
 					return false;
 				break;
 			case TT_SLOT_ABORTED:
-				if (!TransactionIdIsNormal(s->xid)
-					|| s->wrap == TT_WRAP_INVALID
+				if (!TransactionIdIsNormal(s->xid) || s->wrap == TT_WRAP_INVALID
 					|| s->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
-					|| !UBA_is_invalid(s->first_undo_block)
-					|| s->commit_scn != InvalidScn)
+					|| !UBA_is_invalid(s->first_undo_block) || s->commit_scn != InvalidScn)
 					return false;
 				break;
 			case TT_SLOT_UNUSED:

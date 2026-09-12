@@ -46,7 +46,7 @@
 #define CLUSTER_ITL_H
 
 #include "c.h"
-#include "access/htup.h"			 /* HeapTupleHeader forward typedef */
+#include "access/htup.h" /* HeapTupleHeader forward typedef */
 #include "access/htup_details.h"
 #include "access/transam.h"			 /* TransactionId */
 #include "storage/buf.h"			 /* Buffer */
@@ -143,7 +143,7 @@ extern bool cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid
  * sentinel.
  */
 extern bool cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
-												 uint8 *slot_index_out);
+													uint8 *slot_index_out);
 
 /*
  * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2 / F6):
@@ -195,7 +195,7 @@ extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xm
  * reduced ClusterUndoTTSlotRef.
  */
 extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
-												  uint8 *slot_index_out);
+													 uint8 *slot_index_out);
 
 #ifdef USE_PGRAC_CLUSTER
 /* Normalize an undo copy, not the live tuple. A missing or ambiguous locator
@@ -326,8 +326,7 @@ extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixac
  *	cluster_itl_touch_register() for xact-end finalization.
  */
 extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx);
-extern bool cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid,
-									 bool lock_only);
+extern bool cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid, bool lock_only);
 
 /*
  * cluster_itl_alloc_or_reuse_lock_slot -- lock-only allocator for
@@ -377,6 +376,12 @@ extern bool cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId top_x
  */
 extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
 									 UBA undo_segment_head);
+/* Only after the prepared record containing the exact predecessor is consumed. */
+extern void cluster_itl_stamp_active_with_history(Buffer buf, uint8 slot_idx, TransactionId xid,
+												  SCN write_scn, UBA undo_segment_head);
+extern void cluster_itl_stamp_lock_active_with_history(Buffer buf, uint8 slot_idx,
+													   TransactionId xid, SCN write_scn,
+													   UBA undo_segment_head);
 
 /*
  * spec-3.10 §v0.5 slot-reuse fail-closed helpers.

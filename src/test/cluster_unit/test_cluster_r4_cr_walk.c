@@ -21,6 +21,7 @@
 
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_cr_coordinator_stat.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_undo_record.h"
@@ -35,6 +36,50 @@
 
 UT_DEFINE_GLOBALS();
 
+extern bool cr_history_test_synchronous(char *page, SCN read_scn, const BufferTag *tag,
+										bool server_mode, bool *partial, uint32 *steps);
+
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+int cluster_cross_instance_cr_coordinator = CR_COORD_MODE_OFF;
+bool cluster_cross_instance_cr_probe;
+
+ClusterCrCoordOriginClass
+cluster_cr_coordinator_classify_origin(NodeId origin)
+{
+	/* This adapter witness is local-only; R4 kind-4 continuation is covered
+	 * separately below, not replaced by this synchronous runtime seam. */
+	UT_ASSERT_EQ(origin, 0);
+	return CR_COORD_ORIGIN_OWN;
+}
+
+void
+cluster_cr_coordinator_stat_bump(ClusterCrCoordCounter counter pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+
+int
+errhint(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
+void *
+palloc(Size size)
+{
+	void *result = malloc(size);
+	if (result == NULL)
+		abort();
+	return result;
+}
+
 int cluster_node_id = 0;
 int cluster_cr_chain_walk_max_steps = 4096;
 static unsigned ut_horizon_log_count;
@@ -45,6 +90,28 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	UT_ASSERT_EQ(level, LOG);
 	return true;
+}
+
+bool
+errstart_cold(int level, const char *domain pg_attribute_unused())
+{
+	/* Page primitives must not throw for these well-formed scratch images. */
+	UT_ASSERT(level < ERROR);
+	if (level >= ERROR)
+		abort();
+	return false;
+}
+
+int
+errcode(int code pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 int
@@ -85,25 +152,27 @@ pfree(void *pointer)
 }
 
 #define TEST_TUPLE_LENGTH 32
-#define TEST_UNDO_RECORD_CAPACITY \
-	(sizeof(UndoRecordHeader) + sizeof(UndoUpdatePayload) + TEST_TUPLE_LENGTH)
+#define TEST_UNDO_RECORD_CAPACITY                                                                  \
+	(sizeof(UndoRecordHeader) + sizeof(UndoUpdatePayload) + TEST_TUPLE_LENGTH + 136)
 
-static char ut_undo_record[TEST_UNDO_RECORD_CAPACITY]
-	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static char ut_undo_record[TEST_UNDO_RECORD_CAPACITY] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static size_t ut_undo_record_length;
 static UBA ut_expected_record_uba;
-static char ut_second_undo_record[TEST_UNDO_RECORD_CAPACITY]
-	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static char ut_second_undo_record[TEST_UNDO_RECORD_CAPACITY] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static size_t ut_second_undo_record_length;
 static UBA ut_expected_second_record_uba;
 static bool ut_two_record_sequence;
-static char ut_third_undo_record[TEST_UNDO_RECORD_CAPACITY]
-	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static char ut_third_undo_record[TEST_UNDO_RECORD_CAPACITY] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static size_t ut_third_undo_record_length;
 static UBA ut_expected_third_record_uba;
 static bool ut_three_record_sequence;
 static bool ut_cycle_record_sequence;
 static int ut_undo_get_record_calls;
+
+#define TEST_HISTORY_RECORDS 12
+static PGAlignedBlock ut_history_records[TEST_HISTORY_RECORDS];
+static UBA ut_history_ubas[TEST_HISTORY_RECORDS];
+static bool ut_history_sequence;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -126,46 +195,6 @@ scn_time_cmp(SCN a, SCN b)
 	return 0;
 }
 
-/*
- * Faithful standalone subset used by cluster_cr_apply.o when an inverse must
- * re-add a tuple at an UNUSED/truncated offset.  This focused R4 case restores
- * in place, but the real helper retains that branch in the linked function.
- */
-OffsetNumber
-PageAddItemExtended(Page page, Item item, Size size, OffsetNumber offsetNumber, int flags)
-{
-	PageHeader phdr = (PageHeader)page;
-	OffsetNumber limit = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-	ItemId item_id;
-	Size aligned_size;
-	int lower;
-	int upper;
-
-	(void)flags;
-	if (offsetNumber == InvalidOffsetNumber)
-		offsetNumber = limit;
-	if (offsetNumber > limit)
-		return InvalidOffsetNumber;
-	if (offsetNumber < limit) {
-		item_id = PageGetItemId(page, offsetNumber);
-		if (ItemIdIsUsed(item_id) || ItemIdHasStorage(item_id))
-			return InvalidOffsetNumber;
-		lower = phdr->pd_lower;
-	} else {
-		lower = (int)phdr->pd_lower + (int)sizeof(ItemIdData);
-	}
-	aligned_size = MAXALIGN(size);
-	upper = (int)phdr->pd_upper - (int)aligned_size;
-	if (lower > upper)
-		return InvalidOffsetNumber;
-	item_id = PageGetItemId(page, offsetNumber);
-	ItemIdSetNormal(item_id, (unsigned)upper, size);
-	memcpy((char *)page + upper, item, size);
-	phdr->pd_lower = (LocationIndex)lower;
-	phdr->pd_upper = (LocationIndex)upper;
-	return offsetNumber;
-}
-
 size_t
 cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 {
@@ -173,6 +202,24 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	size_t record_length;
 	UBA expected_uba;
 	int record_index = ut_undo_get_record_calls++;
+
+	if (ut_history_sequence) {
+		unsigned i;
+
+		for (i = 0; i < TEST_HISTORY_RECORDS; i++) {
+			if (cluster_undo_record_uba_equal(ut_history_ubas[i], uba)) {
+				const UndoRecordHeader *header
+					= (const UndoRecordHeader *)ut_history_records[i].data;
+				size_t length = sizeof(*header) + header->payload_length;
+
+				if (length > buffer_size)
+					return 0;
+				memcpy(out_buffer, ut_history_records[i].data, length);
+				return length;
+			}
+		}
+		return 0;
+	}
 
 	if (ut_cycle_record_sequence && (record_index % 2) == 0) {
 		record = ut_undo_record;
@@ -199,8 +246,7 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 		return 0;
 	}
 
-	UT_ASSERT(uba.raw[0] == expected_uba.raw[0]
-			  && uba.raw[1] == expected_uba.raw[1]);
+	UT_ASSERT(uba.raw[0] == expected_uba.raw[0] && uba.raw[1] == expected_uba.raw[1]);
 	UT_ASSERT(buffer_size >= record_length);
 	if (out_buffer == NULL || buffer_size < record_length)
 		return 0;
@@ -549,18 +595,15 @@ make_builder_extension(uint64 generation, uint64 builder_incarnation)
 }
 
 static void
-make_one_insert_candidate_page(char page[BLCKSZ],
-						   ClusterR4CrSlotExtension *extension)
+make_one_insert_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension)
 {
 	PageHeader header = (PageHeader)page;
 	ItemId item_id;
 	ClusterItlSlotData *slot;
 	const uint16 tuple_length = TEST_TUPLE_LENGTH;
-	const uint16 tuple_offset
-		= (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - tuple_length);
+	const uint16 tuple_offset = (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - tuple_length);
 	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
-	UndoInsertPayload *payload
-		= (UndoInsertPayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	UndoInsertPayload *payload = (UndoInsertPayload *)(ut_undo_record + sizeof(UndoRecordHeader));
 
 	make_zero_candidate_page(page);
 	header->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
@@ -606,9 +649,8 @@ make_one_insert_candidate_page(char page[BLCKSZ],
 }
 
 static void
-make_one_update_candidate_page(char page[BLCKSZ],
-						   ClusterR4CrSlotExtension *extension,
-						   char expected_old[TEST_TUPLE_LENGTH])
+make_one_update_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+							   char expected_old[TEST_TUPLE_LENGTH])
 {
 	PageHeader header = (PageHeader)page;
 	ItemId old_item;
@@ -621,8 +663,7 @@ make_one_update_candidate_page(char page[BLCKSZ],
 		= (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
 	const uint16 old_offset = (uint16)(replacement_offset - TEST_TUPLE_LENGTH);
 	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
-	UndoUpdatePayload *payload
-		= (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	UndoUpdatePayload *payload = (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
 	char *record_old = (char *)payload + sizeof(UndoUpdatePayload);
 	const TransactionId base_xid = (TransactionId)(TEST_XID - 1);
 
@@ -641,8 +682,7 @@ make_one_update_candidate_page(char page[BLCKSZ],
 	old_image->t_infomask2 = 0;
 	old_image->t_hoff = SizeofHeapTupleHeader;
 	old_image->t_itl_slot_idx = 0;
-	ItemPointerSet(&old_image->t_ctid, extension->route_proof.tag.blockNum,
-				   FirstOffsetNumber);
+	ItemPointerSet(&old_image->t_ctid, extension->route_proof.tag.blockNum, FirstOffsetNumber);
 
 	current_old = (HeapTupleHeader)(page + old_offset);
 	memcpy(current_old, expected_old, TEST_TUPLE_LENGTH);
@@ -690,16 +730,14 @@ make_one_update_candidate_page(char page[BLCKSZ],
 	payload->old_tuple_length = TEST_TUPLE_LENGTH;
 	payload->old_tuple_offset = sizeof(*payload);
 	memcpy(record_old, expected_old, TEST_TUPLE_LENGTH);
-	ut_undo_record_length
-		= sizeof(UndoRecordHeader) + sizeof(*payload) + TEST_TUPLE_LENGTH;
+	ut_undo_record_length = sizeof(UndoRecordHeader) + sizeof(*payload) + TEST_TUPLE_LENGTH;
 	ut_two_record_sequence = false;
 	ut_undo_get_record_calls = 0;
 }
 
 static UBA
-make_one_foreign_update_candidate_page(char page[BLCKSZ],
-								   ClusterR4CrSlotExtension *extension,
-								   char expected_old[TEST_TUPLE_LENGTH])
+make_one_foreign_update_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+									   char expected_old[TEST_TUPLE_LENGTH])
 {
 	ClusterItlSlotData *slot;
 	UBA foreign_uba = uba_encode(257, 9, TEST_TT_OFFSET, 6);
@@ -717,20 +755,17 @@ make_one_foreign_update_candidate_page(char page[BLCKSZ],
 }
 
 static void
-make_one_delete_candidate_page(char page[BLCKSZ],
-						   ClusterR4CrSlotExtension *extension,
-						   char expected_old[TEST_TUPLE_LENGTH])
+make_one_delete_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+							   char expected_old[TEST_TUPLE_LENGTH])
 {
 	PageHeader header = (PageHeader)page;
 	ItemId item;
 	HeapTupleHeader current;
 	HeapTupleHeader old_image = (HeapTupleHeader)expected_old;
 	ClusterItlSlotData *slot;
-	const uint16 tuple_offset
-		= (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
+	const uint16 tuple_offset = (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
 	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
-	UndoDeletePayload *payload
-		= (UndoDeletePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	UndoDeletePayload *payload = (UndoDeletePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
 	char *record_old = (char *)payload + sizeof(UndoDeletePayload);
 	const TransactionId base_xid = (TransactionId)(TEST_XID - 1);
 
@@ -747,8 +782,7 @@ make_one_delete_candidate_page(char page[BLCKSZ],
 	old_image->t_infomask2 = 0;
 	old_image->t_hoff = SizeofHeapTupleHeader;
 	old_image->t_itl_slot_idx = 0;
-	ItemPointerSet(&old_image->t_ctid, extension->route_proof.tag.blockNum,
-				   FirstOffsetNumber);
+	ItemPointerSet(&old_image->t_ctid, extension->route_proof.tag.blockNum, FirstOffsetNumber);
 
 	current = (HeapTupleHeader)(page + tuple_offset);
 	memcpy(current, expected_old, TEST_TUPLE_LENGTH);
@@ -782,25 +816,21 @@ make_one_delete_candidate_page(char page[BLCKSZ],
 	payload->full_tuple_length = TEST_TUPLE_LENGTH;
 	payload->full_tuple_offset = sizeof(*payload);
 	memcpy(record_old, expected_old, TEST_TUPLE_LENGTH);
-	ut_undo_record_length
-		= sizeof(UndoRecordHeader) + sizeof(*payload) + TEST_TUPLE_LENGTH;
+	ut_undo_record_length = sizeof(UndoRecordHeader) + sizeof(*payload) + TEST_TUPLE_LENGTH;
 	ut_two_record_sequence = false;
 	ut_undo_get_record_calls = 0;
 }
 
 static void
-make_one_itl_candidate_page(char page[BLCKSZ],
-						ClusterR4CrSlotExtension *extension)
+make_one_itl_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension)
 {
 	PageHeader header = (PageHeader)page;
 	ItemId item;
 	HeapTupleHeader tuple;
 	ClusterItlSlotData *slot;
-	const uint16 tuple_offset
-		= (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
+	const uint16 tuple_offset = (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
 	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
-	UndoItlPayload *payload
-		= (UndoItlPayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	UndoItlPayload *payload = (UndoItlPayload *)(ut_undo_record + sizeof(UndoRecordHeader));
 	const TransactionId base_xid = (TransactionId)(TEST_XID - 1);
 
 	make_zero_candidate_page(page);
@@ -816,8 +846,7 @@ make_one_itl_candidate_page(char page[BLCKSZ],
 	tuple->t_infomask2 = HEAP_KEYS_UPDATED;
 	tuple->t_hoff = SizeofHeapTupleHeader;
 	tuple->t_itl_slot_idx = 0;
-	ItemPointerSet(&tuple->t_ctid, extension->route_proof.tag.blockNum,
-				   FirstOffsetNumber);
+	ItemPointerSet(&tuple->t_ctid, extension->route_proof.tag.blockNum, FirstOffsetNumber);
 
 	ut_expected_record_uba = make_record_uba(7, 4);
 	slot = &ClusterPageGetItlSlots((Page)page)[0];
@@ -857,9 +886,8 @@ make_one_itl_candidate_page(char page[BLCKSZ],
 }
 
 static void
-make_two_update_candidate_page(char page[BLCKSZ],
-						   ClusterR4CrSlotExtension *extension,
-						   char expected_oldest[TEST_TUPLE_LENGTH])
+make_two_update_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+							   char expected_oldest[TEST_TUPLE_LENGTH])
 {
 	PageHeader header = (PageHeader)page;
 	ItemId oldest_item;
@@ -872,8 +900,7 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	char middle_image_bytes[TEST_TUPLE_LENGTH];
 	HeapTupleHeader middle_image = (HeapTupleHeader)middle_image_bytes;
 	ClusterItlSlotData *slot;
-	const uint16 newest_offset
-		= (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
+	const uint16 newest_offset = (uint16)(BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - TEST_TUPLE_LENGTH);
 	const uint16 middle_offset = (uint16)(newest_offset - TEST_TUPLE_LENGTH);
 	const uint16 oldest_offset = (uint16)(middle_offset - TEST_TUPLE_LENGTH);
 	const OffsetNumber middle_offnum = OffsetNumberNext(FirstOffsetNumber);
@@ -907,15 +934,13 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	oldest_image->t_infomask2 = 0;
 	oldest_image->t_hoff = SizeofHeapTupleHeader;
 	oldest_image->t_itl_slot_idx = 0;
-	ItemPointerSet(&oldest_image->t_ctid, extension->route_proof.tag.blockNum,
-				   FirstOffsetNumber);
+	ItemPointerSet(&oldest_image->t_ctid, extension->route_proof.tag.blockNum, FirstOffsetNumber);
 
 	oldest_current = (HeapTupleHeader)(page + oldest_offset);
 	memcpy(oldest_current, expected_oldest, TEST_TUPLE_LENGTH);
 	HeapTupleHeaderSetXmax(oldest_current, TEST_XID);
 	oldest_current->t_infomask &= ~HEAP_XMAX_INVALID;
-	ItemPointerSet(&oldest_current->t_ctid, extension->route_proof.tag.blockNum,
-				   middle_offnum);
+	ItemPointerSet(&oldest_current->t_ctid, extension->route_proof.tag.blockNum, middle_offnum);
 
 	memset(middle_image_bytes, 0, sizeof(middle_image_bytes));
 	HeapTupleHeaderSetXmin(middle_image, TEST_XID);
@@ -924,15 +949,13 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	middle_image->t_infomask2 = 0;
 	middle_image->t_hoff = SizeofHeapTupleHeader;
 	middle_image->t_itl_slot_idx = 0;
-	ItemPointerSet(&middle_image->t_ctid, extension->route_proof.tag.blockNum,
-				   middle_offnum);
+	ItemPointerSet(&middle_image->t_ctid, extension->route_proof.tag.blockNum, middle_offnum);
 
 	middle_current = (HeapTupleHeader)(page + middle_offset);
 	memcpy(middle_current, middle_image_bytes, TEST_TUPLE_LENGTH);
 	HeapTupleHeaderSetXmax(middle_current, TEST_XID);
 	middle_current->t_infomask &= ~HEAP_XMAX_INVALID;
-	ItemPointerSet(&middle_current->t_ctid, extension->route_proof.tag.blockNum,
-				   newest_offnum);
+	ItemPointerSet(&middle_current->t_ctid, extension->route_proof.tag.blockNum, newest_offnum);
 
 	newest_current = (HeapTupleHeader)(page + newest_offset);
 	memset(newest_current, 0, TEST_TUPLE_LENGTH);
@@ -941,8 +964,7 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	newest_current->t_infomask = HEAP_XMAX_INVALID;
 	newest_current->t_hoff = SizeofHeapTupleHeader;
 	newest_current->t_itl_slot_idx = 0;
-	ItemPointerSet(&newest_current->t_ctid, extension->route_proof.tag.blockNum,
-				   newest_offnum);
+	ItemPointerSet(&newest_current->t_ctid, extension->route_proof.tag.blockNum, newest_offnum);
 
 	slot = &ClusterPageGetItlSlots((Page)page)[0];
 	slot->xid = TEST_XID;
@@ -995,8 +1017,7 @@ make_two_update_candidate_page(char page[BLCKSZ],
 	tail_payload->old_tuple_offset = sizeof(*tail_payload);
 	memcpy(tail_old, expected_oldest, TEST_TUPLE_LENGTH);
 
-	ut_undo_record_length
-		= sizeof(UndoRecordHeader) + sizeof(*head_payload) + TEST_TUPLE_LENGTH;
+	ut_undo_record_length = sizeof(UndoRecordHeader) + sizeof(*head_payload) + TEST_TUPLE_LENGTH;
 	ut_expected_record_uba = head_uba;
 	ut_second_undo_record_length
 		= sizeof(UndoRecordHeader) + sizeof(*tail_payload) + TEST_TUPLE_LENGTH;
@@ -1006,8 +1027,7 @@ make_two_update_candidate_page(char page[BLCKSZ],
 }
 
 static void
-make_single_record_undo_block(char block[BLCKSZ], const char *record_bytes,
-							  size_t record_length)
+make_single_record_undo_block(char block[BLCKSZ], const char *record_bytes, size_t record_length)
 {
 	UndoBlockHeader *header = (UndoBlockHeader *)block;
 	const UndoRecordHeader *record = (const UndoRecordHeader *)record_bytes;
@@ -1016,8 +1036,7 @@ make_single_record_undo_block(char block[BLCKSZ], const char *record_bytes,
 	UT_ASSERT(record_bytes != NULL);
 	UT_ASSERT(record_length >= sizeof(UndoRecordHeader));
 	UT_ASSERT(record_length <= UINT16_MAX);
-	UT_ASSERT(sizeof(UndoBlockHeader) + record_length
-			  < UNDO_SLOT_DIR_OFFSET(0));
+	UT_ASSERT(sizeof(UndoBlockHeader) + record_length < UNDO_SLOT_DIR_OFFSET(0));
 	memset(block, 0, BLCKSZ);
 	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	header->block_version = UNDO_BLOCK_VERSION_1;
@@ -1050,8 +1069,7 @@ make_resident_record_fixture(char block[BLCKSZ], PGAlignedBlock *record_bytes,
 }
 
 static void
-assert_resident_record_rejected_unchanged(
-	const char block[BLCKSZ], const ClusterTxLocator *locator)
+assert_resident_record_rejected_unchanged(const char block[BLCKSZ], const ClusterTxLocator *locator)
 {
 	PGAlignedBlock record_out;
 	PGAlignedBlock record_before;
@@ -1067,12 +1085,11 @@ assert_resident_record_rejected_unchanged(
 	canonical_before = canonical_out;
 	memcpy(block_before, block, sizeof(block_before));
 
-	UT_ASSERT(!cluster_cr_r4_extract_resident_record(
-		block, locator, record_out.data, &record_length, &canonical_out));
+	UT_ASSERT(!cluster_cr_r4_extract_resident_record(block, locator, record_out.data,
+													 &record_length, &canonical_out));
 	UT_ASSERT_EQ(record_length, 777);
 	UT_ASSERT_EQ(memcmp(&record_out, &record_before, sizeof(record_out)), 0);
-	UT_ASSERT_EQ(memcmp(&canonical_out, &canonical_before,
-					 sizeof(canonical_out)), 0);
+	UT_ASSERT_EQ(memcmp(&canonical_out, &canonical_before, sizeof(canonical_out)), 0);
 	UT_ASSERT_EQ(memcmp(block, block_before, sizeof(block_before)), 0);
 	UT_ASSERT_EQ(memcmp(locator, &locator_before, sizeof(locator_before)), 0);
 }
@@ -1089,15 +1106,14 @@ UT_TEST(test_r4_resident_record_extracts_exact_canonical_hit)
 	size_t expected_length;
 	size_t record_length = 0;
 
-	expected_length
-		= make_resident_record_fixture(block, &record_bytes, &locator);
+	expected_length = make_resident_record_fixture(block, &record_bytes, &locator);
 	locator_before = locator;
 	memcpy(block_before, block, sizeof(block_before));
 	memset(&record_out, 0xa5, sizeof(record_out));
 	memset(&canonical_out, 0, sizeof(canonical_out));
 
-	UT_ASSERT(cluster_cr_r4_extract_resident_record(
-		block, &locator, record_out.data, &record_length, &canonical_out));
+	UT_ASSERT(cluster_cr_r4_extract_resident_record(block, &locator, record_out.data,
+													&record_length, &canonical_out));
 	UT_ASSERT_EQ(record_length, expected_length);
 	UT_ASSERT_EQ(memcmp(record_out.data, record_bytes.data, expected_length), 0);
 	UT_ASSERT_EQ((unsigned char)record_out.data[expected_length], 0xa5);
@@ -1116,14 +1132,13 @@ UT_TEST(test_r4_resident_record_upgrades_unknown_wrap_once)
 	size_t expected_length;
 	size_t record_length = 0;
 
-	expected_length
-		= make_resident_record_fixture(block, &record_bytes, &locator);
+	expected_length = make_resident_record_fixture(block, &record_bytes, &locator);
 	locator.tt_wrap = TT_WRAP_INVALID;
 	memset(&record_out, 0, sizeof(record_out));
 	memset(&canonical_out, 0, sizeof(canonical_out));
 
-	UT_ASSERT(cluster_cr_r4_extract_resident_record(
-		block, &locator, record_out.data, &record_length, &canonical_out));
+	UT_ASSERT(cluster_cr_r4_extract_resident_record(block, &locator, record_out.data,
+													&record_length, &canonical_out));
 	UT_ASSERT_EQ(record_length, expected_length);
 	UT_ASSERT_EQ(canonical_out.tt_wrap, TEST_WRAP);
 	UT_ASSERT_EQ(canonical_out.uba.raw[0], locator.uba.raw[0]);
@@ -1247,9 +1262,8 @@ UT_TEST(test_r4_resident_record_rejects_malformed_and_block_zero_uba)
  * directory entry is allowed to identify a record whose header is not
  * naturally aligned within the immutable DATA image. */
 static void
-make_unaligned_second_record_undo_block(char block[BLCKSZ],
-									const char *record_bytes,
-									size_t record_length)
+make_unaligned_second_record_undo_block(char block[BLCKSZ], const char *record_bytes,
+										size_t record_length)
 {
 	PGAlignedBlock prefix_buffer;
 	UndoRecordHeader *prefix = (UndoRecordHeader *)prefix_buffer.data;
@@ -1259,9 +1273,8 @@ make_unaligned_second_record_undo_block(char block[BLCKSZ],
 	UndoSlotDirEntry *prefix_slot;
 	UndoSlotDirEntry *record_slot;
 	const size_t prefix_tuple_length = TEST_TUPLE_LENGTH + 1;
-	const size_t prefix_length = sizeof(UndoRecordHeader)
-								 + sizeof(UndoUpdatePayload)
-								 + prefix_tuple_length;
+	const size_t prefix_length
+		= sizeof(UndoRecordHeader) + sizeof(UndoUpdatePayload) + prefix_tuple_length;
 	const size_t record_offset = sizeof(UndoBlockHeader) + prefix_length;
 
 	UT_ASSERT(record_bytes != NULL);
@@ -1273,8 +1286,7 @@ make_unaligned_second_record_undo_block(char block[BLCKSZ],
 	memset(&prefix_buffer, 0, sizeof(prefix_buffer));
 	prefix->record_type = UNDO_RECORD_UPDATE;
 	prefix->flags = UNDO_REC_FLAG_FIRST_IN_TX;
-	prefix->payload_length
-		= (uint16)(sizeof(UndoUpdatePayload) + prefix_tuple_length);
+	prefix->payload_length = (uint16)(sizeof(UndoUpdatePayload) + prefix_tuple_length);
 	prefix_payload->new_block = InvalidBlockNumber;
 	prefix_payload->new_offset = InvalidOffsetNumber;
 	prefix_payload->old_tuple_length = (uint16)prefix_tuple_length;
@@ -1299,10 +1311,10 @@ make_unaligned_second_record_undo_block(char block[BLCKSZ],
 }
 
 static void
-make_two_foreign_update_candidate_page(
-	char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
-	char expected_oldest[TEST_TUPLE_LENGTH], char head_block[BLCKSZ],
-	char tail_block[BLCKSZ], UBA *head_uba_out, UBA *tail_uba_out)
+make_two_foreign_update_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+									   char expected_oldest[TEST_TUPLE_LENGTH],
+									   char head_block[BLCKSZ], char tail_block[BLCKSZ],
+									   UBA *head_uba_out, UBA *tail_uba_out)
 {
 	ClusterItlSlotData *slot;
 	UndoRecordHeader *head = (UndoRecordHeader *)ut_undo_record;
@@ -1318,10 +1330,8 @@ make_two_foreign_update_candidate_page(
 	head->prev_uba = tail_uba;
 	tail->origin_node_id = 1;
 	tail->tt_slot_segment_id = 257;
-	make_single_record_undo_block(
-		head_block, ut_undo_record, ut_undo_record_length);
-	make_single_record_undo_block(
-		tail_block, ut_second_undo_record, ut_second_undo_record_length);
+	make_single_record_undo_block(head_block, ut_undo_record, ut_undo_record_length);
+	make_single_record_undo_block(tail_block, ut_second_undo_record, ut_second_undo_record_length);
 
 	/* Both records are foreign; the holder-local reader must remain unused. */
 	ut_expected_record_uba = head_uba;
@@ -1334,9 +1344,9 @@ make_two_foreign_update_candidate_page(
 }
 
 static void
-make_target_other_target_update_candidate_page(
-	char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
-	char expected_oldest[TEST_TUPLE_LENGTH])
+make_target_other_target_update_candidate_page(char page[BLCKSZ],
+											   ClusterR4CrSlotExtension *extension,
+											   char expected_oldest[TEST_TUPLE_LENGTH])
 {
 	ClusterItlSlotData *slot;
 	UndoRecordHeader *head = (UndoRecordHeader *)ut_undo_record;
@@ -1346,8 +1356,7 @@ make_target_other_target_update_candidate_page(
 	UBA tail_uba = make_record_uba(8, 4);
 
 	make_two_update_candidate_page(page, extension, expected_oldest);
-	memcpy(ut_third_undo_record, ut_second_undo_record,
-		   ut_second_undo_record_length);
+	memcpy(ut_third_undo_record, ut_second_undo_record, ut_second_undo_record_length);
 	ut_third_undo_record_length = ut_second_undo_record_length;
 	ut_expected_third_record_uba = tail_uba;
 
@@ -1368,9 +1377,8 @@ make_target_other_target_update_candidate_page(
 }
 
 static void
-make_two_xid_update_candidate_page(char page[BLCKSZ],
-							   ClusterR4CrSlotExtension *extension,
-							   char expected_oldest[TEST_TUPLE_LENGTH])
+make_two_xid_update_candidate_page(char page[BLCKSZ], ClusterR4CrSlotExtension *extension,
+								   char expected_oldest[TEST_TUPLE_LENGTH])
 {
 	ClusterItlSlotData *slots;
 	ItemId middle_item;
@@ -1387,8 +1395,7 @@ make_two_xid_update_candidate_page(char page[BLCKSZ],
 
 	make_two_update_candidate_page(page, extension, expected_oldest);
 	middle_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
-	newest_item = PageGetItemId(
-		(Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
+	newest_item = PageGetItemId((Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
 	middle_current = (HeapTupleHeader)PageGetItem((Page)page, middle_item);
 	newest_current = (HeapTupleHeader)PageGetItem((Page)page, newest_item);
 	HeapTupleHeaderSetXmax(middle_current, newer_xid);
@@ -1439,32 +1446,32 @@ UT_TEST(test_r4_builder_zero_candidate_is_full_and_exact_forget_reopens_key)
 	memset(foreign_page, 0x5a, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 41, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 41, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
 	UT_ASSERT(memcmp(&extension, &extension_before, sizeof(extension)) == 0);
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 41, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 41, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 
 	cluster_cr_build_on_holder_forget(0, 42);
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 41, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 41, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 
 	cluster_cr_build_on_holder_forget(0, 41);
 	reason = CLUSTER_CR_BUILD_PROTOCOL;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 41, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 41, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	cluster_cr_build_on_holder_forget(0, 41);
 }
@@ -1486,9 +1493,9 @@ UT_TEST(test_r4_builder_recycle_watermark_above_read_scn_fails_closed)
 	memset(foreign_page, 0xa5, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 42, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 42, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
 	UT_ASSERT_EQ(ut_horizon_log_count, logs_before + 1);
 	UT_ASSERT(strstr(ut_horizon_log, "PGRAC_SITE=PAGE_WATERMARK") != NULL);
@@ -1520,9 +1527,9 @@ UT_TEST(test_r4_builder_rejects_invalid_page_layout_before_full)
 	memset(foreign_page, 0xc3, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 43, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 43, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
 	UT_ASSERT_EQ(extension.build_steps, 0);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
@@ -1541,9 +1548,9 @@ UT_TEST(test_r4_builder_refuses_resume_without_context)
 
 	make_zero_candidate_page(page);
 	memset(foreign_page, 0xa5, sizeof(foreign_page));
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 51, true, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 51, true, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 }
 
@@ -1559,13 +1566,13 @@ UT_TEST(test_r4_builder_context_is_isolated_per_physical_slot)
 	make_zero_candidate_page(page0);
 	make_zero_candidate_page(page1);
 	memset(foreign_page, 0, sizeof(foreign_page));
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(2, 61, false, &extension0, page0,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(2, 61, false, &extension0, page0, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	reason = CLUSTER_CR_BUILD_PROTOCOL;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(3, 62, false, &extension1, page1,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 62, false, &extension1, page1, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	cluster_cr_build_on_holder_forget(2, 61);
 	cluster_cr_build_on_holder_forget(3, 62);
@@ -1587,9 +1594,9 @@ UT_TEST(test_r4_builder_single_local_insert_inverse_reaches_full)
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
 	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)page, FirstOffsetNumber)));
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 71, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 71, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 	UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page, FirstOffsetNumber)));
@@ -1597,9 +1604,9 @@ UT_TEST(test_r4_builder_single_local_insert_inverse_reaches_full)
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 71, false, &extension, page,
-											 foreign_page, &reason),
-			 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 71, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_cr_build_on_holder_forget(0, 71);
 }
@@ -1631,26 +1638,22 @@ UT_TEST(test_r4_builder_single_local_update_hot_inverse_reaches_full)
 
 	UT_ASSERT(ItemIdIsNormal(old_item));
 	UT_ASSERT(ItemIdIsNormal(new_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, old_item), expected_old,
-				 TEST_TUPLE_LENGTH)
-			  != 0);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 72, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, old_item), expected_old, TEST_TUPLE_LENGTH) != 0);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 72, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 	UT_ASSERT(ItemIdIsNormal(old_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, old_item), expected_old,
-				 TEST_TUPLE_LENGTH)
-			  == 0);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, old_item), expected_old, TEST_TUPLE_LENGTH) == 0);
 	UT_ASSERT(!ItemIdIsNormal(new_item));
 	UT_ASSERT(memcmp(&extension, &expected_extension, sizeof(extension)) == 0);
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 72, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 72, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_cr_build_on_holder_forget(1, 72);
 }
@@ -1679,25 +1682,21 @@ UT_TEST(test_r4_builder_single_local_delete_inverse_reaches_full)
 	item = PageGetItemId((Page)page, FirstOffsetNumber);
 
 	UT_ASSERT(ItemIdIsNormal(item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, item), expected_old,
-				 TEST_TUPLE_LENGTH)
-			  != 0);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(2, 73, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, item), expected_old, TEST_TUPLE_LENGTH) != 0);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(2, 73, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 	UT_ASSERT(ItemIdIsNormal(item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, item), expected_old,
-				 TEST_TUPLE_LENGTH)
-			  == 0);
+	UT_ASSERT(memcmp(PageGetItem((Page)page, item), expected_old, TEST_TUPLE_LENGTH) == 0);
 	UT_ASSERT(memcmp(&extension, &expected_extension, sizeof(extension)) == 0);
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(2, 73, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(2, 73, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_cr_build_on_holder_forget(2, 73);
 }
@@ -1723,16 +1722,15 @@ UT_TEST(test_r4_builder_single_local_itl_inverse_reaches_full)
 	expected_extension.build_steps = 1;
 	memset(foreign_page, 0x4b, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
-	tuple = (HeapTupleHeader)PageGetItem(
-		(Page)page, PageGetItemId((Page)page, FirstOffsetNumber));
+	tuple = (HeapTupleHeader)PageGetItem((Page)page, PageGetItemId((Page)page, FirstOffsetNumber));
 	slot = &ClusterPageGetItlSlots((Page)page)[0];
 
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), TEST_XID);
 	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
 	UT_ASSERT(!UBA_is_invalid(slot->undo_segment_head));
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(3, 74, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 74, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), InvalidTransactionId);
@@ -1771,9 +1769,9 @@ UT_TEST(test_r4_builder_record_at_read_scn_is_normal_horizon_stop)
 	memset(foreign_page, 0xb4, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 82, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 82, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
@@ -1808,23 +1806,20 @@ UT_TEST(test_r4_builder_two_local_updates_walk_newest_to_oldest)
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 	oldest_item = PageGetItemId((Page)page, FirstOffsetNumber);
 	middle_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
-	newest_item = PageGetItemId((Page)page,
-							  OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
+	newest_item = PageGetItemId((Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
 
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
 	UT_ASSERT(ItemIdIsNormal(middle_item));
 	UT_ASSERT(ItemIdIsNormal(newest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  != 0);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(3, 74, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 74, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  == 0);
 	UT_ASSERT(!ItemIdIsNormal(middle_item));
 	UT_ASSERT(!ItemIdIsNormal(newest_item));
@@ -1832,9 +1827,9 @@ UT_TEST(test_r4_builder_two_local_updates_walk_newest_to_oldest)
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(3, 74, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 74, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_cr_build_on_holder_forget(3, 74);
 }
@@ -1864,23 +1859,20 @@ UT_TEST(test_r4_builder_two_local_candidate_xids_use_write_scn_desc)
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 	oldest_item = PageGetItemId((Page)page, FirstOffsetNumber);
 	middle_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
-	newest_item = PageGetItemId(
-		(Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
+	newest_item = PageGetItemId((Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
 
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
 	UT_ASSERT(ItemIdIsNormal(middle_item));
 	UT_ASSERT(ItemIdIsNormal(newest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  != 0);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 75, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 75, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  == 0);
 	UT_ASSERT(!ItemIdIsNormal(middle_item));
 	UT_ASSERT(!ItemIdIsNormal(newest_item));
@@ -1888,9 +1880,9 @@ UT_TEST(test_r4_builder_two_local_candidate_xids_use_write_scn_desc)
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 75, false, &extension, page,
-										 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 75, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_cr_build_on_holder_forget(0, 75);
 }
@@ -1917,8 +1909,7 @@ UT_TEST(test_r4_builder_foreign_head_freezes_one_need_undo)
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
 	extension.route_proof.formation_epoch = 19;
-	foreign_uba
-		= make_one_foreign_update_candidate_page(page, &extension, expected_old);
+	foreign_uba = make_one_foreign_update_candidate_page(page, &extension, expected_old);
 	UT_ASSERT_EQ(foreign_uba.raw[0], UINT64CONST(0x0000000900000101));
 	UT_ASSERT_EQ(foreign_uba.raw[1], UINT64CONST(0x0000000000060003));
 
@@ -1938,8 +1929,8 @@ UT_TEST(test_r4_builder_foreign_head_freezes_one_need_undo)
 	memset(foreign_page, 0x3c, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	step_result = cluster_cr_build_on_holder_step(1, 76, false, &extension, page,
-											  foreign_page, &reason);
+	step_result
+		= cluster_cr_build_on_holder_step(1, 76, false, &extension, page, foreign_page, &reason);
 	UT_ASSERT_EQ(step_result, CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
@@ -1954,26 +1945,22 @@ UT_TEST(test_r4_builder_foreign_head_freezes_one_need_undo)
 	expected_locator.itl_kind = ITL_FLAG_ACTIVE;
 	expected_locator.itl_slot_index = 0;
 	memset(&pending_locator, 0, sizeof(pending_locator));
-	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(
-		1, 76, &pending_locator));
-	UT_ASSERT_EQ(memcmp(&pending_locator, &expected_locator,
-					 sizeof(expected_locator)), 0);
-	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(
-		1, 77, &pending_locator));
+	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(1, 76, &pending_locator));
+	UT_ASSERT_EQ(memcmp(&pending_locator, &expected_locator, sizeof(expected_locator)), 0);
+	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(1, 77, &pending_locator));
 
 	extension_after_pause = extension;
 	reason = CLUSTER_CR_BUILD_NONE;
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(1, 76, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(1, 76, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
 	UT_ASSERT(memcmp(foreign_page, foreign_before, sizeof(foreign_page)) == 0);
 	UT_ASSERT(memcmp(&extension, &extension_after_pause, sizeof(extension)) == 0);
 	cluster_cr_build_on_holder_forget(1, 76);
-	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(
-		1, 76, &pending_locator));
+	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(1, 76, &pending_locator));
 }
 
 /* Both records live on the same foreign origin.  The first delivered block
@@ -2003,43 +1990,39 @@ UT_TEST(test_r4_builder_foreign_resume_preserves_predecessor_and_step_count)
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
 	extension.route_proof.formation_epoch = 20;
-	make_two_foreign_update_candidate_page(
-		page, &extension, expected_oldest, head_block, tail_block,
-		&head_uba, &tail_uba);
+	make_two_foreign_update_candidate_page(page, &extension, expected_oldest, head_block,
+										   tail_block, &head_uba, &tail_uba);
 	expected_extension = extension;
 	expected_extension.build_steps = 2;
 	oldest_item = PageGetItemId((Page)page, FirstOffsetNumber);
 	middle_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
-	newest_item = PageGetItemId(
-		(Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
+	newest_item = PageGetItemId((Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
 	memset(foreign_page, 0xa7, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
-		3, 78, false, &extension, page, foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_NEED_UNDO);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 78, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(extension.build_steps, 1);
 	UT_ASSERT_EQ(extension.foreign_request_id, (UINT64CONST(78) << 18) | 3);
 	UT_ASSERT(extension.foreign_uba.raw[0] == head_uba.raw[0]
 			  && extension.foreign_uba.raw[1] == head_uba.raw[1]);
 	memset(&pending_locator, 0, sizeof(pending_locator));
-	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(
-		3, 78, &pending_locator));
+	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(3, 78, &pending_locator));
 	UT_ASSERT(pending_locator.uba.raw[0] == head_uba.raw[0]
 			  && pending_locator.uba.raw[1] == head_uba.raw[1]);
 
 	memcpy(foreign_page, head_block, sizeof(foreign_page));
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
-		3, 78, true, &extension, page, foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_NEED_UNDO);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 78, true, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(extension.build_steps, 2);
 	UT_ASSERT_EQ(extension.foreign_request_id, (UINT64CONST(78) << 18) | 7);
 	UT_ASSERT(extension.foreign_uba.raw[0] == tail_uba.raw[0]
 			  && extension.foreign_uba.raw[1] == tail_uba.raw[1]);
 	memset(&pending_locator, 0, sizeof(pending_locator));
-	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(
-		3, 78, &pending_locator));
+	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(3, 78, &pending_locator));
 	UT_ASSERT(pending_locator.uba.raw[0] == tail_uba.raw[0]
 			  && pending_locator.uba.raw[1] == tail_uba.raw[1]);
 
@@ -2057,21 +2040,19 @@ UT_TEST(test_r4_builder_foreign_resume_preserves_predecessor_and_step_count)
 		UT_ASSERT(memcmp(before_late, page, BLCKSZ) == 0);
 		extension.foreign_request_id = exact_id;
 	}
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
-		3, 78, true, &extension, page, foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 78, true, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
 	UT_ASSERT_EQ(memcmp(&extension, &expected_extension, sizeof(extension)), 0);
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
-	UT_ASSERT_EQ(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-					 TEST_TUPLE_LENGTH),
+	UT_ASSERT_EQ(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH),
 				 0);
 	UT_ASSERT(!ItemIdIsNormal(middle_item));
 	UT_ASSERT(!ItemIdIsNormal(newest_item));
 	UT_ASSERT_EQ(memcmp(foreign_page, tail_block, sizeof(foreign_page)), 0);
-	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(
-		3, 78, &pending_locator));
+	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(3, 78, &pending_locator));
 	cluster_cr_build_on_holder_forget(3, 78);
 }
 
@@ -2095,36 +2076,32 @@ UT_TEST(test_r4_builder_foreign_resume_accepts_unaligned_record_offset)
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
 	extension.route_proof.formation_epoch = 21;
-	(void)make_one_foreign_update_candidate_page(page, &extension,
-											 expected_old);
+	(void)make_one_foreign_update_candidate_page(page, &extension, expected_old);
 	foreign_uba = make_record_uba_in_segment(257, 9, 1);
 	slot = &ClusterPageGetItlSlots((Page)page)[0];
 	slot->undo_segment_head = foreign_uba;
 	record->origin_node_id = 1;
 	record->tt_slot_segment_id = 257;
-	make_unaligned_second_record_undo_block(
-		foreign_block.data, ut_undo_record, TEST_UNDO_RECORD_CAPACITY);
+	make_unaligned_second_record_undo_block(foreign_block.data, ut_undo_record,
+											sizeof(*record) + record->payload_length);
 	expected_extension = extension;
 	expected_extension.build_steps = 1;
 	old_item = PageGetItemId((Page)page, FirstOffsetNumber);
-	replacement_item
-		= PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
+	replacement_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
-		0, 79, false, &extension, page, foreign_block.data, &reason),
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 79, false, &extension, page, foreign_block.data,
+												 &reason),
 				 CLUSTER_R4_CR_STEP_NEED_UNDO);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(extension.foreign_row_offset, 1);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(
-		0, 79, true, &extension, page, foreign_block.data, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 79, true, &extension, page, foreign_block.data, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
 	UT_ASSERT_EQ(memcmp(&extension, &expected_extension, sizeof(extension)), 0);
 	UT_ASSERT(ItemIdIsNormal(old_item));
-	UT_ASSERT_EQ(memcmp(PageGetItem((Page)page, old_item), expected_old,
-					 TEST_TUPLE_LENGTH),
-				 0);
+	UT_ASSERT_EQ(memcmp(PageGetItem((Page)page, old_item), expected_old, TEST_TUPLE_LENGTH), 0);
 	UT_ASSERT(!ItemIdIsNormal(replacement_item));
 	cluster_cr_build_on_holder_forget(0, 79);
 }
@@ -2147,31 +2124,27 @@ UT_TEST(test_r4_builder_transaction_global_chain_skips_other_block)
 	extension.route_proof.tag.relNumber = 20000;
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
-	make_target_other_target_update_candidate_page(page, &extension,
-											expected_oldest);
+	make_target_other_target_update_candidate_page(page, &extension, expected_oldest);
 	expected_extension = extension;
 	expected_extension.build_steps = 3;
 	memset(foreign_page, 0x87, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 	oldest_item = PageGetItemId((Page)page, FirstOffsetNumber);
 	middle_item = PageGetItemId((Page)page, OffsetNumberNext(FirstOffsetNumber));
-	newest_item = PageGetItemId(
-		(Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
+	newest_item = PageGetItemId((Page)page, OffsetNumberNext(OffsetNumberNext(FirstOffsetNumber)));
 
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
 	UT_ASSERT(ItemIdIsNormal(middle_item));
 	UT_ASSERT(ItemIdIsNormal(newest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  != 0);
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(2, 77, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(2, 77, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 3);
 	UT_ASSERT(ItemIdIsNormal(oldest_item));
-	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest,
-				 TEST_TUPLE_LENGTH)
+	UT_ASSERT(memcmp(PageGetItem((Page)page, oldest_item), expected_oldest, TEST_TUPLE_LENGTH)
 			  == 0);
 	UT_ASSERT(!ItemIdIsNormal(middle_item));
 	UT_ASSERT(!ItemIdIsNormal(newest_item));
@@ -2197,17 +2170,16 @@ UT_TEST(test_r4_builder_rejects_malformed_off_target_relation_before_filter)
 	extension.route_proof.tag.relNumber = 20000;
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
-	make_target_other_target_update_candidate_page(page, &extension,
-											expected_oldest);
+	make_target_other_target_update_candidate_page(page, &extension, expected_oldest);
 	middle->target_locator.relNumber = InvalidRelFileNumber;
 	expected_extension = extension;
 	expected_extension.build_steps = 2;
 	memset(foreign_page, 0x78, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(3, 80, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(3, 80, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
 	UT_ASSERT(memcmp(&extension, &expected_extension, sizeof(extension)) == 0);
@@ -2224,8 +2196,7 @@ UT_TEST(test_r4_builder_rejects_off_target_itl_invalid_slot_before_filter)
 	char foreign_page[BLCKSZ];
 	char foreign_before[BLCKSZ];
 	UndoRecordHeader *middle = (UndoRecordHeader *)ut_second_undo_record;
-	UndoItlPayload *payload
-		= (UndoItlPayload *)(ut_second_undo_record + sizeof(UndoRecordHeader));
+	UndoItlPayload *payload = (UndoItlPayload *)(ut_second_undo_record + sizeof(UndoRecordHeader));
 	ClusterR4CrSlotExtension extension = make_builder_extension(81, 111);
 	ClusterR4CrSlotExtension expected_extension;
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
@@ -2235,8 +2206,7 @@ UT_TEST(test_r4_builder_rejects_off_target_itl_invalid_slot_before_filter)
 	extension.route_proof.tag.relNumber = 20000;
 	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
 	extension.route_proof.tag.blockNum = 37;
-	make_target_other_target_update_candidate_page(page, &extension,
-											expected_oldest);
+	make_target_other_target_update_candidate_page(page, &extension, expected_oldest);
 	middle->record_type = UNDO_RECORD_ITL;
 	middle->payload_length = sizeof(*payload);
 	memset(payload, 0, sizeof(*payload));
@@ -2247,9 +2217,9 @@ UT_TEST(test_r4_builder_rejects_off_target_itl_invalid_slot_before_filter)
 	memset(foreign_page, 0x69, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 81, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 81, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
 	UT_ASSERT(memcmp(&extension, &expected_extension, sizeof(extension)) == 0);
@@ -2298,9 +2268,9 @@ UT_TEST(test_r4_builder_cross_segment_cycle_fails_before_repeat_fetch)
 	memset(foreign_page, 0x78, sizeof(foreign_page));
 	memcpy(foreign_before, foreign_page, sizeof(foreign_page));
 
-	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(2, 83, false, &extension, page,
-											 foreign_page, &reason),
-				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(2, 83, false, &extension, page, foreign_page, &reason),
+		CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_BAD_UNDO);
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
@@ -2979,10 +2949,513 @@ UT_TEST(test_r4_history_detail_limit_never_changes_the_refusal)
 	UT_ASSERT(strstr(ut_horizon_log, "detail_limit=1") != NULL);
 }
 
+/* Independent wire fixture: keep the producer's persisted bytes explicit. */
+typedef struct TestUndoHistoryEntry {
+	uint32 block;
+	uint8 slot_index;
+	uint8 after_kind;
+	uint16 reserved;
+	SCN after_write_scn;
+	ClusterItlSlotData prior;
+} TestUndoHistoryEntry;
+
+typedef struct TestUndoHistoryTrailer {
+	uint32 magic;
+	uint16 version;
+	uint8 count;
+	uint8 reserved;
+	TestUndoHistoryEntry entries[2];
+} TestUndoHistoryTrailer;
+
+StaticAssertDecl(sizeof(TestUndoHistoryTrailer) == 136, "history fixture is136 bytes");
+
+UT_TEST(test_page_history_restores_reused_slot_across_transaction_identity)
+{
+	PGAlignedBlock page;
+	PGAlignedBlock foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(606, 906);
+	ClusterCrBuildReason reason;
+	UndoRecordHeader *new_record = (UndoRecordHeader *)ut_undo_record;
+	UndoRecordHeader *old_record = (UndoRecordHeader *)ut_second_undo_record;
+	TestUndoHistoryTrailer history;
+	ClusterItlSlotData *slot;
+	HeapTupleHeader tuple;
+	PageHeader header;
+	Size trailer_offset = sizeof(UndoRecordHeader) + sizeof(UndoInsertPayload);
+
+	make_one_insert_candidate_page(page.data, &extension);
+	header = (PageHeader)page.data;
+	header->pd_lower += sizeof(ItemIdData);
+	header->pd_upper -= TEST_TUPLE_LENGTH;
+	ItemIdSetNormal(PageGetItemId((Page)page.data, 2), header->pd_upper, TEST_TUPLE_LENGTH);
+	tuple = (HeapTupleHeader)PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1));
+	memset(tuple, 0, TEST_TUPLE_LENGTH);
+	HeapTupleHeaderSetXmin(tuple, TEST_XID - 1);
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_infomask = HEAP_XMAX_INVALID;
+	ItemPointerSet(&tuple->t_ctid, 37, 1);
+	tuple = (HeapTupleHeader)PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 2));
+	memset(tuple, 0, TEST_TUPLE_LENGTH);
+	HeapTupleHeaderSetXmin(tuple, TEST_XID);
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_infomask = HEAP_XMAX_INVALID;
+	ItemPointerSet(&tuple->t_ctid, 37, 2);
+	slot = &ClusterPageGetItlSlots((Page)page.data)[0];
+	slot->wrap = TEST_WRAP + 1;
+	slot->flags = ITL_FLAG_COMMITTED;
+	slot->commit_scn = 210;
+	new_record->target_offset = 2;
+	new_record->write_scn = 201;
+	new_record->flags |= UINT8_C(0x08);
+	new_record->payload_length += sizeof(history);
+	memset(&history, 0, sizeof(history));
+	history.magic = UINT32_C(0x49544c48);
+	history.version = 1;
+	history.count = 1;
+	history.entries[0].block = 37;
+	history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+	history.entries[0].after_write_scn = 200;
+	history.entries[0].prior = *slot;
+	history.entries[0].prior.xid = TEST_XID - 1;
+	history.entries[0].prior.wrap = TEST_WRAP;
+	history.entries[0].prior.write_scn = 150;
+	history.entries[0].prior.commit_scn = 160;
+	ut_expected_second_record_uba = make_record_uba(7, 0);
+	history.entries[0].prior.undo_segment_head = ut_expected_second_record_uba;
+	memcpy(ut_undo_record + trailer_offset, &history, sizeof(history));
+	ut_undo_record_length = trailer_offset + sizeof(history);
+	memcpy(ut_second_undo_record, ut_undo_record, ut_undo_record_length);
+	old_record->xid = TEST_XID - 1;
+	old_record->target_offset = 1;
+	old_record->write_scn = 151;
+	history.entries[0].after_write_scn = 150;
+	memset(&history.entries[0].prior, 0, sizeof(history.entries[0].prior));
+	history.entries[0].prior.wrap = TEST_WRAP;
+	memcpy(ut_second_undo_record + trailer_offset, &history, sizeof(history));
+	ut_second_undo_record_length = ut_undo_record_length;
+	ut_two_record_sequence = true;
+	memset(foreign.data, 0, BLCKSZ);
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 606, false, &extension, page.data, foreign.data,
+												 &reason),
+				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 2);
+	UT_ASSERT_EQ(extension.build_steps, 2);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)page.data, 1)));
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)page.data, 2)));
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_FREE);
+	UT_ASSERT_EQ(slot->wrap, TEST_WRAP);
+	UT_ASSERT(UBA_is_invalid(slot->undo_segment_head));
+	cluster_cr_build_on_holder_forget(0, 606);
+	ut_two_record_sequence = false;
+}
+
+static void
+make_many_page_history(char *page, ClusterR4CrSlotExtension *extension, bool same_xid,
+					   bool interleaved, bool lock_carrier)
+{
+	UndoRecordHeader base;
+	PageHeader page_header = (PageHeader)page;
+	ClusterItlSlotData *slots;
+	unsigned i;
+
+	make_one_insert_candidate_page(page, extension);
+	base = *(UndoRecordHeader *)ut_undo_record;
+	make_zero_candidate_page(page);
+	page_header->pd_lower = SizeOfPageHeaderData + TEST_HISTORY_RECORDS * sizeof(ItemIdData);
+	slots = ClusterPageGetItlSlots((Page)page);
+	for (i = 0; i < TEST_HISTORY_RECORDS; i++) {
+		unsigned slot_index = interleaved ? i % 2 : 0;
+		ClusterItlSlotData *slot = &slots[slot_index];
+		UndoRecordHeader *record = (UndoRecordHeader *)ut_history_records[i].data;
+		UndoItlHistoryTrailer history = { 0 };
+		UndoInsertPayload insert = { TEST_TUPLE_LENGTH, 0 };
+		bool lock_record = lock_carrier && i == 5;
+		uint8 after_kind = lock_record ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+		HeapTupleHeader tuple;
+		Size body_length = lock_record ? sizeof(UndoItlPayload) : sizeof(insert);
+
+		memset(ut_history_records[i].data, 0, BLCKSZ);
+		*record = base;
+		record->record_type = lock_record ? UNDO_RECORD_ITL : UNDO_RECORD_INSERT;
+		record->xid = same_xid ? TEST_XID : TEST_XID + i;
+		record->target_offset = lock_record ? 1 : i + 1;
+		record->write_scn = 151 + i * 10;
+		record->flags = UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_FIRST_IN_TX;
+		ut_history_ubas[i] = make_record_uba(7, i);
+		if (same_xid && i > 0) {
+			record->prev_uba = ut_history_ubas[i - 1];
+			record->flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+		}
+		record->payload_length = body_length + sizeof(history);
+		history.magic = UNDO_ITL_HISTORY_MAGIC;
+		history.version = UNDO_ITL_HISTORY_VERSION;
+		history.count = 1;
+		history.entries[0].block = 37;
+		history.entries[0].slot_index = slot_index;
+		history.entries[0].after_kind = after_kind;
+		history.entries[0].after_write_scn = record->write_scn - 1;
+		history.entries[0].prior = *slot;
+		if (slot->flags != ITL_FLAG_FREE
+			&& !(slot->flags == after_kind && slot->xid == record->xid))
+			slot->wrap++;
+		slot->xid = record->xid;
+		slot->flags = same_xid		? after_kind
+					  : lock_record ? ITL_FLAG_LOCK_ONLY_COMMITTED
+									: ITL_FLAG_COMMITTED;
+		slot->write_scn = history.entries[0].after_write_scn;
+		slot->commit_scn = same_xid ? InvalidScn : slot->write_scn + 2;
+		slot->undo_segment_head = ut_history_ubas[i];
+		if (lock_record) {
+			UndoItlPayload lock = { 0 };
+
+			lock.itl_slot_idx = slot_index;
+			lock.new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+			lock.lock_xid = record->xid;
+			lock.prev_flags = history.entries[0].prior.flags;
+			lock.prev_commit_scn = history.entries[0].prior.commit_scn;
+			lock.prev_undo_segment_head = history.entries[0].prior.undo_segment_head;
+			lock.prev_infomask = HEAP_XMAX_INVALID;
+			memcpy((char *)record + sizeof(*record), &lock, sizeof(lock));
+			tuple = (HeapTupleHeader)PageGetItem((Page)page, PageGetItemId((Page)page, 1));
+			HeapTupleHeaderSetXmax(tuple, record->xid);
+			tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+			ItemIdSetUnused(PageGetItemId((Page)page, i + 1));
+		} else {
+			memcpy((char *)record + sizeof(*record), &insert, sizeof(insert));
+			page_header->pd_upper -= TEST_TUPLE_LENGTH;
+			ItemIdSetNormal(PageGetItemId((Page)page, i + 1), page_header->pd_upper,
+							TEST_TUPLE_LENGTH);
+			tuple = (HeapTupleHeader)(page + page_header->pd_upper);
+			memset(tuple, 0, TEST_TUPLE_LENGTH);
+			tuple->t_hoff = SizeofHeapTupleHeader;
+			tuple->t_infomask = HEAP_XMAX_INVALID;
+			tuple->t_itl_slot_idx = slot_index;
+			HeapTupleHeaderSetXmin(tuple, record->xid);
+			ItemPointerSet(&tuple->t_ctid, 37, i + 1);
+		}
+		memcpy((char *)record + sizeof(*record) + body_length, &history, sizeof(history));
+	}
+	ut_history_sequence = true;
+	ut_undo_get_record_calls = 0;
+}
+
+UT_TEST(test_page_history_more_than_eight_writers_and_interleaved_heads)
+{
+	unsigned variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		PGAlignedBlock page;
+		PGAlignedBlock foreign;
+		ClusterR4CrSlotExtension extension = make_builder_extension(607 + variant, 907 + variant);
+		ClusterCrBuildReason reason;
+		unsigned i;
+
+		make_many_page_history(page.data, &extension, variant == 1, variant == 2, variant == 3);
+		if (variant == 1)
+			extension.route_proof.read_scn = 195; /* five earlier same-xid creations must survive */
+		UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 607 + variant, false, &extension, page.data,
+													 foreign.data, &reason),
+					 CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+		UT_ASSERT_EQ(ut_undo_get_record_calls, variant == 1 ? 7 : TEST_HISTORY_RECORDS);
+		for (i = 0; i < TEST_HISTORY_RECORDS; i++)
+			UT_ASSERT_EQ(ItemIdIsNormal(PageGetItemId((Page)page.data, i + 1)),
+						 variant == 1 && i < 5);
+		cluster_cr_build_on_holder_forget(0, 607 + variant);
+		ut_history_sequence = false;
+	}
+}
+
+UT_TEST(test_page_history_corruption_never_falls_back_to_legacy_or_partial_full)
+{
+	unsigned variant;
+
+	for (variant = 0; variant < 7; variant++) {
+		PGAlignedBlock page;
+		PGAlignedBlock foreign;
+		ClusterR4CrSlotExtension extension = make_builder_extension(620 + variant, 920 + variant);
+		ClusterCrBuildReason reason;
+		UndoRecordHeader *head;
+		UndoItlHistoryTrailer history;
+
+		make_many_page_history(page.data, &extension, false, false, false);
+		head = (UndoRecordHeader *)ut_history_records[TEST_HISTORY_RECORDS - 1].data;
+		memcpy(&history, (char *)head + sizeof(*head) + sizeof(UndoInsertPayload), sizeof(history));
+		switch (variant) {
+		case 0:
+			history.entries[0].prior.wrap++;
+			break;
+		case 1:
+			history.entries[0].prior.xid++;
+			break;
+		case 2:
+			history.entries[0].prior.undo_segment_head = ut_history_ubas[TEST_HISTORY_RECORDS - 1];
+			break;
+		case 3:
+			history.entries[0].prior.write_scn = history.entries[0].after_write_scn;
+			break;
+		case 4:
+			history.entries[0].prior.undo_segment_head = make_record_uba(9, 0);
+			break;
+		case 5:
+			((UndoRecordHeader *)ut_history_records[TEST_HISTORY_RECORDS - 2].data)->flags
+				&= ~UNDO_REC_FLAG_HAS_ITL_HISTORY;
+			break;
+		case 6: {
+			HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(
+				(Page)page.data, PageGetItemId((Page)page.data, TEST_HISTORY_RECORDS));
+			HeapTupleHeaderSetXmin(tuple, 999999);
+			break;
+		}
+		}
+		memcpy((char *)head + sizeof(*head) + sizeof(UndoInsertPayload), &history, sizeof(history));
+		UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 620 + variant, false, &extension, page.data,
+													 foreign.data, &reason),
+					 CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT(reason == CLUSTER_CR_BUILD_BAD_UNDO
+				  || reason == CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
+		cluster_cr_build_on_holder_forget(0, 620 + variant);
+		ut_history_sequence = false;
+	}
+}
+
+UT_TEST(test_page_history_foreign_continuation_restores_local_predecessor_and_forgets)
+{
+	PGAlignedBlock page;
+	PGAlignedBlock foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(640, 940);
+	ClusterCrBuildReason reason;
+	UndoRecordHeader *head;
+	ClusterTxLocator pending;
+
+	make_many_page_history(page.data, &extension, false, false, false);
+	head = (UndoRecordHeader *)ut_history_records[TEST_HISTORY_RECORDS - 1].data;
+	head->origin_node_id = 1;
+	head->tt_slot_segment_id = 257;
+	ClusterPageGetItlSlots((Page)page.data)[0].undo_segment_head
+		= make_record_uba_in_segment(257, 7, 0);
+	make_single_record_undo_block(foreign.data, (char *)head, sizeof(*head) + head->payload_length);
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 640, false, &extension, page.data, foreign.data,
+												 &reason),
+				 CLUSTER_R4_CR_STEP_NEED_UNDO);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
+	UT_ASSERT(cluster_cr_build_on_holder_pending_locator(0, 640, &pending));
+	UT_ASSERT_EQ(extension.foreign_origin_node, 1);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 640, true, &extension, page.data, foreign.data, &reason),
+		CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(extension.build_steps, TEST_HISTORY_RECORDS);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, TEST_HISTORY_RECORDS - 1);
+	UT_ASSERT(!cluster_cr_build_on_holder_pending_locator(0, 640, &pending));
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 640, true, &extension, page.data, foreign.data, &reason),
+		CLUSTER_R4_CR_STEP_FAIL); /* duplicate cannot resume */
+	cluster_cr_build_on_holder_forget(0, 640);
+	UT_ASSERT_EQ(
+		cluster_cr_build_on_holder_step(0, 640, true, &extension, page.data, foreign.data, &reason),
+		CLUSTER_R4_CR_STEP_FAIL); /* late after exact forget */
+	ut_history_sequence = false;
+}
+
+UT_TEST(test_page_history_cross_page_update_applies_only_matching_entry)
+{
+	unsigned successor;
+
+	for (successor = 0; successor < 2; successor++) {
+		PGAlignedBlock page;
+		PGAlignedBlock foreign;
+		ClusterR4CrSlotExtension extension
+			= make_builder_extension(641 + successor, 941 + successor);
+		ClusterCrBuildReason reason;
+		char old_image[TEST_TUPLE_LENGTH];
+		UndoRecordHeader *record;
+		UndoUpdatePayload *update;
+		UndoItlHistoryTrailer history = { 0 };
+		ClusterItlSlotData *slot;
+		HeapTupleHeader tuple;
+		Size body_length;
+
+		extension.route_proof.tag.spcOid = 1663;
+		extension.route_proof.tag.dbOid = 5;
+		extension.route_proof.tag.relNumber = 20000;
+		extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+		extension.route_proof.tag.blockNum = 37;
+		make_one_update_candidate_page(page.data, &extension, old_image);
+		record = (UndoRecordHeader *)ut_undo_record;
+		update = (UndoUpdatePayload *)(ut_undo_record + sizeof(*record));
+		update->new_block = 38;
+		update->new_offset = 2;
+		body_length = record->payload_length;
+		history.magic = UNDO_ITL_HISTORY_MAGIC;
+		history.version = UNDO_ITL_HISTORY_VERSION;
+		history.count = 2;
+		history.entries[0].block = 37;
+		history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+		history.entries[0].after_write_scn = 200;
+		history.entries[0].prior.wrap = TEST_WRAP;
+		history.entries[1] = history.entries[0];
+		history.entries[1].block = 38;
+		record->flags |= UNDO_REC_FLAG_HAS_ITL_HISTORY;
+		record->payload_length += sizeof(history);
+		memcpy(ut_undo_record + sizeof(*record) + body_length, &history, sizeof(history));
+		ut_undo_record_length += sizeof(history);
+		slot = &ClusterPageGetItlSlots((Page)page.data)[0];
+		slot->wrap = TEST_WRAP;
+		if (successor) {
+			extension.route_proof.tag.blockNum = 38;
+			tuple
+				= (HeapTupleHeader)PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1));
+			HeapTupleHeaderSetXmin(tuple,
+								   123456); /* unrelated old-page offset must not be restored */
+		}
+		UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 641 + successor, false, &extension,
+													 page.data, foreign.data, &reason),
+					 CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+		UT_ASSERT_EQ(slot->flags, ITL_FLAG_FREE);
+		if (successor) {
+			UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page.data, 2)));
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 123456);
+		} else {
+			UT_ASSERT_EQ(memcmp(PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1)),
+								old_image, sizeof(old_image)),
+						 0);
+			UT_ASSERT(ItemIdIsNormal(
+				PageGetItemId((Page)page.data, 2))); /* a different page owns successor */
+		}
+		cluster_cr_build_on_holder_forget(0, 641 + successor);
+	}
+}
+
+UT_TEST(test_page_history_reclaims_removed_successor_storage_before_readding_old_version)
+{
+	PGAlignedBlock page;
+	PGAlignedBlock foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(643, 943);
+	ClusterCrBuildReason reason;
+	char old_image[TEST_TUPLE_LENGTH];
+	UndoRecordHeader *record;
+	UndoItlHistoryTrailer history = { 0 };
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page.data, &extension, old_image);
+	record = (UndoRecordHeader *)ut_undo_record;
+	history.magic = UNDO_ITL_HISTORY_MAGIC;
+	history.version = UNDO_ITL_HISTORY_VERSION;
+	history.count = 1;
+	history.entries[0].block = 37;
+	history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+	history.entries[0].after_write_scn = 200;
+	history.entries[0].prior.wrap = TEST_WRAP;
+	memcpy(ut_undo_record + ut_undo_record_length, &history, sizeof(history));
+	record->flags |= UNDO_REC_FLAG_HAS_ITL_HISTORY;
+	record->payload_length += sizeof(history);
+	ut_undo_record_length += sizeof(history);
+	ItemIdSetUnused(PageGetItemId((Page)page.data, 1));
+	((PageHeader)page.data)->pd_upper = ((PageHeader)page.data)->pd_lower;
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 643, false, &extension, page.data, foreign.data,
+												 &reason),
+				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)page.data, 1)));
+	if (ItemIdIsNormal(PageGetItemId((Page)page.data, 1)))
+		UT_ASSERT_EQ(memcmp(PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1)),
+							old_image, sizeof(old_image)),
+					 0);
+	cluster_cr_build_on_holder_forget(0, 643);
+}
+
+UT_TEST(test_synchronous_entry_consumes_new_history_not_transaction_chain)
+{
+	PGAlignedBlock page, before;
+	ClusterR4CrSlotExtension extension = make_builder_extension(644, 944);
+	uint32 steps = 0;
+	bool partial = true;
+	unsigned i;
+
+	make_many_page_history(page.data, &extension, false, false, true);
+	UT_ASSERT(cr_history_test_synchronous(page.data, 100, &extension.route_proof.tag, true,
+										  &partial, &steps));
+	UT_ASSERT_EQ(steps, TEST_HISTORY_RECORDS);
+	UT_ASSERT(!partial);
+	for (i = 1; i <= TEST_HISTORY_RECORDS; i++)
+		UT_ASSERT(!ItemIdIsNormal(PageGetItemId(page.data, i)));
+	UT_ASSERT_EQ(ClusterPageGetItlSlots(page.data)[0].flags, ITL_FLAG_FREE);
+	ut_history_sequence = false;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	memcpy(before.data, page.data, BLCKSZ);
+	steps = 0;
+	UT_ASSERT(!cr_history_test_synchronous(page.data, 100, &extension.route_proof.tag, false,
+										   &partial, &steps));
+	UT_ASSERT_EQ(steps, 0);
+	UT_ASSERT_EQ(memcmp(page.data, before.data, BLCKSZ), 0);
+}
+
+UT_TEST(test_retained_insert_into_real_line_pointer_hole_restores_page)
+{
+	PGAlignedBlock page, foreign;
+	char old_tuple[TEST_TUPLE_LENGTH] = { 0 };
+	char new_tuple[TEST_TUPLE_LENGTH] = { 0 };
+	ClusterR4CrSlotExtension extension = make_builder_extension(645, 945);
+	ClusterCrBuildReason reason;
+	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
+	UndoInsertPayload *insert = (UndoInsertPayload *)(ut_undo_record + sizeof(*record));
+	UndoItlHistoryTrailer history = { 0 };
+	OffsetNumber actual;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	((HeapTupleHeader)old_tuple)->t_hoff = SizeofHeapTupleHeader;
+	HeapTupleHeaderSetXmin((HeapTupleHeader)old_tuple, TEST_XID - 1);
+	((HeapTupleHeader)new_tuple)->t_hoff = SizeofHeapTupleHeader;
+	HeapTupleHeaderSetXmin((HeapTupleHeader)new_tuple, TEST_XID);
+	ItemIdSetUnused(PageGetItemId(page.data, 1));
+	UT_ASSERT_EQ(PageAddItem(page.data, old_tuple, sizeof(old_tuple), 2, false, true), 2);
+	PageSetHasFreeLinePointers(page.data);
+	actual = PageAddItem(page.data, new_tuple, sizeof(new_tuple), InvalidOffsetNumber, false, true);
+	UT_ASSERT_EQ(actual, 1);
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(page.data), 2);
+	record->target_offset = actual;
+	record->flags |= UNDO_REC_FLAG_HAS_ITL_HISTORY;
+	insert->inserted_tuple_len = sizeof(new_tuple);
+	history.magic = UNDO_ITL_HISTORY_MAGIC;
+	history.version = UNDO_ITL_HISTORY_VERSION;
+	history.count = 1;
+	history.entries[0].block = 37;
+	history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+	history.entries[0].after_write_scn = 200;
+	history.entries[0].prior.wrap = TEST_WRAP;
+	memcpy(ut_undo_record + ut_undo_record_length, &history, sizeof(history));
+	record->payload_length += sizeof(history);
+	ut_undo_record_length += sizeof(history);
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 645, false, &extension, page.data, foreign.data,
+												 &reason),
+				 CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(!ItemIdIsNormal(PageGetItemId(page.data, 1)));
+	UT_ASSERT(ItemIdIsNormal(PageGetItemId(page.data, 2)));
+	UT_ASSERT_EQ(
+		memcmp(PageGetItem(page.data, PageGetItemId(page.data, 2)), old_tuple, sizeof(old_tuple)),
+		0);
+	UT_ASSERT_EQ(ClusterPageGetItlSlots(page.data)[0].flags, ITL_FLAG_FREE);
+	cluster_cr_build_on_holder_forget(0, 645);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(75);
+	UT_PLAN(83);
+	UT_RUN(test_retained_insert_into_real_line_pointer_hole_restores_page);
+	UT_RUN(test_synchronous_entry_consumes_new_history_not_transaction_chain);
+	UT_RUN(test_page_history_reclaims_removed_successor_storage_before_readding_old_version);
+	UT_RUN(test_page_history_foreign_continuation_restores_local_predecessor_and_forgets);
+	UT_RUN(test_page_history_cross_page_update_applies_only_matching_entry);
+	UT_RUN(test_page_history_more_than_eight_writers_and_interleaved_heads);
+	UT_RUN(test_page_history_corruption_never_falls_back_to_legacy_or_partial_full);
+	UT_RUN(test_page_history_restores_reused_slot_across_transaction_identity);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);

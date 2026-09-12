@@ -249,7 +249,7 @@ typedef struct UndoSegmentHeaderData {
 
 	/* === 32 bytes: retention info === */
 	SCN oldest_active_scn;	  /* offset 64; 8 B */
-	SCN commit_horizon_scn;	  /* offset 72; 8 B */
+	SCN commit_horizon_scn;	  /* offset 72; final record-drain bound, not a TT commit */
 	TimestampTz created_at;	  /* offset 80; 8 B */
 	TimestampTz last_used_at; /* offset 88; 8 B */
 
@@ -301,8 +301,7 @@ StaticAssertDecl(offsetof(UndoSegmentHeaderData, segment_id) == 32,
 StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots) == 112,
 				 "spec-1.21 invariant: tt_slots embedded at byte 112 "
 				 "(C natural alignment shifts the v0.2 body table value 108 by +4)");
-StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots)
-						 + TT_SLOTS_PER_SEGMENT * sizeof(TTSlot)
+StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots) + TT_SLOTS_PER_SEGMENT * sizeof(TTSlot)
 					 <= 4096,
 				 "spec-8.4A invariant: durable TT slots must fit in the first half page");
 StaticAssertDecl(offsetof(UndoSegmentHeaderData, free_block_bitmap) == 1656,
@@ -394,6 +393,21 @@ static inline void
 UndoSegmentHeader_set_record_seal_upper_scn(UndoSegmentHeaderData *hdr, SCN scn)
 {
 	hdr->oldest_active_scn = scn;
+}
+
+/* Persisted semantics since catalog 202609120. The seal orders admission of
+ * writers; this later bound is sampled only after those writers have drained.
+ * Zero is unknown and cannot authorize record-byte reuse. */
+static inline SCN
+UndoSegmentHeader_record_drain_upper_scn(const UndoSegmentHeaderData *hdr)
+{
+	return hdr->commit_horizon_scn;
+}
+
+static inline void
+UndoSegmentHeader_set_record_drain_upper_scn(UndoSegmentHeaderData *hdr, SCN scn)
+{
+	hdr->commit_horizon_scn = scn;
 }
 
 

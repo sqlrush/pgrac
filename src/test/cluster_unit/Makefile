@@ -3068,15 +3068,19 @@ test_cluster_r4_multi_subx_2pc: test_cluster_r4_multi_subx_2pc.c unit_test.h \
 # copied page.  Function sections retain only the builder entry/context;
 # cluster_cr_apply.o supplies the existing pure candidate collector.
 CLUSTER_R4_CR_WALK_TEST_O = test_cluster_r4_cr_walk_product.o
-$(CLUSTER_R4_CR_WALK_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c \
-		$(top_srcdir)/src/include/cluster/cluster_cr.h
+$(CLUSTER_R4_CR_WALK_TEST_O): test_cluster_r4_cr_walk_product.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cr.c \
+		$(top_srcdir)/src/include/cluster/cluster_cr.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
+		test_cluster_hot_bufpage_product.o \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) $(CLUSTER_CR_APPLY_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) \
 		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -4016,6 +4020,7 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		test_cluster_undo_ctrc_product.o \
+		$(CLUSTER_UBA_O) \
 		../../../src/include/cluster/cluster_undo_record_api.h \
 		../../../src/include/cluster/storage/cluster_undo_alloc.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
@@ -4026,7 +4031,7 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
 		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
 		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
-		$< test_cluster_undo_ctrc_product.o \
+		$< test_cluster_undo_ctrc_product.o $(CLUSTER_UBA_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -4039,6 +4044,7 @@ test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
+		$(CLUSTER_UBA_O) \
 		test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
 		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
@@ -4050,7 +4056,7 @@ test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.
 		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
 		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
 		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
-		$< test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		$< test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UBA_O) \
 		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

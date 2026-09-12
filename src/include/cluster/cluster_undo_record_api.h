@@ -43,12 +43,12 @@
 #ifndef FRONTEND
 
 #include "postgres.h"
-#include "access/transam.h"						/* TransactionId */
-#include "storage/relfilelocator.h"				/* RelFileLocator */
-#include "storage/block.h"						/* BlockNumber */
-#include "storage/itemptr.h"					/* OffsetNumber */
-#include "common/relpath.h"						/* ForkNumber */
-#include "cluster/cluster_itl_slot.h"			/* UBA */
+#include "access/transam.h"			  /* TransactionId */
+#include "storage/relfilelocator.h"	  /* RelFileLocator */
+#include "storage/block.h"			  /* BlockNumber */
+#include "storage/itemptr.h"		  /* OffsetNumber */
+#include "common/relpath.h"			  /* ForkNumber */
+#include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_record.h"		/* UndoRecordType */
@@ -120,6 +120,9 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	uint8 ctrc_applied_mask;
 	uint8 ctrc_reuse_mask;
 	uint8 ctrc_reserved8[4];
+	UndoItlHistoryEntry itl_history[UNDO_ITL_HISTORY_TARGETS];
+	uint8 itl_history_mask;
+	uint8 itl_history_reserved[7];
 } ClusterUndoRecordPrepareReceipt;
 
 /* Diagnostic counters, not receipt state or authority. */
@@ -154,44 +157,47 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt
 										uint16 payload_len, bool targets_invalidated);
 
 extern uint64 cluster_undo_record_prepare_deadline_us(void);
-extern ClusterUndoRecordPrepareResult cluster_undo_record_prepare(
-	uint8 record_type, uint16 payload_capacity,
-	uint16 tt_slot_segment_id, uint16 tt_slot_offset, UBA prev_uba,
-	uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
-extern bool cluster_undo_record_prepared_recheck(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
-extern bool cluster_undo_record_prepared_uba_exact(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
-	UBA *uba_out);
-extern bool cluster_undo_record_ctrc_stage_pending(
-	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
-	const ClusterCtrcTargetV1 *pending_target);
-extern bool cluster_undo_record_ctrc_prepare_pending(
-	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal);
-extern bool cluster_undo_record_ctrc_stage_reuse(
-	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
-	const ClusterCtrcReceiptHandle *handle);
-extern bool cluster_undo_record_ctrc_pending_matches(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
-	const ClusterCtrcTargetV1 *pending_target);
+extern ClusterUndoRecordPrepareResult
+cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity, uint16 tt_slot_segment_id,
+							uint16 tt_slot_offset, UBA prev_uba, uint64 absolute_deadline_us,
+							ClusterUndoRecordPrepareReceipt *receipt);
+extern bool cluster_undo_record_prepared_recheck(const ClusterUndoRecordPrepareReceipt *receipt,
+												 uint16 payload_len);
+extern bool cluster_undo_record_prepared_uba_exact(const ClusterUndoRecordPrepareReceipt *receipt,
+												   uint16 payload_len, UBA *uba_out);
+extern bool cluster_undo_record_stage_history(ClusterUndoRecordPrepareReceipt *receipt,
+											  uint8 target_ordinal,
+											  const UndoItlHistoryEntry *entry);
+extern bool cluster_undo_record_history_matches(const ClusterUndoRecordPrepareReceipt *receipt,
+												uint8 target_ordinal,
+												const UndoItlHistoryEntry *entry);
+extern bool cluster_undo_record_ctrc_stage_pending(ClusterUndoRecordPrepareReceipt *receipt,
+												   uint8 target_ordinal,
+												   const ClusterCtrcTargetV1 *pending_target);
+extern bool cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receipt,
+													 uint8 target_ordinal);
+extern bool cluster_undo_record_ctrc_stage_reuse(ClusterUndoRecordPrepareReceipt *receipt,
+												 uint8 target_ordinal,
+												 const ClusterCtrcReceiptHandle *handle);
+extern bool cluster_undo_record_ctrc_pending_matches(const ClusterUndoRecordPrepareReceipt *receipt,
+													 uint8 target_ordinal,
+													 const ClusterCtrcTargetV1 *pending_target);
 extern bool cluster_undo_record_ctrc_pending_recheck(const ClusterUndoRecordPrepareReceipt *receipt,
 													 uint8 target_ordinal,
 													 const ClusterCtrcTargetV1 *pending_target);
-extern bool cluster_undo_record_ctrc_required_prepared(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask);
+extern bool
+cluster_undo_record_ctrc_required_prepared(const ClusterUndoRecordPrepareReceipt *receipt,
+										   uint8 required_mask);
 extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(
 	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
-	const ClusterCtrcTargetV1 *final_target,
-	ClusterCtrcApplyToken *token);
-extern void cluster_undo_record_cancel_prepared(
-	ClusterUndoRecordPrepareReceipt *receipt);
+	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
+extern void cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt);
 extern ClusterUndoRecordConsumePreflightResult
-cluster_undo_record_consume_preflight(
-	ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
-extern ClusterUndoRecordConsumeResult cluster_undo_record_consume_prepared(
-	ClusterUndoRecordPrepareReceipt *receipt,
-	const ClusterUndoRecordTarget *target, const void *payload,
-	uint16 payload_len, UBA *out_uba);
+cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
+extern ClusterUndoRecordConsumeResult
+cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
+									 const ClusterUndoRecordTarget *target, const void *payload,
+									 uint16 payload_len, UBA *out_uba);
 
 
 /*
