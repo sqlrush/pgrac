@@ -323,6 +323,7 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 											  const ClusterBufferBarrierSiteId *site,
 											  struct ResourceXAuxiliaryAcquireContext *context);
 extern bool ClusterBufferAuxiliaryObservationUnowned(Buffer buffer);
+extern bool ClusterBufferDirectInitObservationUnowned(Buffer buffer);
 /* PGRAC: EXCLUSIVE lock for pass-based auxiliary work.  False is a clean
  * pre-content-X Resource-X retry; the caller retains only its original pin. */
 extern bool ClusterLockBufferExclusiveRetryAware(Buffer buffer);

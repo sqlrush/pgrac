@@ -14323,6 +14323,117 @@ pcm_resource_x_target_install_terminal_observation_exact(
 		&& observed->resource_x_activation_generation == 0;
 }
 
+/* A creator that deliberately dropped every pin can miss its completed
+ * installation and source release. Physical replacement alone is not enough:
+ * pair it with the exact existing lifecycle, and export no authority. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_aux_creation_reobserve_exact(
+	const ResourceXAssertion *assertion, int32 master_node, uint64 formation, uint64 master_session,
+	uint64 r4_generation, uint32 requester_connection, uint32 master_connection,
+	const ResourceXCallerWitness *caller, uint64 pending_generation, uint64 reservation_token,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	const ClusterPcmResourceXBootstrapRound *round;
+	const ClusterPcmResourceXLocalOwner *owner;
+	ResourceXApplyResult history = RESOURCE_X_APPLY_NOT_FOUND;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_NOT_FOUND;
+	bool same_claim;
+	uint64 attempt;
+
+	if (!resource_x_assertion_valid(assertion) || assertion->requester_node != cluster_node_id
+		|| (BufTagGetForkNum(&assertion->resource) != VISIBILITYMAP_FORKNUM
+			&& BufTagGetForkNum(&assertion->resource) != FSM_FORKNUM)
+		|| master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || formation == 0
+		|| formation == UINT64_MAX || master_session == 0 || master_session == UINT64_MAX
+		|| r4_generation == 0 || r4_generation == UINT64_MAX || requester_connection == 0
+		|| requester_connection == UINT32_MAX || master_connection == 0
+		|| master_connection == UINT32_MAX || pending_generation >= UINT64_MAX - 1
+		|| reservation_token == 0 || reservation_token >= UINT64_MAX - 1 || caller == NULL
+		|| observed == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (caller->failed_attempt != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (observed->generation == UINT64_MAX || observed->reservation_token == UINT64_MAX)
+		return RESOURCE_X_APPLY_STALE;
+	/* The original N reservation and its first installed X still belong to
+	 * the existing path. A token cycle alone does not prove consumption. */
+	if (BufferTagsEqual(&observed->tag, &assertion->resource)
+		&& (observed->generation <= pending_generation + 1
+			|| observed->reservation_token <= reservation_token))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	if (!pcm_resource_x_caller_namespace_matches(caller, assertion, formation, master_session,
+												 r4_generation))
+		return RESOURCE_X_APPLY_STALE;
+	attempt = caller->joined_request.assertion_sequence;
+	if (attempt != 0
+		&& (caller->master_node != master_node
+			|| caller->master_ingress_connection_generation != master_connection
+			|| caller->joined_request.sender_connection_generation != requester_connection))
+		return RESOURCE_X_APPLY_STALE;
+	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	owner = &entry->resource_x_local_owner;
+	if (attempt != 0 && caller->entry_binding_generation != entry_ref.binding_generation)
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!cluster_pcm_lock_resource_x_gate_open_exact(formation)
+			 || !pcm_resource_x_local_owner_valid_locked(owner)
+			 || round->phase >= RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+			 || (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0
+			 || (entry->resource_x_progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0
+			 || (attempt == 0 && round->failed_attempt_floor != 0))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			 && !pcm_resource_x_node_request_key_matches_locked(
+				 round, assertion, master_node, formation, master_session, r4_generation,
+				 requester_connection, master_connection))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!pcm_resource_x_install_claim_valid_locked(round)
+			 || round->cancelled_attempt_floor > round->highest_attempt_floor
+			 || round->failed_attempt_floor > round->highest_attempt_floor
+			 || round->highest_attempt_floor == UINT64_MAX
+			 || (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY
+				 && !pcm_resource_x_local_owner_round_exact_locked(entry, round)))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else {
+		if (attempt != 0)
+			history = pcm_resource_x_observation_history_locked(entry, attempt);
+		same_claim = round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT
+					 && round->install_claim_pending_generation == pending_generation
+					 && round->install_claim_reservation_token == reservation_token;
+		if (history == RESOURCE_X_APPLY_RECOVERY_BLOCKED || history == RESOURCE_X_APPLY_STALE)
+			result = history;
+		else if (history == RESOURCE_X_APPLY_DUPLICATE)
+			result = RESOURCE_X_APPLY_APPLIED;
+		else if (same_claim && round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+				 && round->delivery_target.buffer_id_plus_one == 0
+				 && pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+					 entry, round, &round->terminal_ref, master_session, r4_generation,
+					 pending_generation + 1))
+			result = RESOURCE_X_APPLY_APPLIED;
+		else if ((attempt == 0 || history == RESOURCE_X_APPLY_APPLIED) && !same_claim
+				 && round->failed_attempt_floor == 0 && round->cancelled_attempt_floor != 0
+				 && (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+						 ? (round->highest_attempt_floor == round->cancelled_attempt_floor
+							&& owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY
+							&& pcm_resource_x_active_empty_locked(entry))
+						 : (round->request.assertion_sequence > round->cancelled_attempt_floor
+							&& round->request.assertion_sequence == round->highest_attempt_floor)))
+			/* The creator can miss the entire completed install before its
+			 * first head observation. Zero failure history and an exact closed
+			 * head/successor prove no old creation obligation, not old authority. */
+			result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
 /* A process-local observer may miss any number of completed acquisitions.
  * Use the same exact-owner closed floor as caller history, not a predicted
  * physical generation or the retired acquisition floor (which also includes

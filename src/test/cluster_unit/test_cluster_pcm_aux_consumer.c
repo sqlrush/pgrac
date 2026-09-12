@@ -47,6 +47,9 @@ static uint64 fixture_payload;
 static int fixture_context_pending, fixture_waits, fixture_post_t3_snapshots;
 static bool fixture_change_on_wait, fixture_cancel_on_wait;
 static void (*fixture_wait_check)(void);
+static bool fixture_creation_retired;
+static bool fixture_unproven_not_found;
+static int fixture_aborts;
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -124,8 +127,10 @@ fixture_writer_path(uint64 *generation)
 
 static ResourceXApplyResult
 fixture_acquire(BufferDesc *buf, const BufferTag *tag, uint64 r4_generation, uint64 generation,
-				uint64 token, ResourceXAcquisitionRef *ref)
+				uint64 token, bool *creation_reobserve, ResourceXAcquisitionRef *ref)
 {
+	UT_ASSERT_NOT_NULL(creation_reobserve);
+	*creation_reobserve = false;
 	UT_ASSERT(buf == &fixture_buf);
 	UT_ASSERT_EQ(fixture_state.private_refcount, 0);
 	UT_ASSERT_EQ(r4_generation, 6);
@@ -133,6 +138,8 @@ fixture_acquire(BufferDesc *buf, const BufferTag *tag, uint64 r4_generation, uin
 	UT_ASSERT_EQ(token, 5);
 	fixture_acquires++;
 	memset(ref, 0, sizeof(*ref));
+	if (fixture_unproven_not_found)
+		return RESOURCE_X_APPLY_NOT_FOUND;
 	ref->formation = 2;
 	ref->assertion.resource = *tag;
 	fixture_state.generation = 12;
@@ -142,6 +149,15 @@ fixture_acquire(BufferDesc *buf, const BufferTag *tag, uint64 r4_generation, uin
 	fixture_state.page_is_new = !fixture_remote;
 	if (fixture_remote)
 		fixture_payload = UINT64CONST(0x123456789abcdef0);
+	if (fixture_creation_retired) {
+		*creation_reobserve = true;
+		fixture_state.generation = 13;
+		fixture_state.reservation_token = 6;
+		fixture_state.buffer_type = (uint8)BUF_TYPE_CURRENT;
+		fixture_state.pcm_state = (uint8)PCM_STATE_N;
+		memset(ref, 0, sizeof(*ref));
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	}
 	switch (fixture_mutation) {
 	case 1:
 		fixture_state.tag.blockNum++;
@@ -261,6 +277,13 @@ fixture_failure(void)
 	siglongjmp(fixture_error, 1);
 }
 
+static void
+fixture_abort(void)
+{
+	fixture_aborts++;
+	fixture_failure();
+}
+
 #define cluster_pcm_is_active() true
 #define cluster_bufmgr_should_pcm_track(buf) ((buf) == &fixture_buf)
 #define cluster_bufmgr_pcm_direct_init_snapshot_locked fixture_snapshot
@@ -274,13 +297,16 @@ fixture_failure(void)
 #define cluster_bufmgr_pcm_aux_pin_handoff_finish_exact fixture_pin_finish
 #define cluster_resource_x_writer_path_snapshot fixture_writer_path
 #define cluster_gcs_resource_x_target_direct_init_acquire_exact fixture_acquire
+#define ClusterBufferDirectInitObservationUnowned(buffer)                                          \
+	((buffer) == 1 && fixture_state.private_refcount == 0 && !fixture_content_held                 \
+	 && fixture_track == 0)
 #define cluster_pcm_lock_resource_x_gate_snapshot fixture_gate
 #define cluster_gcs_resource_x_target_context_recheck_exact fixture_context
 #define cluster_gcs_resource_x_target_context_recheck_result_exact fixture_context_result
 #define cluster_bufmgr_resource_x_wait_retry fixture_observation_wait
 #define cluster_bufmgr_pcm_direct_init_report_failure(...) fixture_failure()
 #define cluster_bufmgr_resource_x_writer_report_failure(...) fixture_failure()
-#define cluster_pcm_own_abort_grant_after_error(...) fixture_failure()
+#define cluster_pcm_own_abort_grant_after_error(...) fixture_abort()
 #define cluster_bufmgr_resource_x_fail_closed_current() (fixture_fuse++)
 #define cluster_bufmgr_resource_x_fail_closed_exact(gate) ((void)(gate), fixture_fuse++)
 #define cluster_bufmgr_pcm_join_aux_direct_init_exact(...) (fixture_failure(), false)
@@ -360,6 +386,53 @@ fixture_reset(ClusterPcmDirectInitKind kind, bool remote)
 	fixture_context_pending = fixture_waits = fixture_post_t3_snapshots = 0;
 	fixture_change_on_wait = fixture_cancel_on_wait = false;
 	fixture_wait_check = NULL;
+	fixture_creation_retired = false;
+	fixture_unproven_not_found = false;
+	fixture_aborts = 0;
+}
+
+UT_TEST(test_unproven_not_found_keeps_original_creation_cleanup)
+{
+	for (int kind = CLUSTER_PCM_DIRECT_INIT_VM; kind <= CLUSTER_PCM_DIRECT_INIT_FSM; kind++) {
+		fixture_reset((ClusterPcmDirectInitKind)kind, true);
+		fixture_unproven_not_found = true;
+		if (sigsetjmp(fixture_error, 0) == 0) {
+			(void)LockBufferForAuxiliaryPageInit(1, (ClusterPcmDirectInitKind)kind);
+			UT_ASSERT(!"ordinary NOT_FOUND bypassed cleanup of a live creation reservation");
+		}
+		UT_ASSERT_EQ(fixture_aborts, 1);
+		UT_ASSERT_EQ(fixture_state.generation, 11);
+		UT_ASSERT_EQ(fixture_state.reservation_token, 5);
+		UT_ASSERT_EQ(fixture_state.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		UT_ASSERT_EQ(fixture_ordinary, 0);
+		UT_ASSERT_EQ(fixture_track, 0);
+		UT_ASSERT_EQ(fixture_activate, 0);
+		UT_ASSERT_EQ(fixture_post_t3_snapshots, 0);
+		UT_ASSERT(!fixture_content_held);
+	}
+}
+
+UT_TEST(test_retired_aux_creator_returns_original_reader_without_abort_or_old_access)
+{
+	for (int kind = CLUSTER_PCM_DIRECT_INIT_VM; kind <= CLUSTER_PCM_DIRECT_INIT_FSM; kind++) {
+		fixture_reset((ClusterPcmDirectInitKind)kind, true);
+		fixture_creation_retired = true;
+		if (sigsetjmp(fixture_error, 0) != 0) {
+			UT_ASSERT(!"retired creation tried to abort its consumed token or reported an error");
+			continue;
+		}
+		UT_ASSERT_EQ(LockBufferForAuxiliaryPageInit(1, (ClusterPcmDirectInitKind)kind),
+					 InvalidBuffer);
+		UT_ASSERT_EQ(fixture_post_t3_snapshots, 0);
+		UT_ASSERT_EQ(fixture_ordinary, 0);
+		UT_ASSERT_EQ(fixture_track, 0);
+		UT_ASSERT_EQ(fixture_activate, 0);
+		UT_ASSERT_EQ(fixture_fuse, 0);
+		UT_ASSERT_EQ(fixture_acquires, 1);
+		UT_ASSERT_EQ(fixture_state.private_refcount, 0);
+		UT_ASSERT(!fixture_content_held);
+		UT_ASSERT_EQ(fixture_payload, UINT64CONST(0x123456789abcdef0));
+	}
 }
 
 UT_TEST(test_initialized_remote_aux_uses_ordinary_upper_consumer)
@@ -597,7 +670,9 @@ UT_TEST(test_actual_ordinary_preuse_still_requalifies_without_waiting_under_lock
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(11);
+	UT_RUN(test_unproven_not_found_keeps_original_creation_cleanup);
+	UT_RUN(test_retired_aux_creator_returns_original_reader_without_abort_or_old_access);
 	UT_RUN(test_initialized_remote_aux_uses_ordinary_upper_consumer);
 	UT_RUN(test_known_new_aux_keeps_initialization_proof);
 	UT_RUN(test_initialized_remote_aux_still_rejects_stale_context);

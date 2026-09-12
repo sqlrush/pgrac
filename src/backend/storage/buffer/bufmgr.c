@@ -3585,6 +3585,18 @@ ClusterBufferAuxiliaryObservationUnowned(Buffer buffer)
 		   && !LWLockHeldByMe(BufferDescriptorGetContentLock(buf));
 }
 
+bool
+ClusterBufferDirectInitObservationUnowned(Buffer buffer)
+{
+	BufferDesc *buf;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) || GetPrivateRefCount(buffer) != 0)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	return cluster_bufmgr_pcm_x_writer_find(buf) == NULL
+		   && !LWLockHeldByMe(BufferDescriptorGetContentLock(buf));
+}
+
 /* VM/FSM readers may consume bytes under a pin without taking the content
  * lock, so no such pin may cross a distributed Resource-X conversion.  This
  * stack-only handoff releases every private reference owned by this backend
@@ -3916,6 +3928,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	uint64		writer_r4_generation = 0;
 	bool		aux_pin_required;
 	bool installed_aux_image;
+	bool creation_reobserve = false;
 
 	if (pin_replaced != NULL)
 		*pin_replaced = false;
@@ -4013,11 +4026,9 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 			MemSet(&terminal_ref, 0, sizeof(terminal_ref));
 			PG_TRY();
 			{
-				resource_x_result
-					= cluster_gcs_resource_x_target_direct_init_acquire_exact(
-						buf, &pending_base.tag, writer_r4_generation,
-						pending_base.generation, pending_token,
-						&terminal_ref);
+				resource_x_result = cluster_gcs_resource_x_target_direct_init_acquire_exact(
+					buf, &pending_base.tag, writer_r4_generation, pending_base.generation,
+					pending_token, aux_pin_required ? &creation_reobserve : NULL, &terminal_ref);
 			}
 			PG_CATCH();
 			{
@@ -4027,6 +4038,16 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
+			if (resource_x_result == RESOURCE_X_APPLY_NOT_FOUND && creation_reobserve
+				&& aux_pin_required && pin_replaced != NULL
+				&& ClusterBufferDirectInitObservationUnowned(BufferDescriptorGetBuffer(buf))) {
+				/* GCS proved the creation obligation consumed/retired, not a
+				 * usable grant. All original pins were already handed off. Do
+				 * not abort a successor token or repin/dereference this handle. */
+				pin_handoff.active = false;
+				*pin_replaced = true;
+				return false;
+			}
 			if (resource_x_result != RESOURCE_X_APPLY_APPLIED
 				&& resource_x_result != RESOURCE_X_APPLY_DUPLICATE)
 			{

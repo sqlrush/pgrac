@@ -4659,13 +4659,13 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_abort_exact(
 	ResourceXTargetEvictionPlan *plan);
-extern ResourceXApplyResult
-cluster_gcs_resource_x_target_direct_init_acquire_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 r4_record_generation,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	ResourceXAcquisitionRef *ref_out);
+/* Optional process-local disposition, not authority: only NOT_FOUND plus
+ * creation_reobserve_out=true proves a consumed auxiliary creation may be
+ * relooked up by its original unpinned caller. Bare NOT_FOUND is an error. */
+extern ResourceXApplyResult cluster_gcs_resource_x_target_direct_init_acquire_exact(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token,
+	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_join_exact(
 	BufferDesc *buf, const BufferTag *expected_resource,

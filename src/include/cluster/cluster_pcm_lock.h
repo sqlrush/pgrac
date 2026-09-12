@@ -1483,6 +1483,14 @@ typedef struct ResourceXCallerWitness {
 	PcmRxRequesterWaitReason reobserve_reason;
 } ResourceXCallerWitness;
 
+/* No authority is returned: APPLIED proves only that an unpinned VM/FSM
+ * creator may discard its consumed reservation observation and relookup. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_aux_creation_reobserve_exact(
+	const ResourceXAssertion *assertion, int32 master_node, uint64 formation, uint64 master_session,
+	uint64 r4_generation, uint32 requester_connection, uint32 master_connection,
+	const ResourceXCallerWitness *caller, uint64 pending_generation, uint64 reservation_token,
+	const struct ClusterPcmOwnSnapshot *observed);
+
 /* Caller-owned auxiliary handle requalification. This is a local observation
  * cursor, not a retained grant, a pin or a wire identity. Keep it across a
  * failed repin so descriptor replacement cannot erase caller failure history

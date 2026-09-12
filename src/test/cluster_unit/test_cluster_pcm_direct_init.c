@@ -632,7 +632,9 @@ UT_TEST(test_direct_init_one_shot_image_cannot_return_without_x)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "resource_x_result\n\t\t\t\t\t= cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+		= { "cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+			"aux_pin_required ? &creation_reobserve : NULL",
+			"resource_x_result == RESOURCE_X_APPLY_NOT_FOUND && creation_reobserve",
 			"resource_x_result != RESOURCE_X_APPLY_APPLIED",
 			"cluster_pcm_own_abort_grant_after_error(",
 			"cluster_bufmgr_resource_x_writer_report_failure(",

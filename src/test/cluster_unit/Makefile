@@ -2614,8 +2614,9 @@ test_cluster_pcm_preassert_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^gcs_block_resource_x_target_install_snapshot_result\(/ { print "static ResourceXApplyResult"; emit=1; snapshot++ } \
 	     /^gcs_block_resource_x_target_own_observation_result\(/ { print "static ResourceXApplyResult"; emit=1; observation++ } \
 	     /^gcs_block_resource_x_target_install_capture_coherent\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
+	     /^gcs_block_resource_x_aux_creation_reobserve_coherent\(/ { print "static ResourceXApplyResult"; emit=1; creation++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (stage != 1 || evidence != 1 || mapping != 1 || domain != 1 || snapshot != 1 || observation != 1 || capture != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (stage != 1 || evidence != 1 || mapping != 1 || domain != 1 || snapshot != 1 || observation != 1 || capture != 1 || creation != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_n_predecessor_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -2711,11 +2712,12 @@ test_cluster_pcm_aux_reobserve_owner.inc: $(top_srcdir)/src/backend/storage/buff
 	     /^cluster_bufmgr_pcm_x_writer_(find|free_entry)\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
 	     /^cluster_bufmgr_pcm_x_writer_clear\(/ { print "static void"; emit=1; clear++ } \
 	     /^ClusterBufferAuxiliaryObservationUnowned\(/ { print "bool"; emit=1; unowned++ } \
+	     /^ClusterBufferDirectInitObservationUnowned\(/ { print "bool"; emit=1; creation++ } \
 	     /^ClusterLockBufferExclusiveAuxiliaryAware\(/ { print "bool"; emit=1; consumer++ } \
 	     /^ClusterLockBufferExclusiveAuxiliaryAliasAware\(/ { print "bool"; emit=1; aliases++ } \
 	     /^ClusterLockBufferExclusiveBarrierAware\(/ { print "bool"; emit=1; barrier++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 2 || array != 1 || find != 2 || clear != 1 || unowned != 1 || consumer != 1 || aliases != 1 || barrier != 1) exit 1 }' $< > $@.tmp
+	     END { if (types != 2 || array != 1 || find != 2 || clear != 1 || unowned != 1 || creation != 1 || consumer != 1 || aliases != 1 || barrier != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_vm_lock_entry.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile

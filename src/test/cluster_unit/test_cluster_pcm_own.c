@@ -588,6 +588,42 @@ cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 	return RESOURCE_X_APPLY_NOT_FOUND;
 }
 
+static bool creation_fixture_unowned;
+static bool creation_fixture_change;
+static int creation_fixture_calls;
+static ResourceXApplyResult creation_fixture_result;
+
+bool
+ClusterBufferDirectInitObservationUnowned(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return creation_fixture_unowned;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_aux_creation_reobserve_exact(
+	const ResourceXAssertion *assertion, int32 master_node, uint64 formation, uint64 master_session,
+	uint64 r4_generation, uint32 requester_connection, uint32 master_connection,
+	const ResourceXCallerWitness *caller, uint64 pending_generation, uint64 reservation_token,
+	const ClusterPcmOwnSnapshot *observed)
+{
+	UT_ASSERT_NOT_NULL(assertion);
+	UT_ASSERT_NOT_NULL(caller);
+	UT_ASSERT_NOT_NULL(observed);
+	UT_ASSERT_EQ(master_node, 3);
+	UT_ASSERT_EQ(formation, 2);
+	UT_ASSERT_EQ(master_session, 31);
+	UT_ASSERT_EQ(r4_generation, 6);
+	UT_ASSERT_EQ(requester_connection, 8);
+	UT_ASSERT_EQ(master_connection, 8);
+	UT_ASSERT_EQ(pending_generation, 0);
+	UT_ASSERT_EQ(reservation_token, 1);
+	creation_fixture_calls++;
+	if (creation_fixture_change)
+		pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[0].generation, 1);
+	return creation_fixture_result;
+}
+
 #include "test_cluster_pcm_preassert_owner.inc"
 
 static void
@@ -947,6 +983,38 @@ snapshot_owner_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	pg_atomic_init_u64(&entry->writer_activation_token, 23);
 	pg_atomic_init_u64(&entry->resource_x_activation_generation, 29);
 	pg_atomic_init_u32(&entry->flags, PCM_OWN_FLAG_GRANT_PENDING);
+}
+
+UT_TEST(test_aux_creation_disposition_uses_real_beb_and_excludes_retained_context)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before;
+	ResourceXAssertion assertion;
+	ResourceXCallerWitness caller = { 0 };
+
+	for (unsigned mode = 0; mode < 5; mode++) {
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		cluster_pcm_own_snapshot_locked(&buf, &before);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		memset(&assertion, 0, sizeof(assertion));
+		assertion.resource = buf.tag;
+		creation_fixture_unowned = mode != 0;
+		creation_fixture_change = mode == 2 || mode == 4;
+		creation_fixture_result = mode >= 3 ? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_APPLIED;
+		creation_fixture_calls = 0;
+		UT_ASSERT_EQ(gcs_block_resource_x_aux_creation_reobserve_coherent(
+						 &buf, &assertion, 3, 2, 31, 6, 8, 8, &caller, 0, 1, &before),
+					 mode == 0	 ? RESOURCE_X_APPLY_NOT_FOUND
+					 : mode == 1 ? RESOURCE_X_APPLY_APPLIED
+					 : mode == 3 ? RESOURCE_X_APPLY_STALE
+								 : RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT_EQ(creation_fixture_calls, mode == 0 ? 0 : 1);
+	}
+	creation_fixture_unowned = creation_fixture_change = false;
+	ClusterPcmOwnArray = saved;
 }
 
 UT_TEST(test_real_barrier_refusal_ignores_another_callers_pending)
@@ -6926,7 +6994,8 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(124);
+	UT_RUN(test_aux_creation_disposition_uses_real_beb_and_excludes_retained_context);
 	UT_RUN(test_real_barrier_refusal_ignores_another_callers_pending);
 	UT_RUN(test_real_barrier_refusal_abort_then_successor_is_not_own_residue);
 	UT_RUN(test_real_barrier_refusal_rejects_own_lock_and_ledger);

@@ -79,8 +79,10 @@ fixture_lock_internal(Buffer buffer, int mode, bool *barrier,
 static ResourceXApplyResult
 fixture_acquire_internal(BufferDesc *buf, const BufferTag *tag, uint64 r4, uint64 direct_generation,
 						 uint64 direct_token, bool join, uint64 *deadline,
-						 ResourceXAuxiliaryAcquireContext *context, ResourceXAcquisitionRef *out)
+						 ResourceXAuxiliaryAcquireContext *context, bool *creation_reobserve,
+						 ResourceXAcquisitionRef *out)
 {
+	UT_ASSERT(creation_reobserve == NULL);
 	UT_ASSERT(buf != NULL);
 	UT_ASSERT(BufferTagsEqual(&context->resource, tag));
 	UT_ASSERT_EQ(r4, context->r4_record_generation);
@@ -602,6 +604,31 @@ UT_TEST(pinned_or_retained_identity_contradiction_is_still_stale)
 	UT_ASSERT_EQ(fixture_production_own_guard(&own, &tag, true), RESOURCE_X_APPLY_APPLIED);
 }
 
+UT_TEST(real_creation_observer_requires_no_pins_locks_or_writer_ledger)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+
+	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+	UT_ASSERT(!ClusterBufferDirectInitObservationUnowned(1));
+	fixture_refs[0] = 0;
+	UT_ASSERT(ClusterBufferDirectInitObservationUnowned(1));
+	fixture_content[0] = true;
+	UT_ASSERT(!ClusterBufferDirectInitObservationUnowned(1));
+	fixture_content[0] = false;
+	entry = cluster_bufmgr_pcm_x_writer_free_entry();
+	UT_ASSERT_NOT_NULL(entry);
+	entry->buffer_id = 0;
+	entry->content_lock = BufferDescriptorGetContentLock(&fixture_buffers[0]);
+	for (unsigned phase = PCM_X_WRITER_LEDGER_ACQUIRING; phase <= PCM_X_WRITER_LEDGER_HANDOFF;
+		 phase++) {
+		entry->phase = phase;
+		UT_ASSERT(!ClusterBufferDirectInitObservationUnowned(1));
+	}
+	cluster_bufmgr_pcm_x_writer_clear(entry);
+	UT_ASSERT(ClusterBufferDirectInitObservationUnowned(1));
+	UT_ASSERT(!ClusterBufferDirectInitObservationUnowned(InvalidBuffer));
+}
+
 UT_TEST(real_unowned_gate_requires_empty_pin_and_handoff_not_retained_writer)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
@@ -824,7 +851,8 @@ UT_TEST(actual_prepare_does_not_turn_failed_history_or_namespace_into_retry)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
+	UT_RUN(real_creation_observer_requires_no_pins_locks_or_writer_ledger);
 	UT_RUN(handoff_releases_every_private_pin_before_the_wait);
 	UT_RUN(real_heap_vm_barrier_entry_reobserves_without_acquiring_unready_bytes);
 	UT_RUN(real_heap_vm_plain_entry_must_not_erase_the_retry_channel);

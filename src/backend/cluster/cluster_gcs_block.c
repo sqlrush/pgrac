@@ -14476,14 +14476,41 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 }
 
 
+/* A creation observer is not an authority carrier. The entry decides only
+ * whether its original obligation is gone; B-E-B keeps that decision from
+ * being combined with an unrelated physical sample. */
 static ResourceXApplyResult
-gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *expected_resource,
-											 uint64 r4_record_generation,
-											 uint64 direct_init_ownership_generation,
-											 uint64 direct_init_reservation_token, bool join_only,
-											 uint64 *absolute_deadline_us_io,
-											 ResourceXAuxiliaryAcquireContext *aux_context,
-											 ResourceXAcquisitionRef *ref_out)
+gcs_block_resource_x_aux_creation_reobserve_coherent(
+	BufferDesc *buf, const ResourceXAssertion *assertion, int32 master_node, uint64 formation,
+	uint64 master_session, uint64 r4_generation, uint32 requester_connection,
+	uint32 master_connection, const ResourceXCallerWitness *caller, uint64 pending_generation,
+	uint64 reservation_token, const ClusterPcmOwnSnapshot *before)
+{
+	ResourceXApplyResult result;
+	ClusterPcmOwnSnapshot after;
+	ClusterPcmOwnResult sampled;
+
+	if (!ClusterBufferDirectInitObservationUnowned(BufferDescriptorGetBuffer(buf)))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	result = cluster_pcm_lock_resource_x_aux_creation_reobserve_exact(
+		assertion, master_node, formation, master_session, r4_generation, requester_connection,
+		master_connection, caller, pending_generation, reservation_token, before);
+	if (result == RESOURCE_X_APPLY_NOT_FOUND)
+		return result;
+	sampled = cluster_bufmgr_pcm_own_snapshot(buf, &after);
+	if (sampled != CLUSTER_PCM_OWN_OK)
+		return gcs_block_resource_x_target_install_snapshot_result(sampled);
+	if (!cluster_pcm_own_snapshot_equal_exact(before, &after))
+		return RESOURCE_X_APPLY_DUPLICATE;
+	return result;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_target_acquire_internal(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token, bool join_only,
+	uint64 *absolute_deadline_us_io, ResourceXAuxiliaryAcquireContext *aux_context,
+	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out)
 {
 	BufferTag resource;
 	ClusterPcmOwnSnapshot own;
@@ -14505,6 +14532,7 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 	ResourceXBootstrapRoundFailureSnapshot failure_round;
 	ResourceXTargetInstallContinuation target_install_follow;
 	ResourceXCallerWitness local_caller_witness;
+	ResourceXCallerWitness creation_caller = { 0 };
 	ResourceXCallerWitness *caller_witness
 		= aux_context != NULL ? &aux_context->caller : &local_caller_witness;
 	GcsResourceXWaitDiagnostic wait_diagnostic = { 0 };
@@ -14560,6 +14588,7 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 	int32 terminal_master_node = -1;
 	bool cached_local_x = false;
 	bool direct_init;
+	bool creation_reobserve = false;
 	bool direct_init_pending_n = false;
 	bool dispatch_admission_current = false;
 	bool dispatch_gate_session_current = false;
@@ -14585,6 +14614,8 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 	const char *volatile diagnostic_stage = "entry";
 
 	gcs_resource_x_acquire_diagnostic.valid = false;
+	if (creation_reobserve_out != NULL)
+		*creation_reobserve_out = false;
 	if (ref_out != NULL)
 		memset(ref_out, 0, sizeof(*ref_out));
 	memset(&own, 0, sizeof(own));
@@ -14804,6 +14835,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
 																 wait_diagnostic.state.reason);
 					target_retained_release_inflight = false;
+					if (direct_init && creation_caller.joined_request.assertion_sequence == 0
+						&& caller_witness->joined_request.assertion_sequence != 0)
+						creation_caller = *caller_witness;
 					result = cluster_pcm_lock_resource_x_caller_observe_exact(
 						&assertion, gate.formation, master_session, admission.record_generation,
 						caller_witness);
@@ -14818,8 +14852,11 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 						diagnostic_stage = "caller-history-reject";
 						break;
 					}
-				target_retained_release_post_mutation = false;
-				memset(&own, 0, sizeof(own));
+					if (direct_init && creation_caller.joined_request.assertion_sequence == 0
+						&& caller_witness->joined_request.assertion_sequence != 0)
+						creation_caller = *caller_witness;
+					target_retained_release_post_mutation = false;
+					memset(&own, 0, sizeof(own));
 					diagnostic_stage = "own-snapshot";
 					own_result = cluster_bufmgr_pcm_own_snapshot(buf, &own);
 				if (own_result != CLUSTER_PCM_OWN_OK) {
@@ -14829,6 +14866,30 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 						? RESOURCE_X_APPLY_STALE
 						: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
+				}
+				if (direct_init && !join_only && creation_reobserve_out != NULL
+					&& (BufTagGetForkNum(&resource) == VISIBILITYMAP_FORKNUM
+						|| BufTagGetForkNum(&resource) == FSM_FORKNUM)) {
+					result = gcs_block_resource_x_aux_creation_reobserve_coherent(
+						buf, &assertion, master_node, gate.formation, master_session,
+						admission.record_generation, requester_sender_connection_generation,
+						master_ingress_connection_generation, &creation_caller,
+						direct_init_ownership_generation, direct_init_reservation_token, &own);
+					if (result == RESOURCE_X_APPLY_DUPLICATE) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
+						continue;
+					}
+					if (result == RESOURCE_X_APPLY_APPLIED) {
+						creation_reobserve = true;
+						diagnostic_stage = "auxiliary-creation-reobserve";
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
+						result = RESOURCE_X_APPLY_NOT_FOUND;
+						break;
+					}
+					if (result != RESOURCE_X_APPLY_NOT_FOUND)
+						break;
 				}
 				result = gcs_block_resource_x_target_own_observation_result(
 					&own, &assertion.resource,
@@ -15438,6 +15499,9 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 					own.pcm_state == PCM_STATE_N, cached_local_x,
 					cached_local_x ? own.generation : 0, caller_witness, &own, &dispatch,
 					&terminal_ref);
+				if (direct_init && creation_caller.joined_request.assertion_sequence == 0
+					&& caller_witness->joined_request.assertion_sequence != 0)
+					creation_caller = *caller_witness;
 
 			target_install_terminal_recheck:
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
@@ -15852,6 +15916,7 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 								 * Keep the caller deadline while leaving that
 								 * retired, non-authoritative attempt. */
 								memset(caller_witness, 0, sizeof(*caller_witness));
+								memset(&creation_caller, 0, sizeof(creation_caller));
 								master_node = rebound_master_node;
 								master_session = rebound_master_session;
 								requester_sender_connection_generation
@@ -16039,6 +16104,24 @@ gcs_block_resource_x_target_acquire_internal(BufferDesc *buf, const BufferTag *e
 				diagnostic_stage, diagnostic_request_sequence, ended_us);
 	}
 	cluster_semantic_activation_leave(&admission);
+	if (creation_reobserve) {
+		Assert(result == RESOURCE_X_APPLY_NOT_FOUND);
+		Assert(creation_reobserve_out != NULL);
+		memset(ref_out, 0, sizeof(*ref_out));
+		*creation_reobserve_out = true;
+		ereport(LOG,
+				(errmsg_internal("Resource-X auxiliary creation observation retired"),
+				 errdetail("PGRAC_FAMILY=RESOURCE_X_DIAGNOSTIC "
+						   "PGRAC_REASON=AUX_CREATION_REOBSERVE request=" UINT64_FORMAT
+						   " tag=%u/%u/%u/%u/%u pending_generation=" UINT64_FORMAT
+						   " pending_token=" UINT64_FORMAT " observed_generation=" UINT64_FORMAT
+						   " observed_token=" UINT64_FORMAT " action=caller_owned_repin",
+						   diagnostic_request_sequence, resource.spcOid, resource.dbOid,
+						   resource.relNumber, (unsigned)resource.forkNum, resource.blockNum,
+						   direct_init_ownership_generation, direct_init_reservation_token,
+						   own.generation, own.reservation_token)));
+		return result;
+	}
 	if (aux_context != NULL) {
 		aux_context->wait_state = wait_diagnostic.state;
 		if (aux_context->reobserve) {
@@ -16468,7 +16551,7 @@ cluster_gcs_resource_x_target_acquire_exact(
 	ResourceXAcquisitionRef *ref_out)
 {
 	return gcs_block_resource_x_target_acquire_internal(buf, NULL, r4_record_generation, 0, 0,
-														false, NULL, NULL, ref_out);
+														false, NULL, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult
@@ -16479,9 +16562,9 @@ cluster_gcs_resource_x_target_acquire_until_exact(
 {
 	if (expected_resource == NULL || absolute_deadline_us_io == NULL)
 		return RESOURCE_X_APPLY_INVALID;
-	return gcs_block_resource_x_target_acquire_internal(buf, expected_resource,
-														r4_record_generation, 0, 0, false,
-														absolute_deadline_us_io, NULL, ref_out);
+	return gcs_block_resource_x_target_acquire_internal(
+		buf, expected_resource, r4_record_generation, 0, 0, false, absolute_deadline_us_io, NULL,
+		NULL, ref_out);
 }
 
 ResourceXApplyResult
@@ -16512,22 +16595,24 @@ cluster_gcs_resource_x_target_acquire_reobserve_exact(BufferDesc *buf,
 		return RESOURCE_X_APPLY_STALE;
 	return gcs_block_resource_x_target_acquire_internal(
 		buf, expected_resource, r4_record_generation, 0, 0, false, &context->absolute_deadline_us,
-		context, ref_out);
+		context, NULL, ref_out);
 }
 
 ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_acquire_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 r4_record_generation,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	ResourceXAcquisitionRef *ref_out)
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token,
+	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out)
 {
+	if (creation_reobserve_out != NULL)
+		*creation_reobserve_out = false;
+	if (ref_out != NULL)
+		memset(ref_out, 0, sizeof(*ref_out));
 	if (expected_resource == NULL || direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	return gcs_block_resource_x_target_acquire_internal(
 		buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
-		direct_init_reservation_token, false, NULL, NULL, ref_out);
+		direct_init_reservation_token, false, NULL, NULL, creation_reobserve_out, ref_out);
 }
 
 ResourceXApplyResult
@@ -16541,7 +16626,7 @@ cluster_gcs_resource_x_target_direct_init_join_exact(
 		return RESOURCE_X_APPLY_INVALID;
 	return gcs_block_resource_x_target_acquire_internal(
 		buf, expected_resource, 0, direct_init_ownership_generation, direct_init_reservation_token,
-		true, NULL, NULL, ref_out);
+		true, NULL, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult
