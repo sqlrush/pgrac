@@ -2982,7 +2982,7 @@ UT_TEST(test_r4_history_detail_limit_never_changes_the_refusal)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(73);
+	UT_PLAN(75);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
