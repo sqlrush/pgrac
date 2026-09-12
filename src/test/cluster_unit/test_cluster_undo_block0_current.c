@@ -3122,6 +3122,39 @@ UT_TEST(test_record_drain_bound_is_owned_by_active_to_committed_only)
 	}
 }
 
+UT_TEST(test_record_seal_requires_an_active_predecessor)
+{
+	const uint8 states[] = { SEGMENT_ALLOCATED, SEGMENT_COMMITTED, SEGMENT_RECYCLABLE };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Generation expected = { true, 7 };
+	PGAlignedBlock predecessor;
+	PGAlignedBlock successor;
+	UndoSegmentHeaderData *before = (UndoSegmentHeaderData *)predecessor.data;
+	UndoSegmentHeaderData *after = (UndoSegmentHeaderData *)successor.data;
+	unsigned i;
+
+	for (i = 0; i < lengthof(states); i++) {
+		reset_fixture();
+		fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_sample_generation = expected;
+		init_recyclable_block0(predecessor.data, key.segment_id, key.owner_instance,
+							   expected.value);
+		before->segment_state = states[i];
+		memcpy(successor.data, predecessor.data, BLCKSZ);
+		UndoSegmentHeader_set_record_seal_upper_scn(after, 100);
+		memcpy(fake_disk_page, predecessor.data, BLCKSZ);
+		memcpy(fake_pin_page, predecessor.data, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_mutate_exact(
+						 &key, &expected, predecessor.data, successor.data, 1000),
+					 CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		UT_ASSERT_EQ(semantic_enter_calls, 0);
+		UT_ASSERT_EQ(flush_sync_calls, 0);
+		UT_ASSERT_EQ(memcmp(fake_disk_page, predecessor.data, BLCKSZ), 0);
+	}
+}
+
 UT_TEST(test_live_owner_lifecycle_mutation_rebases_only_exact_current_tt_bytes)
 {
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -3472,7 +3505,8 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 int
 main(void)
 {
-	UT_PLAN(81);
+	UT_PLAN(82);
+	UT_RUN(test_record_seal_requires_an_active_predecessor);
 	UT_RUN(test_record_drain_bound_is_owned_by_active_to_committed_only);
 	UT_RUN(test_wait_failures_preserve_exact_reason_and_cleanup);
 	UT_RUN(test_partial_guard_is_not_repaired_by_retry);

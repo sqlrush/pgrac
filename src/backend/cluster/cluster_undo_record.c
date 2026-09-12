@@ -896,6 +896,14 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return;
 	}
+	/* The cleaner visits TT-only COMMITTED segments too.  A seal added
+	 * after terminal publication would require a final drain bound that can
+	 * only be produced by ACTIVE -> COMMITTED, permanently retaining supply.
+	 * Observe terminal/non-active headers without changing their history. */
+	if (hdr->segment_state != SEGMENT_ACTIVE) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return;
+	}
 	memcpy(successor.data, predecessor.data, BLCKSZ);
 	next = (UndoSegmentHeaderData *)successor.data;
 

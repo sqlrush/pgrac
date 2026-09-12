@@ -4027,6 +4027,7 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 		-c $< -o $@
 
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		test_cluster_undo_ctrc_product.o \
 		$(CLUSTER_UBA_O) \
 		../../../src/include/cluster/cluster_undo_record_api.h \
@@ -4052,6 +4053,7 @@ test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		$(CLUSTER_UBA_O) \
 		test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
 		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \

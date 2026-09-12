@@ -1884,7 +1884,8 @@ current_lifecycle_successor_exact(const char predecessor_page[BLCKSZ],
 		return false;
 	if (UndoSegmentHeader_record_seal_upper_scn(after)
 			!= UndoSegmentHeader_record_seal_upper_scn(before)
-		&& !(SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(after))
+		&& !(before->segment_state == SEGMENT_ACTIVE
+			 && SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(after))
 			 && !SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(before))))
 		return false;
 	if (UndoSegmentHeader_record_drain_upper_scn(after)

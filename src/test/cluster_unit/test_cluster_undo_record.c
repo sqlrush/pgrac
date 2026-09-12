@@ -94,6 +94,17 @@ UT_DEFINE_GLOBALS();
  * exposing test-only product APIs.  Section GC retains only exercised paths. */
 #include UNDO_RECORD_SOURCE_PATH
 
+/* Keep the drain predicate seam below, but run the real unchanged recycle
+ * predicate on the producer's actual successor, not a test-side imitation. */
+bool undo_test_real_drain_predicate(const UndoSegmentHeaderData *hdr,
+									ClusterUndoActiveBoundary boundary,
+									bool any_unresolved_prepared, uint32 fixed_first_segment_id,
+									uint32 active_record_segment_id, uint32 active_tt_segment_id,
+									bool recovery_in_progress);
+#define cluster_undo_record_segment_drainable undo_test_real_drain_predicate
+#include "../../backend/cluster/cluster_undo_retention.c"
+#undef cluster_undo_record_segment_drainable
+
 
 #define UNDO_TEST_SHMEM_BYTES 16384
 
@@ -353,6 +364,12 @@ cluster_scn_advance(void)
 	return (SCN)1000;
 }
 
+SCN
+cluster_scn_current(void)
+{
+	return (SCN)900;
+}
+
 XLogRecPtr
 GetXLogWriteRecPtr(void)
 {
@@ -566,6 +583,8 @@ cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0Lo
 			   : CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 }
 
+static unsigned undo_test_lifecycle_mutate_calls;
+
 ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0LogicalKey *key,
 													const ClusterUndoBlock0Generation *expected,
@@ -577,6 +596,8 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	UndoSegmentHeaderData *current = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 	UndoSegmentHeaderData *next = (UndoSegmentHeaderData *)rebased.data;
 	const UndoSegmentHeaderData *requested = (const UndoSegmentHeaderData *)successor_page;
+
+	undo_test_lifecycle_mutate_calls++;
 
 	if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
 		|| successor_page == NULL || timeout_ms <= 0 || key->segment_id != current->segment_id
@@ -2279,7 +2300,7 @@ UT_TEST(test_record_segment_seal_preserves_concurrent_canonical_tt_slot)
 	TTSlot expected;
 
 	undo_test_reset_record_shmem();
-	undo_test_make_header(1, 1, SEGMENT_COMMITTED, undo_test_lifecycle_disk.data);
+	undo_test_make_header(1, 1, SEGMENT_ACTIVE, undo_test_lifecycle_disk.data);
 	memset(&expected, 0, sizeof(expected));
 	expected.status = TT_SLOT_ACTIVE;
 	expected.xid = (TransactionId)700;
@@ -2323,6 +2344,62 @@ UT_TEST(test_record_drain_owner_stamps_only_after_gate)
 	cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
 	undo_test_drain_allowed = false;
 	UT_ASSERT_EQ(memcmp(retained.data, disk, BLCKSZ), 0);
+}
+
+UT_TEST(test_terminal_tt_only_sweep_preserves_actual_recycle_eligibility)
+{
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+	PGAlignedBlock before;
+	int slot;
+	int pass;
+
+	undo_test_reset_record_shmem();
+	undo_test_make_header(2, 1, SEGMENT_COMMITTED, undo_test_lifecycle_disk.data);
+	for (slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+		TTSlot *tt = &disk->tt_slots[slot];
+
+		memset(tt, 0, sizeof(*tt));
+		tt->xid = 700 + slot;
+		tt->wrap = 1;
+		tt->status = TT_SLOT_COMMITTED;
+		tt->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		tt->commit_scn = 100;
+	}
+	UT_ASSERT(cluster_undo_segment_recyclable_for_mode(disk, 1000, true));
+	memcpy(before.data, disk, BLCKSZ);
+	undo_test_lifecycle_mutate_calls = 0;
+	for (pass = 0; pass < 3; pass++) {
+		/* The cleaner-facing wrapper supplies a fresh nonzero seal clock. */
+		cluster_undo_segment_advance_committed(2);
+		UT_ASSERT_EQ(memcmp(before.data, disk, BLCKSZ), 0);
+		UT_ASSERT(cluster_undo_segment_recyclable_for_mode(disk, 1000, true));
+	}
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 0);
+
+	/* Old malformed terminal history is retained, never repaired by a sweep. */
+	UndoSegmentHeader_set_record_seal_upper_scn(disk, 200);
+	memcpy(before.data, disk, BLCKSZ);
+	cluster_undo_segment_advance_committed(2);
+	UT_ASSERT_EQ(memcmp(before.data, disk, BLCKSZ), 0);
+	UT_ASSERT(!cluster_undo_segment_recyclable_for_mode(disk, 1000, true));
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 0);
+}
+
+UT_TEST(test_record_seal_owner_ignores_every_nonactive_predecessor)
+{
+	const uint8 states[] = { SEGMENT_ALLOCATED, SEGMENT_COMMITTED, SEGMENT_RECYCLABLE };
+	PGAlignedBlock before;
+	unsigned i;
+
+	for (i = 0; i < lengthof(states); i++) {
+		undo_test_reset_record_shmem();
+		undo_test_make_header(2, 1, states[i], undo_test_lifecycle_disk.data);
+		memcpy(before.data, undo_test_lifecycle_disk.data, BLCKSZ);
+		undo_test_lifecycle_mutate_calls = 0;
+		cluster_undo_try_mark_record_segment_committed(2, 1, 42);
+		UT_ASSERT_EQ(memcmp(before.data, undo_test_lifecycle_disk.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 0);
+	}
 }
 
 /* Live block-zero lifecycle bytes and canonical TT slots share one
@@ -3167,7 +3244,9 @@ UT_TEST(test_history_codec_cross_page_update_requires_exactly_two_targets)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(64);
+	UT_PLAN(66);
+	UT_RUN(test_terminal_tt_only_sweep_preserves_actual_recycle_eligibility);
+	UT_RUN(test_record_seal_owner_ignores_every_nonactive_predecessor);
 	UT_RUN(test_history_consume_refuses_missing_metadata_before_install);
 	UT_RUN(test_history_planned_uba_accounts_for_footer_capacity);
 	UT_RUN(test_history_stage_syncs_both_receipts_and_freezes_after_apply);
