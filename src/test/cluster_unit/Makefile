@@ -2092,6 +2092,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_pending_consumer.inc \
 		test_cluster_pcm_n_predecessor_consumer.inc \
@@ -2531,6 +2532,13 @@ test_cluster_pcm_snapshot_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	     END { if (post != 1 || capture != 1 || matches != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_barrier_proof.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef struct ClusterBufmgrBarrierUnwindContext/ { emit=1; context++ } \
+	     /^cluster_bufmgr_barrier_prove_empty\(/ { print "static bool"; emit=1; proof++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (context != 1 || proof != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_pcm_own_bump_failure\(/ { print "static ClusterPcmOwnResult"; emit=1; bump_failure++ } \
 	     /^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_snapshot++ } \
@@ -2647,6 +2655,7 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
 		test_cluster_pcm_source_finish_tick.inc \

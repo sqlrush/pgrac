@@ -79,6 +79,11 @@ static int route_observations, route_binds;
 static int route_drift;
 static int n_predecessor_header_step;
 
+/* Only process-local ledger presence is a fixture. The exact production
+ * refusal proof, snapshots and reservation abort below are not rewritten. */
+typedef struct ClusterPcmXWriterLedgerEntry ClusterPcmXWriterLedgerEntry;
+static bool barrier_local_writer;
+
 /* Explicit entry observations; the dispatch, both physical lookup functions,
  * header predicates and actual ownership hold below remain production C. */
 ResourceXApplyResult
@@ -301,6 +306,10 @@ transition_drop_tail(BufferDesc *buf, uint32 state)
 #undef HOLD_INTERRUPTS
 #define HOLD_INTERRUPTS() ((void)0)
 #include "test_cluster_pcm_transition_owner.inc"
+#define cluster_bufmgr_pcm_x_writer_find(buf)                                                      \
+	(barrier_local_writer ? (ClusterPcmXWriterLedgerEntry *)(buf) : NULL)
+#include "test_cluster_pcm_barrier_proof.inc"
+#undef cluster_bufmgr_pcm_x_writer_find
 #include "test_cluster_pcm_delivery_route_owner.inc"
 #undef HOLD_INTERRUPTS
 #undef elog
@@ -938,6 +947,204 @@ snapshot_owner_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	pg_atomic_init_u64(&entry->writer_activation_token, 23);
 	pg_atomic_init_u64(&entry->resource_x_activation_generation, 29);
 	pg_atomic_init_u32(&entry->flags, PCM_OWN_FLAG_GRANT_PENDING);
+}
+
+UT_TEST(test_real_barrier_refusal_ignores_another_callers_pending)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry stable;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot base = { 0 };
+	ClusterPcmXWriterLedgerEntry *writer = NULL;
+	ClusterBufmgrBarrierUnwindContext context = { 0 };
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+	context.buf = &buf;
+	context.pending_base = &base;
+	context.writer = &writer;
+	transition_content_held = barrier_local_writer = false;
+	memcpy(&stable, &entry, sizeof(entry));
+	UT_ASSERT(cluster_bufmgr_barrier_prove_empty(&context));
+	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_barrier_refusal_abort_then_successor_is_not_own_residue)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry stable;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot base;
+	ClusterPcmXWriterLedgerEntry *writer = NULL;
+	ClusterBufmgrBarrierUnwindContext context = { 0 };
+	uint64 successor_token = 0;
+	uint64 committed_generation = 0;
+	uint32 state;
+	int conversion;
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	pg_atomic_write_u64(&entry.writer_activation_token, 0);
+	pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+	pg_atomic_write_u32(&entry.flags, 0);
+	cluster_pcm_own_snapshot_locked(&buf, &base);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(buf.buf_id, base.generation,
+														 PCM_OWN_FLAG_GRANT_PENDING,
+														 &context.pending_token),
+				 CLUSTER_PCM_OWN_OK);
+	UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+	context.buf = &buf;
+	context.pending_base = &base;
+	context.writer = &writer;
+	transition_content_held = barrier_local_writer = false;
+	UT_ASSERT(!cluster_bufmgr_barrier_prove_empty(&context));
+	UT_ASSERT_EQ(cluster_pcm_own_abort_grant_reservation(&buf, &base, context.pending_token),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT(cluster_bufmgr_barrier_prove_empty(&context));
+	/* A different backend reserves immediately after our exact abort,
+	 * before the common proof: real sidecar owner, not a Boolean model. */
+	state = transition_lock_header(&buf);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(
+					 buf.buf_id, base.generation, PCM_OWN_FLAG_GRANT_PENDING, &successor_token),
+				 CLUSTER_PCM_OWN_OK);
+	UnlockBufHdr(&buf, state);
+	UT_ASSERT(successor_token > context.pending_token);
+	memcpy(&stable, &entry, sizeof(entry));
+	UT_ASSERT(cluster_bufmgr_barrier_prove_empty(&context));
+	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	/* Several later committed lifecycles are not a one-generation release
+	 * exception. Drive real token/commit transitions, preserving every new
+	 * reservation when the old caller observes its own empty responsibility. */
+	for (conversion = 0; conversion < 3; conversion++) {
+		state = transition_lock_header(&buf);
+		UT_ASSERT_EQ(cluster_pcm_own_grant_commit_exact(buf.buf_id,
+														cluster_pcm_own_gen_get(buf.buf_id),
+														successor_token, &committed_generation),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(buf.buf_id, committed_generation,
+															 PCM_OWN_FLAG_GRANT_PENDING,
+															 &successor_token),
+					 CLUSTER_PCM_OWN_OK);
+		UnlockBufHdr(&buf, state);
+		memcpy(&stable, &entry, sizeof(entry));
+		UT_ASSERT(cluster_bufmgr_barrier_prove_empty(&context));
+		UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_barrier_refusal_rejects_own_lock_and_ledger)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry stable;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterBufmgrBarrierUnwindContext context = { 0 };
+
+	snapshot_owner_fixture(&buf, &entry);
+	ClusterPcmOwnArray = &entry;
+	UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+	context.buf = &buf;
+	memcpy(&stable, &entry, sizeof(entry));
+	transition_content_held = true;
+	barrier_local_writer = false;
+	UT_ASSERT(!cluster_bufmgr_barrier_prove_empty(&context));
+	UT_ASSERT_EQ(strcmp(context.proof_reason, "REFUSAL_TARGET_LOCK_HELD"), 0);
+	transition_content_held = false;
+	barrier_local_writer = true;
+	UT_ASSERT(!cluster_bufmgr_barrier_prove_empty(&context));
+	UT_ASSERT_EQ(strcmp(context.proof_reason, "REFUSAL_LOCAL_WRITER_REMAINS"), 0);
+	barrier_local_writer = false;
+	UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_barrier_refusal_preserves_identity_failures)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	int variant;
+
+	for (variant = 0; variant < 15; variant++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnEntry stable;
+		ClusterPcmOwnSnapshot base;
+		ClusterBufmgrBarrierUnwindContext context = { 0 };
+
+		snapshot_owner_fixture(&buf, &entry);
+		ClusterPcmOwnArray = &entry;
+		pg_atomic_write_u64(&entry.writer_activation_token, 0);
+		pg_atomic_write_u64(&entry.resource_x_activation_generation, 0);
+		pg_atomic_write_u32(&entry.flags, 0);
+		cluster_pcm_own_snapshot_locked(&buf, &base);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(buf.buf_id, base.generation,
+															 PCM_OWN_FLAG_GRANT_PENDING,
+															 &context.pending_token),
+					 CLUSTER_PCM_OWN_OK);
+		UnlockBufHdr(&buf, pg_atomic_read_u32(&buf.state));
+		context.buf = &buf;
+		context.pending_base = &base;
+		transition_content_held = barrier_local_writer = false;
+		switch (variant) {
+		case 0: /* Our exact un-aborted GRANT_PENDING. */
+			break;
+		case 1: /* The same still-live token cannot be relabeled away. */
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+			break;
+		case 2:
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING);
+			break;
+		case 3:
+			pg_atomic_write_u64(&entry.reservation_token, context.pending_token - 1);
+			break;
+		case 4:
+			pg_atomic_write_u64(&entry.generation, UINT64_MAX);
+			break;
+		case 5:
+			pg_atomic_write_u64(&entry.generation, base.generation - 1);
+			break;
+		case 6:
+			pg_atomic_write_u64(&entry.reservation_token, UINT64_MAX);
+			break;
+		case 7:
+			buf.tag.blockNum++;
+			break;
+		case 8:
+			context.pending_base = NULL;
+			break;
+		case 9:
+			context.pending_token = UINT64_MAX;
+			break;
+		case 10:
+			base.flags = PCM_OWN_FLAG_GRANT_PENDING;
+			break;
+		case 11:
+			base.reservation_token--;
+			break;
+		case 12:
+			ClusterPcmOwnArray = NULL;
+			break;
+		case 13:
+			base.pcm_state = (uint8)PCM_STATE_X;
+			break;
+		case 14:
+			base.generation = UINT64_MAX;
+			break;
+		}
+		memcpy(&stable, &entry, sizeof(entry));
+		UT_ASSERT(!cluster_bufmgr_barrier_prove_empty(&context));
+		UT_ASSERT_EQ(strcmp(context.proof_reason, variant < 2
+													  ? "REFUSAL_EXACT_PENDING_REMAINS"
+													  : "REFUSAL_PENDING_IDENTITY_UNPROVEN"),
+					 0);
+		UT_ASSERT_EQ(memcmp(&stable, &entry, sizeof(entry)), 0);
+		UT_ASSERT(!transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
 }
 
 UT_TEST(test_real_preassert_discards_completed_conversion_observation)
@@ -6719,7 +6926,11 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(123);
+	UT_RUN(test_real_barrier_refusal_ignores_another_callers_pending);
+	UT_RUN(test_real_barrier_refusal_abort_then_successor_is_not_own_residue);
+	UT_RUN(test_real_barrier_refusal_rejects_own_lock_and_ledger);
+	UT_RUN(test_real_barrier_refusal_preserves_identity_failures);
 	UT_RUN(test_real_preassert_discards_completed_conversion_observation);
 	UT_RUN(test_real_preassert_requalifies_late_unowned_auxiliary_retag);
 	UT_RUN(test_real_preassert_requalifies_late_unowned_auxiliary_readiness);

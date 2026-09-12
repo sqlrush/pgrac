@@ -10259,6 +10259,7 @@ typedef struct ClusterBufmgrBarrierUnwindContext
 	ClusterPcmOwnSnapshot *pending_base;
 	uint64		pending_token;
 	ClusterPcmXWriterLedgerEntry **writer;
+	const char *proof_reason;
 } ClusterBufmgrBarrierUnwindContext;
 
 static ClusterBufferBarrierCleanupResult
@@ -10316,11 +10317,39 @@ static bool
 cluster_bufmgr_barrier_prove_empty(void *arg)
 {
 	ClusterBufmgrBarrierUnwindContext *context = arg;
+	ClusterPcmOwnSnapshot live;
 
-	return !LWLockHeldByMe(BufferDescriptorGetContentLock(context->buf))
-		&& cluster_bufmgr_pcm_x_writer_find(context->buf) == NULL
-		&& (cluster_pcm_own_flags_get(context->buf->buf_id)
-			& PCM_OWN_FLAG_GRANT_PENDING) == 0;
+	context->proof_reason = "REFUSAL_TARGET_LOCK_HELD";
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(context->buf)))
+		return false;
+	context->proof_reason = "REFUSAL_LOCAL_WRITER_REMAINS";
+	if (cluster_bufmgr_pcm_x_writer_find(context->buf) != NULL)
+		return false;
+	/* This is a proof about this call, not node-global quiescence. A
+	 * target-X caller has no S reservation; another caller or the LMS may
+	 * already own the next GRANT_PENDING while this call returns refusal. */
+	if (context->pending_token == 0)
+		return true;
+	context->proof_reason = "REFUSAL_PENDING_IDENTITY_UNPROVEN";
+	if (context->pending_base == NULL || context->pending_base->flags != 0
+		|| (context->pending_base->pcm_state != (uint8)PCM_STATE_N
+			&& context->pending_base->pcm_state != (uint8)PCM_STATE_S)
+		|| context->pending_base->generation == UINT64_MAX
+		|| context->pending_base->reservation_token == UINT64_MAX
+		|| context->pending_token == UINT64_MAX
+		|| context->pending_token != context->pending_base->reservation_token + 1
+		|| cluster_bufmgr_pcm_own_snapshot(context->buf, &live) != CLUSTER_PCM_OWN_OK
+		|| !BufferTagsEqual(&live.tag, &context->pending_base->tag) || live.generation == UINT64_MAX
+		|| live.generation < context->pending_base->generation
+		|| live.reservation_token < context->pending_token || live.reservation_token == UINT64_MAX
+		|| cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+			   == CLUSTER_PCM_OWN_CORRUPT)
+		return false;
+	/* Exact abort/convergence has already completed. Token publication is
+	 * monotone, and this coherent snapshot cannot mix an old token with a
+	 * new flag. Never clear a successor; never excuse our own live marker. */
+	context->proof_reason = "REFUSAL_EXACT_PENDING_REMAINS";
+	return live.reservation_token != context->pending_token || live.flags == 0;
 }
 
 static const ClusterBufferBarrierUnwindOps cluster_bufmgr_barrier_unwind_ops = {
@@ -10375,6 +10404,7 @@ cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
 	context.pending_base = pending_base;
 	context.pending_token = pending_token;
 	context.writer = writer;
+	context.proof_reason = "REFUSAL_UNWIND_INCOMPLETE";
 	result = cluster_buffer_barrier_unwind_execute(
 		&cluster_bufmgr_barrier_unwind_ops, &context,
 		pcm_acquired, pcm_pending_set);
@@ -10382,11 +10412,12 @@ cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not synchronously clear cluster PCM barrier-refusal responsibility"),
-				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+				 errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=%s "
 						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 "
 						   "buffer=%d result=%d pending=%d acquired=%d token=%llu",
-						   cluster_node_id, buf->buf_id, (int)result, pcm_pending_set ? 1 : 0,
-						   pcm_acquired ? 1 : 0, (unsigned long long)pending_token),
+						   context.proof_reason, cluster_node_id, buf->buf_id, (int)result,
+						   pcm_pending_set ? 1 : 0, pcm_acquired ? 1 : 0,
+						   (unsigned long long)pending_token),
 				 errhint("Check the server log for the exact holder, writer, or ownership cleanup "
 						 "failure.")));
 }
