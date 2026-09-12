@@ -1701,6 +1701,10 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 $(filter-out test_cluster_lms_native_probe,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
+# The wire behavior is inline; an updated decoder must rebuild this binary.
+test_cluster_r4_wire_codec: test_cluster_r4_wire_codec.c \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
+
 # M7: execute the production insert-end accessor against the exact WAL page
 # boundary mappings.  A function-sectioned xlog object lets dead stripping
 # retain only the accessor and its unit-only shared-state fixture.

@@ -7048,7 +7048,7 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	free_context->locator = locator;
 	free_context->logical = logical;
 	free_context->root = root;
-	free_context->expected_generation.known = true;
+	free_context->expected_generation.known = expected_generation != UINT32_MAX;
 	free_context->expected_generation.value = expected_generation;
 	free_context->admission = admission;
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
@@ -8167,6 +8167,22 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 						= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 				}
 				break;
+			}
+			/* A holder need not cache this origin's segment header. Select
+			 * only before freezing DATA, under the existing own-origin guard;
+			 * the unchanged plan then binds and rechecks this exact generation. */
+			if (context->undo_data_fetch && !context->expected_generation.known) {
+				ClusterUndoBlock0Generation sampled = { false, 0 };
+
+				if (cluster_undo_block0_current_sample_generation(&context->guard, &context->root,
+																  &sampled)
+						!= CLUSTER_UNDO_BLOCK0_OK
+					|| !sampled.known || sampled.value == UINT32_MAX) {
+					context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+					break;
+				}
+				context->expected_generation = sampled;
 			}
 			origin_step
 				= cluster_runtime_visibility_origin_plan_freeze_data_held(

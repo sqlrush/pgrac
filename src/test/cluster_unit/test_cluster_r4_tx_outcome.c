@@ -118,6 +118,7 @@ static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
 static ClusterUndoBlock0Result test_candidate_sample_result;
+static uint32 test_candidate_data_generation;
 static uint32 test_candidate_tt_generation;
 static bool test_candidate_copy_physical_slot;
 static bool test_current_owner_available;
@@ -576,8 +577,9 @@ cluster_undo_block0_current_sample_generation(
 	test_candidate_sample_calls++;
 	UT_ASSERT(root->root_id == 91 || root->root_id == 92);
 	if (test_candidate_sample_result == CLUSTER_UNDO_BLOCK0_OK)
-		*observed = (ClusterUndoBlock0Generation){ true,
-			root->root_id == 91 ? 17 : test_candidate_tt_generation };
+		*observed = (ClusterUndoBlock0Generation){ true, root->root_id == 91
+															 ? test_candidate_data_generation
+															 : test_candidate_tt_generation };
 	return test_candidate_sample_result;
 }
 
@@ -591,8 +593,8 @@ cluster_undo_block0_current_copy_resident(
 
 	test_candidate_block0_copy_calls++;
 	UT_ASSERT(expected->known);
-	UT_ASSERT_EQ(expected->value,
-				 root->root_id == 91 ? 17 : test_candidate_tt_generation);
+	UT_ASSERT_EQ(expected->value, root->root_id == 91 ? test_candidate_data_generation
+													  : test_candidate_tt_generation);
 	memset(private_page, 0, BLCKSZ);
 	if (test_candidate_copy_physical_slot)
 		header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
@@ -899,6 +901,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
 	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_OK;
+	test_candidate_data_generation = 17;
 	test_candidate_tt_generation = 23;
 	test_candidate_copy_physical_slot = true;
 	test_current_owner_available = false;
@@ -3486,7 +3489,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 {
 	int variant;
-	for (variant = 0; variant < 7; variant++) {
+	for (variant = 0; variant < 8; variant++) {
 		ClusterRuntimeVisibilityOriginPlan plan;
 		ClusterTxResolution resolution;
 		ClusterTxResolveReason reason;
@@ -3530,6 +3533,11 @@ UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 			break;
 		case 5:
 			data_root.root_generation++;
+			break;
+		case 7:
+			/* The same root/UBA after physical reuse cannot satisfy the plan
+			 * frozen at generation17, even if the record bytes still match. */
+			test_candidate_data_generation++;
 			break;
 		default:
 			break;

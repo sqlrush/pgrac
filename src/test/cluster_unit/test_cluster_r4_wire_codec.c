@@ -361,18 +361,16 @@ run_wire_vector(int vector)
 		case 46:
 			memset(&forward, 0xa5, sizeof(forward));
 			UT_ASSERT(!ClusterR4ForwardExtensionSetLocatorGeneration(
-				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, UINT32_MAX));
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, UINT32_MAX));
 			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
 			break;
 		case 47:
-			ClusterR4ForwardExtensionSetLocator(&forward,
-				CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator);
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator);
 			ClusterR4WireWriteU32(forward.subject_id_le, UINT32_MAX);
 			memset(&decoded_locator, 0xa5, sizeof(decoded_locator));
 			physical_generation = UINT32_C(0xa5a5a5a5);
 			UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(
-				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator,
-				&physical_generation));
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator, &physical_generation));
 			UT_ASSERT(bytes_are_zero((const uint8 *)&decoded_locator,
 									 sizeof(decoded_locator)));
 			UT_ASSERT_EQ(physical_generation, 0);
@@ -756,10 +754,37 @@ UT_TEST(test_r4_status24_physical_generation_echo_is_exact)
 	UT_ASSERT_EQ(generation, 0);
 }
 
+UT_TEST(test_kind4_generation_request_distinguishes_origin_sample_from_zero)
+{
+	ClusterR4ForwardExtension extension;
+	ClusterTxLocator locator = { 0 };
+	ClusterTxLocator decoded;
+	uint32 values[] = { 0, 9, UINT32_MAX - 1, UINT32_MAX };
+	uint32 generation;
+	int i;
+
+	locator.uba = uba_encode(257, 9, 3, 6);
+	locator.xid = 797;
+	locator.tt_wrap = TT_WRAP_INVALID;
+	locator.itl_kind = ITL_FLAG_ACTIVE;
+	locator.itl_slot_index = 1;
+	for (i = 0; i < lengthof(values); i++) {
+		UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+			&extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, values[i]));
+		UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
+			&extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded, &generation));
+		UT_ASSERT_EQ(generation, values[i]);
+		UT_ASSERT_EQ(memcmp(&decoded, &locator, sizeof(locator)), 0);
+	}
+	UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(&extension, CLUSTER_R4_WIRE_TX_RESOLVE,
+															 &decoded, &generation));
+}
+
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(96);
+	UT_RUN(test_kind4_generation_request_distinguishes_origin_sample_from_zero);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);

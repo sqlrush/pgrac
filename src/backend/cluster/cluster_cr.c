@@ -523,6 +523,32 @@ cluster_cr_r4_extract_resident_record(
 	return true;
 }
 
+/* Scalar evidence from the already-copied page/request only: no extra lookup,
+ * pin or authority acquisition. A missing local record is not by itself proof
+ * that retention expired. The existing refusal remains identical at the cap. */
+static void
+cr_r4_history_refusal_log(const char *site, uint32 slot_index,
+						  const ClusterR4CrSlotExtension *extension, SCN watermark, const UBA *uba,
+						  TransactionId xid)
+{
+	static uint32 emitted;
+	const BufferTag *tag = &extension->route_proof.tag;
+
+	if (emitted >= 64)
+		return;
+	emitted++;
+	elog(LOG,
+		 "PGRAC_FAMILY=R4_HISTORY_REFUSAL PGRAC_SITE=%s node=%d slot=%u"
+		 " slot_generation=" UINT64_FORMAT " builder_incarnation=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u read_scn=" UINT64_FORMAT " watermark=" UINT64_FORMAT
+		 " build_steps=%u uba=" UINT64_FORMAT "/" UINT64_FORMAT " xid=%u detail_limit=%d",
+		 site, cluster_node_id, slot_index, extension->slot_generation,
+		 extension->owner.builder_incarnation, tag->spcOid, tag->dbOid, tag->relNumber,
+		 (unsigned)tag->forkNum, tag->blockNum, (uint64)extension->route_proof.read_scn,
+		 (uint64)watermark, extension->build_steps, uba == NULL ? (uint64)0 : uba->raw[0],
+		 uba == NULL ? (uint64)0 : uba->raw[1], xid, emitted == 64);
+}
+
 /*
  * cluster_cr_build_on_holder_step -- build from the immutable slot page only.
  *
@@ -593,6 +619,8 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 		if (SCN_VALID(recycle_watermark_scn)
 			&& scn_time_cmp(recycle_watermark_scn, extension->route_proof.read_scn) > 0) {
 			*reason_out = CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
+			cr_r4_history_refusal_log("PAGE_WATERMARK", slot_index, extension,
+									  recycle_watermark_scn, NULL, InvalidTransactionId);
 			return CLUSTER_R4_CR_STEP_FAIL;
 		}
 		memset(context, 0, sizeof(*context));
@@ -755,6 +783,11 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 				*reason_out = record_from_foreign_page
 					? CLUSTER_CR_BUILD_BAD_UNDO
 					: CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
+				if (!record_from_foreign_page)
+					cr_r4_history_refusal_log(
+						"LOCAL_RECORD_UNAVAILABLE", slot_index, extension,
+						ClusterPageGetItlHeader((Page)result_page)->itl_recycle_watermark_scn,
+						&current_uba, locator->xid);
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 			if (record_length < sizeof(UndoRecordHeader)) {

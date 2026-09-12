@@ -561,13 +561,28 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(
 	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
 }
 
+static bool origin_generation_sample_enabled;
+static uint32 origin_generation_sample_value;
+static int origin_generation_sample_calls;
+static bool origin_generation_sample_known;
+static bool origin_generation_sample_throw;
+
 ClusterUndoBlock0Result
-cluster_undo_block0_current_sample_generation(
-	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
-	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
-	ClusterUndoBlock0Generation *observed pg_attribute_unused())
+cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
+											  const ClusterUndoBlock0ResolvedRoot *root,
+											  ClusterUndoBlock0Generation *observed)
 {
-	return CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	origin_generation_sample_calls++;
+	if (origin_generation_sample_throw) {
+		UT_ASSERT_NOT_NULL(PG_exception_stack);
+		siglongjmp(*PG_exception_stack, 1);
+	}
+	if (!origin_generation_sample_enabled || guard == NULL || root == NULL
+		|| root->root_id != UINT64_C(0x8000) || observed == NULL)
+		return CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	observed->known = origin_generation_sample_known;
+	observed->value = origin_generation_sample_value;
+	return CLUSTER_UNDO_BLOCK0_OK;
 }
 
 bool
@@ -1075,6 +1090,11 @@ static void
 route_seam_reset(void)
 {
 	memset(&route_seam, 0, sizeof(route_seam));
+	origin_generation_sample_enabled = false;
+	origin_generation_sample_value = 9;
+	origin_generation_sample_calls = 0;
+	origin_generation_sample_known = true;
+	origin_generation_sample_throw = false;
 	route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
 	route_seam.configured_node_count = 1;
 	route_seam.activation_generation = UT_ACTIVATION_GENERATION;
@@ -1916,9 +1936,11 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	if (locator == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS && mode != CLUSTER_TX_RESOLVE_VISIBILITY)
 		|| admission == NULL || !admission->entered || expected_generation == NULL
-		|| !expected_generation->known || expected_generation->value != UINT32_C(9) || guard == NULL
-		|| root == NULL || root->root_id != UINT64_C(0x8000) || plan == NULL || out == NULL
-		|| reason_out == NULL)
+		|| !expected_generation->known
+		|| expected_generation->value
+			   != (origin_generation_sample_enabled ? origin_generation_sample_value : UINT32_C(9))
+		|| guard == NULL || root == NULL || root->root_id != UINT64_C(0x8000) || plan == NULL
+		|| out == NULL || reason_out == NULL)
 		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
 	memset(plan, 0, sizeof(*plan));
 	plan->opaque[0] = 1;
@@ -5846,6 +5868,88 @@ route_test_undo_forward(uint16 wrap)
 	return forward;
 }
 
+UT_TEST(test_kind4_origin_selects_generation_for_cold_holder)
+{
+	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
+												UT_MASTER_NODE, sizeof(forward));
+	uint32 generation = 0;
+	int saved_node = cluster_node_id;
+	int i;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+	route_seam.candidate_cross_segment = true;
+	origin_generation_sample_enabled = true;
+	/* Unknown is a request to the exact origin, never an actual generation. */
+	memset(forward.extension.subject_id_le, 0xff, sizeof(forward.extension.subject_id_le));
+	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	for (i = 0; i < 4; i++)
+		cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
+	UT_ASSERT_EQ(route_seam.raw_send_header.status, GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT);
+	UT_ASSERT(GcsBlockReplyHeaderGetR4UndoGeneration(&route_seam.raw_send_header, &generation));
+	UT_ASSERT_EQ(generation, 9);
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 3);
+	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
+	UT_ASSERT_EQ(route_seam.candidate_canonical_sample_calls, 1);
+	UT_ASSERT_EQ(route_seam.candidate_data_recheck_calls, 1);
+	UT_ASSERT_EQ(origin_generation_sample_calls, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_kind4_origin_generation_sample_failure_never_publishes_data)
+{
+	int saved_node = cluster_node_id;
+	int variant;
+
+	cluster_node_id = UT_MASTER_NODE;
+	for (variant = 0; variant < 6; variant++) {
+		ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+		ClusterICEnvelope env = route_test_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
+		uint32 generation = UINT32_MAX;
+		int i;
+
+		route_seam_reset();
+		route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+		origin_generation_sample_enabled = variant != 2;
+		origin_generation_sample_value
+			= variant == 0 ? 0 : (variant == 1 ? UINT32_MAX - 1 : (variant == 3 ? UINT32_MAX : 9));
+		origin_generation_sample_known = variant != 4;
+		origin_generation_sample_throw = variant == 5;
+		memset(forward.extension.subject_id_le, 0xff, sizeof(forward.extension.subject_id_le));
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		for (i = 0; i < 4; i++)
+			cluster_gcs_block_test_r4_tx_origin_drain();
+		UT_ASSERT_EQ(origin_generation_sample_calls, 1);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
+		UT_ASSERT_EQ(route_seam.raw_send_header.request_id, forward.base.request_id);
+		UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 1);
+		UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, variant == 5 ? 0 : 1);
+		UT_ASSERT_EQ(route_seam.candidate_cancel_calls, variant == 5 ? 1 : 0);
+		UT_ASSERT_EQ(route_seam.candidate_resolve_calls, variant < 2 ? 1 : 0);
+		UT_ASSERT_EQ(route_seam.raw_send_header.status,
+					 variant < 2 ? GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT : GCS_BLOCK_REPLY_R4_DENIED);
+		if (variant < 2) {
+			UT_ASSERT(
+				GcsBlockReplyHeaderGetR4UndoGeneration(&route_seam.raw_send_header, &generation));
+			UT_ASSERT_EQ(generation, origin_generation_sample_value);
+		} else {
+			for (i = 0; i < BLCKSZ; i++)
+				UT_ASSERT_EQ(route_seam.raw_send_page[i], 0);
+			UT_ASSERT_EQ(route_seam.raw_send_header.page_lsn, 0);
+		}
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	}
+	cluster_node_id = saved_node;
+}
+
 UT_TEST(test_kind4_origin_error_releases_guard_and_returns_correlated_refusal)
 {
 	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
@@ -5887,20 +5991,26 @@ UT_TEST(test_kind4_origin_backpressure_retains_same_proven_page_without_reacquir
 	route_seam_reset();
 	route_seam.raw_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	route_seam.candidate_cross_segment = true;
+	origin_generation_sample_enabled = true;
+	memset(forward.extension.subject_id_le, 0xff, sizeof(forward.extension.subject_id_le));
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
 	for (i = 0; i < 4; i++)
 		cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
 	UT_ASSERT_EQ(route_seam.leave_calls, 0);
 	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
+	UT_ASSERT_EQ(origin_generation_sample_calls, 1);
 	first_header = route_seam.raw_send_header;
 	memcpy(first_page, route_seam.raw_send_page, BLCKSZ);
 	acquires = route_seam.candidate_acquire_begin_calls;
 	sent = route_seam.raw_send_calls;
 	route_seam.raw_send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+	/* A later local observation is not permission to replace the proof. */
+	origin_generation_sample_value++;
 	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(route_seam.raw_send_calls, sent + 1);
 	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, acquires);
+	UT_ASSERT_EQ(origin_generation_sample_calls, 1);
 	UT_ASSERT_EQ(memcmp(first_page, route_seam.raw_send_page, BLCKSZ), 0);
 	UT_ASSERT_EQ(memcmp(&first_header, &route_seam.raw_send_header, sizeof(first_header)), 0);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
@@ -6072,7 +6182,9 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(111);
+	UT_PLAN(113);
+	UT_RUN(test_kind4_origin_selects_generation_for_cold_holder);
+	UT_RUN(test_kind4_origin_generation_sample_failure_never_publishes_data);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);

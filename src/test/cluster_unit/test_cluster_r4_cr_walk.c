@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include <stdarg.h>
 #include <string.h>
 
 #include "access/htup_details.h"
@@ -36,6 +37,34 @@ UT_DEFINE_GLOBALS();
 
 int cluster_node_id = 0;
 int cluster_cr_chain_walk_max_steps = 4096;
+static unsigned ut_horizon_log_count;
+static char ut_horizon_log[1536];
+
+bool
+errstart(int level, const char *domain pg_attribute_unused())
+{
+	UT_ASSERT_EQ(level, LOG);
+	return true;
+}
+
+int
+errmsg_internal(const char *format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf(ut_horizon_log, sizeof(ut_horizon_log), format, args);
+	va_end(args);
+	return 0;
+}
+
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *func pg_attribute_unused())
+{
+	UT_ASSERT(strstr(ut_horizon_log, "PGRAC_FAMILY=R4_HISTORY_REFUSAL") != NULL);
+	ut_horizon_log_count++;
+}
 
 MemoryContext TopMemoryContext = (MemoryContext)0x1;
 
@@ -1449,6 +1478,7 @@ UT_TEST(test_r4_builder_recycle_watermark_above_read_scn_fails_closed)
 	ClusterR4CrSlotExtension extension = make_builder_extension(42, 74);
 	ClusterR4CrSlotExtension extension_before = extension;
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	unsigned logs_before = ut_horizon_log_count;
 
 	make_zero_candidate_page(page);
 	ClusterPageGetItlHeader((Page)page)->itl_recycle_watermark_scn = (SCN)200;
@@ -1460,6 +1490,9 @@ UT_TEST(test_r4_builder_recycle_watermark_above_read_scn_fails_closed)
 											 foreign_page, &reason),
 				 CLUSTER_R4_CR_STEP_FAIL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
+	UT_ASSERT_EQ(ut_horizon_log_count, logs_before + 1);
+	UT_ASSERT(strstr(ut_horizon_log, "PGRAC_SITE=PAGE_WATERMARK") != NULL);
+	UT_ASSERT(strstr(ut_horizon_log, "watermark=200") != NULL);
 	UT_ASSERT_EQ(extension.build_steps, 0);
 	UT_ASSERT(memcmp(page, page_before, sizeof(page)) == 0);
 	UT_ASSERT(memcmp(&extension, &extension_before, sizeof(extension)) == 0);
@@ -2873,10 +2906,58 @@ UT_TEST(test_r4_candidate_allows_history_at_snapshot_boundary)
 	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
 }
 
+UT_TEST(test_r4_missing_local_record_keeps_refusal_and_reports_exact_site)
+{
+	PGAlignedBlock page, before, foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(604, 904);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	unsigned logs_before = ut_horizon_log_count;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	memcpy(before.data, page.data, BLCKSZ);
+	memset(foreign.data, 0, BLCKSZ);
+	ut_undo_record_length = 0;
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 604, false, &extension, page.data, foreign.data,
+												 &reason),
+				 CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+	UT_ASSERT_EQ(memcmp(before.data, page.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(ut_horizon_log_count, logs_before + 1);
+	UT_ASSERT(strstr(ut_horizon_log, "PGRAC_SITE=LOCAL_RECORD_UNAVAILABLE") != NULL);
+	UT_ASSERT(strstr(ut_horizon_log, "slot_generation=604") != NULL);
+	cluster_cr_build_on_holder_forget(0, 604);
+}
+
+/* Details are bounded per process; refusing history never depends on whether
+ * a diagnostic record can still be emitted. Run last, after both sites. */
+UT_TEST(test_r4_history_detail_limit_never_changes_the_refusal)
+{
+	int i;
+	for (i = 0; i < 70; i++) {
+		PGAlignedBlock page, before, foreign;
+		ClusterR4CrSlotExtension extension = make_builder_extension(605, 905);
+		ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+
+		make_zero_candidate_page(page.data);
+		ClusterPageGetItlHeader((Page)page.data)->itl_recycle_watermark_scn = 200;
+		memcpy(before.data, page.data, BLCKSZ);
+		memset(foreign.data, 0, BLCKSZ);
+		UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 605, false, &extension, page.data,
+													 foreign.data, &reason),
+					 CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
+		UT_ASSERT_EQ(memcmp(before.data, page.data, BLCKSZ), 0);
+		cluster_cr_build_on_holder_forget(0, 605);
+	}
+	UT_ASSERT_EQ(ut_horizon_log_count, 64);
+	UT_ASSERT(strstr(ut_horizon_log, "detail_limit=1") != NULL);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(71);
+	UT_PLAN(73);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
@@ -2949,6 +3030,8 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_overlap_does_not_cover_malformed_record);
 	UT_RUN(test_r4_candidate_does_not_hide_recycled_history);
 	UT_RUN(test_r4_candidate_allows_history_at_snapshot_boundary);
+	UT_RUN(test_r4_missing_local_record_keeps_refusal_and_reports_exact_site);
+	UT_RUN(test_r4_history_detail_limit_never_changes_the_refusal);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

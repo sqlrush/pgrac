@@ -2072,59 +2072,34 @@ UT_TEST(test_r4_worker0_query_cancel_terminalizes_exact_building_slot)
 	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, false, 0, 0, NULL));
 }
 
-/* The production NEED_UNDO edge resolves the current PGRD root, samples the
- * resident physical generation under Candidate-2 SCUR, releases SCUR, and
- * only then freezes that value into the immutable FORWARD96 request. */
-UT_TEST(test_r4_worker0_foreign_undo_samples_generation_before_send)
+/* A cold holder sends the exact saved dependency without any foreign-header
+ * pin or SCUR. The original origin owns selection of its physical generation. */
+UT_TEST(test_r4_worker0_foreign_undo_requests_origin_selection_without_local_scur)
 {
 	ClusterLmsSharedState state;
 	ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
 	const ClusterR4CrForwardPayload *forward;
 	ClusterTxLocator locator;
-	uint32 physical_generation = UINT32_MAX;
+	uint32 physical_generation = 0;
 
 	ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
-	UT_ASSERT(!cluster_cr_server_test_r4_send_foreign_undo(0));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_NEED_UNDO);
-	UT_ASSERT_EQ(ut_send_calls, 0);
-	ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	ut_current_release_step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
-	UT_ASSERT(!cluster_cr_server_test_r4_send_foreign_undo(0));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_NEED_UNDO);
-	UT_ASSERT_EQ(ut_send_calls, 0);
-	ut_current_release_step = CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
-	UT_ASSERT_EQ(ut_pending_locator_calls, 3);
+	UT_ASSERT_EQ(ut_pending_locator_calls, 1);
 	UT_ASSERT_EQ(ut_send_calls, 1);
 	UT_ASSERT_EQ(ut_note_send_calls, 1);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 	forward = (const ClusterR4CrForwardPayload *)ut_send_payload;
 	UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
-		&forward->extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator,
-		&physical_generation));
-	UT_ASSERT_EQ(physical_generation, UT_FOREIGN_PHYSICAL_GENERATION);
+		&forward->extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, &physical_generation));
+	UT_ASSERT_EQ(physical_generation, UINT32_MAX);
 	UT_ASSERT_EQ(memcmp(&locator, &ut_pending_locator, sizeof(locator)), 0);
-	UT_ASSERT_EQ(ut_pgrd_resolve_calls, 4);
-	UT_ASSERT_EQ(ut_pgrd_resolve_intent,
-				 CLUSTER_UNDO_PATH_RUNTIME_SHARED);
-	UT_ASSERT_EQ(ut_pgrd_resolve_owner_instance, 2);
-	UT_ASSERT_EQ(ut_pgrd_resolve_segment_id, 257);
-	UT_ASSERT_EQ(memcmp(&ut_pgrd_resolve_admission,
-					 &ut_expected_admission,
-					 sizeof(ut_expected_admission)), 0);
-	UT_ASSERT_EQ(ut_current_acquire_calls, 1);
-	UT_ASSERT_EQ(ut_current_acquire_poll_calls, 1);
-	UT_ASSERT_EQ(ut_current_logical.owner_instance, 2);
-	UT_ASSERT_EQ(ut_current_logical.segment_id, 257);
-	UT_ASSERT_EQ(ut_current_sample_calls, 1);
-	UT_ASSERT_EQ(memcmp(&ut_current_sample_root,
-					 &ut_pgrd_resolved_root,
-					 sizeof(ut_pgrd_resolved_root)), 0);
-	UT_ASSERT_EQ(ut_current_release_calls, 1);
-	UT_ASSERT_EQ(ut_current_release_poll_calls, 1);
+	UT_ASSERT_EQ(ut_pgrd_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_current_acquire_calls, 0);
+	UT_ASSERT_EQ(ut_current_acquire_poll_calls, 0);
+	UT_ASSERT_EQ(ut_current_sample_calls, 0);
+	UT_ASSERT_EQ(ut_current_release_calls, 0);
+	UT_ASSERT_EQ(ut_current_release_poll_calls, 0);
 	UT_ASSERT_EQ(ut_current_cancel_calls, 0);
 	UT_ASSERT_EQ(ut_forget_calls, 0);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
@@ -3135,7 +3110,7 @@ UT_TEST(test_worker0_real_builder_two_foreign_updates_complete_same_owned_contin
 		UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
 	}
 	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
-	UT_ASSERT_EQ(ut_current_sample_calls, 2);
+	UT_ASSERT_EQ(ut_current_sample_calls, 0);
 	for (i = 0; i < 2; i++) {
 		ItemId old_item = PageGetItemId(page, 1 + i * 2);
 		UT_ASSERT(ItemIdIsNormal(old_item));
@@ -3149,32 +3124,93 @@ UT_TEST(test_worker0_real_builder_two_foreign_updates_complete_same_owned_contin
 	UT_ASSERT(!continuation_real_pending(0, 1, &ut_pending_locator));
 }
 
-UT_TEST(test_r4_protocol_detail_distinguishes_actual_scur_failures)
+UT_TEST(test_foreign_undo_cold_holder_reaches_origin_without_resident_header)
 {
-	const char *sites[]
-		= { "PGRAC_SITE=SCUR_ACQUIRE", "PGRAC_SITE=SCUR_SAMPLE", "PGRAC_SITE=SCUR_RELEASE" };
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
+	int phase;
+
+	/* A lock grant does not populate a foreign resident header. The actual
+	 * sender must reach its origin even when that local sampler has no page. */
+	ut_current_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	for (phase = 0; phase < 4 && pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_R4_NEED_UNDO;
+		 phase++)
+		(void)cluster_cr_server_test_r4_send_foreign_undo(0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(ut_send_calls, 1);
+	UT_ASSERT_EQ(ut_current_acquire_calls, 0);
+	UT_ASSERT_EQ(ut_current_sample_calls, 0);
+}
+
+UT_TEST(test_cold_foreign_landing_freezes_only_the_validated_dependency)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		ClusterLmsSharedState state;
+		ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
+		ClusterLmsCrSlot before;
+		GcsBlockReplyHeader header;
+		GcsBlockReplyHeader rejected;
+		ClusterGcsUndoAuthTrailer auth;
+		ClusterICEnvelope env;
+		char page[BLCKSZ];
+
+		ut_current_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
+		make_foreign_undo_reply(&header, &auth, &env, page);
+		UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(&header, variant == 0 ? 0 : 17));
+		rejected = header;
+		if (variant != 0) {
+			if (variant == 1)
+				memset(rejected.reserved_0, 0xff, 4);
+			else if (variant == 2)
+				rejected.checksum ^= 1;
+			else if (variant == 3)
+				ut_extract_ok = false;
+			else
+				rejected.request_id += 4;
+			before = *slot;
+			UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &rejected, page, &auth));
+			UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
+			ut_extract_ok = true;
+		}
+		UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+		before = *slot;
+		UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+		UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
+		ut_builder_publish_foreign_pause = false;
+		ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+		UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+		UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+		UT_ASSERT_EQ(ut_current_acquire_calls, 0);
+		UT_ASSERT_EQ(ut_current_sample_calls, 0);
+	}
+}
+
+UT_TEST(test_r4_protocol_detail_distinguishes_actual_request_and_send_failures)
+{
+	const char *sites[] = { "PGRAC_SITE=FROZEN_REQUEST", "PGRAC_SITE=FORWARD_SEND" };
 
 	for (int leg = 0; leg < lengthof(sites); leg++) {
 		ClusterLmsSharedState state;
 		ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
 
 		if (leg == 0)
-			ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
-		else if (leg == 1)
-			ut_current_sample_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			ut_pending_locator.xid++;
 		else
-			ut_current_release_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+			ut_send_result = CLUSTER_IC_SEND_HARD_ERROR;
 		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
 		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FAIL);
 		UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
-		UT_ASSERT_EQ(ut_send_calls, 0);
-		UT_ASSERT_EQ(ut_current_cancel_calls, 1);
+		UT_ASSERT_EQ(ut_send_calls, leg == 0 ? 0 : 1);
+		UT_ASSERT_EQ(ut_current_cancel_calls, 0);
 		UT_ASSERT_EQ(ut_protocol_logs, 1);
 		UT_ASSERT(strstr(ut_last_log, sites[leg]) != NULL);
 		UT_ASSERT(strstr(ut_last_log, "PGRAC_FAMILY=R4_PROTOCOL") != NULL);
-		UT_ASSERT_EQ(ut_current_acquire_calls, 1);
-		UT_ASSERT_EQ(ut_current_sample_calls, leg == 0 ? 0 : 1);
-		UT_ASSERT_EQ(ut_current_release_calls, leg == 2 ? 1 : 0);
+		UT_ASSERT_EQ(ut_current_acquire_calls, 0);
+		UT_ASSERT_EQ(ut_current_sample_calls, 0);
+		UT_ASSERT_EQ(ut_current_release_calls, 0);
 	}
 }
 
@@ -3184,12 +3220,12 @@ UT_TEST(test_r4_protocol_detail_budget_never_changes_terminal)
 		ClusterLmsSharedState state;
 		ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
 
-		ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		ut_pending_locator.xid++;
 		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
 		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FAIL);
 		UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
 		UT_ASSERT_EQ(ut_send_calls, 0);
-		UT_ASSERT_EQ(ut_current_cancel_calls, 1);
+		UT_ASSERT_EQ(ut_current_cancel_calls, 0);
 	}
 	UT_ASSERT_EQ(ut_protocol_total_logs, 64);
 	UT_ASSERT_EQ(ut_protocol_logs, 0);
@@ -3198,8 +3234,10 @@ UT_TEST(test_r4_protocol_detail_budget_never_changes_terminal)
 int
 main(void)
 {
-	UT_PLAN(45);
-	UT_RUN(test_r4_protocol_detail_distinguishes_actual_scur_failures);
+	UT_PLAN(47);
+	UT_RUN(test_foreign_undo_cold_holder_reaches_origin_without_resident_header);
+	UT_RUN(test_cold_foreign_landing_freezes_only_the_validated_dependency);
+	UT_RUN(test_r4_protocol_detail_distinguishes_actual_request_and_send_failures);
 	UT_RUN(test_free_to_pending_canonicalizes_owner_under_lms_lock);
 	UT_RUN(test_free_to_filling_uses_same_proof_window);
 	UT_RUN(test_busy_slot_preserves_winner_owner_stamp);
@@ -3220,7 +3258,7 @@ main(void)
 	UT_RUN(test_r4_worker0_build_step_publishes_ready_full);
 	UT_RUN(test_r4_worker0_build_step_publishes_one_need_undo);
 	UT_RUN(test_r4_worker0_query_cancel_terminalizes_exact_building_slot);
-	UT_RUN(test_r4_worker0_foreign_undo_samples_generation_before_send);
+	UT_RUN(test_r4_worker0_foreign_undo_requests_origin_selection_without_local_scur);
 	UT_RUN(test_r4_worker0_foreign_undo_sends_frozen_zero_generation);
 	UT_RUN(test_r4_worker0_foreign_undo_admitted_send_is_exact_and_one_shot);
 	UT_RUN(test_r4_worker0_foreign_undo_accepts_initial_tt_wrap);
