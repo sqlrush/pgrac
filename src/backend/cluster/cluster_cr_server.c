@@ -2369,16 +2369,41 @@ cluster_cr_server_local_freshref_c1b_pair_exact(
 	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
 	LmsOwnXidReason reason;
+	volatile LmsFreshrefPairDiagnostic diagnostic;
+	static uint32 refusal_details = 0;
 
 	if (out_wrap != NULL)
 		*out_wrap = 0;
 	reason = lms_resolve_own_xid_freshref_c1b_pair(xid, expected_segment_id, expected_tt_slot_id,
 												   proposed_scn, &verdict, &commit_scn,
-												   &horizon_scn, &wrap, NULL);
-	if (reason != LMS_OWN_XID_PROVEN
-		|| verdict != (uint8) CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
-		|| commit_scn != proposed_scn || SCN_VALID(horizon_scn))
+												   &horizon_scn, &wrap, &diagnostic);
+	if (reason != LMS_OWN_XID_PROVEN || verdict != (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
+		|| commit_scn != proposed_scn || SCN_VALID(horizon_scn)) {
+		/* Report only the sample already made by this proof attempt. The
+		 * diagnostic adds no authority read and cannot change its verdict. */
+		if (lms_freshref_pair_detail_admit(&refusal_details))
+			ereport(
+				LOG,
+				(errmsg_internal("local fresh-ref C1b pair refused"),
+				 errdetail("PGRAC_FAMILY=TT_AUTHORITY_DIAGNOSTIC PGRAC_REASON=%s "
+						   "origin=%d xid=%u expected_segment=%u expected_slot=%u "
+						   "proposed_scn=" UINT64_FORMAT " scan_sampled=%d resolve=%d "
+						   "matched_segment=%u matched_slot=%u matched_wrap=%u "
+						   "resolved_scn=" UINT64_FORMAT " native_sampled=%d no_raw_reuse=%d "
+						   "own_xid=%d clog_sampled=%d clog_floor=%u raw_status=%d "
+						   "retention_sampled=%d retention_ok=%d horizon=" UINT64_FORMAT,
+						   reason == LMS_OWN_XID_PROVEN ? "LOCAL_RESULT_CONTRACT"
+														: diagnostic.predicate,
+						   cluster_node_id, xid, expected_segment_id, expected_tt_slot_id,
+						   (uint64)proposed_scn, diagnostic.scan_sampled, (int)diagnostic.resolve,
+						   (unsigned)diagnostic.matched_segment, (unsigned)diagnostic.matched_slot,
+						   (unsigned)diagnostic.matched_wrap, (uint64)diagnostic.resolved_scn,
+						   diagnostic.native_sampled, diagnostic.no_raw_reuse, diagnostic.own_xid,
+						   diagnostic.clog_sampled, diagnostic.clog_floor, diagnostic.raw_status,
+						   diagnostic.retention_sampled, diagnostic.retention_ok,
+						   (uint64)diagnostic.horizon_scn)));
 		return false;
+	}
 	if (out_wrap != NULL)
 		*out_wrap = wrap;
 	return true;

@@ -1664,15 +1664,35 @@ cluster_runtime_visibility_origin_recycled_abort_candidate(
 	return cluster_runtime_visibility_origin_recycled_abort_sample(locator, diagnostic);
 }
 
-ClusterRuntimeVisibilityOriginStep
-cluster_runtime_visibility_origin_plan_freeze_data_held(
+/* The held DATA SCUR and the caller's generation checks bracket this read.
+ * A synchronous local consumer may fill cold DATA; a split LMS callback
+ * cannot. No pool pin/content lock survives into the canonical TT phase. */
+static bool
+cluster_runtime_visibility_origin_data_copy(uint32 segment_id, uint8 owner, uint32 block_no,
+											char data_out[BLCKSZ], bool allow_readthrough)
+{
+	ClusterUndoBufPin pin;
+	char *page;
+
+	if (cluster_undo_buf_copy_resident(segment_id, owner, block_no, data_out))
+		return true;
+	if (!allow_readthrough)
+		return false;
+	page = cluster_undo_buf_pin(segment_id, owner, block_no, CLUSTER_UNDO_BUF_SHARED, &pin);
+	if (page == NULL)
+		return false;
+	memcpy(data_out, page, BLCKSZ);
+	cluster_undo_buf_unpin(&pin);
+	return true;
+}
+
+static ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
-	const ClusterUndoBlock0Generation *expected_generation,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out)
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out, bool allow_readthrough)
 {
 	ClusterRuntimeVisibilityOriginPlanData *plan_data;
 	ClusterUndoBlock0ResolvedRoot final_root;
@@ -1750,9 +1770,9 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	if (cluster_undo_block0_current_copy_resident(
 			guard, root, &generation, block0.data) != CLUSTER_UNDO_BLOCK0_OK)
 		goto failed;
-	if (!cluster_undo_buf_copy_resident(
-			segment_id, plan_data->data_logical.owner_instance, block_no,
-			data_page.data))
+	if (!cluster_runtime_visibility_origin_data_copy(segment_id,
+													 plan_data->data_logical.owner_instance,
+													 block_no, data_page.data, allow_readthrough))
 		goto failed;
 	if (!cluster_cr_r4_extract_resident_record(
 			data_page.data, locator, record_buf.data, &record_length,
@@ -1841,6 +1861,18 @@ failed:
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+}
+
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_origin_plan_freeze_data_internal(
+		locator, mode, admission, expected_generation, guard, root, plan, out, reason_out, false);
 }
 
 bool
@@ -2090,7 +2122,7 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out, char *data_out,
-	ClusterTxResolveReason *reason_out)
+	ClusterTxResolveReason *reason_out, bool allow_readthrough)
 {
 	ClusterRuntimeVisibilityOriginPlanData *plan_data
 		= cluster_runtime_visibility_origin_plan_data(plan);
@@ -2122,30 +2154,24 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 		goto failed;
 	}
-	if (cluster_undo_block0_current_sample_generation(
-			guard, root, &generation) != CLUSTER_UNDO_BLOCK0_OK
-		|| !generation.known
-		|| generation.value != plan_data->data_generation.value
-		|| !cluster_undo_buf_copy_resident(
-			plan_data->data_logical.segment_id,
-			plan_data->data_logical.owner_instance,
-			plan_data->data_block_no, data_page.data)
-		|| !cluster_cr_r4_extract_resident_record(
-			data_page.data, &plan_data->locator, record_buf.data,
-			&record_length, &rechecked_locator)
+	if (cluster_undo_block0_current_sample_generation(guard, root, &generation)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value != plan_data->data_generation.value
+		|| !cluster_runtime_visibility_origin_data_copy(
+			plan_data->data_logical.segment_id, plan_data->data_logical.owner_instance,
+			plan_data->data_block_no, data_page.data, allow_readthrough)
+		|| !cluster_cr_r4_extract_resident_record(data_page.data, &plan_data->locator,
+												  record_buf.data, &record_length,
+												  &rechecked_locator)
 		|| record_length != plan_data->record_length
-		|| memcmp(record_buf.data, plan_data->record_buf.data,
-				  record_length) != 0
-		|| memcmp(&rechecked_locator, &plan_data->canonical_locator,
-				  sizeof(rechecked_locator)) != 0
-		|| cluster_undo_block0_current_sample_generation(
-			guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
-		|| !final_generation.known
-		|| final_generation.value != plan_data->data_generation.value
+		|| memcmp(record_buf.data, plan_data->record_buf.data, record_length) != 0
+		|| memcmp(&rechecked_locator, &plan_data->canonical_locator, sizeof(rechecked_locator)) != 0
+		|| cluster_undo_block0_current_sample_generation(guard, root, &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known || final_generation.value != plan_data->data_generation.value
 		|| !cluster_runtime_visibility_resolve_root_admitted(
 			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			plan_data->data_logical.owner_instance,
-			plan_data->data_logical.segment_id, &final_root)
+			plan_data->data_logical.owner_instance, plan_data->data_logical.segment_id, &final_root)
 		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
 		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
@@ -2177,7 +2203,7 @@ cluster_runtime_visibility_origin_plan_recheck_data_held(
 	ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_origin_plan_recheck_data_internal(
-		plan, mode, admission, guard, root, out, NULL, reason_out);
+		plan, mode, admission, guard, root, out, NULL, reason_out, false);
 }
 
 ClusterTxOutcome
@@ -2195,7 +2221,7 @@ cluster_runtime_visibility_origin_plan_copy_data_held(
 		return CLUSTER_TX_UNKNOWN;
 	}
 	return cluster_runtime_visibility_origin_plan_recheck_data_internal(
-		plan, mode, admission, guard, root, out, data_out, reason_out);
+		plan, mode, admission, guard, root, out, data_out, reason_out, false);
 }
 
 bool
@@ -2556,9 +2582,8 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
 	logical.segment_id = segment_id;
-	origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
-		locator, mode, admission, expected_generation, guard, root, &plan,
-		out, &reason);
+	origin_step = cluster_runtime_visibility_origin_plan_freeze_data_internal(
+		locator, mode, admission, expected_generation, guard, root, &plan, out, &reason, true);
 	if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_NONE;
@@ -2600,8 +2625,8 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 			&logical, admission, guard, &phase_cleanup, &current_result)
 			   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
 		goto done;
-	outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
-		&plan, mode, admission, guard, &final_root, out, &reason);
+	outcome = cluster_runtime_visibility_origin_plan_recheck_data_internal(
+		&plan, mode, admission, guard, &final_root, out, NULL, &reason, true);
 	if (outcome != CLUSTER_TX_UNKNOWN) {
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_NONE;
