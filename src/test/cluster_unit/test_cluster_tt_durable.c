@@ -79,6 +79,8 @@ scn_time_cmp(SCN a, SCN b)
 
 UT_DEFINE_GLOBALS();
 
+static void (*g_epoch_hook)(void) = NULL;
+
 uint64
 GetSystemIdentifier(void)
 {
@@ -88,6 +90,8 @@ GetSystemIdentifier(void)
 uint64
 cluster_epoch_get_current(void)
 {
+	if (g_epoch_hook != NULL)
+		g_epoch_hook();
 	return 17;
 }
 
@@ -142,9 +146,9 @@ extern XLogRecPtr cluster_tt_slot_durable_publish_active(
 static int last_ereport_errcode = 0;
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return true;
+	return elevel >= ERROR;
 }
 bool
 errstart_cold(int elevel, const char *domain)
@@ -208,6 +212,9 @@ cluster_ctrc_shmem_ready(void)
 }
 
 static ClusterUndoBlock0ResolvedRoot g_current_root;
+static uint32 g_current_segment = 1;
+static void (*g_before_current_acquire_hook)(void) = NULL;
+static void (*g_after_bind_emit_hook)(void) = NULL;
 static ClusterUndoBlock0Generation g_current_generation;
 static char g_current_resident[BLCKSZ];
 static bool g_current_root_ok = true;
@@ -230,12 +237,16 @@ static int g_current_release_calls = 0;
 static int g_current_cancel_calls = 0;
 static int g_current_target_root_calls = 0;
 static int g_current_target_acquire_calls = 0;
+static bool g_process_interrupt_error = false;
 
 void ProcessInterrupts(void);
 
 void
 ProcessInterrupts(void)
-{}
+{
+	if (g_process_interrupt_error)
+		ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("injected caller cancel")));
+}
 
 void
 pg_re_throw(void)
@@ -252,9 +263,8 @@ cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 {
 	g_current_root_calls++;
 	if (!g_current_root_ok || token == NULL || !token->entered
-		|| token->side != CLUSTER_SEMANTIC_SOURCE_SIDE
-		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		|| owner_instance != (uint32)cluster_node_id + 1 || segment_id != 1
+		|| token->side != CLUSTER_SEMANTIC_SOURCE_SIDE || intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| owner_instance != (uint32)cluster_node_id + 1 || segment_id != g_current_segment
 		|| out == NULL)
 		return false;
 	*out = g_current_root;
@@ -271,9 +281,8 @@ cluster_semantic_activation_resolve_shared_undo_root(
 	g_current_root_calls++;
 	g_current_target_root_calls++;
 	if (!g_current_root_ok || token == NULL || !token->entered
-		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
-		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		|| owner_instance != (uint32)cluster_node_id + 1 || segment_id != 1
+		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE || intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| owner_instance != (uint32)cluster_node_id + 1 || segment_id != g_current_segment
 		|| out == NULL)
 		return false;
 	*out = g_current_root;
@@ -300,8 +309,10 @@ cluster_undo_block0_current_acquire_begin_live_owner_source(
 	ClusterUndoBlock0Result *failure)
 {
 	g_current_acquire_calls++;
+	if (g_before_current_acquire_hook != NULL)
+		g_before_current_acquire_hook();
 	if (!g_current_acquire_ok || key == NULL || key->owner_instance != 1
-		|| key->segment_id != 1 || admission == NULL || !admission->entered
+		|| key->segment_id != g_current_segment || admission == NULL || !admission->entered
 		|| admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE || guard == NULL
 		|| guard->opaque[0] != 0) {
 		if (failure != NULL)
@@ -324,8 +335,10 @@ cluster_undo_block0_current_acquire_begin_live_owner_target(
 {
 	g_current_acquire_calls++;
 	g_current_target_acquire_calls++;
+	if (g_before_current_acquire_hook != NULL)
+		g_before_current_acquire_hook();
 	if (!g_current_acquire_ok || key == NULL || key->owner_instance != 1
-		|| key->segment_id != 1 || admission == NULL || !admission->entered
+		|| key->segment_id != g_current_segment || admission == NULL || !admission->entered
 		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE || guard == NULL
 		|| guard->opaque[0] != 0) {
 		if (failure != NULL)
@@ -483,6 +496,7 @@ static ClusterCtrcOriginReserveResult g_ctrc_reserve_result
 static int g_ctrc_reserve_retry_countdown = 0;
 static int g_ctrc_release_overlap_pending_countdown = 0;
 static int g_ctrc_release_overlap_pending_polls = 0;
+static void (*g_ctrc_overlap_hook)(void) = NULL;
 static int g_undo_cleaner_wakeup_calls = 0;
 static bool g_ctrc_open_ok = true;
 static uint32 g_ctrc_open_grant = 7;
@@ -521,6 +535,8 @@ cluster_ctrc_origin_release_overlap_pending(
 	const ClusterCtrcTxnKeyV1 *key)
 {
 	g_ctrc_release_overlap_pending_polls++;
+	if (g_ctrc_overlap_hook != NULL)
+		g_ctrc_overlap_hook();
 	if (key == NULL)
 		return false;
 	if (g_ctrc_release_overlap_pending_countdown > 0)
@@ -568,6 +584,7 @@ cluster_ctrc_origin_block_post_bind(
 		&& reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED;
 }
 
+#ifndef TT_DURABLE_REAL_ALLOCATOR_FIXTURE
 bool
 cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
 									 ClusterTTSlotCurrentOwner *out)
@@ -599,6 +616,7 @@ cluster_tt_slot_current_segment(int node_id)
 		return 2;
 	return g_allocator_current_segment;
 }
+#endif
 
 XLogRecPtr
 cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
@@ -619,6 +637,8 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
 	g_last_bind.wrap = wrap;
 	g_last_bind.xid = xid;
 	g_last_bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	if (g_after_bind_emit_hook != NULL)
+		g_after_bind_emit_hook();
 	return g_bind_emit_lsn;
 }
 
@@ -833,6 +853,14 @@ static void
 reset_current_write_mock(void)
 {
 	reset_header_read_mock();
+	g_epoch_hook = NULL;
+	g_before_current_acquire_hook = NULL;
+	g_after_bind_emit_hook = NULL;
+	g_ctrc_overlap_hook = NULL;
+	g_process_interrupt_error = false;
+	InterruptPending = false;
+	g_current_segment = 1;
+	g_canned_block_segment = 1;
 	g_write_hdr_ok = true;
 	g_write_hdr_calls = 0;
 	memset(&g_last_written_slot, 0, sizeof(g_last_written_slot));
@@ -1403,7 +1431,7 @@ UT_TEST(test_active_publish_wal_precedes_identical_disk_and_resident_successor)
 	UT_ASSERT(UBA_is_invalid(successor.first_undo_block));
 	UT_ASSERT_EQ(memcmp(&successor, &g_last_written_slot, sizeof(successor)), 0);
 	UT_ASSERT_EQ(memcmp(&successor, &resident->tt_slots[7], sizeof(successor)), 0);
-	UT_ASSERT_EQ(g_allocator_owner_calls, 2);
+	UT_ASSERT_EQ(g_allocator_owner_calls, 3);
 	UT_ASSERT_EQ(g_current_recheck_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_reserve_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_open_calls, 1);
@@ -1717,7 +1745,86 @@ UT_TEST(test_active_publish_rejects_allocator_identity_drift_before_wal)
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 }
 
-UT_TEST(test_active_publish_accepts_exact_rollover_after_initial_allocator_check)
+UT_TEST(test_active_publish_returns_unpublished_retry_when_allocator_already_rolled)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	TTSlot successor;
+	TTSlot zero_slot;
+	uint32 generation = UINT32_MAX;
+	volatile XLogRecPtr lsn = InvalidXLogRecPtr;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	g_allocator_owner_ok = false;
+	g_allocator_current_segment = 2;
+	memset(&successor, 0xa5, sizeof(successor));
+	memset(&zero_slot, 0, sizeof(zero_slot));
+	PG_TRY();
+	{
+		lsn = cluster_tt_slot_durable_publish_active(&g_allocator_owner, &admission, &generation,
+													 &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+
+	UT_ASSERT(!caught);
+	UT_ASSERT(XLogRecPtrIsInvalid(lsn));
+	UT_ASSERT_EQ(generation, UINT32_MAX);
+	UT_ASSERT_EQ(memcmp(&successor, &zero_slot, sizeof(successor)), 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 0);
+}
+
+static void
+roll_mock_before_current_result(void)
+{
+	g_before_current_acquire_hook = NULL;
+	g_allocator_current_segment = 2;
+	g_allocator_owner_ok = false;
+}
+
+UT_TEST(test_active_publish_rollover_with_old_root_or_current_unavailable_is_unpublished)
+{
+	volatile unsigned scenario;
+
+	for (scenario = 0; scenario < 2; scenario++) {
+		ClusterSemanticAdmissionToken admission = target_modifier_token();
+		TTSlot successor;
+		uint32 generation = UINT32_MAX;
+		volatile XLogRecPtr lsn = InvalidXLogRecPtr;
+		volatile bool caught = false;
+
+		reset_current_write_mock();
+		g_current_root_ok = scenario != 0;
+		g_current_acquire_ok = scenario != 1;
+		g_before_current_acquire_hook = roll_mock_before_current_result;
+		PG_TRY();
+		{
+			lsn = cluster_tt_slot_durable_publish_active(&g_allocator_owner, &admission,
+														 &generation, &successor);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught);
+		UT_ASSERT(XLogRecPtrIsInvalid(lsn));
+		UT_ASSERT_EQ(generation, UINT32_MAX);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+		UT_ASSERT(!g_current_active);
+		UT_ASSERT_EQ(g_current_cancel_calls, scenario == 0 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_active_publish_retries_rollover_before_xcur_allocator_linearization)
 {
 	ClusterSemanticAdmissionToken admission = target_modifier_token();
 	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
@@ -1747,12 +1854,17 @@ UT_TEST(test_active_publish_accepts_exact_rollover_after_initial_allocator_check
 	PG_END_TRY();
 
 	UT_ASSERT(!caught);
-	UT_ASSERT_EQ(lsn, (XLogRecPtr)0xabcdef);
-	UT_ASSERT_EQ(generation, 4);
-	UT_ASSERT_EQ(g_bind_emit_calls, 1);
-	UT_ASSERT_EQ(g_write_hdr_calls, 1);
-	UT_ASSERT_EQ(successor.status, TT_SLOT_ACTIVE);
-	UT_ASSERT_EQ(successor.xid, 100);
+	UT_ASSERT(XLogRecPtrIsInvalid(lsn));
+	UT_ASSERT_EQ(generation, UINT32_MAX);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 1);
+	UT_ASSERT_EQ(g_current_cancel_calls, 1);
+	UT_ASSERT_EQ(g_current_pin_calls, 0);
+	UT_ASSERT_EQ(g_current_unpin_calls, 0);
+	UT_ASSERT_EQ(successor.status, 0);
+	UT_ASSERT_EQ(successor.xid, InvalidTransactionId);
 	UT_ASSERT_EQ(successor.wrap, 0);
 	UT_ASSERT_EQ(g_allocator_owner_calls, 1);
 }
@@ -2756,7 +2868,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(93);
+	UT_PLAN(95);
 
 	UT_RUN(test_layout_sizes);
 
@@ -2795,7 +2907,9 @@ main(int argc, char **argv)
 	UT_RUN(test_active_publish_existing_open_error_never_cancels_or_blocks_entry);
 	UT_RUN(test_active_publish_requires_exact_root_and_resident_disk_generation);
 	UT_RUN(test_active_publish_rejects_allocator_identity_drift_before_wal);
-	UT_RUN(test_active_publish_accepts_exact_rollover_after_initial_allocator_check);
+	UT_RUN(test_active_publish_returns_unpublished_retry_when_allocator_already_rolled);
+	UT_RUN(test_active_publish_rollover_with_old_root_or_current_unavailable_is_unpublished);
+	UT_RUN(test_active_publish_retries_rollover_before_xcur_allocator_linearization);
 	UT_RUN(test_active_publish_rejects_same_wrap_different_xid_before_wal);
 	UT_RUN(test_precommit_writeonly_publishes_identical_durable_and_resident_successor);
 	UT_RUN(test_precommit_writeonly_target_open_reuses_same_block0_authority);

@@ -734,22 +734,36 @@ cluster_tt_local_get_published_binding(TransactionId top_xid,
 			binding_out);
 }
 
+/* Only called after the publisher's normal, zero-side-effect retry result.
+ * The old allocator has rolled away, so do not free/abort an old physical slot
+ * or touch another backend's CURRENT.  Remove just this local candidate. */
+static void
+cluster_tt_local_forget_unpublished_reservation(TransactionId top_xid)
+{
+	int idx = cluster_tt_local_find_binding(top_xid);
+	ClusterTTLocalBinding *binding;
+
+	if (idx < 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("unpublished canonical reservation disappeared")));
+	binding = &cluster_tt_local_bindings[idx];
+	if (binding->publish_state != CLUSTER_CANONICAL_TXN_RESERVED
+		|| binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE
+		|| !XLogRecPtrIsInvalid(binding->active_lsn) || binding->active_alias_segments != NULL
+		|| binding->active_alias_count != 0 || binding->active_alias_capacity != 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot discard a published or unproved canonical reservation")));
+	memmove(binding, binding + 1,
+			(cluster_tt_local_binding_count - (uint32)idx - 1) * sizeof(*binding));
+	cluster_tt_local_binding_count--;
+	memset(&cluster_tt_local_bindings[cluster_tt_local_binding_count], 0, sizeof(*binding));
+}
+
 bool
 cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 									  ClusterCanonicalTxnBinding *binding_out)
 {
-	ClusterSemanticAdmissionToken modifier_token;
-	ClusterSemanticAdmissionResult admission;
-	ClusterTTSlotCurrentOwner expected_owner;
-	ClusterTTSlotCurrentOwner observed_owner;
-	ClusterTTLocalBinding *binding;
-	XLogRecPtr active_lsn;
-	uint32 segment_id;
-	uint32 segment_generation = UINT32_MAX;
-	uint32 tt_slot_id;
-	uint16 slot_offset;
-	TTSlot successor;
-	int idx;
+	uint64 retry_count = 0;
 
 	if (binding_out == NULL)
 		return false;
@@ -758,89 +772,124 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		|| !TransactionIdIsNormal(top_xid))
 		return false;
 
-	idx = cluster_tt_local_find_binding(top_xid);
-	if (idx >= 0) {
+	for (;;) {
+		ClusterSemanticAdmissionToken modifier_token;
+		ClusterSemanticAdmissionResult admission;
+		ClusterTTSlotCurrentOwner expected_owner;
+		ClusterTTLocalBinding *binding;
+		XLogRecPtr active_lsn;
+		uint32 segment_id;
+		uint32 segment_generation = UINT32_MAX;
+		uint32 tt_slot_id;
+		uint16 slot_offset;
+		TTSlot successor;
+		TTSlot zero_slot;
+		volatile bool retry_unpublished = false;
+		int idx;
+
+		CHECK_FOR_INTERRUPTS();
+		idx = cluster_tt_local_find_binding(top_xid);
+		if (idx >= 0) {
+			binding = &cluster_tt_local_bindings[idx];
+			if (cluster_tt_local_copy_published(binding, binding_out))
+				return true;
+			if (binding->publish_state != CLUSTER_CANONICAL_TXN_RESERVED)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						 errmsg("canonical ACTIVE publication is not reusable for transaction %u",
+								binding->top_xid)));
+		}
+
+		if (!cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset, &tt_slot_id))
+			return false;
+		(void)tt_slot_id;
+		idx = cluster_tt_local_find_binding(top_xid);
+		Assert(idx >= 0);
 		binding = &cluster_tt_local_bindings[idx];
-		if (cluster_tt_local_copy_published(binding, binding_out))
-			return true;
-		if (binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHING
-			|| binding->publish_state == CLUSTER_CANONICAL_TXN_FAILED)
+		if (binding->publish_state != CLUSTER_CANONICAL_TXN_RESERVED
+			|| binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE
+			|| !XLogRecPtrIsInvalid(binding->active_lsn) || binding->active_alias_segments != NULL
+			|| binding->active_alias_count != 0 || binding->active_alias_capacity != 0)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("canonical ACTIVE reservation has prior publication effects")));
+
+		/* The exact candidate was captured under the allocation lock.  Do not
+		 * require an unlocked rescan of a CURRENT index which may have moved.
+		 * The durable producer revalidates before and inside block-zero XCUR. */
+		memset(&expected_owner, 0, sizeof(expected_owner));
+		expected_owner.segment_id = segment_id;
+		expected_owner.slot_offset = slot_offset;
+		expected_owner.xid = top_xid;
+		expected_owner.wrap = binding->wrap;
+		expected_owner.status = CTS_ACTIVE;
+		binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
+
+		admission = cluster_semantic_activation_modifier_enter(
+			cluster_tt_local_writable_admission(), &modifier_token);
+		if (admission != CLUSTER_SEMANTIC_ADMISSION_OK) {
+			binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE publication is not reusable for transaction %u",
-							binding->top_xid)));
-	}
+					 errmsg("cannot publish canonical ACTIVE during cluster reconfiguration")));
+		}
 
-	if (!cluster_tt_local_reserve_binding(top_xid, &segment_id,
-			&slot_offset, &tt_slot_id))
-		return false;
-	(void)segment_id;
-	(void)slot_offset;
-	(void)tt_slot_id;
-	idx = cluster_tt_local_find_binding(top_xid);
-	Assert(idx >= 0);
-	binding = &cluster_tt_local_bindings[idx];
+		PG_TRY();
+		{
+			cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+			active_lsn = cluster_tt_slot_durable_publish_active(&expected_owner, &modifier_token,
+																&segment_generation, &successor);
+			cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+			if (XLogRecPtrIsInvalid(active_lsn)) {
+				memset(&zero_slot, 0, sizeof(zero_slot));
+				if (segment_generation != UINT32_MAX
+					|| memcmp(&successor, &zero_slot, sizeof(successor)) != 0)
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+									errmsg("canonical ACTIVE retry returned publication effects")));
+				/* A normal return certifies that this invocation never reserved
+				 * CTRC or started BIND.  ERROR paths never reach this transition. */
+				binding->publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
+				retry_unpublished = true;
+			} else {
+				if (segment_generation == UINT32_MAX || successor.status != TT_SLOT_ACTIVE
+					|| successor.xid != top_xid || successor.wrap != binding->wrap
+					|| successor.flags != TT_FLAGS_RESERVED || SCN_VALID(successor.commit_scn)
+					|| !UBA_is_invalid(successor.first_undo_block))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("canonical ACTIVE publisher returned an invalid successor")));
 
-	memset(&expected_owner, 0, sizeof(expected_owner));
-	memset(&observed_owner, 0, sizeof(observed_owner));
-	if (!cluster_tt_slot_current_owner_by_xid(cluster_node_id, top_xid,
-			&observed_owner)
-		|| observed_owner.segment_id != binding->segment_id
-		|| observed_owner.slot_offset != binding->slot_offset
-		|| observed_owner.wrap != binding->wrap
-		|| observed_owner.status != CTS_ACTIVE
-		|| observed_owner.commit_scn != InvalidScn)
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("canonical ACTIVE allocator reservation is not exact")));
-	expected_owner = observed_owner;
-	binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
+				binding->segment_generation = segment_generation;
+				binding->active_lsn = active_lsn;
+				binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+				if (!cluster_tt_local_copy_published(binding, binding_out))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("canonical ACTIVE publication receipt is inconsistent")));
+			}
+		}
+		PG_CATCH();
+		{
+			binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
+			cluster_semantic_activation_leave(&modifier_token);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
-	admission = cluster_semantic_activation_modifier_enter(
-		cluster_tt_local_writable_admission(), &modifier_token);
-	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK) {
-		binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot publish canonical ACTIVE during cluster reconfiguration")));
-	}
-
-	PG_TRY();
-	{
-		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-		active_lsn = cluster_tt_slot_durable_publish_active(
-			&expected_owner, &modifier_token, &segment_generation, &successor);
-		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-		if (XLogRecPtrIsInvalid(active_lsn)
-			|| segment_generation == UINT32_MAX
-			|| successor.status != TT_SLOT_ACTIVE
-			|| successor.xid != top_xid
-			|| successor.wrap != binding->wrap
-			|| successor.flags != TT_FLAGS_RESERVED
-			|| SCN_VALID(successor.commit_scn)
-			|| !UBA_is_invalid(successor.first_undo_block))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical ACTIVE publisher returned an invalid successor")));
-
-		binding->segment_generation = segment_generation;
-		binding->active_lsn = active_lsn;
-		binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
-		if (!cluster_tt_local_copy_published(binding, binding_out))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical ACTIVE publication receipt is inconsistent")));
-	}
-	PG_CATCH();
-	{
-		binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
 		cluster_semantic_activation_leave(&modifier_token);
-		PG_RE_THROW();
+		if (!retry_unpublished)
+			return true;
+		cluster_tt_local_forget_unpublished_reservation(top_xid);
+		retry_count++;
+		if (retry_count == 1 || (retry_count & (retry_count - 1)) == 0)
+			ereport(
+				LOG,
+				(errmsg("canonical ACTIVE unpublished allocation reobserved"),
+				 errdetail(
+					 "PGRAC_FAMILY=TT_ACTIVE PGRAC_REASON=ALLOCATOR_ROLLED_BEFORE_BIND "
+					 "node=%d xid=%u old_segment=%u current_segment=%u retry_count=" UINT64_FORMAT,
+					 cluster_node_id, top_xid, segment_id,
+					 cluster_tt_slot_current_segment(cluster_node_id), retry_count)));
 	}
-	PG_END_TRY();
-
-	cluster_semantic_activation_leave(&modifier_token);
-	return true;
 }
 
 /* Legacy shape retained for non-heap callers, but it is now strictly

@@ -86,6 +86,12 @@ extern ClusterTTTerminalTransitionDecision cluster_tt_terminal_transition_decide
  * Publish the canonical physical ACTIVE predecessor for one exact current
  * allocator owner.  This may wait for block-zero current authority and perform
  * WAL/I/O, so callers must invoke it before taking heap content locks.
+ * InvalidXLogRecPtr with generation UINT32_MAX and an all-zero successor is
+ * a normal, strictly pre-BIND allocator-rollover result: this call acquired
+ * no CTRC reservation and wrote nothing; all current/pin holdings are gone.
+ * The backend may discard only its unpublished local reservation and retry.
+ * Every other failure raises ERROR.  In particular a BIND emitter failure
+ * never returns this retry result, and zero outputs after ERROR prove nothing.
  */
 extern XLogRecPtr cluster_tt_slot_durable_publish_active(
 	const ClusterTTSlotCurrentOwner *expected_owner,

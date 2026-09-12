@@ -244,29 +244,42 @@ tt_active_owner_matches(const ClusterTTSlotCurrentOwner *expected,
  * transaction authority: callers must still hold exact XCUR, generation, and
  * byte-identical canonical predecessor/successor evidence.
  */
-static bool
-tt_allocator_corroborates_or_rolled_away(
-	const ClusterTTSlotCurrentOwner *expected)
+typedef enum TTAllocatorOwnerObservation {
+	TT_ALLOCATOR_OWNER_MATCH,
+	TT_ALLOCATOR_OWNER_ROLLED_AWAY,
+	TT_ALLOCATOR_OWNER_CONFLICT
+} TTAllocatorOwnerObservation;
+
+static TTAllocatorOwnerObservation
+tt_allocator_classify_owner(const ClusterTTSlotCurrentOwner *expected)
 {
 	ClusterTTSlotCurrentOwner observed;
 	uint32 current_segment;
 
 	if (expected == NULL || expected->segment_id == 0)
-		return false;
+		return TT_ALLOCATOR_OWNER_CONFLICT;
 	current_segment = cluster_tt_slot_current_segment(cluster_node_id);
 	if (current_segment == 0)
-		return false;
+		return TT_ALLOCATOR_OWNER_CONFLICT;
 	if (current_segment != expected->segment_id)
-		return true;
+		return TT_ALLOCATOR_OWNER_ROLLED_AWAY;
 
 	memset(&observed, 0, sizeof(observed));
 	if (cluster_tt_slot_current_owner_by_xid(
 			cluster_node_id, expected->xid, &observed)
 		&& tt_active_owner_matches(expected, &observed))
-		return true;
+		return TT_ALLOCATOR_OWNER_MATCH;
 
 	current_segment = cluster_tt_slot_current_segment(cluster_node_id);
-	return current_segment != 0 && current_segment != expected->segment_id;
+	return current_segment != 0 && current_segment != expected->segment_id
+			   ? TT_ALLOCATOR_OWNER_ROLLED_AWAY
+			   : TT_ALLOCATOR_OWNER_CONFLICT;
+}
+
+static bool
+tt_allocator_corroborates_or_rolled_away(const ClusterTTSlotCurrentOwner *expected)
+{
+	return tt_allocator_classify_owner(expected) != TT_ALLOCATOR_OWNER_CONFLICT;
 }
 
 XLogRecPtr
@@ -275,7 +288,7 @@ cluster_tt_slot_durable_publish_active(
 	const ClusterSemanticAdmissionToken *admission,
 	uint32 *segment_generation_out, TTSlot *successor_out)
 {
-	ClusterTTSlotCurrentOwner observed_owner;
+	TTAllocatorOwnerObservation allocator_observation;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0ResolvedRoot root;
 	ClusterUndoBlock0ResolvedRoot final_root;
@@ -308,7 +321,6 @@ cluster_tt_slot_durable_publish_active(
 	volatile bool ctrc_pre_bind_cancel_armed = false;
 	volatile bool ctrc_post_bind_block_armed = false;
 
-	memset(&observed_owner, 0, sizeof(observed_owner));
 	memset(&root, 0, sizeof(root));
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&pin, 0, sizeof(pin));
@@ -317,32 +329,41 @@ cluster_tt_slot_durable_publish_active(
 	memset(&ctrc_reservation, 0, sizeof(ctrc_reservation));
 	memset(&successor, 0, sizeof(successor));
 
-	if (expected_owner == NULL || admission == NULL
-		|| segment_generation_out == NULL || successor_out == NULL
-		|| cluster_node_id < 0 || !admission->entered
+	if (expected_owner == NULL || admission == NULL || segment_generation_out == NULL
+		|| successor_out == NULL || cluster_node_id < 0 || !admission->entered
 		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
 			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
-		|| expected_owner->segment_id == 0
+		|| expected_owner->segment_id == 0 || expected_owner->segment_id > UINT16_MAX
 		|| expected_owner->slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(expected_owner->xid)
-		|| expected_owner->wrap == TT_WRAP_INVALID
-		|| expected_owner->status != CTS_ACTIVE
-		|| expected_owner->commit_scn != InvalidScn
-		|| expected_owner->reserved8[0] != 0
-		|| expected_owner->reserved8[1] != 0
+		|| !TransactionIdIsNormal(expected_owner->xid) || expected_owner->wrap == TT_WRAP_INVALID
+		|| expected_owner->status != CTS_ACTIVE || expected_owner->commit_scn != InvalidScn
+		|| expected_owner->reserved8[0] != 0 || expected_owner->reserved8[1] != 0
 		|| expected_owner->reserved8[2] != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 				 errmsg("cannot publish canonical ACTIVE without an exact local TT owner")));
 
+	*segment_generation_out = UINT32_MAX;
+	memset(successor_out, 0, sizeof(*successor_out));
 	owner = tt_owner_instance_for_segment(expected_owner->segment_id);
-	if (owner != (uint8)(cluster_node_id + 1)
-		|| !cluster_tt_slot_current_owner_by_xid(cluster_node_id,
-				expected_owner->xid, &observed_owner)
-		|| !tt_active_owner_matches(expected_owner, &observed_owner))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("canonical ACTIVE allocator identity changed before publication")));
+	allocator_observation = owner == (uint8)(cluster_node_id + 1)
+								? tt_allocator_classify_owner(expected_owner)
+								: TT_ALLOCATOR_OWNER_CONFLICT;
+	/* No authority or reservation has been acquired by this call yet.  Only
+	 * an explicit allocator rollover permits the local owner to select again;
+	 * a missing owner on the same current segment remains an identity error. */
+	if (allocator_observation == TT_ALLOCATOR_OWNER_ROLLED_AWAY)
+		return InvalidXLogRecPtr;
+	if (allocator_observation != TT_ALLOCATOR_OWNER_MATCH)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+			 errmsg("canonical ACTIVE allocator identity changed before publication"),
+			 errdetail("PGRAC_FAMILY=TT_ACTIVE PGRAC_REASON=ALLOCATOR_IDENTITY_CONFLICT "
+					   "stage=entry node=%d xid=%u segment=%u slot=%u wrap=%u current_segment=%u",
+					   cluster_node_id, expected_owner->xid, expected_owner->segment_id,
+					   expected_owner->slot_offset, expected_owner->wrap,
+					   cluster_tt_slot_current_segment(cluster_node_id))));
 
 	key.segment_id = expected_owner->segment_id;
 	key.owner_instance = owner;
@@ -374,6 +395,11 @@ cluster_tt_slot_durable_publish_active(
 				  &current_failure);
 		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
 		{
+			/* A failed begin retains no guard under the current API.  A known
+			 * obsolete local candidate need not restore its old readiness before
+			 * returning the still-unpublished reservation to its caller. */
+			if (tt_allocator_classify_owner(expected_owner) == TT_ALLOCATOR_OWNER_ROLLED_AWAY)
+				goto active_publication_done;
 			ges_failure = cluster_ges_timeout_detail_get();
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -396,6 +422,11 @@ cluster_tt_slot_durable_publish_active(
 					&guard, CLUSTER_UNDO_BLOCK0_WAIT_TT_ACTIVE_ACQUIRE))
 				pg_usleep(1000L);
 		}
+		/* Classify after the wait but before errors about the obsolete root.
+		 * No CTRC reservation, BIND or physical write exists at this cut. */
+		allocator_observation = tt_allocator_classify_owner(expected_owner);
+		if (allocator_observation == TT_ALLOCATOR_OWNER_ROLLED_AWAY)
+			goto active_publication_done;
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)
 		{
 			ges_failure = cluster_ges_timeout_detail_get();
@@ -412,6 +443,20 @@ cluster_tt_slot_durable_publish_active(
 							   cluster_ges_timeout_src_text(ges_failure->source),
 							   ges_failure->master_node, ges_failure->attempts)));
 		}
+		/* With XCUR held, this exact allocator check is the linearization
+		 * point: later rollover cannot reuse the physical segment until this
+		 * guard is released.  Every released-CTRC retry passes here again. */
+		if (allocator_observation != TT_ALLOCATOR_OWNER_MATCH)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("canonical ACTIVE allocator identity changed before publication"),
+				 errdetail(
+					 "PGRAC_FAMILY=TT_ACTIVE PGRAC_REASON=ALLOCATOR_IDENTITY_CONFLICT "
+					 "stage=prebind node=%d xid=%u segment=%u slot=%u wrap=%u current_segment=%u",
+					 cluster_node_id, expected_owner->xid, expected_owner->segment_id,
+					 expected_owner->slot_offset, expected_owner->wrap,
+					 cluster_tt_slot_current_segment(cluster_node_id))));
 
 		result = cluster_undo_block0_current_sample_generation_exclusive(
 			&guard, &root, &generation);
@@ -678,6 +723,7 @@ cluster_tt_slot_durable_publish_active(
 
 		*segment_generation_out = generation.value;
 		*successor_out = successor;
+	active_publication_done:;
 	}
 	PG_FINALLY();
 	{
