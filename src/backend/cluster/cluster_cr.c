@@ -933,7 +933,11 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 				if (!cluster_undo_record_uba_equal(context->candidates[i].undo_segment_head,
 												   current_uba))
 					continue;
-				if (context->candidates[i].write_scn != record->write_scn
+				/* The page target is stamped before receipt APPLY; consuming
+				 * the undo record takes a later SCN. These are ordered events,
+				 * not equal identity fields. Exact UBA and canonical transaction
+				 * identity remain mandatory; reversed order is still invalid. */
+				if (scn_time_cmp(context->candidates[i].write_scn, record->write_scn) > 0
 					|| !cr_r4_canonical_record_locator(&context->locators[i], current_uba, record,
 													   &canonical_locator)) {
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;

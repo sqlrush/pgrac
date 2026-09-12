@@ -2758,7 +2758,7 @@ check_overlapping_lock_head(int variant)
 		= (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
 	HeapTupleHeader pre_update;
 	ClusterR4CrBuildStepResult result;
-	bool foreign = variant == 4;
+	bool foreign = variant == 4 || variant == 8 || variant == 9;
 	bool reject = variant == 2 || variant == 3 || variant == 5;
 
 	extension.route_proof.tag.spcOid = 1663;
@@ -2804,6 +2804,10 @@ check_overlapping_lock_head(int variant)
 		slots[1].write_scn++;
 	else if (variant == 5)
 		lock_payload->itl_slot_idx = CLUSTER_ITL_INITRANS_DEFAULT;
+	else if (variant == 6 || variant == 8)
+		lock->write_scn = (SCN)151;
+	else if (variant == 7 || variant == 9)
+		lock->write_scn = (SCN)175;
 	ut_two_record_sequence = true;
 	ut_three_record_sequence = false;
 	ut_cycle_record_sequence = false;
@@ -2814,6 +2818,15 @@ check_overlapping_lock_head(int variant)
 		update->origin_node_id = lock->origin_node_id = 1;
 		update->tt_slot_segment_id = lock->tt_slot_segment_id = 257;
 		update->prev_uba = slots[1].undo_segment_head;
+		if (variant == 8 || variant == 9) {
+			/* Real producers reserve the page SCN before consuming undo.
+			 * Node bits are provenance, not the temporal order. */
+			slots[0].write_scn = scn_encode(1, 200);
+			slots[1].write_scn = scn_encode(1, 150);
+			update->write_scn = scn_encode(1, 201);
+			lock->write_scn = scn_encode(1, variant == 8 ? 151 : 175);
+			extension.route_proof.read_scn = scn_encode(3, 100);
+		}
 		make_single_record_undo_block(head_page.data, ut_undo_record, ut_undo_record_length);
 		make_single_record_undo_block(tail_page.data, ut_second_undo_record,
 									  ut_second_undo_record_length);
@@ -2866,6 +2879,18 @@ UT_TEST(test_r4_foreign_overlap_preserves_exact_continuation)
 UT_TEST(test_r4_overlap_does_not_cover_malformed_record)
 {
 	check_overlapping_lock_head(5);
+}
+
+UT_TEST(test_r4_overlap_page_reservation_precedes_local_undo_stamp)
+{
+	check_overlapping_lock_head(6);
+	check_overlapping_lock_head(7);
+}
+
+UT_TEST(test_r4_overlap_page_reservation_precedes_foreign_undo_stamp)
+{
+	check_overlapping_lock_head(8);
+	check_overlapping_lock_head(9);
 }
 UT_TEST(test_r4_candidate_does_not_hide_recycled_history)
 {
@@ -3028,6 +3053,8 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_overlapping_uba_with_different_stamp_still_rejects);
 	UT_RUN(test_r4_foreign_overlap_preserves_exact_continuation);
 	UT_RUN(test_r4_overlap_does_not_cover_malformed_record);
+	UT_RUN(test_r4_overlap_page_reservation_precedes_local_undo_stamp);
+	UT_RUN(test_r4_overlap_page_reservation_precedes_foreign_undo_stamp);
 	UT_RUN(test_r4_candidate_does_not_hide_recycled_history);
 	UT_RUN(test_r4_candidate_allows_history_at_snapshot_boundary);
 	UT_RUN(test_r4_missing_local_record_keeps_refusal_and_reports_exact_site);
