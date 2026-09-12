@@ -94,6 +94,7 @@ static unsigned allocation_attempts, fail_allocation_attempt;
 static unsigned flush_calls, durability_calls, barrier_calls;
 static XLogRecPtr test_flush_lsn;
 static void (*durability_hook)(unsigned call);
+static XLogRecPtr (*origin_durability_hook)(int origin);
 static void (*barrier_hook)(void);
 static void (*pool_upgrade_hook)(void);
 static void (*wakeup_hook)(void);
@@ -160,11 +161,11 @@ GetFlushRecPtr(TimeLineID *tli)
 }
 
 XLogRecPtr
-cluster_sf_observed_origin_durable_lsn(int origin pg_attribute_unused())
+cluster_sf_observed_origin_durable_lsn(int origin)
 {
 	if (held_count != 0)
 		abort();
-	return test_flush_lsn;
+	return origin_durability_hook != NULL ? origin_durability_hook(origin) : test_flush_lsn;
 }
 
 void
@@ -355,6 +356,7 @@ reset_fixture(void)
 	flush_calls = durability_calls = barrier_calls = 0;
 	test_flush_lsn = 0;
 	durability_hook = NULL;
+	origin_durability_hook = NULL;
 	barrier_hook = NULL;
 	pool_upgrade_hook = NULL;
 	wakeup_hook = NULL;

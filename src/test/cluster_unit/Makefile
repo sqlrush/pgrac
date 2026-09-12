@@ -34,7 +34,7 @@ endif
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse \
         test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -4102,6 +4102,22 @@ test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleane
 test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Whole production cleaner and exact-page guard, not a reconstructed predicate.
+test_cluster_ctrc_itl_reuse.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^ctrc_cleaner_itl_page_exact\(/ { print "static bool"; emit=1; page++ } \
+	     /^ctrc_cleaner_clean_itl_receipt\(/ { print "static bool"; emit=1; cleaner++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (page != 1 || cleaner != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_itl_reuse.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a \

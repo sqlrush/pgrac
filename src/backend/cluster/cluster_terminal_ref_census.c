@@ -57,6 +57,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_uba.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/backendid.h"
@@ -6917,7 +6918,13 @@ ctrc_cleaner_itl_page_exact(Buffer buffer, const ClusterCtrcTargetV1 *target, Pa
 		|| block_number != target->block_number)
 		return false;
 	page = BufferGetPage(buffer);
-	if (PageIsNew(page) || !PageHasItl(page)
+	if (PageIsNew(page) || !PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| ((PageHeader)page)->pd_lower < SizeOfPageHeaderData
+		|| ((PageHeader)page)->pd_lower > ((PageHeader)page)->pd_upper
+		|| ((PageHeader)page)->pd_upper > ((PageHeader)page)->pd_special
+		|| ((PageHeader)page)->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| (((PageHeader)page)->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
 		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
 		|| !ctrc_page_version_capture(page, &page_lsn_origin, &page_lsn, &page_scn)
 		|| cluster_ctrc_page_version_order(
@@ -6946,6 +6953,119 @@ ctrc_cleaner_dependencies_durable(const ClusterSfDepVec *dependencies,
 			return false;
 	}
 	return true;
+}
+
+/* A completed plain-lock slot can be reused before its asynchronous receipt
+ * is visited. Do not rewrite the successor. Prove absence on the entire exact
+ * current page instead; ambiguous incarnations and MX history stay retained.
+ * Caller owns the pin and current/content-X throughout this read-only proof. */
+static bool
+ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
+							 const ClusterCtrcTargetV1 *target)
+{
+	PageHeader header = (PageHeader)page;
+	const ClusterItlSlotData *slots;
+	const ClusterItlSlotData *successor;
+	UBA old_uba;
+	uint32 uba_segment, uba_block;
+	uint16 uba_slot, uba_row;
+	OffsetNumber offset;
+	OffsetNumber maxoff;
+	unsigned i;
+
+	if (page == NULL || !ctrc_target_exact_itl_valid(key, target)
+		|| target->fork_number != MAIN_FORKNUM || target->itl_class != 2
+		|| !TransactionIdIsNormal(target->itl_xid) || target->itl_slot_wrap == 0
+		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT || !PageHasItl(page)
+		|| PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	memcpy(&old_uba, target->uba, sizeof(old_uba));
+	if (!uba_decode(old_uba, &uba_segment, &uba_block, &uba_slot, &uba_row))
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	successor = &slots[target->itl_slot_index];
+	if (successor->wrap <= target->itl_slot_wrap || successor->flags == ITL_FLAG_FREE)
+		return false;
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		bool has_commit;
+
+		if (slot->xid == target->itl_xid
+			|| memcmp(&slot->undo_segment_head, &old_uba, sizeof(old_uba)) == 0)
+			return false;
+		if (slot->flags == ITL_FLAG_FREE) {
+			if (TransactionIdIsValid(slot->xid) || !UBA_is_invalid(slot->undo_segment_head)
+				|| SCN_VALID(slot->commit_scn) || SCN_VALID(slot->write_scn))
+				return false;
+			continue;
+		}
+		if (slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
+			|| !TransactionIdIsNormal(slot->xid) || slot->wrap == 0
+			|| !uba_decode(slot->undo_segment_head, &uba_segment, &uba_block, &uba_slot, &uba_row))
+			return false;
+		has_commit = slot->flags == ITL_FLAG_COMMITTED || slot->flags == ITL_FLAG_NEEDS_CLEANOUT
+					 || slot->flags == ITL_FLAG_LOCK_ONLY_COMMITTED;
+		if (SCN_VALID(slot->commit_scn) != has_commit)
+			return false;
+	}
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		HeapTupleHeader tuple;
+		unsigned item_offset;
+		unsigned item_length;
+
+		if (ItemIdIsRedirected(item)) {
+			OffsetNumber destination = ItemIdGetRedirect(item);
+
+			if (ItemIdHasStorage(item) || destination < FirstOffsetNumber || destination > maxoff
+				|| !ItemIdIsNormal(PageGetItemId(page, destination)))
+				return false;
+			continue;
+		}
+		if (!ItemIdIsNormal(item)) {
+			if ((!ItemIdIsDead(item) && ItemIdIsUsed(item)) || ItemIdHasStorage(item))
+				return false;
+			continue;
+		}
+		item_offset = ItemIdGetOffset(item);
+		item_length = ItemIdGetLength(item);
+		if (item_length < SizeofHeapTupleHeader || item_offset < header->pd_upper
+			|| item_offset > header->pd_special || item_length > header->pd_special - item_offset
+			|| item_offset != MAXALIGN(item_offset))
+			return false;
+		tuple = (HeapTupleHeader)((char *)page + item_offset);
+		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > item_length
+			|| HeapTupleHeaderGetRawXmin(tuple) == target->itl_xid)
+			return false;
+		if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0
+			&& ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
+				|| HeapTupleHeaderGetRawXmax(tuple) == target->itl_xid))
+			return false;
+	}
+	return true;
+}
+
+/* Absence creates no local WAL. Its existing page WAL must be covered in the
+ * actual origin namespace even if the outstanding SF vector is now empty. */
+static bool
+ctrc_cleaner_absence_page_dependency(Page page, const ClusterCtrcTargetV1 *target,
+									 ClusterSfDepVec *dependencies)
+{
+	uint16 origin;
+	XLogRecPtr lsn;
+	SCN scn;
+
+	if (!ctrc_page_version_capture(page, &origin, &lsn, &scn))
+		return false;
+	if (XLogRecPtrIsInvalid(lsn))
+		return !target->needs_wal;
+	return cluster_sf_dep_vec_set(dependencies, origin, lsn);
 }
 
 typedef enum CtrcCleanerCurrentMxPresence {
@@ -7718,6 +7838,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	ClusterSemanticAdmissionToken admission;
 	ClusterCtrcTerminalStatus terminal_status;
 	ClusterCtrcItlCleanoutApplyResult apply_result;
+	ClusterCtrcItlProjection projection = CTRC_ITL_TERMINAL_INDEPENDENT;
 	ClusterCtrcItlTargetIdentity expected_target;
 	ClusterCtrcReceiptHandle handle;
 	ClusterCtrcDurability durability;
@@ -7732,6 +7853,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	Page page;
 	Page image;
 	bool permanent;
+	bool absent;
 
 	if (participant == NULL || receipt == NULL
 		|| participant_index >= CtrcShared->participant_key_entries
@@ -7791,6 +7913,13 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	cluster_sf_dep_vec_reset(&first_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &first_dependencies);
+	absent = ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target);
+	if (absent
+		&& !ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies)) {
+		UnlockReleaseBuffer(buffer);
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
 	if (!ctrc_cleaner_dependencies_durable(&first_dependencies, &durability)) {
@@ -7816,10 +7945,27 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	cluster_sf_dep_vec_reset(&final_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &final_dependencies);
+	if (absent
+		&& (!ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target)
+			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
+													 &final_dependencies))) {
+		UnlockReleaseBuffer(buffer);
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	if (memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) != 0) {
 		UnlockReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
+	}
+	if (absent) {
+		/* Already durable, read-only page proof. Never flush a foreign page
+		 * LSN as a local WAL coordinate and never alter its successor. */
+		cleanout_lsn = durability.local_flush_lsn;
+		projection = CTRC_ITL_TARGET_ABSENT;
+		UnlockReleaseBuffer(buffer);
+		cluster_semantic_activation_leave(&admission);
+		goto itl_discharge;
 	}
 	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
 	image = GenericXLogRegisterBuffer(xlog_state, buffer, 0);
@@ -7845,6 +7991,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 			return false;
 		XLogFlush(cleanout_lsn);
 	}
+itl_discharge:
 	ctrc_participant_capture_durability(&durability);
 	durability.highest_local_lsn = cleanout_lsn;
 	memcpy(durability.required_lsn, final_dependencies.required, sizeof(durability.required_lsn));
@@ -7869,8 +8016,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	expected_target.itl_class = receipt->target.itl_class;
 	expected_target.needs_wal = receipt->target.needs_wal;
 	memcpy(expected_target.uba, receipt->target.uba, sizeof(expected_target.uba));
-	return cluster_ctrc_receipt_discharge_itl_shared(&handle, &expected_target,
-													 CTRC_ITL_TERMINAL_INDEPENDENT, &durability)
+	return cluster_ctrc_receipt_discharge_itl_shared(&handle, &expected_target, projection,
+													 &durability)
 		   == CLUSTER_CTRC_DISCHARGE_CLEANED;
 }
 
