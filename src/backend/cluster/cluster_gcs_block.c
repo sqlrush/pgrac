@@ -9579,6 +9579,18 @@ gcs_block_resource_x_delivery_arm_exact(int32 master_node, const ResourceXDecode
 	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
 		return own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
 													 : RESOURCE_X_APPLY_BAD_STATE;
+	if (direct_token == 0 && before.pcm_state == (uint8)PCM_STATE_READ_IMAGE) {
+		/* ERROR unwind can leave an unlocked read marker behind this
+		 * round's own S barrier. Reclaim only that exact abandoned bracket;
+		 * all physical hold/entry binding checks below still have to pass. */
+		own_result = cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact(buffer_id,
+																				  &before, &after);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			return own_result == CLUSTER_PCM_OWN_CORRUPT || own_result == CLUSTER_PCM_OWN_EXHAUSTED
+					   ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+					   : RESOURCE_X_APPLY_BAD_STATE;
+		before = after;
+	}
 	if (before.pcm_state != PCM_STATE_N)
 		return dispatch->kind == RESOURCE_X_WIRE_ASSERT_X
 					   && (before.pcm_state == PCM_STATE_S || before.pcm_state == PCM_STATE_X)
@@ -14434,6 +14446,9 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 										 PcmRxRequesterWaitReason reason)
 {
 	PcmRxRequesterWaitSnapshot snapshot;
+	ClusterPcmOwnSnapshot physical = { 0 };
+	ClusterPcmOwnResult physical_result;
+	int physical_buffer_id = -1;
 	uint64 now_us = gcs_block_pcm_x_monotonic_us();
 	uint64 started_us = diagnostic->threshold_us > diagnostic->budget_us
 							? diagnostic->threshold_us - diagnostic->budget_us
@@ -14450,6 +14465,10 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 			&& reason != PCM_RX_WAIT_RETIRED_SUCCESSOR))
 		return;
 	found = cluster_pcm_rx_requester_wait_snapshot(diagnostic->tag, &snapshot);
+	/* Only on an already-triggered diagnostic log, outside entry authority.
+	 * This separate physical observation is deliberately not atomic with E. */
+	physical_result
+		= cluster_bufmgr_pcm_own_snapshot_by_tag(diagnostic->tag, &physical_buffer_id, &physical);
 	ereport(
 		LOG,
 		(errmsg_internal("Resource-X requester owned-wait observation"),
@@ -14462,6 +14481,10 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 			 " head_phase=%u local_owner=%u delivery_bound=%u executor_active=%u "
 			 "head_started_us=" UINT64_FORMAT " last_semantic_progress_us=" UINT64_FORMAT
 			 " formation=" UINT64_FORMAT " master=%d session=" UINT64_FORMAT " r4=" UINT64_FORMAT
+			 " physical_non_atomic=1 physical_result=%u physical_buffer=%d physical_state=%u"
+			 " physical_type=%u physical_generation=" UINT64_FORMAT " physical_token=" UINT64_FORMAT
+			 " physical_flags=%u physical_writer=" UINT64_FORMAT
+			 " physical_activation=" UINT64_FORMAT " physical_semantic=%u"
 			 " action=continue_observation",
 			 cluster_pcm_rx_requester_wait_reason_name(reason), diagnostic->request_sequence,
 			 diagnostic->tag->spcOid, diagnostic->tag->dbOid, diagnostic->tag->relNumber,
@@ -14472,7 +14495,11 @@ gcs_block_resource_x_requester_wait_note(GcsResourceXWaitDiagnostic *diagnostic,
 			 (unsigned)snapshot.round_phase, (unsigned)snapshot.local_owner_state,
 			 (unsigned)snapshot.delivery_bound, (unsigned)snapshot.delivery_executor_active,
 			 snapshot.diagnostic_started_us, snapshot.last_semantic_progress_us, snapshot.formation,
-			 snapshot.master_node, snapshot.master_session, snapshot.r4_generation)));
+			 snapshot.master_node, snapshot.master_session, snapshot.r4_generation,
+			 (unsigned)physical_result, physical_buffer_id, (unsigned)physical.pcm_state,
+			 (unsigned)physical.buffer_type, physical.generation, physical.reservation_token,
+			 physical.flags, physical.writer_activation_token,
+			 physical.resource_x_activation_generation, physical.semantic_buf_state)));
 }
 
 

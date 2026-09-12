@@ -78,6 +78,9 @@ static uint64 route_direct_generation, route_direct_token;
 static int route_observations, route_binds;
 static int route_drift;
 static int n_predecessor_header_step;
+static int read_reclaim_drift;
+static bool read_reclaim_error;
+static ResourceXApplyResult route_bind_result = RESOURCE_X_APPLY_APPLIED;
 
 /* Only process-local ledger presence is a fixture. The exact production
  * refusal proof, snapshots and reservation abort below are not rewritten. */
@@ -126,7 +129,7 @@ cluster_pcm_lock_resource_x_delivery_bind_target_exact(
 	UT_ASSERT_EQ(observation->request.assertion_sequence, UINT64_C(41));
 	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(before, after));
 	route_binds++;
-	return RESOURCE_X_APPLY_APPLIED;
+	return route_bind_result;
 }
 
 sigjmp_buf *PG_exception_stack = NULL;
@@ -144,6 +147,12 @@ static uint32
 transition_lock_header(BufferDesc *buf)
 {
 	uint32 state = pg_atomic_read_u32(&buf->state);
+
+	if (read_reclaim_error && transition_content_held
+		&& transition_pin_count > transition_base_pins) {
+		read_reclaim_error = false;
+		pg_re_throw();
+	}
 
 	/* A concurrent physical I/O interval changes no ownership identity.
 	 * The third sample returns to the exact original physical projection. */
@@ -176,6 +185,11 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 			return false;
 		UT_ASSERT(!transition_content_held);
 		transition_content_held = true;
+		if (read_reclaim_drift == 1)
+			pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[transition_buf->buf_id].generation, 1);
+		else if (read_reclaim_drift == 2)
+			pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_IN_PROGRESS);
+		read_reclaim_drift = 0;
 	}
 	return true;
 }
@@ -1981,6 +1995,9 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_wal_calls = 0;
 	transition_wal_changes = 0;
 	cluster_pcm_x_finish_retain_flush_active = false;
+	read_reclaim_drift = 0;
+	read_reclaim_error = false;
+	route_bind_result = RESOURCE_X_APPLY_APPLIED;
 	cluster_pcm_x_finish_retain_flush_io_active = false;
 }
 
@@ -2560,6 +2577,227 @@ UT_TEST(test_delivery_dispatch_waits_for_ordinary_read_image_owner)
 			UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
 		}
 	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_assert_dispatch_reclaims_only_abandoned_read_image)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+
+	for (int fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry, before;
+		ResourceXDecodedFrame dispatch;
+		ClusterPcmOwnSnapshot base;
+		PGAlignedBlock bytes;
+		uint64 token, generation = 0;
+		uint32 state;
+
+		token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, (ForkNumber)fork, true);
+		transition_content_held = true;
+		UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+					 CLUSTER_PCM_OWN_OK);
+		memcpy(&before, &entry, sizeof(before));
+		memcpy(bytes.data, transition_page.data, BLCKSZ);
+		state = pg_atomic_read_u32(&buf.state);
+		/* A live read bracket is not permission to retire or bind anything. */
+		UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+					 RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+		UT_ASSERT_EQ(route_binds, 0);
+		/* AbortTransactionBody uses LWLockReleaseAll, not the ordinary
+		 * LockBuffer UNLOCK that clears READ_IMAGE before releasing content.
+		 * No new SHARE waiter exists to reclaim this leftover marker. */
+		transition_content_held = false;
+		UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation + 1);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(buf.buf_id), token);
+		UT_ASSERT_EQ(route_binds, 1);
+		UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(buf.buf_id), UINT64_C(41));
+		route_target.buffer_id_plus_one = (uint32)buf.buf_id + 1;
+		route_target.generation = generation + 1;
+		UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(route_binds, 1);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation + 1);
+		UT_ASSERT_EQ(memcmp(transition_page.data, bytes.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_abandoned_read_image_adapter_preserves_all_refusal_boundaries)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+
+	for (int fault = 0; fault < 20; fault++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry, before;
+		ResourceXDecodedFrame dispatch;
+		ClusterPcmOwnSnapshot base, published, cleared, zero = { 0 };
+		PGAlignedBlock bytes;
+		ClusterPcmOwnResult expected = CLUSTER_PCM_OWN_STALE;
+		uint64 token, generation = 0;
+		uint32 state;
+		int expected_id = 0;
+
+		token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, MAIN_FORKNUM, true);
+		transition_content_held = true;
+		UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+					 CLUSTER_PCM_OWN_OK);
+		transition_content_held = false;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &published), CLUSTER_PCM_OWN_OK);
+		switch (fault) {
+		case 0:
+			transition_content_busy = true;
+			expected = CLUSTER_PCM_OWN_BUSY;
+			break;
+		case 1:
+			published.tag.blockNum++;
+			break;
+		case 2:
+			expected_id++;
+			break;
+		case 3:
+			published.generation++;
+			break;
+		case 4:
+			published.reservation_token++;
+			break;
+		case 5:
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+			break;
+		case 6:
+			published.flags = PCM_OWN_FLAG_REVOKING;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 7:
+			published.writer_activation_token = 1;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 8:
+			published.resource_x_activation_generation = 1;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 9:
+			pg_atomic_write_u64(&entry.delivery_attempt, 41);
+			expected = CLUSTER_PCM_OWN_BUSY;
+			break;
+		case 10:
+			published.semantic_buf_state |= BM_IO_ERROR;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 11:
+			published.semantic_buf_state |= BM_IO_IN_PROGRESS;
+			expected = CLUSTER_PCM_OWN_BUSY;
+			break;
+		case 12:
+			published.generation = UINT64_MAX;
+			expected = CLUSTER_PCM_OWN_EXHAUSTED;
+			break;
+		case 13:
+			published.reservation_token = UINT64_MAX;
+			expected = CLUSTER_PCM_OWN_EXHAUSTED;
+			break;
+		case 14:
+			published.buffer_type = (uint8)BUF_TYPE_PI;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 15:
+			published.generation = 0;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 16:
+			published.reservation_token = 0;
+			expected = CLUSTER_PCM_OWN_CORRUPT;
+			break;
+		case 17:
+			ClusterPcmOwnArray = NULL;
+			expected = CLUSTER_PCM_OWN_NOT_READY;
+			break;
+		case 18:
+			read_reclaim_drift = 1;
+			break;
+		case 19:
+			read_reclaim_drift = 2;
+			break;
+		}
+		memcpy(&before, &entry, sizeof(before));
+		memcpy(bytes.data, transition_page.data, BLCKSZ);
+		state = pg_atomic_read_u32(&buf.state);
+		memset(&cleared, 0xa5, sizeof(cleared));
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact(
+						 expected_id, &published, &cleared),
+					 expected);
+		ClusterPcmOwnArray = &entry;
+		if (fault == 18)
+			pg_atomic_fetch_add_u64(&before.generation, 1); /* Only the injected other owner. */
+		if (fault == 19)
+			state |= BM_IO_IN_PROGRESS;
+		UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+		UT_ASSERT_EQ(memcmp(&cleared, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(memcmp(transition_page.data, bytes.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+		UT_ASSERT_EQ(route_binds, 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_abandoned_read_image_cleanup_balances_exception_and_does_not_grant)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ResourceXDecodedFrame dispatch;
+	ClusterPcmOwnSnapshot base, published, cleared;
+	PGAlignedBlock bytes;
+	uint64 token, generation = 0;
+	uint32 state;
+	volatile bool caught = false;
+
+	token = delivery_reader_fixture(&buf, &entry, &dispatch, &base, MAIN_FORKNUM, true);
+	transition_content_held = true;
+	UT_ASSERT_EQ(cluster_pcm_own_publish_read_image_exact(&buf, &base, token, &generation),
+				 CLUSTER_PCM_OWN_OK);
+	transition_content_held = false;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &published), CLUSTER_PCM_OWN_OK);
+	memcpy(bytes.data, transition_page.data, BLCKSZ);
+	state = pg_atomic_read_u32(&buf.state);
+	read_reclaim_error = true;
+	PG_TRY();
+	{
+		(void)cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact(0, &published, &cleared);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_READ_IMAGE);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), generation);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+	/* The marker may be reclaimed, but a real entry refusal still prevents
+	 * dispatch. Its existing delivery hold must not be silently discarded. */
+	route_bind_result = RESOURCE_X_APPLY_STALE;
+	UT_ASSERT_EQ(gcs_block_resource_x_delivery_arm_exact(1, &dispatch), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), generation + 1);
+	UT_ASSERT_EQ(cluster_pcm_own_writer_activation_token_get(0), UINT64_C(0));
+	UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_generation_get(0), UINT64_C(0));
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), UINT64_C(41));
+	UT_ASSERT_EQ(memcmp(transition_page.data, bytes.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
 	ClusterPcmOwnArray = saved;
 }
 
@@ -4849,9 +5087,7 @@ UT_TEST(test_read_image_lifecycle_is_exact_monotonic_and_header_atomic)
 		= { "*cleared_generation_out = 0",
 			"LockBufHdr(buf)",
 			"cluster_pcm_own_snapshot_locked(buf, &live)",
-			"BufferTagsEqual(&live.tag, &published->tag)",
-			"live.generation != published->generation",
-			"live.reservation_token != published->reservation_token",
+			"cluster_pcm_own_snapshot_equal_exact(&live, published)",
 			"live.pcm_state != (uint8) PCM_STATE_READ_IMAGE",
 			"live.flags != 0",
 			"live.writer_activation_token != 0",
@@ -6994,7 +7230,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(124);
+	UT_PLAN(127);
 	UT_RUN(test_aux_creation_disposition_uses_real_beb_and_excludes_retained_context);
 	UT_RUN(test_real_barrier_refusal_ignores_another_callers_pending);
 	UT_RUN(test_real_barrier_refusal_abort_then_successor_is_not_own_residue);
@@ -7020,6 +7256,9 @@ main(void)
 	UT_RUN(test_actual_delivery_arm_keeps_valid_target_and_existing_hold_guards);
 	UT_RUN(test_actual_delivery_arm_rejects_unproved_initializer_without_mutation);
 	UT_RUN(test_delivery_dispatch_waits_for_ordinary_read_image_owner);
+	UT_RUN(test_assert_dispatch_reclaims_only_abandoned_read_image);
+	UT_RUN(test_abandoned_read_image_adapter_preserves_all_refusal_boundaries);
+	UT_RUN(test_abandoned_read_image_cleanup_balances_exception_and_does_not_grant);
 	UT_RUN(test_delivery_dispatch_preserves_ordinary_read_abort_then_arms);
 	UT_RUN(test_real_known_new_sidecar_rejects_installed_remote_image);
 	UT_RUN(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new);

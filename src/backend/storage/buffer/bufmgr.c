@@ -2066,10 +2066,7 @@ cluster_pcm_own_clear_read_image_exact(
 
 	buf_state = LockBufHdr(buf);
 	cluster_pcm_own_snapshot_locked(buf, &live);
-	if (published != NULL
-		&& (!BufferTagsEqual(&live.tag, &published->tag)
-			|| live.generation != published->generation
-			|| live.reservation_token != published->reservation_token))
+	if (published != NULL && !cluster_pcm_own_snapshot_equal_exact(&live, published))
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (live.pcm_state != (uint8) PCM_STATE_READ_IMAGE)
 		result = CLUSTER_PCM_OWN_STALE;
@@ -2082,6 +2079,8 @@ cluster_pcm_own_clear_read_image_exact(
 			 || live.writer_activation_token != 0
 			 || live.resource_x_activation_generation != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (published != NULL && cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
 	else
 	{
 		result = cluster_pcm_own_bump_locked(
@@ -12175,6 +12174,90 @@ cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
 		else
 			UnlockBufHdr(buf, buf_state);
 	}
+}
+
+/* A failed reader can release all LWLocks without taking the normal
+ * READ_IMAGE unlock path. The existing delivery driver must not depend on
+ * another S waiter (itself barred by this round) to clear that marker.
+ * Conditional content-X proves no live read bracket remains; the exact
+ * original snapshot, not elapsed time, authorizes only local marker cleanup.
+ * No page authority, private pin or retained-delivery pin is exported. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact(int expected_buffer_id,
+															 const ClusterPcmOwnSnapshot *published,
+															 ClusterPcmOwnSnapshot *cleared_out)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_BUSY;
+	BufferDesc *buf;
+	LWLock *partition_lock;
+	LWLock *content_lock;
+	uint32 hashcode, buf_state;
+	uint64 cleared_generation = 0;
+	int buffer_id;
+	volatile bool content_locked = false;
+
+	if (cleared_out != NULL)
+		memset(cleared_out, 0, sizeof(*cleared_out));
+	if (published == NULL || cleared_out == NULL || expected_buffer_id < 0
+		|| expected_buffer_id >= NBuffers)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (published->generation == UINT64_MAX || published->reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	if (published->generation == 0 || published->reservation_token == 0
+		|| published->pcm_state != (uint8)PCM_STATE_READ_IMAGE
+		|| published->buffer_type != (uint8)BUF_TYPE_CURRENT || published->flags != 0
+		|| published->writer_activation_token != 0
+		|| published->resource_x_activation_generation != 0
+		|| (published->semantic_buf_state & (BM_TAG_VALID | BM_VALID)) != (BM_TAG_VALID | BM_VALID)
+		|| (published->semantic_buf_state & BM_IO_ERROR) != 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	if ((published->semantic_buf_state & BM_IO_IN_PROGRESS) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	/* The descriptor's lock address is stable even without a pin. Do not
+	 * acquire a raw pin that could only be dropped under our own live lock. */
+	content_lock = BufferDescriptorGetContentLock(GetBufferDescriptor(expected_buffer_id));
+	if (LWLockHeldByMe(content_lock))
+		return CLUSTER_PCM_OWN_BUSY;
+
+	hashcode = BufTableHashCode(&published->tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buffer_id = BufTableLookup(&published->tag, hashcode);
+	if (buffer_id != expected_buffer_id) {
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	buf = GetBufferDescriptor(buffer_id);
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!cluster_pcm_own_snapshot_equal_exact(&live, published)) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	LWLockRelease(partition_lock);
+	content_lock = BufferDescriptorGetContentLock(buf);
+	PG_TRY();
+	{
+		if (LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+			content_locked = true;
+			result = cluster_pcm_own_reclaim_read_image_exact(buf, published, &cleared_generation);
+			if (result == CLUSTER_PCM_OWN_OK)
+				result = cluster_bufmgr_pcm_own_snapshot(buf, cleared_out);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (content_locked)
+			LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /*

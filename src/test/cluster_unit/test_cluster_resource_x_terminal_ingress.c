@@ -1692,6 +1692,7 @@ run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_
 	ResourceXGateSnapshot gate = { 0 }, rebound_gate;
 	ResourceXDecodedFrame dispatch = { 0 };
 	ResourceXCallerWitness local_caller_witness, saved_witness;
+	ResourceXCallerWitness creation_caller = { 0 };
 	ResourceXCallerWitness *caller_witness = &local_caller_witness;
 	ResourceXApplyResult dispatch_gate_session_result pg_attribute_unused();
 	ResourceXApplyResult discard_result, result = RESOURCE_X_APPLY_INVALID;

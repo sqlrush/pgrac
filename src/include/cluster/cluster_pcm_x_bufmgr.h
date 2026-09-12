@@ -741,6 +741,12 @@ extern ClusterPcmOwnResult cluster_pcm_own_release_read_image_exact(BufferDesc *
 extern ClusterPcmOwnResult
 cluster_pcm_own_reclaim_read_image_exact(BufferDesc *buf, const ClusterPcmOwnSnapshot *published,
 										 uint64 *cleared_generation_out);
+/* Existing delivery staging may conditionally retire an abandoned read
+ * bracket. Returned N is a physical observation, never a grant or pin. */
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact(int expected_buffer_id,
+															 const ClusterPcmOwnSnapshot *published,
+															 ClusterPcmOwnSnapshot *cleared_out);
 /* Exact requester-side N assertion preflight.  A passive retained PI mirror
  * is accepted only as a no-local-current shape; no page bytes or proof are
  * returned, and the master still owns proof selection. */
